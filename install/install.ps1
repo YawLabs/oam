@@ -285,34 +285,45 @@ function Get-Asset($assetName, $outFile) {
 }
 
 # Run a native program with a file as its stdin, BYTE for byte, and return
-# its exit code and combined output. Not `Get-Content | & exe`: PowerShell
-# re-encodes piped text and appends a newline, which breaks any signature.
-# Named $argv, not $args: $args is automatic.
+# its exit code and combined output. Start-Process opens the files itself and
+# hands the child their handles as its standard handles, so nothing of
+# PowerShell's or .NET's sits between the file and the program.
+#
+# Not `Get-Content | & exe`: PowerShell re-encodes piped text and appends a
+# newline. And not [Diagnostics.Process] with RedirectStandardInput: .NET
+# Framework wraps that pipe in a StreamWriter using the console's input
+# encoding, and under a UTF-8 console (code page 65001 -- Windows Terminal,
+# `chcp 65001`) that encoding carries a byte-order mark, which the writer
+# emits the moment the process starts: three bytes ahead of the message, and
+# a signature that no longer verifies. Named $argv, not $args: $args is
+# automatic.
 function Invoke-Native([string]$exe, [string[]]$argv, [string]$stdinFile) {
-  $psi = New-Object System.Diagnostics.ProcessStartInfo
-  $psi.FileName = $exe
-  $psi.Arguments = (@($argv | ForEach-Object { '"' + $_ + '"' }) -join ' ')
-  $psi.UseShellExecute = $false
-  $psi.CreateNoWindow = $true
-  $psi.RedirectStandardInput = $true
-  $psi.RedirectStandardOutput = $true
-  $psi.RedirectStandardError = $true
-  $p = [System.Diagnostics.Process]::Start($psi)
-  # Both pipes drained concurrently, or a chatty child deadlocks on a full one.
-  $outTask = $p.StandardOutput.ReadToEndAsync()
-  $errTask = $p.StandardError.ReadToEndAsync()
-  # A child that exits without reading (a malformed signature fails before
-  # the message is read) closes the pipe under the write; its exit code is
-  # the answer then, not the write's exception.
+  $io = Join-Path ([System.IO.Path]::GetTempPath()) ("oam-install-io-" + [System.Guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory -Path $io -Force | Out-Null
   try {
-    if ($stdinFile) {
-      $bytes = [System.IO.File]::ReadAllBytes($stdinFile)
-      $p.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+    $outFile = Join-Path $io 'out'
+    $errFile = Join-Path $io 'err'
+    # stdin is always a file: a child that reads nothing gets an empty one
+    # rather than this console's input.
+    $inFile = $stdinFile
+    if (-not $inFile) { $inFile = Join-Path $io 'in'; [System.IO.File]::WriteAllBytes($inFile, [byte[]]@()) }
+    $start = @{
+      FilePath = $exe
+      RedirectStandardInput = $inFile
+      RedirectStandardOutput = $outFile
+      RedirectStandardError = $errFile
+      NoNewWindow = $true
+      Wait = $true
+      PassThru = $true
     }
-    $p.StandardInput.Close()
-  } catch [System.IO.IOException] { }
-  $p.WaitForExit()
-  return @{ Code = $p.ExitCode; Output = ($outTask.Result + $errTask.Result) }
+    if ($argv.Count -gt 0) { $start.ArgumentList = (@($argv | ForEach-Object { '"' + $_ + '"' }) -join ' ') }
+    $p = Start-Process @start
+    $text = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($outFile)) +
+            [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($errFile))
+    return @{ Code = $p.ExitCode; Output = $text }
+  } finally {
+    Remove-Item -Path $io -Recurse -Force -ErrorAction SilentlyContinue
+  }
 }
 
 # An ssh-keygen that understands -Y (OpenSSH 8.1+). Sysnative first: a 32-bit

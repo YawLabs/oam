@@ -4200,6 +4200,20 @@ fi
 if [ -n "$IN_PS64" ]; then
   # Windows' own directories only: no OpenSSH, no Git, no gh on it.
   IN_WINPATH="/c/Windows/System32:/c/Windows:/c/Windows/System32/WindowsPowerShell/v1.0"
+  # The console code page is part of the fixture. Under a UTF-8 console (65001:
+  # Windows Terminal, Yaw, `chcp 65001`) .NET Framework's Process.StandardInput
+  # writer carries a byte-order mark, and the 2026-10-04 v0.18.0 gate failed
+  # every signed ps1 case with it: ssh-keygen hashed three bytes of BOM ahead
+  # of the manifest. Under conhost's default (437) the same code passed. So
+  # each case runs under an explicit page -- 65001 unless IN_PS_CP says
+  # otherwise -- and the console's own page is put back afterwards: chcp is
+  # per console and sticks, and this suite shares the operator's. chcp.com is
+  # called straight from bash (same console as the PowerShell it precedes);
+  # not through cmd, which gets every embedded quote MSYS-escaped as \".
+  IN_CHCP=/c/Windows/System32/chcp.com
+  IN_CP_ORIG="$("$IN_CHCP" 2>/dev/null | tr -dc '0-9')"
+  [ -n "$IN_CP_ORIG" ] || IN_CP_ORIG=437
+  in_ps_cp(){ "$IN_CHCP" "$1" >/dev/null 2>&1 || true; }
   # in_ps <powershell> <script> <release> <tag> [VAR=value...] -- run it into a
   # fresh $IN/pdest. PowerShell wraps long error lines at the console width,
   # mid-word, so the output is joined back up before any needle is looked for.
@@ -4207,10 +4221,12 @@ if [ -n "$IN_PS64" ]; then
     local ps="$1" script="$2" rel="$3" tag="$4"; shift 4
     rm -rf "$IN/pdest"
     IN_RC=0
+    in_ps_cp "${IN_PS_CP:-65001}"
     IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API \
       PATH="$IN_WINPATH" OAM_INSTALL_BASE="$(in_url "$IN/rel/$rel")" OAM_VERSION="$tag" \
       OAM_INSTALL_DIR="$(cygpath -w "$IN/pdest")" "$@" \
       "$ps" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$script")" 2>&1 | tr -d '\r\n')" || IN_RC=$?
+    in_ps_cp "$IN_CP_ORIG"
   }
   in_ps_refused(){
     if [ "$IN_RC" != "0" ] && grep -qF -- "$1" <<<"$IN_OUT" && [ ! -e "$IN/pdest/oam.exe" ]; then pass
@@ -4221,10 +4237,13 @@ if [ -n "$IN_PS64" ]; then
     else fail "rc=$IN_RC, wanted '$1' and the fixture oam.exe in place: $IN_OUT"; fi
   }
 
-  it "ps1 good: verifies with System32's inbox ssh-keygen and installs"
+  it "ps1 good: verifies with System32's inbox ssh-keygen and installs (UTF-8 console, 65001)"
   in_ps "$IN_PS64" "$IN/install.ps1" good v0.18.0
   if grep -qF 'System32\OpenSSH\ssh-keygen.exe' <<<"$IN_OUT"; then in_ps_installed 'signature ok: v0.18.0, signed by oam-release-k1'
   else fail "did not verify with the System32 ssh-keygen: $IN_OUT"; fi
+  it "ps1 good under conhost's default code page (437)"
+  IN_PS_CP=437 in_ps "$IN_PS64" "$IN/install.ps1" good v0.18.0
+  in_ps_installed 'signature ok: v0.18.0, signed by oam-release-k1'
   it "ps1 good, 32-bit PowerShell: finds ssh-keygen through Sysnative"
   if [ -x "$IN_PS32" ]; then
     in_ps "$IN_PS32" "$IN/install.ps1" good v0.18.0
@@ -4291,9 +4310,11 @@ if [ -n "$IN_PS64" ]; then
     sed "s#https://github.com/#http://127.0.0.1:$IN_PORT/#g" "$IN/install.ps1" >"$IN/install-http.ps1"
     rm -rf "$IN/pdest"
     IN_RC=0
+    in_ps_cp 65001
     IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API -u OAM_VERSION -u OAM_INSTALL_BASE \
       PATH="$IN_WINPATH" OAM_INSTALL_DIR="$(cygpath -w "$IN/pdest")" \
       "$IN_PS64" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$IN/install-http.ps1")" 2>&1 | tr -d '\r\n')" || IN_RC=$?
+    in_ps_cp "$IN_CP_ORIG"
     in_ps_installed 'signature ok: v0.18.0, signed by oam-release-k1'
   else skip "no local HTTP stand-in (see the install.sh group)"; fi
 fi
