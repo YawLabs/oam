@@ -5749,10 +5749,12 @@ pub mod ops {
         }
     }
 
-    pub async fn read_text_file(path: String) -> OpOutcome {
-        match tokio::fs::read_to_string(&path).await {
+    /// `oam.readTextFile`: reads the OS path (`FsPath::os`, namespaced on
+    /// Windows as every fs op's is) and names the path shown strip-only.
+    pub async fn read_text_file(path: super::FsPath) -> OpOutcome {
+        match tokio::fs::read_to_string(path.os()).await {
             Ok(text) => OpOutcome::Text(text),
-            Err(e) => OpOutcome::Failed(format!("could not read {path}: {e}")),
+            Err(e) => OpOutcome::Failed(format!("could not read {}: {e}", path.shown())),
         }
     }
 
@@ -7312,7 +7314,9 @@ mod tests {
     #[test]
     fn read_text_file_fails_cleanly_on_missing_path() {
         let mut core = CoreRuntime::new().unwrap();
-        core.spawn_op(ops::read_text_file("/definitely/not/here.txt".into()));
+        core.spawn_op(ops::read_text_file(FsPath::new(
+            "/definitely/not/here.txt".into(),
+        )));
         let completion = core
             .recv_deadline(Some(Instant::now() + Duration::from_secs(5)))
             .expect("op completes");

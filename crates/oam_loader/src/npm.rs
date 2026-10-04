@@ -332,7 +332,7 @@ fn resolve_subpath_import(
     // is a bare specifier resolved as a regular import from the package root.
     if let Some(rel) = target.strip_prefix("./") {
         let path = pkg_dir.join(rel);
-        if !path.is_file() {
+        if !crate::pathutil::is_file(&path) {
             return Err(diag(
                 "OAM-MOD0002",
                 format!(
@@ -450,7 +450,7 @@ pub(crate) fn resolve_bare(
     let mut dir = referrer.parent().map(Path::to_path_buf);
     while let Some(current) = dir {
         let package_dir = current.join("node_modules").join(&package);
-        if package_dir.is_dir() {
+        if crate::pathutil::is_dir(&package_dir) {
             // Node stops at the first matching package directory: failures
             // inside it are real errors, not reasons to keep walking.
             return resolve_in_package(&package_dir, &package, &subpath, specifier, mode);
@@ -648,7 +648,7 @@ fn resolve_in_package(
                 },
             )?;
         let path = package_dir.join(target.trim_start_matches("./"));
-        if !path.is_file() {
+        if !crate::pathutil::is_file(&path) {
             return Err(diag(
                 "OAM-MOD0002",
                 format!(
@@ -728,15 +728,15 @@ fn resolve_in_package(
 
 /// Legacy probing (import side): exact, +.js, /index.js.
 fn probe_legacy(raw: &Path) -> Option<PathBuf> {
-    if raw.is_file() {
+    if crate::pathutil::is_file(raw) {
         return Some(raw.to_path_buf());
     }
     let with_js = PathBuf::from(format!("{}.js", raw.display()));
-    if with_js.is_file() {
+    if crate::pathutil::is_file(&with_js) {
         return Some(with_js);
     }
     let index = raw.join("index.js");
-    index.is_file().then_some(index)
+    crate::pathutil::is_file(&index).then_some(index)
 }
 
 /// Node's CJS LOAD_AS_FILE + LOAD_AS_DIRECTORY: exact, +.js, +.json, then
@@ -744,13 +744,13 @@ fn probe_legacy(raw: &Path) -> Option<PathBuf> {
 /// index.json). `.node` addons are N-API territory (later milestone).
 fn probe_require(raw: &Path) -> Option<PathBuf> {
     fn as_file(raw: &Path) -> Option<PathBuf> {
-        if raw.is_file() {
+        if crate::pathutil::is_file(raw) {
             return Some(raw.to_path_buf());
         }
         // Node's LOAD_AS_FILE order: .js, .json, .node.
         for ext in ["js", "json", "node"] {
             let candidate = PathBuf::from(format!("{}.{ext}", raw.display()));
-            if candidate.is_file() {
+            if crate::pathutil::is_file(&candidate) {
                 return Some(candidate);
             }
         }
@@ -759,7 +759,7 @@ fn probe_require(raw: &Path) -> Option<PathBuf> {
     fn as_index(dir: &Path) -> Option<PathBuf> {
         for index in ["index.js", "index.json"] {
             let candidate = dir.join(index);
-            if candidate.is_file() {
+            if crate::pathutil::is_file(&candidate) {
                 return Some(candidate);
             }
         }
@@ -769,7 +769,7 @@ fn probe_require(raw: &Path) -> Option<PathBuf> {
     if let Some(found) = as_file(raw) {
         return Some(found);
     }
-    if raw.is_dir() {
+    if crate::pathutil::is_dir(raw) {
         let main = cached_manifest(&raw.join("package.json")).and_then(|manifest| {
             manifest
                 .get("main")

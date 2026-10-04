@@ -27,6 +27,79 @@ pub(crate) fn finalize_resolved(path: PathBuf) -> PathBuf {
     }
 }
 
+/// The path node's module loader stats for the absolute candidate `path`:
+/// on Windows node's `internalModuleStat` and `fs` calls go through
+/// `ToNamespacedPath`, so `C:\app\mod.js.` is looked up as
+/// `\\?\C:\app\mod.js.` -- a name with its trailing dot -- and `C:\app\NUL`
+/// as a file named `NUL`, not the device. Without that prefix Win32 path
+/// normalisation finds `mod.js` and the NUL device, and
+/// `require("./mod.js.")` loaded `mod.js` where node fails
+/// `MODULE_NOT_FOUND`.
+///
+/// For a drive-absolute (`C:\...`) or UNC (`\\srv\sh\...`) path this is the
+/// path resolved lexically (`.` dropped, `..` popped, `/` read as `\`, a
+/// trailing separator dropped) and prefixed `\\?\` or `\\?\UNC\`, which is
+/// what `oam_core::fs_os_path` computes for an absolute path (a test in
+/// oam_engine, which depends on both crates, holds them to the same table).
+/// Every resolver candidate is absolute -- joined onto the referrer's
+/// directory -- so the cwd never enters. Any other path (already `\\?\` or
+/// `\\.\`, drive-relative, rooted) is returned as given, as is every path
+/// off Windows.
+pub fn fs_os_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut components = path.components().peekable();
+        let Some(Component::Prefix(prefix)) = components.next() else {
+            return std::borrow::Cow::Borrowed(path);
+        };
+        let mut out = match prefix.kind() {
+            Prefix::Disk(drive) => {
+                if components.peek() != Some(&Component::RootDir) {
+                    return std::borrow::Cow::Borrowed(path);
+                }
+                format!(r"\\?\{}:", char::from(drive))
+            }
+            // `//?/` and `//./` parse as a UNC prefix with server `?` or
+            // `.`, but they are the device namespaces: as given.
+            Prefix::UNC(server, _) if server == "?" || server == "." => {
+                return std::borrow::Cow::Borrowed(path);
+            }
+            Prefix::UNC(server, share) => format!(
+                r"\\?\UNC\{}\{}",
+                server.to_string_lossy(),
+                share.to_string_lossy()
+            ),
+            _ => return std::borrow::Cow::Borrowed(path),
+        };
+        let mut parts: Vec<std::borrow::Cow<'_, str>> = Vec::new();
+        for component in components {
+            match component {
+                Component::Normal(name) => parts.push(name.to_string_lossy()),
+                Component::ParentDir => {
+                    parts.pop();
+                }
+                Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            }
+        }
+        out.push('\\');
+        out.push_str(&parts.join("\\"));
+        std::borrow::Cow::Owned(PathBuf::from(out))
+    }
+    #[cfg(not(windows))]
+    std::borrow::Cow::Borrowed(path)
+}
+
+/// `Path::is_file` on the path node stats for `path` ([`fs_os_path`]).
+pub(crate) fn is_file(path: &Path) -> bool {
+    fs_os_path(path).is_file()
+}
+
+/// `Path::is_dir` on the path node stats for `path` ([`fs_os_path`]).
+pub(crate) fn is_dir(path: &Path) -> bool {
+    fs_os_path(path).is_dir()
+}
+
 pub(crate) fn is_virtual(path: &Path) -> bool {
     path.to_str()
         .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"))
@@ -141,6 +214,71 @@ fn percent_decode(s: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `path.toNamespacedPath` of each absolute input, measured on node
+    /// v22.22.2 (Windows).
+    #[cfg(windows)]
+    #[test]
+    fn os_path_of_an_absolute_path_is_node_namespaced_path() {
+        let rows: &[(&str, &str)] = &[
+            (r"C:\app\mod.js", r"\\?\C:\app\mod.js"),
+            (r"C:\app\mod.js.", r"\\?\C:\app\mod.js."),
+            (r"C:\app\mod.js ", r"\\?\C:\app\mod.js "),
+            (r"C:\app\NUL", r"\\?\C:\app\NUL"),
+            (r"C:\app\.\sub\..\x.js", r"\\?\C:\app\x.js"),
+            (r"C:/app/sub/", r"\\?\C:\app\sub"),
+            (r"C:\app\\sub", r"\\?\C:\app\sub"),
+            (r"C:\", r"\\?\C:\"),
+            (r"C:\..\x", r"\\?\C:\x"),
+            (r"\\srv\sh\x\..\y.", r"\\?\UNC\srv\sh\y."),
+            (r"\\srv\sh\", r"\\?\UNC\srv\sh\"),
+        ];
+        for (input, node) in rows {
+            assert_eq!(
+                fs_os_path(Path::new(input)).to_str(),
+                Some(*node),
+                "fs_os_path({input:?})"
+            );
+        }
+        // Already namespaced, device, drive-relative or rooted: as given.
+        for input in [
+            r"\\?\C:\x.",
+            r"\\.\C:\x",
+            "//?/C:/x.",
+            "//./C:/x",
+            r"C:x",
+            r"\x",
+            "x",
+        ] {
+            assert!(
+                matches!(fs_os_path(Path::new(input)), std::borrow::Cow::Borrowed(_)),
+                "{input:?}"
+            );
+        }
+    }
+
+    /// The point of the namespaced path: a trailing dot names no file.
+    #[cfg(windows)]
+    #[test]
+    fn a_trailing_dot_or_device_name_is_not_a_file() {
+        let dir = std::env::temp_dir().join(format!("oam-loader-ns-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("mod.js"), "").unwrap();
+        assert!(is_file(&dir.join("mod.js")));
+        assert!(!is_file(&dir.join("mod.js.")));
+        assert!(!is_file(&dir.join("mod.js ")));
+        assert!(!is_file(&dir.join("NUL")));
+        assert!(is_dir(&dir.join("sub")));
+        assert!(!is_dir(&dir.join("sub.")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn off_windows_the_os_path_is_the_path() {
+        let path = Path::new("/app/mod.js.");
+        assert!(matches!(fs_os_path(path), std::borrow::Cow::Borrowed(p) if p == path));
+    }
 
     #[test]
     fn rejects_encoded_separators() {
