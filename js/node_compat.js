@@ -13588,9 +13588,19 @@
       }
       return prop;
     };
+    // Windows hides a name that starts with '=' (`=C:` is drive C's cwd,
+    // updated by every chdir): node's enumerator skips it, so it is not in
+    // Object.keys(process.env) and a child handed process.env does not get
+    // it, yet a read of it goes to the LIVE environment (process.env['=C:']
+    // after process.chdir('C:\\Users') is 'C:\\Users'). natives.env() leaves
+    // these out, and natives.envHidden reads (or deletes) one live. node's
+    // setter ignores such a name, so an assignment stores nothing.
+    const envHidden = (prop) =>
+      envCaseFold && typeof prop === "string" && prop.charCodeAt(0) === 61; // '='
     const env = new Proxy(Object.create(null), {
       get(_, prop) {
         if (typeof prop === "symbol") return undefined;
+        if (envHidden(prop)) return natives.envHidden(prop, false);
         const store = ensureEnv();
         return store[envResolveKey(store, prop)];
       },
@@ -13623,9 +13633,11 @@
             "DEP0104",
           );
         }
+        const text = String(value);
+        if (envHidden(prop)) return true;
         const store = ensureEnv();
         const key = envResolveKey(store, prop);
-        store[key] = String(value);
+        store[key] = text;
         // TZ is not just a string: Node re-reads the zone on assignment so
         // subsequent Dates render in it. Without this the variable changed
         // and every Date kept the zone the process started in.
@@ -13634,6 +13646,7 @@
       },
       has(_, prop) {
         if (typeof prop === "symbol") return false;
+        if (envHidden(prop)) return natives.envHidden(prop, false) !== undefined;
         const store = ensureEnv();
         // `in` on process.env reports only real variables (node: an
         // inherited name like 'hasOwnProperty' is NOT in process.env).
@@ -13641,6 +13654,10 @@
       },
       deleteProperty(_, prop) {
         if (typeof prop === "symbol") return true;
+        if (envHidden(prop)) {
+          natives.envHidden(prop, true);
+          return true;
+        }
         const store = ensureEnv();
         const key = envResolveKey(store, prop);
         delete store[key];
@@ -13676,13 +13693,20 @@
         if (typeof prop === "symbol") {
           throw new TypeError("Cannot convert a Symbol value to a string");
         }
-        ensureEnv()[prop] = String(desc.value);
+        const text = String(desc.value);
+        if (envHidden(prop)) return true;
+        ensureEnv()[prop] = text;
         return true;
       },
       ownKeys() { return Reflect.ownKeys(ensureEnv()); },
       getOwnPropertyDescriptor(_, prop) {
-        const obj = ensureEnv();
         if (typeof prop === "symbol") return undefined;
+        if (envHidden(prop)) {
+          const live = natives.envHidden(prop, false);
+          if (live === undefined) return undefined;
+          return { value: live, writable: true, enumerable: true, configurable: true };
+        }
+        const obj = ensureEnv();
         // OWN properties only: `prop in obj` walks the prototype chain, so an
         // inherited name reported as own -- node asserts
         // Object.hasOwn(process.env, 'hasOwnProperty') === false while

@@ -124,6 +124,23 @@ pub fn stdio_pipe_all() -> StdioSpec {
 /// registers the child with the signal-driver reactor. Callers on the V8
 /// thread must hold a `Handle::enter()` guard; see `CoreRuntime::enter`.
 ///
+/// The hidden Windows variables of this process -- names that start with '='
+/// (`=C:` holds drive C's cwd) -- which a child given an explicit `env` must
+/// not inherit. node builds the child's block from that `env` alone, and its
+/// process.env never enumerates these names, so a node child has no `=C:`
+/// unless the caller's object named one; oam lays the given pairs over its own
+/// environment, so it drops these from the base. Empty on POSIX, where no name
+/// starts with '='.
+pub fn hidden_env_names() -> Vec<std::ffi::OsString> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    std::env::vars_os()
+        .map(|(name, _)| name)
+        .filter(|name| name.as_encoded_bytes().first() == Some(&b'='))
+        .collect()
+}
+
 /// `detached` is node's option: on Windows it adds libuv's
 /// `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` and keeps the child OUT of
 /// the kill-on-close job (job_win.rs) every other child is placed in. It is
@@ -217,6 +234,9 @@ pub fn spawn_child(
         cmd.current_dir(cwd);
     }
     if let Some(env) = env {
+        for name in hidden_env_names() {
+            cmd.env_remove(name);
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -532,6 +552,9 @@ pub fn spawn_sync(
         cmd.current_dir(cwd);
     }
     if let Some(env) = env {
+        for name in hidden_env_names() {
+            cmd.env_remove(name);
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }

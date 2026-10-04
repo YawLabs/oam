@@ -136,6 +136,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     }
     bind!(
         ("env", op_env),
+        ("envHidden", op_env_hidden),
         ("argv", op_argv),
         ("cwd", op_cwd),
         ("chdir", op_chdir),
@@ -951,10 +952,16 @@ fn op_env(
     //
     // Collected before the object is built because get_permissions borrows the
     // scope immutably while v8::String::new needs it mutably.
+    //
+    // A Windows name that starts with '=' (the hidden per-drive cwds `=C:`,
+    // and `=ExitCode`, `=::`) is left out: node's enumerator skips them
+    // (node_env_var.cc), so Object.keys(process.env) never lists one and a
+    // child handed process.env does not get one. A read of such a name goes
+    // to the live process environment instead -- see op_env_hidden.
     let allowed: Vec<(String, String)> = {
         let perms = get_permissions(scope);
         std::env::vars()
-            .filter(|(name, _)| perms.check_env(name).is_ok())
+            .filter(|(name, _)| !is_hidden_env_name(name) && perms.check_env(name).is_ok())
             .collect()
     };
     let env = v8::Object::new(scope);
@@ -968,6 +975,48 @@ fn op_env(
         env.set(scope, key.into(), value.into());
     }
     rv.set(env.into());
+}
+
+/// A name Windows keeps out of sight in the environment block: one that starts
+/// with '=' (`=C:` holds drive C's cwd). There is no such thing on POSIX, where
+/// '=' cannot start a name.
+fn is_hidden_env_name(name: &str) -> bool {
+    cfg!(windows) && name.starts_with('=')
+}
+
+/// `__oam.node.envHidden(name, remove)`: the live value of a hidden Windows
+/// variable (`=C:`), or undefined; with `remove`, the variable is removed first
+/// and undefined returned.
+///
+/// node reads every process.env name through GetEnvironmentVariableW at the
+/// time of the read, so `process.env['=C:']` after `process.chdir('C:\\Users')`
+/// reads `C:\Users` (libuv's uv_chdir updates `=C:`); the snapshot op_env
+/// takes cannot, so the process.env proxy routes these names here. Removal is
+/// node's `delete process.env['=C:']` (uv_os_unsetenv). An assignment is not
+/// offered: node's setter ignores a name that starts with '=' (measured on
+/// v22.22.2: the value reads back unchanged). Any other name is refused, so
+/// this is no general environment writer; a name the env permission denies
+/// reads as undefined and is left in place, as op_env leaves it out.
+fn op_env_hidden(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(name) = arg_string(scope, &args, 0) else {
+        return;
+    };
+    if !is_hidden_env_name(&name) || get_permissions(scope).check_env(&name).is_err() {
+        return;
+    }
+    if args.get(1).is_true() {
+        set_process_env(&name, None);
+        return;
+    }
+    if let Some(value) = std::env::var_os(&name)
+        && let Some(value) = v8::String::new(scope, &value.to_string_lossy())
+    {
+        rv.set(value.into());
+    }
 }
 
 fn op_argv(
