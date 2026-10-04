@@ -13567,8 +13567,72 @@
     // environment variable into a JS object (50-200 vars on a typical dev
     // machine). For programs that never touch process.env, this is pure
     // waste. A Proxy defers the copy until first property access.
+    //
+    // A worker thread's process.env is what its Worker's `env` option made
+    // it (natives.env() returns that, see op_env): a copy of the creator's
+    // process.env, the given object, or -- for SHARE_ENV -- a store shared
+    // with the creator. A shared store lives in the native layer (so every
+    // thread sharing it sees each other's writes): reads re-fetch it only
+    // when its version has moved, writes go through to it.
     let envCache = null;
-    const ensureEnv = () => (envCache ??= natives.env());
+    // natives.envWorker(): null on the main thread; on a worker thread
+    // `{ shared, base }` -- the shared store's id (SHARE_ENV) and the values
+    // of libuv's Windows additions its creator's environment had.
+    let envWorkerInfo;
+    const workerEnvInfo = () => {
+      if (envWorkerInfo === undefined) envWorkerInfo = natives.envWorker() ?? null;
+      return envWorkerInfo;
+    };
+    let envShared;
+    let envSharedVersion = -1;
+    const ensureEnv = () => {
+      if (envShared === undefined && envCache === null) {
+        const info = workerEnvInfo();
+        if (info && info.shared !== undefined) envShared = info.shared;
+      }
+      if (envShared === undefined) return (envCache ??= natives.env());
+      const version = natives.envSharedVersion(envShared);
+      if (envCache === null || version !== envSharedVersion) {
+        const snapshot = JSON.parse(natives.envSharedRead(envShared));
+        const store = {};
+        for (const [key, value] of snapshot.pairs) store[key] = value;
+        envCache = store;
+        envSharedVersion = snapshot.version;
+      }
+      return envCache;
+    };
+    // Store `text` under `key` (undefined deletes it), in a shared store too.
+    const envWrite = (store, key, text) => {
+      if (text === undefined) delete store[key];
+      else store[key] = text;
+      if (envShared === undefined) return;
+      const before = envSharedVersion;
+      const after = natives.envSharedSet(envShared, key, text);
+      // Another thread's write in between means this copy is stale.
+      envSharedVersion = after === before + 1 ? after : -1;
+    };
+    // SHARE_ENV (worker_threads): from now on this thread's process.env is a
+    // store it shares with the new worker. Returns the store's id.
+    registry.shareProcessEnv = () => {
+      if (envShared === undefined) {
+        const store = ensureEnv();
+        envShared = natives.envShareNew(
+          JSON.stringify(
+            Object.keys(store).map((key) => [key.toWellFormed(), store[key].toWellFormed()]),
+          ),
+        );
+        envSharedVersion = -1;
+      }
+      return envShared;
+    };
+    // Where libuv's Windows additions to a child's environment are read
+    // from: node's libuv reads the process's real environment, which is the
+    // main thread's process.env. A worker has the values its creator had
+    // when it was made (docs/node-divergences.md).
+    registry.childEnvBase = () => {
+      const info = workerEnvInfo();
+      return info ? info.base : env;
+    };
     // process.env is a string-coercing view: assigning a non-string coerces
     // via String() (NOT delete -- `process.env.X = undefined` reads back as
     // the literal string 'undefined'); symbol keys are rejected the way Node
@@ -13579,9 +13643,20 @@
     // node reads process.env.CASETEST after setting process.env.CaseTest).
     // The stored key keeps the ORIGINAL casing -- only lookups fold -- so
     // Object.keys() still reports the name as it was written.
-    const envCaseFold = natives.platform === "win32";
+    // That is the main thread's (the real environment). A worker's own store
+    // is case-sensitive, as node's is (a map); one it shares through
+    // SHARE_ENV folds as its creator's does (natives.envWorker's `fold`).
+    let envFold;
+    const envCaseFold = () => {
+      if (envFold === undefined) {
+        const info = workerEnvInfo();
+        envFold = natives.platform === "win32" && (info ? info.fold === true : true);
+      }
+      return envFold;
+    };
+    registry.processEnvFolds = envCaseFold;
     const envResolveKey = (store, prop) => {
-      if (!envCaseFold || prop in store) return prop;
+      if (!envCaseFold() || prop in store) return prop;
       const wanted = String(prop).toLowerCase();
       for (const k of Object.keys(store)) {
         if (k.toLowerCase() === wanted) return k;
@@ -13594,9 +13669,14 @@
     // it, yet a read of it goes to the LIVE environment (process.env['=C:']
     // after process.chdir('C:\\Users') is 'C:\\Users'). natives.env() leaves
     // these out, and natives.envHidden reads (or deletes) one live. node's
-    // setter ignores such a name, so an assignment stores nothing.
+    // setter ignores such a name, so an assignment stores nothing. On the
+    // main thread only: a worker's store, shared or not, has no such names
+    // (node: a worker's process.env['=C:'] is undefined).
     const envHidden = (prop) =>
-      envCaseFold && typeof prop === "string" && prop.charCodeAt(0) === 61; // '='
+      typeof prop === "string" &&
+      prop.charCodeAt(0) === 61 && // '='
+      natives.platform === "win32" &&
+      !workerEnvInfo();
     const env = new Proxy(Object.create(null), {
       get(_, prop) {
         if (typeof prop === "symbol") return undefined;
@@ -13637,7 +13717,7 @@
         if (envHidden(prop)) return true;
         const store = ensureEnv();
         const key = envResolveKey(store, prop);
-        store[key] = text;
+        envWrite(store, key, text);
         // TZ is not just a string: Node re-reads the zone on assignment so
         // subsequent Dates render in it. Without this the variable changed
         // and every Date kept the zone the process started in.
@@ -13660,7 +13740,7 @@
         }
         const store = ensureEnv();
         const key = envResolveKey(store, prop);
-        delete store[key];
+        envWrite(store, key, undefined);
         // Deleting TZ returns to the host zone -- same refresh as setting it.
         if (key === "TZ") natives.setTimeZone(null);
         return true;
@@ -13695,7 +13775,7 @@
         }
         const text = String(desc.value);
         if (envHidden(prop)) return true;
-        ensureEnv()[prop] = text;
+        envWrite(ensureEnv(), prop, text);
         return true;
       },
       ownKeys() { return Reflect.ownKeys(ensureEnv()); },
@@ -31942,6 +32022,91 @@
     return { Session, open, close, url, waitForDebugger, console: globalThis.console || {} };
   };
 
+  // libuv's required_vars (src/win/process.c): on Windows, make_program_env
+  // adds each of these to a child's environment when the block it was given
+  // has no variable of that name (compared case-insensitively), taking the
+  // value from the parent's environment and skipping a name the parent does
+  // not have either. Sorted, upper case, as libuv spells them.
+  const WINDOWS_REQUIRED_ENV = [
+    "HOMEDRIVE", "HOMEPATH", "LOGONSERVER", "PATH", "SYSTEMDRIVE", "SYSTEMROOT",
+    "TEMP", "USERDOMAIN", "USERNAME", "USERPROFILE", "WINDIR",
+  ];
+
+  /** The complete environment a child is started with: the caller's `env`
+   *  or, without one, a copy of process.env as it stands now (assignments
+   *  and deletions included), never the environment oam itself started
+   *  with. The native spawn ops start the child with exactly these pairs.
+   *  Node's normalizeSpawnArguments: NODE_V8_COVERAGE is carried over unless
+   *  the caller's object names it; every enumerable key counts, inherited
+   *  ones included (`for...in`); an undefined value is left out and any
+   *  other is stringified; and on Windows, where names are
+   *  case-insensitive, the first of a set of names differing only in case
+   *  (in default sort order) wins. Then libuv's Windows additions above.
+   *  The parent environment libuv reads those from is the main thread's
+   *  process.env here (registry.childEnvBase), which is the same set node's
+   *  live environment is, less what the --allow-env grant leaves out
+   *  (docs/node-divergences.md). `extra` is
+   *  oam's own channel variables, laid over the result. */
+  function childProcessEnv(platform, optionsEnv, extra) {
+    const procEnv = globalThis.process.env;
+    const source = optionsEnv || { ...procEnv };
+    // node's copyProcessEnvToEnv writes this into the caller's object; it is
+    // read through here instead, so that object is left as it was.
+    const coverage =
+      procEnv.NODE_V8_COVERAGE &&
+      !(optionsEnv && Object.prototype.hasOwnProperty.call(optionsEnv, "NODE_V8_COVERAGE"))
+        ? procEnv.NODE_V8_COVERAGE
+        : undefined;
+    let keys = [];
+    for (const key in source) keys.push(key);
+    if (coverage !== undefined && !keys.includes("NODE_V8_COVERAGE")) keys.push("NODE_V8_COVERAGE");
+    const valueOf = (key) =>
+      key === "NODE_V8_COVERAGE" && coverage !== undefined ? coverage : source[key];
+    const windows = platform === "win32";
+    if (windows) {
+      const seen = new Set();
+      keys = keys.sort().filter((key) => {
+        const upper = key.toUpperCase();
+        if (seen.has(upper)) return false;
+        seen.add(upper);
+        return true;
+      });
+    }
+    const out = Object.create(null);
+    const present = new Set();
+    for (const key of keys) {
+      const value = valueOf(key);
+      if (value === undefined) continue;
+      // node's validateArgumentNullCheck, on the name and on a STRING value
+      // only: either one holding a NUL is refused before anything starts.
+      if (key.includes("\u0000")) throw envNulError(key, key);
+      if (typeof value === "string" && value.includes("\u0000")) throw envNulError(key, value);
+      // Any other value is stringified, and the pair reaches the child as a
+      // C string, which ends at the first NUL (node: `{toString() { return
+      // 'a\0b' }}` gives the child 'a').
+      const text = `${value}`;
+      const nul = text.indexOf("\u0000");
+      out[key] = nul === -1 ? text : text.slice(0, nul);
+      present.add(key.toUpperCase());
+    }
+    if (windows) {
+      const base = registry.childEnvBase();
+      for (const name of WINDOWS_REQUIRED_ENV) {
+        if (present.has(name)) continue;
+        const value = base[name];
+        if (value !== undefined) out[name] = value;
+      }
+    }
+    if (extra) Object.assign(out, extra);
+    return out;
+  }
+
+  function envNulError(key, value) {
+    return codes.ERR_INVALID_ARG_VALUE(
+      `options.env['${key}']`, value, "must be a string without null bytes",
+    );
+  }
+
   // ------------------------------------------------------ child_process
   registry.factories.child_process = (natives) => {
     const EventEmitter = registry.get("events");
@@ -31997,6 +32162,10 @@
         options: opts,
       };
     }
+
+    // The environment a child is started with; see childProcessEnv.
+    const childEnv = (optionsEnv, extra) =>
+      childProcessEnv(natives.platform, optionsEnv, extra);
 
     /** The program and argv node's error for a failed spawn names -- its
      *  `options.file` and `options.args` (normalizeSpawnArguments): the SHELL
@@ -32165,13 +32334,10 @@
       const opts = norm.options;
       const nativeOpts = {
         cwd: opts.cwd || undefined,
-        // No explicit env: hand the child the LIVE process.env view, not the
-        // pristine OS environment. node's process.env writes through to the
-        // real environment, so a runtime `process.env.X = v` is inherited by
-        // children; oam's proxy mutates a JS-side cache, so pass that.
-        env: opts.env || globalThis.process.env,
+        // Exactly the child's environment, which replaces oam's own as node's
+        // envPairs do: see childEnv.
+        env: childEnv(opts.env),
         shell: !!opts.shell,
-        clearEnv: false,
         // node's spawnSync honors `detached` too (spawn_sync.cc sets
         // UV_PROCESS_DETACHED), so a detached sync child is kept out of the
         // Windows kill-on-close job like an async one.
@@ -32419,12 +32585,9 @@
       const codes = stdioArr.map((e, i) => stdioCode(e, i));
       const nativeOpts = {
         cwd: opts.cwd || undefined,
-        // No explicit env: hand the child the LIVE process.env view, not the
-        // pristine OS environment. node's process.env writes through to the
-        // real environment, so a runtime `process.env.X = v` is inherited by
-        // children; oam's proxy mutates a JS-side cache, so pass that.
-        env: opts.env || globalThis.process.env,
-        clearEnv: false,
+        // Exactly the child's environment, which replaces oam's own as node's
+        // envPairs do: see childEnv.
+        env: childEnv(opts.env),
         detached: !!opts.detached,
       };
 
@@ -32436,11 +32599,7 @@
       // returns (node parity, and what the CDP callers rely on).
       const launch = (extraEnv) => {
       if (extraEnv) {
-        nativeOpts.env = Object.assign(
-          {},
-          opts.env || globalThis.process.env,
-          extraEnv,
-        );
+        nativeOpts.env = Object.assign(Object.create(null), nativeOpts.env, extraEnv);
       }
       let info;
       try {
@@ -32789,13 +32948,10 @@
       const nativeOpts = {
         stdio: modes,
         cwd: opts.cwd || undefined,
-        // No explicit env: hand the child the LIVE process.env view, not the
-        // pristine OS environment. node's process.env writes through to the
-        // real environment, so a runtime `process.env.X = v` is inherited by
-        // children; oam's proxy mutates a JS-side cache, so pass that.
-        env: opts.env || globalThis.process.env,
+        // Exactly the child's environment, which replaces oam's own as node's
+        // envPairs do: see childEnv.
+        env: childEnv(opts.env),
         shell: !!opts.shell,
-        clearEnv: false,
         // Windows: a non-detached child joins the kill-on-close job and dies
         // with this process, as under node; a detached one is left out.
         detached: !!opts.detached,
@@ -32834,11 +32990,7 @@
       // tick later (fork() has the same property today).
       const launch = (extraEnv) => {
       if (extraEnv) {
-        nativeOpts.env = Object.assign(
-          {},
-          opts.env || globalThis.process.env,
-          extraEnv,
-        );
+        nativeOpts.env = Object.assign(Object.create(null), nativeOpts.env, extraEnv);
       }
       let info;
       try {
@@ -33209,24 +33361,24 @@
         }
       };
 
+      // Taken now, as node's fork() takes it, not when the channel is bound.
+      const baseEnv = childEnv(opts.env);
       const net = registry.get("net");
       const ipcServer = net.createServer();
 
       ipcServer.listen(0, "127.0.0.1", () => {
         const ipcPort = ipcServer.address().port;
 
-        const childEnv = Object.assign({},
-          opts.env || globalThis.process.env,
-          { OAM_FORK_IPC_PORT: String(ipcPort) },
-        );
+        const forkEnv = Object.assign(Object.create(null), baseEnv, {
+          OAM_FORK_IPC_PORT: String(ipcPort),
+        });
 
         const spawnArgs = execArgv.concat(["run", String(modulePath), "--no-check", "--"]).concat(args);
         const nativeOpts = {
           stdio: modes,
           cwd: opts.cwd || undefined,
-          env: childEnv,
+          env: forkEnv,
           shell: false,
-          clearEnv: false,
           // node's fork() forwards its options to spawn(), detached included.
           detached: !!opts.detached,
         };
@@ -33445,7 +33597,12 @@
         if (!scriptPath) {
           throw new Error("cluster.fork: no entry script (process.argv[1] is empty)");
         }
-        const envObj = env || {};
+        // node's createWorkerProcess hands fork() `{...process.env, ...env}`,
+        // and that is the worker's whole environment (childProcessEnv).
+        const envObj = childProcessEnv(natives.platform, {
+          ...globalThis.process.env,
+          ...env,
+        });
         const worker = new Worker(id, -1, 0);
         this.workers[id] = worker;
         natives.clusterFork(scriptPath, String(id), envObj).then(
@@ -39508,6 +39665,50 @@
     }
     const natives = globalThis.__oam.node;
     const pathMod = registry.get("path");
+    /** The environment a new worker starts with, from the Worker's `env`
+     *  option, as node's Worker constructor reads it: undefined or null, a
+     *  copy of this thread's process.env as it is now; SHARE_ENV, this
+     *  thread's own store, shared (both see each other's writes); an object,
+     *  its own enumerable string-keyed entries, each value stringified. A
+     *  worker's own store is case-sensitive; a shared one folds case as its
+     *  creator's does. `base` is what libuv's Windows additions to a child's
+     *  environment are read from (registry.childEnvBase). */
+    function workerEnvOption(option) {
+      // node keeps the pairs as UTF-8, so a lone surrogate becomes U+FFFD.
+      let env;
+      if (option === SHARE_ENV) {
+        env = { shared: registry.shareProcessEnv(), fold: registry.processEnvFolds() };
+      } else if (option == null) {
+        const own = globalThis.process.env;
+        env = {
+          pairs: Object.keys(own).map((key) => [key.toWellFormed(), own[key].toWellFormed()]),
+          fold: false,
+        };
+      } else if (typeof option === "object") {
+        env = {
+          pairs: Object.entries(option).map(([key, value]) => [
+            key.toWellFormed(),
+            `${value}`.toWellFormed(),
+          ]),
+          fold: false,
+        };
+      } else {
+        throw codes.ERR_INVALID_ARG_TYPE(
+          "options.env",
+          ["object", "undefined", "null", "worker_threads.SHARE_ENV"],
+          option,
+        );
+      }
+      const from = registry.childEnvBase();
+      env.base = [];
+      if (natives.platform === "win32") {
+        for (const name of WINDOWS_REQUIRED_ENV) {
+          const value = from[name];
+          if (value !== undefined) env.base.push([name, value]);
+        }
+      }
+      return env;
+    }
     class Worker extends EventEmitter {
       constructor(filename, opts = {}) {
         super();
@@ -39528,8 +39729,7 @@
         // Store worker name (Node >=12.11 option)
         this.name = opts.name || "";
 
-        // Note SHARE_ENV usage (workers share process env by default in oam)
-        this._shareEnv = opts.env === SHARE_ENV;
+        const env = workerEnvOption(opts.env);
 
         // Node always exposes worker.stdout/.stderr; the option controls
         // whether the worker's output is ROUTED here instead of going
@@ -39549,6 +39749,7 @@
             execArgv: Array.isArray(opts.execArgv)
               ? opts.execArgv.map(String)
               : (process.execArgv || []).map(String),
+            env,
           }),
         );
         this._workerId = result.workerId;
@@ -40045,13 +40246,18 @@
     // Cannot connect during installRuntimeGlobals because CoreRuntime
     // (tokio, TCP ops) is not installed until execute_module/reset_run_slots.
     // Instead, store the port and connect lazily on first process.on('message').
-    const _ipcPort = globalThis.process.env.OAM_FORK_IPC_PORT;
+    // Taken from the real environment (natives.forkIpcPort), which also
+    // removes it, as node deletes NODE_CHANNEL_FD: process.env does not show
+    // it, so this process's own children and workers do not inherit it, and
+    // the --allow-env grant does not decide whether the channel is there.
+    const _ipcPort = natives.forkIpcPort();
     if (_ipcPort) {
       globalThis.process.connected = true;
       let _ipcSock = null;
       let _ipcReady = false;
       const _ipcPending = [];
       let _ipcConnecting = false;
+      let _ipcDisconnectPending = false;
 
       function _ipcEnsureConnect() {
         if (_ipcConnecting || _ipcReady) return;
@@ -40068,6 +40274,10 @@
             _ipcSock.write(p.line, "utf8", p.callback);
           }
           _ipcPending.length = 0;
+          if (_ipcDisconnectPending) {
+            _ipcClose();
+            return;
+          }
 
           _ipcSock.on("data", (chunk) => {
             _ipcBuf += chunk;
@@ -40116,16 +40326,26 @@
         return true;
       };
 
+      // Close the channel once every write handed to it has gone out.
+      function _ipcClose() {
+        var sock = _ipcSock;
+        _ipcSock = null;
+        _ipcReady = false;
+        sock._chain.then(function() {
+          sock.destroy();
+          globalThis.process.emit("disconnect");
+        });
+      }
+
       globalThis.process.disconnect = function disconnect() {
         globalThis.process.connected = false;
-        if (_ipcSock) {
-          var sock = _ipcSock;
-          _ipcSock = null;
-          _ipcReady = false;
-          sock._chain.then(function() {
-            sock.destroy();
-            globalThis.process.emit("disconnect");
-          });
+        if (_ipcSock && !_ipcReady) {
+          // Still connecting: what send() queued goes out first, as node
+          // delivers a message sent just before disconnect(); the connect
+          // callback flushes the queue, then closes.
+          _ipcDisconnectPending = true;
+        } else if (_ipcSock) {
+          _ipcClose();
         } else {
           globalThis.process.emit("disconnect");
         }

@@ -137,6 +137,12 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     bind!(
         ("env", op_env),
         ("envHidden", op_env_hidden),
+        ("forkIpcPort", op_fork_ipc_port),
+        ("envWorker", op_env_worker),
+        ("envShareNew", op_env_share_new),
+        ("envSharedVersion", op_env_shared_version),
+        ("envSharedRead", op_env_shared_read),
+        ("envSharedSet", op_env_shared_set),
         ("argv", op_argv),
         ("cwd", op_cwd),
         ("chdir", op_chdir),
@@ -958,12 +964,21 @@ fn op_env(
     // (node_env_var.cc), so Object.keys(process.env) never lists one and a
     // child handed process.env does not get one. A read of such a name goes
     // to the live process environment instead -- see op_env_hidden.
-    let allowed: Vec<(String, String)> = {
-        let perms = get_permissions(scope);
-        std::env::vars()
-            .filter(|(name, _)| !is_hidden_env_name(name) && perms.check_env(name).is_ok())
-            .collect()
-    };
+    //
+    // A worker thread's environment is the one its Worker's `env` option
+    // gave it (crate::worker::WorkerEnv), not the process environment, and
+    // it is not filtered again: what it holds came from the creator's
+    // process.env, already filtered, or from an object the script built
+    // itself. A shared store (SHARE_ENV) is read by the JS layer directly.
+    let allowed: Vec<(String, String)> =
+        if let Some(env) = scope.get_slot::<crate::worker::WorkerEnv>() {
+            env.pairs.clone()
+        } else {
+            let perms = get_permissions(scope);
+            std::env::vars()
+                .filter(|(name, _)| !is_hidden_env_name(name) && perms.check_env(name).is_ok())
+                .collect()
+        };
     let env = v8::Object::new(scope);
     for (name, value) in allowed {
         let Some(key) = v8::String::new(scope, &name) else {
@@ -1017,6 +1032,143 @@ fn op_env_hidden(
     {
         rv.set(value.into());
     }
+}
+
+/// The variable child_process.fork() names its IPC channel's port in.
+const FORK_IPC_PORT_VAR: &str = "OAM_FORK_IPC_PORT";
+
+/// `__oam.node.forkIpcPort()`: the port of the IPC channel this process was
+/// forked with, or `undefined`. It is taken out of the environment as it is
+/// read, as node's setupChildProcessIpcChannel deletes NODE_CHANNEL_FD: a
+/// forked child's process.env does not hold it, so neither do its own
+/// children nor its workers, which would otherwise connect to the same
+/// parent. Read from the real environment, not through process.env: the
+/// channel is oam's own plumbing, so the --allow-env grant (which decides
+/// what the script may read) does not decide whether a forked child has
+/// its channel.
+fn op_fork_ipc_port(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(port) = std::env::var_os(FORK_IPC_PORT_VAR) else {
+        return;
+    };
+    set_process_env(FORK_IPC_PORT_VAR, None);
+    if let Some(port) = v8::String::new(scope, &port.to_string_lossy()) {
+        rv.set(port.into());
+    }
+}
+
+/// `__oam.node.envWorker()`: `null` on the main thread; on a worker thread
+/// `{ shared, fold, base }` from its [`crate::worker::WorkerEnv`] -- the
+/// SHARE_ENV store's id (absent for a worker with its own store), whether
+/// names fold case, and the values of libuv's Windows additions its creator
+/// had, as an object.
+fn op_env_worker(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some((shared, fold, base)) = scope
+        .get_slot::<crate::worker::WorkerEnv>()
+        .map(|env| (env.shared, env.fold, env.base.clone()))
+    else {
+        rv.set_null();
+        return;
+    };
+    let info = v8::Object::new(scope);
+    if let Some(id) = shared {
+        let key = v8::String::new(scope, "shared").unwrap();
+        let value = v8::Number::new(scope, id as f64);
+        info.set(scope, key.into(), value.into());
+    }
+    let key = v8::String::new(scope, "fold").unwrap();
+    let value = v8::Boolean::new(scope, fold);
+    info.set(scope, key.into(), value.into());
+    let base_obj = v8::Object::new(scope);
+    for (name, value) in base {
+        let (Some(name), Some(value)) = (
+            v8::String::new(scope, &name),
+            v8::String::new(scope, &value),
+        ) else {
+            continue;
+        };
+        base_obj.set(scope, name.into(), value.into());
+    }
+    let key = v8::String::new(scope, "base").unwrap();
+    info.set(scope, key.into(), base_obj.into());
+    rv.set(info.into());
+}
+
+/// The id argument of the envShared* ops.
+fn shared_env_id(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+) -> u64 {
+    args.get(0).number_value(scope).unwrap_or(0.0) as u64
+}
+
+/// `__oam.node.envShareNew(json)`: a new SHARE_ENV store holding the
+/// `[[name, value], ...]` pairs in `json`; returns its id.
+fn op_env_share_new(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let pairs: Vec<(String, String)> = arg_string(scope, &args, 0)
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    let id = crate::worker::shared_env_new(pairs);
+    rv.set(v8::Number::new(scope, id as f64).into());
+}
+
+/// `__oam.node.envSharedVersion(id)`: the store's version (-1 for an
+/// unknown id, which never matches a version read).
+fn op_env_shared_version(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = shared_env_id(scope, &args);
+    let version = crate::worker::shared_env_version(id).map_or(-1.0, |v| v as f64);
+    rv.set(v8::Number::new(scope, version).into());
+}
+
+/// `__oam.node.envSharedRead(id)`: `{"version": n, "pairs": [[name, value],
+/// ...]}` as JSON, read together.
+fn op_env_shared_read(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = shared_env_id(scope, &args);
+    let (version, pairs) = crate::worker::shared_env_read(id).unwrap_or_default();
+    let json = serde_json::json!({ "version": version, "pairs": pairs }).to_string();
+    if let Some(json) = v8::String::new(scope, &json) {
+        rv.set(json.into());
+    }
+}
+
+/// `__oam.node.envSharedSet(id, name, value)`: set `name` in the store, or
+/// remove it when `value` is undefined; returns the new version (-1 for an
+/// unknown id).
+fn op_env_shared_set(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = shared_env_id(scope, &args);
+    let Some(name) = arg_string(scope, &args, 1) else {
+        return;
+    };
+    let value = if args.get(2).is_undefined() {
+        None
+    } else {
+        arg_string(scope, &args, 2)
+    };
+    let version = crate::worker::shared_env_set(id, &name, value).map_or(-1.0, |v| v as f64);
+    rv.set(v8::Number::new(scope, version).into());
 }
 
 fn op_argv(
@@ -8013,10 +8165,29 @@ fn op_worker_new(
     };
 
     // arg 2: JSON options from the JS Worker constructor
-    // ({ stdout, stderr, execArgv }).
-    let options = arg_string(scope, &args, 2)
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-        .unwrap_or(serde_json::Value::Null);
+    // ({ stdout, stderr, execArgv, env }).
+    let options = match arg_string(scope, &args, 2) {
+        None => serde_json::Value::Null,
+        Some(json) => match serde_json::from_str::<serde_json::Value>(&json) {
+            Ok(options) => options,
+            Err(_) => {
+                throw_type_error(scope, "workerNew: malformed options");
+                return;
+            }
+        },
+    };
+    // An `env` the worker cannot be given is refused, never replaced by the
+    // process environment.
+    let env = match options.get("env") {
+        None => None,
+        Some(value) => match crate::worker::WorkerEnv::from_json(value) {
+            Some(env) => Some(env),
+            None => {
+                throw_type_error(scope, "workerNew: malformed env");
+                return;
+            }
+        },
+    };
     let flag = |key: &str| options.get(key).and_then(serde_json::Value::as_bool) == Some(true);
     let worker_options = crate::worker::WorkerOptions {
         pipe_stdout: flag("stdout"),
@@ -8034,6 +8205,7 @@ fn op_worker_new(
                     .collect()
             })
             .unwrap_or_default(),
+        env,
     };
 
     // Tested on the namespaced path the loader then opens (`FsPath`), so a
@@ -8225,6 +8397,38 @@ fn opt_detached(scope: &mut v8::PinScope<'_, '_>, opts: Option<v8::Local<'_, v8:
     .is_some_and(|v| v.is_true())
 }
 
+/// The `env` spawn option: the child's whole environment, as the JS layer
+/// built it (child_process's childEnv -- the caller's env or process.env, with
+/// node's and libuv's adjustments). Absent only for a caller that wants this
+/// process's environment inherited.
+fn opt_env_pairs(
+    scope: &mut v8::PinScope<'_, '_>,
+    opts: Option<v8::Local<'_, v8::Object>>,
+) -> Option<Vec<(String, String)>> {
+    opts.and_then(|o| {
+        let key = v8::String::new(scope, "env")?;
+        let val = o.get(scope, key.into())?;
+        if val.is_null_or_undefined() {
+            return None;
+        }
+        let env_obj = v8::Local::<v8::Object>::try_from(val).ok()?;
+        let names = env_obj.get_own_property_names(scope, Default::default())?;
+        let mut pairs = Vec::new();
+        for i in 0..names.length() {
+            if let Some(name) = names.get_index(scope, i)
+                && let Some(val) = env_obj.get(scope, name)
+                && let (Some(k), Some(v)) = (
+                    name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                    val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                )
+            {
+                pairs.push((k, v));
+            }
+        }
+        Some(pairs)
+    })
+}
+
 fn op_spawn_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -8274,12 +8478,6 @@ fn op_spawn_sync(
             o.get(scope, key.into())
         })
         .is_some_and(|v| v.is_true());
-    let clear_env = opts
-        .and_then(|o| {
-            let key = v8::String::new(scope, "clearEnv")?;
-            o.get(scope, key.into())
-        })
-        .is_some_and(|v| v.is_true());
     let timeout_ms = opts
         .and_then(|o| {
             let key = v8::String::new(scope, "timeout")?;
@@ -8313,28 +8511,7 @@ fn op_spawn_sync(
         Some(text.into_bytes())
     });
 
-    let env_pairs = opts.and_then(|o| {
-        let key = v8::String::new(scope, "env")?;
-        let val = o.get(scope, key.into())?;
-        if val.is_null_or_undefined() {
-            return None;
-        }
-        let env_obj = v8::Local::<v8::Object>::try_from(val).ok()?;
-        let names = env_obj.get_own_property_names(scope, Default::default())?;
-        let mut pairs = Vec::new();
-        for i in 0..names.length() {
-            if let Some(name) = names.get_index(scope, i)
-                && let Some(val) = env_obj.get(scope, name)
-                && let (Some(k), Some(v)) = (
-                    name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                    val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                )
-            {
-                pairs.push((k, v));
-            }
-        }
-        Some(pairs)
-    });
+    let env_pairs = opt_env_pairs(scope, opts);
 
     let stdio = arg_stdio_spec(scope, opts, &core_runtime!(scope).sync_files());
 
@@ -8345,7 +8522,6 @@ fn op_spawn_sync(
         env_pairs.as_deref(),
         input.as_deref(),
         shell,
-        clear_env,
         timeout_ms,
         max_buffer,
         stdio,
@@ -8456,35 +8632,8 @@ fn op_spawn_async(
             o.get(scope, key.into())
         })
         .is_some_and(|v| v.is_true());
-    let clear_env = opts
-        .and_then(|o| {
-            let key = v8::String::new(scope, "clearEnv")?;
-            o.get(scope, key.into())
-        })
-        .is_some_and(|v| v.is_true());
 
-    let env_pairs: Option<Vec<(String, String)>> = opts.and_then(|o| {
-        let key = v8::String::new(scope, "env")?;
-        let val = o.get(scope, key.into())?;
-        if val.is_null_or_undefined() {
-            return None;
-        }
-        let env_obj = v8::Local::<v8::Object>::try_from(val).ok()?;
-        let names = env_obj.get_own_property_names(scope, Default::default())?;
-        let mut pairs = Vec::new();
-        for i in 0..names.length() {
-            if let Some(name) = names.get_index(scope, i)
-                && let Some(val) = env_obj.get(scope, name)
-                && let (Some(k), Some(v)) = (
-                    name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                    val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                )
-            {
-                pairs.push((k, v));
-            }
-        }
-        Some(pairs)
-    });
+    let env_pairs = opt_env_pairs(scope, opts);
 
     let stdio = arg_stdio_spec(scope, opts, &core_runtime!(scope).sync_files());
     let detached = opt_detached(scope, opts);
@@ -8500,9 +8649,7 @@ fn op_spawn_async(
     let spawned = {
         let core = core_runtime!(scope);
         let _guard = core.enter();
-        oam_core::child::spawn_child(
-            command, child_args, cwd, env_pairs, shell, clear_env, stdio, detached,
-        )
+        oam_core::child::spawn_child(command, child_args, cwd, env_pairs, shell, stdio, detached)
     };
     match spawned {
         Ok((child, pid)) => {
@@ -8766,34 +8913,7 @@ fn op_spawn_extra(
         }
         val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
     });
-    let clear_env = opts
-        .and_then(|o| {
-            let key = v8::String::new(scope, "clearEnv")?;
-            o.get(scope, key.into())
-        })
-        .is_some_and(|v| v.is_true());
-    let env_pairs: Option<Vec<(String, String)>> = opts.and_then(|o| {
-        let key = v8::String::new(scope, "env")?;
-        let val = o.get(scope, key.into())?;
-        if val.is_null_or_undefined() {
-            return None;
-        }
-        let env_obj = v8::Local::<v8::Object>::try_from(val).ok()?;
-        let names = env_obj.get_own_property_names(scope, Default::default())?;
-        let mut pairs = Vec::new();
-        for i in 0..names.length() {
-            if let Some(name) = names.get_index(scope, i)
-                && let Some(val) = env_obj.get(scope, name)
-                && let (Some(k), Some(v)) = (
-                    name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                    val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                )
-            {
-                pairs.push((k, v));
-            }
-        }
-        Some(pairs)
-    });
+    let env_pairs = opt_env_pairs(scope, opts);
 
     // stdio codes (arg 3): one number per fd. 0-3 are dispositions; anything
     // at or above DESCRIPTOR_CODE_BASE is `base + <descriptor number>`, the
@@ -8863,7 +8983,6 @@ fn op_spawn_extra(
         &child_args,
         cwd.as_deref(),
         env_pairs.as_deref(),
-        clear_env,
         &stdio,
         detached,
     ) {

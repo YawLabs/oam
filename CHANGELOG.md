@@ -103,6 +103,18 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Changed
 
+- **An explicit `env` replaces the child's environment, as node's does.** `spawn`,
+  `spawnSync`, `exec`, `execSync`, `execFile`, `execFileSync` and `fork` start the child with
+  exactly the given pairs; on Windows, as libuv does, `HOMEDRIVE`, `HOMEPATH`, `LOGONSERVER`,
+  `PATH`, `SYSTEMDRIVE`, `SYSTEMROOT`, `TEMP`, `USERDOMAIN`, `USERNAME`, `USERPROFILE` and
+  `WINDIR` are added from the parent when the given env has no variable of that name in any
+  case. Without `env` the child gets `process.env` as it stands at the call, so a variable
+  deleted from `process.env` is no longer inherited, and `cluster.fork(env)` gives the worker
+  `{ ...process.env, ...env }`. Previously the pairs were laid over the environment oam
+  started with. The pairs are built as node builds them: inherited keys count, an `undefined`
+  value is left out, of names differing only in case on Windows the first in sort order is
+  kept, and `NODE_V8_COVERAGE` is carried over. Under `--permission`, a child's environment
+  holds only what `--allow-env` shows in `process.env` (docs/node-divergences.md).
 - **`net.createServer({ allowHalfOpen: true })` hands the option to the sockets it accepts**,
   as node's does, and such a socket whose `'end'` listener writes and ends emits that write's
   callback and `'error'` before `'close'`. (#219)
@@ -129,6 +141,27 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Fixed
 
+- **A `worker_threads` Worker's `env` option is applied, as node's is.** Without it (or
+  with `null` or `process.env`) the worker starts with a copy of its creator's `process.env`
+  as it stands, assignments and deletions included; with an object, exactly that object's
+  own entries, each stringified; with `SHARE_ENV`, its creator's environment, shared both
+  ways. Any other value throws `ERR_INVALID_ARG_TYPE`. A worker's own copy is
+  case-sensitive, as node's is. Previously every worker started from the environment oam
+  started with, whatever the option said.
+- **A `fork()`ed child's messages sent just before `process.disconnect()` reach the parent**,
+  as node's do; when the channel was still opening, disconnecting dropped them.
+- **A `fork()`ed child has its IPC channel under any `--allow-env`**, and takes the channel's
+  variable out of its environment as node's child does with `NODE_CHANNEL_FD`. It read the
+  port through `process.env`, so under a list `--allow-env` that did not name it
+  `process.send` was undefined; and the variable stayed in `process.env`, so the child's own
+  children inherited it.
+- **A NUL in a child's `env` throws `ERR_INVALID_ARG_VALUE` synchronously**, as node's
+  does: a name, or a string value, holding one is refused by every `child_process` entry
+  point before anything starts ("The property 'options.env['FOO']' must be a string without
+  null bytes"); it reached the spawn and failed `EINVAL`. A value that is not a string is
+  stringified and cut at its first NUL, as the C string node hands libuv is.
+- **`process.execve(file)` defaults `args` to `[]` and `env` to `process.env`**, as node's
+  does (`process.execve.length` is 1); it threw `ERR_INVALID_ARG_TYPE` for the missing `args`.
 - **A zone-id host or `lookup` answer is matched against `--allow-net` as an address and a
   zone, never as text,** by `fetch`, `http.request`, `net.connect` and `tls.connect` alike.
   The zone is all of the host's text after `%`, as node's `net.isIP` reads it

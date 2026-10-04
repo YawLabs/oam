@@ -312,6 +312,26 @@ Differences from Node's model:
   hook to throw from, and an exception would leak the names of variables the script is
   not permitted to see. Worth knowing: under a too-narrow `--allow-env` a program fails
   later, wherever it uses the missing value, rather than at the point of denial.
+- **A child's environment is built from `process.env`, so `--allow-env` shapes it too.**
+  As in Node, a spawn without an `env` option hands the child `process.env`, and an
+  explicit `env` is the child's whole environment, passed as given (`child_process` needs
+  `--allow-child-process` in both runtimes). Under a list `--allow-env`, `process.env` holds
+  only the granted variables, so a child started without `env` gets only those. The
+  variables libuv adds to a Windows child whose environment lacks them (`PATH`,
+  `SYSTEMROOT`, `TEMP` and the rest of its list) are taken from `process.env` as well,
+  where Node takes them from the live environment: a variable the grant leaves out is not
+  added. So under `--allow-env=API_KEY` a Windows child gets no `PATH` or `SYSTEMROOT`
+  unless the grant names them or the script puts them into `env` itself, and a program
+  that needs them (Winsock fails to start without `SYSTEMROOT`) has to be granted them.
+  Node has no environment grant, so it has no counterpart to this; without `--permission`,
+  or with bare `--allow-env`, the two runtimes build the same environment.
+  A `worker_threads` Worker follows the same rule: without `env` it starts with a copy of
+  its creator's `process.env` (so only granted variables), with an object `env` it has
+  exactly that object's entries, passed as given, and with `SHARE_ENV` it shares its
+  creator's `process.env`. One difference without `--permission` too: in a worker, the
+  values libuv's additions to a Windows child are read from are the ones the main thread's
+  `process.env` had when the worker was made; Node reads the live environment at the
+  spawn, so a change the main thread makes later reaches that child in Node only.
 - **`process.permission` is not implemented.** Node exposes `process.permission.has()`
   for runtime introspection; in oam it is `undefined` with or without the flag.
 

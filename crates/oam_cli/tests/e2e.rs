@@ -32089,6 +32089,185 @@ fn process_env_respects_the_env_permission() {
     );
 }
 
+/// A child's environment is built from process.env, so what `--allow-env`
+/// leaves out of process.env is not in a child's environment either.
+///
+/// Without an `env` option a child gets process.env as it stands (node's
+/// `options.env || process.env`), never the environment oam started with; an
+/// explicit `env` is the child's whole environment, passed as given. Both
+/// held before only in name: the pairs were laid over oam's own start-up
+/// environment, so a child saw every variable, granted or not.
+///
+/// The children run without `--permission`, so they see all they were given.
+#[test]
+fn a_child_gets_only_the_variables_process_env_shows() {
+    let reporter = write_temp(
+        "child_env_perm_reporter.cjs",
+        "const v = (k) => process.env[k] ?? 'ABSENT';\n\
+         process.stdout.write(['CE_GRANTED', 'CE_HIDDEN', 'CE_GIVEN']\n\
+         \x20 .map((k) => k + '=' + v(k)).join(' '));\n",
+    );
+    let script = write_temp(
+        "child_env_perm.mjs",
+        "import { execFileSync, spawn, spawnSync } from 'node:child_process';\n\
+         const reporter = process.argv[2];\n\
+         console.log('parent: CE_HIDDEN=' + (process.env.CE_HIDDEN ?? 'ABSENT'));\n\
+         const sync = (opts) => spawnSync(process.execPath, [reporter], { encoding: 'utf8', ...opts });\n\
+         console.log('spawnSync default: ' + sync({}).stdout);\n\
+         console.log('spawnSync explicit: ' + sync({ env: { CE_GIVEN: 'given' } }).stdout);\n\
+         console.log('execFileSync default: ' + execFileSync(process.execPath, [reporter], { encoding: 'utf8' }));\n\
+         const out = await new Promise((resolve) => {\n\
+         \x20 const cp = spawn(process.execPath, [reporter]);\n\
+         \x20 let s = '';\n\
+         \x20 cp.stdout.on('data', (d) => (s += d));\n\
+         \x20 cp.on('close', () => resolve(s));\n\
+         });\n\
+         console.log('spawn default: ' + out);\n",
+    );
+    let out = oam_with_env(
+        &[
+            "--permission",
+            "--allow-env=CE_GRANTED",
+            "--allow-child-process",
+            "--allow-fs-read=*",
+            script.to_str().unwrap(),
+            reporter.to_str().unwrap(),
+        ],
+        &[("CE_GRANTED", "granted"), ("CE_HIDDEN", "hidden")],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("parent: CE_HIDDEN=ABSENT"),
+        "the grant hides CE_HIDDEN from the parent: {stdout}"
+    );
+    for entry in ["spawnSync default", "execFileSync default", "spawn default"] {
+        assert!(
+            stdout.contains(&format!(
+                "{entry}: CE_GRANTED=granted CE_HIDDEN=ABSENT CE_GIVEN=ABSENT"
+            )),
+            "{entry}: a child gets process.env, which has no CE_HIDDEN: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("spawnSync explicit: CE_GRANTED=ABSENT CE_HIDDEN=ABSENT CE_GIVEN=given"),
+        "an explicit env is the child's whole environment: {stdout}"
+    );
+}
+
+/// A forked child has its IPC channel whatever `--allow-env` grants.
+///
+/// fork() names the channel's port in an environment variable of oam's own;
+/// the child read it through process.env, so under a list `--allow-env` that
+/// did not name it the child had no channel and `process.send` was undefined.
+/// The child now takes it from the real environment and removes it, as
+/// node's child deletes NODE_CHANNEL_FD: process.env does not show it, and
+/// the child's own child does not inherit it.
+#[test]
+fn a_forked_child_has_its_channel_under_a_list_allow_env() {
+    let child = write_temp(
+        "fork_ipc_perm_child.cjs",
+        "const { spawnSync } = require('node:child_process');\n\
+         const ipc = (env) => Object.keys(env).filter((k) => /IPC|CHANNEL/.test(k)).join(',') || 'none';\n\
+         const grand = spawnSync(process.execPath, ['-e', \"process.stdout.write(Object.keys(process.env).filter((k) => /IPC|CHANNEL/.test(k)).join(',') || 'none')\"], { encoding: 'utf8' });\n\
+         process.send({ send: typeof process.send, own: ipc(process.env), grand: grand.stdout },\n\
+         \x20 () => process.disconnect());\n",
+    );
+    let script = write_temp(
+        "fork_ipc_perm.mjs",
+        "import { fork } from 'node:child_process';\n\
+         const cp = fork(process.argv[2]);\n\
+         cp.on('message', (m) => console.log('message ' + JSON.stringify(m)));\n\
+         cp.on('exit', (code) => console.log('child exit ' + code));\n",
+    );
+    let out = oam_with_env(
+        &[
+            "--permission",
+            "--allow-env=CE_GRANTED,SYSTEMROOT,PATH,TEMP,WINDIR,SYSTEMDRIVE,USERPROFILE",
+            "--allow-child-process",
+            "--allow-net",
+            "--allow-fs-read=*",
+            script.to_str().unwrap(),
+            child.to_str().unwrap(),
+        ],
+        &[("CE_GRANTED", "granted")],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains(r#"message {"send":"function","own":"none","grand":"none"}"#),
+        "the child has its channel, and neither it nor its child sees the port: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("child exit 0"),
+        "{stdout}\nstderr: {stderr}"
+    );
+}
+
+/// A worker's process.env, and so its children's, is what its `env` option
+/// makes it, and under a list `--allow-env` holds no variable the grant hides.
+///
+/// Without `env` a worker starts with a copy of its creator's process.env as
+/// it stands (a deletion included); an object `env` is the worker's whole
+/// environment, passed as given; SHARE_ENV shares the creator's. A worker
+/// used to start from oam's start-up environment whatever the option said.
+#[test]
+fn a_worker_env_follows_its_option_and_the_env_grant() {
+    let script = write_temp(
+        "worker_env_perm.mjs",
+        "import { Worker, SHARE_ENV, isMainThread, parentPort, workerData } from 'node:worker_threads';\n\
+         import { spawnSync } from 'node:child_process';\n\
+         import { fileURLToPath } from 'node:url';\n\
+         const ce = (env) => Object.keys(env).filter((k) => k.startsWith('CE_')).sort().join(',') || 'none';\n\
+         if (!isMainThread) {\n\
+         \x20 const r = spawnSync(process.execPath, ['-e', \"process.stdout.write(Object.keys(process.env).filter((k) => k.startsWith('CE_')).sort().join(',') || 'none')\"], { encoding: 'utf8' });\n\
+         \x20 parentPort.postMessage(workerData + ': worker ' + ce(process.env) + ' child ' + r.stdout);\n\
+         } else {\n\
+         \x20 delete process.env.CE_GRANTED;\n\
+         \x20 process.env.CE_SET = 'set';\n\
+         \x20 const run = (mode, env) => new Promise((resolve) => {\n\
+         \x20   const w = new Worker(fileURLToPath(import.meta.url), { workerData: mode, env });\n\
+         \x20   w.on('message', (m) => console.log(m));\n\
+         \x20   w.on('error', (e) => console.log(mode + ' error ' + e.message));\n\
+         \x20   w.on('exit', resolve);\n\
+         \x20 });\n\
+         \x20 await run('default', undefined);\n\
+         \x20 await run('object', { CE_X: 'x' });\n\
+         \x20 await run('share', SHARE_ENV);\n\
+         }\n",
+    );
+    let out = oam_with_env(
+        &[
+            "--permission",
+            "--allow-env=CE_GRANTED,CE_KEPT",
+            "--allow-worker",
+            "--allow-child-process",
+            "--allow-fs-read=*",
+            script.to_str().unwrap(),
+        ],
+        &[
+            ("CE_GRANTED", "granted"),
+            ("CE_KEPT", "kept"),
+            ("CE_HIDDEN", "hidden"),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    for line in [
+        "default: worker CE_KEPT,CE_SET child CE_KEPT,CE_SET",
+        "object: worker CE_X child CE_X",
+        "share: worker CE_KEPT,CE_SET child CE_KEPT,CE_SET",
+    ] {
+        assert!(
+            stdout.contains(line),
+            "expected `{line}`: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
 /// `--allow-net` must scope by host, not merely toggle networking on.
 #[test]
 fn allow_net_list_is_scoped_to_the_listed_host() {
