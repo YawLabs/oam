@@ -294,6 +294,9 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   below the directory, named relative to it (or as Dirents with their `parentPath`), in node's
   order -- breadth first for the sync and callback forms, the last directory found first for
   the promise one. They used to list the top level only.
+- **`fs.watch` of a path that is not there throws** `ENOENT: no such file or directory, watch
+  '<path>'` at the call, with `path` and `filename` set, as node's does, instead of handing
+  back a watcher that never fires.
 
 ### Performance
 

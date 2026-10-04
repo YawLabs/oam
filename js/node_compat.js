@@ -12222,7 +12222,21 @@
       try {
         prevMtime = natives.fsStatSync(filePath, false).mtimeMs;
       } catch (e) {
-        // file may not exist yet
+        // node starts its watcher at the call, and a path that cannot be
+        // watched -- one that is not there -- throws then, as libuv's error
+        // for syscall `watch`, naming the path as given and carrying it as
+        // `filename` too (measured on v22.22.2: `ENOENT: no such file or
+        // directory, watch 'nope'`). Anything else (a refused permission)
+        // is thrown as it is.
+        if (!e || typeof e.errno !== "number" || typeof e.code !== "string") throw e;
+        const reason = /^[A-Z0-9_]+: (.*), stat /.exec(String(e.message));
+        const err = new Error(`${e.code}: ${reason ? reason[1] : e.code}, watch '${filePath}'`);
+        err.errno = e.errno;
+        err.syscall = "watch";
+        err.code = e.code;
+        err.path = filePath;
+        err.filename = filePath;
+        throw err;
       }
       var pollInterval = opts.interval || 100;
       var poll = setInterval(function () {

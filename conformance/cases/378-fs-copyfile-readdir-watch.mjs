@@ -113,5 +113,23 @@ await settle("promises.readdir recursive missing", () => fs.promises.readdir("no
 await settle("readdir recursive missing", () => viaCallback(fs.readdir, "nope", { recursive: true }));
 process.chdir(D);
 
+// fs.watch of a path that is not there throws at the call, as libuv's
+// `watch` error naming the path as given. oam used to hand back a watcher
+// that never fired.
+const watchError = (e) => [describe(e), Object.keys(e).join(","), scrub(e.filename)].join(" | ");
+for (const p of ["nope", path.join(D, "nope"), path.join("f.txt", "sub")]) {
+  try {
+    fs.watch(p).close();
+    console.log("watch " + JSON.stringify(scrub(p)) + ": watcher");
+  } catch (e) {
+    console.log("watch " + JSON.stringify(scrub(p)) + ": " + watchError(e));
+  }
+}
+{
+  const w = fs.watch("f.txt");
+  w.close();
+  console.log("watch f.txt: watcher");
+}
+
 process.chdir(start);
 fs.rmSync(made, { recursive: true, force: true });
