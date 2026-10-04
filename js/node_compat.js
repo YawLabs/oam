@@ -11119,11 +11119,17 @@
   // fs.promises.cp's is node's SystemError ERR_FS_EISDIR naming the path as
   // given; cpSync's, from its C++, a plain Error with `code` alone naming
   // the path as it reaches the C++ -- on Windows namespaced and with a
-  // trailing separator (`\\?\C:\d\`). Off Windows the path is
-  // rendered as given to the C++, not measured.
+  // trailing separator (`\\?\C:\d\`), added only where the namespaced path
+  // does not already end in one, as a drive or share root's does
+  // (`\\?\UNC\srv\sh\`). Off Windows the path is rendered as given to the
+  // C++, not measured.
   function cpDirWithoutRecursive(src, sync) {
     if (sync) {
-      const shown = process.platform === "win32" ? globalThis.__oam.node.fsOsPathOf(src) + "\\" : src;
+      let shown = src;
+      if (process.platform === "win32") {
+        shown = globalThis.__oam.node.fsOsPathOf(src);
+        if (!shown.endsWith("\\") && !shown.endsWith("/")) shown += "\\";
+      }
       return makeNodeError("ERR_FS_EISDIR", "Recursive option not enabled, cannot copy a directory: " + shown);
     }
     return new SystemError("ERR_FS_EISDIR", "Path is a directory", {

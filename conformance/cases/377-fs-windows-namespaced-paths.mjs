@@ -109,6 +109,13 @@ if (process.platform !== "win32") {
     show("openSync root a " + label, () => fs.openSync(r, "a"));
     show("loadEnvFile root " + label, () => process.loadEnvFile(r));
   }
+  // cpSync of a share root without `recursive` names its namespaced path,
+  // which already ends in a separator: one, not two.
+  if (fs.existsSync(share)) {
+    for (const r of [share, share + "\\"]) {
+      show("cpSync share root " + JSON.stringify(r.replace(share, "<SHARE>")), () => fs.cpSync(r, "cp-share-dest"));
+    }
+  }
 
   // A patched process.cwd: node's binding resolves against the real one.
   process.cwd = () => "C:\\patched";
