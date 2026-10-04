@@ -454,16 +454,14 @@
   /// The path node names in an error oam builds itself, for a path as the
   /// caller passed it: on Windows node's binding reports the RESOLVED path
   /// (`ToNamespacedPath`), so `rmdirSync("file.txt")` fails `rmdir
-  /// 'C:\cwd\file.txt'`. The native ops do the same (oam_core::fs_error_path);
-  /// this is its twin for the errors made in JS. An empty path, and one that
-  /// resolves to two characters or fewer, stay as passed.
+  /// 'C:\cwd\file.txt'`. It is the native ops' own rule
+  /// (oam_core::fs_error_path, via `fsShownPathOf`), so it resolves against
+  /// the process's real cwd as node's binding does, not a patched
+  /// `process.cwd`. An empty path, and one that resolves to two characters
+  /// or fewer, stay as passed.
   function fsErrorPath(path) {
     if (globalThis.__oam.node.platform !== "win32" || path === "") return path;
-    const resolved = registry.get("path").win32.resolve(path);
-    if (resolved.length <= 2) return path;
-    if (resolved.startsWith("\\\\?\\UNC\\")) return "\\\\" + resolved.slice(8);
-    if (resolved.startsWith("\\\\?\\")) return resolved.slice(4);
-    return resolved;
+    return globalThis.__oam.node.fsShownPathOf(path);
   }
 
   /// Buffer/Uint8Array path -> string. Split out so `toPath` reads as a
@@ -11098,7 +11096,8 @@
     const kept = srcIsDir ? "non-directory" : "directory";
     const copied = srcIsDir ? "directory" : "non-directory";
     if (sync) {
-      const ns = registry.get("path").toNamespacedPath;
+      // The namespaced path node's binding is handed, real cwd and all.
+      const ns = globalThis.__oam.node.fsOsPathOf;
       return makeNodeError(code, `Cannot overwrite ${kept} ${ns(dest)} with ${copied} ${ns(src)}`);
     }
     // EISDIR is 21 and ENOTDIR 20 in every platform's os.constants.errno.
@@ -11119,8 +11118,7 @@
   // rendered as given to the C++, not measured.
   function cpDirWithoutRecursive(src, sync) {
     if (sync) {
-      const pathModule = registry.get("path");
-      const shown = process.platform === "win32" ? pathModule.toNamespacedPath(src) + pathModule.sep : src;
+      const shown = process.platform === "win32" ? globalThis.__oam.node.fsOsPathOf(src) + "\\" : src;
       return makeNodeError("ERR_FS_EISDIR", "Recursive option not enabled, cannot copy a directory: " + shown);
     }
     return new SystemError("ERR_FS_EISDIR", "Path is a directory", {
@@ -14567,7 +14565,7 @@
             throw makeSystemError("ENOENT", "open", given === null ? ".env" : fsErrorPath(given));
           }
           if (e && typeof e.code === "string" && typeof e.syscall === "string") {
-            var opened = given === null ? ".env" : registry.get("path").toNamespacedPath(given);
+            var opened = given === null ? ".env" : globalThis.__oam.node.fsOsPathOf(given);
             var bad = new TypeError("Contents of '" + opened + "' should be a valid string.");
             bad.code = "ERR_INVALID_ARG_TYPE";
             throw bad;

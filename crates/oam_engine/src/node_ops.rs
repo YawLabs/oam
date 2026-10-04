@@ -227,6 +227,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsReadFileUtf8Sync", op_fs_read_file_utf8_sync),
         ("fsWriteFileSync", op_fs_write_file_sync),
         ("fsExistsSync", op_fs_exists_sync),
+        ("fsOsPathOf", op_fs_os_path_of),
+        ("fsShownPathOf", op_fs_shown_path_of),
         ("fsStatSync", op_fs_stat_sync),
         ("fsStatfsSync", op_fs_statfs_sync),
         ("fsReaddirSync", op_fs_readdir_sync),
@@ -6260,6 +6262,36 @@ fn op_fs_write_file_sync(
     }
 }
 
+/// `fsOsPathOf(path)`: the path node's fs binding hands the OS for `path`
+/// (`oam_core::fs_os_path`: on Windows resolved against the process's real
+/// cwd and `\\?\`-prefixed, elsewhere `path`). For the messages node renders
+/// with the namespaced path, prefix and all (cpSync's, loadEnvFile's).
+fn op_fs_os_path_of(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let path = arg_string(scope, &args, 0).unwrap_or_default();
+    if let Some(value) = v8::String::new(scope, &oam_core::fs_os_path(&path)) {
+        rv.set(value.into());
+    }
+}
+
+/// `fsShownPathOf(path)`: the path node's fs errors name for `path`
+/// (`oam_core::fs_error_path`: the OS path with the prefix taken off). The
+/// errors built in JS use it, so they name the real cwd as the native ops'
+/// errors do, never a patched `process.cwd`.
+fn op_fs_shown_path_of(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let path = arg_string(scope, &args, 0).unwrap_or_default();
+    if let Some(value) = v8::String::new(scope, &oam_core::fs_error_path(&path)) {
+        rv.set(value.into());
+    }
+}
+
 fn op_fs_exists_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -10368,6 +10400,14 @@ mod permission_audit {
             ("op_fs_fchown_sync", "fd from a checked open()"),
             ("op_fs_futimes", "fd from a checked open()"),
             ("op_fs_futimes_sync", "fd from a checked open()"),
+            (
+                "op_fs_os_path_of",
+                "computes a path string from the cwd; opens nothing",
+            ),
+            (
+                "op_fs_shown_path_of",
+                "computes a path string from the cwd; opens nothing",
+            ),
             (
                 "op_spawn_kill",
                 "signals a child already permitted at spawn",
