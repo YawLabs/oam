@@ -941,6 +941,9 @@ impl Permissions {
                     // would open (see `check_read_path`).
                     "read" | "write" => perm.allows_fs_path(&oam_core::fs_os_path(t)),
                     "net" => perm.allows_net(t),
+                    // The child, worker and addon gates match a path prefix
+                    // (`check_child`, `check_worker`, `check_ffi`).
+                    "child" | "worker" | "ffi" => perm.allows_path(t),
                     _ => perm.allows_exact(t),
                 };
                 if granted { "granted" } else { "denied" }
@@ -2531,6 +2534,55 @@ mod tests {
             let gate = p.check_read_path(&os(&target)).is_ok();
             let expected = if gate { "granted" } else { "denied" };
             assert_eq!(p.query_state("read", Some(&target)), expected, "{target:?}");
+        }
+    }
+
+    /// A scoped query of the child, worker or addon list answers as that
+    /// list's gate does (`allows_path`: a prefix anchored at a separator,
+    /// read through the resolve a grant entry gets), not by string equality:
+    /// under a grant of `<cwd>/tools`, `query('child', '<cwd>/tools/x.exe')`
+    /// said "denied" while the spawn of it passed `check_child`.
+    #[test]
+    fn query_state_for_the_path_lists_agrees_with_their_gates() {
+        let base = std::path::PathBuf::from(cwd()).join("tools");
+        let plain = base.to_string_lossy().into_owned();
+        let list = || BoolOrList::List(vec![plain.clone()]);
+        let p = Permissions::from_opts(Some(PermissionsOptions {
+            child: list(),
+            worker: list(),
+            ffi: list(),
+            ..opts_read_only(vec![])
+        }));
+        let inside = base.join("x.exe").to_string_lossy().into_owned();
+        let targets = [
+            plain.clone(),
+            inside.clone(),
+            "tools/x.exe".to_string(),
+            format!("{plain}-other"),
+            base.with_file_name("elsewhere")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        type Gate = fn(&Permissions, &str) -> Result<(), PermissionDenial>;
+        let gates: [(&str, Gate); 3] = [
+            ("child", Permissions::check_child),
+            ("worker", Permissions::check_worker),
+            ("ffi", Permissions::check_ffi),
+        ];
+        for (name, gate) in gates {
+            for target in &targets {
+                let expected = if gate(&p, target).is_ok() {
+                    "granted"
+                } else {
+                    "denied"
+                };
+                assert_eq!(
+                    p.query_state(name, Some(target)),
+                    expected,
+                    "{name} {target}"
+                );
+            }
+            assert_eq!(p.query_state(name, Some(&inside)), "granted", "{name}");
         }
     }
 

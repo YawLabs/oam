@@ -53,7 +53,9 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   grant of `\` or `/` is the cwd drive's root; and a `\\.\` device path, a `\\?\` path in
   neither drive nor UNC form, or a path judged as given that is spelt with the NT prefix
   `\??\` (the `mkdtemp` template, a pipe path, the child, worker and addon lists) matches no
-  grant. `oam.readTextFile` is checked the same way. (#275)
+  grant. `oam.readTextFile` is checked the same way. A scoped `permissions.query` of a
+  child-process, worker or addon list grant matches the path as that permission's check does
+  (a path under a granted directory is granted), where it used to compare the strings. (#275)
 
 ### Added
 
