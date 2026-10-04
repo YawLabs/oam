@@ -475,6 +475,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tlsCanonicalizeIp", op_tls_canonicalize_ip),
         // oam:permissions query surface
         ("permissionsQuery", op_permissions_query),
+        ("permissionEnabled", op_permission_enabled),
         // worker_threads
         ("workerNew", op_worker_new),
         ("workerPostMessage", op_worker_post_message),
@@ -8145,6 +8146,18 @@ fn op_permissions_query(
     let state_val = v8::String::new(scope, state).unwrap();
     result.set(scope, state_key.into(), state_val.into());
     rv.set(result.into());
+}
+
+/// permissionEnabled() -> boolean: whether the permission model is on,
+/// node's `permission.isEnabled()` (child_process reads it to hand a child
+/// the permission flags in NODE_OPTIONS, as node's does).
+fn op_permission_enabled(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let enabled = get_permissions(scope).enabled;
+    rv.set(v8::Boolean::new(scope, enabled).into());
 }
 
 // -------------------------------------------------------------- worker_threads

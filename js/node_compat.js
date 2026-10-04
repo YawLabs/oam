@@ -32046,10 +32046,13 @@
    *  process.env here (registry.childEnvBase), which is the same set node's
    *  live environment is, less what the --allow-env grant leaves out
    *  (docs/node-divergences.md). `extra` is
-   *  oam's own channel variables, laid over the result. */
-  function childProcessEnv(platform, optionsEnv, extra) {
+   *  oam's own channel variables, laid over the result. `spawnArgs` is the
+   *  child's argv when the permission model is on (permissionNodeOptions),
+   *  else null. */
+  function childProcessEnv(platform, optionsEnv, extra, spawnArgs) {
     const procEnv = globalThis.process.env;
     const source = optionsEnv || { ...procEnv };
+    const nodeOptions = spawnArgs ? permissionNodeOptions(source, spawnArgs) : undefined;
     // node's copyProcessEnvToEnv writes this into the caller's object; it is
     // read through here instead, so that object is left as it was.
     const coverage =
@@ -32060,8 +32063,13 @@
     let keys = [];
     for (const key in source) keys.push(key);
     if (coverage !== undefined && !keys.includes("NODE_V8_COVERAGE")) keys.push("NODE_V8_COVERAGE");
+    if (nodeOptions !== undefined && !keys.includes("NODE_OPTIONS")) keys.push("NODE_OPTIONS");
     const valueOf = (key) =>
-      key === "NODE_V8_COVERAGE" && coverage !== undefined ? coverage : source[key];
+      key === "NODE_V8_COVERAGE" && coverage !== undefined
+        ? coverage
+        : key === "NODE_OPTIONS" && nodeOptions !== undefined
+          ? nodeOptions
+          : source[key];
     const windows = platform === "win32";
     if (windows) {
       const seen = new Set();
@@ -32099,6 +32107,37 @@
     }
     if (extra) Object.assign(out, extra);
     return out;
+  }
+
+  // The permission model's flags: node's permission.availableFlags() plus
+  // --permission, and oam's --allow-net / --allow-env, which are flags of
+  // the same model here.
+  const PERMISSION_FLAGS_TO_COPY = [
+    "--allow-fs-read", "--allow-fs-write", "--allow-addons", "--allow-child-process",
+    "--allow-wasi", "--allow-worker", "--allow-net", "--allow-env", "--permission",
+  ];
+
+  /** The NODE_OPTIONS a child started under the permission model gets, or
+   *  undefined to leave the variable as `env` has it. Node's
+   *  copyPermissionModelFlagsToEnv (lib/child_process.js; measured on
+   *  v22.22.2): unless the child's argv holds `--permission` or the
+   *  variable already names it, every process.execArgv entry starting with
+   *  a permission flag is appended, space-separated and as spelled, to the
+   *  value `env` has (the caller's env or process.env alike), for any
+   *  program, node or not. Node writes it into the caller's object; it is
+   *  read through here instead, so that object is left as it was. */
+  function permissionNodeOptions(env, spawnArgs) {
+    const current = env.NODE_OPTIONS;
+    if (spawnArgs.includes("--permission") || (current && `${current}`.indexOf("--permission") !== -1)) {
+      return undefined;
+    }
+    let value = current;
+    for (const arg of globalThis.process.execArgv || []) {
+      for (const flag of PERMISSION_FLAGS_TO_COPY) {
+        if (`${arg}`.startsWith(flag)) value = `${value ? value + " " + arg : arg}`;
+      }
+    }
+    return value === current ? undefined : value;
   }
 
   function envNulError(key, value) {
@@ -32164,8 +32203,22 @@
     }
 
     // The environment a child is started with; see childProcessEnv.
-    const childEnv = (optionsEnv, extra) =>
-      childProcessEnv(natives.platform, optionsEnv, extra);
+    // `argv` is what the child is started with -- the program, then its
+    // arguments, or the shell's own argv under `shell` -- which node checks
+    // for `--permission` before handing it the permission flags.
+    const childEnv = (optionsEnv, argv, extra) =>
+      childProcessEnv(
+        natives.platform,
+        optionsEnv,
+        extra,
+        natives.permissionEnabled() ? argv : null,
+      );
+
+    /** The child's argv as node's normalizeSpawnArguments has it when it
+     *  copies the permission flags: under `shell` the command and its
+     *  arguments are one string, so no entry is `--permission`. */
+    const spawnArgv = (norm) =>
+      norm.options.shell ? spawnErrorTarget(norm).args : [norm.command, ...norm.args];
 
     /** The program and argv node's error for a failed spawn names -- its
      *  `options.file` and `options.args` (normalizeSpawnArguments): the SHELL
@@ -32336,7 +32389,7 @@
         cwd: opts.cwd || undefined,
         // Exactly the child's environment, which replaces oam's own as node's
         // envPairs do: see childEnv.
-        env: childEnv(opts.env),
+        env: childEnv(opts.env, spawnArgv(norm)),
         shell: !!opts.shell,
         // node's spawnSync honors `detached` too (spawn_sync.cc sets
         // UV_PROCESS_DETACHED), so a detached sync child is kept out of the
@@ -32587,7 +32640,7 @@
         cwd: opts.cwd || undefined,
         // Exactly the child's environment, which replaces oam's own as node's
         // envPairs do: see childEnv.
-        env: childEnv(opts.env),
+        env: childEnv(opts.env, spawnArgv(norm)),
         detached: !!opts.detached,
       };
 
@@ -32950,7 +33003,7 @@
         cwd: opts.cwd || undefined,
         // Exactly the child's environment, which replaces oam's own as node's
         // envPairs do: see childEnv.
-        env: childEnv(opts.env),
+        env: childEnv(opts.env, spawnArgv(norm)),
         shell: !!opts.shell,
         // Windows: a non-detached child joins the kill-on-close job and dies
         // with this process, as under node; a detached one is left out.
@@ -33362,7 +33415,10 @@
       };
 
       // Taken now, as node's fork() takes it, not when the channel is bound.
-      const baseEnv = childEnv(opts.env);
+      const baseEnv = childEnv(
+        opts.env,
+        [execPath, ...execArgv, "run", String(modulePath), "--no-check", "--", ...args],
+      );
       const net = registry.get("net");
       const ipcServer = net.createServer();
 
@@ -33599,10 +33655,15 @@
         }
         // node's createWorkerProcess hands fork() `{...process.env, ...env}`,
         // and that is the worker's whole environment (childProcessEnv).
-        const envObj = childProcessEnv(natives.platform, {
-          ...globalThis.process.env,
-          ...env,
-        });
+        // A worker is `oam run <script>`, its permission flags carried in
+        // NODE_OPTIONS (node passes them as execArgv; either way the worker
+        // runs under the primary's permission set).
+        const envObj = childProcessEnv(
+          natives.platform,
+          { ...globalThis.process.env, ...env },
+          undefined,
+          natives.permissionEnabled() ? [globalThis.process.execPath, "run", scriptPath] : null,
+        );
         const worker = new Worker(id, -1, 0);
         this.workers[id] = worker;
         natives.clusterFork(scriptPath, String(id), envObj).then(

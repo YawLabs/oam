@@ -296,7 +296,9 @@ fn main() -> ExitCode {
         // never touches `raw`/`i` (so no environment token can reach clap and
         // brick a subcommand), and it deliberately excludes everything that
         // executes code or names a file -- `-e`/`--eval`/`-p`/`--input-type`/
-        // `--env-file`/`--permission`. An unrecognized token is ignored
+        // `--env-file`. The permission flags are on it, as they are on node's:
+        // a child process started under `--permission` gets them in
+        // NODE_OPTIONS, as node's does. An unrecognized token is ignored
         // rather than fatal, because NODE_OPTIONS is usually set globally in
         // a shell profile and may legitimately carry flags oam has no
         // opinion on.
@@ -1719,8 +1721,13 @@ fn apply_node_options_env(flags: &mut NodeFlags) -> bool {
     let Ok(raw) = std::env::var("NODE_OPTIONS") else {
         return false;
     };
+    apply_node_options(flags, &raw)
+}
+
+/// [`apply_node_options_env`] on a given NODE_OPTIONS value.
+fn apply_node_options(flags: &mut NodeFlags, raw: &str) -> bool {
     let before = flags.clone();
-    let tokens = split_node_options(&raw);
+    let tokens = split_node_options(raw);
     let mut it = tokens.iter().peekable();
     while let Some(tok) = it.next() {
         let tok = tok.as_str();
@@ -1763,6 +1770,34 @@ fn apply_node_options_env(flags: &mut NodeFlags) -> bool {
             && let Some(v) = it.next()
         {
             flags.disabled_warnings.push(v.clone());
+        } else if tok == "--permission" {
+            // The permission model's flags, which node accepts here and
+            // copies here for a child process (child_process.js,
+            // copyPermissionModelFlagsToEnv), so a child started under
+            // `--permission` runs under it too. Spelled as process.execArgv
+            // spells them; a repeated list flag keeps its last value, as on
+            // the command line.
+            flags.permission = true;
+        } else if let Some(list) = tok.strip_prefix("--allow-fs-read=") {
+            flags.allow_fs_read = Some(list.to_string());
+        } else if let Some(list) = tok.strip_prefix("--allow-fs-write=") {
+            flags.allow_fs_write = Some(list.to_string());
+        } else if let Some(list) = tok.strip_prefix("--allow-net=") {
+            flags.allow_net = Some(list.to_string());
+        } else if tok == "--allow-net" {
+            flags.allow_net = Some("*".to_string());
+        } else if let Some(list) = tok.strip_prefix("--allow-env=") {
+            flags.allow_env = Some(list.to_string());
+        } else if tok == "--allow-env" {
+            flags.allow_env = Some("*".to_string());
+        } else if tok == "--allow-child-process" {
+            flags.allow_child_process = true;
+        } else if tok == "--allow-worker" {
+            flags.allow_worker = true;
+        } else if tok == "--allow-addons" {
+            // A build without the `napi` feature loads no addon at all, so
+            // there is nothing to grant (argv refuses the flag outright).
+            flags.allow_addons = cfg!(feature = "napi");
         } else if let Some(v) = tok.strip_prefix("--redirect-warnings=") {
             flags.redirect_warnings = Some(v.to_string());
         } else if tok == "--redirect-warnings"
@@ -3577,6 +3612,45 @@ mod tests {
         let p = perms_for(&flags);
         assert!(is_denied(&p.net));
         assert!(is_denied(&p.env));
+    }
+
+    #[test]
+    fn node_options_carries_the_permission_flags_a_child_inherits() {
+        // What a parent under `--permission` appends to a child's
+        // NODE_OPTIONS (process.execArgv's permission flags, space-joined,
+        // as node's copyPermissionModelFlagsToEnv writes them) puts the
+        // child under the same permission set.
+        let raw = [
+            "--max-http-header-size=100",
+            "--permission",
+            "--allow-fs-read=C:/a,C:/b",
+            "--allow-fs-write=*",
+            "--allow-net",
+            "--allow-env=HOME",
+            "--allow-child-process",
+            "--allow-worker",
+        ]
+        .join(" ");
+        let mut flags = super::NodeFlags::default();
+        assert!(super::apply_node_options(&mut flags, &raw));
+        assert!(flags.permission);
+        assert_eq!(flags.allow_fs_read.as_deref(), Some("C:/a,C:/b"));
+        assert_eq!(flags.allow_fs_write.as_deref(), Some("*"));
+        assert_eq!(flags.allow_net.as_deref(), Some("*"));
+        assert_eq!(flags.allow_env.as_deref(), Some("HOME"));
+        assert!(flags.allow_child_process && flags.allow_worker);
+        let p = perms_for(&flags);
+        assert!(matches!(p.write, oam_engine::BoolOrList::Bool(true)));
+        assert!(matches!(p.child, oam_engine::BoolOrList::Bool(true)));
+        // Without them, NODE_OPTIONS leaves the permission model off.
+        let mut plain = super::NodeFlags::default();
+        super::apply_node_options(&mut plain, "--no-warnings");
+        assert!(plain.permissions().is_none());
+        // And a bare `--permission` grants nothing.
+        let mut bare = super::NodeFlags::default();
+        super::apply_node_options(&mut bare, "--permission");
+        let p = perms_for(&bare);
+        assert!(is_denied(&p.read) && is_denied(&p.write) && is_denied(&p.child));
     }
 
     #[test]
