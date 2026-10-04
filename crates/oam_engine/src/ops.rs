@@ -1295,8 +1295,10 @@ fn op_fork_spawn(
             .map(|s| s.to_rust_string_lossy(scope))
     };
 
+    // Tested on the namespaced path the child's loader opens, as the worker
+    // gate is (`op_worker_new`).
     let path = std::path::PathBuf::from(&script_path);
-    if !path.is_file() {
+    if !std::path::Path::new(oam_core::FsPath::new(script_path.clone()).os()).is_file() {
         let msg = v8::String::new(
             scope,
             &format!("forkSpawn: script not found: {script_path}"),

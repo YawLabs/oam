@@ -35923,3 +35923,42 @@ fn chdir_moves_the_drive_cwd_that_drive_relative_paths_use() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// The worker and fork entry gates test the script on the namespaced path
+// the loader then opens, so a trailing dot stays in the name for both. The
+// gates used to test the raw path, which Win32 trims: with only `w.js` on
+// disk `new Worker('w.js.')` passed (and failed later in the loader), and a
+// file really named `x.js.` was "not found". node v22.22.2 fails `w.js.` as
+// a missing module and finds `x.js.`.
+#[cfg(windows)]
+#[test]
+fn worker_and_fork_entry_gates_test_the_namespaced_path() {
+    let dir = write_temp("worker_gate_ns/w.js", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let script = write_temp(
+        "worker_gate_ns/main.cjs",
+        "const fs = require('fs');\n\
+         const path = require('path');\n\
+         const { Worker } = require('worker_threads');\n\
+         const dir = path.resolve(process.argv[2]);\n\
+         fs.writeFileSync('\\\\\\\\?\\\\' + path.join(dir, 'x.js.'), '');\n\
+         for (const name of ['w.js.', 'x.js.']) {\n\
+           try { new Worker(path.join(dir, name)).on('error', () => {}); console.log('worker ' + name + ' passed'); }\n\
+           catch (e) { console.log('worker ' + name + ' ' + (/not found/.test(e.message) ? 'not found' : e.message)); }\n\
+           try { globalThis.__oam.forkSpawn(path.join(dir, name), null); console.log('fork ' + name + ' passed'); }\n\
+           catch (e) { console.log('fork ' + name + ' ' + (/not found/.test(e.message) ? 'not found' : e.message)); }\n\
+         }\n\
+         setTimeout(() => process.exit(0), 500);\n",
+    );
+    let out = oam(&[script.to_str().unwrap(), dir.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(
+        stdout,
+        "worker w.js. not found\nfork w.js. not found\n\
+         worker x.js. passed\nfork x.js. passed\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

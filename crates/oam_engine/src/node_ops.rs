@@ -7979,8 +7979,11 @@ fn op_worker_new(
             .unwrap_or_default(),
     };
 
+    // Tested on the namespaced path the loader then opens (`FsPath`), so a
+    // trailing dot or space stays in the name for both: tested raw, Win32
+    // dropped it and `w.js.` passed on the strength of `w.js`.
     let path = PathBuf::from(&script_path);
-    if !path.is_file() {
+    if !std::path::Path::new(oam_core::FsPath::new(script_path.clone()).os()).is_file() {
         throw_type_error(scope, &format!("worker script not found: {script_path}"));
         return;
     }

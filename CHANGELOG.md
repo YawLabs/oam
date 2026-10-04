@@ -277,7 +277,9 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   `fs.promises.symlink` honour the type argument: only a missing (non-string) type probes the
   target, so `'file'` makes a file link even to a directory, `'dir'` a directory link to a
   target not made yet, `'junction'` stores the target resolved against the link's parent, and
-  a type outside the three fails `ERR_FS_INVALID_SYMLINK_TYPE`. (#275)
+  a type outside the three fails `ERR_FS_INVALID_SYMLINK_TYPE`. `new Worker(path)` tests that
+  its script exists on the namespaced path its loader opens, so `w.js.` is not found when only
+  `w.js` exists, and a file named `x.js.` is. (#275)
 
 ### Performance
 
