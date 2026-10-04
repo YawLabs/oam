@@ -141,6 +141,8 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Fixed
 
+- **A `fork()`ed child's messages sent just before `process.disconnect()` reach the parent**,
+  as node's do; when the channel was still opening, disconnecting dropped them.
 - **A `fork()`ed child has its IPC channel under any `--allow-env`**, and takes the channel's
   variable out of its environment as node's child does with `NODE_CHANNEL_FD`. It read the
   port through `process.env`, so under a list `--allow-env` that did not name it

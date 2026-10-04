@@ -40131,6 +40131,7 @@
       let _ipcReady = false;
       const _ipcPending = [];
       let _ipcConnecting = false;
+      let _ipcDisconnectPending = false;
 
       function _ipcEnsureConnect() {
         if (_ipcConnecting || _ipcReady) return;
@@ -40147,6 +40148,10 @@
             _ipcSock.write(p.line, "utf8", p.callback);
           }
           _ipcPending.length = 0;
+          if (_ipcDisconnectPending) {
+            _ipcClose();
+            return;
+          }
 
           _ipcSock.on("data", (chunk) => {
             _ipcBuf += chunk;
@@ -40195,16 +40200,26 @@
         return true;
       };
 
+      // Close the channel once every write handed to it has gone out.
+      function _ipcClose() {
+        var sock = _ipcSock;
+        _ipcSock = null;
+        _ipcReady = false;
+        sock._chain.then(function() {
+          sock.destroy();
+          globalThis.process.emit("disconnect");
+        });
+      }
+
       globalThis.process.disconnect = function disconnect() {
         globalThis.process.connected = false;
-        if (_ipcSock) {
-          var sock = _ipcSock;
-          _ipcSock = null;
-          _ipcReady = false;
-          sock._chain.then(function() {
-            sock.destroy();
-            globalThis.process.emit("disconnect");
-          });
+        if (_ipcSock && !_ipcReady) {
+          // Still connecting: what send() queued goes out first, as node
+          // delivers a message sent just before disconnect(); the connect
+          // callback flushes the queue, then closes.
+          _ipcDisconnectPending = true;
+        } else if (_ipcSock) {
+          _ipcClose();
         } else {
           globalThis.process.emit("disconnect");
         }
