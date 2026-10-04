@@ -141,6 +141,8 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Fixed
 
+- **`process.execve(file)` defaults `args` to `[]` and `env` to `process.env`**, as node's
+  does (`process.execve.length` is 1); it threw `ERR_INVALID_ARG_TYPE` for the missing `args`.
 - **A zone-id host or `lookup` answer is matched against `--allow-net` as an address and a
   zone, never as text,** by `fetch`, `http.request`, `net.connect` and `tls.connect` alike.
   The zone is all of the host's text after `%`, as node's `net.isIP` reads it

@@ -15,7 +15,10 @@
 globalThis.__oamPerThread = function (natives, codes, applyNodeErrorShape) {
   // Named `execve`, and NOT defined as a method, so the frame reads
   // `execve (node:internal/process/per_thread:...)` the way node's does.
-  function execve(execPath, args, env) {
+  // `args` and `env` default as node's do (`args = [], env = process.env`):
+  // the new image gets exactly `env`, and without one process.env as it
+  // stands, never the environment this process started with.
+  function execve(execPath, args = [], env = globalThis.process.env) {
     // execve(2) REPLACES the current process image: on success nothing after
     // this call ever runs -- no 'exit' handlers, no unwind, no flush (the op
     // flushes first for that reason). Node has it on POSIX only.
