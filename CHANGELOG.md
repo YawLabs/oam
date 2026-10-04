@@ -249,7 +249,9 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   through `OAM-TS0007`, `OAM-PKG0000` through `OAM-PKG0009` and `OAM-NATIVE0001` /
   `OAM-NATIVE0002` were answered "unknown code", and the unknown-code text called
   `OAM-TEST*` / `OAM-PKG*` "reserved" although both are emitted. A test now fails if any
-  code under `crates/*/src` has no explanation.
+  code under `crates/*/src` has no explanation. The `OAM-MOD0002` and `OAM-MOD0006` explanations
+  no longer say the installer is unshipped or that `http` and `child_process` are missing; they
+  now describe every case each code covers.
 - **The README no longer describes typed repair plans, sandboxed-by-default execution or
   checkpoint/fork as shipped.** The ODIF `repairs` field is reserved and populated by nothing
   yet, the permission model is opt-in (`--permission`; the default is all-granted, as in

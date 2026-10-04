@@ -379,7 +379,7 @@ const KNOWN_CODES: &[(&str, &str)] = &[
     ),
     (
         "OAM-MOD0002",
-        "A package could not be found in any node_modules directory above the importing file (or its resolution pointed at a missing file). Is it installed? oam resolves against existing npm/pnpm installs until the oam installer lands (M3).",
+        "A bare package specifier did not resolve. Usually the package is not in any node_modules directory above the importing file: install it (`oam install` installs from an existing package-lock.json; `npm install` creates one). The same code covers a malformed package specifier and a package.json `imports` (#subpath) entry with no owning package.json, an invalid target, or a target file that does not exist; the message says which.",
     ),
     (
         "OAM-MOD0005",
@@ -387,7 +387,7 @@ const KNOWN_CODES: &[(&str, &str)] = &[
     ),
     (
         "OAM-MOD0006",
-        "This Node builtin is not implemented yet. Shipped: assert, async_hooks (AsyncLocalStorage), buffer, crypto (hash/hmac/random/webcrypto-digest), events, fs (+streams), fs/promises, module, os, path, process, stream (+promises/web/consumers), string_decoder, tty, url, util; the rest (http, child_process, zlib, ...) land with later compat waves.",
+        "A builtin module specifier oam cannot provide. The message says which case applies: a Node builtin oam does not implement yet (docs/node-divergences.md lists what is missing), a `node:` name that is not a Node builtin at all, or an `oam:` module that does not exist (the message lists the available ones). A package of the same name in node_modules does not shadow a builtin, so installing one will not help.",
     ),
     (
         "OAM-MOD0007",
