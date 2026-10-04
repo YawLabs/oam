@@ -751,6 +751,20 @@ else pass; fi
 it "empty text is not a transport drop"
 ssh_transport_dropped "" && fail "matched nothing" || pass
 
+# A remote step is run again only when the TRANSPORT dropped under it, the VM
+# is still RUNNING and attempts remain -- never for a command that exited.
+VMS_DROP=$'  PASS   test-stream-pipeline-with-empty-string.js\nConnection to localhost closed by remote host.'
+it "a transport drop under a RUNNING VM, with attempts left, is run again"
+if remote_step_should_retry 1 3 "$VMS_DROP" RUNNING; then pass; else fail "not retried"; fi
+it "the last attempt is not run again"
+remote_step_should_retry 3 3 "$VMS_DROP" RUNNING && fail "retried past the last attempt" || pass
+it "a VM that is not RUNNING is not run again -- the postmortem says who stopped it"
+remote_step_should_retry 1 3 "$VMS_DROP" TERMINATED && fail "retried against a stopped VM" || pass
+it "a remote command that exited non-zero is never run again"
+remote_step_should_retry 1 3 $'error: test failed, to rerun pass ...\n[remote] test FAILED' RUNNING && fail "retried a real failure" || pass
+it "a blank attempt count is not an invitation"
+remote_step_should_retry "" 3 "$VMS_DROP" RUNNING && fail "retried on a blank attempt" || pass
+
 # =============================================================================
 group "iap-helpers.sh -- ssh transport: direct first, IAP tunnel fallback"
 # =============================================================================
@@ -1142,7 +1156,8 @@ VMS_WIRE=""
 for want in 'vm_start_types "$ORIGINAL_MACHINE_TYPE"' 'vm_start_verdict "$start_err"' \
             'vm_start_verdict "$set_err"' 'gcloud_error_message "$start_err"' \
             'vm_start_zones_available "$start_err"' \
-            '${OAM_GCP_FALLBACK_MACHINE_TYPES-' 'OAM_VM_START_BUDGET_S:-900' \
+            '${OAM_GCP_FALLBACK_MACHINE_TYPES-' 'OAM_VM_START_BUDGET_S:-1800' \
+            'remote_step_should_retry "$attempt" "$REMOTE_STEP_ATTEMPTS"' 'reconnect_builder' \
             '--filter="name~^${INSTANCE}\$"' 'trap restore_machine_type EXIT' \
             'cleanup() { stop_iap_tunnel; reattach_stop_schedules; stop_vm; restore_machine_type; }'; do
   grep -qF -- "$want" <<<"$VMS_SRC" || VMS_WIRE="$VMS_WIRE [$want]"

@@ -56,6 +56,8 @@
 #   OAM_GCP_FALLBACK_MACHINE_TYPES
 #                             n2-highmem-4 n2d-highmem-4 c2d-highmem-4
 #                             n1-highmem-4 e2-standard-8 t2d-standard-8
+#                             n2-standard-8 n2d-standard-8 c2-standard-8
+#                             n1-standard-8 e2-highmem-8
 #                             (default -- same-zone machine types tried, in
 #                             this order, when the zone has no capacity for
 #                             the VM's own type: ZONE_RESOURCE_POOL_EXHAUSTED
@@ -75,7 +77,16 @@
 #                             N2_CPUS, N2D_CPUS, C2D_CPUS, T2D_CPUS; n1 on
 #                             CPUS), all ample for one VM here. Empty
 #                             disables the fallback.)
-#   OAM_VM_START_BUDGET_S     900                (default -- seconds after
+#   OAM_REMOTE_STEP_ATTEMPTS  3                  (default -- times a remote
+#                                                step is run when the ssh
+#                                                transport under it drops
+#                                                while the VM stays RUNNING;
+#                                                each retry reconnects first,
+#                                                direct again or the IAP
+#                                                tunnel. A step whose command
+#                                                EXITS non-zero is never
+#                                                retried.)
+#   OAM_VM_START_BUDGET_S     1800               (default -- seconds after
 #                                                which no further pass over
 #                                                those types begins; a pass
 #                                                in progress finishes, passes
@@ -153,8 +164,11 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Before anything touches the VM: a typo here must not cost a VM start.
 ssh_mode_valid "$SSH_MODE" \
   || fail "invalid OAM_IAP_SSH_MODE='$SSH_MODE' (want auto|direct|tunnel)"
-case "${OAM_VM_START_BUDGET_S:-900}" in
-  '' | *[!0-9]*) fail "invalid OAM_VM_START_BUDGET_S='${OAM_VM_START_BUDGET_S:-}' (want whole seconds, e.g. 900)" ;;
+case "${OAM_VM_START_BUDGET_S:-1800}" in
+  '' | *[!0-9]*) fail "invalid OAM_VM_START_BUDGET_S='${OAM_VM_START_BUDGET_S:-}' (want whole seconds, e.g. 1800)" ;;
+esac
+case "${OAM_REMOTE_STEP_ATTEMPTS:-3}" in
+  '' | 0 | *[!0-9]*) fail "invalid OAM_REMOTE_STEP_ATTEMPTS='${OAM_REMOTE_STEP_ATTEMPTS:-}' (want a whole number of attempts, 1 or more)" ;;
 esac
 
 RUNID="$(date +%Y%m%d-%H%M%S)"
@@ -264,10 +278,10 @@ if [ "$VM_STATUS" != "RUNNING" ]; then
   # is spent. gcloud's progress ("Starting instance(s)...", the dots) is
   # stderr too, so it is captured with the error and the operator sees one
   # verdict line per attempt instead.
-  VM_START_BUDGET="${OAM_VM_START_BUDGET_S:-900}"
+  VM_START_BUDGET="${OAM_VM_START_BUDGET_S:-1800}"
   ORIGINAL_MACHINE_TYPE="$(vm_describe 'machineType.basename()' || true)"
   VM_TYPES="$(vm_start_types "$ORIGINAL_MACHINE_TYPE" \
-    "${OAM_GCP_FALLBACK_MACHINE_TYPES-n2-highmem-4 n2d-highmem-4 c2d-highmem-4 n1-highmem-4 e2-standard-8 t2d-standard-8}")" \
+    "${OAM_GCP_FALLBACK_MACHINE_TYPES-n2-highmem-4 n2d-highmem-4 c2d-highmem-4 n1-highmem-4 e2-standard-8 t2d-standard-8 n2-standard-8 n2d-standard-8 c2-standard-8 n1-standard-8 e2-highmem-8}")" \
     || fail "could not read the machine type of $INSTANCE -- not starting it"
   CURRENT_MACHINE_TYPE="$ORIGINAL_MACHINE_TYPE"
   # Armed before the first set-machine-type: a fail below must not leave the
@@ -782,6 +796,16 @@ connect_builder(){
   fi
 }
 
+# reconnect_builder: prove the ssh path again after a transport drop under a
+# step. A tunnel that was up is torn down first -- a reset relay is not
+# reused -- and the choice is made afresh: direct, else the tunnel.
+reconnect_builder(){
+  step "Reconnect to $INSTANCE after an ssh transport drop"
+  stop_iap_tunnel
+  REMOTE_TRANSPORT=""; DIRECT_IP=""
+  connect_builder
+}
+
 # Ship the WORKING TREE (uncommitted release fixes should build), asking git
 # what the tree IS rather than hand-maintaining a list of what it is not -- see
 # lib/src-sync.sh for why, and for the 11.6 GB release this cost. On the remote
@@ -848,13 +872,45 @@ remote_step_postmortem() {
   esac
 }
 
-# remote_step <dispatch>: one short ssh invocation per build-remote.sh
-# dispatch, log captured per step, tail surfaced on failure.
+# remote_step_run <dispatch>: one short ssh invocation per build-remote.sh
+# dispatch, log captured per step, tail surfaced on failure. 0 when the step
+# passed, 1 when it failed for good.
+#
+# A step whose ssh TRANSPORT dropped under it (OpenSSH's own closing line as
+# the log's tail: a reset IAP relay, a cut direct connection, an sshd restart)
+# while the VM is still RUNNING is run again, up to OAM_REMOTE_STEP_ATTEMPTS
+# times in all, after reconnecting -- direct ssh is probed again and the IAP
+# tunnel is the fallback, as at the start. Each dispatch is a fresh
+# `build-remote.sh <dispatch>` on the synced tree, so running one again is
+# safe (cargo waits on its own lock if the cut command is still finishing).
+# A step whose command EXITED non-zero is a real failure and is never run
+# again; a VM that is no longer RUNNING is left to the postmortem, which says
+# who stopped it. Each earlier attempt's log is kept as <dispatch>.log.attemptN.
+REMOTE_STEP_ATTEMPTS="${OAM_REMOTE_STEP_ATTEMPTS:-3}"
+remote_step_run(){
+  local dispatch="$1" log="$STAGE_DIR/logs/$1.log" attempt=1 status
+  while :; do
+    if gcp_ssh "cd $REMOTE_DIR && bash scripts/build-remote.sh $dispatch" >"$log" 2>&1; then
+      return 0
+    fi
+    tail -30 "$log" >&2
+    status="$(vm_describe status || echo UNKNOWN)"
+    if remote_step_should_retry "$attempt" "$REMOTE_STEP_ATTEMPTS" "$(tail -5 "$log" 2>/dev/null || true)" "$status"; then
+      cp "$log" "$log.attempt$attempt" 2>/dev/null || true
+      warn "remote '$dispatch' lost its ssh transport on attempt $attempt of $REMOTE_STEP_ATTEMPTS while $INSTANCE is RUNNING -- reconnecting and running it again (that attempt's log: $log.attempt$attempt)"
+      reconnect_builder
+      attempt=$((attempt + 1))
+      continue
+    fi
+    remote_step_postmortem "$log"
+    return 1
+  done
+}
+
+# remote_step <dispatch>: a failure ends the run.
 remote_step(){
   local dispatch="$1"
-  gcp_ssh "cd $REMOTE_DIR && bash scripts/build-remote.sh $dispatch" \
-    > "$STAGE_DIR/logs/$dispatch.log" 2>&1 \
-    || { tail -30 "$STAGE_DIR/logs/$dispatch.log" >&2; remote_step_postmortem "$STAGE_DIR/logs/$dispatch.log"; fail "remote '$dispatch' failed -- see $STAGE_DIR/logs/$dispatch.log"; }
+  remote_step_run "$dispatch" || fail "remote '$dispatch' failed -- see $STAGE_DIR/logs/$dispatch.log"
   ok "remote $dispatch ok"
 }
 
@@ -864,12 +920,9 @@ remote_step(){
 # gate exits non-zero -- discarding them on failure loses the measurement).
 remote_step_advisory(){
   local dispatch="$1"
-  if gcp_ssh "cd $REMOTE_DIR && bash scripts/build-remote.sh $dispatch" \
-    > "$STAGE_DIR/logs/$dispatch.log" 2>&1; then
+  if remote_step_run "$dispatch"; then
     ok "remote $dispatch ok"
   else
-    tail -30 "$STAGE_DIR/logs/$dispatch.log" >&2
-    remote_step_postmortem "$STAGE_DIR/logs/$dispatch.log"
     warn "remote '$dispatch' failed (advisory -- continuing; see $STAGE_DIR/logs/$dispatch.log)"
   fi
 }

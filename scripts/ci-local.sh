@@ -634,10 +634,31 @@ say "13/14 Scripts (release-orchestration shell tests + changelog tooling + side
 # state with the compile steps above: a failure here invalidates none of the
 # Rust work, and steps 10 and 12 already establish that a compile-free gate can
 # sit down here. Add `-v` for per-case output.
-if bash scripts/test-scripts.sh; then
-  ok "script tests passed"
+# Run twice before failing, with both runs' output kept. The suite is 500+
+# spawn-bound cases on a loaded box, and on 2026-10-04 one stubbed read came
+# back empty under a release's gate and ended the release an hour in, with
+# the output gone with the terminal. A flake passes the second run; a real
+# failure fails both. The logs live under target/ci-local/ so a failure can
+# be read after the fact -- and so a second-run pass still leaves the first
+# run's failures on disk: a case that fails only under load is a bug to file,
+# not a pass.
+SCRIPTS_LOG_DIR="target/ci-local"
+mkdir -p "$SCRIPTS_LOG_DIR"
+run_script_tests(){  # <run-number>
+  local rc=0
+  bash scripts/test-scripts.sh 2>&1 | tee "$SCRIPTS_LOG_DIR/test-scripts-$1.log"
+  rc="${PIPESTATUS[0]}"
+  return "$rc"
+}
+if run_script_tests 1; then
+  ok "script tests passed (log: $SCRIPTS_LOG_DIR/test-scripts-1.log)"
 else
-  ko "script tests failed (see above) -- './scripts/test-scripts.sh -v' for per-case detail"
+  warn "script tests failed on the first run -- running the suite once more (a flake passes now; a real failure fails twice)"
+  if run_script_tests 2; then
+    ok "script tests passed on the second run -- the first run's failures are in $SCRIPTS_LOG_DIR/test-scripts-1.log; a case that fails only under load is a bug to file"
+  else
+    ko "script tests failed twice (see above; logs: $SCRIPTS_LOG_DIR/test-scripts-1.log and test-scripts-2.log) -- './scripts/test-scripts.sh -v' for per-case detail"
+  fi
 fi
 
 # Still step 13: the changelog tooling. release-local.sh's changelog gate had

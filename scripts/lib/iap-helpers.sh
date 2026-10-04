@@ -188,6 +188,18 @@ ssh_transport_dropped() {
   grep -qE 'closed by remote host|Connection reset by peer|Broken pipe|Connection closed by|client_loop: send disconnect|Connection timed out' <<<"$1"
 }
 
+# remote_step_should_retry <attempt> <max> <log-tail-text> <vm-status> -- 0
+# when a failed remote step is worth running again: its ssh transport dropped
+# (above), the VM is still RUNNING, and attempts remain. A remote command that
+# exited non-zero never is: the same failure would repeat. A VM that is not
+# RUNNING is left to the postmortem, which says who stopped it.
+remote_step_should_retry() {
+  local attempt="$1" max="$2" tail="$3" status="$4"
+  [ "$attempt" -lt "$max" ] 2>/dev/null || return 1
+  [ "$status" = "RUNNING" ] || return 1
+  ssh_transport_dropped "$tail"
+}
+
 # --- ssh transport: direct first, the IAP tunnel as the fallback --------------
 #
 # The builder has an external IP, and the default network's default-allow-ssh
