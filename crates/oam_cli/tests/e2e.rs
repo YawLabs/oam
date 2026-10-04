@@ -13088,6 +13088,35 @@ fn oam_test_async_hooks_only_filter_and_json_mode() {
     assert!(stderr.contains("OAM-TEST0000"), "summary line: {stderr}");
 }
 
+/// A run that never settles outside any test (here a beforeEach hook, which
+/// has no per-test timeout, awaits a promise nothing resolves) is OAM-TEST0003,
+/// and its ODIF origin is `test` -- the code's namespace -- not `runtime`.
+#[test]
+fn oam_test_unsettled_run_is_test0003_with_test_origin() {
+    write_temp(
+        "runner_test0003/stuck.test.ts",
+        "import { describe, test, beforeEach } from 'oam:test';\n\
+         describe('stuck', () => {\n\
+           beforeEach(() => new Promise(() => {}));\n\
+           test('never reached', () => {});\n\
+         });",
+    );
+    let dir = write_temp("runner_test0003/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = oam(&["test", dir.to_str().unwrap(), "--json"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let diag = stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["code"] == "OAM-TEST0003")
+        .unwrap_or_else(|| panic!("no OAM-TEST0003 line: {stderr}"));
+    assert_eq!(diag["origin"], "test", "diag: {diag}");
+    assert_eq!(diag["severity"], "error", "diag: {diag}");
+}
+
 #[test]
 fn oam_test_mocks_spies_and_fake_timers() {
     write_temp(

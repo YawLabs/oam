@@ -243,6 +243,22 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 - **The npm undici's `fetch` never delivered a MockAgent reply's body**: `stream.finished()` on a
   web stream threw and `performance.markResourceTiming()` was missing. (#206)
 - **`console.table`** draws node's table, and a `new Console()` has `table()`.
+- **`OAM-TEST0003` carries `"origin": "test"`**, the origin of its code family; it was emitted
+  with `"origin": "runtime"`. Every `OAM-RT*` code keeps `runtime`.
+- **The MCP server's `oam_explain` knows every code oam emits.** `OAM-TS0002`, `OAM-TS0005`
+  through `OAM-TS0007`, `OAM-PKG0000` through `OAM-PKG0009` and `OAM-NATIVE0001` /
+  `OAM-NATIVE0002` were answered "unknown code", and the unknown-code text called
+  `OAM-TEST*` / `OAM-PKG*` "reserved" although both are emitted. A test now fails if any
+  code under `crates/*/src` has no explanation. The `OAM-MOD0002` and `OAM-MOD0006` explanations
+  no longer say the installer is unshipped or that `http` and `child_process` are missing; they
+  now describe every case each code covers. `OAM-RT0001` is no longer explained as an uncaught
+  exception only (it is the catch-all, engine failures included), and `OAM-RT0004` names its
+  second case, an inspector that could not start.
+- **The README no longer describes typed repair plans, sandboxed-by-default execution or
+  checkpoint/fork as shipped.** The ODIF `repairs` field is reserved and populated by nothing
+  yet, the permission model is opt-in (`--permission`; the default is all-granted, as in
+  node), and `oam.fork()` is a pre-warmed isolate pool. The ODIF origin list now includes
+  `resolve`.
 
 ### Performance
 
