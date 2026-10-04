@@ -1021,6 +1021,56 @@ fn op_chdir(
     };
     if let Err(e) = std::env::set_current_dir(&dir) {
         throw_node_error_as_passed(scope, "chdir", &oam_core::fs_error_path(&dir), &e);
+        return;
+    }
+    #[cfg(windows)]
+    record_drive_cwd();
+}
+
+/// Record the new cwd in its drive's hidden `=X:` variable, as libuv's
+/// uv_chdir does after SetCurrentDirectoryW (src/win/util.c, v1.51.0):
+/// SetCurrentDirectoryW leaves `=X:` alone, and node's resolve -- the one
+/// `oam_core::FsPath` runs -- reads `=X:` before the cwd for a drive-relative
+/// `X:name`, so without this every such path resolved against the directory
+/// the process was launched with. The value is GetCurrentDirectoryW's, with
+/// a trailing separator dropped unless it is a drive root (`C:\`); a cwd
+/// with no drive letter (a UNC share) sets nothing, and the letter is upper
+/// case.
+#[cfg(windows)]
+fn record_drive_cwd() {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let mut wide: Vec<u16> = cwd.as_os_str().encode_wide().collect();
+    let is_root = wide.len() == 3 && wide[1] == u16::from(b':');
+    if wide.last() == Some(&u16::from(b'\\')) && !is_root {
+        wide.pop();
+    }
+    let letter = match wide.first().copied().and_then(|c| u8::try_from(c).ok()) {
+        Some(c) if wide.get(1) == Some(&u16::from(b':')) && c.is_ascii_alphabetic() => {
+            c.to_ascii_uppercase()
+        }
+        _ => return,
+    };
+    let name = format!("={}:", char::from(letter));
+    set_process_env(&name, Some(&std::ffi::OsString::from_wide(&wide)));
+}
+
+/// Set a variable in the process environment, or remove it with `None`: the
+/// one place the ops change the real environment (`process.env.TZ`, a
+/// chdir's `=X:`), each as node's own binding does.
+fn set_process_env(name: &str, value: Option<&std::ffi::OsStr>) {
+    // SAFETY: edition 2024 marks env mutation unsafe because on POSIX it
+    // races other threads calling getenv. Every caller runs on the isolate
+    // thread inside an op, as node's own TZ and chdir updates do; on Windows
+    // the environment block is guarded by the process's own lock, which
+    // makes the mutation sound on any thread (std::env::set_var's docs).
+    unsafe {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
     }
 }
 
@@ -2905,16 +2955,9 @@ fn op_set_timezone(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let value = arg_string(scope, &args, 0);
-    // SAFETY: edition 2024 marks env mutation unsafe because it races other
-    // threads calling getenv. This runs on the isolate thread during a JS
-    // property set, and the tzset/ICU refresh below is the whole point of
-    // the call -- the same trade Node makes for process.env.TZ.
-    unsafe {
-        match &value {
-            Some(tz) => std::env::set_var("TZ", tz),
-            None => std::env::remove_var("TZ"),
-        }
-    }
+    // The tzset/ICU refresh below is the whole point of the call -- the same
+    // trade Node makes for process.env.TZ.
+    set_process_env("TZ", value.as_deref().map(std::ffi::OsStr::new));
     // libc caches the parsed zone; tzset() re-reads TZ for anything going
     // through localtime(3). Declared here rather than used from the libc
     // crate, which does not export it on darwin.

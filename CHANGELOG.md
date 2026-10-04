@@ -265,7 +265,9 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   not `'C:'`), a patched `process.cwd` no longer changes any fs error, `realpath` and
   `readlink` show a UNC result as `\\srv\sh\x`, and an ESM specifier gets the URL parser's
   clean-up (`import("./x.mjs ")` loads `x.mjs`, as on node). A script that relied on that
-  normalisation now fails as it does under node. (#275)
+  normalisation now fails as it does under node. `process.chdir` records the new cwd in its
+  drive's `=X:` variable, as libuv's `uv_chdir` does, so a drive-relative `C:name` resolves
+  against the directory the process moved to, not the one it was launched in. (#275)
 
 ### Performance
 

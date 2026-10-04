@@ -35880,3 +35880,46 @@ fn a_negative_descriptor_never_reaches_stdin() {
         "nothing was written to stdin"
     );
 }
+
+// process.chdir updates the drive's hidden `=X:` variable, as libuv's
+// uv_chdir does (src/win/util.c). The namespaced fs paths resolve a
+// drive-relative `X:name` against `=X:` first, as node's resolve does, so a
+// chdir that left `=X:` behind made every `X:name` op, its permission check
+// and its error name the directory the process was launched with: cmd.exe
+// hands each child `=C:`, and statSync('C:Public') after
+// process.chdir('C:\\Users') looked in C:\Windows. Measured on node v22.22.2:
+// the stat finds the file in the new cwd, and a miss names the new cwd.
+#[cfg(windows)]
+#[test]
+fn chdir_moves_the_drive_cwd_that_drive_relative_paths_use() {
+    let dir = write_temp("chdir_drive_cwd/target/probe.txt", "p")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let stale = write_temp("chdir_drive_cwd/stale/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let script = write_temp(
+        "chdir_drive_cwd/main.cjs",
+        "const fs = require('fs');\n\
+         const dir = require('path').resolve(process.argv[2]);\n\
+         process.chdir(dir);\n\
+         const drive = dir.slice(0, 2);\n\
+         console.log('found ' + fs.statSync(drive + 'probe.txt').size);\n\
+         try { fs.statSync(drive + 'missing.txt'); console.log('missing found'); }\n\
+         catch (e) { console.log('missing ' + (e.path === dir + '\\\\missing.txt')); }\n",
+    );
+    let dir_s = dir.to_str().unwrap();
+    let drive_var = format!("={}", dir_s[..2].to_ascii_uppercase());
+    let out = bounded_output(
+        oam_command(&[script.to_str().unwrap(), dir_s]).env(&drive_var, stale.to_str().unwrap()),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(
+        stdout,
+        "found 1\nmissing true\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
