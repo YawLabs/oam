@@ -3200,7 +3200,7 @@ mod win32_resolve_tests {
 mod fs_os_path_tests {
     use super::{
         FsPath, Win32ResolveMode, fs_error_path, fs_os_path, fs_os_path_with, fs_shown_path,
-        win32_resolve_mode, win32_shown_path,
+        strip_unc_prefix, win32_resolve_mode, win32_shown_path,
     };
     use std::borrow::Cow;
 
@@ -3494,6 +3494,11 @@ mod fs_os_path_tests {
         assert_eq!(fs_error_path(""), "");
         assert!(matches!(fs_os_path(""), Cow::Borrowed("")));
         assert_eq!(fs_shown_path(r"\\?\UNC\srv\sh\x"), r"\\srv\sh\x");
+        assert_eq!(
+            strip_unc_prefix(std::path::Path::new(r"\\?\UNC\srv\sh\x")),
+            r"\\srv\sh\x"
+        );
+        assert_eq!(strip_unc_prefix(std::path::Path::new(r"\\?\C:\x")), r"C:\x");
     }
 
     #[cfg(not(windows))]
@@ -3512,6 +3517,7 @@ mod fs_os_path_tests {
             let fs_path = FsPath::new(p.to_string());
             assert_eq!(fs_path.os(), p);
             assert_eq!(fs_path.shown(), p);
+            assert_eq!(strip_unc_prefix(std::path::Path::new(p)), p);
         }
     }
 }
@@ -3666,11 +3672,13 @@ pub fn remove_path(path: &str, recursive: bool) -> std::io::Result<()> {
     }
 }
 
-/// std::fs::canonicalize returns \\?\-prefixed paths on Windows, which leak
-/// into user-visible strings and break naive comparisons — strip the prefix.
+/// std::fs::canonicalize (and a symlink target read back) gives `\\?\`
+/// paths on Windows, which node shows without the prefix: the path as
+/// `fs_shown_path` shows it, so a UNC result `\\?\UNC\srv\sh\x` reads
+/// `\\srv\sh\x` (not `UNC\srv\sh\x`) and `\\?\C:\x` reads `C:\x`. Off
+/// Windows the path is returned as it is.
 pub fn strip_unc_prefix(path: &std::path::Path) -> String {
-    let s = path.to_string_lossy();
-    s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+    fs_shown_path(&path.to_string_lossy()).into_owned()
 }
 
 /// node:zlib backend (flate2 encoders, [`inflate::NodeInflate`] decoders,
