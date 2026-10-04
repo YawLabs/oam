@@ -290,6 +290,10 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   with node's `ERR_FS_CP_EINVAL` ("src and dest cannot be the same", "... to a subdirectory
   of self ..."), before anything is made. A directory copied into its own subdirectory used to
   be copied until the process was killed, and a file copied onto itself failed `EBUSY`.
+- **`fs.readdirSync`, `fs.readdir` and `fs.promises.readdir` honour `recursive`**: every entry
+  below the directory, named relative to it (or as Dirents with their `parentPath`), in node's
+  order -- breadth first for the sync and callback forms, the last directory found first for
+  the promise one. They used to list the top level only.
 
 ### Performance
 

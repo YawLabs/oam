@@ -9774,6 +9774,64 @@
     return entries.map((e) => new Dirent(e.name, parent, e.kind));
   }
 
+  // readdir with `recursive`, as node v22.22.2's lib/fs.js and
+  // lib/internal/fs/promises.js walk it. Names come back relative to the
+  // base (`path.relative`), Dirents carry the directory they were read from
+  // as `parentPath`. An entry is descended into when it stats as a directory
+  // (internalModuleStat follows a link to one) -- except a Dirent of
+  // fs.promises.readdir, which only when it IS one, so a link is listed and
+  // not followed there. readdirSync and the callback readdir go breadth
+  // first; fs.promises.readdir takes the last directory found first (it
+  // pops its queue), so its order differs, as node's does.
+  function readdirIsDir(natives, file) {
+    try {
+      return natives.fsStatSync(file, false).kind === "dir";
+    } catch {
+      return false;
+    }
+  }
+  function readdirFound(natives, base, dir, entries, withFileTypes, out, queue, direntFollows = true) {
+    const join = registry.get("path").join;
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (withFileTypes) {
+        const dirent = new Dirent(entry.name, dir, entry.kind);
+        out.push(dirent);
+        if (dirent.isDirectory() || (direntFollows && readdirIsDir(natives, full))) queue.push(full);
+      } else {
+        out.push(registry.get("path").relative(base, full));
+        if (readdirIsDir(natives, full)) queue.push(full);
+      }
+    }
+  }
+  function readdirRecursiveSync(natives, base, withFileTypes) {
+    const out = [];
+    const queue = [base];
+    for (let i = 0; i < queue.length; i++) {
+      readdirFound(natives, base, queue[i], natives.fsReaddirSync(queue[i]), withFileTypes, out, queue);
+    }
+    return out;
+  }
+  async function readdirRecursiveBreadthFirst(natives, base, withFileTypes) {
+    const out = [];
+    const queue = [base];
+    for (let i = 0; i < queue.length; i++) {
+      readdirFound(natives, base, queue[i], await natives.fsReaddir(queue[i]), withFileTypes, out, queue);
+    }
+    return out;
+  }
+  async function readdirRecursiveLastFirst(natives, base, withFileTypes) {
+    const out = [];
+    const pending = [[base, await natives.fsReaddir(base)]];
+    while (pending.length > 0) {
+      const [dir, entries] = pending.pop();
+      const found = [];
+      readdirFound(natives, base, dir, entries, withFileTypes, out, found, false);
+      for (const next of found) pending.push([next, await natives.fsReaddir(next)]);
+    }
+    return out;
+  }
+
   function makeDirent(parentPath, entry) {
     var name = typeof entry === "string" ? entry : entry.name;
     var kind = typeof entry === "object" && entry.kind ? entry.kind : "file";
@@ -11360,7 +11418,8 @@
       lstat: withPath(async (file) => wrapStat(await natives.fsStat(file, true))),
       statfs: withPath(async (file, options) => wrapStatFs(await natives.fsStatfs(file), options)),
       readdir: withPath(async (file, options) => {
-        const { withFileTypes } = readOptions(options);
+        const { withFileTypes, recursive } = readOptions(options);
+        if (recursive === true) return readdirRecursiveLastFirst(natives, file, withFileTypes === true);
         const entries = await natives.fsReaddir(file);
         return wrapDirents(file, entries, withFileTypes === true);
       }),
@@ -12283,6 +12342,13 @@
     const realpathByPath = callbackify1((p) => realpathWalking(realpathArg(p)), 1);
     const mkdtempByPrefix = callbackify1(promises.mkdtemp, 1, 1);
     const symlinkByCallback = callbackify1(promises.symlink, CB_LAST);
+    const readdirByPath = callbackify1(promises.readdir, 1, 1);
+    const readdirBreadthFirstByPath = callbackify1(
+      (path, options) =>
+        readdirRecursiveBreadthFirst(natives, toPath(path), readOptions(options).withFileTypes === true),
+      1,
+      1,
+    );
     // cpSync over two validated paths; `top` runs node's path checks, which
     // node makes once, on the paths the call was given.
     function cpSyncWalk(srcStr, destStr, opts, top) {
@@ -12404,7 +12470,8 @@
       lstatSync: (path) => wrapStat(natives.fsStatSync(toPath(path), true)),
       statfsSync: (path, options) => wrapStatFs(natives.fsStatfsSync(toPath(path)), options),
       readdirSync: (path, options) => {
-        const { withFileTypes } = readOptions(options);
+        const { withFileTypes, recursive } = readOptions(options);
+        if (recursive === true) return readdirRecursiveSync(natives, toPath(path), withFileTypes === true);
         return wrapDirents(
           toPath(path),
           natives.fsReaddirSync(toPath(path)),
@@ -12597,7 +12664,12 @@
       stat: callbackify1(promises.stat, 1, 1),
       lstat: callbackify1(promises.lstat, 1, 1),
       statfs: callbackify1(promises.statfs, 1, 1),
-      readdir: callbackify1(promises.readdir, 1, 1),
+      // With `recursive`, node's callback readdir walks breadth first, as
+      // readdirSync does; fs.promises.readdir does not.
+      readdir: function readdir(path, options, callback) {
+        const opts = typeof options === "function" ? undefined : options;
+        return (readOptions(opts).recursive === true ? readdirBreadthFirstByPath : readdirByPath)(...arguments);
+      },
       glob: callbackify1(promises._globAsPromise, 1, 1),
       mkdir: callbackify1(promises.mkdir, 1, 1),
       // node's rm (lib/fs.js, v22.22.2) validates the path and its options

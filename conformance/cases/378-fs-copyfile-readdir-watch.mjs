@@ -74,5 +74,44 @@ if (process.platform === "win32") {
   console.log("FICLONE_FORCE rows are Windows only");
 }
 
+// readdir with `recursive`: every entry below, names relative to the base,
+// Dirents with the directory they were read from. readdirSync and readdir
+// go breadth first; fs.promises.readdir pops its queue, so it lists the last
+// directory found first; a link to a directory is followed except by a
+// promise Dirent walk. oam used to list the top level only.
+fs.mkdirSync("tree");
+process.chdir("tree");
+for (const d of ["a", "a/x", "a/x/deep", "b", "b/y", "c"]) fs.mkdirSync(d);
+for (const f of ["top.txt", "a/1.txt", "a/x/2.txt", "a/x/deep/3.txt", "b/4.txt", "b/y/5.txt"]) fs.writeFileSync(f, f);
+let link;
+try {
+  fs.symlinkSync(path.join(process.cwd(), "b"), "lnk", "dir");
+  link = "made";
+} catch (e) {
+  link = e.code;
+}
+console.log("readdir link: " + link);
+const dirents = (list) => list.map((d) => [d.name, scrub(d.parentPath), d.isDirectory()].join(":"));
+show("readdirSync recursive", () => fs.readdirSync(".", { recursive: true }));
+show("readdirSync recursive below", () => fs.readdirSync("a", { recursive: true }));
+show("readdirSync recursive absolute", () => fs.readdirSync(process.cwd(), { recursive: true }));
+show("readdirSync recursive withFileTypes", () =>
+  dirents(fs.readdirSync(".", { recursive: true, withFileTypes: true })),
+);
+show("readdirSync recursive false", () => fs.readdirSync("a", { recursive: false }));
+await settle("readdir recursive", () => viaCallback(fs.readdir, ".", { recursive: true }));
+await settle("readdir recursive withFileTypes", async () =>
+  dirents(await viaCallback(fs.readdir, ".", { recursive: true, withFileTypes: true })),
+);
+await settle("promises.readdir recursive", () => fs.promises.readdir(".", { recursive: true }));
+await settle("promises.readdir recursive withFileTypes", async () =>
+  dirents(await fs.promises.readdir(".", { recursive: true, withFileTypes: true })),
+);
+show("readdirSync recursive missing", () => fs.readdirSync("nope", { recursive: true }));
+show("readdirSync recursive of a file", () => fs.readdirSync("top.txt", { recursive: true }));
+await settle("promises.readdir recursive missing", () => fs.promises.readdir("nope", { recursive: true }));
+await settle("readdir recursive missing", () => viaCallback(fs.readdir, "nope", { recursive: true }));
+process.chdir(D);
+
 process.chdir(start);
 fs.rmSync(made, { recursive: true, force: true });
