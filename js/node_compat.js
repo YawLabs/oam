@@ -10765,6 +10765,26 @@
   const CB_LAST = -1;
   // The link types node's stringToSymlinkType accepts.
   const SYMLINK_TYPES = ["dir", "file", "junction"];
+
+  // copyFile's mode as node v22.22.2 checks it (the same in all three
+  // forms, measured): none is 0, a non-number is refused, a non-finite one
+  // is out of range, and anything else is truncated and must be 0..7 (the
+  // COPYFILE_EXCL / FICLONE / FICLONE_FORCE bits) -- 1.5 is EXCL, -0.5 is 0,
+  // 2 ** 32 + 1 is out of range.
+  function copyFileMode(mode) {
+    if (mode == null) return 0;
+    if (typeof mode !== "number") {
+      throw Object.assign(new TypeError("mode must be int32 or null/undefined"), { code: "ERR_INVALID_ARG_TYPE" });
+    }
+    if (!Number.isFinite(mode)) {
+      throw Object.assign(new RangeError("mode is out of range"), { code: "ERR_OUT_OF_RANGE" });
+    }
+    const bits = Math.trunc(mode);
+    if (bits < 0 || bits > 7) {
+      throw Object.assign(new RangeError("mode is out of range: >= 0 && <= 7"), { code: "ERR_OUT_OF_RANGE" });
+    }
+    return bits | 0;
+  }
   function callbackSlot(args, required, optional) {
     if (required === CB_LAST) return args.length > 0 ? args.length - 1 : 0;
     const end = required + optional;
@@ -11293,7 +11313,11 @@
       }),
       unlink: (path) => natives.fsUnlink(toPath(path)),
       rename: (from, to) => natives.fsRename(toPath(from, "oldPath"), toPath(to, "newPath")),
-      copyFile: (from, to) => natives.fsCopyFile(toPath(from, "src"), toPath(to, "dest")),
+      copyFile: (from, to, mode) => {
+        const src = toPath(from, "src");
+        const dest = toPath(to, "dest");
+        return natives.fsCopyFile(src, dest, copyFileMode(mode));
+      },
       // node v22's fs.promises.glob returns an AsyncIterable, not a Promise.
       // Wrap the materialized array so Array.fromAsync() works on both sides.
       glob: (pattern, options) => globAsyncIterable(globSyncRaw(pattern, options, natives)),
@@ -12315,7 +12339,11 @@
       unlinkSync: (path) => natives.fsUnlinkSync(toPath(path)),
       renameSync: (from, to) =>
         natives.fsRenameSync(toPath(from, "oldPath"), toPath(to, "newPath")),
-      copyFileSync: (from, to) => natives.fsCopyFileSync(toPath(from, "src"), toPath(to, "dest")),
+      copyFileSync: (from, to, mode) => {
+        const src = toPath(from, "src");
+        const dest = toPath(to, "dest");
+        return natives.fsCopyFileSync(src, dest, copyFileMode(mode));
+      },
       accessSync: (path, mode) => natives.fsAccessSync(toPath(path), mode ?? 0),
       // node's realpathSync stringifies rather than type-checks (`p += ''`),
       // and on failure reports what its component walk hit (realpathWalk).

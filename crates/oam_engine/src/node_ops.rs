@@ -6484,13 +6484,15 @@ fn op_fs_copy_file_sync(
         throw_type_error(scope, "copyFileSync requires from and to paths");
         return;
     };
+    // The COPYFILE_* bits, checked in JS (copyFileMode).
+    let copy_mode = args.get(2).uint32_value(scope).unwrap_or(0);
     let Some(from) = fs_path_of(scope, from, FsAccess::Read) else {
         return;
     };
     let Some(to) = fs_path_of(scope, to, FsAccess::Write) else {
         return;
     };
-    if let Err(e) = std::fs::copy(&from, &to) {
+    if let Err(e) = oam_core::copy_file(&from, &to, copy_mode) {
         let (path, dest) = (from.shown(), to.shown());
         throw_node_error_dest(scope, "copyfile", &path, &dest, &e);
     }
@@ -7144,13 +7146,19 @@ fn op_fs_copy_file(
         throw_type_error(scope, "copyFile requires from and to paths");
         return;
     };
+    // The COPYFILE_* bits, checked in JS (copyFileMode).
+    let copy_mode = args.get(2).uint32_value(scope).unwrap_or(0);
     let Some(from) = fs_path_of(scope, from, FsAccess::Read) else {
         return;
     };
     let Some(to) = fs_path_of(scope, to, FsAccess::Write) else {
         return;
     };
-    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_copy_file(from, to));
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fs_copy_file(from, to, copy_mode),
+    );
 }
 
 fn op_fs_unlink(

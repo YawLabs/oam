@@ -281,6 +281,11 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   a type outside the three fails `ERR_FS_INVALID_SYMLINK_TYPE`. `new Worker(path)` tests that
   its script exists on the namespaced path its loader opens, so `w.js.` is not found when only
   `w.js` exists, and a file named `x.js.` is. (#275)
+- **`fs.copyFile`, `copyFileSync` and `fs.promises.copyFile` honour their mode.**
+  `COPYFILE_EXCL` fails `EEXIST` instead of overwriting the destination; a mode that is not
+  a number, not finite or outside 0..7 fails `ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE`
+  before any path is touched; on Windows `COPYFILE_FICLONE_FORCE` fails `ENOSYS`, as node's
+  does.
 
 ### Performance
 

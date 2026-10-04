@@ -2797,6 +2797,45 @@ pub fn win32_symlink_target(
     }
 }
 
+/// `fs.constants.COPYFILE_EXCL`: fail if the destination exists.
+pub const COPYFILE_EXCL: u32 = 1;
+/// `fs.constants.COPYFILE_FICLONE_FORCE`: clone or fail.
+pub const COPYFILE_FICLONE_FORCE: u32 = 4;
+
+/// `fs.copyFile` with node's `mode` bits (already checked to be 0..7), as
+/// libuv's uv_fs_copyfile treats them:
+///
+/// - `COPYFILE_FICLONE_FORCE` on Windows is `ENOSYS` before anything is
+///   touched: libuv's Windows copy has no clone. Elsewhere it copies, as
+///   `COPYFILE_FICLONE` (try a clone, fall back) always does here.
+/// - `COPYFILE_EXCL` fails `EEXIST` when the destination exists, as
+///   CopyFileW with fail-if-exists and libuv's Unix `O_EXCL` open do. The
+///   source is looked at first, so a missing source is `ENOENT` even when
+///   the destination exists; the destination is then claimed with a
+///   create-new open, so a destination made meanwhile is not overwritten,
+///   and the claim is dropped again if the copy fails.
+pub fn copy_file(from: &FsPath, to: &FsPath, mode: u32) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if mode & COPYFILE_FICLONE_FORCE != 0 {
+        // No raw OS code to carry: the kind gives ENOSYS, the text uv_strerror's.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "function not implemented",
+        ));
+    }
+    if mode & COPYFILE_EXCL == 0 {
+        return std::fs::copy(from, to).map(|_| ());
+    }
+    std::fs::metadata(from)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    std::fs::copy(from, to).map(|_| ()).inspect_err(|_| {
+        let _ = std::fs::remove_file(to);
+    })
+}
+
 /// The link type a `symlink` call asked for, as node's JS hands it over:
 /// `Probe` when it gave none (on Windows node then stats the target to
 /// choose), otherwise `file`, `dir` or `junction`. Off Windows the type
@@ -5290,14 +5329,18 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_copy_file(from: super::FsPath, to: super::FsPath) -> OpOutcome {
-        match tokio::fs::copy(&from, &to).await {
-            Ok(_) => OpOutcome::Done,
-            Err(e) => {
-                let (path, dest) = (from.shown(), to.shown());
-                node_fail_dest(e, "copyfile", &path, &dest)
-            }
-        }
+    /// node's async `copyFile`; `mode` as `super::copy_file` takes it.
+    pub async fn fs_copy_file(from: super::FsPath, to: super::FsPath, mode: u32) -> OpOutcome {
+        let result =
+            tokio::task::spawn_blocking(move || match super::copy_file(&from, &to, mode) {
+                Ok(()) => OpOutcome::Done,
+                Err(e) => {
+                    let (path, dest) = (from.shown(), to.shown());
+                    node_fail_dest(e, "copyfile", &path, &dest)
+                }
+            })
+            .await;
+        result.unwrap_or_else(|e| OpOutcome::Failed(format!("copyfile: {e}")))
     }
 
     pub async fn fs_access(path: super::FsPath, mode: i32) -> OpOutcome {
