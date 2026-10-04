@@ -13,10 +13,14 @@ oam is a JavaScript/TypeScript runtime built in Rust on V8, designed around thre
    WinterTC ECMA-429, WPT), soak farms, crash-rate telemetry, a behavior-change log on every
    release, and an LTS commitment. Claims come with reproducible numbers or they don't ship.
 3. **Built for the AI era, owned by no model vendor.** Every diagnostic oam emits — parse,
-   type, runtime, test, install — is ODIF: structured JSON with stable codes and typed repair
-   plans that agents consume directly (and humans see pretty-printed from the same stream).
-   Sandboxed-by-default agent execution, an MCP server into the runtime's introspection, and
-   checkpoint/fork primitives for parallel eval loops.
+   type, resolve, runtime, test, install — is ODIF: structured JSON with stable codes and
+   source spans that agents consume directly (and humans see pretty-printed from the same
+   stream). Typed repair plans are the design goal: the envelope reserves a `repairs` field,
+   but nothing populates it yet. Today oam ships an MCP server into the runtime's
+   introspection, Node's permission model as an opt-in sandbox (`--permission` plus
+   `--allow-*` grants; a run without it is all-granted, as in Node), and `oam.fork()`, a
+   pool of pre-warmed isolates for parallel eval loops — not checkpoint/restore of a running
+   isolate.
 
 ## Status
 

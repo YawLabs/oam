@@ -361,99 +361,166 @@ fn tool_text(text: &str, is_error: bool) -> Value {
 }
 
 /// The offline twin of https://oamjs.org/docs/errors: explanations for
-/// ODIF codes that need no network.
+/// ODIF codes that need no network. Every zero-padded code the workspace
+/// emits must have an entry here; `every_emitted_code_has_an_explanation`
+/// enforces it.
+const KNOWN_CODES: &[(&str, &str)] = &[
+    (
+        "OAM-PARSE0001",
+        "TypeScript/JavaScript parse error from the oxc parser. The source is syntactically invalid at the span; fix the syntax before anything else will work.",
+    ),
+    (
+        "OAM-PARSE0002",
+        "TypeScript transform error: the source parsed but could not be lowered to JavaScript (e.g. unsupported syntax combination).",
+    ),
+    (
+        "OAM-MOD0001",
+        "A relative import did not resolve to any file. The message lists every candidate path tried; create the file or fix the specifier.",
+    ),
+    (
+        "OAM-MOD0002",
+        "A package could not be found in any node_modules directory above the importing file (or its resolution pointed at a missing file). Is it installed? oam resolves against existing npm/pnpm installs until the oam installer lands (M3).",
+    ),
+    (
+        "OAM-MOD0005",
+        "Retired (no longer emitted): CommonJS entries execute through CJS interop since M2. If an old toolchain surfaced this code, upgrade oam and re-run.",
+    ),
+    (
+        "OAM-MOD0006",
+        "This Node builtin is not implemented yet. Shipped: assert, async_hooks (AsyncLocalStorage), buffer, crypto (hash/hmac/random/webcrypto-digest), events, fs (+streams), fs/promises, module, os, path, process, stream (+promises/web/consumers), string_decoder, tty, url, util; the rest (http, child_process, zlib, ...) land with later compat waves.",
+    ),
+    (
+        "OAM-MOD0007",
+        "The package's exports map does not export this subpath (Node's ERR_PACKAGE_PATH_NOT_EXPORTED). Check the package's documented entry points.",
+    ),
+    (
+        "OAM-MOD0008",
+        "Warning: tsconfig.json `extends` names a package (e.g. @tsconfig/node20), which oam does not resolve yet. The declaring file's own compilerOptions still apply; only what it would have inherited (paths, jsx settings) is unavailable. Inline those options or extend a relative path.",
+    ),
+    (
+        "OAM-MOD0009",
+        "Warning: a tsconfig.json could not be used -- it is not valid JSONC, cannot be read, or its extends chain is deeper than 8 levels (a cycle). Its compilerOptions (paths, jsx settings) are ignored until it parses; `oam check` reports the exact syntax error.",
+    ),
+    (
+        "OAM-MOD0003",
+        "This module type is not executable: a .json file used as the ENTRY (import it from a script — JSON imports work, with or without `with { type: 'json' }`), an unsupported import-attribute type, or an unknown extension. .cts runs through CJS interop with TS strip; .cjs runs through CJS interop; .tsx/.jsx run through the JSX automatic runtime (v0.8.1+).",
+    ),
+    (
+        "OAM-MOD0004",
+        "Invalid module specifier shape: '.', '..', or backslashes. Use './name' or '../name' with forward slashes.",
+    ),
+    (
+        "OAM-TEST0000",
+        "oam test machine summary (counts per run). severity=info means all green; severity=error means at least one failure.",
+    ),
+    (
+        "OAM-TEST0001",
+        "A test failed. The message carries 'FAIL <full test name>: <assertion message>'; the span points at the test file. Run `oam test -t '<name>'` to re-run just that test.",
+    ),
+    (
+        "OAM-TEST0003",
+        "The test run itself crashed outside any test (a beforeAll threw at module scope, the runner deadlocked, or results failed to serialize). Fix the file-level error before reading individual results.",
+    ),
+    (
+        "OAM-RT0001",
+        "Uncaught runtime exception. The message carries the JS error; the span (when present) points at the throw site.",
+    ),
+    (
+        "OAM-RT0002",
+        "The runtime could not read a file or start a subsystem (I/O error). Check the path and permissions in the message.",
+    ),
+    (
+        "OAM-RT0003",
+        "Top-level await never settled and no timers or pending IO remain: the awaited promise can never resolve (deadlock). Find the promise that is never resolved/rejected.",
+    ),
+    (
+        "OAM-RT0004",
+        "A promise rejected with no handler attached (Node's ERR_UNHANDLED_REJECTION equivalent). Attach .catch() or await it in a try/catch.",
+    ),
+    (
+        "OAM-RT0005",
+        "Uncaught runtime exception, reported in Node's format: source frame, stack, then the error's own properties. The stack's first frame is the throw site.",
+    ),
+    (
+        "OAM-TS0000",
+        "tsgo (the TypeScript 7 native compiler) is not installed or not on PATH. Install: npm i -g @typescript/native-preview, or set OAM_TSGO.",
+    ),
+    (
+        "OAM-TS0003",
+        "oam check found no tsconfig.json walking up from the target. Point it at a .ts file directly or add a tsconfig.json.",
+    ),
+    (
+        "OAM-TS0004",
+        "tsgo exited abnormally without producing diagnostics — its raw output is in the message. Usually a tsgo crash or bad flags, not a problem in your code.",
+    ),
+    (
+        "OAM-TS0002",
+        "oam could not launch tsgo, or launched something that is not tsgo: the message says what `--version` printed and what was expected (major version 7 or above, from @typescript/native-preview). A `tsc` on PATH under the name oam resolved is the usual cause. The same code covers a check that could not be set up at all (a bad check target path).",
+    ),
+    (
+        "OAM-TS0005",
+        "Warning: the concurrent type check did not finish before the program exited, so this run has no type results. By design `oam run` never blocks on the checker. The message says which case applies: a project with a tsconfig.json is warming its daemon and will be instant next run; a single file has no daemon (or the one-shot check was cancelled), so run `oam check <file>` for results. OAM_CHECK_WAIT_MS lengthens the wait.",
+    ),
+    (
+        "OAM-TS0006",
+        "tsgo ran past its timeout and its process tree was killed. The message carries the timeout and the command; set OAM_TSGO_TIMEOUT_MS higher for a genuinely large project.",
+    ),
+    (
+        "OAM-TS0007",
+        "The tsgo run was cancelled before it finished: the work it was doing is no longer wanted, typically because the run that asked for it ended. Not a problem in your code.",
+    ),
+    (
+        "OAM-PKG0000",
+        "Info: the summary of a successful `oam install --json` -- how many packages were installed and how long it took. Emitted even when nothing failed.",
+    ),
+    (
+        "OAM-PKG0001",
+        "The lockfile could not be read or parsed. If package-lock.json is missing, run `npm install` once to generate it -- oam installs from the lockfile and does not write one.",
+    ),
+    (
+        "OAM-PKG0002",
+        "Unsupported lockfileVersion. oam reads lockfileVersion 3; regenerate the lockfile with npm 7 or later.",
+    ),
+    (
+        "OAM-PKG0003",
+        "The installer could not build its async runtime or its HTTP client. A local environment failure, not a problem with your dependency tree; the message carries the underlying error.",
+    ),
+    (
+        "OAM-PKG0004",
+        "One package failed to install: 'failed to install <key>: <cause>', where the cause is the download, the SRI integrity check, or extraction. The key is the package's lockfile path, so a dependency duplicated at two versions is unambiguous.",
+    ),
+    (
+        "OAM-PKG0005",
+        "Warning: bin shims could not be created (the node_modules/.bin directory could not be made, or a package directory could not be canonicalized). The packages are installed, but the commands they provide are not on node_modules/.bin. Does not fail the install.",
+    ),
+    (
+        "OAM-PKG0006",
+        "Only --frozen-lockfile mode is supported in this release. `oam install` is the `npm ci` equivalent: it installs exactly what the lockfile says and never changes it.",
+    ),
+    (
+        "OAM-PKG0007",
+        "Warning: a package's lifecycle scripts were skipped. The message names the package, its version and the scripts; skipping dependency code is the default, not a failure. Allow one package with `oam trust add <package>`. The same code covers the blanket skip when OAM_IGNORE_SCRIPTS is set.",
+    ),
+    (
+        "OAM-PKG0008",
+        "Warning: `oam install --precompile` could not pre-transpile some files in a package. The message names the package and the first few failures. Nothing is broken: those files transpile on first use, as they would without --precompile.",
+    ),
+    (
+        "OAM-PKG0009",
+        "A lifecycle script you trusted ran and failed. The message names the package and the phase. The install is partial: the package is on disk but its build step did not complete.",
+    ),
+    (
+        "OAM-NATIVE0001",
+        "Thrown as an Error's `code` at require() time, not an ODIF diagnostic: native .node addons are disabled by default, because a Node-built addon can deadlock the OS loader inside oam. Set OAM_ENABLE_NATIVE_ADDONS=1 to opt in to oam's N-API support (alpha). Catchable, so `try { require(native) } catch { /* JS fallback */ }` keeps working.",
+    ),
+    (
+        "OAM-NATIVE0002",
+        "Thrown as an Error's `code` at require() time, not an ODIF diagnostic: this oam build has no N-API support at all (compiled without the `napi` cargo feature), so no environment variable can help. Rebuild with the default features.",
+    ),
+];
+
 fn explain_code(code: &str) -> String {
-    let known: &[(&str, &str)] = &[
-        (
-            "OAM-PARSE0001",
-            "TypeScript/JavaScript parse error from the oxc parser. The source is syntactically invalid at the span; fix the syntax before anything else will work.",
-        ),
-        (
-            "OAM-PARSE0002",
-            "TypeScript transform error: the source parsed but could not be lowered to JavaScript (e.g. unsupported syntax combination).",
-        ),
-        (
-            "OAM-MOD0001",
-            "A relative import did not resolve to any file. The message lists every candidate path tried; create the file or fix the specifier.",
-        ),
-        (
-            "OAM-MOD0002",
-            "A package could not be found in any node_modules directory above the importing file (or its resolution pointed at a missing file). Is it installed? oam resolves against existing npm/pnpm installs until the oam installer lands (M3).",
-        ),
-        (
-            "OAM-MOD0005",
-            "Retired (no longer emitted): CommonJS entries execute through CJS interop since M2. If an old toolchain surfaced this code, upgrade oam and re-run.",
-        ),
-        (
-            "OAM-MOD0006",
-            "This Node builtin is not implemented yet. Shipped: assert, async_hooks (AsyncLocalStorage), buffer, crypto (hash/hmac/random/webcrypto-digest), events, fs (+streams), fs/promises, module, os, path, process, stream (+promises/web/consumers), string_decoder, tty, url, util; the rest (http, child_process, zlib, ...) land with later compat waves.",
-        ),
-        (
-            "OAM-MOD0007",
-            "The package's exports map does not export this subpath (Node's ERR_PACKAGE_PATH_NOT_EXPORTED). Check the package's documented entry points.",
-        ),
-        (
-            "OAM-MOD0008",
-            "Warning: tsconfig.json `extends` names a package (e.g. @tsconfig/node20), which oam does not resolve yet. The declaring file's own compilerOptions still apply; only what it would have inherited (paths, jsx settings) is unavailable. Inline those options or extend a relative path.",
-        ),
-        (
-            "OAM-MOD0009",
-            "Warning: a tsconfig.json could not be used -- it is not valid JSONC, cannot be read, or its extends chain is deeper than 8 levels (a cycle). Its compilerOptions (paths, jsx settings) are ignored until it parses; `oam check` reports the exact syntax error.",
-        ),
-        (
-            "OAM-MOD0003",
-            "This module type is not executable: a .json file used as the ENTRY (import it from a script — JSON imports work, with or without `with { type: 'json' }`), an unsupported import-attribute type, or an unknown extension. .cts runs through CJS interop with TS strip; .cjs runs through CJS interop; .tsx/.jsx run through the JSX automatic runtime (v0.8.1+).",
-        ),
-        (
-            "OAM-MOD0004",
-            "Invalid module specifier shape: '.', '..', or backslashes. Use './name' or '../name' with forward slashes.",
-        ),
-        (
-            "OAM-TEST0000",
-            "oam test machine summary (counts per run). severity=info means all green; severity=error means at least one failure.",
-        ),
-        (
-            "OAM-TEST0001",
-            "A test failed. The message carries 'FAIL <full test name>: <assertion message>'; the span points at the test file. Run `oam test -t '<name>'` to re-run just that test.",
-        ),
-        (
-            "OAM-TEST0003",
-            "The test run itself crashed outside any test (a beforeAll threw at module scope, the runner deadlocked, or results failed to serialize). Fix the file-level error before reading individual results.",
-        ),
-        (
-            "OAM-RT0001",
-            "Uncaught runtime exception. The message carries the JS error; the span (when present) points at the throw site.",
-        ),
-        (
-            "OAM-RT0002",
-            "The runtime could not read a file or start a subsystem (I/O error). Check the path and permissions in the message.",
-        ),
-        (
-            "OAM-RT0003",
-            "Top-level await never settled and no timers or pending IO remain: the awaited promise can never resolve (deadlock). Find the promise that is never resolved/rejected.",
-        ),
-        (
-            "OAM-RT0004",
-            "A promise rejected with no handler attached (Node's ERR_UNHANDLED_REJECTION equivalent). Attach .catch() or await it in a try/catch.",
-        ),
-        (
-            "OAM-RT0005",
-            "Uncaught runtime exception, reported in Node's format: source frame, stack, then the error's own properties. The stack's first frame is the throw site.",
-        ),
-        (
-            "OAM-TS0000",
-            "tsgo (the TypeScript 7 native compiler) is not installed or not on PATH. Install: npm i -g @typescript/native-preview, or set OAM_TSGO.",
-        ),
-        (
-            "OAM-TS0003",
-            "oam check found no tsconfig.json walking up from the target. Point it at a .ts file directly or add a tsconfig.json.",
-        ),
-        (
-            "OAM-TS0004",
-            "tsgo exited abnormally without producing diagnostics — its raw output is in the message. Usually a tsgo crash or bad flags, not a problem in your code.",
-        ),
-    ];
-    if let Some((_, explanation)) = known.iter().find(|(k, _)| *k == code) {
+    if let Some((_, explanation)) = KNOWN_CODES.iter().find(|(k, _)| *k == code) {
         return format!("{code}: {explanation}");
     }
     // Zero-padded OAM-TS codes are oam's OWN (OAM-TS0004 is "tsgo exited
@@ -473,7 +540,7 @@ fn explain_code(code: &str) -> String {
         );
     }
     format!(
-        "{code}: unknown code. Known families: OAM-PARSE* (parse/transform), OAM-MOD* (module resolution), OAM-RT* (runtime), OAM-TS* (type checking), OAM-TEST*/OAM-PKG* (reserved for the test runner and installer)."
+        "{code}: unknown code. Known families: OAM-PARSE* (parse/transform), OAM-MOD* (module resolution), OAM-RT* (runtime), OAM-TS* (type checking), OAM-TEST* (test runner), OAM-PKG* (installer), OAM-NATIVE* (native addon load errors). See https://oamjs.org/docs/errors for the full list."
     )
 }
 
@@ -535,6 +602,84 @@ mod tests {
         assert!(explain_code("OAM-MOD0002").contains("node_modules"));
         assert!(explain_code("OAM-TS2322").contains("TS2322"));
         assert!(explain_code("OAM-NOPE").contains("unknown code"));
+        assert!(!explain_code("OAM-NOPE").contains("reserved"));
+        for code in [
+            "OAM-TS0002",
+            "OAM-TS0005",
+            "OAM-TS0006",
+            "OAM-TS0007",
+            "OAM-PKG0000",
+            "OAM-PKG0009",
+            "OAM-NATIVE0001",
+        ] {
+            assert!(
+                !explain_code(code).contains("unknown code"),
+                "{code}: {}",
+                explain_code(code)
+            );
+        }
+    }
+
+    /// Every zero-padded `"OAM-XXX0000"` literal under crates/*/src (the
+    /// codes oam itself raises; non-zero-padded OAM-TS codes are tsgo
+    /// pass-throughs and the OAM-TEST9xxx ones are fixtures) has its own
+    /// entry in KNOWN_CODES, so an emitter cannot ship a code that
+    /// `oam_explain` answers with "unknown code".
+    #[test]
+    fn every_emitted_code_has_an_explanation() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let mut files = Vec::new();
+        for krate in std::fs::read_dir(crates).unwrap().flatten() {
+            let src = krate.path().join("src");
+            if src.is_dir() && krate.file_name() != "oam_mcp" {
+                walk(&src, &mut files);
+            }
+        }
+        assert!(!files.is_empty(), "no sources found under {crates:?}");
+        let mut emitted = std::collections::BTreeSet::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            for (i, _) in text.match_indices("\"OAM-") {
+                let rest = &text[i + 1..];
+                let Some(end) = rest.find('"') else { continue };
+                let code = &rest[..end];
+                let tail = &code["OAM-".len()..];
+                let letters = tail.trim_end_matches(|c: char| c.is_ascii_digit());
+                let digits = &tail[letters.len()..];
+                if letters.is_empty()
+                    || !letters.chars().all(|c| c.is_ascii_uppercase())
+                    || digits.len() != 4
+                    || !digits.starts_with('0')
+                {
+                    continue;
+                }
+                emitted.insert(code.to_string());
+            }
+        }
+        assert!(
+            emitted.contains("OAM-PKG0004"),
+            "scanner found: {emitted:?}"
+        );
+        let missing: Vec<_> = emitted
+            .iter()
+            .filter(|c| !KNOWN_CODES.iter().any(|(k, _)| k == c))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "codes with no oam_explain entry: {missing:?}"
+        );
     }
 
     #[test]
