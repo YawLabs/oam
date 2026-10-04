@@ -286,6 +286,10 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   a number, not finite or outside 0..7 fails `ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE`
   before any path is touched; on Windows `COPYFILE_FICLONE_FORCE` fails `ENOSYS`, as node's
   does.
+- **`fs.cpSync`, `fs.cp` and `fs.promises.cp` refuse a copy onto itself or into itself**
+  with node's `ERR_FS_CP_EINVAL` ("src and dest cannot be the same", "... to a subdirectory
+  of self ..."), before anything is made. A directory copied into its own subdirectory used to
+  be copied until the process was killed, and a file copied onto itself failed `EBUSY`.
 
 ### Performance
 

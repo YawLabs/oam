@@ -11161,6 +11161,85 @@
     });
   }
 
+  // Whether two stats name the same file, as node's areIdentical judges it.
+  function cpSameFile(a, b) {
+    return !!(b && b.ino && b.dev && a.ino === b.ino && a.dev === b.dev);
+  }
+
+  // The rest of node's cp path checks, after cpTypeMismatch: a copy onto
+  // itself, and a directory copied into itself. `srcRaw` / `destRaw` are the
+  // two stats (`destRaw` null when there is nothing there); `statOf(p)` is
+  // the stat of `p` or null. Returns the error, or null. Measured on
+  // v22.22.2:
+  //
+  // - cpSync (C++ CpSyncCheckPaths) throws a plain Error with `code` alone,
+  //   on the paths its C++ is handed (namespaced on Windows): "src and dest
+  //   cannot be the same <dest>", and "Cannot copy <src><sep> to a
+  //   subdirectory of self <dest>" when dest's string starts with src's
+  //   plus a separator, or dest's parent is src itself.
+  // - cp and fs.promises.cp (checkPaths, checkParentPaths) throw the
+  //   SystemError ERR_FS_CP_EINVAL naming the paths as given: "src and dest
+  //   cannot be the same", and "cannot copy <src> to a subdirectory of self
+  //   <dest>" when src's resolved components lead dest's, or any directory
+  //   above dest (up to the root, or to src's own parent) is src.
+  //
+  // Both come before the check for a directory copied without `recursive`.
+  // Without them a copy into its own subdirectory never ended.
+  function cpSelfCheck(srcRaw, destRaw, src, dest, sync, statOf) {
+    const path = registry.get("path");
+    if (sync) {
+      const ns = globalThis.__oam.node.fsOsPathOf;
+      const destShown = ns(dest);
+      if (destRaw !== null && cpSameFile(srcRaw, destRaw)) {
+        return makeNodeError("ERR_FS_CP_EINVAL", "src and dest cannot be the same " + destShown);
+      }
+      let srcShown = ns(src);
+      if (!srcShown.endsWith(path.sep)) srcShown += path.sep;
+      const self = () =>
+        makeNodeError("ERR_FS_CP_EINVAL", "Cannot copy " + srcShown + " to a subdirectory of self " + destShown);
+      if (srcRaw.kind === "dir" && destShown.startsWith(srcShown)) return self();
+      const destParent = path.dirname(destShown);
+      if (path.dirname(ns(src)) !== destParent && path.dirname(destParent) !== destParent) {
+        if (cpSameFile(srcRaw, statOf(destParent))) return self();
+      }
+      return null;
+    }
+    const einval = (message) =>
+      new SystemError("ERR_FS_CP_EINVAL", "Invalid src or dest", {
+        message,
+        path: dest,
+        syscall: "cp",
+        errno: 22,
+        code: "EINVAL",
+      });
+    if (destRaw !== null && cpSameFile(srcRaw, destRaw)) return einval("src and dest cannot be the same");
+    const self = () => einval(`cannot copy ${src} to a subdirectory of self ${dest}`);
+    if (srcRaw.kind === "dir") {
+      const srcParts = path.resolve(src).split(path.sep).filter(Boolean);
+      const destParts = path.resolve(dest).split(path.sep).filter(Boolean);
+      if (srcParts.every((part, i) => destParts[i] === part)) return self();
+    }
+    const srcParent = path.resolve(path.dirname(src));
+    let destParent = path.resolve(path.dirname(dest));
+    while (destParent !== srcParent && destParent !== path.parse(destParent).root) {
+      const parentRaw = statOf(destParent);
+      if (parentRaw === null) break;
+      if (cpSameFile(srcRaw, parentRaw)) return self();
+      destParent = path.resolve(path.dirname(destParent));
+    }
+    return null;
+  }
+
+  // The stat of `p` for cpSelfCheck's parent walk, null when it is not there.
+  function cpStatOrNull(natives, p) {
+    try {
+      return natives.fsStatSync(p, false);
+    } catch (e) {
+      if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return null;
+      throw e;
+    }
+  }
+
   // The destination's stat for cpTypeMismatch: lstat, as node's (stat with
   // `dereference`), null when there is nothing there.
   function cpDestStatSync(natives, dest, opts) {
@@ -11199,13 +11278,20 @@
     const withPath = (fn) =>
       Object.defineProperty((path, ...rest) => fn(toPath(path), ...rest), "length", { value: fn.length });
     // fs/promises.cp over two validated paths.
-    async function cpRecursive(srcStr, destStr, options) {
+    async function cpRecursive(srcStr, destStr, options, nested) {
       var opts = options || {};
       var raw = await natives.fsStat(srcStr, false);
+      var destRaw = await cpDestStat(natives, destStr, opts);
       // A directory onto a file, or a file onto a directory: node's coded
       // errors, before anything is copied.
-      var mismatch = cpTypeMismatch(raw.kind === "dir", await cpDestStat(natives, destStr, opts), srcStr, destStr, false);
+      var mismatch = cpTypeMismatch(raw.kind === "dir", destRaw, srcStr, destStr, false);
       if (mismatch !== null) throw mismatch;
+      // node's checks of a copy onto or into itself, once, on the paths the
+      // call was given.
+      if (!nested) {
+        var self = cpSelfCheck(raw, destRaw, srcStr, destStr, false, (p) => cpStatOrNull(natives, p));
+        if (self !== null) throw self;
+      }
       if (raw.kind === "dir") {
         if (!opts.recursive) throw cpDirWithoutRecursive(srcStr, false);
         try { await natives.fsMkdir(destStr, true); } catch (e) {}
@@ -11214,7 +11300,7 @@
         // them with the platform's separator.
         var join = registry.get("path").join;
         for (var i = 0; i < entries.length; i++) {
-          await cpRecursive(join(srcStr, entries[i].name), join(destStr, entries[i].name), opts);
+          await cpRecursive(join(srcStr, entries[i].name), join(destStr, entries[i].name), opts, true);
         }
       } else {
         await natives.fsCopyFile(srcStr, destStr);
@@ -12197,6 +12283,39 @@
     const realpathByPath = callbackify1((p) => realpathWalking(realpathArg(p)), 1);
     const mkdtempByPrefix = callbackify1(promises.mkdtemp, 1, 1);
     const symlinkByCallback = callbackify1(promises.symlink, CB_LAST);
+    // cpSync over two validated paths; `top` runs node's path checks, which
+    // node makes once, on the paths the call was given.
+    function cpSyncWalk(srcStr, destStr, opts, top) {
+      var raw = natives.fsStatSync(srcStr, false);
+      var destRaw = cpDestStatSync(natives, destStr, opts);
+      // A copy onto itself is never a type mismatch, so the self checks can
+      // follow that one and still come first for it.
+      var mismatch = cpTypeMismatch(raw.kind === "dir", destRaw, srcStr, destStr, true);
+      if (mismatch !== null) throw mismatch;
+      if (top) {
+        // The C++ stops its parent walk on any error, not only a missing path.
+        var statOf = (p) => {
+          try {
+            return natives.fsStatSync(p, false);
+          } catch (e) {
+            return null;
+          }
+        };
+        var self = cpSelfCheck(raw, destRaw, srcStr, destStr, true, statOf);
+        if (self !== null) throw self;
+      }
+      if (raw.kind === "dir") {
+        if (!opts.recursive) throw cpDirWithoutRecursive(srcStr, true);
+        try { natives.fsMkdirSync(destStr, true); } catch (e) {}
+        var entries = natives.fsReaddirSync(srcStr);
+        var join = registry.get("path").join;
+        for (var i = 0; i < entries.length; i++) {
+          cpSyncWalk(join(srcStr, entries[i].name), join(destStr, entries[i].name), opts, false);
+        }
+      } else {
+        natives.fsCopyFileSync(srcStr, destStr);
+      }
+    }
     const truncateByPath = callbackify1(promises.truncate, 2);
     const chmodByPath = callbackify1(promises.chmod, 2);
 
@@ -12452,24 +12571,8 @@
         var dirPath = toPath(path);
         return new Dir(dirPath, natives.fsReaddirSync(dirPath));
       },
-      cpSync: function cpSyncRecursive(src, dest, options) {
-        var srcStr = toPath(src, "src");
-        var destStr = toPath(dest, "dest");
-        var opts = options || {};
-        var raw = natives.fsStatSync(srcStr, false);
-        var mismatch = cpTypeMismatch(raw.kind === "dir", cpDestStatSync(natives, destStr, opts), srcStr, destStr, true);
-        if (mismatch !== null) throw mismatch;
-        if (raw.kind === "dir") {
-          if (!opts.recursive) throw cpDirWithoutRecursive(srcStr, true);
-          try { natives.fsMkdirSync(destStr, true); } catch (e) {}
-          var entries = natives.fsReaddirSync(srcStr);
-          var join = registry.get("path").join;
-          for (var i = 0; i < entries.length; i++) {
-            cpSyncRecursive(join(srcStr, entries[i].name), join(destStr, entries[i].name), opts);
-          }
-        } else {
-          natives.fsCopyFileSync(srcStr, destStr);
-        }
+      cpSync: function cpSync(src, dest, options) {
+        cpSyncWalk(toPath(src, "src"), toPath(dest, "dest"), options || {}, true);
       },
 
       readFile: function (path, options, cb) {
