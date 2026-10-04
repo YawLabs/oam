@@ -137,6 +137,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     bind!(
         ("env", op_env),
         ("envHidden", op_env_hidden),
+        ("forkIpcPort", op_fork_ipc_port),
         ("argv", op_argv),
         ("cwd", op_cwd),
         ("chdir", op_chdir),
@@ -1016,6 +1017,32 @@ fn op_env_hidden(
         && let Some(value) = v8::String::new(scope, &value.to_string_lossy())
     {
         rv.set(value.into());
+    }
+}
+
+/// The variable child_process.fork() names its IPC channel's port in.
+const FORK_IPC_PORT_VAR: &str = "OAM_FORK_IPC_PORT";
+
+/// `__oam.node.forkIpcPort()`: the port of the IPC channel this process was
+/// forked with, or `undefined`. It is taken out of the environment as it is
+/// read, as node's setupChildProcessIpcChannel deletes NODE_CHANNEL_FD: a
+/// forked child's process.env does not hold it, so neither do its own
+/// children nor its workers, which would otherwise connect to the same
+/// parent. Read from the real environment, not through process.env: the
+/// channel is oam's own plumbing, so the --allow-env grant (which decides
+/// what the script may read) does not decide whether a forked child has
+/// its channel.
+fn op_fork_ipc_port(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(port) = std::env::var_os(FORK_IPC_PORT_VAR) else {
+        return;
+    };
+    set_process_env(FORK_IPC_PORT_VAR, None);
+    if let Some(port) = v8::String::new(scope, &port.to_string_lossy()) {
+        rv.set(port.into());
     }
 }
 

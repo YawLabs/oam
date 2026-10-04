@@ -32156,6 +32156,56 @@ fn a_child_gets_only_the_variables_process_env_shows() {
     );
 }
 
+/// A forked child has its IPC channel whatever `--allow-env` grants.
+///
+/// fork() names the channel's port in an environment variable of oam's own;
+/// the child read it through process.env, so under a list `--allow-env` that
+/// did not name it the child had no channel and `process.send` was undefined.
+/// The child now takes it from the real environment and removes it, as
+/// node's child deletes NODE_CHANNEL_FD: process.env does not show it, and
+/// the child's own child does not inherit it.
+#[test]
+fn a_forked_child_has_its_channel_under_a_list_allow_env() {
+    let child = write_temp(
+        "fork_ipc_perm_child.cjs",
+        "const { spawnSync } = require('node:child_process');\n\
+         const ipc = (env) => Object.keys(env).filter((k) => /IPC|CHANNEL/.test(k)).join(',') || 'none';\n\
+         const grand = spawnSync(process.execPath, ['-e', \"process.stdout.write(Object.keys(process.env).filter((k) => /IPC|CHANNEL/.test(k)).join(',') || 'none')\"], { encoding: 'utf8' });\n\
+         process.send({ send: typeof process.send, own: ipc(process.env), grand: grand.stdout },\n\
+         \x20 () => process.disconnect());\n",
+    );
+    let script = write_temp(
+        "fork_ipc_perm.mjs",
+        "import { fork } from 'node:child_process';\n\
+         const cp = fork(process.argv[2]);\n\
+         cp.on('message', (m) => console.log('message ' + JSON.stringify(m)));\n\
+         cp.on('exit', (code) => console.log('child exit ' + code));\n",
+    );
+    let out = oam_with_env(
+        &[
+            "--permission",
+            "--allow-env=CE_GRANTED,SYSTEMROOT,PATH,TEMP,WINDIR,SYSTEMDRIVE,USERPROFILE",
+            "--allow-child-process",
+            "--allow-net",
+            "--allow-fs-read=*",
+            script.to_str().unwrap(),
+            child.to_str().unwrap(),
+        ],
+        &[("CE_GRANTED", "granted")],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains(r#"message {"send":"function","own":"none","grand":"none"}"#),
+        "the child has its channel, and neither it nor its child sees the port: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("child exit 0"),
+        "{stdout}\nstderr: {stderr}"
+    );
+}
+
 /// `--allow-net` must scope by host, not merely toggle networking on.
 #[test]
 fn allow_net_list_is_scoped_to_the_listed_host() {

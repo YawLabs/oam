@@ -23,8 +23,9 @@
 // prints only CE_* names with values, plus the names (never the values) of
 // libuv's set that it has, sorted -- so the output is the same on any machine
 // for the same platform, and the node and oam legs are compared on the same
-// one. A fork() child also carries the IPC channel's variables, which differ
-// by runtime and are outside that filter.
+// one. The IPC channel's variable a fork() child is started with differs by
+// runtime and is outside that filter (each child also removes its own from
+// process.env).
 import {
   exec,
   execFile,

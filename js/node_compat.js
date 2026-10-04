@@ -40120,7 +40120,11 @@
     // Cannot connect during installRuntimeGlobals because CoreRuntime
     // (tokio, TCP ops) is not installed until execute_module/reset_run_slots.
     // Instead, store the port and connect lazily on first process.on('message').
-    const _ipcPort = globalThis.process.env.OAM_FORK_IPC_PORT;
+    // Taken from the real environment (natives.forkIpcPort), which also
+    // removes it, as node deletes NODE_CHANNEL_FD: process.env does not show
+    // it, so this process's own children and workers do not inherit it, and
+    // the --allow-env grant does not decide whether the channel is there.
+    const _ipcPort = natives.forkIpcPort();
     if (_ipcPort) {
       globalThis.process.connected = true;
       let _ipcSock = null;

@@ -141,6 +141,11 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Fixed
 
+- **A `fork()`ed child has its IPC channel under any `--allow-env`**, and takes the channel's
+  variable out of its environment as node's child does with `NODE_CHANNEL_FD`. It read the
+  port through `process.env`, so under a list `--allow-env` that did not name it
+  `process.send` was undefined; and the variable stayed in `process.env`, so the child's own
+  children inherited it.
 - **A NUL in a child's `env` throws `ERR_INVALID_ARG_VALUE` synchronously**, as node's
   does: a name, or a string value, holding one is refused by every `child_process` entry
   point before anything starts ("The property 'options.env['FOO']' must be a string without
