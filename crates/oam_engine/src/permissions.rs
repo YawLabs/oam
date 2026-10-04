@@ -2408,7 +2408,7 @@ mod tests {
         let nt = [
             format!(r"\??\{drive}\x"),
             format!(r"\??\{other}\x"),
-            r"\??\UNC\127.0.0.1\ADMIN$\Temp\q-".to_string(),
+            r"\??\UNC\srv\sh\x".to_string(),
             format!(r"\??\GLOBALROOT\??\{drive}\x"),
         ];
         for root in &roots {
