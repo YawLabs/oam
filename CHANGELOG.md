@@ -53,11 +53,11 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   events, `address()` shapes and errors (`connect ENOENT <path>`, `listen EADDRINUSE` with
   port -1, `EINVAL` for a name with a NUL byte in it), and `http.request({ socketPath })`
   rides on them, so `@playwright/mcp --isolated` now works on oam. On Windows a server keeps
-  four instances waiting and a dial to a busy pipe waits with `WaitNamedPipeW`, as libuv's do (200 clients at once connect in tens of ms), and
-  a write is done once the pipe has taken all but its last 64 KiB. TLS over a pipe, and
-  `tls`, `http`, `https` and `http2` servers on one, are still refused with
-  `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`; what else differs is in docs/node-divergences.md,
-  entry 50. (#219)
+  four instances waiting and a dial to a busy pipe waits with `WaitNamedPipeW`, as libuv's do
+  (200 clients at once connect in tens of ms), and a write is done once the pipe has taken all
+  but its last 64 KiB. TLS over a pipe, and `tls`, `http`, `https` and `http2` servers on one,
+  are still refused with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`; what else differs is in
+  docs/node-divergences.md, entry 50. (#219)
 - **http2 trailers work both ways, as in node.** A client stream emits `'trailers'` and
   supports `waitForTrailers`, `'wantTrailers'`, `sendTrailers()` and `sentTrailers`. Server
   streams, secure and cleartext, send trailers and receive a request's trailer section as
