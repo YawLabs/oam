@@ -669,6 +669,11 @@ pub struct Permissions {
     /// imply `--allow-child-process` (a worker could just spawn its way out),
     /// which over-granted every caller that only wanted a worker.
     pub worker: PermValue,
+    /// Whether the permission model is on (`--permission`), whatever it
+    /// grants: node's `permission.isEnabled()`. A child process started
+    /// while it is on inherits the permission flags in NODE_OPTIONS, as
+    /// node's does.
+    pub enabled: bool,
 }
 
 impl Default for Permissions {
@@ -681,6 +686,7 @@ impl Default for Permissions {
             ffi: PermValue::All,
             child: PermValue::All,
             worker: PermValue::All,
+            enabled: false,
         }
     }
 }
@@ -700,6 +706,7 @@ impl Permissions {
             ffi: from_bool_or_list(o.ffi),
             child: from_bool_or_list(o.child),
             worker: from_bool_or_list(o.worker),
+            enabled: true,
         }
     }
 
@@ -1182,6 +1189,7 @@ mod tests {
             ffi: PermValue::None,
             child: PermValue::None,
             worker: PermValue::None,
+            enabled: true,
         }
     }
 

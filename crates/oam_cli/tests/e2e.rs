@@ -32098,7 +32098,8 @@ fn process_env_respects_the_env_permission() {
 /// held before only in name: the pairs were laid over oam's own start-up
 /// environment, so a child saw every variable, granted or not.
 ///
-/// The children run without `--permission`, so they see all they were given.
+/// The children run under the parent's permission flags (in NODE_OPTIONS),
+/// whose grant names every variable they are given.
 #[test]
 fn a_child_gets_only_the_variables_process_env_shows() {
     let reporter = write_temp(
@@ -32127,7 +32128,7 @@ fn a_child_gets_only_the_variables_process_env_shows() {
     let out = oam_with_env(
         &[
             "--permission",
-            "--allow-env=CE_GRANTED",
+            "--allow-env=CE_GRANTED,CE_GIVEN",
             "--allow-child-process",
             "--allow-fs-read=*",
             script.to_str().unwrap(),
@@ -32241,7 +32242,9 @@ fn a_worker_env_follows_its_option_and_the_env_grant() {
     let out = oam_with_env(
         &[
             "--permission",
-            "--allow-env=CE_GRANTED,CE_KEPT",
+            // CE_SET and CE_X are named for the children, which run under
+            // these flags; the workers' own env is what their option makes it.
+            "--allow-env=CE_GRANTED,CE_KEPT,CE_SET,CE_X",
             "--allow-worker",
             "--allow-child-process",
             "--allow-fs-read=*",
@@ -32266,6 +32269,103 @@ fn a_worker_env_follows_its_option_and_the_env_grant() {
             "expected `{line}`: {stdout}\nstderr: {stderr}"
         );
     }
+}
+
+/// A child started under `--permission` inherits the permission flags in
+/// NODE_OPTIONS, as node's does, so an oam child runs under the same grants.
+///
+/// node's copyPermissionModelFlagsToEnv (measured on v22.22.2): unless the
+/// child's argv holds `--permission` or its NODE_OPTIONS already names it,
+/// every process.execArgv entry starting with a permission flag is appended,
+/// space-separated and as spelled, to the NODE_OPTIONS the child's env has --
+/// the caller's `env` or process.env alike, and for any program, node or not.
+/// oam passed nothing on, and its NODE_OPTIONS did not read the flags, so an
+/// oam child of a `--permission` run read files its parent could not.
+#[test]
+fn a_child_inherits_the_permission_flags_in_node_options() {
+    let reporter = write_temp(
+        "child_perm_flags/reporter.cjs",
+        "const fs = require('node:fs');\n\
+         let r;\n\
+         try { fs.readFileSync(process.argv[2], 'utf8'); r = 'read'; } catch (e) { r = 'denied ' + e.code; }\n\
+         process.stdout.write(r + ' NODE_OPTIONS=' + (process.env.NODE_OPTIONS ?? 'unset'));\n\
+         if (process.send) process.disconnect();\n",
+    );
+    let script = write_temp(
+        "child_perm_flags/main.mjs",
+        "import cp from 'node:child_process';\n\
+         const [reporter, outside] = process.argv.slice(2);\n\
+         const argv = [reporter, outside];\n\
+         const sync = (args, opts) => cp.spawnSync(process.execPath, args, { encoding: 'utf8', ...opts }).stdout;\n\
+         console.log('spawnSync: ' + sync(argv, {}));\n\
+         console.log('spawnSync env: ' + sync(argv, { env: { ONLY: '1' } }));\n\
+         console.log('execFileSync: ' + cp.execFileSync(process.execPath, argv, { encoding: 'utf8' }));\n\
+         console.log('execSync: ' + cp.execSync(`\"${process.execPath}\" \"${reporter}\" \"${outside}\"`, { encoding: 'utf8' }));\n\
+         const collect = (child) => new Promise((resolve) => {\n\
+         \x20 let s = '';\n\
+         \x20 child.stdout.on('data', (d) => (s += d));\n\
+         \x20 child.on('close', () => resolve(s));\n\
+         });\n\
+         console.log('spawn: ' + await collect(cp.spawn(process.execPath, argv)));\n\
+         console.log('execFile: ' + await new Promise((r) => cp.execFile(process.execPath, argv, (e, o) => r(o))));\n\
+         console.log('exec: ' + await new Promise((r) => cp.exec(`\"${process.execPath}\" \"${reporter}\" \"${outside}\"`, (e, o) => r(o))));\n\
+         console.log('fork: ' + await collect(cp.fork(reporter, [outside], { silent: true })));\n\
+         // A child given --permission of its own keeps its own flags.\n\
+         console.log('own flags: ' + sync(['--permission', '--allow-fs-read=*', '--allow-env', ...argv], {}));\n\
+         // Any program gets the variable, node or not.\n\
+         const echo = process.platform === 'win32' ? 'echo %NODE_OPTIONS%' : 'echo \"$NODE_OPTIONS\"';\n\
+         console.log('shell: ' + cp.execSync(echo, { encoding: 'utf8' }).trim());\n",
+    );
+    let outside = write_temp("child_perm_flags_outside/data.txt", "data");
+    let dir = script.parent().unwrap().to_str().unwrap().to_string();
+    let grant = format!("--allow-fs-read={dir}");
+    let mut cmd = oam_command(&[
+        "--permission",
+        &grant,
+        // oam's fork() channel is a loopback socket.
+        "--allow-net",
+        "--allow-env",
+        "--allow-child-process",
+        script.to_str().unwrap(),
+        reporter.to_str().unwrap(),
+        outside.to_str().unwrap(),
+    ]);
+    cmd.env_remove("NODE_OPTIONS");
+    let out = bounded_output(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    let flags = format!("--permission {grant} --allow-net --allow-env --allow-child-process");
+    for entry in [
+        "spawnSync",
+        "spawnSync env",
+        "execFileSync",
+        "execSync",
+        "spawn",
+        "execFile",
+        "exec",
+    ] {
+        assert!(
+            stdout.contains(&format!(
+                "{entry}: denied ERR_ACCESS_DENIED NODE_OPTIONS={flags}\n"
+            )),
+            "{entry}: the child runs under the parent's flags: {stdout}\nstderr: {stderr}"
+        );
+    }
+    // fork() passes process.execArgv on the command line, so its child holds
+    // `--permission` in its argv and NODE_OPTIONS is left as it was.
+    assert!(
+        stdout.contains("fork: denied ERR_ACCESS_DENIED NODE_OPTIONS=unset\n"),
+        "{stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("own flags: read NODE_OPTIONS=unset\n"),
+        "{stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("shell: {flags}\n")),
+        "{stdout}\nstderr: {stderr}"
+    );
 }
 
 /// `--allow-net` must scope by host, not merely toggle networking on.

@@ -21,6 +21,13 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Permissions
 
+- **A child process started under `--permission` inherits the permission flags in
+  NODE_OPTIONS, as node's does**, across spawn / exec / execFile (sync and async) and
+  cluster.fork: process.execArgv's `--permission` / `--allow-*` entries are appended to the
+  child's NODE_OPTIONS (an explicit `env` or process.env alike, for any program), unless the
+  child's argv holds `--permission` or its NODE_OPTIONS already names it; fork() passes them
+  on the command line. oam now reads those flags from NODE_OPTIONS, so an oam child runs
+  under its parent's grants. Up to 0.17.1 a child started with none of them.
 - **A port-scoped `--allow-net` entry now admits `fetch`, `http.request` / `https.request`,
   `undici.request` and `WebSocket` to that port**, as it already admitted `net.connect` /
   `tls.connect`: `--allow-net=example.com:443` admits `https://example.com/` and refuses
