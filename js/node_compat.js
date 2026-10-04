@@ -13567,8 +13567,72 @@
     // environment variable into a JS object (50-200 vars on a typical dev
     // machine). For programs that never touch process.env, this is pure
     // waste. A Proxy defers the copy until first property access.
+    //
+    // A worker thread's process.env is what its Worker's `env` option made
+    // it (natives.env() returns that, see op_env): a copy of the creator's
+    // process.env, the given object, or -- for SHARE_ENV -- a store shared
+    // with the creator. A shared store lives in the native layer (so every
+    // thread sharing it sees each other's writes): reads re-fetch it only
+    // when its version has moved, writes go through to it.
     let envCache = null;
-    const ensureEnv = () => (envCache ??= natives.env());
+    // natives.envWorker(): null on the main thread; on a worker thread
+    // `{ shared, base }` -- the shared store's id (SHARE_ENV) and the values
+    // of libuv's Windows additions its creator's environment had.
+    let envWorkerInfo;
+    const workerEnvInfo = () => {
+      if (envWorkerInfo === undefined) envWorkerInfo = natives.envWorker() ?? null;
+      return envWorkerInfo;
+    };
+    let envShared;
+    let envSharedVersion = -1;
+    const ensureEnv = () => {
+      if (envShared === undefined && envCache === null) {
+        const info = workerEnvInfo();
+        if (info && info.shared !== undefined) envShared = info.shared;
+      }
+      if (envShared === undefined) return (envCache ??= natives.env());
+      const version = natives.envSharedVersion(envShared);
+      if (envCache === null || version !== envSharedVersion) {
+        const snapshot = JSON.parse(natives.envSharedRead(envShared));
+        const store = {};
+        for (const [key, value] of snapshot.pairs) store[key] = value;
+        envCache = store;
+        envSharedVersion = snapshot.version;
+      }
+      return envCache;
+    };
+    // Store `text` under `key` (undefined deletes it), in a shared store too.
+    const envWrite = (store, key, text) => {
+      if (text === undefined) delete store[key];
+      else store[key] = text;
+      if (envShared === undefined) return;
+      const before = envSharedVersion;
+      const after = natives.envSharedSet(envShared, key, text);
+      // Another thread's write in between means this copy is stale.
+      envSharedVersion = after === before + 1 ? after : -1;
+    };
+    // SHARE_ENV (worker_threads): from now on this thread's process.env is a
+    // store it shares with the new worker. Returns the store's id.
+    registry.shareProcessEnv = () => {
+      if (envShared === undefined) {
+        const store = ensureEnv();
+        envShared = natives.envShareNew(
+          JSON.stringify(
+            Object.keys(store).map((key) => [key.toWellFormed(), store[key].toWellFormed()]),
+          ),
+        );
+        envSharedVersion = -1;
+      }
+      return envShared;
+    };
+    // Where libuv's Windows additions to a child's environment are read
+    // from: node's libuv reads the process's real environment, which is the
+    // main thread's process.env. A worker has the values its creator had
+    // when it was made (docs/node-divergences.md).
+    registry.childEnvBase = () => {
+      const info = workerEnvInfo();
+      return info ? info.base : env;
+    };
     // process.env is a string-coercing view: assigning a non-string coerces
     // via String() (NOT delete -- `process.env.X = undefined` reads back as
     // the literal string 'undefined'); symbol keys are rejected the way Node
@@ -13579,9 +13643,20 @@
     // node reads process.env.CASETEST after setting process.env.CaseTest).
     // The stored key keeps the ORIGINAL casing -- only lookups fold -- so
     // Object.keys() still reports the name as it was written.
-    const envCaseFold = natives.platform === "win32";
+    // That is the main thread's (the real environment). A worker's own store
+    // is case-sensitive, as node's is (a map); one it shares through
+    // SHARE_ENV folds as its creator's does (natives.envWorker's `fold`).
+    let envFold;
+    const envCaseFold = () => {
+      if (envFold === undefined) {
+        const info = workerEnvInfo();
+        envFold = natives.platform === "win32" && (info ? info.fold === true : true);
+      }
+      return envFold;
+    };
+    registry.processEnvFolds = envCaseFold;
     const envResolveKey = (store, prop) => {
-      if (!envCaseFold || prop in store) return prop;
+      if (!envCaseFold() || prop in store) return prop;
       const wanted = String(prop).toLowerCase();
       for (const k of Object.keys(store)) {
         if (k.toLowerCase() === wanted) return k;
@@ -13594,9 +13669,14 @@
     // it, yet a read of it goes to the LIVE environment (process.env['=C:']
     // after process.chdir('C:\\Users') is 'C:\\Users'). natives.env() leaves
     // these out, and natives.envHidden reads (or deletes) one live. node's
-    // setter ignores such a name, so an assignment stores nothing.
+    // setter ignores such a name, so an assignment stores nothing. On the
+    // main thread only: a worker's store, shared or not, has no such names
+    // (node: a worker's process.env['=C:'] is undefined).
     const envHidden = (prop) =>
-      envCaseFold && typeof prop === "string" && prop.charCodeAt(0) === 61; // '='
+      typeof prop === "string" &&
+      prop.charCodeAt(0) === 61 && // '='
+      natives.platform === "win32" &&
+      !workerEnvInfo();
     const env = new Proxy(Object.create(null), {
       get(_, prop) {
         if (typeof prop === "symbol") return undefined;
@@ -13637,7 +13717,7 @@
         if (envHidden(prop)) return true;
         const store = ensureEnv();
         const key = envResolveKey(store, prop);
-        store[key] = text;
+        envWrite(store, key, text);
         // TZ is not just a string: Node re-reads the zone on assignment so
         // subsequent Dates render in it. Without this the variable changed
         // and every Date kept the zone the process started in.
@@ -13660,7 +13740,7 @@
         }
         const store = ensureEnv();
         const key = envResolveKey(store, prop);
-        delete store[key];
+        envWrite(store, key, undefined);
         // Deleting TZ returns to the host zone -- same refresh as setting it.
         if (key === "TZ") natives.setTimeZone(null);
         return true;
@@ -13695,7 +13775,7 @@
         }
         const text = String(desc.value);
         if (envHidden(prop)) return true;
-        ensureEnv()[prop] = text;
+        envWrite(ensureEnv(), prop, text);
         return true;
       },
       ownKeys() { return Reflect.ownKeys(ensureEnv()); },
@@ -31962,9 +32042,10 @@
    *  other is stringified; and on Windows, where names are
    *  case-insensitive, the first of a set of names differing only in case
    *  (in default sort order) wins. Then libuv's Windows additions above.
-   *  The parent environment libuv reads those from is process.env here,
-   *  which is the same set node's live environment is, less what the
-   *  --allow-env grant leaves out (docs/node-divergences.md). `extra` is
+   *  The parent environment libuv reads those from is the main thread's
+   *  process.env here (registry.childEnvBase), which is the same set node's
+   *  live environment is, less what the --allow-env grant leaves out
+   *  (docs/node-divergences.md). `extra` is
    *  oam's own channel variables, laid over the result. */
   function childProcessEnv(platform, optionsEnv, extra) {
     const procEnv = globalThis.process.env;
@@ -32009,9 +32090,10 @@
       present.add(key.toUpperCase());
     }
     if (windows) {
+      const base = registry.childEnvBase();
       for (const name of WINDOWS_REQUIRED_ENV) {
         if (present.has(name)) continue;
-        const value = procEnv[name];
+        const value = base[name];
         if (value !== undefined) out[name] = value;
       }
     }
@@ -39583,6 +39665,50 @@
     }
     const natives = globalThis.__oam.node;
     const pathMod = registry.get("path");
+    /** The environment a new worker starts with, from the Worker's `env`
+     *  option, as node's Worker constructor reads it: undefined or null, a
+     *  copy of this thread's process.env as it is now; SHARE_ENV, this
+     *  thread's own store, shared (both see each other's writes); an object,
+     *  its own enumerable string-keyed entries, each value stringified. A
+     *  worker's own store is case-sensitive; a shared one folds case as its
+     *  creator's does. `base` is what libuv's Windows additions to a child's
+     *  environment are read from (registry.childEnvBase). */
+    function workerEnvOption(option) {
+      // node keeps the pairs as UTF-8, so a lone surrogate becomes U+FFFD.
+      let env;
+      if (option === SHARE_ENV) {
+        env = { shared: registry.shareProcessEnv(), fold: registry.processEnvFolds() };
+      } else if (option == null) {
+        const own = globalThis.process.env;
+        env = {
+          pairs: Object.keys(own).map((key) => [key.toWellFormed(), own[key].toWellFormed()]),
+          fold: false,
+        };
+      } else if (typeof option === "object") {
+        env = {
+          pairs: Object.entries(option).map(([key, value]) => [
+            key.toWellFormed(),
+            `${value}`.toWellFormed(),
+          ]),
+          fold: false,
+        };
+      } else {
+        throw codes.ERR_INVALID_ARG_TYPE(
+          "options.env",
+          ["object", "undefined", "null", "worker_threads.SHARE_ENV"],
+          option,
+        );
+      }
+      const from = registry.childEnvBase();
+      env.base = [];
+      if (natives.platform === "win32") {
+        for (const name of WINDOWS_REQUIRED_ENV) {
+          const value = from[name];
+          if (value !== undefined) env.base.push([name, value]);
+        }
+      }
+      return env;
+    }
     class Worker extends EventEmitter {
       constructor(filename, opts = {}) {
         super();
@@ -39603,8 +39729,7 @@
         // Store worker name (Node >=12.11 option)
         this.name = opts.name || "";
 
-        // Note SHARE_ENV usage (workers share process env by default in oam)
-        this._shareEnv = opts.env === SHARE_ENV;
+        const env = workerEnvOption(opts.env);
 
         // Node always exposes worker.stdout/.stderr; the option controls
         // whether the worker's output is ROUTED here instead of going
@@ -39624,6 +39749,7 @@
             execArgv: Array.isArray(opts.execArgv)
               ? opts.execArgv.map(String)
               : (process.execArgv || []).map(String),
+            env,
           }),
         );
         this._workerId = result.workerId;

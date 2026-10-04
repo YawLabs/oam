@@ -72,12 +72,124 @@ impl super::JsRuntime {
     }
 }
 
+/// The environment a worker thread's process.env starts as: node's Worker
+/// `env` option, resolved by the JS Worker constructor (workerEnvOption).
+/// Set as an isolate slot before the runtime globals are installed; op_env
+/// reads it in place of the process environment.
+pub(crate) struct WorkerEnv {
+    /// The worker's own pairs (a copy of its creator's process.env, or the
+    /// given object). Empty when `shared` is set.
+    pub pairs: Vec<(String, String)>,
+    /// SHARE_ENV: the id of the store shared with the creator.
+    pub shared: Option<u64>,
+    /// Whether names fold case (Windows, a store that leads back to the main
+    /// thread's environment).
+    pub fold: bool,
+    /// The values libuv's Windows additions to a child's environment are
+    /// read from: the creator's, when the worker was made.
+    pub base: Vec<(String, String)>,
+}
+
+impl WorkerEnv {
+    /// From the `env` member of workerNew's options JSON; `None` when it is
+    /// absent or malformed.
+    pub(crate) fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let pairs = |key: &str| -> Option<Vec<(String, String)>> {
+            match value.get(key) {
+                None | Some(serde_json::Value::Null) => Some(Vec::new()),
+                Some(serde_json::Value::Array(items)) => items
+                    .iter()
+                    .map(|item| {
+                        let pair = item.as_array()?;
+                        match pair.as_slice() {
+                            [name, value] => {
+                                Some((name.as_str()?.to_string(), value.as_str()?.to_string()))
+                            }
+                            _ => None,
+                        }
+                    })
+                    .collect(),
+                Some(_) => None,
+            }
+        };
+        let shared = match value.get("shared") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(id) => Some(id.as_u64()?),
+        };
+        Some(Self {
+            pairs: pairs("pairs")?,
+            shared,
+            fold: value.get("fold").and_then(serde_json::Value::as_bool) == Some(true),
+            base: pairs("base")?,
+        })
+    }
+}
+
+/// An environment store shared between threads through SHARE_ENV. The
+/// version moves on every write, so a thread re-reads the pairs only when
+/// another has changed them.
+struct SharedEnv {
+    version: u64,
+    pairs: Vec<(String, String)>,
+}
+
+static SHARED_ENVS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, SharedEnv>>,
+> = std::sync::LazyLock::new(Default::default);
+static NEXT_SHARED_ENV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn shared_envs() -> std::sync::MutexGuard<'static, std::collections::HashMap<u64, SharedEnv>> {
+    SHARED_ENVS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A new shared store holding `pairs`; returns its id. A store lives as long
+/// as the process: a thread shares its environment at most once, and
+/// every thread that shares it keeps using the same one.
+pub(crate) fn shared_env_new(pairs: Vec<(String, String)>) -> u64 {
+    let id = NEXT_SHARED_ENV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    shared_envs().insert(id, SharedEnv { version: 0, pairs });
+    id
+}
+
+/// The store's version, or `None` for an unknown id.
+pub(crate) fn shared_env_version(id: u64) -> Option<u64> {
+    shared_envs().get(&id).map(|env| env.version)
+}
+
+/// The store's version and pairs, read together.
+pub(crate) fn shared_env_read(id: u64) -> Option<(u64, Vec<(String, String)>)> {
+    shared_envs()
+        .get(&id)
+        .map(|env| (env.version, env.pairs.clone()))
+}
+
+/// Set `name` (exactly as spelled: the caller has already folded case) to
+/// `value`, or remove it with `None`. Returns the new version.
+pub(crate) fn shared_env_set(id: u64, name: &str, value: Option<String>) -> Option<u64> {
+    let mut envs = shared_envs();
+    let env = envs.get_mut(&id)?;
+    let at = env.pairs.iter().position(|(key, _)| key == name);
+    match (at, value) {
+        (Some(at), Some(value)) => env.pairs[at].1 = value,
+        (None, Some(value)) => env.pairs.push((name.to_string(), value)),
+        (Some(at), None) => {
+            env.pairs.remove(at);
+        }
+        (None, None) => {}
+    }
+    env.version += 1;
+    Some(env.version)
+}
+
 /// Spawn a worker thread. Returns (worker_id, thread_id). The caller
 /// must store the returned handles in the parent's WorkerRegistry.
 pub(crate) struct WorkerOptions {
     pub pipe_stdout: bool,
     pub pipe_stderr: bool,
     pub exec_argv: Vec<String>,
+    /// `None` only for a caller that passed no `env` (the worker then reads
+    /// the process environment, as before).
+    pub env: Option<WorkerEnv>,
 }
 
 pub(crate) fn spawn_worker(
@@ -119,6 +231,7 @@ fn run_worker(
         pipe_stdout,
         pipe_stderr,
         exec_argv,
+        env,
     } = options;
     // Worker isolate: no fork pool (same recursion hazard as the prewarm
     // path -- a worker that installed a pool would spawn prewarm threads that
@@ -127,7 +240,7 @@ fn run_worker(
     // INHERIT the spawning isolate's permissions: a worker used to run
     // all-granted, which made `new Worker(...)` a one-line escape from
     // --permission.
-    let mut rt = super::JsRuntime::new_worker_runtime_with(permissions);
+    let mut rt = super::JsRuntime::new_worker_thread_runtime(permissions, env);
     rt.set_process_argv(vec![
         "oam".to_string(),
         script_path.to_string_lossy().into_owned(),
@@ -171,4 +284,61 @@ fn run_worker(
     // ends, and re-reads exitCode after (a handler may set it).
     rt.emit_process_exit();
     rt.process_exit_code().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn worker_env_reads_the_constructor_json() {
+        let json = serde_json::json!({
+            "pairs": [["B", "2"], ["A", "1"]],
+            "fold": false,
+            "base": [["PATH", "p"]],
+        });
+        let env = WorkerEnv::from_json(&json).expect("well-formed");
+        assert_eq!(env.pairs, pairs(&[("B", "2"), ("A", "1")]), "order kept");
+        assert_eq!(env.shared, None);
+        assert!(!env.fold);
+        assert_eq!(env.base, pairs(&[("PATH", "p")]));
+
+        let shared = serde_json::json!({ "shared": 7, "fold": true, "base": [] });
+        let env = WorkerEnv::from_json(&shared).expect("well-formed");
+        assert_eq!(env.shared, Some(7));
+        assert!(env.fold);
+        assert!(env.pairs.is_empty());
+
+        for bad in [
+            serde_json::json!({ "pairs": [["A"]] }),
+            serde_json::json!({ "pairs": [["A", 1]] }),
+            serde_json::json!({ "pairs": "A=1" }),
+            serde_json::json!({ "shared": "7" }),
+        ] {
+            assert!(WorkerEnv::from_json(&bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_shared_env_store_versions_every_write() {
+        let id = shared_env_new(pairs(&[("A", "1")]));
+        assert_eq!(shared_env_version(id), Some(0));
+        assert_eq!(shared_env_set(id, "B", Some("2".into())), Some(1));
+        assert_eq!(shared_env_set(id, "A", Some("one".into())), Some(2));
+        assert_eq!(shared_env_set(id, "a", None), Some(3), "names are exact");
+        assert_eq!(
+            shared_env_read(id),
+            Some((3, pairs(&[("A", "one"), ("B", "2")])))
+        );
+        assert_eq!(shared_env_set(id, "A", None), Some(4));
+        assert_eq!(shared_env_read(id), Some((4, pairs(&[("B", "2")]))));
+        assert_eq!(shared_env_version(u64::MAX), None);
+        assert_eq!(shared_env_set(u64::MAX, "A", None), None);
+    }
 }

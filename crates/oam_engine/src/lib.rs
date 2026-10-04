@@ -476,6 +476,7 @@ impl JsRuntime {
         Self::new_inner(
             std::sync::Arc::new(permissions::Permissions::from_opts(opts)),
             true,
+            None,
         )
     }
 
@@ -490,12 +491,23 @@ impl JsRuntime {
     pub(crate) fn new_worker_runtime_with(
         permissions: std::sync::Arc<permissions::Permissions>,
     ) -> Self {
-        Self::new_inner(permissions, false)
+        Self::new_inner(permissions, false, None)
+    }
+
+    /// A worker_threads isolate: [`Self::new_worker_runtime_with`], plus the
+    /// environment its process.env starts as (the Worker's `env` option),
+    /// set before the runtime globals are installed.
+    pub(crate) fn new_worker_thread_runtime(
+        permissions: std::sync::Arc<permissions::Permissions>,
+        env: Option<worker::WorkerEnv>,
+    ) -> Self {
+        Self::new_inner(permissions, false, env)
     }
 
     fn new_inner(
         permissions: std::sync::Arc<permissions::Permissions>,
         with_fork_pool: bool,
+        worker_env: Option<worker::WorkerEnv>,
     ) -> Self {
         init_platform();
         // OAM_MAX_HEAP_MB: hard cap on the V8 heap (Node's --max-old-space-size
@@ -580,6 +592,9 @@ impl JsRuntime {
         // Permissions slot: all-granted by default so existing code needs
         // no changes.  Restricted runtimes pass Some(PermissionsOptions{..}).
         isolate.set_slot(permissions);
+        if let Some(env) = worker_env {
+            isolate.set_slot(env);
+        }
         let context = {
             v8::scope!(let scope, &mut isolate);
             // Deserializes the snapshot's runtime context: bootstrap.js is

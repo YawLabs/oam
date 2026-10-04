@@ -138,6 +138,11 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("env", op_env),
         ("envHidden", op_env_hidden),
         ("forkIpcPort", op_fork_ipc_port),
+        ("envWorker", op_env_worker),
+        ("envShareNew", op_env_share_new),
+        ("envSharedVersion", op_env_shared_version),
+        ("envSharedRead", op_env_shared_read),
+        ("envSharedSet", op_env_shared_set),
         ("argv", op_argv),
         ("cwd", op_cwd),
         ("chdir", op_chdir),
@@ -959,12 +964,21 @@ fn op_env(
     // (node_env_var.cc), so Object.keys(process.env) never lists one and a
     // child handed process.env does not get one. A read of such a name goes
     // to the live process environment instead -- see op_env_hidden.
-    let allowed: Vec<(String, String)> = {
-        let perms = get_permissions(scope);
-        std::env::vars()
-            .filter(|(name, _)| !is_hidden_env_name(name) && perms.check_env(name).is_ok())
-            .collect()
-    };
+    //
+    // A worker thread's environment is the one its Worker's `env` option
+    // gave it (crate::worker::WorkerEnv), not the process environment, and
+    // it is not filtered again: what it holds came from the creator's
+    // process.env, already filtered, or from an object the script built
+    // itself. A shared store (SHARE_ENV) is read by the JS layer directly.
+    let allowed: Vec<(String, String)> =
+        if let Some(env) = scope.get_slot::<crate::worker::WorkerEnv>() {
+            env.pairs.clone()
+        } else {
+            let perms = get_permissions(scope);
+            std::env::vars()
+                .filter(|(name, _)| !is_hidden_env_name(name) && perms.check_env(name).is_ok())
+                .collect()
+        };
     let env = v8::Object::new(scope);
     for (name, value) in allowed {
         let Some(key) = v8::String::new(scope, &name) else {
@@ -1044,6 +1058,117 @@ fn op_fork_ipc_port(
     if let Some(port) = v8::String::new(scope, &port.to_string_lossy()) {
         rv.set(port.into());
     }
+}
+
+/// `__oam.node.envWorker()`: `null` on the main thread; on a worker thread
+/// `{ shared, fold, base }` from its [`crate::worker::WorkerEnv`] -- the
+/// SHARE_ENV store's id (absent for a worker with its own store), whether
+/// names fold case, and the values of libuv's Windows additions its creator
+/// had, as an object.
+fn op_env_worker(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some((shared, fold, base)) = scope
+        .get_slot::<crate::worker::WorkerEnv>()
+        .map(|env| (env.shared, env.fold, env.base.clone()))
+    else {
+        rv.set_null();
+        return;
+    };
+    let info = v8::Object::new(scope);
+    if let Some(id) = shared {
+        let key = v8::String::new(scope, "shared").unwrap();
+        let value = v8::Number::new(scope, id as f64);
+        info.set(scope, key.into(), value.into());
+    }
+    let key = v8::String::new(scope, "fold").unwrap();
+    let value = v8::Boolean::new(scope, fold);
+    info.set(scope, key.into(), value.into());
+    let base_obj = v8::Object::new(scope);
+    for (name, value) in base {
+        let (Some(name), Some(value)) = (
+            v8::String::new(scope, &name),
+            v8::String::new(scope, &value),
+        ) else {
+            continue;
+        };
+        base_obj.set(scope, name.into(), value.into());
+    }
+    let key = v8::String::new(scope, "base").unwrap();
+    info.set(scope, key.into(), base_obj.into());
+    rv.set(info.into());
+}
+
+/// The id argument of the envShared* ops.
+fn shared_env_id(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+) -> u64 {
+    args.get(0).number_value(scope).unwrap_or(0.0) as u64
+}
+
+/// `__oam.node.envShareNew(json)`: a new SHARE_ENV store holding the
+/// `[[name, value], ...]` pairs in `json`; returns its id.
+fn op_env_share_new(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let pairs: Vec<(String, String)> = arg_string(scope, &args, 0)
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    let id = crate::worker::shared_env_new(pairs);
+    rv.set(v8::Number::new(scope, id as f64).into());
+}
+
+/// `__oam.node.envSharedVersion(id)`: the store's version (-1 for an
+/// unknown id, which never matches a version read).
+fn op_env_shared_version(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = shared_env_id(scope, &args);
+    let version = crate::worker::shared_env_version(id).map_or(-1.0, |v| v as f64);
+    rv.set(v8::Number::new(scope, version).into());
+}
+
+/// `__oam.node.envSharedRead(id)`: `{"version": n, "pairs": [[name, value],
+/// ...]}` as JSON, read together.
+fn op_env_shared_read(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = shared_env_id(scope, &args);
+    let (version, pairs) = crate::worker::shared_env_read(id).unwrap_or_default();
+    let json = serde_json::json!({ "version": version, "pairs": pairs }).to_string();
+    if let Some(json) = v8::String::new(scope, &json) {
+        rv.set(json.into());
+    }
+}
+
+/// `__oam.node.envSharedSet(id, name, value)`: set `name` in the store, or
+/// remove it when `value` is undefined; returns the new version (-1 for an
+/// unknown id).
+fn op_env_shared_set(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = shared_env_id(scope, &args);
+    let Some(name) = arg_string(scope, &args, 1) else {
+        return;
+    };
+    let value = if args.get(2).is_undefined() {
+        None
+    } else {
+        arg_string(scope, &args, 2)
+    };
+    let version = crate::worker::shared_env_set(id, &name, value).map_or(-1.0, |v| v as f64);
+    rv.set(v8::Number::new(scope, version).into());
 }
 
 fn op_argv(
@@ -8040,10 +8165,29 @@ fn op_worker_new(
     };
 
     // arg 2: JSON options from the JS Worker constructor
-    // ({ stdout, stderr, execArgv }).
-    let options = arg_string(scope, &args, 2)
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-        .unwrap_or(serde_json::Value::Null);
+    // ({ stdout, stderr, execArgv, env }).
+    let options = match arg_string(scope, &args, 2) {
+        None => serde_json::Value::Null,
+        Some(json) => match serde_json::from_str::<serde_json::Value>(&json) {
+            Ok(options) => options,
+            Err(_) => {
+                throw_type_error(scope, "workerNew: malformed options");
+                return;
+            }
+        },
+    };
+    // An `env` the worker cannot be given is refused, never replaced by the
+    // process environment.
+    let env = match options.get("env") {
+        None => None,
+        Some(value) => match crate::worker::WorkerEnv::from_json(value) {
+            Some(env) => Some(env),
+            None => {
+                throw_type_error(scope, "workerNew: malformed env");
+                return;
+            }
+        },
+    };
     let flag = |key: &str| options.get(key).and_then(serde_json::Value::as_bool) == Some(true);
     let worker_options = crate::worker::WorkerOptions {
         pipe_stdout: flag("stdout"),
@@ -8061,6 +8205,7 @@ fn op_worker_new(
                     .collect()
             })
             .unwrap_or_default(),
+        env,
     };
 
     // Tested on the namespaced path the loader then opens (`FsPath`), so a

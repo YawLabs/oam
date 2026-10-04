@@ -141,6 +141,13 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Fixed
 
+- **A `worker_threads` Worker's `env` option is applied, as node's is.** Without it (or
+  with `null` or `process.env`) the worker starts with a copy of its creator's `process.env`
+  as it stands, assignments and deletions included; with an object, exactly that object's
+  own entries, each stringified; with `SHARE_ENV`, its creator's environment, shared both
+  ways. Any other value throws `ERR_INVALID_ARG_TYPE`. A worker's own copy is
+  case-sensitive, as node's is. Previously every worker started from the environment oam
+  started with, whatever the option said.
 - **A `fork()`ed child's messages sent just before `process.disconnect()` reach the parent**,
   as node's do; when the channel was still opening, disconnecting dropped them.
 - **A `fork()`ed child has its IPC channel under any `--allow-env`**, and takes the channel's

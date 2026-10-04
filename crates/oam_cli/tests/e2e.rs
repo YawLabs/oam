@@ -32206,6 +32206,68 @@ fn a_forked_child_has_its_channel_under_a_list_allow_env() {
     );
 }
 
+/// A worker's process.env, and so its children's, is what its `env` option
+/// makes it, and under a list `--allow-env` holds no variable the grant hides.
+///
+/// Without `env` a worker starts with a copy of its creator's process.env as
+/// it stands (a deletion included); an object `env` is the worker's whole
+/// environment, passed as given; SHARE_ENV shares the creator's. A worker
+/// used to start from oam's start-up environment whatever the option said.
+#[test]
+fn a_worker_env_follows_its_option_and_the_env_grant() {
+    let script = write_temp(
+        "worker_env_perm.mjs",
+        "import { Worker, SHARE_ENV, isMainThread, parentPort, workerData } from 'node:worker_threads';\n\
+         import { spawnSync } from 'node:child_process';\n\
+         import { fileURLToPath } from 'node:url';\n\
+         const ce = (env) => Object.keys(env).filter((k) => k.startsWith('CE_')).sort().join(',') || 'none';\n\
+         if (!isMainThread) {\n\
+         \x20 const r = spawnSync(process.execPath, ['-e', \"process.stdout.write(Object.keys(process.env).filter((k) => k.startsWith('CE_')).sort().join(',') || 'none')\"], { encoding: 'utf8' });\n\
+         \x20 parentPort.postMessage(workerData + ': worker ' + ce(process.env) + ' child ' + r.stdout);\n\
+         } else {\n\
+         \x20 delete process.env.CE_GRANTED;\n\
+         \x20 process.env.CE_SET = 'set';\n\
+         \x20 const run = (mode, env) => new Promise((resolve) => {\n\
+         \x20   const w = new Worker(fileURLToPath(import.meta.url), { workerData: mode, env });\n\
+         \x20   w.on('message', (m) => console.log(m));\n\
+         \x20   w.on('error', (e) => console.log(mode + ' error ' + e.message));\n\
+         \x20   w.on('exit', resolve);\n\
+         \x20 });\n\
+         \x20 await run('default', undefined);\n\
+         \x20 await run('object', { CE_X: 'x' });\n\
+         \x20 await run('share', SHARE_ENV);\n\
+         }\n",
+    );
+    let out = oam_with_env(
+        &[
+            "--permission",
+            "--allow-env=CE_GRANTED,CE_KEPT",
+            "--allow-worker",
+            "--allow-child-process",
+            "--allow-fs-read=*",
+            script.to_str().unwrap(),
+        ],
+        &[
+            ("CE_GRANTED", "granted"),
+            ("CE_KEPT", "kept"),
+            ("CE_HIDDEN", "hidden"),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    for line in [
+        "default: worker CE_KEPT,CE_SET child CE_KEPT,CE_SET",
+        "object: worker CE_X child CE_X",
+        "share: worker CE_KEPT,CE_SET child CE_KEPT,CE_SET",
+    ] {
+        assert!(
+            stdout.contains(line),
+            "expected `{line}`: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
 /// `--allow-net` must scope by host, not merely toggle networking on.
 #[test]
 fn allow_net_list_is_scoped_to_the_listed_host() {
