@@ -391,15 +391,20 @@ verify_manifest() {
     # 1. The signature, against each embedded principal in turn with -I: the
     #    exact command a person verifying by hand runs.
     embedded_allowed_signers >"$tmp/allowed_signers"
+    #    Every key's first error line is kept, by principal: the last key
+    #    tried is almost never the signer, and its "Could not verify
+    #    signature." says nothing about why the signer's own attempt failed.
+    _why=""
     for _p in $(embedded_allowed_signers | data_lines | awk '{ print $1 }'); do
       case "$_p" in "$PRINCIPAL_PREFIX"*) ;; *) continue ;; esac
       if "$KEYGEN" -Y verify -f "$tmp/allowed_signers" -I "$_p" -n "$SIGN_NAMESPACE" \
            -s "$_s" <"$_m" >"$tmp/verify.out" 2>&1; then
         _principal="$_p"; break
       fi
+      _why="${_why:+$_why; }$_p: $(head -1 "$tmp/verify.out" 2>/dev/null)"
     done
     [ -n "$_principal" ] \
-      || die "RELEASE-MANIFEST.sig for $tag does not verify against any oam release key ($(head -1 "$tmp/verify.out" 2>/dev/null)) -- this is not a release we signed; refusing it"
+      || die "RELEASE-MANIFEST.sig for $tag does not verify against any oam release key ($_why) -- this is not a release we signed; refusing it"
   fi
   # 2. The header, only now that the bytes are known to be ours: line 1 the v1
   #    header, line 2 exactly "tag <the tag we resolved>". awk reads the raw

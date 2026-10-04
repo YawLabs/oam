@@ -1,7 +1,7 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "1064df5",
-  "oamVersion": "oam 0.17.1",
+  "commit": "6395132",
+  "oamVersion": "oam 0.18.0",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
   "suites": {
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 281,
-      "total": 281,
+      "pass": 307,
+      "total": 307,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -883,7 +883,55 @@
           "status": "pass"
         },
         {
+          "case": "350-https-clients-alpn-offer.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "351-http2-secure-server-close-idle-http1.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "352-http2-connect-goaway.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "353-http2-connect-goaway-held-open.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "354-fs-error-path-as-node-reports.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "355-fs-readfile-read-phase-errors.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "358-fetch-lookup-once-per-connection.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "359-fetch-lookup-second-callback.mjs",
+          "status": "pass"
+        },
+        {
           "case": "36-buffer-callable-no-new.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "366-http-common-parser.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "367-http-legacy-module-aliases.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "368-http-response-and-request-over-own-sockets.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "369-stream-finished-web-streams.mjs",
           "status": "pass"
         },
         {
@@ -891,7 +939,63 @@
           "status": "pass"
         },
         {
+          "case": "370-console-table.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "371-performance-mark-resource-timing.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "372-http-outgoing-message-without-socket.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "373-listen-error-shape.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "374-net-pipe-write-settling.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "375-net-pipe-connect-listen.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "376-net-pipe-windows-names.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "377-fs-windows-namespaced-paths.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "378-fs-copyfile-readdir-watch.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "379-child-env-replaces.mjs",
+          "status": "pass"
+        },
+        {
           "case": "38-assert-api-shape.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "380-process-execve-defaults.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "381-child-env-nul.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "382-fork-send-then-disconnect.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "383-worker-env.mjs",
           "status": "pass"
         },
         {
@@ -1242,7 +1346,7 @@
         "platform": "win32",
         "noBaseline": false,
         "nodeTotal": 1874,
-        "knownMissing": 306,
+        "knownMissing": 315,
         "newMissing": [],
         "staleRatchet": [],
         "absentModules": [],
@@ -1403,6 +1507,7 @@
               "getEntriesByName",
               "getEntriesByType",
               "mark",
+              "markResourceTiming",
               "measure",
               "now",
               "timeOrigin",

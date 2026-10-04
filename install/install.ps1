@@ -380,15 +380,18 @@ try {
       #    The key file is written LF-only and without a BOM, as committed.
       $asPath = Join-Path $tmp 'allowed_signers'
       [System.IO.File]::WriteAllText($asPath, (($embeddedAllowedSigners -replace "`r`n", "`n") + "`n"), (New-Object System.Text.ASCIIEncoding))
-      $last = ''
+      #    Every key's first error line is kept, by principal: the last key
+      #    tried is almost never the signer, and its "Could not verify
+      #    signature." says nothing about why the signer's own attempt failed.
+      $why = @()
       foreach ($line in (Get-DataLines $embeddedAllowedSigners)) {
         $p = ($line -split '[ \t]+')[0]
         if (-not $p.StartsWith($principalPrefix, [System.StringComparison]::Ordinal)) { continue }
         $r = Invoke-Native $keygen @('-Y', 'verify', '-f', $asPath, '-I', $p, '-n', $signNamespace, '-s', $sPath) $mPath
         if ($r.Code -eq 0) { $principal = $p; break }
-        $last = ($r.Output -split "`n")[0].Trim()
+        $why += "${p}: " + ($r.Output -split "`n")[0].Trim() + " (exit $($r.Code))"
       }
-      if (-not $principal) { Die "RELEASE-MANIFEST.sig for $tag does not verify against any oam release key ($last) -- this is not a release we signed; refusing it" }
+      if (-not $principal) { Die "RELEASE-MANIFEST.sig for $tag does not verify against any oam release key ($($why -join '; ')) -- this is not a release we signed; refusing it" }
     }
 
     # 2. The header, only now that the bytes are known to be ours: line 1 the
