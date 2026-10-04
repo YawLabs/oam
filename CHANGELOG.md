@@ -44,6 +44,15 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   `WebSocket` through undici's `Agent({ connect: { socketPath } })` (or any custom `connect`)
   is checked against its URL's `host:port` too, so it needs that host's grant as well. Node 22
   does not gate pipes; see docs/node-divergences.md, entry 50. (#219)
+- **Permission matching on Windows now follows node's resolve.** An fs op is checked on the
+  path it hands the OS -- resolved against the cwd and `\\?\`-prefixed, as node's binding
+  computes it -- and the `ERR_ACCESS_DENIED` `resource` names that path (`\\?\C:\work\x`), as
+  node's does. Names compare case-sensitively, as node's do (`c:\work\x` is not under a grant
+  of `C:\work`); a trailing dot or space is part of a name (`allowed.\x` is not under
+  `allowed`); a UNC path `\\srv\sh\x` and the rooted path `\srv\sh\x` are different paths; a
+  grant of `\` or `/` is the cwd drive's root; and a `\\.\` device path, or a `\\?\` path in
+  neither drive nor UNC form, matches no grant. `oam.readTextFile` is checked the same way.
+  (#275)
 
 ### Added
 
@@ -243,6 +252,20 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 - **The npm undici's `fetch` never delivered a MockAgent reply's body**: `stream.finished()` on a
   web stream threw and `performance.markResourceTiming()` was missing. (#206)
 - **`console.table`** draws node's table, and a `new Console()` has `table()`.
+- **On Windows, fs paths reach the OS namespaced, as node's do.** Every path-taking fs op,
+  the module loader (`require`, `import`, the main entry), `oam.readTextFile` and native addon
+  loading hand the OS `path.toNamespacedPath(p)` -- resolved against the cwd and prefixed
+  `\\?\` -- so Win32 path normalisation no longer applies: `readFileSync("sub/")` fails
+  `EISDIR` `read`; `NUL`, `COM1` and a name with a trailing dot or space (`.env.`, `.env `)
+  are files that do not exist (`ENOENT`) rather than the device or `.env`;
+  `writeFileSync("g.txt.")` creates `g.txt.`; `require("./mod.js.")` fails
+  `MODULE_NOT_FOUND`. A symlink's target is stored as node stores it, and whether it is a
+  directory link is decided by the target beside the link, not in the cwd. Errors name the
+  path with the prefix taken off and never resolved again (`mkdirSync("C:\\")` says `'C:\'`,
+  not `'C:'`), a patched `process.cwd` no longer changes any fs error, `realpath` and
+  `readlink` show a UNC result as `\\srv\sh\x`, and an ESM specifier gets the URL parser's
+  clean-up (`import("./x.mjs ")` loads `x.mjs`, as on node). A script that relied on that
+  normalisation now fails as it does under node. (#275)
 
 ### Performance
 

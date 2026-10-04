@@ -3625,17 +3625,31 @@ what is left:
   `create_dir` lengthens such paths itself. Refusing a path the file system accepts was not
   worth reproducing.
 
-### Windows paths outside the `fs` ops reach the OS as given
+### Windows: `require` of a `\\?\` or `\\.\` spelling of a module loads it
 
-node's `fs` hands libuv every path through `path.toNamespacedPath`: resolved against the cwd
-(which normalises `.` / `..` and drops a trailing separator) and prefixed with `\\?\`, which
-turns off Win32 path normalisation, so the OS does not strip trailing dots and spaces and does
-not treat DOS device names as devices. oam's `fs` ops do the same (up to 0.17.1 they passed
-the path as given): `readFileSync("sub/")` fails `EISDIR` `read`, `readFileSync("NUL")` and
-`statSync(".env.")` fail `ENOENT`, and `writeFileSync("g.txt.", ...)` creates `g.txt.`, as in
-node v22.22.2, and a symlink's target is stored as node stores it. Not converted yet: the
-module loader's reads and native addon loading (`require` of a `.node` file) still hand the
-OS the path as given.
+node's `fs` and module loader hand the OS every path through `path.toNamespacedPath`:
+resolved against the cwd (which normalises `.` / `..` and drops a trailing separator) and
+prefixed with `\\?\`, which turns off Win32 path normalisation, so the OS does not strip
+trailing dots and spaces and does not treat DOS device names as devices. oam does the same
+(up to 0.17.1 it passed the path as given) in its `fs` ops, `require`, `import`, the main
+entry, `oam.readTextFile` and native addon loading: `readFileSync("sub/")` fails `EISDIR`
+`read`, `readFileSync("NUL")` and `statSync(".env.")` fail `ENOENT`,
+`writeFileSync("g.txt.", ...)` creates `g.txt.`, and `require("./mod.js.")` fails
+`MODULE_NOT_FOUND`, as in node v22.22.2 (conformance case 377).
+
+One corner is left. `require` of an absolute `\\?\C:\...`, `\\.\C:\...` or `//?/C:/...`
+spelling of an existing module loads it on oam; node v22.22.2 fails `EISDIR` (`lstat 'C:'`,
+or `lstat '\\.\C:'`), because its realpath walk takes the first component after the prefix
+for a directory to lstat. Reproducing a failure of node's own was not worth it.
+
+### Windows `fs.open` of a directory fails
+
+node opens a directory on Windows (libuv passes `FILE_FLAG_BACKUP_SEMANTICS`), so
+`openSync("dir", "r")` returns a descriptor, and opening a drive root to write fails `EPERM`.
+oam opens without that flag: `openSync("dir", "r")` fails `EPERM`, and an open of a drive
+root (`openSync("C:\\", "w")`, or `"r"`) fails `ENOENT`. The error names the path as node's
+does (`'C:\'`), and `readFileSync` of a directory fails `EISDIR` `read` in both. Measured
+against v22.22.2 while writing conformance case 377; not fixed yet.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 
