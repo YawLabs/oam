@@ -266,7 +266,8 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   directory link is decided by the target beside the link, not in the cwd. Errors name the
   path with the prefix taken off and never resolved again (`mkdirSync("C:\\")` says `'C:\'`,
   not `'C:'`), a patched `process.cwd` no longer changes any fs error, `realpath` and
-  `readlink` show a UNC result as `\\srv\sh\x`, and an ESM specifier gets the URL parser's
+  `readlink` show a UNC result as `\\srv\sh\x` (and `realpathSync` / callback `realpath` a
+  share root as `\\srv\sh\`, as node's JS realpath does), and an ESM specifier gets the URL parser's
   clean-up (`import("./x.mjs ")` loads `x.mjs`, as on node). A script that relied on that
   normalisation now fails as it does under node. `process.chdir` records the new cwd in its
   drive's `=X:` variable, as libuv's `uv_chdir` does, so a drive-relative `C:name` resolves

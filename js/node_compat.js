@@ -11803,6 +11803,18 @@
       return value === (value | 0);
     }
 
+    // The native realpath's answer as node's JS realpath (realpathSync and
+    // the callback realpath, not their `.native` forms or the promise one)
+    // gives it: on Windows that walk starts from path.win32.resolve, which
+    // keeps a UNC share root's trailing separator, so `\\srv\sh` is
+    // `\\srv\sh\` there (measured on v22.22.2) where the native says
+    // `\\srv\sh`. Every other result is the same in both.
+    function realpathJsShape(resolved) {
+      if (process.platform !== "win32" || typeof resolved !== "string") return resolved;
+      const unc = /^\\\\([^\\/]+)\\([^\\/]+)$/.exec(resolved);
+      return unc && unc[1] !== "." && unc[1] !== "?" ? resolved + "\\" : resolved;
+    }
+
     // node's realpath / realpathSync argument: a file: URL becomes its path,
     // anything else is stringified (`p += ''`), and a NUL byte is refused.
     function realpathArg(path) {
@@ -11827,7 +11839,7 @@
 
     async function realpathWalking(path) {
       try {
-        return await natives.fsRealpath(path);
+        return realpathJsShape(await natives.fsRealpath(path));
       } catch (original) {
         // A failing lstat / readlink rejects with its own error.
         const walk = realpathWalk(path);
@@ -12310,7 +12322,7 @@
       realpathSync: (path) => {
         const file = realpathArg(path);
         try {
-          return natives.fsRealpathSync(file);
+          return realpathJsShape(natives.fsRealpathSync(file));
         } catch (e) {
           throw realpathWalkErrorSync(file, e);
         }

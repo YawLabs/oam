@@ -115,6 +115,19 @@ if (process.platform !== "win32") {
     for (const r of [share, share + "\\"]) {
       show("cpSync share root " + JSON.stringify(r.replace(share, "<SHARE>")), () => fs.cpSync(r, "cp-share-dest"));
     }
+    // node's JS realpath keeps a share root's trailing separator (its walk
+    // starts from path.win32.resolve); the native and promise forms do not.
+    const shareRoot = (p) => p.split(share).join("<SHARE>");
+    for (const r of [share, share + "\\", share + "\\Windows\\.."]) {
+      const label = JSON.stringify(shareRoot(r));
+      show("realpathSync " + label, () => shareRoot(fs.realpathSync(r)));
+      show("realpathSync.native " + label, () => shareRoot(fs.realpathSync.native(r)));
+      console.log(
+        "realpath " + label + ": " +
+          (await new Promise((res) => fs.realpath(r, (e, v) => res(e ? e.code : shareRoot(v))))),
+      );
+      console.log("promises.realpath " + label + ": " + shareRoot(await fs.promises.realpath(r)));
+    }
   }
 
   // A patched process.cwd: node's binding resolves against the real one.
