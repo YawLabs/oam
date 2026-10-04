@@ -23,6 +23,45 @@ entries ship here, under "Prepared as 0.17.2" below): fs and Windows paths, perm
 undici and its mocks, child processes, net over a pipe, web streams, zlib and http2. Each change
 below is held to node v22.22.2 by a conformance case or an e2e test.
 
+### Release signing
+
+- **Every release from this one on is signed.** A release carries `RELEASE-MANIFEST` (the tag
+  and the `SHA256SUMS` of its binaries) and `RELEASE-MANIFEST.sig`, an SSH signature by a
+  committed release key. `release-keys/allowed_signers` names the keys and
+  `release-keys/ranges` says which tags each may sign; a key is retired by closing its range,
+  never by removing it, so the tags it signed keep verifying. By hand:
+  `ssh-keygen -Y verify -f release-keys/allowed_signers -I oam-release-k1 -n oam-release -s RELEASE-MANIFEST.sig < RELEASE-MANIFEST`.
+  A release whose signing is not possible fails instead of shipping unsigned
+  (`OAM_SIGN_REQUIRED=1` is the default). (#266, #267, #270, #272, #273, #277)
+- **The installers verify the release before they download the binary.** `install.sh` and
+  `install.ps1` embed the key list and ranges, fetch every asset from the resolved tag's own
+  `/download/<tag>/`, and refuse a signature that does not verify, a manifest signed for
+  another tag, a key outside its range, a missing manifest, and a binary whose SHA-256 is not
+  the signed one -- the checksum comes from the manifest, not from an unsigned `SHA256SUMS`.
+  Releases before 0.18.0 are checked against `release-keys/presigning-sums`, a committed table
+  of the SHA-256 of each published `SHA256SUMS`; a pre-signing tag that is not in it is
+  refused. Verifying needs `ssh-keygen` 8.1 or later (macOS and Linux ship it; on Windows the
+  inbox OpenSSH client, which `install.ps1` finds in Sysnative, System32, then PATH). Without
+  it the install fails and names the fix, unless `OAM_INSECURE_SKIP_SIGNATURE=1`, which
+  installs with a loud warning and still never excuses a bad signature or a missing manifest.
+  `OAM_INSTALL_BASE` now requires `OAM_VERSION`. (#267)
+- **`oam self-update` verifies the same manifest natively**, with the trust root compiled in,
+  instead of piping the installer into a shell: ed25519 and sk-ed25519 keys, namespace
+  `oam-release`, the signed tag equal to the requested one and inside the key's range, and
+  pre-signing tags against the pinned table. Without `--version` it refuses a release older
+  than the running binary. The new binary is written to a temp file beside the old one, hashed
+  against the manifest, renamed into place and smoked with `--version`; a failed smoke puts
+  the old binary back. There is no override flag. `OAM_SELF_UPDATE_URL` is now an asset-base
+  override that needs `--version` and still requires a valid signature. (#266)
+- **The Windows binaries are Authenticode-signed** (Azure Artifact Signing, timestamped), and
+  each is verified from disk twice before it ships: `signtool verify /pa`, then an independent
+  PowerShell check of the signer, the timestamp and the chain. (#270)
+- **The mac binaries are codesigned**: hardened runtime, identifier `org.oamjs.oam` and
+  exactly the three entitlements V8's JIT needs, verified against a pinned identity and
+  JIT-smoked on both architectures before they ship. The identity is oam's own certificate,
+  not a Developer ID, so Gatekeeper still treats a download as it did; Developer ID plus
+  notarization is the next step and changes nothing in the verify rules. (#272)
+
 ### Permissions
 
 - **A child process started under `--permission` inherits the permission flags in
