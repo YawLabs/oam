@@ -7216,27 +7216,25 @@ fn op_fs_symlink(
         throw_type_error(scope, "symlink requires a path");
         return;
     };
-    // node's callback and promise forms stat the probe and fall back to a
-    // file link on any failure, a refused read included: no error, and
-    // nothing learnt about a path the read grant refuses.
+    let kind = oam_core::SymlinkType::from_arg(arg_string(scope, &args, 2).as_deref());
+    // With no type, node's callback and promise forms stat the probe and
+    // fall back to a file link on any failure, a refused read included: no
+    // error, and nothing learnt about a path the read grant refuses. A type
+    // given is used as it is, with no probe.
     #[cfg(windows)]
-    let probe = {
-        let probe = oam_core::FsPath::new(oam_core::symlink_probe_path(&link, &target));
-        get_permissions(scope)
-            .check_read_path(&probe)
-            .is_ok()
-            .then_some(probe)
-    };
+    let probe = (kind == oam_core::SymlinkType::Probe)
+        .then(|| oam_core::FsPath::new(oam_core::symlink_probe_path(&link, &target)))
+        .filter(|probe| get_permissions(scope).check_read_path(probe).is_ok());
     #[cfg(not(windows))]
     let probe = None;
+    let stored = oam_core::symlink_stored_target(&link, &target, kind);
     let Some(path) = fs_path_of(scope, link, FsAccess::Write) else {
         return;
     };
-    let target = oam_core::symlink_target_os(&target).into_owned();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::fs_symlink(target, probe, path),
+        oam_core::ops::fs_symlink(stored, kind, probe, path),
     );
 }
 
@@ -7299,30 +7297,37 @@ fn op_fs_symlink_sync(
         throw_type_error(scope, "symlinkSync requires a path");
         return;
     };
-    // node's symlinkSync picks a directory or a file link with
+    let kind = oam_core::SymlinkType::from_arg(arg_string(scope, &args, 2).as_deref());
+    // With no type, node's symlinkSync picks a directory or a file link with
     // `statSync(path.resolve(link, '..', target), { throwIfNoEntry: false })`
     // before anything else: the target is taken relative to the link's
     // parent, the read grant is checked on it, and a failure other than
-    // ENOENT or ENOTDIR is thrown as that stat's error.
+    // ENOENT or ENOTDIR is thrown as that stat's error. A type given is used
+    // as it is, with no probe: `dir` and `junction` make a directory link
+    // even to a target that is not there yet.
     #[cfg(windows)]
-    let is_dir = {
-        let probe = oam_core::symlink_probe_path(&link, &target);
-        let Some(probe) = fs_path_of(scope, probe, FsAccess::Read) else {
-            return;
-        };
-        match std::fs::metadata(&probe) {
-            Ok(meta) => meta.is_dir(),
-            Err(e) if matches!(oam_core::node_error_code(&e), "ENOENT" | "ENOTDIR") => false,
-            Err(e) => {
-                throw_node_error(scope, "stat", &probe, &e);
+    let is_dir = match kind {
+        oam_core::SymlinkType::File => false,
+        oam_core::SymlinkType::Dir | oam_core::SymlinkType::Junction => true,
+        oam_core::SymlinkType::Probe => {
+            let probe = oam_core::symlink_probe_path(&link, &target);
+            let Some(probe) = fs_path_of(scope, probe, FsAccess::Read) else {
                 return;
+            };
+            match std::fs::metadata(&probe) {
+                Ok(meta) => meta.is_dir(),
+                Err(e) if matches!(oam_core::node_error_code(&e), "ENOENT" | "ENOTDIR") => false,
+                Err(e) => {
+                    throw_node_error(scope, "stat", &probe, &e);
+                    return;
+                }
             }
         }
     };
+    let target = oam_core::symlink_stored_target(&link, &target, kind);
     let Some(path) = fs_path_of(scope, link, FsAccess::Write) else {
         return;
     };
-    let target = oam_core::symlink_target_os(&target);
     #[cfg(windows)]
     let result = if is_dir {
         std::os::windows::fs::symlink_dir(&*target, &path)

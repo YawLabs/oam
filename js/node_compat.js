@@ -1331,6 +1331,9 @@
   codes.ERR_FS_CP_NON_DIR_TO_DIR = E("ERR_FS_CP_NON_DIR_TO_DIR", Error, function(msg) {
     return msg;
   });
+  codes.ERR_FS_INVALID_SYMLINK_TYPE = E("ERR_FS_INVALID_SYMLINK_TYPE", Error, function(type) {
+    return 'Symlink type must be one of "dir", "file", or "junction". Received "' + type + '"';
+  });
   // node's SystemError (lib/internal/errors.js, v22.22.2): the class of the
   // codes node raises for a failure it decides itself but reports in a
   // system error's terms (ERR_FS_EISDIR). The message is `<prefix>: <syscall>
@@ -10760,6 +10763,8 @@
   // positional argument happened to be. CB_LAST is symlink's rule, which
   // node writes as `makeCallback(arguments[arguments.length - 1])`.
   const CB_LAST = -1;
+  // The link types node's stringToSymlinkType accepts.
+  const SYMLINK_TYPES = ["dir", "file", "junction"];
   function callbackSlot(args, required, optional) {
     if (required === CB_LAST) return args.length > 0 ? args.length - 1 : 0;
     const end = required + optional;
@@ -11296,7 +11301,17 @@
         const [valid, encoding] = mkdtempArgs(prefix, options);
         return natives.fsMkdtemp(valid).then((dir) => mkdtempResult(dir, encoding));
       },
-      symlink: (target, path) => natives.fsSymlink(toPath(target, "target"), toPath(path)),
+      // node's promise symlink reads any non-string type as none (and on
+      // Windows probes the target), and refuses a string outside the three.
+      symlink: (target, path, type) => {
+        const kind = typeof type === "string" ? type : null;
+        const validTarget = toPath(target, "target");
+        const validPath = toPath(path);
+        if (kind !== null && !SYMLINK_TYPES.includes(kind)) {
+          return Promise.reject(codes.ERR_FS_INVALID_SYMLINK_TYPE(kind));
+        }
+        return natives.fsSymlink(validTarget, validPath, kind);
+      },
       readlink: (path) => natives.fsReadlink(toPath(path)),
       link: (existing, newPath) =>
         natives.fsLink(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
@@ -12139,6 +12154,7 @@
     // realpathArg runs inside, so the callback is checked before the path.
     const realpathByPath = callbackify1((p) => realpathWalking(realpathArg(p)), 1);
     const mkdtempByPrefix = callbackify1(promises.mkdtemp, 1, 1);
+    const symlinkByCallback = callbackify1(promises.symlink, CB_LAST);
     const truncateByPath = callbackify1(promises.truncate, 2);
     const chmodByPath = callbackify1(promises.chmod, 2);
 
@@ -12297,7 +12313,18 @@
         const [valid, encoding] = mkdtempArgs(prefix, options);
         return mkdtempResult(natives.fsMkdtempSync(valid), encoding);
       },
-      symlinkSync: (target, path) => natives.fsSymlinkSync(toPath(target, "target"), toPath(path)),
+      // node's symlinkSync reads any non-string type as none (and on Windows
+      // probes the target), and a string must be one of the three (node
+      // v22.22.2 lib/fs.js, stringToSymlinkType).
+      symlinkSync: (target, path, type) => {
+        const kind = typeof type === "string" ? type : null;
+        const validTarget = toPath(target, "target");
+        const validPath = toPath(path);
+        if (kind !== null && !SYMLINK_TYPES.includes(kind)) {
+          throw codes.ERR_FS_INVALID_SYMLINK_TYPE(kind);
+        }
+        return natives.fsSymlinkSync(validTarget, validPath, kind);
+      },
       readlinkSync: (path) => natives.fsReadlinkSync(toPath(path)),
       linkSync: (existing, newPath) =>
         natives.fsLinkSync(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
@@ -12459,7 +12486,17 @@
       mkdtemp: function mkdtemp(prefix, options, callback) {
         return mkdtempByPrefix(...arguments);
       },
-      symlink: callbackify1(promises.symlink, CB_LAST),
+      // node's callback symlink throws a bad type string synchronously,
+      // after the callback and the two paths are checked.
+      symlink: function symlink(target, path, type, callback) {
+        if (typeof type === "string" && !SYMLINK_TYPES.includes(type)) {
+          validateCb(arguments[arguments.length - 1], "cb");
+          toPath(target, "target");
+          toPath(path);
+          throw codes.ERR_FS_INVALID_SYMLINK_TYPE(type);
+        }
+        return symlinkByCallback(...arguments);
+      },
       readlink: callbackify1(promises.readlink, 1, 1),
       link: callbackify1(promises.link, 2),
       // node's chmod checks the path and the mode before the callback.

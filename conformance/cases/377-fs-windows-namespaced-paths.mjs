@@ -64,6 +64,18 @@ show("writeFileSync g.txt.", () => {
 });
 show("readFileSync g.txt.", () => fs.readFileSync("g.txt.", "utf8"));
 show("unlinkSync g.txt.", () => fs.unlinkSync("g.txt."));
+// A symlink type outside node's three is refused before anything is made:
+// symlinkSync and the callback form throw, the promise form rejects.
+show("symlinkSync type bogus", () => fs.symlinkSync("d", "lnk-bogus", "bogus"));
+show("symlink callback type bogus", () => fs.symlink("d", "lnk-bogus", "bogus", () => console.log("called")));
+console.log(
+  "promises.symlink type bogus: " +
+    (await fs.promises.symlink("d", "lnk-bogus", "bogus").then(
+      () => "OK",
+      (e) => e.code + " " + e.message,
+    )),
+);
+show("symlink type bogus made nothing", () => fs.existsSync("lnk-bogus"));
 
 if (process.platform !== "win32") {
   console.log("the Windows namespace rows are Windows only");
@@ -122,6 +134,55 @@ if (process.platform !== "win32") {
   for (const [label, target] of targets) {
     show("symlinkSync EEXIST " + label, () => fs.symlinkSync(target, "file.txt"));
   }
+  // A type given is used as it is: node probes the target only when the
+  // type is null or undefined. A junction's target is resolved against the
+  // link's parent and namespaced.
+  show("symlinkSync EEXIST junction", () => fs.symlinkSync("sub", "file.txt", "junction"));
+  show("symlinkSync file to a missing share", () => {
+    fs.symlinkSync("\\\\localhost\\oam-no-such-share\\x", "lnk-unc", "file");
+    return fs.readlinkSync("lnk-unc");
+  });
+  const lists = (p) => {
+    try {
+      fs.readdirSync(p);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  show("symlinkSync file to a directory", () => {
+    fs.symlinkSync("sub", "lnk-file", "file");
+    return lists("lnk-file");
+  });
+  show("symlinkSync dir made before its target", () => {
+    fs.symlinkSync("later", "lnk-dir", "dir");
+    fs.mkdirSync("later");
+    return fs.readdirSync("lnk-dir");
+  });
+  show("symlinkSync junction", () => {
+    fs.symlinkSync("sub", "lnk-junction", "junction");
+    return scrub(fs.readlinkSync("lnk-junction")) + " " + lists("lnk-junction");
+  });
+  show("symlinkSync type 1 to a directory", () => {
+    fs.symlinkSync("sub", "lnk-number", 1);
+    return lists("lnk-number");
+  });
+  for (const [label, type] of [["file", "file"], ["junction", "junction"], ["none", undefined], ["type 7", 7]]) {
+    const link = "lnk-p-" + label.replace(" ", "");
+    console.log(
+      "promises.symlink " + label + ": " +
+        (await fs.promises.symlink("sub", link, type).then(
+          () => JSON.stringify([scrub(fs.readlinkSync(link)), lists(link)]),
+          (e) => e.code,
+        )),
+    );
+  }
+  console.log(
+    "symlink callback file: " +
+      (await new Promise((res) =>
+        fs.symlink("sub", "lnk-cb", "file", (e) => res(e ? e.code : String(lists("lnk-cb")))),
+      )),
+  );
 
   // --permission matching on the namespaced path, in a child.
   fs.mkdirSync("allowed");

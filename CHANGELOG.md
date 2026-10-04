@@ -270,7 +270,11 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   against the directory the process moved to, not the one it was launched in. A drive or
   share root (`C:\`, `\`, `/`, `\\srv\sh`) fails as a directory, not `ENOENT`:
   `readFileSync` fails `EISDIR` `read` and `writeFileSync`, `appendFileSync` and a write
-  `openSync` fail `EPERM` naming the root. (#275)
+  `openSync` fail `EPERM` naming the root. `fs.symlink`, `fs.symlinkSync` and
+  `fs.promises.symlink` honour the type argument: only a missing (non-string) type probes the
+  target, so `'file'` makes a file link even to a directory, `'dir'` a directory link to a
+  target not made yet, `'junction'` stores the target resolved against the link's parent, and
+  a type outside the three fails `ERR_FS_INVALID_SYMLINK_TYPE`. (#275)
 
 ### Performance
 

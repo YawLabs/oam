@@ -3642,6 +3642,15 @@ spelling of an existing module loads it on oam; node v22.22.2 fails `EISDIR` (`l
 or `lstat '\\.\C:'`), because its realpath walk takes the first component after the prefix
 for a directory to lstat. Reproducing a failure of node's own was not worth it.
 
+### Windows `fs.symlink(target, path, 'junction')` makes a directory symlink
+
+node makes an NTFS junction. oam stores the same target node does (resolved against the
+link's parent and namespaced, so `readlinkSync` gives the same absolute path) but makes a
+directory symlink, because std has no junction call on stable Rust. The link works the same
+way; the difference is that a symlink needs the create-symlink privilege (Developer Mode or
+an elevated process), which a junction does not, so where that privilege is missing oam's
+call fails `EPERM` and node's succeeds. Measured against v22.22.2 (conformance case 377).
+
 ### Windows `fs.open` of a directory fails
 
 node opens a directory on Windows (libuv passes `FILE_FLAG_BACKUP_SEMANTICS`), so

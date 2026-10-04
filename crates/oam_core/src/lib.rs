@@ -2797,6 +2797,46 @@ pub fn win32_symlink_target(
     }
 }
 
+/// The link type a `symlink` call asked for, as node's JS hands it over:
+/// `Probe` when it gave none (on Windows node then stats the target to
+/// choose), otherwise `file`, `dir` or `junction`. Off Windows the type
+/// changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SymlinkType {
+    Probe,
+    File,
+    Dir,
+    Junction,
+}
+
+impl SymlinkType {
+    /// The type from the op's argument: `None` is `Probe`, and anything
+    /// that is not `dir` or `junction` is a file link (node's JS has already
+    /// refused any other string).
+    pub fn from_arg(arg: Option<&str>) -> Self {
+        match arg {
+            None => SymlinkType::Probe,
+            Some("dir") => SymlinkType::Dir,
+            Some("junction") => SymlinkType::Junction,
+            Some(_) => SymlinkType::File,
+        }
+    }
+}
+
+/// The target string a link of `kind` stores (`preprocessSymlinkDestination`):
+/// a junction's target is resolved against the link's parent and namespaced
+/// (`toNamespacedPath(path.resolve(link, '..', target))`), any other's is
+/// `symlink_target_os`. oam has no junction call of its own and makes a
+/// junction as a directory symlink to that target.
+pub fn symlink_stored_target(link: &str, target: &str, kind: SymlinkType) -> String {
+    #[cfg(windows)]
+    if kind == SymlinkType::Junction {
+        return symlink_target_os(&symlink_probe_path(link, target)).into_owned();
+    }
+    let _ = (link, kind);
+    symlink_target_os(target).into_owned()
+}
+
 /// The path node's Windows `fs.symlink` stats to choose a directory or a
 /// file link when no type is given: `path.resolve(link, '..', target)`, the
 /// target taken relative to the link's parent directory, not the cwd.
@@ -5294,24 +5334,27 @@ pub mod ops {
     }
 
     /// node's async `symlink`: `target` is the string the link stores
-    /// (`symlink_target_os`). On Windows `probe` is the path statted to pick
-    /// a directory or a file link (`symlink_probe_path`), `None` when the
-    /// read grant refuses it; as in node's callback and promise forms, a
-    /// probe that cannot be statted makes a file link. Elsewhere there is no
-    /// probe.
+    /// (`symlink_stored_target`), `kind` the type the call gave. On Windows,
+    /// with no type, `probe` is the path statted to pick a directory or a
+    /// file link (`symlink_probe_path`), `None` when the read grant refuses
+    /// it; as in node's callback and promise forms, a probe that cannot be
+    /// statted makes a file link. A given type is never probed. Elsewhere
+    /// neither matters.
     pub async fn fs_symlink(
         target: String,
+        kind: super::SymlinkType,
         probe: Option<super::FsPath>,
         path: super::FsPath,
     ) -> OpOutcome {
         #[cfg(windows)]
         let result = {
-            let is_dir = match &probe {
-                Some(probe) => tokio::fs::metadata(probe)
+            let is_dir = match (kind, &probe) {
+                (super::SymlinkType::Probe, Some(probe)) => tokio::fs::metadata(probe)
                     .await
                     .map(|m| m.is_dir())
                     .unwrap_or(false),
-                None => false,
+                (super::SymlinkType::Probe, None) | (super::SymlinkType::File, _) => false,
+                (super::SymlinkType::Dir | super::SymlinkType::Junction, _) => true,
             };
             if is_dir {
                 tokio::fs::symlink_dir(&target, &path).await
@@ -5321,7 +5364,7 @@ pub mod ops {
         };
         #[cfg(not(windows))]
         let result = {
-            let _ = probe;
+            let _ = (kind, probe);
             tokio::fs::symlink(&target, &path).await
         };
         match result {
