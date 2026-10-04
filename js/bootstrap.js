@@ -4065,8 +4065,16 @@
       // engine calls this with no JS below it.
       captureStackTrace(err, makeSysError);
     }
-    if (fields.errno !== undefined) err.errno = fields.errno;
-    err.code = fields.code;
+    if (fields.syscall === "listen") {
+      // A server's listen error is node's uvExceptionWithHostPort, which
+      // sets the code before the errno (measured on v22.22.2: keys code,
+      // errno, syscall, address, port); every other is errno first.
+      err.code = fields.code;
+      if (fields.errno !== undefined) err.errno = fields.errno;
+    } else {
+      if (fields.errno !== undefined) err.errno = fields.errno;
+      err.code = fields.code;
+    }
     if (fields.syscall !== undefined) err.syscall = fields.syscall;
     if (fields.path !== undefined) err.path = fields.path;
     if (fields.dest !== undefined) err.dest = fields.dest;

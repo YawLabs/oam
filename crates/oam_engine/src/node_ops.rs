@@ -383,6 +383,10 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tcpServerClose", op_tcp_server_close),
         ("tcpSetRef", op_tcp_set_ref),
         ("tcpServerSetRef", op_tcp_server_set_ref),
+        // Pipes (node:net's `path`): named pipes / Unix domain sockets,
+        // whose streams and servers then take the tcp* ops above.
+        ("pipeConnect", op_pipe_connect),
+        ("pipeListen", op_pipe_listen),
         // UDP sockets (node:dgram)
         ("udpBind", op_udp_bind),
         ("udpSend", op_udp_send),
@@ -4806,6 +4810,71 @@ fn op_tcp_listen(
     let tcp = core.tcp();
     let ids = core.body_ids();
     crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_listen(tcp, ids, at));
+}
+
+/// The pipe path argument 0 of a pipe op and the path the op is to use,
+/// through the pipe gate ([`crate::permissions::Permissions::check_pipe`]:
+/// net for the pipe, and the fs read and write grants when the path is a
+/// file; a relative path resolved against the cwd when a check needed it).
+/// `None` means an exception is pending.
+fn pipe_path_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    op: &str,
+) -> Option<(String, String)> {
+    let Some(path) = arg_string(scope, args, 0) else {
+        throw_type_error(scope, &format!("{op} requires a path"));
+        return None;
+    };
+    let target = match get_permissions(scope).check_pipe(&path) {
+        Ok(target) => target.into_owned(),
+        Err(denial) => {
+            throw_permission_denied(scope, &denial);
+            return None;
+        }
+    };
+    Some((path, target))
+}
+
+/// `__oam.node.pipeConnect(path) -> Promise<{ handle }>`: net.connect({ path
+/// }) to a Windows named pipe or a Unix domain socket. The handle is a TCP
+/// registry stream: tcpRead / tcpWrite / tcpShutdown / tcpClose take it.
+fn op_pipe_connect(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some((path, target)) = pipe_path_arg(scope, &args, "pipeConnect") else {
+        return;
+    };
+    let core = core_runtime!(scope);
+    let tcp = core.tcp();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::tcp::pipe_connect(tcp, ids, path, target),
+    );
+}
+
+/// `__oam.node.pipeListen(path) -> Promise<{ serverId }>`: a net server's
+/// listen(path). tcpAccept / tcpServerClose / tcpServerSetRef take the id.
+fn op_pipe_listen(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some((path, target)) = pipe_path_arg(scope, &args, "pipeListen") else {
+        return;
+    };
+    let core = core_runtime!(scope);
+    let tcp = core.tcp();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::tcp::pipe_listen(tcp, ids, path, target),
+    );
 }
 
 fn op_tcp_accept(
