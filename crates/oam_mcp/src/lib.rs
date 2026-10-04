@@ -423,7 +423,7 @@ const KNOWN_CODES: &[(&str, &str)] = &[
     ),
     (
         "OAM-RT0001",
-        "Uncaught runtime exception. The message carries the JS error; the span (when present) points at the throw site.",
+        "A runtime error with no more specific code. Most often an uncaught exception on a path that does not produce the Node-format report (that one is OAM-RT0005); also the engine's own failures and hard limits, such as module evaluation not returning a promise or a source or path too long to become a V8 string. Read the message: it may describe oam's state rather than a throw in your code.",
     ),
     (
         "OAM-RT0002",
@@ -435,7 +435,7 @@ const KNOWN_CODES: &[(&str, &str)] = &[
     ),
     (
         "OAM-RT0004",
-        "A promise rejected with no handler attached (Node's ERR_UNHANDLED_REJECTION equivalent). Attach .catch() or await it in a try/catch.",
+        "Two unrelated conditions share this code, so read the message. An unhandled promise rejection (Node's ERR_UNHANDLED_REJECTION): attach .catch() or await it in a try/catch. Or 'could not start inspector on <address>': the --inspect port is usually already bound; free it or pick another port.",
     ),
     (
         "OAM-RT0005",
