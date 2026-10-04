@@ -16,8 +16,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
-Follow-ups to the 0.17.2 batch, across fs, fetch, undici and Buffer, web streams, zlib and http2:
-each change below is held to node v22.22.2 by a conformance case or an e2e test.
+## [0.18.0] - 2026-10-04
+
+Two batches of node-compat work since 0.17.1 (0.17.2 was prepared but never released, so its
+entries ship here, under "Prepared as 0.17.2" below): fs and Windows paths, permissions, fetch,
+undici and its mocks, child processes, net over a pipe, web streams, zlib and http2. Each change
+below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Permissions
 
@@ -359,13 +363,13 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 - **The web streams' queues dequeue in O(1)**, so a producer that runs ahead no longer goes
   quadratic: 300k unawaited writes take 0.2 s instead of 143 s.
 
-## [0.17.2] - YYYY-MM-DD
+### Prepared as 0.17.2
 
 Node-compat depth across fetch, the http client and server, net, dns, undici, zlib, fs and
 node's coded errors: each change below is held to node v22.22.2 by a conformance case or an
 e2e test.
 
-### Added
+#### Added
 
 - **`undici` exports `ProxyAgent` and `EnvHttpProxyAgent`** (#208). The dispatch-only names
   (`RetryAgent`, `connect()`, `pipeline()`, ...) now export and refuse with
@@ -383,7 +387,7 @@ e2e test.
 - **`net.Socket` has `writableEnded` and `writableFinished`**, and `fs.realpath.native` exists.
 - **The MCP sidecar gate hosts the yaw-mcp broker itself**, as `oam run --no-check` (#221).
 
-### Changed
+#### Changed
 
 - **`listen()` without a host binds dual-stack `::`, as node's does** (#172). An http, https
   or http2 server started without a host used to bind `127.0.0.1` and was unreachable from
@@ -391,7 +395,7 @@ e2e test.
   `ipv6Only`, `address()` reports the family bound, and listen errors have node's shape.
   Under `--permission`, such a listen is checked as `0.0.0.0:<port>` on every server kind.
 
-### Fixed
+#### Fixed
 
 - **fetch, `Request` and `Response` stringified a `Blob`, `File`, `FormData`,
   `URLSearchParams` or `ReadableStream` body** (#154). They send it as itself with node's
@@ -4021,8 +4025,8 @@ releases.
 - The `fork` prewarm pool warms lazily, on first `fork()`.
 - `io_uring` read chunks grow from 64 KiB to 4 MiB, fixing large-file reads.
 
-[Unreleased]: https://github.com/YawLabs/oam/compare/v0.17.1...HEAD
-[0.17.2]: https://github.com/YawLabs/oam/compare/v0.17.1...v0.17.2
+[Unreleased]: https://github.com/YawLabs/oam/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/YawLabs/oam/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/YawLabs/oam/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/YawLabs/oam/compare/v0.16.4...v0.17.0
 [0.16.4]: https://github.com/YawLabs/oam/compare/v0.16.3...v0.16.4
