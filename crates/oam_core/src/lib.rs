@@ -3633,10 +3633,10 @@ pub fn fd_error_code(error: &std::io::Error) -> &'static str {
 /// at all (and the async form with no `syscall` or `path` either), where every
 /// sibling fs op carries all four.
 ///
-/// The message names the path as `fs_error_path` reports it, and so must the
+/// The message names the path as `path.shown()` reports it, and so must the
 /// caller's `path` property.
-pub fn check_access(path: &str, mode: i32) -> Result<(), (String, String, Option<i32>)> {
-    let shown = fs_error_path(path);
+pub fn check_access(path: &FsPath, mode: i32) -> Result<(), (String, String, Option<i32>)> {
+    let shown = path.shown();
     let meta = std::fs::metadata(path).map_err(|e| {
         let code = node_error_code(&e);
         (
@@ -4309,10 +4309,10 @@ pub mod ops {
         OpOutcome::Done
     }
 
-    /// A failed path operation, naming the path as node does (on Windows the
-    /// resolved one, see `fs_error_path`).
-    fn node_fail(error: std::io::Error, syscall: &str, path: &str) -> OpOutcome {
-        node_fail_as_passed(error, syscall, &super::fs_error_path(path))
+    /// A failed path operation, naming the path as node does: the OS path
+    /// with the prefix taken off (`FsPath::shown`).
+    fn node_fail(error: std::io::Error, syscall: &str, path: &super::FsPath) -> OpOutcome {
+        node_fail_as_passed(error, syscall, &path.shown())
     }
 
     /// `node_fail` naming `path` exactly as given: for mkdtemp, whose
@@ -4347,10 +4347,10 @@ pub mod ops {
     fn node_fail_whole_file(
         site: super::FsSite<'_>,
         error: super::WholeFileError,
-        path: &str,
+        path: &super::FsPath,
     ) -> OpOutcome {
-        let failure = super::whole_file_error(site, path, &error);
-        let shown = super::fs_error_path(path);
+        let failure = super::whole_file_error(site, path.os(), &error);
+        let shown = path.shown();
         OpOutcome::node_failed_at(
             failure.code,
             super::fs_error_message(failure, &shown, error.io()),
@@ -4366,10 +4366,10 @@ pub mod ops {
         site: super::FsSite<'_>,
         error: std::io::Error,
         syscall: &'static str,
-        path: &str,
+        path: &super::FsPath,
     ) -> OpOutcome {
-        let failure = super::fs_error_at(site, syscall, path, &error);
-        let shown = super::fs_error_path(path);
+        let failure = super::fs_error_at(site, syscall, path.os(), &error);
+        let shown = path.shown();
         OpOutcome::node_failed_at(
             failure.code,
             super::fs_error_message(failure, &shown, &error),
@@ -4848,7 +4848,7 @@ pub mod ops {
         Ok(serde_json::Value::Array(entries).to_string())
     }
 
-    pub async fn fs_read_file(path: String) -> OpOutcome {
+    pub async fn fs_read_file(path: super::FsPath) -> OpOutcome {
         // Always raw bytes: encodings decode JS-side via Buffer#toString
         // (a Rust-side utf8-lossy decode was silently wrong for base64/
         // hex/latin1 requests).
@@ -4860,7 +4860,7 @@ pub mod ops {
         #[cfg(target_os = "linux")]
         {
             if let Some(uring) = crate::io_uring_fs::global()
-                && let Ok(bytes) = uring.read_file(path.clone()).await
+                && let Ok(bytes) = uring.read_file(path.os().to_string()).await
             {
                 return OpOutcome::Bytes(bytes);
             }
@@ -4868,7 +4868,7 @@ pub mod ops {
         // One blocking-pool hop, as tokio::fs::read makes, but with the open
         // and the read reported apart (super::whole_file_error).
         let owned = path.clone();
-        let result = tokio::task::spawn_blocking(move || super::read_whole_file(&owned))
+        let result = tokio::task::spawn_blocking(move || super::read_whole_file(owned.os()))
             .await
             .unwrap_or_else(|e| Err(super::WholeFileError::Open(std::io::Error::other(e))));
         match result {
@@ -4877,7 +4877,7 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_write_file(path: String, data: Vec<u8>, append: bool) -> OpOutcome {
+    pub async fn fs_write_file(path: super::FsPath, data: Vec<u8>, append: bool) -> OpOutcome {
         // io_uring fast path (Linux, opt-in): non-append writes only (create +
         // truncate + write_all_at). `data` is moved in -- no clone on the happy
         // path. On a worker-channel failure write_file hands the un-consumed
@@ -4889,7 +4889,7 @@ pub mod ops {
         #[cfg(target_os = "linux")]
         {
             if !append && let Some(uring) = crate::io_uring_fs::global() {
-                match uring.write_file(path.clone(), data).await {
+                match uring.write_file(path.os().to_string(), data).await {
                     Ok(()) => return OpOutcome::Done,
                     // Channel failure with the buffer recovered: retry via std.
                     Err((_chan_err, recovered)) if !recovered.is_empty() => {
@@ -4910,10 +4910,10 @@ pub mod ops {
     /// with the open and the write reported apart (`super::whole_file_error`).
     /// Factored out so the io_uring fast path can fall through to it with a
     /// recovered buffer on a worker-channel failure.
-    async fn fs_write_file_std(path: String, data: Vec<u8>, append: bool) -> OpOutcome {
+    async fn fs_write_file_std(path: super::FsPath, data: Vec<u8>, append: bool) -> OpOutcome {
         let owned = path.clone();
         let result =
-            tokio::task::spawn_blocking(move || super::write_whole_file(&owned, &data, append))
+            tokio::task::spawn_blocking(move || super::write_whole_file(owned.os(), &data, append))
                 .await
                 .unwrap_or_else(|e| Err(super::WholeFileError::Open(std::io::Error::other(e))));
         let site = if append {
@@ -4927,12 +4927,12 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_stat(path: String, lstat: bool) -> OpOutcome {
+    pub async fn fs_stat(path: super::FsPath, lstat: bool) -> OpOutcome {
         // One hop to a blocking thread for the whole operation. Awaiting
         // tokio's metadata and THEN opening a handle here would do the second
         // (blocking) open on a runtime thread.
         let owned = path.clone();
-        let result = tokio::task::spawn_blocking(move || stat_path_json(&owned, lstat)).await;
+        let result = tokio::task::spawn_blocking(move || stat_path_json(owned.os(), lstat)).await;
         match result {
             Ok(Ok(json)) => OpOutcome::Json(json),
             Ok(Err(e)) => node_fail(e, if lstat { "lstat" } else { "stat" }, &path),
@@ -5015,9 +5015,9 @@ pub mod ops {
             .map(|meta| stat_to_json(&meta, StatSource::File(file)))
     }
 
-    pub async fn fs_statfs(path: String) -> OpOutcome {
+    pub async fn fs_statfs(path: super::FsPath) -> OpOutcome {
         let owned = path.clone();
-        let result = tokio::task::spawn_blocking(move || statfs_json(&owned)).await;
+        let result = tokio::task::spawn_blocking(move || statfs_json(owned.os())).await;
         match result {
             Ok(Ok(json)) => OpOutcome::Json(json),
             Ok(Err(e)) => node_fail(e, "statfs", &path),
@@ -5025,10 +5025,10 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_readdir(path: String) -> OpOutcome {
+    pub async fn fs_readdir(path: super::FsPath) -> OpOutcome {
         match tokio::task::spawn_blocking({
             let path = path.clone();
-            move || readdir_to_json(&path)
+            move || readdir_to_json(path.os())
         })
         .await
         .unwrap_or_else(|e| Err(std::io::Error::other(e)))
@@ -5038,7 +5038,7 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_mkdir(path: String, recursive: bool) -> OpOutcome {
+    pub async fn fs_mkdir(path: super::FsPath, recursive: bool) -> OpOutcome {
         let result = if recursive {
             tokio::fs::create_dir_all(&path).await
         } else {
@@ -5050,10 +5050,10 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_rm(path: String, recursive: bool, force: bool) -> OpOutcome {
+    pub async fn fs_rm(path: super::FsPath, recursive: bool, force: bool) -> OpOutcome {
         let result = tokio::task::spawn_blocking({
             let path = path.clone();
-            move || super::remove_path(&path, recursive)
+            move || super::remove_path(path.os(), recursive)
         })
         .await
         .unwrap_or_else(|e| Err(std::io::Error::other(e)));
@@ -5064,38 +5064,38 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_unlink(path: String) -> OpOutcome {
+    pub async fn fs_unlink(path: super::FsPath) -> OpOutcome {
         match tokio::fs::remove_file(&path).await {
             Ok(()) => OpOutcome::Done,
             Err(e) => node_fail(e, "unlink", &path),
         }
     }
 
-    pub async fn fs_rename(from: String, to: String) -> OpOutcome {
+    pub async fn fs_rename(from: super::FsPath, to: super::FsPath) -> OpOutcome {
         match tokio::fs::rename(&from, &to).await {
             Ok(()) => OpOutcome::Done,
             Err(e) => {
-                let (path, dest) = (super::fs_error_path(&from), super::fs_error_path(&to));
+                let (path, dest) = (from.shown(), to.shown());
                 node_fail_dest(e, "rename", &path, &dest)
             }
         }
     }
 
-    pub async fn fs_copy_file(from: String, to: String) -> OpOutcome {
+    pub async fn fs_copy_file(from: super::FsPath, to: super::FsPath) -> OpOutcome {
         match tokio::fs::copy(&from, &to).await {
             Ok(_) => OpOutcome::Done,
             Err(e) => {
-                let (path, dest) = (super::fs_error_path(&from), super::fs_error_path(&to));
+                let (path, dest) = (from.shown(), to.shown());
                 node_fail_dest(e, "copyfile", &path, &dest)
             }
         }
     }
 
-    pub async fn fs_access(path: String, mode: i32) -> OpOutcome {
+    pub async fn fs_access(path: super::FsPath, mode: i32) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || match super::check_access(&path, mode) {
             Ok(()) => OpOutcome::Done,
             Err((code, message, errno)) => {
-                let shown = super::fs_error_path(&path);
+                let shown = path.shown();
                 OpOutcome::node_failed_at(code, message, "access", Some(&*shown), errno)
             }
         })
@@ -5103,7 +5103,7 @@ pub mod ops {
         result.unwrap_or_else(|e| OpOutcome::Failed(format!("access: {e}")))
     }
 
-    pub async fn fs_realpath(path: String) -> OpOutcome {
+    pub async fn fs_realpath(path: super::FsPath) -> OpOutcome {
         match tokio::fs::canonicalize(&path).await {
             Ok(real) => OpOutcome::Text(super::strip_unc_prefix(&real)),
             Err(e) => node_fail(e, "realpath", &path),
@@ -5124,7 +5124,7 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_symlink(target: String, path: String) -> OpOutcome {
+    pub async fn fs_symlink(target: String, path: super::FsPath) -> OpOutcome {
         #[cfg(windows)]
         let result = {
             let is_dir = tokio::fs::metadata(&target)
@@ -5143,28 +5143,28 @@ pub mod ops {
             Ok(()) => OpOutcome::Done,
             // The target is stored as written, so node reports it so; the
             // link's own path is resolved like any other.
-            Err(e) => node_fail_dest(e, "symlink", &target, &super::fs_error_path(&path)),
+            Err(e) => node_fail_dest(e, "symlink", &target, &path.shown()),
         }
     }
 
-    pub async fn fs_readlink(path: String) -> OpOutcome {
+    pub async fn fs_readlink(path: super::FsPath) -> OpOutcome {
         match tokio::fs::read_link(&path).await {
             Ok(target) => OpOutcome::Text(super::strip_unc_prefix(&target)),
             Err(e) => node_fail_at(super::FsSite::Readlink, e, "readlink", &path),
         }
     }
 
-    pub async fn fs_link(existing: String, new_path: String) -> OpOutcome {
+    pub async fn fs_link(existing: super::FsPath, new_path: super::FsPath) -> OpOutcome {
         match tokio::fs::hard_link(&existing, &new_path).await {
             Ok(()) => OpOutcome::Done,
             Err(e) => {
-                let path = super::fs_error_path(&existing);
-                node_fail_dest(e, "link", &path, &super::fs_error_path(&new_path))
+                let path = existing.shown();
+                node_fail_dest(e, "link", &path, &new_path.shown())
             }
         }
     }
 
-    pub async fn fs_chmod(path: String, mode: u32) -> OpOutcome {
+    pub async fn fs_chmod(path: super::FsPath, mode: u32) -> OpOutcome {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -5520,11 +5520,11 @@ pub mod ops {
         .map_err(super::io_from_errno)
     }
 
-    pub async fn fs_chown(path: String, uid: u32, gid: u32, follow: bool) -> OpOutcome {
+    pub async fn fs_chown(path: super::FsPath, uid: u32, gid: u32, follow: bool) -> OpOutcome {
         let syscall = if follow { "chown" } else { "lchown" };
         let owned = path.clone();
         let result =
-            tokio::task::spawn_blocking(move || chown_path(&owned, uid, gid, follow)).await;
+            tokio::task::spawn_blocking(move || chown_path(owned.os(), uid, gid, follow)).await;
         match result {
             Ok(Ok(())) => OpOutcome::Done,
             Ok(Err(e)) => node_fail(e, syscall, &path),
@@ -5532,13 +5532,19 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_utimes(path: String, atime_ms: f64, mtime_ms: f64, follow: bool) -> OpOutcome {
+    pub async fn fs_utimes(
+        path: super::FsPath,
+        atime_ms: f64,
+        mtime_ms: f64,
+        follow: bool,
+    ) -> OpOutcome {
         // node reports the SINGULAR syscall name here (measured).
         let syscall = if follow { "utime" } else { "lutime" };
         let owned = path.clone();
-        let result =
-            tokio::task::spawn_blocking(move || utimes_path(&owned, atime_ms, mtime_ms, follow))
-                .await;
+        let result = tokio::task::spawn_blocking(move || {
+            utimes_path(owned.os(), atime_ms, mtime_ms, follow)
+        })
+        .await;
         match result {
             Ok(Ok(())) => OpOutcome::Done,
             Ok(Err(e)) => node_fail(e, syscall, &path),
@@ -5576,9 +5582,9 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_lchmod(path: String, mode: u32) -> OpOutcome {
+    pub async fn fs_lchmod(path: super::FsPath, mode: u32) -> OpOutcome {
         let owned = path.clone();
-        let result = tokio::task::spawn_blocking(move || fs_lchmod_sync(&owned, mode)).await;
+        let result = tokio::task::spawn_blocking(move || fs_lchmod_sync(owned.os(), mode)).await;
         match result {
             Ok(Ok(())) => OpOutcome::Done,
             Ok(Err(e)) => node_fail(e, "lchmod", &path),
@@ -5966,7 +5972,7 @@ pub mod ops {
     pub async fn fs_open(
         files: super::FileRegistry,
         ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        path: String,
+        path: super::FsPath,
         mode: String,
     ) -> OpOutcome {
         let options = super::open_options_for(&mode);
@@ -6029,11 +6035,7 @@ pub mod ops {
         let (mut buf, result) = match done {
             Ok(t) => t,
             Err(e) => {
-                return node_fail(
-                    std::io::Error::other(e.to_string()),
-                    "read",
-                    &handle.to_string(),
-                );
+                return node_fail_fd(std::io::Error::other(e.to_string()), "read");
             }
         };
         match result {
