@@ -50,9 +50,10 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   node's does. Names compare case-sensitively, as node's do (`c:\work\x` is not under a grant
   of `C:\work`); a trailing dot or space is part of a name (`allowed.\x` is not under
   `allowed`); a UNC path `\\srv\sh\x` and the rooted path `\srv\sh\x` are different paths; a
-  grant of `\` or `/` is the cwd drive's root; and a `\\.\` device path, or a `\\?\` path in
-  neither drive nor UNC form, matches no grant. `oam.readTextFile` is checked the same way.
-  (#275)
+  grant of `\` or `/` is the cwd drive's root; and a `\\.\` device path, a `\\?\` path in
+  neither drive nor UNC form, or a path judged as given that is spelt with the NT prefix
+  `\??\` (the `mkdtemp` template, a pipe path, the child, worker and addon lists) matches no
+  grant. `oam.readTextFile` is checked the same way. (#275)
 
 ### Added
 

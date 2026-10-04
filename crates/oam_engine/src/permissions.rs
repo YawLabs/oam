@@ -227,8 +227,18 @@ fn posix_key(normalized: &str) -> FsKey {
 /// separators, `.` or `?`, then a separator or the end (`\\.\C:\x`,
 /// `\\?\C:\x`, `//./pipe/x`, `\\?`). node's resolve keeps such a path's
 /// prefix (`path.win32.resolve('\\\\?\\C:\\x')` is `\\?\C:\x`).
+///
+/// The NT-prefix spelling `\??\...` (backslashes only) is one too:
+/// CreateFileW hands it to the object manager as an NT path, so
+/// `\??\D:\x`, `\??\UNC\srv\sh\x` and `\??\GLOBALROOT\...` name another
+/// drive, a share or a device, while a resolve reads it as the rooted
+/// `C:\??\...` on the cwd's drive. `/??/x` is not: Win32 opens it as the
+/// literal `C:\??\x`.
 #[cfg(windows)]
 fn is_device_spelling(path: &str) -> bool {
+    if path.starts_with(r"\??\") {
+        return true;
+    }
     let b = path.as_bytes();
     let sep = |c: u8| c == b'\\' || c == b'/';
     b.len() >= 3
@@ -281,7 +291,8 @@ fn win_plain_key(path: &str) -> Option<FsKey> {
 ///   `\\?\C:\x` is `C:\x` and `\\?\UNC\srv\sh\x` is `\\srv\sh\x`. Any other
 ///   `\\?\` path (`\\?\GLOBALROOT\...`, the volume `\\?\C:`, `\\?\Volume{..}`)
 ///   matches nothing.
-/// - Any other device spelling (`\\.\C:\x`, `//?/C:/x`) matches nothing:
+/// - Any other device spelling (`\\.\C:\x`, `//?/C:/x`, the NT prefix
+///   `\??\C:\x`) matches nothing:
 ///   Win32 hands such a path to the object manager after its own rewriting,
 ///   and node v22.22.2 refuses `\\.\C:\x` under a grant of `C:\`.
 /// - Any other path is resolved as Win32 itself will resolve it when it is
@@ -2378,6 +2389,54 @@ mod tests {
         );
     }
 
+    /// The NT-prefix spelling `\??\...` is handed to the object manager as an
+    /// NT path by CreateFileW (RtlDosPathNameToNtPathName), so `\??\D:\x`,
+    /// `\??\UNC\srv\sh\x` and `\??\GLOBALROOT\...` open another drive, a
+    /// share or a device. Read as a rooted Win32 path it is `C:\??\...`, on
+    /// the cwd's drive. Like the other device spellings it matches no grant,
+    /// wherever a path is judged as given: the mkdtemp template, a pipe path,
+    /// and the child, worker and addon lists. Only the backslash spelling is
+    /// an NT path: `/??/C:/x` is opened as the literal `C:\??\C:\x`.
+    #[cfg(windows)]
+    #[test]
+    fn the_nt_prefix_spelling_matches_no_grant() {
+        let (drive, other) = drives();
+        let roots = [format!(r"{drive}\"), r"\".to_string()];
+        let nt = [
+            format!(r"\??\{drive}\x"),
+            format!(r"\??\{other}\x"),
+            r"\??\UNC\127.0.0.1\ADMIN$\Temp\q-".to_string(),
+            format!(r"\??\GLOBALROOT\??\{drive}\x"),
+        ];
+        for root in &roots {
+            let p = read_grant(&[root]);
+            for target in &nt {
+                assert!(p.check_read(target).is_err(), "{root} -> {target}");
+            }
+            assert!(p.check_read(&format!("/??/{drive}/x")).is_ok(), "{root}");
+            let both = Permissions::from_opts(Some(PermissionsOptions {
+                read: BoolOrList::List(vec![root.clone()]),
+                write: BoolOrList::List(vec![root.clone()]),
+                net: BoolOrList::Bool(true),
+                ..opts_read_only(vec![])
+            }));
+            for target in &nt {
+                assert!(both.check_pipe(target).is_err(), "pipe {root} -> {target}");
+            }
+            let list = PermValue::List(vec![root.clone()]);
+            for target in &nt {
+                assert!(!list.allows_path(target), "list {root} -> {target}");
+            }
+        }
+        // As a grant entry it grants nothing either.
+        let p = read_grant(&[&format!(r"\??\{drive}\")]);
+        assert!(p.check_read(&format!(r"{drive}\x")).is_err());
+        assert!(p.check_read(&format!(r"\??\{drive}\x")).is_err());
+        assert!(
+            !PermValue::List(vec![format!(r"\??\{drive}\")]).allows_path(&format!(r"{drive}\x"))
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_device_or_verbatim_grant_entry_grants_nothing() {
@@ -2463,6 +2522,11 @@ mod tests {
             format!(r"{other}\x"),
             format!(r"{drive}\"),
             String::new(),
+            // An fs op hands the OS `\\?\C:\??\...`, a literal name on the
+            // cwd's drive, as node's binding does; the query judges that too.
+            format!(r"\??\{plain}\x"),
+            format!(r"\??\{drive}\x"),
+            r"\??\UNC\srv\sh\x".to_string(),
         ] {
             let gate = p.check_read_path(&os(&target)).is_ok();
             let expected = if gate { "granted" } else { "denied" };

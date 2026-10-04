@@ -293,10 +293,16 @@ Differences from Node's model:
   case-sensitively, as in Node (`c:\box\f` and `C:\BOX\f` are outside a grant of
   `C:\box`); a trailing dot or space is part of the name (`allowed.\x` is not inside
   `allowed`); a grant of `\` or `/` is the root of the cwd's drive; and a UNC path
-  `\\srv\sh\x` is never the rooted `\srv\sh\x`. oam is stricter than Node in two
+  `\\srv\sh\x` is never the rooted `\srv\sh\x`. oam is stricter than Node in three
   corners, each refused where Node v22.22.2 admits it: a `\\.\` path is matched by no
-  grant (Node matches it, prefix and all, against a grant spelled `\\.\...`), and the
-  volume `\\?\C:` (what `\\?\C:\` resolves to) is not inside a grant of `C:\`. One
+  grant (Node matches it, prefix and all, against a grant spelled `\\.\...`); the
+  volume `\\?\C:` (what `\\?\C:\` resolves to) is not inside a grant of `C:\`; and a
+  path spelt with the NT prefix `\??\` (`\??\D:\x`, `\??\UNC\srv\sh\x`), which the OS
+  opens as an NT path on another drive, share or device, is matched by no grant where it
+  is judged as given -- the `mkdtemp` template, a pipe path, and the child, worker and
+  addon lists -- while Node resolves it to the rooted `C:\??\...` and admits it under a
+  grant of `C:\`. An fs op on such a path is unaffected: it opens the literal
+  `\\?\C:\??\...`, as Node's does. One
   corner is the other way: a grant of a UNC path (`--allow-fs-read=\\srv\sh`) admits ops
   on `\\srv\sh\x`, which `process.permission.has` reports granted but Node's ops refuse.
 - **A denied environment read is silent; every other denial throws.** Filesystem,
