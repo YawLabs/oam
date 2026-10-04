@@ -1185,6 +1185,12 @@ cat > "$VMS_BIN/gcloud" <<EOF
 S="$VMS_STATE"
 printf '%s\n' "\$*" >> "\$S/log"
 a="\$*"
+# State reads are bash builtins, not cat: under a full ci-local.sh run one
+# forked cat came back empty (2026-10-04), and the orchestrator read that as
+# an unreadable VM. The orchestrator now re-asks a blank describe; the stub
+# still does not fork for a one-line file. blank-status-once makes the next
+# status describe answer blank, exit 0 -- the shape that bit.
+rd(){ local l; IFS= read -r l < "\$1" || true; printf '%s\n' "\$l"; }
 # An instance that moved zones: nothing answers in the old zone but the list.
 if [ -e "\$S/moved" ]; then
   case "\$a" in
@@ -1195,8 +1201,10 @@ if [ -e "\$S/moved" ]; then
 fi
 case "\$a" in
   *"instances describe"*"value(name)"*)                 echo yaw-linux-builder ;;
-  *"instances describe"*"value(status)"*)               cat "\$S/status" ;;
-  *"instances describe"*"machineType.basename()"*)      cat "\$S/type" ;;
+  *"instances describe"*"value(status)"*)
+    if [ -e "\$S/blank-status-once" ]; then rm -f "\$S/blank-status-once"; exit 0; fi
+    rd "\$S/status" ;;
+  *"instances describe"*"machineType.basename()"*)      rd "\$S/type" ;;
   *"instances describe"*"resourcePolicies"*)            echo ;;
   *"instances describe"*"natIP"*)                       echo 203.0.113.9 ;;
   *"instances set-machine-type"*)
@@ -1209,7 +1217,7 @@ case "\$a" in
     echo "\$t" > "\$S/type"
     if [ -e "\$S/interrupt-set-\$t" ]; then printf '\n\nCommand killed by keyboard interrupt\n' >&2; exit 2; fi ;;
   *"instances start"*)
-    if [ "\$(cat "\$S/type")" = "\$(cat "\$S/good-type")" ]; then echo RUNNING > "\$S/status"
+    if [ "\$(rd "\$S/type")" = "\$(rd "\$S/good-type")" ]; then echo RUNNING > "\$S/status"
     elif [ -e "\$S/start-quota" ]; then cat "\$S/quota.txt" >&2; exit 1
     else cat "\$S/exhausted.txt" >&2; exit 1; fi ;;
   *"instances stop"*)              echo 'Stopping instance(s) yaw-linux-builder...' >&2; echo TERMINATED > "\$S/status" ;;
@@ -1231,7 +1239,7 @@ chmod +x "$VMS_BIN/gcloud" "$VMS_BIN/ssh"
 # another project cannot turn a run red. Stdout to VMS_OUT, stderr to VMS_ERR,
 # status to VMS_RC, the stub's call log to VMS_LOG.
 vms_run(){
-  rm -f "$VMS_STATE/log" "$VMS_STATE/moved" "$VMS_STATE/start-quota" "$VMS_STATE"/reject-set-* "$VMS_STATE"/interrupt-set-*
+  rm -f "$VMS_STATE/log" "$VMS_STATE/moved" "$VMS_STATE/start-quota" "$VMS_STATE/blank-status-once" "$VMS_STATE"/reject-set-* "$VMS_STATE"/interrupt-set-*
   echo TERMINATED > "$VMS_STATE/status"; echo e2-highmem-4 > "$VMS_STATE/type"
   echo "$1" > "$VMS_STATE/good-type"; shift
   local flag; for flag in "$@"; do : > "$VMS_STATE/$flag"; done
@@ -1276,6 +1284,19 @@ VMS_HINT_LINE="$(grep -n -- '-- if this is interrupted, run:' <<<"$VMS_ERR" | he
 VMS_STOPPING_LINE="$(grep -n 'Stopping instance(s) yaw-linux-builder' <<<"$VMS_ERR" | head -1 | cut -d: -f1)"
 if [ -n "$VMS_HINT_LINE" ] && [ -n "$VMS_STOPPING_LINE" ] && [ "$VMS_HINT_LINE" -lt "$VMS_STOPPING_LINE" ]; then pass
 else fail "hint@${VMS_HINT_LINE:-?} stop@${VMS_STOPPING_LINE:-?} in stderr"; fi
+
+# The same start, with the very first status describe answering blank (exit
+# 0, no text): it is asked again and the run goes on exactly as above. Before
+# vm_describe this read as "unreadable, not TERMINATED" and, with no budget
+# left, ended the run -- the 2026-10-04 gate failure.
+vms_run n2-highmem-4 blank-status-once
+it "a status describe that answers blank once is asked again, not read as an unreadable VM"
+if [ "$VMS_RC" != "0" ] && [ -z "$VMS_OUT" ] \
+   && grep -qF "VM started as n2-highmem-4 (its own type is e2-highmem-4; set back when this run stops it)" <<<"$VMS_ERR" \
+   && ! grep -q "unreadable" <<<"$VMS_ERR" \
+   && [ "$(sed -n '2p;3p' <<<"$VMS_LOG" | grep -c 'value(status)')" = "2" ] \
+   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ] && [ "$(cat "$VMS_STATE/status")" = "TERMINATED" ]; then pass
+else fail "rc=$VMS_RC type=$(cat "$VMS_STATE/type") log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
 
 vms_run n2-highmem-4 interrupt-set-n2-highmem-4
 it "a Ctrl-C that lands after set-machine-type was applied ends the run, and the VM's real type is what gets put back"

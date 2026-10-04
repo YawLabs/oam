@@ -195,8 +195,26 @@ if ! DESCRIBE_ERR="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE
   warn "instance $INSTANCE is not in $ZONE but in $FOUND_ZONE -- using that (OAM_GCP_BUILDER_ZONE=$FOUND_ZONE silences this)"
   ZONE="$FOUND_ZONE"
 fi
-VM_STATUS="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
-  --format='value(status)' 2>/dev/null | tr -d '\r' || true)"
+# vm_describe <field> -- `describe --format=value(<field>)`, CR-stripped. A
+# blank or failed answer is asked again, three tries two seconds apart, before
+# it comes back blank. gcloud answers blank for a moment during an auth refresh
+# or a 5xx, and one such answer used to read as "unreadable" and cost a whole
+# pass -- with no budget left, the release. The script suite met the same
+# shape: a stubbed read, racing the box's scanner under a full ci-local.sh
+# run, answered blank once and failed the gate. The natIP reader below
+# already retries this way. A field that is legitimately blank
+# (resourcePolicies) does not go through here.
+vm_describe() {
+  local v try
+  for try in 1 2 3; do
+    v="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
+      --format="value($1)" 2>/dev/null | tr -d '\r' || true)"
+    if [ -n "$v" ]; then printf '%s' "$v"; return 0; fi
+    if [ "$try" -lt 3 ]; then sleep 2; fi
+  done
+  return 1
+}
+VM_STATUS="$(vm_describe status || true)"
 [ -n "$VM_STATUS" ] || fail "could not read the status of $INSTANCE in $ZONE ($PROJECT)"
 # The machine type this run found the VM with, and the one it is set to now.
 # They differ only while a capacity fallback is in effect; restore_machine_type
@@ -208,8 +226,7 @@ CURRENT_MACHINE_TYPE=""
 # Ctrl-C while it polled, a timeout) can still have been applied.
 vm_machine_type_now() {
   local t
-  t="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
-    --format='value(machineType.basename())' 2>/dev/null | tr -d '\r' || true)"
+  t="$(vm_describe 'machineType.basename()' || true)"
   printf '%s' "${t:-$CURRENT_MACHINE_TYPE}"
 }
 restore_machine_type() {
@@ -217,8 +234,7 @@ restore_machine_type() {
   local status now
   now="$(vm_machine_type_now)"
   [ "$now" != "$ORIGINAL_MACHINE_TYPE" ] || return 0
-  status="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
-    --format='value(status)' 2>/dev/null | tr -d '\r' || true)"
+  status="$(vm_describe status || true)"
   if [ "$status" = "TERMINATED" ] \
      && gcloud compute instances set-machine-type "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
           --machine-type="$ORIGINAL_MACHINE_TYPE" >/dev/null 2>&1; then
@@ -249,8 +265,7 @@ if [ "$VM_STATUS" != "RUNNING" ]; then
   # stderr too, so it is captured with the error and the operator sees one
   # verdict line per attempt instead.
   VM_START_BUDGET="${OAM_VM_START_BUDGET_S:-900}"
-  ORIGINAL_MACHINE_TYPE="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
-    --format='value(machineType.basename())' 2>/dev/null | tr -d '\r' || true)"
+  ORIGINAL_MACHINE_TYPE="$(vm_describe 'machineType.basename()' || true)"
   VM_TYPES="$(vm_start_types "$ORIGINAL_MACHINE_TYPE" \
     "${OAM_GCP_FALLBACK_MACHINE_TYPES-n2-highmem-4 n2d-highmem-4 c2d-highmem-4 n1-highmem-4 e2-standard-8 t2d-standard-8}")" \
     || fail "could not read the machine type of $INSTANCE -- not starting it"
@@ -269,8 +284,7 @@ if [ "$VM_STATUS" != "RUNNING" ]; then
       # 03:00 schedule or an operator can be stopping or starting the VM under
       # this loop: only a TERMINATED VM takes a set-machine-type, and one that
       # is RUNNING is what the loop is after.
-      vm_now="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
-        --format='value(status)' 2>/dev/null | tr -d '\r' || true)"
+      vm_now="$(vm_describe status || true)"
       case "$vm_now" in
         RUNNING) ok "$INSTANCE is RUNNING (as $CURRENT_MACHINE_TYPE)"; VM_START_OK=1; break ;;
         TERMINATED) ;;
@@ -298,8 +312,7 @@ if [ "$VM_STATUS" != "RUNNING" ]; then
       case " $VM_TRIED " in *" $vm_type "*) ;; *) VM_TRIED="${VM_TRIED:+$VM_TRIED }$vm_type" ;; esac
       ok "starting $INSTANCE as $vm_type (pass $VM_START_PASS; gcloud's progress is captured, so this can be silent for a minute)..."
       if start_err="$(gcloud compute instances start "$INSTANCE" --zone="$ZONE" --project="$PROJECT" 2>&1 >/dev/null)"; then
-        vm_now="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
-          --format='value(status)' 2>/dev/null | tr -d '\r' || true)"
+        vm_now="$(vm_describe status || true)"
         [ "$vm_now" = "RUNNING" ] && { VM_START_OK=1; break; }
         warn "start of $INSTANCE ($vm_type) returned, but it reads ${vm_now:-unreadable} -- checking again next pass"
         break
@@ -817,9 +830,7 @@ sync_src(){
 remote_step_postmortem() {
   local log="$1" status last_stop
   ssh_transport_dropped "$(tail -5 "$log" 2>/dev/null || true)" || return 0
-  status="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
-    --format='value(status)' 2>/dev/null || echo UNKNOWN)"
-  status="${status//$'\r'/}"
+  status="$(vm_describe status || echo UNKNOWN)"
   case "$status" in
     RUNNING)
       if [ "$REMOTE_TRANSPORT" = "direct" ]; then
