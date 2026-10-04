@@ -602,6 +602,18 @@ fn rt_diag(code: &str, message: impl Into<String>) -> Vec<Diagnostic> {
     )]
 }
 
+/// OAM-TEST* failures from the test-runner bridge. Same shape as
+/// [`rt_diag`], but the origin must match the code's namespace (`test`, not
+/// `runtime`) -- agents route on `origin`.
+fn test_diag(code: &str, message: impl Into<String>) -> Vec<Diagnostic> {
+    vec![Diagnostic::new(
+        code,
+        Severity::Error,
+        Origin::Test,
+        message,
+    )]
+}
+
 impl JsRuntime {
     /// Reset all per-run isolate slots. Shared by the ESM and CJS entry
     /// paths.
@@ -1078,9 +1090,9 @@ impl JsRuntime {
             .ok_or_else(|| rt_diag("OAM-RT0001", "test runner key allocation failed"))?;
         let runner = global
             .get(tc, key.into())
-            .ok_or_else(|| rt_diag("OAM-TEST0003", "__oamTestRun missing from snapshot"))?;
+            .ok_or_else(|| test_diag("OAM-TEST0003", "__oamTestRun missing from snapshot"))?;
         let runner = v8::Local::<v8::Function>::try_from(runner)
-            .map_err(|_| rt_diag("OAM-TEST0003", "__oamTestRun is not a function"))?;
+            .map_err(|_| test_diag("OAM-TEST0003", "__oamTestRun is not a function"))?;
 
         let arg: v8::Local<v8::Value> = match filter {
             Some(filter) => v8::String::new(tc, filter)
@@ -1099,7 +1111,7 @@ impl JsRuntime {
             return Err(failure);
         }
         let promise = v8::Local::<v8::Promise>::try_from(result)
-            .map_err(|_| rt_diag("OAM-TEST0003", "__oamTestRun did not return a promise"))?;
+            .map_err(|_| test_diag("OAM-TEST0003", "__oamTestRun did not return a promise"))?;
 
         pump_event_loop(tc, Some(promise), false)?;
 
@@ -1107,7 +1119,7 @@ impl JsRuntime {
             v8::PromiseState::Fulfilled => {
                 let value = promise.result(tc);
                 let json = v8::json::stringify(tc, value)
-                    .ok_or_else(|| rt_diag("OAM-TEST0003", "test results failed to serialize"))?;
+                    .ok_or_else(|| test_diag("OAM-TEST0003", "test results failed to serialize"))?;
                 Ok(json.to_rust_string_lossy(tc))
             }
             v8::PromiseState::Rejected => {
@@ -1116,12 +1128,12 @@ impl JsRuntime {
                     .to_string(tc)
                     .map(|s| s.to_rust_string_lossy(tc))
                     .unwrap_or_else(|| "unknown exception".to_string());
-                Err(rt_diag(
+                Err(test_diag(
                     "OAM-TEST0003",
                     format!("test run crashed outside any test: {text}"),
                 ))
             }
-            v8::PromiseState::Pending => Err(rt_diag(
+            v8::PromiseState::Pending => Err(test_diag(
                 "OAM-TEST0003",
                 "test run never settled: a test holds the loop open (deadlocked await?)",
             )),
