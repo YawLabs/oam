@@ -2327,6 +2327,9 @@ pub struct FsError {
 /// - fs__readlink reports ERROR_NOT_A_REPARSE_POINT as `EINVAL`.
 /// - fs__scandir reports a file as `ENOTDIR`; libuv's table says `ENOENT` for
 ///   the ERROR_DIRECTORY std gets.
+/// - A drive or share root does not open at all without that flag, and fails
+///   not-found: its `readFile` is node's failed read and any other open is
+///   `EPERM`, as node's write open of a root is.
 ///
 /// Not reproduced: `fs.open(dir)` with `r`, `r+`, `a` or `a+` SUCCEEDS in
 /// node, which would take directory descriptors oam does not have. oam fails
@@ -2345,7 +2348,8 @@ pub fn fs_error_at(
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{
-            ERROR_ACCESS_DENIED, ERROR_DIRECTORY, ERROR_INVALID_NAME, ERROR_NOT_A_REPARSE_POINT,
+            ERROR_ACCESS_DENIED, ERROR_DIRECTORY, ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME,
+            ERROR_NOT_A_REPARSE_POINT, ERROR_PATH_NOT_FOUND,
         };
         let raw = error.raw_os_error().and_then(|r| u32::try_from(r).ok());
         let at = |code, syscall, has_path| FsError {
@@ -2366,6 +2370,29 @@ pub fn fs_error_at(
                 return at("EINVAL", syscall, true);
             }
             _ => {}
+        }
+        let open_shaped = matches!(
+            site,
+            FsSite::ReadFile | FsSite::WriteFile | FsSite::AppendFile | FsSite::Open(_)
+        );
+        if open_shaped
+            && matches!(
+                raw,
+                Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_INVALID_NAME)
+            )
+            && std::path::Path::new(path).is_dir()
+        {
+            // A drive or share root (`\\?\C:\`, `\\?\UNC\srv\sh\`): opened
+            // without backup semantics it fails ERROR_PATH_NOT_FOUND (a
+            // drive) or ERROR_INVALID_NAME (a share), where node opens it.
+            // Its readFile then fails on the read, and any write open is
+            // refused with ERROR_ACCESS_DENIED, which libuv reads as EPERM --
+            // a root is not the plain directory the rule below describes,
+            // whose `w` open fails ERROR_FILE_EXISTS.
+            return match site {
+                FsSite::ReadFile => at("EISDIR", "read", false),
+                _ => at("EPERM", syscall, true),
+            };
         }
         if raw == Some(ERROR_ACCESS_DENIED) && std::path::Path::new(path).is_dir() {
             match site {
@@ -2566,7 +2593,8 @@ pub fn node_error_message_dest(
     format!("{code}: {reason}, {syscall} '{path}' -> '{dest}'")
 }
 
-/// The path a filesystem error names, for a path as the caller passed it.
+/// The path a filesystem error names, for a path as the caller passed it:
+/// `fs_shown_path(&fs_os_path(path))`.
 ///
 /// On Windows node's binding resolves every path before libuv sees it
 /// (`ToNamespacedPath`: `PathResolve`, then the `\\?\` long-path prefix),
@@ -2574,37 +2602,296 @@ pub fn node_error_message_dest(
 /// (`StringFromPath`): `fs.statSync("x")` fails with `stat 'C:\cwd\x'`,
 /// `mkdirSync("a/b")` with `mkdir 'C:\cwd\a\b'`. An empty path is left alone
 /// (`fs.openSync("")` fails `open ''`), and so is one that resolves to two
-/// characters or fewer, as `ToNamespacedPath` leaves those. Elsewhere the path
+/// bytes or fewer, as `ToNamespacedPath` leaves those. Elsewhere the path
 /// is reported as passed.
+///
+/// Only for a path as the caller passed it. A path that is already the OS
+/// path (an `FsPath`) is shown with `fs_shown_path` alone: resolving it again
+/// is not the same thing (`\\?\C:\` resolves to the volume `\\?\C:`, so
+/// `mkdirSync("C:\\")` would report `'C:'` where node reports `'C:\'`).
 ///
 /// Not for `mkdtemp`, whose template node passes to libuv unresolved, or a
 /// symlink's target, which is stored as written.
 pub fn fs_error_path(path: &str) -> std::borrow::Cow<'_, str> {
+    match fs_os_path(path) {
+        std::borrow::Cow::Borrowed(os) => fs_shown_path(os),
+        std::borrow::Cow::Owned(os) => std::borrow::Cow::Owned(fs_shown_path(&os).into_owned()),
+    }
+}
+
+/// The path node's fs binding hands libuv for `path` on this platform: on
+/// Windows `fs_os_path_with` with the process's real current directory and
+/// the `=X:` per-drive directories, as `ToNamespacedPath` reads them (node's
+/// C++ never sees a patched `process.cwd`); elsewhere `path` itself, borrowed.
+pub fn fs_os_path(path: &str) -> std::borrow::Cow<'_, str> {
     #[cfg(windows)]
     {
-        if path.is_empty() {
-            return std::borrow::Cow::Borrowed(path);
-        }
-        let cwd = std::env::current_dir()
-            .map(|dir| dir.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let resolved = win32_resolve(path, &cwd, |device| {
-            std::env::var(format!("={device}")).ok()
-        });
-        if resolved.len() <= 2 {
-            return std::borrow::Cow::Borrowed(path);
-        }
-        let shown = if let Some(rest) = resolved.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{rest}")
-        } else if let Some(rest) = resolved.strip_prefix(r"\\?\") {
-            rest.to_string()
-        } else {
-            resolved
-        };
-        std::borrow::Cow::Owned(shown)
+        fs_os_path_with(path, real_cwd, real_drive_cwd, Win32ResolveMode::Cpp)
     }
     #[cfg(not(windows))]
     std::borrow::Cow::Borrowed(path)
+}
+
+/// node's `ToNamespacedPath` (src/path.cc, v22.22.2), the same steps as
+/// lib/path.js `win32.toNamespacedPath`, on any host: an empty path is left
+/// alone; otherwise the path is resolved (`win32_resolve_mode`), and a result
+/// of two bytes or fewer leaves the path as passed (`Q:`, `Q:.`); a
+/// UNC result (`\\srv\sh\x`) becomes `\\?\UNC\srv\sh\x`, a drive-absolute one
+/// (`C:\x`) `\\?\C:\x`, and any other result (a `\\?\` or `\\.\` path, a
+/// drive-relative `Z:a` the resolve could not anchor) is used as resolved.
+///
+/// `cwd` is called only when the resolve needs the current directory, and
+/// `drive_cwd(device)` only for a drive-relative path. `mode` is
+/// `Win32ResolveMode::Cpp` for what the fs binding does. Measured on node
+/// v22.22.2 with the cwd `C:\Windows`: `x` gives `\\?\C:\Windows\x`, `C:\`
+/// gives `\\?\C:\`, `\\srv\sh` gives `\\?\UNC\srv\sh\`, and `\\?\C:\` gives
+/// `\\?\C:` (the volume, not its root directory), so this is not idempotent
+/// on a root and an OS path must never be passed through it again.
+pub fn fs_os_path_with(
+    path: &str,
+    cwd: impl Fn() -> String,
+    drive_cwd: impl Fn(&str) -> Option<String>,
+    mode: Win32ResolveMode,
+) -> std::borrow::Cow<'_, str> {
+    if path.is_empty() {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let resolved = win32_resolve_mode(path, cwd, drive_cwd, mode);
+    // The C++ compares the UTF-8 byte length, not UTF-16 units.
+    let bytes = resolved.as_bytes();
+    if bytes.len() <= 2 {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    if bytes[0] == b'\\' {
+        if bytes[1] == b'\\' && bytes[2] != b'?' && bytes[2] != b'.' {
+            return std::borrow::Cow::Owned(format!(r"\\?\UNC\{}", &resolved[2..]));
+        }
+    } else if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\' {
+        return std::borrow::Cow::Owned(format!(r"\\?\{resolved}"));
+    }
+    std::borrow::Cow::Owned(resolved)
+}
+
+/// The path an error shows for an OS path (one from `fs_os_path`), on this
+/// platform: on Windows `win32_shown_path`, elsewhere `os` itself, borrowed.
+pub fn fs_shown_path(os: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        win32_shown_path(os)
+    }
+    #[cfg(not(windows))]
+    std::borrow::Cow::Borrowed(os)
+}
+
+/// node's `StringFromPath` (src/node_file.cc, v22.22.2) on any host: the
+/// prefix `ToNamespacedPath` added is taken off the exact string handed to
+/// libuv, and nothing else is done to it. `\\?\UNC\srv\sh\x` shows as
+/// `\\srv\sh\x`; any other `\\?\` is dropped (`\\?\C:\x` shows `C:\x`,
+/// `\\?\GLOBALROOT\x` shows `GLOBALROOT\x`, `\\?\` shows the empty string);
+/// `\\.\` paths and the rest show as they are. `UNC` is matched case-sensitively:
+/// node shows `\\?\unc\srv\sh` as `unc\srv\sh`.
+pub fn win32_shown_path(os: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = os.strip_prefix(r"\\?\UNC\") {
+        std::borrow::Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = os.strip_prefix(r"\\?\") {
+        std::borrow::Cow::Borrowed(rest)
+    } else {
+        std::borrow::Cow::Borrowed(os)
+    }
+}
+
+/// A filesystem op's path once it is the path node's binding would hand
+/// libuv (`fs_os_path`). Holding one instead of a `String` keeps the two
+/// spellings apart: the op opens `os()`, and its errors show `shown()`, the
+/// OS path with the prefix taken off -- never the OS path resolved again,
+/// which is not the same path on a root (see `fs_os_path_with`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FsPath {
+    os: String,
+}
+
+impl FsPath {
+    /// The OS path for `path` as the caller passed it. Off Windows this is
+    /// `path` itself, moved in.
+    pub fn new(path: String) -> Self {
+        let os = match fs_os_path(&path) {
+            std::borrow::Cow::Owned(os) => Some(os),
+            std::borrow::Cow::Borrowed(_) => None,
+        };
+        Self {
+            os: os.unwrap_or(path),
+        }
+    }
+
+    /// The path to hand the OS.
+    pub fn os(&self) -> &str {
+        &self.os
+    }
+
+    /// The path an error names: `fs_shown_path` of the OS path.
+    pub fn shown(&self) -> std::borrow::Cow<'_, str> {
+        fs_shown_path(&self.os)
+    }
+
+    /// The OS path, owned.
+    pub fn into_os(self) -> String {
+        self.os
+    }
+}
+
+impl AsRef<std::path::Path> for FsPath {
+    fn as_ref(&self) -> &std::path::Path {
+        std::path::Path::new(&self.os)
+    }
+}
+
+/// The process's real current directory as node's C++ reads it, for the
+/// Windows resolves (`fs_os_path`): never a patched `process.cwd`.
+#[cfg(windows)]
+fn real_cwd() -> String {
+    std::env::current_dir()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// The per-drive current directory Windows keeps in `=X:`.
+#[cfg(windows)]
+fn real_drive_cwd(device: &str) -> Option<String> {
+    std::env::var(format!("={device}")).ok()
+}
+
+/// The target string a symlink stores, as node's fs hands it to the binding
+/// for a file or directory link (`preprocessSymlinkDestination` in
+/// lib/internal/fs/utils.js, v22.22.2): on Windows an absolute target
+/// (`path.win32.isAbsolute`: a separator first, or `X:` and a separator) is
+/// namespaced as `path.toNamespacedPath` does (`\\?\C:\x`, `\\?\UNC\srv\sh\x`;
+/// a rooted `\x` lands on the cwd's drive), and a relative one, which stays
+/// relative to the link, only has `/` turned into `\` -- `..` and `.` are
+/// kept. Elsewhere the target as given. A symlink error shows this string
+/// strip-only (`fs_shown_path`), as node's does.
+pub fn symlink_target_os(target: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        win32_symlink_target(target, real_cwd, real_drive_cwd)
+    }
+    #[cfg(not(windows))]
+    std::borrow::Cow::Borrowed(target)
+}
+
+/// `symlink_target_os` on Windows, with the cwd and `=X:` lookups given.
+pub fn win32_symlink_target(
+    target: &str,
+    cwd: impl Fn() -> String,
+    drive_cwd: impl Fn(&str) -> Option<String>,
+) -> std::borrow::Cow<'_, str> {
+    let b = target.as_bytes();
+    let sep = |c: u8| c == b'/' || c == b'\\';
+    let absolute = !b.is_empty()
+        && (sep(b[0]) || (b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && sep(b[2])));
+    if absolute {
+        fs_os_path_with(target, cwd, drive_cwd, Win32ResolveMode::Js)
+    } else if target.contains('/') {
+        std::borrow::Cow::Owned(target.replace('/', "\\"))
+    } else {
+        std::borrow::Cow::Borrowed(target)
+    }
+}
+
+/// `fs.constants.COPYFILE_EXCL`: fail if the destination exists.
+pub const COPYFILE_EXCL: u32 = 1;
+/// `fs.constants.COPYFILE_FICLONE_FORCE`: clone or fail.
+pub const COPYFILE_FICLONE_FORCE: u32 = 4;
+
+/// `fs.copyFile` with node's `mode` bits (already checked to be 0..7), as
+/// libuv's uv_fs_copyfile treats them:
+///
+/// - `COPYFILE_FICLONE_FORCE` on Windows is `ENOSYS` before anything is
+///   touched: libuv's Windows copy has no clone. Elsewhere it copies, as
+///   `COPYFILE_FICLONE` (try a clone, fall back) always does here.
+/// - `COPYFILE_EXCL` fails `EEXIST` when the destination exists, as
+///   CopyFileW with fail-if-exists and libuv's Unix `O_EXCL` open do. The
+///   source is looked at first, so a missing source is `ENOENT` even when
+///   the destination exists; the destination is then claimed with a
+///   create-new open, so a destination made meanwhile is not overwritten,
+///   and the claim is dropped again if the copy fails.
+pub fn copy_file(from: &FsPath, to: &FsPath, mode: u32) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if mode & COPYFILE_FICLONE_FORCE != 0 {
+        // No raw OS code to carry: the kind gives ENOSYS, the text uv_strerror's.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "function not implemented",
+        ));
+    }
+    if mode & COPYFILE_EXCL == 0 {
+        return std::fs::copy(from, to).map(|_| ());
+    }
+    std::fs::metadata(from)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    std::fs::copy(from, to).map(|_| ()).inspect_err(|_| {
+        let _ = std::fs::remove_file(to);
+    })
+}
+
+/// The link type a `symlink` call asked for, as node's JS hands it over:
+/// `Probe` when it gave none (on Windows node then stats the target to
+/// choose), otherwise `file`, `dir` or `junction`. Off Windows the type
+/// changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SymlinkType {
+    Probe,
+    File,
+    Dir,
+    Junction,
+}
+
+impl SymlinkType {
+    /// The type from the op's argument: `None` is `Probe`, and anything
+    /// that is not `dir` or `junction` is a file link (node's JS has already
+    /// refused any other string).
+    pub fn from_arg(arg: Option<&str>) -> Self {
+        match arg {
+            None => SymlinkType::Probe,
+            Some("dir") => SymlinkType::Dir,
+            Some("junction") => SymlinkType::Junction,
+            Some(_) => SymlinkType::File,
+        }
+    }
+}
+
+/// The target string a link of `kind` stores (`preprocessSymlinkDestination`):
+/// a junction's target is resolved against the link's parent and namespaced
+/// (`toNamespacedPath(path.resolve(link, '..', target))`), any other's is
+/// `symlink_target_os`. oam has no junction call of its own and makes a
+/// junction as a directory symlink to that target.
+pub fn symlink_stored_target(link: &str, target: &str, kind: SymlinkType) -> String {
+    #[cfg(windows)]
+    if kind == SymlinkType::Junction {
+        return symlink_target_os(&symlink_probe_path(link, target)).into_owned();
+    }
+    let _ = (link, kind);
+    symlink_target_os(target).into_owned()
+}
+
+/// The path node's Windows `fs.symlink` stats to choose a directory or a
+/// file link when no type is given: `path.resolve(link, '..', target)`, the
+/// target taken relative to the link's parent directory, not the cwd.
+#[cfg(windows)]
+pub fn symlink_probe_path(link: &str, target: &str) -> String {
+    win32_symlink_probe(link, target, real_cwd, real_drive_cwd)
+}
+
+/// `symlink_probe_path` with the cwd and `=X:` lookups given.
+pub fn win32_symlink_probe(
+    link: &str,
+    target: &str,
+    cwd: impl Fn() -> String,
+    drive_cwd: impl Fn(&str) -> Option<String>,
+) -> String {
+    win32_resolve_all_mode(&[link, "..", target], cwd, drive_cwd, Win32ResolveMode::Js)
 }
 
 /// The template node's binding hands libuv for `mkdtemp(prefix)` (src/
@@ -2771,32 +3058,89 @@ fn mkdtemp_failed_path(template: &str, tried: &str) -> String {
     }
 }
 
-/// node's `path.win32.resolve(path)` (lib/path.js; src/path.cc `PathResolve`
-/// is the same algorithm): `cwd` is `process.cwd()`, and `drive_cwd(device)`
-/// the per-drive current directory Windows keeps in the `=C:` environment
-/// variables, for a drive-relative path (`D:x`) on another drive.
+/// Which of node's two implementations of `path.win32.resolve` to follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Win32ResolveMode {
+    /// lib/path.js `win32.resolve`, behind `path.resolve` and
+    /// `path.toNamespacedPath`.
+    Js,
+    /// src/path.cc `PathResolve`, what node's fs binding runs before libuv.
+    /// It differs in one rule. For a drive-relative path (`Z:a`) both read
+    /// the drive's directory from `=Z:`, falling back to the current
+    /// directory, and replace one on another drive with the drive's root
+    /// `Z:\`; the JS takes "on another drive" to mean a `\` at index 2, the
+    /// C++ a `/`. Measured on node v22.22.2 (cwd `C:\Windows`, a first
+    /// `statSync('Z:a')` per drive): `=Z:` unset gives `Z:a` (the cwd is
+    /// kept and then skipped as another drive's path, so the result stays
+    /// drive-relative) where `path.win32.resolve` gives `Z:\a`;
+    /// `=Z:=C:/elsewhere` gives `Z:\a` where the JS gives `Z:a`; `=Z:=Z:\d`
+    /// gives `Z:\d\a` in both. The C++ also takes an empty fallback directory
+    /// as the drive's root, where the JS skips it.
+    Cpp,
+}
+
+/// node's `path.win32.resolve(path)` (lib/path.js): `cwd` is
+/// `process.cwd()`, and `drive_cwd(device)` the per-drive current directory
+/// Windows keeps in the `=C:` environment variables, for a drive-relative
+/// path (`D:x`) on another drive. `win32_resolve_mode` with
+/// `Win32ResolveMode::Js`.
 ///
-/// Pure, so every rule is unit-tested on any host; only `fs_error_path` is
+/// Pure, so every rule is unit-tested on any host; only `fs_os_path` is
 /// Windows-only.
 pub fn win32_resolve(path: &str, cwd: &str, drive_cwd: impl Fn(&str) -> Option<String>) -> String {
+    win32_resolve_mode(path, || cwd.to_string(), drive_cwd, Win32ResolveMode::Js)
+}
+
+/// `path.win32.resolve(path)` as lib/path.js (`Win32ResolveMode::Js`) or
+/// src/path.cc `PathResolve` (`Win32ResolveMode::Cpp`) computes it. `cwd` is
+/// called only when the path is not absolute with a device.
+pub fn win32_resolve_mode(
+    path: &str,
+    cwd: impl Fn() -> String,
+    drive_cwd: impl Fn(&str) -> Option<String>,
+    mode: Win32ResolveMode,
+) -> String {
+    win32_resolve_all_mode(&[path], cwd, drive_cwd, mode)
+}
+
+/// `path.win32.resolve(...paths)` with several arguments, as
+/// `win32_resolve_mode` resolves one: the arguments are taken right to left
+/// until one is absolute with a device, then (`i === -1`) the cwd.
+pub fn win32_resolve_all_mode(
+    paths: &[&str],
+    cwd: impl Fn() -> String,
+    drive_cwd: impl Fn(&str) -> Option<String>,
+    mode: Win32ResolveMode,
+) -> String {
     let is_sep = |b: u8| b == b'/' || b == b'\\';
     let mut resolved_device = String::new();
     let mut resolved_tail = String::new();
     let mut resolved_absolute = false;
-    // resolve's loop over one argument: the path, then (`i === -1`) the cwd --
-    // or, once a device is known, that drive's own current directory.
-    for step in 0..2 {
-        let candidate = if step == 0 {
-            path.to_string()
+    // resolve's loop over its arguments, last first, then (`i === -1`) the
+    // cwd -- or, once a device is known, that drive's own current directory.
+    for step in 0..=paths.len() {
+        let candidate = if step < paths.len() {
+            paths[paths.len() - 1 - step].to_string()
         } else if resolved_device.is_empty() {
-            cwd.to_string()
+            cwd()
         } else {
-            let drive = drive_cwd(&resolved_device).unwrap_or_else(|| cwd.to_string());
-            // Not a directory on that drive: the drive's root instead.
+            // `process.env['=Z:'] || process.cwd()`: an empty value is unset.
+            let drive = drive_cwd(&resolved_device)
+                .filter(|dir| !dir.is_empty())
+                .unwrap_or_else(&cwd);
+            // Not a directory on that drive: the drive's root instead. The
+            // JS and the C++ test a different separator, see
+            // `Win32ResolveMode::Cpp`.
             let other_drive = drive
                 .get(..2)
                 .is_none_or(|head| !head.eq_ignore_ascii_case(&resolved_device));
-            if other_drive && drive.as_bytes().get(2) == Some(&b'\\') {
+            let root = match mode {
+                Win32ResolveMode::Js => other_drive && drive.as_bytes().get(2) == Some(&b'\\'),
+                Win32ResolveMode::Cpp => {
+                    drive.is_empty() || (other_drive && drive.as_bytes().get(2) == Some(&b'/'))
+                }
+            };
+            if root {
                 format!("{resolved_device}\\")
             } else {
                 drive
@@ -3031,6 +3375,401 @@ mod win32_resolve_tests {
     }
 }
 
+#[cfg(test)]
+mod fs_os_path_tests {
+    use super::{
+        FsPath, Win32ResolveMode, fs_error_path, fs_os_path, fs_os_path_with, fs_shown_path,
+        strip_unc_prefix, win32_resolve_all_mode, win32_resolve_mode, win32_shown_path,
+        win32_symlink_probe, win32_symlink_target,
+    };
+    use std::borrow::Cow;
+
+    const CWD: &str = r"C:\Windows";
+
+    /// `fs_os_path_with` in the binding's mode, cwd `C:\Windows`, no `=X:`
+    /// drive directories.
+    fn os(path: &str) -> String {
+        fs_os_path_with(path, || CWD.to_string(), |_| None, Win32ResolveMode::Cpp).into_owned()
+    }
+
+    /// (input, OS path, node's `err.path`). The third column is measured:
+    /// node v22.22.2 on Windows 11, cwd `C:\Windows`, `fs.statSync(input)`
+    /// (`fs.mkdirSync` for the roots, which exist), each row's `err.path`
+    /// pasted as printed. The second column is what `ToNamespacedPath` hands
+    /// libuv: lib/path.js `toNamespacedPath` printed the same string for
+    /// every row but the two drive-relative ones on a drive with no `=Z:`,
+    /// where the C++ resolve differs (`Win32ResolveMode::Cpp`).
+    const NODE: &[(&str, &str, &str)] = &[
+        // Relative to the cwd.
+        ("zz-none", r"\\?\C:\Windows\zz-none", r"C:\Windows\zz-none"),
+        (
+            "sub/zz-none/",
+            r"\\?\C:\Windows\sub\zz-none",
+            r"C:\Windows\sub\zz-none",
+        ),
+        (
+            r".\zz-none\.\x",
+            r"\\?\C:\Windows\zz-none\x",
+            r"C:\Windows\zz-none\x",
+        ),
+        // Drive-absolute, any separator, the case kept.
+        (r"C:\zz-none", r"\\?\C:\zz-none", r"C:\zz-none"),
+        ("C:/zz-none/x", r"\\?\C:\zz-none\x", r"C:\zz-none\x"),
+        (r"c:\zz-none", r"\\?\c:\zz-none", r"c:\zz-none"),
+        // Rooted on the cwd's drive.
+        ("/zz-none", r"\\?\C:\zz-none", r"C:\zz-none"),
+        (r"\zz-none", r"\\?\C:\zz-none", r"C:\zz-none"),
+        // Drive roots: the OS path keeps its trailing `\`.
+        (r"C:\", r"\\?\C:\", r"C:\"),
+        ("C:/", r"\\?\C:\", r"C:\"),
+        (r"\", r"\\?\C:\", r"C:\"),
+        ("/", r"\\?\C:\", r"C:\"),
+        // `..` past the root stops at it.
+        (r"C:\..\..\zz-none", r"\\?\C:\zz-none", r"C:\zz-none"),
+        (r"C:\..\..", r"\\?\C:\", r"C:\"),
+        (r"..\..\..\..\..\zz-none", r"\\?\C:\zz-none", r"C:\zz-none"),
+        // Drive-relative: on the cwd's drive, and on a drive with no `=Z:`
+        // (the first call per drive in a process; see Win32ResolveMode::Cpp).
+        (
+            "C:zz-none",
+            r"\\?\C:\Windows\zz-none",
+            r"C:\Windows\zz-none",
+        ),
+        ("Z:zz-none", "Z:zz-none", "Z:zz-none"),
+        (r"Z:a\..\b", "Z:b", "Z:b"),
+        ("Q:", "Q:", "Q:"),
+        ("Q:.", "Q:.", "Q:."),
+        (r"Z:\zz-none", r"\\?\Z:\zz-none", r"Z:\zz-none"),
+        // Already namespaced: resolved again, not prefixed again.
+        (r"\\?\C:\zz-none", r"\\?\C:\zz-none", r"C:\zz-none"),
+        (r"\\?\C:\zz-none\..\nope", r"\\?\C:\nope", r"C:\nope"),
+        (r"\\?\C:\", r"\\?\C:", "C:"),
+        (r"\\?\C:", r"\\?\C:", "C:"),
+        ("//?/C:/zz-none", r"\\?\C:\zz-none", r"C:\zz-none"),
+        (r"\\?\C:\a\..\..\..\zz", r"\\?\zz", "zz"),
+        (r"\\?\C:\a\..\..", r"\\?\", ""),
+        (r"\\?\", r"\\?\C:\?", r"C:\?"),
+        (r"\\?\zz-none", r"\\?\zz-none", "zz-none"),
+        (
+            r"\\?\GLOBALROOT\zz-none",
+            r"\\?\GLOBALROOT\zz-none",
+            r"GLOBALROOT\zz-none",
+        ),
+        (
+            r"\\?\UNC\localhost\zz-noshare\x",
+            r"\\?\UNC\localhost\zz-noshare\x",
+            r"\\localhost\zz-noshare\x",
+        ),
+        (
+            r"\\?\UNC\localhost\zz-noshare\",
+            r"\\?\UNC\localhost\zz-noshare",
+            r"\\localhost\zz-noshare",
+        ),
+        (
+            "//?/UNC/localhost/zz-noshare/x",
+            r"\\?\UNC\localhost\zz-noshare\x",
+            r"\\localhost\zz-noshare\x",
+        ),
+        (
+            r"\\?\unc\localhost\zz-noshare\x",
+            r"\\?\unc\localhost\zz-noshare\x",
+            r"unc\localhost\zz-noshare\x",
+        ),
+        (r"\\?\UNC\zz-srv", r"\\?\UNC\zz-srv", r"\\zz-srv"),
+        // Device paths: resolved, never prefixed, shown as they are.
+        (r"\\.\C:\zz-none", r"\\.\C:\zz-none", r"\\.\C:\zz-none"),
+        (r"\\.\zz-nodevice", r"\\.\zz-nodevice", r"\\.\zz-nodevice"),
+        (r"\\.\C:\..\..\zz", r"\\.\zz", r"\\.\zz"),
+        // UNC, share roots included: the share root keeps a trailing `\`.
+        (
+            r"\\localhost\zz-noshare",
+            r"\\?\UNC\localhost\zz-noshare\",
+            r"\\localhost\zz-noshare\",
+        ),
+        (
+            r"\\localhost\zz-noshare\",
+            r"\\?\UNC\localhost\zz-noshare\",
+            r"\\localhost\zz-noshare\",
+        ),
+        (
+            r"\\localhost\zz-noshare\..",
+            r"\\?\UNC\localhost\zz-noshare\",
+            r"\\localhost\zz-noshare\",
+        ),
+        (
+            r"\\localhost\zz-noshare\..\..\x",
+            r"\\?\UNC\localhost\zz-noshare\x",
+            r"\\localhost\zz-noshare\x",
+        ),
+        (
+            "//localhost/zz-noshare/x/",
+            r"\\?\UNC\localhost\zz-noshare\x",
+            r"\\localhost\zz-noshare\x",
+        ),
+        // A server with no share is not a UNC root: rooted on the cwd's drive.
+        (r"\\srv", r"\\?\C:\srv", r"C:\srv"),
+        // Device names are ordinary names in a `\\?\` path.
+        ("NUL", r"\\?\C:\Windows\NUL", r"C:\Windows\NUL"),
+        ("CON", r"\\?\C:\Windows\CON", r"C:\Windows\CON"),
+        (
+            r"zz-none\COM1.txt",
+            r"\\?\C:\Windows\zz-none\COM1.txt",
+            r"C:\Windows\zz-none\COM1.txt",
+        ),
+        // Trailing dots and spaces are kept.
+        (
+            "zz-none.",
+            r"\\?\C:\Windows\zz-none.",
+            r"C:\Windows\zz-none.",
+        ),
+        (
+            "zz-none ",
+            r"\\?\C:\Windows\zz-none ",
+            r"C:\Windows\zz-none ",
+        ),
+        (
+            r"zz-none. .\x",
+            r"\\?\C:\Windows\zz-none. .\x",
+            r"C:\Windows\zz-none. .\x",
+        ),
+        (r"\\?\C:\zz-none.", r"\\?\C:\zz-none.", r"C:\zz-none."),
+        (r"\\?\C:\zz-none \x", r"\\?\C:\zz-none \x", r"C:\zz-none \x"),
+    ];
+
+    #[test]
+    fn os_path_and_shown_path_match_node() {
+        for (input, want_os, err_path) in NODE {
+            let got = os(input);
+            assert_eq!(got, *want_os, "fs_os_path_with({input:?})");
+            assert_eq!(win32_shown_path(&got), *err_path, "shown(os({input:?}))");
+        }
+    }
+
+    /// Rows whose `stat` succeeded on that box, so node printed no err.path;
+    /// lib/path.js `toNamespacedPath` printed the OS path.
+    #[test]
+    fn os_path_of_existing_paths_matches_to_namespaced_path() {
+        for (input, want_os) in [
+            ("C:", r"\\?\C:\Windows"),
+            (r"\\.\", r"\\?\C:\"),
+            (r"C:\zz-none\..\..\..", r"\\?\C:\"),
+        ] {
+            assert_eq!(os(input), want_os, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn long_paths_are_prefixed_whole() {
+        let long = "a".repeat(100);
+        let tail = [long.as_str(); 4].join(r"\");
+        let abs = format!(r"C:\zz-none\{tail}");
+        assert_eq!(os(&abs), format!(r"\\?\{abs}"));
+        assert_eq!(win32_shown_path(&os(&abs)), abs);
+        let rel = format!(r"zz-none\{tail}");
+        assert_eq!(os(&rel), format!(r"\\?\C:\Windows\{rel}"));
+        assert_eq!(win32_shown_path(&os(&rel)), format!(r"C:\Windows\{rel}"));
+    }
+
+    /// Resolving an OS path again gives the same OS path except on a root:
+    /// `\\?\C:\` names the drive's root directory and its resolve `\\?\C:`
+    /// the volume; `\\?\UNC\srv\sh\` loses its trailing `\` the same way;
+    /// and `\\?\` resolves to `C:\?`. This is why an error shows an OS path
+    /// strip-only.
+    #[test]
+    fn os_path_is_idempotent_except_on_roots() {
+        let roots: &[&str] = &[
+            r"C:\",
+            "C:/",
+            r"\",
+            "/",
+            r"C:\..\..",
+            r"\\?\C:\a\..\..",
+            r"\\localhost\zz-noshare",
+            r"\\localhost\zz-noshare\",
+            r"\\localhost\zz-noshare\..",
+        ];
+        for (input, _, _) in NODE {
+            let once = os(input);
+            let twice = os(&once);
+            if roots.contains(input) {
+                assert_ne!(twice, once, "{input:?} is a root and is not idempotent");
+            } else {
+                assert_eq!(twice, once, "os(os({input:?}))");
+            }
+        }
+        assert_eq!(os(r"\\?\C:\"), r"\\?\C:");
+        assert_eq!(os(r"\\?\UNC\srv\sh\"), r"\\?\UNC\srv\sh");
+    }
+
+    /// The drive-directory rule of the two resolves, measured with `=Z:` set
+    /// in a child's environment (cwd `C:\Windows`): `statSync('Z:a')` for the
+    /// C++, `path.win32.resolve('Z:a')` for the JS.
+    #[test]
+    fn the_cpp_and_js_resolves_differ_only_in_the_drive_directory_check() {
+        let cwd = || CWD.to_string();
+        let cases: &[(Option<&str>, &str, &str)] = &[
+            (None, "Z:a", r"Z:\a"),
+            (Some(r"Z:\dcwd"), r"Z:\dcwd\a", r"Z:\dcwd\a"),
+            (Some(r"C:\elsewhere"), "Z:a", r"Z:\a"),
+            (Some("C:/elsewhere"), r"Z:\a", "Z:a"),
+            (Some("Z:/fwd"), r"Z:\fwd\a", r"Z:\fwd\a"),
+            (Some(r"z:\low"), r"Z:\low\a", r"Z:\low\a"),
+            (Some(""), "Z:a", r"Z:\a"),
+        ];
+        for (dir, cpp, js) in cases {
+            let drive = |_: &str| dir.map(str::to_string);
+            assert_eq!(
+                win32_resolve_mode("Z:a", cwd, drive, Win32ResolveMode::Cpp),
+                *cpp,
+                "Cpp, =Z: {dir:?}"
+            );
+            assert_eq!(
+                win32_resolve_mode("Z:a", cwd, drive, Win32ResolveMode::Js),
+                *js,
+                "Js, =Z: {dir:?}"
+            );
+        }
+        // Once Windows has set `=Z:` to `Z:\` (it does on the first
+        // drive-relative call), node's later calls resolve: `Z:\zz-none`.
+        let set = |_: &str| Some(r"Z:\".to_string());
+        let os_set = |p: &str| fs_os_path_with(p, cwd, set, Win32ResolveMode::Cpp).into_owned();
+        assert_eq!(os_set("Z:zz-none"), r"\\?\Z:\zz-none");
+        assert_eq!(win32_shown_path(&os_set("Z:")), r"Z:\");
+        assert_eq!(win32_shown_path(&os_set(r"Z:a\..")), r"Z:\");
+        // The C++ takes an empty current directory as the drive's root.
+        let none = || String::new();
+        assert_eq!(
+            win32_resolve_mode("Z:a", none, |_| None, Win32ResolveMode::Cpp),
+            r"Z:\a"
+        );
+        assert_eq!(
+            win32_resolve_mode("Z:a", none, |_| None, Win32ResolveMode::Js),
+            "Z:a"
+        );
+    }
+
+    /// node v22.22.2's `symlinkSync(target, existing)` fails EEXIST naming
+    /// the target as its binding stored it, strip-only (stage2-sym.cjs, cwd
+    /// `W`'s parent): an absolute target namespaced, a relative one with `/`
+    /// turned into `\` and nothing else done to it.
+    #[test]
+    fn a_symlink_target_is_stored_as_node_preprocesses_it() {
+        for (target, stored, shown) in [
+            (
+                "C:/w/sub/file.txt",
+                r"\\?\C:\w\sub\file.txt",
+                r"C:\w\sub\file.txt",
+            ),
+            (
+                r"C:\w\sub\file.txt",
+                r"\\?\C:\w\sub\file.txt",
+                r"C:\w\sub\file.txt",
+            ),
+            ("sub/file.txt", r"sub\file.txt", r"sub\file.txt"),
+            (r"\w\sub", r"\\?\C:\w\sub", r"C:\w\sub"),
+            (r"\\?\C:\w\sub", r"\\?\C:\w\sub", r"C:\w\sub"),
+            (r"C:\", r"\\?\C:\", r"C:\"),
+            ("../x/./y", r"..\x\.\y", r"..\x\.\y"),
+            (r"\\srv\sh\x", r"\\?\UNC\srv\sh\x", r"\\srv\sh\x"),
+            ("C:x", "C:x", "C:x"),
+            ("plain", "plain", "plain"),
+            ("", "", ""),
+        ] {
+            let got = win32_symlink_target(target, || CWD.to_string(), |_| None);
+            assert_eq!(got, stored, "{target:?}");
+            assert_eq!(win32_shown_path(&got), shown, "{target:?}");
+        }
+        // A relative target with no `/` is not copied.
+        assert!(matches!(
+            win32_symlink_target(r"a\b", || unreachable!(), |_| None),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    /// node's Windows symlink stats `path.resolve(link, '..', target)` to
+    /// choose a directory or a file link: the target relative to the link's
+    /// parent. stage2-sym.cjs: `symlinkSync('dir', 'W/sub/l1')` with
+    /// `W/sub/dir` a directory makes a directory link even though the cwd has
+    /// no `dir`.
+    #[test]
+    fn the_symlink_probe_is_relative_to_the_links_parent() {
+        let probe = |link: &str, target: &str| {
+            win32_symlink_probe(link, target, || CWD.to_string(), |_| None)
+        };
+        assert_eq!(probe(r"C:\w\sub\l1", "dir"), r"C:\w\sub\dir");
+        assert_eq!(probe(r"C:\w\l2", "sub/dir"), r"C:\w\sub\dir");
+        assert_eq!(probe(r"C:\w\l3", r"C:\abs\dir"), r"C:\abs\dir");
+        assert_eq!(probe(r"C:\w\l4", r"\rooted"), r"C:\rooted");
+        assert_eq!(probe(r"C:\w\l5", r"..\up"), r"C:\up");
+        assert_eq!(probe("rel-link", "t"), r"C:\Windows\t");
+        assert_eq!(probe(r"\\srv\sh\l", "t"), r"\\srv\sh\t");
+        // A drive-relative target on another drive: the `..` still applies,
+        // to that drive's directory (here its root, `=D:` being unset).
+        assert_eq!(probe(r"C:\w\l", "D:x"), r"D:\x");
+        // With one argument the resolve is `win32_resolve_mode`'s.
+        for path in ["x", r"C:\a\..\b", r"\\srv\sh", "D:y", ""] {
+            assert_eq!(
+                win32_resolve_all_mode(&[path], || CWD.to_string(), |_| None, Win32ResolveMode::Js),
+                win32_resolve_mode(path, || CWD.to_string(), |_| None, Win32ResolveMode::Js),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cwd_is_read_only_when_needed() {
+        let cwd = || -> String { panic!("cwd read for an absolute path") };
+        for p in [r"C:\x", r"\\srv\sh\x", r"\\?\C:\x", r"\\.\pipe\x"] {
+            fs_os_path_with(p, cwd, |_| None, Win32ResolveMode::Cpp);
+        }
+        let empty = fs_os_path_with("", cwd, |_| None, Win32ResolveMode::Cpp);
+        assert!(matches!(empty, Cow::Borrowed("")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_os_path_is_namespaced_and_shown_strip_only() {
+        let root = FsPath::new(r"C:\".to_string());
+        assert_eq!(root.os(), r"\\?\C:\");
+        assert_eq!(root.shown(), r"C:\");
+        let unc = FsPath::new(r"\\srv\sh".to_string());
+        assert_eq!(unc.os(), r"\\?\UNC\srv\sh\");
+        assert_eq!(unc.shown(), r"\\srv\sh\");
+        let rel = FsPath::new("zz-none".to_string());
+        assert!(rel.os().starts_with(r"\\?\") && rel.os().ends_with(r"\zz-none"));
+        assert_eq!(fs_error_path(r"C:\"), r"C:\");
+        assert_eq!(fs_error_path(r"\\?\C:\"), "C:");
+        assert_eq!(fs_error_path(""), "");
+        assert!(matches!(fs_os_path(""), Cow::Borrowed("")));
+        assert_eq!(fs_shown_path(r"\\?\UNC\srv\sh\x"), r"\\srv\sh\x");
+        assert_eq!(
+            strip_unc_prefix(std::path::Path::new(r"\\?\UNC\srv\sh\x")),
+            r"\\srv\sh\x"
+        );
+        assert_eq!(strip_unc_prefix(std::path::Path::new(r"\\?\C:\x")), r"C:\x");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn off_windows_paths_are_borrowed_as_given() {
+        for p in ["", "x", "/abs/x", r"\\?\C:\x", r"C:\"] {
+            assert!(matches!(fs_os_path(p), Cow::Borrowed(b) if b == p), "{p:?}");
+            assert!(
+                matches!(fs_shown_path(p), Cow::Borrowed(b) if b == p),
+                "{p:?}"
+            );
+            assert!(
+                matches!(fs_error_path(p), Cow::Borrowed(b) if b == p),
+                "{p:?}"
+            );
+            let fs_path = FsPath::new(p.to_string());
+            assert_eq!(fs_path.os(), p);
+            assert_eq!(fs_path.shown(), p);
+            assert_eq!(strip_unc_prefix(std::path::Path::new(p)), p);
+        }
+    }
+}
+
 /// Error code for an operation on an ALREADY-OPEN descriptor.
 ///
 /// A descriptor was opened successfully, so there is no path left to be denied:
@@ -3142,10 +3881,10 @@ pub fn fd_error_code(error: &std::io::Error) -> &'static str {
 /// at all (and the async form with no `syscall` or `path` either), where every
 /// sibling fs op carries all four.
 ///
-/// The message names the path as `fs_error_path` reports it, and so must the
+/// The message names the path as `path.shown()` reports it, and so must the
 /// caller's `path` property.
-pub fn check_access(path: &str, mode: i32) -> Result<(), (String, String, Option<i32>)> {
-    let shown = fs_error_path(path);
+pub fn check_access(path: &FsPath, mode: i32) -> Result<(), (String, String, Option<i32>)> {
+    let shown = path.shown();
     let meta = std::fs::metadata(path).map_err(|e| {
         let code = node_error_code(&e);
         (
@@ -3181,11 +3920,13 @@ pub fn remove_path(path: &str, recursive: bool) -> std::io::Result<()> {
     }
 }
 
-/// std::fs::canonicalize returns \\?\-prefixed paths on Windows, which leak
-/// into user-visible strings and break naive comparisons — strip the prefix.
+/// std::fs::canonicalize (and a symlink target read back) gives `\\?\`
+/// paths on Windows, which node shows without the prefix: the path as
+/// `fs_shown_path` shows it, so a UNC result `\\?\UNC\srv\sh\x` reads
+/// `\\srv\sh\x` (not `UNC\srv\sh\x`) and `\\?\C:\x` reads `C:\x`. Off
+/// Windows the path is returned as it is.
 pub fn strip_unc_prefix(path: &std::path::Path) -> String {
-    let s = path.to_string_lossy();
-    s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+    fs_shown_path(&path.to_string_lossy()).into_owned()
 }
 
 /// node:zlib backend (flate2 encoders, [`inflate::NodeInflate`] decoders,
@@ -3816,10 +4557,10 @@ pub mod ops {
         OpOutcome::Done
     }
 
-    /// A failed path operation, naming the path as node does (on Windows the
-    /// resolved one, see `fs_error_path`).
-    fn node_fail(error: std::io::Error, syscall: &str, path: &str) -> OpOutcome {
-        node_fail_as_passed(error, syscall, &super::fs_error_path(path))
+    /// A failed path operation, naming the path as node does: the OS path
+    /// with the prefix taken off (`FsPath::shown`).
+    fn node_fail(error: std::io::Error, syscall: &str, path: &super::FsPath) -> OpOutcome {
+        node_fail_as_passed(error, syscall, &path.shown())
     }
 
     /// `node_fail` naming `path` exactly as given: for mkdtemp, whose
@@ -3854,10 +4595,10 @@ pub mod ops {
     fn node_fail_whole_file(
         site: super::FsSite<'_>,
         error: super::WholeFileError,
-        path: &str,
+        path: &super::FsPath,
     ) -> OpOutcome {
-        let failure = super::whole_file_error(site, path, &error);
-        let shown = super::fs_error_path(path);
+        let failure = super::whole_file_error(site, path.os(), &error);
+        let shown = path.shown();
         OpOutcome::node_failed_at(
             failure.code,
             super::fs_error_message(failure, &shown, error.io()),
@@ -3873,10 +4614,10 @@ pub mod ops {
         site: super::FsSite<'_>,
         error: std::io::Error,
         syscall: &'static str,
-        path: &str,
+        path: &super::FsPath,
     ) -> OpOutcome {
-        let failure = super::fs_error_at(site, syscall, path, &error);
-        let shown = super::fs_error_path(path);
+        let failure = super::fs_error_at(site, syscall, path.os(), &error);
+        let shown = path.shown();
         OpOutcome::node_failed_at(
             failure.code,
             super::fs_error_message(failure, &shown, &error),
@@ -4355,7 +5096,7 @@ pub mod ops {
         Ok(serde_json::Value::Array(entries).to_string())
     }
 
-    pub async fn fs_read_file(path: String) -> OpOutcome {
+    pub async fn fs_read_file(path: super::FsPath) -> OpOutcome {
         // Always raw bytes: encodings decode JS-side via Buffer#toString
         // (a Rust-side utf8-lossy decode was silently wrong for base64/
         // hex/latin1 requests).
@@ -4367,7 +5108,7 @@ pub mod ops {
         #[cfg(target_os = "linux")]
         {
             if let Some(uring) = crate::io_uring_fs::global()
-                && let Ok(bytes) = uring.read_file(path.clone()).await
+                && let Ok(bytes) = uring.read_file(path.os().to_string()).await
             {
                 return OpOutcome::Bytes(bytes);
             }
@@ -4375,7 +5116,7 @@ pub mod ops {
         // One blocking-pool hop, as tokio::fs::read makes, but with the open
         // and the read reported apart (super::whole_file_error).
         let owned = path.clone();
-        let result = tokio::task::spawn_blocking(move || super::read_whole_file(&owned))
+        let result = tokio::task::spawn_blocking(move || super::read_whole_file(owned.os()))
             .await
             .unwrap_or_else(|e| Err(super::WholeFileError::Open(std::io::Error::other(e))));
         match result {
@@ -4384,7 +5125,7 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_write_file(path: String, data: Vec<u8>, append: bool) -> OpOutcome {
+    pub async fn fs_write_file(path: super::FsPath, data: Vec<u8>, append: bool) -> OpOutcome {
         // io_uring fast path (Linux, opt-in): non-append writes only (create +
         // truncate + write_all_at). `data` is moved in -- no clone on the happy
         // path. On a worker-channel failure write_file hands the un-consumed
@@ -4396,7 +5137,7 @@ pub mod ops {
         #[cfg(target_os = "linux")]
         {
             if !append && let Some(uring) = crate::io_uring_fs::global() {
-                match uring.write_file(path.clone(), data).await {
+                match uring.write_file(path.os().to_string(), data).await {
                     Ok(()) => return OpOutcome::Done,
                     // Channel failure with the buffer recovered: retry via std.
                     Err((_chan_err, recovered)) if !recovered.is_empty() => {
@@ -4417,10 +5158,10 @@ pub mod ops {
     /// with the open and the write reported apart (`super::whole_file_error`).
     /// Factored out so the io_uring fast path can fall through to it with a
     /// recovered buffer on a worker-channel failure.
-    async fn fs_write_file_std(path: String, data: Vec<u8>, append: bool) -> OpOutcome {
+    async fn fs_write_file_std(path: super::FsPath, data: Vec<u8>, append: bool) -> OpOutcome {
         let owned = path.clone();
         let result =
-            tokio::task::spawn_blocking(move || super::write_whole_file(&owned, &data, append))
+            tokio::task::spawn_blocking(move || super::write_whole_file(owned.os(), &data, append))
                 .await
                 .unwrap_or_else(|e| Err(super::WholeFileError::Open(std::io::Error::other(e))));
         let site = if append {
@@ -4434,12 +5175,12 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_stat(path: String, lstat: bool) -> OpOutcome {
+    pub async fn fs_stat(path: super::FsPath, lstat: bool) -> OpOutcome {
         // One hop to a blocking thread for the whole operation. Awaiting
         // tokio's metadata and THEN opening a handle here would do the second
         // (blocking) open on a runtime thread.
         let owned = path.clone();
-        let result = tokio::task::spawn_blocking(move || stat_path_json(&owned, lstat)).await;
+        let result = tokio::task::spawn_blocking(move || stat_path_json(owned.os(), lstat)).await;
         match result {
             Ok(Ok(json)) => OpOutcome::Json(json),
             Ok(Err(e)) => node_fail(e, if lstat { "lstat" } else { "stat" }, &path),
@@ -4522,9 +5263,9 @@ pub mod ops {
             .map(|meta| stat_to_json(&meta, StatSource::File(file)))
     }
 
-    pub async fn fs_statfs(path: String) -> OpOutcome {
+    pub async fn fs_statfs(path: super::FsPath) -> OpOutcome {
         let owned = path.clone();
-        let result = tokio::task::spawn_blocking(move || statfs_json(&owned)).await;
+        let result = tokio::task::spawn_blocking(move || statfs_json(owned.os())).await;
         match result {
             Ok(Ok(json)) => OpOutcome::Json(json),
             Ok(Err(e)) => node_fail(e, "statfs", &path),
@@ -4532,10 +5273,10 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_readdir(path: String) -> OpOutcome {
+    pub async fn fs_readdir(path: super::FsPath) -> OpOutcome {
         match tokio::task::spawn_blocking({
             let path = path.clone();
-            move || readdir_to_json(&path)
+            move || readdir_to_json(path.os())
         })
         .await
         .unwrap_or_else(|e| Err(std::io::Error::other(e)))
@@ -4545,7 +5286,7 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_mkdir(path: String, recursive: bool) -> OpOutcome {
+    pub async fn fs_mkdir(path: super::FsPath, recursive: bool) -> OpOutcome {
         let result = if recursive {
             tokio::fs::create_dir_all(&path).await
         } else {
@@ -4557,10 +5298,10 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_rm(path: String, recursive: bool, force: bool) -> OpOutcome {
+    pub async fn fs_rm(path: super::FsPath, recursive: bool, force: bool) -> OpOutcome {
         let result = tokio::task::spawn_blocking({
             let path = path.clone();
-            move || super::remove_path(&path, recursive)
+            move || super::remove_path(path.os(), recursive)
         })
         .await
         .unwrap_or_else(|e| Err(std::io::Error::other(e)));
@@ -4571,38 +5312,42 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_unlink(path: String) -> OpOutcome {
+    pub async fn fs_unlink(path: super::FsPath) -> OpOutcome {
         match tokio::fs::remove_file(&path).await {
             Ok(()) => OpOutcome::Done,
             Err(e) => node_fail(e, "unlink", &path),
         }
     }
 
-    pub async fn fs_rename(from: String, to: String) -> OpOutcome {
+    pub async fn fs_rename(from: super::FsPath, to: super::FsPath) -> OpOutcome {
         match tokio::fs::rename(&from, &to).await {
             Ok(()) => OpOutcome::Done,
             Err(e) => {
-                let (path, dest) = (super::fs_error_path(&from), super::fs_error_path(&to));
+                let (path, dest) = (from.shown(), to.shown());
                 node_fail_dest(e, "rename", &path, &dest)
             }
         }
     }
 
-    pub async fn fs_copy_file(from: String, to: String) -> OpOutcome {
-        match tokio::fs::copy(&from, &to).await {
-            Ok(_) => OpOutcome::Done,
-            Err(e) => {
-                let (path, dest) = (super::fs_error_path(&from), super::fs_error_path(&to));
-                node_fail_dest(e, "copyfile", &path, &dest)
-            }
-        }
+    /// node's async `copyFile`; `mode` as `super::copy_file` takes it.
+    pub async fn fs_copy_file(from: super::FsPath, to: super::FsPath, mode: u32) -> OpOutcome {
+        let result =
+            tokio::task::spawn_blocking(move || match super::copy_file(&from, &to, mode) {
+                Ok(()) => OpOutcome::Done,
+                Err(e) => {
+                    let (path, dest) = (from.shown(), to.shown());
+                    node_fail_dest(e, "copyfile", &path, &dest)
+                }
+            })
+            .await;
+        result.unwrap_or_else(|e| OpOutcome::Failed(format!("copyfile: {e}")))
     }
 
-    pub async fn fs_access(path: String, mode: i32) -> OpOutcome {
+    pub async fn fs_access(path: super::FsPath, mode: i32) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || match super::check_access(&path, mode) {
             Ok(()) => OpOutcome::Done,
             Err((code, message, errno)) => {
-                let shown = super::fs_error_path(&path);
+                let shown = path.shown();
                 OpOutcome::node_failed_at(code, message, "access", Some(&*shown), errno)
             }
         })
@@ -4610,7 +5355,7 @@ pub mod ops {
         result.unwrap_or_else(|e| OpOutcome::Failed(format!("access: {e}")))
     }
 
-    pub async fn fs_realpath(path: String) -> OpOutcome {
+    pub async fn fs_realpath(path: super::FsPath) -> OpOutcome {
         match tokio::fs::canonicalize(&path).await {
             Ok(real) => OpOutcome::Text(super::strip_unc_prefix(&real)),
             Err(e) => node_fail(e, "realpath", &path),
@@ -4631,13 +5376,29 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_symlink(target: String, path: String) -> OpOutcome {
+    /// node's async `symlink`: `target` is the string the link stores
+    /// (`symlink_stored_target`), `kind` the type the call gave. On Windows,
+    /// with no type, `probe` is the path statted to pick a directory or a
+    /// file link (`symlink_probe_path`), `None` when the read grant refuses
+    /// it; as in node's callback and promise forms, a probe that cannot be
+    /// statted makes a file link. A given type is never probed. Elsewhere
+    /// neither matters.
+    pub async fn fs_symlink(
+        target: String,
+        kind: super::SymlinkType,
+        probe: Option<super::FsPath>,
+        path: super::FsPath,
+    ) -> OpOutcome {
         #[cfg(windows)]
         let result = {
-            let is_dir = tokio::fs::metadata(&target)
-                .await
-                .map(|m| m.is_dir())
-                .unwrap_or(false);
+            let is_dir = match (kind, &probe) {
+                (super::SymlinkType::Probe, Some(probe)) => tokio::fs::metadata(probe)
+                    .await
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false),
+                (super::SymlinkType::Probe, None) | (super::SymlinkType::File, _) => false,
+                (super::SymlinkType::Dir | super::SymlinkType::Junction, _) => true,
+            };
             if is_dir {
                 tokio::fs::symlink_dir(&target, &path).await
             } else {
@@ -4645,33 +5406,35 @@ pub mod ops {
             }
         };
         #[cfg(not(windows))]
-        let result = tokio::fs::symlink(&target, &path).await;
+        let result = {
+            let _ = (kind, probe);
+            tokio::fs::symlink(&target, &path).await
+        };
         match result {
             Ok(()) => OpOutcome::Done,
-            // The target is stored as written, so node reports it so; the
-            // link's own path is resolved like any other.
-            Err(e) => node_fail_dest(e, "symlink", &target, &super::fs_error_path(&path)),
+            // The target as stored, strip-only, and the link's own path.
+            Err(e) => node_fail_dest(e, "symlink", &super::fs_shown_path(&target), &path.shown()),
         }
     }
 
-    pub async fn fs_readlink(path: String) -> OpOutcome {
+    pub async fn fs_readlink(path: super::FsPath) -> OpOutcome {
         match tokio::fs::read_link(&path).await {
             Ok(target) => OpOutcome::Text(super::strip_unc_prefix(&target)),
             Err(e) => node_fail_at(super::FsSite::Readlink, e, "readlink", &path),
         }
     }
 
-    pub async fn fs_link(existing: String, new_path: String) -> OpOutcome {
+    pub async fn fs_link(existing: super::FsPath, new_path: super::FsPath) -> OpOutcome {
         match tokio::fs::hard_link(&existing, &new_path).await {
             Ok(()) => OpOutcome::Done,
             Err(e) => {
-                let path = super::fs_error_path(&existing);
-                node_fail_dest(e, "link", &path, &super::fs_error_path(&new_path))
+                let path = existing.shown();
+                node_fail_dest(e, "link", &path, &new_path.shown())
             }
         }
     }
 
-    pub async fn fs_chmod(path: String, mode: u32) -> OpOutcome {
+    pub async fn fs_chmod(path: super::FsPath, mode: u32) -> OpOutcome {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -5027,11 +5790,11 @@ pub mod ops {
         .map_err(super::io_from_errno)
     }
 
-    pub async fn fs_chown(path: String, uid: u32, gid: u32, follow: bool) -> OpOutcome {
+    pub async fn fs_chown(path: super::FsPath, uid: u32, gid: u32, follow: bool) -> OpOutcome {
         let syscall = if follow { "chown" } else { "lchown" };
         let owned = path.clone();
         let result =
-            tokio::task::spawn_blocking(move || chown_path(&owned, uid, gid, follow)).await;
+            tokio::task::spawn_blocking(move || chown_path(owned.os(), uid, gid, follow)).await;
         match result {
             Ok(Ok(())) => OpOutcome::Done,
             Ok(Err(e)) => node_fail(e, syscall, &path),
@@ -5039,13 +5802,19 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_utimes(path: String, atime_ms: f64, mtime_ms: f64, follow: bool) -> OpOutcome {
+    pub async fn fs_utimes(
+        path: super::FsPath,
+        atime_ms: f64,
+        mtime_ms: f64,
+        follow: bool,
+    ) -> OpOutcome {
         // node reports the SINGULAR syscall name here (measured).
         let syscall = if follow { "utime" } else { "lutime" };
         let owned = path.clone();
-        let result =
-            tokio::task::spawn_blocking(move || utimes_path(&owned, atime_ms, mtime_ms, follow))
-                .await;
+        let result = tokio::task::spawn_blocking(move || {
+            utimes_path(owned.os(), atime_ms, mtime_ms, follow)
+        })
+        .await;
         match result {
             Ok(Ok(())) => OpOutcome::Done,
             Ok(Err(e)) => node_fail(e, syscall, &path),
@@ -5083,9 +5852,9 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_lchmod(path: String, mode: u32) -> OpOutcome {
+    pub async fn fs_lchmod(path: super::FsPath, mode: u32) -> OpOutcome {
         let owned = path.clone();
-        let result = tokio::task::spawn_blocking(move || fs_lchmod_sync(&owned, mode)).await;
+        let result = tokio::task::spawn_blocking(move || fs_lchmod_sync(owned.os(), mode)).await;
         match result {
             Ok(Ok(())) => OpOutcome::Done,
             Ok(Err(e)) => node_fail(e, "lchmod", &path),
@@ -5093,10 +5862,12 @@ pub mod ops {
         }
     }
 
-    pub async fn read_text_file(path: String) -> OpOutcome {
-        match tokio::fs::read_to_string(&path).await {
+    /// `oam.readTextFile`: reads the OS path (`FsPath::os`, namespaced on
+    /// Windows as every fs op's is) and names the path shown strip-only.
+    pub async fn read_text_file(path: super::FsPath) -> OpOutcome {
+        match tokio::fs::read_to_string(path.os()).await {
             Ok(text) => OpOutcome::Text(text),
-            Err(e) => OpOutcome::Failed(format!("could not read {path}: {e}")),
+            Err(e) => OpOutcome::Failed(format!("could not read {}: {e}", path.shown())),
         }
     }
 
@@ -5473,7 +6244,7 @@ pub mod ops {
     pub async fn fs_open(
         files: super::FileRegistry,
         ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        path: String,
+        path: super::FsPath,
         mode: String,
     ) -> OpOutcome {
         let options = super::open_options_for(&mode);
@@ -5536,11 +6307,7 @@ pub mod ops {
         let (mut buf, result) = match done {
             Ok(t) => t,
             Err(e) => {
-                return node_fail(
-                    std::io::Error::other(e.to_string()),
-                    "read",
-                    &handle.to_string(),
-                );
+                return node_fail_fd(std::io::Error::other(e.to_string()), "read");
             }
         };
         match result {
@@ -6315,6 +7082,73 @@ mod os_error_code_tests {
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// A drive root or a UNC share root does not open at all without
+    /// FILE_FLAG_BACKUP_SEMANTICS: CreateFileW fails it not-found, which the
+    /// generic table reads as ENOENT. node opens the root, so its readFile
+    /// fails on the read (`EISDIR`, syscall `read`, no path) and any open for
+    /// writing is refused (`EPERM` `open` with the path) -- measured on node
+    /// v22.22.2 for `C:\`, `\`, `/` and `\\localhost\C$`. The error here is
+    /// the one std really returns for the namespaced root.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_root_that_does_not_open_is_a_directory() {
+        let temp = std::env::temp_dir();
+        let temp = temp.to_str().unwrap();
+        let mut roots = vec![format!(r"\\?\{}\", &temp[..2])];
+        // The loopback admin share exists only where file sharing is on.
+        let share = format!(r"\\?\UNC\localhost\{}$\", &temp[..1]);
+        if std::path::Path::new(&share).is_dir() {
+            roots.push(share);
+        }
+        let expect = |code, syscall, has_path| FsError {
+            code,
+            syscall,
+            has_path,
+        };
+        for root in &roots {
+            let opened = |write: bool| {
+                std::fs::OpenOptions::new()
+                    .read(!write)
+                    .write(write)
+                    .open(root)
+                    .expect_err("std opens no directory")
+            };
+            let (read, write) = (opened(false), opened(true));
+            assert_eq!(
+                fs_error_at(FsSite::ReadFile, "open", root, &read),
+                expect("EISDIR", "read", false),
+                "{root}: {read:?}"
+            );
+            for site in [FsSite::WriteFile, FsSite::AppendFile, FsSite::Open("w")] {
+                assert_eq!(
+                    fs_error_at(site, "open", root, &write),
+                    expect("EPERM", "open", true),
+                    "{root} {site:?}: {write:?}"
+                );
+            }
+            // node opens it for reading; oam cannot, and says EPERM, as for
+            // any other directory.
+            assert_eq!(
+                fs_error_at(FsSite::Open("r"), "open", root, &read),
+                expect("EPERM", "open", true),
+                "{root}: {read:?}"
+            );
+            // Only the open-shaped operations: a scandir that fails
+            // not-found stays ENOENT.
+            assert_eq!(
+                fs_error_at(FsSite::Scandir, "scandir", root, &read).code,
+                node_error_code(&read)
+            );
+        }
+        // A path that is not there is still ENOENT.
+        let missing = format!(r"\\?\{temp}\oam-no-such-root-{}", std::process::id());
+        let gone = std::fs::File::open(&missing).expect_err("missing");
+        assert_eq!(
+            fs_error_at(FsSite::ReadFile, "open", &missing, &gone),
+            expect("ENOENT", "open", true)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6660,7 +7494,9 @@ mod tests {
     #[test]
     fn read_text_file_fails_cleanly_on_missing_path() {
         let mut core = CoreRuntime::new().unwrap();
-        core.spawn_op(ops::read_text_file("/definitely/not/here.txt".into()));
+        core.spawn_op(ops::read_text_file(FsPath::new(
+            "/definitely/not/here.txt".into(),
+        )));
         let completion = core
             .recv_deadline(Some(Instant::now() + Duration::from_secs(5)))
             .expect("op completes");

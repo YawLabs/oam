@@ -48,6 +48,7 @@ pub mod trust;
 mod tsconfig;
 mod warnings;
 pub use npm::{ModuleKind, module_kind, resolve_require};
+pub use pathutil::fs_os_path;
 pub use warnings::take_warnings;
 
 /// Whether `specifier` names a Node builtin (bare like `fs` or prefixed

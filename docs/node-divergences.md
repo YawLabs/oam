@@ -283,11 +283,28 @@ Differences from Node's model:
   resolved against the cwd of the moment before it is matched (so `process.chdir` moves
   it), and a relative grant (`--allow-fs-write=.`, `=../out`) against the cwd at startup.
   Up to 0.17.1 oam matched the raw string, so `writeFileSync("out.txt")`, `mkdirSync("d")`
-  and `mkdtempSync("tmp-")` were refused under a grant of the cwd that Node honours. What
-  still differs is the denial's `resource`: oam reports the path as the script passed it,
-  where Node's spelling varies by op -- `mkdtempSync` names the template as passed, but
-  `writeFileSync("wf-y")` on Windows names the resolved, `\\?\`-prefixed path
-  (`\\?\C:\work\wf-y`), and a rooted `\x` names `\\?\C:\x` (measured against v22.22.2).
+  and `mkdtempSync("tmp-")` were refused under a grant of the cwd that Node honours. The
+  denial's `resource` is the path the op hands the OS, as Node's is: on Windows the
+  resolved, `\\?\`-prefixed path (`writeFileSync("wf-y")` names `\\?\C:\work\wf-y`, a
+  rooted `\x` names `\\?\C:\x`, a UNC path `\\?\UNC\srv\sh\x`), and `mkdtempSync` the
+  template as passed (measured against v22.22.2). Up to 0.17.1 oam named the path as the
+  script passed it.
+- **On Windows an fs path is matched as node's resolve leaves it.** Names compare
+  case-sensitively, as in Node (`c:\box\f` and `C:\BOX\f` are outside a grant of
+  `C:\box`); a trailing dot or space is part of the name (`allowed.\x` is not inside
+  `allowed`); a grant of `\` or `/` is the root of the cwd's drive; and a UNC path
+  `\\srv\sh\x` is never the rooted `\srv\sh\x`. oam is stricter than Node in three
+  corners, each refused where Node v22.22.2 admits it: a `\\.\` path is matched by no
+  grant (Node matches it, prefix and all, against a grant spelled `\\.\...`); the
+  volume `\\?\C:` (what `\\?\C:\` resolves to) is not inside a grant of `C:\`; and a
+  path spelt with the NT prefix `\??\` (`\??\D:\x`, `\??\UNC\srv\sh\x`), which the OS
+  opens as an NT path on another drive, share or device, is matched by no grant where it
+  is judged as given -- the `mkdtemp` template, a pipe path, and the child, worker and
+  addon lists -- while Node resolves it to the rooted `C:\??\...` and admits it under a
+  grant of `C:\`. An fs op on such a path is unaffected: it opens the literal
+  `\\?\C:\??\...`, as Node's does. One
+  corner is the other way: a grant of a UNC path (`--allow-fs-read=\\srv\sh`) admits ops
+  on `\\srv\sh\x`, which `process.permission.has` reports granted but Node's ops refuse.
 - **A denied environment read is silent; every other denial throws.** Filesystem,
   network and child-process denials throw `ERR_ACCESS_DENIED` as described above. A
   variable denied by `--allow-env` is instead simply absent from `process.env` and reads
@@ -3614,35 +3631,42 @@ what is left:
   `create_dir` lengthens such paths itself. Refusing a path the file system accepts was not
   worth reproducing.
 
-### Windows `fs` paths reach the OS as given, not namespaced
+### Windows: `require` of a `\\?\` or `\\.\` spelling of a module loads it
 
-node's `fs` hands libuv every path through `path.toNamespacedPath`: resolved against the cwd
-(which normalises `.` / `..` and drops a trailing separator) and prefixed with `\\?\`. That
-prefix turns off Win32 path normalisation, so the OS does not strip trailing dots and spaces
-and does not treat DOS device names as devices. oam passes the path as given to std, which
-goes through that normalisation. Errors already NAME the path as node does (the resolved path,
-prefix removed); which file the OS opens differs. Measured against node v22.22.2 on Windows,
-for `fs.readFileSync`, and so for `process.loadEnvFile`, which reads through it:
+node's `fs` and module loader hand the OS every path through `path.toNamespacedPath`:
+resolved against the cwd (which normalises `.` / `..` and drops a trailing separator) and
+prefixed with `\\?\`, which turns off Win32 path normalisation, so the OS does not strip
+trailing dots and spaces and does not treat DOS device names as devices. oam does the same
+(up to 0.17.1 it passed the path as given) in its `fs` ops, `require`, `import`, the main
+entry, `oam.readTextFile` and native addon loading: `readFileSync("sub/")` fails `EISDIR`
+`read`, `readFileSync("NUL")` and `statSync(".env.")` fail `ENOENT`,
+`writeFileSync("g.txt.", ...)` creates `g.txt.`, and `require("./mod.js.")` fails
+`MODULE_NOT_FOUND`, as in node v22.22.2 (conformance case 377).
 
-| path | node | oam |
-|---|---|---|
-| a directory with a trailing separator, `sub/` or `sub\` | opens `sub`, fails `EISDIR` `read` (`loadEnvFile`: `Contents of '\\?\<cwd>\sub' should be a valid string.`) | the open fails, `ENOENT` `open '<cwd>\sub'` |
-| `NUL` / `nul` | `ENOENT` `open '<cwd>\NUL'` | reads the NUL device: `""` (`loadEnvFile` loads nothing and succeeds) |
-| a trailing dot or space, `.env.`, `.env `, `f.txt...` | `ENOENT` | opens `.env` / `f.txt` |
+One corner is left. `require` of an absolute `\\?\C:\...`, `\\.\C:\...` or `//?/C:/...`
+spelling of an existing module loads it on oam; node v22.22.2 fails `EISDIR` (`lstat 'C:'`,
+or `lstat '\\.\C:'`), because its realpath walk takes the first component after the prefix
+for a directory to lstat. Reproducing a failure of node's own was not worth it.
 
-The same holds beyond reads: `statSync(".env.")` and `existsSync(".env.")` find `.env`
-(node: `ENOENT`, `false`), `openSync("NUL")` opens the device and `statSync("NUL")` fails
-`EISDIR` (node: `ENOENT` for both), and `writeFileSync("g.txt.", ...)` creates `g.txt` where
-node creates a file literally named `g.txt.`. `COM1` agrees (`ENOENT` in both) on a machine
-without that port.
+### Windows `fs.symlink(target, path, 'junction')` makes a directory symlink
 
-Not fixed yet because there is no single place to change: paths reach the OS through some 66
-`toPath` call sites in `js/node_compat.js` and over 100 path-taking ops in Rust (sync ops in
-`oam_engine`, async ones in `oam_core`), the `--permission` checks resolve the path against
-the cwd themselves and would have to agree with what the OS is handed, and several results
-echo the path back (`mkdtemp`, recursive `mkdir`, `readdir` with `recursive`,
-`Dirent.parentPath`, symlink targets), where a namespaced path must not leak out. It wants
-its own design and a full `fs` conformance pass.
+node makes an NTFS junction. oam stores the same target node does (resolved against the
+link's parent and namespaced, so `readlinkSync` gives the same absolute path) but makes a
+directory symlink, because std has no junction call on stable Rust. The link works the same
+way; the difference is that a symlink needs the create-symlink privilege (Developer Mode or
+an elevated process), which a junction does not, so where that privilege is missing oam's
+call fails `EPERM` and node's succeeds. Measured against v22.22.2 (conformance case 377).
+
+### Windows `fs.open` of a directory fails
+
+node opens a directory on Windows (libuv passes `FILE_FLAG_BACKUP_SEMANTICS`), so
+`openSync("dir", "r")`, `"a"` and `"r+"` return a descriptor, and `appendFileSync("dir", "")`
+succeeds. oam opens without that flag, so each of those fails `EPERM` (`appendFileSync`
+`EISDIR` `write`). Everything that fails in node fails the same way in oam: `readFileSync`
+of a directory or of a drive or share root (`C:\`, `\`, `/`, `\\srv\sh`) fails `EISDIR`
+`read`, `openSync("dir", "w")` fails `EISDIR`, and a write open of a root fails `EPERM`
+naming the root (`'C:\'`, `'\\srv\sh\'`). Measured against v22.22.2 (conformance case 377);
+not fixed yet: it needs directory descriptors.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 

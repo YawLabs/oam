@@ -95,5 +95,52 @@ for (const [label, src, dest, options] of [
   console.log(`promises.cp nested file onto a dir: ${describe(failure)} || ${state()}`);
 }
 
+// A copy onto itself, or of a directory into itself: ERR_FS_CP_EINVAL before
+// anything is made (cpSync's from its C++, on the namespaced paths; cp's a
+// SystemError on the paths as given). oam used to copy a directory into its
+// own subdirectory until it was killed, building an ever deeper tree, and to
+// fail a file copied onto itself EBUSY from copyfile.
+const selfRows = [
+  ["file onto itself", "f", "f", {}],
+  ["file onto itself via ./", "f", "./f", {}],
+  ["dir onto itself", "d", "d", { recursive: true }],
+  ["dir into its own subdirectory", "d", path.join("d", "inner2"), { recursive: true }],
+  ["dir into its own subdirectory, no recursive", "d", path.join("d", "x"), {}],
+  ["dir deeper into itself", "d", path.join("d", "a", "b"), { recursive: true }],
+  ["dir into a sibling", "d", "d-copy", { recursive: true }],
+];
+if (process.platform === "win32") {
+  // Another spelling of the same directory: no string prefix, the same file.
+  selfRows.push(["dir into itself spelt in upper case", "d", path.join("D", "inner3"), { recursive: true }]);
+  // A drive root without `recursive` (never with it): cpSync's string check
+  // sees the cwd under it; cp's component check does not, and it fails as a
+  // directory copied without `recursive`.
+  selfRows.push(["drive root, no recursive", cwd.slice(0, 3), "root-copy", {}]);
+}
+const made = () => ["d-copy", "root-copy", path.join("d", "inner2"), path.join("d", "x"), path.join("d", "a")]
+  .filter((p) => fs.existsSync(p))
+  .join(",");
+for (const [label, src, dest, options] of selfRows) {
+  let failure;
+  try {
+    fs.cpSync(src, dest, options);
+  } catch (e) {
+    failure = e;
+  }
+  console.log(`cpSync ${label}: ${describe(failure)} || made [${made()}]`);
+  fs.rmSync("d-copy", { recursive: true, force: true });
+  failure = undefined;
+  try {
+    await fs.promises.cp(src, dest, options);
+  } catch (e) {
+    failure = e;
+  }
+  console.log(`promises.cp ${label}: ${describe(failure)} || made [${made()}]`);
+  fs.rmSync("d-copy", { recursive: true, force: true });
+  failure = await new Promise((resolve) => fs.cp(src, dest, options, (e) => resolve(e ?? undefined)));
+  console.log(`cp ${label}: ${describe(failure)} || made [${made()}]`);
+  fs.rmSync("d-copy", { recursive: true, force: true });
+}
+
 process.chdir(os.tmpdir());
 fs.rmSync(base, { recursive: true, force: true });

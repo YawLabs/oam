@@ -136,6 +136,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     }
     bind!(
         ("env", op_env),
+        ("envHidden", op_env_hidden),
         ("argv", op_argv),
         ("cwd", op_cwd),
         ("chdir", op_chdir),
@@ -227,6 +228,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsReadFileUtf8Sync", op_fs_read_file_utf8_sync),
         ("fsWriteFileSync", op_fs_write_file_sync),
         ("fsExistsSync", op_fs_exists_sync),
+        ("fsOsPathOf", op_fs_os_path_of),
+        ("fsShownPathOf", op_fs_shown_path_of),
         ("fsStatSync", op_fs_stat_sync),
         ("fsStatfsSync", op_fs_statfs_sync),
         ("fsReaddirSync", op_fs_readdir_sync),
@@ -651,19 +654,20 @@ fn node_errno(code: &str, error: &std::io::Error) -> Option<i32> {
 /// path at all, use `throw_fd_error` -- inferring "no path" from `path == ""`
 /// conflated the two and stripped the quotes off every empty-path error.
 ///
-/// On Windows the path is the resolved one node reports (see
-/// `oam_core::fs_error_path`).
+/// The path shown is the op's OS path with the prefix taken off
+/// (`FsPath::shown`), as node's `StringFromPath` shows it: on Windows the
+/// resolved path (`stat 'C:\cwd\x'`), never the OS path resolved again.
 fn throw_node_error(
     scope: &mut v8::PinScope<'_, '_>,
     syscall: &str,
-    path: &str,
+    path: &oam_core::FsPath,
     error: &std::io::Error,
 ) {
-    throw_node_error_as_passed(scope, syscall, &oam_core::fs_error_path(path), error);
+    throw_node_error_as_passed(scope, syscall, &path.shown(), error);
 }
 
 /// `throw_node_error` naming `path` exactly as given: for mkdtemp, whose
-/// template node does not resolve.
+/// template node does not resolve, and a path already shown.
 fn throw_node_error_as_passed(
     scope: &mut v8::PinScope<'_, '_>,
     syscall: &str,
@@ -704,11 +708,11 @@ fn throw_fs_error(
     scope: &mut v8::PinScope<'_, '_>,
     site: oam_core::FsSite<'_>,
     syscall: &'static str,
-    path: &str,
+    path: &oam_core::FsPath,
     error: &std::io::Error,
 ) {
-    let failure = oam_core::fs_error_at(site, syscall, path, error);
-    let shown = oam_core::fs_error_path(path);
+    let failure = oam_core::fs_error_at(site, syscall, path.os(), error);
+    let shown = path.shown();
     let message = oam_core::fs_error_message(failure, &shown, error);
     throw_system_error(
         scope,
@@ -726,11 +730,11 @@ fn throw_fs_error(
 fn throw_whole_file_error(
     scope: &mut v8::PinScope<'_, '_>,
     site: oam_core::FsSite<'_>,
-    path: &str,
+    path: &oam_core::FsPath,
     error: &oam_core::WholeFileError,
 ) {
-    let failure = oam_core::whole_file_error(site, path, error);
-    let shown = oam_core::fs_error_path(path);
+    let failure = oam_core::whole_file_error(site, path.os(), error);
+    let shown = path.shown();
     let message = oam_core::fs_error_message(failure, &shown, error.io());
     throw_system_error(
         scope,
@@ -948,10 +952,16 @@ fn op_env(
     //
     // Collected before the object is built because get_permissions borrows the
     // scope immutably while v8::String::new needs it mutably.
+    //
+    // A Windows name that starts with '=' (the hidden per-drive cwds `=C:`,
+    // and `=ExitCode`, `=::`) is left out: node's enumerator skips them
+    // (node_env_var.cc), so Object.keys(process.env) never lists one and a
+    // child handed process.env does not get one. A read of such a name goes
+    // to the live process environment instead -- see op_env_hidden.
     let allowed: Vec<(String, String)> = {
         let perms = get_permissions(scope);
         std::env::vars()
-            .filter(|(name, _)| perms.check_env(name).is_ok())
+            .filter(|(name, _)| !is_hidden_env_name(name) && perms.check_env(name).is_ok())
             .collect()
     };
     let env = v8::Object::new(scope);
@@ -965,6 +975,48 @@ fn op_env(
         env.set(scope, key.into(), value.into());
     }
     rv.set(env.into());
+}
+
+/// A name Windows keeps out of sight in the environment block: one that starts
+/// with '=' (`=C:` holds drive C's cwd). There is no such thing on POSIX, where
+/// '=' cannot start a name.
+fn is_hidden_env_name(name: &str) -> bool {
+    cfg!(windows) && name.starts_with('=')
+}
+
+/// `__oam.node.envHidden(name, remove)`: the live value of a hidden Windows
+/// variable (`=C:`), or undefined; with `remove`, the variable is removed first
+/// and undefined returned.
+///
+/// node reads every process.env name through GetEnvironmentVariableW at the
+/// time of the read, so `process.env['=C:']` after `process.chdir('C:\\Users')`
+/// reads `C:\Users` (libuv's uv_chdir updates `=C:`); the snapshot op_env
+/// takes cannot, so the process.env proxy routes these names here. Removal is
+/// node's `delete process.env['=C:']` (uv_os_unsetenv). An assignment is not
+/// offered: node's setter ignores a name that starts with '=' (measured on
+/// v22.22.2: the value reads back unchanged). Any other name is refused, so
+/// this is no general environment writer; a name the env permission denies
+/// reads as undefined and is left in place, as op_env leaves it out.
+fn op_env_hidden(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(name) = arg_string(scope, &args, 0) else {
+        return;
+    };
+    if !is_hidden_env_name(&name) || get_permissions(scope).check_env(&name).is_err() {
+        return;
+    }
+    if args.get(1).is_true() {
+        set_process_env(&name, None);
+        return;
+    }
+    if let Some(value) = std::env::var_os(&name)
+        && let Some(value) = v8::String::new(scope, &value.to_string_lossy())
+    {
+        rv.set(value.into());
+    }
 }
 
 fn op_argv(
@@ -1017,7 +1069,57 @@ fn op_chdir(
         return;
     };
     if let Err(e) = std::env::set_current_dir(&dir) {
-        throw_node_error(scope, "chdir", &dir, &e);
+        throw_node_error_as_passed(scope, "chdir", &oam_core::fs_error_path(&dir), &e);
+        return;
+    }
+    #[cfg(windows)]
+    record_drive_cwd();
+}
+
+/// Record the new cwd in its drive's hidden `=X:` variable, as libuv's
+/// uv_chdir does after SetCurrentDirectoryW (src/win/util.c, v1.51.0):
+/// SetCurrentDirectoryW leaves `=X:` alone, and node's resolve -- the one
+/// `oam_core::FsPath` runs -- reads `=X:` before the cwd for a drive-relative
+/// `X:name`, so without this every such path resolved against the directory
+/// the process was launched with. The value is GetCurrentDirectoryW's, with
+/// a trailing separator dropped unless it is a drive root (`C:\`); a cwd
+/// with no drive letter (a UNC share) sets nothing, and the letter is upper
+/// case.
+#[cfg(windows)]
+fn record_drive_cwd() {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let mut wide: Vec<u16> = cwd.as_os_str().encode_wide().collect();
+    let is_root = wide.len() == 3 && wide[1] == u16::from(b':');
+    if wide.last() == Some(&u16::from(b'\\')) && !is_root {
+        wide.pop();
+    }
+    let letter = match wide.first().copied().and_then(|c| u8::try_from(c).ok()) {
+        Some(c) if wide.get(1) == Some(&u16::from(b':')) && c.is_ascii_alphabetic() => {
+            c.to_ascii_uppercase()
+        }
+        _ => return,
+    };
+    let name = format!("={}:", char::from(letter));
+    set_process_env(&name, Some(&std::ffi::OsString::from_wide(&wide)));
+}
+
+/// Set a variable in the process environment, or remove it with `None`: the
+/// one place the ops change the real environment (`process.env.TZ`, a
+/// chdir's `=X:`), each as node's own binding does.
+fn set_process_env(name: &str, value: Option<&std::ffi::OsStr>) {
+    // SAFETY: edition 2024 marks env mutation unsafe because on POSIX it
+    // races other threads calling getenv. Every caller runs on the isolate
+    // thread inside an op, as node's own TZ and chdir updates do; on Windows
+    // the environment block is guarded by the process's own lock, which
+    // makes the mutation sound on any thread (std::env::set_var's docs).
+    unsafe {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
     }
 }
 
@@ -2902,16 +3004,9 @@ fn op_set_timezone(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let value = arg_string(scope, &args, 0);
-    // SAFETY: edition 2024 marks env mutation unsafe because it races other
-    // threads calling getenv. This runs on the isolate thread during a JS
-    // property set, and the tzset/ICU refresh below is the whole point of
-    // the call -- the same trade Node makes for process.env.TZ.
-    unsafe {
-        match &value {
-            Some(tz) => std::env::set_var("TZ", tz),
-            None => std::env::remove_var("TZ"),
-        }
-    }
+    // The tzset/ICU refresh below is the whole point of the call -- the same
+    // trade Node makes for process.env.TZ.
+    set_process_env("TZ", value.as_deref().map(std::ffi::OsStr::new));
     // libc caches the parsed zone; tzset() re-reads TZ for anything going
     // through localtime(3). Declared here rather than used from the libc
     // crate, which does not export it on darwin.
@@ -6185,16 +6280,18 @@ fn op_fs_read_file_sync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "readFileSync requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Read,
+        "readFileSync requires a path",
+    ) else {
         return;
     };
-    if !check_read_perm(scope, &path) {
-        return;
-    }
     // Always raw bytes: encodings decode JS-side via Buffer#toString, so
     // 'base64'/'hex'/'latin1' behave instead of utf8-lossy garbage.
-    match oam_core::read_whole_file(&path) {
+    match oam_core::read_whole_file(path.os()) {
         Ok(bytes) => {
             if let Some(value) = bytes_to_uint8array(scope, bytes) {
                 rv.set(value);
@@ -6209,14 +6306,16 @@ fn op_fs_read_file_utf8_sync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "readFileSync requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Read,
+        "readFileSync requires a path",
+    ) else {
         return;
     };
-    if !check_read_perm(scope, &path) {
-        return;
-    }
-    match oam_core::read_whole_file(&path) {
+    match oam_core::read_whole_file(path.os()) {
         Ok(bytes) => {
             if let Some(s) = v8::String::new_from_utf8(scope, &bytes, v8::NewStringType::Normal) {
                 rv.set(s.into());
@@ -6231,25 +6330,57 @@ fn op_fs_write_file_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "writeFileSync requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Write,
+        "writeFileSync requires a path",
+    ) else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let Some(bytes) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "writeFileSync requires data");
         return;
     };
     let append = args.get(2).is_true();
-    if let Err(e) = oam_core::write_whole_file(&path, &bytes, append) {
+    if let Err(e) = oam_core::write_whole_file(path.os(), &bytes, append) {
         let site = if append {
             oam_core::FsSite::AppendFile
         } else {
             oam_core::FsSite::WriteFile
         };
         throw_whole_file_error(scope, site, &path, &e);
+    }
+}
+
+/// `fsOsPathOf(path)`: the path node's fs binding hands the OS for `path`
+/// (`oam_core::fs_os_path`: on Windows resolved against the process's real
+/// cwd and `\\?\`-prefixed, elsewhere `path`). For the messages node renders
+/// with the namespaced path, prefix and all (cpSync's, loadEnvFile's).
+fn op_fs_os_path_of(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let path = arg_string(scope, &args, 0).unwrap_or_default();
+    if let Some(value) = v8::String::new(scope, &oam_core::fs_os_path(&path)) {
+        rv.set(value.into());
+    }
+}
+
+/// `fsShownPathOf(path)`: the path node's fs errors name for `path`
+/// (`oam_core::fs_error_path`: the OS path with the prefix taken off). The
+/// errors built in JS use it, so they name the real cwd as the native ops'
+/// errors do, never a patched `process.cwd`.
+fn op_fs_shown_path_of(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let path = arg_string(scope, &args, 0).unwrap_or_default();
+    if let Some(value) = v8::String::new(scope, &oam_core::fs_error_path(&path)) {
+        rv.set(value.into());
     }
 }
 
@@ -6262,10 +6393,10 @@ fn op_fs_exists_sync(
         rv.set_bool(false);
         return;
     };
-    if !check_read_perm(scope, &path) {
+    let Some(path) = fs_path_of(scope, path, FsAccess::Read) else {
         return;
-    }
-    rv.set_bool(std::path::Path::new(&path).exists());
+    };
+    rv.set_bool(std::path::Path::new(path.os()).exists());
 }
 
 fn op_fs_stat_sync(
@@ -6273,15 +6404,12 @@ fn op_fs_stat_sync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "statSync requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Read, "statSync requires a path")
+    else {
         return;
     };
-    if !check_read_perm(scope, &path) {
-        return;
-    }
     let lstat = args.get(1).is_true();
-    match oam_core::ops::stat_path_json(&path, lstat) {
+    match oam_core::ops::stat_path_json(path.os(), lstat) {
         Ok(json) => return_json(scope, &mut rv, &json),
         Err(e) => throw_node_error(scope, if lstat { "lstat" } else { "stat" }, &path, &e),
     }
@@ -6292,14 +6420,16 @@ fn op_fs_statfs_sync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "statfsSync requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Read,
+        "statfsSync requires a path",
+    ) else {
         return;
     };
-    if !check_read_perm(scope, &path) {
-        return;
-    }
-    match oam_core::ops::statfs_json(&path) {
+    match oam_core::ops::statfs_json(path.os()) {
         Ok(json) => return_json(scope, &mut rv, &json),
         Err(e) => throw_node_error(scope, "statfs", &path, &e),
     }
@@ -6310,14 +6440,16 @@ fn op_fs_readdir_sync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "readdirSync requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Read,
+        "readdirSync requires a path",
+    ) else {
         return;
     };
-    if !check_read_perm(scope, &path) {
-        return;
-    }
-    match oam_core::ops::readdir_to_json(&path) {
+    match oam_core::ops::readdir_to_json(path.os()) {
         Ok(json) => return_json(scope, &mut rv, &json),
         Err(e) => throw_fs_error(scope, oam_core::FsSite::Scandir, "scandir", &path, &e),
     }
@@ -6328,13 +6460,15 @@ fn op_fs_mkdir_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "mkdirSync requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Write,
+        "mkdirSync requires a path",
+    ) else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let recursive = args.get(1).is_true();
     let result = if recursive {
         std::fs::create_dir_all(&path)
@@ -6357,16 +6491,12 @@ fn op_fs_rm_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "rmSync requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Write, "rmSync requires a path") else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let recursive = args.get(1).is_true();
     let force = args.get(2).is_true();
-    match oam_core::remove_path(&path, recursive) {
+    match oam_core::remove_path(path.os(), recursive) {
         Ok(()) => {}
         Err(e) if force && e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => throw_node_error(scope, "rm", &path, &e),
@@ -6382,14 +6512,14 @@ fn op_fs_rename_sync(
         throw_type_error(scope, "renameSync requires from and to paths");
         return;
     };
-    if !check_write_perm(scope, &from) {
+    let Some(from) = fs_path_of(scope, from, FsAccess::Write) else {
         return;
-    }
-    if !check_write_perm(scope, &to) {
+    };
+    let Some(to) = fs_path_of(scope, to, FsAccess::Write) else {
         return;
-    }
+    };
     if let Err(e) = std::fs::rename(&from, &to) {
-        let (path, dest) = (oam_core::fs_error_path(&from), oam_core::fs_error_path(&to));
+        let (path, dest) = (from.shown(), to.shown());
         throw_node_error_dest(scope, "rename", &path, &dest, &e);
     }
 }
@@ -6403,14 +6533,16 @@ fn op_fs_copy_file_sync(
         throw_type_error(scope, "copyFileSync requires from and to paths");
         return;
     };
-    if !check_read_perm(scope, &from) {
+    // The COPYFILE_* bits, checked in JS (copyFileMode).
+    let copy_mode = args.get(2).uint32_value(scope).unwrap_or(0);
+    let Some(from) = fs_path_of(scope, from, FsAccess::Read) else {
         return;
-    }
-    if !check_write_perm(scope, &to) {
+    };
+    let Some(to) = fs_path_of(scope, to, FsAccess::Write) else {
         return;
-    }
-    if let Err(e) = std::fs::copy(&from, &to) {
-        let (path, dest) = (oam_core::fs_error_path(&from), oam_core::fs_error_path(&to));
+    };
+    if let Err(e) = oam_core::copy_file(&from, &to, copy_mode) {
+        let (path, dest) = (from.shown(), to.shown());
         throw_node_error_dest(scope, "copyfile", &path, &dest, &e);
     }
 }
@@ -6420,13 +6552,15 @@ fn op_fs_unlink_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "unlinkSync requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Write,
+        "unlinkSync requires a path",
+    ) else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     if let Err(e) = std::fs::remove_file(&path) {
         throw_node_error(scope, "unlink", &path, &e);
     }
@@ -6437,13 +6571,15 @@ fn op_fs_access_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "accessSync requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Read,
+        "accessSync requires a path",
+    ) else {
         return;
     };
-    if !check_read_perm(scope, &path) {
-        return;
-    }
     let mode = args.get(1).int32_value(scope).unwrap_or(0);
     match oam_core::check_access(&path, mode) {
         Ok(()) => {}
@@ -6462,7 +6598,7 @@ fn op_fs_access_sync(
                     let value = v8::Integer::new(scope, errno);
                     obj.set(scope, key.into(), value.into());
                 }
-                let shown = oam_core::fs_error_path(&path);
+                let shown = path.shown();
                 let props: [(&str, &str); 3] =
                     [("code", &code), ("syscall", "access"), ("path", &shown)];
                 for (name, value) in props {
@@ -6482,14 +6618,16 @@ fn op_fs_realpath_sync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "realpathSync requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Read,
+        "realpathSync requires a path",
+    ) else {
         return;
     };
-    if !check_read_perm(scope, &path) {
-        return;
-    }
-    match std::fs::canonicalize(PathBuf::from(&path)) {
+    match std::fs::canonicalize(&path) {
         Ok(real) => {
             let text = oam_core::strip_unc_prefix(&real);
             if let Some(value) = v8::String::new(scope, &text) {
@@ -6507,13 +6645,10 @@ fn op_fs_read_file(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "readFile requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Read, "readFile requires a path")
+    else {
         return;
     };
-    if !check_read_perm(scope, &path) {
-        return;
-    }
     // Always raw bytes; encodings decode JS-side (see the sync twin).
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_read_file(path));
 }
@@ -6523,13 +6658,15 @@ fn op_fs_write_file(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "writeFile requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Write,
+        "writeFile requires a path",
+    ) else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let Some(bytes) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "writeFile requires data");
         return;
@@ -6547,13 +6684,9 @@ fn op_fs_stat(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "stat requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Read, "stat requires a path") else {
         return;
     };
-    if !check_read_perm(scope, &path) {
-        return;
-    }
     let lstat = args.get(1).is_true();
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_stat(path, lstat));
 }
@@ -6815,13 +6948,9 @@ fn op_fs_chown(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "chown requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Write, "chown requires a path") else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let (uid, gid) = chown_args(scope, &args);
     crate::ops::spawn_op(
         scope,
@@ -6835,13 +6964,9 @@ fn op_fs_lchown(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "lchown requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Write, "lchown requires a path") else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let (uid, gid) = chown_args(scope, &args);
     crate::ops::spawn_op(
         scope,
@@ -6855,13 +6980,9 @@ fn op_fs_utimes(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "utimes requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Write, "utimes requires a path") else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let (atime, mtime) = utime_args(scope, &args, 1);
     crate::ops::spawn_op(
         scope,
@@ -6875,13 +6996,10 @@ fn op_fs_lutimes(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "lutimes requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Write, "lutimes requires a path")
+    else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let (atime, mtime) = utime_args(scope, &args, 1);
     crate::ops::spawn_op(
         scope,
@@ -6895,13 +7013,9 @@ fn op_fs_lchmod(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "lchmod requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Write, "lchmod requires a path") else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_lchmod(path, mode));
 }
@@ -6911,15 +7025,17 @@ fn op_fs_chown_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "chownSync requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Write,
+        "chownSync requires a path",
+    ) else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let (uid, gid) = chown_args(scope, &args);
-    if let Err(e) = oam_core::ops::fs_chown_sync(&path, uid, gid, true) {
+    if let Err(e) = oam_core::ops::fs_chown_sync(path.os(), uid, gid, true) {
         throw_node_error(scope, "chown", &path, &e);
     }
 }
@@ -6929,15 +7045,17 @@ fn op_fs_lchown_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "lchownSync requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Write,
+        "lchownSync requires a path",
+    ) else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let (uid, gid) = chown_args(scope, &args);
-    if let Err(e) = oam_core::ops::fs_chown_sync(&path, uid, gid, false) {
+    if let Err(e) = oam_core::ops::fs_chown_sync(path.os(), uid, gid, false) {
         throw_node_error(scope, "lchown", &path, &e);
     }
 }
@@ -6947,16 +7065,18 @@ fn op_fs_utimes_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "utimesSync requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Write,
+        "utimesSync requires a path",
+    ) else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let (atime, mtime) = utime_args(scope, &args, 1);
     // node reports the SINGULAR `utime` here, not `utimes`.
-    if let Err(e) = oam_core::ops::fs_utimes_sync(&path, atime, mtime, true) {
+    if let Err(e) = oam_core::ops::fs_utimes_sync(path.os(), atime, mtime, true) {
         throw_node_error(scope, "utime", &path, &e);
     }
 }
@@ -6966,15 +7086,17 @@ fn op_fs_lutimes_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "lutimesSync requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Write,
+        "lutimesSync requires a path",
+    ) else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let (atime, mtime) = utime_args(scope, &args, 1);
-    if let Err(e) = oam_core::ops::fs_utimes_sync(&path, atime, mtime, false) {
+    if let Err(e) = oam_core::ops::fs_utimes_sync(path.os(), atime, mtime, false) {
         throw_node_error(scope, "lutime", &path, &e);
     }
 }
@@ -6984,15 +7106,17 @@ fn op_fs_lchmod_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "lchmodSync requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Write,
+        "lchmodSync requires a path",
+    ) else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
-    if let Err(e) = oam_core::ops::fs_lchmod_sync(&path, mode) {
+    if let Err(e) = oam_core::ops::fs_lchmod_sync(path.os(), mode) {
         throw_node_error(scope, "lchmod", &path, &e);
     }
 }
@@ -7002,13 +7126,9 @@ fn op_fs_statfs(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "statfs requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Read, "statfs requires a path") else {
         return;
     };
-    if !check_read_perm(scope, &path) {
-        return;
-    }
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_statfs(path));
 }
 
@@ -7017,13 +7137,9 @@ fn op_fs_readdir(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "readdir requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Read, "readdir requires a path") else {
         return;
     };
-    if !check_read_perm(scope, &path) {
-        return;
-    }
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_readdir(path));
 }
 
@@ -7032,13 +7148,9 @@ fn op_fs_mkdir(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "mkdir requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Write, "mkdir requires a path") else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let recursive = args.get(1).is_true();
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_mkdir(path, recursive));
 }
@@ -7048,13 +7160,9 @@ fn op_fs_rm(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "rm requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Write, "rm requires a path") else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let recursive = args.get(1).is_true();
     let force = args.get(2).is_true();
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_rm(path, recursive, force));
@@ -7069,12 +7177,12 @@ fn op_fs_rename(
         throw_type_error(scope, "rename requires from and to paths");
         return;
     };
-    if !check_write_perm(scope, &from) {
+    let Some(from) = fs_path_of(scope, from, FsAccess::Write) else {
         return;
-    }
-    if !check_write_perm(scope, &to) {
+    };
+    let Some(to) = fs_path_of(scope, to, FsAccess::Write) else {
         return;
-    }
+    };
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_rename(from, to));
 }
 
@@ -7087,13 +7195,19 @@ fn op_fs_copy_file(
         throw_type_error(scope, "copyFile requires from and to paths");
         return;
     };
-    if !check_read_perm(scope, &from) {
+    // The COPYFILE_* bits, checked in JS (copyFileMode).
+    let copy_mode = args.get(2).uint32_value(scope).unwrap_or(0);
+    let Some(from) = fs_path_of(scope, from, FsAccess::Read) else {
         return;
-    }
-    if !check_write_perm(scope, &to) {
+    };
+    let Some(to) = fs_path_of(scope, to, FsAccess::Write) else {
         return;
-    }
-    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_copy_file(from, to));
+    };
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fs_copy_file(from, to, copy_mode),
+    );
 }
 
 fn op_fs_unlink(
@@ -7101,13 +7215,9 @@ fn op_fs_unlink(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "unlink requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Write, "unlink requires a path") else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_unlink(path));
 }
 
@@ -7116,13 +7226,9 @@ fn op_fs_access(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "access requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Read, "access requires a path") else {
         return;
     };
-    if !check_read_perm(scope, &path) {
-        return;
-    }
     let mode = args.get(1).int32_value(scope).unwrap_or(0);
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_access(path, mode));
 }
@@ -7132,13 +7238,10 @@ fn op_fs_realpath(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "realpath requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Read, "realpath requires a path")
+    else {
         return;
     };
-    if !check_read_perm(scope, &path) {
-        return;
-    }
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_realpath(path));
 }
 
@@ -7151,7 +7254,7 @@ fn op_fs_mkdtemp(
     // As in the sync twin: the template is checked, and that same template
     // goes to the op.
     let template = oam_core::mkdtemp_template(&prefix);
-    if !check_write_perm(scope, &template) {
+    if !check_fs_as_given(scope, &template, FsAccess::Write) {
         return;
     }
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_mkdtemp(template));
@@ -7166,14 +7269,30 @@ fn op_fs_symlink(
         throw_type_error(scope, "symlink requires a target");
         return;
     };
-    let Some(path) = arg_string(scope, &args, 1) else {
+    let Some(link) = arg_string(scope, &args, 1) else {
         throw_type_error(scope, "symlink requires a path");
         return;
     };
-    if !check_write_perm(scope, &path) {
+    let kind = oam_core::SymlinkType::from_arg(arg_string(scope, &args, 2).as_deref());
+    // With no type, node's callback and promise forms stat the probe and
+    // fall back to a file link on any failure, a refused read included: no
+    // error, and nothing learnt about a path the read grant refuses. A type
+    // given is used as it is, with no probe.
+    #[cfg(windows)]
+    let probe = (kind == oam_core::SymlinkType::Probe)
+        .then(|| oam_core::FsPath::new(oam_core::symlink_probe_path(&link, &target)))
+        .filter(|probe| get_permissions(scope).check_read_path(probe).is_ok());
+    #[cfg(not(windows))]
+    let probe = None;
+    let stored = oam_core::symlink_stored_target(&link, &target, kind);
+    let Some(path) = fs_path_of(scope, link, FsAccess::Write) else {
         return;
-    }
-    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_symlink(target, path));
+    };
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fs_symlink(stored, kind, probe, path),
+    );
 }
 
 fn op_fs_readlink(
@@ -7181,13 +7300,10 @@ fn op_fs_readlink(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "readlink requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Read, "readlink requires a path")
+    else {
         return;
     };
-    if !check_read_perm(scope, &path) {
-        return;
-    }
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_readlink(path));
 }
 
@@ -7204,12 +7320,12 @@ fn op_fs_link(
         throw_type_error(scope, "link requires a new path");
         return;
     };
-    if !check_read_perm(scope, &existing) {
+    let Some(existing) = fs_path_of(scope, existing, FsAccess::Read) else {
         return;
-    }
-    if !check_write_perm(scope, &new_path) {
+    };
+    let Some(new_path) = fs_path_of(scope, new_path, FsAccess::Write) else {
         return;
-    }
+    };
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_link(existing, new_path));
 }
 
@@ -7218,13 +7334,9 @@ fn op_fs_chmod(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "chmod requires a path");
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Write, "chmod requires a path") else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_chmod(path, mode));
 }
@@ -7238,36 +7350,53 @@ fn op_fs_symlink_sync(
         throw_type_error(scope, "symlinkSync requires a target");
         return;
     };
-    let Some(path) = arg_string(scope, &args, 1) else {
+    let Some(link) = arg_string(scope, &args, 1) else {
         throw_type_error(scope, "symlinkSync requires a path");
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
+    let kind = oam_core::SymlinkType::from_arg(arg_string(scope, &args, 2).as_deref());
+    // With no type, node's symlinkSync picks a directory or a file link with
+    // `statSync(path.resolve(link, '..', target), { throwIfNoEntry: false })`
+    // before anything else: the target is taken relative to the link's
+    // parent, the read grant is checked on it, and a failure other than
+    // ENOENT or ENOTDIR is thrown as that stat's error. A type given is used
+    // as it is, with no probe: `dir` and `junction` make a directory link
+    // even to a target that is not there yet.
     #[cfg(windows)]
-    let result = {
-        let is_dir = std::fs::metadata(&target)
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
-        if is_dir {
-            std::os::windows::fs::symlink_dir(&target, &path)
-        } else {
-            std::os::windows::fs::symlink_file(&target, &path)
+    let is_dir = match kind {
+        oam_core::SymlinkType::File => false,
+        oam_core::SymlinkType::Dir | oam_core::SymlinkType::Junction => true,
+        oam_core::SymlinkType::Probe => {
+            let probe = oam_core::symlink_probe_path(&link, &target);
+            let Some(probe) = fs_path_of(scope, probe, FsAccess::Read) else {
+                return;
+            };
+            match std::fs::metadata(&probe) {
+                Ok(meta) => meta.is_dir(),
+                Err(e) if matches!(oam_core::node_error_code(&e), "ENOENT" | "ENOTDIR") => false,
+                Err(e) => {
+                    throw_node_error(scope, "stat", &probe, &e);
+                    return;
+                }
+            }
         }
     };
+    let target = oam_core::symlink_stored_target(&link, &target, kind);
+    let Some(path) = fs_path_of(scope, link, FsAccess::Write) else {
+        return;
+    };
+    #[cfg(windows)]
+    let result = if is_dir {
+        std::os::windows::fs::symlink_dir(&*target, &path)
+    } else {
+        std::os::windows::fs::symlink_file(&*target, &path)
+    };
     #[cfg(not(windows))]
-    let result = std::os::unix::fs::symlink(&target, &path);
+    let result = std::os::unix::fs::symlink(&*target, &path);
     if let Err(e) = result {
-        // The target is stored as written, so node reports it so; the link's
-        // own path is resolved like any other.
-        throw_node_error_dest(
-            scope,
-            "symlink",
-            &target,
-            &oam_core::fs_error_path(&path),
-            &e,
-        );
+        // The target as stored, strip-only, and the link's own path.
+        let shown = oam_core::fs_shown_path(&target);
+        throw_node_error_dest(scope, "symlink", &shown, &path.shown(), &e);
     }
 }
 
@@ -7276,13 +7405,15 @@ fn op_fs_readlink_sync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "readlinkSync requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Read,
+        "readlinkSync requires a path",
+    ) else {
         return;
     };
-    if !check_read_perm(scope, &path) {
-        return;
-    }
     match std::fs::read_link(&path) {
         Ok(target) => {
             let text = oam_core::strip_unc_prefix(&target);
@@ -7307,21 +7438,15 @@ fn op_fs_link_sync(
         throw_type_error(scope, "linkSync requires a new path");
         return;
     };
-    if !check_read_perm(scope, &existing) {
+    let Some(existing) = fs_path_of(scope, existing, FsAccess::Read) else {
         return;
-    }
-    if !check_write_perm(scope, &new_path) {
+    };
+    let Some(new_path) = fs_path_of(scope, new_path, FsAccess::Write) else {
         return;
-    }
+    };
     if let Err(e) = std::fs::hard_link(&existing, &new_path) {
-        let path = oam_core::fs_error_path(&existing);
-        throw_node_error_dest(
-            scope,
-            "link",
-            &path,
-            &oam_core::fs_error_path(&new_path),
-            &e,
-        );
+        let path = existing.shown();
+        throw_node_error_dest(scope, "link", &path, &new_path.shown(), &e);
     }
 }
 
@@ -7330,13 +7455,15 @@ fn op_fs_chmod_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "chmodSync requires a path");
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Write,
+        "chmodSync requires a path",
+    ) else {
         return;
     };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
     let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
     #[cfg(unix)]
     {
@@ -7370,7 +7497,7 @@ fn op_fs_mkdtemp_sync(
     // node's binding checks write permission on the template it hands libuv
     // (prefix + XXXXXX, unresolved): the directory is created beside it.
     let template = oam_core::mkdtemp_template(&prefix);
-    if !check_write_perm(scope, &template) {
+    if !check_fs_as_given(scope, &template, FsAccess::Write) {
         return;
     }
     match oam_core::mkdtemp(&template) {
@@ -7405,13 +7532,14 @@ fn op_fs_open(
         return;
     };
     let mode = arg_string(scope, &args, 1).unwrap_or_else(|| "r".to_string());
-    if open_flags_write(&mode) {
-        if !check_write_perm(scope, &path) {
-            return;
-        }
-    } else if !check_read_perm(scope, &path) {
+    let access = if open_flags_write(&mode) {
+        FsAccess::Write
+    } else {
+        FsAccess::Read
+    };
+    let Some(path) = fs_path_of(scope, path, access) else {
         return;
-    }
+    };
     let core = core_runtime!(scope);
     let files = core.files();
     let ids = core.body_ids();
@@ -7519,13 +7647,14 @@ fn op_fs_open_sync(
         return;
     };
     let flags = arg_string(scope, &args, 1).unwrap_or_else(|| "r".to_string());
-    if open_flags_write(&flags) {
-        if !check_write_perm(scope, &path) {
-            return;
-        }
-    } else if !check_read_perm(scope, &path) {
+    let access = if open_flags_write(&flags) {
+        FsAccess::Write
+    } else {
+        FsAccess::Read
+    };
+    let Some(path) = fs_path_of(scope, path, access) else {
         return;
-    }
+    };
     match open_options_for(&flags).open(&path) {
         Ok(file) => {
             let core = core_runtime!(scope);
@@ -7742,27 +7871,74 @@ fn get_permissions(
         .unwrap_or_default()
 }
 
-/// Check `read` permission for `path`; throw and return `false` if denied.
-/// Usage:
-/// ```ignore
-/// if !check_read_perm(scope, &path) { return; }
-/// ```
-fn check_read_perm(scope: &mut v8::PinScope<'_, '_>, path: &str) -> bool {
-    if let Err(denial) = get_permissions(scope).check_read(path) {
-        throw_permission_denied(scope, &denial);
-        false
-    } else {
-        true
+/// Which fs grant an op's path needs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FsAccess {
+    Read,
+    Write,
+}
+
+/// The path argument `index` of an fs op as the OS path node's binding hands
+/// libuv (`oam_core::FsPath`: on Windows resolved against the cwd of the
+/// moment and `\\?\`-prefixed, elsewhere the path as passed), once `access`
+/// is granted for it. Throws a TypeError with `missing` when the argument is
+/// absent, or `ERR_ACCESS_DENIED` naming the OS path, and returns `None`.
+///
+/// Every fs op that takes a path goes through this (or `fs_path_of`), so the
+/// path that is checked is the path that is opened, and an error shows that
+/// path with the prefix taken off (`FsPath::shown`), never resolved again.
+/// An async op builds its `FsPath` here, on the isolate thread, so a
+/// relative path means what it meant when the op was called.
+fn fs_path_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+    access: FsAccess,
+    missing: &str,
+) -> Option<oam_core::FsPath> {
+    let Some(path) = arg_string(scope, args, index) else {
+        throw_type_error(scope, missing);
+        return None;
+    };
+    fs_path_of(scope, path, access)
+}
+
+/// `fs_path_arg` for a path already read from the arguments.
+fn fs_path_of(
+    scope: &mut v8::PinScope<'_, '_>,
+    path: String,
+    access: FsAccess,
+) -> Option<oam_core::FsPath> {
+    let path = oam_core::FsPath::new(path);
+    let permissions = get_permissions(scope);
+    let verdict = match access {
+        FsAccess::Read => permissions.check_read_path(&path),
+        FsAccess::Write => permissions.check_write_path(&path),
+    };
+    match verdict {
+        Ok(()) => Some(path),
+        Err(denial) => {
+            throw_permission_denied(scope, &denial);
+            None
+        }
     }
 }
 
-/// Check `write` permission for `path`.
-fn check_write_perm(scope: &mut v8::PinScope<'_, '_>, path: &str) -> bool {
-    if let Err(denial) = get_permissions(scope).check_write(path) {
-        throw_permission_denied(scope, &denial);
-        false
-    } else {
-        true
+/// Check `access` for a path the op hands the OS exactly as given -- the
+/// mkdtemp template, which node's binding passes to libuv unresolved -- and
+/// throw `ERR_ACCESS_DENIED` naming it as given. Returns whether it passed.
+fn check_fs_as_given(scope: &mut v8::PinScope<'_, '_>, path: &str, access: FsAccess) -> bool {
+    let permissions = get_permissions(scope);
+    let verdict = match access {
+        FsAccess::Read => permissions.check_read(path),
+        FsAccess::Write => permissions.check_write(path),
+    };
+    match verdict {
+        Ok(()) => true,
+        Err(denial) => {
+            throw_permission_denied(scope, &denial);
+            false
+        }
     }
 }
 
@@ -7860,8 +8036,11 @@ fn op_worker_new(
             .unwrap_or_default(),
     };
 
+    // Tested on the namespaced path the loader then opens (`FsPath`), so a
+    // trailing dot or space stays in the name for both: tested raw, Win32
+    // dropped it and `w.js.` passed on the strength of `w.js`.
     let path = PathBuf::from(&script_path);
-    if !path.is_file() {
+    if !std::path::Path::new(oam_core::FsPath::new(script_path.clone()).os()).is_file() {
         throw_type_error(scope, &format!("worker script not found: {script_path}"));
         return;
     }
@@ -10330,6 +10509,14 @@ mod permission_audit {
             ("op_fs_futimes", "fd from a checked open()"),
             ("op_fs_futimes_sync", "fd from a checked open()"),
             (
+                "op_fs_os_path_of",
+                "computes a path string from the cwd; opens nothing",
+            ),
+            (
+                "op_fs_shown_path_of",
+                "computes a path string from the cwd; opens nothing",
+            ),
+            (
                 "op_spawn_kill",
                 "signals a child already permitted at spawn",
             ),
@@ -10417,8 +10604,9 @@ mod permission_audit {
             if is_unsupported_stub {
                 return;
             }
-            let checked = body.contains("check_read_perm")
-            || body.contains("check_write_perm")
+            let checked = body.contains("fs_path_arg(")
+            || body.contains("fs_path_of(")
+            || body.contains("check_fs_as_given(")
             || body.contains("check_child_perm")
             || body.contains("check_worker_perm")
             // Direct form: `get_permissions(scope).check_child(..)`.

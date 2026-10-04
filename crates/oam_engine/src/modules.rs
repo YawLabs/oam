@@ -565,12 +565,26 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
 /// (`node:` / `oam:`) are not files — pass them through untouched. Canonicalize
 /// failures (file removed mid-run, races) fall back to the lexical form so a
 /// transient error never aborts the run.
+///
+/// On Windows the path is first resolved as node's loader resolves it
+/// (`oam_core::FsPath`: lexically against the cwd, `\\?\`-prefixed), so
+/// `app.js.` is the file named `app.js.` -- missing, keyed by that name and
+/// failing its read -- not `app.js`, which `std::path::absolute`
+/// (GetFullPathNameW) would make of it.
 pub(crate) fn module_key(path: &Path) -> std::io::Result<PathBuf> {
     if path
         .to_str()
         .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"))
     {
         return Ok(path.to_path_buf());
+    }
+    #[cfg(windows)]
+    if let Some(given) = path.to_str().filter(|s| !s.is_empty()) {
+        let os = oam_core::FsPath::new(given.to_string());
+        return match std::fs::canonicalize(os.os()) {
+            Ok(real) => Ok(strip_verbatim(real)),
+            Err(_) => Ok(PathBuf::from(os.shown().into_owned())),
+        };
     }
     let absolute = std::path::absolute(path)?;
     match std::fs::canonicalize(&absolute) {
@@ -3003,4 +3017,40 @@ fn annotate_missing_builtin_export(message: &str) -> String {
          conformance/surface-gaps.json for the machine-readable one. If the name is not \
          listed there, it is a bug worth reporting."
     )
+}
+
+/// The module loader's `oam_loader::fs_os_path` (the path its resolver
+/// probes) and the fs ops' `oam_core::fs_os_path_with` are two
+/// implementations of node's `ToNamespacedPath` for an absolute path; this
+/// crate depends on both, so it holds them to one table.
+#[cfg(all(test, windows))]
+mod fs_os_path_agreement_tests {
+    #[test]
+    fn loader_and_fs_ops_namespace_an_absolute_path_alike() {
+        let rows = [
+            r"C:\app\mod.js",
+            r"C:\app\mod.js.",
+            r"C:\app\mod.js ",
+            r"C:\app\NUL",
+            r"C:\app\.\sub\..\x.js",
+            r"C:/app/sub/",
+            r"C:\app\\sub",
+            r"C:\",
+            r"C:\..\x",
+            r"D:\a\b.",
+            r"\\srv\sh\x\..\y.",
+            r"\\srv\sh\",
+            r"\\srv\sh\x",
+        ];
+        for row in rows {
+            let loader = oam_loader::fs_os_path(std::path::Path::new(row));
+            let ops = oam_core::fs_os_path_with(
+                row,
+                || r"C:\unused".to_string(),
+                |_| None,
+                oam_core::Win32ResolveMode::Cpp,
+            );
+            assert_eq!(loader.to_str(), Some(&*ops), "{row:?}");
+        }
+    }
 }

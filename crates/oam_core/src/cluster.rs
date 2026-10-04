@@ -20,6 +20,11 @@ pub async fn cluster_fork(
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.arg("run");
     cmd.arg(&script_path);
+    // node's cluster.fork hands the worker {...process.env, ...env}, which
+    // never holds a hidden `=C:` (child::hidden_env_names).
+    for name in super::child::hidden_env_names() {
+        cmd.env_remove(name);
+    }
     cmd.env("OAM_CLUSTER_WORKER", &worker_id);
     for (k, v) in &env_pairs {
         cmd.env(k, v);

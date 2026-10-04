@@ -162,12 +162,16 @@ fn append_quoted(arg: &str, out: &mut String) {
 }
 
 /// Build a double-null-terminated UTF-16 environment block (sorted, as Windows
-/// expects). Merges the inherited environment with overrides unless cleared.
+/// expects). Merges the inherited environment with overrides unless cleared;
+/// the inherited hidden `=X:` names are left out, as `child::hidden_env_names`
+/// explains (only the overrides can carry one).
 fn build_env_block(env: &[(String, String)], clear: bool) -> Vec<u16> {
     let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     if !clear {
         for (k, v) in std::env::vars() {
-            map.insert(k, v);
+            if !k.starts_with('=') {
+                map.insert(k, v);
+            }
         }
     }
     for (k, v) in env {

@@ -658,7 +658,7 @@ fn main() -> ExitCode {
             // vendored suite's `"${process.execPath}" "${__filename}" child`).
             // A real SUBCOMMAND always wins, so `oam test` still runs the
             // test runner even if a file named `test` sits in the cwd.
-            if !flag.starts_with('-') && !SUBCOMMANDS.contains(&flag) && Path::new(flag).is_file() {
+            if !flag.starts_with('-') && !SUBCOMMANDS.contains(&flag) && script_is_file(flag) {
                 let file = PathBuf::from(flag);
                 drain_loader_warnings_on_hard_exit(false);
                 let outcome = run_file_with_flags(
@@ -1854,7 +1854,9 @@ impl oam_engine::ModuleHost for CliHost {
             }
         }
 
-        let source = std::fs::read_to_string(path).map_err(|e| {
+        // Read the namespaced path node reads (`oam_loader::fs_os_path`), so
+        // an entry named `app.mjs.` fails rather than reading `app.mjs`.
+        let source = std::fs::read_to_string(oam_loader::fs_os_path(path)).map_err(|e| {
             vec![Diagnostic::new(
                 "OAM-RT0002",
                 Severity::Error,
@@ -2140,6 +2142,13 @@ fn run_file(
     // shape) were stashed by main; a direct `oam run` has none.
     let flags = NODE_FLAGS.get().cloned().unwrap_or_default();
     run_file_with_flags(file, script_args, inspect, replay_mode, &flags)
+}
+
+/// Whether `arg` names an existing script file as node's main-entry lookup
+/// sees it: on Windows through the namespaced path, so `app.js.` is not
+/// `app.js` and `NUL` is not the device.
+fn script_is_file(arg: &str) -> bool {
+    oam_engine::module_key(Path::new(arg)).is_ok_and(|key| oam_loader::fs_os_path(&key).is_file())
 }
 
 /// Which loader an entry file goes to, decided on the file's real location

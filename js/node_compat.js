@@ -454,16 +454,14 @@
   /// The path node names in an error oam builds itself, for a path as the
   /// caller passed it: on Windows node's binding reports the RESOLVED path
   /// (`ToNamespacedPath`), so `rmdirSync("file.txt")` fails `rmdir
-  /// 'C:\cwd\file.txt'`. The native ops do the same (oam_core::fs_error_path);
-  /// this is its twin for the errors made in JS. An empty path, and one that
-  /// resolves to two characters or fewer, stay as passed.
+  /// 'C:\cwd\file.txt'`. It is the native ops' own rule
+  /// (oam_core::fs_error_path, via `fsShownPathOf`), so it resolves against
+  /// the process's real cwd as node's binding does, not a patched
+  /// `process.cwd`. An empty path, and one that resolves to two characters
+  /// or fewer, stay as passed.
   function fsErrorPath(path) {
     if (globalThis.__oam.node.platform !== "win32" || path === "") return path;
-    const resolved = registry.get("path").win32.resolve(path);
-    if (resolved.length <= 2) return path;
-    if (resolved.startsWith("\\\\?\\UNC\\")) return "\\\\" + resolved.slice(8);
-    if (resolved.startsWith("\\\\?\\")) return resolved.slice(4);
-    return resolved;
+    return globalThis.__oam.node.fsShownPathOf(path);
   }
 
   /// Buffer/Uint8Array path -> string. Split out so `toPath` reads as a
@@ -1332,6 +1330,9 @@
   });
   codes.ERR_FS_CP_NON_DIR_TO_DIR = E("ERR_FS_CP_NON_DIR_TO_DIR", Error, function(msg) {
     return msg;
+  });
+  codes.ERR_FS_INVALID_SYMLINK_TYPE = E("ERR_FS_INVALID_SYMLINK_TYPE", Error, function(type) {
+    return 'Symlink type must be one of "dir", "file", or "junction". Received "' + type + '"';
   });
   // node's SystemError (lib/internal/errors.js, v22.22.2): the class of the
   // codes node raises for a failure it decides itself but reports in a
@@ -9773,6 +9774,64 @@
     return entries.map((e) => new Dirent(e.name, parent, e.kind));
   }
 
+  // readdir with `recursive`, as node v22.22.2's lib/fs.js and
+  // lib/internal/fs/promises.js walk it. Names come back relative to the
+  // base (`path.relative`), Dirents carry the directory they were read from
+  // as `parentPath`. An entry is descended into when it stats as a directory
+  // (internalModuleStat follows a link to one) -- except a Dirent of
+  // fs.promises.readdir, which only when it IS one, so a link is listed and
+  // not followed there. readdirSync and the callback readdir go breadth
+  // first; fs.promises.readdir takes the last directory found first (it
+  // pops its queue), so its order differs, as node's does.
+  function readdirIsDir(natives, file) {
+    try {
+      return natives.fsStatSync(file, false).kind === "dir";
+    } catch {
+      return false;
+    }
+  }
+  function readdirFound(natives, base, dir, entries, withFileTypes, out, queue, direntFollows = true) {
+    const join = registry.get("path").join;
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (withFileTypes) {
+        const dirent = new Dirent(entry.name, dir, entry.kind);
+        out.push(dirent);
+        if (dirent.isDirectory() || (direntFollows && readdirIsDir(natives, full))) queue.push(full);
+      } else {
+        out.push(registry.get("path").relative(base, full));
+        if (readdirIsDir(natives, full)) queue.push(full);
+      }
+    }
+  }
+  function readdirRecursiveSync(natives, base, withFileTypes) {
+    const out = [];
+    const queue = [base];
+    for (let i = 0; i < queue.length; i++) {
+      readdirFound(natives, base, queue[i], natives.fsReaddirSync(queue[i]), withFileTypes, out, queue);
+    }
+    return out;
+  }
+  async function readdirRecursiveBreadthFirst(natives, base, withFileTypes) {
+    const out = [];
+    const queue = [base];
+    for (let i = 0; i < queue.length; i++) {
+      readdirFound(natives, base, queue[i], await natives.fsReaddir(queue[i]), withFileTypes, out, queue);
+    }
+    return out;
+  }
+  async function readdirRecursiveLastFirst(natives, base, withFileTypes) {
+    const out = [];
+    const pending = [[base, await natives.fsReaddir(base)]];
+    while (pending.length > 0) {
+      const [dir, entries] = pending.pop();
+      const found = [];
+      readdirFound(natives, base, dir, entries, withFileTypes, out, found, false);
+      for (const next of found) pending.push([next, await natives.fsReaddir(next)]);
+    }
+    return out;
+  }
+
   function makeDirent(parentPath, entry) {
     var name = typeof entry === "string" ? entry : entry.name;
     var kind = typeof entry === "object" && entry.kind ? entry.kind : "file";
@@ -10762,6 +10821,28 @@
   // positional argument happened to be. CB_LAST is symlink's rule, which
   // node writes as `makeCallback(arguments[arguments.length - 1])`.
   const CB_LAST = -1;
+  // The link types node's stringToSymlinkType accepts.
+  const SYMLINK_TYPES = ["dir", "file", "junction"];
+
+  // copyFile's mode as node v22.22.2 checks it (the same in all three
+  // forms, measured): none is 0, a non-number is refused, a non-finite one
+  // is out of range, and anything else is truncated and must be 0..7 (the
+  // COPYFILE_EXCL / FICLONE / FICLONE_FORCE bits) -- 1.5 is EXCL, -0.5 is 0,
+  // 2 ** 32 + 1 is out of range.
+  function copyFileMode(mode) {
+    if (mode == null) return 0;
+    if (typeof mode !== "number") {
+      throw Object.assign(new TypeError("mode must be int32 or null/undefined"), { code: "ERR_INVALID_ARG_TYPE" });
+    }
+    if (!Number.isFinite(mode)) {
+      throw Object.assign(new RangeError("mode is out of range"), { code: "ERR_OUT_OF_RANGE" });
+    }
+    const bits = Math.trunc(mode);
+    if (bits < 0 || bits > 7) {
+      throw Object.assign(new RangeError("mode is out of range: >= 0 && <= 7"), { code: "ERR_OUT_OF_RANGE" });
+    }
+    return bits | 0;
+  }
   function callbackSlot(args, required, optional) {
     if (required === CB_LAST) return args.length > 0 ? args.length - 1 : 0;
     const end = required + optional;
@@ -11098,7 +11179,8 @@
     const kept = srcIsDir ? "non-directory" : "directory";
     const copied = srcIsDir ? "directory" : "non-directory";
     if (sync) {
-      const ns = registry.get("path").toNamespacedPath;
+      // The namespaced path node's binding is handed, real cwd and all.
+      const ns = globalThis.__oam.node.fsOsPathOf;
       return makeNodeError(code, `Cannot overwrite ${kept} ${ns(dest)} with ${copied} ${ns(src)}`);
     }
     // EISDIR is 21 and ENOTDIR 20 in every platform's os.constants.errno.
@@ -11115,12 +11197,17 @@
   // fs.promises.cp's is node's SystemError ERR_FS_EISDIR naming the path as
   // given; cpSync's, from its C++, a plain Error with `code` alone naming
   // the path as it reaches the C++ -- on Windows namespaced and with a
-  // trailing separator (`\\?\C:\d\`). Off Windows the path is
-  // rendered as given to the C++, not measured.
+  // trailing separator (`\\?\C:\d\`), added only where the namespaced path
+  // does not already end in one, as a drive or share root's does
+  // (`\\?\UNC\srv\sh\`). Off Windows the path is rendered as given to the
+  // C++, not measured.
   function cpDirWithoutRecursive(src, sync) {
     if (sync) {
-      const pathModule = registry.get("path");
-      const shown = process.platform === "win32" ? pathModule.toNamespacedPath(src) + pathModule.sep : src;
+      let shown = src;
+      if (process.platform === "win32") {
+        shown = globalThis.__oam.node.fsOsPathOf(src);
+        if (!shown.endsWith("\\") && !shown.endsWith("/")) shown += "\\";
+      }
       return makeNodeError("ERR_FS_EISDIR", "Recursive option not enabled, cannot copy a directory: " + shown);
     }
     return new SystemError("ERR_FS_EISDIR", "Path is a directory", {
@@ -11130,6 +11217,85 @@
       errno: 21,
       code: "EISDIR",
     });
+  }
+
+  // Whether two stats name the same file, as node's areIdentical judges it.
+  function cpSameFile(a, b) {
+    return !!(b && b.ino && b.dev && a.ino === b.ino && a.dev === b.dev);
+  }
+
+  // The rest of node's cp path checks, after cpTypeMismatch: a copy onto
+  // itself, and a directory copied into itself. `srcRaw` / `destRaw` are the
+  // two stats (`destRaw` null when there is nothing there); `statOf(p)` is
+  // the stat of `p` or null. Returns the error, or null. Measured on
+  // v22.22.2:
+  //
+  // - cpSync (C++ CpSyncCheckPaths) throws a plain Error with `code` alone,
+  //   on the paths its C++ is handed (namespaced on Windows): "src and dest
+  //   cannot be the same <dest>", and "Cannot copy <src><sep> to a
+  //   subdirectory of self <dest>" when dest's string starts with src's
+  //   plus a separator, or dest's parent is src itself.
+  // - cp and fs.promises.cp (checkPaths, checkParentPaths) throw the
+  //   SystemError ERR_FS_CP_EINVAL naming the paths as given: "src and dest
+  //   cannot be the same", and "cannot copy <src> to a subdirectory of self
+  //   <dest>" when src's resolved components lead dest's, or any directory
+  //   above dest (up to the root, or to src's own parent) is src.
+  //
+  // Both come before the check for a directory copied without `recursive`.
+  // Without them a copy into its own subdirectory never ended.
+  function cpSelfCheck(srcRaw, destRaw, src, dest, sync, statOf) {
+    const path = registry.get("path");
+    if (sync) {
+      const ns = globalThis.__oam.node.fsOsPathOf;
+      const destShown = ns(dest);
+      if (destRaw !== null && cpSameFile(srcRaw, destRaw)) {
+        return makeNodeError("ERR_FS_CP_EINVAL", "src and dest cannot be the same " + destShown);
+      }
+      let srcShown = ns(src);
+      if (!srcShown.endsWith(path.sep)) srcShown += path.sep;
+      const self = () =>
+        makeNodeError("ERR_FS_CP_EINVAL", "Cannot copy " + srcShown + " to a subdirectory of self " + destShown);
+      if (srcRaw.kind === "dir" && destShown.startsWith(srcShown)) return self();
+      const destParent = path.dirname(destShown);
+      if (path.dirname(ns(src)) !== destParent && path.dirname(destParent) !== destParent) {
+        if (cpSameFile(srcRaw, statOf(destParent))) return self();
+      }
+      return null;
+    }
+    const einval = (message) =>
+      new SystemError("ERR_FS_CP_EINVAL", "Invalid src or dest", {
+        message,
+        path: dest,
+        syscall: "cp",
+        errno: 22,
+        code: "EINVAL",
+      });
+    if (destRaw !== null && cpSameFile(srcRaw, destRaw)) return einval("src and dest cannot be the same");
+    const self = () => einval(`cannot copy ${src} to a subdirectory of self ${dest}`);
+    if (srcRaw.kind === "dir") {
+      const srcParts = path.resolve(src).split(path.sep).filter(Boolean);
+      const destParts = path.resolve(dest).split(path.sep).filter(Boolean);
+      if (srcParts.every((part, i) => destParts[i] === part)) return self();
+    }
+    const srcParent = path.resolve(path.dirname(src));
+    let destParent = path.resolve(path.dirname(dest));
+    while (destParent !== srcParent && destParent !== path.parse(destParent).root) {
+      const parentRaw = statOf(destParent);
+      if (parentRaw === null) break;
+      if (cpSameFile(srcRaw, parentRaw)) return self();
+      destParent = path.resolve(path.dirname(destParent));
+    }
+    return null;
+  }
+
+  // The stat of `p` for cpSelfCheck's parent walk, null when it is not there.
+  function cpStatOrNull(natives, p) {
+    try {
+      return natives.fsStatSync(p, false);
+    } catch (e) {
+      if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return null;
+      throw e;
+    }
   }
 
   // The destination's stat for cpTypeMismatch: lstat, as node's (stat with
@@ -11170,13 +11336,20 @@
     const withPath = (fn) =>
       Object.defineProperty((path, ...rest) => fn(toPath(path), ...rest), "length", { value: fn.length });
     // fs/promises.cp over two validated paths.
-    async function cpRecursive(srcStr, destStr, options) {
+    async function cpRecursive(srcStr, destStr, options, nested) {
       var opts = options || {};
       var raw = await natives.fsStat(srcStr, false);
+      var destRaw = await cpDestStat(natives, destStr, opts);
       // A directory onto a file, or a file onto a directory: node's coded
       // errors, before anything is copied.
-      var mismatch = cpTypeMismatch(raw.kind === "dir", await cpDestStat(natives, destStr, opts), srcStr, destStr, false);
+      var mismatch = cpTypeMismatch(raw.kind === "dir", destRaw, srcStr, destStr, false);
       if (mismatch !== null) throw mismatch;
+      // node's checks of a copy onto or into itself, once, on the paths the
+      // call was given.
+      if (!nested) {
+        var self = cpSelfCheck(raw, destRaw, srcStr, destStr, false, (p) => cpStatOrNull(natives, p));
+        if (self !== null) throw self;
+      }
       if (raw.kind === "dir") {
         if (!opts.recursive) throw cpDirWithoutRecursive(srcStr, false);
         try { await natives.fsMkdir(destStr, true); } catch (e) {}
@@ -11185,7 +11358,7 @@
         // them with the platform's separator.
         var join = registry.get("path").join;
         for (var i = 0; i < entries.length; i++) {
-          await cpRecursive(join(srcStr, entries[i].name), join(destStr, entries[i].name), opts);
+          await cpRecursive(join(srcStr, entries[i].name), join(destStr, entries[i].name), opts, true);
         }
       } else {
         await natives.fsCopyFile(srcStr, destStr);
@@ -11245,7 +11418,8 @@
       lstat: withPath(async (file) => wrapStat(await natives.fsStat(file, true))),
       statfs: withPath(async (file, options) => wrapStatFs(await natives.fsStatfs(file), options)),
       readdir: withPath(async (file, options) => {
-        const { withFileTypes } = readOptions(options);
+        const { withFileTypes, recursive } = readOptions(options);
+        if (recursive === true) return readdirRecursiveLastFirst(natives, file, withFileTypes === true);
         const entries = await natives.fsReaddir(file);
         return wrapDirents(file, entries, withFileTypes === true);
       }),
@@ -11284,7 +11458,11 @@
       }),
       unlink: (path) => natives.fsUnlink(toPath(path)),
       rename: (from, to) => natives.fsRename(toPath(from, "oldPath"), toPath(to, "newPath")),
-      copyFile: (from, to) => natives.fsCopyFile(toPath(from, "src"), toPath(to, "dest")),
+      copyFile: (from, to, mode) => {
+        const src = toPath(from, "src");
+        const dest = toPath(to, "dest");
+        return natives.fsCopyFile(src, dest, copyFileMode(mode));
+      },
       // node v22's fs.promises.glob returns an AsyncIterable, not a Promise.
       // Wrap the materialized array so Array.fromAsync() works on both sides.
       glob: (pattern, options) => globAsyncIterable(globSyncRaw(pattern, options, natives)),
@@ -11298,7 +11476,17 @@
         const [valid, encoding] = mkdtempArgs(prefix, options);
         return natives.fsMkdtemp(valid).then((dir) => mkdtempResult(dir, encoding));
       },
-      symlink: (target, path) => natives.fsSymlink(toPath(target, "target"), toPath(path)),
+      // node's promise symlink reads any non-string type as none (and on
+      // Windows probes the target), and refuses a string outside the three.
+      symlink: (target, path, type) => {
+        const kind = typeof type === "string" ? type : null;
+        const validTarget = toPath(target, "target");
+        const validPath = toPath(path);
+        if (kind !== null && !SYMLINK_TYPES.includes(kind)) {
+          return Promise.reject(codes.ERR_FS_INVALID_SYMLINK_TYPE(kind));
+        }
+        return natives.fsSymlink(validTarget, validPath, kind);
+      },
       readlink: (path) => natives.fsReadlink(toPath(path)),
       link: (existing, newPath) =>
         natives.fsLink(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
@@ -11784,6 +11972,18 @@
       return value === (value | 0);
     }
 
+    // The native realpath's answer as node's JS realpath (realpathSync and
+    // the callback realpath, not their `.native` forms or the promise one)
+    // gives it: on Windows that walk starts from path.win32.resolve, which
+    // keeps a UNC share root's trailing separator, so `\\srv\sh` is
+    // `\\srv\sh\` there (measured on v22.22.2) where the native says
+    // `\\srv\sh`. Every other result is the same in both.
+    function realpathJsShape(resolved) {
+      if (process.platform !== "win32" || typeof resolved !== "string") return resolved;
+      const unc = /^\\\\([^\\/]+)\\([^\\/]+)$/.exec(resolved);
+      return unc && unc[1] !== "." && unc[1] !== "?" ? resolved + "\\" : resolved;
+    }
+
     // node's realpath / realpathSync argument: a file: URL becomes its path,
     // anything else is stringified (`p += ''`), and a NUL byte is refused.
     function realpathArg(path) {
@@ -11808,7 +12008,7 @@
 
     async function realpathWalking(path) {
       try {
-        return await natives.fsRealpath(path);
+        return realpathJsShape(await natives.fsRealpath(path));
       } catch (original) {
         // A failing lstat / readlink rejects with its own error.
         const walk = realpathWalk(path);
@@ -12022,7 +12222,21 @@
       try {
         prevMtime = natives.fsStatSync(filePath, false).mtimeMs;
       } catch (e) {
-        // file may not exist yet
+        // node starts its watcher at the call, and a path that cannot be
+        // watched -- one that is not there -- throws then, as libuv's error
+        // for syscall `watch`, naming the path as given and carrying it as
+        // `filename` too (measured on v22.22.2: `ENOENT: no such file or
+        // directory, watch 'nope'`). Anything else (a refused permission)
+        // is thrown as it is.
+        if (!e || typeof e.errno !== "number" || typeof e.code !== "string") throw e;
+        const reason = /^[A-Z0-9_]+: (.*), stat /.exec(String(e.message));
+        const err = new Error(`${e.code}: ${reason ? reason[1] : e.code}, watch '${filePath}'`);
+        err.errno = e.errno;
+        err.syscall = "watch";
+        err.code = e.code;
+        err.path = filePath;
+        err.filename = filePath;
+        throw err;
       }
       var pollInterval = opts.interval || 100;
       var poll = setInterval(function () {
@@ -12141,6 +12355,47 @@
     // realpathArg runs inside, so the callback is checked before the path.
     const realpathByPath = callbackify1((p) => realpathWalking(realpathArg(p)), 1);
     const mkdtempByPrefix = callbackify1(promises.mkdtemp, 1, 1);
+    const symlinkByCallback = callbackify1(promises.symlink, CB_LAST);
+    const readdirByPath = callbackify1(promises.readdir, 1, 1);
+    const readdirBreadthFirstByPath = callbackify1(
+      (path, options) =>
+        readdirRecursiveBreadthFirst(natives, toPath(path), readOptions(options).withFileTypes === true),
+      1,
+      1,
+    );
+    // cpSync over two validated paths; `top` runs node's path checks, which
+    // node makes once, on the paths the call was given.
+    function cpSyncWalk(srcStr, destStr, opts, top) {
+      var raw = natives.fsStatSync(srcStr, false);
+      var destRaw = cpDestStatSync(natives, destStr, opts);
+      // A copy onto itself is never a type mismatch, so the self checks can
+      // follow that one and still come first for it.
+      var mismatch = cpTypeMismatch(raw.kind === "dir", destRaw, srcStr, destStr, true);
+      if (mismatch !== null) throw mismatch;
+      if (top) {
+        // The C++ stops its parent walk on any error, not only a missing path.
+        var statOf = (p) => {
+          try {
+            return natives.fsStatSync(p, false);
+          } catch (e) {
+            return null;
+          }
+        };
+        var self = cpSelfCheck(raw, destRaw, srcStr, destStr, true, statOf);
+        if (self !== null) throw self;
+      }
+      if (raw.kind === "dir") {
+        if (!opts.recursive) throw cpDirWithoutRecursive(srcStr, true);
+        try { natives.fsMkdirSync(destStr, true); } catch (e) {}
+        var entries = natives.fsReaddirSync(srcStr);
+        var join = registry.get("path").join;
+        for (var i = 0; i < entries.length; i++) {
+          cpSyncWalk(join(srcStr, entries[i].name), join(destStr, entries[i].name), opts, false);
+        }
+      } else {
+        natives.fsCopyFileSync(srcStr, destStr);
+      }
+    }
     const truncateByPath = callbackify1(promises.truncate, 2);
     const chmodByPath = callbackify1(promises.chmod, 2);
 
@@ -12229,7 +12484,8 @@
       lstatSync: (path) => wrapStat(natives.fsStatSync(toPath(path), true)),
       statfsSync: (path, options) => wrapStatFs(natives.fsStatfsSync(toPath(path)), options),
       readdirSync: (path, options) => {
-        const { withFileTypes } = readOptions(options);
+        const { withFileTypes, recursive } = readOptions(options);
+        if (recursive === true) return readdirRecursiveSync(natives, toPath(path), withFileTypes === true);
         return wrapDirents(
           toPath(path),
           natives.fsReaddirSync(toPath(path)),
@@ -12283,14 +12539,18 @@
       unlinkSync: (path) => natives.fsUnlinkSync(toPath(path)),
       renameSync: (from, to) =>
         natives.fsRenameSync(toPath(from, "oldPath"), toPath(to, "newPath")),
-      copyFileSync: (from, to) => natives.fsCopyFileSync(toPath(from, "src"), toPath(to, "dest")),
+      copyFileSync: (from, to, mode) => {
+        const src = toPath(from, "src");
+        const dest = toPath(to, "dest");
+        return natives.fsCopyFileSync(src, dest, copyFileMode(mode));
+      },
       accessSync: (path, mode) => natives.fsAccessSync(toPath(path), mode ?? 0),
       // node's realpathSync stringifies rather than type-checks (`p += ''`),
       // and on failure reports what its component walk hit (realpathWalk).
       realpathSync: (path) => {
         const file = realpathArg(path);
         try {
-          return natives.fsRealpathSync(file);
+          return realpathJsShape(natives.fsRealpathSync(file));
         } catch (e) {
           throw realpathWalkErrorSync(file, e);
         }
@@ -12299,7 +12559,18 @@
         const [valid, encoding] = mkdtempArgs(prefix, options);
         return mkdtempResult(natives.fsMkdtempSync(valid), encoding);
       },
-      symlinkSync: (target, path) => natives.fsSymlinkSync(toPath(target, "target"), toPath(path)),
+      // node's symlinkSync reads any non-string type as none (and on Windows
+      // probes the target), and a string must be one of the three (node
+      // v22.22.2 lib/fs.js, stringToSymlinkType).
+      symlinkSync: (target, path, type) => {
+        const kind = typeof type === "string" ? type : null;
+        const validTarget = toPath(target, "target");
+        const validPath = toPath(path);
+        if (kind !== null && !SYMLINK_TYPES.includes(kind)) {
+          throw codes.ERR_FS_INVALID_SYMLINK_TYPE(kind);
+        }
+        return natives.fsSymlinkSync(validTarget, validPath, kind);
+      },
       readlinkSync: (path) => natives.fsReadlinkSync(toPath(path)),
       linkSync: (existing, newPath) =>
         natives.fsLinkSync(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
@@ -12381,24 +12652,8 @@
         var dirPath = toPath(path);
         return new Dir(dirPath, natives.fsReaddirSync(dirPath));
       },
-      cpSync: function cpSyncRecursive(src, dest, options) {
-        var srcStr = toPath(src, "src");
-        var destStr = toPath(dest, "dest");
-        var opts = options || {};
-        var raw = natives.fsStatSync(srcStr, false);
-        var mismatch = cpTypeMismatch(raw.kind === "dir", cpDestStatSync(natives, destStr, opts), srcStr, destStr, true);
-        if (mismatch !== null) throw mismatch;
-        if (raw.kind === "dir") {
-          if (!opts.recursive) throw cpDirWithoutRecursive(srcStr, true);
-          try { natives.fsMkdirSync(destStr, true); } catch (e) {}
-          var entries = natives.fsReaddirSync(srcStr);
-          var join = registry.get("path").join;
-          for (var i = 0; i < entries.length; i++) {
-            cpSyncRecursive(join(srcStr, entries[i].name), join(destStr, entries[i].name), opts);
-          }
-        } else {
-          natives.fsCopyFileSync(srcStr, destStr);
-        }
+      cpSync: function cpSync(src, dest, options) {
+        cpSyncWalk(toPath(src, "src"), toPath(dest, "dest"), options || {}, true);
       },
 
       readFile: function (path, options, cb) {
@@ -12423,7 +12678,12 @@
       stat: callbackify1(promises.stat, 1, 1),
       lstat: callbackify1(promises.lstat, 1, 1),
       statfs: callbackify1(promises.statfs, 1, 1),
-      readdir: callbackify1(promises.readdir, 1, 1),
+      // With `recursive`, node's callback readdir walks breadth first, as
+      // readdirSync does; fs.promises.readdir does not.
+      readdir: function readdir(path, options, callback) {
+        const opts = typeof options === "function" ? undefined : options;
+        return (readOptions(opts).recursive === true ? readdirBreadthFirstByPath : readdirByPath)(...arguments);
+      },
       glob: callbackify1(promises._globAsPromise, 1, 1),
       mkdir: callbackify1(promises.mkdir, 1, 1),
       // node's rm (lib/fs.js, v22.22.2) validates the path and its options
@@ -12461,7 +12721,17 @@
       mkdtemp: function mkdtemp(prefix, options, callback) {
         return mkdtempByPrefix(...arguments);
       },
-      symlink: callbackify1(promises.symlink, CB_LAST),
+      // node's callback symlink throws a bad type string synchronously,
+      // after the callback and the two paths are checked.
+      symlink: function symlink(target, path, type, callback) {
+        if (typeof type === "string" && !SYMLINK_TYPES.includes(type)) {
+          validateCb(arguments[arguments.length - 1], "cb");
+          toPath(target, "target");
+          toPath(path);
+          throw codes.ERR_FS_INVALID_SYMLINK_TYPE(type);
+        }
+        return symlinkByCallback(...arguments);
+      },
       readlink: callbackify1(promises.readlink, 1, 1),
       link: callbackify1(promises.link, 2),
       // node's chmod checks the path and the mode before the callback.
@@ -13318,9 +13588,19 @@
       }
       return prop;
     };
+    // Windows hides a name that starts with '=' (`=C:` is drive C's cwd,
+    // updated by every chdir): node's enumerator skips it, so it is not in
+    // Object.keys(process.env) and a child handed process.env does not get
+    // it, yet a read of it goes to the LIVE environment (process.env['=C:']
+    // after process.chdir('C:\\Users') is 'C:\\Users'). natives.env() leaves
+    // these out, and natives.envHidden reads (or deletes) one live. node's
+    // setter ignores such a name, so an assignment stores nothing.
+    const envHidden = (prop) =>
+      envCaseFold && typeof prop === "string" && prop.charCodeAt(0) === 61; // '='
     const env = new Proxy(Object.create(null), {
       get(_, prop) {
         if (typeof prop === "symbol") return undefined;
+        if (envHidden(prop)) return natives.envHidden(prop, false);
         const store = ensureEnv();
         return store[envResolveKey(store, prop)];
       },
@@ -13353,9 +13633,11 @@
             "DEP0104",
           );
         }
+        const text = String(value);
+        if (envHidden(prop)) return true;
         const store = ensureEnv();
         const key = envResolveKey(store, prop);
-        store[key] = String(value);
+        store[key] = text;
         // TZ is not just a string: Node re-reads the zone on assignment so
         // subsequent Dates render in it. Without this the variable changed
         // and every Date kept the zone the process started in.
@@ -13364,6 +13646,7 @@
       },
       has(_, prop) {
         if (typeof prop === "symbol") return false;
+        if (envHidden(prop)) return natives.envHidden(prop, false) !== undefined;
         const store = ensureEnv();
         // `in` on process.env reports only real variables (node: an
         // inherited name like 'hasOwnProperty' is NOT in process.env).
@@ -13371,6 +13654,10 @@
       },
       deleteProperty(_, prop) {
         if (typeof prop === "symbol") return true;
+        if (envHidden(prop)) {
+          natives.envHidden(prop, true);
+          return true;
+        }
         const store = ensureEnv();
         const key = envResolveKey(store, prop);
         delete store[key];
@@ -13406,13 +13693,20 @@
         if (typeof prop === "symbol") {
           throw new TypeError("Cannot convert a Symbol value to a string");
         }
-        ensureEnv()[prop] = String(desc.value);
+        const text = String(desc.value);
+        if (envHidden(prop)) return true;
+        ensureEnv()[prop] = text;
         return true;
       },
       ownKeys() { return Reflect.ownKeys(ensureEnv()); },
       getOwnPropertyDescriptor(_, prop) {
-        const obj = ensureEnv();
         if (typeof prop === "symbol") return undefined;
+        if (envHidden(prop)) {
+          const live = natives.envHidden(prop, false);
+          if (live === undefined) return undefined;
+          return { value: live, writable: true, enumerable: true, configurable: true };
+        }
+        const obj = ensureEnv();
         // OWN properties only: `prop in obj` walks the prototype chain, so an
         // inherited name reported as own -- node asserts
         // Object.hasOwn(process.env, 'hasOwnProperty') === false while
@@ -14567,7 +14861,7 @@
             throw makeSystemError("ENOENT", "open", given === null ? ".env" : fsErrorPath(given));
           }
           if (e && typeof e.code === "string" && typeof e.syscall === "string") {
-            var opened = given === null ? ".env" : registry.get("path").toNamespacedPath(given);
+            var opened = given === null ? ".env" : globalThis.__oam.node.fsOsPathOf(given);
             var bad = new TypeError("Contents of '" + opened + "' should be a valid string.");
             bad.code = "ERR_INVALID_ARG_TYPE";
             throw bad;

@@ -314,13 +314,14 @@ fn op_read_text_file(
         scope.throw_exception(exception);
         return;
     };
-    let path = path.to_rust_string_lossy(scope);
-    // Permission gate: read access for this path.
+    // The path as an fs op takes it (`FsPath`: namespaced on Windows), so
+    // the path the permission check judges is the path that is read.
+    let path = oam_core::FsPath::new(path.to_rust_string_lossy(scope));
     if let Err(denial) = scope
         .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
         .cloned()
         .unwrap_or_default()
-        .check_read(&path)
+        .check_read_path(&path)
     {
         crate::node_ops::throw_permission_denied(scope, &denial);
         return;
@@ -1294,8 +1295,10 @@ fn op_fork_spawn(
             .map(|s| s.to_rust_string_lossy(scope))
     };
 
+    // Tested on the namespaced path the child's loader opens, as the worker
+    // gate is (`op_worker_new`).
     let path = std::path::PathBuf::from(&script_path);
-    if !path.is_file() {
+    if !std::path::Path::new(oam_core::FsPath::new(script_path.clone()).os()).is_file() {
         let msg = v8::String::new(
             scope,
             &format!("forkSpawn: script not found: {script_path}"),

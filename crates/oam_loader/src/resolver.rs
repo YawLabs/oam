@@ -163,7 +163,7 @@ impl Resolver {
                 return false;
             }
         }
-        if path.is_file() {
+        if crate::pathutil::is_file(path) {
             self.negative_probes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -207,6 +207,7 @@ impl Resolver {
         specifier: &str,
         referrer: &Path,
     ) -> Result<PathBuf, Diagnostic> {
+        let specifier = &*url_specifier_input(specifier);
         // Shapes that are invalid as ESM specifiers everywhere — npm resolution
         // will never fix these, so they get their own diagnostic, not MOD0002.
         if specifier.is_empty() || specifier == "." || specifier == ".." || specifier.contains('\\')
@@ -340,6 +341,39 @@ impl Resolver {
     }
 }
 
+/// An import specifier node resolves as a URL -- a relative one (`./`,
+/// `../`, `/`, resolved against the importer's URL) or a `file:` URL -- with
+/// the WHATWG URL parser's input clean-up applied: leading and trailing C0
+/// controls and spaces dropped and every tab, LF and CR removed. Measured on
+/// node v22.22.2: `import("./esm.mjs ")`, `import("./es\tm.mjs")` and
+/// `import(" file:///.../esm.mjs")` all load `esm.mjs`, while
+/// `import(" ./esm.mjs")` (not relative, so a bare name) and a bare
+/// specifier are left alone. Before the resolver probed the namespaced path
+/// a trailing space reached Win32, which dropped it.
+fn url_specifier_input(specifier: &str) -> std::borrow::Cow<'_, str> {
+    let c0_or_space = |c: char| c <= ' ';
+    let leading_trimmed = specifier.trim_start_matches(c0_or_space);
+    let url = if leading_trimmed
+        .get(..5)
+        .is_some_and(|p| p.eq_ignore_ascii_case("file:"))
+    {
+        leading_trimmed
+    } else if specifier.starts_with("./")
+        || specifier.starts_with("../")
+        || specifier.starts_with('/')
+    {
+        specifier
+    } else {
+        return std::borrow::Cow::Borrowed(specifier);
+    };
+    let url = url.trim_end_matches(c0_or_space);
+    if url.contains(['\t', '\n', '\r']) {
+        std::borrow::Cow::Owned(url.replace(['\t', '\n', '\r'], ""))
+    } else {
+        std::borrow::Cow::Borrowed(url)
+    }
+}
+
 // ── Thread-local default Resolver ────────────────────────────────────────
 //
 // The free functions in `oam_loader` (the existing public API) need a
@@ -389,6 +423,29 @@ pub fn default_clear_caches() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_url_specifier_gets_the_url_parsers_input_clean_up() {
+        for (input, cleaned) in [
+            ("./esm.mjs ", "./esm.mjs"),
+            ("./esm.mjs\t", "./esm.mjs"),
+            ("./es\tm.mjs", "./esm.mjs"),
+            ("./es\nm.mjs", "./esm.mjs"),
+            ("./esm.mjs\u{1}", "./esm.mjs"),
+            ("../x.mjs  ", "../x.mjs"),
+            ("/x.mjs ", "/x.mjs"),
+            (" file:///C:/x.mjs ", "file:///C:/x.mjs"),
+            ("./esm.mjs.", "./esm.mjs."),
+            (" ./esm.mjs", " ./esm.mjs"),
+            ("pkg ", "pkg "),
+        ] {
+            assert_eq!(url_specifier_input(input), cleaned, "{input:?}");
+        }
+        assert!(matches!(
+            url_specifier_input("./esm.mjs"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
 
     #[test]
     fn clear_caches_is_not_undone_by_a_stale_backfill() {

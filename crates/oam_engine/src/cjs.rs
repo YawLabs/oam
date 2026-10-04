@@ -381,7 +381,8 @@ pub(crate) fn load_cjs<'s>(
                 );
                 return None;
             }
-            let exports_value = crate::napi::load_addon(scope, &key)?;
+            // node's `.node` loader hands dlopen `path.toNamespacedPath(filename)`.
+            let exports_value = crate::napi::load_addon(scope, &oam_loader::fs_os_path(&key))?;
             let module = v8::Object::new(scope);
             let exports_key = v8::String::new(scope, "exports")?;
             module.set(scope, exports_key.into(), exports_value);
@@ -408,7 +409,9 @@ pub(crate) fn load_cjs<'s>(
     // oxc inline, storing the fresh output for the next run.
     let needs_transpile = oam_loader::is_transpiled_source(&key);
 
-    let raw = match std::fs::read_to_string(&key) {
+    // The namespaced path node's loader reads (`oam_loader::fs_os_path`): a
+    // key named `app.js.` reads that name, not `app.js`.
+    let raw = match std::fs::read_to_string(oam_loader::fs_os_path(&key)) {
         Ok(source) => source,
         Err(e) => {
             throw_error(scope, &format!("cannot read {file}: {e}"));

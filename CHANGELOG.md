@@ -44,6 +44,18 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   `WebSocket` through undici's `Agent({ connect: { socketPath } })` (or any custom `connect`)
   is checked against its URL's `host:port` too, so it needs that host's grant as well. Node 22
   does not gate pipes; see docs/node-divergences.md, entry 50. (#219)
+- **Permission matching on Windows now follows node's resolve.** An fs op is checked on the
+  path it hands the OS -- resolved against the cwd and `\\?\`-prefixed, as node's binding
+  computes it -- and the `ERR_ACCESS_DENIED` `resource` names that path (`\\?\C:\work\x`), as
+  node's does. Names compare case-sensitively, as node's do (`c:\work\x` is not under a grant
+  of `C:\work`); a trailing dot or space is part of a name (`allowed.\x` is not under
+  `allowed`); a UNC path `\\srv\sh\x` and the rooted path `\srv\sh\x` are different paths; a
+  grant of `\` or `/` is the cwd drive's root; and a `\\.\` device path, a `\\?\` path in
+  neither drive nor UNC form, or a path judged as given that is spelt with the NT prefix
+  `\??\` (the `mkdtemp` template, a pipe path, the child, worker and addon lists) matches no
+  grant. `oam.readTextFile` is checked the same way. A scoped `permissions.query` of a
+  child-process, worker or addon list grant matches the path as that permission's check does
+  (a path under a granted directory is granted), where it used to compare the strings. (#275)
 
 ### Added
 
@@ -243,6 +255,48 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 - **The npm undici's `fetch` never delivered a MockAgent reply's body**: `stream.finished()` on a
   web stream threw and `performance.markResourceTiming()` was missing. (#206)
 - **`console.table`** draws node's table, and a `new Console()` has `table()`.
+- **On Windows, fs paths reach the OS namespaced, as node's do.** Every path-taking fs op,
+  the module loader (`require`, `import`, the main entry), `oam.readTextFile` and native addon
+  loading hand the OS `path.toNamespacedPath(p)` -- resolved against the cwd and prefixed
+  `\\?\` -- so Win32 path normalisation no longer applies: `readFileSync("sub/")` fails
+  `EISDIR` `read`; `NUL`, `COM1` and a name with a trailing dot or space (`.env.`, `.env `)
+  are files that do not exist (`ENOENT`) rather than the device or `.env`;
+  `writeFileSync("g.txt.")` creates `g.txt.`; `require("./mod.js.")` fails
+  `MODULE_NOT_FOUND`. A symlink's target is stored as node stores it, and whether it is a
+  directory link is decided by the target beside the link, not in the cwd. Errors name the
+  path with the prefix taken off and never resolved again (`mkdirSync("C:\\")` says `'C:\'`,
+  not `'C:'`), a patched `process.cwd` no longer changes any fs error, `realpath` and
+  `readlink` show a UNC result as `\\srv\sh\x` (and `realpathSync` / callback `realpath` a
+  share root as `\\srv\sh\`, as node's JS realpath does), and an ESM specifier gets the URL
+  parser's clean-up (`import("./x.mjs ")` loads `x.mjs`, as on node). A script that relied on that
+  normalisation now fails as it does under node. `process.chdir` records the new cwd in its
+  drive's `=X:` variable, as libuv's `uv_chdir` does, so a drive-relative `C:name` resolves
+  against the directory the process moved to, not the one it was launched in. A drive or
+  share root (`C:\`, `\`, `/`, `\\srv\sh`) fails as a directory, not `ENOENT`:
+  `readFileSync` fails `EISDIR` `read` and `writeFileSync`, `appendFileSync` and a write
+  `openSync` fail `EPERM` naming the root. `fs.symlink`, `fs.symlinkSync` and
+  `fs.promises.symlink` honour the type argument: only a missing (non-string) type probes the
+  target, so `'file'` makes a file link even to a directory, `'dir'` a directory link to a
+  target not made yet, `'junction'` stores the target resolved against the link's parent, and
+  a type outside the three fails `ERR_FS_INVALID_SYMLINK_TYPE`. `new Worker(path)` tests that
+  its script exists on the namespaced path its loader opens, so `w.js.` is not found when only
+  `w.js` exists, and a file named `x.js.` is. (#275)
+- **`fs.copyFile`, `copyFileSync` and `fs.promises.copyFile` honour their mode.**
+  `COPYFILE_EXCL` fails `EEXIST` instead of overwriting the destination; a mode that is not
+  a number, not finite or outside 0..7 fails `ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE`
+  before any path is touched; on Windows `COPYFILE_FICLONE_FORCE` fails `ENOSYS`, as node's
+  does.
+- **`fs.cpSync`, `fs.cp` and `fs.promises.cp` refuse a copy onto itself or into itself**
+  with node's `ERR_FS_CP_EINVAL` ("src and dest cannot be the same", "... to a subdirectory
+  of self ..."), before anything is made. A directory copied into its own subdirectory used to
+  be copied until the process was killed, and a file copied onto itself failed `EBUSY`.
+- **`fs.readdirSync`, `fs.readdir` and `fs.promises.readdir` honour `recursive`**: every entry
+  below the directory, named relative to it (or as Dirents with their `parentPath`), in node's
+  order -- breadth first for the sync and callback forms, the last directory found first for
+  the promise one. They used to list the top level only.
+- **`fs.watch` of a path that is not there throws** `ENOENT: no such file or directory, watch
+  '<path>'` at the call, with `path` and `filename` set, as node's does, instead of handing
+  back a watcher that never fires.
 - **`OAM-TEST0003` carries `"origin": "test"`**, the origin of its code family; it was emitted
   with `"origin": "runtime"`. Every `OAM-RT*` code keeps `runtime`.
 - **The MCP server's `oam_explain` knows every code oam emits.** `OAM-TS0002`, `OAM-TS0005`

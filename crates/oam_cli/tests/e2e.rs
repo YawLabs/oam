@@ -35909,3 +35909,162 @@ fn a_negative_descriptor_never_reaches_stdin() {
         "nothing was written to stdin"
     );
 }
+
+// process.chdir updates the drive's hidden `=X:` variable, as libuv's
+// uv_chdir does (src/win/util.c). The namespaced fs paths resolve a
+// drive-relative `X:name` against `=X:` first, as node's resolve does, so a
+// chdir that left `=X:` behind made every `X:name` op, its permission check
+// and its error name the directory the process was launched with: cmd.exe
+// hands each child `=C:`, and statSync('C:Public') after
+// process.chdir('C:\\Users') looked in C:\Windows. Measured on node v22.22.2:
+// the stat finds the file in the new cwd, and a miss names the new cwd.
+#[cfg(windows)]
+#[test]
+fn chdir_moves_the_drive_cwd_that_drive_relative_paths_use() {
+    let dir = write_temp("chdir_drive_cwd/target/probe.txt", "p")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let stale = write_temp("chdir_drive_cwd/stale/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let script = write_temp(
+        "chdir_drive_cwd/main.cjs",
+        "const fs = require('fs');\n\
+         const dir = require('path').resolve(process.argv[2]);\n\
+         process.chdir(dir);\n\
+         const drive = dir.slice(0, 2);\n\
+         console.log('found ' + fs.statSync(drive + 'probe.txt').size);\n\
+         try { fs.statSync(drive + 'missing.txt'); console.log('missing found'); }\n\
+         catch (e) { console.log('missing ' + (e.path === dir + '\\\\missing.txt')); }\n",
+    );
+    let dir_s = dir.to_str().unwrap();
+    let drive_var = format!("={}", dir_s[..2].to_ascii_uppercase());
+    let out = bounded_output(
+        oam_command(&[script.to_str().unwrap(), dir_s]).env(&drive_var, stale.to_str().unwrap()),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(
+        stdout,
+        "found 1\nmissing true\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// process.env and the hidden `=X:` drive-cwd variables, as node has them
+// (node_env_var.cc; measured on v22.22.2): the names are not enumerated, a
+// read goes to the live environment -- so it follows a chdir -- an assignment
+// is ignored and a delete removes the variable. A child is built from the env
+// object it is handed, so it has no `=X:` unless that object names one. oam
+// enumerated `=X:` from a startup snapshot: it read stale after a chdir, and
+// every child (default, `env: process.env`, an explicit env without it, and a
+// fork) inherited the stale value.
+#[cfg(windows)]
+#[test]
+fn process_env_hides_the_drive_cwd_variables_and_reads_them_live() {
+    let dir = write_temp("env_drive_cwd/target/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let stale = write_temp("env_drive_cwd/stale/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    write_temp(
+        "env_drive_cwd/forked.cjs",
+        "console.log('fork ' + JSON.stringify(process.env[process.argv[2]]));\n",
+    );
+    let script = write_temp(
+        "env_drive_cwd/main.cjs",
+        "const { spawnSync, spawn, fork } = require('child_process');\n\
+         const path = require('path');\n\
+         const dir = path.resolve(process.argv[2]);\n\
+         const stale = process.argv[3];\n\
+         const name = '=' + dir.slice(0, 2).toUpperCase();\n\
+         const lower = name.toLowerCase();\n\
+         console.log('start ' + (process.env[name] === stale) + ' ' + (process.env[lower] === stale));\n\
+         console.log('keys ' + Object.keys(process.env).filter((k) => k[0] === '=').length);\n\
+         console.log('own ' + Object.hasOwn(process.env, name) + ' ' + (name in process.env));\n\
+         process.chdir(dir);\n\
+         console.log('live ' + (process.env[name] === dir));\n\
+         process.env[name] = stale;\n\
+         process.env['=OAMTEST'] = 'x';\n\
+         console.log('set ' + (process.env[name] === dir) + ' ' + process.env['=OAMTEST']);\n\
+         const code = 'console.log(JSON.stringify(process.env[process.argv[1]]))';\n\
+         const run = (label, opts) => {\n\
+           const r = spawnSync(process.execPath, ['-e', code, name], { encoding: 'utf8', ...opts });\n\
+           console.log(label + ' ' + (r.stdout + r.stderr).trim());\n\
+         };\n\
+         run('default', {});\n\
+         run('env', { env: process.env });\n\
+         run('plain', { env: { SystemRoot: process.env.SystemRoot } });\n\
+         run('named', { env: { ...process.env, [name]: 'C:\\\\named' } });\n\
+         const c = spawn(process.execPath, ['-e', code, name]);\n\
+         let out = '';\n\
+         c.stdout.on('data', (d) => (out += d));\n\
+         c.on('close', () => {\n\
+           console.log('async ' + out.trim());\n\
+           const f = fork(path.join(__dirname, 'forked.cjs'), [name], { stdio: ['pipe', 'inherit', 'inherit', 'ipc'] });\n\
+           f.on('exit', () => {\n\
+             delete process.env[name];\n\
+             console.log('deleted ' + process.env[name] + ' ' + (name in process.env));\n\
+           });\n\
+         });\n",
+    );
+    let dir_s = dir.to_str().unwrap();
+    let drive_var = format!("={}", dir_s[..2].to_ascii_uppercase());
+    let out = bounded_output(
+        oam_command(&[script.to_str().unwrap(), dir_s, stale.to_str().unwrap()])
+            .env(&drive_var, stale.to_str().unwrap()),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(
+        stdout,
+        "start true true\nkeys 0\nown true true\nlive true\nset true undefined\n\
+         default undefined\nenv undefined\nplain undefined\nnamed \"C:\\\\named\"\n\
+         async undefined\nfork undefined\ndeleted undefined false\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// The worker and fork entry gates test the script on the namespaced path
+// the loader then opens, so a trailing dot stays in the name for both. The
+// gates used to test the raw path, which Win32 trims: with only `w.js` on
+// disk `new Worker('w.js.')` passed (and failed later in the loader), and a
+// file really named `x.js.` was "not found". node v22.22.2 fails `w.js.` as
+// a missing module and finds `x.js.`.
+#[cfg(windows)]
+#[test]
+fn worker_and_fork_entry_gates_test_the_namespaced_path() {
+    let dir = write_temp("worker_gate_ns/w.js", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let script = write_temp(
+        "worker_gate_ns/main.cjs",
+        "const fs = require('fs');\n\
+         const path = require('path');\n\
+         const { Worker } = require('worker_threads');\n\
+         const dir = path.resolve(process.argv[2]);\n\
+         fs.writeFileSync('\\\\\\\\?\\\\' + path.join(dir, 'x.js.'), '');\n\
+         for (const name of ['w.js.', 'x.js.']) {\n\
+           try { new Worker(path.join(dir, name)).on('error', () => {}); console.log('worker ' + name + ' passed'); }\n\
+           catch (e) { console.log('worker ' + name + ' ' + (/not found/.test(e.message) ? 'not found' : e.message)); }\n\
+           try { globalThis.__oam.forkSpawn(path.join(dir, name), null); console.log('fork ' + name + ' passed'); }\n\
+           catch (e) { console.log('fork ' + name + ' ' + (/not found/.test(e.message) ? 'not found' : e.message)); }\n\
+         }\n\
+         setTimeout(() => process.exit(0), 500);\n",
+    );
+    let out = oam(&[script.to_str().unwrap(), dir.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(
+        stdout,
+        "worker w.js. not found\nfork w.js. not found\n\
+         worker x.js. passed\nfork x.js. passed\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
