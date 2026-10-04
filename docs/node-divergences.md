@@ -3645,11 +3645,13 @@ for a directory to lstat. Reproducing a failure of node's own was not worth it.
 ### Windows `fs.open` of a directory fails
 
 node opens a directory on Windows (libuv passes `FILE_FLAG_BACKUP_SEMANTICS`), so
-`openSync("dir", "r")` returns a descriptor, and opening a drive root to write fails `EPERM`.
-oam opens without that flag: `openSync("dir", "r")` fails `EPERM`, and an open of a drive
-root (`openSync("C:\\", "w")`, or `"r"`) fails `ENOENT`. The error names the path as node's
-does (`'C:\'`), and `readFileSync` of a directory fails `EISDIR` `read` in both. Measured
-against v22.22.2 while writing conformance case 377; not fixed yet.
+`openSync("dir", "r")`, `"a"` and `"r+"` return a descriptor, and `appendFileSync("dir", "")`
+succeeds. oam opens without that flag, so each of those fails `EPERM` (`appendFileSync`
+`EISDIR` `write`). Everything that fails in node fails the same way in oam: `readFileSync`
+of a directory or of a drive or share root (`C:\`, `\`, `/`, `\\srv\sh`) fails `EISDIR`
+`read`, `openSync("dir", "w")` fails `EISDIR`, and a write open of a root fails `EPERM`
+naming the root (`'C:\'`, `'\\srv\sh\'`). Measured against v22.22.2 (conformance case 377);
+not fixed yet: it needs directory descriptors.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 

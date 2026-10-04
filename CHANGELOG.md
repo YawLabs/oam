@@ -267,7 +267,10 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   clean-up (`import("./x.mjs ")` loads `x.mjs`, as on node). A script that relied on that
   normalisation now fails as it does under node. `process.chdir` records the new cwd in its
   drive's `=X:` variable, as libuv's `uv_chdir` does, so a drive-relative `C:name` resolves
-  against the directory the process moved to, not the one it was launched in. (#275)
+  against the directory the process moved to, not the one it was launched in. A drive or
+  share root (`C:\`, `\`, `/`, `\\srv\sh`) fails as a directory, not `ENOENT`:
+  `readFileSync` fails `EISDIR` `read` and `writeFileSync`, `appendFileSync` and a write
+  `openSync` fail `EPERM` naming the root. (#275)
 
 ### Performance
 

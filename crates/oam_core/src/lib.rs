@@ -2327,6 +2327,9 @@ pub struct FsError {
 /// - fs__readlink reports ERROR_NOT_A_REPARSE_POINT as `EINVAL`.
 /// - fs__scandir reports a file as `ENOTDIR`; libuv's table says `ENOENT` for
 ///   the ERROR_DIRECTORY std gets.
+/// - A drive or share root does not open at all without that flag, and fails
+///   not-found: its `readFile` is node's failed read and any other open is
+///   `EPERM`, as node's write open of a root is.
 ///
 /// Not reproduced: `fs.open(dir)` with `r`, `r+`, `a` or `a+` SUCCEEDS in
 /// node, which would take directory descriptors oam does not have. oam fails
@@ -2345,7 +2348,8 @@ pub fn fs_error_at(
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{
-            ERROR_ACCESS_DENIED, ERROR_DIRECTORY, ERROR_INVALID_NAME, ERROR_NOT_A_REPARSE_POINT,
+            ERROR_ACCESS_DENIED, ERROR_DIRECTORY, ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME,
+            ERROR_NOT_A_REPARSE_POINT, ERROR_PATH_NOT_FOUND,
         };
         let raw = error.raw_os_error().and_then(|r| u32::try_from(r).ok());
         let at = |code, syscall, has_path| FsError {
@@ -2366,6 +2370,29 @@ pub fn fs_error_at(
                 return at("EINVAL", syscall, true);
             }
             _ => {}
+        }
+        let open_shaped = matches!(
+            site,
+            FsSite::ReadFile | FsSite::WriteFile | FsSite::AppendFile | FsSite::Open(_)
+        );
+        if open_shaped
+            && matches!(
+                raw,
+                Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_INVALID_NAME)
+            )
+            && std::path::Path::new(path).is_dir()
+        {
+            // A drive or share root (`\\?\C:\`, `\\?\UNC\srv\sh\`): opened
+            // without backup semantics it fails ERROR_PATH_NOT_FOUND (a
+            // drive) or ERROR_INVALID_NAME (a share), where node opens it.
+            // Its readFile then fails on the read, and any write open is
+            // refused with ERROR_ACCESS_DENIED, which libuv reads as EPERM --
+            // a root is not the plain directory the rule below describes,
+            // whose `w` open fails ERROR_FILE_EXISTS.
+            return match site {
+                FsSite::ReadFile => at("EISDIR", "read", false),
+                _ => at("EPERM", syscall, true),
+            };
         }
         if raw == Some(ERROR_ACCESS_DENIED) && std::path::Path::new(path).is_dir() {
             match site {
@@ -6968,6 +6995,73 @@ mod os_error_code_tests {
             "EISDIR: illegal operation on a directory, read"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A drive root or a UNC share root does not open at all without
+    /// FILE_FLAG_BACKUP_SEMANTICS: CreateFileW fails it not-found, which the
+    /// generic table reads as ENOENT. node opens the root, so its readFile
+    /// fails on the read (`EISDIR`, syscall `read`, no path) and any open for
+    /// writing is refused (`EPERM` `open` with the path) -- measured on node
+    /// v22.22.2 for `C:\`, `\`, `/` and `\\localhost\C$`. The error here is
+    /// the one std really returns for the namespaced root.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_root_that_does_not_open_is_a_directory() {
+        let temp = std::env::temp_dir();
+        let temp = temp.to_str().unwrap();
+        let mut roots = vec![format!(r"\\?\{}\", &temp[..2])];
+        // The loopback admin share exists only where file sharing is on.
+        let share = format!(r"\\?\UNC\localhost\{}$\", &temp[..1]);
+        if std::path::Path::new(&share).is_dir() {
+            roots.push(share);
+        }
+        let expect = |code, syscall, has_path| FsError {
+            code,
+            syscall,
+            has_path,
+        };
+        for root in &roots {
+            let opened = |write: bool| {
+                std::fs::OpenOptions::new()
+                    .read(!write)
+                    .write(write)
+                    .open(root)
+                    .expect_err("std opens no directory")
+            };
+            let (read, write) = (opened(false), opened(true));
+            assert_eq!(
+                fs_error_at(FsSite::ReadFile, "open", root, &read),
+                expect("EISDIR", "read", false),
+                "{root}: {read:?}"
+            );
+            for site in [FsSite::WriteFile, FsSite::AppendFile, FsSite::Open("w")] {
+                assert_eq!(
+                    fs_error_at(site, "open", root, &write),
+                    expect("EPERM", "open", true),
+                    "{root} {site:?}: {write:?}"
+                );
+            }
+            // node opens it for reading; oam cannot, and says EPERM, as for
+            // any other directory.
+            assert_eq!(
+                fs_error_at(FsSite::Open("r"), "open", root, &read),
+                expect("EPERM", "open", true),
+                "{root}: {read:?}"
+            );
+            // Only the open-shaped operations: a scandir that fails
+            // not-found stays ENOENT.
+            assert_eq!(
+                fs_error_at(FsSite::Scandir, "scandir", root, &read).code,
+                node_error_code(&read)
+            );
+        }
+        // A path that is not there is still ENOENT.
+        let missing = format!(r"\\?\{temp}\oam-no-such-root-{}", std::process::id());
+        let gone = std::fs::File::open(&missing).expect_err("missing");
+        assert_eq!(
+            fs_error_at(FsSite::ReadFile, "open", &missing, &gone),
+            expect("ENOENT", "open", true)
+        );
     }
 }
 

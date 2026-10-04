@@ -78,16 +78,24 @@ if (process.platform !== "win32") {
 
   // Drive roots: the namespaced root is `\\?\X:\`; resolving it again
   // gives the volume `\\?\X:`, so the error must not be re-resolved.
-  // openSync's code is not compared: oam opens without
-  // FILE_FLAG_BACKUP_SEMANTICS, so opening a directory fails differently
-  // (docs/node-divergences.md); the path it names is what this row guards.
   show("mkdirSync root", () => fs.mkdirSync(root));
   show("mkdirSync root via ..", () => fs.mkdirSync(root + "x\\.."));
-  try {
-    fs.openSync(root, "w");
-    console.log("openSync root w: OK");
-  } catch (e) {
-    console.log("openSync root w: " + e.syscall + " path=" + JSON.stringify(scrub(e.path)));
+  // A drive or share root opens in node (FILE_FLAG_BACKUP_SEMANTICS): its
+  // readFile fails on the read and every write open is EPERM. oam opens
+  // without that flag, where a root fails not-found, and it read as ENOENT.
+  // A read-only openSync of a root is not compared: node gets a directory
+  // descriptor oam does not have (docs/node-divergences.md).
+  const share = "\\\\localhost\\" + D[0] + "$";
+  const roots = [root, "\\", "/", D.slice(0, 2) + "\\.."];
+  if (fs.existsSync(share)) roots.push(share, share + "\\");
+  for (const r of roots) {
+    const label = JSON.stringify(r === share || r === share + "\\" ? r.replace(share, "<SHARE>") : scrub(r));
+    show("readFileSync root " + label, () => fs.readFileSync(r));
+    show("writeFileSync root " + label, () => fs.writeFileSync(r, ""));
+    show("appendFileSync root " + label, () => fs.appendFileSync(r, ""));
+    show("openSync root w " + label, () => fs.openSync(r, "w"));
+    show("openSync root a " + label, () => fs.openSync(r, "a"));
+    show("loadEnvFile root " + label, () => process.loadEnvFile(r));
   }
 
   // A patched process.cwd: node's binding resolves against the real one.
