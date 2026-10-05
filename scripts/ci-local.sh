@@ -101,10 +101,13 @@
 #   OAM_CI_FRESH=1           run every step: clear the step ledger first. By
 #                            default a step that already passed on EXACTLY this
 #                            tree -- HEAD, the working tree with its untracked
-#                            files, rustc -V, cargo -V and the two flags above
-#                            all unchanged -- is skipped with a notice, so a
-#                            re-run after one late step failed goes straight
-#                            back to that step. The ledger is
+#                            files, rustc -V, cargo -V, the cargo environment
+#                            (RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS,
+#                            CARGO_BUILD_RUSTFLAGS, CARGO_TARGET_DIR) and the
+#                            two flags above all unchanged; for step 14 the
+#                            nightly toolchain too -- is skipped with a notice,
+#                            so a re-run after one late step failed goes
+#                            straight back to that step. The ledger is
 #                            target/ci-local/passed (scripts/lib/ci-ledger.sh);
 #                            step 5 always runs, see its comment.
 #
@@ -112,10 +115,14 @@
 # and takes about seventy minutes: when step 13 failed on a flake on
 # 2026-10-04, the fix was to run all fourteen steps again to reach it. A step
 # is recorded only when it actually RAN and passed -- never from a warn or
-# self-skip path -- and a failed step exits before anything is recorded. The
-# ledger is per-box, per-checkout state under target/, which is gitignored: it
-# cannot dirty the release preflight's clean-tree check, and it is outside its
-# own key by the same rule.
+# self-skip path -- and only when the tree it ran on is still the tree on
+# disk as it finishes: the key is re-read at the mark, so a step whose own
+# run rewrote a tracked file (8 and 9 stamp the conformance receipts) or that
+# overlapped an edit in the checkout is left unrecorded and runs again next
+# time. A failed step exits before anything is recorded. The ledger is
+# per-box, per-checkout state under target/, which is gitignored: it cannot
+# dirty the release preflight's clean-tree check, and it is outside its own
+# key by the same rule.
 #
 # Install as a pre-push hook (so you can't push without it passing). A
 # wrapper, NOT `ln -s`: MSYS/Git Bash `ln -s` silently COPIES the file, and
@@ -255,13 +262,15 @@ trap cleanup EXIT
 
 # --- the step ledger -----------------------------------------------------------
 # Every gating step but 5 asks step_done_earlier first and calls step_passed
-# as the last statement of its body. The key is computed here, once, and
-# RE-READ after every step that may rewrite a tracked file (8 and 9: xtask
-# stamps the conformance receipts when the results moved) -- mutable state is
-# re-read at step boundaries, never cached across one that can change it. A
-# step marked before such a rewrite stays keyed to the tree it ran on, so a
-# later run on the rewritten tree runs it again: a skip is a claim about THIS
-# tree, and that is the only claim the ledger makes.
+# as the last statement of its body. The key is computed here, once, RE-READ
+# when a step finishes (the mark is written only when the key is still the
+# one the step was asked under), and RE-READ again after every step that may
+# rewrite a tracked file (8 and 9: xtask stamps the conformance receipts when
+# the results moved) -- mutable state is re-read at step boundaries, never
+# cached across one that can change it. A step whose run changed the tree, or
+# overlapped an edit to it, is therefore never recorded under the tree it
+# started on: a skip is a claim about THIS tree, and that is the only claim
+# the ledger makes.
 CI_LEDGER_DIR="target/ci-local/passed"
 # Validated before anything runs: a mistyped value must not be read as "fresh"
 # or as "not fresh" by accident.
@@ -274,36 +283,66 @@ esac
 CI_KEY_FLAGS=""
 [ "$FAST" -eq 0 ]       || CI_KEY_FLAGS="--fast"
 [ "$SKIP_TESTS" -eq 0 ] || CI_KEY_FLAGS="$CI_KEY_FLAGS --no-tests"
-# Unquoted on purpose: the flags are separate arguments to the key.
-# shellcheck disable=SC2086
-CI_KEY="$(ci_ledger_key $CI_KEY_FLAGS)" || ko "cannot key the step ledger (reason above)"
+# step_key [input]... -- the key for the tree, toolchain and cargo environment
+# as they stand, under this run's flags, plus any input a step measures on its
+# own (step 14 passes the nightly toolchain it runs on). About half a second
+# warm, so it is read at every step boundary rather than cached.
+step_key() {
+  # Unquoted on purpose: the flags are separate arguments to the key.
+  # shellcheck disable=SC2086
+  ci_ledger_key $CI_KEY_FLAGS "$@"
+}
+CI_KEY="$(step_key)" || ko "cannot key the step ledger (reason above)"
+STEP_KEY=""
 STEPS_RAN=0; STEPS_SKIPPED=0
-# step_done_earlier <step-id> -- 0, with a notice, when the ledger holds a pass
-# for this step under the current key; 1 otherwise, counting the step as run.
+# step_done_earlier <step-id> [input]... -- 0, with a notice, when the ledger
+# holds a pass for this step under its key; 1 otherwise. The key is CI_KEY, or
+# with inputs a key read now that folds them in; either way it is kept in
+# STEP_KEY for step_passed to check against. A step is not counted as run
+# here: a body may still take a warn/self-skip path that checks nothing, and
+# only step_passed knows it did not.
 step_done_earlier() {
-  if ci_ledger_passed "$CI_LEDGER_DIR" "$CI_KEY" "$1"; then
+  local step="$1"; shift
+  if [ $# -eq 0 ]; then STEP_KEY="$CI_KEY"
+  else STEP_KEY="$(step_key "$@")" || ko "cannot key the step ledger for $step (reason above)"; fi
+  if ci_ledger_passed "$CI_LEDGER_DIR" "$STEP_KEY" "$step"; then
     STEPS_SKIPPED=$((STEPS_SKIPPED + 1))
-    ok "$1 -- passed earlier on this exact tree ($CI_LEDGER_DIR), skipped; OAM_CI_FRESH=1 runs it again"
+    ok "$step -- passed earlier on this exact tree ($CI_LEDGER_DIR), skipped; OAM_CI_FRESH=1 runs it again"
     return 0
   fi
-  STEPS_RAN=$((STEPS_RAN + 1))
   return 1
 }
-# step_passed <step-id> -- the LAST statement of a step's body: every failure
-# above it is a ko, which exits, so reaching it is the pass. A mark that cannot
-# be written is a warning, not a failure -- the gate passed; only the memo of
-# it is lost.
+# step_passed <step-id> [input]... -- the LAST statement of a step's body, with
+# the same inputs its ask was given: every failure above it is a ko, which
+# exits, so reaching it is the pass, and the step is counted as run. The key
+# is re-read HERE, and the pass is recorded only when it is still the key the
+# step was asked under: a step that rewrote a tracked file (8 and 9 stamp the
+# receipts) or overlapped an edit in this shared checkout ran on a tree that
+# is no longer the one on disk, and a mark under the old key would skip it on
+# a re-run of a tree it never passed on (a revert, or the release restoring
+# the committed receipts, brings exactly that tree back). Not recording is a
+# warning, not a failure -- the gate passed; only the memo of it is withheld,
+# and the next run on whichever tree it finds runs the step again.
 step_passed() {
-  ci_ledger_mark "$CI_LEDGER_DIR" "$CI_KEY" "$1" \
-    || warn "could not record $1 in $CI_LEDGER_DIR -- a re-run will run it again"
+  local step="$1" now; shift
+  STEPS_RAN=$((STEPS_RAN + 1))
+  now="$(step_key "$@")" \
+    || { warn "could not re-key the step ledger after $step (reason above) -- not recorded; a re-run will run it again"; return 0; }
+  if [ "$now" != "$STEP_KEY" ]; then
+    warn "the tree changed while $step ran -- its pass is not recorded, because a skip must describe the tree it is read on; a re-run will run it again"
+    return 0
+  fi
+  ci_ledger_mark "$CI_LEDGER_DIR" "$STEP_KEY" "$step" \
+    || warn "could not record $step in $CI_LEDGER_DIR -- a re-run will run it again"
 }
 # rekey_after <what> -- re-read the key after a step that may have rewritten a
-# tracked file. A changed key is announced, because it means the steps marked
-# so far this run are keyed to a tree that no longer exists on disk.
+# tracked file, so the steps that follow are asked and recorded under the tree
+# as it is now. A changed key is announced: the step that changed it was not
+# recorded (step_passed saw the change), and the steps recorded before it are
+# keyed to a tree that no longer exists on disk.
 rekey_after() {
   local new
-  # shellcheck disable=SC2086
-  new="$(ci_ledger_key $CI_KEY_FLAGS)" || ko "cannot re-key the step ledger after $1 (reason above)"
+  new="$(step_key)" || ko "cannot re-key the step ledger after $1 (reason above)"
   if [ "$new" != "$CI_KEY" ]; then
     echo "  tree changed during $1 -- the remaining steps are keyed to the tree as it is now; a re-run runs the earlier steps again"
     CI_KEY="$new"
@@ -637,11 +676,17 @@ if [ "$FAST" -eq 0 ]; then
   say "8/14 Conformance (node-differential gate)"
   # Skippable, with one thing to know: xtask REWRITES the tracked receipts
   # (CONFORMANCE.md, conformance/scorecard.json) when the results moved, and
-  # release-local.sh reads them after this gate. On a skip they are exactly
-  # what the recorded pass left on disk -- a rewrite would have changed the
-  # tree, and with it the key -- so the release reads the same files it would
-  # have read then. And a rewrite that did happen is why the key is re-read
-  # right after: the steps recorded above are keyed to the tree before it.
+  # release-local.sh reads them after this gate -- and restores the COMMITTED
+  # ones afterwards (restore_gate_artifacts), which puts the tree back to the
+  # key this step was asked under. So a pass that rewrote the receipts is NOT
+  # recorded: step_passed re-reads the key, sees the rewrite, and withholds
+  # the mark; the release's next run finds no pass for the restored tree and
+  # measures again, instead of skipping with HEAD's stale receipts on disk
+  # and reporting "nothing to land". A pass that left the receipts untouched
+  # is recorded, and on that skip they are exactly what the recorded pass
+  # left on disk. The rewrite is also why the key is re-read right after: the
+  # steps recorded above are keyed to the tree before it, and the steps below
+  # must be keyed to the tree after it.
   if ! step_done_earlier 08-conformance; then
     command -v node >/dev/null 2>&1 || ko "conformance needs node on PATH"
     if cargo run -p xtask -- conformance; then
@@ -655,7 +700,8 @@ if [ "$FAST" -eq 0 ]; then
 
   say "9/14 Node-suite (skip-ratchet + pass-floor gate)"
   # Same shape as step 8: CONFORMANCE-NODE.md and
-  # conformance/node-suite-scorecard.json are tracked and may be rewritten.
+  # conformance/node-suite-scorecard.json are tracked and may be rewritten, so
+  # a pass that rewrote them is not recorded, and the key is re-read after.
   if ! step_done_earlier 09-node-suite; then
     if cargo run -p xtask -- node-suite; then
       ok "node-suite gate ok (pass-rate in CONFORMANCE-NODE.md)"
@@ -891,15 +937,21 @@ say "14/14 Miri aliasing models (Stacked Borrows check on napi.rs's pointer disc
 # to require of every checkout, and the rest of the gate is unaffected. The skip
 # is loud on purpose.
 #
-# Skippable; the two SKIPPED paths are not recorded (nothing ran, and whether
-# nightly+miri is installed is not in the key -- install it and the step runs).
-if step_done_earlier 14-miri; then
-  :
-elif ! rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
+# Skippable, under a key of its own: this is the one step that runs on a
+# toolchain other than the pinned stable one, so the nightly's `rustc -V` and
+# miri's version are added to its key as inputs -- a `rustup update nightly`
+# changes what every aliasing verdict means without touching a tracked byte
+# or the stable toolchain the shared key measures. Which is why the toolchain
+# is checked BEFORE the ledger is asked: the key needs it. The two SKIPPED
+# paths are not recorded (nothing ran, and whether nightly+miri is installed
+# is not in the key -- install it and the step runs).
+if ! rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
   warn "miri models SKIPPED -- no nightly toolchain (install: rustup toolchain install nightly --component miri)"
-elif ! cargo +nightly miri --version >/dev/null 2>&1; then
+elif ! miri_v="$(cargo +nightly miri --version 2>/dev/null)"; then
   warn "miri models SKIPPED -- nightly present but miri component missing (rustup component add miri --toolchain nightly)"
-else
+elif ! nightly_v="$(rustc +nightly -V 2>/dev/null)"; then
+  ko "rustc +nightly -V failed although the toolchain is listed -- the nightly install is broken (rustup toolchain install nightly --component miri)"
+elif ! step_done_earlier 14-miri "nightly=$nightly_v" "miri=$miri_v"; then
   # tee'd rather than captured: a miri run is minutes long, and swallowing its
   # progress to parse the summary afterwards would trade live feedback for a
   # count. Same shape as the build log above -- tee reads to EOF, so there is
@@ -939,10 +991,13 @@ else
     esac
   done
   ok "miri: all ${#OAM_MIRI_HELD_CASES[@]} known-UB models still rejected, each on a reported UB diagnosis"
-  step_passed 14-miri
+  step_passed 14-miri "nightly=$nightly_v" "miri=$miri_v"
 fi
 
 echo ""
-# Ran vs skipped counts only the steps the ledger decided about; a step a flag
-# turned off (--fast, --no-tests) is in neither number.
+# "Ran" is counted where a step's body reached step_passed (and in step 5,
+# which always runs): a step a flag turned off (--fast, --no-tests) and a step
+# that took a warn/self-skip path (no node, no cargo-about, no nightly, a scan
+# that could not run) are in neither number -- the latter checked nothing,
+# and its warning above says so.
 ok "All local CI gates passed ($STEPS_RAN steps ran, $STEPS_SKIPPED skipped -- passed earlier on this exact tree; OAM_CI_FRESH=1 runs them all)"
