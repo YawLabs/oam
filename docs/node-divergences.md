@@ -3898,6 +3898,19 @@ comment, **not** something measured. Do not rely on either the claim or its nega
   in its `'connection'` listener included, `conformance/cases/288-net-paused-accepted-socket.mjs`;
   up to 0.17.1 that first chunk was emitted while paused); it then reads no further, where
   Node's goes on reading into its buffer up to the high-water mark.
+- **`end()` then `resetAndDestroy()` on a socket still looking up its host.** oam resets at
+  connect, before the end()'s shutdown goes out, as Node does on macOS and Windows
+  (`conformance/cases/297-net-end-then-reset-while-looking-up.mjs`). Node on Linux issues the
+  shutdown first, refuses the reset with `EINVAL`, and its client then never emits `'close'`
+  (measured on v22.22.2 and v22.23.2, whatever answers the lookup); oam keeps the macOS and
+  Windows order there too, and the case does not run on Linux.
+- **A reset that arrives before Node's connect callback, on Linux.** A loopback connect
+  completes in the connect() call there, and libuv reports it a loop turn later, reading
+  `SO_ERROR` then: a server that resets in its `'connection'` listener, or on the first bytes
+  of the request, has reset by then, and Node's client fails with `connect ECONNRESET
+  <address>:<port>` (syscall `connect`). oam reports the same reset at the first read (`read
+  ECONNRESET`, syscall `read`), as Node does on macOS and Windows; the error code is the same
+  (`conformance/cases/254-http-reset-and-destroy.mjs` compares only the code on Linux).
 - **N-API async surfaces.** `napi_create_async_work`, `napi_queue_async_work`, and the
   threadsafe-function family are reported as stubs, with threadsafe finalizers possibly
   dropped. Only reachable with `OAM_ENABLE_NATIVE_ADDONS=1`.

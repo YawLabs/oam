@@ -9285,13 +9285,20 @@ fn op_dns_lookup(
         0
     };
     let all = args.get(2).is_true();
+    // args[3]: node's `hints`, the platform's AI_* bits (see
+    // oam_core::dns::dns_lookup).
+    let flags = if args.get(3).is_number() {
+        args.get(3).number_value(scope).unwrap_or(0.0) as i32
+    } else {
+        0
+    };
     // node's GetAddrInfo hands getaddrinfo the UTS #46 ToASCII form.
     let name = ada_url::Idna::ascii(&hostname);
 
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::dns::dns_lookup(hostname, name, family, all),
+        oam_core::dns::dns_lookup(hostname, name, family, all, flags),
     );
 }
 

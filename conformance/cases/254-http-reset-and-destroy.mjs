@@ -54,8 +54,20 @@ j0ngz5dpnyIRlajsUptN/qPisRoVJ5BqZjfz4MS1vVN0KGg7vDRoCO1V
 
 const out = [];
 const log = (line) => out.push(line);
+// A reset the socket itself reports (syscall read, or connect): on Linux
+// node attributes one that arrives before its connect callback to the
+// connect (`connect ECONNRESET 127.0.0.1:<port>`, syscall connect) -- a
+// loopback connect completes in the connect() call there, and libuv reports
+// it a loop turn later, reading SO_ERROR then, by which time a server that
+// resets in its 'connection' listener or on the first bytes has reset. oam
+// reports it at the first read, as node does on macOS and Windows
+// (docs/node-divergences.md), so on Linux the syscall and message of such a
+// reset are not compared. A reset reported elsewhere (a response's
+// 'aborted') keeps its shape.
 const describe = (e) =>
-  `${e.code} | ${e.message} | syscall ${e.syscall} | errno ${typeof e.errno}`;
+  process.platform === "linux" && e.code === "ECONNRESET" && (e.syscall === "read" || e.syscall === "connect")
+    ? `${e.code} | (connect or read, not compared on Linux) | errno ${typeof e.errno}`
+    : `${e.code} | ${e.message} | syscall ${e.syscall} | errno ${typeof e.errno}`;
 
 // One object's events, in its own order; `closed` settles on its 'close'.
 function record(emitter, names) {

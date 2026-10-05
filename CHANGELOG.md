@@ -203,7 +203,12 @@ below is held to node v22.22.2 by a conformance case or an e2e test.
 - **`fs.readdir` lists entries in node's order on macOS and Linux: sorted by name.** Node's
   readdir is libuv's scandir, which sorts on unix; oam handed back the file system's own order,
   which APFS and ext4 do not keep sorted. `opendir`'s Dir still reads in the file system's order,
-  as node's does through uv_fs_readdir. Windows is unchanged.
+  as node's does through uv_fs_readdir. Windows is unchanged. `fs.cp` and `cpSync` walk a
+  directory in the file system's order, as node's do through opendir and std::filesystem.
+- **`dns.lookup` hands its `hints` to getaddrinfo.** `V4MAPPED` and `ALL` were emulated over an
+  unflagged lookup, so the answer was not always the platform resolver's: glibc answers a name
+  with both `::1` and `127.0.0.1` in /etc/hosts under `V4MAPPED | ALL` with the mapped address
+  twice, and node reports both. `ADDRCONFIG` is still not applied.
 - **`net.Socket`'s write highWaterMark is node's default for the platform: 16 KiB on Windows,
   64 KiB elsewhere.** It was 16 KiB everywhere, so on macOS and Linux a socket's `write()`
   returned false, and 'drain' followed, four times earlier than node's, and `writableNeedDrain`

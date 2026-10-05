@@ -10,6 +10,16 @@
 // is not a case here, as node's client then never emits 'close'.)
 import net from "node:net";
 
+// Node on Linux orders the two the other way round: the end()'s shutdown
+// goes out first, the reset is refused with EINVAL, and its client then
+// never emits 'close' (measured on v22.22.2 and v22.23.2, through a name
+// looked up any way). oam keeps the macOS and Windows order everywhere
+// (docs/node-divergences.md), so there is nothing to compare on Linux.
+if (process.platform === "linux") {
+  console.log("linux: not compared (node refuses the reset with EINVAL and its client never closes; oam resets)");
+  process.exit(0);
+}
+
 setTimeout(() => {
   console.log("WATCHDOG", clientLog.join(", "), "|", serverLog.join(", "));
   process.exit(9);
