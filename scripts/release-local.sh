@@ -43,6 +43,9 @@
 # release IS the gate):
 #   - scripts/ci-local.sh full (fmt/clippy/build/test/smoke/conformance/
 #     node-suite) on this box            [OAM_SKIP_LOCAL_GATE=1 to skip]
+#     A re-run of the gate on the same tree skips the steps that already
+#     passed (ci-local.sh's step ledger, target/ci-local/passed; OAM_CI_FRESH=1
+#     runs every step again)
 #   - gate+test+conformance+node-suite on the Linux VM (inside --mode=release
 #     -- the node-suite ratchet was node-compat.yml's ubuntu GATING job)
 #   - gate+test+conformance on the Mac (inside mac-release) -- conformance
