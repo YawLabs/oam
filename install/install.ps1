@@ -312,7 +312,11 @@ function Invoke-Native([string]$exe, [string[]]$argv, [string]$stdinFile) {
       RedirectStandardInput = $inFile
       RedirectStandardOutput = $outFile
       RedirectStandardError = $errFile
-      NoNewWindow = $true
+      # Hidden, not -NoNewWindow: under a host with no console of its own
+      # (PowerShell ISE, an embedded engine) -NoNewWindow lets each
+      # console-subsystem child open a visible window; a hidden new console
+      # behaves the same with and without a parent console.
+      WindowStyle = 'Hidden'
       Wait = $true
       PassThru = $true
     }
@@ -326,20 +330,25 @@ function Invoke-Native([string]$exe, [string[]]$argv, [string]$stdinFile) {
   }
 }
 
-# An ssh-keygen that understands -Y (OpenSSH 8.1+). Sysnative first: a 32-bit
-# PowerShell on 64-bit Windows sees System32 redirected to SysWOW64, which has
-# no OpenSSH, and reaches the real one only through Sysnative. Then System32,
-# then PATH (a removed inbox feature, Git for Windows, scoop). The probe asks
-# the tool itself: one with -Y answers an unknown operation with "Unsupported
-# operation for -Y"; one without rejects the flag.
+# An ssh-keygen that understands -Y verify (OpenSSH 8.1+). Sysnative first: a
+# 32-bit PowerShell on 64-bit Windows sees System32 redirected to SysWOW64,
+# which has no OpenSSH, and reaches the real one only through Sysnative. Then
+# System32, then PATH (a removed inbox feature, Git for Windows, scoop). The
+# probe asks the tool itself: an unknown -Y operation. 8.2 and later answer
+# "Unsupported operation for -Y"; 8.1 (the Windows 10 inbox client) has no
+# such text and, given a namespace, falls through to its usage, which lists
+# "ssh-keygen -Y verify"; a tool from before -Y rejects the flag and prints a
+# usage without that line. -n is passed because 8.1 checks for it BEFORE it
+# looks at the operation ("Too few arguments for sign/verify: missing
+# namespace").
 $sshKeygenCandidates = @("$env:windir\Sysnative\OpenSSH\ssh-keygen.exe", "$env:windir\System32\OpenSSH\ssh-keygen.exe")
 function Find-SshKeygen {
   $found = @($sshKeygenCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
   $cmd = Get-Command ssh-keygen -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($cmd) { $found += $cmd.Path }
   foreach ($kg in $found) {
-    try { $r = Invoke-Native $kg @('-Y', 'oam-probe') '' } catch { continue }
-    if ($r.Output -match 'Unsupported operation for -Y') { return $kg }
+    try { $r = Invoke-Native $kg @('-Y', 'oam-probe', '-n', $signNamespace) '' } catch { continue }
+    if ($r.Output -match 'Unsupported operation for -Y|ssh-keygen -Y verify') { return $kg }
   }
   return $null
 }

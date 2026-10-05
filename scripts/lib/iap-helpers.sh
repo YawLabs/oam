@@ -188,14 +188,16 @@ ssh_transport_dropped() {
   grep -qE 'closed by remote host|Connection reset by peer|Broken pipe|Connection closed by|client_loop: send disconnect|Connection timed out' <<<"$1"
 }
 
-# remote_step_should_retry <attempt> <max> <log-tail-text> <vm-status> -- 0
-# when a failed remote step is worth running again: its ssh transport dropped
-# (above), the VM is still RUNNING, and attempts remain. A remote command that
-# exited non-zero never is: the same failure would repeat. A VM that is not
-# RUNNING is left to the postmortem, which says who stopped it.
+# remote_step_should_retry <attempt> <max> <ssh-exit> <log-tail-text> <vm-status>
+# -- 0 when a failed remote step is worth running again: ssh itself failed
+# (exit 255 -- a remote command's own status is 0..254, so a test whose
+# output merely mentions a reset connection never counts), its log ends in a
+# transport drop (above), the VM is still RUNNING, and attempts remain. A VM
+# that is not RUNNING is left to the postmortem, which says who stopped it.
 remote_step_should_retry() {
-  local attempt="$1" max="$2" tail="$3" status="$4"
+  local attempt="$1" max="$2" rc="$3" tail="$4" status="$5"
   [ "$attempt" -lt "$max" ] 2>/dev/null || return 1
+  [ "$rc" = "255" ] || return 1
   [ "$status" = "RUNNING" ] || return 1
   ssh_transport_dropped "$tail"
 }

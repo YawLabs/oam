@@ -93,6 +93,11 @@
 #                            refusing; xtask conformance honours it too). For an
 #                            ad-hoc run only -- the receipts then name the node
 #                            that really ran, which is not the parity target.
+#   OAM_SCRIPT_TESTS_RETRY=0 do not run step 13's script suite a second time
+#                            when the first run fails (default: one re-run, so
+#                            a case that flakes under load does not end a
+#                            release; a real failure fails both runs). Both
+#                            runs' output is kept under target/ci-local/.
 #
 # Install as a pre-push hook (so you can't push without it passing). A
 # wrapper, NOT `ln -s`: MSYS/Git Bash `ln -s` silently COPIES the file, and
@@ -652,8 +657,10 @@ run_script_tests(){  # <run-number>
 }
 if run_script_tests 1; then
   ok "script tests passed (log: $SCRIPTS_LOG_DIR/test-scripts-1.log)"
+elif [ "${OAM_SCRIPT_TESTS_RETRY:-1}" != "1" ]; then
+  ko "script tests failed (see above; log: $SCRIPTS_LOG_DIR/test-scripts-1.log; OAM_SCRIPT_TESTS_RETRY=0, so no second run) -- './scripts/test-scripts.sh -v' for per-case detail"
 else
-  warn "script tests failed on the first run -- running the suite once more (a flake passes now; a real failure fails twice)"
+  warn "script tests failed on the first run -- running the suite once more (a flake passes now; a real failure fails twice; OAM_SCRIPT_TESTS_RETRY=0 skips this)"
   if run_script_tests 2; then
     ok "script tests passed on the second run -- the first run's failures are in $SCRIPTS_LOG_DIR/test-scripts-1.log; a case that fails only under load is a bug to file"
   else

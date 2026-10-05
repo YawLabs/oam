@@ -65,7 +65,14 @@ scrub_operator_knobs
 # pre-push gate that grew without bound (149 had piled up on the dev box before
 # anyone looked). Same shape as ci-local.sh`s CLEANUP_PATHS + EXIT trap.
 SUITE_TMP="$(mktemp -d -t oamtest-XXXXXX)"
-trap 'rm -rf "$SUITE_TMP"' EXIT
+# One EXIT trap: the temp root goes, and a console code page an install.ps1
+# case switched (in_ps_cp, below) is put back when the suite dies mid-case --
+# chcp is per console and sticks, and the console is the operator's.
+suite_exit(){
+  rm -rf "$SUITE_TMP"
+  if [ -n "${IN_CP_ORIG:-}" ] && [ -x "${IN_CHCP:-}" ]; then "$IN_CHCP" "$IN_CP_ORIG" >/dev/null 2>&1 || true; fi
+}
+trap suite_exit EXIT
 
 RED='\033[0;31m'; GRN='\033[0;32m'; YEL='\033[0;33m'; CYA='\033[0;36m'; NC='\033[0m'
 PASS=0; FAIL=0; SKIP=0; CURRENT=""
@@ -754,16 +761,18 @@ ssh_transport_dropped "" && fail "matched nothing" || pass
 # A remote step is run again only when the TRANSPORT dropped under it, the VM
 # is still RUNNING and attempts remain -- never for a command that exited.
 VMS_DROP=$'  PASS   test-stream-pipeline-with-empty-string.js\nConnection to localhost closed by remote host.'
-it "a transport drop under a RUNNING VM, with attempts left, is run again"
-if remote_step_should_retry 1 3 "$VMS_DROP" RUNNING; then pass; else fail "not retried"; fi
+it "a transport drop (ssh exit 255) under a RUNNING VM, with attempts left, is run again"
+if remote_step_should_retry 1 3 255 "$VMS_DROP" RUNNING; then pass; else fail "not retried"; fi
 it "the last attempt is not run again"
-remote_step_should_retry 3 3 "$VMS_DROP" RUNNING && fail "retried past the last attempt" || pass
+remote_step_should_retry 3 3 255 "$VMS_DROP" RUNNING && fail "retried past the last attempt" || pass
 it "a VM that is not RUNNING is not run again -- the postmortem says who stopped it"
-remote_step_should_retry 1 3 "$VMS_DROP" TERMINATED && fail "retried against a stopped VM" || pass
+remote_step_should_retry 1 3 255 "$VMS_DROP" TERMINATED && fail "retried against a stopped VM" || pass
 it "a remote command that exited non-zero is never run again"
-remote_step_should_retry 1 3 $'error: test failed, to rerun pass ...\n[remote] test FAILED' RUNNING && fail "retried a real failure" || pass
+remote_step_should_retry 1 3 1 $'error: test failed, to rerun pass ...\n[remote] test FAILED' RUNNING && fail "retried a real failure" || pass
+it "a remote command that exited 1 with a log that mentions a reset is a real failure, not a drop"
+remote_step_should_retry 1 3 1 "$VMS_DROP" RUNNING && fail "retried on the log's words alone" || pass
 it "a blank attempt count is not an invitation"
-remote_step_should_retry "" 3 "$VMS_DROP" RUNNING && fail "retried on a blank attempt" || pass
+remote_step_should_retry "" 3 255 "$VMS_DROP" RUNNING && fail "retried on a blank attempt" || pass
 
 # =============================================================================
 group "iap-helpers.sh -- ssh transport: direct first, IAP tunnel fallback"
@@ -1163,6 +1172,15 @@ for want in 'vm_start_types "$ORIGINAL_MACHINE_TYPE"' 'vm_start_verdict "$start_
   grep -qF -- "$want" <<<"$VMS_SRC" || VMS_WIRE="$VMS_WIRE [$want]"
 done
 if [ -z "$VMS_WIRE" ]; then pass; else fail "build-platforms-gcp-iap.sh no longer carries:$VMS_WIRE"; fi
+
+# The reconnect is CALLED from the retry path, not merely defined: a bare
+# `reconnect_builder` line on its own, inside remote_step_run.
+it "remote_step_run reconnects before it runs a dropped step again"
+VMS_RUN_BODY="$(awk '/^remote_step_run\(\)/ { f = 1 } f { print } f && /^}/ { exit }' scripts/build-platforms-gcp-iap.sh)"
+if grep -qE '^[[:space:]]+reconnect_builder[[:space:]]*$' <<<"$VMS_RUN_BODY" \
+   && grep -qE 'remote_step_should_retry .*"\$rc"' <<<"$VMS_RUN_BODY" \
+   && grep -qE '\|\| rc=\$\?' <<<"$VMS_RUN_BODY"; then pass
+else fail "remote_step_run must capture ssh's exit into rc, decide with it, and call reconnect_builder before the next attempt; body:$(printf '\n  %s' "$VMS_RUN_BODY")"; fi
 
 it "the VM start neither discards gcloud's stderr nor retries a fixed six times"
 if grep -E 'instances start ' <<<"$VMS_SRC" | grep -q '2>/dev/null' \
@@ -4065,6 +4083,18 @@ if [ "$IN_SSH" = "1" ]; then
   it "an ssh-keygen without -Y counts as none"
   in_sh good v0.18.0 "$IN_PATH_OLDKG"
   in_refused 'has no -Y'
+  # OpenSSH 8.1 (the Windows 10 inbox client): -Y verify works, but the probe
+  # text "Unsupported operation for -Y" only arrived in 8.2, and without -n
+  # 8.1 stops at "missing namespace" before it looks at the operation. The
+  # stub answers the probe as 8.1 does and hands everything else to the real
+  # ssh-keygen, so a probe that rejects it fails the whole install.
+  IN_KG81="$IN/kg81"; mkdir -p "$IN_KG81"
+  printf '#!/bin/sh\ncase "$*" in\n  *"-Y oam-probe"*)\n    case "$*" in *" -n "*) ;; *) echo "Too few arguments for sign/verify: missing namespace" >&2; exit 1 ;; esac\n    echo "usage: ssh-keygen [-q] [-b bits]" >&2\n    echo "       ssh-keygen -Y verify -f allowed_signers_file -I signer_identity" >&2\n    exit 1 ;;\nesac\nexec "%s" "$@"\n' \
+    "$(command -v ssh-keygen)" >"$IN_KG81/ssh-keygen"
+  chmod +x "$IN_KG81/ssh-keygen"
+  it "an OpenSSH 8.1 ssh-keygen (no 'Unsupported operation' text) counts as present, and installs"
+  in_sh good v0.18.0 "$IN_STUB:$IN_KG81:$PATH"
+  in_installed good 'signature ok: v0.18.0, signed by oam-release-k1'
   it "OAM_INSECURE_SKIP_SIGNATURE=1 installs without ssh-keygen, loudly"
   in_sh good v0.18.0 "$IN_PATH_NOKG" OAM_INSECURE_SKIP_SIGNATURE=1
   in_installed good 'installing WITHOUT signature verification'
@@ -4340,6 +4370,18 @@ if [ -n "$IN_PS64" ]; then
   it "ps1 OAM_INSECURE_SKIP_SIGNATURE=1 installs without ssh-keygen, loudly"
   in_ps "$IN_PS64" "$IN/install-nokg.ps1" good v0.18.0 OAM_INSECURE_SKIP_SIGNATURE=1
   in_ps_installed 'installing WITHOUT signature verification'
+  # The 8.1 shape for install.ps1: an ssh-keygen.cmd on PATH (the nokg copy
+  # points the inbox candidates at nothing, so PATH is where it looks) that
+  # answers the probe as 8.1 does and hands everything else to System32's
+  # tool. Start-Process runs a .cmd through cmd.exe with the same redirected
+  # handles.
+  IN_KG81W="$IN/kg81w"; mkdir -p "$IN_KG81W"
+  printf '@echo off\r\necho %%* | findstr /c:"oam-probe" >nul\r\nif errorlevel 1 goto real\r\necho %%* | findstr /c:"-n" >nul\r\nif errorlevel 1 goto nons\r\necho usage: ssh-keygen [-q] [-b bits] 1>&2\r\necho        ssh-keygen -Y verify -f allowed_signers_file -I signer_identity 1>&2\r\nexit /b 1\r\n:nons\r\necho Too few arguments for sign/verify: missing namespace 1>&2\r\nexit /b 1\r\n:real\r\n"%s" %%*\r\nexit /b %%errorlevel%%\r\n' \
+    'C:\Windows\System32\OpenSSH\ssh-keygen.exe' >"$IN_KG81W/ssh-keygen.cmd"
+  it "ps1: an OpenSSH 8.1-shaped ssh-keygen on PATH counts as present, and installs"
+  in_ps "$IN_PS64" "$IN/install-nokg.ps1" good v0.18.0 "PATH=$IN_KG81W:$IN_WINPATH"
+  if grep -qF 'ssh-keygen.cmd' <<<"$IN_OUT"; then in_ps_installed 'signature ok: v0.18.0, signed by oam-release-k1'
+  else fail "did not verify with the 8.1-shaped ssh-keygen.cmd: $IN_OUT"; fi
 
   it "ps1 latest: the tag comes from the /releases/latest redirect (the local stand-in above)"
   if [ -n "${IN_PORT:-}" ]; then

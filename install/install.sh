@@ -365,17 +365,21 @@ hash_from_sums() {
     END { if (n != 1) exit 1; print tolower(h) }' "$1"
 }
 
-# find_ssh_keygen -- KEYGEN set to an ssh-keygen that understands -Y (OpenSSH
-# 8.1+), or empty with KEYGEN_WHY saying what is wrong. The probe asks the tool
-# itself, as scripts/lib/signing.sh does: one with -Y answers an unknown
-# operation with "Unsupported operation for -Y"; one without rejects the flag.
+# find_ssh_keygen -- KEYGEN set to an ssh-keygen that understands -Y verify
+# (OpenSSH 8.1+), or empty with KEYGEN_WHY saying what is wrong. The probe asks
+# the tool itself: an unknown -Y operation. 8.2 and later answer "Unsupported
+# operation for -Y"; 8.1 (the Windows 10 inbox client) has no such text and,
+# given a namespace, falls through to its usage, which lists "ssh-keygen -Y
+# verify"; a tool from before -Y rejects the flag and prints a usage without
+# that line. -n is passed because 8.1 checks for it BEFORE it looks at the
+# operation ("Too few arguments for sign/verify: missing namespace").
 KEYGEN=""; KEYGEN_WHY=""
 find_ssh_keygen() {
   _kg="$(command -v ssh-keygen 2>/dev/null)" || _kg=""
   if [ -z "$_kg" ]; then KEYGEN_WHY="ssh-keygen is not installed"; return 1; fi
-  _probe="$("$_kg" -Y oam-probe </dev/null 2>&1)" || true
+  _probe="$("$_kg" -Y oam-probe -n "$SIGN_NAMESPACE" </dev/null 2>&1)" || true
   case "$_probe" in
-    *'Unsupported operation for -Y'*) KEYGEN="$_kg"; return 0 ;;
+    *'Unsupported operation for -Y'* | *'ssh-keygen -Y verify'*) KEYGEN="$_kg"; return 0 ;;
   esac
   KEYGEN_WHY="$_kg has no -Y (it is older than OpenSSH 8.1)"
   return 1

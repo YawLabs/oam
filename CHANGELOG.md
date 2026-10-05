@@ -31,8 +31,8 @@ below is held to node v22.22.2 by a conformance case or an e2e test.
   `release-keys/ranges` says which tags each may sign; a key is retired by closing its range,
   never by removing it, so the tags it signed keep verifying. By hand:
   `ssh-keygen -Y verify -f release-keys/allowed_signers -I oam-release-k1 -n oam-release -s RELEASE-MANIFEST.sig < RELEASE-MANIFEST`.
-  A release whose signing is not possible fails instead of shipping unsigned
-  (`OAM_SIGN_REQUIRED=1` is the default). (#266, #267, #270, #272, #273, #277)
+  There is no knob that skips the manifest signature: while key lines exist, a release that
+  cannot sign does not ship. (#266, #267, #270, #272, #273, #277)
 - **The installers verify the release before they download the binary.** `install.sh` and
   `install.ps1` embed the key list and ranges, fetch every asset from the resolved tag's own
   `/download/<tag>/`, and refuse a signature that does not verify, a manifest signed for
@@ -55,7 +55,10 @@ below is held to node v22.22.2 by a conformance case or an e2e test.
   override that needs `--version` and still requires a valid signature. (#266)
 - **The Windows binaries are Authenticode-signed** (Azure Artifact Signing, timestamped), and
   each is verified from disk twice before it ships: `signtool verify /pa`, then an independent
-  PowerShell check of the signer, the timestamp and the chain. (#270)
+  PowerShell check of the signer, the timestamp and the chain. Binary signing that is not
+  possible fails the release rather than shipping unsigned (`OAM_SIGN_REQUIRED=1` is the
+  default); `OAM_SKIP_WIN_SIGN=1` and `OAM_SKIP_MAC_SIGN=1` ship a leg unsigned deliberately,
+  with a warning. (#270, #273, #277)
 - **The mac binaries are codesigned**: hardened runtime, identifier `org.oamjs.oam` and
   exactly the three entitlements V8's JIT needs, verified against a pinned identity and
   JIT-smoked on both architectures before they ship. The identity is oam's own certificate,

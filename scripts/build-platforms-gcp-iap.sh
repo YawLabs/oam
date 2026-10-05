@@ -599,8 +599,11 @@ stop_iap_tunnel() {
   # anyone could read it. -s, not -f: on the direct path no tunnel ran, and an
   # empty iap-tunnel.log among the logs would read as a tunnel that said
   # nothing.
+  # Appended, not copied over: a reconnect after a reset relay stops one
+  # tunnel and starts another, and the reset is in the FIRST one's output.
   if [ -s "$IAP_TUNNEL_LOG" ]; then
-    cp "$IAP_TUNNEL_LOG" "$STAGE_DIR/logs/iap-tunnel.log" 2>/dev/null || true
+    { printf -- '--- tunnel on port %s, stopped %s ---\n' "$IAP_TUNNEL_PORT" "$(date +%Y-%m-%dT%H:%M:%S)"; cat "$IAP_TUNNEL_LOG"; } \
+      >> "$STAGE_DIR/logs/iap-tunnel.log" 2>/dev/null || true
   fi
   rm -f "$IAP_TUNNEL_LOG"
 }
@@ -851,13 +854,16 @@ sync_src(){
 # the VM and delete the tunnel log, so ask the compute API NOW and put the
 # answer next to the failure. Best effort: a postmortem must never mask the
 # failure itself.
+# remote_step_postmortem <log> [attempts-made]
 remote_step_postmortem() {
-  local log="$1" status last_stop
+  local log="$1" attempts="${2:-1}" status last_stop
   ssh_transport_dropped "$(tail -5 "$log" 2>/dev/null || true)" || return 0
   status="$(vm_describe status || echo UNKNOWN)"
   case "$status" in
     RUNNING)
-      if [ "$REMOTE_TRANSPORT" = "direct" ]; then
+      if [ "$attempts" -gt 1 ]; then
+        warn "ssh transport dropped under this step $attempts times in a row, each time reconnected, and $INSTANCE is still RUNNING -- the path to the builder is not holding (last transport: $REMOTE_TRANSPORT${DIRECT_IP:+, direct IP $DIRECT_IP}). Try the other one: OAM_IAP_SSH_MODE=tunnel or =direct; OAM_REMOTE_STEP_ATTEMPTS raises the count. Tunnel log: $STAGE_DIR/logs/iap-tunnel.log"
+      elif [ "$REMOTE_TRANSPORT" = "direct" ]; then
         warn "ssh transport dropped but $INSTANCE is still RUNNING -- the direct connection to ${DIRECT_IP} was cut under the step (a network blip or an sshd restart on the guest; transient -- re-run)"
       else
         warn "ssh transport dropped but $INSTANCE is still RUNNING -- the IAP tunnel reset under the step (transient; re-run). Tunnel log tail: $(tail -3 "$IAP_TUNNEL_LOG" 2>/dev/null | tr -d '\r' | tr '\n' ' ')"
@@ -888,21 +894,23 @@ remote_step_postmortem() {
 # who stopped it. Each earlier attempt's log is kept as <dispatch>.log.attemptN.
 REMOTE_STEP_ATTEMPTS="${OAM_REMOTE_STEP_ATTEMPTS:-3}"
 remote_step_run(){
-  local dispatch="$1" log="$STAGE_DIR/logs/$1.log" attempt=1 status
+  local dispatch="$1" log="$STAGE_DIR/logs/$1.log" attempt=1 rc status
   while :; do
-    if gcp_ssh "cd $REMOTE_DIR && bash scripts/build-remote.sh $dispatch" >"$log" 2>&1; then
-      return 0
-    fi
+    rc=0
+    gcp_ssh "cd $REMOTE_DIR && bash scripts/build-remote.sh $dispatch" >"$log" 2>&1 || rc=$?
+    [ "$rc" -eq 0 ] && return 0
     tail -30 "$log" >&2
     status="$(vm_describe status || echo UNKNOWN)"
-    if remote_step_should_retry "$attempt" "$REMOTE_STEP_ATTEMPTS" "$(tail -5 "$log" 2>/dev/null || true)" "$status"; then
+    # ssh's own exit (255), not the remote command's: a step whose command
+    # exited 1 with a log that mentions a reset is a real failure.
+    if remote_step_should_retry "$attempt" "$REMOTE_STEP_ATTEMPTS" "$rc" "$(tail -5 "$log" 2>/dev/null || true)" "$status"; then
       cp "$log" "$log.attempt$attempt" 2>/dev/null || true
       warn "remote '$dispatch' lost its ssh transport on attempt $attempt of $REMOTE_STEP_ATTEMPTS while $INSTANCE is RUNNING -- reconnecting and running it again (that attempt's log: $log.attempt$attempt)"
       reconnect_builder
       attempt=$((attempt + 1))
       continue
     fi
-    remote_step_postmortem "$log"
+    remote_step_postmortem "$log" "$attempt"
     return 1
   done
 }
