@@ -1261,7 +1261,10 @@ mod tests {
             "/run/app.sock".to_string(),
             "C".to_string(),
         ]));
-        assert!(p.check_pipe(r"\\.\pipe\app").is_ok());
+        // On Windows the entry names the pipe exactly. Unix has no pipe
+        // namespace: there `\\.\pipe\app` is a relative file name, resolved
+        // against the cwd, and the entry, relative too, grants nothing.
+        assert_eq!(p.check_pipe(r"\\.\pipe\app").is_ok(), cfg!(windows));
         assert!(p.check_pipe("/run/app.sock").is_ok());
         // The same path spelt with other separators, or a doubled one.
         assert!(p.check_pipe("/run//app.sock").is_ok());
