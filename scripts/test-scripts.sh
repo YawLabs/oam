@@ -1209,8 +1209,10 @@ for want in 'vm_start_types "$ORIGINAL_MACHINE_TYPE"' 'vm_start_verdict "$start_
             'start_vm_walk "$VM_STATUS"' 'restart_builder "$status"' 'OAM_GCP_ZONE_FALLBACK:-1' \
             'gce_zone_name_valid "$fz"' 'zone_fallback_candidates "$origin_zone" "$FALLBACK_ZONES"' \
             'machine-images create "$img" --source-instance="$origin"' '--source-machine-image="$img"' \
-            '--filter="name~^${INSTANCE}\$"' 'trap restore_machine_type EXIT' \
-            'cleanup() { stop_iap_tunnel; reattach_stop_schedules; stop_vm; restore_machine_type; delete_machine_image; }'; do
+            '--filter="name~^${INSTANCE}\$"' "trap 'stop_vm; restore_machine_type || true; delete_machine_image' EXIT" \
+            'cleanup() { stop_iap_tunnel; reattach_stop_schedules; stop_vm; restore_machine_type || true; delete_machine_image; }' \
+            'vm_start_verdict "$img_err"' 'clone_leftover "$clone" "$zone"' 'restore_machine_type || origin_left="$UNRESTORED_TYPE"' \
+            'remote_step_postmortem "$log" "$attempt" "$reruns" "$restarts"' '[ "${fz%-*}" = "${ZONE%-*}" ]'; do
   grep -qF -- "$want" <<<"$VMS_SRC" || VMS_WIRE="$VMS_WIRE [$want]"
 done
 if [ -z "$VMS_WIRE" ]; then pass; else fail "build-platforms-gcp-iap.sh no longer carries:$VMS_WIRE"; fi
@@ -1235,13 +1237,21 @@ else pass; fi
 
 # The restore needs the VM TERMINATED, so the type change has to be undone by an
 # EXIT trap armed BEFORE the first set-machine-type runs, and in cleanup() only
-# after the stop. Asserted by line order, since that is the property.
-it "the restore trap is armed before the first set-machine-type, and cleanup stops before it restores"
-VMS_TRAP_LINE="$(grep -n 'trap restore_machine_type EXIT' scripts/build-platforms-gcp-iap.sh | head -1 | cut -d: -f1)"
+# after the stop. The trap the walk arms also stops what the walk started and
+# deletes the zone fallback's image: the first start runs before cleanup() is
+# the trap, and the fallback with it. Both guard the restore with `|| true`,
+# since under `set -e` its non-zero status would end the trap right there.
+# Asserted by line order, since that is the property.
+it "the walk's trap (stop, restore, image) is armed before the first set-machine-type, and cleanup stops before it restores"
+VMS_TRAP_LINE="$(grep -nF "trap 'stop_vm; restore_machine_type || true; delete_machine_image' EXIT" scripts/build-platforms-gcp-iap.sh | head -1 | cut -d: -f1)"
 VMS_SET_LINE="$(grep -n -- '--machine-type="$vm_type"' scripts/build-platforms-gcp-iap.sh | head -1 | cut -d: -f1)"
+VMS_STOP_DEF_LINE="$(grep -n '^stop_vm() {' scripts/build-platforms-gcp-iap.sh | head -1 | cut -d: -f1)"
+VMS_IMG_DEF_LINE="$(grep -n '^delete_machine_image() {' scripts/build-platforms-gcp-iap.sh | head -1 | cut -d: -f1)"
 if [ -n "$VMS_TRAP_LINE" ] && [ -n "$VMS_SET_LINE" ] && [ "$VMS_TRAP_LINE" -lt "$VMS_SET_LINE" ] \
-   && grep -q 'stop_vm; restore_machine_type; delete_machine_image; }' scripts/build-platforms-gcp-iap.sh; then pass
-else fail "order is trap@${VMS_TRAP_LINE:-?} set-machine-type@${VMS_SET_LINE:-?}; cleanup must run stop_vm, then restore_machine_type, then delete_machine_image"; fi
+   && [ -n "$VMS_STOP_DEF_LINE" ] && [ "$VMS_STOP_DEF_LINE" -lt "$VMS_TRAP_LINE" ] \
+   && [ -n "$VMS_IMG_DEF_LINE" ] && [ "$VMS_IMG_DEF_LINE" -lt "$VMS_TRAP_LINE" ] \
+   && grep -qF 'stop_vm; restore_machine_type || true; delete_machine_image; }' scripts/build-platforms-gcp-iap.sh; then pass
+else fail "order is stop_vm@${VMS_STOP_DEF_LINE:-?} delete_machine_image@${VMS_IMG_DEF_LINE:-?} trap@${VMS_TRAP_LINE:-?} set-machine-type@${VMS_SET_LINE:-?}; the trap's functions must be defined above it, and cleanup must run stop_vm, then restore_machine_type || true, then delete_machine_image"; fi
 
 # =============================================================================
 group "build-platforms-gcp-iap.sh -- the start loop against a stubbed gcloud"
@@ -1287,6 +1297,13 @@ case "\$a" in
   *"instances describe"*"value(name)"*)                 echo yaw-linux-builder ;;
   *"instances describe"*"value(status)"*)
     if [ -e "\$S/blank-status-once" ]; then rm -f "\$S/blank-status-once"; exit 0; fi
+    # stopping-for=<n>: the next n status reads of the ORIGINAL answer STOPPING
+    # (a stop in progress -- the previous run's --async stop, a schedule's),
+    # then the state file speaks again. A clone's reads never go through it.
+    if [ "\$ST" = "\$S/status" ] && [ -e "\$S/stopping-for" ]; then
+      n="\$(rd "\$S/stopping-for")"
+      if [ "\${n:-0}" -gt 0 ] 2>/dev/null; then echo \$((n - 1)) > "\$S/stopping-for"; echo STOPPING; exit 0; fi
+    fi
     rd "\$ST" ;;
   *"instances describe"*"machineType.basename()"*)      rd "\$TY" ;;
   *"instances describe"*"resourcePolicies"*)            echo ;;
@@ -1316,11 +1333,15 @@ case "\$a" in
   *"operations list"*)
     printf '2026-10-04T03:00:00.000-07:00\tservice-123456789@compute-system.iam.gserviceaccount.com\r\n' ;;
   # The zone fallback. zones=<names> is what \`zones list\` reports, each UP in
-  # us-west1 unless suffixed :DOWN; machine-images create records the image;
-  # instances create succeeds only in the zone clone-ok-zone names, and from
-  # then on the clone exists -- RUNNING, on the type asked for -- for every
-  # later call that names it; elsewhere the create is refused for capacity,
-  # and with leftover-clone set, us-west1-a already holds the earlier clone.
+  # us-west1 unless suffixed :DOWN; machine-images create records the image
+  # (interrupt-image: records it, then reports a Ctrl-C the way Windows sees
+  # it); instances create succeeds only in the zone clone-ok-zone names, and
+  # from then on the clone exists -- RUNNING, on the type asked for -- for
+  # every later call that names it; in the zone interrupt-create-zone names
+  # the clone comes up the same way but gcloud reports a Ctrl-C (the request
+  # went through, the answer did not); deny-create refuses every create for a
+  # missing permission; elsewhere the create is refused for capacity, and
+  # with leftover-clone set, us-west1-a already holds the earlier clone.
   *"zones list"*)
     for z in \$(rd "\$S/zones" 2>/dev/null); do
       st=UP; case "\$z" in *:*) st="\${z#*:}"; z="\${z%%:*}" ;; esac
@@ -1328,6 +1349,7 @@ case "\$a" in
     done ;;
   *"machine-images create"*)
     i="\${a##*machine-images create }"; i="\${i%% *}"; echo "\$i" > "\$S/image"
+    if [ -e "\$S/interrupt-image" ]; then printf '\n\nCommand killed by keyboard interrupt\n' >&2; exit 2; fi
     echo "Created [https://www.googleapis.com/compute/v1/projects/yaw-labs-prod/global/machineImages/\$i]." >&2 ;;
   *"machine-images delete"*)       rm -f "\$S/image" ;;
   *"instances create"*)
@@ -1336,6 +1358,11 @@ case "\$a" in
     t="\${a##*--machine-type=}"; t="\${t%% *}"
     if [ -e "\$S/leftover-clone" ] && [ "\$n" = "yaw-linux-builder-us-west1-a" ]; then
       printf "ERROR: (gcloud.compute.instances.create) Could not fetch resource:\r\n - The resource 'projects/yaw-labs-prod/zones/us-west1-a/instances/\$n' already exists\r\n\r\n" >&2; exit 1
+    elif [ -e "\$S/deny-create" ]; then
+      printf "ERROR: (gcloud.compute.instances.create) Could not fetch resource:\r\n - Required 'iam.serviceAccounts.actAs' permission for 'projects/yaw-labs-prod/serviceAccounts/123456789-compute@developer.gserviceaccount.com'\r\n\r\n" >&2; exit 1
+    elif [ -e "\$S/interrupt-create-zone" ] && [ "\$z" = "\$(rd "\$S/interrupt-create-zone")" ]; then
+      echo "\$n" > "\$S/clone"; echo RUNNING > "\$S/clone-status"; echo "\$t" > "\$S/clone-type"
+      printf '\n\nCommand killed by keyboard interrupt\n' >&2; exit 2
     elif [ -e "\$S/clone-ok-zone" ] && [ "\$z" = "\$(rd "\$S/clone-ok-zone")" ]; then
       echo "\$n" > "\$S/clone"; echo RUNNING > "\$S/clone-status"; echo "\$t" > "\$S/clone-type"
     else cat "\$S/exhausted.txt" >&2; exit 1; fi ;;
@@ -1347,9 +1374,12 @@ EOF
 # would -- the probe's `true`, the sync's extract, df, each build-remote.sh
 # dispatch -- and drops the next ssh-drop dispatches the way the 2026-09-25
 # schedule stop looked from here (OpenSSH's closing line, exit 255, the VM
-# TERMINATED behind it); fail-step-<dispatch> makes that dispatch exit 1, a
-# real failure that ends a run where a case wants it to. Every call lands in
-# the same log as gcloud's, so an order can be asserted across both.
+# TERMINATED behind it -- or in the state drop-status names, one word per
+# drop in turn; drop-stopping-for=<n> arms the gcloud stub's stopping-for at
+# the drop, for a stop still in progress behind it); fail-step-<dispatch>
+# makes that dispatch exit 1, a real failure that ends a run where a case
+# wants it to. Every call lands in the same log as gcloud's, so an order can
+# be asserted across both.
 cat > "$VMS_BIN/ssh" <<EOF
 #!/bin/bash
 S="$VMS_STATE"
@@ -1368,7 +1398,10 @@ case "\$cmd" in
       echo \$((left - 1)) > "\$S/ssh-drop"
       echo "[remote] \$d: running..."
       echo 'Connection to localhost closed by remote host.' >&2
-      echo TERMINATED > "\$S/status"
+      ds="\$(rd "\$S/drop-status" 2>/dev/null)"; st="\${ds%% *}"; [ -n "\$st" ] || st=TERMINATED
+      case "\$ds" in *" "*) echo "\${ds#* }" > "\$S/drop-status" ;; *) rm -f "\$S/drop-status" ;; esac
+      echo "\$st" > "\$S/status"
+      if [ -e "\$S/drop-stopping-for" ]; then cp "\$S/drop-stopping-for" "\$S/stopping-for"; fi
       exit 255
     fi
     if [ -e "\$S/fail-step-\$d" ]; then echo "[remote] \$d FAILED"; exit 1; fi
@@ -1386,10 +1419,13 @@ chmod +x "$VMS_BIN/gcloud" "$VMS_BIN/ssh" "$VMS_BIN/scp"
 # from a TERMINATED e2-highmem-4, with n2-highmem-4 the one fallback and no
 # budget for a second pass. Flags are state files the stubs read: a bare name
 # is an empty file (moved, start-quota, reject-set-<type>, interrupt-set-<type>,
-# leftover-clone, fail-step-<dispatch>); name=value writes the value (zones=,
-# clone-ok-zone=, ssh-mode=builder, ssh-drop=<n>, and the three knob files
-# zone-fallback, step-attempts and fallback-zones, which feed
-# OAM_GCP_ZONE_FALLBACK, OAM_REMOTE_STEP_ATTEMPTS and OAM_GCP_FALLBACK_ZONES).
+# leftover-clone, fail-step-<dispatch>, interrupt-image, deny-create);
+# name=value writes the value (zones=, clone-ok-zone=, interrupt-create-zone=,
+# ssh-mode=builder, ssh-drop=<n>, drop-status=<states>, drop-stopping-for=<n>,
+# stopping-for=<n>, and the knob files zone-fallback, step-attempts,
+# fallback-zones, start-budget, keep-vm and keep-schedule, which feed
+# OAM_GCP_ZONE_FALLBACK, OAM_REMOTE_STEP_ATTEMPTS, OAM_GCP_FALLBACK_ZONES,
+# OAM_VM_START_BUDGET_S, OAM_KEEP_VM and OAM_KEEP_VM_SCHEDULE).
 # The zone fallback is pinned OFF unless a case turns it on: the stub's default
 # answers describe a same-zone walk, and the capacity cases assert that walk's
 # own failure. Every OAM_* knob the orchestrator reads is pinned, so a shell
@@ -1403,7 +1439,9 @@ vms_knob(){ local v; if [ -e "$VMS_STATE/$1" ] && IFS= read -r v < "$VMS_STATE/$
 vms_run(){
   rm -f "$VMS_STATE/log" "$VMS_STATE/moved" "$VMS_STATE/start-quota" "$VMS_STATE/blank-status-once" "$VMS_STATE"/reject-set-* "$VMS_STATE"/interrupt-set-* \
         "$VMS_STATE"/clone* "$VMS_STATE/image" "$VMS_STATE/zones" "$VMS_STATE/leftover-clone" "$VMS_STATE/ssh-mode" "$VMS_STATE/ssh-drop" "$VMS_STATE"/fail-step-* \
-        "$VMS_STATE/zone-fallback" "$VMS_STATE/step-attempts" "$VMS_STATE/fallback-zones"
+        "$VMS_STATE/zone-fallback" "$VMS_STATE/step-attempts" "$VMS_STATE/fallback-zones" \
+        "$VMS_STATE/stopping-for" "$VMS_STATE/drop-status" "$VMS_STATE/drop-stopping-for" "$VMS_STATE/interrupt-image" "$VMS_STATE/deny-create" \
+        "$VMS_STATE/interrupt-create-zone" "$VMS_STATE/start-budget" "$VMS_STATE/keep-vm" "$VMS_STATE/keep-schedule"
   echo TERMINATED > "$VMS_STATE/status"; echo e2-highmem-4 > "$VMS_STATE/type"
   echo "$1" > "$VMS_STATE/good-type"; shift
   local flag
@@ -1411,9 +1449,9 @@ vms_run(){
     case "$flag" in *=*) printf '%s\n' "${flag#*=}" > "$VMS_STATE/${flag%%=*}" ;; *) : > "$VMS_STATE/$flag" ;; esac
   done
   VMS_OUT="$(PATH="$VMS_BIN:$PATH" TMPDIR="$VMS_TMP" OAM_GCP_FALLBACK_MACHINE_TYPES=n2-highmem-4 \
-    OAM_VM_START_BUDGET_S=0 OAM_IAP_SSH_MODE=direct OAM_GCP_BUILDER_ZONE=us-west1-b \
+    OAM_VM_START_BUDGET_S="$(vms_knob start-budget 0)" OAM_IAP_SSH_MODE=direct OAM_GCP_BUILDER_ZONE=us-west1-b \
     OAM_GCP_PROJECT=yaw-labs-prod OAM_GCP_BUILDER_INSTANCE=yaw-linux-builder OAM_LINUX_USER=jeff \
-    OAM_KEEP_VM=0 OAM_KEEP_VM_SCHEDULE=0 OAM_LINUX_FAST=0 \
+    OAM_KEEP_VM="$(vms_knob keep-vm 0)" OAM_KEEP_VM_SCHEDULE="$(vms_knob keep-schedule 0)" OAM_LINUX_FAST=0 \
     OAM_GCP_ZONE_FALLBACK="$(vms_knob zone-fallback 0)" OAM_REMOTE_STEP_ATTEMPTS="$(vms_knob step-attempts 3)" \
     OAM_GCP_FALLBACK_ZONES="$(vms_knob fallback-zones '')" \
     bash scripts/build-platforms-gcp-iap.sh --mode=release 2>"$SUITE_TMP/vms-err")"
@@ -1633,6 +1671,183 @@ it "a bad OAM_GCP_ZONE_FALLBACK or OAM_GCP_FALLBACK_ZONES fails before anything 
 if grep -qF "invalid OAM_GCP_ZONE_FALLBACK='2' (want 0 or 1)" <<<"$VMS_ERR_A" && [ -z "$VMS_LOG_A" ] \
    && grep -qF "invalid zone 'west1c' in OAM_GCP_FALLBACK_ZONES='us-west1-c west1c' (want zone names like us-west1-c, space-separated)" <<<"$VMS_ERR" && [ -z "$VMS_LOG" ]; then pass
 else fail "fallback=2: log:[$VMS_LOG_A] stderr:$(printf '\n  %s' "$VMS_ERR_A") zones: log:[$VMS_LOG] stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+# A zone of another region in OAM_GCP_FALLBACK_ZONES (a typo for us-west1-a)
+# fails once the builder's zone is final -- after the describe, before any
+# start -- rather than reaching `instances create` there once per machine
+# type, each refusal worded as the type's.
+vms_run none zone-fallback=1 "fallback-zones=us-central1-a us-west1-c" clone-ok-zone=us-west1-c
+it "a zone of another region in OAM_GCP_FALLBACK_ZONES fails once the builder's zone is known, before any start"
+if [ "$VMS_RC" != "0" ] \
+   && grep -qF "zone 'us-central1-a' in OAM_GCP_FALLBACK_ZONES='us-central1-a us-west1-c' is not in us-west1, the region of yaw-linux-builder's zone us-west1-b -- the zone fallback clones within the region (want other zones of us-west1)" <<<"$VMS_ERR" \
+   && grep -q 'instances describe' <<<"$VMS_LOG" \
+   && ! grep -qE 'instances (start|set-machine-type|create)|machine-images' <<<"$VMS_LOG"; then pass
+else fail "rc=$VMS_RC log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+# --- the walk and the clone under what the 2026-10-04 review found -------------
+
+# A VM still STOPPING when the walk begins -- the previous run's exit stop is
+# --async, so a re-run inside the minute sees exactly this -- says nothing
+# about capacity. It reads STOPPING at the top and on pass 1, which settles;
+# pass 2 is refused for capacity on every type with the budget then spent, and
+# the zone fallback must follow -- not a refusal to clone because the zone 'was
+# not shown to be out of capacity'. Budget 5s: pass 1 (one describe) ends
+# inside it, and what is left is the pause before pass 2.
+vms_run none zone-fallback=1 "zones=us-west1-a us-west1-c" clone-ok-zone=us-west1-c stopping-for=2 start-budget=5
+it "a VM found STOPPING on the first pass does not cost the walk its zone fallback"
+if [ "$VMS_RC" != "0" ] \
+   && grep -qF "Start VM yaw-linux-builder (status: STOPPING)" <<<"$VMS_ERR" \
+   && grep -qF "yaw-linux-builder is STOPPING, not TERMINATED -- waiting for it to settle before the next pass" <<<"$VMS_ERR" \
+   && grep -qF "no e2-highmem-4 capacity in us-west1-b (pass 2)" <<<"$VMS_ERR" \
+   && ! grep -qF "was not shown to be out of capacity" <<<"$VMS_ERR" \
+   && grep -qF "THIS RUN NOW BUILDS ON yaw-linux-builder-us-west1-c IN us-west1-c" <<<"$VMS_ERR"; then pass
+else fail "rc=$VMS_RC log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+# A restart under a step walks again with the first walk's drops: e2 was
+# refused for quota on pass 1 (regional; a minute changes nothing), so the
+# second walk must not set the VM back to it and ask again -- one quota
+# warning, three starts in all (e2 refused, n2 up, n2 up again), and the only
+# set back to e2 is the exit's.
+vms_run n2-highmem-4 start-quota ssh-mode=builder ssh-drop=1 fail-step-gate
+it "a second walk, after a stop under a step, keeps the types the first walk dropped"
+if [ "$VMS_RC" != "0" ] \
+   && [ "$(grep -c "e2-highmem-4 is not usable here -- not trying it again this run" <<<"$VMS_ERR")" = "1" ] \
+   && [ "$(grep -c 'Start VM yaw-linux-builder (status: TERMINATED)' <<<"$VMS_ERR")" = "2" ] \
+   && [ "$(grep -c 'instances start yaw-linux-builder' <<<"$VMS_LOG")" = "3" ] \
+   && [ "$(grep -c -- 'set-machine-type yaw-linux-builder --zone=us-west1-b --project=yaw-labs-prod --machine-type=e2-highmem-4' <<<"$VMS_LOG")" = "1" ] \
+   && grep -qF "remote prep ok" <<<"$VMS_ERR" && grep -qF "remote 'gate' failed" <<<"$VMS_ERR" \
+   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ]; then pass
+else fail "rc=$VMS_RC type=$(cat "$VMS_STATE/type") log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+# A Ctrl-C during the clone's `instances create`: gcloud exits 2 with the
+# request already through, and the clone comes up RUNNING in the other zone
+# while INSTANCE still names the original. The run must look, name the clone
+# with its delete command (and stop it, since nothing will build on it), and
+# still delete the image -- on the FIRST start, where cleanup() is not yet the
+# EXIT trap and the failure text promised the delete all the same.
+vms_run none zone-fallback=1 "zones=us-west1-a us-west1-c" interrupt-create-zone=us-west1-a
+it "a Ctrl-C during the clone's create names and stops the clone that came up anyway, and the first-start exit deletes the image"
+VMS_IMG="$(grep -oE 'yaw-linux-builder-img-[0-9]{8}-[0-9]{6}' <<<"$VMS_LOG" | head -1)"
+if [ "$VMS_RC" != "0" ] && [ -n "$VMS_IMG" ] \
+   && grep -qF "interrupted while creating yaw-linux-builder-us-west1-a in us-west1-a -- yaw-linux-builder-us-west1-a EXISTS in us-west1-a (RUNNING; a stop was issued) and is yours to delete: gcloud compute instances delete yaw-linux-builder-us-west1-a --zone=us-west1-a --project=yaw-labs-prod; machine image $VMS_IMG is deleted on exit" <<<"$VMS_ERR" \
+   && grep -qF -- "instances describe yaw-linux-builder-us-west1-a --zone=us-west1-a --project=yaw-labs-prod --format=value(status)" <<<"$VMS_LOG" \
+   && grep -qF -- "instances stop yaw-linux-builder-us-west1-a --zone=us-west1-a --project=yaw-labs-prod --async" <<<"$VMS_LOG" \
+   && [ "$(grep -c 'instances create ' <<<"$VMS_LOG")" = "1" ] \
+   && grep -qF -- "machine-images delete $VMS_IMG --project=yaw-labs-prod --quiet" <<<"$VMS_LOG" \
+   && grep -qF "deleted machine image $VMS_IMG" <<<"$VMS_ERR" \
+   && [ ! -e "$VMS_STATE/image" ] && [ "$(cat "$VMS_STATE/clone-status")" = "TERMINATED" ] \
+   && ! grep -q 'instances stop yaw-linux-builder ' <<<"$VMS_LOG" \
+   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ]; then pass
+else fail "rc=$VMS_RC img=${VMS_IMG:-?} log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+# The cold-run case: the image made, the first create refused for a missing
+# actAs permission (permanent), on the first start. The image must go at exit
+# as the failure text says -- and go even though the restore of the original
+# before the image failed (reject-set-e2: the stub's API says no): under
+# `set -e` a restore that returned non-zero unguarded would end the trap
+# before the delete. The restore is warned twice, there and again at exit.
+vms_run none zone-fallback=1 "zones=us-west1-a us-west1-c" deny-create reject-set-e2-highmem-4
+it "a clone create refused for good on the first start deletes the image at exit, as the failure says, even after a failed restore"
+VMS_IMG="$(grep -oE 'yaw-linux-builder-img-[0-9]{8}-[0-9]{6}' <<<"$VMS_LOG" | head -1)"
+if [ "$VMS_RC" != "0" ] && [ -n "$VMS_IMG" ] \
+   && grep -qF "creating yaw-linux-builder-us-west1-a in us-west1-a failed, and retrying cannot help: Required 'iam.serviceAccounts.actAs' permission" <<<"$VMS_ERR" \
+   && grep -qF "(machine image $VMS_IMG is deleted on exit)" <<<"$VMS_ERR" \
+   && [ "$(grep -c 'yaw-linux-builder is still n2-highmem-4 (status TERMINATED) -- set it back with:' <<<"$VMS_ERR")" = "2" ] \
+   && grep -qF -- "machine-images delete $VMS_IMG --project=yaw-labs-prod --quiet" <<<"$VMS_LOG" \
+   && grep -qF "deleted machine image $VMS_IMG" <<<"$VMS_ERR" \
+   && [ ! -e "$VMS_STATE/image" ] \
+   && [ "$(grep -c 'instances create ' <<<"$VMS_LOG")" = "1" ] \
+   && [ "$(cat "$VMS_STATE/type")" = "n2-highmem-4" ]; then pass
+else fail "rc=$VMS_RC img=${VMS_IMG:-?} log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+# A Ctrl-C during the minutes-long image create: an interrupt, not a refused
+# image. The image gcloud was polling exists, so the exit deletes it, and the
+# run stops on the interrupt rather than going on to 'could not be made'.
+vms_run none zone-fallback=1 "zones=us-west1-a us-west1-c" clone-ok-zone=us-west1-c interrupt-image
+it "a Ctrl-C during the machine image's create is an interrupt, and the image it left is deleted at exit"
+VMS_IMG="$(grep -oE 'yaw-linux-builder-img-[0-9]{8}-[0-9]{6}' <<<"$VMS_LOG" | head -1)"
+if [ "$VMS_RC" != "0" ] && [ -n "$VMS_IMG" ] \
+   && grep -qF "interrupted while creating machine image $VMS_IMG from yaw-linux-builder -- the request may have gone through, so the exit deletes the image if it exists" <<<"$VMS_ERR" \
+   && ! grep -qF "could not be made" <<<"$VMS_ERR" \
+   && ! grep -q 'instances create' <<<"$VMS_LOG" \
+   && grep -qF -- "machine-images delete $VMS_IMG --project=yaw-labs-prod --quiet" <<<"$VMS_LOG" \
+   && [ ! -e "$VMS_STATE/image" ] \
+   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ]; then pass
+else fail "rc=$VMS_RC img=${VMS_IMG:-?} log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+# The walk left the original on n2-highmem-4 and the restore before the image
+# is refused (reject-set-e2), while OAM_KEEP_VM=1 keeps the clone up at exit.
+# The clone message and the closing word must say what is so: the original
+# still on the fallback type, with the command that puts it back, at the clone
+# and again at exit after the clone's own line; the clone RUNNING, with the
+# command that stops it, and no stop issued.
+vms_run none zone-fallback=1 "zones=us-west1-a us-west1-c" clone-ok-zone=us-west1-c reject-set-e2-highmem-4 keep-vm=1
+it "an original whose restore failed before the clone is named, at the clone and at exit, as still on the fallback type"
+VMS_IMG="$(grep -oE 'yaw-linux-builder-img-[0-9]{8}-[0-9]{6}' <<<"$VMS_LOG" | head -1)"
+VMS_ORIGIN_NOTE="yaw-linux-builder in us-west1-b is stopped but STILL ON n2-highmem-4, not its own e2-highmem-4: setting it back failed before the clone was made. Set it back with: gcloud compute instances stop yaw-linux-builder --zone=us-west1-b --project=yaw-labs-prod && gcloud compute instances set-machine-type yaw-linux-builder --zone=us-west1-b --project=yaw-labs-prod --machine-type=e2-highmem-4"
+VMS_L_CLONE_WORD="$(grep -nF "this run's clone of yaw-linux-builder in us-west1-b" <<<"$VMS_ERR" | head -1 | cut -d: -f1)"
+VMS_L_ORIGIN_WORD="$(grep -nF "$VMS_ORIGIN_NOTE" <<<"$VMS_ERR" | tail -1 | cut -d: -f1)"
+if [ "$VMS_RC" != "0" ] && [ -n "$VMS_IMG" ] \
+   && grep -qF "yaw-linux-builder is still n2-highmem-4 (status TERMINATED) -- set it back with:" <<<"$VMS_ERR" \
+   && [ "$(grep -cF "$VMS_ORIGIN_NOTE" <<<"$VMS_ERR")" = "2" ] \
+   && grep -qF "made from machine image $VMS_IMG. $VMS_ORIGIN_NOTE The next run finds it by name as before, and reads that type as its own." <<<"$VMS_ERR" \
+   && ! grep -qF "yaw-linux-builder is untouched" <<<"$VMS_ERR" \
+   && [ -n "$VMS_L_CLONE_WORD" ] && [ -n "$VMS_L_ORIGIN_WORD" ] && [ "$VMS_L_CLONE_WORD" -lt "$VMS_L_ORIGIN_WORD" ] \
+   && [ "$(cat "$VMS_STATE/type")" = "n2-highmem-4" ]; then pass
+else fail "rc=$VMS_RC clone-word@${VMS_L_CLONE_WORD:-?} origin-word@${VMS_L_ORIGIN_WORD:-?} type=$(cat "$VMS_STATE/type") log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+it "with OAM_KEEP_VM=1 the clone is left RUNNING, and the clone message and the closing word say so, with the stop command"
+if grep -qF "The clone is left RUNNING when this run exits (OAM_KEEP_VM=1) and is NOT deleted; the image is." <<<"$VMS_ERR" \
+   && grep -qF "yaw-linux-builder-us-west1-c in us-west1-c, this run's clone of yaw-linux-builder in us-west1-b, is left RUNNING (OAM_KEEP_VM=1) -- it costs compute until: gcloud compute instances stop yaw-linux-builder-us-west1-c --zone=us-west1-c --project=yaw-labs-prod -- and is yours to delete when nothing needs it: gcloud compute instances delete yaw-linux-builder-us-west1-c --zone=us-west1-c --project=yaw-labs-prod" <<<"$VMS_ERR" \
+   && ! grep -qF "is left stopped" <<<"$VMS_ERR" \
+   && ! grep -q 'instances stop' <<<"$VMS_LOG" \
+   && [ "$(cat "$VMS_STATE/clone-status")" = "RUNNING" ] \
+   && grep -qF -- "machine-images delete $VMS_IMG --project=yaw-labs-prod --quiet" <<<"$VMS_LOG"; then pass
+else fail "rc=$VMS_RC clone-status=$(cat "$VMS_STATE/clone-status") log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+# The VM read STOPPING behind the drop and came back RUNNING by someone else's
+# hand while the restart waited for the stop to settle: a guest seconds into
+# its boot. Its sshd is waited for on the serial console before the reconnect,
+# as after this run's own start -- and it is not started again. (The settle
+# wait polls every 10s, so this case costs one of those.)
+vms_run e2-highmem-4 ssh-mode=builder ssh-drop=1 fail-step-gate drop-status=RUNNING drop-stopping-for=2
+it "a VM that came back RUNNING on its own under the restart's settle wait is waited for like a fresh boot before the reconnect"
+VMS_L_OPS="$(vms_line 'operations list' 1)"
+VMS_L_SERIAL2="$(vms_line 'get-serial-port-output' 2)"
+VMS_L_PROBE2="$(grep -nE -- '^ssh .* true$' <<<"$VMS_LOG" | awk -F: -v s="${VMS_L_OPS:-0}" '$1 > s { print $1; exit }')"
+if [ "$VMS_RC" != "0" ] \
+   && grep -qF "ssh transport dropped because yaw-linux-builder is STOPPING -- last stop operation:" <<<"$VMS_ERR" \
+   && grep -qF "yaw-linux-builder is STOPPING -- waiting for it to settle before starting it again (0s of 180s)" <<<"$VMS_ERR" \
+   && grep -qF "yaw-linux-builder is RUNNING again -- someone else started it; waiting for its sshd, then reconnecting without starting it" <<<"$VMS_ERR" \
+   && [ "$(grep -c 'instances start yaw-linux-builder' <<<"$VMS_LOG")" = "1" ] \
+   && [ "$(grep -c 'guest sshd up' <<<"$VMS_ERR")" = "2" ] \
+   && [ -n "$VMS_L_OPS" ] && [ -n "$VMS_L_SERIAL2" ] && [ -n "$VMS_L_PROBE2" ] \
+   && [ "$VMS_L_OPS" -lt "$VMS_L_SERIAL2" ] && [ "$VMS_L_SERIAL2" -lt "$VMS_L_PROBE2" ] \
+   && grep -qF "remote prep ok" <<<"$VMS_ERR" && grep -qF "remote 'gate' failed" <<<"$VMS_ERR"; then pass
+else fail "rc=$VMS_RC ops@${VMS_L_OPS:-?} serial2@${VMS_L_SERIAL2:-?} probe2@${VMS_L_PROBE2:-?} log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+# Three attempts: the first drop a VM stop (started again), the next two with
+# the VM RUNNING. The closing postmortem is about the transport, so it counts
+# the two RUNNING drops and names the stop apart -- not 'three times in a row'
+# with advice to switch transports. OAM_KEEP_VM_SCHEDULE=1 on the same run:
+# its warning has to describe this restart, not a run the stop kills.
+vms_run e2-highmem-4 ssh-mode=builder ssh-drop=3 step-attempts=3 "drop-status=TERMINATED RUNNING RUNNING" keep-schedule=1
+it "the postmortem after a stop and two transport drops counts the two drops and names the stop apart"
+if [ "$VMS_RC" != "0" ] \
+   && grep -qF "remote 'prep' lost its ssh transport on attempt 1 of 3 because yaw-linux-builder was stopped under it (TERMINATED)" <<<"$VMS_ERR" \
+   && grep -qF "remote 'prep' lost its ssh transport on attempt 2 of 3 while yaw-linux-builder is RUNNING -- reconnecting and running it again" <<<"$VMS_ERR" \
+   && grep -qF "ssh transport dropped under this step 2 times while yaw-linux-builder was RUNNING, each time reconnected (1 of the 3 attempts ended with yaw-linux-builder stopped under the step instead, and it was started again each time) -- the path to the builder is not holding (last transport: direct, direct IP 203.0.113.9). Try the other one: OAM_IAP_SSH_MODE=tunnel or =direct" <<<"$VMS_ERR" \
+   && ! grep -qF "times in a row" <<<"$VMS_ERR" \
+   && [ "$(grep -c 'instances start yaw-linux-builder' <<<"$VMS_LOG")" = "2" ] \
+   && [ "$(grep -cE 'build-remote.sh prep$' <<<"$VMS_LOG")" = "3" ] \
+   && grep -qF "remote 'prep' failed -- see" <<<"$VMS_ERR"; then pass
+else fail "rc=$VMS_RC log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+it "the OAM_KEEP_VM_SCHEDULE=1 warning describes the restart that follows a scheduled stop, not a run the stop kills"
+if grep -qF "OAM_KEEP_VM_SCHEDULE=1 -- leaving the VM's instance schedules attached. A scheduled stop under a remote step is followed by a start of the VM (the same walk as at the top, which can clone it into another zone) and the step again, counting against OAM_REMOTE_STEP_ATTEMPTS=3, and the VM is then this run's to stop on exit (OAM_KEEP_VM=1 keeps it); a stop outside a remote step, or on the last attempt, ends the run" <<<"$VMS_ERR" \
+   && ! grep -qF "will kill this run" <<<"$VMS_ERR" \
+   && ! grep -q 'value(resourcePolicies)' <<<"$VMS_LOG"; then pass
+else fail "rc=$VMS_RC log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
 
 # =============================================================================
 group "tailnet-helpers.sh -- the mac build host preflight"
