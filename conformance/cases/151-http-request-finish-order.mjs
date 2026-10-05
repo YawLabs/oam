@@ -270,9 +270,16 @@ async function writes(label, mod, options, drive) {
   });
   req.on("finish", () => events.push(`finish finished=${req.writableFinished}`));
   req.on("close", () => events.push("close"));
+  // 'response' is reported after the ordered events, not among them: over
+  // TLS on macOS, node's write callback for the last chunk (and so
+  // 'finish') lands after the response has been read, where on Linux and
+  // Windows it lands before -- the server answers only once it has the
+  // whole request, so that order is node's TLS write completion, not the
+  // request's.
+  let responded = false;
   await new Promise((resolve) => {
     req.on("response", (res) => {
-      events.push("response");
+      responded = true;
       res.resume();
       res.on("end", resolve);
     });
@@ -284,6 +291,7 @@ async function writes(label, mod, options, drive) {
     drive(req, events, cb);
   });
   await sleep(30);
+  if (responded) events.push("response");
   console.log(`${label}: ${events.join(", ")}`);
 }
 

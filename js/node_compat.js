@@ -11199,14 +11199,18 @@
   // the path as it reaches the C++ -- on Windows namespaced and with a
   // trailing separator (`\\?\C:\d\`), added only where the namespaced path
   // does not already end in one, as a drive or share root's does
-  // (`\\?\UNC\srv\sh\`). Off Windows the path is rendered as given to the
-  // C++, not measured.
+  // (`\\?\UNC\srv\sh\`). Off Windows the path as given, with a trailing
+  // `/` added where it does not already end in one (`d` -> `d/`, `./d` ->
+  // `./d/`, `d/` and `d//` as they are; measured on v22.23 on Linux and
+  // macOS): std::filesystem's `path / ""` on both.
   function cpDirWithoutRecursive(src, sync) {
     if (sync) {
       let shown = src;
       if (process.platform === "win32") {
         shown = globalThis.__oam.node.fsOsPathOf(src);
         if (!shown.endsWith("\\") && !shown.endsWith("/")) shown += "\\";
+      } else if (!shown.endsWith("/")) {
+        shown += "/";
       }
       return makeNodeError("ERR_FS_EISDIR", "Recursive option not enabled, cannot copy a directory: " + shown);
     }
@@ -11526,7 +11530,9 @@
         return Promise.reject(err);
       },
       opendir: withPath(async function (dirPath) {
-        return new Dir(dirPath, await natives.fsReaddir(dirPath));
+        // Raw order: node's Dir reads through uv_fs_readdir, which never
+        // sorts, where readdir's scandir sorts on unix.
+        return new Dir(dirPath, await natives.fsReaddir(dirPath, true));
       }),
       cp: (src, dest, options) => cpRecursive(toPath(src, "src"), toPath(dest, "dest"), options),
       // node's order: the path, the flags, the mode.
@@ -12650,7 +12656,7 @@
       },
       opendirSync: function (path) {
         var dirPath = toPath(path);
-        return new Dir(dirPath, natives.fsReaddirSync(dirPath));
+        return new Dir(dirPath, natives.fsReaddirSync(dirPath, true));
       },
       cpSync: function cpSync(src, dest, options) {
         cpSyncWalk(toPath(src, "src"), toPath(dest, "dest"), options || {}, true);
@@ -28399,6 +28405,19 @@
         this.bytesWritten = 0;
         this.bufferSize = 0;
         this.allowHalfOpen = (options && options.allowHalfOpen) || false;
+        // The writable highWaterMark, taken at construction as node's Duplex
+        // takes it: the option, else the platform default -- 16 KiB on
+        // Windows, 64 KiB elsewhere (internal/streams/state; measured: a
+        // 20000-byte write sets needDrain under node v22 on Windows and not
+        // on macOS or Linux). Taken HERE and not lazily in write(): the first
+        // load of that module costs milliseconds, and spent between a write
+        // and a resetAndDestroy() they moved the reset into the window where
+        // macOS loses it for a peer that is not reading (conformance case
+        // 252 hung on every run; node itself stalls there with a 2-5 ms gap).
+        this._writableHighWaterMark =
+          options && options.writableHighWaterMark != null ? options.writableHighWaterMark
+          : options && options.highWaterMark != null ? options.highWaterMark
+          : globalThis.__oamVendor.require("internal/streams/state").getDefaultHighWaterMark(false);
         // Node's net.Socket is a Duplex stream, so libraries read its stream
         // state objects directly. ws's socketOnClose reads socket._readableState
         // (.endEmitted / .length) and its bufferedAmount getter reads
@@ -28959,9 +28978,11 @@
         return null;
       }
 
-      // Node's default for a net.Socket. Settable, as Node allows via options.
+      // Taken at construction (see the constructor); settable, as Node
+      // allows via options. The fallback is for a socket built without the
+      // constructor's run (Object.create): node's platform default.
       get writableHighWaterMark() {
-        return this._writableHighWaterMark ?? 16384;
+        return this._writableHighWaterMark ?? (process.platform === "win32" ? 16384 : 65536);
       }
       set writableHighWaterMark(v) {
         this._writableHighWaterMark = v;
@@ -34772,11 +34793,20 @@
       if (buf.length > 0) stream.push(buf);
       return stream._held === null && stream.readableLength < kDefaultInitialWindowSize;
     }
-    // The bytes pushInWindow held back, first on the next read.
+    // The bytes pushInWindow held back, first on the next read. A _read() is
+    // JS asking, so they go in whatever the buffer holds: a Readable whose
+    // _read() pushes nothing stays `reading` and is never asked again, and
+    // off Windows node's default highWaterMark (64 KiB, over the window)
+    // has resume()'s read(0) ask with a window's worth still buffered --
+    // pushing nothing there hung an unread body of a window or more for
+    // good (conformance case 345 on macOS and Linux). A resumed stream may
+    // so hold a window plus one frame for a moment, as node's does while
+    // its WINDOW_UPDATE is on the wire. True when the stream reads on.
     function pushHeld(stream) {
       var held = stream._held;
       stream._held = null;
-      return pushInWindow(stream, held);
+      stream.push(held);
+      return stream.readableLength < kDefaultInitialWindowSize;
     }
     function emitTrailers(stream, pairs) {
       var raw = [];

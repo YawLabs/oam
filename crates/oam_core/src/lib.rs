@@ -5079,8 +5079,26 @@ pub mod ops {
         payload.to_string()
     }
 
-    pub fn readdir_to_json(path: &str) -> std::io::Result<String> {
-        let mut entries = Vec::new();
+    /// The order libuv's scandir hands node's `readdir`: on unix sorted by
+    /// name, bytewise (src/unix/fs.c `uv__fs_scandir_sort` is strcmp); on
+    /// Windows the file system's own, which NTFS already keeps sorted by
+    /// its own collation, so nothing is imposed there.
+    #[cfg(not(windows))]
+    fn sort_as_scandir(found: &mut [(std::ffi::OsString, &'static str)]) {
+        use std::os::unix::ffi::OsStrExt;
+        found.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    }
+    #[cfg(windows)]
+    fn sort_as_scandir(_found: &mut [(std::ffi::OsString, &'static str)]) {}
+
+    /// The entries of `path` as node hands them out: `readdir`'s come from
+    /// libuv's scandir, sorted on unix (`sort_as_scandir`); `raw` asks for
+    /// the file system's own order, which is what `opendir`'s Dir reads
+    /// through uv_fs_readdir on every platform. Measured on node v22.23 on
+    /// macOS (APFS returns `a, top.txt, lnk, c, b`; readdir answers
+    /// `a, b, c, lnk, top.txt`) and Linux.
+    pub fn readdir_to_json(path: &str, raw: bool) -> std::io::Result<String> {
+        let mut found = Vec::new();
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let kind = match entry.file_type() {
@@ -5088,11 +5106,20 @@ pub mod ops {
                 Ok(t) if t.is_dir() => "dir",
                 _ => "file",
             };
-            entries.push(serde_json::json!({
-                "name": entry.file_name().to_string_lossy(),
-                "kind": kind,
-            }));
+            found.push((entry.file_name(), kind));
         }
+        if !raw {
+            sort_as_scandir(&mut found);
+        }
+        let entries: Vec<serde_json::Value> = found
+            .iter()
+            .map(|(name, kind)| {
+                serde_json::json!({
+                    "name": name.to_string_lossy(),
+                    "kind": kind,
+                })
+            })
+            .collect();
         Ok(serde_json::Value::Array(entries).to_string())
     }
 
@@ -5273,10 +5300,10 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_readdir(path: super::FsPath) -> OpOutcome {
+    pub async fn fs_readdir(path: super::FsPath, raw: bool) -> OpOutcome {
         match tokio::task::spawn_blocking({
             let path = path.clone();
-            move || readdir_to_json(path.os())
+            move || readdir_to_json(path.os(), raw)
         })
         .await
         .unwrap_or_else(|e| Err(std::io::Error::other(e)))

@@ -194,6 +194,22 @@ below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Fixed
 
+- **An http2 body of a window or more, left unread and then resumed, reaches its end off
+  Windows.** Node's default stream highWaterMark is 64 KiB everywhere but Windows, more than the
+  65535-byte stream window oam fills while JS does not read, so `resume()` asked for more with a
+  window's worth still buffered and oam's held-back bytes were not pushed: the stream stayed
+  `reading` and was never asked again, and the body never ended (nor its trailers came). The
+  held bytes now go in whenever the stream asks.
+- **`fs.readdir` lists entries in node's order on macOS and Linux: sorted by name.** Node's
+  readdir is libuv's scandir, which sorts on unix; oam handed back the file system's own order,
+  which APFS and ext4 do not keep sorted. `opendir`'s Dir still reads in the file system's order,
+  as node's does through uv_fs_readdir. Windows is unchanged.
+- **`net.Socket`'s write highWaterMark is node's default for the platform: 16 KiB on Windows,
+  64 KiB elsewhere.** It was 16 KiB everywhere, so on macOS and Linux a socket's `write()`
+  returned false, and 'drain' followed, four times earlier than node's, and `writableNeedDrain`
+  read true where node's reads false.
+- **`fs.cpSync` of a directory without `recursive` names the directory as node's message does
+  off Windows: with a trailing `/` unless it already ends in one.**
 - **The type-check daemon's tsgo runs without a console window on Windows.** The daemon has
   no console (it is spawned detached), so each tsgo it ran — the version probe and every
   check — got a new console with a visible window, which flashed on the desktop and, under
