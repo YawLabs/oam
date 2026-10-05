@@ -678,9 +678,20 @@ pub async fn out(bridges: Bridges, id: u64) -> OpOutcome {
     // JS reads the newest progress when this completes, whichever branch
     // woke it.
     seen.mark_unchanged();
-    if let Some(bridge) = lock(&bridges).get_mut(&id) {
-        bridge.out = Some((half, seen));
-    }
+    let mut guard = lock(&bridges);
+    let Some(bridge) = guard.get_mut(&id) else {
+        // Closed while parked. [`close`] drops the bridge, and with it
+        // hyper's end of the pipe and the progress sender, but the
+        // connection task it aborts unwinds on its own schedule: its last
+        // flush can move the progress before the pipe's end reaches the
+        // read, and then this woke on the progress and would report empty
+        // bytes to a caller that closed the bridge itself (the Linux
+        // release leg, once in ~30 runs). A closed bridge has nothing more
+        // to say, whichever event woke the read: the end.
+        return OpOutcome::Done;
+    };
+    bridge.out = Some((half, seen));
+    drop(guard);
     match read {
         None => OpOutcome::Bytes(Vec::new()),
         Some(Ok(0) | Err(_)) => OpOutcome::Done,
