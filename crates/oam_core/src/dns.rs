@@ -93,14 +93,49 @@ fn host(name: &hickory_resolver::proto::rr::Name) -> String {
 /// dns.lookup: getaddrinfo of `name`, the UTS #46 ToASCII form of `hostname`
 /// node's GetAddrInfo hands libuv; errors name `hostname` as written. An
 /// empty `name` is libuv's EINVAL (see `net_connect::resolve_as`).
-pub async fn dns_lookup(hostname: String, name: String, family: i32, all: bool) -> OpOutcome {
+///
+/// `flags` are node's `hints` as getaddrinfo takes them (AI_V4MAPPED, AI_ALL;
+/// the platform's values), handed to the platform resolver with the family
+/// and SOCK_STREAM, as libuv's uv_getaddrinfo hands node's. The answer is
+/// then the resolver's own, duplicates included: glibc answers a name with
+/// `::1` and `127.0.0.1` lines in /etc/hosts under AI_V4MAPPED | AI_ALL with
+/// the mapped `::ffff:127.0.0.1` twice, and node reports both (the 0.18.0
+/// linux release leg, conformance case 228). Emulating the flags over an
+/// unflagged lookup answered it once.
+pub async fn dns_lookup(
+    hostname: String,
+    name: String,
+    family: i32,
+    all: bool,
+    flags: i32,
+) -> OpOutcome {
     if name.is_empty() {
         return OpOutcome::sys(crate::net_connect::empty_name_error(&hostname));
     }
-    let lookup = format!("{}:0", name);
-    let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(&lookup).await {
-        Ok(iter) => iter.collect(),
-        Err(_) => {
+    // AF_UNSPEC is 0 everywhere; the crate names only the concrete families.
+    let address: i32 = match family {
+        4 => dns_lookup::AddrFamily::Inet.into(),
+        6 => dns_lookup::AddrFamily::Inet6.into(),
+        _ => 0,
+    };
+    let hints = dns_lookup::AddrInfoHints {
+        flags,
+        address,
+        socktype: dns_lookup::SockType::Stream.into(),
+        protocol: 0,
+    };
+    let answered = tokio::task::spawn_blocking(move || {
+        dns_lookup::getaddrinfo(Some(&name), None, Some(hints)).map(|answers| {
+            answers
+                .filter_map(Result::ok)
+                .map(|answer| answer.sockaddr)
+                .collect::<Vec<std::net::SocketAddr>>()
+        })
+    })
+    .await;
+    let addrs: Vec<std::net::SocketAddr> = match answered {
+        Ok(Ok(addrs)) => addrs,
+        _ => {
             return OpOutcome::node_failed(
                 "ENOTFOUND",
                 format!("getaddrinfo ENOTFOUND {hostname}"),

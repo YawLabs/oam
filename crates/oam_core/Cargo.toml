@@ -105,6 +105,9 @@ rustls-webpki = { version = "0.103", default-features = false, features = ["ring
 # "all" for the fetch connector's keepalive probe count and TCP_USER_TIMEOUT;
 # hyper-util already builds socket2 with it.
 socket2 = { version = "0.6", features = ["all"] }
+# getaddrinfo with node's hints (AI_V4MAPPED, AI_ALL): a safe wrapper, so the
+# answer is the platform resolver's, duplicates and all, as node's is.
+dns-lookup = "4"
 # fs.mkdtemp's names (lib.rs `mkdtemp`): the OS CSPRNG, as libuv draws them
 # from RtlGenRandom and glibc from getrandom(2).
 #

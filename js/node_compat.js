@@ -11357,7 +11357,10 @@
       if (raw.kind === "dir") {
         if (!opts.recursive) throw cpDirWithoutRecursive(srcStr, false);
         try { await natives.fsMkdir(destStr, true); } catch (e) {}
-        var entries = await natives.fsReaddir(srcStr);
+        // Raw order: node's cp walks a directory through opendir
+        // (lib/internal/fs/cp/cp.js), which never sorts, so which entry a
+        // type mismatch is reported for is the file system's order.
+        var entries = await natives.fsReaddir(srcStr, true);
         // node joins each entry's paths with path.join, so an error names
         // them with the platform's separator.
         var join = registry.get("path").join;
@@ -12393,7 +12396,9 @@
       if (raw.kind === "dir") {
         if (!opts.recursive) throw cpDirWithoutRecursive(srcStr, true);
         try { natives.fsMkdirSync(destStr, true); } catch (e) {}
-        var entries = natives.fsReaddirSync(srcStr);
+        // Raw order, as node's cpSync walks it (std::filesystem's directory
+        // iterator; see the async cp above).
+        var entries = natives.fsReaddirSync(srcStr, true);
         var join = registry.get("path").join;
         for (var i = 0; i < entries.length; i++) {
           cpSyncWalk(join(srcStr, entries[i].name), join(destStr, entries[i].name), opts, false);
@@ -28670,7 +28675,10 @@
             // the write ahead of it): the shutdown, and anything after it,
             // are held until the 'connect' listeners have run. Through an
             // IP literal node issues the shutdown first and refuses the
-            // reset with EINVAL, and so does oam.
+            // reset with EINVAL, and so does oam. (Through a name on Linux,
+            // node also issues the shutdown first, refuses the reset, and its
+            // client then never closes; oam keeps the macOS and Windows order
+            // there -- docs/node-divergences.md, conformance case 297.)
             const afterConnect = this._releaseHeldOps(this._resetAtConnect === true);
             this.emit("connect");
             this.emit("ready");
@@ -34016,7 +34024,7 @@
     // promises API and the Resolver class all inherit the same shaped error --
     // dns.promises.lookup() used to hand back the bare op error because it
     // returned the native promise straight to the caller.
-    function _dnsLookup(hostname, family, all) {
+    function _dnsLookup(hostname, family, all, flags = 0) {
       const host = String(hostname);
       // node answers an IP literal itself, as written (no resolver, no
       // family filter): '0:0:0:0:0:0:0:1' stays that, '::1%1' keeps its zone.
@@ -34025,7 +34033,7 @@
         const answer = { address: host, family: literal };
         return Promise.resolve(all ? [answer] : answer);
       }
-      return natives.dnsLookup(host, family, all).then(undefined, (err) => {
+      return natives.dnsLookup(host, family, all, flags).then(undefined, (err) => {
         throw _shapeDnsError(err, "getaddrinfo", host, true);
       });
     }
@@ -34069,26 +34077,15 @@
       return hints;
     }
 
-    // dns.lookup with its hints. AI_V4MAPPED and AI_ALL mean something only
-    // for an IPv6 lookup, and getaddrinfo's rule for them is plain enough to
-    // apply to the unfiltered answer: V4MAPPED answers the IPv4 addresses as
-    // `::ffff:a.b.c.d` when there is no IPv6 one, and with ALL as well as the
-    // IPv6 ones. AI_ADDRCONFIG is not applied: oam's resolver is getaddrinfo
-    // without hints (docs/node-divergences.md).
+    // dns.lookup with its hints: AI_V4MAPPED and AI_ALL go to getaddrinfo
+    // with the family, as node's do, so the answer is the platform
+    // resolver's own -- glibc answers a name with both `::1` and
+    // `127.0.0.1` in /etc/hosts under V4MAPPED | ALL with the mapped
+    // address twice, and node reports both; emulating the flags over an
+    // unflagged lookup answered it once (case 228 on the linux leg).
+    // AI_ADDRCONFIG is not applied (docs/node-divergences.md).
     function _dnsLookupHinted(hostname, family, all, hints) {
-      if (family !== 6 || (hints & V4MAPPED) === 0 || registry.get("net").isIP(String(hostname))) {
-        return _dnsLookup(hostname, family, all);
-      }
-      return _dnsLookup(hostname, 0, true).then((answers) => {
-        const v6 = answers.filter((a) => a.family === 6);
-        const mapped = answers
-          .filter((a) => a.family === 4)
-          .map((a) => ({ address: `::ffff:${a.address}`, family: 6 }));
-        const merged = hints & ALL ? v6.concat(mapped) : v6.length > 0 ? v6 : mapped;
-        // None at all is the error an IPv6 lookup of the name reports.
-        if (merged.length === 0) return _dnsLookup(hostname, 6, all);
-        return all ? merged : merged[0];
-      });
+      return _dnsLookup(hostname, family, all, hints & (V4MAPPED | ALL));
     }
 
     function lookup(hostname, options, callback) {
