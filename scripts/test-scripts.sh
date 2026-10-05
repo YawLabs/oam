@@ -6290,7 +6290,30 @@ run_taps(){
 
 # What origin actually SERVES -- the only question that matters here. Every
 # defect below reported success while this stayed on the old release.
-served(){ git -C "$taps_dir/$1.git" show "refs/heads/main:$2" 2>/dev/null; }
+#
+# A read that git itself FAILS is asked again, up to five times 0.4s apart;
+# a read that succeeds is final, whatever it says, so a tap left on the wrong
+# version still fails at once. Under a full suite run a git read of a bare
+# repo just pushed to can fail for a moment on Windows (an object file still
+# held open by the push or a scanner), and with stderr discarded that empty
+# answer read exactly like "origin still serves the old release": the
+# downgrade case failed about one group run in six on 2026-10-04 while the
+# script had pushed. The last failed read's own message is kept in
+# SERVED_ERR for the case to print.
+SERVED_ERR=""
+served(){
+  local try out err
+  SERVED_ERR=""
+  for try in 1 2 3 4 5; do
+    err="$SUITE_TMP/served-err"
+    if out="$(git -C "$taps_dir/$1.git" show "refs/heads/main:$2" 2>"$err")"; then
+      printf '%s\n' "$out"; return 0
+    fi
+    SERVED_ERR="$(head -2 "$err" 2>/dev/null | tr '\n' ' ')"
+    if [ "$try" -lt 5 ]; then sleep 0.4; fi
+  done
+  return 1
+}
 
 if ! command -v git >/dev/null 2>&1; then
   it "bump-taps.sh cases"; skip "git not on PATH"
@@ -6390,11 +6413,16 @@ else
   else fail "the early abort did not report its real reason: $OUT"; fi
 
   it "a downgrade proceeds when it is asked for explicitly"
+  # Its own fixture, brought to 0.14.0 first, as the header above asks of
+  # every case -- not the repos the two refusal cases before it left behind.
+  taps_fixture
+  run_taps v0.14.0 >/dev/null
   OUT="$(OAM_ALLOW_DOWNGRADE=1 PATH="$TAPS_BIN:$PATH" \
         OAM_HOMEBREW_DIR="$taps_dir/homebrew-yaw" OAM_SCOOP_DIR="$taps_dir/scoop-yaw" \
         bash "$REPO_DIR/scripts/bump-taps.sh" v0.13.2 2>&1)"
-  if printf '%s' "$(served homebrew-yaw Formula/oam.rb)" | grep -q 'version "0.13.2"'; then pass
-  else fail "an explicitly authorized downgrade did not land: $OUT"; fi
+  TAPS_SERVED="$(served homebrew-yaw Formula/oam.rb)"
+  if printf '%s' "$TAPS_SERVED" | grep -q 'version "0.13.2"'; then pass
+  else fail "an explicitly authorized downgrade did not land (origin serves: $(printf '%s' "$TAPS_SERVED" | grep -m1 'version' || echo "nothing -- git: ${SERVED_ERR:-no error}")): $OUT"; fi
 
   it "an untracked file does not block a tap that is behind origin"
   # `git rebase` does not care about untracked files, and the advice the refusal
