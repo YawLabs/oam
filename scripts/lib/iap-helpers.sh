@@ -22,6 +22,10 @@
 #   gcloud_error_message  2026-09-30 release died on a zone with no
 #   vm_start_zones_available  e2-highmem-4 for its whole retry window, with
 #                       gcloud's stderr thrown away and the log guessing.
+#   remote_step_verdict what a remote step whose ssh dropped gets: run again,
+#                       the VM started again first, or the postmortem.
+#   zone_fallback_candidates  which zones a builder whose zone stayed out of
+#   gce_zone_name_valid capacity for the whole budget is cloned into.
 #
 # Same convention as lib/build-locks.sh: sourced, never executed. All functions
 # RETURN status rather than exiting; the caller owns fail()/warn(). The one
@@ -188,18 +192,38 @@ ssh_transport_dropped() {
   grep -qE 'closed by remote host|Connection reset by peer|Broken pipe|Connection closed by|client_loop: send disconnect|Connection timed out' <<<"$1"
 }
 
-# remote_step_should_retry <attempt> <max> <ssh-exit> <log-tail-text> <vm-status>
-# -- 0 when a failed remote step is worth running again: ssh itself failed
-# (exit 255 -- a remote command's own status is 0..254, so a test whose
-# output merely mentions a reset connection never counts), its log ends in a
-# transport drop (above), the VM is still RUNNING, and attempts remain. A VM
-# that is not RUNNING is left to the postmortem, which says who stopped it.
-remote_step_should_retry() {
+# remote_step_verdict <attempt> <max> <ssh-exit> <log-tail-text> <vm-status>
+# Echoes what a failed remote step gets. A step is worth running again only
+# when ssh ITSELF failed (exit 255 -- a remote command's own status is
+# 0..254, so a test whose output merely mentions a reset connection never
+# counts), its log ends in a transport drop (above), and attempts remain;
+# then the VM's state says how:
+#   rerun    the VM is still RUNNING: the path to it broke (a reset IAP relay,
+#            a cut direct connection, an sshd restart) -- reconnect, run again
+#   restart  the VM is TERMINATED or STOPPING: someone or something stopped
+#            it under the step (an operator, a schedule this run could not
+#            detach, a host event) -- start it again by the same walk as at
+#            the top, reconnect, run again; the postmortem says who first
+#   no       anything else: a command that exited, the last attempt, a VM in
+#            a state this does not know how to recover (STAGING, SUSPENDED,
+#            unreadable) -- the postmortem, then the failure
+remote_step_verdict() {
   local attempt="$1" max="$2" rc="$3" tail="$4" status="$5"
-  [ "$attempt" -lt "$max" ] 2>/dev/null || return 1
-  [ "$rc" = "255" ] || return 1
-  [ "$status" = "RUNNING" ] || return 1
-  ssh_transport_dropped "$tail"
+  if [ "$attempt" -lt "$max" ] 2>/dev/null && [ "$rc" = "255" ] && ssh_transport_dropped "$tail"; then
+    case "$status" in
+      RUNNING) printf 'rerun'; return 0 ;;
+      TERMINATED | STOPPING) printf 'restart'; return 0 ;;
+    esac
+  fi
+  printf 'no'
+}
+
+# remote_step_should_retry <attempt> <max> <ssh-exit> <log-tail-text> <vm-status>
+# -- 0 when the verdict above is `rerun`: the step is run again against the VM
+# as it is. Kept as the status-only form of the same decision, over the same
+# function, so the two cannot drift.
+remote_step_should_retry() {
+  [ "$(remote_step_verdict "$@")" = "rerun" ]
 }
 
 # --- ssh transport: direct first, the IAP tunnel as the fallback --------------
@@ -386,6 +410,51 @@ vm_start_zones_available() {
   z="${z//\'/}"; z="${z//\"/}"; z="${z//[[:space:]]/}"
   [ -n "$z" ] || return 1
   printf '%s' "$z"
+}
+
+# --- zone fallback: clone the builder into a zone that has capacity ----------
+#
+# When a whole start budget goes by with every start refused for capacity, no
+# machine type of the walk is coming back to that zone soon, and the only way
+# on is another zone. The orchestrator then makes a machine image of the
+# stopped builder and creates `<instance>-<zone>` from it in another zone of
+# the region, for that run only; these are the pure parts of choosing where.
+
+# gce_zone_name_valid <name>   -- 0 for the shape of a GCE zone name:
+# <continent>-<area><n>-<letter> (us-west1-b, europe-west4-a,
+# northamerica-northeast1-a). Checked before anything touches a VM, like the
+# other knobs: a typo in OAM_GCP_FALLBACK_ZONES must not first show up as a
+# refused clone half an hour into a walk.
+gce_zone_name_valid() {
+  [[ "${1//$'\r'/}" =~ ^[a-z]+-[a-z]+[0-9]+-[a-z]$ ]]
+}
+
+# zone_fallback_candidates <zone> <operator-list> <region> <zones-list-output>
+# One zone per line to clone the builder into, never <zone> itself and never
+# one twice: the operator's list (OAM_GCP_FALLBACK_ZONES, space-separated) as
+# given when it has anything in it, else every zone of <region> that `gcloud
+# compute zones list --format='value(name,status,region.basename())'` reports
+# UP, in its order. A reading without the region column is taken at its word
+# (the filter already narrowed it). CRs stripped (gcloud on Windows).
+# Non-zero, echoing nothing, when there is nothing to try.
+zone_fallback_candidates() {
+  local zone="${1//$'\r'/}" list="${2//$'\r'/}" region="$3" reading="${4//$'\r'/}"
+  local z status r seen=" " any=0
+  if [ -n "${list//[[:space:]]/}" ]; then
+    for z in $list; do
+      [ "$z" != "$zone" ] || continue
+      case "$seen" in *" $z "*) continue ;; esac
+      printf '%s\n' "$z"; seen="$seen$z "; any=1
+    done
+  else
+    while IFS=$'\t' read -r z status r; do
+      [ -n "$z" ] && [ "$z" != "$zone" ] && [ "$status" = "UP" ] || continue
+      [ -z "$r" ] || [ "$r" = "$region" ] || continue
+      case "$seen" in *" $z "*) continue ;; esac
+      printf '%s\n' "$z"; seen="$seen$z "; any=1
+    done <<<"$reading"
+  fi
+  [ "$any" = "1" ]
 }
 
 # --- background process reaping -----------------------------------------------
