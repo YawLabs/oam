@@ -78,21 +78,76 @@
 #                             CPUS), all ample for one VM here. Empty
 #                             disables the fallback.)
 #   OAM_REMOTE_STEP_ATTEMPTS  3                  (default -- times a remote
-#                                                step is run when the ssh
-#                                                transport under it drops
-#                                                while the VM stays RUNNING;
-#                                                each retry reconnects first,
-#                                                direct again or the IAP
-#                                                tunnel. A step whose command
-#                                                EXITS non-zero is never
-#                                                retried.)
+#                                                step is run, in all, when the
+#                                                ssh transport under it drops.
+#                                                A VM still RUNNING is
+#                                                reconnected to, direct again
+#                                                or the IAP tunnel; one that is
+#                                                TERMINATED or STOPPING --
+#                                                stopped under the step by an
+#                                                operator, a schedule this run
+#                                                could not detach, a host event
+#                                                -- is started again by the
+#                                                same walk as at the top, once
+#                                                a stop in progress has settled
+#                                                (3 minutes at most) and the
+#                                                postmortem has said who
+#                                                stopped it, and is this run's
+#                                                to stop on exit from then on.
+#                                                Every attempt counts against
+#                                                the same number. A step whose
+#                                                command EXITS non-zero is
+#                                                never retried.)
 #   OAM_VM_START_BUDGET_S     1800               (default -- seconds after
 #                                                which no further pass over
 #                                                those types begins; a pass
 #                                                in progress finishes, passes
 #                                                are a minute apart, and the
-#                                                run then fails naming the
-#                                                zone move; whole seconds)
+#                                                run then clones the builder
+#                                                into another zone (below) or
+#                                                fails naming the zone move;
+#                                                whole seconds)
+#   OAM_GCP_ZONE_FALLBACK     1                  (default -- when the budget is
+#                                                spent with every start refused
+#                                                for capacity, the run moves to
+#                                                another zone of the region
+#                                                WITHOUT touching the builder:
+#                                                a machine image of it
+#                                                (<instance>-img-<run id>:
+#                                                disks, metadata, service
+#                                                account, scopes, tags, network
+#                                                config; the boot disk's copy
+#                                                keeps the cargo cache warm),
+#                                                then an instance from that
+#                                                image, <instance>-<zone>, in
+#                                                each candidate zone and each
+#                                                machine type of the walk,
+#                                                until one boots. The original
+#                                                stays stopped on its own type
+#                                                and the next run finds it by
+#                                                name as before. The clone is
+#                                                stopped on exit and left for
+#                                                the operator to delete (the
+#                                                command is printed, at the
+#                                                clone and again at exit); the
+#                                                image is deleted on exit, or
+#                                                kept and named, with the hand
+#                                                move, when no zone took it. A
+#                                                start refused for anything but
+#                                                capacity (a backend error, a
+#                                                timeout) keeps the run in its
+#                                                zone: that is not a stockout.
+#                                                A clone is never cloned again.
+#                                                0: fail as before, naming the
+#                                                zone move.)
+#   OAM_GCP_FALLBACK_ZONES    (unset)            (the zones to clone into,
+#                                                space-separated, in order;
+#                                                default: the other UP zones of
+#                                                the builder's region, in
+#                                                `gcloud compute zones list`
+#                                                order. Each must look like a
+#                                                zone name, us-west1-c; the
+#                                                builder's own zone is skipped.)
 #   OAM_IAP_SSH_MODE          auto               (default -- direct ssh to the
 #                                                VM's external IP, falling back
 #                                                to the IAP tunnel, with a
@@ -110,7 +165,12 @@
 #   - gcloud CLI authenticated; identity has compute.instances.get (and
 #     start/stop for the lifecycle step, instances.setMachineType for the
 #     capacity fallback, compute.resourcePolicies.get +
-#     instances.{add,remove}ResourcePolicies for the instance-schedule step).
+#     instances.{add,remove}ResourcePolicies for the instance-schedule step,
+#     and for the zone fallback compute.machineImages.{create,delete,
+#     useReadOnly}, compute.instances.create in the other zones,
+#     compute.zones.list, plus iam.serviceAccounts.actAs on the builder's
+#     service account, which the clone runs as -- roles/compute.instanceAdmin.v1
+#     with roles/iam.serviceAccountUser covers it).
 #   - Direct path: the VM has an external IP, and TCP:22 on it is reachable
 #     from this host (the default network's default-allow-ssh rule opens it
 #     to 0.0.0.0/0); ~/.ssh/google_compute_engine is a key the VM accepts for
@@ -170,6 +230,20 @@ esac
 case "${OAM_REMOTE_STEP_ATTEMPTS:-3}" in
   '' | 0 | *[!0-9]*) fail "invalid OAM_REMOTE_STEP_ATTEMPTS='${OAM_REMOTE_STEP_ATTEMPTS:-}' (want a whole number of attempts, 1 or more)" ;;
 esac
+ZONE_FALLBACK="${OAM_GCP_ZONE_FALLBACK:-1}"
+case "$ZONE_FALLBACK" in
+  0 | 1) ;;
+  *) fail "invalid OAM_GCP_ZONE_FALLBACK='$ZONE_FALLBACK' (want 0 or 1)" ;;
+esac
+# Empty and unset both mean "the region's other UP zones"; a list is checked
+# name by name, since a typo would first show up as a refused clone half an
+# hour into a walk.
+FALLBACK_ZONES="${OAM_GCP_FALLBACK_ZONES:-}"
+for fz in $FALLBACK_ZONES; do
+  gce_zone_name_valid "$fz" \
+    || fail "invalid zone '$fz' in OAM_GCP_FALLBACK_ZONES='$FALLBACK_ZONES' (want zone names like us-west1-c, space-separated)"
+done
+unset fz
 
 RUNID="$(date +%Y%m%d-%H%M%S)"
 STAGE_DIR="$(mktemp -d -t oam-iap-build-$RUNID-XXXXXX)"
@@ -230,6 +304,20 @@ vm_describe() {
 }
 VM_STATUS="$(vm_describe status || true)"
 [ -n "$VM_STATUS" ] || fail "could not read the status of $INSTANCE in $ZONE ($PROJECT)"
+# A run whose zone had no capacity clones the builder into another zone as
+# `<instance>-<zone>` (the zone fallback, below) and leaves the clone stopped
+# for the operator to delete. Its disk costs money for as long as it exists,
+# and nothing else would ever mention it again, so every run looks for one
+# before it starts anything. Best effort: a list that fails must not stop a
+# release.
+LEFTOVER_CLONES="$(gcloud compute instances list --project="$PROJECT" \
+  --filter="name~^${INSTANCE}-[a-z]+-[a-z]+[0-9]+-[a-z]\$" \
+  --format='value(name,zone.basename(),status)' 2>/dev/null | tr -d '\r' || true)"
+while IFS=$'\t' read -r clone_name clone_zone clone_status; do
+  [ -n "$clone_name" ] || continue
+  warn "a clone of $INSTANCE from an earlier run is still there: $clone_name in ${clone_zone:-?} (${clone_status:-?}) -- its disk costs money while it exists; when nothing needs it, delete it: gcloud compute instances delete $clone_name --zone=${clone_zone:-<zone>} --project=$PROJECT"
+done <<<"$LEFTOVER_CLONES"
+unset clone_name clone_zone clone_status
 # The machine type this run found the VM with, and the one it is set to now.
 # They differ only while a capacity fallback is in effect; restore_machine_type
 # (on EXIT, from before the first change) puts the VM back.
@@ -258,36 +346,63 @@ restore_machine_type() {
     warn "$INSTANCE is still $now (status ${status:-unknown}) -- set it back with: gcloud compute instances stop $INSTANCE --zone=$ZONE --project=$PROJECT && gcloud compute instances set-machine-type $INSTANCE --zone=$ZONE --project=$PROJECT --machine-type=$ORIGINAL_MACHINE_TYPE"
   fi
 }
-if [ "$VM_STATUS" != "RUNNING" ]; then
-  step "Start VM $INSTANCE (status: $VM_STATUS)"
-  # `instances start` fails with ZONE_RESOURCE_POOL_EXHAUSTED when the zone
-  # has no capacity for the VM's machine type. The 06be680 loop retried that
-  # six times a minute apart, which covered the shortages of its week (the
-  # same start succeeded minutes later) and not the 2026-09-30 one, which
-  # outlasted the window and took the v0.17.1 release with it. It also threw
-  # gcloud's stderr away and retried every error alike, so the log guessed
-  # "usually zone capacity" whatever had happened.
-  #
-  # Now: the VM's own type first, then each OAM_GCP_FALLBACK_MACHINE_TYPES
-  # entry, set with `set-machine-type` (TERMINATED VMs only; this branch is
-  # one) -- a zone short of e2-highmem-4 usually has n2/n2d/n1 to spare, and
-  # nothing on the leg reads the vCPU count. Every failure is classified by
-  # lib/iap-helpers.sh (tested): capacity moves on to the next type, quota
-  # drops the type for the run, anything permanent fails now with gcloud's
-  # own text, and the walk repeats a minute apart until OAM_VM_START_BUDGET_S
-  # is spent. gcloud's progress ("Starting instance(s)...", the dots) is
-  # stderr too, so it is captured with the error and the operator sees one
-  # verdict line per attempt instead.
+# --- VM start: the machine-type walk, and the zone fallback -------------------
+# start_vm_walk <status>: start a VM that is not RUNNING, and mark it this
+# run's to stop (WE_STARTED_VM). Called once below, before the run connects,
+# and again by restart_builder when the VM was stopped under a remote step; a
+# second call keeps ORIGINAL_MACHINE_TYPE -- the type this run FOUND the VM
+# on, the one it goes back to -- and reads the type it is on now afresh.
+#
+# `instances start` fails with ZONE_RESOURCE_POOL_EXHAUSTED when the zone
+# has no capacity for the VM's machine type. The 06be680 loop retried that
+# six times a minute apart, which covered the shortages of its week (the
+# same start succeeded minutes later) and not the 2026-09-30 one, which
+# outlasted the window and took the v0.17.1 release with it. It also threw
+# gcloud's stderr away and retried every error alike, so the log guessed
+# "usually zone capacity" whatever had happened.
+#
+# Now: the VM's own type first, then each OAM_GCP_FALLBACK_MACHINE_TYPES
+# entry, set with `set-machine-type` (TERMINATED VMs only; this branch is
+# one) -- a zone short of e2-highmem-4 usually has n2/n2d/n1 to spare, and
+# nothing on the leg reads the vCPU count. Every failure is classified by
+# lib/iap-helpers.sh (tested): capacity moves on to the next type, quota
+# drops the type for the run, anything permanent fails now with gcloud's
+# own text, and the walk repeats a minute apart until OAM_VM_START_BUDGET_S
+# is spent. gcloud's progress ("Starting instance(s)...", the dots) is
+# stderr too, so it is captured with the error and the operator sees one
+# verdict line per attempt instead. A budget spent with every start refused
+# for capacity hands over to zone_fallback_clone (below), which moves the run
+# to another zone of the region, unless OAM_GCP_ZONE_FALLBACK=0.
+CLEANUP_ARMED=0           # 1 once cleanup() is the EXIT trap (set beside it)
+MACHINE_IMAGE=""          # the zone fallback's machine image; deleted at exit
+CLONE_INSTANCE=""         # the clone this run builds on, once the walk moved to one
+CLONE_ORIGIN=""           # "<instance> in <zone>" that clone was made from
+VM_CLONE_NOTE=""          # what the zone fallback adds to a start failure
+start_vm_walk() {
+  local vm_type vm_now set_err start_err zones_with_it
+  step "Start VM $INSTANCE (status: $1)"
   VM_START_BUDGET="${OAM_VM_START_BUDGET_S:-1800}"
-  ORIGINAL_MACHINE_TYPE="$(vm_describe 'machineType.basename()' || true)"
+  if [ -z "$ORIGINAL_MACHINE_TYPE" ]; then
+    ORIGINAL_MACHINE_TYPE="$(vm_describe 'machineType.basename()' || true)"
+    CURRENT_MACHINE_TYPE="$ORIGINAL_MACHINE_TYPE"
+  else
+    # A restart: whoever stopped the VM under the step may have set its type.
+    CURRENT_MACHINE_TYPE="$(vm_machine_type_now)"
+  fi
   VM_TYPES="$(vm_start_types "$ORIGINAL_MACHINE_TYPE" \
     "${OAM_GCP_FALLBACK_MACHINE_TYPES-n2-highmem-4 n2d-highmem-4 c2d-highmem-4 n1-highmem-4 e2-standard-8 t2d-standard-8 n2-standard-8 n2d-standard-8 c2-standard-8 n1-standard-8 e2-highmem-8}")" \
     || fail "could not read the machine type of $INSTANCE -- not starting it"
-  CURRENT_MACHINE_TYPE="$ORIGINAL_MACHINE_TYPE"
   # Armed before the first set-machine-type: a fail below must not leave the
-  # VM stopped on a fallback type. cleanup() takes this over further down.
-  trap restore_machine_type EXIT
+  # VM stopped on a fallback type. cleanup() takes this over further down --
+  # and a restart under a step comes after that, so it must not put this back
+  # in cleanup's place.
+  [ "$CLEANUP_ARMED" = "1" ] || trap restore_machine_type EXIT
   VM_START_OK=0; VM_START_PASS=0; VM_UNUSABLE_TYPES=" "; VM_TRIED=""; VM_LAST_MSG=""
+  # Stays 1 while every refused start was a capacity verdict -- the one shape
+  # a zone clone answers. A backend error, or a start that returned to a VM
+  # not RUNNING, clears it: that is not a stockout. A quota or an unsupported
+  # type drops the type and says nothing about the zone.
+  VM_START_ALL_CAPACITY=1
   VM_START_DEADLINE=$((SECONDS + 10#$VM_START_BUDGET))   # 10#: "0900" is not octal
   while :; do
     VM_START_PASS=$((VM_START_PASS + 1))
@@ -304,7 +419,7 @@ if [ "$VM_STATUS" != "RUNNING" ]; then
         TERMINATED) ;;
         SUSPENDED | SUSPENDING)
           fail "$INSTANCE is $vm_now, and \`instances start\` only starts a stopped VM -- run: gcloud compute instances resume $INSTANCE --zone=$ZONE --project=$PROJECT" ;;
-        *) warn "$INSTANCE is ${vm_now:-unreadable}, not TERMINATED -- waiting for it to settle before the next pass"; break ;;
+        *) warn "$INSTANCE is ${vm_now:-unreadable}, not TERMINATED -- waiting for it to settle before the next pass"; VM_START_ALL_CAPACITY=0; break ;;
       esac
       if [ "$vm_type" != "$CURRENT_MACHINE_TYPE" ]; then
         if ! set_err="$(gcloud compute instances set-machine-type "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
@@ -329,6 +444,7 @@ if [ "$VM_STATUS" != "RUNNING" ]; then
         vm_now="$(vm_describe status || true)"
         [ "$vm_now" = "RUNNING" ] && { VM_START_OK=1; break; }
         warn "start of $INSTANCE ($vm_type) returned, but it reads ${vm_now:-unreadable} -- checking again next pass"
+        VM_START_ALL_CAPACITY=0
         break
       fi
       VM_LAST_MSG="$(gcloud_error_message "$start_err" || echo '(gcloud printed nothing)')"
@@ -344,7 +460,8 @@ if [ "$VM_STATUS" != "RUNNING" ]; then
         permanent)
           fail "starting $INSTANCE ($vm_type) in $ZONE failed, and retrying cannot help: $VM_LAST_MSG" ;;
         *)
-          warn "start of $INSTANCE ($vm_type) failed (pass $VM_START_PASS): $VM_LAST_MSG -- retrying" ;;
+          warn "start of $INSTANCE ($vm_type) failed (pass $VM_START_PASS): $VM_LAST_MSG -- retrying"
+          VM_START_ALL_CAPACITY=0 ;;
       esac
     done <<<"$VM_TYPES"
     [ "$VM_START_OK" = "1" ] && break
@@ -356,8 +473,19 @@ if [ "$VM_STATUS" != "RUNNING" ]; then
     [ "$VM_USABLE_LEFT" = "1" ] \
       || fail "no machine type left to try for $INSTANCE in $ZONE (tried: ${VM_TRIED:-nothing}; last: ${VM_LAST_MSG:-no start was attempted})"
     VM_START_REMAINING=$((VM_START_DEADLINE - SECONDS))
-    [ "$VM_START_REMAINING" -gt 0 ] \
-      || fail "could not start $INSTANCE in $ZONE within ${VM_START_BUDGET}s (tried: ${VM_TRIED:-nothing}; last: ${VM_LAST_MSG:-no start was attempted}). Wait and re-run (OAM_VM_START_BUDGET_S=<seconds> waits longer), or move the builder to a zone that has capacity: snapshot its boot disk, create a disk from the snapshot there, create the instance from that disk under the same name, delete the old one, and run again -- this script finds the moved instance by itself (OAM_GCP_BUILDER_ZONE pins it)."
+    if [ "$VM_START_REMAINING" -le 0 ]; then
+      VM_CLONE_NOTE=""
+      if [ "$ZONE_FALLBACK" != "1" ]; then
+        VM_CLONE_NOTE=" OAM_GCP_ZONE_FALLBACK=1 (the default) clones the builder into another zone of ${ZONE%-*} for the run instead."
+      elif [ -n "$CLONE_INSTANCE" ]; then
+        VM_CLONE_NOTE=" $INSTANCE is already this run's clone of $CLONE_ORIGIN; a clone is not cloned again."
+      elif [ -z "$VM_TRIED" ] || [ "$VM_START_ALL_CAPACITY" != "1" ]; then
+        VM_CLONE_NOTE=" Not cloning the builder into another zone: $ZONE was not shown to be out of capacity (a start was refused for something else, or none was attempted)."
+      elif zone_fallback_clone; then
+        break
+      fi
+      fail "could not start $INSTANCE in $ZONE within ${VM_START_BUDGET}s (tried: ${VM_TRIED:-nothing}; last: ${VM_LAST_MSG:-no start was attempted}). Wait and re-run (OAM_VM_START_BUDGET_S=<seconds> waits longer), or move the builder to a zone that has capacity: snapshot its boot disk, create a disk from the snapshot there, create the instance from that disk under the same name, delete the old one, and run again -- this script finds the moved instance by itself (OAM_GCP_BUILDER_ZONE pins it).$VM_CLONE_NOTE"
+    fi
     VM_START_PAUSE=60
     [ "$VM_START_PAUSE" -le "$VM_START_REMAINING" ] || VM_START_PAUSE="$VM_START_REMAINING"
     warn "nothing started on pass $VM_START_PASS -- pass $((VM_START_PASS + 1)) in ${VM_START_PAUSE}s (${VM_START_REMAINING}s of the ${VM_START_BUDGET}s budget left)"
@@ -369,46 +497,153 @@ if [ "$VM_STATUS" != "RUNNING" ]; then
   else
     ok "VM started as $CURRENT_MACHINE_TYPE (its own type is $ORIGINAL_MACHINE_TYPE; set back when this run stops it)"
   fi
-  # `instances start` returning RUNNING means the API finished, NOT the guest:
-  # sshd comes up ~15-60s later -- whichever transport the run then uses. On
-  # the IAP fallback it is worse: gcloud`s start-iap-tunnel does a real backend
-  # round-trip BEFORE it binds anything, and against a still-booting guest that
-  # round-trip EXITS with a 4003 instead of retrying -- so the first tunnel
-  # attempt was near-guaranteed to fail on a cold VM, burning ~30s and printing
-  # a scary warning for an entirely expected condition.
-  #
-  # The serial console reads straight off the compute API -- no tunnel, no ssh --
-  # so it is the one guest-side signal available before the chicken-and-egg
-  # breaks. GCE resets the serial buffer each boot, so a match is from THIS boot.
-  wait_for_guest_sshd() {
-    local waited=0 max=180 serial
-    while [ "$waited" -lt "$max" ]; do
-      # Capture then match, rather than `gcloud | grep -q`: under `set -o
-      # pipefail` grep short-circuits on a match, gcloud dies on SIGPIPE, and
-      # the pipeline reports FAILURE -- turning a successful detection into a
-      # false negative that would burn the whole ${max}s window every cold boot.
-      #
-      # Refetching the WHOLE buffer each poll is deliberate. gcloud offers
-      # --start=<byte offset> to fetch only new output, but the offset would
-      # have to be derived from the length of a command substitution, which
-      # strips trailing newlines -- so the offset drifts and a poll can skip
-      # the very line being matched. The buffer is ~150KB and sshd normally
-      # lands on the first or second poll; trading a correct detection for
-      # those bytes is not worth it.
-      serial="$(gcloud compute instances get-serial-port-output "$INSTANCE" \
-        --zone="$ZONE" --project="$PROJECT" 2>/dev/null || true)"
-      if sshd_banner_seen "$serial"; then
-        ok "guest sshd up (serial console, ${waited}s after start)"
+}
+
+# zone_fallback_clone: the zone has refused every start of the walk for
+# capacity for the whole budget, so this run moves to another zone of the
+# region WITHOUT touching the builder. A machine image of the stopped builder
+# first -- it carries the disks, metadata, service account, scopes, tags and
+# network config, and the boot disk's copy keeps the cargo cache under
+# ~/$REMOTE_DIR warm, where a fresh VM would spend ~30 min on deps -- then
+# `<instance>-<zone>` from it in each candidate zone (OAM_GCP_FALLBACK_ZONES,
+# else the region's other UP zones) and each machine type of the walk, until
+# one boots. `instances create` boots what it creates, so no start follows,
+# and a refused create is classified like a refused start: capacity moves on,
+# quota drops the type (quotas are regional), anything permanent fails now.
+# Returns 0 with INSTANCE, ZONE and the machine-type bookkeeping on the clone,
+# which is this run's to stop; 1, with VM_CLONE_NOTE saying what to do by
+# hand, when no image could be made or no zone took it -- the image is then
+# KEPT, since the hand move needs it. The original is put back on its own
+# type FIRST, while INSTANCE still names it, and is then left alone: stopped,
+# found by name by the next run as before.
+zone_fallback_clone() {
+  local origin="$INSTANCE" origin_zone="$ZONE" region="${ZONE%-*}" img="$INSTANCE-img-$RUNID"
+  local img_err zone_list list_err zones zone clone clone_type create_err msg unusable=" "
+  step "Clone $origin into another zone of $region for this run"
+  warn "$origin_zone refused every start for capacity for ${VM_START_BUDGET}s -- cloning $origin into another zone of $region for this run (OAM_GCP_ZONE_FALLBACK=0 fails instead). The original is not deleted and not started: it stays stopped, on its own type."
+  restore_machine_type
+  ok "creating machine image $img from $origin (gcloud's progress is captured; a large disk takes minutes)..."
+  if ! img_err="$(gcloud compute machine-images create "$img" --source-instance="$origin" \
+         --source-instance-zone="$origin_zone" --project="$PROJECT" 2>&1 >/dev/null)"; then
+    VM_CLONE_NOTE=" A clone into another zone was tried too, and the machine image could not be made: $(gcloud_error_message "$img_err" || echo '(gcloud printed nothing)')"
+    return 1
+  fi
+  MACHINE_IMAGE="$img"
+  ok "machine image $img created from $origin (deleted when this run exits)"
+  zone_list=""
+  if [ -z "$FALLBACK_ZONES" ]; then
+    zone_list="$(gcloud compute zones list --project="$PROJECT" --filter="region:$region" \
+      --format='value(name,status,region.basename())' 2>"$STAGE_DIR/logs/zones-list.err" | tr -d '\r' || true)"
+  fi
+  if ! zones="$(zone_fallback_candidates "$origin_zone" "$FALLBACK_ZONES" "$region" "$zone_list")"; then
+    list_err="$(gcloud_error_message "$(cat "$STAGE_DIR/logs/zones-list.err" 2>/dev/null)" || true)"
+    VM_CLONE_NOTE=" A clone into another zone was tried too, and there is no other UP zone of $region to clone into${FALLBACK_ZONES:+ (OAM_GCP_FALLBACK_ZONES='$FALLBACK_ZONES')}${list_err:+ (zones list: $list_err)}. Machine image $img is KEPT for a move by hand -- gcloud compute instances create $origin-<zone> --zone=<zone> --source-machine-image=$img --project=$PROJECT, then run again with OAM_GCP_BUILDER_INSTANCE=$origin-<zone> OAM_GCP_BUILDER_ZONE=<zone> -- and costs storage until: gcloud compute machine-images delete $img --project=$PROJECT"
+    MACHINE_IMAGE=""
+    return 1
+  fi
+  ok "zones to try, in order: $(tr '\n' ' ' <<<"$zones")"
+  while IFS= read -r zone; do
+    [ -n "$zone" ] || continue
+    clone="$origin-$zone"
+    while IFS= read -r clone_type; do
+      [ -n "$clone_type" ] || continue
+      case "$VM_UNUSABLE_TYPES$unusable" in *" $clone_type "*) continue ;; esac
+      ok "creating $clone in $zone as $clone_type from $img (gcloud's progress is captured)..."
+      if create_err="$(gcloud compute instances create "$clone" --zone="$zone" --source-machine-image="$img" \
+             --machine-type="$clone_type" --project="$PROJECT" 2>&1 >/dev/null)"; then
+        CLONE_INSTANCE="$clone"; CLONE_ORIGIN="$origin in $origin_zone"
+        INSTANCE="$clone"; ZONE="$zone"
+        ORIGINAL_MACHINE_TYPE="$clone_type"; CURRENT_MACHINE_TYPE="$clone_type"
+        WE_STARTED_VM=1
+        warn "THIS RUN NOW BUILDS ON $clone IN $zone (as $clone_type), a clone of $origin ($origin_zone) made from machine image $img. $origin is untouched: stopped, on its own type, and the next run finds it by name as before. The clone is stopped when this run exits and is NOT deleted; the image is. When nothing needs the clone any more, delete it, and the image should this run's exit have failed to: gcloud compute instances delete $clone --zone=$zone --project=$PROJECT && gcloud compute machine-images delete $img --project=$PROJECT"
         return 0
       fi
-      sleep 10
-      waited=$((waited + 10))
-    done
-    # Never fatal: the connect step's own retries (the direct probe's boot
-    # budget, then the tunnel loop) are still the real backstop.
-    warn "no sshd banner on the serial console after ${max}s -- proceeding (the connect step still retries)"
-    return 0
-  }
+      msg="$(gcloud_error_message "$create_err" || echo '(gcloud printed nothing)')"
+      # The name is taken: an earlier run's clone, left for the operator (the
+      # preflight names it). Not created over, not deleted -- the next zone.
+      case "${create_err//$'\r'/}" in
+        *"instances/$clone' already exists"*)
+          warn "$clone already exists in $zone -- an earlier run's clone, left for you to delete; not creating over it. To use this zone, delete it first: gcloud compute instances delete $clone --zone=$zone --project=$PROJECT"
+          break ;;
+      esac
+      case "$(vm_start_verdict "$create_err")" in
+        interrupted) fail "interrupted while creating $clone in $zone (machine image $img is deleted on exit)" ;;
+        permanent)   fail "creating $clone in $zone failed, and retrying cannot help: $msg (machine image $img is deleted on exit)" ;;
+        capacity)    warn "no $clone_type capacity in $zone either: $msg" ;;
+        quota)
+          warn "$clone_type is not usable in $region -- not trying it in another zone: $msg"
+          unusable="$unusable$clone_type " ;;
+        unsupported) warn "$clone cannot be created as $clone_type in $zone: $msg" ;;
+        *) warn "creating $clone in $zone as $clone_type failed: $msg -- trying the next (if gcloud lost the answer rather than the request, a $clone may exist: the next run's preflight lists clones)" ;;
+      esac
+    done <<<"$VM_TYPES"
+  done <<<"$zones"
+  VM_CLONE_NOTE=" A clone into another zone was tried too, and no zone of $region took it (tried: $(tr '\n' ' ' <<<"$zones" | sed 's/ *$//')). Machine image $img is KEPT for a move by hand -- gcloud compute instances create $origin-<zone> --zone=<zone> --source-machine-image=$img --project=$PROJECT, then run again with OAM_GCP_BUILDER_INSTANCE=$origin-<zone> OAM_GCP_BUILDER_ZONE=<zone> -- and costs storage until: gcloud compute machine-images delete $img --project=$PROJECT"
+  MACHINE_IMAGE=""
+  return 1
+}
+
+# delete_machine_image: the zone fallback's image, at exit -- never the clone
+# (the warm builder the operator may want again) and never the original. A
+# failed delete only warns, with the command: the run's result is decided by
+# then. The clone's delete command is printed here too, as the last thing the
+# operator sees.
+delete_machine_image() {
+  if [ -n "$CLONE_INSTANCE" ]; then
+    warn "$CLONE_INSTANCE in $ZONE, this run's clone of $CLONE_ORIGIN, is left stopped and is yours to delete when nothing needs it: gcloud compute instances delete $CLONE_INSTANCE --zone=$ZONE --project=$PROJECT"
+  fi
+  [ -n "$MACHINE_IMAGE" ] || return 0
+  if gcloud compute machine-images delete "$MACHINE_IMAGE" --project="$PROJECT" --quiet >/dev/null 2>&1; then
+    ok "deleted machine image $MACHINE_IMAGE"
+  else
+    warn "could not delete machine image $MACHINE_IMAGE -- it costs storage until you run: gcloud compute machine-images delete $MACHINE_IMAGE --project=$PROJECT"
+  fi
+  MACHINE_IMAGE=""
+}
+
+# `instances start` returning RUNNING means the API finished, NOT the guest:
+# sshd comes up ~15-60s later -- whichever transport the run then uses. On
+# the IAP fallback it is worse: gcloud`s start-iap-tunnel does a real backend
+# round-trip BEFORE it binds anything, and against a still-booting guest that
+# round-trip EXITS with a 4003 instead of retrying -- so the first tunnel
+# attempt was near-guaranteed to fail on a cold VM, burning ~30s and printing
+# a scary warning for an entirely expected condition.
+#
+# The serial console reads straight off the compute API -- no tunnel, no ssh --
+# so it is the one guest-side signal available before the chicken-and-egg
+# breaks. GCE resets the serial buffer each boot, so a match is from THIS boot.
+wait_for_guest_sshd() {
+  local waited=0 max=180 serial
+  while [ "$waited" -lt "$max" ]; do
+    # Capture then match, rather than `gcloud | grep -q`: under `set -o
+    # pipefail` grep short-circuits on a match, gcloud dies on SIGPIPE, and
+    # the pipeline reports FAILURE -- turning a successful detection into a
+    # false negative that would burn the whole ${max}s window every cold boot.
+    #
+    # Refetching the WHOLE buffer each poll is deliberate. gcloud offers
+    # --start=<byte offset> to fetch only new output, but the offset would
+    # have to be derived from the length of a command substitution, which
+    # strips trailing newlines -- so the offset drifts and a poll can skip
+    # the very line being matched. The buffer is ~150KB and sshd normally
+    # lands on the first or second poll; trading a correct detection for
+    # those bytes is not worth it.
+    serial="$(gcloud compute instances get-serial-port-output "$INSTANCE" \
+      --zone="$ZONE" --project="$PROJECT" 2>/dev/null || true)"
+    if sshd_banner_seen "$serial"; then
+      ok "guest sshd up (serial console, ${waited}s after start)"
+      return 0
+    fi
+    sleep 10
+    waited=$((waited + 10))
+  done
+  # Never fatal: the connect step's own retries (the direct probe's boot
+  # budget, then the tunnel loop) are still the real backstop.
+  warn "no sshd banner on the serial console after ${max}s -- proceeding (the connect step still retries)"
+  return 0
+}
+
+if [ "$VM_STATUS" != "RUNNING" ]; then
+  start_vm_walk "$VM_STATUS"
   step "Wait for guest sshd on $INSTANCE"
   wait_for_guest_sshd
 else
@@ -447,7 +682,14 @@ stop_vm() {
 # care who started it. OAM_KEEP_VM_SCHEDULE=1 leaves the schedules alone, and
 # the run then has to fit before the next stop. The parsing lives in
 # lib/iap-helpers.sh (iap_policy_*), where it is tested.
+#
+# The re-attach goes to the instance the policies came OFF, not to $INSTANCE:
+# a run whose VM was stopped under a step can end up on a zone clone
+# (restart_builder -> start_vm_walk -> zone_fallback_clone), and the original
+# must get its backstop back, not the clone.
 DETACHED_POLICIES=""
+DETACHED_FROM_INSTANCE=""
+DETACHED_FROM_ZONE=""
 detach_stop_schedules() {
   if [ "${OAM_KEEP_VM_SCHEDULE:-0}" = "1" ]; then
     warn "OAM_KEEP_VM_SCHEDULE=1 -- leaving the VM's instance schedules attached; a scheduled stop will kill this run"
@@ -471,6 +713,7 @@ detach_stop_schedules() {
     if gcloud compute instances remove-resource-policies "$INSTANCE" --resource-policies="$name" \
          --zone="$ZONE" --project="$PROJECT" >/dev/null 2>&1; then
       DETACHED_POLICIES="$DETACHED_POLICIES $name"
+      DETACHED_FROM_INSTANCE="$INSTANCE"; DETACHED_FROM_ZONE="$ZONE"
       ok "detached instance schedule $name (stops $INSTANCE at '$stop' $tz) for this run -- re-attached on exit"
     else
       warn "could not detach instance schedule $name (stops $INSTANCE at '$stop' $tz) -- a run still going then will be killed"
@@ -478,13 +721,13 @@ detach_stop_schedules() {
   done <<<"$(iap_policy_urls "$reading")"
 }
 reattach_stop_schedules() {
-  local name
+  local name inst="${DETACHED_FROM_INSTANCE:-$INSTANCE}" zone="${DETACHED_FROM_ZONE:-$ZONE}"
   for name in $DETACHED_POLICIES; do
-    if gcloud compute instances add-resource-policies "$INSTANCE" --resource-policies="$name" \
-         --zone="$ZONE" --project="$PROJECT" >/dev/null 2>&1; then
-      ok "re-attached instance schedule $name"
+    if gcloud compute instances add-resource-policies "$inst" --resource-policies="$name" \
+         --zone="$zone" --project="$PROJECT" >/dev/null 2>&1; then
+      ok "re-attached instance schedule $name to $inst"
     else
-      warn "could not re-attach instance schedule $name -- $INSTANCE has NO scheduled stop until you run: gcloud compute instances add-resource-policies $INSTANCE --resource-policies=$name --zone=$ZONE --project=$PROJECT"
+      warn "could not re-attach instance schedule $name -- $inst has NO scheduled stop until you run: gcloud compute instances add-resource-policies $inst --resource-policies=$name --zone=$zone --project=$PROJECT"
     fi
   done
   DETACHED_POLICIES=""
@@ -607,9 +850,12 @@ stop_iap_tunnel() {
   fi
   rm -f "$IAP_TUNNEL_LOG"
 }
-# restore_machine_type last: it needs the stop before it to have finished.
-cleanup() { stop_iap_tunnel; reattach_stop_schedules; stop_vm; restore_machine_type; }
+# restore_machine_type after stop_vm: it needs the stop before it to have
+# finished. delete_machine_image last: it is independent of the VM, and its
+# closing word -- the clone left for the operator -- belongs at the end.
+cleanup() { stop_iap_tunnel; reattach_stop_schedules; stop_vm; restore_machine_type; delete_machine_image; }
 trap cleanup EXIT
+CLEANUP_ARMED=1
 # Only now that the trap is armed: a failure between detaching a schedule and
 # arming the trap would leave the VM with no scheduled stop at all.
 detach_stop_schedules
@@ -809,6 +1055,37 @@ reconnect_builder(){
   connect_builder
 }
 
+# restart_builder <status>: the VM was stopped under a remote step -- by an
+# operator, a schedule this run could not detach, a host event -- and the
+# postmortem has already said who. A stop still in progress settles first
+# (STOPPING lasts a minute or so; 3 minutes is the cap), then the same walk
+# as at the top starts the VM again, the guest's sshd is waited for, and the
+# ssh path is proved afresh -- the external IP is ephemeral and can have
+# changed. From here the VM is this run's to stop on exit, whoever started it
+# the first time: a run that starts a VM owns that start. One that came back
+# RUNNING on its own (someone started it while this waited) is only
+# reconnected to.
+restart_builder(){
+  local status="$1" waited=0
+  while [ "$waited" -lt 180 ]; do
+    case "$status" in TERMINATED | RUNNING) break ;; esac
+    warn "$INSTANCE is $status -- waiting for it to settle before starting it again (${waited}s of 180s)"
+    sleep 10; waited=$((waited + 10))
+    status="$(vm_describe status || echo UNKNOWN)"
+  done
+  case "$status" in
+    TERMINATED)
+      start_vm_walk "$status"
+      step "Wait for guest sshd on $INSTANCE"
+      wait_for_guest_sshd ;;
+    RUNNING)
+      warn "$INSTANCE is RUNNING again -- someone else started it; reconnecting without starting it" ;;
+    *)
+      fail "$INSTANCE is $status ${waited}s after its ssh transport dropped, neither TERMINATED nor RUNNING -- not starting it again" ;;
+  esac
+  reconnect_builder
+}
+
 # Ship the WORKING TREE (uncommitted release fixes should build), asking git
 # what the tree IS rather than hand-maintaining a list of what it is not -- see
 # lib/src-sync.sh for why, and for the 11.6 GB release this cost. On the remote
@@ -883,18 +1160,21 @@ remote_step_postmortem() {
 # passed, 1 when it failed for good.
 #
 # A step whose ssh TRANSPORT dropped under it (OpenSSH's own closing line as
-# the log's tail: a reset IAP relay, a cut direct connection, an sshd restart)
-# while the VM is still RUNNING is run again, up to OAM_REMOTE_STEP_ATTEMPTS
-# times in all, after reconnecting -- direct ssh is probed again and the IAP
-# tunnel is the fallback, as at the start. Each dispatch is a fresh
-# `build-remote.sh <dispatch>` on the synced tree, so running one again is
-# safe (cargo waits on its own lock if the cut command is still finishing).
-# A step whose command EXITED non-zero is a real failure and is never run
-# again; a VM that is no longer RUNNING is left to the postmortem, which says
-# who stopped it. Each earlier attempt's log is kept as <dispatch>.log.attemptN.
+# the log's tail: a reset IAP relay, a cut direct connection, an sshd restart,
+# a VM stopped under it) is run again, up to OAM_REMOTE_STEP_ATTEMPTS times in
+# all. The VM's state says how (remote_step_verdict in lib/iap-helpers.sh,
+# tested): one still RUNNING is reconnected to -- direct ssh is probed again
+# and the IAP tunnel is the fallback, as at the start; one TERMINATED or
+# STOPPING was stopped under the step, and the postmortem says who BEFORE
+# restart_builder starts it again, by the same walk as at the top, and
+# reconnects. Each dispatch is a fresh `build-remote.sh <dispatch>` on the
+# synced tree, so running one again is safe (cargo waits on its own lock if
+# the cut command is still finishing). A step whose command EXITED non-zero is
+# a real failure and is never run again; a VM in any other state is left to
+# the postmortem. Each earlier attempt's log is kept as <dispatch>.log.attemptN.
 REMOTE_STEP_ATTEMPTS="${OAM_REMOTE_STEP_ATTEMPTS:-3}"
 remote_step_run(){
-  local dispatch="$1" log="$STAGE_DIR/logs/$1.log" attempt=1 rc status
+  local dispatch="$1" log="$STAGE_DIR/logs/$1.log" attempt=1 rc status verdict
   while :; do
     rc=0
     gcp_ssh "cd $REMOTE_DIR && bash scripts/build-remote.sh $dispatch" >"$log" 2>&1 || rc=$?
@@ -903,13 +1183,24 @@ remote_step_run(){
     status="$(vm_describe status || echo UNKNOWN)"
     # ssh's own exit (255), not the remote command's: a step whose command
     # exited 1 with a log that mentions a reset is a real failure.
-    if remote_step_should_retry "$attempt" "$REMOTE_STEP_ATTEMPTS" "$rc" "$(tail -5 "$log" 2>/dev/null || true)" "$status"; then
-      cp "$log" "$log.attempt$attempt" 2>/dev/null || true
-      warn "remote '$dispatch' lost its ssh transport on attempt $attempt of $REMOTE_STEP_ATTEMPTS while $INSTANCE is RUNNING -- reconnecting and running it again (that attempt's log: $log.attempt$attempt)"
-      reconnect_builder
-      attempt=$((attempt + 1))
-      continue
-    fi
+    verdict="$(remote_step_verdict "$attempt" "$REMOTE_STEP_ATTEMPTS" "$rc" "$(tail -5 "$log" 2>/dev/null || true)" "$status")"
+    case "$verdict" in
+      rerun)
+        cp "$log" "$log.attempt$attempt" 2>/dev/null || true
+        warn "remote '$dispatch' lost its ssh transport on attempt $attempt of $REMOTE_STEP_ATTEMPTS while $INSTANCE is RUNNING -- reconnecting and running it again (that attempt's log: $log.attempt$attempt)"
+        reconnect_builder
+        attempt=$((attempt + 1))
+        continue ;;
+      restart)
+        cp "$log" "$log.attempt$attempt" 2>/dev/null || true
+        # Who stopped it, from the operations log, before the start below
+        # becomes the newest operation on the instance.
+        remote_step_postmortem "$log" "$attempt"
+        warn "remote '$dispatch' lost its ssh transport on attempt $attempt of $REMOTE_STEP_ATTEMPTS because $INSTANCE was stopped under it ($status) -- starting it again, reconnecting and running it again (that attempt's log: $log.attempt$attempt)"
+        restart_builder "$status"
+        attempt=$((attempt + 1))
+        continue ;;
+    esac
     remote_step_postmortem "$log" "$attempt"
     return 1
   done
