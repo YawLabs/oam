@@ -1225,7 +1225,6 @@ fn op_chdir(
         throw_node_error_as_passed(scope, "chdir", &oam_core::fs_error_path(&dir), &e);
         return;
     }
-    #[cfg(windows)]
     record_drive_cwd();
 }
 
@@ -1258,6 +1257,13 @@ fn record_drive_cwd() {
     let name = format!("={}:", char::from(letter));
     set_process_env(&name, Some(&std::ffi::OsString::from_wide(&wide)));
 }
+
+/// Only Windows keeps a per-drive cwd, so elsewhere a chdir has nothing to
+/// record. The twin keeps `op_chdir` the same on every target: without it the
+/// error arm's `return` is the function's last statement on unix, and clippy
+/// 1.97 rejects it as `needless_return` (the 0.18.0 mac release leg).
+#[cfg(not(windows))]
+fn record_drive_cwd() {}
 
 /// Set a variable in the process environment, or remove it with `None`: the
 /// one place the ops change the real environment (`process.env.TZ`, a
