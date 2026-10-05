@@ -194,6 +194,14 @@ below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Fixed
 
+- **The type-check daemon's tsgo runs without a console window on Windows.** The daemon has
+  no console (it is spawned detached), so each tsgo it ran — the version probe and every
+  check — got a new console with a visible window, which flashed on the desktop and, under
+  load, could fail to come up at all: a console process whose console cannot be set up exits
+  with STATUS_DLL_INIT_FAILED (0xC0000142) before it runs, which is how this release's own
+  gate lost a probe and read the empty `--version` as an impostor tsgo. tsgo and the taskkill
+  that ends it are now spawned with CREATE_NO_WINDOW from the daemon. A one-shot check from a
+  terminal still shares that terminal's console, and with it its Ctrl+C.
 - **A `worker_threads` Worker's `env` option is applied, as node's is.** Without it (or
   with `null` or `process.env`) the worker starts with a copy of its creator's `process.env`
   as it stands, assignments and deletions included; with an object, exactly that object's

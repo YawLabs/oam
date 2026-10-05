@@ -14477,6 +14477,74 @@ fn daemon_status_gives_a_reason_with_every_spawn_failure() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn daemon_spawns_tsgo_without_a_console_window() {
+    // A console process whose parent has no console gets a new console of
+    // its own, with a visible window; the daemon (DETACHED_PROCESS) has
+    // none, so every tsgo it ran flashed a window -- and under the e2e
+    // suite's load the 0.18.0 release gate lost a version probe to
+    // STATUS_DLL_INIT_FAILED (0xC0000142) when that console could not be
+    // set up. The fake appends the console window handle it was given on
+    // each --version; the daemon's probe must see none (0). The one-shot
+    // path is not asserted: it shares the harness's console, and a harness
+    // run without one would read 0 there too.
+    let record = write_temp("windowless-tsgo/windows.txt", "");
+    let fake = write_fake_tsgo(
+        "windowless-tsgo",
+        &format!(
+            "@echo off\r\n\
+             if not \"%1\"==\"--version\" exit /b 0\r\n\
+             powershell -NoProfile -NonInteractive -Command \"$k = Add-Type -MemberDefinition \
+             '[DllImport(\\\"kernel32.dll\\\")] public static extern IntPtr GetConsoleWindow();' \
+             -Name K -Namespace P -PassThru; [P.K]::GetConsoleWindow()\" >> \"{}\"\r\n\
+             echo Version 7.0.0-fake\r\n\
+             exit /b 0\r\n",
+            record.display()
+        ),
+        "",
+    );
+    let cache = write_temp("windowless-tsgo-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    write_temp(
+        "windowlessproj/tsconfig.json",
+        "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true}}",
+    );
+    let proj = write_temp("windowlessproj/a.ts", "export const n: number = 1;")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["check", proj.to_str().unwrap(), "--json"])
+        .env("OAM_CACHE_DIR", &cache)
+        .env("OAM_DAEMON_IDLE_MS", "45000")
+        .env("OAM_TSGO", &fake)
+        .output()
+        .expect("oam check runs");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The daemon probes on its own clock: on a loaded box the client falls
+    // back to a one-shot (which records a window of the harness's console)
+    // before the daemon's probe has written its line.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let windows = loop {
+        let windows = std::fs::read_to_string(&record).unwrap_or_default();
+        if windows.lines().any(|l| l.trim() == "0") || std::time::Instant::now() >= deadline {
+            break windows;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    assert!(
+        windows.lines().any(|l| l.trim() == "0"),
+        "the daemon's tsgo was given a console window (one handle per --version): {windows:?}"
+    );
+}
+
 #[test]
 fn check_tsgo_timeout_surfaces_as_a_diagnostic_not_a_hang() {
     // A wedged tsgo must cost OAM_TSGO_TIMEOUT_MS and produce OAM-TS0006,

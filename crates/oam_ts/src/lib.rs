@@ -96,11 +96,28 @@ enum HandleState {
 /// caller that gives up on a check (warn-mode `oam run` exiting, the daemon
 /// shutting down) never leaves a type-check burning CPU behind it.
 #[derive(Clone, Default)]
-pub struct TsgoHandle(Arc<Mutex<HandleState>>);
+pub struct TsgoHandle {
+    state: Arc<Mutex<HandleState>>,
+    /// The process holding this handle has no console (the daemon, which
+    /// spawn_daemon starts DETACHED_PROCESS), so the children spawned
+    /// through it get [`hide_console_window`].
+    no_console: bool,
+}
 
 impl TsgoHandle {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The handle for a process that runs without a console: the daemon.
+    /// On Windows its tsgo children (and the taskkill that ends them) are
+    /// spawned windowless, where the default gave each a new console with
+    /// a visible window -- see [`hide_console_window`].
+    pub fn without_console() -> Self {
+        Self {
+            no_console: true,
+            ..Self::default()
+        }
     }
 
     /// Kill the in-flight tsgo, if any, and refuse future spawns. Returns
@@ -116,11 +133,11 @@ impl TsgoHandle {
     ///
     /// [`Child`]: std::process::Child
     pub fn cancel(&self) -> bool {
-        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let killed = if let HandleState::Running(child) = &mut *state {
             // Descendants first (they are still findable by parent pid),
             // through the reserved pid; then the parent via its handle.
-            kill_tree(child.id());
+            kill_tree(child.id(), self.no_console);
             let _ = child.kill();
             true
         } else {
@@ -141,7 +158,7 @@ impl TsgoHandle {
     /// cancelled: the child is handed back and the caller must kill and
     /// reap what it just spawned.
     fn register(&self, child: std::process::Child) -> Result<(), std::process::Child> {
-        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if matches!(*state, HandleState::Cancelled) {
             return Err(child);
         }
@@ -156,7 +173,7 @@ impl TsgoHandle {
     /// kills nothing). None = a cancel got there first (Cancelled is
     /// sticky) or nothing was running.
     fn take_running(&self) -> Option<std::process::Child> {
-        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if matches!(*state, HandleState::Running(_))
             && let HandleState::Running(child) = std::mem::replace(&mut *state, HandleState::Idle)
         {
@@ -166,26 +183,61 @@ impl TsgoHandle {
     }
 }
 
+/// Spawn `command` without a console window (Windows). A console process
+/// whose parent has no console gets a new console of its own, and with it,
+/// by default, a visible window: every tsgo the daemon ran -- the version
+/// probe and each check -- flashed a console window on the desktop. The
+/// window is the expensive part. Creating it is serialized through the
+/// desktop (measured: 96 console children from a detached parent, 32 wide,
+/// took 13.3 s with windows and 1.8 s without), and a console process whose
+/// console cannot be set up exits with STATUS_DLL_INIT_FAILED (0xC0000142)
+/// before it runs, printing nothing -- which is how the 0.18.0 release gate
+/// lost a daemon's version probe under the e2e suite's load, reading the
+/// empty `--version` as an impostor tsgo. CREATE_NO_WINDOW keeps the
+/// console (cmd.exe and node still have `CON`; a probe through it answers
+/// as before) and drops only the window.
+///
+/// Only for a process that HAS no console. Where this process has one, the
+/// child inherits it by default -- cheaper than a console of its own, and
+/// the way a terminal's Ctrl+C reaches a one-shot check's tsgo (oam
+/// installs no handler of its own that would kill it).
+#[cfg(windows)]
+fn hide_console_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_console_window(_command: &mut Command) {}
+
 /// Kill `pid` and its descendants with the OS's own tools (no FFI, no libc
 /// dependency — oam_ts stays a plain crate). The tree matters: the npm shim
 /// makes the real compiler a grandchild (cmd.exe -> node -> tsgo.exe on
 /// Windows; node -> tsgo on Unix when `process.execve` is unavailable), so
 /// killing only the direct child would leave the actual work running.
 /// Best-effort: a missing `taskkill`/`pkill` degrades to the old behaviour
-/// (the child finishes on its own).
-fn kill_tree(pid: u32) {
+/// (the child finishes on its own). `no_console` is the caller's
+/// [`TsgoHandle::no_console`]: taskkill is a console process too, and from
+/// the daemon it would get a window of its own.
+fn kill_tree(pid: u32, no_console: bool) {
     let pid = pid.to_string();
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
+        let mut taskkill = Command::new("taskkill");
+        taskkill
             .args(["/T", "/F", "/PID", &pid])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .stderr(Stdio::null());
+        if no_console {
+            hide_console_window(&mut taskkill);
+        }
+        let _ = taskkill.status();
     }
     #[cfg(not(windows))]
     {
+        let _ = no_console;
         // Children first (they are still findable by parent pid), then the
         // child itself.
         let _ = Command::new("pkill")
@@ -233,8 +285,8 @@ fn run_with_timeout(
             bytes
         })
     }
-    fn kill_and_reap(mut child: std::process::Child) {
-        kill_tree(child.id());
+    fn kill_and_reap(mut child: std::process::Child, no_console: bool) {
+        kill_tree(child.id(), no_console);
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -243,6 +295,9 @@ fn run_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if handle.no_console {
+        hide_console_window(&mut command);
+    }
     // Windows: tsgo (and the cmd -> node -> tsgo shim chain) would inherit
     // every inheritable handle this process holds -- our own stdout and
     // stderr included, when we run with piped stdio -- as extras beside the
@@ -260,7 +315,7 @@ fn run_with_timeout(
     let err_pipe = drain(child.stderr.take());
     if let Err(child) = handle.register(child) {
         // Cancelled before we could register: kill what we just spawned.
-        kill_and_reap(child);
+        kill_and_reap(child, handle.no_console);
         return Err(RunFailure::Cancelled);
     }
     // Pipe EOF signals the tree is done writing; a channel carries it so
@@ -291,12 +346,12 @@ fn run_with_timeout(
                         });
                     }
                     Ok(None) if Instant::now() >= deadline => {
-                        kill_and_reap(child);
+                        kill_and_reap(child, handle.no_console);
                         return Err(RunFailure::TimedOut);
                     }
                     Ok(None) => std::thread::sleep(Duration::from_millis(10)),
                     Err(e) => {
-                        kill_and_reap(child);
+                        kill_and_reap(child, handle.no_console);
                         return Err(RunFailure::Spawn(e));
                     }
                 }
@@ -304,7 +359,7 @@ fn run_with_timeout(
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => match handle.take_running() {
             Some(child) => {
-                kill_and_reap(child);
+                kill_and_reap(child, handle.no_console);
                 Err(RunFailure::TimedOut)
             }
             // The cancel beat the timeout to the child.
@@ -312,7 +367,7 @@ fn run_with_timeout(
         },
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             if let Some(child) = handle.take_running() {
-                kill_and_reap(child);
+                kill_and_reap(child, handle.no_console);
             }
             Err(RunFailure::Spawn(std::io::Error::other(
                 "tsgo pipe drain thread exited without a result",

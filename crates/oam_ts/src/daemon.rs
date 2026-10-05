@@ -1148,8 +1148,11 @@ fn serve_inner(tsconfig: &Path, state_file: &Path) -> std::io::Result<()> {
 
     // Prove the tsgo this project resolves to before advertising ourselves:
     // a daemon with no usable compiler must fail setup (recorded), not
-    // serve OAM-TS0002 for its whole idle life.
-    let handle = TsgoHandle::new();
+    // serve OAM-TS0002 for its whole idle life. without_console: this
+    // process was spawned DETACHED_PROCESS (spawn_daemon) and has no console
+    // for its children to inherit, so on Windows they are spawned windowless
+    // rather than each getting a console with a visible window.
+    let handle = TsgoHandle::without_console();
     let (tsgo_path, tsgo_version) =
         crate::resolve_tsgo(&root, &handle).map_err(|d| std::io::Error::other(d.message))?;
 
