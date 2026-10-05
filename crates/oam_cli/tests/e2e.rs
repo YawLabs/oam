@@ -14305,6 +14305,23 @@ fn check_daemon_cache_invalidates_on_checkjs_and_nested_target_edits() {
 
 /// Write a fake tsgo script; returns the path to point OAM_TSGO at.
 /// `body_unix`/`body_windows` are the full script bodies.
+/// `path` spelled as the OS reports it for a cwd. A relative path is checked
+/// against process.cwd(), which getcwd(3) answers through real components:
+/// on macOS the temp dir is `/var/folders/...` and a cwd entered through it
+/// is reported as `/private/var/folders/...`, so a grant spelled the temp
+/// dir's way never matches a relative target -- in node too (v22.23.2,
+/// probed with a cwd entered through a symlink: `--allow-fs-write=<link>/B`
+/// denies `writeFileSync('wf-x')` from `<link>/B`, `--allow-fs-write=<real>/B`
+/// allows it). Windows reports the spelling chdir was given, short names and
+/// symlinks included, so the path stands as is there.
+fn cwd_spelling(path: &std::path::Path) -> PathBuf {
+    if cfg!(windows) {
+        path.to_path_buf()
+    } else {
+        std::fs::canonicalize(path).unwrap()
+    }
+}
+
 fn write_fake_tsgo(name: &str, body_windows: &str, body_unix: &str) -> PathBuf {
     if cfg!(windows) {
         write_temp(&format!("{name}/tsgo.cmd"), body_windows)
@@ -32944,14 +32961,15 @@ fn every_path_fs_op_respects_the_permission_model() {
 /// `--allow-fs-write=<cwd>` mkdtempSync("dt-") (template "dt-XXXXXX", which
 /// node's binding checks unresolved), writeFileSync("wf-x") and
 /// mkdirSync("mk-x") were all denied where node v22.22.2 allows them.
-/// Expected lines measured against node v22.22.2 on Windows.
+/// Expected lines measured against node v22.22.2 on Windows, and the macOS
+/// line against v22.23.1 there.
 #[test]
 fn a_relative_path_is_checked_against_the_cwd_as_node_does() {
     let script = write_temp(
         "fs_perm_relative.cjs",
         "const fs = require('fs'), fsp = require('fs/promises');\n\
          const t = (label, fn) => {\n\
-           try { const r = fn(); console.log(label + '=' + (typeof r === 'string' ? r.replace(/[A-Za-z0-9]{6}$/, '<6>') : 'OK')); }\n\
+           try { const r = fn(); console.log(label + '=' + (typeof r === 'string' ? r.replace(/[A-Za-z0-9]+$/, (m) => '<' + m.length + '>') : 'OK')); }\n\
            catch (e) { console.log(label + '=' + e.code + ' ' + JSON.stringify(e.resource ?? e.path)); }\n\
          };\n\
          t('mkdtemp', () => fs.mkdtempSync('dt-'));\n\
@@ -32967,7 +32985,7 @@ fn a_relative_path_is_checked_against_the_cwd_as_node_does() {
          t('chdirA.writeBack', () => fs.writeFileSync('../B/wf-z', 'x'));\n\
          process.chdir('../B/sub');\n\
          t('chdirSub.write', () => fs.writeFileSync('wf-s', 'x'));\n\
-         fsp.mkdtemp('./pr-').then((r) => console.log('promises=' + r.replace(/[A-Za-z0-9]{6}$/, '<6>')),\n\
+         fsp.mkdtemp('./pr-').then((r) => console.log('promises=' + r.replace(/[A-Za-z0-9]+$/, (m) => '<' + m.length + '>')),\n\
            (e) => console.log('promises=' + e.code));\n",
     );
     let script = script.to_string_lossy().to_string();
@@ -32978,6 +32996,9 @@ fn a_relative_path_is_checked_against_the_cwd_as_node_does() {
             .parent()
             .unwrap()
             .to_path_buf();
+        // The absolute grant names the cwd: spelled as the cwd is reported,
+        // or on macOS (/var -> /private/var) nothing relative matches it.
+        let root = cwd_spelling(&root);
         std::fs::create_dir_all(root.parent().unwrap().join("A")).unwrap();
         let abs = root.to_string_lossy().to_string();
         let grant = format!("--allow-fs-write={}", grant.unwrap_or(&abs));
@@ -32989,8 +33010,15 @@ fn a_relative_path_is_checked_against_the_cwd_as_node_does() {
             "mkdtemp=dt-<6>",
             "mkdtempDot=./dt-<6>",
             "mkdtempSub=sub/dt-<6>",
-            // Admitted, then refused by mkdtemp itself, as node does.
-            "mkdtempEmpty=EINVAL \"XXXXX\"",
+            // Admitted, then handed to mkdtemp with the five X's node's binding
+            // gives an empty prefix (oam_core::mkdtemp_template): refused by
+            // glibc and libuv's Windows mkdtemp, filled by macOS's mkdtemp(3)
+            // -- node v22.23.1 there answers "4XQ6E".
+            if cfg!(target_os = "macos") {
+                "mkdtempEmpty=<5>"
+            } else {
+                "mkdtempEmpty=EINVAL \"XXXXX\""
+            },
             "mkdtempUp=ERR_ACCESS_DENIED \"../A/dt-XXXXXX\"",
             "mkdtempUpViaSub=ERR_ACCESS_DENIED \"sub/../../A/dt-XXXXXX\"",
             "write=OK",
@@ -34603,6 +34631,30 @@ fn e2e_pipe_path(tag: &str) -> String {
     }
 }
 
+/// A directory for one e2e test's Unix domain sockets and the files beside
+/// them: under `/tmp` on unix, where `sun_path` (104 bytes on macOS, 108 on
+/// Linux) rules out write_temp's run dir -- macOS's canonical
+/// `/private/var/folders/<..>/T/` is 58 bytes before the run dir's own 34 --
+/// and in write_temp's run dir on Windows, whose pipes live in the pipe
+/// namespace. Spelled as the cwd reports it (see `cwd_spelling`).
+fn socket_dir(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    let leaf = format!("oam-e2e-{tag}-{}-{nanos}", std::process::id());
+    let dir = if cfg!(windows) {
+        write_temp(&format!("{leaf}/.keep"), "")
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    } else {
+        PathBuf::from("/tmp").join(leaf)
+    };
+    std::fs::create_dir_all(&dir).unwrap();
+    cwd_spelling(&dir)
+}
+
 /// #219: oam's pipe server and client speak to node's -- a Windows named
 /// pipe, a Unix domain socket elsewhere -- in both directions: 4 MiB through
 /// a server that echoes as it reads, every byte back intact, then the
@@ -34820,15 +34872,17 @@ fn an_undici_request_over_a_pipe_needs_the_url_host_grant_too() {
 /// pipe; an absolute one admits exactly the socket it names.
 #[test]
 fn a_pipe_path_that_is_a_file_needs_the_fs_grants_and_resolves_against_the_cwd() {
-    let dir = write_temp("pipe_fs_gate/box/.keep", "")
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let secret = write_temp("pipe_fs_gate/secret.txt", "s");
-    let script = write_temp(
-        "pipe_fs_gate/main.mjs",
+    // socket_dir: `listen box` binds box/x.sock, which must fit sun_path,
+    // and the script chdirs into `dir` and connects relatively from there,
+    // so the grants and the absolute socket name are spelled as the cwd is
+    // reported (macOS: /private/..., not the temp dir's /var/...).
+    let dir = socket_dir("pipe-fs-gate");
+    std::fs::create_dir_all(dir.join("box")).unwrap();
+    let secret = dir.join("secret.txt");
+    std::fs::write(&secret, "s").unwrap();
+    let script = dir.join("main.mjs");
+    std::fs::write(
+        &script,
         "import net from 'node:net';\n\
          import path from 'node:path';\n\
          const [dir, secret] = process.argv.slice(2);\n\
@@ -34847,7 +34901,8 @@ fn a_pipe_path_that_is_a_file_needs_the_fs_grants_and_resolves_against_the_cwd()
          await tryIt('connect rel', () => net.connect('rel.sock'));\n\
          process.chdir(box);\n\
          await tryIt('connect rel after chdir', () => net.connect('rel.sock'));\n",
-    );
+    )
+    .unwrap();
     let dir_s = dir.to_string_lossy().into_owned();
     let rel_abs = dir.join("rel.sock").to_string_lossy().into_owned();
     let run = |grants: &[String]| {
