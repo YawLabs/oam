@@ -98,6 +98,24 @@
 #                            a case that flakes under load does not end a
 #                            release; a real failure fails both runs). Both
 #                            runs' output is kept under target/ci-local/.
+#   OAM_CI_FRESH=1           run every step: clear the step ledger first. By
+#                            default a step that already passed on EXACTLY this
+#                            tree -- HEAD, the working tree with its untracked
+#                            files, rustc -V, cargo -V and the two flags above
+#                            all unchanged -- is skipped with a notice, so a
+#                            re-run after one late step failed goes straight
+#                            back to that step. The ledger is
+#                            target/ci-local/passed (scripts/lib/ci-ledger.sh);
+#                            step 5 always runs, see its comment.
+#
+# The step ledger exists because this file is release-local.sh's local gate
+# and takes about seventy minutes: when step 13 failed on a flake on
+# 2026-10-04, the fix was to run all fourteen steps again to reach it. A step
+# is recorded only when it actually RAN and passed -- never from a warn or
+# self-skip path -- and a failed step exits before anything is recorded. The
+# ledger is per-box, per-checkout state under target/, which is gitignored: it
+# cannot dirty the release preflight's clean-tree check, and it is outside its
+# own key by the same rule.
 #
 # Install as a pre-push hook (so you can't push without it passing). A
 # wrapper, NOT `ln -s`: MSYS/Git Bash `ln -s` silently COPIES the file, and
@@ -162,6 +180,12 @@ ko()  { echo -e "${RED}  [fail]${NC} $*" >&2; exit 1; }
 # preflight below makes, shared with the remote legs' provisioning.
 # shellcheck source=lib/node-pin.sh
 . scripts/lib/node-pin.sh
+
+# The step ledger: which steps already passed on exactly this tree. The key's
+# rationale and the atomic-mark shape are in the lib's header; the wiring is
+# the block after the EXIT trap below.
+# shellcheck source=lib/ci-ledger.sh
+. scripts/lib/ci-ledger.sh
 
 # Leftovers under target/debug are, by definition, orphans of an earlier run:
 # nothing a human uses long-term runs out of the debug tree. Clearing them
@@ -229,6 +253,63 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# --- the step ledger -----------------------------------------------------------
+# Every gating step but 5 asks step_done_earlier first and calls step_passed
+# as the last statement of its body. The key is computed here, once, and
+# RE-READ after every step that may rewrite a tracked file (8 and 9: xtask
+# stamps the conformance receipts when the results moved) -- mutable state is
+# re-read at step boundaries, never cached across one that can change it. A
+# step marked before such a rewrite stays keyed to the tree it ran on, so a
+# later run on the rewritten tree runs it again: a skip is a claim about THIS
+# tree, and that is the only claim the ledger makes.
+CI_LEDGER_DIR="target/ci-local/passed"
+# Validated before anything runs: a mistyped value must not be read as "fresh"
+# or as "not fresh" by accident.
+case "${OAM_CI_FRESH:-}" in
+  ""|0) ;;
+  1) ci_ledger_clear "$CI_LEDGER_DIR"
+     ok "OAM_CI_FRESH=1 -- step ledger cleared, every step runs" ;;
+  *) ko "OAM_CI_FRESH must be unset, 0 or 1 (got '$OAM_CI_FRESH')" ;;
+esac
+CI_KEY_FLAGS=""
+[ "$FAST" -eq 0 ]       || CI_KEY_FLAGS="--fast"
+[ "$SKIP_TESTS" -eq 0 ] || CI_KEY_FLAGS="$CI_KEY_FLAGS --no-tests"
+# Unquoted on purpose: the flags are separate arguments to the key.
+# shellcheck disable=SC2086
+CI_KEY="$(ci_ledger_key $CI_KEY_FLAGS)" || ko "cannot key the step ledger (reason above)"
+STEPS_RAN=0; STEPS_SKIPPED=0
+# step_done_earlier <step-id> -- 0, with a notice, when the ledger holds a pass
+# for this step under the current key; 1 otherwise, counting the step as run.
+step_done_earlier() {
+  if ci_ledger_passed "$CI_LEDGER_DIR" "$CI_KEY" "$1"; then
+    STEPS_SKIPPED=$((STEPS_SKIPPED + 1))
+    ok "$1 -- passed earlier on this exact tree ($CI_LEDGER_DIR), skipped; OAM_CI_FRESH=1 runs it again"
+    return 0
+  fi
+  STEPS_RAN=$((STEPS_RAN + 1))
+  return 1
+}
+# step_passed <step-id> -- the LAST statement of a step's body: every failure
+# above it is a ko, which exits, so reaching it is the pass. A mark that cannot
+# be written is a warning, not a failure -- the gate passed; only the memo of
+# it is lost.
+step_passed() {
+  ci_ledger_mark "$CI_LEDGER_DIR" "$CI_KEY" "$1" \
+    || warn "could not record $1 in $CI_LEDGER_DIR -- a re-run will run it again"
+}
+# rekey_after <what> -- re-read the key after a step that may have rewritten a
+# tracked file. A changed key is announced, because it means the steps marked
+# so far this run are keyed to a tree that no longer exists on disk.
+rekey_after() {
+  local new
+  # shellcheck disable=SC2086
+  new="$(ci_ledger_key $CI_KEY_FLAGS)" || ko "cannot re-key the step ledger after $1 (reason above)"
+  if [ "$new" != "$CI_KEY" ]; then
+    echo "  tree changed during $1 -- the remaining steps are keyed to the tree as it is now; a re-run runs the earlier steps again"
+    CI_KEY="$new"
+  fi
+}
+
 # Preflight, not a numbered step: the conformance oracle must be EXACTLY the
 # Node pinned in .node-version. xtask conformance refuses any other node too,
 # but it only runs at step 8 -- after the build, both test runs and the smoke
@@ -280,21 +361,28 @@ say "1/14 Control bytes (raw C0 in tracked text)"
 # control byte that does not exist. It is a WARN rather than a hard fail so
 # that a Rust-only box without node can still run the other thirteen steps;
 # node is already a soft dependency here (step 12 skips itself without it).
-set +e
-bash scripts/check-control-bytes.sh
-control_rc=$?
-set -e
-case "$control_rc" in
-  0) ok "no raw control bytes" ;;
-  2) warn "control-byte scan could not run (needs node on PATH) -- NOT a clean result" ;;
-  *) ko "raw control bytes above -- see the fix line in the report" ;;
-esac
+if ! step_done_earlier 01-control-bytes; then
+  set +e
+  bash scripts/check-control-bytes.sh
+  control_rc=$?
+  set -e
+  case "$control_rc" in
+    0) ok "no raw control bytes"; step_passed 01-control-bytes ;;
+    # Not recorded: a scan that could not run is not a pass, so the next run
+    # tries it again (it costs a second).
+    2) warn "control-byte scan could not run (needs node on PATH) -- NOT a clean result" ;;
+    *) ko "raw control bytes above -- see the fix line in the report" ;;
+  esac
+fi
 
 say "2/14 Format (cargo fmt --check)"
-if cargo fmt --all --check; then
-  ok "fmt clean"
-else
-  ko "fmt diffs above -- run 'cargo fmt --all' and re-stage"
+if ! step_done_earlier 02-fmt; then
+  if cargo fmt --all --check; then
+    ok "fmt clean"
+  else
+    ko "fmt diffs above -- run 'cargo fmt --all' and re-stage"
+  fi
+  step_passed 02-fmt
 fi
 
 say "3/14 Clippy (-D warnings, --all-features)"
@@ -311,10 +399,13 @@ say "3/14 Clippy (-D warnings, --all-features)"
 # (The ConPTY e2e used to be the live case, behind a conpty-e2e feature. Since
 # YawLabs/oam#109 it is crates/oam_cli/tests/conpty.rs, cfg(windows) and
 # always on, so a Windows run lints it like any other test.)
-if cargo clippy --workspace --all-targets --all-features -- -D warnings; then
-  ok "clippy clean (all features)"
-else
-  ko "clippy warnings above"
+if ! step_done_earlier 03-clippy; then
+  if cargo clippy --workspace --all-targets --all-features -- -D warnings; then
+    ok "clippy clean (all features)"
+  else
+    ko "clippy warnings above"
+  fi
+  step_passed 03-clippy
 fi
 
 say "4/14 Feature-off configuration (--no-default-features)"
@@ -338,30 +429,45 @@ say "4/14 Feature-off configuration (--no-default-features)"
 # Scoped to the two crates that HAVE the feature. `--no-default-features` across
 # the whole workspace would also strip unrelated third-party defaults, which
 # tests a configuration nobody ships.
-clear_debug_holders
-park_link_targets
-if cargo build -p oam_cli -p oam_engine --no-default-features; then
-  ok "napi-off build links"
-else
-  ko "the --no-default-features build failed -- a #[cfg(feature = \"napi\")] boundary has rotted"
-fi
-if cargo clippy -p oam_cli -p oam_engine --no-default-features --all-targets -- -D warnings; then
-  ok "napi-off clippy clean"
-else
-  ko "clippy warnings in the --no-default-features configuration (above)"
-fi
-if [ "$SKIP_TESTS" -eq 0 ]; then
-  nodefault_status=0
-  bounded_cargo_test -p oam_cli -p oam_engine --no-default-features || nodefault_status=$?
+if ! step_done_earlier 04-feature-off; then
   clear_debug_holders
-  [ "$nodefault_status" -eq 0 ] \
-    || ko "napi-off tests failed (status $nodefault_status -- 124 means it hit the 15-min hang ceiling)"
-  ok "napi-off tests passed"
-else
-  warn "napi-off tests SKIPPED (--no-tests) -- build + clippy still ran"
+  park_link_targets
+  if cargo build -p oam_cli -p oam_engine --no-default-features; then
+    ok "napi-off build links"
+  else
+    ko "the --no-default-features build failed -- a #[cfg(feature = \"napi\")] boundary has rotted"
+  fi
+  if cargo clippy -p oam_cli -p oam_engine --no-default-features --all-targets -- -D warnings; then
+    ok "napi-off clippy clean"
+  else
+    ko "clippy warnings in the --no-default-features configuration (above)"
+  fi
+  if [ "$SKIP_TESTS" -eq 0 ]; then
+    nodefault_status=0
+    bounded_cargo_test -p oam_cli -p oam_engine --no-default-features || nodefault_status=$?
+    clear_debug_holders
+    [ "$nodefault_status" -eq 0 ] \
+      || ko "napi-off tests failed (status $nodefault_status -- 124 means it hit the 15-min hang ceiling)"
+    ok "napi-off tests passed"
+  else
+    warn "napi-off tests SKIPPED (--no-tests) -- build + clippy still ran"
+  fi
+  # Recorded under --no-tests too: --no-tests is part of the key, so that pass
+  # is only ever reused by another --no-tests run.
+  step_passed 04-feature-off
 fi
 
 say "5/14 Build (cargo build --workspace)"
+# The one step the ledger never skips, and not because it is expensive: on an
+# unchanged tree cargo has nothing to do and this is a sub-second no-op. Running
+# it is what GUARANTEES that target/debug/oam is the default-feature binary
+# steps 7-9 execute. Step 4 leaves a napi-LESS one behind whenever it runs, and
+# a `cargo build --no-default-features` by hand between two gate runs does the
+# same -- and the ledger cannot see either, because target/ is outside its key
+# on purpose (it is ignored, and the ledger itself lives there). So the only
+# honest answer is to let cargo re-check the tree every time; the linker-
+# diagnostics scan below rides along, since a no-op build emits none.
+STEPS_RAN=$((STEPS_RAN + 1))
 clear_debug_holders
 park_link_targets
 # Captured, not streamed straight through. rustc surfaces linker diagnostics --
@@ -393,77 +499,85 @@ fi
 
 if [ "$SKIP_TESTS" -eq 0 ]; then
   say "6/14 Tests (cargo test --workspace)"
-  # ci.yml installed tsgo per matrix leg (continue-on-error); locally just
-  # surface the gap -- the oam-check differential tests self-skip without it.
-  command -v tsgo >/dev/null 2>&1 \
-    || warn "tsgo not on PATH -- oam-check tests will self-skip (npm install -g @typescript/native-preview)"
-  # The http_server_wire flood tests dial ~300 sockets at once, above a stock
-  # POSIX soft limit (macOS ships 256), and skip themselves when the harness
-  # would be the one to run out. A no-op on Windows, which has no such limit.
-  ulimit -n 4096 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
-  # The harnesses cargo is about to relink are exactly the images a previous
-  # run's orphans are still executing.
-  clear_debug_holders
-  test_status=0
-  bounded_cargo_test --workspace || test_status=$?
-  # Unconditional, and BEFORE the failure exit: a failed or timed-out run leaks
-  # more orphans than a clean one, and the smoke step below executes
-  # target/debug/oam.
-  clear_debug_holders
-  [ "$test_status" -eq 0 ] \
-    || ko "tests failed (status $test_status -- 124 means it hit the 15-min hang ceiling)"
-  ok "tests passed"
+  if ! step_done_earlier 06-tests; then
+    # ci.yml installed tsgo per matrix leg (continue-on-error); locally just
+    # surface the gap -- the oam-check differential tests self-skip without it.
+    command -v tsgo >/dev/null 2>&1 \
+      || warn "tsgo not on PATH -- oam-check tests will self-skip (npm install -g @typescript/native-preview)"
+    # The http_server_wire flood tests dial ~300 sockets at once, above a stock
+    # POSIX soft limit (macOS ships 256), and skip themselves when the harness
+    # would be the one to run out. A no-op on Windows, which has no such limit.
+    ulimit -n 4096 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+    # The harnesses cargo is about to relink are exactly the images a previous
+    # run's orphans are still executing.
+    clear_debug_holders
+    test_status=0
+    bounded_cargo_test --workspace || test_status=$?
+    # Unconditional, and BEFORE the failure exit: a failed or timed-out run leaks
+    # more orphans than a clean one, and the smoke step below executes
+    # target/debug/oam.
+    clear_debug_holders
+    [ "$test_status" -eq 0 ] \
+      || ko "tests failed (status $test_status -- 124 means it hit the 15-min hang ceiling)"
+    ok "tests passed"
+    step_passed 06-tests
+  fi
 else
   say "6/14 Tests SKIPPED (--no-tests)"
 fi
 
 say "7/14 Smoke (oam run)"
-SMOKE_DIR="$(mktemp -d)"
-CLEANUP_PATHS+=("$SMOKE_DIR")
-echo "console.log('ci smoke', 6 * 7)" > "$SMOKE_DIR/smoke.js"
-# Guarded capture (a crash inside $() under set -e dies without a message)
-# + ci.yml's 5-min smoke ceiling where a timeout tool exists.
-#
-# OAM_DAEMON_IDLE_MS: without it the type-check daemon this run may spawn idles
-# for THIRTY MINUTES (crates/oam_ts/src/daemon.rs), detached, holding
-# target/debug/oam.exe -- long enough to break the next gate's link step. The
-# e2e suite already pins 45s for the same reason; the smoke step never needs a
-# warm daemon at all.
-if command -v timeout >/dev/null 2>&1; then
-  out=$(OAM_DAEMON_IDLE_MS=1500 timeout 300 ./target/debug/oam run "$SMOKE_DIR/smoke.js") || ko "smoke run failed (crash or 5-min hang)"
-else
-  out=$(OAM_DAEMON_IDLE_MS=1500 ./target/debug/oam run "$SMOKE_DIR/smoke.js") || ko "smoke run failed (crashed)"
-fi
-if [ "$out" = "ci smoke 42" ]; then
-  ok "smoke ok"
-else
-  ko "smoke output unexpected: '$out'"
-fi
+# Skippable: it reads target/debug/oam, which step 5 has just re-checked with
+# cargo on this same tree, and writes nothing a later step reads.
+if ! step_done_earlier 07-smoke; then
+  SMOKE_DIR="$(mktemp -d)"
+  CLEANUP_PATHS+=("$SMOKE_DIR")
+  echo "console.log('ci smoke', 6 * 7)" > "$SMOKE_DIR/smoke.js"
+  # Guarded capture (a crash inside $() under set -e dies without a message)
+  # + ci.yml's 5-min smoke ceiling where a timeout tool exists.
+  #
+  # OAM_DAEMON_IDLE_MS: without it the type-check daemon this run may spawn idles
+  # for THIRTY MINUTES (crates/oam_ts/src/daemon.rs), detached, holding
+  # target/debug/oam.exe -- long enough to break the next gate's link step. The
+  # e2e suite already pins 45s for the same reason; the smoke step never needs a
+  # warm daemon at all.
+  if command -v timeout >/dev/null 2>&1; then
+    out=$(OAM_DAEMON_IDLE_MS=1500 timeout 300 ./target/debug/oam run "$SMOKE_DIR/smoke.js") || ko "smoke run failed (crash or 5-min hang)"
+  else
+    out=$(OAM_DAEMON_IDLE_MS=1500 ./target/debug/oam run "$SMOKE_DIR/smoke.js") || ko "smoke run failed (crashed)"
+  fi
+  if [ "$out" = "ci smoke 42" ]; then
+    ok "smoke ok"
+  else
+    ko "smoke output unexpected: '$out'"
+  fi
 
-# Still step 7: running is necessary but not sufficient. This box has the VC++
-# redistributable (every box with Visual Studio does), so a binary that imports
-# the dynamic CRT smokes green here and dies on a clean end-user machine. Only
-# an import check catches that, and only on the Windows leg -- elsewhere there
-# is no oam.exe to inspect.
-if [ -f target/debug/oam.exe ]; then
-  # Self-check first. Every bug this checker has had degenerated it toward
-  # always-passing, which looks exactly like a clean binary from out here.
-  assert_static_crt_canary || ko "CRT-linkage self-check failed -- see above"
-  if assert_static_crt target/debug/oam.exe; then
-    ok "CRT linkage static (no VC++ redist dependency)"
-  else
-    ko "oam.exe imports the dynamic CRT -- see the diagnostic above"
+  # Still step 7: running is necessary but not sufficient. This box has the VC++
+  # redistributable (every box with Visual Studio does), so a binary that imports
+  # the dynamic CRT smokes green here and dies on a clean end-user machine. Only
+  # an import check catches that, and only on the Windows leg -- elsewhere there
+  # is no oam.exe to inspect.
+  if [ -f target/debug/oam.exe ]; then
+    # Self-check first. Every bug this checker has had degenerated it toward
+    # always-passing, which looks exactly like a clean binary from out here.
+    assert_static_crt_canary || ko "CRT-linkage self-check failed -- see above"
+    if assert_static_crt target/debug/oam.exe; then
+      ok "CRT linkage static (no VC++ redist dependency)"
+    else
+      ko "oam.exe imports the dynamic CRT -- see the diagnostic above"
+    fi
+    # The other half, and the half that regresses invisibly: oam_engine's build
+    # script links V8 to generate the startup snapshot and was the original source
+    # of the libcmt.lib LNK4098. Adding --target back to a Windows cargo
+    # invocation withholds the crt-static rustflags from host units, which leaves
+    # the shipped binary correct and this build script wrong.
+    if assert_static_crt_build_script target/debug oam_engine; then
+      ok "CRT linkage static in the oam_engine build script (links V8)"
+    else
+      ko "the oam_engine build script imports the dynamic CRT -- see above"
+    fi
   fi
-  # The other half, and the half that regresses invisibly: oam_engine's build
-  # script links V8 to generate the startup snapshot and was the original source
-  # of the libcmt.lib LNK4098. Adding --target back to a Windows cargo
-  # invocation withholds the crt-static rustflags from host units, which leaves
-  # the shipped binary correct and this build script wrong.
-  if assert_static_crt_build_script target/debug oam_engine; then
-    ok "CRT linkage static in the oam_engine build script (links V8)"
-  else
-    ko "the oam_engine build script imports the dynamic CRT -- see above"
-  fi
+  step_passed 07-smoke
 fi
 
 # attribution_step [why-under-fast] -- step 10, as a function because BOTH
@@ -472,6 +586,11 @@ fi
 # the --fast reason, echoed so the log explains a step the flag used to skip.
 attribution_step() {
   say "10/14 Attribution (THIRD_PARTY_LICENSES drift)"
+  # Skippable: it compares a fresh generate in a temp file against the tracked
+  # file and writes nothing into the tree. Recorded only on the real match
+  # below -- the two warn paths (no cargo-about, OAM_SKIP_ATTRIBUTION=1) checked
+  # nothing, and neither the tool's presence nor that knob is in the key.
+  if step_done_earlier 10-attribution; then return 0; fi
   [ -z "$1" ] || echo "  running under --fast: $1"
   # Every released binary statically links ~380 crates, so their notices have to
   # travel with it. Cargo.lock changes silently invalidate the checked-in file;
@@ -497,6 +616,7 @@ attribution_step() {
       # would otherwise fail the gate over line endings that carry no meaning.
       if attribution_matches "$attr_tmp" THIRD_PARTY_LICENSES.md; then
         ok "THIRD_PARTY_LICENSES.md matches the dependency graph"
+        step_passed 10-attribution
       else
         ko "THIRD_PARTY_LICENSES.md is stale -- regenerate with: cargo about generate about.hbs -o THIRD_PARTY_LICENSES.md"
       fi
@@ -515,18 +635,35 @@ attribution_step() {
 
 if [ "$FAST" -eq 0 ]; then
   say "8/14 Conformance (node-differential gate)"
-  command -v node >/dev/null 2>&1 || ko "conformance needs node on PATH"
-  if cargo run -p xtask -- conformance; then
-    ok "conformance clean"
-  else
-    ko "conformance diverged from Node -- see output above / conformance/scorecard.json"
+  # Skippable, with one thing to know: xtask REWRITES the tracked receipts
+  # (CONFORMANCE.md, conformance/scorecard.json) when the results moved, and
+  # release-local.sh reads them after this gate. On a skip they are exactly
+  # what the recorded pass left on disk -- a rewrite would have changed the
+  # tree, and with it the key -- so the release reads the same files it would
+  # have read then. And a rewrite that did happen is why the key is re-read
+  # right after: the steps recorded above are keyed to the tree before it.
+  if ! step_done_earlier 08-conformance; then
+    command -v node >/dev/null 2>&1 || ko "conformance needs node on PATH"
+    if cargo run -p xtask -- conformance; then
+      ok "conformance clean"
+    else
+      ko "conformance diverged from Node -- see output above / conformance/scorecard.json"
+    fi
+    step_passed 08-conformance
+    rekey_after "step 8 (conformance receipts)"
   fi
 
   say "9/14 Node-suite (skip-ratchet + pass-floor gate)"
-  if cargo run -p xtask -- node-suite; then
-    ok "node-suite gate ok (pass-rate in CONFORMANCE-NODE.md)"
-  else
-    ko "node-suite gate failed (skip-ratchet or pass-floor violation -- see output above)"
+  # Same shape as step 8: CONFORMANCE-NODE.md and
+  # conformance/node-suite-scorecard.json are tracked and may be rewritten.
+  if ! step_done_earlier 09-node-suite; then
+    if cargo run -p xtask -- node-suite; then
+      ok "node-suite gate ok (pass-rate in CONFORMANCE-NODE.md)"
+    else
+      ko "node-suite gate failed (skip-ratchet or pass-floor violation -- see output above)"
+    fi
+    step_passed 09-node-suite
+    rekey_after "step 9 (node-suite receipts)"
   fi
 
   attribution_step ""
@@ -563,26 +700,29 @@ say "11/14 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5) + vendor
 # per-site justification is now denied-by-lint on every crate (step 3).
 # Baseline: conformance/unsafe-budget.json; regen with
 # `cargo run -p xtask -- unsafe-budget --regen`.
-if cargo run -p xtask -- unsafe-budget; then
-  ok "unsafe budget within ceilings"
-else
-  ko "unsafe-budget ratchet violated (see above) -- fix, or re-bless with 'cargo run -p xtask -- unsafe-budget --regen'"
+if ! step_done_earlier 11-unsafe-budget; then
+  if cargo run -p xtask -- unsafe-budget; then
+    ok "unsafe budget within ceilings"
+  else
+    ko "unsafe-budget ratchet violated (see above) -- fix, or re-bless with 'cargo run -p xtask -- unsafe-budget --regen'"
+  fi
+  # The budget scan walks crates/ and xtask only, and vendor/ is outside the
+  # workspace (no fmt, clippy or tests) with no Cargo.lock checksum. So a
+  # vendored crate's one gate is this: byte-equal to its checksummed crates.io
+  # release plus the committed OAM-PATCH.diff, and warning-free in every feature
+  # set OAM-PATCH.features lists. Exit 2 is "could not run" (crate neither in
+  # cargo's cache nor downloadable), which is not a clean result.
+  set +e
+  bash scripts/check-vendor.sh --build
+  vendor_rc=$?
+  set -e
+  case "$vendor_rc" in
+    0) ok "vendored crates match their releases plus OAM-PATCH.diff" ;;
+    2) ko "vendored-crate check could not run (above) -- NOT a clean result" ;;
+    *) ko "vendored crate drifted from its release plus OAM-PATCH.diff, or does not build (above)" ;;
+  esac
+  step_passed 11-unsafe-budget
 fi
-# The budget scan walks crates/ and xtask only, and vendor/ is outside the
-# workspace (no fmt, clippy or tests) with no Cargo.lock checksum. So a
-# vendored crate's one gate is this: byte-equal to its checksummed crates.io
-# release plus the committed OAM-PATCH.diff, and warning-free in every feature
-# set OAM-PATCH.features lists. Exit 2 is "could not run" (crate neither in
-# cargo's cache nor downloadable), which is not a clean result.
-set +e
-bash scripts/check-vendor.sh --build
-vendor_rc=$?
-set -e
-case "$vendor_rc" in
-  0) ok "vendored crates match their releases plus OAM-PATCH.diff" ;;
-  2) ko "vendored-crate check could not run (above) -- NOT a clean result" ;;
-  *) ko "vendored crate drifted from its release plus OAM-PATCH.diff, or does not build (above)" ;;
-esac
 
 say "12/14 npm launcher packaging (manifest drift + node --test)"
 # GATING, and compiles nothing -- seconds, not minutes.
@@ -610,15 +750,19 @@ say "12/14 npm launcher packaging (manifest drift + node --test)"
 #
 # `--no-tests` does NOT skip these: it is documented as skipping the two CARGO
 # test runs, which are minutes of compilation. This is three seconds.
-if ! command -v node >/dev/null 2>&1; then
-  warn "npm packaging gate SKIPPED -- no node on PATH (the conformance step needs it too, so a full run cannot get this far)"
-else
-  ( cd npm && node sync-packages.mjs --check ) \
-    || ko "npm/ manifests do not match Cargo.toml (above) -- regenerate with 'node npm/sync-packages.mjs' and commit the result"
-  ok "npm/ manifests match the workspace version"
-  ( cd npm && node --test "test/*.test.mjs" ) \
-    || ko "npm launcher tests failed (above) -- reproduce with: cd npm && node --test \"test/*.test.mjs\""
-  ok "npm launcher tests passed"
+if ! step_done_earlier 12-npm; then
+  if ! command -v node >/dev/null 2>&1; then
+    # Not recorded: nothing was checked.
+    warn "npm packaging gate SKIPPED -- no node on PATH (the conformance step needs it too, so a full run cannot get this far)"
+  else
+    ( cd npm && node sync-packages.mjs --check ) \
+      || ko "npm/ manifests do not match Cargo.toml (above) -- regenerate with 'node npm/sync-packages.mjs' and commit the result"
+    ok "npm/ manifests match the workspace version"
+    ( cd npm && node --test "test/*.test.mjs" ) \
+      || ko "npm launcher tests failed (above) -- reproduce with: cd npm && node --test \"test/*.test.mjs\""
+    ok "npm launcher tests passed"
+    step_passed 12-npm
+  fi
 fi
 
 say "13/14 Scripts (release-orchestration shell tests + changelog tooling + sidecar matrix self-test)"
@@ -655,61 +799,68 @@ run_script_tests(){  # <run-number>
   rc="${PIPESTATUS[0]}"
   return "$rc"
 }
-if run_script_tests 1; then
-  ok "script tests passed (log: $SCRIPTS_LOG_DIR/test-scripts-1.log)"
-elif [ "${OAM_SCRIPT_TESTS_RETRY:-1}" != "1" ]; then
-  ko "script tests failed (see above; log: $SCRIPTS_LOG_DIR/test-scripts-1.log; OAM_SCRIPT_TESTS_RETRY=0, so no second run) -- './scripts/test-scripts.sh -v' for per-case detail"
-else
-  warn "script tests failed on the first run -- running the suite once more (a flake passes now; a real failure fails twice; OAM_SCRIPT_TESTS_RETRY=0 skips this)"
-  if run_script_tests 2; then
-    ok "script tests passed on the second run -- the first run's failures are in $SCRIPTS_LOG_DIR/test-scripts-1.log; a case that fails only under load is a bug to file"
+# Skippable, and the step this ledger was built for: the suite below is the
+# one that flaked. Its logs live under target/ci-local/, beside the ledger and
+# outside the key. Recorded as one step, after all three suites.
+if ! step_done_earlier 13-scripts; then
+  if run_script_tests 1; then
+    ok "script tests passed (log: $SCRIPTS_LOG_DIR/test-scripts-1.log)"
+  elif [ "${OAM_SCRIPT_TESTS_RETRY:-1}" != "1" ]; then
+    ko "script tests failed (see above; log: $SCRIPTS_LOG_DIR/test-scripts-1.log; OAM_SCRIPT_TESTS_RETRY=0, so no second run) -- './scripts/test-scripts.sh -v' for per-case detail"
   else
-    ko "script tests failed twice (see above; logs: $SCRIPTS_LOG_DIR/test-scripts-1.log and test-scripts-2.log) -- './scripts/test-scripts.sh -v' for per-case detail"
+    warn "script tests failed on the first run -- running the suite once more (a flake passes now; a real failure fails twice; OAM_SCRIPT_TESTS_RETRY=0 skips this)"
+    if run_script_tests 2; then
+      ok "script tests passed on the second run -- the first run's failures are in $SCRIPTS_LOG_DIR/test-scripts-1.log; a case that fails only under load is a bug to file"
+    else
+      ko "script tests failed twice (see above; logs: $SCRIPTS_LOG_DIR/test-scripts-1.log and test-scripts-2.log) -- './scripts/test-scripts.sh -v' for per-case detail"
+    fi
   fi
-fi
 
-# Still step 13: the changelog tooling. release-local.sh's changelog gate had
-# no test of its own and passed six releases (0.15.1 through 0.16.3) whose
-# notes never left [Unreleased]; the helper that now promotes them shipped
-# claiming a strictness its code did not have. The suite slices the gate block VERBATIM out of
-# release-local.sh (so it tests what the release runs, not a copy), runs it and
-# scripts/changelog-release.sh on fixtures, checks the two agree on one file,
-# and asserts the gate still sits above the auto-bump and the tag -- the order
-# whose violation once left a half-released state. Its own script rather than
-# a group in test-scripts.sh: it belongs beside the two scripts it covers. A
-# release runs it only here, on the Windows box -- the Linux and Mac legs run
-# scripts/build-remote.sh, which calls neither this suite nor this script --
-# but it is kept to bash + POSIX awk so any checkout can run it.
-# Compiles nothing. Spawn-bound like the suite above: ~280 process spawns;
-# measured 2m13s on win-arm64 on a day the box spawned a bare awk in 0.8s
-# (2026-09-21), and 4m18s for 35 assertions on the same box later that day.
-if bash scripts/test-changelog-tools.sh; then
-  ok "changelog tooling tests passed"
-else
-  ko "changelog tooling tests failed (see above) -- './scripts/test-changelog-tools.sh -v' for per-case detail"
-fi
+  # Still step 13: the changelog tooling. release-local.sh's changelog gate had
+  # no test of its own and passed six releases (0.15.1 through 0.16.3) whose
+  # notes never left [Unreleased]; the helper that now promotes them shipped
+  # claiming a strictness its code did not have. The suite slices the gate block VERBATIM out of
+  # release-local.sh (so it tests what the release runs, not a copy), runs it and
+  # scripts/changelog-release.sh on fixtures, checks the two agree on one file,
+  # and asserts the gate still sits above the auto-bump and the tag -- the order
+  # whose violation once left a half-released state. Its own script rather than
+  # a group in test-scripts.sh: it belongs beside the two scripts it covers. A
+  # release runs it only here, on the Windows box -- the Linux and Mac legs run
+  # scripts/build-remote.sh, which calls neither this suite nor this script --
+  # but it is kept to bash + POSIX awk so any checkout can run it.
+  # Compiles nothing. Spawn-bound like the suite above: ~280 process spawns;
+  # measured 2m13s on win-arm64 on a day the box spawned a bare awk in 0.8s
+  # (2026-09-21), and 4m18s for 35 assertions on the same box later that day.
+  if bash scripts/test-changelog-tools.sh; then
+    ok "changelog tooling tests passed"
+  else
+    ko "changelog tooling tests failed (see above) -- './scripts/test-changelog-tools.sh -v' for per-case detail"
+  fi
 
-# Still step 13: the MCP sidecar matrix's offline self-test. The matrix gates
-# every release (release-local.sh runs it live against the staged binary), and
-# its self-test is what holds the matrix's own verdicts -- whose fault a failed
-# sidecar is, which arm is pinned to node, what an uncalled row counts as. It
-# ran in no gate until this block, so it guarded only when someone ran it by
-# hand, and a verdict mutation that turned an oam regression into a warn passed
-# every release. Offline by construction: no network, npm or oam, and no disk
-# beyond reading its own source; five cases spawn on node's own -e: two
-# stand-in sidecars (one through a detached child that exits by itself), a
-# stand-in install -- a node, and a child of its, under a shell -- that is left
-# to time out and is killed with everything under it, one more that an
-# interrupt of the run kills, and a node handed npm's arguments the way npm is.
-# About ten seconds on an idle box.
-# Skips without node, like step 12 -- a full run cannot get this far without
-# one anyway.
-if ! command -v node >/dev/null 2>&1; then
-  warn "sidecar matrix self-test SKIPPED -- no node on PATH"
-elif node scripts/mcp-sidecar-matrix.mjs --self-test; then
-  ok "sidecar matrix self-test passed"
-else
-  ko "sidecar matrix self-test failed (see above) -- reproduce with: node scripts/mcp-sidecar-matrix.mjs --self-test"
+  # Still step 13: the MCP sidecar matrix's offline self-test. The matrix gates
+  # every release (release-local.sh runs it live against the staged binary), and
+  # its self-test is what holds the matrix's own verdicts -- whose fault a failed
+  # sidecar is, which arm is pinned to node, what an uncalled row counts as. It
+  # ran in no gate until this block, so it guarded only when someone ran it by
+  # hand, and a verdict mutation that turned an oam regression into a warn passed
+  # every release. Offline by construction: no network, npm or oam, and no disk
+  # beyond reading its own source; five cases spawn on node's own -e: two
+  # stand-in sidecars (one through a detached child that exits by itself), a
+  # stand-in install -- a node, and a child of its, under a shell -- that is left
+  # to time out and is killed with everything under it, one more that an
+  # interrupt of the run kills, and a node handed npm's arguments the way npm is.
+  # About ten seconds on an idle box.
+  # Skips without node, like step 12 -- a full run cannot get this far without
+  # one anyway.
+  if ! command -v node >/dev/null 2>&1; then
+    # Not recorded: two of the three suites ran, the step did not.
+    warn "sidecar matrix self-test SKIPPED -- no node on PATH"
+  elif node scripts/mcp-sidecar-matrix.mjs --self-test; then
+    ok "sidecar matrix self-test passed"
+    step_passed 13-scripts
+  else
+    ko "sidecar matrix self-test failed (see above) -- reproduce with: node scripts/mcp-sidecar-matrix.mjs --self-test"
+  fi
 fi
 
 say "14/14 Miri aliasing models (Stacked Borrows check on napi.rs's pointer disciplines)"
@@ -739,7 +890,12 @@ say "14/14 Miri aliasing models (Stacked Borrows check on napi.rs's pointer disc
 # SKIPPED rather than fatal when nightly+miri is absent: it is a large toolchain
 # to require of every checkout, and the rest of the gate is unaffected. The skip
 # is loud on purpose.
-if ! rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
+#
+# Skippable; the two SKIPPED paths are not recorded (nothing ran, and whether
+# nightly+miri is installed is not in the key -- install it and the step runs).
+if step_done_earlier 14-miri; then
+  :
+elif ! rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
   warn "miri models SKIPPED -- no nightly toolchain (install: rustup toolchain install nightly --component miri)"
 elif ! cargo +nightly miri --version >/dev/null 2>&1; then
   warn "miri models SKIPPED -- nightly present but miri component missing (rustup component add miri --toolchain nightly)"
@@ -783,7 +939,10 @@ else
     esac
   done
   ok "miri: all ${#OAM_MIRI_HELD_CASES[@]} known-UB models still rejected, each on a reported UB diagnosis"
+  step_passed 14-miri
 fi
 
 echo ""
-ok "All local CI gates passed"
+# Ran vs skipped counts only the steps the ledger decided about; a step a flag
+# turned off (--fast, --no-tests) is in neither number.
+ok "All local CI gates passed ($STEPS_RAN steps ran, $STEPS_SKIPPED skipped -- passed earlier on this exact tree; OAM_CI_FRESH=1 runs them all)"
