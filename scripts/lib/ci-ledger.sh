@@ -20,12 +20,22 @@
 #     (target/, node_modules/, the ledger itself) does not perturb it;
 #   - rustc -V and cargo -V, because a toolchain update changes what fmt,
 #     clippy and the build mean without touching one tracked byte;
+#   - the cargo environment that decides what that toolchain builds:
+#     RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS and CARGO_BUILD_RUSTFLAGS (an env
+#     RUSTFLAGS -- even an EMPTY one -- replaces .cargo/config.toml's
+#     +crt-static rustflags, and a weakening one such as -Awarnings changes
+#     what clippy and the tests passed), and CARGO_TARGET_DIR (step 7 reads
+#     ./target/debug/oam, so a build that landed elsewhere is not the binary
+#     it smoked). Set-but-empty is kept apart from unset: empty is the hazard;
 #   - the ci-local.sh flags that change what a step means (--fast, --no-tests):
 #     a pass under --no-tests says nothing about step 6.
-# One token, sha256 over all of it. Anything else -- node's version, an env
+# One token, sha256 over all of it. Anything else -- node's version, an OAM_*
 # knob -- is NOT in the key; steps whose outcome such a thing decides are not
 # marked when they take the self-skip path (ci-local.sh marks only a step
-# that actually RAN and passed).
+# that actually RAN and passed). Step 14 runs on a toolchain of its own
+# (nightly + miri), which ci-local.sh adds to that ONE step's key as an extra
+# input: a `rustup update nightly` changes every aliasing verdict and nothing
+# else here.
 #
 # NOTE ON THE SCRATCH INDEX. The tree id comes from `git add -A` into a
 # private index (GIT_INDEX_FILE) followed by `git write-tree`, so the real
@@ -48,7 +58,8 @@
 #
 # NOTE ON PIPES. ci-local.sh runs under `set -e -o pipefail`. Nothing here
 # pipes into `grep -q`; the comparison is a bash string test and the hash is
-# `sha256sum` reading a here-string to EOF.
+# `sha256sum` -- or `shasum -a 256` where only that exists (stock macOS) --
+# reading a here-string to EOF.
 #
 # Every function takes the ledger dir and the key as ARGUMENTS, so
 # scripts/test-scripts.sh drives passed/mark/clear on a fixture directory
@@ -90,33 +101,71 @@ ci_ledger_tree_id() {
   printf '%s\n' "$tree"
 }
 
-# ci_ledger_key_from <head> <tree-id> <toolchain> [flag]... -- the key as a
+# ci_ledger_sha256 -- the hex sha256 of stdin. `sha256sum` where coreutils is
+# on PATH, else `shasum -a 256`: stock macOS ships perl's shasum and no
+# coreutils, and ci-local.sh is the gate on that box too (the same fallback
+# scripts/check-vendor.sh and lib/node-pin.sh carry). Both print "<hex>  -"
+# (Git Bash's sha256sum prints "<hex> *-"); the first word is kept. Returns 1
+# with a reason when neither exists, so the caller fails rather than keying
+# the ledger to an empty string.
+ci_ledger_sha256() {
+  local sum
+  if command -v sha256sum >/dev/null 2>&1; then
+    sum="$(sha256sum)" || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    sum="$(shasum -a 256)" || return 1
+  else
+    echo "ci_ledger_sha256: neither sha256sum nor shasum on PATH" >&2
+    return 1
+  fi
+  printf '%s\n' "${sum%% *}"
+}
+
+# ci_ledger_cargo_env -- the cargo environment lines of the key, one per
+# variable, on stdout: "NAME=unset" when the variable is not in the
+# environment, "NAME=set:<value>" when it is -- so set-but-empty, the
+# RUSTFLAGS="" that silently drops +crt-static, keys apart from unset. The
+# four are the ones that change what steps 3-7 build or where they build it
+# (see the header); OAM_* knobs are deliberately not here.
+ci_ledger_cargo_env() {
+  local name
+  for name in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_TARGET_DIR; do
+    if [ -n "${!name+set}" ]; then printf '%s=set:%s\n' "$name" "${!name}"
+    else printf '%s=unset\n' "$name"; fi
+  done
+}
+
+# ci_ledger_key_from <head> <tree-id> <toolchain> [input]... -- the key as a
 # pure function of what the caller measured: one sha256 token over the parts,
 # newline-separated so no part can run into the next. <toolchain> is the
-# `rustc -V` and `cargo -V` lines; the flags are ci-local.sh's, in the order
-# the caller passes them (ci-local.sh passes a fixed order). Empty <head> or
-# <tree-id> is refused: a key made from a missing part would be a key that
+# `rustc -V` and `cargo -V` lines followed by the cargo environment lines
+# (ci_ledger_cargo_env). Every further argument is one more input, in the
+# order the caller passes them: ci-local.sh passes its flags in a fixed order,
+# and for step 14 the nightly toolchain that step alone runs on. Empty <head>
+# or <tree-id> is refused: a key made from a missing part would be a key that
 # matches the wrong tree.
 ci_ledger_key_from() {
-  local head="$1" tree="$2" toolchain="$3" flag parts; shift 3
+  local head="$1" tree="$2" toolchain="$3" input parts; shift 3
   if [ -z "$head" ] || [ -z "$tree" ]; then
     echo "ci_ledger_key_from: head and tree id are required" >&2
     return 1
   fi
   parts="head=$head"$'\n'"tree=$tree"$'\n'"toolchain=$toolchain"
-  for flag in "$@"; do parts="$parts"$'\n'"flag=$flag"; done
-  # `sha256sum` prints "<hex>  -"; keep the hex. A here-string, read to EOF.
+  for input in "$@"; do parts="$parts"$'\n'"input=$input"; done
+  # A here-string, read to EOF.
   local sum
-  sum="$(sha256sum <<<"$parts")" || return 1
-  printf '%s\n' "${sum%% *}"
+  sum="$(ci_ledger_sha256 <<<"$parts")" || return 1
+  printf '%s\n' "$sum"
 }
 
-# ci_ledger_key [flag]... -- the key for the current tree and toolchain, from
-# git, rustc and cargo as found on PATH. Fails (1, reason on stderr) rather
+# ci_ledger_key [input]... -- the key for the current tree, toolchain and cargo
+# environment, from git, rustc and cargo as found on PATH; the inputs are
+# passed through to ci_ledger_key_from. Fails (1, reason on stderr) rather
 # than printing a partial key when any of them cannot answer. ci-local.sh
-# calls this once at the start and AGAIN after any step that may rewrite a
-# tracked file, because a key computed before such a step describes a tree
-# that no longer exists.
+# calls this once at the start, AGAIN when a step finishes (a pass is recorded
+# only when the tree it ran on is still the tree on disk), and after any step
+# that may rewrite a tracked file, because a key computed before such a step
+# describes a tree that no longer exists.
 ci_ledger_key() {
   local head tree rustc_v cargo_v
   head="$(git rev-parse HEAD 2>/dev/null)" \
@@ -124,7 +173,7 @@ ci_ledger_key() {
   tree="$(ci_ledger_tree_id)" || return 1
   rustc_v="$(rustc -V 2>/dev/null)" || { echo "ci_ledger_key: rustc -V failed" >&2; return 1; }
   cargo_v="$(cargo -V 2>/dev/null)" || { echo "ci_ledger_key: cargo -V failed" >&2; return 1; }
-  ci_ledger_key_from "$head" "$tree" "$rustc_v"$'\n'"$cargo_v" "$@"
+  ci_ledger_key_from "$head" "$tree" "$rustc_v"$'\n'"$cargo_v"$'\n'"$(ci_ledger_cargo_env)" "$@"
 }
 
 # ci_ledger_passed <dir> <key> <step-id> -- 0 when <dir>/<step-id> exists and

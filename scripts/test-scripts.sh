@@ -2533,9 +2533,56 @@ case "$LG_K1" in
   *) [ "${#LG_K1}" = "64" ] && pass || fail "length ${#LG_K1}, want 64" ;;
 esac
 
-# Eight keys, seven distinct: only the first two share every input. A flag is
-# a separate part, not a substring of one -- the last line is the pair.
-it "the same inputs give the same key; HEAD, the tree, the toolchain and each flag change it"
+# Stock macOS ships perl's shasum and no coreutils, and ci-local.sh keys the
+# ledger before step 1 -- a hasher that only knew sha256sum ended the whole
+# gate there with nothing run. Driven through PATH: a dir holding only a
+# shasum (a wrapper over the real one, so the fallback's output is checked
+# against the sha256sum key above), then a dir holding neither.
+it "the hash falls back to shasum -a 256 where sha256sum is absent, giving the same key; with neither on PATH it fails with a reason"
+LG_HASH="$SUITE_TMP/ledger-hash"
+mkdir -p "$LG_HASH/shasum-only" "$LG_HASH/neither"
+LG_REAL_SHASUM="$(command -v shasum 2>/dev/null || true)"
+LG_BAD=""
+if [ -n "$LG_REAL_SHASUM" ]; then
+  printf '#!/bin/bash\nexec "%s" "$@"\n' "$LG_REAL_SHASUM" > "$LG_HASH/shasum-only/shasum"
+  chmod +x "$LG_HASH/shasum-only/shasum"
+  LG_K_SHASUM="$(PATH="$LG_HASH/shasum-only"; hash -r; ci_ledger_key_from 1111111 aaaaaaa "$LG_TC" 2>"$LG_HASH/err")" \
+    || LG_BAD="$LG_BAD shasum-only-failed:'$(cat "$LG_HASH/err")'"
+  [ "$LG_K_SHASUM" = "$LG_K1" ] || LG_BAD="$LG_BAD shasum-key='$LG_K_SHASUM'"
+else
+  LG_BAD="$LG_BAD (no shasum on this box: the fallback's output was not compared)"
+fi
+LG_K_NONE="$(PATH="$LG_HASH/neither"; hash -r; ci_ledger_key_from 1111111 aaaaaaa "$LG_TC" 2>"$LG_HASH/err")" \
+  && LG_BAD="$LG_BAD neither-succeeded:'$LG_K_NONE'"
+[ -z "$LG_K_NONE" ] || LG_BAD="$LG_BAD neither-printed:'$LG_K_NONE'"
+grep -q 'neither sha256sum nor shasum' "$LG_HASH/err" || LG_BAD="$LG_BAD neither-reason:'$(cat "$LG_HASH/err")'"
+if [ -z "$LG_BAD" ]; then pass
+elif [ -z "$LG_REAL_SHASUM" ] && [ "$LG_BAD" = " (no shasum on this box: the fallback's output was not compared)" ]; then skip "no shasum on PATH -- only the no-hasher refusal was checked, and it held"
+else fail "$LG_BAD"; fi
+
+# The cargo environment is in the key because it changes what the toolchain
+# builds while touching no tracked byte: an env RUSTFLAGS -- the EMPTY one
+# included -- replaces .cargo/config.toml's +crt-static rustflags. So unset,
+# set-but-empty and set must be three different inputs, for each of the four.
+it "the cargo environment lines keep unset, set-but-empty and set apart, for RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS, CARGO_BUILD_RUSTFLAGS and CARGO_TARGET_DIR"
+LG_ENV_WANT='RUSTFLAGS=unset
+CARGO_ENCODED_RUSTFLAGS=unset
+CARGO_BUILD_RUSTFLAGS=unset
+CARGO_TARGET_DIR=unset'
+LG_ENV_U="$(unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_TARGET_DIR; ci_ledger_cargo_env)"
+LG_ENV_E="$(unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_TARGET_DIR; RUSTFLAGS=""; CARGO_ENCODED_RUSTFLAGS=""; CARGO_BUILD_RUSTFLAGS=""; CARGO_TARGET_DIR=""; ci_ledger_cargo_env)"
+LG_ENV_S="$(unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_TARGET_DIR; RUSTFLAGS="-Awarnings"; CARGO_ENCODED_RUSTFLAGS=$'-A\x1fwarnings'; CARGO_BUILD_RUSTFLAGS="-C opt-level=1"; CARGO_TARGET_DIR="target/x64 host"; ci_ledger_cargo_env)"
+LG_BAD=""
+[ "$LG_ENV_U" = "$LG_ENV_WANT" ] || LG_BAD="$LG_BAD unset:'$(tr '\n' ' ' <<<"$LG_ENV_U")'"
+[ "$LG_ENV_E" = "$(sed 's/=unset$/=set:/' <<<"$LG_ENV_WANT")" ] || LG_BAD="$LG_BAD empty:'$(tr '\n' ' ' <<<"$LG_ENV_E")'"
+[ "$LG_ENV_S" = "RUSTFLAGS=set:-Awarnings"$'\n'"CARGO_ENCODED_RUSTFLAGS=set:-A"$'\x1f'"warnings"$'\n'"CARGO_BUILD_RUSTFLAGS=set:-C opt-level=1"$'\n'"CARGO_TARGET_DIR=set:target/x64 host" ] \
+  || LG_BAD="$LG_BAD set:'$(tr '\n' ' ' <<<"$LG_ENV_S")'"
+if [ -z "$LG_BAD" ]; then pass; else fail "$LG_BAD"; fi
+
+# Nine keys, eight distinct: only the first two share every input. An input is
+# a separate part, not a substring of one -- the --fast / --no-tests pair is
+# the check -- and step 14's nightly line is one more input like the flags.
+it "the same inputs give the same key; HEAD, the tree, the toolchain, each flag and a step's own input change it"
 LG_KEYS="$LG_K1
 $(ci_ledger_key_from 1111111 aaaaaaa "$LG_TC")
 $LG_K2
@@ -2543,8 +2590,9 @@ $(ci_ledger_key_from 2222222 aaaaaaa "$LG_TC")
 $(ci_ledger_key_from 1111111 bbbbbbb "$LG_TC")
 $(ci_ledger_key_from 1111111 aaaaaaa 'rustc 1.97.0 (0000000 2026-07-01)')
 $(ci_ledger_key_from 1111111 aaaaaaa "$LG_TC" --no-tests)
-$(ci_ledger_key_from 1111111 aaaaaaa "$LG_TC" --fast --no-tests)"
-eq "$(printf '%s\n' "$LG_KEYS" | sort -u | wc -l | tr -d ' ')" "7"
+$(ci_ledger_key_from 1111111 aaaaaaa "$LG_TC" --fast --no-tests)
+$(ci_ledger_key_from 1111111 aaaaaaa "$LG_TC" 'nightly=rustc 1.100.0-nightly (bff8e12ff 2026-08-26)')"
+eq "$(printf '%s\n' "$LG_KEYS" | sort -u | wc -l | tr -d ' ')" "8"
 
 it "the key refuses a missing HEAD or tree id rather than keying half a tree"
 LG_BAD=""
@@ -2613,11 +2661,27 @@ if [ -z "$LG_BAD" ]; then pass; else fail "$LG_BAD"; fi
 # and a mode bit or an ignored-but-tracked file does not move it -- the reason
 # the scratch index is seeded from the real one), an untracked file moves it,
 # an ignored one does not, and the REAL index is never touched.
+#
+# The commit is made with signing OFF on the command line, like the suite's
+# other git fixtures, and under a config that demands a signature with a key
+# that does not exist (GIT_CONFIG_* env, which -c overrides): this suite is
+# ci-local.sh step 13, and a fixture commit that inherited the box's
+# commit.gpgsign=true would hang on a passphrase or fail silently with the
+# key unreachable, and the four tree-id cases below would go red over a
+# signing key. The commit's output is kept, and a repo with no commit fails
+# its own case instead of feeding a sentinel into those four.
 LG_REPO="$SUITE_TMP/ledger-repo"
 mkdir -p "$LG_REPO"
-( cd "$LG_REPO" && git init -q . && git config user.email t@t && git config user.name t \
-  && printf 'tracked\n' > a && printf 'scratch\n' > .gitignore && git add a .gitignore && git commit -qm one ) >/dev/null 2>&1
-LG_HEAD_TREE="$(cd "$LG_REPO" && git rev-parse 'HEAD^{tree}')"
+LG_COMMIT_OUT="$({ cd "$LG_REPO" && git init -q . && git config user.email t@t && git config user.name t \
+  && printf 'tracked\n' > a && printf 'scratch\n' > .gitignore && git add a .gitignore \
+  && GIT_CONFIG_COUNT=3 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=true \
+     GIT_CONFIG_KEY_1=gpg.format GIT_CONFIG_VALUE_1=ssh \
+     GIT_CONFIG_KEY_2=user.signingkey GIT_CONFIG_VALUE_2="$SUITE_TMP/no-such-signing-key" \
+     git -c commit.gpgsign=false -c tag.gpgsign=false commit -qm one; } 2>&1)" || LG_COMMIT_OUT="rc=$? $LG_COMMIT_OUT"
+LG_HEAD_TREE="$(cd "$LG_REPO" && git rev-parse --verify -q 'HEAD^{tree}' 2>/dev/null)" || LG_HEAD_TREE=""
+
+it "the tree-id fixture has a commit, made with signing off under a config that demands a signature it cannot produce"
+if [ -n "$LG_HEAD_TREE" ]; then pass; else fail "the fixture commit failed: ${LG_COMMIT_OUT:-no output}"; fi
 
 it "tree id: a clean checkout hashes to HEAD's own tree"
 eq "$(cd "$LG_REPO" && ci_ledger_tree_id)" "$LG_HEAD_TREE"
@@ -2644,13 +2708,18 @@ LG_T_EDIT="$(cd "$LG_REPO" && ci_ledger_tree_id)"
 if [ -n "$LG_T_EDIT" ] && [ "$LG_T_EDIT" != "$LG_HEAD_TREE" ]; then pass; else fail "edit invisible: '$LG_T_EDIT'"; fi
 
 # The composed key is its parts, hashed: proven by rebuilding it from HEAD,
-# the tree id and the two version lines, which is also the only way to check
-# it without a second slow call.
-it "ci_ledger_key is the sha256 of HEAD, the tree id, rustc -V, cargo -V and the flags"
+# the tree id, the two version lines and the cargo environment lines, which
+# is also the only way to check it without a second slow call. Then the one
+# environment case that matters most, end to end: RUSTFLAGS="" -- the exact
+# invocation that drops +crt-static -- must not key the same as a plain run.
+it "ci_ledger_key is the sha256 of HEAD, the tree id, rustc -V, cargo -V, the cargo environment and the flags; RUSTFLAGS=\"\" keys differently"
 if command -v rustc >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
   LG_KA="$(cd "$LG_REPO" && ci_ledger_key --fast)"
-  LG_KX="$(ci_ledger_key_from "$(cd "$LG_REPO" && git rev-parse HEAD)" "$LG_HEAD_TREE" "$(rustc -V)"$'\n'"$(cargo -V)" --fast)"
-  eq "$LG_KA" "$LG_KX"
+  LG_KX="$(ci_ledger_key_from "$(cd "$LG_REPO" && git rev-parse HEAD)" "$LG_HEAD_TREE" "$(rustc -V)"$'\n'"$(cargo -V)"$'\n'"$(ci_ledger_cargo_env)" --fast)"
+  LG_KR="$(cd "$LG_REPO" && RUSTFLAGS="" ci_ledger_key --fast)"
+  if [ "$LG_KA" != "$LG_KX" ]; then fail "expected '$LG_KX', got '$LG_KA'"
+  elif [ -z "$LG_KR" ] || [ "$LG_KR" = "$LG_KA" ]; then fail "RUSTFLAGS=\"\" keyed as '$LG_KR' against a plain '$LG_KA'"
+  else pass; fi
 else
   skip "rustc/cargo not on PATH -- the composed key cannot be computed here"
 fi
@@ -2665,7 +2734,7 @@ grep -qxF 'CI_LEDGER_DIR="target/ci-local/passed"' scripts/ci-local.sh || LG_BAD
 grep -qF 'ci_ledger_clear "$CI_LEDGER_DIR"' scripts/ci-local.sh || LG_BAD="$LG_BAD fresh-does-not-clear"
 grep -qE '^#   OAM_CI_FRESH=1 ' scripts/ci-local.sh || LG_BAD="$LG_BAD knob-undocumented-in-header"
 LG_L_FRESH="$(lg_line 'case "${OAM_CI_FRESH:-}" in')"
-LG_L_KEY="$(lg_line 'CI_KEY="$(ci_ledger_key $CI_KEY_FLAGS)"')"
+LG_L_KEY="$(lg_line 'CI_KEY="$(step_key)"')"
 LG_L_SAY1="$(lg_line 'say "1/14 ')"
 if [ -z "$LG_L_FRESH" ] || [ -z "$LG_L_KEY" ] || [ -z "$LG_L_SAY1" ] \
    || [ "$LG_L_FRESH" -ge "$LG_L_KEY" ] || [ "$LG_L_KEY" -ge "$LG_L_SAY1" ]; then
@@ -2691,24 +2760,75 @@ if [ -z "$LG_CASE" ]; then fail "the OAM_CI_FRESH case block was not found in ci
 else eq "${LG_GOT% }" "unset:[] 0:[] 1:[clear L ok] yes:[ko]"; fi
 
 # The two helpers every step goes through, sliced verbatim and run against a
-# fixture ledger: the first ask counts the step as run and says no, the mark
-# records it, the second ask says yes with the notice the operator reads.
-it "step_done_earlier / step_passed: ask, run, record, then skip with the notice -- and the counts follow"
+# fixture ledger with step_key stubbed (LG_NOW stands for the tree as it is
+# when the key is read): the first ask says no, the mark records it, the
+# second ask says yes with the notice the operator reads. The counts: "ran"
+# is counted at the mark, not the ask -- a step that asked and then took a
+# warn/self-skip path (no node, no nightly) checked nothing and is not one of
+# the "N steps ran" in the summary.
 LG_FNS="$(awk '/^step_done_earlier\(\) \{$/ || /^step_passed\(\) \{$/ { f = 1 } f { print } f && /^}$/ { f = 0 }' scripts/ci-local.sh)"
 LG_W="$SUITE_TMP/ledger-wire"
-LG_OUT="$(bash -c ". scripts/lib/ci-ledger.sh; ok(){ echo \"ok \$*\"; }; warn(){ echo \"warn \$*\"; }
-  CI_LEDGER_DIR='$LG_W'; CI_KEY='$LG_K1'; STEPS_RAN=0; STEPS_SKIPPED=0; $LG_FNS
+# lg_wire <script> -- the sliced helpers, the lib and the stubs, then <script>.
+lg_wire(){
+  bash -c ". scripts/lib/ci-ledger.sh; ok(){ echo \"ok \$*\"; }; warn(){ echo \"warn \$*\"; }; ko(){ echo \"ko \$*\"; exit 1; }
+  step_key(){ printf '%s\n' \"\$LG_NOW\${1:+:\$*}\"; }
+  CI_LEDGER_DIR='$LG_W'; CI_KEY='$LG_K1'; LG_NOW='$LG_K1'; STEP_KEY=''; STEPS_RAN=0; STEPS_SKIPPED=0; $LG_FNS
+  $1
+  echo \"ran=\$STEPS_RAN skipped=\$STEPS_SKIPPED\"" 2>&1
+}
+it "step_done_earlier / step_passed: ask, run, record, then skip with the notice; a step that asked and self-skipped is not counted as run"
+LG_OUT="$(lg_wire '
   step_done_earlier 06-tests && echo first-said-yes
   step_passed 06-tests
   step_done_earlier 06-tests || echo second-said-no
-  CI_KEY='$LG_K2'; step_done_earlier 06-tests && echo other-key-said-yes
-  echo \"ran=\$STEPS_RAN skipped=\$STEPS_SKIPPED\"" 2>&1)"
+  CI_KEY='"'$LG_K2'"'; step_done_earlier 06-tests && echo other-key-said-yes
+  step_done_earlier 12-npm && echo unmarked-said-yes')"
 if [ "$(grep -c '() {$' <<<"$LG_FNS")" != "2" ]; then fail "step_done_earlier/step_passed not found in ci-local.sh"
 elif grep -q 'said' <<<"$LG_OUT"; then fail "wrong answers:$(printf '\n%s' "$LG_OUT")"
 elif ! grep -qxF "ok 06-tests -- passed earlier on this exact tree ($LG_W), skipped; OAM_CI_FRESH=1 runs it again" <<<"$LG_OUT"; then
   fail "the skip notice changed:$(printf '\n%s' "$LG_OUT")"
-elif ! grep -qx 'ran=2 skipped=1' <<<"$LG_OUT"; then fail "counts:$(printf '\n%s' "$LG_OUT")"
+elif ! grep -qx 'ran=1 skipped=1' <<<"$LG_OUT"; then fail "counts:$(printf '\n%s' "$LG_OUT")"
 else pass; fi
+
+# The mark re-reads the key. Step 8 is the case that bit: xtask rewrites the
+# tracked receipts, the pass used to be recorded under the key from BEFORE
+# the rewrite, and release-local.sh then restores the committed receipts --
+# which is that same tree -- so the next release run skipped step 8 with
+# HEAD's stale receipts on disk and landed nothing. Same mechanism for an
+# edit that overlaps a step in the shared checkout. Here LG_NOW moves between
+# the ask and the mark: no entry may be written, the warn must say so, and
+# neither the old tree nor the new one may skip the step afterwards.
+it "step_passed withholds the mark when the tree changed while the step ran, and says so; neither tree skips the step after"
+rm -rf "$LG_W"
+LG_OUT="$(lg_wire '
+  step_done_earlier 08-conformance || echo asked
+  LG_NOW='"'$LG_K2'"'
+  step_passed 08-conformance
+  [ -e "$CI_LEDGER_DIR/08-conformance" ] && echo "entry-written:$(cat "$CI_LEDGER_DIR/08-conformance")"
+  LG_NOW='"'$LG_K1'"'; step_done_earlier 08-conformance && echo old-tree-skipped
+  CI_KEY='"'$LG_K2'"'; LG_NOW='"'$LG_K2'"'; step_done_earlier 08-conformance && echo new-tree-skipped')"
+if grep -q 'skipped$\|entry-written' <<<"$LG_OUT"; then fail "recorded across a tree change:$(printf '\n%s' "$LG_OUT")"
+elif ! grep -qF 'warn the tree changed while 08-conformance ran -- its pass is not recorded' <<<"$LG_OUT"; then
+  fail "the operator was not told:$(printf '\n%s' "$LG_OUT")"
+elif ! grep -qx 'ran=1 skipped=0' <<<"$LG_OUT"; then fail "counts:$(printf '\n%s' "$LG_OUT")"
+else pass; fi
+
+# Step 14 runs on the nightly toolchain, which the shared key does not
+# measure, so it hands its ask and its mark the nightly's version as inputs:
+# the same inputs skip, a moved nightly does not, and an ask without the
+# inputs (the shared key) does not read as the nightly pass.
+it "a step's own inputs (step 14: the nightly) are part of its key: same inputs skip, a new nightly runs again, the shared key never matches"
+rm -rf "$LG_W"
+LG_OUT="$(lg_wire '
+  step_done_earlier 14-miri "nightly=rustc 1.100.0-nightly (bff8e12ff 2026-08-26)" "miri=miri 0.1.0" || echo asked
+  step_passed 14-miri "nightly=rustc 1.100.0-nightly (bff8e12ff 2026-08-26)" "miri=miri 0.1.0"
+  step_done_earlier 14-miri "nightly=rustc 1.100.0-nightly (bff8e12ff 2026-08-26)" "miri=miri 0.1.0" || echo same-nightly-said-no
+  step_done_earlier 14-miri "nightly=rustc 1.101.0-nightly (0000000 2026-10-01)" "miri=miri 0.1.0" && echo new-nightly-said-yes
+  step_done_earlier 14-miri && echo shared-key-said-yes')"
+if grep -q 'said' <<<"$LG_OUT"; then fail "wrong answers:$(printf '\n%s' "$LG_OUT")"
+elif ! grep -qx 'ran=1 skipped=1' <<<"$LG_OUT"; then fail "counts:$(printf '\n%s' "$LG_OUT")"
+else pass; fi
+rm -rf "$LG_W"
 
 # Which steps consult the ledger is the safety question. Every gating step but
 # 5 must; 5 must NOT, and must say why: it is the no-op rebuild that
@@ -2721,24 +2841,49 @@ LG_MARKED="$(grep -oE 'step_passed [0-9][0-9]-[a-z-]+' scripts/ci-local.sh | sed
 LG_WANT="01-control-bytes 02-fmt 03-clippy 04-feature-off 06-tests 07-smoke 08-conformance 09-node-suite 10-attribution 11-unsafe-budget 12-npm 13-scripts 14-miri "
 if [ "$LG_ASKED" != "$LG_WANT" ]; then fail "steps consulting the ledger: '$LG_ASKED' -- want '$LG_WANT'"
 elif [ "$LG_MARKED" != "$LG_WANT" ]; then fail "steps recording a pass: '$LG_MARKED' -- want '$LG_WANT'"
-elif ! grep -q 'ci_ledger_passed "\$CI_LEDGER_DIR" "\$CI_KEY"' scripts/ci-local.sh || ! grep -q 'ci_ledger_mark "\$CI_LEDGER_DIR" "\$CI_KEY"' scripts/ci-local.sh; then
-  fail "the helpers no longer decide through ci_ledger_passed / ci_ledger_mark"
+elif ! grep -q 'ci_ledger_passed "\$CI_LEDGER_DIR" "\$STEP_KEY"' scripts/ci-local.sh || ! grep -q 'ci_ledger_mark "\$CI_LEDGER_DIR" "\$STEP_KEY"' scripts/ci-local.sh; then
+  fail "the helpers no longer decide through ci_ledger_passed / ci_ledger_mark on the key the step was asked under"
 elif ! grep -q 'The one step the ledger never skips' scripts/ci-local.sh; then fail "step 5's exemption lost its explanation"
 else pass; fi
 
 # A mark must be the LAST statement of a step's body, after every ko: a step
 # recorded before its own checks ran would be skipped next time on the
 # strength of nothing. Checked for the steps whose body ends in a mark on its
-# own line -- the mark's line must come after the step's last ko.
-it "a step's pass is recorded after its last failure exit, never before"
+# own line. The window is the whole step -- from its ask to the next step's
+# `say` (or the end of the file) -- not just ask..mark, which could not see a
+# ko placed AFTER a mark that had crept upward; and a ko counts wherever it
+# sits on the line: at the start, after `||`, or in a case arm (`2) ko "`),
+# which is how step 11's check-vendor failures are spelled. Step 11 is also
+# pinned to that: its last ko must be below the check-vendor.sh call.
+it "a step's pass is recorded after its last failure exit, never before -- case-arm and trailing kos included"
 LG_BAD=""
-for s in 02-fmt 03-clippy 04-feature-off 06-tests 07-smoke 08-conformance 09-node-suite 11-unsafe-budget; do
+LG_L_VENDOR="$(lg_line 'bash scripts/check-vendor.sh --build')"
+for s in 02-fmt 03-clippy 04-feature-off 06-tests 07-smoke 08-conformance 09-node-suite 11-unsafe-budget 12-npm 14-miri; do
   LG_ASK="$(lg_line "step_done_earlier $s")"; LG_MARK="$(lg_line "step_passed $s")"
-  LG_LASTKO="$(awk -v a="$LG_ASK" -v m="$LG_MARK" 'NR > a && NR < m && /^ *(\|\| )?ko "/ { n = NR } END { print n + 0 }' scripts/ci-local.sh)"
-  [ -n "$LG_ASK" ] && [ -n "$LG_MARK" ] && [ "$LG_LASTKO" -gt "$LG_ASK" ] && [ "$LG_LASTKO" -lt "$LG_MARK" ] \
-    || LG_BAD="$LG_BAD $s(ask@${LG_ASK:-?} last-ko@$LG_LASTKO mark@${LG_MARK:-?})"
+  LG_KO="$(awk -v a="$LG_ASK" '
+    NR > a && /^ *say "/ { exit }
+    NR > a && !/^ *#/ && /(^|[ )])ko "/ { last = NR }
+    END { print last + 0 " " NR + 1 }' scripts/ci-local.sh)"
+  LG_LASTKO="${LG_KO% *}"; LG_END="${LG_KO#* }"
+  [ -n "$LG_ASK" ] && [ -n "$LG_MARK" ] && [ "$LG_LASTKO" -gt "$LG_ASK" ] && [ "$LG_LASTKO" -lt "$LG_MARK" ] && [ "$LG_MARK" -lt "$LG_END" ] \
+    || LG_BAD="$LG_BAD $s(ask@${LG_ASK:-?} last-ko@$LG_LASTKO mark@${LG_MARK:-?} end@$LG_END)"
+  if [ "$s" = "11-unsafe-budget" ] && { [ -z "$LG_L_VENDOR" ] || [ "$LG_LASTKO" -le "$LG_L_VENDOR" ]; }; then
+    LG_BAD="$LG_BAD 11-unsafe-budget(last-ko@$LG_LASTKO is not below check-vendor.sh@${LG_L_VENDOR:-?})"
+  fi
 done
 if [ -z "$LG_BAD" ]; then pass; else fail "mark not after the step's last ko:$LG_BAD"; fi
+
+# Step 14's key carries the nightly toolchain, so the toolchain is probed
+# before the ledger is asked, and the ask and the mark name the same inputs.
+it "step 14 checks for nightly+miri before asking the ledger, and asks and marks under the nightly's version"
+LG_L_RUSTUP="$(lg_line "rustup toolchain list 2>/dev/null | grep -q '^nightly'")"
+LG_L_ASK14="$(lg_line 'step_done_earlier 14-miri')"; LG_L_MARK14="$(lg_line 'step_passed 14-miri')"
+LG_IN14='"nightly=$nightly_v" "miri=$miri_v"'
+if [ -z "$LG_L_RUSTUP" ] || [ -z "$LG_L_ASK14" ] || [ "$LG_L_RUSTUP" -ge "$LG_L_ASK14" ]; then
+  fail "the nightly check (@${LG_L_RUSTUP:-?}) does not precede the ledger ask (@${LG_L_ASK14:-?})"
+elif ! grep -qF "step_done_earlier 14-miri $LG_IN14" scripts/ci-local.sh || ! grep -qF "step_passed 14-miri $LG_IN14" scripts/ci-local.sh; then
+  fail "the ask or the mark of step 14 no longer carries $LG_IN14 (ask@${LG_L_ASK14:-?} mark@${LG_L_MARK14:-?})"
+else pass; fi
 
 # Steps 8 and 9 are the two whose xtask rewrites TRACKED receipts; the key is
 # re-read right after each, inside the branch that ran it, and nowhere else.
