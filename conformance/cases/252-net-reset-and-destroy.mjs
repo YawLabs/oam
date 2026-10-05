@@ -79,9 +79,18 @@ async function connected() {
   client.resetAndDestroy();
   await rec.closed;
   conn.resume();
+  // The peer learns of the reset on its next send. One that only reads may
+  // never: macOS drops a reset that arrives against a closed window, and a
+  // reader that drains and then waits sends nothing the closed port could
+  // refuse -- measured under node v22.22.2 there as under oam, the step
+  // hung past 4 s with the reset a few milliseconds behind the write. So
+  // the peer writes, and which error ends it -- read ECONNRESET when the
+  // reset got through, EPIPE from this write when it did not -- is the
+  // kernel's timing, so only the close is reported.
+  conn.write("x");
   await peer.closed;
   log(`client: ${rec.events.join(", ")}`);
-  log(`peer:   ${peer.events.join(", ")}`);
+  log(`peer:   closed with error ${peer.events.some((e) => e.startsWith("error"))}`);
   log(`peer got all of it ${received === big.length}`);
 }
 

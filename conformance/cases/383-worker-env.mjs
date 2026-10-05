@@ -52,7 +52,11 @@ if (!isMainThread) {
     hidden: process.env["=C:"] === undefined,
   };
   if (mode === "object") {
-    report.keys = Object.keys(process.env);
+    // Sorted: node keeps a worker's object env in a std::unordered_map,
+    // whose iteration order is the C++ library's (insertion order under
+    // MSVC, reversed under libc++ and libstdc++ for this few keys), so the
+    // set of keys is node's and their order is not.
+    report.keys = Object.keys(process.env).sort();
     report.caseFold = process.env.w_obj !== undefined;
   }
   if (mode === "child") {

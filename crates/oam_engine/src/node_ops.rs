@@ -6608,7 +6608,10 @@ fn op_fs_readdir_sync(
     ) else {
         return;
     };
-    match oam_core::ops::readdir_to_json(path.os()) {
+    // args[1]: the file system's own order, for opendir's Dir (see
+    // oam_core::ops::readdir_to_json).
+    let raw = args.get(1).is_true();
+    match oam_core::ops::readdir_to_json(path.os(), raw) {
         Ok(json) => return_json(scope, &mut rv, &json),
         Err(e) => throw_fs_error(scope, oam_core::FsSite::Scandir, "scandir", &path, &e),
     }
@@ -7299,7 +7302,8 @@ fn op_fs_readdir(
     let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Read, "readdir requires a path") else {
         return;
     };
-    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_readdir(path));
+    let raw = args.get(1).is_true();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_readdir(path, raw));
 }
 
 fn op_fs_mkdir(
