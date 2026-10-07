@@ -396,82 +396,178 @@ unsafe extern "C" fn boom(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
 
 // ================================================================ beta impls
 
-/// Finalizer called when V8 GC collects the object (or napi_remove_wrap).
-/// Drops the heap-allocated i64 counter.
+/// Every counter `wrap_counter` has handed to the host and whose finalizer has
+/// not yet run, keyed by the address of its heap allocation -- the exact value
+/// passed to `napi_wrap` as the native pointer.
 ///
-/// # Safety
+/// The addon never dereferences the pointer `napi_unwrap` returns. That
+/// pointer comes back from the host as an untyped `void*`, and nothing in it
+/// proves it still points at a live `i64` this addon allocated: the object may
+/// have been wrapped by a different addon (or by this one with a different
+/// type), or its finalizer may already have reclaimed the allocation. Casting
+/// it to `*mut i64` and reading through it would be a type confusion or a
+/// use-after-free in either case. Instead the address is used only as a key
+/// into this table, which owns the allocation; a key outside the table's live
+/// addresses is absent. The key cannot prove provenance: a foreign object
+/// holding a stale address that coincides with a live counter's would match,
+/// so lookup is an identity check, not an ownership check -- harmless here
+/// only because nothing is ever dereferenced through it.
 ///
-/// Valid only as the `napi_finalize` registered by `napi_wrap` in
-/// `wrap_counter`: `data` must be the `Box::into_raw(Box::new(0i64))` pointer
-/// handed over there, and the host must invoke it at most once for that wrap.
-/// `env` and `hint` are ignored.
-unsafe extern "C" fn counter_finalize(_env: NapiEnv, data: *mut c_void, _hint: *mut c_void) {
-    if !data.is_null() {
-        // SAFETY: `data` is non-null on this branch, and the only pointer this
-        // addon ever wraps with this finalizer is the
-        // `Box::into_raw(Box::new(0i64))` produced in `wrap_counter` -- so it
-        // is a live, correctly-aligned `*mut i64` from the global allocator.
-        // N-API runs a finalizer at most once per wrap (GC collection or
-        // `napi_remove_wrap`), so this `Box::from_raw` reclaims that
-        // allocation exactly once: no double free, and no Rust alias survives
-        // because ownership was moved into the JS object at wrap time.
-        drop(unsafe { Box::from_raw(data as *mut i64) });
+/// A `BTreeMap` because `BTreeMap::new` is `const`, so the table needs no lazy
+/// initializer.
+static COUNTERS: std::sync::Mutex<std::collections::BTreeMap<usize, Box<i64>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Locks `COUNTERS`, recovering the table from a poisoned lock rather than
+/// panicking: every caller is an `extern "C"` callback, where an unwind would
+/// abort the host. The table holds only plain integers, so a panic part-way
+/// through an update cannot leave it in a state later readers would misuse.
+fn counters() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<usize, Box<i64>>> {
+    COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Registers a new zeroed counter and returns the native pointer to hand to
+/// `napi_wrap`. The table keeps ownership of the allocation; the pointer is
+/// only an identity token for it.
+fn counter_register() -> *mut c_void {
+    let counter = Box::new(0i64);
+    let native = std::ptr::from_ref::<i64>(&*counter)
+        .cast_mut()
+        .cast::<c_void>();
+    counters().insert(native.addr(), counter);
+    native
+}
+
+/// Drops the counter registered under `native`, if any. Returns whether one
+/// was registered, so a finalizer invoked twice, or with a foreign pointer,
+/// is a no-op rather than a double free.
+fn counter_release(native: *mut c_void) -> bool {
+    counters().remove(&native.addr()).is_some()
+}
+
+/// The current value of the counter registered under `native`, or `None` when
+/// `native` is not a live counter of this addon.
+fn counter_value(native: *mut c_void) -> Option<i64> {
+    counters().get(&native.addr()).map(|counter| **counter)
+}
+
+/// Increments the counter registered under `native`. Returns `false`, leaving
+/// every counter untouched, when `native` is not a live counter of this addon.
+fn counter_increment(native: *mut c_void) -> bool {
+    match counters().get_mut(&native.addr()) {
+        Some(counter) => {
+            **counter += 1;
+            true
+        }
+        None => false,
     }
 }
 
+/// Finalizer called when V8 GC collects the object (or napi_remove_wrap).
+/// Releases the counter registered for the wrapped pointer. Safe to call with
+/// any pointer, any number of times: only a registered counter is dropped.
+extern "C" fn counter_finalize(_env: NapiEnv, data: *mut c_void, _hint: *mut c_void) {
+    counter_release(data);
+}
+
 /// wrapCounter() -> obj
-/// Creates a new plain JS object and wraps a heap-allocated i64 (value 0) on it.
+/// Creates a new plain JS object and wraps the address of a registry-owned
+/// counter (value 0) as an identity token.
 ///
 /// # Safety
 ///
 /// Only ever invoked by the N-API host as a `napi_callback` with a live
-/// `env`; the `info` frame is ignored. Ownership of a heap-allocated i64 is
-/// transferred to the returned JS object, whose finalizer
-/// (`counter_finalize`) is what frees it.
+/// `env`; the `info` frame is ignored. The returned JS object's finalizer
+/// (`counter_finalize`) releases the counter registered for it.
 unsafe extern "C" fn wrap_counter(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
     // SAFETY: `obj` is a live local, so `napi_create_object`'s out-pointer is
     // valid, and a non-zero status bails out before the handle is used. The
-    // counter is a fresh `Box::into_raw` allocation with no surviving Rust
-    // alias, so passing it to `napi_wrap` transfers sole ownership to the JS
-    // object; `counter_finalize` is the matching `Box::from_raw` and runs once
-    // when that object is collected. The trailing nulls are the finalize hint
-    // and the optional `napi_ref` out-param, neither of which this addon
-    // wants. A failing `napi_wrap` would leak the box -- a leak, not
-    // unsoundness.
+    // native pointer given to `napi_wrap` is an identity token the host only
+    // stores and hands back; the allocation behind it is owned by `COUNTERS`,
+    // never by the host, so nothing the host does with it can free or alias
+    // it. The trailing nulls are the finalize hint and the optional
+    // `napi_ref` out-param, neither of which this addon wants. If `napi_wrap`
+    // fails the counter is released here, since no finalizer will ever run
+    // for it.
     unsafe {
         let mut obj: NapiValue = std::ptr::null_mut();
         if (host().create_object)(env, &mut obj) != 0 {
             return std::ptr::null_mut();
         }
-        let counter = Box::into_raw(Box::new(0i64)) as *mut c_void;
-        (host().wrap)(
+        let native = counter_register();
+        let finalize: unsafe extern "C" fn(NapiEnv, *mut c_void, *mut c_void) = counter_finalize;
+        if (host().wrap)(
             env,
             obj,
-            counter,
-            Some(counter_finalize),
+            native,
+            Some(finalize),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-        );
+        ) != 0
+        {
+            counter_release(native);
+            return std::ptr::null_mut();
+        }
         obj
     }
 }
 
-/// counterGet(obj) -> Number
+/// wrapForeign() -> obj
+/// Creates a plain JS object wrapped around a pointer `counter_register`
+/// never produced -- the shape an object wrapped by a different addon
+/// presents to this one's counter callbacks.
 ///
 /// # Safety
 ///
-/// Only ever invoked by the N-API host as a `napi_callback` with a live `env`
-/// and its `info` frame. Argument 0 is expected to be an object produced by
-/// `wrapCounter`; any other value simply fails to unwrap and yields null.
-unsafe extern "C" fn counter_get(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+/// Only ever invoked by the N-API host as a `napi_callback` with a live
+/// `env`; the `info` frame is ignored. The wrapped pointer is fabricated but
+/// never dereferenced by anyone: the host stores it, and `counter_finalize`
+/// only removes registry keys, so the finalizer drops nothing either way.
+unsafe extern "C" fn wrap_foreign(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: `obj` is a live local, so `napi_create_object`'s out-pointer is
+    // valid, and a non-zero status bails out before the handle is used. The
+    // fabricated pointer is an identity token the host only stores and hands
+    // back for registry lookup -- never dereferenced -- and `counter_finalize`
+    // removes only registered keys, so finalizing it is a no-op rather than a
+    // bad free. The trailing nulls are the finalize hint and the optional
+    // `napi_ref` out-param, neither of which this fixture wants.
+    unsafe {
+        let mut obj: NapiValue = std::ptr::null_mut();
+        if (host().create_object)(env, &mut obj) != 0 {
+            return std::ptr::null_mut();
+        }
+        let foreign = std::ptr::without_provenance_mut::<c_void>(0xdead_beef_usize);
+        let finalize: unsafe extern "C" fn(NapiEnv, *mut c_void, *mut c_void) = counter_finalize;
+        if (host().wrap)(
+            env,
+            obj,
+            foreign,
+            Some(finalize),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            return std::ptr::null_mut();
+        }
+        obj
+    }
+}
+
+/// Reads argument 0 of the current call and returns the native pointer
+/// wrapped on it, or `None` when it carries no wrap.
+///
+/// # Safety
+///
+/// `env` must be live and `info` must be the callback-info frame of the
+/// N-API call currently executing on it.
+unsafe fn unwrap_arg0(env: NapiEnv, info: NapiCallbackInfo) -> Option<*mut c_void> {
     // SAFETY: `argc` is seeded with `argv`'s real capacity of 1, so
-    // `napi_get_cb_info` cannot overrun the stack array. `native` is
-    // dereferenced only after `napi_unwrap` returned OK *and* the pointer
-    // tested non-null, and the only pointer ever wrapped by this addon is the
-    // `*mut i64` from `wrap_counter` -- so the read is of a live, aligned
-    // `i64` still owned by the JS object (it is reachable through `argv[0]`,
-    // therefore the finalizer has not run). The read copies the value out; no
-    // reference outlives the statement.
+    // `napi_get_cb_info` cannot overrun the stack array; `env` and `info` are
+    // live per this function's contract. `native` is a live local, so its
+    // address is a valid out-param for `napi_unwrap`. The returned pointer is
+    // never dereferenced -- callers only use it as a `COUNTERS` key.
     unsafe {
         let mut argc = 1usize;
         let mut argv: [NapiValue; 1] = [std::ptr::null_mut(); 1];
@@ -484,10 +580,30 @@ unsafe extern "C" fn counter_get(env: NapiEnv, info: NapiCallbackInfo) -> NapiVa
             std::ptr::null_mut(),
         );
         let mut native: *mut c_void = std::ptr::null_mut();
-        if (host().unwrap)(env, argv[0], &mut native) != 0 || native.is_null() {
-            return std::ptr::null_mut();
+        if (host().unwrap)(env, argv[0], &mut native) != 0 {
+            return None;
         }
-        let val = *(native as *const i64);
+        Some(native)
+    }
+}
+
+/// counterGet(obj) -> Number
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback` with a live `env`
+/// and its `info` frame. Argument 0 is expected to be an object produced by
+/// `wrapCounter`; any other value -- unwrapped, or wrapped with a pointer this
+/// addon did not register -- yields null.
+unsafe extern "C" fn counter_get(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: `env` and `info` come straight from the host for this call,
+    // which is `unwrap_arg0`'s contract. The value is read out of `COUNTERS`
+    // by key, with no raw-pointer dereference, and `result` is a live local
+    // whose address is a valid out-param for `napi_create_int64`.
+    unsafe {
+        let Some(val) = unwrap_arg0(env, info).and_then(counter_value) else {
+            return std::ptr::null_mut();
+        };
         let mut result: NapiValue = std::ptr::null_mut();
         (host().create_int64)(env, val, &mut result);
         result
@@ -500,32 +616,17 @@ unsafe extern "C" fn counter_get(env: NapiEnv, info: NapiCallbackInfo) -> NapiVa
 ///
 /// Only ever invoked by the N-API host as a `napi_callback` with a live `env`
 /// and its `info` frame. Argument 0 is expected to be a `wrapCounter` object;
-/// the i64 wrapped on it is mutated in place.
+/// the counter registered for it is incremented. Any other value yields null
+/// and changes nothing.
 unsafe extern "C" fn counter_inc(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
-    // SAFETY: `argc` is seeded with `argv`'s capacity of 1, bounding what
-    // `napi_get_cb_info` writes. The increment happens only after
-    // `napi_unwrap` returned OK and `native` tested non-null, and the sole
-    // pointer type this addon ever wraps is the `*mut i64` from
-    // `wrap_counter` -- so this is an aligned read-modify-write on a live
-    // allocation the JS object still owns. N-API callbacks run on the single
-    // JS thread, so no other thread can be touching the same counter
-    // concurrently.
+    // SAFETY: `env` and `info` come straight from the host for this call,
+    // which is `unwrap_arg0`'s contract. The increment goes through
+    // `COUNTERS` by key, with no raw-pointer dereference, and `undef` is a
+    // live local whose address is a valid out-param for `napi_get_undefined`.
     unsafe {
-        let mut argc = 1usize;
-        let mut argv: [NapiValue; 1] = [std::ptr::null_mut(); 1];
-        (host().get_cb_info)(
-            env,
-            info,
-            &mut argc,
-            argv.as_mut_ptr(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        let mut native: *mut c_void = std::ptr::null_mut();
-        if (host().unwrap)(env, argv[0], &mut native) != 0 || native.is_null() {
+        if !unwrap_arg0(env, info).is_some_and(counter_increment) {
             return std::ptr::null_mut();
         }
-        *(native as *mut i64) += 1;
         let mut undef: NapiValue = std::ptr::null_mut();
         (host().get_undefined)(env, &mut undef);
         undef
@@ -1220,7 +1321,7 @@ pub unsafe extern "C" fn napi_register_module_v1(env: NapiEnv, exports: NapiValu
             (host().set_named_property)(env, exports, name.as_ptr(), function);
         }
 
-        let beta_bindings: [(&std::ffi::CStr, NapiCallback); 22] = [
+        let beta_bindings: [(&std::ffi::CStr, NapiCallback); 23] = [
             (c"abaStaleReadStatus", aba_stale_read_status),
             (c"abaHandleRecycled", aba_handle_recycled),
             (c"deleteRefHandle", delete_ref_handle),
@@ -1237,6 +1338,7 @@ pub unsafe extern "C" fn napi_register_module_v1(env: NapiEnv, exports: NapiValu
             (c"readRefHandle", read_ref_handle),
             (c"readRefInt", read_ref_int),
             (c"wrapCounter", wrap_counter),
+            (c"wrapForeign", wrap_foreign),
             (c"counterGet", counter_get),
             (c"counterInc", counter_inc),
             (c"makeBigInt64", make_bigint64),
@@ -1262,5 +1364,72 @@ pub unsafe extern "C" fn napi_register_module_v1(env: NapiEnv, exports: NapiValu
         (host().set_named_property)(env, exports, c"answer".as_ptr(), answer);
 
         exports
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counter_registry_roundtrip() {
+        let native = counter_register();
+        assert_eq!(counter_value(native), Some(0));
+        assert!(counter_increment(native));
+        assert!(counter_increment(native));
+        assert_eq!(counter_value(native), Some(2));
+        assert!(counter_release(native));
+        // Finalized: no read, no write, and a second finalize is a no-op.
+        assert_eq!(counter_value(native), None);
+        assert!(!counter_increment(native));
+        assert!(!counter_release(native));
+    }
+
+    #[test]
+    fn foreign_pointer_is_never_treated_as_a_counter() {
+        // A pointer this addon never registered -- e.g. another addon's wrap --
+        // must not be read or written as an i64.
+        let mut foreign = [0u8; 3];
+        let native = foreign.as_mut_ptr().cast::<c_void>();
+        assert_eq!(counter_value(native), None);
+        assert!(!counter_increment(native));
+        assert!(!counter_release(native));
+        assert_eq!(foreign, [0u8; 3]);
+        assert_eq!(counter_value(std::ptr::null_mut()), None);
+    }
+
+    #[test]
+    fn counters_are_independent() {
+        let a = counter_register();
+        let b = counter_register();
+        assert_ne!(a, b);
+        assert!(counter_increment(a));
+        assert_eq!(counter_value(a), Some(1));
+        assert_eq!(counter_value(b), Some(0));
+        counter_finalize(std::ptr::null_mut(), a, std::ptr::null_mut());
+        assert_eq!(counter_value(a), None);
+        assert_eq!(counter_value(b), Some(0));
+        assert!(counter_release(b));
+    }
+
+    #[test]
+    fn poisoned_lock_still_serves_every_caller() {
+        // `counters()` must recover a poisoned lock instead of unwinding: its
+        // callers are `extern "C"` callbacks where a panic aborts the host.
+        // Poison the lock once, then prove the registry keeps working.
+        let poison = std::panic::catch_unwind(|| {
+            let _guard = COUNTERS.lock().unwrap();
+            panic!("poison the registry lock");
+        });
+        assert!(poison.is_err(), "the probe panic must be caught");
+        // Paranoia: if the panic never reached the guard the lock, this test
+        // would pass while covering nothing -- confirm the lock IS poisoned.
+        assert!(COUNTERS.is_poisoned(), "the lock must be poisoned");
+        let native = counter_register();
+        assert_eq!(counter_value(native), Some(0));
+        assert!(counter_increment(native));
+        assert_eq!(counter_value(native), Some(1));
+        assert!(counter_release(native));
+        assert_eq!(counter_value(native), None);
     }
 }
