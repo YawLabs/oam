@@ -16,6 +16,16 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The N-API test addon no longer dereferences the pointer `napi_unwrap` hands back.**
+  `counterGet` / `counterInc` in `crates/oam_napi_test_addon` cast that untyped pointer to
+  `*mut i64` and read or wrote through it, so an object wrapped by another addon (or a pointer
+  already reclaimed by the finalizer) would have been a type confusion or use-after-free. The
+  counters now live in an addon-owned table keyed by the wrapped address; the pointer is only a
+  lookup key, an unknown or finalized one yields null, and a failed `napi_wrap` no longer leaks
+  the allocation. Clears CodeQL `rust/access-invalid-pointer` alerts #7 and #8.
+
 ## [0.18.0] - 2026-10-04
 
 Two batches of node-compat work since 0.17.1 (0.17.2 was prepared but never released, so its
