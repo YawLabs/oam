@@ -2521,6 +2521,55 @@ fn napi_beta_wrap_counter_roundtrip() {
 
 #[cfg(feature = "napi")]
 #[test]
+fn napi_beta_counter_rejects_non_counters() {
+    // counterGet / counterInc must change nothing and answer undefined for
+    // anything that is not a live counter of this addon: an object with no
+    // wrap on it, a call with no arguments at all (argv[0] stays null), and
+    // an object wrapped around a pointer this addon never registered
+    // (wrapForeign). The live counter at the end proves the failed calls
+    // left it untouched.
+    let dir = napi_addon_dir("napi_beta_counter_bad_args");
+    write_temp(
+        "napi_beta_counter_bad_args/bad_args.cjs",
+        "const native = require('./native.node');\n\
+         const show = (v) => console.log(typeof v + ':' + v);\n\
+         // A plain object: no wrap on it.\n\
+         show(native.counterGet({}));\n\
+         show(native.counterInc({}));\n\
+         // Missing argument: argv[0] stays null.\n\
+         show(native.counterGet());\n\
+         show(native.counterInc());\n\
+         // A live counter, so the foreign calls below can be shown to change\n\
+         // nothing.\n\
+         const c = native.wrapCounter();\n\
+         native.counterInc(c);\n\
+         // An object wrapped around a pointer this addon never registered.\n\
+         const foreign = native.wrapForeign();\n\
+         show(native.counterGet(foreign));\n\
+         show(native.counterInc(foreign));\n\
+         show(native.counterGet(c));",
+    );
+    let main = dir.join("bad_args.cjs");
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 7, "stdout: {stdout}");
+    for (i, line) in lines.iter().take(6).enumerate() {
+        assert_eq!(*line, "undefined:undefined", "line {i}: expected undefined");
+    }
+    assert_eq!(
+        lines[6], "number:1",
+        "foreign and bad-arg calls left the live counter untouched"
+    );
+}
+
+#[cfg(feature = "napi")]
+#[test]
 fn napi_reference_read_after_delete_is_rejected() {
     // Regression: napi_get_reference_value used to deref the caller's handle
     // behind a null check alone, so reading a reference the addon had already

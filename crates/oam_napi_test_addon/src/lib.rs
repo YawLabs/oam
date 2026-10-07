@@ -407,8 +407,11 @@ unsafe extern "C" fn boom(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
 /// type), or its finalizer may already have reclaimed the allocation. Casting
 /// it to `*mut i64` and reading through it would be a type confusion or a
 /// use-after-free in either case. Instead the address is used only as a key
-/// into this table, which owns the allocation; a pointer the addon did not
-/// produce, or one already finalized, is simply absent.
+/// into this table, which owns the allocation; a key outside the table's live
+/// addresses is absent. The key cannot prove provenance: a foreign object
+/// holding a stale address that coincides with a live counter's would match,
+/// so lookup is an identity check, not an ownership check -- harmless here
+/// only because nothing is ever dereferenced through it.
 ///
 /// A `BTreeMap` because `BTreeMap::new` is `const`, so the table needs no lazy
 /// initializer.
@@ -470,7 +473,8 @@ extern "C" fn counter_finalize(_env: NapiEnv, data: *mut c_void, _hint: *mut c_v
 }
 
 /// wrapCounter() -> obj
-/// Creates a new plain JS object and wraps a heap-allocated i64 (value 0) on it.
+/// Creates a new plain JS object and wraps the address of a registry-owned
+/// counter (value 0) as an identity token.
 ///
 /// # Safety
 ///
@@ -504,6 +508,47 @@ unsafe extern "C" fn wrap_counter(env: NapiEnv, _info: NapiCallbackInfo) -> Napi
         ) != 0
         {
             counter_release(native);
+            return std::ptr::null_mut();
+        }
+        obj
+    }
+}
+
+/// wrapForeign() -> obj
+/// Creates a plain JS object wrapped around a pointer `counter_register`
+/// never produced -- the shape an object wrapped by a different addon
+/// presents to this one's counter callbacks.
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback` with a live
+/// `env`; the `info` frame is ignored. The wrapped pointer is fabricated but
+/// never dereferenced by anyone: the host stores it, and `counter_finalize`
+/// only removes registry keys, so the finalizer drops nothing either way.
+unsafe extern "C" fn wrap_foreign(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: `obj` is a live local, so `napi_create_object`'s out-pointer is
+    // valid, and a non-zero status bails out before the handle is used. The
+    // fabricated pointer is an identity token the host only stores and hands
+    // back for registry lookup -- never dereferenced -- and `counter_finalize`
+    // removes only registered keys, so finalizing it is a no-op rather than a
+    // bad free. The trailing nulls are the finalize hint and the optional
+    // `napi_ref` out-param, neither of which this fixture wants.
+    unsafe {
+        let mut obj: NapiValue = std::ptr::null_mut();
+        if (host().create_object)(env, &mut obj) != 0 {
+            return std::ptr::null_mut();
+        }
+        let foreign = std::ptr::without_provenance_mut::<c_void>(0xdead_beef_usize);
+        let finalize: unsafe extern "C" fn(NapiEnv, *mut c_void, *mut c_void) = counter_finalize;
+        if (host().wrap)(
+            env,
+            obj,
+            foreign,
+            Some(finalize),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ) != 0
+        {
             return std::ptr::null_mut();
         }
         obj
@@ -1276,7 +1321,7 @@ pub unsafe extern "C" fn napi_register_module_v1(env: NapiEnv, exports: NapiValu
             (host().set_named_property)(env, exports, name.as_ptr(), function);
         }
 
-        let beta_bindings: [(&std::ffi::CStr, NapiCallback); 22] = [
+        let beta_bindings: [(&std::ffi::CStr, NapiCallback); 23] = [
             (c"abaStaleReadStatus", aba_stale_read_status),
             (c"abaHandleRecycled", aba_handle_recycled),
             (c"deleteRefHandle", delete_ref_handle),
@@ -1293,6 +1338,7 @@ pub unsafe extern "C" fn napi_register_module_v1(env: NapiEnv, exports: NapiValu
             (c"readRefHandle", read_ref_handle),
             (c"readRefInt", read_ref_int),
             (c"wrapCounter", wrap_counter),
+            (c"wrapForeign", wrap_foreign),
             (c"counterGet", counter_get),
             (c"counterInc", counter_inc),
             (c"makeBigInt64", make_bigint64),
@@ -1364,5 +1410,26 @@ mod tests {
         assert_eq!(counter_value(a), None);
         assert_eq!(counter_value(b), Some(0));
         assert!(counter_release(b));
+    }
+
+    #[test]
+    fn poisoned_lock_still_serves_every_caller() {
+        // `counters()` must recover a poisoned lock instead of unwinding: its
+        // callers are `extern "C"` callbacks where a panic aborts the host.
+        // Poison the lock once, then prove the registry keeps working.
+        let poison = std::panic::catch_unwind(|| {
+            let _guard = COUNTERS.lock().unwrap();
+            panic!("poison the registry lock");
+        });
+        assert!(poison.is_err(), "the probe panic must be caught");
+        // Paranoia: if the panic never reached the guard the lock, this test
+        // would pass while covering nothing -- confirm the lock IS poisoned.
+        assert!(COUNTERS.is_poisoned(), "the lock must be poisoned");
+        let native = counter_register();
+        assert_eq!(counter_value(native), Some(0));
+        assert!(counter_increment(native));
+        assert_eq!(counter_value(native), Some(1));
+        assert!(counter_release(native));
+        assert_eq!(counter_value(native), None);
     }
 }
