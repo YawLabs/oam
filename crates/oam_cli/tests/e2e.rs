@@ -12783,6 +12783,9 @@ const server = net.createServer((sock) => {
       const cl = m ? Number(m[1]) : 0;
       buf = buf.slice(i + 4);
       if (buf.length >= cl) buf = buf.slice(cl);
+      // Only this test's client asks here, but an unbounded head buffer is
+      // a shape to refuse rather than trust.
+      if (buf.length > 64 * 1024) { sock.destroy(); return; }
       bump(path);
       if (path.startsWith('/redir')) {
         // The issue's shape: 307 and FIN in one callback.
@@ -12868,7 +12871,8 @@ process.exit(0);
     assert!(
         ok >= 398,
         "only {ok}/400 POSTs on a just-pooled connection whose FIN followed got through \
-         (tolerance 2 -- the gate in pool::reuse_h1 lost a race this run):\n{stdout}"
+         (tolerance 2 -- either the pool::reuse_h1 freshness wait lost the race to an \
+         in-flight FIN, or a fetch's own POST lost to it before the checkout ran):\n{stdout}"
     );
 }
 
