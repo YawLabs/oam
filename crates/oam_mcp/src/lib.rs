@@ -18,9 +18,27 @@ use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
-/// Newest protocol revision we know; we echo the client's requested version
-/// (stateless servers don't negotiate sessions).
-const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
+/// Newest protocol revision we speak, and the answer to any `initialize`
+/// that asks for a version we do not support (or for none).
+const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// Every revision `initialize` will agree to, newest first. The server
+/// itself is stateless and tools-only, so these revisions all describe the
+/// same wire behaviour here.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// The version `initialize` answers with: the requested one when we support
+/// it, otherwise the latest. We negotiate rather than echo -- the lifecycle
+/// spec says a server that does not support the requested version "MUST
+/// respond with another protocol version it supports", and the client then
+/// decides whether it can speak that.
+fn negotiate(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|r| SUPPORTED_PROTOCOL_VERSIONS.iter().find(|v| **v == r))
+        .copied()
+        .unwrap_or(LATEST_PROTOCOL_VERSION)
+}
 
 /// Serve MCP over stdio until stdin closes. Responses are written as one
 /// JSON line each; notifications produce no response. Lines are read as
@@ -75,12 +93,9 @@ fn handle_message(message: &Value) -> Option<Value> {
 
     let result = match method {
         "initialize" => {
-            let requested = params
-                .get("protocolVersion")
-                .and_then(Value::as_str)
-                .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+            let requested = params.get("protocolVersion").and_then(Value::as_str);
             json!({
-                "protocolVersion": requested,
+                "protocolVersion": negotiate(requested),
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "oam", "version": env!("CARGO_PKG_VERSION") },
             })
@@ -97,6 +112,9 @@ fn handle_message(message: &Value) -> Option<Value> {
                 }
             }
         }
+        // Everything else, `server/discover` included, is a plain -32601
+        // with the id echoed: the legacy signal a dual-era client's discover
+        // probe falls back to `initialize` on.
         _ => {
             return Some(error_response(
                 id,
@@ -552,17 +570,69 @@ mod tests {
         json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }).to_string()
     }
 
+    fn initialize_answer(params: Value) -> Value {
+        let response = handle_line(&request("initialize", params)).expect("response");
+        serde_json::from_str(&response).unwrap()
+    }
+
     #[test]
-    fn initialize_echoes_protocol_version_and_advertises_tools() {
-        let response = handle_line(&request(
-            "initialize",
-            json!({"protocolVersion": "2025-06-18"}),
-        ))
-        .expect("response");
-        let v: Value = serde_json::from_str(&response).unwrap();
+    fn initialize_answers_a_supported_requested_version() {
+        let v = initialize_answer(json!({"protocolVersion": "2025-06-18"}));
         assert_eq!(v["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(v["result"]["serverInfo"]["name"], "oam");
         assert!(v["result"]["capabilities"]["tools"].is_object());
+        for version in SUPPORTED_PROTOCOL_VERSIONS {
+            let v = initialize_answer(json!({ "protocolVersion": version }));
+            assert_eq!(v["result"]["protocolVersion"], *version);
+        }
+    }
+
+    #[test]
+    fn initialize_counters_an_unsupported_version_with_latest() {
+        for version in ["2026-07-28", "2099-01-01", "1999-01-01", "", "latest"] {
+            let v = initialize_answer(json!({ "protocolVersion": version }));
+            assert_eq!(
+                v["result"]["protocolVersion"], LATEST_PROTOCOL_VERSION,
+                "asked for {version:?}"
+            );
+            assert!(v.get("error").is_none(), "asked for {version:?}: {v}");
+        }
+        // A non-string version is not a version we support either.
+        let v = initialize_answer(json!({ "protocolVersion": 20251125 }));
+        assert_eq!(v["result"]["protocolVersion"], LATEST_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn initialize_without_version_gets_latest() {
+        let v = initialize_answer(json!({}));
+        assert_eq!(v["result"]["protocolVersion"], LATEST_PROTOCOL_VERSION);
+        let line = json!({ "jsonrpc": "2.0", "id": 7, "method": "initialize" }).to_string();
+        let v: Value = serde_json::from_str(&handle_line(&line).expect("response")).unwrap();
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["result"]["protocolVersion"], LATEST_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn latest_is_the_newest_supported_version() {
+        assert_eq!(SUPPORTED_PROTOCOL_VERSIONS[0], LATEST_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn server_discover_is_a_non_modern_error() {
+        // A dual-era client probes with server/discover and falls back to
+        // initialize on a legacy error; -32601 with the id echoed is that
+        // signal. Pin it so it cannot drift into a modern code (-32020..-32022).
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": "probe-1",
+            "method": "server/discover",
+            "params": {},
+        })
+        .to_string();
+        let v: Value = serde_json::from_str(&handle_line(&line).expect("response")).unwrap();
+        assert_eq!(v["id"], "probe-1");
+        assert_eq!(v["error"]["code"], -32601);
+        assert!(v.get("result").is_none());
     }
 
     #[test]

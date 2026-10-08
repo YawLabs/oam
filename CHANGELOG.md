@@ -50,6 +50,14 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `getaddrinfo` returned (`EAI_AGAIN` for a temporary failure, libuv's `-3007` for
   `EAI_NODATA`) where `dns.lookup` reported every failure as `ENOTFOUND`. Conformance case 110
   prints the full `localhost` shape on every platform.
+- **`oam mcp` answers `initialize` with a protocol version it supports.** It echoed whatever
+  the client asked for, so a client asking for `2026-07-28` (or `1999-01-01`) was told oam
+  speaks it. Now a supported request (`2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`)
+  is answered with itself and anything else, or no version at all, with `2025-11-25`, as the
+  2025-11-25 lifecycle requires ("the server MUST respond with another protocol version it
+  supports"). `server/discover` stays a plain `-32601` with the id echoed, the legacy signal a
+  dual-era client falls back on. Unit tests pin each case; the `oam mcp` e2e test asks the
+  built binary for `2026-07-28` and gets `2025-11-25`.
 - **The N-API test addon no longer dereferences the pointer `napi_unwrap` hands back.**
   `counterGet` / `counterInc` in `crates/oam_napi_test_addon` cast that untyped pointer to
   `*mut i64` and read or wrote through it, so an object wrapped by another addon (or a pointer
