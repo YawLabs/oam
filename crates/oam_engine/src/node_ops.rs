@@ -4359,6 +4359,14 @@ fn op_net_resolve(
     let Some(port) = port_arg(scope, &args, 3, "netResolve") else {
         return;
     };
+    // args[4]: the `hints` node's net hands dns.lookup for this connect --
+    // the caller's, validated in JS as node's validateHints does, or net's
+    // default for one given no family and no hints (dns.ADDRCONFIG off
+    // Windows, 0 on it); the platform's AI_* bits (`net_connect::getaddrinfo`).
+    let hints = match args.get(4).number_value(scope) {
+        Some(hints) if hints.is_finite() => hints as i32,
+        _ => 0,
+    };
     if !check_net_perm(scope, &format!("{host}:{port}")) {
         return;
     }
@@ -4368,7 +4376,7 @@ fn op_net_resolve(
     // What node's GetAddrInfo hands getaddrinfo: the UTS #46 ToASCII form.
     let name = ada_url::Idna::ascii(&host);
     crate::ops::spawn_op(scope, &mut rv, async move {
-        let mut addrs = match oam_core::net_connect::resolve_as(&host, &name, family).await {
+        let mut addrs = match oam_core::net_connect::resolve_as(&host, &name, family, hints).await {
             Ok(addrs) => addrs,
             Err(e) => return e.to_outcome(),
         };

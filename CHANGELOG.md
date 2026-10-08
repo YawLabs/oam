@@ -35,6 +35,21 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   (+2.2 ms per just-parked reuse), still under node's 4.3 s for the same run. Pinned by e2e
   `a_post_written_after_a_just_pooled_connections_fin_is_not_lost`; gate-off vs gate-on tables
   in `docs/node-divergences.md` entry 38.
+- **Name resolution passes `AI_ADDRCONFIG` off Windows, as node's `net` does** (#165, closes
+  divergence 37). `net.connect`, `tls.connect`, `http.request`, `fetch` and `dns.lookup` resolve
+  through `getaddrinfo` with the hints node's would get -- the connect's default
+  (`dns.ADDRCONFIG` off Windows, nothing on it) or the caller's `hints`, `ADDRCONFIG` included
+  -- and the family, through the `dns-lookup` crate (no new `unsafe`). On a Linux or macOS
+  host with no routable IPv6 address `localhost` resolves to `127.0.0.1` alone, as in node, so
+  a refused connect there is one plain error, not an `AggregateError` over `::1` as well.
+  `net.connect` and `http.request` validate `hints` and `family` as `dns.lookup` does, throwing
+  `ERR_INVALID_ARG_TYPE` / `ERR_INVALID_ARG_VALUE` out of `connect()` or `http.request()`, and
+  `dns.lookup` now validates `family` (`0`, `4`, `6`, `'IPv4'`, `'IPv6'`); an `http.request` with
+  `hints` or `family` resolves with them, where it ignored both (`family: 6` to `localhost` tried
+  `127.0.0.1` too); a resolver failure carries the code
+  `getaddrinfo` returned (`EAI_AGAIN` for a temporary failure, libuv's `-3007` for
+  `EAI_NODATA`) where `dns.lookup` reported every failure as `ENOTFOUND`. Conformance case 110
+  prints the full `localhost` shape on every platform.
 - **The N-API test addon no longer dereferences the pointer `napi_unwrap` hands back.**
   `counterGet` / `counterInc` in `crates/oam_napi_test_addon` cast that untyped pointer to
   `*mut i64` and read or wrote through it, so an object wrapped by another addon (or a pointer

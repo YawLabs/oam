@@ -508,7 +508,7 @@ pub async fn bind_listener(
         }
         Some(host) => match host.parse::<IpAddr>() {
             Ok(ip) => ip,
-            Err(_) => match crate::net_connect::resolve(host, None).await {
+            Err(_) => match crate::net_connect::resolve(host, None, 0).await {
                 Ok(addrs) => addrs[0],
                 Err(crate::net_connect::ConnectError::Resolve(e)) => return Err(*e),
                 Err(other) => {
@@ -648,6 +648,7 @@ pub async fn tcp_connect_pinned(
         attempt_timeout,
         pin,
         local,
+        ..crate::net_connect::ConnectOptions::default()
     };
     let stream = match crate::net_connect::connect(&host, port, &opts).await {
         Ok(connected) => connected.stream,

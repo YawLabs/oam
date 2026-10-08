@@ -94,14 +94,17 @@ fn host(name: &hickory_resolver::proto::rr::Name) -> String {
 /// node's GetAddrInfo hands libuv; errors name `hostname` as written. An
 /// empty `name` is libuv's EINVAL (see `net_connect::resolve_as`).
 ///
-/// `flags` are node's `hints` as getaddrinfo takes them (AI_V4MAPPED, AI_ALL;
-/// the platform's values), handed to the platform resolver with the family
-/// and SOCK_STREAM, as libuv's uv_getaddrinfo hands node's. The answer is
-/// then the resolver's own, duplicates included: glibc answers a name with
-/// `::1` and `127.0.0.1` lines in /etc/hosts under AI_V4MAPPED | AI_ALL with
-/// the mapped `::ffff:127.0.0.1` twice, and node reports both (the 0.18.0
-/// linux release leg, conformance case 228). Emulating the flags over an
-/// unflagged lookup answered it once.
+/// `flags` are node's `hints` as getaddrinfo takes them (AI_ADDRCONFIG,
+/// AI_V4MAPPED, AI_ALL; the platform's values), handed to the platform
+/// resolver with the family and SOCK_STREAM, as libuv's uv_getaddrinfo hands
+/// node's (`net_connect::getaddrinfo`, the resolver a connect uses too). The
+/// answer is then the resolver's own, duplicates included: glibc answers a
+/// name with `::1` and `127.0.0.1` lines in /etc/hosts under AI_V4MAPPED |
+/// AI_ALL with the mapped `::ffff:127.0.0.1` twice, and node reports both
+/// (the 0.18.0 linux release leg, conformance case 228). Emulating the flags
+/// over an unflagged lookup answered it once. A failure is node's
+/// `DNSException` for the resolver's own code (`getaddrinfo EAI_AGAIN host`
+/// for a temporary failure, not `ENOTFOUND` for everything).
 pub async fn dns_lookup(
     hostname: String,
     name: String,
@@ -112,36 +115,18 @@ pub async fn dns_lookup(
     if name.is_empty() {
         return OpOutcome::sys(crate::net_connect::empty_name_error(&hostname));
     }
-    // AF_UNSPEC is 0 everywhere; the crate names only the concrete families.
-    let address: i32 = match family {
-        4 => dns_lookup::AddrFamily::Inet.into(),
-        6 => dns_lookup::AddrFamily::Inet6.into(),
-        _ => 0,
+    let family_hint = match family {
+        4 => Some(4),
+        6 => Some(6),
+        _ => None,
     };
-    let hints = dns_lookup::AddrInfoHints {
-        flags,
-        address,
-        socktype: dns_lookup::SockType::Stream.into(),
-        protocol: 0,
-    };
-    let answered = tokio::task::spawn_blocking(move || {
-        dns_lookup::getaddrinfo(Some(&name), None, Some(hints)).map(|answers| {
-            answers
-                .filter_map(Result::ok)
-                .map(|answer| answer.sockaddr)
-                .collect::<Vec<std::net::SocketAddr>>()
-        })
-    })
-    .await;
-    let addrs: Vec<std::net::SocketAddr> = match answered {
-        Ok(Ok(addrs)) => addrs,
-        _ => {
-            return OpOutcome::node_failed(
-                "ENOTFOUND",
-                format!("getaddrinfo ENOTFOUND {hostname}"),
-            );
-        }
-    };
+    let addrs: Vec<std::net::SocketAddr> =
+        match crate::net_connect::getaddrinfo(&name, 0, family_hint, flags).await {
+            Ok(addrs) => addrs,
+            Err(error) => {
+                return OpOutcome::sys(crate::net_connect::resolve_error(&hostname, &error));
+            }
+        };
 
     if addrs.is_empty() {
         return OpOutcome::node_failed("ENOTFOUND", format!("getaddrinfo ENOTFOUND {hostname}"));

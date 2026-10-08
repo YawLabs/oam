@@ -1887,6 +1887,7 @@ pub async fn tls_connect_pinned(
         attempt_timeout,
         pin,
         local,
+        ..crate::net_connect::ConnectOptions::default()
     };
     let tcp = match crate::net_connect::connect(&host, port, &opts).await {
         Ok(connected) => connected.stream,

@@ -18097,6 +18097,88 @@ fn dns_hint_constants_on_android_are_bionic_values() {
     );
 }
 
+/// #165: net.connect and http.request validate `hints` and `family` as
+/// node's do -- through dns.lookup, synchronously out of connect() and
+/// http.request() -- where oam connected on any value; a user's `lookup`
+/// hook is handed them as given, as node's is; and a valid `hints` reaches
+/// oam's own resolver for a name (the connect completes). The expected lines
+/// are node v22.22.2's on the same program.
+#[test]
+fn net_connect_validates_hints_as_dns_lookup_does() {
+    let stdout = run_ok(
+        "net_connect_hints.mjs",
+        r#"import net from 'node:net';
+import dns from 'node:dns';
+import http from 'node:http';
+const server = net.createServer((c) => c.end());
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+for (const hints of [12345678, 'x', dns.ADDRCONFIG | 1]) {
+  try {
+    net.connect({ host: 'localhost', port, hints });
+    console.log('accepted', JSON.stringify(hints));
+  } catch (e) {
+    console.log('threw', JSON.stringify(hints), e.code, e.message);
+  }
+}
+for (const extra of [{ family: 5 }, { hints: 'x' }, { family: 'x' }]) {
+  try {
+    net.connect({ host: 'localhost', port, ...extra }).on('error', () => {}).destroy();
+    console.log('net accepted', JSON.stringify(extra));
+  } catch (e) {
+    console.log('net threw', JSON.stringify(extra), e.code);
+  }
+  try {
+    http.request({ host: 'localhost', port, ...extra }).on('error', () => {}).destroy();
+    console.log('http accepted', JSON.stringify(extra));
+  } catch (e) {
+    console.log('http threw', JSON.stringify(extra), e.code);
+  }
+}
+await new Promise((resolve) => {
+  const s = net.connect({ host: 'localhost', port: 1, hints: 12345678, lookup: (h, o, cb) => {
+    console.log('hook', o.hints, o.family, o.all);
+    cb(null, [{ address: '127.0.0.1', family: 4 }]);
+    // The hook runs inside connect(), as node's does: `s` is not bound yet.
+    process.nextTick(() => { s.destroy(); resolve(); });
+  } });
+  s.on('error', () => {});
+});
+await new Promise((resolve) => {
+  const s = net.connect({ host: 'localhost', port, family: 4, hints: dns.ADDRCONFIG }, () => {
+    console.log('connected with hints', s.remoteAddress);
+    s.destroy();
+    resolve();
+  });
+  s.on('error', (e) => { console.log('error?!', e.code); resolve(); });
+});
+server.close();
+"#,
+    );
+    let expected = [
+        "threw 12345678 ERR_INVALID_ARG_VALUE The argument 'hints' is invalid. Received 12345678",
+        "threw \"x\" ERR_INVALID_ARG_TYPE The \"options.hints\" property must be of type number. Received type string ('x')",
+        "threw 1025 ERR_INVALID_ARG_VALUE The argument 'hints' is invalid. Received 1025",
+        "net threw {\"family\":5} ERR_INVALID_ARG_VALUE",
+        "http threw {\"family\":5} ERR_INVALID_ARG_VALUE",
+        "net threw {\"hints\":\"x\"} ERR_INVALID_ARG_TYPE",
+        "http threw {\"hints\":\"x\"} ERR_INVALID_ARG_TYPE",
+        "net threw {\"family\":\"x\"} ERR_INVALID_ARG_VALUE",
+        "http threw {\"family\":\"x\"} ERR_INVALID_ARG_VALUE",
+        "hook 12345678 undefined true",
+        "connected with hints 127.0.0.1",
+    ]
+    .join("\n");
+    let expected = if cfg!(target_os = "linux") {
+        expected
+            .replace("threw 1025", "threw 33")
+            .replace("Received 1025", "Received 33")
+    } else {
+        expected
+    };
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 #[test]
 fn dns_lookup_resolves_localhost() {
     let f = write_temp(
@@ -34191,8 +34273,9 @@ Error.prepareStackTrace = saved;
 /// '::1'})` reaches the transport: the request URL used to be built without
 /// brackets (`http://::1:PORT/`), which failed as "fetch failed" before any
 /// connect. Off Windows `localhost` may resolve to one address or two
-/// (AI_ADDRCONFIG), and `::1` may fail synchronously on a host with no IPv6,
-/// so only the platform-proof parts are asserted there.
+/// (AI_ADDRCONFIG, which both runtimes pass since #165), and `::1` may fail
+/// synchronously on a host with no IPv6, so only the platform-proof parts are
+/// asserted there.
 #[test]
 fn http_upgrade_and_ipv6_host_refusals_have_the_net_connect_shape() {
     let stdout = run_ok(

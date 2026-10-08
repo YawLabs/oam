@@ -13,20 +13,19 @@
 // failed" and carries it as `cause` (oam's fetch used to patch the URL's host
 // onto a reqwest error, so a name reported itself as the address).
 //
-// `localhost` prints the full shape only on win32, where node and oam both call
-// getaddrinfo with no flags. Off Windows node adds AI_ADDRCONFIG and oam does
-// not (a documented divergence), so on a host with no routable IPv6 address
-// node may resolve localhost to 127.0.0.1 alone -- a plain error -- while oam
-// also tries ::1 -- an aggregate. There only invariants that hold for either
-// list are printed. A failure connect(2) reports synchronously carries the
-// local socket's ephemeral port (` - Local (0.0.0.0:55035)`), so that detail is
-// redacted everywhere.
+// `localhost` prints the full shape on every platform: node and oam call
+// getaddrinfo with the same flags -- none on win32, AI_ADDRCONFIG elsewhere
+// (#165) -- so on a host with no routable IPv6 address both resolve it to
+// 127.0.0.1 alone (a plain error), and on one with IPv6 both try ::1 and
+// 127.0.0.1 (an aggregate). Up to 0.18.0 oam passed no flags anywhere, and off
+// Windows this case printed only invariants that held for either list. A
+// failure connect(2) reports synchronously carries the local socket's
+// ephemeral port (` - Local (0.0.0.0:55035)`), so that detail is redacted
+// everywhere.
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
 import tls from "node:tls";
-
-const FULL = process.platform === "win32";
 
 // A port that was listening a moment ago and is closed now.
 const probe = net.createServer();
@@ -37,6 +36,11 @@ await new Promise((resolve) => probe.close(resolve));
 const P = (s) => String(s).replaceAll(String(port), "PORT");
 const unlocal = (message) => String(message).replace(/ - Local \([^)]*\)$/, " - Local (LOCAL)");
 const timing = (since) => (Date.now() - since < 1000 ? "fast" : "slow");
+// The unresolvable name's lines print no timing class: how long a failed
+// lookup takes is the host resolver's business (0.8-1.4 s on WSL, either
+// side of the threshold run to run for node itself), not the connect's.
+const NOWHERE = "oam-conformance-110.invalid";
+const timed = (host, since) => (host === NOWHERE ? [] : [timing(since)]);
 
 const own = (e) =>
   Reflect.ownKeys(e)
@@ -71,26 +75,7 @@ function full(e) {
   })) + "\n    " + e.errors.map(plain).join("\n    ");
 }
 
-function invariant(e) {
-  const agg = e instanceof AggregateError;
-  const errs = agg ? e.errors : [e];
-  const childOk = (c) =>
-    Object.keys(c).join() === "errno,code,syscall,address,port" &&
-    c.syscall === "connect" && c.port === port && typeof c.errno === "number" &&
-    unlocal(c.message).replace(" - Local (LOCAL)", "") === `connect ${c.code} ${c.address}:${port}` &&
-    net.isIP(c.address) !== 0;
-  return JSON.stringify({
-    aggregateHasSeveral: agg ? errs.length >= 2 : true,
-    aggregateShape: agg
-      ? Object.keys(e).join() === "code" && e.code === errs[0].code && !Object.hasOwn(e, "message") &&
-        String(e.stack).startsWith(`AggregateError [${e.code}]: `) && e.constructor === AggregateError
-      : true,
-    childrenOk: errs.every(childOk),
-    refused127: errs.some((c) => c.address === "127.0.0.1" && c.code === "ECONNREFUSED"),
-  });
-}
-
-const render = (host, e) => (host === "localhost" && !FULL ? invariant(e) : full(e));
+const render = (_host, e) => full(e);
 
 function failure(label, host, open) {
   return new Promise((resolve) => {
@@ -102,7 +87,7 @@ function failure(label, host, open) {
       resolve();
     });
     socket.on("error", (e) => {
-      console.log(label, host, timing(since), render(host, e));
+      console.log(label, host, ...timed(host, since), render(host, e));
       resolve();
     });
   });
@@ -147,7 +132,7 @@ for (const host of ["127.0.0.1", "::1", "localhost"]) {
 }
 
 // Unresolvable: node's DNSException, never aggregated.
-const nowhere = "oam-conformance-110.invalid";
+const nowhere = NOWHERE;
 await failure("net", nowhere, () => net.connect({ host: nowhere, port }));
 await failure("tls", nowhere, () => tls.connect({ host: nowhere, port, rejectUnauthorized: false }));
 

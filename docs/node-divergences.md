@@ -1351,8 +1351,9 @@ attempt's own socket.
 
 Two things this moved rather than removed:
 
-- **Off Windows `localhost` can resolve differently** (entry 37): oam does not pass
-  `AI_ADDRCONFIG`, so case 110 prints only shape invariants there.
+- **Off Windows `localhost` could resolve differently** (entry 37, closed after 0.18.0): oam
+  did not pass `AI_ADDRCONFIG`, so case 110 printed only shape invariants there. It prints the
+  full shape everywhere now.
 - **A request to `localhost` now tries `::1` first**, which is Node's order. reqwest's
   client carried an IPv4-first override for `localhost`; the owned transport does not. Against
   a listener that is IPv4 only (every oam `listen(port)` was, up to 0.17.1: entry 36) the
@@ -1382,34 +1383,47 @@ as `127.0.0.1:<port>`, which no longer describes what it binds.
 _(probed)_ Node v22.22.2 and oam on the same `createServer().listen(0)` + `connect(port)`
 program, for each server kind.
 
-### 37. Name resolution does not pass `AI_ADDRCONFIG` off Windows
+### 37. Name resolution did not pass `AI_ADDRCONFIG` off Windows: closed after 0.18.0
 
-`net.connect`, `tls.connect`, `http.request` and `fetch` resolve a name through the system
-`getaddrinfo` (tokio's `lookup_host`) with no flags. Node's `net` passes `dns.ADDRCONFIG` off
-Windows (`lib/net.js` `lookupAndConnect`), which drops a family the host has no configured
-address for. On a Linux or macOS host with no routable IPv6 address, Node can resolve
-`localhost` to `127.0.0.1` alone while oam also gets `::1`: a refused connect there is a
-plain `Error` in Node and an `AggregateError` over both addresses in oam, and a successful
-one may try `::1` first. On Windows Node's `net` passes no flags, so the two agree there
-(`conformance/cases/110-connect-refused-shapes.mjs` prints the full shape only on Windows).
+Up to 0.18.0 `net.connect`, `tls.connect`, `http.request` and `fetch` resolved a name through
+the system `getaddrinfo` (tokio's `lookup_host`) with no flags, where Node's `net` passes
+`dns.ADDRCONFIG` off Windows (`lib/net.js` `lookupAndConnect`) for a connect given no
+`family` and no `hints`, which drops a family the host has no configured address for. On a
+Linux or macOS host with no routable IPv6 address Node resolved `localhost` to `127.0.0.1`
+alone while oam also got `::1`: a refused connect there was a plain `Error` in Node and an
+`AggregateError` over both addresses in oam, and a successful one could try `::1` first.
 
-A `lookup` hook (`net.connect({ lookup })`, `tls.connect`, `http.request`, or a replaced
-`dns.lookup`) is called with Node's arguments, `hints` included: `0` on Windows, the
-platform's `AI_ADDRCONFIG` value elsewhere (`1024` on macOS, `32` on glibc Linux). Only oam's
-own resolver leaves the flag out.
+Since the release after 0.18.0 (#165) oam's own resolver is `getaddrinfo` with the hints
+Node's would get -- the connect's default (`AI_ADDRCONFIG` off Windows, nothing on it), or
+the caller's `hints` -- and the family, as libuv hands them (`crates/oam_core/src/net_connect.rs`
+`getaddrinfo`, through the `dns-lookup` crate: no new `unsafe`). `dns.lookup` is the same
+call, so `dns.ADDRCONFIG` in a caller's `hints` is applied too (up to 0.18.0 it was accepted
+and dropped), and `net.connect` and `http.request` validate `hints` and then `family` as `dns.lookup` does,
+throwing `ERR_INVALID_ARG_TYPE` / `ERR_INVALID_ARG_VALUE` out of `connect()` or
+`http.request()` before anything is looked up (up to 0.18.0 any value connected, and
+`dns.lookup` itself accepted any `family`). An `http.request` with `hints` or `family` resolves
+with them, through the agent's socket as Node's does (up to 0.18.0 it ignored both, so
+`family: 6` to `localhost` also tried `127.0.0.1`). A `listen()` on a hostname resolves with no flags, as
+Node's `lookupAndListen` does. A resolver failure is classified from the code `getaddrinfo`
+returned, as libuv does (`EAI_AGAIN` for a temporary failure; `ENOTFOUND` with libuv's
+`-3007` for `EAI_NODATA` and `-3008` for `EAI_NONAME`), where `dns.lookup` used to report
+every failure as `ENOTFOUND`. `conformance/cases/110-connect-refused-shapes.mjs` prints the
+full `localhost` shape on every platform (up to 0.18.0 only on Windows), and
+`228-dns-lookup-hints.mjs` pins the `ADDRCONFIG` answer and `net.connect`'s validation.
 
-Passing the flag means calling `getaddrinfo` by hand, through new `unsafe` code, which is
-why it is not done yet. `dns.lookup` is the same resolver, and its `hints` are handled in
-JS: since 0.17.2 `dns.ADDRCONFIG`, `dns.V4MAPPED` and `dns.ALL` are the platform's `AI_*`
-values (`1024`, `2048`, `256` on Windows, macOS, the BSDs and Android; `32`, `8`, `16` on Linux;
-up to 0.17.1 all three were `0`), `hints` is validated as Node's `validateHints` does
-(`ERR_INVALID_ARG_TYPE` for a non-number, `ERR_INVALID_ARG_VALUE` for any other bit), and
-`V4MAPPED` (with or without `ALL`) on a `family: 6` lookup answers IPv4 addresses as
-`::ffff:a.b.c.d` by getaddrinfo's rule (`conformance/cases/228-dns-lookup-hints.mjs`).
-`dns.ADDRCONFIG` in a caller's `hints` is accepted and not applied, for the reason above.
+A `lookup` hook (`net.connect({ lookup })`, `tls.connect`, `http.request`, undici's
+`connect.lookup`, or a replaced `dns.lookup`) is called with Node's arguments, `hints`
+included and unvalidated: `0` on Windows, the platform's `AI_ADDRCONFIG` value elsewhere
+(`1024` on macOS, `32` on glibc Linux; measured against Node v22.22.2 on each). `dns.ADDRCONFIG`,
+`dns.V4MAPPED` and `dns.ALL` are the platform's `AI_*` values since 0.17.2 (`1024`, `2048`,
+`256` on Windows, macOS, the BSDs and Android; `32`, `8`, `16` on Linux; up to 0.17.1 all three
+were `0`), and `V4MAPPED` (with or without `ALL`) on a `family: 6` lookup answers IPv4
+addresses as `::ffff:a.b.c.d`, the resolver's own answer since 0.18.0.
 
 _(source: `crates/oam_core/src/net_connect.rs`, `dns.rs`, `js/node_compat.js`
-`registry.factories.dns`; the `dns` constants probed on Windows.)_
+`registry.factories.dns`; the `dns` constants probed on Windows; cases 110 and 228 run against
+Node on Windows and on Linux (WSL, no routable IPv6: `localhost` resolves to `127.0.0.1` alone
+on both runtimes).)_
 
 ### 38. `fetch` and `http.request` on oam's own client: what still differs (#143)
 

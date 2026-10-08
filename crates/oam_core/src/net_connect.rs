@@ -29,12 +29,14 @@
 //! loopback peer; a failure `connect(2)` reports at once gets node's
 //! ` - Local (addr:port)` detail, one that arrives later does not.
 //!
-//! Resolution stays on std's getaddrinfo (tokio `lookup_host`) with no
-//! AI_ADDRCONFIG, where node passes it off Windows: on a POSIX host without a
-//! routable IPv6 address node may resolve `localhost` to `127.0.0.1` alone
-//! while oam also tries `::1` -- a narrowed divergence, kept because passing
-//! AI_ADDRCONFIG means calling getaddrinfo by hand, through new unsafe. On
-//! Windows node passes no flags either, so the two agree there.
+//! Resolution is the platform's getaddrinfo with the hints node's `net` hands
+//! its `dns.lookup` ([`getaddrinfo`]): `dns.ADDRCONFIG` off Windows on a
+//! connect whose caller gave no `family` and no `hints` (lib/net.js
+//! `lookupAndConnect`), so a POSIX host without a routable IPv6 address
+//! resolves `localhost` to `127.0.0.1` alone, as node does, and a refused
+//! connect there is one plain error, not an aggregate over `::1` as well. On
+//! Windows node passes no flags, and neither does oam (#165). Up to 0.18.0
+//! oam resolved through tokio's `lookup_host` with no flags everywhere.
 
 use crate::{NodeSysError, OpOutcome, node_errno, node_error_code};
 use std::net::{IpAddr, SocketAddr};
@@ -79,6 +81,11 @@ pub struct ConnectOptions {
     /// Where each attempt's socket is bound before it dials: node's
     /// `localAddress` / `localPort`.
     pub local: Option<LocalBind>,
+    /// The getaddrinfo flags the connect's own lookup is made with (the
+    /// platform's `AI_*` bits, node's `hints`), when no [`Pin`] stands in
+    /// for it. The default is what node's `net` passes a connect given no
+    /// `family` and no `hints`: [`default_connect_hints`].
+    pub hints: i32,
 }
 
 impl Default for ConnectOptions {
@@ -87,8 +94,112 @@ impl Default for ConnectOptions {
             attempt_timeout: DEFAULT_ATTEMPT_TIMEOUT,
             pin: None,
             local: None,
+            hints: default_connect_hints(),
         }
     }
+}
+
+/// The `hints` node's `net` hands `dns.lookup` for a connect whose caller
+/// gave no `family` and no `hints` (lib/net.js `lookupAndConnect`): nothing
+/// on Windows, `dns.ADDRCONFIG` -- the platform's `AI_ADDRCONFIG` -- elsewhere,
+/// so the resolver answers only the families the host has an address
+/// configured for. The same value node_compat.js `addrconfigHints()` and
+/// bootstrap.js `lookupHints()` hand a user's `lookup` hook.
+pub fn default_connect_hints() -> i32 {
+    #[cfg(unix)]
+    {
+        libc::AI_ADDRCONFIG
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// The platform resolver as libuv's `uv_getaddrinfo` calls it for node's
+/// `dns.lookup` and `net.connect` (src/cares_wrap.cc `GetAddrInfo`):
+/// getaddrinfo of `name` with `ai_family` from `family` (4, 6, else
+/// `AF_UNSPEC`), `SOCK_STREAM`, and `ai_flags` = `hints` (the platform's
+/// `AI_*` bits), on a blocking thread. The answers come back in the
+/// resolver's order, duplicates included, each at `port`.
+///
+/// Through the `dns-lookup` crate, a safe wrapper: no `unsafe` here. A
+/// resolver failure is an [`std::io::Error`] carrying the `EAI_*` code
+/// ([`GaiError`]) for [`resolve_error`] to classify as libuv does;
+/// `EAI_SYSTEM` carries the errno instead, as libuv reports it.
+pub(crate) async fn getaddrinfo(
+    name: &str,
+    port: u16,
+    family: Option<u8>,
+    hints: i32,
+) -> std::io::Result<Vec<SocketAddr>> {
+    // AF_UNSPEC is 0 everywhere; the crate names only the concrete families.
+    let address: i32 = match family {
+        Some(4) => dns_lookup::AddrFamily::Inet.into(),
+        Some(6) => dns_lookup::AddrFamily::Inet6.into(),
+        _ => 0,
+    };
+    let hints = dns_lookup::AddrInfoHints {
+        flags: hints,
+        address,
+        socktype: dns_lookup::SockType::Stream.into(),
+        protocol: 0,
+    };
+    let name = name.to_owned();
+    let answered = tokio::task::spawn_blocking(move || {
+        dns_lookup::getaddrinfo(Some(&name), None, Some(hints))
+            .map_err(gai_io_error)
+            .map(|answers| {
+                answers
+                    .filter_map(Result::ok)
+                    .map(|answer| {
+                        let mut addr = answer.sockaddr;
+                        addr.set_port(port);
+                        addr
+                    })
+                    .collect::<Vec<SocketAddr>>()
+            })
+    })
+    .await;
+    match answered {
+        Ok(result) => result,
+        // The blocking task panicked or was cancelled: not a resolver answer.
+        Err(join) => Err(std::io::Error::other(join)),
+    }
+}
+
+/// A getaddrinfo failure as [`getaddrinfo`] reports it: the `EAI_*` code
+/// (a `WSA*` code on Windows), with the resolver's own text.
+#[derive(Debug)]
+pub(crate) struct GaiError {
+    /// getaddrinfo's return value.
+    pub(crate) code: i32,
+    /// The crate's rendering of it (`gai_strerror`'s text on POSIX).
+    inner: std::io::Error,
+}
+
+impl std::fmt::Display for GaiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl std::error::Error for GaiError {}
+
+/// The crate's error as an [`std::io::Error`] [`resolve_error`] can read:
+/// a resolver code wrapped as [`GaiError`]; `EAI_SYSTEM` (POSIX) and a plain
+/// I/O failure (a name with a NUL in it) as the OS error they carry.
+fn gai_io_error(error: dns_lookup::LookupError) -> std::io::Error {
+    let code = error.error_num();
+    let inner: std::io::Error = error.into();
+    #[cfg(unix)]
+    if code == libc::EAI_SYSTEM {
+        return inner;
+    }
+    if code == 0 {
+        return inner;
+    }
+    std::io::Error::other(GaiError { code, inner })
 }
 
 /// node's `localAddress` / `localPort` connect options (lib/net.js
@@ -195,7 +306,8 @@ pub(crate) async fn zone_scope_id<D: Dialer>(
     } else if cfg!(target_os = "linux") {
         sysfs_ifindex(zone).unwrap_or(0)
     } else {
-        match dialer.lookup(&format!("{ip}%{zone}"), 0).await {
+        // A literal with its zone, no flags: the resolver only maps the zone.
+        match dialer.lookup(&format!("{ip}%{zone}"), 0, None, 0).await {
             Ok(resolved) => resolved
                 .iter()
                 .find_map(|addr| match addr {
@@ -360,8 +472,14 @@ struct LoggedDialer<'a>(&'a AttemptLog);
 impl Dialer for LoggedDialer<'_> {
     type Stream = tokio::net::TcpStream;
 
-    async fn lookup(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
-        SystemDialer.lookup(host, port).await
+    async fn lookup(
+        &self,
+        host: &str,
+        port: u16,
+        family: Option<u8>,
+        hints: i32,
+    ) -> std::io::Result<Vec<SocketAddr>> {
+        SystemDialer.lookup(host, port, family, hints).await
     }
 
     async fn dial(
@@ -381,12 +499,18 @@ impl Dialer for LoggedDialer<'_> {
 /// Name resolution ahead of a connect: what node's default `dns.lookup` hands
 /// `net.connect` (lib/net.js `lookupAndConnect`), so JS can emit the socket's
 /// `'lookup'` events -- and let a listener veto the connect -- before anything
-/// is dialled. getaddrinfo in the resolver's order, narrowed to `family` (4 or
-/// 6; anything else keeps both); a failure, or an answer the family leaves
-/// empty, is the error a connect to the same name reports (`getaddrinfo
-/// ENOTFOUND host`).
-pub async fn resolve(host: &str, family: Option<u8>) -> Result<Vec<IpAddr>, ConnectError> {
-    resolve_with(host, host, family, &SystemDialer).await
+/// is dialled. getaddrinfo in the resolver's order, handed `family` (4 or 6;
+/// anything else `AF_UNSPEC`, and the answer is narrowed to the family as
+/// well) and `hints` (node's: the platform's `AI_*` bits -- 0 for a listen,
+/// whose `dns.lookup` node passes none; see [`default_connect_hints`] for a
+/// connect); a failure, or an answer the family leaves empty, is the error a
+/// connect to the same name reports (`getaddrinfo ENOTFOUND host`).
+pub async fn resolve(
+    host: &str,
+    family: Option<u8>,
+    hints: i32,
+) -> Result<Vec<IpAddr>, ConnectError> {
+    resolve_with(host, host, family, hints, &SystemDialer).await
 }
 
 /// [`resolve`], with getaddrinfo handed `name` where errors name `host`.
@@ -401,8 +525,9 @@ pub async fn resolve_as(
     host: &str,
     name: &str,
     family: Option<u8>,
+    hints: i32,
 ) -> Result<Vec<IpAddr>, ConnectError> {
-    resolve_with(host, name, family, &SystemDialer).await
+    resolve_with(host, name, family, hints, &SystemDialer).await
 }
 
 /// The error a lookup of an empty name reports: libuv's `UV_EINVAL`,
@@ -415,13 +540,18 @@ pub(crate) async fn resolve_with<D: Dialer>(
     host: &str,
     name: &str,
     family: Option<u8>,
+    hints: i32,
     dialer: &D,
 ) -> Result<Vec<IpAddr>, ConnectError> {
     if name.is_empty() {
         return Err(ConnectError::Resolve(Box::new(empty_name_error(host))));
     }
+    // The family goes to the resolver, as node's does (AI_V4MAPPED means
+    // something only with AF_INET6), and the answer is narrowed to it as
+    // well: a resolver that answers both to AF_UNSPEC, or one that ignores
+    // the family, never hands a connect an address it cannot have asked for.
     let resolved = dialer
-        .lookup(name, 0)
+        .lookup(name, 0, family, hints)
         .await
         .map_err(|error| ConnectError::Resolve(Box::new(resolve_error(host, &error))))?;
     let addrs: Vec<IpAddr> = resolved
@@ -543,8 +673,16 @@ pub(crate) struct DialFailure {
 /// driven by a script in tests.
 pub(crate) trait Dialer {
     type Stream;
-    /// getaddrinfo, in the resolver's order.
-    async fn lookup(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>>;
+    /// getaddrinfo of `host`, in the resolver's order, handed `family` (4
+    /// or 6; else `AF_UNSPEC`) and `hints` (the platform's `AI_*` bits) as
+    /// libuv hands node's; each answer at `port`.
+    async fn lookup(
+        &self,
+        host: &str,
+        port: u16,
+        family: Option<u8>,
+        hints: i32,
+    ) -> std::io::Result<Vec<SocketAddr>>;
     /// One connect attempt to one address, its socket bound to `local`
     /// first when that is set.
     async fn dial(
@@ -563,8 +701,14 @@ pub(crate) struct SystemDialer;
 impl Dialer for SystemDialer {
     type Stream = tokio::net::TcpStream;
 
-    async fn lookup(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
-        Ok(tokio::net::lookup_host((host, port)).await?.collect())
+    async fn lookup(
+        &self,
+        host: &str,
+        port: u16,
+        family: Option<u8>,
+        hints: i32,
+    ) -> std::io::Result<Vec<SocketAddr>> {
+        getaddrinfo(host, port, family, hints).await
     }
 
     async fn dial(
@@ -623,7 +767,7 @@ pub(crate) async fn connect_with<D: Dialer>(
             }
             targets
         }
-        None => match dialer.lookup(host, port).await {
+        None => match dialer.lookup(host, port, None, opts.hints).await {
             Ok(resolved) => resolved
                 .into_iter()
                 .map(|addr| (addr, addr.ip().to_string()))
@@ -850,39 +994,90 @@ fn dns_error(host: &str, code: &str, errno: i32) -> NodeSysError {
 /// could not be triggered on the dev box to confirm what node shows, so this
 /// row is unverified against node.
 ///
-/// std builds a POSIX resolver failure with no OS number, only gai_strerror's
-/// text (EAI_SYSTEM excepted, which carries errno), so there the text decides:
-/// glibc's EAI_NONAME "Name or service not known" / macOS's "nodename nor
-/// servname provided, or not known" are ENOTFOUND/-3008 (UV_EAI_NONAME),
-/// glibc's EAI_NODATA "No address associated with hostname" is
-/// ENOTFOUND/-3007 (UV_EAI_NODATA), "temporary failure" (either case) is
-/// EAI_AGAIN/-3001, and anything else EAI_FAIL/-3004.
+/// A failure from [`getaddrinfo`] carries the resolver's code
+/// ([`GaiError`]), classified as libuv classifies it ([`classify_gai`]);
+/// EAI_SYSTEM carries errno instead. A POSIX failure with neither (one that
+/// came through std, or a code [`classify_gai`] has no row for) falls back to
+/// gai_strerror's text: glibc's EAI_NONAME "Name or service not known" /
+/// macOS's "nodename nor servname provided, or not known" are
+/// ENOTFOUND/-3008 (UV_EAI_NONAME), glibc's EAI_NODATA "No address associated
+/// with hostname" is ENOTFOUND/-3007 (UV_EAI_NODATA), "temporary failure"
+/// (either case) is EAI_AGAIN/-3001, and anything else EAI_FAIL/-3004.
 pub(crate) fn resolve_error(host: &str, error: &std::io::Error) -> NodeSysError {
     let (code, errno) = classify_resolve(error);
     dns_error(host, code, errno)
 }
 
+/// libuv's `UV_EAI_*` numbers (include/uv/errno.h), node's `errno` for a
+/// resolver failure; `UV_EAI_NONAME` and `UV_EAI_NODATA` are reported under
+/// the code `ENOTFOUND` (errors.js `DNSException`).
+#[cfg(unix)]
+fn classify_gai(code: i32) -> Option<(&'static str, i32)> {
+    Some(match code {
+        libc::EAI_NONAME => ("ENOTFOUND", -3008),
+        #[cfg(not(target_os = "freebsd"))]
+        libc::EAI_NODATA => ("ENOTFOUND", -3007),
+        libc::EAI_AGAIN => ("EAI_AGAIN", -3001),
+        libc::EAI_BADFLAGS => ("EAI_BADFLAGS", -3002),
+        libc::EAI_FAIL => ("EAI_FAIL", -3004),
+        libc::EAI_FAMILY => ("EAI_FAMILY", -3005),
+        libc::EAI_MEMORY => ("EAI_MEMORY", -3006),
+        libc::EAI_OVERFLOW => ("EAI_OVERFLOW", -3009),
+        libc::EAI_SERVICE => ("EAI_SERVICE", -3010),
+        libc::EAI_SOCKTYPE => ("EAI_SOCKTYPE", -3011),
+        // EAI_ADDRFAMILY, which the libc crate does not name for these
+        // targets: glibc's netdb.h has -9, macOS's 1. libuv reports it as
+        // UV_EAI_ADDRFAMILY.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        -9 => ("EAI_ADDRFAMILY", -3000),
+        #[cfg(target_vendor = "apple")]
+        1 => ("EAI_ADDRFAMILY", -3000),
+        _ => return None,
+    })
+}
+
+/// Windows' getaddrinfo returns the `WSA*` code, which libuv translates
+/// (src/win/getaddrinfo.c `uv__getaddrinfo_translate_error`); the same table
+/// [`classify_resolve`] applies to a raw OS error.
+#[cfg(windows)]
+fn classify_gai(code: i32) -> Option<(&'static str, i32)> {
+    classify_wsa(code)
+}
+
+#[cfg(windows)]
+fn classify_wsa(raw: i32) -> Option<(&'static str, i32)> {
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAEAFNOSUPPORT, WSAEINVAL, WSAESOCKTNOSUPPORT, WSAHOST_NOT_FOUND, WSANO_DATA,
+        WSANO_RECOVERY, WSATRY_AGAIN, WSATYPE_NOT_FOUND,
+    };
+    Some(match raw {
+        WSAHOST_NOT_FOUND | WSANO_DATA => ("ENOTFOUND", -3008),
+        WSATRY_AGAIN => ("EAI_AGAIN", -3001),
+        WSANO_RECOVERY => ("EAI_FAIL", -3004),
+        WSAEINVAL => ("EAI_BADFLAGS", -3002),
+        WSAEAFNOSUPPORT => ("EAI_FAMILY", -3005),
+        WSATYPE_NOT_FOUND => ("EAI_SERVICE", -3010),
+        WSAESOCKTNOSUPPORT => ("EAI_SOCKTYPE", -3011),
+        _ => return None,
+    })
+}
+
 fn classify_resolve(error: &std::io::Error) -> (&'static str, i32) {
+    // The resolver's own code, when the lookup carried one ([`getaddrinfo`]).
+    if let Some(classified) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<GaiError>())
+        .and_then(|gai| classify_gai(gai.code))
+    {
+        return classified;
+    }
     #[cfg(windows)]
     if let Some(raw) = error.raw_os_error() {
-        use windows_sys::Win32::Networking::WinSock::{
-            WSAEAFNOSUPPORT, WSAEINVAL, WSAESOCKTNOSUPPORT, WSAHOST_NOT_FOUND, WSANO_DATA,
-            WSANO_RECOVERY, WSATRY_AGAIN, WSATYPE_NOT_FOUND,
-        };
-        return match raw {
-            WSAHOST_NOT_FOUND | WSANO_DATA => ("ENOTFOUND", -3008),
-            WSATRY_AGAIN => ("EAI_AGAIN", -3001),
-            WSANO_RECOVERY => ("EAI_FAIL", -3004),
-            WSAEINVAL => ("EAI_BADFLAGS", -3002),
-            WSAEAFNOSUPPORT => ("EAI_FAMILY", -3005),
-            WSATYPE_NOT_FOUND => ("EAI_SERVICE", -3010),
-            WSAESOCKTNOSUPPORT => ("EAI_SOCKTYPE", -3011),
+        return classify_wsa(raw).unwrap_or_else(|| {
             // libuv's default: the generic system-error translation.
-            _ => {
-                let code = node_error_code(error);
-                (code, node_errno(code, error).unwrap_or(-3004))
-            }
-        };
+            let code = node_error_code(error);
+            (code, node_errno(code, error).unwrap_or(-3004))
+        });
     }
     #[cfg(not(windows))]
     if error.raw_os_error().is_some() {
@@ -1215,6 +1410,8 @@ mod tests {
         lookup_error: &'static str,
         dials: Vec<(IpAddr, Dial)>,
         lookups: Mutex<Vec<String>>,
+        /// The hints each lookup was made with.
+        hints: Mutex<Vec<i32>>,
         dialled: Mutex<Vec<SocketAddr>>,
     }
 
@@ -1228,6 +1425,7 @@ mod tests {
                     .map(|(ip, dial)| (ip.parse().unwrap(), *dial))
                     .collect(),
                 lookups: Mutex::new(Vec::new()),
+                hints: Mutex::new(Vec::new()),
                 dialled: Mutex::new(Vec::new()),
             }
         }
@@ -1254,8 +1452,15 @@ mod tests {
         /// The address that answered.
         type Stream = SocketAddr;
 
-        async fn lookup(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        async fn lookup(
+            &self,
+            host: &str,
+            port: u16,
+            _family: Option<u8>,
+            hints: i32,
+        ) -> io::Result<Vec<SocketAddr>> {
             self.lookups.lock().unwrap().push(host.to_string());
+            self.hints.lock().unwrap().push(hints);
             match &self.resolved {
                 Some(ips) => Ok(ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect()),
                 None => Err(gai(self.lookup_error)),
@@ -1295,8 +1500,7 @@ mod tests {
     fn opts(attempt_ms: u64) -> ConnectOptions {
         ConnectOptions {
             attempt_timeout: Duration::from_millis(attempt_ms),
-            pin: None,
-            local: None,
+            ..ConnectOptions::default()
         }
     }
 
@@ -1494,9 +1698,8 @@ mod tests {
             addrs: vec!["127.0.0.2".parse().unwrap(), "127.0.0.1".parse().unwrap()],
         };
         let pinned = ConnectOptions {
-            attempt_timeout: Duration::from_millis(250),
             pin: Some(pin.clone()),
-            local: None,
+            ..opts(250)
         };
         let script = Script::new(&["::1"], &[("127.0.0.1", now(Outcome::Connect))]);
         let (answered, attempted) = connect_with("Pinned.Example", 443, &pinned, &script)
@@ -1985,12 +2188,11 @@ mod tests {
     async fn probe_blackhole_then_refused_loopback() {
         let port = closed_port().await;
         let pinned = ConnectOptions {
-            attempt_timeout: Duration::from_millis(250),
             pin: Some(Pin {
                 host: "blackhole.example".to_string(),
                 addrs: vec!["192.0.2.1".parse().unwrap(), "127.0.0.1".parse().unwrap()],
             }),
-            local: None,
+            ..opts(250)
         };
         let Err(ConnectError::Multi(errors)) = connect("blackhole.example", port, &pinned).await
         else {
@@ -2000,25 +2202,129 @@ mod tests {
         assert_eq!(errors[1].code, "ECONNREFUSED");
     }
 
+    /// #165: a connect's own lookup is made with node's `hints` -- net's
+    /// default for one given no family and no hints (AI_ADDRCONFIG off
+    /// Windows, nothing on it), or what the caller set -- and a resolve ahead
+    /// of a connect with the hints JS hands it.
+    #[tokio::test]
+    async fn lookups_are_made_with_nodes_hints() {
+        let default = default_connect_hints();
+        #[cfg(unix)]
+        assert_eq!(default, libc::AI_ADDRCONFIG, "AI_ADDRCONFIG off Windows");
+        #[cfg(unix)]
+        assert_ne!(default, 0, "a nonzero AI_ADDRCONFIG off Windows");
+        #[cfg(windows)]
+        assert_eq!(default, 0, "node's net passes no hints on Windows");
+        assert_eq!(ConnectOptions::default().hints, default);
+
+        let script = Script::new(&["127.0.0.1"], &[("127.0.0.1", now(Outcome::Connect))]);
+        connect_with("name.example", 80, &opts(250), &script)
+            .await
+            .unwrap();
+        let chosen = ConnectOptions {
+            hints: 7,
+            ..opts(250)
+        };
+        connect_with("name.example", 80, &chosen, &script)
+            .await
+            .unwrap();
+        resolve_with("name.example", "name.example", None, 5, &script)
+            .await
+            .unwrap();
+        assert_eq!(*script.hints.lock().unwrap(), [default, 7, 5]);
+        // A pin stands in for the lookup: no hints are used at all.
+        let pinned = ConnectOptions {
+            pin: Some(Pin {
+                host: "name.example".to_string(),
+                addrs: vec!["127.0.0.1".parse().unwrap()],
+            }),
+            ..opts(250)
+        };
+        connect_with("name.example", 80, &pinned, &script)
+            .await
+            .unwrap();
+        assert_eq!(script.hints.lock().unwrap().len(), 3);
+    }
+
+    /// The platform resolver answers `localhost` with the family it is asked
+    /// for, and nothing of the other.
+    #[tokio::test]
+    async fn system_lookup_hands_the_family_to_the_resolver() {
+        let v4 = SystemDialer
+            .lookup("localhost", 80, Some(4), 0)
+            .await
+            .unwrap();
+        assert!(!v4.is_empty());
+        assert!(v4.iter().all(|a| a.is_ipv4() && a.port() == 80), "{v4:?}");
+        // AF_INET6 may legitimately have no answer on a host whose hosts file
+        // has no ::1; an answer, if any, is IPv6.
+        if let Ok(v6) = SystemDialer.lookup("localhost", 443, Some(6), 0).await {
+            assert!(v6.iter().all(|a| a.is_ipv6() && a.port() == 443), "{v6:?}");
+        }
+    }
+
+    /// A failure the resolver reports by code is classified from the code,
+    /// as libuv does, not from its text.
+    #[cfg(unix)]
+    #[test]
+    fn gai_codes_follow_libuv() {
+        let cases = [
+            (libc::EAI_NONAME, "ENOTFOUND", -3008),
+            (libc::EAI_AGAIN, "EAI_AGAIN", -3001),
+            (libc::EAI_FAIL, "EAI_FAIL", -3004),
+            (libc::EAI_BADFLAGS, "EAI_BADFLAGS", -3002),
+            (libc::EAI_FAMILY, "EAI_FAMILY", -3005),
+            (libc::EAI_SERVICE, "EAI_SERVICE", -3010),
+            #[cfg(not(target_os = "freebsd"))]
+            (libc::EAI_NODATA, "ENOTFOUND", -3007),
+        ];
+        for (gai, code, errno) in cases {
+            let error = io::Error::other(GaiError {
+                code: gai,
+                inner: io::Error::other("the resolver's text, unread"),
+            });
+            let e = resolve_error("host.invalid", &error);
+            assert_eq!((e.code.as_str(), e.errno), (code, Some(errno)), "{gai}");
+            assert_eq!(e.message, format!("getaddrinfo {code} host.invalid"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gai_codes_follow_libuv() {
+        use windows_sys::Win32::Networking::WinSock::{WSAHOST_NOT_FOUND, WSATRY_AGAIN};
+        for (wsa, code, errno) in [
+            (WSAHOST_NOT_FOUND, "ENOTFOUND", -3008),
+            (WSATRY_AGAIN, "EAI_AGAIN", -3001),
+        ] {
+            let error = io::Error::other(GaiError {
+                code: wsa,
+                inner: io::Error::other("the resolver's text, unread"),
+            });
+            let e = resolve_error("host.invalid", &error);
+            assert_eq!((e.code.as_str(), e.errno), (code, Some(errno)));
+        }
+    }
+
     #[tokio::test]
     async fn resolve_keeps_the_resolver_order_and_filters_by_family() {
         let script = Script::new(&["::1", "127.0.0.1", "::2"], &[]);
-        let all = resolve_with("dual.example", "dual.example", None, &script)
+        let all = resolve_with("dual.example", "dual.example", None, 0, &script)
             .await
             .unwrap();
         let all: Vec<String> = all.iter().map(|ip| ip.to_string()).collect();
         assert_eq!(all, ["::1", "127.0.0.1", "::2"]);
         // A family that is neither 4 nor 6 keeps both, as dns.lookup does
         // for family 0.
-        let zero = resolve_with("dual.example", "dual.example", Some(0), &script)
+        let zero = resolve_with("dual.example", "dual.example", Some(0), 0, &script)
             .await
             .unwrap();
         assert_eq!(zero.len(), 3);
-        let v4 = resolve_with("dual.example", "dual.example", Some(4), &script)
+        let v4 = resolve_with("dual.example", "dual.example", Some(4), 0, &script)
             .await
             .unwrap();
         assert_eq!(v4, ["127.0.0.1".parse::<IpAddr>().unwrap()]);
-        let v6 = resolve_with("dual.example", "dual.example", Some(6), &script)
+        let v6 = resolve_with("dual.example", "dual.example", Some(6), 0, &script)
             .await
             .unwrap();
         assert_eq!(v6.len(), 2);
@@ -2081,7 +2387,7 @@ mod tests {
     async fn resolve_looks_up_the_mapped_name_and_reports_the_host_as_written() {
         // getaddrinfo is handed the ToASCII form; errors name the host.
         let script = Script::new(&["127.0.0.1"], &[]);
-        let found = resolve_with("LOC\u{AD}ALHOST", "localhost", None, &script)
+        let found = resolve_with("LOC\u{AD}ALHOST", "localhost", None, 0, &script)
             .await
             .unwrap();
         assert_eq!(found, ["127.0.0.1".parse::<IpAddr>().unwrap()]);
@@ -2092,6 +2398,7 @@ mod tests {
             "b\u{FC}cher.invalid",
             "xn--bcher-kva.invalid",
             None,
+            0,
             &script,
         )
         .await
@@ -2104,7 +2411,7 @@ mod tests {
         // ToASCII refused the host (or mapped it to nothing): libuv's EINVAL,
         // and nothing is looked up.
         let script = Script::new(&["127.0.0.1"], &[]);
-        let Err(ConnectError::Resolve(error)) = resolve_with("\u{AD}", "", None, &script).await
+        let Err(ConnectError::Resolve(error)) = resolve_with("\u{AD}", "", None, 0, &script).await
         else {
             panic!("expected EINVAL");
         };
@@ -2122,7 +2429,7 @@ mod tests {
         // A family the name has no address in: getaddrinfo ENOTFOUND.
         let script = Script::new(&["127.0.0.1"], &[]);
         let Err(ConnectError::Resolve(error)) =
-            resolve_with("v4only.example", "v4only.example", Some(6), &script).await
+            resolve_with("v4only.example", "v4only.example", Some(6), 0, &script).await
         else {
             panic!("expected a resolver error");
         };
@@ -2134,7 +2441,7 @@ mod tests {
         // A resolver failure is classified exactly as connect classifies it.
         let script = Script::failing_lookup("Name or service not known");
         let Err(ConnectError::Resolve(resolved)) =
-            resolve_with("nx.example", "nx.example", None, &script).await
+            resolve_with("nx.example", "nx.example", None, 0, &script).await
         else {
             panic!("expected a resolver error");
         };
@@ -2219,9 +2526,8 @@ mod tests {
         );
         let pin = redeem_answer(&answers, 5, "ticket.example").unwrap();
         let pinned = ConnectOptions {
-            attempt_timeout: Duration::from_millis(250),
             pin: Some(pin),
-            local: None,
+            ..opts(250)
         };
         let script = Script::new(&["10.9.9.9"], &[]);
         let _ = connect_with("ticket.example", 80, &pinned, &script).await;
@@ -2236,9 +2542,8 @@ mod tests {
             vec!["127.0.0.1".parse().unwrap()],
         );
         let pinned = ConnectOptions {
-            attempt_timeout: Duration::from_millis(250),
             pin: Some(redeem_answer(&answers, 6, "one.example").unwrap()),
-            local: None,
+            ..opts(250)
         };
         let script = Script::new(&[], &[]);
         let Err(ConnectError::Single(error)) =
