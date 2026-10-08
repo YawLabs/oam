@@ -72,6 +72,37 @@ type PoolKey = (Scheme, Authority, Alpn);
 type H1Sender = http1::SendRequest<ReqBody>;
 type H2Sender = http2::SendRequest<ReqBody>;
 
+/// One reactor turn before a just-parked h1 connection is handed out (#155).
+/// A server that answers and FINs in one callback (a 3xx then `end()`, a
+/// keep-alive timeout) makes a connection parked moments ago the one whose
+/// FIN can still be in flight: a request written at once races it, and
+/// either lands in a close the server never reads (a double delivery after
+/// oam's one resend) or fails a request oam may not send twice (RFC 9110
+/// s9.2.2). The checkout sleeps until the entry is [`FRESH_GATE`] old, which
+/// parks the send task on the reactor: the connection's own dispatcher polls
+/// meanwhile -- hyper reads an idle connection before every write, and
+/// `EagerTcp`'s peek asks the kernel -- so a FIN that lands during the wait
+/// closes the entry, [`Pool::reuse_h1`] skips it, and the request dials
+/// fresh instead of racing. Node takes a turn of its own here (its event
+/// loop reads the FIN before it writes); this is oam's. A timing heuristic,
+/// swept against node (issue #155's tables) from 0 to 5 ms on Windows
+/// arm64: 0 reproduces the gap (0-51 doubles and 9-31 failures per 1,000),
+/// 1 ms onward measured at node's 0/0 across all three open rows, so 1 ms
+/// is the smallest clean window. tokio's timer rounds the wait up to its ms
+/// tick, which matches the constant. No env knob: the sweep is done, and a
+/// gate a deployment can silently disable is a gate that rots.
+const FRESH_GATE: Duration = Duration::from_millis(1);
+
+/// How long a checkout must wait before taking the entry parked at
+/// `parked_at`: `None` when it is already [`FRESH_GATE`] old, else the
+/// remaining time. Pure -- the reactor belongs to [`Pool::reuse_h1`].
+fn fresh_delay(parked_at: Instant, now: Instant, window: Duration) -> Option<Duration> {
+    let age = now.saturating_duration_since(parked_at);
+    // `then`, not `then_some`: the subtraction must not evaluate when the
+    // entry is already window-old (Duration subtraction panics on overflow).
+    (age < window).then(|| window - age)
+}
+
 /// hyper-util's `pool_idle_timeout`, the reqwest default oam inherited.
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// The reaper never wakes sooner than this after its last pass (hyper-util's
@@ -366,7 +397,7 @@ impl Pool {
             if let Some(conn) = self.reuse_h2(key) {
                 return Ok(conn);
             }
-            if let Some(conn) = self.reuse_h1(key) {
+            if let Some(conn) = self.reuse_h1(key).await {
                 return Ok(conn);
             }
         }
@@ -443,10 +474,35 @@ impl Pool {
             })
     }
 
-    fn reuse_h1(&self, key: &PoolKey) -> Option<Conn> {
-        let mut map = self.inner.idle.lock().unwrap_or_else(|e| e.into_inner());
-        let deque = map.get_mut(key)?;
-        while let Some(entry) = deque.pop_front() {
+    /// Take the front idle h1 connection for `key`, or nothing: expired and
+    /// already-closed entries are dropped (their sender closes the
+    /// connection), a live one is handed out.
+    ///
+    /// #155: the entry is POPPED FIRST, so the one aged by the wait below is
+    /// the one used -- a concurrent checkout cannot steal it mid-wait and
+    /// leave this request racing a younger entry it never aged. The wait
+    /// parks the send task until the entry is [`FRESH_GATE`] old: the
+    /// connection's own dispatcher polls meanwhile (hyper reads the idle
+    /// connection before every write, `EagerTcp`'s peek asks the kernel), so
+    /// a server's FIN that was in flight lands, its EOF read closes the
+    /// sender, and the re-check here drops it -- the request dials fresh
+    /// instead of writing into the close. A sleep, not a `yield_now` spin:
+    /// a spin keeps every worker draining runnable queues so none parks on
+    /// the epoll driver, which is what delivers the FIN's readiness -- the
+    /// very turn this gate exists to create. An entry already window-old
+    /// (the steady-state reuse) waits nothing.
+    async fn reuse_h1(&self, key: &PoolKey) -> Option<Conn> {
+        loop {
+            // Pop under the lock; nothing else can take this entry after.
+            let entry = {
+                let mut map = self.inner.idle.lock().unwrap_or_else(|e| e.into_inner());
+                let deque = map.get_mut(key)?;
+                let entry = deque.pop_front();
+                if deque.is_empty() {
+                    map.remove(key);
+                }
+                entry
+            }?;
             if let Some(timeout) = self.inner.idle_timeout
                 && idle_left(timeout, Instant::now(), entry.parked_at).is_none()
             {
@@ -455,22 +511,24 @@ impl Pool {
             if entry.sender.is_closed() {
                 continue; // a processed FIN; drop (lazy skip)
             }
+            if let Some(delay) = fresh_delay(entry.parked_at, Instant::now(), FRESH_GATE) {
+                tokio::time::sleep(delay).await;
+                // Hands the run queue to a dispatcher woken at the deadline.
+                tokio::task::yield_now().await;
+                if entry.sender.is_closed() {
+                    continue; // the FIN landed during the wait -> drop
+                }
+            }
             let stats = entry.stats.clone();
-            let conn = Conn {
+            return Some(Conn {
                 proto: Proto::H1(entry.sender, entry.stats),
                 stats,
                 info: entry.info,
                 proxied: entry.proxied,
                 is_h2: false,
                 key: key.clone(),
-            };
-            if deque.is_empty() {
-                map.remove(key);
-            }
-            return Some(conn);
+            });
         }
-        map.remove(key);
-        None
     }
 
     async fn connect(
@@ -1089,6 +1147,151 @@ mod tests {
         );
     }
 
+    /// #155: the checkout waits out [`FRESH_GATE`] before handing a
+    /// just-parked entry to a request. The expected delay is
+    /// `max(0, gate - age)`; the gate off (`Duration::ZERO`) must wait
+    /// nothing, and gate on must wait a young entry (calibrated against the
+    /// test's own jitter so it holds on a slow box).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_just_parked_entry_delays_the_checkout_by_the_fresh_gate() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // A live origin that answers EVERY request on a connection with a 200
+        // and keeps it open (keep-alive): both requests ride one connection,
+        // and its entry parks after each body drains.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        // Read one request head (a GET carries no body).
+                        let mut head = Vec::new();
+                        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            let Ok(n) = stream.read(&mut buf).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            head.extend_from_slice(&buf[..n]);
+                        }
+                        // Answer it; the loop keeps the connection alive for
+                        // the next one until the client closes.
+                        if stream
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let pool = Pool::new(
+            OamConnector {
+                shared: Arc::new(super::super::connector::Shared {
+                    tls: super::super::TlsSource::Unavailable("not used".into()),
+                    proxy: None,
+                    user_agent: http::HeaderValue::from_static("oam-test"),
+                    tls_range: std::sync::atomic::AtomicU8::new(
+                        super::super::TlsRange::Both.code(),
+                    ),
+                }),
+                via: super::super::connector::Via::Pooled,
+            },
+            Some(Duration::from_secs(90)),
+        );
+        let dial = || Dial {
+            connect_timeout: None,
+            alpn: Alpn::default(),
+            attempt_timeout: Duration::from_millis(250),
+            pin: None,
+        };
+        let uri: Uri = format!("http://127.0.0.1:{port}/").parse().unwrap();
+        let get = || {
+            let mut req = Request::new(super::super::transport::empty_body());
+            *req.uri_mut() = uri.clone();
+            req
+        };
+        // First request: opens the connection; its response parks it. Every
+        // await is bounded: a regression here must fail, not hang the suite.
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            pool.request(get(), false, dial(), None),
+        )
+        .await
+        .expect("the first request timed out")
+        .unwrap_or_else(|e| panic!("first request failed: {}", e.error));
+        let released = response.extensions().get::<Released>().cloned().unwrap();
+        http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap();
+        // The entry is just parked. Measure the checkout DIRECTLY, not
+        // through a whole request (whose debug round trip exceeds the 1ms
+        // window): `reuse_h1` is what sleeps. `phase` -- the body drain to
+        // that pop -- bounds the entry's age when the age is read inside it.
+        let phase_started = Instant::now();
+        released.settled().await;
+        let phase = phase_started.elapsed();
+        let key = pool_key(&uri, Alpn::default()).unwrap();
+        let young_started = Instant::now();
+        let young = pool.reuse_h1(&key).await;
+        let young_wait = young_started.elapsed();
+        // Park a second connection for the baseline pop: request 2 dials
+        // fresh (the young pop already took the parked entry).
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            pool.request(get(), false, dial(), None),
+        )
+        .await
+        .expect("the second request timed out")
+        .unwrap_or_else(|e| panic!("second request failed: {}", e.error));
+        let released = response.extensions().get::<Released>().cloned().unwrap();
+        http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap();
+        released.settled().await;
+        // Baseline: the same pop path once the entry is past the gate.
+        tokio::time::sleep(FRESH_GATE * 2).await;
+        let base_started = Instant::now();
+        let old = pool.reuse_h1(&key).await;
+        let baseline = base_started.elapsed();
+        assert!(
+            young.is_some() && old.is_some(),
+            "both parked entries must be available to the checkout"
+        );
+        // The gate stays at a swept window (>=500us: the sweep's floor was
+        // 1ms, and 0 reproduced the #155 gap). A constant dropped to zero
+        // fails here, not on an expectation derived from the same constant
+        // it would be testing.
+        assert!(
+            FRESH_GATE >= Duration::from_micros(500),
+            "FRESH_GATE must stay at a swept window of at least 500us (the #155 sweep's \
+             floor is 1ms; 0 measured at the gap), got {FRESH_GATE:?}"
+        );
+        // And the checkout must actually sleep it out: `phase` bounds the
+        // entry's age, `baseline` is the no-wait cost of the same pop path,
+        // so `required` is what remains of the window. A checkout that stops
+        // sleeping takes about `baseline` and fails; a box too slow to prove
+        // the difference fails loudly rather than passing silently.
+        let required = FRESH_GATE
+            .checked_sub(phase)
+            .and_then(|left| left.checked_sub(baseline))
+            .expect(
+                "this box is too slow to prove the freshness wait (gate - phase - \
+                     baseline <= 0): the test needs a faster run, not a skip",
+            );
+        assert!(
+            young_wait >= required,
+            "the checkout waited only {young_wait:?}, short of {required:?} \
+             (FRESH_GATE {FRESH_GATE:?}, phase {phase:?}, baseline {baseline:?}): \
+             the freshness wait did not run"
+        );
+    }
+
     /// A marker error the send path's classifiers look for, to prove
     /// `PoolError::source()` reproduces the chain `find_in_chain` walks. The
     /// connector's real errors (`ConnectError`, `HandshakeFailed`,
@@ -1123,6 +1326,30 @@ mod tests {
             reaches::<Marker>(&error),
             "PoolError::source() must reach the connector's error, or the send \
              path misclassifies a connect / TLS failure as a generic send error",
+        );
+    }
+
+    #[test]
+    fn a_just_parked_connection_waits_out_the_fresh_gate_and_an_old_one_does_not() {
+        let window = Duration::from_micros(200);
+        let parked_at = Instant::now();
+        // Just parked: the wait is (nearly) the whole window.
+        let delay = fresh_delay(parked_at, parked_at, window).expect("young entry waits");
+        assert_eq!(delay, Duration::from_micros(200));
+        // Half a window old: only the remainder.
+        let delay = fresh_delay(parked_at, parked_at + Duration::from_micros(120), window)
+            .expect("entry inside the window waits");
+        assert_eq!(delay, Duration::from_micros(80));
+        // Window-old (the steady-state reuse): no wait at all.
+        assert_eq!(
+            fresh_delay(parked_at, parked_at + Duration::from_micros(200), window),
+            None
+        );
+        // A much older entry never waits -- and the subtraction must not
+        // evaluate here at all (it would panic on underflow).
+        assert_eq!(
+            fresh_delay(parked_at, parked_at + Duration::from_secs(1), window),
+            None
         );
     }
 }

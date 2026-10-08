@@ -12747,6 +12747,131 @@ process.exit(0);
     );
 }
 
+/// #155: a request written onto a pooled connection whose server FIN is in
+/// flight. Two shapes, in one script, both counting every arrival per path so
+/// a hop read into a close (or delivered twice) shows as a count above 1:
+///
+/// - `POST` + `307`: the server answers and FINs in one callback, so the hop
+///   can be written before the FIN arrives. The hop dials its own connection
+///   (#271), so every fetch succeeds and the 307's connection carries nothing
+///   but the request that was answered. Deterministic: hard equality.
+/// - No redirect: `200` + keep-alive, FIN at once. The next `POST` in each
+///   chain takes the just-pooled connection, whose FIN is still in flight --
+///   the row the freshness gate in `pool::reuse_h1` exists for. A POST is
+///   never resent (RFC 9110 s9.2.2), so a lost race fails the fetch; with the
+///   gate measured 0 failures per 1,000 on release builds, without it 9-31.
+///   Tolerated at 2 of 400: the FIN landing before the write is timing, not
+///   a guarantee, and a loaded CI box shifts it.
+#[test]
+fn a_post_written_after_a_just_pooled_connections_fin_is_not_lost() {
+    let script = write_temp(
+        "fin_in_flight/main.mjs",
+        r#"import net from 'node:net';
+// Counts every arrival per path: a request read into a close the server
+// never answers still counts, and a request delivered twice counts twice.
+const counts = new Map();
+const bump = (p) => counts.set(p, (counts.get(p) || 0) + 1);
+const server = net.createServer((sock) => {
+  let buf = '';
+  sock.on('data', (d) => {
+    buf += d.toString('latin1');
+    let i;
+    while ((i = buf.indexOf('\r\n\r\n')) !== -1) {
+      const head = buf.slice(0, i);
+      const path = head.split(' ')[1].split('?')[0];
+      const m = head.match(/content-length:\s*(\d+)/i);
+      const cl = m ? Number(m[1]) : 0;
+      buf = buf.slice(i + 4);
+      if (buf.length >= cl) buf = buf.slice(cl);
+      bump(path);
+      if (path.startsWith('/redir')) {
+        // The issue's shape: 307 and FIN in one callback.
+        sock.write(`HTTP/1.1 307 Temporary Redirect\r\nlocation: ${path.replace('/redir', '/final')}\r\ncontent-length: 0\r\n\r\n`);
+        sock.end();
+      } else if (path.startsWith('/fin')) {
+        // 200 + keep-alive answered, then FIN at once.
+        sock.write('HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok');
+        sock.end();
+      } else {
+        sock.write('HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok');
+      }
+    }
+  });
+  sock.on('error', () => {});
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+const post = (url) => fetch(url, { method: 'POST', body: 'x' });
+
+// 8 chains x 25 sequential POSTs, each followed through its 307.
+let redirOk = 0;
+await Promise.all(Array.from({ length: 8 }, async (_, c) => {
+  for (let i = 0; i < 25; i++) {
+    try {
+      const r = await post(`${base}/redir/${c}_${i}`);
+      if (r.status === 200 && (await r.text()) === 'ok') redirOk++;
+    } catch {}
+  }
+}));
+
+// 8 chains x 50 sequential POSTs against the 200-then-FIN shape: every
+// pooled connection each chain meets is one whose FIN is in flight.
+let finOk = 0;
+await Promise.all(Array.from({ length: 8 }, async (_, c) => {
+  for (let i = 0; i < 50; i++) {
+    try {
+      const r = await post(`${base}/fin/${c}_${i}`);
+      if (r.status === 200 && (await r.text()) === 'ok') finOk++;
+    } catch {}
+  }
+}));
+
+// Let a late server-side arrival land before reading the counts.
+await new Promise((r) => setTimeout(r, 100));
+const maxArrivals = (pred) => {
+  let max = 0;
+  for (const [p, n] of counts) if (pred(p)) max = Math.max(max, n);
+  return max;
+};
+console.log('redir_ok=' + redirOk);
+console.log('redir_max=' + maxArrivals((p) => p.startsWith('/redir') || p.startsWith('/final')));
+console.log('fin_ok=' + finOk);
+console.log('fin_max=' + maxArrivals((p) => p.startsWith('/fin')));
+process.exit(0);
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let num = |key: &str| -> u64 {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{key} missing from:\n{stdout}"))
+    };
+    assert_eq!(
+        num("redir_ok="),
+        200,
+        "every POST + 307 fetch succeeds:\n{stdout}"
+    );
+    assert_eq!(
+        num("redir_max="),
+        1,
+        "the 307's request and its hop each arrived exactly once:\n{stdout}"
+    );
+    assert_eq!(
+        num("fin_max="),
+        1,
+        "no request on a just-pooled connection was read twice:\n{stdout}"
+    );
+    let ok = num("fin_ok=");
+    assert!(
+        ok >= 398,
+        "only {ok}/400 POSTs on a just-pooled connection whose FIN followed got through \
+         (tolerance 2 -- the gate in pool::reuse_h1 lost a race this run):\n{stdout}"
+    );
+}
+
 /// A fetch whose dispatcher carries a connect.lookup hook never goes through
 /// the environment proxy: an undici Agent does not read HTTP_PROXY, and a
 /// pin that a proxy resolved again would pin nothing. The same fetch without
