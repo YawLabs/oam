@@ -1187,6 +1187,10 @@ impl HandshakeInfo {
 ///
 /// Shared by the node:tls server (`tls_accept`, which hands the connection
 /// to JS) and the https server (`https_serve`, which serves it natively).
+// clippy::result_large_err (Rust 1.98 and later): boxing the OpOutcome would
+// not shrink this Result, whose Ok carries the whole TLS server stream and is larger
+// than the error. `allow`, not `expect`: older clippy does not fire here.
+#[allow(clippy::result_large_err)]
 pub async fn accept_stream(
     tcp_stream: tokio::net::TcpStream,
     context: &ServerContext,

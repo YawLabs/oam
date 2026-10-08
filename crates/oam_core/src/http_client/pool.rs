@@ -233,9 +233,9 @@ impl Pool {
         close_requested: bool,
         mut dial: Dial,
         follows: Option<Rules>,
-    ) -> Result<Response<Incoming>, PoolFail> {
+    ) -> Result<Response<Incoming>, Box<PoolFail>> {
         let Some(key) = pool_key(req.uri(), dial.alpn) else {
-            return Err(PoolFail {
+            return Err(Box::new(PoolFail {
                 error: PoolError::connect(Box::<dyn std::error::Error + Send + Sync>::from(
                     "request url has no scheme or authority",
                 )),
@@ -243,7 +243,7 @@ impl Pool {
                 response_started: false,
                 conn: None,
                 returned: None,
-            });
+            }));
         };
         let is_connect = req.method() == Method::CONNECT;
         // Only a request that could not be sent again needs its method after
@@ -265,22 +265,22 @@ impl Pool {
                     // Unsent, and as the caller built it: a retry below
                     // handed it back with its URI already rewritten.
                     *req.uri_mut() = original_uri;
-                    return Err(PoolFail {
+                    return Err(Box::new(PoolFail {
                         error: PoolError::connect(Box::new(needed)),
                         reused: false,
                         response_started: false,
                         conn: None,
                         returned: Some(req),
-                    });
+                    }));
                 }
                 Err(Checkout::Failed(error)) => {
-                    return Err(PoolFail {
+                    return Err(Box::new(PoolFail {
                         error: PoolError::connect(error),
                         reused: false,
                         response_started: false,
                         conn: None,
                         returned: None,
-                    });
+                    }));
                 }
             };
             // `attempt_stats` carries this attempt's `read` baseline, snapshotted
@@ -308,13 +308,13 @@ impl Pool {
                 && let Err(error) = gate.prime(&mut req).await
             {
                 drop(proto);
-                return Err(PoolFail {
+                return Err(Box::new(PoolFail {
                     error: PoolError::body(error),
                     reused: false,
                     response_started: false,
                     conn: Some(info),
                     returned: None,
-                });
+                }));
             }
             *req.uri_mut() = original_uri.clone();
             set_host_header(&mut req, is_h2);
@@ -355,32 +355,32 @@ impl Pool {
                         allow_reuse = false;
                         continue;
                     }
-                    return Err(PoolFail {
+                    return Err(Box::new(PoolFail {
                         error: PoolError::send(error),
                         reused,
                         response_started,
                         conn: Some(info),
                         returned: None,
-                    });
+                    }));
                 }
                 SendResult::Sent(error, proto) => {
                     let reused = attempt_stats.count_one();
                     let response_started = attempt_stats.response_started();
                     self.on_failure(proto, is_h2, &conn_key);
-                    return Err(PoolFail {
+                    return Err(Box::new(PoolFail {
                         error: PoolError::send(error),
                         reused,
                         response_started,
                         conn: Some(info),
                         returned: None,
-                    });
+                    }));
                 }
             }
         }
 
         // Unreachable: a fresh connection is never retried, so at most two
         // attempts run. Surface a canceled error rather than panic.
-        Err(PoolFail {
+        Err(Box::new(PoolFail {
             error: PoolError::connect(Box::<dyn std::error::Error + Send + Sync>::from(
                 "connection retries exhausted",
             )),
@@ -388,7 +388,7 @@ impl Pool {
             response_started: false,
             conn: None,
             returned: None,
-        })
+        }))
     }
 
     /// Reuse an idle connection for `key`, or open exactly one. Never both.
@@ -840,7 +840,10 @@ async fn send_on(proto: Proto, req: Request<ReqBody>) -> SendResult {
 }
 
 /// A request that produced no response, plus the two signals `send.rs`'s
-/// stale-resend is gated on.
+/// stale-resend is gated on. Handed back boxed ([`Pool::request`]), and kept
+/// so inside [`super::SendError`]: the connection's [`ConnInfo`] and the
+/// unsent request make it about 500 bytes, which every `Result` it rides in
+/// would otherwise carry (clippy's `result_large_err`).
 pub(crate) struct PoolFail {
     pub(crate) error: PoolError,
     pub(crate) reused: bool,

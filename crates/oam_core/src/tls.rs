@@ -1953,6 +1953,10 @@ fn no_protocols() -> OpOutcome {
 /// (one trailing dot stripped, as node's `unfqdn` does); `target` names the
 /// endpoint in a transport error.
 #[allow(clippy::too_many_arguments)]
+// clippy::result_large_err (Rust 1.98 and later): boxing the OpOutcome would
+// not shrink this Result, whose Ok carries the whole TLS client stream and is larger
+// than the error. `allow`, not `expect`: older clippy does not fire here.
+#[allow(clippy::result_large_err)]
 async fn client_handshake<IO>(
     io: IO,
     name: &str,

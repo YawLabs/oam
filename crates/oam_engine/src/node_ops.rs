@@ -9770,8 +9770,10 @@ fn cpu_model() -> String {
     }
 
     let wide: Vec<u16> = buf[..buf_len as usize]
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| u16::from_le_bytes(pair))
         .take_while(|&c| c != 0)
         .collect();
     String::from_utf16_lossy(&wide).trim().to_string()
