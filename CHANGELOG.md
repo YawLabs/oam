@@ -52,7 +52,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   (non-enumerable, named after the original): it resolves `{ stdout, stderr }`, rejects the
   callback's error with `err.stdout` and `err.stderr` set, exposes the ChildProcess as
   `promise.child`, and keeps Buffers under `encoding: 'buffer'`. Pinned by conformance case
-  384.
+  385.
 
 - **A request written onto a pooled connection whose server's FIN is in flight now waits it
   out instead of racing it (#155).** A server that answers and FINs in one callback (a 3xx
