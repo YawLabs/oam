@@ -479,11 +479,32 @@ fn sweep(root: &Path, now: SystemTime) -> SweepReport {
         }
     }
     let mut report = SweepReport::default();
-    if std::fs::write(root.join(SWEEP_STAMP), b"").is_err() {
+    if !write_stamp(&root.join(SWEEP_STAMP), now) {
         return report;
     }
     walk(root, now, &mut report);
     report
+}
+
+/// (Re)write the sweep stamp at `path` and set its mtime to `now`
+/// explicitly. Returns false when the stamp cannot be created (the
+/// writability probe [`sweep`] relies on).
+///
+/// The explicit `set_modified` is the load-bearing part. Rust std emulates
+/// create+truncate on Windows as `OPEN_ALWAYS` plus a manual truncate, so
+/// rewriting an existing 0-byte stamp with 0 bytes never bumps NTFS's
+/// LastWriteTime: the stamp froze at its first-ever write and every process
+/// that loaded a module re-walked the whole cache. A `set_modified` failure
+/// (a filesystem without settable times) is swallowed -- the worst case is a
+/// sweep that runs more often than the interval, never one that is skipped.
+fn write_stamp(path: &Path, now: SystemTime) -> bool {
+    match std::fs::File::create(path) {
+        Ok(file) => {
+            let _ = file.set_modified(now);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// A snapshot of the on-disk cache for `oam cache info`.
@@ -769,6 +790,40 @@ mod tests {
             .unwrap();
         f.set_modified(now + Duration::from_secs(3600)).unwrap();
         assert!(!sweep_due(&root, now));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The stamp must ADVANCE when a sweep rewrites an existing empty one.
+    /// Rust std emulates create+truncate on Windows as OPEN_ALWAYS plus a
+    /// manual truncate, so rewriting a 0-byte file with 0 bytes never bumps
+    /// NTFS's LastWriteTime: the stamp stayed at its first-ever write and
+    /// every process that loaded a module re-walked the whole cache. The
+    /// aged stamp here is 0 bytes, exactly what production leaves behind.
+    #[test]
+    fn sweep_advances_an_existing_empty_stamp() {
+        let root = scratch("restamp");
+        let stamp = root.join(SWEEP_STAMP);
+        let now = SystemTime::now();
+        std::fs::write(&stamp, b"").unwrap();
+        let aged = now - SWEEP_INTERVAL * 3;
+        std::fs::File::options()
+            .write(true)
+            .open(&stamp)
+            .unwrap()
+            .set_modified(aged)
+            .unwrap();
+        assert!(sweep_due(&root, now), "an aged stamp is due");
+
+        sweep(&root, now);
+        let stamped = std::fs::metadata(&stamp).unwrap().modified().unwrap();
+        assert!(
+            stamped > aged + SWEEP_INTERVAL,
+            "the sweep must move the stamp forward (still {stamped:?})"
+        );
+        assert!(
+            !sweep_due(&root, now + Duration::from_secs(60)),
+            "the next check within the interval must skip the walk"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
