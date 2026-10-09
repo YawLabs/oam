@@ -16054,6 +16054,10 @@ fn mcp_serves_the_agent_loop_over_stdio() {
             "params": {"name": "oam_run", "arguments": {"file": broken.to_str().unwrap()}}}),
         serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
             "params": {"name": "oam_explain", "arguments": {"code": "OAM-MOD0001"}}}),
+        // A version oam does not speak is countered with one it does, never
+        // echoed back as if it were agreed.
+        serde_json::json!({"jsonrpc": "2.0", "id": 5, "method": "initialize",
+            "params": {"protocolVersion": "2026-07-28", "clientInfo": {"name": "e2e"}}}),
     ];
     {
         let stdin = child.stdin.as_mut().unwrap();
@@ -16070,9 +16074,11 @@ fn mcp_serves_the_agent_loop_over_stdio() {
         .collect();
     assert!(child.wait().unwrap().success(), "clean exit on stdin EOF");
 
-    // 4 requests with ids -> 4 responses, in order; the notification none.
-    assert_eq!(responses.len(), 4);
+    // 5 requests with ids -> 5 responses, in order; the notification none.
+    assert_eq!(responses.len(), 5);
     assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(responses[4]["id"], 5);
+    assert_eq!(responses[4]["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 4);
 
     // The run tool reports the failure as structured ODIF, not prose.
