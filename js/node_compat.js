@@ -33410,6 +33410,54 @@
       );
     }
 
+    // node v22 lib/child_process.js customPromiseExecFunction: exec and
+    // execFile call back with TWO values, so the generic util.promisify would
+    // resolve stdout alone and reject an error with no output on it. node
+    // pins its own promisified form instead -- resolve { stdout, stderr },
+    // reject the callback's error with err.stdout / err.stderr stamped on,
+    // and hang the ChildProcess off the promise as `.child`. Whatever
+    // `encoding` asked for reaches both unchanged (Buffers stay Buffers).
+    // The descriptor matches node's (non-enumerable, non-writable,
+    // non-configurable), and so do the wrapper's name and zero length.
+    // node does NOT also set customPromisifyArgs here: its symbol is internal,
+    // and oam's is a Symbol.for, so setting it would add an own symbol that
+    // node does not have.
+    const promisifyCustom = Symbol.for("nodejs.util.promisify.custom");
+    const customPromiseExecFunction = (orig) => {
+      // A plain function (it keeps a `prototype`, as node's does), renamed to
+      // the original's name the way node's assignFunctionName does it.
+      const promisified = function (...args) {
+        let resolve;
+        let reject;
+        const promise = new Promise((res, rej) => {
+          resolve = res;
+          reject = rej;
+        });
+        promise.child = orig(...args, (err, stdout, stderr) => {
+          if (err !== null) {
+            err.stdout = stdout;
+            err.stderr = stderr;
+            reject(err);
+          } else {
+            resolve({ stdout, stderr });
+          }
+        });
+        return promise;
+      };
+      Object.defineProperty(promisified, "name", { value: orig.name });
+      return promisified;
+    };
+    Object.defineProperty(exec, promisifyCustom, {
+      __proto__: null,
+      enumerable: false,
+      value: customPromiseExecFunction(exec),
+    });
+    Object.defineProperty(execFile, promisifyCustom, {
+      __proto__: null,
+      enumerable: false,
+      value: customPromiseExecFunction(execFile),
+    });
+
     function fork(modulePath, args, options) {
       if (typeof args === "object" && !Array.isArray(args)) {
         options = args;
