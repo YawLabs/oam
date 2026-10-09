@@ -261,7 +261,8 @@ fn win_plain_key(path: &str) -> Option<FsKey> {
     let (root, rest) =
         if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' {
             (path[..2].to_string(), &path[3..])
-        } else if let Some(unc) = path.strip_prefix(r"\\") {
+        } else {
+            let unc = path.strip_prefix(r"\\")?;
             let mut it = unc.splitn(3, '\\');
             let server = it.next().unwrap_or("");
             let share = it.next().unwrap_or("");
@@ -269,8 +270,6 @@ fn win_plain_key(path: &str) -> Option<FsKey> {
                 return None;
             }
             (format!(r"\\{server}\{share}"), it.next().unwrap_or(""))
-        } else {
-            return None;
         };
     let mut parts = Vec::new();
     for part in rest.split('\\').filter(|part| !part.is_empty()) {

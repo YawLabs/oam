@@ -1,16 +1,21 @@
 // dns.lookup's `hints`: dns.ADDRCONFIG / V4MAPPED / ALL are the platform's
-// AI_* flags, `hints` is validated as node's validateHints does, and
+// AI_* flags, `hints` is validated as node's validateHints does -- from
+// net.connect too, which reaches dns.lookup with its `hints` and throws
+// synchronously on a bad one -- and every flag goes to getaddrinfo:
 // V4MAPPED | ALL on an IPv6 lookup answers the IPv4 addresses as
-// `::ffff:a.b.c.d` besides the IPv6 ones.
+// `::ffff:a.b.c.d` besides the IPv6 ones, and ADDRCONFIG answers only the
+// families this host has an address configured for.
 //
 // Regression guard (#165): the three constants were 0, so a caller's
 // `hints: dns.ADDRCONFIG | dns.V4MAPPED` passed 0; any `hints` was accepted,
-// even bits no flag has; and V4MAPPED was never applied.
+// even bits no flag has, and net.connect accepted any `hints` up to 0.18.0;
+// V4MAPPED was never applied, and ADDRCONFIG was dropped up to 0.18.0.
 //
 // The constants' values differ by platform (glibc's on Linux, the BSD ones
-// elsewhere), not by runtime. AI_ADDRCONFIG is not applied by oam (see
-// docs/node-divergences.md), so no line depends on what is configured.
+// elsewhere), not by runtime. The ADDRCONFIG answer depends on what this host
+// has configured, the same way for both runtimes.
 import dns from "node:dns";
+import net from "node:net";
 
 const { ADDRCONFIG, V4MAPPED, ALL } = dns;
 console.log("distinct single bits:", [ADDRCONFIG, V4MAPPED, ALL].every((v) => v > 0 && (v & (v - 1)) === 0) &&
@@ -66,3 +71,46 @@ const flagged = await dns.promises.lookup("localhost", { all: true, hints: V4MAP
 console.log("family 0 unchanged:", JSON.stringify(plain) === JSON.stringify(flagged));
 // An IP literal is answered as written, flags or not.
 console.log("literal:", JSON.stringify(await dns.promises.lookup("127.0.0.1", { family: 6, all: true, hints: V4MAPPED | ALL })));
+
+// ADDRCONFIG goes to the resolver: its answer is a subset of the unflagged one
+// (a family this host has no configured address for is dropped), never empty,
+// and the same whether dns.lookup or a connect asks. Sorted: the order is the
+// resolver's.
+const sorted = (list) => JSON.stringify(list.map((a) => `${a.family} ${a.address}`).sort());
+const configured = await dns.promises.lookup("localhost", { all: true, hints: ADDRCONFIG });
+console.log("ADDRCONFIG:", sorted(configured));
+console.log("ADDRCONFIG within unflagged:", configured.length > 0 &&
+  configured.every((a) => plain.some((p) => p.address === a.address && p.family === a.family)));
+
+// net.connect validates `hints` through dns.lookup, synchronously: a bad one
+// throws out of connect() before anything is looked up or dialled, where a
+// user's `lookup` hook is handed them as given. The default a hook sees is 0
+// on Windows and dns.ADDRCONFIG elsewhere, and `family: 4` or a caller's
+// own `hints` turn that default off.
+for (const hints of [12345678, "x", ADDRCONFIG | 1]) {
+  try {
+    const s = net.connect({ host: "localhost", port: 1, hints });
+    s.on("error", () => {});
+    s.destroy();
+    console.log(`connect hints ${JSON.stringify(hints)}: accepted`);
+  } catch (e) {
+    console.log(`connect hints ${JSON.stringify(hints)}: ${describe(e)}`);
+  }
+}
+const hookSees = (options) => new Promise((resolve) => {
+  const s = net.connect({
+    host: "localhost",
+    port: 1,
+    ...options,
+    lookup: (_host, opts, cb) => {
+      resolve(JSON.stringify({ hints: opts.hints, family: opts.family, all: opts.all }));
+      cb(null, [{ address: "127.0.0.1", family: 4 }]);
+    },
+  });
+  s.on("error", () => {});
+});
+console.log("hook sees, no options:", (await hookSees({})) ===
+  JSON.stringify({ hints: process.platform === "win32" ? 0 : ADDRCONFIG, family: undefined, all: true }));
+console.log("hook sees, family 4:", await hookSees({ family: 4 }));
+console.log("hook sees, own hints:", (await hookSees({ hints: V4MAPPED })) === JSON.stringify({ hints: V4MAPPED, family: undefined, all: true }));
+console.log("hook sees, invalid hints:", await hookSees({ hints: 12345678 }));

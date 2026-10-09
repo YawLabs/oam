@@ -1508,7 +1508,7 @@ pub async fn http_serve(
 ) -> super::OpOutcome {
     let (listener, local) = match super::tcp::bind_listener(&at).await {
         Ok(bound) => bound,
-        Err(e) => return super::OpOutcome::sys(e),
+        Err(e) => return super::OpOutcome::sys(*e),
     };
     let server_id = state.next_id();
     let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
@@ -2427,7 +2427,7 @@ pub async fn https_serve(
 ) -> super::OpOutcome {
     let (listener, local) = match super::tcp::bind_listener(&at).await {
         Ok(bound) => bound,
-        Err(e) => return super::OpOutcome::sys(e),
+        Err(e) => return super::OpOutcome::sys(*e),
     };
     let server_id = state.next_id();
     let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
@@ -2908,7 +2908,7 @@ pub async fn http2_serve(
 ) -> super::OpOutcome {
     let (listener, local) = match super::tcp::bind_listener(&at).await {
         Ok(bound) => bound,
-        Err(e) => return super::OpOutcome::sys(e),
+        Err(e) => return super::OpOutcome::sys(*e),
     };
     let server_id = state.next_id();
     let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);

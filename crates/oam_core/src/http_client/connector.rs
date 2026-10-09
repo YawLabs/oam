@@ -982,6 +982,7 @@ impl OamConnector {
                     attempt_timeout: params.attempt_timeout,
                     pin: None,
                     local: None,
+                    ..ConnectOptions::default()
                 }
             }
             Via::Hooked => {
@@ -1007,6 +1008,7 @@ impl OamConnector {
                     attempt_timeout: params.attempt_timeout,
                     pin,
                     local: None,
+                    ..ConnectOptions::default()
                 }
             }
         };
@@ -1124,6 +1126,7 @@ impl Service<Uri> for ProxyTransport {
                 attempt_timeout: this.attempt_timeout,
                 pin: None,
                 local: None,
+                ..ConnectOptions::default()
             };
             let tcp = dial(&host, port, &opts, &AttemptLog::default()).await?;
             // The proxy's endpoints. Its own TLS session is not an origin's
@@ -1497,6 +1500,7 @@ mod tests {
             attempt_timeout: Duration::from_millis(250),
             pin: None,
             local: None,
+            ..ConnectOptions::default()
         };
         (
             dial("127.0.0.1", port, &opts, &AttemptLog::default())

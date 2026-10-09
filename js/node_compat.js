@@ -23556,6 +23556,12 @@
         (!agent && typeof opts.createConnection === "function") ||
         (!literal && merged.lookup != null) ||
         (!literal && dnsLookupReplaced()) ||
+        // node hands `hints` and `family` to net.connect, whose dns.lookup
+        // validates them (throwing out of http.request()) and resolves with
+        // them; the agent's socket does exactly that (#165). oam's own
+        // transport resolves with net's default for neither.
+        (!literal && ((merged.hints != null && merged.hints !== 0) ||
+          (merged.family != null && merged.family !== 0))) ||
         socketLayerPatched(protocol === "https:") ||
         (protocol === "https:" && carriesTlsPolicy(merged)) ||
         // A socket an earlier request over this (stock) agent left in its
@@ -27918,6 +27924,52 @@
     return socket;
   }
 
+  // node's getaddrinfo flags, as `dns.ADDRCONFIG` / `dns.V4MAPPED` / `dns.ALL`
+  // expose them: the system's AI_* values, which are glibc's (and musl's) on
+  // Linux and the BSD ones on Windows, macOS, the BSDs and Android (bionic's
+  // netdb.h has the BSD values: AI_ALL 0x100, AI_ADDRCONFIG 0x400,
+  // AI_V4MAPPED 0x800). Read at call time, from whatever process.platform
+  // says then. The same table bootstrap.js lookupHints() keeps for a fetch's
+  // connect.lookup, and the values oam's own resolver hands getaddrinfo
+  // (net_connect::default_connect_hints for a connect's default).
+  function dnsHintFlags() {
+    return globalThis.process.platform === "linux"
+      ? { ADDRCONFIG: 0x20, V4MAPPED: 0x8, ALL: 0x10 }
+      : { ADDRCONFIG: 0x400, V4MAPPED: 0x800, ALL: 0x100 };
+  }
+
+  // node lib/dns.js lookup: `options.hints` must be a number (or absent); it
+  // is read as a uint32 and may carry no flag but those three
+  // (internal/dns/utils validateHints). Returns the hints to use. net.connect
+  // reaches dns.lookup with its `hints`, so a bad one throws out of connect()
+  // too, before anything is looked up (#165).
+  function validateDnsHints(hints) {
+    if (hints == null) return 0;
+    if (typeof hints !== "number") {
+      throw codes.ERR_INVALID_ARG_TYPE("options.hints", "number", hints);
+    }
+    const bits = hints >>> 0;
+    const { ADDRCONFIG, V4MAPPED, ALL } = dnsHintFlags();
+    if ((bits & ~(ADDRCONFIG | ALL | V4MAPPED)) !== 0) {
+      throw codes.ERR_INVALID_ARG_VALUE("hints", bits);
+    }
+    return bits;
+  }
+
+  // node lib/dns.js lookup, right after the hints: `options.family` is
+  // 'IPv4' / 'IPv6' or one of 0, 4, 6 (validateOneOf), and the number form
+  // `dns.lookup(host, 6, cb)` is checked under the name 'family'. Returns
+  // the family to use. net.connect reaches it with its own `family`.
+  function validateDnsFamily(family, name) {
+    if (family == null) return 0;
+    if (family === "IPv4") return 4;
+    if (family === "IPv6") return 6;
+    if (family !== 0 && family !== 4 && family !== 6) {
+      throw codes.ERR_INVALID_ARG_VALUE(name, family, "must be one of: 0, 4, 6");
+    }
+    return family;
+  }
+
   registry.factories.net = (natives) => {
     const EventEmitter = registry.get("events");
 
@@ -28064,13 +28116,11 @@
     }
 
     // node's `dns.ADDRCONFIG`, the hints net passes a lookup off Windows when
-    // the caller gave none: the platform's AI_ADDRCONFIG. The table
-    // bootstrap.js lookupHints() uses for a fetch's connect.lookup (measured:
-    // 1024 on macOS 26, 0x20 on glibc; bionic has the BSD value).
+    // the caller gave none: the platform's AI_ADDRCONFIG (measured: 1024 on
+    // macOS 26, 0x20 on glibc; bionic has the BSD value). A user's lookup
+    // hook is handed it, and oam's own resolver passes it to getaddrinfo.
     function addrconfigHints() {
-      const platform = globalThis.process.platform;
-      if (platform === "darwin" || platform === "freebsd" || platform === "android") return 1024;
-      return 0x20;
+      return dnsHintFlags().ADDRCONFIG;
     }
 
     // The dns module's `lookup` as a connect reads it: at call time. null is
@@ -28346,9 +28396,15 @@
       }
 
       // oam's resolver: the addresses come back with a ticket the connect
-      // redeems, and every path that does not dial drops it.
+      // redeems, and every path that does not dial drops it. The hints and
+      // then the family are validated first, as dns.lookup validates them in
+      // node: a bad one throws out of connect() (ERR_INVALID_ARG_TYPE /
+      // ERR_INVALID_ARG_VALUE) before anything is looked up, while a user's
+      // lookup hook, above, is handed them as given, as node's is.
       const family = dnsopts.family === 4 || dnsopts.family === 6 ? dnsopts.family : 0;
-      natives.netResolve(host, family, multiple, port).then(
+      const hints = validateDnsHints(dnsopts.hints);
+      validateDnsFamily(dnsopts.family, "options.family");
+      natives.netResolve(host, family, multiple, port, hints).then(
         (answer) => {
           const token = answer.token;
           let redeemed = false;
@@ -33968,13 +34024,12 @@
     // libuv number in .errno -- so it is .errno, not .code, that round-trips
     // through util.getSystemErrorName (-3008 -> "EAI_NONAME").
     //
-    // EAI_NONAME is the only number oam claims. Its lookup path collapses every
-    // failure it can hit to ENOTFOUND (resolver error, empty answer, and no
-    // address in the requested family -- see oam_core/src/dns.rs), and node
-    // reports -3008 for all three of those shapes: an unknown name, a name that
-    // holds no address record, and a family the name has no record for.
-    // EAI_NODATA (-3007) is never stamped: oam cannot tell it apart from
-    // EAI_NONAME from here, and an absent errno beats a wrong one.
+    // The lookup path's number comes from the native side, classified from
+    // the code getaddrinfo returned as libuv does (net_connect.rs
+    // classify_gai): EAI_NONAME is -3008 and EAI_NODATA -3007, both under the
+    // code ENOTFOUND. The table below is the fallback for an error that
+    // arrives without a number (an empty answer is ENOTFOUND / -3008, as
+    // node reports a name with no address in the requested family).
     //
     // No per-platform table, unlike _netErrno in the net factory: every EAI_*
     // code takes libuv's fixed number on every host, because none of them has a
@@ -34011,11 +34066,15 @@
       // caller looked up an empty name.
       if (hostname) e.hostname = hostname;
       if (lookupPath) {
-        const errno = _dnsLookupErrno(code);
-        if (errno !== undefined) e.errno = errno;
-        // A name ToASCII refused is libuv's EINVAL, whose number the native
-        // side already took for this platform.
-        else if (code === "EINVAL" && typeof err.errno === "number") e.errno = err.errno;
+        // The resolver's own number when the native side reports one: libuv's
+        // UV_EAI_* for the code getaddrinfo returned (EAI_NODATA is ENOTFOUND
+        // with -3007 where EAI_NONAME is -3008), or this platform's EINVAL
+        // for a name ToASCII refused. Else the code's usual number.
+        if (typeof err.errno === "number") e.errno = err.errno;
+        else {
+          const errno = _dnsLookupErrno(code);
+          if (errno !== undefined) e.errno = errno;
+        }
       }
       return e;
     }
@@ -34052,40 +34111,24 @@
       });
     }
 
-    // node's getaddrinfo flags, as `dns.ADDRCONFIG` / `dns.V4MAPPED` /
-    // `dns.ALL` expose them: the system's AI_* values, which are glibc's (and
-    // musl's) on Linux and the BSD ones on Windows, macOS, the BSDs and
-    // Android (bionic's netdb.h has the BSD values: AI_ALL 0x100,
-    // AI_ADDRCONFIG 0x400, AI_V4MAPPED 0x800).
-    const [ADDRCONFIG, V4MAPPED, ALL] =
-      globalThis.process.platform === "linux"
-        ? [0x20, 0x8, 0x10]
-        : [0x400, 0x800, 0x100];
+    // node's getaddrinfo flags, the platform's AI_* values (dnsHintFlags,
+    // shared with net's default for a connect); read when node:dns loads.
+    const { ADDRCONFIG, V4MAPPED, ALL } = dnsHintFlags();
 
-    // node lib/dns.js lookup: `options.hints` must be a number; it is read as
-    // a uint32 and may carry no flag but those three
-    // (internal/dns/utils validateHints). Returns the hints to use.
+    // node lib/dns.js lookup: a bad `options.hints` throws (validateDnsHints).
     function lookupHints(opts) {
-      if (opts.hints == null) return 0;
-      if (typeof opts.hints !== "number") {
-        throw codes.ERR_INVALID_ARG_TYPE("options.hints", "number", opts.hints);
-      }
-      const hints = opts.hints >>> 0;
-      if ((hints & ~(ADDRCONFIG | ALL | V4MAPPED)) !== 0) {
-        throw codes.ERR_INVALID_ARG_VALUE("hints", hints);
-      }
-      return hints;
+      return validateDnsHints(opts.hints);
     }
 
-    // dns.lookup with its hints: AI_V4MAPPED and AI_ALL go to getaddrinfo
-    // with the family, as node's do, so the answer is the platform
-    // resolver's own -- glibc answers a name with both `::1` and
+    // dns.lookup with its hints: AI_ADDRCONFIG, AI_V4MAPPED and AI_ALL go to
+    // getaddrinfo with the family, as node's do, so the answer is the
+    // platform resolver's own -- glibc answers a name with both `::1` and
     // `127.0.0.1` in /etc/hosts under V4MAPPED | ALL with the mapped
     // address twice, and node reports both; emulating the flags over an
-    // unflagged lookup answered it once (case 228 on the linux leg).
-    // AI_ADDRCONFIG is not applied (docs/node-divergences.md).
+    // unflagged lookup answered it once (case 228 on the linux leg), and
+    // ADDRCONFIG was dropped here up to 0.18.0 (#165).
     function _dnsLookupHinted(hostname, family, all, hints) {
-      return _dnsLookup(hostname, family, all, hints & (V4MAPPED | ALL));
+      return _dnsLookup(hostname, family, all, hints);
     }
 
     function lookup(hostname, options, callback) {
@@ -34093,10 +34136,14 @@
         callback = options;
         options = {};
       }
-      if (typeof options === "number") options = { family: options };
+      let family;
+      if (typeof options === "number") {
+        family = validateDnsFamily(options, "family");
+        options = {};
+      }
       const opts = options || {};
       const hints = lookupHints(opts);
-      const family = opts.family || 0;
+      if (family === undefined) family = validateDnsFamily(opts.family, "options.family");
       const all = !!opts.all;
 
       _dnsLookupHinted(hostname, family, all, hints).then(
@@ -34209,10 +34256,14 @@
 
     const promises = {
       lookup(hostname, options) {
-        const opts = typeof options === "number" ? { family: options } : (options || {});
-        // node validates before it returns a promise: a bad `hints` throws.
+        const numeric = typeof options === "number";
+        const opts = numeric ? {} : (options || {});
+        // node validates before it returns a promise: a bad `hints` or
+        // `family` throws.
         const hints = lookupHints(opts);
-        const family = opts.family || 0;
+        const family = numeric
+          ? validateDnsFamily(options, "family")
+          : validateDnsFamily(opts.family, "options.family");
         const all = !!opts.all;
         return _dnsLookupHinted(hostname, family, all, hints);
       },

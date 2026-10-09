@@ -492,27 +492,33 @@ const LISTEN_BACKLOG: i32 = 511;
 /// the lookup's for a name.
 pub async fn bind_listener(
     at: &ListenAt,
-) -> Result<(tokio::net::TcpListener, std::net::SocketAddr), NodeSysError> {
+) -> Result<(tokio::net::TcpListener, std::net::SocketAddr), Box<NodeSysError>> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     let ip = match at.host.as_deref() {
         None => {
             let any6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), at.port);
             match bind_one(any6, at.ipv6_only) {
                 Ok(bound) => return Ok(bound),
-                Err(ListenFailure::Listen(e)) => return Err(listen_error(&e, "::", at.port)),
+                Err(ListenFailure::Listen(e)) => {
+                    return Err(Box::new(listen_error(&e, "::", at.port)));
+                }
                 Err(ListenFailure::Bind(e)) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                    return Err(listen_error(&e, "::", at.port));
+                    return Err(Box::new(listen_error(&e, "::", at.port)));
                 }
                 Err(ListenFailure::Bind(_)) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             }
         }
         Some(host) => match host.parse::<IpAddr>() {
             Ok(ip) => ip,
-            Err(_) => match crate::net_connect::resolve(host, None).await {
+            Err(_) => match crate::net_connect::resolve(host, None, 0).await {
                 Ok(addrs) => addrs[0],
-                Err(crate::net_connect::ConnectError::Resolve(e)) => return Err(*e),
+                Err(crate::net_connect::ConnectError::Resolve(e)) => return Err(e),
                 Err(other) => {
-                    return Err(listen_error(&std::io::Error::other(other), host, at.port));
+                    return Err(Box::new(listen_error(
+                        &std::io::Error::other(other),
+                        host,
+                        at.port,
+                    )));
                 }
             },
         },
@@ -520,7 +526,7 @@ pub async fn bind_listener(
     match bind_one(SocketAddr::new(ip, at.port), at.ipv6_only) {
         Ok(bound) => Ok(bound),
         Err(ListenFailure::Bind(e) | ListenFailure::Listen(e)) => {
-            Err(listen_error(&e, &ip.to_string(), at.port))
+            Err(Box::new(listen_error(&e, &ip.to_string(), at.port)))
         }
     }
 }
@@ -648,6 +654,7 @@ pub async fn tcp_connect_pinned(
         attempt_timeout,
         pin,
         local,
+        ..crate::net_connect::ConnectOptions::default()
     };
     let stream = match crate::net_connect::connect(&host, port, &opts).await {
         Ok(connected) => connected.stream,
@@ -1066,7 +1073,7 @@ pub async fn tcp_listen(
 ) -> OpOutcome {
     let (listener, local_addr) = match bind_listener(&at).await {
         Ok(bound) => bound,
-        Err(e) => return OpOutcome::sys(e),
+        Err(e) => return OpOutcome::sys(*e),
     };
 
     let server_id = ids.fetch_add(1, Ordering::Relaxed);

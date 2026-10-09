@@ -1887,6 +1887,7 @@ pub async fn tls_connect_pinned(
         attempt_timeout,
         pin,
         local,
+        ..crate::net_connect::ConnectOptions::default()
     };
     let tcp = match crate::net_connect::connect(&host, port, &opts).await {
         Ok(connected) => connected.stream,
@@ -1952,6 +1953,10 @@ fn no_protocols() -> OpOutcome {
 /// (one trailing dot stripped, as node's `unfqdn` does); `target` names the
 /// endpoint in a transport error.
 #[allow(clippy::too_many_arguments)]
+// clippy::result_large_err (Rust 1.98 and later): boxing the OpOutcome would
+// not shrink this Result, whose Ok carries the whole TLS client stream and is larger
+// than the error. `allow`, not `expect`: older clippy does not fire here.
+#[allow(clippy::result_large_err)]
 async fn client_handshake<IO>(
     io: IO,
     name: &str,

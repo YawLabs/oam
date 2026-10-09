@@ -2010,7 +2010,9 @@
   // `{ family: undefined, hints, all: true }` with hints 0 on win32, 1024 on
   // macOS 26 arm64 and 32 (0x20) on Debian 12 x64 (glibc 2.36). FreeBSD's
   // 1024 is its <netdb.h> value, unmeasured. The same values as oam's
-  // dns.ADDRCONFIG off Windows.
+  // dns.ADDRCONFIG off Windows (node_compat.js dnsHintFlags), and the hints
+  // oam's own resolver passes getaddrinfo for a fetch with no hook
+  // (net_connect::default_connect_hints).
   function lookupHints() {
     const platform = globalThis.process?.platform;
     if (platform === "win32") return 0;

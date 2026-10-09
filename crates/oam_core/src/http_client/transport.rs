@@ -23,10 +23,10 @@ use hyper::body::{Frame, Incoming};
 use hyper_util::client::proxy::matcher::Matcher;
 
 use super::connector::{
-    ConnInfo, ConnectTimedOut, HookPin, LookupGate, LookupGates, NeedsLookup, OamConnector, Shared,
+    ConnectTimedOut, HookPin, LookupGate, LookupGates, NeedsLookup, OamConnector, Shared,
     SuppliedConn, SuppliedConns, TlsSetupError, Via, authority_key,
 };
-use super::pool::{Dial, Pool, PoolError, PoolFail};
+use super::pool::{Dial, Pool, PoolFail};
 use super::prepare::host_for_connect;
 use super::{BoxError, ReqBody};
 use crate::OpOutcome;
@@ -325,22 +325,9 @@ impl HttpTransport {
             attempt_timeout: route.attempt_timeout,
             pin,
         };
-        match pool.request(request, close_requested, dial, follows).await {
-            Ok(response) => Ok(response),
-            Err(PoolFail {
-                error,
-                reused,
-                response_started,
-                conn,
-                returned,
-            }) => Err(SendError {
-                error,
-                reused,
-                response_started,
-                conn,
-                returned,
-            }),
-        }
+        pool.request(request, close_requested, dial, follows)
+            .await
+            .map_err(|fail| SendError { fail })
     }
 
     /// The `proxy-authorization` value this hop needs: only an http request
@@ -524,30 +511,26 @@ impl Route {
     }
 }
 
-/// A request that produced no response.
+/// A request that produced no response: the pool's [`PoolFail`], boxed --
+/// whether it went out on a connection an earlier request had already used
+/// (`reused`), whether some part of a response arrived on it after this
+/// request took it (`response_started`, see `ConnStats`), that connection
+/// for the socket a `SocketError` describes (`conn`; `None` when the
+/// request never had one), and the request, unsent, when it waits for a hook
+/// answer (`returned`, [`SendError::lookup_needed`]). Boxed so a
+/// `Result<_, SendError>` stays small (clippy's `result_large_err`).
 pub struct SendError {
-    error: PoolError,
-    /// It went out on a connection an earlier request had already used.
-    reused: bool,
-    /// Some part of a response arrived on that connection after this request
-    /// took it (see `ConnStats`).
-    response_started: bool,
-    /// That connection, for the socket a `SocketError` describes; `None`
-    /// when the request never had one.
-    conn: Option<ConnInfo>,
-    /// The request, unsent, when it waits for a hook answer
-    /// ([`SendError::lookup_needed`]).
-    returned: Option<http::Request<ReqBody>>,
+    fail: Box<PoolFail>,
 }
 
 impl std::fmt::Debug for SendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SendError")
-            .field("error", &self.error)
-            .field("reused", &self.reused)
-            .field("response_started", &self.response_started)
-            .field("conn", &self.conn)
-            .field("returned", &self.returned.is_some())
+            .field("error", &self.fail.error)
+            .field("reused", &self.fail.reused)
+            .field("response_started", &self.fail.response_started)
+            .field("conn", &self.fail.conn)
+            .field("returned", &self.fail.returned.is_some())
             .finish()
     }
 }
@@ -559,27 +542,27 @@ impl SendError {
     /// it back with [`SendError::take_request`], hand the route the hook's
     /// answer ([`Route::set_addrs`]) and send it again.
     pub fn lookup_needed(&self) -> Option<(String, String)> {
-        let needed = find_in_chain::<NeedsLookup>(&self.error)?;
+        let needed = find_in_chain::<NeedsLookup>(&self.fail.error)?;
         Some((needed.key.clone(), needed.host.clone()))
     }
 
     /// The unsent request a [`SendError::lookup_needed`] failure hands back
     /// (once).
     pub fn take_request(&mut self) -> Option<http::Request<ReqBody>> {
-        self.returned.take()
+        self.fail.returned.take()
     }
 
     /// The connect failure behind this error, if a connect failed: through
     /// hyper-util's error and, for a proxied https request, through the
     /// tunnel's -- a proxy that refused or did not resolve is named in it.
     pub fn connect_error(&self) -> Option<&ConnectError> {
-        find_in_chain::<ConnectError>(&self.error)
+        find_in_chain::<ConnectError>(&self.fail.error)
     }
 
     /// A response head hyper could not parse ([`super::bridge::head_parse_error`]),
     /// in undici's words for fetch and undici.request.
     pub fn head_parse_outcome(&self, undici: bool) -> Option<OpOutcome> {
-        let error = find_in_chain::<hyper::Error>(&self.error)?;
+        let error = find_in_chain::<hyper::Error>(&self.fail.error)?;
         super::bridge::head_parse_error(error, undici)
     }
 
@@ -602,20 +585,20 @@ impl SendError {
         // undici's connect timeout ran out (`Route::with_connect_timeout`):
         // its ConnectTimeoutError's code and message, which the JS side
         // turns into the class.
-        if let Some(timed_out) = find_in_chain::<ConnectTimedOut>(&self.error) {
+        if let Some(timed_out) = find_in_chain::<ConnectTimedOut>(&self.fail.error) {
             return OpOutcome::node_failed("UND_ERR_CONNECT_TIMEOUT", timed_out.to_string());
         }
         // A certificate refused in Node's terms (tls_config's
         // NodeNamedRefusals): its code and message, as tls.connect reports
         // them.
-        if let Some(refusal) = node_cert_refusal(&self.error)
+        if let Some(refusal) = node_cert_refusal(&self.fail.error)
             && let Some(code) = refusal.code
         {
             return OpOutcome::node_failed(code, refusal.message.clone());
         }
         // A version range with nothing to offer (node's live defaults leave
         // none): the code tls.connect reports for the same range.
-        if let Some(none) = find_in_chain::<NoProtocolsAvailable>(&self.error) {
+        if let Some(none) = find_in_chain::<NoProtocolsAvailable>(&self.fail.error) {
             return OpOutcome::node_failed("ERR_SSL_NO_PROTOCOLS_AVAILABLE", none.to_string());
         }
         // A fatal alert the server sent (#196). The two callers of this
@@ -633,8 +616,8 @@ impl SendError {
         // (its disconnect, which `fetch` keeps) with the same prefix and the
         // `received fatal alert` text a transport EOF lacks, so `https.get`
         // can still tell it from a close and make it `write EPROTO`.
-        if let Some(alert) = received_alert(&self.error) {
-            let handshake = find_in_chain::<HandshakeFailed>(&self.error).is_some();
+        if let Some(alert) = received_alert(&self.fail.error) {
+            let handshake = find_in_chain::<HandshakeFailed>(&self.fail.error).is_some();
             let detail = format!("received fatal alert: {alert:?}");
             let message = if handshake {
                 format!("handshake failed: {detail}")
@@ -650,12 +633,12 @@ impl SendError {
         // The transport closed before the handshake was done: node's
         // disconnect, with its own message (the JS side adds the options
         // the request dialled with).
-        if let Some(handshake) = find_in_chain::<HandshakeFailed>(&self.error)
+        if let Some(handshake) = find_in_chain::<HandshakeFailed>(&self.fail.error)
             && handshake.0.kind() == std::io::ErrorKind::UnexpectedEof
         {
             return crate::tls::disconnected_before_secure();
         }
-        if let Some(tls) = find_in_chain::<TlsSetupError>(&self.error) {
+        if let Some(tls) = find_in_chain::<TlsSetupError>(&self.fail.error) {
             return OpOutcome::Failed(tls.to_string());
         }
         // The server reset the connection (resetAndDestroy(), SO_LINGER 0)
@@ -663,7 +646,7 @@ impl SendError {
         // both of its clients report that error -- `read ECONNRESET`, with
         // errno, code and syscall -- http.request as the request's 'error',
         // fetch as the cause of its `fetch failed` (measured on v22.22.2).
-        if let Some(io) = find_in_chain::<std::io::Error>(&self.error)
+        if let Some(io) = find_in_chain::<std::io::Error>(&self.fail.error)
             && io.kind() == std::io::ErrorKind::ConnectionReset
         {
             return crate::tcp::errno_failure(io, "read");
@@ -672,7 +655,7 @@ impl SendError {
         // through it: undici's `SocketError` `other side closed`, describing
         // the socket (fetch's cause), and node's `socket hang up` for
         // http.request, which the JS makes of the same outcome.
-        if let Some(conn) = &self.conn
+        if let Some(conn) = &self.fail.conn
             && self.is_closed_by_peer()
         {
             return OpOutcome::socket_closed(conn.socket_facts());
@@ -685,7 +668,7 @@ impl SendError {
     /// session closed without its close_notify).
     fn is_closed_by_peer(&self) -> bool {
         self.is_incomplete_message()
-            || find_in_chain::<std::io::Error>(&self.error)
+            || find_in_chain::<std::io::Error>(&self.fail.error)
                 .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
     }
 
@@ -709,7 +692,7 @@ impl SendError {
     /// as `UND_ERR_SOCKET` when the FIN comes 0-5 ms after its 3xx
     /// (`docs/node-divergences.md` entry 38).
     pub fn is_incomplete_message(&self) -> bool {
-        find_in_chain::<hyper::Error>(&self.error).is_some_and(|e| e.is_incomplete_message())
+        find_in_chain::<hyper::Error>(&self.fail.error).is_some_and(|e| e.is_incomplete_message())
     }
 
     /// Some part of a response -- even a few bytes of a status line --
@@ -719,7 +702,7 @@ impl SendError {
     /// "closed before any part of a response is received". Also true when
     /// oam cannot tell.
     pub fn response_started(&self) -> bool {
-        self.response_started
+        self.fail.response_started
     }
 
     /// The request went out on a connection an earlier request had already
@@ -729,7 +712,7 @@ impl SendError {
     /// deliver it twice where node delivers it once (measured: a server that
     /// closes every connection unanswered sees a GET once from node).
     pub fn on_reused_connection(&self) -> bool {
-        self.reused
+        self.fail.reused
     }
 
     /// reqwest's retry classification (retry.rs:303-313): the server refused
@@ -737,7 +720,7 @@ impl SendError {
     /// connection down gracefully (GOAWAY with NO_ERROR). Either way the
     /// request was not processed and may be sent again (RFC 9113 s8.7).
     pub fn is_h2_retryable(&self) -> bool {
-        find_in_chain::<h2::Error>(&self.error).is_some_and(|e| {
+        find_in_chain::<h2::Error>(&self.fail.error).is_some_and(|e| {
             e.is_remote()
                 && ((e.is_go_away() && e.reason() == Some(h2::Reason::NO_ERROR))
                     || (e.is_reset() && e.reason() == Some(h2::Reason::REFUSED_STREAM)))
@@ -748,7 +731,7 @@ impl SendError {
 impl std::fmt::Display for SendError {
     /// The whole source chain, for tests and debugging.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&self.error);
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&self.fail.error);
         let mut first = true;
         while let Some(error) = current {
             if !first {
@@ -764,7 +747,7 @@ impl std::fmt::Display for SendError {
 
 impl std::error::Error for SendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
+        Some(&self.fail.error)
     }
 }
 
