@@ -46,18 +46,19 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "fs", "io-util",
 # rustls-no-provider + explicit ring: reqwest's default rustls provider is
 # aws-lc-rs, whose C build (aws-lc-sys) fails under MSVC on ARM64. ring
 # compiles clean on every tier-1 target (same choice Deno ships).
-# "gzip"/"deflate" (async-compression over flate2, through tower-http) were
-# chosen for the fetch op, which no longer uses reqwest, but they are not
-# dead for the installer: with them reqwest sends `accept-encoding:
-# gzip,deflate` on every tarball GET and decodes a response that carries
-# `content-encoding`, as npm's own client does (pinned by install.rs's
-# tarball_download_offers_gzip_and_decodes_an_encoded_response).
-# registry.npmjs.org answers identity either way; whether every mirror /
-# proxy registry does without the header is not something the build can
-# prove, so they stay until that is decided (#173). "stream"
-# (Body::wrap_stream / Response::bytes_stream) went with the fetch op: the
-# installer GETs with no body and reads the response whole with `bytes()`.
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "gzip", "deflate"] }
+# "stream" (Body::wrap_stream / Response::bytes_stream) went with the fetch
+# op (#265): the installer GETs with no body and reads the response whole
+# with `bytes()`. "gzip"/"deflate" (async-compression over flate2, through
+# tower-http) went in #173: they made reqwest send `accept-encoding:
+# gzip,deflate` on every tarball GET and decode a response that carries
+# `content-encoding`, but the registries oam resolves against serve
+# tarballs identity-encoded whatever the offer (registry.npmjs.org,
+# registry.yarnpkg.com, npmmirror's CDN -- measured for #173), so an
+# encoded response arriving unasked now reaches verify_integrity still
+# encoded and fails loudly there instead of being silently decoded
+# (pinned by install.rs's
+# tarball_download_sends_no_accept_encoding_and_passes_an_encoded_body_through).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: serde_json::Map keeps insertion order (IndexMap) instead of
