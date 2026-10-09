@@ -2145,14 +2145,15 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
     The multi-process run (100 processes of 50 fetches, 8 at a time = 5,000) also measures
     0 fails either side, where the issue saw 595 and 1,137 of 16,000 pre-#271.
   - **FIN at once, `GET` + `302`.** The hop may be resent, so it takes the pooled
-    connection. Gate off: the server received 50-59 of 1,000 hops twice (the first copy
+    connection. Gate off (the range spans the baseline, post-harness-fix and sweep-at-0
+    runs): the server received 7-59 of 1,000 hops twice (the first copy
     written into the closing connection and read unanswered, then oam's one resend; the
     issue measured 21-32), 0 fetches failed. Gate on: 0 twice, 0 failed -- node's numbers.
     Node measured 0 doubles throughout (it can still fail this row under load, its own
     `UND_ERR_SOCKET`, same mechanism as the 0-5 ms case below).
   - **No redirect: `200` + keep-alive, then FIN at once.** The next request takes the
-    pooled connection, as above. Gate off: 9-12 of 1,000 `POST`s fail (the issue saw
-    19-29) and 2-17 of 1,000 `GET`s are read twice. Gate on: 0 fails and 0 doubles across
+    pooled connection, as above. Gate off: 6-31 of 1,000 `POST`s fail (the issue saw
+    19-29) and 0-26 of 1,000 `GET`s are read twice. Gate on: 0 fails and 0 doubles across
     the measured runs. Node fails none.
   - **FIN 0-5 ms after the 3xx.** Here Node loses the race too, and fails with
     `UND_ERR_SOCKET`: 2,561 of 16,000 `GET`s and 2,587 `POST`s, where oam up to 0.17.1 failed

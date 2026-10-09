@@ -27,10 +27,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   checkout can swap a younger one in mid-wait), sleeps until it is 1 ms old -- which parks the
   send task so the connection's dispatcher reads the FIN -- and drops the entry if it closed
   during the wait, dialing fresh instead of writing into the close. Measured against node on
-  Windows arm64, release builds, 8 concurrent chains: `GET` + `302` hop double-deliveries
-  50-59 per 1,000 -> 0, `POST` after a 200-then-FIN 9-12 failures per 1,000 -> 0, `GET` after
-  the same 2-17 double-deliveries -> 0, with the `POST` + `307` rows (already fixed by #271)
-  unchanged at node's numbers. Pinned by e2e
+  Windows arm64, release builds, 8 concurrent chains, gate off vs on: `GET` + `302` hop
+  double-deliveries 7-59 per 1,000 -> 0, `POST` after a 200-then-FIN 6-31 failures ->
+  0, `GET` after the same 0-26 double-deliveries -> 0, with the `POST` + `307` rows (already
+  fixed by #271) unchanged at node's numbers. The cost: every checkout of a connection
+  parked within 1 ms waits out the window -- 1,000 sequential fetches went 0.5 s -> 2.7 s
+  (+2.2 ms per just-parked reuse), still under node's 4.3 s for the same run. Pinned by e2e
   `a_post_written_after_a_just_pooled_connections_fin_is_not_lost`; gate-off vs gate-on tables
   in `docs/node-divergences.md` entry 38.
 - **The N-API test addon no longer dereferences the pointer `napi_unwrap` hands back.**

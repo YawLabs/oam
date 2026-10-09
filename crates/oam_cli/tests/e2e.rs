@@ -12759,7 +12759,7 @@ process.exit(0);
 ///   chain takes the just-pooled connection, whose FIN is still in flight --
 ///   the row the freshness gate in `pool::reuse_h1` exists for. A POST is
 ///   never resent (RFC 9110 s9.2.2), so a lost race fails the fetch; with the
-///   gate measured 0 failures per 1,000 on release builds, without it 9-31.
+///   gate measured 0 failures per 1,000 on release builds, gate off 6-31.
 ///   Tolerated at 2 of 400: the FIN landing before the write is timing, not
 ///   a guarantee, and a loaded CI box shifts it.
 #[test]
@@ -12791,7 +12791,7 @@ const server = net.createServer((sock) => {
         // The issue's shape: 307 and FIN in one callback.
         sock.write(`HTTP/1.1 307 Temporary Redirect\r\nlocation: ${path.replace('/redir', '/final')}\r\ncontent-length: 0\r\n\r\n`);
         sock.end();
-      } else if (path.startsWith('/fin')) {
+      } else if (path.startsWith('/fin/')) {
         // 200 + keep-alive answered, then FIN at once.
         sock.write('HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok');
         sock.end();
@@ -12839,7 +12839,7 @@ const maxArrivals = (pred) => {
 console.log('redir_ok=' + redirOk);
 console.log('redir_max=' + maxArrivals((p) => p.startsWith('/redir') || p.startsWith('/final')));
 console.log('fin_ok=' + finOk);
-console.log('fin_max=' + maxArrivals((p) => p.startsWith('/fin')));
+console.log('fin_max=' + maxArrivals((p) => p.startsWith('/fin/')));
 process.exit(0);
 "#,
     );
@@ -12873,6 +12873,94 @@ process.exit(0);
         "only {ok}/400 POSTs on a just-pooled connection whose FIN followed got through \
          (tolerance 2 -- either the pool::reuse_h1 freshness wait lost the race to an \
          in-flight FIN, or a fetch's own POST lost to it before the checkout ran):\n{stdout}"
+    );
+}
+
+/// #155's headline row: a `GET` + `302` hop takes the pooled connection the
+/// 302 came on (the method may be resent), so without the freshness gate the
+/// hop can be written into the close the server's `end()` is sending --
+/// measured at 7-59 of 1,000 hops read twice, gate off, and 0 gate on (node
+/// reads every hop once). Each fetch's `/redir` request and its hop's
+/// `/final` path must each arrive exactly once. Hard equality: 0 doubles was
+/// every gate-on run, and the issue measured 0 from node throughout.
+#[test]
+fn a_get_hop_after_a_302_and_fin_is_read_exactly_once() {
+    let script = write_temp(
+        "get302_in_flight/main.mjs",
+        r#"import net from 'node:net';
+// Per-path arrival counts: a hop read into the close the server's end() is
+// sending, then resent from a fresh connection, counts twice on /final.
+const counts = new Map();
+const bump = (p) => counts.set(p, (counts.get(p) || 0) + 1);
+const server = net.createServer((sock) => {
+  let buf = '';
+  sock.on('data', (d) => {
+    buf += d.toString('latin1');
+    let i;
+    while ((i = buf.indexOf('\r\n\r\n')) !== -1) {
+      const head = buf.slice(0, i);
+      const path = head.split(' ')[1].split('?')[0];
+      buf = buf.slice(i + 4);
+      if (buf.length > 64 * 1024) { sock.destroy(); return; }
+      bump(path);
+      if (path.startsWith('/redir')) {
+        // The issue's shape: 302 and FIN in one callback; the hop rides the
+        // connection the 302 came on, so its FIN can still be in flight.
+        sock.write(`HTTP/1.1 302 Found\r\nlocation: ${path.replace('/redir', '/final')}\r\ncontent-length: 0\r\n\r\n`);
+        sock.end();
+      } else {
+        sock.write('HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok');
+      }
+    }
+  });
+  sock.on('error', () => {});
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+
+// 8 chains x 25 sequential GETs, each followed through its 302.
+let ok = 0;
+await Promise.all(Array.from({ length: 8 }, async (_, c) => {
+  for (let i = 0; i < 25; i++) {
+    try {
+      const r = await fetch(`${base}/redir/${c}_${i}?s=302`);
+      if (r.status === 200 && (await r.text()) === 'ok') ok++;
+    } catch {}
+  }
+}));
+// Let a late server-side arrival land before reading the counts.
+await new Promise((r) => setTimeout(r, 100));
+const maxArrivals = (pred) => {
+  let max = 0;
+  for (const [p, n] of counts) if (pred(p)) max = Math.max(max, n);
+  return max;
+};
+console.log('ok=' + ok);
+console.log('redir_max=' + maxArrivals((p) => p.startsWith('/redir/')));
+console.log('final_max=' + maxArrivals((p) => p.startsWith('/final/')));
+process.exit(0);
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let num = |key: &str| -> u64 {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{key} missing from:\n{stdout}"))
+    };
+    assert_eq!(num("ok="), 200, "every GET + 302 fetch succeeds:\n{stdout}");
+    assert_eq!(
+        num("redir_max="),
+        1,
+        "every 302 request arrived exactly once:\n{stdout}"
+    );
+    assert_eq!(
+        num("final_max="),
+        1,
+        "every GET + 302 hop arrived exactly once -- a count of 2 is the hop written \
+         into the closing connection and resent:\n{stdout}"
     );
 }
 
