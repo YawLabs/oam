@@ -109,7 +109,12 @@ for (const [kind, agent] of [["transport", () => new http.Agent()], ["agent sock
   await run(`${kind}: setTimeout callback, late head`, "/?head=700", (req, e) => req.setTimeout(150, () => e.push("callback")), a());
   await run(`${kind}: timeout option, late body, destroy`, "/?body=700", destroyOnTimeout, a({ timeout: 150 }));
   await run(`${kind}: timeout option, late body`, "/?body=700", recordTimeout, a({ timeout: 150 }));
-  await run(`${kind}: timeout option, prompt answer`, "/", recordTimeout, a({ timeout: 150 }));
+  // The prompt-answer row records only the response lifecycle: whether the
+  // 150 ms timer ALSO fires is the event loop's lateness under load, not a
+  // behaviour -- idle, BOTH runtimes print the bare lifecycle, and loaded,
+  // node itself printed the timeout first. The option stays set, so the row
+  // still pins that an armed timeout does not disturb a prompt answer.
+  await run(`${kind}: timeout option, prompt answer`, "/", () => {}, a({ timeout: 150 }));
   await run(`${kind}: body trickling faster than the timeout`, "/?trickle=8", recordTimeout, a({ timeout: 300 }));
   await run(`${kind}: setTimeout after the head`, "/?body=700", (req, e) => {
     recordTimeout(req, e);

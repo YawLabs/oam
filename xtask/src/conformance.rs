@@ -266,9 +266,9 @@ pub fn run(release: bool) -> Result<()> {
 
     enum Outcome {
         Timeout,
-        /// Both sides cut short by the case's own watchdog, with the sides
-        /// (`both` here; a one-sided cut is a Fail).
-        Watchdog(&'static str),
+        /// Both sides cut short by the case's own watchdog -- the only shape
+        /// `verdict` returns Watchdog for; a one-sided cut is a Fail.
+        Watchdog,
         Pass,
         /// The scorecard row, already shaped.
         Fail(Value),
@@ -343,7 +343,7 @@ pub fn run(release: bool) -> Result<()> {
                     println!(
                         "  WATCHDOG {name} (both runtimes cut it short; compared up to the shorter cut)"
                     );
-                    Outcome::Watchdog(fired.unwrap_or_default())
+                    Outcome::Watchdog
                 } else if verdict == Verdict::Pass {
                     println!("  pass {name}");
                     Outcome::Pass
@@ -420,9 +420,9 @@ pub fn run(release: bool) -> Result<()> {
                     diff_pass += 1;
                     diff_results.push(json!({ "case": name, "status": "pass" }));
                 }
-                Some(Outcome::Watchdog(sides)) => {
+                Some(Outcome::Watchdog) => {
                     diff_results
-                        .push(json!({ "case": name, "status": "watchdog", "sides": sides }));
+                        .push(json!({ "case": name, "status": "watchdog", "sides": "both" }));
                     diff_watchdog.push(name);
                 }
                 Some(Outcome::Timeout) => {
