@@ -45,7 +45,7 @@ DEALINGS IN THE SOFTWARE.
 
 ## Summary
 
-- Apache License 2.0 -- 264 crate(s)
+- Apache License 2.0 -- 261 crate(s)
 - MIT License -- 79 crate(s)
 - Unicode License v3 -- 27 crate(s)
 - BSD 3-Clause "New" or "Revised" License -- 6 crate(s)
@@ -5815,14 +5815,11 @@ Used by:
 
 - asn1-rs-derive 0.5.1
 - asn1-rs 0.6.2
-- async-compression 0.4.43
 - atomic-waker 1.1.2
 - base64 0.22.1
 - bitflags 1.3.2
 - bitflags 2.13.0
 - cfg-if 1.0.4
-- compression-codecs 0.4.38
-- compression-core 0.4.32
 - core-foundation-sys 0.8.7
 - core-foundation 0.10.1
 - core-foundation 0.9.4

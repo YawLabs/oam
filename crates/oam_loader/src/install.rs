@@ -1312,22 +1312,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // The installer's GET, against a one-connection loopback server: it
-    // offers gzip and deflate, as npm's own client does, and hands back the
-    // DECODED bytes of a response that carries `content-encoding: gzip` --
-    // so the integrity check and the extractor see the tarball the registry
-    // published, whatever a mirror or proxy did to it in transit. reqwest's
-    // "gzip" / "deflate" features provide both halves, and this is the
-    // behaviour that changes if they are dropped (#173): the header goes,
-    // and an encoded response would reach verify_integrity still encoded.
+    // The installer's GET, against a one-connection loopback server: since
+    // #173 it sends no `accept-encoding` (reqwest adds the header only with
+    // its "gzip" / "deflate" features, which are gone), and a response that
+    // carries `content-encoding: gzip` anyway is handed over STILL ENCODED --
+    // verify_integrity then fails with a hash mismatch instead of the body
+    // being silently decoded. The registries oam resolves against serve
+    // tarballs identity-encoded whatever the offer (registry.npmjs.org,
+    // registry.yarnpkg.com, npmmirror's CDN -- measured for #173), so this
+    // pins the loud-failure path for a mirror or proxy that encodes
+    // unasked, not the common path.
     #[test]
-    fn tarball_download_offers_gzip_and_decodes_an_encoded_response() {
+    fn tarball_download_sends_no_accept_encoding_and_passes_an_encoded_body_through() {
         use std::io::{Read, Write};
 
         let payload = b"the bytes the registry published".to_vec();
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         gz.write_all(&payload).unwrap();
         let encoded = gz.finish().unwrap();
+        let expect = encoded.clone();
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1360,8 +1363,8 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}/pkg/-/pkg-1.0.0.tgz");
         let got = download_with_retry(&rt, &client, &url, 0).unwrap();
         let head = server.join().unwrap();
-        assert!(head.contains("accept-encoding: gzip,deflate"), "{head}");
-        assert_eq!(got, payload);
+        assert!(!head.contains("accept-encoding"), "{head}");
+        assert_eq!(got, expect);
     }
 
     #[test]

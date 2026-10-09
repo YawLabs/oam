@@ -16,6 +16,22 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Changed
+
+- **`oam install` no longer offers or decodes transfer-level compression (#173).** reqwest's
+  `gzip` / `deflate` features left the workspace dependency: `fetch` and `http.request` have
+  decoded bodies themselves since #143, and the installer reads each tarball whole with
+  `bytes()`. The registries oam resolves against serve tarballs identity-encoded whatever the
+  offer (registry.npmjs.org, registry.yarnpkg.com, npmmirror's CDN -- measured), so the
+  `accept-encoding: gzip, deflate` header the features added never paid for itself. Without
+  them, a mirror or proxy that encodes a response unasked now fails loudly at the integrity
+  check (sha512 mismatch) instead of being silently decoded -- pinned by install.rs's
+  `tarball_download_sends_no_accept_encoding_and_passes_an_encoded_body_through`. The three
+  packages that existed only for those features (`async-compression`, `compression-codecs`,
+  `compression-core`) leave the dependency graph; `flate2` stays (node:zlib and tarball
+  extraction). `process.versions` and oam_engine/build.rs's single-version checks are
+  unchanged -- reqwest itself remains in the build for `oam install` and `oam self-update`.
+
 ### Fixed
 
 - **A request written onto a pooled connection whose server's FIN is in flight now waits it
