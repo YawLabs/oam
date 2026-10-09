@@ -22,9 +22,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   Every case binds its own ephemeral ports and carries no cross-case state, so pairs run
   `OAM_CONFORMANCE_JOBS`-at-a-time (default half the cores, 2-8); results are reassembled in
   sorted case order, so the scorecard and the gate's arithmetic do not depend on scheduling.
-  The full node-differential wall clock on windows-aarch64 drops from about 45 minutes serial
-  to about 10 at 4 workers (measured). A spawn failure is recorded per case and fails the run
-  after the pool drains, as the serial loop's error did.
+  Wall clock on windows-aarch64, full harness: 36 min from a cold build cache at 4 workers,
+  against 34 min (warm build) and 52 min (busy box) for the serial runs -- most of the
+  parallel run's time was the one-time cold build, and the case phase is now bounded by the
+  slowest worker instead of the sum of the cases. A spawn failure is recorded per case and
+  fails the run after the pool drains, as the serial loop's error did.
 - **The differential's V8 bytecode cache can be reused across runs** by pointing
   `OAM_CONFORMANCE_CACHE_DIR` at a fixed path; the default stays a per-run temporary directory.
   Cache blobs are content-addressed and written temp-file + rename, so concurrent cases sharing

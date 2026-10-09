@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "174a8db+wip",
+  "commit": "68bb11e",
   "oamVersion": "oam 0.18.0",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -20,7 +20,7 @@
     },
     "nodeDifferential": {
       "pass": 307,
-      "total": 307,
+      "total": 308,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -997,6 +997,11 @@
         {
           "case": "383-worker-env.mjs",
           "status": "pass"
+        },
+        {
+          "case": "384-harness-pins-a-deliberate-watchdog.mjs",
+          "status": "watchdog",
+          "sides": "both"
         },
         {
           "case": "39-util-fidelity.mjs",
