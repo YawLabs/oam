@@ -72,20 +72,20 @@ pub fn run(release: bool) -> Result<()> {
     let node_version = found_node_version.unwrap_or_else(|| "absent".to_string());
 
     let oam = ensure_oam_built(&repo, release)?;
-    // Each case gets its own cache subdirectory: a shared dir let one case's
-    // precompile seed another's, which is fine for the code cache (blobs are
-    // content-addressed and written temp-file + rename, so concurrent runs
-    // never tear) -- the per-case dirs exist so a case can be re-run in
-    // isolation with its cache intact. Default root is per-pid and thrown
-    // away; set OAM_CONFORMANCE_CACHE_DIR to a fixed path to reuse the
-    // warmed V8 bytecode cache across runs (the differential's per-case
-    // startup is most of the serial wall clock on a warm box).
+    // Each case gets its own cache subdirectory (created in run_case, named
+    // after the case), so a case can be re-run in isolation with its cache
+    // intact. Default root is per-pid and thrown away; set
+    // OAM_CONFORMANCE_CACHE_DIR to a fixed path to reuse the warmed V8
+    // bytecode cache across runs -- blobs are written temp-file + rename
+    // (code_cache.rs), so a reader never observes a torn file.
     let cache_root = std::env::var("OAM_CONFORMANCE_CACHE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             std::env::temp_dir().join(format!("oam-conformance-{}", std::process::id()))
         });
-    let cache = cache_root.join(format!("case-{}", std::process::id()));
+    // The three runner suites (wpt-url, surface, oam-modules) share one
+    // subdirectory -- they are single oam invocations, not one of N cases.
+    let cache = cache_root.join("runners");
     std::fs::create_dir_all(&cache)?;
 
     let oam_version = capture_version(&oam, &["--version"]);
@@ -295,6 +295,16 @@ pub fn run(release: bool) -> Result<()> {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            // One cache subdirectory per case, keyed by the file stem: with
+            // the root on OAM_CONFORMANCE_CACHE_DIR this is what survives
+            // the run and warms the next one. A stem is unique -- the cases
+            // live in one flat directory.
+            let cache = cache_root.join(
+                case.file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+            std::fs::create_dir_all(&cache)?;
             // Hermetic color env: Node honors FORCE_COLOR/COLORTERM even when
             // piped, so a terminal that force-enables color (Yaw sets
             // FORCE_COLOR=3) makes every differential line "diverge" on invisible

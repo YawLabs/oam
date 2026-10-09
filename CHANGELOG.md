@@ -29,8 +29,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   fails the run after the pool drains, as the serial loop's error did.
 - **The differential's V8 bytecode cache can be reused across runs** by pointing
   `OAM_CONFORMANCE_CACHE_DIR` at a fixed path; the default stays a per-run temporary directory.
-  Cache blobs are content-addressed and written temp-file + rename, so concurrent cases sharing
-  one warmed root never read a torn blob.
+  Each case's cache lives in its own subdirectory named after the case, and cache blobs are
+  written temp-file + rename, so a reader never observes a torn file.
 - **`oam install` no longer offers or decodes transfer-level compression (#173).** reqwest's
   `gzip` / `deflate` features left the workspace dependency: `fetch` and `http.request` have
   decoded bodies themselves since #143, and the installer reads each tarball whole with
