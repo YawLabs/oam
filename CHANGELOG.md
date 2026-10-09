@@ -18,6 +18,23 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **A request written onto a pooled connection whose server's FIN is in flight now waits it
+  out instead of racing it (#155).** A server that answers and FINs in one callback (a 3xx
+  then `end()`, a keep-alive timeout) leaves its FIN in flight while the next request is
+  written; a `POST` -- never resent (RFC 9110 s9.2.2) -- failed outright, and an idempotent
+  request's first copy was read into a close and sent again, so the server saw it twice where
+  node's server sees it once. `pool::reuse_h1` now pops the idle entry first (no concurrent
+  checkout can swap a younger one in mid-wait), sleeps until it is 1 ms old -- which parks the
+  send task so the connection's dispatcher reads the FIN -- and drops the entry if it closed
+  during the wait, dialing fresh instead of writing into the close. Measured against node on
+  Windows arm64, release builds, 8 concurrent chains, gate off vs on: `GET` + `302` hop
+  double-deliveries 7-59 per 1,000 -> 0, `POST` after a 200-then-FIN 6-31 failures ->
+  0, `GET` after the same 0-26 double-deliveries -> 0, with the `POST` + `307` rows (already
+  fixed by #271) unchanged at node's numbers. The cost: every checkout of a connection
+  parked within 1 ms waits out the window -- 1,000 sequential fetches went 0.5 s -> 2.7 s
+  (+2.2 ms per just-parked reuse), still under node's 4.3 s for the same run. Pinned by e2e
+  `a_post_written_after_a_just_pooled_connections_fin_is_not_lost`; gate-off vs gate-on tables
+  in `docs/node-divergences.md` entry 38.
 - **The N-API test addon no longer dereferences the pointer `napi_unwrap` hands back.**
   `counterGet` / `counterInc` in `crates/oam_napi_test_addon` cast that untyped pointer to
   `*mut i64` and read or wrote through it, so an object wrapped by another addon (or a pointer

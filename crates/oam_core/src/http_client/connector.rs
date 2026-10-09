@@ -93,7 +93,9 @@ pub(crate) struct ConnCounters {
 }
 
 impl ConnStats {
-    fn new() -> ConnStats {
+    /// `pub(crate)`: the pool's unit tests build idle entries around it to
+    /// exercise checkout paths without a socket.
+    pub(crate) fn new() -> ConnStats {
         ConnStats {
             counters: Arc::new(ConnCounters::default()),
             read_at_checkout: None,

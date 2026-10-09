@@ -701,10 +701,13 @@ impl SendError {
     /// Why oam hits it where node does not: a server that advertises
     /// keep-alive and then FINs (the idle-timeout shape) leaves a pooled
     /// connection that the next request can be written onto before the FIN
-    /// arrives, because oam's redirect loop stays in Rust with no event-loop
-    /// tick between the 3xx and the hop. A FIN the kernel already holds is
-    /// caught before the write (`connector::EagerTcp`); one still in flight
-    /// is not, in oam or in node.
+    /// arrives. A FIN the kernel already holds is caught before the write
+    /// (`connector::EagerTcp`), and a checkout now waits out the freshness
+    /// gate first (`pool::reuse_h1`, #155) so a FIN landing during the wait
+    /// closes the entry instead of the request; a FIN still in flight after
+    /// that window is not caught, in oam or in node -- node's own race shows
+    /// as `UND_ERR_SOCKET` when the FIN comes 0-5 ms after its 3xx
+    /// (`docs/node-divergences.md` entry 38).
     pub fn is_incomplete_message(&self) -> bool {
         find_in_chain::<hyper::Error>(&self.error).is_some_and(|e| e.is_incomplete_message())
     }

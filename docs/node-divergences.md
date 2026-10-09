@@ -2121,33 +2121,40 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   It does not decode the body either, and adds no `accept`, `user-agent` or
   `accept-encoding` to the request, as Node's does not (case 192); up to 0.17.1 it did
   both, as `fetch` does (entry 32).
-- **A hop that lands on a pooled connection the server has just closed.** oam's redirect loop
-  has no event-loop tick between the 3xx and the hop, so against a server that sends the 3xx
-  with keep-alive and then FINs, the hop can be written before the server's FIN arrives.
-  Node's hop goes out later, after its event loop has read the FIN. A FIN that has already
-  reached the kernel is read before the write in oam too, and the hop goes to another
-  connection unsent. A hop that could not be sent again -- one whose method is not
-  idempotent, a `POST` that a `307` or `308` sends on, a `PATCH` that a `302` does -- never
-  goes out on the connection its 3xx came on, and that connection is not pooled for
-  anything else either (#155): the hop dials a connection of its own, a cost on that path
-  alone. A connection whose response says `Connection: close` is never reused, as before.
-  Measured on Windows arm64 against a node server, one process with 8 concurrent chains of
-  125 fetches, release builds:
-  - **FIN at once, `POST` + `307`.** Node: none of 1,000 fails. oam up to 0.17.1: 29 of 1,000
-    failed (a `POST` is never sent again -- oam did write it and cannot know the server
-    ignored it -- so the fetch fails, its cause undici's `SocketError`, `other side
-    closed`); the issue's earlier measurement, 320 processes of 50 fetches 8 at a time, saw
-    595 and 1,137 of 16,000. oam now: none of 1,000 fails, and the server reads every hop
-    once (e2e guard `a_post_never_goes_out_on_the_connection_a_307_came_on`).
-  - **FIN at once, `GET` + `302`.** The hop may be sent again, so it still takes the pooled
-    connection, and what differs remains: no fetch fails in Node, and in oam the server
-    receives 21-32 of 1,000 hops twice -- the first copy written into the closing connection
-    and read unanswered, then oam's one resend -- and 1-2 of 1,000 fetches fail, the resend
-    meeting another closing connection. Node's server receives every hop once.
+- **A request written onto a pooled connection whose server FIN is in flight.** A server that
+  answers and FINs in one callback (a 3xx then `end()`, a keep-alive timeout) leaves its FIN
+  in flight while the next request is written. Node's request goes out later, after its event
+  loop has read the FIN. oam's redirect loop still has no event-loop tick between the 3xx and
+  the hop, and a checkout takes the connection whose response just completed; #155's fix is
+  therefore in the pool: `reuse_h1` pops the entry FIRST (so no concurrent checkout can swap
+  a younger one in mid-wait), sleeps until it is `FRESH_GATE` -- 1 ms, tokio's timer rounding
+  -- re-reads the sender, and drops the entry if its dispatcher read the FIN during the wait,
+  dialing fresh instead of writing into the close. It is a timing heuristic, not a guarantee:
+  a FIN still in flight after 1 ms can be raced, and the e2e guard
+  `a_post_written_after_a_just_pooled_connections_fin_is_not_lost` tolerates 2 losses per
+  400. A hop that could not be sent again -- one whose method is not idempotent, a `POST`
+  that a `307` or `308` sends on -- never goes out on the connection its 3xx came on and does
+  not pool it either (#271): the hop dials a connection of its own, a cost on that path alone.
+  A connection whose response says `Connection: close` is never reused, as before.
+  Measured on Windows arm64 against a node server, release builds, 8 concurrent chains of
+  125 fetches per process (oam gate off vs on; node for comparison):
+  - **FIN at once, `POST` + `307`.** The hop dials its own connection (#271), so the gate
+    changes nothing: 0 of 1,000 fails before or after, and the server reads every request
+    once (issue: 29 of 1,000 failed up to 0.17.1; e2e guards
+    `a_post_never_goes_out_on_the_connection_a_307_came_on` and the pinned #155 test).
+    The multi-process run (100 processes of 50 fetches, 8 at a time = 5,000) also measures
+    0 fails either side, where the issue saw 595 and 1,137 of 16,000 pre-#271.
+  - **FIN at once, `GET` + `302`.** The hop may be resent, so it takes the pooled
+    connection. Gate off (the range spans the baseline, post-harness-fix and sweep-at-0
+    runs): the server received 7-59 of 1,000 hops twice (the first copy
+    written into the closing connection and read unanswered, then oam's one resend; the
+    issue measured 21-32), 0 fetches failed. Gate on: 0 twice, 0 failed -- node's numbers.
+    Node measured 0 doubles throughout (it can still fail this row under load, its own
+    `UND_ERR_SOCKET`, same mechanism as the 0-5 ms case below).
   - **No redirect: `200` + keep-alive, then FIN at once.** The next request takes the
-    pooled connection, as above: 19-29 of 1,000 `POST`s fail in oam and 2-3 `GET`s, where
-    Node fails none, and the server reads 36-37 of 1,000 `GET`s twice. With one request at a
-    time per process (100 processes of 50, 8 at a time), 6-9 of 5,000 `POST`s fail.
+    pooled connection, as above. Gate off: 6-31 of 1,000 `POST`s fail (the issue saw
+    19-29) and 0-26 of 1,000 `GET`s are read twice. Gate on: 0 fails and 0 doubles across
+    the measured runs. Node fails none.
   - **FIN 0-5 ms after the 3xx.** Here Node loses the race too, and fails with
     `UND_ERR_SOCKET`: 2,561 of 16,000 `GET`s and 2,587 `POST`s, where oam up to 0.17.1 failed
     no `GET` (its one resend) and 1,948 `POST`s. Not measured since the `POST` hop dials its
