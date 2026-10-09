@@ -34,6 +34,17 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **The code cache's once-a-day sweep now actually runs once a day on Windows.** The sweep
+  stamped `<cache>/bytecode/.sweep` by rewriting it as an empty file, and Rust's std emulates
+  create+truncate on Windows as `OPEN_ALWAYS` plus a manual truncate, so rewriting a 0-byte
+  file with 0 bytes never advanced its LastWriteTime. The stamp froze at its first write and
+  every oam process that loaded a module started a background walk of the whole cache --
+  measured on a Windows arm64 host with an 11,096-blob / 416 MB cache: a short hook script
+  cost 234 ms CPU instead of ~47 ms, and a 3-second script 1,547 ms instead of ~47 ms. The
+  stamp's mtime is now set explicitly after the write. Pinned by code_cache.rs's
+  `sweep_advances_an_existing_empty_stamp`. POSIX `O_TRUNC` already marks the mtime for
+  update, so Linux and macOS were not expected to be affected.
+
 - **A request written onto a pooled connection whose server's FIN is in flight now waits it
   out instead of racing it (#155).** A server that answers and FINs in one callback (a 3xx
   then `end()`, a keep-alive timeout) leaves its FIN in flight while the next request is
