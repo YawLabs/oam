@@ -159,12 +159,6 @@ for (const watch of [false, true]) {
   await probe("https 127.0.0.1, rejectUnauthorized:false", https, { host: "127.0.0.1", port: T4, rejectUnauthorized: false }, watch, true);
 }
 await probe("https localhost, verified", https, { host: "localhost", port: T4, ca: CA }, true, true);
-// Host spellings the URL parser would rewrite go over net.connect with the
-// string as given: the platform's resolver decides (and the socket reports
-// what it dialled), or it fails, as in node.
-for (const host of ["LocalHost", "0177.0.0.1", "127.000.000.001", "127.0.0.1.", "%31%32%37.0.0.1"]) {
-  await probe(`http host ${JSON.stringify(host)}`, http, { host, port: P4 }, false);
-}
 
 // The facts are there at 'response' even when the server closes the
 // connection straight after its answer: node's parser emits 'response' as it
@@ -204,6 +198,16 @@ for (let i = 0; i < ROUNDS; i++) {
   }
 }
 console.log(`closing server: socket up at 'response' ${alive}/${2 * ROUNDS}, closed after ${closedAfter}/${2 * ROUNDS}`);
+
+// Host spellings the URL parser would rewrite go over net.connect with the
+// string as given: the platform's resolver decides (and the socket reports
+// what it dialled), or it fails, as in node. These lookups are the case's
+// slowest part and the one whose cost varies most between hosts, so they sit
+// last: on a slow host the watchdog cuts the cheapest coverage, not the
+// regression the case was written for (#211).
+for (const host of ["LocalHost", "0177.0.0.1", "127.000.000.001", "127.0.0.1.", "%31%32%37.0.0.1"]) {
+  await probe(`http host ${JSON.stringify(host)}`, http, { host, port: P4 }, false);
+}
 
 srv4.close();
 srv6.close();
