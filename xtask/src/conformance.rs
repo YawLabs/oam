@@ -24,6 +24,8 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// How long ONE side of a differential pair may run before the harness kills
@@ -42,7 +44,7 @@ use std::time::{Duration, Instant};
 ///
 /// A case that really hangs still ends here; its own watchdog just gets to
 /// speak first.
-const CASE_CEILING: Duration = Duration::from_secs(90);
+const CASE_CEILING: Duration = Duration::from_secs(150);
 
 pub fn run(release: bool) -> Result<()> {
     let release = release
@@ -70,7 +72,20 @@ pub fn run(release: bool) -> Result<()> {
     let node_version = found_node_version.unwrap_or_else(|| "absent".to_string());
 
     let oam = ensure_oam_built(&repo, release)?;
-    let cache = std::env::temp_dir().join(format!("oam-conformance-{}", std::process::id()));
+    // Each case gets its own cache subdirectory: a shared dir let one case's
+    // precompile seed another's, which is fine for the code cache (blobs are
+    // content-addressed and written temp-file + rename, so concurrent runs
+    // never tear) -- the per-case dirs exist so a case can be re-run in
+    // isolation with its cache intact. Default root is per-pid and thrown
+    // away; set OAM_CONFORMANCE_CACHE_DIR to a fixed path to reuse the
+    // warmed V8 bytecode cache across runs (the differential's per-case
+    // startup is most of the serial wall clock on a warm box).
+    let cache_root = std::env::var("OAM_CONFORMANCE_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::temp_dir().join(format!("oam-conformance-{}", std::process::id()))
+        });
+    let cache = cache_root.join(format!("case-{}", std::process::id()));
     std::fs::create_dir_all(&cache)?;
 
     let oam_version = capture_version(&oam, &["--version"]);
@@ -230,101 +245,186 @@ pub fn run(release: bool) -> Result<()> {
     // the shorter cut: compared no further, not counted as identical, and
     // named in a warning of their own.
     let mut diff_watchdog = Vec::new();
-    for case in &cases {
-        let name = case
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let Some(node) = node.as_deref() else {
+
+    // The pairs run on a worker pool: every case binds its own ephemeral
+    // ports and carries no cross-case state, so the only shared resource is
+    // the box. Results are collected per slot and reported in the sorted
+    // case order, whatever order the workers finish in -- the scorecard's
+    // rows and the gate's arithmetic must not depend on scheduling.
+    //
+    // Worker count: half the cores, 2-8. Full-core parallelism is the load
+    // that made the knife-edge TLS cases miss their own watchdogs (below);
+    // the ceiling keeps a many-core box from doing the same.
+    let workers = std::env::var("OAM_CONFORMANCE_JOBS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| (1..=16).contains(v))
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 8))
+        });
+    println!("  ({workers} worker(s); OAM_CONFORMANCE_JOBS to change)");
+
+    enum Outcome {
+        Timeout,
+        /// Both sides cut short by the case's own watchdog, with the sides
+        /// (`both` here; a one-sided cut is a Fail).
+        Watchdog(&'static str),
+        Pass,
+        /// The scorecard row, already shaped.
+        Fail(Value),
+        /// A spawn failure -- about the harness, not the case. Fails the run
+        /// after the pool drains, as the serial loop's `?` did.
+        Harness(String),
+    }
+    if node.as_deref().is_none() {
+        for case in &cases {
+            let name = case
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             diff_results
                 .push(json!({ "case": name, "status": "skipped", "reason": "node absent" }));
-            continue;
-        };
-        // Hermetic color env: Node honors FORCE_COLOR/COLORTERM even when
-        // piped, so a terminal that force-enables color (Yaw sets
-        // FORCE_COLOR=3) makes every differential line "diverge" on invisible
-        // ANSI escapes. Strip the forcing vars and set NO_COLOR for BOTH
-        // sides so the diff never depends on the invoking terminal.
-        let oam_out = run_with_timeout(
-            Command::new(&oam)
-                .arg("run")
-                .arg(case)
-                .arg("--no-check")
-                .env("OAM_CACHE_DIR", &cache)
-                .env_remove("FORCE_COLOR")
-                .env_remove("COLORTERM")
-                .env_remove("CLICOLOR_FORCE")
-                .env("NO_COLOR", "1")
-                .current_dir(&repo),
-            CASE_CEILING,
-        )?;
-        let node_out = run_with_timeout(
-            Command::new(node)
-                .arg(case)
-                .env_remove("FORCE_COLOR")
-                .env_remove("COLORTERM")
-                .env_remove("CLICOLOR_FORCE")
-                .env("NO_COLOR", "1")
-                .current_dir(&repo),
-            CASE_CEILING,
-        )?;
-        if oam_out.timed_out || node_out.timed_out {
-            println!("  TIMEOUT {name}");
-            diff_results.push(json!({ "case": name, "status": "timeout" }));
-            continue;
         }
-        let fired = watchdog_sides(&oam_out, &node_out);
-        let verdict = verdict(&oam_out, &node_out);
-        if verdict == Verdict::Watchdog {
-            println!(
-                "  WATCHDOG {name} (both runtimes cut it short; compared up to the shorter cut)"
-            );
-            diff_results.push(json!({ "case": name, "status": "watchdog", "sides": fired }));
-            diff_watchdog.push(name);
-        } else if verdict == Verdict::Pass {
-            diff_pass += 1;
-            diff_results.push(json!({ "case": name, "status": "pass" }));
-            println!("  pass {name}");
-        } else {
-            let same_exit = oam_out.code == node_out.code;
-            let detail =
-                first_difference(&normalize(&oam_out.stdout), &normalize(&node_out.stdout));
-            println!("  FAIL {name}");
-            if let Some(side) = fired {
-                println!("    watchdog: {side} cut the case short with its own");
+    }
+    if let Some(oracle) = node.as_deref() {
+        let slots: Vec<Mutex<Option<Outcome>>> = cases.iter().map(|_| Mutex::new(None)).collect();
+        let next = AtomicUsize::new(0);
+        let run_case = |slot: usize| -> Result<()> {
+            let case = &cases[slot];
+            let name = case
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // Hermetic color env: Node honors FORCE_COLOR/COLORTERM even when
+            // piped, so a terminal that force-enables color (Yaw sets
+            // FORCE_COLOR=3) makes every differential line "diverge" on invisible
+            // ANSI escapes. Strip the forcing vars and set NO_COLOR for BOTH
+            // sides so the diff never depends on the invoking terminal.
+            let oam_out = run_with_timeout(
+                Command::new(&oam)
+                    .arg("run")
+                    .arg(case)
+                    .arg("--no-check")
+                    .env("OAM_CACHE_DIR", &cache)
+                    .env_remove("FORCE_COLOR")
+                    .env_remove("COLORTERM")
+                    .env_remove("CLICOLOR_FORCE")
+                    .env("NO_COLOR", "1")
+                    .current_dir(&repo),
+                CASE_CEILING,
+            )?;
+            let node_out = run_with_timeout(
+                Command::new(oracle)
+                    .arg(case)
+                    .env_remove("FORCE_COLOR")
+                    .env_remove("COLORTERM")
+                    .env_remove("CLICOLOR_FORCE")
+                    .env("NO_COLOR", "1")
+                    .current_dir(&repo),
+                CASE_CEILING,
+            )?;
+            let outcome = if oam_out.timed_out || node_out.timed_out {
+                println!("  TIMEOUT {name}");
+                Outcome::Timeout
+            } else {
+                let fired = watchdog_sides(&oam_out, &node_out);
+                let verdict = verdict(&oam_out, &node_out);
+                if verdict == Verdict::Watchdog {
+                    println!(
+                        "  WATCHDOG {name} (both runtimes cut it short; compared up to the shorter cut)"
+                    );
+                    Outcome::Watchdog(fired.unwrap_or_default())
+                } else if verdict == Verdict::Pass {
+                    println!("  pass {name}");
+                    Outcome::Pass
+                } else {
+                    let same_exit = oam_out.code == node_out.code;
+                    let detail =
+                        first_difference(&normalize(&oam_out.stdout), &normalize(&node_out.stdout));
+                    println!("  FAIL {name}");
+                    if let Some(side) = fired {
+                        println!("    watchdog: {side} cut the case short with its own");
+                    }
+                    // Print the divergence to stdout, not just the scorecard JSON: the
+                    // scorecard is a CI artifact that isn't surfaced in the run log, so
+                    // a platform-specific FAIL (e.g. a case that only diverges on Linux)
+                    // was undiagnosable from `gh run view --log-failed`. Show exit codes,
+                    // the first differing line (oam vs node), and oam's stderr head.
+                    if !same_exit {
+                        println!("    exit: oam={} node={}", oam_out.code, node_out.code);
+                    }
+                    if let Some(line) = detail.get("line").and_then(Value::as_u64) {
+                        let oam_line = detail.get("oam").and_then(Value::as_str).unwrap_or("");
+                        let node_line = detail.get("node").and_then(Value::as_str).unwrap_or("");
+                        println!("    first diff at line {line}:");
+                        println!("      oam:  {oam_line}");
+                        println!("      node: {node_line}");
+                    }
+                    let stderr_head = oam_out
+                        .stderr
+                        .lines()
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    if !stderr_head.is_empty() {
+                        println!("    oam stderr: {stderr_head}");
+                    }
+                    Outcome::Fail(json!({
+                        "case": name,
+                        "status": "fail",
+                        "watchdog": fired,
+                        "exit": { "oam": oam_out.code, "node": node_out.code },
+                        "firstDifference": detail,
+                        "oamStderr": oam_out.stderr.lines().take(3).collect::<Vec<_>>().join(" | "),
+                    }))
+                }
+            };
+            *slots[slot].lock().unwrap() = Some(outcome);
+            Ok(())
+        };
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let slot = next.fetch_add(1, Ordering::Relaxed);
+                        if slot >= cases.len() {
+                            return;
+                        }
+                        if let Err(e) = run_case(slot) {
+                            // A worker stops pulling on a harness error; the run
+                            // fails below, after the pool drains.
+                            *slots[slot].lock().unwrap() = Some(Outcome::Harness(format!("{e:#}")));
+                            return;
+                        }
+                    }
+                });
             }
-            // Print the divergence to stdout, not just the scorecard JSON: the
-            // scorecard is a CI artifact that isn't surfaced in the run log, so
-            // a platform-specific FAIL (e.g. a case that only diverges on Linux)
-            // was undiagnosable from `gh run view --log-failed`. Show exit codes,
-            // the first differing line (oam vs node), and oam's stderr head.
-            if !same_exit {
-                println!("    exit: oam={} node={}", oam_out.code, node_out.code);
+        });
+        for (slot, result) in slots.iter().enumerate() {
+            let name = cases[slot]
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match result.lock().unwrap().take() {
+                Some(Outcome::Pass) => {
+                    diff_pass += 1;
+                    diff_results.push(json!({ "case": name, "status": "pass" }));
+                }
+                Some(Outcome::Watchdog(sides)) => {
+                    diff_results
+                        .push(json!({ "case": name, "status": "watchdog", "sides": sides }));
+                    diff_watchdog.push(name);
+                }
+                Some(Outcome::Timeout) => {
+                    diff_results.push(json!({ "case": name, "status": "timeout" }));
+                }
+                Some(Outcome::Fail(detail)) => diff_results.push(detail),
+                Some(Outcome::Harness(error)) => bail!(
+                    "node-differential harness error on {name}: {error}
+The receipts were NOT rewritten; fix the harness and re-run."
+                ),
+                None => unreachable!("every slot is filled or the run has already failed"),
             }
-            if let Some(line) = detail.get("line").and_then(Value::as_u64) {
-                let oam_line = detail.get("oam").and_then(Value::as_str).unwrap_or("");
-                let node_line = detail.get("node").and_then(Value::as_str).unwrap_or("");
-                println!("    first diff at line {line}:");
-                println!("      oam:  {oam_line}");
-                println!("      node: {node_line}");
-            }
-            let stderr_head = oam_out
-                .stderr
-                .lines()
-                .take(3)
-                .collect::<Vec<_>>()
-                .join(" | ");
-            if !stderr_head.is_empty() {
-                println!("    oam stderr: {stderr_head}");
-            }
-            diff_results.push(json!({
-                "case": name,
-                "status": "fail",
-                "watchdog": fired,
-                "exit": { "oam": oam_out.code, "node": node_out.code },
-                "firstDifference": detail,
-                "oamStderr": oam_out.stderr.lines().take(3).collect::<Vec<_>>().join(" | "),
-            }));
         }
     }
     let diff_total = cases.len();

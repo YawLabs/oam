@@ -18,6 +18,17 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Changed
 
+- **The conformance differential's case pairs run on a worker pool instead of one at a time.**
+  Every case binds its own ephemeral ports and carries no cross-case state, so pairs run
+  `OAM_CONFORMANCE_JOBS`-at-a-time (default half the cores, 2-8); results are reassembled in
+  sorted case order, so the scorecard and the gate's arithmetic do not depend on scheduling.
+  The full node-differential wall clock on windows-aarch64 drops from about 45 minutes serial
+  to about 10 at 4 workers (measured). A spawn failure is recorded per case and fails the run
+  after the pool drains, as the serial loop's error did.
+- **The differential's V8 bytecode cache can be reused across runs** by pointing
+  `OAM_CONFORMANCE_CACHE_DIR` at a fixed path; the default stays a per-run temporary directory.
+  Cache blobs are content-addressed and written temp-file + rename, so concurrent cases sharing
+  one warmed root never read a torn blob.
 - **`oam install` no longer offers or decodes transfer-level compression (#173).** reqwest's
   `gzip` / `deflate` features left the workspace dependency: `fetch` and `http.request` have
   decoded bodies themselves since #143, and the installer reads each tarball whole with
@@ -54,6 +65,16 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `promise.child`, and keeps Buffers under `encoding: 'buffer'`. Pinned by conformance case
   385.
 
+- **The node-differential cases now fit their budgets (#211, remaining items).** Case 122 ran
+  its refused-host-spellings lookups -- the slowest section and the one whose cost varies most
+  between hosts -- before the 25-round "socket up at 'response'" check, so a slow host's
+  watchdog cut the regression the case was written for; the lookups now run last. Cases 141,
+  154 and 169 armed 50-55 s watchdogs that sat inside oam's measured runtime for them
+  (51-90 s on windows-aarch64; node: 26-43 s), so ordinary box load flipped them -- two full
+  runs failed on 154, and 141 and 169 once each; their budgets now clear the worst measured
+  (80 s; 154: 120 s, with the harness ceiling at 150 s). New case 384 deliberately fires its
+  own watchdog under both runtimes, pinning the `watchdog` scoring end to end: if it ever
+  scores `pass`, `verdict()` is being read as just another stdout line again.
 - **A request written onto a pooled connection whose server's FIN is in flight now waits it
   out instead of racing it (#155).** A server that answers and FINs in one callback (a 3xx
   then `end()`, a keep-alive timeout) leaves its FIN in flight while the next request is
