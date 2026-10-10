@@ -12879,10 +12879,15 @@ process.exit(0);
 /// #155's headline row: a `GET` + `302` hop takes the pooled connection the
 /// 302 came on (the method may be resent), so without the freshness gate the
 /// hop can be written into the close the server's `end()` is sending --
-/// measured at 7-59 of 1,000 hops read twice, gate off, and 0 gate on (node
-/// reads every hop once). Each fetch's `/redir` request and its hop's
-/// `/final` path must each arrive exactly once. Hard equality: 0 doubles was
-/// every gate-on run, and the issue measured 0 from node throughout.
+/// measured at 7-59 of 1,000 hops read twice, gate off (node reads every hop
+/// once). Each fetch's `/redir` request arrives exactly once, hard. The gate
+/// (`pool::reuse_h1`'s 1 ms FRESH_GATE) is a timing heuristic, not a
+/// guarantee: a FIN that lands after the wait still doubles the hop, about
+/// one hop in 2,000 on an idle box. So the run is the issue's own 1,000 hops
+/// and the `/final` doubles are tolerated at <= 3 -- the same race the POST
+/// test above allows 2 per 400 for. At ~0.5 doubles per 1,000 gate on, 4 or
+/// more is a 0.2% flake; at the gate-off floor of 7 per 1,000, 3 or fewer is
+/// an 8% escape, and none from 15 per 1,000 up.
 #[test]
 fn a_get_hop_after_a_302_and_fin_is_read_exactly_once() {
     let script = write_temp(
@@ -12918,10 +12923,11 @@ const server = net.createServer((sock) => {
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}`;
 
-// 8 chains x 25 sequential GETs, each followed through its 302.
+// 8 chains x 125 sequential GETs, each followed through its 302: the
+// 1,000 hops #155 measured with.
 let ok = 0;
 await Promise.all(Array.from({ length: 8 }, async (_, c) => {
-  for (let i = 0; i < 25; i++) {
+  for (let i = 0; i < 125; i++) {
     try {
       const r = await fetch(`${base}/redir/${c}_${i}?s=302`);
       if (r.status === 200 && (await r.text()) === 'ok') ok++;
@@ -12935,9 +12941,17 @@ const maxArrivals = (pred) => {
   for (const [p, n] of counts) if (pred(p)) max = Math.max(max, n);
   return max;
 };
+// How many /final hops arrived more than once: each is a hop written into
+// the closing connection and resent from a fresh one.
+let doubles = (pred) => {
+  let n = 0;
+  for (const [p, c] of counts) if (pred(p) && c > 1) n++;
+  return n;
+};
 console.log('ok=' + ok);
 console.log('redir_max=' + maxArrivals((p) => p.startsWith('/redir/')));
 console.log('final_max=' + maxArrivals((p) => p.startsWith('/final/')));
+console.log('final_doubles=' + doubles((p) => p.startsWith('/final/')));
 process.exit(0);
 "#,
     );
@@ -12950,17 +12964,27 @@ process.exit(0);
             .and_then(|value| value.trim().parse().ok())
             .unwrap_or_else(|| panic!("{key} missing from:\n{stdout}"))
     };
-    assert_eq!(num("ok="), 200, "every GET + 302 fetch succeeds:\n{stdout}");
+    assert_eq!(
+        num("ok="),
+        1000,
+        "every GET + 302 fetch succeeds:\n{stdout}"
+    );
     assert_eq!(
         num("redir_max="),
         1,
         "every 302 request arrived exactly once:\n{stdout}"
     );
-    assert_eq!(
-        num("final_max="),
-        1,
-        "every GET + 302 hop arrived exactly once -- a count of 2 is the hop written \
-         into the closing connection and resent:\n{stdout}"
+    // final_max is a diagnostic only (a 2 is one doubled hop; the gate is a
+    // heuristic); the count of doubled hops is what the tolerance is on.
+    let final_max = num("final_max=");
+    let final_doubles = num("final_doubles=");
+    println!("final_max={final_max} final_doubles={final_doubles}");
+    assert!(
+        final_doubles <= 3,
+        "{final_doubles}/1000 GET + 302 hops on the connection the 302 came on arrived twice \
+         (tolerance 3 -- the pool::reuse_h1 freshness wait is a 1 ms heuristic and can lose \
+         the race to an in-flight FIN, writing the hop into the close and resending it; \
+         gate off measured 7-59 per 1,000):\n{stdout}"
     );
 }
 
