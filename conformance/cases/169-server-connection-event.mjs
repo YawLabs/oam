@@ -37,7 +37,7 @@ import { spawn } from "node:child_process";
 setTimeout(() => {
   console.log("WATCHDOG");
   process.exit(9);
-}, 55000).unref();
+}, 80000).unref();
 
 const CA = `-----BEGIN CERTIFICATE-----
 MIIBmjCCAUGgAwIBAgIUHjF3aO/Nr2SNMEQNV9GNuumIljswCgYIKoZIzj0EAwIw
