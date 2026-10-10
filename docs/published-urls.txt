@@ -52,6 +52,7 @@ example.com          # reserved example name (RFC 2606), in fixtures and unit te
 example.invalid      # reserved example name (RFC 2606), in the install fixtures
 example.org          # reserved example name (RFC 2606), in the bench URL corpus
 example.test         # reserved example name (RFC 2606), in oam_core websocket.rs unit tests; never dialled
+gate.test            # reserved example name (RFC 2606), in oam_core http_client/pool.rs unit tests; never dialled
 github.com           # oam_cli self_update: the release files `oam self-update` fetches (github.com/YawLabs/oam/releases)
 localhost            # the bench URL corpus
 nodejs.org           # js/node_compat.js: node's own mkdtemp "templates ending with X" warning, reproduced word for word; a page node publishes, not oam

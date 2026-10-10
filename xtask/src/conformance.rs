@@ -347,24 +347,33 @@ pub fn run(release: bool) -> Result<()> {
                     let same_exit = oam_out.code == node_out.code;
                     let detail =
                         first_difference(&normalize(&oam_out.stdout), &normalize(&node_out.stdout));
-                    println!("  FAIL {name}");
-                    if let Some(side) = fired {
-                        println!("    watchdog: {side} cut the case short with its own");
-                    }
                     // Print the divergence to stdout, not just the scorecard JSON: the
                     // scorecard is a CI artifact that isn't surfaced in the run log, so
                     // a platform-specific FAIL (e.g. a case that only diverges on Linux)
                     // was undiagnosable from `gh run view --log-failed`. Show exit codes,
                     // the first differing line (oam vs node), and oam's stderr head.
+                    //
+                    // The whole block goes out in ONE print: with several workers
+                    // printing at once, separate println!s interleave and only the
+                    // header line carries the case name.
+                    let mut block = format!("  FAIL {name}\n");
+                    if let Some(side) = fired {
+                        block.push_str(&format!(
+                            "    watchdog: {side} cut the case short with its own\n"
+                        ));
+                    }
                     if !same_exit {
-                        println!("    exit: oam={} node={}", oam_out.code, node_out.code);
+                        block.push_str(&format!(
+                            "    exit: oam={} node={}\n",
+                            oam_out.code, node_out.code
+                        ));
                     }
                     if let Some(line) = detail.get("line").and_then(Value::as_u64) {
                         let oam_line = detail.get("oam").and_then(Value::as_str).unwrap_or("");
                         let node_line = detail.get("node").and_then(Value::as_str).unwrap_or("");
-                        println!("    first diff at line {line}:");
-                        println!("      oam:  {oam_line}");
-                        println!("      node: {node_line}");
+                        block.push_str(&format!("    first diff at line {line}:\n"));
+                        block.push_str(&format!("      oam:  {oam_line}\n"));
+                        block.push_str(&format!("      node: {node_line}\n"));
                     }
                     let stderr_head = oam_out
                         .stderr
@@ -373,8 +382,9 @@ pub fn run(release: bool) -> Result<()> {
                         .collect::<Vec<_>>()
                         .join(" | ");
                     if !stderr_head.is_empty() {
-                        println!("    oam stderr: {stderr_head}");
+                        block.push_str(&format!("    oam stderr: {stderr_head}\n"));
                     }
+                    print!("{block}");
                     Outcome::Fail(json!({
                         "case": name,
                         "status": "fail",
@@ -393,17 +403,10 @@ pub fn run(release: bool) -> Result<()> {
         // The receipts must not be rewritten off a broken harness: a
         // harness-error row -- or a panic that landed between cases -- fails
         // the run here, before write_receipts.
-        let mut problems = stray;
-        for row in &rows {
-            if row["status"] == "harness-error" {
-                problems.push(row["error"].as_str().unwrap_or("harness error").to_string());
-            }
-        }
-        if !problems.is_empty() {
+        if let Some(problems) = harness_problems(stray, &rows) {
             bail!(
-                "node-differential harness error(s): {}
-The receipts were NOT rewritten; fix the harness and re-run.",
-                problems.join("; ")
+                "node-differential harness error(s): {problems}
+The receipts were NOT rewritten; fix the harness and re-run."
             );
         }
         diff_pass += pass;
@@ -669,18 +672,38 @@ The receipts were NOT rewritten; fix the harness and re-run.",
             diff_total - diff_pass - diff_watchdog.len()
         );
     }
-    if !diff_watchdog.is_empty() {
+    //
+    // A case that cuts itself ON PURPOSE (384 pins the scoring) is still
+    // scored `watchdog` and still counted above, but it is not a slow host,
+    // so it never raises the warning on its own.
+    let (deliberate, accidental): (Vec<&String>, Vec<&String>) = diff_watchdog
+        .iter()
+        .partition(|name| is_deliberate_watchdog(&cases_dir.join(name)));
+    if !accidental.is_empty() {
         println!(
             "\nWARNING: {} node-differential case(s) fired their own watchdog under BOTH \
              runtimes, so what they cover past that point was NOT COMPARED on this host:",
-            diff_watchdog.len()
+            accidental.len()
         );
-        for name in &diff_watchdog {
+        for name in &accidental {
             println!("         {name}");
         }
         println!(
             "         They are scored `watchdog`, not `pass`. A host this slow needs the \
              cases to fit their budget, not a higher score."
+        );
+        if !deliberate.is_empty() {
+            println!(
+                "         Cut short on purpose (by design, not the host): {}",
+                join_names(&deliberate)
+            );
+        }
+    } else if !deliberate.is_empty() {
+        println!(
+            "\nnote: {} node-differential case(s) cut short by their own watchdog on purpose \
+             (scored `watchdog` by design): {}",
+            deliberate.len(),
+            join_names(&deliberate)
         );
     }
 
@@ -1747,7 +1770,7 @@ fn run_pool(
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
-        for (worker, cell) in in_flight.iter().enumerate() {
+        for cell in &in_flight {
             let next = &next;
             handles.push(scope.spawn(move || {
                 loop {
@@ -1797,11 +1820,20 @@ fn run_pool(
     stray
 }
 
+/// The error text `reassemble` files for a case no worker ever pulled. The
+/// caller's bail counts these rather than listing them: when every worker
+/// stops on the same spawn failure, hundreds of cases are left this way and
+/// the one real error must not be buried under them.
+const NOT_RUN: &str = "not run (a worker stopped on an earlier harness error)";
+
 /// Fan the filled slots back into the scorecard's shapes, in sorted case
-/// order whatever order the workers finished in. An EMPTY slot means a
-/// worker panicked without recording anything: the row is a harness error
-/// naming the case, and the caller fails the run on those before any
-/// receipt is written.
+/// order whatever order the workers finished in. An EMPTY slot means NO
+/// worker ever pulled the case: a worker stops pulling on a harness error,
+/// and `run_pool` has already filed a panic WHILE a case was in flight into
+/// that case's slot, so what is still empty here was never reached. The row
+/// is a harness error naming the case (status `harness-error`, the same shape
+/// as a real harness error, so the JSON consumers see one kind), and the
+/// caller fails the run on those before any receipt is written.
 fn reassemble(
     slots: &[Mutex<Option<Outcome>>],
     cases: &[PathBuf],
@@ -1833,11 +1865,56 @@ fn reassemble(
             None => rows.push(json!({
                 "case": name,
                 "status": "harness-error",
-                "error": format!("{name}: the worker ended without recording an outcome"),
+                "error": format!("{name}: {NOT_RUN}"),
             })),
         }
     }
     (rows, pass, watchdog)
+}
+
+/// The bail text for a run with harness trouble, or None when there was
+/// none: the stray panics and the real harness-error rows first, each in
+/// full, then the never-pulled cases as ONE count -- they are a consequence
+/// of the real error, not more of it.
+fn harness_problems(stray: Vec<String>, rows: &[Value]) -> Option<String> {
+    let mut problems = stray;
+    let mut not_run = 0usize;
+    for row in rows {
+        if row["status"] != "harness-error" {
+            continue;
+        }
+        let error = row["error"].as_str().unwrap_or("harness error");
+        if error.ends_with(NOT_RUN) {
+            not_run += 1;
+        } else {
+            problems.push(error.to_string());
+        }
+    }
+    if not_run > 0 {
+        problems.push(format!("{not_run} case(s) not run"));
+    }
+    (!problems.is_empty()).then(|| problems.join("; "))
+}
+
+/// The phrase case 384's header carries: it fires its watchdog on purpose,
+/// on both runtimes, so the scorecard has a `watchdog` row that is a receipt
+/// of the scoring rather than a slow host's accident.
+const DELIBERATE_WATCHDOG_MARKER: &str = "fires it ON PURPOSE";
+
+/// Whether a case cuts itself short BY DESIGN, per the marker phrase in its
+/// source. Such a case is scored `watchdog` like any other, but it is not a
+/// slow host, so the end-of-run warning leaves it out. An unreadable case
+/// is not deliberate: the warning is the safe side.
+fn is_deliberate_watchdog(case: &Path) -> bool {
+    std::fs::read_to_string(case).is_ok_and(|src| src.contains(DELIBERATE_WATCHDOG_MARKER))
+}
+
+fn join_names(names: &[&String]) -> String {
+    names
+        .iter()
+        .map(|n| n.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -2081,10 +2158,78 @@ mod tests {
         assert_eq!(order, vec!["aaa.mjs", "bbb.mjs", "ccc.mjs"]);
         assert_eq!(rows[0]["status"], "fail");
         assert_eq!(rows[1]["status"], "harness-error");
-        assert!(rows[1]["error"].as_str().unwrap().contains("bbb.mjs"));
+        let error = rows[1]["error"].as_str().unwrap();
+        assert!(error.contains("bbb.mjs"));
+        assert!(
+            error.ends_with(NOT_RUN),
+            "an empty slot is a never-pulled case, not a panic: {error}"
+        );
         assert_eq!(rows[2]["status"], "watchdog");
         assert_eq!(pass, 0);
         assert_eq!(watchdog, vec!["ccc.mjs".to_string()]);
+    }
+
+    /// When every worker stops on the same spawn failure, the cases nobody
+    /// pulled are a COUNT in the bail, after the real errors; they are not
+    /// hundreds of rows ahead of the one line that says what broke.
+    #[test]
+    fn the_bail_lists_real_errors_and_counts_the_not_run() {
+        let names = ["aaa.mjs", "bbb.mjs", "ccc.mjs", "ddd.mjs"];
+        let cases: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
+        let slots: Vec<Mutex<Option<Outcome>>> = cases.iter().map(|_| Mutex::new(None)).collect();
+        *slots[0].lock().unwrap() = Some(Outcome::Pass);
+        *slots[1].lock().unwrap() = Some(Outcome::Harness("bbb.mjs: spawn failed".into()));
+        // ccc and ddd never pulled.
+        let (rows, _, _) = reassemble(&slots, &cases);
+        // Every kind keeps the one row shape the JSON consumers read.
+        assert_eq!(rows[1]["status"], "harness-error");
+        assert_eq!(rows[2]["status"], "harness-error");
+        assert_eq!(rows[3]["status"], "harness-error");
+        let problems =
+            harness_problems(vec!["worker 3 panicked between cases: boom".into()], &rows)
+                .expect("a harness error fails the run");
+        assert_eq!(
+            problems,
+            "worker 3 panicked between cases: boom; bbb.mjs: spawn failed; 2 case(s) not run"
+        );
+        assert!(
+            !problems.contains("ccc.mjs"),
+            "not-run cases are counted, not listed"
+        );
+        // A clean run has nothing to say.
+        let clean = vec![json!({ "case": "aaa.mjs", "status": "pass" })];
+        assert_eq!(harness_problems(Vec::new(), &clean), None);
+    }
+
+    /// Case 384 cuts itself on purpose, so it is left out of the slow-host
+    /// WARNING; any other watchdog case is not. The marker is the phrase in
+    /// 384's header, so this also pins that the header still carries it.
+    #[test]
+    fn the_deliberate_watchdog_case_is_marked_and_the_others_are_not() {
+        let dir = repo_root()
+            .expect("repo root")
+            .join("conformance")
+            .join("cases");
+        let deliberate = dir.join("384-harness-pins-a-deliberate-watchdog.mjs");
+        assert!(
+            is_deliberate_watchdog(&deliberate),
+            "{} must carry {DELIBERATE_WATCHDOG_MARKER:?} in its header",
+            deliberate.display()
+        );
+        let marked: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read cases")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("mjs"))
+            .filter(|p| is_deliberate_watchdog(p))
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            marked,
+            vec!["384-harness-pins-a-deliberate-watchdog.mjs".to_string()]
+        );
+        // Unreadable is not deliberate: the warning is the safe side.
+        assert!(!is_deliberate_watchdog(&dir.join("no-such-case.mjs")));
     }
 
     /// The pool traces a PANICKING worker to the case it was running and

@@ -91,6 +91,28 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `promise.child`, and keeps Buffers under `encoding: 'buffer'`. Pinned by conformance case
   385.
 
+- **The conformance harness's worker pool is clippy-clean, keeps a FAIL block together, tells a
+  deliberate watchdog from a slow host, and summarises the cases a stopped worker never ran.**
+  The pool loop bound an index it never used, so `cargo clippy --workspace -- -D warnings` --
+  the release gate's own step -- failed on main. A case's FAIL diagnostic was six separate
+  prints from a worker thread, so with 2-8 workers another case's lines could land inside it
+  and `--log-failed` output blamed the wrong divergence; it is now one print. Case 384 fires
+  its watchdog on purpose on every host, which made the end-of-run "a host this slow" warning
+  fire on every run; a case whose header says it cuts itself on purpose is now listed as such
+  and the warning is kept for the accidental ones. A worker that stops on a harness error left
+  every case it never pulled filed as "the worker ended without recording an outcome", the
+  message reserved for a panic, and the bail listed hundreds of them ahead of the one real
+  error; they are now "not run (a worker stopped on an earlier harness error)" and the bail
+  prints the real errors first with a one-line count of the rest.
+- **The e2e 302-hop guard for #155 measures the documented race instead of hard-asserting it
+  away.** `pool::reuse_h1`'s 1 ms freshness wait is a heuristic, and a FIN that lands after it
+  still doubles a GET hop about once in 2,000; the test asserted every one of 200 hops arrived
+  exactly once, which went red on an idle box about one run in ten. It now runs the issue's
+  own 1,000 hops and tolerates 3 doubled `/final` paths -- a 0.2% flake gate on, while a
+  gate-off build (7-59 doubles per 1,000) still fails it -- with `ok` and the `/redir` count
+  hard as before. The pool's unit tests dial the reserved host `gate.test`, which the
+  published-URLs gate did not allowlist, so that gate was red on main too.
+
 - **The node-differential cases now fit their budgets (#211, remaining items).** Case 122 ran
   its refused-host-spellings lookups -- the slowest section and the one whose cost varies most
   between hosts -- before the 25-round "socket up at 'response'" check, so a slow host's
