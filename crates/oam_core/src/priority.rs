@@ -49,6 +49,17 @@ fn parse_priority_env(value: &str) -> Option<i32> {
     }
 }
 
+/// The priority `OAM_PRIORITY=requested` moves this process to, if any:
+/// only ever a lower one (a higher number). A process its launcher already
+/// lowered further -- `start /low`, `nice -n 19`, or an `oam` parent at idle
+/// whose class a Windows child inherits -- stays where it is: Windows lets
+/// any process raise its own class back to NORMAL, so applying the value
+/// as given would silently undo the launcher's choice. An unreadable current
+/// priority leaves it alone too.
+fn lowered_to(requested: i32, current: Option<i32>) -> Option<i32> {
+    current.filter(|&c| requested > c).map(|_| requested)
+}
+
 /// Applies `OAM_PRIORITY` and `OAM_ECOQOS=1` to this process. Call it first
 /// thing in `main`, before any thread exists: on Linux a nice value is
 /// per-thread and new threads inherit their creator's, and on Windows the
@@ -56,16 +67,18 @@ fn parse_priority_env(value: &str) -> Option<i32> {
 /// in the environment every child inherits, so each `oam` in a fork tree
 /// applies them to itself as well.
 ///
-/// Best effort: a value it cannot parse is reported once on stderr and
-/// ignored, and a refusal from the OS (lowering is never refused; going back
-/// to `normal` from a niced shell is, without privilege) is ignored.
+/// Lowering only (see `lowered_to`), so `normal` changes nothing unless the
+/// process was started above normal. Best effort: a value it cannot parse is
+/// reported once on stderr and ignored, and so is a refusal from the OS.
 pub fn apply_env() {
     if let Ok(raw) = std::env::var("OAM_PRIORITY")
         && !raw.trim().is_empty()
     {
         match parse_priority_env(&raw) {
             Some(p) => {
-                let _ = set_priority(0, p);
+                if let Some(p) = lowered_to(p, get_priority(0).ok()) {
+                    let _ = set_priority(0, p);
+                }
             }
             None => eprintln!(
                 "oam: ignoring OAM_PRIORITY={raw:?}: expected normal, below_normal, idle, \
@@ -74,7 +87,9 @@ pub fn apply_env() {
         }
     }
     if matches!(
-        std::env::var("OAM_ECOQOS").as_deref().map(str::trim),
+        std::env::var("OAM_ECOQOS")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
         Ok("1" | "true" | "on")
     ) {
         imp::enable_ecoqos();
@@ -248,6 +263,18 @@ mod tests {
         assert_eq!(parse_priority_env("high"), None);
         assert_eq!(parse_priority_env("20"), None);
         assert_eq!(parse_priority_env(""), None);
+    }
+
+    #[test]
+    fn priority_env_never_raises() {
+        assert_eq!(lowered_to(10, Some(0)), Some(10));
+        assert_eq!(lowered_to(19, Some(10)), Some(19));
+        assert_eq!(lowered_to(0, Some(-7)), Some(0));
+        // Already that low, or lower: left alone.
+        assert_eq!(lowered_to(10, Some(10)), None);
+        assert_eq!(lowered_to(10, Some(19)), None);
+        assert_eq!(lowered_to(0, Some(10)), None);
+        assert_eq!(lowered_to(19, None), None);
     }
 
     #[test]

@@ -36895,8 +36895,8 @@ fn v8_pool_size_extremes_still_run_gc_heavy_code() {
 
 /// OAM_PRIORITY lowers oam's own priority before anything runs, so the
 /// program -- and its children, which inherit it -- read the lowered value
-/// back through os.getPriority. A value it cannot use is one warning and
-/// otherwise ignored.
+/// back through os.getPriority. It never raises a process started lower. A
+/// value it cannot use is one warning and otherwise ignored.
 #[test]
 fn oam_priority_env_lowers_the_process_and_its_children() {
     let script = "const os=require('os');\
@@ -36914,6 +36914,24 @@ fn oam_priority_env_lowers_the_process_and_its_children() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "19 19");
+
+    // Lowering only: a child started already at idle and asked for
+    // below_normal stays at idle (Windows would let it raise its own class).
+    let raise = "const c=require('child_process').spawnSync(process.execPath,\
+                 ['-e','console.log(require(\"os\").getPriority())'],\
+                 {encoding:'utf8',env:{...process.env,OAM_PRIORITY:'below_normal'}});\
+                 console.log(c.stdout.trim())";
+    let out = bounded_output(
+        oam_command(&["-e", raise])
+            .env("OAM_PRIORITY", "idle")
+            .env_remove("OAM_ECOQOS"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "19");
 
     let out = bounded_output(
         oam_command(&["-e", "console.log(typeof require('os').getPriority())"])

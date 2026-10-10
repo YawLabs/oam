@@ -128,6 +128,15 @@ fn parse_pool_size(value: &str) -> i64 {
     digits[..end].parse::<i64>().map_or(0, |n| sign * n)
 }
 
+/// `OAM_V8_POOL_SIZE`: unlike the node flag, only a whole integer counts.
+/// node reads `--v8-pool-size=abc` as 0, "one per core", but a typo in an
+/// environment knob meant to shrink the pool should not grow it to the
+/// per-core maximum, so anything else is ignored (None: the default) -- as
+/// `OAM_MAX_HEAP_MB` ignores a value it cannot use. Empty is unset.
+fn parse_pool_size_env(value: &str) -> Option<i64> {
+    value.trim().parse::<i64>().ok()
+}
+
 /// How many V8 platform worker threads to start. These run concurrent GC
 /// marking/sweeping and background compilation for EVERY isolate in the
 /// process, so they are a per-process cost paid by each short-lived `oam`
@@ -163,13 +172,17 @@ pub fn init_platform_with_flags(v8_flags: &[&str]) {
         // pumps. The worker pool is sized by `v8_pool_size` (node's default
         // of 4, `--v8-pool-size`, `OAM_V8_POOL_SIZE`).
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let env = std::env::var("OAM_V8_POOL_SIZE")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
-        let requested = V8_POOL_SIZE_FLAG
-            .get()
-            .copied()
-            .or_else(|| env.as_deref().map(parse_pool_size));
+        let requested = V8_POOL_SIZE_FLAG.get().copied().or_else(|| {
+            let raw = std::env::var("OAM_V8_POOL_SIZE").ok()?;
+            let parsed = parse_pool_size_env(&raw);
+            if parsed.is_none() && !raw.trim().is_empty() {
+                eprintln!(
+                    "oam: ignoring OAM_V8_POOL_SIZE={raw:?}: expected an integer \
+                     (0 or below sizes the pool from the core count)"
+                );
+            }
+            parsed
+        });
         let workers = v8_pool_size(requested, cores);
         let platform =
             v8::new_custom_platform(workers, false, false, platform::OamPlatform).make_shared();
@@ -1136,6 +1149,20 @@ mod tests {
         assert_eq!(v8_pool_size(Some(0), 12), 11);
         assert_eq!(v8_pool_size(Some(-3), 12), 11);
         assert_eq!(v8_pool_size(Some(0), 1), 1);
+    }
+
+    #[test]
+    fn v8_pool_size_env_takes_whole_integers_only() {
+        assert_eq!(parse_pool_size_env("2"), Some(2));
+        assert_eq!(parse_pool_size_env(" 1 "), Some(1));
+        assert_eq!(parse_pool_size_env("0"), Some(0));
+        assert_eq!(parse_pool_size_env("-3"), Some(-3));
+        // Unlike the flag, garbage is the default, not the per-core pool.
+        assert_eq!(parse_pool_size_env(""), None);
+        assert_eq!(parse_pool_size_env("abc"), None);
+        assert_eq!(parse_pool_size_env("7abc"), None);
+        assert_eq!(parse_pool_size_env("1e3"), None);
+        assert_eq!(v8_pool_size(parse_pool_size_env("abc"), 12), 4);
     }
 
     #[test]

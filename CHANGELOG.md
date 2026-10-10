@@ -25,12 +25,13 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   a program importing either name failed to link. Conformance case 386.
 - **`OAM_PRIORITY` and `OAM_ECOQOS`.** `OAM_PRIORITY=below_normal|idle|normal` (or 0..19)
   lowers oam's own scheduling priority at startup, before any thread exists, so its V8 and I/O
-  threads and every child process run lowered; `OAM_ECOQOS=1` opts a Windows process into
+  threads and every child process run lowered. It never raises a process its launcher started
+  lower. `OAM_ECOQOS=1` opts a Windows process into
   EcoQoS. Both are read by every `oam` in a fork tree, since children inherit the environment.
 - **`--v8-pool-size` takes effect, and `OAM_V8_POOL_SIZE`.** The flag was accepted (it is in
   `process.allowedNodeEnvironmentFlags`) but ignored. It now sizes the V8 worker pool from argv
   or `NODE_OPTIONS` and round-trips through `process.execArgv`; `OAM_V8_POOL_SIZE` is the
-  fallback.
+  fallback (a value that is not an integer is a warning and keeps the default).
 
 ### Changed
 
