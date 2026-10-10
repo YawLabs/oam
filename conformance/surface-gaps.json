@@ -5,8 +5,8 @@
       "generatedAgainst": "v22.22.2 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1480,
-        "missing": 345,
+        "present": 1482,
+        "missing": 343,
         "absentModules": 5,
         "absentModuleExportNames": 59
       },
@@ -328,10 +328,6 @@
           "getDefaultAutoSelectFamily",
           "setDefaultAutoSelectFamily"
         ],
-        "os": [
-          "getPriority",
-          "setPriority"
-        ],
         "path": [
           "_makeLong"
         ],
@@ -462,8 +458,8 @@
       "generatedAgainst": "v22.22.2 on linux-x64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1480,
-        "missing": 349,
+        "present": 1482,
+        "missing": 347,
         "absentModules": 5,
         "absentModuleExportNames": 59
       },
@@ -789,10 +785,6 @@
           "getDefaultAutoSelectFamily",
           "setDefaultAutoSelectFamily"
         ],
-        "os": [
-          "getPriority",
-          "setPriority"
-        ],
         "path": [
           "_makeLong"
         ],
@@ -923,8 +915,8 @@
       "generatedAgainst": "v22.22.2 on win32-arm64",
       "counts": {
         "nodeExportNames": 1874,
-        "present": 1500,
-        "missing": 315,
+        "present": 1502,
+        "missing": 313,
         "absentModules": 5,
         "absentModuleExportNames": 59
       },
@@ -1234,10 +1226,6 @@
           "_setSimultaneousAccepts",
           "getDefaultAutoSelectFamily",
           "setDefaultAutoSelectFamily"
-        ],
-        "os": [
-          "getPriority",
-          "setPriority"
         ],
         "path": [
           "_makeLong"

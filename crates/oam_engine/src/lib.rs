@@ -45,6 +45,8 @@ pub use modules::ModuleHost;
 // Also re-exported for the CLI: `--max-http-header-size` and
 // `--insecure-http-parser` set process-wide state there.
 pub use oam_core::http_head;
+// Re-exported for the CLI, which applies OAM_PRIORITY / OAM_ECOQOS at startup.
+pub use oam_core::priority;
 pub use oam_core::{
     exit_process, register_exit_cleanup, register_exit_hook, register_process_state_hook,
     run_exit_cleanup, run_exit_hooks, run_process_state_hooks, snapshot_inherited_fds,
@@ -99,6 +101,56 @@ pub(crate) fn worker_host() -> Option<Box<dyn ModuleHost>> {
     WORKER_HOST_FACTORY.get().map(|f| f())
 }
 
+/// `--v8-pool-size=N` from argv or NODE_OPTIONS, recorded by the embedder
+/// before the platform is initialized. Wins over `OAM_V8_POOL_SIZE`.
+static V8_POOL_SIZE_FLAG: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+/// Records `--v8-pool-size`'s value for `init_platform_with_flags`. Must run
+/// before the first `JsRuntime` (or `init_platform*` call): the pool is sized
+/// once, when V8 is initialized, and a later call has no effect.
+pub fn set_v8_pool_size(value: &str) {
+    let _ = V8_POOL_SIZE_FLAG.set(parse_pool_size(value));
+}
+
+/// node parses `--v8-pool-size` as a C integer: leading digits (with an
+/// optional sign) count and anything unparsable reads as 0, which -- like any
+/// value below 1 -- means "size it from the core count".
+fn parse_pool_size(value: &str) -> i64 {
+    let v = value.trim();
+    let (sign, digits) = match v.as_bytes().first() {
+        Some(b'-') => (-1, &v[1..]),
+        Some(b'+') => (1, &v[1..]),
+        _ => (1, v),
+    };
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    digits[..end].parse::<i64>().map_or(0, |n| sign * n)
+}
+
+/// How many V8 platform worker threads to start. These run concurrent GC
+/// marking/sweeping and background compilation for EVERY isolate in the
+/// process, so they are a per-process cost paid by each short-lived `oam`
+/// spawn too.
+///
+/// - No request: node's default, 4, capped at one per core but one (and at
+///   least 1). One thread per core was the old default; with many runtimes
+///   on one box that multiplied into hundreds of mostly idle threads that
+///   all wake for each process's GC.
+/// - A request below 1 (node's `--v8-pool-size=0`): node's "estimate it from
+///   the machine", one per core but one, as `NewDefaultPlatform` does.
+/// - Otherwise the request itself. Always clamped to 1..=16; V8 needs one
+///   worker, and past 16 it gains nothing.
+fn v8_pool_size(requested: Option<i64>, cores: usize) -> u32 {
+    let per_core = cores.saturating_sub(1).max(1) as i64;
+    let n = match requested {
+        None => per_core.min(4),
+        Some(n) if n < 1 => per_core,
+        Some(n) => n,
+    };
+    n.clamp(1, 16) as u32
+}
+
 /// V8 flags must be set BEFORE `V8::initialize`, so the embedder passes any
 /// node-style flags that map to V8 ones (currently `--expose-gc`) here.
 pub fn init_platform_with_flags(v8_flags: &[&str]) {
@@ -108,11 +160,17 @@ pub fn init_platform_with_flags(v8_flags: &[&str]) {
         }
         // V8's default platform, with its foreground tasks handed to the
         // isolate's own event loop (platform.rs) instead of a queue nothing
-        // pumps. The worker pool keeps NewDefaultPlatform's size: one thread
-        // per core but one, between 1 and 16.
-        let workers = std::thread::available_parallelism()
-            .map_or(1, |n| n.get().saturating_sub(1))
-            .clamp(1, 16) as u32;
+        // pumps. The worker pool is sized by `v8_pool_size` (node's default
+        // of 4, `--v8-pool-size`, `OAM_V8_POOL_SIZE`).
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let env = std::env::var("OAM_V8_POOL_SIZE")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let requested = V8_POOL_SIZE_FLAG
+            .get()
+            .copied()
+            .or_else(|| env.as_deref().map(parse_pool_size));
+        let workers = v8_pool_size(requested, cores);
         let platform =
             v8::new_custom_platform(workers, false, false, platform::OamPlatform).make_shared();
         v8::V8::initialize_platform(platform);
@@ -1060,6 +1118,37 @@ mod tests {
     // the EnvGuard scope so the SET -- ASSERT -- DROP sequence is atomic
     // from any other test's perspective.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn v8_pool_defaults_to_node_four_capped_by_cores() {
+        assert_eq!(v8_pool_size(None, 12), 4);
+        assert_eq!(v8_pool_size(None, 4), 3);
+        assert_eq!(v8_pool_size(None, 2), 1);
+        assert_eq!(v8_pool_size(None, 1), 1);
+        assert_eq!(v8_pool_size(None, 0), 1);
+    }
+
+    #[test]
+    fn v8_pool_request_wins_and_below_one_means_per_core() {
+        assert_eq!(v8_pool_size(Some(1), 12), 1);
+        assert_eq!(v8_pool_size(Some(8), 4), 8);
+        assert_eq!(v8_pool_size(Some(64), 12), 16);
+        assert_eq!(v8_pool_size(Some(0), 12), 11);
+        assert_eq!(v8_pool_size(Some(-3), 12), 11);
+        assert_eq!(v8_pool_size(Some(0), 1), 1);
+    }
+
+    #[test]
+    fn v8_pool_size_parses_like_node() {
+        assert_eq!(parse_pool_size("2"), 2);
+        assert_eq!(parse_pool_size(" 3 "), 3);
+        assert_eq!(parse_pool_size("+5"), 5);
+        assert_eq!(parse_pool_size("-1"), -1);
+        assert_eq!(parse_pool_size("7abc"), 7);
+        assert_eq!(parse_pool_size("abc"), 0);
+        assert_eq!(parse_pool_size(""), 0);
+        assert_eq!(parse_pool_size("99999999999999999999999"), 0);
+    }
 
     /// RAII guard for env-var mutations in tests. Sets `OAM_MAX_HEAP_MB` on
     /// construction and restores the prior value (or unsets it) on drop --
