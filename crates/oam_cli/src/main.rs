@@ -264,6 +264,11 @@ fn main() -> ExitCode {
     // oam cache dir on any Rust panic or V8 OOM (internal diagnostics, not
     // public telemetry). Installed before anything can panic.
     oam_engine::install_panic_hook();
+    // OAM_PRIORITY / OAM_ECOQOS, before any thread exists: a nice value is
+    // per-thread on Linux and inherited by the threads a thread creates, and
+    // the V8 pool, the tokio runtime and every child process should all run
+    // at the lowered priority.
+    oam_engine::priority::apply_env();
     // Before anything opens a file: the descriptors we hold RIGHT NOW are, by
     // definition, the ones a parent handed us. Taken this early because on unix
     // a file oam opens for itself would otherwise be indistinguishable from an
@@ -471,6 +476,26 @@ fn main() -> ExitCode {
                         return ExitCode::from(9);
                     }
                 }
+            } else if let Some(v) = arg.strip_prefix("--v8-pool-size=") {
+                if v.is_empty() {
+                    eprintln!("oam: --v8-pool-size= requires an argument");
+                    return ExitCode::from(9);
+                }
+                flags.v8_pool_size = Some(v.to_string());
+                flags.v8_pool_size_spaced = false;
+                i += 1;
+            } else if arg == "--v8-pool-size" {
+                match raw.get(i + 1) {
+                    Some(v) => {
+                        flags.v8_pool_size = Some(v.clone());
+                        flags.v8_pool_size_spaced = true;
+                        i += 2;
+                    }
+                    None => {
+                        eprintln!("oam: --v8-pool-size requires an argument");
+                        return ExitCode::from(9);
+                    }
+                }
             } else if arg == "--insecure-http-parser" {
                 flags.insecure_http_parser = true;
                 i += 1;
@@ -608,6 +633,11 @@ fn main() -> ExitCode {
         if flags.experimental_vm_modules {
             // SAFETY: single-threaded startup, before any runtime exists.
             unsafe { std::env::set_var("OAM_EXPERIMENTAL_VM_MODULES", "1") };
+        }
+        // The V8 platform's worker pool is sized when V8 initializes, so the
+        // flag is recorded before anything below can initialize it.
+        if let Some(v) = &flags.v8_pool_size {
+            oam_engine::set_v8_pool_size(v);
         }
         // Collect every node flag that is really a V8 flag: they all have to
         // go in ONE call, because V8::initialize runs on the first one and
@@ -1744,6 +1774,15 @@ fn apply_node_options(flags: &mut NodeFlags, raw: &str) -> bool {
             && let Some(v) = it.next()
         {
             flags.max_http_header_size = Some(v.clone());
+        } else if let Some(v) = tok.strip_prefix("--v8-pool-size=") {
+            // Empty is node's exit 9; here a bad token is ignored instead.
+            if !v.is_empty() {
+                flags.v8_pool_size = Some(v.to_string());
+            }
+        } else if tok == "--v8-pool-size"
+            && let Some(v) = it.next()
+        {
+            flags.v8_pool_size = Some(v.clone());
         } else if tok == "--insecure-http-parser" {
             flags.insecure_http_parser = true;
         } else if tok == "--no-warnings" {
@@ -2548,6 +2587,12 @@ struct NodeFlags {
     /// It was given as two tokens (`--max-http-header-size N`), which is how
     /// execArgv hands it back.
     max_http_header_size_spaced: bool,
+    /// `--v8-pool-size=N`: the V8 platform's worker-thread count (see
+    /// oam_engine::set_v8_pool_size). Kept raw, like the header size, so
+    /// execArgv hands it back unchanged and a fork child sizes its pool the
+    /// same way.
+    v8_pool_size: Option<String>,
+    v8_pool_size_spaced: bool,
     /// `--insecure-http-parser`.
     insecure_http_parser: bool,
     /// `--tls-min-v1.0` / `--tls-min-v1.1` / `--tls-min-v1.2` /
@@ -2584,6 +2629,11 @@ impl NodeFlags {
             } else {
                 (env.max_http_header_size, env.max_http_header_size_spaced)
             };
+        let (v8_pool_size, v8_pool_size_spaced) = if argv.v8_pool_size.is_some() {
+            (argv.v8_pool_size.clone(), argv.v8_pool_size_spaced)
+        } else {
+            (env.v8_pool_size, env.v8_pool_size_spaced)
+        };
         NodeFlags {
             pending_deprecation: env.pending_deprecation || argv.pending_deprecation,
             expose_gc: env.expose_gc || argv.expose_gc,
@@ -2609,6 +2659,8 @@ impl NodeFlags {
             experimental_vm_modules: env.experimental_vm_modules || argv.experimental_vm_modules,
             max_http_header_size,
             max_http_header_size_spaced,
+            v8_pool_size,
+            v8_pool_size_spaced,
             insecure_http_parser: env.insecure_http_parser || argv.insecure_http_parser,
             tls_min_v1_0: env.tls_min_v1_0 || argv.tls_min_v1_0,
             tls_min_v1_1: env.tls_min_v1_1 || argv.tls_min_v1_1,
@@ -2847,6 +2899,14 @@ impl NodeFlags {
                 out.push(v.clone());
             } else {
                 out.push(format!("--max-http-header-size={v}"));
+            }
+        }
+        if let Some(v) = &self.v8_pool_size {
+            if self.v8_pool_size_spaced {
+                out.push("--v8-pool-size".into());
+                out.push(v.clone());
+            } else {
+                out.push(format!("--v8-pool-size={v}"));
             }
         }
         if self.insecure_http_parser {

@@ -43,6 +43,9 @@ pub mod net_connect;
 /// (`net.connect({ path })`, `server.listen(path)`); their streams live in
 /// the TCP registry.
 mod pipe;
+/// Process scheduling priority: `os.getPriority` / `os.setPriority`, and the
+/// `OAM_PRIORITY` / `OAM_ECOQOS` startup knobs.
+pub mod priority;
 /// Inbound OS signal delivery (SIGTERM/SIGINT/SIGHUP). Unix uses
 /// tokio::signal::unix; Windows uses SetConsoleCtrlHandler. Both feed the op
 /// channel with an OpCompletion{ id: SIGNAL_OP_ID, .. } that the engine

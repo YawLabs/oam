@@ -5202,6 +5202,18 @@
   // ------------------------------------------------------------------- os
   registry.factories.os = (natives) => {
     const isWin = natives.platform === "win32";
+    // node's ERR_SYSTEM_ERROR for a failed uv_os_* call: the context libuv's
+    // error fills in (errno, code, message, syscall, in that order) under the
+    // "A system error occurred" prefix.
+    const uvSystemError = (code, syscall) => {
+      const entry = Array.from(uvErrnoTable(natives)).find(([, e]) => e[0] === code);
+      return new SystemError("ERR_SYSTEM_ERROR", "A system error occurred", {
+        errno: entry === undefined ? undefined : entry[0],
+        code,
+        message: entry === undefined ? code : entry[1][1],
+        syscall,
+      });
+    };
     return {
       EOL: isWin ? "\r\n" : "\n",
       devNull: isWin ? "\\\\.\\nul" : "/dev/null",
@@ -5234,6 +5246,27 @@
       freemem: () => natives.osFreeMem(),
       uptime: () => natives.uptimeMs() / 1000,
       loadavg: () => [0, 0, 0],
+      // node's lib/os.js (v22.22.2): validate, call libuv, and turn a failure
+      // into ERR_SYSTEM_ERROR naming uv_os_{get,set}priority. Priorities are
+      // node's -20..19 scale; on Windows libuv maps them onto priority
+      // classes, so setPriority(12) reads back as 10 (BELOW_NORMAL).
+      getPriority: function getPriority(pid) {
+        if (pid === undefined) pid = 0;
+        else validateInt32(pid, "pid");
+        const result = natives.osGetPriority(pid);
+        if (typeof result === "string") throw uvSystemError(result, "uv_os_getpriority");
+        return result;
+      },
+      setPriority: function setPriority(pid, priority) {
+        if (priority === undefined) {
+          priority = pid;
+          pid = 0;
+        }
+        validateInt32(pid, "pid");
+        validateInt32(priority, "priority", -20, 19);
+        const result = natives.osSetPriority(pid, priority);
+        if (typeof result === "string") throw uvSystemError(result, "uv_os_setpriority");
+      },
       networkInterfaces: () => JSON.parse(natives.networkInterfaces()),
       machine: () => {
         var a = natives.arch;

@@ -521,6 +521,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("osRelease", op_os_release),
         ("osTotalMem", op_os_total_mem),
         ("osFreeMem", op_os_free_mem),
+        ("osGetPriority", op_os_get_priority),
+        ("osSetPriority", op_os_set_priority),
         // v8 heap / process memory
         ("heapStatistics", op_heap_statistics),
         ("processRss", op_process_rss),
@@ -9423,6 +9425,35 @@ fn op_os_free_mem(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     rv.set(v8::Number::new(scope, free_mem() as f64).into());
+}
+
+/// `os.getPriority(pid)`: the priority on node's scale, or the libuv code
+/// name of the failure (a string) for node_compat.js to raise as
+/// ERR_SYSTEM_ERROR. The pid is validated as an int32 in JS first.
+fn op_os_get_priority(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let pid = args.get(0).int32_value(scope).unwrap_or(0);
+    match oam_core::priority::get_priority(pid) {
+        Ok(p) => rv.set(v8::Integer::new(scope, p).into()),
+        Err(code) => rv.set(v8::String::new(scope, code).unwrap().into()),
+    }
+}
+
+/// `os.setPriority(pid, priority)`: undefined on success, else the libuv
+/// code name, as for `op_os_get_priority`.
+fn op_os_set_priority(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let pid = args.get(0).int32_value(scope).unwrap_or(0);
+    let priority = args.get(1).int32_value(scope).unwrap_or(0);
+    if let Err(code) = oam_core::priority::set_priority(pid, priority) {
+        rv.set(v8::String::new(scope, code).unwrap().into());
+    }
 }
 
 #[cfg(windows)]

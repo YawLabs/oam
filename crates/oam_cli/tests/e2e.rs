@@ -36825,3 +36825,128 @@ fn worker_and_fork_entry_gates_test_the_namespaced_path() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `--v8-pool-size` is node's flag for the V8 worker pool: accepted from argv
+/// and NODE_OPTIONS, reflected in execArgv as given (so a fork child sizes
+/// its pool the same way), and an empty value is node's exit 9.
+#[test]
+fn v8_pool_size_flag_round_trips_through_exec_argv() {
+    let script = "console.log(JSON.stringify(process.execArgv))";
+    let out = oam(&["--v8-pool-size=2", "-e", script]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        r#"["--v8-pool-size=2"]"#
+    );
+
+    let out = oam(&["--v8-pool-size", "3", "-e", script]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        r#"["--v8-pool-size","3"]"#
+    );
+
+    // NODE_OPTIONS sizes the pool too, but node never lists it in execArgv.
+    let out = bounded_output(oam_command(&["-e", script]).env("NODE_OPTIONS", "--v8-pool-size=1"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[]");
+
+    let out = oam(&["--v8-pool-size=", "-e", script]);
+    assert_eq!(out.status.code(), Some(9));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--v8-pool-size= requires an argument"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A one-thread pool (and the per-core one) still runs a program that makes
+/// V8 garbage-collect and compile in the background.
+#[test]
+fn v8_pool_size_extremes_still_run_gc_heavy_code() {
+    let script = "let a=[];for(let i=0;i<200000;i++){a.push({i,s:'x'+i});if(a.length>5000)a=[]}\
+                  globalThis.gc();console.log('ok')";
+    for (flag, env) in [("--v8-pool-size=1", None), ("--expose-gc", Some("0"))] {
+        let mut cmd = oam_command(&["--expose-gc", flag, "-e", script]);
+        if let Some(v) = env {
+            cmd.env("OAM_V8_POOL_SIZE", v);
+        }
+        let out = bounded_output(&mut cmd);
+        assert!(
+            out.status.success(),
+            "{flag}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+    }
+}
+
+/// OAM_PRIORITY lowers oam's own priority before anything runs, so the
+/// program -- and its children, which inherit it -- read the lowered value
+/// back through os.getPriority. It never raises a process started lower. A
+/// value it cannot use is one warning and otherwise ignored.
+#[test]
+fn oam_priority_env_lowers_the_process_and_its_children() {
+    let script = "const os=require('os');\
+                  const c=require('child_process').spawnSync(process.execPath,\
+                  ['-e','console.log(require(\"os\").getPriority())'],{encoding:'utf8'});\
+                  console.log(os.getPriority(), c.stdout.trim())";
+    let out = bounded_output(
+        oam_command(&["-e", script])
+            .env("OAM_PRIORITY", "idle")
+            .env_remove("OAM_ECOQOS"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "19 19");
+
+    // Lowering only: a child started already at idle and asked for
+    // below_normal stays at idle (Windows would let it raise its own class).
+    let raise = "const c=require('child_process').spawnSync(process.execPath,\
+                 ['-e','console.log(require(\"os\").getPriority())'],\
+                 {encoding:'utf8',env:{...process.env,OAM_PRIORITY:'below_normal'}});\
+                 console.log(c.stdout.trim())";
+    let out = bounded_output(
+        oam_command(&["-e", raise])
+            .env("OAM_PRIORITY", "idle")
+            .env_remove("OAM_ECOQOS"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "19");
+
+    let out = bounded_output(
+        oam_command(&["-e", "console.log(typeof require('os').getPriority())"])
+            .env("OAM_PRIORITY", "turbo")
+            .env("OAM_ECOQOS", "1"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "number");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ignoring OAM_PRIORITY=\"turbo\""),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

@@ -16,6 +16,23 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Added
+
+- **`os.getPriority([pid])` and `os.setPriority([pid,] priority)`.** Node's validation
+  (`ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE`, priority in -20..19), libuv's mapping onto
+  Windows priority classes and back, and `ERR_SYSTEM_ERROR` naming `uv_os_getpriority` /
+  `uv_os_setpriority` for a pid with no process. Only `os.constants.priority` existed before, so
+  a program importing either name failed to link. Conformance case 386.
+- **`OAM_PRIORITY` and `OAM_ECOQOS`.** `OAM_PRIORITY=below_normal|idle|normal` (or 0..19)
+  lowers oam's own scheduling priority at startup, before any thread exists, so its V8 and I/O
+  threads and every child process run lowered. It never raises a process its launcher started
+  lower. `OAM_ECOQOS=1` opts a Windows process into
+  EcoQoS. Both are read by every `oam` in a fork tree, since children inherit the environment.
+- **`--v8-pool-size` takes effect, and `OAM_V8_POOL_SIZE`.** The flag was accepted (it is in
+  `process.allowedNodeEnvironmentFlags`) but ignored. It now sizes the V8 worker pool from argv
+  or `NODE_OPTIONS` and round-trips through `process.execArgv`; `OAM_V8_POOL_SIZE` is the
+  fallback (a value that is not an integer is a warning and keeps the default).
+
 ### Changed
 
 - **The conformance differential's case pairs run on a worker pool instead of one at a time.**
@@ -31,6 +48,13 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `OAM_CONFORMANCE_CACHE_DIR` at a fixed path; the default stays a per-run temporary directory.
   Each case's cache lives in its own subdirectory named after the case, and cache blobs are
   written temp-file + rename, so a reader never observes a torn file.
+- **The V8 platform worker pool defaults to 4 threads, not one per core.** Node's default.
+  Every oam process started one V8 worker per core but one (11 on a 12-core machine), so a box
+  running a dozen oam sidecars, hooks and test children held well over a hundred mostly idle
+  V8 threads that all woke for each process's GC, and each short-lived `oam run` paid to create
+  them. On machines with 5 or fewer cores nothing changes. `--v8-pool-size=0` or
+  `OAM_V8_POOL_SIZE=0` restores the per-core pool.
+
 - **`oam install` no longer offers or decodes transfer-level compression (#173).** reqwest's
   `gzip` / `deflate` features left the workspace dependency: `fetch` and `http.request` have
   decoded bodies themselves since #143, and the installer reads each tarball whole with
