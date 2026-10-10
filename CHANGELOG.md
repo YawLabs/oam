@@ -45,6 +45,15 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `sweep_advances_an_existing_empty_stamp`. POSIX `O_TRUNC` already marks the mtime for
   update, so Linux and macOS were not expected to be affected.
 
+- **`util.promisify(exec)` and `util.promisify(execFile)` resolve `{ stdout, stderr }`, as node's
+  do (#302).** Neither function had a `util.promisify.custom`, so the generic promisify resolved
+  the stdout string alone (`const { stdout } = await ...` gave `undefined`) and rejected an
+  error with no `stdout` / `stderr` on it. Both now carry node v22's custom form
+  (non-enumerable, named after the original): it resolves `{ stdout, stderr }`, rejects the
+  callback's error with `err.stdout` and `err.stderr` set, exposes the ChildProcess as
+  `promise.child`, and keeps Buffers under `encoding: 'buffer'`. Pinned by conformance case
+  385.
+
 - **A request written onto a pooled connection whose server's FIN is in flight now waits it
   out instead of racing it (#155).** A server that answers and FINs in one callback (a 3xx
   then `end()`, a keep-alive timeout) leaves its FIN in flight while the next request is
