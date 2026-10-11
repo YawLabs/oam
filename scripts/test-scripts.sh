@@ -5276,6 +5276,26 @@ if [ -n "$IN_PS64" ]; then
   if grep -qF 'ssh-keygen.cmd' <<<"$IN_OUT"; then in_ps_installed 'signature ok: v0.18.0, signed by oam-release-k1'
   else fail "did not verify with the 8.1-shaped ssh-keygen.cmd: $IN_OUT"; fi
 
+  # The PATH-shadow guard, Windows side: the install dir must be a PATH entry
+  # (it is APPENDED at the end on first install, so not-yet-on-PATH installs
+  # are never refused) and an earlier entry must resolve an oam.exe. The fake
+  # lives in its own dir on PATH ahead of it; OAM_INSTALL_DIR must be a literal
+  # PATH entry too, spelled exactly as passed, or the membership test misses.
+  it "ps1: refuses when an earlier PATH entry resolves an oam.exe and the install dir is on PATH"
+  IN_SHADOW="$IN/shadow-bin"; mkdir -p "$IN_SHADOW"
+  printf '@echo off\r\necho fake oam.exe\r\n' >"$IN_SHADOW/oam.exe"
+  rm -rf "$IN/pdest"
+  IN_RC=0
+  in_ps_cp 65001
+  IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API \
+    PATH="$IN_SHADOW:$IN/pdest:$IN_WINPATH" OAM_INSTALL_BASE="$(in_url "$IN/rel/good")" OAM_VERSION=v0.18.0 \
+    OAM_INSTALL_DIR="$(cygpath -w "$IN/pdest")" \
+    "$IN_PS64" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$IN/install.ps1")" 2>&1 | tr -d '\r\n')" || IN_RC=$?
+  in_ps_cp "$IN_CP_ORIG"
+  if [ "$IN_RC" != "0" ] && grep -qF 'another oam would win on PATH' <<<"$IN_OUT" && [ ! -e "$IN/pdest/oam.exe" ]; then pass
+  else fail "rc=$IN_RC, wanted a PATH-shadow refusal and no oam.exe: $IN_OUT"; fi
+  rm -f "$IN_SHADOW/oam.exe"
+
   it "ps1 latest: the tag comes from the /releases/latest redirect (the local stand-in above)"
   if [ -n "${IN_PORT:-}" ]; then
     sed "s#https://github.com/#http://127.0.0.1:$IN_PORT/#g" "$IN/install.ps1" >"$IN/install-http.ps1"

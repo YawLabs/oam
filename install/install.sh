@@ -63,6 +63,24 @@ warn() { printf 'oam-install: warning: %s\n' "$1" >&2; }
 die() { printf 'oam-install: error: %s\n' "$1" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "required tool not found: $1"; }
 
+# Refuse to install where another oam would win: this run only helps if the
+# binary it lays down is the one the shell will run. Checked only when
+# $INSTALL_DIR is already a PATH entry -- the guidance near the end PREPENDS it
+# when it is missing, so a dir not on PATH yet is not a lasting shadow, while a
+# dir already listed but beaten by an earlier entry always is.
+case ":${PATH}:" in
+  *":${INSTALL_DIR}:"*)
+    _shadow=""
+    while IFS= read -r _d; do
+      if [ "$_d" = "$INSTALL_DIR" ]; then break; fi
+      if [ -n "$_d" ] && [ -x "$_d/oam" ]; then _shadow="$_d/oam"; break; fi
+    done <<EOF
+$(printf '%s\n' "$PATH" | tr ':' '\n')
+EOF
+    [ -z "$_shadow" ] || die "another oam would win on PATH: $_shadow resolves before $INSTALL_DIR -- remove it (typically a dev build or a stale copy), or put $INSTALL_DIR earlier in PATH"
+    ;;
+esac
+
 # --- The trust root, embedded ---------------------------------------------------
 # Byte-identical copies of release-keys/allowed_signers, release-keys/ranges and
 # release-keys/presigning-sums; scripts/test-scripts.sh fails on any drift.

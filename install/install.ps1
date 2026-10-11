@@ -371,6 +371,21 @@ function Get-HashFromSums([string]$text) {
   return $hits[0]
 }
 
+# Refuse to install where another oam.exe would win: this run only helps if the
+# binary it lays down is the one Get-Command resolves. install.ps1 APPENDS the
+# install dir to PATH below, so a shadowing entry earlier on PATH keeps winning
+# even after a restart -- appending cannot fix it, only reordering can. Scan in
+# PATH order and stop at the install dir itself: nothing before it shadows, and
+# nothing after it can win. (install.sh PREPENDS in its guidance, so its check
+# is gated on the dir already being a PATH entry; this one is not.)
+$shadow = $null
+foreach ($p in ($env:Path -split ';')) {
+  if (-not $p) { continue }
+  if ($p -ieq $installDir) { break }
+  if (Test-Path -LiteralPath (Join-Path $p 'oam.exe') -PathType Leaf) { $shadow = Join-Path $p 'oam.exe'; break }
+}
+if ($shadow) { Die "another oam would win on PATH: $shadow resolves before $installDir -- remove it (typically a dev build or a stale copy), or put $installDir earlier in PATH" }
+
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("oam-install-" + [System.Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 try {
@@ -495,7 +510,12 @@ try {
     catch { Remove-Item -Path "$dest.old" -Force -ErrorAction SilentlyContinue; Move-Item -Path $dest -Destination "$dest.old" -Force }
   }
   Move-Item -Path $binPath -Destination $dest -Force
+  # The move-aside is removed best-effort: a running copy (an `oam mcp` server,
+  # a second session) keeps it until a later install or `oam self-update`, whose
+  # sweep clears it. Say so when it survives -- a stray oam.exe beside the
+  # install is exactly the residue that must not go unnoticed.
   Remove-Item -Path "$dest.old" -Force -ErrorAction SilentlyContinue
+  if (Test-Path "$dest.old") { Warn "the previous oam.exe is still running, so $dest.old was kept -- it is not on PATH and a later install or 'oam self-update' will clear it" }
   Say "installed oam $tag to $dest"
 
   # The binary is a binary redistribution of V8, ICU, the Node streams port and
