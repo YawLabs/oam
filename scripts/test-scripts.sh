@@ -4922,6 +4922,46 @@ if [ "$IN_SSH" = "1" ]; then
   it "good: license files land beside the binary"
   ck cmp -s "$IN/dest/licenses/NOTICE" "$IN/rel/good/NOTICE"
 
+  # The PATH-shadow guard (see the block in install.sh): it fires only when
+  # the install dir is ALREADY a PATH entry -- the guidance PREPENDS the dir
+  # when missing, so a dir not on PATH yet is not a lasting shadow -- and only
+  # an earlier entry resolving an executable FILE named oam counts (a
+  # non-executable leftover or a directory named oam must not block), with
+  # entries compared trailing-slash-stripped.
+  it "refuses when an earlier PATH entry resolves an oam and the install dir is on PATH"
+  IN_SHADOW="$IN/shadow-bin"; mkdir -p "$IN_SHADOW"
+  printf '#!/bin/sh\necho fake oam\n' >"$IN_SHADOW/oam"
+  chmod +x "$IN_SHADOW/oam"
+  in_sh good v0.18.0 "$IN_SHADOW:$IN/dest:$IN_PATH_KG"
+  in_refused 'another oam would win on PATH'
+  it "installs when the earlier oam sits AFTER the install dir"
+  in_sh good v0.18.0 "$IN/dest:$IN_SHADOW:$IN_PATH_KG"
+  in_installed good 'signature ok: v0.18.0, signed by oam-release-k1'
+  it "installs when no oam is on PATH yet (the guidance installs it later)"
+  in_sh good v0.18.0 "$IN_PATH_KG"
+  in_installed good 'signature ok: v0.18.0, signed by oam-release-k1'
+  it "a non-executable oam earlier on PATH does not block"
+  # No shebang: MSYS's exec heuristic marks #!-files executable whatever
+  # chmod says, so a plain-text copy is the honest non-executable here.
+  printf 'echo fake oam\n' >"$IN_SHADOW/oam"
+  chmod 644 "$IN_SHADOW/oam"
+  in_sh good v0.18.0 "$IN_SHADOW:$IN/dest:$IN_PATH_KG"
+  in_installed good 'signature ok: v0.18.0, signed by oam-release-k1'
+  printf '#!/bin/sh\necho fake oam\n' >"$IN_SHADOW/oam"
+  chmod +x "$IN_SHADOW/oam"
+  it "a directory named oam earlier on PATH does not block"
+  rm -f "$IN_SHADOW/oam"
+  mkdir -p "$IN_SHADOW/oam"
+  in_sh good v0.18.0 "$IN_SHADOW:$IN/dest:$IN_PATH_KG"
+  in_installed good 'signature ok: v0.18.0, signed by oam-release-k1'
+  rmdir "$IN_SHADOW/oam"
+  printf '#!/bin/sh\necho fake oam\n' >"$IN_SHADOW/oam"
+  chmod +x "$IN_SHADOW/oam"
+  it "an INSTALL_DIR entry with a trailing slash still gates the check"
+  in_sh good v0.18.0 "$IN_SHADOW:$IN/dest/:$IN_PATH_KG"
+  in_refused 'another oam would win on PATH'
+  rm -f "$IN_SHADOW/oam"
+
   it "bad signature: signed by a key that is not in allowed_signers"
   in_sh stranger v0.18.0 "$IN_PATH_KG"
   in_refused 'does not verify against any oam release key'
@@ -5295,6 +5335,16 @@ if [ -n "$IN_PS64" ]; then
   in_ps_cp "$IN_CP_ORIG"
   if [ "$IN_RC" != "0" ] && grep -qF 'another oam would win on PATH' <<<"$IN_OUT" && [ ! -e "$IN/pdest/oam.exe" ]; then pass
   else fail "rc=$IN_RC, wanted a PATH-shadow refusal and no oam.exe: $IN_OUT"; fi
+  it "ps1: OAM_SKIP_PATH_SHADOW=0 does not unlock (only a literal 1 does)"
+  rm -rf "$IN/pdest"
+  IN_RC=0
+  in_ps_cp 65001
+  IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API \
+    PATH="$IN_SHADOW:$IN_WINPATH" OAM_INSTALL_BASE="$(in_url "$IN/rel/good")" OAM_VERSION=v0.18.0 \
+    OAM_INSTALL_DIR="$(cygpath -w "$IN/pdest")" OAM_SKIP_PATH_SHADOW=0 \
+    "$IN_PS64" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$IN/install.ps1")" 2>&1 | tr -d '\r\n')" || IN_RC=$?
+  in_ps_cp "$IN_CP_ORIG"
+  in_ps_refused 'another oam would win on PATH'
   it "ps1: OAM_SKIP_PATH_SHADOW=1 installs anyway, loudly"
   rm -rf "$IN/pdest"
   IN_RC=0
@@ -5306,6 +5356,17 @@ if [ -n "$IN_PS64" ]; then
   in_ps_cp "$IN_CP_ORIG"
   in_ps_installed 'another oam would win on PATH'
   rm -f "$IN_SHADOW/oam.exe"
+  it "ps1: upgrading over its own install stands down (Get-Command resolves the install dir)"
+  rm -rf "$IN/pdest"; mkdir -p "$IN/pdest"
+  printf '@echo off\r\necho old oam.exe\r\n' >"$IN/pdest/oam.exe"
+  IN_RC=0
+  in_ps_cp 65001
+  IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API \
+    PATH="$IN/pdest:$IN_WINPATH" OAM_INSTALL_BASE="$(in_url "$IN/rel/good")" OAM_VERSION=v0.18.0 \
+    OAM_INSTALL_DIR="$(cygpath -w "$IN/pdest")" \
+    "$IN_PS64" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$IN/install.ps1")" 2>&1 | tr -d '\r\n')" || IN_RC=$?
+  in_ps_cp "$IN_CP_ORIG"
+  in_ps_installed 'signature ok: v0.18.0, signed by oam-release-k1'
 
   it "ps1 latest: the tag comes from the /releases/latest redirect (the local stand-in above)"
   if [ -n "${IN_PORT:-}" ]; then
