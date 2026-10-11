@@ -53,7 +53,7 @@ OPERATOR_KNOBS="OAM_SIGN_REQUIRED OAM_RELEASE_SIGNING_KEY
   OAM_WIN_SIGN_METADATA OAM_WIN_SIGN_PUBLISHER OAM_SKIP_WIN_SIGN OAM_WIN_SIGN_TIMEOUT
   OAM_SKIP_WIN_X64 OAM_SKIP_LINUX OAM_SKIP_LOCAL_GATE
   OAM_DRY_RUN OAM_NO_AUTO_BUMP OAM_NO_AUTO_ATTRIBUTION
-  OAM_INSECURE_SKIP_SIGNATURE"
+  OAM_INSECURE_SKIP_SIGNATURE OAM_SKIP_PATH_SHADOW"
 scrub_operator_knobs(){
   local k
   for k in $OPERATOR_KNOBS; do unset "$k"; done
@@ -4670,7 +4670,7 @@ eq "$IN_CUTS" "$IN_CUT $IN_CUT"
 # every check below, so the set is pinned here.
 it "install.sh and install.ps1 read only the documented OAM_* variables"
 IN_ENV="$(grep -v '^[[:space:]]*#' install/install.sh | grep -oE '\$\{?OAM_[A-Z0-9_]+' | tr -d '${' | LC_ALL=C sort -u | tr '\n' ' ')|$(tr -d '\r' <install/install.ps1 | grep -v '^[[:space:]]*#' | grep -oE 'env:OAM_[A-Z0-9_]+' | cut -d: -f2 | LC_ALL=C sort -u | tr '\n' ' ')"
-eq "$IN_ENV" "OAM_GH_API OAM_INSECURE_SKIP_SIGNATURE OAM_INSTALL_BASE OAM_INSTALL_DIR OAM_VERSION |OAM_GH_API OAM_INSECURE_SKIP_SIGNATURE OAM_INSTALL_BASE OAM_INSTALL_DIR OAM_VERSION "
+eq "$IN_ENV" "OAM_GH_API OAM_INSECURE_SKIP_SIGNATURE OAM_INSTALL_BASE OAM_INSTALL_DIR OAM_VERSION |OAM_GH_API OAM_INSECURE_SKIP_SIGNATURE OAM_INSTALL_BASE OAM_INSTALL_DIR OAM_SKIP_PATH_SHADOW OAM_VERSION "
 
 it "install.sh parses as POSIX sh"
 ck sh -n install/install.sh
@@ -5276,24 +5276,35 @@ if [ -n "$IN_PS64" ]; then
   if grep -qF 'ssh-keygen.cmd' <<<"$IN_OUT"; then in_ps_installed 'signature ok: v0.18.0, signed by oam-release-k1'
   else fail "did not verify with the 8.1-shaped ssh-keygen.cmd: $IN_OUT"; fi
 
-  # The PATH-shadow guard, Windows side: the install dir must be a PATH entry
-  # (it is APPENDED at the end on first install, so not-yet-on-PATH installs
-  # are never refused) and an earlier entry must resolve an oam.exe. The fake
-  # lives in its own dir on PATH ahead of it; OAM_INSTALL_DIR must be a literal
-  # PATH entry too, spelled exactly as passed, or the membership test misses.
-  it "ps1: refuses when an earlier PATH entry resolves an oam.exe and the install dir is on PATH"
+  # The PATH-shadow guard, Windows side: UNGATED -- install.ps1 APPENDS the
+  # install dir to PATH, so even a first install is refused while any earlier
+  # PATH entry resolves an oam (Get-Command, PATHEXT included). The fake lives
+  # in its own dir on PATH and the install dir is NOT on PATH: the refusal must
+  # not depend on the dir already being listed. OAM_SKIP_PATH_SHADOW=1 lifts
+  # the refusal into a loud warning and installs anyway.
+  it "ps1: refuses when an earlier PATH entry resolves an oam.exe"
   IN_SHADOW="$IN/shadow-bin"; mkdir -p "$IN_SHADOW"
   printf '@echo off\r\necho fake oam.exe\r\n' >"$IN_SHADOW/oam.exe"
   rm -rf "$IN/pdest"
   IN_RC=0
   in_ps_cp 65001
   IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API \
-    PATH="$IN_SHADOW:$IN/pdest:$IN_WINPATH" OAM_INSTALL_BASE="$(in_url "$IN/rel/good")" OAM_VERSION=v0.18.0 \
+    PATH="$IN_SHADOW:$IN_WINPATH" OAM_INSTALL_BASE="$(in_url "$IN/rel/good")" OAM_VERSION=v0.18.0 \
     OAM_INSTALL_DIR="$(cygpath -w "$IN/pdest")" \
     "$IN_PS64" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$IN/install.ps1")" 2>&1 | tr -d '\r\n')" || IN_RC=$?
   in_ps_cp "$IN_CP_ORIG"
   if [ "$IN_RC" != "0" ] && grep -qF 'another oam would win on PATH' <<<"$IN_OUT" && [ ! -e "$IN/pdest/oam.exe" ]; then pass
   else fail "rc=$IN_RC, wanted a PATH-shadow refusal and no oam.exe: $IN_OUT"; fi
+  it "ps1: OAM_SKIP_PATH_SHADOW=1 installs anyway, loudly"
+  rm -rf "$IN/pdest"
+  IN_RC=0
+  in_ps_cp 65001
+  IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API \
+    PATH="$IN_SHADOW:$IN_WINPATH" OAM_INSTALL_BASE="$(in_url "$IN/rel/good")" OAM_VERSION=v0.18.0 \
+    OAM_INSTALL_DIR="$(cygpath -w "$IN/pdest")" OAM_SKIP_PATH_SHADOW=1 \
+    "$IN_PS64" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$IN/install.ps1")" 2>&1 | tr -d '\r\n')" || IN_RC=$?
+  in_ps_cp "$IN_CP_ORIG"
+  in_ps_installed 'another oam would win on PATH'
   rm -f "$IN_SHADOW/oam.exe"
 
   it "ps1 latest: the tag comes from the /releases/latest redirect (the local stand-in above)"

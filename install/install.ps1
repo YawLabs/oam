@@ -32,6 +32,11 @@
 #                     ssh-keygen, WITHOUT checking its signature. Only a
 #                     missing tool is skipped: with ssh-keygen present the
 #                     signature is always checked, and a bad one always fails.
+#   OAM_SKIP_PATH_SHADOW=1
+#                     install even though another oam earlier on PATH would
+#                     still be the one that runs (a dev build, or another
+#                     product's bundled copy). Loud: this install does not
+#                     take effect until PATH is reordered.
 #   GH_TOKEN          GitHub token for private-repo installs (GITHUB_TOKEN is
 #                     also accepted). Needed on headless hosts -- CI, a fresh
 #                     VM -- that have a token but no gh CLI. While the repo is
@@ -227,6 +232,22 @@ function Get-LatestTag {
   return $null
 }
 
+# Refuse to install where another oam would win: whatever Get-Command resolves
+# for `oam` (PATHEXT included, so oam.cmd/oam.bat count) is still the oam that
+# runs after this install, because this script only APPENDS the install dir to
+# PATH -- appending cannot fix a shadow, only reordering can. Checked before
+# tag resolution so a shadowed host fails instantly, with no network round
+# trip. (install.sh PREPENDS in its guidance, so its check is gated on the dir
+# already being a PATH entry; this one is not.)
+$shadowCmd = Get-Command oam -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($shadowCmd -and "$($shadowCmd.Path)" -ne (Join-Path $installDir 'oam.exe')) {
+  if ($env:OAM_SKIP_PATH_SHADOW -eq '1') {
+    Warn "OAM_SKIP_PATH_SHADOW=1: installing even though another oam would win on PATH ($($shadowCmd.Path) resolves ahead of $installDir) -- this install is not the oam that runs until PATH is reordered"
+  } else {
+    Die "another oam would win on PATH: $($shadowCmd.Path) resolves ahead of $installDir -- remove it (typically a dev build or a stale copy), put $installDir earlier in PATH, or set OAM_SKIP_PATH_SHADOW=1 to install anyway"
+  }
+}
+
 if ($env:OAM_VERSION) {
   $tag = $env:OAM_VERSION
 } elseif ($env:OAM_INSTALL_BASE) {
@@ -371,21 +392,6 @@ function Get-HashFromSums([string]$text) {
   return $hits[0]
 }
 
-# Refuse to install where another oam.exe would win: this run only helps if the
-# binary it lays down is the one Get-Command resolves. install.ps1 APPENDS the
-# install dir to PATH below, so a shadowing entry earlier on PATH keeps winning
-# even after a restart -- appending cannot fix it, only reordering can. Scan in
-# PATH order and stop at the install dir itself: nothing before it shadows, and
-# nothing after it can win. (install.sh PREPENDS in its guidance, so its check
-# is gated on the dir already being a PATH entry; this one is not.)
-$shadow = $null
-foreach ($p in ($env:Path -split ';')) {
-  if (-not $p) { continue }
-  if ($p -ieq $installDir) { break }
-  if (Test-Path -LiteralPath (Join-Path $p 'oam.exe') -PathType Leaf) { $shadow = Join-Path $p 'oam.exe'; break }
-}
-if ($shadow) { Die "another oam would win on PATH: $shadow resolves before $installDir -- remove it (typically a dev build or a stale copy), or put $installDir earlier in PATH" }
-
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("oam-install-" + [System.Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 try {
@@ -515,7 +521,7 @@ try {
   # sweep clears it. Say so when it survives -- a stray oam.exe beside the
   # install is exactly the residue that must not go unnoticed.
   Remove-Item -Path "$dest.old" -Force -ErrorAction SilentlyContinue
-  if (Test-Path "$dest.old") { Warn "the previous oam.exe is still running, so $dest.old was kept -- it is not on PATH and a later install or 'oam self-update' will clear it" }
+  if (Test-Path "$dest.old") { Warn "$dest.old could not be removed -- most likely the previous oam.exe is still running (an ACL refusal looks the same); it is not on PATH and a later install or 'oam self-update' will clear it" }
   Say "installed oam $tag to $dest"
 
   # The binary is a binary redistribution of V8, ICU, the Node streams port and
