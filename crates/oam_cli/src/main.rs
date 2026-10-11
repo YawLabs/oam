@@ -3905,6 +3905,73 @@ mod tests {
         });
         assert_eq!(argv_only.exec_argv(), vec!["--no-warnings"]);
     }
+
+    #[test]
+    fn node_options_takes_v8_pool_size_in_both_forms_and_ignores_an_empty_one() {
+        // Pins the NODE_OPTIONS arms for --v8-pool-size, which mirror the
+        // header-size ones: an empty `=` value is node's exit 9, but the
+        // allowlist ignores the token instead (it must not read as a pool of
+        // 0), and the spaced form takes the next token as the value.
+        let mut flags = super::NodeFlags::default();
+        assert!(super::apply_node_options(
+            &mut flags,
+            "--v8-pool-size= --v8-pool-size 2"
+        ));
+        assert_eq!(flags.v8_pool_size.as_deref(), Some("2"));
+        // The `=` form alone sets it too.
+        let mut eq = super::NodeFlags::default();
+        assert!(super::apply_node_options(&mut eq, "--v8-pool-size=3"));
+        assert_eq!(eq.v8_pool_size.as_deref(), Some("3"));
+        // An empty `=` value alone leaves it unset, and the return value
+        // reports that nothing changed rather than an error.
+        let mut empty = super::NodeFlags::default();
+        assert!(!super::apply_node_options(&mut empty, "--v8-pool-size="));
+        assert_eq!(empty.v8_pool_size, None);
+        // A trailing spaced form with no value is ignored the same way.
+        let mut trailing = super::NodeFlags::default();
+        assert!(!super::apply_node_options(&mut trailing, "--v8-pool-size"));
+        assert_eq!(trailing.v8_pool_size, None);
+    }
+
+    #[test]
+    fn merged_takes_argv_v8_pool_size_as_a_pair_and_reflects_it() {
+        // Pins the merge arm for --v8-pool-size: argv's value wins together
+        // with its spacing (the environment's spaced `1` does not leak its
+        // `spaced` bit onto argv's `=2`), and execArgv hands argv's form
+        // back so a fork child sizes its pool the same way.
+        let env = super::NodeFlags {
+            v8_pool_size: Some("1".into()),
+            v8_pool_size_spaced: true,
+            ..Default::default()
+        };
+        let argv = super::NodeFlags {
+            v8_pool_size: Some("2".into()),
+            v8_pool_size_spaced: false,
+            ..Default::default()
+        };
+        let merged = env.merged(argv);
+        assert_eq!(merged.v8_pool_size.as_deref(), Some("2"));
+        assert!(!merged.v8_pool_size_spaced);
+        assert_eq!(merged.exec_argv(), vec!["--v8-pool-size=2"]);
+        // A value only the environment gave stands, pair intact, and is
+        // not reflected: node never lists NODE_OPTIONS in execArgv.
+        let env_only = super::NodeFlags {
+            v8_pool_size: Some("1".into()),
+            v8_pool_size_spaced: true,
+            ..Default::default()
+        }
+        .merged(super::NodeFlags::default());
+        assert_eq!(env_only.v8_pool_size.as_deref(), Some("1"));
+        assert!(env_only.v8_pool_size_spaced);
+        assert!(env_only.exec_argv().is_empty());
+        // argv's spaced form is reflected as two tokens.
+        let spaced = super::NodeFlags::default().merged(super::NodeFlags {
+            v8_pool_size: Some("4".into()),
+            v8_pool_size_spaced: true,
+            ..Default::default()
+        });
+        assert_eq!(spaced.exec_argv(), vec!["--v8-pool-size", "4"]);
+    }
 }
 
 /// Every all-granted runtime construction in this binary has to be something

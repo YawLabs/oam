@@ -2264,7 +2264,10 @@ mod tests {
     }
 
     /// A failure the resolver reports by code is classified from the code,
-    /// as libuv does, not from its text.
+    /// as libuv does (src/unix/getaddrinfo.c `uv__getaddrinfo_translate_error`),
+    /// not from its text: every row of [`classify_gai`] lands on its
+    /// `UV_EAI_*` number, including EAI_ADDRFAMILY, which the libc crate does
+    /// not name and the table spells as glibc's -9 / macOS's 1.
     #[cfg(unix)]
     #[test]
     fn gai_codes_follow_libuv() {
@@ -2274,9 +2277,17 @@ mod tests {
             (libc::EAI_FAIL, "EAI_FAIL", -3004),
             (libc::EAI_BADFLAGS, "EAI_BADFLAGS", -3002),
             (libc::EAI_FAMILY, "EAI_FAMILY", -3005),
+            (libc::EAI_MEMORY, "EAI_MEMORY", -3006),
+            (libc::EAI_OVERFLOW, "EAI_OVERFLOW", -3009),
             (libc::EAI_SERVICE, "EAI_SERVICE", -3010),
+            (libc::EAI_SOCKTYPE, "EAI_SOCKTYPE", -3011),
             #[cfg(not(target_os = "freebsd"))]
             (libc::EAI_NODATA, "ENOTFOUND", -3007),
+            // EAI_ADDRFAMILY by its netdb.h value (glibc -9, macOS 1).
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            (-9, "EAI_ADDRFAMILY", -3000),
+            #[cfg(target_vendor = "apple")]
+            (1, "EAI_ADDRFAMILY", -3000),
         ];
         for (gai, code, errno) in cases {
             let error = io::Error::other(GaiError {
@@ -2289,21 +2300,58 @@ mod tests {
         }
     }
 
+    /// Windows' getaddrinfo reports a `WSA*` code, classified as libuv does
+    /// (src/win/getaddrinfo.c `uv__getaddrinfo_translate_error`), not from
+    /// its text: every row of [`classify_wsa`] lands on its `UV_EAI_*`
+    /// number. WSANO_DATA is the one row libuv does not have; it is pinned
+    /// as the ENOTFOUND/-3008 the table chose (see [`resolve_error`]).
     #[cfg(windows)]
     #[test]
     fn gai_codes_follow_libuv() {
-        use windows_sys::Win32::Networking::WinSock::{WSAHOST_NOT_FOUND, WSATRY_AGAIN};
+        use windows_sys::Win32::Networking::WinSock::{
+            WSAEAFNOSUPPORT, WSAEINVAL, WSAESOCKTNOSUPPORT, WSAHOST_NOT_FOUND, WSANO_DATA,
+            WSANO_RECOVERY, WSATRY_AGAIN, WSATYPE_NOT_FOUND,
+        };
         for (wsa, code, errno) in [
             (WSAHOST_NOT_FOUND, "ENOTFOUND", -3008),
+            (WSANO_DATA, "ENOTFOUND", -3008),
             (WSATRY_AGAIN, "EAI_AGAIN", -3001),
+            (WSANO_RECOVERY, "EAI_FAIL", -3004),
+            (WSAEINVAL, "EAI_BADFLAGS", -3002),
+            (WSAEAFNOSUPPORT, "EAI_FAMILY", -3005),
+            (WSATYPE_NOT_FOUND, "EAI_SERVICE", -3010),
+            (WSAESOCKTNOSUPPORT, "EAI_SOCKTYPE", -3011),
         ] {
             let error = io::Error::other(GaiError {
                 code: wsa,
                 inner: io::Error::other("the resolver's text, unread"),
             });
             let e = resolve_error("host.invalid", &error);
-            assert_eq!((e.code.as_str(), e.errno), (code, Some(errno)));
+            assert_eq!((e.code.as_str(), e.errno), (code, Some(errno)), "{wsa}");
+            assert_eq!(e.message, format!("getaddrinfo {code} host.invalid"));
         }
+    }
+
+    /// A resolver code with no row in the table is classified from
+    /// gai_strerror's text, the fallback [`resolve_error`] documents, rather
+    /// than falling through to EAI_FAIL blindly: "Temporary failure in name
+    /// resolution" is EAI_AGAIN/-3001 whatever code carried it.
+    #[test]
+    fn an_unknown_gai_code_falls_back_to_the_resolver_text() {
+        let error = io::Error::other(GaiError {
+            code: 99999,
+            inner: io::Error::other("Temporary failure in name resolution"),
+        });
+        let e = resolve_error("host.invalid", &error);
+        assert_eq!((e.code.as_str(), e.errno), ("EAI_AGAIN", Some(-3001)));
+        assert_eq!(e.message, "getaddrinfo EAI_AGAIN host.invalid");
+        // Text the fallback does not know is EAI_FAIL, its last resort.
+        let error = io::Error::other(GaiError {
+            code: 99999,
+            inner: io::Error::other("Something the fallback never heard of"),
+        });
+        let e = resolve_error("host.invalid", &error);
+        assert_eq!((e.code.as_str(), e.errno), ("EAI_FAIL", Some(-3004)));
     }
 
     #[tokio::test]

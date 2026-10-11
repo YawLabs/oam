@@ -12988,6 +12988,222 @@ process.exit(0);
     );
 }
 
+/// #155's two open rows over TLS: the same raw-socket handler on
+/// `tls.createServer`, fetched over https with the private CA in
+/// NODE_EXTRA_CA_CERTS. The freshness gate in `pool::reuse_h1` is keyed on
+/// the pooled entry, not on what the connection carries, so an https
+/// connection is gated the same way -- but what the close looks like
+/// differs. On plain TCP the server's `end()` is a kernel FIN, caught by
+/// `EagerTcp`'s peek (an EOF the reactor has not reported yet). Over TLS
+/// node's `end()` sends a close_notify alert first, then the FIN: the peek
+/// sees BYTES, not EOF, rustls reads the alert and reports the stream's end
+/// to hyper, and the dispatcher closes the sender on that -- the close
+/// arrives through rustls as EOF (close_notify), not as a kernel FIN. The
+/// gate's 1 ms window has to cover that extra decode, so the contract here
+/// is the two plain-TCP tests' above, with their tolerances: the `POST` +
+/// `200`-then-FIN row at >= 398 of 400 and the `GET` + `302` row at <= 3
+/// doubled hops of 1,000, every `/redir` request read once, every fetch
+/// answered.
+///
+/// Ignored: oam does not meet it yet. Measured 2026-10-10 on Windows
+/// arm64, debug build, node v22.22.2 as the server, five runs: 4, 10, 53,
+/// 53 and 53 of 1,000 `GET` + `302` hops doubled, 0-7 of 1,000 fetches
+/// failed, a `/redir` request read twice in three runs, and 380-400 of 400
+/// `POST`s through -- the plain-TCP gate-off numbers, where the same box
+/// and the same run measure plain TCP at 0 doubles, 0 fails and 400 of
+/// 400. Node's own client over the same TLS server measures 0 doubles, 0
+/// fails and 400 of 400, twice. So the freshness gate does not cover the
+/// TLS close, and the row is node's to match; this test is the contract
+/// to un-ignore with the fix.
+#[test]
+#[ignore = "the pool's freshness gate does not cover a TLS close: 4-53 of 1,000 GET + 302 hops \
+            doubled and 380-400 of 400 POSTs through where node measures 0 and 400 (see the doc)"]
+fn the_fin_gate_holds_over_tls_for_a_get_hop_and_a_post_after_a_fin() {
+    let bundle = write_temp("tls-fin-gate/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import tls from 'node:tls';
+// Per-path arrival counts: a request read into the close the server's
+// end() is sending, then resent from a fresh connection, counts twice.
+const counts = new Map();
+const bump = (p) => counts.set(p, (counts.get(p) || 0) + 1);
+const server = tls.createServer({ cert: `__CERT__`, key: `__KEY__` }, (sock) => {
+  let buf = '';
+  sock.on('data', (d) => {
+    buf += d.toString('latin1');
+    let i;
+    while ((i = buf.indexOf('\r\n\r\n')) !== -1) {
+      const head = buf.slice(0, i);
+      const path = head.split(' ')[1].split('?')[0];
+      const m = head.match(/content-length:\s*(\d+)/i);
+      const cl = m ? Number(m[1]) : 0;
+      buf = buf.slice(i + 4);
+      if (buf.length >= cl) buf = buf.slice(cl);
+      if (buf.length > 64 * 1024) { sock.destroy(); return; }
+      bump(path);
+      if (path.startsWith('/redir')) {
+        // 302 and close in one callback: over TLS the close is a
+        // close_notify alert and then the FIN.
+        sock.write(`HTTP/1.1 302 Found\r\nlocation: ${path.replace('/redir', '/final')}\r\ncontent-length: 0\r\n\r\n`);
+        sock.end();
+      } else if (path.startsWith('/fin/')) {
+        // 200 + keep-alive answered, then the close at once.
+        sock.write('HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok');
+        sock.end();
+      } else {
+        sock.write('HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok');
+      }
+    }
+  });
+  sock.on('error', () => {});
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `https://127.0.0.1:${server.address().port}`;
+
+// 8 chains x 125 sequential GETs, each followed through its 302: the
+// 1,000 hops #155 measured with.
+let getOk = 0;
+await Promise.all(Array.from({ length: 8 }, async (_, c) => {
+  for (let i = 0; i < 125; i++) {
+    try {
+      const r = await fetch(`${base}/redir/${c}_${i}?s=302`);
+      if (r.status === 200 && (await r.text()) === 'ok') getOk++;
+    } catch {}
+  }
+}));
+
+// 8 chains x 50 sequential POSTs against the 200-then-close shape: every
+// pooled connection each chain meets is one whose close is in flight.
+let finOk = 0;
+await Promise.all(Array.from({ length: 8 }, async (_, c) => {
+  for (let i = 0; i < 50; i++) {
+    try {
+      const r = await fetch(`${base}/fin/${c}_${i}`, { method: 'POST', body: 'x' });
+      if (r.status === 200 && (await r.text()) === 'ok') finOk++;
+    } catch {}
+  }
+}));
+
+// Let a late server-side arrival land before reading the counts.
+await new Promise((r) => setTimeout(r, 100));
+const maxArrivals = (pred) => {
+  let max = 0;
+  for (const [p, n] of counts) if (pred(p)) max = Math.max(max, n);
+  return max;
+};
+const doubles = (pred) => {
+  let n = 0;
+  for (const [p, c] of counts) if (pred(p) && c > 1) n++;
+  return n;
+};
+console.log('get_ok=' + getOk);
+console.log('redir_max=' + maxArrivals((p) => p.startsWith('/redir/')));
+console.log('final_max=' + maxArrivals((p) => p.startsWith('/final/')));
+console.log('final_doubles=' + doubles((p) => p.startsWith('/final/')));
+console.log('fin_ok=' + finOk);
+console.log('fin_max=' + maxArrivals((p) => p.startsWith('/fin/')));
+process.exit(0);
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("tls_fin_gate/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, _) = run_script_ok(&script, out);
+    let num = |key: &str| -> u64 {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{key} missing from:\n{stdout}"))
+    };
+    assert_eq!(
+        num("get_ok="),
+        1000,
+        "every GET + 302 fetch over TLS succeeds:\n{stdout}"
+    );
+    assert_eq!(
+        num("redir_max="),
+        1,
+        "every 302 request arrived exactly once:\n{stdout}"
+    );
+    let final_max = num("final_max=");
+    let final_doubles = num("final_doubles=");
+    let fin_max = num("fin_max=");
+    let fin_ok = num("fin_ok=");
+    println!(
+        "final_max={final_max} final_doubles={final_doubles} fin_ok={fin_ok} fin_max={fin_max}"
+    );
+    assert!(
+        final_doubles <= 3,
+        "{final_doubles}/1000 GET + 302 hops over TLS arrived twice (tolerance 3, as over \
+         plain TCP -- the pool::reuse_h1 freshness wait is a 1 ms heuristic, and over TLS \
+         the close is a close_notify rustls must decode before the sender closes):\n{stdout}"
+    );
+    assert_eq!(
+        fin_max, 1,
+        "no POST on a just-pooled TLS connection was read twice:\n{stdout}"
+    );
+    assert!(
+        fin_ok >= 398,
+        "only {fin_ok}/400 POSTs on a just-pooled TLS connection whose close followed got \
+         through (tolerance 2, as over plain TCP):\n{stdout}"
+    );
+}
+
+/// `http.request` hands `family` and `hints` to the agent's socket, where
+/// node's net.connect resolves with them (#165), instead of oam's own
+/// transport, which resolves with neither. Against a server listening on
+/// 127.0.0.1 alone: `family: 6` resolves `localhost` to `::1` where the
+/// resolver has it, and the connect is refused there (`ECONNREFUSED` with
+/// address `::1`, one error, never an AggregateError -- node connects to
+/// the one address a family-pinned lookup returns), or fails the lookup
+/// (`ENOTFOUND`) on a box whose `localhost` is 127.0.0.1 only; either way
+/// no response. `family: 4` and `hints: dns.ADDRCONFIG` reach the server.
+/// Both outcomes were measured on node v22.22.2: this box resolves
+/// `localhost` to `::1` first, so its line is the ECONNREFUSED one.
+#[test]
+fn http_request_family_and_hints_resolve_on_the_agent_socket() {
+    let script = write_temp(
+        "http_request_family/main.mjs",
+        r#"import http from 'node:http';
+import dns from 'node:dns';
+const server = http.createServer((req, res) => res.end('ok'));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const attempt = (label, extra) => new Promise((resolve) => {
+  const req = http.get({ host: 'localhost', port, path: '/', ...extra }, (res) => {
+    let s = '';
+    res.on('data', (d) => (s += d));
+    res.on('end', () => { console.log(label, 'response', res.statusCode, s); resolve(); });
+  });
+  req.on('error', (e) => {
+    console.log(label, 'error', e.name, e.code, e.address ?? '-', e.port === port ? 'PORT' : (e.port ?? '-'), Array.isArray(e.errors) ? 'aggregate' : 'single');
+    resolve();
+  });
+});
+await attempt('family6', { family: 6 });
+await attempt('family4', { family: 4 });
+await attempt('addrconfig', { hints: dns.ADDRCONFIG });
+server.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let stdout = stdout.trim().replace("\r\n", "\n");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "stdout: {stdout}\nstderr: {stderr}");
+    // Which of the two the resolver gives is the box's; both are node's.
+    assert!(
+        lines[0] == "family6 error Error ECONNREFUSED ::1 PORT single"
+            || lines[0] == "family6 error Error ENOTFOUND - - single",
+        "family: 6 against a 127.0.0.1-only server must fail node's way, got: {}\nstderr: {stderr}",
+        lines[0]
+    );
+    assert_eq!(lines[1], "family4 response 200 ok", "stderr: {stderr}");
+    assert_eq!(lines[2], "addrconfig response 200 ok", "stderr: {stderr}");
+}
+
 /// A fetch whose dispatcher carries a connect.lookup hook never goes through
 /// the environment proxy: an undici Agent does not read HTTP_PROXY, and a
 /// pin that a proxy resolved again would pin nothing. The same fetch without
@@ -31196,6 +31412,110 @@ fn install_precompile_creates_cache() {
     let _ = std::fs::remove_dir_all(&project_dir);
 }
 
+/// A registry mirror or proxy that encodes a tarball response unasked fails
+/// the install loudly, at integrity. Since #173 the installer sends no
+/// `accept-encoding` and decodes nothing, so a body served under
+/// `content-encoding: gzip` is hashed as it came -- the gzip wrapper, not
+/// the tarball the lockfile's sha512 names -- and `OAM-PKG0004` reports the
+/// mismatch, the install exits non-zero, and the package is not extracted.
+/// (A silent decode would hide a mirror that rewrites what it serves; the
+/// registries oam resolves against serve identity whatever the offer.)
+#[test]
+fn install_fails_loudly_when_a_tarball_arrives_content_encoded() {
+    use sha2::{Digest, Sha512};
+
+    let tarball = make_fake_tarball(&[("index.js", "module.exports = 1;\n")]);
+    // The lockfile names the tarball the registry published...
+    let hash = Sha512::digest(&tarball);
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash.as_slice());
+    let integrity = format!("sha512-{b64}");
+    // ...and the mirror serves it wrapped in a transfer-level gzip.
+    let encoded = {
+        use std::io::Write as _;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tarball).unwrap();
+        gz.finish().unwrap()
+    };
+
+    use std::io::{Read as _, Write as _};
+    use std::sync::Arc;
+    let encoded = Arc::new(encoded);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = encoded.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let data = body.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\n\
+                     content-encoding: gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    data.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&data);
+            });
+        }
+    });
+
+    let resolved_url = format!("http://{addr}/fake-pkg-1.0.0.tgz");
+    let lockfile = format!(
+        r#"{{
+            "name": "test-encoded-tarball",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {{
+                "": {{"name":"test-encoded-tarball","version":"1.0.0"}},
+                "node_modules/fake-pkg": {{
+                    "version": "1.0.0",
+                    "resolved": "{resolved_url}",
+                    "integrity": "{integrity}"
+                }}
+            }}
+        }}"#
+    );
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let project_dir = std::env::temp_dir().join(format!(
+        "oam-e2e-encoded-tarball-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&project_dir).unwrap();
+    std::fs::write(project_dir.join("package-lock.json"), &lockfile).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["install"])
+        .current_dir(&project_dir)
+        .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
+        .output()
+        .expect("oam binary runs");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "an unasked content-encoding must fail the install; stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("OAM-PKG0004") && stderr.contains("integrity mismatch"),
+        "the failure is reported as the package's integrity mismatch; stdout: {stdout}\nstderr: {stderr}"
+    );
+    let pkg_dir = project_dir.join("node_modules").join("fake-pkg");
+    assert!(
+        !pkg_dir.exists(),
+        "a tarball that failed integrity must not be extracted: {} exists",
+        pkg_dir.display()
+    );
+
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
 // C1: --precompile on a WARM tree. A prior `oam install` without the flag
 // (or an npm-installed tree) leaves no precompile cache; re-running install
 // WITH the flag must populate it, because the precompile pass walks every
@@ -32458,6 +32778,119 @@ fn heap_cap_env_always_caps_and_warns_on_an_unusable_value() {
         "OAM_MAX_HEAP_MB=8192 must raise the cap, got {large} bytes"
     );
     assert!(!stderr.contains("warning"), "8192 is valid: {stderr}");
+}
+
+/// `OAM_V8_POOL_SIZE`'s warning contract (oam_engine::init_platform_with_flags):
+/// a value that is not an integer is named in one `ignoring` line on stderr
+/// and the run goes on with the default pool (exit 0); an empty value is
+/// unset, not a mistake, so nothing is said; and `--v8-pool-size` wins
+/// outright -- the variable is not even read, so a bad one beside the flag
+/// draws no warning. The flag's own contract, node's: a bare trailing
+/// `--v8-pool-size` with nothing after it (before any subcommand, where
+/// oam's node-style flags live) is exit 9.
+#[test]
+fn v8_pool_size_env_warns_once_on_a_bad_value_and_yields_to_the_flag() {
+    let script = write_temp("v8_pool_size_env.mjs", "console.log('ran');");
+    let path = script.to_string_lossy().to_string();
+    let run = |args: &[&str], value: &str| -> String {
+        let out = oam_with_env(args, &[("OAM_V8_POOL_SIZE", value)]);
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            out.status.success(),
+            "OAM_V8_POOL_SIZE={value:?} {args:?}: exit {}; stderr: {stderr}",
+            out.status
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "ran",
+            "OAM_V8_POOL_SIZE={value:?} {args:?}: stderr: {stderr}"
+        );
+        stderr
+    };
+
+    let stderr = run(&["run", &path], "abc");
+    let warning = "oam: ignoring OAM_V8_POOL_SIZE=\"abc\": expected an integer";
+    assert_eq!(
+        stderr.matches(warning).count(),
+        1,
+        "a non-integer is named in exactly one warning: {stderr}"
+    );
+
+    let stderr = run(&["run", &path], "");
+    assert!(
+        !stderr.contains("OAM_V8_POOL_SIZE"),
+        "an empty value is unset, not a mistake: {stderr}"
+    );
+
+    // node-style flags go before the subcommand, as node's go before the
+    // script (`oam run --v8-pool-size=2 x` is clap's exit 2).
+    let stderr = run(&["--v8-pool-size=2", "run", &path], "abc");
+    assert!(
+        !stderr.contains("OAM_V8_POOL_SIZE"),
+        "the flag wins and the variable is not read: {stderr}"
+    );
+
+    let out = oam(&["--v8-pool-size"]);
+    assert_eq!(
+        out.status.code(),
+        Some(9),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--v8-pool-size requires an argument"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The pool size takes effect: the V8 platform starts exactly as many
+/// worker threads as `--v8-pool-size` / `OAM_V8_POOL_SIZE` ask for, and
+/// without either `oam_engine::v8_pool_size`'s default -- node's 4, capped
+/// at one per core but one (and at least 1). Counted through
+/// `/proc/self/task/*/comm`, where V8 names them `V8 DefaultWorker` (comm
+/// truncates to 15 bytes, so the prefix `V8 DefaultWorke`); Linux only,
+/// since nowhere else exposes thread names this way.
+#[cfg(target_os = "linux")]
+#[test]
+fn v8_pool_size_sets_the_platforms_worker_thread_count() {
+    let script = write_temp(
+        "v8_pool_threads.mjs",
+        "import fs from 'node:fs';\n\
+         let n = 0;\n\
+         for (const t of fs.readdirSync('/proc/self/task')) {\n\
+           let comm = '';\n\
+           try { comm = fs.readFileSync(`/proc/self/task/${t}/comm`, 'utf8'); } catch { continue; }\n\
+           if (comm.startsWith('V8 DefaultWorke')) n++;\n\
+         }\n\
+         console.log(n);\n",
+    );
+    let path = script.to_string_lossy().to_string();
+    let workers = |args: &[&str], env: &[(&str, &str)]| -> u64 {
+        let out = oam_with_env(args, env);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{args:?} {env:?}: exit {}; stderr: {stderr}",
+            out.status
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        stdout.trim().parse().unwrap_or_else(|e| {
+            panic!("{args:?} {env:?}: stdout {stdout:?}: {e}; stderr: {stderr}")
+        })
+    };
+    assert_eq!(workers(&["run", "--v8-pool-size=1", &path], &[]), 1);
+    assert_eq!(workers(&["run", "--v8-pool-size=3", &path], &[]), 3);
+    assert_eq!(workers(&["run", &path], &[("OAM_V8_POOL_SIZE", "2")]), 2);
+    // No request: min(4, cores - 1), and at least 1 -- the same formula on
+    // the same box the child sizes from.
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let default = cores.saturating_sub(1).max(1).min(4) as u64;
+    assert_eq!(
+        workers(&["run", &path], &[]),
+        default,
+        "the default pool on a {cores}-core box"
+    );
 }
 
 /// Reaching the cap is the `OAM-RT-OOM` banner and exit 134, not a V8 abort.

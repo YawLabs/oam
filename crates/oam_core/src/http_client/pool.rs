@@ -1478,6 +1478,70 @@ mod tests {
         );
     }
 
+    /// The pop-first invariant of [`Pool::reuse_h1`] (#155): the entry
+    /// leaves the idle map when the checkout pops it, BEFORE the gate wait,
+    /// so a concurrent checkout under the same key finds nothing rather
+    /// than stealing the entry mid-wait. Had the pop come after the sleep,
+    /// the second checkout here would take the entry and the first would
+    /// wake to age an entry it never got. Polled by hand with a noop waker
+    /// so the second checkout runs while the first is pinned inside the
+    /// wait, not wherever a scheduler would put it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_checkout_in_the_gate_wait_already_holds_the_entry_it_popped() {
+        use std::task::{Context, Poll, Waker};
+        fn poll_once<F: Future + ?Sized>(fut: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+            fut.poll(&mut Context::from_waker(Waker::noop()))
+        }
+
+        let (sender, _keep) = h1_sender().await;
+        let pool = test_pool(Some(Duration::from_secs(90)));
+        let key = pool_key(&"http://gate.test/".parse().unwrap(), Alpn::default()).unwrap();
+        push_idle(&pool, &key, sender, Instant::now());
+        let mut first = Box::pin(pool.reuse_h1(&key));
+        assert!(
+            poll_once(first.as_mut()).is_pending(),
+            "a just-parked live entry must enter the gate wait, not be handed out"
+        );
+        // While the first checkout sleeps, the entry is already its own.
+        assert!(
+            pool.reuse_h1(&key).await.is_none(),
+            "a concurrent checkout must not steal the entry the first popped"
+        );
+        assert!(
+            !pool
+                .inner
+                .idle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&key),
+            "the idle map must drop the key once its only entry is popped"
+        );
+        // Let the gate elapse, then drive the first checkout home with the
+        // FIN test's bounded poll loop: the post-sleep `yield_now` yields
+        // Pending once under a noop waker.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut handed = None;
+        for _ in 0..8 {
+            match poll_once(first.as_mut()) {
+                Poll::Ready(conn) => {
+                    handed = Some(conn);
+                    break;
+                }
+                Poll::Pending => tokio::task::yield_now().await,
+            }
+        }
+        let conn = handed
+            .expect("the first checkout must complete within 8 polls")
+            .expect("the first checkout must hand out the entry it popped");
+        let Proto::H1(sender, _) = conn.proto else {
+            panic!("an h1 pool must hand out an h1 sender");
+        };
+        assert!(
+            !sender.is_closed(),
+            "the handed-out sender is the live entry aged by the wait"
+        );
+    }
+
     /// A dead front entry is consumed and skipped, and the live one behind
     /// it is handed out -- the only path by which a checkout gets a SECOND
     /// pooled entry since the pop-first restructure.
