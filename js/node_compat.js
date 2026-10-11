@@ -22121,11 +22121,14 @@
       server[Symbol.for("oam.serverClosing")] = false;
       server[Symbol.for("oam.serverClosed")] = false;
       server._serverId = bound.serverId;
-      server._port = bound.port;
+      // A pipe server has no port, host or family (#282): a null port is
+      // what marks the server as a pipe's while it listens (net.Server's
+      // shape), and address() answers the path (server._pipeName).
+      server._port = bound.port !== undefined ? bound.port : null;
       // Where the listener IS bound: `::` for a listen() without a host
       // (dual-stack), the looked-up address for a name.
-      server._host = bound.address;
-      server._family = bound.family;
+      server._host = bound.address !== undefined ? bound.address : null;
+      server._family = bound.family !== undefined ? bound.family : undefined;
       server.listening = true;
       syncServerTimeouts(server);
       startConnectionsCheck(server);
@@ -22468,35 +22471,68 @@
         // node's reading of the arguments (net.Server's listen is the one
         // http.Server has); a port that is not one throws from here (#163).
         const listen = normalizeListenArgs(args);
-        if (refusePipeListen(this, listen)) return this;
-        const { port, host, ipv6Only, cb: callback } = listen;
+        const { port, host, ipv6Only, path, cb: callback } = listen;
+        // A path: a Unix domain socket or a Windows named pipe (#282). node
+        // names the server by it from here on -- address() answers the path
+        // once listening, and still after close() (`this._pipeName`).
+        if (path !== undefined) this._pipeName = path;
         if (callback !== null) this.once("listening", callback);
         // Stream request bodies: the handler is dispatched on headers and
         // req delivers chunks as they arrive, instead of waiting for the
         // last byte (docs/design/streaming-bodies.md).
         const policy = serverHeadPolicy(this);
-        natives.httpServe(
-          // No host: node's default, dual-stack `::` (#172).
-          host ?? null,
-          port,
-          true,
-          policy.maxHeaderSize,
-          policy.insecure,
-          ...serverTimeoutArgs(this),
-          // maxHeadersCount: null (the default) leaves the native 1000-field
-          // cap; 0 is no limit; a number is that cap.
-          this.maxHeadersCount,
-          ipv6Only,
-        ).then(
+        let binding;
+        if (path !== undefined) {
+          // net's module section assigns the pipe-name helpers on load, and
+          // THIS module may have loaded without it (a script that only
+          // imports node:http) -- force it, as the upgrade path does.
+          registry.get("net");
+          // A name libuv refuses (EINVAL for a NUL byte) fails as a bind
+          // does: 'error' on a later tick, the server never listening.
+          binding =
+            typeof path === "string" && registry._pipeNameHasNul(path)
+              ? Promise.reject(registry._pipeNulError("listen", path))
+              : natives.httpPipeServe(
+                path,
+                true,
+                policy.maxHeaderSize,
+                policy.insecure,
+                ...serverTimeoutArgs(this),
+                // maxHeadersCount: null (the default) leaves the native
+                // 1000-field cap; 0 is no limit; a number is that cap.
+                this.maxHeadersCount,
+              );
+        } else {
+          binding = natives.httpServe(
+            // No host: node's default, dual-stack `::` (#172).
+            host ?? null,
+            port,
+            true,
+            policy.maxHeaderSize,
+            policy.insecure,
+            ...serverTimeoutArgs(this),
+            this.maxHeadersCount,
+            ipv6Only,
+          );
+        }
+        binding.then(
           (bound) => serverBound(this, bound, false),
-          (err) => this.emit("error", err),
+          (err) => {
+            // node's uvExceptionWithHostPort: a pipe's bind error carries
+            // port -1 (last of its keys), as net's own pipe path reports.
+            if (err && err.syscall === "listen") err.port = -1;
+            this.emit("error", err);
+          },
         );
         return this;
       }
       address() {
-        return this.listening
-          ? { address: this._host, family: this._family, port: this._port }
-          : null;
+        if (this.listening && this._port !== null) {
+          return { address: this._host, family: this._family, port: this._port };
+        }
+        // A pipe server is named by its path from listen(path) on, even
+        // after close() (node's `_pipeName`).
+        return this._pipeName !== undefined ? this._pipeName : null;
       }
       close(callback) {
         // A never-listening server's callback gets ERR_SERVER_NOT_RUNNING
@@ -28330,6 +28366,10 @@
       return true;
     }
     registry._netRefusePipeConnect = refusePipeConnect;
+    // net's pipe-name validation, shared with the tls.Server listen() that
+    // also takes a path now (#282): same NUL check, same node error shapes.
+    registry._pipeNameHasNul = pipeNameHasNul;
+    registry._pipeNulError = pipeNulError;
 
     // `host` is the caller's (net: options.host || 'localhost'), `port` the
     // caller's too, validated here; the caller dials `port | 0`.
@@ -31759,31 +31799,62 @@
         // node's reading of the arguments; a port that is not one throws
         // from here (#163).
         var listen = normalizeListenArgs(args);
-        if (refusePipeListen(this, listen)) return this;
-        var port = listen.port, host = listen.host, callback = listen.cb;
+        var port = listen.port, host = listen.host, path = listen.path, callback = listen.cb;
+        // A path: a Unix domain socket or a Windows named pipe (#282). node
+        // names the server by it from here on -- address() answers the path
+        // once listening, and still after close() (`this._pipeName`).
+        if (path !== undefined) this._pipeName = path;
         if (callback !== null) this.once("listening", callback);
         var policy = registry._httpParserOptions.policy(this);
         var accept = tlsAcceptArgs(this);
-        natives.httpsServe(
-          // No host: node's default, dual-stack `::` (#172).
-          host || null,
-          port,
-          ...accept,
-          policy.maxHeaderSize,
-          policy.insecure,
-          ...registry._httpParserOptions.timeoutArgs(this),
-          // maxHeadersCount: null (the default) leaves the native 1000-field
-          // cap; 0 is no limit; a number is that cap.
-          this.maxHeadersCount,
-          listen.ipv6Only,
-        ).then(
+        var binding;
+        if (path !== undefined) {
+          // net's module section assigns the pipe-name helpers on load, and
+          // THIS module may have loaded without it -- force it, as
+          // _connectTls does.
+          registry.get("net");
+          // A name libuv refuses (EINVAL for a NUL byte) fails as a bind
+          // does: 'error' on a later tick, the server never listening.
+          binding =
+            typeof path === "string" && registry._pipeNameHasNul(path)
+              ? Promise.reject(registry._pipeNulError("listen", path))
+              : natives.httpsPipeServe(
+                  path,
+                  ...accept,
+                  policy.maxHeaderSize,
+                  policy.insecure,
+                  ...registry._httpParserOptions.timeoutArgs(this),
+                  // maxHeadersCount: null (the default) leaves the native
+                  // 1000-field cap; 0 is no limit; a number is that cap.
+                  this.maxHeadersCount,
+                );
+        } else {
+          binding = natives.httpsServe(
+            // No host: node's default, dual-stack `::` (#172).
+            host || null,
+            port,
+            ...accept,
+            policy.maxHeaderSize,
+            policy.insecure,
+            ...registry._httpParserOptions.timeoutArgs(this),
+            this.maxHeadersCount,
+            listen.ipv6Only,
+          );
+        }
+        binding.then(
           (bound) => {
             this[kTlsSynced] = JSON.stringify(accept);
             registry._httpParserOptions.bound(this, bound, true);
             // Anything changed while the server was binding.
             syncTls(this);
           },
-          (err) => this.emit("error", typeof err === "string" ? new Error(err) : err),
+          (err) => {
+            const e = typeof err === "string" ? new Error(err) : err;
+            // node's uvExceptionWithHostPort: a pipe's bind error carries
+            // port -1, as net's own pipe path reports.
+            if (e && e.syscall === "listen") e.port = -1;
+            this.emit("error", e);
+          },
         );
         return this;
       }
@@ -31794,9 +31865,12 @@
         return this;
       }
       address() {
-        return this.listening
-          ? { address: this._host, family: this._family, port: this._port }
-          : null;
+        if (this.listening && this._port !== null) {
+          return { address: this._host, family: this._family, port: this._port };
+        }
+        // A pipe server is named by its path from listen(path) on, even
+        // after close() (node's `_pipeName`).
+        return this._pipeName !== undefined ? this._pipeName : null;
       }
       close(callback) {
         // As the http server's: it drains, and a close() on a server that
@@ -34970,18 +35044,39 @@
         // node's reading of the arguments; a port that is not one throws
         // from here (#163).
         var listen = normalizeListenArgs(args);
-        if (refusePipeListen(this, listen)) return this;
-        var port = listen.port, host = listen.host, callback = listen.cb;
+        var port = listen.port, host = listen.host, path = listen.path, callback = listen.cb;
+        // A path: a Unix domain socket or a Windows named pipe (#282). node
+        // names the server by it from here on -- address() answers the path
+        // once listening, and still after close() (`this._pipeName`).
+        if (path !== undefined) this._pipeName = path;
         if (callback !== null) this.once("listening", callback);
         var self = this;
-        // No host: node's default, dual-stack `::` (#172). Args 2 and 3
-        // (the HTTP/1 head policy) are left to their defaults.
-        natives.http2Serve(host || null, port, undefined, undefined, listen.ipv6Only).then(
+        var binding;
+        if (path !== undefined) {
+          // net's module section assigns the pipe-name helpers on load, and
+          // THIS module may have loaded without it -- force it.
+          registry.get("net");
+          // A name libuv refuses (EINVAL for a NUL byte) fails as a bind
+          // does: 'error' on a later tick, the server never listening.
+          binding =
+            typeof path === "string" && registry._pipeNameHasNul(path)
+              ? Promise.reject(registry._pipeNulError("listen", path))
+              // Args 2 and 3 (the HTTP/1 head policy) are left to their
+              // defaults, as the TCP call's are.
+              : natives.http2PipeServe(path, undefined, undefined);
+        } else {
+          // No host: node's default, dual-stack `::` (#172). Args 2 and 3
+          // (the HTTP/1 head policy) are left to their defaults.
+          binding = natives.http2Serve(host || null, port, undefined, undefined, listen.ipv6Only);
+        }
+        binding.then(
           function(bound) {
             self._serverId = bound.serverId;
-            self._port = bound.port;
-            self._host = bound.address;
-            self._family = bound.family;
+            // A pipe has no port, host or family: a null port is what marks
+            // the server as a pipe's while it listens (net.Server's shape).
+            self._port = bound.port !== undefined ? bound.port : null;
+            self._host = bound.address !== undefined ? bound.address : null;
+            self._family = bound.family !== undefined ? bound.family : undefined;
             self.listening = true;
             self.emit("listening");
             var streams = new Map();
@@ -35010,14 +35105,22 @@
               self.emit("close");
             })();
           },
-          function(err) { self.emit("error", err); },
+          function(err) {
+            // node's uvExceptionWithHostPort: a pipe's bind error carries
+            // port -1, as net's own pipe path reports.
+            if (err && err.syscall === "listen") err.port = -1;
+            self.emit("error", err);
+          },
         );
         return this;
       }
       address() {
-        return this.listening
-          ? { address: this._host, family: this._family, port: this._port }
-          : null;
+        if (this.listening && this._port !== null) {
+          return { address: this._host, family: this._family, port: this._port };
+        }
+        // A pipe server is named by its path from listen(path) on, even
+        // after close() (node's `_pipeName`).
+        return this._pipeName !== undefined ? this._pipeName : null;
       }
       close(callback) {
         if (this._serverId !== null) {
@@ -39468,21 +39571,43 @@
         // node's reading of the arguments; a port that is not one throws
         // from here (#163).
         var listen = normalizeListenArgs(args);
-        if (refusePipeListen(this, listen)) return this;
-        var port = listen.port, host = listen.host, callback = listen.cb;
+        var port = listen.port, host = listen.host, path = listen.path, callback = listen.cb;
+        // A path: a Unix domain socket or a Windows named pipe. node names
+        // the server by it from here on -- address() answers the path once
+        // listening, and still after close() (`this._pipeName`).
+        if (path !== undefined) this._pipeName = path;
         if (callback !== null) this.once("listening", callback);
         this._closed = false;
 
         // Registered synchronously inside listen(), as net.Server is: Node
-        // lists a listening tls.Server as a TCPServerWrap.
-        registry._activeHandles.set(this, "TCPServerWrap");
-        // No host: node's default, dual-stack `::` (#172).
-        natives.tcpListen(host || null, port, listen.ipv6Only).then(
+        // lists a listening tls.Server as a TCPServerWrap -- a PipeWrap for
+        // a pipe.
+        registry._activeHandles.set(this, path !== undefined ? "PipeWrap" : "TCPServerWrap");
+
+        var binding;
+        if (path !== undefined) {
+          // net's module section assigns the pipe-name helpers on load, and
+          // THIS module may have loaded without it (a script that only
+          // imports node:tls) -- force it, as _connectTls does.
+          registry.get("net");
+          // A name libuv refuses (EINVAL for a NUL byte) fails as a bind
+          // does: 'error' on a later tick, the server never listening.
+          binding =
+            typeof path === "string" && registry._pipeNameHasNul(path)
+              ? Promise.reject(registry._pipeNulError("listen", path))
+              : natives.pipeListen(path);
+        } else {
+          // No host: node's default, dual-stack `::` (#172).
+          binding = natives.tcpListen(host || null, port, listen.ipv6Only);
+        }
+        binding.then(
           (bound) => {
             this._serverId = bound.serverId;
-            this._port = bound.port;
-            this._host = bound.hostname;
-            this._family = bound.family;
+            // A pipe has no port, host or family: a null port is what marks
+            // the server as a pipe's while it listens (net.Server's shape).
+            this._port = path === undefined ? bound.port : null;
+            this._host = path === undefined ? bound.hostname : null;
+            this._family = path === undefined ? bound.family : undefined;
             this.listening = true;
             // unref() before listen(), applied once bound (as net.Server).
             if (this._handleRefed === false) natives.tcpServerSetRef(bound.serverId, false);
@@ -39491,6 +39616,9 @@
           },
           (err) => {
             registry._activeHandles.delete(this);
+            // node's uvExceptionWithHostPort(err, 'listen', path, -1): a
+            // pipe's listen error carries port -1, last of its keys.
+            if (path !== undefined && err && err.syscall === "listen") err.port = -1;
             this.emit("error", typeof err === "string" ? new Error(err) : err);
           },
         );
@@ -39670,9 +39798,12 @@
         );
       }
       address() {
-        return this.listening
-          ? { address: this._host, family: this._family, port: this._port }
-          : null;
+        if (this.listening && this._port !== null) {
+          return { address: this._host, family: this._family, port: this._port };
+        }
+        // A pipe server is named by its path from listen(path) on, even
+        // after close() (node's `_pipeName`).
+        return this._pipeName !== undefined ? this._pipeName : null;
       }
       close(callback) {
         this._closed = true;

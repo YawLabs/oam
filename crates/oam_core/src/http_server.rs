@@ -202,18 +202,41 @@ pub enum ServerEvent {
 /// itself, never from anything the client sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnAddrs {
-    pub remote: std::net::SocketAddr,
-    /// `None` only if the OS could not report the accepted socket's own
-    /// address (node leaves the fields undefined then too).
+    /// None for a pipe connection (#282): a named pipe or Unix socket has
+    /// no IP address, and node leaves remoteAddress and friends undefined
+    /// on one -- as it does for localAddress when the OS cannot report the
+    /// accepted socket's own address.
+    pub remote: Option<std::net::SocketAddr>,
+    /// `None` if the OS could not report the accepted socket's own address,
+    /// or the connection is a pipe's (node leaves the fields undefined then
+    /// too).
     pub local: Option<std::net::SocketAddr>,
 }
 
 impl ConnAddrs {
+    /// The connection's addresses, from the accepted TCP socket.
+    pub fn of(stream: &tokio::net::TcpStream) -> Self {
+        ConnAddrs {
+            remote: stream.peer_addr().ok(),
+            local: stream.local_addr().ok(),
+        }
+    }
+
+    /// A pipe connection's: no addresses at all.
+    pub fn pipe() -> Self {
+        ConnAddrs {
+            remote: None,
+            local: None,
+        }
+    }
+
     /// The accept meta fields, node's names and shapes.
     fn write_meta(&self, meta: &mut serde_json::Value) {
-        meta["remoteAddress"] = serde_json::json!(node_ip_string(&self.remote));
-        meta["remotePort"] = serde_json::json!(self.remote.port());
-        meta["remoteFamily"] = serde_json::json!(node_family(&self.remote));
+        if let Some(remote) = &self.remote {
+            meta["remoteAddress"] = serde_json::json!(node_ip_string(remote));
+            meta["remotePort"] = serde_json::json!(remote.port());
+            meta["remoteFamily"] = serde_json::json!(node_family(remote));
+        }
         if let Some(local) = &self.local {
             meta["localAddress"] = serde_json::json!(node_ip_string(local));
             meta["localPort"] = serde_json::json!(local.port());
@@ -1552,7 +1575,7 @@ pub async fn http_serve(
                         continue;
                     };
                     let conn_addrs = ConnAddrs {
-                        remote: peer,
+                        remote: Some(peer),
                         local: stream.local_addr().ok(),
                     };
                     let Some(slot) = admit(&server_timeouts, &queue_tx, conn_addrs) else {
@@ -1566,148 +1589,22 @@ pub async fn http_serve(
                     let conn_queue = queue_tx.clone();
                     let conn_tcp = accept_tcp.clone();
                     let conn_tcp_ids = accept_tcp_ids.clone();
-                    let conn_stream_bodies = stream_request_body;
                     let conn_timeouts = Arc::clone(&server_timeouts);
                     let conn_shutdown = shutdown_rx.clone();
-                    tokio::spawn(async move {
-                        let slot = slot;
-                        // node's timeouts hold from the accept: a connection
-                        // that never sends a byte is answered 408 once
-                        // headersTimeout passes, like any other.
-                        let watch =
-                            ConnWatch::new(conn_state.next_id(), server_id, conn_timeouts.clone());
-                        let registration = conn_state.register_conn(Arc::clone(&watch));
-                        let conn_id = watch.id;
-                        let js_driven = conn_timeouts.js_driven();
-                        // node's 'connection': the server's listeners see a
-                        // new connection before a byte is read off it, and an
-                        // application that filters clients there -- an allow
-                        // list that destroys the sockets it refuses -- has
-                        // decided before the request head is parsed. A server
-                        // oam drives itself (oam.serve) has no JS server
-                        // object and nothing to ask.
-                        let announcement = if js_driven {
-                            announce_connection(
-                                &conn_queue,
-                                &watch,
-                                ServerEvent::Connection {
-                                    conn_id,
-                                    conn: conn_addrs,
-                                },
-                            )
-                            .await
-                        } else {
-                            Announcement {
-                                announced: false,
-                                serve: true,
-                            }
-                        };
-                        if !announcement.serve {
-                            // A listener refused this client, or the server
-                            // went away under it: the connection closes
-                            // without a request ever reaching the handler,
-                            // and without an answer on the wire.
-                            crate::http_conn::close_unserved(stream, &watch);
-                            if announcement.announced {
-                                let _ = conn_queue
-                                    .send(ServerEvent::ConnectionClosed {
-                                        conn_id,
-                                        reset: watch.failure(),
-                                    })
-                                    .await;
-                            }
-                            drop(registration);
-                            drop(slot);
-                            return;
-                        }
-                        // A node:http server routes upgrades and CONNECT;
-                        // oam.serve hands every request to its handler.
-                        let (upgrades, taken) = if js_driven {
-                            let (route, taken) = UpgradeRoute::new(Arc::clone(&conn_timeouts));
-                            (Upgrades::Route(route), Some(taken))
-                        } else {
-                            (Upgrades::Serve, None)
-                        };
-                        let service_state = conn_state.clone();
-                        let service_queue = conn_queue.clone();
-                        let service_watch = Arc::clone(&watch);
-                        let service = hyper::service::service_fn(move |req| {
-                            handle_request(
-                                service_state.clone(),
-                                service_queue.clone(),
-                                req,
-                                conn_stream_bodies, // per-server opt-in
-                                conn_addrs,
-                                None,
-                                policy,
-                                Some(Arc::clone(&service_watch)),
-                                upgrades.clone(),
-                            )
-                        });
-                        let closed_watch = Arc::clone(&watch);
-                        let taken = serve_http1(
-                            stream,
-                            watch,
-                            policy,
-                            service,
-                            conn_queue.clone(),
-                            js_driven,
-                            conn_addrs,
-                            conn_shutdown,
-                            taken,
-                        )
-                        .await;
-                        // The socket leaves node's http timeouts (node drops
-                        // its 'timeout' handling for an upgraded socket) and
-                        // maxConnections (node counts it until it closes).
-                        drop(registration);
-                        drop(slot);
-                        // JS lets go of the socket it was handed for this
-                        // connection. An upgraded connection is handed on as
-                        // a socket of its own below, so this one is done
-                        // either way -- but for a taken connection the release
-                        // rides ON the takeover (replaces_conn) rather than as
-                        // an event of its own. Sent apart, one of them arrives
-                        // a turn before the other, and in that turn the
-                        // server's getConnections() counted the connection
-                        // twice or not at all -- node does neither, and a
-                        // drain loop that reads the short count finishes with
-                        // the websocket still open.
-                        let Some((stream, head, takeover)) = taken else {
-                            if announcement.announced {
-                                let _ = conn_queue
-                                    .send(ServerEvent::ConnectionClosed {
-                                        conn_id,
-                                        reset: closed_watch.failure(),
-                                    })
-                                    .await;
-                            }
-                            return;
-                        };
-                        let handle = conn_tcp_ids.fetch_add(1, Ordering::Relaxed);
-                        let (reader, writer) = stream.into_split();
-                        conn_tcp
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .register_stream(handle, reader, writer);
-                        let _ = conn_queue
-                            .send(ServerEvent::Request(IncomingRequest {
-                                id: takeover.id,
-                                method: takeover.head.method,
-                                uri: takeover.head.target,
-                                http10: takeover.head.http10,
-                                headers: takeover.head.headers,
-                                is_upgrade: true,
-                                socket_handle: Some(handle),
-                                conn: conn_addrs,
-                                conn_id: None,
-                                replaces_conn: announcement.announced.then_some(conn_id),
-                                head: head.to_vec(),
-                                end_stream: false,
-                                tls: None,
-                            }))
-                            .await;
-                    });
+                    tokio::spawn(serve_conn(
+                        crate::tcp::PlainStream::Tcp(stream),
+                        conn_addrs,
+                        slot,
+                        server_id,
+                        conn_state,
+                        conn_queue,
+                        conn_tcp,
+                        conn_tcp_ids,
+                        stream_request_body,
+                        conn_timeouts,
+                        policy,
+                        conn_shutdown,
+                    ));
                 }
             }
         }
@@ -1728,6 +1625,284 @@ pub async fn http_serve(
         })
         .to_string(),
     )
+}
+
+/// Serve ONE accepted connection of a node:http server -- the body of the
+/// TCP accept loop's spawned task, shared with the pipe accept loop
+/// ([`http_pipe_serve`], #282): announce it to JS's listeners ('connection')
+/// and wait for their verdict, then run hyper over it until it or the
+/// server ends. An upgrade or CONNECT that takes the connection hands it
+/// to JS as a socket of its own.
+#[allow(clippy::too_many_arguments)]
+async fn serve_conn(
+    stream: crate::tcp::PlainStream,
+    conn_addrs: ConnAddrs,
+    slot: crate::http_conn::ConnSlot,
+    server_id: u64,
+    conn_state: Arc<HttpState>,
+    conn_queue: mpsc::Sender<ServerEvent>,
+    conn_tcp: crate::tcp::TcpRegistry,
+    conn_tcp_ids: Arc<std::sync::atomic::AtomicU64>,
+    conn_stream_bodies: bool,
+    conn_timeouts: Arc<ServerTimeouts>,
+    policy: HeadPolicy,
+    conn_shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    // node's timeouts hold from the accept: a connection
+    // that never sends a byte is answered 408 once
+    // headersTimeout passes, like any other.
+    let watch = ConnWatch::new(conn_state.next_id(), server_id, Arc::clone(&conn_timeouts));
+    let registration = conn_state.register_conn(Arc::clone(&watch));
+    let conn_id = watch.id;
+    let js_driven = conn_timeouts.js_driven();
+    // node's 'connection': the server's listeners see a
+    // new connection before a byte is read off it, and an
+    // application that filters clients there -- an allow
+    // list that destroys the sockets it refuses -- has
+    // decided before the request head is parsed. A server
+    // oam drives itself (oam.serve) has no JS server
+    // object and nothing to ask.
+    let announcement = if js_driven {
+        announce_connection(
+            &conn_queue,
+            &watch,
+            ServerEvent::Connection {
+                conn_id,
+                conn: conn_addrs,
+            },
+        )
+        .await
+    } else {
+        Announcement {
+            announced: false,
+            serve: true,
+        }
+    };
+    if !announcement.serve {
+        // A listener refused this client, or the server
+        // went away under it: the connection closes
+        // without a request ever reaching the handler,
+        // and without an answer on the wire.
+        crate::http_conn::close_unserved(stream, &watch);
+        if announcement.announced {
+            let _ = conn_queue
+                .send(ServerEvent::ConnectionClosed {
+                    conn_id,
+                    reset: watch.failure(),
+                })
+                .await;
+        }
+        drop(registration);
+        drop(slot);
+        return;
+    }
+    // A node:http server routes upgrades and CONNECT;
+    // oam.serve hands every request to its handler.
+    let (upgrades, taken) = if js_driven {
+        let (route, taken) = UpgradeRoute::new(Arc::clone(&conn_timeouts));
+        (Upgrades::Route(route), Some(taken))
+    } else {
+        (Upgrades::Serve, None)
+    };
+    let service_state = conn_state.clone();
+    let service_queue = conn_queue.clone();
+    let service_watch = Arc::clone(&watch);
+    let service = hyper::service::service_fn(move |req| {
+        handle_request(
+            service_state.clone(),
+            service_queue.clone(),
+            req,
+            conn_stream_bodies, // per-server opt-in
+            conn_addrs,
+            None,
+            policy,
+            Some(Arc::clone(&service_watch)),
+            upgrades.clone(),
+        )
+    });
+    let closed_watch = Arc::clone(&watch);
+    let taken = serve_http1(
+        stream,
+        watch,
+        policy,
+        service,
+        conn_queue.clone(),
+        js_driven,
+        conn_addrs,
+        conn_shutdown,
+        taken,
+    )
+    .await;
+    // The socket leaves node's http timeouts (node drops
+    // its 'timeout' handling for an upgraded socket) and
+    // maxConnections (node counts it until it closes).
+    drop(registration);
+    drop(slot);
+    // JS lets go of the socket it was handed for this
+    // connection. An upgraded connection is handed on as
+    // a socket of its own below, so this one is done
+    // either way -- but for a taken connection the release
+    // rides ON the takeover (replaces_conn) rather than as
+    // an event of its own. Sent apart, one of them arrives
+    // a turn before the other, and in that turn the
+    // server's getConnections() counted the connection
+    // twice or not at all -- node does neither, and a
+    // drain loop that reads the short count finishes with
+    // the websocket still open.
+    let Some((stream, head, takeover)) = taken else {
+        if announcement.announced {
+            let _ = conn_queue
+                .send(ServerEvent::ConnectionClosed {
+                    conn_id,
+                    reset: closed_watch.failure(),
+                })
+                .await;
+        }
+        return;
+    };
+    let handle = conn_tcp_ids.fetch_add(1, Ordering::Relaxed);
+    let (reader, writer) = stream.into_halves();
+    conn_tcp
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .register_raw_stream(handle, reader, writer);
+    let _ = conn_queue
+        .send(ServerEvent::Request(IncomingRequest {
+            id: takeover.id,
+            method: takeover.head.method,
+            uri: takeover.head.target,
+            http10: takeover.head.http10,
+            headers: takeover.head.headers,
+            is_upgrade: true,
+            socket_handle: Some(handle),
+            conn: conn_addrs,
+            conn_id: None,
+            replaces_conn: announcement.announced.then_some(conn_id),
+            head: head.to_vec(),
+            end_stream: false,
+            tls: None,
+        }))
+        .await;
+}
+
+/// Bind + spawn the accept loop of a node:http server listening on a PIPE
+/// (a Windows named pipe or Unix domain socket, #282): the pipe twin of
+/// [`http_serve`]. Same server entry, queue, connection lifecycle and
+/// close(); only the listener differs -- bound by [`crate::pipe::bind`],
+/// each accept bridged into a [`crate::tcp::PlainStream`] (a duplex pump on
+/// Windows, the socket itself on Unix) and handed to the same
+/// [`serve_conn`]. Resolves Json {serverId} -- a pipe has no port; the JS
+/// server names itself by the path (its `address()`).
+#[allow(clippy::too_many_arguments)]
+pub async fn http_pipe_serve(
+    state: Arc<HttpState>,
+    // The path as the script gave it (what an error names) and as the
+    // permission gate resolved it (what is bound), as
+    // [`crate::tcp::pipe_listen`] takes them.
+    path: String,
+    target: String,
+    tcp: super::tcp::TcpRegistry,
+    tcp_ids: Arc<std::sync::atomic::AtomicU64>,
+    stream_request_body: bool,
+    policy: HeadPolicy,
+    timeouts: TimeoutSettings,
+) -> super::OpOutcome {
+    if let Err(e) = crate::pipe::refuse_nul("listen", &target, &path) {
+        return super::OpOutcome::sys(*e);
+    }
+    let listener = match crate::pipe::bind(&target, &path) {
+        Ok(listener) => listener,
+        Err(e) => return super::OpOutcome::sys(*e),
+    };
+    let server_id = state.next_id();
+    let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let server_timeouts = ServerTimeouts::new(timeouts);
+    let (listener_gone_tx, listener_gone_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    state
+        .servers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            server_id,
+            ServerEntry {
+                queue: Some(queue_rx),
+                shutdown: Some(shutdown_tx),
+                listener_gone: Some(listener_gone_rx),
+                timeouts: Some(Arc::clone(&server_timeouts)),
+                tls: None,
+            },
+        );
+    if !server_timeouts.js_driven() {
+        tokio::spawn(check_connections(
+            state.clone(),
+            server_id,
+            Arc::clone(&server_timeouts),
+            shutdown_rx.clone(),
+        ));
+    }
+
+    let accept_state = state.clone();
+    let accept_tcp = tcp;
+    let accept_tcp_ids = tcp_ids;
+    tokio::spawn(async move {
+        let mut listener = listener;
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => break,
+                accepted = listener.accept() => {
+                    let Ok(halves) = accepted else {
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                        continue;
+                    };
+                    // The bridge (on Windows) or the socket itself (Unix):
+                    // what the connection is served over.
+                    let (reader, writer) = super::tcp::pipe_halves(halves);
+                    let stream =
+                        match super::tcp::plain_stream_from_halves(reader, writer).await {
+                            Ok(stream) => stream,
+                            Err(_) => continue,
+                        };
+                    // A pipe connection has no addresses: node leaves the
+                    // fields undefined on its sockets too.
+                    let conn_addrs = ConnAddrs::pipe();
+                    let Some(slot) = admit(&server_timeouts, &queue_tx, conn_addrs) else {
+                        drop(stream);
+                        continue;
+                    };
+                    // Everything after the accept runs on the connection's
+                    // own task, as the TCP loop's does.
+                    let conn_state = accept_state.clone();
+                    let conn_queue = queue_tx.clone();
+                    let conn_tcp = accept_tcp.clone();
+                    let conn_tcp_ids = accept_tcp_ids.clone();
+                    let conn_timeouts = Arc::clone(&server_timeouts);
+                    let conn_shutdown = shutdown_rx.clone();
+                    tokio::spawn(serve_conn(
+                        stream,
+                        conn_addrs,
+                        slot,
+                        server_id,
+                        conn_state,
+                        conn_queue,
+                        conn_tcp,
+                        conn_tcp_ids,
+                        stream_request_body,
+                        conn_timeouts,
+                        policy,
+                        conn_shutdown,
+                    ));
+                }
+            }
+        }
+        // Dropping the listener unlinks a Unix socket file (libuv's
+        // uv_pipe_close) and frees the pipe name.
+        drop(listener);
+        let _ = listener_gone_tx.send(());
+    });
+
+    super::OpOutcome::Json(serde_json::json!({ "serverId": server_id }).to_string())
 }
 
 /// RAII cleanup tied to the REQUEST lifetime, not the body read. When
@@ -2471,16 +2646,13 @@ pub async fn https_serve(
                     // Taken from the TCP socket before the TLS handshake
                     // wraps it: the peer is the TCP peer, as in node.
                     let conn_addrs = ConnAddrs {
-                        remote: peer,
+                        remote: Some(peer),
                         local: stream.local_addr().ok(),
                     };
                     let Some(slot) = admit(&server_timeouts, &queue_tx, conn_addrs) else {
                         drop(stream);
                         continue;
                     };
-                    // What this connection is accepted with: the server's
-                    // context and options as they are now.
-                    let (context, options) = tls.current();
                     let conn_state = accept_state.clone();
                     let conn_queue = queue_tx.clone();
                     let conn_timeouts = Arc::clone(&server_timeouts);
@@ -2490,110 +2662,20 @@ pub async fn https_serve(
                     // Everything after the accept runs on the connection's
                     // own task: a client that never finishes its handshake
                     // holds up no one else.
-                    tokio::spawn(async move {
-                        let slot = slot;
-                        // The connection belongs to JS from the accept, as
-                        // node's does: 'connection' carries the plain socket,
-                        // before any TLS work is done for this client, and an
-                        // application that filters clients there has decided
-                        // before the handshake starts.
-                        let watch = ConnWatch::new(
-                            conn_state.next_id(),
-                            server_id,
-                            Arc::clone(&conn_timeouts),
-                        );
-                        let registration = conn_state.register_conn(Arc::clone(&watch));
-                        let conn_id = watch.id;
-                        let announcement = announce_connection(
-                            &conn_queue,
-                            &watch,
-                            ServerEvent::Connection {
-                                conn_id,
-                                conn: conn_addrs,
-                            },
-                        )
-                        .await;
-                        let mut announced = announcement.announced;
-                        let refusal = if !announcement.serve {
-                            // A listener refused this client: no handshake is
-                            // run and no
-                            // 'tlsClientError' is raised -- node's client
-                            // sees the connection close mid-handshake.
-                            crate::http_conn::close_unserved(stream, &watch);
-                            None
-                        } else {
-                            // A handshake under way when close() is called
-                            // runs to its end, as node's does: the server
-                            // had accepted the connection. handshakeTimeout
-                            // bounds it.
-                            let handshake =
-                                crate::tls::server::accept_stream(stream, &context, &options).await;
-                            match handshake {
-                                Ok((tls_stream, info)) => {
-                                    // node's onServerSocketSecure: a
-                                    // certificate that did not verify, under
-                                    // rejectUnauthorized, and the socket is
-                                    // destroyed before 'secureConnection' (a
-                                    // resumed session's; a chain sent in the
-                                    // handshake was refused there).
-                                    if options.request_cert
-                                        && options.reject_unauthorized
-                                        && !info.authorized
-                                    {
-                                        drop(tls_stream);
-                                        Some((
-                                            Some("ECONNRESET".to_string()),
-                                            "socket hang up".to_string(),
-                                        ))
-                                    } else {
-                                        if serve_https_connection(
-                                            tls_stream,
-                                            info,
-                                            conn_state,
-                                            conn_queue.clone(),
-                                            conn_timeouts,
-                                            Arc::clone(&watch),
-                                            conn_addrs,
-                                            policy,
-                                            conn_shutdown,
-                                            conn_tls_registry,
-                                            conn_body_ids,
-                                        )
-                                        .await
-                                        {
-                                            announced = true;
-                                        }
-                                        None
-                                    }
-                                }
-                                Err(failed) => Some(failure_parts(failed)),
-                            }
-                        };
-                        // The connection is gone: it no longer counts
-                        // against maxConnections, and JS hears why (node's
-                        // 'tlsClientError').
-                        drop(registration);
-                        drop(slot);
-                        if let Some((code, message)) = refusal {
-                            let _ = conn_queue
-                                .send(ServerEvent::TlsClientError {
-                                    conn: conn_addrs,
-                                    code,
-                                    message,
-                                })
-                                .await;
-                        }
-                        // JS lets go of every socket it was handed for this
-                        // connection, however it ended.
-                        if announced {
-                            let _ = conn_queue
-                                .send(ServerEvent::ConnectionClosed {
-                                    conn_id,
-                                    reset: watch.failure(),
-                                })
-                                .await;
-                        }
-                    });
+                    tokio::spawn(serve_secure_conn(
+                        crate::tcp::PlainStream::Tcp(stream),
+                        conn_addrs,
+                        slot,
+                        server_id,
+                        conn_state,
+                        conn_queue,
+                        conn_timeouts,
+                        policy,
+                        conn_shutdown,
+                        conn_tls_registry,
+                        conn_body_ids,
+                        tls.clone(),
+                    ));
                 }
             }
         }
@@ -2612,6 +2694,238 @@ pub async fn https_serve(
         })
         .to_string(),
     )
+}
+
+/// Serve ONE accepted https connection -- the body of the TCP accept loop's
+/// spawned task, shared with the pipe accept loop ([`https_pipe_serve`],
+/// #282): announce the plain connection to JS ('connection') and wait for
+/// the listeners' verdict, run the TLS handshake (`accept_stream`) unless
+/// the client was refused there, announce it again as 'secureConnection'
+/// with what the handshake settled, and serve it as HTTP/1.1 until it or
+/// the server ends. A failed handshake reaches JS as node's
+/// 'tlsClientError'.
+#[allow(clippy::too_many_arguments)]
+async fn serve_secure_conn(
+    stream: crate::tcp::PlainStream,
+    conn_addrs: ConnAddrs,
+    slot: crate::http_conn::ConnSlot,
+    server_id: u64,
+    conn_state: Arc<HttpState>,
+    conn_queue: mpsc::Sender<ServerEvent>,
+    conn_timeouts: Arc<ServerTimeouts>,
+    policy: HeadPolicy,
+    conn_shutdown: tokio::sync::watch::Receiver<bool>,
+    conn_tls_registry: crate::tls::TlsRegistry,
+    conn_body_ids: Arc<std::sync::atomic::AtomicU64>,
+    tls: Arc<HttpsTls>,
+) {
+    // What this connection is accepted with: the server's
+    // context and options as they are now.
+    let (context, options) = tls.current();
+    // The connection belongs to JS from the accept, as
+    // node's does: 'connection' carries the plain socket,
+    // before any TLS work is done for this client, and an
+    // application that filters clients there has decided
+    // before the handshake starts.
+    let watch = ConnWatch::new(conn_state.next_id(), server_id, Arc::clone(&conn_timeouts));
+    let registration = conn_state.register_conn(Arc::clone(&watch));
+    let conn_id = watch.id;
+    let announcement = announce_connection(
+        &conn_queue,
+        &watch,
+        ServerEvent::Connection {
+            conn_id,
+            conn: conn_addrs,
+        },
+    )
+    .await;
+    let mut announced = announcement.announced;
+    let refusal = if !announcement.serve {
+        // A listener refused this client: no handshake is
+        // run and no
+        // 'tlsClientError' is raised -- node's client
+        // sees the connection close mid-handshake.
+        crate::http_conn::close_unserved(stream, &watch);
+        None
+    } else {
+        // A handshake under way when close() is called
+        // runs to its end, as node's does: the server
+        // had accepted the connection. handshakeTimeout
+        // bounds it.
+        let handshake = crate::tls::server::accept_stream(stream, &context, &options).await;
+        match handshake {
+            Ok((tls_stream, info)) => {
+                // node's onServerSocketSecure: a
+                // certificate that did not verify, under
+                // rejectUnauthorized, and the socket is
+                // destroyed before 'secureConnection' (a
+                // resumed session's; a chain sent in the
+                // handshake was refused there).
+                if options.request_cert && options.reject_unauthorized && !info.authorized {
+                    drop(tls_stream);
+                    Some((Some("ECONNRESET".to_string()), "socket hang up".to_string()))
+                } else if serve_https_connection(
+                    tls_stream,
+                    info,
+                    conn_state,
+                    conn_queue.clone(),
+                    conn_timeouts,
+                    Arc::clone(&watch),
+                    conn_addrs,
+                    policy,
+                    conn_shutdown,
+                    conn_tls_registry,
+                    conn_body_ids,
+                )
+                .await
+                {
+                    announced = true;
+                    None
+                } else {
+                    None
+                }
+            }
+            Err(failed) => Some(failure_parts(failed)),
+        }
+    };
+    // The connection is gone: it no longer counts
+    // against maxConnections, and JS hears why (node's
+    // 'tlsClientError').
+    drop(registration);
+    drop(slot);
+    if let Some((code, message)) = refusal {
+        let _ = conn_queue
+            .send(ServerEvent::TlsClientError {
+                conn: conn_addrs,
+                code,
+                message,
+            })
+            .await;
+    }
+    // JS lets go of every socket it was handed for this
+    // connection, however it ended.
+    if announced {
+        let _ = conn_queue
+            .send(ServerEvent::ConnectionClosed {
+                conn_id,
+                reset: watch.failure(),
+            })
+            .await;
+    }
+}
+
+/// Bind + spawn the accept loop of an https server listening on a PIPE
+/// (a Windows named pipe or Unix domain socket, #282): the pipe twin of
+/// [`https_serve`]. Same secure context (`HttpsTls`, replaceable from JS),
+/// handshake, connection lifecycle and close(); only the listener differs
+/// -- bound by [`crate::pipe::bind`], each accept bridged into a
+/// [`crate::tcp::PlainStream`] and handed to the same [`serve_secure_conn`].
+/// Resolves Json {serverId} -- a pipe has no port.
+#[allow(clippy::too_many_arguments)]
+pub async fn https_pipe_serve(
+    state: Arc<HttpState>,
+    path: String,
+    target: String,
+    tls: Arc<HttpsTls>,
+    policy: HeadPolicy,
+    timeouts: TimeoutSettings,
+    tls_registry: crate::tls::TlsRegistry,
+    body_ids: Arc<std::sync::atomic::AtomicU64>,
+) -> super::OpOutcome {
+    if let Err(e) = crate::pipe::refuse_nul("listen", &target, &path) {
+        return super::OpOutcome::sys(*e);
+    }
+    let listener = match crate::pipe::bind(&target, &path) {
+        Ok(listener) => listener,
+        Err(e) => return super::OpOutcome::sys(*e),
+    };
+    let server_id = state.next_id();
+    let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let server_timeouts = ServerTimeouts::new(timeouts);
+    let (listener_gone_tx, listener_gone_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    state
+        .servers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            server_id,
+            ServerEntry {
+                queue: Some(queue_rx),
+                shutdown: Some(shutdown_tx),
+                listener_gone: Some(listener_gone_rx),
+                timeouts: Some(Arc::clone(&server_timeouts)),
+                tls: Some(Arc::clone(&tls)),
+            },
+        );
+    if !server_timeouts.js_driven() {
+        tokio::spawn(check_connections(
+            state.clone(),
+            server_id,
+            Arc::clone(&server_timeouts),
+            shutdown_rx.clone(),
+        ));
+    }
+
+    let accept_state = state.clone();
+    tokio::spawn(async move {
+        let mut listener = listener;
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => break,
+                accepted = listener.accept() => {
+                    let Ok(halves) = accepted else {
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                        continue;
+                    };
+                    // The bridge (on Windows) or the socket itself (Unix):
+                    // what the connection is served over.
+                    let (reader, writer) = super::tcp::pipe_halves(halves);
+                    let stream =
+                        match super::tcp::plain_stream_from_halves(reader, writer).await {
+                            Ok(stream) => stream,
+                            Err(_) => continue,
+                        };
+                    // A pipe connection has no addresses: node leaves the
+                    // fields undefined on its sockets too.
+                    let conn_addrs = ConnAddrs::pipe();
+                    let Some(slot) = admit(&server_timeouts, &queue_tx, conn_addrs) else {
+                        drop(stream);
+                        continue;
+                    };
+                    let conn_state = accept_state.clone();
+                    let conn_queue = queue_tx.clone();
+                    let conn_timeouts = Arc::clone(&server_timeouts);
+                    let conn_shutdown = shutdown_rx.clone();
+                    let conn_tls_registry = tls_registry.clone();
+                    let conn_body_ids = Arc::clone(&body_ids);
+                    // Everything after the accept runs on the connection's
+                    // own task, as the TCP loop's does.
+                    tokio::spawn(serve_secure_conn(
+                        stream,
+                        conn_addrs,
+                        slot,
+                        server_id,
+                        conn_state,
+                        conn_queue,
+                        conn_timeouts,
+                        policy,
+                        conn_shutdown,
+                        conn_tls_registry,
+                        conn_body_ids,
+                        tls.clone(),
+                    ));
+                }
+            }
+        }
+        // Dropping the listener unlinks a Unix socket file and frees the
+        // pipe name.
+        drop(listener);
+        let _ = listener_gone_tx.send(());
+    });
+
+    super::OpOutcome::Json(serde_json::json!({ "serverId": server_id }).to_string())
 }
 
 /// One https connection past its handshake, served as HTTP/1.1 until it
@@ -2897,8 +3211,12 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 ///
 /// Each connection auto-detects the protocol: if the client sends the HTTP/2
 /// connection preface it runs through hyper's http2 builder, otherwise it
-/// falls back to the http1 builder. This matches Node's `http2.createServer()`
-/// semantics: h2c with prior knowledge AND HTTP/1.1 clients both work.
+/// falls back to the http1 builder. The fallback is oam's OWN extension:
+/// Node's cleartext `http2.createServer()` refuses an HTTP/1.1 client (its
+/// response to `GET / HTTP/1.1` is h2 frames the client cannot parse --
+/// measured, HPE_INVALID_CONSTANT on node v22.22.2). Kept for the
+/// handiness the secure server's `allowHTTP1` has; recorded as a
+/// divergence in docs/node-divergences.md.
 pub async fn http2_serve(
     state: Arc<HttpState>,
     // Where to listen, as node's net.Server does (super::tcp::bind_listener).
@@ -2953,7 +3271,7 @@ pub async fn http2_serve(
                         continue;
                     };
                     let conn_addrs = ConnAddrs {
-                        remote: peer,
+                        remote: Some(peer),
                         local: stream.local_addr().ok(),
                     };
                     let Some(slot) = admit(&server_timeouts, &queue_tx, conn_addrs) else {
@@ -3093,6 +3411,310 @@ pub async fn http2_serve(
     )
 }
 
+/// A stream whose first bytes were already read -- the h2 preface probe on
+/// a PEEKLESS pipe (#282; the TCP path peeks and consumes nothing, so it
+/// never wraps one). Serves the prefix back before the stream, then the
+/// stream alone.
+struct PrefixedIo {
+    stream: crate::tcp::PlainStream,
+    prefix: Bytes,
+}
+
+impl tokio::io::AsyncRead for PrefixedIo {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // The probe's bytes belong to the protocol stream: hand them back
+        // before the stream's own.
+        if !self.prefix.is_empty() && buf.remaining() > 0 {
+            let take = self.prefix.len().min(buf.remaining());
+            let chunk = self.prefix.split_to(take);
+            buf.put_slice(&chunk);
+            if buf.remaining() == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+        }
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for PrefixedIo {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+// The preface bytes ride INSIDE the stream; a reset arms the socket the
+// stream already holds (a pipe's resets nothing, as its close is the drop).
+impl crate::http_conn::AbortiveClose for PrefixedIo {
+    fn arm_reset(&self) {
+        self.stream.arm_reset();
+    }
+}
+
+/// Detect the h2c preface on a connection, as [`http2_serve`]'s peek loop
+/// does: read the head bytes (up to 24), compare, and hand back what was
+/// read to serve to the parser. A TCP stream peeks (no prefix, nothing
+/// consumed); a PEEKLESS pipe reads, and its bytes come back as the prefix
+/// [`PrefixedIo`] serves to the parser. Retries the short reads a first
+/// segment can leave, bounded, as the TCP loop does; None when the
+/// connection ended (a close or a client gone) before a verdict.
+async fn read_h2_preface(
+    stream: &mut crate::tcp::PlainStream,
+) -> std::io::Result<Option<(bool, Bytes)>> {
+    let mut peek_buf = [0u8; 24];
+    loop {
+        let peeked = match stream {
+            crate::tcp::PlainStream::Tcp(tcp) => tcp.peek(&mut peek_buf).await,
+            crate::tcp::PlainStream::Pipe(_) => {
+                tokio::io::AsyncReadExt::read(stream, &mut peek_buf).await
+            }
+        };
+        match peeked {
+            Ok(n) if n >= H2_PREFACE.len() => {
+                let is_h2 = peek_buf[..H2_PREFACE.len()] == *H2_PREFACE;
+                // Only a pipe's read consumed bytes; a TCP peek leaves them.
+                let prefix = if matches!(stream, crate::tcp::PlainStream::Pipe(_)) {
+                    Bytes::copy_from_slice(&peek_buf[..n])
+                } else {
+                    Bytes::new()
+                };
+                return Ok(Some((is_h2, prefix)));
+            }
+            Ok(0) => return Ok(Some((false, Bytes::new()))),
+            // A partial head (or more bytes than the probe holds, which a
+            // 24-byte buffer cannot produce): a preface prefix waits for
+            // more, as the TCP loop does; anything else is HTTP/1.1.
+            Ok(n) => {
+                let n = n.min(H2_PREFACE.len());
+                if peek_buf[..n] == H2_PREFACE[..n] {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
+                let prefix = if matches!(stream, crate::tcp::PlainStream::Pipe(_)) {
+                    Bytes::copy_from_slice(&peek_buf[..n])
+                } else {
+                    Bytes::new()
+                };
+                return Ok(Some((false, prefix)));
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+            Err(_) => return Ok(None),
+        }
+    }
+}
+
+/// Bind + spawn the accept loop of an h2c (cleartext HTTP/2) server
+/// listening on a PIPE (a Windows named pipe or Unix domain socket, #282):
+/// the pipe twin of [`http2_serve`]. Same dual-protocol detection (the
+/// preface is READ off the peekless pipe and served back through
+/// [`PrefixedIo`]), HTTP/1 fallback, queue and close(); only the listener
+/// differs. Resolves Json {serverId} -- a pipe has no port.
+pub async fn http2_pipe_serve(
+    state: Arc<HttpState>,
+    path: String,
+    target: String,
+    policy: HeadPolicy,
+) -> super::OpOutcome {
+    if let Err(e) = crate::pipe::refuse_nul("listen", &target, &path) {
+        return super::OpOutcome::sys(*e);
+    }
+    let listener = match crate::pipe::bind(&target, &path) {
+        Ok(listener) => listener,
+        Err(e) => return super::OpOutcome::sys(*e),
+    };
+    let server_id = state.next_id();
+    let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    // node's Http2Server has none of the http server's timeouts, but this
+    // server also takes HTTP/1 and has to wait for a client's first bytes
+    // to tell which: until a connection turns out to be HTTP/2, and for
+    // good when it is HTTP/1, it is held to the http server's defaults,
+    // checked here (as http2_serve's is).
+    let server_timeouts = ServerTimeouts::new(TimeoutSettings::default());
+    let (listener_gone_tx, listener_gone_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    state
+        .servers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            server_id,
+            ServerEntry {
+                queue: Some(queue_rx),
+                shutdown: Some(shutdown_tx),
+                listener_gone: Some(listener_gone_rx),
+                timeouts: Some(Arc::clone(&server_timeouts)),
+                tls: None,
+            },
+        );
+    tokio::spawn(check_connections(
+        state.clone(),
+        server_id,
+        Arc::clone(&server_timeouts),
+        shutdown_rx.clone(),
+    ));
+
+    let accept_state = state.clone();
+    tokio::spawn(async move {
+        let mut listener = listener;
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => break,
+                accepted = listener.accept() => {
+                    let Ok(halves) = accepted else {
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                        continue;
+                    };
+                    // The bridge (on Windows) or the socket itself (Unix):
+                    // what the connection is served over.
+                    let (reader, writer) = super::tcp::pipe_halves(halves);
+                    let mut stream =
+                        match super::tcp::plain_stream_from_halves(reader, writer).await {
+                            Ok(stream) => stream,
+                            Err(_) => continue,
+                        };
+                    // A pipe connection has no addresses: node leaves the
+                    // fields undefined on its sockets too.
+                    let conn_addrs = ConnAddrs::pipe();
+                    let Some(slot) = admit(&server_timeouts, &queue_tx, conn_addrs) else {
+                        drop(stream);
+                        continue;
+                    };
+                    let conn_state = accept_state.clone();
+                    let conn_queue = queue_tx.clone();
+                    let conn_timeouts = Arc::clone(&server_timeouts);
+                    let mut conn_shutdown = shutdown_rx.clone();
+                    tokio::spawn(async move {
+                        let _slot = slot;
+                        let watch =
+                            ConnWatch::new(conn_state.next_id(), server_id, conn_timeouts.clone());
+                        let registration = conn_state.register_conn(Arc::clone(&watch));
+                        // Peek (TCP) or read-and-serve-back (pipe) the first
+                        // bytes to detect HTTP/2 prior-knowledge. A client
+                        // that sends nothing is closed at headersTimeout.
+                        let verdict = tokio::select! {
+                            // An io error mid-probe is a connection gone:
+                            // the same "nothing was said" as the two closes.
+                            verdict = read_h2_preface(&mut stream) =>
+                                verdict.ok().flatten(),
+                            _ = conn_shutdown.changed() => None,
+                            _ = watch.closed(CloseReason::End) => None,
+                        };
+                        // Nothing was said: close without an answer (the
+                        // client may speak HTTP/2).
+                        let Some((is_h2, prefix)) = verdict else {
+                            return;
+                        };
+                        let io = PrefixedIo { stream, prefix };
+                        if is_h2 {
+                            // HTTP/2: no timeouts, as in node.
+                            drop(registration);
+                            let io = hyper_util::rt::TokioIo::new(io);
+                            let service = hyper::service::service_fn(move |req| {
+                                handle_request(
+                                    conn_state.clone(),
+                                    conn_queue.clone(),
+                                    req,
+                                    // Streamed, as the secure server's are:
+                                    // node's 'stream' comes with the headers,
+                                    // and the body (and its trailers) can
+                                    // still arrive after the response.
+                                    true,
+                                    conn_addrs,
+                                    None,
+                                    policy,
+                                    None,
+                                    Upgrades::Serve,
+                                )
+                            });
+                            let conn = hyper::server::conn::http2::Builder::new(
+                                hyper_util::rt::TokioExecutor::new(),
+                            )
+                            .serve_connection(io, service);
+                            let mut conn = std::pin::pin!(conn);
+                            let mut shutting_down = false;
+                            loop {
+                                tokio::select! {
+                                    result = conn.as_mut() => {
+                                        let _ = result;
+                                        break;
+                                    }
+                                    _ = conn_shutdown.changed(), if !shutting_down => {
+                                        shutting_down = true;
+                                        conn.as_mut().graceful_shutdown();
+                                    }
+                                }
+                            }
+                        } else {
+                            let _registration = registration;
+                            let service_queue = conn_queue.clone();
+                            let service_watch = Arc::clone(&watch);
+                            let service = hyper::service::service_fn(move |req| {
+                                handle_request(
+                                    conn_state.clone(),
+                                    service_queue.clone(),
+                                    req,
+                                    false, // http2: buffered until a later slice
+                                    conn_addrs,
+                                    None,
+                                    policy,
+                                    Some(Arc::clone(&service_watch)),
+                                    Upgrades::CloseConnect,
+                                )
+                            });
+                            serve_http1(
+                                io,
+                                watch,
+                                policy,
+                                service,
+                                conn_queue,
+                                false,
+                                conn_addrs,
+                                conn_shutdown,
+                                None,
+                            )
+                            .await;
+                        }
+                    });
+                }
+            }
+        }
+        // Dropping the listener unlinks a Unix socket file and frees the
+        // pipe name.
+        drop(listener);
+        let _ = listener_gone_tx.send(());
+    });
+
+    super::OpOutcome::Json(serde_json::json!({ "serverId": server_id }).to_string())
+}
+
 /// Backpressured chunk push for streaming responses. A bounded timeout is
 /// the half-open backstop: when a client stops reading (or vanishes
 /// without a reset the OS has noticed yet), hyper stops draining the body,
@@ -3228,7 +3850,7 @@ mod address_tests {
 
     fn meta_for(remote: &str, local: Option<&str>) -> serde_json::Value {
         let conn = ConnAddrs {
-            remote: remote.parse().unwrap(),
+            remote: Some(remote.parse().unwrap()),
             local: local.map(|l| l.parse().unwrap()),
         };
         let mut meta = serde_json::json!({});
@@ -3418,7 +4040,7 @@ mod takeover_tests {
         let (queue, _events) = mpsc::channel(8);
         let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
         let addrs = ConnAddrs {
-            remote: "127.0.0.1:1".parse().unwrap(),
+            remote: Some("127.0.0.1:1".parse().unwrap()),
             local: None,
         };
         let served = tokio::spawn(serve_http1(

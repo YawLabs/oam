@@ -45,11 +45,11 @@ pub fn http2_serve_tls(
     // The http server's timeouts, for an HTTP/1 connection.
     http1_timeouts: TimeoutSettings,
 ) -> std::io::Result<SecureSession> {
-    let tcp = stream.get_ref().0.tcp();
-    let addrs = ConnAddrs {
-        remote: tcp.peer_addr()?,
-        local: tcp.local_addr().ok(),
-    };
+    let addrs = stream
+        .get_ref()
+        .0
+        .tcp()
+        .map_or_else(ConnAddrs::pipe, ConnAddrs::of);
     let settings = if http1 {
         TimeoutSettings {
             js_driven: false,
