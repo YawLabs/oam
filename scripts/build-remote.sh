@@ -201,6 +201,29 @@ remote_prep() {
   # Reads rust-toolchain.toml (cwd = repo root); same step ci.yml ran.
   rustup toolchain install
   note "toolchain: $(rustc --version) ($(host_triple))"
+  # Assert the pin, not just install it: `rustup toolchain install` resolves
+  # rust-toolchain.toml, but PATH's rustc could still be an older default or a
+  # non-rustup install -- and the gate IS clippy, whose lint set moves between
+  # versions (the 1.96-vs-1.97 skew that failed v0.18.1's linux leg an hour
+  # in, on a line the release box's gate had never linted). Same parse+verdict
+  # ci-local.sh and release-local.sh make on their hosts, from lib/rust-pin.sh.
+  # Fail-closed like the Node pin below; OAM_ALLOW_RUST_MISMATCH is deliberately
+  # NOT forwarded by the orchestrators.
+  # shellcheck source=lib/rust-pin.sh
+  . scripts/lib/rust-pin.sh
+  pinned_rust="$(rust_pin_read .)" \
+    || die "cannot read the pinned Rust toolchain (reason above)"
+  found_rust="$(rustc --version 2>/dev/null | awk '{print $2}' || true)"
+  rust_verdict="$(rust_pin_verdict "$pinned_rust" "$found_rust" "${OAM_ALLOW_RUST_MISMATCH:-0}")" || true
+  case "$rust_verdict" in
+    pinned) note "pinned rustc: $(rustc --version)" ;;
+    mismatch-allowed)
+      warn "rustc on PATH is $found_rust, NOT the pinned $pinned_rust -- continuing because OAM_ALLOW_RUST_MISMATCH=1; this leg does not gate on the toolchain the other legs gate on" ;;
+    absent-allowed)
+      die "no rustc on PATH and OAM_ALLOW_RUST_MISMATCH=1 does not build anything -- run 'rustup toolchain install' in the repo root" ;;
+    *)
+      die "rustc on PATH is ${found_rust:-absent}, but rust-toolchain.toml pins $pinned_rust -- 'rustup toolchain install' in the repo root should have made it first on PATH. The gate must run on exactly the pinned toolchain; see scripts/lib/rust-pin.sh" ;;
+  esac
 
   # Rust needs a system linker driver. The yaw builder image ships
   # build-essential; a fresh image without it fails here with the fix named.
@@ -334,7 +357,15 @@ build_mac_x64() {
   /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null \
     || die "Rosetta 2 not installed -- run: softwareupdate --install-rosetta --agree-to-license  (or set OAM_SKIP_MAC_X64=1 to drop the mac-x64 asset)"
   # --force-non-host: rustup refuses a foreign-host toolchain without it.
-  rustup toolchain install stable-x86_64-apple-darwin --profile minimal --force-non-host
+  # The SAME exact version rust-toolchain.toml pins, never a floating
+  # channel: a `stable-x86_64-apple-darwin` install resolves to latest
+  # stable at install time, which would put a DIFFERENT rustc on this leg
+  # than the arm64 one the toml resolved to (see lib/rust-pin.sh).
+  # shellcheck source=lib/rust-pin.sh
+  . scripts/lib/rust-pin.sh
+  local rosetta_rust
+  rosetta_rust="$(rust_pin_read .)" || die "cannot read the pinned Rust toolchain (reason above)"
+  rustup toolchain install "$rosetta_rust-x86_64-apple-darwin" --profile minimal --force-non-host
   # The C toolchain runs NATIVE (arm64), not under Rosetta. Command Line Tools
   # 27.0 ships libxcrun.dylib, clang and ld as arm64/arm64e only, so every
   # /usr/bin shim (cc, ar, xcrun, ...) that an x86_64 process launches -- and
@@ -364,7 +395,7 @@ build_mac_x64() {
   CC_x86_64_apple_darwin="$tools/cc" CXX_x86_64_apple_darwin="$tools/c++" \
   AR_x86_64_apple_darwin="$tools/ar" \
   CARGO_TARGET_DIR=target/x64-host \
-    cargo +stable-x86_64-apple-darwin build --release --target x86_64-apple-darwin -p oam_cli
+    cargo +"$rosetta_rust-x86_64-apple-darwin" build --release --target x86_64-apple-darwin -p oam_cli
   mkdir -p dist
   rm -f "dist/oam-x86_64-apple-darwin"
   cp "target/x64-host/x86_64-apple-darwin/release/oam" "dist/oam-x86_64-apple-darwin"

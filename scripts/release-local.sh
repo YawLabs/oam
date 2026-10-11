@@ -447,6 +447,11 @@ assert_release_unpublished() {
 # The private ssh-agent and the RELEASE-MANIFEST sign/verify.
 # shellcheck source=lib/signing.sh
 . "$SCRIPT_DIR/lib/signing.sh"
+# The pinned Rust toolchain (rust-toolchain.toml): the preflight below asserts
+# the release box gates on exactly it, and the win-x64 leg derives its
+# emulated toolchain name from the pin.
+# shellcheck source=lib/rust-pin.sh
+. "$SCRIPT_DIR/lib/rust-pin.sh"
 
 # ONE EXIT trap for the whole script (a second `trap ... EXIT` silently
 # replaces the first). Anything that must be undone on every exit goes into
@@ -560,6 +565,21 @@ gh auth status >/dev/null 2>&1 || fail "gh not authenticated -- run 'gh auth sta
 restore_gate_artifacts "preflight"
 [ -z "$(git status --porcelain)" ] \
   || fail "working tree is dirty (untracked files count -- the remote legs ship the working tree) -- release from a clean tree"
+# The release box gates first (ci-local.sh below) and BUILDS one of the assets
+# itself -- both must run on exactly the pinned toolchain, or this leg's clippy
+# lints a different lint set from the remote legs' (the 1.96-vs-1.97 skew that
+# failed v0.18.1's linux leg). Checked in the cheap half: fails in a second.
+pinned_rust="$(rust_pin_read .)" \
+  || fail "cannot read the pinned Rust toolchain (reason above)"
+found_rust="$(rustc --version 2>/dev/null | awk '{print $2}' || true)"
+rust_verdict="$(rust_pin_verdict "$pinned_rust" "$found_rust" "${OAM_ALLOW_RUST_MISMATCH:-0}")" || true
+case "$rust_verdict" in
+  pinned) ok "rustc $found_rust is the pinned toolchain (rust-toolchain.toml)" ;;
+  mismatch-allowed)
+    warn "rustc on PATH is $found_rust, NOT the pinned $pinned_rust -- OAM_ALLOW_RUST_MISMATCH=1" ;;
+  *)
+    fail "rustc on PATH is ${found_rust:-absent}, but rust-toolchain.toml pins $pinned_rust -- run 'rustup toolchain install' in the repo root before releasing. The local gate and both remote legs must lint on the SAME toolchain; see scripts/lib/rust-pin.sh" ;;
+esac
 # The commit the checks below judge. Re-read after the slow half: the
 # CHANGELOG verdict holds only for the commit it read.
 preflight_head="$(git rev-parse HEAD)"
@@ -1062,7 +1082,7 @@ else
   # --force-non-host: rustup refuses a foreign-host toolchain without it.
   # CARGO_TARGET_DIR isolation keeps the x64 toolchain's host artifacts from
   # churning the native toolchain's fingerprints in target/.
-  rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --force-non-host
+  rustup toolchain install "$pinned_rust-x86_64-pc-windows-msvc" --profile minimal --force-non-host
   # Same LNK1104 story as the native leg: link writes deps/oam.exe before
   # promoting it to release/oam.exe, so both paths must be free of a deny-delete
   # holder. x64-host's trees are isolated from the native ones by CARGO_TARGET_DIR
@@ -1070,7 +1090,7 @@ else
   # of an earlier aborted x64 build, not a typed-cli session.
   free_locked_binary target/x64-host/release/oam.exe
   free_locked_binary target/x64-host/release/deps/oam.exe
-  # No --target, deliberately: the +stable-x86_64-pc-windows-msvc toolchain
+  # No --target, deliberately: the +$pinned_rust-x86_64-pc-windows-msvc toolchain
   # already builds for x86_64-pc-windows-msvc, so naming it was redundant --
   # but not harmless. Passing --target splits cargo's unit graph into host and
   # target halves and withholds [target.<triple>].rustflags from the host half,
@@ -1081,7 +1101,7 @@ else
   # identical in shape to the aarch64 one above, and its output flattens back
   # to target/x64-host/release (mirrored in scripts/gc-target.sh's TREES).
   CARGO_TARGET_DIR=target/x64-host \
-    cargo +stable-x86_64-pc-windows-msvc build --release -p oam_cli
+    cargo +"$pinned_rust-x86_64-pc-windows-msvc" build --release -p oam_cli
   cp target/x64-host/release/oam.exe "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"
   sign_win_asset "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"
   smoke "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"   # runs under the OS's x64 emulation

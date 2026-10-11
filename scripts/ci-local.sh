@@ -188,6 +188,13 @@ ko()  { echo -e "${RED}  [fail]${NC} $*" >&2; exit 1; }
 # shellcheck source=lib/node-pin.sh
 . scripts/lib/node-pin.sh
 
+# The pinned Rust toolchain (rust-toolchain.toml): the parse and the same
+# verdict, shared with the remote legs' prep and the release preflight. The
+# gate IS clippy, and clippy's lint set moves between versions -- the exact
+# pin is what keeps every leg gating on the same one.
+# shellcheck source=lib/rust-pin.sh
+. scripts/lib/rust-pin.sh
+
 # The step ledger: which steps already passed on exactly this tree. The key's
 # rationale and the atomic-mark shape are in the lib's header; the wiring is
 # the block after the EXIT trap below.
@@ -378,6 +385,34 @@ if [ "$FAST" -eq 0 ]; then
   say "Preflight: pinned Node oracle"
   node_oracle_preflight
 fi
+
+# Preflight, not a numbered step: the gate IS clippy, and clippy's lint set
+# moves between rustc versions -- run it on exactly the pinned toolchain or
+# not at all. The v0.18.1 release lost its linux leg to exactly this: channel
+# = "stable" resolved to 1.96 here and 1.97 on the builder, and the builder's
+# newer clippy linted a line this box's gate had never seen. Not under --fast,
+# because clippy (step 3) is not either. The remote legs assert the same pin
+# in remote_prep (scripts/build-remote.sh); release-local.sh asserts it on the
+# release box before its slow half.
+rust_oracle_preflight() {
+  local pinned found verdict
+  pinned="$(rust_pin_read .)" || ko "cannot read the pinned Rust toolchain version (reason above)"
+  found="$(rustc --version 2>/dev/null | awk '{print $2}' || true)"
+  verdict="$(rust_pin_verdict "$pinned" "$found" "${OAM_ALLOW_RUST_MISMATCH:-0}" || true)"
+  case "$verdict" in
+    pinned)
+      ok "rustc $found on PATH is the pinned toolchain (rust-toolchain.toml)" ;;
+    mismatch-allowed)
+      warn "rustc on PATH is $found, NOT the pinned $pinned -- continuing because OAM_ALLOW_RUST_MISMATCH=1; this run does not gate on the toolchain the other legs gate on" ;;
+    absent-allowed)
+      ko "no rustc on PATH, and clippy (step 3) needs exactly $pinned (rust-toolchain.toml) -- OAM_ALLOW_RUST_MISMATCH=1 does not build anything. Run 'rustup toolchain install' in the repo root." ;;
+    mismatch)
+      ko "rustc on PATH is $found ($(command -v rustc)), but rust-toolchain.toml pins $pinned -- 'rustup toolchain install' in the repo root should have made it first on PATH. The gate must run on exactly the pinned toolchain, or the legs lint with different clippy versions." ;;
+    *)
+      ko "no rustc on PATH, and clippy (step 3) needs exactly $pinned (rust-toolchain.toml) -- run 'rustup toolchain install' in the repo root." ;;
+  esac
+}
+rust_oracle_preflight
 
 say "1/14 Control bytes (raw C0 in tracked text)"
 # FIRST because it is the cheapest gate in the file (~1s over 859 tracked

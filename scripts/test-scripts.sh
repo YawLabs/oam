@@ -2648,7 +2648,7 @@ for s in scripts/ci-local.sh scripts/bump-taps.sh scripts/release-local.sh \
          scripts/lib/miri-gate.sh scripts/lib/build-locks.sh \
          scripts/lib/crt-linkage.sh scripts/lib/iap-helpers.sh \
          scripts/lib/tap-verify.sh scripts/lib/attribution.sh \
-         scripts/lib/ci-ledger.sh \
+         scripts/lib/ci-ledger.sh scripts/lib/rust-pin.sh \
          scripts/lib/signing.sh scripts/release-upload-local-arm64.sh; do
   bash -n "$s" 2>/dev/null || PARSE_BAD="$PARSE_BAD $s"
 done
@@ -2930,7 +2930,12 @@ if [ -n "$LG_T_EDIT" ] && [ "$LG_T_EDIT" != "$LG_HEAD_TREE" ]; then pass; else f
 it "ci_ledger_key is the sha256 of HEAD, the tree id, rustc -V, cargo -V, the cargo environment and the flags; RUSTFLAGS=\"\" keys differently"
 if command -v rustc >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
   LG_KA="$(cd "$LG_REPO" && ci_ledger_key --fast)"
-  LG_KX="$(ci_ledger_key_from "$(cd "$LG_REPO" && git rev-parse HEAD)" "$LG_HEAD_TREE" "$(rustc -V)"$'\n'"$(cargo -V)"$'\n'"$(ci_ledger_cargo_env)" --fast)"
+  # Every part is measured where LG_KA was: rust-toolchain.toml's override is
+  # CWD-DEPENDENT, so under the exact pin the repo root and this fixture dir
+  # (outside it) resolve different rustc versions. `stable` used to paper over
+  # that by resolving identically everywhere; the parts-rebuild would then
+  # compare a 1.99 key against a 1.96 rebuild of it and fail.
+  LG_KX="$(cd "$LG_REPO" && ci_ledger_key_from "$(git rev-parse HEAD)" "$LG_HEAD_TREE" "$(rustc -V)"$'\n'"$(cargo -V)"$'\n'"$(ci_ledger_cargo_env)" --fast)"
   LG_KR="$(cd "$LG_REPO" && RUSTFLAGS="" ci_ledger_key --fast)"
   if [ "$LG_KA" != "$LG_KX" ]; then fail "expected '$LG_KX', got '$LG_KA'"
   elif [ -z "$LG_KR" ] || [ "$LG_KR" = "$LG_KA" ]; then fail "RUSTFLAGS=\"\" keyed as '$LG_KR' against a plain '$LG_KA'"
@@ -6898,6 +6903,79 @@ else
   it "rejects an unknown flag as could-not-run, not as clean"
   eq "$(ccb --nonsense)" "2"
 fi
+
+# =============================================================================
+group "rust-pin.sh -- the pinned Rust toolchain"
+# =============================================================================
+# channel = "stable" resolved to different rustc versions per release leg
+# (1.96 on the Windows box, 1.97 on the GCP builder), and the builder's
+# clippy carried a lint the local one did not -- v0.18.1's linux leg died on
+# it an hour in. The pin must be exact, and every leg must assert it.
+# shellcheck source=lib/rust-pin.sh
+. scripts/lib/rust-pin.sh
+
+RP_TMP="$SUITE_TMP/rust-pin"
+mkdir -p "$RP_TMP"
+
+rp_pin(){
+  printf '[toolchain]\nchannel = "%s"\n' "$1" >"$RP_TMP/rust-toolchain.toml"
+  rust_pin_read "$RP_TMP"
+}
+
+it "the pin parse reads an exact version"
+eq "$(rp_pin 1.99.0)" "1.99.0"
+
+it "the pin parse accepts whitespace around the value and single quotes"
+RP_TOML="$RP_TMP/rust-toolchain.toml"
+printf 'channel = \x27 1.99.0 \x27\n' >"$RP_TOML"
+eq "$(rust_pin_read "$RP_TMP")" "1.99.0"
+
+it "the pin parse reads the LAST channel line (toml duplicate-key semantics)"
+printf 'channel = "1.98.0"\nchannel = "1.99.0"\n' >"$RP_TOML"
+eq "$(rust_pin_read "$RP_TMP")" "1.99.0"
+
+it "the pin parse strips a trailing comment"
+printf 'channel = "1.99.0" # exact pin\n' >"$RP_TOML"
+eq "$(rust_pin_read "$RP_TMP")" "1.99.0"
+
+it "a floating channel is refused, not resolved"
+RP_OUT="$(rp_pin stable 2>&1)"; RP_RC=$?
+if [ "$RP_RC" != "0" ] && grep -q 'EXACT x.y.z' <<<"$RP_OUT"; then pass; else fail "rc=$RP_RC out=$RP_OUT"; fi
+
+it "a host triple in the channel is refused -- it is wrong on every other host"
+RP_OUT="$(rp_pin 1.99.0-x86_64-apple-darwin 2>&1)"; RP_RC=$?
+if [ "$RP_RC" != "0" ] && grep -q 'EXACT x.y.z' <<<"$RP_OUT"; then pass; else fail "rc=$RP_RC out=$RP_OUT"; fi
+
+it "a missing toolchain file is refused with the reason"
+RP_OUT="$(rust_pin_read "$RP_TMP/no-such-dir" 2>&1)"; RP_RC=$?
+if [ "$RP_RC" != "0" ] && grep -q 'is missing' <<<"$RP_OUT"; then pass; else fail "rc=$RP_RC out=$RP_OUT"; fi
+
+it "the committed pin is an exact version, and this repo never floats again"
+RP_PINNED="$(rust_pin_read "$REPO_DIR")"
+case "$RP_PINNED" in
+  [0-9]*.[0-9]*.[0-9]*) pass ;;
+  *) fail "rust-toolchain.toml resolves to '$RP_PINNED'" ;;
+esac
+
+# verdict: "<echoed verdict> <return code>" for each input -- the same
+# contract node-pin.sh's group asserts.
+rp_verdict(){ local v rc; v="$(rust_pin_verdict "$@")"; rc=$?; echo "$v $rc"; }
+it "the verdict passes exactly the pinned version"
+eq "$(rp_verdict 1.99.0 1.99.0 0)" "pinned 0"
+it "the verdict refuses another version, including a prefix-sibling"
+eq "$(rp_verdict 1.99.0 1.99.1 0) / $(rp_verdict 1.99.0 1.9 0)" "mismatch 1 / mismatch 1"
+it "the verdict refuses an absent rustc"
+eq "$(rp_verdict 1.99.0 "" 0)" "absent 1"
+it "only a literal 1 opens the escape hatch"
+eq "$(rp_verdict 1.99.0 1.98.0 1) / $(rp_verdict 1.99.0 "" 1) / $(rp_verdict 1.99.0 1.98.0 true)" \
+   "mismatch-allowed 0 / absent-allowed 0 / mismatch 1"
+
+it "every consumer sources the lib (a pin asserted nowhere is a pin ignored)"
+RP_WIRED="ok"
+grep -q 'source=lib/rust-pin.sh' scripts/ci-local.sh || RP_WIRED="ci-local.sh does not source it"
+grep -q 'source=lib/rust-pin.sh' scripts/build-remote.sh || RP_WIRED="$RP_WIRED build-remote.sh does not source it"
+grep -q 'source=lib/rust-pin.sh' scripts/release-local.sh || RP_WIRED="$RP_WIRED release-local.sh does not source it"
+eq "$RP_WIRED" "ok"
 
 if [ "$FAIL" -gt 0 ]; then
   echo -e "${RED}$FAIL failed${NC}, $PASS passed${SKIP_NOTE}"

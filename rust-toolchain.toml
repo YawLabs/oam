@@ -1,3 +1,8 @@
 [toolchain]
-channel = "stable"
+# EXACT pin, never a floating channel: `stable` resolves per host at install
+# time, so two release legs silently gate on different clippy versions (how
+# manual_clamp passed locally at 1.96 and failed the builder at 1.97).
+# Bump deliberately -- scripts/toolchain-consistency.sh gates every release leg
+# on this pin resolving to the same rustc everywhere.
+channel = "1.99.0"
 components = ["rustfmt", "clippy", "rust-analyzer"]
