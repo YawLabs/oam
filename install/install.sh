@@ -63,6 +63,34 @@ warn() { printf 'oam-install: warning: %s\n' "$1" >&2; }
 die() { printf 'oam-install: error: %s\n' "$1" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "required tool not found: $1"; }
 
+# Refuse to install where another oam would win: this run only helps if the
+# binary it lays down is the one the shell will run. Checked only when
+# $INSTALL_DIR is already a PATH entry -- the guidance near the end PREPENDS it
+# when it is missing, so a dir not on PATH yet is not a lasting shadow, while a
+# dir already listed but beaten by an earlier entry always is. Entries are
+# compared with trailing slashes stripped (real PATHs carry them); a shadow is
+# a regular executable FILE, not a searchable directory that happens to be
+# named oam, matching install.ps1's Leaf check.
+_sh_path=""
+while IFS= read -r _d; do
+  _sh_path="$_sh_path:${_d%/}"
+done <<EOF
+$(printf '%s\n' "$PATH" | tr ':' '\n')
+EOF
+_sh_install="${INSTALL_DIR%/}"
+case ":${_sh_path}:" in
+  *":${_sh_install}:"*)
+    _shadow=""
+    while IFS= read -r _d; do
+      if [ "$_d" = "$_sh_install" ]; then break; fi
+      if [ -n "$_d" ] && [ -f "$_d/oam" ] && [ -x "$_d/oam" ]; then _shadow="$_d/oam"; break; fi
+    done <<EOF
+$(printf '%s\n' "$_sh_path" | tr ':' '\n')
+EOF
+    [ -z "$_shadow" ] || die "another oam would win on PATH: $_shadow resolves before $INSTALL_DIR -- remove it (typically a dev build or a stale copy), or put $INSTALL_DIR earlier in PATH"
+    ;;
+esac
+
 # --- The trust root, embedded ---------------------------------------------------
 # Byte-identical copies of release-keys/allowed_signers, release-keys/ranges and
 # release-keys/presigning-sums; scripts/test-scripts.sh fails on any drift.

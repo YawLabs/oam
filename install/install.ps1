@@ -32,6 +32,11 @@
 #                     ssh-keygen, WITHOUT checking its signature. Only a
 #                     missing tool is skipped: with ssh-keygen present the
 #                     signature is always checked, and a bad one always fails.
+#   OAM_SKIP_PATH_SHADOW=1
+#                     install even though another oam earlier on PATH would
+#                     still be the one that runs (a dev build, or another
+#                     product's bundled copy). Loud: this install does not
+#                     take effect until PATH is reordered.
 #   GH_TOKEN          GitHub token for private-repo installs (GITHUB_TOKEN is
 #                     also accepted). Needed on headless hosts -- CI, a fresh
 #                     VM -- that have a token but no gh CLI. While the repo is
@@ -225,6 +230,22 @@ function Get-LatestTag {
     if ($t) { return [string]$t }
   }
   return $null
+}
+
+# Refuse to install where another oam would win: whatever Get-Command resolves
+# for `oam` (PATHEXT included, so oam.cmd/oam.bat count) is still the oam that
+# runs after this install, because this script only APPENDS the install dir to
+# PATH -- appending cannot fix a shadow, only reordering can. Checked before
+# tag resolution so a shadowed host fails instantly, with no network round
+# trip. (install.sh PREPENDS in its guidance, so its check is gated on the dir
+# already being a PATH entry; this one is not.)
+$shadowCmd = Get-Command oam -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($shadowCmd -and "$($shadowCmd.Path)" -ne (Join-Path $installDir 'oam.exe')) {
+  if ($env:OAM_SKIP_PATH_SHADOW -eq '1') {
+    Warn "OAM_SKIP_PATH_SHADOW=1: installing even though another oam would win on PATH ($($shadowCmd.Path) resolves ahead of $installDir) -- this install is not the oam that runs until PATH is reordered"
+  } else {
+    Die "another oam would win on PATH: $($shadowCmd.Path) resolves ahead of $installDir -- remove it (typically a dev build or a stale copy), put $installDir earlier in PATH, or set OAM_SKIP_PATH_SHADOW=1 to install anyway"
+  }
 }
 
 if ($env:OAM_VERSION) {
@@ -495,7 +516,12 @@ try {
     catch { Remove-Item -Path "$dest.old" -Force -ErrorAction SilentlyContinue; Move-Item -Path $dest -Destination "$dest.old" -Force }
   }
   Move-Item -Path $binPath -Destination $dest -Force
+  # The move-aside is removed best-effort: a running copy (an `oam mcp` server,
+  # a second session) keeps it until a later install or `oam self-update`, whose
+  # sweep clears it. Say so when it survives -- a stray oam.exe beside the
+  # install is exactly the residue that must not go unnoticed.
   Remove-Item -Path "$dest.old" -Force -ErrorAction SilentlyContinue
+  if (Test-Path "$dest.old") { Warn "$dest.old could not be removed -- most likely the previous oam.exe is still running (an ACL refusal looks the same); it is not on PATH and a later install or 'oam self-update' will clear it" }
   Say "installed oam $tag to $dest"
 
   # The binary is a binary redistribution of V8, ICU, the Node streams port and
