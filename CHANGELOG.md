@@ -16,11 +16,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
-## [0.18.1] - 2026-10-10
+## [0.19.0] - 2026-10-11
 
 ### Added
 
-- **`listen(path)` on the `tls`, `http`, `https` and `http2` servers (#282).** A Windows
+- **`listen(path)` on the `tls`, `http`, `https` and `http2` servers (#282, #313).** A Windows
   named pipe or Unix domain socket, as Node's: the server binds it, `address()` answers
   the path (while listening and after close), a NUL in the path is the async EINVAL bind
   error, and a connection's address fields are undefined (`server.address()` on the
@@ -30,6 +30,41 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   join hyper directly). The CLIENT side of TLS over a pipe (`tls.connect({ path })`, an
   https request's `socketPath`) is still the recorded refusal -- the workaround is TLS
   over an existing socket. Conformance cases 388-391.
+
+### Changed
+
+- **The Rust toolchain is pinned exactly, not a floating `stable`, and every release leg
+  asserts it.** `channel = "stable"` resolved per host at install time -- 1.96 on the
+  Windows release box, 1.97 on the GCP builder -- so the v0.18.1 linux leg died on a lint
+  the local gate had never run. `rust-toolchain.toml` now pins `1.99.0` and
+  `scripts/lib/rust-pin.sh` checks it in ci-local preflight, remote prep and release
+  preflight; `OAM_ALLOW_RUST_MISMATCH=1` is the ad-hoc escape hatch.
+
+### Fixed
+
+- **A pipe's TCP bind error keeps its real port, and a split HTTP/2 preface survives the
+  pipe's consuming reads (#314).** Review follow-ups to `listen(path)`: the http/https/h2c
+  pipe error handlers stamped `port: -1` on every bind failure (node reports `-1` only for
+  a pipe's -- a TCP one keeps the port), and the h2c preface probe on a pipe discarded the
+  bytes each retry consumed, so an `PRI * HTTP/2.0` preface split across pipe reads was
+  never seen whole. The probe now accumulates across retries (a TCP peek re-reads the
+  untouched head, so nothing changes there); cases 388-391 are byte-identical to node
+  v22.22.2 after the fixes.
+- **The installers refuse an install another `oam` would shadow on PATH (#315).** A
+  v0.18.0+ install whose binary is not the `oam` the shell resolves delivers only a
+  license file. `install.sh` and `install.ps1` now refuse before the download when an
+  earlier PATH entry resolves an oam (install.sh only when its install dir is already a
+  PATH entry, since its guidance prepends when missing; install.ps1 always, since it
+  appends and appending cannot fix a shadow, and it catches `oam.cmd`/`oam.bat` via
+  PATHEXT too).
+  `OAM_SKIP_PATH_SHADOW=1` lifts the refusal into a loud warning for setups where an
+  earlier oam (e.g. one bundled by another product) is intended. `install.ps1` also warns
+  when a surviving `oam.exe.old` is left behind instead of leaving it silently.
+
+## [0.18.1] - 2026-10-10
+
+### Added
+
 - **`os.getPriority([pid])` and `os.setPriority([pid,] priority)`.** Node's validation
   (`ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE`, priority in -20..19), libuv's mapping onto
   Windows priority classes and back, and `ERR_SYSTEM_ERROR` naming `uv_os_getpriority` /
@@ -4276,7 +4311,8 @@ releases.
 - The `fork` prewarm pool warms lazily, on first `fork()`.
 - `io_uring` read chunks grow from 64 KiB to 4 MiB, fixing large-file reads.
 
-[Unreleased]: https://github.com/YawLabs/oam/compare/v0.18.1...HEAD
+[Unreleased]: https://github.com/YawLabs/oam/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/YawLabs/oam/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/YawLabs/oam/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/YawLabs/oam/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/YawLabs/oam/compare/v0.17.0...v0.17.1
