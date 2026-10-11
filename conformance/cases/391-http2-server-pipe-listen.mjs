@@ -14,7 +14,7 @@
 // The h2 client dials through its net socket with the `path` option (the
 // plain pipe dial, not the refused tls.connect({ path })).
 import http2 from "node:http2";
-import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -68,6 +68,39 @@ log("listening address=" + JSON.stringify(server.address()));
     req.end();
   });
   log("h2 " + out);
+}
+
+// An h2 preface split across two writes, from a raw socket: node's client
+// writes it whole, so this pins the detection against the pipe's peekless
+// read losing the first chunk to a retry. The client sends 10 preface
+// bytes, then the rest plus an empty SETTINGS frame, and the server's
+// SETTINGS (frame type 4) back is the proof it ran h2 and not the HTTP/1.1
+// fallback. The first 9 response bytes' frame type is node's contract; a
+// fallback answers HTTP/1.1 text and fails the check.
+{
+  const out = await new Promise((resolve) => {
+    const s = net.connect({ path: P });
+    const PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    const SETTINGS = Buffer.from([0, 0, 0, 4, 0, 0, 0, 0, 0]);
+    let got = Buffer.alloc(0);
+    s.on("error", (e) => resolve("error " + e.code));
+    s.on("connect", () => {
+      s.write(Buffer.from(PREFACE.slice(0, 10)));
+      setTimeout(() => {
+        s.write(Buffer.concat([Buffer.from(PREFACE.slice(10)), SETTINGS]));
+      }, 20);
+    });
+    s.on("data", (d) => {
+      got = Buffer.concat([got, d]);
+      if (got.length >= 9) {
+        // The verdict is in; the socket must go or the server's close()
+        // below drains forever waiting for it.
+        s.destroy();
+        resolve("frame type " + got[3]);
+      }
+    });
+  });
+  log("split preface " + out);
 }
 
 // close() drains; the server keeps its name after.
