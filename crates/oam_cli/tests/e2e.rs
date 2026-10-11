@@ -32885,7 +32885,7 @@ fn v8_pool_size_sets_the_platforms_worker_thread_count() {
     // No request: min(4, cores - 1), and at least 1 -- the same formula on
     // the same box the child sizes from.
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let default = cores.saturating_sub(1).max(1).min(4) as u64;
+    let default = cores.saturating_sub(1).clamp(1, 4) as u64;
     assert_eq!(
         workers(&["run", &path], &[]),
         default,
