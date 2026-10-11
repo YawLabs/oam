@@ -1,7 +1,7 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "68bb11e",
-  "oamVersion": "oam 0.18.0",
+  "commit": "8839fb3",
+  "oamVersion": "oam 0.18.1",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
   "suites": {
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 307,
-      "total": 308,
+      "pass": 309,
+      "total": 310,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -1004,6 +1004,14 @@
           "sides": "both"
         },
         {
+          "case": "385-child-exec-promisify-custom.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "386-os-priority.mjs",
+          "status": "pass"
+        },
+        {
           "case": "39-util-fidelity.mjs",
           "status": "pass"
         },
@@ -1351,7 +1359,7 @@
         "platform": "win32",
         "noBaseline": false,
         "nodeTotal": 1874,
-        "knownMissing": 315,
+        "knownMissing": 313,
         "newMissing": [],
         "staleRatchet": [],
         "absentModules": [],
