@@ -3483,36 +3483,51 @@ async fn read_h2_preface(
     stream: &mut crate::tcp::PlainStream,
 ) -> std::io::Result<Option<(bool, Bytes)>> {
     let mut peek_buf = [0u8; 24];
+    // A PIPE read consumes what it read and cannot put it back, so its
+    // retries read on at `got` and the decision is made on the whole head
+    // -- a preface split across pipe reads accumulates instead of losing
+    // its first chunk to the retry. A TCP peek re-reads the untouched head
+    // every time, so `got` stays 0 there.
+    let mut got = 0usize;
     loop {
         let peeked = match stream {
             crate::tcp::PlainStream::Tcp(tcp) => tcp.peek(&mut peek_buf).await,
             crate::tcp::PlainStream::Pipe(_) => {
-                tokio::io::AsyncReadExt::read(stream, &mut peek_buf).await
+                tokio::io::AsyncReadExt::read(stream, &mut peek_buf[got..]).await
             }
         };
         match peeked {
-            Ok(n) if n >= H2_PREFACE.len() => {
+            Ok(n) if got + n >= H2_PREFACE.len() => {
                 let is_h2 = peek_buf[..H2_PREFACE.len()] == *H2_PREFACE;
                 // Only a pipe's read consumed bytes; a TCP peek leaves them.
                 let prefix = if matches!(stream, crate::tcp::PlainStream::Pipe(_)) {
-                    Bytes::copy_from_slice(&peek_buf[..n])
+                    Bytes::copy_from_slice(&peek_buf[..got + n])
                 } else {
                     Bytes::new()
                 };
                 return Ok(Some((is_h2, prefix)));
             }
-            Ok(0) => return Ok(Some((false, Bytes::new()))),
-            // A partial head (or more bytes than the probe holds, which a
-            // 24-byte buffer cannot produce): a preface prefix waits for
-            // more, as the TCP loop does; anything else is HTTP/1.1.
+            Ok(0) => {
+                let prefix = if matches!(stream, crate::tcp::PlainStream::Pipe(_)) && got > 0 {
+                    Bytes::copy_from_slice(&peek_buf[..got])
+                } else {
+                    Bytes::new()
+                };
+                return Ok(Some((false, prefix)));
+            }
+            // A partial head: a preface prefix waits for more, as the TCP
+            // loop does; anything else is HTTP/1.1.
             Ok(n) => {
-                let n = n.min(H2_PREFACE.len());
-                if peek_buf[..n] == H2_PREFACE[..n] {
+                let total = got + n;
+                if peek_buf[..total] == H2_PREFACE[..total] {
+                    if matches!(stream, crate::tcp::PlainStream::Pipe(_)) {
+                        got = total;
+                    }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     continue;
                 }
                 let prefix = if matches!(stream, crate::tcp::PlainStream::Pipe(_)) {
-                    Bytes::copy_from_slice(&peek_buf[..n])
+                    Bytes::copy_from_slice(&peek_buf[..total])
                 } else {
                     Bytes::new()
                 };

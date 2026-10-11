@@ -22518,9 +22518,10 @@
         binding.then(
           (bound) => serverBound(this, bound, false),
           (err) => {
-            // node's uvExceptionWithHostPort: a pipe's bind error carries
-            // port -1 (last of its keys), as net's own pipe path reports.
-            if (err && err.syscall === "listen") err.port = -1;
+            // node's uvExceptionWithHostPort: a PIPE's bind error carries
+            // port -1 (last of its keys), as net's own pipe path reports --
+            // a TCP bind error keeps the real port.
+            if (path !== undefined && err && err.syscall === "listen") err.port = -1;
             this.emit("error", err);
           },
         );
@@ -31850,9 +31851,10 @@
           },
           (err) => {
             const e = typeof err === "string" ? new Error(err) : err;
-            // node's uvExceptionWithHostPort: a pipe's bind error carries
-            // port -1, as net's own pipe path reports.
-            if (e && e.syscall === "listen") e.port = -1;
+            // node's uvExceptionWithHostPort: a PIPE's bind error carries
+            // port -1, as net's own pipe path reports -- a TCP bind error
+            // keeps the real port.
+            if (path !== undefined && e && e.syscall === "listen") e.port = -1;
             this.emit("error", e);
           },
         );
@@ -35106,9 +35108,10 @@
             })();
           },
           function(err) {
-            // node's uvExceptionWithHostPort: a pipe's bind error carries
-            // port -1, as net's own pipe path reports.
-            if (err && err.syscall === "listen") err.port = -1;
+            // node's uvExceptionWithHostPort: a PIPE's bind error carries
+            // port -1, as net's own pipe path reports -- a TCP bind error
+            // keeps the real port.
+            if (path !== undefined && err && err.syscall === "listen") err.port = -1;
             self.emit("error", err);
           },
         );
