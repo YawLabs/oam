@@ -113,6 +113,19 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   hard as before. The pool's unit tests dial the reserved host `gate.test`, which the
   published-URLs gate did not allowlist, so that gate was red on main too.
 
+- **Fourteen tests for the branches the PRs since 0.18.0 left unpinned.** The pool's pop-first
+  invariant (a concurrent checkout cannot take an entry another is ageing), the hand-written
+  getaddrinfo rows and the unknown-code text fallback, the Windows priority-class raise ladder
+  and the EcoQoS read-back, `--v8-pool-size` through `NODE_OPTIONS` and the merge with argv,
+  the `OAM_V8_POOL_SIZE` warning contract and the bare flag's exit 9, an `http.request` with
+  `family` / `hints` reaching the agent socket, `oam install` failing loudly on a tarball that
+  arrives content-encoded, and the harness's worker-error, panic-payload, timeout and FAIL-block
+  paths (the FAIL block is now assembled by `fail_block`, same bytes). One e2e is `#[ignore]`d
+  with its numbers: the freshness gate for #155 does NOT hold over TLS -- 4-53 of 1,000 GET + 302
+  hops doubled against a `tls.createServer` that answers then `end()`s, where node's client
+  doubles none -- so the test is the contract for that fix. The Linux-only thread-count e2e for
+  `--v8-pool-size` is compiled but was not run on the Windows box that wrote it.
+
 - **The node-differential cases now fit their budgets (#211, remaining items).** Case 122 ran
   its refused-host-spellings lookups -- the slowest section and the one whose cost varies most
   between hosts -- before the 25-round "socket up at 'response'" check, so a slow host's

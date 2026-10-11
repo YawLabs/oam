@@ -285,6 +285,9 @@ mod tests {
 
     #[test]
     fn get_priority_of_self_is_on_the_scale() {
+        // Two reads that must agree: hold off the raise ladder in between.
+        #[cfg(windows)]
+        let _g = process_wide::lock();
         let p = get_priority(0).unwrap();
         assert!((PRIORITY_HIGHEST..=PRIORITY_LOW).contains(&p));
         assert_eq!(get_priority(std::process::id() as i32), Ok(p));
@@ -294,5 +297,124 @@ mod tests {
     fn missing_process_is_esrch() {
         assert_eq!(get_priority(i32::MAX), Err("ESRCH"));
         assert_eq!(set_priority(i32::MAX, PRIORITY_LOW), Err("ESRCH"));
+    }
+
+    /// The priority class and the power-throttling state are process-wide,
+    /// and the test binary runs its tests on parallel threads: every test
+    /// that changes or reads either holds this lock for its whole body, so a
+    /// raise in one is never observed by another.
+    #[cfg(windows)]
+    mod process_wide {
+        use super::*;
+        use std::sync::{Mutex, MutexGuard};
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, GetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+            ProcessPowerThrottling, SetProcessInformation,
+        };
+
+        static LOCK: Mutex<()> = Mutex::new(());
+
+        pub(super) fn lock() -> MutexGuard<'static, ()> {
+            LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        /// Puts the priority class back to the value it was read at on
+        /// drop, so a failed assertion mid-ladder cannot leave the rest of
+        /// the binary (or a runner that launched it lowered) raised.
+        struct RestorePriority(i32);
+
+        impl Drop for RestorePriority {
+            fn drop(&mut self) {
+                let _ = set_priority(0, self.0);
+            }
+        }
+
+        /// Pins the Windows raise ladder: -7 lands on ABOVE_NORMAL and
+        /// reads back as -7, -14 on HIGH as -14, and 0 is NORMAL again.
+        /// REALTIME (-20) is not asserted: it needs a privilege, and without
+        /// it Windows silently substitutes HIGH. The starting class is
+        /// whatever the runner launched us at, and that is what is restored.
+        #[test]
+        fn set_priority_raises_through_above_normal_and_high_and_back() {
+            let _g = lock();
+            let _restore = RestorePriority(get_priority(0).unwrap());
+            assert_eq!(set_priority(0, PRIORITY_ABOVE_NORMAL), Ok(()));
+            assert_eq!(get_priority(0), Ok(PRIORITY_ABOVE_NORMAL));
+            assert_eq!(set_priority(0, PRIORITY_HIGH), Ok(()));
+            assert_eq!(get_priority(0), Ok(PRIORITY_HIGH));
+            assert_eq!(set_priority(0, PRIORITY_NORMAL), Ok(()));
+            assert_eq!(get_priority(0), Ok(PRIORITY_NORMAL));
+        }
+
+        /// This process's power-throttling state as the kernel reports it.
+        fn throttling_state() -> PROCESS_POWER_THROTTLING_STATE {
+            let mut state = PROCESS_POWER_THROTTLING_STATE {
+                Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                ControlMask: 0,
+                StateMask: 0,
+            };
+            // SAFETY: the current-process pseudo-handle is always valid, and
+            // the call writes exactly size_of::<PROCESS_POWER_THROTTLING_STATE>()
+            // bytes through a pointer to `state`, a live local of that type.
+            let ok = unsafe {
+                GetProcessInformation(
+                    GetCurrentProcess(),
+                    ProcessPowerThrottling,
+                    (&raw mut state).cast(),
+                    std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+                )
+            };
+            assert_ne!(
+                ok,
+                0,
+                "GetProcessInformation: {}",
+                std::io::Error::last_os_error()
+            );
+            state
+        }
+
+        /// Puts the throttling state back on drop -- the system default
+        /// (ControlMask 0) unless the launcher throttled us -- so the rest of
+        /// the test binary does not run on efficiency cores.
+        struct RestoreThrottling(PROCESS_POWER_THROTTLING_STATE);
+
+        impl Drop for RestoreThrottling {
+            fn drop(&mut self) {
+                // SAFETY: as in `enable_ecoqos`: the pseudo-handle is always
+                // valid and the call reads exactly the size of `self.0`, a
+                // live, initialized value of that type.
+                unsafe {
+                    SetProcessInformation(
+                        GetCurrentProcess(),
+                        ProcessPowerThrottling,
+                        (&raw const self.0).cast(),
+                        std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+                    );
+                }
+            }
+        }
+
+        /// Pins that `enable_ecoqos` really opts the process into
+        /// execution-speed throttling: read back, both the control mask (the
+        /// bit is managed) and the state mask (it is on) carry
+        /// EXECUTION_SPEED. The call is fire-and-forget, so this read-back is
+        /// the only evidence it did anything.
+        #[test]
+        fn enable_ecoqos_sets_execution_speed_throttling() {
+            let _g = lock();
+            let _restore = RestoreThrottling(throttling_state());
+            imp::enable_ecoqos();
+            let state = throttling_state();
+            assert_eq!(state.Version, PROCESS_POWER_THROTTLING_CURRENT_VERSION);
+            assert_ne!(
+                state.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                0
+            );
+            assert_ne!(
+                state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                0
+            );
+        }
     }
 }

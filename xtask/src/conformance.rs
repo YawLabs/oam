@@ -344,47 +344,17 @@ pub fn run(release: bool) -> Result<()> {
                     println!("  pass {name}");
                     Outcome::Pass
                 } else {
-                    let same_exit = oam_out.code == node_out.code;
                     let detail =
                         first_difference(&normalize(&oam_out.stdout), &normalize(&node_out.stdout));
                     // Print the divergence to stdout, not just the scorecard JSON: the
                     // scorecard is a CI artifact that isn't surfaced in the run log, so
                     // a platform-specific FAIL (e.g. a case that only diverges on Linux)
-                    // was undiagnosable from `gh run view --log-failed`. Show exit codes,
-                    // the first differing line (oam vs node), and oam's stderr head.
+                    // was undiagnosable from `gh run view --log-failed`.
                     //
                     // The whole block goes out in ONE print: with several workers
                     // printing at once, separate println!s interleave and only the
                     // header line carries the case name.
-                    let mut block = format!("  FAIL {name}\n");
-                    if let Some(side) = fired {
-                        block.push_str(&format!(
-                            "    watchdog: {side} cut the case short with its own\n"
-                        ));
-                    }
-                    if !same_exit {
-                        block.push_str(&format!(
-                            "    exit: oam={} node={}\n",
-                            oam_out.code, node_out.code
-                        ));
-                    }
-                    if let Some(line) = detail.get("line").and_then(Value::as_u64) {
-                        let oam_line = detail.get("oam").and_then(Value::as_str).unwrap_or("");
-                        let node_line = detail.get("node").and_then(Value::as_str).unwrap_or("");
-                        block.push_str(&format!("    first diff at line {line}:\n"));
-                        block.push_str(&format!("      oam:  {oam_line}\n"));
-                        block.push_str(&format!("      node: {node_line}\n"));
-                    }
-                    let stderr_head = oam_out
-                        .stderr
-                        .lines()
-                        .take(3)
-                        .collect::<Vec<_>>()
-                        .join(" | ");
-                    if !stderr_head.is_empty() {
-                        block.push_str(&format!("    oam stderr: {stderr_head}\n"));
-                    }
-                    print!("{block}");
+                    print!("{}", fail_block(&name, fired, &oam_out, &node_out, &detail));
                     Outcome::Fail(json!({
                         "case": name,
                         "status": "fail",
@@ -1731,6 +1701,43 @@ fn first_difference(a: &str, b: &str) -> Value {
     json!(null)
 }
 
+/// The one-print FAIL block for a divergent differential pair: the header,
+/// then only the segments that apply -- a watchdog cut, differing exit
+/// codes, the first differing line (oam vs node), and oam's stderr head.
+/// Every line is newline-terminated so the block ends on exactly one.
+/// Assembled as one String so the caller can `print!` it once; with several
+/// workers printing at once, separate println!s interleave and only the
+/// header line would carry the case name.
+fn fail_block(
+    name: &str,
+    fired: Option<&str>,
+    oam: &Captured,
+    node: &Captured,
+    detail: &Value,
+) -> String {
+    let mut block = format!("  FAIL {name}\n");
+    if let Some(side) = fired {
+        block.push_str(&format!(
+            "    watchdog: {side} cut the case short with its own\n"
+        ));
+    }
+    if oam.code != node.code {
+        block.push_str(&format!("    exit: oam={} node={}\n", oam.code, node.code));
+    }
+    if let Some(line) = detail.get("line").and_then(Value::as_u64) {
+        let oam_line = detail.get("oam").and_then(Value::as_str).unwrap_or("");
+        let node_line = detail.get("node").and_then(Value::as_str).unwrap_or("");
+        block.push_str(&format!("    first diff at line {line}:\n"));
+        block.push_str(&format!("      oam:  {oam_line}\n"));
+        block.push_str(&format!("      node: {node_line}\n"));
+    }
+    let stderr_head = oam.stderr.lines().take(3).collect::<Vec<_>>().join(" | ");
+    if !stderr_head.is_empty() {
+        block.push_str(&format!("    oam stderr: {stderr_head}\n"));
+    }
+    block
+}
+
 /// A worker between cases, per the per-worker in-flight cell.
 const SENTINEL: usize = usize::MAX;
 
@@ -2169,6 +2176,28 @@ mod tests {
         assert_eq!(watchdog, vec!["ccc.mjs".to_string()]);
     }
 
+    /// A case the harness's own clock killed is a `timeout` row and nothing
+    /// else: it is not a pass, and it is not a watchdog (the case never got
+    /// to fire its own), so the slow-host WARNING list leaves it out.
+    #[test]
+    fn reassemble_scores_a_timeout_as_its_own_status() {
+        let names = ["aaa.mjs", "bbb.mjs", "ccc.mjs"];
+        let cases: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
+        let slots: Vec<Mutex<Option<Outcome>>> = cases.iter().map(|_| Mutex::new(None)).collect();
+        *slots[0].lock().unwrap() = Some(Outcome::Pass);
+        *slots[1].lock().unwrap() = Some(Outcome::Timeout);
+        *slots[2].lock().unwrap() = Some(Outcome::Watchdog);
+        let (rows, pass, watchdog) = reassemble(&slots, &cases);
+        assert_eq!(rows[1], json!({ "case": "bbb.mjs", "status": "timeout" }));
+        assert_eq!(pass, 1, "a timeout is not a pass");
+        assert_eq!(
+            watchdog,
+            vec!["ccc.mjs".to_string()],
+            "a timeout is not a watchdog"
+        );
+        assert_eq!(harness_problems(Vec::new(), &rows), None);
+    }
+
     /// When every worker stops on the same spawn failure, the cases nobody
     /// pulled are a COUNT in the bail, after the real errors; they are not
     /// hundreds of rows ahead of the one line that says what broke.
@@ -2268,6 +2297,121 @@ mod tests {
         assert!(watchdog.is_empty());
     }
 
+    /// `panic!("... {slot}")` carries a String payload, not a `&str`; the
+    /// pool's join arm must downcast both, or a formatted panic is reported
+    /// as "non-text panic payload" and the row stops saying what broke.
+    #[test]
+    fn a_formatted_panic_payload_is_quoted_in_the_row() {
+        let names = ["aaa.mjs", "bbb.mjs"];
+        let cases: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
+        let slots: Vec<Mutex<Option<Outcome>>> = cases.iter().map(|_| Mutex::new(None)).collect();
+        let stray = run_pool(
+            &cases,
+            2,
+            &|slot: usize| {
+                if slot == 1 {
+                    panic!("boom in slot {slot}");
+                }
+                *slots[slot].lock().unwrap() = Some(Outcome::Pass);
+                Ok(())
+            },
+            &slots,
+        );
+        assert!(stray.is_empty(), "a mid-case panic is not stray: {stray:?}");
+        let (rows, pass, _) = reassemble(&slots, &cases);
+        assert_eq!(pass, 1);
+        assert_eq!(rows[1]["status"], "harness-error");
+        let error = rows[1]["error"].as_str().unwrap();
+        assert!(
+            error.contains("bbb.mjs") && error.contains("boom in slot 1"),
+            "a String payload is quoted like a &str one: {error}"
+        );
+    }
+
+    /// A `run_case` Err is a harness error (a spawn failure, not a case
+    /// verdict): the pool files the FULL `{e:#}` context chain into the
+    /// case's slot and that worker stops pulling, so with one worker the
+    /// rest of the queue is never reached and the bail counts it. The
+    /// bail's text is the chain as filed -- the real spawn error names the
+    /// case through its `Command` debug, and the row's `case` field names
+    /// it in the JSON.
+    #[test]
+    fn a_run_case_error_fills_its_slot_and_stops_the_worker() {
+        let names = ["aaa.mjs", "bbb.mjs", "ccc.mjs"];
+        let cases: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
+        let slots: Vec<Mutex<Option<Outcome>>> = cases.iter().map(|_| Mutex::new(None)).collect();
+        let stray = run_pool(
+            &cases,
+            1,
+            &|slot: usize| {
+                if slot == 0 {
+                    return Err(anyhow::anyhow!("spawn failed").context("spawning node"));
+                }
+                *slots[slot].lock().unwrap() = Some(Outcome::Pass);
+                Ok(())
+            },
+            &slots,
+        );
+        assert!(stray.is_empty(), "an Err is not a panic: {stray:?}");
+        match slots[0].lock().unwrap().as_ref() {
+            Some(Outcome::Harness(error)) => assert!(
+                error.contains("spawning node") && error.contains("spawn failed"),
+                "the slot carries the whole context chain: {error}"
+            ),
+            _ => panic!("slot 0 is a Harness outcome"),
+        }
+        assert!(slots[1].lock().unwrap().is_none(), "the one worker stopped");
+        assert!(slots[2].lock().unwrap().is_none(), "the one worker stopped");
+        let (rows, pass, _) = reassemble(&slots, &cases);
+        assert_eq!(pass, 0);
+        assert_eq!(rows[0]["case"], "aaa.mjs");
+        assert_eq!(
+            harness_problems(stray, &rows),
+            Some("spawning node: spawn failed; 2 case(s) not run".to_string())
+        );
+    }
+
+    /// Only the worker that hit the Err stops: with two workers, the other
+    /// one drains the queue, so the cases after the failure are still run
+    /// and scored, and the bail names just the one real error.
+    #[test]
+    fn a_run_case_error_stops_only_its_own_worker() {
+        let names = ["aaa.mjs", "bbb.mjs", "ccc.mjs"];
+        let cases: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
+        let slots: Vec<Mutex<Option<Outcome>>> = cases.iter().map(|_| Mutex::new(None)).collect();
+        let stray = run_pool(
+            &cases,
+            2,
+            &|slot: usize| {
+                if slot == 0 {
+                    return Err(anyhow::anyhow!("spawn failed").context("spawning node"));
+                }
+                *slots[slot].lock().unwrap() = Some(Outcome::Pass);
+                Ok(())
+            },
+            &slots,
+        );
+        assert!(stray.is_empty());
+        assert!(matches!(
+            slots[0].lock().unwrap().as_ref(),
+            Some(Outcome::Harness(_))
+        ));
+        assert!(matches!(
+            slots[1].lock().unwrap().as_ref(),
+            Some(Outcome::Pass)
+        ));
+        assert!(matches!(
+            slots[2].lock().unwrap().as_ref(),
+            Some(Outcome::Pass)
+        ));
+        let (rows, pass, _) = reassemble(&slots, &cases);
+        assert_eq!(pass, 2);
+        assert_eq!(
+            harness_problems(stray, &rows),
+            Some("spawning node: spawn failed".to_string())
+        );
+    }
+
     #[test]
     fn a_watchdog_on_one_side_is_still_a_failure() {
         let finished = captured("one\ntwo\nthree\n", 0);
@@ -2276,6 +2420,66 @@ mod tests {
         assert_eq!(watchdog_sides(&cut, &finished), Some("oam"));
         assert_eq!(verdict(&finished, &cut), Verdict::Fail);
         assert_eq!(watchdog_sides(&finished, &cut), Some("node"));
+    }
+
+    /// The FAIL block carries every segment that applies, in the order the
+    /// log reader expects -- watchdog, exit, first diff, stderr -- with
+    /// every line newline-terminated and exactly one trailing newline, so
+    /// the one `print!` neither runs into the next worker's header nor
+    /// leaves a blank line.
+    #[test]
+    fn the_fail_block_carries_every_segment_in_order() {
+        let oam = Captured {
+            stdout: "one\nWATCHDOG\n".to_string(),
+            stderr: "err one\nerr two\n".to_string(),
+            code: 9,
+            timed_out: false,
+        };
+        let node = captured("one\ntwo\nthree\n", 0);
+        let fired = watchdog_sides(&oam, &node);
+        assert_eq!(fired, Some("oam"));
+        let detail = first_difference(&normalize(&oam.stdout), &normalize(&node.stdout));
+        let block = fail_block("001-x.mjs", fired, &oam, &node, &detail);
+        assert_eq!(
+            block,
+            "  FAIL 001-x.mjs\n\
+             \x20   watchdog: oam cut the case short with its own\n\
+             \x20   exit: oam=9 node=0\n\
+             \x20   first diff at line 2:\n\
+             \x20     oam:  WATCHDOG\n\
+             \x20     node: two\n\
+             \x20   oam stderr: err one | err two\n"
+        );
+        let segments = ["watchdog:", "exit:", "first diff at line", "oam stderr:"];
+        let positions: Vec<usize> = segments
+            .iter()
+            .map(|s| {
+                block
+                    .find(s)
+                    .unwrap_or_else(|| panic!("{s} is in the block"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "segments in order"
+        );
+        assert!(block.ends_with('\n') && !block.ends_with("\n\n"));
+        assert_eq!(block.lines().count(), block.matches('\n').count());
+    }
+
+    /// Only the segments that apply are printed: identical stdout has no
+    /// first-diff lines, and empty stderr has no stderr line, so the block
+    /// is the header and the exit line and nothing else.
+    #[test]
+    fn the_fail_block_omits_the_segments_that_do_not_apply() {
+        let oam = captured("one\ntwo\n", 1);
+        let node = captured("one\ntwo\n", 0);
+        let fired = watchdog_sides(&oam, &node);
+        assert_eq!(fired, None);
+        let detail = first_difference(&normalize(&oam.stdout), &normalize(&node.stdout));
+        assert_eq!(detail, json!(null));
+        let block = fail_block("002-y.mjs", fired, &oam, &node, &detail);
+        assert_eq!(block, "  FAIL 002-y.mjs\n    exit: oam=1 node=0\n");
     }
 
     #[test]
