@@ -278,7 +278,7 @@ const PROTOCOL_VERSION_ALERT: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x4
 /// the alert before the client reads it -- and the socket is then drained to
 /// the client's close so the alert is delivered before it goes. Both waits
 /// are bounded, for a client that sends nothing or never closes.
-pub(crate) async fn refuse_no_protocols(mut stream: tokio::net::TcpStream) {
+pub(crate) async fn refuse_no_protocols(mut stream: crate::tcp::PlainStream) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let bound = std::time::Duration::from_secs(5);
     let mut hello = [0u8; 4096];
@@ -3030,7 +3030,7 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            refuse_no_protocols(tcp).await;
+            refuse_no_protocols(crate::tcp::PlainStream::Tcp(tcp)).await;
         });
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),

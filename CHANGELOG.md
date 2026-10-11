@@ -20,6 +20,16 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Added
 
+- **`listen(path)` on the `tls`, `http`, `https` and `http2` servers (#282).** A Windows
+  named pipe or Unix domain socket, as Node's: the server binds it, `address()` answers
+  the path (while listening and after close), a NUL in the path is the async EINVAL bind
+  error, and a connection's address fields are undefined (`server.address()` on the
+  socket answers `{}`), as Node leaves them. oam's native TLS and HTTP servers run on
+  the pipe connection itself -- on Unix over the socket, on Windows through a tokio
+  duplex whose pumps copy the bytes (a named pipe's halves share one handle and cannot
+  join hyper directly). The CLIENT side of TLS over a pipe (`tls.connect({ path })`, an
+  https request's `socketPath`) is still the recorded refusal -- the workaround is TLS
+  over an existing socket. Conformance cases 388-391.
 - **`os.getPriority([pid])` and `os.setPriority([pid,] priority)`.** Node's validation
   (`ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE`, priority in -20..19), libuv's mapping onto
   Windows priority classes and back, and `ERR_SYSTEM_ERROR` naming `uv_os_getpriority` /

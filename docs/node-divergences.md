@@ -3138,7 +3138,9 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
 - **Pipes.** An http request's `socketPath` goes over `net.connect({ path })` to that Unix
   domain socket or Windows named pipe, as in Node, and never to `host:port` (entry 50). An
   https request's `socketPath`, like `tls.connect({ path })`, still fails with
-  `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`: oam has no TLS over a pipe. Up to 0.16.2 they all
+  `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`: oam's TLS client does not dial a pipe (the server
+  side does since #282 -- entry 50; the workaround is `createConnection` over
+  `tls.connect({ socket: net.connect({ path }) })`). Up to 0.16.2 they all
   connected to `host:port` instead (http.request sent the whole request there); up to
   0.17.1 the http ones failed with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` too.
 - **`--permission`.** The request is a `net.connect` / `tls.connect`, and its grant is
@@ -3408,11 +3410,25 @@ to 0.16.2 the server bound a TCP port and the client dialled `host:port`), which
 left `@playwright/mcp --isolated` -- a browser server on a pipe, its client dialling it --
 booting and then failing every browser tool.
 
-- **No TLS, http or http2 server over a pipe.** `tls.connect({ path })` and an https
+- **No TLS, http or http2 server over a pipe.** ~~`tls.connect({ path })` and an https
   request's `socketPath` fail with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`; so does
-  `listen(path)` on a `tls`, `http`, `https` or `http2` server (an `'error'`, on the next
-  tick). oam's TLS connect and those servers are native and TCP-only; `net` is the one
-  carried over to pipes.
+  `listen(path)` on a `tls`, `http`, `https` or `http2` server~~ Since 0.18.1 the servers
+  listen on a pipe as Node's do (#282: `listen(path)` on `tls`, `http`, `https` and both
+  http2 servers -- `address()` answers the path, a NUL in it is the async EINVAL bind
+  error, a Windows pipe connection's addresses are undefined as Node's are;
+  `conformance/cases/388-tls-server-pipe-listen.mjs` through
+  `391-http2-server-pipe-listen.mjs`). Still refused: `tls.connect({ path })` and an
+  https request's `socketPath` -- oam's TLS CLIENT does not dial a pipe (the workaround
+  is TLS over an existing socket: `tls.connect({ socket: net.connect({ path }) })`, and
+  `createConnection` hands such a socket to an https request). oam's native TLS and HTTP
+  servers run on the pipe connection itself: on Unix over the socket, on Windows through
+  a tokio duplex whose pumps copy the bytes (a named pipe's halves share one handle and
+  cannot join hyper directly).
+  A second divergence the two cleartext servers carry: oam's `http2.createServer()` serves
+  HTTP/1.1 clients as a fallback (on TCP and pipes alike); Node's refuses one -- the
+  client reads h2 frames as HTTP/1 and fails `HPE_INVALID_CONSTANT`
+  (measured on v22.22.2). Not pinned in the conformance cases, which compare against
+  Node's refusal.
 - **`--permission`.** A pipe is a net resource named by its path: granted by unrestricted
   `--allow-net`, or by an entry that is exactly that path (`--allow-net=\\.\pipe\app`,
   `--allow-net=/run/app.sock`) -- never by a host entry, a prefix, or a `C` read out of

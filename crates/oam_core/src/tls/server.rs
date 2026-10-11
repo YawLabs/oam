@@ -36,6 +36,7 @@ use super::{
     refuse_no_protocols,
 };
 use crate::OpOutcome;
+use bytes::Bytes;
 use rustls::CertificateError;
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
@@ -45,7 +46,6 @@ use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use x509_parser::parse_x509_certificate;
 use x509_parser::time::ASN1Time;
 
@@ -942,7 +942,7 @@ fn alpn_agrees<'a>(ours: &[Vec<u8>], theirs: Option<impl Iterator<Item = &'a [u8
 const NO_APPLICATION_PROTOCOL_ALERT: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x78];
 
 /// Answer with one alert and close (gracefully, so it is read).
-async fn close_with_alert(mut stream: tokio::net::TcpStream, alert: [u8; 7]) {
+async fn close_with_alert(mut stream: crate::tcp::PlainStream, alert: [u8; 7]) {
     let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &alert).await;
     close_after_alert(stream).await;
 }
@@ -952,14 +952,27 @@ async fn close_with_alert(mut stream: tokio::net::TcpStream, alert: [u8; 7]) {
 const RECORD_OVERFLOW_ALERT: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x16];
 
 /// What came before the handshake: at least the five bytes of a record
-/// header, fewer only at EOF. Read with peek, so the handshake still sees
-/// them.
-async fn peek_record_header(stream: &tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+/// header, fewer only at EOF. A TCP stream reads with peek, so the
+/// handshake still sees the bytes; a pipe has no peek, so its bytes are
+/// READ and returned as the prefix `ServerIo` serves back to rustls.
+async fn read_record_header(
+    stream: &mut crate::tcp::PlainStream,
+) -> std::io::Result<(Vec<u8>, Bytes)> {
     let mut buf = [0u8; 5];
     loop {
-        let n = stream.peek(&mut buf).await?;
-        if n == 0 || n >= buf.len() {
-            return Ok(buf[..n].to_vec());
+        match stream {
+            crate::tcp::PlainStream::Tcp(tcp) => {
+                let n = tcp.peek(&mut buf).await?;
+                if n == 0 || n >= buf.len() {
+                    return Ok((buf[..n].to_vec(), Bytes::new()));
+                }
+            }
+            crate::tcp::PlainStream::Pipe(_) => {
+                // No peek: read once. The bytes come back as the prefix.
+                let n = tokio::io::AsyncReadExt::read(stream, &mut buf).await?;
+                let prefix = Bytes::copy_from_slice(&buf[..n]);
+                return Ok((buf[..n].to_vec(), prefix));
+            }
         }
         // A partial header: peek returns at once while those bytes are
         // unread, so wait for the socket to have more (or a short beat when
@@ -972,11 +985,13 @@ async fn peek_record_header(stream: &tokio::net::TcpStream) -> std::io::Result<V
 /// out, so half-close, and wait (bounded) for the client to read it and
 /// close its side before the socket goes -- closing with the client's bytes
 /// unread would reset the connection, and a reset can overtake the alert.
-async fn close_after_alert(mut stream: tokio::net::TcpStream) {
+async fn close_after_alert(mut stream: crate::tcp::PlainStream) {
     let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
     let mut sink = [0u8; 4096];
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
-        while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
+        while matches!(tokio::io::AsyncReadExt::read(&mut stream, &mut sink).await, Ok(n) if n > 0)
+        {
+        }
     })
     .await;
 }
@@ -985,14 +1000,19 @@ async fn close_after_alert(mut stream: tokio::net::TcpStream) {
 /// server does: read what the client sent (so the close is a FIN, not a
 /// reset that could throw the client's own buffered data away), send the
 /// alert if there is one and nothing else, close.
-async fn close_refused(mut stream: tokio::net::TcpStream, alert: bool) {
+async fn close_refused(mut stream: crate::tcp::PlainStream, alert: bool) {
     let mut sink = [0u8; 4096];
-    loop {
-        match stream.try_read(&mut sink) {
-            Ok(0) => break,
-            Ok(_) => continue,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(_) => break,
+    // Drain what the client already sent, so the close that follows is a
+    // FIN. A TCP socket at rest answers try_read; a pipe has none, and its
+    // close is not a reset either way -- drop straight to the alert.
+    if let crate::tcp::PlainStream::Tcp(tcp) = &mut stream {
+        loop {
+            match tcp.try_read(&mut sink) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
         }
     }
     if alert {
@@ -1002,19 +1022,26 @@ async fn close_refused(mut stream: tokio::net::TcpStream, alert: bool) {
     // Give the client a moment to read the FIN and close its side before
     // this side's close; bounded for a client that never does.
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
-        while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
+        while matches!(tokio::io::AsyncReadExt::read(&mut stream, &mut sink).await, Ok(n) if n > 0)
+        {
+        }
     })
     .await;
 }
 
-/// The TCP stream under an accepted TLS connection. It carries the
-/// connection's client-certificate verdict: once a certificate is refused
-/// under `rejectUnauthorized`, nothing more is written -- the flight rustls
-/// queued after judging it (a TLS 1.2 server's Finished, a TLS 1.3 server's
-/// session tickets) is dropped with the connection, as Node's server
-/// destroys the socket before writing it.
+/// The plain stream under an accepted TLS connection -- a TCP socket or,
+/// since #282, a pipe. It carries the connection's client-certificate
+/// verdict: once a certificate is refused under `rejectUnauthorized`,
+/// nothing more is written -- the flight rustls queued after judging it (a
+/// TLS 1.2 server's Finished, a TLS 1.3 server's session tickets) is
+/// dropped with the connection, as Node's server destroys the socket
+/// before writing it.
 pub struct ServerIo {
-    tcp: tokio::net::TcpStream,
+    stream: crate::tcp::PlainStream,
+    /// Bytes read off the stream BEFORE rustls took it -- the record-header
+    /// probe. Served back on the first poll_read. A TCP stream's probe was
+    /// a `peek` and never consumed anything, so this is empty for one.
+    prefix: Bytes,
     verdict: Option<Arc<VerdictSlot>>,
     /// How much of the `handshake_failure` alert is out (`Gate::NoCertificate`).
     alert_written: usize,
@@ -1026,8 +1053,11 @@ pub struct ServerIo {
 const HANDSHAKE_FAILURE_ALERT: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28];
 
 impl ServerIo {
-    pub fn tcp(&self) -> &tokio::net::TcpStream {
-        &self.tcp
+    /// The TCP socket underneath, when this connection runs over one. A
+    /// pipe connection has none -- its addresses are undefined, as node's
+    /// are (socket.address() on a pipe socket answers {}).
+    pub fn tcp(&self) -> Option<&tokio::net::TcpStream> {
+        self.stream.tcp()
     }
 
     fn gate(&self) -> Gate {
@@ -1048,7 +1078,17 @@ impl tokio::io::AsyncRead for ServerIo {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.tcp).poll_read(cx, buf)
+        // The probe's bytes belong to the handshake (a TCP probe was a
+        // peek, so this is empty there and costs one branch).
+        if !self.prefix.is_empty() && buf.remaining() > 0 {
+            let take = self.prefix.len().min(buf.remaining());
+            let chunk = self.prefix.split_to(take);
+            buf.put_slice(&chunk);
+            if buf.remaining() == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+        }
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
     }
 }
 
@@ -1059,7 +1099,7 @@ impl tokio::io::AsyncWrite for ServerIo {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         match self.gate() {
-            Gate::Open => std::pin::Pin::new(&mut self.tcp).poll_write(cx, buf),
+            Gate::Open => std::pin::Pin::new(&mut self.stream).poll_write(cx, buf),
             // Swallowed: the handshake completes on rustls's side without
             // its last flight reaching the client, and the connection is
             // then dropped (`close_refused_connection`).
@@ -1068,7 +1108,7 @@ impl tokio::io::AsyncWrite for ServerIo {
                 while self.alert_written < HANDSHAKE_FAILURE_ALERT.len() {
                     let from = self.alert_written;
                     let this = &mut *self;
-                    match std::pin::Pin::new(&mut this.tcp)
+                    match std::pin::Pin::new(&mut this.stream)
                         .poll_write(cx, &HANDSHAKE_FAILURE_ALERT[from..])
                     {
                         std::task::Poll::Ready(Ok(n)) if n > 0 => this.alert_written += n,
@@ -1085,14 +1125,14 @@ impl tokio::io::AsyncWrite for ServerIo {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.tcp).poll_flush(cx)
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
     }
 
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.tcp).poll_shutdown(cx)
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
 
@@ -1108,9 +1148,15 @@ impl tokio::io::AsyncWrite for ServerIo {
 fn close_refused_connection(stream: tokio_rustls::server::TlsStream<ServerIo>) {
     let (io, _) = stream.get_ref();
     let mut probe = [0u8; 1];
-    let pending = matches!(io.tcp.try_read(&mut probe), Ok(n) if n > 0);
+    // Only a TCP connection can report bytes still unread in the socket (a
+    // try_read at rest); a pipe's has no try_read and no reset either way.
+    let pending = io
+        .tcp()
+        .map(|tcp| matches!(tcp.try_read(&mut probe), Ok(n) if n > 0))
+        .unwrap_or(false);
     if pending {
-        let _ = socket2::SockRef::from(&io.tcp).set_linger(Some(std::time::Duration::ZERO));
+        let _ =
+            socket2::SockRef::from(io.tcp().unwrap()).set_linger(Some(std::time::Duration::ZERO));
     }
     drop(stream);
 }
@@ -1192,7 +1238,7 @@ impl HandshakeInfo {
 // than the error. `allow`, not `expect`: older clippy does not fire here.
 #[allow(clippy::result_large_err)]
 pub async fn accept_stream(
-    tcp_stream: tokio::net::TcpStream,
+    mut stream: crate::tcp::PlainStream,
     context: &ServerContext,
     options: &AcceptOptions,
 ) -> Result<(tokio_rustls::server::TlsStream<ServerIo>, HandshakeInfo), OpOutcome> {
@@ -1200,7 +1246,7 @@ pub async fn accept_stream(
     // per-connection code; the socket is answered with the alert the client
     // expects, off this task.
     let Some(plain) = &context.plain else {
-        tokio::spawn(refuse_no_protocols(tcp_stream));
+        tokio::spawn(refuse_no_protocols(stream));
         return Err(OpOutcome::node_failed(
             "ERR_SSL_NO_PROTOCOLS_AVAILABLE",
             "no protocols available for the requested TLS version range".to_string(),
@@ -1212,18 +1258,24 @@ pub async fn accept_stream(
     });
 
     let handshake = async {
-        match peek_record_header(&tcp_stream).await {
-            Ok(first) if first.is_empty() => return Err(socket_hang_up()),
-            Ok(first) => {
-                if let Some((code, alert)) = first_record_refusal(&first) {
-                    tokio::spawn(close_refused(tcp_stream, alert));
-                    return Err(OpOutcome::node_failed(code, first_record_message(code)));
-                }
-            }
+        // At least the five header bytes, fewer at EOF -- and the pipe
+        // bytes read off the stream (a TCP probe peeks and consumes
+        // nothing), which ServerIo serves back to rustls as the prefix.
+        let (first, prefix) = match read_record_header(&mut stream).await {
+            Ok(read) => read,
             Err(_) => return Err(socket_hang_up()),
+        };
+        match first_record_refusal(&first) {
+            Some((code, alert)) => {
+                tokio::spawn(close_refused(stream, alert));
+                return Err(OpOutcome::node_failed(code, first_record_message(code)));
+            }
+            None if first.is_empty() => return Err(socket_hang_up()),
+            None => {}
         }
         let io = ServerIo {
-            tcp: tcp_stream,
+            stream,
+            prefix,
             verdict: options.request_cert.then(|| Arc::clone(&verdict)),
             alert_written: 0,
         };
@@ -1236,7 +1288,7 @@ pub async fn accept_stream(
             Ok(start) => start,
             Err(e) => {
                 if let Some(io) = lazy.take_io() {
-                    tokio::spawn(close_after_alert(io.tcp));
+                    tokio::spawn(close_after_alert(io.stream));
                 }
                 return Err(handshake_failure(&e, context.has_identity));
             }
@@ -1246,7 +1298,7 @@ pub async fn accept_stream(
             // OpenSSL answers the ClientHello with this alert alone, in the
             // clear.
             tokio::spawn(close_with_alert(
-                start.io.tcp,
+                start.io.stream,
                 NO_APPLICATION_PROTOCOL_ALERT,
             ));
             return Err(OpOutcome::node_failed(
@@ -1268,7 +1320,7 @@ pub async fn accept_stream(
                 // its close is the 'socket hang up' Node reports.
                 Gate::Silent => Err(socket_hang_up()),
                 Gate::NoCertificate => {
-                    tokio::spawn(close_after_alert(io.tcp));
+                    tokio::spawn(close_after_alert(io.stream));
                     Err(OpOutcome::node_failed(
                         "ERR_SSL_PEER_DID_NOT_RETURN_A_CERTIFICATE",
                         "peer did not return a certificate",
@@ -1277,7 +1329,7 @@ pub async fn accept_stream(
                 Gate::Open => {
                     // The alert rustls wrote has to reach the client: close
                     // with a FIN after it, not a reset that could discard it.
-                    tokio::spawn(close_after_alert(io.tcp));
+                    tokio::spawn(close_after_alert(io.stream));
                     Err(handshake_failure(&e, context.has_identity))
                 }
             },
@@ -1351,11 +1403,13 @@ pub async fn accept_stream(
     ))
 }
 
-/// Accept one TLS connection on an accepted TCP socket of a node:tls server
+/// Accept one TLS connection on an accepted connection of a node:tls server
 /// (`accept_stream`) and register it for JS. Resolves Json {handle,
 /// protocol, cipher, cipherStandardName, alpnProtocol, servername,
 /// authorized, authorizationError, peerCertificates?, localAddr?,
-/// remoteAddr?}; a failed handshake rejects with Node's code for it.
+/// remoteAddr?}; a failed handshake rejects with Node's code for it. The
+/// connection may be a pipe (#282): its addresses are then undefined, as
+/// node's are.
 pub async fn tls_accept(
     tls_registry: TlsRegistry,
     tcp_registry: crate::tcp::TcpRegistry,
@@ -1367,21 +1421,21 @@ pub async fn tls_accept(
     let Some((reader, writer)) = tcp_registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .take_halves(tcp_handle)
+        .take_raw_halves(tcp_handle)
     else {
-        return OpOutcome::Failed(format!("tls accept: tcp handle {tcp_handle} is gone"));
+        return OpOutcome::Failed(format!("tls accept: stream handle {tcp_handle} is gone"));
     };
-    let tcp_stream = match reader.reunite(writer) {
+    let stream = match crate::tcp::plain_stream_from_halves(reader, writer).await {
         Ok(s) => s,
-        Err(e) => return OpOutcome::Failed(format!("tls accept: reunite failed: {e}")),
+        Err(e) => return OpOutcome::Failed(format!("tls accept: {e}")),
     };
-    let (tls_stream, info) = match accept_stream(tcp_stream, &context, &options).await {
+    let (tls_stream, info) = match accept_stream(stream, &context, &options).await {
         Ok(accepted) => accepted,
         Err(failed) => return failed,
     };
     let (io, _) = tls_stream.get_ref();
-    let local_addr = io.tcp.local_addr().ok();
-    let remote_addr = io.tcp.peer_addr().ok();
+    let local_addr = io.tcp().and_then(|tcp| tcp.local_addr().ok());
+    let remote_addr = io.tcp().and_then(|tcp| tcp.peer_addr().ok());
 
     let handle = ids.fetch_add(1, Ordering::Relaxed);
     let (reader, writer) = tokio::io::split(tls_stream);

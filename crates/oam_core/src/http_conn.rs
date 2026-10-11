@@ -232,7 +232,21 @@ impl AbortiveClose for tokio::net::TcpStream {
 
 impl AbortiveClose for tokio_rustls::server::TlsStream<crate::tls::server::ServerIo> {
     fn arm_reset(&self) {
-        crate::tcp::arm_reset(self.get_ref().0.tcp());
+        // Only a TCP connection has a socket to reset; a pipe's (#282)
+        // close is its drop.
+        if let Some(tcp) = self.get_ref().0.tcp() {
+            crate::tcp::arm_reset(tcp);
+        }
+    }
+}
+
+/// A server connection's plain stream: the TCP case resets its socket, a
+/// pipe has no socket to reset and its close is the drop.
+impl AbortiveClose for crate::tcp::PlainStream {
+    fn arm_reset(&self) {
+        if let Some(tcp) = self.tcp() {
+            crate::tcp::arm_reset(tcp);
+        }
     }
 }
 

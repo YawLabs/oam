@@ -24,6 +24,11 @@ pub(crate) enum ReadHalf {
     Unix(tokio::net::unix::OwnedReadHalf),
     #[cfg(windows)]
     Pipe(crate::pipe::PipeRead),
+    /// A Windows named pipe bridged through a tokio duplex for a native
+    /// (TLS / HTTP) server (#282): the split halves of the server end JS
+    /// ends up holding after an upgrade or CONNECT takeover.
+    #[cfg(windows)]
+    Duplex(tokio::io::ReadHalf<tokio::io::DuplexStream>),
 }
 
 impl ReadHalf {
@@ -34,6 +39,8 @@ impl ReadHalf {
             ReadHalf::Unix(reader) => reader.read(buf).await,
             #[cfg(windows)]
             ReadHalf::Pipe(reader) => reader.read(buf).await,
+            #[cfg(windows)]
+            ReadHalf::Duplex(reader) => reader.read(buf).await,
         }
     }
 
@@ -53,6 +60,9 @@ pub(crate) enum WriteHalf {
     Unix(tokio::net::unix::OwnedWriteHalf),
     #[cfg(windows)]
     Pipe(crate::pipe::PipeWrite),
+    /// The bridged server end's write half (see [`ReadHalf::Duplex`]).
+    #[cfg(windows)]
+    Duplex(tokio::io::WriteHalf<tokio::io::DuplexStream>),
 }
 
 impl WriteHalf {
@@ -63,6 +73,10 @@ impl WriteHalf {
             WriteHalf::Unix(writer) => writer.try_write(data),
             #[cfg(windows)]
             WriteHalf::Pipe(writer) => writer.try_write(data),
+            // A duplex has no try_write: nothing is taken in the call, and
+            // the write goes out through the queued write_all path.
+            #[cfg(windows)]
+            WriteHalf::Duplex(_) => Err(std::io::ErrorKind::WouldBlock.into()),
         }
     }
 
@@ -73,13 +87,17 @@ impl WriteHalf {
             WriteHalf::Unix(writer) => writer.write_all(data).await,
             #[cfg(windows)]
             WriteHalf::Pipe(writer) => writer.write_all(data).await,
+            #[cfg(windows)]
+            WriteHalf::Duplex(writer) => writer.write_all(data).await,
         }
     }
 
     /// Whether dropping the half is its whole shutdown, done in the call: a
     /// socket's is (tokio shuts the write side down when an owned write half
     /// goes, and the FIN leaves at once). A Windows named pipe's shutdown
-    /// first waits for the peer to read what was written.
+    /// first waits for the peer to read what was written. A bridged
+    /// duplex's is: the pump translates the drop into the pipe's own
+    /// (flushing) shutdown.
     fn shuts_down_on_drop(&self) -> bool {
         #[cfg(windows)]
         {
@@ -104,6 +122,10 @@ impl WriteHalf {
             }
             #[cfg(windows)]
             WriteHalf::Pipe(writer) => writer.shutdown().await,
+            #[cfg(windows)]
+            WriteHalf::Duplex(writer) => {
+                let _ = tokio::io::AsyncWriteExt::shutdown(writer).await;
+            }
         }
     }
 
@@ -124,13 +146,17 @@ impl WriteHalf {
             WriteHalf::Unix(writer) => writer.forget(),
             #[cfg(windows)]
             WriteHalf::Pipe(writer) => drop(writer),
+            // A duplex half cannot skip its direction-close; the pump
+            // carries it to the pipe, whose flush semantics hold either way.
+            #[cfg(windows)]
+            WriteHalf::Duplex(writer) => drop(writer),
         }
     }
 }
 
 /// A Windows named pipe's halves as the registry keeps them.
 #[cfg(windows)]
-fn pipe_halves(
+pub(crate) fn pipe_halves(
     (reader, writer): (crate::pipe::PipeRead, crate::pipe::PipeWrite),
 ) -> (ReadHalf, WriteHalf) {
     (ReadHalf::Pipe(reader), WriteHalf::Pipe(writer))
@@ -138,13 +164,178 @@ fn pipe_halves(
 
 /// A Unix domain socket's halves as the registry keeps them.
 #[cfg(unix)]
-fn pipe_halves(
+pub(crate) fn pipe_halves(
     (reader, writer): (
         tokio::net::unix::OwnedReadHalf,
         tokio::net::unix::OwnedWriteHalf,
     ),
 ) -> (ReadHalf, WriteHalf) {
     (ReadHalf::Unix(reader), WriteHalf::Unix(writer))
+}
+
+/// A server connection's plain stream -- what a TLS server runs its
+/// handshake over, before any TLS wraps it. A TLS server now runs over a
+/// pipe too (#282): on Unix the pipe halves reunite into the socket; on
+/// Windows they share one named-pipe handle and cannot implement the poll
+/// traits, so they are bridged through a tokio duplex whose pump tasks copy
+/// the bytes ([`plain_stream_from_halves`]).
+pub enum PlainStream {
+    Tcp(tokio::net::TcpStream),
+    #[cfg(unix)]
+    Pipe(tokio::net::UnixStream),
+    #[cfg(windows)]
+    Pipe(tokio::io::DuplexStream),
+}
+
+impl PlainStream {
+    /// The TCP socket underneath, for the socket options and addresses only
+    /// a TCP connection has. None for a pipe: node leaves a pipe
+    /// connection's addresses undefined too.
+    pub fn tcp(&self) -> Option<&tokio::net::TcpStream> {
+        match self {
+            PlainStream::Tcp(stream) => Some(stream),
+            PlainStream::Pipe(_) => None,
+        }
+    }
+
+    /// Split the stream into registry halves, for a connection an upgrade
+    /// or CONNECT hands over to JS (the takeover path): JS reads and writes
+    /// the halves through the registry's stream ops.
+    pub(crate) fn into_halves(self) -> (ReadHalf, WriteHalf) {
+        match self {
+            PlainStream::Tcp(stream) => {
+                let (r, w) = stream.into_split();
+                (ReadHalf::Tcp(r), WriteHalf::Tcp(w))
+            }
+            #[cfg(unix)]
+            PlainStream::Pipe(stream) => {
+                let (r, w) = stream.into_split();
+                (ReadHalf::Unix(r), WriteHalf::Unix(w))
+            }
+            #[cfg(windows)]
+            PlainStream::Pipe(stream) => {
+                let (r, w) = tokio::io::split(stream);
+                (ReadHalf::Duplex(r), WriteHalf::Duplex(w))
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for PlainStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            PlainStream::Tcp(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            PlainStream::Pipe(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for PlainStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            PlainStream::Tcp(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            PlainStream::Pipe(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            PlainStream::Tcp(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            PlainStream::Pipe(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            PlainStream::Tcp(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            PlainStream::Pipe(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+/// One connected pipe's registry halves as a [`PlainStream`] a TLS or HTTP
+/// server can serve on. Unix reunites them into the socket. On Windows the
+/// halves share one named-pipe handle (no poll traits), so each direction
+/// is pumped through a tokio duplex: what the client writes is copied into
+/// the duplex the server reads, and the other way for the server's writes.
+/// The pump feeding the pipe shuts IT down, with the pipe's own flush
+/// semantics ([`crate::pipe`]'s PipeWrite::shutdown, the
+/// flush-until-the-peer-has-read an `end()` has), when the server's half of
+/// the duplex ends; the pump feeding the duplex forwards the client's EOF
+/// as the server's read EOF.
+pub(crate) async fn plain_stream_from_halves(
+    reader: ReadHalf,
+    writer: WriteHalf,
+) -> std::io::Result<PlainStream> {
+    match (reader, writer) {
+        (ReadHalf::Tcp(reader), WriteHalf::Tcp(writer)) => Ok(PlainStream::Tcp(
+            reader
+                .reunite(writer)
+                .map_err(|e| std::io::Error::other(e.to_string()))?,
+        )),
+        #[cfg(unix)]
+        (ReadHalf::Unix(reader), WriteHalf::Unix(writer)) => Ok(PlainStream::Pipe(
+            reader
+                .reunite(writer)
+                .map_err(|e| std::io::Error::other(e.to_string()))?,
+        )),
+        #[cfg(windows)]
+        (ReadHalf::Pipe(mut reader), WriteHalf::Pipe(mut writer)) => {
+            const BRIDGE_BUF: usize = 64 * 1024;
+            let (server_end, pump_end) = tokio::io::duplex(BRIDGE_BUF);
+            let (mut pump_read, mut pump_write) = tokio::io::split(pump_end);
+            // Client -> server: the pipe's read half into the duplex. The
+            // client hanging up is the server's read EOF.
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; BRIDGE_BUF];
+                loop {
+                    match reader.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if pump_write.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = pump_write.shutdown().await;
+            });
+            // Server -> client: out of the duplex, into the pipe's write
+            // half. The duplex ending -- the TLS layer dropped or shut down
+            // its half -- shuts the PIPE down with its flush semantics.
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; BRIDGE_BUF];
+                loop {
+                    match pump_read.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if writer.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                writer.shutdown().await;
+            });
+            Ok(PlainStream::Pipe(server_end))
+        }
+        // The two halves of one registered stream: kinds cannot mix.
+        _ => unreachable!("halves of two different streams"),
+    }
 }
 
 /// A listening server: a TCP listener, or a pipe's ([`crate::pipe`]).
@@ -192,28 +383,25 @@ impl TcpState {
         self.writers.insert(handle, WriteHalf::Tcp(writer));
     }
 
-    /// Both halves of a TCP stream, for a TLS upgrade. Both present means
+    /// Both halves of a stream, whatever kind it is -- a TLS server now runs
+    /// over a pipe too (#282), so the TLS accept cannot assume the TCP
+    /// reunion. The caller reunites or bridges them; both present means
     /// nothing is in flight, so there is no await to guard and no marker to
-    /// leave. A pipe stream is left where it is: no TLS server runs over a
-    /// pipe.
-    pub fn take_halves(&mut self, handle: u64) -> Option<(OwnedReadHalf, OwnedWriteHalf)> {
-        match (self.readers.remove(&handle), self.writers.remove(&handle)) {
-            (Some(ReadHalf::Tcp(reader)), Some(WriteHalf::Tcp(writer))) => {
-                // The stream leaves the registry: so does its parked ops'
-                // wake-up.
-                self.cancel.remove(&handle);
-                Some((reader, writer))
-            }
-            (reader, writer) => {
-                if let Some(reader) = reader {
-                    self.readers.insert(handle, reader);
-                }
-                if let Some(writer) = writer {
-                    self.writers.insert(handle, writer);
-                }
-                None
-            }
-        }
+    /// leave. The stream leaves the registry: so does its parked ops'
+    /// wake-up.
+    pub(crate) fn take_raw_halves(&mut self, handle: u64) -> Option<(ReadHalf, WriteHalf)> {
+        let reader = self.readers.remove(&handle)?;
+        let writer = self.writers.remove(&handle)?;
+        self.cancel.remove(&handle);
+        Some((reader, writer))
+    }
+
+    /// Register a stream whose halves are already split -- the takeover
+    /// path's [`PlainStream::into_halves`], where the kinds are not all
+    /// TCP's.
+    pub(crate) fn register_raw_stream(&mut self, handle: u64, reader: ReadHalf, writer: WriteHalf) {
+        self.readers.insert(handle, reader);
+        self.writers.insert(handle, writer);
     }
 
     /// The wake-up of the ops parked on stream `handle` (see [`tcp_close`],

@@ -320,6 +320,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("zlibHandleWriteSync", op_zlib_handle_write_sync),
         // HTTP server
         ("httpServe", op_http_serve),
+        // The same server on a named pipe / Unix domain socket (#282).
+        ("httpPipeServe", op_http_pipe_serve),
         ("httpAccept", op_http_accept),
         ("httpRequestBody", op_http_request_body),
         ("httpRespond", op_http_respond),
@@ -355,10 +357,14 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpInsecureParser", op_http_insecure_parser),
         // HTTP/2 cleartext server (h2c — same accept/respond ops)
         ("http2Serve", op_http2_serve),
+        // The same server on a named pipe / Unix domain socket (#282).
+        ("http2PipeServe", op_http2_pipe_serve),
         // http2.createSecureServer: a node:tls connection served as h2 / h1
         ("http2ServeTls", op_http2_serve_tls),
         // HTTPS server (TLS-wrapped HTTP, same accept/respond ops)
         ("httpsServe", op_https_serve),
+        // The same server on a named pipe / Unix domain socket (#282).
+        ("httpsPipeServe", op_https_pipe_serve),
         ("httpsServerTls", op_https_server_tls),
         // TCP sockets (node:net)
         ("tcpConnect", op_tcp_connect),
@@ -3658,6 +3664,48 @@ fn op_http_serve(
     );
 }
 
+/// httpPipeServe(path, streamRequestBody, maxHeaderSize, insecureHTTPParser,
+/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs,
+/// maxHeadersCount) -> JSON `{ serverId }`: node's http.Server#listen(path)
+/// (#282), on a Windows named pipe or Unix domain socket. The pipe grant is
+/// checked here (as pipeListen's is); the same accept/respond/close ops
+/// take the server as they take a TCP one.
+fn op_http_pipe_serve(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    // The pipe gate: the path is the resource being bound.
+    let Some((path, target)) = pipe_path_arg(scope, &args, "httpPipeServe") else {
+        return;
+    };
+    let rt = core_runtime!(scope);
+    let state = rt.http();
+    let tcp = rt.tcp();
+    let tcp_ids = rt.body_ids();
+    // args 2, 3: maxHeaderSize, insecureHTTPParser.
+    let mut policy = head_policy_args(scope, &args, 2);
+    // args 4..=9: node's server timeouts.
+    let timeouts = timeout_args(scope, &args, 4);
+    // arg 10: maxHeadersCount.
+    apply_max_headers_count(scope, &args, 10, &mut policy);
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_server::http_pipe_serve(
+            state,
+            path,
+            target,
+            tcp,
+            tcp_ids,
+            // arg 1: dispatch-on-headers + streamed request bodies.
+            args.get(1).is_true(),
+            policy,
+            timeouts,
+        ),
+    );
+}
+
 fn op_http_accept(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -4155,6 +4203,31 @@ fn op_http2_serve(
     );
 }
 
+/// http2PipeServe(path, maxHeaderSize, insecureHTTPParser) -> JSON
+/// `{ serverId }`: node's http2.createServer()#listen(path) (#282), the
+/// cleartext h2c server on a Windows named pipe or Unix domain socket --
+/// the same dual-protocol accept (h2c prior-knowledge or HTTP/1.1 fallback)
+/// as http2Serve, bound to a pipe. The pipe grant is checked here (as
+/// pipeListen's is).
+fn op_http2_pipe_serve(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    // The pipe gate: the path is the resource being bound.
+    let Some((path, target)) = pipe_path_arg(scope, &args, "http2PipeServe") else {
+        return;
+    };
+    let state = core_runtime!(scope).http();
+    // args 1, 2: maxHeaderSize, insecureHTTPParser (HTTP/1 connections).
+    let policy = head_policy_args(scope, &args, 1);
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_server::http2_pipe_serve(state, path, target, policy),
+    );
+}
+
 /// http2ServeTls(tlsHandle, http1, maxHeaderSize, insecureHTTPParser,
 /// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs) -> JSON
 /// `{ sessionId, connId }`: an accepted node:tls connection (at rest: JS has
@@ -4243,6 +4316,62 @@ fn op_https_serve(
         oam_core::http_server::https_serve(
             state,
             at,
+            tls,
+            policy,
+            timeouts,
+            tls_registry,
+            body_ids,
+        ),
+    );
+}
+
+/// httpsPipeServe(path, contextId, handshakeTimeout, requestCert,
+/// rejectUnauthorized, alpnJson, maxHeaderSize, insecureHTTPParser,
+/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs,
+/// maxHeadersCount) -> JSON `{ serverId }`: node's https.Server#listen(path)
+/// (#282), on a Windows named pipe or Unix domain socket -- the same TLS
+/// handshake and HTTP/1 serving as httpsServe, bound to a pipe. The pipe
+/// grant is checked here (as pipeListen's is).
+fn op_https_pipe_serve(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    // The pipe gate: the path is the resource being bound.
+    let Some((path, target)) = pipe_path_arg(scope, &args, "httpsPipeServe") else {
+        return;
+    };
+    let context_id = args.get(1).number_value(scope).unwrap_or(0.0) as u64;
+    // args 2..=5: handshakeTimeout, requestCert, rejectUnauthorized, ALPN.
+    let Some(options) = accept_option_args(scope, &args, 2, "httpsPipeServe") else {
+        return;
+    };
+    let core = core_runtime!(scope);
+    let Some(context) = oam_core::tls::server::context(&core.tls(), context_id) else {
+        throw_type_error(scope, "httpsPipeServe: the server's secure context is gone");
+        return;
+    };
+    let state = core.http();
+    // The TLS handle store and the shared handle-id counter, for handing an
+    // upgrade / CONNECT connection to JS as a tls.TLSSocket (#205). Taken now,
+    // as the last use of `core`, so its borrow ends before the scope-mutating
+    // arg reads below.
+    let tls_registry = core.tls();
+    let body_ids = core.body_ids();
+    // args 6, 7: maxHeaderSize, insecureHTTPParser.
+    let mut policy = head_policy_args(scope, &args, 6);
+    // args 8..=13: node's server timeouts.
+    let timeouts = timeout_args(scope, &args, 8);
+    // arg 14: maxHeadersCount.
+    apply_max_headers_count(scope, &args, 14, &mut policy);
+    let tls = std::sync::Arc::new(oam_core::http_server::HttpsTls::new(context, options));
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_server::https_pipe_serve(
+            state,
+            path,
+            target,
             tls,
             policy,
             timeouts,
