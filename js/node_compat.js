@@ -13491,11 +13491,13 @@
     // "at process.processTicksAndRejections". Installed as a real process
     // method below and invoked through it, so V8 renders the receiver too.
     const drainTickQueue = function processTicksAndRejections() {
-      // The finally is load-bearing: EVERY exit -- normal completion, the
-      // fatal no-listener rethrow, or a throw from a user's uncaughtException/
-      // monitor handler itself -- must reset the queue state so a later
-      // host drain starts from a consistent queue while the process keeps
-      // running.
+      // Node's shape: try/finally, NO catch. A throwing tick whose ladder
+      // finds no consumer unwinds natively into the host's TryCatch, which
+      // captures the throw-site Message (the USER's file:line -- a JS
+      // catch/rethrow would reposition it to this file, #167 item 2) and
+      // routes the error through the uncaught ledger. The finally keeps the
+      // queue consistent: consumed entries are gone, UN-RUN entries stay
+      // pending for the next tick point, exactly node's FixedQueue.
       try {
         while (tickIndex < tickQueue.length) {
           const entry = tickQueue[tickIndex];
@@ -13509,49 +13511,41 @@
             tickQueue = tickQueue.slice(tickIndex);
             tickIndex = 0;
           }
-          try {
-            // Domain wrap, Node shape: enter before, exit ONLY on success --
-            // a throw unwinds with the domain entered so dispatchUncaught
-            // (in the catch below) routes it to the domain's error handler.
-            const tickDom = entry[2];
-            if (tickDom) tickDom.enter();
-            // Local, not entry[0](...): calling a function off an array makes
-            // V8 name the callee's frame "Array.<anonymous>".
-            const tickFn = entry[0];
-            // Only pay the continuation get/set when a frame was actually
-            // captured -- the overwhelmingly common case is no ALS in play,
-            // and this is the hottest loop in the runtime.
-            const frame = entry[3];
-            if (frame === undefined) {
+          // Domain wrap, Node shape: enter before, exit ONLY on success --
+          // a throw unwinds with the domain entered so dispatchUncaught
+          // (below) routes it to the domain's error handler.
+          const tickDom = entry[2];
+          if (tickDom) tickDom.enter();
+          // Local, not entry[0](...): calling a function off an array makes
+          // V8 name the callee's frame "Array.<anonymous>".
+          const tickFn = entry[0];
+          // Only pay the continuation get/set when a frame was actually
+          // captured -- the overwhelmingly common case is no ALS in play,
+          // and this is the hottest loop in the runtime.
+          const frame = entry[3];
+          if (frame === undefined) {
+            tickFn(...entry[1]);
+          } else {
+            const prevFrame = registry._setContinuationFrame(frame);
+            try {
               tickFn(...entry[1]);
-            } else {
-              const prevFrame = registry._setContinuationFrame(frame);
-              try {
-                tickFn(...entry[1]);
-              } finally {
-                registry._setContinuationFrame(prevFrame);
-              }
+            } finally {
+              registry._setContinuationFrame(prevFrame);
             }
-            if (tickDom) tickDom.exit();
-          } catch (e) {
-            // Node's onGlobalUncaughtException order: monitor first; then the
-            // capture callback, which REPLACES 'uncaughtException' emission
-            // and is never fatal; then listeners (handled -> this same drain
-            // keeps going). Emitting inline here (rather than rethrowing to
-            // the engine ledger, which only delivers after the whole
-            // microtask checkpoint) is what keeps the handler AHEAD of later
-            // ticks. No consumer at all = fatal: rethrow, and Node-faithfully
-            // drop the remaining ticks (via the finally) rather than racing
-            // their side effects against process death. A throw from the
-            // handler itself also escapes here -- fatal in Node; the finally
-            // keeps nextTick functional if the engine survives the run.
-            if (dispatchUncaught(e, "uncaughtException")) continue;
-            throw e;
           }
+          if (tickDom) tickDom.exit();
         }
       } finally {
-        tickQueue = [];
-        tickIndex = 0;
+        // Keep the un-run entries on a fatal unwind: node holds them in its
+        // FixedQueue and a later tick point (the next callback) drains them
+        // -- a handled throw defers the batch, and the fatal path can still
+        // reach a later drain while listeners run. Wiping them here drops
+        // t2/t3 from `t1 throws (handled), t2, t3, setTimeout(...)`, which
+        // node prints AFTER the timer (probe-verified).
+        if (tickIndex >= 1024) {
+          tickQueue = tickQueue.slice(tickIndex);
+          tickIndex = 0;
+        }
       }
     };
     // Host-driven tick points (docs/design/nexttick-engine.md): the engine

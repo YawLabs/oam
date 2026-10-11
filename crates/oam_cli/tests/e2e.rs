@@ -1515,7 +1515,10 @@ fn next_tick_binds_als_frame_per_callback() {
 #[test]
 fn next_tick_queue_drains_past_handled_uncaught_exception() {
     // Node semantics: a throwing tick surfaces as uncaughtException, and when
-    // a handler exists the REMAINING tick queue still drains.
+    // a handler exists the run survives -- but the interrupted batch defers:
+    // node keeps the remaining ticks queued and drains them at the NEXT tick
+    // point (after the next macrotask), not in place (probe-verified on
+    // v22.22.2: "caught boom", "done", then "after").
     let stdout = run_ok(
         "next_tick_throw.ts",
         "process.on('uncaughtException', (e: Error) => console.log('caught ' + e.message));\n\
@@ -1523,7 +1526,7 @@ fn next_tick_queue_drains_past_handled_uncaught_exception() {
          process.nextTick(() => console.log('after'));\n\
          setTimeout(() => console.log('done'), 0);",
     );
-    assert_eq!(stdout, "caught boom\nafter\ndone");
+    assert_eq!(stdout, "caught boom\ndone\nafter");
 }
 
 #[test]
@@ -1531,7 +1534,8 @@ fn next_tick_capture_callback_replaces_uncaught_emission() {
     // Node's onGlobalUncaughtException order: monitor, then the capture
     // callback -- which REPLACES 'uncaughtException' emission and is never
     // fatal -- then listeners. A throwing tick with a capture callback set
-    // must invoke it, keep draining, and exit 0 (Node-identical).
+    // must invoke it and exit 0; as with a listener, the interrupted batch
+    // defers to the next tick point (after the timer, node-identical).
     let stdout = run_ok(
         "next_tick_capture.ts",
         "process.setUncaughtExceptionCaptureCallback((e: Error) => console.log('captured ' + e.message));\n\
@@ -1539,7 +1543,7 @@ fn next_tick_capture_callback_replaces_uncaught_emission() {
          process.nextTick(() => console.log('after'));\n\
          setTimeout(() => console.log('done'), 0);",
     );
-    assert_eq!(stdout, "captured boom\nafter\ndone");
+    assert_eq!(stdout, "captured boom\ndone\nafter");
 }
 
 #[test]
