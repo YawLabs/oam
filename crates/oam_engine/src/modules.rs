@@ -1485,10 +1485,16 @@ pub(crate) fn pump_event_loop(
         // Belt-and-suspenders (docs/design/nexttick-engine.md): every
         // JS-running site drains through run_ticks_and_microtasks, so a
         // stranded tick here means a missed seam -- run it rather than
-        // exiting or sleeping with work queued (Node never does either).
+        // exiting with work queued (Node never does either). Only when
+        // nothing else holds the loop open: a batch deferred by a HANDLED
+        // throw drains at the NEXT tick point, which is the callback the
+        // loop is about to wait for -- draining it here first would print
+        // the remainder ahead of a pending timer (node probe: 1ms timer,
+        // "done" then "after"; draining here raced the deadline and put
+        // "after" first, flaking on the release legs).
         // The drain routes fatal throws to the UncaughtLedger; deliver them
         // NOW or the `continue` -> `break` path would exit 0 on a fatal.
-        if has_pending_ticks(tc) {
+        if has_pending_ticks(tc) && !has_ref_timers && !has_inflight {
             if let Some(failure) = run_ticks_and_microtasks(tc) {
                 return Err(failure);
             }

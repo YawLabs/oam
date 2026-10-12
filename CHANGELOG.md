@@ -16,6 +16,21 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A nextTick batch interrupted by a handled throw waits for the pending timer, as Node's
+  does.** The stranded-tick backstop drained a deferred batch at the first idle check --
+  BEFORE the loop waited for an already-scheduled timer, so `process.nextTick(() => { throw })
+  ; process.nextTick(...) ; setTimeout(...)` with an `uncaughtException` handler printed the
+  batch's remainder ahead of the timer. The order was a race against the timer's deadline:
+  it came out Node's way only when the 1 ms deadline happened to pass first, which is why
+  the two `next_tick_*` e2e tests flaked on the mac and Windows release legs (release builds
+  reproduced the wrong order ~6/7 locally, debug ~1/6). The backstop now runs only when no
+  ref'd timer and no inflight op holds the loop open -- the condition
+  `docs/design/nexttick-engine.md` already described -- so the batch drains at the next tick
+  point (the timer's scope close), matching Node's probe-verified order on every delay and
+  in the no-timer and unref-only cases.
+
 ## [0.19.0] - 2026-10-11
 
 ### Added
