@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "5febccc",
+  "commit": "d86f5bc",
   "oamVersion": "oam 0.19.0",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,7 +19,7 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 312,
+      "pass": 313,
       "total": 314,
       "cases": [
         {
@@ -1013,18 +1013,7 @@
         },
         {
           "case": "388-tls-server-pipe-listen.mjs",
-          "status": "fail",
-          "watchdog": null,
-          "exit": {
-            "oam": 0,
-            "node": 0
-          },
-          "firstDifference": {
-            "line": 2,
-            "oam": "connection remote=undefined",
-            "node": "plain client connected"
-          },
-          "oamStderr": ""
+          "status": "pass"
         },
         {
           "case": "389-http-server-pipe-listen.mjs",
