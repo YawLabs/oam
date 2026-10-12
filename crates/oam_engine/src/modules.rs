@@ -99,13 +99,7 @@ pub(crate) struct RejectionLedger {
 /// Error; without a listener the event loop fails the run, like Node.
 #[derive(Default)]
 pub(crate) struct UncaughtLedger {
-    /// (value, "{file}:{line}: {text}", throw-site frame). The frame is
-    /// captured by the message listener while V8's Message still holds the
-    /// user's position (#167 item 2): once the report renders -- after the
-    /// exception was reset and re-dispatched -- `create_message` rebuilds
-    /// the position from the error's OWN stack, which a frameless error
-    /// (`e.stack = e.stack.split('\n')[0]`) does not have.
-    entries: Vec<(v8::Global<v8::Value>, String, Option<String>)>,
+    entries: Vec<(v8::Global<v8::Value>, String)>,
 }
 
 /// V8 message listener. Zero capture, raw C ABI.
@@ -135,17 +129,10 @@ pub(crate) unsafe extern "C" fn message_listener(
         line = src_line as usize;
     }
     let value = v8::Global::new(scope, exception);
-    // Capture the throw-site frame NOW, while the Message still carries the
-    // user's position (#167 item 2). drain_uncaught's fatal report runs after
-    // the exception was reset and re-offered to listeners, so its
-    // create_message fallback rebuilds the position from the error's own
-    // stack -- which a frameless error (e.stack stripped to its header line)
-    // does not have, losing the header.
-    let frame = source_frame(scope, message);
     if let Some(ledger) = scope.get_slot_mut::<UncaughtLedger>() {
         ledger
             .entries
-            .push((value, format!("{file}:{line}: {text}"), frame));
+            .push((value, format!("{file}:{line}: {text}")));
     }
 }
 
@@ -338,9 +325,8 @@ pub(crate) const FATAL_CODE: &str = "OAM-RT0005";
 
 /// Node's `<file>:<line>` + source line + caret preamble. Built from the V8
 /// Message BEFORE the TryCatch is reset -- the message is gone after.
-/// Takes the pin-erased scope: callers hold TryCatch pins and the
-/// message listener a bare CallbackScope, and neither converts to the
-/// TryCatch pin; every Message method takes `&PinScope`.
+/// Takes the pin-erased scope: a TryCatch pin derefs to it, and every
+/// Message method takes `&PinScope`.
 fn source_frame(
     scope: &v8::PinScope<'_, '_>,
     message: v8::Local<'_, v8::Message>,
@@ -508,21 +494,24 @@ pub(crate) fn drain_uncaught(
     // returning. Terminates because each pass drains the ledger and only
     // fresh throws refill it.
     loop {
-        let captured: Vec<(v8::Global<v8::Value>, String, Option<String>)> = tc
+        let captured: Vec<(v8::Global<v8::Value>, String)> = tc
             .get_slot_mut::<UncaughtLedger>()
             .map(|ledger| std::mem::take(&mut ledger.entries))
             .unwrap_or_default();
         if captured.is_empty() {
             break;
         }
-        for (value, text, frame) in captured {
+        for (value, text) in captured {
             let local = v8::Local::new(tc, &value);
             let (local, frame, message) = match dispatch_uncaught(tc, local) {
                 Uncaught::Handled => continue,
-                // The frame was captured at throw time (message_listener);
-                // rebuilding it here from the error's own stack would lose
-                // the throw site for a frameless error (#167 item 2).
-                Uncaught::Fatal => (local, frame, format!("Uncaught (in microtask) {text}")),
+                // No stored frame: for a microtask-thrown error V8 has no
+                // throw-site Message at all (probe-verified -- file
+                // "undefined", line 0, for a stack-stripped throw; node
+                // prints `<anonymous_script>:0` the same way). The report's
+                // create_message fallback derives the position from the
+                // error's own stack, which is exactly node's derivation.
+                Uncaught::Fatal => (local, None, format!("Uncaught (in microtask) {text}")),
                 Uncaught::HandlerThrew {
                     value,
                     frame,
@@ -1214,6 +1203,16 @@ pub(crate) fn run_ticks_and_microtasks(
                 // not checkpoint-drain them in place.
                 if let Some(failure) = handle_uncaught_throw(tc, "process.nextTick") {
                     return Some(failure);
+                }
+                // Node's RunNextTicks skips its runMicrotasks() while the
+                // interrupted batch stays queued -- the NEXT tick point
+                // drains the batch and checkpoints after it. When the queue
+                // is EMPTY, though, the do-while's runMicrotasks() is the
+                // very next thing node does: checkpoint now so a
+                // listener-queued microtask flushes instead of stranding
+                // until some unrelated JS-running site checkpoints.
+                if !has_pending_ticks(tc) {
+                    tc.perform_microtask_checkpoint();
                 }
                 return None;
             }

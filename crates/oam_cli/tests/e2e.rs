@@ -1547,6 +1547,61 @@ fn next_tick_capture_callback_replaces_uncaught_emission() {
 }
 
 #[test]
+fn frameless_throw_from_fs_callback_keeps_source_header() {
+    // #167 item 2, the e2e stderr test the issue asks for: the throw-site
+    // header is what points a reader at the `if (err) throw err;` line. The
+    // message listener captures the frame while V8's Message still holds the
+    // user's position -- the report must never rebuild it from the error's
+    // own stack, which this error has stripped to its header line.
+    let file = write_temp(
+        "frameless_fs_throw.cjs",
+        "const fs = require('fs');\n\
+         fs.readFile('missing-file-oam-test.txt', (e) => { e.stack = e.stack.split('\\n')[0]; throw e; });",
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let name = file.file_name().unwrap().to_string_lossy();
+    assert!(
+        !out.status.success(),
+        "a frameless throw is still fatal; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("{name}:2")),
+        "the report must open with the throw-site header; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("throw e;"),
+        "the report must show the throwing source line; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn frameless_throw_from_next_tick_keeps_source_header() {
+    // Same surface through the tick path: the drain lets the throw unwind
+    // natively (node's try/finally shape), so the Message the host reports
+    // carries the user's line, not a rethrow inside the runtime.
+    let file = write_temp(
+        "frameless_tick_throw.cjs",
+        "process.nextTick(() => { const e = new Error('tick boom'); e.stack = e.stack.split('\\n')[0]; throw e; });",
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let name = file.file_name().unwrap().to_string_lossy();
+    assert!(
+        !out.status.success(),
+        "a frameless throw is still fatal; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("{name}:1")),
+        "the report must open with the throw-site header; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("throw e;"),
+        "the report must show the throwing source line; stderr: {stderr}"
+    );
+}
+
+#[test]
 fn throwing_uncaught_exception_handler_is_fatal_exit_7() {
     // Node parity (formerly a documented divergence, fixed by the lifecycle
     // tranche): a THROWING uncaughtException handler is immediately fatal --
