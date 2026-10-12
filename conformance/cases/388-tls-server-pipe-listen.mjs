@@ -11,8 +11,15 @@
 // refusal (docs/node-divergences.md, entry 50) -- this case pins the
 // SERVER. The { socket } form runs on both engines.
 //
-// Each side's events are logged and printed at the end; the order between
-// the two ends is the scheduler's, not node's contract.
+// Each side's events are captured and then printed after BOTH ends have
+// reported: the differential compares line order, and the two ends of one
+// socket are scheduled independently, so 'connection' (server) vs 'connect'
+// (client) and 'secureConnection' (server) vs the secure callback (client)
+// flip order between engines and runs (measured: darwin/node put the server
+// line first where win/node and win/oam put the client line first -- the
+// 2026-10-12 mac release leg died on exactly that). Each pair is awaited on
+// both ends and logged in one fixed order, so the printed sequence is this
+// case's on every platform.
 import tls from "node:tls";
 import net from "node:net";
 import os from "node:os";
@@ -90,69 +97,114 @@ const finish = () => {
   process.exit(0);
 };
 
+// Cross-end slot: a server event fills its slot with the line, a reader takes
+// it (or waits for it). Each step then prints every line itself, in one fixed
+// order -- arrival order is the scheduler's and is never printed directly.
+const slots = {};
+const fill = (k, line) => {
+  const s = (slots[k] = slots[k] || {});
+  s.line = line;
+  if (s.resolve) s.resolve(s.line);
+};
+const take = (k) =>
+  new Promise((resolve) => {
+    const s = (slots[k] = slots[k] || {});
+    if (s.line !== undefined) resolve(s.line);
+    else s.resolve = resolve;
+  });
+
 // 1. listen(path), and the server's name while it listens.
 const server = new tls.Server({ cert: CERT, key: KEY });
+// Which connection step is dialing: the two dials are strictly sequential
+// (each step awaits the previous one to completion), so one variable is
+// enough to route each accepted connection to its step's slot.
+let dialStep = 0;
 server.on("secureConnection", (s) => {
-  log("secureConnection remote=" + JSON.stringify(s.remoteAddress));
+  fill("secure3", "secureConnection remote=" + JSON.stringify(s.remoteAddress));
   s.on("data", (d) => s.write(d));
 });
 server.on("connection", (s) => {
-  log("connection remote=" + JSON.stringify(s.remoteAddress));
   s.on("error", () => {});
+  fill("conn" + dialStep, "connection remote=" + JSON.stringify(s.remoteAddress));
 });
-server.on("tlsClientError", (e) => log("tlsClientError " + (e.code ?? "none")));
+server.on("tlsClientError", (e) => fill("tcerr", "tlsClientError " + (e.code ?? "none")));
 server.on("error", (e) => log("server error " + e.code));
 await new Promise((r) => server.listen(P, r));
 log("listening address=" + JSON.stringify(server.address()));
 
 // 2. A plain net client: 'connection' fires, the address fields are
 //    undefined, and the client goes away before any TLS happens -- which
-//    the server reports as a tlsClientError. Awaited here, so its place in
-//    the log is not the scheduler's to move.
+//    the server reports as a tlsClientError. Every line here is printed by
+//    this step AFTER both ends have reported, in the fixed order below:
+//    which end reports first is the scheduler's, not node's contract, and
+//    it flipped between engines, platforms and runs (measured: darwin/node
+//    put the server line first where win/node and win/oam put the client
+//    line first 12/12 -- the 2026-10-12 mac release leg died on exactly
+//    that). The tlsClientError line comes last: it can only fire after the
+//    server accepted the connection, and the step waits for it anyway.
 {
-  const clientError = new Promise((r) => {
-    const onErr = () => {
-      server.removeListener("tlsClientError", onErr);
-      r();
-    };
-    server.on("tlsClientError", onErr);
+  dialStep = 2;
+  const dial = new Promise((r) => {
+    const s = net.connect({ path: P });
+    s.once("connect", () => {
+      s.destroy();
+      r("plain client connected");
+    });
   });
-  const s = net.connect({ path: P });
-  await new Promise((r) => s.once("connect", r));
+  const [conn, tle] = await Promise.all([take("conn2"), take("tcerr"), dial]);
+  log(conn);
   log("plain client connected");
-  s.destroy();
-  await clientError;
+  log(tle);
 }
 
 // 3. A TLS client over the pipe socket: the handshake, one echo, the end,
 //    and the server's name through both closes (while listening, after the
-//    client is gone, after the drain).
+//    client is gone, after the drain). Same fixed-order rule as step 2: the
+//    server's accept ('connection'), the server's handshake event
+//    ('secureConnection') and the client's handshake callback all race each
+//    other on arrival, so every line is gathered first and printed in one
+//    order below. close() and the NUL refusal are then driven from THIS
+//    flow, after the batch -- never from an event handler -- so no line's
+//    place depends on whether an engine drains its nextTick queue before
+//    its promise microtasks.
 {
+  dialStep = 3;
   const raw = net.connect({ path: P });
   await new Promise((r) => raw.once("connect", r));
+  const conn3 = take("conn3");
   const c = tls.connect({ socket: raw, rejectUnauthorized: false }, () => {
-    log("client secure protocol=" + c.getProtocol());
+    fill("clientSecure3", "client secure protocol=" + c.getProtocol());
     c.write("ping");
   });
   c.on("data", (d) => {
-    log("client echo=" + d.toString());
+    fill("echo3", "client echo=" + d.toString());
     c.end();
   });
   c.on("error", (e) => log("client error " + e.code));
-  c.on("close", () => {
-    log("client gone address=" + JSON.stringify(server.address()));
-    server.close(() => {
-      log("drained address=" + JSON.stringify(server.address()));
-      // 4. A NUL in the path: the refusal is ASYNC on both engines (an
-      //    'error' event, not a synchronous throw), with the bind-shaped
-      //    fields -- EINVAL, syscall listen, port -1. Only the fields that
-      //    are node's contract print; the message text is not compared.
-      const bad = new tls.Server({ cert: CERT, key: KEY });
-      bad.on("error", (e) => {
-        log("nul " + e.code + " syscall=" + e.syscall + " port=" + e.port);
-        finish();
-      });
-      bad.listen("a\0b");
-    });
-  });
+  c.on("close", () => fill("gone3", "client gone address=" + JSON.stringify(server.address())));
+  const [conn, secure, clientSecure, echo, gone] = await Promise.all([
+    conn3,
+    take("secure3"),
+    take("clientSecure3"),
+    take("echo3"),
+    take("gone3"),
+  ]);
+  log(conn);
+  log(secure);
+  log(clientSecure);
+  log(echo);
+  log(gone);
+
+  await new Promise((r) => server.close(r));
+  log("drained address=" + JSON.stringify(server.address()));
+
+  // 4. A NUL in the path: the refusal is ASYNC on both engines (an
+  //    'error' event, not a synchronous throw), with the bind-shaped
+  //    fields -- EINVAL, syscall listen, port -1. Only the fields that
+  //    are node's contract print; the message text is not compared.
+  const bad = new tls.Server({ cert: CERT, key: KEY });
+  bad.on("error", (e) => fill("nul", "nul " + e.code + " syscall=" + e.syscall + " port=" + e.port));
+  bad.listen("a\0b");
+  log(await take("nul"));
+  finish();
 }
