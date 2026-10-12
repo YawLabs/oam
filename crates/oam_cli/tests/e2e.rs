@@ -32938,8 +32938,8 @@ fn v8_pool_size_sets_the_platforms_worker_thread_count() {
             panic!("{args:?} {env:?}: stdout {stdout:?}: {e}; stderr: {stderr}")
         })
     };
-    assert_eq!(workers(&["run", "--v8-pool-size=1", &path], &[]), 1);
-    assert_eq!(workers(&["run", "--v8-pool-size=3", &path], &[]), 3);
+    assert_eq!(workers(&["--v8-pool-size=1", "run", &path], &[]), 1);
+    assert_eq!(workers(&["--v8-pool-size=3", "run", &path], &[]), 3);
     assert_eq!(workers(&["run", &path], &[("OAM_V8_POOL_SIZE", "2")]), 2);
     // No request: min(4, cores - 1), and at least 1 -- the same formula on
     // the same box the child sizes from.
