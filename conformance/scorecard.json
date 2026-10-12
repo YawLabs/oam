@@ -1,7 +1,7 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "8839fb3",
-  "oamVersion": "oam 0.18.1",
+  "commit": "5febccc",
+  "oamVersion": "oam 0.19.0",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
   "suites": {
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 309,
-      "total": 310,
+      "pass": 312,
+      "total": 314,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -1012,7 +1012,34 @@
           "status": "pass"
         },
         {
+          "case": "388-tls-server-pipe-listen.mjs",
+          "status": "fail",
+          "watchdog": null,
+          "exit": {
+            "oam": 0,
+            "node": 0
+          },
+          "firstDifference": {
+            "line": 2,
+            "oam": "connection remote=undefined",
+            "node": "plain client connected"
+          },
+          "oamStderr": ""
+        },
+        {
+          "case": "389-http-server-pipe-listen.mjs",
+          "status": "pass"
+        },
+        {
           "case": "39-util-fidelity.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "390-https-server-pipe-listen.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "391-http2-server-pipe-listen.mjs",
           "status": "pass"
         },
         {
