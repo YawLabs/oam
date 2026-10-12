@@ -1515,7 +1515,10 @@ fn next_tick_binds_als_frame_per_callback() {
 #[test]
 fn next_tick_queue_drains_past_handled_uncaught_exception() {
     // Node semantics: a throwing tick surfaces as uncaughtException, and when
-    // a handler exists the REMAINING tick queue still drains.
+    // a handler exists the run survives -- but the interrupted batch defers:
+    // node keeps the remaining ticks queued and drains them at the NEXT tick
+    // point (after the next macrotask), not in place (probe-verified on
+    // v22.22.2: "caught boom", "done", then "after").
     let stdout = run_ok(
         "next_tick_throw.ts",
         "process.on('uncaughtException', (e: Error) => console.log('caught ' + e.message));\n\
@@ -1523,7 +1526,7 @@ fn next_tick_queue_drains_past_handled_uncaught_exception() {
          process.nextTick(() => console.log('after'));\n\
          setTimeout(() => console.log('done'), 0);",
     );
-    assert_eq!(stdout, "caught boom\nafter\ndone");
+    assert_eq!(stdout, "caught boom\ndone\nafter");
 }
 
 #[test]
@@ -1531,7 +1534,8 @@ fn next_tick_capture_callback_replaces_uncaught_emission() {
     // Node's onGlobalUncaughtException order: monitor, then the capture
     // callback -- which REPLACES 'uncaughtException' emission and is never
     // fatal -- then listeners. A throwing tick with a capture callback set
-    // must invoke it, keep draining, and exit 0 (Node-identical).
+    // must invoke it and exit 0; as with a listener, the interrupted batch
+    // defers to the next tick point (after the timer, node-identical).
     let stdout = run_ok(
         "next_tick_capture.ts",
         "process.setUncaughtExceptionCaptureCallback((e: Error) => console.log('captured ' + e.message));\n\
@@ -1539,7 +1543,62 @@ fn next_tick_capture_callback_replaces_uncaught_emission() {
          process.nextTick(() => console.log('after'));\n\
          setTimeout(() => console.log('done'), 0);",
     );
-    assert_eq!(stdout, "captured boom\nafter\ndone");
+    assert_eq!(stdout, "captured boom\ndone\nafter");
+}
+
+#[test]
+fn frameless_throw_from_fs_callback_keeps_source_header() {
+    // #167 item 2, the e2e stderr test the issue asks for: the throw-site
+    // header is what points a reader at the `if (err) throw err;` line. The
+    // message listener captures the frame while V8's Message still holds the
+    // user's position -- the report must never rebuild it from the error's
+    // own stack, which this error has stripped to its header line.
+    let file = write_temp(
+        "frameless_fs_throw.cjs",
+        "const fs = require('fs');\n\
+         fs.readFile('missing-file-oam-test.txt', (e) => { e.stack = e.stack.split('\\n')[0]; throw e; });",
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let name = file.file_name().unwrap().to_string_lossy();
+    assert!(
+        !out.status.success(),
+        "a frameless throw is still fatal; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("{name}:2")),
+        "the report must open with the throw-site header; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("throw e;"),
+        "the report must show the throwing source line; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn frameless_throw_from_next_tick_keeps_source_header() {
+    // Same surface through the tick path: the drain lets the throw unwind
+    // natively (node's try/finally shape), so the Message the host reports
+    // carries the user's line, not a rethrow inside the runtime.
+    let file = write_temp(
+        "frameless_tick_throw.cjs",
+        "process.nextTick(() => { const e = new Error('tick boom'); e.stack = e.stack.split('\\n')[0]; throw e; });",
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let name = file.file_name().unwrap().to_string_lossy();
+    assert!(
+        !out.status.success(),
+        "a frameless throw is still fatal; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("{name}:1")),
+        "the report must open with the throw-site header; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("throw e;"),
+        "the report must show the throwing source line; stderr: {stderr}"
+    );
 }
 
 #[test]

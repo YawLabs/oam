@@ -203,12 +203,14 @@ fn process_has_listener(
 /// Fire 'unhandledRejection' for ledger entries that HAVE a listener,
 /// promptly (Node fires after the microtask checkpoint, not at end-of-run).
 /// No-listener rejections are left in the ledger for the fatal end check.
-/// Called after each microtask checkpoint in the event loop.
+/// Called after each microtask checkpoint in the event loop. Returns
+/// failures when the listener's queued ticks threw fatally -- the pump must
+/// fail the run, not swallow them.
 pub(crate) fn flush_handled_rejections(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
-) {
+) -> Option<Vec<Diagnostic>> {
     if !process_has_listener(tc, "unhandledRejection") {
-        return;
+        return None;
     }
     let drained: Vec<(v8::Global<v8::Promise>, v8::Global<v8::Value>)> = tc
         .get_slot_mut::<RejectionLedger>()
@@ -227,9 +229,10 @@ pub(crate) fn flush_handled_rejections(
     // Explicit microtask policy: nothing flushes what the listener queued
     // (an async listener's continuation!) unless we do it here. A fatal
     // tick throw lands on the UncaughtLedger for the pump's next drain.
-    if ran_listener {
-        let _ = run_ticks_and_microtasks(tc);
+    if ran_listener && let Some(failure) = run_ticks_and_microtasks(tc) {
+        return Some(failure);
     }
+    None
 }
 
 /// Route an uncaught exception through the JS canonical dispatcher
@@ -322,20 +325,22 @@ pub(crate) const FATAL_CODE: &str = "OAM-RT0005";
 
 /// Node's `<file>:<line>` + source line + caret preamble. Built from the V8
 /// Message BEFORE the TryCatch is reset -- the message is gone after.
+/// Takes the pin-erased scope: a TryCatch pin derefs to it, and every
+/// Message method takes `&PinScope`.
 fn source_frame(
-    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    scope: &v8::PinScope<'_, '_>,
     message: v8::Local<'_, v8::Message>,
 ) -> Option<String> {
     let file = message
-        .get_script_resource_name(tc)?
-        .to_rust_string_lossy(tc);
-    let line = message.get_line_number(tc)?;
+        .get_script_resource_name(scope)?
+        .to_rust_string_lossy(scope);
+    let line = message.get_line_number(scope)?;
     // Synthetic messages (eval wrappers) carry no usable location; Node
     // always has one, so print no frame at all rather than "undefined:0".
     if line == 0 || file.is_empty() || file == "undefined" {
         return None;
     }
-    let src = message.get_source_line(tc)?.to_rust_string_lossy(tc);
+    let src = message.get_source_line(scope)?.to_rust_string_lossy(scope);
     // Transpiled files: V8's position AND source line are codegen text.
     // With a source map registered, point at the line the user wrote --
     // position from the registry, text from the file on disk. Any failure
@@ -500,6 +505,12 @@ pub(crate) fn drain_uncaught(
             let local = v8::Local::new(tc, &value);
             let (local, frame, message) = match dispatch_uncaught(tc, local) {
                 Uncaught::Handled => continue,
+                // No stored frame: for a microtask-thrown error V8 has no
+                // throw-site Message at all (probe-verified -- file
+                // "undefined", line 0, for a stack-stripped throw; node
+                // prints `<anonymous_script>:0` the same way). The report's
+                // create_message fallback derives the position from the
+                // error's own stack, which is exactly node's derivation.
                 Uncaught::Fatal => (local, None, format!("Uncaught (in microtask) {text}")),
                 Uncaught::HandlerThrew {
                     value,
@@ -515,8 +526,12 @@ pub(crate) fn drain_uncaught(
             ));
         }
         // Flush what the listeners queued -- explicit policy means nothing
-        // else will until the next macrotask boundary.
-        let _ = run_ticks_and_microtasks(tc);
+        // else will until the next macrotask boundary. A fatal tick throw
+        // from that flush fails the run: merge its report and stop quiescing.
+        if let Some(failure) = run_ticks_and_microtasks(tc) {
+            fatal.extend(failure);
+            break;
+        }
     }
     if fatal.is_empty() { None } else { Some(fatal) }
 }
@@ -1174,26 +1189,32 @@ pub(crate) fn run_ticks_and_microtasks(
         if let Some(drain) = drain {
             let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
             if drain.call(tc, recv, &[]).is_none() {
-                // The JS drain already ran Node's monitor/capture/listener
-                // ladder; a throw only escapes for the fatal shapes (no
-                // consumer, or the handler itself threw). Route it through
-                // the uncaught LEDGER: drain_uncaught re-delivers to
-                // uncaughtException (the documented oam divergence -- a
-                // throwing handler re-delivers and the run survives) and
-                // reports fatal only when no listener handles it. The
-                // drain's finally already reset the queue, so looping on is
-                // safe.
-                let exception = tc.exception();
-                let text = crate::exception_to_error(tc, "process.nextTick").to_string();
-                if let Some(exception) = exception {
-                    let value = v8::Global::new(tc, exception);
-                    tc.reset();
-                    if let Some(ledger) = tc.get_slot_mut::<UncaughtLedger>() {
-                        ledger.entries.push((value, text));
-                    }
-                } else {
-                    tc.reset();
+                // A fatal tick throw unwound natively from the drain (node's
+                // try/finally shape -- no JS catch/rethrow), so the Message
+                // still carries the USER's throw position; running the JS
+                // ladder again here would reposition the report to
+                // node_compat.js and double-fire 'uncaughtExceptionMonitor'
+                // (#167 item 2). The ladder runs HERE, once, exactly like a
+                // timer callback's throw (handle_uncaught_throw): handled
+                // continues the run, fatal/handler-threw fails it. Handled
+                // ALSO defers the interrupted batch -- node keeps the
+                // remaining ticks queued and drains them at the next tick
+                // point, AFTER the next macrotask (probe-verified), so do
+                // not checkpoint-drain them in place.
+                if let Some(failure) = handle_uncaught_throw(tc, "process.nextTick") {
+                    return Some(failure);
                 }
+                // Node's RunNextTicks skips its runMicrotasks() while the
+                // interrupted batch stays queued -- the NEXT tick point
+                // drains the batch and checkpoints after it. When the queue
+                // is EMPTY, though, the do-while's runMicrotasks() is the
+                // very next thing node does: checkpoint now so a
+                // listener-queued microtask flushes instead of stranding
+                // until some unrelated JS-running site checkpoints.
+                if !has_pending_ticks(tc) {
+                    tc.perform_microtask_checkpoint();
+                }
+                return None;
             }
         }
         tc.perform_microtask_checkpoint();
@@ -1334,7 +1355,9 @@ pub(crate) fn pump_event_loop(
         // not die on a background rejection. unhandled_rejection_failures drains
         // the ledger each turn, so the caller's post-loop end check is a no-op.
         if !report_unhandled {
-            flush_handled_rejections(tc);
+            if let Some(failures) = flush_handled_rejections(tc) {
+                return Err(failures);
+            }
         } else if let Some(failures) = unhandled_rejection_failures(tc) {
             return Err(failures);
         }
@@ -1675,7 +1698,11 @@ pub(crate) fn unhandled_rejection_failures(
     }
     // Flush what the listeners queued (async listener continuations) --
     // explicit policy means no one else will until the next macrotask.
-    let _ = run_ticks_and_microtasks(tc);
+    // A fatal tick throw from the flush fails the run: merge its report
+    // with any rejection reports (all are fatal diagnostics).
+    if let Some(failure) = run_ticks_and_microtasks(tc) {
+        fatal.extend(failure);
+    }
     if fatal.is_empty() { None } else { Some(fatal) }
 }
 

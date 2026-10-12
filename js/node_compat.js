@@ -11995,15 +11995,18 @@
           fsReqEnd(token);
           throw e;
         }
-        // node's FSReqCallback::Resolve passes the value only when there is
-        // one: an operation with no result (chmod, rename, unlink, ...) calls
-        // back with the single argument null, not (null, undefined).
+        // Deliver on the tick queue, not a microtask: node dispatches fs
+        // callbacks from the poll phase, and a throw out of the callback must
+        // unwind into the host's TryCatch for the report to keep the
+        // throw-site Message. A microtask throw has NO Message position --
+        // V8 rebuilds one from the error's own stack, so a frameless error
+        // loses the header (#167 item 2, probe-verified on both runtimes).
         p.then(
           (value) => {
             fsReqEnd(token);
-            queueMicrotask(() => (value === undefined ? cb(null) : cb(null, value)));
+            process.nextTick(() => (value === undefined ? cb(null) : cb(null, value)));
           },
-          (err) => { fsReqEnd(token); queueMicrotask(() => cb(err)); },
+          (err) => { fsReqEnd(token); process.nextTick(() => cb(err)); },
         );
       };
     }
@@ -12230,8 +12233,8 @@
             throw e;
           }
           p.then(
-            () => { fsReqEnd(token); queueMicrotask(() => cb(null)); },
-            (err) => { fsReqEnd(token); queueMicrotask(() => cb(err)); },
+            () => { fsReqEnd(token); process.nextTick(() => cb(null)); },
+            (err) => { fsReqEnd(token); process.nextTick(() => cb(err)); },
           );
           return;
         }
@@ -12462,15 +12465,15 @@
       Promise.resolve(natives.fsReadChunk(fd, want, position)).then(
         function (chunk) {
           if (chunk === undefined || chunk === null) {
-            queueMicrotask(function () { cb(null, 0, buffer); });
+            process.nextTick(function () { cb(null, 0, buffer); });
             return;
           }
           var view = new Uint8Array(buffer.buffer, buffer.byteOffset + offset);
           view.set(chunk.subarray(0, Math.min(chunk.length, view.length)));
-          queueMicrotask(function () { cb(null, chunk.length, buffer); });
+          process.nextTick(function () { cb(null, chunk.length, buffer); });
         },
         // node calls a failed read back with (err, 0, buffer), as a write.
-        function (err) { queueMicrotask(function () { cb(err, 0, buffer); }); },
+        function (err) { process.nextTick(function () { cb(err, 0, buffer); }); },
       );
     }
 
@@ -12745,8 +12748,8 @@
         validateRmOptions(options);
         const token = fsReqStart();
         promises.rm(file, options).then(
-          () => { fsReqEnd(token); queueMicrotask(() => callback(null)); },
-          (err) => { fsReqEnd(token); queueMicrotask(() => callback(err)); },
+          () => { fsReqEnd(token); process.nextTick(() => callback(null)); },
+          (err) => { fsReqEnd(token); process.nextTick(() => callback(err)); },
         );
       },
       rmdir: callbackify1(promises.rmdir, 1, 1),
@@ -12840,8 +12843,8 @@
           throw e;
         }
         p.then(
-          function (info) { fsReqEnd(token); queueMicrotask(function () { cb(null, info.handle); }); },
-          function (err) { fsReqEnd(token); queueMicrotask(function () { cb(err); }); },
+          function (info) { fsReqEnd(token); process.nextTick(function () { cb(null, info.handle); }); },
+          function (err) { fsReqEnd(token); process.nextTick(function () { cb(err); }); },
         );
       },
       // The callback is optional, but one that is passed must be a function,
@@ -12856,7 +12859,7 @@
         validateFd(fd, true);
         var err = null;
         try { natives.fsCloseSync(fd); } catch (e) { err = e; }
-        queueMicrotask(function () { cb(err); });
+        process.nextTick(function () { cb(err); });
       },
       // Async fd-based write. Node overloads:
       //   fs.write(fd, buffer[, offset[, length[, position]]], cb)
@@ -12909,10 +12912,10 @@
           // node's callback for a failed write is (err, 0, data), not (err):
           // its wrapper passes `written || 0` and the buffer or string
           // either way (measured on v22.22.2, fd 1 and a read-only fd).
-          queueMicrotask(function () { cb(e, 0, data); });
+          process.nextTick(function () { cb(e, 0, data); });
           return;
         }
-        queueMicrotask(function () { cb(null, n, data); });
+        process.nextTick(function () { cb(null, n, data); });
       },
       read: function read(fd, buffer, offsetOrOptions, length, position, cb) {
         // node's JS getValidatedFd, before any other argument (validateFd).
@@ -12979,12 +12982,12 @@
           // A bad fd throws out of the op before a promise exists; node
           // reports it through the callback, never synchronously.
           fsReqEnd(token);
-          queueMicrotask(function () { cb(e); });
+          process.nextTick(function () { cb(e); });
           return;
         }
         p.then(
-          function (raw) { fsReqEnd(token); queueMicrotask(function () { cb(null, wrapStat(raw)); }); },
-          function (err) { fsReqEnd(token); queueMicrotask(function () { cb(err); }); },
+          function (raw) { fsReqEnd(token); process.nextTick(function () { cb(null, wrapStat(raw)); }); },
+          function (err) { fsReqEnd(token); process.nextTick(function () { cb(err); }); },
         );
       },
       // node's internal time coercion, exported (unprefixed by convention but
@@ -13021,12 +13024,12 @@
           p = run(...args);
         } catch (e) {
           fsReqEnd(token);
-          queueMicrotask(() => cb(e));
+          process.nextTick(() => cb(e));
           return;
         }
         p.then(
-          () => { fsReqEnd(token); queueMicrotask(() => cb(null)); },
-          (err) => { fsReqEnd(token); queueMicrotask(() => cb(err)); },
+          () => { fsReqEnd(token); process.nextTick(() => cb(null)); },
+          (err) => { fsReqEnd(token); process.nextTick(() => cb(err)); },
         );
       };
 
@@ -13199,7 +13202,7 @@
       const total = asViewArray(buffers);
       if (typeof position === "function") { cb = position; position = null; }
       validateCb(cb);
-      if (emptyList(buffers)) { queueMicrotask(() => cb(null, 0, buffers)); return; }
+      if (emptyList(buffers)) { process.nextTick(() => cb(null, 0, buffers)); return; }
       // Reuses fs.write, so the position handling lives in exactly one place.
       fs.write(fd, flattenViews(buffers, total), 0, total, fsPositionArg(position), (err, written) =>
         err ? cb(err, 0, buffers) : cb(null, written, buffers),
@@ -13215,7 +13218,7 @@
         // This one IS deferred, and beats a closed descriptor: node reports
         // EINVAL through the callback for one (an out-of-range one has
         // already thrown above).
-        queueMicrotask(() => cb(einvalRead(natives.platform), 0, buffers));
+        process.nextTick(() => cb(einvalRead(natives.platform), 0, buffers));
         return;
       }
       const tmp = globalThis.Buffer.allocUnsafe(total);
@@ -13491,11 +13494,13 @@
     // "at process.processTicksAndRejections". Installed as a real process
     // method below and invoked through it, so V8 renders the receiver too.
     const drainTickQueue = function processTicksAndRejections() {
-      // The finally is load-bearing: EVERY exit -- normal completion, the
-      // fatal no-listener rethrow, or a throw from a user's uncaughtException/
-      // monitor handler itself -- must reset the queue state so a later
-      // host drain starts from a consistent queue while the process keeps
-      // running.
+      // Node's shape: try/finally, NO catch. A throwing tick whose ladder
+      // finds no consumer unwinds natively into the host's TryCatch, which
+      // captures the throw-site Message (the USER's file:line -- a JS
+      // catch/rethrow would reposition it to this file, #167 item 2) and
+      // routes the error through the uncaught ledger. The finally keeps the
+      // queue consistent: consumed entries are gone, UN-RUN entries stay
+      // pending for the next tick point, exactly node's FixedQueue.
       try {
         while (tickIndex < tickQueue.length) {
           const entry = tickQueue[tickIndex];
@@ -13509,49 +13514,41 @@
             tickQueue = tickQueue.slice(tickIndex);
             tickIndex = 0;
           }
-          try {
-            // Domain wrap, Node shape: enter before, exit ONLY on success --
-            // a throw unwinds with the domain entered so dispatchUncaught
-            // (in the catch below) routes it to the domain's error handler.
-            const tickDom = entry[2];
-            if (tickDom) tickDom.enter();
-            // Local, not entry[0](...): calling a function off an array makes
-            // V8 name the callee's frame "Array.<anonymous>".
-            const tickFn = entry[0];
-            // Only pay the continuation get/set when a frame was actually
-            // captured -- the overwhelmingly common case is no ALS in play,
-            // and this is the hottest loop in the runtime.
-            const frame = entry[3];
-            if (frame === undefined) {
+          // Domain wrap, Node shape: enter before, exit ONLY on success --
+          // a throw unwinds with the domain entered so dispatchUncaught
+          // (below) routes it to the domain's error handler.
+          const tickDom = entry[2];
+          if (tickDom) tickDom.enter();
+          // Local, not entry[0](...): calling a function off an array makes
+          // V8 name the callee's frame "Array.<anonymous>".
+          const tickFn = entry[0];
+          // Only pay the continuation get/set when a frame was actually
+          // captured -- the overwhelmingly common case is no ALS in play,
+          // and this is the hottest loop in the runtime.
+          const frame = entry[3];
+          if (frame === undefined) {
+            tickFn(...entry[1]);
+          } else {
+            const prevFrame = registry._setContinuationFrame(frame);
+            try {
               tickFn(...entry[1]);
-            } else {
-              const prevFrame = registry._setContinuationFrame(frame);
-              try {
-                tickFn(...entry[1]);
-              } finally {
-                registry._setContinuationFrame(prevFrame);
-              }
+            } finally {
+              registry._setContinuationFrame(prevFrame);
             }
-            if (tickDom) tickDom.exit();
-          } catch (e) {
-            // Node's onGlobalUncaughtException order: monitor first; then the
-            // capture callback, which REPLACES 'uncaughtException' emission
-            // and is never fatal; then listeners (handled -> this same drain
-            // keeps going). Emitting inline here (rather than rethrowing to
-            // the engine ledger, which only delivers after the whole
-            // microtask checkpoint) is what keeps the handler AHEAD of later
-            // ticks. No consumer at all = fatal: rethrow, and Node-faithfully
-            // drop the remaining ticks (via the finally) rather than racing
-            // their side effects against process death. A throw from the
-            // handler itself also escapes here -- fatal in Node; the finally
-            // keeps nextTick functional if the engine survives the run.
-            if (dispatchUncaught(e, "uncaughtException")) continue;
-            throw e;
           }
+          if (tickDom) tickDom.exit();
         }
       } finally {
-        tickQueue = [];
-        tickIndex = 0;
+        // Keep the un-run entries on a fatal unwind: node holds them in its
+        // FixedQueue and a later tick point (the next callback) drains them
+        // -- a handled throw defers the batch, and the fatal path can still
+        // reach a later drain while listeners run. Wiping them here drops
+        // t2/t3 from `t1 throws (handled), t2, t3, setTimeout(...)`, which
+        // node prints AFTER the timer (probe-verified).
+        if (tickIndex >= 1024) {
+          tickQueue = tickQueue.slice(tickIndex);
+          tickIndex = 0;
+        }
       }
     };
     // Host-driven tick points (docs/design/nexttick-engine.md): the engine
