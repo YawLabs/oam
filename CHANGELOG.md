@@ -14,7 +14,7 @@ gap between headings below is expected rather than a missing entry. Not every ta
 is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
 one, so `install.sh`, which resolves the latest Release, never handed them out.
 
-## [Unreleased]
+## [0.19.0] - 2026-10-11
 
 ### Fixed
 
@@ -30,8 +30,6 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `docs/design/nexttick-engine.md` already described -- so the batch drains at the next tick
   point (the timer's scope close), matching Node's probe-verified order on every delay and
   in the no-timer and unref-only cases.
-
-## [0.19.0] - 2026-10-11
 
 ### Added
 
