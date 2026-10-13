@@ -305,3 +305,173 @@ for (const flags of ["r", "r+", "w+", "a+", "w", "wx", "zz"]) {
   await closed(rs);
   console.log(`read stream flags ${flags} | ${JSON.stringify(log)} read ${JSON.stringify(got)} holds ${JSON.stringify(read(p))}`);
 }
+
+// ---- Destroyed under a write: the write lands first ----
+for (let round = 0; round < 5; round++) {
+  const p = fresh();
+  const ws = fs.createWriteStream(p);
+  const log = watch(ws);
+  await once(ws, "ready");
+  ws.write("abc", (e) => log.push("write callback " + (e ? e.code : "ok")));
+  ws.destroy();
+  await closed(ws);
+  await new Promise((res) => setImmediate(res));
+  console.log(`destroyed under a write ${round} | ${JSON.stringify(log.map((l) => l.replace(/^error:.*$/, "error")))} bytesWritten=${ws.bytesWritten} content=${JSON.stringify(read(p))}`);
+}
+
+// ---- autoClose is the stream's autoDestroy; destroy() always closes ----
+const fdState = (fd) => {
+  try {
+    fs.fstatSync(fd);
+    return "open";
+  } catch (e) {
+    return e.code;
+  }
+};
+{
+  const p = fresh();
+  const ws = fs.createWriteStream(p, { autoClose: false });
+  const log = watch(ws);
+  await once(ws, "ready");
+  const fd = ws.fd;
+  console.log("autoClose | " + [ws.autoClose, "autoClose" in ws, fs.createWriteStream(fresh()).autoClose, fs.createReadStream(p).autoClose].join(" "));
+  ws.end("x");
+  await once(ws, "finish");
+  ws.destroy();
+  await closed(ws);
+  console.log("autoClose false, destroy | " + JSON.stringify(log) + " " + state(ws) + " descriptor " + fdState(fd));
+}
+{
+  const p = fresh();
+  const ws = fs.createWriteStream(p, { autoClose: false });
+  const log = watch(ws);
+  await once(ws, "ready");
+  const fd = ws.fd;
+  ws.write("z");
+  await new Promise((res) => ws.close(res));
+  console.log("autoClose false, close(cb) | " + JSON.stringify(log) + " " + state(ws) + " descriptor " + fdState(fd));
+}
+{
+  const p = fresh("0123456789");
+  const rs = fs.createReadStream(p, { autoClose: false, encoding: "utf8" });
+  const seen = [];
+  rs.on("data", (c) => seen.push(c));
+  await once(rs, "end");
+  await new Promise((res) => setImmediate(res));
+  const fd = rs.fd;
+  seen.push(`after end fd=${typeof fd} destroyed=${rs.destroyed} descriptor ${fdState(fd)}`);
+  rs.destroy();
+  await closed(rs);
+  console.log("read autoClose false | " + JSON.stringify(seen) + " then fd=" + rs.fd + " descriptor " + fdState(fd));
+  const set = fs.createWriteStream(fresh());
+  set.autoClose = false;
+  set.end("x");
+  await once(set, "finish");
+  await new Promise((res) => setImmediate(res));
+  console.log("autoClose assigned false | destroyed=" + set.destroyed + " fd=" + typeof set.fd);
+  set.destroy();
+  await closed(set);
+}
+// The descriptor is the stream's until it is destroyed: at 'end' it is still there.
+{
+  const p = fresh("0123456789");
+  const rs = fs.createReadStream(p);
+  const at = [];
+  rs.on("data", () => at.push(`data fd=${typeof rs.fd} pending=${rs.pending}`));
+  rs.on("end", () => at.push(`end fd=${typeof rs.fd} pending=${rs.pending}`));
+  await closed(rs);
+  at.push(`close fd=${rs.fd} pending=${rs.pending}`);
+  console.log("read stream descriptor | " + JSON.stringify(at));
+}
+// `pos` is the cursor: assigning it moves the next read or write.
+{
+  const p = fresh("0123456789");
+  const rs = fs.createReadStream(p, { encoding: "utf8", highWaterMark: 2, start: 0 });
+  const got = [];
+  for await (const chunk of rs) {
+    got.push(chunk);
+    if (got.length === 1) rs.pos = 6;
+  }
+  console.log("read pos assigned | " + JSON.stringify(got));
+  const ws = fs.createWriteStream(p, { flags: "r+", start: 0 });
+  await once(ws, "ready");
+  ws.write("AB");
+  const during = ws.pos;
+  ws.pos = 8;
+  ws.end("YZ");
+  await closed(ws);
+  console.log("write pos | during " + during + " content " + JSON.stringify(read(p)));
+}
+// What queued behind the open goes out as one write.
+{
+  const p = fresh();
+  const ws = fs.createWriteStream(p);
+  const counts = [];
+  ws.write("aa", () => counts.push(ws.bytesWritten));
+  ws.write("bbb", () => counts.push(ws.bytesWritten));
+  ws.write("c", () => counts.push(ws.bytesWritten));
+  ws.end();
+  await closed(ws);
+  console.log("queued writes | bytesWritten in each callback " + JSON.stringify(counts) + " content " + JSON.stringify(read(p)));
+  const other = fs.createWriteStream(fresh());
+  console.log("destroySoon | " + typeof other.destroySoon + " " + (other.destroySoon === other.end));
+  other.destroySoon();
+  await closed(other);
+}
+// Handed a descriptor, a stream has no path, flags or mode.
+{
+  const p = fresh("0123456789");
+  const keys = (stream) => Object.keys(stream).filter((k) => !k.startsWith("_")).join(",");
+  const wfd = fs.openSync(p, "r+");
+  const ws = fs.createWriteStream("ignored", { fd: wfd, flags: "a", mode: 0o600 });
+  console.log("write stream with fd | keys " + keys(ws) + " flags " + ws.flags + " mode " + ws.mode);
+  ws.destroy();
+  await closed(ws);
+  const rfd = fs.openSync(p, "r");
+  const rs = fs.createReadStream("ignored", { fd: rfd, flags: "a" });
+  console.log("read stream with fd | keys " + keys(rs) + " flags " + rs.flags + " mode " + rs.mode);
+  rs.destroy();
+  await closed(rs);
+  const url = new URL("file:///" + p.split(path.sep).join("/").replace(/^\//, ""));
+  const byUrl = fs.createReadStream(url);
+  console.log("path from a URL | " + typeof byUrl.path + " " + (byUrl.path === p));
+  byUrl.destroy();
+  await closed(byUrl);
+}
+// The checks a bad call meets, in node's order.
+for (const [label, make] of [
+  ["options 5", (k) => k(fresh(""), 5)],
+  ["encoding", (k) => k(fresh(""), { encoding: "nope" })],
+  ["encoding string", (k) => k(fresh(""), "nope")],
+  ["encoding before path", (k) => k(5, { encoding: "nope" })],
+  ["path before start", (k) => k(5, { start: -1 })],
+  ["path before flush", (k) => k(5, { flush: 1 })],
+  ["flush before start", (k) => k(fresh(""), { flush: 1, start: -1 })],
+  ["fd before start", (k) => k(fresh(""), { fd: -1, start: -1 })],
+  ["start before end", (k) => k(fresh(""), { start: -1, end: -1 })],
+]) {
+  for (const [kind, k] of [["write", fs.createWriteStream], ["read", fs.createReadStream]]) {
+    let line;
+    try {
+      const stream = make(k);
+      stream.on("error", () => {});
+      const done = closed(stream);
+      stream.destroy();
+      await done;
+      line = "made";
+    } catch (e) {
+      line = e.code + " " + scrub(e.message);
+    }
+    console.log(`${kind} stream, ${label} | ${line}`);
+  }
+}
+{
+  const p = fresh("0123456789");
+  const rs = fs.createReadStream(p, { emitClose: false });
+  const log = [];
+  for (const name of ["open", "end", "close"]) rs.on(name, () => log.push(name));
+  rs.resume();
+  await once(rs, "end");
+  await new Promise((res) => setTimeout(res, 20));
+  console.log("read emitClose false | " + JSON.stringify(log) + " destroyed=" + rs.destroyed);
+}

@@ -36,10 +36,20 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   ignored (every write went to the cursor); `flush: true` now syncs before the close; and
   `createWriteStream(path, "latin1")` encodes strings as it says. The write stream's
   default `highWaterMark` is node's 16384 (it was 65536).
-- **File streams have node's properties**: `fd` (null until open and after close),
-  `pending`, `flags`, `mode`, `start`, `pos`, and `end` on a read stream, where there
-  were only `path` and the byte count. `start` and `end` are validated as node's are, and
-  a stream handed a descriptor has no `path`.
+- **File streams have node's properties**: `fd` (null until open and once closed),
+  `pending`, `autoClose`, `flags`, `mode`, `start`, `pos`, and `end` on a read stream,
+  where there were only `path` and the byte count. `pos` is the live cursor, `path` from
+  a `file:` URL is a string, and a stream handed a descriptor has no `path`, `flags` or
+  `mode`. Options are checked as node checks them, in its order: a bad `encoding` is
+  `ERR_INVALID_ARG_VALUE`, and `start` / `end` are range-checked.
+- **A file stream closes its descriptor when it is destroyed, after the read or write in
+  flight.** `write()` followed at once by `destroy()` used to close the descriptor under
+  the write and lose it; the write now lands first, as in node. With `autoClose: false`,
+  `destroy()` and `close(cb)` left the descriptor open (and `close`'s callback never
+  ran); both close it now. A read stream keeps its descriptor through `'end'`.
+- **`WriteStream` has `destroySoon()` and writes a queued batch as one write**, so
+  `bytesWritten` moves once per batch as node's does. `createReadStream` honours
+  `emitClose`.
 - **A read error under `FileHandle.readLines()` no longer ends the process (#337).** A
   `readline` Interface did not listen for its input stream's `'error'`, so a failed read
   was thrown as an uncaught exception -- from inside a `try` / `catch` around
