@@ -5725,29 +5725,72 @@ pub mod ops {
     /// `fchmod(2)`. Windows has no mode bits, only a read-only flag, so the
     /// owner-write bit decides it -- the same reduction `fs_chmod` already makes
     /// for the path form.
+    ///
+    /// On Windows the attribute is not set on the descriptor's own handle. As
+    /// libuv's fs__fchmod does (src/win/fs.c, v1.51.0), the handle is REOPENED
+    /// for FILE_WRITE_ATTRIBUTES and the attribute set on that one, so what
+    /// the descriptor was opened for does not matter: a handle opened `r` has
+    /// no FILE_WRITE_ATTRIBUTES, and setting it there failed `EPERM` where
+    /// node changes the mode (#322). The reopen is also what refuses what it
+    /// cannot reopen, with node's codes: a directory is ERROR_ACCESS_DENIED
+    /// (`EPERM`), the NUL device ERROR_INVALID_PARAMETER (`EINVAL`), an
+    /// anonymous pipe ERROR_PIPE_BUSY (`EBUSY`). Measured on node v22.22.2:
+    /// conformance case 395.
     fn fchmod_file(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(std::fs::Permissions::from_mode(mode))
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            let meta = file.metadata()?;
-            // libuv's fs__fchmod reopens the handle to set the attribute, and
-            // that reopen refuses a directory: node fails EPERM on a directory
-            // descriptor whatever it was opened for.
-            #[cfg(windows)]
-            if meta.is_dir() {
-                use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
-                return Err(std::io::Error::from_raw_os_error(
-                    ERROR_ACCESS_DENIED as i32,
-                ));
-            }
+            use windows_sys::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER};
+            let reopened = reopen_for_attributes(file)?;
+            // A device with no attributes to read (NUL) reopens, and fails
+            // here. libuv asks NtQueryInformationFile, which says
+            // STATUS_INVALID_PARAMETER (node's `EINVAL`); the Win32 call std
+            // makes says ERROR_INVALID_FUNCTION for the same refusal, which
+            // the table reads as `EISDIR`.
+            let meta = reopened.metadata().map_err(|e| {
+                if e.raw_os_error() == i32::try_from(ERROR_INVALID_FUNCTION).ok() {
+                    std::io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32)
+                } else {
+                    e
+                }
+            })?;
             let mut perms = meta.permissions();
+            perms.set_readonly(mode & 0o200 == 0);
+            reopened.set_permissions(perms)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let mut perms = file.metadata()?.permissions();
             perms.set_readonly(mode & 0o200 == 0);
             file.set_permissions(perms)
         }
+    }
+
+    /// A second handle on the file `file` has open, with
+    /// FILE_WRITE_ATTRIBUTES and nothing else: libuv's
+    /// `ReOpenFile(handle, FILE_WRITE_ATTRIBUTES, 0, 0)`. Asking for no data
+    /// access, it shares with every handle already open, whatever the share
+    /// mode says.
+    #[cfg(windows)]
+    fn reopen_for_attributes(file: &std::fs::File) -> std::io::Result<std::fs::File> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_WRITE_ATTRIBUTES, ReOpenFile};
+        // SAFETY: `file` is borrowed for the call, so its handle is open; the
+        // other arguments are plain values. ReOpenFile makes a new handle and
+        // leaves the one it is given as it was.
+        let handle = unsafe { ReOpenFile(file.as_raw_handle(), FILE_WRITE_ATTRIBUTES, 0, 0) };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `handle` is the open handle ReOpenFile just returned (it is
+        // not INVALID_HANDLE_VALUE), nothing else has seen it, and the File
+        // takes the one ownership of it.
+        Ok(unsafe { std::fs::File::from_raw_handle(handle) })
     }
 
     /// `fchown(2)`. Windows has no uid/gid and libuv reports success there
@@ -7555,6 +7598,48 @@ mod os_error_code_tests {
             let _ = std::process::Command::new("attrib")
                 .args(["-h", file_s])
                 .status();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// fchmod reaches the file through any handle on it, one opened only to
+    /// read included: the attribute is set on a reopened handle, as libuv's
+    /// is. A directory and the NUL device do not reopen for it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_fchmod_does_not_need_a_handle_opened_to_write() {
+        let dir = whole_file_dir("fchmod-reopen");
+        let file = dir.join("f.txt");
+        for flags in ["r", "r+", "a", "a+", "w", "w+"] {
+            std::fs::write(&file, b"x").unwrap();
+            let opened = open_options_for(flags).open(&file).unwrap();
+            ops::fs_fchmod_sync(&opened, 0o444).unwrap_or_else(|e| panic!("{flags}: {e:?}"));
+            assert!(
+                opened.metadata().unwrap().permissions().readonly(),
+                "{flags}"
+            );
+            ops::fs_fchmod_sync(&opened, 0o666).unwrap_or_else(|e| panic!("{flags}: {e:?}"));
+            assert!(
+                !opened.metadata().unwrap().permissions().readonly(),
+                "{flags}"
+            );
+        }
+        // A file that is already read-only opens only to read, and that is
+        // enough to make it writable again.
+        let opened = open_options_for("r").open(&file).unwrap();
+        ops::fs_fchmod_sync(&opened, 0o444).unwrap();
+        drop(opened);
+        let opened = open_options_for("r").open(&file).unwrap();
+        ops::fs_fchmod_sync(&opened, 0o644).unwrap();
+        assert!(!std::fs::metadata(&file).unwrap().permissions().readonly());
+        drop(opened);
+        for flags in ["r", "r+", "a"] {
+            let opened = open_options_for(flags).open(&dir).unwrap();
+            let failed = ops::fs_fchmod_sync(&opened, 0o666).unwrap_err();
+            assert_eq!(node_error_code(&failed), "EPERM", "{flags}: {failed:?}");
+            let opened = open_options_for(flags).open(r"\\.\NUL").unwrap();
+            let failed = ops::fs_fchmod_sync(&opened, 0o666).unwrap_err();
+            assert_eq!(node_error_code(&failed), "EINVAL", "{flags}: {failed:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

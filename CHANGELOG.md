@@ -20,6 +20,13 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **On Windows `fchmod` works through a descriptor opened for reading (#322).**
+  `fchmodSync(fd, 0o444)`, `fs.fchmod` and `FileHandle.chmod()` failed `EPERM: operation not
+  permitted, fchmod` when the descriptor was opened `"r"`: oam set the read-only attribute
+  on the descriptor's own handle, which has no right to. It now reopens the handle for that
+  one right, as libuv does, so what the descriptor was opened for does not matter. What
+  cannot be reopened fails with node's code: the NUL device `EINVAL` (it was `EISDIR`) and a
+  piped stdin or stdout `EBUSY` (it succeeded). Conformance case 395.
 - **On Windows a truncating open of a named pipe returns a descriptor (#320).**
   `openSync(pipe, "w")`, `"w+"`, `writeFile` and a write stream over a pipe failed
   `EINVAL: invalid argument, open` -- after connecting to the pipe's server, twice. oam
