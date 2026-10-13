@@ -12221,6 +12221,20 @@
         validateCb(cb);
         options = writeFileOptions(options, append);
         const bytes = writeFileData(data, options, false);
+        if (!isInt32(path) && bytes.byteLength === 0) {
+          // Nothing to write is still one write: node's writeAll issues it
+          // before it looks at what is left, so the descriptor answers --
+          // appendFile(dir, "", cb) fails EISDIR on the write where the sync
+          // and promise forms, which skip an empty write, succeed (v22.22.2,
+          // measured). The flag is node's
+          // `options.flag || 'w'`: an options object is taken as given, so
+          // one without a flag has none.
+          fs.open(path, options.flag || (append ? "a" : "w"), options.mode, (openErr, fd) => {
+            if (openErr) return cb(openErr);
+            fs.write(fd, bytes, 0, 0, null, (err) => fs.close(fd, (closeErr) => cb(err || closeErr || null)));
+          });
+          return;
+        }
         if (!isInt32(path)) {
           // The path's own checks throw here, at the call, as node's fs.open
           // does; the write's outcome reaches the callback, with no value.
@@ -12241,11 +12255,13 @@
         // fs.write's descriptor check, which node reaches synchronously.
         validateFd(path, false);
         let off = 0;
+        // At least one write, as above: an empty one on a descriptor not open
+        // for writing is EBADF in node, not a silent success.
         const next = () => {
-          if (off >= bytes.byteLength) return cb(null);
           fs.write(path, bytes, off, bytes.byteLength - off, null, (err, n) => {
             if (err) return cb(err);
             off += n;
+            if (off >= bytes.byteLength) return cb(null);
             next();
           });
         };

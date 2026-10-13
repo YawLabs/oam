@@ -3714,16 +3714,35 @@ way; the difference is that a symlink needs the create-symlink privilege (Develo
 an elevated process), which a junction does not, so where that privilege is missing oam's
 call fails `EPERM` and node's succeeds. Measured against v22.22.2 (conformance case 377).
 
-### Windows `fs.open` of a directory fails
+### Windows directory descriptors: the corners left
 
-node opens a directory on Windows (libuv passes `FILE_FLAG_BACKUP_SEMANTICS`), so
-`openSync("dir", "r")`, `"a"` and `"r+"` return a descriptor, and `appendFileSync("dir", "")`
-succeeds. oam opens without that flag, so each of those fails `EPERM` (`appendFileSync`
-`EISDIR` `write`). Everything that fails in node fails the same way in oam: `readFileSync`
-of a directory or of a drive or share root (`C:\`, `\`, `/`, `\\srv\sh`) fails `EISDIR`
-`read`, `openSync("dir", "w")` fails `EISDIR`, and a write open of a root fails `EPERM`
-naming the root (`'C:\'`, `'\\srv\sh\'`). Measured against v22.22.2 (conformance case 377);
-not fixed yet: it needs directory descriptors.
+A directory opens on Windows as it does in node (`FILE_FLAG_BACKUP_SEMANTICS`), and its
+descriptor answers as node's does: conformance case 392, measured against v22.22.2. These
+corners are left.
+
+- Callback `fs.readFile(fd, cb)` on a directory descriptor fails `EISDIR` `read` (`EBADF`
+  on one opened `"a"`), as `readFileSync(fd)` and `FileHandle.readFile()` do in both
+  runtimes. node's callback form drops the failed read of a descriptor it was handed and
+  calls back with an empty Buffer.
+- `fs.openAsBlob("dir")` rejects `ERR_INVALID_ARG_VALUE`; node resolves a Blob of size 0.
+- `readFile`'s `flag` option does not reach the open, which is always read-only. On a file
+  that seldom shows; on a directory node's answer follows the flag (`"a"` is `EBADF`
+  `read`, `"w"` `EISDIR` `open`) and oam's is always `EISDIR` `read`.
+- A write stream opens `"a"` or `"w"` and a read stream `"r"`, whatever `flags` says, so
+  `createWriteStream("dir", { flags: "r+" })` fails `EISDIR` `open` where node emits
+  `'open'` and then fails the write.
+- `FileHandle.readLines()` over a directory handle throws the `EISDIR` out of the stream
+  instead of rejecting the iteration, as it already did for any handle whose read fails (a
+  file opened `"a"`).
+- Numeric flags open as the nearest flag string (see "Open flags the natives cannot
+  spell"), so on a directory one that maps to `"w"` -- `O_WRONLY` without `O_APPEND`, or
+  with `O_CREAT` -- fails `EISDIR` where node returns a descriptor. `O_TRUNC` without
+  `O_CREAT` is `EINVAL` in node; in oam it opens the directory (alone, or with `O_RDWR`)
+  or fails `EISDIR` (with `O_WRONLY`).
+- A truncating open through a junction or directory symlink whose target is gone fails
+  `EPERM`; node's fails `ENOENT`. Neither creates anything.
+- An exclusive open (`wx`, `wx+`, `ax`, `ax+`) through such a link fails `EEXIST` and
+  creates nothing; node's creates the target as a directory and returns its descriptor.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 

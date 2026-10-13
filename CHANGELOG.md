@@ -14,6 +14,34 @@ gap between headings below is expected rather than a missing entry. Not every ta
 is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
 one, so `install.sh`, which resolves the latest Release, never handed them out.
 
+## [Unreleased]
+
+### Fixed
+
+- **On Windows a directory opens, as node's does (#284).** oam opened through std without
+  `FILE_FLAG_BACKUP_SEMANTICS`, which libuv asks for on every path and without which
+  Windows opens no directory at all, so every open node allows failed `EPERM`. Now
+  `openSync(dir, "r")`, `"r+"`, `"a"` and `"a+"` (and `fs.open`, `fs.promises.open`)
+  return a descriptor: `fstat` of it is a directory, a read or write on it fails `EISDIR:
+  illegal operation on a directory, read` / `..., write` with no path (`EBADF` on a
+  descriptor not opened for that direction), `fchmod` is `EPERM`, and the directory can be
+  renamed or removed under it. It follows that `appendFileSync(dir, "")` and
+  `fs.promises.appendFile(dir, "")` succeed instead of failing `EISDIR` `write`,
+  `truncateSync(dir)` fails `EINVAL` `ftruncate` instead of `EPERM` `open`,
+  `openSync(dir, "ax")` is `EEXIST` instead of `EPERM`, `createReadStream(dir)` and
+  `createWriteStream(dir, { flags: "a" })` emit `'open'` before their `EISDIR`, and a drive
+  or share root (`C:\`, `\\srv\sh`) opens for reading. What failed in node still fails the same way:
+  `openSync(dir, "w")` `EISDIR`, `readFileSync(dir)` `EISDIR` `read`, a write open of a
+  root `EPERM`. Conformance case 392.
+- **Callback `fs.writeFile` and `fs.appendFile` issue their write even for no data.** node's
+  callback forms write once before looking at what is left, so the descriptor answers:
+  `fs.writeFile(fdOpenedForRead, "", cb)` and `fs.writeFile(path, "", { flag: "r" }, cb)`
+  are `EBADF` `write`, where oam called back with no error, and
+  `fs.appendFile(dir, "", cb)` on Windows stays `EISDIR` `write` now that the directory
+  opens. The sync and promise forms skip an empty write in both runtimes.
+- **On Windows `stat` reports a directory's size as 0.** `statSync("C:\\").size` was the
+  root's index allocation (12288 on NTFS); libuv reports 0 for every directory.
+
 ## [0.19.0] - 2026-10-11
 
 ### Fixed
