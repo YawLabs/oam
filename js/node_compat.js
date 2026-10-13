@@ -4991,56 +4991,58 @@
   registry.factories["path/posix"] = () => registry.get("path").posix;
   registry.factories["path/win32"] = () => registry.get("path").win32;
 
-  // Node's fs.constants O_* are the platform's fcntl/CRT values: O_CREAT/O_EXCL/
-  // O_TRUNC/O_APPEND differ between Linux, Windows (MSVCRT), and macOS (BSD).
-  // (O_RDONLY/O_WRONLY/O_RDWR are 0/1/2 everywhere.) openFlagString() must use
-  // the same per-platform values, so this is the single source for both.
-  function platformOFlags(platform) {
-    if (platform === "win32") return { O_CREAT: 256, O_EXCL: 1024, O_TRUNC: 512, O_APPEND: 8 };
-    if (platform === "darwin") return { O_CREAT: 512, O_EXCL: 2048, O_TRUNC: 1024, O_APPEND: 8 };
-    // O_NOATIME is Linux-only and must be ABSENT elsewhere -- Node's test
-    // asserts both directions, and code feature-detects with `in`.
-    return { O_CREAT: 64, O_EXCL: 128, O_TRUNC: 512, O_APPEND: 1024, O_NOATIME: 0x40000 };
+  // Node's fs.constants O_* are the platform's own values -- open(2)'s on
+  // unix, the CRT's and libuv's on Windows -- and which names exist differs
+  // too (no O_SYNC on Windows, O_NOATIME only on Linux). A numeric `flags` is
+  // handed to the open as it is, so the table has to be the real one: it
+  // comes from the native side (oam_core::open_flag_table), which reads the
+  // values off the platform it was built for.
+  let _openFlagBits;
+  function openFlagBits(natives) {
+    if (_openFlagBits === undefined) {
+      _openFlagBits = { __proto__: null };
+      for (const [name, value] of natives.fsOpenFlagBits()) _openFlagBits[name] = value;
+    }
+    return _openFlagBits;
   }
 
-  // Map numeric O_* open flags to the fopen-style string natives.fsOpen /
-  // fsOpenSync take. Most callers pass a string ("r"/"w"/...); chokidar and
-  // lockfile code pass numbers. O_CREAT|O_EXCL is "x" (fail if it exists)
-  // and O_CREAT|O_TRUNC a truncating "w"; a combination no fopen string
-  // spells (O_WRONLY alone, O_WRONLY|O_CREAT) opens as the nearest one.
-  function openFlagString(n, platform) {
-    const { O_APPEND, O_CREAT, O_EXCL } = platformOFlags(platform);
-    const acc = n & 3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
-    const plus = acc === 2 ? "+" : "";
-    const exclusive = (n & O_CREAT) !== 0 && (n & O_EXCL) !== 0;
-    if (acc === 0) return "r";
-    if ((n & O_APPEND) !== 0) return (exclusive ? "ax" : "a") + plus;
-    if (exclusive) return "wx" + plus;
-    return acc === 2 && (n & O_CREAT) === 0 ? "r+" : "w" + plus;
-  }
-
-  // node's stringToFlags (lib/internal/fs/utils.js, v22.22.2), as the
-  // fopen-style strings the natives take: an int32 is O_* bits, null /
-  // undefined is "r", and a string must be one of node's spellings -- the
-  // synchronous ("s") ones open as their plain twins, without O_SYNC -- or it
-  // is ERR_INVALID_ARG_VALUE "flags". Shared by every open: fs.open,
-  // fs.openSync, fs/promises.open and the writeFile family's `flag`.
-  const OPEN_FLAG_STRINGS = {
-    __proto__: null,
-    r: "r", rs: "r", sr: "r", "r+": "r+", "rs+": "r+", "sr+": "r+",
-    w: "w", wx: "wx", xw: "wx", "w+": "w+", "wx+": "wx+", "xw+": "wx+",
-    a: "a", ax: "ax", xa: "ax", as: "a", sa: "a",
-    "a+": "a+", "ax+": "ax+", "xa+": "ax+", "as+": "a+", "sa+": "a+",
-  };
-  function openFlags(flags, platform) {
+  // node's stringToFlags (lib/internal/fs/utils.js, v22.22.2): the O_* bits
+  // an open is made with. An int32 IS the bits; null / undefined is "r"; and
+  // a string must be one of node's spellings, or it is ERR_INVALID_ARG_VALUE
+  // "flags". The synchronous spellings add O_SYNC where the platform has it
+  // (node's own table ORs in an undefined on Windows, which is nothing).
+  // Shared by every open: fs.open, fs.openSync, fs/promises.open, the
+  // writeFile family's `flag` and the file streams.
+  //
+  // The natives used to take a flag STRING, and a number was turned into
+  // the nearest one. No string spells "write, do not truncate": O_WRONLY,
+  // O_WRONLY | O_CREAT and O_RDWR | O_CREAT opened as "w" / "w+" and emptied
+  // the file (#328).
+  function openFlags(flags, natives) {
     if (typeof flags === "number") {
       validateInt32(flags, "flags");
-      return openFlagString(flags, platform);
+      return flags;
     }
-    if (flags == null) return "r";
-    const fopen = typeof flags === "string" ? OPEN_FLAG_STRINGS[flags] : undefined;
-    if (fopen === undefined) throw codes.ERR_INVALID_ARG_VALUE("flags", flags);
-    return fopen;
+    const { O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY } = openFlagBits(natives);
+    const O_SYNC = openFlagBits(natives).O_SYNC ?? 0;
+    if (flags == null) return O_RDONLY;
+    switch (flags) {
+      case "r": return O_RDONLY;
+      case "rs": case "sr": return O_RDONLY | O_SYNC;
+      case "r+": return O_RDWR;
+      case "rs+": case "sr+": return O_RDWR | O_SYNC;
+      case "w": return O_TRUNC | O_CREAT | O_WRONLY;
+      case "wx": case "xw": return O_TRUNC | O_CREAT | O_WRONLY | O_EXCL;
+      case "w+": return O_TRUNC | O_CREAT | O_RDWR;
+      case "wx+": case "xw+": return O_TRUNC | O_CREAT | O_RDWR | O_EXCL;
+      case "a": return O_APPEND | O_CREAT | O_WRONLY;
+      case "ax": case "xa": return O_APPEND | O_CREAT | O_WRONLY | O_EXCL;
+      case "as": case "sa": return O_APPEND | O_CREAT | O_WRONLY | O_SYNC;
+      case "a+": return O_APPEND | O_CREAT | O_RDWR;
+      case "ax+": case "xa+": return O_APPEND | O_CREAT | O_RDWR | O_EXCL;
+      case "as+": case "sa+": return O_APPEND | O_CREAT | O_RDWR | O_SYNC;
+    }
+    throw codes.ERR_INVALID_ARG_VALUE("flags", flags);
   }
 
   // libuv error strings, keyed by code. This list is the AUTHORITY on which
@@ -11107,7 +11109,7 @@
     function constructStream(stream, callback) {
       if (stream[kSupplied]) { callback(); return; }
       const opening = new Promise((resolve) => {
-        resolve(natives.fsOpen(toPath(stream.path), openFlags(stream.flags, process.platform)));
+        resolve(natives.fsOpen(toPath(stream.path), openFlags(stream.flags, natives)));
       });
       settled(
         opening,
@@ -11614,10 +11616,10 @@
       data = writeFileData(data, options, true);
       if (fileHandles.has(path)) return path.writeFile(data, options);
       const file = toPath(path);
-      const flag = openFlags(options.flag || (append ? "a" : "w"), natives.platform);
+      const flag = openFlags(options.flag || (append ? "a" : "w"), natives);
       parseFileMode(options.mode, "mode", 0o666);
-      if (!isCustomIterable(data) && (flag === "w" || flag === "a")) {
-        return natives.fsWriteFile(file, data, flag === "a");
+      if (!isCustomIterable(data) && (flag === openFlags("w", natives) || flag === openFlags("a", natives))) {
+        return natives.fsWriteFile(file, data, flag === openFlags("a", natives));
       }
       return (async () => {
         const { handle } = await natives.fsOpen(file, flag);
@@ -11719,7 +11721,7 @@
       // file is ENOENT `open` before the length is looked at, and a bad
       // length leaves the file alone.
       truncate: withPath(async (file, len = 0) => {
-        const { handle } = await natives.fsOpen(file, "r+");
+        const { handle } = await natives.fsOpen(file, openFlags("r+", natives));
         try {
           validateInteger(len, "len");
           await natives.fsFtruncate(handle, Math.max(0, len));
@@ -11753,7 +11755,7 @@
       cp: (src, dest, options) => cpRecursive(toPath(src, "src"), toPath(dest, "dest"), options),
       // node's order: the path, the flags, the mode.
       open: withPath(async function (file, flags, mode) {
-        flags = openFlags(flags, natives.platform);
+        flags = openFlags(flags, natives);
         parseFileMode(mode, "mode", 0o666);
         var info = await natives.fsOpen(file, flags);
 
@@ -12115,9 +12117,7 @@
       }),
       constants: {
         F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
-        O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
-        ...platformOFlags(natives.platform), O_SYNC: 1052672,
-        O_DIRECTORY: 65536, O_NOFOLLOW: 131072,
+        ...openFlagBits(natives),
         S_IFMT: 61440, S_IFREG: 32768, S_IFDIR: 16384, S_IFLNK: 40960,
         S_IFBLK: 24576, S_IFCHR: 8192, S_IFIFO: 4096, S_IFSOCK: 49152,
         S_IRUSR: 256, S_IWUSR: 128, S_IXUSR: 64,
@@ -12323,10 +12323,12 @@
         return void writeFdSync(path, data, options);
       }
       const file = toPath(path);
-      const flag = openFlags(options.flag || (append ? "a" : "w"), natives.platform);
+      const flag = openFlags(options.flag || (append ? "a" : "w"), natives);
       parseFileMode(options.mode, "mode", 0o666);
       const bytes = encodeWrite(data, options);
-      if (flag === "w" || flag === "a") return void natives.fsWriteFileSync(file, bytes, flag === "a");
+      if (flag === openFlags("w", natives) || flag === openFlags("a", natives)) {
+        return void natives.fsWriteFileSync(file, bytes, flag === openFlags("a", natives));
+      }
       // Any other flag: open with it, write it all, close -- node's own
       // writeFileSync, which writes nothing (and so fails nothing) when the
       // data is empty.
@@ -12682,9 +12684,7 @@
       promises: registry.get("fs/promises"),
       constants: {
         F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
-        O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
-        ...platformOFlags(natives.platform), O_SYNC: 1052672,
-        O_DIRECTORY: 65536, O_NOFOLLOW: 131072,
+        ...openFlagBits(natives),
         S_IFMT: 61440, S_IFREG: 32768, S_IFDIR: 16384, S_IFLNK: 40960,
         S_IFBLK: 24576, S_IFCHR: 8192, S_IFIFO: 4096, S_IFSOCK: 49152,
         S_IRUSR: 256, S_IWUSR: 128, S_IXUSR: 64,
@@ -12840,7 +12840,7 @@
       // node's order: the path, the flags, the mode.
       openSync: (path, flags, mode) => {
         const file = toPath(path);
-        flags = openFlags(flags, natives.platform);
+        flags = openFlags(flags, natives);
         parseFileMode(mode, "mode", 0o666);
         return natives.fsOpenSync(file, flags);
       },
@@ -13028,7 +13028,7 @@
         } else {
           parseFileMode(mode, "mode", 0o666);
         }
-        var flagStr = openFlags(flags, natives.platform);
+        var flagStr = openFlags(flags, natives);
         validateCb(cb);
         var token = fsReqStart();
         var p;

@@ -3556,13 +3556,6 @@ refused, and a name the binding does not know (`'bogus'`) writes UTF-8 -- so
 `ERR_UNKNOWN_ENCODING`.
 What still differs:
 
-- **Open flags the natives cannot spell.** oam opens through fopen-style flag
-  strings, so the synchronous spellings (`'rs+'`, `'as'`, ...) open without `O_SYNC`,
-  and a numeric combination no fopen string expresses -- `O_WRONLY` without
-  `O_CREAT`, or `O_WRONLY | O_CREAT` without `O_TRUNC` -- opens as the nearest one
-  (`'w'`, which creates and truncates; on Windows it replaces the file as any `'w'` does,
-  so its alternate data streams go and a hidden or system file is refused `EPERM`). Numeric flags with both access bits set
-  (`-1`) are `EINVAL` in node and open read-only in oam.
 - **A `FileHandle` is not an `EventEmitter`, and a stream over one is not tied to it
   (#343).** node's handle emits `'close'`, and a stream made from it
   (`handle.createReadStream()`, `createWriteStream()`, `readLines()`, `{ fd: handle }`)
@@ -3725,16 +3718,9 @@ corners are left.
 - `readFile`'s `flag` option does not reach the open, which is always read-only. On a file
   that seldom shows; on a directory node's answer follows the flag (`"a"` is `EBADF`
   `read`, `"w"` `EISDIR` `open`) and oam's is always `EISDIR` `read`.
-- Numeric flags open as the nearest flag string (see "Open flags the natives cannot
-  spell"), so on a directory one that maps to `"w"` -- `O_WRONLY` without `O_APPEND`, or
-  with `O_CREAT` -- fails `EISDIR` where node returns a descriptor. `O_TRUNC` without
-  `O_CREAT` is `EINVAL` in node; in oam it opens the directory (alone, or with `O_RDWR`)
-  or fails `EISDIR` (with `O_WRONLY`).
 - `fstatSync` of a console opened by name to write (`openSync("\\\\.\\CON", "w")`,
   `"\\\\.\\CONOUT$"` opened `"w"` or `"a"`) answers with the console's shape; node's
   fails `EISDIR` `fstat`. The open itself matches (conformance case 394).
-- An exclusive open (`wx`, `wx+`, `ax`, `ax+`) through a junction or directory symlink
-  whose target is gone fails `EEXIST` and creates nothing; node's creates the target as a directory and returns its descriptor.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 

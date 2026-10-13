@@ -2276,9 +2276,9 @@ const UV_ERROR_MESSAGES: &[(&str, &str)] = &[
 /// Which filesystem operation failed, for `fs_error_at`: the few places where
 /// node's answer for an OS error depends on the operation, not just the code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FsSite<'a> {
-    /// `fs.open` with these flags (`r`, `w+`, `wx`, ...).
-    Open(&'a str),
+pub enum FsSite {
+    /// `fs.open` with these flags.
+    Open(OpenFlags),
     /// `fs.readFile`: open, then read everything.
     ReadFile,
     /// `fs.writeFile`: open with `w`, then write.
@@ -2317,7 +2317,7 @@ pub struct FsError {
 /// table alone gives node's code for the wrong operation:
 ///
 /// - A truncating open (`w`, `w+`, `writeFile`) of a DIRECTORY fails
-///   ERROR_FILE_EXISTS -- CREATE_ALWAYS (`create_always`) collides with the
+///   ERROR_FILE_EXISTS -- CREATE_ALWAYS (`OpenFlags::open`) collides with the
 ///   name before the directory's ACL or sharing is asked -- which the table
 ///   reads as `EEXIST` and fs__open turns into `EISDIR` for any open that
 ///   creates and is not exclusive. A root is refused ERROR_ACCESS_DENIED,
@@ -2335,7 +2335,7 @@ pub struct FsError {
 /// ERROR_FILE_EXISTS, the table's `EEXIST`; and an open of a root for writing
 /// is refused ERROR_ACCESS_DENIED, the table's `EPERM`, as node's is.
 pub fn fs_error_at(
-    site: FsSite<'_>,
+    site: FsSite,
     syscall: &'static str,
     path: &str,
     error: &std::io::Error,
@@ -2369,7 +2369,7 @@ pub fn fs_error_at(
         }
         let truncates = match site {
             FsSite::WriteFile => true,
-            FsSite::Open(flags) => flags.contains('w') && !flags.contains('x'),
+            FsSite::Open(flags) => flags.creates_or_opens(),
             _ => false,
         };
         if truncates && raw == Some(ERROR_FILE_EXISTS) {
@@ -2425,11 +2425,12 @@ impl WholeFileError {
 /// a descriptor for one (`openSync(dir, "r")`, `"r+"`, `"a"`), `fstat` of it
 /// is a directory, and a read or write on it is what fails:
 /// ERROR_INVALID_FUNCTION, the table's `EISDIR`. The flag changes nothing for
-/// a regular file. Every open behind a node descriptor or a whole-file
-/// operation goes through here, but one: a TRUNCATING open (`w`, `w+`,
-/// `writeFile`), which on Windows is not std's open at all
-/// (`create_always`, which asks for the flag itself). Elsewhere the flag
-/// does not exist and this is a no-op.
+/// a regular file.
+///
+/// node's opens are `OpenFlags::open`, which asks for the flag itself. This
+/// is for the opens still made through std: `readFile`'s, and the second look
+/// a failed listing takes (`ops::readdir_to_json`). Elsewhere the flag does
+/// not exist and this is a no-op.
 pub fn opens_as_libuv(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
     #[cfg(windows)]
     {
@@ -2485,103 +2486,270 @@ fn refuse_a_root_that_is_no_disk(path: &std::path::Path) -> std::io::Result<()> 
     Ok(())
 }
 
-/// node's TRUNCATING open (`w`, `w+`, `writeFile`) as libuv's fs__open
-/// makes it (src/win/fs.c, v1.51.0): one CreateFileW with CREATE_ALWAYS,
-/// FILE_ATTRIBUTE_NORMAL and FILE_FLAG_BACKUP_SEMANTICS, sharing everything.
-///
-/// std has no way to ask for CREATE_ALWAYS. Its `create(true).truncate(true)`
-/// is OPEN_ALWAYS and then a truncation of the handle it got, which is a
-/// different operation wherever the two disagree, and node's answers are
-/// CREATE_ALWAYS's (v22.22.2, measured; conformance case 394):
-///
-/// - a named pipe opens, and so does `\\.\CON`: there is nothing to
-///   truncate, and std's truncation failed ERROR_INVALID_PARAMETER --
-///   `EINVAL` from an open that had already connected to the pipe's server
-///   (#320);
-/// - a hidden or system file is refused, ERROR_ACCESS_DENIED: CREATE_ALWAYS
-///   must be given the attributes the file has. std emptied it (#321);
-/// - the file is REPLACED: its alternate data streams go and its attributes
-///   are reset to the archive bit, where std kept both;
-/// - a directory is a name collision, ERROR_FILE_EXISTS, which `fs_error_at`
-///   reads as libuv does -- `EISDIR` -- and nothing is created through a link
-///   whose target is gone.
-///
-/// `read` is `w+`. The path is the OS path as node hands it to libuv
-/// (`FsPath::os`), passed as it is.
-///
-/// One argument is not libuv's yet: the open's `mode`. libuv adds
-/// FILE_ATTRIBUTE_READONLY for a mode without the owner's write bit, so node's
-/// `openSync(p, "w", 0o444)` leaves a read-only file; no creating open here is
-/// handed the mode (#324).
+/// The platform's value for each open flag node knows. node's
+/// `fs.constants.O_*` are these numbers -- open(2)'s on unix, the CRT's and
+/// libuv's on Windows -- and a numeric `flags` is handed to the open as it is,
+/// so they have to be the real ones: `open_flag_table` is where JS gets them.
+#[cfg(unix)]
+mod o_flag {
+    use rustix::fs::OFlags;
+    pub const RDONLY: i32 = OFlags::RDONLY.bits() as i32;
+    pub const WRONLY: i32 = OFlags::WRONLY.bits() as i32;
+    pub const RDWR: i32 = OFlags::RDWR.bits() as i32;
+    pub const CREAT: i32 = OFlags::CREATE.bits() as i32;
+    pub const EXCL: i32 = OFlags::EXCL.bits() as i32;
+    pub const NOCTTY: i32 = OFlags::NOCTTY.bits() as i32;
+    pub const TRUNC: i32 = OFlags::TRUNC.bits() as i32;
+    pub const APPEND: i32 = OFlags::APPEND.bits() as i32;
+    pub const DIRECTORY: i32 = OFlags::DIRECTORY.bits() as i32;
+    pub const NOFOLLOW: i32 = OFlags::NOFOLLOW.bits() as i32;
+    pub const SYNC: i32 = OFlags::SYNC.bits() as i32;
+    pub const DSYNC: i32 = OFlags::DSYNC.bits() as i32;
+    pub const NONBLOCK: i32 = OFlags::NONBLOCK.bits() as i32;
+    #[cfg(target_os = "linux")]
+    pub const NOATIME: i32 = OFlags::NOATIME.bits() as i32;
+    #[cfg(target_os = "linux")]
+    pub const DIRECT: i32 = OFlags::DIRECT.bits() as i32;
+}
+/// libuv's values (include/uv/win.h): the CRT's `_O_*` where it has one, and
+/// libuv's own high bits for what the CRT has no flag for.
 #[cfg(windows)]
-fn create_always(path: &std::path::Path, read: bool) -> std::io::Result<std::fs::File> {
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::FromRawHandle;
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
-    };
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    // CreateFileW reads a name up to its first NUL, and would open the file
-    // named by what comes before one; std refuses such a path the same way.
-    if wide.contains(&0) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "file name contained an unexpected NUL byte",
-        ));
-    }
-    wide.push(0);
-    let access = if read {
-        FILE_GENERIC_READ | FILE_GENERIC_WRITE
-    } else {
-        FILE_GENERIC_WRITE
-    };
-    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the call;
-    // the security attributes and the template handle are null, which
-    // CreateFileW documents as optional, and every other argument is a
-    // constant.
-    let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null(),
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `handle` is the open handle CreateFileW just returned (it is
-    // not INVALID_HANDLE_VALUE), nothing else has seen it, and the File takes
-    // the one ownership of it. It was not opened FILE_FLAG_OVERLAPPED, which
-    // is what File's synchronous reads and writes need.
-    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+mod o_flag {
+    pub const RDONLY: i32 = 0x0000;
+    pub const WRONLY: i32 = 0x0001;
+    pub const RDWR: i32 = 0x0002;
+    pub const APPEND: i32 = 0x0008;
+    pub const RANDOM: i32 = 0x0010;
+    pub const SEQUENTIAL: i32 = 0x0020;
+    pub const TEMPORARY: i32 = 0x0040;
+    pub const CREAT: i32 = 0x0100;
+    pub const TRUNC: i32 = 0x0200;
+    pub const EXCL: i32 = 0x0400;
+    pub const SHORT_LIVED: i32 = 0x1000;
+    pub const DIRECT: i32 = 0x0200_0000;
+    pub const DSYNC: i32 = 0x0400_0000;
+    pub const SYNC: i32 = 0x0800_0000;
+    pub const EXLOCK: i32 = 0x1000_0000;
+    pub const FILEMAP: i32 = 0x2000_0000;
 }
 
-/// How node opens a path for one fopen-style flag: `open_options_for`'s
-/// answer. Everything but a truncating open on Windows is std's OpenOptions
-/// (through `open_path`); that one is `create_always`.
-#[derive(Debug)]
-pub struct NodeOpen {
-    options: std::fs::OpenOptions,
-    /// A truncating open, and whether it also reads (`w+`).
+/// `fs.constants`' open flags on this platform: the names node has here, in
+/// node's order, with the platform's values (v22.22.2; Windows and Linux
+/// measured, macOS from node's source).
+pub fn open_flag_table() -> Vec<(&'static str, i32)> {
+    let mut table = vec![
+        ("O_RDONLY", o_flag::RDONLY),
+        ("O_WRONLY", o_flag::WRONLY),
+        ("O_RDWR", o_flag::RDWR),
+        ("O_CREAT", o_flag::CREAT),
+        ("O_EXCL", o_flag::EXCL),
+    ];
     #[cfg(windows)]
-    truncating: Option<bool>,
+    table.extend([
+        ("UV_FS_O_FILEMAP", o_flag::FILEMAP),
+        ("O_TRUNC", o_flag::TRUNC),
+        ("O_APPEND", o_flag::APPEND),
+    ]);
+    #[cfg(unix)]
+    {
+        table.extend([
+            ("UV_FS_O_FILEMAP", 0),
+            ("O_NOCTTY", o_flag::NOCTTY),
+            ("O_TRUNC", o_flag::TRUNC),
+            ("O_APPEND", o_flag::APPEND),
+            ("O_DIRECTORY", o_flag::DIRECTORY),
+        ]);
+        #[cfg(target_os = "linux")]
+        table.push(("O_NOATIME", o_flag::NOATIME));
+        table.extend([
+            ("O_NOFOLLOW", o_flag::NOFOLLOW),
+            ("O_SYNC", o_flag::SYNC),
+            ("O_DSYNC", o_flag::DSYNC),
+        ]);
+        #[cfg(target_os = "linux")]
+        table.push(("O_DIRECT", o_flag::DIRECT));
+        #[cfg(target_os = "macos")]
+        table.push(("O_SYMLINK", rustix::fs::OFlags::SYMLINK.bits() as i32));
+        table.push(("O_NONBLOCK", o_flag::NONBLOCK));
+    }
+    table
 }
 
-impl NodeOpen {
-    pub fn open(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
-        #[cfg(windows)]
-        if let Some(read) = self.truncating {
-            refuse_a_root_that_is_no_disk(path.as_ref())?;
-            return create_always(path.as_ref(), read);
+/// The flags of one open: the platform's O_* bits, as node hands them to
+/// libuv. A flag STRING is only node's shorthand for some of them
+/// (`stringToFlags`; `open_options_for` here), and a number is the bits
+/// themselves -- so the open is made from the bits, whichever it was given.
+///
+/// The natives used to take the string, and a number was turned into the
+/// nearest one. No string spells "write, do not truncate, do not append", so
+/// `O_WRONLY`, `O_WRONLY | O_CREAT` and `O_RDWR | O_CREAT` opened as `"w"` /
+/// `"w+"` and emptied the file (#328).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenFlags(pub i32);
+
+impl OpenFlags {
+    /// Whether the open can change anything -- the file's content, or
+    /// whether it exists -- and so needs the write grant.
+    pub fn writes(self) -> bool {
+        self.0 & (o_flag::WRONLY | o_flag::RDWR | o_flag::CREAT | o_flag::TRUNC | o_flag::APPEND)
+            != 0
+    }
+
+    /// Creates a file that is missing and accepts one that is there: the
+    /// opens libuv reports a name collision for as `EISDIR` (`fs_error_at`).
+    pub fn creates_or_opens(self) -> bool {
+        self.0 & o_flag::CREAT != 0 && self.0 & o_flag::EXCL == 0
+    }
+
+    /// open(2) with exactly these bits (and libuv's O_CLOEXEC), which is the
+    /// whole of what node's open is on unix.
+    #[cfg(unix)]
+    pub fn open(self, path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
+        use rustix::fs::{Mode, OFlags};
+        let flags = OFlags::from_bits_retain(self.0 as _) | OFlags::CLOEXEC;
+        let fd = rustix::fs::open(path.as_ref(), flags, Mode::from_raw_mode(0o666))
+            .map_err(io_from_errno)?;
+        Ok(std::fs::File::from(fd))
+    }
+
+    /// libuv's fs__open (src/win/fs.c, v1.51.0): ONE CreateFileW whose
+    /// access, creation disposition and attributes are worked out from the
+    /// bits the way libuv works them out. std's OpenOptions cannot make the
+    /// call -- it has no creation disposition to set, and its truncating open
+    /// is an open and then a truncation -- and node's answers are this
+    /// call's (v22.22.2, measured; conformance cases 394 and 398):
+    ///
+    /// - `O_CREAT | O_TRUNC` is CREATE_ALWAYS, which REPLACES the file: a
+    ///   named pipe opens (#320), a hidden or system file is refused (#321),
+    ///   the file's streams go and its attributes are reset;
+    /// - `O_TRUNC` without `O_CREAT` is TRUNCATE_EXISTING, which CreateFileW
+    ///   refuses for an access mask without the GENERIC_WRITE bit itself:
+    ///   node's `EINVAL`;
+    /// - `O_APPEND` swaps FILE_WRITE_DATA for FILE_APPEND_DATA, whatever the
+    ///   access mode, so even `O_RDONLY | O_APPEND` writes at the end;
+    /// - FILE_FLAG_BACKUP_SEMANTICS on every open, without which Windows
+    ///   opens no directory;
+    /// - a combination libuv has no case for (both access bits; both of
+    ///   sequential and random) is `EINVAL` before any call.
+    ///
+    /// One argument is not libuv's yet: the open's `mode`. libuv adds
+    /// FILE_ATTRIBUTE_READONLY for a creating open whose mode lacks the
+    /// owner's write bit (#324).
+    #[cfg(windows)]
+    pub fn open(self, path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CREATE_ALWAYS, CREATE_NEW, CreateFileW, DELETE, FILE_APPEND_DATA,
+            FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_NO_BUFFERING, FILE_FLAG_RANDOM_ACCESS,
+            FILE_FLAG_SEQUENTIAL_SCAN, FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ,
+            FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_WRITE_DATA, OPEN_ALWAYS, OPEN_EXISTING, TRUNCATE_EXISTING,
+        };
+        let path = path.as_ref();
+        let invalid = || std::io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32);
+        refuse_a_root_that_is_no_disk(path)?;
+        let bits = self.0;
+        let has = |flag: i32| bits & flag != 0;
+
+        let mut access = match bits & (o_flag::WRONLY | o_flag::RDWR) {
+            o_flag::RDONLY => FILE_GENERIC_READ,
+            o_flag::WRONLY => FILE_GENERIC_WRITE,
+            o_flag::RDWR => FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            _ => return Err(invalid()),
+        };
+        if has(o_flag::APPEND) {
+            access &= !FILE_WRITE_DATA;
+            access |= FILE_APPEND_DATA;
         }
-        open_path(&self.options, path)
+        let share = if has(o_flag::EXLOCK) {
+            0
+        } else {
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        };
+        let disposition = match (has(o_flag::CREAT), has(o_flag::EXCL), has(o_flag::TRUNC)) {
+            (false, _, false) => OPEN_EXISTING,
+            (true, false, false) => OPEN_ALWAYS,
+            (true, true, _) => CREATE_NEW,
+            (false, _, true) => TRUNCATE_EXISTING,
+            (true, false, true) => CREATE_ALWAYS,
+        };
+        let mut attributes = FILE_ATTRIBUTE_NORMAL;
+        if has(o_flag::TEMPORARY) {
+            attributes |= FILE_FLAG_DELETE_ON_CLOSE | FILE_ATTRIBUTE_TEMPORARY;
+            access |= DELETE;
+        }
+        if has(o_flag::SHORT_LIVED) {
+            attributes |= FILE_ATTRIBUTE_TEMPORARY;
+        }
+        match (has(o_flag::SEQUENTIAL), has(o_flag::RANDOM)) {
+            (false, false) => {}
+            (true, false) => attributes |= FILE_FLAG_SEQUENTIAL_SCAN,
+            (false, true) => attributes |= FILE_FLAG_RANDOM_ACCESS,
+            (true, true) => return Err(invalid()),
+        }
+        if has(o_flag::DIRECT) {
+            // Unbuffered I/O and an append-only handle do not go together:
+            // libuv gives up the append where the handle can also write at
+            // an offset, and refuses the open where it cannot.
+            if access & FILE_APPEND_DATA != 0 {
+                if access & FILE_WRITE_DATA != 0 {
+                    access &= !FILE_APPEND_DATA;
+                } else {
+                    return Err(invalid());
+                }
+            }
+            attributes |= FILE_FLAG_NO_BUFFERING;
+        }
+        match (has(o_flag::DSYNC), has(o_flag::SYNC)) {
+            (false, false) => {}
+            (true, true) => return Err(invalid()),
+            _ => attributes |= FILE_FLAG_WRITE_THROUGH,
+        }
+        attributes |= FILE_FLAG_BACKUP_SEMANTICS;
+
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        // CreateFileW reads a name up to its first NUL, and would open the file
+        // named by what comes before one; std refuses such a path the same way.
+        if wide.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "file name contained an unexpected NUL byte",
+            ));
+        }
+        wide.push(0);
+        // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the call;
+        // the security attributes and the template handle are null, which
+        // CreateFileW documents as optional, and every other argument is a
+        // plain value.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                access,
+                share,
+                std::ptr::null(),
+                disposition,
+                attributes,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `handle` is the open handle CreateFileW just returned (it is
+        // not INVALID_HANDLE_VALUE), nothing else has seen it, and the File takes
+        // the one ownership of it. It was not opened FILE_FLAG_OVERLAPPED, which
+        // is what File's synchronous reads and writes need.
+        Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub fn open(self, path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        options.open(path)
     }
 }
 
@@ -2674,7 +2842,7 @@ fn write_opened(mut writer: impl std::io::Write, data: &[u8]) -> Result<(), Whol
 /// through `fs_error_at` as syscall `open` with the path; a read or write
 /// failure is the descriptor's, as libuv's fs__read / fs__write report it --
 /// `fd_error_code`, syscall `read` (readFile) or `write`, no path.
-pub fn whole_file_error(site: FsSite<'_>, path: &str, error: &WholeFileError) -> FsError {
+pub fn whole_file_error(site: FsSite, path: &str, error: &WholeFileError) -> FsError {
     match error {
         WholeFileError::Open(e) => fs_error_at(site, "open", path, e),
         WholeFileError::Transfer(e) => FsError {
@@ -3933,67 +4101,38 @@ mod fs_os_path_tests {
 ///
 /// Windows is what makes this show up: it returns ERROR_ACCESS_DENIED for a
 /// wrong-mode handle where POSIX returns EBADF directly.
-/// fopen-style flag string -> how node opens for it (`NodeOpen`). Mirrors Node's fs flag set; an
-/// unknown flag defaults to read-only (Node would throw, but lenient is
-/// safer for compat). `+`/`w`/`a`/`x` imply write.
+/// node's `stringToFlags` (lib/internal/fs/utils.js): the bits one of node's
+/// flag strings stands for. The JS layer makes the same translation before a
+/// flag reaches a native; this one serves the opens made on this side
+/// (`readFile`, `writeFile`, `appendFile`) and the tests. A string node does
+/// not know is read-only here; node itself refuses it, in JS.
 ///
-/// Lives here, not in the engine, because BOTH opens need it. The async
-/// `fs_open` used to carry its own three-arm r/w/a table, so a descriptor the
-/// sync family could open was rejected by the async one:
-/// `fs.promises.open(p, "r+")` failed with `fs_open: unknown mode 'r+'` --
-/// not even a node-shaped error -- and every read/write-mode flag was
-/// unreachable from `fs.promises.open` and callback `fs.open`.
-pub fn open_options_for(flags: &str) -> NodeOpen {
-    let mut oo = std::fs::OpenOptions::new();
-    match flags {
-        "r" => {
-            oo.read(true);
-        }
-        "r+" | "rs+" | "sr+" => {
-            oo.read(true).write(true);
-        }
-        "w" => {
-            oo.write(true).create(true).truncate(true);
-        }
-        "wx" | "xw" => {
-            oo.write(true).create_new(true);
-        }
-        "w+" => {
-            oo.read(true).write(true).create(true).truncate(true);
-        }
-        "wx+" | "xw+" => {
-            oo.read(true).write(true).create_new(true);
-        }
-        "a" => {
-            oo.append(true).create(true);
-        }
-        "ax" | "xa" => {
-            oo.append(true).create_new(true);
-        }
-        "a+" => {
-            oo.read(true).append(true).create(true);
-        }
-        "ax+" | "xa+" => {
-            oo.read(true).append(true).create_new(true);
-        }
-        _ => {
-            oo.read(true);
-        }
-    }
-    // Not the truncating opens, which on Windows are not std's at all: see
-    // `create_always`.
-    if !matches!(flags, "w" | "w+") {
-        opens_as_libuv(&mut oo);
-    }
-    NodeOpen {
-        options: oo,
-        #[cfg(windows)]
-        truncating: match flags {
-            "w" => Some(false),
-            "w+" => Some(true),
-            _ => None,
-        },
-    }
+/// The synchronous spellings (`rs`, `as+`, ...) add O_SYNC, where the platform
+/// has it: node's `fs.constants` has no O_SYNC on Windows, so there they are
+/// their plain twins.
+pub fn open_options_for(flags: &str) -> OpenFlags {
+    use o_flag::{APPEND, CREAT, EXCL, RDONLY, RDWR, TRUNC, WRONLY};
+    #[cfg(unix)]
+    const SYNC: i32 = o_flag::SYNC;
+    #[cfg(not(unix))]
+    const SYNC: i32 = 0;
+    OpenFlags(match flags {
+        "r" => RDONLY,
+        "rs" | "sr" => RDONLY | SYNC,
+        "r+" => RDWR,
+        "rs+" | "sr+" => RDWR | SYNC,
+        "w" => TRUNC | CREAT | WRONLY,
+        "wx" | "xw" => TRUNC | CREAT | WRONLY | EXCL,
+        "w+" => TRUNC | CREAT | RDWR,
+        "wx+" | "xw+" => TRUNC | CREAT | RDWR | EXCL,
+        "a" => APPEND | CREAT | WRONLY,
+        "ax" | "xa" => APPEND | CREAT | WRONLY | EXCL,
+        "as" | "sa" => APPEND | CREAT | WRONLY | SYNC,
+        "a+" => APPEND | CREAT | RDWR,
+        "ax+" | "xa+" => APPEND | CREAT | RDWR | EXCL,
+        "as+" | "sa+" => APPEND | CREAT | RDWR | SYNC,
+        _ => RDONLY,
+    })
 }
 
 /// `write_all`, except that an EMPTY buffer still issues one write syscall.
@@ -4756,7 +4895,7 @@ pub mod ops {
     /// A failed whole-file operation (see `whole_file_error`): the open half
     /// names the path, the read or write half does not.
     fn node_fail_whole_file(
-        site: super::FsSite<'_>,
+        site: super::FsSite,
         error: super::WholeFileError,
         path: &super::FsPath,
     ) -> OpOutcome {
@@ -4774,7 +4913,7 @@ pub mod ops {
     /// `node_fail` for an operation with call-site error rules (see
     /// `fs_error_at`).
     fn node_fail_at(
-        site: super::FsSite<'_>,
+        site: super::FsSite,
         error: std::io::Error,
         syscall: &'static str,
         path: &super::FsPath,
@@ -6627,9 +6766,9 @@ pub mod ops {
         files: super::FileRegistry,
         ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
         path: super::FsPath,
-        mode: String,
+        flags: super::OpenFlags,
     ) -> OpOutcome {
-        let options = super::open_options_for(&mode);
+        let options = flags;
         // The sync family's open on the blocking pool rather than tokio::fs,
         // so the descriptor lands in the ONE registry that family also reads.
         let owned = path.clone();
@@ -6648,7 +6787,7 @@ pub mod ops {
                     .insert(handle, std::sync::Arc::new(file));
                 OpOutcome::Json(serde_json::json!({ "handle": handle }).to_string())
             }
-            Err(e) => node_fail_at(super::FsSite::Open(&mode), e, "open", &path),
+            Err(e) => node_fail_at(super::FsSite::Open(flags), e, "open", &path),
         }
     }
 
@@ -7377,7 +7516,11 @@ mod os_error_code_tests {
         // EISDIR. Any open that is denied is the table's EPERM -- a hidden
         // file's, a root's, an ACL's.
         let denied = raw(ERROR_ACCESS_DENIED);
-        for site in [FsSite::Open("w"), FsSite::Open("w+"), FsSite::WriteFile] {
+        for site in [
+            FsSite::Open(open_options_for("w")),
+            FsSite::Open(open_options_for("w+")),
+            FsSite::WriteFile,
+        ] {
             assert_eq!(
                 fs_error_at(site, "open", dir_s, &raw(ERROR_FILE_EXISTS)),
                 expect("EISDIR", "open", true),
@@ -7394,10 +7537,10 @@ mod os_error_code_tests {
         for site in [
             FsSite::ReadFile,
             FsSite::AppendFile,
-            FsSite::Open("r"),
-            FsSite::Open("r+"),
-            FsSite::Open("a"),
-            FsSite::Open("wx"),
+            FsSite::Open(open_options_for("r")),
+            FsSite::Open(open_options_for("r+")),
+            FsSite::Open(open_options_for("a")),
+            FsSite::Open(open_options_for("wx")),
         ] {
             for path in [dir_s, file_s] {
                 assert_eq!(
@@ -7410,7 +7553,12 @@ mod os_error_code_tests {
         // An exclusive open of a directory is the table's EEXIST.
         for flags in ["wx", "wx+", "ax", "ax+"] {
             assert_eq!(
-                fs_error_at(FsSite::Open(flags), "open", dir_s, &raw(ERROR_FILE_EXISTS)),
+                fs_error_at(
+                    FsSite::Open(open_options_for(flags)),
+                    "open",
+                    dir_s,
+                    &raw(ERROR_FILE_EXISTS)
+                ),
                 expect("EEXIST", "open", true),
                 "{flags}"
             );
@@ -7433,12 +7581,22 @@ mod os_error_code_tests {
             expect("ENOENT", "mkdir", true)
         );
         assert_eq!(
-            fs_error_at(FsSite::Open("r"), "open", file_s, &raw(ERROR_DIRECTORY)),
+            fs_error_at(
+                FsSite::Open(open_options_for("r")),
+                "open",
+                file_s,
+                &raw(ERROR_DIRECTORY)
+            ),
             expect("ENOENT", "open", true)
         );
         // ...but only mkdir: every other operation keeps the table's answer.
         assert_eq!(
-            fs_error_at(FsSite::Open("r"), "open", "a*b", &raw(ERROR_INVALID_NAME)),
+            fs_error_at(
+                FsSite::Open(open_options_for("r")),
+                "open",
+                "a*b",
+                &raw(ERROR_INVALID_NAME)
+            ),
             expect("ENOENT", "open", true)
         );
         assert_eq!(
@@ -7500,7 +7658,12 @@ mod os_error_code_tests {
         ] {
             let failed = open_options_for(flags).open(dir_s).unwrap_err();
             assert_eq!(
-                fs_error_at(FsSite::Open(flags), "open", dir_s, &failed),
+                fs_error_at(
+                    FsSite::Open(open_options_for(flags)),
+                    "open",
+                    dir_s,
+                    &failed
+                ),
                 expect(code, "open", true),
                 "{flags}: {failed:?}"
             );
@@ -7660,7 +7823,13 @@ mod os_error_code_tests {
             for flags in ["w", "w+"] {
                 let failed = open_options_for(flags).open(file_s).unwrap_err();
                 assert_eq!(
-                    fs_error_at(FsSite::Open(flags), "open", file_s, &failed).code,
+                    fs_error_at(
+                        FsSite::Open(open_options_for(flags)),
+                        "open",
+                        file_s,
+                        &failed
+                    )
+                    .code,
                     "EPERM",
                     "{flags}: {failed:?}"
                 );
@@ -7825,7 +7994,7 @@ mod os_error_code_tests {
             for flags in ["w", "w+"] {
                 let failed = open_options_for(flags).open(root).unwrap_err();
                 assert_eq!(
-                    fs_error_at(FsSite::Open(flags), "open", root, &failed),
+                    fs_error_at(FsSite::Open(open_options_for(flags)), "open", root, &failed),
                     expect("EPERM", "open", true),
                     "{root} {flags}: {failed:?}"
                 );
@@ -7842,7 +8011,7 @@ mod os_error_code_tests {
             for flags in ["a", "r+"] {
                 if let Err(failed) = open_options_for(flags).open(root) {
                     assert_eq!(
-                        fs_error_at(FsSite::Open(flags), "open", root, &failed),
+                        fs_error_at(FsSite::Open(open_options_for(flags)), "open", root, &failed),
                         expect("EPERM", "open", true),
                         "{root} {flags}: {failed:?}"
                     );
@@ -7857,7 +8026,7 @@ mod os_error_code_tests {
             for flags in ["r", "r+", "a", "ax", "w", "wx"] {
                 let failed = open_options_for(flags).open(ipc).unwrap_err();
                 assert_eq!(
-                    fs_error_at(FsSite::Open(flags), "open", ipc, &failed),
+                    fs_error_at(FsSite::Open(open_options_for(flags)), "open", ipc, &failed),
                     expect("EINVAL", "open", true),
                     "{flags}: {failed:?}"
                 );

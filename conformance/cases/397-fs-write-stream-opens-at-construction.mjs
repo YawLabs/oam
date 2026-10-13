@@ -334,7 +334,16 @@ const fdState = (fd) => {
   const log = watch(ws);
   await once(ws, "ready");
   const fd = ws.fd;
-  console.log("autoClose | " + [ws.autoClose, "autoClose" in ws, fs.createWriteStream(fresh()).autoClose, fs.createReadStream(p).autoClose].join(" "));
+  // The two default streams are closed before the row goes on: a descriptor
+  // node closes is a number its next open may be handed, so a stream left
+  // open here would decide what `fdState` reads below.
+  const defaults = [fs.createWriteStream(fresh()), fs.createReadStream(p)];
+  console.log("autoClose | " + [ws.autoClose, "autoClose" in ws, ...defaults.map((stream) => stream.autoClose)].join(" "));
+  for (const stream of defaults) {
+    const done = closed(stream);
+    stream.destroy();
+    await done;
+  }
   ws.end("x");
   await once(ws, "finish");
   ws.destroy();
