@@ -10437,13 +10437,17 @@
   /// Natives always hand back raw bytes; encodings decode HERE via
   /// Buffer#toString so 'base64'/'hex'/'latin1'/... all behave (the
   /// Rust-side decode was utf8-only and silently wrong for the rest).
-  function decodeRead(bytes, encoding) {
+  ///
+  /// `emptyIsString`: the sync and callback forms of readFile decode with
+  /// `buffer.toString(encoding)`, which answers "" for an empty Buffer before
+  /// it looks the encoding up -- so with the `"buffer"` encoding (which the
+  /// options check lets through) nothing read is "", and something read is
+  /// ERR_UNKNOWN_ENCODING. fs.promises.readFile settles the encoding first
+  /// and refuses `"buffer"` whatever was read (measured on v22.22.2).
+  function decodeRead(bytes, encoding, emptyIsString) {
     const BufferCtor = globalThis.Buffer;
     const buf = BufferCtor.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    // Nothing read is "" for any encoding the options check let through --
-    // `"buffer"` too, which node's toString never gets to look up for an
-    // empty Buffer.
-    if (encoding && buf.length === 0) return "";
+    if (emptyIsString && encoding && buf.length === 0) return "";
     return encoding ? buf.toString(encoding) : buf;
   }
 
@@ -11633,7 +11637,7 @@
       const flag = readsWithFlag(options, falsyIsRead);
       if (flag === null) {
         const bytes = await natives.fsReadFile(file);
-        return decodeRead(bytes, readOptions(options).encoding ?? null);
+        return decodeRead(bytes, readOptions(options).encoding ?? null, !falsyIsRead);
       }
       const signal = readOptions(options).signal;
       const { handle } = await natives.fsOpen(file, flag);
@@ -11647,7 +11651,7 @@
           chunks.push(chunk);
         }
         const whole = globalThis.Buffer.concat(chunks);
-        return decodeRead(whole, readOptions(options).encoding ?? null);
+        return decodeRead(whole, readOptions(options).encoding ?? null, !falsyIsRead);
       } finally {
         natives.fsClose(handle);
       }
@@ -12820,7 +12824,7 @@
           // a stat. Any other encoding never looks at the flag.
           const straight = enc === "utf8" || enc === "utf-8";
           if (straight) openFlags(options.flag === undefined ? "r" : options.flag, natives);
-          return decodeRead(readFdSync(path, straight), enc ?? null);
+          return decodeRead(readFdSync(path, straight), enc ?? null, true);
         }
         // Any flag but a read-only one: open with it, read the descriptor,
         // close it (see readFileAt).
@@ -12829,7 +12833,7 @@
         if (flag !== null && flag !== openFlags("r", natives)) {
           const fd = natives.fsOpenSync(toPath(path), flag);
           try {
-            return decodeRead(readFdSync(fd), enc ?? null);
+            return decodeRead(readFdSync(fd), enc ?? null, true);
           } finally {
             natives.fsCloseSync(fd);
           }
@@ -12838,7 +12842,7 @@
           return natives.fsReadFileUtf8Sync(toPath(path));
         }
         const bytes = natives.fsReadFileSync(toPath(path));
-        return decodeRead(bytes, enc ?? null);
+        return decodeRead(bytes, enc ?? null, true);
       },
       writeFileSync: (path, data, options) => writeFileSyncAt(path, data, writeFileOptions(options, false), false),
       appendFileSync: (path, data, options) => writeFileSyncAt(path, data, writeFileOptions(options, true), true),
@@ -13049,7 +13053,7 @@
           if (err) return cb(err);
           let out;
           try {
-            out = decodeRead(bytes, opts.encoding ?? null);
+            out = decodeRead(bytes, opts.encoding ?? null, true);
           } catch (e) {
             return cb(e);
           }

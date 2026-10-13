@@ -155,3 +155,16 @@ for (const options of [{ encoding: "utf8", flag: "zz" }, { encoding: "utf-8", fl
   console.log(`descriptor with a flag | ${JSON.stringify(options)} | ${answer} | next read ${JSON.stringify(b.toString("latin1", 0, fs.readSync(fd, b, 0, 4, null)))}`);
   fs.closeSync(fd);
 }
+
+// The "buffer" encoding with nothing read: "" from the sync and callback
+// forms, whose toString never looks the name up for an empty Buffer, and
+// refused by fs.promises.readFile, which settles the encoding first.
+{
+  const empty = path.join(made, "empty");
+  fs.writeFileSync(empty, "");
+  for (const [name, p] of [["empty", empty], ["ten bytes", file]]) {
+    const viaPath = await new Promise((res) => fs.readFile(p, "buffer", (e, v) => res(e ? e.code : value(v))));
+    const viaPromise = await fs.promises.readFile(p, "buffer").then(value, (e) => e.code);
+    console.log(`"buffer", ${name} | ${viaSync(p, "buffer")} | callback ${viaPath} | promise ${viaPromise}`);
+  }
+}
