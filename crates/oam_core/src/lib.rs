@@ -2317,11 +2317,14 @@ pub struct FsError {
 /// Every rule here is Windows-only, and each is a place where the generic
 /// table alone gives node's code for the wrong operation:
 ///
-/// - A DIRECTORY opens, so `w` on one has to fail by itself. libuv's
-///   CREATE_ALWAYS fails ERROR_FILE_EXISTS, which fs__open turns into
-///   `EISDIR`. std opens the directory and then fails to truncate it,
-///   ERROR_INVALID_PARAMETER, which the table reads as `EINVAL`. (`wx` and
-///   `ax` fail ERROR_FILE_EXISTS in both, the table's `EEXIST`.)
+/// - A truncating open (`w`, `w+`, `writeFile`) is the one open that does
+///   not ask for FILE_FLAG_BACKUP_SEMANTICS (`opens_as_libuv`), so a
+///   DIRECTORY does not open for it: ERROR_ACCESS_DENIED, which the table
+///   reads as `EPERM`. libuv's CREATE_ALWAYS fails ERROR_FILE_EXISTS there,
+///   which fs__open turns into `EISDIR` -- whatever the directory's ACL or
+///   sharing says, since the name collides before either is asked.
+/// - A drive or share root does not open at all without that flag, and fails
+///   not-found; node's truncating open of a root is refused `EPERM`.
 /// - fs__mkdir reports ERROR_INVALID_NAME and ERROR_DIRECTORY as `EINVAL`. Not
 ///   for a recursive mkdir: node's MKDirp re-stats the path after the failure
 ///   and reports `ENOENT`.
@@ -2329,9 +2332,10 @@ pub struct FsError {
 /// - fs__scandir reports a file as `ENOTDIR`; libuv's table says `ENOENT` for
 ///   the ERROR_DIRECTORY std gets.
 ///
-/// A drive or share root needs no rule: it opens for reading like any other
-/// directory, and every open of it for writing is refused ERROR_ACCESS_DENIED,
-/// the table's `EPERM`, as node's is.
+/// Every other open of a directory needs no rule. It opens, a root included,
+/// and the read or write on it is what fails; `wx` and `ax` fail
+/// ERROR_FILE_EXISTS, the table's `EEXIST`; and an open of a root for writing
+/// is refused ERROR_ACCESS_DENIED, the table's `EPERM`, as node's is.
 pub fn fs_error_at(
     site: FsSite<'_>,
     syscall: &'static str,
@@ -2346,8 +2350,8 @@ pub fn fs_error_at(
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{
-            ERROR_DIRECTORY, ERROR_FILE_EXISTS, ERROR_INVALID_NAME, ERROR_INVALID_PARAMETER,
-            ERROR_NOT_A_REPARSE_POINT,
+            ERROR_ACCESS_DENIED, ERROR_DIRECTORY, ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME,
+            ERROR_NOT_A_REPARSE_POINT, ERROR_PATH_NOT_FOUND,
         };
         let raw = error.raw_os_error().and_then(|r| u32::try_from(r).ok());
         let at = |code, syscall, has_path| FsError {
@@ -2374,11 +2378,16 @@ pub fn fs_error_at(
             FsSite::Open(flags) => flags.contains('w') && !flags.contains('x'),
             _ => false,
         };
-        if truncates
-            && matches!(raw, Some(ERROR_INVALID_PARAMETER | ERROR_FILE_EXISTS))
-            && std::path::Path::new(path).is_dir()
-        {
-            return at("EISDIR", syscall, true);
+        if truncates && std::path::Path::new(path).is_dir() {
+            match raw {
+                // A drive or share root (`\\?\C:\`, `\\?\UNC\srv\sh\`): a
+                // drive fails ERROR_PATH_NOT_FOUND, a share ERROR_INVALID_NAME.
+                Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_INVALID_NAME) => {
+                    return at("EPERM", syscall, true);
+                }
+                Some(ERROR_ACCESS_DENIED) => return at("EISDIR", syscall, true),
+                _ => {}
+            }
         }
     }
     #[cfg(not(windows))]
@@ -2432,7 +2441,13 @@ impl WholeFileError {
 /// is a directory, and a read or write on it is what fails:
 /// ERROR_INVALID_FUNCTION, the table's `EISDIR`. The flag changes nothing for
 /// a regular file. Every open behind a node descriptor or a whole-file
-/// operation goes through here.
+/// operation goes through here, but one: a TRUNCATING open (`w`, `w+`,
+/// `writeFile`). node's never opens a directory -- CREATE_ALWAYS fails on
+/// one -- and std's is not CREATE_ALWAYS: it opens what is there and then
+/// truncates it, so with the flag it would open the directory before failing,
+/// and through a junction or directory symlink whose target is gone it would
+/// CREATE that target as a directory. Without the flag it opens no directory
+/// and makes none, and `fs_error_at` names the refusal as node does.
 pub fn opens_as_libuv(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
     #[cfg(windows)]
     {
@@ -2524,9 +2539,10 @@ pub fn write_whole_file(path: &str, data: &[u8], append: bool) -> Result<(), Who
         .write(!append)
         .truncate(!append)
         .append(append);
-    let file = opens_as_libuv(&mut options)
-        .open(path)
-        .map_err(WholeFileError::Open)?;
+    if append {
+        opens_as_libuv(&mut options);
+    }
+    let file = options.open(path).map_err(WholeFileError::Open)?;
     write_opened(&file, data)
 }
 
@@ -3828,7 +3844,10 @@ pub fn open_options_for(flags: &str) -> std::fs::OpenOptions {
             oo.read(true);
         }
     }
-    opens_as_libuv(&mut oo);
+    // Not the truncating opens: see `opens_as_libuv`.
+    if !matches!(flags, "w" | "w+") {
+        opens_as_libuv(&mut oo);
+    }
     oo
 }
 
@@ -7022,7 +7041,7 @@ mod os_error_code_tests {
     fn windows_filesystem_rules_depend_on_the_operation() {
         use windows_sys::Win32::Foundation::{
             ERROR_ACCESS_DENIED, ERROR_DIRECTORY, ERROR_FILE_EXISTS, ERROR_INVALID_NAME,
-            ERROR_INVALID_PARAMETER, ERROR_NOT_A_REPARSE_POINT,
+            ERROR_NOT_A_REPARSE_POINT,
         };
         let dir = std::env::temp_dir().join(format!("oam-fs-error-at-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -7036,48 +7055,31 @@ mod os_error_code_tests {
             has_path,
         };
 
-        // A truncating open of a directory: std's failed truncate, and the
-        // ERROR_FILE_EXISTS libuv's CREATE_ALWAYS gets, are both node's EISDIR.
-        for code in [ERROR_INVALID_PARAMETER, ERROR_FILE_EXISTS] {
-            let e = raw(code);
-            for site in [FsSite::Open("w"), FsSite::Open("w+"), FsSite::WriteFile] {
-                assert_eq!(
-                    fs_error_at(site, "open", dir_s, &e),
-                    expect("EISDIR", "open", true),
-                    "{site:?} {code}"
-                );
-            }
-        }
-        // Only a truncating open, and only of a directory: an exclusive one
-        // is EEXIST, and a file keeps the table's answer.
-        for flags in ["wx", "wx+", "ax", "ax+"] {
+        // A truncating open of a directory is refused where libuv's collides
+        // with the name: node's EISDIR. Every other open of one that is
+        // denied is the ACL's EPERM -- the directory would have opened.
+        let denied = raw(ERROR_ACCESS_DENIED);
+        for site in [FsSite::Open("w"), FsSite::Open("w+"), FsSite::WriteFile] {
             assert_eq!(
-                fs_error_at(FsSite::Open(flags), "open", dir_s, &raw(ERROR_FILE_EXISTS)),
-                expect("EEXIST", "open", true),
-                "{flags}"
+                fs_error_at(site, "open", dir_s, &denied),
+                expect("EISDIR", "open", true),
+                "{site:?}"
+            );
+            assert_eq!(
+                fs_error_at(site, "open", file_s, &denied),
+                expect("EPERM", "open", true),
+                "{site:?}"
             );
         }
-        assert_eq!(
-            fs_error_at(
-                FsSite::Open("w"),
-                "open",
-                file_s,
-                &raw(ERROR_INVALID_PARAMETER)
-            ),
-            expect("EINVAL", "open", true)
-        );
-        // A denied open is EPERM for every operation, directory or file: the
-        // directory would have opened, so the denial is the ACL's.
-        let denied = raw(ERROR_ACCESS_DENIED);
-        for path in [dir_s, file_s] {
-            for site in [
-                FsSite::ReadFile,
-                FsSite::WriteFile,
-                FsSite::AppendFile,
-                FsSite::Open("r"),
-                FsSite::Open("w"),
-                FsSite::Open("a"),
-            ] {
+        for site in [
+            FsSite::ReadFile,
+            FsSite::AppendFile,
+            FsSite::Open("r"),
+            FsSite::Open("r+"),
+            FsSite::Open("a"),
+            FsSite::Open("wx"),
+        ] {
+            for path in [dir_s, file_s] {
                 assert_eq!(
                     fs_error_at(site, "open", path, &denied),
                     expect("EPERM", "open", true),
@@ -7085,7 +7087,14 @@ mod os_error_code_tests {
                 );
             }
         }
-
+        // An exclusive open of a directory is the table's EEXIST.
+        for flags in ["wx", "wx+", "ax", "ax+"] {
+            assert_eq!(
+                fs_error_at(FsSite::Open(flags), "open", dir_s, &raw(ERROR_FILE_EXISTS)),
+                expect("EEXIST", "open", true),
+                "{flags}"
+            );
+        }
         for code in [ERROR_INVALID_NAME, ERROR_DIRECTORY] {
             let e = raw(code);
             assert_eq!(
@@ -7235,18 +7244,31 @@ mod os_error_code_tests {
                 expect("EISDIR", "read", false),
                 "{root}: {failed:?}"
             );
-            // The refusal is the ACL's, and an elevated process is not
-            // refused: only a refusal has a shape to check.
-            for (site, append) in [(FsSite::WriteFile, false), (FsSite::AppendFile, true)] {
-                if let Err(failed) = write_whole_file(root, b"", append) {
-                    assert_eq!(
-                        whole_file_error(site, root, &failed),
-                        expect("EPERM", "open", true),
-                        "{root} {site:?}: {failed:?}"
-                    );
-                }
+            // A truncating open never opens a root.
+            let failed = write_whole_file(root, b"", false).unwrap_err();
+            assert_eq!(
+                whole_file_error(FsSite::WriteFile, root, &failed),
+                expect("EPERM", "open", true),
+                "{root}: {failed:?}"
+            );
+            for flags in ["w", "w+"] {
+                let failed = open_options_for(flags).open(root).unwrap_err();
+                assert_eq!(
+                    fs_error_at(FsSite::Open(flags), "open", root, &failed),
+                    expect("EPERM", "open", true),
+                    "{root} {flags}: {failed:?}"
+                );
             }
-            for flags in ["w", "a", "r+"] {
+            // Any other open for writing is refused by the ACL, and an
+            // elevated process is not refused: only a refusal has a shape.
+            if let Err(failed) = write_whole_file(root, b"", true) {
+                assert_eq!(
+                    whole_file_error(FsSite::AppendFile, root, &failed),
+                    expect("EPERM", "open", true),
+                    "{root}: {failed:?}"
+                );
+            }
+            for flags in ["a", "r+"] {
                 if let Err(failed) = open_options_for(flags).open(root) {
                     assert_eq!(
                         fs_error_at(FsSite::Open(flags), "open", root, &failed),

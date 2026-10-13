@@ -3714,10 +3714,10 @@ way; the difference is that a symlink needs the create-symlink privilege (Develo
 an elevated process), which a junction does not, so where that privilege is missing oam's
 call fails `EPERM` and node's succeeds. Measured against v22.22.2 (conformance case 377).
 
-### Windows directory descriptors: three corners
+### Windows directory descriptors: the corners left
 
 A directory opens on Windows as it does in node (`FILE_FLAG_BACKUP_SEMANTICS`), and its
-descriptor answers as node's does: conformance case 392, measured against v22.22.2. Three
+descriptor answers as node's does: conformance case 392, measured against v22.22.2. These
 corners are left.
 
 - Callback `fs.readFile(fd, cb)` on a directory descriptor fails `EISDIR` `read` (`EBADF`
@@ -3725,9 +3725,21 @@ corners are left.
   runtimes. node's callback form drops the failed read of a descriptor it was handed and
   calls back with an empty Buffer.
 - `fs.openAsBlob("dir")` rejects `ERR_INVALID_ARG_VALUE`; node resolves a Blob of size 0.
-- A numeric `O_WRONLY` with neither `O_CREAT` nor `O_APPEND` opens as `"w"` (the natives
-  take node's flag strings, and none spells it), so on a directory it fails `EISDIR` where
-  node returns a descriptor.
+- `readFile`'s `flag` option does not reach the open, which is always read-only. On a file
+  that seldom shows; on a directory node's answer follows the flag (`"a"` is `EBADF`
+  `read`, `"w"` `EISDIR` `open`) and oam's is always `EISDIR` `read`.
+- A write stream opens `"a"` or `"w"` and a read stream `"r"`, whatever `flags` says, so
+  `createWriteStream("dir", { flags: "r+" })` fails `EISDIR` `open` where node emits
+  `'open'` and then fails the write.
+- `FileHandle.readLines()` over a directory handle throws the `EISDIR` out of the stream
+  instead of rejecting the iteration, as it already did for any handle whose read fails (a
+  file opened `"a"`).
+- Numeric flags open as the nearest flag string (see "Open flags the natives cannot
+  spell"), so on a directory one that maps to `"w"` -- `O_WRONLY` without `O_APPEND`, or
+  with `O_CREAT` -- fails `EISDIR` where node returns a descriptor, and `O_TRUNC` without
+  `O_CREAT` opens it where node fails `EINVAL`.
+- A truncating open through a junction or directory symlink whose target is gone fails
+  `EPERM`; node's fails `ENOENT`. Neither creates anything.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 

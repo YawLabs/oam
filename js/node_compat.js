@@ -12226,8 +12226,11 @@
           // before it looks at what is left, so the descriptor answers --
           // appendFile(dir, "", cb) fails EISDIR on the write where the sync
           // and promise forms, which skip an empty write, succeed (v22.22.2,
-          // measured).
-          fs.open(path, options.flag, options.mode, (openErr, fd) => {
+          // measured). Not with a signal: that call keeps the promise form's
+          // handling of it, and skips the write. The flag is node's
+          // `options.flag || 'w'`: an options object is taken as given, so
+          // one without a flag has none.
+          fs.open(path, options.flag || (append ? "a" : "w"), options.mode, (openErr, fd) => {
             if (openErr) return cb(openErr);
             fs.write(fd, bytes, 0, 0, null, (err) => fs.close(fd, (closeErr) => cb(err || closeErr || null)));
           });

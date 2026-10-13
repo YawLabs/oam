@@ -28,16 +28,17 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   renamed or removed under it. It follows that `appendFileSync(dir, "")` and
   `fs.promises.appendFile(dir, "")` succeed instead of failing `EISDIR` `write`,
   `truncateSync(dir)` fails `EINVAL` `ftruncate` instead of `EPERM` `open`,
-  `openSync(dir, "ax")` is `EEXIST` instead of `EPERM`, a read or append stream over a
-  directory emits `'open'` before its `EISDIR`, and a drive or share root (`C:\`,
-  `\\srv\sh`) opens for reading. What failed in node still fails the same way:
+  `openSync(dir, "ax")` is `EEXIST` instead of `EPERM`, `createReadStream(dir)` and
+  `createWriteStream(dir, { flags: "a" })` emit `'open'` before their `EISDIR`, and a drive
+  or share root (`C:\`, `\\srv\sh`) opens for reading. What failed in node still fails the same way:
   `openSync(dir, "w")` `EISDIR`, `readFileSync(dir)` `EISDIR` `read`, a write open of a
   root `EPERM`. Conformance case 392.
 - **Callback `fs.writeFile` and `fs.appendFile` issue their write even for no data.** node's
   callback forms write once before looking at what is left, so the descriptor answers:
   `fs.writeFile(fdOpenedForRead, "", cb)` is `EBADF` `write` and `fs.appendFile(dir, "", cb)`
   on Windows `EISDIR` `write`, where oam called back with no error. The sync and promise
-  forms skip an empty write in both runtimes.
+  forms skip an empty write in both runtimes; so, still, does a callback call given a
+  `signal`.
 - **On Windows `stat` reports a directory's size as 0.** `statSync("C:\\").size` was the
   root's index allocation (12288 on NTFS); libuv reports 0 for every directory.
 

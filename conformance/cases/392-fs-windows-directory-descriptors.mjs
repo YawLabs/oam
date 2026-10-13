@@ -35,7 +35,12 @@ const root = D.slice(0, 3);
 const share = "\\\\localhost\\" + D[0] + "$";
 const scrub = (s) =>
   typeof s === "string"
-    ? s.split(D).join("<D>").split(made).join("<D>").split(share).join("<SHARE>").split(root).join("<ROOT>")
+    ? s
+        .split(D).join("<D>")
+        .split(made).join("<D>")
+        .split(process.env.SystemRoot).join("<SYSTEM>")
+        .split(share).join("<SHARE>")
+        .split(root).join("<ROOT>")
     : s;
 const shape = (e) =>
   [e.code, e.errno, e.syscall, "path=" + JSON.stringify(scrub(e.path)), scrub(e.message)].join(" ");
@@ -68,7 +73,7 @@ const kind = (fd) => {
 fs.mkdirSync("d");
 fs.writeFileSync("d/a.txt", "a");
 fs.mkdirSync("d/inner");
-fs.mkdirSync("empty");
+fs.mkdirSync("bare");
 
 // --- openSync: which flags open a directory -----------------------------------
 const spellings = [
@@ -76,7 +81,7 @@ const spellings = [
   ["d\\", "d\\"],
   ["d/", "d/"],
   ["d/inner", "d/inner"],
-  ["empty", "empty"],
+  ["bare", "bare"],
   ["absolute", path.join(D, "d")],
   ["verbatim", "\\\\?\\" + path.join(D, "d")],
   [".", "."],
@@ -229,7 +234,16 @@ for (const flag of ["r", "r+", "a"]) {
 }
 
 // --- a path that is a directory, whole-file forms -----------------------------
-for (const [name, p] of [["d", "d"], ["d\\", "d\\"], ["verbatim", "\\\\?\\" + path.join(D, "d")], ["empty", "empty"]]) {
+// A truncating open collides with the name before the directory's ACL is
+// asked: one the caller may not write is EISDIR too, not EPERM.
+const system = process.env.SystemRoot;
+for (const flag of ["w", "w+", "wx"]) {
+  show("openSync SystemRoot " + flag, () => fs.openSync(system, flag));
+}
+show("writeFileSync SystemRoot", () => fs.writeFileSync(system, "x"));
+await later("promises.writeFile SystemRoot", () => fs.promises.writeFile(system, "x"));
+await later("fs.writeFile SystemRoot empty", () => called((cb) => fs.writeFile(system, "", cb)));
+for (const [name, p] of [["d", "d"], ["d\\", "d\\"], ["verbatim", "\\\\?\\" + path.join(D, "d")], ["bare", "bare"]]) {
   const row = (label, f) => show(label + " " + name, f);
   row("readFileSync", () => fs.readFileSync(p));
   row("readFileSync utf8", () => fs.readFileSync(p, "utf8"));
@@ -268,6 +282,29 @@ await later("fs.appendFile file empty", async () => {
   fs.unlinkSync("made-w.txt");
   return out;
 });
+// An options object is taken as given: one without a flag still opens "w"
+// (or "a"), creating the file and truncating it.
+for (const [name, options] of [["{}", {}], ["encoding", { encoding: "utf8" }], ["mode", { mode: 0o666 }], ["flush", { flush: false }], ["flag undefined", { flag: undefined }], ["string", "utf8"], ["null", null]]) {
+  await later("fs.writeFile empty, options " + name, async () => {
+    fs.writeFileSync("old.txt", "old");
+    await called((cb) => fs.writeFile("old.txt", "", options, cb));
+    await called((cb) => fs.writeFile("new.txt", "", options, cb));
+    const out = [fs.readFileSync("old.txt", "utf8"), fs.existsSync("new.txt")];
+    fs.unlinkSync("new.txt");
+    return out;
+  });
+  await later("fs.appendFile empty, options " + name, async () => {
+    fs.writeFileSync("old.txt", "old");
+    await called((cb) => fs.appendFile("old.txt", Buffer.alloc(0), options, cb));
+    await called((cb) => fs.appendFile("new.txt", "", options, cb));
+    const out = [fs.readFileSync("old.txt", "utf8"), fs.existsSync("new.txt")];
+    fs.unlinkSync("new.txt");
+    return out;
+  });
+}
+await later("fs.writeFile empty, flag wx on a file", () => called((cb) => fs.writeFile("old.txt", "", { flag: "wx" }, cb)));
+await later("fs.writeFile empty, flag r on a file", () => called((cb) => fs.writeFile("old.txt", "", { flag: "r" }, cb)));
+await later("fs.writeFile empty, missing parent", () => called((cb) => fs.writeFile("no-such/new.txt", "", cb)));
 await later("fs.writeFile fd empty on a read-only file", async () => {
   const fd = fs.openSync("d/a.txt", "r");
   try {
@@ -350,13 +387,13 @@ for (const flag of ["r", "r+", "a"]) {
     return out;
   });
   show("children under a descriptor " + flag, () => {
-    const fd = fs.openSync("empty", flag);
-    fs.writeFileSync("empty/f.txt", "f");
-    fs.renameSync("empty/f.txt", "empty/g.txt");
-    const listed = fs.readdirSync("empty");
-    fs.unlinkSync("empty/g.txt");
-    fs.mkdirSync("empty/sub");
-    fs.rmdirSync("empty/sub");
+    const fd = fs.openSync("bare", flag);
+    fs.writeFileSync("bare/f.txt", "f");
+    fs.renameSync("bare/f.txt", "bare/g.txt");
+    const listed = fs.readdirSync("bare");
+    fs.unlinkSync("bare/g.txt");
+    fs.mkdirSync("bare/sub");
+    fs.rmdirSync("bare/sub");
     fs.closeSync(fd);
     return listed;
   });
