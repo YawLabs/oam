@@ -20,6 +20,37 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`fs.createWriteStream` opens its file when the stream is made (#323).** oam opened at
+  the first write, or at `end()` when there was none. A stream nobody had written to had no
+  file and had emitted nothing; one ended without data never emitted `'open'` or `'ready'`;
+  and one over a path that does not open stayed silent until it was written to. The open
+  now happens at construction, as node's does: `'open'` then `'ready'` fire, writes queue
+  behind it, and a failed open destroys the stream with the open's error (`'error'`, then
+  `'close'`), so `finished()` and `pipeline()` see it without a write. Conformance case
+  397.
+- **`createWriteStream` and `createReadStream` honour `flags`.** A write stream opened
+  `"a"` or else `"w"`, and a read stream always `"r"`: `{ flags: "r+" }` truncated the
+  file it was meant to write into, and `"wx"` overwrote one that was there. The flag given
+  is the flag opened with.
+- **`createWriteStream` honours `start`, `flush` and a string `encoding`.** `start` was
+  ignored (every write went to the cursor); `flush: true` now syncs before the close; and
+  `createWriteStream(path, "latin1")` encodes strings as it says. The write stream's
+  default `highWaterMark` is node's 16384 (it was 65536).
+- **File streams have node's properties**: `fd` (null until open and once closed),
+  `pending`, `autoClose`, `flags`, `mode`, `start`, `pos`, and `end` on a read stream,
+  where there were only `path` and the byte count. `pos` is the live cursor, `path` from
+  a `file:` URL is a string, and a stream handed a descriptor has no `path`, `flags` or
+  `mode`. Options are checked as node checks them, in its order: a bad `encoding` is
+  `ERR_INVALID_ARG_VALUE`, and `start` / `end` are range-checked.
+- **A file stream closes its descriptor when it is destroyed, after the read or write in
+  flight.** `write()` followed at once by `destroy()` used to close the descriptor under
+  the write and lose it; the write now lands first, as in node. With `autoClose: false`,
+  `destroy()` and `close(cb)` left the descriptor open (and `close`'s callback never
+  ran); both close it now. A read stream keeps its descriptor through `'end'`, and
+  `'close'` comes a turn of the event loop after `'finish'` or `'end'`, as in node.
+- **`WriteStream` has `destroySoon()` and writes a queued batch as one write**, so
+  `bytesWritten` moves once per batch as node's does. `createReadStream` honours
+  `emitClose`.
 - **A read error under `FileHandle.readLines()` no longer ends the process (#337).** A
   `readline` Interface did not listen for its input stream's `'error'`, so a failed read
   was thrown as an uncaught exception -- from inside a `try` / `catch` around

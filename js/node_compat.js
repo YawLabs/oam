@@ -11036,7 +11036,139 @@
       );
     };
 
+    // The two classes below follow node's lib/internal/fs/streams.js (v22.22.2)
+    // step for step -- the order options are checked in, which properties a
+    // stream has and when each changes, and where the descriptor is closed --
+    // because all of it shows: in the error a bad call gets, in what an
+    // 'end' or 'close' listener reads off the stream, and in whether the
+    // last write of a destroyed stream reaches the file.
+
+    // node's getOptions for a stream: a string is the encoding, null or
+    // undefined is no options, and the encoding is checked before anything
+    // else about the call.
+    const streamOptions = (options) => {
+      let opts;
+      if (options == null) opts = {};
+      else if (typeof options === "string") opts = { encoding: options };
+      else if (typeof options === "object") opts = { ...options };
+      else throw codes.ERR_INVALID_ARG_TYPE("options", ["string", "Object"], options);
+      if (opts.encoding && opts.encoding !== "buffer" && !globalThis.Buffer.isEncoding(opts.encoding)) {
+        throw codes.ERR_INVALID_ARG_VALUE("encoding", opts.encoding, "is invalid encoding");
+      }
+      return opts;
+    };
+    // node's toPathIfFileURL: a file: URL is its path, anything else is kept
+    // as it was given (a Buffer stays a Buffer).
+    const pathProperty = (path) =>
+      path && typeof path === "object" && typeof path.href === "string" && typeof path.protocol === "string"
+        ? toPath(path)
+        : path;
+    // A native operation settles as a promise, so its continuation runs as a
+    // microtask; node's runs as a callback from the event loop, where every
+    // process.nextTick it queues runs before any promise continuation does.
+    // The stream machine leans on that: it marks a stream constructed, and
+    // sends what was queued behind the open, on a nextTick after the open's
+    // callback -- so in node a write made by code that awaited 'ready' goes
+    // straight to the descriptor. Settling from a nextTick gives the same
+    // order: ticks queued inside one run before the microtasks that follow.
+    const settled = (promise, onDone, onFailed) => {
+      promise.then(
+        (value) => process.nextTick(onDone, value),
+        (error) => process.nextTick(onFailed, error),
+      );
+    };
+    // A read or write is in flight; and the event that says it has landed,
+    // which a destroy() made meanwhile waits for before it closes.
+    const kIsPerformingIO = Symbol("kIsPerformingIO");
+    const kIoDone = Symbol("kIoDone");
+    const kSupplied = Symbol("kSupplied");
+
+    // node's importFd half of both constructors: with no descriptor the
+    // stream gets `path`, `flags` and `mode`, and the path is validated
+    // here, so a bad one throws from the constructor; handed a descriptor it
+    // gets none of the three.
+    function importFdOrPath(stream, path, opts, defaultFlags) {
+      const supplied = suppliedFd(opts);
+      stream[kSupplied] = supplied;
+      if (!supplied) {
+        stream.fd = null;
+        stream.path = pathProperty(path);
+        stream.flags = opts.flags === undefined ? defaultFlags : opts.flags;
+        stream.mode = opts.mode === undefined ? 0o666 : opts.mode;
+        toPath(stream.path);
+      } else {
+        stream.fd = supplied.handle;
+      }
+    }
+    // node's _construct for both: nothing to do for a descriptor that was
+    // handed over -- no open, so neither 'open' nor 'ready' -- and otherwise
+    // the open, with whatever `flags` says: a flag node does not know fails
+    // the open, not the constructor.
+    function constructStream(stream, callback) {
+      if (stream[kSupplied]) { callback(); return; }
+      const opening = new Promise((resolve) => {
+        resolve(natives.fsOpen(toPath(stream.path), openFlags(stream.flags, process.platform)));
+      });
+      settled(
+        opening,
+        (r) => {
+          stream.fd = r.handle;
+          callback();
+          stream.emit("open", stream.fd);
+          stream.emit("ready");
+        },
+        (e) => callback(e),
+      );
+    }
+    // node's close(): the descriptor goes, `fd` is null from here on, and a
+    // write stream's `flush` syncs first. The close is made whatever the
+    // sync did -- skipping it on a failed sync leaked the descriptor behind a
+    // stream that said it was closed -- and a failed close is the error
+    // reported, ahead of the one the stream was destroyed with and the
+    // sync's. The answer crosses a turn of the event loop, as a close that
+    // runs on node's thread pool does: a setImmediate made in a 'finish' or
+    // 'end' listener runs before 'close'.
+    function closeStream(stream, err, cb) {
+      if (stream.fd === null || stream.fd === undefined) { cb(err); return; }
+      const fd = stream.fd;
+      const supplied = stream[kSupplied];
+      stream.fd = null;
+      const close = (flushErr) => {
+        new Promise((resolve) => resolve(supplied ? supplied.close() : natives.fsClose(fd))).then(
+          () => setImmediate(cb, err || flushErr),
+          (er) => setImmediate(cb, er || err || flushErr),
+        );
+      };
+      if (stream.flush) {
+        new Promise((resolve) => resolve(natives.fsFsync(fd))).then(() => close(), close);
+      } else {
+        close();
+      }
+    }
+    // node's _destroy for both: a read or write still in flight lands first.
+    // Closing under it lost the write (and raced the read).
+    function destroyStream(stream, err, cb) {
+      if (stream[kIsPerformingIO]) {
+        stream.once(kIoDone, (er) => closeStream(stream, err || er, cb));
+      } else {
+        closeStream(stream, err, cb);
+      }
+    }
+    // `autoClose` IS the stream machine's autoDestroy, readable and settable:
+    // it decides whether the stream destroys itself at the end or on an
+    // error. The descriptor is closed by destroy() whichever it is.
+    const autoCloseOver = (state) => ({
+      configurable: true,
+      enumerable: true,
+      get() { return this[state].autoDestroy; },
+      set(value) { this[state].autoDestroy = value; },
+    });
+
     class ReadStream extends Readable {
+      // True until the stream has a descriptor, and again once it is closed.
+      get pending() {
+        return this.fd === null;
+      }
       // Node v22 ReadStream.prototype.close (lib/internal/fs/streams.js --
       // outside the vendored internal/streams tree, so supplied here).
       close(cb) {
@@ -11044,179 +11176,199 @@
         this.destroy();
       }
       constructor(path, options) {
-        const opts = readOptions(options);
-        const highWaterMark = opts.highWaterMark ?? 65536;
-        const supplied = suppliedFd(opts);
-        // node's importFd: with no descriptor, the path is validated here in
-        // the constructor, so a bad one throws from createReadStream itself
-        // rather than failing the open a tick later as an 'error' event.
-        if (!supplied) toPath(path);
-        // node's `autoClose` is about the DESCRIPTOR, not the stream object:
-        // false means the application owns the fd and the stream must leave it
-        // open even at EOF and even on error. It also maps onto the stream
-        // machine's autoDestroy, which is the stream-object half of the same
-        // option.
-        const autoClose = opts.autoClose !== false;
-        // `start` is a real SEEK, and the read cursor from here on -- null
-        // meaning "wherever the descriptor already is". It used to feed only
-        // the maxBytes arithmetic while every read came from the cursor, so a
-        // windowed read returned the first (end-start+1) bytes of the file
-        // instead of the requested range.
-        let pos = typeof opts.start === "number" ? opts.start : null;
-        const endByte = typeof opts.end === "number" ? opts.end : Infinity;
-        const maxBytes = endByte === Infinity ? Infinity : endByte - (pos ?? 0) + 1;
-        let handle = supplied ? supplied.handle : null;
-        let eof = false;
-        let totalRead = 0;
-        const closeFd = async () => {
-          if (handle === null) return;
-          const h = handle;
-          handle = null;
-          try {
-            await (supplied ? supplied.close() : natives.fsClose(h));
-          } catch { /* a close error is not a read error */ }
-        };
+        const opts = streamOptions(options);
+        if (opts.highWaterMark === undefined) opts.highWaterMark = 65536;
+        // A stand-in to hang the properties on until `this` exists; they are
+        // assigned in node's order below.
+        const own = {};
+        importFdOrPath(own, path, opts, "r");
+        const start = opts.start;
+        let end = opts.end;
+        if (start !== undefined) validateInteger(start, "start", 0);
+        if (end === undefined) end = Infinity;
+        else if (end !== Infinity) {
+          validateInteger(end, "end", 0);
+          if (start !== undefined && start > end) {
+            throw codes.ERR_OUT_OF_RANGE("start", `<= "end" (here: ${end})`, start);
+          }
+        }
         super({
           // Node's fs.ReadStream flow: EOF -> push(null) -> 'end' ->
-          // autoDestroy -> destroy() -> _destroy -> 'close'. The stream
-          // machine owns 'close' (single emission); the read path only
-          // closes the fd early so EOF never holds it open.
-          // autoClose:false (Node option) = keep the stream alive past
-          // EOF/error, mapped straight onto the machine's autoDestroy.
-          autoDestroy: autoClose,
-          highWaterMark,
+          // autoDestroy -> destroy() -> the close -> 'close'. The stream
+          // machine owns 'close' (single emission). autoClose:false keeps
+          // the stream alive past EOF and an error, descriptor and all.
+          autoDestroy: opts.autoClose === undefined ? true : opts.autoClose,
+          emitClose: opts.emitClose,
+          highWaterMark: opts.highWaterMark,
           encoding: opts.encoding ?? null,
           // Eager open (Node's _construct phase): a bad path surfaces as
           // 'error' + 'close' BEFORE any read -- finished()/pipeline() on
           // an unopenable stream reject with the ENOENT instead of
           // hanging on a lazily-failing first read.
-          //
-          // Skipped entirely when the descriptor was supplied: node's
-          // _construct returns immediately for a numeric fd and emits
-          // NEITHER 'open' NOR 'ready' (measured on v22.22.2), because
-          // there was no open to report.
           construct(callback) {
-            if (supplied) { callback(); return; }
-            Promise.resolve(natives.fsOpen(toPath(path), "r")).then(
-              (r) => {
-                handle = r.handle;
-                this.emit("open", handle);
-                this.emit("ready");
-                callback();
-              },
-              (e) => callback(e),
-            );
+            constructStream(this, callback);
           },
-          async read(size) {
-            try {
-              if (eof || handle === null) {
-                // construct() always ran first (vendored Readable contract),
-                // so a null handle means the EOF path already closed it:
-                // never re-open a finished file.
-                return;
-              }
-              const remaining = maxBytes - totalRead;
-              if (remaining <= 0) {
-                eof = true;
-                if (autoClose) await closeFd();
-                this.push(null);
-                return;
-              }
-              const want = Math.min(size || highWaterMark, remaining);
-              const chunk = await natives.fsReadChunk(handle, want, pos);
-              if (chunk === undefined) {
-                eof = true;
-                if (autoClose) await closeFd();
-                this.push(null);
-              } else {
-                const buf = globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.length);
-                if (pos !== null) pos += buf.length;
-                totalRead += buf.length;
-                this.bytesRead = totalRead;
-                this.push(buf);
-              }
-            } catch (e) {
-              this.destroy(e);
-            }
+          read(size) {
+            const want = this.pos !== undefined
+              ? Math.min(this.end - this.pos + 1, size)
+              : Math.min(this.end - this.bytesRead + 1, size);
+            if (want <= 0) { this.push(null); return; }
+            this[kIsPerformingIO] = true;
+            settled(
+              new Promise((resolve) => resolve(natives.fsReadChunk(this.fd, want, this.pos))),
+                (chunk) => {
+                  this[kIsPerformingIO] = false;
+                  // The stream was destroyed under the read: it is waiting
+                  // for this to close the descriptor.
+                  if (this.destroyed) { this.emit(kIoDone); return; }
+                  if (chunk === undefined) { this.push(null); return; }
+                  const buf = globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.length);
+                  // `start` is a real SEEK, and `pos` the read cursor from
+                  // there on -- undefined meaning "wherever the descriptor
+                  // already is".
+                  if (this.pos !== undefined) this.pos += buf.length;
+                  this.bytesRead += buf.length;
+                  this.push(buf);
+                },
+                (e) => {
+                  this[kIsPerformingIO] = false;
+                  if (this.destroyed) { this.emit(kIoDone, e); return; }
+                  this.destroy(e);
+                },
+              );
           },
           destroy(err, cb) {
-            if (autoClose) closeFd();
-            cb(err);
+            destroyStream(this, err, cb);
           },
         });
-        this.path = path;
+        // The properties node's ReadStream has, in its order.
+        this[kSupplied] = own[kSupplied];
+        this.fd = own.fd;
+        if (!own[kSupplied]) {
+          this.path = own.path;
+          this.flags = own.flags;
+          this.mode = own.mode;
+        }
+        this.start = start;
+        this.end = end;
+        this.pos = start;
         this.bytesRead = 0;
+        this[kIsPerformingIO] = false;
       }
     }
+    Object.defineProperty(ReadStream.prototype, "autoClose", autoCloseOver("_readableState"));
+
     class WriteStream extends Writable {
-      // Node v22 WriteStream.prototype.close === end-then-wait-for-close.
+      // Node v22 WriteStream.prototype.close: end, then wait for 'close'. A
+      // stream that does not destroy itself at the end is destroyed here,
+      // or it would finish and never close.
       close(cb) {
         if (typeof cb === "function") {
-          if (this.closed) process.nextTick(cb);
-          else this.on("close", cb);
+          if (this.closed) { process.nextTick(cb); return; }
+          this.on("close", cb);
         }
+        if (!this.autoClose) this.on("finish", this.destroy);
         this.end();
       }
+      // True until the stream has a descriptor, and again once it is closed.
+      get pending() {
+        return this.fd === null;
+      }
       constructor(path, options) {
-        const opts = readOptions(options);
-        const flags = opts.flags === "a" ? "a" : "w";
-        const supplied = suppliedFd(opts);
-        // Validated in the constructor, as node's importFd does (see ReadStream).
-        if (!supplied) toPath(path);
-        const autoClose = opts.autoClose !== false;
-        let handle = supplied ? supplied.handle : null;
-        let totalWritten = 0;
-        const closeFd = async () => {
-          if (handle === null) return;
-          const h = handle;
-          handle = null;
-          try {
-            await (supplied ? supplied.close() : natives.fsClose(h));
-          } catch { /* a close error is not a write error */ }
+        const opts = streamOptions(options);
+        const own = {};
+        importFdOrPath(own, path, opts, "w");
+        const flush = opts.flush ?? false;
+        if (typeof flush !== "boolean") throw codes.ERR_INVALID_ARG_TYPE("options.flush", "boolean", flush);
+        const start = opts.start;
+        if (start !== undefined) validateInteger(start, "start", 0);
+        // One native write at the stream's position, counted when it lands.
+        const writeAt = (stream, bytes, position, cb) => {
+          stream[kIsPerformingIO] = true;
+          settled(
+            new Promise((resolve) => resolve(natives.fsWriteChunk(stream.fd, bytes, position))),
+              () => {
+                stream[kIsPerformingIO] = false;
+                // Destroyed under the write: the bytes are in the file, the
+                // caller is told the stream is gone, and the destroy that
+                // was waiting closes the descriptor and reports the same
+                // error, as node's does ('error', then 'close').
+                if (stream.destroyed) {
+                  const gone = codes.ERR_STREAM_DESTROYED("write");
+                  cb(gone);
+                  stream.emit(kIoDone, gone);
+                  return;
+                }
+                stream.bytesWritten += bytes.length;
+                cb();
+              },
+              (e) => {
+                stream[kIsPerformingIO] = false;
+                cb(e);
+                if (stream.destroyed) stream.emit(kIoDone, e);
+              },
+            );
         };
         super({
-          // Node's fs.WriteStream flow: end() -> final() -> 'finish' ->
-          // autoDestroy -> destroy() -> 'close'. The machine owns 'close'.
-          autoDestroy: autoClose,
-          highWaterMark: opts.highWaterMark ?? 65536,
-          async write(chunk, _encoding, cb) {
-            try {
-              if (handle === null) {
-                handle = (await natives.fsOpen(toPath(path), flags)).handle;
-                this.emit("open", handle);
-                this.emit("ready");
-              }
-              await natives.fsWriteChunk(handle, chunk);
-              totalWritten += chunk.length;
-              this.bytesWritten = totalWritten;
-              cb();
-            } catch (e) {
-              cb(e);
-            }
+          // Node's fs.WriteStream flow: construct (the open) -> writes ->
+          // end() -> 'finish' -> autoDestroy -> destroy(), which closes the
+          // descriptor -> 'close'. The machine owns 'close'.
+          autoDestroy: opts.autoClose === undefined ? true : opts.autoClose,
+          emitClose: opts.emitClose,
+          highWaterMark: opts.highWaterMark,
+          decodeStrings: true,
+          // The open happens when the stream is made (node's _construct),
+          // written to or not: the file exists, 'open' and 'ready' fire, and
+          // a path that does not open destroys the stream with the open's
+          // error. Every write waits behind it. It used to happen at the
+          // first write, or in final() when there was none -- so a stream
+          // nobody had written to had no file and had said nothing, and one
+          // over an unwritable path stayed silent until written to.
+          construct(callback) {
+            constructStream(this, callback);
           },
-          async final(cb) {
-            try {
-              // Zero-write stream: the file must still exist afterwards.
-              // Unreachable when the descriptor was supplied -- it is already
-              // open, and `path` is undefined there.
-              if (handle === null) {
-                handle = (await natives.fsOpen(toPath(path), flags)).handle;
-              }
-              if (autoClose) await closeFd();
-              cb();
-            } catch (e) {
-              cb(e);
-            }
+          // With `start` every write names its position, and `pos` moves on
+          // as the write is issued; without it the descriptor's own cursor
+          // does the placing.
+          write(chunk, _encoding, cb) {
+            const at = this.pos;
+            if (at !== undefined) this.pos = at + chunk.length;
+            writeAt(this, chunk, at, cb);
+          },
+          // What queued behind the open, or behind cork(), goes out as ONE
+          // write, as node's _writev does: `bytesWritten` moves once, and
+          // two streams on one descriptor do not interleave inside a batch.
+          writev(chunks, cb) {
+            const bytes = globalThis.Buffer.concat(chunks.map((entry) => entry.chunk));
+            const at = this.pos;
+            if (at !== undefined) this.pos = at + bytes.length;
+            writeAt(this, bytes, at, cb);
           },
           destroy(err, cb) {
-            if (autoClose) closeFd();
-            cb(err);
+            destroyStream(this, err, cb);
           },
         });
-        this.path = path;
+        // The properties node's WriteStream has, in its order.
+        this[kSupplied] = own[kSupplied];
+        this.fd = own.fd;
+        if (!own[kSupplied]) {
+          this.path = own.path;
+          this.flags = own.flags;
+          this.mode = own.mode;
+        }
+        this.flush = flush;
+        this.start = start;
+        this.pos = start;
         this.bytesWritten = 0;
+        this[kIsPerformingIO] = false;
+        // node: the `encoding` option is what a string written without one
+        // is encoded as.
+        if (opts.encoding) this.setDefaultEncoding(opts.encoding);
       }
     }
+    Object.defineProperty(WriteStream.prototype, "autoClose", autoCloseOver("_writableState"));
+    // node: `WriteStream.prototype.destroySoon = WriteStream.prototype.end`.
+    WriteStream.prototype.destroySoon = WriteStream.prototype.end;
     _rwStreams = { ReadStream, WriteStream };
     return _rwStreams;
   }
