@@ -284,6 +284,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsFstatSync", op_fs_fstat_sync),
         // fs fd-based ops (fsync/ftruncate/fchmod/fchown/futimes families)
         ("fsFsync", op_fs_fsync),
+        ("fsOpenFlagBits", op_fs_open_flag_bits),
         ("fsFdatasync", op_fs_fdatasync),
         ("fsFtruncate", op_fs_ftruncate),
         ("fsFchmod", op_fs_fchmod),
@@ -721,7 +722,7 @@ fn throw_node_error_dest(
 /// operation (see `oam_core::fs_error_at`).
 fn throw_fs_error(
     scope: &mut v8::PinScope<'_, '_>,
-    site: oam_core::FsSite<'_>,
+    site: oam_core::FsSite,
     syscall: &'static str,
     path: &oam_core::FsPath,
     error: &std::io::Error,
@@ -744,7 +745,7 @@ fn throw_fs_error(
 /// write half names `read` / `write` and no path (`oam_core::whole_file_error`).
 fn throw_whole_file_error(
     scope: &mut v8::PinScope<'_, '_>,
-    site: oam_core::FsSite<'_>,
+    site: oam_core::FsSite,
     path: &oam_core::FsPath,
     error: &oam_core::WholeFileError,
 ) {
@@ -7818,12 +7819,40 @@ fn op_fs_mkdtemp_sync(
 
 // ---------------------------------------------------------- fs stream ops
 
-/// Whether an open with these fopen-style flags can write, and so needs the
-/// write grant rather than the read one: "r+" reads AND writes, as does any
-/// flag with "w", "a" or "x" in it. One answer for fsOpen and fsOpenSync,
-/// which share one descriptor space.
-fn open_flags_write(flags: &str) -> bool {
-    flags.contains('w') || flags.contains('a') || flags.contains('+') || flags.contains('x')
+/// Whether an open with these bits needs the write grant rather than the
+/// read one (`OpenFlags::writes`: anything that is not plainly a read). One
+/// answer for fsOpen and fsOpenSync, which share one descriptor space.
+fn open_flags_write(flags: oam_core::OpenFlags) -> bool {
+    flags.writes()
+}
+
+/// The flags argument of an open: the platform's O_* bits, which the JS
+/// layer has already made of whatever the caller passed (node's
+/// stringToFlags). Absent, read-only.
+fn open_flags_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+) -> oam_core::OpenFlags {
+    let value = args.get(index);
+    let bits = if value.is_number() {
+        value.int32_value(scope).unwrap_or(0)
+    } else {
+        0
+    };
+    oam_core::OpenFlags(bits)
+}
+
+/// fsOpenFlagBits() -> [[name, value], ...]: `fs.constants`' open flags on
+/// this platform (see `oam_core::open_flag_table`).
+fn op_fs_open_flag_bits(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let table: Vec<(&str, i32)> = oam_core::open_flag_table();
+    let json = serde_json::to_string(&table).unwrap_or_else(|_| "[]".to_string());
+    return_json(scope, &mut rv, &json);
 }
 
 fn op_fs_open(
@@ -7835,8 +7864,8 @@ fn op_fs_open(
         throw_type_error(scope, "fsOpen requires a path");
         return;
     };
-    let mode = arg_string(scope, &args, 1).unwrap_or_else(|| "r".to_string());
-    let access = if open_flags_write(&mode) {
+    let mode = open_flags_arg(scope, &args, 1);
+    let access = if open_flags_write(mode) {
         FsAccess::Write
     } else {
         FsAccess::Read
@@ -7931,11 +7960,6 @@ fn throw_ebadf(scope: &mut v8::PinScope<'_, '_>, syscall: &str) {
     scope.throw_exception(exception);
 }
 
-/// fopen-style flag string -> how node opens for it. Re-exported from oam_core so the
-/// sync and async opens cannot disagree about what a flag means -- they share
-/// one descriptor space, so they have to share one flag table too.
-use oam_core::open_options_for;
-
 /// fsOpenSync(path, flags) -> fd. Synchronous open backed by std::fs::File in
 /// the sync-file registry; the returned number is the integer fd. The classic
 /// callback/`*Sync` fd API some packages (graceful-fs/playwright lock probe)
@@ -7950,8 +7974,8 @@ fn op_fs_open_sync(
         throw_type_error(scope, "openSync requires a path");
         return;
     };
-    let flags = arg_string(scope, &args, 1).unwrap_or_else(|| "r".to_string());
-    let access = if open_flags_write(&flags) {
+    let flags = open_flags_arg(scope, &args, 1);
+    let access = if open_flags_write(flags) {
         FsAccess::Write
     } else {
         FsAccess::Read
@@ -7959,7 +7983,7 @@ fn op_fs_open_sync(
     let Some(path) = fs_path_of(scope, path, access) else {
         return;
     };
-    match open_options_for(&flags).open(&path) {
+    match flags.open(&path) {
         Ok(file) => {
             let core = core_runtime!(scope);
             let id = core
@@ -7973,7 +7997,7 @@ fn op_fs_open_sync(
             let val = v8::Number::new(scope, id as f64);
             rv.set(val.into());
         }
-        Err(e) => throw_fs_error(scope, oam_core::FsSite::Open(&flags), "open", &path, &e),
+        Err(e) => throw_fs_error(scope, oam_core::FsSite::Open(flags), "open", &path, &e),
     }
 }
 
@@ -10838,6 +10862,10 @@ mod permission_audit {
         // checking a path the caller no longer names. Node draws the line in the
         // same place. Anything added to this list needs a reason of that quality.
         const EXEMPT: &[(&str, &str)] = &[
+            (
+                "op_fs_open_flag_bits",
+                "a table of constants: touches no file",
+            ),
             ("op_fs_read_chunk", "fd from a checked open()"),
             ("op_fs_write_chunk", "fd from a checked open()"),
             ("op_fs_close", "fd from a checked open()"),

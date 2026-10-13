@@ -20,6 +20,30 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **Numeric open flags mean what their bits say (#328).** oam turned a numeric `flags`
+  into the nearest flag string, and no string spells "write, do not truncate":
+  `fs.openSync(p, O_WRONLY)`, `O_WRONLY | O_CREAT` and `O_RDWR | O_CREAT` opened as `"w"`
+  / `"w+"` and **emptied the file**, and `O_WRONLY` created one that was missing. The open
+  is now made from the bits themselves, by every form (`open`, `openSync`,
+  `fs.promises.open`, the `flag` of `writeFile`, file streams): through `open(2)` as
+  given on Linux and macOS, and on Windows as the one `CreateFileW` libuv builds from
+  them (`O_TRUNC` without `O_CREAT` is `EINVAL`, `O_APPEND` appends whatever the access
+  mode, both access bits are `EINVAL`). Conformance case 398.
+- **Under `--permission`, an open needs the write grant unless it can only read.** The
+  grant used to be read off the flag string. It is now decided from the bits the open is
+  made with: read-only access plus flags that change nothing is a read, and everything
+  else needs `--allow-fs-write` -- `O_CREAT`, `O_TRUNC` or `O_APPEND` with read-only
+  access, Windows's delete-on-close `O_TEMPORARY`, and any bit oam has no name for.
+- **`fs.constants`' open flags are the platform's.** They were one hand-written table:
+  `O_SYNC`, `O_DIRECTORY` and `O_NOFOLLOW` were listed on Windows, where node has none of
+  them, and with one value for every platform. The table now comes from the platform the
+  binary was built for, with node's names for it (`UV_FS_O_FILEMAP`, and on Linux and
+  macOS `O_NOCTTY`, `O_DSYNC`, `O_NONBLOCK` and the rest).
+- **The synchronous flag strings ask for `O_SYNC`.** `"rs"`, `"rs+"`, `"as"` and `"as+"`
+  opened as their plain twins on Linux and macOS.
+- **On Windows an exclusive open through a junction whose target is gone makes the
+  target (#333)**, as a directory, and returns its descriptor, as node's does; it failed
+  `EEXIST`.
 - **`fs.createWriteStream` opens its file when the stream is made (#323).** oam opened at
   the first write, or at `end()` when there was none. A stream nobody had written to had no
   file and had emitted nothing; one ended without data never emitted `'open'` or `'ready'`;

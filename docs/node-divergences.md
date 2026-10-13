@@ -3556,13 +3556,17 @@ refused, and a name the binding does not know (`'bogus'`) writes UTF-8 -- so
 `ERR_UNKNOWN_ENCODING`.
 What still differs:
 
-- **Open flags the natives cannot spell.** oam opens through fopen-style flag
-  strings, so the synchronous spellings (`'rs+'`, `'as'`, ...) open without `O_SYNC`,
-  and a numeric combination no fopen string expresses -- `O_WRONLY` without
-  `O_CREAT`, or `O_WRONLY | O_CREAT` without `O_TRUNC` -- opens as the nearest one
-  (`'w'`, which creates and truncates; on Windows it replaces the file as any `'w'` does,
-  so its alternate data streams go and a hidden or system file is refused `EPERM`). Numeric flags with both access bits set
-  (`-1`) are `EINVAL` in node and open read-only in oam.
+- **`UV_FS_O_FILEMAP` is accepted and ignored (Windows).** libuv opens such a file
+  read-write and does its reads and writes through a file mapping, emulating `O_APPEND`
+  and the access mode there. oam opens an ordinary handle. The two agree except together
+  with `O_APPEND` (node's descriptor can `ftruncate`, and a write through
+  `O_RDONLY | O_APPEND | UV_FS_O_FILEMAP` is `EBADF` where oam's appends) or `O_DIRECT`.
+- **An open under `--permission` needs the write grant unless it can only read.** node
+  asks for it when the flags name a write (`O_WRONLY`, `O_RDWR`, `O_APPEND`, `O_CREAT`,
+  `O_TRUNC`, and on Windows `O_TEMPORARY`). oam asks for it for every open whose flags are
+  not read-only access plus a short list of flags that change nothing, so `O_EXCL` alone,
+  `UV_FS_O_FILEMAP`, or a numeric flag it has no name for (`O_PATH`) needs the write grant
+  where node's needs only the read one.
 - **A `FileHandle` is not an `EventEmitter`, and a stream over one is not tied to it
   (#343).** node's handle emits `'close'`, and a stream made from it
   (`handle.createReadStream()`, `createWriteStream()`, `readLines()`, `{ fd: handle }`)
@@ -3725,16 +3729,9 @@ corners are left.
 - `readFile`'s `flag` option does not reach the open, which is always read-only. On a file
   that seldom shows; on a directory node's answer follows the flag (`"a"` is `EBADF`
   `read`, `"w"` `EISDIR` `open`) and oam's is always `EISDIR` `read`.
-- Numeric flags open as the nearest flag string (see "Open flags the natives cannot
-  spell"), so on a directory one that maps to `"w"` -- `O_WRONLY` without `O_APPEND`, or
-  with `O_CREAT` -- fails `EISDIR` where node returns a descriptor. `O_TRUNC` without
-  `O_CREAT` is `EINVAL` in node; in oam it opens the directory (alone, or with `O_RDWR`)
-  or fails `EISDIR` (with `O_WRONLY`).
 - `fstatSync` of a console opened by name to write (`openSync("\\\\.\\CON", "w")`,
   `"\\\\.\\CONOUT$"` opened `"w"` or `"a"`) answers with the console's shape; node's
   fails `EISDIR` `fstat`. The open itself matches (conformance case 394).
-- An exclusive open (`wx`, `wx+`, `ax`, `ax+`) through a junction or directory symlink
-  whose target is gone fails `EEXIST` and creates nothing; node's creates the target as a directory and returns its descriptor.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 
@@ -3803,7 +3800,7 @@ The largest per-module gaps (counts from windows-aarch64), all tracked in that f
 
 | Module | Missing | Shape of the gap |
 |---|---|---|
-| `constants` | 113 (70 linux / 66 darwin) | The legacy all-in-one table. Platform-conditional values — the `WSA*` block on Windows, `O_DIRECT`/`O_NOCTTY`/`RTLD_*` on POSIX, plus `UV_DIRENT_*` and the `SSL_OP_*`/`ENGINE_METHOD_*` OpenSSL set everywhere. This module is the *entire* reason the ratchet is keyed by platform: a Windows-only baseline reports 16 phantom new gaps on Linux and 12 on darwin, every one of them here. `fs.constants` and `os.constants` are separately correct — see *Platform constant tables* above. |
+| `constants` | 54 win32 / 65 linux / 61 darwin | The legacy all-in-one table. Platform-conditional values — the `WSA*` block on Windows, `RTLD_*` on POSIX, plus `UV_DIRENT_*` and the `SSL_OP_*`/`ENGINE_METHOD_*` OpenSSL set everywhere. This module is the *entire* reason the ratchet is keyed by platform: a Windows-only baseline reports 16 phantom new gaps on Linux and 12 on darwin, every one of them here. `fs.constants` and `os.constants` are separately correct — see *Platform constant tables* above. |
 | `dns/promises` | 31 | `Resolver`, `getServers`/`setServers`, `lookupService`, `resolveTlsa`, and the `BADNAME`/`NOTFOUND`/… error-code constants. |
 | `module` | 25 | The `Module._*` loader internals (`_load`, `_resolveFilename`, `_cache`, `_extensions`), `register`, `SourceMap`/`findSourceMap`, the compile-cache API. |
 | `fs` | **0** | Closed in 0.9.1–0.9.2. Ownership and fd metadata (`chown`/`fchown`/`lchown`, `fchmod`/`lchmod`), durability (`fsync`/`fdatasync`), `ftruncate`, the `utimes`/`futimes`/`lutimes` family, `readv`/`writev`, `openAsBlob`, `statfs` and `glob`/`globSync` all landed. `node:fs` now has no missing export names on any platform; `fs/promises` is down to `watch`. |
