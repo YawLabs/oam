@@ -111,4 +111,22 @@ console.log("file", content());
   await ro.close();
 }
 
+// The callback forms issue their one write even for no data, so a path
+// opened with a flag that cannot write answers EBADF where the sync and
+// promise forms, which skip an empty write, succeed. A signal that has not
+// fired changes nothing.
+fs.writeFileSync(file, "kept");
+await settle("fs.writeFile empty, flag r", (cb) => fs.writeFile(file, "", { flag: "r" }, cb));
+await settle("fs.writeFile empty buffer, flag r", (cb) => fs.writeFile(file, Buffer.alloc(0), { flag: "r" }, cb));
+await settle("fs.appendFile empty, flag r", (cb) => fs.appendFile(file, "", { flag: "r" }, cb));
+await settle("fs.writeFile empty, flag r, live signal", (cb) =>
+  fs.writeFile(file, "", { flag: "r", signal: new AbortController().signal }, cb));
+sync("fs.writeFileSync empty, flag r", () => fs.writeFileSync(file, "", { flag: "r" }));
+await promised("fsp.writeFile empty, flag r", () => fsp.writeFile(file, "", { flag: "r" }));
+console.log("file", content());
+await settle("fs.appendFile empty", (cb) => fs.appendFile(file, "", cb));
+console.log("file", content());
+await settle("fs.writeFile empty, options {}", (cb) => fs.writeFile(file, "", {}, cb));
+console.log("file", content());
+
 fs.rmSync(dir, { recursive: true, force: true });

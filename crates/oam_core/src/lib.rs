@@ -2385,6 +2385,12 @@ pub fn fs_error_at(
                 Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_INVALID_NAME) => {
                     return at("EPERM", syscall, true);
                 }
+                // A share root spelled without its separator
+                // (`\\?\UNC\srv\sh`) is refused as any directory is, and is
+                // a root all the same.
+                Some(ERROR_ACCESS_DENIED) if is_root(path) => {
+                    return at("EPERM", syscall, true);
+                }
                 Some(ERROR_ACCESS_DENIED) => return at("EISDIR", syscall, true),
                 _ => {}
             }
@@ -2458,15 +2464,48 @@ pub fn opens_as_libuv(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenO
     options
 }
 
+/// Whether `path` is a drive or share root: a prefix with nothing under it.
+#[cfg(windows)]
+fn is_root(path: impl AsRef<std::path::Path>) -> bool {
+    use std::path::Component;
+    let mut parts = path.as_ref().components();
+    matches!(parts.next(), Some(Component::Prefix(_)))
+        && parts.all(|part| matches!(part, Component::RootDir))
+}
+
+/// `options.open(path)`, after refusing the one path FILE_FLAG_BACKUP_SEMANTICS
+/// opens and node does not: the root of a share that is no disk
+/// (`\\srv\IPC$`). node fails every open of it `EINVAL` (v22.22.2,
+/// measured), which is also what a stat of it answers in both runtimes. With
+/// the flag CreateFileW hands back a handle for it, so `openSync` returned a
+/// descriptor and an `appendFile` of no data succeeded. Only a root is asked,
+/// so no other open pays for the stat.
+pub fn open_path(
+    options: &std::fs::OpenOptions,
+    path: impl AsRef<std::path::Path>,
+) -> std::io::Result<std::fs::File> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+        if is_root(&path) {
+            match std::fs::metadata(&path) {
+                Err(e) if e.raw_os_error() == i32::try_from(ERROR_INVALID_PARAMETER).ok() => {
+                    return Err(e);
+                }
+                _ => {}
+            }
+        }
+    }
+    options.open(path)
+}
+
 /// `fs.readFile` of a path: `std::fs::read`, with the open and the read kept
 /// apart. Same syscalls on success: open, one fstat for the size hint, one
 /// read of the whole file and one short read that finds EOF.
 pub fn read_whole_file(path: &str) -> Result<Vec<u8>, WholeFileError> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
-    let file = opens_as_libuv(&mut options)
-        .open(path)
-        .map_err(WholeFileError::Open)?;
+    let file = open_path(opens_as_libuv(&mut options), path).map_err(WholeFileError::Open)?;
     let size = file.metadata().ok().map(|m| m.len());
     read_opened(&file, size)
 }
@@ -2542,7 +2581,7 @@ pub fn write_whole_file(path: &str, data: &[u8], append: bool) -> Result<(), Who
     if append {
         opens_as_libuv(&mut options);
     }
-    let file = options.open(path).map_err(WholeFileError::Open)?;
+    let file = open_path(&options, path).map_err(WholeFileError::Open)?;
     write_opened(&file, data)
 }
 
@@ -6315,7 +6354,7 @@ pub mod ops {
         // descriptor lands in the ONE registry the sync family also reads.
         // tokio::fs::open is this exact call on this exact pool.
         let owned = path.clone();
-        let opened = tokio::task::spawn_blocking(move || options.open(&owned)).await;
+        let opened = tokio::task::spawn_blocking(move || super::open_path(&options, &owned)).await;
         let opened = match opened {
             Ok(r) => r,
             Err(e) => return node_fail(std::io::Error::other(e.to_string()), "open", &path),
@@ -7225,6 +7264,8 @@ mod os_error_code_tests {
         // The loopback admin share exists only where file sharing is on.
         let share = format!(r"\\?\UNC\localhost\{}$\", &temp[..1]);
         if std::path::Path::new(&share).is_dir() {
+            // The spelling the JS layer sends has no trailing separator.
+            roots.push(share.trim_end_matches('\\').to_string());
             roots.push(share);
         }
         let expect = |code, syscall, has_path| FsError {
@@ -7276,6 +7317,34 @@ mod os_error_code_tests {
                         "{root} {flags}: {failed:?}"
                     );
                 }
+            }
+        }
+        // A share that is no disk has a root that does not open, whatever
+        // the flag: EINVAL, as a stat of it is. Only where the loopback
+        // share answers at all.
+        let ipc = r"\\?\UNC\localhost\IPC$";
+        if std::fs::metadata(ipc).is_err_and(|e| node_error_code(&e) == "EINVAL") {
+            for flags in ["r", "r+", "a", "ax", "w", "wx"] {
+                let failed = open_path(&open_options_for(flags), ipc).unwrap_err();
+                assert_eq!(
+                    fs_error_at(FsSite::Open(flags), "open", ipc, &failed),
+                    expect("EINVAL", "open", true),
+                    "{flags}: {failed:?}"
+                );
+            }
+            let failed = read_whole_file(ipc).unwrap_err();
+            assert_eq!(
+                whole_file_error(FsSite::ReadFile, ipc, &failed),
+                expect("EINVAL", "open", true),
+                "{failed:?}"
+            );
+            for (site, append) in [(FsSite::WriteFile, false), (FsSite::AppendFile, true)] {
+                let failed = write_whole_file(ipc, b"", append).unwrap_err();
+                assert_eq!(
+                    whole_file_error(site, ipc, &failed),
+                    expect("EINVAL", "open", true),
+                    "{site:?}: {failed:?}"
+                );
             }
         }
         // A path that is not there is still ENOENT.

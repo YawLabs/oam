@@ -31,6 +31,13 @@ const start = process.cwd();
 const made = fs.mkdtempSync(path.join(os.tmpdir(), "oam-case-392-"));
 process.chdir(made);
 const D = process.cwd();
+// Whichever row throws, the directory goes.
+process.on("exit", () => {
+  try {
+    process.chdir(start);
+    fs.rmSync(made, { recursive: true, force: true });
+  } catch {}
+});
 const root = D.slice(0, 3);
 const share = "\\\\localhost\\" + D[0] + "$";
 const scrub = (s) =>
@@ -305,6 +312,16 @@ for (const [name, options] of [["{}", {}], ["encoding", { encoding: "utf8" }], [
 await later("fs.writeFile empty, flag wx on a file", () => called((cb) => fs.writeFile("old.txt", "", { flag: "wx" }, cb)));
 await later("fs.writeFile empty, flag r on a file", () => called((cb) => fs.writeFile("old.txt", "", { flag: "r" }, cb)));
 await later("fs.writeFile empty, missing parent", () => called((cb) => fs.writeFile("no-such/new.txt", "", cb)));
+// A signal that has not fired changes nothing: the write is still issued.
+for (const [name, f] of [
+  ["fs.writeFile empty, flag r", (signal, cb) => fs.writeFile("old.txt", "", { flag: "r", signal }, cb)],
+  ["fs.writeFile empty on d, flag a", (signal, cb) => fs.writeFile("d", "", { flag: "a", signal }, cb)],
+  ["fs.appendFile empty on d", (signal, cb) => fs.appendFile("d", "", { signal }, cb)],
+  ["fs.appendFile empty buffer on d", (signal, cb) => fs.appendFile("d", Buffer.alloc(0), { signal }, cb)],
+  ["fs.appendFile empty on a file", (signal, cb) => fs.appendFile("old.txt", "", { signal }, cb)],
+]) {
+  await later(name + ", live signal", () => called((cb) => f(new AbortController().signal, cb)));
+}
 await later("fs.writeFile fd empty on a read-only file", async () => {
   const fd = fs.openSync("d/a.txt", "r");
   try {
@@ -399,6 +416,20 @@ for (const flag of ["r", "r+", "a"]) {
   });
 }
 
+// --- a share that is no disk has no root to open ------------------------------
+if (fs.existsSync(share)) {
+  for (const ipc of ["\\\\localhost\\IPC$", "\\\\localhost\\IPC$\\"]) {
+    for (const flag of ["r", "r+", "a", "ax", "w", "wx"]) {
+      show("openSync " + ipc + " " + flag, () => fs.openSync(ipc, flag));
+    }
+    show("readFileSync " + ipc, () => fs.readFileSync(ipc));
+    show("writeFileSync " + ipc, () => fs.writeFileSync(ipc, ""));
+    show("appendFileSync " + ipc, () => fs.appendFileSync(ipc, ""));
+    await later("promises.open " + ipc, () => fs.promises.open(ipc, "r"));
+    await later("fs.appendFile " + ipc, () => called((cb) => fs.appendFile(ipc, "", cb)));
+  }
+}
+
 // --- a drive or share root is a directory too ---------------------------------
 // Read-only: whether a root opens for writing is the caller's privilege.
 const roots = [root, "\\", "/"];
@@ -424,6 +455,3 @@ for (const r of roots) {
     return isDir;
   });
 }
-
-process.chdir(start);
-fs.rmSync(made, { recursive: true, force: true });

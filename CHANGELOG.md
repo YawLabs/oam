@@ -35,10 +35,10 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   root `EPERM`. Conformance case 392.
 - **Callback `fs.writeFile` and `fs.appendFile` issue their write even for no data.** node's
   callback forms write once before looking at what is left, so the descriptor answers:
-  `fs.writeFile(fdOpenedForRead, "", cb)` is `EBADF` `write` and `fs.appendFile(dir, "", cb)`
-  on Windows `EISDIR` `write`, where oam called back with no error. The sync and promise
-  forms skip an empty write in both runtimes; so, still, does a callback call given a
-  `signal`.
+  `fs.writeFile(fdOpenedForRead, "", cb)` and `fs.writeFile(path, "", { flag: "r" }, cb)`
+  are `EBADF` `write`, where oam called back with no error, and
+  `fs.appendFile(dir, "", cb)` on Windows stays `EISDIR` `write` now that the directory
+  opens. The sync and promise forms skip an empty write in both runtimes.
 - **On Windows `stat` reports a directory's size as 0.** `statSync("C:\\").size` was the
   root's index allocation (12288 on NTFS); libuv reports 0 for every directory.
 

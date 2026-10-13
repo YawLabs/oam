@@ -3736,10 +3736,13 @@ corners are left.
   file opened `"a"`).
 - Numeric flags open as the nearest flag string (see "Open flags the natives cannot
   spell"), so on a directory one that maps to `"w"` -- `O_WRONLY` without `O_APPEND`, or
-  with `O_CREAT` -- fails `EISDIR` where node returns a descriptor, and `O_TRUNC` without
-  `O_CREAT` opens it where node fails `EINVAL`.
+  with `O_CREAT` -- fails `EISDIR` where node returns a descriptor. `O_TRUNC` without
+  `O_CREAT` is `EINVAL` in node; in oam it opens the directory (alone, or with `O_RDWR`)
+  or fails `EISDIR` (with `O_WRONLY`).
 - A truncating open through a junction or directory symlink whose target is gone fails
   `EPERM`; node's fails `ENOENT`. Neither creates anything.
+- An exclusive open (`wx`, `wx+`, `ax`, `ax+`) through such a link fails `EEXIST` and
+  creates nothing; node's creates the target as a directory and returns its descriptor.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 
