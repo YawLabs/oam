@@ -16,6 +16,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-10-13
+
 ### Fixed
 
 - **On Windows `readdir` of a link of the wrong kind reports what node does (#285).** oam
@@ -35,11 +37,6 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `opendirSync`'s error carries no `path` (`ENOTDIR: not a directory, opendir`).
 - **On Windows `opendir("")` lists the current directory**, as node's does, with `dir.path`
   still `""`; it failed `ENOENT`. `readdir("")` is `ENOENT` in both.
-
-## [0.19.1] - 2026-10-13
-
-### Fixed
-
 - **On Windows a directory opens, as node's does (#284).** oam opened through std without
   `FILE_FLAG_BACKUP_SEMANTICS`, which libuv asks for on every path and without which
   Windows opens no directory at all, so every open node allows failed `EPERM`. Now
