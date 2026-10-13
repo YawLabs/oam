@@ -2037,9 +2037,10 @@ fn unix_errno_code(raw: i32) -> Option<&'static str> {
 ///   gets here -- std's handle read returns `Ok(0)` for ERROR_BROKEN_PIPE --
 ///   so what reaches this table is a write's.
 ///
-/// Where libuv changes the answer for one operation only -- readdir's
-/// `ENOTDIR`, mkdir's `EINVAL` -- that is `fs_error_at`'s job, not this
-/// table's: the same code means something else at another call site
+/// Where libuv changes the answer for one operation only -- mkdir's
+/// `EINVAL`, readlink's -- that is `fs_error_at`'s job (and for a listing
+/// `ops::readdir_to_json`'s), not this table's: the same code means
+/// something else at another call site
 /// (ERROR_DIRECTORY from CreateProcessW is a bad working directory, `ENOENT`).
 #[cfg(windows)]
 fn windows_error_code(raw: i32) -> &'static str {
@@ -2782,7 +2783,10 @@ impl FsPath {
     /// fails `ENOENT: ..., scandir 'C:\cwd\f\'` where `f` is a file, though
     /// `statSync("f\\")` and `openSync("f\\")` answer for `f` (v22.22.2,
     /// measured: `f\`, `f/` and `f\\` keep one separator, `f\.` keeps
-    /// none). `opendir` does not keep it.
+    /// none). `opendir` does not keep it. The code is the open's, so it is
+    /// not `ENOENT` everywhere: under a directory itself reached through a
+    /// junction or symlink the same open succeeds, and the answer is `ENOTDIR`
+    /// in both runtimes.
     pub fn for_scandir(path: String) -> Self {
         let trailing = cfg!(windows) && path.ends_with(['\\', '/']);
         let mut found = Self::new(path);
@@ -5176,8 +5180,13 @@ pub mod ops {
     ///   FILE_FLAG_BACKUP_SEMANTICS and following links, and reports that
     ///   open's failure: `EPERM` for a file symlink to a directory, `ENOENT`
     ///   for a directory symlink or junction to a file, and for a file named
-    ///   with a trailing separator. What opens and is no directory fails the
-    ///   listing: `ENOTDIR`.
+    ///   with a trailing separator (unless one of its directories is a link).
+    ///   What opens and is no directory fails the listing: `ENOTDIR`, which
+    ///   is also the answer for a root that is no disk (`\\srv\IPC$`). The
+    ///   open here is the bare one, not `open_path`: that refusal is
+    ///   `fs.open`'s.
+    /// - fs__opendir (`raw`) lists an empty path as the current directory;
+    ///   that one is the caller's to arrange (node_compat's `opendirPath`).
     /// - fs__opendir (`raw`) reads the path's own attributes, a link's
     ///   rather than its target's, and reports `ENOTDIR` when they are not a
     ///   directory's -- a file symlink, wherever it leads. Attributes that
@@ -5201,10 +5210,10 @@ pub mod ops {
         }
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
-        match super::open_path(super::opens_as_libuv(&mut options), path) {
+        match super::opens_as_libuv(&mut options).open(path) {
             Err(open) => open,
-            Ok(opened) if opened.metadata().is_ok_and(|m| !m.is_dir()) => not_a_directory(),
-            Ok(_) => error,
+            Ok(opened) if opened.metadata().is_ok_and(|m| m.is_dir()) => error,
+            Ok(_) => not_a_directory(),
         }
     }
 
@@ -7313,7 +7322,10 @@ mod os_error_code_tests {
     #[cfg(windows)]
     #[test]
     fn windows_a_listing_of_what_is_no_directory() {
-        let dir = whole_file_dir("listing");
+        // The directory's real path: through a junction or symlink above it
+        // the open of `f.txt\` succeeds and the answer is ENOTDIR (in node
+        // too), and a temp directory may be reached through one.
+        let dir = std::fs::canonicalize(whole_file_dir("listing")).unwrap();
         let dir_s = dir.to_str().unwrap();
         let file = dir.join("f.txt");
         std::fs::write(&file, b"f").unwrap();

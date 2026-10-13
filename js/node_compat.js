@@ -9715,6 +9715,14 @@
     isSocket() { return false; }
   }
 
+  // The path opendir lists. On Windows node's opendir of an empty path
+  // lists the current directory, in all three forms and with `dir.path`
+  // still `""` (v22.22.2, measured); everywhere else, and for readdir on
+  // every platform, an empty path is ENOENT.
+  function opendirPath(dirPath) {
+    return dirPath === "" && process.platform === "win32" ? "." : dirPath;
+  }
+
   // node's fs.Dir. Was two ad-hoc object literals (one per opendir form),
   // which left `fs.Dir` unexported and gave each form only half the method
   // set -- an opendirSync() handle had no read()/close(), an opendir() handle
@@ -11568,7 +11576,7 @@
       opendir: withPath(async function (dirPath) {
         // Raw order: node's Dir reads through uv_fs_readdir, which never
         // sorts, where readdir's scandir sorts on unix.
-        return new Dir(dirPath, await natives.fsReaddir(dirPath, true));
+        return new Dir(dirPath, await natives.fsReaddir(opendirPath(dirPath), true));
       }),
       cp: (src, dest, options) => cpRecursive(toPath(src, "src"), toPath(dest, "dest"), options),
       // node's order: the path, the flags, the mode.
@@ -12713,7 +12721,7 @@
       },
       opendirSync: function (path) {
         var dirPath = toPath(path);
-        return new Dir(dirPath, natives.fsReaddirSync(dirPath, true));
+        return new Dir(dirPath, natives.fsReaddirSync(opendirPath(dirPath), true));
       },
       cpSync: function cpSync(src, dest, options) {
         cpSyncWalk(toPath(src, "src"), toPath(dest, "dest"), options || {}, true);

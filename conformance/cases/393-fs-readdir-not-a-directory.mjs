@@ -37,7 +37,11 @@ process.on("exit", () => {
   } catch {}
 });
 
-const scrub = (s) => (typeof s === "string" ? s.split(D).join("<D>").split(made).join("<D>") : s);
+// node shows `\\?\\\srv\sh\x` with the prefix off and no `\\` back on, so a temp
+// directory on a share is scrubbed without its leading separators too.
+const bare = D.startsWith("\\\\") ? D.slice(2) : D;
+const scrub = (s) =>
+  typeof s === "string" ? s.split(D).join("<D>").split(made).join("<D>").split(bare).join("<D>") : s;
 const shape = (e) =>
   e && e.code
     ? `${e.code} ${e.errno} ${e.syscall} path=${JSON.stringify(scrub(e.path))} ${scrub(e.message)}`
@@ -53,7 +57,8 @@ fs.mkdirSync("dir");
 fs.writeFileSync("dir/a.txt", "a");
 fs.writeFileSync("file.txt", "f");
 
-const names = ["dir", "file.txt", "missing", "file.txt/x", "dir/a.txt", "dir/a.txt/x", "dir/missing"];
+// The empty path: opendir lists the current directory on Windows.
+const names = ["dir", "file.txt", "missing", "", "file.txt/x", "dir/a.txt", "dir/a.txt/x", "dir/missing"];
 // A trailing separator, and what is not one.
 for (const base of ["dir", "file.txt", "missing", "dir/a.txt"]) {
   names.push(base + "/", base + "//", base + "/.", base + "/./");
@@ -62,6 +67,11 @@ for (const base of ["dir", "file.txt", "missing", "dir/a.txt"]) {
 if (win) {
   names.push(path.join(D, "file.txt") + "\\", "\\\\?\\" + path.join(D, "file.txt") + "\\", "\\\\?\\" + path.join(D, "file.txt"));
   names.push(path.join(D, "dir") + "\\", "\\\\?\\" + path.join(D, "dir") + "\\");
+}
+
+// The root of a share that is no disk: it opens, and is no directory.
+if (win && fs.existsSync("\\\\localhost\\" + D[0] + "$")) {
+  names.push("\\\\localhost\\IPC$", "\\\\localhost\\IPC$\\");
 }
 
 if (win) {

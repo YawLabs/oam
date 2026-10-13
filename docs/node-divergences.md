@@ -3674,7 +3674,8 @@ what is left:
 node's `fs` and module loader hand the OS every path through `path.toNamespacedPath`:
 resolved against the cwd (which normalises `.` / `..` and drops a trailing separator) and
 prefixed with `\\?\`, which turns off Win32 path normalisation, so the OS does not strip
-trailing dots and spaces and does not treat DOS device names as devices. oam does the same
+trailing dots and spaces and does not treat DOS device names as devices. (`readdir` alone
+keeps one trailing separator, in both runtimes: conformance case 393.) oam does the same
 (up to 0.17.1 it passed the path as given) in its `fs` ops, `require`, `import`, the main
 entry, `oam.readTextFile` and native addon loading: `readFileSync("sub/")` fails `EISDIR`
 `read`, `readFileSync("NUL")` and `statSync(".env.")` fail `ENOENT`,
@@ -3694,6 +3695,15 @@ directory symlink, because std has no junction call on stable Rust. The link wor
 way; the difference is that a symlink needs the create-symlink privilege (Developer Mode or
 an elevated process), which a junction does not, so where that privilege is missing oam's
 call fails `EPERM` and node's succeeds. Measured against v22.22.2 (conformance case 377).
+
+### Windows `readdir` of a volume or the pipe namespace lists it
+
+`readdir` reports what libuv's scandir does for a path that fails to list (conformance case
+393), but a listing that works is not looked at again. Three spellings list in oam where
+node v22.22.2 refuses them: `readdirSync("\\\\?\\C:")` and `readdirSync("\\\\.\\C:")` (the
+volume, not its root directory) are `EPERM` `scandir` in node, and
+`readdirSync("\\\\.\\pipe")` without a trailing separator is `ENOTDIR`. `opendir` lists all
+three in both runtimes.
 
 ### Windows directory descriptors: the corners left
 

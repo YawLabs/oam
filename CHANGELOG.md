@@ -33,6 +33,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **A failed `opendir` names `opendir`.** `fs.opendir`, `fs.promises.opendir` and
   `opendirSync` reported syscall `scandir` on every platform; node reports `opendir`, and
   `opendirSync`'s error carries no `path` (`ENOTDIR: not a directory, opendir`).
+- **On Windows `opendir("")` lists the current directory**, as node's does, with `dir.path`
+  still `""`; it failed `ENOENT`. `readdir("")` is `ENOENT` in both.
 
 ## [0.19.1] - 2026-10-13
 
