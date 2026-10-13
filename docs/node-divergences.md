@@ -3730,8 +3730,9 @@ corners are left.
   with `O_CREAT` -- fails `EISDIR` where node returns a descriptor. `O_TRUNC` without
   `O_CREAT` is `EINVAL` in node; in oam it opens the directory (alone, or with `O_RDWR`)
   or fails `EISDIR` (with `O_WRONLY`).
-- A truncating open through a junction or directory symlink whose target is gone fails
-  `EPERM`; node's fails `ENOENT`. Neither creates anything.
+- `fstatSync` of a console opened by name to write (`openSync("\\\\.\\CON", "w")`,
+  `"\\\\.\\CONOUT$"` opened `"w"` or `"a"`) answers with the console's shape; node's
+  fails `EISDIR` `fstat`. The open itself matches (conformance case 394).
 - An exclusive open (`wx`, `wx+`, `ax`, `ax+`) through such a link fails `EEXIST` and
   creates nothing; node's creates the target as a directory and returns its descriptor.
 

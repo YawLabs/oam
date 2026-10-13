@@ -2316,14 +2316,12 @@ pub struct FsError {
 /// Every rule here is Windows-only, and each is a place where the generic
 /// table alone gives node's code for the wrong operation:
 ///
-/// - A truncating open (`w`, `w+`, `writeFile`) is the one open that does
-///   not ask for FILE_FLAG_BACKUP_SEMANTICS (`opens_as_libuv`), so a
-///   DIRECTORY does not open for it: ERROR_ACCESS_DENIED, which the table
-///   reads as `EPERM`. libuv's CREATE_ALWAYS fails ERROR_FILE_EXISTS there,
-///   which fs__open turns into `EISDIR` -- whatever the directory's ACL or
-///   sharing says, since the name collides before either is asked.
-/// - A drive or share root does not open at all without that flag, and fails
-///   not-found; node's truncating open of a root is refused `EPERM`.
+/// - A truncating open (`w`, `w+`, `writeFile`) of a DIRECTORY fails
+///   ERROR_FILE_EXISTS -- CREATE_ALWAYS (`create_always`) collides with the
+///   name before the directory's ACL or sharing is asked -- which the table
+///   reads as `EEXIST` and fs__open turns into `EISDIR` for any open that
+///   creates and is not exclusive. A root is refused ERROR_ACCESS_DENIED,
+///   the table's `EPERM`, with no rule.
 /// - fs__mkdir reports ERROR_INVALID_NAME and ERROR_DIRECTORY as `EINVAL`. Not
 ///   for a recursive mkdir: node's MKDirp re-stats the path after the failure
 ///   and reports `ENOENT`.
@@ -2350,8 +2348,7 @@ pub fn fs_error_at(
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{
-            ERROR_ACCESS_DENIED, ERROR_DIRECTORY, ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME,
-            ERROR_NOT_A_REPARSE_POINT, ERROR_PATH_NOT_FOUND,
+            ERROR_DIRECTORY, ERROR_FILE_EXISTS, ERROR_INVALID_NAME, ERROR_NOT_A_REPARSE_POINT,
         };
         let raw = error.raw_os_error().and_then(|r| u32::try_from(r).ok());
         let at = |code, syscall, has_path| FsError {
@@ -2375,25 +2372,10 @@ pub fn fs_error_at(
             FsSite::Open(flags) => flags.contains('w') && !flags.contains('x'),
             _ => false,
         };
-        if truncates && std::path::Path::new(path).is_dir() {
-            match raw {
-                // A drive or share root (`\\?\C:\`, `\\?\UNC\srv\sh\`): a
-                // drive fails ERROR_PATH_NOT_FOUND, a share ERROR_INVALID_NAME.
-                Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_INVALID_NAME) => {
-                    return at("EPERM", syscall, true);
-                }
-                // A share root spelled without its separator
-                // (`\\?\UNC\srv\sh`) is refused as any directory is, and is
-                // a root all the same.
-                Some(ERROR_ACCESS_DENIED) if is_root(path) => {
-                    return at("EPERM", syscall, true);
-                }
-                Some(ERROR_ACCESS_DENIED) => return at("EISDIR", syscall, true),
-                _ => {}
-            }
+        if truncates && raw == Some(ERROR_FILE_EXISTS) {
+            return at("EISDIR", syscall, true);
         }
     }
-    #[cfg(not(windows))]
     let _ = (site, path);
     plain
 }
@@ -2445,12 +2427,9 @@ impl WholeFileError {
 /// ERROR_INVALID_FUNCTION, the table's `EISDIR`. The flag changes nothing for
 /// a regular file. Every open behind a node descriptor or a whole-file
 /// operation goes through here, but one: a TRUNCATING open (`w`, `w+`,
-/// `writeFile`). node's never opens a directory -- CREATE_ALWAYS fails on
-/// one -- and std's is not CREATE_ALWAYS: it opens what is there and then
-/// truncates it, so with the flag it would open the directory before failing,
-/// and through a junction or directory symlink whose target is gone it would
-/// CREATE that target as a directory. Without the flag it opens no directory
-/// and makes none, and `fs_error_at` names the refusal as node does.
+/// `writeFile`), which on Windows is not std's open at all
+/// (`create_always`, which asks for the flag itself). Elsewhere the flag
+/// does not exist and this is a no-op.
 pub fn opens_as_libuv(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
     #[cfg(windows)]
     {
@@ -2461,13 +2440,18 @@ pub fn opens_as_libuv(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenO
     options
 }
 
-/// Whether `path` is a drive or share root: a prefix with nothing under it.
+/// Whether `path` is the root of a share: a UNC prefix with nothing under
+/// it. Not a device (`\\.\CON`), which is a prefix with nothing under it
+/// too, and which node opens or refuses as CreateFileW does.
 #[cfg(windows)]
-fn is_root(path: impl AsRef<std::path::Path>) -> bool {
-    use std::path::Component;
-    let mut parts = path.as_ref().components();
-    matches!(parts.next(), Some(Component::Prefix(_)))
-        && parts.all(|part| matches!(part, Component::RootDir))
+fn is_share_root(path: &std::path::Path) -> bool {
+    use std::path::{Component, Prefix};
+    let mut parts = path.components();
+    matches!(
+        parts.next(),
+        Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
+    ) && parts.all(|part| matches!(part, Component::RootDir))
 }
 
 /// `options.open(path)`, after refusing the one path FILE_FLAG_BACKUP_SEMANTICS
@@ -2482,18 +2466,118 @@ pub fn open_path(
     path: impl AsRef<std::path::Path>,
 ) -> std::io::Result<std::fs::File> {
     #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
-        if is_root(&path) {
-            match std::fs::metadata(&path) {
-                Err(e) if e.raw_os_error() == i32::try_from(ERROR_INVALID_PARAMETER).ok() => {
-                    return Err(e);
-                }
-                _ => {}
+    refuse_a_root_that_is_no_disk(path.as_ref())?;
+    options.open(path)
+}
+
+/// `open_path`'s refusal, for the two opens that share it.
+#[cfg(windows)]
+fn refuse_a_root_that_is_no_disk(path: &std::path::Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+    if is_share_root(path) {
+        match std::fs::metadata(path) {
+            Err(e) if e.raw_os_error() == i32::try_from(ERROR_INVALID_PARAMETER).ok() => {
+                return Err(e);
             }
+            _ => {}
         }
     }
-    options.open(path)
+    Ok(())
+}
+
+/// node's TRUNCATING open (`w`, `w+`, `writeFile`) as libuv's fs__open
+/// makes it (src/win/fs.c, v1.51.0): one CreateFileW with CREATE_ALWAYS,
+/// FILE_ATTRIBUTE_NORMAL and FILE_FLAG_BACKUP_SEMANTICS, sharing everything.
+///
+/// std has no way to ask for CREATE_ALWAYS. Its `create(true).truncate(true)`
+/// is OPEN_ALWAYS and then a truncation of the handle it got, which is a
+/// different operation wherever the two disagree, and node's answers are
+/// CREATE_ALWAYS's (v22.22.2, measured; conformance case 394):
+///
+/// - a named pipe opens, and so does `\\.\CON`: there is nothing to
+///   truncate, and std's truncation failed ERROR_INVALID_PARAMETER --
+///   `EINVAL` from an open that had already connected to the pipe's server
+///   (#320);
+/// - a hidden or system file is refused, ERROR_ACCESS_DENIED: CREATE_ALWAYS
+///   must be given the attributes the file has. std emptied it (#321);
+/// - the file is REPLACED: its alternate data streams go and its attributes
+///   are reset to the archive bit, where std kept both;
+/// - a directory is a name collision, ERROR_FILE_EXISTS, which `fs_error_at`
+///   reads as libuv does -- `EISDIR` -- and nothing is created through a link
+///   whose target is gone.
+///
+/// `read` is `w+`. The path is the OS path as node hands it to libuv
+/// (`FsPath::os`), passed as it is.
+#[cfg(windows)]
+fn create_always(path: &std::path::Path, read: bool) -> std::io::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    // CreateFileW reads a name up to its first NUL, and would open the file
+    // named by what comes before one; std refuses such a path the same way.
+    if wide.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file name contained an unexpected NUL byte",
+        ));
+    }
+    wide.push(0);
+    let access = if read {
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE
+    } else {
+        FILE_GENERIC_WRITE
+    };
+    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the call;
+    // the security attributes and the template handle are null, which
+    // CreateFileW documents as optional, and every other argument is a
+    // constant.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `handle` is the open handle CreateFileW just returned (it is
+    // not INVALID_HANDLE_VALUE), nothing else has seen it, and the File takes
+    // the one ownership of it. It was not opened FILE_FLAG_OVERLAPPED, which
+    // is what File's synchronous reads and writes need.
+    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+}
+
+/// How node opens a path for one fopen-style flag: `open_options_for`'s
+/// answer. Everything but a truncating open on Windows is std's OpenOptions
+/// (through `open_path`); that one is `create_always`.
+#[derive(Debug)]
+pub struct NodeOpen {
+    options: std::fs::OpenOptions,
+    /// A truncating open, and whether it also reads (`w+`).
+    #[cfg(windows)]
+    truncating: Option<bool>,
+}
+
+impl NodeOpen {
+    pub fn open(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
+        #[cfg(windows)]
+        if let Some(read) = self.truncating {
+            refuse_a_root_that_is_no_disk(path.as_ref())?;
+            return create_always(path.as_ref(), read);
+        }
+        open_path(&self.options, path)
+    }
 }
 
 /// `fs.readFile` of a path: `std::fs::read`, with the open and the read kept
@@ -2569,16 +2653,9 @@ fn read_opened(
 /// or `fs.appendFile` (create + append) of a path, with the open and the write
 /// kept apart.
 pub fn write_whole_file(path: &str, data: &[u8], append: bool) -> Result<(), WholeFileError> {
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .create(true)
-        .write(!append)
-        .truncate(!append)
-        .append(append);
-    if append {
-        opens_as_libuv(&mut options);
-    }
-    let file = open_path(&options, path).map_err(WholeFileError::Open)?;
+    let file = open_options_for(if append { "a" } else { "w" })
+        .open(path)
+        .map_err(WholeFileError::Open)?;
     write_opened(&file, data)
 }
 
@@ -3861,7 +3938,7 @@ mod fs_os_path_tests {
 /// `fs.promises.open(p, "r+")` failed with `fs_open: unknown mode 'r+'` --
 /// not even a node-shaped error -- and every read/write-mode flag was
 /// unreachable from `fs.promises.open` and callback `fs.open`.
-pub fn open_options_for(flags: &str) -> std::fs::OpenOptions {
+pub fn open_options_for(flags: &str) -> NodeOpen {
     let mut oo = std::fs::OpenOptions::new();
     match flags {
         "r" => {
@@ -3898,11 +3975,20 @@ pub fn open_options_for(flags: &str) -> std::fs::OpenOptions {
             oo.read(true);
         }
     }
-    // Not the truncating opens: see `opens_as_libuv`.
+    // Not the truncating opens, which on Windows are not std's at all: see
+    // `create_always`.
     if !matches!(flags, "w" | "w+") {
         opens_as_libuv(&mut oo);
     }
-    oo
+    NodeOpen {
+        options: oo,
+        #[cfg(windows)]
+        truncating: match flags {
+            "w" => Some(false),
+            "w+" => Some(true),
+            _ => None,
+        },
+    }
 }
 
 /// `write_all`, except that an EMPTY buffer still issues one write syscall.
@@ -6421,7 +6507,7 @@ pub mod ops {
         // descriptor lands in the ONE registry the sync family also reads.
         // tokio::fs::open is this exact call on this exact pool.
         let owned = path.clone();
-        let opened = tokio::task::spawn_blocking(move || super::open_path(&options, &owned)).await;
+        let opened = tokio::task::spawn_blocking(move || options.open(&owned)).await;
         let opened = match opened {
             Ok(r) => r,
             Err(e) => return node_fail(std::io::Error::other(e.to_string()), "open", &path),
@@ -7161,21 +7247,23 @@ mod os_error_code_tests {
             has_path,
         };
 
-        // A truncating open of a directory is refused where libuv's collides
-        // with the name: node's EISDIR. Every other open of one that is
-        // denied is the ACL's EPERM -- the directory would have opened.
+        // A truncating open of a directory collides with the name: node's
+        // EISDIR. Any open that is denied is the table's EPERM -- a hidden
+        // file's, a root's, an ACL's.
         let denied = raw(ERROR_ACCESS_DENIED);
         for site in [FsSite::Open("w"), FsSite::Open("w+"), FsSite::WriteFile] {
             assert_eq!(
-                fs_error_at(site, "open", dir_s, &denied),
+                fs_error_at(site, "open", dir_s, &raw(ERROR_FILE_EXISTS)),
                 expect("EISDIR", "open", true),
                 "{site:?}"
             );
-            assert_eq!(
-                fs_error_at(site, "open", file_s, &denied),
-                expect("EPERM", "open", true),
-                "{site:?}"
-            );
+            for path in [dir_s, file_s] {
+                assert_eq!(
+                    fs_error_at(site, "open", path, &denied),
+                    expect("EPERM", "open", true),
+                    "{site:?} {path}"
+                );
+            }
         }
         for site in [
             FsSite::ReadFile,
@@ -7373,6 +7461,119 @@ mod os_error_code_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A truncating open REPLACES the file, as libuv's CREATE_ALWAYS does
+    /// and std's open-then-truncate did not: an alternate data stream goes
+    /// with the file it was on, a hidden file is refused (`EPERM`; `r+` and
+    /// `a` still open it), and `w+` reads what it wrote. A named pipe is
+    /// conformance case 394's.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_truncating_open_replaces_the_file() {
+        use std::io::{Read, Seek, Write};
+        let dir = whole_file_dir("create-always");
+        let file = dir.join("f.txt");
+        let file_s = file.to_str().unwrap();
+        let stream = format!("{file_s}:side");
+        let fill = || {
+            std::fs::write(&file, b"0123456789").unwrap();
+            std::fs::write(&stream, b"stream").unwrap();
+        };
+        for flags in ["r+", "a", "a+"] {
+            fill();
+            drop(open_options_for(flags).open(file_s).unwrap());
+            assert_eq!(std::fs::read(&stream).unwrap(), b"stream", "{flags}");
+            assert_eq!(std::fs::metadata(&file).unwrap().len(), 10, "{flags}");
+        }
+        for flags in ["w", "w+"] {
+            fill();
+            let mut opened = open_options_for(flags).open(file_s).unwrap();
+            assert_eq!(opened.metadata().unwrap().len(), 0, "{flags}");
+            assert!(std::fs::read(&stream).is_err(), "{flags}");
+            opened.write_all(b"new").unwrap();
+            opened.rewind().unwrap();
+            let mut back = String::new();
+            let read = opened.read_to_string(&mut back);
+            if flags == "w+" {
+                read.unwrap();
+                assert_eq!(back, "new");
+            } else {
+                assert_eq!(fd_error_code(&read.unwrap_err()), "EBADF");
+            }
+        }
+        fill();
+        write_whole_file(file_s, b"x", false).unwrap();
+        assert!(std::fs::read(&stream).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"x");
+        // A missing file is made; a missing directory is not.
+        let fresh = dir.join("fresh.txt");
+        drop(open_options_for("w").open(&fresh).unwrap());
+        assert!(fresh.is_file());
+        let failed = open_options_for("w")
+            .open(dir.join("no").join("f"))
+            .unwrap_err();
+        assert_eq!(node_error_code(&failed), "ENOENT");
+        // The name ends at a NUL for CreateFileW; it is refused before that.
+        let failed = open_options_for("w")
+            .open(format!("{file_s}\0x"))
+            .unwrap_err();
+        assert_eq!(failed.kind(), std::io::ErrorKind::InvalidInput);
+
+        // A hidden file: CREATE_ALWAYS must be handed the attributes it has.
+        fill();
+        let hide = std::process::Command::new("attrib")
+            .args(["+h", file_s])
+            .status();
+        if hide.is_ok_and(|status| status.success()) {
+            for flags in ["w", "w+"] {
+                let failed = open_options_for(flags).open(file_s).unwrap_err();
+                assert_eq!(
+                    fs_error_at(FsSite::Open(flags), "open", file_s, &failed).code,
+                    "EPERM",
+                    "{flags}: {failed:?}"
+                );
+            }
+            let failed = write_whole_file(file_s, b"x", false).unwrap_err();
+            assert_eq!(
+                whole_file_error(FsSite::WriteFile, file_s, &failed).code,
+                "EPERM"
+            );
+            assert_eq!(std::fs::metadata(&file).unwrap().len(), 10);
+            for flags in ["r+", "a"] {
+                drop(open_options_for(flags).open(file_s).unwrap());
+            }
+            let _ = std::process::Command::new("attrib")
+                .args(["-h", file_s])
+                .status();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A device is no share root: `\\.\NUL` opens for every flag, the
+    /// truncating ones included, and the refusal `open_path` keeps for a
+    /// share that is no disk does not reach it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_device_opens_for_a_truncating_open() {
+        for name in [r"\\.\NUL", r"\\?\NUL"] {
+            assert!(!is_share_root(std::path::Path::new(name)), "{name}");
+            for flags in ["r", "r+", "w", "w+", "a"] {
+                let opened = open_options_for(flags).open(name);
+                assert!(opened.is_ok(), "{name} {flags}: {opened:?}");
+            }
+            write_whole_file(name, b"gone", false).unwrap();
+        }
+        for (name, root) in [
+            (r"\\.\CON", false),
+            (r"\\?\C:\", false),
+            (r"\\?\UNC\srv\IPC$", true),
+            (r"\\?\UNC\srv\IPC$\", true),
+            (r"\\srv\share\", true),
+            (r"\\srv\share\f", false),
+        ] {
+            assert_eq!(is_share_root(std::path::Path::new(name)), root, "{name}");
+        }
+    }
+
     /// A drive root or a UNC share root is a directory like any other for
     /// reading: it opens, and its readFile fails on the read (`EISDIR`,
     /// syscall `read`, no path). Any open of it for writing is refused
@@ -7448,7 +7649,7 @@ mod os_error_code_tests {
         let ipc = r"\\?\UNC\localhost\IPC$";
         if std::fs::metadata(ipc).is_err_and(|e| node_error_code(&e) == "EINVAL") {
             for flags in ["r", "r+", "a", "ax", "w", "wx"] {
-                let failed = open_path(&open_options_for(flags), ipc).unwrap_err();
+                let failed = open_options_for(flags).open(ipc).unwrap_err();
                 assert_eq!(
                     fs_error_at(FsSite::Open(flags), "open", ipc, &failed),
                     expect("EINVAL", "open", true),
