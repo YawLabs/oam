@@ -2504,6 +2504,13 @@ mod o_flag {
     pub const DIRECTORY: i32 = OFlags::DIRECTORY.bits() as i32;
     pub const NOFOLLOW: i32 = OFlags::NOFOLLOW.bits() as i32;
     pub const SYNC: i32 = OFlags::SYNC.bits() as i32;
+    // Not rustix's DSYNC on Linux: its raw backend spells that as O_SYNC's
+    // bits (it asks the kernel for the stronger guarantee), and node's
+    // `fs.constants.O_DSYNC` is the kernel's own O_DSYNC -- 0o10000 on the
+    // architectures oam is built for (x86_64, aarch64).
+    #[cfg(target_os = "linux")]
+    pub const DSYNC: i32 = 0o10000;
+    #[cfg(not(target_os = "linux"))]
     pub const DSYNC: i32 = OFlags::DSYNC.bits() as i32;
     pub const NONBLOCK: i32 = OFlags::NONBLOCK.bits() as i32;
     #[cfg(target_os = "linux")]

@@ -10863,6 +10863,10 @@ mod permission_audit {
         // checking a path the caller no longer names. Node draws the line in the
         // same place. Anything added to this list needs a reason of that quality.
         const EXEMPT: &[(&str, &str)] = &[
+            (
+                "op_fs_open_flag_bits",
+                "a table of constants: touches no file",
+            ),
             ("op_fs_read_chunk", "fd from a checked open()"),
             ("op_fs_write_chunk", "fd from a checked open()"),
             ("op_fs_close", "fd from a checked open()"),
