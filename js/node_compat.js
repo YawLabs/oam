@@ -10437,9 +10437,17 @@
   /// Natives always hand back raw bytes; encodings decode HERE via
   /// Buffer#toString so 'base64'/'hex'/'latin1'/... all behave (the
   /// Rust-side decode was utf8-only and silently wrong for the rest).
-  function decodeRead(bytes, encoding) {
+  ///
+  /// `emptyIsString`: the sync and callback forms of readFile decode with
+  /// `buffer.toString(encoding)`, which answers "" for an empty Buffer before
+  /// it looks the encoding up -- so with the `"buffer"` encoding (which the
+  /// options check lets through) nothing read is "", and something read is
+  /// ERR_UNKNOWN_ENCODING. fs.promises.readFile settles the encoding first
+  /// and refuses `"buffer"` whatever was read (measured on v22.22.2).
+  function decodeRead(bytes, encoding, emptyIsString) {
     const BufferCtor = globalThis.Buffer;
     const buf = BufferCtor.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (emptyIsString && encoding && buf.length === 0) return "";
     return encoding ? buf.toString(encoding) : buf;
   }
 
@@ -11629,7 +11637,7 @@
       const flag = readsWithFlag(options, falsyIsRead);
       if (flag === null) {
         const bytes = await natives.fsReadFile(file);
-        return decodeRead(bytes, readOptions(options).encoding ?? null);
+        return decodeRead(bytes, readOptions(options).encoding ?? null, !falsyIsRead);
       }
       const signal = readOptions(options).signal;
       const { handle } = await natives.fsOpen(file, flag);
@@ -11643,7 +11651,7 @@
           chunks.push(chunk);
         }
         const whole = globalThis.Buffer.concat(chunks);
-        return decodeRead(whole, readOptions(options).encoding ?? null);
+        return decodeRead(whole, readOptions(options).encoding ?? null, !falsyIsRead);
       } finally {
         natives.fsClose(handle);
       }
@@ -12324,9 +12332,22 @@
 
     // readFileSync(fd): everything from the descriptor's current position.
     // fstat first, as node's does, so a bad descriptor fails `fstat` -- and a
-    // negative one fails fstatSync's descriptor check.
-    function readFdSync(fd) {
-      fs.fstatSync(fd);
+    // negative one fails fstatSync's descriptor check. Not with `straight`:
+    // for a utf8 read node's binding reads the descriptor without a stat,
+    // and a bad one fails the `read`.
+    function readFdSync(fd, straight) {
+      if (!straight) fs.fstatSync(fd);
+      // No stat, and no range check either: the binding hands the number to
+      // the read, and a negative one is a descriptor that is not open.
+      else if (fd < 0) {
+        let errno;
+        for (const [number, [code]] of uvErrnoTable(natives)) if (code === "EBADF") errno = number;
+        const err = new Error("EBADF: bad file descriptor, read");
+        err.errno = errno;
+        err.code = "EBADF";
+        err.syscall = "read";
+        throw err;
+      }
       const chunks = [];
       let total = 0;
       for (;;) {
@@ -12430,27 +12451,50 @@
     // the call and never reaches the callback: it is thrown from that tick,
     // as an uncaught exception (v22.22.2, measured -- a try/catch around
     // fs.readFile(-1, cb) does not see it).
-    function readFdAsync(fd, cb) {
+    function readFdAsync(fd, cb, signal) {
       if (fd < 0) {
         const err = invalidFdError(fd, true);
         process.nextTick(() => { throw err; });
         return;
       }
-      fs.fstat(fd, (statErr) => {
-        if (statErr) return cb(statErr);
-        const chunks = [];
-        let total = 0;
-        const next = () => {
-          const chunk = globalThis.Buffer.allocUnsafe(65536);
-          fs.read(fd, chunk, 0, chunk.length, null, (err, n) => {
-            if (err) return cb(err);
-            if (n === 0) return cb(null, globalThis.Buffer.concat(chunks, total));
-            chunks.push(n === chunk.length ? chunk : chunk.subarray(0, n));
-            total += n;
-            next();
-          });
-        };
-        next();
+      // What node's callback readFile does with a failure on a descriptor it
+      // was HANDED (lib/internal/fs/read/context.js, v22.22.2): its close
+      // step skips the close -- the descriptor is the caller's -- and with it
+      // the line that keeps the error. So:
+      // - a read that fails ends the read, and the callback gets what was
+      //   read so far with no error: an empty Buffer for a descriptor opened
+      //   to write only, or for a directory;
+      // - a stat that fails (the descriptor is not open) leaves nothing to
+      //   hand back, and node's own Buffer.concat(null) is what the callback
+      //   hears about.
+      // Neither is the failure itself; both are what a program written
+      // against node sees.
+      //
+      // An aborted `signal` goes the same way: node checks it before every
+      // read and hands the abort to that close step, so the callback gets
+      // the bytes read before it and no error, and the descriptor stays
+      // where those reads left it.
+      //
+      // The stat is made a tick after the call, as node's is: a descriptor
+      // the caller closes right after calling is one the stat finds closed.
+      process.nextTick(() => {
+        fs.fstat(fd, (statErr) => {
+          if (statErr) return cb(codes.ERR_INVALID_ARG_TYPE("list", "Array", null));
+          const chunks = [];
+          let total = 0;
+          const done = () => cb(null, globalThis.Buffer.concat(chunks, total));
+          const next = () => {
+            if (signal && signal.aborted) return done();
+            const chunk = globalThis.Buffer.allocUnsafe(65536);
+            fs.read(fd, chunk, 0, chunk.length, null, (err, n) => {
+              if (err || n === 0) return done();
+              chunks.push(n === chunk.length ? chunk : chunk.subarray(0, n));
+              total += n;
+              next();
+            });
+          };
+          next();
+        });
       });
     }
 
@@ -12773,7 +12817,15 @@
         // before anything is opened.
         options = fsGetOptions(options, {});
         const enc = options.encoding;
-        if (isInt32(path)) return decodeRead(readFdSync(path), enc ?? null);
+        if (isInt32(path)) {
+          // node's fast path, by these two spellings exactly: its binding is
+          // handed the flag as bits, so a bad flag is refused here even
+          // though a descriptor has no use for one, and then reads without
+          // a stat. Any other encoding never looks at the flag.
+          const straight = enc === "utf8" || enc === "utf-8";
+          if (straight) openFlags(options.flag === undefined ? "r" : options.flag, natives);
+          return decodeRead(readFdSync(path, straight), enc ?? null, true);
+        }
         // Any flag but a read-only one: open with it, read the descriptor,
         // close it (see readFileAt).
         const given = options.flag;
@@ -12781,7 +12833,7 @@
         if (flag !== null && flag !== openFlags("r", natives)) {
           const fd = natives.fsOpenSync(toPath(path), flag);
           try {
-            return decodeRead(readFdSync(fd), enc ?? null);
+            return decodeRead(readFdSync(fd), enc ?? null, true);
           } finally {
             natives.fsCloseSync(fd);
           }
@@ -12790,7 +12842,7 @@
           return natives.fsReadFileUtf8Sync(toPath(path));
         }
         const bytes = natives.fsReadFileSync(toPath(path));
-        return decodeRead(bytes, enc ?? null);
+        return decodeRead(bytes, enc ?? null, true);
       },
       writeFileSync: (path, data, options) => writeFileSyncAt(path, data, writeFileOptions(options, false), false),
       appendFileSync: (path, data, options) => writeFileSyncAt(path, data, writeFileOptions(options, true), true),
@@ -13001,12 +13053,12 @@
           if (err) return cb(err);
           let out;
           try {
-            out = decodeRead(bytes, readOptions(options).encoding ?? null);
+            out = decodeRead(bytes, opts.encoding ?? null, true);
           } catch (e) {
             return cb(e);
           }
           cb(null, out);
-        });
+        }, opts.signal);
       },
       writeFile: fdOrPathWrite(promises.writeFile, false),
       appendFile: fdOrPathWrite(promises.appendFile, true),

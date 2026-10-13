@@ -3508,9 +3508,10 @@ Every `fs` call that takes a descriptor (`closeSync` / `close`, `fstat`, `read`,
 `futimes`, their `*Sync` forms, `truncate(fd)`, `readFile(fd)` / `writeFile(fd)` /
 `appendFile(fd)` and the streams' `fd` option) refuses one that is not an int32 in
 `[0, 2**31-1]` as node v22.22.2 does: `ERR_OUT_OF_RANGE` / `ERR_INVALID_ARG_TYPE`,
-thrown at the call, never `EBADF` (node's two exceptions included: `readFile(-1, cb)`
-throws a tick later, as an uncaught exception, and `writeFileSync(-1, utf8String)` is
-`EBADF`, see `conformance/cases/240-*`). Both of node's wordings are reproduced -- the JS
+thrown at the call, never `EBADF` (node's three exceptions included: `readFile(-1, cb)`
+throws a tick later, as an uncaught exception; `writeFileSync(-1, utf8String)` is
+`EBADF`, see `conformance/cases/240-*`; and `readFileSync(-1, "utf8")` is `EBADF`
+`read`, node's stat-less utf8 read, see `conformance/cases/400-*`). Both of node's wordings are reproduced -- the JS
 `getValidatedFd` (`read`, `write`, `readv`, `writev`, streams) and the C++ one (every
 `*Sync` form and the other callback forms) -- and so is where each check sits relative
 to the callback and the other arguments (`conformance/cases/246-*`, `247-*`). Before
@@ -3721,10 +3722,6 @@ A directory opens on Windows as it does in node (`FILE_FLAG_BACKUP_SEMANTICS`), 
 descriptor answers as node's does: conformance case 392, measured against v22.22.2. These
 corners are left.
 
-- Callback `fs.readFile(fd, cb)` on a directory descriptor fails `EISDIR` `read` (`EBADF`
-  on one opened `"a"`), as `readFileSync(fd)` and `FileHandle.readFile()` do in both
-  runtimes. node's callback form drops the failed read of a descriptor it was handed and
-  calls back with an empty Buffer.
 - `fs.openAsBlob("dir")` rejects `ERR_INVALID_ARG_VALUE`; node resolves a Blob of size 0.
 - `fstatSync` of a console opened by name to write (`openSync("\\\\.\\CON", "w")`,
   `"\\\\.\\CONOUT$"` opened `"w"` or `"a"`) answers with the console's shape; node's
