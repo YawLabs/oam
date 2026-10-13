@@ -2624,6 +2624,14 @@ impl OpenFlags {
         self.0 & !o_flag::HARMLESS != o_flag::RDONLY
     }
 
+    /// Whether the open needs the read grant: any access mode but
+    /// write-only, as node's rule has it (CheckOpenPermissions). An open is
+    /// asked for BOTH grants when it reads and writes -- `r+` hands back a
+    /// descriptor that can read the file.
+    pub fn reads(self) -> bool {
+        self.0 & (o_flag::WRONLY | o_flag::RDWR) != o_flag::WRONLY
+    }
+
     /// Creates a file that is missing and accepts one that is there: the
     /// opens libuv reports a name collision for as `EISDIR` (`fs_error_at`).
     pub fn creates_or_opens(self) -> bool {
@@ -7984,6 +7992,13 @@ mod os_error_code_tests {
         }
         assert!(OpenFlags(-1).writes());
         assert!(OpenFlags(i32::MIN).writes());
+        // The read grant: every access mode but write-only.
+        for flags in ["r", "r+", "w+", "a+", "wx+", "ax+", "rs+"] {
+            assert!(open_options_for(flags).reads(), "{flags}");
+        }
+        for flags in ["w", "a", "wx", "ax", "as"] {
+            assert!(!open_options_for(flags).reads(), "{flags}");
+        }
         // Delete-on-close is no read, whatever the access mode.
         #[cfg(windows)]
         {

@@ -10666,6 +10666,19 @@
   const writeEncoding = (encoding) =>
     typeof encoding === "string" && globalThis.Buffer.isEncoding(encoding) ? encoding : "utf8";
 
+  // Set by the fs/promises factory, read by the fs one (which loads it first).
+  let fsPromisesInternals;
+
+  // node's AbortError for an fs call given a signal that is aborted: named
+  // and coded as such, with the signal's reason as its cause.
+  const FsAbortError = class AbortError extends Error {
+    constructor(signal) {
+      super("The operation was aborted", { cause: signal.reason });
+      this.code = "ABORT_ERR";
+      this.name = "AbortError";
+    }
+  };
+
   // node's getOptions (lib/internal/fs/utils.js, v22.22.2): null, undefined
   // or a function is the defaults, a string is the encoding, anything else
   // that is not an object is ERR_INVALID_ARG_TYPE; then assertEncoding
@@ -11001,8 +11014,6 @@
   // deliberately redefinable getter (graceful-fs replaces it with its own
   // wrapper), while node's FileHandle uses the internal class regardless of
   // what userland last assigned.
-  // Set by the fs/promises factory, read by the fs one (which loads it first).
-  let fsPromisesInternals;
   let _rwStreams;
   function rwStreams(natives) {
     if (_rwStreams) return _rwStreams;
@@ -11620,10 +11631,13 @@
         const bytes = await natives.fsReadFile(file);
         return decodeRead(bytes, readOptions(options).encoding ?? null);
       }
+      const signal = readOptions(options).signal;
       const { handle } = await natives.fsOpen(file, flag);
       try {
         const chunks = [];
         for (;;) {
+          // node looks at the signal again between reads.
+          if (signal && signal.aborted) throw new FsAbortError(signal);
           const chunk = await natives.fsReadChunk(handle, 65536);
           if (chunk === undefined) break;
           chunks.push(chunk);
@@ -11676,8 +11690,16 @@
     };
     rawFsPromises = {
       // A FileHandle reads / writes through itself, as node's do.
-      readFile: (path, options) =>
-        fileHandles.has(path) ? path.readFile(options) : readFileAt(toPath(path), options, true),
+      // node's order: the options (a bad encoding or signal is refused
+      // before anything is opened -- with a flag, the open is what would
+      // empty or create the file), a FileHandle's own read, a signal already
+      // aborted, and only then the path and the flag.
+      readFile: (path, options) => {
+        const opts = fsGetOptions(options, {});
+        if (fileHandles.has(path)) return path.readFile(options);
+        if (opts.signal && opts.signal.aborted) return Promise.reject(new FsAbortError(opts.signal));
+        return readFileAt(toPath(path), opts, true);
+      },
       writeFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, false), false),
       appendFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, true), true),
       stat: withPath(async (file) => wrapStat(await natives.fsStat(file, false))),
@@ -12747,11 +12769,14 @@
       readFileSync: (path, options) => {
         // node checks the path before the flag.
         const openFlagsAfterPath = (p, flags) => (toPath(p), openFlags(flags, natives));
-        const enc = readOptions(options).encoding;
+        // The options first, as node's getOptions: a bad encoding is refused
+        // before anything is opened.
+        options = fsGetOptions(options, {});
+        const enc = options.encoding;
         if (isInt32(path)) return decodeRead(readFdSync(path), enc ?? null);
         // Any flag but a read-only one: open with it, read the descriptor,
         // close it (see readFileAt).
-        const given = readOptions(options).flag;
+        const given = options.flag;
         const flag = given === undefined ? null : openFlagsAfterPath(path, given);
         if (flag !== null && flag !== openFlags("r", natives)) {
           const fd = natives.fsOpenSync(toPath(path), flag);
@@ -12959,8 +12984,19 @@
         // node's `callback ||= options`, as in writeFile.
         if (!cb) cb = options;
         if (typeof options === "function") options = undefined;
-        if (!isInt32(path)) return readFileByPath(path, options, cb);
+        // node's order (lib/fs.js readFile): the callback, the options, then
+        // -- for a path -- a signal already aborted (reported to the
+        // callback, at once), the flag (thrown from the call, and named
+        // "options.flag"), and the path last. All before anything is opened:
+        // with a flag, the open is what would empty or create the file.
         validateCb(cb);
+        const opts = fsGetOptions(options, {});
+        if (!isInt32(path)) {
+          if (opts.signal && opts.signal.aborted) return void cb(new FsAbortError(opts.signal));
+          if (typeof opts.flag === "number") validateInt32(opts.flag, "options.flag");
+          else if (opts.flag !== undefined) openFlags(opts.flag, natives);
+          return readFileByPath(path, opts, cb);
+        }
         readFdAsync(path, (err, bytes) => {
           if (err) return cb(err);
           let out;

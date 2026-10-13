@@ -86,3 +86,56 @@ for (const flag of flags) {
   fs.unlinkSync(p);
   console.log("600 reads later the file is gone: " + !fs.existsSync(p));
 }
+
+// What node checks before it opens anything: the options and, in the forms
+// that take one, a signal already aborted. With a flag the open is what
+// empties or creates the file, so a call node refuses must leave it alone.
+{
+  const abortShape = (e) => [e.constructor.name, e.name, e.code, String(e.cause)].join(" / ");
+  const bad = [
+    ["encoding", { flag: "w+", encoding: "nope" }],
+    ["encoding, a+", { flag: "a+", encoding: "nope" }],
+    ["options 5", 5],
+    ["signal 1", { flag: "w+", signal: 1 }],
+    ["aborted", { flag: "w+", signal: AbortSignal.abort() }],
+    ["aborted with a reason", { flag: "a+", signal: AbortSignal.abort("why") }],
+    ["aborted, plain read", { signal: AbortSignal.abort() }],
+  ];
+  for (const [label, options] of bad) {
+    for (const target of ["existing", "missing"]) {
+      for (const [form, read] of forms) {
+        const p = path.join(made, "v" + made_n++);
+        if (target === "existing") fs.writeFileSync(p, "0123456789");
+        let line;
+        try {
+          const got = await read(p, options);
+          line = "read " + (typeof got === "string" ? JSON.stringify(got) : "a Buffer of " + got.length);
+        } catch (e) {
+          line = e && e.name === "AbortError" ? abortShape(e) : e.code;
+        }
+        console.log(`${label} | ${target} | ${form}: ${line} | holds ${holds(p)}`);
+      }
+    }
+  }
+  // The callback form throws a bad flag from the call itself, names a
+  // numeric one "options.flag", and looks at the flag before the path.
+  const thrown = (f) => {
+    let late = "no callback";
+    try {
+      f((e) => (late = "callback " + (e ? e.code : "ok")));
+      return "returned, " + late;
+    } catch (e) {
+      return "threw " + e.code + " " + e.message;
+    }
+  };
+  const p = path.join(made, "order");
+  fs.writeFileSync(p, "0123456789");
+  console.log("callback, flag zz: " + thrown((cb) => fs.readFile(p, { flag: "zz" }, cb)));
+  console.log("callback, flag 1.5: " + thrown((cb) => fs.readFile(p, { flag: 1.5 }, cb)));
+  console.log("callback, bad flag and bad path: " + thrown((cb) => fs.readFile(5.5, { flag: "zz" }, cb)));
+  console.log("callback, bad encoding and bad flag: " + thrown((cb) => fs.readFile(p, { encoding: "nope", flag: "zz" }, cb)));
+  console.log("callback, aborted: " + thrown((cb) => fs.readFile(p, { signal: AbortSignal.abort() }, cb)));
+  console.log("sync, bad flag and bad path: " + thrown(() => fs.readFileSync(5.5, { flag: "zz" })));
+  console.log("promise, flag 1.5: " + (await fs.promises.readFile(p, { flag: 1.5 }).then(() => "read", (e) => e.code + " " + e.message)));
+  console.log("promise, bad flag and bad path: " + (await fs.promises.readFile(5.5, { flag: "zz" }).then(() => "read", (e) => e.code)));
+}

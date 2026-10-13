@@ -37531,3 +37531,81 @@ fn a_read_grant_opens_only_what_can_only_read() {
     }
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "kept");
 }
+
+/// Under `--permission`, an open is checked for every grant it needs: the
+/// read grant unless it is write-only, and the write grant unless it can
+/// only read -- both, for one that reads and writes. With a write grant and
+/// no read grant for a file, nothing hands back its content: not a
+/// read-write descriptor, not `readFile` with a flag, not a stream.
+#[test]
+fn a_write_grant_alone_reads_nothing() {
+    let script = write_temp(
+        "write-grant-open.mjs",
+        "import fs from 'node:fs';\n\
+         const file = process.argv[2];\n\
+         const show = async (label, f) => {\n\
+         \x20 let answer;\n\
+         \x20 try { answer = 'got ' + (await f()); } catch (e) { answer = e.code + ' ' + (e.permission ?? ''); }\n\
+         \x20 console.log(label + ': ' + answer.trim());\n\
+         };\n\
+         for (const flag of ['r', 'r+', 'a+', 'w+', fs.constants.O_RDWR]) {\n\
+         \x20 await show('openSync ' + flag, () => { const fd = fs.openSync(file, flag); fs.closeSync(fd); return 'a descriptor'; });\n\
+         \x20 await show('readFileSync ' + flag, () => fs.readFileSync(file, { flag, encoding: 'utf8' }));\n\
+         \x20 await show('readFile ' + flag, () => new Promise((res, rej) => fs.readFile(file, { flag, encoding: 'utf8' }, (e, d) => (e ? rej(e) : res(d)))));\n\
+         \x20 await show('promises.readFile ' + flag, () => fs.promises.readFile(file, { flag, encoding: 'utf8' }));\n\
+         \x20 await show('promises.open ' + flag, async () => { const h = await fs.promises.open(file, flag); await h.close(); return 'a handle'; });\n\
+         }\n\
+         await show('stream r+', () => new Promise((res, rej) => {\n\
+         \x20 const s = fs.createReadStream(file, { flags: 'r+', encoding: 'utf8' });\n\
+         \x20 let d = ''; s.on('data', (c) => (d += c)); s.on('error', rej); s.on('close', () => res(d));\n\
+         }));\n\
+         await show('openSync a', () => { const fd = fs.openSync(file, 'a'); fs.closeSync(fd); return 'a descriptor'; });\n",
+    );
+    let file = write_temp("write-grant-open-secret.txt", "secret");
+    // A read grant for the script alone would also cover the file beside it,
+    // so the file gets its own directory.
+    let dir = file
+        .parent()
+        .unwrap()
+        .join(format!("write-grant-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret = dir.join("secret.txt");
+    std::fs::write(&secret, "secret").unwrap();
+    let out = oam(&[
+        "--permission",
+        &format!("--allow-fs-read={}", script.to_str().unwrap()),
+        &format!("--allow-fs-write={}", dir.to_str().unwrap()),
+        script.to_str().unwrap(),
+        secret.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        !stdout.contains("got secret"),
+        "nothing may hand back the content: {stdout}"
+    );
+    let rows = [
+        "openSync",
+        "readFileSync",
+        "readFile",
+        "promises.readFile",
+        "promises.open",
+    ];
+    for flag in ["r", "r+", "a+", "w+", "2"] {
+        for row in rows {
+            assert!(
+                stdout.contains(&format!("{row} {flag}: ERR_ACCESS_DENIED FileSystemRead")),
+                "{row} {flag} needs the read grant: {stdout}"
+            );
+        }
+    }
+    assert!(
+        stdout.contains("stream r+: ERR_ACCESS_DENIED FileSystemRead"),
+        "{stdout}"
+    );
+    // A write-only open needs only the write grant.
+    assert!(stdout.contains("openSync a: got a descriptor"), "{stdout}");
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), "secret");
+    let _ = std::fs::remove_dir_all(&dir);
+}
