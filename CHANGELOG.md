@@ -46,7 +46,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   flight.** `write()` followed at once by `destroy()` used to close the descriptor under
   the write and lose it; the write now lands first, as in node. With `autoClose: false`,
   `destroy()` and `close(cb)` left the descriptor open (and `close`'s callback never
-  ran); both close it now. A read stream keeps its descriptor through `'end'`.
+  ran); both close it now. A read stream keeps its descriptor through `'end'`, and
+  `'close'` comes a turn of the event loop after `'finish'` or `'end'`, as in node.
 - **`WriteStream` has `destroySoon()` and writes a queued batch as one write**, so
   `bytesWritten` moves once per batch as node's does. `createReadStream` honours
   `emitClose`.

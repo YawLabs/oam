@@ -11121,16 +11121,29 @@
       );
     }
     // node's close(): the descriptor goes, `fd` is null from here on, and a
-    // write stream's `flush` syncs first.
+    // write stream's `flush` syncs first. The close is made whatever the
+    // sync did -- skipping it on a failed sync leaked the descriptor behind a
+    // stream that said it was closed -- and a failed close is the error
+    // reported, ahead of the one the stream was destroyed with and the
+    // sync's. The answer crosses a turn of the event loop, as a close that
+    // runs on node's thread pool does: a setImmediate made in a 'finish' or
+    // 'end' listener runs before 'close'.
     function closeStream(stream, err, cb) {
       if (stream.fd === null || stream.fd === undefined) { cb(err); return; }
       const fd = stream.fd;
       const supplied = stream[kSupplied];
       stream.fd = null;
-      const synced = stream.flush ? Promise.resolve(natives.fsFsync(fd)) : Promise.resolve();
-      synced
-        .then(() => (supplied ? supplied.close() : natives.fsClose(fd)))
-        .then(() => cb(err), (er) => cb(err || er));
+      const close = (flushErr) => {
+        new Promise((resolve) => resolve(supplied ? supplied.close() : natives.fsClose(fd))).then(
+          () => setImmediate(cb, err || flushErr),
+          (er) => setImmediate(cb, er || err || flushErr),
+        );
+      };
+      if (stream.flush) {
+        new Promise((resolve) => resolve(natives.fsFsync(fd))).then(() => close(), close);
+      } else {
+        close();
+      }
     }
     // node's _destroy for both: a read or write still in flight lands first.
     // Closing under it lost the write (and raced the read).

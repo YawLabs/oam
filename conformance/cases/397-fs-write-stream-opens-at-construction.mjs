@@ -475,3 +475,45 @@ for (const [label, make] of [
   await new Promise((res) => setTimeout(res, 20));
   console.log("read emitClose false | " + JSON.stringify(log) + " destroyed=" + rs.destroyed);
 }
+
+// A setImmediate made at 'finish' or 'end' runs before 'close': the close
+// takes a turn of the event loop.
+{
+  const order = [];
+  const ws = fs.createWriteStream(fresh());
+  ws.on("finish", () => {
+    order.push("finish closed=" + ws.closed);
+    setImmediate(() => order.push("immediate closed=" + ws.closed));
+  });
+  ws.on("close", () => order.push("close"));
+  ws.end("x");
+  await closed(ws);
+  await new Promise((res) => setImmediate(res));
+  const rs = fs.createReadStream(fresh("0123"));
+  rs.on("end", () => {
+    order.push("end closed=" + rs.closed);
+    setImmediate(() => order.push("immediate closed=" + rs.closed));
+  });
+  rs.on("close", () => order.push("close"));
+  rs.resume();
+  await closed(rs);
+  await new Promise((res) => setImmediate(res));
+  console.log("close takes a turn | " + JSON.stringify(order));
+}
+// `flush` whose sync fails still closes the descriptor.
+{
+  const p = fresh("0123456789");
+  for (const how of ["destroy", "end"]) {
+    const fd = fs.openSync(p, "r");
+    const ws = fs.createWriteStream(null, { fd, flush: true });
+    const log = [];
+    ws.on("error", (e) => log.push("error " + e.syscall));
+    ws.on("close", () => log.push("close"));
+    if (how === "destroy") ws.destroy();
+    else ws.end();
+    await closed(ws);
+    // What the sync says of a descriptor opened to read is the platform's;
+    // that the descriptor is closed afterwards is not.
+    console.log(`flush on a read-only descriptor, ${how} | ${log.includes("close")} fd=${ws.fd} descriptor ${fdState(fd)}`);
+  }
+}

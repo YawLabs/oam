@@ -3563,6 +3563,13 @@ What still differs:
   (`'w'`, which creates and truncates; on Windows it replaces the file as any `'w'` does,
   so its alternate data streams go and a hidden or system file is refused `EPERM`). Numeric flags with both access bits set
   (`-1`) are `EINVAL` in node and open read-only in oam.
+- **A `FileHandle` is not an `EventEmitter`, and a stream over one is not tied to it
+  (#343).** node's handle emits `'close'`, and a stream made from it
+  (`handle.createReadStream()`, `createWriteStream()`, `readLines()`, `{ fd: handle }`)
+  holds a reference and closes itself when the handle closes. oam's stream borrows the
+  descriptor: closing the handle under it fails the stream's next read or write `EBADF`
+  where node closes it cleanly, and an `autoClose: false` stream outlives the handle with
+  its `fd` still set.
 - **A negative position for `writev` / `readv` of several buffers, on Windows.**
   libuv offsets each buffer from the position in turn, so with `-2` the second
   buffer of `writevSync(fd, [a, b], -2)` lands at `-2 + a.length` -- `-1` is the
