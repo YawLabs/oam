@@ -43,9 +43,9 @@
 # one, and the copy is correctness, not speed. Measured on the win-arm64 dev
 # box: from an empty index, `git add -A` re-hashes every file from working-tree
 # bytes and the resulting tree differs from HEAD's on a CLEAN checkout --
-# core.filemode=false drops the scripts' exec bits, and the two tracked
-# `.oam-eval-*.cjs` files under the vendored corpus match a .gitignore rule,
-# so an empty index never picks them up. Seeded from the real index, an
+# core.filemode=false drops the scripts' exec bits, and a tracked file that
+# matches a .gitignore rule (leaked `.oam-eval-*.cjs` files under the vendored
+# corpus were, until they were removed) is never picked up by an empty index. Seeded from the real index, an
 # unchanged file keeps its committed blob and mode and only a file git itself
 # would call modified is re-hashed: a clean checkout yields HEAD's tree id,
 # and `git status`-clean means the same key run after run. (7.7s cold vs
