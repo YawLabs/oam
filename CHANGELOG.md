@@ -20,6 +20,24 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **A read error under `FileHandle.readLines()` no longer ends the process (#337).** A
+  `readline` Interface did not listen for its input stream's `'error'`, so a failed read
+  was thrown as an uncaught exception -- from inside a `try` / `catch` around
+  `for await (const line of handle.readLines())` that never saw it. The Interface now
+  emits its input's error on itself, as node's does: an `'error'` listener on it is called,
+  and the async iterator rejects with it after the lines that arrived first. The same goes
+  for `readline.createInterface({ input })` and `readline/promises` over any stream that
+  fails. Conformance case 396.
+- **A `readline` Interface's async iterator is node's.** It is made once per Interface;
+  several `next()` calls made at once are answered in order (all but the last used to
+  hang); `return()` keeps the lines already queued; it has `throw()`; and with more than
+  1024 lines unread the Interface is paused and then resumed as they are read, so a slow
+  `for await` no longer buffers the whole input.
+- **`events.on()` takes `close`, `highWaterMark` and `lowWaterMark`.** `close` names
+  events that end the iteration; the watermarks call the emitter's `pause()` and
+  `resume()`. Its iterator now stops listening the moment it sees an `'error'`, keeps
+  queued events readable after `return()`, and has `%AsyncIteratorPrototype%` as its
+  prototype, as node's does.
 - **On Windows `fchmod` works through a descriptor opened for reading (#322).**
   `fchmodSync(fd, 0o444)`, `fs.fchmod` and `FileHandle.chmod()` failed `EPERM: operation not
   permitted, fchmod` when the descriptor was opened `"r"`: oam set the read-only attribute

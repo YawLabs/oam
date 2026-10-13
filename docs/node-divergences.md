@@ -3721,9 +3721,6 @@ corners are left.
 - A write stream opens `"a"` or `"w"` and a read stream `"r"`, whatever `flags` says, so
   `createWriteStream("dir", { flags: "r+" })` fails `EISDIR` `open` where node emits
   `'open'` and then fails the write.
-- `FileHandle.readLines()` over a directory handle throws the `EISDIR` out of the stream
-  instead of rejecting the iteration, as it already did for any handle whose read fails (a
-  file opened `"a"`).
 - Numeric flags open as the nearest flag string (see "Open flags the natives cannot
   spell"), so on a directory one that maps to `"w"` -- `O_WRONLY` without `O_APPEND`, or
   with `O_CREAT` -- fails `EISDIR` where node returns a descriptor. `O_TRUNC` without
