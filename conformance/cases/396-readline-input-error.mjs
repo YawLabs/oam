@@ -65,7 +65,9 @@ const failing = (lines, error = new Error("input failed")) => {
   const seen = [];
   for (const name of ["line", "close", "pause", "resume"]) rl.on(name, () => seen.push(name));
   rl.on("error", (e) => seen.push("error " + shape(e)));
-  await new Promise((res) => setTimeout(res, 50));
+  // The read is real I/O: wait for the event, not for a clock.
+  await new Promise((res) => rl.once("error", res));
+  await new Promise((res) => setImmediate(res));
   console.log("readLines a, listening: " + JSON.stringify(seen));
   await handle.close().catch(() => {});
 }
@@ -102,6 +104,83 @@ for (const [label, lines] of [["at once", []], ["after two lines", ["a\n", "b\n"
   }
   console.log("iterator steps: " + JSON.stringify(steps));
   rl.close();
+}
+// Several next() calls at once are answered in the order they were made.
+{
+  const settle = (p) => p.then((r) => (r.done ? "done" : "line " + r.value), (e) => "rejected " + shape(e));
+  const rl = readline.createInterface({ input: Readable.from(["a\nb\n"]) });
+  const it = rl[Symbol.asyncIterator]();
+  console.log("three at once: " + JSON.stringify(await Promise.all([it.next(), it.next(), it.next()].map(settle))));
+  const bad = readline.createInterface({ input: failing([]) });
+  const bit = bad[Symbol.asyncIterator]();
+  console.log("three at once, failing: " + JSON.stringify(await Promise.all([bit.next(), bit.next(), bit.next()].map(settle))));
+}
+// The iterator stops listening at the error: a line after it is not yielded,
+// and a second error is the Interface's, with nobody left to take it.
+{
+  const input = new Readable({ read() {} });
+  const rl = readline.createInterface({ input });
+  const it = rl[Symbol.asyncIterator]();
+  rl.emit("line", "before");
+  rl.emit("error", new Error("first"));
+  rl.emit("line", "after");
+  const counts = ["line", "close", "error"].map((name) => rl.listenerCount(name));
+  let second;
+  try {
+    rl.emit("error", new Error("second"));
+    second = "taken";
+  } catch (e) {
+    second = "threw " + e.message;
+  }
+  const steps = [];
+  for (let i = 0; i < 4; i++) {
+    steps.push(await it.next().then((r) => (r.done ? "done" : "line " + r.value), (e) => "rejected " + shape(e)));
+  }
+  console.log("after an error: listeners " + JSON.stringify(counts) + " second " + second + " steps " + JSON.stringify(steps));
+  rl.close();
+}
+// return() ends the iteration and keeps what was queued; throw() is an error.
+{
+  const rl = readline.createInterface({ input: Readable.from(["a\nb\nc\n"]) });
+  const it = rl[Symbol.asyncIterator]();
+  await new Promise((res) => rl.once("close", res));
+  const step = (p) => p.then((r) => (r.done ? "done" : "line " + r.value), (e) => "rejected " + shape(e));
+  const steps = [await step(it.next()), await step(it.return()), await step(it.next()), await step(it.next()), await step(it.next())];
+  console.log("return keeps the queue: " + JSON.stringify(steps));
+  const AsyncIteratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf(async function* () {}).prototype);
+  console.log("iterator shape: " + [Object.getPrototypeOf(it) === AsyncIteratorPrototype, typeof it.throw, Object.keys(it).join(",")].join(" "));
+
+  const other = readline.createInterface({ input: new Readable({ read() {} }) });
+  const oit = other[Symbol.asyncIterator]();
+  other.emit("line", "queued");
+  let threw;
+  try {
+    threw = String(oit.throw("not an error"));
+  } catch (e) {
+    threw = e.code;
+  }
+  const returned = oit.throw(new Error("thrown"));
+  console.log("throw: " + threw + " " + String(returned) + " " + JSON.stringify([await step(oit.next()), await step(oit.next()), await step(oit.next())]));
+  other.close();
+}
+// More lines than the iterator holds: the Interface is paused, and resumed
+// as they are read.
+{
+  const input = new Readable({ read() {} });
+  const rl = readline.createInterface({ input });
+  const seen = [];
+  rl.on("pause", () => seen.push("pause"));
+  rl.on("resume", () => seen.push("resume"));
+  const it = rl[Symbol.asyncIterator]();
+  input.push("x\n".repeat(3000));
+  await new Promise((res) => setImmediate(res));
+  await new Promise((res) => setImmediate(res));
+  const held = JSON.stringify(seen) + " input paused " + input.isPaused();
+  input.push(null);
+  let lines = 0;
+  for await (const line of rl) lines += line === "x" ? 1 : 1000000;
+  console.log("3000 lines: " + held + " | read " + lines + " " + JSON.stringify(seen));
+  void it;
 }
 // The same iterator each time it is asked for.
 {

@@ -3520,6 +3520,9 @@
       });
     }
 
+    // node's internal kFirstEventParam option of on(): yield the event's first
+    // argument on its own. readline's line iterator asks for it.
+    var kFirstEventParam = Symbol.for("oam.events.on.firstEventParam");
     function on(emitter, event, options) {
       // Same validation contract as once(): a plain object, a bad options
       // bag, or a non-AbortSignal signal used to surface as whatever
@@ -3548,44 +3551,60 @@
           emitter,
         );
       }
+      // node's on() (lib/events.js, v22.22.2), piece for piece:
+      // - `close`: event names that end the iteration, after what is queued;
+      // - `highWaterMark` / `lowWaterMark` (and node's older spellings): once
+      //   more events than the high mark sit unconsumed the emitter's own
+      //   pause() is called, and resume() once next() has drained them below
+      //   the low mark -- for an emitter that has the two, as a readline
+      //   Interface does;
+      // - kFirstEventParam, node's internal option: the iterator yields the
+      //   event's first argument, not the array of them.
+      var closeEvents = options && options.close;
+      var highWatermark =
+        (options && (options.highWaterMark ?? options.highWatermark)) ?? Number.MAX_SAFE_INTEGER;
+      var lowWatermark = (options && (options.lowWaterMark ?? options.lowWatermark)) ?? 1;
+      validateInteger(highWatermark, "options.highWaterMark", 1);
+      validateInteger(lowWatermark, "options.lowWaterMark", 1);
+      var firstParam = !!(options && options[kFirstEventParam]);
       var unconsumed = [];
       var waiting = [];
+      var paused = false;
       var error = null;
-      var done = false;
-      // An error is reported to exactly one consumer; after that the
-      // iterator simply reads as finished.
-      var errorDelivered = false;
+      var finished = false;
+      var doneResult = function () {
+        return { value: undefined, done: true };
+      };
 
-      function eventHandler() {
-        var args = [];
-        for (var i = 0; i < arguments.length; i++) args.push(arguments[i]);
+      function eventHandler(first) {
+        var value = first;
+        if (!firstParam) {
+          value = [];
+          for (var i = 0; i < arguments.length; i++) value.push(arguments[i]);
+        }
         if (waiting.length > 0) {
-          waiting.shift().resolve({ value: args, done: false });
-        } else {
-          unconsumed.push(args);
+          waiting.shift().resolve({ value: value, done: false });
+          return;
+        }
+        unconsumed.push(value);
+        if (!paused && unconsumed.length > highWatermark) {
+          paused = true;
+          emitter.pause();
         }
       }
 
+      // The error goes to ONE consumer: the next() already waiting, or else
+      // the next one to ask once what is queued has been handed out. Either
+      // way the iterator stops listening now, not when that next() comes:
+      // nothing emitted after the error is yielded, and a later 'error' is
+      // the emitter's to answer for (unhandled, with no other listener).
       function errorHandler(err) {
-        error = err;
-        // The iterator is finished the moment it errors: unhook now rather
-        // than waiting for a return() the consumer will never make.
-        cleanup();
-        var w = waiting.slice();
-        waiting.length = 0;
-        // The error is delivered ONCE, to the FIRST waiter; everyone else
-        // sees a finished iterator. Rejecting every pending next() with the
-        // same error made three concurrent next() calls produce three
-        // rejections where node produces one rejection and two dones.
-        for (var i = 0; i < w.length; i++) {
-          if (i === 0 && !errorDelivered) {
-            errorDelivered = true;
-            w[i].reject(err);
-          } else {
-            w[i].resolve({ value: undefined, done: true });
-          }
-        }
-        done = true;
+        if (waiting.length > 0) waiting.shift().reject(err);
+        else error = err;
+        closeHandler();
+      }
+      function abortHandler() {
+        errorHandler(makeAbortErrorForOn(signal && signal.reason));
       }
 
       function makeAbortErrorForOn(reason) {
@@ -3595,15 +3614,7 @@
         if (reason !== undefined) err.cause = reason;
         return err;
       }
-      function abortHandler() {
-        errorHandler(makeAbortErrorForOn(signal && signal.reason));
-      }
 
-      // ONE teardown for every way this iterator can finish. It used to
-      // live only in return()/throw(), and a rejected next() does NOT
-      // trigger return() -- so the ERROR path left both listeners attached
-      // to the emitter forever. The signal's abort listener was never
-      // removed on any path.
       // EventTarget has no .on/.removeListener. on() only ever spoke the
       // EventEmitter dialect, so passing an EventTarget (an AbortSignal,
       // say) died with "emitter.on is not a function" -- even though the
@@ -3616,76 +3627,85 @@
         ? function (type, fn) { emitter.removeEventListener(type, fn); }
         : function (type, fn) { emitter.removeListener(type, fn); };
 
+      // ONE teardown for every way this iterator can finish: a close event,
+      // an error, an abort, return() and throw(). Listeners off, and every
+      // next() still waiting told the iteration is over. What is queued, and
+      // an error not yet handed out, stay for the next() calls to come.
       var cleanedUp = false;
-      function cleanup() {
-        if (cleanedUp) return;
-        cleanedUp = true;
-        detach(event, eventHandler);
-        if (event !== "error") detach("error", errorHandler);
-        if (signal) signal.removeEventListener?.("abort", abortHandler);
+      function closeHandler() {
+        if (!cleanedUp) {
+          cleanedUp = true;
+          detach(event, eventHandler);
+          if (event !== "error") detach("error", errorHandler);
+          if (closeEvents) {
+            for (var i = 0; i < closeEvents.length; i++) detach(closeEvents[i], closeHandler);
+          }
+          if (signal) signal.removeEventListener?.("abort", abortHandler);
+        }
+        finished = true;
+        while (waiting.length > 0) waiting.shift().resolve(doneResult());
+        return Promise.resolve(doneResult());
       }
 
+      if (signal && signal.aborted) {
+        // Already aborted: throw SYNCHRONOUSLY. Routing it through the
+        // async error path handed back an iterator that looked usable
+        // and only failed on first next(), so `assert.throws(() => on(...))`
+        // saw nothing thrown.
+        throw makeAbortErrorForOn(signal.reason);
+      }
       attach(event, eventHandler);
       if (event !== "error") attach("error", errorHandler);
-      if (signal) {
-        if (signal.aborted) {
-          // Already aborted: throw SYNCHRONOUSLY. Routing it through the
-          // async error path handed back an iterator that looked usable
-          // and only failed on first next(), so `assert.throws(() => on(...))`
-          // saw nothing thrown.
-          cleanup();
-          throw makeAbortErrorForOn(signal.reason);
-        }
-        signal.addEventListener("abort", abortHandler, { once: true });
+      if (closeEvents) {
+        for (var c = 0; c < closeEvents.length; c++) attach(closeEvents[c], closeHandler);
       }
+      if (signal) signal.addEventListener("abort", abortHandler, { once: true });
 
-      var iterator = {
-        next: function() {
-          if (unconsumed.length > 0) {
-            return Promise.resolve({ value: unconsumed.shift(), done: false });
-          }
-          if (error && !errorDelivered) {
-            errorDelivered = true;
-            return Promise.reject(error);
-          }
-          if (done || error) {
-            return Promise.resolve({ value: undefined, done: true });
-          }
-          return new Promise(function(resolve, reject) {
-            waiting.push({ resolve: resolve, reject: reject });
-          });
+      // The prototype every async iterator has, which supplies
+      // [Symbol.asyncIterator]; node sets it the same way.
+      var AsyncIteratorPrototype = Object.getPrototypeOf(
+        Object.getPrototypeOf(async function* () {}).prototype,
+      );
+      return Object.setPrototypeOf(
+        {
+          next: function () {
+            if (unconsumed.length > 0) {
+              var value = unconsumed.shift();
+              if (paused && unconsumed.length < lowWatermark) {
+                emitter.resume();
+                paused = false;
+              }
+              return Promise.resolve({ value: value, done: false });
+            }
+            if (error) {
+              var rejected = Promise.reject(error);
+              error = null;
+              return rejected;
+            }
+            if (finished) return closeHandler();
+            return new Promise(function (resolve, reject) {
+              waiting.push({ resolve: resolve, reject: reject });
+            });
+          },
+          return: function () {
+            return closeHandler();
+          },
+          throw: function (err) {
+            // throw() takes an ERROR. Accepting undefined finished the
+            // iterator with a rejection nobody could interpret; node
+            // validates synchronously and says what it wanted.
+            if (!(err instanceof Error)) {
+              throw new codes.ERR_INVALID_ARG_TYPE("EventEmitter.AsyncIterator", "Error", err);
+            }
+            // The SAME path a real 'error' event takes: that is what rejects
+            // the already-pending next(), which is how the for-await
+            // consumer observes the throw. Returns undefined, as node's does.
+            errorHandler(err);
+            return undefined;
+          },
         },
-        return: function() {
-          done = true;
-          cleanup();
-          var w = waiting.slice();
-          waiting.length = 0;
-          for (var i = 0; i < w.length; i++) w[i].resolve({ value: undefined, done: true });
-          return Promise.resolve({ value: undefined, done: true });
-        },
-        throw: function(err) {
-          // throw() takes an ERROR. Accepting undefined finished the
-          // iterator with a rejection nobody could interpret; node
-          // validates synchronously and says what it wanted.
-          if (!(err instanceof Error)) {
-            throw new codes.ERR_INVALID_ARG_TYPE(
-              "EventEmitter.AsyncIterator",
-              "Error",
-              err,
-            );
-          }
-          // Route through the SAME error path a real 'error' event takes:
-          // that is what rejects the already-pending next(), which is how
-          // the for-await consumer actually observes the throw. Setting
-          // `error` and returning a rejected promise left the pending
-          // waiter hanging (and produced a rejection nobody was there to
-          // handle). Returns undefined, as node's does.
-          errorHandler(err);
-          return undefined;
-        },
-      };
-      iterator[Symbol.asyncIterator] = function() { return iterator; };
-      return iterator;
+        AsyncIteratorPrototype,
+      );
     }
 
     function getEventListeners(emitter, name) {
@@ -31230,70 +31250,23 @@
         }
         return this;
       }
-      // node's is `events.on(this, "line", { close: ["close"] })`, made once
-      // and handed out every time: lines queue until they are asked for,
-      // 'close' ends the iteration after the lines already queued, and an
-      // 'error' on the Interface -- its input's, see the constructor --
-      // rejects the next() that reaches it, after which the iteration is
-      // over (measured on v22.22.2: line, rejected, done, done).
+      // node's own: `events.on(this, "line", { close: ["close"],
+      // highWaterMark: 1024, [kFirstEventParam]: true })`, made once and handed
+      // out every time. Lines queue until they are asked for; with more than
+      // 1024 waiting the Interface is paused, and resumed once they are
+      // drained; 'close' ends the iteration after the lines already queued;
+      // and an 'error' on the Interface -- its input's, see the constructor --
+      // rejects one next() and ends it (measured on v22.22.2: line, rejected,
+      // done, done).
       [Symbol.asyncIterator]() {
-        if (this._lineIterator) return this._lineIterator;
-        const self = this;
-        const queue = [];
-        let waiting = null;
-        let failure = null;
-        let done = false;
-        const settle = () => {
-          if (!waiting) return;
-          if (queue.length) {
-            const w = waiting; waiting = null;
-            w.resolve({ value: queue.shift(), done: false });
-          } else if (failure) {
-            const w = waiting; waiting = null;
-            const err = failure.err;
-            failure = null;
-            finish();
-            w.reject(err);
-          } else if (done) {
-            const w = waiting; waiting = null;
-            w.resolve({ value: undefined, done: true });
-          }
-        };
-        const onLine = (line) => { queue.push(line); settle(); };
-        const onClose = () => { finish(); settle(); };
-        const onError = (err) => { if (!done && !failure) { failure = { err }; settle(); } };
-        function finish() {
-          done = true;
-          self.removeListener("line", onLine);
-          self.removeListener("close", onClose);
-          self.removeListener("error", onError);
+        if (this._lineIterator === undefined) {
+          this._lineIterator = registry.get("events").on(this, "line", {
+            close: ["close"],
+            highWaterMark: 1024,
+            [Symbol.for("oam.events.on.firstEventParam")]: true,
+          });
         }
-        self.on("line", onLine);
-        self.on("close", onClose);
-        self.on("error", onError);
-        const iterator = {
-          next() {
-            if (queue.length) return Promise.resolve({ value: queue.shift(), done: false });
-            if (failure) {
-              const err = failure.err;
-              failure = null;
-              finish();
-              return Promise.reject(err);
-            }
-            if (done) return Promise.resolve({ value: undefined, done: true });
-            return new Promise((resolve, reject) => { waiting = { resolve, reject }; });
-          },
-          return() {
-            queue.length = 0;
-            failure = null;
-            finish();
-            settle();
-            return Promise.resolve({ value: undefined, done: true });
-          },
-          [Symbol.asyncIterator]() { return iterator; },
-        };
-        this._lineIterator = iterator;
-        return iterator;
+        return this._lineIterator;
       }
     }
     function createInterface(input, output) {
