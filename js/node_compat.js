@@ -504,7 +504,8 @@
 
   /// Every FileHandle `fs/promises.open` hands out, so `readFile` /
   /// `writeFile` / `appendFile` can tell one from a path (node checks
-  /// `instanceof FileHandle`; oam's handles are plain objects).
+  /// `instanceof FileHandle`; oam's class lives inside the fs/promises
+  /// factory, so the streams and the fs factory ask this set instead).
   const fileHandles = new WeakSet();
 
   /// The error of a native that probed with lstat on rmdir's behalf, as node
@@ -3161,7 +3162,7 @@
       }
       // node's init: an own `_maxListeners`, undefined until it is set --
       // the third of an emitter's own keys, which code does list.
-      this._maxListeners = this._maxListeners || undefined;
+      this._maxListeners ||= undefined;
       if (opts && opts.captureRejections) this[kCapture] = true;
     }
     EventEmitter.prototype[kCapture] = false;
@@ -11038,11 +11039,10 @@
     //   - a raw number, from `fs.createReadStream(path, { fd })`;
     //   - a FileHandle, which is how FileHandle.createReadStream is
     //     implemented upstream (`new ReadStream(undefined, {...opts, fd: this})`).
-    // Taking the FileHandle's OWN close() rather than closing its handle
-    // number behind its back is the whole double-close story: that close is
-    // idempotent and flips the handle's `closed` flag, so the descriptor is
-    // released exactly once and every FileHandle method starts reporting
-    // EBADF at the same instant the stream finishes. Closing the number
+    // A stream over a FileHandle holds one of the handle's references for its
+    // life, and closes by giving it back and asking the handle to close: the
+    // descriptor is released exactly once, when its last user is done, and
+    // every FileHandle method reports EBADF from then on. Closing the number
     // directly would leave the FileHandle believing it was still open, and it
     // would then close the fd a SECOND time -- by which point the number can
     // already have been handed to an unrelated open().
@@ -11060,10 +11060,16 @@
       if (fd !== null && typeof fd === "object" && fileHandles.has(fd)) {
         // node's importFd for a FileHandle: the stream takes a reference,
         // and gives it back -- then asks the handle to close -- when it
-        // closes. `attach` is the other half: the handle's 'close' closes
-        // the stream.
+        // closes; and the handle's 'close' closes the stream. Both are
+        // done by the stream's constructor (`followHandle`), once nothing
+        // else in it can throw: a reference taken here and then stranded by
+        // a bad `start` would leave the handle unable to close.
+        if (opts.fs) {
+          const err = new Error("The FileHandle with fs method is not implemented");
+          err.code = "ERR_METHOD_NOT_IMPLEMENTED";
+          throw err;
+        }
         validateFd(fd.fd, false);
-        fd[kFhRef]();
         return {
           handle: fd.fd,
           fileHandle: fd,
@@ -11141,6 +11147,13 @@
       } else {
         stream.fd = supplied.handle;
       }
+    }
+    // A stream over a FileHandle: one of the handle's references, held until
+    // the stream closes, and the stream closed when the handle is.
+    function followHandle(stream, supplied) {
+      if (!supplied || !supplied.fileHandle) return;
+      supplied.fileHandle[kFhRef]();
+      supplied.fileHandle.on("close", () => stream.close());
     }
     // node's _construct for both: nothing to do for a descriptor that was
     // handed over -- no open, so neither 'open' nor 'ready' -- and otherwise
@@ -11279,7 +11292,15 @@
                 (e) => {
                   this[kIsPerformingIO] = false;
                   if (this.destroyed) { this.emit(kIoDone, e); return; }
-                  this.destroy(e);
+                  // node's errorOrDestroy: a stream that does not destroy
+                  // itself (autoClose: false) reports the error and keeps
+                  // its descriptor -- over a FileHandle, the handle the
+                  // caller asked to keep.
+                  if (this._readableState.autoDestroy) this.destroy(e);
+                  else {
+                    this._readableState.errored ??= e;
+                    this.emit("error", e);
+                  }
                 },
               );
           },
@@ -11289,9 +11310,7 @@
         });
         // The properties node's ReadStream has, in its order.
         this[kSupplied] = own[kSupplied];
-        if (own[kSupplied] && own[kSupplied].fileHandle) {
-          own[kSupplied].fileHandle.on("close", () => this.close());
-        }
+        followHandle(this, own[kSupplied]);
         this.fd = own.fd;
         if (!own[kSupplied]) {
           this.path = own.path;
@@ -11399,9 +11418,7 @@
         });
         // The properties node's WriteStream has, in its order.
         this[kSupplied] = own[kSupplied];
-        if (own[kSupplied] && own[kSupplied].fileHandle) {
-          own[kSupplied].fileHandle.on("close", () => this.close());
-        }
+        followHandle(this, own[kSupplied]);
         this.fd = own.fd;
         if (!own[kSupplied]) {
           this.path = own.path;
@@ -11680,18 +11697,23 @@
     const guardStreamFd = function (handle) {
       if (handle[kFd] === -1) throw codes.ERR_OUT_OF_RANGE("fd", ">= 0 && <= 2147483647", -1);
     };
-    // The descriptor's close. It settles a turn of the event loop later, as a
+    // The descriptor's close. It settles after a turn of the event loop, as a
     // close on node's thread pool does: a stream over the handle, which is
     // told at once, finishes before whoever awaited close() hears.
     const closeNative = (native) =>
       new Promise((resolve, reject) => {
         let failure;
         try {
-          natives.fsClose(native);
+          // The one of the two closes that reports a descriptor that is
+          // already gone (closed behind the handle's back): EBADF, close.
+          natives.fsCloseSync(native);
         } catch (e) {
           failure = e;
         }
-        setImmediate(() => (failure ? reject(failure) : resolve()));
+        // Two hops: after the immediates queued in this turn, the caller's
+        // own and a 'close' listener's among them, which a close on the
+        // thread pool lets run first.
+        setImmediate(() => setImmediate(() => (failure ? reject(failure) : resolve())));
       });
     class FileHandle extends registry.get("events").EventEmitter {
       constructor(native) {
@@ -11849,7 +11871,7 @@
       // inode. "open a temp file then unlink it and keep the handle" is a
       // standard pattern, so the divergence was reachable from ordinary
       // code, and silent in the rename case.
-      async stat() {
+      async stat(options) {
         const fh = this, h = this[kNative];
         return wrapStat(await natives.fsFstat(h));
       }
@@ -11946,7 +11968,7 @@
       // path. Everything reachable through a default reader or async
       // iteration matches node; a BYOB reader does not. The fix belongs in
       // js/streams.js's controller, not in a second reader here.
-      readableWebStream(options) {
+      readableWebStream(options = undefined) {
         const fh = this, h = this[kNative];
         if (fh[kFd] === -1) throw codes.ERR_INVALID_STATE("The FileHandle is closed");
         if (fh[kClosePromise]) throw codes.ERR_INVALID_STATE("The FileHandle is closing");
@@ -12029,12 +12051,12 @@
       // cannot be closed twice and every method above starts reporting
       // EBADF the moment the stream is done. autoClose:false opts out and
       // leaves the descriptor to the caller.
-      createReadStream(options) {
+      createReadStream(options = undefined) {
         const fh = this, h = this[kNative];
         guardStreamFd(fh);
         return new (rwStreams(natives).ReadStream)(undefined, { ...readOptions(options), fd: fh });
       }
-      createWriteStream(options) {
+      createWriteStream(options = undefined) {
         const fh = this, h = this[kNative];
         guardStreamFd(fh);
         return new (rwStreams(natives).WriteStream)(undefined, { ...readOptions(options), fd: fh });
@@ -12045,7 +12067,7 @@
       // closes when its input stream ends, which (autoClose) closes this
       // handle. Splitting on /\r?\n/ and dropping the empty tail after a
       // final newline is the Interface's job, already matching node.
-      readLines(options) {
+      readLines(options = undefined) {
         const fh = this, h = this[kNative];
         guardStreamFd(fh);
         return registry.get("readline").createInterface({
@@ -12057,6 +12079,15 @@
     // node's fsCall around each operation: refused on a closed handle, and
     // holding a reference while it runs, so a close() made meanwhile waits
     // for it.
+    // fs.promises.readFile(handle) reads the handle without that guard, as
+    // node's does (readFileHandle, called directly): no reference is held, so
+    // a close() made under it is not kept waiting, and a handle that is
+    // already closed is a descriptor of -1 -- node's range error.
+    const readHandleUnguarded = FileHandle.prototype.readFile;
+    const readFileOfHandle = async (handle, options) => {
+      if (handle[kFd] === -1) throw codes.ERR_OUT_OF_RANGE("fd", ">= 0 && <= 2147483647", -1);
+      return readHandleUnguarded.call(handle, options);
+    };
     for (const [name, syscall] of [
       ["readFile", "readFile"], ["writeFile", "writeFile"], ["appendFile", "writeFile"],
       ["write", "write"], ["read", "read"], ["stat", "fstat"], ["chmod", "fchmod"],
@@ -12176,7 +12207,7 @@
       // aborted, and only then the path and the flag.
       readFile: (path, options) => {
         const opts = fsGetOptions(options, {});
-        if (fileHandles.has(path)) return path.readFile(options);
+        if (fileHandles.has(path)) return readFileOfHandle(path, options);
         if (opts.signal && opts.signal.aborted) return Promise.reject(new FsAbortError(opts.signal));
         return readFileAt(toPath(path), opts, true);
       },

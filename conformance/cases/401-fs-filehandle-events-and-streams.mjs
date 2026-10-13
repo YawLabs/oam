@@ -36,8 +36,9 @@ const out = (label) => { console.log(label + ": " + log.join(" | ")); log.length
   h.on("close", () => log.push("handle close"));
   const rs = h.createReadStream({ highWaterMark: 16 });
   rs.on("error", (e) => log.push("stream error " + e.code)); rs.on("end", () => log.push("stream end")); rs.on("close", () => log.push("stream close errored=" + (rs.errored && rs.errored.code)));
-  await new Promise((res) => rs.once("data", () => { const p = h.close(); p.then(() => log.push("close() resolved")); res(); }));
-  await new Promise((r) => rs.on("close", r)); await tick(); await tick();
+  let closing;
+  await new Promise((res) => rs.once("data", () => { closing = h.close(); closing.then(() => log.push("close() resolved")); res(); }));
+  await new Promise((r) => rs.on("close", r)); await closing;
   log.push("fd " + h.fd + " rs.fd " + rs.fd + " destroyed " + rs.destroyed);
   out("close under a read stream");
 }
@@ -65,10 +66,14 @@ const out = (label) => { console.log(label + ": " + log.join(" | ")); log.length
   const h = await fs.promises.open(file, "r");
   h.on("close", () => log.push("handle close"));
   const a = h.createReadStream({ start: 0, end: 9 }); const b = h.createReadStream({ start: 10, end: 19 });
-  a.on("close", () => log.push("a close")); b.on("close", () => log.push("b close errored=" + (b.errored && b.errored.code))); b.on("error", (e) => log.push("b error " + e.code));
-  let got = ""; a.on("data", (c) => (got += c)); b.on("data", (c) => (got += c));
+  // Which of the two reaches its end first is a race; that both close, and
+  // neither with an error, is not.
+  const ended = {};
+  a.on("close", () => (ended.a = String(a.errored && a.errored.code))); b.on("close", () => (ended.b = String(b.errored && b.errored.code)));
+  a.on("error", (e) => log.push("a error " + e.code)); b.on("error", (e) => log.push("b error " + e.code));
+  a.resume(); b.resume();
   await Promise.all([new Promise((r) => a.on("close", r)), new Promise((r) => b.on("close", r))]); await tick();
-  log.push("read " + got.length + " fd " + h.fd);
+  log.push("a closed errored=" + ended.a + " b closed errored=" + ended.b + " fd " + h.fd);
   out("two streams");
 }
 { // write stream
@@ -112,12 +117,15 @@ const out = (label) => { console.log(label + ": " + log.join(" | ")); log.length
 
 { // an operation in flight when close() is called finishes first
   const h = await fs.promises.open(file, "r");
-  const read = h.read(Buffer.alloc(4), 0, 4, 0).then((r) => log.push("read " + r.bytesRead + " fd during " + (typeof h.fd)), (e) => log.push("read " + e.code));
-  const closing = h.close().then(() => log.push("close() resolved"));
+  // The read and the stat are two operations in flight: either may land
+  // first, and close() settles after both.
+  const done = {};
+  const read = h.read(Buffer.alloc(4), 0, 4, 0).then((r) => (done.read = "read " + r.bytesRead + " fd during " + typeof h.fd), (e) => (done.read = "read " + e.code));
+  const closing = h.close().then(() => (done.close = "close() resolved after both " + (done.read !== undefined && done.stat !== undefined)));
   log.push("fd right after close() " + typeof h.fd);
-  const late = h.stat().then(() => log.push("stat while closing ok"), (e) => log.push("stat while closing " + e.code));
+  const late = h.stat().then(() => (done.stat = "stat while closing ok"), (e) => (done.stat = "stat while closing " + e.code));
   await Promise.all([read, closing, late]);
-  log.push("fd " + h.fd);
+  log.push(done.read, done.stat, done.close, "fd " + h.fd);
   out("close with a read in flight");
 }
 { // the web stream of a handle that is closing, and one that is closed
@@ -156,4 +164,62 @@ const out = (label) => { console.log(label + ": " + log.join(" | ")); log.length
   await h[Symbol.asyncDispose]();
   log.push("fd " + h.fd);
   out("asyncDispose");
+}
+
+{ // a stream that cannot be made leaves the handle able to close
+  for (const [label, make] of [
+    ["read start -1", (h) => h.createReadStream({ start: -1 })],
+    ["read start past end", (h) => h.createReadStream({ start: 5, end: 2 })],
+    ["write flush 1", (h) => h.createWriteStream({ flush: 1 })],
+    ["fd with options.fs", (h) => fs.createReadStream(null, { fd: h, fs: { open() {}, read() {}, close() {} } })],
+  ]) {
+    const h = await fs.promises.open(file, "r");
+    try { make(h); log.push(label + ": made"); } catch (e) { log.push(label + ": " + e.constructor.name + " " + e.code); }
+    await h.stat().then(() => log.push("still usable"), (e) => log.push("stat " + e.code));
+    // node leaves the handle unable to close after the first three (its
+    // close() throws); oam gives the reference back. Not compared: the
+    // handle is abandoned here in both.
+    if (label === "fd with options.fs") { await h.close(); log.push("fd " + h.fd); }
+    out("unmakeable stream");
+  }
+}
+{ // closed behind the handle's back: close() says so
+  const h = await fs.promises.open(file, "r");
+  fs.closeSync(h.fd);
+  log.push(await h.close().then(() => "close() resolved", (e) => "close() rejected " + e.code + " " + e.syscall));
+  log.push("fd " + h.fd);
+  out("descriptor closed underneath");
+}
+{ // close() settles after the immediates of its turn
+  const h = await fs.promises.open(file, "r");
+  h.on("close", () => setImmediate(() => log.push("immediate from the 'close' listener")));
+  const closing = h.close().then(() => log.push("close() resolved"));
+  setImmediate(() => log.push("immediate after close()"));
+  await closing; await tick();
+  out("close and immediates");
+}
+{ // an autoClose: false stream whose read fails keeps the handle
+  const p = path.join(d, "wo"); fs.writeFileSync(p, "x");
+  const h = await fs.promises.open(p, "a");
+  const rs = h.createReadStream({ autoClose: false });
+  rs.on("error", (e) => log.push("stream error " + e.code + " destroyed " + rs.destroyed));
+  rs.on("close", () => log.push("stream close"));
+  rs.resume();
+  await new Promise((r) => rs.once("error", r)); await tick(); await tick();
+  log.push("handle fd " + typeof h.fd + " stat " + (await h.stat().then(() => "ok", (e) => e.code)));
+  await h.close(); await tick();
+  log.push("then fd " + h.fd);
+  out("read error, autoClose false");
+}
+{ // arities, and readFile of a handle through fs.promises
+  const h = await fs.promises.open(file, "r");
+  log.push(["createReadStream", "createWriteStream", "readLines", "readableWebStream", "stat", "close", "readFile", "read", "write", "truncate"].map((n) => n + "=" + h[n].length).join(" "));
+  log.push("readFile(handle) " + (await fs.promises.readFile(h, "utf8")).length);
+  await h.close();
+  log.push("readFile(closed handle) " + (await fs.promises.readFile(h).then(() => "read", (e) => e.code)));
+  class Limited extends (await import("node:events")).EventEmitter {}
+  Limited.prototype._maxListeners = 3;
+  const e = new Limited();
+  log.push("inherited limit: own key " + Object.hasOwn(e, "_maxListeners") + " value " + e.getMaxListeners());
+  out("surface");
 }
