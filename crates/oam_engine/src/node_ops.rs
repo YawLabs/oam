@@ -7819,10 +7819,9 @@ fn op_fs_mkdtemp_sync(
 
 // ---------------------------------------------------------- fs stream ops
 
-/// Whether an open with these fopen-style flags can write, and so needs the
-/// write grant rather than the read one: "r+" reads AND writes, as does any
-/// flag with "w", "a" or "x" in it. One answer for fsOpen and fsOpenSync,
-/// which share one descriptor space.
+/// Whether an open with these bits needs the write grant rather than the
+/// read one (`OpenFlags::writes`: anything that is not plainly a read). One
+/// answer for fsOpen and fsOpenSync, which share one descriptor space.
 fn open_flags_write(flags: oam_core::OpenFlags) -> bool {
     flags.writes()
 }

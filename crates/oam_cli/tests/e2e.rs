@@ -37466,3 +37466,68 @@ fn oam_priority_env_lowers_the_process_and_its_children() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Under `--permission`, an open with only a read grant can only read. The
+/// flags of an open reach the operating system as the bits they are, so the
+/// grant is decided the same way: read-only access and nothing but flags that
+/// change nothing, or else the write grant -- for a flag that creates,
+/// empties or appends, for Windows's delete-on-close (`O_TEMPORARY`, 0x40),
+/// and for a bit oam has no name for. The file is there, unchanged, after
+/// every refusal.
+#[test]
+fn a_read_grant_opens_only_what_can_only_read() {
+    let script = write_temp(
+        "read-grant-open.mjs",
+        "import fs from 'node:fs';\n\
+         const file = process.argv[2];\n\
+         const C = fs.constants;\n\
+         const rows = [['read', 0], ['create', C.O_CREAT], ['truncate', C.O_TRUNC], ['append', C.O_APPEND],\n\
+         \x20 ['read-write', C.O_RDWR], ['write', C.O_WRONLY], ['bit 0x40', 0x40], ['bit 0x20000000', 0x20000000],\n\
+         \x20 ['all bits', -1]];\n\
+         for (const [label, bits] of rows) {\n\
+         \x20 let answer;\n\
+         \x20 try { fs.closeSync(fs.openSync(file, bits)); answer = 'opened'; }\n\
+         \x20 catch (e) { answer = e.code + ' ' + e.permission; }\n\
+         \x20 console.log(label + ': ' + answer + ' | ' + fs.readFileSync(file, 'utf8'));\n\
+         }\n\
+         const viaStream = await new Promise((resolve) => {\n\
+         \x20 const stream = fs.createReadStream(file, { flags: C.O_TRUNC });\n\
+         \x20 stream.on('error', (e) => resolve(e.code + ' ' + e.permission));\n\
+         \x20 stream.on('open', () => resolve('opened'));\n\
+         });\n\
+         console.log('stream: ' + viaStream + ' | ' + fs.readFileSync(file, 'utf8'));\n\
+         const viaPromise = await fs.promises.open(file, C.O_APPEND).then((h) => h.close().then(() => 'opened'), (e) => e.code + ' ' + e.permission);\n\
+         console.log('promise: ' + viaPromise + ' | ' + fs.readFileSync(file, 'utf8'));\n",
+    );
+    let file = write_temp("read-grant-open-kept.txt", "kept");
+    let out = oam(&[
+        "--permission",
+        "--allow-fs-read=*",
+        script.to_str().unwrap(),
+        file.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("read: opened | kept"), "{stdout}");
+    for label in [
+        "create",
+        "truncate",
+        "append",
+        "read-write",
+        "write",
+        "bit 0x40",
+        "bit 0x20000000",
+        "all bits",
+        "stream",
+        "promise",
+    ] {
+        assert!(
+            stdout.contains(&format!(
+                "{label}: ERR_ACCESS_DENIED FileSystemWrite | kept"
+            )),
+            "{label} needs the write grant, and the file is as it was: {stdout}"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "kept");
+}

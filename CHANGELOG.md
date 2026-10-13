@@ -29,6 +29,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   given on Linux and macOS, and on Windows as the one `CreateFileW` libuv builds from
   them (`O_TRUNC` without `O_CREAT` is `EINVAL`, `O_APPEND` appends whatever the access
   mode, both access bits are `EINVAL`). Conformance case 398.
+- **Under `--permission`, an open needs the write grant unless it can only read.** The
+  grant used to be read off the flag string. It is now decided from the bits the open is
+  made with: read-only access plus flags that change nothing is a read, and everything
+  else needs `--allow-fs-write` -- `O_CREAT`, `O_TRUNC` or `O_APPEND` with read-only
+  access, Windows's delete-on-close `O_TEMPORARY`, and any bit oam has no name for.
 - **`fs.constants`' open flags are the platform's.** They were one hand-written table:
   `O_SYNC`, `O_DIRECTORY` and `O_NOFOLLOW` were listed on Windows, where node has none of
   them, and with one value for every platform. The table now comes from the platform the

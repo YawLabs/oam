@@ -68,10 +68,6 @@
           "ENGINE_METHOD_RAND",
           "ENGINE_METHOD_RSA",
           "OPENSSL_VERSION_NUMBER",
-          "O_DSYNC",
-          "O_NOCTTY",
-          "O_NONBLOCK",
-          "O_SYMLINK",
           "POINT_CONVERSION_HYBRID",
           "RSA_PSS_SALTLEN_AUTO",
           "RSA_PSS_SALTLEN_DIGEST",
@@ -116,7 +112,6 @@
           "UV_FS_COPYFILE_EXCL",
           "UV_FS_COPYFILE_FICLONE",
           "UV_FS_COPYFILE_FICLONE_FORCE",
-          "UV_FS_O_FILEMAP",
           "defaultCipherList"
         ],
         "crypto": [
@@ -521,10 +516,6 @@
           "ENGINE_METHOD_RAND",
           "ENGINE_METHOD_RSA",
           "OPENSSL_VERSION_NUMBER",
-          "O_DIRECT",
-          "O_DSYNC",
-          "O_NOCTTY",
-          "O_NONBLOCK",
           "POINT_CONVERSION_HYBRID",
           "RSA_PSS_SALTLEN_AUTO",
           "RSA_PSS_SALTLEN_DIGEST",
@@ -573,7 +564,6 @@
           "UV_FS_COPYFILE_EXCL",
           "UV_FS_COPYFILE_FICLONE",
           "UV_FS_COPYFILE_FICLONE_FORCE",
-          "UV_FS_O_FILEMAP",
           "defaultCipherList"
         ],
         "crypto": [
@@ -1015,7 +1005,6 @@
           "UV_FS_COPYFILE_EXCL",
           "UV_FS_COPYFILE_FICLONE",
           "UV_FS_COPYFILE_FICLONE_FORCE",
-          "UV_FS_O_FILEMAP",
           "defaultCipherList"
         ],
         "crypto": [

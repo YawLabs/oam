@@ -2513,8 +2513,19 @@ mod o_flag {
     #[cfg(not(target_os = "linux"))]
     pub const DSYNC: i32 = OFlags::DSYNC.bits() as i32;
     pub const NONBLOCK: i32 = OFlags::NONBLOCK.bits() as i32;
+    /// The flags an open may carry and still only read: see
+    /// `OpenFlags::writes`.
+    #[cfg(target_os = "linux")]
+    pub const HARMLESS: i32 =
+        NOCTTY | DIRECTORY | NOFOLLOW | SYNC | DSYNC | NONBLOCK | NOATIME | DIRECT;
+    #[cfg(not(target_os = "linux"))]
+    pub const HARMLESS: i32 = NOCTTY | DIRECTORY | NOFOLLOW | SYNC | DSYNC | NONBLOCK;
     #[cfg(target_os = "linux")]
     pub const NOATIME: i32 = OFlags::NOATIME.bits() as i32;
+    // Apple's O_SYMLINK (sys/fcntl.h), which the rustix this is built against
+    // has no name for.
+    #[cfg(target_os = "macos")]
+    pub const SYMLINK: i32 = 0x0020_0000;
     #[cfg(target_os = "linux")]
     pub const DIRECT: i32 = OFlags::DIRECT.bits() as i32;
 }
@@ -2538,6 +2549,11 @@ mod o_flag {
     pub const SYNC: i32 = 0x0800_0000;
     pub const EXLOCK: i32 = 0x1000_0000;
     pub const FILEMAP: i32 = 0x2000_0000;
+    /// The flags an open may carry and still only read: see
+    /// `OpenFlags::writes`. Not TEMPORARY, which deletes the file when the
+    /// descriptor closes; and not FILEMAP, which asks for a writable
+    /// mapping of the file in libuv and is left off the list for that.
+    pub const HARMLESS: i32 = RANDOM | SEQUENTIAL | SHORT_LIVED | DIRECT | DSYNC | SYNC | EXLOCK;
 }
 
 /// `fs.constants`' open flags on this platform: the names node has here, in
@@ -2576,7 +2592,7 @@ pub fn open_flag_table() -> Vec<(&'static str, i32)> {
         #[cfg(target_os = "linux")]
         table.push(("O_DIRECT", o_flag::DIRECT));
         #[cfg(target_os = "macos")]
-        table.push(("O_SYMLINK", rustix::fs::OFlags::SYMLINK.bits() as i32));
+        table.push(("O_SYMLINK", o_flag::SYMLINK));
         table.push(("O_NONBLOCK", o_flag::NONBLOCK));
     }
     table
@@ -2595,11 +2611,17 @@ pub fn open_flag_table() -> Vec<(&'static str, i32)> {
 pub struct OpenFlags(pub i32);
 
 impl OpenFlags {
-    /// Whether the open can change anything -- the file's content, or
-    /// whether it exists -- and so needs the write grant.
+    /// Whether the open needs the write grant: anything but an open that
+    /// can ONLY read. That is decided by what is allowed, not by what is
+    /// known to write: the access mode must be read-only and every other
+    /// bit one of a short list that changes nothing (`o_flag::HARMLESS`).
+    /// Any other bit -- O_CREAT, O_TRUNC, O_APPEND, Windows's delete-on-close
+    /// O_TEMPORARY, a flag this table has never heard of -- needs the write
+    /// grant, since the bits now reach the open as they are. node's rule
+    /// (CheckOpenPermissions) names the writing flags instead; this one is a
+    /// superset of it.
     pub fn writes(self) -> bool {
-        self.0 & (o_flag::WRONLY | o_flag::RDWR | o_flag::CREAT | o_flag::TRUNC | o_flag::APPEND)
-            != 0
+        self.0 & !o_flag::HARMLESS != o_flag::RDONLY
     }
 
     /// Creates a file that is missing and accepts one that is there: the
@@ -2614,8 +2636,11 @@ impl OpenFlags {
     pub fn open(self, path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
         use rustix::fs::{Mode, OFlags};
         let flags = OFlags::from_bits_retain(self.0 as _) | OFlags::CLOEXEC;
-        let fd = rustix::fs::open(path.as_ref(), flags, Mode::from_raw_mode(0o666))
-            .map_err(io_from_errno)?;
+        // Retried while a signal interrupts it, as std's open and libuv's are.
+        let fd = rustix::io::retry_on_intr(|| {
+            rustix::fs::open(path.as_ref(), flags, Mode::from_raw_mode(0o666))
+        })
+        .map_err(io_from_errno)?;
         Ok(std::fs::File::from(fd))
     }
 
@@ -2639,9 +2664,15 @@ impl OpenFlags {
     /// - a combination libuv has no case for (both access bits; both of
     ///   sequential and random) is `EINVAL` before any call.
     ///
-    /// One argument is not libuv's yet: the open's `mode`. libuv adds
-    /// FILE_ATTRIBUTE_READONLY for a creating open whose mode lacks the
-    /// owner's write bit (#324).
+    /// Two things are not libuv's:
+    ///
+    /// - the open's `mode`: libuv adds FILE_ATTRIBUTE_READONLY for a creating
+    ///   open whose mode lacks the owner's write bit (#324);
+    /// - UV_FS_O_FILEMAP is accepted and ignored. libuv opens such a file
+    ///   read-write, without the append swap, and does its reads and writes
+    ///   through a mapping, emulating append and the access mode there; here
+    ///   it is an ordinary handle, which differs only together with O_APPEND
+    ///   or O_DIRECT (docs/node-divergences.md).
     #[cfg(windows)]
     pub fn open(self, path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
         use std::os::windows::ffi::OsStrExt;
@@ -4111,7 +4142,7 @@ mod fs_os_path_tests {
 /// node's `stringToFlags` (lib/internal/fs/utils.js): the bits one of node's
 /// flag strings stands for. The JS layer makes the same translation before a
 /// flag reaches a native; this one serves the opens made on this side
-/// (`readFile`, `writeFile`, `appendFile`) and the tests. A string node does
+/// (`writeFile`, `appendFile`) and the tests. A string node does
 /// not know is read-only here; node itself refuses it, in JS.
 ///
 /// The synchronous spellings (`rs`, `as+`, ...) add O_SYNC, where the platform
@@ -6765,10 +6796,9 @@ pub mod ops {
         }
     }
 
-    /// Open a file for streaming. Takes node's full fopen-style flag set via
-    /// the shared `open_options_for` table -- the same one the sync open uses,
-    /// so a flag that works on `fs.openSync` works here too. Resolves with
-    /// Json {handle}.
+    /// Open a file for a descriptor, with the platform's O_* bits: the same
+    /// `OpenFlags::open` the sync open makes, so the two cannot disagree
+    /// about what a flag means. Resolves with Json {handle}.
     pub async fn fs_open(
         files: super::FileRegistry,
         ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -7928,6 +7958,41 @@ mod os_error_code_tests {
             assert_eq!(node_error_code(&failed), "EINVAL", "{flags}: {failed:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An open needs the write grant unless it can only read: read-only
+    /// access and nothing else but flags that change nothing.
+    #[test]
+    fn an_open_that_is_not_plainly_a_read_needs_the_write_grant() {
+        for flags in ["r", "rs", "sr"] {
+            assert!(!open_options_for(flags).writes(), "{flags}");
+        }
+        for flags in [
+            "r+", "rs+", "w", "wx", "w+", "wx+", "a", "ax", "as", "a+", "ax+", "as+",
+        ] {
+            assert!(open_options_for(flags).writes(), "{flags}");
+        }
+        // Read-only access with a flag that creates, empties or appends.
+        for bit in [o_flag::CREAT, o_flag::TRUNC, o_flag::APPEND, o_flag::EXCL] {
+            assert!(OpenFlags(o_flag::RDONLY | bit).writes(), "{bit:#x}");
+        }
+        // Every bit that is not on the short list, the unknown ones included.
+        for shift in 0..31 {
+            let bit = 1i32 << shift;
+            let harmless = bit & o_flag::HARMLESS != 0;
+            assert_eq!(OpenFlags(bit).writes(), !harmless, "{bit:#x}");
+        }
+        assert!(OpenFlags(-1).writes());
+        assert!(OpenFlags(i32::MIN).writes());
+        // Delete-on-close is no read, whatever the access mode.
+        #[cfg(windows)]
+        {
+            assert!(OpenFlags(o_flag::TEMPORARY).writes());
+            assert!(OpenFlags(o_flag::FILEMAP).writes());
+            assert!(!OpenFlags(o_flag::SEQUENTIAL | o_flag::RANDOM).writes());
+        }
+        #[cfg(unix)]
+        assert!(!OpenFlags(o_flag::DIRECTORY | o_flag::NOFOLLOW).writes());
     }
 
     /// A device is no share root: `\\.\NUL` opens for every flag, the

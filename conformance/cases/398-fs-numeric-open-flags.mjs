@@ -157,15 +157,6 @@ for (const flags of ["r", "rs", "sr", "r+", "rs+", "w", "wx", "xw", "w+", "wx+",
 if (process.platform === "win32") {
   const { execFileSync } = await import("node:child_process");
   const attrib = (...args) => execFileSync("attrib", args).toString();
-  process.on("exit", () => {
-    try {
-      for (const name of fs.readdirSync(made)) {
-        try {
-          attrib("-r", "-h", "-s", path.join(made, name));
-        } catch {}
-      }
-    } catch {}
-  });
   // Only CREATE_ALWAYS replaces the file: a hidden file is refused by it and
   // by nothing else, and a stream beside the data survives every other open.
   for (const [label, n] of combos.filter(([, bits]) => (bits & 3) !== 0)) {
