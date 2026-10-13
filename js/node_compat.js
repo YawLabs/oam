@@ -11769,25 +11769,28 @@
       async [Symbol.asyncDispose]() {
         await this.close();
       }
+      // node's readFileHandle (lib/internal/fs/promises.js, v22.22.2), in its
+      // order: the options (getOptions: their type, a known encoding, the
+      // signal's type); the decoder for the encoding, which is where
+      // `"buffer"` -- an encoding the options check lets through -- is
+      // refused; a signal already aborted; and only then the reads, with the
+      // signal looked at again between them. What is wrong with the call is
+      // reported whatever the handle holds. It used to read first and decode
+      // at the end, so a bad encoding went unreported for an empty file and
+      // behind the read's own error for a handle that cannot be read.
       async readFile(options) {
-        const fh = this, h = this[kNative];
-        var enc = (options && typeof options === "object") ? options.encoding : (typeof options === "string" ? options : null);
-        var chunks = [];
-        while (true) {
-          var chunk = await natives.fsReadChunk(h, 65536);
+        const h = this[kNative];
+        const { encoding, signal } = fsGetOptions(options, {});
+        if (encoding === "buffer") throw codes.ERR_UNKNOWN_ENCODING(encoding);
+        const chunks = [];
+        for (;;) {
+          if (signal && signal.aborted) throw new FsAbortError(signal);
+          const chunk = await natives.fsReadChunk(h, 65536);
           if (chunk === undefined) break;
           chunks.push(chunk);
         }
-        if (chunks.length === 0) return enc ? "" : globalThis.Buffer.alloc(0);
-        var total = 0;
-        for (var i = 0; i < chunks.length; i++) total += chunks[i].length;
-        var buf = globalThis.Buffer.alloc(total);
-        var off = 0;
-        for (var i = 0; i < chunks.length; i++) {
-          buf.set(chunks[i], off);
-          off += chunks[i].length;
-        }
-        return enc ? buf.toString(enc) : buf;
+        const whole = globalThis.Buffer.concat(chunks);
+        return encoding ? whole.toString(encoding) : whole;
       }
       // node's fs/promises writeFile over this handle: the options, then
       // the data (a string, a view or an iterable), as every writeFile

@@ -20,6 +20,13 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`FileHandle.readFile` checks its options before it reads (#351).** It read first and
+  decoded at the end, so an unknown `encoding` was reported with the wrong code
+  (`ERR_UNKNOWN_ENCODING`), not reported at all for an empty file, and hidden behind the
+  read's own `EBADF` on a handle that cannot be read. The options are now checked first,
+  as node's are (`ERR_INVALID_ARG_VALUE`; `"buffer"` is `ERR_UNKNOWN_ENCODING`), and a
+  `signal` is honoured: one already aborted, or aborted between reads, rejects
+  `AbortError`. Conformance case 402.
 - **A `FileHandle` is an `EventEmitter`, and a stream over one is tied to it (#343).**
   `fs.promises.open()` returned a plain object: `handle.on("close", ...)` threw, and
   `handle.close()` closed the descriptor on the spot. It is now node's `FileHandle`
