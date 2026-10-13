@@ -10440,6 +10440,10 @@
   function decodeRead(bytes, encoding) {
     const BufferCtor = globalThis.Buffer;
     const buf = BufferCtor.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    // Nothing read is "" for any encoding the options check let through --
+    // `"buffer"` too, which node's toString never gets to look up for an
+    // empty Buffer.
+    if (encoding && buf.length === 0) return "";
     return encoding ? buf.toString(encoding) : buf;
   }
 
@@ -12443,7 +12447,7 @@
     // the call and never reaches the callback: it is thrown from that tick,
     // as an uncaught exception (v22.22.2, measured -- a try/catch around
     // fs.readFile(-1, cb) does not see it).
-    function readFdAsync(fd, cb) {
+    function readFdAsync(fd, cb, signal) {
       if (fd < 0) {
         const err = invalidFdError(fd, true);
         process.nextTick(() => { throw err; });
@@ -12461,20 +12465,32 @@
       //   hears about.
       // Neither is the failure itself; both are what a program written
       // against node sees.
-      fs.fstat(fd, (statErr) => {
-        if (statErr) return cb(codes.ERR_INVALID_ARG_TYPE("list", "Array", null));
-        const chunks = [];
-        let total = 0;
-        const next = () => {
-          const chunk = globalThis.Buffer.allocUnsafe(65536);
-          fs.read(fd, chunk, 0, chunk.length, null, (err, n) => {
-            if (err || n === 0) return cb(null, globalThis.Buffer.concat(chunks, total));
-            chunks.push(n === chunk.length ? chunk : chunk.subarray(0, n));
-            total += n;
-            next();
-          });
-        };
-        next();
+      //
+      // An aborted `signal` goes the same way: node checks it before every
+      // read and hands the abort to that close step, so the callback gets
+      // the bytes read before it and no error, and the descriptor stays
+      // where those reads left it.
+      //
+      // The stat is made a tick after the call, as node's is: a descriptor
+      // the caller closes right after calling is one the stat finds closed.
+      process.nextTick(() => {
+        fs.fstat(fd, (statErr) => {
+          if (statErr) return cb(codes.ERR_INVALID_ARG_TYPE("list", "Array", null));
+          const chunks = [];
+          let total = 0;
+          const done = () => cb(null, globalThis.Buffer.concat(chunks, total));
+          const next = () => {
+            if (signal && signal.aborted) return done();
+            const chunk = globalThis.Buffer.allocUnsafe(65536);
+            fs.read(fd, chunk, 0, chunk.length, null, (err, n) => {
+              if (err || n === 0) return done();
+              chunks.push(n === chunk.length ? chunk : chunk.subarray(0, n));
+              total += n;
+              next();
+            });
+          };
+          next();
+        });
       });
     }
 
@@ -12797,8 +12813,15 @@
         // before anything is opened.
         options = fsGetOptions(options, {});
         const enc = options.encoding;
-        // node's fast path, by these two spellings exactly.
-        if (isInt32(path)) return decodeRead(readFdSync(path, enc === "utf8" || enc === "utf-8"), enc ?? null);
+        if (isInt32(path)) {
+          // node's fast path, by these two spellings exactly: its binding is
+          // handed the flag as bits, so a bad flag is refused here even
+          // though a descriptor has no use for one, and then reads without
+          // a stat. Any other encoding never looks at the flag.
+          const straight = enc === "utf8" || enc === "utf-8";
+          if (straight) openFlags(options.flag === undefined ? "r" : options.flag, natives);
+          return decodeRead(readFdSync(path, straight), enc ?? null);
+        }
         // Any flag but a read-only one: open with it, read the descriptor,
         // close it (see readFileAt).
         const given = options.flag;
@@ -13026,12 +13049,12 @@
           if (err) return cb(err);
           let out;
           try {
-            out = decodeRead(bytes, readOptions(options).encoding ?? null);
+            out = decodeRead(bytes, opts.encoding ?? null);
           } catch (e) {
             return cb(e);
           }
           cb(null, out);
-        });
+        }, opts.signal);
       },
       writeFile: fdOrPathWrite(promises.writeFile, false),
       appendFile: fdOrPathWrite(promises.appendFile, true),

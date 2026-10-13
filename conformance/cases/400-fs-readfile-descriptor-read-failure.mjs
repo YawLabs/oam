@@ -46,18 +46,20 @@ const viaSync = (fd, options) => {
   }
 };
 
+// What each row opens, by all three forms: the path and the flag.
 const opens = [
-  ["file r", () => fs.openSync(file, "r")],
-  ["file r+", () => fs.openSync(file, "r+")],
-  ["file a+", () => fs.openSync(file, "a+")],
-  ["file a, write-only", () => fs.openSync(file, "a")],
-  ["file w, write-only", () => fs.openSync(path.join(made, "w"), "w")],
-  ["file O_WRONLY", () => fs.openSync(file, fs.constants.O_WRONLY)],
+  ["file r", file, "r"],
+  ["file r+", file, "r+"],
+  ["file a+", file, "a+"],
+  ["file a, write-only", file, "a"],
+  ["file w, write-only", path.join(made, "w"), "w"],
+  ["file O_WRONLY", file, fs.constants.O_WRONLY],
+  // A directory opens for reading everywhere; its read is what fails.
+  ["directory r", path.join(made, "dir"), "r"],
 ];
-// A directory opens for reading everywhere; its read is what fails.
-opens.push(["directory r", () => fs.openSync(path.join(made, "dir"), "r")]);
-for (const [label, open] of opens) {
-  for (const options of [undefined, "utf8", { encoding: "hex" }, { encoding: null }]) {
+for (const [label, target, flag] of opens) {
+  const open = () => fs.openSync(target, flag);
+  for (const options of [undefined, "utf8", { encoding: "hex" }, { encoding: null }, "buffer"]) {
     const name = options === undefined ? "no options" : JSON.stringify(options);
     let fd;
     try {
@@ -71,7 +73,10 @@ for (const [label, open] of opens) {
     fd = open();
     console.log(`${label} | ${name} | ${viaSync(fd, options)}`);
     fs.closeSync(fd);
-    const handle = await fs.promises.open(typeof label === "string" && label.startsWith("directory") ? path.join(made, "dir") : file, label.includes("write-only") || label.includes("WRONLY") ? "a" : "r");
+    // FileHandle.readFile reads the "buffer" encoding its own way; not this case's.
+    if (options === "buffer") continue;
+    if (flag === "w") fs.writeFileSync(file, "0123456789");
+    const handle = await fs.promises.open(target, flag);
     console.log(`${label} | ${name} | FileHandle ` + (await handle.readFile(options).then(value, shape)));
     await handle.close();
   }
@@ -108,4 +113,45 @@ for (const [label, open] of opens) {
   for (const fd of [-1, 2 ** 31, 1.5]) {
     console.log(`descriptor ${fd} | ${viaSync(fd, "utf8")} | ${viaSync(fd)}`);
   }
+}
+
+// The callback form looks at the descriptor a tick after the call: one the
+// caller closes at once is closed by then. One descriptor per process state,
+// so the number is not one a later open has been handed.
+{
+  const fd = fs.openSync(file, "r");
+  const answer = new Promise((res) => fs.readFile(fd, "utf8", (e, v) => res(e ? shape(e) : value(v))));
+  fs.closeSync(fd);
+  console.log("closed in the same tick | " + (await answer));
+}
+// A signal that is aborted ends the read like a failed read does: what was
+// read before it, no error, and the descriptor where it was.
+{
+  const position = (fd) => {
+    const b = Buffer.alloc(4);
+    return JSON.stringify(b.toString("latin1", 0, fs.readSync(fd, b, 0, 4, null)));
+  };
+  for (const options of [{ signal: AbortSignal.abort() }, { signal: AbortSignal.abort(), encoding: "utf8" }]) {
+    const fd = fs.openSync(file, "r");
+    const answer = await viaCallback(fd, options);
+    console.log(`aborted signal | ${options.encoding ?? "no encoding"} | ${answer} | next read ${position(fd)}`);
+    fs.closeSync(fd);
+  }
+  const controller = new AbortController();
+  const fd = fs.openSync(file, "r");
+  const answer = viaCallback(fd, { signal: controller.signal });
+  controller.abort();
+  console.log(`aborted in the same tick | ${await answer} | next read ${position(fd)}`);
+  fs.closeSync(fd);
+  const sync = fs.openSync(file, "r");
+  console.log("readFileSync ignores a signal | " + viaSync(sync, { signal: AbortSignal.abort(), encoding: "utf8" }));
+  fs.closeSync(sync);
+}
+// The utf8 fast path checks a flag it has no use for; no other encoding does.
+for (const options of [{ encoding: "utf8", flag: "zz" }, { encoding: "utf-8", flag: 7.5 }, { encoding: "hex", flag: "zz" }, { flag: "zz" }, { encoding: "utf8", flag: "w" }]) {
+  const fd = fs.openSync(file, "r");
+  const b = Buffer.alloc(4);
+  const answer = viaSync(fd, options);
+  console.log(`descriptor with a flag | ${JSON.stringify(options)} | ${answer} | next read ${JSON.stringify(b.toString("latin1", 0, fs.readSync(fd, b, 0, 4, null)))}`);
+  fs.closeSync(fd);
 }
