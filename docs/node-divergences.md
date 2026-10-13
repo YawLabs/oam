@@ -3501,25 +3501,6 @@ booting and then failing every browser tool.
   the `PipeWrap` but not Node's `ConnectWrap` -- as oam's TCP connect lists no
   `TCPConnectWrap`.
 
-### `err.syscall` on `fs.opendir`
-
-Node's own sync and async forms disagree here, and oam is self-consistent where
-node is not:
-
-| call | node | oam |
-|---|---|---|
-| `opendirSync(missing)` | `syscall: "opendir"`, no `path` | `syscall: "scandir"`, `path` set |
-| `opendir(missing)` | `syscall: "opendir"`, `path` set | `syscall: "scandir"`, `path` set |
-
-Everything else — `code`, `errno`, the message — matches. `fs.realpath` used to
-be listed here too; since #167 oam reports what node does for every form:
-`realpathSync` and callback `realpath` fail with the `lstat` of the first
-missing component (node's JS path walk), and `realpathSync.native`,
-`realpath.native` and `fs/promises.realpath` with `realpath` and the whole path
-(`conformance/cases/240-*`). Both are excluded from the async/sync error-parity
-case (`conformance/cases/72-*`), because asserting node's behaviour there would
-mean encoding its inconsistency into a case whose purpose is the rule.
-
 ### `fs` descriptor arguments: what still differs
 
 Every `fs` call that takes a descriptor (`closeSync` / `close`, `fstat`, `read`,

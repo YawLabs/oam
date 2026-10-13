@@ -2289,8 +2289,6 @@ pub enum FsSite<'a> {
         recursive: bool,
     },
     Readlink,
-    /// `fs.readdir`.
-    Scandir,
 }
 
 /// What node reports for a failed filesystem operation: the code, the syscall
@@ -2329,8 +2327,9 @@ pub struct FsError {
 ///   for a recursive mkdir: node's MKDirp re-stats the path after the failure
 ///   and reports `ENOENT`.
 /// - fs__readlink reports ERROR_NOT_A_REPARSE_POINT as `EINVAL`.
-/// - fs__scandir reports a file as `ENOTDIR`; libuv's table says `ENOENT` for
-///   the ERROR_DIRECTORY std gets.
+///
+/// `readdir` and `opendir` have rules too, which need the path looked at
+/// again and so live with the listing: `ops::readdir_to_json`.
 ///
 /// Every other open of a directory needs no rule. It opens, a root included,
 /// and the read or write on it is what fails; `wx` and `ax` fail
@@ -2364,9 +2363,6 @@ pub fn fs_error_at(
                 if matches!(raw, Some(ERROR_INVALID_NAME | ERROR_DIRECTORY)) =>
             {
                 return at("EINVAL", syscall, true);
-            }
-            FsSite::Scandir if raw == Some(ERROR_DIRECTORY) => {
-                return at("ENOTDIR", syscall, true);
             }
             FsSite::Readlink if raw == Some(ERROR_NOT_A_REPARSE_POINT) => {
                 return at("EINVAL", syscall, true);
@@ -2779,6 +2775,21 @@ impl FsPath {
     /// The path to hand the OS.
     pub fn os(&self) -> &str {
         &self.os
+    }
+
+    /// The OS path node's `readdir` hands libuv's scandir. On Windows that
+    /// is the one path a trailing separator survives on: `readdirSync("f\\")`
+    /// fails `ENOENT: ..., scandir 'C:\cwd\f\'` where `f` is a file, though
+    /// `statSync("f\\")` and `openSync("f\\")` answer for `f` (v22.22.2,
+    /// measured: `f\`, `f/` and `f\\` keep one separator, `f\.` keeps
+    /// none). `opendir` does not keep it.
+    pub fn for_scandir(path: String) -> Self {
+        let trailing = cfg!(windows) && path.ends_with(['\\', '/']);
+        let mut found = Self::new(path);
+        if trailing && !found.os.is_empty() && !found.os.ends_with('\\') {
+            found.os.push('\\');
+        }
+        found
     }
 
     /// The path an error names: `fs_shown_path` of the OS path.
@@ -5155,6 +5166,48 @@ pub mod ops {
     #[cfg(windows)]
     fn sort_as_scandir(_found: &mut [(std::ffi::OsString, &'static str)]) {}
 
+    /// What libuv reports where std's `read_dir` (FindFirstFileW on
+    /// `path\*`) failed. std fails ERROR_DIRECTORY for anything that is no
+    /// directory -- a file, a link of the wrong kind -- and libuv's table reads
+    /// that as `ENOENT`; each of libuv's two listings looks at the path its
+    /// own way first (src/win/fs.c, v1.51.0), and node reports that:
+    ///
+    /// - fs__scandir (`readdir`) OPENS the path, with
+    ///   FILE_FLAG_BACKUP_SEMANTICS and following links, and reports that
+    ///   open's failure: `EPERM` for a file symlink to a directory, `ENOENT`
+    ///   for a directory symlink or junction to a file, and for a file named
+    ///   with a trailing separator. What opens and is no directory fails the
+    ///   listing: `ENOTDIR`.
+    /// - fs__opendir (`raw`) reads the path's own attributes, a link's
+    ///   rather than its target's, and reports `ENOTDIR` when they are not a
+    ///   directory's -- a file symlink, wherever it leads. Attributes that
+    ///   cannot be read pass, and so does a directory link to a file: both
+    ///   fail the listing itself, the table's `ENOENT`.
+    ///
+    /// Asked only once the listing has failed, so a listing that works pays
+    /// nothing. Measured on node v22.22.2: conformance case 393.
+    #[cfg(windows)]
+    fn listing_error(path: &str, raw: bool, error: std::io::Error) -> std::io::Error {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+        let not_a_directory = || std::io::Error::from(std::io::ErrorKind::NotADirectory);
+        if raw {
+            return match std::fs::symlink_metadata(path) {
+                Ok(own) if own.file_attributes() & FILE_ATTRIBUTE_DIRECTORY == 0 => {
+                    not_a_directory()
+                }
+                _ => error,
+            };
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        match super::open_path(super::opens_as_libuv(&mut options), path) {
+            Err(open) => open,
+            Ok(opened) if opened.metadata().is_ok_and(|m| !m.is_dir()) => not_a_directory(),
+            Ok(_) => error,
+        }
+    }
+
     /// The entries of `path` as node hands them out: `readdir`'s come from
     /// libuv's scandir, sorted on unix (`sort_as_scandir`); `raw` asks for
     /// the file system's own order, which is what `opendir`'s Dir reads
@@ -5163,7 +5216,11 @@ pub mod ops {
     /// `a, b, c, lnk, top.txt`) and Linux.
     pub fn readdir_to_json(path: &str, raw: bool) -> std::io::Result<String> {
         let mut found = Vec::new();
-        for entry in std::fs::read_dir(path)? {
+        #[cfg(windows)]
+        let listing = std::fs::read_dir(path).map_err(|e| listing_error(path, raw, e))?;
+        #[cfg(not(windows))]
+        let listing = std::fs::read_dir(path)?;
+        for entry in listing {
             let entry = entry?;
             let kind = match entry.file_type() {
                 Ok(t) if t.is_symlink() => "symlink",
@@ -5373,7 +5430,8 @@ pub mod ops {
         .unwrap_or_else(|e| Err(std::io::Error::other(e)))
         {
             Ok(json) => OpOutcome::Json(json),
-            Err(e) => node_fail_at(super::FsSite::Scandir, e, "scandir", &path),
+            // node's Dir is opened by uv_fs_opendir, and says so.
+            Err(e) => node_fail(e, if raw { "opendir" } else { "scandir" }, &path),
         }
     }
 
@@ -7151,11 +7209,6 @@ mod os_error_code_tests {
             ),
             expect("ENOENT", "mkdir", true)
         );
-        // readdir of a file is ENOTDIR; the same code elsewhere is ENOENT.
-        assert_eq!(
-            fs_error_at(FsSite::Scandir, "scandir", file_s, &raw(ERROR_DIRECTORY)),
-            expect("ENOTDIR", "scandir", true)
-        );
         assert_eq!(
             fs_error_at(FsSite::Open("r"), "open", file_s, &raw(ERROR_DIRECTORY)),
             expect("ENOENT", "open", true)
@@ -7248,6 +7301,64 @@ mod os_error_code_tests {
         );
         write_whole_file(dir_s, b"", true).expect("an empty append to a directory succeeds");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A listing of what is no directory fails as libuv's does, not with
+    /// the one ERROR_DIRECTORY std has for all of it: a file is `ENOTDIR` for
+    /// `readdir` and `opendir` both, and `readdir` of a file named with a
+    /// trailing separator -- which only `FsPath::for_scandir` keeps -- is
+    /// the `ENOENT` of the open libuv makes first. Links of the wrong kind
+    /// are conformance case 393's: making one needs a privilege a test run
+    /// may not have.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_listing_of_what_is_no_directory() {
+        let dir = whole_file_dir("listing");
+        let dir_s = dir.to_str().unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, b"f").unwrap();
+        let file_s = file.to_str().unwrap();
+        let code = |path: &str, raw: bool| match ops::readdir_to_json(path, raw) {
+            Ok(json) => panic!("{path} listed: {json}"),
+            Err(e) => node_error_code(&e),
+        };
+        for raw in [false, true] {
+            assert_eq!(code(file_s, raw), "ENOTDIR", "raw {raw}");
+            assert_eq!(
+                code(&format!(r"{dir_s}\missing"), raw),
+                "ENOENT",
+                "raw {raw}"
+            );
+            assert_eq!(code(&format!(r"{file_s}\x"), raw), "ENOENT", "raw {raw}");
+        }
+        for sep in ['\\', '/'] {
+            let given = format!("{file_s}{sep}");
+            let kept = FsPath::for_scandir(given.clone());
+            assert!(kept.os().ends_with('\\'), "{}", kept.os());
+            assert!(kept.shown().ends_with(r"f.txt\"), "{}", kept.shown());
+            assert_eq!(code(kept.os(), false), "ENOENT");
+            // Every other call's path drops it, opendir's among them.
+            let dropped = FsPath::new(given);
+            assert!(dropped.os().ends_with("f.txt"), "{}", dropped.os());
+            assert_eq!(code(dropped.os(), true), "ENOTDIR");
+        }
+        // Not a separator: `f.txt\.` is `f.txt`.
+        let dot = FsPath::for_scandir(format!(r"{file_s}\."));
+        assert!(dot.os().ends_with("f.txt"), "{}", dot.os());
+        // A directory lists either way, and a root keeps the one it has.
+        let listed = FsPath::for_scandir(format!(r"{dir_s}\"));
+        assert!(
+            ops::readdir_to_json(listed.os(), false)
+                .unwrap()
+                .contains("f.txt")
+        );
+        let root = FsPath::for_scandir(format!(r"{}\", &dir_s[..2]));
+        assert!(
+            root.os().ends_with(r":\") && !root.os().ends_with(r"\\"),
+            "{}",
+            root.os()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A drive root or a UNC share root is a directory like any other for

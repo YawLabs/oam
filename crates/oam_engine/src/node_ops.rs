@@ -6738,21 +6738,23 @@ fn op_fs_readdir_sync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = fs_path_arg(
-        scope,
-        &args,
-        0,
-        FsAccess::Read,
-        "readdirSync requires a path",
-    ) else {
-        return;
-    };
     // args[1]: the file system's own order, for opendir's Dir (see
     // oam_core::ops::readdir_to_json).
     let raw = args.get(1).is_true();
+    let Some(path) = scandir_path_arg(scope, &args, raw, "readdirSync requires a path") else {
+        return;
+    };
     match oam_core::ops::readdir_to_json(path.os(), raw) {
         Ok(json) => return_json(scope, &mut rv, &json),
-        Err(e) => throw_fs_error(scope, oam_core::FsSite::Scandir, "scandir", &path, &e),
+        // node's opendirSync names its syscall and no path (`ENOTDIR: not a
+        // directory, opendir`), on every platform; opendir and
+        // fs.promises.opendir name the path too.
+        Err(e) if raw => {
+            let code = node_error_code(&e);
+            let message = oam_core::node_error_message_fd(code, "opendir", &e);
+            throw_system_error(scope, code, &message, "opendir", None, &e);
+        }
+        Err(e) => throw_node_error(scope, "scandir", &path, &e),
     }
 }
 
@@ -7438,10 +7440,10 @@ fn op_fs_readdir(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Read, "readdir requires a path") else {
+    let raw = args.get(1).is_true();
+    let Some(path) = scandir_path_arg(scope, &args, raw, "readdir requires a path") else {
         return;
     };
-    let raw = args.get(1).is_true();
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_readdir(path, raw));
 }
 
@@ -8205,13 +8207,42 @@ fn fs_path_arg(
     fs_path_of(scope, path, access)
 }
 
+/// `fs_path_arg` for a listing's path, argument 0: `readdir`'s is the
+/// one that keeps a trailing separator (`FsPath::for_scandir`); `opendir`'s
+/// (`raw`) is a path like any other.
+fn scandir_path_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    raw: bool,
+    missing: &str,
+) -> Option<oam_core::FsPath> {
+    let Some(path) = arg_string(scope, args, 0) else {
+        throw_type_error(scope, missing);
+        return None;
+    };
+    let path = if raw {
+        oam_core::FsPath::new(path)
+    } else {
+        oam_core::FsPath::for_scandir(path)
+    };
+    fs_path_checked(scope, path, FsAccess::Read)
+}
+
 /// `fs_path_arg` for a path already read from the arguments.
 fn fs_path_of(
     scope: &mut v8::PinScope<'_, '_>,
     path: String,
     access: FsAccess,
 ) -> Option<oam_core::FsPath> {
-    let path = oam_core::FsPath::new(path);
+    fs_path_checked(scope, oam_core::FsPath::new(path), access)
+}
+
+/// The permission check on a path that is already the OS path.
+fn fs_path_checked(
+    scope: &mut v8::PinScope<'_, '_>,
+    path: oam_core::FsPath,
+    access: FsAccess,
+) -> Option<oam_core::FsPath> {
     let permissions = get_permissions(scope);
     let verdict = match access {
         FsAccess::Read => permissions.check_read_path(&path),
@@ -10925,6 +10956,8 @@ mod permission_audit {
             }
             let checked = body.contains("fs_path_arg(")
             || body.contains("fs_path_of(")
+            // readdir's path: checked like `fs_path_of`'s (`fs_path_checked`).
+            || body.contains("scandir_path_arg(")
             || body.contains("check_fs_as_given(")
             || body.contains("check_child_perm")
             || body.contains("check_worker_perm")
