@@ -20,6 +20,21 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **On Windows a truncating open of a named pipe returns a descriptor (#320).**
+  `openSync(pipe, "w")`, `"w+"`, `writeFile` and a write stream over a pipe failed
+  `EINVAL: invalid argument, open` -- after connecting to the pipe's server, twice. oam
+  opened through std, whose truncating open is an open and then a truncation of the handle,
+  and a pipe has nothing to truncate. It is now the single `CREATE_ALWAYS` open libuv
+  makes: the descriptor comes back, the write arrives, and the server sees one connection.
+  `\\.\CON` opens `"w"` the same way. Conformance case 394.
+- **On Windows a truncating open no longer empties a hidden or system file (#321).** node
+  refuses `"w"`, `"w+"` and `writeFile` on one (`EPERM: operation not permitted, open`)
+  and leaves it as it was; oam truncated it. `"r+"` and `"a"` open it in both.
+- **On Windows a truncating open replaces the file**, as node's does, where oam emptied it
+  in place: its alternate data streams go and its attributes are reset to the archive bit
+  (the read-only bit a `mode` without the owner's write bit asks for is still not set: #324).
+  Through a junction or directory symlink whose target is gone the open now fails `ENOENT`
+  (it was `EPERM`).
 - **On Windows `readdir` of a link of the wrong kind reports what node does (#285).** oam
   listed through std's `read_dir`, whose one answer for anything that is no directory it
   reported as `ENOTDIR`. libuv's scandir opens the path first and reports that open:

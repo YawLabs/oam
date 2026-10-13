@@ -7931,10 +7931,10 @@ fn throw_ebadf(scope: &mut v8::PinScope<'_, '_>, syscall: &str) {
     scope.throw_exception(exception);
 }
 
-/// fopen-style flag string -> OpenOptions. Re-exported from oam_core so the
+/// fopen-style flag string -> how node opens for it. Re-exported from oam_core so the
 /// sync and async opens cannot disagree about what a flag means -- they share
 /// one descriptor space, so they have to share one flag table too.
-use oam_core::{open_options_for, open_path};
+use oam_core::open_options_for;
 
 /// fsOpenSync(path, flags) -> fd. Synchronous open backed by std::fs::File in
 /// the sync-file registry; the returned number is the integer fd. The classic
@@ -7959,7 +7959,7 @@ fn op_fs_open_sync(
     let Some(path) = fs_path_of(scope, path, access) else {
         return;
     };
-    match open_path(&open_options_for(&flags), &path) {
+    match open_options_for(&flags).open(&path) {
         Ok(file) => {
             let core = core_runtime!(scope);
             let id = core
