@@ -5818,7 +5818,7 @@ pub mod ops {
     /// The file's times and attributes: FILE_BASIC_INFO, what libuv reads
     /// with NtQueryInformationFile(FileBasicInformation).
     #[cfg(windows)]
-    fn basic_info(
+    pub(super) fn basic_info(
         file: &std::fs::File,
     ) -> std::io::Result<windows_sys::Win32::Storage::FileSystem::FILE_BASIC_INFO> {
         use std::os::windows::io::AsRawHandle;
@@ -7728,7 +7728,7 @@ mod os_error_code_tests {
                 .status();
             if clear.is_ok_and(|status| status.success()) {
                 let opened = open_options_for("r").open(&file).unwrap();
-                let changed = opened.metadata().unwrap().change_time();
+                let changed = ops::basic_info(&opened).unwrap().ChangeTime;
                 ops::fs_fchmod_sync(&opened, 0o444).unwrap();
                 assert_eq!(
                     attrs() & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE),
@@ -7740,7 +7740,7 @@ mod os_error_code_tests {
                     0
                 );
                 // The change time is written back as it was read.
-                assert_eq!(opened.metadata().unwrap().change_time(), changed);
+                assert_eq!(ops::basic_info(&opened).unwrap().ChangeTime, changed);
             }
         }
         for flags in ["r", "r+", "a"] {
