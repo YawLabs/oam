@@ -7819,11 +7819,24 @@ fn op_fs_mkdtemp_sync(
 
 // ---------------------------------------------------------- fs stream ops
 
-/// Whether an open with these bits needs the write grant rather than the
-/// read one (`OpenFlags::writes`: anything that is not plainly a read). One
-/// answer for fsOpen and fsOpenSync, which share one descriptor space.
-fn open_flags_write(flags: oam_core::OpenFlags) -> bool {
-    flags.writes()
+/// The path of an open, checked for every grant the open needs: the read
+/// grant unless it is write-only (`OpenFlags::reads`), and the write grant
+/// unless it can only read (`OpenFlags::writes`) -- both, for an open that
+/// reads and writes. node's order: read, then write. One answer for fsOpen
+/// and fsOpenSync, which share one descriptor space.
+fn open_path_of(
+    scope: &mut v8::PinScope<'_, '_>,
+    path: String,
+    flags: oam_core::OpenFlags,
+) -> Option<oam_core::FsPath> {
+    let mut path = oam_core::FsPath::new(path);
+    if flags.reads() {
+        path = fs_path_checked(scope, path, FsAccess::Read)?;
+    }
+    if flags.writes() {
+        path = fs_path_checked(scope, path, FsAccess::Write)?;
+    }
+    Some(path)
 }
 
 /// The flags argument of an open: the platform's O_* bits, which the JS
@@ -7865,12 +7878,7 @@ fn op_fs_open(
         return;
     };
     let mode = open_flags_arg(scope, &args, 1);
-    let access = if open_flags_write(mode) {
-        FsAccess::Write
-    } else {
-        FsAccess::Read
-    };
-    let Some(path) = fs_path_of(scope, path, access) else {
+    let Some(path) = open_path_of(scope, path, mode) else {
         return;
     };
     let core = core_runtime!(scope);
@@ -7975,12 +7983,7 @@ fn op_fs_open_sync(
         return;
     };
     let flags = open_flags_arg(scope, &args, 1);
-    let access = if open_flags_write(flags) {
-        FsAccess::Write
-    } else {
-        FsAccess::Read
-    };
-    let Some(path) = fs_path_of(scope, path, access) else {
+    let Some(path) = open_path_of(scope, path, flags) else {
         return;
     };
     match flags.open(&path) {
@@ -10986,6 +10989,7 @@ mod permission_audit {
             || body.contains("fs_path_of(")
             // readdir's path: checked like `fs_path_of`'s (`fs_path_checked`).
             || body.contains("scandir_path_arg(")
+                || body.contains("open_path_of(")
             || body.contains("check_fs_as_given(")
             || body.contains("check_child_perm")
             || body.contains("check_worker_perm")

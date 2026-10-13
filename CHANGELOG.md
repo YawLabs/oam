@@ -20,6 +20,20 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`readFile` honours its `flag` (#336).** `readFileSync`, `fs.readFile` and
+  `fs.promises.readFile` always opened read-only, whatever `flag` said. The path is now
+  opened with the flag given, as node's is, so its effects are the call's:
+  `{ flag: "w+" }` empties the file before reading it, `"a+"` creates one that is missing,
+  `"wx"` refuses one that is there, and a write-only flag fails the read `EBADF`. The
+  options are checked before anything is opened, as node checks them: a bad `encoding` is
+  `ERR_INVALID_ARG_VALUE`, and a signal that is already aborted rejects `AbortError`.
+  Conformance case 399.
+- **Under `--permission`, an open is checked for every grant it needs**: the read grant
+  unless it is write-only, and the write grant unless it can only read -- both, for an
+  open that reads and writes (`"r+"`, `"w+"`, `"a+"`), as node's rule has it.
+- **`fs/promises` no longer exports `_globAsPromise`**, an internal helper that had been
+  left on the module object; `import { _globAsPromise } from "node:fs/promises"` linked in
+  oam and is the `SyntaxError` it is in node.
 - **Numeric open flags mean what their bits say (#328).** oam turned a numeric `flags`
   into the nearest flag string, and no string spells "write, do not truncate":
   `fs.openSync(p, O_WRONLY)`, `O_WRONLY | O_CREAT` and `O_RDWR | O_CREAT` opened as `"w"`
