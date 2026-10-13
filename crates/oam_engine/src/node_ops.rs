@@ -10989,6 +10989,7 @@ mod permission_audit {
             || body.contains("fs_path_of(")
             // readdir's path: checked like `fs_path_of`'s (`fs_path_checked`).
             || body.contains("scandir_path_arg(")
+                || body.contains("open_path_of(")
             || body.contains("check_fs_as_given(")
             || body.contains("check_child_perm")
             || body.contains("check_worker_perm")
