@@ -93,10 +93,10 @@ if (process.platform !== "win32") {
   show("mkdirSync root", () => fs.mkdirSync(root));
   show("mkdirSync root via ..", () => fs.mkdirSync(root + "x\\.."));
   // A drive or share root opens in node (FILE_FLAG_BACKUP_SEMANTICS): its
-  // readFile fails on the read and every write open is EPERM. oam opens
-  // without that flag, where a root fails not-found, and it read as ENOENT.
-  // A read-only openSync of a root is not compared: node gets a directory
-  // descriptor oam does not have (docs/node-divergences.md).
+  // readFile fails on the read and every write open is EPERM. oam once
+  // opened without that flag, where a root fails not-found, and it read as
+  // ENOENT. The read-only openSync of a root, and the descriptor it gives,
+  // are case 392's.
   const share = "\\\\localhost\\" + D[0] + "$";
   const roots = [root, "\\", "/", D.slice(0, 2) + "\\.."];
   if (fs.existsSync(share)) roots.push(share, share + "\\");

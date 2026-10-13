@@ -3714,16 +3714,20 @@ way; the difference is that a symlink needs the create-symlink privilege (Develo
 an elevated process), which a junction does not, so where that privilege is missing oam's
 call fails `EPERM` and node's succeeds. Measured against v22.22.2 (conformance case 377).
 
-### Windows `fs.open` of a directory fails
+### Windows directory descriptors: three corners
 
-node opens a directory on Windows (libuv passes `FILE_FLAG_BACKUP_SEMANTICS`), so
-`openSync("dir", "r")`, `"a"` and `"r+"` return a descriptor, and `appendFileSync("dir", "")`
-succeeds. oam opens without that flag, so each of those fails `EPERM` (`appendFileSync`
-`EISDIR` `write`). Everything that fails in node fails the same way in oam: `readFileSync`
-of a directory or of a drive or share root (`C:\`, `\`, `/`, `\\srv\sh`) fails `EISDIR`
-`read`, `openSync("dir", "w")` fails `EISDIR`, and a write open of a root fails `EPERM`
-naming the root (`'C:\'`, `'\\srv\sh\'`). Measured against v22.22.2 (conformance case 377);
-not fixed yet: it needs directory descriptors.
+A directory opens on Windows as it does in node (`FILE_FLAG_BACKUP_SEMANTICS`), and its
+descriptor answers as node's does: conformance case 392, measured against v22.22.2. Three
+corners are left.
+
+- Callback `fs.readFile(fd, cb)` on a directory descriptor fails `EISDIR` `read` (`EBADF`
+  on one opened `"a"`), as `readFileSync(fd)` and `FileHandle.readFile()` do in both
+  runtimes. node's callback form drops the failed read of a descriptor it was handed and
+  calls back with an empty Buffer.
+- `fs.openAsBlob("dir")` rejects `ERR_INVALID_ARG_VALUE`; node resolves a Blob of size 0.
+- A numeric `O_WRONLY` with neither `O_CREAT` nor `O_APPEND` opens as `"w"` (the natives
+  take node's flag strings, and none spells it), so on a directory it fails `EISDIR` where
+  node returns a descriptor.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 
