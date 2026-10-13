@@ -28,8 +28,8 @@ const PAIRS = [
   // forms disagree on them (realpathSync reports the `lstat` its path-walk
   // failed on where realpath() reports `realpath`; opendirSync omits `path`
   // where opendir() sets it). Asserting the rule on those would mean encoding
-  // node's inconsistency into a case whose whole point is the rule. oam's
-  // divergence there is recorded in docs/node-divergences.md instead.
+  // node's inconsistency into a case whose whole point is the rule. oam
+  // matches node on both, form by form: cases 240 and 393.
   ["truncate", () => fs.truncateSync(MISSING, 0), () => fsp.truncate(MISSING, 0)],
   ["chmod", () => fs.chmodSync(MISSING, 0o644), () => fsp.chmod(MISSING, 0o644)],
   ["readlink", () => fs.readlinkSync(MISSING), () => fsp.readlink(MISSING)],

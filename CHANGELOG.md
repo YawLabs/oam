@@ -16,6 +16,26 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Fixed
+
+- **On Windows `readdir` of a link of the wrong kind reports what node does (#285).** oam
+  listed through std's `read_dir`, whose one answer for anything that is no directory it
+  reported as `ENOTDIR`. libuv's scandir opens the path first and reports that open:
+  `readdirSync` of a file symlink to a directory is now `EPERM`, and of a directory symlink
+  or junction to a file `ENOENT`, in every form (`withFileTypes`, `recursive`, callback,
+  promise). A plain file is still `ENOTDIR`. `opendir` follows libuv's other listing, which
+  reads the link's own attributes: a directory link to a file is `ENOENT`, a file symlink
+  `ENOTDIR` wherever it leads. Conformance case 393.
+- **On Windows `readdir` keeps a trailing separator.** It is the one call whose path does:
+  `readdirSync("file.txt\\")` fails `ENOENT: no such file or directory, scandir
+  'C:\cwd\file.txt\'` as node's does, where oam dropped the separator and answered
+  `ENOTDIR` for `'C:\cwd\file.txt'`. A directory lists the same either way.
+- **A failed `opendir` names `opendir`.** `fs.opendir`, `fs.promises.opendir` and
+  `opendirSync` reported syscall `scandir` on every platform; node reports `opendir`, and
+  `opendirSync`'s error carries no `path` (`ENOTDIR: not a directory, opendir`).
+- **On Windows `opendir("")` lists the current directory**, as node's does, with `dir.path`
+  still `""`; it failed `ENOENT`. `readdir("")` is `ENOENT` in both.
+
 ## [0.19.1] - 2026-10-13
 
 ### Fixed
