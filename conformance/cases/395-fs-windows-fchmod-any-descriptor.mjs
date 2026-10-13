@@ -3,17 +3,21 @@
 // that handle for FILE_WRITE_ATTRIBUTES and sets it on the new one, so what the
 // descriptor was opened for does not matter -- `fchmodSync(fd, 0o444)` through
 // a descriptor opened `r` makes the file read-only, and `0o666` through one
-// makes it writable again. The reopen is also what fails for what cannot be
-// reopened: a directory is `EPERM` and the NUL device `EINVAL`. A named pipe
-// opened by name is reopened, and the call succeeds.
+// makes it writable again -- also where read-only is the only attribute the
+// file has -- and the file's change time does not move. What cannot be
+// reopened fails there: a directory is `EPERM`, an anonymous pipe (a piped
+// stdin or stdout) `EBUSY`. The NUL device reopens and has no attributes to
+// read: `EINVAL`. A named pipe opened by name is reopened, which its server
+// sees as a second connection, and the call succeeds.
 //
 // Regression guard: oam set the attribute on the descriptor's own handle, and
 // a handle opened `r` has no FILE_WRITE_ATTRIBUTES: `EPERM: operation not
-// permitted, fchmod`. NUL's descriptor was `EISDIR`.
+// permitted, fchmod`. NUL's descriptor was `EISDIR`, and a piped stdin's
+// succeeded.
 //
 // Windows-only by design: on POSIX fchmod(2) is one call on the descriptor in
 // both runtimes. Elsewhere the case prints one line so node == oam still holds.
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -45,10 +49,11 @@ const shape = (e) =>
     ? `${e.code} ${e.errno} ${e.syscall} path=${JSON.stringify(scrub(e.path))} ${scrub(e.message)}`
     : "threw " + String(e);
 const called = (f) => new Promise((res, rej) => f((e, v) => (e ? rej(e) : res(v))));
-// The attribute letters attrib prints before the path.
+// The attribute letters attrib prints before the path, which it spells its
+// own way: found by its shape, a drive or a share, not by the text of `p`.
 const attributes = (p) => {
-  const out = attrib(p);
-  return out.slice(0, out.indexOf(p)).replace(/\s+/g, "");
+  const found = /^(.*?)\s*(?:[A-Za-z]:|\\\\)/.exec(attrib(p));
+  return found ? found[1].replace(/\s+/g, "") : "?";
 };
 const octal = (mode) => (mode & 0o777).toString(8);
 let made_n = 0;
@@ -105,16 +110,30 @@ for (const flags of flagsList) {
 }
 
 // ---- A file that is already read-only, hidden or system ----
-for (const [kind, attrs] of [["read-only", ["+r"]], ["hidden", ["+h"]], ["system", ["+s"]], ["read-only hidden", ["+r", "+h"]], ["no archive bit", ["-a"]]]) {
+const kinds = [
+  ["read-only", ["+r"]],
+  ["hidden", ["+h"]],
+  ["system", ["+s"]],
+  ["read-only hidden", ["+r", "+h"]],
+  ["no archive bit", ["-a"]],
+  // Read-only and nothing else: clearing it leaves no attribute at all.
+  ["read-only, no archive bit", ["+r", "-a"]],
+  ["hidden, no archive bit", ["+h", "-a"]],
+];
+for (const [kind, attrs] of kinds) {
   for (const flags of ["r", "r+", "a"]) {
-    for (const mode of [0o666, 0o444]) {
+    for (const mode of [0o666, 0o444, 0o200]) {
       const p = fresh(...attrs);
       let line;
       try {
         const fd = fs.openSync(p, flags);
         try {
+          const before = fs.fstatSync(fd, { bigint: true });
           fs.fchmodSync(fd, mode);
-          line = "OK fstat " + octal(fs.fstatSync(fd).mode);
+          const after = fs.fstatSync(fd, { bigint: true });
+          // The change time stays where it was, and so do the others.
+          const moved = ["ctimeNs", "mtimeNs", "atimeNs", "birthtimeNs"].filter((t) => before[t] !== after[t]);
+          line = "OK fstat " + octal(Number(after.mode)) + " moved " + JSON.stringify(moved);
         } finally {
           fs.closeSync(fd);
         }
@@ -184,8 +203,8 @@ const refused = async (label, open, after = () => {}) => {
         line = shape(e);
       }
       if (fd !== undefined) fs.closeSync(fd);
-      await after();
-      console.log(`${label} | ${form} ${octal(mode)}: ${line}`);
+      const note = (await after()) ?? "";
+      console.log(`${label} | ${form} ${octal(mode)}: ${line}${note}`);
     }
   }
 };
@@ -196,8 +215,9 @@ for (const flags of ["r", "r+", "a"]) {
 }
 console.log("directory | after: " + octal(fs.statSync(path.join(made, "dir")).mode) + " " + attributes(path.join(made, "dir")));
 
-// A pipe has one instance free at a time: the next open waits until the
-// server has taken this one and seen it close.
+// A named pipe. The reopen opens the pipe by name again, so each row is two
+// connections to the server, the second made while the first is still open;
+// the next row waits until the server has taken both and seen them close.
 let connections = 0;
 let live = 0;
 const server = net.createServer((socket) => {
@@ -210,12 +230,29 @@ const server = net.createServer((socket) => {
 await new Promise((res) => server.listen(pipe, res));
 let seen = 0;
 const settled = async () => {
-  for (let i = 0; i < 2000 && (connections === seen || live > 0); i++) {
+  for (let i = 0; i < 2000 && (connections - seen < 2 || live > 0); i++) {
     await new Promise((res) => setTimeout(res, 5));
   }
+  const made = connections - seen;
   seen = connections;
+  return " | connections " + made;
 };
 for (const flags of ["r", "r+", "w"]) {
   await refused("pipe " + flags, () => fs.openSync(pipe, flags), settled);
 }
 await new Promise((res) => server.close(res));
+
+// ---- Descriptors 0-2 of a child: anonymous pipes, and NUL ----
+const child = `
+const fs = require("node:fs");
+const out = [];
+for (const fd of [0, 1]) for (const mode of [0o444, 0o666]) {
+  try { fs.fchmodSync(fd, mode); out.push(fd + " " + mode.toString(8) + " OK"); }
+  catch (e) { out.push(fd + " " + mode.toString(8) + " " + e.code + " " + e.errno + " " + e.syscall + " " + e.message); }
+}
+fs.writeSync(2, out.join("\\n"));
+`;
+for (const [label, stdio] of [["piped", ["pipe", "pipe", "pipe"]], ["NUL", ["ignore", "ignore", "pipe"]]]) {
+  const ran = spawnSync(process.execPath, ["-e", child], { stdio, input: stdio[0] === "pipe" ? "" : undefined });
+  for (const line of String(ran.stderr).split("\n")) console.log(`child stdio ${label} | fchmodSync ${line}`);
+}

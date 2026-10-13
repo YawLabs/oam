@@ -3581,8 +3581,8 @@ What still differs:
   `EBADF`, as in node). One unix difference remains: node's descriptors are the OS's,
   so `fs.closeSync(1)` followed by `fs.openSync(file, 'w')` gets descriptor 1 back
   and stdout's writes go to the file; oam's `openSync` numbers its own descriptors,
-  and stdout stays closed. `fchmod` reopens the handle as libuv's does (a pipe is
-  `EBUSY`, NUL `EINVAL`; `conformance/cases/395-*`). A character device other than the console
+  and stdout stays closed. `fchmod` reopens the handle as libuv's does (an anonymous pipe
+  is `EBUSY`, NUL `EINVAL`; `conformance/cases/395-*`). A character device other than the console
   and NUL (a serial port) stats with NUL's shape on oam, where libuv reads its file
   information.
 - **`fchown` of a closed descriptor on Windows.** node's (libuv's) Windows `fchown`

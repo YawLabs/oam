@@ -5731,11 +5731,26 @@ pub mod ops {
     /// for FILE_WRITE_ATTRIBUTES and the attribute set on that one, so what
     /// the descriptor was opened for does not matter: a handle opened `r` has
     /// no FILE_WRITE_ATTRIBUTES, and setting it there failed `EPERM` where
-    /// node changes the mode (#322). The reopen is also what refuses what it
-    /// cannot reopen, with node's codes: a directory is ERROR_ACCESS_DENIED
-    /// (`EPERM`), the NUL device ERROR_INVALID_PARAMETER (`EINVAL`), an
-    /// anonymous pipe ERROR_PIPE_BUSY (`EBUSY`). Measured on node v22.22.2:
-    /// conformance case 395.
+    /// node changes the mode (#322). What cannot be reopened fails there with
+    /// node's code -- a directory ERROR_ACCESS_DENIED (`EPERM`), an anonymous
+    /// pipe ERROR_PIPE_BUSY (`EBUSY`) -- and the NUL device reopens and has
+    /// no basic information to read: ERROR_INVALID_PARAMETER (`EINVAL`).
+    ///
+    /// The rest is libuv's sequence too, on the file's basic information
+    /// read whole and written back whole:
+    ///
+    /// - the times go back as they were read, so the change time does not
+    ///   move (zeroes, which std's `set_permissions` writes, let the file
+    ///   system stamp a new one);
+    /// - an attribute word that comes to 0 is written as
+    ///   FILE_ATTRIBUTE_NORMAL: 0 means "leave them as they are", so clearing
+    ///   read-only where it was the only attribute did nothing, and said it
+    ///   had;
+    /// - a file without the archive bit is given it for the change and has
+    ///   it taken away again, which libuv does because some file systems
+    ///   ignore a read-only change without it.
+    ///
+    /// Measured on node v22.22.2: conformance case 395.
     fn fchmod_file(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
         #[cfg(unix)]
         {
@@ -5744,23 +5759,30 @@ pub mod ops {
         }
         #[cfg(windows)]
         {
-            use windows_sys::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER};
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
+            };
             let reopened = reopen_for_attributes(file)?;
-            // A device with no attributes to read (NUL) reopens, and fails
-            // here. libuv asks NtQueryInformationFile, which says
-            // STATUS_INVALID_PARAMETER (node's `EINVAL`); the Win32 call std
-            // makes says ERROR_INVALID_FUNCTION for the same refusal, which
-            // the table reads as `EISDIR`.
-            let meta = reopened.metadata().map_err(|e| {
-                if e.raw_os_error() == i32::try_from(ERROR_INVALID_FUNCTION).ok() {
-                    std::io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32)
-                } else {
-                    e
+            let mut info = basic_info(&reopened)?;
+            let archive_was_clear = info.FileAttributes & FILE_ATTRIBUTE_ARCHIVE == 0;
+            if archive_was_clear {
+                info.FileAttributes |= FILE_ATTRIBUTE_ARCHIVE;
+                set_basic_info(&reopened, &info)?;
+            }
+            if mode & 0o200 != 0 {
+                info.FileAttributes &= !FILE_ATTRIBUTE_READONLY;
+            } else {
+                info.FileAttributes |= FILE_ATTRIBUTE_READONLY;
+            }
+            set_basic_info(&reopened, &info)?;
+            if archive_was_clear {
+                info.FileAttributes &= !FILE_ATTRIBUTE_ARCHIVE;
+                if info.FileAttributes == 0 {
+                    info.FileAttributes = FILE_ATTRIBUTE_NORMAL;
                 }
-            })?;
-            let mut perms = meta.permissions();
-            perms.set_readonly(mode & 0o200 == 0);
-            reopened.set_permissions(perms)
+                set_basic_info(&reopened, &info)?;
+            }
+            Ok(())
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -5791,6 +5813,63 @@ pub mod ops {
         // not INVALID_HANDLE_VALUE), nothing else has seen it, and the File
         // takes the one ownership of it.
         Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+    }
+
+    /// The file's times and attributes: FILE_BASIC_INFO, what libuv reads
+    /// with NtQueryInformationFile(FileBasicInformation).
+    #[cfg(windows)]
+    fn basic_info(
+        file: &std::fs::File,
+    ) -> std::io::Result<windows_sys::Win32::Storage::FileSystem::FILE_BASIC_INFO> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+        };
+        let mut info = FILE_BASIC_INFO::default();
+        // SAFETY: `file` is borrowed for the call, so its handle is open, and
+        // `info` is a live FILE_BASIC_INFO -- the structure FileBasicInfo
+        // fills -- of exactly the size passed.
+        let read = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileBasicInfo,
+                std::ptr::from_mut(&mut info).cast(),
+                size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        };
+        if read == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(info)
+    }
+
+    /// Write `info` back: every time as given (0 leaves one alone) and the
+    /// attributes as given (0 leaves them alone).
+    #[cfg(windows)]
+    fn set_basic_info(
+        file: &std::fs::File,
+        info: &windows_sys::Win32::Storage::FileSystem::FILE_BASIC_INFO,
+    ) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_BASIC_INFO, FileBasicInfo, SetFileInformationByHandle,
+        };
+        // SAFETY: `file` is borrowed for the call, so its handle is open, and
+        // `info` is a live FILE_BASIC_INFO -- the structure FileBasicInfo
+        // reads -- of exactly the size passed. The call does not keep the
+        // pointer.
+        let set = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileBasicInfo,
+                std::ptr::from_ref(info).cast(),
+                size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        };
+        if set == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// `fchown(2)`. Windows has no uid/gid and libuv reports success there
@@ -7604,7 +7683,8 @@ mod os_error_code_tests {
 
     /// fchmod reaches the file through any handle on it, one opened only to
     /// read included: the attribute is set on a reopened handle, as libuv's
-    /// is. A directory and the NUL device do not reopen for it.
+    /// is. A directory does not reopen for it, and the NUL device has no
+    /// attributes to read.
     #[cfg(windows)]
     #[test]
     fn windows_fchmod_does_not_need_a_handle_opened_to_write() {
@@ -7633,6 +7713,36 @@ mod os_error_code_tests {
         ops::fs_fchmod_sync(&opened, 0o644).unwrap();
         assert!(!std::fs::metadata(&file).unwrap().permissions().readonly());
         drop(opened);
+        // Read-only as the file's ONLY attribute: clearing it comes to an
+        // attribute word of 0, which must be written as "normal" to count.
+        // And the archive bit a file does not have stays off.
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_READONLY,
+            };
+            let attrs = || std::fs::metadata(&file).unwrap().file_attributes();
+            let clear = std::process::Command::new("attrib")
+                .arg("-a")
+                .arg(&file)
+                .status();
+            if clear.is_ok_and(|status| status.success()) {
+                let opened = open_options_for("r").open(&file).unwrap();
+                let changed = opened.metadata().unwrap().change_time();
+                ops::fs_fchmod_sync(&opened, 0o444).unwrap();
+                assert_eq!(
+                    attrs() & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE),
+                    FILE_ATTRIBUTE_READONLY
+                );
+                ops::fs_fchmod_sync(&opened, 0o666).unwrap();
+                assert_eq!(
+                    attrs() & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE),
+                    0
+                );
+                // The change time is written back as it was read.
+                assert_eq!(opened.metadata().unwrap().change_time(), changed);
+            }
+        }
         for flags in ["r", "r+", "a"] {
             let opened = open_options_for(flags).open(&dir).unwrap();
             let failed = ops::fs_fchmod_sync(&opened, 0o666).unwrap_err();
