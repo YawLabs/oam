@@ -3120,7 +3120,6 @@
 
   // --------------------------------------------------------------- events
   registry.factories.events = () => {
-    const kMax = Symbol("maxListeners");
     const errorMonitor = Symbol("events.errorMonitor");
     // captureRejections: when set on an instance (via opts.captureRejections),
     // emit() routes a listener's rejected thenable to the emitter's
@@ -3160,15 +3159,18 @@
       } else {
         this._eventsCount ??= 0;
       }
+      // node's init: an own `_maxListeners`, undefined until it is set --
+      // the third of an emitter's own keys, which code does list.
+      this._maxListeners = this._maxListeners || undefined;
       if (opts && opts.captureRejections) this[kCapture] = true;
     }
     EventEmitter.prototype[kCapture] = false;
     EventEmitter.prototype.setMaxListeners = function (n) {
-      this[kMax] = n;
+      this._maxListeners = n;
       return this;
     };
     EventEmitter.prototype.getMaxListeners = function () {
-      return this[kMax] ?? EventEmitter.defaultMaxListeners;
+      return this._maxListeners ?? EventEmitter.defaultMaxListeners;
     };
     EventEmitter.prototype._add = function (type, listener, prepend, once) {
       eventsOf(this);
@@ -10676,6 +10678,10 @@
 
   // Set by the fs/promises factory, read by the fs one (which loads it first).
   let fsPromisesInternals;
+  // A FileHandle's reference count, by the names node's has (kRef / kUnref):
+  // the handle's own methods and the streams made over one both use them.
+  const kFhRef = Symbol("kRef");
+  const kFhUnref = Symbol("kUnref");
 
   // node's AbortError for an fs call given a signal that is aborted: named
   // and coded as such, with the signal's reason as its cause.
@@ -11051,8 +11057,21 @@
         validateFd(fd, false);
         return { handle: fd, close: () => natives.fsClose(fd) };
       }
-      if (typeof fd === "object" && typeof fd.fd === "number" && typeof fd.close === "function") {
-        return { handle: fd.fd, close: () => fd.close() };
+      if (fd !== null && typeof fd === "object" && fileHandles.has(fd)) {
+        // node's importFd for a FileHandle: the stream takes a reference,
+        // and gives it back -- then asks the handle to close -- when it
+        // closes. `attach` is the other half: the handle's 'close' closes
+        // the stream.
+        validateFd(fd.fd, false);
+        fd[kFhRef]();
+        return {
+          handle: fd.fd,
+          fileHandle: fd,
+          close: () => {
+            fd[kFhUnref]();
+            return fd.close();
+          },
+        };
       }
       throw nodeTypeError(
         'The "options.fd" property must be of type number or an instance of FileHandle.' + receivedSuffix(fd),
@@ -11156,10 +11175,14 @@
       const fd = stream.fd;
       const supplied = stream[kSupplied];
       stream.fd = null;
+      // Over a FileHandle the answer is the handle's close(), which is
+      // already settled for the stream that gave back the last reference
+      // and otherwise waits for whoever still holds one.
+      const later = supplied && supplied.fileHandle ? (done, e) => done(e) : setImmediate;
       const close = (flushErr) => {
         new Promise((resolve) => resolve(supplied ? supplied.close() : natives.fsClose(fd))).then(
-          () => setImmediate(cb, err || flushErr),
-          (er) => setImmediate(cb, er || err || flushErr),
+          () => later(cb, err || flushErr),
+          (er) => later(cb, er || err || flushErr),
         );
       };
       if (stream.flush) {
@@ -11266,6 +11289,9 @@
         });
         // The properties node's ReadStream has, in its order.
         this[kSupplied] = own[kSupplied];
+        if (own[kSupplied] && own[kSupplied].fileHandle) {
+          own[kSupplied].fileHandle.on("close", () => this.close());
+        }
         this.fd = own.fd;
         if (!own[kSupplied]) {
           this.path = own.path;
@@ -11373,6 +11399,9 @@
         });
         // The properties node's WriteStream has, in its order.
         this[kSupplied] = own[kSupplied];
+        if (own[kSupplied] && own[kSupplied].fileHandle) {
+          own[kSupplied].fileHandle.on("close", () => this.close());
+        }
         this.fd = own.fd;
         if (!own[kSupplied]) {
           this.path = own.path;
@@ -11607,6 +11636,449 @@
         await natives.fsCopyFile(srcStr, destStr);
       }
     }
+    // node's FileHandle (lib/internal/fs/promises.js, v22.22.2): an
+    // EventEmitter that emits 'close', with the methods on its prototype and
+    // `close` an own property, and a count of who is using the descriptor.
+    //
+    // The count is what ties a handle to what runs over it. The handle
+    // holds one reference itself; every method holds one while its
+    // operation is in flight; a stream made over the handle holds one for
+    // its life. `close()` gives up the handle's own and emits 'close' at
+    // once -- which is what tells a stream over it to close itself -- but
+    // the descriptor is closed, and the promise settled, only when the last
+    // reference goes. So closing a handle under a read does not pull the
+    // descriptor out from under it, and a stream never outlives the handle
+    // with a descriptor number that is no longer its own. It used to be a
+    // plain object whose close() closed the descriptor on the spot: a
+    // stream over it failed its next read EBADF, and `handle.on` threw.
+    const kNative = Symbol("kNative");
+    const kFd = Symbol("kFd");
+    const kRefs = Symbol("kRefs");
+    const kClosePromise = Symbol("kClosePromise");
+    const kCloseResolve = Symbol("kCloseResolve");
+    const kCloseReject = Symbol("kCloseReject");
+    const kLocked = Symbol("kLocked");
+    // node's fsCall guard: EVERY FileHandle method re-checks the descriptor
+    // first and rejects on a closed one rather than reaching a native with a
+    // stale handle. The error is a PLAIN Error -- not a subclass, not one of
+    // the ERR_* codes -- with message "file closed" and exactly two own
+    // properties, code then syscall, in that order. The syscall is
+    // per-method and names the syscall the call WOULD have made (fstat,
+    // fchmod, futimes, ...), not the method; appendFile reports "writeFile"
+    // because node implements it as an alias of writeFile. Measured on
+    // v22.22.2 -- all fourteen methods were checked individually.
+    const ebadf = function (syscall) {
+      const err = new Error("file closed");
+      err.code = "EBADF";
+      err.syscall = syscall;
+      return err;
+    };
+    // createReadStream/createWriteStream/readLines are the exception: they
+    // are not fsCall-wrapped, so a closed handle reaches node's stream
+    // constructor as fd -1 and fails its integer-range validation, THROWN
+    // synchronously as a RangeError rather than delivered as a rejection.
+    const guardStreamFd = function (handle) {
+      if (handle[kFd] === -1) throw codes.ERR_OUT_OF_RANGE("fd", ">= 0 && <= 2147483647", -1);
+    };
+    // The descriptor's close. It settles a turn of the event loop later, as a
+    // close on node's thread pool does: a stream over the handle, which is
+    // told at once, finishes before whoever awaited close() hears.
+    const closeNative = (native) =>
+      new Promise((resolve, reject) => {
+        let failure;
+        try {
+          natives.fsClose(native);
+        } catch (e) {
+          failure = e;
+        }
+        setImmediate(() => (failure ? reject(failure) : resolve()));
+      });
+    class FileHandle extends registry.get("events").EventEmitter {
+      constructor(native) {
+        super();
+        this[kNative] = native;
+        this[kFd] = native;
+        this[kRefs] = 1;
+        this[kClosePromise] = undefined;
+        this[kLocked] = false;
+      }
+      // -1 once the descriptor is closed; until then the number, also while
+      // a close() is waiting for the last reference.
+      get fd() {
+        return this[kFd];
+      }
+      getAsyncId() {
+        return this[kNative];
+      }
+      [kFhRef]() {
+        this[kRefs]++;
+      }
+      [kFhUnref]() {
+        this[kRefs]--;
+        if (this[kRefs] === 0) {
+          this[kFd] = -1;
+          closeNative(this[kNative]).then(this[kCloseResolve], this[kCloseReject]);
+        }
+      }
+      // An own property, as node's is (`close = () => { ... }`).
+      close = () => {
+        if (this[kFd] === -1) return Promise.resolve();
+        if (this[kClosePromise]) return this[kClosePromise];
+        const settled = () => {
+          this[kClosePromise] = undefined;
+          this[kCloseReject] = undefined;
+          this[kCloseResolve] = undefined;
+        };
+        this[kRefs]--;
+        let closing;
+        if (this[kRefs] === 0) {
+          this[kFd] = -1;
+          closing = closeNative(this[kNative]);
+        } else {
+          closing = new Promise((resolve, reject) => {
+            this[kCloseResolve] = resolve;
+            this[kCloseReject] = reject;
+          });
+        }
+        this[kClosePromise] = closing.finally(settled);
+        this.emit("close");
+        return this[kClosePromise];
+      };
+      async [Symbol.asyncDispose]() {
+        await this.close();
+      }
+      async readFile(options) {
+        const fh = this, h = this[kNative];
+        var enc = (options && typeof options === "object") ? options.encoding : (typeof options === "string" ? options : null);
+        var chunks = [];
+        while (true) {
+          var chunk = await natives.fsReadChunk(h, 65536);
+          if (chunk === undefined) break;
+          chunks.push(chunk);
+        }
+        if (chunks.length === 0) return enc ? "" : globalThis.Buffer.alloc(0);
+        var total = 0;
+        for (var i = 0; i < chunks.length; i++) total += chunks[i].length;
+        var buf = globalThis.Buffer.alloc(total);
+        var off = 0;
+        for (var i = 0; i < chunks.length; i++) {
+          buf.set(chunks[i], off);
+          off += chunks[i].length;
+        }
+        return enc ? buf.toString(enc) : buf;
+      }
+      // node's fs/promises writeFile over this handle: the options, then
+      // the data (a string, a view or an iterable), as every writeFile
+      // form checks them; the flag and flush do not apply to a handle.
+      async writeFile(data, options) {
+        const fh = this, h = this[kNative];
+        options = writeFileOptions(options, false);
+        await writeHandleData(h, writeFileData(data, options, true), options.encoding);
+      }
+      // NOT an append. node documents FileHandle.appendFile as an ALIAS of
+      // writeFile ("the mode cannot be changed from what it was set to
+      // with open()"), and measurement agrees: it writes at the handle's
+      // CURRENT position, so on a handle opened "r+" and rewound it
+      // OVERWRITES from byte 0. Only the "a" flag at open() time appends.
+      // Implemented as a real delegation so the two cannot drift.
+      async appendFile(data, options) {
+        const fh = this, h = this[kNative];
+        return fh.writeFile(data, options);
+      }
+      // `position` is a pwrite/pread offset: it writes/reads THERE and
+      // leaves the cursor alone. Both used to accept the argument and throw
+      // it away, because the natives had no position parameter to pass it
+      // to -- fh.read(buf, 0, 3, 10) returned the bytes at the cursor.
+      //
+      // node's overloads and checks (lib/internal/fs/promises.js write,
+      // v22.22.2), the same as fs.writeSync's: (buffer[, offset[,
+      // length[, position]]]) or (buffer, options) with bufferWriteArgs,
+      // and (string[, position[, encoding]]) -- the second argument is a
+      // POSITION there, not an offset into the string. An empty view
+      // resolves 0 before anything is checked. The result has a null
+      // prototype, as node's has.
+      async write(buffer, offset, length, position) {
+        const fh = this, h = this[kNative];
+        if (buffer?.byteLength === 0) return { __proto__: null, bytesWritten: 0, buffer: buffer };
+        var bytes, pos;
+        if (ArrayBuffer.isView(buffer)) {
+          ({ bytes, position: pos } = bufferWriteArgs(buffer, offset, length, position, false));
+        } else {
+          validateWriteData(buffer, "buffer");
+          validateWriteEncoding(buffer, length);
+          bytes = globalThis.Buffer.from(buffer, writeEncoding(length));
+          pos = fsPositionArg(offset);
+        }
+        await natives.fsWriteChunk(h, bytes, pos);
+        return { __proto__: null, bytesWritten: bytes.byteLength, buffer: buffer };
+      }
+      // node's overloads and checks (lib/internal/fs/promises.js,
+      // v22.22.2): read(options), read(buffer, options) and the
+      // positional form; then the offset, which an empty read checks
+      // too, and the range. Unlike fs.read the length is not `| 0`'d:
+      // a missing one is the rest of the buffer.
+      async read(buffer, offset, length, position) {
+        const fh = this, h = this[kNative];
+        if (!ArrayBuffer.isView(buffer)) {
+          if (buffer !== undefined) validateReadOptions(buffer);
+          ({
+            buffer = globalThis.Buffer.alloc(16384),
+            offset = 0,
+            length = buffer.byteLength - offset,
+            position = null,
+          } = buffer ?? {});
+          validateReadBuffer(buffer);
+        }
+        if (offset !== null && typeof offset === "object") {
+          ({ offset = 0, length = buffer.byteLength - offset, position = null } = offset);
+        }
+        if (offset == null) offset = 0;
+        else validateInteger(offset, "offset", 0);
+        length ??= buffer.byteLength - offset;
+        if (length === 0) return { __proto__: null, bytesRead: 0, buffer: buffer };
+        validateReadRange(buffer, offset, length);
+        var chunk = await natives.fsReadChunk(h, length, readPosition(position, length));
+        if (chunk === undefined) return { __proto__: null, bytesRead: 0, buffer: buffer };
+        new Uint8Array(buffer.buffer, buffer.byteOffset + offset, length).set(chunk);
+        return { __proto__: null, bytesRead: chunk.length, buffer: buffer };
+      }
+      // FSTAT, not stat. This used to re-stat the PATH the handle was
+      // opened from, which is a different object the moment anything moves
+      // the name: after a rename it described the wrong file, and after an
+      // unlink it raised ENOENT where node happily reports the still-open
+      // inode. "open a temp file then unlink it and keep the handle" is a
+      // standard pattern, so the divergence was reachable from ordinary
+      // code, and silent in the rename case.
+      async stat() {
+        const fh = this, h = this[kNative];
+        return wrapStat(await natives.fsFstat(h));
+      }
+      // node's validators, after the closed-handle check (fsCall runs
+      // first): chmod's mode through parseFileMode, chown's uid / gid
+      // in [-1, 2**32-1], truncate's length an integer (a negative one
+      // is 0) -- the same checks as fchmod / fchown / ftruncate.
+      async chmod(mode) {
+        const fh = this, h = this[kNative];
+        await natives.fsFchmod(h, parseFileMode(mode, "mode"));
+      }
+      // POSIX-only in effect. libuv implements uv_fs_fchown on Windows as
+      // a successful no-op, and node inherits that -- the call RESOLVES
+      // there, it just does not change an owner Windows does not model
+      // this way. Left unguarded so the resolve/reject shape matches.
+      async chown(uid, gid) {
+        const fh = this, h = this[kNative];
+        await natives.fsFchown(h, ...ownerArgs(uid, gid));
+      }
+      async truncate(len = 0) {
+        const fh = this, h = this[kNative];
+        validateInteger(len, "len");
+        await natives.fsFtruncate(h, Math.max(0, len));
+      }
+      async sync() {
+        const fh = this, h = this[kNative];
+        await natives.fsFsync(h);
+      }
+      async datasync() {
+        const fh = this, h = this[kNative];
+        await natives.fsFdatasync(h);
+      }
+      async utimes(atime, mtime) {
+        const fh = this, h = this[kNative];
+        await natives.fsFutimes(h, toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
+      }
+      // The object-returning half of the vectored pair. node:fs's readv
+      // hands back a bare number and node:fs/promises has no free
+      // function at all -- only these. Same validation and same
+      // gather/scatter as fs.readv/fs.writev (module-scope helpers), so a
+      // fix to one lands on both.
+      async readv(buffers, position) {
+        const fh = this, h = this[kNative];
+        var total = asViewArray(buffers);
+        // Before the descriptor, deliberately: node raises this even on a
+        // closed handle -- but the fsCall guard above runs first there
+        // too, and EBADF wins. Measured: readv([]) on a CLOSED handle
+        // reports EBADF, on an open one EINVAL.
+        if (emptyList(buffers)) throw einvalRead(natives.platform);
+        var tmp = globalThis.Buffer.allocUnsafe(total);
+        var chunk = await natives.fsReadChunk(h, total, fsPositionArg(position));
+        var n = chunk === undefined ? 0 : chunk.length;
+        if (n > 0) tmp.set(chunk);
+        scatterViews(buffers, tmp, n);
+        // The SAME array instance goes back out; callers compare identity.
+        return { __proto__: null, bytesRead: n, buffers: buffers };
+      }
+      async writev(buffers, position) {
+        const fh = this, h = this[kNative];
+        var total = asViewArray(buffers);
+        // node reports 0 without touching the descriptor.
+        if (emptyList(buffers)) return { __proto__: null, bytesWritten: 0, buffers: buffers };
+        await natives.fsWriteChunk(h, flattenViews(buffers, total), fsPositionArg(position));
+        return { __proto__: null, bytesWritten: total, buffers: buffers };
+      }
+      // The WEB stream, and not createReadStream in web clothing: node
+      // builds it directly over THIS handle's read() (lib/internal/fs/
+      // promises.js), 16 KiB a pull, from the CURRENT cursor rather than
+      // byte 0, and -- unlike createReadStream -- it does NOT take the
+      // descriptor: autoClose defaults to FALSE, so draining the stream
+      // leaves the handle open and usable.
+      //
+      // The handle is LOCKED to the stream on the first call and stays
+      // locked for life: a second call is ERR_INVALID_STATE even after the
+      // first stream was cancelled or fully drained. The lock is taken
+      // BEFORE the options are validated, so a call that dies on a bad
+      // `options` still burns it -- checked, not assumed.
+      //
+      // `options.type` is NOT value-validated. v22 accepts anything:
+      // 'bytes' and undefined are silent, every other value ('foo', 123,
+      // null) emits an ExperimentalWarning and still builds the same
+      // stream. There is no ERR_INVALID_ARG_VALUE on this path, and the
+      // warning text carries node's own typo ("steam"), reproduced here so
+      // a caller matching on it sees the same bytes.
+      //
+      // DIVERGENCE, deliberate, and the only one: node's stream is a BYTE
+      // stream (`type: 'bytes'`, autoAllocateChunkSize 16384), so
+      // `getReader({ mode: 'byob' })` there returns a real
+      // ReadableStreamBYOBReader. oam's web-streams layer (js/streams.js)
+      // is default-reader-only -- a `type: 'bytes'` stream queues bytes
+      // and pulls as node's does, but has no byobRequest -- so this
+      // returns a stream read through a default reader, carrying the same 16 KiB
+      // plain-Uint8Array chunks, at the same boundaries, off the same read
+      // path. Everything reachable through a default reader or async
+      // iteration matches node; a BYOB reader does not. The fix belongs in
+      // js/streams.js's controller, not in a second reader here.
+      readableWebStream(options) {
+        const fh = this, h = this[kNative];
+        if (fh[kFd] === -1) throw codes.ERR_INVALID_STATE("The FileHandle is closed");
+        if (fh[kClosePromise]) throw codes.ERR_INVALID_STATE("The FileHandle is closing");
+        if (fh[kLocked]) throw codes.ERR_INVALID_STATE("The FileHandle is locked");
+        fh[kLocked] = true;
+
+        if (options === undefined) options = {};
+        // node's validateObject: null, arrays and non-objects (a function
+        // included -- typeof 'function' is not 'object') are rejected.
+        if (options === null || Array.isArray(options) || typeof options !== "object") {
+          throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+        }
+        var type = options.type === undefined ? "bytes" : options.type;
+        var autoClose = options.autoClose === undefined ? false : options.autoClose;
+        if (typeof autoClose !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.autoClose", "boolean", autoClose);
+        }
+        if (type !== "bytes") {
+          process.emitWarning(
+            'A non-"bytes" options.type has no effect. A byte-oriented steam is always created.',
+            "ExperimentalWarning",
+          );
+        }
+
+        // The handle is closed, or on its way: `close()` has been called.
+        var gone = function () { return fh[kFd] === -1 || fh[kClosePromise] !== undefined; };
+        // node's ondone: unref the handle, then close it only under
+        // autoClose. close() is idempotent, so the cancel path and the
+        // EOF path can both run it.
+        var ondone = async function () {
+          if (autoClose) await fh.close();
+        };
+        // node's autoAllocateChunkSize. The boundaries are OBSERVABLE --
+        // a 200000-byte file arrives as 12 x 16384 plus a 3392 tail on
+        // both runtimes -- so this is not a free tuning knob.
+        var CHUNK = 16384;
+        return new globalThis.ReadableStream({
+          // High-water mark 0 and byte accounting, as node's byte
+          // stream: nothing is read off the handle until a read asks.
+          type: "bytes",
+          pull: async function (controller) {
+            // node wires `this.once('close', () => readableStreamCancel(
+            // readable))`, so closing the handle mid-stream ENDS the
+            // stream: a subsequent read() reports done, it does not
+            // reject with EBADF. This web stream does not listen for it,
+            // so the same outcome is produced from the pull side, and on
+            // BOTH sides of the read -- closed before the pull was
+            // issued, or closed while it was in flight (in which case the
+            // chunk is dropped, exactly as a cancel drops it).
+            if (gone()) {
+              controller.close();
+              await ondone();
+              return;
+            }
+            var view = new Uint8Array(CHUNK);
+            // The existing read path, deliberately: same cursor, same
+            // guard, same natives. A second reader here would be a second
+            // place for the chunking to be wrong.
+            var r = await fh.read(view, 0, CHUNK);
+            if (gone() || r.bytesRead === 0) {
+              controller.close();
+              await ondone();
+              return;
+            }
+            // A plain Uint8Array, not a Buffer: node's byte stream hands
+            // back the auto-allocated view, whose constructor is
+            // Uint8Array, and callers do print it.
+            controller.enqueue(view.subarray(0, r.bytesRead));
+          },
+          cancel: async function () {
+            await ondone();
+          },
+        });
+      }
+      // Both stream factories hand the WHOLE FileHandle to the shared
+      // ReadStream/WriteStream (exactly as node does -- `new ReadStream(
+      // undefined, { ...options, fd: this })`), which is what makes the
+      // ownership right: the stream closes the fd through THIS object's
+      // close(), which is idempotent and flips `closed`, so the handle
+      // cannot be closed twice and every method above starts reporting
+      // EBADF the moment the stream is done. autoClose:false opts out and
+      // leaves the descriptor to the caller.
+      createReadStream(options) {
+        const fh = this, h = this[kNative];
+        guardStreamFd(fh);
+        return new (rwStreams(natives).ReadStream)(undefined, { ...readOptions(options), fd: fh });
+      }
+      createWriteStream(options) {
+        const fh = this, h = this[kNative];
+        guardStreamFd(fh);
+        return new (rwStreams(natives).WriteStream)(undefined, { ...readOptions(options), fd: fh });
+      }
+      // node: createInterface({ input: this.createReadStream(options),
+      // crlfDelay: Infinity }). The returned readline Interface IS the
+      // async iterable -- there is no separate iterator type -- and it
+      // closes when its input stream ends, which (autoClose) closes this
+      // handle. Splitting on /\r?\n/ and dropping the empty tail after a
+      // final newline is the Interface's job, already matching node.
+      readLines(options) {
+        const fh = this, h = this[kNative];
+        guardStreamFd(fh);
+        return registry.get("readline").createInterface({
+          input: fh.createReadStream(options),
+          crlfDelay: Infinity,
+        });
+      }
+    }
+    // node's fsCall around each operation: refused on a closed handle, and
+    // holding a reference while it runs, so a close() made meanwhile waits
+    // for it.
+    for (const [name, syscall] of [
+      ["readFile", "readFile"], ["writeFile", "writeFile"], ["appendFile", "writeFile"],
+      ["write", "write"], ["read", "read"], ["stat", "fstat"], ["chmod", "fchmod"],
+      ["chown", "fchown"], ["truncate", "ftruncate"], ["sync", "fsync"],
+      ["datasync", "fdatasync"], ["utimes", "futimes"], ["readv", "readv"], ["writev", "writev"],
+    ]) {
+      const operation = FileHandle.prototype[name];
+      const guarded = {
+        async [name](...args) {
+          if (this[kFd] === -1) throw ebadf(syscall);
+          this[kFhRef]();
+          try {
+            return await operation.apply(this, args);
+          } finally {
+            this[kFhUnref]();
+          }
+        },
+      }[name];
+      // The method's own arity, which callers do read.
+      Object.defineProperty(guarded, "length", { value: operation.length, configurable: true });
+      FileHandle.prototype[name] = guarded;
+    }
     // readFile's `flag` is the flag the path is opened with, as node's is:
     // what it does to the file (create, empty, refuse one that is there) and
     // what the descriptor may do (a write-only one fails the read, EBADF) are
@@ -11831,359 +12303,7 @@
         parseFileMode(mode, "mode", 0o666);
         var info = await natives.fsOpen(file, flags);
 
-        var h = info.handle;
-        var closed = false;
-        // readableWebStream() locks the handle to its stream FOR LIFE -- see
-        // the method below; the flag never goes back down.
-        var webStreamLocked = false;
-
-        // node's fsCall guard (lib/internal/fs/promises.js): EVERY FileHandle
-        // method re-checks the descriptor first and rejects on a closed one
-        // rather than reaching a native with a stale handle. The error is a
-        // PLAIN Error -- not a subclass, not one of the ERR_* codes -- with
-        // message "file closed" and exactly two own properties, code then
-        // syscall, in that order. The syscall is per-method and names the
-        // syscall the call WOULD have made (fstat, fchmod, futimes, ...), not
-        // the method; appendFile reports "writeFile" because node implements
-        // it as an alias of writeFile. Measured on v22.22.2 -- all fourteen
-        // methods below were checked individually.
-        var ebadf = function (syscall) {
-          var err = new Error("file closed");
-          err.code = "EBADF";
-          err.syscall = syscall;
-          return err;
-        };
-        // Throwing from inside an async function is a REJECTION, which is what
-        // node does for every one of these -- none of them throws synchronously.
-        var guard = function (syscall) {
-          if (closed) throw ebadf(syscall);
-        };
-        // createReadStream/createWriteStream/readLines are the exception: they
-        // are not fsCall-wrapped, so a closed handle reaches node's stream
-        // constructor as fd -1 and fails its integer-range validation, THROWN
-        // synchronously as a RangeError rather than delivered as a rejection.
-        var guardStreamFd = function () {
-          if (closed) throw codes.ERR_OUT_OF_RANGE("fd", ">= 0 && <= 2147483647", -1);
-        };
-
-        var fh = {
-          fd: h,
-          readFile: async function (options) {
-            guard("readFile");
-            var enc = (options && typeof options === "object") ? options.encoding : (typeof options === "string" ? options : null);
-            var chunks = [];
-            while (true) {
-              var chunk = await natives.fsReadChunk(h, 65536);
-              if (chunk === undefined) break;
-              chunks.push(chunk);
-            }
-            if (chunks.length === 0) return enc ? "" : globalThis.Buffer.alloc(0);
-            var total = 0;
-            for (var i = 0; i < chunks.length; i++) total += chunks[i].length;
-            var buf = globalThis.Buffer.alloc(total);
-            var off = 0;
-            for (var i = 0; i < chunks.length; i++) {
-              buf.set(chunks[i], off);
-              off += chunks[i].length;
-            }
-            return enc ? buf.toString(enc) : buf;
-          },
-          // node's fs/promises writeFile over this handle: the options, then
-          // the data (a string, a view or an iterable), as every writeFile
-          // form checks them; the flag and flush do not apply to a handle.
-          writeFile: async function (data, options) {
-            guard("writeFile");
-            options = writeFileOptions(options, false);
-            await writeHandleData(h, writeFileData(data, options, true), options.encoding);
-          },
-          // NOT an append. node documents FileHandle.appendFile as an ALIAS of
-          // writeFile ("the mode cannot be changed from what it was set to
-          // with open()"), and measurement agrees: it writes at the handle's
-          // CURRENT position, so on a handle opened "r+" and rewound it
-          // OVERWRITES from byte 0. Only the "a" flag at open() time appends.
-          // Implemented as a real delegation so the two cannot drift.
-          appendFile: async function (data, options) {
-            guard("writeFile");
-            return fh.writeFile(data, options);
-          },
-          // `position` is a pwrite/pread offset: it writes/reads THERE and
-          // leaves the cursor alone. Both used to accept the argument and throw
-          // it away, because the natives had no position parameter to pass it
-          // to -- fh.read(buf, 0, 3, 10) returned the bytes at the cursor.
-          //
-          // node's overloads and checks (lib/internal/fs/promises.js write,
-          // v22.22.2), the same as fs.writeSync's: (buffer[, offset[,
-          // length[, position]]]) or (buffer, options) with bufferWriteArgs,
-          // and (string[, position[, encoding]]) -- the second argument is a
-          // POSITION there, not an offset into the string. An empty view
-          // resolves 0 before anything is checked. The result has a null
-          // prototype, as node's has.
-          write: async function (buffer, offset, length, position) {
-            guard("write");
-            if (buffer?.byteLength === 0) return { __proto__: null, bytesWritten: 0, buffer: buffer };
-            var bytes, pos;
-            if (ArrayBuffer.isView(buffer)) {
-              ({ bytes, position: pos } = bufferWriteArgs(buffer, offset, length, position, false));
-            } else {
-              validateWriteData(buffer, "buffer");
-              validateWriteEncoding(buffer, length);
-              bytes = globalThis.Buffer.from(buffer, writeEncoding(length));
-              pos = fsPositionArg(offset);
-            }
-            await natives.fsWriteChunk(h, bytes, pos);
-            return { __proto__: null, bytesWritten: bytes.byteLength, buffer: buffer };
-          },
-          // node's overloads and checks (lib/internal/fs/promises.js,
-          // v22.22.2): read(options), read(buffer, options) and the
-          // positional form; then the offset, which an empty read checks
-          // too, and the range. Unlike fs.read the length is not `| 0`'d:
-          // a missing one is the rest of the buffer.
-          read: async function (buffer, offset, length, position) {
-            guard("read");
-            if (!ArrayBuffer.isView(buffer)) {
-              if (buffer !== undefined) validateReadOptions(buffer);
-              ({
-                buffer = globalThis.Buffer.alloc(16384),
-                offset = 0,
-                length = buffer.byteLength - offset,
-                position = null,
-              } = buffer ?? {});
-              validateReadBuffer(buffer);
-            }
-            if (offset !== null && typeof offset === "object") {
-              ({ offset = 0, length = buffer.byteLength - offset, position = null } = offset);
-            }
-            if (offset == null) offset = 0;
-            else validateInteger(offset, "offset", 0);
-            length ??= buffer.byteLength - offset;
-            if (length === 0) return { __proto__: null, bytesRead: 0, buffer: buffer };
-            validateReadRange(buffer, offset, length);
-            var chunk = await natives.fsReadChunk(h, length, readPosition(position, length));
-            if (chunk === undefined) return { __proto__: null, bytesRead: 0, buffer: buffer };
-            new Uint8Array(buffer.buffer, buffer.byteOffset + offset, length).set(chunk);
-            return { __proto__: null, bytesRead: chunk.length, buffer: buffer };
-          },
-          // FSTAT, not stat. This used to re-stat the PATH the handle was
-          // opened from, which is a different object the moment anything moves
-          // the name: after a rename it described the wrong file, and after an
-          // unlink it raised ENOENT where node happily reports the still-open
-          // inode. "open a temp file then unlink it and keep the handle" is a
-          // standard pattern, so the divergence was reachable from ordinary
-          // code, and silent in the rename case.
-          stat: async function () {
-            guard("fstat");
-            return wrapStat(await natives.fsFstat(h));
-          },
-          // node's validators, after the closed-handle check (fsCall runs
-          // first): chmod's mode through parseFileMode, chown's uid / gid
-          // in [-1, 2**32-1], truncate's length an integer (a negative one
-          // is 0) -- the same checks as fchmod / fchown / ftruncate.
-          chmod: async function (mode) {
-            guard("fchmod");
-            await natives.fsFchmod(h, parseFileMode(mode, "mode"));
-          },
-          // POSIX-only in effect. libuv implements uv_fs_fchown on Windows as
-          // a successful no-op, and node inherits that -- the call RESOLVES
-          // there, it just does not change an owner Windows does not model
-          // this way. Left unguarded so the resolve/reject shape matches.
-          chown: async function (uid, gid) {
-            guard("fchown");
-            await natives.fsFchown(h, ...ownerArgs(uid, gid));
-          },
-          truncate: async function (len = 0) {
-            guard("ftruncate");
-            validateInteger(len, "len");
-            await natives.fsFtruncate(h, Math.max(0, len));
-          },
-          sync: async function () {
-            guard("fsync");
-            await natives.fsFsync(h);
-          },
-          datasync: async function () {
-            guard("fdatasync");
-            await natives.fsFdatasync(h);
-          },
-          utimes: async function (atime, mtime) {
-            guard("futimes");
-            await natives.fsFutimes(h, toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
-          },
-          // The object-returning half of the vectored pair. node:fs's readv
-          // hands back a bare number and node:fs/promises has no free
-          // function at all -- only these. Same validation and same
-          // gather/scatter as fs.readv/fs.writev (module-scope helpers), so a
-          // fix to one lands on both.
-          readv: async function (buffers, position) {
-            guard("readv");
-            var total = asViewArray(buffers);
-            // Before the descriptor, deliberately: node raises this even on a
-            // closed handle -- but the fsCall guard above runs first there
-            // too, and EBADF wins. Measured: readv([]) on a CLOSED handle
-            // reports EBADF, on an open one EINVAL.
-            if (emptyList(buffers)) throw einvalRead(natives.platform);
-            var tmp = globalThis.Buffer.allocUnsafe(total);
-            var chunk = await natives.fsReadChunk(h, total, fsPositionArg(position));
-            var n = chunk === undefined ? 0 : chunk.length;
-            if (n > 0) tmp.set(chunk);
-            scatterViews(buffers, tmp, n);
-            // The SAME array instance goes back out; callers compare identity.
-            return { __proto__: null, bytesRead: n, buffers: buffers };
-          },
-          writev: async function (buffers, position) {
-            guard("writev");
-            var total = asViewArray(buffers);
-            // node reports 0 without touching the descriptor.
-            if (emptyList(buffers)) return { __proto__: null, bytesWritten: 0, buffers: buffers };
-            await natives.fsWriteChunk(h, flattenViews(buffers, total), fsPositionArg(position));
-            return { __proto__: null, bytesWritten: total, buffers: buffers };
-          },
-          // The WEB stream, and not createReadStream in web clothing: node
-          // builds it directly over THIS handle's read() (lib/internal/fs/
-          // promises.js), 16 KiB a pull, from the CURRENT cursor rather than
-          // byte 0, and -- unlike createReadStream -- it does NOT take the
-          // descriptor: autoClose defaults to FALSE, so draining the stream
-          // leaves the handle open and usable.
-          //
-          // The handle is LOCKED to the stream on the first call and stays
-          // locked for life: a second call is ERR_INVALID_STATE even after the
-          // first stream was cancelled or fully drained. The lock is taken
-          // BEFORE the options are validated, so a call that dies on a bad
-          // `options` still burns it -- checked, not assumed.
-          //
-          // `options.type` is NOT value-validated. v22 accepts anything:
-          // 'bytes' and undefined are silent, every other value ('foo', 123,
-          // null) emits an ExperimentalWarning and still builds the same
-          // stream. There is no ERR_INVALID_ARG_VALUE on this path, and the
-          // warning text carries node's own typo ("steam"), reproduced here so
-          // a caller matching on it sees the same bytes.
-          //
-          // DIVERGENCE, deliberate, and the only one: node's stream is a BYTE
-          // stream (`type: 'bytes'`, autoAllocateChunkSize 16384), so
-          // `getReader({ mode: 'byob' })` there returns a real
-          // ReadableStreamBYOBReader. oam's web-streams layer (js/streams.js)
-          // is default-reader-only -- a `type: 'bytes'` stream queues bytes
-          // and pulls as node's does, but has no byobRequest -- so this
-          // returns a stream read through a default reader, carrying the same 16 KiB
-          // plain-Uint8Array chunks, at the same boundaries, off the same read
-          // path. Everything reachable through a default reader or async
-          // iteration matches node; a BYOB reader does not. The fix belongs in
-          // js/streams.js's controller, not in a second reader here.
-          readableWebStream: function (options) {
-            if (closed) throw codes.ERR_INVALID_STATE("The FileHandle is closed");
-            // node's middle check, "The FileHandle is closing", is unreachable
-            // here: it parks a kClosePromise while the fd is still live, and
-            // oam's close() flips `closed` synchronously, so the branch above
-            // already covers that window.
-            if (webStreamLocked) throw codes.ERR_INVALID_STATE("The FileHandle is locked");
-            webStreamLocked = true;
-
-            if (options === undefined) options = {};
-            // node's validateObject: null, arrays and non-objects (a function
-            // included -- typeof 'function' is not 'object') are rejected.
-            if (options === null || Array.isArray(options) || typeof options !== "object") {
-              throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
-            }
-            var type = options.type === undefined ? "bytes" : options.type;
-            var autoClose = options.autoClose === undefined ? false : options.autoClose;
-            if (typeof autoClose !== "boolean") {
-              throw codes.ERR_INVALID_ARG_TYPE("options.autoClose", "boolean", autoClose);
-            }
-            if (type !== "bytes") {
-              process.emitWarning(
-                'A non-"bytes" options.type has no effect. A byte-oriented steam is always created.',
-                "ExperimentalWarning",
-              );
-            }
-
-            // node's ondone: unref the handle, then close it only under
-            // autoClose. close() is idempotent, so the cancel path and the
-            // EOF path can both run it.
-            var ondone = async function () {
-              if (autoClose) await fh.close();
-            };
-            // node's autoAllocateChunkSize. The boundaries are OBSERVABLE --
-            // a 200000-byte file arrives as 12 x 16384 plus a 3392 tail on
-            // both runtimes -- so this is not a free tuning knob.
-            var CHUNK = 16384;
-            return new globalThis.ReadableStream({
-              // High-water mark 0 and byte accounting, as node's byte
-              // stream: nothing is read off the handle until a read asks.
-              type: "bytes",
-              pull: async function (controller) {
-                // node wires `this.once('close', () => readableStreamCancel(
-                // readable))`, so closing the handle mid-stream ENDS the
-                // stream: a subsequent read() reports done, it does not
-                // reject with EBADF. oam's FileHandle is not an EventEmitter,
-                // so the same outcome is produced from the pull side, and on
-                // BOTH sides of the read -- closed before the pull was
-                // issued, or closed while it was in flight (in which case the
-                // chunk is dropped, exactly as a cancel drops it).
-                if (closed) {
-                  controller.close();
-                  await ondone();
-                  return;
-                }
-                var view = new Uint8Array(CHUNK);
-                // The existing read path, deliberately: same cursor, same
-                // guard, same natives. A second reader here would be a second
-                // place for the chunking to be wrong.
-                var r = await fh.read(view, 0, CHUNK);
-                if (closed || r.bytesRead === 0) {
-                  controller.close();
-                  await ondone();
-                  return;
-                }
-                // A plain Uint8Array, not a Buffer: node's byte stream hands
-                // back the auto-allocated view, whose constructor is
-                // Uint8Array, and callers do print it.
-                controller.enqueue(view.subarray(0, r.bytesRead));
-              },
-              cancel: async function () {
-                await ondone();
-              },
-            });
-          },
-          // Both stream factories hand the WHOLE FileHandle to the shared
-          // ReadStream/WriteStream (exactly as node does -- `new ReadStream(
-          // undefined, { ...options, fd: this })`), which is what makes the
-          // ownership right: the stream closes the fd through THIS object's
-          // close(), which is idempotent and flips `closed`, so the handle
-          // cannot be closed twice and every method above starts reporting
-          // EBADF the moment the stream is done. autoClose:false opts out and
-          // leaves the descriptor to the caller.
-          createReadStream: function (options) {
-            guardStreamFd();
-            return new (rwStreams(natives).ReadStream)(undefined, { ...readOptions(options), fd: fh });
-          },
-          createWriteStream: function (options) {
-            guardStreamFd();
-            return new (rwStreams(natives).WriteStream)(undefined, { ...readOptions(options), fd: fh });
-          },
-          // node: createInterface({ input: this.createReadStream(options),
-          // crlfDelay: Infinity }). The returned readline Interface IS the
-          // async iterable -- there is no separate iterator type -- and it
-          // closes when its input stream ends, which (autoClose) closes this
-          // handle. Splitting on /\r?\n/ and dropping the empty tail after a
-          // final newline is the Interface's job, already matching node.
-          readLines: function (options) {
-            guardStreamFd();
-            return registry.get("readline").createInterface({
-              input: fh.createReadStream(options),
-              crlfDelay: Infinity,
-            });
-          },
-          close: async function () {
-            if (!closed) {
-              closed = true;
-              // node reports -1 from `fh.fd` once closed; leaving the real
-              // handle number visible invites a caller to keep using it.
-              fh.fd = -1;
-              await Promise.resolve(natives.fsClose(h)).catch(function () {});
-            }
-          },
-          [Symbol.asyncDispose]: async function () {
-            await fh.close();
-          },
-        };
+        var fh = new FileHandle(info.handle);
         fileHandles.add(fh);
         return fh;
       }),

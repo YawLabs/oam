@@ -3568,13 +3568,6 @@ What still differs:
   not read-only access plus a short list of flags that change nothing, so `O_EXCL` alone,
   `UV_FS_O_FILEMAP`, or a numeric flag it has no name for (`O_PATH`) needs the write grant
   where node's needs only the read one.
-- **A `FileHandle` is not an `EventEmitter`, and a stream over one is not tied to it
-  (#343).** node's handle emits `'close'`, and a stream made from it
-  (`handle.createReadStream()`, `createWriteStream()`, `readLines()`, `{ fd: handle }`)
-  holds a reference and closes itself when the handle closes. oam's stream borrows the
-  descriptor: closing the handle under it fails the stream's next read or write `EBADF`
-  where node closes it cleanly, and an `autoClose: false` stream outlives the handle with
-  its `fd` still set.
 - **A negative position for `writev` / `readv` of several buffers, on Windows.**
   libuv offsets each buffer from the position in turn, so with `-2` the second
   buffer of `writevSync(fd, [a, b], -2)` lands at `-2 + a.length` -- `-1` is the
