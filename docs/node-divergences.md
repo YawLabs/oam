@@ -3572,7 +3572,7 @@ What still differs:
 - **An anonymous class instance as the descriptor** reads `Received an instance of
   Object` in the C++ wording on oam, where V8 names it after the variable it was
   assigned to (`an instance of vals`); JS cannot see that inferred name.
-- **`fchmod` of a Windows pipe or NUL descriptor.** Descriptors 0-2 are the process's
+- **Descriptors 0-2.** Descriptors 0-2 are the process's
   stdin, stdout and stderr for every fd call, as in node (`fstatSync(0)`,
   `readSync(0)`, `readFileSync(0)`, `fsyncSync(1)`; `conformance/cases/258-*`), with
   libuv's Windows `fstat` shapes for a pipe, the console and NUL, and its close rule
@@ -3581,10 +3581,8 @@ What still differs:
   `EBADF`, as in node). One unix difference remains: node's descriptors are the OS's,
   so `fs.closeSync(1)` followed by `fs.openSync(file, 'w')` gets descriptor 1 back
   and stdout's writes go to the file; oam's `openSync` numbers its own descriptors,
-  and stdout stays closed. libuv's Windows `fchmod`
-  reopens the handle first, which fails for a pipe (`EBUSY`) and NUL (`EINVAL`);
-  oam's sets the attribute on the handle it has, so `fchmodSync(0, mode)` on a piped
-  stdin succeeds and on NUL is `EISDIR`. A character device other than the console
+  and stdout stays closed. `fchmod` reopens the handle as libuv's does (an anonymous pipe
+  is `EBUSY`, NUL `EINVAL`; `conformance/cases/395-*`). A character device other than the console
   and NUL (a serial port) stats with NUL's shape on oam, where libuv reads its file
   information.
 - **`fchown` of a closed descriptor on Windows.** node's (libuv's) Windows `fchown`

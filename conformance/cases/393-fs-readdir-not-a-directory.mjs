@@ -57,7 +57,7 @@ fs.mkdirSync("dir");
 fs.writeFileSync("dir/a.txt", "a");
 fs.writeFileSync("file.txt", "f");
 
-// The empty path: opendir lists the current directory on Windows.
+// The empty path, which readdir refuses everywhere.
 const names = ["dir", "file.txt", "missing", "", "file.txt/x", "dir/a.txt", "dir/a.txt/x", "dir/missing"];
 // A trailing separator, and what is not one.
 for (const base of ["dir", "file.txt", "missing", "dir/a.txt"]) {
@@ -113,6 +113,11 @@ for (const n of names) {
     ["promises.opendir", async () => first(await fs.promises.opendir(n))],
   ];
   for (const [label, f] of forms) {
+    // node's opendir of an empty path on Windows lists the current directory
+    // -- nearly always. Under a loaded machine its promise form has answered
+    // ENOENT instead (seen once in a parallel run of this suite, never in a
+    // run alone), so the row has no fixed answer to hold oam to.
+    if (win && n === "" && label.includes("opendir")) continue;
     let line;
     try {
       line = JSON.stringify(await f());
