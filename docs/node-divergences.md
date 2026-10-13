@@ -3721,10 +3721,6 @@ A directory opens on Windows as it does in node (`FILE_FLAG_BACKUP_SEMANTICS`), 
 descriptor answers as node's does: conformance case 392, measured against v22.22.2. These
 corners are left.
 
-- Callback `fs.readFile(fd, cb)` on a directory descriptor fails `EISDIR` `read` (`EBADF`
-  on one opened `"a"`), as `readFileSync(fd)` and `FileHandle.readFile()` do in both
-  runtimes. node's callback form drops the failed read of a descriptor it was handed and
-  calls back with an empty Buffer.
 - `fs.openAsBlob("dir")` rejects `ERR_INVALID_ARG_VALUE`; node resolves a Blob of size 0.
 - `fstatSync` of a console opened by name to write (`openSync("\\\\.\\CON", "w")`,
   `"\\\\.\\CONOUT$"` opened `"w"` or `"a"`) answers with the console's shape; node's

@@ -12324,9 +12324,22 @@
 
     // readFileSync(fd): everything from the descriptor's current position.
     // fstat first, as node's does, so a bad descriptor fails `fstat` -- and a
-    // negative one fails fstatSync's descriptor check.
-    function readFdSync(fd) {
-      fs.fstatSync(fd);
+    // negative one fails fstatSync's descriptor check. Not with `straight`:
+    // for a utf8 read node's binding reads the descriptor without a stat,
+    // and a bad one fails the `read`.
+    function readFdSync(fd, straight) {
+      if (!straight) fs.fstatSync(fd);
+      // No stat, and no range check either: the binding hands the number to
+      // the read, and a negative one is a descriptor that is not open.
+      else if (fd < 0) {
+        let errno;
+        for (const [number, [code]] of uvErrnoTable(natives)) if (code === "EBADF") errno = number;
+        const err = new Error("EBADF: bad file descriptor, read");
+        err.errno = errno;
+        err.code = "EBADF";
+        err.syscall = "read";
+        throw err;
+      }
       const chunks = [];
       let total = 0;
       for (;;) {
@@ -12436,15 +12449,26 @@
         process.nextTick(() => { throw err; });
         return;
       }
+      // What node's callback readFile does with a failure on a descriptor it
+      // was HANDED (lib/internal/fs/read/context.js, v22.22.2): its close
+      // step skips the close -- the descriptor is the caller's -- and with it
+      // the line that keeps the error. So:
+      // - a read that fails ends the read, and the callback gets what was
+      //   read so far with no error: an empty Buffer for a descriptor opened
+      //   to write only, or for a directory;
+      // - a stat that fails (the descriptor is not open) leaves nothing to
+      //   hand back, and node's own Buffer.concat(null) is what the callback
+      //   hears about.
+      // Neither is the failure itself; both are what a program written
+      // against node sees.
       fs.fstat(fd, (statErr) => {
-        if (statErr) return cb(statErr);
+        if (statErr) return cb(codes.ERR_INVALID_ARG_TYPE("list", "Array", null));
         const chunks = [];
         let total = 0;
         const next = () => {
           const chunk = globalThis.Buffer.allocUnsafe(65536);
           fs.read(fd, chunk, 0, chunk.length, null, (err, n) => {
-            if (err) return cb(err);
-            if (n === 0) return cb(null, globalThis.Buffer.concat(chunks, total));
+            if (err || n === 0) return cb(null, globalThis.Buffer.concat(chunks, total));
             chunks.push(n === chunk.length ? chunk : chunk.subarray(0, n));
             total += n;
             next();
@@ -12773,7 +12797,8 @@
         // before anything is opened.
         options = fsGetOptions(options, {});
         const enc = options.encoding;
-        if (isInt32(path)) return decodeRead(readFdSync(path), enc ?? null);
+        // node's fast path, by these two spellings exactly.
+        if (isInt32(path)) return decodeRead(readFdSync(path, enc === "utf8" || enc === "utf-8"), enc ?? null);
         // Any flag but a read-only one: open with it, read the descriptor,
         // close it (see readFileAt).
         const given = options.flag;

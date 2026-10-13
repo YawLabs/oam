@@ -20,6 +20,14 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **Callback `fs.readFile(fd, cb)` answers as node's does when the descriptor cannot be
+  read (#334).** node's callback form drops a failed read of a descriptor it was handed
+  and calls back with what was read so far, and no error: an empty Buffer (or `""`) for a
+  descriptor opened to write only, and for a directory. oam reported the read's `EBADF` /
+  `EISDIR`. A descriptor that is not open gets node's own `ERR_INVALID_ARG_TYPE` there
+  rather than `EBADF` `fstat`, and `readFileSync(fd, "utf8")` of one fails `EBADF`
+  `read`, as node's stat-less utf8 read does. `readFileSync(fd)` and
+  `FileHandle.readFile()` report the failure, as before. Conformance case 400.
 - **`readFile` honours its `flag` (#336).** `readFileSync`, `fs.readFile` and
   `fs.promises.readFile` always opened read-only, whatever `flag` said. The path is now
   opened with the flag given, as node's is, so its effects are the call's:
