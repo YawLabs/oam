@@ -20,6 +20,18 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **A `FileHandle` is an `EventEmitter`, and a stream over one is tied to it (#343).**
+  `fs.promises.open()` returned a plain object: `handle.on("close", ...)` threw, and
+  `handle.close()` closed the descriptor on the spot. It is now node's `FileHandle`
+  class. `close()` emits `'close'`, and the handle counts who is using its descriptor --
+  each method while its operation runs, and each stream made over it -- closing the
+  descriptor, and settling `close()`, when the last one is done. So closing a handle
+  under a stream closes the stream cleanly (it failed its next read `EBADF`), a second
+  stream on the same handle no longer fails when the first ends, an `autoClose: false`
+  stream is closed with its handle instead of outliving it, and a `close()` made while a
+  read is in flight waits for the read. Conformance case 401.
+- **An `EventEmitter` has an own `_maxListeners`**, as node's does: `undefined` until
+  `setMaxListeners()` sets it, and the third of an emitter's own keys.
 - **Callback `fs.readFile(fd, cb)` answers as node's does when the descriptor cannot be
   read (#334).** node's callback form drops a failed read of a descriptor it was handed
   and calls back with what was read so far, and no error: an empty Buffer (or `""`) for a
