@@ -16,6 +16,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-10-13
+
 ### Fixed
 
 - **On Windows a directory opens, as node's does (#284).** oam opened through std without
@@ -4352,7 +4354,8 @@ releases.
 - The `fork` prewarm pool warms lazily, on first `fork()`.
 - `io_uring` read chunks grow from 64 KiB to 4 MiB, fixing large-file reads.
 
-[Unreleased]: https://github.com/YawLabs/oam/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/YawLabs/oam/compare/v0.19.1...HEAD
+[0.19.1]: https://github.com/YawLabs/oam/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/YawLabs/oam/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/YawLabs/oam/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/YawLabs/oam/compare/v0.17.1...v0.18.0
