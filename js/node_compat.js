@@ -11036,7 +11036,27 @@
       );
     };
 
+    // node's checks on `start` and `end` (lib/internal/fs/streams.js): each
+    // a safe integer from 0, `end` also Infinity, and `start` not past it.
+    const validRange = (opts, withEnd) => {
+      const { start } = opts;
+      let end = withEnd ? opts.end : undefined;
+      if (start !== undefined) validateInteger(start, "start", 0);
+      if (end === undefined) end = Infinity;
+      else if (end !== Infinity) {
+        validateInteger(end, "end", 0);
+        if (start !== undefined && start > end) {
+          throw codes.ERR_OUT_OF_RANGE("start", `<= "end" (here: ${end})`, start);
+        }
+      }
+      return { start, end };
+    };
+
     class ReadStream extends Readable {
+      // True until the stream has a descriptor, and again once it is closed.
+      get pending() {
+        return this.fd === null;
+      }
       // Node v22 ReadStream.prototype.close (lib/internal/fs/streams.js --
       // outside the vendored internal/streams tree, so supplied here).
       close(cb) {
@@ -11047,6 +11067,10 @@
         const opts = readOptions(options);
         const highWaterMark = opts.highWaterMark ?? 65536;
         const supplied = suppliedFd(opts);
+        const range = validRange(opts, true);
+        // What the open is asked for is whatever `flags` says, as node's is:
+        // a flag node does not know fails the open, not the constructor.
+        const givenFlags = opts.flags === undefined ? "r" : opts.flags;
         // node's importFd: with no descriptor, the path is validated here in
         // the constructor, so a bad one throws from createReadStream itself
         // rather than failing the open a tick later as an 'error' event.
@@ -11062,16 +11086,18 @@
         // the maxBytes arithmetic while every read came from the cursor, so a
         // windowed read returned the first (end-start+1) bytes of the file
         // instead of the requested range.
-        let pos = typeof opts.start === "number" ? opts.start : null;
-        const endByte = typeof opts.end === "number" ? opts.end : Infinity;
+        let pos = typeof range.start === "number" ? range.start : null;
+        const endByte = range.end;
         const maxBytes = endByte === Infinity ? Infinity : endByte - (pos ?? 0) + 1;
         let handle = supplied ? supplied.handle : null;
         let eof = false;
         let totalRead = 0;
+        let self = null;
         const closeFd = async () => {
           if (handle === null) return;
           const h = handle;
           handle = null;
+          if (self) self.fd = null;
           try {
             await (supplied ? supplied.close() : natives.fsClose(h));
           } catch { /* a close error is not a read error */ }
@@ -11097,9 +11123,10 @@
           // there was no open to report.
           construct(callback) {
             if (supplied) { callback(); return; }
-            Promise.resolve(natives.fsOpen(toPath(path), "r")).then(
+            new Promise((resolve) => resolve(natives.fsOpen(toPath(path), openFlags(givenFlags, process.platform)))).then(
               (r) => {
                 handle = r.handle;
+                this.fd = handle;
                 this.emit("open", handle);
                 this.emit("ready");
                 callback();
@@ -11130,7 +11157,10 @@
                 this.push(null);
               } else {
                 const buf = globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.length);
-                if (pos !== null) pos += buf.length;
+                if (pos !== null) {
+                  pos += buf.length;
+                  this.pos = pos;
+                }
                 totalRead += buf.length;
                 this.bytesRead = totalRead;
                 this.push(buf);
@@ -11144,7 +11174,16 @@
             cb(err);
           },
         });
-        this.path = path;
+        self = this;
+        // The properties node's ReadStream has, in its order.
+        this.fd = supplied ? supplied.handle : null;
+        // A stream handed its descriptor has no path, whatever was passed.
+        this.path = supplied ? undefined : path;
+        this.flags = givenFlags;
+        this.mode = opts.mode === undefined ? 0o666 : opts.mode;
+        this.start = range.start;
+        this.end = range.end;
+        this.pos = range.start;
         this.bytesRead = 0;
       }
     }
@@ -11157,38 +11196,72 @@
         }
         this.end();
       }
+      // True until the stream has a descriptor, and again once it is closed.
+      get pending() {
+        return this.fd === null;
+      }
       constructor(path, options) {
         const opts = readOptions(options);
-        const flags = opts.flags === "a" ? "a" : "w";
         const supplied = suppliedFd(opts);
         // Validated in the constructor, as node's importFd does (see ReadStream).
         if (!supplied) toPath(path);
+        const { start } = validRange(opts, false);
+        const flush = opts.flush ?? false;
+        if (typeof flush !== "boolean") throw codes.ERR_INVALID_ARG_TYPE("options.flush", "boolean", flush);
+        // What the open is asked for is whatever `flags` says, as node's is
+        // ("r+" to write into a file in place, "wx" to refuse one that is
+        // there): a flag node does not know fails the open, not the
+        // constructor. It used to be "a" or else "w".
+        const givenFlags = opts.flags === undefined ? "w" : opts.flags;
         const autoClose = opts.autoClose !== false;
         let handle = supplied ? supplied.handle : null;
-        let totalWritten = 0;
+        let self = null;
         const closeFd = async () => {
           if (handle === null) return;
           const h = handle;
           handle = null;
+          if (self) self.fd = null;
           try {
             await (supplied ? supplied.close() : natives.fsClose(h));
           } catch { /* a close error is not a write error */ }
         };
         super({
-          // Node's fs.WriteStream flow: end() -> final() -> 'finish' ->
-          // autoDestroy -> destroy() -> 'close'. The machine owns 'close'.
+          // Node's fs.WriteStream flow: construct (the open) -> writes ->
+          // end() -> final() -> 'finish' -> autoDestroy -> destroy(), which
+          // closes the descriptor -> 'close'. The machine owns 'close'.
           autoDestroy: autoClose,
-          highWaterMark: opts.highWaterMark ?? 65536,
-          async write(chunk, _encoding, cb) {
-            try {
-              if (handle === null) {
-                handle = (await natives.fsOpen(toPath(path), flags)).handle;
+          emitClose: opts.emitClose,
+          highWaterMark: opts.highWaterMark,
+          // The open happens when the stream is made (node's _construct),
+          // written to or not: the file exists, 'open' and 'ready' fire, and
+          // a path that does not open destroys the stream with the open's
+          // error. Every write waits behind it. It used to happen at the
+          // first write, or in final() when there was none -- so a stream
+          // nobody had written to had no file and had said nothing, and one
+          // over an unwritable path stayed silent until written to.
+          //
+          // Skipped when the descriptor was supplied: there was no open to
+          // report, and node emits neither 'open' nor 'ready'.
+          construct(callback) {
+            if (supplied) { callback(); return; }
+            new Promise((resolve) => resolve(natives.fsOpen(toPath(path), openFlags(givenFlags, process.platform)))).then(
+              (r) => {
+                handle = r.handle;
+                this.fd = handle;
                 this.emit("open", handle);
                 this.emit("ready");
-              }
-              await natives.fsWriteChunk(handle, chunk);
-              totalWritten += chunk.length;
-              this.bytesWritten = totalWritten;
+                callback();
+              },
+              (e) => callback(e),
+            );
+          },
+          async write(chunk, _encoding, cb) {
+            try {
+              // With `start` every write names its position; without it the
+              // descriptor's own cursor does.
+              await natives.fsWriteChunk(handle, chunk, this.pos);
+              if (this.pos !== undefined) this.pos += chunk.length;
+              this.bytesWritten += chunk.length;
               cb();
             } catch (e) {
               cb(e);
@@ -11196,25 +11269,32 @@
           },
           async final(cb) {
             try {
-              // Zero-write stream: the file must still exist afterwards.
-              // Unreachable when the descriptor was supplied -- it is already
-              // open, and `path` is undefined there.
-              if (handle === null) {
-                handle = (await natives.fsOpen(toPath(path), flags)).handle;
-              }
-              if (autoClose) await closeFd();
+              // node's `flush` option: fsync before the close.
+              if (flush && handle !== null) await natives.fsFsync(handle);
               cb();
             } catch (e) {
               cb(e);
             }
           },
           destroy(err, cb) {
-            if (autoClose) closeFd();
-            cb(err);
+            if (autoClose) closeFd().then(() => cb(err));
+            else cb(err);
           },
         });
-        this.path = path;
+        self = this;
+        // The properties node's WriteStream has, in its order.
+        this.fd = supplied ? supplied.handle : null;
+        // A stream handed its descriptor has no path, whatever was passed.
+        this.path = supplied ? undefined : path;
+        this.flags = givenFlags;
+        this.mode = opts.mode === undefined ? 0o666 : opts.mode;
+        this.flush = flush;
+        this.start = start;
+        this.pos = start;
         this.bytesWritten = 0;
+        // node: the `encoding` option is what a string written without one
+        // is encoded as.
+        if (opts.encoding) this.setDefaultEncoding(opts.encoding);
       }
     }
     _rwStreams = { ReadStream, WriteStream };

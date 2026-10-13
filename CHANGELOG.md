@@ -20,6 +20,26 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`fs.createWriteStream` opens its file when the stream is made (#323).** oam opened at
+  the first write, or at `end()` when there was none. A stream nobody had written to had no
+  file and had emitted nothing; one ended without data never emitted `'open'` or `'ready'`;
+  and one over a path that does not open stayed silent until it was written to. The open
+  now happens at construction, as node's does: `'open'` then `'ready'` fire, writes queue
+  behind it, and a failed open destroys the stream with the open's error (`'error'`, then
+  `'close'`), so `finished()` and `pipeline()` see it without a write. Conformance case
+  397.
+- **`createWriteStream` and `createReadStream` honour `flags`.** A write stream opened
+  `"a"` or else `"w"`, and a read stream always `"r"`: `{ flags: "r+" }` truncated the
+  file it was meant to write into, and `"wx"` overwrote one that was there. The flag given
+  is the flag opened with.
+- **`createWriteStream` honours `start`, `flush` and a string `encoding`.** `start` was
+  ignored (every write went to the cursor); `flush: true` now syncs before the close; and
+  `createWriteStream(path, "latin1")` encodes strings as it says. The write stream's
+  default `highWaterMark` is node's 16384 (it was 65536).
+- **File streams have node's properties**: `fd` (null until open and after close),
+  `pending`, `flags`, `mode`, `start`, `pos`, and `end` on a read stream, where there
+  were only `path` and the byte count. `start` and `end` are validated as node's are, and
+  a stream handed a descriptor has no `path`.
 - **A read error under `FileHandle.readLines()` no longer ends the process (#337).** A
   `readline` Interface did not listen for its input stream's `'error'`, so a failed read
   was thrown as an uncaught exception -- from inside a `try` / `catch` around

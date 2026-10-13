@@ -3718,9 +3718,6 @@ corners are left.
 - `readFile`'s `flag` option does not reach the open, which is always read-only. On a file
   that seldom shows; on a directory node's answer follows the flag (`"a"` is `EBADF`
   `read`, `"w"` `EISDIR` `open`) and oam's is always `EISDIR` `read`.
-- A write stream opens `"a"` or `"w"` and a read stream `"r"`, whatever `flags` says, so
-  `createWriteStream("dir", { flags: "r+" })` fails `EISDIR` `open` where node emits
-  `'open'` and then fails the write.
 - Numeric flags open as the nearest flag string (see "Open flags the natives cannot
   spell"), so on a directory one that maps to `"w"` -- `O_WRONLY` without `O_APPEND`, or
   with `O_CREAT` -- fails `EISDIR` where node returns a descriptor. `O_TRUNC` without
