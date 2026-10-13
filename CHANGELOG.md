@@ -31,7 +31,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   refuses `"w"`, `"w+"` and `writeFile` on one (`EPERM: operation not permitted, open`)
   and leaves it as it was; oam truncated it. `"r+"` and `"a"` open it in both.
 - **On Windows a truncating open replaces the file**, as node's does, where oam emptied it
-  in place: its alternate data streams go and its attributes are reset to the archive bit.
+  in place: its alternate data streams go and its attributes are reset to the archive bit
+  (the read-only bit a `mode` without the owner's write bit asks for is still not set: #324).
   Through a junction or directory symlink whose target is gone the open now fails `ENOENT`
   (it was `EPERM`).
 - **On Windows `readdir` of a link of the wrong kind reports what node does (#285).** oam

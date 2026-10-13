@@ -7931,7 +7931,7 @@ fn throw_ebadf(scope: &mut v8::PinScope<'_, '_>, syscall: &str) {
     scope.throw_exception(exception);
 }
 
-/// fopen-style flag string -> OpenOptions. Re-exported from oam_core so the
+/// fopen-style flag string -> how node opens for it. Re-exported from oam_core so the
 /// sync and async opens cannot disagree about what a flag means -- they share
 /// one descriptor space, so they have to share one flag table too.
 use oam_core::open_options_for;

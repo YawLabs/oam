@@ -2508,6 +2508,11 @@ fn refuse_a_root_that_is_no_disk(path: &std::path::Path) -> std::io::Result<()> 
 ///
 /// `read` is `w+`. The path is the OS path as node hands it to libuv
 /// (`FsPath::os`), passed as it is.
+///
+/// One argument is not libuv's yet: the open's `mode`. libuv adds
+/// FILE_ATTRIBUTE_READONLY for a mode without the owner's write bit, so node's
+/// `openSync(p, "w", 0o444)` leaves a read-only file; no creating open here is
+/// handed the mode (#324).
 #[cfg(windows)]
 fn create_always(path: &std::path::Path, read: bool) -> std::io::Result<std::fs::File> {
     use std::os::windows::ffi::OsStrExt;
@@ -3928,7 +3933,7 @@ mod fs_os_path_tests {
 ///
 /// Windows is what makes this show up: it returns ERROR_ACCESS_DENIED for a
 /// wrong-mode handle where POSIX returns EBADF directly.
-/// fopen-style flag string -> OpenOptions. Mirrors Node's fs flag set; an
+/// fopen-style flag string -> how node opens for it (`NodeOpen`). Mirrors Node's fs flag set; an
 /// unknown flag defaults to read-only (Node would throw, but lenient is
 /// safer for compat). `+`/`w`/`a`/`x` imply write.
 ///
@@ -6503,9 +6508,8 @@ pub mod ops {
         mode: String,
     ) -> OpOutcome {
         let options = super::open_options_for(&mode);
-        // std OpenOptions on the blocking pool rather than tokio::fs, so the
-        // descriptor lands in the ONE registry the sync family also reads.
-        // tokio::fs::open is this exact call on this exact pool.
+        // The sync family's open on the blocking pool rather than tokio::fs,
+        // so the descriptor lands in the ONE registry that family also reads.
         let owned = path.clone();
         let opened = tokio::task::spawn_blocking(move || options.open(&owned)).await;
         let opened = match opened {
@@ -7474,21 +7478,28 @@ mod os_error_code_tests {
         let file = dir.join("f.txt");
         let file_s = file.to_str().unwrap();
         let stream = format!("{file_s}:side");
+        // Not every volume a temp directory sits on has streams (FAT, some
+        // RAM disks); where there are none, only the rest is asserted.
+        std::fs::write(&file, b"").unwrap();
+        let streams = std::fs::write(&stream, b"stream").is_ok();
         let fill = || {
             std::fs::write(&file, b"0123456789").unwrap();
-            std::fs::write(&stream, b"stream").unwrap();
+            if streams {
+                std::fs::write(&stream, b"stream").unwrap();
+            }
         };
+        let stream_is_there = |there: bool| !streams || std::fs::read(&stream).is_ok() == there;
         for flags in ["r+", "a", "a+"] {
             fill();
             drop(open_options_for(flags).open(file_s).unwrap());
-            assert_eq!(std::fs::read(&stream).unwrap(), b"stream", "{flags}");
+            assert!(stream_is_there(true), "{flags}");
             assert_eq!(std::fs::metadata(&file).unwrap().len(), 10, "{flags}");
         }
         for flags in ["w", "w+"] {
             fill();
             let mut opened = open_options_for(flags).open(file_s).unwrap();
             assert_eq!(opened.metadata().unwrap().len(), 0, "{flags}");
-            assert!(std::fs::read(&stream).is_err(), "{flags}");
+            assert!(stream_is_there(false), "{flags}");
             opened.write_all(b"new").unwrap();
             opened.rewind().unwrap();
             let mut back = String::new();
@@ -7502,7 +7513,7 @@ mod os_error_code_tests {
         }
         fill();
         write_whole_file(file_s, b"x", false).unwrap();
-        assert!(std::fs::read(&stream).is_err());
+        assert!(stream_is_there(false));
         assert_eq!(std::fs::read(&file).unwrap(), b"x");
         // A missing file is made; a missing directory is not.
         let fresh = dir.join("fresh.txt");

@@ -3560,7 +3560,8 @@ What still differs:
   strings, so the synchronous spellings (`'rs+'`, `'as'`, ...) open without `O_SYNC`,
   and a numeric combination no fopen string expresses -- `O_WRONLY` without
   `O_CREAT`, or `O_WRONLY | O_CREAT` without `O_TRUNC` -- opens as the nearest one
-  (`'w'`, which creates and truncates). Numeric flags with both access bits set
+  (`'w'`, which creates and truncates; on Windows it replaces the file as any `'w'` does,
+  so its alternate data streams go and a hidden or system file is refused `EPERM`). Numeric flags with both access bits set
   (`-1`) are `EINVAL` in node and open read-only in oam.
 - **A negative position for `writev` / `readv` of several buffers, on Windows.**
   libuv offsets each buffer from the position in turn, so with `-2` the second
@@ -3733,8 +3734,8 @@ corners are left.
 - `fstatSync` of a console opened by name to write (`openSync("\\\\.\\CON", "w")`,
   `"\\\\.\\CONOUT$"` opened `"w"` or `"a"`) answers with the console's shape; node's
   fails `EISDIR` `fstat`. The open itself matches (conformance case 394).
-- An exclusive open (`wx`, `wx+`, `ax`, `ax+`) through such a link fails `EEXIST` and
-  creates nothing; node's creates the target as a directory and returns its descriptor.
+- An exclusive open (`wx`, `wx+`, `ax`, `ax+`) through a junction or directory symlink
+  whose target is gone fails `EEXIST` and creates nothing; node's creates the target as a directory and returns its descriptor.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 

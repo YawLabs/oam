@@ -3,7 +3,7 @@
 // and everything that open answers follows:
 //
 // - a named pipe opens, the write reaches its server, and the server sees one
-//   connection; so does a device (`NUL`, `\\.\CON`);
+//   connection; so does a device (`\\.\NUL`, `\\.\CON`);
 // - a hidden or system file is refused `EPERM`, though `r+` and `a` open it:
 //   CREATE_ALWAYS must be given the attributes the file already has;
 // - the file that was there is replaced: its alternate data streams are gone
@@ -30,11 +30,16 @@ if (process.platform !== "win32") {
   process.exit(0);
 }
 
+const start = process.cwd();
 const made = fs.mkdtempSync(path.join(os.tmpdir(), "oam-case-394-"));
+// A relative name is opened here: a bare `NUL` is a FILE of that name in the
+// current directory, in both runtimes, and must not be left in the caller's.
+process.chdir(made);
 const attrib = (...args) => execFileSync("attrib", args).toString();
 // Whichever row throws, the directory goes -- hidden and read-only files too.
 process.on("exit", () => {
   try {
+    process.chdir(start);
     for (const name of fs.readdirSync(made)) {
       try {
         attrib("-r", "-h", "-s", path.join(made, name));
@@ -45,7 +50,10 @@ process.on("exit", () => {
 });
 
 const pipe = "\\\\.\\pipe\\oam-case-394-" + process.pid;
-const scrub = (s) => (typeof s === "string" ? s.split(made).join("<D>").split(pipe).join("<PIPE>") : s);
+// The drive or share the temp directory is on.
+const root = path.parse(made).root;
+const scrub = (s) =>
+  typeof s === "string" ? s.split(made).join("<D>").split(pipe).join("<PIPE>").split(root).join("<ROOT>") : s;
 const shape = (e) =>
   e && e.code
     ? `${e.code} ${e.errno} ${e.syscall} path=${JSON.stringify(scrub(e.path))} ${scrub(e.message)}`
@@ -270,8 +278,8 @@ const names = [
   ["missing parent", path.join(made, "no", "file")],
   ["under a file", path.join(made, "f0", "x")],
   ["file with a separator", path.join(made, "f0") + "\\"],
-  ["drive root", made.slice(0, 3)],
-  ["NUL", "NUL"],
+  ["root", root],
+  ["a file named NUL", "NUL"],
   ["\\\\.\\NUL", "\\\\.\\NUL"],
   ["\\\\?\\NUL", "\\\\?\\NUL"],
   ["\\\\.\\CON", "\\\\.\\CON"],
