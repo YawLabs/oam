@@ -3726,9 +3726,6 @@ corners are left.
   runtimes. node's callback form drops the failed read of a descriptor it was handed and
   calls back with an empty Buffer.
 - `fs.openAsBlob("dir")` rejects `ERR_INVALID_ARG_VALUE`; node resolves a Blob of size 0.
-- `readFile`'s `flag` option does not reach the open, which is always read-only. On a file
-  that seldom shows; on a directory node's answer follows the flag (`"a"` is `EBADF`
-  `read`, `"w"` `EISDIR` `open`) and oam's is always `EISDIR` `read`.
 - `fstatSync` of a console opened by name to write (`openSync("\\\\.\\CON", "w")`,
   `"\\\\.\\CONOUT$"` opened `"w"` or `"a"`) answers with the console's shape; node's
   fails `EISDIR` `fstat`. The open itself matches (conformance case 394).

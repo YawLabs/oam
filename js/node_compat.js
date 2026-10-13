@@ -11001,6 +11001,8 @@
   // deliberately redefinable getter (graceful-fs replaces it with its own
   // wrapper), while node's FileHandle uses the internal class regardless of
   // what userland last assigned.
+  // Set by the fs/promises factory, read by the fs one (which loads it first).
+  let fsPromisesInternals;
   let _rwStreams;
   function rwStreams(natives) {
     if (_rwStreams) return _rwStreams;
@@ -11586,9 +11588,51 @@
         await natives.fsCopyFile(srcStr, destStr);
       }
     }
-    const readFileAt = async (file, options) => {
-      const bytes = await natives.fsReadFile(file);
-      return decodeRead(bytes, readOptions(options).encoding ?? null);
+    // readFile's `flag` is the flag the path is opened with, as node's is:
+    // what it does to the file (create, empty, refuse one that is there) and
+    // what the descriptor may do (a write-only one fails the read, EBADF) are
+    // the call's. The whole-file native is the read-only open, so any other
+    // flag opens a descriptor, reads it to the end and closes it. It used to
+    // be ignored: every readFile opened read-only, whatever it was told.
+    //
+    // `falsyIsRead` is fs.promises.readFile's own reading of the option
+    // (`options.flag || "r"`, so `""` and `0` are a plain read); the
+    // callback form hands the flag to the open as it is, and `""` is refused.
+    const readsWithFlag = (options, falsyIsRead) => {
+      const flag = readOptions(options).flag;
+      const given = flag === undefined || (falsyIsRead && !flag) ? "r" : flag;
+      const bits = openFlags(given, natives);
+      return bits === openFlags("r", natives) ? null : bits;
+    };
+    // What the callback forms in node:fs are built from. Kept off the
+    // module object: a builtin's exports are its object's own keys, so a
+    // helper parked there (`_globAsPromise` was) is a name node's
+    // fs/promises does not have, and `import { _globAsPromise }` linked.
+    fsPromisesInternals = {
+      // The callback readFile's: the same read, with the flag taken as given.
+      readFileForCallback: (path, options) =>
+        fileHandles.has(path) ? path.readFile(options) : readFileAt(toPath(path), options, false),
+      globAsPromise: (pattern, options) => Promise.resolve().then(() => globSyncRaw(pattern, options, natives)),
+    };
+    const readFileAt = async (file, options, falsyIsRead) => {
+      const flag = readsWithFlag(options, falsyIsRead);
+      if (flag === null) {
+        const bytes = await natives.fsReadFile(file);
+        return decodeRead(bytes, readOptions(options).encoding ?? null);
+      }
+      const { handle } = await natives.fsOpen(file, flag);
+      try {
+        const chunks = [];
+        for (;;) {
+          const chunk = await natives.fsReadChunk(handle, 65536);
+          if (chunk === undefined) break;
+          chunks.push(chunk);
+        }
+        const whole = globalThis.Buffer.concat(chunks);
+        return decodeRead(whole, readOptions(options).encoding ?? null);
+      } finally {
+        natives.fsClose(handle);
+      }
     };
     // node's writeFileHandle (lib/internal/fs/promises.js, v22.22.2): a view
     // in one write -- none at all for an empty one -- or each chunk of an
@@ -11633,7 +11677,7 @@
     rawFsPromises = {
       // A FileHandle reads / writes through itself, as node's do.
       readFile: (path, options) =>
-        fileHandles.has(path) ? path.readFile(options) : readFileAt(toPath(path), options),
+        fileHandles.has(path) ? path.readFile(options) : readFileAt(toPath(path), options, true),
       writeFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, false), false),
       appendFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, true), true),
       stat: withPath(async (file) => wrapStat(await natives.fsStat(file, false))),
@@ -11688,10 +11732,8 @@
       // node v22's fs.promises.glob returns an AsyncIterable, not a Promise.
       // Wrap the materialized array so Array.fromAsync() works on both sides.
       glob: (pattern, options) => globAsyncIterable(globSyncRaw(pattern, options, natives)),
-      // callback fs.glob needs a Promise-returning function (callbackify1
-      // calls .then on the result). Hide this from users -- the public
-      // promises API is the AsyncIterable form above.
-      _globAsPromise: (pattern, options) => Promise.resolve().then(() => globSyncRaw(pattern, options, natives)),
+      // (Callback fs.glob needs a Promise-returning function instead:
+      // fsPromisesInternals.globAsPromise.)
       access: (path, mode) => natives.fsAccess(toPath(path), mode ?? 0),
       realpath: (path) => natives.fsRealpath(toPath(path)),
       mkdtemp: (prefix, options) => {
@@ -12594,7 +12636,7 @@
 
     // The path halves of callback forms whose own wrapper has already put the
     // callback in place, built once rather than per call.
-    const readFileByPath = callbackify1(promises.readFile, 2);
+    const readFileByPath = callbackify1(fsPromisesInternals.readFileForCallback, 2);
     // realpathArg runs inside, so the callback is checked before the path.
     const realpathByPath = callbackify1((p) => realpathWalking(realpathArg(p)), 1);
     const mkdtempByPrefix = callbackify1(promises.mkdtemp, 1, 1);
@@ -12703,8 +12745,22 @@
       // An int32 `path` is a file descriptor (node's isInt32 test), read or
       // written from its current position; anything else must be a path.
       readFileSync: (path, options) => {
+        // node checks the path before the flag.
+        const openFlagsAfterPath = (p, flags) => (toPath(p), openFlags(flags, natives));
         const enc = readOptions(options).encoding;
         if (isInt32(path)) return decodeRead(readFdSync(path), enc ?? null);
+        // Any flag but a read-only one: open with it, read the descriptor,
+        // close it (see readFileAt).
+        const given = readOptions(options).flag;
+        const flag = given === undefined ? null : openFlagsAfterPath(path, given);
+        if (flag !== null && flag !== openFlags("r", natives)) {
+          const fd = natives.fsOpenSync(toPath(path), flag);
+          try {
+            return decodeRead(readFdSync(fd), enc ?? null);
+          } finally {
+            natives.fsCloseSync(fd);
+          }
+        }
         if (enc === "utf8" || enc === "utf-8") {
           return natives.fsReadFileUtf8Sync(toPath(path));
         }
@@ -12927,7 +12983,7 @@
         const opts = typeof options === "function" ? undefined : options;
         return (readOptions(opts).recursive === true ? readdirBreadthFirstByPath : readdirByPath)(...arguments);
       },
-      glob: callbackify1(promises._globAsPromise, 1, 1),
+      glob: callbackify1(fsPromisesInternals.globAsPromise, 1, 1),
       mkdir: callbackify1(promises.mkdir, 1, 1),
       // node's rm (lib/fs.js, v22.22.2) validates the path and its options
       // synchronously, and NEVER checks the callback: the removal runs, and
