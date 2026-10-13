@@ -20,6 +20,14 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **A read error under `FileHandle.readLines()` no longer ends the process (#337).** A
+  `readline` Interface did not listen for its input stream's `'error'`, so a failed read
+  was thrown as an uncaught exception -- from inside a `try` / `catch` around
+  `for await (const line of handle.readLines())` that never saw it. The Interface now
+  emits its input's error on itself, as node's does: an `'error'` listener on it is called,
+  and the async iterator rejects with it after the lines that arrived first. The same goes
+  for `readline.createInterface({ input })` and `readline/promises` over any stream that
+  fails. The iterator is also made once per Interface, as node's is. Conformance case 396.
 - **On Windows `fchmod` works through a descriptor opened for reading (#322).**
   `fchmodSync(fd, 0o444)`, `fs.fchmod` and `FileHandle.chmod()` failed `EPERM: operation not
   permitted, fchmod` when the descriptor was opened `"r"`: oam set the read-only attribute

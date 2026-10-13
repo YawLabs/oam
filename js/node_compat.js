@@ -31045,13 +31045,26 @@
             }
             this.close();
           };
+          // node's Interface listens for its input's 'error' and emits it
+          // on itself, so the failure is the Interface's to report: to an
+          // 'error' listener, or to the async iterator, which rejects with
+          // it. With neither it is uncaught, as an unhandled 'error' is
+          // anywhere. Without this the input's error had no listener at all
+          // and was thrown from the stream: `for await` over
+          // FileHandle.readLines() ended the process on a failed read, from
+          // inside a try / catch that never saw it.
+          const onError = (err) => {
+            this.emit("error", err);
+          };
           this.input.on("data", onData);
+          this.input.on("error", onError);
           this.input.on("end", onEnd);
           // Node detaches its input listeners on close (onSelfCloseWithout-
           // Terminal), so a closed interface stops being a consumer of the
           // stream and a later one over the same input is its only reader.
           this.once("close", () => {
             this.input.removeListener("data", onData);
+            this.input.removeListener("error", onError);
             this.input.removeListener("end", onEnd);
           });
           // Node ends its constructor with input.resume(). close() pauses the
@@ -31217,26 +31230,70 @@
         }
         return this;
       }
+      // node's is `events.on(this, "line", { close: ["close"] })`, made once
+      // and handed out every time: lines queue until they are asked for,
+      // 'close' ends the iteration after the lines already queued, and an
+      // 'error' on the Interface -- its input's, see the constructor --
+      // rejects the next() that reaches it, after which the iteration is
+      // over (measured on v22.22.2: line, rejected, done, done).
       [Symbol.asyncIterator]() {
+        if (this._lineIterator) return this._lineIterator;
         const self = this;
         const queue = [];
-        let resolver = null;
+        let waiting = null;
+        let failure = null;
         let done = false;
-        self.on("line", (line) => {
-          if (resolver) { const r = resolver; resolver = null; r({ value: line, done: false }); }
-          else queue.push(line);
-        });
-        self.once("close", () => {
+        const settle = () => {
+          if (!waiting) return;
+          if (queue.length) {
+            const w = waiting; waiting = null;
+            w.resolve({ value: queue.shift(), done: false });
+          } else if (failure) {
+            const w = waiting; waiting = null;
+            const err = failure.err;
+            failure = null;
+            finish();
+            w.reject(err);
+          } else if (done) {
+            const w = waiting; waiting = null;
+            w.resolve({ value: undefined, done: true });
+          }
+        };
+        const onLine = (line) => { queue.push(line); settle(); };
+        const onClose = () => { finish(); settle(); };
+        const onError = (err) => { if (!done && !failure) { failure = { err }; settle(); } };
+        function finish() {
           done = true;
-          if (resolver) { const r = resolver; resolver = null; r({ value: undefined, done: true }); }
-        });
-        return {
+          self.removeListener("line", onLine);
+          self.removeListener("close", onClose);
+          self.removeListener("error", onError);
+        }
+        self.on("line", onLine);
+        self.on("close", onClose);
+        self.on("error", onError);
+        const iterator = {
           next() {
             if (queue.length) return Promise.resolve({ value: queue.shift(), done: false });
+            if (failure) {
+              const err = failure.err;
+              failure = null;
+              finish();
+              return Promise.reject(err);
+            }
             if (done) return Promise.resolve({ value: undefined, done: true });
-            return new Promise((r) => { resolver = r; });
+            return new Promise((resolve, reject) => { waiting = { resolve, reject }; });
           },
+          return() {
+            queue.length = 0;
+            failure = null;
+            finish();
+            settle();
+            return Promise.resolve({ value: undefined, done: true });
+          },
+          [Symbol.asyncIterator]() { return iterator; },
         };
+        this._lineIterator = iterator;
+        return iterator;
       }
     }
     function createInterface(input, output) {
