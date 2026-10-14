@@ -191,9 +191,11 @@ pub(crate) fn produce_cjs_code_cache(
 /// If it fails on syntax only a module has (an import or export statement,
 /// import.meta) it is a module; if it fails on what only the wrapper forbids
 /// (a top-level declaration of require, module, exports, __filename or
-/// __dirname, a top-level await) it is a module when it compiles as one. Any
-/// other failure is CommonJS's, to be reported as such. The exception is
-/// left behind no TryCatch: it is caught here.
+/// __dirname, a top-level await, or what a top-level await inside an
+/// expression reads as to a function body) it is a module when it compiles as
+/// one. Any other failure leaves it CommonJS. Only the answer is used: the
+/// error node would then report is not (oam runs the entry as a module
+/// either way). The exception is caught here.
 pub(crate) fn contains_module_syntax(
     scope: &mut v8::PinScope<'_, '_>,
     source: &str,
@@ -212,6 +214,14 @@ pub(crate) fn contains_module_syntax(
         "Identifier '__dirname' has already been declared",
         "await is only valid in async functions and the top level bodies of modules",
     ];
+    // node's maybe_top_level_await_errors: `console.log(await 1)` or
+    // `if (await x)` read as a call or a token out of place to a function.
+    const MAYBE_TOP_LEVEL_AWAIT_ERRORS: [&str; 2] =
+        ["missing ) after argument list", "SyntaxError: Unexpected"];
+    // node's GetCJSParameters: the wrapper's five names. oam's own wrapper
+    // adds `global`, which would make a top-level `const global` fail here
+    // where node's does not.
+    const NODE_CJS_PARAMS: [&str; 5] = ["exports", "require", "module", "__filename", "__dirname"];
     let source = strip_shebang(source.to_string());
     v8::tc_scope!(let tc, scope);
     let (Some(code), Some(resource)) = (v8::String::new(tc, &source), v8::String::new(tc, name))
@@ -232,7 +242,7 @@ pub(crate) fn contains_module_syntax(
         None,
     );
     let mut compiler_source = v8::script_compiler::Source::new(code, Some(&as_cjs));
-    let params: Vec<v8::Local<v8::String>> = CJS_PARAMS
+    let params: Vec<v8::Local<v8::String>> = NODE_CJS_PARAMS
         .iter()
         .filter_map(|p| v8::String::new(tc, p))
         .collect();
@@ -258,10 +268,11 @@ pub(crate) fn contains_module_syntax(
     {
         return true;
     }
-    if !THROWS_ONLY_IN_CJS_ERROR_MESSAGES
+    let maybe_valid_in_esm = THROWS_ONLY_IN_CJS_ERROR_MESSAGES
         .iter()
-        .any(|m| message.contains(m))
-    {
+        .chain(MAYBE_TOP_LEVEL_AWAIT_ERRORS.iter())
+        .any(|m| message.contains(m));
+    if !maybe_valid_in_esm {
         return false;
     }
     let as_module = v8::ScriptOrigin::new(

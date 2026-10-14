@@ -154,6 +154,13 @@ const require = 1;
 const metaInComment = `${plain}
 // import.meta
 `;
+const awaitInCall = `${plain}
+console.log(await 1);
+`;
+const globalExport = `${plain}
+const global = 1;
+export {};
+`;
 const plainThrows = `
 process.on("uncaughtException", (e, origin) => console.log("uncaughtException", origin));
 process.nextTick(() => console.log("tick"));
@@ -196,6 +203,8 @@ for (const [name, text] of Object.entries({
   "export-empty.js": exportEmpty,
   "redeclared.js": redeclared,
   "meta-in-comment.js": metaInComment,
+  "await-in-call.js": awaitInCall,
+  "global-export.js": globalExport,
 })) {
   fs.writeFileSync(path.join(typeless, name), text);
 }
@@ -234,10 +243,21 @@ try {
     ["typeless .js with only export {}", "export-empty.js"],
     ["typeless .js redeclaring require", "redeclared.js"],
     ["typeless .js with import.meta in a comment", "meta-in-comment.js"],
+    ["typeless .js awaiting inside a call", "await-in-call.js"],
+    ["typeless .js declaring global, with export {}", "global-export.js"],
   ]) {
     const run = spawnSync(process.execPath, [path.join("typeless", file)], { cwd: dir, encoding: "utf8" });
     console.log(`${label}: ${run.stdout.trim().split(/\r?\n/).join(" | ")} (status ${run.status})`);
   }
+  // A "type" other than "module" or "commonjs" is none to node, which
+  // runs CommonJS under it as CommonJS; so does oam.
+  const oddType = path.join(dir, "odd-type");
+  fs.mkdirSync(oddType);
+  fs.writeFileSync(path.join(oddType, "package.json"), JSON.stringify({ type: "cjs" }));
+  fs.writeFileSync(path.join(oddType, "helper.js"), "module.exports = { v: 1 };\n");
+  fs.writeFileSync(path.join(oddType, "main.js"), `${plain}\nconsole.log(typeof require, require("./helper.js").v);\n`);
+  const odd = spawnSync(process.execPath, [path.join("odd-type", "main.js")], { cwd: dir, encoding: "utf8" });
+  console.log(`"type": "cjs" with CommonJS: ${odd.stdout.trim().split(/\r?\n/).join(" | ")} (status ${odd.status})`);
 } finally {
   fs.rmSync(dir, { recursive: true, force: true });
 }
