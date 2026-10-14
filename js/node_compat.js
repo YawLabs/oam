@@ -11164,7 +11164,8 @@
     function constructStream(stream, callback) {
       if (stream[kSupplied]) { callback(); return; }
       const opening = new Promise((resolve) => {
-        resolve(natives.fsOpen(toPath(stream.path), openFlags(stream.flags, natives)));
+        const flags = openFlags(stream.flags, natives);
+        resolve(natives.fsOpen(toPath(stream.path), flags, parseFileMode(stream.mode, "mode", 0o666)));
       });
       settled(
         opening,
@@ -12223,12 +12224,12 @@
       if (fileHandles.has(path)) return path.writeFile(data, options);
       const file = toPath(path);
       const flag = openFlags(options.flag || (append ? "a" : "w"), natives);
-      parseFileMode(options.mode, "mode", 0o666);
+      const mode = parseFileMode(options.mode, "mode", 0o666);
       if (!isCustomIterable(data) && (flag === openFlags("w", natives) || flag === openFlags("a", natives))) {
-        return natives.fsWriteFile(file, data, flag === openFlags("a", natives));
+        return natives.fsWriteFile(file, data, flag === openFlags("a", natives), mode);
       }
       return (async () => {
-        const { handle } = await natives.fsOpen(file, flag);
+        const { handle } = await natives.fsOpen(file, flag, mode);
         try {
           await writeHandleData(handle, data, options.encoding);
         } finally {
@@ -12368,8 +12369,8 @@
       // node's order: the path, the flags, the mode.
       open: withPath(async function (file, flags, mode) {
         flags = openFlags(flags, natives);
-        parseFileMode(mode, "mode", 0o666);
-        var info = await natives.fsOpen(file, flags);
+        mode = parseFileMode(mode, "mode", 0o666);
+        var info = await natives.fsOpen(file, flags, mode);
 
         var fh = new FileHandle(info.handle);
         fileHandles.add(fh);
@@ -12597,15 +12598,15 @@
       }
       const file = toPath(path);
       const flag = openFlags(options.flag || (append ? "a" : "w"), natives);
-      parseFileMode(options.mode, "mode", 0o666);
+      const mode = parseFileMode(options.mode, "mode", 0o666);
       const bytes = encodeWrite(data, options);
       if (flag === openFlags("w", natives) || flag === openFlags("a", natives)) {
-        return void natives.fsWriteFileSync(file, bytes, flag === openFlags("a", natives));
+        return void natives.fsWriteFileSync(file, bytes, flag === openFlags("a", natives), mode);
       }
       // Any other flag: open with it, write it all, close -- node's own
       // writeFileSync, which writes nothing (and so fails nothing) when the
       // data is empty.
-      const fd = natives.fsOpenSync(file, flag);
+      const fd = natives.fsOpenSync(file, flag, mode);
       try {
         if (bytes.byteLength !== 0) natives.fsWriteSync(fd, bytes, null);
       } finally {
@@ -13162,8 +13163,8 @@
       openSync: (path, flags, mode) => {
         const file = toPath(path);
         flags = openFlags(flags, natives);
-        parseFileMode(mode, "mode", 0o666);
-        return natives.fsOpenSync(file, flags);
+        mode = parseFileMode(mode, "mode", 0o666);
+        return natives.fsOpenSync(file, flags, mode);
       },
       // The *Sync descriptor checks sit where node's C++ binding makes them:
       // after every other argument, right before the call (see validateFd).
@@ -13357,15 +13358,16 @@
           flags = "r";
         } else if (typeof mode === "function") {
           cb = mode;
+          mode = 0o666;
         } else {
-          parseFileMode(mode, "mode", 0o666);
+          mode = parseFileMode(mode, "mode", 0o666);
         }
         var flagStr = openFlags(flags, natives);
         validateCb(cb);
         var token = fsReqStart();
         var p;
         try {
-          p = Promise.resolve(natives.fsOpen(file, flagStr));
+          p = Promise.resolve(natives.fsOpen(file, flagStr, mode));
         } catch (e) {
           fsReqEnd(token);
           throw e;
