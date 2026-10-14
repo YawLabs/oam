@@ -20,6 +20,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`events.once` is an async function and an abort rejects with node's `AbortError`, as in node (#344).**
+  It was a plain function, so the continuation of `await once(...)` ran before the microtasks the
+  same emit queued, and its kind and `length` (3) were not node's. An aborted `once` rejected with a
+  `DOMException` (`code` 20, no `cause`); it now rejects with node's `AbortError`, `code` `"ABORT_ERR"`
+  and the signal's reason as `cause`. A null emitter rejects with node's `TypeError`.
 - **At an ES module's top level `process.nextTick` runs after the promise jobs, as in node (#345).**
   node evaluates an ES module inside a microtask drain, so the promise jobs its top level queues,
   and the code after a top-level await they settle, run before any tick. oam ran the ticks first.
