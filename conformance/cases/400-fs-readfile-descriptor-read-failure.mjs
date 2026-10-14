@@ -73,8 +73,6 @@ for (const [label, target, flag] of opens) {
     fd = open();
     console.log(`${label} | ${name} | ${viaSync(fd, options)}`);
     fs.closeSync(fd);
-    // FileHandle.readFile reads the "buffer" encoding its own way; not this case's.
-    if (options === "buffer") continue;
     if (flag === "w") fs.writeFileSync(file, "0123456789");
     const handle = await fs.promises.open(target, flag);
     console.log(`${label} | ${name} | FileHandle ` + (await handle.readFile(options).then(value, shape)));

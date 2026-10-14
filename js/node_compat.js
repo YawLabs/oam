@@ -1926,8 +1926,10 @@
       return value instanceof Buffer;
     }
 
+    // Only a string names an encoding, as in node: an array or a String
+    // object that would coerce to a known name does not.
     static isEncoding(enc) {
-      return normalizeEncoding(enc) !== undefined;
+      return typeof enc === "string" && enc.length !== 0 && normalizeEncoding(enc) !== undefined;
     }
 
     static alloc(size, fill, encoding) {
@@ -11769,25 +11771,61 @@
       async [Symbol.asyncDispose]() {
         await this.close();
       }
+      // node's readFileHandle (lib/internal/fs/promises.js, v22.22.2), in its
+      // order: the options (getOptions: their type, a known encoding, the
+      // signal's type); the decoder for the encoding, which is where
+      // `"buffer"` -- an encoding the options check lets through -- is
+      // refused; a signal already aborted; a stat of the handle; the signal
+      // again; and only then the reads, with the signal looked at before
+      // each. What is wrong with the call is reported whatever the handle
+      // holds. It used to read first and decode at the end, so a bad
+      // encoding went unreported for an empty file and behind the read's own
+      // error for a handle that cannot be read.
+      //
+      // The stat is what the read is measured by: a regular file is read up
+      // to the size it had then, 512 KiB at a time, so what is appended
+      // meanwhile is left for the next read; a file of no size, or anything
+      // that is no regular file, is read to its end, 64 KiB at a time. It
+      // is also the awaited step that lets an abort made right after the
+      // call be seen before anything is read.
+      //
+      // The descriptor is looked up for each call, as node's is: through
+      // fs.promises.readFile(handle), which holds no reference, a close()
+      // made under the read leaves -1 there -- a range error, not a read of
+      // a descriptor that is someone else's by now.
       async readFile(options) {
-        const fh = this, h = this[kNative];
-        var enc = (options && typeof options === "object") ? options.encoding : (typeof options === "string" ? options : null);
-        var chunks = [];
-        while (true) {
-          var chunk = await natives.fsReadChunk(h, 65536);
+        const { encoding, signal } = fsGetOptions(options, {});
+        if (encoding === "buffer") throw codes.ERR_UNKNOWN_ENCODING(encoding);
+        const descriptor = () => {
+          if (this[kFd] === -1) throw codes.ERR_OUT_OF_RANGE("fd", ">= 0 && <= 2147483647", -1);
+          return this[kNative];
+        };
+        const checkAborted = () => {
+          if (signal && signal.aborted) throw new FsAbortError(signal);
+        };
+        checkAborted();
+        const stat = wrapStat(await natives.fsFstat(descriptor()));
+        checkAborted();
+        const size = stat.isFile() ? stat.size : 0;
+        if (size > 2 ** 31 - 1) {
+          throw applyNodeErrorShape(
+            new RangeError(`File size (${size}) is greater than 2 GiB`),
+            "ERR_FS_FILE_TOO_LARGE",
+          );
+        }
+        const chunks = [];
+        let total = 0;
+        for (;;) {
+          checkAborted();
+          const want = size === 0 ? 65536 : Math.min(size - total, 524288);
+          if (want === 0) break;
+          const chunk = await natives.fsReadChunk(descriptor(), want);
           if (chunk === undefined) break;
           chunks.push(chunk);
+          total += chunk.length;
         }
-        if (chunks.length === 0) return enc ? "" : globalThis.Buffer.alloc(0);
-        var total = 0;
-        for (var i = 0; i < chunks.length; i++) total += chunks[i].length;
-        var buf = globalThis.Buffer.alloc(total);
-        var off = 0;
-        for (var i = 0; i < chunks.length; i++) {
-          buf.set(chunks[i], off);
-          off += chunks[i].length;
-        }
-        return enc ? buf.toString(enc) : buf;
+        const whole = globalThis.Buffer.concat(chunks, total);
+        return encoding ? whole.toString(encoding) : whole;
       }
       // node's fs/promises writeFile over this handle: the options, then
       // the data (a string, a view or an iterable), as every writeFile
@@ -12082,12 +12120,11 @@
     // fs.promises.readFile(handle) reads the handle without that guard, as
     // node's does (readFileHandle, called directly): no reference is held, so
     // a close() made under it is not kept waiting, and a handle that is
-    // already closed is a descriptor of -1 -- node's range error.
+    // already closed is a descriptor of -1 -- node's range error, raised
+    // where the method first needs the descriptor (after the encoding and
+    // the signal have had their say).
     const readHandleUnguarded = FileHandle.prototype.readFile;
-    const readFileOfHandle = async (handle, options) => {
-      if (handle[kFd] === -1) throw codes.ERR_OUT_OF_RANGE("fd", ">= 0 && <= 2147483647", -1);
-      return readHandleUnguarded.call(handle, options);
-    };
+    const readFileOfHandle = (handle, options) => readHandleUnguarded.call(handle, options);
     for (const [name, syscall] of [
       ["readFile", "readFile"], ["writeFile", "writeFile"], ["appendFile", "writeFile"],
       ["write", "write"], ["read", "read"], ["stat", "fstat"], ["chmod", "fchmod"],
