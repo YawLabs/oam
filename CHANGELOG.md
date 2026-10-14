@@ -20,6 +20,15 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`fs.cp`, `fs.cpSync` and `fs.promises.cp` honour their options, as node's do (#390).** The copy
+  read `recursive` alone. So `force: false` overwrote the file it was asked to keep, `errorOnExist`
+  never failed, and `filter`, `dereference`, `verbatimSymlinks`, `preserveTimestamps` and `mode`
+  did nothing. The copies are now node v22.22.2's, ported: the options are checked as node checks
+  them, links are copied as links (absolute, or verbatim), and the errors are node's
+  (`ERR_FS_CP_EEXIST`, `ERR_INCOMPATIBLE_OPTION_PAIR`, a promise from cpSync's `filter`). A
+  directory symlink inside the tree no longer stops `cpSync`. Where node's cpSync fails by its
+  platform's std::filesystem, or aborts, oam fails as node does on Linux; see
+  docs/node-divergences.md.
 - **A `SystemError` code is an instance of its own `NodeError` class, as node's is (#288).**
   node raises `fs.cp`'s `ERR_FS_CP_*` and `ERR_FS_EISDIR`, and `os.getPriority`'s
   `ERR_SYSTEM_ERROR`, as a per-code `class NodeError extends SystemError`. oam built every one
