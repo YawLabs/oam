@@ -11577,6 +11577,7 @@
   // node's getValidatedPath for a copy's paths: checked as any path is, a
   // file: URL made the path, and a Buffer (any Uint8Array) kept as it is --
   // which node's async copy then hands to path.dirname, and fails.
+  let cpCallbackified;
   function cpPathArg(p, name) {
     const checked = toPath(p, name);
     return p instanceof Uint8Array ? p : checked;
@@ -11656,7 +11657,7 @@
       if (opts.filter && !(await opts.filter(s, d))) return { skipped: true };
       const [srcStat, destStat] = await getStats(s, d);
       if (destStat) {
-        if (cpAreIdentical(srcStat, destStat)) {
+        if (cpAreIdentical(srcStat, destStat) && cpSamePath(s, d, opts.dereference)) {
           throw cpSystemError("ERR_FS_CP_EINVAL", "src and dest cannot be the same", d, CP_ERRNO.EINVAL, "EINVAL");
         }
         if (srcStat.isDirectory() && !destStat.isDirectory()) {
@@ -11686,7 +11687,7 @@
         if (err.code === "ENOENT") return;
         throw err;
       }
-      if (cpAreIdentical(srcStat, destStat)) {
+      if (cpAreIdentical(srcStat, destStat) && cpSameAs(s, opts.dereference, destParent, true)) {
         throw cpSystemError("ERR_FS_CP_EINVAL", `cannot copy ${s} to a subdirectory of self ${d}`, d, CP_ERRNO.EINVAL, "EINVAL");
       }
       return checkParentPaths(s, srcStat, destParent);
@@ -11851,11 +11852,7 @@
     const destShown = cpNs(dest);
     if (destStat !== null) {
       // std::filesystem::equivalent follows both.
-      let same = false;
-      try {
-        same = cpAreIdentical(fs.statSync(src), fs.statSync(dest));
-      } catch (e) {}
-      if (same) throw makeNodeError("ERR_FS_CP_EINVAL", "src and dest cannot be the same " + destShown);
+      if (cpSamePath(src, dest, true)) throw makeNodeError("ERR_FS_CP_EINVAL", "src and dest cannot be the same " + destShown);
       const destIsDir = destStat.isDirectory();
       if (srcIsDir && !destIsDir) {
         throw makeNodeError("ERR_FS_CP_DIR_TO_NON_DIR", `Cannot overwrite non-directory ${destShown} with directory ${srcShown}`);
@@ -11873,13 +11870,9 @@
     // src's parent or the root.
     let destParent = path.dirname(destShown);
     while (path.dirname(srcShown) !== destParent && path.dirname(destParent) !== destParent) {
-      let same;
-      try {
-        same = cpAreIdentical(fs.statSync(src), fs.statSync(path.dirname(destShown)));
-      } catch (e) {
-        break;
-      }
-      if (same) throw self();
+      const parent = path.dirname(destShown);
+      if (!fs.existsSync(src) || !fs.existsSync(parent)) break;
+      if (cpSamePath(src, parent, true)) throw self();
       destParent = path.dirname(destParent);
     }
     if (srcIsDir && !recursive) throw cpDirWithoutRecursive(src);
@@ -12070,12 +12063,21 @@
   // an error (`errorOnExist`), or kept; a link is made anew pointing at
   // its target's absolute path (or, with `verbatimSymlinks`, at the same
   // text); a directory is made if missing and never given a mode; anything
-  // else (a socket, a FIFO, a device) is passed over.
+  // else (a socket, a FIFO, a device) is passed over. On Windows a link is
+  // a symlink alone, as MSVC's std::filesystem has it: a junction (or any
+  // other reparse point) is what it leads to, so a junction to a directory
+  // is copied as a directory.
+  //
+  // Walked with a stack of its own, in the C++'s order (each directory's
+  // entries in turn, a subdirectory's whole tree before the next entry), so
+  // a deep tree costs no JS or native stack.
+  const IO_REPARSE_TAG_SYMLINK = 0xa000000c;
   function cpSyncCopyDir(src, dest, opts) {
     src = cpString(src);
     dest = cpString(dest);
     const fs = registry.get("fs");
     const path = registry.get("path");
+    const isWin = process.platform === "win32";
     try {
       fs.mkdirSync(dest, { recursive: true });
     } catch (e) {
@@ -12088,10 +12090,19 @@
         return null;
       }
     };
-    const copyContents = (from, to) => {
-      const toShown = cpNs(to);
+    // std::filesystem's is_symlink: on Windows a symlink's reparse tag.
+    const isLink = (p, lstat) => {
+      if (lstat === null || !lstat.isSymbolicLink()) return false;
+      if (!isWin) return true;
+      try {
+        return globalThis.__oam.node.fsStatSync(p, true).reparseTag === IO_REPARSE_TAG_SYMLINK;
+      } catch (e) {
+        return true;
+      }
+    };
+    const namesOf = (dir) => {
       // Raw order: std::filesystem's directory iterator never sorts.
-      const listing = fs.opendirSync(from);
+      const listing = fs.opendirSync(dir);
       const names = [];
       try {
         let dirent;
@@ -12099,104 +12110,148 @@
       } finally {
         listing.closeSync();
       }
-      for (const name of names) {
-        const entry = { name };
-        const entryPath = path.join(from, entry.name);
-        const destFile = path.join(to, entry.name);
-        const linkStat = statOrNull(entryPath, false);
-        if (linkStat !== null && linkStat.isSymbolicLink()) {
-          if (opts.verbatimSymlinks) {
-            try {
-              const target = fs.readlinkSync(entryPath);
-              const followed = statOrNull(entryPath, true);
-              fs.symlinkSync(target, destFile, followed !== null && followed.isDirectory() ? "dir" : "file");
-            } catch (e) {
-              throw cpStdErrorOf(e, "cp", toShown);
-            }
-            continue;
-          }
-          let target;
+      return names;
+    };
+    const copyLink = (from, to, entryPath, destFile) => {
+      const toShown = cpNs(to);
+      const followed = statOrNull(entryPath, true);
+      const type = followed !== null && followed.isDirectory() ? "dir" : "file";
+      if (opts.verbatimSymlinks) {
+        try {
+          fs.symlinkSync(fs.readlinkSync(entryPath), destFile, type);
+        } catch (e) {
+          throw cpStdErrorOf(e, "cp", toShown);
+        }
+        return;
+      }
+      let target;
+      try {
+        target = fs.readlinkSync(entryPath);
+      } catch (e) {
+        throw cpStdErrorOf(e, "cp", toShown);
+      }
+      if (statOrNull(destFile, true) !== null) {
+        if (isLink(destFile, statOrNull(destFile, false))) {
+          let current;
           try {
-            target = fs.readlinkSync(entryPath);
+            current = fs.readlinkSync(destFile);
           } catch (e) {
             throw cpStdErrorOf(e, "cp", toShown);
           }
-          if (statOrNull(destFile, true) !== null) {
-            const destLink = statOrNull(destFile, false);
-            if (destLink !== null && destLink.isSymbolicLink()) {
-              let current;
-              try {
-                current = fs.readlinkSync(destFile);
-              } catch (e) {
-                throw cpStdErrorOf(e, "cp", toShown);
-              }
-              // As the C++ judges it: the link's text taken from the
-              // working directory.
-              const targetStat = statOrNull(target, true);
-              if (!opts.dereference && targetStat !== null && targetStat.isDirectory() && cpIsInsideDir(target, current)) {
-                throw makeNodeError("ERR_FS_CP_EINVAL", `Cannot copy ${target} to a subdirectory of self ${current}`);
-              }
-              const destFollowed = statOrNull(destFile, true);
-              if (destFollowed !== null && destFollowed.isDirectory() && cpIsInsideDir(current, target)) {
-                throw makeNodeError("ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY", `cannot overwrite ${current} with ${target}`);
-              }
-              // A link is replaced even under `force: false`, as node's is.
-              try {
-                fs.unlinkSync(destFile);
-              } catch (e) {
-                throw cpStdErrorOf(e, "cp", toShown);
-              }
-            } else {
-              const destFollowed = statOrNull(destFile, true);
-              if (destFollowed !== null && destFollowed.isFile() &&
-                  (!opts.dereference || (!opts.force && opts.errorOnExist))) {
-                throw cpStdError("EEXIST", "cp", cpNs(destFile));
-              }
-            }
+          // As the C++ judges it: the link's text taken from the working
+          // directory.
+          const targetStat = statOrNull(target, true);
+          if (!opts.dereference && targetStat !== null && targetStat.isDirectory() && cpIsInsideDir(target, current)) {
+            throw makeNodeError("ERR_FS_CP_EINVAL", `Cannot copy ${target} to a subdirectory of self ${current}`);
           }
-          const absolute = cpWeaklyCanonical(path.resolve(from, target));
-          const followed = statOrNull(entryPath, true);
+          const destFollowed = statOrNull(destFile, true);
+          if (destFollowed !== null && destFollowed.isDirectory() && cpIsInsideDir(current, target)) {
+            throw makeNodeError("ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY", `cannot overwrite ${current} with ${target}`);
+          }
+          // A link is replaced even under `force: false`, as node's is.
           try {
-            fs.symlinkSync(absolute, destFile, followed !== null && followed.isDirectory() ? "dir" : "file");
+            fs.unlinkSync(destFile);
           } catch (e) {
             throw cpStdErrorOf(e, "cp", toShown);
           }
-        } else if (linkStat !== null && linkStat.isDirectory()) {
-          const there = statOrNull(destFile, true);
-          if (there === null) {
-            try {
-              fs.mkdirSync(destFile);
-            } catch (e) {
-              throw cpStdErrorOf(e, "cp", cpNs(destFile));
-            }
-          } else if (!there.isDirectory()) {
-            // node's C++ does not catch this one, and aborts.
+        } else {
+          const destFollowed = statOrNull(destFile, true);
+          if (destFollowed !== null && destFollowed.isFile() &&
+              (!opts.dereference || (!opts.force && opts.errorOnExist))) {
             throw cpStdError("EEXIST", "cp", cpNs(destFile));
           }
-          copyContents(entryPath, destFile);
-        } else if (linkStat !== null && linkStat.isFile()) {
-          const there = statOrNull(destFile, true);
-          if (there !== null) {
-            if (!there.isFile()) throw cpStdError(there.isDirectory() ? "ENOTSUP" : "EEXIST", "cp", toShown);
-            if (opts.force) {
-              // overwrite_existing
-            } else if (opts.errorOnExist) {
-              throw makeNodeError("ERR_FS_CP_EEXIST",
-                `[ERR_FS_CP_EEXIST]: Target already exists: cp returned EEXIST (${cpNs(destFile)} already exists)`);
-            } else {
-              continue; // skip_existing
-            }
-          }
-          try {
-            fs.copyFileSync(entryPath, destFile);
-          } catch (e) {
-            throw cpStdErrorOf(e, "cp", toShown);
-          }
-          if (opts.preserveTimestamps) cpSyncCopyUtimes(entryPath, destFile);
         }
       }
+      try {
+        fs.symlinkSync(cpWeaklyCanonical(path.resolve(from, target)), destFile, type);
+      } catch (e) {
+        throw cpStdErrorOf(e, "cp", toShown);
+      }
     };
-    copyContents(src, dest);
+    // std::filesystem::copy_file with the copy's options: a regular file
+    // there is the same file (EEXIST, whatever the options), kept, an error
+    // or overwritten; anything else there is ENOTSUP. The times are copied
+    // after any copy_file that did not fail -- a file kept too.
+    const copyRegular = (to, entryPath, destFile) => {
+      const there = statOrNull(destFile, true);
+      let copy = true;
+      if (there !== null) {
+        if (!there.isFile()) throw cpStdError("ENOTSUP", "cp", cpNs(to));
+        const exists = () => makeNodeError("ERR_FS_CP_EEXIST",
+          `[ERR_FS_CP_EEXIST]: Target already exists: cp returned EEXIST (${cpNs(destFile)} already exists)`);
+        if (cpSamePath(entryPath, destFile, true)) throw exists();
+        if (!opts.force) {
+          if (opts.errorOnExist) throw exists();
+          copy = false; // skip_existing
+        }
+      }
+      if (copy) {
+        try {
+          fs.copyFileSync(entryPath, destFile);
+        } catch (e) {
+          throw cpStdErrorOf(e, "cp", cpNs(to));
+        }
+      }
+      if (opts.preserveTimestamps) cpSyncCopyUtimes(entryPath, destFile);
+    };
+    const stack = [{ from: src, to: dest, names: namesOf(src), at: 0 }];
+    while (stack.length > 0) {
+      const top = stack[stack.length - 1];
+      if (top.at === top.names.length) {
+        stack.pop();
+        continue;
+      }
+      const name = top.names[top.at++];
+      const entryPath = path.join(top.from, name);
+      const destFile = path.join(top.to, name);
+      const lstat = statOrNull(entryPath, false);
+      if (isLink(entryPath, lstat)) {
+        copyLink(top.from, top.to, entryPath, destFile);
+        continue;
+      }
+      // What it is, through a junction or other reparse point on Windows.
+      const kind = lstat !== null && lstat.isSymbolicLink() ? statOrNull(entryPath, true) : lstat;
+      if (kind !== null && kind.isDirectory()) {
+        const there = statOrNull(destFile, true);
+        if (there === null) {
+          try {
+            fs.mkdirSync(destFile);
+          } catch (e) {
+            throw cpStdErrorOf(e, "cp", cpNs(destFile));
+          }
+        } else if (!there.isDirectory()) {
+          // node's C++ does not catch this one, and aborts.
+          throw cpStdError("EEXIST", "cp", cpNs(destFile));
+        }
+        stack.push({ from: entryPath, to: destFile, names: namesOf(entryPath), at: 0 });
+      } else if (kind !== null && kind.isFile()) {
+        copyRegular(top.to, entryPath, destFile);
+      }
+    }
+  }
+
+  // Whether `a` (followed or not) and `b` (likewise) are one file, exactly.
+  function cpSameAs(a, followA, b, followB) {
+    try {
+      const idOf = (p, follow) => globalThis.__oam.node.fsStatSync(cpString(p), !follow).fileId;
+      const id = idOf(a, followA);
+      return id !== undefined && id === idOf(b, followB);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Whether two paths name the same file (std::filesystem::equivalent; with
+  // `follow`, through links): by exact file identity, which a stat's `dev`
+  // and `ino` as numbers are not once an NTFS file ID passes 2^53.
+  function cpSamePath(a, b, follow) {
+    try {
+      const idOf = (p) => globalThis.__oam.node.fsStatSync(cpString(p), !follow).fileId;
+      const id = idOf(a);
+      return id !== undefined && id === idOf(b);
+    } catch (e) {
+      return false;
+    }
   }
 
   function cpSyncLink(destStat, src, dest, verbatimSymlinks) {
@@ -13928,8 +13983,9 @@
       // opendir is the one whose callback node validates as "callback".
       opendir: callbackify1(promises.opendir, 1, 1, "callback"),
       // node's fs.cp: the callback, the options and the paths are checked
-      // in the call, which throws; the copy answers through the callback
-      // (util.callbackify's: a later tick, `(null, undefined)` or the error).
+      // in the call, which throws; the copy answers through the callback, as
+      // node's util.callbackify(cpFn) does -- a later tick, `(null, undefined)`
+      // or the error, a falsy rejection made ERR_FALSY_VALUE_REJECTION.
       cp: function cp(src, dest, options, callback) {
         if (typeof options === "function") {
           callback = options;
@@ -13939,10 +13995,8 @@
         const opts = validateCpOptions(options);
         const from = cpPathArg(src, "src");
         const to = cpPathArg(dest, "dest");
-        cpAsync(from, to, opts).then(
-          (value) => process.nextTick(callback, null, value),
-          (err) => process.nextTick(callback, err),
-        );
+        cpCallbackified ??= registry.get("util").callbackify(cpAsync);
+        cpCallbackified(from, to, opts, callback);
       },
       exists: (path, cb) => {
         // Deprecated single-arg callback shape, still in the wild. A path

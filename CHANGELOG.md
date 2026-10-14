@@ -26,7 +26,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   did nothing. The copies are now node v22.22.2's, ported: the options are checked as node checks
   them, links are copied as links (absolute, or verbatim), and the errors are node's
   (`ERR_FS_CP_EEXIST`, `ERR_INCOMPATIBLE_OPTION_PAIR`, a promise from cpSync's `filter`). A
-  directory symlink inside the tree no longer stops `cpSync`. Where node's cpSync fails by its
+  directory symlink inside the tree no longer stops `cpSync`, and a junction is copied as the
+  directory it leads to, as node does. On Windows `fs.unlink` removes a directory symlink or
+  junction, as libuv does, where it failed `EPERM`. Where node's cpSync fails by its
   platform's std::filesystem, or aborts, oam fails as node does on Linux; see
   docs/node-divergences.md.
 - **A `SystemError` code is an instance of its own `NodeError` class, as node's is (#288).**

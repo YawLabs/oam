@@ -3737,7 +3737,7 @@ call fails `EPERM` and node's succeeds. Measured against v22.22.2 (conformance c
 ### `fs.cpSync` where node's C++ fails by its platform's std::filesystem
 
 `fs.cpSync` of a directory with no `filter` runs in node's C++ (`CpSyncCopyDir`), over
-std::filesystem. Three of its failures come out of the C++ library rather than node, so they
+std::filesystem. Four of its failures come out of the C++ library rather than node, so they
 differ by platform. oam fails each as node does on Linux (libstdc++), on every platform:
 
 - **`errorOnExist` with a file already there** (`force: false`). On Linux, a plain Error,
@@ -3747,6 +3747,10 @@ differ by platform. oam fails each as node does on Linux (libstdc++), on every p
   `, The file exists. '<dir>'`.
 - **A file copied where a directory is.** On Linux `ENOTSUP, Operation not supported '<dir>'`.
   On Windows `EIO, Access is denied. '<dir>'`.
+- **A file already there that is the same file** (a hard link to the source). On Linux
+  `ERR_FS_CP_EEXIST`, as for `errorOnExist`, whatever `force` says. On Windows MSVC reports a
+  sharing violation, `EPIPE` 32 `The process cannot access the file because it is being used
+  by another process.`, or with `errorOnExist` the errno-80 error above.
 - **A directory copied where a file is.** node does not catch std::filesystem's exception
   and the process aborts (`SIGABRT` on Linux, `0xC0000409` on Windows). oam fails
   `EEXIST, File exists '<path>'` (`syscall` `cp`), the shape of node's other

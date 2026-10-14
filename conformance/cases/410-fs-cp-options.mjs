@@ -132,10 +132,60 @@ S("dir with a link dereferenced", (b) => { dir(b); fs.symlinkSync("a", b + "/s/l
 S("link over a link", (b) => { W(b + "/t", "T"); W(b + "/u", "U"); fs.symlinkSync("t", b + "/s"); fs.symlinkSync("u", b + "/d"); }, "s", "d",
   { force: false }, { links: true });
 S("dir link", (b) => { dir(b); fs.symlinkSync("s", b + "/l", "dir"); }, "l", "d", { recursive: true }, { links: true });
+S("preserveTimestamps on a file kept", (b) => { W(b + "/s/a", "A"); fs.utimesSync(b + "/s/a", 1000, 2000); W(b + "/d/a", "OLD"); fs.utimesSync(b + "/d/a", 5000, 6000); },
+  "s", "d", { recursive: true, force: false, preserveTimestamps: true }, { times: "d/a" });
+S("link over a dir link", (b) => { W(b + "/t", "T"); fs.mkdirSync(b + "/u"); fs.symlinkSync("t", b + "/s"); fs.symlinkSync("u", b + "/d", "dir"); },
+  "s", "d", undefined, { links: true });
+S("dir with a dir link, twice", (b) => { W(b + "/s/real/x", "X"); fs.symlinkSync("real", b + "/s/dl", "dir"); fs.cpSync(b + "/s", b + "/d", { recursive: true }); },
+  "s", "d", { recursive: true }, { links: true, skip: ["promise", "callback"] });
 S("dir link dereferenced", (b) => { dir(b); fs.symlinkSync("s", b + "/l", "dir"); }, "l", "d", { recursive: true, dereference: true }, { links: true });
 
 let n = 0;
 try {
+  // A junction (Windows): cpSync copies it as the directory it leads to.
+  // Made with mklink, which both runtimes see the same way.
+  if (process.platform === "win32") {
+    const b = path.join(root, "junction");
+    W(b + "/s/real/x", "X");
+    const made = (await import("node:child_process")).spawnSync("cmd", ["/c", "mklink", "/J", path.join(b, "s", "jl"), path.join(b, "s", "real")]);
+    if (made.status === 0) {
+      process.chdir(b);
+      for (const dest of ["o", "o"]) {
+        try {
+          fs.cpSync("s", dest, { recursive: true });
+          console.log("junction [sync]", "ok ||", tree("o"));
+        } catch (e) {
+          console.log("junction [sync]", errStr(e));
+        }
+      }
+      process.chdir(home);
+    } else {
+      console.log("junction: mklink failed");
+    }
+  } else {
+    console.log("junction: Windows only");
+  }
+  // unlink of a directory link removes the link, as libuv's does.
+  if (links) {
+    const b = path.join(root, "unlink");
+    fs.mkdirSync(path.join(b, "u"), { recursive: true });
+    fs.symlinkSync(path.join(b, "u"), path.join(b, "l"), "dir");
+    try {
+      fs.unlinkSync(path.join(b, "l"));
+      console.log("unlinkSync of a dir link: ok", fs.existsSync(path.join(b, "u")), fs.existsSync(path.join(b, "l")));
+    } catch (e) {
+      console.log("unlinkSync of a dir link:", errStr(e));
+    }
+  }
+  // A falsy rejection reaches fs.cp's callback as ERR_FALSY_VALUE_REJECTION.
+  {
+    const b = path.join(root, "falsy");
+    W(b + "/s/a", "A");
+    for (const [label, filter] of [["throws undefined", () => { throw undefined; }], ["rejects null", () => Promise.reject(null)]]) {
+      const args = await new Promise((r) => fs.cp(path.join(b, "s"), path.join(b, "d"), { recursive: true, filter }, (...a) => r(a)));
+      console.log("filter", label, "[callback]", args.length, args[0] && args[0].code, args[0] && args[0].reason);
+    }
+  }
   for (const sc of scenarios) {
     for (const [form, run] of Object.entries(forms)) {
       if (sc.skip?.includes(form)) continue;

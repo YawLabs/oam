@@ -4549,6 +4549,21 @@ pub fn check_access(path: &FsPath, mode: i32) -> Result<(), (String, String, Opt
     Ok(())
 }
 
+/// unlink as libuv's: a file, or on Windows a directory symlink or junction
+/// -- a link, which fs__unlink removes as one -- but never a directory. std's
+/// remove_file refuses a directory link EPERM, and node's fs.cp replaces one
+/// (#390).
+pub fn unlink_path(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink_dir()) {
+            return std::fs::remove_dir(path);
+        }
+    }
+    std::fs::remove_file(path)
+}
+
 /// rm with Node semantics: file or directory, optional recursion.
 pub fn remove_path(path: &str, recursive: bool) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
@@ -5343,6 +5358,10 @@ pub mod ops {
         blocks: u64,
         /// Inode-change time in ms, or None if it could not be read.
         ctime_ms: Option<f64>,
+        /// A Windows reparse point's tag, read for an lstat of one (a
+        /// symlink is IO_REPARSE_TAG_SYMLINK, a junction
+        /// IO_REPARSE_TAG_MOUNT_POINT); None everywhere else.
+        reparse_tag: Option<u32>,
     }
 
     #[cfg(unix)]
@@ -5360,6 +5379,7 @@ pub mod ops {
             // st_ctim is the inode-change time and is NOT mtime: chmod moves it
             // and leaves mtime alone.
             ctime_ms: Some(meta.ctime() as f64 * 1000.0 + meta.ctime_nsec() as f64 / 1_000_000.0),
+            reparse_tag: None,
         })
     }
 
@@ -5371,39 +5391,69 @@ pub mod ops {
         ticks as f64 / TICKS_PER_MS - EPOCH_DIFFERENCE_MS
     }
 
-    /// A handle's FILE_STANDARD_INFO, or why it has none: a device that
-    /// keeps no file information (a console) fails ERROR_INVALID_FUNCTION.
+    /// The information classes [`file_info`] reads: each is the struct
+    /// GetFileInformationByHandleEx fills for its `CLASS`, which is what
+    /// makes the one call sound for every implementor. Private, so no other
+    /// pairing can be made.
     #[cfg(windows)]
-    fn standard_info(
-        file: &std::fs::File,
-    ) -> std::io::Result<windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO> {
+    trait FileInfoClass: Default {
+        const CLASS: windows_sys::Win32::Storage::FileSystem::FILE_INFO_BY_HANDLE_CLASS;
+    }
+    #[cfg(windows)]
+    impl FileInfoClass for windows_sys::Win32::Storage::FileSystem::FILE_BASIC_INFO {
+        const CLASS: windows_sys::Win32::Storage::FileSystem::FILE_INFO_BY_HANDLE_CLASS =
+            windows_sys::Win32::Storage::FileSystem::FileBasicInfo;
+    }
+    #[cfg(windows)]
+    impl FileInfoClass for windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO {
+        const CLASS: windows_sys::Win32::Storage::FileSystem::FILE_INFO_BY_HANDLE_CLASS =
+            windows_sys::Win32::Storage::FileSystem::FileStandardInfo;
+    }
+    #[cfg(windows)]
+    impl FileInfoClass for windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TAG_INFO {
+        const CLASS: windows_sys::Win32::Storage::FileSystem::FILE_INFO_BY_HANDLE_CLASS =
+            windows_sys::Win32::Storage::FileSystem::FileAttributeTagInfo;
+    }
+
+    /// A handle's information of class `T`, or why it has none: a device
+    /// that keeps no file information (a console) fails
+    /// ERROR_INVALID_FUNCTION.
+    #[cfg(windows)]
+    fn file_info<T: FileInfoClass>(file: &std::fs::File) -> std::io::Result<T> {
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
-        };
-        let mut standard = FILE_STANDARD_INFO::default();
-        // SAFETY: `file` owns its handle for the whole call, and `standard` is
-        // a writable FILE_STANDARD_INFO of exactly the size passed.
+        use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
+        let mut out = T::default();
+        // SAFETY: `file` owns its handle for the whole call, and `out` is a
+        // writable T of exactly the size passed -- the struct the API fills
+        // for T::CLASS (FileInfoClass pairs them).
         let ok = unsafe {
             GetFileInformationByHandleEx(
                 file.as_raw_handle().cast::<std::ffi::c_void>(),
-                FileStandardInfo,
-                (&mut standard as *mut FILE_STANDARD_INFO).cast(),
-                std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+                T::CLASS,
+                (&mut out as *mut T).cast(),
+                std::mem::size_of::<T>() as u32,
             )
         };
         if ok == 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(standard)
+        Ok(out)
+    }
+
+    /// A handle's FILE_STANDARD_INFO ([`file_info`]).
+    #[cfg(windows)]
+    fn standard_info(
+        file: &std::fs::File,
+    ) -> std::io::Result<windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO> {
+        file_info(file)
     }
 
     #[cfg(windows)]
     fn stat_extras(meta: &std::fs::Metadata, source: StatSource<'_>) -> Option<StatExtras> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle,
-            GetFileInformationByHandleEx,
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+            FILE_BASIC_INFO, GetFileInformationByHandle,
         };
 
         let opened;
@@ -5435,20 +5485,22 @@ pub mod ops {
         let blocks =
             standard_info(file).map_or(0, |standard| (standard.AllocationSize as u64) >> 9);
 
-        let mut basic = FILE_BASIC_INFO::default();
-        // SAFETY: as above.
-        let ctime_ms = if unsafe {
-            GetFileInformationByHandleEx(
-                handle,
-                FileBasicInfo,
-                (&mut basic as *mut FILE_BASIC_INFO).cast(),
-                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
-            )
-        } != 0
-        {
-            Some(filetime_to_ms(basic.ChangeTime))
-        } else {
-            None
+        let basic = file_info::<FILE_BASIC_INFO>(file).ok();
+        let ctime_ms = basic.map(|basic| filetime_to_ms(basic.ChangeTime));
+        // An lstat of a reparse point (the handle was opened on the point
+        // itself): which kind it is. fs.cpSync copies a junction as the
+        // directory it leads to, a symlink as a link, as node's MSVC
+        // std::filesystem tells them apart (#390).
+        let reparse_tag = match (source, basic) {
+            (StatSource::Path(_), Some(basic))
+                if meta.is_symlink()
+                    && basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 =>
+            {
+                file_info::<FILE_ATTRIBUTE_TAG_INFO>(file)
+                    .ok()
+                    .map(|tag| tag.ReparseTag)
+            }
+            _ => None,
         };
 
         Some(StatExtras {
@@ -5463,6 +5515,7 @@ pub mod ops {
             blksize: 4096,
             blocks,
             ctime_ms,
+            reparse_tag,
         })
     }
 
@@ -5738,6 +5791,16 @@ pub mod ops {
                 ("blocks", extras.blocks),
             ] {
                 fields.insert(name.to_string(), value.into());
+            }
+            // The file's identity exactly, which `dev` and `ino` as JSON
+            // numbers are not past 2^53 -- NTFS file IDs often are. Internal
+            // (Stats copies the fields it knows): fs.cp's same-file checks.
+            fields.insert(
+                "fileId".to_string(),
+                format!("{}:{}", extras.dev, extras.ino).into(),
+            );
+            if let Some(tag) = extras.reparse_tag {
+                fields.insert("reparseTag".to_string(), tag.into());
             }
         }
         payload.to_string()
@@ -6165,7 +6228,11 @@ pub mod ops {
     }
 
     pub async fn fs_unlink(path: super::FsPath) -> OpOutcome {
-        match tokio::fs::remove_file(&path).await {
+        let target = path.as_ref().to_path_buf();
+        let removed = tokio::task::spawn_blocking(move || super::unlink_path(&target))
+            .await
+            .unwrap_or_else(|joined| Err(std::io::Error::other(joined)));
+        match removed {
             Ok(()) => OpOutcome::Done,
             Err(e) => node_fail(e, "unlink", &path),
         }
@@ -9434,5 +9501,36 @@ mod op_outcome_serde_tests {
             }
             other => panic!("expected SocketClosed, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod unlink_path_tests {
+    /// libuv's unlink removes a directory link (on Windows a directory
+    /// symlink, which std's remove_file refuses EPERM) and leaves its target,
+    /// but refuses a real directory (#390).
+    #[test]
+    fn unlink_removes_a_directory_link_but_not_a_directory() {
+        let dir = std::env::temp_dir().join(format!("oam-unlink-{}", std::process::id()));
+        let target = dir.join("u");
+        let link = dir.join("l");
+        std::fs::create_dir_all(&target).unwrap();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(&target, &link);
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&target, &link);
+        if made.is_ok() {
+            super::unlink_path(&link).unwrap();
+            assert!(
+                std::fs::symlink_metadata(&link).is_err(),
+                "the link is gone"
+            );
+            assert!(target.is_dir(), "its target is not");
+        }
+        assert!(
+            super::unlink_path(&target).is_err(),
+            "a directory is no file to unlink"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
