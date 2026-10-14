@@ -82,14 +82,23 @@ for (const [label, target, flag] of [["file", big, "r"], ["empty file", empty, "
     await handle.close();
   }
 }
-// What is appended after the read began is not part of it.
+// What is appended while a read is under way: the read goes up to the size
+// the file had when its fstat ran, and the next one takes the rest. Which
+// side of that fstat a same-tick append lands on is a race between the main
+// thread and the pool, in node as here (node split it the other way 1 time
+// in 25 under load), so what is printed is what holds either way: the two
+// reads between them give the whole file once, in order.
 {
   const growing = path.join(made, "growing");
   fs.writeFileSync(growing, "0123456789");
   const handle = await fs.promises.open(growing, "r");
   const reading = answer(handle.readFile("utf8"));
   fs.appendFileSync(growing, "ABCDE");
-  console.log("appended in the same tick | " + (await reading) + " | then " + (await answer(handle.readFile("utf8"))));
+  const first = await reading;
+  const second = await answer(handle.readFile("utf8"));
+  const split = [first, second].join(" + ");
+  const whole = ['string "0123456789" + string "ABCDE"', 'string "0123456789ABCDE" + string ""'];
+  console.log("appended in the same tick | " + (whole.includes(split) ? "the whole file, once" : split));
   await handle.close();
   // An empty file has no size to read up to: it is read to its end.
   const grown = path.join(made, "grown");
