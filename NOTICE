@@ -84,7 +84,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 Node.js
 ================================================================================
 
-oam vendors Node.js in two separate places, both under the MIT license.
+oam carries Node.js code in three places, all under the MIT license.
 Copyright Node.js contributors; portions copyright Joyent, Inc. and other Node
 contributors (per-file headers retained in the vendored sources). Like V8's,
 this notice is hand-maintained: neither tree is a cargo dependency, so neither
@@ -100,8 +100,18 @@ can be collected by `cargo about`.
      the node-suite conformance harness. Node's own LICENSE ships alongside it
      at conformance/vendor/node/LICENSE; provenance is in the README there.
 
-The full MIT text is reproduced in THIRD_PARTY_LICENSES.md ("Node.js" section)
-and at conformance/vendor/node/LICENSE.
+  3. js/node_compat.js (and the other js/ sources of oam's Node API) --
+     SHIPPED IN THE BINARY. Not vendored files but ports: parts of oam's Node
+     API are Node.js's own lib/ code rewritten for oam, each marked by a
+     comment naming the Node.js source it follows -- among them the fs copy
+     (lib/internal/fs/cp/cp.js and cp-sync.js, with lib/internal/fs/utils.js's
+     option checks) and the error classes of lib/internal/errors.js. Node.js's
+     fs copy is itself a modified version of node-fs-extra's, MIT licensed,
+     Copyright (c) 2011-2017 JP Richardson.
+
+The full MIT texts, Node.js's and node-fs-extra's, are reproduced in
+THIRD_PARTY_LICENSES.md ("Node.js" section) and at
+conformance/vendor/node/LICENSE.
 
 ================================================================================
 web-platform-tests
