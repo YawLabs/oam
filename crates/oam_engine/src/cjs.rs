@@ -185,6 +185,115 @@ pub(crate) fn produce_cjs_code_cache(
     wrapper.create_code_cache().map(|cd| cd.to_vec())
 }
 
+/// node's containsModuleSyntax (src/node_contextify.cc, v22.22.2): whether
+/// node runs a file it has no declared type for as an ES module. The source
+/// is compiled as node's CommonJS wrapper; if that compiles it is CommonJS.
+/// If it fails on syntax only a module has (an import or export statement,
+/// import.meta) it is a module; if it fails on what only the wrapper forbids
+/// (a top-level declaration of require, module, exports, __filename or
+/// __dirname, a top-level await, or what a top-level await inside an
+/// expression reads as to a function body) it is a module when it compiles as
+/// one. Any other failure leaves it CommonJS. Only the answer is used: the
+/// error node would then report is not (oam runs the entry as a module
+/// either way). The exception is caught here.
+pub(crate) fn contains_module_syntax(
+    scope: &mut v8::PinScope<'_, '_>,
+    source: &str,
+    name: &str,
+) -> bool {
+    const ESM_SYNTAX_ERROR_MESSAGES: [&str; 3] = [
+        "Cannot use import statement outside a module",
+        "Unexpected token 'export'",
+        "Cannot use 'import.meta' outside a module",
+    ];
+    const THROWS_ONLY_IN_CJS_ERROR_MESSAGES: [&str; 6] = [
+        "Identifier 'module' has already been declared",
+        "Identifier 'exports' has already been declared",
+        "Identifier 'require' has already been declared",
+        "Identifier '__filename' has already been declared",
+        "Identifier '__dirname' has already been declared",
+        "await is only valid in async functions and the top level bodies of modules",
+    ];
+    // node's maybe_top_level_await_errors: `console.log(await 1)` or
+    // `if (await x)` read as a call or a token out of place to a function.
+    const MAYBE_TOP_LEVEL_AWAIT_ERRORS: [&str; 2] =
+        ["missing ) after argument list", "SyntaxError: Unexpected"];
+    // node's GetCJSParameters: the wrapper's five names. oam's own wrapper
+    // adds `global`, which would make a top-level `const global` fail here
+    // where node's does not.
+    const NODE_CJS_PARAMS: [&str; 5] = ["exports", "require", "module", "__filename", "__dirname"];
+    let source = strip_shebang(source.to_string());
+    v8::tc_scope!(let tc, scope);
+    let (Some(code), Some(resource)) = (v8::String::new(tc, &source), v8::String::new(tc, name))
+    else {
+        return false;
+    };
+    let as_cjs = v8::ScriptOrigin::new(
+        tc,
+        resource.into(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        false,
+        false,
+        /* is_module */ false,
+        None,
+    );
+    let mut compiler_source = v8::script_compiler::Source::new(code, Some(&as_cjs));
+    let params: Vec<v8::Local<v8::String>> = NODE_CJS_PARAMS
+        .iter()
+        .filter_map(|p| v8::String::new(tc, p))
+        .collect();
+    let compiled = v8::script_compiler::compile_function(
+        tc,
+        &mut compiler_source,
+        &params,
+        &[],
+        v8::script_compiler::CompileOptions::NoCompileOptions,
+        v8::script_compiler::NoCacheReason::NoReason,
+    );
+    if compiled.is_some() {
+        return false;
+    }
+    let message = tc
+        .message()
+        .map(|m| m.get(tc).to_rust_string_lossy(tc))
+        .unwrap_or_default();
+    tc.reset();
+    if ESM_SYNTAX_ERROR_MESSAGES
+        .iter()
+        .any(|m| message.contains(m))
+    {
+        return true;
+    }
+    let maybe_valid_in_esm = THROWS_ONLY_IN_CJS_ERROR_MESSAGES
+        .iter()
+        .chain(MAYBE_TOP_LEVEL_AWAIT_ERRORS.iter())
+        .any(|m| message.contains(m));
+    if !maybe_valid_in_esm {
+        return false;
+    }
+    let as_module = v8::ScriptOrigin::new(
+        tc,
+        resource.into(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        false,
+        false,
+        /* is_module */ true,
+        None,
+    );
+    let mut module_source = v8::script_compiler::Source::new(code, Some(&as_module));
+    let module = v8::script_compiler::compile_module(tc, &mut module_source);
+    tc.reset();
+    module.is_some()
+}
+
 /// `__oam.requireCjs(path)`: pure cache lookup used by generated ESM
 /// facades. The module was executed during graph load; a miss here is an
 /// internal invariant violation, not a user error.

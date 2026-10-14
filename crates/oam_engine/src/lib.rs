@@ -846,6 +846,13 @@ impl JsRuntime {
     /// prints uncaught exit-handler errors); `process.exit()` inside a handler
     /// still terminates via the native path.
     pub fn emit_process_exit(&mut self) {
+        self.emit_process_exit_after(AfterScript::Microtasks);
+    }
+
+    /// [`Self::emit_process_exit`] with what runs after the emit: on a
+    /// natural exit node drains the promise jobs the 'exit' listeners queue
+    /// (`Microtasks`); past a fatal exception it runs nothing (`Nothing`).
+    pub fn emit_process_exit_after(&mut self, after: AfterScript) {
         // A throw from an 'exit' listener is fatal in Node: it reports the
         // error and exits 1, whatever the handler set exitCode to.
         // Inline the emit (no leaked global): touch process to build it if
@@ -854,7 +861,10 @@ impl JsRuntime {
         // process.exit(); process._exiting is the shared once-guard.
         // IIFE so the locals stay function-scoped: top-level `var` in a classic
         // script would leak onto globalThis (and trip Node common's leak check).
-        if let Err(e) = self.execute_script(
+        // node emits 'exit' and drains the promise jobs its listeners queue,
+        // but never reaches the tick queue again: a nextTick from an 'exit'
+        // listener does not run (#345 review).
+        if let Err(e) = self.execute_script_draining(
             "<process-exit>",
             "(function () { \
                var p = globalThis.__oamProcessRef || globalThis.process; \
@@ -867,6 +877,7 @@ impl JsRuntime {
                  } \
                } \
              })();",
+            after,
         ) {
             eprintln!("{e}");
         }
@@ -874,7 +885,21 @@ impl JsRuntime {
 
     /// Compile and run `source` as a classic script. Returns the stringified
     /// completion value. Exceptions come back as `Err` with script:line info.
+    /// A tick point follows, as after any JS the host runs.
     pub fn execute_script(&mut self, name: &str, source: &str) -> Result<String> {
+        self.execute_script_draining(name, source, AfterScript::TicksAndMicrotasks)
+    }
+
+    /// [`Self::execute_script`] with what runs after it chosen: the host's own
+    /// scripts on the way out run no ticks (node, past a fatal exception or
+    /// the 'exit' emit, never reaches the tick queue again), and read or set
+    /// a value with nothing to drain at all.
+    pub fn execute_script_draining(
+        &mut self,
+        name: &str,
+        source: &str,
+        after: AfterScript,
+    ) -> Result<String> {
         // Plain classic scripts can still call import() -- V8 routes any
         // import() through the host_import callback set on the isolate.
         // Clear any host pointer parked by a prior execute_module so we
@@ -902,13 +927,19 @@ impl JsRuntime {
                 .to_string(tc)
                 .map(|s| s.to_rust_string_lossy(tc))
                 .unwrap_or_default();
-            if let Some(failures) = crate::modules::run_ticks_and_microtasks(tc) {
-                let text = failures
-                    .iter()
-                    .map(|d| d.message.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                return Err(anyhow!("{text}"));
+            match after {
+                AfterScript::TicksAndMicrotasks => {
+                    if let Some(failures) = crate::modules::run_ticks_and_microtasks(tc) {
+                        let text = failures
+                            .iter()
+                            .map(|d| d.message.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        return Err(anyhow!("{text}"));
+                    }
+                }
+                AfterScript::Microtasks => tc.perform_microtask_checkpoint(),
+                AfterScript::Nothing => {}
             }
             if tc.has_caught() {
                 return Err(exception_to_error(tc, name));
@@ -2026,4 +2057,16 @@ mod tests {
             "permissions query module did not complete: {ok}"
         );
     }
+}
+
+/// What [`JsRuntime::execute_script_draining`] runs after the script.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AfterScript {
+    /// A tick point: the nextTick queue, then the microtasks, until both are
+    /// empty.
+    TicksAndMicrotasks,
+    /// A microtask checkpoint alone.
+    Microtasks,
+    /// Nothing.
+    Nothing,
 }

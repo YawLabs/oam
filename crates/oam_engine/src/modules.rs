@@ -97,6 +97,61 @@ pub(crate) struct RejectionLedger {
 /// them to stdout while we exited 0 (review finding). The listener records
 /// the VALUE here so a process 'uncaughtException' listener gets the real
 /// Error; without a listener the event loop fails the run, like Node.
+/// The ES module entry's evaluation promise while the event loop runs it: a
+/// tick point stops at the microtask checkpoint that rejects it. node
+/// reports an entry's throw from inside the drain that resumed it (a
+/// top-level await a timer or an op settled), so the ticks its top level
+/// queued before the throw never run (#345). Cleared once the entry has
+/// settled, so the tick points after that run in full.
+#[derive(Default)]
+pub(crate) struct EntryEvaluation(Option<v8::Global<v8::Promise>>);
+
+/// Whether the parked entry evaluation ([`EntryEvaluation`]) has rejected.
+fn entry_rejected(scope: &mut v8::PinScope<'_, '_>) -> bool {
+    let Some(entry) = scope
+        .get_slot::<EntryEvaluation>()
+        .and_then(|e| e.0.clone())
+    else {
+        return false;
+    };
+    v8::Local::new(scope, &entry).state() == v8::PromiseState::Rejected
+}
+
+/// Whether node would run the entry `path` as an ES module, which decides
+/// when the ticks its top level queues run (#345): declared by extension or
+/// package.json "type" ([`oam_loader::node_declared_module_kind`]), or, for a
+/// typeless file, by node's own test of its syntax
+/// ([`crate::cjs::contains_module_syntax`]). The source node tests is the
+/// file as written -- for TypeScript, the code oam runs, which node's type
+/// stripping matches but for an import whose every name is a type (node keeps
+/// it as `import {} from ...`; oam drops it).
+fn node_runs_as_esm(scope: &mut v8::PinScope<'_, '_>, host: &dyn ModuleHost, path: &Path) -> bool {
+    if let Some(kind) = oam_loader::node_declared_module_kind(path) {
+        return kind == oam_loader::ModuleKind::Esm;
+    }
+    let typescript = matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("ts" | "tsx" | "mts" | "cts")
+    );
+    let source = if typescript {
+        host.load(path).ok()
+    } else {
+        std::fs::read_to_string(path).ok()
+    };
+    source.is_some_and(|source| {
+        crate::cjs::contains_module_syntax(scope, &source, &path.to_string_lossy())
+    })
+}
+
+/// Park (or, with None, clear) the entry evaluation for [`entry_rejected`].
+fn park_entry_evaluation(
+    scope: &mut v8::PinScope<'_, '_>,
+    promise: Option<v8::Local<'_, v8::Promise>>,
+) {
+    let parked = promise.map(|p| v8::Global::new(scope, p));
+    scope.set_slot(EntryEvaluation(parked));
+}
+
 #[derive(Default)]
 pub(crate) struct UncaughtLedger {
     entries: Vec<(v8::Global<v8::Value>, String)>,
@@ -261,6 +316,17 @@ pub(crate) fn dispatch_uncaught(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     exception: v8::Local<v8::Value>,
 ) -> Uncaught {
+    dispatch_uncaught_from(tc, exception, "uncaughtException")
+}
+
+/// [`dispatch_uncaught`] with the `origin` the listeners see: node's
+/// `'unhandledRejection'` for an ES module entry's own throw, which reaches
+/// it as the rejection of the module's evaluation.
+pub(crate) fn dispatch_uncaught_from(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    exception: v8::Local<v8::Value>,
+    origin: &str,
+) -> Uncaught {
     let lookup = (|| {
         let context = tc.get_current_context();
         let global = context.global(tc);
@@ -275,7 +341,10 @@ pub(crate) fn dispatch_uncaught(
         };
     };
     let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
-    match dispatch.call(tc, recv, &[exception]) {
+    let Some(origin) = v8::String::new(tc, origin) else {
+        return Uncaught::Fatal;
+    };
+    match dispatch.call(tc, recv, &[exception, origin.into()]) {
         Some(result) => {
             if result.is_true() {
                 Uncaught::Handled
@@ -525,6 +594,11 @@ pub(crate) fn drain_uncaught(
                 fatal_report(tc, local, frame, &message),
             ));
         }
+        // A fatal throw ends the run here: node exits at it, and nothing
+        // queued since -- a tick, a promise job -- runs (#345 review).
+        if !fatal.is_empty() {
+            break;
+        }
         // Flush what the listeners queued -- explicit policy means nothing
         // else will until the next macrotask boundary. A fatal tick throw
         // from that flush fails the run: merge its report and stop quiescing.
@@ -752,17 +826,46 @@ impl JsRuntime {
             return Err(vec![diag]);
         };
         store_pending_code_cache(tc);
-        if let Some(failure) = run_ticks_and_microtasks(tc) {
-            return Err(failure);
-        }
-        if let Some(failure) = drain_uncaught(tc) {
-            return Err(failure);
-        }
-
         let promise = v8::Local::<v8::Promise>::try_from(value)
             .map_err(|_| rt_diag("OAM-RT0001", "module evaluation did not return a promise"))?;
+        let esm_in_node = node_runs_as_esm(tc, host, &entry);
+        if esm_in_node {
+            // node evaluates an ES module inside a microtask drain (its
+            // loader's promise job), so the promise jobs the module's top
+            // level queued -- and a top-level await they settle -- run
+            // before the tick queue is reached: `process.nextTick` there
+            // runs after them, not ahead (#345). A bare checkpoint first,
+            // then the tick point.
+            tc.perform_microtask_checkpoint();
+            // A promise job in that drain that threw: fatal, it ends the run
+            // before any tick, as node exits at it; handled, it is delivered
+            // before the ticks.
+            if let Some(failure) = drain_uncaught(tc) {
+                return Err(failure);
+            }
+        }
+        // An entry node would run as CommonJS (a typeless file with no
+        // module syntax) keeps CommonJS's order: its ticks first, at the tick
+        // point below, and a synchronous throw reported at once, with
+        // nothing queued run.
 
-        pump_event_loop(tc, Some(promise), true)?;
+        // The entry's own throw -- at its top level, or after a top-level
+        // await the drain settled -- is reported from inside node's drain,
+        // so no tick runs before the uncaughtException ladder does.
+        if promise.state() != v8::PromiseState::Rejected {
+            park_entry_evaluation(tc, Some(promise));
+            let ran = (|| {
+                if let Some(failure) = run_ticks_and_microtasks(tc) {
+                    return Err(failure);
+                }
+                if let Some(failure) = drain_uncaught(tc) {
+                    return Err(failure);
+                }
+                pump_event_loop(tc, Some(promise), true)
+            })();
+            park_entry_evaluation(tc, None);
+            ran?;
+        }
 
         match promise.state() {
             v8::PromiseState::Fulfilled => match unhandled_rejection_failures(tc) {
@@ -780,14 +883,29 @@ impl JsRuntime {
                 // The full ladder, same as the CJS path: monitor -> capture
                 // callback -> listeners. A bare emit here skipped
                 // uncaughtExceptionMonitor entirely and mis-reported a
-                // throwing handler.
-                let (exception, frame) = match dispatch_uncaught(tc, exception) {
+                // throwing handler. node's origin for an ES module's is
+                // 'unhandledRejection': its loader sees the evaluation's
+                // rejection.
+                let origin = if esm_in_node {
+                    "unhandledRejection"
+                } else {
+                    "uncaughtException"
+                };
+                let (exception, frame) = match dispatch_uncaught_from(tc, exception, origin) {
                     Uncaught::Handled => {
                         // A listener suppressed the fatal exit: continue like
                         // a clean run -- drain ticks + microtasks the handler
                         // queued (delivering any fresh throws), pump any
                         // pending timers/ops, then report unhandled
-                        // rejections.
+                        // rejections. For an ES module the handler's
+                        // promise jobs first: in node it runs inside the
+                        // drain, ahead of the ticks.
+                        if esm_in_node {
+                            tc.perform_microtask_checkpoint();
+                            if let Some(failure) = drain_uncaught(tc) {
+                                return Err(failure);
+                            }
+                        }
                         if let Some(failure) = run_ticks_and_microtasks(tc) {
                             return Err(failure);
                         }
@@ -1178,6 +1296,11 @@ impl JsRuntime {
 pub(crate) fn run_ticks_and_microtasks(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
 ) -> Option<Vec<Diagnostic>> {
+    // The entry already rejected: it is reported next, before anything else
+    // runs ([`EntryEvaluation`]).
+    if entry_rejected(tc) {
+        return None;
+    }
     loop {
         let drain = (|| {
             let context = tc.get_current_context();
@@ -1218,7 +1341,7 @@ pub(crate) fn run_ticks_and_microtasks(
             }
         }
         tc.perform_microtask_checkpoint();
-        if !has_pending_ticks(tc) {
+        if !has_pending_ticks(tc) || entry_rejected(tc) {
             return None;
         }
         if !have_drain {
@@ -1443,11 +1566,20 @@ pub(crate) fn pump_event_loop(
             }
             progressed = true;
         }
+        // The entry rejected in that callback's drain (a top-level await it
+        // resumed, then a throw): node reports it from inside the drain, so
+        // no other callback of this turn runs first (#345).
+        if entry_promise.is_some_and(|promise| promise.state() == v8::PromiseState::Rejected) {
+            break;
+        }
 
         // V8's foreground tasks (platform.rs) -- node runs them from its
         // loop's poll phase, each followed by a tick + microtask drain.
         if run_platform_tasks(tc)? {
             progressed = true;
+        }
+        if entry_promise.is_some_and(|promise| promise.state() == v8::PromiseState::Rejected) {
+            break;
         }
 
         if let Some(completion) = tc

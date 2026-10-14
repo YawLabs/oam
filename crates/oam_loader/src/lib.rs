@@ -47,7 +47,7 @@ pub mod transpile_cache;
 pub mod trust;
 mod tsconfig;
 mod warnings;
-pub use npm::{ModuleKind, module_kind, resolve_require};
+pub use npm::{ModuleKind, module_kind, node_declared_module_kind, resolve_require};
 pub use pathutil::fs_os_path;
 pub use warnings::take_warnings;
 

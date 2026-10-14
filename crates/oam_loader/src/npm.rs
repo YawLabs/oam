@@ -807,13 +807,53 @@ pub fn module_kind(path: &Path) -> ModuleKind {
         Some("cjs" | "cts" | "node") => return ModuleKind::Cjs,
         _ => {}
     }
+    // Any "type" but "module" runs as CommonJS here, as oam always has; node
+    // takes a value other than "module" or "commonjs" for none and detects
+    // the syntax (node_declared_module_kind), which for the CommonJS such a
+    // package holds comes to the same.
+    match declared_package_type(path) {
+        Some(PackageType::Module) => return ModuleKind::Esm,
+        Some(PackageType::Commonjs | PackageType::Other) => return ModuleKind::Cjs,
+        None => {}
+    }
     let in_node_modules = path.components().any(|c| c.as_os_str() == "node_modules");
-    let untyped_default = if in_node_modules {
+    if in_node_modules {
         ModuleKind::Cjs
     } else {
         ModuleKind::Esm
-    };
+    }
+}
 
+/// The kind node itself takes a file for before it looks at its syntax:
+/// .mjs/.mts ESM, .cjs/.cts CJS, and otherwise the nearest package.json
+/// "type" -- None for a file with none (a typeless .js/.jsx/.ts/.tsx), the
+/// files node decides by whether their syntax is a module's. oam runs those
+/// as ESM outside node_modules ([`module_kind`]); where the difference is
+/// observable (when nextTick runs, #345) oam follows node's decision.
+pub fn node_declared_module_kind(path: &Path) -> Option<ModuleKind> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("mjs" | "mts") => Some(ModuleKind::Esm),
+        Some("cjs" | "cts" | "node") => Some(ModuleKind::Cjs),
+        _ => match declared_package_type(path) {
+            Some(PackageType::Module) => Some(ModuleKind::Esm),
+            Some(PackageType::Commonjs) => Some(ModuleKind::Cjs),
+            Some(PackageType::Other) | None => None,
+        },
+    }
+}
+
+/// A package.json "type": "module", "commonjs", or another string -- which
+/// node's package.json reader takes for none.
+enum PackageType {
+    Module,
+    Commonjs,
+    Other,
+}
+
+/// The nearest package.json "type" above `path`, up to a node_modules
+/// boundary, or None where the nearest package.json declares none (or there
+/// is none).
+fn declared_package_type(path: &Path) -> Option<PackageType> {
     let mut dir = path.parent();
     while let Some(current) = dir {
         let manifest_path = current.join("package.json");
@@ -825,9 +865,10 @@ pub fn module_kind(path: &Path) -> ModuleKind {
                     .map(str::to_string)
             });
             return match declared.as_deref() {
-                Some("module") => ModuleKind::Esm,
-                Some(_) => ModuleKind::Cjs,
-                None => untyped_default,
+                Some("module") => Some(PackageType::Module),
+                Some("commonjs") => Some(PackageType::Commonjs),
+                Some(_) => Some(PackageType::Other),
+                None => None,
             };
         }
         if current
@@ -838,7 +879,7 @@ pub fn module_kind(path: &Path) -> ModuleKind {
         }
         dir = current.parent();
     }
-    untyped_default
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

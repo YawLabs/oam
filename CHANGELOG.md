@@ -20,6 +20,21 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **At an ES module's top level `process.nextTick` runs after the promise jobs, as in node (#345).**
+  node evaluates an ES module inside a microtask drain, so the promise jobs its top level queues,
+  and the code after a top-level await they settle, run before any tick. oam ran the ticks first.
+  Now the main module's and a worker's match node; CommonJS and timer callbacks were already right.
+  A `.js` or `.ts` file with no package.json "type", which oam runs as an ES module, gets the order
+  node gives it, decided by node's own test of the syntax: an ES module's if the file has an import
+  or export (`export {}` too), a top-level await, `import.meta`, or a top-level declaration of
+  `require`, `module`, `exports`, `__filename` or `__dirname`; CommonJS's if it has none. And no
+  tick runs where node's never does: before the report of an ES module entry that throws, at its top
+  level or after any top-level await (its `uncaughtException` origin is now node's
+  `'unhandledRejection'`), after a fatal microtask throw at an ES module's top level, from an
+  `'exit'` listener, or after the `'exit'` emit of a fatal exit. A top-level await that never
+  settles exits as node's does: code 13 unless `process.exitCode` was set, and the `'exit'`
+  listeners' promise jobs run, where oam exited 1. A module that `import()` loads still runs its top
+  level early (#397).
 - **`fs.cp`, `fs.cpSync` and `fs.promises.cp` honour their options, as node's do (#390).** The copy
   read `recursive` alone. So `force: false` overwrote the file it was asked to keep, `errorOnExist`
   never failed, and `filter`, `dereference`, `verbatimSymlinks`, `preserveTimestamps` and `mode`

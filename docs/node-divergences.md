@@ -3734,6 +3734,30 @@ way; the difference is that a symlink needs the create-symlink privilege (Develo
 an elevated process), which a junction does not, so where that privilege is missing oam's
 call fails `EPERM` and node's succeeds. Measured against v22.22.2 (conformance case 377).
 
+### A module `import()` loads is evaluated inside the import
+
+oam evaluates a module that `import()` loads synchronously, inside its import hook, while the
+importer's frame is still on the stack. node loads and evaluates it in a later job, inside a
+microtask drain. So the imported module's synchronous top level runs before the importer's
+next statement, where in node it runs after the importer's own synchronous code and promise
+jobs, and its `process.nextTick` callbacks run ahead of ticks the importer queued after the
+call. From CommonJS they also run before the importer's continuation: `micro | tick | after
+import` where node prints `micro | after import | tick`. Only an ES module that awaits
+`import()` as its first step lines up with node. Tracked in #397.
+
+An ES module's own top level orders ticks after its promise jobs, as node's does (#345,
+conformance case 411). A `.js` or `.ts` file with no package.json "type" runs as an ES module
+in oam (see the module-kind default), where node decides it by its syntax; for the order of its
+ticks oam decides as node does, by node's containsModuleSyntax test: an import or export
+(`export {}` too), a top-level await, `import.meta`, or a top-level declaration of a name
+CommonJS's wrapper owns make it an ES module's, none a CommonJS file's (ticks first, a
+top-level throw an `'uncaughtException'`). For TypeScript the test sees the code oam runs, which
+drops an import whose every name is a type, where node's stripping keeps it as
+`import {} from ...`: such a file with no other module syntax gets CommonJS's order in oam and
+an ES module's in node. Under `oam test`, though, a test file's `test()` bodies run after the
+file's top-level `process.nextTick` callbacks; under `node --test` they run after its promise
+jobs but before its ticks. oam runs the registered tests once the file's module has run and its
+event loop has drained.
 ### `fs.cpSync` where node's C++ fails by its platform's std::filesystem
 
 `fs.cpSync` of a directory with no `filter` runs in node's C++ (`CpSyncCopyDir`), over
