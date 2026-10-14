@@ -32,6 +32,7 @@
 //! through to a normal compile. Housekeeping is opportunistic and off the
 //! load path: see [`maybe_sweep`].
 
+use oam_diagnostics::own_files::{self, Audience};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once, OnceLock};
@@ -284,9 +285,9 @@ pub(crate) fn record_seed_rejection(key: &CacheKey) {
     forget_seed(key);
     let path = tombstone_path(key);
     if let Some(parent) = path.parent() {
-        let _ = create_cache_dirs(parent);
+        let _ = own_files::create_dir_all(parent, Audience::Kept);
     }
-    let _ = write_cache_file(&path, b"");
+    let _ = own_files::write(&path, b"", Audience::Kept);
 }
 
 /// Load a cached bytecode blob for `key`, if one exists for the current V8
@@ -331,77 +332,6 @@ pub(crate) fn load(key: &CacheKey) -> Option<Loaded> {
     })
 }
 
-/// `create_dir_all` for the cache, with the modes the cache means its
-/// directories to have rather than whatever the process's file mode
-/// creation mask leaves of the default: the mask is the running program's
-/// to set (`process.umask`), and the cache outlives the program. Each
-/// directory this creates is the user's alone (0o700); one already there --
-/// `OAM_CACHE_DIR`, `~/.cache` -- is left as it is. Windows has no such
-/// mode and takes the directory's inherited ACL, as before.
-fn create_cache_dirs(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        let mut missing = Vec::new();
-        let mut at = Some(dir);
-        while let Some(path) = at {
-            if path.as_os_str().is_empty() || path.exists() {
-                break;
-            }
-            missing.push(path);
-            at = path.parent();
-        }
-        for path in missing.into_iter().rev() {
-            match std::fs::DirBuilder::new().mode(0o700).create(path) {
-                // The mask applies to mkdir's mode too; chmod is not under it.
-                Ok(()) => {
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-                }
-                // Another process made it first: its directory, its mode.
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(dir)
-    }
-}
-
-/// Write a new cache file, the user's alone (0o600) on unix whatever the
-/// process's mask (see [`create_cache_dirs`]). The file must not exist: the
-/// callers write a temp name of their own, or a marker whose second write
-/// is as good as its first.
-fn write_cache_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-        {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && bytes.is_empty() => {
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        };
-        // On the descriptor, so it holds for a file the mask created with
-        // no permissions at all.
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        file.write_all(bytes)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-    }
-}
-
 /// Store a freshly produced bytecode blob for `key`. Best-effort: a write
 /// failure (read-only dir, ENOSPC) is silently ignored. Atomic via a unique
 /// temp file + rename so a concurrent reader never observes a torn blob.
@@ -411,7 +341,8 @@ pub(crate) fn store(key: &CacheKey, bytes: &[u8]) {
     }
     let path = path_for_key(key);
     let Some(parent) = path.parent() else { return };
-    if create_cache_dirs(parent).is_err() {
+    // The cache's own modes, not the running program's mask: `own_files`.
+    if own_files::create_dir_all(parent, Audience::Kept).is_err() {
         return;
     }
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -421,7 +352,7 @@ pub(crate) fn store(key: &CacheKey, bytes: &[u8]) {
         std::process::id(),
         CTR.fetch_add(1, Ordering::Relaxed)
     ));
-    if write_cache_file(&tmp, bytes).is_err() {
+    if own_files::write(&tmp, bytes, Audience::Kept).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return;
     }
@@ -569,7 +500,7 @@ fn sweep(root: &Path, now: SystemTime) -> SweepReport {
 /// (a filesystem without settable times) is swallowed -- the worst case is a
 /// sweep that runs more often than the interval, never one that is skipped.
 fn write_stamp(path: &Path, now: SystemTime) -> bool {
-    match std::fs::File::create(path) {
+    match own_files::create(path, Audience::Kept) {
         Ok(file) => {
             let _ = file.set_modified(now);
             true
@@ -773,39 +704,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    /// The cache's directories and files have the modes the cache gives
-    /// them, not what the process's mask leaves of a default: under the
-    /// usual 0o022 a plain create would make these 0o755 and 0o644. A
-    /// directory that was already there keeps its mode.
-    #[cfg(unix)]
-    #[test]
-    fn cache_dirs_and_files_are_the_users_alone() {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
-        let root = scratch("modes");
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let shard = root.join("bytecode").join("ab");
-        create_cache_dirs(&shard).unwrap();
-        assert_eq!(mode(&root), 0o755, "an existing directory is left alone");
-        assert_eq!(mode(&root.join("bytecode")), 0o700);
-        assert_eq!(mode(&shard), 0o700);
-        create_cache_dirs(&shard).unwrap();
-
-        let blob = shard.join("k.tmp");
-        write_cache_file(&blob, b"bytes").unwrap();
-        assert_eq!(mode(&blob), 0o600);
-        assert_eq!(std::fs::read(&blob).unwrap(), b"bytes");
-        assert!(
-            write_cache_file(&blob, b"again").is_err(),
-            "a blob's temp name is new"
-        );
-        let marker = shard.join("k.seedrej");
-        write_cache_file(&marker, b"").unwrap();
-        write_cache_file(&marker, b"").unwrap();
-        assert_eq!(mode(&marker), 0o600);
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     fn write_aged(path: &Path, age: Duration, now: SystemTime) {

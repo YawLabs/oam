@@ -2568,6 +2568,10 @@ mod o_flag {
 /// the first read sets and restores it once. A mask changed behind this --
 /// by a native addon calling umask(2) itself -- is not seen until the next
 /// set.
+///
+/// The first value this learns is the mask the process started with, and
+/// is noted as that (`oam_diagnostics::own_files`): what oam writes for
+/// itself keeps the modes that mask gives, whatever is set here later.
 #[cfg(unix)]
 pub fn process_umask(set: Option<u32>) -> u32 {
     use rustix::fs::Mode;
@@ -2587,18 +2591,30 @@ pub fn process_umask(set: Option<u32>) -> u32 {
     match set {
         Some(mask) => {
             let mask = mask & KEPT;
-            let was = rustix::process::umask(Mode::from_raw_mode(mask as _));
+            let was = bits(rustix::process::umask(Mode::from_raw_mode(mask as _)));
+            // Before the new mask is known to anything else here.
+            oam_diagnostics::own_files::note_inherited_umask(known.unwrap_or(was));
             *known = Some(mask);
-            bits(was)
+            was
         }
         None => *known.get_or_insert_with(|| {
-            umask_from_proc().unwrap_or_else(|| {
+            let mask = umask_from_proc().unwrap_or_else(|| {
                 let was = rustix::process::umask(Mode::empty());
                 rustix::process::umask(was);
                 bits(was)
-            })
+            });
+            oam_diagnostics::own_files::note_inherited_umask(mask);
+            mask
         }),
     }
+}
+
+/// Learn the mask the process started with, before any program code can
+/// change it: the CLI calls this first thing (see `process_umask`). Nothing
+/// to learn on Windows, where the mask is this process's own from zero.
+pub fn snapshot_inherited_umask() {
+    #[cfg(unix)]
+    process_umask(None);
 }
 
 /// The `Umask:` line of /proc/self/status (Linux 4.7 and later): the mask

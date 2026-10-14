@@ -13,6 +13,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod own_files;
+
 pub const ODIF_VERSION: &str = "1";
 
 /// Where a diagnostic came from. Determines its code namespace.

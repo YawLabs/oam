@@ -27,7 +27,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   and is inherited by child processes. On Windows it keeps the owner's read and write bits
   and decides whether a created file is read-only, as node's does. A mask is checked as node
   checks one (an octal string or a 32-bit unsigned integer), and a worker may read the mask
-  but not set it (`ERR_WORKER_UNSUPPORTED_OPERATION`).
+  but not set it (`ERR_WORKER_UNSUPPORTED_OPERATION`). What oam writes for itself -- its
+  bytecode and transpile caches, crash reports, the scratch files of `-e`, of a compiled
+  binary and of `serve --workers` -- does not follow a mask the program sets: caches and
+  reports keep the modes the mask oam started under gives them, with the owner's own
+  bits always kept, and scratch files are the owner's alone.
 
 - **The `mode` of an open that creates its file is applied (#324).** It was checked and then
   dropped: every file was created with the default `0o666`. On Windows a mode with no
