@@ -25,7 +25,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   cannot name. So the root of a share that is no disk is `EINVAL` however it is spelled --
   `\\.\UNC\srv\IPC$` opened, where `\\srv\IPC$` and `\\?\UNC\srv\IPC$` already refused --
   and the mailslot namespace, `\\.\mailslot`, is `UNKNOWN` (errno -4094), where it opened. This
-  holds for every open, and for `writeFile` and `appendFile`.
+  holds for every open, and for `readFile`, `writeFile` and `appendFile`.
 
 - **On Windows `fstat` of a console opened to write only fails `EISDIR`, as node's does (#331).**
   `fs.fstatSync(fs.openSync("\\\\.\\CONOUT$", "w"))` (and `\\.\CON` or `\\.\CONIN$` opened `"w"`,

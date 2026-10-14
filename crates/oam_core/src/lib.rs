@@ -2455,13 +2455,16 @@ fn is_share_root(path: &std::path::Path) -> bool {
     ) && parts.all(|part| matches!(part, Component::RootDir))
 }
 
-/// `options.open(path)`, after refusing the one path FILE_FLAG_BACKUP_SEMANTICS
-/// opens and node does not: the root of a share that is no disk
-/// (`\\srv\IPC$`). node fails every open of it `EINVAL` (v22.22.2,
-/// measured), which is also what a stat of it answers in both runtimes. With
-/// the flag CreateFileW hands back a handle for it, so `openSync` returned a
-/// descriptor and an `appendFile` of no data succeeded. Only a root is asked,
-/// so no other open pays for the stat.
+/// `options.open(path)` with libuv's two Windows refusals. Before the open,
+/// the one path FILE_FLAG_BACKUP_SEMANTICS opens and node does not: the root
+/// of a share that is no disk (`\\srv\IPC$`). node fails every open of it
+/// `EINVAL` (v22.22.2, measured), which is also what a stat of it answers in
+/// both runtimes. With the flag CreateFileW hands back a handle for it, so
+/// `openSync` returned a descriptor and an `appendFile` of no data succeeded.
+/// Only a root is asked, so no other open pays for the stat. After the open,
+/// what the C runtime refuses (`as_the_crt_takes_it`), as for
+/// `OpenFlags::open_with_mode`'s handles: `\\.\UNC\srv\IPC$` is `EINVAL`,
+/// `\\.\mailslot` `UNKNOWN`.
 pub fn open_path(
     options: &std::fs::OpenOptions,
     path: impl AsRef<std::path::Path>,
