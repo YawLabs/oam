@@ -3475,114 +3475,90 @@
     EventEmitter.defaultMaxListeners = 10;
     EventEmitter.errorMonitor = errorMonitor;
 
-    function once(emitter, type, options) {
-      // Node's once() is an async function, so a bad `options` surfaces as a
-      // REJECTION, never a synchronous throw -- callers write
-      // `await rejects(once(ee, 'x', 1), ...)`. Anything non-object (and
-      // null, and arrays) is rejected rather than silently ignored, which is
-      // what oam did: `once(ee, 'x', {signl: sig})` typo'd its way into a
-      // promise that never settled.
-      if (
-        options !== undefined &&
-        (options === null || typeof options !== "object" || Array.isArray(options))
-      ) {
-        return Promise.reject(
-          new codes.ERR_INVALID_ARG_TYPE("options", "Object", options),
-        );
+    // node's events.once (lib/events.js, v22.22.2), as written: an async
+    // function, so a bad argument is a rejection and the caller's await
+    // resumes after the microtasks the emit queued, as in node (#344); its
+    // length is 2 (`options` has a default). An abort rejects with node's
+    // AbortError (code ABORT_ERR, the signal's reason as `cause`), not a
+    // DOMException. Listeners on an EventTarget (an AbortSignal, say) as on
+    // an EventEmitter; the abort listener resists stopImmediatePropagation,
+    // and every settle path unhooks all three listeners.
+    class AbortError extends Error {
+      constructor(message = "The operation was aborted", options = undefined) {
+        if (options !== undefined && typeof options !== "object") {
+          throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+        }
+        super(message, options);
+        this.code = "ABORT_ERR";
+        this.name = "AbortError";
       }
-      const signal = options ? options.signal : undefined;
-      // Node's validateAbortSignal, and it runs BEFORE the aborted check:
-      // duck-typed on 'aborted' rather than instanceof, so a signal from
-      // another realm still works while `{}` or a stray number does not.
+    }
+    const kResistStopPropagation = Symbol.for("oam.kResistStopPropagation");
+    function eventTargetAgnosticAddListener(emitter, name, listener, flags) {
+      if (typeof emitter.on === "function") {
+        if (flags?.once) emitter.once(name, listener);
+        else emitter.on(name, listener);
+      } else if (typeof emitter.addEventListener === "function") {
+        emitter.addEventListener(name, listener, flags);
+      } else {
+        throw new codes.ERR_INVALID_ARG_TYPE("emitter", "EventEmitter", emitter);
+      }
+    }
+    function eventTargetAgnosticRemoveListener(emitter, name, listener, flags) {
+      if (typeof emitter.removeListener === "function") {
+        emitter.removeListener(name, listener);
+      } else if (typeof emitter.removeEventListener === "function") {
+        emitter.removeEventListener(name, listener, flags);
+      } else {
+        throw new codes.ERR_INVALID_ARG_TYPE("emitter", "EventEmitter", emitter);
+      }
+    }
+    const kEmptyOnceOptions = Object.freeze({ __proto__: null });
+    async function once(emitter, name, options = kEmptyOnceOptions) {
+      // node's validateObject: a plain object (not null, an array or a
+      // function).
+      if (options === null || typeof options !== "object" || Array.isArray(options)) {
+        throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+      }
+      const { signal } = options;
+      // node's validateAbortSignal: duck-typed on 'aborted'.
       if (
         signal !== undefined &&
         (signal === null || typeof signal !== "object" || !("aborted" in signal))
       ) {
-        return Promise.reject(
-          new codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal),
-        );
+        throw new codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
       }
-      if (signal && signal.aborted) {
-        return Promise.reject(
-          new (globalThis.DOMException ?? Error)(
-            "The operation was aborted",
-            "AbortError",
-          ),
-        );
-      }
-      // The emitter has to be one or the other. An AbortController, say,
-      // is neither (its SIGNAL is the target), and oam used to return a
-      // promise that simply never settled.
-      if (
-        typeof emitter?.once !== "function" &&
-        typeof emitter?.addEventListener !== "function"
-      ) {
-        return Promise.reject(
-          new codes.ERR_INVALID_ARG_TYPE(
-            "emitter",
-            ["EventEmitter", "EventTarget"],
-            emitter,
-          ),
-        );
-      }
-      // Support BOTH EventEmitter (.once/.removeListener) and EventTarget
-      // (AbortSignal et al, .addEventListener/.removeEventListener), the way
-      // Node's events.once does -- the stream operator tests await
-      // once(abortSignal, 'abort') inside a mapper.
-      const isEventTarget =
-        typeof emitter.once !== "function" &&
-        typeof emitter.addEventListener === "function";
+      if (signal?.aborted) throw new AbortError(undefined, { cause: signal.reason });
       return new Promise((resolve, reject) => {
-        // EVERY settle path has to unhook EVERYTHING -- the event listener,
-        // the error listener, and the signal's 'abort' listener. Leaving the
-        // abort listener attached kept the promise's closure (and the
-        // emitter) reachable from a long-lived AbortSignal for as long as
-        // the signal itself lived: a leak for any caller that reuses one
-        // signal across many once() calls, which is the normal pattern.
-        let onAbort;
-        const cleanup = () => {
-          if (isEventTarget) {
-            emitter.removeEventListener(type, onEvent);
-            if (typeof emitter.removeEventListener === "function") {
-              emitter.removeEventListener("error", onError);
-            }
-          } else {
-            emitter.removeListener(type, onEvent);
-            emitter.removeListener("error", onError);
-          }
-          if (signal && onAbort) signal.removeEventListener("abort", onAbort);
-        };
-        const onEvent = (...args) => {
-          cleanup();
-          resolve(args);
-        };
-        const onError = (err) => {
-          cleanup();
+        const errorListener = (err) => {
+          emitter.removeListener(name, resolver);
+          if (signal != null) eventTargetAgnosticRemoveListener(signal, "abort", abortListener);
           reject(err);
         };
-        if (isEventTarget) {
-          emitter.addEventListener(type, onEvent, { once: true });
-        } else {
-          emitter.once(type, onEvent);
-          if (type !== "error") emitter.once("error", onError);
+        const resolver = (...args) => {
+          if (typeof emitter.removeListener === "function") {
+            emitter.removeListener("error", errorListener);
+          }
+          if (signal != null) eventTargetAgnosticRemoveListener(signal, "abort", abortListener);
+          resolve(args);
+        };
+        const opts = { __proto__: null, once: true, [kResistStopPropagation]: true };
+        eventTargetAgnosticAddListener(emitter, name, resolver, opts);
+        if (name !== "error" && typeof emitter.once === "function") {
+          // An EventTarget has no 'error' event semantics; an EventEmitter
+          // rejects on one.
+          emitter.once("error", errorListener);
         }
-        if (signal) {
-          onAbort = () => {
-            cleanup();
-            reject(
-              new (globalThis.DOMException ?? Error)(
-                "The operation was aborted",
-                "AbortError",
-              ),
-            );
-          };
-          // kResistStopPropagation: an UNRELATED abort listener calling
-          // stopImmediatePropagation must not starve this one -- otherwise
-          // the promise never settles and the caller hangs forever. Node
-          // marks its own internal abort listeners the same way.
-          signal.addEventListener("abort", onAbort, {
+        function abortListener() {
+          eventTargetAgnosticRemoveListener(emitter, name, resolver);
+          eventTargetAgnosticRemoveListener(emitter, "error", errorListener);
+          reject(new AbortError(undefined, { cause: signal?.reason }));
+        }
+        if (signal != null) {
+          eventTargetAgnosticAddListener(signal, "abort", abortListener, {
+            __proto__: null,
             once: true,
-            [Symbol.for("oam.kResistStopPropagation")]: true,
+            [kResistStopPropagation]: true,
           });
         }
       });
