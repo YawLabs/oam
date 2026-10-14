@@ -3734,15 +3734,6 @@ way; the difference is that a symlink needs the create-symlink privilege (Develo
 an elevated process), which a junction does not, so where that privilege is missing oam's
 call fails `EPERM` and node's succeeds. Measured against v22.22.2 (conformance case 377).
 
-### Windows `readdir` of a volume or the pipe namespace lists it
-
-`readdir` reports what libuv's scandir does for a path that fails to list (conformance case
-393), but a listing that works is not looked at again. Three spellings list in oam where
-node v22.22.2 refuses them: `readdirSync("\\\\?\\C:")` and `readdirSync("\\\\.\\C:")` (the
-volume, not its root directory) are `EPERM` `scandir` in node, and
-`readdirSync("\\\\.\\pipe")` without a trailing separator is `ENOTDIR`. `opendir` lists all
-three in both runtimes.
-
 ### Windows directory descriptors: the corners left
 
 A directory opens on Windows as it does in node (`FILE_FLAG_BACKUP_SEMANTICS`), and its
