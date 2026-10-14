@@ -100,6 +100,57 @@ type H2Sender = http2::SendRequest<ReqBody>;
 /// reuse), still under node's 4.3 s for the same run.
 const FRESH_GATE: Duration = Duration::from_millis(1);
 
+/// How long a connection has to sit idle before it has shown it is staying
+/// open, for an origin that has closed one right after answering on it
+/// (#312). Also what "right after" means: a parked connection that a
+/// checkout finds dead within this long of its being parked is what marks
+/// its origin -- the pool sees a close only when it next goes to use the
+/// connection, so requests further apart than this never mark one, and
+/// never needed to.
+///
+/// Why there is such a rule. A server that answers and closes in one go --
+/// a 3xx then `end()`, an answer on the last request of a keep-alive budget
+/// -- leaves a pooled connection whose close is still on its way, and
+/// [`FRESH_GATE`] only covers a close that takes about a millisecond. Over
+/// TLS it takes longer: the close is a close_notify record the server sends
+/// a turn or more of its event loop after the answer, and those turns are
+/// long while it is busy with other handshakes. Measured against a node
+/// v22.22.2 TLS server in its own process (1,000 `GET` + `302` hops and 400
+/// `POST`s, the plain-TCP sibling and node's own client as controls):
+///
+/// | client, window            | hops read twice | POSTs through |
+/// |---------------------------|-----------------|---------------|
+/// | node                      | 0               | 400           |
+/// | oam, plain TCP, 1 ms      | 0               | 400           |
+/// | oam, TLS, 1 ms            | 102-135         | 288-313       |
+/// | oam, TLS, 3 ms            | 12-40           | 371-372       |
+/// | oam, TLS, 10 ms           | 1-2             | 384-393       |
+/// | oam, TLS, 30 ms           | 0               | 400           |
+/// | oam, TLS, this rule       | 0-1             | 400           |
+///
+/// A window long enough to cover it (30 ms) tripled the run. So the pool
+/// does not wait longer; it learns. An origin seen to close a connection
+/// right after parking it is not handed a just-parked connection again for
+/// [`DISTRUST`]: such a request dials, which is what it would have had to do
+/// anyway once the write met the close, without the request being read
+/// twice or lost on the way. A connection that has sat idle this long has
+/// outlived any close that was coming with its last answer, and is reused
+/// as before; and an origin never seen to do it is not affected at all.
+///
+/// The cost is to a marked origin's requests that follow one another
+/// closely: each dials. Of the connections those leave, one is parked to
+/// settle and the rest are closed (`on_success`), so the origin does not
+/// end up with a connection per request. An origin marked on one stray
+/// close -- a restart, an idle timeout that fell just after an answer --
+/// pays that for [`DISTRUST`] too; a request whose own body failed does not
+/// mark one, nor does a connection JS closed itself. What is not covered is the first request or two to an origin
+/// that does close this way, before there is anything to have learned from.
+const SETTLE: Duration = Duration::from_millis(250);
+
+/// How long an origin stays marked after it last closed a connection right
+/// after answering on it.
+const DISTRUST: Duration = Duration::from_secs(60);
+
 /// How long a checkout must wait before taking the entry parked at
 /// `parked_at`: `None` when it is already [`FRESH_GATE`] old, else the
 /// remaining time. Pure -- the reactor belongs to [`Pool::reuse_h1`].
@@ -158,6 +209,9 @@ struct PoolInner {
     generation: AtomicU64,
     /// The idle reaper is spawned once, on the first park.
     reaper_started: AtomicBool,
+    /// Origins that closed a connection right after answering on it, and
+    /// until when each is remembered for it: see [`SETTLE`].
+    closes_early: Mutex<HashMap<PoolKey, Instant>>,
 }
 
 struct IdleH1 {
@@ -167,6 +221,22 @@ struct IdleH1 {
     info: ConnInfo,
     proxied: bool,
     parked_at: Instant,
+}
+
+impl IdleH1 {
+    /// The connection is closed, or its peer has said it is closing: the
+    /// dispatcher has processed a FIN, or the TLS session has read the
+    /// peer's close_notify (which can arrive with the answer itself, where
+    /// no later read is there to notice it).
+    fn is_dead(&self) -> bool {
+        self.sender.is_closed() || self.stats.peer_closed()
+    }
+
+    /// Alive, and parked less than [`SETTLE`] ago: what a marked origin is
+    /// not handed. A dead one is not settling; it is to be dropped.
+    fn settling(&self, now: Instant) -> bool {
+        !self.is_dead() && now.saturating_duration_since(self.parked_at) < SETTLE
+    }
 }
 
 struct H2Entry {
@@ -188,6 +258,7 @@ impl Pool {
                 idle_timeout,
                 generation: AtomicU64::new(0),
                 reaper_started: AtomicBool::new(false),
+                closes_early: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -292,7 +363,13 @@ impl Pool {
                 proxied,
                 is_h2,
                 key: conn_key,
+                parked_for,
             } = conn;
+            // A connection that fails the request it was just reused for,
+            // through no doing of the request's own, was closing when it was
+            // taken.
+            let closed_early = parked_for.is_some_and(|parked| parked < SETTLE);
+            let closed_early = move |stats: &ConnStats| closed_early && !stats.closed_here();
             // The request has a connection, and hyper writes it as soon as
             // it is handed over: node's 'finish' for http.request, and where
             // undici's headersTimeout starts (`sent`).
@@ -342,6 +419,9 @@ impl Pool {
                 SendResult::Unsent(returned, error, proto) => {
                     let reused = attempt_stats.count_one();
                     let response_started = attempt_stats.response_started();
+                    if closed_early(&attempt_stats) {
+                        self.inner.saw_an_early_close(&conn_key);
+                    }
                     self.on_failure(proto, is_h2, &conn_key);
                     if reused && allow_reuse {
                         // A pooled connection handed the request back unsent:
@@ -366,6 +446,13 @@ impl Pool {
                 SendResult::Sent(error, proto) => {
                     let reused = attempt_stats.count_one();
                     let response_started = attempt_stats.response_started();
+                    // Only when nothing of an answer came back -- a
+                    // connection that failed part way through one was not
+                    // closing -- and not when it is the request's own body
+                    // that failed, which says nothing about the origin.
+                    if closed_early(&attempt_stats) && !response_started && !error.is_user() {
+                        self.inner.saw_an_early_close(&conn_key);
+                    }
                     self.on_failure(proto, is_h2, &conn_key);
                     return Err(Box::new(PoolFail {
                         error: PoolError::send(error),
@@ -446,12 +533,14 @@ impl Pool {
             proxied: entry.proxied,
             is_h2: true,
             key: key.clone(),
+            parked_for: None,
         })
     }
 
     /// Whether a request for `uri` offering `alpn` would find a connection
     /// to reuse right now: a live h2 connection to the origin, or a live,
-    /// unexpired idle h1 one. A look, not a reservation -- another request
+    /// unexpired idle h1 one that a checkout would hand out (for an origin
+    /// marked as closing early, one parked at least [`SETTLE`] ago). A look, not a reservation -- another request
     /// can take it first, and the checkout then decides afresh.
     pub(crate) fn has_idle(&self, uri: &Uri, alpn: Alpn) -> bool {
         let Some(key) = pool_key(uri, alpn) else {
@@ -471,24 +560,35 @@ impl Pool {
             return true;
         }
         let now = Instant::now();
-        self.inner
-            .idle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .is_some_and(|deque| {
-                deque.iter().any(|entry| {
-                    !entry.sender.is_closed()
-                        && self.inner.idle_timeout.is_none_or(|timeout| {
-                            idle_left(timeout, now, entry.parked_at).is_some()
-                        })
-                })
-            })
+        // The entries in the order a checkout meets them, and with what it
+        // would learn on the way: a dead one it drops can mark the origin.
+        let mut marked = self.inner.closes_early(&key, now);
+        let map = self.inner.idle.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in map.get(&key).into_iter().flatten() {
+            if self
+                .inner
+                .idle_timeout
+                .is_some_and(|timeout| idle_left(timeout, now, entry.parked_at).is_none())
+            {
+                continue;
+            }
+            if entry.is_dead() {
+                marked |= now.saturating_duration_since(entry.parked_at) < SETTLE
+                    && !entry.stats.closed_here();
+                continue;
+            }
+            return !(marked && entry.settling(now));
+        }
+        false
     }
 
     /// Take the front idle h1 connection for `key`, or nothing: expired and
-    /// already-closed entries are dropped (their sender closes the
-    /// connection), a live one is handed out.
+    /// dead entries (a closed sender, or a TLS session that has read its
+    /// peer's close_notify) are dropped, their sender closing the
+    /// connection, and one found dead within [`SETTLE`] of being parked
+    /// marks its origin; a live one is handed out -- unless its origin is
+    /// marked and it was parked less than [`SETTLE`] ago, when it is left
+    /// where it is and the request dials (#312).
     ///
     /// #155: the entry is POPPED FIRST, so the one aged by the wait below is
     /// the one used -- a concurrent checkout cannot steal it mid-wait and
@@ -505,10 +605,20 @@ impl Pool {
     /// (the steady-state reuse) waits nothing.
     async fn reuse_h1(&self, key: &PoolKey) -> Option<Conn> {
         loop {
+            let now = Instant::now();
+            // Read before the idle lock: the two are never held together.
+            let marked = self.inner.closes_early(key, now);
             // Pop under the lock; nothing else can take this entry after.
             let entry = {
                 let mut map = self.inner.idle.lock().unwrap_or_else(|e| e.into_inner());
                 let deque = map.get_mut(key)?;
+                // An origin that closes right after answering: only a
+                // connection that has outlived that is handed out. The
+                // front one -- the oldest, entries being parked at the back
+                // -- has not, so it is never taken off: the request dials.
+                if marked && deque.front().is_some_and(|front| front.settling(now)) {
+                    return None;
+                }
                 let entry = deque.pop_front();
                 if deque.is_empty() {
                     map.remove(key);
@@ -516,19 +626,29 @@ impl Pool {
                 entry
             }?;
             if let Some(timeout) = self.inner.idle_timeout
-                && idle_left(timeout, Instant::now(), entry.parked_at).is_none()
+                && idle_left(timeout, now, entry.parked_at).is_none()
             {
                 continue; // expired -> drop, close
             }
-            if entry.sender.is_closed() {
-                continue; // a processed FIN; drop (lazy skip)
+            let parked_for = now.saturating_duration_since(entry.parked_at);
+            if entry.is_dead() {
+                // Drop (lazy skip). One found dead this soon after it was
+                // parked marks the origin, unless the close was ours.
+                if parked_for < SETTLE && !entry.stats.closed_here() {
+                    self.inner.saw_an_early_close(key);
+                }
+                continue;
             }
-            if let Some(delay) = fresh_delay(entry.parked_at, Instant::now(), FRESH_GATE) {
+            if let Some(delay) = fresh_delay(entry.parked_at, now, FRESH_GATE) {
                 tokio::time::sleep(delay).await;
                 // Hands the run queue to a dispatcher woken at the deadline.
                 tokio::task::yield_now().await;
-                if entry.sender.is_closed() {
-                    continue; // the FIN landed during the wait -> drop
+                if entry.is_dead() {
+                    // The close landed during the wait -> drop.
+                    if !entry.stats.closed_here() {
+                        self.inner.saw_an_early_close(key);
+                    }
+                    continue;
                 }
             }
             let stats = entry.stats.clone();
@@ -539,6 +659,7 @@ impl Pool {
                 proxied: entry.proxied,
                 is_h2: false,
                 key: key.clone(),
+                parked_for: Some(parked_for),
             });
         }
     }
@@ -587,6 +708,7 @@ impl Pool {
                 proxied,
                 is_h2: true,
                 key: key.clone(),
+                parked_for: None,
             })
         } else {
             let (sender, connection) = http1::handshake(conn)
@@ -596,6 +718,7 @@ impl Pool {
             // (`req.socket.destroy()` / `resetAndDestroy()`): the task then
             // drops it, mid-response or idle in the pool alike.
             let closer = info.connection.and_then(ConnCloser::find);
+            let closed_here = stats.closed_here_flag();
             tokio::spawn(async move {
                 match closer {
                     Some(closer) => {
@@ -605,7 +728,9 @@ impl Pool {
                         // of the reset.
                         tokio::select! {
                             biased;
-                            () = closer.requested() => {}
+                            // Said before the connection drops, so the pool
+                            // never takes this close for the origin's.
+                            () = closer.requested() => closed_here.store(true, Ordering::Release),
                             _ = connection.with_upgrades() => {}
                         }
                     }
@@ -621,6 +746,7 @@ impl Pool {
                 proxied,
                 is_h2: false,
                 key: key.clone(),
+                parked_for: None,
             })
         }
     }
@@ -663,20 +789,17 @@ impl Pool {
             if let Some(inner) = inner.upgrade()
                 && inner.generation.load(Ordering::Relaxed) == gen_id
             {
-                inner
-                    .idle
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .entry(key)
-                    .or_default()
-                    .push_back(IdleH1 {
-                        sender,
-                        stats,
-                        info,
-                        proxied,
-                        parked_at: Instant::now(),
-                    });
-                inner.ensure_reaper();
+                let now = Instant::now();
+                let entry = IdleH1 {
+                    sender,
+                    stats,
+                    info,
+                    proxied,
+                    parked_at: now,
+                };
+                if inner.park(key, entry, now) {
+                    inner.ensure_reaper();
+                }
             }
         });
     }
@@ -698,6 +821,47 @@ impl Pool {
 }
 
 impl PoolInner {
+    /// `key`'s origin closed a connection right after answering on it.
+    fn saw_an_early_close(&self, key: &PoolKey) {
+        let mut marked = self.closes_early.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        // Kept small: the marks that have run out go when one is added.
+        marked.retain(|_, until| *until > now);
+        marked.insert(key.clone(), now + DISTRUST);
+    }
+
+    /// Park `entry`, the newest for `key`, or drop it (closing its
+    /// connection) and say false.
+    ///
+    /// A marked origin's requests dial while what is parked settles (see
+    /// [`SETTLE`]). Parking every one of those connections would leave the
+    /// origin with as many as were opened in that time, where it had one;
+    /// so one settles and the rest are dropped here.
+    fn park(&self, key: PoolKey, entry: IdleH1, now: Instant) -> bool {
+        // Read before the idle lock: the two are never held together.
+        let marked = self.closes_early(&key, now);
+        let mut map = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        if marked
+            && map
+                .get(&key)
+                .and_then(|deque| deque.back())
+                .is_some_and(|newest| newest.settling(now))
+        {
+            return false;
+        }
+        map.entry(key).or_default().push_back(entry);
+        true
+    }
+
+    /// Whether `key`'s origin is still remembered for an early close.
+    fn closes_early(&self, key: &PoolKey, now: Instant) -> bool {
+        self.closes_early
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .is_some_and(|until| *until > now)
+    }
+
     /// Spawn the idle reaper the first time a connection is parked: one task per
     /// pool that drops expired or dead idle entries and self-cancels when the
     /// pool is gone. Lazy skip-on-checkout handles the rest.
@@ -796,6 +960,9 @@ struct Conn {
     proxied: bool,
     is_h2: bool,
     key: PoolKey,
+    /// An h1 connection taken from the pool: how long it had been parked.
+    /// `None` for one just opened, and for h2.
+    parked_for: Option<Duration>,
 }
 
 enum Proto {
@@ -1429,6 +1596,211 @@ mod tests {
             });
     }
 
+    /// A dead sender over a duplex pair: its server end is gone and the
+    /// connection task has seen the EOF.
+    async fn dead_h1_sender() -> H1Sender {
+        let (sender, server) = h1_sender().await;
+        drop(server);
+        for _ in 0..200 {
+            if sender.is_closed() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(sender.is_closed(), "the sender never saw its EOF");
+        sender
+    }
+
+    fn idle_count(pool: &Pool, key: &PoolKey) -> usize {
+        pool.inner
+            .idle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map_or(0, |deque| deque.len())
+    }
+
+    /// #312: a connection found closed right after it was parked marks its
+    /// origin, and a marked origin is not handed a just-parked connection --
+    /// which stays parked, to be reused once it has outlived [`SETTLE`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_origin_that_closed_early_is_not_handed_a_just_parked_connection() {
+        let pool = test_pool(Some(Duration::from_secs(90)));
+        let key = pool_key(&"http://gate.test/".parse().unwrap(), Alpn::default()).unwrap();
+        let other = pool_key(&"http://gate.test:8081/".parse().unwrap(), Alpn::default()).unwrap();
+
+        // Stamped ahead of the clock: the parked age saturates to zero, so
+        // "just parked" holds however long this thread is descheduled.
+        let just_parked = Instant::now() + Duration::from_secs(5);
+        push_idle(&pool, &key, dead_h1_sender().await, just_parked);
+        assert!(pool.reuse_h1(&key).await.is_none());
+        assert!(pool.inner.closes_early(&key, Instant::now()));
+        assert!(!pool.inner.closes_early(&other, Instant::now()));
+
+        // Live and just parked: not handed out, not offered, and still
+        // there -- at the front, with a second behind it.
+        let uri: Uri = "http://gate.test/".parse().unwrap();
+        let (sender, _keep) = h1_sender().await;
+        let (second, _keep_second) = h1_sender().await;
+        push_idle(&pool, &key, sender, just_parked);
+        push_idle(&pool, &key, second, just_parked);
+        assert!(pool.reuse_h1(&key).await.is_none());
+        assert!(!pool.has_idle(&uri, Alpn::default()));
+        assert_eq!(idle_count(&pool, &key), 2);
+        pool.inner
+            .idle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&key)
+            .unwrap()
+            .pop_back();
+
+        // The same entry once it has sat for SETTLE: handed out, and its
+        // parked age goes with it.
+        pool.inner
+            .idle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&key)
+            .unwrap()[0]
+            .parked_at = Instant::now() - SETTLE - Duration::from_millis(1);
+        assert!(pool.has_idle(&uri, Alpn::default()));
+        let conn = pool
+            .reuse_h1(&key)
+            .await
+            .expect("a settled entry is reused");
+        assert!(conn.parked_for.is_some_and(|parked| parked >= SETTLE));
+        assert_eq!(idle_count(&pool, &key), 0);
+
+        // Another origin is untouched: its just-parked entry is handed out.
+        let (sender, _keep_other) = h1_sender().await;
+        push_idle(&pool, &other, sender, Instant::now());
+        assert!(pool.reuse_h1(&other).await.is_some());
+    }
+
+    fn idle_entry(sender: H1Sender, parked_at: Instant) -> IdleH1 {
+        IdleH1 {
+            sender,
+            stats: ConnStats::new(),
+            info: ConnInfo::default(),
+            proxied: false,
+            parked_at,
+        }
+    }
+
+    /// #312: a marked origin parks one settling connection and drops the
+    /// rest, so the requests that dial while it settles do not leave it a
+    /// connection each. An unmarked origin parks them all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_marked_origin_parks_one_settling_connection() {
+        let pool = test_pool(Some(Duration::from_secs(90)));
+        let key = pool_key(&"http://gate.test/".parse().unwrap(), Alpn::default()).unwrap();
+        let other = pool_key(&"http://gate.test:8081/".parse().unwrap(), Alpn::default()).unwrap();
+        let mut keep = Vec::new();
+        let mut live = async || {
+            let (sender, server) = h1_sender().await;
+            keep.push(server);
+            sender
+        };
+        let now = Instant::now();
+        let settled = now - SETTLE - Duration::from_millis(1);
+
+        pool.inner.saw_an_early_close(&key);
+        assert!(
+            pool.inner
+                .park(key.clone(), idle_entry(live().await, now), now)
+        );
+        assert!(
+            !pool
+                .inner
+                .park(key.clone(), idle_entry(live().await, now), now)
+        );
+        assert_eq!(idle_count(&pool, &key), 1);
+
+        // The one parked has settled: the next is parked behind it, and it
+        // is that newest one, not the front, the one after is held to.
+        pool.inner
+            .idle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&key)
+            .unwrap()[0]
+            .parked_at = settled;
+        assert!(
+            pool.inner
+                .park(key.clone(), idle_entry(live().await, now), now)
+        );
+        assert!(
+            !pool
+                .inner
+                .park(key.clone(), idle_entry(live().await, now), now)
+        );
+        assert_eq!(idle_count(&pool, &key), 2);
+
+        assert!(
+            pool.inner
+                .park(other.clone(), idle_entry(live().await, now), now)
+        );
+        assert!(
+            pool.inner
+                .park(other.clone(), idle_entry(live().await, now), now)
+        );
+        assert_eq!(idle_count(&pool, &other), 2);
+    }
+
+    /// A connection this side closed -- JS destroyed its socket -- is
+    /// dropped like any dead one and marks nothing: the origin did not
+    /// close it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_closed_from_this_side_marks_nothing() {
+        let pool = test_pool(Some(Duration::from_secs(90)));
+        let key = pool_key(&"http://gate.test/".parse().unwrap(), Alpn::default()).unwrap();
+        let entry = idle_entry(
+            dead_h1_sender().await,
+            Instant::now() + Duration::from_secs(5),
+        );
+        entry
+            .stats
+            .closed_here_flag()
+            .store(true, Ordering::Release);
+        pool.inner
+            .idle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.clone())
+            .or_default()
+            .push_back(entry);
+        assert!(pool.reuse_h1(&key).await.is_none());
+        assert_eq!(idle_count(&pool, &key), 0);
+        assert!(!pool.inner.closes_early(&key, Instant::now()));
+    }
+
+    /// A connection found dead long after it was parked says nothing about
+    /// how its origin closes -- an idle timeout does that -- and marks
+    /// nothing; and a mark runs out after [`DISTRUST`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_close_right_after_parking_marks_an_origin_and_the_mark_runs_out() {
+        let pool = test_pool(Some(Duration::from_secs(90)));
+        let key = pool_key(&"http://gate.test/".parse().unwrap(), Alpn::default()).unwrap();
+        let long_ago = Instant::now() - SETTLE - Duration::from_millis(1);
+        push_idle(&pool, &key, dead_h1_sender().await, long_ago);
+        assert!(pool.reuse_h1(&key).await.is_none());
+        assert!(!pool.inner.closes_early(&key, Instant::now()));
+
+        pool.inner.saw_an_early_close(&key);
+        let now = Instant::now();
+        assert!(pool.inner.closes_early(&key, now));
+        assert!(
+            pool.inner
+                .closes_early(&key, now + DISTRUST - Duration::from_secs(1))
+        );
+        assert!(
+            !pool
+                .inner
+                .closes_early(&key, now + DISTRUST + Duration::from_secs(1))
+        );
+    }
+
     /// #155's mechanism at its exact point: the entry is alive when the
     /// checkout pops it and enters the gate wait, and its connection sees
     /// EOF DURING that wait. The re-check after the sleep must drop it.
@@ -1475,6 +1847,10 @@ mod tests {
         assert_eq!(
             outcome, "dropped",
             "the entry whose FIN landed during the wait must be dropped, not handed out"
+        );
+        assert!(
+            pool.inner.closes_early(&key, Instant::now()),
+            "a close during the gate wait marks the origin (#312)"
         );
     }
 
@@ -1552,8 +1928,13 @@ mod tests {
         drop(server);
         let pool = test_pool(Some(Duration::from_secs(90)));
         let key = pool_key(&"http://gate.test/".parse().unwrap(), Alpn::default()).unwrap();
-        push_idle(&pool, &key, dead, Instant::now());
-        push_idle(&pool, &key, live, Instant::now());
+        // Parked long enough ago that the front's death says nothing about
+        // how the origin closes: one that died just after parking would
+        // hold the live one back (#312,
+        // `an_origin_that_closed_early_is_not_handed_a_just_parked_connection`).
+        let parked_at = Instant::now() - SETTLE - Duration::from_millis(1);
+        push_idle(&pool, &key, dead, parked_at);
+        push_idle(&pool, &key, live, parked_at);
         // Let the dead front's connection task observe the EOF.
         tokio::time::sleep(Duration::from_millis(20)).await;
         let conn = pool

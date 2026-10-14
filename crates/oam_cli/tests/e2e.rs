@@ -12820,7 +12820,11 @@ process.exit(0);
 ///   never resent (RFC 9110 s9.2.2), so a lost race fails the fetch; with the
 ///   gate measured 0 failures per 1,000 on release builds, gate off 6-31.
 ///   Tolerated at 2 of 400: the FIN landing before the write is timing, not
-///   a guarantee, and a loaded CI box shifts it.
+///   a guarantee, and a loaded CI box shifts it. Since #312 the gate is not
+///   what most of this run rests on: the first such close marks the origin,
+///   and every later POST that follows closely dials (`pool::SETTLE`). What
+///   the tolerance now covers is each chain's first POSTs, sent before the
+///   mark; the gate itself is pinned by the pool's own unit tests.
 #[test]
 fn a_post_written_after_a_just_pooled_connections_fin_is_not_lost() {
     let script = write_temp(
@@ -12946,7 +12950,10 @@ process.exit(0);
 /// and the `/final` doubles are tolerated at <= 3 -- the same race the POST
 /// test above allows 2 per 400 for. At ~0.5 doubles per 1,000 gate on, 4 or
 /// more is a 0.2% flake; at the gate-off floor of 7 per 1,000, 3 or fewer is
-/// an 8% escape, and none from 15 per 1,000 up.
+/// an 8% escape, and none from 15 per 1,000 up. Those figures are from
+/// before #312: the first close now marks the origin and later hops dial
+/// (`pool::SETTLE`), so the tolerance covers the first hops of the eight
+/// chains, and the gate itself is pinned by the pool's own unit tests.
 #[test]
 fn a_get_hop_after_a_302_and_fin_is_read_exactly_once() {
     let script = write_temp(
@@ -13057,26 +13064,25 @@ process.exit(0);
 /// node's `end()` sends a close_notify alert first, then the FIN: the peek
 /// sees BYTES, not EOF, rustls reads the alert and reports the stream's end
 /// to hyper, and the dispatcher closes the sender on that -- the close
-/// arrives through rustls as EOF (close_notify), not as a kernel FIN. The
-/// gate's 1 ms window has to cover that extra decode, so the contract here
-/// is the two plain-TCP tests' above, with their tolerances: the `POST` +
+/// arrives through rustls as EOF (close_notify), not as a kernel FIN, and
+/// later: a turn or more of the server's event loop after the answer, which
+/// the gate's 1 ms window does not cover. The contract here is the two
+/// plain-TCP tests' above, with their tolerances: the `POST` +
 /// `200`-then-FIN row at >= 398 of 400 and the `GET` + `302` row at <= 3
 /// doubled hops of 1,000, every `/redir` request read once, every fetch
 /// answered.
 ///
-/// Ignored: oam does not meet it yet. Measured 2026-10-10 on Windows
-/// arm64, debug build, node v22.22.2 as the server, five runs: 4, 10, 53,
-/// 53 and 53 of 1,000 `GET` + `302` hops doubled, 0-7 of 1,000 fetches
-/// failed, a `/redir` request read twice in three runs, and 380-400 of 400
-/// `POST`s through -- the plain-TCP gate-off numbers, where the same box
-/// and the same run measure plain TCP at 0 doubles, 0 fails and 400 of
-/// 400. Node's own client over the same TLS server measures 0 doubles, 0
-/// fails and 400 of 400, twice. So the freshness gate does not cover the
-/// TLS close, and the row is node's to match; this test is the contract
-/// to un-ignore with the fix.
+/// What meets it (#312) is not a longer window but the pool learning the
+/// origin: one seen to close a connection right after answering on it is
+/// not handed a just-parked connection again (`pool::SETTLE`), and the TLS
+/// stream reports a close_notify the session has already read
+/// (`connector::TlsWatched`). Before that, 2026-10-10 on Windows arm64,
+/// debug build, node v22.22.2 as the server, five runs: 4, 10, 53, 53 and
+/// 53 of 1,000 `GET` + `302` hops doubled and 380-400 of 400 `POST`s
+/// through, where node's own client measures 0 and 400. The tolerances
+/// stay: the first requests to an origin go out before there is anything
+/// to have learned from.
 #[test]
-#[ignore = "the pool's freshness gate does not cover a TLS close: 4-53 of 1,000 GET + 302 hops \
-            doubled and 380-400 of 400 POSTs through where node measures 0 and 400 (see the doc)"]
 fn the_fin_gate_holds_over_tls_for_a_get_hop_and_a_post_after_a_fin() {
     let bundle = write_temp("tls-fin-gate/ca.pem", TLS_TEST_CA_CERT);
     let src = r#"import tls from 'node:tls';

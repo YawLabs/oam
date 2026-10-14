@@ -2146,7 +2146,23 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   dialing fresh instead of writing into the close. It is a timing heuristic, not a guarantee:
   a FIN still in flight after 1 ms can be raced, and the e2e guard
   `a_post_written_after_a_just_pooled_connections_fin_is_not_lost` tolerates 2 losses per
-  400. A hop that could not be sent again -- one whose method is not idempotent, a `POST`
+  400. Over TLS 1 ms is not enough -- the close is a close_notify record a busy server sends
+  a turn or more of its event loop after the answer, and 102-135 of 1,000 `GET` + `302`
+  hops were read twice against a node TLS server where plain TCP and node's own client
+  measure 0 -- so since 0.19.1 the pool also learns (#312), for http and https alike: an
+  origin found, at the next request, to have closed a connection within 250 ms of answering
+  on it is, for the next 60 s,
+  not handed a connection parked less than 250 ms ago. Such a request dials, and of the
+  connections those requests leave one is parked and the rest are closed; a connection that
+  has sat idle longer is reused as before, and an origin never seen to do it is not
+  affected. The cost is a connection per closely-following request to a marked origin,
+  which one stray close (a restart, an idle timeout that fell just after an answer) also
+  buys for a minute. A TLS connection also reports a close_notify its session has read
+  before hyper has acted on it. With both, the same run measures 0-1 hops read twice and
+  400 of 400 `POST`s through over five runs (the gate off/on figures below predate this).
+  Node has no such rule: it reads the close before it writes. What stays open is the first
+  request or two to such an origin, sent before there is anything to have learned from.
+  A hop that could not be sent again -- one whose method is not idempotent, a `POST`
   that a `307` or `308` sends on -- never goes out on the connection its 3xx came on and does
   not pool it either (#271): the hop dials a connection of its own, a cost on that path alone.
   A connection whose response says `Connection: close` is never reused, as before.
