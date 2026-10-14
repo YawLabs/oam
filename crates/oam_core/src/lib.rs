@@ -2638,15 +2638,26 @@ impl OpenFlags {
         self.0 & o_flag::CREAT != 0 && self.0 & o_flag::EXCL == 0
     }
 
-    /// open(2) with exactly these bits (and libuv's O_CLOEXEC), which is the
-    /// whole of what node's open is on unix.
-    #[cfg(unix)]
+    /// The open with node's default `mode`, 0o666: what a file it creates
+    /// gets when the caller names none.
     pub fn open(self, path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
+        self.open_with_mode(path, 0o666)
+    }
+
+    /// open(2) with exactly these bits (and libuv's O_CLOEXEC) and `mode`,
+    /// which is the whole of what node's open is on unix. The kernel uses
+    /// the mode only for a file this open creates, less the umask.
+    #[cfg(unix)]
+    pub fn open_with_mode(
+        self,
+        path: impl AsRef<std::path::Path>,
+        mode: u32,
+    ) -> std::io::Result<std::fs::File> {
         use rustix::fs::{Mode, OFlags};
         let flags = OFlags::from_bits_retain(self.0 as _) | OFlags::CLOEXEC;
         // Retried while a signal interrupts it, as std's open and libuv's are.
         let fd = rustix::io::retry_on_intr(|| {
-            rustix::fs::open(path.as_ref(), flags, Mode::from_raw_mode(0o666))
+            rustix::fs::open(path.as_ref(), flags, Mode::from_raw_mode(mode as _))
         })
         .map_err(io_from_errno)?;
         Ok(std::fs::File::from(fd))
@@ -2682,17 +2693,21 @@ impl OpenFlags {
     ///   it is an ordinary handle, which differs only together with O_APPEND
     ///   or O_DIRECT (docs/node-divergences.md).
     #[cfg(windows)]
-    pub fn open(self, path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
+    pub fn open_with_mode(
+        self,
+        path: impl AsRef<std::path::Path>,
+        mode: u32,
+    ) -> std::io::Result<std::fs::File> {
         use std::os::windows::ffi::OsStrExt;
         use std::os::windows::io::FromRawHandle;
         use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::Storage::FileSystem::{
             CREATE_ALWAYS, CREATE_NEW, CreateFileW, DELETE, FILE_APPEND_DATA,
-            FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_NO_BUFFERING, FILE_FLAG_RANDOM_ACCESS,
-            FILE_FLAG_SEQUENTIAL_SCAN, FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ,
-            FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            FILE_WRITE_DATA, OPEN_ALWAYS, OPEN_EXISTING, TRUNCATE_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_TEMPORARY,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_NO_BUFFERING,
+            FILE_FLAG_RANDOM_ACCESS, FILE_FLAG_SEQUENTIAL_SCAN, FILE_FLAG_WRITE_THROUGH,
+            FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FILE_WRITE_DATA, OPEN_ALWAYS, OPEN_EXISTING, TRUNCATE_EXISTING,
         };
         let path = path.as_ref();
         let invalid = || std::io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32);
@@ -2723,6 +2738,15 @@ impl OpenFlags {
             (true, false, true) => CREATE_ALWAYS,
         };
         let mut attributes = FILE_ATTRIBUTE_NORMAL;
+        // The one thing a mode says on Windows: an open that may create its
+        // file, with no owner-write bit, asks for a read-only one. libuv
+        // also takes its umask off first, which is the CRT's and is zero
+        // unless something in the process set it; nothing in oam does.
+        // CreateFileW applies the attribute to a file it creates or (for
+        // CREATE_ALWAYS) replaces, and ignores it for one it merely opens.
+        if has(o_flag::CREAT) && mode & 0o200 == 0 {
+            attributes |= FILE_ATTRIBUTE_READONLY;
+        }
         if has(o_flag::TEMPORARY) {
             attributes |= FILE_FLAG_DELETE_ON_CLOSE | FILE_ATTRIBUTE_TEMPORARY;
             access |= DELETE;
@@ -2792,7 +2816,11 @@ impl OpenFlags {
     }
 
     #[cfg(not(any(unix, windows)))]
-    pub fn open(self, path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
+    pub fn open_with_mode(
+        self,
+        path: impl AsRef<std::path::Path>,
+        _mode: u32,
+    ) -> std::io::Result<std::fs::File> {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
         options.open(path)
@@ -2870,10 +2898,16 @@ fn read_opened(
 
 /// `fs.writeFile` (`append == false`: `std::fs::write`'s create + truncate)
 /// or `fs.appendFile` (create + append) of a path, with the open and the write
-/// kept apart.
-pub fn write_whole_file(path: &str, data: &[u8], append: bool) -> Result<(), WholeFileError> {
+/// kept apart. `mode` is the open's (`OpenFlags::open_with_mode`): what the
+/// file gets if this creates it.
+pub fn write_whole_file(
+    path: &str,
+    data: &[u8],
+    append: bool,
+    mode: u32,
+) -> Result<(), WholeFileError> {
     let file = open_options_for(if append { "a" } else { "w" })
-        .open(path)
+        .open_with_mode(path, mode)
         .map_err(WholeFileError::Open)?;
     write_opened(&file, data)
 }
@@ -5558,7 +5592,12 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_write_file(path: super::FsPath, data: Vec<u8>, append: bool) -> OpOutcome {
+    pub async fn fs_write_file(
+        path: super::FsPath,
+        data: Vec<u8>,
+        append: bool,
+        mode: u32,
+    ) -> OpOutcome {
         // io_uring fast path (Linux, opt-in): non-append writes only (create +
         // truncate + write_all_at). `data` is moved in -- no clone on the happy
         // path. On a worker-channel failure write_file hands the un-consumed
@@ -5566,15 +5605,19 @@ pub mod ops {
         // it; a genuine io error from the worker comes back with an empty Vec
         // and is surfaced directly (node_fail), matching the read path's
         // "io_uring is a pure optimization, never a correctness dependency"
-        // contract. Append and the no-io_uring case use the std path below.
+        // contract. Append, the no-io_uring case and a `mode` other than the
+        // default (the ring's open creates with 0o666) use the std path below.
         #[cfg(target_os = "linux")]
         {
-            if !append && let Some(uring) = crate::io_uring_fs::global() {
+            if !append
+                && mode == 0o666
+                && let Some(uring) = crate::io_uring_fs::global()
+            {
                 match uring.write_file(path.os().to_string(), data).await {
                     Ok(()) => return OpOutcome::Done,
                     // Channel failure with the buffer recovered: retry via std.
                     Err((_chan_err, recovered)) if !recovered.is_empty() => {
-                        return fs_write_file_std(path, recovered, append).await;
+                        return fs_write_file_std(path, recovered, append, mode).await;
                     }
                     // Genuine io error (empty buffer), or an unrecoverable
                     // channel failure where the data is gone: surface directly.
@@ -5584,19 +5627,25 @@ pub mod ops {
                 }
             }
         }
-        fs_write_file_std(path, data, append).await
+        fs_write_file_std(path, data, append, mode).await
     }
 
     /// std write path: one blocking-pool hop, as `tokio::fs::write` makes,
     /// with the open and the write reported apart (`super::whole_file_error`).
     /// Factored out so the io_uring fast path can fall through to it with a
     /// recovered buffer on a worker-channel failure.
-    async fn fs_write_file_std(path: super::FsPath, data: Vec<u8>, append: bool) -> OpOutcome {
+    async fn fs_write_file_std(
+        path: super::FsPath,
+        data: Vec<u8>,
+        append: bool,
+        mode: u32,
+    ) -> OpOutcome {
         let owned = path.clone();
-        let result =
-            tokio::task::spawn_blocking(move || super::write_whole_file(owned.os(), &data, append))
-                .await
-                .unwrap_or_else(|e| Err(super::WholeFileError::Open(std::io::Error::other(e))));
+        let result = tokio::task::spawn_blocking(move || {
+            super::write_whole_file(owned.os(), &data, append, mode)
+        })
+        .await
+        .unwrap_or_else(|e| Err(super::WholeFileError::Open(std::io::Error::other(e))));
         let site = if append {
             super::FsSite::AppendFile
         } else {
@@ -6812,12 +6861,14 @@ pub mod ops {
         ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
         path: super::FsPath,
         flags: super::OpenFlags,
+        mode: u32,
     ) -> OpOutcome {
         let options = flags;
         // The sync family's open on the blocking pool rather than tokio::fs,
         // so the descriptor lands in the ONE registry that family also reads.
         let owned = path.clone();
-        let opened = tokio::task::spawn_blocking(move || options.open(&owned)).await;
+        let opened =
+            tokio::task::spawn_blocking(move || options.open_with_mode(&owned, mode)).await;
         let opened = match opened {
             Ok(r) => r,
             Err(e) => return node_fail(std::io::Error::other(e.to_string()), "open", &path),
@@ -7230,6 +7281,76 @@ mod os_error_code_tests {
     }
 
     #[cfg(windows)]
+    /// #324: the mode of an open that creates its file is the file's. A mode
+    /// with no owner-write bit makes it read-only on every platform; one
+    /// that merely opens a file leaves it as it was.
+    #[test]
+    fn a_creating_open_applies_its_mode() {
+        let dir = std::env::temp_dir().join(format!("oam-open-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let readonly = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().readonly();
+
+        for (i, flags) in ["w", "a", "wx", "a+", "w+"].into_iter().enumerate() {
+            let made = dir.join(format!("made-{i}"));
+            drop(
+                open_options_for(flags)
+                    .open_with_mode(&made, 0o444)
+                    .unwrap(),
+            );
+            assert!(
+                readonly(&made),
+                "{flags} with 0o444 creates a read-only file"
+            );
+            let plain = dir.join(format!("plain-{i}"));
+            drop(open_options_for(flags).open(&plain).unwrap());
+            assert!(
+                !readonly(&plain),
+                "{flags} with the default mode creates a writable one"
+            );
+        }
+
+        // Already there: an open that does not replace it changes nothing.
+        let kept = dir.join("kept");
+        std::fs::write(&kept, b"x").unwrap();
+        for flags in ["a", "a+", "r+", "r"] {
+            drop(
+                open_options_for(flags)
+                    .open_with_mode(&kept, 0o444)
+                    .unwrap(),
+            );
+            assert!(
+                !readonly(&kept),
+                "{flags} over an existing file leaves its mode"
+            );
+        }
+
+        let through = dir.join("whole");
+        write_whole_file(through.to_str().unwrap(), b"x", false, 0o444).unwrap();
+        assert!(readonly(&through));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let private = dir.join("private");
+            drop(
+                open_options_for("w")
+                    .open_with_mode(&private, 0o600)
+                    .unwrap(),
+            );
+            let mode = std::fs::metadata(&private).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "0o600 leaves nothing for group or other");
+        }
+
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn windows_access_denied_is_eperm_everywhere_but_a_wrong_mode_descriptor() {
         use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
@@ -7355,7 +7476,7 @@ mod os_error_code_tests {
         assert!(matches!(failed, WholeFileError::Open(_)), "{failed:?}");
         assert_eq!(whole_file_error(FsSite::ReadFile, missing, &failed), enoent);
         for (site, append) in [(FsSite::WriteFile, false), (FsSite::AppendFile, true)] {
-            let failed = write_whole_file(missing, b"x", append).unwrap_err();
+            let failed = write_whole_file(missing, b"x", append, 0o666).unwrap_err();
             assert!(matches!(failed, WholeFileError::Open(_)), "{failed:?}");
             assert_eq!(whole_file_error(site, missing, &failed), enoent);
         }
@@ -7370,12 +7491,12 @@ mod os_error_code_tests {
         let file = dir.join("f.bin");
         let file = file.to_str().unwrap();
         let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-        write_whole_file(file, &big, false).unwrap();
+        write_whole_file(file, &big, false, 0o666).unwrap();
         assert_eq!(read_whole_file(file).unwrap(), big);
-        write_whole_file(file, b"ab", false).unwrap();
-        write_whole_file(file, b"cd", true).unwrap();
+        write_whole_file(file, b"ab", false, 0o666).unwrap();
+        write_whole_file(file, b"cd", true, 0o666).unwrap();
         assert_eq!(read_whole_file(file).unwrap(), b"abcd");
-        write_whole_file(file, b"", false).unwrap();
+        write_whole_file(file, b"", false, 0o666).unwrap();
         assert_eq!(read_whole_file(file).unwrap(), b"");
         // A stale size hint (the file grew or shrank since the fstat): the
         // read still returns what is there.
@@ -7499,7 +7620,7 @@ mod os_error_code_tests {
             "EBUSY: resource busy or locked, read"
         );
         for (site, append) in [(FsSite::AppendFile, true), (FsSite::WriteFile, false)] {
-            let failed = write_whole_file(file_s, b"B=2\n", append).unwrap_err();
+            let failed = write_whole_file(file_s, b"B=2\n", append, 0o666).unwrap_err();
             assert!(matches!(failed, WholeFileError::Transfer(_)), "{failed:?}");
             assert_eq!(whole_file_error(site, file_s, &failed), busy("write"));
         }
@@ -7525,7 +7646,7 @@ mod os_error_code_tests {
             }
         );
         for (site, append) in [(FsSite::WriteFile, false), (FsSite::AppendFile, true)] {
-            let failed = write_whole_file("/dev/full", b"x", append).unwrap_err();
+            let failed = write_whole_file("/dev/full", b"x", append, 0o666).unwrap_err();
             assert!(matches!(failed, WholeFileError::Transfer(_)), "{failed:?}");
             assert_eq!(
                 whole_file_error(site, "/dev/full", &failed),
@@ -7716,13 +7837,13 @@ mod os_error_code_tests {
 
         // The whole-file operations: writeFile fails on the open, appendFile
         // opens and fails on the write -- unless there is nothing to write.
-        let failed = write_whole_file(dir_s, b"x", false).unwrap_err();
+        let failed = write_whole_file(dir_s, b"x", false, 0o666).unwrap_err();
         assert!(matches!(failed, WholeFileError::Open(_)), "{failed:?}");
         assert_eq!(
             whole_file_error(FsSite::WriteFile, dir_s, &failed),
             expect("EISDIR", "open", true)
         );
-        let failed = write_whole_file(dir_s, b"x", true).unwrap_err();
+        let failed = write_whole_file(dir_s, b"x", true, 0o666).unwrap_err();
         assert!(matches!(failed, WholeFileError::Transfer(_)), "{failed:?}");
         let failure = whole_file_error(FsSite::AppendFile, dir_s, &failed);
         assert_eq!(failure, expect("EISDIR", "write", false));
@@ -7730,7 +7851,7 @@ mod os_error_code_tests {
             fs_error_message(failure, dir_s, failed.io()),
             "EISDIR: illegal operation on a directory, write"
         );
-        write_whole_file(dir_s, b"", true).expect("an empty append to a directory succeeds");
+        write_whole_file(dir_s, b"", true, 0o666).expect("an empty append to a directory succeeds");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -7842,7 +7963,7 @@ mod os_error_code_tests {
             }
         }
         fill();
-        write_whole_file(file_s, b"x", false).unwrap();
+        write_whole_file(file_s, b"x", false, 0o666).unwrap();
         assert!(stream_is_there(false));
         assert_eq!(std::fs::read(&file).unwrap(), b"x");
         // A missing file is made; a missing directory is not.
@@ -7879,7 +8000,7 @@ mod os_error_code_tests {
                     "{flags}: {failed:?}"
                 );
             }
-            let failed = write_whole_file(file_s, b"x", false).unwrap_err();
+            let failed = write_whole_file(file_s, b"x", false, 0o666).unwrap_err();
             assert_eq!(
                 whole_file_error(FsSite::WriteFile, file_s, &failed).code,
                 "EPERM"
@@ -8022,7 +8143,7 @@ mod os_error_code_tests {
                 let opened = open_options_for(flags).open(name);
                 assert!(opened.is_ok(), "{name} {flags}: {opened:?}");
             }
-            write_whole_file(name, b"gone", false).unwrap();
+            write_whole_file(name, b"gone", false, 0o666).unwrap();
         }
         for (name, root) in [
             (r"\\.\CON", false),
@@ -8072,7 +8193,7 @@ mod os_error_code_tests {
                 "{root}: {failed:?}"
             );
             // A truncating open never opens a root.
-            let failed = write_whole_file(root, b"", false).unwrap_err();
+            let failed = write_whole_file(root, b"", false, 0o666).unwrap_err();
             assert_eq!(
                 whole_file_error(FsSite::WriteFile, root, &failed),
                 expect("EPERM", "open", true),
@@ -8088,7 +8209,7 @@ mod os_error_code_tests {
             }
             // Any other open for writing is refused by the ACL, and an
             // elevated process is not refused: only a refusal has a shape.
-            if let Err(failed) = write_whole_file(root, b"", true) {
+            if let Err(failed) = write_whole_file(root, b"", true, 0o666) {
                 assert_eq!(
                     whole_file_error(FsSite::AppendFile, root, &failed),
                     expect("EPERM", "open", true),
@@ -8125,7 +8246,7 @@ mod os_error_code_tests {
                 "{failed:?}"
             );
             for (site, append) in [(FsSite::WriteFile, false), (FsSite::AppendFile, true)] {
-                let failed = write_whole_file(ipc, b"", append).unwrap_err();
+                let failed = write_whole_file(ipc, b"", append, 0o666).unwrap_err();
                 assert_eq!(
                     whole_file_error(site, ipc, &failed),
                     expect("EINVAL", "open", true),

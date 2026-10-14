@@ -6643,7 +6643,8 @@ fn op_fs_write_file_sync(
         return;
     };
     let append = args.get(2).is_true();
-    if let Err(e) = oam_core::write_whole_file(path.os(), &bytes, append) {
+    let mode = open_mode_arg(scope, &args, 3);
+    if let Err(e) = oam_core::write_whole_file(path.os(), &bytes, append, mode) {
         let site = if append {
             oam_core::FsSite::AppendFile
         } else {
@@ -6976,10 +6977,11 @@ fn op_fs_write_file(
         return;
     };
     let append = args.get(2).is_true();
+    let mode = open_mode_arg(scope, &args, 3);
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::fs_write_file(path, bytes, append),
+        oam_core::ops::fs_write_file(path, bytes, append, mode),
     );
 }
 
@@ -7856,6 +7858,22 @@ fn open_flags_arg(
     oam_core::OpenFlags(bits)
 }
 
+/// The `mode` of an open that may create its file, as the shim hands it
+/// over (already through node's parseFileMode); 0o666, node's default, for
+/// anything else.
+fn open_mode_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+) -> u32 {
+    let value = args.get(index);
+    if value.is_number() {
+        value.uint32_value(scope).unwrap_or(0o666)
+    } else {
+        0o666
+    }
+}
+
 /// fsOpenFlagBits() -> [[name, value], ...]: `fs.constants`' open flags on
 /// this platform (see `oam_core::open_flag_table`).
 fn op_fs_open_flag_bits(
@@ -7877,8 +7895,9 @@ fn op_fs_open(
         throw_type_error(scope, "fsOpen requires a path");
         return;
     };
-    let mode = open_flags_arg(scope, &args, 1);
-    let Some(path) = open_path_of(scope, path, mode) else {
+    let flags = open_flags_arg(scope, &args, 1);
+    let mode = open_mode_arg(scope, &args, 2);
+    let Some(path) = open_path_of(scope, path, flags) else {
         return;
     };
     let core = core_runtime!(scope);
@@ -7887,7 +7906,7 @@ fn op_fs_open(
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::fs_open(files, ids, path, mode),
+        oam_core::ops::fs_open(files, ids, path, flags, mode),
     );
 }
 
@@ -7968,7 +7987,7 @@ fn throw_ebadf(scope: &mut v8::PinScope<'_, '_>, syscall: &str) {
     scope.throw_exception(exception);
 }
 
-/// fsOpenSync(path, flags) -> fd. Synchronous open backed by std::fs::File in
+/// fsOpenSync(path, flags, mode) -> fd. Synchronous open backed by std::fs::File in
 /// the sync-file registry; the returned number is the integer fd. The classic
 /// callback/`*Sync` fd API some packages (graceful-fs/playwright lock probe)
 /// require -- they read `err.code === "ENOENT"` to distinguish missing from
@@ -7983,10 +8002,11 @@ fn op_fs_open_sync(
         return;
     };
     let flags = open_flags_arg(scope, &args, 1);
+    let mode = open_mode_arg(scope, &args, 2);
     let Some(path) = open_path_of(scope, path, flags) else {
         return;
     };
-    match flags.open(&path) {
+    match flags.open_with_mode(&path, mode) {
         Ok(file) => {
             let core = core_runtime!(scope);
             let id = core

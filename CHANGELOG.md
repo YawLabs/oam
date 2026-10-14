@@ -20,6 +20,15 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **The `mode` of an open that creates its file is applied (#324).** It was checked and then
+  dropped: every file was created with the default `0o666`. On Windows a mode with no
+  owner-write bit now creates the file read-only, as node's does (`openSync(f, "w", 0o444)`
+  gave a writable file); on Linux and macOS the mode goes to `open(2)`, so a file created
+  `0o600` is no longer readable by group and other. This holds for `fs.open`, `openSync`
+  and `fs.promises.open`, for `writeFile` and `appendFile` in their three forms, and for
+  `createWriteStream` and `createReadStream`. A file that is already there keeps its mode,
+  except, on Windows and as with node, one a truncating open (`"w"`) replaces.
+
 - **The pool learns an origin that closes right after answering, so a request is not written
   into a connection it is closing (#312).** A server that answers and closes in one go -- a
   `302` then `end()`, the last answer of a keep-alive budget -- left a pooled connection
