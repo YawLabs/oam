@@ -6889,7 +6889,7 @@ fn op_fs_unlink_sync(
     ) else {
         return;
     };
-    if let Err(e) = std::fs::remove_file(&path) {
+    if let Err(e) = oam_core::unlink_path(path.as_ref()) {
         throw_node_error(scope, "unlink", &path, &e);
     }
 }

@@ -3734,6 +3734,36 @@ way; the difference is that a symlink needs the create-symlink privilege (Develo
 an elevated process), which a junction does not, so where that privilege is missing oam's
 call fails `EPERM` and node's succeeds. Measured against v22.22.2 (conformance case 377).
 
+### `fs.cpSync` where node's C++ fails by its platform's std::filesystem
+
+`fs.cpSync` of a directory with no `filter` runs in node's C++ (`CpSyncCopyDir`), over
+std::filesystem. Four of its failures come out of the C++ library rather than node, so they
+differ by platform. oam fails each as node does on Linux (libstdc++), on every platform:
+
+- **`errorOnExist` with a file already there** (`force: false`). On Linux, a plain Error,
+  `ERR_FS_CP_EEXIST` `[ERR_FS_CP_EEXIST]: Target already exists: cp returned EEXIST (<path>
+  already exists)`. On Windows, node's check for `EEXIST` misses MSVC's
+  `ERROR_FILE_EXISTS` (80), so it throws `errno` 80 with an empty `code` and the message
+  `, The file exists. '<dir>'`.
+- **A file copied where a directory is.** On Linux `ENOTSUP, Operation not supported '<dir>'`.
+  On Windows `EIO, Access is denied. '<dir>'`.
+- **A file already there that is the same file** (a hard link to the source). On Linux
+  `ERR_FS_CP_EEXIST`, as for `errorOnExist`, whatever `force` says. On Windows MSVC reports a
+  sharing violation, `EPIPE` 32 `The process cannot access the file because it is being used
+  by another process.`, or with `errorOnExist` the errno-80 error above.
+- **A directory copied where a file is.** node does not catch std::filesystem's exception
+  and the process aborts (`SIGABRT` on Linux, `0xC0000409` on Windows). oam fails
+  `EEXIST, File exists '<path>'` (`syscall` `cp`), the shape of node's other
+  std::filesystem failures. So does a junction (Windows) that leads back into the tree it is
+  in: node's C++ follows it until the path is too long, and aborts; oam fails `ELOOP`.
+
+The texts of oam's other std::filesystem-shaped failures in that copy (a link that
+cannot be made, a directory that cannot be created) are glibc's `strerror`, which is
+what node prints on Linux; on Windows node prints the system's message. Measured against
+v22.22.2 on Windows and Linux; macOS (libc++) is not measured. cp's and
+`fs.promises.cp`'s copies, and cpSync with a `filter`, are node's JS and match it
+(conformance case 410).
+
 ### `fs.realpath` under `--permission` — oam is stricter
 
 Measured against Node v22.22.2: with `--permission` and no grants, node allows

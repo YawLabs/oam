@@ -16,8 +16,10 @@ and `lib/internal/streams/*` -- at `js/vendor/node-streams/` (upstream tag and
 per-file checksums in that directory's `UPSTREAM` manifest). These files are
 compiled into every released binary and are invisible to `cargo about` (they
 are not a cargo dependency), so their notice is carried by this hand-maintained
-template section, same as the V8 entry in `NOTICE`. Node.js is distributed
-under the MIT license:
+template section, same as the V8 entry in `NOTICE`. Parts of oam's own Node
+API (`js/node_compat.js` and the other `js/` sources) are ports of Node.js's
+`lib/` code, each marked by a comment naming the source it follows; they
+carry the same notice. Node.js is distributed under the MIT license:
 
 ```text
 Copyright Node.js contributors. All rights reserved.
@@ -41,6 +43,33 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+```
+
+Node.js's fs copy (`lib/internal/fs/cp`), which oam's `fs.cp` follows, is a
+modified version of node-fs-extra's, licensed as follows:
+
+```text
+(The MIT License)
+
+Copyright (c) 2011-2017 JP Richardson
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the 'Software'), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```
 
 ## Summary
