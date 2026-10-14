@@ -2150,7 +2150,8 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   a turn or more of its event loop after the answer, and 102-135 of 1,000 `GET` + `302`
   hops were read twice against a node TLS server where plain TCP and node's own client
   measure 0 -- so since 0.19.1 the pool also learns (#312), for http and https alike: an
-  origin seen to close a connection within 250 ms of answering on it is, for the next 60 s,
+  origin found, at the next request, to have closed a connection within 250 ms of answering
+  on it is, for the next 60 s,
   not handed a connection parked less than 250 ms ago. Such a request dials, and of the
   connections those requests leave one is parked and the rest are closed; a connection that
   has sat idle longer is reused as before, and an origin never seen to do it is not

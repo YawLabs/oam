@@ -542,7 +542,9 @@ async fn a_request_on_a_closed_pooled_connection_is_sent_again() {
         // Warm the pool, then let hyper-util put the connection back into it.
         let p = payload(reg.fetch(&transport, json!({ "url": &url })).await);
         assert_eq!(reg.text(handle_of(&p)).await, "ok");
-        let_the_pool_settle().await;
+        // Short: the close the next request meets has to be seen well inside
+        // the pool's `SETTLE` (250 ms) for the origin to be marked by it.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert_eq!(server.accepts(), 1);
 
         let p = payload(reg.fetch(&transport, json!({ "url": &url })).await);
@@ -558,8 +560,8 @@ async fn a_request_on_a_closed_pooled_connection_is_sent_again() {
         // The origin has now been seen to close a connection it had just
         // answered on, so the one parked a moment ago is not trusted with
         // the next request (#312): a POST that follows closely dials its
-        // own, and is answered where it would have been lost.
-        let_the_pool_settle().await;
+        // own, and is answered where it would have been lost. No wait: it
+        // dials whether or not the retry's connection is parked yet.
         let p = payload(
             reg.fetch(&transport, json!({ "url": &url, "method": "POST" }))
                 .await,

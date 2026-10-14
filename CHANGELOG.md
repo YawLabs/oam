@@ -27,8 +27,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   into it: read twice by the server, or lost if it could not be sent again. The pool's 1 ms
   wait covered a plain-TCP close and not a TLS one, which arrives later (102-135 of 1,000
   redirect hops read twice and 288-313 of 400 `POST`s through, against a node TLS server
-  where node's own client measures 0 and 400). The pool now remembers an origin that closes
-  a connection within 250 ms of answering on it and, for a minute, does not reuse a
+  where node's own client measures 0 and 400). The pool now remembers an origin it finds
+  has closed a connection within 250 ms of answering on it and, for a minute, does not reuse a
   connection to it parked less than 250 ms ago: such a request opens its own, and of the
   connections those leave one is kept. The rule is per origin and applies to http as well
   as https, so an origin that closes after some answers sees more connections from oam for

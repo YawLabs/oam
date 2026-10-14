@@ -80,6 +80,9 @@ pub(crate) struct ConnStats {
     /// Set once the TLS session has the peer's close_notify (see
     /// [`TlsWatched`]); `None` for a connection with no TLS of its own.
     peer_closed: Option<Arc<AtomicBool>>,
+    /// Set when it is this side that closed the connection: JS asked for
+    /// it ([`ConnCloser`]), so the close says nothing about the origin.
+    closed_here: Arc<AtomicBool>,
     /// The response-byte count when this copy was made from the pool's own
     /// copy; `None` on the pool's own copy.
     read_at_checkout: Option<u64>,
@@ -102,6 +105,7 @@ impl ConnStats {
         ConnStats {
             counters: Arc::new(ConnCounters::default()),
             peer_closed: None,
+            closed_here: Arc::new(AtomicBool::new(false)),
             read_at_checkout: None,
         }
     }
@@ -113,6 +117,7 @@ impl ConnStats {
         ConnStats {
             counters: self.counters.clone(),
             peer_closed: self.peer_closed.clone(),
+            closed_here: self.closed_here.clone(),
             read_at_checkout: None,
         }
     }
@@ -122,6 +127,17 @@ impl ConnStats {
         self.peer_closed
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
+    /// This side closed the connection, at JS's asking.
+    pub(crate) fn closed_here(&self) -> bool {
+        self.closed_here.load(Ordering::Acquire)
+    }
+
+    /// The flag [`ConnStats::closed_here`] reads, for the connection's task
+    /// to set as it drops the connection.
+    pub(crate) fn closed_here_flag(&self) -> Arc<AtomicBool> {
+        self.closed_here.clone()
     }
 
     /// Counts one more request on this connection: true when an earlier
@@ -156,6 +172,7 @@ impl Clone for ConnStats {
         ConnStats {
             counters: self.counters.clone(),
             peer_closed: self.peer_closed.clone(),
+            closed_here: self.closed_here.clone(),
             read_at_checkout: Some(
                 self.read_at_checkout
                     .unwrap_or_else(|| self.counters.read.load(Ordering::Relaxed)),
