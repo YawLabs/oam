@@ -2333,9 +2333,10 @@ fn run_file_with_flags(
             // 7 = throwing uncaughtException handler): Node exits WITHOUT
             // emitting 'exit', and the code is not handler-overridable.
             let sub_code = rt
-                .execute_script(
+                .execute_script_draining(
                     "<fatal-sub-code>",
                     "String((globalThis.process && globalThis.process.__oamFatalCode) || '')",
+                    oam_engine::AfterScript::Nothing,
                 )
                 .ok()
                 .and_then(|s| s.parse::<u8>().ok());
@@ -2352,9 +2353,10 @@ fn run_file_with_flags(
             // TriggerUncaughtException (UNCONDITIONALLY -- an earlier script
             // assignment loses), emits 'exit', then re-reads: a handler
             // mutating exitCode (98, or back to 0) decides the final code.
-            let _ = rt.execute_script(
+            let _ = rt.execute_script_draining(
                 "<fatal-exit-code>",
                 "(function () { var p = globalThis.process; if (p) { p.exitCode = 1; } })();",
+                oam_engine::AfterScript::Nothing,
             );
             rt.emit_process_exit();
             let final_code = rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8;
@@ -3069,9 +3071,10 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
                 render(d, false);
             }
             let sub_code = rt
-                .execute_script(
+                .execute_script_draining(
                     "<fatal-sub-code>",
                     "String((globalThis.process && globalThis.process.__oamFatalCode) || '')",
+                    oam_engine::AfterScript::Nothing,
                 )
                 .ok()
                 .and_then(|s| s.parse::<u8>().ok());
@@ -3080,9 +3083,10 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
                 oam_engine::run_exit_hooks();
                 return ExitCode::from(code);
             }
-            let _ = rt.execute_script(
+            let _ = rt.execute_script_draining(
                 "<fatal-exit-code>",
                 "(function () { var p = globalThis.process; if (p) { p.exitCode = 1; } })();",
+                oam_engine::AfterScript::Nothing,
             );
             rt.emit_process_exit();
             ExitCode::from(rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8)
@@ -3215,9 +3219,10 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
                 render(d, false);
             }
             let sub_code = rt
-                .execute_script(
+                .execute_script_draining(
                     "<fatal-sub-code>",
                     "String((globalThis.process && globalThis.process.__oamFatalCode) || '')",
+                    oam_engine::AfterScript::Nothing,
                 )
                 .ok()
                 .and_then(|s| s.parse::<u8>().ok());
@@ -3226,9 +3231,10 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
                 oam_engine::run_exit_hooks();
                 return ExitCode::from(code);
             }
-            let _ = rt.execute_script(
+            let _ = rt.execute_script_draining(
                 "<fatal-exit-code>",
                 "(function () { var p = globalThis.process; if (p) { p.exitCode = 1; } })();",
+                oam_engine::AfterScript::Nothing,
             );
             rt.emit_process_exit();
             ExitCode::from(rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8)

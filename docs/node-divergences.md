@@ -3738,11 +3738,18 @@ call fails `EPERM` and node's succeeds. Measured against v22.22.2 (conformance c
 
 oam evaluates a module that `import()` loads synchronously, inside its import hook, while the
 importer's frame is still on the stack. node loads and evaluates it in a later job, inside a
-microtask drain. From an ES module the two agree. From CommonJS the `process.nextTick`
-callbacks the imported module queues at its top level run before the importer's continuation:
-`micro | tick | after import` where node prints `micro | after import | tick`. Tracked in #397.
+microtask drain. So the imported module's synchronous top level runs before the importer's
+next statement, where in node it runs after the importer's own synchronous code and promise
+jobs, and its `process.nextTick` callbacks run ahead of ticks the importer queued after the
+call. From CommonJS they also run before the importer's continuation: `micro | tick | after
+import` where node prints `micro | after import | tick`. Only an ES module that awaits
+`import()` as its first step lines up with node. Tracked in #397.
+
 An ES module's own top level orders ticks after its promise jobs, as node's does (#345,
-conformance case 411).
+conformance case 411). Under `oam test`, though, a test file's `test()` bodies run after the
+file's top-level `process.nextTick` callbacks; under `node --test` they run after its promise
+jobs but before its ticks. oam runs the registered tests once the file's module has run and its
+event loop has drained.
 ### `fs.cpSync` where node's C++ fails by its platform's std::filesystem
 
 `fs.cpSync` of a directory with no `filter` runs in node's C++ (`CpSyncCopyDir`), over

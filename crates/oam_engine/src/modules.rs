@@ -261,6 +261,17 @@ pub(crate) fn dispatch_uncaught(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     exception: v8::Local<v8::Value>,
 ) -> Uncaught {
+    dispatch_uncaught_from(tc, exception, "uncaughtException")
+}
+
+/// [`dispatch_uncaught`] with the `origin` the listeners see: node's
+/// `'unhandledRejection'` for an ES module entry's own throw, which reaches
+/// it as the rejection of the module's evaluation.
+pub(crate) fn dispatch_uncaught_from(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    exception: v8::Local<v8::Value>,
+    origin: &str,
+) -> Uncaught {
     let lookup = (|| {
         let context = tc.get_current_context();
         let global = context.global(tc);
@@ -275,7 +286,10 @@ pub(crate) fn dispatch_uncaught(
         };
     };
     let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
-    match dispatch.call(tc, recv, &[exception]) {
+    let Some(origin) = v8::String::new(tc, origin) else {
+        return Uncaught::Fatal;
+    };
+    match dispatch.call(tc, recv, &[exception, origin.into()]) {
         Some(result) => {
             if result.is_true() {
                 Uncaught::Handled
@@ -525,6 +539,11 @@ pub(crate) fn drain_uncaught(
                 fatal_report(tc, local, frame, &message),
             ));
         }
+        // A fatal throw ends the run here: node exits at it, and nothing
+        // queued since -- a tick, a promise job -- runs (#345 review).
+        if !fatal.is_empty() {
+            break;
+        }
         // Flush what the listeners queued -- explicit policy means nothing
         // else will until the next macrotask boundary. A fatal tick throw
         // from that flush fails the run: merge its report and stop quiescing.
@@ -758,9 +777,9 @@ impl JsRuntime {
         // reached: `process.nextTick` there runs after them, not ahead
         // (#345). A bare checkpoint first, then the tick point.
         tc.perform_microtask_checkpoint();
-        if let Some(failure) = run_ticks_and_microtasks(tc) {
-            return Err(failure);
-        }
+        // A promise job in that drain that threw: fatal, it ends the run
+        // before any tick, as node exits at it; handled, it is delivered
+        // before the ticks.
         if let Some(failure) = drain_uncaught(tc) {
             return Err(failure);
         }
@@ -768,7 +787,18 @@ impl JsRuntime {
         let promise = v8::Local::<v8::Promise>::try_from(value)
             .map_err(|_| rt_diag("OAM-RT0001", "module evaluation did not return a promise"))?;
 
-        pump_event_loop(tc, Some(promise), true)?;
+        // The entry's own throw -- at its top level, or after a top-level
+        // await the drain settled -- is reported from inside node's drain,
+        // so no tick runs before the uncaughtException ladder does.
+        if promise.state() != v8::PromiseState::Rejected {
+            if let Some(failure) = run_ticks_and_microtasks(tc) {
+                return Err(failure);
+            }
+            if let Some(failure) = drain_uncaught(tc) {
+                return Err(failure);
+            }
+            pump_event_loop(tc, Some(promise), true)?;
+        }
 
         match promise.state() {
             v8::PromiseState::Fulfilled => match unhandled_rejection_failures(tc) {
@@ -786,31 +816,39 @@ impl JsRuntime {
                 // The full ladder, same as the CJS path: monitor -> capture
                 // callback -> listeners. A bare emit here skipped
                 // uncaughtExceptionMonitor entirely and mis-reported a
-                // throwing handler.
-                let (exception, frame) = match dispatch_uncaught(tc, exception) {
-                    Uncaught::Handled => {
-                        // A listener suppressed the fatal exit: continue like
-                        // a clean run -- drain ticks + microtasks the handler
-                        // queued (delivering any fresh throws), pump any
-                        // pending timers/ops, then report unhandled
-                        // rejections.
-                        if let Some(failure) = run_ticks_and_microtasks(tc) {
-                            return Err(failure);
+                // throwing handler. node's origin for it is
+                // 'unhandledRejection': its loader sees the evaluation's
+                // rejection.
+                let (exception, frame) =
+                    match dispatch_uncaught_from(tc, exception, "unhandledRejection") {
+                        Uncaught::Handled => {
+                            // A listener suppressed the fatal exit: continue like
+                            // a clean run -- drain ticks + microtasks the handler
+                            // queued (delivering any fresh throws), pump any
+                            // pending timers/ops, then report unhandled
+                            // rejections. The handler's promise jobs first: in
+                            // node it runs inside the drain, ahead of the ticks.
+                            tc.perform_microtask_checkpoint();
+                            if let Some(failure) = drain_uncaught(tc) {
+                                return Err(failure);
+                            }
+                            if let Some(failure) = run_ticks_and_microtasks(tc) {
+                                return Err(failure);
+                            }
+                            if let Some(failure) = drain_uncaught(tc) {
+                                return Err(failure);
+                            }
+                            pump_event_loop(tc, None, true)?;
+                            return match unhandled_rejection_failures(tc) {
+                                Some(failures) => Err(failures),
+                                None => Ok(()),
+                            };
                         }
-                        if let Some(failure) = drain_uncaught(tc) {
-                            return Err(failure);
+                        Uncaught::Fatal => (exception, None),
+                        Uncaught::HandlerThrew { value, frame, .. } => {
+                            (v8::Local::new(tc, &value), frame)
                         }
-                        pump_event_loop(tc, None, true)?;
-                        return match unhandled_rejection_failures(tc) {
-                            Some(failures) => Err(failures),
-                            None => Ok(()),
-                        };
-                    }
-                    Uncaught::Fatal => (exception, None),
-                    Uncaught::HandlerThrew { value, frame, .. } => {
-                        (v8::Local::new(tc, &value), frame)
-                    }
-                };
+                    };
                 let text = exception
                     .to_string(tc)
                     .map(|s| s.to_rust_string_lossy(tc))

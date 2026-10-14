@@ -7,6 +7,12 @@
 // left out: oam evaluates it inside the import hook, and its ticks run
 // before the importer's continuation -- #397, docs/node-divergences.md.)
 //
+// And on the way out, as node: an ES module entry that throws -- at its
+// top level, or after a top-level await -- runs no tick before the
+// uncaughtException ladder, whose origin for it is 'unhandledRejection'; a
+// fatal microtask throw runs no tick after it; a nextTick from an 'exit'
+// listener never runs, the promise jobs those listeners queue do.
+//
 // Regression guard: oam ran an ES module's top-level ticks ahead of its
 // promise jobs.
 import { spawnSync } from "node:child_process";
@@ -52,6 +58,34 @@ log.push("after import");
 await new Promise((r) => setTimeout(r, 5));
 console.log(log.join(" | "));
 `;
+const throws = `
+process.nextTick(() => console.log("tick"));
+Promise.resolve().then(() => console.log("micro"));
+throw new Error("boom");
+`;
+const throwsLate = `
+process.nextTick(() => console.log("tick"));
+await null;
+console.log("after await");
+throw new Error("boom");
+`;
+const origin = `
+process.on("uncaughtException", (e, origin) => console.log("uncaughtException", origin, e.message));
+process.nextTick(() => console.log("tick"));
+throw new Error("boom");
+`;
+const microThrow = `
+process.on("exit", (code) => console.log("exit", code));
+process.nextTick(() => console.log("tick"));
+queueMicrotask(() => { throw new Error("boom"); });
+`;
+const exitListener = `
+process.on("exit", () => {
+  process.nextTick(() => console.log("tick in exit"));
+  Promise.resolve().then(() => console.log("micro in exit"));
+  console.log("exit");
+});
+`;
 // A worker whose entry is an ES module.
 const worker = `
 import { Worker } from "node:worker_threads";
@@ -64,6 +98,11 @@ const files = {
   "imported.mjs": imported,
   "importer.mjs": importer,
   "worker.mjs": worker,
+  "throws.mjs": throws,
+  "throws-late.mjs": throwsLate,
+  "origin.mjs": origin,
+  "micro-throw.mjs": microThrow,
+  "exit-listener.cjs": exitListener,
 };
 for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text);
 try {
@@ -76,6 +115,18 @@ try {
   ]) {
     const run = spawnSync(process.execPath, [file], { cwd: dir, encoding: "utf8" });
     console.log(`${label}: ${run.stdout.trim()}${run.status === 0 ? "" : ` (status ${run.status}) ${run.stderr.trim().split("\n")[0]}`}`);
+  }
+  // Exits that fail: what ran (stdout) and the status; the report itself
+  // names the file each runtime's way.
+  for (const [label, file] of [
+    ["ES module entry that throws", "throws.mjs"],
+    ["ES module entry that throws after await", "throws-late.mjs"],
+    ["origin of an ES module entry's throw", "origin.mjs"],
+    ["fatal microtask throw", "micro-throw.mjs"],
+    ["'exit' listener's tick and promise job", "exit-listener.cjs"],
+  ]) {
+    const run = spawnSync(process.execPath, [file], { cwd: dir, encoding: "utf8" });
+    console.log(`${label}: ${run.stdout.trim().split(/\r?\n/).join(" | ")} (status ${run.status})`);
   }
 } finally {
   fs.rmSync(dir, { recursive: true, force: true });
