@@ -833,8 +833,8 @@ pub fn node_declared_module_kind(path: &Path) -> Option<ModuleKind> {
 }
 
 /// The nearest package.json "type" above `path`, up to a node_modules
-/// boundary: "module" is ESM, any other value CJS, none (or no package.json)
-/// None.
+/// boundary: "module" is ESM, "commonjs" CJS, and none -- or any other value,
+/// which node's package.json reader takes for none -- None.
 fn declared_package_type(path: &Path) -> Option<ModuleKind> {
     let mut dir = path.parent();
     while let Some(current) = dir {
@@ -848,8 +848,8 @@ fn declared_package_type(path: &Path) -> Option<ModuleKind> {
             });
             return match declared.as_deref() {
                 Some("module") => Some(ModuleKind::Esm),
-                Some(_) => Some(ModuleKind::Cjs),
-                None => None,
+                Some("commonjs") => Some(ModuleKind::Cjs),
+                _ => None,
             };
         }
         if current

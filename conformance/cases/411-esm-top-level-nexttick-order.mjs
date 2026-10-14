@@ -14,10 +14,12 @@
 // listener never runs, the promise jobs those listeners queue do. A
 // top-level await that never settles exits naturally, code 13.
 //
-// A .js file with no package.json "type" is one node decides by its syntax:
-// with an import or export, a top-level await or import.meta it is an ES
-// module (micro first); without, CommonJS (tick first), and its throw is
-// an uncaughtException. oam runs both as ES modules but orders them as node
+// A .js file with no package.json "type" is one node decides by its syntax
+// (containsModuleSyntax): with an import or export (even `export {}`), a
+// top-level await or import.meta, or a top-level declaration of a name
+// CommonJS's wrapper owns (`const require`), it is an ES module (micro
+// first); without, CommonJS (tick first), and its throw is an
+// uncaughtException. oam runs both as ES modules but orders them as node
 // does.
 //
 // Regression guard: oam ran an ES module's top-level ticks ahead of its
@@ -143,6 +145,15 @@ export const x = 1;
 const withMeta = `${plain}
 void import.meta.url;
 `;
+const exportEmpty = `${plain}
+export {};
+`;
+const redeclared = `${plain}
+const require = 1;
+`;
+const metaInComment = `${plain}
+// import.meta
+`;
 const plainThrows = `
 process.on("uncaughtException", (e, origin) => console.log("uncaughtException", origin));
 process.nextTick(() => console.log("tick"));
@@ -182,6 +193,9 @@ for (const [name, text] of Object.entries({
   "with-export.js": withExport,
   "with-meta.js": withMeta,
   "plain-throws.js": plainThrows,
+  "export-empty.js": exportEmpty,
+  "redeclared.js": redeclared,
+  "meta-in-comment.js": metaInComment,
 })) {
   fs.writeFileSync(path.join(typeless, name), text);
 }
@@ -217,6 +231,9 @@ try {
     ["typeless .js with an export", "with-export.js"],
     ["typeless .js with import.meta", "with-meta.js"],
     ["typeless .js, no module syntax, throws", "plain-throws.js"],
+    ["typeless .js with only export {}", "export-empty.js"],
+    ["typeless .js redeclaring require", "redeclared.js"],
+    ["typeless .js with import.meta in a comment", "meta-in-comment.js"],
   ]) {
     const run = spawnSync(process.execPath, [path.join("typeless", file)], { cwd: dir, encoding: "utf8" });
     console.log(`${label}: ${run.stdout.trim().split(/\r?\n/).join(" | ")} (status ${run.status})`);

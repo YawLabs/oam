@@ -1474,11 +1474,10 @@ fn next_tick_fifo_batch_runs_ahead_of_later_microtasks() {
     // ticks, ticks appended mid-drain join the same batch, and the batch runs
     // ahead of promise jobs queued after it started. For ticks scheduled from
     // SYNCHRONOUS macrotask code this is Node-identical (differential twin:
-    // conformance/cases/55-next-tick-fifo.mjs). The residual: ticks scheduled
-    // from promise-job contexts (.then/await continuations, ESM top-level as
-    // asserted here) drain at their scheduling position, while Node exhausts
-    // the whole microtask queue first -- so Node would print p0,m0 ahead of
-    // the batch below. oam's batch-first order is the documented divergence.
+    // conformance/cases/55-next-tick-fifo.mjs). The file below is a .ts with
+    // no module syntax, which node runs as CommonJS (ticks first), so this is
+    // node's order too; oam runs it as an ES module but orders its ticks as
+    // node does (#345, conformance case 411).
     let stdout = run_ok(
         "next_tick_fifo.ts",
         "const order: string[] = [];\n\

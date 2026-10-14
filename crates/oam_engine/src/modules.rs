@@ -118,30 +118,29 @@ fn entry_rejected(scope: &mut v8::PinScope<'_, '_>) -> bool {
 }
 
 /// Whether node would run the entry `path` as an ES module, which decides
-/// when the ticks its top level queues run (#345). Declared by extension or
-/// package.json "type" ([`oam_loader::node_declared_module_kind`]), or, for
-/// a typeless file, by its syntax as node detects it: a static import or
-/// export, a top-level await, or `import.meta`. Asked once the module has
-/// been evaluated, so its record answers the first three; the source answers
-/// the last.
-fn node_runs_as_esm(
-    scope: &mut v8::PinScope<'_, '_>,
-    module: v8::Local<'_, v8::Module>,
-    path: &Path,
-) -> bool {
+/// when the ticks its top level queues run (#345): declared by extension or
+/// package.json "type" ([`oam_loader::node_declared_module_kind`]), or, for a
+/// typeless file, by node's own test of its syntax
+/// ([`crate::cjs::contains_module_syntax`]). The source node tests is the
+/// file as written -- for TypeScript, the code oam runs, which node's type
+/// stripping matches but for an import whose every name is a type (node keeps
+/// it as `import {} from ...`; oam drops it).
+fn node_runs_as_esm(scope: &mut v8::PinScope<'_, '_>, host: &dyn ModuleHost, path: &Path) -> bool {
     if let Some(kind) = oam_loader::node_declared_module_kind(path) {
         return kind == oam_loader::ModuleKind::Esm;
     }
-    if module.get_module_requests().length() > 0 || module.is_graph_async() {
-        return true;
-    }
-    let exports = v8::Local::<v8::Object>::try_from(module.get_module_namespace())
-        .ok()
-        .and_then(|namespace| {
-            namespace.get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
-        })
-        .is_some_and(|names| names.length() > 0);
-    exports || std::fs::read_to_string(path).is_ok_and(|source| source.contains("import.meta"))
+    let typescript = matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("ts" | "tsx" | "mts" | "cts")
+    );
+    let source = if typescript {
+        host.load(path).ok()
+    } else {
+        std::fs::read_to_string(path).ok()
+    };
+    source.is_some_and(|source| {
+        crate::cjs::contains_module_syntax(scope, &source, &path.to_string_lossy())
+    })
 }
 
 /// Park (or, with None, clear) the entry evaluation for [`entry_rejected`].
@@ -829,7 +828,7 @@ impl JsRuntime {
         store_pending_code_cache(tc);
         let promise = v8::Local::<v8::Promise>::try_from(value)
             .map_err(|_| rt_diag("OAM-RT0001", "module evaluation did not return a promise"))?;
-        let esm_in_node = node_runs_as_esm(tc, module, &entry);
+        let esm_in_node = node_runs_as_esm(tc, host, &entry);
         if esm_in_node {
             // node evaluates an ES module inside a microtask drain (its
             // loader's promise job), so the promise jobs the module's top
