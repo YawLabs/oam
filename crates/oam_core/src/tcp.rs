@@ -344,15 +344,47 @@ enum Listener {
     Pipe(crate::pipe::PipeListener),
 }
 
+impl Listener {
+    /// The next connection, polled where the listener sits in the registry,
+    /// or None for a listener that has to be taken out to accept: a Windows
+    /// pipe server, whose accept hands out the waiting pipe instance and
+    /// creates the next.
+    fn poll_in_place(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Option<std::task::Poll<std::io::Result<Accepted>>> {
+        match self {
+            Listener::Tcp(listener) => Some(
+                listener
+                    .poll_accept(cx)
+                    .map_ok(|(stream, peer)| Accepted::Tcp(stream, peer)),
+            ),
+            #[cfg(unix)]
+            Listener::Pipe(listener) => Some(listener.poll_accept(cx).map_ok(|halves| {
+                let (reader, writer) = pipe_halves(halves);
+                Accepted::Pipe(reader, writer)
+            })),
+            #[cfg(windows)]
+            Listener::Pipe(_) => None,
+        }
+    }
+
+    /// Whether [`Self::poll_in_place`] can accept from it, without polling.
+    fn accepts_in_place(&self) -> bool {
+        cfg!(unix) || matches!(self, Listener::Tcp(_))
+    }
+}
+
 #[derive(Default)]
 pub struct TcpState {
     readers: HashMap<u64, ReadHalf>,
     writers: HashMap<u64, WriteHalf>,
     listeners: HashMap<u64, Listener>,
     /// Stream handles closed while a half was checked out for an await
-    /// (the last half back removes the marker), plus server ids closed
-    /// mid-accept (`reinsert_listener` removes those). A stream id used to
-    /// stay here for the life of the process once closed (#139).
+    /// (the last half back removes the marker), plus the ids of Windows pipe
+    /// servers closed while an accept held their listener (the accept
+    /// removes those). A stream id used to stay here for the life of the
+    /// process once closed (#139).
     closed: HashSet<u64>,
     /// The closed stream handles among `closed` that were closed by
     /// [`tcp_reset`]: a half that comes back from its await drops without
@@ -366,7 +398,8 @@ pub struct TcpState {
     shut_down: HashSet<u64>,
     /// Halves currently out of the maps for an await, per stream handle.
     in_flight: HashMap<u64, u32>,
-    /// A parked accept's wake-up, per server id; per stream handle, the
+    /// An accept's wake-up, per server id, for as long as the accept is in
+    /// flight (one at a time per server); per stream handle, the
     /// wake-up of the reads and writes parked on it, which [`tcp_close`]
     /// and [`tcp_reset`] send (created by the first read or queued write).
     cancel: HashMap<u64, std::sync::Arc<tokio::sync::Notify>>,
@@ -1329,8 +1362,55 @@ async fn accept_one(listener: &mut Listener) -> std::io::Result<Accepted> {
     }
 }
 
-/// Accept one connection from a listener, TCP or pipe. Remove-await-reinsert
-/// on the LISTENER. Splits and stores the accepted stream's read/write
+/// The next connection on server `server_id`, or None once the server is
+/// closed. `held` is a listener the accept took out of the registry to
+/// wait on (see [`Listener::poll_in_place`]): put back when the accept is
+/// done, unless the server was closed meanwhile -- and then what it accepted
+/// goes too, as a connection still in a closed listener's backlog does.
+/// Every other listener is polled where it sits, so the close that removes
+/// it closes it.
+async fn next_connection(
+    registry: &TcpRegistry,
+    server_id: u64,
+    held: Option<Listener>,
+) -> Option<std::io::Result<Accepted>> {
+    let Some(mut listener) = held else {
+        return std::future::poll_fn(|cx| {
+            let guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.listeners.get(&server_id).and_then(|l| l.poll_in_place(cx)) {
+                Some(polled) => polled.map(Some),
+                None => std::task::Poll::Ready(None),
+            }
+        })
+        .await;
+    };
+    let result = accept_one(&mut listener).await;
+    reinsert_listener(registry, server_id, listener).then_some(result)
+}
+
+/// An accept in flight on a server, as its registered wake-up: removed when
+/// the accept ends, however it ends, unless a close took it first.
+struct AcceptInFlight<'a> {
+    registry: &'a TcpRegistry,
+    server_id: u64,
+    notify: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl Drop for AcceptInFlight<'_> {
+    fn drop(&mut self) {
+        let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        if guard
+            .cancel
+            .get(&self.server_id)
+            .is_some_and(|n| std::sync::Arc::ptr_eq(n, &self.notify))
+        {
+            guard.cancel.remove(&self.server_id);
+        }
+    }
+}
+
+/// Accept one connection from a listener, TCP or pipe
+/// ([`next_connection`]). Splits and stores the accepted stream's read/write
 /// halves. Returns Json {handle, remoteAddr, localAddr?} -- for a pipe just
 /// {handle} -- or Done if the listener was closed. The accepted socket's own
 /// address too, so `socket.address()`, `localAddress` and `localPort` on a
@@ -1340,91 +1420,106 @@ pub async fn tcp_accept(
     server_id: u64,
     stream_ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> OpOutcome {
-    let (mut listener, notify) = {
+    let (held, notify) = {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-        // Closed, or another accept already holds the listener. Checked
+        // Closed, or another accept is already in flight on it. Checked
         // BEFORE the cancel Notify is created: an accept that lands after
         // `tcp_server_close` removed the server's Notify would otherwise
         // insert a fresh one that nothing ever removes (#139).
-        let Some(listener) = guard.listeners.remove(&server_id) else {
+        let Some(listener) = guard.listeners.get(&server_id) else {
             return OpOutcome::Done;
         };
-        let notify = guard
-            .cancel
-            .entry(server_id)
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Notify::new()))
-            .clone();
-        (listener, notify)
+        if guard.cancel.contains_key(&server_id) {
+            return OpOutcome::Done;
+        }
+        let held = if listener.accepts_in_place() {
+            None
+        } else {
+            guard.listeners.remove(&server_id)
+        };
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        guard.cancel.insert(server_id, notify.clone());
+        (held, notify)
+    };
+    let in_flight = AcceptInFlight {
+        registry: &registry,
+        server_id,
+        notify,
     };
 
-    tokio::select! {
-        result = accept_one(&mut listener) => {
-            reinsert_listener(&registry, server_id, listener);
-            let accepted = match result {
-                Ok(accepted) => accepted,
-                Err(e) => return tcp_fail(e, "accept"),
-            };
-            let handle = stream_ids.fetch_add(1, Ordering::Relaxed);
-            match accepted {
-                Accepted::Tcp(stream, peer_addr) => {
-                    let local_addr = stream.local_addr().ok();
-                    let (reader, writer) = stream.into_split();
-                    registry
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .register_stream(handle, reader, writer);
-
-                    let mut payload = serde_json::json!({
-                        "handle": handle,
-                        "remoteAddr": addr_to_json(peer_addr),
-                    });
-                    if let Some(la) = local_addr {
-                        payload["localAddr"] = addr_to_json(la);
-                    }
-                    OpOutcome::Json(payload.to_string())
-                }
-                Accepted::Pipe(reader, writer) => {
-                    {
-                        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.readers.insert(handle, reader);
-                        guard.writers.insert(handle, writer);
-                    }
-                    OpOutcome::Json(serde_json::json!({ "handle": handle }).to_string())
-                }
-            }
-        }
-        _ = notify.notified() => {
-            // The close that woke this accept set the marker for the two
-            // accept-completed branches, which reinsert the listener; this
-            // one drops it itself, so the marker has nothing left to guard.
-            drop(listener);
+    let next = tokio::select! {
+        next = next_connection(&registry, server_id, held) => next,
+        _ = in_flight.notify.notified() => {
+            // A held listener went with the future; the close that woke
+            // this accept marked the server closed for it, and the marker
+            // has nothing left to guard.
             registry
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .closed
                 .remove(&server_id);
-            OpOutcome::Done
+            None
+        }
+    };
+    drop(in_flight);
+    let accepted = match next {
+        None => return OpOutcome::Done,
+        Some(Err(e)) => return tcp_fail(e, "accept"),
+        Some(Ok(accepted)) => accepted,
+    };
+    let handle = stream_ids.fetch_add(1, Ordering::Relaxed);
+    match accepted {
+        Accepted::Tcp(stream, peer_addr) => {
+            let local_addr = stream.local_addr().ok();
+            let (reader, writer) = stream.into_split();
+            registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .register_stream(handle, reader, writer);
+
+            let mut payload = serde_json::json!({
+                "handle": handle,
+                "remoteAddr": addr_to_json(peer_addr),
+            });
+            if let Some(la) = local_addr {
+                payload["localAddr"] = addr_to_json(la);
+            }
+            OpOutcome::Json(payload.to_string())
+        }
+        Accepted::Pipe(reader, writer) => {
+            {
+                let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+                guard.readers.insert(handle, reader);
+                guard.writers.insert(handle, writer);
+            }
+            OpOutcome::Json(serde_json::json!({ "handle": handle }).to_string())
         }
     }
 }
 
-/// Close a TCP server. Remove the listener; if an accept is parked on it, mark
-/// it closed so the accept does not resurrect it, and wake the accept. The
-/// marker lives only while an accept is in flight: `reinsert_listener`
-/// removes it when that accept observes it, and a server closed with no
-/// accept parked leaves nothing behind (#139).
+/// Close a server at once, as libuv's `uv_close` closes the listening
+/// socket before it returns: a connect made after `server.close()` is
+/// refused (#338). It used to land in the backlog of a listener a parked
+/// accept still held, to be accepted and handed to the closed server -- the
+/// client connected, to nothing, or saw a reset. Remove the listener, which
+/// closes it -- an accept polls it where it sits -- and wake an accept in
+/// flight. A Windows pipe server's accept holds its listener while it
+/// waits; that server is marked closed, so the accept does not put the
+/// listener back but drops it when it wakes. The marker lives only while
+/// that accept is in flight, and a server closed with no accept parked
+/// leaves nothing behind (#139).
 pub fn tcp_server_close(registry: &TcpRegistry, server_id: u64) {
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-    let had_listener = guard.listeners.remove(&server_id).is_some();
+    let listener = guard.listeners.remove(&server_id);
     if let Some(notify) = guard.cancel.remove(&server_id) {
-        // An accept holds the listener while it is parked, so "no listener
-        // in the map but a cancel Notify registered" is exactly "an accept is
-        // in flight": the marker is what stops it re-inserting the listener.
-        if !had_listener {
+        // An accept in flight with no listener in the map is one holding it.
+        if listener.is_none() {
             guard.closed.insert(server_id);
         }
         notify.notify_one();
     }
+    drop(guard);
+    drop(listener);
 }
 
 #[cfg(test)]
@@ -1557,15 +1652,15 @@ mod tests {
                     tcp_server_close(&registry, server_id);
                 }
                 1 => {
-                    // Closed while an accept is parked: the marker's one use.
+                    // Closed while an accept is parked.
                     let parked = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
                     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                     tcp_server_close(&registry, server_id);
                     assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
                 }
                 _ => {
-                    // An accept completes (its Notify stays registered), the
-                    // stream is closed, then the server.
+                    // An accept completes, the stream is closed, then the
+                    // server.
                     let client = tokio::net::TcpStream::connect(("127.0.0.1", port))
                         .await
                         .unwrap();
@@ -1596,6 +1691,54 @@ mod tests {
         let bookkeeping = registry.lock().unwrap().bookkeeping();
         assert_eq!(
             bookkeeping,
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+    }
+
+    /// #338: a server closed while an accept is parked on it refuses a
+    /// connect made right after the close, as node's does once close() has
+    /// returned. On a current-thread runtime the woken accept cannot run
+    /// between the two: a close that only woke it, leaving the listener to
+    /// the accept to drop, still had the socket listening, and the connect
+    /// landed in its backlog -- to be accepted for the closed server.
+    #[tokio::test]
+    async fn a_connect_after_close_is_refused_with_an_accept_parked() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let OpOutcome::Json(payload) = tcp_listen(
+            registry.clone(),
+            ids.clone(),
+            ListenAt {
+                host: Some("127.0.0.1".into()),
+                port: 0,
+                ipv6_only: false,
+            },
+        )
+        .await
+        else {
+            panic!("listen failed");
+        };
+        let info: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let server_id = info["serverId"].as_u64().unwrap();
+        let port = u16::try_from(info["port"].as_u64().unwrap()).unwrap();
+        let parked = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        // One accept at a time: a second answers Done, the first parks on.
+        assert!(matches!(
+            tcp_accept(registry.clone(), server_id, ids.clone()).await,
+            OpOutcome::Done
+        ));
+        tcp_server_close(&registry, server_id);
+        let refused = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+        assert_eq!(
+            refused.as_ref().err().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::ConnectionRefused),
+            "connected to a closed server: {refused:?}"
+        );
+        assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
             (0, 0, 0, 0, 0),
             "(closed, cancel, in_flight, readers, writers)"
         );

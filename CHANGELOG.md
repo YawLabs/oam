@@ -20,6 +20,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **A connect made after `server.close()` is refused, as node's is (#338).** A `net` or `tls`
+  server's close only woke the accept parked on it, which still held the listening socket, so a
+  connect that came before that accept ran landed in its backlog. The connection was then accepted
+  for the closed server: the client either stayed connected to nothing, or saw `read ECONNRESET`
+  where node reports `connect ECONNREFUSED`. Now the close drops the listening socket before it
+  returns, and a connection accepted before `close()` but answered after it is reset.
 - **On Windows an open is refused where node's C runtime refuses the handle (#330).** libuv hands
   every handle its open gets to `_open_osfhandle`, which refuses one whose type `GetFileType`
   cannot name. So the root of a share that is no disk is `EINVAL` however it is spelled --

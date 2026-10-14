@@ -804,6 +804,18 @@ mod unix {
             let (stream, _) = self.listener.accept().await?;
             Ok(stream.into_split())
         }
+
+        /// [`Self::accept`] polled through a shared reference, so the
+        /// listener can stay where its server keeps it (see
+        /// `crate::tcp::tcp_accept`).
+        pub(crate) fn poll_accept(
+            &self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<(OwnedReadHalf, OwnedWriteHalf)>> {
+            self.listener
+                .poll_accept(cx)
+                .map_ok(|(stream, _)| stream.into_split())
+        }
     }
 
     impl Drop for PipeListener {

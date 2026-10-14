@@ -30618,7 +30618,17 @@
             break;
           }
           if (accepted === undefined) break;
-          if (generation !== this._listenGeneration) return; // superseded
+          // Accepted before close() (or the listen() that superseded this
+          // loop) and answered after it: a connection node's listener still
+          // had in its backlog when it closed, which the client sees reset.
+          // Handed to the closed server, it left the client connected to
+          // nothing (#338).
+          const superseded = generation !== this._listenGeneration;
+          if (superseded || !this.listening) {
+            natives.tcpReset(accepted.handle, false);
+            if (superseded) return;
+            break;
+          }
           const socket = new Socket({
             _handle: accepted.handle,
             _remoteAddr: accepted.remoteAddr,
@@ -40258,6 +40268,12 @@
               continue;
             }
             if (accepted === undefined) break;
+            // Accepted before close() and answered after it: reset, as
+            // net.Server's accept loop resets one (#338).
+            if (this._closed) {
+              natives.tcpReset(accepted.handle, false);
+              break;
+            }
             // Not awaited: each connection handshakes on its own. A
             // listener that throws raises 'uncaughtException' as in Node;
             // letting it out would end this loop and the server would stop
