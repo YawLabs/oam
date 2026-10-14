@@ -567,6 +567,7 @@
   const PromiseCtor = Promise;
   const promiseThen = Promise.prototype.then;
   const captureStackTrace = Error.captureStackTrace;
+  const kIsNodeErrorMark = globalThis.__oamKIsNodeError;
 
   function asAlwaysRejecting(api) {
     const out = {};
@@ -596,7 +597,11 @@
       // `at readFile (...)`; an async caller adds its `at async` frames below.
       const onRejected = {
         [key]: function (err) {
-          if (err !== null && typeof err === "object" && typeof err.syscall === "string") {
+          // Not one of node's own coded errors (kIsNodeError), which JS
+          // builds and no binding hands back: fs.promises.rm's
+          // ERR_FS_EISDIR keeps its no frames.
+          if (err !== null && typeof err === "object" && typeof err.syscall === "string" &&
+              err[kIsNodeErrorMark] !== true) {
             captureStackTrace(err);
           }
           throw err;
@@ -1337,8 +1342,10 @@
   });
   // node's SystemError (lib/internal/errors.js, v22.22.2): the class of the
   // codes node raises for a failure it decides itself but reports in a
-  // system error's terms (ERR_FS_EISDIR). The message is `<prefix>: <syscall>
-  // returned <code> (<message>) <path>`, `info` is the context object, and
+  // system error's terms (ERR_FS_EISDIR). `new SystemError(key, context)`,
+  // as node's: the prefix is the key's message (systemErrorMessages). The
+  // message is `<prefix>: <syscall> returned <code> (<message>) <path>`,
+  // `info` is the context object, and
   // errno / syscall / path are enumerable accessors over it -- own keys
   // stack, code, name, message, info, errno, syscall, path, in that order.
   // toString() and the stack header read `SystemError [<key>]: <message>`,
@@ -1346,10 +1353,23 @@
   // bootstrap.js's Error.prepareStackTrace's, which renders a kIsNodeError
   // error's from its name, code and message when the stack is first read.
   const kIsNodeErrorBrand = globalThis.__oamKIsNodeError;
+  const systemErrorMessages = {
+    __proto__: null,
+    ERR_FS_CP_DIR_TO_NON_DIR: "Cannot overwrite non-directory with directory",
+    ERR_FS_CP_EEXIST: "Target already exists",
+    ERR_FS_CP_EINVAL: "Invalid src or dest",
+    ERR_FS_CP_FIFO_PIPE: "Cannot copy a FIFO pipe",
+    ERR_FS_CP_NON_DIR_TO_DIR: "Cannot overwrite directory with non-directory",
+    ERR_FS_CP_SOCKET: "Cannot copy a socket file",
+    ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY: "Cannot overwrite symlink in subdirectory of self",
+    ERR_FS_CP_UNKNOWN: "Cannot copy an unknown file type",
+    ERR_FS_EISDIR: "Path is a directory",
+    ERR_SYSTEM_ERROR: "A system error occurred",
+  };
   class SystemError extends Error {
-    constructor(key, prefix, context) {
+    constructor(key, context) {
       super();
-      let message = `${prefix}: ${context.syscall} returned ${context.code} (${context.message})`;
+      let message = `${systemErrorMessages[key]}: ${context.syscall} returned ${context.code} (${context.message})`;
       if (context.path !== undefined) message += ` ${context.path}`;
       if (context.dest !== undefined) message += ` => ${context.dest}`;
       this.code = key;
@@ -1360,6 +1380,9 @@
         configurable: true,
       });
       Object.defineProperties(this, {
+        // node's SystemError is kIsNodeError, its own (hidden) mark: its
+        // stack header names the code.
+        [kIsNodeErrorBrand]: { value: true, enumerable: false, writable: false, configurable: true },
         name: { value: "SystemError", enumerable: false, writable: true, configurable: true },
         message: { value: message, enumerable: false, writable: true, configurable: true },
         info: { value: context, enumerable: true, configurable: true, writable: false },
@@ -1369,10 +1392,6 @@
       if (context.path !== undefined) Object.defineProperty(this, "path", field("path"));
       if (context.dest !== undefined) Object.defineProperty(this, "dest", field("dest"));
     }
-    // node's SystemError is kIsNodeError: its stack header names the code.
-    get [kIsNodeErrorBrand]() {
-      return true;
-    }
     toString() {
       return `${this.name} [${this.code}]: ${this.message}`;
     }
@@ -1380,7 +1399,48 @@
       return registry.get("util").inspect(this, { ...ctx, getters: true, customInspect: false });
     }
   }
-  codes.ERR_FS_EISDIR = (context) => new SystemError("ERR_FS_EISDIR", "Path is a directory", context);
+  // node's makeSystemErrorWithCode: a SystemError code raises an instance of
+  // its own subclass, `class NodeError extends SystemError`, so its
+  // constructor.name is 'NodeError' (#288). One class per code, made once.
+  const nodeSystemErrors = new Map();
+  const systemErrorClass = (key) => {
+    let NodeError = nodeSystemErrors.get(key);
+    if (NodeError === undefined) {
+      NodeError = class NodeError extends SystemError {
+        constructor(ctx) {
+          super(key, ctx);
+        }
+      };
+      nodeSystemErrors.set(key, NodeError);
+    }
+    return NodeError;
+  };
+  const systemErrorWithCode = (key, context) => new (systemErrorClass(key))(context);
+  // fs.rm's ERR_FS_EISDIR is node's `ERR_FS_EISDIR.HideStackFramesError`
+  // (makeNodeErrorForHideStackFrame): a subclass of the code's NodeError,
+  // made with no stack frames, whose `constructor` -- a getter on its
+  // prototype -- answers SystemError. So constructor.name reads
+  // 'SystemError' while the error is still an instance of the code's class.
+  let RmIsADirectory;
+  const rmIsADirectory = (context) => {
+    if (RmIsADirectory === undefined) {
+      RmIsADirectory = class HideStackFramesError extends systemErrorClass("ERR_FS_EISDIR") {
+        constructor(ctx) {
+          const limit = Error.stackTraceLimit;
+          Error.stackTraceLimit = 0;
+          try {
+            super(ctx);
+          } finally {
+            Error.stackTraceLimit = limit;
+          }
+        }
+        get ["constructor"]() {
+          return SystemError;
+        }
+      };
+    }
+    return new RmIsADirectory(context);
+  };
   codes.ERR_MODULE_NOT_FOUND = E("ERR_MODULE_NOT_FOUND", Error, function(path, base) {
     return 'Cannot find module "' + path + '"' + (base ? ' imported from ' + base : '');
   });
@@ -5234,7 +5294,7 @@
     // "A system error occurred" prefix.
     const uvSystemError = (code, syscall) => {
       const entry = Array.from(uvErrnoTable(natives)).find(([, e]) => e[0] === code);
-      return new SystemError("ERR_SYSTEM_ERROR", "A system error occurred", {
+      return systemErrorWithCode("ERR_SYSTEM_ERROR", {
         errno: entry === undefined ? undefined : entry[0],
         code,
         message: entry === undefined ? code : entry[1][1],
@@ -10622,13 +10682,18 @@
   // `recursive` is set -- ERR_FS_EISDIR, nothing removed -- and a path whose
   // lstat fails reports that failure (syscall lstat), except ENOENT under
   // `force`. `raw` is the lstat result, or the error it failed with.
-  function rmCheckTarget(file, recursive, force, raw, failed) {
+  // rmSync's ERR_FS_EISDIR gets its stack from the call (node's
+  // hideStackFrames recaptures it there); rm's and fs.promises.rm's has
+  // none, as node's has none.
+  function rmCheckTarget(file, recursive, force, raw, failed, sync) {
     if (failed !== undefined) {
       if (force && failed?.code === "ENOENT") return;
       throw failed;
     }
     if (raw.kind === "dir" && !recursive) {
-      throw codes.ERR_FS_EISDIR({ code: "EISDIR", message: "is a directory", path: file, syscall: "rm", errno: 21 });
+      const err = rmIsADirectory({ code: "EISDIR", message: "is a directory", path: file, syscall: "rm", errno: 21 });
+      if (sync && Error.stackTraceLimit) Error.captureStackTrace(err, rmCheckTarget);
+      throw err;
     }
   }
 
@@ -11491,7 +11556,7 @@
       return makeNodeError(code, `Cannot overwrite ${kept} ${ns(dest)} with ${copied} ${ns(src)}`);
     }
     // EISDIR is 21 and ENOTDIR 20 in every platform's os.constants.errno.
-    return new SystemError(code, `Cannot overwrite ${kept} with ${copied}`, {
+    return systemErrorWithCode(code, {
       message: `cannot overwrite ${kept} ${dest} with ${copied} ${src}`,
       path: dest,
       syscall: "cp",
@@ -11521,7 +11586,7 @@
       }
       return makeNodeError("ERR_FS_EISDIR", "Recursive option not enabled, cannot copy a directory: " + shown);
     }
-    return new SystemError("ERR_FS_EISDIR", "Path is a directory", {
+    return systemErrorWithCode("ERR_FS_EISDIR", {
       message: `${src} is a directory (not copied)`,
       path: src,
       syscall: "cp",
@@ -11574,7 +11639,7 @@
       return null;
     }
     const einval = (message) =>
-      new SystemError("ERR_FS_CP_EINVAL", "Invalid src or dest", {
+      systemErrorWithCode("ERR_FS_CP_EINVAL", {
         message,
         path: dest,
         syscall: "cp",
@@ -13114,7 +13179,7 @@
           } catch (e) {
             failed = e;
           }
-          rmCheckTarget(file, recursive, force, raw, failed);
+          rmCheckTarget(file, recursive, force, raw, failed, true);
         }
         natives.fsRmSync(file, recursive, force);
       },

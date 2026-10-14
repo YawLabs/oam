@@ -53,7 +53,12 @@ console.log("a chunk written to leaves the Blob:", await kept.text());
       console.log(label, "throws", e.name, e.message);
     }
   };
-  const b = await fs.openAsBlob(os.tmpdir());
+  // A directory of its own: node fails the read of a file-backed Blob whose
+  // file changed after the open, and the shared temporary directory changes
+  // whenever another process makes or removes something in it.
+  const own = fs.mkdtempSync(path.join(os.tmpdir(), "oam-case-407-"));
+  fs.writeFileSync(path.join(own, "x"), "x");
+  const b = await fs.openAsBlob(own);
   console.log("a directory has a size:", b.size > 0);
   await t("new Blob([b]) has its size", () => new Blob([b]).size === b.size);
   await t("new Blob([b, 'x']) has its size and one", () => new Blob([b, "x"]).size === b.size + 1);
@@ -68,4 +73,5 @@ console.log("a chunk written to leaves the Blob:", await kept.text());
   form.append("f", b, "d");
   await t("in a FormData it has its size", () => form.get("f").size === b.size);
   await t("new Response(form).text", async () => (await new Response(form).text()).length > 0);
+  fs.rmSync(own, { recursive: true, force: true });
 }
