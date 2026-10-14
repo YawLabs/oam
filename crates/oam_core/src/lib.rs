@@ -7280,7 +7280,6 @@ mod os_error_code_tests {
         assert_eq!(node_error_code(&kind_only), "EACCES");
     }
 
-    #[cfg(windows)]
     /// #324: the mode of an open that creates its file is the file's. A mode
     /// with no owner-write bit makes it read-only on every platform; one
     /// that merely opens a file leaves it as it was.
@@ -7351,6 +7350,7 @@ mod os_error_code_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn windows_access_denied_is_eperm_everywhere_but_a_wrong_mode_descriptor() {
         use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
