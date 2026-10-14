@@ -6761,10 +6761,12 @@ fn op_fs_readdir_sync(
     }
 }
 
+/// fsMkdirSync(path, recursive, mode) -> the first directory a recursive
+/// call made, or undefined.
 fn op_fs_mkdir_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let Some(path) = fs_path_arg(
         scope,
@@ -6776,19 +6778,39 @@ fn op_fs_mkdir_sync(
         return;
     };
     let recursive = args.get(1).is_true();
-    let result = if recursive {
-        std::fs::create_dir_all(&path)
-    } else {
-        std::fs::create_dir(&path)
-    };
-    if let Err(e) = result {
-        throw_fs_error(
+    let mode = dir_mode_arg(scope, &args, 2);
+    match oam_core::make_dir(path.os(), mode, recursive) {
+        // The first directory a recursive call made, as node returns it.
+        Ok(Some(first)) => {
+            if let Some(first) = v8::String::new(scope, &first) {
+                rv.set(first.into());
+            }
+        }
+        Ok(None) => {}
+        // The synchronous form names the path asked for, whichever
+        // component it was that failed.
+        Err(failure) => throw_fs_error(
             scope,
             oam_core::FsSite::Mkdir { recursive },
             "mkdir",
             &path,
-            &e,
-        );
+            &failure.error,
+        ),
+    }
+}
+
+/// The `mode` of a mkdir, as the shim hands it over (already through node's
+/// parseFileMode); 0o777, node's default, for anything else.
+fn dir_mode_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+) -> u32 {
+    let value = args.get(index);
+    if value.is_number() {
+        value.uint32_value(scope).unwrap_or(0o777)
+    } else {
+        0o777
     }
 }
 
@@ -7460,7 +7482,12 @@ fn op_fs_mkdir(
         return;
     };
     let recursive = args.get(1).is_true();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_mkdir(path, recursive));
+    let mode = dir_mode_arg(scope, &args, 2);
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fs_mkdir(path, recursive, mode),
+    );
 }
 
 fn op_fs_rm(
