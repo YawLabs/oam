@@ -20,6 +20,188 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **On Windows an open is refused where node's C runtime refuses the handle (#330).** libuv hands
+  every handle its open gets to `_open_osfhandle`, which refuses one whose type `GetFileType`
+  cannot name. So the root of a share that is no disk is `EINVAL` however it is spelled --
+  `\\.\UNC\srv\IPC# Changelog
+
+All notable changes to oam are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+Entries are derived from the commit history between release tags. Pure internal
+churn — formatting passes, lockfile syncs, benchmark receipt refreshes — is
+omitted. oam is pre-1.0: breaking changes can land in a minor release.
+
+Version numbering is not contiguous: **0.9.3 and 0.9.5 were never tagged**, so a
+gap between headings below is expected rather than a missing entry. Not every tag
+is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
+one, so `install.sh`, which resolves the latest Release, never handed them out.
+
+## [Unreleased]
+
+## [0.19.1] - 2026-10-13
+
+### Fixed
+
+- **On Windows an open is refused where node's C runtime refuses the handle (#330).** libuv hands
+  every handle its open gets to `_open_osfhandle`, which refuses one whose type `GetFileType`
+  cannot name. So the root of a share that is no disk is `EINVAL` however it is spelled --
+   opened, where `\\srv\IPC# Changelog
+
+All notable changes to oam are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+Entries are derived from the commit history between release tags. Pure internal
+churn — formatting passes, lockfile syncs, benchmark receipt refreshes — is
+omitted. oam is pre-1.0: breaking changes can land in a minor release.
+
+Version numbering is not contiguous: **0.9.3 and 0.9.5 were never tagged**, so a
+gap between headings below is expected rather than a missing entry. Not every tag
+is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
+one, so `install.sh`, which resolves the latest Release, never handed them out.
+
+## [Unreleased]
+
+## [0.19.1] - 2026-10-13
+
+### Fixed
+
+- **On Windows an open is refused where node's C runtime refuses the handle (#330).** libuv hands
+  every handle its open gets to `_open_osfhandle`, which refuses one whose type `GetFileType`
+  cannot name. So the root of a share that is no disk is `EINVAL` however it is spelled --
+  `\\.\UNC\srv\IPC# Changelog
+
+All notable changes to oam are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+Entries are derived from the commit history between release tags. Pure internal
+churn — formatting passes, lockfile syncs, benchmark receipt refreshes — is
+omitted. oam is pre-1.0: breaking changes can land in a minor release.
+
+Version numbering is not contiguous: **0.9.3 and 0.9.5 were never tagged**, so a
+gap between headings below is expected rather than a missing entry. Not every tag
+is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
+one, so `install.sh`, which resolves the latest Release, never handed them out.
+
+## [Unreleased]
+
+## [0.19.1] - 2026-10-13
+
+### Fixed
+
+- **On Windows an open is refused where node's C runtime refuses the handle (#330).** libuv hands
+  every handle its open gets to `_open_osfhandle`, which refuses one whose type `GetFileType`
+  cannot name. So the root of a share that is no disk is `EINVAL` however it is spelled --
+   opened, where  and `\\?\UNC\srv\IPC# Changelog
+
+All notable changes to oam are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+Entries are derived from the commit history between release tags. Pure internal
+churn — formatting passes, lockfile syncs, benchmark receipt refreshes — is
+omitted. oam is pre-1.0: breaking changes can land in a minor release.
+
+Version numbering is not contiguous: **0.9.3 and 0.9.5 were never tagged**, so a
+gap between headings below is expected rather than a missing entry. Not every tag
+is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
+one, so `install.sh`, which resolves the latest Release, never handed them out.
+
+## [Unreleased]
+
+## [0.19.1] - 2026-10-13
+
+### Fixed
+
+- **On Windows an open is refused where node's C runtime refuses the handle (#330).** libuv hands
+  every handle its open gets to `_open_osfhandle`, which refuses one whose type `GetFileType`
+  cannot name. So the root of a share that is no disk is `EINVAL` however it is spelled --
+  `\\.\UNC\srv\IPC# Changelog
+
+All notable changes to oam are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+Entries are derived from the commit history between release tags. Pure internal
+churn — formatting passes, lockfile syncs, benchmark receipt refreshes — is
+omitted. oam is pre-1.0: breaking changes can land in a minor release.
+
+Version numbering is not contiguous: **0.9.3 and 0.9.5 were never tagged**, so a
+gap between headings below is expected rather than a missing entry. Not every tag
+is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
+one, so `install.sh`, which resolves the latest Release, never handed them out.
+
+## [Unreleased]
+
+## [0.19.1] - 2026-10-13
+
+### Fixed
+
+- **On Windows an open is refused where node's C runtime refuses the handle (#330).** libuv hands
+  every handle its open gets to `_open_osfhandle`, which refuses one whose type `GetFileType`
+  cannot name. So the root of a share that is no disk is `EINVAL` however it is spelled --
+   opened, where `\\srv\IPC# Changelog
+
+All notable changes to oam are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+Entries are derived from the commit history between release tags. Pure internal
+churn — formatting passes, lockfile syncs, benchmark receipt refreshes — is
+omitted. oam is pre-1.0: breaking changes can land in a minor release.
+
+Version numbering is not contiguous: **0.9.3 and 0.9.5 were never tagged**, so a
+gap between headings below is expected rather than a missing entry. Not every tag
+is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
+one, so `install.sh`, which resolves the latest Release, never handed them out.
+
+## [Unreleased]
+
+## [0.19.1] - 2026-10-13
+
+### Fixed
+
+- **On Windows an open is refused where node's C runtime refuses the handle (#330).** libuv hands
+  every handle its open gets to `_open_osfhandle`, which refuses one whose type `GetFileType`
+  cannot name. So the root of a share that is no disk is `EINVAL` however it is spelled --
+  `\\.\UNC\srv\IPC# Changelog
+
+All notable changes to oam are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+Entries are derived from the commit history between release tags. Pure internal
+churn — formatting passes, lockfile syncs, benchmark receipt refreshes — is
+omitted. oam is pre-1.0: breaking changes can land in a minor release.
+
+Version numbering is not contiguous: **0.9.3 and 0.9.5 were never tagged**, so a
+gap between headings below is expected rather than a missing entry. Not every tag
+is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
+one, so `install.sh`, which resolves the latest Release, never handed them out.
+
+## [Unreleased]
+
+## [0.19.1] - 2026-10-13
+
+### Fixed
+
+- **On Windows an open is refused where node's C runtime refuses the handle (#330).** libuv hands
+  every handle its open gets to `_open_osfhandle`, which refuses one whose type `GetFileType`
+  cannot name. So the root of a share that is no disk is `EINVAL` however it is spelled --
+   opened, where  and  already refused --
+  and the mailslot namespace, `\\.\mailslot`, is `UNKNOWN` (errno -4094), where it opened. This
+  holds for every open, and for `writeFile` and `appendFile`.
+
 - **On Windows `fstat` of a console opened to write only fails `EISDIR`, as node's does (#331).**
   `fs.fstatSync(fs.openSync("\\\\.\\CONOUT$", "w"))` (and `\\.\CON` or `\\.\CONIN$` opened `"w"`,
   or `"a"`) answered as a character device. libuv sees a console only through a handle that
