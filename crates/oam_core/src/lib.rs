@@ -2571,14 +2571,22 @@ mod o_flag {
 #[cfg(unix)]
 pub fn process_umask(set: Option<u32>) -> u32 {
     use rustix::fs::Mode;
+    // What the kernel keeps of a mask, and so what it says the mask was:
+    // the permission bits on Linux (S_IRWXUGO), those and the set-id and
+    // sticky bits on macOS and the BSDs (ALLPERMS).
+    const KEPT: u32 = if cfg!(any(target_os = "linux", target_os = "android")) {
+        0o777
+    } else {
+        0o7777
+    };
     // mode_t is 16 bits on macOS and 32 on Linux.
     #[allow(clippy::useless_conversion)]
-    let bits = |mode: Mode| u32::from(mode.as_raw_mode()) & 0o777;
+    let bits = |mode: Mode| u32::from(mode.as_raw_mode()) & KEPT;
     static KNOWN: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
     let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
     match set {
         Some(mask) => {
-            let mask = mask & 0o777;
+            let mask = mask & KEPT;
             let was = rustix::process::umask(Mode::from_raw_mode(mask as _));
             *known = Some(mask);
             bits(was)

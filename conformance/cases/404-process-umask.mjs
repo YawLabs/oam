@@ -36,6 +36,8 @@ if (!isMainThread) {
   console.log("name and length:", process.umask.name, process.umask.length);
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oam-case-404-"));
+  // Whatever mask this started under, the directory is one to work in.
+  fs.chmodSync(dir, 0o700);
   let n = 0;
   // A mask can take away what a form needs (copying a file nobody may
   // read): then the row is the error's code.
@@ -86,10 +88,11 @@ if (!isMainThread) {
     [viaPromise, viaCallback, viaStream].map((f) => oct(fs.statSync(f).mode & 0o777)).join(" "),
   );
 
-  // A child starts with the mask its parent has.
-  process.umask(0o27);
+  // A child starts with the mask its parent has -- on unix, where the mask
+  // is the kernel's; on Windows it is the C runtime's, and a child's is 0.
+  process.umask(0o627);
   const child = spawnSync(process.execPath, ["-e", "console.log(process.umask().toString(8))"], { encoding: "utf8" });
-  console.log("a child of a 27 parent reads:", child.stdout.trim());
+  console.log(`a child of a parent that reads ${oct(process.umask())} reads:`, child.stdout.trim());
   process.umask(0);
 
   // What a mask may be.

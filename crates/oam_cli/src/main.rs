@@ -2943,6 +2943,30 @@ fn cleanup_eval_artifacts(tmp_dir: Option<&Path>, tmp_file: &Path) {
     }
 }
 
+/// Create the file `-e`'s source is written to, empty, as one its owner can
+/// read and write whatever file mode creation mask this process started
+/// under: a parent may have set one that takes the owner's own bits off
+/// (`process.umask(0o600)` then a spawn), and the source is written to the
+/// file by a second open.
+fn create_eval_file(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        // On the descriptor: chmod is not under the mask.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, "")
+    }
+}
+
 fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags) -> ExitCode {
     // Node's eval module resolves from CWD; oam executes a real file, so
     // place it in the CWD (unique name, cleaned up below).
@@ -2960,11 +2984,20 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
         .ok()
         .map(|d| d.join(format!(".oam-eval-{}.{ext}", std::process::id())));
     let (tmp_dir, tmp_file) = match cwd_candidate {
-        Some(p) if std::fs::write(&p, "").is_ok() => (None, p),
+        Some(p) if create_eval_file(&p).is_ok() => (None, p),
         _ => {
             let dir = std::env::temp_dir().join(format!("oam-eval-{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("create eval temp dir");
+            // The mask this process started under may have left its owner
+            // unable to use the directory it just made (see
+            // `create_eval_file`).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
             let file = dir.join(format!("__oam_eval.{ext}"));
+            create_eval_file(&file).expect("create eval temp file");
             (Some(dir), file)
         }
     };
