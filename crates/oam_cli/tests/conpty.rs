@@ -1197,3 +1197,46 @@ console.log('[done]');
         "no mojibake (UTF-8 read as CP437): {text:?}"
     );
 }
+
+/// #331: `fstat` of a console opened by name answers as node's does. A
+/// console handle libuv can see is one -- which takes read access -- is a
+/// character device; one opened to write only is, to libuv, a file whose
+/// information it asks for and a console has none of: `EISDIR`, syscall
+/// `fstat`. NUL answers either way. Measured against node v22.22.2 in a
+/// console; the opens themselves are conformance case 394's.
+#[test]
+fn fstat_of_a_console_opened_by_name_answers_as_node() {
+    let script = write_temp(
+        "conpty_console_fstat.mjs",
+        r#"
+import fs from 'node:fs';
+const rows = [];
+for (const [name, flag] of [
+  ['\\\\.\\CON', 'w'], ['\\\\.\\CON', 'r'],
+  ['\\\\.\\CONOUT$', 'w'], ['\\\\.\\CONOUT$', 'a'], ['\\\\.\\CONOUT$', 'r+'], ['\\\\.\\CONOUT$', 'r'],
+  ['\\\\.\\CONIN$', 'r'], ['\\\\.\\CONIN$', 'r+'], ['\\\\.\\CONIN$', 'w'],
+  ['\\\\.\\NUL', 'w'], ['\\\\.\\NUL', 'r'],
+]) {
+  const fd = fs.openSync(name, flag);
+  let row;
+  try {
+    const s = fs.fstatSync(fd);
+    row = `chr ${s.mode.toString(8)}`;
+  } catch (e) {
+    row = `${e.code} ${e.syscall}`;
+  }
+  fs.closeSync(fd);
+  rows.push(`${name.slice(4)} ${flag}: ${row}`);
+}
+console.log('[fstat ' + rows.join('; ') + ']');
+"#,
+    );
+    let pty = ConPty::spawn(&script);
+    pty.wait_for(
+        "[fstat CON w: EISDIR fstat; CON r: chr 20000; \
+         CONOUT$ w: EISDIR fstat; CONOUT$ a: EISDIR fstat; CONOUT$ r+: chr 20000; CONOUT$ r: chr 20000; \
+         CONIN$ r: chr 20000; CONIN$ r+: chr 20000; CONIN$ w: EISDIR fstat; \
+         NUL w: chr 20666; NUL r: chr 20666]",
+    );
+    assert_eq!(pty.wait_exit(), 0);
+}

@@ -20,6 +20,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **On Windows `fstat` of a console opened to write only fails `EISDIR`, as node's does (#331).**
+  `fs.fstatSync(fs.openSync("\\\\.\\CONOUT$", "w"))` (and `\\.\CON` or `\\.\CONIN$` opened `"w"`,
+  or `"a"`) answered as a character device. libuv sees a console only through a handle that
+  can read; one that can only write is a file to it, whose information a console does not
+  have. NUL, and a console opened to read, are character devices as before.
+
 - **On Windows `readdir` of a volume or a device namespace refuses it, as node's does (#332).**
   `readdirSync("\\\\?\\C:")` and `"\\\\.\\C:"` (the volume, not its root directory) listed the
   root; node's are `EPERM`. `"\\\\.\\pipe"` with no separator after it listed the pipes; node's is

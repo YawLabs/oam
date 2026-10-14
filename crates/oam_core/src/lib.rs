@@ -5336,12 +5336,39 @@ pub mod ops {
         ticks as f64 / TICKS_PER_MS - EPOCH_DIFFERENCE_MS
     }
 
+    /// A handle's FILE_STANDARD_INFO, or why it has none: a device that
+    /// keeps no file information (a console) fails ERROR_INVALID_FUNCTION.
+    #[cfg(windows)]
+    fn standard_info(
+        file: &std::fs::File,
+    ) -> std::io::Result<windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
+        };
+        let mut standard = FILE_STANDARD_INFO::default();
+        // SAFETY: `file` owns its handle for the whole call, and `standard` is
+        // a writable FILE_STANDARD_INFO of exactly the size passed.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle().cast::<std::ffi::c_void>(),
+                FileStandardInfo,
+                (&mut standard as *mut FILE_STANDARD_INFO).cast(),
+                std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(standard)
+    }
+
     #[cfg(windows)]
     fn stat_extras(meta: &std::fs::Metadata, source: StatSource<'_>) -> Option<StatExtras> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FILE_STANDARD_INFO, FileBasicInfo,
-            FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+            BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle,
+            GetFileInformationByHandleEx,
         };
 
         let opened;
@@ -5367,24 +5394,11 @@ pub mod ops {
             return None;
         }
 
-        let mut standard = FILE_STANDARD_INFO::default();
         // `blocks` counts 512-byte units of ALLOCATED space, which is not
         // ceil(size / 512): a small file resident in the MFT allocates none,
         // and node duly reports 0 blocks for it.
-        // SAFETY: as above; the size passed matches the struct written.
-        let blocks = if unsafe {
-            GetFileInformationByHandleEx(
-                handle,
-                FileStandardInfo,
-                (&mut standard as *mut FILE_STANDARD_INFO).cast(),
-                std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
-            )
-        } != 0
-        {
-            (standard.AllocationSize as u64) >> 9
-        } else {
-            0
-        };
+        let blocks =
+            standard_info(file).map_or(0, |standard| (standard.AllocationSize as u64) >> 9);
 
         let mut basic = FILE_BASIC_INFO::default();
         // SAFETY: as above.
@@ -6000,6 +6014,13 @@ pub mod ops {
     /// and gives that shape to NUL alone; a serial port, the one other
     /// character device a process plausibly holds, gets NUL's here. Every other
     /// field and every time is 0.
+    ///
+    /// "The console" is a console handle libuv can see is one, which takes
+    /// read access (GetConsoleMode). A console opened to write only is, to
+    /// libuv, a file: it asks for the file information, which a console has
+    /// none of, and fails ERROR_INVALID_FUNCTION -- the table's `EISDIR`, what
+    /// node reports for `fstat` of `openSync("\\\\.\\CON", "w")` (#331). The
+    /// same question tells NUL, which answers it, from such a console.
     pub fn fstat_to_json(file: &std::fs::File) -> std::io::Result<String> {
         #[cfg(windows)]
         {
@@ -6015,7 +6036,10 @@ pub mod ops {
                 FILE_TYPE_CHAR if file.is_terminal() => {
                     Some((0o020000, FILE_DEVICE_CONSOLE, handle as u64, 0))
                 }
-                FILE_TYPE_CHAR => Some((0o020666, FILE_DEVICE_NULL, 0, 4096)),
+                FILE_TYPE_CHAR => {
+                    standard_info(file)?;
+                    Some((0o020666, FILE_DEVICE_NULL, 0, 4096))
+                }
                 FILE_TYPE_PIPE => Some((0o010000, FILE_DEVICE_NAMED_PIPE, handle as u64, 0)),
                 _ => None,
             };
