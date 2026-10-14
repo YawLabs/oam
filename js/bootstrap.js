@@ -648,7 +648,7 @@
       if (object.type !== "") state.type = object.type;
       // oam's own Blob holds its bytes, and they never change. Anything else
       // that passes for one is read through its stream.
-      if (object._bytes instanceof Uint8Array) state.bytes = object._bytes;
+      if (object._bytes instanceof Uint8Array && !object._unreadableSize) state.bytes = object._bytes;
       else {
         state.stream = object.stream();
         // What fetch sends as its content-length, as undici does.
@@ -663,7 +663,11 @@
     } else if (object instanceof globalThis.FormData) {
       state.kind = "formdata";
       const boundary = multipartBoundary();
-      state.bytes = multipartBytes(object, boundary);
+      // A file in it that cannot be read: the body is made, and reading it
+      // fails, as node's does.
+      const unreadable = [...object.values()].some((v) => typeof v !== "string" && v._unreadableSize);
+      if (unreadable) state.stream = new globalThis.Blob([unreadableBlobMarker(1)]).stream();
+      else state.bytes = multipartBytes(object, boundary);
       state.type = `multipart/form-data; boundary=${boundary}`;
     } else if (
       typeof globalThis.URLSearchParams === "function" &&
@@ -728,6 +732,13 @@
     }
     parts.push(encoder.encode(`--${boundary}--\r\n`));
     return concatBytes(parts);
+  }
+
+  // A Blob of `size` bytes that cannot be read (see the Blob class).
+  function unreadableBlobMarker(size) {
+    const blob = new globalThis.Blob([]);
+    blob._unreadableSize = size;
+    return blob;
   }
 
   function concatBytes(chunks) {
@@ -1076,6 +1087,7 @@
     class Blob {
       constructor(parts, options) {
         let size = 0;
+        let unreadable = false;
         const pieces = [];
         if (parts != null) {
           for (const part of parts) {
@@ -1084,8 +1096,9 @@
               pieces.push(enc);
               size += enc.length;
             } else if (part instanceof Blob) {
-              pieces.push(part._bytes);
-              size += part._bytes.length;
+              if (part._unreadableSize) unreadable = true;
+              else pieces.push(part._bytes);
+              size += part.size;
             } else if (part instanceof ArrayBuffer) {
               const view = new Uint8Array(part);
               pieces.push(view);
@@ -1101,9 +1114,9 @@
             }
           }
         }
-        const bytes = new Uint8Array(size);
+        const bytes = new Uint8Array(unreadable ? 0 : size);
         let offset = 0;
-        for (const piece of pieces) { bytes.set(piece, offset); offset += piece.length; }
+        if (!unreadable) for (const piece of pieces) { bytes.set(piece, offset); offset += piece.length; }
         // NON-ENUMERABLE, and that is load-bearing rather than tidiness.
         // These were plain assignments, so a Blob's internals were own
         // ENUMERABLE properties: `Object.keys(blob)` returned
@@ -1121,6 +1134,15 @@
           enumerable: false,
           configurable: true,
         });
+        // A Blob that has a size and cannot be read: what fs.openAsBlob gives
+        // for a directory, and anything made with one as a part. 0 for
+        // every other Blob. Its reads fail NotReadableError, as node's do.
+        Object.defineProperty(this, "_unreadableSize", {
+          value: unreadable ? size : 0,
+          writable: true,
+          enumerable: false,
+          configurable: true,
+        });
         Object.defineProperty(this, "_type", {
           value: (options && typeof options.type === "string") ? options.type.toLowerCase() : "",
           writable: true,
@@ -1128,22 +1150,39 @@
           configurable: true,
         });
       }
-      get size() { return this._bytes.length; }
+      get size() { return this._unreadableSize || this._bytes.length; }
       get type() { return this._type; }
       slice(start, end, type) {
-        const len = this._bytes.length;
+        const len = this.size;
         let s = start === undefined ? 0 : start < 0 ? Math.max(0, len + start) : Math.min(start, len);
         let e = end === undefined ? len : end < 0 ? Math.max(0, len + end) : Math.min(end, len);
         if (s >= e) s = e = 0;
         const result = new Blob([], { type: type !== undefined ? String(type) : this._type });
-        result._bytes = this._bytes.subarray(s, e);
+        if (this._unreadableSize) result._unreadableSize = e - s;
+        else result._bytes = this._bytes.subarray(s, e);
         return result;
       }
-      async arrayBuffer() { return this._bytes.buffer.slice(this._bytes.byteOffset, this._bytes.byteOffset + this._bytes.length); }
-      async bytes() { return this._bytes.slice(); }
-      async text() { return new TextDecoder().decode(this._bytes); }
+      #unreadable() {
+        return new DOMException("The blob could not be read", "NotReadableError");
+      }
+      async arrayBuffer() {
+        if (this._unreadableSize) throw this.#unreadable();
+        return this._bytes.buffer.slice(this._bytes.byteOffset, this._bytes.byteOffset + this._bytes.length);
+      }
+      async bytes() {
+        if (this._unreadableSize) throw this.#unreadable();
+        return this._bytes.slice();
+      }
+      async text() {
+        if (this._unreadableSize) throw this.#unreadable();
+        return new TextDecoder().decode(this._bytes);
+      }
       stream() {
         const bytes = this._bytes;
+        if (this._unreadableSize) {
+          const failure = this.#unreadable();
+          return new ReadableStream({ type: "bytes", pull: (controller) => controller.error(failure) });
+        }
         return new ReadableStream({
           type: "bytes", // node's Blob#stream() is a byte stream
           // A copy: what the stream hands out belongs to its reader, and a

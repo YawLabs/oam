@@ -13829,44 +13829,16 @@
     };
     // What node's openAsBlob gives for a directory (#335): its open and fstat
     // succeed, so the Blob is made, with the size the fstat says -- 0 on
-    // Windows, the directory's own size on Linux and macOS -- and every read
-    // of it fails NotReadableError, as reading a directory does. A size of 0
+    // Windows, the directory's own size on Linux and macOS -- and reading a
+    // non-empty one fails NotReadableError, as reading a directory does. The
+    // Blob class carries that state (`_unreadableSize`), so a Blob, a body or
+    // a form made with this one as a part fails the same way. A size of 0
     // has nothing to read, so on Windows it reads as empty.
-    class UnreadableBlob extends Blob {
-      #size;
-      constructor(size, type) {
-        super([], { type });
-        this.#size = size;
-      }
-      get size() {
-        return this.#size;
-      }
-      #fail() {
-        return new DOMException("The blob could not be read", "NotReadableError");
-      }
-      #read(empty) {
-        return this.#size === 0 ? super[empty]() : Promise.reject(this.#fail());
-      }
-      text() {
-        return this.#read("text");
-      }
-      arrayBuffer() {
-        return this.#read("arrayBuffer");
-      }
-      bytes() {
-        return this.#read("bytes");
-      }
-      stream() {
-        if (this.#size === 0) return super.stream();
-        const failure = this.#fail();
-        return new ReadableStream({ pull: (controller) => controller.error(failure) });
-      }
-      slice(start, end, contentType) {
-        // The size a slice of this size would have, by Blob's own rules.
-        const size = new Blob([new Uint8Array(this.#size)]).slice(start, end).size;
-        return markFileBacked(new UnreadableBlob(size, new Blob([], { type: contentType ?? "" }).type));
-      }
-    }
+    const directoryBlob = (size, type) => {
+      const blob = new Blob([], { type });
+      if (size > 0) blob._unreadableSize = size;
+      return markFileBacked(blob);
+    };
     const markFileBacked = (blob) => {
       // node returns an instance of an INTERNAL TransferableBlob subclass and
       // plants an own `constructor` back-pointing at Blob so the subclass does
@@ -13886,7 +13858,7 @@
       let bytes;
       try {
         const raw = await natives.fsStat(file, false);
-        if (raw.kind === "dir") return markFileBacked(new UnreadableBlob(Number(raw.size), type));
+        if (raw.kind === "dir") return directoryBlob(Number(raw.size), type);
         bytes = await natives.fsReadFile(file);
       } catch {
         // Deliberately swallowing the underlying error: node reports none of

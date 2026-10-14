@@ -41,3 +41,31 @@ console.log("stream of an empty File:", await chunks(new File([], "f")));
 const kept = new Blob(["abc"]);
 for await (const c of kept.stream()) c[0] = 120;
 console.log("a chunk written to leaves the Blob:", await kept.text());
+
+// A directory Blob used to make something else: what is made has its size
+// and fails to read the same way (a non-empty one: Linux and macOS; on
+// Windows a directory has size 0 and all of it reads as empty).
+{
+  const t = async (label, f) => {
+    try {
+      console.log(label, "->", JSON.stringify(await f()));
+    } catch (e) {
+      console.log(label, "throws", e.name, e.message);
+    }
+  };
+  const b = await fs.openAsBlob(os.tmpdir());
+  console.log("a directory has a size:", b.size > 0);
+  await t("new Blob([b]) has its size", () => new Blob([b]).size === b.size);
+  await t("new Blob([b, 'x']) has its size and one", () => new Blob([b, "x"]).size === b.size + 1);
+  await t("new Blob([b]).text", () => new Blob([b]).text());
+  await t("new Blob(['x', b.slice(0, 2)]).size", () => new Blob(["x", b.slice(0, 2)]).size);
+  await t("new Blob(['x', b.slice(0, 2)]).text", () => new Blob(["x", b.slice(0, 2)]).text());
+  await t("b.slice(0, 0).text", () => b.slice(0, 0).text());
+  await t("new File([b], 'f') has its size", () => new File([b], "f").size === b.size);
+  await t("new Response(b).text", () => new Response(b).text());
+  await t("a Request with b as its body, text", () => new Request("http://x/", { method: "POST", body: b }).text());
+  const form = new FormData();
+  form.append("f", b, "d");
+  await t("in a FormData it has its size", () => form.get("f").size === b.size);
+  await t("new Response(form).text", async () => (await new Response(form).text()).length > 0);
+}

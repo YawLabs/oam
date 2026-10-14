@@ -23,7 +23,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **`fs.openAsBlob` of a directory gives a Blob, as node's does (#335).** It rejected
   `ERR_INVALID_ARG_VALUE`. A directory opens and has a size -- 0 on Windows, the
   directory's own on Linux and macOS -- so the Blob is made with that size, and reading a
-  non-empty one fails `NotReadableError`, as reading a directory does. A non-string
+  non-empty one fails `NotReadableError`, as reading a directory does; so does reading a
+  Blob, a `Response` or `Request` body or a `FormData` made with one. A non-string
   `options.type` is reported as node reports it (`The "options.type" property ...`). Found on
   the way, for any `Blob`: `stream()` of an empty one gave a zero-length chunk where node
   gives none, and the chunks it gave were the Blob's own bytes, so writing to one changed
