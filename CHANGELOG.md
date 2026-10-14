@@ -27,7 +27,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   other than node's `connect ECONNREFUSED`. Now the close of a TCP or Unix-socket server drops
   the listening socket before it returns, and a connection accepted before `close()` but
   answered after it is reset. A Windows named-pipe server still lets its waiting pipe instance go
-  only when its accept wakes.
+  only when its accept wakes (#388).
 - **On Windows an open is refused where node's C runtime refuses the handle (#330).** libuv hands
   every handle its open gets to `_open_osfhandle`, which refuses one whose type `GetFileType`
   cannot name. So the root of a share that is no disk is `EINVAL` however it is spelled --
