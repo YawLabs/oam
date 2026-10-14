@@ -11804,8 +11804,13 @@
   // (libstdc++'s errno and strerror); see docs/node-divergences.md.
   const CP_STRERROR = {
     EACCES: "Permission denied",
+    EBUSY: "Device or resource busy",
     EEXIST: "File exists",
+    EINVAL: "Invalid argument",
+    EIO: "Input/output error",
     EISDIR: "Is a directory",
+    ELOOP: "Too many levels of symbolic links",
+    ENAMETOOLONG: "File name too long",
     ENOENT: "No such file or directory",
     ENOTDIR: "Not a directory",
     ENOTEMPTY: "Directory not empty",
@@ -11813,7 +11818,8 @@
     EPERM: "Operation not permitted",
   };
   const CP_LINUX_ERRNO = {
-    EACCES: 13, EEXIST: 17, EISDIR: 21, ENOENT: 2, ENOTDIR: 20, ENOTEMPTY: 39, ENOTSUP: 95, EPERM: 1,
+    EACCES: 13, EBUSY: 16, EEXIST: 17, EINVAL: 22, EIO: 5, EISDIR: 21, ELOOP: 40, ENAMETOOLONG: 36, ENOENT: 2,
+    ENOTDIR: 20, ENOTEMPTY: 39, ENOTSUP: 95, EPERM: 1,
   };
   function cpStdError(code, syscall, path) {
     const err = new Error(`${code}, ${CP_STRERROR[code] ?? code} '${path}'`);
@@ -12210,7 +12216,18 @@
         continue;
       }
       // What it is, through a junction or other reparse point on Windows.
-      const kind = lstat !== null && lstat.isSymbolicLink() ? statOrNull(entryPath, true) : lstat;
+      // One that leads nowhere is passed over; one that cannot be followed
+      // (a cycle runs the path past what the system takes) fails, where
+      // node's C++ aborts.
+      let kind = lstat;
+      if (lstat !== null && lstat.isSymbolicLink()) {
+        try {
+          kind = fs.statSync(entryPath);
+        } catch (e) {
+          if (e?.code !== "ENOENT" && e?.code !== "ENOTDIR") throw cpStdErrorOf(e, "cp", cpNs(top.to));
+          kind = null;
+        }
+      }
       if (kind !== null && kind.isDirectory()) {
         const there = statOrNull(destFile, true);
         if (there === null) {

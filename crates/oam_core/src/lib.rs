@@ -4558,7 +4558,7 @@ pub fn unlink_path(path: &std::path::Path) -> std::io::Result<()> {
     {
         use std::os::windows::fs::FileTypeExt;
         if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink_dir()) {
-            return std::fs::remove_dir(path);
+            return ops::unlink_directory_link(path);
         }
     }
     std::fs::remove_file(path)
@@ -5391,12 +5391,13 @@ pub mod ops {
         ticks as f64 / TICKS_PER_MS - EPOCH_DIFFERENCE_MS
     }
 
-    /// The information classes [`file_info`] reads: each is the struct
-    /// GetFileInformationByHandleEx fills for its `CLASS`, which is what
-    /// makes the one call sound for every implementor. Private, so no other
-    /// pairing can be made.
+    /// The information classes [`file_info`] reads and [`set_file_info`]
+    /// writes: each is the struct GetFileInformationByHandleEx fills, and
+    /// SetFileInformationByHandle reads, for its `CLASS`, which is what makes
+    /// the one call of each sound for every implementor. Crate-private, so no
+    /// other pairing can be made.
     #[cfg(windows)]
-    trait FileInfoClass: Default {
+    pub(crate) trait FileInfoClass: Default {
         const CLASS: windows_sys::Win32::Storage::FileSystem::FILE_INFO_BY_HANDLE_CLASS;
     }
     #[cfg(windows)]
@@ -5414,12 +5415,105 @@ pub mod ops {
         const CLASS: windows_sys::Win32::Storage::FileSystem::FILE_INFO_BY_HANDLE_CLASS =
             windows_sys::Win32::Storage::FileSystem::FileAttributeTagInfo;
     }
+    #[cfg(windows)]
+    impl FileInfoClass for windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO {
+        const CLASS: windows_sys::Win32::Storage::FileSystem::FILE_INFO_BY_HANDLE_CLASS =
+            windows_sys::Win32::Storage::FileSystem::FileDispositionInfo;
+    }
+
+    /// Set a handle's information of class `T` ([`FileInfoClass`]).
+    #[cfg(windows)]
+    pub(crate) fn set_file_info<T: FileInfoClass>(
+        file: &std::fs::File,
+        info: &T,
+    ) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
+        // SAFETY: `file` owns its handle for the whole call, and `info` is a
+        // readable T of exactly the size passed -- the struct the API reads
+        // for T::CLASS (FileInfoClass pairs them).
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle().cast::<std::ffi::c_void>(),
+                T::CLASS,
+                (info as *const T).cast(),
+                std::mem::size_of::<T>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// libuv's fs__unlink for a directory link on Windows, on one handle so
+    /// that what is checked is what is deleted: the reparse point itself is
+    /// opened; a directory that is not a symlink or junction is refused
+    /// EPERM (ERROR_ACCESS_DENIED, as POSIX has unlink refuse a directory);
+    /// a read-only link is made writable; and the handle is marked for
+    /// deletion. Checking the path and then removing it by path again could
+    /// delete a real directory put there in between.
+    #[cfg(windows)]
+    pub(crate) fn unlink_directory_link(path: &std::path::Path) -> std::io::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
+            FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_WRITE_ATTRIBUTES,
+        };
+        const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+        const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+        let file = std::fs::OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        let basic = file_info::<FILE_BASIC_INFO>(&file)?;
+        if basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            let link = basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                && file_info::<FILE_ATTRIBUTE_TAG_INFO>(&file).is_ok_and(|tag| {
+                    matches!(
+                        tag.ReparseTag,
+                        IO_REPARSE_TAG_SYMLINK | IO_REPARSE_TAG_MOUNT_POINT
+                    )
+                });
+            if !link {
+                return Err(std::io::Error::from_raw_os_error(
+                    ERROR_ACCESS_DENIED as i32,
+                ));
+            }
+        }
+        if basic.FileAttributes & FILE_ATTRIBUTE_READONLY != 0 {
+            // Times of 0 are left as they are.
+            let writable = FILE_BASIC_INFO {
+                FileAttributes: (basic.FileAttributes & !FILE_ATTRIBUTE_READONLY)
+                    | FILE_ATTRIBUTE_ARCHIVE,
+                ..FILE_BASIC_INFO::default()
+            };
+            set_file_info(&file, &writable)?;
+        }
+        let delete = FILE_DISPOSITION_INFO { DeleteFile: true };
+        if let Err(failed) = set_file_info(&file, &delete) {
+            if basic.FileAttributes & FILE_ATTRIBUTE_READONLY != 0 {
+                let restored = FILE_BASIC_INFO {
+                    FileAttributes: basic.FileAttributes,
+                    ..FILE_BASIC_INFO::default()
+                };
+                let _ = set_file_info(&file, &restored);
+            }
+            return Err(failed);
+        }
+        Ok(())
+    }
 
     /// A handle's information of class `T`, or why it has none: a device
     /// that keeps no file information (a console) fails
     /// ERROR_INVALID_FUNCTION.
     #[cfg(windows)]
-    fn file_info<T: FileInfoClass>(file: &std::fs::File) -> std::io::Result<T> {
+    pub(crate) fn file_info<T: FileInfoClass>(file: &std::fs::File) -> std::io::Result<T> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
         let mut out = T::default();

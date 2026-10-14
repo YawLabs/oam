@@ -3754,7 +3754,8 @@ differ by platform. oam fails each as node does on Linux (libstdc++), on every p
 - **A directory copied where a file is.** node does not catch std::filesystem's exception
   and the process aborts (`SIGABRT` on Linux, `0xC0000409` on Windows). oam fails
   `EEXIST, File exists '<path>'` (`syscall` `cp`), the shape of node's other
-  std::filesystem failures.
+  std::filesystem failures. So does a junction (Windows) that leads back into the tree it is
+  in: node's C++ follows it until the path is too long, and aborts; oam fails `ELOOP`.
 
 The texts of oam's other std::filesystem-shaped failures in that copy (a link that
 cannot be made, a directory that cannot be created) are glibc's `strerror`, which is
