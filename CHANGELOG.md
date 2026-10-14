@@ -20,6 +20,21 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`fs.mkdir` applies its mode, checks its options, and says what it made.** In all three
+  forms (`mkdirSync`, `fs.mkdir`, `fs.promises.mkdir`):
+  - the mode -- `mkdirSync(dir, 0o700)`, `{ mode }` -- was dropped on Linux and macOS, every
+    directory being created `0o777` less the mask; it now goes to `mkdir(2)`, for every
+    directory a recursive call makes and none that was already there;
+  - the options are checked as node checks them: a `recursive` that is not a boolean and a
+    mode that is not one are refused (`{ recursive: "yes" }` was taken as `false`), in node's
+    order for each form, and `fs.mkdir` has node's `length` and `name`;
+  - a recursive mkdir returns (or calls back with, or resolves to) the first directory it
+    made, where it returned `undefined`;
+  - a recursive mkdir through a file is `ENOTDIR` (it was `EEXIST`), of an empty path
+    `ENOENT`, of a drive root `EPERM` and onto a dangling link `ENOENT` (the last three
+    succeeded or said `EEXIST`), and the callback and promise forms name the component
+    that failed.
+
 - **`process.umask` is the process's file mode creation mask.** It kept a number of its
   own: it started at `0` whatever the process had inherited, and setting it changed nothing
   about the files created afterwards. It is now `umask(2)` on Linux and macOS, so it reads

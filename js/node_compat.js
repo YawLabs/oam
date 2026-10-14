@@ -10595,6 +10595,28 @@
     return value;
   }
 
+  // What node's mkdir and mkdirSync take after the path (lib/fs.js,
+  // v22.22.2): a number or a string is the mode; of anything else truthy,
+  // `recursive` must be a boolean if it is there at all and `mode` goes
+  // through parseFileMode under its own name. Checked before the path.
+  const MKDIR_DEFAULTS = { mode: 0o777, recursive: false };
+  function mkdirOptions(options) {
+    let mode = 0o777;
+    let recursive = false;
+    if (typeof options === "number" || typeof options === "string") {
+      mode = parseFileMode(options, "mode");
+    } else if (options) {
+      if (options.recursive !== undefined) {
+        recursive = options.recursive;
+        if (typeof recursive !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.recursive", "boolean", recursive);
+        }
+      }
+      if (options.mode !== undefined) mode = parseFileMode(options.mode, "options.mode");
+    }
+    return { mode, recursive };
+  }
+
   // The lstat half of node's validateRmOptions (lib/internal/fs/utils.js,
   // v22.22.2), once the options are valid: rm refuses a directory unless
   // `recursive` is set -- ERR_FS_EISDIR, nothing removed -- and a path whose
@@ -12260,9 +12282,20 @@
         const entries = await natives.fsReaddir(file);
         return wrapDirents(file, entries, withFileTypes === true);
       }),
-      mkdir: withPath(async (file, options) => {
-        await natives.fsMkdir(file, readOptions(options).recursive === true);
-      }),
+      // node's promise form (lib/internal/fs/promises.js): the options are
+      // read, then the path is checked, then `recursive`, then the mode --
+      // an argument here, by name, and one `null` leaves at its default.
+      // With no options nothing is read, Object.prototype included.
+      // Resolves with the first directory a recursive call made.
+      mkdir: async function mkdir(path, options) {
+        if (typeof options === "number" || typeof options === "string") options = { mode: options };
+        const { recursive = false, mode = 0o777 } = options || { __proto__: null };
+        const file = toPath(path);
+        if (typeof recursive !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.recursive", "boolean", recursive);
+        }
+        return natives.fsMkdir(file, recursive, parseFileMode(mode, "mode", 0o777));
+      },
       rm: withPath(async (file, options) => {
         validateRmOptions(options);
         const recursive = options?.recursive === true;
@@ -12418,6 +12451,11 @@
     // Callback forms delegate to the promise forms (Node-style (err, value)).
     // `required` / `optional` say where node finds the callback (callbackSlot);
     // the promise form gets the arguments before it.
+    // The callback mkdir once its arguments are checked.
+    const mkdirCb = callbackify1(
+      (file, parsed) => natives.fsMkdir(file, parsed.recursive, parsed.mode),
+      2,
+    );
     function callbackify1(promiseFn, required, optional = 0, cbName = "cb") {
       return (...args) => {
         const at = callbackSlot(args, required, optional);
@@ -13059,7 +13097,8 @@
       },
       globSync: (pattern, options) => globSyncRaw(pattern, options, natives),
       mkdirSync: (path, options) => {
-        natives.fsMkdirSync(toPath(path), readOptions(options).recursive === true);
+        const { mode, recursive } = mkdirOptions(options);
+        return natives.fsMkdirSync(toPath(path), recursive, mode);
       },
       // node's rmSync skips the lstat only when both `force` and
       // `recursive` are set.
@@ -13261,7 +13300,14 @@
         return (readOptions(opts).recursive === true ? readdirBreadthFirstByPath : readdirByPath)(...arguments);
       },
       glob: callbackify1(fsPromisesInternals.globAsPromise, 1, 1),
-      mkdir: callbackify1(promises.mkdir, 1, 1),
+      // node's order: the options, the callback, the path.
+      mkdir: function mkdir(path, options, callback) {
+        let parsed = MKDIR_DEFAULTS;
+        if (typeof options === "function") callback = options;
+        else parsed = mkdirOptions(options);
+        validateCb(callback);
+        mkdirCb(toPath(path), parsed, callback);
+      },
       // node's rm (lib/fs.js, v22.22.2) validates the path and its options
       // synchronously, and NEVER checks the callback: the removal runs, and
       // calling a missing one when it settles is an uncaught TypeError

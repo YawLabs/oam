@@ -3211,6 +3211,11 @@ impl FsPath {
         &self.os
     }
 
+    /// A path that is already an OS path: a piece of one `os` gave.
+    pub fn from_os(os: String) -> Self {
+        Self { os }
+    }
+
     /// The OS path node's `readdir` hands libuv's scandir. On Windows that
     /// is the one path a trailing separator survives on: `readdirSync("f\\")`
     /// fails `ENOENT: ..., scandir 'C:\cwd\f\'` where `f` is a file, though
@@ -3525,6 +3530,124 @@ fn mkdtemp_drawing(
     }
     let exhausted = if cfg!(windows) { String::new() } else { path };
     Err((last_error, exhausted))
+}
+
+/// A failed `mkdir`: the error, and the path it was for -- the one asked
+/// for, or for a recursive mkdir the component that could not be made.
+#[derive(Debug)]
+pub struct MkdirFailure {
+    pub error: std::io::Error,
+    pub at: String,
+}
+
+/// mkdir(2) with `mode`, which the kernel takes the process's mask off. On
+/// Windows there is no mode to give, as with libuv's.
+fn mkdir_one(path: &str, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(mode).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        std::fs::create_dir(path)
+    }
+}
+
+/// `fs.mkdir` of `path` (an OS path: `FsPath::os`).
+///
+/// Recursive, it is node's MKDirpSync (src/node_file.cc, v22.22.2), kept
+/// step for step because what it reports is a matter of its steps: it
+/// tries the path itself, climbs a parent at a time while the answer is
+/// ENOENT -- cutting the string at its last separator, so the pieces are
+/// the caller's own spelling -- and comes back down. Every directory it
+/// makes gets `mode`; one already there is left as it is. The answer is the
+/// first directory THIS call made (`None` when all were there), which is
+/// why it is not a walk to the first existing ancestor: a directory another
+/// process makes in between is not one this call made. A component that is
+/// a file is ENOTDIR, the path itself being one is EEXIST.
+///
+/// `asynchronous` is for the one place node's two walks part ways: a
+/// component that is there but cannot be looked at (a link to nothing) is
+/// the stat's own error from MKDirpSync and ENOTDIR from MKDirpAsync.
+pub fn make_dir(
+    path: &str,
+    mode: u32,
+    recursive: bool,
+    asynchronous: bool,
+) -> Result<Option<String>, MkdirFailure> {
+    let fail = |error: std::io::Error, at: &str| MkdirFailure {
+        error,
+        at: at.to_string(),
+    };
+    if !recursive {
+        return mkdir_one(path, mode)
+            .map(|()| None)
+            .map_err(|e| fail(e, path));
+    }
+    let mut first: Option<String> = None;
+    let mut stack = vec![path.to_string()];
+    // Every turn makes a directory, ends, or climbs, and a component is
+    // tried twice at most -- on the way up and on the way down. The bound
+    // is for a file system that will not have it so (a directory made that
+    // then is not there to make another in), where node's walk never ends.
+    let bound = 2 * path.matches(std::path::MAIN_SEPARATOR).count() + 16;
+    let mut turns = 0usize;
+    while let Some(next) = stack.pop() {
+        turns += 1;
+        let error = match mkdir_one(&next, mode) {
+            Ok(()) => {
+                first.get_or_insert(next);
+                continue;
+            }
+            Err(error) => error,
+        };
+        // As libuv's mkdir reports it: a name Windows cannot have is EINVAL
+        // there, not the ENOENT that would send this climbing.
+        let code = fs_error_at(FsSite::Mkdir { recursive: false }, "mkdir", &next, &error).code;
+        match code {
+            "EACCES" | "ENOSPC" | "ENOTDIR" | "EPERM" => return Err(fail(error, &next)),
+            "ENOENT" if turns < bound => {
+                if let Some(cut) = next.rfind(std::path::MAIN_SEPARATOR) {
+                    let parent = next[..cut].to_string();
+                    stack.push(next);
+                    stack.push(parent);
+                    continue;
+                }
+                // Nothing above it to make: the stat below says why.
+            }
+            _ => {}
+        }
+        // A component of the path, with more of it still to make, rather
+        // than the path itself.
+        let component = code == "EEXIST" && !stack.is_empty();
+        // With the OS's own number on unix, where the errno node reports is
+        // read off the error.
+        let in_the_way = |component: bool| {
+            #[cfg(unix)]
+            let error = io_from_errno(if component {
+                rustix::io::Errno::NOTDIR
+            } else {
+                rustix::io::Errno::EXIST
+            });
+            #[cfg(not(unix))]
+            let error = std::io::Error::from(if component {
+                std::io::ErrorKind::NotADirectory
+            } else {
+                std::io::ErrorKind::AlreadyExists
+            });
+            error
+        };
+        match std::fs::metadata(&next) {
+            // Already a directory: nothing to make here.
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(fail(in_the_way(component), &next)),
+            Err(_) if asynchronous && component => return Err(fail(in_the_way(true), &next)),
+            Err(stat) => return Err(fail(stat, &next)),
+        }
+    }
+    Ok(first)
 }
 
 #[cfg(unix)]
@@ -5872,15 +5995,26 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_mkdir(path: super::FsPath, recursive: bool) -> OpOutcome {
-        let result = if recursive {
-            tokio::fs::create_dir_all(&path).await
-        } else {
-            tokio::fs::create_dir(&path).await
-        };
+    /// `fs.mkdir` and `fs.promises.mkdir`: resolves with the first directory
+    /// a recursive call made, if it made one (`super::make_dir`). A failure
+    /// names the component that could not be made, as node's asynchronous
+    /// mkdir does; the synchronous one names the path asked for.
+    pub async fn fs_mkdir(path: super::FsPath, recursive: bool, mode: u32) -> OpOutcome {
+        let owned = path.clone();
+        let result =
+            tokio::task::spawn_blocking(move || super::make_dir(owned.os(), mode, recursive, true))
+                .await;
+        let site = super::FsSite::Mkdir { recursive };
         match result {
-            Ok(()) => OpOutcome::Done,
-            Err(e) => node_fail_at(super::FsSite::Mkdir { recursive }, e, "mkdir", &path),
+            Ok(Ok(Some(first))) => OpOutcome::Text(first),
+            Ok(Ok(None)) => OpOutcome::Done,
+            Ok(Err(failure)) => node_fail_at(
+                site,
+                failure.error,
+                "mkdir",
+                &super::FsPath::from_os(failure.at),
+            ),
+            Err(e) => node_fail_at(site, std::io::Error::other(e.to_string()), "mkdir", &path),
         }
     }
 
@@ -7394,6 +7528,93 @@ mod os_error_code_tests {
         assert!(creates_read_only(0o666, 0o200));
         assert!(creates_read_only(0o777, 0o600));
         assert!(!creates_read_only(0o666, 0o400));
+    }
+
+    /// A recursive mkdir says which directory it made first, makes nothing
+    /// of what is there, and tells a file in the way of a component
+    /// (ENOTDIR) from one at the path itself (EEXIST), naming the path that
+    /// failed.
+    #[test]
+    fn make_dir_reports_the_first_directory_it_made_and_where_it_failed() {
+        let root = std::env::temp_dir().join(format!("oam-make-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let p = |rest: &[&str]| {
+            let mut path = root.clone();
+            for part in rest {
+                path.push(part);
+            }
+            path.to_str().unwrap().to_string()
+        };
+
+        assert_eq!(make_dir(&p(&["one"]), 0o777, false, false).unwrap(), None);
+        let failed = make_dir(&p(&["one"]), 0o777, false, false).unwrap_err();
+        assert_eq!(node_error_code(&failed.error), "EEXIST");
+        assert_eq!(failed.at, p(&["one"]));
+        let failed = make_dir(&p(&["no", "leaf"]), 0o777, false, false).unwrap_err();
+        assert_eq!(node_error_code(&failed.error), "ENOENT");
+
+        assert_eq!(
+            make_dir(&p(&["a", "b", "c"]), 0o777, true, false).unwrap(),
+            Some(p(&["a"])),
+            "none of it was there: the first made is the top"
+        );
+        assert_eq!(
+            make_dir(&p(&["a", "b", "d", "e"]), 0o777, true, true).unwrap(),
+            Some(p(&["a", "b", "d"])),
+            "what was there is not counted"
+        );
+        assert_eq!(
+            make_dir(&p(&["a", "b", "d", "e"]), 0o777, true, true).unwrap(),
+            None
+        );
+        assert!(std::path::Path::new(&p(&["a", "b", "d", "e"])).is_dir());
+
+        // Deeper than any fixed number of turns: the walk is bounded by the
+        // path, not by a count.
+        let deep: Vec<&str> = std::iter::once("deep")
+            .chain(std::iter::repeat_n("d", 300))
+            .collect();
+        assert_eq!(
+            make_dir(&p(&deep), 0o777, true, false).unwrap(),
+            Some(p(&["deep"]))
+        );
+        assert!(std::path::Path::new(&p(&deep)).is_dir());
+
+        std::fs::write(p(&["file"]), b"").unwrap();
+        let failed = make_dir(&p(&["file"]), 0o777, true, false).unwrap_err();
+        assert_eq!(node_error_code(&failed.error), "EEXIST");
+        assert_eq!(failed.at, p(&["file"]));
+        let failed = make_dir(&p(&["file", "x", "y"]), 0o777, true, true).unwrap_err();
+        assert_eq!(node_error_code(&failed.error), "ENOTDIR");
+        // Windows climbs to the file and names it; unix is told ENOTDIR at
+        // the first mkdir and names that.
+        let named = if cfg!(windows) {
+            p(&["file"])
+        } else {
+            p(&["file", "x", "y"])
+        };
+        assert_eq!(failed.at, named);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &str| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            std::fs::create_dir(p(&["kept"])).unwrap();
+            let kept = mode(&p(&["kept"]));
+            make_dir(&p(&["kept", "m", "n"]), 0o700, true, false).unwrap();
+            assert_eq!(
+                mode(&p(&["kept", "m"])),
+                0o700,
+                "every directory made gets the mode"
+            );
+            assert_eq!(mode(&p(&["kept", "m", "n"])), 0o700);
+            assert_eq!(mode(&p(&["kept"])), kept, "one already there keeps its own");
+            make_dir(&p(&["single"]), 0o700, false, false).unwrap();
+            assert_eq!(mode(&p(&["single"])), 0o700);
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// #324: the mode of an open that creates its file is the file's. A mode

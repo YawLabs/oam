@@ -45,8 +45,6 @@ fix opportunistically or when a real package trips one.
 ## fs / os / process / module (js/node_compat.js + natives)
 
 - fs.exists invokes its callback synchronously (zalgo).
-- fsPromises.mkdir({recursive:true}) resolves to undefined instead of the
-  first created path.
 - Stats objects lack nlink; fs.constants lacks the O_* open flags.
 - Async fs rejections carry .code only — .syscall/.path are dropped, and
   .errno is missing on both sync and async paths.
