@@ -268,6 +268,16 @@ fn run_worker(
     if let Some(js) = crate::inherited_flags_js() {
         let _ = rt.execute_script("<flags>", js);
     }
+    // The worker's own `execArgv: ["--no-warnings"]`: its process has no
+    // default 'warning' listener, as node's has none. (The other flags a
+    // worker may be given are not applied per worker.)
+    if exec_argv.iter().any(|arg| arg == "--no-warnings") {
+        let _ = rt.execute_script(
+            "<worker-flags>",
+            "for (const f of globalThis.process.listeners('warning')) \
+               if (f.name === 'onWarning') globalThis.process.removeListener('warning', f);",
+        );
+    }
     if let Err(diagnostics) = rt.execute_worker(script_path, ctx) {
         for d in &diagnostics {
             eprintln!("worker {thread_id}: {}", d.message);

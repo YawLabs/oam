@@ -14177,8 +14177,81 @@
 
     // NODE_REDIRECT_WARNINGS destination, resolved lazily on the first warning
     // and cached: undefined = not looked up yet, null = unset/empty (write to
-    // stderr), string = append warnings to that path. See emitWarning.
+    // stderr), string = append warnings to that path. See onWarning.
     let redirectWarningsPath;
+
+    // node's default 'warning' listener (lib/internal/process/warning.js,
+    // v22.22.2), and like node's an ordinary one: `process.listeners` shows
+    // it, and a program that reports warnings its own way takes it off
+    // (`removeAllListeners("warning")`, `off`) and hears each warning once.
+    // It prints whatever Error the event carries -- one emitted directly
+    // too, not only through emitWarning -- and nothing that is not one.
+    //
+    // Not here: node's one-time hint naming `--trace-warnings` /
+    // `--trace-deprecation`. oam has neither flag, so there is nothing true
+    // for the hint to say (docs/node-divergences.md).
+    function onWarning(warning) {
+      if (!(warning instanceof Error)) return;
+      const isDeprecation = warning.name === "DeprecationWarning";
+      if (isDeprecation && process.noDeprecation) return;
+      // --no-warnings takes the listener off at startup (the CLI's prelude,
+      // which a worker inherits); the check is for whatever still holds a
+      // reference to this function and calls it.
+      if (globalThis.__oamNoWarnings) return;
+      if (globalThis.__oamNoDeprecation && isDeprecation) return;
+      // --disable-warning=<name|code>: still emitted, not printed.
+      const disabled = globalThis.__oamDisabledWarnings;
+      if (
+        Array.isArray(disabled) &&
+        (disabled.includes(warning.name) || (warning.code && disabled.includes(warning.code)))
+      ) {
+        return;
+      }
+      // The (node:PID) prefix is node's own (`process.release.name`), kept
+      // so tooling that greps warnings still finds them. A warning whose
+      // toString is not a function is printed as an Error prints.
+      let line = `(node:${process.pid}) `;
+      if (warning.code) line += `[${warning.code}] `;
+      line += typeof warning.toString === "function"
+        ? `${warning.toString()}`
+        : Error.prototype.toString.call(warning);
+      if (typeof warning.detail === "string") line += `\n${warning.detail}`;
+      line += "\n";
+      // NODE_REDIRECT_WARNINGS: append the formatted warning to the named
+      // file instead of stderr. Read from natives.env() (the real OS
+      // environment) and cached, NOT process.env: node snapshots the
+      // variable at startup, so a runtime `process.env.NODE_REDIRECT_
+      // WARNINGS = ...` is ignored (probe-verified -- the warning still
+      // goes to stderr). Relative paths resolve against cwd; 'a' appends
+      // across runs. Node silently falls back to stderr on ANY write
+      // failure (probe: a path under a missing directory prints to stderr
+      // and still exits 0), so every throw here routes to stderrWrite.
+      if (redirectWarningsPath === undefined) {
+        // --redirect-warnings=<path> takes precedence over the env var
+        // (probe-verified); both are snapshotted, not re-read.
+        let v = globalThis.__oamRedirectWarnings;
+        if (typeof v !== "string" || v === "") {
+          try { v = natives.env().NODE_REDIRECT_WARNINGS; } catch (_) { v = undefined; }
+        }
+        redirectWarningsPath = typeof v === "string" && v !== "" ? v : null;
+      }
+      if (redirectWarningsPath !== null) {
+        try {
+          registry.get("fs").appendFileSync(redirectWarningsPath, line, "utf8");
+          return;
+        } catch (_) {
+          // fall through to stderr, exactly as node does
+        }
+      }
+      // Through process.stderr, as node's goes through console.error: a
+      // program that has taken over `process.stderr.write` gets its
+      // warnings there with everything else it prints.
+      try {
+        process.stderr.write(line);
+      } catch (_) {
+        natives.stderrWrite(line);
+      }
+    }
 
     // Lazy env: natives.env() crosses the FFI boundary and copies every
     // environment variable into a JS object (50-200 vars on a typical dev
@@ -14656,6 +14729,9 @@
         natives.stopSignal(type);
       }
     });
+    // After the two above, as node's is: `process.eventNames()` lists it
+    // third.
+    process.on("warning", onWarning);
 
     // Node's internal/process/finalization, ported. Pure JS there too: it
     // needs only WeakRef, FinalizationRegistry and the exit/beforeExit
@@ -15108,63 +15184,10 @@
           if (process.noDeprecation) return;
         }
 
-        // Defer so listeners attached after the emitWarning call (Node defers
-        // to nextTick) still fire.
-        process.nextTick(() => {
-          process.emit("warning", warningObj);
-          // Node's built-in default 'warning' handler always writes the
-          // formatted warning to stderr (it fires even when a user listener is
-          // also present). emitWarning always builds an Error, so this path is
-          // Error-shaped; a raw-string warning emitted via process.emit(...)
-          // bypasses emitWarning and is correctly NOT printed (test-process-
-          // warning). Use name+message rather than toString() so a warning with
-          // a non-function toString does not crash. The (node:PID) prefix
-          // matches Node's format so tooling that greps warnings still works.
-          const code = warningObj.code ? `[${warningObj.code}] ` : "";
-          let line = `(node:${process.pid}) ${code}${warningObj.name}: ${warningObj.message}\n`;
-          if (typeof warningObj.detail === "string") line += `${warningObj.detail}\n`;
-          // NODE_REDIRECT_WARNINGS: append the formatted warning to the named
-          // file instead of stderr. Read from natives.env() (the real OS
-          // environment) and cached, NOT process.env: node snapshots the
-          // variable at startup, so a runtime `process.env.NODE_REDIRECT_
-          // WARNINGS = ...` is ignored (probe-verified -- the warning still
-          // goes to stderr). Relative paths resolve against cwd; 'a' appends
-          // across runs. Node silently falls back to stderr on ANY write
-          // failure (probe: a path under a missing directory prints to stderr
-          // and still exits 0), so every throw here routes to stderrWrite.
-          // Suppression flags (--no-warnings / --no-deprecation /
-          // --disable-warning=<name|code>, installed by the CLI as
-          // non-enumerable globals). Node still EMITS the 'warning' event
-          // under all of them -- only this default stderr writer is gated.
-          if (globalThis.__oamNoWarnings) return;
-          if (globalThis.__oamNoDeprecation && warningObj.name === "DeprecationWarning") return;
-          const disabled = globalThis.__oamDisabledWarnings;
-          if (
-            Array.isArray(disabled) &&
-            (disabled.includes(warningObj.name) ||
-              (warningObj.code && disabled.includes(warningObj.code)))
-          ) {
-            return;
-          }
-          if (redirectWarningsPath === undefined) {
-            // --redirect-warnings=<path> takes precedence over the env var
-            // (probe-verified); both are snapshotted, not re-read.
-            let v = globalThis.__oamRedirectWarnings;
-            if (typeof v !== "string" || v === "") {
-              try { v = natives.env().NODE_REDIRECT_WARNINGS; } catch (_) { v = undefined; }
-            }
-            redirectWarningsPath = typeof v === "string" && v !== "" ? v : null;
-          }
-          if (redirectWarningsPath !== null) {
-            try {
-              registry.get("fs").appendFileSync(redirectWarningsPath, line, "utf8");
-              return;
-            } catch (_) {
-              // fall through to stderr, exactly as node does
-            }
-          }
-          natives.stderrWrite(line);
-        });
+        // Deferred, as node's is, so a listener attached after the call
+        // still hears it. What prints it is a listener like any other:
+        // `onWarning`, below.
+        process.nextTick(() => process.emit("warning", warningObj));
       },
       cpuUsage: (prev) => {
         if (prev) {
