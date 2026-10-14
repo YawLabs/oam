@@ -15,6 +15,14 @@
 //
 // The server is a separate `node` process (the harness's oracle, on PATH)
 // in BOTH runs, so only the client differs.
+//
+// Sequenced by events, not timers (#348): the server answers -- or sends
+// the rest of the body -- once it has seen the client's GOAWAY, a turn
+// later, so its own GOAWAY in answer is on the wire first; the client closes
+// once the server reports it has the whole request. Timers raced the connection under load, and
+// node's own output then varied. A GOAWAY that reaches a session after its
+// stream has closed (the one a server sends as it ends the connection) is
+// left out: node reports it or not by how the two race.
 import http2 from "node:http2";
 import { spawn } from "node:child_process";
 
@@ -25,35 +33,47 @@ setTimeout(() => {
 
 // before: GOAWAY(NO_ERROR, 2^31-1) once the request is in, then the answer.
 // last:   GOAWAY(NO_ERROR, 1) -- the request's stream -- then the answer.
-// mid:    the head and part of the body, GOAWAY(NO_ERROR, 1), the rest.
+// mid:    the head, GOAWAY(NO_ERROR, 1), part of the body, the rest.
 // client: no GOAWAY from the server; the client closes the session.
 // The server never ends the connection itself.
 const SERVER = `
 import http2 from "node:http2";
 const mode = process.argv[1];
 const server = http2.createServer();
+// What the server does once it has seen the client's GOAWAY: a turn later,
+// after the GOAWAY it answers with.
+const afterClientGoaway = (session, fn) => {
+  if (session.sawGoaway) setImmediate(fn);
+  else session.once("goaway", () => setImmediate(fn));
+};
 server.on("stream", (stream) => {
   stream.on("error", () => {});
   stream.resume();
   stream.on("end", () => {
+    console.log("request");
     if (mode === "mid") {
+      // The GOAWAY right after the head, ahead of the first part on the
+      // wire: node reports it before that part only when one read holds both.
       stream.respond({ ":status": 200 });
-      stream.write("part1");
       stream.session.goaway(0, 1);
-      setTimeout(() => stream.end("part2"), 300);
+      stream.write("part1");
+      afterClientGoaway(stream.session, () => stream.end("part2"));
       return;
     }
     if (mode === "before") stream.session.goaway(0, 2147483647);
     if (mode === "last") stream.session.goaway(0, 1);
-    setTimeout(() => {
+    afterClientGoaway(stream.session, () => {
       stream.respond({ ":status": 200 });
       stream.end("ok");
-    }, 150);
+    });
   });
 });
 server.on("session", (session) => {
   session.on("error", () => {});
-  session.on("goaway", (code, last) => console.log("goaway " + code + " " + last));
+  session.on("goaway", (code, last) => {
+    session.sawGoaway = true;
+    console.log("goaway " + code + " " + last);
+  });
 });
 server.listen(0, "127.0.0.1", () => console.log(server.address().port));
 `;
@@ -63,6 +83,8 @@ function startServer(mode) {
     stdio: ["ignore", "pipe", "inherit"],
   });
   const seen = [];
+  let requested;
+  const request = new Promise((r) => (requested = r));
   return new Promise((resolve) => {
     let out = "";
     server.stdout.setEncoding("utf8");
@@ -71,7 +93,8 @@ function startServer(mode) {
       const lines = out.split("\n");
       out = lines.pop();
       for (const line of lines) {
-        if (/^\d+$/.test(line.trim())) resolve({ server, port: line.trim(), seen });
+        if (/^\d+$/.test(line.trim())) resolve({ server, port: line.trim(), seen, request });
+        else if (line.trim() === "request") requested();
         else seen.push(line.trim());
       }
     });
@@ -79,12 +102,14 @@ function startServer(mode) {
 }
 
 async function run(mode) {
-  const { server, port, seen } = await startServer(mode);
+  const { server, port, seen, request } = await startServer(mode);
   const lines = [];
   const session = http2.connect("http://127.0.0.1:" + port);
   session.on("error", (e) => lines.push("session error " + e.code));
-  session.on("goaway", (code, last) =>
-    lines.push("session goaway " + code + " " + last + " closed=" + session.closed));
+  let streamClosed = false;
+  session.on("goaway", (code, last) => {
+    if (!streamClosed) lines.push("session goaway " + code + " " + last + " closed=" + session.closed);
+  });
   const closed = new Promise((resolve) => session.on("close", () => {
     lines.push("session close");
     resolve(true);
@@ -95,9 +120,12 @@ async function run(mode) {
   req.on("data", (d) => lines.push("stream data " + d));
   req.on("end", () => lines.push("stream end"));
   req.on("error", (e) => lines.push("stream error " + e.code));
-  req.on("close", () => lines.push("stream close rstCode=" + req.rstCode));
+  req.on("close", () => {
+    streamClosed = true;
+    lines.push("stream close rstCode=" + req.rstCode);
+  });
   req.end("x");
-  if (mode === "client") setTimeout(() => session.close(), 50);
+  if (mode === "client") request.then(() => session.close());
   // node closes at once; 10 s is a session that never closes.
   const deadline = new Promise((resolve) => setTimeout(resolve, 10000, false).unref());
   const ok = await Promise.race([closed, deadline]);
