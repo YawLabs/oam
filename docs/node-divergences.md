@@ -712,6 +712,24 @@ reads it without setting its own mode.
 _(source)_ Read out of both implementations, not measured side by side. Unix is unaffected:
 there oam applies libuv's `UV_TTY_MODE_RAW` recipe exactly (`raw_mode_bits`, same file).
 
+### 51. A process warning is printed without node's trace hint
+
+After the first warning of a process node prints, once, a line saying how to see where it
+came from:
+
+```
+(node:1234) [DEP_X] DeprecationWarning: first
+(Use `node --trace-deprecation ...` to show where the warning was created)
+```
+
+oam prints the warning and not the hint. The hint names a flag (`--trace-deprecation`, or
+`--trace-warnings` for a warning that is not a deprecation) and oam has neither, so there
+is nothing true for it to say; printing node's line as it stands would send the reader to
+another program. Everything else about the printer is node's: it is the `onWarning`
+listener on `process`, removable like any other, absent under `--no-warnings` and
+`NODE_NO_WARNINGS=1` (conformance case 406, which takes the hint line out of both sides).
+The flags and the hint are #364.
+
 ---
 
 ## Module loading and the CLI

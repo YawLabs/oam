@@ -20,6 +20,17 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **What prints a process warning is a `'warning'` listener that can be removed (#342).** oam
+  printed warnings from inside `process.emitWarning`, so `process` had no `'warning'`
+  listener and the printing could not be turned off: a program that took over warning
+  reporting the documented way -- `process.removeAllListeners("warning")`, then its own
+  listener -- got every warning twice. The printer is now node's `onWarning` listener:
+  `process.listeners("warning")` shows it, removing it stops the printing, and it prints
+  any `Error` the event carries, one emitted with `process.emit("warning", err)` included
+  (those were not printed). Under `--no-warnings` it is not installed, and
+  `NODE_NO_WARNINGS=1` now means the same, as it does to node. Node's one-time hint naming
+  `--trace-warnings` is not printed: oam has no such flag yet (#364).
+
 - **`fs.mkdir` applies its mode, checks its options, and says what it made.** In all three
   forms (`mkdirSync`, `fs.mkdir`, `fs.promises.mkdir`):
   - the mode -- `mkdirSync(dir, 0o700)`, `{ mode }` -- was dropped on Linux and macOS, every

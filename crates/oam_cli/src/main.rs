@@ -2731,8 +2731,16 @@ impl NodeFlags {
         if pending {
             js.push_str(&def("__oamPendingDeprecation", "true".into()));
         }
-        if self.no_warnings {
+        // --no-warnings, and NODE_NO_WARNINGS=1 which is the same thing to
+        // node: the default 'warning' listener is not there at all, so
+        // `process.listenerCount("warning")` is 0 (the event is still
+        // emitted to a program's own listeners).
+        if self.no_warnings || std::env::var("NODE_NO_WARNINGS").as_deref() == Ok("1") {
             js.push_str(&def("__oamNoWarnings", "true".into()));
+            js.push_str(
+                "for (const f of globalThis.process.listeners('warning')) \
+                   if (f.name === 'onWarning') globalThis.process.removeListener('warning', f);",
+            );
         }
         if self.no_deprecation {
             js.push_str(&def("__oamNoDeprecation", "true".into()));
