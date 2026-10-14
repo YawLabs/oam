@@ -96,6 +96,19 @@ process.on("exit", (code) => {
 Promise.resolve().then(() => console.log("micro"));
 throw new Error("boom");
 `;
+// An op completes in the same turn as the timer that resumes the await.
+const sameTurn = `
+import fs from "node:fs";
+process.on("exit", (code) => console.log("exit", code));
+await new Promise((r) => setTimeout(() => {
+  fs.readFile(new URL(import.meta.url), () => console.log("read callback"));
+  const end = Date.now() + 200;
+  while (Date.now() < end);
+  r();
+}, 1));
+process.nextTick(() => console.log("tick"));
+throw new Error("boom");
+`;
 const unsettled = `
 process.on("exit", (code) => {
   console.log("exit", code);
@@ -131,6 +144,7 @@ const files = {
   "throws-after-timer.mjs": throwsAfterTimer,
   "cjs-fatal-exit.cjs": cjsFatalExit,
   "unsettled.mjs": unsettled,
+  "same-turn.mjs": sameTurn,
 };
 for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text);
 try {
@@ -155,6 +169,7 @@ try {
     ["ES module entry that throws after a timer", "throws-after-timer.mjs"],
     ["CommonJS throw: what runs after", "cjs-fatal-exit.cjs"],
     ["top-level await that never settles", "unsettled.mjs"],
+    ["throw after a timer with an op done in its turn", "same-turn.mjs"],
   ]) {
     const run = spawnSync(process.execPath, [file], { cwd: dir, encoding: "utf8" });
     console.log(`${label}: ${run.stdout.trim().split(/\r?\n/).join(" | ")} (status ${run.status})`);

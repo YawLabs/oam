@@ -1256,6 +1256,11 @@ impl JsRuntime {
 pub(crate) fn run_ticks_and_microtasks(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
 ) -> Option<Vec<Diagnostic>> {
+    // The entry already rejected: it is reported next, before anything else
+    // runs ([`EntryEvaluation`]).
+    if entry_rejected(tc) {
+        return None;
+    }
     loop {
         let drain = (|| {
             let context = tc.get_current_context();
@@ -1521,11 +1526,20 @@ pub(crate) fn pump_event_loop(
             }
             progressed = true;
         }
+        // The entry rejected in that callback's drain (a top-level await it
+        // resumed, then a throw): node reports it from inside the drain, so
+        // no other callback of this turn runs first (#345).
+        if entry_promise.is_some_and(|promise| promise.state() == v8::PromiseState::Rejected) {
+            break;
+        }
 
         // V8's foreground tasks (platform.rs) -- node runs them from its
         // loop's poll phase, each followed by a tick + microtask drain.
         if run_platform_tasks(tc)? {
             progressed = true;
+        }
+        if entry_promise.is_some_and(|promise| promise.state() == v8::PromiseState::Rejected) {
+            break;
         }
 
         if let Some(completion) = tc
