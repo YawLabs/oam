@@ -1146,7 +1146,13 @@
         const bytes = this._bytes;
         return new ReadableStream({
           type: "bytes", // node's Blob#stream() is a byte stream
-          start(controller) { controller.enqueue(bytes); controller.close(); },
+          // A copy: what the stream hands out belongs to its reader, and a
+          // Blob does not change. Nothing at all for an empty one, as node's
+          // gives no chunk.
+          start(controller) {
+            if (bytes.length > 0) controller.enqueue(bytes.slice());
+            controller.close();
+          },
         });
       }
       toString() { return "[object Blob]"; }
