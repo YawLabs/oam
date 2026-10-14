@@ -1337,7 +1337,9 @@
   });
   // node's SystemError (lib/internal/errors.js, v22.22.2): the class of the
   // codes node raises for a failure it decides itself but reports in a
-  // system error's terms (ERR_FS_EISDIR). The message is `<prefix>: <syscall>
+  // system error's terms (ERR_FS_EISDIR). `new SystemError(key, context)`,
+  // as node's: the prefix is the key's message (systemErrorMessages). The
+  // message is `<prefix>: <syscall>
   // returned <code> (<message>) <path>`, `info` is the context object, and
   // errno / syscall / path are enumerable accessors over it -- own keys
   // stack, code, name, message, info, errno, syscall, path, in that order.
@@ -1346,10 +1348,23 @@
   // bootstrap.js's Error.prepareStackTrace's, which renders a kIsNodeError
   // error's from its name, code and message when the stack is first read.
   const kIsNodeErrorBrand = globalThis.__oamKIsNodeError;
+  const systemErrorMessages = {
+    __proto__: null,
+    ERR_FS_CP_DIR_TO_NON_DIR: "Cannot overwrite non-directory with directory",
+    ERR_FS_CP_EEXIST: "Target already exists",
+    ERR_FS_CP_EINVAL: "Invalid src or dest",
+    ERR_FS_CP_FIFO_PIPE: "Cannot copy a FIFO pipe",
+    ERR_FS_CP_NON_DIR_TO_DIR: "Cannot overwrite directory with non-directory",
+    ERR_FS_CP_SOCKET: "Cannot copy a socket file",
+    ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY: "Cannot overwrite symlink in subdirectory of self",
+    ERR_FS_CP_UNKNOWN: "Cannot copy an unknown file type",
+    ERR_FS_EISDIR: "Path is a directory",
+    ERR_SYSTEM_ERROR: "A system error occurred",
+  };
   class SystemError extends Error {
-    constructor(key, prefix, context) {
+    constructor(key, context) {
       super();
-      let message = `${prefix}: ${context.syscall} returned ${context.code} (${context.message})`;
+      let message = `${systemErrorMessages[key]}: ${context.syscall} returned ${context.code} (${context.message})`;
       if (context.path !== undefined) message += ` ${context.path}`;
       if (context.dest !== undefined) message += ` => ${context.dest}`;
       this.code = key;
@@ -1380,7 +1395,23 @@
       return registry.get("util").inspect(this, { ...ctx, getters: true, customInspect: false });
     }
   }
-  codes.ERR_FS_EISDIR = (context) => new SystemError("ERR_FS_EISDIR", "Path is a directory", context);
+  // node's makeSystemErrorWithCode: what most SystemError codes raise is an
+  // instance of a per-code subclass, `class NodeError extends SystemError`,
+  // so its constructor.name is 'NodeError' (#288). fs.rm's ERR_FS_EISDIR is
+  // the exception: node builds that one with SystemError itself.
+  const nodeSystemErrors = new Map();
+  const systemErrorWithCode = (key, context) => {
+    let NodeError = nodeSystemErrors.get(key);
+    if (NodeError === undefined) {
+      NodeError = class NodeError extends SystemError {
+        constructor(ctx) {
+          super(key, ctx);
+        }
+      };
+      nodeSystemErrors.set(key, NodeError);
+    }
+    return new NodeError(context);
+  };
   codes.ERR_MODULE_NOT_FOUND = E("ERR_MODULE_NOT_FOUND", Error, function(path, base) {
     return 'Cannot find module "' + path + '"' + (base ? ' imported from ' + base : '');
   });
@@ -5234,7 +5265,7 @@
     // "A system error occurred" prefix.
     const uvSystemError = (code, syscall) => {
       const entry = Array.from(uvErrnoTable(natives)).find(([, e]) => e[0] === code);
-      return new SystemError("ERR_SYSTEM_ERROR", "A system error occurred", {
+      return systemErrorWithCode("ERR_SYSTEM_ERROR", {
         errno: entry === undefined ? undefined : entry[0],
         code,
         message: entry === undefined ? code : entry[1][1],
@@ -10628,7 +10659,7 @@
       throw failed;
     }
     if (raw.kind === "dir" && !recursive) {
-      throw codes.ERR_FS_EISDIR({ code: "EISDIR", message: "is a directory", path: file, syscall: "rm", errno: 21 });
+      throw new SystemError("ERR_FS_EISDIR", { code: "EISDIR", message: "is a directory", path: file, syscall: "rm", errno: 21 });
     }
   }
 
@@ -11491,7 +11522,7 @@
       return makeNodeError(code, `Cannot overwrite ${kept} ${ns(dest)} with ${copied} ${ns(src)}`);
     }
     // EISDIR is 21 and ENOTDIR 20 in every platform's os.constants.errno.
-    return new SystemError(code, `Cannot overwrite ${kept} with ${copied}`, {
+    return systemErrorWithCode(code, {
       message: `cannot overwrite ${kept} ${dest} with ${copied} ${src}`,
       path: dest,
       syscall: "cp",
@@ -11521,7 +11552,7 @@
       }
       return makeNodeError("ERR_FS_EISDIR", "Recursive option not enabled, cannot copy a directory: " + shown);
     }
-    return new SystemError("ERR_FS_EISDIR", "Path is a directory", {
+    return systemErrorWithCode("ERR_FS_EISDIR", {
       message: `${src} is a directory (not copied)`,
       path: src,
       syscall: "cp",
@@ -11574,7 +11605,7 @@
       return null;
     }
     const einval = (message) =>
-      new SystemError("ERR_FS_CP_EINVAL", "Invalid src or dest", {
+      systemErrorWithCode("ERR_FS_CP_EINVAL", {
         message,
         path: dest,
         syscall: "cp",
