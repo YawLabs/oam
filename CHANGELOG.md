@@ -20,6 +20,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **At an ES module's top level `process.nextTick` runs after the promise jobs, as in node (#345).**
+  node evaluates an ES module inside a microtask drain, so the promise jobs its top level
+  queues, and the code after a top-level await they settle, run before any tick. oam ran the
+  ticks first. Now the main module's and a worker's match node; CommonJS and timer callbacks
+  were already right. A module that CommonJS `import()`s still runs its ticks early (#397).
 - **`fs.cp`, `fs.cpSync` and `fs.promises.cp` honour their options, as node's do (#390).** The copy
   read `recursive` alone. So `force: false` overwrote the file it was asked to keep, `errorOnExist`
   never failed, and `filter`, `dereference`, `verbatimSymlinks`, `preserveTimestamps` and `mode`

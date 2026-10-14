@@ -3734,6 +3734,15 @@ way; the difference is that a symlink needs the create-symlink privilege (Develo
 an elevated process), which a junction does not, so where that privilege is missing oam's
 call fails `EPERM` and node's succeeds. Measured against v22.22.2 (conformance case 377).
 
+### A module `import()` loads is evaluated inside the import
+
+oam evaluates a module that `import()` loads synchronously, inside its import hook, while the
+importer's frame is still on the stack. node loads and evaluates it in a later job, inside a
+microtask drain. From an ES module the two agree. From CommonJS the `process.nextTick`
+callbacks the imported module queues at its top level run before the importer's continuation:
+`micro | tick | after import` where node prints `micro | after import | tick`. Tracked in #397.
+An ES module's own top level orders ticks after its promise jobs, as node's does (#345,
+conformance case 411).
 ### `fs.cpSync` where node's C++ fails by its platform's std::filesystem
 
 `fs.cpSync` of a directory with no `filter` runs in node's C++ (`CpSyncCopyDir`), over

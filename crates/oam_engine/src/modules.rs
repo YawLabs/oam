@@ -752,6 +752,12 @@ impl JsRuntime {
             return Err(vec![diag]);
         };
         store_pending_code_cache(tc);
+        // node evaluates an ES module inside a microtask drain (its loader's
+        // promise job), so the promise jobs the module's top level queued --
+        // and a top-level await they settle -- run before the tick queue is
+        // reached: `process.nextTick` there runs after them, not ahead
+        // (#345). A bare checkpoint first, then the tick point.
+        tc.perform_microtask_checkpoint();
         if let Some(failure) = run_ticks_and_microtasks(tc) {
             return Err(failure);
         }
