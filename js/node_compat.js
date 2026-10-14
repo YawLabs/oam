@@ -15217,27 +15217,22 @@
       // Lives in js/internal/process/per_thread.js so its stack frame names
       // the module node core names. Bound once here; see that file.
       execve: perThread.execve,
-      umask(mask) {
-        const prev = process._umask ?? 0;
-        if (mask === undefined) return prev;
-        if (typeof mask === "number") {
-          process._umask = mask & 0o777;
-          return prev;
-        }
-        if (typeof mask === "string") {
-          // Octal string ("0664"). Reject non-octal.
-          if (!/^[0-7]+$/.test(mask)) {
-            throw new codes.ERR_INVALID_ARG_VALUE("mask", mask, "must be a 32-bit unsigned integer or an octal string");
+      // node's wrappedUmask (lib/internal/bootstrap/node.js; a worker's is in
+      // lib/internal/process/worker_thread_only.js): the mask is the
+      // process's, so a worker may read it and may not set it -- refused
+      // before the mask is looked at -- and a mask goes through
+      // parseFileMode as a file mode does.
+      umask: function wrappedUmask(mask) {
+        if (mask !== undefined) {
+          if (!natives.workerIsMainThread()) {
+            throw applyNodeErrorShape(
+              new TypeError("Setting process.umask() is not supported in workers"),
+              "ERR_WORKER_UNSUPPORTED_OPERATION",
+            );
           }
-          const parsed = parseInt(mask, 8);
-          if (!Number.isFinite(parsed) || parsed > 0xffffffff) {
-            throw new codes.ERR_INVALID_ARG_VALUE("mask", mask, "must be a 32-bit unsigned integer or an octal string");
-          }
-          // Node keeps only the low permission bits (mode > 0o777 still works).
-          process._umask = parsed & 0o777;
-          return prev;
+          mask = parseFileMode(mask, "mask");
         }
-        throw new codes.ERR_INVALID_ARG_TYPE("mask", ["number", "string"], mask);
+        return natives.processUmask(mask);
       },
       // Active-resource introspection, backed by three JS-side tables:
       // registry._activeRequests (fs callback ops), registry._activeHandles

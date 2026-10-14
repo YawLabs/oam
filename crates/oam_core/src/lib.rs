@@ -2556,6 +2556,83 @@ mod o_flag {
     pub const HARMLESS: i32 = RANDOM | SEQUENTIAL | SHORT_LIVED | DIRECT | DSYNC | SYNC | EXLOCK;
 }
 
+/// `process.umask`: set the process's file mode creation mask to `set` and
+/// say what it was, or with `None` only say what it is.
+///
+/// On unix it is umask(2), so the kernel takes it off the mode of every
+/// file and directory this process creates, and a child inherits it. The
+/// value is remembered here once known, because umask(2) can only be read
+/// by setting it: asking through it each time, as node does, would leave
+/// the mask at zero for a moment in which another thread's open creates a
+/// file wider than was asked. Linux can say without that (/proc); elsewhere
+/// the first read sets and restores it once. A mask changed behind this --
+/// by a native addon calling umask(2) itself -- is not seen until the next
+/// set.
+#[cfg(unix)]
+pub fn process_umask(set: Option<u32>) -> u32 {
+    use rustix::fs::Mode;
+    // mode_t is 16 bits on macOS and 32 on Linux.
+    #[allow(clippy::useless_conversion)]
+    let bits = |mode: Mode| u32::from(mode.as_raw_mode()) & 0o777;
+    static KNOWN: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    match set {
+        Some(mask) => {
+            let mask = mask & 0o777;
+            let was = rustix::process::umask(Mode::from_raw_mode(mask as _));
+            *known = Some(mask);
+            bits(was)
+        }
+        None => *known.get_or_insert_with(|| {
+            umask_from_proc().unwrap_or_else(|| {
+                let was = rustix::process::umask(Mode::empty());
+                rustix::process::umask(was);
+                bits(was)
+            })
+        }),
+    }
+}
+
+/// The `Umask:` line of /proc/self/status (Linux 4.7 and later): the mask
+/// read without touching it.
+#[cfg(unix)]
+fn umask_from_proc() -> Option<u32> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find_map(|l| l.strip_prefix("Umask:"))?;
+    u32::from_str_radix(line.trim(), 8).ok()
+}
+
+/// The mask on Windows, where there is no such thing below the C runtime:
+/// what node's `_umask` keeps is the owner's read and write bits, and the
+/// one use libuv makes of it is in its open (`OpenFlags::open_with_mode`).
+#[cfg(windows)]
+static WINDOWS_UMASK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(windows)]
+pub fn process_umask(set: Option<u32>) -> u32 {
+    use std::sync::atomic::Ordering;
+    match set {
+        Some(mask) => WINDOWS_UMASK.swap(mask & 0o600, Ordering::AcqRel),
+        None => WINDOWS_UMASK.load(Ordering::Acquire),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn process_umask(_set: Option<u32>) -> u32 {
+    0
+}
+
+/// Whether a Windows open that may create its file asks for a read-only
+/// one: libuv's fs__open rule, the mode less the umask having no
+/// owner-write bit.
+#[cfg(any(windows, test))]
+fn creates_read_only(mode: u32, umask: u32) -> bool {
+    (mode & !umask) & 0o200 == 0
+}
+
 /// `fs.constants`' open flags on this platform: the names node has here, in
 /// node's order, with the platform's values (v22.22.2; Windows and Linux
 /// measured, macOS from node's source).
@@ -2739,12 +2816,11 @@ impl OpenFlags {
         };
         let mut attributes = FILE_ATTRIBUTE_NORMAL;
         // The one thing a mode says on Windows: an open that may create its
-        // file, with no owner-write bit, asks for a read-only one (libuv's
-        // fs__open, which first takes the CRT's umask off the mode; that
-        // step is not made here). CreateFileW applies the attribute to a
-        // file it creates or (for CREATE_ALWAYS) replaces, and ignores it
-        // for one it merely opens.
-        if has(o_flag::CREAT) && mode & 0o200 == 0 {
+        // file, with no owner-write bit left once the umask is taken off,
+        // asks for a read-only one (libuv's fs__open). CreateFileW applies
+        // the attribute to a file it creates or (for CREATE_ALWAYS)
+        // replaces, and ignores it for one it merely opens.
+        if has(o_flag::CREAT) && creates_read_only(mode, process_umask(None)) {
             attributes |= FILE_ATTRIBUTE_READONLY;
         }
         if has(o_flag::TEMPORARY) {
@@ -7278,6 +7354,19 @@ mod os_error_code_tests {
         // An error with no raw code still maps by kind.
         let kind_only = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
         assert_eq!(node_error_code(&kind_only), "EACCES");
+    }
+
+    /// libuv's rule for a Windows open that may create its file: read-only
+    /// when the mode, less the umask, has no owner-write bit.
+    #[test]
+    fn a_created_file_is_read_only_without_an_owner_write_bit_after_the_umask() {
+        assert!(!creates_read_only(0o666, 0));
+        assert!(!creates_read_only(0o200, 0));
+        assert!(creates_read_only(0o444, 0));
+        assert!(creates_read_only(0o577, 0));
+        assert!(creates_read_only(0o666, 0o200));
+        assert!(creates_read_only(0o777, 0o600));
+        assert!(!creates_read_only(0o666, 0o400));
     }
 
     /// #324: the mode of an open that creates its file is the file's. A mode
