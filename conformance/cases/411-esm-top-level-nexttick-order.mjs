@@ -14,6 +14,12 @@
 // listener never runs, the promise jobs those listeners queue do. A
 // top-level await that never settles exits naturally, code 13.
 //
+// A .js file with no package.json "type" is one node decides by its syntax:
+// with an import or export, a top-level await or import.meta it is an ES
+// module (micro first); without, CommonJS (tick first), and its throw is
+// an uncaughtException. oam runs both as ES modules but orders them as node
+// does.
+//
 // Regression guard: oam ran an ES module's top-level ticks ahead of its
 // promise jobs.
 import { spawnSync } from "node:child_process";
@@ -124,6 +130,25 @@ process.on("exit", () => {
   console.log("exit");
 });
 `;
+// Typeless .js files: node decides by syntax.
+const plain = `
+const log = [];
+process.nextTick(() => log.push("tick"));
+Promise.resolve().then(() => log.push("micro"));
+setTimeout(() => console.log(log.join(" | ")), 5);
+`;
+const withExport = `${plain}
+export const x = 1;
+`;
+const withMeta = `${plain}
+void import.meta.url;
+`;
+const plainThrows = `
+process.on("uncaughtException", (e, origin) => console.log("uncaughtException", origin));
+process.nextTick(() => console.log("tick"));
+Promise.resolve().then(() => console.log("micro"));
+throw new Error("boom");
+`;
 // A worker whose entry is an ES module.
 const worker = `
 import { Worker } from "node:worker_threads";
@@ -147,6 +172,19 @@ const files = {
   "same-turn.mjs": sameTurn,
 };
 for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text);
+// The typeless files sit in a directory of their own whose package.json
+// declares no "type", so nothing above decides for them.
+const typeless = path.join(dir, "typeless");
+fs.mkdirSync(typeless);
+fs.writeFileSync(path.join(typeless, "package.json"), "{}\n");
+for (const [name, text] of Object.entries({
+  "plain.js": plain,
+  "with-export.js": withExport,
+  "with-meta.js": withMeta,
+  "plain-throws.js": plainThrows,
+})) {
+  fs.writeFileSync(path.join(typeless, name), text);
+}
 try {
   for (const [label, file] of [
     ["ES module top level", "order.mjs"],
@@ -172,6 +210,15 @@ try {
     ["throw after a timer with an op done in its turn", "same-turn.mjs"],
   ]) {
     const run = spawnSync(process.execPath, [file], { cwd: dir, encoding: "utf8" });
+    console.log(`${label}: ${run.stdout.trim().split(/\r?\n/).join(" | ")} (status ${run.status})`);
+  }
+  for (const [label, file] of [
+    ["typeless .js, no module syntax", "plain.js"],
+    ["typeless .js with an export", "with-export.js"],
+    ["typeless .js with import.meta", "with-meta.js"],
+    ["typeless .js, no module syntax, throws", "plain-throws.js"],
+  ]) {
+    const run = spawnSync(process.execPath, [path.join("typeless", file)], { cwd: dir, encoding: "utf8" });
     console.log(`${label}: ${run.stdout.trim().split(/\r?\n/).join(" | ")} (status ${run.status})`);
   }
 } finally {

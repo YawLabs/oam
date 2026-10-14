@@ -24,7 +24,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   node evaluates an ES module inside a microtask drain, so the promise jobs its top level
   queues, and the code after a top-level await they settle, run before any tick. oam ran the
   ticks first. Now the main module's and a worker's match node; CommonJS and timer callbacks
-  were already right. And no tick runs where node's never does: before the report of an ES
+  were already right. A `.js` or `.ts` file with no package.json "type", which oam runs as an
+  ES module, gets the order node gives it: an ES module's if it has an import, an export, a
+  top-level await or `import.meta`, CommonJS's if it has none. And no tick runs where node's never does: before the report of an ES
   module entry that throws, at its top level or after any top-level await (its `uncaughtException`
   origin is now node's `'unhandledRejection'`), after a fatal microtask throw at an ES module's top
   level, from an `'exit'` listener, or after the `'exit'` emit of a fatal exit. A top-level await

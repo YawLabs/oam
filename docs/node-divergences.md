@@ -3746,7 +3746,11 @@ import` where node prints `micro | after import | tick`. Only an ES module that 
 `import()` as its first step lines up with node. Tracked in #397.
 
 An ES module's own top level orders ticks after its promise jobs, as node's does (#345,
-conformance case 411). Under `oam test`, though, a test file's `test()` bodies run after the
+conformance case 411). A `.js` or `.ts` file with no package.json "type" runs as an ES module
+in oam (see the module-kind default), where node decides it by its syntax; for the order of its
+ticks oam decides as node does: an import, an export, a top-level await or `import.meta` make
+it an ES module's, none a CommonJS file's (ticks first, a top-level throw an
+`'uncaughtException'`). Under `oam test`, though, a test file's `test()` bodies run after the
 file's top-level `process.nextTick` callbacks; under `node --test` they run after its promise
 jobs but before its ticks. oam runs the registered tests once the file's module has run and its
 event loop has drained.

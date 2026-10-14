@@ -117,6 +117,33 @@ fn entry_rejected(scope: &mut v8::PinScope<'_, '_>) -> bool {
     v8::Local::new(scope, &entry).state() == v8::PromiseState::Rejected
 }
 
+/// Whether node would run the entry `path` as an ES module, which decides
+/// when the ticks its top level queues run (#345). Declared by extension or
+/// package.json "type" ([`oam_loader::node_declared_module_kind`]), or, for
+/// a typeless file, by its syntax as node detects it: a static import or
+/// export, a top-level await, or `import.meta`. Asked once the module has
+/// been evaluated, so its record answers the first three; the source answers
+/// the last.
+fn node_runs_as_esm(
+    scope: &mut v8::PinScope<'_, '_>,
+    module: v8::Local<'_, v8::Module>,
+    path: &Path,
+) -> bool {
+    if let Some(kind) = oam_loader::node_declared_module_kind(path) {
+        return kind == oam_loader::ModuleKind::Esm;
+    }
+    if module.get_module_requests().length() > 0 || module.is_graph_async() {
+        return true;
+    }
+    let exports = v8::Local::<v8::Object>::try_from(module.get_module_namespace())
+        .ok()
+        .and_then(|namespace| {
+            namespace.get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
+        })
+        .is_some_and(|names| names.length() > 0);
+    exports || std::fs::read_to_string(path).is_ok_and(|source| source.contains("import.meta"))
+}
+
 /// Park (or, with None, clear) the entry evaluation for [`entry_rejected`].
 fn park_entry_evaluation(
     scope: &mut v8::PinScope<'_, '_>,
@@ -800,21 +827,28 @@ impl JsRuntime {
             return Err(vec![diag]);
         };
         store_pending_code_cache(tc);
-        // node evaluates an ES module inside a microtask drain (its loader's
-        // promise job), so the promise jobs the module's top level queued --
-        // and a top-level await they settle -- run before the tick queue is
-        // reached: `process.nextTick` there runs after them, not ahead
-        // (#345). A bare checkpoint first, then the tick point.
-        tc.perform_microtask_checkpoint();
-        // A promise job in that drain that threw: fatal, it ends the run
-        // before any tick, as node exits at it; handled, it is delivered
-        // before the ticks.
-        if let Some(failure) = drain_uncaught(tc) {
-            return Err(failure);
-        }
-
         let promise = v8::Local::<v8::Promise>::try_from(value)
             .map_err(|_| rt_diag("OAM-RT0001", "module evaluation did not return a promise"))?;
+        let esm_in_node = node_runs_as_esm(tc, module, &entry);
+        if esm_in_node {
+            // node evaluates an ES module inside a microtask drain (its
+            // loader's promise job), so the promise jobs the module's top
+            // level queued -- and a top-level await they settle -- run
+            // before the tick queue is reached: `process.nextTick` there
+            // runs after them, not ahead (#345). A bare checkpoint first,
+            // then the tick point.
+            tc.perform_microtask_checkpoint();
+            // A promise job in that drain that threw: fatal, it ends the run
+            // before any tick, as node exits at it; handled, it is delivered
+            // before the ticks.
+            if let Some(failure) = drain_uncaught(tc) {
+                return Err(failure);
+            }
+        }
+        // An entry node would run as CommonJS (a typeless file with no
+        // module syntax) keeps CommonJS's order: its ticks first, at the tick
+        // point below, and a synchronous throw reported at once, with
+        // nothing queued run.
 
         // The entry's own throw -- at its top level, or after a top-level
         // await the drain settled -- is reported from inside node's drain,
@@ -850,39 +884,46 @@ impl JsRuntime {
                 // The full ladder, same as the CJS path: monitor -> capture
                 // callback -> listeners. A bare emit here skipped
                 // uncaughtExceptionMonitor entirely and mis-reported a
-                // throwing handler. node's origin for it is
+                // throwing handler. node's origin for an ES module's is
                 // 'unhandledRejection': its loader sees the evaluation's
                 // rejection.
-                let (exception, frame) =
-                    match dispatch_uncaught_from(tc, exception, "unhandledRejection") {
-                        Uncaught::Handled => {
-                            // A listener suppressed the fatal exit: continue like
-                            // a clean run -- drain ticks + microtasks the handler
-                            // queued (delivering any fresh throws), pump any
-                            // pending timers/ops, then report unhandled
-                            // rejections. The handler's promise jobs first: in
-                            // node it runs inside the drain, ahead of the ticks.
+                let origin = if esm_in_node {
+                    "unhandledRejection"
+                } else {
+                    "uncaughtException"
+                };
+                let (exception, frame) = match dispatch_uncaught_from(tc, exception, origin) {
+                    Uncaught::Handled => {
+                        // A listener suppressed the fatal exit: continue like
+                        // a clean run -- drain ticks + microtasks the handler
+                        // queued (delivering any fresh throws), pump any
+                        // pending timers/ops, then report unhandled
+                        // rejections. For an ES module the handler's
+                        // promise jobs first: in node it runs inside the
+                        // drain, ahead of the ticks.
+                        if esm_in_node {
                             tc.perform_microtask_checkpoint();
                             if let Some(failure) = drain_uncaught(tc) {
                                 return Err(failure);
                             }
-                            if let Some(failure) = run_ticks_and_microtasks(tc) {
-                                return Err(failure);
-                            }
-                            if let Some(failure) = drain_uncaught(tc) {
-                                return Err(failure);
-                            }
-                            pump_event_loop(tc, None, true)?;
-                            return match unhandled_rejection_failures(tc) {
-                                Some(failures) => Err(failures),
-                                None => Ok(()),
-                            };
                         }
-                        Uncaught::Fatal => (exception, None),
-                        Uncaught::HandlerThrew { value, frame, .. } => {
-                            (v8::Local::new(tc, &value), frame)
+                        if let Some(failure) = run_ticks_and_microtasks(tc) {
+                            return Err(failure);
                         }
-                    };
+                        if let Some(failure) = drain_uncaught(tc) {
+                            return Err(failure);
+                        }
+                        pump_event_loop(tc, None, true)?;
+                        return match unhandled_rejection_failures(tc) {
+                            Some(failures) => Err(failures),
+                            None => Ok(()),
+                        };
+                    }
+                    Uncaught::Fatal => (exception, None),
+                    Uncaught::HandlerThrew { value, frame, .. } => {
+                        (v8::Local::new(tc, &value), frame)
+                    }
+                };
                 let text = exception
                     .to_string(tc)
                     .map(|s| s.to_rust_string_lossy(tc))

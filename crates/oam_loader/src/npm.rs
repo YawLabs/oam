@@ -807,13 +807,35 @@ pub fn module_kind(path: &Path) -> ModuleKind {
         Some("cjs" | "cts" | "node") => return ModuleKind::Cjs,
         _ => {}
     }
+    if let Some(declared) = declared_package_type(path) {
+        return declared;
+    }
     let in_node_modules = path.components().any(|c| c.as_os_str() == "node_modules");
-    let untyped_default = if in_node_modules {
+    if in_node_modules {
         ModuleKind::Cjs
     } else {
         ModuleKind::Esm
-    };
+    }
+}
 
+/// The kind node itself takes a file for before it looks at its syntax:
+/// .mjs/.mts ESM, .cjs/.cts CJS, and otherwise the nearest package.json
+/// "type" -- None for a file with none (a typeless .js/.jsx/.ts/.tsx), the
+/// files node decides by whether their syntax is a module's. oam runs those
+/// as ESM outside node_modules ([`module_kind`]); where the difference is
+/// observable (when nextTick runs, #345) oam follows node's decision.
+pub fn node_declared_module_kind(path: &Path) -> Option<ModuleKind> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("mjs" | "mts") => Some(ModuleKind::Esm),
+        Some("cjs" | "cts" | "node") => Some(ModuleKind::Cjs),
+        _ => declared_package_type(path),
+    }
+}
+
+/// The nearest package.json "type" above `path`, up to a node_modules
+/// boundary: "module" is ESM, any other value CJS, none (or no package.json)
+/// None.
+fn declared_package_type(path: &Path) -> Option<ModuleKind> {
     let mut dir = path.parent();
     while let Some(current) = dir {
         let manifest_path = current.join("package.json");
@@ -825,9 +847,9 @@ pub fn module_kind(path: &Path) -> ModuleKind {
                     .map(str::to_string)
             });
             return match declared.as_deref() {
-                Some("module") => ModuleKind::Esm,
-                Some(_) => ModuleKind::Cjs,
-                None => untyped_default,
+                Some("module") => Some(ModuleKind::Esm),
+                Some(_) => Some(ModuleKind::Cjs),
+                None => None,
             };
         }
         if current
@@ -838,7 +860,7 @@ pub fn module_kind(path: &Path) -> ModuleKind {
         }
         dir = current.parent();
     }
-    untyped_default
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
