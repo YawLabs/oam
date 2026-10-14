@@ -1181,6 +1181,9 @@ fn repl_command() -> ExitCode {
     // reset_run_slots and create a CoreRuntime). Init it here so
     // tick() and repl_eval() have a Tokio runtime to drive ops on.
     rt.ensure_core_runtime();
+    // The process-level flags (--no-warnings and the rest), as a script run
+    // gets them: the REPL used to start with none.
+    flags.install(&mut rt);
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "oam".to_string());

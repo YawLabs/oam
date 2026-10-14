@@ -15,8 +15,21 @@ const scenario = process.argv[2];
 
 if (!isMainThread) {
   parentPort.postMessage(process.listeners("warning").map((f) => `${f.name}/${f.length}`));
+} else if (scenario === "captured") {
+  // The printing goes through process.stderr: a program that has taken that
+  // over gets its warnings there.
+  const written = [];
+  const write = process.stderr.write;
+  process.stderr.write = (chunk) => (written.push(String(chunk)), true);
+  process.emitWarning("to whoever holds process.stderr");
+  setImmediate(() => {
+    process.stderr.write = write;
+    const lines = written.join("").replace(/\((node|oam):\d+\)/g, "(node:PID)").split("\n");
+    console.log("captured:", JSON.stringify(lines.filter((line) => line !== "" && !line.startsWith("(Use `"))));
+  });
 } else if (scenario === "emit") {
   const seen = [];
+  console.log("events:", process.eventNames().map(String));
   console.log("listeners:", process.listeners("warning").map((f) => `${f.name}/${f.length}`));
   process.on("warning", (w) => seen.push(typeof w === "string" ? `string ${w}` : `${w.name}: ${w.message}`));
   process.emitWarning("dep", "DeprecationWarning", "DEP_X");
@@ -53,7 +66,12 @@ if (!isMainThread) {
   });
 } else if (scenario === "worker") {
   const worker = new Worker(new URL(import.meta.url));
-  worker.on("message", (names) => console.log("in a worker:", names));
+  worker.on("message", (names) => {
+    console.log("in a worker:", names);
+    // A worker given --no-warnings of its own has none.
+    const quiet = new Worker(new URL(import.meta.url), { execArgv: ["--no-warnings"] });
+    quiet.on("message", (none) => console.log("in a worker with execArgv --no-warnings:", none));
+  });
 } else {
   const run = (name, flags = [], env = {}) => {
     const child = spawnSync(process.execPath, [...flags, import.meta.filename, name], {
@@ -78,5 +96,7 @@ if (!isMainThread) {
   run("emit", ["--disable-warning=ExperimentalWarning", "--disable-warning=C1"]);
   run("removed");
   run("removed", ["--no-warnings"]);
+  run("captured");
   run("worker");
+  run("worker", ["--no-warnings"]);
 }

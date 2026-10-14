@@ -14194,8 +14194,9 @@
       if (!(warning instanceof Error)) return;
       const isDeprecation = warning.name === "DeprecationWarning";
       if (isDeprecation && process.noDeprecation) return;
-      // --no-warnings takes the listener off at startup (the CLI's prelude);
-      // this is for a runtime that prelude did not reach.
+      // --no-warnings takes the listener off at startup (the CLI's prelude,
+      // which a worker inherits); the check is for whatever still holds a
+      // reference to this function and calls it.
       if (globalThis.__oamNoWarnings) return;
       if (globalThis.__oamNoDeprecation && isDeprecation) return;
       // --disable-warning=<name|code>: still emitted, not printed.
@@ -14242,9 +14243,15 @@
           // fall through to stderr, exactly as node does
         }
       }
-      natives.stderrWrite(line);
+      // Through process.stderr, as node's goes through console.error: a
+      // program that has taken over `process.stderr.write` gets its
+      // warnings there with everything else it prints.
+      try {
+        process.stderr.write(line);
+      } catch (_) {
+        natives.stderrWrite(line);
+      }
     }
-    process.on("warning", onWarning);
 
     // Lazy env: natives.env() crosses the FFI boundary and copies every
     // environment variable into a JS object (50-200 vars on a typical dev
@@ -14722,6 +14729,9 @@
         natives.stopSignal(type);
       }
     });
+    // After the two above, as node's is: `process.eventNames()` lists it
+    // third.
+    process.on("warning", onWarning);
 
     // Node's internal/process/finalization, ported. Pure JS there too: it
     // needs only WeakRef, FinalizationRegistry and the exit/beforeExit
