@@ -1377,7 +1377,11 @@ async fn next_connection(
     let Some(mut listener) = held else {
         return std::future::poll_fn(|cx| {
             let guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-            match guard.listeners.get(&server_id).and_then(|l| l.poll_in_place(cx)) {
+            match guard
+                .listeners
+                .get(&server_id)
+                .and_then(|l| l.poll_in_place(cx))
+            {
                 Some(polled) => polled.map(Some),
                 None => std::task::Poll::Ready(None),
             }
@@ -1734,6 +1738,43 @@ mod tests {
         assert_eq!(
             refused.as_ref().err().map(std::io::Error::kind),
             Some(std::io::ErrorKind::ConnectionRefused),
+            "connected to a closed server: {refused:?}"
+        );
+        assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+    }
+
+    /// #338's Unix-socket twin: closing the server while an accept is parked
+    /// removes the socket file before close returns, so a dial right after
+    /// it gets ENOENT, as node's does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_unix_socket_server_closed_with_an_accept_parked_is_gone_at_once() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let path = std::env::temp_dir()
+            .join(format!("oam-338-{}.sock", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&path);
+        let OpOutcome::Json(payload) =
+            pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await
+        else {
+            panic!("listen failed");
+        };
+        let info: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let server_id = info["serverId"].as_u64().unwrap();
+        let parked = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        tcp_server_close(&registry, server_id);
+        let refused = tokio::net::UnixStream::connect(&path).await;
+        assert_eq!(
+            refused.as_ref().err().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound),
             "connected to a closed server: {refused:?}"
         );
         assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
