@@ -94,9 +94,7 @@ for (const [label, target, flag] of [["file", big, "r"], ["empty file", empty, "
   const handle = await fs.promises.open(growing, "r");
   const reading = answer(handle.readFile("utf8"));
   fs.appendFileSync(growing, "ABCDE");
-  const first = await reading;
-  const second = await answer(handle.readFile("utf8"));
-  const split = [first, second].join(" + ");
+  const split = [await reading, await answer(handle.readFile("utf8"))].join(" + ");
   const whole = ['string "0123456789" + string "ABCDE"', 'string "0123456789ABCDE" + string ""'];
   console.log("appended in the same tick | " + (whole.includes(split) ? "the whole file, once" : split));
   await handle.close();
