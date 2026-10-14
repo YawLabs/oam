@@ -2591,8 +2591,11 @@ pub fn process_umask(set: Option<u32>) -> u32 {
     match set {
         Some(mask) => {
             let mask = mask & KEPT;
+            // Said first: from here what oam writes for itself sets its
+            // modes itself. (A write of its own already past that check
+            // when the mask changes under it is the one thing not covered.)
+            oam_diagnostics::own_files::note_umask_set();
             let was = bits(rustix::process::umask(Mode::from_raw_mode(mask as _)));
-            // Before the new mask is known to anything else here.
             oam_diagnostics::own_files::note_inherited_umask(known.unwrap_or(was));
             *known = Some(mask);
             was

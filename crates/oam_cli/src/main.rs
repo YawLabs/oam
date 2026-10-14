@@ -2025,7 +2025,8 @@ fn serve_with_workers(
         .replace("__OAM_WORKER_SCRIPT__", &worker_path_str);
 
     let dispatcher_path = dir.join("_pool_dispatcher.cjs");
-    std::fs::write(&dispatcher_path, &dispatcher_src).expect("write dispatcher");
+    own_files::write(&dispatcher_path, &dispatcher_src, Audience::Scratch)
+        .expect("write dispatcher");
 
     let result = run_file(&dispatcher_path, &[], inspect, oam_engine::ReplayMode::Off);
     let _ = std::fs::remove_dir_all(&dir);
