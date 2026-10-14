@@ -127,3 +127,35 @@ for (const n of names) {
     console.log(scrub(n) + " | " + label + ": " + line);
   }
 }
+
+// A prefix with nothing under it names a volume or a device namespace, not
+// a directory (#332): libuv's open of the volume is refused (EPERM), the
+// pipe namespace and NUL open and are no directory (ENOTDIR, and EISDIR for
+// NUL as libuv reads its answer). With a separator after them they list in
+// both runtimes, which is not shown: what they list is the machine's.
+// readdir only -- opendir lists all of them, the machine's again.
+if (win) {
+  const drive = D.slice(0, 2);
+  // A console refuses a listing's open (EINVAL), and the mailslot
+  // namespace is a directory with nothing in it, not even . and ..
+  for (const n of [`\\\\?\\${drive}`, `\\\\.\\${drive}`, "\\\\.\\pipe", "\\\\.\\NUL", "\\\\.\\CON", "\\\\.\\mailslot\\"]) {
+    const forms = [
+      ["readdirSync", () => fs.readdirSync(n)],
+      ["readdirSync withFileTypes", () => fs.readdirSync(n, { withFileTypes: true })],
+      ["readdirSync recursive", () => fs.readdirSync(n, { recursive: true })],
+      ["readdir", () => called((cb) => fs.readdir(n, cb))],
+      ["readdir recursive", () => called((cb) => fs.readdir(n, { recursive: true }, cb))],
+      ["promises.readdir", () => fs.promises.readdir(n)],
+    ];
+    for (const [label, f] of forms) {
+      let line;
+      try {
+        const listed = await f();
+        line = n.includes("mailslot") ? JSON.stringify(listed) : `lists ${listed.length > 0}`;
+      } catch (e) {
+        line = shape(e);
+      }
+      console.log(n.replace(drive, "<drive>") + " | " + label + ": " + line);
+    }
+  }
+}

@@ -20,6 +20,14 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **On Windows `readdir` of a volume or a device namespace refuses it, as node's does (#332).**
+  `readdirSync("\\\\?\\C:")` and `"\\\\.\\C:"` (the volume, not its root directory) listed the
+  root; node's are `EPERM`. `"\\\\.\\pipe"` with no separator after it listed the pipes; node's is
+  `ENOTDIR`. A device is what node says it is, where it was `ENOTDIR`: `"\\\\.\\NUL"`,
+  `"\\\\.\\CONIN$"` and `"\\\\.\\CONOUT$"` are `EISDIR`, `"\\\\.\\CON"` is `EINVAL`. And
+  `"\\\\.\\mailslot\\"` lists as empty, where it was `ENOENT`. `"\\\\?\\C:\\"` and `"\\\\.\\pipe\\"`,
+  with a separator, list as before and as in node; `opendir` is unchanged.
+
 - **`fs.openAsBlob` of a directory gives a Blob, as node's does (#335).** It rejected
   `ERR_INVALID_ARG_VALUE`. A directory opens and has a size -- 0 on Windows, the
   directory's own on Linux and macOS -- so the Blob is made with that size, and reading a

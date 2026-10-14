@@ -5730,7 +5730,9 @@ pub mod ops {
     ///   fail the listing itself, the table's `ENOENT`.
     ///
     /// Asked only once the listing has failed, so a listing that works pays
-    /// nothing. Measured on node v22.22.2: conformance case 393.
+    /// nothing -- except for a path that is a prefix with nothing under it
+    /// (`listed_before_opened`). Measured on node v22.22.2: conformance case
+    /// 393.
     #[cfg(windows)]
     fn listing_error(path: &str, raw: bool, error: std::io::Error) -> std::io::Error {
         use std::os::windows::fs::MetadataExt;
@@ -5744,13 +5746,58 @@ pub mod ops {
                 _ => error,
             };
         }
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        match super::opens_as_libuv(&mut options).open(path) {
-            Err(open) => open,
-            Ok(opened) if opened.metadata().is_ok_and(|m| m.is_dir()) => error,
-            Ok(_) => not_a_directory(),
+        match scandir_open(path) {
+            Err(refused) => refused,
+            Ok(()) => error,
         }
+    }
+
+    /// fs__scandir's open of `path` and its first question of what opened:
+    /// the open's own failure; `ENOTDIR` for what answers and is no
+    /// directory, and for what answers ERROR_INVALID_PARAMETER (libuv reads
+    /// its directory query's STATUS_INVALID_PARAMETER so: the pipe
+    /// namespace, `\\.\pipe`); what any other handle says when it cannot
+    /// answer (a device: `\\.\NUL` is ERROR_INVALID_FUNCTION, the table's
+    /// `EISDIR`, which is what node reports); and nothing for a directory.
+    #[cfg(windows)]
+    fn scandir_open(path: &str) -> std::io::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_LIST_DIRECTORY, SYNCHRONIZE};
+        // libuv's access, not a read: a console (`\\.\CON`) refuses a
+        // directory listing's open ERROR_INVALID_PARAMETER, the table's
+        // `EINVAL`, where a read open would succeed.
+        let mut options = std::fs::OpenOptions::new();
+        options.access_mode(FILE_LIST_DIRECTORY | SYNCHRONIZE);
+        let opened = super::opens_as_libuv(&mut options).open(path)?;
+        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+        let not_a_directory = || std::io::Error::from(std::io::ErrorKind::NotADirectory);
+        match opened.metadata() {
+            Ok(meta) if meta.is_dir() => Ok(()),
+            Ok(_) => Err(not_a_directory()),
+            Err(asked) if asked.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => {
+                Err(not_a_directory())
+            }
+            Err(asked) => Err(asked),
+        }
+    }
+
+    /// A path std lists that libuv's scandir refuses (#332): a prefix with
+    /// nothing under it, which names a volume or a device namespace rather
+    /// than a directory -- `\\?\C:`, `\\.\C:`, `\\.\pipe`. std lists
+    /// `path\*`, which is the root directory under it; libuv opens the path
+    /// itself, and a volume refuses that open (`EPERM`) and the pipe
+    /// namespace is no directory (`ENOTDIR`). With a separator after it, or
+    /// a plain drive (`C:`, that drive's current directory), the two agree,
+    /// and a UNC share is a directory either way.
+    #[cfg(windows)]
+    fn listed_before_opened(path: &str) -> bool {
+        // Read off the string: std's Path gives a device prefix a root
+        // directory it does not spell, so it cannot tell `\\.\C:` from
+        // `\\.\C:\`.
+        let rest = path
+            .strip_prefix(r"\\?\")
+            .or_else(|| path.strip_prefix(r"\\.\"));
+        rest.is_some_and(|rest| !rest.is_empty() && !rest.contains(['\\', '/']))
     }
 
     /// The entries of `path` as node hands them out: `readdir`'s come from
@@ -5761,8 +5808,34 @@ pub mod ops {
     /// `a, b, c, lnk, top.txt`) and Linux.
     pub fn readdir_to_json(path: &str, raw: bool) -> std::io::Result<String> {
         let mut found = Vec::new();
+        // readdir of a path std would list and libuv refuses: refused here
+        // first, as libuv's open refuses it.
         #[cfg(windows)]
-        let listing = std::fs::read_dir(path).map_err(|e| listing_error(path, raw, e))?;
+        if !raw && listed_before_opened(path) {
+            scandir_open(path)?;
+        }
+        #[cfg(windows)]
+        let listing = match std::fs::read_dir(path) {
+            // A directory std cannot list and libuv's query finds nothing in:
+            // the mailslot namespace, `\\.\mailslot\`, which has no entries
+            // at all -- not even `.` and `..` -- and takes no `*` pattern
+            // (FindFirstFileW: ERROR_INVALID_NAME; an empty directory of that
+            // kind would be ERROR_FILE_NOT_FOUND). It opens as libuv opens a
+            // directory, and readdir gives [].
+            Err(e)
+                if !raw
+                    && e.raw_os_error().is_some_and(|code| {
+                        use windows_sys::Win32::Foundation::{
+                            ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME,
+                        };
+                        code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_INVALID_NAME as i32
+                    })
+                    && scandir_open(path).is_ok() =>
+            {
+                return Ok("[]".to_string());
+            }
+            listing => listing.map_err(|e| listing_error(path, raw, e))?,
+        };
         #[cfg(not(windows))]
         let listing = std::fs::read_dir(path)?;
         for entry in listing {
