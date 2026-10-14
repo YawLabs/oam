@@ -20,6 +20,19 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **A request is no longer written into an https connection its server is closing (#312).**
+  A server that answers and closes in one go -- a `302` then `end()`, the last answer of a
+  keep-alive budget -- left a pooled connection whose close was still on its way, and the
+  next request to that origin could be written into it: read twice by the server, or lost
+  if it could not be sent again. The pool's 1 ms wait covered a plain-TCP close and not a
+  TLS one, which arrives later (102-135 of 1,000 redirect hops read twice and 288-313 of
+  400 `POST`s through, against a node TLS server where node's own client measures 0 and
+  400). The pool now remembers an origin that closes a connection right after answering on
+  it and, for a minute, does not reuse a connection to it parked less than 250 ms ago: such
+  a request opens its own. A connection that has sat idle longer is reused as before, and
+  origins that keep their connections open are unaffected. A TLS connection also reports a
+  close that arrived together with the answer. The same run now measures 0 and 400.
+
 - **`FileHandle.readFile` checks its options before it reads (#351).** It read first and
   decoded at the end, so an unknown `encoding` was reported with the wrong code
   (`ERR_UNKNOWN_ENCODING`), not reported at all for an empty file, and hidden behind the

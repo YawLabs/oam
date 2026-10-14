@@ -13057,26 +13057,25 @@ process.exit(0);
 /// node's `end()` sends a close_notify alert first, then the FIN: the peek
 /// sees BYTES, not EOF, rustls reads the alert and reports the stream's end
 /// to hyper, and the dispatcher closes the sender on that -- the close
-/// arrives through rustls as EOF (close_notify), not as a kernel FIN. The
-/// gate's 1 ms window has to cover that extra decode, so the contract here
-/// is the two plain-TCP tests' above, with their tolerances: the `POST` +
+/// arrives through rustls as EOF (close_notify), not as a kernel FIN, and
+/// later: a turn or more of the server's event loop after the answer, which
+/// the gate's 1 ms window does not cover. The contract here is the two
+/// plain-TCP tests' above, with their tolerances: the `POST` +
 /// `200`-then-FIN row at >= 398 of 400 and the `GET` + `302` row at <= 3
 /// doubled hops of 1,000, every `/redir` request read once, every fetch
 /// answered.
 ///
-/// Ignored: oam does not meet it yet. Measured 2026-10-10 on Windows
-/// arm64, debug build, node v22.22.2 as the server, five runs: 4, 10, 53,
-/// 53 and 53 of 1,000 `GET` + `302` hops doubled, 0-7 of 1,000 fetches
-/// failed, a `/redir` request read twice in three runs, and 380-400 of 400
-/// `POST`s through -- the plain-TCP gate-off numbers, where the same box
-/// and the same run measure plain TCP at 0 doubles, 0 fails and 400 of
-/// 400. Node's own client over the same TLS server measures 0 doubles, 0
-/// fails and 400 of 400, twice. So the freshness gate does not cover the
-/// TLS close, and the row is node's to match; this test is the contract
-/// to un-ignore with the fix.
+/// What meets it (#312) is not a longer window but the pool learning the
+/// origin: one seen to close a connection right after answering on it is
+/// not handed a just-parked connection again (`pool::SETTLE`), and the TLS
+/// stream reports a close_notify the session has already read
+/// (`connector::TlsWatched`). Before that, 2026-10-10 on Windows arm64,
+/// debug build, node v22.22.2 as the server, five runs: 4, 10, 53, 53 and
+/// 53 of 1,000 `GET` + `302` hops doubled and 380-400 of 400 `POST`s
+/// through, where node's own client measures 0 and 400. The tolerances
+/// stay: the first requests to an origin go out before there is anything
+/// to have learned from.
 #[test]
-#[ignore = "the pool's freshness gate does not cover a TLS close: 4-53 of 1,000 GET + 302 hops \
-            doubled and 380-400 of 400 POSTs through where node measures 0 and 400 (see the doc)"]
 fn the_fin_gate_holds_over_tls_for_a_get_hop_and_a_post_after_a_fin() {
     let bundle = write_temp("tls-fin-gate/ca.pem", TLS_TEST_CA_CERT);
     let src = r#"import tls from 'node:tls';

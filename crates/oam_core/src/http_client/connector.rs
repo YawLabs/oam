@@ -77,6 +77,9 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> AsyncIo for T {}
 #[derive(Debug)]
 pub(crate) struct ConnStats {
     counters: Arc<ConnCounters>,
+    /// Set once the TLS session has the peer's close_notify (see
+    /// [`TlsWatched`]); `None` for a connection with no TLS of its own.
+    peer_closed: Option<Arc<AtomicBool>>,
     /// The response-byte count when this copy was made from the pool's own
     /// copy; `None` on the pool's own copy.
     read_at_checkout: Option<u64>,
@@ -98,6 +101,7 @@ impl ConnStats {
     pub(crate) fn new() -> ConnStats {
         ConnStats {
             counters: Arc::new(ConnCounters::default()),
+            peer_closed: None,
             read_at_checkout: None,
         }
     }
@@ -108,8 +112,16 @@ impl ConnStats {
     fn clone_for_pool(&self) -> ConnStats {
         ConnStats {
             counters: self.counters.clone(),
+            peer_closed: self.peer_closed.clone(),
             read_at_checkout: None,
         }
+    }
+
+    /// The peer has said it is closing: its close_notify has been read.
+    pub(crate) fn peer_closed(&self) -> bool {
+        self.peer_closed
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
     }
 
     /// Counts one more request on this connection: true when an earlier
@@ -143,6 +155,7 @@ impl Clone for ConnStats {
     fn clone(&self) -> ConnStats {
         ConnStats {
             counters: self.counters.clone(),
+            peer_closed: self.peer_closed.clone(),
             read_at_checkout: Some(
                 self.read_at_checkout
                     .unwrap_or_else(|| self.counters.read.load(Ordering::Relaxed)),
@@ -284,6 +297,22 @@ pub(crate) struct OamConn {
 }
 
 impl OamConn {
+    /// A connection over TLS: [`OamConn::new`], with the session watched for
+    /// the peer's close.
+    fn new_tls<IO>(tls: tokio_rustls::client::TlsStream<IO>, h2: bool, info: ConnInfo) -> OamConn
+    where
+        IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let peer_closed = Arc::new(AtomicBool::new(false));
+        let watched = TlsWatched {
+            tls,
+            peer_closed: peer_closed.clone(),
+        };
+        let mut conn = OamConn::new(Box::new(watched), h2, false, info);
+        conn.stats.peer_closed = Some(peer_closed);
+        conn
+    }
+
     fn new(io: Box<dyn AsyncIo>, h2: bool, proxied: bool, mut info: ConnInfo) -> OamConn {
         let stats = ConnStats::new();
         // An h2 connection carries every request to its origin at once: one
@@ -1028,7 +1057,7 @@ impl OamConnector {
         let config = self.shared.tls(alpn).await?;
         let (tls, h2) = tls_handshake(config, name, tcp).await?;
         let info = info.with_tls(tls.get_ref().1);
-        Ok(OamConn::new(Box::new(tls), h2, false, info))
+        Ok(OamConn::new_tls(tls, h2, info))
     }
 
     async fn through_proxy(
@@ -1069,7 +1098,7 @@ impl OamConnector {
         let config = self.shared.tls(alpn).await?;
         let (tls, h2) = tls_handshake(config, name, TokioIo::new(tunneled)).await?;
         let info = endpoints.with_tls(tls.get_ref().1);
-        Ok(OamConn::new(Box::new(tls), h2, false, info))
+        Ok(OamConn::new_tls(tls, h2, info))
     }
 }
 
@@ -1140,7 +1169,7 @@ impl Service<Uri> for ProxyTransport {
             // carry. (reqwest offered h2 here for an http destination.)
             let config = this.shared.tls(Alpn::None).await?;
             let (tls, _) = tls_handshake(config, name, tcp).await?;
-            Ok(OamConn::new(Box::new(tls), false, false, info))
+            Ok(OamConn::new_tls(tls, false, info))
         })
     }
 }
@@ -1442,6 +1471,55 @@ const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
 /// hyper-rustls's refusal was.
 fn server_name(host: &str) -> Result<ServerName<'static>, BoxError> {
     ServerName::try_from(host.to_string()).map_err(|e| Box::new(e) as BoxError)
+}
+
+/// A TLS stream that says when its peer has closed: after every read it
+/// asks the session whether the peer's close_notify is among what has been
+/// read, and sets the connection's flag ([`ConnStats::peer_closed`]) if so.
+///
+/// Why hyper's own answer is not enough. A server that answers and closes in
+/// one go can put the answer and its close_notify in one segment. The
+/// session then has both from the read that brought the answer, hands hyper
+/// the answer, and hyper -- its message complete -- reads no further: the
+/// connection is parked with its end already known to the session and to
+/// nobody else, since no later bytes arrive to wake a read. The pool asks
+/// this flag at checkout (`pool::reuse_h1`).
+struct TlsWatched<IO> {
+    tls: tokio_rustls::client::TlsStream<IO>,
+    peer_closed: Arc<AtomicBool>,
+}
+
+impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsWatched<IO> {
+    fn poll_read(
+        self: StdPin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let polled = StdPin::new(&mut this.tls).poll_read(cx, buf);
+        if let Ok(state) = this.tls.get_mut().1.process_new_packets()
+            && state.peer_has_closed()
+        {
+            this.peer_closed.store(true, Ordering::Release);
+        }
+        polled
+    }
+}
+
+impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsWatched<IO> {
+    fn poll_write(
+        self: StdPin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        StdPin::new(&mut self.get_mut().tls).poll_write(cx, buf)
+    }
+    fn poll_flush(self: StdPin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        StdPin::new(&mut self.get_mut().tls).poll_flush(cx)
+    }
+    fn poll_shutdown(self: StdPin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        StdPin::new(&mut self.get_mut().tls).poll_shutdown(cx)
+    }
 }
 
 /// Handshake over `io`; the bool is whether ALPN selected h2.
