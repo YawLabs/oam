@@ -20,11 +20,13 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
-- **A `SystemError` code is an instance of its own `NodeError` class, as node's is (#288).** node raises most
-  of them (`fs.cp`'s `ERR_FS_CP_*` and `ERR_FS_EISDIR`, `os.getPriority`'s `ERR_SYSTEM_ERROR`) as a
-  per-code `class NodeError extends SystemError`, and `fs.rm`'s `ERR_FS_EISDIR` with `SystemError`
-  itself. oam built every one with a single class, so `err.constructor.name` read `SystemError`
-  where node's reads `NodeError`. The name, code, keys and message are unchanged.
+- **A `SystemError` code is an instance of its own `NodeError` class, as node's is (#288).**
+  node raises `fs.cp`'s `ERR_FS_CP_*` and `ERR_FS_EISDIR`, and `os.getPriority`'s
+  `ERR_SYSTEM_ERROR`, as a per-code `class NodeError extends SystemError`. oam built every one
+  with a single class, so `err.constructor.name` read `SystemError` where node's reads
+  `NodeError`. `fs.rm`'s `ERR_FS_EISDIR` is node's stackless subclass of that code's class, whose
+  `constructor` answers `SystemError`. And the `kIsNodeError` mark is each error's own, as
+  node's is. The name, code, keys and message are unchanged.
 - **A connect made after `server.close()` is refused, as node's is (#338).** A `net` or `tls`
   server's close only woke the accept parked on it, which still held the listening socket, so a
   connect that came before that accept ran landed in its backlog. The connection was then accepted

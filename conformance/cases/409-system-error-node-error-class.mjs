@@ -1,8 +1,9 @@
 // What node's SystemError codes are instances of (#288). Most are made by
 // makeSystemErrorWithCode, a per-code `class NodeError extends SystemError`:
 // constructor.name 'NodeError', length 1, a prototype that owns only its
-// constructor. fs.rm's ERR_FS_EISDIR is built with SystemError itself
-// (length 2, which owns toString too). Either way the error's name is
+// constructor. fs.rm's ERR_FS_EISDIR is a stackless subclass of that code's
+// class whose `constructor` answers SystemError itself (length 2, whose
+// prototype owns toString too). Either way the error's name is
 // 'SystemError', its own keys and its header unchanged.
 //
 // Regression guard: oam built every one with a single SystemError class, so
@@ -10,6 +11,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import util from "node:util";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oam-case-409-"));
 const at = (p) => path.join(dir, p);
@@ -47,5 +49,19 @@ const b = await rejection(fs.promises.cp(at("d"), at("d/sub"), { recursive: true
 const c = await rejection(fs.promises.cp(at("d"), at("f"), { recursive: true }));
 console.log("same class", a.constructor === b.constructor, a.constructor === c.constructor,
   Object.getPrototypeOf(a.constructor) === Object.getPrototypeOf(c.constructor));
+
+// fs.rm's is node's stackless subclass of ERR_FS_EISDIR's class, whose
+// constructor answers SystemError; every one is kIsNodeError, its own mark.
+const chain = (e) => {
+  const names = [];
+  for (let p = Object.getPrototypeOf(e); p !== null; p = Object.getPrototypeOf(p)) names.push(p.constructor.name);
+  return names.join(">");
+};
+const cpEisdir = await rejection(fs.promises.cp(at("d"), at("new")));
+const rmEisdir = await rejection(fs.promises.rm(at("empty")));
+console.log("rm chain", chain(rmEisdir), rmEisdir instanceof cpEisdir.constructor,
+  Object.getOwnPropertySymbols(rmEisdir).map(String), Object.getOwnPropertySymbols(cpEisdir).map(String));
+console.log("rm inspect", util.inspect(rmEisdir).split("\n")[0].split(":")[0]);
+console.log("cp chain", chain(cpEisdir));
 
 fs.rmSync(dir, { recursive: true, force: true });

@@ -567,6 +567,7 @@
   const PromiseCtor = Promise;
   const promiseThen = Promise.prototype.then;
   const captureStackTrace = Error.captureStackTrace;
+  const kIsNodeErrorMark = globalThis.__oamKIsNodeError;
 
   function asAlwaysRejecting(api) {
     const out = {};
@@ -596,7 +597,11 @@
       // `at readFile (...)`; an async caller adds its `at async` frames below.
       const onRejected = {
         [key]: function (err) {
-          if (err !== null && typeof err === "object" && typeof err.syscall === "string") {
+          // Not one of node's own coded errors (kIsNodeError), which JS
+          // builds and no binding hands back: fs.promises.rm's
+          // ERR_FS_EISDIR keeps its no frames.
+          if (err !== null && typeof err === "object" && typeof err.syscall === "string" &&
+              err[kIsNodeErrorMark] !== true) {
             captureStackTrace(err);
           }
           throw err;
@@ -1339,8 +1344,8 @@
   // codes node raises for a failure it decides itself but reports in a
   // system error's terms (ERR_FS_EISDIR). `new SystemError(key, context)`,
   // as node's: the prefix is the key's message (systemErrorMessages). The
-  // message is `<prefix>: <syscall>
-  // returned <code> (<message>) <path>`, `info` is the context object, and
+  // message is `<prefix>: <syscall> returned <code> (<message>) <path>`,
+  // `info` is the context object, and
   // errno / syscall / path are enumerable accessors over it -- own keys
   // stack, code, name, message, info, errno, syscall, path, in that order.
   // toString() and the stack header read `SystemError [<key>]: <message>`,
@@ -1375,6 +1380,9 @@
         configurable: true,
       });
       Object.defineProperties(this, {
+        // node's SystemError is kIsNodeError, its own (hidden) mark: its
+        // stack header names the code.
+        [kIsNodeErrorBrand]: { value: true, enumerable: false, writable: false, configurable: true },
         name: { value: "SystemError", enumerable: false, writable: true, configurable: true },
         message: { value: message, enumerable: false, writable: true, configurable: true },
         info: { value: context, enumerable: true, configurable: true, writable: false },
@@ -1384,10 +1392,6 @@
       if (context.path !== undefined) Object.defineProperty(this, "path", field("path"));
       if (context.dest !== undefined) Object.defineProperty(this, "dest", field("dest"));
     }
-    // node's SystemError is kIsNodeError: its stack header names the code.
-    get [kIsNodeErrorBrand]() {
-      return true;
-    }
     toString() {
       return `${this.name} [${this.code}]: ${this.message}`;
     }
@@ -1395,12 +1399,11 @@
       return registry.get("util").inspect(this, { ...ctx, getters: true, customInspect: false });
     }
   }
-  // node's makeSystemErrorWithCode: what most SystemError codes raise is an
-  // instance of a per-code subclass, `class NodeError extends SystemError`,
-  // so its constructor.name is 'NodeError' (#288). fs.rm's ERR_FS_EISDIR is
-  // the exception: node builds that one with SystemError itself.
+  // node's makeSystemErrorWithCode: a SystemError code raises an instance of
+  // its own subclass, `class NodeError extends SystemError`, so its
+  // constructor.name is 'NodeError' (#288). One class per code, made once.
   const nodeSystemErrors = new Map();
-  const systemErrorWithCode = (key, context) => {
+  const systemErrorClass = (key) => {
     let NodeError = nodeSystemErrors.get(key);
     if (NodeError === undefined) {
       NodeError = class NodeError extends SystemError {
@@ -1410,7 +1413,33 @@
       };
       nodeSystemErrors.set(key, NodeError);
     }
-    return new NodeError(context);
+    return NodeError;
+  };
+  const systemErrorWithCode = (key, context) => new (systemErrorClass(key))(context);
+  // fs.rm's ERR_FS_EISDIR is node's `ERR_FS_EISDIR.HideStackFramesError`
+  // (makeNodeErrorForHideStackFrame): a subclass of the code's NodeError,
+  // made with no stack frames, whose `constructor` -- a getter on its
+  // prototype -- answers SystemError. So constructor.name reads
+  // 'SystemError' while the error is still an instance of the code's class.
+  let RmIsADirectory;
+  const rmIsADirectory = (context) => {
+    if (RmIsADirectory === undefined) {
+      RmIsADirectory = class HideStackFramesError extends systemErrorClass("ERR_FS_EISDIR") {
+        constructor(ctx) {
+          const limit = Error.stackTraceLimit;
+          Error.stackTraceLimit = 0;
+          try {
+            super(ctx);
+          } finally {
+            Error.stackTraceLimit = limit;
+          }
+        }
+        get ["constructor"]() {
+          return SystemError;
+        }
+      };
+    }
+    return new RmIsADirectory(context);
   };
   codes.ERR_MODULE_NOT_FOUND = E("ERR_MODULE_NOT_FOUND", Error, function(path, base) {
     return 'Cannot find module "' + path + '"' + (base ? ' imported from ' + base : '');
@@ -10653,13 +10682,18 @@
   // `recursive` is set -- ERR_FS_EISDIR, nothing removed -- and a path whose
   // lstat fails reports that failure (syscall lstat), except ENOENT under
   // `force`. `raw` is the lstat result, or the error it failed with.
-  function rmCheckTarget(file, recursive, force, raw, failed) {
+  // rmSync's ERR_FS_EISDIR gets its stack from the call (node's
+  // hideStackFrames recaptures it there); rm's and fs.promises.rm's has
+  // none, as node's has none.
+  function rmCheckTarget(file, recursive, force, raw, failed, sync) {
     if (failed !== undefined) {
       if (force && failed?.code === "ENOENT") return;
       throw failed;
     }
     if (raw.kind === "dir" && !recursive) {
-      throw new SystemError("ERR_FS_EISDIR", { code: "EISDIR", message: "is a directory", path: file, syscall: "rm", errno: 21 });
+      const err = rmIsADirectory({ code: "EISDIR", message: "is a directory", path: file, syscall: "rm", errno: 21 });
+      if (sync && Error.stackTraceLimit) Error.captureStackTrace(err, rmCheckTarget);
+      throw err;
     }
   }
 
@@ -13145,7 +13179,7 @@
           } catch (e) {
             failed = e;
           }
-          rmCheckTarget(file, recursive, force, raw, failed);
+          rmCheckTarget(file, recursive, force, raw, failed, true);
         }
         natives.fsRmSync(file, recursive, force);
       },
