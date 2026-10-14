@@ -2455,21 +2455,55 @@ fn is_share_root(path: &std::path::Path) -> bool {
     ) && parts.all(|part| matches!(part, Component::RootDir))
 }
 
-/// `options.open(path)`, after refusing the one path FILE_FLAG_BACKUP_SEMANTICS
-/// opens and node does not: the root of a share that is no disk
-/// (`\\srv\IPC$`). node fails every open of it `EINVAL` (v22.22.2,
-/// measured), which is also what a stat of it answers in both runtimes. With
-/// the flag CreateFileW hands back a handle for it, so `openSync` returned a
-/// descriptor and an `appendFile` of no data succeeded. Only a root is asked,
-/// so no other open pays for the stat.
+/// `options.open(path)` with libuv's two Windows refusals. Before the open,
+/// the one path FILE_FLAG_BACKUP_SEMANTICS opens and node does not: the root
+/// of a share that is no disk (`\\srv\IPC$`). node fails every open of it
+/// `EINVAL` (v22.22.2, measured), which is also what a stat of it answers in
+/// both runtimes. With the flag CreateFileW hands back a handle for it, so
+/// `openSync` returned a descriptor and an `appendFile` of no data succeeded.
+/// Only a root is asked, so no other open pays for the stat. After the open,
+/// what the C runtime refuses (`as_the_crt_takes_it`), as for
+/// `OpenFlags::open_with_mode`'s handles: `\\.\UNC\srv\IPC$` is `EINVAL`,
+/// `\\.\mailslot` `UNKNOWN`.
 pub fn open_path(
     options: &std::fs::OpenOptions,
     path: impl AsRef<std::path::Path>,
 ) -> std::io::Result<std::fs::File> {
     #[cfg(windows)]
     refuse_a_root_that_is_no_disk(path.as_ref())?;
+    #[cfg(windows)]
+    return options.open(path).and_then(as_the_crt_takes_it);
+    #[cfg(not(windows))]
     options.open(path)
 }
+
+/// What libuv does with every handle its open gets (src/win/fs.c fs__open,
+/// v1.51.0): hands it to the CRT's `_open_osfhandle`, which refuses one whose
+/// type GetFileType cannot name. libuv reports that refusal as the thread's
+/// last error -- ERROR_INVALID_PARAMETER for the root of a share that is no
+/// disk however it is spelled (`\\.\UNC\srv\IPC$`), node's `EINVAL` -- or,
+/// where GetFileType set none, `UV_UNKNOWN` itself: the mailslot namespace
+/// (`\\.\mailslot`), node's `UNKNOWN` (errno -4094). Measured against
+/// v22.22.2 (#330).
+#[cfg(windows)]
+fn as_the_crt_takes_it(file: std::fs::File) -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::FILE_TYPE_UNKNOWN;
+    if crate::child_win::file_type(file.as_raw_handle()) != FILE_TYPE_UNKNOWN {
+        return Ok(file);
+    }
+    // GetFileType sets the last error on this path itself, NO_ERROR included.
+    let why = std::io::Error::last_os_error();
+    Err(match why.raw_os_error() {
+        Some(0) | None => std::io::Error::from_raw_os_error(UV_UNKNOWN),
+        Some(_) => why,
+    })
+}
+
+/// libuv's UV_UNKNOWN, which it stores as a Win32 error where it has none;
+/// the error table has no entry for it, so it reads back as `UNKNOWN`.
+#[cfg(windows)]
+const UV_UNKNOWN: i32 = -4094;
 
 /// `open_path`'s refusal, for the two opens that share it.
 #[cfg(windows)]
@@ -2915,7 +2949,8 @@ impl OpenFlags {
         // not INVALID_HANDLE_VALUE), nothing else has seen it, and the File takes
         // the one ownership of it. It was not opened FILE_FLAG_OVERLAPPED, which
         // is what File's synchronous reads and writes need.
-        Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+        let file = unsafe { std::fs::File::from_raw_handle(handle) };
+        as_the_crt_takes_it(file)
     }
 
     #[cfg(not(any(unix, windows)))]

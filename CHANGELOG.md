@@ -20,6 +20,13 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **On Windows an open is refused where node's C runtime refuses the handle (#330).** libuv hands
+  every handle its open gets to `_open_osfhandle`, which refuses one whose type `GetFileType`
+  cannot name. So the root of a share that is no disk is `EINVAL` however it is spelled --
+  `\\.\UNC\srv\IPC$` opened, where `\\srv\IPC$` and `\\?\UNC\srv\IPC$` already refused --
+  and the mailslot namespace, `\\.\mailslot`, is `UNKNOWN` (errno -4094), where it opened. This
+  holds for every open, and for `readFile`, `writeFile` and `appendFile`.
+
 - **On Windows `fstat` of a console opened to write only fails `EISDIR`, as node's does (#331).**
   `fs.fstatSync(fs.openSync("\\\\.\\CONOUT$", "w"))` (and `\\.\CON` or `\\.\CONIN$` opened `"w"`,
   or `"a"`) answered as a character device. libuv sees a console only through a handle that
