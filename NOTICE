@@ -87,8 +87,8 @@ Node.js
 oam carries Node.js code in three places, all under the MIT license.
 Copyright Node.js contributors; portions copyright Joyent, Inc. and other Node
 contributors (per-file headers retained in the vendored sources). Like V8's,
-this notice is hand-maintained: neither tree is a cargo dependency, so neither
-can be collected by `cargo about`.
+this notice is hand-maintained: none of the three is a cargo dependency, so
+none can be collected by `cargo about`.
 
   1. js/vendor/node-streams/ -- SHIPPED IN THE BINARY. lib/stream.js,
      lib/stream/promises.js and lib/internal/streams/*, compiled into the
