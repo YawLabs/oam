@@ -97,6 +97,35 @@ pub(crate) struct RejectionLedger {
 /// them to stdout while we exited 0 (review finding). The listener records
 /// the VALUE here so a process 'uncaughtException' listener gets the real
 /// Error; without a listener the event loop fails the run, like Node.
+/// The ES module entry's evaluation promise while the event loop runs it: a
+/// tick point stops at the microtask checkpoint that rejects it. node
+/// reports an entry's throw from inside the drain that resumed it (a
+/// top-level await a timer or an op settled), so the ticks its top level
+/// queued before the throw never run (#345). Cleared once the entry has
+/// settled, so the tick points after that run in full.
+#[derive(Default)]
+pub(crate) struct EntryEvaluation(Option<v8::Global<v8::Promise>>);
+
+/// Whether the parked entry evaluation ([`EntryEvaluation`]) has rejected.
+fn entry_rejected(scope: &mut v8::PinScope<'_, '_>) -> bool {
+    let Some(entry) = scope
+        .get_slot::<EntryEvaluation>()
+        .and_then(|e| e.0.clone())
+    else {
+        return false;
+    };
+    v8::Local::new(scope, &entry).state() == v8::PromiseState::Rejected
+}
+
+/// Park (or, with None, clear) the entry evaluation for [`entry_rejected`].
+fn park_entry_evaluation(
+    scope: &mut v8::PinScope<'_, '_>,
+    promise: Option<v8::Local<'_, v8::Promise>>,
+) {
+    let parked = promise.map(|p| v8::Global::new(scope, p));
+    scope.set_slot(EntryEvaluation(parked));
+}
+
 #[derive(Default)]
 pub(crate) struct UncaughtLedger {
     entries: Vec<(v8::Global<v8::Value>, String)>,
@@ -791,13 +820,18 @@ impl JsRuntime {
         // await the drain settled -- is reported from inside node's drain,
         // so no tick runs before the uncaughtException ladder does.
         if promise.state() != v8::PromiseState::Rejected {
-            if let Some(failure) = run_ticks_and_microtasks(tc) {
-                return Err(failure);
-            }
-            if let Some(failure) = drain_uncaught(tc) {
-                return Err(failure);
-            }
-            pump_event_loop(tc, Some(promise), true)?;
+            park_entry_evaluation(tc, Some(promise));
+            let ran = (|| {
+                if let Some(failure) = run_ticks_and_microtasks(tc) {
+                    return Err(failure);
+                }
+                if let Some(failure) = drain_uncaught(tc) {
+                    return Err(failure);
+                }
+                pump_event_loop(tc, Some(promise), true)
+            })();
+            park_entry_evaluation(tc, None);
+            ran?;
         }
 
         match promise.state() {
@@ -1262,7 +1296,7 @@ pub(crate) fn run_ticks_and_microtasks(
             }
         }
         tc.perform_microtask_checkpoint();
-        if !has_pending_ticks(tc) {
+        if !has_pending_ticks(tc) || entry_rejected(tc) {
             return None;
         }
         if !have_drain {

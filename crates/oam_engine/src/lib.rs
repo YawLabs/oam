@@ -846,6 +846,13 @@ impl JsRuntime {
     /// prints uncaught exit-handler errors); `process.exit()` inside a handler
     /// still terminates via the native path.
     pub fn emit_process_exit(&mut self) {
+        self.emit_process_exit_after(AfterScript::Microtasks);
+    }
+
+    /// [`Self::emit_process_exit`] with what runs after the emit: on a
+    /// natural exit node drains the promise jobs the 'exit' listeners queue
+    /// (`Microtasks`); past a fatal exception it runs nothing (`Nothing`).
+    pub fn emit_process_exit_after(&mut self, after: AfterScript) {
         // A throw from an 'exit' listener is fatal in Node: it reports the
         // error and exits 1, whatever the handler set exitCode to.
         // Inline the emit (no leaked global): touch process to build it if
@@ -870,7 +877,7 @@ impl JsRuntime {
                  } \
                } \
              })();",
-            AfterScript::Microtasks,
+            after,
         ) {
             eprintln!("{e}");
         }

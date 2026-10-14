@@ -79,6 +79,22 @@ process.on("exit", (code) => console.log("exit", code));
 process.nextTick(() => console.log("tick"));
 queueMicrotask(() => { throw new Error("boom"); });
 `;
+const throwsAfterTimer = `
+process.on("exit", (code) => { console.log("exit", code); Promise.resolve().then(() => console.log("micro in exit")); });
+await new Promise((r) => setTimeout(r, 1));
+Promise.resolve().then(() => console.log("micro"));
+process.nextTick(() => console.log("tick"));
+throw new Error("boom");
+`;
+const cjsFatalExit = `
+process.on("exit", (code) => {
+  console.log("exit", code);
+  Promise.resolve().then(() => console.log("micro in exit"));
+  process.nextTick(() => console.log("tick in exit"));
+});
+Promise.resolve().then(() => console.log("micro"));
+throw new Error("boom");
+`;
 const exitListener = `
 process.on("exit", () => {
   process.nextTick(() => console.log("tick in exit"));
@@ -103,6 +119,8 @@ const files = {
   "origin.mjs": origin,
   "micro-throw.mjs": microThrow,
   "exit-listener.cjs": exitListener,
+  "throws-after-timer.mjs": throwsAfterTimer,
+  "cjs-fatal-exit.cjs": cjsFatalExit,
 };
 for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text);
 try {
@@ -124,6 +142,8 @@ try {
     ["origin of an ES module entry's throw", "origin.mjs"],
     ["fatal microtask throw", "micro-throw.mjs"],
     ["'exit' listener's tick and promise job", "exit-listener.cjs"],
+    ["ES module entry that throws after a timer", "throws-after-timer.mjs"],
+    ["CommonJS throw: what runs after", "cjs-fatal-exit.cjs"],
   ]) {
     const run = spawnSync(process.execPath, [file], { cwd: dir, encoding: "utf8" });
     console.log(`${label}: ${run.stdout.trim().split(/\r?\n/).join(" | ")} (status ${run.status})`);

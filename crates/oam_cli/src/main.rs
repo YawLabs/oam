@@ -2358,7 +2358,9 @@ fn run_file_with_flags(
                 "(function () { var p = globalThis.process; if (p) { p.exitCode = 1; } })();",
                 oam_engine::AfterScript::Nothing,
             );
-            rt.emit_process_exit();
+            // Past a fatal exception node emits 'exit' and runs nothing
+            // after it: no promise job, no tick.
+            rt.emit_process_exit_after(oam_engine::AfterScript::Nothing);
             let final_code = rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8;
             Err((diagnostics, final_code))
         }
@@ -3088,7 +3090,9 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
                 "(function () { var p = globalThis.process; if (p) { p.exitCode = 1; } })();",
                 oam_engine::AfterScript::Nothing,
             );
-            rt.emit_process_exit();
+            // Past a fatal exception node emits 'exit' and runs nothing
+            // after it: no promise job, no tick.
+            rt.emit_process_exit_after(oam_engine::AfterScript::Nothing);
             ExitCode::from(rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8)
         }
     }
@@ -3236,7 +3240,9 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
                 "(function () { var p = globalThis.process; if (p) { p.exitCode = 1; } })();",
                 oam_engine::AfterScript::Nothing,
             );
-            rt.emit_process_exit();
+            // Past a fatal exception node emits 'exit' and runs nothing
+            // after it: no promise job, no tick.
+            rt.emit_process_exit_after(oam_engine::AfterScript::Nothing);
             ExitCode::from(rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8)
         }
     }

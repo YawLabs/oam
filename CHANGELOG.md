@@ -25,8 +25,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   queues, and the code after a top-level await they settle, run before any tick. oam ran the
   ticks first. Now the main module's and a worker's match node; CommonJS and timer callbacks
   were already right. And no tick runs where node's never does: before the report of an ES
-  module entry that throws (whose `uncaughtException` origin is now node's
-  `'unhandledRejection'`), after a fatal microtask throw, or from an `'exit'` listener. A
+  module entry that throws, at its top level or after any top-level await (its `uncaughtException`
+  origin is now node's `'unhandledRejection'`), after a fatal microtask throw at an ES module's top
+  level, from an `'exit'` listener, or after the `'exit'` emit of a fatal exit. A
   module that `import()` loads still runs its top level early (#397).
 - **`fs.cp`, `fs.cpSync` and `fs.promises.cp` honour their options, as node's do (#390).** The copy
   read `recursive` alone. So `force: false` overwrote the file it was asked to keep, `errorOnExist`
