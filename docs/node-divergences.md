@@ -3746,7 +3746,7 @@ three in both runtimes.
 ### Windows directory descriptors: the corners left
 
 A directory opens on Windows as it does in node (`FILE_FLAG_BACKUP_SEMANTICS`), and its
-descriptor answers as node's does: conformance case 392, measured against v22.22.2. These
+descriptor answers as node's does: conformance case 392, measured against v22.22.2. One
 corner is left (`fs.openAsBlob("dir")` was one until 0.19.1, conformance case 407).
 
 - `fstatSync` of a console opened by name to write (`openSync("\\\\.\\CON", "w")`,
