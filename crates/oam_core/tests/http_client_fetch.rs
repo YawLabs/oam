@@ -555,18 +555,38 @@ async fn a_request_on_a_closed_pooled_connection_is_sent_again() {
             "the dead connection read the first try"
         );
 
+        // The origin has now been seen to close a connection it had just
+        // answered on, so the one parked a moment ago is not trusted with
+        // the next request (#312): a POST that follows closely dials its
+        // own, and is answered where it would have been lost.
+        let_the_pool_settle().await;
+        let p = payload(
+            reg.fetch(&transport, json!({ "url": &url, "method": "POST" }))
+                .await,
+        );
+        assert_eq!(p["status"], 200);
+        assert_eq!(reg.text(handle_of(&p)).await, "ok");
+        assert_eq!(server.accepts(), 3, "the POST dialled its own connection");
+
         // A POST is NOT replayed: oam DID put the request on the wire and
         // cannot know the server ignored it (RFC 9110 s9.2.2, idempotent
-        // methods only).
-        let_the_pool_settle().await;
+        // methods only). On the connection the retry left, which has by now
+        // sat idle long enough to be reused.
+        let_a_parked_connection_settle().await;
         let socket = closed_by_peer(
             reg.fetch(&transport, json!({ "url": &url, "method": "POST" }))
                 .await,
         );
         assert_eq!(socket.remote_port, Some(server.port));
-        assert_eq!(server.accepts(), 2, "no fresh connection for a POST");
+        assert_eq!(server.accepts(), 3, "no fresh connection for a POST");
     })
     .await;
+}
+
+/// Longer than the pool's `SETTLE` (250 ms): after it a parked connection
+/// is reused whatever its origin has been seen to do.
+async fn let_a_parked_connection_settle() {
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
 }
 
 /// A server whose connections each answer their first request and close on
@@ -621,6 +641,11 @@ async fn a_stale_resend_is_sent_once() {
         let url = format!("http://127.0.0.1:{}/x", server.port);
         fill_the_pool(&reg, &transport, &url, 2).await;
         assert_eq!(server.accepts(), 2);
+        // Both have sat idle: a resend only meets a second pooled connection
+        // when that one is past the pool's `SETTLE`. A first try that failed
+        // on a just-parked connection marks the origin, and the resend then
+        // dials (#312, the test above).
+        let_a_parked_connection_settle().await;
 
         let socket = closed_by_peer(reg.fetch(&transport, json!({ "url": &url })).await);
         assert_eq!(socket.remote_port, Some(server.port));

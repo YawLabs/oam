@@ -12820,7 +12820,11 @@ process.exit(0);
 ///   never resent (RFC 9110 s9.2.2), so a lost race fails the fetch; with the
 ///   gate measured 0 failures per 1,000 on release builds, gate off 6-31.
 ///   Tolerated at 2 of 400: the FIN landing before the write is timing, not
-///   a guarantee, and a loaded CI box shifts it.
+///   a guarantee, and a loaded CI box shifts it. Since #312 the gate is not
+///   what most of this run rests on: the first such close marks the origin,
+///   and every later POST that follows closely dials (`pool::SETTLE`). What
+///   the tolerance now covers is each chain's first POSTs, sent before the
+///   mark; the gate itself is pinned by the pool's own unit tests.
 #[test]
 fn a_post_written_after_a_just_pooled_connections_fin_is_not_lost() {
     let script = write_temp(
@@ -12946,7 +12950,10 @@ process.exit(0);
 /// and the `/final` doubles are tolerated at <= 3 -- the same race the POST
 /// test above allows 2 per 400 for. At ~0.5 doubles per 1,000 gate on, 4 or
 /// more is a 0.2% flake; at the gate-off floor of 7 per 1,000, 3 or fewer is
-/// an 8% escape, and none from 15 per 1,000 up.
+/// an 8% escape, and none from 15 per 1,000 up. Those figures are from
+/// before #312: the first close now marks the origin and later hops dial
+/// (`pool::SETTLE`), so the tolerance covers the first hops of the eight
+/// chains, and the gate itself is pinned by the pool's own unit tests.
 #[test]
 fn a_get_hop_after_a_302_and_fin_is_read_exactly_once() {
     let script = write_temp(

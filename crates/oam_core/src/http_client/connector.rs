@@ -1477,13 +1477,15 @@ fn server_name(host: &str) -> Result<ServerName<'static>, BoxError> {
 /// asks the session whether the peer's close_notify is among what has been
 /// read, and sets the connection's flag ([`ConnStats::peer_closed`]) if so.
 ///
-/// Why hyper's own answer is not enough. A server that answers and closes in
-/// one go can put the answer and its close_notify in one segment. The
-/// session then has both from the read that brought the answer, hands hyper
-/// the answer, and hyper -- its message complete -- reads no further: the
-/// connection is parked with its end already known to the session and to
-/// nobody else, since no later bytes arrive to wake a read. The pool asks
-/// this flag at checkout (`pool::reuse_h1`).
+/// Why the sender's own `is_closed` is not enough. The session learns of the
+/// close in the read that brings the record; the sender learns of it only
+/// once hyper's dispatcher has been polled again and has acted on the end of
+/// the stream. A checkout that falls between the two finds a sender that
+/// still says open over a session that already knows better, so the pool
+/// asks this flag as well (`pool::IdleH1::is_dead`). It is the smaller half
+/// of #312 -- measured, 7 hops read twice in 8 runs of 1,000 without it and
+/// 1 in 5 with -- the larger being that a close still on its way cannot be
+/// seen at all (`pool::SETTLE`).
 struct TlsWatched<IO> {
     tls: tokio_rustls::client::TlsStream<IO>,
     peer_closed: Arc<AtomicBool>,
@@ -1519,6 +1521,16 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsWatched<IO> {
     }
     fn poll_shutdown(self: StdPin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         StdPin::new(&mut self.get_mut().tls).poll_shutdown(cx)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.tls.is_write_vectored()
+    }
+    fn poll_write_vectored(
+        self: StdPin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        StdPin::new(&mut self.get_mut().tls).poll_write_vectored(cx, bufs)
     }
 }
 
