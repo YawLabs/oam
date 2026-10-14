@@ -136,7 +136,9 @@ for (const n of names) {
 // readdir only -- opendir lists all of them, the machine's again.
 if (win) {
   const drive = D.slice(0, 2);
-  for (const n of [`\\\\?\\${drive}`, `\\\\.\\${drive}`, "\\\\.\\pipe", "\\\\.\\NUL"]) {
+  // A console refuses a listing's open (EINVAL), and the mailslot
+  // namespace is a directory with nothing in it, not even . and ..
+  for (const n of [`\\\\?\\${drive}`, `\\\\.\\${drive}`, "\\\\.\\pipe", "\\\\.\\NUL", "\\\\.\\CON", "\\\\.\\mailslot\\"]) {
     const forms = [
       ["readdirSync", () => fs.readdirSync(n)],
       ["readdirSync withFileTypes", () => fs.readdirSync(n, { withFileTypes: true })],
@@ -149,7 +151,7 @@ if (win) {
       let line;
       try {
         const listed = await f();
-        line = `lists ${listed.length > 0}`;
+        line = n.includes("mailslot") ? JSON.stringify(listed) : `lists ${listed.length > 0}`;
       } catch (e) {
         line = shape(e);
       }

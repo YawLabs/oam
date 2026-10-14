@@ -5761,8 +5761,13 @@ pub mod ops {
     /// `EISDIR`, which is what node reports); and nothing for a directory.
     #[cfg(windows)]
     fn scandir_open(path: &str) -> std::io::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_LIST_DIRECTORY, SYNCHRONIZE};
+        // libuv's access, not a read: a console (`\\.\CON`) refuses a
+        // directory listing's open ERROR_INVALID_PARAMETER, the table's
+        // `EINVAL`, where a read open would succeed.
         let mut options = std::fs::OpenOptions::new();
-        options.read(true);
+        options.access_mode(FILE_LIST_DIRECTORY | SYNCHRONIZE);
         let opened = super::opens_as_libuv(&mut options).open(path)?;
         use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
         let not_a_directory = || std::io::Error::from(std::io::ErrorKind::NotADirectory);
@@ -5810,7 +5815,27 @@ pub mod ops {
             scandir_open(path)?;
         }
         #[cfg(windows)]
-        let listing = std::fs::read_dir(path).map_err(|e| listing_error(path, raw, e))?;
+        let listing = match std::fs::read_dir(path) {
+            // A directory std cannot list and libuv's query finds nothing in:
+            // the mailslot namespace, `\\.\mailslot\`, which has no entries
+            // at all -- not even `.` and `..` -- and takes no `*` pattern
+            // (FindFirstFileW: ERROR_INVALID_NAME; an empty directory of that
+            // kind would be ERROR_FILE_NOT_FOUND). It opens as libuv opens a
+            // directory, and readdir gives [].
+            Err(e)
+                if !raw
+                    && e.raw_os_error().is_some_and(|code| {
+                        use windows_sys::Win32::Foundation::{
+                            ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME,
+                        };
+                        code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_INVALID_NAME as i32
+                    })
+                    && scandir_open(path).is_ok() =>
+            {
+                return Ok("[]".to_string());
+            }
+            listing => listing.map_err(|e| listing_error(path, raw, e))?,
+        };
         #[cfg(not(windows))]
         let listing = std::fs::read_dir(path)?;
         for entry in listing {
