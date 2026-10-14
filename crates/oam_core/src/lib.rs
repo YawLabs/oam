@@ -2739,11 +2739,11 @@ impl OpenFlags {
         };
         let mut attributes = FILE_ATTRIBUTE_NORMAL;
         // The one thing a mode says on Windows: an open that may create its
-        // file, with no owner-write bit, asks for a read-only one. libuv
-        // also takes its umask off first, which is the CRT's and is zero
-        // unless something in the process set it; nothing in oam does.
-        // CreateFileW applies the attribute to a file it creates or (for
-        // CREATE_ALWAYS) replaces, and ignores it for one it merely opens.
+        // file, with no owner-write bit, asks for a read-only one (libuv's
+        // fs__open, which first takes the CRT's umask off the mode; that
+        // step is not made here). CreateFileW applies the attribute to a
+        // file it creates or (for CREATE_ALWAYS) replaces, and ignores it
+        // for one it merely opens.
         if has(o_flag::CREAT) && mode & 0o200 == 0 {
             attributes |= FILE_ATTRIBUTE_READONLY;
         }
