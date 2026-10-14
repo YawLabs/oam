@@ -620,10 +620,33 @@ async fn closing_ends_everything_parked() {
         let id = reg.start(json!({ "method": "GET", "target": "/", "headers": [["host", "h"]] }));
         let head = reg.response(id);
         reg.written_until(id, "\r\n\r\n").await;
-        let parked = tokio::spawn(bridge::out(reg.bridges.clone(), id));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // `out` also completes, with no bytes, when the progress moves, and
+        // hyper's flush that says the request is all written can land after
+        // the head was read (#346: under load, 1 run in ~130). Wait until
+        // that flush is in -- nothing moves the progress of a GET after it --
+        // then until a read is really parked: an `out` that ends with no
+        // bytes had a progress change still to report, and the next one
+        // parks.
+        while !bridge::progress(&reg.bridges, id).is_some_and(|p| p.complete) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let parked = loop {
+            let parked = tokio::spawn(bridge::out(reg.bridges.clone(), id));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if !parked.is_finished() {
+                break parked;
+            }
+            match parked.await.unwrap() {
+                OpOutcome::Bytes(bytes) if bytes.is_empty() => {}
+                other => panic!("out ended before the close: {other:?}"),
+            }
+        };
         assert!(bridge::close(&reg.bridges, id));
-        assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+        let ended = parked.await.unwrap();
+        assert!(
+            matches!(ended, OpOutcome::Done),
+            "parked out ended {ended:?}"
+        );
         assert!(matches!(head.await.unwrap(), OpOutcome::NodeFailed { .. }));
         assert!(matches!(
             bridge::input(reg.bridges.clone(), id, b"x".to_vec()).await,
