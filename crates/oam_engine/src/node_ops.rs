@@ -541,6 +541,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // process.cpuUsage / process.kill
         ("processCpuUsage", op_process_cpu_usage),
         ("processKill", op_process_kill),
+        ("processUmask", op_process_umask),
     );
 
     let node_key = v8::String::new(scope, "node").unwrap();
@@ -10456,6 +10457,27 @@ fn cpu_usage_us() -> (u64, u64) {
     let user = usage.ru_utime.tv_sec as u64 * 1_000_000 + usage.ru_utime.tv_usec as u64;
     let system = usage.ru_stime.tv_sec as u64 * 1_000_000 + usage.ru_stime.tv_usec as u64;
     (user, system)
+}
+
+// ========================================================= process.umask
+
+/// processUmask(mask?) -> the mask before the call: with a number, sets the
+/// process's file mode creation mask; with nothing, only reads it
+/// (`oam_core::process_umask`). The shim has the mask through node's
+/// parseFileMode already.
+fn op_process_umask(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let value = args.get(0);
+    let set = if value.is_number() {
+        value.uint32_value(scope)
+    } else {
+        None
+    };
+    let was = oam_core::process_umask(set);
+    rv.set(v8::Number::new(scope, f64::from(was)).into());
 }
 
 // ========================================================== process.kill

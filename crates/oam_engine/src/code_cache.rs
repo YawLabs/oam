@@ -32,6 +32,7 @@
 //! through to a normal compile. Housekeeping is opportunistic and off the
 //! load path: see [`maybe_sweep`].
 
+use oam_diagnostics::own_files::{self, Audience};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once, OnceLock};
@@ -284,9 +285,9 @@ pub(crate) fn record_seed_rejection(key: &CacheKey) {
     forget_seed(key);
     let path = tombstone_path(key);
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = own_files::create_dir_all(parent, Audience::Kept);
     }
-    let _ = std::fs::write(path, b"");
+    let _ = own_files::write(&path, b"", Audience::Kept);
 }
 
 /// Load a cached bytecode blob for `key`, if one exists for the current V8
@@ -340,7 +341,8 @@ pub(crate) fn store(key: &CacheKey, bytes: &[u8]) {
     }
     let path = path_for_key(key);
     let Some(parent) = path.parent() else { return };
-    if std::fs::create_dir_all(parent).is_err() {
+    // The cache's own modes, not the running program's mask: `own_files`.
+    if own_files::create_dir_all(parent, Audience::Kept).is_err() {
         return;
     }
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -350,7 +352,7 @@ pub(crate) fn store(key: &CacheKey, bytes: &[u8]) {
         std::process::id(),
         CTR.fetch_add(1, Ordering::Relaxed)
     ));
-    if std::fs::write(&tmp, bytes).is_err() {
+    if own_files::write(&tmp, bytes, Audience::Kept).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return;
     }
@@ -498,7 +500,7 @@ fn sweep(root: &Path, now: SystemTime) -> SweepReport {
 /// (a filesystem without settable times) is swallowed -- the worst case is a
 /// sweep that runs more often than the interval, never one that is skipped.
 fn write_stamp(path: &Path, now: SystemTime) -> bool {
-    match std::fs::File::create(path) {
+    match own_files::create(path, Audience::Kept) {
         Ok(file) => {
             let _ = file.set_modified(now);
             true

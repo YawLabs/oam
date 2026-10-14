@@ -20,6 +20,19 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`process.umask` is the process's file mode creation mask.** It kept a number of its
+  own: it started at `0` whatever the process had inherited, and setting it changed nothing
+  about the files created afterwards. It is now `umask(2)` on Linux and macOS, so it reads
+  what the process started with, applies to every file and directory created after a set,
+  and is inherited by child processes. On Windows it keeps the owner's read and write bits
+  and decides whether a created file is read-only, as node's does. A mask is checked as node
+  checks one (an octal string or a 32-bit unsigned integer), and a worker may read the mask
+  but not set it (`ERR_WORKER_UNSUPPORTED_OPERATION`). What oam writes for itself -- its
+  bytecode and transpile caches, crash reports, the scratch files of `-e`, of a compiled
+  binary and of `serve --workers` -- does not follow a mask the program sets: caches and
+  reports keep the modes the mask oam started under gives them, with the owner's own
+  bits always kept, and scratch files are the owner's alone.
+
 - **The `mode` of an open that creates its file is applied (#324).** It was checked and then
   dropped: every file was created with the default `0o666`. On Windows a mode with no
   owner-write bit now creates the file read-only, as node's does (`openSync(f, "w", 0o444)`

@@ -34,6 +34,7 @@
 //! an accelerator, and the fallback (transpile again) is always correct.
 //! `OAM_TRANSPILE_CACHE=0|off|false|no` disables it.
 
+use oam_diagnostics::own_files::{self, Audience};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -273,7 +274,8 @@ fn store_in(root: &Path, path: &Path, source: &str, js: &str, source_map: Option
     let Some(parent) = final_path.parent() else {
         return;
     };
-    if std::fs::create_dir_all(parent).is_err() {
+    // The cache's own modes, not the running program's mask: `own_files`.
+    if own_files::create_dir_all(parent, Audience::Kept).is_err() {
         return;
     }
     let nanos = std::time::SystemTime::now()
@@ -287,7 +289,7 @@ fn store_in(root: &Path, path: &Path, source: &str, js: &str, source_map: Option
         sha256_hex(&body),
         js.len()
     );
-    if std::fs::write(&tmp, payload).is_err() {
+    if own_files::write(&tmp, payload, Audience::Kept).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return;
     }

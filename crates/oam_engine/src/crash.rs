@@ -22,6 +22,7 @@
 //! `std::backtrace::Backtrace`; in `--release` (`strip = "symbols"`) frames
 //! are addresses without names -- acceptable for internal triage.
 
+use oam_diagnostics::own_files::{self, Audience};
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::io::Write;
 use std::path::PathBuf;
@@ -91,13 +92,14 @@ fn banner(kind: &str, detail: &str) -> String {
 /// Returns the path when the write lands so the caller can point at it.
 fn write_crash_file(body: &str) -> Option<PathBuf> {
     let dir = cache_root().join("crashes");
-    std::fs::create_dir_all(&dir).ok()?;
+    // The report's own modes, not the running program's mask: `own_files`.
+    own_files::create_dir_all(&dir, Audience::Kept).ok()?;
     let path = dir.join(format!(
         "crash-{}-{}.txt",
         unix_millis(),
         std::process::id()
     ));
-    let mut file = std::fs::File::create(&path).ok()?;
+    let mut file = own_files::create(&path, Audience::Kept).ok()?;
     file.write_all(body.as_bytes()).ok()?;
     Some(path)
 }

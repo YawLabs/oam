@@ -9,6 +9,7 @@
 mod self_update;
 
 use clap::{Parser, Subcommand};
+use oam_diagnostics::own_files::{self, Audience};
 use oam_diagnostics::{Diagnostic, Origin, Severity};
 use oam_loader::SourceKind;
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -274,6 +275,10 @@ fn main() -> ExitCode {
     // a file oam opens for itself would otherwise be indistinguishable from an
     // inherited one -- see oam_core::snapshot_inherited_fds.
     oam_engine::snapshot_inherited_fds();
+    // And the file mode creation mask a parent handed us, before a program
+    // can set its own: what oam writes for itself keeps the modes this one
+    // gives (oam_diagnostics::own_files).
+    oam_engine::snapshot_inherited_umask();
     register_worker_host();
     // Internal self-test hook (undocumented, env-gated): exercises the crash
     // path deterministically in CI without needing a JS-reachable panic.
@@ -2004,10 +2009,10 @@ fn serve_with_workers(
         .unwrap()
         .as_nanos();
     let dir = std::env::temp_dir().join(format!("oam-serve-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    own_files::create_dir_all(&dir, Audience::Scratch).expect("temp dir");
 
     let worker_path = dir.join("_pool_worker.cjs");
-    std::fs::write(&worker_path, POOL_WORKER_CJS).expect("write worker shim");
+    own_files::write(&worker_path, POOL_WORKER_CJS, Audience::Scratch).expect("write worker shim");
 
     let worker_path_str = worker_path
         .to_string_lossy()
@@ -2020,7 +2025,8 @@ fn serve_with_workers(
         .replace("__OAM_WORKER_SCRIPT__", &worker_path_str);
 
     let dispatcher_path = dir.join("_pool_dispatcher.cjs");
-    std::fs::write(&dispatcher_path, &dispatcher_src).expect("write dispatcher");
+    own_files::write(&dispatcher_path, &dispatcher_src, Audience::Scratch)
+        .expect("write dispatcher");
 
     let result = run_file(&dispatcher_path, &[], inspect, oam_engine::ReplayMode::Off);
     let _ = std::fs::remove_dir_all(&dir);
@@ -2960,10 +2966,13 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
         .ok()
         .map(|d| d.join(format!(".oam-eval-{}.{ext}", std::process::id())));
     let (tmp_dir, tmp_file) = match cwd_candidate {
-        Some(p) if std::fs::write(&p, "").is_ok() => (None, p),
+        // Scratch, the owner's alone whatever mask this started under: a
+        // parent may have set one that takes the owner's own bits off, and
+        // the source written here is read back by this process.
+        Some(p) if own_files::write(&p, "", Audience::Scratch).is_ok() => (None, p),
         _ => {
             let dir = std::env::temp_dir().join(format!("oam-eval-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).expect("create eval temp dir");
+            own_files::create_dir_all(&dir, Audience::Scratch).expect("create eval temp dir");
             let file = dir.join(format!("__oam_eval.{ext}"));
             (Some(dir), file)
         }
@@ -2996,7 +3005,7 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
     } else {
         source.to_string()
     };
-    std::fs::write(&tmp_file, body).expect("write eval source to temp");
+    own_files::write(&tmp_file, body, Audience::Scratch).expect("write eval source to temp");
 
     let mut rt = oam_engine::JsRuntime::new_with_permissions(flags.permissions());
     let exe = std::env::current_exe()
@@ -3162,9 +3171,10 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
         .unwrap()
         .as_nanos();
     let tmp_dir = std::env::temp_dir().join(format!("oam-embed-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&tmp_dir).expect("create temp dir for embedded source");
+    own_files::create_dir_all(&tmp_dir, Audience::Scratch)
+        .expect("create temp dir for embedded source");
     let tmp_file = tmp_dir.join("__oam_embedded.js");
-    std::fs::write(&tmp_file, source).expect("write embedded source to temp");
+    own_files::write(&tmp_file, source, Audience::Scratch).expect("write embedded source to temp");
 
     // Node convention: argv[0]=binary, argv[1]=script path. argv[1] is the
     // temp file spelled the way the loader spells __filename (module_key:
