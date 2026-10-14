@@ -3746,10 +3746,9 @@ three in both runtimes.
 ### Windows directory descriptors: the corners left
 
 A directory opens on Windows as it does in node (`FILE_FLAG_BACKUP_SEMANTICS`), and its
-descriptor answers as node's does: conformance case 392, measured against v22.22.2. These
-corners are left.
+descriptor answers as node's does: conformance case 392, measured against v22.22.2. One
+corner is left (`fs.openAsBlob("dir")` was one until 0.19.1, conformance case 407).
 
-- `fs.openAsBlob("dir")` rejects `ERR_INVALID_ARG_VALUE`; node resolves a Blob of size 0.
 - `fstatSync` of a console opened by name to write (`openSync("\\\\.\\CON", "w")`,
   `"\\\\.\\CONOUT$"` opened `"w"` or `"a"`) answers with the console's shape; node's
   fails `EISDIR` `fstat`. The open itself matches (conformance case 394).

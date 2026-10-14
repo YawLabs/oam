@@ -13823,24 +13823,23 @@
     fs.openAsBlob = (p, options) => {
       const type = (options && options.type) || "";
       if (typeof type !== "string") {
-        throw nodeTypeError(
-          `The "options.type" argument must be of type string. Received ${describeArg(type)}`,
-        );
+        throw codes.ERR_INVALID_ARG_TYPE("options.type", "string", type);
       }
       return openAsBlobPath(toPath(p), type);
     };
-    const openAsBlobPath = async (file, type) => {
-      let bytes;
-      try {
-        bytes = await natives.fsReadFile(file);
-      } catch {
-        // Deliberately swallowing the underlying error: node reports none of
-        // it, and leaking ENOENT here would be a divergence, not a courtesy.
-        const err = new TypeError("Unable to open file as blob");
-        err.code = "ERR_INVALID_ARG_VALUE";
-        throw err;
-      }
-      const blob = new Blob([bytes], { type });
+    // What node's openAsBlob gives for a directory (#335): its open and fstat
+    // succeed, so the Blob is made, with the size the fstat says -- 0 on
+    // Windows, the directory's own size on Linux and macOS -- and reading a
+    // non-empty one fails NotReadableError, as reading a directory does. The
+    // Blob class carries that state (`_unreadableSize`), so a Blob, a body or
+    // a form made with this one as a part fails the same way. A size of 0
+    // has nothing to read, so on Windows it reads as empty.
+    const directoryBlob = (size, type) => {
+      const blob = new Blob([], { type });
+      if (size > 0) blob._unreadableSize = size;
+      return markFileBacked(blob);
+    };
+    const markFileBacked = (blob) => {
       // node returns an instance of an INTERNAL TransferableBlob subclass and
       // plants an own `constructor` back-pointing at Blob so the subclass does
       // not leak through `b.constructor.name`. Measured descriptor:
@@ -13854,6 +13853,21 @@
       // and a symbol key so it stays out of Object.keys.
       blob[Symbol.for("oam.blob.fileBacked")] = true;
       return blob;
+    };
+    const openAsBlobPath = async (file, type) => {
+      let bytes;
+      try {
+        const raw = await natives.fsStat(file, false);
+        if (raw.kind === "dir") return directoryBlob(Number(raw.size), type);
+        bytes = await natives.fsReadFile(file);
+      } catch {
+        // Deliberately swallowing the underlying error: node reports none of
+        // it, and leaking ENOENT here would be a divergence, not a courtesy.
+        const err = new TypeError("Unable to open file as blob");
+        err.code = "ERR_INVALID_ARG_VALUE";
+        throw err;
+      }
+      return markFileBacked(new Blob([bytes], { type }));
     };
 
     // The `.native` forms are the OS realpath: node type-checks their path
