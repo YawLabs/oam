@@ -27,7 +27,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   were already right. And no tick runs where node's never does: before the report of an ES
   module entry that throws, at its top level or after any top-level await (its `uncaughtException`
   origin is now node's `'unhandledRejection'`), after a fatal microtask throw at an ES module's top
-  level, from an `'exit'` listener, or after the `'exit'` emit of a fatal exit. A
+  level, from an `'exit'` listener, or after the `'exit'` emit of a fatal exit. A top-level await
+  that never settles exits as node's does: code 13 unless `process.exitCode` was set, and the
+  `'exit'` listeners' promise jobs run, where oam exited 1. A
   module that `import()` loads still runs its top level early (#397).
 - **`fs.cp`, `fs.cpSync` and `fs.promises.cp` honour their options, as node's do (#390).** The copy
   read `recursive` alone. So `force: false` overwrote the file it was asked to keep, `errorOnExist`

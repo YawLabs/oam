@@ -11,7 +11,8 @@
 // top level, or after a top-level await -- runs no tick before the
 // uncaughtException ladder, whose origin for it is 'unhandledRejection'; a
 // fatal microtask throw runs no tick after it; a nextTick from an 'exit'
-// listener never runs, the promise jobs those listeners queue do.
+// listener never runs, the promise jobs those listeners queue do. A
+// top-level await that never settles exits naturally, code 13.
 //
 // Regression guard: oam ran an ES module's top-level ticks ahead of its
 // promise jobs.
@@ -95,6 +96,14 @@ process.on("exit", (code) => {
 Promise.resolve().then(() => console.log("micro"));
 throw new Error("boom");
 `;
+const unsettled = `
+process.on("exit", (code) => {
+  console.log("exit", code);
+  process.nextTick(() => console.log("tick in exit"));
+  Promise.resolve().then(() => console.log("micro in exit"));
+});
+await new Promise(() => {});
+`;
 const exitListener = `
 process.on("exit", () => {
   process.nextTick(() => console.log("tick in exit"));
@@ -121,6 +130,7 @@ const files = {
   "exit-listener.cjs": exitListener,
   "throws-after-timer.mjs": throwsAfterTimer,
   "cjs-fatal-exit.cjs": cjsFatalExit,
+  "unsettled.mjs": unsettled,
 };
 for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text);
 try {
@@ -144,6 +154,7 @@ try {
     ["'exit' listener's tick and promise job", "exit-listener.cjs"],
     ["ES module entry that throws after a timer", "throws-after-timer.mjs"],
     ["CommonJS throw: what runs after", "cjs-fatal-exit.cjs"],
+    ["top-level await that never settles", "unsettled.mjs"],
   ]) {
     const run = spawnSync(process.execPath, [file], { cwd: dir, encoding: "utf8" });
     console.log(`${label}: ${run.stdout.trim().split(/\r?\n/).join(" | ")} (status ${run.status})`);
