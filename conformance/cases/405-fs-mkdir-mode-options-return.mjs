@@ -24,6 +24,9 @@ import { pathToFileURL } from 'node:url';
 
 const WIN = process.platform === 'win32';
 const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'oam-case-405-')));
+// The rows that take the temp root apart by its drive letter need it to
+// have one: a temp directory on a share has none.
+const DRIVE = /^[A-Za-z]:\\/.test(base);
 const origCwd = process.cwd();
 let n = 0;
 const fresh = () => {
@@ -216,13 +219,15 @@ const exists = (p) => fs.existsSync(p);
   await three('rec Buffer path', (d) => Buffer.from(path.join(d, 'a', 'b')), R);
   await three('rec URL path', (d) => pathToFileURL(path.join(d, 'a', 'b')), R);
   await three('rec "."', () => '.', R);
-  if (WIN) {
+  if (WIN && DRIVE) {
     await three('rec \\\\?\\ namespaced abs', (d) => '\\\\?\\' + path.join(d, 'a', 'b'), R);
     await three('rec lower-case drive letter', (d) => d[0].toLowerCase() + d.slice(1) + '\\a\\b', R);
     await three('rec UPPERCASED existing prefix', (d) => d.toUpperCase() + '\\a\\b', R);
     await three('rec drive root', (d) => d.slice(0, 3), R);
     await three('rec drive-relative "C:a\\b"', (d) => d.slice(0, 2) + 'a\\b', R, (d) => 'entries=' + fs.readdirSync(d).join(','));
     await three('rec rooted no drive "\\<T-without-drive>\\a\\b"', (d) => d.slice(2) + '\\a\\b', R);
+  }
+  if (WIN) {
     await three('rec long path (>260)', (d) => path.join(d, 'L'.repeat(120), 'M'.repeat(120), 'N'.repeat(120)), R, (d) => 'exists=' + exists(path.join(d, 'L'.repeat(120), 'M'.repeat(120), 'N'.repeat(120))));
   }
   await three('rec through symlinked dir', (d) => {
@@ -249,6 +254,24 @@ const exists = (p) => fs.existsSync(p);
   await three('nonrec forward-slash existing (err.path form)', (d) => { fs.mkdirSync(path.join(d, 'a')); return d.replace(/\\/g, '/') + '/a'; });
   await three('nonrec Buffer existing', (d) => { fs.mkdirSync(path.join(d, 'a')); return Buffer.from(path.join(d, 'a')); });
   await three('nonrec URL existing', (d) => { fs.mkdirSync(path.join(d, 'a')); return pathToFileURL(path.join(d, 'a')); });
+  // A link to nothing with more to make below it: the stat's ENOENT from
+  // the sync form, ENOTDIR from the other two.
+  await three('rec through dangling link lnk/a/b', (d) => {
+    try { fs.symlinkSync(path.join(d, 'gone'), path.join(d, 'lnk'), 'junction'); } catch (e) { return path.join(d, 'nolink-skip', 'a', 'b'); }
+    return path.join(d, 'lnk', 'a', 'b');
+  }, R);
+  // With no options nothing is read off Object.prototype.
+  {
+    Object.prototype.recursive = true;
+    Object.prototype.mode = 0o700;
+    try {
+      await three('nonrec under a polluted Object.prototype', (d) => path.join(d, 'no', 'a'));
+    } finally {
+      delete Object.prototype.recursive;
+      delete Object.prototype.mode;
+    }
+  }
+  await prom('options read before the path is checked', () => fs.promises.mkdir(123, { get recursive() { throw new Error('read first'); } }));
   await three('rec dangling symlink leaf', (d) => {
     try { fs.symlinkSync(path.join(d, 'gone'), path.join(d, 'lnk'), 'junction'); } catch (e) { return path.join(d, 'nolink-skip'); }
     return path.join(d, 'lnk');

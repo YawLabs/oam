@@ -3567,7 +3567,16 @@ fn mkdir_one(path: &str, mode: u32) -> std::io::Result<()> {
 /// why it is not a walk to the first existing ancestor: a directory another
 /// process makes in between is not one this call made. A component that is
 /// a file is ENOTDIR, the path itself being one is EEXIST.
-pub fn make_dir(path: &str, mode: u32, recursive: bool) -> Result<Option<String>, MkdirFailure> {
+///
+/// `asynchronous` is for the one place node's two walks part ways: a
+/// component that is there but cannot be looked at (a link to nothing) is
+/// the stat's own error from MKDirpSync and ENOTDIR from MKDirpAsync.
+pub fn make_dir(
+    path: &str,
+    mode: u32,
+    recursive: bool,
+    asynchronous: bool,
+) -> Result<Option<String>, MkdirFailure> {
     let fail = |error: std::io::Error, at: &str| MkdirFailure {
         error,
         at: at.to_string(),
@@ -3579,8 +3588,11 @@ pub fn make_dir(path: &str, mode: u32, recursive: bool) -> Result<Option<String>
     }
     let mut first: Option<String> = None;
     let mut stack = vec![path.to_string()];
-    // Every turn either makes a directory, ends, or climbs; the bound is for
-    // a path that will do none of them (a drive that is not there).
+    // Every turn makes a directory, ends, or climbs, and a component is
+    // tried twice at most -- on the way up and on the way down. The bound
+    // is for a file system that will not have it so (a directory made that
+    // then is not there to make another in), where node's walk never ends.
+    let bound = 2 * path.matches(std::path::MAIN_SEPARATOR).count() + 16;
     let mut turns = 0usize;
     while let Some(next) = stack.pop() {
         turns += 1;
@@ -3596,47 +3608,42 @@ pub fn make_dir(path: &str, mode: u32, recursive: bool) -> Result<Option<String>
         let code = fs_error_at(FsSite::Mkdir { recursive: false }, "mkdir", &next, &error).code;
         match code {
             "EACCES" | "ENOSPC" | "ENOTDIR" | "EPERM" => return Err(fail(error, &next)),
-            "ENOENT" if turns < 4096 => {
-                let parent = match next.rfind(std::path::MAIN_SEPARATOR) {
-                    Some(cut) => &next[..cut],
-                    None => next.as_str(),
-                };
-                if parent != next {
-                    let parent = parent.to_string();
+            "ENOENT" if turns < bound => {
+                if let Some(cut) = next.rfind(std::path::MAIN_SEPARATOR) {
+                    let parent = next[..cut].to_string();
                     stack.push(next);
                     stack.push(parent);
-                    continue;
-                }
-                if !stack.is_empty() {
                     continue;
                 }
                 // Nothing above it to make: the stat below says why.
             }
             _ => {}
         }
+        // A component of the path, with more of it still to make, rather
+        // than the path itself.
+        let component = code == "EEXIST" && !stack.is_empty();
+        // With the OS's own number on unix, where the errno node reports is
+        // read off the error.
+        let in_the_way = |component: bool| {
+            #[cfg(unix)]
+            let error = io_from_errno(if component {
+                rustix::io::Errno::NOTDIR
+            } else {
+                rustix::io::Errno::EXIST
+            });
+            #[cfg(not(unix))]
+            let error = std::io::Error::from(if component {
+                std::io::ErrorKind::NotADirectory
+            } else {
+                std::io::ErrorKind::AlreadyExists
+            });
+            error
+        };
         match std::fs::metadata(&next) {
             // Already a directory: nothing to make here.
             Ok(meta) if meta.is_dir() => {}
-            Ok(_) => {
-                // A component of the path, with more of it still to make,
-                // or the path itself.
-                let component = code == "EEXIST" && !stack.is_empty();
-                // With the OS's own number on unix, where the errno node
-                // reports is read off the error.
-                #[cfg(unix)]
-                let error = io_from_errno(if component {
-                    rustix::io::Errno::NOTDIR
-                } else {
-                    rustix::io::Errno::EXIST
-                });
-                #[cfg(not(unix))]
-                let error = std::io::Error::from(if component {
-                    std::io::ErrorKind::NotADirectory
-                } else {
-                    std::io::ErrorKind::AlreadyExists
-                });
-                return Err(fail(error, &next));
-            }
+            Ok(_) => return Err(fail(in_the_way(component), &next)),
+            Err(_) if asynchronous && component => return Err(fail(in_the_way(true), &next)),
             Err(stat) => return Err(fail(stat, &next)),
         }
     }
@@ -5995,7 +6002,8 @@ pub mod ops {
     pub async fn fs_mkdir(path: super::FsPath, recursive: bool, mode: u32) -> OpOutcome {
         let owned = path.clone();
         let result =
-            tokio::task::spawn_blocking(move || super::make_dir(owned.os(), mode, recursive)).await;
+            tokio::task::spawn_blocking(move || super::make_dir(owned.os(), mode, recursive, true))
+                .await;
         let site = super::FsSite::Mkdir { recursive };
         match result {
             Ok(Ok(Some(first))) => OpOutcome::Text(first),
@@ -7539,34 +7547,45 @@ mod os_error_code_tests {
             path.to_str().unwrap().to_string()
         };
 
-        assert_eq!(make_dir(&p(&["one"]), 0o777, false).unwrap(), None);
-        let failed = make_dir(&p(&["one"]), 0o777, false).unwrap_err();
+        assert_eq!(make_dir(&p(&["one"]), 0o777, false, false).unwrap(), None);
+        let failed = make_dir(&p(&["one"]), 0o777, false, false).unwrap_err();
         assert_eq!(node_error_code(&failed.error), "EEXIST");
         assert_eq!(failed.at, p(&["one"]));
-        let failed = make_dir(&p(&["no", "leaf"]), 0o777, false).unwrap_err();
+        let failed = make_dir(&p(&["no", "leaf"]), 0o777, false, false).unwrap_err();
         assert_eq!(node_error_code(&failed.error), "ENOENT");
 
         assert_eq!(
-            make_dir(&p(&["a", "b", "c"]), 0o777, true).unwrap(),
+            make_dir(&p(&["a", "b", "c"]), 0o777, true, false).unwrap(),
             Some(p(&["a"])),
             "none of it was there: the first made is the top"
         );
         assert_eq!(
-            make_dir(&p(&["a", "b", "d", "e"]), 0o777, true).unwrap(),
+            make_dir(&p(&["a", "b", "d", "e"]), 0o777, true, true).unwrap(),
             Some(p(&["a", "b", "d"])),
             "what was there is not counted"
         );
         assert_eq!(
-            make_dir(&p(&["a", "b", "d", "e"]), 0o777, true).unwrap(),
+            make_dir(&p(&["a", "b", "d", "e"]), 0o777, true, true).unwrap(),
             None
         );
         assert!(std::path::Path::new(&p(&["a", "b", "d", "e"])).is_dir());
 
+        // Deeper than any fixed number of turns: the walk is bounded by the
+        // path, not by a count.
+        let deep: Vec<&str> = std::iter::once("deep")
+            .chain(std::iter::repeat_n("d", 300))
+            .collect();
+        assert_eq!(
+            make_dir(&p(&deep), 0o777, true, false).unwrap(),
+            Some(p(&["deep"]))
+        );
+        assert!(std::path::Path::new(&p(&deep)).is_dir());
+
         std::fs::write(p(&["file"]), b"").unwrap();
-        let failed = make_dir(&p(&["file"]), 0o777, true).unwrap_err();
+        let failed = make_dir(&p(&["file"]), 0o777, true, false).unwrap_err();
         assert_eq!(node_error_code(&failed.error), "EEXIST");
         assert_eq!(failed.at, p(&["file"]));
-        let failed = make_dir(&p(&["file", "x", "y"]), 0o777, true).unwrap_err();
+        let failed = make_dir(&p(&["file", "x", "y"]), 0o777, true, true).unwrap_err();
         assert_eq!(node_error_code(&failed.error), "ENOTDIR");
         // Windows climbs to the file and names it; unix is told ENOTDIR at
         // the first mkdir and names that.
@@ -7583,7 +7602,7 @@ mod os_error_code_tests {
             let mode = |path: &str| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
             std::fs::create_dir(p(&["kept"])).unwrap();
             let kept = mode(&p(&["kept"]));
-            make_dir(&p(&["kept", "m", "n"]), 0o700, true).unwrap();
+            make_dir(&p(&["kept", "m", "n"]), 0o700, true, false).unwrap();
             assert_eq!(
                 mode(&p(&["kept", "m"])),
                 0o700,
@@ -7591,7 +7610,7 @@ mod os_error_code_tests {
             );
             assert_eq!(mode(&p(&["kept", "m", "n"])), 0o700);
             assert_eq!(mode(&p(&["kept"])), kept, "one already there keeps its own");
-            make_dir(&p(&["single"]), 0o700, false).unwrap();
+            make_dir(&p(&["single"]), 0o700, false, false).unwrap();
             assert_eq!(mode(&p(&["single"])), 0o700);
         }
 

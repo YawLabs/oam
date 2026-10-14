@@ -6779,7 +6779,7 @@ fn op_fs_mkdir_sync(
     };
     let recursive = args.get(1).is_true();
     let mode = dir_mode_arg(scope, &args, 2);
-    match oam_core::make_dir(path.os(), mode, recursive) {
+    match oam_core::make_dir(path.os(), mode, recursive, false) {
         // The first directory a recursive call made, as node returns it.
         Ok(Some(first)) => {
             if let Some(first) = v8::String::new(scope, &first) {

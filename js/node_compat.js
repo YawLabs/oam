@@ -12282,18 +12282,20 @@
         const entries = await natives.fsReaddir(file);
         return wrapDirents(file, entries, withFileTypes === true);
       }),
-      // node's promise form (lib/internal/fs/promises.js): the path first,
-      // then `recursive`, then the mode -- an argument here, by name, and
-      // one `null` leaves at its default. Resolves with the first directory
-      // a recursive call made.
-      mkdir: withPath(async function mkdir(file, options) {
+      // node's promise form (lib/internal/fs/promises.js): the options are
+      // read, then the path is checked, then `recursive`, then the mode --
+      // an argument here, by name, and one `null` leaves at its default.
+      // With no options nothing is read, Object.prototype included.
+      // Resolves with the first directory a recursive call made.
+      mkdir: async function mkdir(path, options) {
         if (typeof options === "number" || typeof options === "string") options = { mode: options };
-        const { recursive = false, mode = 0o777 } = options || {};
+        const { recursive = false, mode = 0o777 } = options || { __proto__: null };
+        const file = toPath(path);
         if (typeof recursive !== "boolean") {
           throw codes.ERR_INVALID_ARG_TYPE("options.recursive", "boolean", recursive);
         }
         return natives.fsMkdir(file, recursive, parseFileMode(mode, "mode", 0o777));
-      }),
+      },
       rm: withPath(async (file, options) => {
         validateRmOptions(options);
         const recursive = options?.recursive === true;
