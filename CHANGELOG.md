@@ -65,6 +65,20 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   exception, as in node, not an unhandled rejection. `close(cb)` on a net, tls or http2 server that
   is not running now calls back with `ERR_SERVER_NOT_RUNNING` (it never called back), and a second
   `listen()` throws node's `ERR_SERVER_ALREADY_LISTEN`.
+- **fs's stat forms honour `bigint` and `throwIfNoEntry`, as node's do (#392).** They ignored their
+  options. So a `statSync(p, { throwIfNoEntry: false })` existence check threw ENOENT, and
+  `{ bigint: true }` gave plain numbers. Now `statSync` and `lstatSync` answer `undefined` for a
+  path that is not there (ENOENT or ENOTDIR) when `throwIfNoEntry` is `false`. `bigint: true` gives
+  a `BigIntStats` with exact 64-bit fields and the `*Ns` times in every form: `statSync`,
+  `lstatSync`, `fstatSync`, `stat`, `lstat`, `fstat`, `fs.promises.stat` / `lstat`,
+  `FileHandle.stat` and `watchFile`. The options are read as node reads them: unvalidated, in node's
+  order, and as many times as node reads them (the callback forms read `bigint` twice). A null
+  options throws, or rejects in the promise forms. The `*Ms` times keep the fraction of a
+  millisecond that node reports; oam's were whole milliseconds. `Stats` is built as node builds it:
+  prototypes, lazy Date fields that can be assigned, and the deprecated `fs.Stats` constructor
+  (DEP0180), which takes node's positional arguments and warns once per code alongside
+  `util.deprecate` wrappers. The callback `stat`, `lstat` and `fstat` are named and have length 1,
+  as node's are.
 - **`events.once` is an async function and an abort rejects with node's `AbortError`, as in node (#344).**
   It was a plain function, so the continuation of `await once(...)` ran before the microtasks the
   same emit queued, and its kind and `length` (3) were not node's. An aborted `once` rejected with a

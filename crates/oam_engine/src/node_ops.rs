@@ -6710,8 +6710,21 @@ fn op_fs_stat_sync(
         return;
     };
     let lstat = args.get(1).is_true();
+    // statSync / lstatSync's `throwIfNoEntry`, passed as the caller gave
+    // it: as in node's binding only `false` itself turns the throw off, and
+    // then only for a path that is not there -- ENOENT, or ENOTDIR for one
+    // under a file -- which answers undefined (#392). Returning undefined
+    // here rather than catching in JS spares the existence check the error
+    // object and its stack, which is the point of the option.
+    let no_throw_if_no_entry = args.get(2).is_false();
     match oam_core::ops::stat_path_json(path.os(), lstat) {
         Ok(json) => return_json(scope, &mut rv, &json),
+        Err(e)
+            if no_throw_if_no_entry
+                && matches!(oam_core::node_error_code(&e), "ENOENT" | "ENOTDIR") =>
+        {
+            rv.set_undefined();
+        }
         Err(e) => throw_node_error(scope, if lstat { "lstat" } else { "stat" }, &path, &e),
     }
 }

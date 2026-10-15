@@ -5356,8 +5356,8 @@ pub mod ops {
         rdev: u64,
         blksize: u64,
         blocks: u64,
-        /// Inode-change time in ms, or None if it could not be read.
-        ctime_ms: Option<f64>,
+        /// Inode-change time, or None if it could not be read.
+        ctime: Option<Timespec>,
         /// A Windows reparse point's tag, read for an lstat of one (a
         /// symlink is IO_REPARSE_TAG_SYMLINK, a junction
         /// IO_REPARSE_TAG_MOUNT_POINT); None everywhere else.
@@ -5378,17 +5378,109 @@ pub mod ops {
             blocks: meta.blocks(),
             // st_ctim is the inode-change time and is NOT mtime: chmod moves it
             // and leaves mtime alone.
-            ctime_ms: Some(meta.ctime() as f64 * 1000.0 + meta.ctime_nsec() as f64 / 1_000_000.0),
+            ctime: Some(Timespec {
+                sec: meta.ctime(),
+                nsec: meta.ctime_nsec(),
+            }),
             reparse_tag: None,
         })
     }
 
-    /// FILETIME (100ns ticks since 1601-01-01) to milliseconds since the epoch.
-    #[cfg(windows)]
-    fn filetime_to_ms(ticks: i64) -> f64 {
-        const TICKS_PER_MS: f64 = 10_000.0;
-        const EPOCH_DIFFERENCE_MS: f64 = 11_644_473_600_000.0;
-        ticks as f64 / TICKS_PER_MS - EPOCH_DIFFERENCE_MS
+    /// A stat time as libuv's `uv_timespec_t` holds it, from which node
+    /// derives both forms (lib/internal/fs/utils.js, v22.22.2): `*Ms` is
+    /// `sec * 1e3 + nsec / 1e6` in doubles, a BigIntStats' `*Ns` is
+    /// `sec * 1e9 + nsec` exactly (#392). The times used to be sent as whole
+    /// milliseconds (`as_millis`), which dropped the fraction node reports
+    /// (1792020645055.304 came out 1792020645055), and a bigint form needs
+    /// the nanoseconds anyway.
+    #[derive(Clone, Copy, Default)]
+    struct Timespec {
+        sec: i64,
+        nsec: i64,
+    }
+
+    impl Timespec {
+        /// A `SystemTime` (std's view of the same field), as libuv's
+        /// conversion of it would read. A time std cannot read is 0, as
+        /// before.
+        fn of(time: std::io::Result<std::time::SystemTime>) -> Self {
+            let Ok(time) = time else {
+                return Self::default();
+            };
+            // Nanoseconds since the epoch, signed: a time before it is a
+            // negative offset rather than an error.
+            let nanos: i128 = match time.duration_since(std::time::UNIX_EPOCH) {
+                Ok(after) => after.as_nanos() as i128,
+                Err(before) => -(before.duration().as_nanos() as i128),
+            };
+            #[cfg(windows)]
+            {
+                // std's SystemTime on Windows IS the FILETIME, so this is
+                // exact in 100 ns ticks.
+                Self::from_unix_ticks((nanos / 100) as i64)
+            }
+            #[cfg(not(windows))]
+            {
+                // The kernel's normalized timespec: nsec in [0, 1e9).
+                Self {
+                    sec: nanos.div_euclid(1_000_000_000) as i64,
+                    nsec: nanos.rem_euclid(1_000_000_000) as i64,
+                }
+            }
+        }
+
+        /// A FILETIME (100 ns ticks since 1601-01-01).
+        #[cfg(windows)]
+        fn from_filetime(ticks: i64) -> Self {
+            const WIN_TO_UNIX_TICK_OFFSET: i64 = 116_444_736_000_000_000;
+            Self::from_unix_ticks(ticks - WIN_TO_UNIX_TICK_OFFSET)
+        }
+
+        /// libuv's `uv__filetime_to_timespec` (deps/uv/src/win/fs.c): the
+        /// seconds land in a C `long`, which is 32 bits on Windows -- so a
+        /// time past 2106 wraps, which node reports as it is (`utimesSync(f,
+        /// 2 ** 32 + 0.5, ...)` then reads back a `mtimeMs` of 500).
+        #[cfg(windows)]
+        fn from_unix_ticks(ticks: i64) -> Self {
+            const TICKS_PER_SEC: i64 = 10_000_000;
+            let mut sec = (ticks / TICKS_PER_SEC) as i32;
+            let mut nsec = (ticks % TICKS_PER_SEC) * 100;
+            if nsec < 0 {
+                sec = sec.wrapping_sub(1);
+                nsec += 1_000_000_000;
+            }
+            Self {
+                sec: i64::from(sec),
+                nsec,
+            }
+        }
+
+        /// The seconds as node's FillStatsArray stores them (src/node_file-
+        /// inl.h): on Windows through a cast to C `unsigned long`, 32 bits
+        /// there, so a time before the epoch reads as one after 2038;
+        /// elsewhere as they are, negative before the epoch. The same value
+        /// lands in the Float64Array of a Stats and the BigInt64Array of a
+        /// BigIntStats.
+        fn node_sec(self) -> i64 {
+            #[cfg(windows)]
+            {
+                i64::from(self.sec as u32)
+            }
+            #[cfg(not(windows))]
+            {
+                self.sec
+            }
+        }
+
+        /// node's `msFromTimeSpec`: the `*Ms` field of a `Stats`.
+        fn node_ms(self) -> f64 {
+            self.node_sec() as f64 * 1000.0 + self.nsec as f64 / 1_000_000.0
+        }
+
+        /// node's `nsFromTimeSpecBigInt`: the `*Ns` field of a BigIntStats.
+        fn node_ns(self) -> i128 {
+            i128::from(self.node_sec()) * 1_000_000_000 + i128::from(self.nsec)
+        }
     }
 
     /// The information classes [`file_info`] reads and [`set_file_info`]
@@ -5580,7 +5672,7 @@ pub mod ops {
             standard_info(file).map_or(0, |standard| (standard.AllocationSize as u64) >> 9);
 
         let basic = file_info::<FILE_BASIC_INFO>(file).ok();
-        let ctime_ms = basic.map(|basic| filetime_to_ms(basic.ChangeTime));
+        let ctime = basic.map(|basic| Timespec::from_filetime(basic.ChangeTime));
         // An lstat of a reparse point (the handle was opened on the point
         // itself): which kind it is. fs.cpSync copies a junction as the
         // directory it leads to, a symlink as a link, as node's MSVC
@@ -5608,7 +5700,7 @@ pub mod ops {
             rdev: 0,
             blksize: 4096,
             blocks,
-            ctime_ms,
+            ctime,
             reparse_tag,
         })
     }
@@ -5807,12 +5899,6 @@ pub mod ops {
     /// stat/lstat payload, shared with the sync native in oam_engine for a
     /// single wire shape ({kind, size, mtimeMs, ...}).
     pub fn stat_to_json(meta: &std::fs::Metadata, source: StatSource<'_>) -> String {
-        fn ms(time: std::io::Result<std::time::SystemTime>) -> f64 {
-            time.ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as f64)
-                .unwrap_or(0.0)
-        }
         let kind = if meta.is_symlink() {
             "symlink"
         } else if meta.is_dir() {
@@ -5856,24 +5942,48 @@ pub mod ops {
         let size = if meta.is_dir() { 0 } else { meta.len() };
         #[cfg(not(windows))]
         let size = meta.len();
+        let atime = Timespec::of(meta.accessed());
+        let mtime = Timespec::of(meta.modified());
+        // Falls back to mtime only when the real change time could not be
+        // read; the two genuinely differ (chmod moves ctime, not mtime).
+        let ctime = extras
+            .as_ref()
+            .and_then(|extras| extras.ctime)
+            .unwrap_or(mtime);
+        let birthtime = Timespec::of(meta.created());
         let mut payload = serde_json::json!({
             "kind": kind,
             "size": size,
-            "mtimeMs": ms(meta.modified()),
-            "atimeMs": ms(meta.accessed()),
-            // Falls back to mtime only when the real change time could not be
-            // read; the two genuinely differ (chmod moves ctime, not mtime).
-            "ctimeMs": extras
-                .as_ref()
-                .and_then(|extras| extras.ctime_ms)
-                .unwrap_or_else(|| ms(meta.modified())),
-            "birthtimeMs": ms(meta.created()),
+            "mtimeMs": mtime.node_ms(),
+            "atimeMs": atime.node_ms(),
+            "ctimeMs": ctime.node_ms(),
+            "birthtimeMs": birthtime.node_ms(),
             "mode": mode,
         });
+        let fields = payload
+            .as_object_mut()
+            .expect("json! macro built an object literal");
+        let known = extras.as_ref();
+        fields.insert(
+            "big".to_string(),
+            bigint_fields(
+                [
+                    known.map(|extras| extras.dev),
+                    Some(u64::from(mode)),
+                    known.map(|extras| extras.nlink),
+                    known.map(|extras| extras.uid),
+                    known.map(|extras| extras.gid),
+                    known.map(|extras| extras.rdev),
+                    known.map(|extras| extras.blksize),
+                    known.map(|extras| extras.ino),
+                    Some(size),
+                    known.map(|extras| extras.blocks),
+                ],
+                [atime, mtime, ctime, birthtime],
+            )
+            .into(),
+        );
         if let Some(extras) = extras {
-            let fields = payload
-                .as_object_mut()
-                .expect("json! macro built an object literal");
             for (name, value) in [
                 ("dev", extras.dev),
                 ("ino", extras.ino),
@@ -5898,6 +6008,37 @@ pub mod ops {
             }
         }
         payload.to_string()
+    }
+
+    /// The payload's `big` field: a BigIntStats' fourteen values in node's
+    /// constructor order (dev, mode, nlink, uid, gid, rdev, blksize, ino,
+    /// size, blocks, atimeNs, mtimeNs, ctimeNs, birthtimeNs), as decimal
+    /// integers separated by spaces, `-` for one this platform could not
+    /// read (absent from the Stats too). Exact where the JSON numbers are
+    /// not: an NTFS file ID is often past 2^53, and a nanosecond time always
+    /// is (#392). One string rather than fourteen fields, so the payload of
+    /// a plain stat -- the common case, which never reads it -- stays small.
+    ///
+    /// node's BigIntStats array is a BigInt64Array, so an unsigned field is
+    /// read through int64 (src/node_file-inl.h `static_cast<NativeT>`), and
+    /// that is what is sent.
+    fn bigint_fields(integers: [Option<u64>; 10], times: [Timespec; 4]) -> String {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(160);
+        for value in integers {
+            match value {
+                Some(value) => write!(out, "{} ", value as i64),
+                None => write!(out, "- "),
+            }
+            .expect("writing to a String cannot fail");
+        }
+        for (at, time) in times.into_iter().enumerate() {
+            if at > 0 {
+                out.push(' ');
+            }
+            write!(out, "{}", time.node_ns()).expect("writing to a String cannot fail");
+        }
+        out
     }
 
     /// The order libuv's scandir hands node's `readdir`: on unix sorted by
@@ -6236,6 +6377,7 @@ pub mod ops {
                 _ => None,
             };
             if let Some((mode, device_type, ino, blksize)) = device {
+                let rdev = device_type << 16;
                 return Ok(serde_json::json!({
                     "kind": "file",
                     "size": 0,
@@ -6249,9 +6391,24 @@ pub mod ops {
                     "nlink": 1,
                     "uid": 0,
                     "gid": 0,
-                    "rdev": device_type << 16,
+                    "rdev": rdev,
                     "blksize": blksize,
                     "blocks": 0,
+                    "big": bigint_fields(
+                        [
+                            Some(0),
+                            Some(mode),
+                            Some(1),
+                            Some(0),
+                            Some(0),
+                            Some(rdev),
+                            Some(blksize),
+                            Some(ino),
+                            Some(0),
+                            Some(0),
+                        ],
+                        [Timespec::default(); 4],
+                    ),
                 })
                 .to_string());
             }
