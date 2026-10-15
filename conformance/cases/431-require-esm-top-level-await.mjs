@@ -4,7 +4,10 @@
 // async, and refused before ANY of it runs (not even the synchronous
 // modules ahead of the await), with node's message naming the requiring and
 // the required file. It is refused the same way on every require(), and an
-// import() of the same module afterwards still evaluates it.
+// import() of the same module afterwards still evaluates it -- after which
+// a require() is STILL refused: node tests the graph for a top-level await
+// whatever state import() left it in, so an evaluated async graph is no
+// more requirable than one that never ran.
 //
 // Regression guard: oam threw ERR_REQUIRE_ESM for every require() of an ES
 // module, async or not.
@@ -40,7 +43,11 @@ const attempt = (label, specifier) => {
 attempt('direct', './tla.mjs');
 attempt('direct again', './tla.mjs');
 attempt('deep', './deep.mjs');
-import('./deep.mjs').then((ns) => console.log('import() afterwards', ns.y));
+import('./deep.mjs').then((ns) => {
+  console.log('import() afterwards', ns.y);
+  attempt('after import() finished', './deep.mjs');
+  attempt('after import() finished, direct', './tla.mjs');
+});
 `,
 };
 
