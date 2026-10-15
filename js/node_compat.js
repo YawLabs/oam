@@ -41572,8 +41572,18 @@
         super();
         // `eval: true` makes `filename` the worker's source, which oam cannot
         // run yet. Refused by name: read as a path (as it was), the source
-        // was looked for as a file.
+        // was looked for as a file. node validates the arguments first (#287):
+        // with eval set, a filename that is not a string (a URL, a number)
+        // is ERR_INVALID_ARG_VALUE on options.eval, an argument error that
+        // precedes the unsupported-feature refusal.
         if (opts.eval) {
+          if (typeof filename !== "string") {
+            throw new codes.ERR_INVALID_ARG_VALUE(
+              "options.eval",
+              opts.eval,
+              "must be false when 'filename' is not a string",
+            );
+          }
           throw new Error("new Worker(source, { eval: true }) is not supported in oam");
         }
         // node accepts a string path OR a URL (the `new Worker(new URL("./w.js",

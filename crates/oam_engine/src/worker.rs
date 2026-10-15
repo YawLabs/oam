@@ -55,7 +55,9 @@ impl super::JsRuntime {
         let request = filename.to_string_lossy();
         // `filename` is absolute (the constructor resolved it), so the
         // referrer is never read.
-        let Ok(found) = oam_loader::resolve_require(&request, filename) else {
+        let resolved = oam_loader::resolve_require(&request, filename);
+        directory_package_check(filename, resolved.as_ref().ok())?;
+        let Ok(found) = resolved else {
             return Err(WorkerError {
                 name: "Error".to_string(),
                 message: format!("Cannot find module '{request}'"),
@@ -68,18 +70,24 @@ impl super::JsRuntime {
                 ],
             });
         };
-        let extension = node_extname(&found);
+        // node's runMain decides the loader on the entry's realpath, and names
+        // it in ERR_UNKNOWN_FILE_EXTENSION. resolve_require realpaths most
+        // finds but leaves a trailing-dot name (`w.js.`) as spelled, so one
+        // reached through a junction or symlink was named by its link path
+        // (#287). module_key canonicalizes through the namespaced form, which
+        // keeps the trailing dot.
+        let real = crate::modules::module_key(&found).unwrap_or_else(|_| found.clone());
+        let extension = node_extname(&real);
         let loader_knows = matches!(extension, ".js" | ".mjs" | ".cjs" | ".json" | ".node")
-            || oam_loader::is_transpiled_source(&found);
+            || oam_loader::is_transpiled_source(&real);
         if loader_knows {
-            return Ok((found.clone(), oam_loader::module_kind(&found)));
+            return Ok((found, oam_loader::module_kind(&real)));
         }
-        let type_module = oam_loader::node_declared_module_kind(&found) == Some(ModuleKind::Esm);
+        let type_module = oam_loader::node_declared_module_kind(&real) == Some(ModuleKind::Esm);
         let module_syntax = !type_module && {
-            let source =
-                std::fs::read_to_string(oam_loader::fs_os_path(&found)).unwrap_or_default();
+            let source = std::fs::read_to_string(oam_loader::fs_os_path(&real)).unwrap_or_default();
             v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
-            crate::cjs::contains_module_syntax(scope, &source, &found.to_string_lossy())
+            crate::cjs::contains_module_syntax(scope, &source, &real.to_string_lossy())
         };
         if !type_module && !module_syntax {
             return Ok((found, ModuleKind::Cjs));
@@ -88,13 +96,13 @@ impl super::JsRuntime {
             // node runs an extensionless module (`bin`, `.hidden`) as an ES
             // module; oam's ES module host does not load one yet, so it
             // keeps the kind oam gives it and fails there.
-            return Ok((found.clone(), oam_loader::module_kind(&found)));
+            return Ok((found, oam_loader::module_kind(&real)));
         }
         Err(WorkerError {
             name: "TypeError".to_string(),
             message: format!(
                 "Unknown file extension \"{extension}\" for {}",
-                found.display()
+                real.display()
             ),
             props: vec![("code".to_string(), "ERR_UNKNOWN_FILE_EXTENSION".into())],
         })
@@ -154,6 +162,96 @@ impl super::JsRuntime {
             None => Ok(()),
         }
     }
+}
+
+/// node's `tryPackage` for an entry found as a directory (#287): when neither
+/// `filename` nor `filename` with an extension is a file, node reads the
+/// directory's package.json before looking for its `main` or index, and
+///
+/// * a package.json that is not a JSON object fails the entry with
+///   `ERR_INVALID_PACKAGE_CONFIG`, even when an index.js is there;
+/// * a non-empty string `main` that resolves to nothing, with no index to
+///   fall back on, fails `MODULE_NOT_FOUND` naming `main`'s path and asking
+///   to "verify that the package.json has a valid \"main\" entry", with own
+///   props `path` (the package.json, namespaced as node's reader has it) and
+///   `requestPath` -- not the plain "Cannot find module '<dir>'" with
+///   `requireStack` a missing directory gives.
+///
+/// `found` is what resolve_require found; the package was consulted only
+/// when that is inside the directory. node's DEP0128 warning, for a bad
+/// `main` that falls back to the index, is not emitted (oam's require()
+/// does not emit it either; docs/node-divergences.md).
+fn directory_package_check(
+    filename: &Path,
+    found: Option<&PathBuf>,
+) -> Result<(), oam_core::worker::WorkerError> {
+    use oam_core::worker::WorkerError;
+    let is_dir = std::fs::metadata(oam_loader::fs_os_path(filename)).is_ok_and(|m| m.is_dir());
+    if !is_dir {
+        return Ok(());
+    }
+    if let Some(found) = found {
+        let dir = crate::modules::module_key(filename).unwrap_or_else(|_| filename.to_path_buf());
+        if !found.starts_with(&dir) || found.as_path() == dir.as_path() {
+            return Ok(());
+        }
+    }
+    let manifest = filename.join("package.json");
+    let Ok(bytes) = std::fs::read(oam_loader::fs_os_path(&manifest)) else {
+        return Ok(());
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let shown_manifest = oam_loader::fs_os_path(&manifest).display().to_string();
+    let Ok(serde_json::Value::Object(package)) = serde_json::from_str::<serde_json::Value>(text)
+    else {
+        // node v22.22.2, measured: invalid JSON, `null`, `5`, `[]`, a string
+        // and an empty file all fail so.
+        return Err(WorkerError {
+            name: "Error".to_string(),
+            message: format!("Invalid package config {shown_manifest}."),
+            props: vec![("code".to_string(), "ERR_INVALID_PACKAGE_CONFIG".into())],
+        });
+    };
+    if found.is_some() {
+        return Ok(());
+    }
+    // A `main` that is not a non-empty string is ignored (`5`, `""`): the
+    // directory is then looked up by its index alone.
+    let Some(main) = package
+        .get("main")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+    else {
+        return Ok(());
+    };
+    // path.resolve(requestPath, main): an absolute `main` replaces the
+    // directory, and `.`/`..` and a trailing separator are dropped.
+    let mut main_path = PathBuf::new();
+    for component in filename.join(main).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                main_path.pop();
+            }
+            other => main_path.push(other.as_os_str()),
+        }
+    }
+    Err(WorkerError {
+        name: "Error".to_string(),
+        message: format!(
+            "Cannot find module '{}'. Please verify that the package.json has a valid \"main\" entry",
+            main_path.display()
+        ),
+        props: vec![
+            ("code".to_string(), "MODULE_NOT_FOUND".into()),
+            ("path".to_string(), shown_manifest.into()),
+            (
+                "requestPath".to_string(),
+                filename.to_string_lossy().into_owned().into(),
+            ),
+        ],
+    })
 }
 
 /// node's `path.extname` of `path`'s file name: from its last dot, unless
