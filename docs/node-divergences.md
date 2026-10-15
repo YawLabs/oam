@@ -3924,9 +3924,22 @@ that could never be unref'd) and `fs.promises.watch` did not exist. What is left
   the watched file's case-insensitively and against its 8.3 short name; oam (`notify`)
   compares the path as given, so `fs.watch('README.MD')` on a file spelled `README.md` sees
   nothing.
-- **One native thread per watcher** on Windows and Linux (the backend's event loop), where
-  libuv shares the process's loop. Fine for a CLI's handful of watchers; thousands of
-  watchers cost thousands of threads.
+- **One native thread per watcher on Windows and macOS** (the `notify` backend's event loop:
+  ReadDirectoryChangesW's completion thread, an FSEvents run loop), where libuv shares the
+  process's loop. Fine for a CLI's watchers; thousands of watchers cost thousands of threads.
+  On Linux every watcher of a run shares one inotify instance and one reader thread, as
+  libuv shares one instance per loop, so `fs.watch` on each directory of a large tree is
+  bounded by `fs.inotify.max_user_watches` (`ENOSPC`, node's message), not by the 128
+  instances a user may hold.
+- **A recursive watch on Linux is native.** node v22.22.2 runs a JS watcher there, for
+  `fs.watch` and `fs.promises.watch` alike (`internal/fs/recursive_watch`: an `fs.watch` per
+  file and per directory, and a `statSync` per event); its `ref()` and `unref()` do nothing
+  and return `undefined`, its `close()` emits `'close'` at once, and it reports a new
+  directory's entries as `rename` events but not the first write to a file it has just seen
+  made. oam watches each directory of the tree on the shared inotify instance: nested entries
+  are named by their path under the root in both, but which events a burst of changes
+  becomes differs (measured: writing a new `s1/s2/deep` is `rename` in node, `rename` then
+  `change` in oam), and oam's watcher is node's ordinary `FSWatcher`.
 - **A queue overflow** (ReadDirectoryChangesW's, inotify's `IN_Q_OVERFLOW`, an FSEvents
   drop) is reported as one `rename` with a `null` filename on every platform; libuv does so
   on Windows only. On Windows oam's backend reads the OS buffer on a thread of its own, so it

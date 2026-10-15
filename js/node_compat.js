@@ -13933,7 +13933,8 @@
     // 'ignore'` drops each with a warning and 'error' empties the queue and
     // throws ERR_FS_WATCH_QUEUE_OVERFLOW. An abort closes the watch and
     // throws AbortError; return() (a `break` out of for-await) closes it.
-    // Named `watch`, as node's is (`fs.promises.watch.name`).
+    // Named `watch`, as node's is on Windows and macOS (`_watch` elsewhere:
+    // see the export below).
     const fspWatch = async function* watch(filename, options = {}) {
       const path = toPath(filename);
       if (options === null || typeof options !== "object" || Array.isArray(options)) {
@@ -14278,6 +14279,12 @@
       Dirent,
       watch: fspWatch,
     };
+    // Off Windows and macOS node exports its `_watch` wrapper instead (which
+    // runs a recursive watch through its JS watcher), so the name differs by
+    // platform (internal/fs/promises.js, v22.22.2).
+    if (natives.platform !== "win32" && natives.platform !== "darwin") {
+      Object.defineProperty(fspWatch, "name", { value: "_watch" });
+    }
     return asAlwaysRejecting(rawFsPromises);
   };
 

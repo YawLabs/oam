@@ -2051,6 +2051,7 @@ dependencies = [
  "httparse",
  "hyper",
  "hyper-util",
+ "inotify",
  "io-uring",
  "libc",
  "md-5",
