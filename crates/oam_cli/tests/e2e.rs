@@ -37742,5 +37742,8 @@ fn write_heap_snapshot_needs_the_write_grant() {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().ends_with(".heapsnapshot"))
         .collect();
-    assert!(written.is_empty(), "a snapshot was written despite the denial");
+    assert!(
+        written.is_empty(),
+        "a snapshot was written despite the denial"
+    );
 }
