@@ -11500,6 +11500,18 @@ mod permission_audit {
                 "computes a path string from the cwd; opens nothing",
             ),
             (
+                "op_fs_watch_next",
+                "reads events of a watcher whose path was checked at fsWatchStart",
+            ),
+            (
+                "op_fs_watch_close",
+                "stops a watcher whose path was checked at fsWatchStart",
+            ),
+            (
+                "op_fs_watch_set_ref",
+                "flips loop-liveness of a watcher checked at fsWatchStart; touches no file",
+            ),
+            (
                 "op_spawn_kill",
                 "signals a child already permitted at spawn",
             ),
