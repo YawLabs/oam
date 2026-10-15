@@ -27607,7 +27607,7 @@ fn readline_clearline_ansi() {
         const after3 = buf;
         buf = '';
 
-        // no stream => returns false
+        // no stream => returns true, as node v22.22.2 does (#391)
         const r2 = readline.clearLine(null, 0);
 
         console.log('cl_left=' + JSON.stringify(after1));
@@ -27634,7 +27634,7 @@ fn readline_clearline_ansi() {
         "clearLine return with stream: {stdout}"
     );
     assert!(
-        stdout.contains("ret_null=false"),
+        stdout.contains("ret_null=true"),
         "clearLine return without stream: {stdout}"
     );
 }
