@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 impl super::JsRuntime {
-    /// Execute a worker thread entry. Sets up worker context (parentPort,
-    /// isMainThread=false, workerData) before loading the script. Called on
-    /// the WORKER thread, not the parent.
+    /// Execute a worker thread entry as the kind oam's loader gives its file
+    /// (oam.fork()'s in-process pool; a `new Worker` thread finds its entry
+    /// with [`Self::worker_entry`] first). Called on the WORKER thread, not
+    /// the parent.
     pub(crate) fn execute_worker(
         &mut self,
         entry: &Path,
@@ -24,7 +25,98 @@ impl super::JsRuntime {
         // which an entry never passes through. Asked of the file's real path,
         // as the CLI routes a program's entry (entry_module_kind in oam_cli).
         let real = crate::modules::module_key(entry).unwrap_or_else(|_| entry.to_path_buf());
-        if oam_loader::module_kind(&real) == oam_loader::ModuleKind::Esm {
+        let kind = oam_loader::module_kind(&real);
+        self.execute_worker_as(entry, kind, ctx)
+    }
+
+    /// The file a `new Worker(filename)` thread runs, and as which kind, by
+    /// the rules node's worker applies to its entry (#287): it runs it as
+    /// the main module of the thread (`Module.runMain`), so `filename` is
+    /// found as node finds a program's entry -- the file itself, then with
+    /// `.js`, `.json` or `.node` added, then as a directory (package.json
+    /// `main`, index.js) -- and is looked for only once the thread runs. A
+    /// missing entry is therefore no throw from the constructor: the Worker
+    /// starts and reports `MODULE_NOT_FOUND` as its 'error' event, exiting 1.
+    ///
+    /// An extension neither of oam's loaders knows (`x.txt`, and `x.js.`,
+    /// whose extension node reads as `.`) is node's CommonJS loader's: it
+    /// runs such a file as a .js file -- unless the package is
+    /// `"type": "module"` or the source has module syntax, when it goes to
+    /// the ES module loader, which refuses the extension with
+    /// `ERR_UNKNOWN_FILE_EXTENSION`. oam's ES module host refused every such
+    /// file as an "unsupported module type", so `x.js.` (which #275 had just
+    /// made findable) failed where node runs it.
+    pub(crate) fn worker_entry(
+        &mut self,
+        filename: &Path,
+    ) -> Result<(PathBuf, oam_loader::ModuleKind), oam_core::worker::WorkerError> {
+        use oam_core::worker::WorkerError;
+        use oam_loader::ModuleKind;
+        let request = filename.to_string_lossy();
+        // `filename` is absolute (the constructor resolved it), so the
+        // referrer is never read.
+        let resolved = oam_loader::resolve_require(&request, filename);
+        directory_package_check(filename, resolved.as_ref().ok())?;
+        let Ok(found) = resolved else {
+            return Err(WorkerError {
+                name: "Error".to_string(),
+                message: format!("Cannot find module '{request}'"),
+                props: vec![
+                    ("code".to_string(), "MODULE_NOT_FOUND".into()),
+                    (
+                        "requireStack".to_string(),
+                        serde_json::Value::Array(Vec::new()),
+                    ),
+                ],
+            });
+        };
+        // node's runMain decides the loader on the entry's realpath, and names
+        // it in ERR_UNKNOWN_FILE_EXTENSION. resolve_require realpaths most
+        // finds but leaves a trailing-dot name (`w.js.`) as spelled, so one
+        // reached through a junction or symlink was named by its link path
+        // (#287). module_key canonicalizes through the namespaced form, which
+        // keeps the trailing dot.
+        let real = crate::modules::module_key(&found).unwrap_or_else(|_| found.clone());
+        let extension = node_extname(&real);
+        let loader_knows = matches!(extension, ".js" | ".mjs" | ".cjs" | ".json" | ".node")
+            || oam_loader::is_transpiled_source(&real);
+        if loader_knows {
+            return Ok((found, oam_loader::module_kind(&real)));
+        }
+        let type_module = oam_loader::node_declared_module_kind(&real) == Some(ModuleKind::Esm);
+        let module_syntax = !type_module && {
+            let source = std::fs::read_to_string(oam_loader::fs_os_path(&real)).unwrap_or_default();
+            v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
+            crate::cjs::contains_module_syntax(scope, &source, &real.to_string_lossy())
+        };
+        if !type_module && !module_syntax {
+            return Ok((found, ModuleKind::Cjs));
+        }
+        if extension.is_empty() {
+            // node runs an extensionless module (`bin`, `.hidden`) as an ES
+            // module; oam's ES module host does not load one yet, so it
+            // keeps the kind oam gives it and fails there.
+            return Ok((found, oam_loader::module_kind(&real)));
+        }
+        Err(WorkerError {
+            name: "TypeError".to_string(),
+            message: format!(
+                "Unknown file extension \"{extension}\" for {}",
+                real.display()
+            ),
+            props: vec![("code".to_string(), "ERR_UNKNOWN_FILE_EXTENSION".into())],
+        })
+    }
+
+    /// Run a worker's entry `entry` as `kind`. Sets up the worker context
+    /// (parentPort, isMainThread=false, workerData) before loading it.
+    pub(crate) fn execute_worker_as(
+        &mut self,
+        entry: &Path,
+        kind: oam_loader::ModuleKind,
+        ctx: WorkerContext,
+    ) -> Result<(), Vec<Diagnostic>> {
+        if kind == oam_loader::ModuleKind::Esm {
             let host = crate::worker_host().ok_or_else(|| {
                 vec![Diagnostic::new(
                     "OAM-MOD0003",
@@ -69,6 +161,123 @@ impl super::JsRuntime {
             Some(failures) => Err(failures),
             None => Ok(()),
         }
+    }
+}
+
+/// node's `tryPackage` for an entry found as a directory (#287): when neither
+/// `filename` nor `filename` with an extension is a file, node reads the
+/// directory's package.json before looking for its `main` or index, and
+///
+/// * a package.json that is not a JSON object fails the entry with
+///   `ERR_INVALID_PACKAGE_CONFIG`, even when an index.js is there;
+/// * a non-empty string `main` that resolves to nothing, with no index to
+///   fall back on, fails `MODULE_NOT_FOUND` naming `main`'s path and asking
+///   to "verify that the package.json has a valid \"main\" entry", with own
+///   props `path` (the package.json, namespaced as node's reader has it) and
+///   `requestPath` -- not the plain "Cannot find module '<dir>'" with
+///   `requireStack` a missing directory gives.
+///
+/// `found` is what resolve_require found; the package was consulted only
+/// when that is inside the directory. node's DEP0128 warning, for a bad
+/// `main` that falls back to the index, is not emitted (oam's require()
+/// does not emit it either; docs/node-divergences.md).
+fn directory_package_check(
+    filename: &Path,
+    found: Option<&PathBuf>,
+) -> Result<(), oam_core::worker::WorkerError> {
+    use oam_core::worker::WorkerError;
+    let is_dir = std::fs::metadata(oam_loader::fs_os_path(filename)).is_ok_and(|m| m.is_dir());
+    if !is_dir {
+        return Ok(());
+    }
+    // node tries the path as a file, then with each extension, and only then
+    // as a directory: a sibling file it takes first means the package was
+    // never read. Decided on the unresolved names, not on where `found`
+    // resolves to -- an index.js that is a link out of the directory is
+    // still the directory's.
+    if found.is_some() {
+        let as_file =
+            |p: &Path| std::fs::metadata(oam_loader::fs_os_path(p)).is_ok_and(|m| m.is_file());
+        let with_ext = filename.as_os_str().to_owned();
+        let taken_as_file = [".js", ".json", ".node"].iter().any(|ext| {
+            let mut candidate = with_ext.clone();
+            candidate.push(ext);
+            as_file(Path::new(&candidate))
+        });
+        if taken_as_file {
+            return Ok(());
+        }
+    }
+    let manifest = filename.join("package.json");
+    let Ok(bytes) = std::fs::read(oam_loader::fs_os_path(&manifest)) else {
+        return Ok(());
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let shown_manifest = oam_loader::fs_os_path(&manifest).display().to_string();
+    let Ok(serde_json::Value::Object(package)) = serde_json::from_str::<serde_json::Value>(text)
+    else {
+        // node v22.22.2, measured: invalid JSON, `null`, `5`, `[]`, a string
+        // and an empty file all fail so.
+        return Err(WorkerError {
+            name: "Error".to_string(),
+            message: format!("Invalid package config {shown_manifest}."),
+            props: vec![("code".to_string(), "ERR_INVALID_PACKAGE_CONFIG".into())],
+        });
+    };
+    if found.is_some() {
+        return Ok(());
+    }
+    // A `main` that is not a non-empty string is ignored (`5`, `""`): the
+    // directory is then looked up by its index alone.
+    let Some(main) = package
+        .get("main")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+    else {
+        return Ok(());
+    };
+    // path.resolve(requestPath, main): an absolute `main` replaces the
+    // directory, and `.`/`..` and a trailing separator are dropped.
+    let mut main_path = PathBuf::new();
+    for component in filename.join(main).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                main_path.pop();
+            }
+            other => main_path.push(other.as_os_str()),
+        }
+    }
+    Err(WorkerError {
+        name: "Error".to_string(),
+        message: format!(
+            "Cannot find module '{}'. Please verify that the package.json has a valid \"main\" entry",
+            main_path.display()
+        ),
+        props: vec![
+            ("code".to_string(), "MODULE_NOT_FOUND".into()),
+            ("path".to_string(), shown_manifest.into()),
+            (
+                "requestPath".to_string(),
+                filename.to_string_lossy().into_owned().into(),
+            ),
+        ],
+    })
+}
+
+/// node's `path.extname` of `path`'s file name: from its last dot, unless
+/// that dot leads the name (`.hidden` has none) or the name is `..`. Unlike
+/// `Path::extension` it keeps the dot, so `x.js.` gives `.` and `noext` an
+/// empty string -- the two node tells apart (#287).
+fn node_extname(path: &Path) -> &str {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return "";
+    };
+    match name.rfind('.') {
+        Some(0) | None => "",
+        Some(_) if name == ".." => "",
+        Some(dot) => &name[dot..],
     }
 }
 
@@ -278,22 +487,55 @@ fn run_worker(
                if (f.name === 'onWarning') globalThis.process.removeListener('warning', f);",
         );
     }
-    if let Err(diagnostics) = rt.execute_worker(script_path, ctx) {
+    // The entry is looked for on the worker's own thread, as node's is
+    // (#287): its failure is the thread's error, handed to the parent whole,
+    // and the thread exits 1.
+    let (entry, kind) = match rt.worker_entry(script_path) {
+        Ok(entry) => entry,
+        Err(error) => {
+            let _ = to_parent.send(WorkerEvent::Error(error));
+            return 1;
+        }
+    };
+    if let Err(diagnostics) = rt.execute_worker_as(&entry, kind, ctx) {
         for d in &diagnostics {
             eprintln!("worker {thread_id}: {}", d.message);
         }
-        let _ = to_parent.send(WorkerEvent::Error(
+        let _ = to_parent.send(WorkerEvent::Error(oam_core::worker::WorkerError::message(
             diagnostics
                 .first()
                 .map(|d| d.message.clone())
                 .unwrap_or_else(|| "unknown worker error".to_string()),
-        ));
+        )));
         return 1;
     }
     // Node emits 'exit' on the worker's own process object before the thread
     // ends, and re-reads exitCode after (a handler may set it).
     rt.emit_process_exit();
     rt.process_exit_code().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod entry_tests {
+    use super::*;
+
+    #[test]
+    fn node_extname_keeps_the_dot_and_skips_a_leading_one() {
+        // node v22.22.2's path.extname, measured.
+        for (name, ext) in [
+            ("w.js", ".js"),
+            ("w.js.", "."),
+            ("x.txt", ".txt"),
+            ("noext", ""),
+            (".hidden", ""),
+            ("..x", ".x"),
+            ("...", "."),
+            ("a.b.c", ".c"),
+        ] {
+            assert_eq!(node_extname(&Path::new("dir").join(name)), ext, "{name}");
+        }
+        assert_eq!(node_extname(Path::new("dir/..")), "");
+    }
 }
 
 #[cfg(test)]

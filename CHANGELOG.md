@@ -34,6 +34,23 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `fs.promises.opendir` takes a third argument as opendir's callback, as node's promisify does.
   `new fs.Dir()` throws `ERR_MISSING_ARGS` and `Dir.length` is 3. `path` is a getter, and
   `entries()`, `Symbol.dispose` and `Symbol.asyncDispose` exist, as on node's `Dir`.
+- **A `worker_threads` Worker finds and runs its entry as node's does (#287).** A missing entry
+  threw a `TypeError` ("worker script not found") from the constructor; now the Worker is made,
+  emits `'error'` with node's `MODULE_NOT_FOUND` error (`requireStack: []`) and exits 1. The entry
+  is searched for as node searches for a program's: the file, then with `.js` added, then a
+  directory's `main` or index. A directory whose package.json is not a JSON object fails with
+  `ERR_INVALID_PACKAGE_CONFIG`, and a `main` that resolves to nothing with node's "Please verify
+  that the package.json has a valid \"main\" entry" error, which carries `path` and `requestPath`.
+  An extension neither loader knows, such as `x.txt` or a file really named `x.js.` (whose extension
+  node reads as `.`), runs as CommonJS, where oam refused it as an "unsupported module type"; in a
+  `"type": "module"` package, or when the file has module syntax, it fails with node's
+  `ERR_UNKNOWN_FILE_EXTENSION`, naming the entry's real path. A string that is not absolute or
+  `./`/`../`-relative throws node's `ERR_WORKER_PATH`, as a `file:` URL string does; oam resolved
+  both against the cwd. `eval: true` with a filename that is not a string throws node's
+  `ERR_INVALID_ARG_VALUE`. A worker's `'error'` event carries the error's class and `code`, not only
+  a message. And a Worker's `'error'` or `'message'` whose listener throws, or an `'error'` with no
+  listener, is an uncaught exception, as in node, and the Worker's later events still come; it was
+  an unhandled rejection.
 - **`events.once` is an async function and an abort rejects with node's `AbortError`, as in node (#344).**
   It was a plain function, so the continuation of `await once(...)` ran before the microtasks the
   same emit queued, and its kind and `length` (3) were not node's. An aborted `once` rejected with a
