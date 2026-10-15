@@ -20,6 +20,19 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **Buffer's string paths no longer encode into a temporary, and match node where they did not.**
+  `Buffer.from(string)`, `buf.write`, `Buffer.byteLength` and `TextEncoder` encoded into a scratch
+  array and copied it over; they now encode straight into the destination, and `byteLength` counts
+  without encoding. `buf.toString()` decodes long spans with V8's own decoders, the ones node calls.
+  Per 100k ops, debug build, medians of 5 interleaved with node (before -> after, node):
+  `Buffer.from(utf8)` 205 -> 49 ms (58), `Buffer.byteLength` 157 -> 28 ms (18), `buf.toString()`
+  61 -> 36 ms (14), `buf.write` 101 -> 17 ms (29), `Buffer.concat` 84 -> 19 ms (30). Parity fixes
+  found on the way: `Buffer.from(string)` places its bytes in the pool as node's `fromStringFast`
+  does, so `byteOffset` and `.buffer` match; base64 reads each code unit's low byte, and
+  `byteLength` discounts at most two trailing `=`; `Buffer.concat` allocates from the pool;
+  `toString` over an empty range ignores the encoding; `TextEncoder#encodeInto` validates its
+  arguments and reports `read` exactly.
+
 - **`fs.opendir`, `fs.opendirSync` and `fs.promises.opendir` honour `recursive`, as node's do
   (#286).** The `Dir` took one listing with one parent for all of it and ignored every option, so
   `{ recursive: true }` listed the top level only. It now walks as node v22.22.2's does. Handing out
