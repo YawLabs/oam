@@ -152,8 +152,12 @@ try {
   }
   clearInterval(timer);
   console.log("after break:", JSON.stringify(await it.next()));
+  // A fresh, quiet directory: a late event from the writes above would
+  // settle the pending next() before the abort does.
+  const quiet = path.join(root, "q");
+  fs.mkdirSync(quiet);
   const ac = new AbortController();
-  const it2 = fsp.watch(dir, { signal: ac.signal });
+  const it2 = fsp.watch(quiet, { signal: ac.signal });
   const pending = it2.next();
   setTimeout(() => ac.abort("stop"), 50);
   try {
