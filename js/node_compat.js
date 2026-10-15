@@ -1609,8 +1609,11 @@
 
   // Render a number the way Node's ERR_OUT_OF_RANGE does: underscore thousands
   // separators only for magnitudes strictly greater than 2**32 (Node parity --
-  // 2**32 itself prints plain, 2**40 gets separators); otherwise String(n).
+  // 2**32 itself prints plain, 2**40 gets separators); otherwise String(n),
+  // except -0: node inspects the value, which keeps its sign ("Received -0"
+  // for fs.opendirSync(p, { bufferSize: -0 }), measured on v22.22.2; #286).
   function fmtRange(n) {
+    if (Object.is(n, -0)) return "-0";
     // A bigint is grouped past 2n**32n, as a number is; either way it keeps
     // its n.
     if (typeof n === "bigint") {
@@ -9816,6 +9819,13 @@
   const OPENDIR_DEFAULTS = { encoding: "utf8" };
   const SymbolDispose = Symbol.dispose ?? Symbol.for("nodejs.dispose");
   const SymbolAsyncDispose = Symbol.asyncDispose ?? Symbol.for("nodejs.asyncDispose");
+  // The fs callback layer's fsReqStart/fsReqEnd, for a Dir's own requests.
+  const dirRequestStart = () => {
+    const token = { type: "FSReqCallback" };
+    registry._activeRequests.add(token);
+    return token;
+  };
+  const dirRequestEnd = (token) => registry._activeRequests.delete(token);
   class Dir {
     #natives;
     #path;
@@ -9829,14 +9839,19 @@
     // node's #operationQueue: non-null while a read of the top directory is
     // in flight, holding the reads and closes made meanwhile.
     #queue = null;
-    constructor(natives, path, entries, options) {
+    // node's signature (handle, path, options), so `length` is 3 and a Dir
+    // made without a handle throws ERR_MISSING_ARGS, as node's does (#286).
+    // The handle here is { natives, entries }: the natives the walk opens
+    // subdirectories with, and the top directory's listing.
+    constructor(handle, path, options) {
+      if (!handle) throw new codes.ERR_MISSING_ARGS("handle");
       // node spreads the options over the default, so an own `bufferSize:
       // undefined` is refused as not a number. It validates after the open.
       const opts = { bufferSize: 32, ...options };
       validateInteger(opts.bufferSize, "options.bufferSize", 1, 4294967295);
-      this.#natives = natives;
+      this.#natives = handle.natives;
       this.#path = path;
-      this.#handle = { entries, index: 0 };
+      this.#handle = { entries: handle.entries, index: 0 };
       this.#recursive = opts.recursive;
       this.#bufferSize = opts.bufferSize;
     }
@@ -9921,22 +9936,38 @@
         }
       }
       this.#queue = [];
+      // node holds an FSReqCallback for the read of the top directory (the
+      // promise form too, and the read that finds the end), and none for a
+      // buffered entry: process.getActiveResourcesInfo() lists it, until
+      // its callback has returned -- a close(cb) made in that callback
+      // still sees it (#286).
+      const token = dirRequestStart();
       setImmediate(() => {
-        process.nextTick(() => {
-          const queue = this.#queue;
-          this.#queue = null;
-          for (const op of queue) op();
-        });
-        const chunk = this.#readHandle(this.#handle);
-        if (chunk === null) return callback(null, null);
         try {
-          this.#buffer(this.#path, chunk);
-          callback(null, this.#take());
-        } catch (error) {
-          callback(error);
+          this.#readTop(callback);
+        } finally {
+          dirRequestEnd(token);
         }
-        return undefined;
       });
+      return undefined;
+    }
+    // The completion of a read of the top directory. The reads and closes
+    // queued behind it run on the next tick. As node's, a throw from the
+    // callback calls it again with that error.
+    #readTop(callback) {
+      process.nextTick(() => {
+        const queue = this.#queue;
+        this.#queue = null;
+        for (const op of queue) op();
+      });
+      const chunk = this.#readHandle(this.#handle);
+      if (chunk === null) return callback(null, null);
+      try {
+        this.#buffer(this.#path, chunk);
+        callback(null, this.#take());
+      } catch (error) {
+        callback(error);
+      }
       return undefined;
     }
     readSync() {
@@ -9964,7 +9995,16 @@
       }
       this.#handlers.length = 0;
       this.#closed = true;
-      setImmediate(callback, null);
+      // An FSReqCallback while the close is in flight, as node's (not for a
+      // close of a closed Dir, which calls back on the next tick; #286).
+      const token = dirRequestStart();
+      setImmediate(() => {
+        try {
+          callback(null);
+        } finally {
+          dirRequestEnd(token);
+        }
+      });
       return undefined;
     }
     #closePromise() {
@@ -10050,7 +10090,7 @@
     reading.then(
       (entries) => {
         requests?.end(token);
-        process.nextTick(() => callback(null, new Dir(natives, dirPath, entries, opts)));
+        process.nextTick(() => callback(null, new Dir({ natives, entries }, dirPath, opts)));
       },
       (err) => {
         requests?.end(token);
@@ -13199,12 +13239,15 @@
         return Promise.reject(err);
       },
       // node's is promisify(opendir): it hands opendir its arguments with the
-      // callback last, and has its `length` (3).
+      // callback last, and has its `length` (3). Only opendir's three slots
+      // are passed on, so a third argument the caller gave is the callback
+      // there, as in node (which calls it and never settles the promise),
+      // not opendirAsync's `requests` (#286).
       opendir: Object.defineProperty(
         function opendir(...args) {
           return new Promise((resolve, reject) => {
             args.push((err, dir) => (err ? reject(err) : resolve(dir)));
-            opendirAsync(natives, ...args);
+            opendirAsync(natives, args[0], args[1], args[2]);
           });
         },
         "length",
@@ -14038,7 +14081,7 @@
       opendirSync: function opendirSync(path, options) {
         const dirPath = toPath(path);
         const opts = fsGetOptions(options, OPENDIR_DEFAULTS);
-        return new Dir(natives, dirPath, natives.fsReaddirSync(opendirPath(dirPath), true), opts);
+        return new Dir({ natives, entries: natives.fsReaddirSync(opendirPath(dirPath), true) }, dirPath, opts);
       },
       cpSync: function cpSync(src, dest, options) {
         const opts = validateCpOptions(options);

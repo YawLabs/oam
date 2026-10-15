@@ -3724,9 +3724,18 @@ top level only, #286). Measured on Windows, what is left:
   chunking are node's; only what changed in between differs.
 - **`encoding` is checked but not applied**: names are strings, where `encoding: 'buffer'`
   gives node Buffers (and `'hex'` hex strings). `readdir` shares this.
-- **A read that has to list the top directory completes in the check phase** (as a
-  `setImmediate` does), where node's completes in the poll phase. The order of the reads, the
-  queue behind them and the next-tick delivery of a buffered entry are node's.
+- **A read that has to list the top directory, and a close, complete in the check phase** (as
+  a `setImmediate` does), where node's complete in the poll phase: `close(cb)` and `close()`
+  settle after a `setImmediate` made before them, where node's settle before it. The order of
+  the reads, the queue behind them and the next-tick delivery of a buffered entry are node's.
+  `process.getActiveResourcesInfo()` lists node's `FSReqCallback` for each such read and close
+  while it is in flight, and also an `Immediate` beside it, which node does not.
+- **A Buffer path is held as a string.** node keeps the Buffer as `dir.path` and as each
+  Dirent's `parentPath`, so `opendirSync(buffer, { recursive: true })` throws
+  `ERR_INVALID_ARG_TYPE` there at the first subdirectory (`path.join` refuses the Buffer);
+  oam's `dir.path` is a string and the walk goes on. Reproducing that throw was not worth it.
+- **`Dir.prototype` lacks node's `processReadResult` and `readSyncRecursive`**, public
+  methods there only by accident of node's implementation.
 - **A Dir is also sync-iterable** (`for (const d of dir)`), an extra node does not have, kept
   from before the class and pinned by the e2e test `dir_sync_iterator_is_an_intentional_oam_extra`.
 

@@ -213,7 +213,7 @@ for (const [label, read] of [
 }
 
 // What the options are checked for, and when.
-for (const options of [{ bufferSize: 0 }, { bufferSize: 1.5 }, { bufferSize: "2" }, { bufferSize: undefined }, { bufferSize: 4294967296 }, 42, "not-an-encoding"]) {
+for (const options of [{ bufferSize: 0 }, { bufferSize: -0 }, { bufferSize: 1.5 }, { bufferSize: "2" }, { bufferSize: undefined }, { bufferSize: 4294967296 }, 42, "not-an-encoding"]) {
   try {
     drainSync(fs.opendirSync(root, options));
     console.log(`opendirSync ${inspect(options)}: ok`);
@@ -235,3 +235,82 @@ try {
 console.log(`lengths: ${fs.opendir.length} ${fs.opendirSync.length} ${fs.promises.opendir.length}`);
 console.log(`path is an own property: ${Object.keys(fs.opendirSync(root)).includes("path")}`);
 console.log(`[Symbol.asyncIterator] is entries: ${fs.Dir.prototype[Symbol.asyncIterator] === fs.Dir.prototype.entries}`);
+
+// fs.promises.opendir is promisify(opendir): a third argument is opendir's
+// callback, which is called with the Dir, and the promise never settles.
+{
+  const settled = [];
+  const dir = await new Promise((res) => {
+    fs.promises.opendir(root, {}, (e, d) => res(d)).then(
+      () => settled.push("resolved"),
+      (e) => settled.push(`rejected ${e.message}`),
+    );
+  });
+  dir.closeSync();
+  await new Promise((res) => setTimeout(res, 10));
+  console.log(`promises.opendir third argument: called back with a ${dir.constructor.name}, promise ${settled.join(" ") || "pending"}`);
+}
+
+// The Dir class itself: node's constructor(handle, path, options).
+console.log(`Dir.length: ${fs.Dir.length}`);
+for (const args of [[], [undefined], [null]]) {
+  try {
+    new fs.Dir(...args);
+    console.log(`new Dir(${args.map(String).join(", ")}): built`);
+  } catch (e) {
+    console.log(`new Dir(${args.map(String).join(", ")}): ${e.code} ${e.message}`);
+  }
+}
+
+// process.getActiveResourcesInfo() holds an FSReqCallback while a read of
+// the top directory (either form, the one finding the end too) or a close
+// is in flight, and none for a buffered entry or a close of a closed Dir.
+{
+  const requests = () => process.getActiveResourcesInfo().filter((t) => t === "FSReqCallback").length;
+  const settle = () => new Promise((res) => setTimeout(res, 10));
+  const log = [];
+  mk("q/sub");
+  wf("q/f.txt");
+  let dir = fs.opendirSync(at("q"));
+  let p = dir.read();
+  log.push(`read() of the top: ${requests()}`);
+  await p;
+  await settle();
+  p = dir.read();
+  log.push(`read() buffered: ${requests()}`);
+  await p;
+  await settle();
+  p = dir.read();
+  log.push(`read() at the end: ${requests()}`);
+  await p;
+  await settle();
+  p = dir.close();
+  log.push(`close(): ${requests()}`);
+  await p;
+  await settle();
+  dir = fs.opendirSync(at("q"));
+  await new Promise((res) => {
+    dir.read(res);
+    log.push(`read(cb) of the top: ${requests()}`);
+  });
+  // Settled first: node still counts the read's request in the microtasks
+  // run straight after its callback.
+  await settle();
+  await new Promise((res) => {
+    dir.read(res);
+    log.push(`read(cb) buffered: ${requests()}`);
+  });
+  await settle();
+  await new Promise((res) => {
+    dir.close(res);
+    log.push(`close(cb): ${requests()}`);
+  });
+  await settle();
+  await new Promise((res) => {
+    dir.close(res);
+    log.push(`close(cb) closed: ${requests()}`);
+  });
+  await settle();
+  log.push(`after: ${requests()}`);
+  console.log(log.join("\n"));
+}
