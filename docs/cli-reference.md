@@ -7,7 +7,7 @@ overview, plus the environment variables, which `--help` does not list.
 
 | Command | What it does |
 |---|---|
-| `oam run <file>` | Run a JS/TS file. TypeScript is type-checked **concurrently** — execution never waits on the checker. |
+| `oam run <file>` | Run a JS/TS file. TypeScript runs with its types stripped and unchecked, as in node. `--check=warn` checks it concurrently and reports after the program ends; `--check=block` checks it first and refuses to run on a type error. |
 | `oam test` | Run `*.test.*` / `*.spec.*` / `*_test.*`, each file in a fresh isolate. Import `oam:test`. Does not block on types. |
 | `oam repl` | Interactive typed REPL. Also the default with no subcommand. |
 | `oam check` | Type-check a file or project with tsgo (TypeScript 7 native). |
@@ -26,8 +26,8 @@ pretty-printed errors — the form agents should consume. The envelope is
 documented at <https://oamjs.org/docs/odif>, and every code it can carry at
 <https://oamjs.org/docs/errors>.
 
-Every check -- `oam check`, and the concurrent one behind `oam run` and
-`oam test` -- also sees oam's own declarations for the `oam:` modules
+Every check -- `oam check`, and the one `oam run --check=warn` or
+`--check=block` makes -- also sees oam's own declarations for the `oam:` modules
 (`oam:mcp`, `oam:test`, `oam:ai`, `oam:permissions`) and the `oam` global.
 Nothing to install and no `tsconfig.json` edit: for a project they arrive
 through a generated config that `extends` yours, so your `compilerOptions`,
@@ -116,7 +116,7 @@ line; the debugger is not. Full story:
 |---|---|
 | `OAM_TSGO` | Path to the tsgo binary. Without it, oam prefers the project's `node_modules/.bin/tsgo` (nearest, walking up), then PATH. |
 | `OAM_TSGO_TIMEOUT_MS` | Wall-clock bound on one tsgo run (default 300000). A run past it is killed — whole process tree — and reported as `OAM-TS0006`. |
-| `OAM_CHECK_WAIT_MS` | How long warn-mode `oam run` waits for the concurrent checker after the program exits (default 10000). |
+| `OAM_CHECK_WAIT_MS` | How long `oam run --check=warn` waits for the concurrent checker after the program exits (default 10000). |
 | `OAM_DAEMON_IDLE_MS` | How long the type-check daemon stays warm before exiting. |
 | `OAM_DEBUG` | `1` prints why a check fell back from the daemon to one-shot (normally swallowed by the never-worse-than-one-shot contract). |
 

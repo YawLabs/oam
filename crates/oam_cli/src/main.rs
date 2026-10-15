@@ -33,22 +33,27 @@ struct Cli {
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum CheckMode {
-    /// Check concurrently with execution; report, never block (default).
+    /// Check concurrently with execution; report after the program ends,
+    /// waiting up to OAM_CHECK_WAIT_MS for the checker.
     Warn,
     /// Check BEFORE execution; type errors prevent the run (CI gate).
     Block,
-    /// No type checking.
+    /// No type checking (default), as node runs TypeScript.
     Off,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a JavaScript or TypeScript file (TypeScript is type-checked
-    /// concurrently by default — execution never waits for the checker).
+    /// Run a JavaScript or TypeScript file. TypeScript runs with its types
+    /// stripped and unchecked, as node runs it; --check=warn or
+    /// --check=block (or `oam check`) adds the type check.
     Run {
         file: PathBuf,
-        /// Type-check policy for TypeScript entries.
-        #[arg(long, value_enum, default_value = "warn")]
+        /// Type-check policy for TypeScript entries. Off by default: warn
+        /// mode reports after the program ends, so a short run's exit
+        /// waited for the checker -- seconds for a file with no tsconfig,
+        /// whose check starts a fresh tsgo every time.
+        #[arg(long, value_enum, default_value = "off")]
         check: CheckMode,
         /// Alias for --check=off.
         #[arg(long)]
@@ -835,9 +840,11 @@ fn dispatch(cli: Cli) -> ExitCode {
             if *workers > 0 {
                 serve_with_workers(file, *workers, cli.json, inspect)
             } else {
+                // No type check, as `oam run`'s default: a server's
+                // shutdown should not wait on a checker either.
                 run_command(
                     file,
-                    CheckMode::Warn,
+                    CheckMode::Off,
                     false,
                     cli.json,
                     &[],

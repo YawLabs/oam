@@ -30,6 +30,13 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   uses `import`/`export` needs nothing. Otherwise add `"type": "module"` to `package.json` or rename
   the file to `.mjs`, and do the same to drop the warning.
 
+- **`oam run` no longer type-checks TypeScript by default; it runs it unchecked, as node does.**
+  The default was `--check=warn`, which checks alongside the program and reports after it ends --
+  so every run's exit waited for the checker, up to `OAM_CHECK_WAIT_MS` (10 s). A file with no
+  `tsconfig.json` has no daemon and starts a fresh `tsgo` each run, so a short script exited 1-7 s
+  after its last output. `--check=warn` and `--check=block` still check, as does `oam check`;
+  `oam serve` no longer checks either. The bare form `oam x.ts` never checked.
+
 ### Fixed
 
 - **Buffer's string paths no longer encode into a temporary, and match node where they did not.**

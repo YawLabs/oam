@@ -17,10 +17,10 @@ cd "$work"
 failed=0
 
 echo
-echo "ACT 1 - the typed loop: oam run main.ts"
+echo "ACT 1 - the typed loop: oam run main.ts --check=warn"
 echo "  (a classic silent bug: a string in a number slot. Node runs it"
 echo "   silently. Bun runs it silently. Watch oam.)"
-"$oam" run main.ts || { failed=1; echo "unexpected: run should succeed (types warn)"; }
+"$oam" run main.ts --check=warn || { failed=1; echo "unexpected: run should succeed (types warn)"; }
 echo "  ^ executed instantly (wrong answer: 410), AND the type error surfaced."
 
 echo

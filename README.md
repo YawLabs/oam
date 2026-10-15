@@ -6,9 +6,10 @@
 
 oam is a JavaScript/TypeScript runtime built in Rust on V8, designed around three ideas:
 
-1. **Types-aware execution.** oam strips and runs TypeScript instantly (oxc), while a warm
-   TypeScript 7 (`tsgo`) sidecar streams full type diagnostics concurrently — never blocking
-   execution. Node strips without checking; Bun executes types-blind. oam closes the loop.
+1. **Types-aware execution.** oam strips and runs TypeScript instantly (oxc), and a warm
+   TypeScript 7 (`tsgo`) daemon checks it on demand: `oam check`, `oam run --check=warn` to
+   report type errors after the run, or `--check=block` to gate on them. Node strips without
+   checking; Bun executes types-blind. oam closes the loop.
 2. **Reliability with receipts.** Public conformance dashboards (Node's own test suite,
    WinterTC ECMA-429, WPT), soak farms, crash-rate telemetry, a behavior-change log on every
    release, and an LTS commitment. Claims come with reproducible numbers or they don't ship.
@@ -54,7 +55,7 @@ Node, Deno and Bun, and when to pick one of those instead), and
 variables).
 
 ```
-oam run hello.ts        # strip + execute instantly, types stream concurrently
+oam run hello.ts        # strip + execute instantly (add --check=warn for types)
 oam test                # *.test.ts in fresh isolates, ODIF output for agents
 oam check               # tsgo type-check with a warm daemon
 ```

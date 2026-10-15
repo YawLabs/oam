@@ -22,10 +22,10 @@ Push-Location $work
 $failed = $false
 
 Write-Host ""
-Write-Host "ACT 1 - the typed loop: oam run main.ts" -ForegroundColor Cyan
+Write-Host "ACT 1 - the typed loop: oam run main.ts --check=warn" -ForegroundColor Cyan
 Write-Host "  (the program carries a classic silent bug: a string in a number slot." -ForegroundColor DarkGray
 Write-Host "   Node runs it silently. Bun runs it silently. Watch oam.)" -ForegroundColor DarkGray
-& $OamBin run main.ts 2>&1 | ForEach-Object { Write-Host "  $_" }
+& $OamBin run main.ts --check=warn 2>&1 | ForEach-Object { Write-Host "  $_" }
 if ($LASTEXITCODE -ne 0) { $failed = $true; Write-Host "unexpected: run should succeed (types warn)" -ForegroundColor Red }
 Write-Host "  ^ executed instantly (wrong answer: 410), AND the type error surfaced." -ForegroundColor DarkGray
 
