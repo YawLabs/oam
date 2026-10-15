@@ -6991,8 +6991,13 @@ fn op_fs_watch_start(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Read, "fsWatchStart requires a path")
-    else {
+    let Some(path) = fs_path_arg(
+        scope,
+        &args,
+        0,
+        FsAccess::Read,
+        "fsWatchStart requires a path",
+    ) else {
         return;
     };
     let recursive = args.get(1).is_true();
@@ -7005,8 +7010,9 @@ fn op_fs_watch_start(
         }
         Err(oam_core::fs_watch::WatchStartError::LimitReached) => {
             let e = std::io::Error::from_raw_os_error(28);
-            let message =
-                format!("ENOSPC: System limit for number of file watchers reached, watch '{shown}'");
+            let message = format!(
+                "ENOSPC: System limit for number of file watchers reached, watch '{shown}'"
+            );
             throw_system_error(scope, "ENOSPC", &message, "watch", Some(&shown), &e);
         }
     }

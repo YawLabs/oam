@@ -203,7 +203,13 @@ fn failed(error: std::io::Error) -> OpOutcome {
     let code = crate::node_error_code(&error);
     let errno = crate::node_errno(code, &error);
     let reason = crate::node_error_reason(code, &error);
-    OpOutcome::node_failed_at(code, format!("{code}: {reason}, watch"), "watch", None, errno)
+    OpOutcome::node_failed_at(
+        code,
+        format!("{code}: {reason}, watch"),
+        "watch",
+        None,
+        errno,
+    )
 }
 
 /// The batch as one byte string: per event, one byte for the type (0
@@ -416,11 +422,23 @@ mod tests {
         let cases = [
             (EventKind::Create(CreateKind::File), Some(Rename)),
             (EventKind::Remove(RemoveKind::Any), Some(Rename)),
-            (EventKind::Modify(ModifyKind::Name(RenameMode::From)), Some(Rename)),
-            (EventKind::Modify(ModifyKind::Name(RenameMode::To)), Some(Rename)),
+            (
+                EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+                Some(Rename),
+            ),
+            (
+                EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+                Some(Rename),
+            ),
             (EventKind::Modify(ModifyKind::Name(RenameMode::Both)), None),
-            (EventKind::Modify(ModifyKind::Data(DataChange::Any)), Some(Change)),
-            (EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)), Some(Change)),
+            (
+                EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+                Some(Change),
+            ),
+            (
+                EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+                Some(Change),
+            ),
             (EventKind::Modify(ModifyKind::Any), Some(Change)),
             (EventKind::Access(AccessKind::Any), None),
             (EventKind::Other, None),
@@ -440,7 +458,10 @@ mod tests {
             EventKind::Create(CreateKind::File),
             &[&root.join("a.txt"), &nested],
         );
-        let want_nested = Path::new("sub").join("f.txt").to_string_lossy().into_owned();
+        let want_nested = Path::new("sub")
+            .join("f.txt")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             got,
             vec![
