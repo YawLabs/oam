@@ -1131,6 +1131,14 @@
     return param + " is not a valid Brotli parameter";
   });
   codes.ERR_ZLIB_INITIALIZATION_FAILED = E("ERR_ZLIB_INITIALIZATION_FAILED", Error, "Initialization failed");
+  // node: E('ERR_INVALID_FD', '"fd" must be a positive integer: %s',
+  // RangeError) -- a format string, so the value goes through util.format's
+  // %s (tty.ReadStream / tty.WriteStream, #391).
+  codes.ERR_INVALID_FD = E("ERR_INVALID_FD", RangeError, function(fd) {
+    return registry.get("util").format('"fd" must be a positive integer: %s', fd);
+  });
+  codes.ERR_INVALID_CURSOR_POS = E("ERR_INVALID_CURSOR_POS", TypeError,
+    "Cannot set cursor row without setting its column");
   codes.ERR_BUFFER_OUT_OF_BOUNDS = E("ERR_BUFFER_OUT_OF_BOUNDS", RangeError, function(name) {
     return name ? '"' + name + '" is outside of buffer bounds' : 'Attempt to access memory outside buffer bounds';
   });
@@ -1543,6 +1551,7 @@
     ERR_FS_CP_UNKNOWN: "Cannot copy an unknown file type",
     ERR_FS_EISDIR: "Path is a directory",
     ERR_SYSTEM_ERROR: "A system error occurred",
+    ERR_TTY_INIT_FAILED: "TTY initialization failed",
   };
   class SystemError extends Error {
     constructor(key, context) {
@@ -8361,34 +8370,150 @@
   //
   // process.env is re-read on every call so a test that flips NO_COLOR /
   // NODE_DISABLE_COLORS mid-run is honored.
-  function colorDepthFor(stream) {
-    const env = process.env;
-    // Node checks FORCE_COLOR first -- it wins over NO_COLOR.
+  //
+  // ttyGetColorDepth / ttyHasColors are node's internal/tty.js (v22.22.2),
+  // whole: tty.WriteStream.prototype carries them as getColorDepth and
+  // hasColors (#391). The stand-in they replace stopped at FORCE_COLOR /
+  // NO_COLOR and answered 4 for every terminal, so a Windows console -- 24
+  // in node, from the OS build -- said hasColors(256) === false, and TERM,
+  // COLORTERM, TMUX and the CI variables were never read.
+  const COLORS_2 = 1;
+  const COLORS_16 = 4;
+  const COLORS_256 = 8;
+  const COLORS_16m = 24;
+  const TERM_ENVS = {
+    "eterm": COLORS_16,
+    "cons25": COLORS_16,
+    "console": COLORS_16,
+    "cygwin": COLORS_16,
+    "dtterm": COLORS_16,
+    "gnome": COLORS_16,
+    "hurd": COLORS_16,
+    "jfbterm": COLORS_16,
+    "konsole": COLORS_16,
+    "kterm": COLORS_16,
+    "mlterm": COLORS_16,
+    "mosh": COLORS_16m,
+    "putty": COLORS_16,
+    "st": COLORS_16,
+    "rxvt-unicode-24bit": COLORS_16m,
+    "terminator": COLORS_16m,
+    "xterm-kitty": COLORS_16m,
+  };
+  const CI_ENVS_MAP = new Map(Object.entries({
+    APPVEYOR: COLORS_256,
+    BUILDKITE: COLORS_256,
+    CIRCLECI: COLORS_16m,
+    DRONE: COLORS_256,
+    GITEA_ACTIONS: COLORS_16m,
+    GITHUB_ACTIONS: COLORS_16m,
+    GITLAB_CI: COLORS_256,
+    TRAVIS: COLORS_256,
+  }));
+  const TERM_ENVS_REG_EXP = [
+    /ansi/, /color/, /linux/, /direct/, /^con[0-9]*x[0-9]/, /^rxvt/, /^screen/, /^xterm/, /^vt100/, /^vt220/,
+  ];
+  let colorWarned = false;
+  function warnOnDeactivatedColors(env) {
+    if (colorWarned) return;
+    let name = "";
+    if (env.NODE_DISABLE_COLORS !== undefined) name = "NODE_DISABLE_COLORS";
+    if (env.NO_COLOR !== undefined) {
+      if (name !== "") name += "' and '";
+      name += "NO_COLOR";
+    }
+    if (name !== "") {
+      process.emitWarning(`The '${name}' env is ignored due to the 'FORCE_COLOR' env being set.`, "Warning");
+      colorWarned = true;
+    }
+  }
+  let ttyOsRelease;
+  function ttyGetColorDepth(env = process.env) {
     if (env.FORCE_COLOR !== undefined) {
       switch (env.FORCE_COLOR) {
         case "":
         case "1":
         case "true":
-          return 4;
+          warnOnDeactivatedColors(env);
+          return COLORS_16;
         case "2":
-          return 8;
+          warnOnDeactivatedColors(env);
+          return COLORS_256;
         case "3":
-          return 24;
+          warnOnDeactivatedColors(env);
+          return COLORS_16m;
         default:
-          return 1;
+          return COLORS_2;
       }
     }
     if (env.NODE_DISABLE_COLORS !== undefined || env.NO_COLOR !== undefined || env.TERM === "dumb") {
-      return 1;
+      return COLORS_2;
     }
-    if (!stream || !stream.isTTY) return 1;
-    if (typeof stream.getColorDepth === "function") return stream.getColorDepth();
-    return 4;
+    if (process.platform === "win32") {
+      // Windows 10 build 10586 is the first with 256 colours, build 14931
+      // the first with 16m.
+      if (ttyOsRelease === undefined) ttyOsRelease = registry.get("os").release().split(".", 3);
+      if (+ttyOsRelease[0] >= 10) {
+        const build = +ttyOsRelease[2];
+        if (build >= 14931) return COLORS_16m;
+        if (build >= 10586) return COLORS_256;
+      }
+      return COLORS_16;
+    }
+    if (env.TMUX) return COLORS_16m;
+    // Azure DevOps
+    if (Object.hasOwn(env, "TF_BUILD") && Object.hasOwn(env, "AGENT_NAME")) return COLORS_16;
+    if (Object.hasOwn(env, "CI")) {
+      for (const { 0: envName, 1: colors } of CI_ENVS_MAP) {
+        if (Object.hasOwn(env, envName)) return colors;
+      }
+      if (env.CI_NAME === "codeship") return COLORS_256;
+      return COLORS_2;
+    }
+    if ("TEAMCITY_VERSION" in env) {
+      return /^(9\.(0*[1-9]\d*)\.|\d{2,}\.)/.exec(env.TEAMCITY_VERSION) !== null ? COLORS_16 : COLORS_2;
+    }
+    switch (env.TERM_PROGRAM) {
+      case "iTerm.app":
+        if (!env.TERM_PROGRAM_VERSION || /^[0-2]\./.exec(env.TERM_PROGRAM_VERSION) !== null) {
+          return COLORS_256;
+        }
+        return COLORS_16m;
+      case "HyperTerm":
+      case "MacTerm":
+        return COLORS_16m;
+      case "Apple_Terminal":
+        return COLORS_256;
+    }
+    if (env.COLORTERM === "truecolor" || env.COLORTERM === "24bit") return COLORS_16m;
+    if (env.TERM) {
+      if (/truecolor/.exec(env.TERM) !== null) return COLORS_16m;
+      if (/^xterm-256/.exec(env.TERM) !== null) return COLORS_256;
+      const termEnv = env.TERM.toLowerCase();
+      if (TERM_ENVS[termEnv]) return TERM_ENVS[termEnv];
+      if (TERM_ENVS_REG_EXP.some((term) => term.exec(termEnv) !== null)) return COLORS_16;
+    }
+    // 16-colour COLORTERM ranks below 16m and 256.
+    if (env.COLORTERM) return COLORS_16;
+    return COLORS_2;
+  }
+  function ttyHasColors(count, env) {
+    if (env === undefined && (count === undefined || (typeof count === "object" && count !== null))) {
+      env = count;
+      count = 16;
+    } else {
+      validateInteger(count, "count", 2);
+    }
+    return count <= 2 ** ttyGetColorDepth(env);
   }
 
+  // node's internal/util/colors shouldColorize, as written: FORCE_COLOR asks
+  // getColorDepth, otherwise a TTY stream colours unless its own
+  // getColorDepth says 2 colours or fewer.
   function shouldColorize(stream) {
-    if (process.env.FORCE_COLOR !== undefined) return colorDepthFor(stream) > 2;
-    return !!(stream && stream.isTTY) && colorDepthFor(stream) > 2;
+    if (process.env.FORCE_COLOR !== undefined) return ttyGetColorDepth() > 2;
+    return !!(stream && stream.isTTY) &&
+      (typeof stream.getColorDepth === "function" ? stream.getColorDepth() > 2 : true);
   }
 
   // --------------------------------------------------------------- assert
@@ -8408,7 +8533,7 @@
     const deepEqual = util._deepEqual;
 
     // ---- colors (port of node internal/util/colors.js) ----------------------
-    // colorDepthFor / shouldColorize are module scope now (search "colour
+    // ttyGetColorDepth / shouldColorize are module scope now (search "colour
     // capability" above) -- util.styleText and the tty WriteStream decorator
     // answer from the SAME pair, so the three surfaces cannot disagree.
     // Kept as an own property here because refresh() and node's own
@@ -15725,108 +15850,6 @@
     const stderrIsTTY = natives.isTTY(2);
     const stdinIsTTY = natives.isTTY(0);
 
-    // --- TTY surface (tty.WriteStream / tty.ReadStream) -----------------------
-    // columns/rows are LIVE getters over the native ttyGetWinSize op
-    // (GetConsoleScreenBufferInfo on Windows, TIOCGWINSZ ioctl on Unix) so they
-    // always reflect the real terminal. 'resize' fires via a lazy, UNREF'd poll
-    // that runs only while a 'resize' listener is attached -- mirrors Node
-    // starting/stopping its SIGWINCH watch on add/removeListener('resize'). The
-    // interval is unref'd so it never keeps the event loop alive (an unref'd
-    // interval still fires while the loop is otherwise alive but does not block
-    // exit -- both verified against node).
-    function decorateTtyWriteStream(stream, fd, isTTY) {
-      stream.fd = fd;
-      if (!isTTY) return stream; // non-TTY: plain Writable, no isTTY/columns (node parity)
-      stream.isTTY = true;
-      // node: hasColors([count][, env]) -> count <= 2 ** getColorDepth(),
-      // count defaulting to 16. This was hardcoded `() => true`, which
-      // claimed 16-colour support even under NO_COLOR / NODE_DISABLE_COLORS
-      // / TERM=dumb, and answered true for hasColors(2 ** 24) on a plain
-      // 4-bit terminal. Same colorDepthFor that assert's colours and
-      // util.styleText consult, so the three agree. isTTY is untouched --
-      // this stream IS a TTY, it just may not be allowed to colour.
-      stream.hasColors = (count) => {
-        const n = typeof count === "number" ? count : 16;
-        return n <= 2 ** colorDepthFor(stream);
-      };
-      const readSize = () => natives.ttyGetWinSize(fd);
-      Object.defineProperties(stream, {
-        columns: { configurable: true, enumerable: true, get() { const s = readSize(); return s ? s[0] : undefined; } },
-        rows: { configurable: true, enumerable: true, get() { const s = readSize(); return s ? s[1] : undefined; } },
-      });
-      stream.getWindowSize = () => { const s = readSize(); return s ? [s[0], s[1]] : [80, 24]; };
-      let poll = null, lastCols = -1, lastRows = -1;
-      const startPoll = () => {
-        if (poll) return;
-        const s = readSize();
-        if (s) { lastCols = s[0]; lastRows = s[1]; }
-        poll = setInterval(() => {
-          const cur = readSize();
-          if (!cur) return;
-          if (cur[0] !== lastCols || cur[1] !== lastRows) {
-            lastCols = cur[0]; lastRows = cur[1];
-            stream.emit("resize");
-          }
-        }, 250);
-        if (poll && typeof poll.unref === "function") poll.unref();
-      };
-      const stopPoll = () => {
-        if (poll && stream.listenerCount("resize") === 0) { clearInterval(poll); poll = null; }
-      };
-      stream.on("newListener", (ev) => { if (ev === "resize") startPoll(); });
-      stream.on("removeListener", (ev) => { if (ev === "resize") stopPoll(); });
-      return stream;
-    }
-
-    function decorateTtyReadStream(stream, fd, isTTY) {
-      stream.fd = fd;
-      if (!isTTY) return stream; // non-TTY stdin: no isTTY/setRawMode (node parity)
-      stream.isTTY = true;
-      stream.isRaw = false;
-      let exitHooked = false;
-      stream.setRawMode = function setRawMode(mode) {
-        const enable = !!mode;
-        // Native flips the console mode / termios. In raw mode line-buffering,
-        // echo and PROCESSED_INPUT/ISIG are OFF, so each keypress arrives as a
-        // stdin 'data' byte and Ctrl-C is delivered as 0x03 (no SIGINT) -- the
-        // signals-in item's console-ctrl handler naturally won't fire.
-        // 0 or the negative libuv errno, matching uv_tty_set_mode. Node's
-        // tty.ReadStream#setRawMode emits a failure as an 'error' event and
-        // leaves isRaw alone (lib/tty.js, v22.22.2), and the error is
-        // `new ErrnoException(err, 'setRawMode')`: code is
-        // util.getSystemErrorName(err), message is `setRawMode <code>`, and
-        // errno, code, syscall are set in that order. Swallowing it left the
-        // program believing it was raw.
-        const rawErrno = natives.ttySetRawMode(fd, enable);
-        if (rawErrno !== 0) {
-          // getSystemErrorName's lookup and its unmapped-errno fallback.
-          const entry = uvErrnoTable(natives).get(rawErrno);
-          const code = entry === undefined ? "Unknown system error " + rawErrno : entry[0];
-          const err = new Error(`setRawMode ${code}`);
-          err.errno = rawErrno;
-          err.code = code;
-          err.syscall = "setRawMode";
-          stream.emit("error", err);
-          return stream;
-        }
-        stream.isRaw = enable;
-        // Restore cooked mode on graceful exit so the shell isn't left raw
-        // (Node restores internally). The exits that never emit 'exit' -- the
-        // stdout/stderr EPIPE bails, the OOM banner, a fatal sub-code, a
-        // re-raised signal -- are covered by the runtime's own exit hook
-        // instead. A true hard kill (SIGKILL) still cannot be.
-        if (enable && !exitHooked) {
-          exitHooked = true;
-          // Native-side is idempotent (a disable with nothing saved is a
-          // no-op), and the runtime arms its own hook for the exits that
-          // never emit 'exit' at all -- see arm_tty_restore_hook.
-          process.on("exit", () => { if (stream.isRaw) natives.ttySetRawMode(fd, false); });
-        }
-        return stream;
-      };
-      return stream;
-    }
-
     // argv is LAZY: the embedder declares it (entry path + script args)
     // after this module instantiates, so the first script-time access must
     // read the native, not a construction-time copy.
@@ -16869,23 +16892,47 @@
         cb(err);
         this._undestroy();
       }
-      lazyStdio("stdout", () => {
+      // On a terminal, stdout and stderr are node's tty.WriteStream and stdin
+      // its tty.ReadStream (#391) -- `process.stdout instanceof
+      // tty.WriteStream` holds as in node, and the terminal surface (isTTY,
+      // columns, getColorDepth, cursorTo...) is the class's. Otherwise stdout
+      // and stderr stay the Writable over the stdio op, without that surface,
+      // as node's pipe and file streams are.
+      const ttyStdioStream = (name, fd) => {
+        // Loading the module is what installs registry._ttyStdio.
+        const Ctor = registry.get("tty")[name];
+        return registry._ttyStdio(Ctor, fd);
+      };
+      const stdioWritable = (fd, isTTY, write) => {
+        let stream;
+        if (isTTY) {
+          // createWritableStdioStream + getStdout: dummyDestroy, and
+          // destroySoon is destroy.
+          stream = ttyStdioStream("WriteStream", fd);
+          stream._type = "tty";
+          stream.fd = fd;
+          stream._isStdio = true;
+          stream.destroySoon = stream.destroy;
+          stream._destroy = stdioDestroy;
+          return stream;
+        }
         const { Writable } = registry.get("stream");
-        return decorateTtyWriteStream(new Writable({
-          write(chunk, _enc, cb) { cb(ctxOrderError(natives.stdoutWrite(chunk))); },
-          destroy: stdioDestroy,
-          decodeStrings: false,
-        }), 1, stdoutIsTTY);
-      });
-      lazyStdio("stderr", () => {
-        const { Writable } = registry.get("stream");
-        return decorateTtyWriteStream(new Writable({
-          write(chunk, _enc, cb) { cb(ctxOrderError(natives.stderrWrite(chunk))); },
-          destroy: stdioDestroy,
-          decodeStrings: false,
-        }), 2, stderrIsTTY);
-      });
+        stream = new Writable({ write, destroy: stdioDestroy, decodeStrings: false });
+        stream.fd = fd;
+        return stream;
+      };
+      lazyStdio("stdout", () => stdioWritable(1, stdoutIsTTY, (chunk, _enc, cb) => {
+        cb(ctxOrderError(natives.stdoutWrite(chunk)));
+      }));
+      lazyStdio("stderr", () => stdioWritable(2, stderrIsTTY, (chunk, _enc, cb) => {
+        cb(ctxOrderError(natives.stderrWrite(chunk)));
+      }));
       lazyStdio("stdin", () => {
+        if (stdinIsTTY) {
+          const stdin = ttyStdioStream("ReadStream", 0);
+          stdin.fd = 0;
+          return stdin;
+        }
         const { Readable } = registry.get("stream");
         // What EOF does depends on what fd 0 is, because node builds stdin's
         // class from it (getStdin, lib/internal/bootstrap/switches/
@@ -16938,7 +16985,8 @@
           natives.stdinSetRef(true);
           return this;
         };
-        return decorateTtyReadStream(stdin, 0, stdinIsTTY);
+        stdin.fd = 0;
+        return stdin;
       });
     }
 
@@ -32052,11 +32100,318 @@
   };
 
   // ------------------------------------------------------------------ tty
-  registry.factories.tty = (natives) => ({
-    isatty: (fd) => natives.isTTY(Number(fd)),
-    ReadStream: class ReadStream {},
-    WriteStream: class WriteStream {},
-  });
+  // node's lib/tty.js (v22.22.2). ReadStream and WriteStream were empty
+  // stub classes: they constructed over any descriptor, had none of the
+  // stream or terminal surface, and process.stdout / process.stdin were not
+  // instances of them (#391). They are node's constructors now -- callable
+  // without `new`, ERR_INVALID_FD for a descriptor that is no int32 >= 0,
+  // ERR_TTY_INIT_FAILED for one uv_tty_init refuses -- and the stdio streams
+  // on a terminal are built by them.
+  //
+  // node's are net.Socket subclasses over a libuv TTY handle. oam's
+  // net.Socket is a hand-rolled EventEmitter over the tcp natives, so these
+  // are stream.Duplex underneath, with the I/O on the stdio ops (0-2) or the
+  // descriptor table (above 2), and answer `instanceof net.Socket` by the
+  // same brand TLSSocket does (#132). docs/node-divergences.md has the rest.
+  registry.factories.tty = (natives) => {
+    const { Duplex } = registry.get("stream");
+    const kNetSocketLike = Symbol.for("oam.netSocketLike");
+    const isWindows = natives.platform === "win32";
+    let readline;
+    // The descriptor a stream was made over, for setRawMode and the size
+    // reads (`fd` is a public property node's stdio adds, and a program's to
+    // change), and the last size read, for 'resize'.
+    const kTtyFd = Symbol("kTtyFd");
+    const kLastSize = Symbol("kLastSize");
+    // process.stdin / stdout / stderr on a terminal are built by these
+    // constructors, as node's getStdin / createWritableStdioStream build
+    // them, once the runtime has already seen the descriptor is a terminal:
+    // that build skips the uv_tty_init question, so a stdio getter can never
+    // throw it.
+    let stdioBuild = false;
+    registry._ttyStdio = (Ctor, fd) => {
+      stdioBuild = true;
+      try {
+        return new Ctor(fd);
+      } finally {
+        stdioBuild = false;
+      }
+    };
+
+    function isatty(fd) {
+      return Number.isInteger(fd) && fd >= 0 && fd <= 2147483647 && natives.isTTY(fd);
+    }
+
+    // `new TTY(fd, ctx)` + `throw new ERR_TTY_INIT_FAILED(ctx)`: the context
+    // is uv_tty_init's error in node's key order.
+    function ttyInit(fd) {
+      const errno = natives.ttyInit(fd);
+      if (errno === 0) return;
+      const entry = uvErrnoTable(natives).get(errno);
+      throw systemErrorWithCode("ERR_TTY_INIT_FAILED", {
+        errno,
+        code: entry === undefined ? "UNKNOWN" : entry[0],
+        message: entry === undefined ? "unknown error" : entry[1],
+        syscall: "uv_tty_init",
+      });
+    }
+
+    function uvErrno(code) {
+      for (const [errno, entry] of uvErrnoTable(natives)) if (entry[0] === code) return errno;
+      return -1;
+    }
+
+    // node's ErrnoException(err, syscall): code is the errno's name, message
+    // `${syscall} ${code}`, and errno, code, syscall set in that order.
+    function errnoException(errno, syscall) {
+      const entry = uvErrnoTable(natives).get(errno);
+      const code = entry === undefined ? "Unknown system error " + errno : entry[0];
+      const err = new Error(`${syscall} ${code}`);
+      err.errno = errno;
+      err.code = code;
+      err.syscall = syscall;
+      return err;
+    }
+
+    // A write goes out whole before its callback, as node's terminal writes
+    // do (`this._handle.setBlocking(true)` in WriteStream). 1 and 2 take the
+    // stdio ops, which on a console write UTF-16; any other descriptor
+    // writes through the table.
+    function writeTo(fd, chunk) {
+      if (fd === 1) return ctxOrderError(natives.stdoutWrite(chunk));
+      if (fd === 2) return ctxOrderError(natives.stderrWrite(chunk));
+      try {
+        const fs = registry.get("fs");
+        const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+        let done = 0;
+        while (done < bytes.length) done += fs.writeSync(fd, bytes, done, bytes.length - done);
+        return undefined;
+      } catch (err) {
+        return err;
+      }
+    }
+
+    // [columns, rows], or null where node's getWindowSize fails. The native
+    // reads the std handles on Windows, so a console the program opened by
+    // name has no size there.
+    function windowSize(fd) {
+      if (isWindows && fd > 2) return null;
+      return natives.ttyGetWinSize(fd) ?? null;
+    }
+
+    // Reading. Descriptor 0 is the stdin reader process.stdin has always
+    // used (a blocking read it can stop counting toward the event loop); any
+    // other descriptor reads through the table.
+    function readFrom(stream, fd) {
+      if (fd === 0) {
+        natives.stdinRead().then(
+          (chunk) => {
+            if (chunk === undefined || chunk === null || chunk.length === 0) stream.push(null);
+            else stream.push(Buffer.from(chunk));
+          },
+          () => stream.push(null),
+        );
+        return;
+      }
+      const buf = Buffer.allocUnsafe(65536);
+      registry.get("fs").read(fd, buf, 0, buf.length, null, (err, n) => {
+        if (err) stream.destroy(err);
+        else stream.push(n === 0 ? null : buf.subarray(0, n));
+      });
+    }
+
+    // The options net.Socket forces on its Duplex (lib/net.js): half-open
+    // off unless asked for, autoDestroy on, strings written as they are.
+    function socketOptions(fd, options, readable) {
+      return {
+        readableHighWaterMark: 0,
+        ...options,
+        allowHalfOpen: Boolean(options && options.allowHalfOpen),
+        autoDestroy: true,
+        decodeStrings: false,
+        read() {
+          // A WriteStream's handle is never read from: node's starts with
+          // manualStart and nothing on a terminal's output side asks.
+          if (readable) readFrom(this, fd);
+        },
+        write(chunk, _encoding, cb) {
+          cb(writeTo(fd, chunk));
+        },
+        // Socket._final shuts the handle down and finishes from the
+        // shutdown's callback, so 'prefinish' comes after end() returns.
+        final(cb) {
+          process.nextTick(cb);
+        },
+        destroy(err, cb) {
+          // Destroying stdin closes its handle in node, so the process stops
+          // waiting on it. The blocking read cannot be cancelled; it just
+          // stops counting toward the event loop.
+          if (fd === 0) natives.stdinSetRef(false);
+          cb(err);
+        },
+      };
+    }
+
+    // `net.Socket.call(this, ...)`: the public own properties a Socket over a
+    // handle starts with, in node's order (connecting, allowHalfOpen -- the
+    // Duplex's -- then server), and Socket's ref() / unref(), which for
+    // descriptor 0 are the stdin read's hold on the event loop. Both return
+    // the stream.
+    function socketInit(stream, fd, options, readable) {
+      stream.connecting = false;
+      Duplex.call(stream, socketOptions(fd, options, readable));
+      stream.server = null;
+      Object.defineProperty(stream, kTtyFd, { value: fd });
+      // Not enumerable: node's live on Socket.prototype, out of Object.keys.
+      Object.defineProperties(stream, {
+        ref: {
+          configurable: true,
+          writable: true,
+          value: function ref() {
+            if (fd === 0) natives.stdinSetRef(true);
+            return this;
+          },
+        },
+        unref: {
+          configurable: true,
+          writable: true,
+          value: function unref() {
+            if (fd === 0) natives.stdinSetRef(false);
+            return this;
+          },
+        },
+      });
+    }
+
+    function ReadStream(fd, options) {
+      if (!(this instanceof ReadStream)) return new ReadStream(fd, options);
+      if (fd >> 0 !== fd || fd < 0) throw new codes.ERR_INVALID_FD(fd);
+      if (!stdioBuild) ttyInit(fd);
+      socketInit(this, fd, options, true);
+      this.isRaw = false;
+      this.isTTY = true;
+    }
+    Object.setPrototypeOf(ReadStream.prototype, Duplex.prototype);
+    Object.setPrototypeOf(ReadStream, Duplex);
+    Object.defineProperty(ReadStream.prototype, kNetSocketLike, { value: true });
+
+    const rawExitHooked = new WeakSet();
+    ReadStream.prototype.setRawMode = function (flag) {
+      flag = !!flag;
+      const fd = this[kTtyFd];
+      // The native switches the console / termios behind descriptor 0, the
+      // one the stdin reader serves; another descriptor is refused with
+      // ENOTSUP rather than flipping the wrong handle.
+      // 0 or the negative libuv errno, as uv_tty_set_mode answers. node
+      // emits a failure as 'error' (ErrnoException(err, 'setRawMode')) and
+      // leaves isRaw alone.
+      const err = fd === 0 ? natives.ttySetRawMode(0, flag) : uvErrno("ENOTSUP");
+      if (err) {
+        this.emit("error", errnoException(err, "setRawMode"));
+        return this;
+      }
+      this.isRaw = flag;
+      // Restore cooked mode on a graceful exit so the shell is not left raw
+      // (node restores in ResetStdio). The exits that never emit 'exit' --
+      // the stdout/stderr EPIPE bails, the OOM banner, a fatal sub-code, a
+      // re-raised signal -- are the runtime's own exit hook's
+      // (arm_tty_restore_hook). Native-side the disable is idempotent.
+      if (flag && !rawExitHooked.has(this)) {
+        rawExitHooked.add(this);
+        const stream = this;
+        process.on("exit", () => { if (stream.isRaw) natives.ttySetRawMode(0, false); });
+      }
+      return this;
+    };
+
+    function WriteStream(fd) {
+      if (!(this instanceof WriteStream)) return new WriteStream(fd);
+      if (fd >> 0 !== fd || fd < 0) throw new codes.ERR_INVALID_FD(fd);
+      if (!stdioBuild) ttyInit(fd);
+      socketInit(this, fd, undefined, false);
+      // columns / rows are set when the size can be read, as node's are.
+      // Here they are live reads of the terminal, where node's are data
+      // properties its SIGWINCH handler refreshes: oam has no SIGWINCH, and a
+      // copy taken here would go stale on the first resize. Assigning one
+      // makes it a plain data property, as it is in node.
+      const size = windowSize(fd);
+      if (size !== null) {
+        this[kLastSize] = size;
+        for (const [name, index] of [["columns", 0], ["rows", 1]]) {
+          Object.defineProperty(this, name, {
+            configurable: true,
+            enumerable: true,
+            get() {
+              const now = windowSize(fd);
+              return (now ?? this[kLastSize])[index];
+            },
+            set(value) {
+              Object.defineProperty(this, name, { value, writable: true, enumerable: true, configurable: true });
+            },
+          });
+        }
+        // 'resize' fires from an unref'd poll that runs only while a
+        // 'resize' listener is attached -- node starts and stops its SIGWINCH
+        // watch the same way. Unref'd, it never keeps the loop alive.
+        let poll = null;
+        this.on("newListener", (ev) => {
+          if (ev !== "resize" || poll !== null) return;
+          this[kLastSize] = windowSize(fd) ?? this[kLastSize];
+          poll = setInterval(() => this._refreshSize(), 250);
+          poll.unref();
+        });
+        this.on("removeListener", (ev) => {
+          if (ev === "resize" && poll !== null && this.listenerCount("resize") === 0) {
+            clearInterval(poll);
+            poll = null;
+          }
+        });
+      }
+    }
+    Object.setPrototypeOf(WriteStream.prototype, Duplex.prototype);
+    Object.setPrototypeOf(WriteStream, Duplex);
+    Object.defineProperty(WriteStream.prototype, kNetSocketLike, { value: true });
+
+    WriteStream.prototype.isTTY = true;
+    WriteStream.prototype.getColorDepth = function getColorDepth(env = process.env) {
+      return ttyGetColorDepth(env);
+    };
+    WriteStream.prototype.hasColors = function hasColors(count, env) {
+      return ttyHasColors(count, env);
+    };
+    WriteStream.prototype._refreshSize = function () {
+      const old = this[kLastSize];
+      const now = windowSize(this[kTtyFd]);
+      if (now === null) {
+        this.emit("error", errnoException(uvErrno("EBADF"), "getWindowSize"));
+        return;
+      }
+      this[kLastSize] = now;
+      if (old === undefined || old[0] !== now[0] || old[1] !== now[1]) this.emit("resize");
+    };
+    // Backwards-compat
+    WriteStream.prototype.cursorTo = function (x, y, callback) {
+      if (readline === undefined) readline = registry.get("readline");
+      return readline.cursorTo(this, x, y, callback);
+    };
+    WriteStream.prototype.moveCursor = function (dx, dy, callback) {
+      if (readline === undefined) readline = registry.get("readline");
+      return readline.moveCursor(this, dx, dy, callback);
+    };
+    WriteStream.prototype.clearLine = function (dir, callback) {
+      if (readline === undefined) readline = registry.get("readline");
+      return readline.clearLine(this, dir, callback);
+    };
+    WriteStream.prototype.clearScreenDown = function (callback) {
+      if (readline === undefined) readline = registry.get("readline");
+      return readline.clearScreenDown(this, callback);
+    };
+    WriteStream.prototype.getWindowSize = function () {
+      return [this.columns, this.rows];
+    };
+
+    return { isatty, ReadStream, WriteStream };
+  };
 
   // --------------------------------------------------------------- buffer
   registry.factories.buffer = () => {
@@ -33121,54 +33476,62 @@
       if (input && typeof input.on === "function") return new Interface({ input, output });
       return new Interface(input || {});
     }
-    function clearLine(stream, dir, cb) {
-      if (!stream || typeof stream.write !== "function") {
-        if (typeof cb === "function") queueMicrotask(cb);
-        return false;
+    // clearLine, clearScreenDown, cursorTo and moveCursor are node's
+    // internal/readline/callbacks.js (v22.22.2), which tty.WriteStream's
+    // methods of the same names delegate to (#391). oam's returned no value
+    // from clearScreenDown, wrote a two-axis move as two writes, never handed
+    // the callback to the write -- it ran on a microtask whether or not the
+    // data went out -- and validated nothing.
+    const validateCallback = (callback) => {
+      if (callback !== undefined && typeof callback !== "function") {
+        throw new codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
       }
-      if (dir === -1) {
-        stream.write("\x1b[1K");
-      } else if (dir === 1) {
-        stream.write("\x1b[0K");
-      } else {
-        stream.write("\x1b[2K");
+    };
+    function clearLine(stream, dir, callback) {
+      validateCallback(callback);
+      if (stream === null || stream === undefined) {
+        if (typeof callback === "function") process.nextTick(callback, null);
+        return true;
       }
-      if (typeof cb === "function") queueMicrotask(cb);
-      return true;
+      const type = dir < 0 ? "\x1b[1K" : dir > 0 ? "\x1b[0K" : "\x1b[2K";
+      return stream.write(type, callback);
     }
-    function clearScreenDown(stream, cb) {
-      if (stream && typeof stream.write === "function") {
-        stream.write("\x1b[0J");
+    function clearScreenDown(stream, callback) {
+      validateCallback(callback);
+      if (stream === null || stream === undefined) {
+        if (typeof callback === "function") process.nextTick(callback, null);
+        return true;
       }
-      if (typeof cb === "function") queueMicrotask(cb);
+      return stream.write("\x1b[0J", callback);
     }
-    function cursorTo(stream, x, y, cb) {
-      if (typeof y === "function") { cb = y; y = undefined; }
-      if (stream && typeof stream.write === "function") {
-        if (typeof x === "number") {
-          if (typeof y === "number") {
-            stream.write("\x1b[" + (y + 1) + ";" + (x + 1) + "H");
-          } else {
-            stream.write("\x1b[" + (x + 1) + "G");
-          }
-        }
+    function cursorTo(stream, x, y, callback) {
+      validateCallback(callback);
+      if (typeof y === "function") {
+        callback = y;
+        y = undefined;
       }
-      if (typeof cb === "function") queueMicrotask(cb);
-      return true;
+      if (Number.isNaN(x)) throw new codes.ERR_INVALID_ARG_VALUE("x", x);
+      if (Number.isNaN(y)) throw new codes.ERR_INVALID_ARG_VALUE("y", y);
+      if (stream == null || (typeof x !== "number" && typeof y !== "number")) {
+        if (typeof callback === "function") process.nextTick(callback, null);
+        return true;
+      }
+      if (typeof x !== "number") throw new codes.ERR_INVALID_CURSOR_POS();
+      const data = typeof y !== "number" ? `\x1b[${x + 1}G` : `\x1b[${y + 1};${x + 1}H`;
+      return stream.write(data, callback);
     }
-    function moveCursor(stream, dx, dy, cb) {
-      if (stream && typeof stream.write === "function") {
-        if (dx !== 0 && typeof dx === "number") {
-          if (dx > 0) stream.write("\x1b[" + dx + "C");
-          else stream.write("\x1b[" + (-dx) + "D");
-        }
-        if (dy !== 0 && typeof dy === "number") {
-          if (dy > 0) stream.write("\x1b[" + dy + "B");
-          else stream.write("\x1b[" + (-dy) + "A");
-        }
+    function moveCursor(stream, dx, dy, callback) {
+      validateCallback(callback);
+      if (stream == null || !(dx || dy)) {
+        if (typeof callback === "function") process.nextTick(callback, null);
+        return true;
       }
-      if (typeof cb === "function") queueMicrotask(cb);
-      return true;
+      let data = "";
+      if (dx < 0) data += `\x1b[${-dx}D`;
+      else if (dx > 0) data += `\x1b[${dx}C`;
+      if (dy < 0) data += `\x1b[${-dy}A`;
+      else if (dy > 0) data += `\x1b[${dy}B`;
+      return stream.write(data, callback);
     }
     function emitKeypressEvents() {}
     return {

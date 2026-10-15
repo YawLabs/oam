@@ -491,7 +491,7 @@ pub fn stdin_handle_type() -> HandleType {
 /// `IsTerminal`, the one `process.stdin.isTTY` already reports, so the two
 /// can never disagree.
 #[cfg(windows)]
-fn guess_handle<H>(handle: &H) -> HandleType
+pub fn guess_handle<H>(handle: &H) -> HandleType
 where
     H: std::os::windows::io::AsRawHandle + std::io::IsTerminal,
 {
@@ -513,7 +513,7 @@ where
 /// spawns, so every socket is a PIPE here. An fd `fstat` fails on (closed)
 /// is UNKNOWN, as are directories and block devices.
 #[cfg(unix)]
-fn guess_handle<H>(handle: &H) -> HandleType
+pub fn guess_handle<H>(handle: &H) -> HandleType
 where
     H: std::os::fd::AsFd + std::io::IsTerminal,
 {

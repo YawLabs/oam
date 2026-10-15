@@ -150,6 +150,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("stdoutWrite", op_stdout_write),
         ("stderrWrite", op_stderr_write),
         ("isTTY", op_is_tty),
+        ("ttyInit", op_tty_init),
         // TTY raw-mode + window-size for interactive TUIs (process.stdin/stdout).
         ("ttySetRawMode", op_tty_set_raw_mode),
         ("ttyGetWinSize", op_tty_get_win_size),
@@ -1857,9 +1858,63 @@ fn op_is_tty(
         0 => std::io::stdin().is_terminal(),
         1 => std::io::stdout().is_terminal(),
         2 => std::io::stderr().is_terminal(),
+        // node's isatty is uv_guess_handle(fd) == UV_TTY for ANY descriptor:
+        // a terminal the program opened itself (`/dev/tty`, `\\.\CONOUT$`)
+        // is one too. Every descriptor above 2 used to answer false (#391).
+        fd if fd > 2 => {
+            let files = core_runtime!(scope).sync_files();
+            oam_core::registered_file(&files, fd as u64).is_some_and(|file| file.is_terminal())
+        }
         _ => false,
     };
     rv.set_bool(is_tty);
+}
+
+/// `__oam.node.ttyInit(fd) -> 0 | negative libuv errno`: libuv's
+/// `uv_tty_init` verdict on `fd`, which is what node's `tty.ReadStream` and
+/// `tty.WriteStream` constructors ask before anything else and turn into
+/// `ERR_TTY_INIT_FAILED` (#391). The handle is never kept: the JS stream does
+/// its I/O through the stdio ops (0-2) or the descriptor table (above 2).
+fn op_tty_init(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).int32_value(scope).unwrap_or(-1);
+    let file = if fd < 0 {
+        None
+    } else {
+        let files = core_runtime!(scope).sync_files();
+        oam_core::registered_file(&files, fd as u64)
+    };
+    rv.set_int32(tty_init_verdict(file.as_deref()));
+}
+
+/// `uv_tty_init` (src/win/tty.c): a descriptor with no OS handle is EBADF,
+/// and a handle that is no console fails `GetConsoleScreenBufferInfo` with
+/// ERROR_INVALID_HANDLE, which is EBADF too. Measured under node v22.22.2: an
+/// unopened descriptor, a disk file and a pipe all answer EBADF.
+#[cfg(windows)]
+fn tty_init_verdict(file: Option<&std::fs::File>) -> i32 {
+    use oam_core::stdin::{HandleType, guess_handle};
+    match file {
+        Some(file) if guess_handle(file) == HandleType::Tty => 0,
+        _ => -4083,
+    }
+}
+
+/// `uv_tty_init` (src/unix/tty.c) refuses with EINVAL whatever
+/// `uv_guess_handle` calls UV_FILE or UV_UNKNOWN_HANDLE -- a regular file, a
+/// character device that is not a terminal, and a descriptor that is not open
+/// (its fstat fails) -- and takes a terminal, a pipe or a socket. node's
+/// test-ttywrap-invalid-fd pins the EINVAL for an unopened descriptor.
+#[cfg(unix)]
+fn tty_init_verdict(file: Option<&std::fs::File>) -> i32 {
+    use oam_core::stdin::{HandleType, guess_handle};
+    match file.map(guess_handle) {
+        Some(HandleType::Tty | HandleType::Pipe) => 0,
+        _ => -libc::EINVAL,
+    }
 }
 
 // ============================================================ tty raw-mode
