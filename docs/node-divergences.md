@@ -3707,6 +3707,29 @@ what is left:
   `create_dir` lengthens such paths itself. Refusing a path the file system accepts was not
   worth reproducing.
 
+### `fs.Dir`: what still differs
+
+`opendirSync`, `fs.opendir` and `fs/promises.opendir` follow node v22.22.2's
+`lib/internal/fs/dir.js`: entries handed out `bufferSize` at a time, `recursive` walking in
+node's order (breadth first while a directory fits in one chunk, interleaved past that), each
+Dirent's own `parentPath`, the open of a vanished subdirectory failing its read with
+`opendir` and the path, the read queue with `ERR_DIR_CONCURRENT_OPERATION`, and `for await` /
+`entries()` closing the handle (`conformance/cases/414-*`; up to 0.19.1 `recursive` listed the
+top level only, #286). Measured on Windows, what is left:
+
+- **A directory is listed when it is opened, not as it is read.** node reads through a
+  `uv_dir_t` handle chunk by chunk, so a file created after `opendirSync` and before the first
+  read is listed there (measured); oam takes the top directory's entries at the open, and a
+  subdirectory's when its Dirent is handed out, so that file is not. The order and the
+  chunking are node's; only what changed in between differs.
+- **`encoding` is checked but not applied**: names are strings, where `encoding: 'buffer'`
+  gives node Buffers (and `'hex'` hex strings). `readdir` shares this.
+- **A read that has to list the top directory completes in the check phase** (as a
+  `setImmediate` does), where node's completes in the poll phase. The order of the reads, the
+  queue behind them and the next-tick delivery of a buffered entry are node's.
+- **A Dir is also sync-iterable** (`for (const d of dir)`), an extra node does not have, kept
+  from before the class and pinned by the e2e test `dir_sync_iterator_is_an_intentional_oam_extra`.
+
 ### Windows: `require` of a `\\?\` or `\\.\` spelling of a module loads it
 
 node's `fs` and module loader hand the OS every path through `path.toNamespacedPath`:
