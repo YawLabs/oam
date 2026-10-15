@@ -144,6 +144,7 @@ fn oam_command(args: &[&str]) -> std::process::Command {
         // .node addons), which is OFF by default in production -- opt in here.
         .env("OAM_ENABLE_NATIVE_ADDONS", "1")
         .env("OAM_CACHE_DIR", cache)
+        .without_ambient_compile_cache()
         .env("OAM_DAEMON_IDLE_MS", "45000")
         // Warn-mode `oam run` waits this long for the checker after the
         // program exits (default 10s). Under the full-parallel suite a cold
@@ -29159,6 +29160,7 @@ fn compile_embeds_bytecode_consumed_without_disk_cache() {
     ));
     let run_out = std::process::Command::new(&output)
         .env("OAM_CACHE_DIR", &run_cache)
+        .without_ambient_compile_cache()
         .output()
         .expect("compiled binary runs");
     let _ = std::fs::remove_file(&output);
@@ -31937,6 +31939,24 @@ fn install_precompile_esm_ts_cache_used_on_run() {
 
 // ── B3: V8 bytecode code-cache ───────────────────────────────────────────
 
+/// Removes the compile-cache switches a developer's shell may export --
+/// node users often set `NODE_COMPILE_CACHE` globally -- from a command
+/// whose test decides the cache on its own. `NODE_COMPILE_CACHE` outranks
+/// `OAM_CACHE_DIR`, and the other two turn the cache off, so an inherited
+/// one made every test that counts blobs under `<OAM_CACHE_DIR>/bytecode`
+/// find none.
+trait WithoutAmbientCompileCache {
+    fn without_ambient_compile_cache(&mut self) -> &mut Self;
+}
+
+impl WithoutAmbientCompileCache for std::process::Command {
+    fn without_ambient_compile_cache(&mut self) -> &mut Self {
+        self.env_remove("NODE_COMPILE_CACHE")
+            .env_remove("NODE_DISABLE_COMPILE_CACHE")
+            .env_remove("OAM_CODE_CACHE")
+    }
+}
+
 /// Recursively count `.v8c` bytecode-cache blobs under `dir`.
 fn count_v8c(dir: &std::path::Path) -> usize {
     let mut n = 0;
@@ -31983,6 +32003,7 @@ fn cjs_bytecode_cache_produced_and_reused() {
             .args(["run", entry.to_str().unwrap()])
             .current_dir(&project_dir)
             .env("OAM_CACHE_DIR", &cache)
+            .without_ambient_compile_cache()
             .output()
             .expect("oam binary runs")
     };
@@ -32058,6 +32079,7 @@ fn esm_bytecode_cache_produced_and_reused() {
             .args(["run", entry.to_str().unwrap()])
             .current_dir(&project_dir)
             .env("OAM_CACHE_DIR", &cache)
+            .without_ambient_compile_cache()
             .output()
             .expect("oam binary runs")
     };
@@ -32143,6 +32165,7 @@ fn code_cache_opt_out_disables_produce() {
         .args(["run", entry.to_str().unwrap()])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", &cache)
+        .without_ambient_compile_cache()
         .env("OAM_CODE_CACHE", "0")
         .output()
         .expect("oam binary runs");
@@ -32209,21 +32232,38 @@ fn run_compile_cache(
         cmd.arg("--");
         cmd.args(args);
     }
-    cmd.current_dir(cwd)
-        .env_remove("OAM_CODE_CACHE")
-        .env_remove("NODE_COMPILE_CACHE")
-        .env_remove("NODE_DISABLE_COMPILE_CACHE");
+    cmd.current_dir(cwd).without_ambient_compile_cache();
     for (k, v) in envs {
         cmd.env(k, v);
     }
     cmd.output().expect("oam binary runs")
 }
 
+/// Every `.v8c` blob under `dir` with its mtime: equal snapshots before and
+/// after a run mean the run neither added nor rewrote an entry.
+fn v8c_mtimes(
+    dir: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, std::time::SystemTime> {
+    let mut blobs = Vec::new();
+    collect_v8c(dir, &mut blobs);
+    blobs
+        .into_iter()
+        .map(|p| {
+            let mtime = std::fs::metadata(&p).unwrap().modified().unwrap();
+            (p, mtime)
+        })
+        .collect()
+}
+
 // node's compile-cache API: module.enableCompileCache(dir) moves the
 // bytecode cache into <dir>/oam-v<ver>-<arch>-<v8 tag> for everything
 // compiled after the call -- CJS (require) and ESM (import()) alike -- and
-// the warm run prints exactly what the cold one did. The entry itself was
-// compiled before the call, so it stays in the default root, as in node.
+// the warm run prints exactly what the cold one did. The entry was looked
+// up before the call. node never caches it; oam stores it in the root that
+// lookup used (the default root), where the next run finds it. Storing it
+// under the root current at store time (the named one) made every run
+// miss, recompile and rewrite it, so the warm run must leave every blob in
+// both roots untouched.
 #[test]
 fn compile_cache_enable_dir_holds_the_blobs() {
     let project = compile_cache_scratch("cc-enable");
@@ -32260,6 +32300,12 @@ fn compile_cache_enable_dir_holds_the_blobs() {
         "lib.cjs and lib.mjs are cached in the named dir; found {}",
         count_v8c(&dirs[0])
     );
+    assert!(
+        count_v8c(&oam_cache) >= 1,
+        "main.cjs is cached in the default root, where it was looked up"
+    );
+    let named_before = v8c_mtimes(&named);
+    let default_before = v8c_mtimes(&oam_cache);
 
     let warm = run_compile_cache(&project, &entry, &[&named], &envs);
     assert!(
@@ -32270,6 +32316,196 @@ fn compile_cache_enable_dir_holds_the_blobs() {
     assert_eq!(
         warm.stdout, cold.stdout,
         "the warm run prints what the cold one did"
+    );
+    assert_eq!(
+        v8c_mtimes(&named),
+        named_before,
+        "a warm run adds and rewrites nothing in the named dir"
+    );
+    assert_eq!(
+        v8c_mtimes(&oam_cache),
+        default_before,
+        "a warm run adds and rewrites nothing in the default root"
+    );
+    let _ = std::fs::remove_dir_all(&project);
+}
+
+// The ESM shape of the test above: an entry whose static imports were all
+// looked up before its body calls enableCompileCache(dir). Their blobs are
+// produced after the graph evaluates, by which time the root has moved;
+// each must still land where its lookup looked, so the warm runs hit all of
+// them and write nothing anywhere.
+#[test]
+fn compile_cache_enable_dir_keeps_the_esm_graph_warm() {
+    let project = compile_cache_scratch("cc-enable-esm");
+    let oam_cache = project.join("oam-cache");
+    let named = project.join("named");
+    std::fs::write(project.join("a.mjs"), "export const a = 1;\n").unwrap();
+    std::fs::write(project.join("b.mjs"), "export const b = 2;\n").unwrap();
+    let entry = project.join("main.mjs");
+    std::fs::write(
+        &entry,
+        "import { a } from './a.mjs';\n\
+         import { b } from './b.mjs';\n\
+         import { enableCompileCache } from 'node:module';\n\
+         console.log('ok', enableCompileCache(process.argv[2]).status, a + b);\n",
+    )
+    .unwrap();
+
+    let envs = [("OAM_CACHE_DIR", oam_cache.as_path())];
+    let cold = run_compile_cache(&project, &entry, &[&named], &envs);
+    assert!(
+        cold.status.success(),
+        "cold run: {}",
+        String::from_utf8_lossy(&cold.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&cold.stdout), "ok 1 3\n");
+    assert!(
+        count_v8c(&oam_cache) >= 3,
+        "main.mjs, a.mjs and b.mjs are cached in the default root; found {}",
+        count_v8c(&oam_cache)
+    );
+    let named_before = v8c_mtimes(&named);
+    let default_before = v8c_mtimes(&oam_cache);
+
+    for run in 0..2 {
+        let warm = run_compile_cache(&project, &entry, &[&named], &envs);
+        assert!(
+            warm.status.success(),
+            "warm run {run}: {}",
+            String::from_utf8_lossy(&warm.stderr)
+        );
+        assert_eq!(warm.stdout, cold.stdout, "warm run {run} prints the same");
+        assert_eq!(
+            v8c_mtimes(&oam_cache),
+            default_before,
+            "warm run {run} rewrites nothing in the default root"
+        );
+        assert_eq!(
+            v8c_mtimes(&named),
+            named_before,
+            "warm run {run} adds nothing to the named dir"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&project);
+}
+
+// A CommonJS bin that ends in process.exit() never returns to the
+// post-body store, yet node writes its entry on the way out (measured on
+// v22.22.2: main.cjs and dep.cjs both land in NODE_COMPILE_CACHE). oam
+// stores the wrappers whose body is still running at process.exit(), so
+// the bin is warm on the next run and that run writes nothing.
+#[test]
+fn compile_cache_process_exit_writes_the_running_cjs_entry() {
+    let project = compile_cache_scratch("cc-exit-cjs");
+    let ncc = project.join("ncc");
+    std::fs::write(project.join("dep.cjs"), "module.exports = 7;\n").unwrap();
+    let entry = project.join("main.cjs");
+    std::fs::write(
+        &entry,
+        "const v = require('./dep.cjs');\nconsole.log('ok', v);\nprocess.exit(0);\n",
+    )
+    .unwrap();
+
+    let envs = [("NODE_COMPILE_CACHE", ncc.as_path())];
+    let cold = run_compile_cache(&project, &entry, &[], &envs);
+    assert!(
+        cold.status.success(),
+        "cold run: {}",
+        String::from_utf8_lossy(&cold.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&cold.stdout), "ok 7\n");
+    let dirs = oam_version_dirs(&ncc);
+    assert_eq!(dirs.len(), 1, "one per-build dir: {dirs:?}");
+    assert_eq!(
+        count_v8c(&dirs[0]),
+        2,
+        "main.cjs (which exited from its body) and dep.cjs are both cached"
+    );
+    let before = v8c_mtimes(&ncc);
+
+    let warm = run_compile_cache(&project, &entry, &[], &envs);
+    assert!(
+        warm.status.success(),
+        "warm run: {}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    assert_eq!(warm.stdout, cold.stdout);
+    assert_eq!(v8c_mtimes(&ncc), before, "the warm run hits both entries");
+    let _ = std::fs::remove_dir_all(&project);
+}
+
+// node's compile-cache state is per thread (per Environment), measured on
+// v22.22.2: a worker sees getCompileCacheDir() undefined after the main
+// thread enabled the cache, enables a directory of its own, and neither
+// thread's call moves the other's cache.
+#[test]
+fn compile_cache_api_state_is_per_thread() {
+    let project = compile_cache_scratch("cc-worker");
+    std::fs::write(
+        project.join("wk.cjs"),
+        "const m = require('node:module');\n\
+         const path = require('node:path');\n\
+         const { workerData } = require('node:worker_threads');\n\
+         console.log('worker dir', m.getCompileCacheDir());\n\
+         const r = m.enableCompileCache(workerData + 'w');\n\
+         console.log('worker enable', r.status, path.basename(r.directory));\n\
+         const again = m.enableCompileCache(workerData).status;\n\
+         const now = path.basename(path.dirname(m.getCompileCacheDir()));\n\
+         console.log('worker again', again, now);\n",
+    )
+    .unwrap();
+    let entry = project.join("main.cjs");
+    std::fs::write(
+        &entry,
+        "const { Worker } = require('node:worker_threads');\n\
+         const m = require('node:module');\n\
+         const path = require('node:path');\n\
+         const d = path.join(__dirname, 'cc');\n\
+         const first = process.argv[2] === 'main-first';\n\
+         if (first) console.log('main enable', m.enableCompileCache(d).status);\n\
+         const w = new Worker(path.join(__dirname, 'wk.cjs'), { workerData: d });\n\
+         w.on('exit', () => {\n\
+           if (!first) console.log('main dir', m.getCompileCacheDir());\n\
+           if (!first) console.log('main enable', m.enableCompileCache(d).status);\n\
+           const now = path.basename(path.dirname(m.getCompileCacheDir()));\n\
+           console.log('main dir after', now);\n\
+         });\n",
+    )
+    .unwrap();
+
+    // The main thread enables first: the worker still starts with none.
+    let main_first = std::path::Path::new("main-first");
+    let out = run_compile_cache(&project, &entry, &[main_first], &[]);
+    assert!(
+        out.status.success(),
+        "run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "main enable 1\n\
+         worker dir undefined\n\
+         worker enable 1 ccw\n\
+         worker again 2 ccw\n\
+         main dir after cc\n"
+    );
+    // The worker enables first: the main thread's cache does not move.
+    let worker_first = std::path::Path::new("worker-first");
+    let out = run_compile_cache(&project, &entry, &[worker_first], &[]);
+    assert!(
+        out.status.success(),
+        "run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "worker dir undefined\n\
+         worker enable 1 ccw\n\
+         worker again 2 ccw\n\
+         main dir undefined\n\
+         main enable 1\n\
+         main dir after cc\n"
     );
     let _ = std::fs::remove_dir_all(&project);
 }
@@ -32485,6 +32721,7 @@ fn code_cache_corrupt_blob_falls_back_and_refreshes() {
             .args(["run", entry.to_str().unwrap()])
             .current_dir(&project_dir)
             .env("OAM_CACHE_DIR", &cache)
+            .without_ambient_compile_cache()
             .output()
             .expect("oam binary runs")
     };
@@ -32585,6 +32822,7 @@ fn esm_code_cache_produced_after_evaluation_and_consumed() {
             .args(["run", entry.to_str().unwrap()])
             .current_dir(&project_dir)
             .env("OAM_CACHE_DIR", &cache)
+            .without_ambient_compile_cache()
             .output()
             .expect("oam binary runs")
     };
@@ -32668,6 +32906,7 @@ fn esm_code_cache_produced_when_evaluation_throws() {
         .args(["run", entry.to_str().unwrap()])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", &cache)
+        .without_ambient_compile_cache()
         .output()
         .expect("oam binary runs");
     assert!(!out.status.success(), "a throwing module must fail the run");
@@ -32707,6 +32946,7 @@ fn cache_subcommand_info_and_clean() {
         .args(["run", entry.to_str().unwrap()])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", &cache)
+        .without_ambient_compile_cache()
         .output()
         .expect("oam binary runs");
     assert!(
@@ -32724,6 +32964,7 @@ fn cache_subcommand_info_and_clean() {
         std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
             .args(args)
             .env("OAM_CACHE_DIR", &cache)
+            .without_ambient_compile_cache()
             .output()
             .expect("oam binary runs")
     };
