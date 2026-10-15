@@ -20256,10 +20256,14 @@ fn process_versions_honest_keys() {
          const versionish = /^\\d+\\.\\d+\\.\\d+/;\n\
          const real = ['node', 'oam', 'v8', 'ada', 'brotli', 'flate2', 'h2',\n\
                        'hickory', 'hyper', 'oxc', 'reqwest', 'ring', 'rustls',\n\
-                       'tokio', 'url'];\n\
+                       'tokio', 'url', 'zstd'];\n\
          for (const k of real) {\n\
            console.log('has_' + k + ':', typeof v[k] === 'string' && versionish.test(v[k]));\n\
          }\n\
+         // zstd is node's own key for libzstd, which oam links too (node:zlib's\n\
+         // zstd engine): the vendored C library's 1.x version, as node reports\n\
+         // it, not the binding crates' (zstd-safe 7.x, zstd-sys 2.x).\n\
+         console.log('zstd_is_libzstd:', /^1\\.\\d+\\.\\d+$/.test(v.zstd));\n\
          // icu/unicode are x.y shaped (77.1, 16.0), verified from the pinned\n\
          // v8 crate's own headers at build time.\n\
          for (const k of ['icu', 'unicode']) {\n\
@@ -20268,7 +20272,7 @@ fn process_versions_honest_keys() {
          // cldr/tz live in ICU DATA files the v8 crate does not vendor, so\n\
          // their versions cannot be verified -- they must stay absent.\n\
          const lying = ['uv', 'openssl', 'llhttp', 'ares', 'nghttp2', 'napi',\n\
-                        'modules', 'undici', 'zlib', 'acorn', 'zstd',\n\
+                        'modules', 'undici', 'zlib', 'acorn',\n\
                         'cldr', 'tz'];\n\
          for (const k of lying) {\n\
            console.log('absent_' + k + ':', !(k in v));\n\
