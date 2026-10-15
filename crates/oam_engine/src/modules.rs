@@ -77,6 +77,15 @@ struct ModuleMap {
     /// Default facades `require()` has built ([`default_facade`]), which
     /// numbers each one's map key.
     facades: usize,
+    /// CommonJS dependencies of an ES graph whose body threw while a graph
+    /// load ran them, with what the load reported. node runs such a module
+    /// once, as part of the graph's evaluation, and the graph stays errored:
+    /// every later `import()` or `require()` of it sees that same error. oam
+    /// runs the module while the graph loads and drops it from the CommonJS
+    /// cache when it throws (a direct `require()` of it runs it again, as
+    /// node's does), so the graph load replays this record instead of
+    /// running the body a second time.
+    failed_cjs: HashMap<PathBuf, (v8::Global<v8::Value>, Diagnostic)>,
 }
 
 /// The module graph loads on the stack, innermost last. A load can nest: a
@@ -98,7 +107,43 @@ struct GraphLoad {
     for_require: bool,
     /// The CommonJS dependency whose body is running, if one is.
     executing_cjs: Option<PathBuf>,
+    /// [`evaluating_in_loads`] as last computed while this load was the
+    /// innermost one. The walk covers every outer load's graph, and a
+    /// `require()` graph asks it once per import of an already-compiled
+    /// module, so recomputing it each time costs edges x outer graph size.
+    /// It stays valid while nothing it read changes: the outer loads are
+    /// suspended, so only this load can change it, by compiling a module the
+    /// walk visited (that adds its imports) or by running a CommonJS
+    /// dependency (whose nested loads can evaluate modules). Both clear it.
+    evaluating_memo: Option<EvaluatingInLoads>,
 }
+
+/// What [`evaluating_in_loads`] found: the modules node would have in
+/// evaluation, and every module the walk read the imports or status of.
+struct EvaluatingInLoads {
+    evaluating: HashSet<PathBuf>,
+    visited: HashSet<PathBuf>,
+}
+
+/// How many synchronous `require()`s of an ES module are running
+/// ([`require_esm_sync`], from its load to the end of evaluation). node's
+/// require() runs no ticks and no promise jobs before it returns, so no
+/// load nested anywhere inside one -- an `import()` a CommonJS dependency or
+/// the required module's body makes -- may drain them, whichever load is
+/// innermost.
+#[derive(Default)]
+struct RequireDepth(usize);
+
+/// Whether a synchronous `require()` of an ES module is on the stack.
+fn inside_require(scope: &mut v8::PinScope<'_, '_>) -> bool {
+    scope.get_slot::<RequireDepth>().is_some_and(|d| d.0 > 0)
+}
+
+/// The import a graph load could not resolve, kept beside the diagnostic so
+/// `require()` can raise node's ERR_MODULE_NOT_FOUND for it, which names the
+/// importer and the specifier.
+#[derive(Default)]
+struct UnresolvedDuringLoad(Option<(String, PathBuf)>);
 
 /// The exception a failed graph load caught, as catch_to_diagnostic last
 /// saw it. A diagnostic carries only text; `require()` of an ES module
@@ -2190,6 +2235,7 @@ fn load_module_graph(
             entry: entry.clone(),
             for_require,
             executing_cjs: None,
+            evaluating_memo: None,
         });
     // The prefetch pool borrows `host`, so it lives inside a thread scope:
     // workers spawn lazily as prefetchable imports are discovered, and the
@@ -2273,7 +2319,7 @@ fn recorded_imports(
 /// has not reached yet is a leaf to it, which is where the two can part: when
 /// that module would itself have led to the dependency (a sibling import
 /// discovered later), node has it evaluating and this does not.
-fn evaluating_in_loads(scope: &mut v8::PinScope<'_, '_>) -> HashSet<PathBuf> {
+fn evaluating_in_loads(scope: &mut v8::PinScope<'_, '_>) -> EvaluatingInLoads {
     let loads: Vec<(PathBuf, PathBuf)> = scope
         .get_slot::<GraphLoads>()
         .map(|loads| {
@@ -2306,6 +2352,7 @@ fn evaluating_in_loads(scope: &mut v8::PinScope<'_, '_>) -> HashSet<PathBuf> {
             .collect()
     }
     let mut evaluating = HashSet::new();
+    let mut all_visited = HashSet::new();
     for (entry, running) in loads {
         // Iterative depth-first walk; `on_path` is the walk's current path.
         let mut visited: HashSet<PathBuf> = HashSet::from([entry.clone()]);
@@ -2337,26 +2384,79 @@ fn evaluating_in_loads(scope: &mut v8::PinScope<'_, '_>) -> HashSet<PathBuf> {
                 }
             }
         }
+        all_visited.extend(visited);
         let Some(on_path) = on_path else {
             continue;
         };
         // The finished modules that reach the path stay in evaluation with
-        // it: grow the set backwards over the recorded imports to a fixpoint.
-        let mut held: HashSet<PathBuf> = on_path.into_iter().collect();
-        loop {
-            let before = held.len();
-            for (module, imports) in &children {
-                if !held.contains(module) && imports.iter().any(|i| held.contains(i)) {
-                    held.insert(module.clone());
-                }
+        // it: everything that reaches the path over the recorded imports,
+        // found by one breadth-first walk of the reversed edges.
+        let mut importers: HashMap<&Path, Vec<&Path>> = HashMap::new();
+        for (module, imports) in &children {
+            for import in imports {
+                importers
+                    .entry(import.as_path())
+                    .or_default()
+                    .push(module.as_path());
             }
-            if held.len() == before {
-                break;
+        }
+        let mut held: HashSet<PathBuf> = on_path.iter().cloned().collect();
+        let mut queue: VecDeque<PathBuf> = on_path.into_iter().collect();
+        while let Some(module) = queue.pop_front() {
+            for importer in importers.get(module.as_path()).into_iter().flatten() {
+                if held.insert(importer.to_path_buf()) {
+                    queue.push_back(importer.to_path_buf());
+                }
             }
         }
         evaluating.extend(held);
     }
-    evaluating
+    EvaluatingInLoads {
+        evaluating,
+        visited: all_visited,
+    }
+}
+
+/// Whether `path` is in [`evaluating_in_loads`], answered from the innermost
+/// load's memo when it has one (see [`GraphLoad::evaluating_memo`]). For the
+/// checks a load makes of its own imports ([`check_required_import`]), while
+/// it is the innermost load and so the only one that can change the answer.
+fn in_evaluation_by_loads(scope: &mut v8::PinScope<'_, '_>, path: &Path) -> bool {
+    if let Some(memo) = scope
+        .get_slot::<GraphLoads>()
+        .and_then(|loads| loads.0.last())
+        .and_then(|load| load.evaluating_memo.as_ref())
+    {
+        return memo.evaluating.contains(path);
+    }
+    let found = evaluating_in_loads(scope);
+    let answer = found.evaluating.contains(path);
+    if let Some(load) = scope
+        .get_slot_mut::<GraphLoads>()
+        .and_then(|loads| loads.0.last_mut())
+    {
+        load.evaluating_memo = Some(found);
+    }
+    answer
+}
+
+/// Drop the innermost load's [`evaluating_in_loads`] memo -- all of it, or,
+/// with `compiled`, only when the walk read that module (whose imports a
+/// compile has just recorded).
+fn invalidate_evaluating_memo(scope: &mut v8::PinScope<'_, '_>, compiled: Option<&Path>) {
+    if let Some(load) = scope
+        .get_slot_mut::<GraphLoads>()
+        .and_then(|loads| loads.0.last_mut())
+    {
+        let stale = match (&load.evaluating_memo, compiled) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(memo), Some(path)) => memo.visited.contains(path),
+        };
+        if stale {
+            load.evaluating_memo = None;
+        }
+    }
 }
 
 /// node's refusals for an import inside a graph a `require()` loads
@@ -2392,7 +2492,7 @@ fn check_required_import(
     let in_evaluation = match status {
         v8::ModuleStatus::Evaluating => true,
         v8::ModuleStatus::Evaluated | v8::ModuleStatus::Errored => false,
-        _ => evaluating_in_loads(scope).contains(resolved),
+        _ => in_evaluation_by_loads(scope, resolved),
     };
     if in_evaluation {
         return Err(rt_diag(
@@ -2436,7 +2536,18 @@ fn load_module_graph_overlapped(
             // recorded edges. (An instantiated module's graph is complete.)
             let module = v8::Local::new(tc, &present);
             if module.get_status() == v8::ModuleStatus::Uninstantiated {
-                for (specifier, resolved) in recorded_imports(tc, &path, module) {
+                let recorded = recorded_imports(tc, &path, module);
+                if recorded.len() < module.get_module_requests().length() {
+                    // An import with no edge: the load that compiled the
+                    // module failed on it (a specifier that did not
+                    // resolve). Resolve them all again, so this load fails
+                    // the same way -- or, if the file has appeared since,
+                    // goes on -- instead of reaching instantiation with an
+                    // edge the resolve callback cannot find.
+                    resolve_imports(tc, host, &path, module, prefetch, &mut work)?;
+                    continue;
+                }
+                for (specifier, resolved) in recorded {
                     check_required_import(tc, &path, &specifier, &resolved)?;
                     if !tc
                         .get_slot::<ModuleMap>()
@@ -2488,7 +2599,26 @@ fn load_module_graph_overlapped(
                 return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
             };
             crate::cjs::facade_source(tc, &path, exports)
-        } else if oam_loader::module_kind(&path) == oam_loader::ModuleKind::Cjs {
+        } else if oam_loader::module_kind(&path) == oam_loader::ModuleKind::Cjs
+            // A typeless file inside node_modules, which oam takes for
+            // CommonJS, that a `require()` is loading as an ES module: the
+            // require() already compiled it as CommonJS and found module
+            // syntax (node's detection), so it is not run as CommonJS here --
+            // that would answer from the placeholder `require.cache` entry
+            // the require() made and build a facade around its empty
+            // exports.
+            && !crate::cjs::is_requiring_esm(tc, &path)
+        {
+            if let Some((value, diagnostic)) = tc
+                .get_slot::<ModuleMap>()
+                .and_then(|map| map.failed_cjs.get(&path))
+                .map(|(value, diagnostic)| (value.clone(), diagnostic.clone()))
+            {
+                // Its body threw in an earlier load: that error again, the
+                // body not run again (see ModuleMap::failed_cjs).
+                tc.set_slot(CaughtDuringLoad(Some(value)));
+                return Err(vec![diagnostic]);
+            }
             // Recorded for the duration of the body, so a `require()` of an
             // ES module from it can tell which of this graph's modules node
             // would have in evaluation (evaluating_in_loads).
@@ -2496,13 +2626,18 @@ fn load_module_graph_overlapped(
             crate::cjs::clear_compile_failure(tc);
             let loaded = crate::cjs::load_cjs(tc, &path);
             set_executing_cjs(tc, None);
+            // The body may have loaded and evaluated modules (a require() or
+            // import() of its own), which the memo's walk read.
+            invalidate_evaluating_memo(tc, None);
             match loaded {
                 Some(exports) => {
-                    // A graph `require()` loads runs inside the requiring
+                    // A graph a `require()` loads runs inside the requiring
                     // statement, and node's require never runs ticks or
-                    // promise jobs before it returns; only a top-level or
-                    // import() load drains here.
-                    if !loading_for_require(tc) {
+                    // promise jobs before it returns -- nor does a load
+                    // nested inside one (an import() from a CommonJS
+                    // dependency of the required graph). Only a top-level or
+                    // import() load outside any require() drains here.
+                    if !inside_require(tc) {
                         if let Some(failure) = run_ticks_and_microtasks(tc) {
                             return Err(failure);
                         }
@@ -2523,7 +2658,19 @@ fn load_module_graph_overlapped(
                     tc.reset();
                     host.load(&path)?
                 }
-                None => return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]),
+                None => {
+                    let caught = tc.exception().map(|value| v8::Global::new(tc, value));
+                    let diagnostic = catch_to_diagnostic(tc, &path.to_string_lossy());
+                    if let Some(value) = caught
+                        && !tc.has_terminated()
+                    {
+                        tc.get_slot_mut::<ModuleMap>()
+                            .expect("module map installed")
+                            .failed_cjs
+                            .insert(path.clone(), (value, diagnostic.clone()));
+                    }
+                    return Err(vec![diagnostic]);
+                }
             }
         } else {
             match prefetch.take(&path) {
@@ -2637,95 +2784,116 @@ fn load_module_graph_overlapped(
             }
         }
 
-        let requests = module.get_module_requests();
-        for i in 0..requests.length() {
-            let request = requests.get(tc, i).expect("module request index in range");
-            let request = v8::Local::<v8::ModuleRequest>::try_from(request)
-                .expect("module request entry is a ModuleRequest");
-            let specifier = request.get_specifier().to_rust_string_lossy(tc);
+        invalidate_evaluating_memo(tc, Some(&path));
+        resolve_imports(tc, host, &path, module, prefetch, &mut work)?;
+    }
+    Ok(())
+}
 
-            // Import attributes: [key, value, source_offset] triples. The
-            // only supported attribute is type, and the only supported
-            // type is json. Spec-required behavior is to IGNORE unknown
-            // keys; an unsupported type VALUE is an error.
-            let attributes = request.get_import_attributes();
-            let mut typed_json = false;
-            let mut index = 0;
-            while index + 1 < attributes.length() {
-                let key = attributes
-                    .get(tc, index)
-                    .and_then(|d| v8::Local::<v8::Value>::try_from(d).ok())
-                    .and_then(|v| v.to_string(tc))
-                    .map(|s| s.to_rust_string_lossy(tc))
-                    .unwrap_or_default();
-                let value = attributes
-                    .get(tc, index + 1)
-                    .and_then(|d| v8::Local::<v8::Value>::try_from(d).ok())
-                    .and_then(|v| v.to_string(tc))
-                    .map(|s| s.to_rust_string_lossy(tc))
-                    .unwrap_or_default();
-                if key == "type" {
-                    if value == "json" {
-                        typed_json = true;
-                    } else {
-                        return Err(rt_diag(
-                            "OAM-MOD0003",
-                            format!(
-                                "{}: import of '{specifier}' declares type \"{value}\" — \
-                                 the only supported import-attribute type is \"json\"",
-                                path.display()
-                            ),
-                        ));
-                    }
+/// Resolve every import of `module` (compiled from `path`), record each edge
+/// for the resolve callback, and queue the resolved paths on `work`. A
+/// resolve failure is also kept in [`UnresolvedDuringLoad`].
+fn resolve_imports(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    host: &dyn ModuleHost,
+    path: &Path,
+    module: v8::Local<'_, v8::Module>,
+    prefetch: &mut GraphPrefetcher<'_, '_>,
+    work: &mut VecDeque<PathBuf>,
+) -> Result<(), Vec<Diagnostic>> {
+    let requests = module.get_module_requests();
+    for i in 0..requests.length() {
+        let request = requests.get(tc, i).expect("module request index in range");
+        let request = v8::Local::<v8::ModuleRequest>::try_from(request)
+            .expect("module request entry is a ModuleRequest");
+        let specifier = request.get_specifier().to_rust_string_lossy(tc);
+
+        // Import attributes: [key, value, source_offset] triples. The
+        // only supported attribute is type, and the only supported
+        // type is json. Spec-required behavior is to IGNORE unknown
+        // keys; an unsupported type VALUE is an error.
+        let attributes = request.get_import_attributes();
+        let mut typed_json = false;
+        let mut index = 0;
+        while index + 1 < attributes.length() {
+            let key = attributes
+                .get(tc, index)
+                .and_then(|d| v8::Local::<v8::Value>::try_from(d).ok())
+                .and_then(|v| v.to_string(tc))
+                .map(|s| s.to_rust_string_lossy(tc))
+                .unwrap_or_default();
+            let value = attributes
+                .get(tc, index + 1)
+                .and_then(|d| v8::Local::<v8::Value>::try_from(d).ok())
+                .and_then(|v| v.to_string(tc))
+                .map(|s| s.to_rust_string_lossy(tc))
+                .unwrap_or_default();
+            if key == "type" {
+                if value == "json" {
+                    typed_json = true;
+                } else {
+                    return Err(rt_diag(
+                        "OAM-MOD0003",
+                        format!(
+                            "{}: import of '{specifier}' declares type \"{value}\" — \
+                             the only supported import-attribute type is \"json\"",
+                            path.display()
+                        ),
+                    ));
                 }
-                index += 3;
             }
-
-            let resolved = host.resolve(&specifier, &path)?;
-            if typed_json && resolved.extension().and_then(|e| e.to_str()) != Some("json") {
-                return Err(rt_diag(
-                    "OAM-MOD0003",
-                    format!(
-                        "{}: '{specifier}' is imported with type \"json\" but resolves to {} \
-                         (only .json files load as JSON modules today)",
-                        path.display(),
-                        resolved.display()
-                    ),
-                ));
-            }
-            // Virtual builtin paths must not go through filesystem
-            // normalization (absolute() would anchor "node:fs" at cwd).
-            let resolved = if resolved
-                .to_str()
-                .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"))
-            {
-                resolved
-            } else {
-                module_key(&resolved).map_err(|e| {
-                    rt_diag(
-                        "OAM-RT0002",
-                        format!("bad resolved path {}: {e}", resolved.display()),
-                    )
-                })?
-            };
-            tc.get_slot_mut::<ModuleMap>()
-                .expect("module map installed")
-                .edges
-                .insert((path.clone(), specifier.clone()), resolved.clone());
-            check_required_import(tc, &path, &specifier, &resolved)?;
-            // Paths already in the map pop straight into the `continue`
-            // above; don't load them ahead either (dyn-import re-entry,
-            // diamonds resolved by an earlier pop).
-            if !tc
-                .get_slot::<ModuleMap>()
-                .expect("module map installed")
-                .by_path
-                .contains_key(&resolved)
-            {
-                prefetch.enqueue(&resolved);
-            }
-            work.push_back(resolved);
+            index += 3;
         }
+
+        let resolved = host.resolve(&specifier, path).inspect_err(|_| {
+            tc.set_slot(UnresolvedDuringLoad(Some((
+                specifier.clone(),
+                path.to_path_buf(),
+            ))));
+        })?;
+        if typed_json && resolved.extension().and_then(|e| e.to_str()) != Some("json") {
+            return Err(rt_diag(
+                "OAM-MOD0003",
+                format!(
+                    "{}: '{specifier}' is imported with type \"json\" but resolves to {} \
+                     (only .json files load as JSON modules today)",
+                    path.display(),
+                    resolved.display()
+                ),
+            ));
+        }
+        // Virtual builtin paths must not go through filesystem
+        // normalization (absolute() would anchor "node:fs" at cwd).
+        let resolved = if resolved
+            .to_str()
+            .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"))
+        {
+            resolved
+        } else {
+            module_key(&resolved).map_err(|e| {
+                rt_diag(
+                    "OAM-RT0002",
+                    format!("bad resolved path {}: {e}", resolved.display()),
+                )
+            })?
+        };
+        tc.get_slot_mut::<ModuleMap>()
+            .expect("module map installed")
+            .edges
+            .insert((path.to_path_buf(), specifier.clone()), resolved.clone());
+        check_required_import(tc, path, &specifier, &resolved)?;
+        // Paths already in the map pop straight into the `continue`
+        // above; don't load them ahead either (dyn-import re-entry,
+        // diamonds resolved by an earlier pop).
+        if !tc
+            .get_slot::<ModuleMap>()
+            .expect("module map installed")
+            .by_path
+            .contains_key(&resolved)
+        {
+            prefetch.enqueue(&resolved);
+        }
+        work.push_back(resolved);
     }
     Ok(())
 }
@@ -3013,8 +3181,22 @@ fn dyn_import_load(
     spec: &str,
 ) -> DynResult {
     // Pull the rest of the graph in (idempotent: already-loaded paths skip).
+    tc.set_slot(CaughtDuringLoad(None));
     if let Err(diags) = load_module_graph(tc, host, resolved.clone(), false) {
         store_pending_code_cache(tc);
+        let caught = tc
+            .get_slot_mut::<CaughtDuringLoad>()
+            .and_then(|c| c.0.take());
+        // The load caught a JS value -- a CommonJS dependency's throw, a
+        // syntax error -- which is what node's import() rejects with. A
+        // CommonJS dependency's throw is replayed on a later load
+        // (ModuleMap::failed_cjs), so a second import() rejects with the
+        // same object, as node's does.
+        if let Some(value) = caught
+            && diags.first().is_some_and(|d| d.code == "OAM-RT0001")
+        {
+            return DynResult::Rejected(value);
+        }
         let msg = if diags.is_empty() {
             format!("failed to load '{spec}'")
         } else {
@@ -3114,7 +3296,18 @@ fn dyn_import_load(
     // imported module wait for the caller's next real tick point. (The
     // mid-hook microtask flush itself is a documented pre-existing
     // divergence the sync-graph fast path depends on.)
-    tc.perform_microtask_checkpoint();
+    //
+    // Inside a synchronous `require()` of an ES module (an import() a
+    // CommonJS dependency of the required graph, or its body, makes) not
+    // even that: node's require runs no promise jobs before it returns, and
+    // the checkpoint would run the requiring code's own. A graph without
+    // top-level await has settled within evaluate() and needs none; one
+    // with it still takes the checkpoint, which it cannot settle without.
+    let settled = v8::Local::<v8::Promise>::try_from(value)
+        .is_ok_and(|p| p.state() != v8::PromiseState::Pending);
+    if !(settled && inside_require(tc)) {
+        tc.perform_microtask_checkpoint();
+    }
 
     // evaluate() yields the module's top-level-await promise.
     let Ok(eval_promise) = v8::Local::<v8::Promise>::try_from(value) else {
@@ -3325,7 +3518,118 @@ fn require_cycle(key: &Path, parent: &str) -> RequireFailure {
     }
 }
 
+/// node's refusal of a graph with a top-level await (runSync, and
+/// getNamespaceSync for a module an import() has already evaluated).
+fn require_async(key: &Path, parent: &str) -> RequireFailure {
+    RequireFailure::Node {
+        code: "ERR_REQUIRE_ASYNC_MODULE",
+        args: vec![key.to_string_lossy().into_owned(), parent.to_string()],
+    }
+}
+
+/// What `require()` returns for a module V8 reports as evaluated, as node's
+/// getNamespaceSync decides it: a graph with a top-level await is refused
+/// even once it has finished, and V8 reports one still part-way through its
+/// await as evaluated too, so the test comes before anything is read from
+/// the namespace (whose bindings may still be uninitialized).
+fn evaluated_exports(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    key: &Path,
+    parent: &str,
+    module: v8::Local<'_, v8::Module>,
+) -> Result<v8::Global<v8::Value>, RequireFailure> {
+    if module.is_graph_async() {
+        return Err(require_async(key, parent));
+    }
+    required_exports(tc, key, module)
+}
+
 fn require_esm_sync(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    host: &dyn ModuleHost,
+    key: &Path,
+    parent: &str,
+) -> Result<v8::Global<v8::Value>, RequireFailure> {
+    if tc.get_slot::<RequireDepth>().is_none() {
+        tc.set_slot(RequireDepth::default());
+    }
+    tc.get_slot_mut::<RequireDepth>()
+        .expect("require depth installed")
+        .0 += 1;
+    let required = require_esm_sync_inner(tc, host, key, parent);
+    if let Some(depth) = tc.get_slot_mut::<RequireDepth>() {
+        depth.0 -= 1;
+    }
+    required
+}
+
+/// The module-not-found failures of a `require()` graph's load, as node's
+/// ERR_MODULE_NOT_FOUND: a relative or absolute specifier names the file it
+/// would have been (`Cannot find module '<path>' imported from <importer>`,
+/// with the file URL as `url`), a bare one the package (`Cannot find package
+/// '<name>' ...`). A bare specifier whose package was found but whose file
+/// was not keeps oam's message, which says which candidates were tried, under
+/// node's code.
+fn module_not_found(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    diagnostic: Diagnostic,
+) -> RequireFailure {
+    let unresolved = tc
+        .get_slot_mut::<UnresolvedDuringLoad>()
+        .and_then(|u| u.0.take());
+    let Some((specifier, importer)) = unresolved else {
+        return RequireFailure::Diagnostic {
+            code: "ERR_MODULE_NOT_FOUND".to_string(),
+            message: diagnostic.message,
+        };
+    };
+    let base = importer.to_string_lossy().into_owned();
+    let relative = specifier.starts_with("./")
+        || specifier.starts_with("../")
+        || specifier == "."
+        || specifier == "..";
+    if relative || Path::new(&specifier).is_absolute() || specifier.starts_with('/') {
+        let joined = importer
+            .parent()
+            .map(|dir| dir.join(&specifier))
+            .unwrap_or_else(|| PathBuf::from(&specifier));
+        // Lexically: the file does not exist, so there is nothing to
+        // canonicalize against.
+        let mut file = PathBuf::new();
+        for component in joined.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    file.pop();
+                }
+                other => file.push(other),
+            }
+        }
+        let url = path_to_file_url(&file);
+        return RequireFailure::Node {
+            code: "ERR_MODULE_NOT_FOUND",
+            args: vec![file.to_string_lossy().into_owned(), base, url],
+        };
+    }
+    if diagnostic.code == "OAM-MOD0002" && !specifier.contains(':') {
+        let mut segments = specifier.split('/');
+        let first = segments.next().unwrap_or_default();
+        let package = match (first.starts_with('@'), segments.next()) {
+            (true, Some(name)) => format!("{first}/{name}"),
+            _ => first.to_string(),
+        };
+        return RequireFailure::Node {
+            code: "ERR_MODULE_NOT_FOUND",
+            args: vec![package, base],
+        };
+    }
+    RequireFailure::Diagnostic {
+        code: "ERR_MODULE_NOT_FOUND".to_string(),
+        message: diagnostic.message,
+    }
+}
+
+fn require_esm_sync_inner(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     host: &dyn ModuleHost,
     key: &Path,
@@ -3340,7 +3644,7 @@ fn require_esm_sync(
     if let Some(global) = compiled(tc) {
         let module = v8::Local::new(tc, &global);
         match module.get_status() {
-            v8::ModuleStatus::Evaluated => return required_exports(tc, key, module),
+            v8::ModuleStatus::Evaluated => return evaluated_exports(tc, key, parent, module),
             v8::ModuleStatus::Errored => {
                 return Err(RequireFailure::Throw(v8::Global::new(
                     tc,
@@ -3349,7 +3653,10 @@ fn require_esm_sync(
             }
             v8::ModuleStatus::Evaluating => return Err(require_cycle(key, parent)),
             _ => {
-                if evaluating_in_loads(tc).contains(key) {
+                // Fresh, not the memo: this runs from a CommonJS body in the
+                // caller's load, where earlier require()s and import()s may
+                // have evaluated modules the memo's walk read.
+                if evaluating_in_loads(tc).evaluating.contains(key) {
                     return Err(require_cycle(key, parent));
                 }
             }
@@ -3357,6 +3664,7 @@ fn require_esm_sync(
     }
 
     tc.set_slot(CaughtDuringLoad(None));
+    tc.set_slot(UnresolvedDuringLoad(None));
     if let Err(diags) = load_module_graph(tc, host, key.to_path_buf(), true) {
         store_pending_code_cache(tc);
         let caught = tc
@@ -3376,6 +3684,9 @@ fn require_esm_sync(
             // The load caught a JS value -- a CommonJS dependency's throw, a
             // compile error -- and that is what node's require() throws.
             Some(value) if first.code == "OAM-RT0001" => RequireFailure::Throw(value),
+            _ if first.code == "OAM-MOD0001" || first.code == "OAM-MOD0002" => {
+                module_not_found(tc, first)
+            }
             _ => RequireFailure::Diagnostic {
                 code: first.code,
                 message: first.message,
@@ -3395,7 +3706,7 @@ fn require_esm_sync(
     // A CommonJS dependency the load ran may have required this module and
     // so settled it already.
     match module.get_status() {
-        v8::ModuleStatus::Evaluated => return required_exports(tc, key, module),
+        v8::ModuleStatus::Evaluated => return evaluated_exports(tc, key, parent, module),
         v8::ModuleStatus::Errored => {
             return Err(RequireFailure::Throw(v8::Global::new(
                 tc,
@@ -3424,10 +3735,7 @@ fn require_esm_sync(
     // node's ModuleJobSync.runSync: instantiate, then refuse a graph with a
     // top-level await before running any of it.
     if module.is_graph_async() {
-        return Err(RequireFailure::Node {
-            code: "ERR_REQUIRE_ASYNC_MODULE",
-            args: vec![key.to_string_lossy().into_owned(), parent.to_string()],
-        });
+        return Err(require_async(key, parent));
     }
     let Some(value) = module.evaluate(tc) else {
         store_pending_code_cache(tc);
@@ -3451,10 +3759,7 @@ fn require_esm_sync(
         }
         // Unreachable for a graph without top-level await, which settles
         // within evaluate().
-        v8::PromiseState::Pending => Err(RequireFailure::Node {
-            code: "ERR_REQUIRE_ASYNC_MODULE",
-            args: vec![key.to_string_lossy().into_owned(), parent.to_string()],
-        }),
+        v8::PromiseState::Pending => Err(require_async(key, parent)),
     }
 }
 

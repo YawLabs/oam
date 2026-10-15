@@ -68,6 +68,13 @@ pub(crate) struct CjsCache {
     warned_require_module: bool,
 }
 
+/// Whether a `require()` is loading the module at `key` as an ES module.
+pub(crate) fn is_requiring_esm(scope: &mut v8::PinScope<'_, '_>, key: &Path) -> bool {
+    scope
+        .get_slot::<CjsCache>()
+        .is_some_and(|cache| cache.requiring_esm.contains_key(key))
+}
+
 /// Whether the body of the module at `key` is running.
 pub(crate) fn is_executing(scope: &mut v8::PinScope<'_, '_>, key: &Path) -> bool {
     scope

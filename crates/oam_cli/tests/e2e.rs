@@ -23121,7 +23121,7 @@ console.log('e5_msg=' + e5.message);
 // ERR_MODULE_NOT_FOUND
 const e6 = codes.ERR_MODULE_NOT_FOUND('foo', '/bar');
 console.log('e6_code=' + e6.code);
-console.log('e6_msg_has_foo=' + e6.message.includes('"foo"'));
+console.log('e6_msg_has_foo=' + e6.message.includes("'foo'"));
 
 // -- util.types expansions --
 console.log('isArrayBufferView=' + util.types.isArrayBufferView(new Uint8Array(1)));

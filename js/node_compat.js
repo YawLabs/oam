@@ -1740,8 +1740,12 @@
     }
     return new RmIsADirectory(context);
   };
-  codes.ERR_MODULE_NOT_FOUND = E("ERR_MODULE_NOT_FOUND", Error, function(path, base) {
-    return 'Cannot find module "' + path + '"' + (base ? ' imported from ' + base : '');
+  // Node's text (v22.22.2 lib/internal/errors.js): with the URL of the
+  // file a relative or absolute specifier named it is a module, kept as
+  // `url`; without one, the package a bare specifier named.
+  codes.ERR_MODULE_NOT_FOUND = E("ERR_MODULE_NOT_FOUND", Error, function(path, base, exactUrl) {
+    if (exactUrl) this.url = `${exactUrl}`;
+    return `Cannot find ${exactUrl ? "module" : "package"} '${path}' imported from ${base}`;
   });
   // require() of an ES module (cjs.rs / modules.rs require_esm raise these
   // through this table so they carry node's shape). Node's texts, v22.22.2
