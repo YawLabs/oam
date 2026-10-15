@@ -1247,7 +1247,10 @@ console.log('[fstat ' + rows.join('; ') + ']');
 /// `instanceof net.Socket`), isTTY is the prototype's on a WriteStream and
 /// an own property on a ReadStream, columns x rows is the console's 120x40,
 /// a WriteStream made over the console input has no size, and a stream made
-/// by the constructor carries no `fd` -- node's stdio adds that.
+/// by the constructor carries no `fd` -- node's stdio adds that. A console
+/// opened by name is a terminal of the console's size (oam's descriptor for it
+/// is a table number, never the OS's), a write honours its encoding, and
+/// stdout's 'resize' watch adds no listeners a program can see.
 #[test]
 fn stdio_on_a_console_are_the_tty_stream_classes() {
     let script = write_temp(
@@ -1255,6 +1258,7 @@ fn stdio_on_a_console_are_the_tty_stream_classes() {
         r"
 import tty from 'node:tty';
 import net from 'node:net';
+import fs from 'node:fs';
 const so = process.stdout, se = process.stderr, si = process.stdin;
 const w = new tty.WriteStream(1);
 const r = tty.ReadStream(0);
@@ -1272,10 +1276,25 @@ const rows = [
 // not match.
 console.log('[tty ' + rows.slice(0, 14).join(',') + ']');
 console.log('[size ' + rows.slice(14).join(',') + ']');
+const fd = fs.openSync('\\\\.\\CONOUT$', 'r+');
+const c = new tty.WriteStream(fd);
+c.write('5b6865785d0a', 'hex');
+c.write('W2Jhc2U2NF0K', 'base64');
+so.on('resize', () => {});
+console.log('[named ' + [
+  tty.isatty(fd), c.columns + 'x' + c.rows, c.getWindowSize().join('x'),
+  so.listenerCount('newListener'), so.listenerCount('removeListener'),
+  so.listenerCount('resize'),
+  // node's carry an internal 'end' listener oam's do not (docs entry 52).
+  new tty.WriteStream(1).eventNames().filter((name) => name !== 'end').length,
+].join(',') + ']');
 ",
     );
     let pty = ConPty::spawn(&script);
     pty.wait_for("[tty true,true,true,true,true,true,false,true,false,1,2,0,true,true]");
     pty.wait_for("[size 120x40,120x40,120x40,,,false,undefined,true,true,true,true]");
+    pty.wait_for("[hex]");
+    pty.wait_for("[base64]");
+    pty.wait_for("[named true,120x40,120x40,0,0,1,0]");
     assert_eq!(pty.wait_exit(), 0);
 }

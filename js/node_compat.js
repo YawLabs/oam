@@ -3385,6 +3385,18 @@
     // emit() routes a listener's rejected thenable to the emitter's
     // nodejs.rejection handler instead of letting it become unhandled.
     const kCapture = Symbol("kCapture");
+    // An internal emitter's own hook, called with the event name after a
+    // listener is added or removed (undefined: every event went at once).
+    // It is how oam's tty.WriteStream starts and stops its 'resize' watch
+    // without 'newListener' / 'removeListener' listeners of its own, which
+    // node's stdout does not carry and a program sees in eventNames() and
+    // drops with removeAllListeners() (#391). Not reachable from user code.
+    const kListenersChanged = Symbol("kListenersChanged");
+    registry._kListenersChanged = kListenersChanged;
+    function listenersChanged(self, type) {
+      const hook = self[kListenersChanged];
+      if (hook !== undefined) hook.call(self, type);
+    }
 
     // Lazy state init (Node parity): express-style code mixes
     // EventEmitter.prototype onto plain functions WITHOUT running the
@@ -3460,6 +3472,7 @@
       } else {
         existing.push(entry);
       }
+      listenersChanged(this, type);
       // Prototype method, not this.listenerCount -- an instance may override/delete it
       // (test-stream-pipe-without-listenerCount sets it undefined); internal accounting
       // must not depend on the instance method.
@@ -3506,6 +3519,7 @@
       if (existing === listener || existing.listener === listener) {
         delete this._events[type];
         this._eventsCount--;
+        listenersChanged(this, type);
         if (this._events.removeListener) {
           this.emit("removeListener", type, existing.listener ?? existing);
         }
@@ -3521,6 +3535,7 @@
               delete this._events[type];
               this._eventsCount--;
             }
+            listenersChanged(this, type);
             if (this._events.removeListener) {
               this.emit("removeListener", type, removed.listener ?? removed);
             }
@@ -3552,6 +3567,7 @@
           delete this._events[type];
           this._eventsCount--;
         }
+        listenersChanged(this, type);
         return this;
       }
 
@@ -16921,11 +16937,18 @@
         stream.fd = fd;
         return stream;
       };
-      lazyStdio("stdout", () => stdioWritable(1, stdoutIsTTY, (chunk, _enc, cb) => {
-        cb(ctxOrderError(natives.stdoutWrite(chunk)));
+      // A string arrives in the write's encoding (decodeStrings is off):
+      // `write('68690a', 'hex')` writes "hi\n" in node, so anything but
+      // UTF-8 becomes its bytes before the op sees it (#391).
+      const stdioBytes = (chunk, encoding) =>
+        typeof chunk === "string" && encoding !== "utf8" && encoding !== "utf-8"
+          ? Buffer.from(chunk, encoding)
+          : chunk;
+      lazyStdio("stdout", () => stdioWritable(1, stdoutIsTTY, (chunk, enc, cb) => {
+        cb(ctxOrderError(natives.stdoutWrite(stdioBytes(chunk, enc))));
       }));
-      lazyStdio("stderr", () => stdioWritable(2, stderrIsTTY, (chunk, _enc, cb) => {
-        cb(ctxOrderError(natives.stderrWrite(chunk)));
+      lazyStdio("stderr", () => stdioWritable(2, stderrIsTTY, (chunk, enc, cb) => {
+        cb(ctxOrderError(natives.stderrWrite(stdioBytes(chunk, enc))));
       }));
       lazyStdio("stdin", () => {
         if (stdinIsTTY) {
@@ -32115,14 +32138,18 @@
   // same brand TLSSocket does (#132). docs/node-divergences.md has the rest.
   registry.factories.tty = (natives) => {
     const { Duplex } = registry.get("stream");
+    registry.get("events");
+    const kListenersChanged = registry._kListenersChanged;
     const kNetSocketLike = Symbol.for("oam.netSocketLike");
-    const isWindows = natives.platform === "win32";
     let readline;
     // The descriptor a stream was made over, for setRawMode and the size
     // reads (`fd` is a public property node's stdio adds, and a program's to
     // change), and the last size read, for 'resize'.
     const kTtyFd = Symbol("kTtyFd");
     const kLastSize = Symbol("kLastSize");
+    // The 'resize' poll of a stdio WriteStream: null while it is stopped,
+    // undefined on a stream that has none (see the constructor).
+    const kResizePoll = Symbol("kResizePoll");
     // process.stdin / stdout / stderr on a terminal are built by these
     // constructors, as node's getStdin / createWritableStdioStream build
     // them, once the runtime has already seen the descriptor is a terminal:
@@ -32176,8 +32203,14 @@
     // A write goes out whole before its callback, as node's terminal writes
     // do (`this._handle.setBlocking(true)` in WriteStream). 1 and 2 take the
     // stdio ops, which on a console write UTF-16; any other descriptor
-    // writes through the table.
-    function writeTo(fd, chunk) {
+    // writes through the table. A string is in the write's encoding --
+    // `write('68690a', 'hex')` is the bytes "hi\n", as node's handle
+    // writeString decodes it (#391) -- so anything but UTF-8 becomes its
+    // bytes first.
+    function writeTo(fd, chunk, encoding) {
+      if (typeof chunk === "string" && encoding !== "utf8" && encoding !== "utf-8") {
+        chunk = Buffer.from(chunk, encoding);
+      }
       if (fd === 1) return ctxOrderError(natives.stdoutWrite(chunk));
       if (fd === 2) return ctxOrderError(natives.stderrWrite(chunk));
       try {
@@ -32191,11 +32224,10 @@
       }
     }
 
-    // [columns, rows], or null where node's getWindowSize fails. The native
-    // reads the std handles on Windows, so a console the program opened by
-    // name has no size there.
+    // [columns, rows], or null where node's getWindowSize fails. Above 2 the
+    // native asks the terminal behind the descriptor-table entry -- oam's
+    // numbers are not the OS's (#391).
     function windowSize(fd) {
-      if (isWindows && fd > 2) return null;
       return natives.ttyGetWinSize(fd) ?? null;
     }
 
@@ -32234,8 +32266,8 @@
           // manualStart and nothing on a terminal's output side asks.
           if (readable) readFrom(this, fd);
         },
-        write(chunk, _encoding, cb) {
-          cb(writeTo(fd, chunk));
+        write(chunk, encoding, cb) {
+          cb(writeTo(fd, chunk, encoding));
         },
         // Socket._final shuts the handle down and finishes from the
         // shutdown's callback, so 'prefinish' comes after end() returns.
@@ -32350,22 +32382,16 @@
             },
           });
         }
-        // 'resize' fires from an unref'd poll that runs only while a
-        // 'resize' listener is attached -- node starts and stops its SIGWINCH
-        // watch the same way. Unref'd, it never keeps the loop alive.
-        let poll = null;
-        this.on("newListener", (ev) => {
-          if (ev !== "resize" || poll !== null) return;
-          this[kLastSize] = windowSize(fd) ?? this[kLastSize];
-          poll = setInterval(() => this._refreshSize(), 250);
-          poll.unref();
-        });
-        this.on("removeListener", (ev) => {
-          if (ev === "resize" && poll !== null && this.listenerCount("resize") === 0) {
-            clearInterval(poll);
-            poll = null;
-          }
-        });
+        // 'resize' is node's for process.stdout and stderr alone: their
+        // getters add a SIGWINCH listener that calls _refreshSize, and a
+        // WriteStream a program makes never hears of a resize. oam has no
+        // SIGWINCH, so a stdio stream polls instead -- unref'd, and only
+        // while a 'resize' listener is attached. The watch is the emitter's
+        // internal kListenersChanged hook, not listeners of the stream's
+        // own, which node's stdout has none of (#391).
+        if (stdioBuild) {
+          Object.defineProperty(this, kResizePoll, { value: null, writable: true });
+        }
       }
     }
     Object.setPrototypeOf(WriteStream.prototype, Duplex.prototype);
@@ -32379,6 +32405,20 @@
     WriteStream.prototype.hasColors = function hasColors(count, env) {
       return ttyHasColors(count, env);
     };
+    Object.defineProperty(WriteStream.prototype, kListenersChanged, {
+      value(type) {
+        if ((type !== undefined && type !== "resize") || this[kResizePoll] === undefined) return;
+        const listening = this.listenerCount("resize") > 0;
+        if (listening && this[kResizePoll] === null) {
+          this[kLastSize] = windowSize(this[kTtyFd]) ?? this[kLastSize];
+          this[kResizePoll] = setInterval(() => this._refreshSize(), 250);
+          this[kResizePoll].unref();
+        } else if (!listening && this[kResizePoll] !== null) {
+          clearInterval(this[kResizePoll]);
+          this[kResizePoll] = null;
+        }
+      },
+    });
     WriteStream.prototype._refreshSize = function () {
       const old = this[kLastSize];
       const now = windowSize(this[kTtyFd]);

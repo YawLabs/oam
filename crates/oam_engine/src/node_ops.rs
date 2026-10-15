@@ -1852,18 +1852,22 @@ fn op_is_tty(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    use std::io::IsTerminal;
+    use oam_core::stdin::{HandleType, guess_handle};
     let fd = args.get(0).int32_value(scope).unwrap_or(-1);
+    // node's isatty is uv_guess_handle(fd) == UV_TTY, for stdio and for ANY
+    // other descriptor: a terminal the program opened itself (`/dev/tty`,
+    // `\\.\CONOUT$`) is one too, where every descriptor above 2 used to
+    // answer false. guess_handle, not std's IsTerminal: on Windows that also
+    // takes an msys/cygwin pty pipe for a terminal, which libuv does not, so
+    // under Git Bash's mintty stdout is not a TTY in node (#391).
     let is_tty = match fd {
-        0 => std::io::stdin().is_terminal(),
-        1 => std::io::stdout().is_terminal(),
-        2 => std::io::stderr().is_terminal(),
-        // node's isatty is uv_guess_handle(fd) == UV_TTY for ANY descriptor:
-        // a terminal the program opened itself (`/dev/tty`, `\\.\CONOUT$`)
-        // is one too. Every descriptor above 2 used to answer false (#391).
+        0 => guess_handle(&std::io::stdin()) == HandleType::Tty,
+        1 => guess_handle(&std::io::stdout()) == HandleType::Tty,
+        2 => guess_handle(&std::io::stderr()) == HandleType::Tty,
         fd if fd > 2 => {
             let files = core_runtime!(scope).sync_files();
-            oam_core::registered_file(&files, fd as u64).is_some_and(|file| file.is_terminal())
+            oam_core::registered_file(&files, fd as u64)
+                .is_some_and(|file| guess_handle(&*file) == HandleType::Tty)
         }
         _ => false,
     };
@@ -1893,7 +1897,9 @@ fn op_tty_init(
 /// `uv_tty_init` (src/win/tty.c): a descriptor with no OS handle is EBADF,
 /// and a handle that is no console fails `GetConsoleScreenBufferInfo` with
 /// ERROR_INVALID_HANDLE, which is EBADF too. Measured under node v22.22.2: an
-/// unopened descriptor, a disk file and a pipe all answer EBADF.
+/// unopened descriptor, a disk file, NUL, a pipe and an msys/cygwin pty pipe
+/// all answer EBADF -- the last is why this asks guess_handle (a console
+/// character device) and not std's IsTerminal, which takes that pipe (#391).
 #[cfg(windows)]
 fn tty_init_verdict(file: Option<&std::fs::File>) -> i32 {
     use oam_core::stdin::{HandleType, guess_handle};
@@ -2354,6 +2360,25 @@ mod console_switch_tests {
 
 #[cfg(windows)]
 fn tty_win_size(fd: i32) -> Option<(i32, i32)> {
+    let h = win_std_handle(fd);
+    if h == 0 || h == -1 {
+        return None;
+    }
+    console_win_size(h)
+}
+
+/// A descriptor oam's table holds: an OS handle the program opened (a
+/// console by name, `\\.\CONOUT$`), not one of the std handles.
+#[cfg(windows)]
+fn file_win_size(file: &std::fs::File) -> Option<(i32, i32)> {
+    use std::os::windows::io::AsRawHandle;
+    console_win_size(file.as_raw_handle() as isize)
+}
+
+/// The visible window of the console screen buffer `h`, or `None` when `h`
+/// is no console screen buffer (an input handle, a pipe, a file).
+#[cfg(windows)]
+fn console_win_size(h: isize) -> Option<(i32, i32)> {
     #[allow(dead_code)]
     #[repr(C)]
     struct Coord {
@@ -2382,14 +2407,12 @@ fn tty_win_size(fd: i32) -> Option<(i32, i32)> {
     unsafe extern "system" {
         fn GetConsoleScreenBufferInfo(h: isize, info: *mut Csbi) -> i32;
     }
-    let h = win_std_handle(fd);
-    if h == 0 || h == -1 {
-        return None;
-    }
     // SAFETY: Csbi is `#[repr(C)]` plain integer data, so an all-zero bit
     // pattern is a valid instance. `info` is a live stack struct passed by
     // `&mut`; its fields are only read after the return is checked non-zero.
-    // `h` is a validated console handle from win_std_handle.
+    // `h` is passed by value and only named to the kernel: a std handle
+    // already checked for 0 / -1, or the live handle of a file the caller
+    // holds. One that is no console fails the call and is never dereferenced.
     unsafe {
         let mut info: Csbi = std::mem::zeroed();
         if GetConsoleScreenBufferInfo(h, &mut info) == 0 {
@@ -2735,6 +2758,15 @@ mod raw_mode_tests {
     }
 }
 
+/// A descriptor oam's table holds. Its number is oam's (from OWN_FD_BASE up,
+/// or a dup of an inherited one), never the OS descriptor, so the ioctl goes
+/// to the file's own.
+#[cfg(unix)]
+fn file_win_size(file: &std::fs::File) -> Option<(i32, i32)> {
+    use std::os::fd::AsRawFd;
+    tty_win_size(file.as_raw_fd())
+}
+
 #[cfg(unix)]
 fn tty_win_size(fd: i32) -> Option<(i32, i32)> {
     // SAFETY: `winsize` is POSIX plain data, valid all-zero; `&mut ws` is live
@@ -2789,7 +2821,20 @@ fn op_tty_get_win_size(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let fd = args.get(0).int32_value(scope).unwrap_or(1);
-    match tty_win_size(fd) {
+    // Above 2 the number is a descriptor-table entry, not an OS descriptor:
+    // oam's own start at OWN_FD_BASE (64), so asking the OS about the bare
+    // number read the wrong terminal or none. node sizes the terminal the
+    // program opened, so the table's file is asked (#391); a number the
+    // table does not hold has no size, as node's getWindowSize fails EBADF.
+    let size = if fd > 2 {
+        let files = core_runtime!(scope).sync_files();
+        oam_core::registered_file(&files, fd as u64).and_then(|file| file_win_size(&file))
+    } else if fd >= 0 {
+        tty_win_size(fd)
+    } else {
+        None
+    };
+    match size {
         Some((cols, rows)) => {
             let c = v8::Integer::new(scope, cols);
             let r = v8::Integer::new(scope, rows);
