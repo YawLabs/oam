@@ -1864,7 +1864,9 @@
   // into a native op has a fixed cost (measured at ~0.4-0.9 us per call in a
   // debug build, where it took buf.toString() of 17 bytes from 25 to 53 ms
   // per 100k), while JIT'd JS decodes a short span in well under that; past
-  // a few dozen bytes the native decoder's per-byte speed wins.
+  // a few dozen bytes the native decoder's per-byte speed wins. A per-kind
+  // crossover (ucs2's JS loop emits one character per two bytes and so runs
+  // longest) did not separate from noise on this host at these spans.
   const SHORT_DECODE = 32;
   let nativeDecode = null;
 
@@ -1884,7 +1886,12 @@
       // Looked up on first use, not at snapshot time: __oam.node is
       // installed after the snapshot is restored.
       if (nativeDecode === null) nativeDecode = globalThis.__oam.node.bufferDecode;
-      return nativeDecode(view, start, end, kind);
+      const decoded = nativeDecode(view, start, end, kind);
+      // undefined: a view over a SharedArrayBuffer, which the native op
+      // will not borrow as a Rust slice while another thread may write it
+      // (crates/oam_engine/src/buffer_ops.rs); the element-wise JS decode
+      // gives the same string.
+      return decoded === undefined ? decodeShort(view, start, end, kind) : decoded;
     }
     const span = start === 0 && end === view.length ? view : view.subarray(start, end);
     switch (norm) {
@@ -1897,6 +1904,45 @@
       default:
         throw codes.ERR_UNKNOWN_ENCODING(encoding);
     }
+  }
+
+  // Buffer#toString's dispatch, as node's lib/buffer.js does it: node calls
+  // the receiver's own `<enc>Slice` method (`this.utf8Slice(...)` with no
+  // encoding, `buf.<enc>Slice(...)` through getEncodingOps otherwise), so a
+  // receiver that lacks it -- Buffer.prototype.toString.call(uint8Array),
+  // or a Uint16Array -- is a TypeError, and one that overrides it gets the
+  // override. Only a Uint8Array whose method is still the native one takes
+  // the direct decode, which is what that native would do with it.
+  const SLICE_METHOD = {
+    utf8: "utf8Slice",
+    latin1: "latin1Slice",
+    ascii: "asciiSlice",
+    utf16le: "ucs2Slice",
+    hex: "hexSlice",
+    base64: "base64Slice",
+    base64url: "base64urlSlice",
+  };
+  // Filled in where the natives are installed on Buffer.prototype.
+  const nativeSlices = {};
+  function sliceVia(receiver, norm, method, start, end, via) {
+    if (method === nativeSlices[SLICE_METHOD[norm]] && receiver instanceof Uint8Array) {
+      // node refuses UP FRONT when the result cannot fit in a V8 string
+      // (kStringMaxLength = 0x1fffffe8): without this guard the decode is
+      // attempted and the process dies with a V8 heap OOM instead of
+      // throwing a catchable error -- e.g. readFileSync(bigFile).toString().
+      // The check is on the BYTE span, matching node: a multi-byte encoding
+      // can only produce fewer characters, and node throws on the span too.
+      if (end - start > 0x1fffffe8) {
+        const err = new Error("Cannot create a string longer than 0x1fffffe8 characters");
+        err.code = "ERR_STRING_TOO_LONG";
+        throw err;
+      }
+      return decodeRange(receiver, start, end, norm);
+    }
+    if (typeof method !== "function") {
+      throw new TypeError(`${via}.${SLICE_METHOD[norm]} is not a function`);
+    }
+    return method.call(receiver, start, end);
   }
 
   // decodeRange's JS path for a short span, per DECODE_KIND.
@@ -2640,6 +2686,14 @@
     }
 
     toString(encoding, start, end) {
+      // node: `if (arguments.length === 0) return this.utf8Slice(0,
+      // this.length)` -- before any range logic, so even an empty receiver
+      // without the method throws. The method is read before the length, as
+      // V8 evaluates node's call.
+      if (arguments.length === 0) {
+        const method = this.utf8Slice;
+        return sliceVia(this, "utf8", method, 0, this.length, "this");
+      }
       // Node coerces start/end with Number(): NaN/non-numeric -> 0, fractional
       // truncates toward zero, negative clamps to 0, > length clamps to length;
       // an undefined end defaults to length. end <= start yields "".
@@ -2659,22 +2713,14 @@
         if (e < 0) e = 0;
         else if (e > len) e = len;
       }
-      // Node refuses UP FRONT when the result cannot fit in a V8 string
-      // (kStringMaxLength = 0x1fffffe8): without this guard the decode is
-      // attempted and the process dies with a V8 heap OOM instead of
-      // throwing a catchable error -- e.g. readFileSync(bigFile).toString().
-      // The check is on the BYTE span, matching node: a multi-byte encoding
-      // can only produce fewer characters, and node throws on the span too.
-      if (e - s > 0x1fffffe8) {
-        const err = new Error("Cannot create a string longer than 0x1fffffe8 characters");
-        err.code = "ERR_STRING_TOO_LONG";
-        throw err;
-      }
       // An empty range is "" before the encoding is looked at, as in node:
       // buf.toString('bogus', buf.length) does not throw there.
       if (e <= s) return "";
-      // No subarray: decodeRange reads [s, e) of the buffer in place.
-      return decodeRange(this, s, e, encoding);
+      if (encoding === undefined) return sliceVia(this, "utf8", this.utf8Slice, s, e, "this");
+      const norm = normalizeEncoding(encoding);
+      if (norm === undefined) throw codes.ERR_UNKNOWN_ENCODING(encoding);
+      // No subarray: the decode reads [s, e) of the buffer in place.
+      return sliceVia(this, norm, this[SLICE_METHOD[norm]], s, e, "buf");
     }
 
     // Node Buffer#slice is a VIEW (Uint8Array#slice copies).
@@ -3087,6 +3133,9 @@
       ucs2Write() { return rawWrite(this, arguments[0], arguments[1], arguments[2], "utf16le"); },
     };
     for (const name of Object.keys(natives)) Buffer.prototype[name] = natives[name];
+    // Buffer#toString decodes directly only while the receiver's method is
+    // one of these (sliceVia).
+    for (const name of Object.values(SLICE_METHOD)) nativeSlices[name] = natives[name];
     // The JS wrappers: length defaults to byteLength (the native clamps it
     // to the room past offset), and the range checks compare the RAW
     // arguments -- a NaN, an object or a numeric string passes them and is
@@ -11230,10 +11279,14 @@
   /// it looks the encoding up -- so with the `"buffer"` encoding (which the
   /// options check lets through) nothing read is "", and something read is
   /// ERR_UNKNOWN_ENCODING. fs.promises.readFile settles the encoding first
-  /// and refuses `"buffer"` whatever was read (measured on v22.22.2).
+  /// and refuses `"buffer"` whatever was read (measured on v22.22.2), so the
+  /// promise path (`!emptyIsString`) looks the label up before it decodes.
   function decodeRead(bytes, encoding, emptyIsString) {
     const BufferCtor = globalThis.Buffer;
     const buf = BufferCtor.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (!emptyIsString && encoding && normalizeEncoding(encoding) === undefined) {
+      throw codes.ERR_UNKNOWN_ENCODING(encoding);
+    }
     if (emptyIsString && encoding && buf.length === 0) return "";
     return encoding ? buf.toString(encoding) : buf;
   }

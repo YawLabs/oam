@@ -17,7 +17,12 @@
 //!
 //! No `unsafe` here: `ArrayBufferView::get_contents` is the safe read of a
 //! view's bytes (a copy into `storage` for a small on-heap array, a borrow of
-//! the off-heap backing store otherwise).
+//! the off-heap backing store otherwise). That borrow is a `&[u8]`, which
+//! promises Rust nothing else writes the bytes while it lives -- a promise a
+//! SharedArrayBuffer cannot keep, since a Worker may store into it during the
+//! decode. So `bufferDecode` declines shared memory (returns `undefined`) and
+//! the JS caller decodes it element by element through the typed array, as
+//! it did before this op existed.
 
 use crate::node_ops::throw_type_error;
 
@@ -43,7 +48,8 @@ const KIND_LATIN1: i32 = 1;
 const KIND_ASCII: i32 = 2;
 const KIND_UTF16LE: i32 = 3;
 
-/// `bufferDecode(view, start, end, kind)` -> string.
+/// `bufferDecode(view, start, end, kind)` -> string, or `undefined` for a
+/// view over a SharedArrayBuffer (the caller decodes that one in JS).
 ///
 /// `start`/`end` are byte indices into `view` that the JS caller has already
 /// clamped (to `0 <= start <= end <= view.byteLength`); they are clamped
@@ -71,6 +77,17 @@ pub(crate) fn op_buffer_decode(
     let end = index(scope, 2, len);
     let start = index(scope, 1, end);
     let kind = args.get(3).int32_value(scope).unwrap_or(KIND_UTF8);
+    // Shared memory: see the module doc. `has_buffer` first, because asking
+    // a small on-heap array for its backing store would move it off-heap;
+    // such an array is never shared.
+    if view.has_buffer()
+        && view
+            .get_backing_store()
+            .is_some_and(|store| store.is_shared())
+    {
+        rv.set_undefined();
+        return;
+    }
     let mut storage = [0u8; v8::TYPED_ARRAY_MAX_SIZE_IN_HEAP];
     let contents = view.get_contents(&mut storage);
     // get_contents spans the whole view; a detached buffer reads as empty.
