@@ -1743,6 +1743,22 @@
   codes.ERR_MODULE_NOT_FOUND = E("ERR_MODULE_NOT_FOUND", Error, function(path, base) {
     return 'Cannot find module "' + path + '"' + (base ? ' imported from ' + base : '');
   });
+  // require() of an ES module (cjs.rs / modules.rs require_esm raise these
+  // through this table so they carry node's shape). Node's texts, v22.22.2
+  // lib/internal/errors.js: the async one names the requiring and the
+  // required file, each line ending in a space as node's does; the cycle one
+  // is a '%s' code whose whole message the loader composes.
+  codes.ERR_REQUIRE_ASYNC_MODULE = E("ERR_REQUIRE_ASYNC_MODULE", Error, function(filename, parentFilename) {
+    let message = "require() cannot be used on an ESM " +
+      "graph with top-level await. Use import() instead. To see where the" +
+      " top-level await comes from, use --experimental-print-required-tla.";
+    if (parentFilename) message += `\n  From ${parentFilename} `;
+    if (filename) message += `\n  Requiring ${filename} `;
+    return message;
+  });
+  codes.ERR_REQUIRE_CYCLE_MODULE = E("ERR_REQUIRE_CYCLE_MODULE", Error, function(message) {
+    return message;
+  });
   codes.ERR_PACKAGE_PATH_NOT_EXPORTED = E("ERR_PACKAGE_PATH_NOT_EXPORTED", Error, function(pkgPath, subpath) {
     return 'Package subpath "' + subpath + '" is not defined by "exports" in ' + pkgPath;
   });
