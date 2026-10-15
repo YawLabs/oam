@@ -17881,7 +17881,10 @@
         return compileCacheResult(compileCacheStatus.FAILED, `Cannot create cache directory: ${reason}`);
       }
       if (!natives.compileCacheEnable(root)) {
-        // Another thread enabled it first; report its directory.
+        // This thread's cache is already on (the state read above makes
+        // this unreachable today; kept so the answer never depends on it).
+        // The state is per thread, as node's is per Environment: a worker
+        // enables its own directory and never moves the main thread's.
         const [, current] = natives.compileCacheState();
         return compileCacheResult(compileCacheStatus.ALREADY_ENABLED, undefined, current);
       }
@@ -17894,9 +17897,10 @@
       return natives.compileCacheState()[1];
     }
 
-    // Writes the ESM entries still waiting for their post-evaluate store;
-    // CJS entries are written as each module body returns. Never throws:
-    // a write failure only costs the next run a compile.
+    // Writes the ESM entries still waiting for their post-evaluate store and
+    // the CommonJS modules whose body is still running (the rest are written
+    // as each body returns). Never throws: a write failure only costs the
+    // next run a compile.
     function flushCompileCache() {
       natives.compileCacheFlush();
     }

@@ -40,8 +40,9 @@
 
 use oam_diagnostics::own_files::{self, Audience};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 /// oam-side format stamp folded into every cache key. Bump it whenever the
@@ -119,11 +120,43 @@ impl Kind {
 }
 
 /// Opaque content-addressed key for one `(source, kind)` pair under the
-/// current V8 build and oam format. Computed once by [`key_for`] and handed to
-/// [`load`], [`store`] and [`forget_seed`], so a load-then-store pair hashes
-/// the source a single time and never re-derives the cache root.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct CacheKey(String);
+/// current V8 build and oam format, plus the cache root its lookup used.
+/// Computed once by [`key_for`] and handed to [`load`], [`store`] and
+/// [`forget_seed`], so a load-then-store pair hashes the source a single
+/// time and never re-derives the cache root.
+///
+/// The root rides in the key because the root can move between a lookup and
+/// its store: `module.enableCompileCache(dir)` runs from inside a module
+/// body, after the entry (and an ESM entry's whole static graph) has been
+/// looked up but before any of them is stored -- ESM blobs are produced
+/// after evaluation, a CJS blob after its body returns. Re-reading the root
+/// at store time filed those entries under the new root while every later
+/// run looked them up under the old one, so the bin that follows node's
+/// advice (call `enableCompileCache` at its top) recompiled and rewrote its
+/// own entry on every run. A store now lands where its lookup looked.
+///
+/// Equality and hashing use the content hash alone: the in-memory seed map
+/// is keyed by content, and a seed must match whichever root the lookup
+/// that finds it used.
+#[derive(Clone, Debug)]
+pub(crate) struct CacheKey {
+    hash: String,
+    root: Arc<Path>,
+}
+
+impl PartialEq for CacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash
+    }
+}
+
+impl Eq for CacheKey {}
+
+impl std::hash::Hash for CacheKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
+}
 
 /// A blob returned by [`load`]: the raw bytes plus where they came from.
 /// `seeded` is true when the bytes are the in-process seed (embedded bytecode
@@ -166,7 +199,7 @@ impl CacheEnv {
     }
 }
 
-/// Pure path logic behind [`cache_root`]: node's `NODE_COMPILE_CACHE`, as
+/// Pure path logic behind [`env_root`]: node's `NODE_COMPILE_CACHE`, as
 /// `<dir>/<version_dir>` (see [`version_dir_name`]), else the
 /// `OAM_CACHE_DIR` override (tests), else the platform cache dir (`%LOCALAPPDATA%\oam` on Windows,
 /// `$XDG_CACHE_HOME/oam` or `~/.cache/oam` elsewhere), else the system temp
@@ -212,6 +245,13 @@ fn env_root() -> &'static Path {
     &env_selection().0
 }
 
+/// [`env_root`] as the shared handle a [`CacheKey`] carries, built once so
+/// a key costs a refcount bump, not a path copy.
+fn env_root_arc() -> Arc<Path> {
+    static ROOT: OnceLock<Arc<Path>> = OnceLock::new();
+    Arc::clone(ROOT.get_or_init(|| Arc::from(env_root())))
+}
+
 /// [`env_root`], and whether `NODE_COMPILE_CACHE` chose it. node creates the
 /// `NODE_COMPILE_CACHE` directory at start-up and, when it cannot (the path
 /// runs through a file, a read-only parent), runs with its compile cache off:
@@ -237,17 +277,26 @@ fn env_selection() -> &'static (PathBuf, bool) {
     })
 }
 
-/// The root `module.enableCompileCache(dir)` chose, once it has. A OnceLock,
-/// not a lock around a path: node's API enables the cache at most once per
-/// process (every later call answers ALREADY_ENABLED with the first
-/// directory), so the root moves at most once and the per-load read stays
-/// lock-free.
-static API_ROOT: OnceLock<PathBuf> = OnceLock::new();
+/// The root `module.enableCompileCache(dir)` chose for one isolate, kept in
+/// that isolate's slot. Per isolate, not per process, because node's
+/// compile-cache state is per Environment (measured on v22.22.2): a
+/// `worker_threads` Worker sees `getCompileCacheDir()` undefined after the
+/// main thread enabled the cache, can enable a directory of its own, and its
+/// call never moves the main thread's cache. A process-wide root let a
+/// worker's call redirect the main thread's lookups and stores mid-run.
+/// Set at most once per isolate: every later `enableCompileCache` call
+/// answers ALREADY_ENABLED with the first directory, as node's does.
+struct ApiRoot(Arc<Path>);
 
-/// Bytecode cache root for this process: the directory
-/// `module.enableCompileCache` chose, else the environment's.
-fn cache_root() -> &'static Path {
-    API_ROOT.get().map_or_else(env_root, PathBuf::as_path)
+/// The bytecode cache root for code compiled in `isolate`: the directory its
+/// `module.enableCompileCache` chose, else the environment's. Read on the
+/// isolate thread at lookup time and carried in the [`CacheKey`] from there
+/// (see its doc); graph-prefetch workers get the value their isolate read.
+pub(crate) fn root_for(isolate: &v8::Isolate) -> Arc<Path> {
+    match isolate.get_slot::<ApiRoot>() {
+        Some(ApiRoot(root)) => Arc::clone(root),
+        None => env_root_arc(),
+    }
 }
 
 /// oam's version, folded into every key and into [`version_dir_name`].
@@ -285,12 +334,12 @@ fn version_dir_name() -> String {
 /// is not reported: node's API answers for node's opt-in cache, and a program
 /// that branches on `getCompileCacheDir() === undefined` to decide whether to
 /// enable one must see the same answer it sees under node.
-pub(crate) fn api_dir() -> Option<PathBuf> {
+pub(crate) fn api_dir(isolate: &v8::Isolate) -> Option<PathBuf> {
     if !enabled() {
         return None;
     }
-    if let Some(root) = API_ROOT.get() {
-        return Some(root.clone());
+    if let Some(ApiRoot(root)) = isolate.get_slot::<ApiRoot>() {
+        return Some(root.to_path_buf());
     }
     let (root, node_selected) = env_selection();
     node_selected.then(|| root.clone())
@@ -307,11 +356,16 @@ pub(crate) fn api_version_dir() -> String {
     version_dir_name()
 }
 
-/// Make `root` this process's cache root, as `enableCompileCache` does.
-/// Returns false when the root was already chosen (another thread won the
-/// race); the caller then reports ALREADY_ENABLED with [`api_dir`].
-pub(crate) fn enable_at(root: PathBuf) -> bool {
-    API_ROOT.set(root).is_ok()
+/// Make `root` the cache root for code `isolate` compiles from now on, as
+/// `enableCompileCache` does. Returns false when this isolate already chose
+/// one; the caller then reports ALREADY_ENABLED with [`api_dir`]. Keys
+/// already handed out keep the root their lookup used (see [`CacheKey`]).
+pub(crate) fn enable_at(isolate: &mut v8::Isolate, root: PathBuf) -> bool {
+    if isolate.get_slot::<ApiRoot>().is_some() {
+        return false;
+    }
+    isolate.set_slot(ApiRoot(Arc::from(root)));
+    true
 }
 
 /// Lowercase hex of a 32-byte digest (no `hex` crate dependency).
@@ -354,25 +408,29 @@ fn entry_hash(source: &str, kind: Kind) -> String {
     hex32(&hasher.finalize().into())
 }
 
-/// The key for `source` compiled as `kind`. One SHA-256 pass; hand the result
-/// to every cache call for this compile.
-pub(crate) fn key_for(source: &str, kind: Kind) -> CacheKey {
-    CacheKey(entry_hash(source, kind))
+/// The key for `source` compiled as `kind`, looked up and stored under
+/// `root` (normally [`root_for`] the compiling isolate). One SHA-256 pass;
+/// hand the result to every cache call for this compile.
+pub(crate) fn key_for(source: &str, kind: Kind, root: Arc<Path>) -> CacheKey {
+    CacheKey {
+        hash: entry_hash(source, kind),
+        root,
+    }
 }
 
-/// Disk path for a key: `<cache_root>/<aa>/<rest>.v8c`.
+/// Disk path for a key: `<key root>/<aa>/<rest>.v8c`.
 fn path_for_key(key: &CacheKey) -> PathBuf {
-    cache_root()
-        .join(&key.0[..2])
-        .join(format!("{}.v8c", &key.0[2..]))
+    key.root
+        .join(&key.hash[..2])
+        .join(format!("{}.v8c", &key.hash[2..]))
 }
 
 /// Disk path for a key's seed-rejection tombstone:
-/// `<cache_root>/<aa>/<rest>.seedrej`. See [`record_seed_rejection`].
+/// `<key root>/<aa>/<rest>.seedrej`. See [`record_seed_rejection`].
 fn tombstone_path(key: &CacheKey) -> PathBuf {
-    cache_root()
-        .join(&key.0[..2])
-        .join(format!("{}.seedrej", &key.0[2..]))
+    key.root
+        .join(&key.hash[..2])
+        .join(format!("{}.seedrej", &key.hash[2..]))
 }
 
 /// Read the disk blob for a key. `None` on miss, any I/O error, or an empty
@@ -402,7 +460,8 @@ pub(crate) fn seed(source: &str, kind: Kind, blob: Vec<u8>) {
     if blob.is_empty() {
         return;
     }
-    let key = key_for(source, kind);
+    // The root is irrelevant here: seeds match on content (see CacheKey).
+    let key = key_for(source, kind, env_root_arc());
     if let Ok(mut map) = seed_map().lock() {
         map.insert(key, blob);
     }
@@ -454,7 +513,7 @@ pub(crate) fn load(key: &CacheKey) -> Option<Loaded> {
     if !enabled() {
         return None;
     }
-    maybe_sweep();
+    maybe_sweep(&key.root);
     let seeded = seed_map()
         .lock()
         .ok()
@@ -538,28 +597,31 @@ const BLOB_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// already stamped, so the leftover work waits for the next interval rather
 /// than the next process. Concurrent
 /// processes may walk at once -- a file deleted twice is a swallowed error.
-fn maybe_sweep() {
-    // One gate per root: `enableCompileCache(dir)` can move the root after
-    // the environment's has been swept, and a directory the program names
-    // needs the same housekeeping or it grows without bound.
-    static ENV_ROOT: Once = Once::new();
-    static API_ROOT_SWEPT: Once = Once::new();
-    let once = if API_ROOT.get().is_some() {
-        &API_ROOT_SWEPT
-    } else {
-        &ENV_ROOT
-    };
-    once.call_once(|| {
-        let root = cache_root().to_path_buf();
-        let _ = std::thread::Builder::new()
-            .name("oam-code-cache-sweep".into())
-            .spawn(move || {
-                let now = SystemTime::now();
-                if sweep_due(&root, now) {
-                    sweep(&root, now);
-                }
-            });
-    });
+fn maybe_sweep(root: &Path) {
+    // One gate per root, not per process: an isolate's
+    // `enableCompileCache(dir)` points its keys at a new root after the
+    // environment's may have been swept, and a directory a program names
+    // needs the same housekeeping or it grows without bound. The gate and
+    // the swept path are the same value, so no root is skipped or walked
+    // twice when a root is chosen between the two.
+    static SWEPT: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let first = SWEPT
+        .get_or_init(Mutex::default)
+        .lock()
+        .map(|mut swept| swept.insert(root.to_path_buf()))
+        .unwrap_or(false);
+    if !first {
+        return;
+    }
+    let root = root.to_path_buf();
+    let _ = std::thread::Builder::new()
+        .name("oam-code-cache-sweep".into())
+        .spawn(move || {
+            let now = SystemTime::now();
+            if sweep_due(&root, now) {
+                sweep(&root, now);
+            }
+        });
 }
 
 /// Whether a sweep of `root` is due at `now`: the root exists (nothing to do
@@ -699,9 +761,11 @@ fn dir_stats(root: &Path) -> (usize, u64) {
     (entries, bytes)
 }
 
-/// The bytecode directory this process uses.
+/// The bytecode directory the environment selects: what `oam cache` reports
+/// and cleans. A directory a program picks with `enableCompileCache(dir)` is
+/// that program's to manage, as under node.
 pub(crate) fn dir() -> PathBuf {
-    cache_root().to_path_buf()
+    env_root().to_path_buf()
 }
 
 /// Location, entry count and total size of this process's bytecode cache.
@@ -719,7 +783,7 @@ pub(crate) fn stats() -> CodeCacheStats {
 /// optimization, so the next run recompiles and repopulates. A missing
 /// directory is success.
 pub(crate) fn clean() -> std::io::Result<()> {
-    match std::fs::remove_dir_all(cache_root()) {
+    match std::fs::remove_dir_all(env_root()) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -870,10 +934,14 @@ mod tests {
         // Production hits every cache call through a constructed JsRuntime, so
         // pinning that order here mirrors the real call shape.
         let _rt = crate::JsRuntime::new();
-        let a = key_for("x", Kind::Function);
-        let b = key_for("x", Kind::Module);
+        let a = key_for("x", Kind::Function, env_root_arc());
+        let b = key_for("x", Kind::Module, env_root_arc());
         assert_ne!(a, b, "kind must key apart identical source");
-        assert_eq!(a, key_for("x", Kind::Function), "key is deterministic");
+        assert_eq!(
+            a,
+            key_for("x", Kind::Function, env_root_arc()),
+            "key is deterministic"
+        );
         // The Function key depends on the wrapper parameter list: the manual
         // digest below with a different param list must differ from `a`.
         use sha2::{Digest, Sha256};
@@ -886,8 +954,8 @@ mod tests {
         h.update(b"exports,require,module,__filename,__dirname,global,extra");
         h.update([0]);
         h.update(b"x");
-        let other = CacheKey(hex32(&h.finalize().into()));
-        assert_ne!(a, other, "a changed CJS_PARAMS must change the key");
+        let other = hex32(&h.finalize().into());
+        assert_ne!(a.hash, other, "a changed CJS_PARAMS must change the key");
         // And the current list reproduces the real key exactly.
         let mut h = Sha256::new();
         h.update(v8::script_compiler::cached_data_version_tag().to_le_bytes());
@@ -898,7 +966,7 @@ mod tests {
         h.update(crate::cjs::CJS_PARAMS.join(",").as_bytes());
         h.update([0]);
         h.update(b"x");
-        assert_eq!(a, CacheKey(hex32(&h.finalize().into())));
+        assert_eq!(a.hash, hex32(&h.finalize().into()));
         // A different oam release keys the same source apart.
         let mut h = Sha256::new();
         h.update(v8::script_compiler::cached_data_version_tag().to_le_bytes());
@@ -909,7 +977,7 @@ mod tests {
         h.update(crate::cjs::CJS_PARAMS.join(",").as_bytes());
         h.update([0]);
         h.update(b"x");
-        assert_ne!(a, CacheKey(hex32(&h.finalize().into())));
+        assert_ne!(a.hash, hex32(&h.finalize().into()));
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -1086,7 +1154,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let source = format!("seedfirst-{}-{nanos}", std::process::id());
-        let key = key_for(&source, Kind::Function);
+        let key = key_for(&source, Kind::Function, env_root_arc());
         seed(&source, Kind::Function, b"seed-bytes".to_vec());
         store(&key, b"disk-bytes");
         let got = load(&key).expect("seeded key loads");

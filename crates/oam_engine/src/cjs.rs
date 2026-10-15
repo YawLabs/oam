@@ -45,6 +45,16 @@ pub(crate) struct CjsCache {
     /// `process.mainModule`, handed to every `require` built afterwards as
     /// `require.main`. None leaves `require.main` undefined, as node does.
     main: Option<v8::Global<v8::Object>>,
+    /// Wrappers whose body is running now and whose bytecode is still to be
+    /// stored (a cache miss or a rejected blob), innermost last. A body that
+    /// ends the process -- `process.exit()` as a CLI's last line -- never
+    /// returns to the post-body store, so `process.exit()` and
+    /// `module.flushCompileCache()` store these too
+    /// ([`flush_in_flight_code_cache`]). node writes such an entry on exit
+    /// (measured on v22.22.2: `require('./dep.cjs'); process.exit(0)` leaves
+    /// both entries on disk); without this a CJS bin that exits from its
+    /// body never got a warm start.
+    in_flight_code_cache: Vec<(v8::Global<v8::Function>, crate::code_cache::CacheKey)>,
 }
 
 /// Name `entry` as this run's main module. Call after reset_run_slots
@@ -842,8 +852,13 @@ fn load_cjs_inner<'s>(
     // over the full source per require, least of all in the cold-compile
     // benchmarks the off switch exists for. `cached` is held for the whole
     // compile because `CachedData` borrows it (BufferNotOwned).
-    let cache_key = crate::code_cache::enabled()
-        .then(|| crate::code_cache::key_for(&source, crate::code_cache::Kind::Function));
+    // The root is read now, at lookup, and carried to the store in the key:
+    // a body that calls `enableCompileCache(dir)` must not file its own entry
+    // under a root later runs never look in (see code_cache::CacheKey).
+    let cache_key = crate::code_cache::enabled().then(|| {
+        let root = crate::code_cache::root_for(scope);
+        crate::code_cache::key_for(&source, crate::code_cache::Kind::Function, root)
+    });
     let cached = cache_key.as_ref().and_then(crate::code_cache::load);
     let consuming = cached.is_some();
 
@@ -974,7 +989,25 @@ fn load_cjs_inner<'s>(
         filename_v8.into(),
         dirname_v8.into(),
     ];
-    if wrapper.call(scope, recv, &call_args).is_none() {
+    // Registered for the duration of the body only, so an exit from inside
+    // it still stores this entry (see CjsCache::in_flight_code_cache).
+    let in_flight = if refresh_cache && let Some(cache_key) = &cache_key {
+        let global = v8::Global::new(scope, wrapper);
+        match scope.get_slot_mut::<CjsCache>() {
+            Some(cache) => {
+                cache.in_flight_code_cache.push((global, cache_key.clone()));
+                true
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+    let returned = wrapper.call(scope, recv, &call_args).is_some();
+    if in_flight && let Some(cache) = scope.get_slot_mut::<CjsCache>() {
+        cache.in_flight_code_cache.pop();
+    }
+    if !returned {
         // The body threw: exception stays pending, cache entry goes (Node
         // re-executes on the next require).
         evict(scope, &key);
@@ -998,6 +1031,23 @@ fn load_cjs_inner<'s>(
 
     // Re-read: `module.exports = ...` reassignment is the common idiom.
     module_exports(scope, module)
+}
+
+/// Store the bytecode of every CommonJS wrapper whose body is running now:
+/// `process.exit()` and `module.flushCompileCache()` (through
+/// `modules::flush_code_cache`). The entries stay registered, so a body that
+/// does return still stores its fuller post-body blob over this one.
+pub(crate) fn flush_in_flight_code_cache(scope: &mut v8::PinScope<'_, '_>) {
+    let in_flight = match scope.get_slot::<CjsCache>() {
+        Some(cache) => cache.in_flight_code_cache.clone(),
+        None => return,
+    };
+    for (wrapper, key) in in_flight {
+        let wrapper = v8::Local::new(scope, &wrapper);
+        if let Some(cd) = wrapper.create_code_cache() {
+            crate::code_cache::store(&key, &cd);
+        }
+    }
 }
 
 fn evict(scope: &mut v8::PinScope<'_, '_>, key: &Path) {

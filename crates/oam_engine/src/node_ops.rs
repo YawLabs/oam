@@ -1451,7 +1451,8 @@ fn op_exit(
 ) {
     let code = args.get(0).int32_value(scope).unwrap_or(0);
     // node writes its compile cache on the way out of process.exit(); the
-    // ESM entries still waiting for their post-evaluate store would be lost
+    // ESM entries still waiting for their post-evaluate store, and the CJS
+    // wrappers whose body is running (this call among them), would be lost
     // here otherwise (see modules::flush_code_cache).
     crate::modules::flush_code_cache(scope);
     // Immediate exit, documented divergence (no 'exit' event flush).
@@ -1477,7 +1478,7 @@ fn op_compile_cache_state(
         }
     }
     let disabled_by = text(scope, crate::code_cache::disabled_by());
-    let directory = crate::code_cache::api_dir();
+    let directory = crate::code_cache::api_dir(scope);
     let directory = text(
         scope,
         directory.as_deref().map(|d| d.to_string_lossy()).as_deref(),
@@ -1492,9 +1493,10 @@ fn op_compile_cache_state(
     rv.set(out.into());
 }
 
-/// `__oam.node.compileCacheEnable(root)`: move the bytecode cache to `root`
-/// (already created by the caller). Returns false when another thread chose
-/// a root first -- the caller then answers ALREADY_ENABLED.
+/// `__oam.node.compileCacheEnable(root)`: move this isolate's bytecode cache
+/// to `root` (already created by the caller). Returns false when this
+/// isolate chose a root already -- the caller then answers ALREADY_ENABLED.
+/// A worker's call moves only the worker's cache, as in node.
 fn op_compile_cache_enable(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -1504,7 +1506,7 @@ fn op_compile_cache_enable(
         throw_type_error(scope, "compileCacheEnable requires a directory");
         return;
     };
-    let won = crate::code_cache::enable_at(std::path::PathBuf::from(root));
+    let won = crate::code_cache::enable_at(scope, std::path::PathBuf::from(root));
     rv.set(v8::Boolean::new(scope, won).into());
 }
 
