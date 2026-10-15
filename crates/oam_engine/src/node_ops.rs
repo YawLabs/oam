@@ -192,6 +192,10 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("hostname", op_hostname),
         ("username", op_username),
         ("makeRequire", op_make_require),
+        // node:module's compile-cache API over code_cache.rs.
+        ("compileCacheState", op_compile_cache_state),
+        ("compileCacheEnable", op_compile_cache_enable),
+        ("compileCacheFlush", op_compile_cache_flush),
         // WHATWG URL (ada parser, same as Node.js): parse + mutation.
         // urlParseHref: validate + return canonical href (no component extraction).
         // urlParse: full extraction (called lazily on first property access).
@@ -1446,8 +1450,71 @@ fn op_exit(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let code = args.get(0).int32_value(scope).unwrap_or(0);
+    // node writes its compile cache on the way out of process.exit(); the
+    // ESM entries still waiting for their post-evaluate store would be lost
+    // here otherwise (see modules::flush_code_cache).
+    crate::modules::flush_code_cache(scope);
     // Immediate exit, documented divergence (no 'exit' event flush).
     oam_core::exit_process(code);
+}
+
+/// `__oam.node.compileCacheState()`: what node:module's compile-cache API
+/// needs to answer, as `[disabledBy, directory, defaultDirectory,
+/// versionDir]` -- `disabledBy` is the variable that turned the cache off
+/// or undefined, `directory` the enabled API directory or undefined (see
+/// code_cache::api_dir).
+fn op_compile_cache_state(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    // undefined for None, a string otherwise (undefined too in the
+    // impossible case that V8 refuses a path-sized string).
+    fn text<'s>(scope: &mut v8::PinScope<'s, '_>, s: Option<&str>) -> v8::Local<'s, v8::Value> {
+        match s.and_then(|s| v8::String::new(scope, s)) {
+            Some(s) => s.into(),
+            None => v8::undefined(scope).into(),
+        }
+    }
+    let disabled_by = text(scope, crate::code_cache::disabled_by());
+    let directory = crate::code_cache::api_dir();
+    let directory = text(
+        scope,
+        directory.as_deref().map(|d| d.to_string_lossy()).as_deref(),
+    );
+    let default_dir = text(
+        scope,
+        Some(&crate::code_cache::default_dir().to_string_lossy()),
+    );
+    let version_dir = text(scope, Some(&crate::code_cache::api_version_dir()));
+    let out =
+        v8::Array::new_with_elements(scope, &[disabled_by, directory, default_dir, version_dir]);
+    rv.set(out.into());
+}
+
+/// `__oam.node.compileCacheEnable(root)`: move the bytecode cache to `root`
+/// (already created by the caller). Returns false when another thread chose
+/// a root first -- the caller then answers ALREADY_ENABLED.
+fn op_compile_cache_enable(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(root) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "compileCacheEnable requires a directory");
+        return;
+    };
+    let won = crate::code_cache::enable_at(std::path::PathBuf::from(root));
+    rv.set(v8::Boolean::new(scope, won).into());
+}
+
+/// `__oam.node.compileCacheFlush()`: `module.flushCompileCache()`.
+fn op_compile_cache_flush(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    crate::modules::flush_code_cache(scope);
 }
 
 /// `__oam.node.stdoutWrite(chunk)`: `undefined`, or the error the write

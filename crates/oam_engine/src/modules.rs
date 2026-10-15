@@ -1893,7 +1893,14 @@ pub(crate) fn unhandled_rejection_failures(
 /// captured -- that is the residual lazy compile. Best-effort: a failed
 /// produce/write just means the next run pays the compile. Drains the list,
 /// so a repeat call is a no-op.
-fn store_pending_code_cache(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>) {
+///
+/// Also the body of `module.flushCompileCache()` and of `process.exit()`'s
+/// last step ([`flush_code_cache`]): node persists its compile cache when a
+/// program exits through `process.exit()` mid-graph (measured: an ESM entry
+/// that imports a module and then calls `process.exit(0)` leaves both
+/// entries on disk), and a CLI that ends that way would otherwise never get
+/// a warm start in oam.
+fn store_pending_code_cache(tc: &mut v8::PinScope<'_, '_>) {
     let pending = match tc.get_slot_mut::<ModuleMap>() {
         Some(map) => std::mem::take(&mut map.pending_code_cache),
         None => return,
@@ -1910,6 +1917,16 @@ fn store_pending_code_cache(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::
             crate::code_cache::store(&key, &cd);
         }
     }
+}
+
+/// Write every pending ESM bytecode entry now: `module.flushCompileCache()`
+/// and `process.exit()`. Drains the list like the post-evaluate store, so
+/// the store that follows evaluation finds nothing left to write -- the
+/// blob written here is a valid entry for its source, just without the
+/// inner functions the rest of evaluation would have compiled. CJS entries
+/// never wait: each is stored as soon as its module body returns.
+pub(crate) fn flush_code_cache(scope: &mut v8::PinScope<'_, '_>) {
+    store_pending_code_cache(scope);
 }
 
 // ------------------------------------------------------------- prefetch
