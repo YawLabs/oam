@@ -91,8 +91,10 @@ pub(crate) fn op_buffer_decode(
         KIND_UTF16LE => {
             // An odd trailing byte is dropped, as node's ucs2 decode does.
             let units: Vec<u16> = bytes
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
                 .collect();
             v8::String::new_from_two_byte(scope, &units, normal)
         }
