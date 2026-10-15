@@ -935,7 +935,7 @@ const STAT_RECORD_BYTES: usize = (oam_core::ops::STAT_NUMBERS + oam_core::ops::S
 fn write_stat_record(cells: &[std::cell::Cell<u8>], record: &oam_core::ops::StatRecord) {
     let doubles = record.numbers.iter().map(|value| value.to_ne_bytes());
     let integers = record.exact.iter().map(|value| value.to_ne_bytes());
-    for (slot, bytes) in cells.chunks_exact(8).zip(doubles.chain(integers)) {
+    for (slot, bytes) in cells.as_chunks::<8>().0.iter().zip(doubles.chain(integers)) {
         for (cell, byte) in slot.iter().zip(bytes) {
             cell.set(byte);
         }

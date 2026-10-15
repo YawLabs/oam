@@ -206,8 +206,9 @@ pub enum OpOutcome {
     /// A stat (stat, lstat, fstat): the engine resolves with a Float64Array
     /// over a fresh buffer laid out as [`ops::StatRecord`] describes, which
     /// the JS side builds its Stats from. A new variant, so a replay file
-    /// recorded before it existed still loads.
-    Stat(ops::StatRecord),
+    /// recorded before it existed still loads. Boxed: inline, its 280 bytes
+    /// would make every outcome that large.
+    Stat(Box<ops::StatRecord>),
     /// A directory's entries (readdir, and opendir's listing): the engine
     /// resolves with `[names, kinds]`, two arrays of strings. A new
     /// variant, so a replay file recorded before it existed still loads.
@@ -6369,7 +6370,7 @@ pub mod ops {
         let owned = path.clone();
         let result = tokio::task::spawn_blocking(move || stat_path_record(owned.os(), lstat)).await;
         match result {
-            Ok(Ok(record)) => OpOutcome::Stat(record),
+            Ok(Ok(record)) => OpOutcome::Stat(Box::new(record)),
             Ok(Err(e)) => node_fail(e, if lstat { "lstat" } else { "stat" }, &path),
             Err(e) => node_fail(
                 std::io::Error::other(e.to_string()),
@@ -6386,7 +6387,7 @@ pub mod ops {
     pub async fn fs_fstat(file: super::OpenFile) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || fstat_record(&file)).await;
         match result {
-            Ok(Ok(record)) => OpOutcome::Stat(record),
+            Ok(Ok(record)) => OpOutcome::Stat(Box::new(record)),
             Ok(Err(e)) => node_fail_fd_op(e, "fstat"),
             Err(e) => node_fail_fd_op(std::io::Error::other(e.to_string()), "fstat"),
         }
