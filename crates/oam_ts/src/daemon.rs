@@ -996,11 +996,15 @@ fn image_is_oam(name: &str) -> bool {
 /// our own std handles before the spawn closes the leak; our own IO is
 /// unaffected (the flag only governs inheritance).
 ///
-/// The `oam` binary calls this once at startup (oam_cli's main, right after
-/// snapshot_inherited_fds), as node does with uv_disable_stdio_inheritance,
-/// so no child of the CLI -- a detached one included -- inherits our std
-/// handles. The other call sites (spawn_daemon below, the tsgo spawn in
-/// lib.rs, oam_mcp) stay for library embedders, which never run that main.
+/// The `oam` binary does this, and more, once at startup:
+/// oam_core::disable_stdio_inheritance (oam_cli's main, right after
+/// snapshot_inherited_fds) clears the flag on these three handles and on
+/// the CRT fds 0 through 63 the parent passed, as node does with
+/// uv_disable_stdio_inheritance, so no child of the CLI -- a detached one
+/// included -- inherits them. This copy stays for library embedders, which
+/// never run that main, at its call sites (spawn_daemon below, the tsgo
+/// spawn in lib.rs, oam_mcp); oam_ts cannot call oam_core's, which it does
+/// not depend on.
 ///
 /// IMPORTANT: every INTERMEDIATE spawner needs this too — `oam mcp` piping
 /// `oam run` leaked ITS std handles (the agent's pipes) into the run child

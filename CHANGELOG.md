@@ -26,8 +26,19 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   the kill-on-close job) with `stdio: 'ignore'` then kept oam's output pipes open, and
   `$(oam run x.js)`, `oam run x.js | tail` or a CI log capture waited for that child to exit. oam
   now makes its std handles non-inheritable at startup, as node does. Children with
-  `stdio: 'inherit'` still write to oam's stdout and stderr; they receive a fresh duplicate. Other
-  inheritable handles (CRT fds 3 and up handed to oam by its parent) are not covered yet.
+  `stdio: 'inherit'` still write to oam's stdout and stderr; they receive a fresh duplicate. The
+  descriptors a parent hands oam above these three are covered by the next entry.
+- **Inherited descriptors above the std three (fds 3 and up) no longer leak into oam's children, as
+  under node.** A parent that spawns oam with `stdio: [..., 'pipe']` hands it extra descriptors; oam
+  left them inheritable, so every child oam started took a copy whatever its `stdio` said, and the
+  parent's read of that pipe ended when the last such child exited instead of when oam did. At
+  startup oam now does what node's `uv_disable_stdio_inheritance` does: on Windows it clears the
+  inherit flag on the std handles and on every CRT fd the parent passed, on unix it sets
+  `FD_CLOEXEC` on the inherited fds 3 and up (never on 0-2, which `stdio: 'inherit'` children
+  receive in place). oam's own reads and writes of an inherited fd, and a child explicitly given one
+  (`stdio: [..., 4]`), are unaffected. Descriptors at 64 and above are not covered
+  ([node-divergences #19](docs/node-divergences.md)). The fix is tested on Windows; the unix half
+  has not yet been built or run on unix, and its test stays ignored until it has.
 - **`fs.opendir`, `fs.opendirSync` and `fs.promises.opendir` honour `recursive`, as node's do
   (#286).** The `Dir` took one listing with one parent for all of it and ignored every option, so
   `{ recursive: true }` listed the top level only. It now walks as node v22.22.2's does. Handing out
