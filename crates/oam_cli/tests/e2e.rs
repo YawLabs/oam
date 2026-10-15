@@ -19593,9 +19593,13 @@ process.exit(0);
 fn fs_watch_detects_file_change() {
     let stdout = run_ok(
         "fs_watch.mjs",
+        // In the temp directory, not the cwd: fs.watch is OS notifications
+        // now, and a checkout on a file system that delivers none (WSL's
+        // /mnt/c) leaves node's watcher as silent as oam's.
         "import fs from 'fs';\n\
+         import os from 'os';\n\
          import path from 'path';\n\
-         const target = path.join(process.cwd(), '_watch_test_' + process.pid + '.tmp');\n\
+         const target = path.join(os.tmpdir(), '_watch_test_' + process.pid + '.tmp');\n\
          fs.writeFileSync(target, 'initial');\n\
          let detected = false;\n\
          const watcher = fs.watch(target, { interval: 30 }, (eventType, filename) => {\n\
