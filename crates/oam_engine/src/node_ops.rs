@@ -7,7 +7,7 @@
 //! failures throw/reject Errors carrying Node's `.code` (ENOENT, ...) —
 //! the ecosystem branches on codes, not messages.
 
-use crate::buffer_ops::op_buffer_decode;
+use crate::buffer_ops::{op_buffer_decode, op_buffer_utf8_length};
 use crate::crypto_ops::{
     op_crypto_check_prime, op_crypto_cipher_create, op_crypto_cipher_final,
     op_crypto_cipher_final_gcm, op_crypto_cipher_get_auth_tag, op_crypto_cipher_set_aad,
@@ -233,6 +233,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // Buffer#toString / *Slice for utf8, latin1, ascii and ucs2: V8's own
         // decoders, the ones node calls (buffer_ops.rs).
         ("bufferDecode", op_buffer_decode),
+        ("bufferUtf8Length", op_buffer_utf8_length),
         // fs sync
         ("fsReadFileSync", op_fs_read_file_sync),
         ("fsReadFileUtf8Sync", op_fs_read_file_utf8_sync),

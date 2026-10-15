@@ -46,6 +46,15 @@ for (const enc of ENCODINGS) {
   }
 }
 
+// UTF-8 byte counts of long strings (counted natively past 128 code units).
+show("byteLength long", () => [
+  Buffer.byteLength("\ud800a\u{1F600}é".repeat(100)),
+  Buffer.byteLength("\udc00".repeat(129)),
+  Buffer.byteLength("\ud83d".repeat(128) + "\ude00"),
+  Buffer.byteLength("\ude00\ud83d".repeat(70)),
+  new TextEncoder().encode("\ud800€".repeat(90)).length,
+]);
+
 // Decodes, short (<= 32 bytes) and long, valid and not.
 const SEQUENCES = [
   "c3", "c3a9c3", "e282", "eda080", "edbfbf", "f09f98", "f4908080", "f0808080", "c080", "e08080",

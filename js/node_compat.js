@@ -47,9 +47,22 @@
   // pair, so the Buffer hot paths allocate nothing.
   let utf8Read = 0;
 
+  // Strings longer than this many code units are counted by V8 natively
+  // (crates/oam_engine/src/buffer_ops.rs): its count is several times faster
+  // per code unit than the loop below, which wins on short strings because
+  // a native call has a fixed cost of its own (~0.5 us in a debug build).
+  const NATIVE_UTF8_LENGTH = 128;
+  let nativeUtf8Length = null;
+
   // Bytes `str` encodes to: node's Buffer.byteLength(str), V8's Utf8Length.
   function utf8Length(str) {
     const n = str.length;
+    if (n > NATIVE_UTF8_LENGTH) {
+      // Looked up on first use: __oam.node is installed after the snapshot
+      // is restored, and nothing counts a long string before that.
+      if (nativeUtf8Length === null) nativeUtf8Length = globalThis.__oam.node.bufferUtf8Length;
+      return nativeUtf8Length(str);
+    }
     let len = n;
     for (let i = 0; i < n; i++) {
       const c = str.charCodeAt(i);

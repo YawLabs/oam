@@ -1,21 +1,41 @@
-//! Native byte->string decoders behind `Buffer#toString` and the `*Slice`
-//! family (js/node_compat.js `decodeRange`).
+//! Native string codecs behind `Buffer` (js/node_compat.js): the byte->string
+//! decoders of `Buffer#toString` and the `*Slice` family for LONG spans
+//! (`decodeRange`), and the UTF-8 byte count of a LONG string
+//! (`utf8Length`). Short ones stay in JS, where they beat the fixed cost of
+//! a native call.
 //!
 //! Why native: a JS decoder builds its result one `String.fromCharCode` at a
-//! time, which made `buf.toString()` several times slower than node's for
-//! even a 17-byte buffer. V8 already owns the four decoders node uses for
-//! these encodings -- node's StringBytes::Encode hands utf8 to
-//! `String::NewFromUtf8` and latin1 / ucs2 to `NewFromOneByte` /
-//! `NewFromTwoByte` -- so calling the same V8 entry points gives node's
-//! output by construction (U+FFFD replacement of invalid UTF-8 included)
-//! rather than by re-implementing it. hex and base64 stay in JS: they ride
-//! V8's native `Uint8Array.prototype.toHex` / `toBase64` already.
+//! time, and a JS byte count reads one code unit at a time; on long input
+//! both are several times slower than V8's own routines. V8 already owns
+//! the decoders node uses for these encodings -- node's StringBytes::Encode
+//! hands utf8 to `String::NewFromUtf8` and latin1 / ucs2 to
+//! `NewFromOneByte` / `NewFromTwoByte` -- so calling the same V8 entry
+//! points gives node's output by construction (U+FFFD replacement of
+//! invalid UTF-8 included) rather than by re-implementing it. hex and base64
+//! stay in JS: they ride V8's native `Uint8Array.prototype.toHex` /
+//! `toBase64` already.
 //!
 //! No `unsafe` here: `ArrayBufferView::get_contents` is the safe read of a
 //! view's bytes (a copy into `storage` for a small on-heap array, a borrow of
 //! the off-heap backing store otherwise).
 
 use crate::node_ops::throw_type_error;
+
+/// `bufferUtf8Length(string)` -> the bytes `string` encodes to as UTF-8: a
+/// surrogate pair 4, a lone surrogate 3 (its U+FFFD), as node's
+/// Buffer.byteLength counts.
+pub(crate) fn op_buffer_utf8_length(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Ok(string) = v8::Local::<v8::String>::try_from(args.get(0)) else {
+        throw_type_error(scope, "bufferUtf8Length: argument must be a string");
+        return;
+    };
+    let length = string.utf8_length(scope);
+    rv.set(v8::Number::new(scope, length as f64).into());
+}
 
 /// The `kind` argument of `bufferDecode`, shared with js/node_compat.js.
 const KIND_UTF8: i32 = 0;
