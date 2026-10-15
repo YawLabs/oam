@@ -192,6 +192,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("hostname", op_hostname),
         ("username", op_username),
         ("makeRequire", op_make_require),
+        ("requireCache", op_require_cache),
         // WHATWG URL (ada parser, same as Node.js): parse + mutation.
         // urlParseHref: validate + return canonical href (no component extraction).
         // urlParse: full extraction (called lazily on first property access).
@@ -6817,6 +6818,17 @@ fn op_make_require(
     };
     if let Some(require) = crate::cjs::make_require(scope, &filename) {
         rv.set(require.into());
+    }
+}
+
+/// node:module's `Module._cache`: the same object every `require.cache` is.
+fn op_require_cache(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if let Some(cache) = crate::cjs::require_cache(scope) {
+        rv.set(cache.into());
     }
 }
 

@@ -17835,6 +17835,10 @@
       "zlib",
     ];
 
+    // Module._cache is require.cache: one object, so a program that deletes
+    // or plants an entry through either name is seen by every require().
+    Module._cache = natives.requireCache();
+
     return {
       createRequire(filename) {
         let base = String(filename);
@@ -17850,6 +17854,9 @@
       },
       syncBuiltinESMExports: () => {},
       Module,
+      // node's require('module') is Module itself, so _cache is reachable
+      // from both names.
+      _cache: Module._cache,
     };
   };
 
