@@ -16636,7 +16636,7 @@ fn a_killed_oam_run_does_not_leave_its_type_check_holding_stdout() {
     let _release = ReleaseOnDrop(stop.clone());
     let tsgo = stand_in_tsgo("killed_run_check");
 
-    let mut child = oam_command(&["run", script.to_str().unwrap()])
+    let mut child = oam_command(&["run", "--check=warn", script.to_str().unwrap()])
         .env("OAM_TSGO", &tsgo)
         .env("OAM_FAKE_TSGO_MARK", &mark)
         .env("OAM_FAKE_TSGO_STOP", &stop)
@@ -16707,7 +16707,7 @@ fn a_spawn_with_extra_stdio_works_once_the_type_check_has_started() {
     let tsgo = stand_in_tsgo("spawn_after_check");
 
     let out = bounded_output(
-        oam_command(&["run", script.to_str().unwrap()])
+        oam_command(&["run", "--check=warn", script.to_str().unwrap()])
             .env("OAM_TSGO", &tsgo)
             .env("OAM_FAKE_TSGO_MARK", &mark)
             .env("OAM_FAKE_TSGO_STOP", &stop)
