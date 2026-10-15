@@ -347,13 +347,16 @@ still wins. Only these tokens are accepted:
 ```
 --pending-deprecation   --no-warnings   --no-deprecation   --expose-gc
 --disable-warning[=]    --redirect-warnings[=]
---max-http-header-size[=]   --insecure-http-parser
+--max-http-header-size[=]   --insecure-http-parser   --trace-require-module[=]
 --tls-min-v1.0  --tls-min-v1.1  --tls-min-v1.2  --tls-min-v1.3  --tls-max-v1.2  --tls-max-v1.3
 ```
 
 Everything else in the variable is **ignored, not rejected** — `NODE_OPTIONS` is usually
 set globally in a shell profile and legitimately carries flags oam has no opinion on, so
-an unknown token must not brick every `oam` invocation on the machine.
+an unknown token must not brick every `oam` invocation on the machine. For the same reason
+an allowlisted flag with a value node refuses -- `--trace-require-module=bogus`, an empty
+`--max-http-header-size=` -- is ignored there, where node exits 9 (`node: invalid value
+for --trace-require-module`); on the command line oam refuses it with exit 9 as node does.
 
 The exclusions are the point: nothing that **executes code or names a file** is accepted
 from the environment. `-e` / `--eval` / `-p` / `--input-type` / `--env-file` /
@@ -835,30 +838,52 @@ module while `process.features.require_module` said `true`. It now does what nod
 by default: the graph loads and evaluates synchronously inside the `require()`, which
 returns the namespace -- or the facade namespace that adds `__esModule: true` when there
 is a default export and no own `__esModule`, or the value of an export named
-`'module.exports'`. A graph with a top-level await is `ERR_REQUIRE_ASYNC_MODULE`, a cycle
+`'module.exports'`. A graph with a top-level await is `ERR_REQUIRE_ASYNC_MODULE`, whether
+it never ran, is part-way through its await, or has finished under an `import`; a cycle
 through a module still loading or evaluating is `ERR_REQUIRE_CYCLE_MODULE` (node's
-wordings), an evaluation error is rethrown on every `require()`, and the module shares the
-one module map with `import()`. The ExperimentalWarning is printed only under
+wordings); an evaluation error, or the throw of a CommonJS module the graph imports, is
+rethrown as the same object on every later `require()` or `import()` without running
+anything again; an import that does not resolve is `ERR_MODULE_NOT_FOUND`, every time. A
+typeless file with module syntax is detected as an ES module, inside `node_modules` too.
+No ticks or promise jobs run before `require()` returns, and the module shares the one
+module map with `import()`. The ExperimentalWarning is printed only under
 `--trace-require-module`. `require.cache` is node's `Module._cache`, ES modules loaded
 through `require()` included: deleting an entry reloads, a planted entry is returned.
-Conformance cases 430-434. One ordering difference remains, entry 52.
+Conformance cases 430-434 and 440-442. What still differs is entry 52.
 
-### 52. A graph `require()` refuses for top-level await has already run its CommonJS dependencies
+### 52. `require()` of an ES module: a CommonJS dependency runs early, and what follows from it
 
 ```js
+// e.mjs:  import './a.mjs'; import './c.cjs';     (a.mjs imports b.mjs)
+//   node: b, a, c, e        oam: c, b, a, e
 // t.mjs:  import c from './c.cjs'; await 0; export const x = c;
-// c.cjs:  console.log('c ran');
-require('./t.mjs')   // both: ERR_REQUIRE_ASYNC_MODULE.  oam prints 'c ran' first; node does not.
+require('./t.mjs')   // both: ERR_REQUIRE_ASYNC_MODULE.  oam prints c's output first; node does not.
 ```
 
 oam runs a CommonJS module an ES graph imports while it loads the graph (its exports
-become the facade's named exports), where node runs it when the graph evaluates. Both run
-the modules in the same post-order, so a graph that evaluates sees no difference. A graph
-`require()` refuses does: node finds the top-level await after instantiating the graph and
-refuses before any of it runs, while oam has already run the CommonJS modules in it by
-then. The ES modules of the graph run in neither. The cycle check accounts for the same
-difference (a CommonJS dependency running during the load is treated as the evaluation
-node would be in), so `ERR_REQUIRE_CYCLE_MODULE` is raised where node raises it.
+become the facade's named exports), where node runs it when the graph evaluates. So in
+any graph, `require()`d or imported, a CommonJS dependency runs before the ES modules
+that come ahead of it in the graph's evaluation order -- the modules imported earlier in
+source order, and what they import. The ES modules themselves run in node's order. Three
+things follow:
+
+- a graph `require()` refuses for a top-level await has already run its CommonJS modules
+  (node finds the await after instantiating the graph and runs none of it); its ES modules
+  run in neither;
+- the cycle check replays the evaluation node would be in when the CommonJS module runs,
+  so `ERR_REQUIRE_CYCLE_MODULE` is raised for the same graphs, but where the two runtimes
+  reach the cycle at different points it can name a different module and use the other
+  wording of the two node has: oam's `Cannot import Module ./e.mjs in a cycle. (from
+  b.mjs)` where node says `Cannot require() ES Module b.mjs in a cycle. (from c.cjs)`;
+- an `import()` that such a CommonJS module makes loads and evaluates its graph inside the
+  `require()` (see "A module `import()` loads is evaluated inside the import"), where node
+  does it after the `require()` has returned and the requiring code's ticks and promise
+  jobs have run. The requiring code's own ticks and promise jobs still wait until the
+  `require()` returns, as in node (conformance case 441).
+
+One message differs on its own: an unresolved bare specifier whose package was found but
+whose file was not is `ERR_MODULE_NOT_FOUND` with oam's message, which lists the
+candidates tried, where node names the one file it resolved to.
 
 ### 24. TypeScript module kind: `.ts`/`.mts` are always ES modules
 
