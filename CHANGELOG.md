@@ -520,6 +520,18 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   that kept the process alive however it was unref'd. Conformance cases 421 and 422; what still
   differs is in docs/node-divergences.md.
 
+### Added
+
+- **`node:zlib` zstd, as Node v22.22.2 has it.** `zstdCompress`, `zstdCompressSync`,
+  `zstdDecompress`, `zstdDecompressSync`, `createZstdCompress`, `createZstdDecompress`, the
+  `ZstdCompress` / `ZstdDecompress` classes and the `ZSTD_*` constants, over libzstd 1.5.7
+  -- the library Node links, through the `zstd-safe` binding -- so the compressed bytes,
+  every `ZSTD_c_*` / `ZSTD_d_*` parameter and the `ZSTD_error_*` errors are Node's. The
+  streams run Node's own `ZlibBase` loop, so its quirks match too: a one-shot decompress
+  returns the first frame only, a frame cut short decodes without error, and `flush()`,
+  `reset()` and `close()` work. `process.versions.zstd` reports the linked libzstd.
+  Conformance cases 435-437.
+
 ## [0.19.0] - 2026-10-11
 
 ### Fixed
