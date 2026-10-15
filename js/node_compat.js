@@ -9844,7 +9844,8 @@
     // The handle here is { natives, entries }: the natives the walk opens
     // subdirectories with, and the top directory's listing.
     constructor(handle, path, options) {
-      if (!handle) throw new codes.ERR_MISSING_ARGS("handle");
+      // node refuses only a missing handle (null or undefined).
+      if (handle == null) throw new codes.ERR_MISSING_ARGS("handle");
       // node spreads the options over the default, so an own `bufferSize:
       // undefined` is refused as not a number. It validates after the open.
       const opts = { bufferSize: 32, ...options };

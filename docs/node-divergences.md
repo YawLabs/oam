@@ -3729,7 +3729,9 @@ top level only, #286). Measured on Windows, what is left:
   settle after a `setImmediate` made before them, where node's settle before it. The order of
   the reads, the queue behind them and the next-tick delivery of a buffered entry are node's.
   `process.getActiveResourcesInfo()` lists node's `FSReqCallback` for each such read and close
-  while it is in flight, and also an `Immediate` beside it, which node does not.
+  while it is in flight, and also an `Immediate` beside it, which node does not. It is released
+  as the read or close settles, so code just after `await dir.read()` or `await dir.close()`
+  (or a microtask a read callback queues) no longer sees it, where node's still lists it.
 - **A Buffer path is held as a string.** node keeps the Buffer as `dir.path` and as each
   Dirent's `parentPath`, so `opendirSync(buffer, { recursive: true })` throws
   `ERR_INVALID_ARG_TYPE` there at the first subdirectory (`path.join` refuses the Buffer);
