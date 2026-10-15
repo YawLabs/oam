@@ -34249,9 +34249,9 @@
   };
 
   // ---------------------------------------------------------------------- v8
-  // v8 module stub: expose minimal heap / serialization surface. Real V8
-  // bindings land with the diagnostics wave; for now, feature-detect callers
-  // get safe defaults and serialization uses JSON under a V8 wire header.
+  // v8 module: heap statistics and heap snapshots are V8's own (natives);
+  // the rest is a minimal surface -- feature-detect callers get safe
+  // defaults and serialization uses JSON under a V8 wire header.
   registry.factories.v8 = (natives) => {
     // V8 serialization wire format sentinel bytes: 0xff 0x0d (version 13).
     function serialize(value) {
