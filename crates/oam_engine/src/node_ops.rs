@@ -6744,11 +6744,17 @@ fn op_fs_readdir_sync(
     // args[1]: the file system's own order, for opendir's Dir (see
     // oam_core::ops::readdir_to_json).
     let raw = args.get(1).is_true();
+    // args[2]: with `raw`, a failure names the path, as the directory a
+    // recursive Dir descends into is opened by node's sync binding with its
+    // path (`ENOENT: ..., opendir '<dir>'`), where opendirSync's own open is
+    // not (#286).
+    let named = args.get(2).is_true();
     let Some(path) = scandir_path_arg(scope, &args, raw, "readdirSync requires a path") else {
         return;
     };
     match oam_core::ops::readdir_to_json(path.os(), raw) {
         Ok(json) => return_json(scope, &mut rv, &json),
+        Err(e) if raw && named => throw_node_error(scope, "opendir", &path, &e),
         // node's opendirSync names its syscall and no path (`ENOTDIR: not a
         // directory, opendir`), on every platform; opendir and
         // fs.promises.opendir name the path too.

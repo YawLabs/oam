@@ -1329,6 +1329,12 @@
   });
   // fs.Dir used after close().
   codes.ERR_DIR_CLOSED = E("ERR_DIR_CLOSED", Error, "Directory handle was closed");
+  // fs.Dir's readSync()/closeSync() while a read() of it is in flight.
+  codes.ERR_DIR_CONCURRENT_OPERATION = E(
+    "ERR_DIR_CONCURRENT_OPERATION",
+    Error,
+    "Cannot do synchronous work on directory handle with concurrent asynchronous operations",
+  );
   // process.setuid() and friends given a user or group name with no entry
   // (`kind` is "User" or "Group").
   codes.ERR_UNKNOWN_CREDENTIAL = E("ERR_UNKNOWN_CREDENTIAL", Error, function(kind, value) {
@@ -1603,8 +1609,11 @@
 
   // Render a number the way Node's ERR_OUT_OF_RANGE does: underscore thousands
   // separators only for magnitudes strictly greater than 2**32 (Node parity --
-  // 2**32 itself prints plain, 2**40 gets separators); otherwise String(n).
+  // 2**32 itself prints plain, 2**40 gets separators); otherwise String(n),
+  // except -0: node inspects the value, which keeps its sign ("Received -0"
+  // for fs.opendirSync(p, { bufferSize: -0 }), measured on v22.22.2; #286).
   function fmtRange(n) {
+    if (Object.is(n, -0)) return "-0";
     // A bigint is grouped past 2n**32n, as a number is; either way it keeps
     // its n.
     if (typeof n === "bigint") {
@@ -9789,91 +9798,306 @@
     return dirPath === "" && process.platform === "win32" ? "." : dirPath;
   }
 
-  // node's fs.Dir. Was two ad-hoc object literals (one per opendir form),
-  // which left `fs.Dir` unexported and gave each form only half the method
-  // set -- an opendirSync() handle had no read()/close(), an opendir() handle
-  // no readSync()/closeSync(), where node's single class carries all four.
-  // Entries are snapshotted at open, as both literals already did.
+  // node's fs.Dir (lib/internal/fs/dir.js, v22.22.2). Was two ad-hoc object
+  // literals (one per opendir form), which left `fs.Dir` unexported and gave
+  // each form only half the method set; then a class over one list with one
+  // parent for all of it, so `{ recursive: true }` listed the top level only
+  // (#286).
+  //
+  // node's Dir reads through a uv_dir_t handle `bufferSize` entries at a time
+  // (32 by default). A handle here is a directory's entries, snapshotted when
+  // it is opened, with a cursor, handed out in the same chunks -- so what
+  // follows from the chunking is node's too. That matters for `recursive`,
+  // whose order is not a plain breadth-first walk: when a directory's Dirent
+  // is handed out, that directory is opened (synchronously, in every form)
+  // and queued, and each later read first pulls one chunk from the queue's
+  // head into the buffer, rotating it to the back while it has more, before
+  // the top directory is read again. A tree whose directories fit in a chunk
+  // comes out breadth first; past that, a subdirectory's entries interleave
+  // with the rest of its parent's (measured on v22.22.2 with bufferSize 1, 2
+  // and 3, and reproduced by the model below).
+  const OPENDIR_DEFAULTS = { encoding: "utf8" };
+  const SymbolDispose = Symbol.dispose ?? Symbol.for("nodejs.dispose");
+  const SymbolAsyncDispose = Symbol.asyncDispose ?? Symbol.for("nodejs.asyncDispose");
+  // The fs callback layer's fsReqStart/fsReqEnd, for a Dir's own requests.
+  const dirRequestStart = () => {
+    const token = { type: "FSReqCallback" };
+    registry._activeRequests.add(token);
+    return token;
+  };
+  const dirRequestEnd = (token) => registry._activeRequests.delete(token);
   class Dir {
-    #entries;
-    #index = 0;
+    #natives;
+    #path;
+    #handle;
+    #buffered = [];
+    // The subdirectories a recursive walk has opened: { handle, path }.
+    #handlers = [];
     #closed = false;
-    constructor(path, entries) {
-      this.path = path;
-      this.#entries = entries;
+    #recursive;
+    #bufferSize;
+    // node's #operationQueue: non-null while a read of the top directory is
+    // in flight, holding the reads and closes made meanwhile.
+    #queue = null;
+    // node's signature (handle, path, options), so `length` is 3 and a Dir
+    // made without a handle throws ERR_MISSING_ARGS, as node's does (#286).
+    // The handle here is { natives, entries }: the natives the walk opens
+    // subdirectories with, and the top directory's listing.
+    constructor(handle, path, options) {
+      // node refuses only a missing handle (null or undefined).
+      if (handle == null) throw new codes.ERR_MISSING_ARGS("handle");
+      // node spreads the options over the default, so an own `bufferSize:
+      // undefined` is refused as not a number. It validates after the open.
+      const opts = { bufferSize: 32, ...options };
+      validateInteger(opts.bufferSize, "options.bufferSize", 1, 4294967295);
+      this.#natives = handle.natives;
+      this.#path = path;
+      this.#handle = { entries: handle.entries, index: 0 };
+      this.#recursive = opts.recursive;
+      this.#bufferSize = opts.bufferSize;
     }
-    #next() {
-      // node tracks the handle's closed state and throws on ANY later
-      // operation -- including a second close() -- rather than reporting
-      // end-of-directory. Returning null here instead made a use-after-close
-      // bug look like an empty directory.
-      if (this.#closed) {
-        throw codes.ERR_DIR_CLOSED();
+    // A getter, as node's: `path` is not an own property of a Dir.
+    get path() {
+      if (!(#path in this)) throw codes.ERR_INVALID_THIS("Dir");
+      return this.#path;
+    }
+    // A handle's next chunk, or null once it has no entries left.
+    #readHandle(handle) {
+      if (handle.index >= handle.entries.length) return null;
+      const chunk = handle.entries.slice(handle.index, handle.index + this.#bufferSize);
+      handle.index += chunk.length;
+      return chunk;
+    }
+    #buffer(parentPath, chunk) {
+      for (const entry of chunk) this.#buffered.push(makeDirent(parentPath, entry));
+    }
+    // node's #processHandlerQueue: whether an entry is buffered once the
+    // opened subdirectories have had their turn.
+    #drainHandlers() {
+      while (this.#handlers.length > 0) {
+        const handler = this.#handlers.shift();
+        const chunk = this.#readHandle(handler.handle);
+        if (chunk !== null) {
+          this.#buffer(handler.path, chunk);
+          this.#handlers.push(handler);
+        }
+        if (this.#buffered.length > 0) break;
       }
-      if (this.#index >= this.#entries.length) return null;
-      return makeDirent(this.path, this.#entries[this.#index++]);
+      return this.#buffered.length > 0;
     }
-    readSync() { return this.#next(); }
-    closeSync() {
-      if (this.#closed) {
-        throw codes.ERR_DIR_CLOSED();
+    // The next buffered Dirent, and with `recursive` (any truthy value, as
+    // node tests it) the directory it names opened for the walk. The Dirent
+    // is taken before the open, so an open that fails -- the directory gone
+    // since its parent was read -- throws it away, as node's does.
+    #take() {
+      const dirent = this.#buffered.shift();
+      if (this.#recursive && dirent.isDirectory()) {
+        const path = registry.get("path").join(dirent.parentPath, dirent.name);
+        const entries = this.#natives.fsReaddirSync(path, true, true);
+        this.#handlers.push({ handle: { entries, index: 0 }, path });
       }
-      this.#closed = true;
+      return dirent;
     }
-    // Both forms accept node's optional callback as well as returning a
-    // promise (node's Dir#read/#close are dual-shaped).
-    //
-    // How a CLOSED handle is reported differs between the two, and it differs
-    // between read and close -- measured against v22.22.2, not assumed:
+    // Dual-shaped, as node's: no argument is a promise; anything else is a
+    // callback (so `read(undefined)` on a closed handle throws). How a
+    // CLOSED handle is reported differs between read and close -- measured
+    // against v22.22.2, not assumed:
     //   read(cb)  -> throws SYNCHRONOUSLY   read()  -> rejects
     //   close(cb) -> calls back with err    close() -> rejects
-    // node's #readImpl runs inline when a callback is supplied, so its guard
-    // throws out of the call itself; close routes its guard through the
-    // callback instead.
     read(callback) {
-      if (typeof callback === "function") {
-        // Deliberately UNGUARDED: a closed handle must throw out of this call.
-        const value = this.#next();
-        callback(null, value);
+      return arguments.length === 0 ? this.#readPromise() : this.#read(true, callback);
+    }
+    #readPromise() {
+      return new Promise((resolve, reject) => {
+        this.#read(false, (err, dirent) => (err ? reject(err) : resolve(dirent)));
+      });
+    }
+    // node's #readImpl. An entry already buffered goes to a callback on the
+    // next tick (to the promise at once); one that needs the top directory
+    // read goes after an asynchronous read, during which other reads and
+    // closes wait their turn and the sync forms throw
+    // ERR_DIR_CONCURRENT_OPERATION. The callback used to be called before
+    // read() returned.
+    #read(maybeSync, callback) {
+      if (this.#closed) throw codes.ERR_DIR_CLOSED();
+      if (callback === undefined) return this.#readPromise();
+      validateCb(callback, "callback");
+      if (this.#queue !== null) {
+        this.#queue.push(() => this.#read(maybeSync, callback));
         return undefined;
       }
-      try { return Promise.resolve(this.#next()); } catch (e) { return Promise.reject(e); }
+      if (this.#drainHandlers()) {
+        try {
+          const dirent = this.#take();
+          if (maybeSync) process.nextTick(callback, null, dirent);
+          else callback(null, dirent);
+          return undefined;
+        } catch (error) {
+          return callback(error);
+        }
+      }
+      this.#queue = [];
+      // node holds an FSReqCallback for the read of the top directory (the
+      // promise form too, and the read that finds the end), and none for a
+      // buffered entry: process.getActiveResourcesInfo() lists it, until
+      // its callback has returned -- a close(cb) made in that callback
+      // still sees it (#286).
+      const token = dirRequestStart();
+      setImmediate(() => {
+        try {
+          this.#readTop(callback);
+        } finally {
+          dirRequestEnd(token);
+        }
+      });
+      return undefined;
+    }
+    // The completion of a read of the top directory. The reads and closes
+    // queued behind it run on the next tick. As node's, a throw from the
+    // callback calls it again with that error.
+    #readTop(callback) {
+      process.nextTick(() => {
+        const queue = this.#queue;
+        this.#queue = null;
+        for (const op of queue) op();
+      });
+      const chunk = this.#readHandle(this.#handle);
+      if (chunk === null) return callback(null, null);
+      try {
+        this.#buffer(this.#path, chunk);
+        callback(null, this.#take());
+      } catch (error) {
+        callback(error);
+      }
+      return undefined;
+    }
+    readSync() {
+      if (this.#closed) throw codes.ERR_DIR_CLOSED();
+      if (this.#queue !== null) throw codes.ERR_DIR_CONCURRENT_OPERATION();
+      if (this.#drainHandlers()) return this.#take();
+      const chunk = this.#readHandle(this.#handle);
+      if (chunk === null) return null;
+      this.#buffer(this.#path, chunk);
+      return this.#take();
     }
     close(callback) {
-      try { this.closeSync(); } catch (e) {
-        if (typeof callback === "function") { callback(e); return undefined; }
-        return Promise.reject(e);
+      if (callback === undefined) {
+        if (this.#closed) return Promise.reject(codes.ERR_DIR_CLOSED());
+        return this.#closePromise();
       }
-      if (typeof callback === "function") { callback(null); return undefined; }
-      return Promise.resolve();
+      validateCb(callback, "callback");
+      if (this.#closed) {
+        process.nextTick(callback, codes.ERR_DIR_CLOSED());
+        return undefined;
+      }
+      if (this.#queue !== null) {
+        this.#queue.push(() => this.close(callback));
+        return undefined;
+      }
+      this.#handlers.length = 0;
+      this.#closed = true;
+      // An FSReqCallback while the close is in flight, as node's (not for a
+      // close of a closed Dir, which calls back on the next tick; #286).
+      const token = dirRequestStart();
+      setImmediate(() => {
+        try {
+          callback(null);
+        } finally {
+          dirRequestEnd(token);
+        }
+      });
+      return undefined;
+    }
+    #closePromise() {
+      return new Promise((resolve, reject) => {
+        this.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+    closeSync() {
+      if (this.#closed) throw codes.ERR_DIR_CLOSED();
+      if (this.#queue !== null) throw codes.ERR_DIR_CONCURRENT_OPERATION();
+      this.#handlers.length = 0;
+      this.#closed = true;
     }
     // Iterating to the end CLOSES the handle, and so does abandoning the loop
-    // early (`break` / `throw` runs the iterator's return()). That is node's
+    // early (`break` / `throw` runs the generator's finally). That is node's
     // behavior -- `await dir.close()` after a for-await rejects there with
-    // ERR_DIR_CLOSED -- and without it a loop leaves the handle open, so the
-    // close() that node rejects would quietly succeed here.
-    #finish() {
-      if (!this.#closed) this.#closed = true;
-      return { done: true, value: undefined };
+    // ERR_DIR_CLOSED, and so does the loop itself when its body closed the
+    // handle.
+    async *entries() {
+      try {
+        while (true) {
+          const dirent = await this.#readPromise();
+          if (dirent === null) break;
+          yield dirent;
+        }
+      } finally {
+        await this.#closePromise();
+      }
     }
-    [Symbol.asyncIterator]() {
-      return {
-        next: async () => {
-          const value = this.#next();
-          return value === null ? this.#finish() : { done: false, value };
-        },
-        return: async () => this.#finish(),
-      };
-    }
+    // A SYNC iterator, which node's Dir does not have: an intentional oam
+    // extra kept from before the class (pinned by the e2e test
+    // dir_sync_iterator_is_an_intentional_oam_extra). It walks as readSync
+    // does, `recursive` included, and closes the handle at the end or on an
+    // abandoned loop.
     [Symbol.iterator]() {
+      const finish = () => {
+        if (!this.#closed) this.closeSync();
+        return { done: true, value: undefined };
+      };
       return {
         next: () => {
-          const value = this.#next();
-          return value === null ? this.#finish() : { done: false, value };
+          const value = this.readSync();
+          return value === null ? finish() : { done: false, value };
         },
-        return: () => this.#finish(),
+        return: finish,
       };
     }
+    [SymbolDispose]() {
+      if (this.#closed) return;
+      this.closeSync();
+    }
+    async [SymbolAsyncDispose]() {
+      if (this.#closed) return;
+      await this.#closePromise();
+    }
+  }
+  Object.defineProperty(Dir.prototype, Symbol.asyncIterator, {
+    value: Dir.prototype.entries,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+
+  // fs.opendir, and through it fs.promises.opendir, which node makes with
+  // promisify (so it takes its callback where this one does, and a Dir that
+  // refuses its options -- a bad `bufferSize`, checked after the open -- is
+  // thrown from the completion, uncaught, in both). `requests` counts the
+  // callback form's request for process.getActiveResourcesInfo().
+  function opendirAsync(natives, path, options, callback, requests) {
+    callback = typeof options === "function" ? options : callback;
+    validateCb(callback, "callback");
+    const dirPath = toPath(path);
+    const opts = fsGetOptions(options, OPENDIR_DEFAULTS);
+    const token = requests?.start();
+    let reading;
+    try {
+      // Raw order: node's Dir reads through uv_fs_readdir, which never
+      // sorts, where readdir's scandir sorts on unix.
+      reading = natives.fsReaddir(opendirPath(dirPath), true);
+    } catch (e) {
+      reading = Promise.reject(e);
+    }
+    reading.then(
+      (entries) => {
+        requests?.end(token);
+        process.nextTick(() => callback(null, new Dir({ natives, entries }, dirPath, opts)));
+      },
+      (err) => {
+        requests?.end(token);
+        process.nextTick(callback, err);
+      },
+    );
   }
 
   function wrapDirents(parent, entries, withFileTypes) {
@@ -13015,11 +13239,21 @@
         err.code = "ERR_METHOD_NOT_IMPLEMENTED";
         return Promise.reject(err);
       },
-      opendir: withPath(async function (dirPath) {
-        // Raw order: node's Dir reads through uv_fs_readdir, which never
-        // sorts, where readdir's scandir sorts on unix.
-        return new Dir(dirPath, await natives.fsReaddir(opendirPath(dirPath), true));
-      }),
+      // node's is promisify(opendir): it hands opendir its arguments with the
+      // callback last, and has its `length` (3). Only opendir's three slots
+      // are passed on, so a third argument the caller gave is the callback
+      // there, as in node (which calls it and never settles the promise),
+      // not opendirAsync's `requests` (#286).
+      opendir: Object.defineProperty(
+        function opendir(...args) {
+          return new Promise((resolve, reject) => {
+            args.push((err, dir) => (err ? reject(err) : resolve(dir)));
+            opendirAsync(natives, args[0], args[1], args[2]);
+          });
+        },
+        "length",
+        { value: 3 },
+      ),
       // node's order: the options, then the paths, then the copy.
       cp: async (src, dest, options) => {
         const opts = validateCpOptions(options);
@@ -13843,9 +14077,12 @@
         validateFd(fd, true);
         return writeSyncTo(fd, bytes, pos);
       },
-      opendirSync: function (path) {
-        var dirPath = toPath(path);
-        return new Dir(dirPath, natives.fsReaddirSync(opendirPath(dirPath), true));
+      // node's order: the path, the options, the open, then (in the Dir)
+      // the bufferSize.
+      opendirSync: function opendirSync(path, options) {
+        const dirPath = toPath(path);
+        const opts = fsGetOptions(options, OPENDIR_DEFAULTS);
+        return new Dir({ natives, entries: natives.fsReaddirSync(opendirPath(dirPath), true) }, dirPath, opts);
       },
       cpSync: function cpSync(src, dest, options) {
         const opts = validateCpOptions(options);
@@ -13974,7 +14211,9 @@
         return truncateByPath(path, Math.max(0, len), cb);
       },
       // opendir is the one whose callback node validates as "callback".
-      opendir: callbackify1(promises.opendir, 1, 1, "callback"),
+      opendir: function opendir(path, options, callback) {
+        opendirAsync(natives, path, options, callback, { start: fsReqStart, end: fsReqEnd });
+      },
       // node's fs.cp: the callback, the options and the paths are checked
       // in the call, which throws; the copy answers through the callback, as
       // node's util.callbackify(cpFn) does -- a later tick, `(null, undefined)`

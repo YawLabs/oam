@@ -20,6 +20,20 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`fs.opendir`, `fs.opendirSync` and `fs.promises.opendir` honour `recursive`, as node's do
+  (#286).** The `Dir` took one listing with one parent for all of it and ignored every option, so
+  `{ recursive: true }` listed the top level only. It now walks as node v22.22.2's does. Handing out
+  a directory's Dirent opens that directory. Entries come `bufferSize` (32) at a time, so the walk
+  is breadth first while a directory fits in a chunk and interleaves past that. Every Dirent carries
+  its own `parentPath`. If a subdirectory is gone before its turn, that read fails with node's
+  `opendir` error, path included, and the walk goes on. The options and `bufferSize` are checked as
+  node checks them, and a refused `-0` reads `Received -0`. `read(cb)` and `close(cb)` used to call
+  back before returning; they now call back asynchronously. While a read is in flight, the reads and
+  closes made meanwhile are queued, `readSync` / `closeSync` throw `ERR_DIR_CONCURRENT_OPERATION`,
+  and the read shows as an `FSReqCallback` in `process.getActiveResourcesInfo()`, as does a close.
+  `fs.promises.opendir` takes a third argument as opendir's callback, as node's promisify does.
+  `new fs.Dir()` throws `ERR_MISSING_ARGS` and `Dir.length` is 3. `path` is a getter, and
+  `entries()`, `Symbol.dispose` and `Symbol.asyncDispose` exist, as on node's `Dir`.
 - **`events.once` is an async function and an abort rejects with node's `AbortError`, as in node (#344).**
   It was a plain function, so the continuation of `await once(...)` ran before the microtasks the
   same emit queued, and its kind and `length` (3) were not node's. An aborted `once` rejected with a
