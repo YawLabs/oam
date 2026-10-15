@@ -45,6 +45,14 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `toString` over an empty range ignores the encoding; `TextEncoder#encodeInto` validates its
   arguments and reports `read` exactly.
 
+- **Windows std handles: a detached child no longer holds oam's stdout or stderr open after oam
+  exits, as under node.** oam left the inherit flag set on its stdin, stdout and stderr handles, so
+  every child took a copy whatever its `stdio` said. A `detached: true` child (which stays out of
+  the kill-on-close job) with `stdio: 'ignore'` then kept oam's output pipes open, and
+  `$(oam run x.js)`, `oam run x.js | tail` or a CI log capture waited for that child to exit. oam
+  now makes its std handles non-inheritable at startup, as node does. Children with
+  `stdio: 'inherit'` still write to oam's stdout and stderr; they receive a fresh duplicate. Other
+  inheritable handles (CRT fds 3 and up handed to oam by its parent) are not covered yet.
 - **`fs.opendir`, `fs.opendirSync` and `fs.promises.opendir` honour `recursive`, as node's do
   (#286).** The `Dir` took one listing with one parent for all of it and ignored every option, so
   `{ recursive: true }` listed the top level only. It now walks as node v22.22.2's does. Handing out
