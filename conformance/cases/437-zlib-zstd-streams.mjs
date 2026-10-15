@@ -10,8 +10,10 @@
 // ERR_TRAILING_JUNK_AFTER_STREAM_END under rejectGarbageAfterEnd), errors
 // with node's coded zstd error on bad input, and ends without error on a
 // frame cut short. reset() starts a new frame with a fresh context, which in
-// node keeps the pledged size but not the parameters. A wrong pledged size
-// fails the frame. The output arrives in chunkSize windows.
+// node keeps the pledged size but not the parameters, and on a closed stream
+// is node's internal assertion. A wrong pledged size fails the frame. The
+// output arrives in chunkSize windows; params key 10 (libzstd's experimental
+// ZSTD_c_format) writes a magicless frame.
 //
 // Regression guard: oam had no zstd streams.
 //
@@ -115,6 +117,8 @@ await run("compress, close() mid-stream", () => zlib.createZstdCompress(), (s) =
   s.close(() => console.log("  close callback"));
 });
 
+await run("compress, magicless format (key 10)", () => zlib.createZstdCompress({ params: { 10: 1 } }), (s) => s.end("hi"));
+
 await run("decompress, two frames in one write", () => zlib.createZstdDecompress(), (s) => s.end(Buffer.concat([frameA, frameB])));
 await run("decompress, a frame per write", () => zlib.createZstdDecompress(), (s) => {
   s.write(frameA);
@@ -153,6 +157,22 @@ await run("decompress, bad windowLogMax", () => zlib.createZstdDecompress({ para
   const s = zlib.createZstdCompress();
   const out = s._processChunk(Buffer.from("hey"), C.ZSTD_e_end);
   console.log("_processChunk sync:", hex(out), "closed:", s._closed, "bytesWritten:", s.bytesWritten);
+}
+
+// reset() on a closed stream: node's internal assert(this._handle), so an
+// ERR_INTERNAL_ASSERTION with node's "this is a bug" suffix.
+{
+  const s = zlib.createZstdCompress();
+  s.close();
+  try {
+    s.reset();
+    console.log("reset after close: no throw");
+  } catch (e) {
+    console.log(
+      "reset after close:", e.constructor.name, e.code, JSON.stringify(e.message),
+      Object.getOwnPropertyNames(e).join(","), JSON.stringify(e.stack.split("\n")[0]),
+    );
+  }
 }
 
 // A pipeline round trip of a large input with a slow reader (backpressure).

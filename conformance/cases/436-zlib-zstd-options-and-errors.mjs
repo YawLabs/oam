@@ -80,6 +80,13 @@ for (const [label, key, value] of [
   ["jobSize 1", C.ZSTD_c_jobSize, 1],
   ["overlapLog 10", C.ZSTD_c_overlapLog, 10],
   ["overlapLog 9", C.ZSTD_c_overlapLog, 9],
+  // ZSTD_c_format (10, not in zlib.constants): libzstd's experimental
+  // magicless-frame switch, inside node's key range and passed on as is.
+  // 1 or true drops the 4-byte magic number; 2 is out of libzstd's bound.
+  ["format 0", 10, 0],
+  ["format 1", 10, 1],
+  ["format true", 10, true],
+  ["format 2", 10, 2],
 ]) {
   attempt(`compress ${label}`, compress({ params: { [key]: value } }));
 }
