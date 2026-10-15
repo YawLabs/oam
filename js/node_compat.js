@@ -34370,7 +34370,13 @@
               return;
             }
             const end = Math.min(this._offset + 65536, json.length);
-            const chunk = Buffer.from(json.buffer, json.byteOffset + this._offset, end - this._offset);
+            // A copy, not a view: a view would keep the whole snapshot's
+            // buffer alive for as long as any one chunk is held (a queued
+            // pipe write, a kept last chunk). node's chunks are separate
+            // allocations, so `chunk.buffer.byteLength > chunk.length` is
+            // false there; one 64 KiB memcpy per chunk is noise next to
+            // taking the snapshot.
+            const chunk = Buffer.from(json.subarray(this._offset, end));
             this._offset = end;
             this.push(chunk);
           }
@@ -43000,6 +43006,13 @@
         );
         this._workerId = result.workerId;
         this.threadId = result.threadId;
+        // Running state for getHeapSnapshot(), which node refuses with
+        // ERR_WORKER_NOT_RUNNING both before the worker is up and once it is
+        // gone (its takeHeapSnapshot finds no running environment either way).
+        // 'online' is the point oam treats as started; every way out of
+        // _recvLoop and terminate() mark it exited.
+        this._started = false;
+        this._exited = false;
 
         // Expose performance reference (mirrors Node behavior)
         this.performance = globalThis.performance;
@@ -43007,7 +43020,10 @@
         this._recvLoop();
 
         // Emit 'online' asynchronously after construction, matching Node
-        queueMicrotask(() => this.emit("online"));
+        queueMicrotask(() => {
+          if (!this._exited) this._started = true;
+          this.emit("online");
+        });
       }
       // An emit from the receive loop whose listener throws -- or an
       // 'error' with no listener -- is an uncaughtException, as node raises
@@ -43025,8 +43041,10 @@
       async _recvLoop() {
         while (true) {
           let raw;
-          try { raw = await natives.workerRecvMessage(this._workerId); } catch { break; }
-          if (raw === undefined) { this._emitFromLoop("exit", 0); break; }
+          try { raw = await natives.workerRecvMessage(this._workerId); } catch { this._exited = true; break; }
+          // undefined: the channel is gone -- terminate() removed it, or the
+          // worker thread dropped it. Either way the worker no longer runs.
+          if (raw === undefined) { this._exited = true; this._emitFromLoop("exit", 0); break; }
           if (raw instanceof Uint8Array) {
             const text = new TextDecoder().decode(raw);
             try {
@@ -43056,6 +43074,10 @@
         natives.workerPostMessage(this._workerId, JSON.stringify(data));
       }
       terminate() {
+        // Marked here, not only when 'exit' arrives: the promise below
+        // resolves at once, and node's worker reports not-running as soon
+        // as terminate() has settled.
+        this._exited = true;
         natives.workerTerminate(this._workerId);
         return Promise.resolve(0);
       }
@@ -43068,13 +43090,14 @@
       // unsafe budget does not admit. So the call is refused honestly --
       // it used to resolve an empty Uint8Array, which is not a snapshot nor
       // even node's stream type. Options are validated first, as node does,
-      // and a worker that has exited rejects as node's does. Inside the
-      // worker, v8.getHeapSnapshot()/writeHeapSnapshot() are real.
+      // and a worker that is not running -- not yet online, terminated, or
+      // exited -- rejects with ERR_WORKER_NOT_RUNNING as node's does. Inside
+      // the worker, v8.getHeapSnapshot()/writeHeapSnapshot() are real.
       getHeapSnapshot(options) {
         registry.get("v8");
         registry._heapSnapshotOptions(options);
         return new Promise((resolve, reject) => {
-          if (this._exited) return reject(codes.ERR_WORKER_NOT_RUNNING());
+          if (this._exited || !this._started) return reject(codes.ERR_WORKER_NOT_RUNNING());
           reject(codes.ERR_METHOD_NOT_IMPLEMENTED("getHeapSnapshot()"));
         });
       }

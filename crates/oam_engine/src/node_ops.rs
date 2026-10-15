@@ -10185,10 +10185,17 @@ fn op_heap_snapshot(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let mut json = Vec::new();
+    let mut ended = false;
     scope.take_heap_snapshot(|chunk| {
+        // An empty chunk is the end-of-stream sentinel (see `snapshot_failed`).
+        ended |= chunk.is_empty();
         json.extend_from_slice(chunk);
         true
     });
+    if !ended {
+        snapshot_failed(scope);
+        return;
+    }
     if let Some(array) = bytes_to_uint8array(scope, json) {
         rv.set(array);
     }
@@ -10240,7 +10247,10 @@ fn op_fs_write_heap_snapshot(
     };
     let mut out = std::io::BufWriter::new(file);
     let mut failed: Option<std::io::Error> = None;
+    let mut ended = false;
     scope.take_heap_snapshot(|chunk| {
+        // An empty chunk is the end-of-stream sentinel (see `snapshot_failed`).
+        ended |= chunk.is_empty();
         // Returning false aborts the serialization (kAbort): once a write has
         // failed there is no file worth finishing.
         match std::io::Write::write_all(&mut out, chunk) {
@@ -10251,6 +10261,16 @@ fn op_fs_write_heap_snapshot(
             }
         }
     });
+    if failed.is_none() && !ended {
+        // No snapshot was taken, so nothing was written: drop the empty file
+        // this op created rather than leave a 0-byte `.heapsnapshot` behind
+        // under a name that looks like a result. Best effort -- the throw
+        // below is what reports the failure.
+        drop(out);
+        let _ = std::fs::remove_file(&path);
+        snapshot_failed(scope);
+        return;
+    }
     let flushed = match failed {
         Some(e) => Err(e),
         None => std::io::Write::flush(&mut out),
@@ -10258,6 +10278,21 @@ fn op_fs_write_heap_snapshot(
     if let Err(e) = flushed {
         throw_fd_error(scope, "write", &e);
     }
+}
+
+/// Throws for a heap snapshot V8 could not take. The v8 crate's
+/// `take_heap_snapshot` returns WITHOUT calling the callback at all when
+/// `HeapProfiler::TakeHeapSnapshot` yields null (its binding.cc: "Snapshotting
+/// failed, probably OOM"); on success V8's serializer always ends with
+/// `EndOfStream`, which reaches the callback as an empty chunk, and it never
+/// writes an empty data chunk. So "no empty chunk seen" (with no write abort
+/// of ours) means no snapshot. node CHECKs the snapshot pointer and aborts
+/// there; an Error is the closest a caller can handle, and either way no
+/// empty result is handed out as if it were a snapshot.
+fn snapshot_failed(scope: &mut v8::PinScope<'_, '_>) {
+    let message = v8::String::new(scope, "heap snapshot failed").unwrap();
+    let exception = v8::Exception::error(scope, message);
+    scope.throw_exception(exception);
 }
 
 /// The sequence number in a generated diagnostic file name

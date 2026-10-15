@@ -6,8 +6,10 @@
 // file: URL's path -- or, with none, node's generated
 // Heap.<date>.<time>.<pid>.<threadId>.<seq>.heapsnapshot in the cwd, its seq
 // one process-wide counter a worker's file continues. Bad arguments throw
-// node's errors; worker.getHeapSnapshot() on an exited worker rejects with
-// ERR_WORKER_NOT_RUNNING.
+// node's errors; worker.getHeapSnapshot() on a worker that is not running --
+// not yet online, terminated, or exited -- rejects with ERR_WORKER_NOT_RUNNING.
+// Each stream chunk owns its memory, as node's do: a view into one buffer
+// holding the whole snapshot would keep all of it alive for any chunk kept.
 //
 // Regression guard: oam had no getHeapSnapshot export at all (a link-time
 // SyntaxError for any import of it), and writeHeapSnapshot wrote nothing and
@@ -84,6 +86,7 @@ for await (const chunk of stream) {
   kinds.add(Buffer.isBuffer(chunk));
 }
 console.log("chunks are Buffers:", [...kinds].join(), "ended:", stream.readableEnded);
+console.log("first chunk owns its memory:", chunks[0].buffer.byteLength === chunks[0].length);
 checkShape("stream", Buffer.concat(chunks).toString());
 console.log("with options:", getHeapSnapshot({ exposeInternals: true, exposeNumericValues: false }).constructor.name);
 
@@ -113,13 +116,31 @@ fs.writeFileSync(
     "parentPort.postMessage(v8.writeHeapSnapshot());\n",
 );
 const worker = new Worker(path.join(dir, "w.cjs"));
+const rejection = (label, p) =>
+  p.then(
+    (s) => console.log(label, "resolved", s.constructor.name),
+    (er) => console.log(label, er.constructor.name, er.code, er.message),
+  );
+// Called in the same tick as the constructor: not running yet.
+const preOnline = rejection("pre-online", worker.getHeapSnapshot());
 const [fromWorker] = await new Promise((resolve) => worker.once("message", (m) => resolve([m])));
 await new Promise((resolve) => worker.once("exit", resolve));
+await preOnline;
 console.log("worker", showName(fromWorker), fs.existsSync(fromWorker));
-await worker.getHeapSnapshot().then(
-  (s) => console.log("resolved", s.constructor.name),
-  (er) => console.log(er.constructor.name, er.code, er.message),
-);
+await rejection("exited", worker.getHeapSnapshot());
+// terminate() settles, then the call: not running, whether or not 'exit'
+// has been delivered yet.
+fs.writeFileSync("idle.cjs", "");
+const online = new Worker(path.join(dir, "idle.cjs"));
+await new Promise((resolve) => online.once("online", resolve));
+await online.terminate();
+await rejection("terminated", online.getHeapSnapshot());
+// terminate() at once, then wait for 'exit'.
+const early = new Worker(path.join(dir, "idle.cjs"));
+const earlyExit = new Promise((resolve) => early.once("exit", resolve));
+early.terminate();
+await earlyExit;
+await rejection("terminated before online", early.getHeapSnapshot());
 console.log(showName(writeHeapSnapshot()));
 
 // Errors, as node throws them.
