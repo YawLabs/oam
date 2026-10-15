@@ -6,7 +6,12 @@
 //! The shape is node's binding, not a convenience codec: one [`ZstdHandle::write`]
 //! is exactly one `ZSTD_compressStream2` or `ZSTD_decompressStream` call into
 //! an output window of the size the caller gives, reporting what it consumed
-//! and produced. node's JavaScript (lib/zlib.js `processChunkSync` and
+//! and produced. The input is the one place the shape differs: node's binding
+//! reads the caller's chunk in place on every call, while this one holds its
+//! own copy ([`ZstdHandle::set_input`]), taken once per chunk, and each call
+//! reads on from where the last one stopped. Copying the unconsumed rest on
+//! every call instead would be quadratic in the chunk's size, because node's
+//! loop calls once per output window (16 KiB by default). node's JavaScript (lib/zlib.js `processChunkSync` and
 //! `processCallback`) decides from those two numbers whether to call again, so
 //! node's observable quirks fall out of running the same loop over the same
 //! library rather than being special-cased here:
@@ -25,7 +30,7 @@
 //! `ERR_ZLIB_INITIALIZATION_FAILED`.
 
 use zstd_safe::zstd_sys::ZSTD_EndDirective;
-use zstd_safe::{CCtx, CParameter, DCtx, DParameter, InBuffer, OutBuffer, Strategy};
+use zstd_safe::{CCtx, CParameter, DCtx, DParameter, FrameFormat, InBuffer, OutBuffer, Strategy};
 
 /// A codec failure, as node reports it (lib/zlib.js `zlibOnError` gives the
 /// `Error` this message, then own `errno` and `code`).
@@ -125,6 +130,10 @@ enum Context {
 pub struct ZstdHandle {
     context: Context,
     pledged_src_size: Option<u64>,
+    /// The chunk being worked through ([`Self::set_input`]) and how much of
+    /// it libzstd has consumed so far.
+    input: Vec<u8>,
+    input_pos: usize,
 }
 
 impl ZstdHandle {
@@ -143,6 +152,8 @@ impl ZstdHandle {
         let mut handle = Self {
             context: init_context(compress, pledged_src_size, dictionary)?,
             pledged_src_size,
+            input: Vec::new(),
+            input_pos: 0,
         };
         for &(key, value) in params {
             handle.set_parameter(key, value)?;
@@ -157,7 +168,18 @@ impl ZstdHandle {
     pub fn reset(&mut self) -> Result<(), &'static str> {
         let compress = matches!(self.context, Context::Compress(_));
         self.context = init_context(compress, self.pledged_src_size, None)?;
+        self.set_input(Vec::new());
         Ok(())
+    }
+
+    /// Start on a new input chunk: the following [`Self::write`] calls read
+    /// it from its start, each going on where the one before stopped (what
+    /// node's loop does when it passes the same chunk back at `inOff +
+    /// consumed`). The handle owns the bytes so a chunk is copied out of
+    /// JavaScript once, not once per call.
+    pub fn set_input(&mut self, input: Vec<u8>) {
+        self.input = input;
+        self.input_pos = 0;
     }
 
     /// `ZSTD_CCtx_setParameter` / `ZSTD_DCtx_setParameter(key, value)`, failing
@@ -173,6 +195,12 @@ impl ZstdHandle {
     /// - `strategy` is an enum: libzstd takes 0 as "the level's own" (what an
     ///   unset parameter already is) and refuses anything outside 1..=9.
     ///
+    /// `ZSTD_c_format` (10) is the one experimental libzstd compression
+    /// parameter inside node's key range (`kMaxZstdCParam`, 402): 0 is the
+    /// standard frame, 1 the magicless one, and libzstd's bound check refuses
+    /// anything else. (`ZSTD_d_format` is 1000, above node's decompression
+    /// range, so a decompressor never sees it.)
+    ///
     /// `enableLongDistanceMatching` is libzstd's three-way switch (0 auto,
     /// 1 enable, 2 disable) but a `bool` in the binding; 2 is accepted, as
     /// libzstd accepts it, and set as 0 (docs/node-divergences.md).
@@ -181,6 +209,9 @@ impl ZstdHandle {
         let result = match &mut self.context {
             Context::Compress(cctx) => {
                 let param = match (key, value) {
+                    (10, 0) => CParameter::Format(FrameFormat::One),
+                    (10, 1) => CParameter::Format(FrameFormat::Magicless),
+                    (10, _) => return Err(PARAM_SET_FAILED),
                     (100, v) => CParameter::CompressionLevel(v),
                     (101, v) => CParameter::WindowLog(v as u32),
                     (102, v) => CParameter::HashLog(v as u32),
@@ -217,18 +248,14 @@ impl ZstdHandle {
     }
 
     /// One `ZSTD_compressStream2(flush)` or `ZSTD_decompressStream` call
-    /// (node_zlib.cc `DoThreadPoolWork`) over `input` into an output window of
-    /// `out_len` bytes: `(bytes of input consumed, bytes produced)`. `flush` is
-    /// the end directive (`ZSTD_e_*`) for a compressor and ignored by a
-    /// decompressor, as node's binding ignores it.
-    pub fn write(
-        &mut self,
-        flush: i32,
-        input: &[u8],
-        out_len: usize,
-    ) -> Result<(usize, Vec<u8>), ZstdError> {
+    /// (node_zlib.cc `DoThreadPoolWork`) over what is left of the input
+    /// [`Self::set_input`] gave, into an output window of `out_len` bytes:
+    /// `(bytes of input consumed, the bytes produced)`. `flush` is the end
+    /// directive (`ZSTD_e_*`) for a compressor and ignored by a decompressor,
+    /// as node's binding ignores it.
+    pub fn write(&mut self, flush: i32, out_len: usize) -> Result<(usize, Vec<u8>), ZstdError> {
         let mut out = vec![0u8; out_len];
-        let mut src = InBuffer::around(input);
+        let mut src = InBuffer::around(&self.input[self.input_pos..]);
         let (result, produced) = {
             let mut dst = OutBuffer::around(out.as_mut_slice());
             let result = match &mut self.context {
@@ -242,7 +269,15 @@ impl ZstdHandle {
         };
         result.map_err(ZstdError::from_code)?;
         out.truncate(produced);
-        Ok((src.pos(), out))
+        let consumed = src.pos();
+        self.input_pos += consumed;
+        // A chunk libzstd has taken all of is not read again (libzstd keeps
+        // what it still needs in its own window), so it is let go now rather
+        // than held until the next chunk replaces it.
+        if self.input_pos == self.input.len() {
+            self.set_input(Vec::new());
+        }
+        Ok((consumed, out))
     }
 }
 
@@ -316,12 +351,11 @@ mod tests {
     fn one_shot(handle: &mut ZstdHandle, input: &[u8], flush: i32) -> Result<Vec<u8>, ZstdError> {
         const CHUNK: usize = 16 * 1024;
         let mut out = Vec::new();
-        let mut rest = input;
+        handle.set_input(input.to_vec());
         let mut offset = 0;
         loop {
             let avail = CHUNK - offset;
-            let (used, made) = handle.write(flush, rest, avail)?;
-            rest = &rest[used..];
+            let (_, made) = handle.write(flush, avail)?;
             offset += made.len();
             let full = made.len() == avail;
             out.extend(made);
@@ -390,7 +424,8 @@ mod tests {
             (10, "ZSTD_error_prefix_unknown", "Unknown frame descriptor")
         );
         let mut c = ZstdHandle::new(true, None, None, &[]).unwrap();
-        let err = c.write(4, b"x", 64).unwrap_err();
+        c.set_input(b"x".to_vec());
+        let err = c.write(4, 64).unwrap_err();
         assert_eq!(
             (err.errno, err.code, err.message),
             (
@@ -403,6 +438,7 @@ mod tests {
             (true, &[(5u32, 1i32)][..]),
             (true, &[(107, 10)]),
             (true, &[(160, 3)]),
+            (true, &[(10, 2)]),
             (false, &[(5, 1)]),
             (false, &[(100, 9)]),
         ] {
@@ -428,12 +464,61 @@ mod tests {
     }
 
     #[test]
+    fn writes_a_magicless_frame_as_node_does() {
+        // node v22.22.2: zlib.zstdCompressSync('hi', { params: { 10: v } })
+        // for v = 0 and v = 1 (ZSTD_c_format: standard, magicless).
+        let mut c = ZstdHandle::new(true, None, None, &[(10, 0)]).unwrap();
+        assert_eq!(
+            hex(&one_shot(&mut c, b"hi", 2).unwrap()),
+            "28b52ffd20021100006869"
+        );
+        let mut c = ZstdHandle::new(true, None, None, &[(10, 1)]).unwrap();
+        assert_eq!(hex(&one_shot(&mut c, b"hi", 2).unwrap()), "20021100006869");
+    }
+
+    #[test]
+    fn reads_a_chunk_on_across_calls() {
+        // One chunk worked through in small output windows: each call goes on
+        // where the last stopped, and the round trip gives the input back.
+        let input: Vec<u8> = (0..200_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let mut c = ZstdHandle::new(true, None, None, &[]).unwrap();
+        c.set_input(input.clone());
+        let (mut frame, mut taken) = (Vec::new(), 0);
+        loop {
+            let (used, made) = c.write(2, 64).unwrap();
+            taken += used;
+            let full = made.len() == 64;
+            frame.extend(made);
+            if !full {
+                break;
+            }
+        }
+        assert_eq!(taken, input.len());
+        let mut d = ZstdHandle::new(false, None, None, &[]).unwrap();
+        d.set_input(frame);
+        let mut back = Vec::new();
+        loop {
+            let (_, made) = d.write(0, 1000).unwrap();
+            let full = made.len() == 1000;
+            back.extend(made);
+            if !full {
+                break;
+            }
+        }
+        assert_eq!(back, input);
+    }
+
+    #[test]
     fn a_wrong_pledged_size_fails_a_streamed_frame() {
         // node: createZstdCompress({ pledgedSrcSize: 3 }) written 'hel' then
         // 'lo' errors ZSTD_error_srcSize_wrong (72) "Src size is incorrect".
         let mut c = ZstdHandle::new(true, Some(3), None, &[]).unwrap();
-        c.write(0, b"hel", 16384).unwrap();
-        let err = c.write(2, b"lo", 16384).unwrap_err();
+        c.set_input(b"hel".to_vec());
+        c.write(0, 16384).unwrap();
+        c.set_input(b"lo".to_vec());
+        let err = c.write(2, 16384).unwrap_err();
         assert_eq!(
             (err.errno, err.code, err.message),
             (72, "ZSTD_error_srcSize_wrong", "Src size is incorrect")

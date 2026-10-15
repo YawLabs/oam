@@ -142,8 +142,11 @@ brotli = { version = "8", default-features = false, features = ["std"] }
 # Features as node's deps/zstd/zstd.gyp builds it: ZSTD_MULTITHREAD on
 # (`zstdmt`, so `ZSTD_c_nbWorkers` > 0 is accepted as node accepts it), no
 # legacy-format decoders and no dictionary builder (node compiles neither),
-# and no bindgen (zstd-sys ships pregenerated bindings).
-zstd-safe = { version = "7.2", default-features = false, features = ["zstdmt"] }
+# and no bindgen (zstd-sys ships pregenerated bindings). `experimental` only
+# exposes libzstd's ZSTD_STATIC_LINKING_ONLY parameters through the binding
+# (the C library it builds is the same): node passes ZSTD_c_format (key 10,
+# magicless frames) to libzstd, so oam must be able to set it too.
+zstd-safe = { version = "7.2", default-features = false, features = ["zstdmt", "experimental"] }
 # HTTP server, and since #143 the fetch client (oam_core adds the client
 # features in its own manifest): hyper + adapters. reqwest, the install
 # client, builds the same versions, so declaring them adds no new

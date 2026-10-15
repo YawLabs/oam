@@ -6672,7 +6672,10 @@ fn op_zstd_handle_create(
 
 /// zstdHandleWriteSync(handle, flush, input, outLen) -> Uint8Array: one
 /// libzstd call on the isolate thread (node's `writeSync`), answered as
-/// `oam_core::ops::zstd_write_result` lays it out. A codec failure throws
+/// `oam_core::ops::zstd_write_result` lays it out. `input` is a new chunk
+/// (copied into the handle once) or undefined to read on through the chunk
+/// the handle holds, so node's once-per-output-window loop does not copy the
+/// unconsumed rest of a large chunk on every call. A codec failure throws
 /// node's coded zstd error.
 fn op_zstd_handle_write_sync(
     scope: &mut v8::PinScope<'_, '_>,
@@ -6681,15 +6684,18 @@ fn op_zstd_handle_write_sync(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let flush = args.get(1).int32_value(scope).unwrap_or(0);
-    let input = arg_bytes(scope, &args, 2).unwrap_or_default();
+    let input = arg_bytes(scope, &args, 2);
     let out_len = args.get(3).uint32_value(scope).unwrap_or(0) as usize;
     let Some(engine) = zstd_engine(scope, handle) else {
         return;
     };
-    let result = engine
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .write(flush, &input, out_len);
+    let result = {
+        let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(input) = input {
+            engine.set_input(input);
+        }
+        engine.write(flush, out_len)
+    };
     match result {
         Ok((consumed, output)) => {
             let bytes = oam_core::ops::zstd_write_result(consumed, output);
@@ -6702,8 +6708,9 @@ fn op_zstd_handle_write_sync(
 }
 
 /// zstdHandleWrite(handle, flush, input, outLen) -> Promise<Uint8Array>:
-/// node's async `write()`, the libzstd call on the blocking pool. Resolves
-/// as the sync form returns; rejects with node's coded zstd error.
+/// node's async `write()`, the libzstd call on the blocking pool. `input`
+/// is as the sync form takes it. Resolves as the sync form returns; rejects
+/// with node's coded zstd error.
 fn op_zstd_handle_write(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -6711,7 +6718,7 @@ fn op_zstd_handle_write(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let flush = args.get(1).int32_value(scope).unwrap_or(0);
-    let input = arg_bytes(scope, &args, 2).unwrap_or_default();
+    let input = arg_bytes(scope, &args, 2);
     let out_len = args.get(3).uint32_value(scope).unwrap_or(0) as usize;
     let Some(engine) = zstd_engine(scope, handle) else {
         return;

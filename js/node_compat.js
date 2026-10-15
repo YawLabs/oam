@@ -1256,6 +1256,15 @@
   });
   codes.ERR_INVALID_CURSOR_POS = E("ERR_INVALID_CURSOR_POS", TypeError,
     "Cannot set cursor row without setting its column");
+  // node's internal `assert(value, message)` failing (internal/assert.js):
+  // the message, then node's "this is a bug" suffix (internal/errors.js).
+  codes.ERR_INTERNAL_ASSERTION = E("ERR_INTERNAL_ASSERTION", Error, function(message) {
+    const suffix = "This is caused by either a bug in Node.js " +
+      "or incorrect usage of Node.js internals.\n" +
+      "Please open an issue with this stack trace at " +
+      "https://github.com/nodejs/node/issues\n";
+    return message === undefined ? suffix : message + "\n" + suffix;
+  });
   // node:zlib's `rejectGarbageAfterEnd` option: input left over once the
   // compressed stream ended. A TypeError in node (measured on v22.22.2).
   codes.ERR_TRAILING_JUNK_AFTER_STREAM_END = E(
@@ -22181,6 +22190,15 @@
     const kError = Symbol("kError");
     const isUint8ArrayValue = (value) => value instanceof Uint8Array;
 
+    // A native libzstd context is not memory V8 sees, so a zstd stream that
+    // is dropped without close() (or whose constructor throws after init,
+    // or a one-shot call whose argument fails validation) would keep it for
+    // the life of the process; node's GC frees its handle. The registry frees
+    // it when the handle object is collected; close() unregisters.
+    const zstdContexts = typeof FinalizationRegistry === "function"
+      ? new FinalizationRegistry((id) => natives.zlibStreamClose(id))
+      : null;
+
     // node's binding classes ZstdCompress / ZstdDecompress (what a stream's
     // `_handle` is), over the natives. write() and writeSync() take node's
     // arguments and report through the write-state array as node's do; a
@@ -22191,24 +22209,44 @@
           this._id = null;
           this._writing = false;
           this._pendingClose = false;
+          // The chunk the native handle holds a copy of, and the inOff and
+          // inLen a call that reads on through it would pass (see _input).
+          this._inChunk = null;
+          this._inNext = 0;
+          this._inLeft = 0;
         }
         init(params, pledgedSrcSize, writeState, processCallback, dictionary) {
           this._writeState = writeState;
           this._processCallback = processCallback;
           this._id = natives.zstdHandleCreate(compress, params, pledgedSrcSize, dictionary);
+          zstdContexts?.register(this, this._id, this);
         }
         // The window [outOff, outOff + outLen) of `out` receives the output;
         // writeState gets [availOutAfter, availInAfter]. The natives answer
         // the output followed by the input consumed (8 bytes, little-endian).
-        _apply(result, inLen, out, outOff, outLen) {
+        _apply(result, inOff, inLen, out, outOff, outLen) {
           const produced = result.length - 8;
           if (produced > 0) out.set(result.subarray(0, produced), outOff);
           const view = new DataView(result.buffer, result.byteOffset + produced, 8);
           const consumed = Number(view.getBigUint64(0, true));
           this._writeState[0] = outLen - produced;
           this._writeState[1] = inLen - consumed;
+          this._inNext = inOff + consumed;
+          this._inLeft = inLen - consumed;
         }
+        // node's loop (processChunkSync, processCallback) calls once per
+        // output window and passes the same chunk back at inOff + consumed
+        // each time. The native handle keeps its own copy of the chunk from
+        // the first call, so such a call passes undefined and the native
+        // reads on; anything else (a new chunk, or the same one written
+        // again from its start) is a new input, copied once. Passing the
+        // rest of the chunk on every call copied it once per 16 KiB window:
+        // quadratic in the chunk's size.
         _input(chunk, inOff, inLen) {
+          if (chunk === this._inChunk && inOff === this._inNext && inLen === this._inLeft) {
+            return undefined;
+          }
+          this._inChunk = chunk;
           return new Uint8Array(chunk.buffer, chunk.byteOffset + inOff, inLen);
         }
         writeSync(flush, chunk, inOff, inLen, out, outOff, outLen) {
@@ -22218,10 +22256,11 @@
               this._id, flush, this._input(chunk, inOff, inLen), outLen,
             );
           } catch (err) {
+            this._inChunk = null;
             this.onerror(err.message, err.errno, err.code);
             return;
           }
-          this._apply(result, inLen, out, outOff, outLen);
+          this._apply(result, inOff, inLen, out, outOff, outLen);
         }
         // node runs the call on the threadpool and calls the write callback
         // back on the loop; a close() that lands meanwhile waits for it.
@@ -22231,11 +22270,12 @@
             this._id, flush, this._input(chunk, inOff, inLen), outLen,
           ).then((result) => {
             this._writing = false;
-            this._apply(result, inLen, out, outOff, outLen);
+            this._apply(result, inOff, inLen, out, outOff, outLen);
             this._processCallback();
             if (this._pendingClose) this.close();
           }, (err) => {
             this._writing = false;
+            this._inChunk = null;
             if (this._pendingClose) this.close();
             this.onerror(err.message, err.errno, err.code);
           });
@@ -22243,6 +22283,8 @@
         // node's reset(): a fresh context with only the pledged size; a
         // refusal is reported as node's binding reports it.
         reset() {
+          // The native reset drops the chunk it held.
+          this._inChunk = null;
           const failure = natives.zstdHandleReset(this._id);
           if (failure !== undefined) {
             this.onerror(failure, -1, "ERR_ZLIB_INITIALIZATION_FAILED");
@@ -22254,7 +22296,9 @@
             return;
           }
           this._pendingClose = false;
+          this._inChunk = null;
           if (this._id !== null) {
+            zstdContexts?.unregister(this);
             natives.zlibStreamClose(this._id);
             this._id = null;
           }
@@ -22423,7 +22467,9 @@
       },
     });
     ZlibBase.prototype.reset = function() {
-      if (!this._handle) throw new Error("zlib binding closed");
+      // node: assert(this._handle, 'zlib binding closed'), an internal
+      // assertion (ERR_INTERNAL_ASSERTION), not a plain Error.
+      if (!this._handle) throw codes.ERR_INTERNAL_ASSERTION("zlib binding closed");
       return this._handle.reset();
     };
     ZlibBase.prototype._flush = function(callback) {

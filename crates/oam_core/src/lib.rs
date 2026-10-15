@@ -7741,18 +7741,21 @@ pub mod ops {
 
     /// zstdHandleWrite: node's async `handle.write()` -- one libzstd call (see
     /// [`super::zstd::ZstdHandle::write`]) on the blocking pool, as node runs
-    /// it on the threadpool. Resolves with [`zstd_write_result`]'s buffer.
+    /// it on the threadpool. `input` is a new chunk to start on, or `None` to
+    /// read on through the one the handle holds. Resolves with
+    /// [`zstd_write_result`]'s buffer.
     pub async fn zstd_handle_write(
         engine: std::sync::Arc<std::sync::Mutex<super::zstd::ZstdHandle>>,
         flush: i32,
-        input: Vec<u8>,
+        input: Option<Vec<u8>>,
         out_len: usize,
     ) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || {
-            engine
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .write(flush, &input, out_len)
+            let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(input) = input {
+                engine.set_input(input);
+            }
+            engine.write(flush, out_len)
         })
         .await;
         match result {

@@ -20287,6 +20287,77 @@ fn process_versions_honest_keys() {
     }
 }
 
+// node:zlib's zstd loop calls the handle once per output window (16 KiB by
+// default) and passes the same chunk back at a growing offset. Each call used
+// to copy the whole unconsumed rest of the chunk, so a 16 MB one-shot took
+// ~10 s against ~45 ms for the same data in one window: quadratic. Now the
+// handle copies a chunk once and reads on through it, so the default window
+// costs a small multiple of one window at most. Timed against itself in the
+// same process (not against a wall-clock budget) so a slow machine does not
+// fail it; the quadratic version was over 200x.
+#[test]
+fn zstd_large_chunk_costs_linear_time() {
+    let stdout = run_ok(
+        "zstd_linear.cjs",
+        "const zlib = require('zlib');\n\
+         const data = require('crypto').randomBytes(16 << 20);\n\
+         const time = (fn) => { const t = process.hrtime.bigint(); const r = fn();\n\
+           return [Number(process.hrtime.bigint() - t) / 1e6, r]; };\n\
+         const one = { chunkSize: 32 << 20, params: { 100: 1 } };\n\
+         const [cOne, packed] = time(() => zlib.zstdCompressSync(data, one));\n\
+         const [cWin, packedWin] = time(() => zlib.zstdCompressSync(data, { params: { 100: 1 } }));\n\
+         const [dOne] = time(() => zlib.zstdDecompressSync(packed, { chunkSize: 32 << 20 }));\n\
+         const [dWin, back] = time(() => zlib.zstdDecompressSync(packed));\n\
+         console.log('same_bytes:', packed.equals(packedWin));\n\
+         console.log('round_trip:', back.equals(data));\n\
+         const ok = (win, single) => win < single * 8 + 250;\n\
+         console.log('compress_linear:', ok(cWin, cOne), cWin, cOne);\n\
+         console.log('decompress_linear:', ok(dWin, dOne), dWin, dOne);",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.split_whitespace().nth(1) == Some("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+    assert_eq!(stdout.lines().count(), 4, "{stdout}");
+}
+
+// A zstd context is native memory V8 does not see. A stream dropped without
+// close() kept its libzstd context in the registry for the life of the
+// process (~0.8 MB each, never reclaimed); node's GC frees its handle. A
+// FinalizationRegistry on the handle now frees it. 600 abandoned streams
+// after the first 200: ~480 MB of growth when they leak, a few MB when not.
+#[test]
+fn zstd_dropped_stream_frees_its_context() {
+    let main = write_temp(
+        "zstd_dropped.mjs",
+        "import zlib from 'node:zlib';\n\
+         const tick = () => new Promise((r) => setImmediate(r));\n\
+         const rss = () => process.memoryUsage().rss / 1048576;\n\
+         let base;\n\
+         for (let round = 0; round < 4; round++) {\n\
+           for (let i = 0; i < 200; i++) {\n\
+             const s = zlib.createZstdCompress();\n\
+             await new Promise((r) => s.write('x', r));\n\
+           }\n\
+           for (let i = 0; i < 3; i++) { globalThis.gc(); await tick(); }\n\
+           if (round === 0) base = rss();\n\
+         }\n\
+         const growth = Math.round(rss() - base);\n\
+         console.log('reclaimed:', growth < 150, growth);",
+    );
+    let out = oam(&["--expose-gc", "run", main.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "exit {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.starts_with("reclaimed: true"), "{stdout}");
+}
+
 #[test]
 fn dns_set_servers_refuses_rather_than_lying() {
     // A DELIBERATE divergence, so it cannot be a differential conformance case:
