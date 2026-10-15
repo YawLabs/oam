@@ -32489,6 +32489,43 @@ console.log('num_enc=' + code);
 }
 
 #[test]
+fn buffer_from_string_leaves_the_unused_pool_zeroed() {
+    // Buffer.from(utf8 string) encodes straight into the pool, and a string
+    // whose bytes turn out to be >= poolSize/2 is copied out to a buffer of
+    // its own. The pool bytes it was encoded into must be zeroed again:
+    // oam's allocUnsafe hands out unused pool as zeroes
+    // (docs/node-divergences.md, 29), and the next allocation lands on them.
+    let path = write_temp(
+        "buf_pool_zeroed.cjs",
+        r#"
+// Fill the current pool so the next string opens a fresh one.
+for (let i = 0; i < 4; i++) if (Buffer.allocUnsafe(4095).byteOffset === 4096) break;
+const opener = Buffer.from('x');
+// 1500 code units, 4500 bytes: under poolSize/2 code units, over it in bytes.
+const own = Buffer.from('€'.repeat(1500));
+const next = Buffer.allocUnsafe(4000);
+console.log('own=' + own.length + '/' + own.buffer.byteLength);
+console.log('own_bytes=' + own.equals(Buffer.from('e282ac'.repeat(1500), 'hex')));
+console.log('same_pool=' + (next.buffer === opener.buffer));
+console.log('next_zero=' + next.every((b) => b === 0));
+"#,
+    );
+    let out = oam(&["run", path.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "own=4500/4500",
+            "own_bytes=true",
+            "same_pool=true",
+            "next_zero=true"
+        ],
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn assert_throws_validation_fn_must_return_true() {
     // A validation function returning non-true is its own failure mode in Node:
     // a specific AssertionError ('expected to return "true"'), NOT the generic

@@ -16,6 +16,7 @@
 use anyhow::{Result, anyhow};
 use std::sync::Once;
 
+mod buffer_ops;
 mod cjs;
 mod code_cache;
 mod crash;
