@@ -190,9 +190,21 @@ fn directory_package_check(
     if !is_dir {
         return Ok(());
     }
-    if let Some(found) = found {
-        let dir = crate::modules::module_key(filename).unwrap_or_else(|_| filename.to_path_buf());
-        if !found.starts_with(&dir) || found.as_path() == dir.as_path() {
+    // node tries the path as a file, then with each extension, and only then
+    // as a directory: a sibling file it takes first means the package was
+    // never read. Decided on the unresolved names, not on where `found`
+    // resolves to -- an index.js that is a link out of the directory is
+    // still the directory's.
+    if found.is_some() {
+        let as_file =
+            |p: &Path| std::fs::metadata(oam_loader::fs_os_path(p)).is_ok_and(|m| m.is_file());
+        let with_ext = filename.as_os_str().to_owned();
+        let taken_as_file = [".js", ".json", ".node"].iter().any(|ext| {
+            let mut candidate = with_ext.clone();
+            candidate.push(ext);
+            as_file(Path::new(&candidate))
+        });
+        if taken_as_file {
             return Ok(());
         }
     }

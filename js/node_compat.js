@@ -41645,21 +41645,34 @@
         // Emit 'online' asynchronously after construction, matching Node
         queueMicrotask(() => this.emit("online"));
       }
+      // An emit from the receive loop whose listener throws -- or an
+      // 'error' with no listener -- is an uncaughtException, as node raises
+      // it, and the loop goes on: thrown out of this async function it was an
+      // unhandled rejection, and the Worker's later events never came.
+      _emitFromLoop(event, ...args) {
+        try {
+          this.emit(event, ...args);
+        } catch (e) {
+          process.nextTick(() => {
+            throw e;
+          });
+        }
+      }
       async _recvLoop() {
         while (true) {
           let raw;
           try { raw = await natives.workerRecvMessage(this._workerId); } catch { break; }
-          if (raw === undefined) { this.emit("exit", 0); break; }
+          if (raw === undefined) { this._emitFromLoop("exit", 0); break; }
           if (raw instanceof Uint8Array) {
             const text = new TextDecoder().decode(raw);
             try {
               const data = JSON.parse(text);
-              this.emit("message", data);
+              this._emitFromLoop("message", data);
             } catch {
-              this.emit("message", text);
+              this._emitFromLoop("message", text);
             }
           } else if (typeof raw === "object" && raw !== null) {
-            if (raw.type === "error") { this.emit("error", workerError(raw)); }
+            if (raw.type === "error") { this._emitFromLoop("error", workerError(raw)); }
             if (raw.type === "stdout" || raw.type === "stderr") {
               // latin1: the Rust side encoded each byte as one code unit.
               this[raw.type].push(Buffer.from(raw.data, "latin1"));
@@ -41668,7 +41681,7 @@
               // EOF both streams so a waiting 'end' listener fires.
               this.stdout.push(null);
               this.stderr.push(null);
-              this.emit("exit", raw.code);
+              this._emitFromLoop("exit", raw.code);
               break;
             }
           }
