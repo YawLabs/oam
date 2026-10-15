@@ -115,6 +115,14 @@ dns-lookup = "4"
 # oam_engine's node:crypto randomness, on the same version. A new dependency
 # EDGE onto a crate already being built.
 getrandom = { workspace = true }
+# fs.watch / fs.promises.watch (src/fs_watch.rs): the OS change-notification
+# APIs libuv's uv_fs_event_t uses -- ReadDirectoryChangesW, inotify, FSEvents
+# -- behind one safe surface, so oam carries none of their raw-pointer FFI
+# (AI-POLICY.md gate 5). NEW supply chain: notify (CC0-1.0, see about.toml),
+# notify-types, and per target inotify/inotify-sys (Linux), fsevent-sys
+# (macOS) and windows-sys 0.60 (Windows). Default features: macOS uses
+# FSEvents, as libuv does for a directory.
+notify = "8.2"
 
 # Windows extra-fd stdio: raw CreateProcessW + lpReserved2 CRT fd-table so a
 # child (Chromium --remote-debugging-pipe) gets numbered fds 3/4 for CDP. std

@@ -19622,6 +19622,45 @@ fn fs_watch_detects_file_change() {
     );
 }
 
+/// A referenced fs.watch watcher is what keeps the process alive: with no
+/// timer pending, the process stays up until something closes the watcher
+/// -- here a change the watcher itself reports, from a child that writes the
+/// file after a delay -- while an unref'd watcher on the same directory still
+/// receives that change without holding the loop open. Under the old polling
+/// fs.watch the referenced watcher could not be told from a timer, and the
+/// unref'd one pinned the process forever.
+#[test]
+fn fs_watch_referenced_watcher_holds_the_loop_until_closed() {
+    let stdout = run_ok(
+        "fs_watch_ref.mjs",
+        "import fs from 'fs';\n\
+         import os from 'os';\n\
+         import path from 'path';\n\
+         import { spawn } from 'child_process';\n\
+         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-e2e-watch-'));\n\
+         const seen = new Set();\n\
+         // Both close once both have seen the file: until then the\n\
+         // referenced one is open, whichever reports first.\n\
+         const saw = (who) => (t, f) => {\n\
+           if (f !== 'go.txt') return;\n\
+           seen.add(who);\n\
+           if (seen.size < 2) return;\n\
+           quiet.close();\n\
+           w.close();\n\
+           console.log('closed after', [...seen].sort().join(','));\n\
+           fs.rmSync(dir, { recursive: true, force: true });\n\
+         };\n\
+         const quiet = fs.watch(dir, saw('unref'));\n\
+         quiet.unref();\n\
+         const w = fs.watch(dir, saw('ref'));\n\
+         // No timer here: only the referenced watcher keeps the loop alive\n\
+         // until the child (a detached write, unref'd) touches the file.\n\
+         const child = spawn(process.execPath, ['-e', `setTimeout(() => require('fs').writeFileSync(${JSON.stringify(path.join(dir, 'go.txt'))}, 'x'), 300)`], { stdio: 'ignore' });\n\
+         child.unref();\n",
+    );
+    assert_eq!(stdout, "closed after ref,unref");
+}
+
 #[test]
 fn os_and_process_native_values() {
     let stdout = run_ok(

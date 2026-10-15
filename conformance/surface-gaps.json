@@ -177,9 +177,6 @@
           "init",
           "usingDomains"
         ],
-        "fs/promises": [
-          "watch"
-        ],
         "global:AbortController.prototype": [
           "signal"
         ],
@@ -625,9 +622,6 @@
           "init",
           "usingDomains"
         ],
-        "fs/promises": [
-          "watch"
-        ],
         "global:AbortController.prototype": [
           "signal"
         ],
@@ -1061,9 +1055,6 @@
           "captureRejections",
           "init",
           "usingDomains"
-        ],
-        "fs/promises": [
-          "watch"
         ],
         "global:AbortController.prototype": [
           "signal"

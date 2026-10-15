@@ -243,6 +243,11 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsOsPathOf", op_fs_os_path_of),
         ("fsShownPathOf", op_fs_shown_path_of),
         ("fsStatSync", op_fs_stat_sync),
+        // fs.watch: OS change notifications (oam_core::fs_watch).
+        ("fsWatchStart", op_fs_watch_start),
+        ("fsWatchNext", op_fs_watch_next),
+        ("fsWatchClose", op_fs_watch_close),
+        ("fsWatchSetRef", op_fs_watch_set_ref),
         ("fsStatfsSync", op_fs_statfs_sync),
         ("fsReaddirSync", op_fs_readdir_sync),
         ("fsMkdirSync", op_fs_mkdir_sync),
@@ -6973,6 +6978,85 @@ fn op_fs_stat_sync(
         }
         Err(e) => throw_node_error(scope, if lstat { "lstat" } else { "stat" }, &path, &e),
     }
+}
+
+/// `__oam.node.fsWatchStart(path, recursive, shown) -> handle`: start an
+/// `fs.watch` watcher. Throws node's error for a path that cannot be watched
+/// -- syscall `watch`, naming the path as the caller gave it (`shown`), which
+/// is how libuv's error reaches node's `FSWatcher` (`ENOENT: no such file or
+/// directory, watch 'nope'`, v22.22.2) -- and, at inotify's watch limit,
+/// node's own ENOSPC message.
+fn op_fs_watch_start(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = fs_path_arg(scope, &args, 0, FsAccess::Read, "fsWatchStart requires a path")
+    else {
+        return;
+    };
+    let recursive = args.get(1).is_true();
+    let shown = arg_string(scope, &args, 2).unwrap_or_else(|| path.shown().into_owned());
+    let registry = core_runtime!(scope).fs_watches();
+    match oam_core::fs_watch::start(&registry, path.os(), recursive) {
+        Ok(handle) => rv.set_double(handle as f64),
+        Err(oam_core::fs_watch::WatchStartError::Io(e)) => {
+            throw_node_error_as_passed(scope, "watch", &shown, &e)
+        }
+        Err(oam_core::fs_watch::WatchStartError::LimitReached) => {
+            let e = std::io::Error::from_raw_os_error(28);
+            let message =
+                format!("ENOSPC: System limit for number of file watchers reached, watch '{shown}'");
+            throw_system_error(scope, "ENOSPC", &message, "watch", Some(&shown), &e);
+        }
+    }
+}
+
+/// `__oam.node.fsWatchNext(handle)`: the watcher's parked read -- resolves
+/// with the next batch of events (a Uint8Array framed by
+/// `oam_core::fs_watch::encode`), with undefined once the watcher is closed,
+/// or rejects with the error the watch failed with. Filed under the
+/// watcher's handle key so an unref'd watcher does not keep the process
+/// alive (node's `persistent: false` / `watcher.unref()`).
+fn op_fs_watch_next(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let registry = core_runtime!(scope).fs_watches();
+    crate::ops::spawn_handle_op(
+        scope,
+        &mut rv,
+        oam_core::HandleKey::FsWatch(handle),
+        oam_core::fs_watch::next(&registry, handle),
+    );
+}
+
+/// `__oam.node.fsWatchClose(handle)`: stop the OS watch; the parked read
+/// settles empty.
+fn op_fs_watch_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let registry = core_runtime!(scope).fs_watches();
+    oam_core::fs_watch::close(&registry, handle);
+    core_runtime_mut!(scope).forget_handle(oam_core::HandleKey::FsWatch(handle));
+}
+
+/// `__oam.node.fsWatchSetRef(handle, referenced)`: `watcher.ref()` /
+/// `watcher.unref()`. The watch keeps running either way; only whether its
+/// parked read holds the event loop open changes.
+fn op_fs_watch_set_ref(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let referenced = args.get(1).boolean_value(scope);
+    core_runtime_mut!(scope).set_handle_ref(oam_core::HandleKey::FsWatch(handle), referenced);
 }
 
 fn op_fs_statfs_sync(

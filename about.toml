@@ -48,6 +48,12 @@ accepted = [
     "Unlicense",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
+    # notify (fs.watch's OS change notifications, crates/oam_core/src/fs_watch.rs):
+    # a public-domain dedication with a permissive fallback licence, so no
+    # copyleft obligation. Unlike MIT/Apache it grants no patent licence (CC0
+    # section 4a), which is why some distributions decline it for code;
+    # accepted here deliberately for this one crate.
+    "CC0-1.0",
 ]
 # `Apache-2.0 WITH LLVM-exception` resolves via the accepted Apache-2.0 above --
 # LLVM-exception is an SPDX *exception*, not a license, and is rejected here.

@@ -482,6 +482,18 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   names, so a plain `readdir` returns the names array as it is. The win is largest for `readdir` on a
   wide directory and for the sync stat forms, which now allocate nothing per call.
 
+### Added
+
+- **Native `fs.watch` and `fs.promises.watch`.** Watchers sit on the OS's change notifications
+  (ReadDirectoryChangesW, inotify, FSEvents, through the `notify` crate) as node's do through
+  libuv: `rename` and `change` events naming the entry relative to the watched directory,
+  `recursive: true` on every platform, every `encoding` including `'buffer'`, `signal`, and
+  `ref()` / `unref()` / `persistent: false` deciding whether a watcher keeps the process alive.
+  `fs.promises.watch` is node's async generator, with `maxQueue` and `overflow`. `fs.watch`
+  polled the path's mtime every 100 ms: no `rename`, nothing from inside a directory, and a
+  watcher that kept the process alive however it was unref'd. Conformance case 421; what still
+  differs is in docs/node-divergences.md.
+
 ## [0.19.0] - 2026-10-11
 
 ### Fixed

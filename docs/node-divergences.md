@@ -3879,6 +3879,42 @@ top level only, #286). Measured on Windows, what is left:
 - **A Dir is also sync-iterable** (`for (const d of dir)`), an extra node does not have, kept
   from before the class and pinned by the e2e test `dir_sync_iterator_is_an_intentional_oam_extra`.
 
+### `fs.watch` and `fs.promises.watch`: what still differs
+
+Both sit on OS change notifications, as node's do through libuv's `uv_fs_event_t`:
+ReadDirectoryChangesW on Windows, inotify on Linux, FSEvents on macOS, reached through the
+`notify` crate (`crates/oam_core/src/fs_watch.rs`). `FSWatcher` is node's: an EventEmitter
+with `_handle`, `'change'` events typed `rename` / `change` by libuv's rule (a content or
+attribute change is `change`, anything that makes or unmakes a name is `rename`), filenames
+relative to the watched directory (the file's own name for a file watch), every encoding
+including `'buffer'`, `recursive` on all three platforms, `close()` emitting `'close'` on the
+next tick, `ref()` / `unref()` / `persistent: false` deciding whether the watcher keeps the
+process alive, `signal`, and the `watch` error shapes. `fs.promises.watch` is node's async
+generator with `maxQueue` / `overflow` (`conformance/cases/421-*`). Up to 0.19.0 `fs.watch`
+polled the path's mtime every 100 ms (no `rename`, nothing from inside a directory, a watcher
+that could never be unref'd) and `fs.promises.watch` did not exist. What is left:
+
+- **Event granularity follows the backend, not libuv.** Where libuv folds one OS record into
+  one event, oam reports what `notify` reports: an FSEvents record flagged created and
+  modified arrives as `rename` then `change` (libuv: one `rename`). inotify and
+  ReadDirectoryChangesW map one to one. Nothing portable could rely on the count; node's own
+  counts differ by platform.
+- **macOS uses FSEvents for a file watch too.** libuv watches a single file with kqueue.
+  Both name the file; FSEvents' latency and coalescing apply.
+- **Deleting a watched directory on Windows.** node v22.22.2 reports `rename` with the full
+  `\\?\` path in a tight loop (3,482 events in 350 ms, measured) until the watcher is closed,
+  and an unref'd watcher on it then keeps the process alive; oam's watch ends quietly after
+  the deletion's own events.
+- **A file watch on Windows matches the name exactly.** libuv compares the changed name with
+  the watched file's case-insensitively and against its 8.3 short name; oam (`notify`)
+  compares the path as given, so `fs.watch('README.MD')` on a file spelled `README.md` sees
+  nothing.
+- **One native thread per watcher** on Windows and Linux (the backend's event loop), where
+  libuv shares the process's loop. Fine for a CLI's handful of watchers; thousands of
+  watchers cost thousands of threads.
+- **A queue overflow** (inotify `IN_Q_OVERFLOW`, an FSEvents drop) is reported as one
+  `rename` with a `null` filename on every platform; libuv does so on Windows only.
+
 ### Windows: `require` of a `\\?\` or `\\.\` spelling of a module loads it
 
 node's `fs` and module loader hand the OS every path through `path.toNamespacedPath`:
@@ -4030,12 +4066,11 @@ The largest per-module gaps (counts from windows-aarch64), all tracked in that f
 | `constants` | 54 win32 / 65 linux / 61 darwin | The legacy all-in-one table. Platform-conditional values — the `WSA*` block on Windows, `RTLD_*` on POSIX, plus `UV_DIRENT_*` and the `SSL_OP_*`/`ENGINE_METHOD_*` OpenSSL set everywhere. This module is the *entire* reason the ratchet is keyed by platform: a Windows-only baseline reports 16 phantom new gaps on Linux and 12 on darwin, every one of them here. `fs.constants` and `os.constants` are separately correct — see *Platform constant tables* above. |
 | `dns/promises` | 31 | `Resolver`, `getServers`/`setServers`, `lookupService`, `resolveTlsa`, and the `BADNAME`/`NOTFOUND`/… error-code constants. |
 | `module` | 25 | The `Module._*` loader internals (`_load`, `_resolveFilename`, `_cache`, `_extensions`), `register`, `SourceMap`/`findSourceMap`, the compile-cache API. |
-| `fs` | **0** | Closed in 0.9.1–0.9.2. Ownership and fd metadata (`chown`/`fchown`/`lchown`, `fchmod`/`lchmod`), durability (`fsync`/`fdatasync`), `ftruncate`, the `utimes`/`futimes`/`lutimes` family, `readv`/`writev`, `openAsBlob`, `statfs` and `glob`/`globSync` all landed. `node:fs` now has no missing export names on any platform; `fs/promises` is down to `watch`. |
+| `fs` | **0** | Closed in 0.9.1–0.9.2. Ownership and fd metadata (`chown`/`fchown`/`lchown`, `fchmod`/`lchmod`), durability (`fsync`/`fdatasync`), `ftruncate`, the `utimes`/`futimes`/`lutimes` family, `readv`/`writev`, `openAsBlob`, `statfs` and `glob`/`globSync` all landed. `node:fs` now has no missing export names on any platform, and `fs/promises` none since `watch` landed after 0.19.0. |
 | `crypto` | 12 | The legacy class constructors (`Hash`, `Hmac`, `Cipher(iv)`, `Decipher(iv)`), `diffieHellman`, `getCipherInfo`, `randomFill`. |
 | `stream/web` | 12 | The controller/reader/writer constructors and the queuing-strategy classes — the same constructors listed in the Web globals row above. |
 | `v8` | 8 | `DefaultSerializer`/`DefaultDeserializer`, `GCProfiler`, `promiseHooks`, `queryObjects`, `setHeapSnapshotNearHeapLimit`. |
 | `path` | 3 (one per of `path`, `path/posix`, `path/win32`) | `_makeLong` (a Windows long-path helper; not surfaced by `fs.glob`, which is in pure JS). |
-| `fs/promises` | 1 | `watch` (the recursive `fs.watch` family — needs an event channel oam does not yet plumb). |
 
 ---
 

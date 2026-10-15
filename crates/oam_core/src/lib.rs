@@ -26,6 +26,9 @@ pub mod cluster;
 /// option and `params()`.
 mod deflate;
 pub mod dns;
+/// `fs.watch` / `fs.promises.watch`: OS change notifications (inotify,
+/// ReadDirectoryChangesW, FSEvents) through the `notify` crate.
+pub mod fs_watch;
 /// oam's own HTTP client transport for the `fetch` op (#143).
 pub mod http_client;
 /// node's acceptance rules for inbound HTTP/1 request heads, and its
@@ -1039,6 +1042,9 @@ pub enum HandleKey {
     TcpServer(u64),
     /// A `tls.TLSSocket`: its parked read.
     Tls(u64),
+    /// An `fs.watch` watcher: its parked `fsWatchNext` (see
+    /// [`crate::fs_watch`]).
+    FsWatch(u64),
 }
 
 /// What [`CoreRuntime`] remembers per [`HandleKey`].
@@ -1129,6 +1135,8 @@ pub struct CoreRuntime {
     ws: websocket::WsRegistry,
     workers: worker::WorkerRegistry,
     children: child::ChildRegistry,
+    /// `fs.watch` watchers; dropped (and the OS watches stopped) with the run.
+    fs_watches: fs_watch::FsWatchRegistry,
     #[cfg(any(windows, unix))]
     raw_children: child_extra::RawChildRegistry,
     // Generic opaque-handle allocator (HTTP body ids, sync file fds, ...).
@@ -1202,6 +1210,7 @@ impl CoreRuntime {
             ws: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             workers: std::sync::Arc::new(std::sync::Mutex::new(worker::WorkerState::default())),
             children: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            fs_watches: fs_watch::FsWatchRegistry::default(),
             #[cfg(any(windows, unix))]
             raw_children: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             // Starts above the inheritable-fd window, not at 3: see OWN_FD_BASE.
@@ -1335,6 +1344,11 @@ impl CoreRuntime {
     /// HTTP server state (Arc clone; servers die with the run).
     pub fn http(&self) -> std::sync::Arc<http_server::HttpState> {
         self.http_state.clone()
+    }
+
+    /// `fs.watch` watchers (Arc clone; die with the run).
+    pub fn fs_watches(&self) -> fs_watch::FsWatchRegistry {
+        self.fs_watches.clone()
     }
 
     /// TCP socket registry (Arc clone; dies with the run).
