@@ -79,6 +79,17 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   (DEP0180), which takes node's positional arguments and warns once per code alongside
   `util.deprecate` wrappers. The callback `stat`, `lstat` and `fstat` are named and have length 1,
   as node's are.
+- **`tty.ReadStream` and `tty.WriteStream` are node's classes, and on a terminal `process.stdout`,
+  `process.stderr` and `process.stdin` are instances of them, as in node (#391).** They were empty
+  stubs that constructed over any descriptor. They now refuse a non-terminal with node's
+  `ERR_TTY_INIT_FAILED` and a bad descriptor with `ERR_INVALID_FD`, are `stream.Duplex` streams
+  that answer `instanceof net.Socket`, and carry node's `getColorDepth`, `hasColors`, `cursorTo`,
+  `clearLine` and `getWindowSize` (a ReadStream `setRawMode`). `tty.isatty` answers for any
+  descriptor, so a terminal the program opened (`/dev/tty`, `\\.\CONOUT$`) is one and is sized; an
+  msys/cygwin pty pipe (Git Bash's mintty) is a pipe there, as libuv says, so `process.stdout.isTTY`
+  is no longer true under mintty. A write in another encoding (`write('68690a', 'hex')`) writes its
+  bytes, and stdout's `'resize'` watch no longer shows up in `eventNames()`. `readline.clearLine`
+  without a stream returns `true`, as node's does.
 - **`events.once` is an async function and an abort rejects with node's `AbortError`, as in node (#344).**
   It was a plain function, so the continuation of `await once(...)` ran before the microtasks the
   same emit queued, and its kind and `length` (3) were not node's. An aborted `once` rejected with a

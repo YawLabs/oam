@@ -1339,8 +1339,9 @@ linked. A chain-build failure (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) leaves `err.ce
 node's are `net.Socket` subclasses over a libuv TTY handle. They are node's constructors
 in oam -- callable without `new`, `ERR_INVALID_FD` for a descriptor that is no int32 >= 0,
 `ERR_TTY_INIT_FAILED` (uv_tty_init's errno: EBADF on Windows for anything that is not a
-console, EINVAL elsewhere for a file or an unopened descriptor, a pipe or socket taken on
-POSIX), node's prototype surface, and on a terminal `process.stdout`, `stderr` and `stdin`
+console, an msys/cygwin pty pipe included, EINVAL elsewhere for a file, the null device or
+an unopened descriptor, a pipe or socket taken on POSIX), node's prototype surface, and on a
+terminal `process.stdout`, `stderr` and `stdin`
 are instances (`conformance/cases/418-tty-stream-classes.mjs`, and the ConPTY test
 `stdio_on_a_console_are_the_tty_stream_classes`). oam's `net.Socket` is the TCP-native
 `EventEmitter` of entry 34, so these cannot extend it. What differs:
@@ -1352,19 +1353,28 @@ are instances (`conformance/cases/418-tty-stream-classes.mjs`, and the ConPTY te
   methods rather than `net.Socket.prototype`'s.
 - **`columns` / `rows` are live accessors**, reading the terminal on each access, where
   node's are data properties its SIGWINCH handler refreshes; assigning one turns it into a
-  data property, as in node. `'resize'` comes from a 250 ms poll that runs while a
-  `'resize'` listener is attached.
+  data property, as in node. `'resize'` on `process.stdout` / `stderr` comes from a
+  250 ms poll that runs while a `'resize'` listener is attached, started by an internal
+  emitter hook and so adding no listeners of its own; node's comes from a `SIGWINCH`
+  listener on `process`, which oam does not add. As in node, a WriteStream a program
+  makes never emits `'resize'`.
 - **Descriptors above 2.** A stream over one (a pipe on POSIX, a terminal opened by name)
   reads and writes through the descriptor table, synchronously for writes as node's
   `setBlocking(true)` makes them. Destroying it does not close the descriptor, a read in
-  flight holds the event loop until it completes, a Windows console opened by name has no
-  size, and `setRawMode` on any descriptor but 0 emits `ENOTSUP` rather than switching it.
+  flight holds the event loop until it completes, and `setRawMode` on any descriptor but 0
+  emits `ENOTSUP` rather than switching it. The size is read from the terminal the table
+  entry holds (oam's descriptor numbers start at 64 and are not the OS's).
 - **Never-read sides.** A WriteStream's readable side never reads (node's starts
   `manualStart` and would read the terminal if asked); stdin's writable side writes to
   descriptor 0 through the table.
 - **Internal state.** `emitClose` is on (node's `net.Socket` turns it off and emits
   `'close'` itself), so `'close'` follows a destroy either way; node's internal `'end'`
   listeners are absent.
+- **Not yet ported** (tracked as follow-ups): `console.log` does not colourise on a TTY or
+  under `FORCE_COLOR` (node's `colorMode: 'auto'`), nor print the `NO_COLOR` warning from
+  there; and `readline.createInterface` on a TTY stdin neither switches it to raw mode nor
+  adds a `'keypress'` listener, `rl.close()` does not pause it, and `rl.getCursorPos` is
+  missing.
 
 ### 35. `http` and `fetch` to a refused port — FIXED, no longer a divergence (#143)
 
