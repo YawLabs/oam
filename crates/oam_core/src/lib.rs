@@ -63,6 +63,8 @@ pub mod tls;
 pub mod udp;
 pub mod websocket;
 pub mod worker;
+/// node:zlib's zstd engine over libzstd (node's binding's native half).
+pub mod zstd;
 
 /// io_uring FS fast path (Linux-only, opt-in via OAM_IO_URING). See
 /// docs/design/io_uring.md. cfg'd out on every other platform.
@@ -1166,6 +1168,11 @@ pub enum ZlibStream {
     BrotliDecompress(Box<BrotliDecompressor>),
     HandleCompress(Box<zlib::NodeDeflate>),
     HandleDecompress(Box<zlib::NodeInflate>),
+    /// node's zstd handle (`zstd::ZstdHandle`). Shared, not owned: an async
+    /// write holds its own reference and the handle's lock for the length of
+    /// the libzstd call, so the registry lock is held only to look it up and
+    /// a close that lands mid-write frees the context when that write ends.
+    Zstd(std::sync::Arc<std::sync::Mutex<zstd::ZstdHandle>>),
 }
 
 pub type ZlibRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, ZlibStream>>>;
@@ -7462,11 +7469,11 @@ pub mod ops {
                 super::ZlibStream::BrotliDecompress(dec) => dec
                     .write_chunk(&chunk)
                     .map_err(|e| failed("brotli stream write", e)),
-                super::ZlibStream::HandleCompress(_) | super::ZlibStream::HandleDecompress(_) => {
-                    Err(Box::new(OpOutcome::Failed(
-                        "zlib handle: use zlibHandleWriteSync, not zlibStreamWrite".into(),
-                    )))
-                }
+                super::ZlibStream::HandleCompress(_)
+                | super::ZlibStream::HandleDecompress(_)
+                | super::ZlibStream::Zstd(_) => Err(Box::new(OpOutcome::Failed(
+                    "zlib handle: use its handle write, not zlibStreamWrite".into(),
+                ))),
             }
         })
         .await;
@@ -7512,11 +7519,11 @@ pub mod ops {
                 super::ZlibStream::BrotliDecompress(dec) => dec
                     .finish()
                     .map_err(|e| Box::new(zlib_decode_failed("brotli stream flush", e))),
-                super::ZlibStream::HandleCompress(_) | super::ZlibStream::HandleDecompress(_) => {
-                    Err(Box::new(OpOutcome::Failed(
-                        "zlib handle: use close(), not zlibStreamFlush".into(),
-                    )))
-                }
+                super::ZlibStream::HandleCompress(_)
+                | super::ZlibStream::HandleDecompress(_)
+                | super::ZlibStream::Zstd(_) => Err(Box::new(OpOutcome::Failed(
+                    "zlib handle: use close(), not zlibStreamFlush".into(),
+                ))),
             }
         })
         .await;
@@ -7669,6 +7676,89 @@ pub mod ops {
             _ => Err(std::io::Error::other(format!(
                 "zlib handle {handle} is not a handle variant"
             ))),
+        }
+    }
+
+    /// zstdHandleCreate: node's zstd binding `init()` (see
+    /// [`super::zstd::ZstdHandle::new`]), registered under a fresh handle. The
+    /// `Err` is node's message for the step that failed, which node throws as
+    /// `ERR_ZLIB_INITIALIZATION_FAILED`.
+    pub fn zstd_handle_create(
+        streams: &super::ZlibRegistry,
+        ids: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+        compress: bool,
+        pledged_src_size: Option<u64>,
+        dictionary: Option<&[u8]>,
+        params: &[(u32, i32)],
+    ) -> Result<u64, &'static str> {
+        let engine = super::zstd::ZstdHandle::new(compress, pledged_src_size, dictionary, params)?;
+        let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        streams.lock().expect("zlib registry lock").insert(
+            handle,
+            super::ZlibStream::Zstd(std::sync::Arc::new(std::sync::Mutex::new(engine))),
+        );
+        Ok(handle)
+    }
+
+    /// The zstd engine registered under `handle`, if it is one and still open.
+    pub fn zstd_handle(
+        streams: &super::ZlibRegistry,
+        handle: u64,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<super::zstd::ZstdHandle>>> {
+        match streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&handle)
+        {
+            Some(super::ZlibStream::Zstd(engine)) => Some(engine.clone()),
+            _ => None,
+        }
+    }
+
+    /// The result of one zstd handle write as the shim reads it: the output
+    /// bytes, then the count of input bytes consumed as 8 little-endian bytes.
+    /// One buffer carries both numbers node's binding reports (through its
+    /// write-state array) without a second op or a JSON round trip.
+    pub fn zstd_write_result(consumed: usize, mut output: Vec<u8>) -> Vec<u8> {
+        output.extend_from_slice(&(consumed as u64).to_le_bytes());
+        output
+    }
+
+    /// node's coded zstd failure, for an async write to reject with.
+    pub fn zstd_failed(error: super::zstd::ZstdError) -> OpOutcome {
+        OpOutcome::NodeFailed {
+            code: error.code.into(),
+            message: error.message.into(),
+            syscall: None,
+            path: None,
+            errno: Some(error.errno),
+            hostname: None,
+            address: None,
+            port: None,
+            dest: None,
+        }
+    }
+
+    /// zstdHandleWrite: node's async `handle.write()` -- one libzstd call (see
+    /// [`super::zstd::ZstdHandle::write`]) on the blocking pool, as node runs
+    /// it on the threadpool. Resolves with [`zstd_write_result`]'s buffer.
+    pub async fn zstd_handle_write(
+        engine: std::sync::Arc<std::sync::Mutex<super::zstd::ZstdHandle>>,
+        flush: i32,
+        input: Vec<u8>,
+        out_len: usize,
+    ) -> OpOutcome {
+        let result = tokio::task::spawn_blocking(move || {
+            engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .write(flush, &input, out_len)
+        })
+        .await;
+        match result {
+            Ok(Ok((consumed, output))) => OpOutcome::Bytes(zstd_write_result(consumed, output)),
+            Ok(Err(error)) => zstd_failed(error),
+            Err(e) => OpOutcome::Failed(format!("zstd write task: {e}")),
         }
     }
 

@@ -43,6 +43,9 @@ futures-util = { workspace = true }
 sha1 = { workspace = true }
 # node:zlib brotli backend (pure-Rust; default features only).
 brotli = { workspace = true }
+# node:zlib zstd backend (src/zstd.rs): libzstd 1.5.7 through its safe
+# binding; the workspace manifest has why it is not a pure-Rust crate.
+zstd-safe = { workspace = true }
 # DNS record-type resolution.
 hickory-resolver = { workspace = true }
 # Base64 decoding for binary fetch request bodies.
