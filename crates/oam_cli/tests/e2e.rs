@@ -1101,15 +1101,108 @@ fn cjs_failure_modes_surface_clearly() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // require() of an ES module points at import (ERR_REQUIRE_ESM).
+    // require() of an ES module loads it, as node 22's does; one with a
+    // top-level await is the failure, and it points at import()
+    // (ERR_REQUIRE_ASYNC_MODULE).
     std::fs::write(proj.join("esm_target.mjs"), "export const x = 1;").unwrap();
-    std::fs::write(proj.join("reqesm.cjs"), "require('./esm_target.mjs');").unwrap();
+    std::fs::write(
+        proj.join("reqesm.cjs"),
+        "console.log(require('./esm_target.mjs').x);",
+    )
+    .unwrap();
     let out = oam(&["run", proj.join("reqesm.cjs").to_str().unwrap()]);
-    assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("ERR_REQUIRE_ESM"),
+        out.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
+    std::fs::write(proj.join("esm_tla.mjs"), "await 0; export const x = 1;").unwrap();
+    std::fs::write(proj.join("reqtla.cjs"), "require('./esm_tla.mjs');").unwrap();
+    let out = oam(&["run", proj.join("reqtla.cjs").to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ERR_REQUIRE_ASYNC_MODULE") && stderr.contains("Use import() instead"),
+        "stderr: {stderr}"
+    );
+}
+
+/// `--trace-require-module` is node's opt-in for the ExperimentalWarning a
+/// require() of an ES module used to print: none without it, one per
+/// process with it (two different ES modules required still warn once), and
+/// `no-node-modules` leaves out a require made inside node_modules. The value
+/// is required and is one of two words (node's exit 9 otherwise), and
+/// execArgv hands it back as given.
+#[test]
+fn trace_require_module_flag_warns_once_when_asked() {
+    let root = "trace-require-module";
+    write_temp(
+        &format!("{root}/node_modules/pkg/inner.mjs"),
+        "export const inner = 1;",
+    );
+    write_temp(
+        &format!("{root}/node_modules/pkg/index.cjs"),
+        "module.exports = require('./inner.mjs');",
+    );
+    write_temp(
+        &format!("{root}/node_modules/pkg/package.json"),
+        r#"{ "name": "pkg", "main": "index.cjs" }"#,
+    );
+    write_temp(&format!("{root}/a.mjs"), "export const a = 1;");
+    write_temp(&format!("{root}/b.mjs"), "export const b = 2;");
+    let main = write_temp(
+        &format!("{root}/main.cjs"),
+        "require('pkg'); require('./a.mjs'); require('./b.mjs'); console.log('ran');",
+    );
+    let main = main.to_str().unwrap();
+    let warnings = |args: &[&str]| {
+        let out = oam(args);
+        assert!(
+            out.status.success(),
+            "{args:?} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let lines: Vec<String> = stderr
+            .lines()
+            .filter(|l| l.contains("ExperimentalWarning"))
+            .map(str::to_string)
+            .collect();
+        lines
+    };
+    assert!(warnings(&[main]).is_empty());
+    let all = warnings(&["--trace-require-module=all", main]);
+    assert_eq!(all.len(), 1, "{all:?}");
+    assert!(
+        all[0].contains("CommonJS module") && all[0].contains("inner.mjs using require()."),
+        "{all:?}"
+    );
+    let spaced = warnings(&["--trace-require-module", "no-node-modules", main]);
+    assert_eq!(spaced.len(), 1, "{spaced:?}");
+    assert!(spaced[0].contains("a.mjs using require()."), "{spaced:?}");
+
+    let out = oam(&["--trace-require-module"]);
+    assert_eq!(out.status.code(), Some(9));
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("--trace-require-module requires an argument")
+    );
+    let out = oam(&["--trace-require-module=some", "-e", "1"]);
+    assert_eq!(out.status.code(), Some(9));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid value for --trace-require-module")
+    );
+    let out = oam(&[
+        "--trace-require-module",
+        "all",
+        "-p",
+        "JSON.stringify(process.execArgv)",
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        r#"["--trace-require-module","all","-p","JSON.stringify(process.execArgv)"]"#
     );
 }
 
