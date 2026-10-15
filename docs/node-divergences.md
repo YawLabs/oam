@@ -1445,6 +1445,47 @@ _(source: `crates/oam_core/src/net_connect.rs`, `dns.rs`, `js/node_compat.js`
 Node on Windows and on Linux (WSL, no routable IPv6: `localhost` resolves to `127.0.0.1` alone
 on both runtimes).)_
 
+### 52. A server's `listen()` binds asynchronously: `listening` and `address()` wait for it (#387)
+
+Node binds a `listen()` given no host -- `listen(port)`, `listen()`, `listen(path)` --
+synchronously, inside the call: on the next line `server.listening` is `true` and
+`server.address()` answers the port. Every oam server (net, tls, http, https, http2) binds on
+the runtime's I/O thread, so between `listen()` and `'listening'` oam answers `false` and
+`null`, as Node does for a `listen(port, host)`, which looks the host up first. Read them in
+the `listen()` callback or on `'listening'`, which both runtimes reach the same way.
+
+What a server does in that window is Node's since #387: a `close()` before the bind lands
+closes it -- no `'listening'`, `'close'` and the `close(cb)` callback as Node gives them (`cb`
+called with nothing for a host-less `listen()`; `ERR_SERVER_NOT_RUNNING` for a `listen()` with
+a host, whose lookup Node abandons, or a bind that fails, whose `'error'` is still emitted
+first), and the port free again once `'close'` has come. A second `close()` in that window
+gets `ERR_SERVER_NOT_RUNNING` and a second `'close'`, both after the first. A `listen()` after
+the `close()` -- in the same tick or later -- binds the port again: its bind waits for the
+closed one to land and let the port go. A failed bind's `'error'` with no listener is an
+uncaught exception, and `'close'` and `cb` still follow it. A second `listen()` throws
+`ERR_SERVER_ALREADY_LISTEN` as Node's does, except during a host lookup, which it supersedes.
+Up to 0.19.0 a `close()` in that window closed nothing: the bind landed afterwards and the
+server listened and served (net, http, https, http2) or kept the port bound with nothing
+accepting (tls), and `close(cb)` never called back (#369).
+
+What still differs comes from the bind being asynchronous, for a `listen()` with no host:
+
+- **When `'close'` comes.** Node emits it, and runs `close(cb)`'s `cb`, on the next tick; oam
+  emits it when the bind lands, a later turn of the event loop. A `setImmediate` (and on net a
+  `setTimeout(..., 0)`) queued in the same tick runs before it under oam and after it under
+  Node. A failed bind's `'error'` comes then too, rather than on Node's next tick; with no
+  `'error'` listener the uncaught exception's report shows the line in `js/node_compat.js`
+  that rethrows it, where Node's shows `node:events`' "Unhandled 'error' event".
+- **`close()` and then `listen()` again in the same tick.** Node's first `'listening'` tick
+  finds the second handle and emits `'listening'` (and so the second `listen()`'s callback)
+  before the first `close()`'s `'close'` and callback; oam emits the first `'close'` when the
+  first bind lands, and the second `'listening'` once the second bind has. Both runtimes emit
+  each event the same number of times and end listening on the port. With a host, Node
+  abandons the first lookup and the order is the same on both.
+
+_(probed: Node v22.22.2 and oam on `conformance/cases/416-server-close-before-bind.mjs`, every
+server kind; source `js/node_compat.js` `startServerBind`, `bindAfterCancelled`.)_
+
 ### 38. `fetch` and `http.request` on oam's own client: what still differs (#143)
 
 Since #143 `fetch`, `http.request` and `https.request` run on oam's own transport (an

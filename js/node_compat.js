@@ -1243,6 +1243,169 @@
     process.nextTick(function() { server.emit("error", err); });
     return true;
   }
+  // A server's bind while it is in flight (#387). Node binds a listen()
+  // without a host -- a port alone, or a pipe -- synchronously, inside
+  // listen(), so a close() in the same tick closes a bound handle: no
+  // 'listening' (emitListeningNT finds no handle), 'close' on the next tick,
+  // and close(cb)'s cb called with nothing. A listen() WITH a host looks the
+  // name up first (lookupAndListen), and a close() during the lookup
+  // abandons it (`_listeningId`): nothing is ever bound, no 'listening', no
+  // 'error' even for a port that is taken, and cb gets ERR_SERVER_NOT_RUNNING
+  // (it had no handle). Every oam server binds asynchronously, and close()
+  // used to act only on a server already bound: a close() before the bind
+  // landed closed nothing, and the bind then made the server listen and
+  // serve (net, http, https, http2) or left the port bound with nobody
+  // accepting (tls), with close(cb)'s cb never run (#387, #369). Now a
+  // listen() records its bind here, a close() while it is in flight closes
+  // it (closePendingBind), and the bind, when it lands, finds itself closed
+  // and closes its own listener (serverBindCancelled).
+  var kPendingBind = Symbol("oam.pendingBind");
+  // The server's latest bind, live or not, until it has landed. A closed
+  // (or superseded) one still holds its listener until then: the next
+  // listen() waits for it (bindAfterCancelled), and a close() made in that
+  // window joins its 'close' (closePendingBind).
+  var kLastBind = Symbol("oam.lastBind");
+  // node's ERR_SERVER_ALREADY_LISTEN: listen() on a server with a handle --
+  // one listening, or one whose host-less bind node would already have made
+  // -- throws, ahead of reading the port (node checks `this._handle` before
+  // validatePort). A listen() during a host lookup supersedes it instead
+  // (the lookup's `_listeningId` check), so that one's bind is abandoned.
+  function assertServerNotListening(server) {
+    var pending = server[kPendingBind];
+    if (server.listening || (pending && !pending.lookup)) {
+      throw codes.ERR_SERVER_ALREADY_LISTEN();
+    }
+  }
+  // The native bind of a listen(), started by `start` -- at once, or, while
+  // a bind closed (or superseded) before it landed is still in flight, once
+  // that one has landed and closed its listener (#387). node's close() has
+  // released the port before it returns, so listen(p); close(); listen(p)
+  // binds p again; started at once, the new bind raced the old listener
+  // for the port and failed with EADDRINUSE. The old bind lands on its own
+  // (it is never left waiting on anything), so the chain always moves on.
+  // A native throw (a permission refused) from a waiting start is that
+  // bind's 'error' rather than a throw from listen(), as it cannot be
+  // anything else by then.
+  function bindAfterCancelled(server, start) {
+    var last = server[kLastBind];
+    if (!last) return start();
+    return last.landed.then(function() {
+      return start();
+    });
+  }
+  function startServerBind(server, listen) {
+    var bind = { lookup: !!listen.host, closed: false, failed: false, extraCloses: 0 };
+    bind.landed = new Promise(function(resolve) {
+      bind.land = resolve;
+    });
+    server[kPendingBind] = bind;
+    server[kLastBind] = bind;
+    return bind;
+  }
+  // close() while the bind is in flight: true when there was one, which it
+  // has closed, registering close(cb)'s cb as node does -- with the error a
+  // server with no handle gets when node would have had none (a host lookup
+  // abandoned, or a bind that fails), decided when 'close' is emitted.
+  // Also true for a close() made after that, while the closed bind has
+  // still not landed: node's server has no handle by then, so cb gets
+  // ERR_SERVER_NOT_RUNNING and one more 'close' comes. Both 'close's come
+  // once the bind has landed and let its listener go (#387); this close()
+  // queuing its own 'close' on the next tick ran the first close(cb)'s cb
+  // with the port still bound.
+  function closePendingBind(server, cb) {
+    var bind = server[kPendingBind];
+    if (!bind) {
+      var last = server[kLastBind];
+      if (!last || !last.closed) return false;
+      if (typeof cb === "function") {
+        server.once("close", function close() {
+          cb(codes.ERR_SERVER_NOT_RUNNING());
+        });
+      }
+      last.extraCloses++;
+      return true;
+    }
+    bind.closed = true;
+    server[kPendingBind] = null;
+    if (typeof cb === "function") {
+      server.once("close", function close() {
+        if (bind.lookup || bind.failed) cb(codes.ERR_SERVER_NOT_RUNNING());
+        else cb();
+      });
+    }
+    return true;
+  }
+  // A server's bind error, emitted as node's: a throw from it -- there is no
+  // 'error' listener -- is an uncaught exception, not this promise
+  // reaction's unhandled rejection (#387). Returns the throw, if any.
+  function emitServerBindError(server, err) {
+    try {
+      server.emit("error", err);
+    } catch (e) {
+      process.nextTick(function() {
+        throw e;
+      });
+      return e;
+    }
+    return undefined;
+  }
+  // The bind landed: false when it is the server's live bind, to go on and
+  // listen. True when a close() (or a listen() superseding a host lookup)
+  // came first: the listener it bound is closed (`closeListener`), a failed
+  // one's error raised only where node's host-less bind would have raised
+  // it, and a closed server emits 'close' (`emitClose`, the server kind's
+  // drain-aware emission) -- once per close() made before it landed.
+  // `err` is undefined for a bind that succeeded.
+  function serverBindCancelled(server, bind, closeListener, emitClose, err) {
+    if (server[kLastBind] === bind) server[kLastBind] = null;
+    if (server[kPendingBind] === bind) {
+      server[kPendingBind] = null;
+      bind.land();
+      return false;
+    }
+    if (err === undefined) closeListener();
+    // The port is free: a listen() waiting on this bind may start its own.
+    bind.land();
+    var thrown;
+    if (err !== undefined && bind.closed && !bind.lookup) {
+      // node: the bind failed inside listen(), and its 'error' -- on a tick
+      // node queued before close()'s 'close' -- is still emitted. With no
+      // listener it is an uncaught exception, and the 'close's still come
+      // after it, as node's own ticks do.
+      bind.failed = true;
+      thrown = emitServerBindError(server, err);
+    }
+    if (bind.closed) {
+      var closes = 1 + bind.extraCloses;
+      var emitCloses = function() {
+        emitClose();
+        for (var i = 1; i < closes; i++) process.nextTick(emitClose);
+      };
+      // After an 'error' nobody listened for, the 'close's wait for the next
+      // callback: oam runs the ticks queued behind a throwing tick only at
+      // the next callback, so a tick here would wait for one that, with
+      // the process held open by another server, may never come.
+      if (thrown !== undefined) setImmediate(emitCloses);
+      else emitCloses();
+    }
+    return true;
+  }
+  // net and tls servers' 'close': node's _emitCloseIfDrained -- once the last
+  // connection accepted has gone too, not when the listener stops. `live` is
+  // the server's set of accepted connections.
+  function emitServerCloseIfDrained(server, live) {
+    var emitClose = function() {
+      try {
+        server.emit("close");
+      } catch (e) {
+        process.nextTick(function() {
+          throw e;
+        });
+      }
+    };
+    if (live && live.size > 0) live[Symbol.for("oam.onDrained")] = emitClose;
+    else emitClose();
+  }
   // ---- Error family ----
   // Node declares this one with three bases (Error, TypeError, RangeError) and
   // reaches the TypeError/RangeError variants through `.TypeError`/`.RangeError`
@@ -1262,6 +1425,12 @@
   // A write, end() or connect-time op on a socket destroyed before it could
   // run (lib/internal/errors.js; net and tls raise them).
   codes.ERR_SOCKET_CLOSED = E("ERR_SOCKET_CLOSED", Error, "Socket is closed");
+  // Every server's listen() and close() (#387; see startServerBind).
+  codes.ERR_SERVER_ALREADY_LISTEN = E(
+    "ERR_SERVER_ALREADY_LISTEN", Error,
+    "Listen method has been called more than once without closing.",
+  );
+  codes.ERR_SERVER_NOT_RUNNING = E("ERR_SERVER_NOT_RUNNING", Error, "Server is not running.");
   codes.ERR_SOCKET_CLOSED_BEFORE_CONNECTION = E(
     "ERR_SOCKET_CLOSED_BEFORE_CONNECTION", Error,
     "Socket closed before the connection was established",
@@ -23787,35 +23956,42 @@
       else done();
     }
 
-    function serverNotRunning() {
-      return Object.assign(new Error("Server is not running."), { code: "ERR_SERVER_NOT_RUNNING" });
+    // A server with no handle has its 'close' emitted (again) now -- unless
+    // an earlier close() is still draining, whose 'close' is the one to
+    // come (node's _emitCloseIfDrained finds connections left and waits).
+    function emitClosedServerClose(server) {
+      if (server[kServerClosing] && !server[kServerClosed]) return;
+      try {
+        server.emit("close");
+      } catch (e) {
+        raiseFromListener(e);
+      }
     }
 
     // node's net.Server#close(cb): the first close() stops the server and its
     // callback runs at 'close'. One made while the server is draining, or
     // after it has closed, or on a server that never listened, gets
-    // ERR_SERVER_NOT_RUNNING -- at 'close', which a server with nothing left
-    // to drain emits (again) on a later tick. `stop` is the server kind's own
-    // shutdown call, run once.
+    // ERR_SERVER_NOT_RUNNING (node's NodeError, not a plain Error with a
+    // code, #387) -- at 'close', which a server with nothing left to drain
+    // emits (again) on a later tick. `stop` is the server kind's own
+    // shutdown call, run once. A close() before listen()'s bind has landed
+    // closes the bind, which closes its listener when it lands (#387); it
+    // used to find no server id, answer ERR_SERVER_NOT_RUNNING, and leave
+    // the bind to make the server listen and serve after it.
     function closeServer(server, callback, stop) {
+      if (closePendingBind(server, callback)) return server;
       const running = server._serverId !== null && server._serverId !== undefined &&
         !server[kServerClosing];
       if (typeof callback === "function") {
         if (running) server.once("close", callback);
-        else server.once("close", () => callback(serverNotRunning()));
+        else server.once("close", () => callback(codes.ERR_SERVER_NOT_RUNNING()));
       }
       if (running) {
         server[kServerClosing] = true;
         server.listening = false;
         stop();
-      } else if (!server[kServerClosing] || server[kServerClosed]) {
-        process.nextTick(() => {
-          try {
-            server.emit("close");
-          } catch (e) {
-            raiseFromListener(e);
-          }
-        });
+      } else {
+        process.nextTick(() => emitClosedServerClose(server));
       }
       return server;
     }
@@ -23926,6 +24102,9 @@
         this.listening = false;
       }
       listen(...args) {
+        // A listen() on a server listening, or binding, throws (node's
+        // ERR_SERVER_ALREADY_LISTEN, #387).
+        assertServerNotListening(this);
         // node's reading of the arguments (net.Server's listen is the one
         // http.Server has); a port that is not one throws from here (#163).
         const listen = normalizeListenArgs(args);
@@ -23939,16 +24118,16 @@
         // req delivers chunks as they arrive, instead of waiting for the
         // last byte (docs/design/streaming-bodies.md).
         const policy = serverHeadPolicy(this);
-        let binding;
-        if (path !== undefined) {
-          // net's module section assigns the pipe-name helpers on load, and
-          // THIS module may have loaded without it (a script that only
-          // imports node:http) -- force it, as the upgrade path does.
-          registry.get("net");
-          // A name libuv refuses (EINVAL for a NUL byte) fails as a bind
-          // does: 'error' on a later tick, the server never listening.
-          binding =
-            typeof path === "string" && registry._pipeNameHasNul(path)
+        // net's module section assigns the pipe-name helpers on load, and
+        // THIS module may have loaded without it (a script that only imports
+        // node:http) -- force it, as the upgrade path does.
+        if (path !== undefined) registry.get("net");
+        // After a bind closed before it landed, if one is in flight (#387).
+        const binding = bindAfterCancelled(this, () => {
+          if (path !== undefined) {
+            // A name libuv refuses (EINVAL for a NUL byte) fails as a bind
+            // does: 'error' on a later tick, the server never listening.
+            return typeof path === "string" && registry._pipeNameHasNul(path)
               ? Promise.reject(registry._pipeNulError("listen", path))
               : natives.httpPipeServe(
                 path,
@@ -23960,8 +24139,8 @@
                 // 1000-field cap; 0 is no limit; a number is that cap.
                 this.maxHeadersCount,
               );
-        } else {
-          binding = natives.httpServe(
+          }
+          return natives.httpServe(
             // No host: node's default, dual-stack `::` (#172).
             host ?? null,
             port,
@@ -23972,15 +24151,24 @@
             this.maxHeadersCount,
             ipv6Only,
           );
-        }
+        });
+        // The bind in flight, which a close() before it lands closes (#387).
+        const bind = startServerBind(this, listen);
         binding.then(
-          (bound) => serverBound(this, bound, false),
+          (bound) => {
+            if (serverBindCancelled(
+              this, bind, () => natives.httpClose(bound.serverId),
+              () => emitClosedServerClose(this),
+            )) return;
+            serverBound(this, bound, false);
+          },
           (err) => {
             // node's uvExceptionWithHostPort: a PIPE's bind error carries
             // port -1 (last of its keys), as net's own pipe path reports --
             // a TCP bind error keeps the real port.
             if (path !== undefined && err && err.syscall === "listen") err.port = -1;
-            this.emit("error", err);
+            if (serverBindCancelled(this, bind, null, () => emitClosedServerClose(this), err)) return;
+            emitServerBindError(this, err);
           },
         );
         return this;
@@ -28112,6 +28300,7 @@
       defineTimeout: defineTimeoutProperty,
       stop: stopConnectionsCheck,
       close: closeServer,
+      emitClosed: emitClosedServerClose,
       closeConnections: closeServerConnections,
     };
     const httpExports = {
@@ -31401,6 +31590,9 @@
       }
 
       listen(...args) {
+        // A listen() on a server listening, or binding, throws (node's
+        // ERR_SERVER_ALREADY_LISTEN, #387).
+        assertServerNotListening(this);
         // node's reading of the arguments; a port that is not one throws
         // from here (#163).
         const listen = normalizeListenArgs(args);
@@ -31414,21 +31606,29 @@
         // registers nothing. Probed: after createServer()
         // _getActiveHandles() is [], on the line after listen(0) it is
         // [Server] / ["TCPServerWrap"].
-        const binding = path !== undefined
+        // After a bind closed before it landed, if one is in flight (#387).
+        const binding = bindAfterCancelled(this, () => (path !== undefined
           // A name libuv refuses (EINVAL for a NUL byte) fails as a bind
           // does: 'error' on a later tick, the server never listening.
           ? (typeof path === "string" && pipeNameHasNul(path)
             ? Promise.reject(pipeNulError("listen", path))
             : natives.pipeListen(path))
           // No host: node's default, dual-stack `::` (#172).
-          : natives.tcpListen(host || null, port, ipv6Only);
+          : natives.tcpListen(host || null, port, ipv6Only)));
         if (cb !== null) this.once("listening", cb);
         registry._activeHandles.set(this, path !== undefined ? "PipeWrap" : "TCPServerWrap");
         // Supersede any in-flight accept loop from a previous listen() so
         // its tail cannot unregister this fresh registration.
         this._listenGeneration = (this._listenGeneration || 0) + 1;
+        // The bind in flight, which a close() before it lands closes (#387).
+        const bind = startServerBind(this, listen);
+        const live = this[kServerConns];
         binding.then(
           (bound) => {
+            if (serverBindCancelled(
+              this, bind, () => natives.tcpServerClose(bound.serverId),
+              () => emitServerCloseIfDrained(this, live),
+            )) return;
             this._serverId = bound.serverId;
             // A pipe has no port, host or family: a null port is what marks
             // the server as a pipe's while it listens.
@@ -31444,12 +31644,15 @@
             this._acceptLoop();
           },
           (err) => {
-            // Bind failed -- there is no live handle to introspect.
-            registry._activeHandles.delete(this);
             // node's uvExceptionWithHostPort(err, 'listen', path, -1): a
             // pipe's listen error carries port -1, last of its keys.
             if (path !== undefined && err && err.syscall === "listen") err.port = -1;
-            this.emit("error", err);
+            if (serverBindCancelled(
+              this, bind, null, () => emitServerCloseIfDrained(this, live), err,
+            )) return;
+            // Bind failed -- there is no live handle to introspect.
+            registry._activeHandles.delete(this);
+            emitServerBindError(this, err);
           },
         );
         return this;
@@ -31511,16 +31714,7 @@
         registry._activeHandles.delete(this);
         // node's _emitCloseIfDrained: 'close' once the last socket accepted
         // has gone too, not when the listener stops.
-        const emitClose = () => {
-          try {
-            this.emit("close");
-          } catch (e) {
-            raiseFromListener(e);
-          }
-        };
-        const live = this[kServerConns];
-        if (live.size > 0) live[Symbol.for("oam.onDrained")] = emitClose;
-        else emitClose();
+        emitServerCloseIfDrained(this, this[kServerConns]);
       }
 
       address() {
@@ -31534,11 +31728,29 @@
 
       close(cb) {
         registry._activeHandles.delete(this);
-        if (this._serverId !== null) {
-          natives.tcpServerClose(this._serverId);
-          this.listening = false;
+        // Before listen()'s bind has landed: the bind is closed instead,
+        // and closes its listener when it lands (#387).
+        if (closePendingBind(this, cb)) return this;
+        // node's close(cb): with no handle -- never listening, already
+        // closed, or a bind that failed -- cb gets ERR_SERVER_NOT_RUNNING at
+        // the 'close' a closed server emits (again) on the next tick, once
+        // nothing is left to drain. It used to wait for a 'close' that never
+        // came (#387).
+        if (!this.listening) {
+          if (typeof cb === "function") {
+            this.once("close", function close() {
+              cb(codes.ERR_SERVER_NOT_RUNNING());
+            });
+          }
+          const live = this[kServerConns];
+          if (live.size === 0) {
+            process.nextTick(() => emitServerCloseIfDrained(this, live));
+          }
+          return this;
         }
-        if (cb) this.once("close", cb);
+        natives.tcpServerClose(this._serverId);
+        this.listening = false;
+        if (typeof cb === "function") this.once("close", cb);
         return this;
       }
 
@@ -33275,6 +33487,9 @@
         syncTls(this);
       }
       listen(...args) {
+        // A listen() on a server listening, or binding, throws (node's
+        // ERR_SERVER_ALREADY_LISTEN, #387).
+        assertServerNotListening(this);
         // node's reading of the arguments; a port that is not one throws
         // from here (#163).
         var listen = normalizeListenArgs(args);
@@ -33286,16 +33501,16 @@
         if (callback !== null) this.once("listening", callback);
         var policy = registry._httpParserOptions.policy(this);
         var accept = tlsAcceptArgs(this);
-        var binding;
-        if (path !== undefined) {
-          // net's module section assigns the pipe-name helpers on load, and
-          // THIS module may have loaded without it -- force it, as
-          // _connectTls does.
-          registry.get("net");
-          // A name libuv refuses (EINVAL for a NUL byte) fails as a bind
-          // does: 'error' on a later tick, the server never listening.
-          binding =
-            typeof path === "string" && registry._pipeNameHasNul(path)
+        // net's module section assigns the pipe-name helpers on load, and
+        // THIS module may have loaded without it -- force it, as _connectTls
+        // does.
+        if (path !== undefined) registry.get("net");
+        // After a bind closed before it landed, if one is in flight (#387).
+        var binding = bindAfterCancelled(this, () => {
+          if (path !== undefined) {
+            // A name libuv refuses (EINVAL for a NUL byte) fails as a bind
+            // does: 'error' on a later tick, the server never listening.
+            return typeof path === "string" && registry._pipeNameHasNul(path)
               ? Promise.reject(registry._pipeNulError("listen", path))
               : natives.httpsPipeServe(
                   path,
@@ -33307,8 +33522,8 @@
                   // 1000-field cap; 0 is no limit; a number is that cap.
                   this.maxHeadersCount,
                 );
-        } else {
-          binding = natives.httpsServe(
+          }
+          return natives.httpsServe(
             // No host: node's default, dual-stack `::` (#172).
             host || null,
             port,
@@ -33319,9 +33534,15 @@
             this.maxHeadersCount,
             listen.ipv6Only,
           );
-        }
+        });
+        // The bind in flight, which a close() before it lands closes (#387).
+        var bind = startServerBind(this, listen);
+        var emitClosed = () => registry._httpParserOptions.emitClosed(this);
         binding.then(
           (bound) => {
+            if (serverBindCancelled(
+              this, bind, () => natives.httpClose(bound.serverId), emitClosed,
+            )) return;
             this[kTlsSynced] = JSON.stringify(accept);
             registry._httpParserOptions.bound(this, bound, true);
             // Anything changed while the server was binding.
@@ -33333,7 +33554,8 @@
             // port -1, as net's own pipe path reports -- a TCP bind error
             // keeps the real port.
             if (path !== undefined && e && e.syscall === "listen") e.port = -1;
-            this.emit("error", e);
+            if (serverBindCancelled(this, bind, null, emitClosed, e)) return;
+            emitServerBindError(this, e);
           },
         );
         return this;
@@ -36521,6 +36743,9 @@
         this.listening = false;
       }
       listen(...args) {
+        // A listen() on a server listening, or binding, throws (node's
+        // ERR_SERVER_ALREADY_LISTEN, #387).
+        assertServerNotListening(this);
         // node's reading of the arguments; a port that is not one throws
         // from here (#163).
         var listen = normalizeListenArgs(args);
@@ -36531,26 +36756,32 @@
         if (path !== undefined) this._pipeName = path;
         if (callback !== null) this.once("listening", callback);
         var self = this;
-        var binding;
-        if (path !== undefined) {
-          // net's module section assigns the pipe-name helpers on load, and
-          // THIS module may have loaded without it -- force it.
-          registry.get("net");
-          // A name libuv refuses (EINVAL for a NUL byte) fails as a bind
-          // does: 'error' on a later tick, the server never listening.
-          binding =
-            typeof path === "string" && registry._pipeNameHasNul(path)
+        // net's module section assigns the pipe-name helpers on load, and
+        // THIS module may have loaded without it -- force it.
+        if (path !== undefined) registry.get("net");
+        // After a bind closed before it landed, if one is in flight (#387).
+        var binding = bindAfterCancelled(this, function() {
+          if (path !== undefined) {
+            // A name libuv refuses (EINVAL for a NUL byte) fails as a bind
+            // does: 'error' on a later tick, the server never listening.
+            return typeof path === "string" && registry._pipeNameHasNul(path)
               ? Promise.reject(registry._pipeNulError("listen", path))
               // Args 2 and 3 (the HTTP/1 head policy) are left to their
               // defaults, as the TCP call's are.
               : natives.http2PipeServe(path, undefined, undefined);
-        } else {
+          }
           // No host: node's default, dual-stack `::` (#172). Args 2 and 3
           // (the HTTP/1 head policy) are left to their defaults.
-          binding = natives.http2Serve(host || null, port, undefined, undefined, listen.ipv6Only);
-        }
+          return natives.http2Serve(host || null, port, undefined, undefined, listen.ipv6Only);
+        });
+        // The bind in flight, which a close() before it lands closes (#387).
+        var bind = startServerBind(this, listen);
+        var emitClosed = function() { self._emitClosedClose(); };
         binding.then(
           function(bound) {
+            if (serverBindCancelled(
+              self, bind, function() { natives.httpClose(bound.serverId); }, emitClosed,
+            )) return;
             self._serverId = bound.serverId;
             // A pipe has no port, host or family: a null port is what marks
             // the server as a pipe's while it listens (net.Server's shape).
@@ -36582,6 +36813,7 @@
                 // request came over.
                 secureServer.emitServerStream(self, undefined, streams, meta, meta.requestId);
               }
+              self._draining = false;
               self.emit("close");
             })();
           },
@@ -36590,10 +36822,18 @@
             // port -1, as net's own pipe path reports -- a TCP bind error
             // keeps the real port.
             if (path !== undefined && err && err.syscall === "listen") err.port = -1;
-            self.emit("error", err);
+            if (serverBindCancelled(self, bind, null, emitClosed, err)) return;
+            emitServerBindError(self, err);
           },
         );
         return this;
+      }
+      // A server with no handle has its 'close' emitted (again) now -- unless
+      // an earlier close() is still draining, whose 'close' is the one to
+      // come, as node's _emitCloseIfDrained waits for the connections (#387).
+      _emitClosedClose() {
+        if (this._draining) return;
+        this.emit("close");
       }
       address() {
         if (this.listening && this._port !== null) {
@@ -36604,11 +36844,28 @@
         return this._pipeName !== undefined ? this._pipeName : null;
       }
       close(callback) {
-        if (this._serverId !== null) {
-          natives.httpClose(this._serverId);
-          this.listening = false;
+        // Before listen()'s bind has landed: the bind is closed instead,
+        // and closes its listener when it lands; the server used to listen
+        // and serve after the close() (#387).
+        if (closePendingBind(this, callback)) return this;
+        // With no handle -- never listening, already closed, a bind that
+        // failed -- node's close(cb): cb gets ERR_SERVER_NOT_RUNNING at the
+        // 'close' a closed server emits (again) on the next tick, once
+        // nothing is left to drain. It used to wait for a 'close' that never
+        // came (#387).
+        if (!this.listening) {
+          if (typeof callback === "function") {
+            this.once("close", function close() {
+              callback(codes.ERR_SERVER_NOT_RUNNING());
+            });
+          }
+          process.nextTick(() => this._emitClosedClose());
+          return this;
         }
-        if (callback) this.once("close", callback);
+        natives.httpClose(this._serverId);
+        this.listening = false;
+        this._draining = true;
+        if (typeof callback === "function") this.once("close", callback);
         return this;
       }
       setTimeout() { return this; }
@@ -41049,6 +41306,9 @@
         if (old !== null) natives.tlsServerContextFree(old);
       }
       listen(...args) {
+        // A listen() on a server listening, or binding, throws (node's
+        // ERR_SERVER_ALREADY_LISTEN, #387).
+        assertServerNotListening(this);
         // node's reading of the arguments; a port that is not one throws
         // from here (#163).
         var listen = normalizeListenArgs(args);
@@ -41058,7 +41318,6 @@
         // listening, and still after close() (`this._pipeName`).
         if (path !== undefined) this._pipeName = path;
         if (callback !== null) this.once("listening", callback);
-        this._closed = false;
         // Supersedes the accept loop of an earlier listen(), as net.Server's
         // generation does.
         this._listenGeneration = (this._listenGeneration || 0) + 1;
@@ -41068,24 +41327,34 @@
         // a pipe.
         registry._activeHandles.set(this, path !== undefined ? "PipeWrap" : "TCPServerWrap");
 
-        var binding;
-        if (path !== undefined) {
-          // net's module section assigns the pipe-name helpers on load, and
-          // THIS module may have loaded without it (a script that only
-          // imports node:tls) -- force it, as _connectTls does.
-          registry.get("net");
-          // A name libuv refuses (EINVAL for a NUL byte) fails as a bind
-          // does: 'error' on a later tick, the server never listening.
-          binding =
-            typeof path === "string" && registry._pipeNameHasNul(path)
+        // net's module section assigns the pipe-name helpers on load, and
+        // THIS module may have loaded without it (a script that only imports
+        // node:tls) -- force it, as _connectTls does.
+        if (path !== undefined) registry.get("net");
+        // After a bind closed before it landed, if one is in flight (#387).
+        var binding = bindAfterCancelled(this, function() {
+          if (path !== undefined) {
+            // A name libuv refuses (EINVAL for a NUL byte) fails as a bind
+            // does: 'error' on a later tick, the server never listening.
+            return typeof path === "string" && registry._pipeNameHasNul(path)
               ? Promise.reject(registry._pipeNulError("listen", path))
               : natives.pipeListen(path);
-        } else {
+          }
           // No host: node's default, dual-stack `::` (#172).
-          binding = natives.tcpListen(host || null, port, listen.ipv6Only);
-        }
+          return natives.tcpListen(host || null, port, listen.ipv6Only);
+        });
+        // Not closed from here: set once the bind has started, as a native
+        // that throws (a permission refused) leaves the server as it was.
+        this._closed = false;
+        // The bind in flight, which a close() before it lands closes (#387).
+        var bind = startServerBind(this, listen);
+        var live = this[Symbol.for("oam.serverConnections")];
         binding.then(
           (bound) => {
+            if (serverBindCancelled(
+              this, bind, () => natives.tcpServerClose(bound.serverId),
+              () => emitServerCloseIfDrained(this, live),
+            )) return;
             this._serverId = bound.serverId;
             // A pipe has no port, host or family: a null port is what marks
             // the server as a pipe's while it listens (net.Server's shape).
@@ -41099,11 +41368,15 @@
             this._acceptLoop(bound.serverId);
           },
           (err) => {
-            registry._activeHandles.delete(this);
             // node's uvExceptionWithHostPort(err, 'listen', path, -1): a
             // pipe's listen error carries port -1, last of its keys.
             if (path !== undefined && err && err.syscall === "listen") err.port = -1;
-            this.emit("error", typeof err === "string" ? new Error(err) : err);
+            var e = typeof err === "string" ? new Error(err) : err;
+            if (serverBindCancelled(
+              this, bind, null, () => emitServerCloseIfDrained(this, live), e,
+            )) return;
+            registry._activeHandles.delete(this);
+            emitServerBindError(this, e);
           },
         );
         return this;
@@ -41148,18 +41421,7 @@
           }
           // node's _emitCloseIfDrained: 'close' once the last connection
           // accepted has gone too, not when the listener stops.
-          var emitClose = () => {
-            try {
-              this.emit("close");
-            } catch (e) {
-              process.nextTick(() => {
-                throw e;
-              });
-            }
-          };
-          var live = this[Symbol.for("oam.serverConnections")];
-          if (live && live.size > 0) live[Symbol.for("oam.onDrained")] = emitClose;
-          else emitClose();
+          emitServerCloseIfDrained(this, this[Symbol.for("oam.serverConnections")]);
         })();
       }
       // One accepted connection: Node's net.Server side hands the plain
@@ -41302,11 +41564,30 @@
       close(callback) {
         this._closed = true;
         registry._activeHandles.delete(this);
-        if (this._serverId !== null) {
-          natives.tcpServerClose(this._serverId);
-          this.listening = false;
+        // Before listen()'s bind has landed: the bind is closed instead,
+        // and closes its listener when it lands. The accept loop used to
+        // run for it and end at once, emitting 'close' with the port still
+        // bound and nobody accepting on it (#387).
+        if (closePendingBind(this, callback)) return this;
+        // With no handle -- never listening, already closed, a bind that
+        // failed -- node's close(cb): cb gets ERR_SERVER_NOT_RUNNING at the
+        // 'close' a closed server emits (again) on the next tick, once
+        // nothing is left to drain (as net.Server's).
+        if (!this.listening) {
+          if (typeof callback === "function") {
+            this.once("close", function close() {
+              callback(codes.ERR_SERVER_NOT_RUNNING());
+            });
+          }
+          var live = this[Symbol.for("oam.serverConnections")];
+          if (!live || live.size === 0) {
+            process.nextTick(() => emitServerCloseIfDrained(this, live));
+          }
+          return this;
         }
-        if (callback) this.once("close", callback);
+        natives.tcpServerClose(this._serverId);
+        this.listening = false;
+        if (typeof callback === "function") this.once("close", callback);
         return this;
       }
       // Same unref semantics as net.Server: the flag is what the

@@ -51,6 +51,20 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   a message. And a Worker's `'error'` or `'message'` whose listener throws, or an `'error'` with no
   listener, is an uncaught exception, as in node, and the Worker's later events still come; it was
   an unhandled rejection.
+- **A server's `close()` made before `listen()`'s bind has landed closes it, as in node (#387,
+  #369).** oam binds every server asynchronously, and `close()` acted only on a server already
+  bound. So a `close()` in the same tick as `listen()` closed nothing: net, http, https and http2
+  servers then listened and served, with `close(cb)` never called back, and a tls server emitted
+  `'close'` with its port still bound and nothing accepting. Now the bind is closed when it lands.
+  There is no `'listening'`, then `'close'` comes and the port is free. `cb` gets no arguments for a
+  `listen()` without a host. It gets `ERR_SERVER_NOT_RUNNING` when node would have had no handle: a
+  `listen(port, host)`, whose lookup node abandons, or a bind that failed, whose `'error'` is still
+  emitted first. A second `close()` in that window gets `ERR_SERVER_NOT_RUNNING`, with its `'close'`
+  after the first one. A `listen()` on the same port after the `close()` binds it again, where it
+  used to fail with `EADDRINUSE`. A failed bind's `'error'` with no listener is an uncaught
+  exception, as in node, not an unhandled rejection. `close(cb)` on a net, tls or http2 server that
+  is not running now calls back with `ERR_SERVER_NOT_RUNNING` (it never called back), and a second
+  `listen()` throws node's `ERR_SERVER_ALREADY_LISTEN`.
 - **`events.once` is an async function and an abort rejects with node's `AbortError`, as in node (#344).**
   It was a plain function, so the continuation of `await once(...)` ran before the microtasks the
   same emit queued, and its kind and `length` (3) were not node's. An aborted `once` rejected with a
