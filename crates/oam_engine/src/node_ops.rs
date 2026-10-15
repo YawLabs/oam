@@ -330,6 +330,11 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // node:zlib handle (sync incremental, for ssh2/native binding compat)
         ("zlibHandleCreate", op_zlib_handle_create),
         ("zlibHandleWriteSync", op_zlib_handle_write_sync),
+        // node:zlib zstd handle (node's ZstdCompress/ZstdDecompress binding)
+        ("zstdHandleCreate", op_zstd_handle_create),
+        ("zstdHandleWriteSync", op_zstd_handle_write_sync),
+        ("zstdHandleWrite", op_zstd_handle_write),
+        ("zstdHandleReset", op_zstd_handle_reset),
         // HTTP server
         ("httpServe", op_http_serve),
         // The same server on a named pipe / Unix domain socket (#282).
@@ -6549,6 +6554,193 @@ fn op_zlib_handle_write_sync(
             let exception = v8::Exception::error(scope, message);
             scope.throw_exception(exception);
         }
+    }
+}
+
+/// Throw an `Error` with `message` and an own `code`, the shape node's C++
+/// `THROW_ERR_*` helpers give (no `[CODE]` in the stack's first line).
+fn throw_coded_error(scope: &mut v8::PinScope<'_, '_>, message: &str, code: &str) {
+    let message = v8::String::new(scope, message).unwrap();
+    let exception = v8::Exception::error(scope, message);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+        let code_key = v8::String::new(scope, "code").unwrap();
+        let code = v8::String::new(scope, code).unwrap();
+        obj.create_data_property(scope, code_key.into(), code.into());
+    }
+    scope.throw_exception(exception);
+}
+
+/// Throw node's zstd codec error: libzstd's message with own `errno` then
+/// `code` (lib/zlib.js `zlibOnError`).
+fn throw_zstd_error(scope: &mut v8::PinScope<'_, '_>, error: &oam_core::zstd::ZstdError) {
+    throw_zlib_coded(
+        scope,
+        &oam_core::zlib::ZlibError {
+            code: error.code,
+            errno: error.errno,
+            message: error.message,
+        },
+    );
+}
+
+/// The zstd engine `handle` names, or a thrown Error when it is closed (the
+/// shim never writes to a closed handle; node's binding CHECKs the same).
+fn zstd_engine(
+    scope: &mut v8::PinScope<'_, '_>,
+    handle: u64,
+) -> Option<std::sync::Arc<std::sync::Mutex<oam_core::zstd::ZstdHandle>>> {
+    // Not `core_runtime!`: that macro's early `return;` only fits a `()` op.
+    let Some(core) = scope.get_slot::<oam_core::CoreRuntime>() else {
+        throw_type_error(scope, "internal: runtime not initialized");
+        return None;
+    };
+    let streams = core.zlib_streams();
+    let engine = oam_core::ops::zstd_handle(&streams, handle);
+    if engine.is_none() {
+        let message = v8::String::new(scope, &format!("zstd handle {handle} is closed")).unwrap();
+        let exception = v8::Exception::error(scope, message);
+        scope.throw_exception(exception);
+    }
+    engine
+}
+
+/// zstdHandleCreate(compress, params, pledgedSrcSize?, dictionary?) -> handle.
+/// node's zstd binding `init()`. `params` is node's `initParamsArray` (a
+/// Uint32Array indexed by parameter key, 0xFFFFFFFF for "not set"); each set
+/// entry goes to libzstd as the int32 node's binding passes. The shim has
+/// already validated the keys; `pledgedSrcSize` is the caller's value, read
+/// here as node's binding reads it. A step libzstd refuses
+/// throws node's `ERR_ZLIB_INITIALIZATION_FAILED` with node's message.
+fn op_zstd_handle_create(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let compress = args.get(0).is_true();
+    let mut params = Vec::new();
+    if let Ok(array) = v8::Local::<v8::Uint32Array>::try_from(args.get(1)) {
+        for index in 0..array.length() as u32 {
+            let Some(value) = array.get_index(scope, index) else {
+                continue;
+            };
+            let value = value.uint32_value(scope).unwrap_or(u32::MAX);
+            if value != u32::MAX {
+                params.push((index, value as i32));
+            }
+        }
+    }
+    // node's binding reads a number `pledgedSrcSize` with V8's IntegerValue
+    // (truncating, NaN as 0, saturating at the int64 range: what `as i64`
+    // does) and refuses a negative one; any other type is "unknown".
+    let pledged = args.get(2);
+    let pledged = if pledged.is_number() {
+        let size = pledged.number_value(scope).unwrap_or(0.0) as i64;
+        if size < 0 {
+            let message = v8::String::new(scope, "pledgedSrcSize may not be negative").unwrap();
+            let exception = v8::Exception::type_error(scope, message);
+            if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+                let code_key = v8::String::new(scope, "code").unwrap();
+                let code = v8::String::new(scope, "ERR_INVALID_ARG_VALUE").unwrap();
+                obj.create_data_property(scope, code_key.into(), code.into());
+            }
+            scope.throw_exception(exception);
+            return;
+        }
+        Some(size as u64)
+    } else {
+        None
+    };
+    let dictionary = arg_bytes(scope, &args, 3);
+    let core = core_runtime!(scope);
+    let streams = core.zlib_streams();
+    let ids = core.body_ids();
+    match oam_core::ops::zstd_handle_create(
+        &streams,
+        &ids,
+        compress,
+        pledged,
+        dictionary.as_deref(),
+        &params,
+    ) {
+        Ok(handle) => {
+            let value = v8::Number::new(scope, handle as f64);
+            rv.set(value.into());
+        }
+        Err(message) => throw_coded_error(scope, message, "ERR_ZLIB_INITIALIZATION_FAILED"),
+    }
+}
+
+/// zstdHandleWriteSync(handle, flush, input, outLen) -> Uint8Array: one
+/// libzstd call on the isolate thread (node's `writeSync`), answered as
+/// `oam_core::ops::zstd_write_result` lays it out. A codec failure throws
+/// node's coded zstd error.
+fn op_zstd_handle_write_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let flush = args.get(1).int32_value(scope).unwrap_or(0);
+    let input = arg_bytes(scope, &args, 2).unwrap_or_default();
+    let out_len = args.get(3).uint32_value(scope).unwrap_or(0) as usize;
+    let Some(engine) = zstd_engine(scope, handle) else {
+        return;
+    };
+    let result = engine
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .write(flush, &input, out_len);
+    match result {
+        Ok((consumed, output)) => {
+            let bytes = oam_core::ops::zstd_write_result(consumed, output);
+            if let Some(value) = bytes_to_uint8array(scope, bytes) {
+                rv.set(value);
+            }
+        }
+        Err(error) => throw_zstd_error(scope, &error),
+    }
+}
+
+/// zstdHandleWrite(handle, flush, input, outLen) -> Promise<Uint8Array>:
+/// node's async `write()`, the libzstd call on the blocking pool. Resolves
+/// as the sync form returns; rejects with node's coded zstd error.
+fn op_zstd_handle_write(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let flush = args.get(1).int32_value(scope).unwrap_or(0);
+    let input = arg_bytes(scope, &args, 2).unwrap_or_default();
+    let out_len = args.get(3).uint32_value(scope).unwrap_or(0) as usize;
+    let Some(engine) = zstd_engine(scope, handle) else {
+        return;
+    };
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::zstd_handle_write(engine, flush, input, out_len),
+    );
+}
+
+/// zstdHandleReset(handle) -> undefined | string: node's `reset()`, a fresh
+/// context with only the pledged source size. Returns node's message when
+/// libzstd refuses it, which the shim reports as node's binding does (an
+/// error on the stream), or undefined.
+fn op_zstd_handle_reset(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(engine) = zstd_engine(scope, handle) else {
+        return;
+    };
+    let result = engine.lock().unwrap_or_else(|e| e.into_inner()).reset();
+    if let Err(message) = result
+        && let Some(text) = v8::String::new(scope, message)
+    {
+        rv.set(text.into());
     }
 }
 
