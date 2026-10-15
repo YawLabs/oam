@@ -20,9 +20,14 @@
 //! Delivery follows the pattern of a socket's parked read: JS keeps exactly
 //! one `fsWatchNext` op in flight per watcher, filed under
 //! [`crate::HandleKey::FsWatch`] so `watcher.unref()` stops it pinning the
-//! loop. The op resolves with every event queued by then, as one framed byte
-//! batch (see [`encode`]), resolves empty (`Done`) once the watcher is
-//! closed, or rejects with the error the watch failed with.
+//! loop. The op completes with ONE event (framed by [`encode`]), empty
+//! (`Done`) once the watcher is closed, or with the error the watch failed
+//! with. One event per completion because node delivers each libuv event as
+//! its own MakeCallback, draining `process.nextTick` and the microtasks after
+//! every one: a listener that closes the watcher from a tick, or a throw from
+//! one listener call, must not reach the events queued behind it. The engine
+//! settles the op by calling the JS callback from the loop (a callback op,
+//! oam_engine `spawn_handle_callback_op`), with a tick point after each.
 
 use crate::OpOutcome;
 use notify::event::{EventKind, ModifyKind, RenameMode};
@@ -69,9 +74,6 @@ pub enum WatchStartError {
 
 struct WatchQueue {
     rx: UnboundedReceiver<Note>,
-    /// A failure drained after events already in the batch: reported by the
-    /// NEXT `fsWatchNext`, so no event queued before it is lost.
-    held: Option<std::io::Error>,
 }
 
 struct Watch {
@@ -110,6 +112,8 @@ pub fn start(
 ) -> Result<u64, WatchStartError> {
     let meta = std::fs::metadata(os_path).map_err(WatchStartError::Io)?;
     let root = std::path::absolute(os_path).map_err(WatchStartError::Io)?;
+    #[cfg(windows)]
+    open_watched_directory(&root, meta.is_dir()).map_err(WatchStartError::Io)?;
     let namer = Namer::new(&root, meta.is_dir());
     let (tx, rx) = unbounded_channel();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -129,11 +133,39 @@ pub fn start(
         id,
         Watch {
             _watcher: watcher,
-            queue: Arc::new(tokio::sync::Mutex::new(WatchQueue { rx, held: None })),
+            queue: Arc::new(tokio::sync::Mutex::new(WatchQueue { rx })),
             closed: Arc::new(tokio::sync::Notify::new()),
         },
     );
     Ok(id)
+}
+
+/// Open the directory ReadDirectoryChangesW will watch -- the path itself, or
+/// a file's parent, as libuv's `uv_fs_event_start` does -- and close it
+/// again, so a refusal is the OS's own error (`EPERM` for a directory the
+/// caller may not list, as node reports it). `notify` opens the same
+/// directory, but folds a failure into `PathNotFound` or a generic error with
+/// no OS code, which reached JS as `EIO` and a Rust debug dump.
+#[cfg(windows)]
+fn open_watched_directory(root: &Path, is_dir: bool) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // winnt.h / winbase.h: the access right and flag notify's CreateFileW
+    // passes (it adds FILE_FLAG_OVERLAPPED, which does not change whether
+    // the open is allowed).
+    const FILE_LIST_DIRECTORY: u32 = 0x0001;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
+    let dir = if is_dir {
+        root
+    } else {
+        root.parent().unwrap_or(root)
+    };
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_LIST_DIRECTORY)
+        .share_mode(SHARE_READ_WRITE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .map(drop)
 }
 
 /// `watcher.close()`: stop the OS watch, and settle the parked
@@ -150,9 +182,8 @@ pub fn close(registry: &FsWatchRegistry, id: u64) {
     }
 }
 
-/// The parked read: the events queued since the last one (at least one),
-/// framed by [`encode`]; `Done` once the watcher is closed; or the error the
-/// watch failed with.
+/// The parked read: the next event, framed by [`encode`]; `Done` once the
+/// watcher is closed; or the error the watch failed with.
 pub fn next(registry: &FsWatchRegistry, id: u64) -> impl Future<Output = OpOutcome> + use<> {
     let parts = registry
         .lock()
@@ -164,35 +195,18 @@ pub fn next(registry: &FsWatchRegistry, id: u64) -> impl Future<Output = OpOutco
             return OpOutcome::Done;
         };
         let mut queue = queue.lock().await;
-        if let Some(error) = queue.held.take() {
-            return failed(error);
-        }
         // Close first: node emits nothing after close(), so events still
         // queued when it ran are dropped, not delivered.
-        let first = tokio::select! {
+        let note = tokio::select! {
             biased;
             () = closed.notified() => None,
             note = queue.rx.recv() => note,
         };
-        let mut batch = Vec::new();
-        match first {
-            None => return OpOutcome::Done,
-            Some(Note::Failed(error)) => return failed(error),
-            Some(Note::Event(event)) => batch.push(event),
+        match note {
+            None => OpOutcome::Done,
+            Some(Note::Failed(error)) => failed(error),
+            Some(Note::Event(event)) => OpOutcome::Bytes(encode(&event)),
         }
-        // Everything else already queued goes in the same batch: one
-        // completion per OS burst, not one per event (a recursive `rm -rf`
-        // can queue thousands).
-        while let Ok(note) = queue.rx.try_recv() {
-            match note {
-                Note::Event(event) => batch.push(event),
-                Note::Failed(error) => {
-                    queue.held = Some(error);
-                    break;
-                }
-            }
-        }
-        OpOutcome::Bytes(encode(&batch))
     }
 }
 
@@ -212,26 +226,20 @@ fn failed(error: std::io::Error) -> OpOutcome {
     )
 }
 
-/// The batch as one byte string: per event, one byte for the type (0
-/// rename, 1 change), a little-endian u32 filename length (`u32::MAX` for no
-/// filename) and the filename's bytes. Bytes rather than JSON so a filename
-/// that is not UTF-8 survives to `encoding: 'buffer'`.
-pub fn encode(batch: &[WatchEvent]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for event in batch {
-        out.push(match event.kind {
-            WatchEventType::Rename => 0,
-            WatchEventType::Change => 1,
-        });
-        match &event.filename {
-            Some(name) => {
-                let len = u32::try_from(name.len()).unwrap_or(u32::MAX - 1);
-                out.extend_from_slice(&len.to_le_bytes());
-                out.extend_from_slice(&name[..len as usize]);
-            }
-            None => out.extend_from_slice(&u32::MAX.to_le_bytes()),
-        }
-    }
+/// One event as a byte string: one byte for the type (0 rename, 1 change),
+/// then the filename's bytes; the type byte alone is node's `null` filename.
+/// Bytes rather than JSON so a filename that is not UTF-8 survives to
+/// `encoding: 'buffer'`. (An empty name never reaches here: [`Namer::name`]
+/// drops one, so a lone type byte is unambiguous.)
+pub fn encode(event: &WatchEvent) -> Vec<u8> {
+    let kind = match event.kind {
+        WatchEventType::Rename => 0,
+        WatchEventType::Change => 1,
+    };
+    let name = event.filename.as_deref().unwrap_or_default();
+    let mut out = Vec::with_capacity(1 + name.len());
+    out.push(kind);
+    out.extend_from_slice(name);
     out
 }
 
@@ -247,7 +255,12 @@ fn notify_io(kind: notify::ErrorKind) -> std::io::Error {
         notify::ErrorKind::Io(error) => error,
         notify::ErrorKind::PathNotFound => std::io::Error::from(std::io::ErrorKind::NotFound),
         notify::ErrorKind::MaxFilesWatch => limit_error(),
-        notify::ErrorKind::Generic(message) => std::io::Error::other(message),
+        // A generic error's text is notify's own (on Windows, a Debug dump of
+        // an inner error); node never shows anything like it, so report the
+        // plain EIO.
+        notify::ErrorKind::Generic(_) => {
+            std::io::Error::other(crate::uv_strerror("EIO").unwrap_or("i/o error"))
+        }
         notify::ErrorKind::WatchNotFound | notify::ErrorKind::InvalidConfig(_) => {
             std::io::Error::from(std::io::ErrorKind::InvalidInput)
         }
@@ -277,8 +290,40 @@ fn forward(namer: &Namer, tx: &UnboundedSender<Note>, res: notify::Result<notify
             }
         }
         Err(error) => {
+            // Windows: the watched directory itself was deleted, and the
+            // backend ended its watch (ERROR_ACCESS_DENIED from
+            // ReadDirectoryChangesW). node reports `rename` naming the
+            // directory by its full `\\?\` path -- over and over, in a tight
+            // loop, until the watcher is closed (v22.22.2, measured: 66,878
+            // events in a second). oam reports that event once; the watcher
+            // then stays open, as node's does, and so a referenced one keeps
+            // the process alive until it is closed. A watched FILE whose
+            // directory goes is node's `EPERM` 'error', which closes it.
+            #[cfg(windows)]
+            if namer.is_dir && matches!(namer.root.try_exists(), Ok(false)) {
+                let _ = tx.send(Note::Event(WatchEvent {
+                    kind: WatchEventType::Rename,
+                    filename: Some(namespaced(&namer.root).into_bytes()),
+                }));
+                return;
+            }
             let _ = tx.send(Note::Failed(notify_io(error.kind)));
         }
+    }
+}
+
+/// `path` as libuv opened it: Win32 namespaced (`\\?\C:\...`,
+/// `\\?\UNC\srv\share\...`), which is how node names a deleted watched
+/// directory.
+#[cfg(windows)]
+fn namespaced(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if text.starts_with(r"\\?\") || text.starts_with(r"\\.\") {
+        text.into_owned()
+    } else if let Some(unc) = text.strip_prefix(r"\\") {
+        format!(r"\\?\UNC\{unc}")
+    } else {
+        format!(r"\\?\{text}")
     }
 }
 
@@ -338,6 +383,9 @@ fn translate(namer: &Namer, event: &notify::Event) -> Vec<WatchEvent> {
 /// deleted or moved (libuv: `uv__basename_r(w->path)`).
 struct Namer {
     root: PathBuf,
+    /// A directory watch (not a file's).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    is_dir: bool,
     /// Other spellings `notify` may report the root under: FSEvents reports
     /// real paths (`/private/var/...` for `/var/...`).
     real_root: Option<PathBuf>,
@@ -364,6 +412,7 @@ impl Namer {
         });
         Self {
             root: root.to_path_buf(),
+            is_dir,
             real_root,
             base,
             real_base,
@@ -502,21 +551,33 @@ mod tests {
     }
 
     #[test]
-    fn encode_frames_type_length_and_name() {
-        let batch = [
-            WatchEvent {
-                kind: WatchEventType::Change,
-                filename: Some(b"ab".to_vec()),
-            },
-            WatchEvent {
-                kind: WatchEventType::Rename,
-                filename: None,
-            },
-        ];
-        assert_eq!(
-            encode(&batch),
-            [&[1u8, 2, 0, 0, 0, b'a', b'b'][..], &[0, 255, 255, 255, 255]].concat()
-        );
+    fn encode_frames_type_and_name() {
+        let change = WatchEvent {
+            kind: WatchEventType::Change,
+            filename: Some(b"ab".to_vec()),
+        };
+        assert_eq!(encode(&change), vec![1u8, b'a', b'b']);
+        let unnamed = WatchEvent {
+            kind: WatchEventType::Rename,
+            filename: None,
+        };
+        assert_eq!(encode(&unnamed), vec![0u8]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_deleted_directory_is_named_by_its_namespaced_path() {
+        assert_eq!(namespaced(Path::new(r"C:\w\d")), r"\\?\C:\w\d");
+        assert_eq!(namespaced(Path::new(r"\\?\C:\w")), r"\\?\C:\w");
+        assert_eq!(namespaced(Path::new(r"\\srv\sh\d")), r"\\?\UNC\srv\sh\d");
+    }
+
+    #[test]
+    fn a_generic_backend_error_is_a_plain_eio() {
+        let e = notify_io(notify::ErrorKind::Generic(
+            "Error in watcher: Error {..}".into(),
+        ));
+        assert_eq!(e.to_string(), "i/o error");
     }
 
     #[test]

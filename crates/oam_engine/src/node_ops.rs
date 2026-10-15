@@ -7018,24 +7018,30 @@ fn op_fs_watch_start(
     }
 }
 
-/// `__oam.node.fsWatchNext(handle)`: the watcher's parked read -- resolves
-/// with the next batch of events (a Uint8Array framed by
-/// `oam_core::fs_watch::encode`), with undefined once the watcher is closed,
-/// or rejects with the error the watch failed with. Filed under the
-/// watcher's handle key so an unref'd watcher does not keep the process
-/// alive (node's `persistent: false` / `watcher.unref()`).
+/// `__oam.node.fsWatchNext(handle, callback)`: the watcher's parked read.
+/// `callback(err, event)` is called from the event loop with the next event
+/// (a Uint8Array framed by `oam_core::fs_watch::encode`), with no event once
+/// the watcher is closed, or with the error the watch failed with -- a
+/// callback, not a promise, so each event is its own top-level callback as
+/// node's FSEvent `onchange` is (see `crate::ops::spawn_handle_callback_op`).
+/// Filed under the watcher's handle key so an unref'd watcher does not keep
+/// the process alive (node's `persistent: false` / `watcher.unref()`).
 fn op_fs_watch_next(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Ok(callback) = v8::Local::<v8::Function>::try_from(args.get(1)) else {
+        throw_type_error(scope, "fsWatchNext requires a callback");
+        return;
+    };
     let registry = core_runtime!(scope).fs_watches();
-    crate::ops::spawn_handle_op(
+    crate::ops::spawn_handle_callback_op(
         scope,
-        &mut rv,
         oam_core::HandleKey::FsWatch(handle),
         oam_core::fs_watch::next(&registry, handle),
+        callback,
     );
 }
 

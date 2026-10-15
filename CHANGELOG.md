@@ -489,10 +489,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   libuv: `rename` and `change` events naming the entry relative to the watched directory,
   `recursive: true` on every platform, every `encoding` including `'buffer'`, `signal`, and
   `ref()` / `unref()` / `persistent: false` deciding whether a watcher keeps the process alive.
-  `fs.promises.watch` is node's async generator, with `maxQueue` and `overflow`. `fs.watch`
-  polled the path's mtime every 100 ms: no `rename`, nothing from inside a directory, and a
-  watcher that kept the process alive however it was unref'd. Conformance case 421; what still
-  differs is in docs/node-divergences.md.
+  `fs.promises.watch` is node's async generator, with `maxQueue` and `overflow`. Each event is
+  its own callback, as in node: `process.nextTick` and the microtasks drain after every listener
+  call, and a listener's throw is an uncaught exception. `fs.watch` polled the path's mtime every
+  100 ms: no `rename`, nothing from inside a directory, and a watcher that kept the process alive
+  however it was unref'd. Conformance cases 421 and 422; what still differs is in
+  docs/node-divergences.md.
 
 ## [0.19.0] - 2026-10-11
 

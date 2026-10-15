@@ -19595,30 +19595,36 @@ fn fs_watch_detects_file_change() {
         "fs_watch.mjs",
         // In the temp directory, not the cwd: fs.watch is OS notifications
         // now, and a checkout on a file system that delivers none (WSL's
-        // /mnt/c) leaves node's watcher as silent as oam's.
+        // /mnt/c) leaves node's watcher as silent as oam's. The listener
+        // waits for a `change`: FSEvents can report the file's creation (a
+        // `rename`) first, its created flag being sticky. The write repeats
+        // until one arrives, so a loaded machine is slow, not a failure; the
+        // 10 s cap only ends a run that would never pass.
         "import fs from 'fs';\n\
          import os from 'os';\n\
          import path from 'path';\n\
          const target = path.join(os.tmpdir(), '_watch_test_' + process.pid + '.tmp');\n\
          fs.writeFileSync(target, 'initial');\n\
          let detected = false;\n\
-         const watcher = fs.watch(target, { interval: 30 }, (eventType, filename) => {\n\
+         const watcher = fs.watch(target, (eventType, filename) => {\n\
+           if (detected || eventType !== 'change') return;\n\
            detected = true;\n\
-           watcher.close();\n\
-           console.log('event:', eventType, 'file:', filename);\n\
+           console.log('event:', eventType, 'file:', filename === path.basename(target));\n\
+           finish();\n\
          });\n\
-         setTimeout(() => {\n\
-           fs.writeFileSync(target, 'changed-' + Date.now());\n\
-         }, 100);\n\
-         setTimeout(() => {\n\
+         const writer = setInterval(() => fs.writeFileSync(target, 'changed-' + Date.now()), 100);\n\
+         const cap = setTimeout(finish, 10000);\n\
+         function finish() {\n\
+           clearInterval(writer);\n\
+           clearTimeout(cap);\n\
            watcher.close();\n\
            try { fs.unlinkSync(target); } catch (e) {}\n\
            console.log('detected:', detected);\n\
-         }, 800);",
+         }",
     );
     assert!(
-        stdout.contains("event: change"),
-        "should detect change event: {stdout}"
+        stdout.contains("event: change file: true"),
+        "should detect a change event naming the file: {stdout}"
     );
     assert!(
         stdout.contains("detected: true"),

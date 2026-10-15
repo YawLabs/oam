@@ -257,3 +257,10 @@ opt-level = 2
 # when a hyper release ships the fix.
 [patch.crates-io]
 hyper = { path = "vendor/hyper-1.10.1" }
+# notify 8.2.0 with three fixes to its Windows backend that node's fs.watch
+# semantics need (crates/oam_core/src/fs_watch.rs): a watch the OS ends (its
+# directory deleted) is reported instead of dropped silently, an overflowed
+# ReadDirectoryChangesW buffer is reported as a rescan, and last-access
+# changes are watched as libuv watches them. vendor/notify-8.2.0/OAM-PATCH.md
+# has the diff and when to drop it.
+notify = { path = "vendor/notify-8.2.0" }

@@ -13837,7 +13837,11 @@
         this[kFsEventEncoding] = "utf8";
         this[kFsEventClosed] = false;
       }
-      start(path, shown, persistent, recursive, encoding) {
+      // `shown` is the path as the error message and `err.path` print it;
+      // `given` is what `err.filename` holds -- the caller's own value (a
+      // Buffer stays a Buffer, a URL given to fs.promises.watch stays a URL),
+      // as node's UVException takes `filename` as passed.
+      start(path, shown, persistent, recursive, encoding, given = shown) {
         let id;
         try {
           id = natives.fsWatchStart(path, recursive === true, shown);
@@ -13852,7 +13856,7 @@
           err.syscall = "watch";
           err.code = e.code;
           err.path = shown;
-          err.filename = shown;
+          err.filename = given;
           throw err;
         }
         this[kFsEventId] = id;
@@ -13863,38 +13867,38 @@
         this[kFsEventPump]();
       }
       [kFsEventPump]() {
-        natives.fsWatchNext(this[kFsEventId]).then(
-          (batch) => {
-            // Settled empty: closed. A batch that lands after close() is
-            // dropped -- a closed node watcher reports nothing more.
-            if (this[kFsEventClosed] || batch === undefined) return;
-            // Re-arm BEFORE delivering: a listener's throw must not leave the
-            // watcher without a read, and the parked read is what keeps a
-            // referenced watcher holding the loop open between batches.
-            this[kFsEventPump]();
-            const bytes = globalThis.Buffer.from(batch.buffer, batch.byteOffset, batch.byteLength);
-            let at = 0;
-            // Framed by oam_core::fs_watch::encode: a type byte (0 rename,
-            // 1 change), a u32le length (all ones: no filename), the name.
-            while (at < bytes.length && !this[kFsEventClosed]) {
-              const eventType = bytes[at] === 1 ? "change" : "rename";
-              const len = bytes.readUInt32LE(at + 1);
-              at += 5;
-              let filename = null;
-              if (len !== 0xffffffff) {
-                const raw = bytes.subarray(at, at + len);
-                at += len;
-                const encoding = this[kFsEventEncoding];
-                filename = encoding === "buffer" ? globalThis.Buffer.from(raw) : raw.toString(encoding);
-              }
-              if (typeof this.onchange === "function") this.onchange(0, eventType, filename);
-            }
-          },
-          (e) => {
-            if (this[kFsEventClosed]) return;
+        // A callback, not a promise: the engine calls it from the loop, one
+        // event per call, and runs the nextTick queue and then the
+        // microtasks after each -- node's MakeCallback around every libuv
+        // event. Inside a promise reaction a listener's nextTick ran after
+        // its promise jobs, and its throw became an unhandled rejection that
+        // also ended the loop over the rest of the batch.
+        natives.fsWatchNext(this[kFsEventId], (e, event) => {
+          // An event that lands after close() is dropped -- a closed node
+          // watcher reports nothing more. No event: closed.
+          if (this[kFsEventClosed]) return;
+          if (e) {
             if (typeof this.onchange === "function") this.onchange(-1, e, null);
-          },
-        );
+            return;
+          }
+          if (event === undefined) return;
+          // Re-arm BEFORE delivering: a listener's throw must not leave the
+          // watcher without a read, and the parked read is what keeps a
+          // referenced watcher holding the loop open between events.
+          this[kFsEventPump]();
+          // Framed by oam_core::fs_watch::encode: a type byte (0 rename,
+          // 1 change), then the name; the type byte alone is no filename.
+          const eventType = event[0] === 1 ? "change" : "rename";
+          let filename = null;
+          if (event.byteLength > 1) {
+            const raw = globalThis.Buffer.from(event.buffer, event.byteOffset + 1, event.byteLength - 1);
+            const encoding = this[kFsEventEncoding];
+            filename = encoding === "buffer" ? globalThis.Buffer.from(raw) : raw.toString(encoding);
+          }
+          // Not caught: a listener's throw is an uncaught exception, as in
+          // node, and the engine routes it to 'uncaughtException'.
+          if (typeof this.onchange === "function") this.onchange(0, eventType, filename);
+        });
       }
       close() {
         if (this[kFsEventClosed]) return;
@@ -13929,7 +13933,8 @@
     // 'ignore'` drops each with a warning and 'error' empties the queue and
     // throws ERR_FS_WATCH_QUEUE_OVERFLOW. An abort closes the watch and
     // throws AbortError; return() (a `break` out of for-await) closes it.
-    async function* fspWatch(filename, options = {}) {
+    // Named `watch`, as node's is (`fs.promises.watch.name`).
+    const fspWatch = async function* watch(filename, options = {}) {
       const path = toPath(filename);
       if (options === null || typeof options !== "object" || Array.isArray(options)) {
         throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
@@ -13995,7 +14000,11 @@
             process.emitWarning("fs.watch maxQueue exceeded");
           }
         };
-        handle.start(path, path, persistent, recursive, encoding);
+        // node names the path as given -- a file: URL by its href, not the
+        // OS path it converts to -- and hands the value itself to
+        // `err.filename` (lib/internal/fs/watchers.js builds the
+        // UVException with `path: filename`).
+        handle.start(path, `${filename}`, persistent, recursive, encoding, filename);
         while (!(signal && signal.aborted)) {
           if (queue.length === 0 && failure === null) {
             await new Promise((resolve) => {
@@ -14010,7 +14019,7 @@
         handle.close();
         if (signal) signal.removeEventListener("abort", oncancel);
       }
-    }
+    };
 
     fsPromisesInternals = {
       FSEvent,
@@ -14715,7 +14724,10 @@
       if (options.recursive === undefined) options.recursive = false;
       const path = toPath(filename);
       const watcher = new FSWatcher();
-      watcher._handle.start(path, path, options.persistent, options.recursive, encoding);
+      // node's getValidatedPath: a URL becomes its OS path, a Buffer stays
+      // a Buffer -- and that value is the error's `filename`.
+      const given = globalThis.Buffer.isBuffer(filename) ? filename : path;
+      watcher._handle.start(path, path, options.persistent, options.recursive, encoding, given);
       if (listener) watcher.addListener("change", listener);
       if (signal) {
         if (signal.aborted) {

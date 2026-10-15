@@ -1,0 +1,129 @@
+diff -ruN a/src/windows.rs b/src/windows.rs
+--- a/src/windows.rs
++++ b/src/windows.rs
+@@ -20,15 +20,16 @@
+ use std::sync::{Arc, Mutex};
+ use std::thread;
+ use windows_sys::Win32::Foundation::{
+-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_OPERATION_ABORTED, ERROR_SUCCESS, HANDLE,
+-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
++    CloseHandle, ERROR_ACCESS_DENIED, ERROR_NOTIFY_ENUM_DIR, ERROR_OPERATION_ABORTED,
++    ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+ };
+ use windows_sys::Win32::Storage::FileSystem::{
+     CreateFileW, ReadDirectoryChangesW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED,
+     FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME,
+     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
+     FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME,
+-    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SECURITY,
++    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_ACCESS, FILE_NOTIFY_CHANGE_LAST_WRITE,
++    FILE_NOTIFY_CHANGE_SECURITY,
+     FILE_NOTIFY_CHANGE_SIZE, FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ,
+     FILE_SHARE_WRITE, OPEN_EXISTING,
+ };
+@@ -286,6 +287,9 @@
+         | FILE_NOTIFY_CHANGE_ATTRIBUTES
+         | FILE_NOTIFY_CHANGE_SIZE
+         | FILE_NOTIFY_CHANGE_LAST_WRITE
++        // oam: libuv's filter (src/win/fs-event.c) includes last-access
++        // changes, and node reports them as `change`.
++        | FILE_NOTIFY_CHANGE_LAST_ACCESS
+         | FILE_NOTIFY_CHANGE_CREATION
+         | FILE_NOTIFY_CHANGE_SECURITY;
+ 
+@@ -328,14 +332,35 @@
+     }
+ }
+ 
++// oam: Windows reports discarded notification details as a zero-byte
++// successful completion or as ERROR_NOTIFY_ENUM_DIR (backported from notify
++// 9.0.0-rc.5, which reports them the same way).
++fn completion_rescan_event(error_code: u32, bytes_written: u32) -> Option<Event> {
++    (error_code == ERROR_NOTIFY_ENUM_DIR || (error_code == ERROR_SUCCESS && bytes_written == 0))
++        .then(|| Event::new(EventKind::Other).set_flag(Flag::Rescan))
++}
++
++// oam: a watch that ends on an OS error is reported to the handler before it
++// is dropped, so the caller learns that it ended and why.
++fn watch_ended_error(error_code: u32, dir: &Path) -> Error {
++    Error::io(std::io::Error::from_raw_os_error(error_code as i32)).add_path(dir.to_path_buf())
++}
++
+ unsafe extern "system" fn handle_event(
+     error_code: u32,
+-    _bytes_written: u32,
++    bytes_written: u32,
+     overlapped: *mut OVERLAPPED,
+ ) {
+     let overlapped: Box<OVERLAPPED> = Box::from_raw(overlapped);
+     let request: Box<ReadDirectoryRequest> = Box::from_raw(overlapped.hEvent as *mut _);
+ 
++    fn emit_event(event_handler: &Mutex<dyn EventHandler>, res: Result<Event>) {
++        if let Ok(mut guard) = event_handler.lock() {
++            let f: &mut dyn EventHandler = &mut *guard;
++            f.handle_event(res);
++        }
++    }
++
+     match error_code {
+         ERROR_OPERATION_ABORTED => {
+             // received when dir is unwatched or watcher is shutdown; return and let overlapped/request get drop-cleaned
+@@ -346,12 +371,16 @@
+             // This could happen when the watched directory is deleted or trashed, first check if it's the case.
+             // If so, unwatch the directory and return, otherwise, continue to handle the event.
+             if !request.data.dir.exists() {
++                emit_event(
++                    &request.event_handler,
++                    Err(watch_ended_error(error_code, &request.data.dir)),
++                );
+                 request.unwatch();
+                 ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
+                 return;
+             }
+         }
+-        ERROR_SUCCESS => {
++        ERROR_SUCCESS | ERROR_NOTIFY_ENUM_DIR => {
+             // Success, continue to handle the event
+         }
+         _ => {
+@@ -361,6 +390,10 @@
+                 request.data.dir.display(),
+                 error_code
+             );
++            emit_event(
++                &request.event_handler,
++                Err(watch_ended_error(error_code, &request.data.dir)),
++            );
+             request.unwatch();
+             ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
+             return;
+@@ -372,9 +405,14 @@
+         &request.data,
+         request.event_handler.clone(),
+         request.handle,
+-        request.action_tx,
++        request.action_tx.clone(),
+     );
+ 
++    if let Some(event) = completion_rescan_event(error_code, bytes_written) {
++        emit_event(&request.event_handler, Ok(event));
++        return;
++    }
++
+     // The FILE_NOTIFY_INFORMATION struct has a variable length due to the variable length
+     // string as its last member. Each struct contains an offset for getting the next entry in
+     // the buffer.
+@@ -413,13 +451,6 @@
+ 
+             let newe = Event::new(EventKind::Any).add_path(path);
+ 
+-            fn emit_event(event_handler: &Mutex<dyn EventHandler>, res: Result<Event>) {
+-                if let Ok(mut guard) = event_handler.lock() {
+-                    let f: &mut dyn EventHandler = &mut *guard;
+-                    f.handle_event(res);
+-                }
+-            }
+-
+             let event_handler = |res| emit_event(&request.event_handler, res);
+ 
+             if cur_entry.Action == FILE_ACTION_RENAMED_OLD_NAME {

@@ -3889,8 +3889,11 @@ attribute change is `change`, anything that makes or unmakes a name is `rename`)
 relative to the watched directory (the file's own name for a file watch), every encoding
 including `'buffer'`, `recursive` on all three platforms, `close()` emitting `'close'` on the
 next tick, `ref()` / `unref()` / `persistent: false` deciding whether the watcher keeps the
-process alive, `signal`, and the `watch` error shapes. `fs.promises.watch` is node's async
-generator with `maxQueue` / `overflow` (`conformance/cases/421-*`). Up to 0.19.0 `fs.watch`
+process alive, `signal`, and the `watch` error shapes. Each event is its own callback from the
+event loop, as libuv's are through MakeCallback: `process.nextTick` and then the microtasks drain
+after every listener call, and a listener's throw is an uncaught exception, after which the
+remaining events still arrive. `fs.promises.watch` is node's async generator with `maxQueue` /
+`overflow` (`conformance/cases/421-*`, `422-*`). Up to 0.19.0 `fs.watch`
 polled the path's mtime every 100 ms (no `rename`, nothing from inside a directory, a watcher
 that could never be unref'd) and `fs.promises.watch` did not exist. What is left:
 
@@ -3901,10 +3904,22 @@ that could never be unref'd) and `fs.promises.watch` did not exist. What is left
   counts differ by platform.
 - **macOS uses FSEvents for a file watch too.** libuv watches a single file with kqueue.
   Both name the file; FSEvents' latency and coalescing apply.
-- **Deleting a watched directory on Windows.** node v22.22.2 reports `rename` with the full
-  `\\?\` path in a tight loop (3,482 events in 350 ms, measured) until the watcher is closed,
-  and an unref'd watcher on it then keeps the process alive; oam's watch ends quietly after
-  the deletion's own events.
+- **Deleting a watched directory on Windows.** node v22.22.2 reports `rename` with the
+  directory's full `\\?\` path in a tight loop (66,878 events in one second, measured) until
+  the watcher is closed, and an unref'd watcher on it then keeps the process alive. oam reports
+  that `rename` once, after the deletion's own events; the watcher stays open, so a referenced
+  one keeps the process alive until it is closed, as node's does, and an unref'd one does not.
+  A watched file whose directory is deleted fails as node's does: `'error'` with `EPERM`
+  (`EPERM: operation not permitted, watch`, `filename` null), and the watcher is closed.
+- **A recursive watch on Windows reports no `change` for the directories above a changed
+  entry.** For each event libuv resolves the entry's long name (`GetLongPathNameW`), which
+  reads every directory on the path and updates their last-access times; its own
+  ReadDirectoryChangesW filter includes last-access changes, so writing `s1\s2\deep.txt`
+  under a recursive watch also reports `change` for `s1` and `s1\s2` (measured: the same
+  watch through notify reports them only when the callback calls `GetLongPathNameW`). oam
+  watches last-access changes too, but does not resolve long names, so it reports what the
+  writes themselves changed. The same resolution is why libuv matches an 8.3 short name (next
+  item).
 - **A file watch on Windows matches the name exactly.** libuv compares the changed name with
   the watched file's case-insensitively and against its 8.3 short name; oam (`notify`)
   compares the path as given, so `fs.watch('README.MD')` on a file spelled `README.md` sees
@@ -3912,8 +3927,12 @@ that could never be unref'd) and `fs.promises.watch` did not exist. What is left
 - **One native thread per watcher** on Windows and Linux (the backend's event loop), where
   libuv shares the process's loop. Fine for a CLI's handful of watchers; thousands of
   watchers cost thousands of threads.
-- **A queue overflow** (inotify `IN_Q_OVERFLOW`, an FSEvents drop) is reported as one
-  `rename` with a `null` filename on every platform; libuv does so on Windows only.
+- **A queue overflow** (ReadDirectoryChangesW's, inotify's `IN_Q_OVERFLOW`, an FSEvents
+  drop) is reported as one `rename` with a `null` filename on every platform; libuv does so
+  on Windows only. On Windows oam's backend reads the OS buffer on a thread of its own, so it
+  overflows later than node's loop does: four writers creating and renaming 3,000 files
+  each overflowed node's watcher (17,764 to 28,251 of 48,000 events, with 87 to 121 `null`
+  filenames) and not oam's (all 48,000).
 
 ### Windows: `require` of a `\\?\` or `\\.\` spelling of a module loads it
 
