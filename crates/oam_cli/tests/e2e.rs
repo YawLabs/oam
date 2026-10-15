@@ -32166,6 +32166,293 @@ fn code_cache_opt_out_disables_produce() {
     let _ = std::fs::remove_dir_all(&project_dir);
 }
 
+/// A fresh scratch dir for a compile-cache e2e test.
+fn compile_cache_scratch(tag: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("oam-e2e-{tag}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// The per-build subdirectories (`oam-v<ver>-<arch>-<v8 tag>`) oam made
+/// inside a directory named by node's compile-cache API.
+fn oam_version_dirs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let prefix = format!("oam-v{}-", env!("CARGO_PKG_VERSION"));
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .collect()
+}
+
+/// `oam run <entry> [-- args]` in `cwd` with `envs`, the inherited cache
+/// switches removed so the test alone decides them.
+fn run_compile_cache(
+    cwd: &std::path::Path,
+    entry: &std::path::Path,
+    args: &[&std::path::Path],
+    envs: &[(&str, &std::path::Path)],
+) -> std::process::Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
+    cmd.arg("run").arg(entry);
+    if !args.is_empty() {
+        cmd.arg("--");
+        cmd.args(args);
+    }
+    cmd.current_dir(cwd)
+        .env_remove("OAM_CODE_CACHE")
+        .env_remove("NODE_COMPILE_CACHE")
+        .env_remove("NODE_DISABLE_COMPILE_CACHE");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("oam binary runs")
+}
+
+// node's compile-cache API: module.enableCompileCache(dir) moves the
+// bytecode cache into <dir>/oam-v<ver>-<arch>-<v8 tag> for everything
+// compiled after the call -- CJS (require) and ESM (import()) alike -- and
+// the warm run prints exactly what the cold one did. The entry itself was
+// compiled before the call, so it stays in the default root, as in node.
+#[test]
+fn compile_cache_enable_dir_holds_the_blobs() {
+    let project = compile_cache_scratch("cc-enable");
+    let oam_cache = project.join("oam-cache");
+    let named = project.join("named");
+    std::fs::write(project.join("lib.cjs"), "module.exports = (n) => n * 2;\n").unwrap();
+    std::fs::write(project.join("lib.mjs"), "export const tag = 'esm';\n").unwrap();
+    let entry = project.join("main.cjs");
+    std::fs::write(
+        &entry,
+        "const m = require('node:module');\n\
+         const r = m.enableCompileCache(process.argv[2]);\n\
+         const twice = require('./lib.cjs');\n\
+         import('./lib.mjs').then((e) => console.log('ok', r.status, twice(21), e.tag));\n",
+    )
+    .unwrap();
+
+    let envs = [("OAM_CACHE_DIR", oam_cache.as_path())];
+    let cold = run_compile_cache(&project, &entry, &[&named], &envs);
+    assert!(
+        cold.status.success(),
+        "cold run: {}",
+        String::from_utf8_lossy(&cold.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&cold.stdout), "ok 1 42 esm\n");
+    let dirs = oam_version_dirs(&named);
+    assert_eq!(
+        dirs.len(),
+        1,
+        "one per-build dir in the named dir: {dirs:?}"
+    );
+    assert!(
+        count_v8c(&dirs[0]) >= 2,
+        "lib.cjs and lib.mjs are cached in the named dir; found {}",
+        count_v8c(&dirs[0])
+    );
+
+    let warm = run_compile_cache(&project, &entry, &[&named], &envs);
+    assert!(
+        warm.status.success(),
+        "warm run: {}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    assert_eq!(
+        warm.stdout, cold.stdout,
+        "the warm run prints what the cold one did"
+    );
+    let _ = std::fs::remove_dir_all(&project);
+}
+
+// NODE_COMPILE_CACHE=<dir> puts every blob, the entry's included, in
+// <dir>/oam-v...; none land in the default root. NODE_DISABLE_COMPILE_CACHE
+// (any value: node tests presence, so "0" disables too) is a true off
+// switch: no blob anywhere, and the named dir is not even created.
+#[test]
+fn compile_cache_env_vars_move_and_disable_it() {
+    let project = compile_cache_scratch("cc-env");
+    let oam_cache = project.join("oam-cache");
+    let ncc = project.join("ncc");
+    std::fs::write(project.join("lib.cjs"), "module.exports = 7;\n").unwrap();
+    let entry = project.join("main.cjs");
+    std::fs::write(&entry, "console.log('v=' + require('./lib.cjs'));\n").unwrap();
+
+    let out = run_compile_cache(
+        &project,
+        &entry,
+        &[],
+        &[("OAM_CACHE_DIR", &oam_cache), ("NODE_COMPILE_CACHE", &ncc)],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "v=7\n");
+    let dirs = oam_version_dirs(&ncc);
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    assert!(
+        count_v8c(&dirs[0]) >= 2,
+        "main.cjs and lib.cjs are cached in NODE_COMPILE_CACHE"
+    );
+    assert_eq!(count_v8c(&oam_cache), 0, "nothing in the default root");
+
+    let off_cache = project.join("off-cache");
+    let off_ncc = project.join("off-ncc");
+    let off = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .arg("run")
+        .arg(&entry)
+        .current_dir(&project)
+        .env_remove("OAM_CODE_CACHE")
+        .env("OAM_CACHE_DIR", &off_cache)
+        .env("NODE_COMPILE_CACHE", &off_ncc)
+        .env("NODE_DISABLE_COMPILE_CACHE", "0")
+        .output()
+        .expect("oam binary runs");
+    assert!(
+        off.status.success(),
+        "{}",
+        String::from_utf8_lossy(&off.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&off.stdout), "v=7\n");
+    assert_eq!(
+        count_v8c(&off_cache),
+        0,
+        "disabled: no blob in the default root"
+    );
+    assert!(
+        !off_ncc.exists(),
+        "disabled: NODE_COMPILE_CACHE is not created"
+    );
+    let _ = std::fs::remove_dir_all(&project);
+}
+
+// A NODE_COMPILE_CACHE that cannot be created (its path runs through a
+// file) is not an error: node runs without its compile cache and reports
+// getCompileCacheDir() undefined; oam reports the same and keeps caching in
+// its default root.
+#[test]
+fn compile_cache_unusable_env_dir_is_ignored() {
+    let project = compile_cache_scratch("cc-unusable");
+    let oam_cache = project.join("oam-cache");
+    let blocker = project.join("a-file");
+    std::fs::write(&blocker, "x").unwrap();
+    let entry = project.join("main.cjs");
+    std::fs::write(
+        &entry,
+        "console.log(String(require('node:module').getCompileCacheDir()));\n",
+    )
+    .unwrap();
+    let out = run_compile_cache(
+        &project,
+        &entry,
+        &[],
+        &[
+            ("OAM_CACHE_DIR", &oam_cache),
+            ("NODE_COMPILE_CACHE", &blocker.join("sub")),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "undefined\n");
+    assert!(count_v8c(&oam_cache) >= 1, "the default root still caches");
+    let _ = std::fs::remove_dir_all(&project);
+}
+
+// Several processes filling one cold compile cache at once all run
+// correctly -- each blob is written to a private temp file and renamed into
+// place, so no reader ever sees a half-written entry -- leave no temp file
+// behind, and the cache they filled serves a correct warm run.
+#[test]
+fn compile_cache_concurrent_processes_share_one_dir() {
+    let project = compile_cache_scratch("cc-concurrent");
+    let ncc = project.join("ncc");
+    let mut lib = String::new();
+    for i in 0..200 {
+        lib.push_str(&format!("exports.f{i} = (x) => x + {i};\n"));
+    }
+    std::fs::write(project.join("lib.cjs"), lib).unwrap();
+    std::fs::write(project.join("lib.mjs"), "export default 'esm';\n").unwrap();
+    let entry = project.join("main.mjs");
+    std::fs::write(
+        &entry,
+        "import { createRequire } from 'node:module';\n\
+         import tag from './lib.mjs';\n\
+         const lib = createRequire(import.meta.url)('./lib.cjs');\n\
+         console.log(tag, lib.f199(1));\n",
+    )
+    .unwrap();
+
+    let children: Vec<_> = (0..6)
+        .map(|_| {
+            std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+                .arg("run")
+                .arg(&entry)
+                .current_dir(&project)
+                .env_remove("OAM_CODE_CACHE")
+                .env_remove("NODE_DISABLE_COMPILE_CACHE")
+                .env("NODE_COMPILE_CACHE", &ncc)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("oam binary spawns")
+        })
+        .collect();
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "esm 200\n");
+    }
+    let dirs = oam_version_dirs(&ncc);
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    let mut leftovers = Vec::new();
+    let mut stack = vec![dirs[0].clone()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("tmp") {
+                leftovers.push(p);
+            }
+        }
+    }
+    assert!(
+        leftovers.is_empty(),
+        "temp files left behind: {leftovers:?}"
+    );
+    assert!(
+        count_v8c(&dirs[0]) >= 3,
+        "the entry, lib.mjs and lib.cjs are cached"
+    );
+
+    let warm = run_compile_cache(&project, &entry, &[], &[("NODE_COMPILE_CACHE", &ncc)]);
+    assert!(
+        warm.status.success(),
+        "{}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&warm.stdout), "esm 200\n");
+    let _ = std::fs::remove_dir_all(&project);
+}
+
 // B3d: a corrupt on-disk blob must NEVER break execution. V8 rejects a blob it
 // can't deserialize (the same path a version-skewed blob takes) and recompiles
 // from source; our refresh logic then rewrites a valid blob. This is the
