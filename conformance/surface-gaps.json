@@ -5,8 +5,8 @@
       "generatedAgainst": "v22.22.2 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1482,
-        "missing": 343,
+        "present": 1483,
+        "missing": 342,
         "absentModules": 5,
         "absentModuleExportNames": 59
       },
@@ -416,7 +416,6 @@
           "DefaultSerializer",
           "GCProfiler",
           "getCppHeapStatistics",
-          "getHeapSnapshot",
           "isStringOneByteRepresentation",
           "promiseHooks",
           "queryObjects",
@@ -450,8 +449,8 @@
       "generatedAgainst": "v22.22.2 on linux-x64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1482,
-        "missing": 347,
+        "present": 1483,
+        "missing": 346,
         "absentModules": 5,
         "absentModuleExportNames": 59
       },
@@ -865,7 +864,6 @@
           "DefaultSerializer",
           "GCProfiler",
           "getCppHeapStatistics",
-          "getHeapSnapshot",
           "isStringOneByteRepresentation",
           "promiseHooks",
           "queryObjects",
@@ -899,8 +897,8 @@
       "generatedAgainst": "v22.22.2 on win32-arm64",
       "counts": {
         "nodeExportNames": 1874,
-        "present": 1502,
-        "missing": 313,
+        "present": 1503,
+        "missing": 312,
         "absentModules": 5,
         "absentModuleExportNames": 59
       },
@@ -1303,7 +1301,6 @@
           "DefaultSerializer",
           "GCProfiler",
           "getCppHeapStatistics",
-          "getHeapSnapshot",
           "isStringOneByteRepresentation",
           "promiseHooks",
           "queryObjects",

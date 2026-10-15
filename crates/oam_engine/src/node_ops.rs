@@ -538,6 +538,10 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("osSetPriority", op_os_set_priority),
         // v8 heap / process memory
         ("heapStatistics", op_heap_statistics),
+        // v8.getHeapSnapshot / writeHeapSnapshot
+        ("heapSnapshot", op_heap_snapshot),
+        ("fsWriteHeapSnapshot", op_fs_write_heap_snapshot),
+        ("heapSnapshotSeq", op_heap_snapshot_seq),
         ("processRss", op_process_rss),
         // cpu info
         ("cpuModel", op_cpu_model),
@@ -10160,6 +10164,117 @@ fn op_heap_statistics(
         obj.set(scope, k.into(), v.into());
     }
     rv.set(obj.into());
+}
+
+// ========================================================== V8 heap snapshots
+
+/// heapSnapshot() -> Uint8Array: a heap snapshot of THIS isolate, serialized
+/// as the `.heapsnapshot` JSON Chrome DevTools loads. Backs
+/// `v8.getHeapSnapshot()`, which node also takes synchronously at the call
+/// (createHeapSnapshotStream) and only then streams out.
+///
+/// The JSON is collected whole rather than streamed into JS: V8 serializes
+/// the snapshot in one synchronous pass (`HeapSnapshot::Serialize`), so there
+/// is no point at which JS could run between chunks anyway, and holding the
+/// bytes is what lets the stream hand them out on demand. It goes through the
+/// v8 crate's safe `take_heap_snapshot`, which takes the snapshot with V8's
+/// default options and deletes it once serialized -- no FFI of our own.
+fn op_heap_snapshot(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let mut json = Vec::new();
+    scope.take_heap_snapshot(|chunk| {
+        json.extend_from_slice(chunk);
+        true
+    });
+    if let Some(array) = bytes_to_uint8array(scope, json) {
+        rv.set(array);
+    }
+}
+
+/// fsWriteHeapSnapshot(path, isDefaultName) -> undefined: a heap snapshot of
+/// this isolate, streamed straight into `path` -- node's `WriteSnapshot`
+/// (src/heap_utils.cc), which opens O_WRONLY|O_CREAT|O_TRUNC with mode 0600
+/// and writes each chunk V8 hands its OutputStream. Streaming to the file,
+/// not collecting first, keeps a snapshot of a large heap from needing a
+/// second copy of itself in memory.
+///
+/// A failed open throws node's `open` system error naming the path as node's
+/// binding shows it (resolved on Windows, `ToNamespacedPath`). The write
+/// permission is checked where node checks it: on the path, or -- for the
+/// generated `Heap.*.heapsnapshot` name, which node writes into the cwd --
+/// on the cwd itself.
+fn op_fs_write_heap_snapshot(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(name) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "fsWriteHeapSnapshot requires a path");
+        return;
+    };
+    let path = if args.get(1).is_true() {
+        // node: THROW_IF_INSUFFICIENT_PERMISSIONS(kFileSystemWrite, cwd).
+        let cwd = std::env::current_dir()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !check_fs_as_given(scope, &cwd, FsAccess::Write) {
+            return;
+        }
+        oam_core::FsPath::new(name)
+    } else {
+        let Some(path) = fs_path_of(scope, name, FsAccess::Write) else {
+            return;
+        };
+        path
+    };
+    let flags = oam_core::open_options_for("w");
+    let file = match flags.open_with_mode(&path, 0o600) {
+        Ok(file) => file,
+        Err(e) => {
+            throw_fs_error(scope, oam_core::FsSite::Open(flags), "open", &path, &e);
+            return;
+        }
+    };
+    let mut out = std::io::BufWriter::new(file);
+    let mut failed: Option<std::io::Error> = None;
+    scope.take_heap_snapshot(|chunk| {
+        // Returning false aborts the serialization (kAbort): once a write has
+        // failed there is no file worth finishing.
+        match std::io::Write::write_all(&mut out, chunk) {
+            Ok(()) => true,
+            Err(e) => {
+                failed = Some(e);
+                false
+            }
+        }
+    });
+    let flushed = match failed {
+        Some(e) => Err(e),
+        None => std::io::Write::flush(&mut out),
+    };
+    if let Err(e) = flushed {
+        throw_fd_error(scope, "write", &e);
+    }
+}
+
+/// The sequence number in a generated diagnostic file name
+/// (`Heap.<date>.<time>.<pid>.<tid>.<seq>.heapsnapshot`). node keeps ONE
+/// counter per process (DiagnosticFilename's static `seq`), shared by every
+/// thread, so a worker's snapshot continues the main thread's numbering
+/// (measured: main 001..003, then the worker's 004). Hence a process-wide
+/// static here rather than per-isolate state. First call returns 1.
+static DIAGNOSTIC_FILE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn op_heap_snapshot_seq(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let seq = DIAGNOSTIC_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    rv.set(v8::Number::new(scope, f64::from(seq)).into());
 }
 
 // ============================================================= process RSS

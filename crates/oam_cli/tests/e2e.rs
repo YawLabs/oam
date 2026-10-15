@@ -37681,3 +37681,66 @@ fn a_write_grant_alone_reads_nothing() {
     assert_eq!(std::fs::read_to_string(&secret).unwrap(), "secret");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// v8.getHeapSnapshot / writeHeapSnapshot snapshot the LIVE heap: an object the
+/// script is holding shows up, by its class name, in both the streamed JSON and
+/// the written file. The conformance case (425) can only check the document's
+/// shape, since its contents differ run to run; this is what proves the bytes
+/// are a snapshot of this isolate and not a well-formed placeholder.
+#[test]
+fn heap_snapshot_captures_a_live_object() {
+    let out_file = write_temp("heap_snapshot/out.heapsnapshot", "");
+    let script = format!(
+        "import v8 from 'node:v8';\n\
+         import fs from 'node:fs';\n\
+         class OamHeapProbeMarker {{ constructor() {{ this.payload = 'x'.repeat(64); }} }}\n\
+         globalThis.keep = new OamHeapProbeMarker();\n\
+         const chunks = [];\n\
+         for await (const c of v8.getHeapSnapshot()) chunks.push(c);\n\
+         const streamed = JSON.parse(Buffer.concat(chunks).toString());\n\
+         console.log('stream', streamed.strings.includes('OamHeapProbeMarker'));\n\
+         const file = {file:?};\n\
+         console.log('returned', v8.writeHeapSnapshot(file) === file);\n\
+         const written = JSON.parse(fs.readFileSync(file, 'utf8'));\n\
+         console.log('file', written.strings.includes('OamHeapProbeMarker'));\n",
+        file = out_file.to_str().unwrap(),
+    );
+    let stdout = run_ok("heap_snapshot/live.mjs", &script);
+    assert_eq!(stdout, "stream true\nreturned true\nfile true", "{stdout}");
+}
+
+/// node checks the write grant where it writes: on the cwd for the generated
+/// `Heap.*.heapsnapshot` name, on the path for a named one. Under
+/// `--permission` with only a read grant both are refused with
+/// ERR_ACCESS_DENIED / FileSystemWrite and nothing is written; getHeapSnapshot,
+/// which writes no file, still works (measured against node v22.22.2).
+#[test]
+fn write_heap_snapshot_needs_the_write_grant() {
+    let main = write_temp(
+        "heap_snapshot_perm/main.cjs",
+        "const v8 = require('node:v8');\n\
+         const path = require('node:path');\n\
+         for (const a of [[], [path.join(__dirname, 'p.heapsnapshot')]]) {\n\
+           try { console.log('wrote', v8.writeHeapSnapshot(...a)); }\n\
+           catch (e) { console.log(e.code, e.permission); }\n\
+         }\n\
+         console.log(v8.getHeapSnapshot().constructor.name);\n",
+    );
+    let dir = main.parent().unwrap().to_path_buf();
+    let mut cmd = oam_command(&["--permission", "--allow-fs-read=*", main.to_str().unwrap()]);
+    cmd.current_dir(&dir);
+    let out = bounded_output(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "ERR_ACCESS_DENIED FileSystemWrite\nERR_ACCESS_DENIED FileSystemWrite\nHeapSnapshotStream",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let written: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".heapsnapshot"))
+        .collect();
+    assert!(written.is_empty(), "a snapshot was written despite the denial");
+}
