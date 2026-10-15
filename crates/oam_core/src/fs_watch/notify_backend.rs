@@ -3,8 +3,9 @@
 //! reports an event's path but not which of its watches produced it, so a
 //! shared watcher could not tell a directory watch from a watch on a file
 //! inside it, both of which see that file's events. The cost is a native
-//! thread per watcher on Windows (the backend's event loop); libuv shares one
-//! loop. That is recorded in docs/node-divergences.md.
+//! thread per watcher (ReadDirectoryChangesW's completion thread, an FSEvents
+//! run loop); libuv shares one loop. That is recorded in
+//! docs/node-divergences.md.
 
 use super::{Note, WatchEvent, WatchEventType, WatchStartError};
 use notify::event::{EventKind, ModifyKind, RenameMode};
