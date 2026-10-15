@@ -10020,7 +10020,9 @@
   const DeprecatedStats = (() => {
     let warned = false;
     function deprecated(...args) {
-      if (!warned) {
+      // node latches nothing while deprecations are silenced: a call made
+      // under process.noDeprecation leaves the one warning for a later call.
+      if (!process.noDeprecation && !warned) {
         warned = true;
         if (!deprecationCodesWarned.has("DEP0180")) {
           deprecationCodesWarned.add("DEP0180");
