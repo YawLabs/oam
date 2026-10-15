@@ -5584,6 +5584,13 @@
     return merged;
   };
 
+  // Deprecation codes that have already warned. Node keeps ONE set for every
+  // deprecate() wrapper in the process (internal/util's codesWarned), so a
+  // code warns once whether util.deprecate's wrappers or a builtin's own
+  // (fs.Stats, DEP0180) reach it first. Here, outside the util factory, so
+  // node:fs can share it without loading util (#392).
+  const deprecationCodesWarned = new Set();
+
   // ----------------------------------------------------------------- util
   registry.factories.util = (natives) => {
     const INSPECT_STYLES = { special: "cyan", number: "yellow", bigint: "yellow", boolean: "yellow", undefined: "grey", null: "bold", string: "green", symbol: "green", date: "magenta", regexp: "red", module: "underline" };
@@ -7083,9 +7090,8 @@
       Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
     }
 
-    // Codes that have already warned, shared across every deprecate() call:
-    // Node warns once per CODE, not once per wrapper.
-    const deprecationCodesWarned = new Set();
+    // Codes that have already warned live in deprecationCodesWarned (above
+    // the util factory): Node warns once per CODE, not once per wrapper.
     function deprecate(fn, msg, code) {
       if (code !== undefined && typeof code !== "string") {
         throw new codes.ERR_INVALID_ARG_TYPE("code", "string", code);
@@ -9846,84 +9852,189 @@
   const S_IFLNK = 0o120000;
   const S_IFSOCK = 0o140000;
 
-  // node's fs.Stats carries its predicates on the PROTOTYPE. That is what lets
-  // two stats of the same file compare equal: as own properties they are
-  // distinct function objects, so `assert.deepStrictEqual(statSync(f),
-  // statSync(f))` failed on every pair, and inspect printed seven [Function]
-  // members node does not show.
-  class Stats {
-    constructor(raw) {
-      // node's own field order, so inspect output lines up with it.
-      // Conditionally defined: if a platform could not supply one, it stays
-      // ABSENT rather than becoming an own property holding undefined, which
-      // deepStrictEqual and JSON.stringify would both treat as an answer.
-      for (const key of ["dev", "mode", "nlink", "uid", "gid", "rdev", "blksize"]) {
-        if (raw[key] !== undefined) this[key] = raw[key];
-      }
-      if (raw.ino !== undefined) this.ino = raw.ino;
-      this.size = raw.size;
-      if (raw.blocks !== undefined) this.blocks = raw.blocks;
-      this.atimeMs = raw.atimeMs;
-      this.mtimeMs = raw.mtimeMs;
-      this.ctimeMs = raw.ctimeMs;
-      this.birthtimeMs = raw.birthtimeMs;
-    }
-    // node exposes the Date views as lazy getters on the PROTOTYPE, not as own
-    // properties. As own properties they showed up in Object.keys, JSON and
-    // inspect where node shows none of them, and they cost four Date
-    // allocations on every stat for callers that only read the *Ms numbers.
-    // Cached in PRIVATE fields so the memo stays invisible to
-    // getOwnPropertySymbols and cannot make two stats of one file unequal.
-    #atime;
-    #mtime;
-    #ctime;
-    #birthtime;
-    get atime() { return (this.#atime ??= new Date(this.atimeMs)); }
-    get mtime() { return (this.#mtime ??= new Date(this.mtimeMs)); }
-    get ctime() { return (this.#ctime ??= new Date(this.ctimeMs)); }
-    get birthtime() { return (this.#birthtime ??= new Date(this.birthtimeMs)); }
-    // Derived from the S_IFMT bits of `mode`, as node does. While `mode` was
-    // hardcoded to 0 these had to read an oam-only `kind` string, which could
-    // only ever answer file/dir/symlink -- the other four were hardcoded false,
-    // so a POSIX character device, block device, FIFO or socket all reported
-    // themselves as none of those.
-    // On Windows node answers false for a FIFO, block device or socket
-    // whatever the mode says ("Some types are not available on Windows") --
-    // which is observable, because libuv's fstat of a pipe IS S_IFIFO.
-    _checkModeProperty(bits) {
-      if (
-        (bits === S_IFIFO || bits === S_IFBLK || bits === S_IFSOCK) &&
-        globalThis.__oam.node.platform === "win32"
-      ) {
-        return false;
-      }
-      return (this.mode & S_IFMT) === bits;
-    }
-    isDirectory() { return this._checkModeProperty(S_IFDIR); }
-    isFile() { return this._checkModeProperty(S_IFREG); }
-    isBlockDevice() { return this._checkModeProperty(S_IFBLK); }
-    isCharacterDevice() { return this._checkModeProperty(S_IFCHR); }
-    isSymbolicLink() { return this._checkModeProperty(S_IFLNK); }
-    isFIFO() { return this._checkModeProperty(S_IFIFO); }
-    isSocket() { return this._checkModeProperty(S_IFSOCK); }
+  // node's fs.Stats and fs.BigIntStats, built as node builds them
+  // (lib/internal/fs/utils.js, v22.22.2): plain constructor functions over a
+  // shared StatsBase, whose prototype carries the seven predicates, each
+  // with its own prototype carrying the four lazy Date fields and the
+  // _checkModeProperty the predicates call. Built by ASSIGNMENT, so those
+  // members are enumerable, and `for...in` over a stat lists node's names
+  // in node's order.
+  //
+  // The predicates live on a prototype, never on the instance: as own
+  // properties they are distinct function objects, so
+  // `assert.deepStrictEqual(statSync(f), statSync(f))` failed on every pair,
+  // and inspect printed seven [Function] members node does not show.
+  //
+  // This used to be one class taking oam's raw payload, which node's
+  // `new fs.Stats(dev, mode, ...)` could not construct (TypeError on the
+  // first field); had no BigIntStats, so `{ bigint: true }` was ignored by
+  // every stat form (#392); and cached the Dates in private fields where
+  // node's getter replaces itself with an own data property, assignable
+  // (`stats.mtime = date`, which a getter-only accessor refused).
+  function StatsBase(dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks) {
+    this.dev = dev;
+    this.mode = mode;
+    this.nlink = nlink;
+    this.uid = uid;
+    this.gid = gid;
+    this.rdev = rdev;
+    this.blksize = blksize;
+    this.ino = ino;
+    this.size = size;
+    this.blocks = blocks;
+  }
+  // Derived from the S_IFMT bits of `mode`, as node does. While `mode` was
+  // hardcoded to 0 these had to read an oam-only `kind` string, which could
+  // only ever answer file/dir/symlink -- the other four were hardcoded false,
+  // so a POSIX character device, block device, FIFO or socket all reported
+  // themselves as none of those.
+  StatsBase.prototype.isDirectory = function () { return this._checkModeProperty(S_IFDIR); };
+  StatsBase.prototype.isFile = function () { return this._checkModeProperty(S_IFREG); };
+  StatsBase.prototype.isBlockDevice = function () { return this._checkModeProperty(S_IFBLK); };
+  StatsBase.prototype.isCharacterDevice = function () { return this._checkModeProperty(S_IFCHR); };
+  StatsBase.prototype.isSymbolicLink = function () { return this._checkModeProperty(S_IFLNK); };
+  StatsBase.prototype.isFIFO = function () { return this._checkModeProperty(S_IFIFO); };
+  StatsBase.prototype.isSocket = function () { return this._checkModeProperty(S_IFSOCK); };
+
+  // node's dateFromMs: rounded by hand, since Date() floors and the double
+  // (or a bigint's whole milliseconds) may sit just under the true value.
+  function statDateFromMs(ms) {
+    return new Date(Math.round(Number(ms)));
   }
 
-  // Class members are non-enumerable; node builds Stats.prototype by
-  // assignment, so ITS members are enumerable -- observable through `for...in`
-  // over a stat object, which must list the same names in the same order.
-  for (const name of [
-    "atime", "mtime", "ctime", "birthtime",
-    "_checkModeProperty", "isDirectory", "isFile", "isBlockDevice",
-    "isCharacterDevice", "isSymbolicLink", "isFIFO", "isSocket",
-  ]) {
-    const descriptor = Object.getOwnPropertyDescriptor(Stats.prototype, name);
-    descriptor.enumerable = true;
-    Object.defineProperty(Stats.prototype, name, descriptor);
+  // node's lazyDateFields. The Date views are computed on first read, not
+  // at stat time -- four Date allocations on every stat for callers that
+  // only read the *Ms numbers -- and the getter then ASSIGNS, which the
+  // setter turns into an own non-enumerable data property: off Object.keys,
+  // JSON and inspect, so two stats of one file still compare equal, and
+  // writable, as node's are.
+  const statLazyDateFields = {};
+  for (const name of ["atime", "mtime", "ctime", "birthtime"]) {
+    const msKey = name + "Ms";
+    statLazyDateFields[name] = {
+      enumerable: true,
+      configurable: true,
+      get() {
+        return (this[name] = statDateFromMs(this[msKey]));
+      },
+      set(value) {
+        Object.defineProperty(this, name, { value, writable: true });
+      },
+    };
   }
 
-  function wrapStat(raw) {
-    return new Stats(raw);
+  // On Windows node answers false for a FIFO, block device or socket
+  // whatever the mode says ("Some types are not available on Windows") --
+  // which is observable, because libuv's fstat of a pipe IS S_IFIFO.
+  function statTypeUnavailable(bits) {
+    return (
+      (bits === S_IFIFO || bits === S_IFBLK || bits === S_IFSOCK) &&
+      globalThis.__oam.node.platform === "win32"
+    );
   }
+
+  function BigIntStats(dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks,
+    atimeNs, mtimeNs, ctimeNs, birthtimeNs) {
+    Reflect.apply(StatsBase, this, [dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks]);
+    this.atimeMs = atimeNs / 1000000n;
+    this.mtimeMs = mtimeNs / 1000000n;
+    this.ctimeMs = ctimeNs / 1000000n;
+    this.birthtimeMs = birthtimeNs / 1000000n;
+    this.atimeNs = atimeNs;
+    this.mtimeNs = mtimeNs;
+    this.ctimeNs = ctimeNs;
+    this.birthtimeNs = birthtimeNs;
+  }
+  Object.setPrototypeOf(BigIntStats.prototype, StatsBase.prototype);
+  Object.setPrototypeOf(BigIntStats, StatsBase);
+  Object.defineProperties(BigIntStats.prototype, statLazyDateFields);
+  BigIntStats.prototype._checkModeProperty = function (property) {
+    if (statTypeUnavailable(property)) return false;
+    return (this.mode & BigInt(S_IFMT)) === BigInt(property);
+  };
+
+  function Stats(dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks,
+    atimeMs, mtimeMs, ctimeMs, birthtimeMs) {
+    StatsBase.call(this, dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks);
+    this.atimeMs = atimeMs;
+    this.mtimeMs = mtimeMs;
+    this.ctimeMs = ctimeMs;
+    this.birthtimeMs = birthtimeMs;
+  }
+  Object.setPrototypeOf(Stats.prototype, StatsBase.prototype);
+  Object.setPrototypeOf(Stats, StatsBase);
+  Object.defineProperties(Stats.prototype, statLazyDateFields);
+  Stats.prototype._checkModeProperty = function (property) {
+    if (statTypeUnavailable(property)) return false;
+    return (this.mode & S_IFMT) === property;
+  };
+
+  // The integer fields a platform may be unable to read (all but mode and
+  // size; see stat_extras in oam_core).
+  const STAT_OPTIONAL_FIELDS = ["dev", "nlink", "uid", "gid", "rdev", "blksize", "ino", "blocks"];
+
+  // A stat payload from the natives as a Stats, or with `bigint` (the
+  // caller's `options.bigint === true`) a BigIntStats. Its exact values come
+  // from the payload's `big` string, because the JSON numbers are doubles:
+  // an NTFS file ID is often past 2^53 and a nanosecond time always is.
+  function wrapStat(raw, bigint = false) {
+    let stats;
+    if (bigint) {
+      const exact = raw.big.split(" ").map((value) => (value === "-" ? undefined : BigInt(value)));
+      stats = new BigIntStats(...exact);
+    } else {
+      stats = new Stats(
+        raw.dev, raw.mode, raw.nlink, raw.uid, raw.gid, raw.rdev, raw.blksize, raw.ino,
+        raw.size, raw.blocks, raw.atimeMs, raw.mtimeMs, raw.ctimeMs, raw.birthtimeMs,
+      );
+    }
+    // A field this platform could not supply stays ABSENT rather than an
+    // own property holding undefined, which deepStrictEqual and
+    // JSON.stringify would both treat as an answer.
+    for (const key of STAT_OPTIONAL_FIELDS) {
+      if (raw[key] === undefined) delete stats[key];
+    }
+    return stats;
+  }
+
+  // What a stat of nothing reads as: libuv's zeroed uv_stat_t, which
+  // node's watchFile hands a listener for a file that is not there.
+  function zeroStat(bigint) {
+    return bigint
+      ? new BigIntStats(0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n)
+      : new Stats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  }
+
+  // The options a stat form defaults to (node's `options = { bigint: false }`).
+  const STAT_DEFAULT_OPTIONS = Object.freeze({ bigint: false });
+  const STAT_SYNC_DEFAULT_OPTIONS = Object.freeze({ bigint: false, throwIfNoEntry: true });
+
+  // node exports Stats through util.deprecate (DEP0180: the constructor is
+  // deprecated; instances, and `instanceof fs.Stats`, are not). That
+  // wrapper, here rather than util's own so loading node:fs does not load
+  // util: one warning, the wrapped arity, Stats as its [[Prototype]] and its
+  // `prototype` shared, so a stat is still an instance of it. The warning is
+  // gated on the process-wide deprecationCodesWarned, as node's is: a
+  // util.deprecate(fn, msg, "DEP0180") wrapper and this one warn once
+  // between them, whichever runs first (#392).
+  const DeprecatedStats = (() => {
+    let warned = false;
+    function deprecated(...args) {
+      if (!warned) {
+        warned = true;
+        if (!deprecationCodesWarned.has("DEP0180")) {
+          deprecationCodesWarned.add("DEP0180");
+          process.emitWarning("fs.Stats constructor is deprecated.", "DeprecationWarning", "DEP0180", deprecated);
+        }
+      }
+      if (new.target) return Reflect.construct(Stats, args, new.target);
+      return Reflect.apply(Stats, this, args);
+    }
+    Object.defineProperty(deprecated, "length", { value: Stats.length, configurable: true });
+    Object.setPrototypeOf(deprecated, Stats);
+    deprecated.prototype = Stats.prototype;
+    return deprecated;
+  })();
 
   // node's fs.StatFs. Seven own fields in node's order and NOTHING on the
   // prototype but the constructor, which is the whole observable surface --
@@ -12954,9 +13065,11 @@
       // inode. "open a temp file then unlink it and keep the handle" is a
       // standard pattern, so the divergence was reachable from ordinary
       // code, and silent in the rename case.
+      // `options.bigint` is read before the fstat, as node's does: a null
+      // options rejects without one (#392).
       async stat(options) {
-        const fh = this, h = this[kNative];
-        return wrapStat(await natives.fsFstat(h));
+        const bigint = (options === undefined ? STAT_DEFAULT_OPTIONS : options).bigint === true;
+        return wrapStat(await natives.fsFstat(this[kNative]), bigint);
       }
       // node's validators, after the closed-handle check (fsCall runs
       // first): chmod's mode through parseFileMode, chown's uid / gid
@@ -13295,8 +13408,16 @@
       },
       writeFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, false), false),
       appendFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, true), true),
-      stat: withPath(async (file) => wrapStat(await natives.fsStat(file, false))),
-      lstat: withPath(async (file) => wrapStat(await natives.fsStat(file, true))),
+      // `options.bigint` after the path and before the stat, as node's
+      // order is; `throwIfNoEntry` is the sync forms' alone (#392).
+      stat: withPath(async (file, options = STAT_DEFAULT_OPTIONS) => {
+        const bigint = options.bigint === true;
+        return wrapStat(await natives.fsStat(file, false), bigint);
+      }),
+      lstat: withPath(async (file, options = STAT_DEFAULT_OPTIONS) => {
+        const bigint = options.bigint === true;
+        return wrapStat(await natives.fsStat(file, true), bigint);
+      }),
       statfs: withPath(async (file, options) => wrapStatFs(await natives.fsStatfs(file), options)),
       readdir: withPath(async (file, options) => {
         const { withFileTypes, recursive } = readOptions(options);
@@ -13909,6 +14030,39 @@
       );
     }
 
+    // statSync / lstatSync (#392): the native answers undefined for a path
+    // that is not there when `throwIfNoEntry` is `false` itself.
+    function statSyncAt(path, options, lstat) {
+      const file = toPath(path);
+      const bigint = options.bigint === true;
+      const raw = natives.fsStatSync(file, lstat, options.throwIfNoEntry);
+      return raw === undefined ? undefined : wrapStat(raw, bigint);
+    }
+
+    // The stat of a callback form, delivered as callbackify1 delivers: from
+    // the poll phase (the tick queue), with the request counted while it is
+    // in flight. A native that throws -- a permission refusal -- reports
+    // through the callback, as the promise form it used to go through did.
+    function deliverStat(start, bigint, callback) {
+      const token = fsReqStart();
+      let pending;
+      try {
+        pending = start();
+      } catch (err) {
+        fsReqEnd(token);
+        process.nextTick(() => callback(err));
+        return;
+      }
+      pending.then(
+        (raw) => {
+          fsReqEnd(token);
+          const stats = wrapStat(raw, bigint);
+          process.nextTick(() => callback(null, stats));
+        },
+        (err) => { fsReqEnd(token); process.nextTick(() => callback(err)); },
+      );
+    }
+
     function fsWatchFile(filename, options, listener) {
       if (typeof options === "function") {
         listener = options;
@@ -13924,11 +14078,16 @@
       var opts = options || {};
       var filePath = toPath(filename);
       var interval = opts.interval || 5007;
+      // node's StatWatcher takes `bigint` too: the listener gets two
+      // BigIntStats (#392).
+      var bigint = opts.bigint === true;
       var prev;
       try {
-        prev = wrapStat(natives.fsStatSync(filePath, false));
+        prev = wrapStat(natives.fsStatSync(filePath, false), bigint);
       } catch (e) {
-        prev = wrapStat({ kind: "file", size: 0, mtime: 0, atime: 0, mode: 0 });
+        // A file that is not there reads as libuv's zeroed stat -- every
+        // field 0, not just the few this placeholder used to carry.
+        prev = zeroStat(bigint);
       }
       // Stopped by close() / unwatchFile(): a stat already in flight then
       // reports nothing, as node's stopped StatWatcher calls no listener.
@@ -13938,7 +14097,7 @@
       var poll = setInterval(function () {
         natives.fsStat(filePath, false).then(function (raw) {
           if (stopped) return;
-          var curr = wrapStat(raw);
+          var curr = wrapStat(raw, bigint);
           if (curr.mtimeMs !== prev.mtimeMs) {
             if (listener) listener(curr, prev);
             prev = curr;
@@ -14084,8 +14243,13 @@
         }
         return natives.fsExistsSync(file);
       },
-      statSync: (path) => wrapStat(natives.fsStatSync(toPath(path), false)),
-      lstatSync: (path) => wrapStat(natives.fsStatSync(toPath(path), true)),
+      // node's options, read raw after the path (bigint, then
+      // throwIfNoEntry), and neither validated: only `true` turns bigint on,
+      // only `false` the throw off, and null options throw reading them
+      // (#392). They were ignored, so `{ throwIfNoEntry: false }` -- an
+      // existence check that hands back the stat -- threw ENOENT.
+      statSync: (path, options = STAT_SYNC_DEFAULT_OPTIONS) => statSyncAt(path, options, false),
+      lstatSync: (path, options = STAT_SYNC_DEFAULT_OPTIONS) => statSyncAt(path, options, true),
       statfsSync: (path, options) => wrapStatFs(natives.fsStatfsSync(toPath(path)), options),
       readdirSync: (path, options) => {
         const { withFileTypes, recursive } = readOptions(options);
@@ -14209,7 +14373,13 @@
       // The *Sync descriptor checks sit where node's C++ binding makes them:
       // after every other argument, right before the call (see validateFd).
       closeSync: (fd) => { validateFd(fd, true); natives.fsCloseSync(fd); },
-      fstatSync: (fd) => { validateFd(fd, true); return wrapStat(natives.fsFstatSync(fd)); },
+      // `options.bigint` is read before the descriptor is checked, as in
+      // node, whose binding checks it.
+      fstatSync: (fd, options = STAT_DEFAULT_OPTIONS) => {
+        const bigint = options.bigint === true;
+        validateFd(fd, true);
+        return wrapStat(natives.fsFstatSync(fd), bigint);
+      },
       // node's argument order (lib/fs.js, v22.22.2): the buffer, the options
       // object, the offset, the length, and only then the descriptor -- so a
       // bad offset is refused even by a read of length 0, which returns 0
@@ -14295,8 +14465,39 @@
       },
       writeFile: fdOrPathWrite(promises.writeFile, false),
       appendFile: fdOrPathWrite(promises.appendFile, true),
-      stat: callbackify1(promises.stat, 1, 1),
-      lstat: callbackify1(promises.lstat, 1, 1),
+      // node's own signatures and order (lib/fs.js, v22.22.2), which the
+      // promise form wrapped by callbackify1 could not give: the callback
+      // checked first, then stat reads `options.bigint` BEFORE the path
+      // (a null options throws even with a bad path) and lstat after it;
+      // a null options throws synchronously rather than reaching the
+      // callback; and the name and arity are "stat" / "lstat" and 1, where
+      // they were "" and 0 (#392). Node reads `options.bigint` TWICE: once
+      // for `new FSReqCallback(options.bigint)`, which picks the Stats type,
+      // and once more as binding.stat's argument after the path is
+      // validated. A getter sees both reads, and one that throws on the
+      // second throws synchronously, so the second read is kept here too.
+      stat: function stat(path, options = STAT_DEFAULT_OPTIONS, callback) {
+        if (typeof options === "function") {
+          callback = options;
+          options = STAT_DEFAULT_OPTIONS;
+        }
+        validateCb(callback);
+        const bigint = options.bigint === true;
+        const file = toPath(path);
+        void options.bigint;
+        deliverStat(() => natives.fsStat(file, false), bigint, callback);
+      },
+      lstat: function lstat(path, options = STAT_DEFAULT_OPTIONS, callback) {
+        if (typeof options === "function") {
+          callback = options;
+          options = STAT_DEFAULT_OPTIONS;
+        }
+        validateCb(callback);
+        const file = toPath(path);
+        const bigint = options.bigint === true;
+        void options.bigint;
+        deliverStat(() => natives.fsStat(file, true), bigint, callback);
+      },
       statfs: callbackify1(promises.statfs, 1, 1),
       // With `recursive`, node's callback readdir walks breadth first, as
       // readdirSync does; fs.promises.readdir does not.
@@ -14565,28 +14766,23 @@
       unwatchFile: fsUnwatchFile,
       // fd-based stat, callback form. fstatSync already existed; only the
       // async spelling was missing, and it is the one promisify() reaches for.
-      fstat: function (fd, options, cb) {
-        if (typeof options === "function") { cb = options; options = undefined; }
+      // node's signature (arity 1) and order: the callback, then
+      // `options.bigint` twice (FSReqCallback's read, which picks the Stats
+      // type, and binding.fstat's argument), then the descriptor, which
+      // node validates in C++ after both reads (#392).
+      fstat: function fstat(fd, options = STAT_DEFAULT_OPTIONS, cb) {
+        if (typeof options === "function") { cb = options; options = STAT_DEFAULT_OPTIONS; }
         validateCb(cb);
+        const bigint = options.bigint === true;
+        void options.bigint;
         validateFd(fd, true);
-        var token = fsReqStart();
         // The ASYNC native, not fsFstatSync: reading metadata inline and then
         // deferring only the callback still blocked the loop for the whole
         // stat, which is the one thing the callback form exists to avoid.
-        var p;
-        try {
-          p = natives.fsFstat(fd);
-        } catch (e) {
-          // A bad fd throws out of the op before a promise exists; node
-          // reports it through the callback, never synchronously.
-          fsReqEnd(token);
-          process.nextTick(function () { cb(e); });
-          return;
-        }
-        p.then(
-          function (raw) { fsReqEnd(token); process.nextTick(function () { cb(null, wrapStat(raw)); }); },
-          function (err) { fsReqEnd(token); process.nextTick(function () { cb(err); }); },
-        );
+        // A bad fd throws out of the op before a promise exists; node
+        // reports it through the callback, never synchronously, which
+        // deliverStat does.
+        deliverStat(() => natives.fsFstat(fd), bigint, cb);
       },
       // node's internal time coercion, exported (unprefixed by convention but
       // public enough that utimes wrappers in the wild call it).
@@ -14903,9 +15099,10 @@
       realpathNativeByPath(path, options, cb);
     };
     fs.Dirent = Dirent;
-    // The real class, so `stat instanceof fs.Stats` holds -- it was a bare
-    // placeholder no stat object was ever an instance of.
-    fs.Stats = Stats;
+    // The real constructor (behind node's DEP0180 wrapper), so `stat
+    // instanceof fs.Stats` holds -- it was a bare placeholder no stat object
+    // was ever an instance of. BigIntStats is not exported, as in node.
+    fs.Stats = DeprecatedStats;
     // Real constructors (lazy) with a `.prototype`, exposed as configurable
     // getters so graceful-fs can read fs.ReadStream.prototype AND later
     // redefine fs.ReadStream with its own wrapper.
