@@ -57,8 +57,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   existing cache backs it for CommonJS and ES modules alike: entries keyed by content hash, V8
   version and flags and now oam's version, written atomically, and a corrupt or unwritable cache
   only costs a compile. `process.exit()` and `flushCompileCache()` now write the ES module entries
-  still pending. The cache stays on by default, unlike node's; see `docs/node-divergences.md`.
-  Conformance cases 438-439.
+  still pending and the CommonJS modules whose body is still running. Each worker thread has its
+  own API state, as in node. The cache stays on by default, unlike node's; see
+  `docs/node-divergences.md`. Conformance cases 438-439.
 
 ### Fixed
 

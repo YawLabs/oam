@@ -962,9 +962,17 @@ node v22.22.2's; what differs is where and when the entries are written:
   tag and flags, oam's cache format and version, the module kind and the source text), not
   one per file name. node and oam can share one directory: their subdirectories differ, and
   neither could use the other's entries anyway, because their V8 builds differ.
+- **Modules compiled before the call.** node caches only what it compiles after
+  `enableCompileCache(dir)`: the module making the call, and an ES entry's static imports,
+  are never cached (measured). oam caches them in the root they were looked up in, the
+  default root or `NODE_COMPILE_CACHE`'s, so they are warm on the next run; only what is
+  compiled after the call goes to the named directory. `oam cache info` and `oam cache clean`
+  cover the default root only.
 - **When they are written.** node writes its entries at exit and on `flushCompileCache()`.
   oam writes a CommonJS module's entry as soon as its body returns, and an ES module's after
-  its graph evaluates, on `flushCompileCache()` or at `process.exit()`. In both runtimes a
+  its graph evaluates, on `flushCompileCache()` or at `process.exit()`; those two also write
+  the CommonJS modules whose body is still running, so a CommonJS bin that ends in
+  `process.exit()` is cached as under node. In both runtimes a
   cache directory that cannot be written only costs the next run a compile, and a
   `NODE_COMPILE_CACHE` that cannot be created is ignored (`getCompileCacheDir()` is
   `undefined`); oam then keeps caching in its default root.
