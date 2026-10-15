@@ -19,7 +19,15 @@
 //     gets ERR_SERVER_NOT_RUNNING;
 //   - listen, close, and in close's callback listen + close again (the
 //     re-listen window);
-//   - close(cb) on a server that never listened, and listen() twice.
+//   - close(cb) on a server that never listened, and listen() twice;
+//   - close() twice before the bind lands, with and without a host: the
+//     second close()'s 'close' waits for the bind to let the port go;
+//   - listen(), close() and listen() again on the same server, in one tick
+//     (with and without a host) and on the next turn of the loop, and two
+//     listen(port, host) in one tick: the second bind waits for the first
+//     to let the port go, where it used to fail with EADDRINUSE;
+//   - a failed same-tick bind with no 'error' listener: an uncaught
+//     exception, then 'close' and cb.
 // The server's own `listening` and address() between listen() and the bind
 // are left out: oam answers false and null there (docs/node-divergences.md).
 // Self-signed pair; nothing here connects, so nothing is verified.
@@ -211,11 +219,164 @@ async function misuse(name, make) {
   await new Promise((resolve) => twice.close(resolve));
 }
 
+// listen(port[, host]) and close() twice in one tick: the second close()
+// finds no handle, so its cb gets ERR_SERVER_NOT_RUNNING at the first
+// 'close' and a second 'close' follows -- and the port is free by the first
+// close()'s cb (the fresh server re-binds it from there). oam's second
+// close() used to emit its 'close' before the bind had landed and let its
+// listener go, so the re-bind failed with EADDRINUSE.
+async function doubleClose(name, make, host) {
+  const tag = name + " double close" + (host ? " host:" : ":");
+  const port = await freePort();
+  const s = make();
+  watch(s, tag);
+  const rebound = await new Promise((resolve) => {
+    if (host) s.listen(port, host);
+    else s.listen(port);
+    s.close((e) => {
+      log(tag, "first close callback", describe(e));
+      resolve(bindAgain(make, port));
+    });
+    s.close((e) => log(tag, "second close callback", describe(e)));
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  log(tag, rebound);
+}
+
+// listen(port, host), close() and listen(port, host) again in one tick: node
+// abandons the first lookup, so 'close' (cb gets ERR_SERVER_NOT_RUNNING),
+// then the second bind listens on the port. oam's second bind used to race
+// the first one's listener for the port and fail with EADDRINUSE.
+async function relistenHost(name, make) {
+  const tag = name + " re-listen same tick host:";
+  const port = await freePort();
+  const s = make();
+  watch(s, tag);
+  await new Promise((resolve) => {
+    s.listen(port, "127.0.0.1");
+    s.close((e) => log(tag, "close callback", describe(e)));
+    s.listen(port, "127.0.0.1", () => {
+      log(tag, "second listen callback, same port", s.address().port === port);
+      s.close(() => {
+        log(tag, "second close callback");
+        resolve();
+      });
+    });
+  });
+  log(tag, await bindAgain(make, port));
+}
+
+// The same with no host. node's bind is synchronous, so its first
+// 'listening' tick already finds the second listener and 'listening' comes
+// before the first 'close'; oam's comes after it (docs/node-divergences.md,
+// 52). What both runtimes do -- once each, the right callbacks, the port
+// re-bound -- is printed once everything has come, not in arrival order.
+async function relistenSameTick(name, make) {
+  const tag = name + " re-listen same tick:";
+  const port = await freePort();
+  const s = make();
+  const seen = { listening: 0, close: 0, error: 0 };
+  s.on("listening", () => seen.listening++);
+  s.on("close", () => seen.close++);
+  s.on("error", () => seen.error++);
+  let first;
+  let samePort;
+  await new Promise((resolve) => {
+    let left = 2;
+    const done = () => --left === 0 && resolve();
+    s.listen(port);
+    s.close((e) => {
+      first = describe(e);
+      done();
+    });
+    s.listen(port, () => {
+      samePort = s.address().port === port;
+      s.close(done);
+    });
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  log(tag, "first close callback", first, "second listen on the same port", samePort);
+  log(tag, "'listening'", seen.listening, "'close'", seen.close, "'error'", seen.error);
+  log(tag, await bindAgain(make, port));
+}
+
+// listen(port) + close(), and listen(port) again on the next turn of the
+// loop (setImmediate): the port is free by then in node; in oam it was
+// still bound by the first bind's listener.
+async function relistenImmediate(name, make) {
+  const tag = name + " re-listen immediate:";
+  const port = await freePort();
+  const s = make();
+  watch(s, tag);
+  await new Promise((resolve) => {
+    s.listen(port);
+    s.close((e) => log(tag, "close callback", describe(e)));
+    setImmediate(() => {
+      s.listen(port, () => {
+        log(tag, "second listen callback");
+        s.close(() => {
+          log(tag, "second close callback");
+          resolve();
+        });
+      });
+    });
+  });
+}
+
+// listen(port, host) twice in one tick: the second supersedes the first's
+// lookup, and listens on the port; oam's two binds used to race for it.
+async function supersede(name, make) {
+  const tag = name + " supersede:";
+  const port = await freePort();
+  const s = make();
+  watch(s, tag);
+  await new Promise((resolve) => {
+    s.listen(port, "127.0.0.1", () => log(tag, "first listen callback"));
+    s.listen(port, "127.0.0.1", () => {
+      log(tag, "second listen callback");
+      s.close(() => {
+        log(tag, "close callback");
+        resolve();
+      });
+    });
+  });
+}
+
+// listen(port) + close(cb) in one tick on a port another server holds, with
+// no 'error' listener: the 'error' is an uncaught exception, and 'close'
+// and cb still come after it. oam's 'error' threw inside the bind's promise
+// reaction, an unhandled rejection, and 'close' and cb never came.
+async function inUseUnhandled(name, make) {
+  const tag = name + " same-tick in use, no 'error' listener:";
+  const port = await freePort();
+  const holder = await hold(port);
+  const s = make();
+  s.on("close", () => log(tag, "'close'"));
+  const uncaught = (e) => log(tag, "uncaughtException", e.code);
+  process.on("uncaughtException", uncaught);
+  await new Promise((resolve) => {
+    s.listen(port);
+    s.close((e) => {
+      log(tag, "close callback", describe(e));
+      resolve();
+    });
+  });
+  process.removeListener("uncaughtException", uncaught);
+  await new Promise((resolve) => holder.close(resolve));
+}
+
 for (const [name, make] of kinds) {
   await sameTick(name, make);
   await sameTickHost(name, make);
   await sameTickInUse(name, make);
   await relisten(name, make);
   await misuse(name, make);
+  await doubleClose(name, make);
+  await doubleClose(name, make, "127.0.0.1");
+  await relistenHost(name, make);
+  await relistenSameTick(name, make);
+  await relistenImmediate(name, make);
+  await supersede(name, make);
+  await inUseUnhandled(name, make);
 }
 log("done");
