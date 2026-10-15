@@ -275,14 +275,17 @@ fn main() -> ExitCode {
     // a file oam opens for itself would otherwise be indistinguishable from an
     // inherited one -- see oam_core::snapshot_inherited_fds.
     oam_engine::snapshot_inherited_fds();
-    // Windows: our std handles must not reach a child by inheritance, as
-    // node's PlatformInit makes sure with uv_disable_stdio_inheritance. A
-    // detached child (outside the kill-on-close job) with stdio 'ignore'
-    // otherwise holds a parent's stdout pipe open after we exit. Only the
-    // inherit flag changes: our own writes look the handle up each time, and
-    // a stdio 'inherit' child gets a fresh inheritable duplicate. Before
+    // Nothing we were born holding may reach a child by inheritance, as
+    // node's PlatformInit makes sure with uv_disable_stdio_inheritance: on
+    // Windows the std handles and the CRT fds a parent passed, on unix
+    // FD_CLOEXEC on fds 3 and up (never 0-2). Otherwise a detached child with
+    // stdio 'ignore' holds a parent's stdout pipe open after we exit, and any
+    // child holds an extra-fd pipe the parent gave us. Only the inheritance
+    // flag changes: our own writes and adopted fds are unaffected, and a
+    // child given one of these (stdio 'inherit', stdio [..., n]) gets a
+    // fresh duplicate. Reads the snapshot just taken. Before
     // extract_embedded, so a compiled binary gets it too.
-    oam_ts::daemon::unshare_std_handles();
+    oam_engine::disable_stdio_inheritance();
     // And the file mode creation mask a parent handed us, before a program
     // can set its own: what oam writes for itself keeps the modes this one
     // gives (oam_diagnostics::own_files).

@@ -421,7 +421,6 @@ fn fd4_ends_while_sleeper_lives(sleeper_mode: &str) {
 /// with every stdio slot ignored exits.
 #[cfg(windows)]
 #[test]
-#[ignore = "gap 2 step 2: fails until oam makes inherited fds 3+ non-inheritable at startup; the fix removes this attribute and nothing else"]
 fn detached_child_does_not_hold_an_inherited_extra_fd() {
     fd4_ends_while_sleeper_lives("detached");
 }
@@ -431,7 +430,6 @@ fn detached_child_does_not_hold_an_inherited_extra_fd() {
 /// only.
 #[cfg(unix)]
 #[test]
-#[ignore = "gap 2 step 2: fails until oam sets FD_CLOEXEC on inherited fds 3+ at startup; the fix removes this attribute and nothing else"]
 fn child_does_not_hold_an_inherited_fd_4() {
     fd4_ends_while_sleeper_lives("attached");
 }

@@ -410,6 +410,17 @@ collide — an unknown fd below 64 is unambiguously "the parent gave me this". A
 passing a descriptor at 64 or above is outside that contract and gets `EBADF`; nothing
 real goes near it (the CDP convention uses 3 and 4).
 
+The same window bounds what oam keeps out of its own children. Like node's startup
+(`uv_disable_stdio_inheritance`), oam makes the descriptors it was born holding
+non-inheritable before anything runs — on Windows the std handles and each CRT fd the parent
+passed, on unix `FD_CLOEXEC` on fds 3 and up — but it finds them with the same 3-63 probe, so a
+descriptor a parent passes at 64 or above stays inheritable and every child oam starts gets a
+copy. node on Windows walks every CRT fd the parent passed; on unix libuv (`src/unix/core.c`)
+tries fds 0-15 and then goes on until the first fd it cannot flag. The unix half of this is not
+yet verified on unix: it was written and tested on Windows, and its test
+(`child_does_not_hold_an_inherited_fd_4` in `crates/oam_cli/tests/stdio_inheritance_fds.rs`)
+stays ignored until it has been run there.
+
 ### 18. An unrecognized `stdio` value is treated as `'inherit'`, not rejected
 
 ```js

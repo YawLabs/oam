@@ -49,9 +49,9 @@ pub use oam_core::http_head;
 // Re-exported for the CLI, which applies OAM_PRIORITY / OAM_ECOQOS at startup.
 pub use oam_core::priority;
 pub use oam_core::{
-    exit_process, register_exit_cleanup, register_exit_hook, register_process_state_hook,
-    run_exit_cleanup, run_exit_hooks, run_process_state_hooks, snapshot_inherited_fds,
-    snapshot_inherited_umask,
+    disable_stdio_inheritance, exit_process, register_exit_cleanup, register_exit_hook,
+    register_process_state_hook, run_exit_cleanup, run_exit_hooks, run_process_state_hooks,
+    snapshot_inherited_fds, snapshot_inherited_umask,
 };
 pub use permissions::{BoolOrList, Permissions, PermissionsOptions};
 pub use replay::ReplayMode;
