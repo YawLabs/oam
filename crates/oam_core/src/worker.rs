@@ -14,13 +14,55 @@ use std::sync::mpsc;
 #[derive(Debug)]
 pub enum WorkerEvent {
     Message(Vec<u8>),
-    Error(String),
+    Error(WorkerError),
     Exit(i32),
     /// Worker stdout/stderr, when the parent asked for it with
     /// `new Worker(..., { stdout: true })`. Without this the worker writes
     /// straight to the shared process fd, so the parent cannot capture it.
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
+}
+
+/// An error a worker reports to its parent, which emits it as the Worker's
+/// 'error' event. node hands the parent the worker's error object itself
+/// (serialized), so a worker whose entry is missing is seen as an `Error`
+/// with `code: 'MODULE_NOT_FOUND'` (#287); a bare message lost the class
+/// and the code a caller branches on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkerError {
+    /// The constructor the parent builds it with: `Error`, `TypeError`, ...
+    pub name: String,
+    pub message: String,
+    /// Own properties the parent sets on it, in order (`code`,
+    /// `requireStack`, ...).
+    pub props: Vec<(String, serde_json::Value)>,
+}
+
+impl WorkerError {
+    /// A plain `Error` carrying only `message`.
+    pub fn message(message: impl Into<String>) -> Self {
+        Self {
+            name: "Error".to_string(),
+            message: message.into(),
+            props: Vec::new(),
+        }
+    }
+
+    /// The JSON the parent's receive loop reads (`type: "error"`).
+    fn to_json(&self) -> String {
+        let props: Vec<serde_json::Value> = self
+            .props
+            .iter()
+            .map(|(key, value)| serde_json::json!([key, value]))
+            .collect();
+        serde_json::json!({
+            "type": "error",
+            "name": self.name,
+            "message": self.message,
+            "props": props,
+        })
+        .to_string()
+    }
 }
 
 /// Parent-side handle to one worker.
@@ -108,9 +150,7 @@ pub async fn parent_recv(registry: WorkerRegistry, worker_id: u64) -> OpOutcome 
             reinsert_receiver(&registry, worker_id, rx);
             match event {
                 WorkerEvent::Message(data) => OpOutcome::Bytes(data),
-                WorkerEvent::Error(msg) => OpOutcome::Json(
-                    serde_json::json!({"type": "error", "message": msg}).to_string(),
-                ),
+                WorkerEvent::Error(error) => OpOutcome::Json(error.to_json()),
                 WorkerEvent::Exit(code) => {
                     OpOutcome::Json(serde_json::json!({"type": "exit", "code": code}).to_string())
                 }
@@ -188,4 +228,37 @@ pub fn worker_post(outbox: &mpsc::Sender<WorkerEvent>, data: Vec<u8>) -> Result<
     outbox
         .send(WorkerEvent::Message(data))
         .map_err(|_| "parent channel closed".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_worker_error_reaches_the_parent_with_its_class_and_props_in_order() {
+        let error = WorkerError {
+            name: "Error".to_string(),
+            message: "Cannot find module 'x'".to_string(),
+            props: vec![
+                ("code".to_string(), serde_json::json!("MODULE_NOT_FOUND")),
+                ("requireStack".to_string(), serde_json::json!([])),
+            ],
+        };
+        let json: serde_json::Value = serde_json::from_str(&error.to_json()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "error",
+                "name": "Error",
+                "message": "Cannot find module 'x'",
+                "props": [["code", "MODULE_NOT_FOUND"], ["requireStack", []]],
+            })
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&WorkerError::message("boom").to_json()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "type": "error", "name": "Error", "message": "boom", "props": [] })
+        );
+    }
 }

@@ -37308,12 +37308,14 @@ fn process_env_hides_the_drive_cwd_variables_and_reads_them_live() {
     );
 }
 
-// The worker and fork entry gates test the script on the namespaced path
-// the loader then opens, so a trailing dot stays in the name for both. The
-// gates used to test the raw path, which Win32 trims: with only `w.js` on
-// disk `new Worker('w.js.')` passed (and failed later in the loader), and a
-// file really named `x.js.` was "not found". node v22.22.2 fails `w.js.` as
-// a missing module and finds `x.js.`.
+// The worker and fork entries are looked for on the namespaced path the
+// loader then opens, so a trailing dot stays in the name for both. The gates
+// used to test the raw path, which Win32 trims: with only `w.js` on disk
+// `new Worker('w.js.')` passed (and failed later in the loader), and a file
+// really named `x.js.` was "not found". node v22.22.2 fails `w.js.` as a
+// missing module -- reported by the started worker, as its 'error' event
+// (#287) -- and runs `x.js.` as CommonJS, which oam's ES module host used to
+// refuse as module type '.'.
 #[cfg(windows)]
 #[test]
 fn worker_and_fork_entry_gates_test_the_namespaced_path() {
@@ -37328,20 +37330,25 @@ fn worker_and_fork_entry_gates_test_the_namespaced_path() {
          const { Worker } = require('worker_threads');\n\
          const dir = path.resolve(process.argv[2]);\n\
          fs.writeFileSync('\\\\\\\\?\\\\' + path.join(dir, 'x.js.'), '');\n\
-         for (const name of ['w.js.', 'x.js.']) {\n\
-           try { new Worker(path.join(dir, name)).on('error', () => {}); console.log('worker ' + name + ' passed'); }\n\
-           catch (e) { console.log('worker ' + name + ' ' + (/not found/.test(e.message) ? 'not found' : e.message)); }\n\
-           try { globalThis.__oam.forkSpawn(path.join(dir, name), null); console.log('fork ' + name + ' passed'); }\n\
-           catch (e) { console.log('fork ' + name + ' ' + (/not found/.test(e.message) ? 'not found' : e.message)); }\n\
-         }\n\
-         setTimeout(() => process.exit(0), 500);\n",
+         (async () => {\n\
+           for (const name of ['w.js.', 'x.js.']) {\n\
+             await new Promise((resolve) => {\n\
+               const worker = new Worker(path.join(dir, name));\n\
+               worker.on('error', (e) => console.log('worker ' + name + ' ' + e.code));\n\
+               worker.on('exit', (code) => { console.log('worker ' + name + ' exit ' + code); resolve(); });\n\
+             });\n\
+             try { globalThis.__oam.forkSpawn(path.join(dir, name), null); console.log('fork ' + name + ' passed'); }\n\
+             catch (e) { console.log('fork ' + name + ' ' + (/not found/.test(e.message) ? 'not found' : e.message)); }\n\
+           }\n\
+           setTimeout(() => process.exit(0), 500);\n\
+         })();\n",
     );
     let out = oam(&[script.to_str().unwrap(), dir.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
     assert_eq!(
         stdout,
-        "worker w.js. not found\nfork w.js. not found\n\
-         worker x.js. passed\nfork x.js. passed\n",
+        "worker w.js. MODULE_NOT_FOUND\nworker w.js. exit 1\nfork w.js. not found\n\
+         worker x.js. exit 0\nfork x.js. passed\n",
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );

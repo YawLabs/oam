@@ -1474,6 +1474,13 @@
   codes.ERR_WORKER_NOT_SUPPORTED = E("ERR_WORKER_NOT_SUPPORTED", Error, function() {
     return 'Worker threads are not supported in this environment';
   });
+  codes.ERR_WORKER_PATH = E("ERR_WORKER_PATH", TypeError, function(filename) {
+    return "The worker script or module filename must be an absolute path or a " +
+      "relative path starting with './' or '../'." +
+      (filename.startsWith("file://") ? " Wrap file:// URLs with `new URL`." : "") +
+      (filename.startsWith("data:text/javascript") ? " Wrap data: URLs with `new URL`." : "") +
+      ` Received "${filename}"`;
+  });
   codes.ERR_ENV_FILE_NOT_FOUND = E("ERR_ENV_FILE_NOT_FOUND", Error, function(path) {
     return 'Cannot find env file: ' + path;
   });
@@ -41547,21 +41554,48 @@
       }
       return env;
     }
+    /** The error a worker reported (oam_core's WorkerError), rebuilt as
+     *  node's parent sees the worker's error: of its class, carrying its own
+     *  properties -- a missing entry is an Error with `code:
+     *  'MODULE_NOT_FOUND'` and `requireStack: []` (#287). */
+    const WORKER_ERROR_CLASSES = {
+      Error, TypeError, RangeError, SyntaxError, ReferenceError, EvalError, URIError,
+    };
+    function workerError(raw) {
+      const Class = Object.hasOwn(WORKER_ERROR_CLASSES, raw.name) ? WORKER_ERROR_CLASSES[raw.name] : Error;
+      const err = new Class(raw.message);
+      for (const [key, value] of raw.props || []) err[key] = value;
+      return err;
+    }
     class Worker extends EventEmitter {
       constructor(filename, opts = {}) {
         super();
+        // `eval: true` makes `filename` the worker's source, which oam cannot
+        // run yet. Refused by name: read as a path (as it was), the source
+        // was looked for as a file.
+        if (opts.eval) {
+          throw new Error("new Worker(source, { eval: true }) is not supported in oam");
+        }
         // node accepts a string path OR a URL (the `new Worker(new URL("./w.js",
         // import.meta.url))` idiom its own docs use); only a string was taken
         // here, so the documented ESM spelling threw.
-        if (filename instanceof URL || (typeof filename === "string" && filename.startsWith("file:"))) {
-          filename = registry.get("url").fileURLToPath(filename);
+        let resolved;
+        if (filename instanceof URL) {
+          resolved = registry.get("url").fileURLToPath(filename);
         } else if (typeof filename !== "string") {
           throw nodeTypeError(
             "The \"filename\" argument must be of type string or an instance of URL. " +
               `Received ${describeArg(filename)}`,
           );
+        } else if (pathMod.isAbsolute(filename) || /^\.\.?[\\/]/.test(filename)) {
+          resolved = pathMod.resolve(filename);
+        } else {
+          // node's ERR_WORKER_PATH (#287): a string entry is a path, absolute
+          // or `./`/`../`-relative -- never a bare name (which is not looked
+          // up as a package) nor a `file:` URL string. Both were resolved
+          // against the cwd here.
+          throw new codes.ERR_WORKER_PATH(filename);
         }
-        const resolved = pathMod.resolve(filename);
         const wd = opts.workerData !== undefined ? JSON.stringify(opts.workerData) : null;
 
         // Store worker name (Node >=12.11 option)
@@ -41615,7 +41649,7 @@
               this.emit("message", text);
             }
           } else if (typeof raw === "object" && raw !== null) {
-            if (raw.type === "error") { this.emit("error", new Error(raw.message)); }
+            if (raw.type === "error") { this.emit("error", workerError(raw)); }
             if (raw.type === "stdout" || raw.type === "stderr") {
               // latin1: the Rust side encoded each byte as one code unit.
               this[raw.type].push(Buffer.from(raw.data, "latin1"));

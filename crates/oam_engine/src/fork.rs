@@ -261,12 +261,14 @@ fn run_fork_request(rt: &mut super::JsRuntime, req: ForkRequest) -> i32 {
         for d in &diagnostics {
             eprintln!("fork worker {}: {}", req.worker_id, d.message);
         }
-        let _ = req.event_tx.send(WorkerEvent::Error(
-            diagnostics
-                .first()
-                .map(|d| d.message.clone())
-                .unwrap_or_else(|| "unknown fork worker error".to_string()),
-        ));
+        let _ = req
+            .event_tx
+            .send(WorkerEvent::Error(oam_core::worker::WorkerError::message(
+                diagnostics
+                    .first()
+                    .map(|d| d.message.clone())
+                    .unwrap_or_else(|| "unknown fork worker error".to_string()),
+            )));
         let _ = req.event_tx.send(WorkerEvent::Exit(1));
         return 1;
     }
