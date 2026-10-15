@@ -1194,15 +1194,14 @@ fn trace_require_module_flag_warns_once_when_asked() {
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("invalid value for --trace-require-module")
     );
-    let out = oam(&[
-        "--trace-require-module",
-        "all",
-        "-p",
-        "JSON.stringify(process.execArgv)",
-    ]);
+    let argv = write_temp(
+        &format!("{root}/argv.cjs"),
+        "console.log(JSON.stringify(process.execArgv));",
+    );
+    let out = oam(&["--trace-require-module", "all", argv.to_str().unwrap()]);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        r#"["--trace-require-module","all","-p","JSON.stringify(process.execArgv)"]"#
+        r#"["--trace-require-module","all"]"#
     );
 }
 
