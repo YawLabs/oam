@@ -48,6 +48,20 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `exposeNumericValues` options are checked but not honoured, and `worker.getHeapSnapshot()` rejects
   rather than resolve an empty array; see docs/node-divergences.md.
 
+### Added
+
+- **`require()` of an ES module, with node 22's semantics.** Every such `require()` threw
+  `ERR_REQUIRE_ESM` while `process.features.require_module` said `true`. The graph now loads and
+  evaluates synchronously inside the `require()`, sharing one module map with `import()`, for a
+  `.mjs`, a `.js` under `"type": "module"` (in node_modules too) and a typeless `.js` with module
+  syntax. It returns the namespace, the facade that adds `__esModule: true` when there is a default
+  export, or an export named `'module.exports'`. Top-level await is `ERR_REQUIRE_ASYNC_MODULE`, a
+  cycle is `ERR_REQUIRE_CYCLE_MODULE` in node's wordings, and an evaluation error is rethrown on
+  every `require()`. `--trace-require-module` gives node's once-per-process warning, silent by
+  default. `require.cache` is now node's `Module._cache`, shared and live, ES modules included. A
+  CommonJS dependency of a graph refused for top-level await has already run; see
+  docs/node-divergences.md.
+
 ### Fixed
 
 - **`fs.readdir` honours `encoding: "buffer"`, as node's does.** Each entry was returned as a
