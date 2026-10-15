@@ -173,9 +173,12 @@ fn v8_pool_size(requested: Option<i64>, cores: usize) -> u32 {
 /// `V8_TYPED_ARRAY_MAX_SIZE_IN_HEAP` define), not a runtime flag: V8's
 /// flag-definitions.h has no such flag, and node itself rejects
 /// `--typed-array-max-size-in-heap` as a bad option. Measured on a debug
-/// build (100k iterations): `new Uint8Array(32)` ~38 ms against node's
-/// ~2 ms, while `new ArrayBuffer(32)`, off-heap in both, is ~30-40 ms in
-/// each, so the gap is that one build setting, not oam's allocator. Only
+/// build (100k iterations): `new Uint8Array(32)` ~30-55 ms against node's
+/// ~4-6 ms (about 10x), while `new ArrayBuffer(32)`, off-heap in both, is
+/// ~30-90 ms in each, so the gap is that one build setting, not oam's
+/// allocator. `Buffer.alloc(n)` for n <= 64 has the same gap for the same
+/// reason (js/node_compat.js `Buffer.alloc` is `new Buffer(size)`, a fresh
+/// typed array); `Buffer.allocUnsafe` slices the pool and runs at parity. Only
 /// building V8 from source with the gn arg changed would close it; were
 /// that done, the backing-store sites in napi.rs and node_ops.rs already
 /// reach a view's bytes through `ArrayBufferView::buffer` (which
