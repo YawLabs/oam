@@ -7,13 +7,18 @@
 // from internal/tty.js and cursorTo / clearLine / ... delegating to
 // readline. tty.isatty takes only an integer descriptor.
 //
-// The harness pipes stdio, so nothing here needs a terminal; the terminal
-// side (process.stdout an instance, columns, raw mode) is the ConPTY test's.
+// The harness runs a case with stdin on the null device (NUL / /dev/null)
+// and stdout / stderr on pipes, so nothing here has a terminal; the terminal
+// side (process.stdout an instance, columns, raw mode, a console opened by
+// name) is the ConPTY test's.
 //
 // Platform rows: uv_tty_init answers EBADF on Windows for anything that is
-// not a console, EINVAL elsewhere for a file or an unopened descriptor, and
-// on POSIX takes a pipe -- so the stdio descriptors are only tried on
-// Windows, and the errno/message of a refusal print on Windows only.
+// not a console, EINVAL elsewhere for a file, the null device or an unopened
+// descriptor, and on POSIX takes a pipe -- so the stdio descriptors are only
+// tried on Windows, and the errno/message of a refusal print on Windows only.
+// Windows also gets a named pipe whose name is an msys/cygwin pty's -- what
+// Git Bash's mintty hands a program -- which libuv calls a pipe though Rust's
+// IsTerminal calls it a terminal: not a TTY, and refused (#391).
 //
 // Regression guard: oam's ReadStream / WriteStream were empty stub classes
 // that constructed over any descriptor.
@@ -55,7 +60,9 @@ for (const [name, C] of [["ReadStream", ReadStream], ["WriteStream", WriteStream
   }
   attempt(`${name}(9999) without new`, () => C(9999));
   if (isWin) {
-    for (const fd of [0, 1, 2]) attempt(`new ${name}(${fd}) on a pipe`, () => new C(fd));
+    for (const [fd, what] of [[0, "NUL"], [1, "a pipe"], [2, "a pipe"]]) {
+      attempt(`new ${name}(${fd}) on the harness's stdio (${what})`, () => new C(fd));
+    }
   } else {
     console.log(`new ${name}(0..2): windows-only row`);
   }
@@ -72,6 +79,33 @@ try {
   }
 } finally {
   fs.rmSync(dir, { recursive: true, force: true });
+}
+{
+  const fd = fs.openSync(isWin ? "\\\\.\\NUL" : "/dev/null", "r+");
+  try {
+    attempt("new WriteStream(<null device>)", () => new WriteStream(fd));
+    attempt("new ReadStream(<null device>)", () => new ReadStream(fd));
+    console.log("isatty(<null device>)", tty.isatty(fd));
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+if (isWin) {
+  // The pid keeps two runs apart; the name itself is never printed.
+  const name = `\\\\.\\pipe\\msys-${process.pid.toString(16)}0418-pty0-to-master`;
+  const server = net.createServer((socket) => socket.on("error", () => {}));
+  await new Promise((resolve) => server.listen(name, resolve));
+  const fd = fs.openSync(name, "r+");
+  try {
+    attempt("new WriteStream(<msys pty pipe>)", () => new WriteStream(fd));
+    attempt("new ReadStream(<msys pty pipe>)", () => new ReadStream(fd));
+    console.log("isatty(<msys pty pipe>)", tty.isatty(fd));
+  } finally {
+    fs.closeSync(fd);
+    await new Promise((resolve) => server.close(resolve));
+  }
+} else {
+  console.log("<msys pty pipe>: windows-only row");
 }
 
 console.log("--- isatty");
