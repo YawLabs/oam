@@ -926,6 +926,120 @@ fn return_json(
     }
 }
 
+/// The bytes a stat takes in an ArrayBuffer: its doubles, then its integers
+/// (see `oam_core::ops::StatRecord`). The JS side's STAT_RECORD_BYTES.
+const STAT_RECORD_BYTES: usize = (oam_core::ops::STAT_NUMBERS + oam_core::ops::STAT_EXACT) * 8;
+
+/// Writes `record` into the first STAT_RECORD_BYTES of `cells`, in the
+/// platform's byte order, which is the order a typed array reads.
+fn write_stat_record(cells: &[std::cell::Cell<u8>], record: &oam_core::ops::StatRecord) {
+    let doubles = record.numbers.iter().map(|value| value.to_ne_bytes());
+    let integers = record.exact.iter().map(|value| value.to_ne_bytes());
+    for (slot, bytes) in cells.chunks_exact(8).zip(doubles.chain(integers)) {
+        for (cell, byte) in slot.iter().zip(bytes) {
+            cell.set(byte);
+        }
+    }
+}
+
+/// An async stat's result: a Float64Array over a buffer of its own, since
+/// the promise's reaction runs after other stats may have completed. The
+/// JS side reads the integers through a BigInt64Array over the same buffer.
+pub(crate) fn stat_record_array<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    record: &oam_core::ops::StatRecord,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let buffer = v8::ArrayBuffer::new(scope, STAT_RECORD_BYTES);
+    write_stat_record(&buffer.get_backing_store(), record);
+    let array = v8::Float64Array::new(scope, buffer, 0, oam_core::ops::STAT_NUMBERS)?;
+    Some(array.into())
+}
+
+/// The Float64Array a sync stat writes into: the caller's, reused across
+/// calls, as node's sync stats fill its binding's one `statValues` array and
+/// the JS side constructs the Stats from it at once -- no allocation, and no
+/// JSON for V8 to parse, per stat. Throws a TypeError (and answers None)
+/// when the argument is not one with room for a whole record past its
+/// offset.
+fn stat_values_arg<'a>(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'a>,
+    index: i32,
+) -> Option<v8::Local<'a, v8::Float64Array>> {
+    let array = v8::Local::<v8::Float64Array>::try_from(args.get(index))
+        .ok()
+        .filter(|array| {
+            array.buffer(scope).is_some_and(|buffer| {
+                buffer.byte_length() >= array.byte_offset() + STAT_RECORD_BYTES
+            })
+        });
+    if array.is_none() {
+        throw_type_error(
+            scope,
+            "stat values must be a Float64Array with room for a stat",
+        );
+    }
+    array
+}
+
+/// Writes `record` into `values` (from stat_values_arg) and returns it.
+fn return_stat_record(
+    scope: &mut v8::PinScope<'_, '_>,
+    rv: &mut v8::ReturnValue<'_, v8::Value>,
+    values: v8::Local<'_, v8::Float64Array>,
+    record: &oam_core::ops::StatRecord,
+) {
+    let Some(buffer) = values.buffer(scope) else {
+        return;
+    };
+    let store = buffer.get_backing_store();
+    let cells: &[std::cell::Cell<u8>] = &store;
+    let start = values.byte_offset();
+    if let Some(cells) = cells.get(start..start + STAT_RECORD_BYTES) {
+        write_stat_record(cells, record);
+        rv.set(values.into());
+    }
+}
+
+/// A listing's `[names, kinds]`: two arrays of strings, the kinds as the
+/// JS side names them ("file", "dir", "symlink"), internalized, so a
+/// `kind === "dir"` against a literal compares one pointer. Built here in
+/// place of a JSON array of `{name, kind}` objects V8 had to parse back.
+pub(crate) fn listing_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    listing: &oam_core::ops::DirListing,
+) -> Option<v8::Local<'s, v8::Value>> {
+    use oam_core::ops::EntryKind;
+    let mut kind_names = [EntryKind::File, EntryKind::Dir, EntryKind::Symlink]
+        .into_iter()
+        .map(|kind| {
+            v8::String::new_from_one_byte(
+                scope,
+                kind.name().as_bytes(),
+                v8::NewStringType::Internalized,
+            )
+            .map(v8::Local::<v8::Value>::from)
+        });
+    let kind_names = [
+        kind_names.next()??,
+        kind_names.next()??,
+        kind_names.next()??,
+    ];
+    let names = listing
+        .names
+        .iter()
+        .map(|name| v8::String::new(scope, name).map(v8::Local::<v8::Value>::from))
+        .collect::<Option<Vec<_>>>()?;
+    let kinds: Vec<v8::Local<v8::Value>> = listing
+        .kinds
+        .iter()
+        .map(|kind| kind_names[*kind as usize])
+        .collect();
+    let names = v8::Array::new_with_elements(scope, &names);
+    let kinds = v8::Array::new_with_elements(scope, &kinds);
+    Some(v8::Array::new_with_elements(scope, &[names.into(), kinds.into()]).into())
+}
+
 fn return_url_obj(
     scope: &mut v8::PinScope<'_, '_>,
     rv: &mut v8::ReturnValue<'_, v8::Value>,
@@ -6710,6 +6824,10 @@ fn op_fs_stat_sync(
         return;
     };
     let lstat = args.get(1).is_true();
+    // args[3]: the Float64Array the stat is written into and returned.
+    let Some(values) = stat_values_arg(scope, &args, 3) else {
+        return;
+    };
     // statSync / lstatSync's `throwIfNoEntry`, passed as the caller gave
     // it: as in node's binding only `false` itself turns the throw off, and
     // then only for a path that is not there -- ENOENT, or ENOTDIR for one
@@ -6717,8 +6835,8 @@ fn op_fs_stat_sync(
     // here rather than catching in JS spares the existence check the error
     // object and its stack, which is the point of the option.
     let no_throw_if_no_entry = args.get(2).is_false();
-    match oam_core::ops::stat_path_json(path.os(), lstat) {
-        Ok(json) => return_json(scope, &mut rv, &json),
+    match oam_core::ops::stat_path_record(path.os(), lstat) {
+        Ok(record) => return_stat_record(scope, &mut rv, values, &record),
         Err(e)
             if no_throw_if_no_entry
                 && matches!(oam_core::node_error_code(&e), "ENOENT" | "ENOTDIR") =>
@@ -6755,7 +6873,7 @@ fn op_fs_readdir_sync(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     // args[1]: the file system's own order, for opendir's Dir (see
-    // oam_core::ops::readdir_to_json).
+    // oam_core::ops::read_dir_listing).
     let raw = args.get(1).is_true();
     // args[2]: with `raw`, a failure names the path, as the directory a
     // recursive Dir descends into is opened by node's sync binding with its
@@ -6765,8 +6883,12 @@ fn op_fs_readdir_sync(
     let Some(path) = scandir_path_arg(scope, &args, raw, "readdirSync requires a path") else {
         return;
     };
-    match oam_core::ops::readdir_to_json(path.os(), raw) {
-        Ok(json) => return_json(scope, &mut rv, &json),
+    match oam_core::ops::read_dir_listing(path.os(), raw) {
+        Ok(listing) => {
+            if let Some(value) = listing_value(scope, &listing) {
+                rv.set(value);
+            }
+        }
         Err(e) if raw && named => throw_node_error(scope, "opendir", &path, &e),
         // node's opendirSync names its syscall and no path (`ENOTDIR: not a
         // directory, opendir`), on every platform; opendir and
@@ -8190,23 +8312,26 @@ fn op_fs_close_sync(
     }
 }
 
-/// fsFstatSync(fd) -> stat json (same shape as statSync). Throws EBADF if the
-/// fd is unknown.
+/// fsFstatSync(fd, values) -> values, the stat written into it as statSync
+/// writes one. Throws EBADF if the fd is unknown.
 fn op_fs_fstat_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let fd = fd_arg(scope, args.get(0));
+    let Some(values) = stat_values_arg(scope, &args, 1) else {
+        return;
+    };
     let files = core_runtime!(scope).sync_files();
     // Adopts an inherited fd, as in op_fs_read_sync. fstat has no path to
     // reopen from, so the extra fields come off the descriptor itself.
     let Some(file) = registered_fd(scope, &files, fd, "fstat") else {
         return;
     };
-    match oam_core::ops::fstat_to_json(&file) {
+    match oam_core::ops::fstat_record(&file) {
         Err(e) => throw_fd_op_error(scope, "fstat", &e),
-        Ok(json) => return_json(scope, &mut rv, &json),
+        Ok(record) => return_stat_record(scope, &mut rv, values, &record),
     }
 }
 

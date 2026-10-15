@@ -546,7 +546,7 @@
       for (let i = 0; i < parts.length; i++) {
         current = current === root ? root + parts[i] : current + pathMod.sep + parts[i];
         const stat = yield ["lstat", current];
-        if (stat.kind === "symlink") {
+        if (statKind(stat) === "symlink") {
           // node stats the link (so a dangling one fails `stat`), reads it,
           // and starts over from the resolved path.
           if (++hops > 40) return;
@@ -9973,28 +9973,88 @@
   // size; see stat_extras in oam_core).
   const STAT_OPTIONAL_FIELDS = ["dev", "nlink", "uid", "gid", "rdev", "blksize", "ino", "blocks"];
 
-  // A stat payload from the natives as a Stats, or with `bigint` (the
-  // caller's `options.bigint === true`) a BigIntStats. Its exact values come
-  // from the payload's `big` string, because the JSON numbers are doubles:
-  // an NTFS file ID is often past 2^53 and a nanosecond time always is.
-  function wrapStat(raw, bigint = false) {
+  // A stat from the natives is a Float64Array laid out as oam_core's
+  // StatRecord: node's fourteen Stats values in its constructor's order,
+  // then the kind, whether the optional fields were read, and a Windows
+  // reparse tag (-1 for none); the same buffer holds, past the doubles, a
+  // BigInt64Array of the ten integers exact and each time's seconds and
+  // nanoseconds. These mirror the STAT_* constants there.
+  const STAT_NUMBERS = 17;
+  const STAT_EXACT = 18;
+  const STAT_KIND = 14;
+  const STAT_IDS_KNOWN = 15;
+  const STAT_REPARSE_TAG = 16;
+  // Two of the fourteen, read off a record without a Stats.
+  const STAT_SIZE = 8;
+  const STAT_MTIME_MS = 11;
+  const STAT_RECORD_BYTES = (STAT_NUMBERS + STAT_EXACT) * 8;
+  // oam_core's EntryKind, by discriminant: the names a listing's kinds and
+  // a Dirent's `_kind` use.
+  const STAT_KIND_NAMES = ["file", "dir", "symlink"];
+  // The one record every sync stat writes into and returns, as node's sync
+  // stats fill its binding's `statValues`: no allocation and no JSON per
+  // stat. A caller reads it before its next stat -- every one builds its
+  // Stats, or takes the one value it wanted, at once.
+  const statSyncBuffer = new ArrayBuffer(STAT_RECORD_BYTES);
+  const statSyncValues = new Float64Array(statSyncBuffer, 0, STAT_NUMBERS);
+  const statSyncExact = new BigInt64Array(statSyncBuffer, STAT_NUMBERS * 8, STAT_EXACT);
+
+  // A record's kind name ("file", "dir" or "symlink").
+  function statKind(record) {
+    return STAT_KIND_NAMES[record[STAT_KIND]];
+  }
+
+  // The file's identity exactly, "dev:ino" as unsigned decimals, which
+  // `dev` and `ino` as numbers are not once an NTFS file ID passes 2^53;
+  // undefined where they could not be read. fs.cp's same-file checks.
+  function statFileId(record) {
+    if (record[STAT_IDS_KNOWN] === 0) return undefined;
+    const exact = statExactValues(record);
+    return `${BigInt.asUintN(64, exact[0])}:${BigInt.asUintN(64, exact[7])}`;
+  }
+
+  function statExactValues(record) {
+    return record === statSyncValues
+      ? statSyncExact
+      : new BigInt64Array(record.buffer, record.byteOffset + STAT_NUMBERS * 8, STAT_EXACT);
+  }
+
+  // A stat record from the natives as a Stats, or with `bigint` (the
+  // caller's `options.bigint === true`) a BigIntStats. A BigIntStats takes
+  // the exact integers, because the doubles are not: an NTFS file ID is
+  // often past 2^53 and a nanosecond time always is.
+  function wrapStat(record, bigint = false) {
     let stats;
     if (bigint) {
-      const exact = raw.big.split(" ").map((value) => (value === "-" ? undefined : BigInt(value)));
-      stats = new BigIntStats(...exact);
+      const e = statExactValues(record);
+      stats = new BigIntStats(
+        e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8], e[9],
+        e[10] * 1000000000n + e[11], e[12] * 1000000000n + e[13],
+        e[14] * 1000000000n + e[15], e[16] * 1000000000n + e[17],
+      );
     } else {
+      const r = record;
       stats = new Stats(
-        raw.dev, raw.mode, raw.nlink, raw.uid, raw.gid, raw.rdev, raw.blksize, raw.ino,
-        raw.size, raw.blocks, raw.atimeMs, raw.mtimeMs, raw.ctimeMs, raw.birthtimeMs,
+        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13],
       );
     }
     // A field this platform could not supply stays ABSENT rather than an
-    // own property holding undefined, which deepStrictEqual and
+    // own property holding a placeholder, which deepStrictEqual and
     // JSON.stringify would both treat as an answer.
-    for (const key of STAT_OPTIONAL_FIELDS) {
-      if (raw[key] === undefined) delete stats[key];
+    if (record[STAT_IDS_KNOWN] === 0) {
+      for (const key of STAT_OPTIONAL_FIELDS) delete stats[key];
     }
     return stats;
+  }
+
+  // A listing from the natives is `[names, kinds]` (oam_core's DirListing).
+  function wrapDirents(parent, listing, withFileTypes) {
+    // The names array is the listing's own, made for this call.
+    if (!withFileTypes) return listing[0];
+    const [names, kinds] = listing;
+    const dirents = [];
+    for (let i = 0; i < names.length; i++) dirents.push(new Dirent(names[i], parent, kinds[i]));
+    return dirents;
   }
 
   // What a stat of nothing reads as: libuv's zeroed uv_stat_t, which
@@ -10130,8 +10190,8 @@
     #queue = null;
     // node's signature (handle, path, options), so `length` is 3 and a Dir
     // made without a handle throws ERR_MISSING_ARGS, as node's does (#286).
-    // The handle here is { natives, entries }: the natives the walk opens
-    // subdirectories with, and the top directory's listing.
+    // The handle here is { natives, listing }: the natives the walk opens
+    // subdirectories with, and the top directory's listing ([names, kinds]).
     constructor(handle, path, options) {
       // node refuses only a missing handle (null or undefined).
       if (handle == null) throw new codes.ERR_MISSING_ARGS("handle");
@@ -10141,7 +10201,7 @@
       validateInteger(opts.bufferSize, "options.bufferSize", 1, 4294967295);
       this.#natives = handle.natives;
       this.#path = path;
-      this.#handle = { entries: handle.entries, index: 0 };
+      this.#handle = { listing: handle.listing, index: 0 };
       this.#recursive = opts.recursive;
       this.#bufferSize = opts.bufferSize;
     }
@@ -10150,15 +10210,20 @@
       if (!(#path in this)) throw codes.ERR_INVALID_THIS("Dir");
       return this.#path;
     }
-    // A handle's next chunk, or null once it has no entries left.
+    // A handle's next chunk -- its listing and the range of it -- or null
+    // once it has no entries left.
     #readHandle(handle) {
-      if (handle.index >= handle.entries.length) return null;
-      const chunk = handle.entries.slice(handle.index, handle.index + this.#bufferSize);
-      handle.index += chunk.length;
-      return chunk;
+      const names = handle.listing[0];
+      if (handle.index >= names.length) return null;
+      const start = handle.index;
+      handle.index = Math.min(names.length, start + this.#bufferSize);
+      return { listing: handle.listing, start, end: handle.index };
     }
     #buffer(parentPath, chunk) {
-      for (const entry of chunk) this.#buffered.push(makeDirent(parentPath, entry));
+      const [names, kinds] = chunk.listing;
+      for (let i = chunk.start; i < chunk.end; i++) {
+        this.#buffered.push(new Dirent(names[i], parentPath, kinds[i]));
+      }
     }
     // node's #processHandlerQueue: whether an entry is buffered once the
     // opened subdirectories have had their turn.
@@ -10182,8 +10247,8 @@
       const dirent = this.#buffered.shift();
       if (this.#recursive && dirent.isDirectory()) {
         const path = registry.get("path").join(dirent.parentPath, dirent.name);
-        const entries = this.#natives.fsReaddirSync(path, true, true);
-        this.#handlers.push({ handle: { entries, index: 0 }, path });
+        const listing = this.#natives.fsReaddirSync(path, true, true);
+        this.#handlers.push({ handle: { listing, index: 0 }, path });
       }
       return dirent;
     }
@@ -10378,20 +10443,15 @@
       reading = Promise.reject(e);
     }
     reading.then(
-      (entries) => {
+      (listing) => {
         requests?.end(token);
-        process.nextTick(() => callback(null, new Dir({ natives, entries }, dirPath, opts)));
+        process.nextTick(() => callback(null, new Dir({ natives, listing }, dirPath, opts)));
       },
       (err) => {
         requests?.end(token);
         process.nextTick(callback, err);
       },
     );
-  }
-
-  function wrapDirents(parent, entries, withFileTypes) {
-    if (!withFileTypes) return entries.map((e) => e.name);
-    return entries.map((e) => new Dirent(e.name, parent, e.kind));
   }
 
   // readdir with `recursive`, as node v22.22.2's lib/fs.js and
@@ -10405,17 +10465,18 @@
   // pops its queue), so its order differs, as node's does.
   function readdirIsDir(natives, file) {
     try {
-      return natives.fsStatSync(file, false).kind === "dir";
+      return statKind(natives.fsStatSync(file, false, true, statSyncValues)) === "dir";
     } catch {
       return false;
     }
   }
-  function readdirFound(natives, base, dir, entries, withFileTypes, out, queue, direntFollows = true) {
+  function readdirFound(natives, base, dir, listing, withFileTypes, out, queue, direntFollows = true) {
     const join = registry.get("path").join;
-    for (const entry of entries) {
-      const full = join(dir, entry.name);
+    const [names, kinds] = listing;
+    for (let i = 0; i < names.length; i++) {
+      const full = join(dir, names[i]);
       if (withFileTypes) {
-        const dirent = new Dirent(entry.name, dir, entry.kind);
+        const dirent = new Dirent(names[i], dir, kinds[i]);
         out.push(dirent);
         if (dirent.isDirectory() || (direntFollows && readdirIsDir(natives, full))) queue.push(full);
       } else {
@@ -10450,12 +10511,6 @@
       for (const next of found) pending.push([next, await natives.fsReaddir(next)]);
     }
     return out;
-  }
-
-  function makeDirent(parentPath, entry) {
-    var name = typeof entry === "string" ? entry : entry.name;
-    var kind = typeof entry === "object" && entry.kind ? entry.kind : "file";
-    return new Dirent(name, parentPath, kind);
   }
 
   // -- glob support (Node v22 surface) --
@@ -10607,9 +10662,9 @@
   // recursed into; revisiting one would loop forever, so we throw ELOOP.
   function globWalk(opts, natives, cwd, segs, pos, base, visited, out, sep, absolutePattern) {
     var seg = segs[pos];
-    var entries;
+    var names, kinds;
     try {
-      entries = natives.fsReaddirSync(base);
+      [names, kinds] = natives.fsReaddirSync(base);
     } catch (e) {
       // Missing directories (ENOENT), non-directory paths (ENOTDIR), and any
       // other readdir failure are silently treated as zero matches -- matches
@@ -10652,9 +10707,9 @@
     // node's behavior here is what makes `**/*.js` with `exclude` keep files
     // directly inside `a/` while still dropping the contents of `a/b/`.
     var excludeFn = typeof opts.exclude === "function" ? opts.exclude : null;
-    for (var k = 0; k < entries.length; k++) {
-      var entry = entries[k];
-      var name = entry.name;
+    for (var k = 0; k < names.length; k++) {
+      var name = names[k];
+      var kind = kinds[k];
       // The leaf-name filter: for non-`**`, the entry's name must match the
       // segment pattern. For `**`, every name passes (the segment is just a
       // permission to traverse).
@@ -10699,7 +10754,7 @@
           // (function exclude was already handled by the leaf-name probe
           // above), so `exclude: ["foo.*"]` continues to drop `foo.js`.
           if (Array.isArray(opts.exclude) && matchExclude(opts.exclude, rel)) continue;
-          emitMatch(opts, natives, base, rel, childPath, entry.kind, out, sep, absolutePattern);
+          emitMatch(opts, natives, base, rel, childPath, kind, out, sep, absolutePattern);
         } else {
           // Empty match (node: `nextMatches && nextIndex === last && !isLast`):
           // emit the entry when it matches the NEXT segment. Mirrored inline
@@ -10709,23 +10764,23 @@
           // path, which would over-exclude `a/b.js` under a globstar.
           // nodir is the cheaper probe and gates every directory entry before
           // we pay for a regex match; check it first, then match the leaf.
-          if (opts.nodir === true && entry.kind === "dir") continue;
+          if (opts.nodir === true && kind === "dir") continue;
           if (
-            entry.kind !== "dir" &&
+            kind !== "dir" &&
             matchSegment(nextSeg, nextCompiled, nextIsMagic, name, false)
           ) {
             if (Array.isArray(opts.exclude) && matchExclude(opts.exclude, rel)) continue;
-            emitMatch(opts, natives, base, rel, childPath, entry.kind, out, sep, absolutePattern);
+            emitMatch(opts, natives, base, rel, childPath, kind, out, sep, absolutePattern);
           }
         }
-        if (entry.kind === "dir" || (opts.follow === true && entry.kind === "symlink")) {
+        if (kind === "dir" || (opts.follow === true && kind === "symlink")) {
           // node's `#addSubpattern` calls `this.#exclude(path)` with the
           // ENTRY's full relative path before queuing a descent. Mirror that
           // so an `exclude: p => p.startsWith('a/')` blocks descent into
           // `a/b/` (path 'a/b' starts with 'a/') while leaving `a/` itself
           // open (path 'a' does not).
           if (excludeFn && excludeFn(rel)) continue;
-          if (opts.follow === true && entry.kind === "symlink") {
+          if (opts.follow === true && kind === "symlink") {
             try { natives.fsReaddirSync(childPath); } catch (e) { continue; }
             if (visited.has(childPath)) {
               throw makeSystemError("ELOOP", "glob", childPath);
@@ -10733,14 +10788,14 @@
             visited.add(childPath);
           }
           globWalk(opts, natives, cwd, segs, pos, childPath, visited, out, sep, absolutePattern);
-          if (opts.follow === true && entry.kind === "symlink") visited.delete(childPath);
+          if (opts.follow === true && kind === "symlink") visited.delete(childPath);
         }
       } else if (isLast) {
-        if (opts.nodir === true && entry.kind === "dir") continue;
+        if (opts.nodir === true && kind === "dir") continue;
         if (opts.exclude && matchExclude(opts.exclude, rel)) continue;
-        emitMatch(opts, natives, base, rel, childPath, entry.kind, out, sep, absolutePattern);
-      } else if (entry.kind === "dir" || (opts.follow === true && entry.kind === "symlink")) {
-        if (opts.follow === true && entry.kind === "symlink") {
+        emitMatch(opts, natives, base, rel, childPath, kind, out, sep, absolutePattern);
+      } else if (kind === "dir" || (opts.follow === true && kind === "symlink")) {
+        if (opts.follow === true && kind === "symlink") {
           try { natives.fsReaddirSync(childPath); } catch (e) { continue; }
           if (visited.has(childPath)) {
             throw makeSystemError("ELOOP", "glob", childPath);
@@ -10748,7 +10803,7 @@
           visited.add(childPath);
         }
         globWalk(opts, natives, cwd, segs, pos + 1, childPath, visited, out, sep, absolutePattern);
-        if (opts.follow === true && entry.kind === "symlink") visited.delete(childPath);
+        if (opts.follow === true && kind === "symlink") visited.delete(childPath);
       }
     }
   }
@@ -11182,7 +11237,7 @@
       if (force && failed?.code === "ENOENT") return;
       throw failed;
     }
-    if (raw.kind === "dir" && !recursive) {
+    if (statKind(raw) === "dir" && !recursive) {
       const err = rmIsADirectory({ code: "EISDIR", message: "is a directory", path: file, syscall: "rm", errno: 21 });
       if (sync && Error.stackTraceLimit) Error.captureStackTrace(err, rmCheckTarget);
       throw err;
@@ -12590,7 +12645,8 @@
       if (lstat === null || !lstat.isSymbolicLink()) return false;
       if (!isWin) return true;
       try {
-        return globalThis.__oam.node.fsStatSync(p, true).reparseTag === IO_REPARSE_TAG_SYMLINK;
+        const record = globalThis.__oam.node.fsStatSync(p, true, true, statSyncValues);
+        return record[STAT_REPARSE_TAG] === IO_REPARSE_TAG_SYMLINK;
       } catch (e) {
         return true;
       }
@@ -12739,7 +12795,8 @@
   // Whether `a` (followed or not) and `b` (likewise) are one file, exactly.
   function cpSameAs(a, followA, b, followB) {
     try {
-      const idOf = (p, follow) => globalThis.__oam.node.fsStatSync(cpString(p), !follow).fileId;
+      const idOf = (p, follow) =>
+        statFileId(globalThis.__oam.node.fsStatSync(cpString(p), !follow, true, statSyncValues));
       const id = idOf(a, followA);
       return id !== undefined && id === idOf(b, followB);
     } catch (e) {
@@ -12752,7 +12809,8 @@
   // and `ino` as numbers are not once an NTFS file ID passes 2^53.
   function cpSamePath(a, b, follow) {
     try {
-      const idOf = (p) => globalThis.__oam.node.fsStatSync(cpString(p), !follow).fileId;
+      const idOf = (p) =>
+        statFileId(globalThis.__oam.node.fsStatSync(cpString(p), !follow, true, statSyncValues));
       const id = idOf(a);
       return id !== undefined && id === idOf(b);
     } catch (e) {
@@ -13465,7 +13523,7 @@
         } catch (e) {
           throw asRmdirError(e);
         }
-        if (raw.kind !== "dir") {
+        if (statKind(raw) !== "dir") {
           // As in the sync twin: node's full system-error shape.
           throw makeSystemError(isWin ? "ENOENT" : "ENOTDIR", "rmdir", fsErrorPath(dir));
         }
@@ -13681,7 +13739,11 @@
       try {
         while (!step.done) {
           const [op, at] = step.value;
-          step = walk.next(op === "readlink" ? natives.fsReadlinkSync(at) : natives.fsStatSync(at, op === "lstat"));
+          step = walk.next(
+            op === "readlink"
+              ? natives.fsReadlinkSync(at)
+              : natives.fsStatSync(at, op === "lstat", true, statSyncValues),
+          );
         }
       } catch (e) {
         return e;
@@ -13957,7 +14019,7 @@
       var prevMtime = 0;
       var closed = false;
       try {
-        prevMtime = natives.fsStatSync(filePath, false).mtimeMs;
+        prevMtime = natives.fsStatSync(filePath, false, true, statSyncValues)[STAT_MTIME_MS];
       } catch (e) {
         // node starts its watcher at the call, and a path that cannot be
         // watched -- one that is not there -- throws then, as libuv's error
@@ -13981,8 +14043,8 @@
         natives.fsStat(filePath, false).then(function (stat) {
           // A stat already in flight when close() ran reports nothing.
           if (closed) return;
-          if (stat.mtimeMs !== prevMtime) {
-            prevMtime = stat.mtimeMs;
+          if (stat[STAT_MTIME_MS] !== prevMtime) {
+            prevMtime = stat[STAT_MTIME_MS];
             var parts = filePath.replace(/\\/g, "/").split("/");
             var base = parts[parts.length - 1] || filePath;
             watcher.emit("change", "change", base);
@@ -14037,7 +14099,7 @@
     function statSyncAt(path, options, lstat) {
       const file = toPath(path);
       const bigint = options.bigint === true;
-      const raw = natives.fsStatSync(file, lstat, options.throwIfNoEntry);
+      const raw = natives.fsStatSync(file, lstat, options.throwIfNoEntry, statSyncValues);
       return raw === undefined ? undefined : wrapStat(raw, bigint);
     }
 
@@ -14085,7 +14147,7 @@
       var bigint = opts.bigint === true;
       var prev;
       try {
-        prev = wrapStat(natives.fsStatSync(filePath, false), bigint);
+        prev = wrapStat(natives.fsStatSync(filePath, false, true, statSyncValues), bigint);
       } catch (e) {
         // A file that is not there reads as libuv's zeroed stat -- every
         // field 0, not just the few this placeholder used to carry.
@@ -14277,7 +14339,7 @@
         if (!force || !recursive) {
           let raw, failed;
           try {
-            raw = natives.fsStatSync(file, true);
+            raw = natives.fsStatSync(file, true, true, statSyncValues);
           } catch (e) {
             failed = e;
           }
@@ -14292,11 +14354,11 @@
         const dir = toPath(path);
         let raw;
         try {
-          raw = natives.fsStatSync(dir, true);
+          raw = natives.fsStatSync(dir, true, true, statSyncValues);
         } catch (e) {
           throw asRmdirError(e);
         }
-        if (raw.kind !== "dir") {
+        if (statKind(raw) !== "dir") {
           // Full system-error shape, not just a code: node sets syscall/path/
           // errno here as it does on any other rmdir failure.
           throw makeSystemError(
@@ -14380,7 +14442,7 @@
       fstatSync: (fd, options = STAT_DEFAULT_OPTIONS) => {
         const bigint = options.bigint === true;
         validateFd(fd, true);
-        return wrapStat(natives.fsFstatSync(fd), bigint);
+        return wrapStat(natives.fsFstatSync(fd, statSyncValues), bigint);
       },
       // node's argument order (lib/fs.js, v22.22.2): the buffer, the options
       // object, the offset, the length, and only then the descriptor -- so a
@@ -14430,7 +14492,7 @@
       opendirSync: function opendirSync(path, options) {
         const dirPath = toPath(path);
         const opts = fsGetOptions(options, OPENDIR_DEFAULTS);
-        return new Dir({ natives, entries: natives.fsReaddirSync(opendirPath(dirPath), true) }, dirPath, opts);
+        return new Dir({ natives, listing: natives.fsReaddirSync(opendirPath(dirPath), true) }, dirPath, opts);
       },
       cpSync: function cpSync(src, dest, options) {
         const opts = validateCpOptions(options);
@@ -15078,7 +15140,7 @@
       let bytes;
       try {
         const raw = await natives.fsStat(file, false);
-        if (raw.kind === "dir") return directoryBlob(Number(raw.size), type);
+        if (statKind(raw) === "dir") return directoryBlob(Number(raw[STAT_SIZE]), type);
         bytes = await natives.fsReadFile(file);
       } catch {
         // Deliberately swallowing the underlying error: node reports none of

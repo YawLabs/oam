@@ -915,6 +915,26 @@ pub(crate) fn settle_completion(
                 }
             }
         }
+        OpOutcome::Stat(record) => match crate::node_ops::stat_record_array(tc, &record) {
+            Some(value) => {
+                resolver.resolve(tc, value);
+            }
+            None => {
+                let message = v8::String::new(tc, "op produced an unviewable stat").unwrap();
+                let exception = v8::Exception::error(tc, message);
+                resolver.reject(tc, exception);
+            }
+        },
+        OpOutcome::Listing(listing) => match crate::node_ops::listing_value(tc, &listing) {
+            Some(value) => {
+                resolver.resolve(tc, value);
+            }
+            None => {
+                let message = v8::String::new(tc, "op result too long for V8 string").unwrap();
+                let exception = v8::Exception::error(tc, message);
+                resolver.reject(tc, exception);
+            }
+        },
         OpOutcome::Bytes(bytes) => {
             let len = bytes.len();
             let store = v8::ArrayBuffer::new_backing_store_from_bytes(bytes.into_boxed_slice())

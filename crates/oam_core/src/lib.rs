@@ -203,6 +203,15 @@ pub enum OpOutcome {
     /// Raw bytes; the engine surfaces a Uint8Array over a fresh backing
     /// store (JS wraps it in Buffer where node: semantics apply).
     Bytes(Vec<u8>),
+    /// A stat (stat, lstat, fstat): the engine resolves with a Float64Array
+    /// over a fresh buffer laid out as [`ops::StatRecord`] describes, which
+    /// the JS side builds its Stats from. A new variant, so a replay file
+    /// recorded before it existed still loads.
+    Stat(ops::StatRecord),
+    /// A directory's entries (readdir, and opendir's listing): the engine
+    /// resolves with `[names, kinds]`, two arrays of strings. A new
+    /// variant, so a replay file recorded before it existed still loads.
+    Listing(ops::DirListing),
     Failed(String),
     /// A failure carrying a Node errno code (ENOENT, EACCES, ...). The
     /// engine rejects with an Error whose `.code` property is set —
@@ -5476,11 +5485,8 @@ pub mod ops {
         fn node_ms(self) -> f64 {
             self.node_sec() as f64 * 1000.0 + self.nsec as f64 / 1_000_000.0
         }
-
-        /// node's `nsFromTimeSpecBigInt`: the `*Ns` field of a BigIntStats.
-        fn node_ns(self) -> i128 {
-            i128::from(self.node_sec()) * 1_000_000_000 + i128::from(self.nsec)
-        }
+        // A BigIntStats' `*Ns` (node's `nsFromTimeSpecBigInt`) is made on
+        // the JS side, from the `node_sec` and `nsec` a StatRecord carries.
     }
 
     /// The information classes [`file_info`] reads and [`set_file_info`]
@@ -5728,10 +5734,10 @@ pub mod ops {
             .open(path)
     }
 
-    /// stat/lstat of a path as the JSON payload the JS side consumes.
+    /// stat/lstat of a path, as the record the JS side builds its Stats from.
     ///
     /// Blocking; async callers must run it on a blocking thread.
-    pub fn stat_path_json(path: &str, lstat: bool) -> std::io::Result<String> {
+    pub fn stat_path_record(path: &str, lstat: bool) -> std::io::Result<StatRecord> {
         // On Windows a plain stat reads EVERYTHING off one handle. Calling
         // std::fs::metadata first and then opening again for dev/ino/blocks
         // meant two opens per stat -- measured at 2x the cost -- because
@@ -5745,14 +5751,14 @@ pub mod ops {
         if !lstat {
             let file = open_for_stat(path, false)?;
             let meta = file.metadata()?;
-            return Ok(stat_to_json(&meta, StatSource::File(&file)));
+            return Ok(stat_record(&meta, StatSource::File(&file)));
         }
         let meta = if lstat {
             std::fs::symlink_metadata(path)?
         } else {
             std::fs::metadata(path)?
         };
-        Ok(stat_to_json(&meta, StatSource::Path(path)))
+        Ok(stat_record(&meta, StatSource::Path(path)))
     }
 
     /// statfs payload: the seven `uv_statfs_t` fields node's `fs.StatFs`
@@ -5896,16 +5902,129 @@ pub mod ops {
         }
     }
 
-    /// stat/lstat payload, shared with the sync native in oam_engine for a
-    /// single wire shape ({kind, size, mtimeMs, ...}).
-    pub fn stat_to_json(meta: &std::fs::Metadata, source: StatSource<'_>) -> String {
-        let kind = if meta.is_symlink() {
-            "symlink"
-        } else if meta.is_dir() {
-            "dir"
-        } else {
-            "file"
-        };
+    /// What an entry is, as far as the JS side's kind checks ask: a
+    /// directory, a symbolic link, or anything else (a "file"; a stat's
+    /// `mode` says which of the others). The discriminant is what a
+    /// [`StatRecord`] carries at [`STAT_KIND`], and the order of the names
+    /// the JS side maps it through.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[repr(u8)]
+    pub enum EntryKind {
+        File = 0,
+        Dir = 1,
+        Symlink = 2,
+    }
+
+    impl EntryKind {
+        fn of(file_type: std::fs::FileType) -> Self {
+            if file_type.is_symlink() {
+                EntryKind::Symlink
+            } else if file_type.is_dir() {
+                EntryKind::Dir
+            } else {
+                EntryKind::File
+            }
+        }
+
+        /// The name the JS side gives this kind (a Dirent's `_kind`).
+        pub fn name(self) -> &'static str {
+            match self {
+                EntryKind::File => "file",
+                EntryKind::Dir => "dir",
+                EntryKind::Symlink => "symlink",
+            }
+        }
+    }
+
+    /// How many doubles a [`StatRecord`] holds: node's fourteen Stats values
+    /// in its constructor's order (dev, mode, nlink, uid, gid, rdev, blksize,
+    /// ino, size, blocks, atimeMs, mtimeMs, ctimeMs, birthtimeMs), then
+    /// [`STAT_KIND`], [`STAT_IDS_KNOWN`] and [`STAT_REPARSE_TAG`]. The JS
+    /// side's `STAT_*` constants mirror these.
+    pub const STAT_NUMBERS: usize = 17;
+    /// Where a [`StatRecord`] keeps its [`EntryKind`].
+    pub const STAT_KIND: usize = 14;
+    /// 1 when the eight fields `std::fs::Metadata` does not carry (dev, ino,
+    /// nlink, uid, gid, rdev, blksize, blocks) were read, 0 when they could
+    /// not be -- the Stats then has none of them, rather than zeros.
+    pub const STAT_IDS_KNOWN: usize = 15;
+    /// A Windows reparse point's tag, read for an lstat of one (a symlink is
+    /// IO_REPARSE_TAG_SYMLINK, a junction IO_REPARSE_TAG_MOUNT_POINT); -1
+    /// everywhere else.
+    pub const STAT_REPARSE_TAG: usize = 16;
+    /// How many 64-bit integers a [`StatRecord`] holds: the ten integer
+    /// fields again, exact, then each time's seconds and nanoseconds
+    /// (atime, mtime, ctime, birthtime), from which a BigIntStats' `*Ns` is
+    /// `sec * 1e9 + nsec`, as node's `nsFromTimeSpecBigInt` makes it.
+    pub const STAT_EXACT: usize = 18;
+
+    /// A stat as node's binding hands it to JS: what its `statValues`
+    /// Float64Array and `bigintStatValues` BigInt64Array hold
+    /// (src/node_file-inl.h `FillStatsArray`), from which the JS side
+    /// constructs a Stats or a BigIntStats.
+    ///
+    /// The engine copies the two arrays into one ArrayBuffer -- the doubles,
+    /// then the integers -- and the JS side reads them through typed-array
+    /// views. It replaced a JSON payload, which the native serialized and V8
+    /// parsed back on every stat at more than the cost of the stat itself on
+    /// a warm file. The doubles are the numbers node reports, the `*Ms` ones
+    /// computed here in the same double arithmetic as its `msFromTimeSpec`;
+    /// the integers are exact where a double is not: an NTFS file ID is often
+    /// past 2^53, and a nanosecond time always is (#392).
+    ///
+    /// node's BigInt64Array reads an unsigned field through int64
+    /// (`static_cast<NativeT>`), and so do the integers here.
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    pub struct StatRecord {
+        pub numbers: [f64; STAT_NUMBERS],
+        pub exact: [i64; STAT_EXACT],
+    }
+
+    impl StatRecord {
+        /// Lays out one stat. `ids` are dev, nlink, uid, gid, rdev, blksize,
+        /// ino, blocks -- None when this platform could not read them.
+        fn new(
+            kind: EntryKind,
+            mode: u64,
+            size: u64,
+            ids: Option<[u64; 8]>,
+            times: [Timespec; 4],
+            reparse_tag: Option<u32>,
+        ) -> Self {
+            let [dev, nlink, uid, gid, rdev, blksize, ino, blocks] = ids.unwrap_or_default();
+            let integers = [dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks];
+            let mut numbers = [0.0; STAT_NUMBERS];
+            let mut exact = [0; STAT_EXACT];
+            for (at, value) in integers.into_iter().enumerate() {
+                // Rounded to the nearest double, as the u64 node stores into
+                // its Float64Array is.
+                numbers[at] = value as f64;
+                exact[at] = value as i64;
+            }
+            for (at, time) in times.into_iter().enumerate() {
+                numbers[10 + at] = time.node_ms();
+                exact[10 + 2 * at] = time.node_sec();
+                exact[11 + 2 * at] = time.nsec;
+            }
+            numbers[STAT_KIND] = f64::from(kind as u8);
+            numbers[STAT_IDS_KNOWN] = if ids.is_some() { 1.0 } else { 0.0 };
+            numbers[STAT_REPARSE_TAG] = reparse_tag.map_or(-1.0, f64::from);
+            StatRecord { numbers, exact }
+        }
+
+        /// The entry's kind (the record's [`STAT_KIND`]).
+        pub fn kind(&self) -> EntryKind {
+            match self.numbers[STAT_KIND] as u8 {
+                1 => EntryKind::Dir,
+                2 => EntryKind::Symlink,
+                _ => EntryKind::File,
+            }
+        }
+    }
+
+    /// The stat of `meta`, with the fields std does not carry read off
+    /// `source`; shared by stat, lstat and fstat, sync and async.
+    pub fn stat_record(meta: &std::fs::Metadata, source: StatSource<'_>) -> StatRecord {
         // `mode` was hardcoded to 0, which quietly broke every permission and
         // file-type test a caller might run on it (`mode & 0o111`, `mode &
         // S_IFMT`) -- and 0 is not "unknown", it reads as a real answer.
@@ -5951,94 +6070,25 @@ pub mod ops {
             .and_then(|extras| extras.ctime)
             .unwrap_or(mtime);
         let birthtime = Timespec::of(meta.created());
-        let mut payload = serde_json::json!({
-            "kind": kind,
-            "size": size,
-            "mtimeMs": mtime.node_ms(),
-            "atimeMs": atime.node_ms(),
-            "ctimeMs": ctime.node_ms(),
-            "birthtimeMs": birthtime.node_ms(),
-            "mode": mode,
-        });
-        let fields = payload
-            .as_object_mut()
-            .expect("json! macro built an object literal");
-        let known = extras.as_ref();
-        fields.insert(
-            "big".to_string(),
-            bigint_fields(
+        StatRecord::new(
+            EntryKind::of(meta.file_type()),
+            u64::from(mode),
+            size,
+            extras.as_ref().map(|extras| {
                 [
-                    known.map(|extras| extras.dev),
-                    Some(u64::from(mode)),
-                    known.map(|extras| extras.nlink),
-                    known.map(|extras| extras.uid),
-                    known.map(|extras| extras.gid),
-                    known.map(|extras| extras.rdev),
-                    known.map(|extras| extras.blksize),
-                    known.map(|extras| extras.ino),
-                    Some(size),
-                    known.map(|extras| extras.blocks),
-                ],
-                [atime, mtime, ctime, birthtime],
-            )
-            .into(),
-        );
-        if let Some(extras) = extras {
-            for (name, value) in [
-                ("dev", extras.dev),
-                ("ino", extras.ino),
-                ("nlink", extras.nlink),
-                ("uid", extras.uid),
-                ("gid", extras.gid),
-                ("rdev", extras.rdev),
-                ("blksize", extras.blksize),
-                ("blocks", extras.blocks),
-            ] {
-                fields.insert(name.to_string(), value.into());
-            }
-            // The file's identity exactly, which `dev` and `ino` as JSON
-            // numbers are not past 2^53 -- NTFS file IDs often are. Internal
-            // (Stats copies the fields it knows): fs.cp's same-file checks.
-            fields.insert(
-                "fileId".to_string(),
-                format!("{}:{}", extras.dev, extras.ino).into(),
-            );
-            if let Some(tag) = extras.reparse_tag {
-                fields.insert("reparseTag".to_string(), tag.into());
-            }
-        }
-        payload.to_string()
-    }
-
-    /// The payload's `big` field: a BigIntStats' fourteen values in node's
-    /// constructor order (dev, mode, nlink, uid, gid, rdev, blksize, ino,
-    /// size, blocks, atimeNs, mtimeNs, ctimeNs, birthtimeNs), as decimal
-    /// integers separated by spaces, `-` for one this platform could not
-    /// read (absent from the Stats too). Exact where the JSON numbers are
-    /// not: an NTFS file ID is often past 2^53, and a nanosecond time always
-    /// is (#392). One string rather than fourteen fields, so the payload of
-    /// a plain stat -- the common case, which never reads it -- stays small.
-    ///
-    /// node's BigIntStats array is a BigInt64Array, so an unsigned field is
-    /// read through int64 (src/node_file-inl.h `static_cast<NativeT>`), and
-    /// that is what is sent.
-    fn bigint_fields(integers: [Option<u64>; 10], times: [Timespec; 4]) -> String {
-        use std::fmt::Write;
-        let mut out = String::with_capacity(160);
-        for value in integers {
-            match value {
-                Some(value) => write!(out, "{} ", value as i64),
-                None => write!(out, "- "),
-            }
-            .expect("writing to a String cannot fail");
-        }
-        for (at, time) in times.into_iter().enumerate() {
-            if at > 0 {
-                out.push(' ');
-            }
-            write!(out, "{}", time.node_ns()).expect("writing to a String cannot fail");
-        }
-        out
+                    extras.dev,
+                    extras.nlink,
+                    extras.uid,
+                    extras.gid,
+                    extras.rdev,
+                    extras.blksize,
+                    extras.ino,
+                    extras.blocks,
+                ]
+            }),
+            [atime, mtime, ctime, birthtime],
+            extras.and_then(|extras| extras.reparse_tag),
+        )
     }
 
     /// The order libuv's scandir hands node's `readdir`: on unix sorted by
@@ -6046,12 +6096,12 @@ pub mod ops {
     /// Windows the file system's own, which NTFS already keeps sorted by
     /// its own collation, so nothing is imposed there.
     #[cfg(not(windows))]
-    fn sort_as_scandir(found: &mut [(std::ffi::OsString, &'static str)]) {
+    fn sort_as_scandir(found: &mut [(std::ffi::OsString, EntryKind)]) {
         use std::os::unix::ffi::OsStrExt;
         found.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     }
     #[cfg(windows)]
-    fn sort_as_scandir(_found: &mut [(std::ffi::OsString, &'static str)]) {}
+    fn sort_as_scandir(_found: &mut [(std::ffi::OsString, EntryKind)]) {}
 
     /// What libuv reports where std's `read_dir` (FindFirstFileW on
     /// `path\*`) failed. std fails ERROR_DIRECTORY for anything that is no
@@ -6147,13 +6197,26 @@ pub mod ops {
         rest.is_some_and(|rest| !rest.is_empty() && !rest.contains(['\\', '/']))
     }
 
+    /// A directory's entries as two parallel lists, the shape node's
+    /// binding hands readdir's JS (`[names, types]` with `withFileTypes`):
+    /// the engine turns it into an array of names and an array of kind
+    /// names, so a plain readdir returns the first as it is and only a
+    /// Dirent listing walks both. It replaced a JSON array of `{name, kind}`
+    /// objects, which the native serialized and V8 parsed back -- at 2.8x
+    /// node's cost for a 2000-entry directory.
+    #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+    pub struct DirListing {
+        pub names: Vec<String>,
+        pub kinds: Vec<EntryKind>,
+    }
+
     /// The entries of `path` as node hands them out: `readdir`'s come from
     /// libuv's scandir, sorted on unix (`sort_as_scandir`); `raw` asks for
     /// the file system's own order, which is what `opendir`'s Dir reads
     /// through uv_fs_readdir on every platform. Measured on node v22.23 on
     /// macOS (APFS returns `a, top.txt, lnk, c, b`; readdir answers
     /// `a, b, c, lnk, top.txt`) and Linux.
-    pub fn readdir_to_json(path: &str, raw: bool) -> std::io::Result<String> {
+    pub fn read_dir_listing(path: &str, raw: bool) -> std::io::Result<DirListing> {
         let mut found = Vec::new();
         // readdir of a path std would list and libuv refuses: refused here
         // first, as libuv's open refuses it.
@@ -6179,7 +6242,7 @@ pub mod ops {
                     })
                     && scandir_open(path).is_ok() =>
             {
-                return Ok("[]".to_string());
+                return Ok(DirListing::default());
             }
             listing => listing.map_err(|e| listing_error(path, raw, e))?,
         };
@@ -6187,26 +6250,22 @@ pub mod ops {
         let listing = std::fs::read_dir(path)?;
         for entry in listing {
             let entry = entry?;
-            let kind = match entry.file_type() {
-                Ok(t) if t.is_symlink() => "symlink",
-                Ok(t) if t.is_dir() => "dir",
-                _ => "file",
-            };
+            // An entry whose type cannot be read is a "file", as before.
+            let kind = entry.file_type().map_or(EntryKind::File, EntryKind::of);
             found.push((entry.file_name(), kind));
         }
         if !raw {
             sort_as_scandir(&mut found);
         }
-        let entries: Vec<serde_json::Value> = found
-            .iter()
-            .map(|(name, kind)| {
-                serde_json::json!({
-                    "name": name.to_string_lossy(),
-                    "kind": kind,
-                })
-            })
-            .collect();
-        Ok(serde_json::Value::Array(entries).to_string())
+        let mut listed = DirListing {
+            names: Vec::with_capacity(found.len()),
+            kinds: Vec::with_capacity(found.len()),
+        };
+        for (name, kind) in found {
+            listed.names.push(name.to_string_lossy().into_owned());
+            listed.kinds.push(kind);
+        }
+        Ok(listed)
     }
 
     pub async fn fs_read_file(path: super::FsPath) -> OpOutcome {
@@ -6308,9 +6367,9 @@ pub mod ops {
         // tokio's metadata and THEN opening a handle here would do the second
         // (blocking) open on a runtime thread.
         let owned = path.clone();
-        let result = tokio::task::spawn_blocking(move || stat_path_json(owned.os(), lstat)).await;
+        let result = tokio::task::spawn_blocking(move || stat_path_record(owned.os(), lstat)).await;
         match result {
-            Ok(Ok(json)) => OpOutcome::Json(json),
+            Ok(Ok(record)) => OpOutcome::Stat(record),
             Ok(Err(e)) => node_fail(e, if lstat { "lstat" } else { "stat" }, &path),
             Err(e) => node_fail(
                 std::io::Error::other(e.to_string()),
@@ -6325,15 +6384,15 @@ pub mod ops {
     /// Takes the descriptor's shared handle rather than the registry, so the
     /// caller never holds the file-registry lock across the blocking read.
     pub async fn fs_fstat(file: super::OpenFile) -> OpOutcome {
-        let result = tokio::task::spawn_blocking(move || fstat_to_json(&file)).await;
+        let result = tokio::task::spawn_blocking(move || fstat_record(&file)).await;
         match result {
-            Ok(Ok(json)) => OpOutcome::Json(json),
+            Ok(Ok(record)) => OpOutcome::Stat(record),
             Ok(Err(e)) => node_fail_fd_op(e, "fstat"),
             Err(e) => node_fail_fd_op(std::io::Error::other(e.to_string()), "fstat"),
         }
     }
 
-    /// The stat payload of an open descriptor, as libuv's fstat builds it --
+    /// The stat of an open descriptor, as libuv's fstat builds it --
     /// shared by the sync and async fstat.
     ///
     /// On Windows a descriptor need not be a disk file: 0-2 are often a pipe,
@@ -6354,7 +6413,7 @@ pub mod ops {
     /// none of, and fails ERROR_INVALID_FUNCTION -- the table's `EISDIR`, what
     /// node reports for `fstat` of `openSync("\\\\.\\CON", "w")` (#331). The
     /// same question tells NUL, which answers it, from such a console.
-    pub fn fstat_to_json(file: &std::fs::File) -> std::io::Result<String> {
+    pub fn fstat_record(file: &std::fs::File) -> std::io::Result<StatRecord> {
         #[cfg(windows)]
         {
             use std::io::IsTerminal;
@@ -6378,43 +6437,20 @@ pub mod ops {
             };
             if let Some((mode, device_type, ino, blksize)) = device {
                 let rdev = device_type << 16;
-                return Ok(serde_json::json!({
-                    "kind": "file",
-                    "size": 0,
-                    "mtimeMs": 0,
-                    "atimeMs": 0,
-                    "ctimeMs": 0,
-                    "birthtimeMs": 0,
-                    "mode": mode,
-                    "dev": 0,
-                    "ino": ino,
-                    "nlink": 1,
-                    "uid": 0,
-                    "gid": 0,
-                    "rdev": rdev,
-                    "blksize": blksize,
-                    "blocks": 0,
-                    "big": bigint_fields(
-                        [
-                            Some(0),
-                            Some(mode),
-                            Some(1),
-                            Some(0),
-                            Some(0),
-                            Some(rdev),
-                            Some(blksize),
-                            Some(ino),
-                            Some(0),
-                            Some(0),
-                        ],
-                        [Timespec::default(); 4],
-                    ),
-                })
-                .to_string());
+                // dev, nlink, uid, gid, rdev, blksize, ino, blocks; every
+                // time 0.
+                return Ok(StatRecord::new(
+                    EntryKind::File,
+                    mode,
+                    0,
+                    Some([0, 1, 0, 0, rdev, blksize, ino, 0]),
+                    [Timespec::default(); 4],
+                    None,
+                ));
             }
         }
         file.metadata()
-            .map(|meta| stat_to_json(&meta, StatSource::File(file)))
+            .map(|meta| stat_record(&meta, StatSource::File(file)))
     }
 
     pub async fn fs_statfs(path: super::FsPath) -> OpOutcome {
@@ -6430,12 +6466,12 @@ pub mod ops {
     pub async fn fs_readdir(path: super::FsPath, raw: bool) -> OpOutcome {
         match tokio::task::spawn_blocking({
             let path = path.clone();
-            move || readdir_to_json(path.os(), raw)
+            move || read_dir_listing(path.os(), raw)
         })
         .await
         .unwrap_or_else(|e| Err(std::io::Error::other(e)))
         {
-            Ok(json) => OpOutcome::Json(json),
+            Ok(listing) => OpOutcome::Listing(listing),
             // node's Dir is opened by uv_fs_opendir, and says so.
             Err(e) => node_fail(e, if raw { "opendir" } else { "scandir" }, &path),
         }
@@ -8160,6 +8196,88 @@ mod os_error_code_tests {
         dir
     }
 
+    /// A stat record's layout, as the engine copies it and the JS side reads
+    /// it (`STAT_*` in js/node_compat.js): the fourteen Stats values in
+    /// node's constructor order, the kind, the ids flag and the reparse tag
+    /// as doubles; the integers again exact, then each time's seconds and
+    /// nanoseconds, from which the doubles' `*Ms` are node's
+    /// `sec * 1e3 + nsec / 1e6`.
+    #[test]
+    fn a_stat_record_is_laid_out_as_the_js_side_reads_it() {
+        let dir = whole_file_dir("stat-record");
+        let file = dir.join("five.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let record = ops::stat_path_record(file.to_str().unwrap(), false).unwrap();
+        assert_eq!(record.kind(), ops::EntryKind::File);
+        assert_eq!(record.numbers[8], 5.0, "size");
+        assert_eq!(record.exact[8], 5, "size, exact");
+        assert_eq!(
+            record.numbers[1] as i64 & 0o170000,
+            0o100000,
+            "mode: S_IFREG"
+        );
+        assert_eq!(
+            record.numbers[1] as i64, record.exact[1],
+            "mode, both forms"
+        );
+        assert_eq!(record.numbers[ops::STAT_IDS_KNOWN], 1.0);
+        assert_eq!(record.numbers[ops::STAT_REPARSE_TAG], -1.0);
+        for (at, value) in record.exact[..10].iter().enumerate() {
+            assert_eq!(record.numbers[at], *value as u64 as f64, "integer {at}");
+        }
+        for time in 0..4 {
+            let (sec, nsec) = (record.exact[10 + 2 * time], record.exact[11 + 2 * time]);
+            assert!(
+                (0..1_000_000_000).contains(&nsec),
+                "time {time}: nsec {nsec}"
+            );
+            assert_eq!(
+                record.numbers[10 + time],
+                sec as f64 * 1000.0 + nsec as f64 / 1_000_000.0,
+                "time {time}"
+            );
+        }
+        let record = ops::stat_path_record(dir.to_str().unwrap(), true).unwrap();
+        assert_eq!(record.kind(), ops::EntryKind::Dir);
+        assert_eq!(record.numbers[ops::STAT_KIND], 1.0);
+        let opened = std::fs::File::open(&file).unwrap();
+        let by_fd = ops::fstat_record(&opened).unwrap();
+        assert_eq!((by_fd.kind(), by_fd.exact[8]), (ops::EntryKind::File, 5));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A listing's two lists run in step, each name with its own kind; on
+    /// unix sorted as libuv's scandir sorts, bytewise.
+    #[test]
+    fn a_listing_pairs_each_name_with_its_kind() {
+        let dir = whole_file_dir("listing-kinds");
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+        std::fs::create_dir(dir.join("a")).unwrap();
+        std::fs::write(dir.join("C.txt"), b"c").unwrap();
+        let listed = ops::read_dir_listing(dir.to_str().unwrap(), false).unwrap();
+        assert_eq!(listed.names.len(), listed.kinds.len());
+        let mut pairs: Vec<(String, ops::EntryKind)> =
+            listed.names.into_iter().zip(listed.kinds).collect();
+        #[cfg(not(windows))]
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["C.txt", "a", "b.txt"]
+        );
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            pairs,
+            [
+                ("C.txt".to_string(), ops::EntryKind::File),
+                ("a".to_string(), ops::EntryKind::Dir),
+                ("b.txt".to_string(), ops::EntryKind::File),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The error a locked region gives a read or write: ERROR_LOCK_VIOLATION
     /// on Windows (node: EBUSY), and EIO standing in for any read failure
     /// elsewhere.
@@ -8660,8 +8778,8 @@ mod os_error_code_tests {
         let file = dir.join("f.txt");
         std::fs::write(&file, b"f").unwrap();
         let file_s = file.to_str().unwrap();
-        let code = |path: &str, raw: bool| match ops::readdir_to_json(path, raw) {
-            Ok(json) => panic!("{path} listed: {json}"),
+        let code = |path: &str, raw: bool| match ops::read_dir_listing(path, raw) {
+            Ok(listing) => panic!("{path} listed: {listing:?}"),
             Err(e) => node_error_code(&e),
         };
         for raw in [false, true] {
@@ -8690,9 +8808,11 @@ mod os_error_code_tests {
         // A directory lists either way, and a root keeps the one it has.
         let listed = FsPath::for_scandir(format!(r"{dir_s}\"));
         assert!(
-            ops::readdir_to_json(listed.os(), false)
+            ops::read_dir_listing(listed.os(), false)
                 .unwrap()
-                .contains("f.txt")
+                .names
+                .iter()
+                .any(|name| name == "f.txt")
         );
         let root = FsPath::for_scandir(format!(r"{}\", &dir_s[..2]));
         assert!(
@@ -9442,7 +9562,7 @@ mod tests {
         let registry: FileRegistry =
             std::sync::Arc::new(std::sync::Mutex::new(FileState::default()));
         let stderr = registered_file(&registry, 2).expect("stderr is a descriptor");
-        assert!(ops::fstat_to_json(&stderr).is_ok());
+        assert!(ops::fstat_record(&stderr).is_ok());
         assert!(close_descriptor(&registry, 2));
         assert!(registered_file(&registry, 2).is_some());
         assert!(registered_file(&registry, OWN_FD_BASE + 12345).is_none());
