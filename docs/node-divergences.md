@@ -1464,7 +1464,7 @@ the `close()` -- in the same tick or later -- binds the port again: its bind wai
 closed one to land and let the port go. A failed bind's `'error'` with no listener is an
 uncaught exception, and `'close'` and `cb` still follow it. A second `listen()` throws
 `ERR_SERVER_ALREADY_LISTEN` as Node's does, except during a host lookup, which it supersedes.
-Up to 0.19.1 a `close()` in that window closed nothing: the bind landed afterwards and the
+Up to 0.19.0 a `close()` in that window closed nothing: the bind landed afterwards and the
 server listened and served (net, http, https, http2) or kept the port bound with nothing
 accepting (tls), and `close(cb)` never called back (#369).
 
