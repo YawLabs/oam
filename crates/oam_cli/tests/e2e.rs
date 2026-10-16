@@ -6267,10 +6267,13 @@ cl-late-end-silent finalized=false"##;
 /// open is still in flight closes the descriptor that open brings back. It
 /// used to keep it: cancel ran while there was no fd yet, the open then
 /// landed and stored one, and nothing closed it until the reader was
-/// collected. 300 such cancels left about 300 extra OS handles open on
-/// Windows (node v22.22.2: flat). The count is the process's HandleCount on
-/// Windows and its /dev/fd entries elsewhere; the margin allows for the
-/// runtime's own handles, never for one per cancel.
+/// collected. The check looks at file descriptors alone, not the process's
+/// whole handle count: 300 cancels can grow tokio's blocking pool by up to a
+/// thread per in-flight open, which idles out on its own and is no leak. On
+/// Windows an open file keeps its directory from being renamed, so the
+/// directory must become renamable; elsewhere the /dev/fd entries must come
+/// back to their count before the loop. Either is polled for up to 5 s, the
+/// time the in-flight opens need to land and close.
 #[test]
 fn open_as_blob_cancel_during_open_closes_the_fd() {
     let stdout = run_ok(
@@ -6278,16 +6281,18 @@ fn open_as_blob_cancel_during_open_closes_the_fd() {
         "import fs from 'node:fs';\n\
          import os from 'node:os';\n\
          import path from 'node:path';\n\
-         import { execFileSync } from 'node:child_process';\n\
-         const open = () => process.platform === 'win32'\n\
-           ? Number(execFileSync('powershell.exe', ['-NoProfile', '-Command',\n\
-               `(Get-Process -Id ${process.pid}).HandleCount`]).toString().trim())\n\
-           : fs.readdirSync('/dev/fd').length;\n\
          const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-blob-cancel-'));\n\
          const file = path.join(dir, 'a.bin');\n\
          fs.writeFileSync(file, Buffer.alloc(1000, 1));\n\
          const blob = await fs.openAsBlob(file);\n\
-         const before = open();\n\
+         const fds = () => fs.readdirSync('/dev/fd').length;\n\
+         const before = process.platform === 'win32' ? 0 : fds();\n\
+         let moved = dir;\n\
+         const closed = () => {\n\
+           if (process.platform !== 'win32') return fds() <= before;\n\
+           try { fs.renameSync(dir, dir + '-moved'); moved = dir + '-moved'; return true; }\n\
+           catch { return false; }\n\
+         };\n\
          for (let i = 0; i < 300; i++) {\n\
            const stream = blob.stream();\n\
            await new Promise((r) => setImmediate(r));\n\
@@ -6296,13 +6301,13 @@ fn open_as_blob_cancel_during_open_closes_the_fd() {
            await reader.cancel();\n\
            await read;\n\
          }\n\
-         await new Promise((r) => setTimeout(r, 300));\n\
-         const grew = open() - before;\n\
-         console.log('grew:', grew, grew < 100 ? 'ok' : 'leaked');\n\
-         fs.rmSync(dir, { recursive: true });\n",
+         let ok = false;\n\
+         for (let t = 0; t < 100 && !(ok = closed()); t++) await new Promise((r) => setTimeout(r, 50));\n\
+         console.log('fds closed:', ok ? 'ok' : 'leaked');\n\
+         fs.rmSync(moved, { recursive: true });\n",
     );
     assert!(
-        stdout.contains(" ok"),
+        stdout.contains("fds closed: ok"),
         "a cancel during the first open must close the fd it brings back: {stdout}"
     );
 }
