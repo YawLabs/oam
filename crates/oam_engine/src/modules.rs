@@ -3590,9 +3590,23 @@ fn require_esm_sync(
     tc.get_slot_mut::<RequireDepth>()
         .expect("require depth installed")
         .0 += 1;
+    // A graph that fails here only throws from the require() call, so a
+    // throw its load noted as the run's fatal error is not one (#399, as
+    // dyn_import_load has it): a worker that catches it must not later hand
+    // its parent this error in place of the one that ends its run. One left
+    // uncaught is noted again on the fatal path it takes.
+    let noted_before = tc
+        .get_slot::<FatalThrown>()
+        .is_some_and(|noted| noted.0.is_some());
     let required = require_esm_sync_inner(tc, host, key, parent);
     if let Some(depth) = tc.get_slot_mut::<RequireDepth>() {
         depth.0 -= 1;
+    }
+    if required.is_err()
+        && !noted_before
+        && let Some(noted) = tc.get_slot_mut::<FatalThrown>()
+    {
+        noted.0 = None;
     }
     required
 }
