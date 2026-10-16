@@ -43439,7 +43439,11 @@
     }
   }
   function portScheduleDrain(port, state) {
-    if (state.drainScheduled || !state.started || state.closed || state.queue.length === 0) return;
+    if (state.drainScheduled || state.closed || state.queue.length === 0) return;
+    // A port that is not started still reads a close at the head of its
+    // queue -- node's ReceiveMessage lets a close message through when
+    // receiving is off -- but nothing else, and nothing behind a message.
+    if (!state.started && state.queue[0] !== kPortClose) return;
     state.drainScheduled = true;
     // From the loop's pending phase (timerPending): after the ticks and
     // microtasks the poster queued and before the immediates, where node's
@@ -43451,8 +43455,13 @@
       else (registry._setImmediate ?? globalThis.setImmediate)(fn);
     };
     later(() => {
-      if (!state.started || state.closed) {
+      if (state.closed) {
         state.drainScheduled = false;
+        return;
+      }
+      if (!state.started) {
+        state.drainScheduled = false;
+        if (state.queue[0] === kPortClose) portCloseLocal(port, state);
         return;
       }
       // What is queued now goes out as one batch, every message of it even
@@ -43473,6 +43482,16 @@
         if (item === kPortClose) {
           state.drainScheduled = false;
           portCloseLocal(port, state);
+          return;
+        }
+        // The last 'message' listener went part way (a once() that ran, an
+        // off() in a listener): node stops reading, so the rest of the
+        // batch stays queued, ahead of anything posted since, for the next
+        // listener to start the port again.
+        if (!state.started) {
+          state.queue = batch.slice(i).concat(state.queue);
+          state.drainScheduled = false;
+          portScheduleDrain(port, state);
           return;
         }
         hybridDispatch(port, item, "message", () => port[kPortCreateEvent](item, "message"));
