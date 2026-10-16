@@ -4220,6 +4220,16 @@ mod tests {
         let (pending, _) =
             super::worker_flags_js(None, false, &[], &env(&[("NODE_PENDING_DEPRECATION", "1")]));
         assert!(pending.contains("__oamPendingDeprecation"), "{pending}");
+        // --trace-require-module is per environment in node too: a worker's
+        // own execArgv sets it, and one given execArgv: [] does not have it.
+        let (traced, _) = super::worker_flags_js(
+            None,
+            false,
+            &args(&["--trace-require-module=all"]),
+            &env(&[]),
+        );
+        assert!(traced.contains("__oamTraceRequireModule"), "{traced}");
+        assert!(!none.contains("__oamTraceRequireModule"), "{none}");
         // A worker that inherits takes its creator's resolved options: a
         // worker given `--no-warnings` creates one with no options, and that
         // one has no 'warning' listener either. Given an execArgv instead, it
