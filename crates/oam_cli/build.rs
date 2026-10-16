@@ -150,7 +150,43 @@ const NAPI_EXPORTS: &[&str] = &[
     "uv_event_loop",
 ];
 
+/// The oam executable's main-thread stack reserve on Windows: 8 MiB, what
+/// node.exe's own PE header says (node v22.22.2, `SizeOfStackReserve`
+/// 8388608). Without it the linker's default applies, 1 MiB.
+///
+/// V8 places its JS stack limit ~984 KiB (its default `--stack-size`) below
+/// wherever the stack is when the isolate starts, and checks only JS frames
+/// against it. The native frames of an op called at that limit -- Rust op
+/// code, the libraries it calls, the OS -- live in whatever reserve is left
+/// below it. Under a 1 MiB reserve that was a few tens of KiB, and recursion
+/// that called copyFileSync, cpSync or zlib.deflateSync at the bottom of the
+/// JS stack killed a release build ("thread 'main' has overflowed its
+/// stack", 0xC00000FD) instead of throwing V8's RangeError (#395); a debug
+/// build's larger frames hit it with readdirSync and opendirSync too. 8 MiB
+/// leaves ~7 MiB under the limit, as node has, while the JS recursion depth
+/// -- set by V8's limit, not by the reserve -- stays node's. It is a
+/// reservation, not a commitment: pages are committed only as the stack
+/// grows into them.
+///
+/// Linux and macOS need nothing: the main thread's stack there is
+/// RLIMIT_STACK (8 MiB by default), the same for node and oam.
+const WINDOWS_MAIN_STACK_RESERVE: u64 = 8 * 1024 * 1024;
+
 fn main() {
+    // Before the napi early return below: the stack reserve is not a napi
+    // concern, and a build with `napi` off needs it as much.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+            Ok("msvc") => {
+                println!("cargo:rustc-link-arg-bins=/STACK:{WINDOWS_MAIN_STACK_RESERVE}");
+            }
+            Ok("gnu") => {
+                println!("cargo:rustc-link-arg-bins=-Wl,--stack,{WINDOWS_MAIN_STACK_RESERVE}");
+            }
+            _ => {}
+        }
+    }
+
     // Cargo re-runs a build script when the package's feature set changes, so
     // this branch is part of the fingerprint -- flipping `napi` off relinks
     // without the export machinery rather than reusing a stale link arg.

@@ -391,6 +391,25 @@ pub(crate) fn shared_env_set(id: u64, name: &str, value: Option<String>) -> Opti
     Some(env.version)
 }
 
+/// The stack every thread that runs a non-main isolate is spawned with (a
+/// worker, a fork's prewarmed or cold-started isolate): 4 MiB, node's own
+/// worker thread size (`kStackSize` in src/node_worker.cc, the default of
+/// `resourceLimits.stackSizeMb`).
+///
+/// Rust's default for a spawned thread is 2 MiB. V8 puts its JS stack limit
+/// ~984 KiB below where the isolate starts and checks only JS frames against
+/// it, so the native frames of an op called at that limit get whatever lies
+/// below. 4 MiB leaves ~3 MiB, so deep recursion through a sync op on a
+/// worker ends in V8's RangeError and never in a native stack overflow that
+/// kills the process (#395, the main thread's side is oam_cli/build.rs).
+///
+/// It is a reservation: pages are committed as the stack grows into them.
+/// node additionally moves the worker's V8 limit down to 192 KiB above the
+/// stack's end, giving worker JS ~3.8 MiB to recurse in where oam's keeps
+/// V8's default; that depth difference is recorded in
+/// docs/node-divergences.md.
+pub(crate) const ISOLATE_THREAD_STACK_SIZE: usize = 4 * 1024 * 1024;
+
 /// Spawn a worker thread. Returns (worker_id, thread_id). The caller
 /// must store the returned handles in the parent's WorkerRegistry.
 pub(crate) struct WorkerOptions {
@@ -413,6 +432,7 @@ pub(crate) fn spawn_worker(
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("oam-worker-{worker_id}"))
+        .stack_size(ISOLATE_THREAD_STACK_SIZE)
         .spawn(move || {
             let exit_code = run_worker(
                 &script_path,

@@ -91,6 +91,7 @@ impl ForkPool {
         let permissions = pool.permissions.clone();
         std::thread::Builder::new()
             .name("oam-fork-prewarm".to_string())
+            .stack_size(super::worker::ISOLATE_THREAD_STACK_SIZE)
             .spawn(move || {
                 // Pre-warm: pay the JsRuntime::new() cost before a request arrives.
                 // Use the worker constructor (NO fork pool) -- a prewarm
