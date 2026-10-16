@@ -849,18 +849,24 @@ pub fn raw_close_fd(reg: &RawChildRegistry, id: u64, fd: u32) {
     let Some(child) = guard.get_mut(&id) else {
         return;
     };
-    match child.fds.get_mut(&fd) {
-        // Taking the handle out drops it here, which is the close. A write in
-        // flight holds its own handle and closes it when it finishes.
-        Some(FdEnd::Write(h)) => drop(h.take()),
-        Some(FdEnd::Read(end)) => {
+    // A read end is shared, so capture it before the entry goes to close it
+    // (cancel a read blocked in ReadFile); a write end is taken by the entry
+    // removal, which is the close.
+    let read_end = match child.fds.get(&fd) {
+        Some(FdEnd::Read(end)) => Some(Arc::clone(end)),
+        Some(FdEnd::Write(_)) | None => None,
+    };
+    // Removing the entry drops a present write handle here -- AND drops the
+    // slot, so a write still in flight (it holds its own handle and re-inserts
+    // only while the slot is present) closes its handle when it finishes
+    // instead of resurrecting the closed pipe.
+    if child.fds.remove(&fd).is_some() {
+        if let Some(end) = read_end {
             end.close();
-            child.fds.remove(&fd);
-            if child.fds.is_empty() && child.process.is_none() {
-                guard.remove(&id);
-            }
         }
-        None => {}
+        if child.fds.is_empty() && child.process.is_none() {
+            guard.remove(&id);
+        }
     }
 }
 
