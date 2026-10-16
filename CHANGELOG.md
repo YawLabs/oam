@@ -50,6 +50,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`fs.readdir` honours `encoding: "buffer"`, as node's does.** Each entry was returned as a
+  string regardless of the option, so `Buffer.isBuffer(entry)` was false; with `{ encoding:
+  "buffer" }` (and with `withFileTypes`) a name is now a `Buffer` of its raw UTF-8 bytes, as node
+  returns. Every other encoding, and the default, are unchanged; `recursive: true` together with
+  `"buffer"` throws node's `ERR_INVALID_ARG_TYPE` on a non-empty directory.
 - **Buffer's string paths no longer encode into a temporary, and match node where they did not.**
   `Buffer.from(string)`, `buf.write`, `Buffer.byteLength` and `TextEncoder` encoded into a scratch
   array and copied it over; they now encode straight into the destination, and `byteLength` counts
