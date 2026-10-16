@@ -734,26 +734,36 @@ The flags and the hint are #364.
 
 ## Module loading and the CLI
 
-### 7. A typeless `.js` file is ESM in oam and CommonJS in Node
+### 7. A typeless `.js` file — FIXED, no longer a divergence
 
-This is the divergence most likely to bite you first.
+This entry used to record oam's ESM-first rule: with no `"type"` in the nearest
+`package.json`, oam ran a project `.js` file as an ES module, where Node runs it as
+CommonJS, so `require` was not defined in a plain script that Node runs.
 
-With no `"type"` field in the nearest `package.json`, oam treats a project `.js` file as
-an ES module. Node treats it as CommonJS.
+oam now decides such a file as Node 22 does. A `.js` file whose nearest `package.json` has
+no `"type"` (or a `"type"` other than `"module"` or `"commonjs"`, which Node reads as none),
+or that has no `package.json` above it at all, is CommonJS unless it has module syntax:
+an `import` or `export` statement, `import.meta`, a top-level `await`, or a top-level
+declaration of a name the CommonJS wrapper owns (`const require`). With module syntax it is
+an ES module, so a file that mixes `import` with `require()` fails on `require`, as in
+Node. This holds for the entry, `import`, `import()`, `require()`, `createRequire`, a
+`Worker`'s entry and a `fork()`ed child, and inside `node_modules` too, where Node applies
+the same test. oam uses Node's own test (`containsModuleSyntax`, ported as
+`contains_module_syntax` in `crates/oam_engine/src/cjs.rs`).
 
-```js
-// app.js, package.json has no "type"
-const p = require('path');       // Node: works.  oam: ReferenceError: require is not defined
-```
+When the test makes a file an ES module and a `package.json` without `"type"` scopes it,
+oam emits Node's `MODULE_TYPELESS_PACKAGE_JSON` warning, once per `package.json`, through
+`process.emitWarning` (so `--no-warnings` silences it and a `'warning'` listener sees it),
+and not for a file under `node_modules`, a `require()`, or a file with no `package.json`.
+Conformance cases 462-465 pin the shapes byte for byte against Node.
 
-Files **inside `node_modules`** keep Node's CommonJS default, so dependencies resolve the
-way their authors intended; the ESM-first default applies to your own project files.
-Node 22 will reparse a typeless `.js` as ESM if it sees module syntax, with a
-`MODULE_TYPELESS_PACKAGE_JSON` warning — so the ESM direction works in both runtimes, and
-only the `require()` direction diverges.
+What still differs: `require()` of such a file that has module syntax throws
+`ERR_REQUIRE_ESM` (entry 9), and the warning has no trace hint line (entry 51). A typeless
+`.ts`/`.tsx` is still an ES module whatever its syntax (entry 24), and a typeless `.jsx`
+outside `node_modules` too: Node runs no JSX to follow.
 
-Fixes, in order of preference: add `"type": "commonjs"` to your `package.json`, rename the
-file to `.cjs`, or convert it to `import`.
+To keep a file an ES module without the warning, add `"type": "module"` to its
+`package.json` or name it `.mjs`.
 
 ### 8. The `"module"` field is preferred over `"main"`
 
@@ -794,7 +804,9 @@ require('./util.ts')   // oam: ERR_REQUIRE_ESM.  Node 22 type stripping: works (
 Node 22's type stripping honors the package `"type"` walk for `.ts`, so the same file is
 CommonJS there and `require()` of it works. In oam, use `.cts` for TypeScript that must be
 require()d, or `import` it. (`.tsx`/`.jsx` DO follow the package `"type"` walk, like
-`.js`, and transpile on whichever path they land.)
+`.js`, and transpile on whichever path they land.) Under a `package.json` with no `"type"`,
+Node decides a `.ts` file by its syntax, as it does a `.js` file (entry 7); oam does not,
+and runs it as an ES module.
 
 ### 25. Source maps are always on, so `Error.prepareStackTrace` is pre-installed
 

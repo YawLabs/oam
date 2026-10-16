@@ -1381,7 +1381,7 @@ fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode
             return ExitCode::from(9);
         }
 
-        let evaluated = if entry_module_kind(file) == oam_loader::ModuleKind::Cjs {
+        let evaluated = if rt.entry_module_kind(file) == oam_loader::ModuleKind::Cjs {
             rt.execute_cjs(file, &CliHost)
         } else {
             rt.execute_module(file, &CliHost)
@@ -2234,18 +2234,6 @@ fn script_is_file(arg: &str) -> bool {
     oam_engine::module_key(Path::new(arg)).is_ok_and(|key| oam_loader::fs_os_path(&key).is_file())
 }
 
-/// Which loader an entry file goes to, decided on the file's real location
-/// (module_key: absolute, links resolved), as node resolves its main entry.
-/// module_kind's package.json "type" walk starts from the path it is handed,
-/// so a relative `gate.js` only ever looked for ./package.json: a CommonJS
-/// script named from a subdirectory of its package routed as an ES module,
-/// and that path names no main module -- its `require.main === module`
-/// guard never ran, and it exited 0.
-fn entry_module_kind(file: &Path) -> oam_loader::ModuleKind {
-    let real = oam_engine::module_key(file).unwrap_or_else(|_| file.to_path_buf());
-    oam_loader::module_kind(&real)
-}
-
 fn run_file_with_flags(
     file: &Path,
     script_args: &[String],
@@ -2312,11 +2300,10 @@ fn run_file_with_flags(
         let _ = rt.execute_script("<flags>", &format!("globalThis.process.execArgv = {json};"));
     }
 
-    // Entry routing follows module kind: .cjs (or "type": "commonjs"
-    // project .js) runs as a CJS program through interop; everything else
-    // is the ESM graph. See oam_loader::module_kind for the typeless
-    // default divergence.
-    let result = if entry_module_kind(file) == oam_loader::ModuleKind::Cjs {
+    // Entry routing follows module kind: .cjs, a "type": "commonjs" .js, or
+    // a typeless .js without module syntax runs as a CJS program through
+    // interop; everything else is the ESM graph, as in node.
+    let result = if rt.entry_module_kind(file) == oam_loader::ModuleKind::Cjs {
         rt.execute_cjs(file, &CliHost)
     } else {
         rt.execute_module(file, &CliHost)

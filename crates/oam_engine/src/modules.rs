@@ -129,6 +129,11 @@ fn node_runs_as_esm(scope: &mut v8::PinScope<'_, '_>, host: &dyn ModuleHost, pat
     if let Some(kind) = oam_loader::node_declared_module_kind(path) {
         return kind == oam_loader::ModuleKind::Esm;
     }
+    // A typeless .js oam has already decided as node does.
+    let key = module_key(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(kind) = crate::cjs::detected_kind(scope, &key) {
+        return kind == oam_loader::ModuleKind::Esm;
+    }
     let typescript = matches!(
         path.extension().and_then(|e| e.to_str()),
         Some("ts" | "tsx" | "mts" | "cts")
@@ -2033,7 +2038,14 @@ impl<'scope, 'env> GraphPrefetcher<'scope, 'env> {
         if path.extension().and_then(|e| e.to_str()) == Some("json") {
             return false;
         }
+        // A file node decides by its syntax is only known to be an ES module
+        // once the isolate has tested it, so it is front-run on a guess: a
+        // typeless project file an ES module imports is usually one, a
+        // typeless file under node_modules usually CommonJS. A guess that
+        // loses costs a read nobody takes (the CommonJS branch loads it).
         oam_loader::module_kind(path) != oam_loader::ModuleKind::Cjs
+            || (oam_loader::kind_from_syntax(path)
+                && !path.components().any(|c| c.as_os_str() == "node_modules"))
     }
 
     /// Hand `path` to the pool if it is eligible and not already requested.
@@ -2153,6 +2165,28 @@ fn load_module_graph_overlapped(
         // Set when the pool loaded this path: the worker's cache probe
         // (key + blob) rides along so nothing is hashed or read twice.
         let mut prefetched = None;
+        // A file CommonJS by its kind runs through the require machinery;
+        // one node decides by its syntax is tested as it is about to, and
+        // with module syntax comes back to load below as the ES module it
+        // is (load_cjs_or_detect).
+        let cjs_exports = if builtin.is_none()
+            && !is_json
+            && oam_loader::module_kind(&path) == oam_loader::ModuleKind::Cjs
+        {
+            match crate::cjs::load_cjs_or_detect(tc, &path) {
+                crate::cjs::CjsLoad::Exports(exports) => Some(exports),
+                crate::cjs::CjsLoad::Threw => {
+                    return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
+                }
+                crate::cjs::CjsLoad::Esm => {
+                    let key = module_key(&path).unwrap_or_else(|_| path.clone());
+                    crate::cjs::warn_typeless_package_json(tc, &key);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let code = if let Some(name) = builtin {
             let Some(exports) = crate::cjs::get_builtin(tc, &name) else {
                 return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
@@ -2168,10 +2202,7 @@ fn load_module_graph_overlapped(
                 return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
             };
             crate::cjs::facade_source(tc, &path, exports)
-        } else if oam_loader::module_kind(&path) == oam_loader::ModuleKind::Cjs {
-            let Some(exports) = crate::cjs::load_cjs(tc, &path) else {
-                return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
-            };
+        } else if let Some(exports) = cjs_exports {
             if let Some(failure) = run_ticks_and_microtasks(tc) {
                 return Err(failure);
             }
@@ -3005,8 +3036,13 @@ pub(crate) fn dynamic_import_callback<'s>(
     Some(promise)
 }
 
-/// Windows-safe file:// URL with minimal percent-encoding (space, #, ?, %).
-fn path_to_file_url(path: &Path) -> String {
+/// Windows-safe file:// URL, percent-encoding exactly the characters node's
+/// `ada` path encoder does -- the set `url.pathToFileURL` produces on
+/// v22.22.2: `"`, `#`, `%`, `<`, `>`, `?`, `[`, `]`, `^`, `` ` ``, `{`, `|`,
+/// `}`, `~` and a space, plus every non-ASCII code point as its UTF-8 bytes.
+/// (`[`/`]`/`~` matter in real names -- a `[id].js` route file -- not just the
+/// non-ASCII case.) Backslashes are already separate-normalized to `/` above.
+pub(crate) fn path_to_file_url(path: &Path) -> String {
     let slashed = path.to_string_lossy().replace('\\', "/");
     let mut out = String::from("file://");
     if !slashed.starts_with('/') {
@@ -3015,9 +3051,26 @@ fn path_to_file_url(path: &Path) -> String {
     for ch in slashed.chars() {
         match ch {
             ' ' => out.push_str("%20"),
+            '"' => out.push_str("%22"),
             '#' => out.push_str("%23"),
-            '?' => out.push_str("%3F"),
             '%' => out.push_str("%25"),
+            '<' => out.push_str("%3C"),
+            '>' => out.push_str("%3E"),
+            '?' => out.push_str("%3F"),
+            '[' => out.push_str("%5B"),
+            ']' => out.push_str("%5D"),
+            '^' => out.push_str("%5E"),
+            '`' => out.push_str("%60"),
+            '{' => out.push_str("%7B"),
+            '|' => out.push_str("%7C"),
+            '}' => out.push_str("%7D"),
+            '~' => out.push_str("%7E"),
+            c if !c.is_ascii() => {
+                let mut buf = [0u8; 4];
+                for byte in c.encode_utf8(&mut buf).bytes() {
+                    out.push_str(&format!("%{byte:02X}"));
+                }
+            }
             _ => out.push(ch),
         }
     }
@@ -3217,5 +3270,76 @@ mod fs_os_path_agreement_tests {
             );
             assert_eq!(loader.to_str(), Some(&*ops), "{row:?}");
         }
+    }
+}
+
+/// `path_to_file_url` must percent-encode exactly what node's `ada` path
+/// encoder does, since it feeds `import.meta.url` and the
+/// MODULE_TYPELESS_PACKAGE_JSON warning. The expected set is the one node
+/// v22.22.2's `url.pathToFileURL` produces (measured over every printable
+/// ASCII character plus é/中/😀); the `[`/`]`/`~` entries are the ones a
+/// minimal "space/#/?/%" encoder missed, and `[`/`]` appear in real names (a
+/// Next.js `[id].js` route). Backslashes are normalized to `/` before the
+/// percent pass, so a rooted Windows path yields no `%5C`.
+#[cfg(test)]
+mod path_to_file_url_tests {
+    use super::path_to_file_url;
+    use std::path::Path;
+
+    #[test]
+    fn encodes_ada_s_ascii_set_and_not_the_rest() {
+        // (char, expected encoded form) for the full ada set. A backslash is
+        // NOT here: it is normalized to `/` before the percent pass (see
+        // `normalizes_backslashes_without_percent_encoding_them`).
+        let encoded = [
+            (' ', "%20"),
+            ('"', "%22"),
+            ('#', "%23"),
+            ('%', "%25"),
+            ('<', "%3C"),
+            ('>', "%3E"),
+            ('?', "%3F"),
+            ('[', "%5B"),
+            (']', "%5D"),
+            ('^', "%5E"),
+            ('`', "%60"),
+            ('{', "%7B"),
+            ('|', "%7C"),
+            ('}', "%7D"),
+            ('~', "%7E"),
+        ];
+        for (ch, want) in encoded {
+            let url = path_to_file_url(Path::new(&format!("/p/a{ch}b.js")));
+            assert!(
+                url.ends_with(&format!("a{want}b.js")),
+                "{ch:?} must encode to {want}, got {url}"
+            );
+        }
+        // Characters ada leaves literal must NOT be encoded.
+        for ch in [
+            '!', '$', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/', ':', ';', '=', '@', '_',
+        ] {
+            let url = path_to_file_url(Path::new(&format!("/p/a{ch}b.js")));
+            assert!(
+                url.ends_with(&format!("a{ch}b.js")),
+                "{ch:?} must stay literal, got {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn encodes_non_ascii_as_utf8_bytes() {
+        assert!(path_to_file_url(Path::new("/p/café.js")).ends_with("caf%C3%A9.js"));
+        assert!(path_to_file_url(Path::new("/p/中.js")).ends_with("%E4%B8%AD.js"));
+        assert!(path_to_file_url(Path::new("/p/😀.js")).ends_with("%F0%9F%98%80.js"));
+    }
+
+    #[test]
+    fn normalizes_backslashes_without_percent_encoding_them() {
+        // A Windows path: separators become `/`, and the drive is prefixed so a
+        // bare `C:` does not read as a URL scheme.
+        let url = path_to_file_url(Path::new(r"C:\Users\app\mod.js"));
+        assert_eq!(url, "file:///C:/Users/app/mod.js");
+        assert!(!url.contains("%5C"), "no encoded backslash: {url}");
     }
 }

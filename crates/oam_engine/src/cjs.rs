@@ -1,9 +1,9 @@
 //! CommonJS interop: the bridge that makes the installed npm ecosystem run.
 //!
 //! Execution model: CJS modules are compiled with V8's CompileFunction
-//! (real line numbers, no textual wrapper) against the Node parameter list
-//! plus `global` — (exports, require, module, __filename, __dirname,
-//! global) — and executed EAGERLY: `require()` is synchronous by
+//! (real line numbers, no textual wrapper) against node's own parameter list
+//! (exports, require, module, __filename, __dirname) and executed EAGERLY:
+//! `require()` is synchronous by
 //! definition, and when the ESM graph loader hits a CJS file it executes
 //! it at load time, then reflects the ACTUAL runtime keys of
 //! `module.exports` as named exports through a generated ESM facade. ES2022
@@ -110,17 +110,17 @@ fn throw_syntax_error_with_code(scope: &mut v8::PinScope<'_, '_>, code: &str, me
     scope.throw_exception(exception);
 }
 
-/// CJS wrapper parameters, in order. Shared between the require() loader and
-/// the `oam compile` bytecode producer so their compiled functions -- and thus
-/// their V8 code-cache blobs -- are interchangeable.
-pub(crate) const CJS_PARAMS: [&str; 6] = [
-    "exports",
-    "require",
-    "module",
-    "__filename",
-    "__dirname",
-    "global",
-];
+/// CJS wrapper parameters, in order: node's `Module.wrapper` list exactly
+/// (`(exports, require, module, __filename, __dirname)`). Shared between the
+/// require() loader and the `oam compile` bytecode producer so their compiled
+/// functions -- and thus their V8 code-cache blobs -- are interchangeable.
+///
+/// `global` is deliberately NOT a parameter. An extra wrapper name would turn a
+/// top-level `const global = ...` (or `let`/`class global`) in a typeless `.js`
+/// into `Identifier 'global' has already been declared`, where node runs it.
+/// `global` is reachable as `globalThis.global` (set in js/node_compat.js).
+pub(crate) const CJS_PARAMS: [&str; 5] =
+    ["exports", "require", "module", "__filename", "__dirname"];
 
 /// Replace a leading `#!` shebang with a `//` comment, byte-for-byte so every
 /// source offset is preserved. Shared so the loader, the bytecode producer, and
@@ -218,9 +218,9 @@ pub(crate) fn contains_module_syntax(
     // `if (await x)` read as a call or a token out of place to a function.
     const MAYBE_TOP_LEVEL_AWAIT_ERRORS: [&str; 2] =
         ["missing ) after argument list", "SyntaxError: Unexpected"];
-    // node's GetCJSParameters: the wrapper's five names. oam's own wrapper
-    // adds `global`, which would make a top-level `const global` fail here
-    // where node's does not.
+    // node's GetCJSParameters: the wrapper's five names, which `CJS_PARAMS`
+    // now matches exactly (a `global` parameter would make a top-level
+    // `const global` fail here where node's does not).
     const NODE_CJS_PARAMS: [&str; 5] = ["exports", "require", "module", "__filename", "__dirname"];
     let source = strip_shebang(source.to_string());
     v8::tc_scope!(let tc, scope);
@@ -292,6 +292,149 @@ pub(crate) fn contains_module_syntax(
     let module = v8::script_compiler::compile_module(tc, &mut module_source);
     tc.reset();
     module.is_some()
+}
+
+/// What node's syntax detection decided for each file it applies to
+/// ([`oam_loader::kind_from_syntax`]), by module key, and which package.json
+/// files a MODULE_TYPELESS_PACKAGE_JSON warning has named. Per isolate, as
+/// node's loader state is per thread: a worker decides and warns for itself.
+#[derive(Default)]
+struct SyntaxKinds {
+    kinds: HashMap<PathBuf, oam_loader::ModuleKind>,
+    warned: std::collections::HashSet<PathBuf>,
+}
+
+fn syntax_kinds<'a>(scope: &'a mut v8::PinScope<'_, '_>) -> &'a mut SyntaxKinds {
+    if scope.get_slot::<SyntaxKinds>().is_none() {
+        scope.set_slot(SyntaxKinds::default());
+    }
+    scope.get_slot_mut::<SyntaxKinds>().expect("just set")
+}
+
+/// The kind detection already gave the file at module key `key`, if it ran.
+pub(crate) fn detected_kind(
+    scope: &mut v8::PinScope<'_, '_>,
+    key: &Path,
+) -> Option<oam_loader::ModuleKind> {
+    scope
+        .get_slot::<SyntaxKinds>()
+        .and_then(|kinds| kinds.kinds.get(key).copied())
+}
+
+/// Decide the file at module key `key`, whose `source` is as read (shebang
+/// and all), by node's test of its syntax, once: a file is one kind for the
+/// life of the isolate, as node's module caches keep it.
+fn detect_kind(
+    scope: &mut v8::PinScope<'_, '_>,
+    key: &Path,
+    source: &str,
+) -> oam_loader::ModuleKind {
+    if let Some(kind) = detected_kind(scope, key) {
+        return kind;
+    }
+    let kind = if contains_module_syntax(scope, source, &key.to_string_lossy()) {
+        oam_loader::ModuleKind::Esm
+    } else {
+        oam_loader::ModuleKind::Cjs
+    };
+    syntax_kinds(scope).kinds.insert(key.to_path_buf(), kind);
+    kind
+}
+
+/// The kind the file at `path` runs as, as node decides it: by extension or
+/// package.json "type" ([`oam_loader::module_kind`]), and for a file node
+/// decides by its syntax, by that -- CommonJS unless it has module syntax.
+/// For a program's or a worker's entry, which has to be routed before
+/// anything loads it; a module the loaders reach is decided as it is
+/// compiled ([`load_cjs_or_detect`]).
+pub(crate) fn module_kind_of(
+    scope: &mut v8::PinScope<'_, '_>,
+    path: &Path,
+) -> oam_loader::ModuleKind {
+    let key = module_key(path).unwrap_or_else(|_| path.to_path_buf());
+    if !oam_loader::kind_from_syntax(&key) {
+        return oam_loader::module_kind(&key);
+    }
+    if let Some(kind) = detected_kind(scope, &key) {
+        return kind;
+    }
+    // Unreadable: the loader it is routed to reports that.
+    let Ok(source) = std::fs::read_to_string(oam_loader::fs_os_path(&key)) else {
+        return oam_loader::module_kind(&key);
+    };
+    // A CommonJS bytecode blob for this exact source means it compiled as a
+    // CommonJS wrapper before -- with node's parameters -- so node's detection
+    // would find no module syntax: no test compile.
+    if crate::code_cache::enabled() {
+        let stripped = strip_shebang(source.clone());
+        let blob_key = crate::code_cache::key_for(&stripped, crate::code_cache::Kind::Function);
+        if crate::code_cache::load(&blob_key).is_some() {
+            syntax_kinds(scope)
+                .kinds
+                .insert(key, oam_loader::ModuleKind::Cjs);
+            return oam_loader::ModuleKind::Cjs;
+        }
+    }
+    detect_kind(scope, &key, &source)
+}
+
+/// node's MODULE_TYPELESS_PACKAGE_JSON warning (warnTypelessPackageJsonFile,
+/// lib/internal/modules/esm/get_format.js, v22.22.2), for the file at module
+/// key `key` that detection made an ES module, as the ES module loader loads
+/// it -- the entry, an import, an import(), a worker's entry; a require()
+/// never warns. Only for a package.json there is to add a "type" to, never
+/// under node_modules ("not the user's fault"), and once per package.json.
+/// Through process.emitWarning, so --no-warnings, 'warning' listeners and
+/// --trace-warnings see it as node's.
+pub(crate) fn warn_typeless_package_json(scope: &mut v8::PinScope<'_, '_>, key: &Path) {
+    if detected_kind(scope, key) != Some(oam_loader::ModuleKind::Esm)
+        || key.components().any(|c| c.as_os_str() == "node_modules")
+    {
+        return;
+    }
+    let Some(package_json) = oam_loader::package_scope(key) else {
+        return;
+    };
+    if !syntax_kinds(scope).warned.insert(package_json.clone()) {
+        return;
+    }
+    let message = format!(
+        "Module type of {} is not specified and it doesn't parse as CommonJS.\n\
+         Reparsing as ES module because module syntax was detected. This incurs a \
+         performance overhead.\n\
+         To eliminate this warning, add \"type\": \"module\" to {}.",
+        crate::modules::path_to_file_url(key),
+        package_json.display()
+    );
+    v8::tc_scope!(let tc, scope);
+    let context = tc.get_current_context();
+    let global = context.global(tc);
+    let (Some(process_key), Some(emit_key), Some(text), Some(code_key), Some(code)) = (
+        v8::String::new(tc, "process"),
+        v8::String::new(tc, "emitWarning"),
+        v8::String::new(tc, &message),
+        v8::String::new(tc, "code"),
+        v8::String::new(tc, "MODULE_TYPELESS_PACKAGE_JSON"),
+    ) else {
+        return;
+    };
+    let Some(process) = global
+        .get(tc, process_key.into())
+        .and_then(|p| p.to_object(tc))
+    else {
+        return;
+    };
+    let Some(emit) = process
+        .get(tc, emit_key.into())
+        .and_then(|f| v8::Local::<v8::Function>::try_from(f).ok())
+    else {
+        return;
+    };
+    let options = v8::Object::new(tc);
+    options.set(tc, code_key.into(), code.into());
+    // A throw from a patched emitWarning is not the loader's to report.
+    let _ = emit.call(tc, process.into(), &[text.into(), options.into()]);
+    tc.reset();
 }
 
 /// `__oam.requireCjs(path)`: pure cache lookup used by generated ESM
@@ -383,31 +526,88 @@ fn require_callback(
     }
     let is_json = path.extension().and_then(|e| e.to_str()) == Some("json");
     if !is_json && oam_loader::module_kind(&path) == oam_loader::ModuleKind::Esm {
-        throw_error_with_code(
-            scope,
-            "ERR_REQUIRE_ESM",
-            &format!(
-                "[ERR_REQUIRE_ESM] require() of ES module {} from {} is not supported — \
-                 use import instead, or a .cjs/.cts module where require() is needed",
-                path.display(),
-                referrer.display()
-            ),
-        );
+        throw_require_esm(scope, &path, Some(&referrer));
         return;
     }
-    if let Some(exports) = load_cjs(scope, &path) {
-        rv.set(exports);
+    // A typeless .js is CommonJS to require() unless its syntax says module,
+    // as node decides it (load_cjs_or_detect).
+    match load_cjs_or_detect(scope, &path) {
+        CjsLoad::Exports(exports) => rv.set(exports),
+        CjsLoad::Esm => throw_require_esm(scope, &path, Some(&referrer)),
+        CjsLoad::Threw => {}
     }
+}
+
+/// What [`load_cjs_or_detect`] made of a file.
+pub(crate) enum CjsLoad<'s> {
+    /// It ran (or had run) as CommonJS: its `module.exports`.
+    Exports(v8::Local<'s, v8::Value>),
+    /// node decides it by its syntax and it has module syntax: an ES module,
+    /// not run, nothing thrown.
+    Esm,
+    /// A JS exception is pending.
+    Threw,
 }
 
 /// Load (or return cached) the CJS module at `path` and return its
 /// `module.exports`. `None` means a JS exception is pending — callers in
 /// callback position just return; the graph loader converts it via its
 /// TryCatch. Re-entrant: module bodies call require, which lands back here
-/// on the same stack.
+/// on the same stack. A file node decides by its syntax that turns out to be
+/// an ES module throws ERR_REQUIRE_ESM, as require() of one does.
 pub(crate) fn load_cjs<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     path: &Path,
+) -> Option<v8::Local<'s, v8::Value>> {
+    match load_cjs_or_detect(scope, path) {
+        CjsLoad::Exports(exports) => Some(exports),
+        CjsLoad::Threw => None,
+        CjsLoad::Esm => {
+            throw_require_esm(scope, path, None);
+            None
+        }
+    }
+}
+
+/// [`load_cjs`], but a file node decides by its syntax
+/// ([`oam_loader::kind_from_syntax`]) that has module syntax comes back as
+/// [`CjsLoad::Esm`] for the caller to load as an ES module. The test runs
+/// where node's does, as the file is about to compile as CommonJS -- and not
+/// at all when a CommonJS bytecode blob for its source is consumed, which
+/// only a CommonJS compile produces -- so a CommonJS file pays no second
+/// compile on a warm run.
+pub(crate) fn load_cjs_or_detect<'s>(scope: &mut v8::PinScope<'s, '_>, path: &Path) -> CjsLoad<'s> {
+    let mut esm = false;
+    match load_cjs_inner(scope, path, &mut esm) {
+        Some(exports) => CjsLoad::Exports(exports),
+        None if esm => CjsLoad::Esm,
+        None => CjsLoad::Threw,
+    }
+}
+
+/// node's ERR_REQUIRE_ESM for `path`, required from `referrer` (or loaded as
+/// CommonJS by oam itself, with none).
+fn throw_require_esm(scope: &mut v8::PinScope<'_, '_>, path: &Path, referrer: Option<&Path>) {
+    let from = referrer
+        .map(|r| format!(" from {}", r.display()))
+        .unwrap_or_default();
+    throw_error_with_code(
+        scope,
+        "ERR_REQUIRE_ESM",
+        &format!(
+            "[ERR_REQUIRE_ESM] require() of ES module {}{from} is not supported — \
+             use import instead, or a .cjs/.cts module where require() is needed",
+            path.display(),
+        ),
+    );
+}
+
+/// The body of [`load_cjs_or_detect`]: None with `esm` set is an ES module
+/// and no exception.
+fn load_cjs_inner<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    path: &Path,
+    esm: &mut bool,
 ) -> Option<v8::Local<'s, v8::Value>> {
     let key = match module_key(path) {
         Ok(key) => key,
@@ -424,6 +624,13 @@ pub(crate) fn load_cjs<'s>(
     if let Some(module) = cached {
         let module = v8::Local::new(scope, &module);
         return module_exports(scope, module);
+    }
+    // Detection already made it an ES module (an import of it, or an
+    // earlier require).
+    let syntax_decides = oam_loader::kind_from_syntax(&key);
+    if syntax_decides && detected_kind(scope, &key) == Some(oam_loader::ModuleKind::Esm) {
+        *esm = true;
+        return None;
     }
 
     // N-API addons: dlopen + register, cached like any CJS module.
@@ -622,35 +829,10 @@ pub(crate) fn load_cjs<'s>(
         return Some(parsed);
     }
 
-    let exports = v8::Object::new(scope);
-    let exports_key = v8::String::new(scope, "exports")?;
-    module.set(scope, exports_key.into(), exports.into());
-    {
-        let global = v8::Global::new(scope, module);
-        scope
-            .get_slot_mut::<CjsCache>()
-            .expect("cjs cache installed")
-            .modules
-            .insert(key.clone(), global);
-    }
-    record_main(scope, &key, module);
-
     // Shebang: byte-for-byte replacement keeps every offset intact. Shared
     // with produce_cjs_code_cache so the cache key matches at compile time.
     let source = strip_shebang(source);
 
-    let source_v8 = match v8::String::new(scope, &source) {
-        Some(source_v8) => source_v8,
-        None => {
-            evict(scope, &key);
-            throw_error(scope, &format!("{file}: source too long for V8 string"));
-            return None;
-        }
-    };
-    let name: v8::Local<v8::Value> = filename_v8.into();
-    let origin = v8::ScriptOrigin::new(
-        scope, name, 0, 0, false, 0, None, false, false, /* is_module */ false, None,
-    );
     // V8 bytecode cache: consume a stored blob for this exact source if one
     // exists (skips the parse+compile) else compile fresh. The blob is keyed by
     // source + V8 version + oam format so a foreign blob can't be served here;
@@ -664,6 +846,45 @@ pub(crate) fn load_cjs<'s>(
         .then(|| crate::code_cache::key_for(&source, crate::code_cache::Kind::Function));
     let cached = cache_key.as_ref().and_then(crate::code_cache::load);
     let consuming = cached.is_some();
+
+    // A file with no declared kind is node's to decide by its syntax, before
+    // it is cached or named the main module: with module syntax it is an ES
+    // module, which the caller loads as one (or require() refuses). A blob
+    // consumed above came from a CommonJS compile of this very source, so
+    // the answer is already known.
+    if syntax_decides
+        && !consuming
+        && detect_kind(scope, &key, &source) == oam_loader::ModuleKind::Esm
+    {
+        *esm = true;
+        return None;
+    }
+
+    let exports = v8::Object::new(scope);
+    let exports_key = v8::String::new(scope, "exports")?;
+    module.set(scope, exports_key.into(), exports.into());
+    {
+        let global = v8::Global::new(scope, module);
+        scope
+            .get_slot_mut::<CjsCache>()
+            .expect("cjs cache installed")
+            .modules
+            .insert(key.clone(), global);
+    }
+    record_main(scope, &key, module);
+
+    let source_v8 = match v8::String::new(scope, &source) {
+        Some(source_v8) => source_v8,
+        None => {
+            evict(scope, &key);
+            throw_error(scope, &format!("{file}: source too long for V8 string"));
+            return None;
+        }
+    };
+    let name: v8::Local<v8::Value> = filename_v8.into();
+    let origin = v8::ScriptOrigin::new(
+        scope, name, 0, 0, false, 0, None, false, false, /* is_module */ false, None,
+    );
     let seeded = cached.as_ref().is_some_and(|c| c.seeded);
     let mut compiler_source = match cached {
         Some(ref c) => v8::script_compiler::Source::new_with_cached_data(
@@ -744,17 +965,14 @@ pub(crate) fn load_cjs<'s>(
     let paths = v8::Array::new_with_elements(scope, &lookup);
     let paths_key = v8::String::new(scope, "paths")?;
     module.set(scope, paths_key.into(), paths.into());
-    let context = scope.get_current_context();
-    let global_obj = context.global(scope);
 
     let recv: v8::Local<v8::Value> = exports.into();
-    let call_args: [v8::Local<v8::Value>; 6] = [
+    let call_args: [v8::Local<v8::Value>; 5] = [
         exports.into(),
         require.into(),
         module.into(),
         filename_v8.into(),
         dirname_v8.into(),
-        global_obj.into(),
     ];
     if wrapper.call(scope, recv, &call_args).is_none() {
         // The body threw: exception stays pending, cache entry goes (Node
@@ -1082,6 +1300,22 @@ fn facade_with_prelude(
 }
 
 impl crate::JsRuntime {
+    /// The kind a program's entry `path` runs as, which picks
+    /// [`Self::execute_cjs`] or [`Self::execute_module`]: by extension or
+    /// package.json "type", and a file with neither to go by -- a typeless
+    /// .js -- as node decides it, by its syntax (CommonJS unless it has module
+    /// syntax). Asked of the entry's real location, as node resolves its main
+    /// entry: the package.json walk starts from the path it is handed, so a
+    /// relative `gate.js` named from a subdirectory of its package once only
+    /// looked for ./package.json, and a CommonJS script routed as an ES
+    /// module had no main module (its `require.main === module` guard never
+    /// ran).
+    pub fn entry_module_kind(&mut self, path: &Path) -> oam_loader::ModuleKind {
+        let real = module_key(path).unwrap_or_else(|_| path.to_path_buf());
+        v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
+        module_kind_of(scope, &real)
+    }
+
     /// Run a CJS entry file as the program: execute it, then pump the event
     /// loop (timers/ops keep the process alive, Node semantics) and fail on
     /// unhandled rejections, exactly like the ESM path. The entry is the main
@@ -1170,5 +1404,26 @@ impl crate::JsRuntime {
             Some(failures) => Err(failures),
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CJS_PARAMS;
+
+    /// The wrapper must be node's `Module.wrapper` exactly -- the five names,
+    /// nothing extra. An added `global` (oam carried one) makes a typeless
+    /// `.js` with a top-level `const global` fail `Identifier 'global' has
+    /// already been declared`, where node runs it; a missing name breaks
+    /// `require`/`module`/`__dirname` in every CJS module. The conformance case
+    /// covers the behavior; this pins the list itself so a one-line edit is
+    /// caught even if the case's fixture drifts.
+    #[test]
+    fn wrapper_params_are_node_s_exact_list() {
+        assert_eq!(
+            CJS_PARAMS,
+            ["exports", "require", "module", "__filename", "__dirname"],
+            "the CommonJS wrapper parameters must match node's Module.wrapper"
+        );
     }
 }
