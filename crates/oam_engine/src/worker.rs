@@ -479,14 +479,31 @@ fn run_worker(
         let _ = rt.execute_script("<flags>", js);
     }
     // The worker's own `execArgv: ["--no-warnings"]`: its process has no
-    // default 'warning' listener, as node's has none. (The other flags a
-    // worker may be given are not applied per worker.)
+    // default 'warning' listener, as node's has none.
     if exec_argv.iter().any(|arg| arg == "--no-warnings") {
         let _ = rt.execute_script(
             "<worker-flags>",
             "for (const f of globalThis.process.listeners('warning')) \
                if (f.name === 'onWarning') globalThis.process.removeListener('warning', f);",
         );
+    }
+    // Its own `--trace-warnings` / `--trace-deprecation`: defined on its
+    // process as the CLI defines them on the main thread's, which is where
+    // the default printer reads them. (The other flags a worker may be given
+    // are not applied per worker.)
+    for (flag, name) in [
+        ("--trace-warnings", "traceProcessWarnings"),
+        ("--trace-deprecation", "traceDeprecation"),
+    ] {
+        if exec_argv.iter().any(|arg| arg == flag) {
+            let _ = rt.execute_script(
+                "<worker-flags>",
+                &format!(
+                    "Object.defineProperty(globalThis.process, '{name}', \
+                       {{ value: true, writable: false, enumerable: true, configurable: true }});"
+                ),
+            );
+        }
     }
     // The entry is looked for on the worker's own thread, as node's is
     // (#287): its failure is the thread's error, handed to the parent whole,
