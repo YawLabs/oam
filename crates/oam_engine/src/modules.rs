@@ -1005,9 +1005,14 @@ impl JsRuntime {
                     } else {
                         completion
                     };
-                crate::ops::settle_completion(tc, completion);
-                if let Some(failure) = run_ticks_and_microtasks(tc) {
-                    return Err(failure);
+                match crate::ops::settle_completion(tc, completion) {
+                    crate::ops::Settled::Fatal(failure) => return Err(failure),
+                    crate::ops::Settled::ThrewHandled => {}
+                    crate::ops::Settled::Ran => {
+                        if let Some(failure) = run_ticks_and_microtasks(tc) {
+                            return Err(failure);
+                        }
+                    }
                 }
                 progressed = true;
             }
@@ -1045,9 +1050,14 @@ impl JsRuntime {
                     } else {
                         completion
                     };
-                crate::ops::settle_completion(tc, completion);
-                if let Some(failure) = run_ticks_and_microtasks(tc) {
-                    return Err(failure);
+                match crate::ops::settle_completion(tc, completion) {
+                    crate::ops::Settled::Fatal(failure) => return Err(failure),
+                    crate::ops::Settled::ThrewHandled => {}
+                    crate::ops::Settled::Ran => {
+                        if let Some(failure) = run_ticks_and_microtasks(tc) {
+                            return Err(failure);
+                        }
+                    }
                 }
             } else if next_timer.is_none_or(|t| t >= deadline) {
                 return Ok(());
@@ -1596,9 +1606,14 @@ pub(crate) fn pump_event_loop(
             } else {
                 completion
             };
-            crate::ops::settle_completion(tc, completion);
-            if let Some(failure) = run_ticks_and_microtasks(tc) {
-                return Err(failure);
+            match crate::ops::settle_completion(tc, completion) {
+                crate::ops::Settled::Fatal(failure) => return Err(failure),
+                crate::ops::Settled::ThrewHandled => {}
+                crate::ops::Settled::Ran => {
+                    if let Some(failure) = run_ticks_and_microtasks(tc) {
+                        return Err(failure);
+                    }
+                }
             }
             if let Some(failure) = drain_uncaught(tc) {
                 return Err(failure);
@@ -1658,9 +1673,14 @@ pub(crate) fn pump_event_loop(
                     } else {
                         completion
                     };
-                crate::ops::settle_completion(tc, completion);
-                if let Some(failure) = run_ticks_and_microtasks(tc) {
-                    return Err(failure);
+                match crate::ops::settle_completion(tc, completion) {
+                    crate::ops::Settled::Fatal(failure) => return Err(failure),
+                    crate::ops::Settled::ThrewHandled => {}
+                    crate::ops::Settled::Ran => {
+                        if let Some(failure) = run_ticks_and_microtasks(tc) {
+                            return Err(failure);
+                        }
+                    }
                 }
                 if let Some(failure) = drain_uncaught(tc) {
                     return Err(failure);
@@ -1721,9 +1741,14 @@ pub(crate) fn pump_event_loop(
                         } else {
                             completion
                         };
-                    crate::ops::settle_completion(tc, completion);
-                    if let Some(failure) = run_ticks_and_microtasks(tc) {
-                        return Err(failure);
+                    match crate::ops::settle_completion(tc, completion) {
+                        crate::ops::Settled::Fatal(failure) => return Err(failure),
+                        crate::ops::Settled::ThrewHandled => {}
+                        crate::ops::Settled::Ran => {
+                            if let Some(failure) = run_ticks_and_microtasks(tc) {
+                                return Err(failure);
+                            }
+                        }
                     }
                     if let Some(failure) = drain_uncaught(tc) {
                         return Err(failure);
@@ -1775,9 +1800,14 @@ pub(crate) fn pump_event_loop(
                             } else {
                                 completion
                             };
-                            crate::ops::settle_completion(tc, completion);
-                            if let Some(failure) = run_ticks_and_microtasks(tc) {
-                                return Err(failure);
+                            match crate::ops::settle_completion(tc, completion) {
+                                crate::ops::Settled::Fatal(failure) => return Err(failure),
+                                crate::ops::Settled::ThrewHandled => {}
+                                crate::ops::Settled::Ran => {
+                                    if let Some(failure) = run_ticks_and_microtasks(tc) {
+                                        return Err(failure);
+                                    }
+                                }
                             }
                             if let Some(failure) = drain_uncaught(tc) {
                                 return Err(failure);

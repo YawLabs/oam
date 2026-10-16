@@ -598,8 +598,9 @@
   /// collection idiom `await Array.fromAsync(fsp.glob(...))` saw a Promise,
   /// took Array.fromAsync's array-like branch, read `length === undefined` and
   /// resolved to `[]` -- so a build step that globs for files found none and
-  /// carried on.
-  const NOT_PROMISE_RETURNING = new Set(["glob"]);
+  /// carried on. `watch` is an async generator (node's is too): wrapped, its
+  /// iterator would arrive inside a Promise and `for await` would refuse it.
+  const NOT_PROMISE_RETURNING = new Set(["glob", "watch"]);
 
   /// The UNWRAPPED `fs/promises` methods, set when that factory runs. The
   /// callback layer builds on these so a bad path still throws synchronously,
@@ -1088,6 +1089,10 @@
   // strategy (an invalid highWaterMark or size).
   codes.ERR_INVALID_ARG_VALUE = E("ERR_INVALID_ARG_VALUE", TypeError, invalidArgValueMessage);
   codes.ERR_INVALID_ARG_VALUE.RangeError = E("ERR_INVALID_ARG_VALUE", RangeError, invalidArgValueMessage);
+  // fs.promises.watch with `overflow: 'error'`, past `maxQueue` queued events.
+  codes.ERR_FS_WATCH_QUEUE_OVERFLOW = E("ERR_FS_WATCH_QUEUE_OVERFLOW", Error, function(max) {
+    return `fs.watch() queued more than ${max} events`;
+  });
   codes.ERR_INVALID_CALLBACK = E("ERR_INVALID_CALLBACK", TypeError, function(name) {
     return 'Callback must be a function. Received ' + String(name);
   });
@@ -13812,7 +13817,214 @@
     // module object: a builtin's exports are its object's own keys, so a
     // helper parked there (`_globAsPromise` was) is a name node's
     // fs/promises does not have, and `import { _globAsPromise }` linked.
+    // node's FSEvent binding (src/fs_event_wrap.cc over libuv's
+    // uv_fs_event_t): the OS watch both fs.watch's FSWatcher and
+    // fs.promises.watch sit on. `start` throws node's error for a path that
+    // cannot be watched; each change reaches `onchange(status, eventType,
+    // filename)` as the binding's callback does -- a negative status (with
+    // the error in place of the event type) for a watch that failed. The
+    // events arrive through one parked `fsWatchNext` op at a time
+    // (oam_core::fs_watch), filed under the watcher's handle so unref()
+    // stops it holding the loop open.
+    const kFsEventId = Symbol("kFsEventId");
+    const kFsEventEncoding = Symbol("kFsEventEncoding");
+    const kFsEventClosed = Symbol("kFsEventClosed");
+    const kFsEventPump = Symbol("kFsEventPump");
+    class FSEvent {
+      constructor() {
+        this.onchange = null;
+        this[kFsEventId] = 0;
+        this[kFsEventEncoding] = "utf8";
+        this[kFsEventClosed] = false;
+      }
+      // `shown` is the path as the error message and `err.path` print it;
+      // `given` is what `err.filename` holds -- the caller's own value (a
+      // Buffer stays a Buffer, a URL given to fs.promises.watch stays a URL),
+      // as node's UVException takes `filename` as passed.
+      start(path, shown, persistent, recursive, encoding, given = shown) {
+        let id;
+        try {
+          id = natives.fsWatchStart(path, recursive === true, shown);
+        } catch (e) {
+          // node's FSWatcher rethrows libuv's error as a UVException: own
+          // keys errno, syscall, code, path, then `filename` -- not an fs
+          // call's errno/code/syscall/path order (measured on v22.22.2:
+          // `ENOENT: no such file or directory, watch 'nope'`).
+          if (!e || typeof e.errno !== "number" || typeof e.code !== "string") throw e;
+          const err = new Error(e.message);
+          err.errno = e.errno;
+          err.syscall = "watch";
+          err.code = e.code;
+          err.path = shown;
+          err.filename = given;
+          throw err;
+        }
+        this[kFsEventId] = id;
+        this[kFsEventEncoding] = encoding || "utf8";
+        // node's binding takes `persistent` as `args[1]->IsTrue()`: anything
+        // but `true` is an unref'd handle from the start.
+        if (persistent !== true) natives.fsWatchSetRef(id, false);
+        this[kFsEventPump]();
+      }
+      [kFsEventPump]() {
+        // A callback, not a promise: the engine calls it from the loop, one
+        // event per call, and runs the nextTick queue and then the
+        // microtasks after each -- node's MakeCallback around every libuv
+        // event. Inside a promise reaction a listener's nextTick ran after
+        // its promise jobs, and its throw became an unhandled rejection that
+        // also ended the loop over the rest of the batch.
+        natives.fsWatchNext(this[kFsEventId], (e, event) => {
+          // An event that lands after close() is dropped -- a closed node
+          // watcher reports nothing more. No event: closed.
+          if (this[kFsEventClosed]) return;
+          if (e) {
+            if (typeof this.onchange === "function") this.onchange(-1, e, null);
+            return;
+          }
+          if (event === undefined) return;
+          // Re-arm BEFORE delivering: a listener's throw must not leave the
+          // watcher without a read, and the parked read is what keeps a
+          // referenced watcher holding the loop open between events.
+          this[kFsEventPump]();
+          // Framed by oam_core::fs_watch::encode: a type byte (0 rename,
+          // 1 change), then the name; the type byte alone is no filename.
+          const eventType = event[0] === 1 ? "change" : "rename";
+          let filename = null;
+          if (event.byteLength > 1) {
+            const raw = globalThis.Buffer.from(event.buffer, event.byteOffset + 1, event.byteLength - 1);
+            const encoding = this[kFsEventEncoding];
+            filename = encoding === "buffer" ? globalThis.Buffer.from(raw) : raw.toString(encoding);
+          }
+          // Not caught: a listener's throw is an uncaught exception, as in
+          // node, and the engine routes it to 'uncaughtException'.
+          if (typeof this.onchange === "function") this.onchange(0, eventType, filename);
+        });
+      }
+      close() {
+        if (this[kFsEventClosed]) return;
+        this[kFsEventClosed] = true;
+        if (this[kFsEventId]) natives.fsWatchClose(this[kFsEventId]);
+      }
+      ref() {
+        if (!this[kFsEventClosed] && this[kFsEventId]) natives.fsWatchSetRef(this[kFsEventId], true);
+      }
+      unref() {
+        if (!this[kFsEventClosed] && this[kFsEventId]) natives.fsWatchSetRef(this[kFsEventId], false);
+      }
+    }
+    // node's UVException for a watch that failed while running (status < 0
+    // in FSEvent's onchange): errno, syscall, code, then `filename`.
+    const watchFailure = (e, filename) => {
+      const err = new Error(e && e.message ? e.message : String(e));
+      if (e && typeof e === "object") {
+        err.errno = e.errno;
+        err.syscall = "watch";
+        err.code = e.code;
+      }
+      err.filename = filename;
+      return err;
+    };
+
+    // fs.promises.watch (lib/internal/fs/watchers.js `watch`, v22.22.2): an
+    // async generator, so nothing -- not the options, not the path's
+    // existence -- is checked until the first next(). Yields
+    // `{ __proto__: null, eventType, filename }`. Events that arrive while
+    // the consumer is busy queue up to `maxQueue`; past it `overflow:
+    // 'ignore'` drops each with a warning and 'error' empties the queue and
+    // throws ERR_FS_WATCH_QUEUE_OVERFLOW. An abort closes the watch and
+    // throws AbortError; return() (a `break` out of for-await) closes it.
+    // Named `watch`, as node's is on Windows and macOS (`_watch` elsewhere:
+    // see the export below).
+    const fspWatch = async function* watch(filename, options = {}) {
+      const path = toPath(filename);
+      if (options === null || typeof options !== "object" || Array.isArray(options)) {
+        throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+      }
+      const {
+        persistent = true,
+        recursive = false,
+        encoding = "utf8",
+        signal,
+        maxQueue = 2048,
+        overflow = "ignore",
+      } = options;
+      if (typeof persistent !== "boolean") throw argTypeOfError("options.persistent", "boolean", persistent);
+      if (typeof recursive !== "boolean") throw argTypeOfError("options.recursive", "boolean", recursive);
+      validateInteger(maxQueue, "options.maxQueue");
+      if (overflow !== "ignore" && overflow !== "error") {
+        throw codes.ERR_INVALID_ARG_VALUE("options.overflow", overflow, "must be one of: 'ignore', 'error'");
+      }
+      if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+        throw codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
+      }
+      // node's own argument order, which names the VALUE as the argument
+      // (`The argument 'buffer' is invalid encoding. Received 'encoding'`),
+      // and so refuses 'buffer', which Buffer.isEncoding does not know.
+      if (encoding && !globalThis.Buffer.isEncoding(encoding)) {
+        throw codes.ERR_INVALID_ARG_VALUE(encoding, "encoding", "is invalid encoding");
+      }
+      if (signal && signal.aborted) throw new FsAbortError(signal);
+      const handle = new FSEvent();
+      const queue = [];
+      let failure = null;
+      let wake = null;
+      const settle = () => {
+        if (wake) {
+          const w = wake;
+          wake = null;
+          w();
+        }
+      };
+      const oncancel = () => {
+        handle.close();
+        failure = new FsAbortError(signal);
+        settle();
+      };
+      try {
+        if (signal) signal.addEventListener("abort", oncancel, { once: true });
+        handle.onchange = (status, eventType, name) => {
+          if (status < 0) {
+            handle.close();
+            failure = watchFailure(eventType, name);
+            settle();
+            return;
+          }
+          if (queue.length < maxQueue) {
+            queue.push({ __proto__: null, eventType, filename: name });
+            settle();
+          } else if (overflow === "error") {
+            queue.length = 0;
+            handle.close();
+            failure = codes.ERR_FS_WATCH_QUEUE_OVERFLOW(maxQueue);
+            settle();
+          } else {
+            process.emitWarning("fs.watch maxQueue exceeded");
+          }
+        };
+        // node names the path as given -- a file: URL by its href, not the
+        // OS path it converts to -- and hands the value itself to
+        // `err.filename` (lib/internal/fs/watchers.js builds the
+        // UVException with `path: filename`).
+        handle.start(path, `${filename}`, persistent, recursive, encoding, filename);
+        while (!(signal && signal.aborted)) {
+          if (queue.length === 0 && failure === null) {
+            await new Promise((resolve) => {
+              wake = resolve;
+            });
+          }
+          if (failure !== null) throw failure;
+          while (queue.length) yield queue.shift();
+        }
+        throw new FsAbortError(signal);
+      } finally {
+        handle.close();
+        if (signal) signal.removeEventListener("abort", oncancel);
+      }
+    };
+
     fsPromisesInternals = {
+      FSEvent,
+      watchFailure,
       // The callback readFile's: the same read, with the flag taken as given.
       readFileForCallback: (path, options) =>
         fileHandles.has(path) ? path.readFile(options) : readFileAt(toPath(path), options, false),
@@ -14065,7 +14277,14 @@
         UV_FS_SYMLINK_DIR: 1, UV_FS_SYMLINK_JUNCTION: 2,
       },
       Dirent,
+      watch: fspWatch,
     };
+    // Off Windows and macOS node exports its `_watch` wrapper instead (which
+    // runs a recursive watch through its JS watcher), so the name differs by
+    // platform (internal/fs/promises.js, v22.22.2).
+    if (natives.platform !== "win32" && natives.platform !== "darwin") {
+      Object.defineProperty(fspWatch, "name", { value: "_watch" });
+    }
     return asAlwaysRejecting(rawFsPromises);
   };
 
@@ -14434,60 +14653,98 @@
       };
     }
 
-    function fsWatch(filename, options, listener) {
-      if (typeof options === "function") {
-        listener = options;
-        options = {};
-      }
-      var opts = options || {};
-      var EventEmitter = registry.get("events");
-      var watcher = new EventEmitter();
-      var filePath = toPath(filename);
-      var prevMtime = 0;
-      var closed = false;
-      try {
-        prevMtime = natives.fsStatSync(filePath, false, true, statSyncValues)[STAT_MTIME_MS];
-      } catch (e) {
-        // node starts its watcher at the call, and a path that cannot be
-        // watched -- one that is not there -- throws then, as libuv's error
-        // for syscall `watch`, naming the path as given and carrying it as
-        // `filename` too (measured on v22.22.2: `ENOENT: no such file or
-        // directory, watch 'nope'`). Anything else (a refused permission)
-        // is thrown as it is.
-        if (!e || typeof e.errno !== "number" || typeof e.code !== "string") throw e;
-        const reason = /^[A-Z0-9_]+: (.*), stat /.exec(String(e.message));
-        const err = new Error(`${e.code}: ${reason ? reason[1] : e.code}, watch '${filePath}'`);
-        err.errno = e.errno;
-        err.syscall = "watch";
-        err.code = e.code;
-        err.path = filePath;
-        err.filename = filePath;
-        throw err;
-      }
-      var pollInterval = opts.interval || 100;
-      var poll = setInterval(function () {
-        if (closed) return;
-        natives.fsStat(filePath, false).then(function (stat) {
-          // A stat already in flight when close() ran reports nothing.
-          if (closed) return;
-          if (stat[STAT_MTIME_MS] !== prevMtime) {
-            prevMtime = stat[STAT_MTIME_MS];
-            var parts = filePath.replace(/\\/g, "/").split("/");
-            var base = parts[parts.length - 1] || filePath;
-            watcher.emit("change", "change", base);
-            if (listener) listener("change", base);
+    // node's FSWatcher (lib/internal/fs/watchers.js, v22.22.2): an
+    // EventEmitter over an FSEvent handle (`_handle`, null once closed). A
+    // failed watch closes the handle WITHOUT 'close' and emits 'error';
+    // close() emits 'close' on the next tick, once. ref()/unref() reach the
+    // handle and return the watcher, after close() too. It used to be a stat
+    // poll every 100 ms: no 'rename' events, only the watched path's own
+    // mtime, nothing from inside a directory, and ref()/unref() no-ops (a
+    // watcher held the process open forever, unref'd or not).
+    const EventEmitterForWatch = registry.get("events");
+    function FSWatcher() {
+      EventEmitterForWatch.call(this);
+      this._handle = new fsPromisesInternals.FSEvent();
+      this._handle.onchange = (status, eventType, filename) => {
+        if (status < 0) {
+          if (this._handle !== null) {
+            // Not this.close(): a failed watch emits 'error', not 'close'.
+            this._handle.close();
+            this._handle = null;
           }
-        }, function (e) {
-          if (!closed) watcher.emit("error", e);
-        });
-      }, pollInterval);
-      watcher.close = function () {
-        closed = true;
-        clearInterval(poll);
-        watcher.emit("close");
+          this.emit("error", fsPromisesInternals.watchFailure(eventType, filename));
+        } else {
+          this.emit("change", eventType, filename);
+        }
       };
-      watcher.ref = function () { return watcher; };
-      watcher.unref = function () { return watcher; };
+    }
+    Object.setPrototypeOf(FSWatcher.prototype, EventEmitterForWatch.prototype);
+    Object.setPrototypeOf(FSWatcher, EventEmitterForWatch);
+    // node keeps `start` as a no-op (the real start is a symbol-keyed method
+    // fs.watch calls); its prototype's own keys are constructor, start,
+    // close, ref, unref, in that order.
+    FSWatcher.prototype.start = () => {};
+    FSWatcher.prototype.close = function () {
+      if (this._handle === null) return;
+      this._handle.close();
+      this._handle = null;
+      process.nextTick(() => this.emit("close"));
+    };
+    FSWatcher.prototype.ref = function () {
+      if (this._handle) this._handle.ref();
+      return this;
+    };
+    FSWatcher.prototype.unref = function () {
+      if (this._handle) this._handle.unref();
+      return this;
+    };
+
+    // fs.watch (lib/fs.js, v22.22.2): getOptions (a string is the encoding;
+    // the encoding and signal are checked), the path, the watch started --
+    // which throws for a path that cannot be watched -- and only then the
+    // listener added, so a bad listener throws from addListener. `recursive`
+    // and `persistent` are not validated: the binding takes `=== true` /
+    // anything-but-false, as libuv's start does. A signal closes the watcher
+    // on abort (on the next tick when it is already aborted).
+    function fsWatch(filename, options, listener) {
+      if (typeof options === "function") listener = options;
+      if (options == null || typeof options === "function") {
+        options = {};
+      } else if (typeof options === "string") {
+        options = { encoding: options };
+      } else if (typeof options !== "object") {
+        throw nodeTypeError(
+          `The "options" argument must be one of type string or object. Received ${describeArg(options)}`,
+        );
+      } else {
+        options = { ...options };
+      }
+      const encoding = options.encoding;
+      if (encoding !== "buffer" && encoding && !globalThis.Buffer.isEncoding(encoding)) {
+        throw codes.ERR_INVALID_ARG_VALUE("encoding", encoding, "is invalid encoding");
+      }
+      const signal = options.signal;
+      if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+        throw codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
+      }
+      if (options.persistent === undefined) options.persistent = true;
+      if (options.recursive === undefined) options.recursive = false;
+      const path = toPath(filename);
+      const watcher = new FSWatcher();
+      // node's getValidatedPath: a URL becomes its OS path, a Buffer stays
+      // a Buffer -- and that value is the error's `filename`.
+      const given = globalThis.Buffer.isBuffer(filename) ? filename : path;
+      watcher._handle.start(path, path, options.persistent, options.recursive, encoding, given);
+      if (listener) watcher.addListener("change", listener);
+      if (signal) {
+        if (signal.aborted) {
+          process.nextTick(() => watcher.close());
+        } else {
+          const onAbort = () => watcher.close();
+          signal.addEventListener("abort", onAbort);
+          watcher.once("close", () => signal.removeEventListener("abort", onAbort));
+        }
+      }
       return watcher;
     }
 

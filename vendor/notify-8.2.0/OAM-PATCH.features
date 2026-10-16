@@ -1,0 +1,4 @@
+# Feature sets scripts/check-vendor.sh --build compiles this crate with, one
+# per line, each warning-free. The patch touches only the Windows backend,
+# which every feature set compiles on Windows; oam uses the default set.
+"macos_fsevent"

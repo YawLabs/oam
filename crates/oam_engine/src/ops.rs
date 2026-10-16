@@ -13,12 +13,30 @@ use std::collections::HashMap;
 use std::future::Future;
 
 #[derive(Default)]
-pub(crate) struct PendingOps(HashMap<OpId, v8::Global<v8::PromiseResolver>>);
+pub(crate) struct PendingOps {
+    promises: HashMap<OpId, v8::Global<v8::PromiseResolver>>,
+    /// Callback ops ([`spawn_handle_callback_op`]): settled by CALLING the
+    /// function, from the loop, rather than by resolving a promise.
+    callbacks: HashMap<OpId, v8::Global<v8::Function>>,
+}
 
 impl PendingOps {
     fn park(&mut self, id: OpId, resolver: v8::Global<v8::PromiseResolver>) {
-        self.0.insert(id, resolver);
+        self.promises.insert(id, resolver);
     }
+}
+
+/// What settling one completion did, for the loop's tick point after it.
+pub(crate) enum Settled {
+    /// A promise settled, or a callback returned: run the tick point.
+    Ran,
+    /// A callback threw and an 'uncaughtException' listener took the error.
+    /// node's InternalCallbackScope skips its tick drain for a callback that
+    /// failed (`if (failed_) return;` in Close), as the timer path here does:
+    /// what the callback queued runs at the next tick point.
+    ThrewHandled,
+    /// A callback threw and nothing took it: the run ends with this report.
+    Fatal(Vec<oam_diagnostics::Diagnostic>),
 }
 
 macro_rules! core_runtime {
@@ -245,6 +263,25 @@ pub(crate) fn spawn_handle_op(
     op: impl Future<Output = OpOutcome> + Send + 'static,
 ) {
     spawn_with(scope, rv, |core| core.spawn_handle_op(key, op));
+}
+
+/// Like `spawn_handle_op`, but the op settles by calling `callback(err,
+/// value)` from the event loop instead of through a promise: node's
+/// MakeCallback, for a handle whose every event is its own callback (an
+/// `fs.watch` watcher's `onchange`). A promise reaction runs inside a
+/// microtask checkpoint, so what a listener queued with `process.nextTick`
+/// ran after its promise jobs, and a listener's throw rejected the reaction's
+/// promise -- an 'unhandledRejection' where node has an 'uncaughtException'.
+/// `err` and `value` are what the promise form would reject or resolve with.
+pub(crate) fn spawn_handle_callback_op(
+    scope: &mut v8::PinScope<'_, '_>,
+    key: HandleKey,
+    op: impl Future<Output = OpOutcome> + Send + 'static,
+    callback: v8::Local<'_, v8::Function>,
+) {
+    let callback = v8::Global::new(scope, callback);
+    let id = core_runtime_mut!(scope).spawn_handle_op(key, op);
+    pending_ops_mut!(scope).callbacks.insert(id, callback);
 }
 
 /// Like `spawn_op`, but the op does NOT keep the event loop alive. For
@@ -861,7 +898,7 @@ fn op_ws_drop(
 pub(crate) fn settle_completion(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     completion: OpCompletion,
-) {
+) -> Settled {
     // Inbound OS signal: no parked resolver (it was never a spawn_op). Emit the
     // named event on `process` so JS listeners fire; a present listener also
     // means the OS default was already suppressed at install time. If nothing
@@ -870,23 +907,76 @@ pub(crate) fn settle_completion(
     // A V8 foreground-task wake (platform.rs): it only had to interrupt the
     // loop's wait; the loop runs the queued tasks itself.
     if completion.id == oam_core::PLATFORM_TASK_OP_ID {
-        return;
+        return Settled::Ran;
     }
     if completion.id == oam_core::SIGNAL_OP_ID {
         if let OpOutcome::Signal(name) = completion.outcome {
             crate::modules::emit_process_event(tc, &name, &[]);
         }
-        return;
+        return Settled::Ran;
     }
-    let resolver = tc
-        .get_slot_mut::<PendingOps>()
-        .and_then(|pending| pending.0.remove(&completion.id));
-    let Some(resolver) = resolver else {
+    let parked = tc.get_slot_mut::<PendingOps>().and_then(|pending| {
+        if let Some(resolver) = pending.promises.remove(&completion.id) {
+            Some((Some(resolver), None))
+        } else {
+            pending
+                .callbacks
+                .remove(&completion.id)
+                .map(|callback| (None, Some(callback)))
+        }
+    });
+    let Some((resolver, callback)) = parked else {
         // Op from a previous execute_module run whose map was reset: ignore.
-        return;
+        return Settled::Ran;
     };
-    let resolver = v8::Local::new(tc, &resolver);
-    match completion.outcome {
+    let resolver = match resolver {
+        Some(resolver) => v8::Local::new(tc, &resolver),
+        // A callback op settles through a promise of its own that nothing
+        // observes, so every outcome below is shaped exactly as an awaited
+        // op's. Marked handled BEFORE it can reject: an unobserved rejection
+        // would otherwise reach the unhandled-rejection tracker.
+        None => {
+            let Some(resolver) = v8::PromiseResolver::new(tc) else {
+                return Settled::Ran;
+            };
+            resolver.get_promise(tc).mark_as_handled();
+            resolver
+        }
+    };
+    settle_outcome(tc, resolver, completion.outcome);
+    let Some(callback) = callback else {
+        return Settled::Ran;
+    };
+    // node's MakeCallback shape: the callback is called from the loop, not
+    // from a promise reaction, so what it queues drains in node's order at
+    // the tick point after it (process.nextTick first, then microtasks) and
+    // a throw is an uncaught exception, not a rejection.
+    let promise = resolver.get_promise(tc);
+    let undefined: v8::Local<v8::Value> = v8::undefined(tc).into();
+    let args = match promise.state() {
+        v8::PromiseState::Fulfilled => [undefined, promise.result(tc)],
+        v8::PromiseState::Rejected => [promise.result(tc), undefined],
+        // A Signal outcome on a non-signal id (see settle_outcome): nothing
+        // to report.
+        v8::PromiseState::Pending => return Settled::Ran,
+    };
+    let callback = v8::Local::new(tc, &callback);
+    if callback.call(tc, undefined, &args).is_none() {
+        return match crate::modules::handle_uncaught_throw(tc, "callback") {
+            None => Settled::ThrewHandled,
+            Some(failure) => Settled::Fatal(failure),
+        };
+    }
+    Settled::Ran
+}
+
+/// Resolve or reject `resolver` with what `outcome` carries.
+fn settle_outcome(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    resolver: v8::Local<'_, v8::PromiseResolver>,
+    outcome: OpOutcome,
+) {
+    match outcome {
         OpOutcome::Done => {
             let value: v8::Local<v8::Value> = v8::undefined(tc).into();
             resolver.resolve(tc, value);
