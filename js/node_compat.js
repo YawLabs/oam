@@ -13273,15 +13273,31 @@
   // name the CRT's errno table gives that number as `code` (none for 183,
   // EIO for 5), and the system's message (measured on v22.22.2, Windows
   // 11): a file in the way of the directory is ERROR_ALREADY_EXISTS, a
-  // directory that may not be written in ERROR_ACCESS_DENIED. Elsewhere,
+  // directory that may not be written in ERROR_ACCESS_DENIED. What mkdir
+  // calls ENOENT is ERROR_PATH_NOT_FOUND (a missing drive, a name too
+  // long; a missing drive wins over a bad name below it) or, for a name
+  // with a character Windows does not allow, ERROR_INVALID_NAME. Elsewhere,
   // and for any other failure, libstdc++'s.
   const CP_WIN_MKDIR = {
     ENOTDIR: [183, "", "Cannot create a file when that file already exists."],
     EACCES: [5, "EIO", "Access is denied."],
     EPERM: [5, "EIO", "Access is denied."],
   };
-  function cpStdMkdirError(e, path) {
-    const win = process.platform === "win32" && e ? CP_WIN_MKDIR[e.code] : undefined;
+  const CP_WIN_PATH_NOT_FOUND = [3, "ESRCH", "The system cannot find the path specified."];
+  const CP_WIN_INVALID_NAME = [123, "ENOPROTOOPT", "The filename, directory name, or volume label syntax is incorrect."];
+  function cpWinMkdirNotFound(dest) {
+    const { win32 } = registry.get("path");
+    const full = win32.resolve(dest);
+    const { root } = win32.parse(full);
+    if (!registry.get("fs").existsSync(root)) return CP_WIN_PATH_NOT_FOUND;
+    const names = full.slice(root.length).split(/[\\/]/);
+    return names.some((name) => /[<>:"|?*\x00-\x1f]/.test(name)) ? CP_WIN_INVALID_NAME : CP_WIN_PATH_NOT_FOUND;
+  }
+  function cpStdMkdirError(e, dest, path) {
+    let win;
+    if (process.platform === "win32" && e) {
+      win = e.code === "ENOENT" ? cpWinMkdirNotFound(dest) : CP_WIN_MKDIR[e.code];
+    }
     if (win) return cpErrnoException(win[0], win[1], win[2], "cp", path);
     return cpStdErrorOf(e, "cp", path);
   }
@@ -13541,7 +13557,7 @@
     try {
       fs.mkdirSync(dest, { recursive: true });
     } catch (e) {
-      throw cpStdMkdirError(e, cpNs(dest));
+      throw cpStdMkdirError(e, dest, cpNs(dest));
     }
     const statOrNull = (p, follow) => {
       try {
