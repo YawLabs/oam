@@ -14141,7 +14141,7 @@
       if (encoding && !globalThis.Buffer.isEncoding(encoding)) {
         throw codes.ERR_INVALID_ARG_VALUE(encoding, "encoding", "is invalid encoding");
       }
-      if (signal && signal.aborted) throw new FsAbortError(signal);
+      if (signal && signal.aborted) throw fsAbortError(signal);
       const handle = new FSEvent();
       const queue = [];
       let failure = null;
@@ -14155,7 +14155,7 @@
       };
       const oncancel = () => {
         handle.close();
-        failure = new FsAbortError(signal);
+        failure = fsAbortError(signal);
         settle();
       };
       try {
@@ -14193,7 +14193,7 @@
           if (failure !== null) throw failure;
           while (queue.length) yield queue.shift();
         }
-        throw new FsAbortError(signal);
+        throw fsAbortError(signal);
       } finally {
         handle.close();
         if (signal) signal.removeEventListener("abort", oncancel);
