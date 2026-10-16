@@ -84,11 +84,23 @@ const rows = [
       const pr = fs.openAsBlob(p);
       r = await pr.then((b) => "resolves " + b.size, (e) => "rejects " + e.code);
     } catch (e) {
-      // (Not a denial's message: oam's ERR_ACCESS_DENIED text lacks node's
-      // "Use --allow-fs-read to manage permissions." hint for every fs API.)
-      r = "throws " + e.constructor.name + " " + e.code + " " + (e.permission || "-") + " " + scrub(e.resource) + " " + Object.keys(e).join("|") + (e.code === "ERR_ACCESS_DENIED" ? "" : " " + JSON.stringify(e.message));
+      r = "throws " + e.constructor.name + " " + e.code + " " + (e.permission || "-") + " " + scrub(e.resource) + " " + Object.keys(e).join("|") + " " + JSON.stringify(e.message);
     }
     console.log(label + ": " + r);
+  }
+  // The denial's message names the flag that grants it, per permission.
+  for (const [label, f] of [
+    ["readFileSync denied", () => fs.readFileSync(path.join(P, "sub", "s.txt"))],
+    ["writeFileSync denied", () => fs.writeFileSync(path.join(__dirname, "w.txt"), "w")],
+    ["spawnSync denied", () => require("child_process").spawnSync(process.execPath, ["-v"])],
+    ["Worker denied", () => new (require("worker_threads").Worker)(__filename)],
+  ]) {
+    try {
+      f();
+      console.log(label + ": no throw");
+    } catch (e) {
+      console.log(label + ": " + e.code + " " + e.permission + " " + JSON.stringify(e.message));
+    }
   }
 })();
 `,

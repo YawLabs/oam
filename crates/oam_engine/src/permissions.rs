@@ -2200,7 +2200,41 @@ mod tests {
         let denial = p.check_read("/etc/passwd").unwrap_err();
         assert_eq!(denial.permission, "FileSystemRead");
         assert_eq!(denial.resource, "/etc/passwd");
-        assert_eq!(denial.to_string(), "Access to this API has been restricted");
+        assert_eq!(
+            denial.to_string(),
+            "Access to this API has been restricted. Use --allow-fs-read to manage permissions."
+        );
+    }
+
+    /// The message names the flag that grants the permission, as node
+    /// v22.22.2's does (measured for each of node's scopes); a scope with no
+    /// flag keeps node's bare sentence and its trailing space. `Net` and
+    /// `Environment` are oam's own scopes and name oam's own flags.
+    #[test]
+    fn denial_message_names_the_granting_flag() {
+        for (permission, flag) in [
+            ("FileSystemRead", Some("--allow-fs-read")),
+            ("FileSystemWrite", Some("--allow-fs-write")),
+            ("ChildProcess", Some("--allow-child-process")),
+            ("WorkerThreads", Some("--allow-worker")),
+            ("WASI", Some("--allow-wasi")),
+            ("Addon", Some("--allow-addons")),
+            ("Net", Some("--allow-net")),
+            ("Environment", Some("--allow-env")),
+            ("Inspector", None),
+        ] {
+            let denial = PermissionDenial {
+                permission,
+                resource: String::new(),
+            };
+            let expected = match flag {
+                Some(flag) => format!(
+                    "Access to this API has been restricted. Use {flag} to manage permissions."
+                ),
+                None => "Access to this API has been restricted. ".to_string(),
+            };
+            assert_eq!(denial.to_string(), expected, "{permission}");
+        }
     }
 
     // ------------------------------------------- fs keys: case, anchoring
