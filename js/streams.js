@@ -1423,6 +1423,17 @@
       return this._reader !== null;
     }
 
+    // node's [kInspect] through its customInspect: the three-field summary
+    // in place of the internal fields. Past the depth limit node's helper
+    // returns its own `this`, which is undefined there (it is called as a
+    // plain function), so util.inspect prints `undefined`; this does too.
+    [Symbol.for("nodejs.util.inspect.custom")](depth, options, inspect) {
+      if (depth < 0) return undefined;
+      const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
+      inspect ??= globalThis.__oamNode.get("util").inspect;
+      return `ReadableStream ${inspect({ locked: this.locked, state: this._state, supportsBYOB: this._isBytes }, opts)}`;
+    }
+
     // node's checks: options an object (or null), then the mode -- absent
     // for a default reader, else it must stringify to "byob".
     getReader(options = {}) {
