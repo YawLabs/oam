@@ -43325,22 +43325,45 @@
   function portScheduleDrain(port, state) {
     if (state.drainScheduled || !state.started || state.closed || state.queue.length === 0) return;
     state.drainScheduled = true;
-    (registry._setImmediate ?? globalThis.setImmediate)(() => {
-      state.drainScheduled = false;
-      if (!state.started || state.closed) return;
+    // From the loop's pending phase (timerPending): after the ticks and
+    // microtasks the poster queued and before the immediates, where node's
+    // port reads its messages (its uv_async comes in the poll phase, ahead
+    // of the check phase).
+    const later = (fn) => {
+      const natives = globalThis.__oam.node;
+      if (typeof natives.timerPending === "function") natives.timerPending(fn);
+      else (registry._setImmediate ?? globalThis.setImmediate)(fn);
+    };
+    later(() => {
+      if (!state.started || state.closed) {
+        state.drainScheduled = false;
+        return;
+      }
       // What is queued now goes out as one batch, every message of it even
       // if a listener closes the port part way (node delivers a batch it
-      // has read whole); a message posted from a listener waits for the
-      // next turn.
+      // has read whole), each from a pending callback of its own, so the
+      // ticks and microtasks a listener queues all run before the next
+      // message, as they do after each of node's callbacks, and nothing
+      // else -- a timer, an immediate -- comes between. A message posted
+      // from a listener waits for the next batch.
       const batch = state.queue.splice(0, state.queue.length);
-      for (const item of batch) {
+      const deliver = (i) => {
+        if (i === batch.length) {
+          state.drainScheduled = false;
+          portScheduleDrain(port, state);
+          return;
+        }
+        const item = batch[i];
         if (item === kPortClose) {
+          state.drainScheduled = false;
           portCloseLocal(port, state);
           return;
         }
         hybridDispatch(port, item, "message", () => port[kPortCreateEvent](item, "message"));
-      }
-      portScheduleDrain(port, state);
+        if (i + 1 === batch.length) deliver(i + 1);
+        else later(() => deliver(i + 1));
+      };
+      deliver(0);
     });
   }
   // This end closes: its queue goes, and its 'close' event follows, which
