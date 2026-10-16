@@ -487,19 +487,24 @@ pub fn stdin_handle_type() -> HandleType {
 
 /// `uv_guess_handle` (src/win/handle.c): a character device is a TTY when it
 /// is a console and a FILE otherwise, a pipe is a PIPE, a disk file a FILE,
-/// and anything GetFileType cannot name is UNKNOWN. The terminal test is
-/// `IsTerminal`, the one `process.stdin.isTTY` already reports, so the two
-/// can never disagree.
+/// and anything GetFileType cannot name is UNKNOWN.
+///
+/// A console is a character device GetConsoleMode accepts. std's
+/// `IsTerminal` asks that too, but it also answers true for a PIPE whose name
+/// is an msys/cygwin pty's (`\\.\pipe\msys-...-pty0-to-master`, what Git
+/// Bash's mintty gives a program) -- and libuv calls that a pipe: node's
+/// `tty.isatty` is false on it, `process.stdout` there is a `net.Socket`, and
+/// `new tty.WriteStream(fd)` is ERR_TTY_INIT_FAILED (#391). So `IsTerminal`
+/// is consulted only for a character device, where it is GetConsoleMode
+/// alone (its pty-name test returns early for anything but a pipe).
 #[cfg(windows)]
-fn guess_handle<H>(handle: &H) -> HandleType
+pub fn guess_handle<H>(handle: &H) -> HandleType
 where
     H: std::os::windows::io::AsRawHandle + std::io::IsTerminal,
 {
     use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE};
-    if handle.is_terminal() {
-        return HandleType::Tty;
-    }
     match crate::child_win::file_type(handle.as_raw_handle()) {
+        FILE_TYPE_CHAR if handle.is_terminal() => HandleType::Tty,
         FILE_TYPE_DISK | FILE_TYPE_CHAR => HandleType::File,
         FILE_TYPE_PIPE => HandleType::Pipe,
         _ => HandleType::Unknown,
@@ -513,7 +518,7 @@ where
 /// spawns, so every socket is a PIPE here. An fd `fstat` fails on (closed)
 /// is UNKNOWN, as are directories and block devices.
 #[cfg(unix)]
-fn guess_handle<H>(handle: &H) -> HandleType
+pub fn guess_handle<H>(handle: &H) -> HandleType
 where
     H: std::os::fd::AsFd + std::io::IsTerminal,
 {
