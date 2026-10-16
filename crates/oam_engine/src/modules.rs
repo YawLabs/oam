@@ -2624,13 +2624,13 @@ fn load_module_graph_overlapped(
             // would have in evaluation (evaluating_in_loads).
             set_executing_cjs(tc, Some(path.clone()));
             crate::cjs::clear_compile_failure(tc);
-            let loaded = crate::cjs::load_cjs(tc, &path);
+            let loaded = crate::cjs::load_cjs_or_detect(tc, &path);
             set_executing_cjs(tc, None);
             // The body may have loaded and evaluated modules (a require() or
             // import() of its own), which the memo's walk read.
             invalidate_evaluating_memo(tc, None);
             match loaded {
-                Some(exports) => {
+                crate::cjs::CjsLoad::Exports(exports) => {
                     // A graph a `require()` loads runs inside the requiring
                     // statement, and node's require never runs ticks or
                     // promise jobs before it returns -- nor does a load
@@ -2647,18 +2647,16 @@ fn load_module_graph_overlapped(
                     }
                     crate::cjs::facade_source(tc, &path, exports)
                 }
-                // A typeless file (inside node_modules, where oam takes one
-                // for CommonJS) that failed to compile as CommonJS on syntax
-                // only an ES module has: node's detection makes it an ES
-                // module, so it loads as one. main's detection path also
-                // emitted node's MODULE_TYPELESS_PACKAGE_JSON here.
-                None if crate::cjs::failed_on_module_syntax(tc, &path) => {
+                // node decides the file by its syntax and it has module
+                // syntax: an ES module, not run. node's
+                // MODULE_TYPELESS_PACKAGE_JSON warning goes out, then it
+                // loads as the module it is.
+                crate::cjs::CjsLoad::Esm => {
                     let wkey = module_key(&path).unwrap_or_else(|_| path.clone());
                     crate::cjs::warn_typeless_package_json(tc, &wkey);
-                    tc.reset();
                     host.load(&path)?
                 }
-                None => {
+                crate::cjs::CjsLoad::Threw => {
                     let caught = tc.exception().map(|value| v8::Global::new(tc, value));
                     let diagnostic = catch_to_diagnostic(tc, &path.to_string_lossy());
                     if let Some(value) = caught
