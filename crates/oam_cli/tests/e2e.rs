@@ -22201,19 +22201,22 @@ events.addAbortListener(ac2.signal, () => { fired2 = true; });
 await new Promise(r => setTimeout(r, 10));
 console.log('pre_aborted_fired=' + fired2);
 
-// -- util.aborted --
+// -- util.aborted -- node's (#401): resolves with the abort Event,
+// undefined when already aborted, and a resource is required.
 const ac3 = new AbortController();
-let abortedReason = null;
-const p = util.aborted(ac3.signal).then(r => { abortedReason = r; });
+let abortedEvent = null;
+const p = util.aborted(ac3.signal, {}).then(r => { abortedEvent = r; });
 ac3.abort('test reason');
 await p;
-console.log('aborted_reason=' + abortedReason);
+console.log('aborted_event=' + abortedEvent.type + ':' + (abortedEvent.target === ac3.signal));
 
 // util.aborted on already-aborted
 const ac4 = new AbortController();
 ac4.abort('already');
-const r4 = await util.aborted(ac4.signal);
+const r4 = await util.aborted(ac4.signal, {});
 console.log('aborted_already=' + r4);
+const noResource = await util.aborted(ac4.signal).catch((err) => err.code);
+console.log('aborted_no_resource=' + noResource);
 
 // -- util.parseEnv --
 const env = util.parseEnv('FOO=bar\nBAZ="hello world"\n# comment\nEMPTY=\nQUOTED=\'single\'');
@@ -22245,8 +22248,9 @@ console.log('captureRejection=' + typeof events.captureRejectionSymbol);
         "disposable_has_dispose=true",
         "abort_fired=true",
         "pre_aborted_fired=true",
-        "aborted_reason=test reason",
-        "aborted_already=already",
+        "aborted_event=abort:true",
+        "aborted_already=undefined",
+        "aborted_no_resource=ERR_INVALID_ARG_TYPE",
         "parseEnv_FOO=bar",
         "parseEnv_BAZ=hello world",
         "parseEnv_EMPTY=\"\"",
