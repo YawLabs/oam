@@ -2563,224 +2563,12 @@ fn load_module_graph_overlapped(
             continue;
         }
 
-        // Virtual modules (node builtins + oam: runtime modules):
-        // instantiate via the snapshot registry, compile a facade module
-        // under the virtual path. Registry keys are stripped for node:
-        // ("fs") and full for oam: ("oam:test").
-        let builtin = path.to_str().and_then(|s| {
-            if let Some(stripped) = s.strip_prefix("node:") {
-                Some(stripped.to_string())
-            } else if s.starts_with("oam:") {
-                Some(s.to_string())
-            } else {
-                None
-            }
-        });
-        // CJS files take the interop path: execute eagerly through the
-        // require machinery, then compile a generated ESM facade (real
-        // runtime export names) as the module at this path. JSON files
-        // ride the same branch when they arrive via npm resolution.
-        let is_json = path.extension().and_then(|e| e.to_str()) == Some("json");
-        // Set when the pool loaded this path: the worker's cache probe
-        // (key + blob) rides along so nothing is hashed or read twice.
-        let mut prefetched = None;
-        let code = if let Some(name) = builtin {
-            let Some(exports) = crate::cjs::get_builtin(tc, &name) else {
-                return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
-            };
-            crate::cjs::builtin_facade_source(tc, &name, exports)
-        } else if is_json {
-            // JSON modules: parsed once through the CJS json loader (same
-            // cache require() uses), exposed via the facade — default is
-            // the parsed value; top-level keys are ALSO named exports, a
-            // documented superset of Node's default-only shape (TS's
-            // resolveJsonModule idiom expects the named form).
-            let Some(exports) = crate::cjs::load_cjs(tc, &path) else {
-                return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
-            };
-            crate::cjs::facade_source(tc, &path, exports)
-        } else if oam_loader::module_kind(&path) == oam_loader::ModuleKind::Cjs
-            // A typeless file inside node_modules, which oam takes for
-            // CommonJS, that a `require()` is loading as an ES module: the
-            // require() already compiled it as CommonJS and found module
-            // syntax (node's detection), so it is not run as CommonJS here --
-            // that would answer from the placeholder `require.cache` entry
-            // the require() made and build a facade around its empty
-            // exports.
-            && !crate::cjs::is_requiring_esm(tc, &path)
-        {
-            if let Some((value, diagnostic)) = tc
-                .get_slot::<ModuleMap>()
-                .and_then(|map| map.failed_cjs.get(&path))
-                .map(|(value, diagnostic)| (value.clone(), diagnostic.clone()))
-            {
-                // Its body threw in an earlier load: that error again, the
-                // body not run again (see ModuleMap::failed_cjs).
-                tc.set_slot(CaughtDuringLoad(Some(value)));
-                return Err(vec![diagnostic]);
-            }
-            // Recorded for the duration of the body, so a `require()` of an
-            // ES module from it can tell which of this graph's modules node
-            // would have in evaluation (evaluating_in_loads).
-            set_executing_cjs(tc, Some(path.clone()));
-            let loaded = crate::cjs::load_cjs_or_detect(tc, &path);
-            set_executing_cjs(tc, None);
-            // The body may have loaded and evaluated modules (a require() or
-            // import() of its own), which the memo's walk read.
-            invalidate_evaluating_memo(tc, None);
-            match loaded {
-                crate::cjs::CjsLoad::Exports(exports) => {
-                    // A graph a `require()` loads runs inside the requiring
-                    // statement, and node's require never runs ticks or
-                    // promise jobs before it returns -- nor does a load
-                    // nested inside one (an import() from a CommonJS
-                    // dependency of the required graph). Only a top-level or
-                    // import() load outside any require() drains here.
-                    if !inside_require(tc) {
-                        if let Some(failure) = run_ticks_and_microtasks(tc) {
-                            return Err(failure);
-                        }
-                        if let Some(failure) = drain_uncaught(tc) {
-                            return Err(failure);
-                        }
-                    }
-                    crate::cjs::facade_source(tc, &path, exports)
-                }
-                // node decides the file by its syntax and it has module
-                // syntax: an ES module, not run. node's
-                // MODULE_TYPELESS_PACKAGE_JSON warning goes out, then it
-                // loads as the module it is.
-                crate::cjs::CjsLoad::Esm => {
-                    let wkey = module_key(&path).unwrap_or_else(|_| path.clone());
-                    crate::cjs::warn_typeless_package_json(tc, &wkey);
-                    host.load(&path)?
-                }
-                crate::cjs::CjsLoad::Threw => {
-                    let caught = tc.exception().map(|value| v8::Global::new(tc, value));
-                    let diagnostic = catch_to_diagnostic(tc, &path.to_string_lossy());
-                    if let Some(value) = caught
-                        && !tc.has_terminated()
-                    {
-                        tc.get_slot_mut::<ModuleMap>()
-                            .expect("module map installed")
-                            .failed_cjs
-                            .insert(path.clone(), (value, diagnostic.clone()));
-                    }
-                    return Err(vec![diagnostic]);
-                }
-            }
-        } else {
-            match prefetch.take(&path) {
-                // A parked Err surfaces HERE — when the path is popped, not
-                // when the worker hit it — so error content and ordering are
-                // byte-identical to the inline call below.
-                Some(Prefetched::Loaded { code, key, cached }) => {
-                    prefetched = Some((key, cached));
-                    code
-                }
-                Some(Prefetched::Failed(diags)) => return Err(diags),
-                Some(Prefetched::Panicked(payload)) => std::panic::resume_unwind(payload),
-                None => host.load(&path)?,
-            }
+        compile_module(tc, host, &path, Some(&mut *prefetch))?;
+        let module = {
+            let map = tc.get_slot::<ModuleMap>().expect("module map installed");
+            let global = map.by_path.get(&path).expect("just compiled").clone();
+            v8::Local::new(tc, &global)
         };
-        let file = path.to_string_lossy().into_owned();
-
-        let source_str = v8::String::new(tc, &code).ok_or_else(|| {
-            rt_diag(
-                "OAM-RT0001",
-                format!("{file}: source too long for V8 string"),
-            )
-        })?;
-        let name: v8::Local<v8::Value> = v8::String::new(tc, &file)
-            .ok_or_else(|| rt_diag("OAM-RT0001", format!("{file}: path too long for V8 string")))?
-            .into();
-        let origin = v8::ScriptOrigin::new(
-            tc, name, 0, 0, false, 0, None, false, false, /* is_module */ true, None,
-        );
-        // V8 bytecode cache (B3b): consume a stored blob for this module
-        // source if present (skips parse + top-level compile), else compile
-        // fresh. Keyed by source + V8 version + oam format, so a foreign blob
-        // is never deserialized here; V8's rejected() guards a stale one. The
-        // key is computed once and kept for the post-evaluate store. `cached`
-        // is held across the compile because CachedData borrows it
-        // (BufferNotOwned). Applies to every module source -- real ESM files
-        // AND the generated builtin/CJS/JSON facades, all of which are
-        // deterministic for a given source string (a different facade is a
-        // different key, hence a miss, never a wrong hit).
-        let (cache_key, cached) = match prefetched {
-            // The pool already derived the key and probed the cache for this
-            // exact source; reuse both.
-            Some((key, cached)) => (key, cached),
-            None => {
-                let key = crate::code_cache::enabled()
-                    .then(|| crate::code_cache::key_for(&code, crate::code_cache::Kind::Module));
-                let cached = key.as_ref().and_then(crate::code_cache::load);
-                (key, cached)
-            }
-        };
-        let consuming = cached.is_some();
-        let seeded = cached.as_ref().is_some_and(|c| c.seeded);
-        let mut source = match cached {
-            Some(ref c) => v8::script_compiler::Source::new_with_cached_data(
-                source_str,
-                Some(&origin),
-                v8::script_compiler::CachedData::new(&c.bytes),
-            ),
-            None => v8::script_compiler::Source::new(source_str, Some(&origin)),
-        };
-        let compile_options = if consuming {
-            v8::script_compiler::CompileOptions::ConsumeCodeCache
-        } else {
-            v8::script_compiler::CompileOptions::NoCompileOptions
-        };
-
-        let Some(module) = v8::script_compiler::compile_module2(
-            tc,
-            &mut source,
-            compile_options,
-            v8::script_compiler::NoCacheReason::NoReason,
-        ) else {
-            return Err(vec![catch_to_diagnostic(tc, &file)]);
-        };
-
-        // On a miss (or if V8 rejected a stale blob) remember the key: the
-        // blob is produced AFTER the graph evaluates (store_pending_code_cache)
-        // so it carries bytecode for the functions evaluation compiled, not
-        // just the top level -- the same produce-after-run shape as the CJS
-        // site. Nothing is serialized here. A rejected SEED is dropped AND
-        // recorded on disk (tombstone) so neither a later load in this
-        // process nor a later run of the same binary is handed the rejected
-        // bytes again. A None key means the cache is off (OAM_CODE_CACHE=0),
-        // which leaves no residual bookkeeping.
-        let rejected = consuming
-            && source
-                .get_cached_data()
-                .map(|cd| cd.rejected())
-                .unwrap_or(true);
-        if rejected
-            && seeded
-            && let Some(cache_key) = &cache_key
-        {
-            crate::code_cache::record_seed_rejection(cache_key);
-        }
-        let refresh_cache = !consuming || rejected;
-
-        let hash = module.get_identity_hash();
-        let global = v8::Global::new(tc, module);
-        {
-            let map = tc
-                .get_slot_mut::<ModuleMap>()
-                .expect("module map installed");
-            map.by_path.insert(path.clone(), global);
-            map.paths_by_hash
-                .entry(hash)
-                .or_default()
-                .push(path.clone());
-            if refresh_cache && let Some(cache_key) = cache_key {
-                map.pending_code_cache.push((path.clone(), cache_key));
-            }
-        }
-
         invalidate_evaluating_memo(tc, Some(&path));
         resolve_imports(tc, host, &path, module, prefetch, &mut work)?;
     }
@@ -2891,6 +2679,237 @@ fn resolve_imports(
             prefetch.enqueue(&resolved);
         }
         work.push_back(resolved);
+    }
+    Ok(())
+}
+
+/// Compile the module at `path` (not yet in the module map) and register it:
+/// an ES module from its source, a builtin, JSON or CommonJS file as a facade
+/// over its exports -- which runs a CommonJS file, then and there. Its
+/// requests are left for the caller, which resolves and loads them next.
+/// `prefetch` hands over a source the pool already loaded.
+fn compile_module(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    host: &dyn ModuleHost,
+    path: &Path,
+    mut prefetch: Option<&mut GraphPrefetcher<'_, '_>>,
+) -> Result<(), Vec<Diagnostic>> {
+    // Virtual modules (node builtins + oam: runtime modules):
+    // instantiate via the snapshot registry, compile a facade module
+    // under the virtual path. Registry keys are stripped for node:
+    // ("fs") and full for oam: ("oam:test").
+    let builtin = path.to_str().and_then(|s| {
+        if let Some(stripped) = s.strip_prefix("node:") {
+            Some(stripped.to_string())
+        } else if s.starts_with("oam:") {
+            Some(s.to_string())
+        } else {
+            None
+        }
+    });
+    // CJS files take the interop path: execute eagerly through the
+    // require machinery, then compile a generated ESM facade (real
+    // runtime export names) as the module at this path. JSON files
+    // ride the same branch when they arrive via npm resolution.
+    let is_json = path.extension().and_then(|e| e.to_str()) == Some("json");
+    // Set when the pool loaded this path: the worker's cache probe
+    // (key + blob) rides along so nothing is hashed or read twice.
+    let mut prefetched = None;
+    let code = if let Some(name) = builtin {
+        let Some(exports) = crate::cjs::get_builtin(tc, &name) else {
+            return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
+        };
+        crate::cjs::builtin_facade_source(tc, &name, exports)
+    } else if is_json {
+        // JSON modules: parsed once through the CJS json loader (same
+        // cache require() uses), exposed via the facade — default is
+        // the parsed value; top-level keys are ALSO named exports, a
+        // documented superset of Node's default-only shape (TS's
+        // resolveJsonModule idiom expects the named form).
+        let Some(exports) = crate::cjs::load_cjs(tc, path) else {
+            return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
+        };
+        crate::cjs::facade_source(tc, path, exports)
+    } else if oam_loader::module_kind(path) == oam_loader::ModuleKind::Cjs
+        // A typeless file inside node_modules, which oam takes for
+        // CommonJS, that a `require()` is loading as an ES module: the
+        // require() already compiled it as CommonJS and found module
+        // syntax (node's detection), so it is not run as CommonJS here --
+        // that would answer from the placeholder `require.cache` entry
+        // the require() made and build a facade around its empty
+        // exports.
+        && !crate::cjs::is_requiring_esm(tc, path)
+    {
+        if let Some((value, diagnostic)) = tc
+            .get_slot::<ModuleMap>()
+            .and_then(|map| map.failed_cjs.get(path))
+            .map(|(value, diagnostic)| (value.clone(), diagnostic.clone()))
+        {
+            // Its body threw in an earlier load: that error again, the
+            // body not run again (see ModuleMap::failed_cjs).
+            tc.set_slot(CaughtDuringLoad(Some(value)));
+            return Err(vec![diagnostic]);
+        }
+        // Recorded for the duration of the body, so a `require()` of an
+        // ES module from it can tell which of this graph's modules node
+        // would have in evaluation (evaluating_in_loads).
+        set_executing_cjs(tc, Some(path.to_path_buf()));
+        let loaded = crate::cjs::load_cjs_or_detect(tc, path);
+        set_executing_cjs(tc, None);
+        // The body may have loaded and evaluated modules (a require() or
+        // import() of its own), which the memo's walk read.
+        invalidate_evaluating_memo(tc, None);
+        match loaded {
+            crate::cjs::CjsLoad::Exports(exports) => {
+                // A graph a `require()` loads runs inside the requiring
+                // statement, and node's require never runs ticks or
+                // promise jobs before it returns -- nor does a load
+                // nested inside one (an import() from a CommonJS
+                // dependency of the required graph). Only a top-level or
+                // import() load outside any require() drains here.
+                if !inside_require(tc) {
+                    if let Some(failure) = run_ticks_and_microtasks(tc) {
+                        return Err(failure);
+                    }
+                    if let Some(failure) = drain_uncaught(tc) {
+                        return Err(failure);
+                    }
+                }
+                crate::cjs::facade_source(tc, path, exports)
+            }
+            // node decides the file by its syntax and it has module
+            // syntax: an ES module, not run. node's
+            // MODULE_TYPELESS_PACKAGE_JSON warning goes out, then it
+            // loads as the module it is.
+            crate::cjs::CjsLoad::Esm => {
+                let wkey = module_key(path).unwrap_or_else(|_| path.to_path_buf());
+                crate::cjs::warn_typeless_package_json(tc, &wkey);
+                host.load(path)?
+            }
+            crate::cjs::CjsLoad::Threw => {
+                let caught = tc.exception().map(|value| v8::Global::new(tc, value));
+                let diagnostic = catch_to_diagnostic(tc, &path.to_string_lossy());
+                if let Some(value) = caught
+                    && !tc.has_terminated()
+                {
+                    tc.get_slot_mut::<ModuleMap>()
+                        .expect("module map installed")
+                        .failed_cjs
+                        .insert(path.to_path_buf(), (value, diagnostic.clone()));
+                }
+                return Err(vec![diagnostic]);
+            }
+        }
+    } else {
+        match prefetch.as_mut().and_then(|prefetch| prefetch.take(path)) {
+            // A parked Err surfaces HERE — when the path is popped, not
+            // when the worker hit it — so error content and ordering are
+            // byte-identical to the inline call below.
+            Some(Prefetched::Loaded { code, key, cached }) => {
+                prefetched = Some((key, cached));
+                code
+            }
+            Some(Prefetched::Failed(diags)) => return Err(diags),
+            Some(Prefetched::Panicked(payload)) => std::panic::resume_unwind(payload),
+            None => host.load(path)?,
+        }
+    };
+    let file = path.to_string_lossy().into_owned();
+
+    let source_str = v8::String::new(tc, &code).ok_or_else(|| {
+        rt_diag(
+            "OAM-RT0001",
+            format!("{file}: source too long for V8 string"),
+        )
+    })?;
+    let name: v8::Local<v8::Value> = v8::String::new(tc, &file)
+        .ok_or_else(|| rt_diag("OAM-RT0001", format!("{file}: path too long for V8 string")))?
+        .into();
+    let origin = v8::ScriptOrigin::new(
+        tc, name, 0, 0, false, 0, None, false, false, /* is_module */ true, None,
+    );
+    // V8 bytecode cache (B3b): consume a stored blob for this module
+    // source if present (skips parse + top-level compile), else compile
+    // fresh. Keyed by source + V8 version + oam format, so a foreign blob
+    // is never deserialized here; V8's rejected() guards a stale one. The
+    // key is computed once and kept for the post-evaluate store. `cached`
+    // is held across the compile because CachedData borrows it
+    // (BufferNotOwned). Applies to every module source -- real ESM files
+    // AND the generated builtin/CJS/JSON facades, all of which are
+    // deterministic for a given source string (a different facade is a
+    // different key, hence a miss, never a wrong hit).
+    let (cache_key, cached) = match prefetched {
+        // The pool already derived the key and probed the cache for this
+        // exact source; reuse both.
+        Some((key, cached)) => (key, cached),
+        None => {
+            let key = crate::code_cache::enabled()
+                .then(|| crate::code_cache::key_for(&code, crate::code_cache::Kind::Module));
+            let cached = key.as_ref().and_then(crate::code_cache::load);
+            (key, cached)
+        }
+    };
+    let consuming = cached.is_some();
+    let seeded = cached.as_ref().is_some_and(|c| c.seeded);
+    let mut source = match cached {
+        Some(ref c) => v8::script_compiler::Source::new_with_cached_data(
+            source_str,
+            Some(&origin),
+            v8::script_compiler::CachedData::new(&c.bytes),
+        ),
+        None => v8::script_compiler::Source::new(source_str, Some(&origin)),
+    };
+    let compile_options = if consuming {
+        v8::script_compiler::CompileOptions::ConsumeCodeCache
+    } else {
+        v8::script_compiler::CompileOptions::NoCompileOptions
+    };
+
+    let Some(module) = v8::script_compiler::compile_module2(
+        tc,
+        &mut source,
+        compile_options,
+        v8::script_compiler::NoCacheReason::NoReason,
+    ) else {
+        return Err(vec![catch_to_diagnostic(tc, &file)]);
+    };
+
+    // On a miss (or if V8 rejected a stale blob) remember the key: the
+    // blob is produced AFTER the graph evaluates (store_pending_code_cache)
+    // so it carries bytecode for the functions evaluation compiled, not
+    // just the top level -- the same produce-after-run shape as the CJS
+    // site. Nothing is serialized here. A rejected SEED is dropped AND
+    // recorded on disk (tombstone) so neither a later load in this
+    // process nor a later run of the same binary is handed the rejected
+    // bytes again. A None key means the cache is off (OAM_CODE_CACHE=0),
+    // which leaves no residual bookkeeping.
+    let rejected = consuming
+        && source
+            .get_cached_data()
+            .map(|cd| cd.rejected())
+            .unwrap_or(true);
+    if rejected
+        && seeded
+        && let Some(cache_key) = &cache_key
+    {
+        crate::code_cache::record_seed_rejection(cache_key);
+    }
+    let refresh_cache = !consuming || rejected;
+
+    let hash = module.get_identity_hash();
+    let global = v8::Global::new(tc, module);
+    {
+        let map = tc
+            .get_slot_mut::<ModuleMap>()
+            .expect("module map installed");
+        map.by_path.insert(path.to_path_buf(), global);
+        map.paths_by_hash
+            .entry(hash)
+            .or_default()
+            .push(path.to_path_buf());
+        if refresh_cache && let Some(cache_key) = cache_key {
+            map.pending_code_cache.push((path.to_path_buf(), cache_key));
+        }
     }
     Ok(())
 }
