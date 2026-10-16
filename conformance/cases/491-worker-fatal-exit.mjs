@@ -14,6 +14,11 @@
 //     rejection of a non-Error as node's ERR_UNHANDLED_REJECTION error;
 //   * nothing is printed by the runtime itself (the parent handles 'error').
 //
+// The error the parent gets is the one that ended the run: what an
+// uncaughtException listener threw in place of the original (with nothing of
+// oam's own bookkeeping on it), not a failed dynamic import() the worker
+// caught; and a cause chain 40 deep arrives whole.
+//
 // (The listener writes to a file, not through parentPort: node delivers the
 // error on the worker's internal port, so its order against a user message
 // is not fixed.)
@@ -26,7 +31,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker, isMainThread, workerData } from "node:worker_threads";
 
 const self = fileURLToPath(import.meta.url);
@@ -54,6 +59,19 @@ if (kind === "throw-symbol") throw Symbol("s");
 if (kind === "throw-undefined") throw undefined;
 if (kind === "throw-function") throw function named() {};
 if (kind === "cause") throw new Error("outer", { cause: new TypeError("inner") });
+if (kind === "deep-cause") {
+  let e = new Error("level 0");
+  for (let i = 1; i < 40; i++) e = new Error("level " + i, { cause: e });
+  throw e;
+}
+if (kind === "handler-rethrow") {
+  process.on("uncaughtException", () => { throw new Error("again"); });
+  throw new Error("first");
+}
+if (kind === "dyn-import") {
+  const bad = require("node:url").pathToFileURL(require("node:path").join(__dirname, "bad.mjs")).href;
+  import(bad).catch(() => setTimeout(() => { throw new Error("after a caught import"); }, 1));
+}
 `;
 
 function describe(e) {
@@ -75,7 +93,9 @@ function describe(e) {
   }
   if ("cause" in e) {
     const cause = e.cause;
-    parts.push(`cause ${Object.getPrototypeOf(cause).constructor.name} ${cause.message}`);
+    let depth = 0;
+    for (let c = e; c !== null && typeof c === "object" && "cause" in c; c = c.cause) depth++;
+    parts.push(`cause ${Object.getPrototypeOf(cause).constructor.name} ${cause.message} depth ${depth}`);
   }
   if (e instanceof Error) {
     const tag = Object.getOwnPropertyDescriptor(e, Symbol.toStringTag);
@@ -92,21 +112,36 @@ if (!isMainThread) {
     fs.appendFileSync(workerData.log, `exit listener ${code} exitCode ${process.exitCode}; `);
     Promise.resolve().then(() => fs.appendFileSync(workerData.log, "exit listener promise job; "));
   });
-  throw new SyntaxError(`boom ${workerData.kind}`);
+  if (workerData.kind === "esm-dyn-import") {
+    // A failed import() the worker catches -- one that does not compile, one
+    // that throws as it runs -- is not the error that ends the run.
+    const dir = path.dirname(workerData.log);
+    for (const name of ["bad.mjs", "throws.mjs"]) {
+      try {
+        await import(pathToFileURL(path.join(dir, name)).href);
+      } catch {}
+    }
+    setTimeout(() => { throw new Error("after a caught import"); }, 1);
+  } else {
+    throw new SyntaxError(`boom ${workerData.kind}`);
+  }
 } else if (process.argv[2] === "stage") {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oam-491-"));
   const file = path.join(dir, "w.cjs");
   fs.writeFileSync(file, fixture);
+  fs.writeFileSync(path.join(dir, "bad.mjs"), "let x = ;\n");
+  fs.writeFileSync(path.join(dir, "throws.mjs"), "throw new TypeError(\"as it runs\");\n");
   const kinds = [
     "sync", "timer", "reject", "reject-string", "throw-42", "throw-object",
-    "custom", "exitcode", "throw-symbol", "throw-undefined", "throw-function", "cause", "esm",
+    "custom", "exitcode", "throw-symbol", "throw-undefined", "throw-function", "cause", "deep-cause",
+    "handler-rethrow", "dyn-import", "esm", "esm-dyn-import",
   ];
   for (const kind of kinds) {
     await new Promise((resolve) => {
       const log = path.join(dir, `${kind}.log`);
       fs.writeFileSync(log, "");
       const logged = () => `[log: ${fs.readFileSync(log, "utf8")}]`;
-      const worker = new Worker(kind === "esm" ? self : file, { workerData: { kind, log } });
+      const worker = new Worker(kind.startsWith("esm") ? self : file, { workerData: { kind, log } });
       const seen = [];
       worker.on("message", (m) => seen.push(`message ${m}`));
       worker.on("error", (e) => seen.push(`error ${logged()} ${describe(e)}`));

@@ -10,6 +10,8 @@
 //     none). So `execArgv: []` under a parent run with `--no-warnings` has
 //     the default 'warning' listener back, and `env: {}` drops a parent's
 //     NODE_OPTIONS;
+//   * a worker that a worker creates with neither inherits the options of
+//     the worker that created it, not the main thread's;
 //   * NODE_NO_WARNINGS is read from the worker's own process.env: an `env`
 //     that sets it takes the listener off, one that leaves it out keeps it
 //     even when the parent's environment had it.
@@ -39,7 +41,12 @@ const clean = (text) =>
     .join("\n")
     .replace(/\((node|oam):\d+\)/g, "(PID)");
 
-if (!isMainThread) {
+if (!isMainThread && workerData.nest) {
+  // A worker that creates one with no options: the inner worker inherits
+  // this worker's options, not the main thread's.
+  const inner = new Worker(self, { workerData: `${workerData.label} inner` });
+  inner.on("message", (m) => parentPort.postMessage(m));
+} else if (!isMainThread) {
   parentPort.postMessage({
     lc: process.listenerCount("warning"),
     nd: process.noDeprecation === true,
@@ -58,10 +65,15 @@ if (!isMainThread) {
     ["SHARE_ENV", { env: SHARE_ENV }],
     ["stderr", { stderr: true }],
     ["stderr env NODE_NO_WARNINGS", { stderr: true, env: { NODE_NO_WARNINGS: "1" } }],
+    ["nested execArgv --no-warnings", { execArgv: ["--no-warnings"] }, true],
+    ["nested execArgv --tls-min-v1.3", { execArgv: ["--tls-min-v1.3"] }, true],
+    ["nested env NODE_OPTIONS", { env: { NODE_OPTIONS: "--no-deprecation" } }, true],
+    ["nested env {}", { env: {} }, true],
   ];
-  for (const [label, options] of rows) {
+  for (const [label, options, nest] of rows) {
     await new Promise((resolve) => {
-      const worker = new Worker(self, { ...options, workerData: label });
+      const data = nest ? { label, nest } : label;
+      const worker = new Worker(self, { ...options, workerData: data });
       let captured = "";
       if (options.stderr) worker.stderr.on("data", (chunk) => (captured += chunk));
       let report;
