@@ -3655,6 +3655,12 @@ socket file is unlinked on close, as libuv does; on Windows the close closes eve
 instance still waiting for a client before it returns, as libuv's does -- up to 0.19.1 they
 stayed open until the server's accept woke, and a dial right after `close()` could connect
 to one and be dropped; #388, `conformance/cases/560-net-pipe-closed-server-gone-at-once.mjs`).
+So does one a client has connected to that the server has not yet emitted `'connection'`
+for: it is closed with the server, its client reads `'end'`, and the name can be listened
+on again in the same tick -- up to 0.19.1 it stayed open until the server's accept loop
+reset it a tick later, so a same-tick open was `EBUSY`, a same-tick `listen` `EADDRINUSE`,
+and a dial waited out `WaitNamedPipeW`'s 30 s to `ETIMEDOUT`
+(`conformance/cases/561-net-pipe-closed-server-drops-unaccepted-client.mjs`).
 On Windows the name goes to the OS as written: `\\.\pipe\x`, `\\?\pipe\x`,
 `//./pipe/x` and another letter case name one pipe; a name that is not a pipe's cannot be
 listened on (`listen EACCES`), and dialling a regular file is `ENOTSOCK`, a directory
@@ -3731,6 +3737,16 @@ booting and then failing every browser tool.
   rarely authenticates; a script that wants remote clients should listen on TCP. Pinned by
   the unit test `a_client_dialling_through_a_unc_server_name_is_refused_as_remote`
   (`crates/oam_core/src/pipe.rs`). _(measured)_
+- **Windows: which side of an in-process pipe connection hears first.** When a script dials
+  its own pipe server, Node always runs the client's `'connect'` callback before the server
+  emits `'connection'` (libuv runs the dial's callback from its pending queue, ahead of the
+  completion port the accept comes in on); on oam the server's `'connection'` can come
+  first -- in 7 of 20 rounds of a dial-then-`close()` probe, against 0 of 20 on v22.22.2.
+  A script that closes the server in the client's `'connect'` callback then finds the
+  connection already handed to the server, which, as on Node, outlives the close: the name
+  stays taken until the connection goes (a dial waits for an instance and gets `ETIMEDOUT`
+  after 30 s, a `listen` is `EADDRINUSE`). Case 561 counts only the rounds where the server
+  has not emitted `'connection'` yet. Not yet worked on. _(measured)_
 - **Windows: many clients at once.** As libuv, oam keeps four pipe instances waiting for
   clients, makes the next as soon as a client takes one, and a client that finds every
   instance taken waits for one with `WaitNamedPipeW`, up to 30 s (`ETIMEDOUT` after that). At

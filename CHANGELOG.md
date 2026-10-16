@@ -23,7 +23,10 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   and dropped them, so a client that dialled the name right after `close()` could connect to one
   and then see the pipe dropped (or, from `fs.openSync`, get an fd) where node gives `ENOENT`. The
   close now disconnects every waiting instance, so none takes a client, and returns once they are
-  closed (#388). Unchanged, by decision: an oam pipe server still refuses clients that reach it
+  closed (#388). A client that had connected but not yet been handed to the server (no
+  `'connection'` yet) is closed with it too and reads `'end'`; its pipe instance used to stay open
+  until the next tick, so a dial right after `close()` waited 30 s for `ETIMEDOUT`, and a `listen`
+  on the name in the same tick was `EADDRINUSE`. Unchanged, by decision: an oam pipe server still refuses clients that reach it
   through a UNC server name, `\\localhost\pipe\x` included, with `EPERM`, where node's accepts them
   (#385; see `docs/node-divergences.md`, entry 50).
 
