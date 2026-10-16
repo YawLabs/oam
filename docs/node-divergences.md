@@ -881,11 +881,13 @@ things follow:
   reach the cycle at different points it can name a different module and use the other
   wording of the two node has: oam's `Cannot import Module ./e.mjs in a cycle. (from
   b.mjs)` where node says `Cannot require() ES Module b.mjs in a cycle. (from c.cjs)`;
-- an `import()` that such a CommonJS module makes loads and evaluates its graph inside the
-  `require()` (see "A module `import()` loads is evaluated inside the import"), where node
-  does it after the `require()` has returned and the requiring code's ticks and promise
-  jobs have run. The requiring code's own ticks and promise jobs still wait until the
-  `require()` returns, as in node (conformance case 441).
+- an `import()` that such a CommonJS module makes is only resolved inside the
+  `require()`; its graph loads and evaluates in promise jobs after the `require()` has
+  returned, as node's does (#397). The requiring code's own ticks and promise jobs wait
+  until the `require()` returns, as in node (conformance case 441). What still differs is
+  when a CommonJS module that `import()` loads runs: on the first microtask turn after the
+  call in oam, where node runs it on the eighth (with the evaluation of an ES module in the
+  same place). When that `import()` settles is node's either way (conformance case 481).
 
 One message differs on its own: an unresolved bare specifier whose package was found but
 whose file was not is `ERR_MODULE_NOT_FOUND` with oam's message, which lists the
@@ -4056,16 +4058,17 @@ way; the difference is that a symlink needs the create-symlink privilege (Develo
 an elevated process), which a junction does not, so where that privilege is missing oam's
 call fails `EPERM` and node's succeeds. Measured against v22.22.2 (conformance case 377).
 
-### A module `import()` loads is evaluated inside the import
+### A module `import()` loads is evaluated inside the import -- FIXED, no longer a divergence (#397)
 
-oam evaluates a module that `import()` loads synchronously, inside its import hook, while the
-importer's frame is still on the stack. node loads and evaluates it in a later job, inside a
-microtask drain. So the imported module's synchronous top level runs before the importer's
-next statement, where in node it runs after the importer's own synchronous code and promise
-jobs, and its `process.nextTick` callbacks run ahead of ticks the importer queued after the
-call. From CommonJS they also run before the importer's continuation: `micro | tick | after
-import` where node prints `micro | after import | tick`. Only an ES module that awaits
-`import()` as its first step lines up with node. Tracked in #397.
+This entry used to record that oam evaluated a module `import()` loads synchronously, inside
+its import hook, with the importer's frame on the stack, and checkpointed microtasks there: the
+module's top level ran before the importer's next statement, its `process.nextTick` callbacks
+ran before the importer's continuation (`micro | tick | after import` where node prints `micro
+| after import | tick`), and a CommonJS importer's own promise jobs ran ahead of its ticks.
+`import()` now runs node's loader chain (js/esm_loader.js, docs/design/dynamic-import.md): the
+specifier is resolved inside the call and everything else happens in promise jobs, on the turns
+node's do (conformance cases 480 and 481). What is left is when a CommonJS module the graph
+imports runs, which entry 52 records.
 
 An ES module's own top level orders ticks after its promise jobs, as node's does (#345,
 conformance case 411). A `.js` or `.ts` file with no package.json "type" runs as an ES module

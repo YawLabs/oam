@@ -715,6 +715,9 @@ impl JsRuntime {
             // util.inspect-powered console, defined by node_compat.js in
             // the snapshot and instantiated here against live natives.
             install_runtime_globals(scope, context);
+            // import()'s loader (js/esm_loader.js), bound to its ops before
+            // any user code can touch the intrinsics it captures.
+            modules::install_dynamic_import(scope, context);
             global
         };
         Self {
