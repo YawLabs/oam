@@ -2048,18 +2048,23 @@ fn op_tty_init(
     rv.set_int32(tty_init_verdict(file.as_deref()));
 }
 
-/// `uv_tty_init` (src/win/tty.c): a descriptor with no OS handle is EBADF,
-/// and a handle that is no console fails `GetConsoleScreenBufferInfo` with
-/// ERROR_INVALID_HANDLE, which is EBADF too. Measured under node v22.22.2: an
-/// unopened descriptor, a disk file, NUL, a pipe and an msys/cygwin pty pipe
-/// all answer EBADF -- the last is why this asks guess_handle (a console
-/// character device) and not std's IsTerminal, which takes that pipe (#391).
+/// `uv_tty_init` (src/win/tty.c): a descriptor with no OS handle is EBADF;
+/// any other handle is asked what libuv asks it ([`probe_console`]) and
+/// refused with the first failing call's error. Measured under node v22.22.2:
+/// an unopened descriptor, a disk file, NUL, a pipe and an msys/cygwin pty
+/// pipe all answer EBADF (#391) -- the pipe even though std's IsTerminal
+/// takes it -- and a console opened by name is EPERM when its access does
+/// not let libuv use it: write-only, or a screen buffer opened without
+/// write access, which `isatty` still calls a terminal (#381).
 #[cfg(windows)]
 fn tty_init_verdict(file: Option<&std::fs::File>) -> i32 {
-    use oam_core::stdin::{HandleType, guess_handle};
+    use std::os::windows::io::AsRawHandle;
     match file {
-        Some(file) if guess_handle(file) == HandleType::Tty => 0,
-        _ => -4083,
+        Some(file) => tty_init_errno(probe_console(
+            file.as_raw_handle() as isize,
+            ConsoleAsk::TtyInit,
+        )),
+        None => -4083,
     }
 }
 
@@ -2533,6 +2538,49 @@ fn file_win_size(file: &std::fs::File) -> Option<(i32, i32)> {
 /// is no console screen buffer (an input handle, a pipe, a file).
 #[cfg(windows)]
 fn console_win_size(h: isize) -> Option<(i32, i32)> {
+    match probe_console(h, ConsoleAsk::WindowSize) {
+        ConsoleProbe::Screen { cols, rows } if cols > 0 && rows > 0 => Some((cols, rows)),
+        _ => None,
+    }
+}
+
+/// What [`probe_console`] is asked for.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsoleAsk {
+    /// The screen buffer's visible window, and nothing else.
+    WindowSize,
+    /// What libuv's `uv_tty_init` asks of the handle, in its order.
+    TtyInit,
+}
+
+/// A console handle's answer to [`probe_console`].
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsoleProbe {
+    /// GetNumberOfConsoleInputEvents answered (asked under `TtyInit` only):
+    /// a console input buffer opened for reading. uv_tty_init stops there.
+    ReadableInput,
+    /// A screen buffer, with its visible window's size; under `TtyInit` its
+    /// cursor info could be read too.
+    Screen { cols: i32, rows: i32 },
+    /// The Win32 error of the first call that failed.
+    Failed(i32),
+}
+
+/// Ask the console behind `h`. One FFI site for the window size and for the
+/// uv_tty_init question, which both start from GetConsoleScreenBufferInfo.
+///
+/// uv_tty_init (src/win/tty.c) takes a handle GetNumberOfConsoleInputEvents
+/// answers -- console input with read access -- and asks anything else for
+/// its screen buffer info and then its cursor info, returning the first
+/// failure. Measured on Windows 11 26200 under ConPTY: GetConsoleCursorInfo
+/// is ERROR_ACCESS_DENIED on a screen buffer opened without write access
+/// (CONOUT$ `r`, `a+`), GetConsoleScreenBufferInfo ERROR_ACCESS_DENIED on one
+/// opened without read access (`w`, `a`, CONIN$ `w` included) and
+/// ERROR_INVALID_HANDLE on anything that is no console (NUL, a file, a pipe).
+#[cfg(windows)]
+fn probe_console(h: isize, ask: ConsoleAsk) -> ConsoleProbe {
     #[allow(dead_code)]
     #[repr(C)]
     struct Coord {
@@ -2555,29 +2603,95 @@ fn console_win_size(h: isize) -> Option<(i32, i32)> {
         window: SmallRect,
         max_window: Coord,
     }
-    // ABI: the signature matches the Win32 ABI (HANDLE + out
-    // CONSOLE_SCREEN_BUFFER_INFO*), and the `#[repr(C)]` Csbi/Coord/SmallRect
-    // layout mirrors the OS struct so the out-write lands in the right fields.
-    unsafe extern "system" {
-        fn GetConsoleScreenBufferInfo(h: isize, info: *mut Csbi) -> i32;
+    #[allow(dead_code)]
+    #[repr(C)]
+    struct CursorInfo {
+        size: u32,
+        visible: i32,
     }
-    // SAFETY: Csbi is `#[repr(C)]` plain integer data, so an all-zero bit
-    // pattern is a valid instance. `info` is a live stack struct passed by
-    // `&mut`; its fields are only read after the return is checked non-zero.
-    // `h` is passed by value and only named to the kernel: a std handle
-    // already checked for 0 / -1, or the live handle of a file the caller
-    // holds. One that is no console fails the call and is never dereferenced.
+    let failed =
+        || ConsoleProbe::Failed(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+    // ABI: the signatures match the Win32 console ABI (HANDLE + out
+    // DWORD* / CONSOLE_SCREEN_BUFFER_INFO* / CONSOLE_CURSOR_INFO*), and the
+    // `#[repr(C)]` Csbi/Coord/SmallRect/CursorInfo layouts mirror the OS
+    // structs so each out-write lands in the right fields.
+    unsafe extern "system" {
+        fn GetNumberOfConsoleInputEvents(h: isize, events: *mut u32) -> i32;
+        fn GetConsoleScreenBufferInfo(h: isize, info: *mut Csbi) -> i32;
+        fn GetConsoleCursorInfo(h: isize, info: *mut CursorInfo) -> i32;
+    }
+    // SAFETY: Csbi and CursorInfo are `#[repr(C)]` plain integer data, so an
+    // all-zero bit pattern is a valid instance of each. Every out-parameter
+    // is a live stack value passed by `&mut`, read only after its call's
+    // return is checked non-zero. `h` is passed by value and only named to
+    // the kernel: a std handle already checked for 0 / -1, or the live
+    // handle of a file the caller holds. One that is no console fails the
+    // calls and is never dereferenced. `failed` reads GetLastError straight
+    // after the call that failed, before anything can move it.
     unsafe {
+        if ask == ConsoleAsk::TtyInit {
+            let mut events: u32 = 0;
+            if GetNumberOfConsoleInputEvents(h, &mut events) != 0 {
+                return ConsoleProbe::ReadableInput;
+            }
+        }
         let mut info: Csbi = std::mem::zeroed();
         if GetConsoleScreenBufferInfo(h, &mut info) == 0 {
-            return None;
+            return failed();
         }
-        let cols = info.window.right as i32 - info.window.left as i32 + 1;
-        let rows = info.window.bottom as i32 - info.window.top as i32 + 1;
-        if cols <= 0 || rows <= 0 {
-            return None;
+        if ask == ConsoleAsk::TtyInit {
+            let mut cursor: CursorInfo = std::mem::zeroed();
+            if GetConsoleCursorInfo(h, &mut cursor) == 0 {
+                return failed();
+            }
         }
-        Some((cols, rows))
+        ConsoleProbe::Screen {
+            cols: info.window.right as i32 - info.window.left as i32 + 1,
+            rows: info.window.bottom as i32 - info.window.top as i32 + 1,
+        }
+    }
+}
+
+/// uv_tty_init's return for a probe's answer: 0 for a console it takes, the
+/// failing call's error translated as libuv's uv_translate_sys_error does
+/// otherwise (ERROR_ACCESS_DENIED is EPERM, ERROR_INVALID_HANDLE EBADF).
+#[cfg(windows)]
+fn tty_init_errno(probe: ConsoleProbe) -> i32 {
+    match probe {
+        ConsoleProbe::ReadableInput | ConsoleProbe::Screen { .. } => 0,
+        ConsoleProbe::Failed(code) => {
+            let err = std::io::Error::from_raw_os_error(code);
+            // libuv's UV_UNKNOWN for an error it cannot name.
+            oam_core::node_errno(oam_core::node_error_code(&err), &err).unwrap_or(-4094)
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tty_init_tests {
+    use super::{ConsoleProbe, tty_init_errno};
+
+    #[test]
+    fn a_console_uv_tty_init_takes_is_zero() {
+        assert_eq!(tty_init_errno(ConsoleProbe::ReadableInput), 0);
+        assert_eq!(
+            tty_init_errno(ConsoleProbe::Screen {
+                cols: 120,
+                rows: 40
+            }),
+            0
+        );
+        // A zero-sized window is still a console uv_tty_init takes; only the
+        // size read refuses it.
+        assert_eq!(tty_init_errno(ConsoleProbe::Screen { cols: 0, rows: 0 }), 0);
+    }
+
+    #[test]
+    fn a_refusal_is_the_failing_calls_error_as_libuv_names_it() {
+        // ERROR_ACCESS_DENIED: a console whose access libuv cannot use.
+        assert_eq!(tty_init_errno(ConsoleProbe::Failed(5)), -4048);
+        // ERROR_INVALID_HANDLE: no console at all.
+        assert_eq!(tty_init_errno(ConsoleProbe::Failed(6)), -4083);
     }
 }
 
