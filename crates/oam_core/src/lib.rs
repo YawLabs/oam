@@ -978,6 +978,25 @@ fn fd_is_open(raw: i32) -> bool {
     unsafe { libc::fcntl(raw, libc::F_GETFD) != -1 }
 }
 
+/// The snapshot's fds that `disable_stdio_inheritance` should act on: inherited
+/// at start, not since consumed by `close_inherited_fd`, and at or above fd 3.
+///
+/// Split out from the platform I/O so the selection can be tested directly. The
+/// `fd >= 3` filter is restated here even though the snapshot starts at 3, so
+/// the unix rule (NEVER 0-2 -- see `disable_stdio_inheritance`) can never be
+/// broken by a change to the snapshot.
+fn inheritable_fds_to_disable(
+    snapshot: &std::collections::HashSet<u64>,
+    consumed: &std::collections::HashSet<u64>,
+) -> Vec<i32> {
+    snapshot
+        .iter()
+        .filter(|fd| !consumed.contains(fd))
+        .filter_map(|&fd| i32::try_from(fd).ok())
+        .filter(|&fd| fd >= 3)
+        .collect()
+}
+
 /// Make the descriptors we were born holding non-inheritable, as node's
 /// startup does with uv_disable_stdio_inheritance. Call ONCE, right after
 /// `snapshot_inherited_fds` (whose record it reads) and before any child is
@@ -1025,14 +1044,8 @@ pub fn disable_stdio_inheritance() {
         .clone();
     let inherited: Vec<i32> = INHERITED_AT_START
         .get()
-        .into_iter()
-        .flatten()
-        .filter(|fd| !consumed.contains(fd))
-        .filter_map(|&fd| i32::try_from(fd).ok())
-        // The snapshot starts at 3; restated so the unix rule above can never
-        // be broken by a change to the snapshot.
-        .filter(|&fd| fd >= 3)
-        .collect();
+        .map(|snapshot| inheritable_fds_to_disable(snapshot, &consumed))
+        .unwrap_or_default();
 
     #[cfg(windows)]
     {
@@ -9695,6 +9708,33 @@ mod tests {
         let registry: SyncFileRegistry =
             std::sync::Arc::new(std::sync::Mutex::new(FileState::default()));
         assert!(!adopt_inherited_fd(&registry, fd));
+    }
+
+    // Guard 1: disable_stdio_inheritance skips a consumed fd. The existing test
+    // proves inherited_eligible/adopt_inherited_fd respect consumption; this
+    // pins the same rule at the selection the function passes to its platform
+    // I/O. Tested through the pure helper, so no snapshot is needed and no live
+    // descriptor is probed or touched.
+    #[test]
+    fn disabled_selection_skips_consumed_fds() {
+        let snapshot = std::collections::HashSet::from([3u64, 9]);
+        let consumed = std::collections::HashSet::from([9u64]);
+        let mut got = inheritable_fds_to_disable(&snapshot, &consumed);
+        got.sort_unstable();
+        assert_eq!(got, vec![3]);
+    }
+
+    // Guard 2: the fd >= 3 restatement filter. The snapshot only ever holds
+    // 3..=MAX_INHERITED_FD, so the filter is defensive -- but the unix rule is
+    // NEVER touch 0-2, so the selection must drop them even if the snapshot some
+    // day lists them.
+    #[test]
+    fn disabled_selection_excludes_stdio_fds() {
+        let snapshot = std::collections::HashSet::from([0u64, 1, 2, 3, 9]);
+        let consumed = std::collections::HashSet::new();
+        let mut got = inheritable_fds_to_disable(&snapshot, &consumed);
+        got.sort_unstable();
+        assert_eq!(got, vec![3, 9]);
     }
 
     /// Descriptors 0-2 are the process's stdio for the fd calls, adopted on
