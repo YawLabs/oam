@@ -16,6 +16,17 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Windows named-pipe server's `close()` closes the pipe before it returns, as node's does.**
+  The pipe instances still waiting for a client stayed open until the server's pending accept woke
+  and dropped them, so a client that dialled the name right after `close()` could connect to one
+  and then see the pipe dropped (or, from `fs.openSync`, get an fd) where node gives `ENOENT`. The
+  close now disconnects every waiting instance, so none takes a client, and returns once they are
+  closed (#388). Unchanged, by decision: an oam pipe server still refuses clients that reach it
+  through a UNC server name, `\\localhost\pipe\x` included, with `EPERM`, where node's accepts them
+  (#385; see `docs/node-divergences.md`, entry 50).
+
 ## [0.19.1] - 2026-10-13
 
 ### Changed
