@@ -1008,22 +1008,27 @@ fn load_cjs_inner<'s>(
     if in_flight && let Some(cache) = scope.get_slot_mut::<CjsCache>() {
         cache.in_flight_code_cache.pop();
     }
-    if !returned {
-        // The body threw: exception stays pending, cache entry goes (Node
-        // re-executes on the next require).
-        evict(scope, &key);
-        return None;
-    }
-
-    // Persist the bytecode now that the body has executed, so the cached blob
-    // includes the body and not just the outer wrapper. Best-effort: a failed
-    // produce or write just means the next run pays the compile again. A None
-    // key means the cache is off, which skips the serialize work entirely.
+    // Persist the bytecode now that the body has run, so the cached blob
+    // includes the body and not just the outer wrapper. This runs for a body
+    // that returned OR threw: node keeps the compile artifact either way and
+    // drops only the module RECORD on a throw (Module._load's try/finally
+    // deletes the cache entry, not the on-disk blob), so a throwing module did
+    // not pay a fresh compile on every run. Best-effort: a failed produce or
+    // write just means the next run pays the compile again. A None key means
+    // the cache is off, which skips the serialize work entirely.
     if refresh_cache
         && let Some(cache_key) = &cache_key
         && let Some(cd) = wrapper.create_code_cache()
     {
         crate::code_cache::store(cache_key, &cd);
+    }
+
+    if !returned {
+        // The body threw: the exception stays pending and the module's records
+        // go, in oam's map and in require.cache, so node re-executes it on the
+        // next require. The compile blob stored above is deliberately kept.
+        evict(scope, &key);
+        return None;
     }
 
     let loaded_key = v8::String::new(scope, "loaded")?;

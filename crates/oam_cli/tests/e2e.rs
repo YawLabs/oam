@@ -32689,6 +32689,58 @@ fn compile_cache_concurrent_processes_share_one_dir() {
     let _ = std::fs::remove_dir_all(&project);
 }
 
+// node stores a module's compile regardless of its body's outcome: a
+// require()'d module whose body throws still leaves its blob in
+// NODE_COMPILE_CACHE (measured on v22.22.2 -- 2 files with a throwing
+// bad.cjs), while the module itself is dropped from require.cache so the
+// next require re-runs it. oam matches: the post-body store runs before the
+// evict, so the cold run leaves both blobs and the warm run consumes them,
+// prints the same output and writes nothing.
+#[test]
+fn compile_cache_throwing_module_still_writes_its_blob() {
+    let project = compile_cache_scratch("cc-throw");
+    let ncc = project.join("ncc");
+    std::fs::write(project.join("bad.cjs"), "throw new Error('boom');\n").unwrap();
+    let entry = project.join("main.cjs");
+    std::fs::write(
+        &entry,
+        "try {\n\
+           require('./bad.cjs');\n\
+         } catch (e) {\n\
+           console.log('caught');\n\
+         }\n\
+         console.log('done');\n",
+    )
+    .unwrap();
+
+    let envs = [("NODE_COMPILE_CACHE", ncc.as_path())];
+    let cold = run_compile_cache(&project, &entry, &[], &envs);
+    assert!(
+        cold.status.success(),
+        "cold run: {}",
+        String::from_utf8_lossy(&cold.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&cold.stdout), "caught\ndone\n");
+    let dirs = oam_version_dirs(&ncc);
+    assert_eq!(dirs.len(), 1, "one per-build dir: {dirs:?}");
+    assert_eq!(
+        count_v8c(&dirs[0]),
+        2,
+        "main.cjs and the throwing bad.cjs are both cached"
+    );
+    let before = v8c_mtimes(&ncc);
+
+    let warm = run_compile_cache(&project, &entry, &[], &envs);
+    assert!(
+        warm.status.success(),
+        "warm run: {}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    assert_eq!(warm.stdout, cold.stdout);
+    assert_eq!(v8c_mtimes(&ncc), before, "the warm run hits both entries");
+    let _ = std::fs::remove_dir_all(&project);
+}
+
 // B3d: a corrupt on-disk blob must NEVER break execution. V8 rejects a blob it
 // can't deserialize (the same path a version-skewed blob takes) and recompiles
 // from source; our refresh logic then rewrites a valid blob. This is the
