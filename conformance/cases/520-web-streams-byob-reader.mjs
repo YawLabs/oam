@@ -253,3 +253,23 @@ await blobRead("empty Blob:", new Blob([]), 4);
   console.log("fetch body: total", reads.reduce((n, x) => n + parseInt(x, 10), 0), "each <= 4", reads.every((x) => parseInt(x, 10) <= 4), "last", last);
   server.close();
 }
+// util.inspect of a ReadableStream is node's three-field summary, which is
+// also what the "not a byte stream" error's message shows. At a depth past
+// the limit node's customInspect returns its own `this`, undefined.
+{
+  const { inspect } = await import("node:util");
+  const s = new ReadableStream();
+  const locked = new ReadableStream({ type: "bytes" });
+  locked.getReader();
+  const errored = new ReadableStream({ start(c) { c.error(new Error("x")); } });
+  const closed = new ReadableStream({ start(c) { c.close(); } });
+  console.log("inspect:", inspect(s), inspect(locked));
+  console.log("inspect:", inspect(errored), inspect(closed));
+  console.log("inspect nested:", inspect({ a: { b: s } }));
+  console.log("inspect past depth:", inspect({ x: s }, { depth: 0 }), inspect(s, { depth: -1 }));
+  try {
+    new ReadableStream().getReader({ mode: "byob" });
+  } catch (e) {
+    console.log("not a byte stream message:", e.message);
+  }
+}
