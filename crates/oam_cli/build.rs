@@ -164,7 +164,8 @@ const NAPI_EXPORTS: &[&str] = &[
 /// stack", 0xC00000FD) instead of throwing V8's RangeError (#395); a debug
 /// build's larger frames hit it with readdirSync and opendirSync too. 8 MiB
 /// leaves ~7 MiB under the limit, as node has, while the JS recursion depth
-/// -- set by V8's limit, not by the reserve -- stays node's. It is a
+/// -- set by V8's limit, not by the reserve -- does not change (it is not
+/// node's exactly; docs/node-divergences.md has the figures). It is a
 /// reservation, not a commitment: pages are committed only as the stack
 /// grows into them.
 ///

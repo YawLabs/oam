@@ -27,7 +27,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   linker's 1 MiB stack, of which V8 takes ~984 KiB for JS; it now reserves 8 MiB, as node.exe's
   header does. Worker threads (and `oam.fork` isolates) get node's 4 MiB worker stack, up from
   2 MiB. How deep JS can recurse is unchanged on every thread: V8 sets that, not the stack size.
-  A worker still recurses about a quarter as deep as node's (see docs/node-divergences.md).
+  It is not node's depth: a worker recurses a quarter to a third as deep as node's, and the main
+  thread somewhat deeper, so a 1500-deep `fs.cpSync` with a `filter` or `fs.rmSync` recursive
+  completes in oam where node throws `RangeError` (see docs/node-divergences.md).
 
 ## [0.19.1] - 2026-10-13
 
