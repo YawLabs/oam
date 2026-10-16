@@ -38115,3 +38115,40 @@ fn windows_exe_reserves_node_sized_main_thread_stack() {
     let reserve = u64::from_le_bytes(bytes[optional + 72..optional + 80].try_into().unwrap());
     assert_eq!(reserve, 8 * 1024 * 1024, "SizeOfStackReserve");
 }
+
+/// #395's own reproducer: `fs.cpSync` of a directory chain 2500 deep with a
+/// `filter`, whose walk is node's JS and recurses once per level. It runs
+/// out of JS stack partway down, and the ops it calls there (opendirSync,
+/// lstatSync, mkdirSync, copyFileSync) run their native frames under V8's
+/// limit -- with oam.exe's old 1 MiB main-thread reserve that overflowed the
+/// native stack and killed the process. node v22.22.2 throws RangeError here
+/// (measured, Windows 11 arm64; it does at 1500 deep too, where oam's walk
+/// still fits -- see docs/node-divergences.md). The chain is made natively so
+/// the test spends its time in the copy.
+#[test]
+fn deep_cp_sync_with_filter_throws_range_error_not_a_native_overflow() {
+    let script = write_temp(
+        "deep_cp_395/cp.cjs",
+        "const fs = require('node:fs');\n\
+         const path = require('node:path');\n\
+         try {\n\
+           fs.cpSync(path.join(__dirname, 'src'), path.join(__dirname, 'dst'),\n\
+             { recursive: true, filter: () => true });\n\
+           console.log('ok');\n\
+         } catch (err) { console.log(err.constructor.name + ': ' + err.message); }\n",
+    );
+    let mut chain = script.parent().unwrap().join("src");
+    for _ in 0..2500 {
+        chain.push("d");
+    }
+    std::fs::create_dir_all(&chain).expect("create the 2500-deep chain");
+    let out = oam(&[script.to_str().unwrap()]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "RangeError: Maximum call stack size exceeded",
+        "status {:?}, stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "status {:?}", out.status);
+}
