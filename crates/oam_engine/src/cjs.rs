@@ -377,7 +377,8 @@ pub(crate) fn module_kind_of(
     // would find no module syntax: no test compile.
     if crate::code_cache::enabled() {
         let stripped = strip_shebang(source.clone());
-        let blob_key = crate::code_cache::key_for(&stripped, crate::code_cache::Kind::Function);
+        let root = crate::code_cache::root_for(scope);
+        let blob_key = crate::code_cache::key_for(&stripped, crate::code_cache::Kind::Function, root);
         if crate::code_cache::load(&blob_key).is_some() {
             syntax_kinds(scope)
                 .kinds
