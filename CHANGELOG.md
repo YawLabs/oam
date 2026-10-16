@@ -441,6 +441,18 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `spawn` 3087 -> 1937; conformance case 394 102751 -> 44660 (node 33971), case 395 57015 ->
   41855 (node 36880). Cases 450-452.
 
+### Performance
+
+- **`stat` and `readdir` results no longer make a JSON round trip.** `stat`, `lstat` and `fstat`
+  (sync, callback, promise, `FileHandle`) and `readdir` / `opendir` listings came back as JSON the
+  native serialized and V8 parsed back on every call. A stat is now a `StatRecord` -- node's fourteen
+  `Stats` values as doubles plus the kind, the ids flag and the Windows reparse tag, integers exact --
+  which a sync stat writes into one reused `Float64Array` (as node's binding fills `statValues`, so no
+  allocation per call) and an async stat resolves as a `Float64Array` over a buffer of its own; the JS
+  side builds `Stats` / `BigIntStats` from it. A listing is two arrays, names and internalized kind
+  names, so a plain `readdir` returns the names array as it is. The win is largest for `readdir` on a
+  wide directory and for the sync stat forms, which now allocate nothing per call.
+
 ## [0.19.0] - 2026-10-11
 
 ### Fixed
