@@ -6,8 +6,11 @@
 //   is the listener's own `throw` -- not a line of the runtime's dispatcher
 //   -- from a CommonJS entry, a timer and an I/O callback.
 // - A listener that handles one throw, queues a tick and a promise job, and
-//   throws on the next: what it queued on the fatal call never runs.
-// - `throw 42` from a CommonJS entry: the source frame, then the value.
+//   throws on the next: what it queued on the fatal call never runs --
+//   from the entry and its ticks, from timers (far enough apart that the
+//   second is never due in the first's timers phase) and from I/O.
+// - `throw 42` from a CommonJS entry: the source frame, then the value,
+//   and the report's blank lines as node's, for each kind of thrown value.
 //   (node then names `--trace-uncaught`, which oam does not have; the hint
 //   is taken out as in case 406. A primitive from an ES module entry is
 //   docs/node-divergences.md #54.)
@@ -52,6 +55,10 @@ setTimeout(() => { throw new Error("orig"); }, 1);
 process.nextTick(() => { throw new Error("B"); });
 throw new Error("A");
 `),
+  "handled-then-fatal-timer.cjs": handledThenFatal(`
+setTimeout(() => { throw new Error("A"); }, 1);
+setTimeout(() => { throw new Error("B"); }, 50);
+`),
   "handled-then-fatal-io.cjs": handledThenFatal(`
 require("fs").stat(__filename, () => { throw new Error("A"); });
 setTimeout(() => require("fs").stat(__filename, () => { throw new Error("B"); }), 50);
@@ -90,6 +97,35 @@ try {
   // -e: the eval's own source frame is named differently by each runtime
   // ("[eval]" in node), so only the 'exit' listener's line and the message
   // line are compared, in the order printed.
+  // A thrown value that is not an Error, from CommonJS, line for line with
+  // the blank lines kept: node opens the report with an empty line, puts the
+  // value right under the caret, and prints a primitive as String() does
+  // (a Symbol as nothing); an object is inspected. A native Error keeps the
+  // empty line after the caret. Only the stack, the banner and node's
+  // `--trace-uncaught` hint (which follows a primitive) are taken out.
+  const values = {
+    "number.cjs": "throw 42;",
+    "string.cjs": 'throw "a string";',
+    "bigint.cjs": "throw 5n;",
+    "null.cjs": "throw null;",
+    "symbol.cjs": 'throw Symbol("y");',
+    "object.cjs": "throw { a: 1 };",
+    "error-prototype.cjs": "throw Object.create(Error.prototype);",
+    "error.cjs": 'throw new Error("e");',
+    "timer-number.cjs": "setTimeout(() => { throw 42; }, 1);",
+    "tick-string.cjs": 'process.nextTick(() => { throw "from a tick"; });',
+    "listener-throws-number.cjs": 'process.on("uncaughtException", () => { throw 43; });\nthrow new Error("x");',
+  };
+  for (const [name, text] of Object.entries(values)) {
+    fs.writeFileSync(path.join(dir, name), `${text}\n`);
+    const run = spawnSync(process.execPath, [name], { cwd: dir, encoding: "utf8" });
+    console.log(`## ${name} lines (status ${run.status})`);
+    const lines = run.stderr
+      .split(/\r?\n/)
+      .filter((l) => !/^\s+at /.test(l) && !/^(Node\.js|oam) v\d/.test(l) && !l.startsWith("(Use `"))
+      .map((l) => l.replace(/(?:[A-Za-z]:)?[^\s:]*[\\/]([^\\/\s:]+\.cjs)/g, "$1"));
+    for (const line of lines) console.log(`  err | ${JSON.stringify(line)}`);
+  }
   const evalRun = spawnSync(
     process.execPath,
     ["-e", 'process.on("exit", (c) => console.error("exit listener", c)); throw new Error("eval fatal");'],

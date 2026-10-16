@@ -11,9 +11,11 @@
 //   next timer or immediate callback, or its check phase -- which comes
 //   before the next immediate, and before node waits for a timer that is
 //   not due yet. So both handled warnings print before an immediate.
-//   (Two timers of one list, the second due in the same timers phase, are
-//   left out: whether node runs the second before the rest of the batch
-//   depends on its loop clock, and under load it did not.)
+// - A timer due in the same timers phase runs before that rest: node's
+//   timers phase goes on to its next due timer after the throw, and runs
+//   the queue when the phase ends. The entry busy-waits so both timers are
+//   due when the loop first looks; without that, whether the second is due
+//   in the first timers phase depends on node's loop clock.
 //
 // The printing goes to stderr, which the harness does not compare, so each
 // scenario runs as a child and its stderr is printed here: the report's
@@ -71,6 +73,25 @@ setTimeout(() => {
   process.nextTick(() => console.log("tick2"));
 }, 1);
 setTimeout(() => console.log("later"), 200);
+`,
+  "timer-then-due-timer.cjs": `
+process.on("uncaughtException", (e) => console.log("uncaughtException", e.message));
+setTimeout(() => {
+  process.nextTick(() => { throw new Error("tickboom"); });
+  process.nextTick(() => console.log("tick2"));
+}, 1);
+setTimeout(() => console.log("later"), 5);
+const end = Date.now() + 50; while (Date.now() < end);
+`,
+  "timer-then-due-timer-same-list.cjs": `
+process.on("uncaughtException", (e) => console.log("uncaughtException", e.message));
+setTimeout(() => {
+  process.nextTick(() => { throw new Error("tickboom"); });
+  process.nextTick(() => console.log("tick2"));
+}, 1);
+setTimeout(() => console.log("later"), 1);
+setTimeout(() => console.log("after the phase"), 300);
+const end = Date.now() + 50; while (Date.now() < end);
 `,
   "timer-then-immediate.cjs": `
 process.on("uncaughtException", (e) => console.log("uncaughtException", e.message));
