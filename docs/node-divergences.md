@@ -852,11 +852,19 @@ generated (transpiled) positions.
 oam file.js --flag value           # works, identical to `node file.js --flag value`
 oam run file.js -- --flag value    # works
 oam run file.js --flag value       # error: unexpected argument '--flag'
+oam run file.js --help             # prints oam's own `run` help, exit 0 -- the script never runs
 ```
 
 The bare form matches Node exactly and is what you should use. The `run` subcommand
 follows the cargo convention, where flags after a subcommand belong to the subcommand
 until `--`.
+
+`--help` (and `-h`) is the silent case: clap takes it as a request for the `run`
+subcommand's own help, prints that help and exits 0, so nothing says the script did not
+run. A tool that times or captures the output measures oam's help, not the script. Use
+`oam file.js --help` or `oam run file.js -- --help`. `--version` is not silent: like
+any other unknown flag it fails with `error: unexpected argument '--version' found` and
+exit code 2 (oam 0.19.0).
 
 ### 11. `oam install` skips lifecycle scripts
 
