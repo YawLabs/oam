@@ -3036,9 +3036,12 @@ pub(crate) fn dynamic_import_callback<'s>(
     Some(promise)
 }
 
-/// Windows-safe file:// URL, percent-encoding what node's `ada` does: a space,
-/// `#`, `?`, `%`, and every non-ASCII code point as its UTF-8 bytes (node names
-/// the warning's file as `file:///.../caf%C3%A9.js`).
+/// Windows-safe file:// URL, percent-encoding exactly the characters node's
+/// `ada` path encoder does -- the set `url.pathToFileURL` produces on
+/// v22.22.2: `"`, `#`, `%`, `<`, `>`, `?`, `[`, `]`, `^`, `` ` ``, `{`, `|`,
+/// `}`, `~` and a space, plus every non-ASCII code point as its UTF-8 bytes.
+/// (`[`/`]`/`~` matter in real names -- a `[id].js` route file -- not just the
+/// non-ASCII case.) Backslashes are already separate-normalized to `/` above.
 pub(crate) fn path_to_file_url(path: &Path) -> String {
     let slashed = path.to_string_lossy().replace('\\', "/");
     let mut out = String::from("file://");
@@ -3048,9 +3051,20 @@ pub(crate) fn path_to_file_url(path: &Path) -> String {
     for ch in slashed.chars() {
         match ch {
             ' ' => out.push_str("%20"),
+            '"' => out.push_str("%22"),
             '#' => out.push_str("%23"),
-            '?' => out.push_str("%3F"),
             '%' => out.push_str("%25"),
+            '<' => out.push_str("%3C"),
+            '>' => out.push_str("%3E"),
+            '?' => out.push_str("%3F"),
+            '[' => out.push_str("%5B"),
+            ']' => out.push_str("%5D"),
+            '^' => out.push_str("%5E"),
+            '`' => out.push_str("%60"),
+            '{' => out.push_str("%7B"),
+            '|' => out.push_str("%7C"),
+            '}' => out.push_str("%7D"),
+            '~' => out.push_str("%7E"),
             c if !c.is_ascii() => {
                 let mut buf = [0u8; 4];
                 for byte in c.encode_utf8(&mut buf).bytes() {
