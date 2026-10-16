@@ -95,12 +95,29 @@ pub(crate) fn inherited_flags_js() -> Option<&'static str> {
     INHERITED_FLAGS_JS.get().map(String::as_str)
 }
 
-/// Builds a worker_threads Worker's flags prelude: `(inherit, exec_argv,
-/// env)`, where `inherit` is a Worker given neither `env` nor `execArgv`,
-/// `exec_argv` the options it runs with, and `env` looks a name up in the
-/// environment it starts with. The CLI owns flag parsing, so it registers
-/// this; without one a worker takes [`inherited_flags_js`].
-pub type WorkerFlagsBuilder = fn(bool, &[String], &dyn Fn(&str) -> Option<String>) -> String;
+/// The options a worker_threads Worker resolved its flags to, kept opaque to
+/// the engine: the CLI owns their type. A Worker that worker creates with
+/// neither `env` nor `execArgv` inherits them (#370).
+pub type WorkerFlagsOptions = std::sync::Arc<dyn std::any::Any + Send + Sync>;
+
+/// Builds a worker_threads Worker's flags prelude: `(creator, inherit,
+/// exec_argv, env)`, where `creator` is the options of the worker that
+/// creates it (`None` for the main thread), `inherit` is a Worker given
+/// neither `env` nor `execArgv`, `exec_argv` the options it runs with, and
+/// `env` looks a name up in the environment it starts with. It returns the
+/// prelude and the options the new worker resolved to. The CLI owns flag
+/// parsing, so it registers this; without one a worker takes
+/// [`inherited_flags_js`].
+pub type WorkerFlagsBuilder = fn(
+    Option<&WorkerFlagsOptions>,
+    bool,
+    &[String],
+    &dyn Fn(&str) -> Option<String>,
+) -> (String, WorkerFlagsOptions);
+
+/// Isolate slot: the options this worker thread resolved its flags to, for
+/// the workers it creates.
+pub(crate) struct CreatorFlags(pub(crate) WorkerFlagsOptions);
 static WORKER_FLAGS_BUILDER: std::sync::OnceLock<WorkerFlagsBuilder> = std::sync::OnceLock::new();
 
 pub fn set_worker_flags_builder(builder: WorkerFlagsBuilder) {

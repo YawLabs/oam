@@ -226,6 +226,7 @@ fn cold_spawn(
             // oam.fork() reads the process environment.
             env: None,
             inherit_flags: true,
+            creator_flags: None,
         },
         permissions,
     );

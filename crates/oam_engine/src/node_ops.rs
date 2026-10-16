@@ -9188,6 +9188,10 @@ fn op_worker_new(
             .get("inheritFlags")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true),
+        // A worker creating one hands it its own options to inherit.
+        creator_flags: scope
+            .get_slot::<crate::CreatorFlags>()
+            .map(|flags| flags.0.clone()),
     };
 
     // Not looked for here: node's Worker constructor never opens its entry,

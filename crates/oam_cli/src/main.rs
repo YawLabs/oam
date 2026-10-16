@@ -794,22 +794,29 @@ fn define_flag_global(name: &str, value: String) -> String {
 
 /// The flags prelude of a new worker_threads Worker (#370), decided as node's
 /// Worker constructor decides its options (src/node_worker.cc): one given
-/// neither `env` nor `execArgv` (`inherit`) shares this process's options;
-/// otherwise it starts from the defaults, applies NODE_PENDING_DEPRECATION
-/// and NODE_OPTIONS from the environment it starts with, then `exec_argv`
-/// (its own, or this thread's process.execArgv when it was given none). A
-/// worker never takes this process's per-environment flags otherwise.
-/// NODE_NO_WARNINGS is read from the worker's own environment either way, as
-/// node's JS reads it from the worker's process.env. The process-wide flags
-/// (`--title`, `--zero-fill-buffers`) are every thread's.
+/// neither `env` nor `execArgv` (`inherit`) shares its creator's options --
+/// `creator`'s, the creating worker's as it resolved them, or this process's
+/// when the main thread creates it; otherwise it starts from the defaults,
+/// applies NODE_PENDING_DEPRECATION and NODE_OPTIONS from the environment it
+/// starts with, then `exec_argv` (its own, or its creator's process.execArgv
+/// when it was given none). A worker never takes its creator's
+/// per-environment flags otherwise. NODE_NO_WARNINGS is read from the
+/// worker's own environment either way, as node's JS reads it from the
+/// worker's process.env. The process-wide flags (`--title`,
+/// `--zero-fill-buffers`) are every thread's. Returns the prelude and the
+/// options the worker resolved to, for the workers it creates in turn.
 fn worker_flags_js(
+    creator: Option<&oam_engine::WorkerFlagsOptions>,
     inherit: bool,
     exec_argv: &[String],
     env: &dyn Fn(&str) -> Option<String>,
-) -> String {
-    let parent = PARENT_OPTIONS.get().cloned().unwrap_or_default();
+) -> (String, oam_engine::WorkerFlagsOptions) {
+    let process = PARENT_OPTIONS.get().cloned().unwrap_or_default();
     let options = if inherit {
-        parent.clone()
+        creator
+            .and_then(|creator| creator.downcast_ref::<NodeFlags>())
+            .unwrap_or(&process)
+            .clone()
     } else {
         let mut options = NodeFlags {
             pending_deprecation: env("NODE_PENDING_DEPRECATION").as_deref() == Some("1"),
@@ -822,8 +829,8 @@ fn worker_flags_js(
         options
     };
     let mut js = options.environment_js(env("NODE_NO_WARNINGS").as_deref() == Some("1"));
-    js.push_str(&parent.process_js());
-    js
+    js.push_str(&process.process_js());
+    (js, std::sync::Arc::new(options))
 }
 
 fn dispatch(cli: Cli) -> ExitCode {
@@ -4183,8 +4190,8 @@ mod tests {
         // #370, node v22.22.2's Worker: given either, the worker starts from
         // the defaults, takes NODE_OPTIONS from the environment it is given,
         // then its execArgv; NODE_NO_WARNINGS is its own environment's.
-        // (The inheriting path reads PARENT_OPTIONS, process-global state
-        // conformance case 490 covers end to end.)
+        // (The main thread's inheriting path reads PARENT_OPTIONS,
+        // process-global state conformance case 490 covers end to end.)
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |name: &str| {
                 pairs
@@ -4194,13 +4201,15 @@ mod tests {
             }
         };
         let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let none = super::worker_flags_js(false, &[], &env(&[]));
+        let (none, _) = super::worker_flags_js(None, false, &[], &env(&[]));
         assert!(!none.contains("__oamNoWarnings"), "{none}");
-        let quiet = super::worker_flags_js(false, &[], &env(&[("NODE_NO_WARNINGS", "1")]));
+        let (quiet, _) =
+            super::worker_flags_js(None, false, &[], &env(&[("NODE_NO_WARNINGS", "1")]));
         assert!(quiet.contains("__oamNoWarnings"), "{quiet}");
-        let argv = super::worker_flags_js(false, &args(&["--no-warnings"]), &env(&[]));
+        let (argv, _) = super::worker_flags_js(None, false, &args(&["--no-warnings"]), &env(&[]));
         assert!(argv.contains("__oamNoWarnings"), "{argv}");
-        let options = super::worker_flags_js(
+        let (options, _) = super::worker_flags_js(
+            None,
             false,
             &args(&["--tls-min-v1.3"]),
             &env(&[("NODE_OPTIONS", "--no-deprecation --tls-min-v1.0")]),
@@ -4208,9 +4217,19 @@ mod tests {
         assert!(options.contains("__oamNoDeprecation"), "{options}");
         // Both minimums set: node's precedence takes the lowest.
         assert!(options.contains("\"TLSv1\""), "{options}");
-        let pending =
-            super::worker_flags_js(false, &[], &env(&[("NODE_PENDING_DEPRECATION", "1")]));
+        let (pending, _) =
+            super::worker_flags_js(None, false, &[], &env(&[("NODE_PENDING_DEPRECATION", "1")]));
         assert!(pending.contains("__oamPendingDeprecation"), "{pending}");
+        // A worker that inherits takes its creator's resolved options: a
+        // worker given `--no-warnings` creates one with no options, and that
+        // one has no 'warning' listener either. Given an execArgv instead, it
+        // starts from the defaults again.
+        let (_, creator) =
+            super::worker_flags_js(None, false, &args(&["--no-warnings"]), &env(&[]));
+        let (inner, _) = super::worker_flags_js(Some(&creator), true, &[], &env(&[]));
+        assert!(inner.contains("__oamNoWarnings"), "{inner}");
+        let (fresh, _) = super::worker_flags_js(Some(&creator), false, &[], &env(&[]));
+        assert!(!fresh.contains("__oamNoWarnings"), "{fresh}");
     }
 }
 

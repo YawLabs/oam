@@ -466,6 +466,9 @@ pub(crate) struct WorkerOptions {
     /// The Worker was given neither `env` (or SHARE_ENV) nor `execArgv`:
     /// it runs with its creator's options, as node's does (#370).
     pub inherit_flags: bool,
+    /// The creating worker's resolved options; `None` when the main thread
+    /// (or oam.fork()) creates it.
+    pub creator_flags: Option<crate::WorkerFlagsOptions>,
 }
 
 pub(crate) fn spawn_worker(
@@ -509,6 +512,7 @@ fn run_worker(
         exec_argv,
         env,
         inherit_flags,
+        creator_flags,
     } = options;
     // Decided before `env` moves into the runtime: the flags read the
     // environment the worker starts with.
@@ -517,7 +521,7 @@ fn run_worker(
             Some(env) => env.get(name),
             None => std::env::var(name).ok(),
         };
-        build(inherit_flags, &exec_argv, &lookup)
+        build(creator_flags.as_ref(), inherit_flags, &exec_argv, &lookup)
     });
     // Worker isolate: no fork pool (same recursion hazard as the prewarm
     // path -- a worker that installed a pool would spawn prewarm threads that
@@ -553,10 +557,13 @@ fn run_worker(
     // own `execArgv` and `env` as node decides them (#370); a fresh isolate
     // would otherwise start with none of them.
     match flags_js {
-        Some(js) => {
+        Some((js, resolved)) => {
             if !js.is_empty() {
                 let _ = rt.execute_script("<flags>", &js);
             }
+            // What a Worker this one creates with neither `env` nor
+            // `execArgv` inherits.
+            rt.isolate.set_slot(crate::CreatorFlags(resolved));
         }
         // No builder registered (an embedder without the CLI): the parent's
         // flags, and the worker's own `execArgv: ["--no-warnings"]`.
