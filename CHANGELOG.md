@@ -16,36 +16,6 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
-### Fixed
-
-- **Windows: `fs.stat` of NUL gives its character-device stat, and other device paths fail as
-  in node.** `statSync`, `lstatSync`, `fs.stat` and `fs.promises.stat` of `\\.\NUL` (and
-  `\\?\NUL`, `\\.\Global\NUL`, `\\.\GLOBALROOT\Device\Null`) failed `EISDIR`; they now give
-  the shape `fstat` of an open NUL gives (`mode` 0o20666, `rdev` 1376256, `blksize` 4096). The
-  pipe and mailslot namespaces and `KsecDD` fail `EINVAL` where oam said `EISDIR` (a volume,
-  `\\.\C:`, stays `EISDIR`, as in node), and `readdirSync` of `KsecDD` is `EISDIR` (was
-  `ENOTDIR`). oam asks what libuv asks:
-  the path by name (GetFileInformationByName, Windows 11 24H2 and later), then the handle's device
-  type and its file information (#380, #383).
-- **Windows: a stat of a path that goes on past a looping symlink is `ENOENT`, as in node.**
-  With `l` a link to itself, `statSync("l/a")` and `mkdirSync("l/a", { recursive: true })` (all
-  three forms) failed `ELOOP`; they are `ENOENT`, and `statSync("l")` stays `ELOOP` (#362).
-- **Windows: `fs.access` and `fs.chmod` read and set a path's own attributes, as libuv does.**
-  A dangling or looping symlink is accessible (`existsSync` still says `false`) and `chmod`
-  changes the link rather than failing `ENOENT`; a read-only directory passes `W_OK`; a device or
-  a volume (`\\.\C:`) is `EINVAL` (was `EISDIR`) and a share root that is no disk (`\\localhost\IPC$`) `ENOTSUP` (was
-  `EINVAL`). `cpSync` from any of these reports the same code, under `lstat`, and names the path
-  without its `\\?\` prefix, as node's does (#383).
-- **Windows: `fs.realpathSync` and `fs.realpath` of a `\\?\` or `\\.\` path follow node's walk.**
-  The path a recursive `mkdirSync` returns (`\\?\C:\...`) resolved in oam; node v22.22.2's
-  component walk fails it `EISDIR: ..., lstat 'C:'`, and oam now does too. NUL resolves to itself
-  (oam failed `EISDIR`). The `.native` forms and `fs.promises.realpath` still resolve such a path
-  (#361, #383).
-- **Windows: an open with `UV_FS_O_FILEMAP` of a console or the pipe namespace fails, as in
-  node.** libuv asks such a handle for its standard information and fails the open when it has
-  none: a console is `EISDIR`, `\\.\pipe\` `EINVAL`; oam handed out a descriptor. A write-only
-  `UV_FS_O_FILEMAP` open also asks read access, as libuv's does (#384).
-
 ## [0.19.1] - 2026-10-13
 
 ### Changed
@@ -556,6 +526,33 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   four slots 979 -> 8 (node 13); 20 `spawnSync` of `cmd /c exit` 3252 -> 1745 (node 1975), 20
   `spawn` 3087 -> 1937; conformance case 394 102751 -> 44660 (node 33971), case 395 57015 ->
   41855 (node 36880). Cases 450-452.
+- **Windows: `fs.stat` of NUL gives its character-device stat, and other device paths fail as
+  in node.** `statSync`, `lstatSync`, `fs.stat` and `fs.promises.stat` of `\\.\NUL` (and
+  `\\?\NUL`, `\\.\Global\NUL`, `\\.\GLOBALROOT\Device\Null`) failed `EISDIR`; they now give
+  the shape `fstat` of an open NUL gives (`mode` 0o20666, `rdev` 1376256, `blksize` 4096). The
+  pipe and mailslot namespaces and `KsecDD` fail `EINVAL` where oam said `EISDIR` (a volume,
+  `\\.\C:`, stays `EISDIR`, as in node), and `readdirSync` of `KsecDD` is `EISDIR` (was
+  `ENOTDIR`). oam asks what libuv asks:
+  the path by name (GetFileInformationByName, Windows 11 24H2 and later), then the handle's device
+  type and its file information (#380, #383).
+- **Windows: a stat of a path that goes on past a looping symlink is `ENOENT`, as in node.**
+  With `l` a link to itself, `statSync("l/a")` and `mkdirSync("l/a", { recursive: true })` (all
+  three forms) failed `ELOOP`; they are `ENOENT`, and `statSync("l")` stays `ELOOP` (#362).
+- **Windows: `fs.access` and `fs.chmod` read and set a path's own attributes, as libuv does.**
+  A dangling or looping symlink is accessible (`existsSync` still says `false`) and `chmod`
+  changes the link rather than failing `ENOENT`; a read-only directory passes `W_OK`; a device or
+  a volume (`\\.\C:`) is `EINVAL` (was `EISDIR`) and a share root that is no disk (`\\localhost\IPC$`) `ENOTSUP` (was
+  `EINVAL`). `cpSync` from any of these reports the same code, under `lstat`, and names the path
+  without its `\\?\` prefix, as node's does (#383).
+- **Windows: `fs.realpathSync` and `fs.realpath` of a `\\?\` or `\\.\` path follow node's walk.**
+  The path a recursive `mkdirSync` returns (`\\?\C:\...`) resolved in oam; node v22.22.2's
+  component walk fails it `EISDIR: ..., lstat 'C:'`, and oam now does too. NUL resolves to itself
+  (oam failed `EISDIR`). The `.native` forms and `fs.promises.realpath` still resolve such a path
+  (#361, #383).
+- **Windows: an open with `UV_FS_O_FILEMAP` of a console or the pipe namespace fails, as in
+  node.** libuv asks such a handle for its standard information and fails the open when it has
+  none: a console is `EISDIR`, `\\.\pipe\` `EINVAL`; oam handed out a descriptor. A write-only
+  `UV_FS_O_FILEMAP` open also asks read access, as libuv's does (#384).
 
 - **`tty.WriteStream` and `tty.ReadStream` over a console opened by name refuse what node's refuse,
   with node's errno (#381).** On Windows they took any descriptor `tty.isatty` called a terminal and
