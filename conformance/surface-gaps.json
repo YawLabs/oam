@@ -285,7 +285,6 @@
         ],
         "module": [
           "SourceMap",
-          "_cache",
           "_debug",
           "_extensions",
           "_findPath",
@@ -730,7 +729,6 @@
         ],
         "module": [
           "SourceMap",
-          "_cache",
           "_debug",
           "_extensions",
           "_findPath",
@@ -1164,7 +1162,6 @@
         ],
         "module": [
           "SourceMap",
-          "_cache",
           "_debug",
           "_extensions",
           "_findPath",

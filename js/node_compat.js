@@ -1740,8 +1740,28 @@
     }
     return new RmIsADirectory(context);
   };
-  codes.ERR_MODULE_NOT_FOUND = E("ERR_MODULE_NOT_FOUND", Error, function(path, base) {
-    return 'Cannot find module "' + path + '"' + (base ? ' imported from ' + base : '');
+  // Node's text (v22.22.2 lib/internal/errors.js): with the URL of the
+  // file a relative or absolute specifier named it is a module, kept as
+  // `url`; without one, the package a bare specifier named.
+  codes.ERR_MODULE_NOT_FOUND = E("ERR_MODULE_NOT_FOUND", Error, function(path, base, exactUrl) {
+    if (exactUrl) this.url = `${exactUrl}`;
+    return `Cannot find ${exactUrl ? "module" : "package"} '${path}' imported from ${base}`;
+  });
+  // require() of an ES module (cjs.rs / modules.rs require_esm raise these
+  // through this table so they carry node's shape). Node's texts, v22.22.2
+  // lib/internal/errors.js: the async one names the requiring and the
+  // required file, each line ending in a space as node's does; the cycle one
+  // is a '%s' code whose whole message the loader composes.
+  codes.ERR_REQUIRE_ASYNC_MODULE = E("ERR_REQUIRE_ASYNC_MODULE", Error, function(filename, parentFilename) {
+    let message = "require() cannot be used on an ESM " +
+      "graph with top-level await. Use import() instead. To see where the" +
+      " top-level await comes from, use --experimental-print-required-tla.";
+    if (parentFilename) message += `\n  From ${parentFilename} `;
+    if (filename) message += `\n  Requiring ${filename} `;
+    return message;
+  });
+  codes.ERR_REQUIRE_CYCLE_MODULE = E("ERR_REQUIRE_CYCLE_MODULE", Error, function(message) {
+    return message;
   });
   codes.ERR_PACKAGE_PATH_NOT_EXPORTED = E("ERR_PACKAGE_PATH_NOT_EXPORTED", Error, function(pkgPath, subpath) {
     return 'Package subpath "' + subpath + '" is not defined by "exports" in ' + pkgPath;
@@ -17819,6 +17839,10 @@
       "zlib",
     ];
 
+    // Module._cache is require.cache: one object, so a program that deletes
+    // or plants an entry through either name is seen by every require().
+    Module._cache = natives.requireCache();
+
     return {
       createRequire(filename) {
         let base = String(filename);
@@ -17834,6 +17858,9 @@
       },
       syncBuiltinESMExports: () => {},
       Module,
+      // node's require('module') is Module itself, so _cache is reachable
+      // from both names.
+      _cache: Module._cache,
     };
   };
 

@@ -520,6 +520,25 @@ fn main() -> ExitCode {
             } else if arg == "--insecure-http-parser" {
                 flags.insecure_http_parser = true;
                 i += 1;
+            } else if arg == "--trace-require-module" || arg.starts_with("--trace-require-module=")
+            {
+                // node's two values; anything else, or no value, is node's
+                // exit 9 (the value is not optional, unlike most trace flags).
+                let (value, spaced) = match arg.strip_prefix("--trace-require-module=") {
+                    Some(v) => (Some(v.to_string()), false),
+                    None => (raw.get(i + 1).cloned(), true),
+                };
+                let Some(value) = value else {
+                    eprintln!("oam: --trace-require-module requires an argument");
+                    return ExitCode::from(9);
+                };
+                if !is_trace_require_module_value(&value) {
+                    eprintln!("oam: invalid value for --trace-require-module");
+                    return ExitCode::from(9);
+                }
+                flags.trace_require_module = Some(value);
+                flags.trace_require_module_spaced = spaced;
+                i += if spaced { 2 } else { 1 };
             } else if let Some(v) = arg.strip_prefix("--title=") {
                 flags.title = Some(v.to_string());
                 i += 1;
@@ -1811,6 +1830,17 @@ fn apply_node_options(flags: &mut NodeFlags, raw: &str) -> bool {
             flags.v8_pool_size = Some(v.clone());
         } else if tok == "--insecure-http-parser" {
             flags.insecure_http_parser = true;
+        } else if let Some(v) = tok.strip_prefix("--trace-require-module=") {
+            // A value node refuses (exit 9) is ignored here instead.
+            if is_trace_require_module_value(v) {
+                flags.trace_require_module = Some(v.to_string());
+            }
+        } else if tok == "--trace-require-module"
+            && let Some(v) = it.next()
+        {
+            if is_trace_require_module_value(v) {
+                flags.trace_require_module = Some(v.clone());
+            }
         } else if tok == "--no-warnings" {
             flags.no_warnings = true;
         } else if tok == "--no-deprecation" {
@@ -1873,6 +1903,11 @@ fn apply_node_options(flags: &mut NodeFlags, raw: &str) -> bool {
         // Anything else: ignored on purpose (see the call site).
     }
     before != *flags
+}
+
+/// The values node's `--trace-require-module` takes.
+fn is_trace_require_module_value(value: &str) -> bool {
+    matches!(value, "all" | "no-node-modules")
 }
 
 fn find_project_dir(start: &Path, target: &str) -> Option<PathBuf> {
@@ -2639,6 +2674,12 @@ struct NodeFlags {
     v8_pool_size_spaced: bool,
     /// `--insecure-http-parser`.
     insecure_http_parser: bool,
+    /// `--trace-require-module=all|no-node-modules`: the once-per-process
+    /// ExperimentalWarning when a CommonJS module require()s an ES module
+    /// (node 22 prints none without it). `no-node-modules` leaves out a
+    /// require made from inside node_modules. Spaced as for the header size.
+    trace_require_module: Option<String>,
+    trace_require_module_spaced: bool,
     /// `--tls-min-v1.0` / `--tls-min-v1.1` / `--tls-min-v1.2` /
     /// `--tls-min-v1.3` and `--tls-max-v1.2` / `--tls-max-v1.3`: the initial
     /// `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION`, so the default
@@ -2673,6 +2714,15 @@ impl NodeFlags {
             } else {
                 (env.max_http_header_size, env.max_http_header_size_spaced)
             };
+        let (trace_require_module, trace_require_module_spaced) =
+            if argv.trace_require_module.is_some() {
+                (
+                    argv.trace_require_module.clone(),
+                    argv.trace_require_module_spaced,
+                )
+            } else {
+                (env.trace_require_module, env.trace_require_module_spaced)
+            };
         let (v8_pool_size, v8_pool_size_spaced) = if argv.v8_pool_size.is_some() {
             (argv.v8_pool_size.clone(), argv.v8_pool_size_spaced)
         } else {
@@ -2705,6 +2755,8 @@ impl NodeFlags {
             max_http_header_size_spaced,
             v8_pool_size,
             v8_pool_size_spaced,
+            trace_require_module,
+            trace_require_module_spaced,
             insecure_http_parser: env.insecure_http_parser || argv.insecure_http_parser,
             tls_min_v1_0: env.tls_min_v1_0 || argv.tls_min_v1_0,
             tls_min_v1_1: env.tls_min_v1_1 || argv.tls_min_v1_1,
@@ -2795,6 +2847,12 @@ impl NodeFlags {
         }
         if self.zero_fill_buffers {
             js.push_str(&def("__oamZeroFillBuffers", "true".into()));
+        }
+        // cjs.rs reads it on the first require() of an ES module. The value
+        // is one of node's two words, so quoting it is all the escaping it
+        // needs.
+        if let Some(mode) = &self.trace_require_module {
+            js.push_str(&def("__oamTraceRequireModule", format!("\"{mode}\"")));
         }
         // node:tls reads these as the initial DEFAULT_MIN_VERSION /
         // DEFAULT_MAX_VERSION (the names are node's own four, so quoting
@@ -2959,6 +3017,14 @@ impl NodeFlags {
                 out.push(v.clone());
             } else {
                 out.push(format!("--v8-pool-size={v}"));
+            }
+        }
+        if let Some(v) = &self.trace_require_module {
+            if self.trace_require_module_spaced {
+                out.push("--trace-require-module".into());
+                out.push(v.clone());
+            } else {
+                out.push(format!("--trace-require-module={v}"));
             }
         }
         if self.insecure_http_parser {

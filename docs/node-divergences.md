@@ -347,13 +347,16 @@ still wins. Only these tokens are accepted:
 ```
 --pending-deprecation   --no-warnings   --no-deprecation   --expose-gc
 --disable-warning[=]    --redirect-warnings[=]
---max-http-header-size[=]   --insecure-http-parser
+--max-http-header-size[=]   --insecure-http-parser   --trace-require-module[=]
 --tls-min-v1.0  --tls-min-v1.1  --tls-min-v1.2  --tls-min-v1.3  --tls-max-v1.2  --tls-max-v1.3
 ```
 
 Everything else in the variable is **ignored, not rejected** — `NODE_OPTIONS` is usually
 set globally in a shell profile and legitimately carries flags oam has no opinion on, so
-an unknown token must not brick every `oam` invocation on the machine.
+an unknown token must not brick every `oam` invocation on the machine. For the same reason
+an allowlisted flag with a value node refuses -- `--trace-require-module=bogus`, an empty
+`--max-http-header-size=` -- is ignored there, where node exits 9 (`node: invalid value
+for --trace-require-module`); on the command line oam refuses it with exit 9 as node does.
 
 The exclusions are the point: nothing that **executes code or names a file** is accepted
 from the environment. `-e` / `--eval` / `-p` / `--input-type` / `--env-file` /
@@ -805,6 +808,13 @@ outside `node_modules` too: Node runs no JSX to follow.
 To keep a file an ES module without the warning, add `"type": "module"` to its
 `package.json` or name it `.mjs`.
 
+`require()` of a typeless project `.js` decides as node does: CommonJS, unless it has
+syntax only an ES module has, in which case it is loaded as one (entry 9). The difference
+is in how oam runs such a file as the entry point or through `import`.
+
+Fixes, in order of preference: add `"type": "commonjs"` to your `package.json`, rename the
+file to `.cjs`, or convert it to `import`.
+
 ### 8. The `"module"` field is preferred over `"main"`
 
 For a package with no `"exports"` map, oam resolves an `import` through the bundler
@@ -821,14 +831,59 @@ and this is invisible (it also avoids a needless CJS-to-ESM hop). It is observab
 package's two builds genuinely differ. `"exports"`-bearing packages — nearly everything
 modern — are unaffected, because `"exports"` wins in both runtimes.
 
-### 9. `require()` of an ES module throws
+### 9. `require()` of an ES module -- FIXED, no longer a divergence
+
+This entry used to record that oam threw `ERR_REQUIRE_ESM` for every `require()` of an ES
+module while `process.features.require_module` said `true`. It now does what node 22 does
+by default: the graph loads and evaluates synchronously inside the `require()`, which
+returns the namespace -- or the facade namespace that adds `__esModule: true` when there
+is a default export and no own `__esModule`, or the value of an export named
+`'module.exports'`. A graph with a top-level await is `ERR_REQUIRE_ASYNC_MODULE`, whether
+it never ran, is part-way through its await, or has finished under an `import`; a cycle
+through a module still loading or evaluating is `ERR_REQUIRE_CYCLE_MODULE` (node's
+wordings); an evaluation error, or the throw of a CommonJS module the graph imports, is
+rethrown as the same object on every later `require()` or `import()` without running
+anything again; an import that does not resolve is `ERR_MODULE_NOT_FOUND`, every time. A
+typeless file with module syntax is detected as an ES module, inside `node_modules` too.
+No ticks or promise jobs run before `require()` returns, and the module shares the one
+module map with `import()`. The ExperimentalWarning is printed only under
+`--trace-require-module`. `require.cache` is node's `Module._cache`, ES modules loaded
+through `require()` included: deleting an entry reloads, a planted entry is returned.
+Conformance cases 430-434 and 440-442. What still differs is entry 52.
+
+### 52. `require()` of an ES module: a CommonJS dependency runs early, and what follows from it
 
 ```js
-require('./thing.mjs')   // oam: ERR_REQUIRE_ESM.  Node 22: works.
+// e.mjs:  import './a.mjs'; import './c.cjs';     (a.mjs imports b.mjs)
+//   node: b, a, c, e        oam: c, b, a, e
+// t.mjs:  import c from './c.cjs'; await 0; export const x = c;
+require('./t.mjs')   // both: ERR_REQUIRE_ASYNC_MODULE.  oam prints c's output first; node does not.
 ```
 
-Node 22 added synchronous `require()` of an ESM graph. oam has not implemented it yet;
-use `await import()`. This is a gap, not a policy — it is on the roadmap.
+oam runs a CommonJS module an ES graph imports while it loads the graph (its exports
+become the facade's named exports), where node runs it when the graph evaluates. So in
+any graph, `require()`d or imported, a CommonJS dependency runs before the ES modules
+that come ahead of it in the graph's evaluation order -- the modules imported earlier in
+source order, and what they import. The ES modules themselves run in node's order. Three
+things follow:
+
+- a graph `require()` refuses for a top-level await has already run its CommonJS modules
+  (node finds the await after instantiating the graph and runs none of it); its ES modules
+  run in neither;
+- the cycle check replays the evaluation node would be in when the CommonJS module runs,
+  so `ERR_REQUIRE_CYCLE_MODULE` is raised for the same graphs, but where the two runtimes
+  reach the cycle at different points it can name a different module and use the other
+  wording of the two node has: oam's `Cannot import Module ./e.mjs in a cycle. (from
+  b.mjs)` where node says `Cannot require() ES Module b.mjs in a cycle. (from c.cjs)`;
+- an `import()` that such a CommonJS module makes loads and evaluates its graph inside the
+  `require()` (see "A module `import()` loads is evaluated inside the import"), where node
+  does it after the `require()` has returned and the requiring code's ticks and promise
+  jobs have run. The requiring code's own ticks and promise jobs still wait until the
+  `require()` returns, as in node (conformance case 441).
+
+One message differs on its own: an unresolved bare specifier whose package was found but
+whose file was not is `ERR_MODULE_NOT_FOUND` with oam's message, which lists the
+candidates tried, where node names the one file it resolved to.
 
 ### 24. TypeScript module kind: `.ts`/`.mts` are always ES modules
 
@@ -838,7 +893,7 @@ including `"type": "commonjs"`.
 
 ```js
 // package.json: { "type": "commonjs" }
-require('./util.ts')   // oam: ERR_REQUIRE_ESM.  Node 22 type stripping: works (CommonJS).
+require('./util.ts')   // oam: loaded as an ES module.  Node 22 type stripping: CommonJS.
 ```
 
 Node 22's type stripping honors the package `"type"` walk for `.ts`, so the same file is
@@ -847,6 +902,11 @@ require()d, or `import` it. (`.tsx`/`.jsx` DO follow the package `"type"` walk, 
 `.js`, and transpile on whichever path they land.) Under a `package.json` with no `"type"`,
 Node decides a `.ts` file by its syntax, as it does a `.js` file (entry 7); oam does not,
 and runs it as an ES module.
+
+CommonJS there. oam's `require()` loads it as the ES module it takes it to be (entry 9), so
+a file written as CommonJS (`module.exports = ...`) fails there with `module is not
+defined`. In oam, use `.cts` for TypeScript written as CommonJS. (`.tsx`/`.jsx` DO follow the package `"type"` walk, like
+`.js`, and transpile on whichever path they land.)
 
 ### 25. Source maps are always on, so `Error.prepareStackTrace` is pre-installed
 
