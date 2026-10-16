@@ -730,6 +730,35 @@ listener on `process`, removable like any other, absent under `--no-warnings` an
 `NODE_NO_WARNINGS=1` (conformance case 406, which takes the hint line out of both sides).
 The flags and the hint are #364.
 
+### 53. Windows child windows: no console popup from a console-less oam, no `SW_HIDE` on std spawns
+
+oam applies `windowsHide` as libuv's `uv_spawn` does: `CREATE_NO_WINDOW` only for
+`windowsHide: true` with no inherited or numbered stdio slot, so by default a console child
+shares oam's console (conformance case 450). Two places still differ.
+
+- **A process with no console.** When oam itself has no console (it was started detached,
+  or by a GUI program), a console child needs a console of its own. node gives it one with
+  a visible window: run detached, node v22.22.2's `windowsHide: false` grandchild reported
+  a visible console window. oam adds `CREATE_NO_WINDOW` there, so the child's console has
+  no window. The child needs a new console either way, so this costs nothing; what differs
+  is only whether a window appears (`windows_creation_flags`,
+  `crates/oam_core/src/child.rs`).
+- **`SW_HIDE` for a GUI child.** libuv also starts every child with
+  `STARTF_USESHOWWINDOW` and `SW_HIDE` under `windowsHide` (else `SW_SHOWDEFAULT`), which
+  hides a GUI program's first window. oam does that only for a spawn with more than three
+  stdio slots, which it starts with its own `CreateProcessW` (`child_win.rs`). The others
+  go through Rust's `std::process::Command`, which has no stable way to set the show state,
+  so a GUI child spawned with `windowsHide: true` opens its window as usual. A console
+  child is not affected: `CREATE_NO_WINDOW` already keeps its console windowless.
+
+On POSIX `windowsHide` does nothing, as under node.
+
+_Extra-fd stdio and `destroy()`._ Destroying a readable stream on a numbered slot closes
+the pipe, as node's does, so the child's next write to it fails (case 452, run on Windows).
+On POSIX a read in flight holds the parent's end until it returns (`child_unix.rs` reads
+with a blocking `poll`), so the pipe closes after the child's next write rather than at
+once, and that write is read and dropped; on Windows the close cancels the read.
+
 ---
 
 ## Module loading and the CLI

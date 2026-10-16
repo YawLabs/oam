@@ -12,14 +12,16 @@
 //! A raw child is NOT a `tokio::process::Child`, so it has its own registry and
 //! op set: wait via `WaitForSingleObject` on the blocking pool, kill via
 //! `TerminateProcess`, pipe I/O via blocking `ReadFile`/`WriteFile` on the
-//! blocking pool. Anonymous pipes are unidirectional, so extra fds carry one
+//! blocking pool (a read that a close must stop is cancelled with
+//! `CancelIoEx`; see `ReadEnd`). Anonymous pipes are unidirectional, so extra fds carry one
 //! direction each (sufficient for CDP); full-duplex extra fds (named pipes)
 //! are a future enhancement no current consumer needs.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::BorrowedHandle;
+use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows_sys::Win32::Foundation::{
@@ -34,31 +36,40 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
-use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
+use windows_sys::Win32::System::IO::CancelIoEx;
+use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESHOWWINDOW,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject,
 };
 
 use super::OpOutcome;
+
+// ShowWindow commands for STARTUPINFO.wShowWindow (winuser.h). Spelled out
+// rather than pulling in windows-sys's whole UI module for two numbers.
+const SW_HIDE: u16 = 0;
+const SW_SHOWDEFAULT: u16 = 10;
 
 // MSVCRT fd-info flags packed into lpReserved2 (one byte per fd).
 const FOPEN: u8 = 0x01;
 const FPIPE: u8 = 0x08;
 const FDEV: u8 = 0x40;
 
-/// HANDLE is `*mut c_void`, not Send. We only ever touch a given handle from
-/// one thread at a time (taken out of the registry for the op), so sending the
-/// raw value across the blocking pool is sound.
+/// HANDLE is `*mut c_void`, not Send. Only the child's PROCESS handle travels
+/// this way now (the pipe ends are `OwnedHandle`s): `raw_wait` waits on a copy
+/// on the blocking pool while `raw_kill` may terminate through the registry's.
 #[derive(Clone, Copy)]
 struct SendHandle(HANDLE);
-// SAFETY: HANDLE is a raw `*mut c_void`, hence not auto-`Send`. Every handle is
-// touched from only one thread at a time -- it is taken out of the registry for
-// the duration of an op -- so moving the raw value across the blocking pool
-// never exposes it to a concurrent accessor.
+// SAFETY: HANDLE is a raw `*mut c_void`, hence not auto-`Send`. The process
+// handle is only ever passed to WaitForSingleObject, GetExitCodeProcess and
+// TerminateProcess, which the kernel serializes on the object and which may be
+// called on one handle from several threads; it is closed once, by `raw_wait`,
+// after its wait has returned and after taking it out of the registry under
+// the lock `raw_kill` also takes, so no copy is used after the close.
 unsafe impl Send for SendHandle {}
 
 /// What to do with one child fd index.
@@ -81,14 +92,127 @@ pub enum StdioFd {
     Descriptor(isize),
 }
 
-/// Parent-side end of one piped fd.
-struct FdEnd {
-    handle: Option<SendHandle>,
-    /// true => parent reads this end (child writes); false => parent writes.
-    readable: bool,
+/// Parent-side end of one piped fd. Owned handles: dropping an end is its
+/// close, so no path has to remember to close one.
+enum FdEnd {
+    /// The parent writes, the child reads. Taken out of the registry for the
+    /// length of a write and put back after it; `None` once closed.
+    Write(Option<OwnedHandle>),
+    /// The parent reads, the child writes. Shared rather than taken, so a
+    /// close can reach a read that is blocked in `ReadFile` on the pool.
+    Read(Arc<ReadEnd>),
+}
+
+/// The parent's read end of a child-write pipe.
+///
+/// A read is ONE blocking `ReadFile` on the blocking pool: it returns the
+/// moment the child writes anything (up to 64 KiB, as libuv reads), and with
+/// EOF once every write end is closed. That replaced a `PeekNamedPipe` poll
+/// that slept 50 ms whenever the pipe was empty, so each message a child
+/// sent waited up to 50 ms to be seen: 20 echo round trips over a 4-slot
+/// stdio took about 1 s where node takes 4 ms.
+///
+/// A blocked read must not outlive a close of the end (`destroy()` on the
+/// stream): `close` marks the end and cancels the read with `CancelIoEx`,
+/// which stops a synchronous `ReadFile` issued by another thread. The handle
+/// itself closes when the last holder -- the registry or the read -- drops
+/// it, never under a read that is still using it.
+struct ReadEnd {
+    handle: OwnedHandle,
+    /// Set by `close`: a read that starts after it returns EOF at once.
+    closing: AtomicBool,
+    /// True from just before a read checks `closing` until its `ReadFile`
+    /// has returned, so `close` knows whether there is a read to cancel.
+    reading: AtomicBool,
+}
+
+impl ReadEnd {
+    fn new(handle: OwnedHandle) -> Self {
+        ReadEnd {
+            handle,
+            closing: AtomicBool::new(false),
+            reading: AtomicBool::new(false),
+        }
+    }
+
+    /// One blocking read: `Some(bytes)`, or `None` at EOF (the child's write
+    /// ends all closed, or this end closed by `close`).
+    fn read_blocking(&self) -> Result<Option<Vec<u8>>, String> {
+        self.reading.store(true, Ordering::SeqCst);
+        let out = if self.closing.load(Ordering::SeqCst) {
+            Ok(None)
+        } else {
+            let mut buf = vec![0u8; 65536];
+            let mut n: u32 = 0;
+            // SAFETY: the handle is owned by `self`, which the caller's Arc keeps
+            // alive for the whole call, so it is open; `buf` is a live 64 KiB
+            // buffer and `n` a live out-param; no OVERLAPPED (a synchronous pipe).
+            let ok = unsafe {
+                ReadFile(
+                    self.handle.as_raw_handle(),
+                    buf.as_mut_ptr(),
+                    65536,
+                    &mut n,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    // ERROR_BROKEN_PIPE: every write end closed == clean EOF.
+                    Some(109) => Ok(None),
+                    // ERROR_OPERATION_ABORTED: `close` cancelled this read.
+                    Some(995) if self.closing.load(Ordering::SeqCst) => Ok(None),
+                    _ => Err(format!("ReadFile: {err}")),
+                }
+            } else if n == 0 {
+                Ok(None)
+            } else {
+                buf.truncate(n as usize);
+                Ok(Some(buf))
+            }
+        };
+        self.reading.store(false, Ordering::SeqCst);
+        out
+    }
+
+    /// Stop this end: no read starts after this, and one in flight ends.
+    fn close(self: &Arc<Self>) {
+        self.closing.store(true, Ordering::SeqCst);
+        if !self.reading.load(Ordering::SeqCst) {
+            return;
+        }
+        self.cancel();
+        if !self.reading.load(Ordering::SeqCst) {
+            return;
+        }
+        // A read can sit between its `closing` check and the kernel taking its
+        // ReadFile, where a cancel finds nothing to cancel and the read then
+        // blocks. So keep cancelling until it is out -- off this thread, which
+        // is the JS thread -- with a bound, so a read that cannot be cancelled
+        // never pins a thread here forever.
+        let end = Arc::clone(self);
+        std::thread::spawn(move || {
+            for _ in 0..2000 {
+                if !end.reading.load(Ordering::SeqCst) {
+                    return;
+                }
+                end.cancel();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+    }
+
+    fn cancel(&self) {
+        // SAFETY: the handle is owned by `self` and open; a null OVERLAPPED
+        // cancels every I/O outstanding on it from any thread, a synchronous
+        // ReadFile included. Nothing of ours is written.
+        unsafe { CancelIoEx(self.handle.as_raw_handle(), std::ptr::null()) };
+    }
 }
 
 pub struct RawChild {
+    /// `None` once `raw_wait` has collected the exit and closed it.
     process: Option<SendHandle>,
     pub pid: u32,
     fds: HashMap<u32, FdEnd>,
@@ -246,6 +370,11 @@ fn open_nul() -> HANDLE {
 /// job (job_win.rs), and only then resumed, so it never runs an instruction
 /// outside the job. A `detached` child skips the job and gets libuv's
 /// DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP.
+///
+/// `windows_hide` is node's `windowsHide`, applied as libuv applies it:
+/// `CREATE_NO_WINDOW` when no slot is inherited (`child::
+/// windows_creation_flags`), and `SW_HIDE` -- otherwise `SW_SHOWDEFAULT` --
+/// as the window state a GUI child starts in.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_extra(
     command: &str,
@@ -254,6 +383,7 @@ pub fn spawn_extra(
     env: Option<&[(String, String)]>,
     stdio: &[StdioFd],
     detached: bool,
+    windows_hide: bool,
 ) -> Result<RawChild, String> {
     // Same program search as the std-backed spawns (see child.rs).
     let resolved = match super::child::resolve_windows_program(command, cwd) {
@@ -285,20 +415,17 @@ pub fn spawn_extra(
         let mut child_close: Vec<HANDLE> = Vec::new();
         let mut nul_handles: Vec<HANDLE> = Vec::new();
 
-        let cleanup_fail =
-            |child_close: &[HANDLE], nul: &[HANDLE], parent: &HashMap<u32, FdEnd>| {
-                for h in child_close {
-                    CloseHandle(*h);
-                }
-                for h in nul {
-                    CloseHandle(*h);
-                }
-                for fd in parent.values() {
-                    if let Some(SendHandle(h)) = fd.handle {
-                        CloseHandle(h);
-                    }
-                }
-            };
+        // The parent's ends are OwnedHandles in `parent_fds`, which close
+        // themselves when an early return drops it; only the raw child-side
+        // and NUL handles need closing here.
+        let cleanup_fail = |child_close: &[HANDLE], nul: &[HANDLE]| {
+            for h in child_close {
+                CloseHandle(*h);
+            }
+            for h in nul {
+                CloseHandle(*h);
+            }
+        };
 
         for (i, spec) in stdio.iter().enumerate() {
             let fd = i as u32;
@@ -341,7 +468,7 @@ pub fn spawn_extra(
                         DUPLICATE_SAME_ACCESS,
                     ) == 0
                     {
-                        cleanup_fail(&child_close, &nul_handles, &parent_fds);
+                        cleanup_fail(&child_close, &nul_handles);
                         return Err(format!(
                             "DuplicateHandle(fd{fd}) failed: {}",
                             GetLastError()
@@ -366,7 +493,7 @@ pub fn spawn_extra(
                         DUPLICATE_SAME_ACCESS,
                     ) == 0
                     {
-                        cleanup_fail(&child_close, &nul_handles, &parent_fds);
+                        cleanup_fail(&child_close, &nul_handles);
                         return Err(format!(
                             "DuplicateHandle(fd{fd}) failed: {}",
                             GetLastError()
@@ -380,18 +507,17 @@ pub fn spawn_extra(
                     let mut child_read: HANDLE = std::ptr::null_mut();
                     let mut parent_write: HANDLE = std::ptr::null_mut();
                     if CreatePipe(&mut child_read, &mut parent_write, &sa, 0) == 0 {
-                        cleanup_fail(&child_close, &nul_handles, &parent_fds);
+                        cleanup_fail(&child_close, &nul_handles);
                         return Err(format!("CreatePipe(fd{fd}) failed: {}", GetLastError()));
                     }
                     SetHandleInformation(parent_write, HANDLE_FLAG_INHERIT, 0);
                     child_close.push(child_read);
                     child_handles.push(child_read);
+                    // `parent_write` is the fresh handle CreatePipe returned and
+                    // nothing else owns it.
                     parent_fds.insert(
                         fd,
-                        FdEnd {
-                            handle: Some(SendHandle(parent_write)),
-                            readable: false,
-                        },
+                        FdEnd::Write(Some(OwnedHandle::from_raw_handle(parent_write))),
                     );
                 }
                 StdioFd::ChildWrite => {
@@ -399,18 +525,19 @@ pub fn spawn_extra(
                     let mut parent_read: HANDLE = std::ptr::null_mut();
                     let mut child_write: HANDLE = std::ptr::null_mut();
                     if CreatePipe(&mut parent_read, &mut child_write, &sa, 0) == 0 {
-                        cleanup_fail(&child_close, &nul_handles, &parent_fds);
+                        cleanup_fail(&child_close, &nul_handles);
                         return Err(format!("CreatePipe(fd{fd}) failed: {}", GetLastError()));
                     }
                     SetHandleInformation(parent_read, HANDLE_FLAG_INHERIT, 0);
                     child_close.push(child_write);
                     child_handles.push(child_write);
+                    // `parent_read` is the fresh handle CreatePipe returned and
+                    // nothing else owns it.
                     parent_fds.insert(
                         fd,
-                        FdEnd {
-                            handle: Some(SendHandle(parent_read)),
-                            readable: true,
-                        },
+                        FdEnd::Read(Arc::new(ReadEnd::new(OwnedHandle::from_raw_handle(
+                            parent_read,
+                        )))),
                     );
                 }
             }
@@ -460,7 +587,7 @@ pub fn spawn_extra(
         let attr_list = attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
         if InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size) == 0 {
             let err = GetLastError();
-            cleanup_fail(&child_close, &nul_handles, &parent_fds);
+            cleanup_fail(&child_close, &nul_handles);
             return Err(format!("InitializeProcThreadAttributeList failed: {err}"));
         }
         if UpdateProcThreadAttribute(
@@ -475,13 +602,20 @@ pub fn spawn_extra(
         {
             let err = GetLastError();
             DeleteProcThreadAttributeList(attr_list);
-            cleanup_fail(&child_close, &nul_handles, &parent_fds);
+            cleanup_fail(&child_close, &nul_handles);
             return Err(format!("UpdateProcThreadAttribute failed: {err}"));
         }
 
         let mut si: STARTUPINFOEXW = std::mem::zeroed();
         si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        // STARTF_USESHOWWINDOW always, as libuv sets it: SW_HIDE for
+        // windowsHide, else SW_SHOWDEFAULT.
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+        si.StartupInfo.wShowWindow = if windows_hide {
+            SW_HIDE
+        } else {
+            SW_SHOWDEFAULT
+        };
         si.StartupInfo.hStdInput = child_handles
             .first()
             .copied()
@@ -509,7 +643,11 @@ pub fn spawn_extra(
 
         // Environment block: `env` is the child's whole environment; with
         // none the child inherits this process's.
-        let base_flags = super::child::windows_creation_flags(detached);
+        // libuv's UV_INHERIT_FD test: an inherited slot or a numbered one.
+        let inherits = stdio
+            .iter()
+            .any(|s| matches!(s, StdioFd::Inherit | StdioFd::Descriptor(_)));
+        let base_flags = super::child::windows_creation_flags(detached, windows_hide, inherits);
         let mut env_block;
         let (env_ptr, creation_flags) = match env {
             Some(env) => {
@@ -546,7 +684,7 @@ pub fn spawn_extra(
         DeleteProcThreadAttributeList(attr_list);
         if ok == 0 {
             let err = GetLastError();
-            cleanup_fail(&child_close, &nul_handles, &parent_fds);
+            cleanup_fail(&child_close, &nul_handles);
             // Route through the shared io::Error mapping so ERROR_PATH_NOT_FOUND
             // (3) and friends land on the same code node reports, and errno
             // rides along: node emits it as the `code` argument of the 'close'
@@ -573,7 +711,7 @@ pub fn spawn_extra(
             TerminateProcess(pi.hProcess, 1);
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
-            cleanup_fail(&child_close, &nul_handles, &parent_fds);
+            cleanup_fail(&child_close, &nul_handles);
             let ioe = std::io::Error::from_raw_os_error(err as i32);
             return Err(super::child::spawn_failure_json_with(
                 &ioe,
@@ -601,105 +739,48 @@ pub fn spawn_extra(
 
 /// Read up to 64 KiB from a parent-readable fd end. EOF (0 bytes) -> Done.
 pub async fn raw_read(reg: RawChildRegistry, id: u64, fd: u32) -> OpOutcome {
-    let handle = {
-        let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.get_mut(&id).and_then(|c| c.fds.get_mut(&fd)) {
-            Some(end) if end.readable => end.handle.take(),
-            Some(_) => return OpOutcome::Failed(format!("fd {fd} is not readable")),
+    let end = {
+        let guard = reg.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.get(&id).and_then(|c| c.fds.get(&fd)) {
+            Some(FdEnd::Read(end)) => Arc::clone(end),
+            Some(FdEnd::Write(_)) => return OpOutcome::Failed(format!("fd {fd} is not readable")),
             None => return OpOutcome::Done,
         }
     };
-    let Some(h) = handle else {
-        return OpOutcome::Done;
-    };
-    // Copy to a usize so the closure captures a Send value, not the raw
-    // pointer field (2021 disjoint capture would otherwise grab `h.0`).
-    let raw = h.0 as usize;
-    let result = tokio::task::spawn_blocking(move || {
-        let hh = raw as HANDLE;
-        // Peek before the blocking read so ReadFile only runs once bytes are
-        // confirmed waiting. PeekNamedPipe fails (EOF) the moment the child's
-        // write end closes, so this loop cannot spin forever on a dead child;
-        // a live-but-quiet child re-peeks until data arrives -- no timeout
-        // cap, because a timeout here is a false EOF that silently truncates
-        // the stream.
-        loop {
-            let mut avail: u32 = 0;
-            // SAFETY: hh is a live pipe read handle; null buffer/read/left
-            // args, avail receives the total-bytes-available count.
-            let peeked = unsafe {
-                PeekNamedPipe(
-                    hh,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null_mut(),
-                    &mut avail,
-                    std::ptr::null_mut(),
-                )
-            };
-            if peeked == 0 {
-                // Broken pipe (child died / closed its end) == clean EOF.
-                return Ok(None);
-            }
-            if avail > 0 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        let mut buf = vec![0u8; 65536];
-        let mut n: u32 = 0;
-        // SAFETY: bytes are confirmed waiting, so this read cannot block; buf
-        // is a live 64 KiB buffer for the live hh.
-        let ok = unsafe { ReadFile(hh, buf.as_mut_ptr(), 65536, &mut n, std::ptr::null_mut()) };
-        if ok == 0 {
-            // ERROR_BROKEN_PIPE (109) on a closed write end == clean EOF.
-            // SAFETY: GetLastError only reads the calling thread's last-error
-            // slot; it takes no pointers and is always sound.
-            let err = unsafe { GetLastError() };
-            if err == 109 {
-                Ok(None)
-            } else {
-                Err(format!("ReadFile: {err}"))
-            }
-        } else if n == 0 {
-            Ok(None)
-        } else {
-            buf.truncate(n as usize);
-            Ok(Some(buf))
-        }
-    })
-    .await;
-
+    let reader = Arc::clone(&end);
+    let result = tokio::task::spawn_blocking(move || reader.read_blocking()).await;
     match result {
-        Ok(Ok(Some(bytes))) => {
-            let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(end) = guard.get_mut(&id).and_then(|c| c.fds.get_mut(&fd)) {
-                end.handle = Some(h);
-            } else {
-                // SAFETY: the registry entry is gone, so `h` (taken for this op)
-                // has no other owner; close it exactly once.
-                unsafe { CloseHandle(h.0) };
-            }
-            OpOutcome::Bytes(bytes)
-        }
+        Ok(Ok(Some(bytes))) => OpOutcome::Bytes(bytes),
+        // EOF, a failed read or a failed join all end the stream: the end
+        // leaves the registry, and its handle closes with the last holder.
         Ok(Ok(None)) => {
-            // SAFETY: EOF -- `h` is not re-inserted, so this op is its sole
-            // owner; close it exactly once.
-            unsafe { CloseHandle(h.0) };
+            retire_read_end(&reg, id, fd, &end);
             OpOutcome::Done
         }
         Ok(Err(e)) => {
-            // SAFETY: error path -- `h` is not re-inserted, so this op is its
-            // sole owner; close it exactly once.
-            unsafe { CloseHandle(h.0) };
+            retire_read_end(&reg, id, fd, &end);
             OpOutcome::Failed(e)
         }
         Err(e) => {
-            // SAFETY: join failure -- `h` is not re-inserted, so this op is its
-            // sole owner; close it exactly once.
-            unsafe { CloseHandle(h.0) };
+            retire_read_end(&reg, id, fd, &end);
             OpOutcome::Failed(format!("read join: {e}"))
         }
+    }
+}
+
+/// Take a finished read end out of the registry -- only that end: the slot
+/// may hold nothing else, but `Arc::ptr_eq` keeps this honest -- and drop the
+/// child's entry once `raw_wait` has collected the exit and no end is left.
+fn retire_read_end(reg: &RawChildRegistry, id: u64, fd: u32, end: &Arc<ReadEnd>) {
+    let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(child) = guard.get_mut(&id) else {
+        return;
+    };
+    if matches!(child.fds.get(&fd), Some(FdEnd::Read(e)) if Arc::ptr_eq(e, end)) {
+        child.fds.remove(&fd);
+    }
+    if child.fds.is_empty() && child.process.is_none() {
+        guard.remove(&id);
     }
 }
 
@@ -708,26 +789,26 @@ pub async fn raw_write(reg: RawChildRegistry, id: u64, fd: u32, data: Vec<u8>) -
     let handle = {
         let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get_mut(&id).and_then(|c| c.fds.get_mut(&fd)) {
-            Some(end) if !end.readable => end.handle.take(),
-            Some(_) => return OpOutcome::Failed(format!("fd {fd} is not writable")),
+            Some(FdEnd::Write(h)) => h.take(),
+            Some(FdEnd::Read(_)) => return OpOutcome::Failed(format!("fd {fd} is not writable")),
             None => return OpOutcome::Failed(format!("unknown fd {fd}")),
         }
     };
     let Some(h) = handle else {
         return OpOutcome::Failed(format!("fd {fd} not available"));
     };
-    let raw = h.0 as usize;
+    // The owned end goes into the blocking task and comes back only on
+    // success; every other path drops it, which is its close.
     let result = tokio::task::spawn_blocking(move || {
-        let hh = raw as HANDLE;
         let mut off = 0usize;
         while off < data.len() {
             let mut written: u32 = 0;
-            // SAFETY: `hh` is the live write handle taken for this op; the
+            // SAFETY: `h` is the open write handle this task owns; the
             // pointer/length are the head of the still-live `data` slice and
             // `written` is a live out-param.
             let ok = unsafe {
                 WriteFile(
-                    hh,
+                    h.as_raw_handle(),
                     data[off..].as_ptr(),
                     (data.len() - off) as u32,
                     &mut written,
@@ -735,55 +816,51 @@ pub async fn raw_write(reg: RawChildRegistry, id: u64, fd: u32, data: Vec<u8>) -
                 )
             };
             if ok == 0 {
-                // SAFETY: GetLastError only reads the thread's last-error slot.
-                let err = unsafe { GetLastError() };
-                return Err(format!("WriteFile: {err}"));
+                return Err(format!("WriteFile: {}", std::io::Error::last_os_error()));
             }
             if written == 0 {
                 return Err("WriteFile wrote 0".to_string());
             }
             off += written as usize;
         }
-        Ok(())
+        Ok(h)
     })
     .await;
 
     match result {
-        Ok(Ok(())) => {
+        Ok(Ok(h)) => {
             let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(end) = guard.get_mut(&id).and_then(|c| c.fds.get_mut(&fd)) {
-                end.handle = Some(h);
-            } else {
-                // SAFETY: the registry entry is gone, so `h` (taken for this op)
-                // has no other owner; close it exactly once.
-                unsafe { CloseHandle(h.0) };
+            if let Some(FdEnd::Write(slot)) = guard.get_mut(&id).and_then(|c| c.fds.get_mut(&fd)) {
+                *slot = Some(h);
             }
+            // else: the end was closed or the entry dropped mid-write; `h`
+            // closes as it goes out of scope here.
             OpOutcome::Done
         }
-        Ok(Err(e)) => {
-            // SAFETY: error path -- `h` is not re-inserted, so this op is its
-            // sole owner; close it exactly once.
-            unsafe { CloseHandle(h.0) };
-            OpOutcome::Failed(e)
-        }
-        Err(e) => {
-            // SAFETY: join failure -- `h` is not re-inserted, so this op is its
-            // sole owner; close it exactly once.
-            unsafe { CloseHandle(h.0) };
-            OpOutcome::Failed(format!("write join: {e}"))
-        }
+        Ok(Err(e)) => OpOutcome::Failed(e),
+        Err(e) => OpOutcome::Failed(format!("write join: {e}")),
     }
 }
 
-/// Close one parent-side fd end (e.g. end stdin / a CDP pipe).
+/// Close one parent-side fd end: end stdin or a CDP pipe, or `destroy()` a
+/// readable one. A read blocked on the end is cancelled and reports EOF.
 pub fn raw_close_fd(reg: &RawChildRegistry, id: u64, fd: u32) {
     let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(end) = guard.get_mut(&id).and_then(|c| c.fds.get_mut(&fd))
-        && let Some(SendHandle(h)) = end.handle.take()
-    {
-        // SAFETY: `h` was just taken out of the registry entry, so this call is
-        // its sole owner; close it exactly once.
-        unsafe { CloseHandle(h) };
+    let Some(child) = guard.get_mut(&id) else {
+        return;
+    };
+    match child.fds.get_mut(&fd) {
+        // Taking the handle out drops it here, which is the close. A write in
+        // flight holds its own handle and closes it when it finishes.
+        Some(FdEnd::Write(h)) => drop(h.take()),
+        Some(FdEnd::Read(end)) => {
+            end.close();
+            child.fds.remove(&fd);
+            if child.fds.is_empty() && child.process.is_none() {
+                guard.remove(&id);
+            }
+        }
+        None => {}
     }
 }
 
@@ -840,21 +917,27 @@ pub async fn raw_wait(reg: RawChildRegistry, id: u64) -> OpOutcome {
     })
     .await;
 
-    // Drop the entry, close every handle we still own.
-    let (kill_signal, fds, proc_handle) = {
+    // Close the process handle and the write ends. The READ ends stay: the
+    // child is gone, but what it wrote before exiting may still sit in a pipe,
+    // and a grandchild that inherited a write end can still be writing. Each
+    // is read to its EOF, as node reads a child's stdio to the end before
+    // 'close', and `retire_read_end` drops the entry with the last of them.
+    // (Dropping the entry here, as this used to, turned the next read of a
+    // pipe with data still in it into an early EOF.)
+    let (kill_signal, proc_handle) = {
         let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.remove(&id) {
-            Some(c) => (c.kill_signal, c.fds, c.process),
-            None => (None, HashMap::new(), None),
+        match guard.get_mut(&id) {
+            Some(c) => {
+                let out = (c.kill_signal.take(), c.process.take());
+                c.fds.retain(|_, end| matches!(end, FdEnd::Read(_)));
+                if c.fds.is_empty() {
+                    guard.remove(&id);
+                }
+                out
+            }
+            None => (None, None),
         }
     };
-    for end in fds.values() {
-        if let Some(SendHandle(h)) = end.handle {
-            // SAFETY: `fds` was removed from the registry above, so this fn is
-            // the sole owner of each remaining pipe end; close each once.
-            unsafe { CloseHandle(h) };
-        }
-    }
     if let Some(SendHandle(h)) = proc_handle {
         // SAFETY: the process handle was removed from the registry above, so
         // this fn is its sole owner; close it once.
@@ -1012,6 +1095,7 @@ mod tests {
                 None,
                 None,
                 &[StdioFd::ChildRead, StdioFd::Ignore, StdioFd::Ignore],
+                false,
                 false,
             )
             .expect("spawn_extra");

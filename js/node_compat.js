@@ -34252,6 +34252,17 @@
       "install", "trust", "compile", "self-update", "help",
     ]);
 
+    // node's normalizeSpawnArguments checks `windowsHide` before it spawns
+    // (ERR_INVALID_ARG_TYPE for anything but a boolean, null or undefined).
+    // spawn, spawnSync and fork run it on the caller's value, and so do
+    // execSync and execFileSync through spawnSync; exec and execFile hand
+    // spawn `!!windowsHide` and so never throw it.
+    function validateWindowsHide(opts) {
+      if (opts.windowsHide != null && typeof opts.windowsHide !== "boolean") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.windowsHide", "boolean", opts.windowsHide);
+      }
+    }
+
     function normalizeArgs(command, args, options) {
       if (args != null && typeof args === "object" && !Array.isArray(args)) {
         options = args;
@@ -34478,6 +34489,7 @@
     function spawnSync(command, args, options) {
       const norm = normalizeArgs(command, args, options);
       const opts = norm.options;
+      validateWindowsHide(opts);
       const nativeOpts = {
         cwd: opts.cwd || undefined,
         // Exactly the child's environment, which replaces oam's own as node's
@@ -34488,6 +34500,10 @@
         // UV_PROCESS_DETACHED), so a detached sync child is kept out of the
         // Windows kill-on-close job like an async one.
         detached: !!opts.detached,
+        // Windows: CREATE_NO_WINDOW (and SW_HIDE) only when asked, as libuv
+        // does; without it a console child shares this process's console
+        // instead of paying for a hidden conhost.exe of its own.
+        windowsHide: !!opts.windowsHide,
         timeout: opts.timeout || 0,
         maxBuffer: opts.maxBuffer || 50 * 1024 * 1024,
         input: opts.input != null
@@ -34735,6 +34751,7 @@
         // envPairs do: see childEnv.
         env: childEnv(opts.env, spawnArgv(norm)),
         detached: !!opts.detached,
+        windowsHide: !!opts.windowsHide,
       };
 
       cp.stdio = new Array(stdioArr.length).fill(null);
@@ -34795,7 +34812,18 @@
           cp.stdio[fd] = w;
         } else if (codes[fd] === 3) {
           // child writes -> parent reads: a Readable + a pump loop.
-          const r = new Readable({ read() {} });
+          const r = new Readable({
+            read() {},
+            // destroy() closes the pipe, as node's does: the child's next
+            // write fails, and a native read blocked on the pipe is cancelled
+            // (it reports EOF, which ends the pump) instead of holding a
+            // thread for as long as the child lives. After 'end' the end is
+            // already closed and this is a no-op.
+            destroy(err, callback) {
+              natives.spawnExtraCloseFd(cp._handle, fd);
+              callback(err);
+            },
+          });
           cp.stdio[fd] = r;
           reads.push((async () => {
             while (true) {
@@ -34810,6 +34838,13 @@
               }
               if (chunk === undefined || chunk === null || chunk.length === 0) {
                 r.push(null);
+                break;
+              }
+              if (r.destroyed) {
+                // destroy() landed while this read was in flight. On Windows
+                // it already cancelled the read; the POSIX read held the end
+                // until it returned, so the close happens now.
+                natives.spawnExtraCloseFd(cp._handle, fd);
                 break;
               }
               r.push(Buffer.from(chunk));
@@ -35004,6 +35039,7 @@
     function spawn(command, args, options) {
       const norm = normalizeArgs(command, args, options);
       const opts = norm.options;
+      validateWindowsHide(opts);
       // stdio: [..., 'ipc'] asks for a message channel, the same one fork()
       // sets up. Splice the slot out FIRST so a 4-entry array does not get
       // misrouted to the extra-fd path below; Node reports stdio[3] as null.
@@ -35101,6 +35137,7 @@
         // Windows: a non-detached child joins the kill-on-close job and dies
         // with this process, as under node; a detached one is left out.
         detached: !!opts.detached,
+        windowsHide: !!opts.windowsHide,
       };
 
       const readStdout = async (handle) => {
@@ -35253,6 +35290,9 @@
       const spawnOpts = Object.assign({}, opts);
       delete spawnOpts.stdio;
       delete spawnOpts.detached;
+      // The whitelist hands spawn `!!options.windowsHide`, so exec never
+      // throws spawn's type check for it.
+      spawnOpts.windowsHide = !!opts.windowsHide;
       return collectExec(spawn(command, [], spawnOpts), command, opts, callback);
     }
 
@@ -35404,9 +35444,11 @@
       // happen to appear inside an argument. `shell` stays honored if the
       // caller explicitly asks for one, which node also supports.
       const spawnOpts = Object.assign({}, opts, { shell: !!opts.shell });
-      // Same whitelist as exec(): neither stdio nor detached reaches spawn.
+      // Same whitelist as exec(): neither stdio nor detached reaches spawn,
+      // and windowsHide arrives as a boolean.
       delete spawnOpts.stdio;
       delete spawnOpts.detached;
+      spawnOpts.windowsHide = !!opts.windowsHide;
       const display = norm.args.length
         ? `${norm.command} ${norm.args.join(" ")}`
         : norm.command;
@@ -35473,6 +35515,7 @@
       }
       args = (args || []).map(String);
       const opts = Object.assign({}, options);
+      validateWindowsHide(opts);
       const execPath = opts.execPath || globalThis.process.execPath;
       const execArgv = opts.execArgv || globalThis.process.execArgv || [];
       const silent = !!opts.silent;
@@ -35576,8 +35619,10 @@
           cwd: opts.cwd || undefined,
           env: forkEnv,
           shell: false,
-          // node's fork() forwards its options to spawn(), detached included.
+          // node's fork() forwards its options to spawn(), detached and
+          // windowsHide included.
           detached: !!opts.detached,
+          windowsHide: !!opts.windowsHide,
         };
 
         ipcServer.on("connection", (socket) => {

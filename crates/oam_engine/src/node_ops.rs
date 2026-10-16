@@ -8680,6 +8680,21 @@ fn opt_detached(scope: &mut v8::PinScope<'_, '_>, opts: Option<v8::Local<'_, v8:
     .is_some_and(|v| v.is_true())
 }
 
+/// node's `windowsHide` spawn option, read as the JS layer normalized it
+/// (`!!`, after node's boolean check). On Windows it decides
+/// `CREATE_NO_WINDOW` as libuv does; see oam_core's
+/// `child::windows_creation_flags`.
+fn opt_windows_hide(
+    scope: &mut v8::PinScope<'_, '_>,
+    opts: Option<v8::Local<'_, v8::Object>>,
+) -> bool {
+    opts.and_then(|o| {
+        let key = v8::String::new(scope, "windowsHide")?;
+        o.get(scope, key.into())
+    })
+    .is_some_and(|v| v.is_true())
+}
+
 /// The `env` spawn option: the child's whole environment, as the JS layer
 /// built it (child_process's childEnv -- the caller's env or process.env, with
 /// node's and libuv's adjustments). Absent only for a caller that wants this
@@ -8769,6 +8784,7 @@ fn op_spawn_sync(
         })
         .unwrap_or(0.0) as u64;
     let detached = opt_detached(scope, opts);
+    let windows_hide = opt_windows_hide(scope, opts);
     let max_buffer = opts
         .and_then(|o| {
             let key = v8::String::new(scope, "maxBuffer")?;
@@ -8809,6 +8825,7 @@ fn op_spawn_sync(
         max_buffer,
         stdio,
         detached,
+        windows_hide,
     );
 
     let obj = v8::Object::new(scope);
@@ -8920,6 +8937,7 @@ fn op_spawn_async(
 
     let stdio = arg_stdio_spec(scope, opts, &core_runtime!(scope).sync_files());
     let detached = opt_detached(scope, opts);
+    let windows_hide = opt_windows_hide(scope, opts);
 
     let children = core_runtime!(scope).children();
     let ids = core_runtime!(scope).body_ids();
@@ -8932,7 +8950,16 @@ fn op_spawn_async(
     let spawned = {
         let core = core_runtime!(scope);
         let _guard = core.enter();
-        oam_core::child::spawn_child(command, child_args, cwd, env_pairs, shell, stdio, detached)
+        oam_core::child::spawn_child(
+            command,
+            child_args,
+            cwd,
+            env_pairs,
+            shell,
+            stdio,
+            detached,
+            windows_hide,
+        )
     };
     match spawned {
         Ok((child, pid)) => {
@@ -9259,6 +9286,7 @@ fn op_spawn_extra(
     }
 
     let detached = opt_detached(scope, opts);
+    let windows_hide = opt_windows_hide(scope, opts);
     let reg = core_runtime!(scope).raw_children();
     let ids = core_runtime!(scope).body_ids();
     match oam_core::child_extra::spawn_extra(
@@ -9268,6 +9296,7 @@ fn op_spawn_extra(
         env_pairs.as_deref(),
         &stdio,
         detached,
+        windows_hide,
     ) {
         Ok(child) => {
             let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

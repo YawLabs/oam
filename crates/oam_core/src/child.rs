@@ -134,6 +134,12 @@ pub fn stdio_pipe_all() -> StdioSpec {
 /// `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` and keeps the child OUT of
 /// the kill-on-close job (job_win.rs) every other child is placed in. It is
 /// not yet honored on POSIX, where node would also `setsid()` the child.
+///
+/// `windows_hide` is node's `windowsHide`, which decides `CREATE_NO_WINDOW`
+/// as libuv does (see `windows_creation_flags`). std's `Command` has no
+/// stable way to set `wShowWindow`, so libuv's `SW_HIDE` for a GUI child is
+/// not applied here; docs/node-divergences.md records it. Ignored on POSIX,
+/// as under node.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_child(
     command: String,
@@ -143,6 +149,7 @@ pub fn spawn_child(
     shell: bool,
     stdio: StdioSpec,
     detached: bool,
+    windows_hide: bool,
 ) -> Result<(tokio::process::Child, u32), String> {
     let (prog, final_args) = if shell {
         #[cfg(windows)]
@@ -208,6 +215,9 @@ pub fn spawn_child(
     }
     #[cfg(not(windows))]
     cmd.args(&final_args);
+    // Read before the spec is consumed below.
+    #[cfg(windows)]
+    let inherits = stdio_inherits(&stdio);
     // Destructured, not indexed: a slot can now OWN a descriptor, so the spec
     // is consumed rather than copied.
     let [slot0, slot1, slot2] = stdio;
@@ -228,10 +238,10 @@ pub fn spawn_child(
 
     #[cfg(windows)]
     {
-        cmd.creation_flags(windows_creation_flags(detached));
+        cmd.creation_flags(windows_creation_flags(detached, windows_hide, inherits));
     }
     #[cfg(not(windows))]
-    let _ = detached;
+    let _ = (detached, windows_hide);
 
     let child = cmd.spawn().map_err(|e| spawn_failure_json(&e))?;
     // Right after spawn, not suspended: tokio's Command cannot resume a
@@ -406,21 +416,62 @@ fn synthetic_spawn_errno(code: &str) -> Option<i32> {
     }
 }
 
-/// Windows creation flags for a `child_process` spawn. `CREATE_NO_WINDOW` is
-/// oam's standing default; a `detached: true` child instead gets libuv's
-/// `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` -- no console of the parent's
-/// and no share of its Ctrl+C. CREATE_NO_WINDOW is left off there because the
-/// CreateProcessW contract ignores it alongside DETACHED_PROCESS.
+/// Windows creation flags for a `child_process` spawn, as libuv's
+/// `uv_spawn` (src/win/process.c) computes them from node's options.
+///
+/// `CREATE_NO_WINDOW` is set for `windowsHide: true` when no stdio slot is
+/// inherited (`inherits` -- libuv's `UV_INHERIT_FD`: an `'inherit'` slot or
+/// a numbered descriptor). It is NOT set by default: a console child then
+/// shares this process's console, where `CREATE_NO_WINDOW` makes Windows
+/// start a fresh hidden conhost.exe for every child -- about 35 ms a spawn,
+/// which node pays only when the caller asks for `windowsHide`.
+///
+/// The one place oam still adds it unasked is a process with NO console of
+/// its own (started detached, or by a GUI program): there node's child gets a
+/// new console with a VISIBLE window (measured: node v22.22.2 run detached,
+/// its `windowsHide: false` grandchild reports a visible console window).
+/// That child needs a new console either way, so the flag costs nothing and
+/// only keeps the window from popping up; docs/node-divergences.md has it.
+///
+/// `detached` adds libuv's `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` --
+/// no console of the parent's and no share of its Ctrl+C. CreateProcessW
+/// ignores `CREATE_NO_WINDOW` alongside `DETACHED_PROCESS`, so the
+/// no-console rule is skipped there.
 #[cfg(windows)]
-pub(crate) fn windows_creation_flags(detached: bool) -> u32 {
+pub(crate) fn windows_creation_flags(detached: bool, windows_hide: bool, inherits: bool) -> u32 {
     use windows_sys::Win32::System::Threading::{
         CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
     };
-    if detached {
-        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    } else {
-        CREATE_NO_WINDOW
+    let mut flags = 0;
+    if (windows_hide && !inherits) || (!detached && !has_console()) {
+        flags |= CREATE_NO_WINDOW;
     }
+    if detached {
+        flags |= DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    }
+    flags
+}
+
+/// Whether this process is attached to a console. `GetConsoleWindow` is not
+/// the test: a process started with `CREATE_NO_WINDOW` has a console with no
+/// window, which its children share without any window appearing.
+/// `GetConsoleCP` fails (0) only when there is no console at all.
+#[cfg(windows)]
+fn has_console() -> bool {
+    // SAFETY: GetConsoleCP takes no arguments and touches no memory of ours;
+    // it reads the code page of the console this process is attached to, or
+    // fails with 0 when there is none.
+    unsafe { windows_sys::Win32::System::Console::GetConsoleCP() != 0 }
+}
+
+/// libuv's `UV_INHERIT_FD` test over a std spawn's three slots: an inherited
+/// slot or a numbered descriptor. It decides whether `windowsHide` may add
+/// `CREATE_NO_WINDOW` (see `windows_creation_flags`).
+#[cfg(windows)]
+fn stdio_inherits(stdio: &StdioSpec) -> bool {
+    stdio
+        .iter()
+        .any(|s| matches!(s, StdioMode::Inherit | StdioMode::File(_)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -435,6 +486,7 @@ pub fn spawn_sync(
     max_buffer: usize,
     stdio: StdioSpec,
     detached: bool,
+    windows_hide: bool,
 ) -> SpawnSyncResult {
     let (prog, final_args) = if shell {
         #[cfg(windows)]
@@ -512,6 +564,8 @@ pub fn spawn_sync(
     // "EOF by another route": the child's fd 0 becomes a character device, so
     // `fstatSync(0).isCharacterDevice()` flips and 'pipe' stops being
     // distinguishable from 'ignore' to a child that inspects its own stdin.
+    #[cfg(windows)]
+    let inherits = stdio_inherits(&stdio);
     let [slot0, slot1, slot2] = stdio;
     cmd.stdin(if slot0.is_pipe() {
         std::process::Stdio::piped()
@@ -523,10 +577,11 @@ pub fn spawn_sync(
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(windows_creation_flags(detached));
+        // windowsHide as spawn_child applies it (and with the same SW_HIDE gap).
+        cmd.creation_flags(windows_creation_flags(detached, windows_hide, inherits));
     }
     #[cfg(not(windows))]
-    let _ = detached;
+    let _ = (detached, windows_hide);
 
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
