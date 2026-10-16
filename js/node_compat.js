@@ -16700,9 +16700,9 @@
       if (!(warning instanceof Error)) return;
       const isDeprecation = warning.name === "DeprecationWarning";
       if (isDeprecation && process.noDeprecation) return;
-      // --no-warnings takes the listener off at startup (the CLI's prelude,
-      // which a worker inherits); the check is for whatever still holds a
-      // reference to this function and calls it.
+      // --no-warnings takes the listener off at startup (the CLI's prelude;
+      // a worker's own, decided by its execArgv and env, #370); the check is
+      // for whatever still holds a reference to this function and calls it.
       if (globalThis.__oamNoWarnings) return;
       if (globalThis.__oamNoDeprecation && isDeprecation) return;
       // --disable-warning=<name|code>: still emitted, not printed.

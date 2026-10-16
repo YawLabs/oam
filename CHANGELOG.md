@@ -16,6 +16,30 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A worker_threads Worker's own `execArgv` and `env` decide its process flags, as node's do
+  (#370).** Every worker ran with the flags of its parent's command line, whatever it was given:
+  `execArgv: []` under a parent run with `--no-warnings` had no default `'warning'` listener, and
+  `env: { NODE_NO_WARNINGS: "1" }` did not remove it. Now a Worker given neither option shares its
+  creator's options; given either, it starts from the defaults, takes `NODE_OPTIONS` from the
+  environment it is given, then its `execArgv`, and reads `NODE_NO_WARNINGS` from its own
+  `process.env` -- for `--no-warnings`, `--no-deprecation`, `--pending-deprecation`,
+  `--disable-warning`, `--redirect-warnings` and the `--tls-min/max-v1.x` defaults.
+  `--title` and `--zero-fill-buffers` stay the whole process's, as in node. `stderr: true` now
+  sends the worker's `process.stderr` output, its warnings included, to `worker.stderr`; it went
+  to the process's stderr.
+- **A worker whose run fails fatally ends as node's does (#399).** It now emits `'exit'` with code
+  1 on its own `process` before the parent hears of the error (nothing an `'exit'` listener queues
+  runs, and the thread exits with the `exitCode` the listeners leave), and the parent's `'error'`
+  event gets the error itself: an `Error` of the nearest built-in class with its own `message`,
+  `name`, `stack`, `code` and other properties, a `cause` rebuilt the same way, any other thrown
+  value as itself, and an unhandled rejection of a non-`Error` as node's `ERR_UNHANDLED_REJECTION`
+  error. It was a plain `Error` whose `message` was the whole rendered report, which oam also
+  printed to stderr under `worker N:`; nothing is printed now unless the parent leaves `'error'`
+  unhandled. A synchronous throw from a CommonJS worker entry now reaches the worker's own
+  `'uncaughtException'` listeners too.
+
 ## [0.19.1] - 2026-10-13
 
 ### Changed
