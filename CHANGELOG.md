@@ -403,6 +403,18 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **On Windows `stat` reports a directory's size as 0.** `statSync("C:\\").size` was the
   root's index allocation (12288 on NTFS); libuv reports 0 for every directory.
 
+### Performance
+
+- **`stat` and `readdir` results no longer make a JSON round trip.** `stat`, `lstat` and `fstat`
+  (sync, callback, promise, `FileHandle`) and `readdir` / `opendir` listings came back as JSON the
+  native serialized and V8 parsed back on every call. A stat is now a `StatRecord` -- node's fourteen
+  `Stats` values as doubles plus the kind, the ids flag and the Windows reparse tag, integers exact --
+  which a sync stat writes into one reused `Float64Array` (as node's binding fills `statValues`, so no
+  allocation per call) and an async stat resolves as a `Float64Array` over a buffer of its own; the JS
+  side builds `Stats` / `BigIntStats` from it. A listing is two arrays, names and internalized kind
+  names, so a plain `readdir` returns the names array as it is. The win is largest for `readdir` on a
+  wide directory and for the sync stat forms, which now allocate nothing per call.
+
 ## [0.19.0] - 2026-10-11
 
 ### Fixed
