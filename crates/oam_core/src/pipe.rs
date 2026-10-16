@@ -538,17 +538,59 @@ mod windows {
 
     /// A listening named pipe: the instances waiting for the next clients,
     /// [`PENDING_INSTANCES`] of them as libuv keeps. Each connected instance
-    /// is handed out by [`PipeListener::accept`] and a fresh one takes its
-    /// place at once, so the name is never without a listening instance
+    /// is handed out by [`PipeListener::poll_accept`] and a fresh one takes
+    /// its place at once, so the name is never without a listening instance
     /// while the server is open.
+    ///
+    /// The instances wait inside the listener ([`Instance`]), so it is
+    /// accepted from where it sits, through `&mut self`, and never taken out
+    /// to be waited on: [`PipeListener::close`] reaches every one of them.
     pub(crate) struct PipeListener {
         path: String,
-        pending: Vec<NamedPipeServer>,
+        pending: Vec<Instance>,
     }
 
-    fn instance(path: &str, first: bool) -> io::Result<NamedPipeServer> {
-        ServerOptions::new().first_pipe_instance(first).create(path)
+    /// One instance waiting for a client: the instance, and the wait for a
+    /// client to connect to it, which holds the instance too.
+    struct Instance {
+        server: Arc<NamedPipeServer>,
+        wait: std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>>,
+        /// Whether the wait has been polled: from then on its connect
+        /// (ConnectNamedPipe) is in flight.
+        polled: bool,
     }
+
+    impl Instance {
+        fn new(server: NamedPipeServer) -> Instance {
+            let server = Arc::new(server);
+            let held = server.clone();
+            Instance {
+                server,
+                wait: Box::pin(async move { held.connect().await }),
+                polled: false,
+            }
+        }
+
+        /// The instance itself, its wait dropped.
+        fn into_server(self) -> NamedPipeServer {
+            let Instance { server, wait, .. } = self;
+            // The wait was the only other owner.
+            drop(wait);
+            Arc::into_inner(server).expect("an instance's wait is its only other owner")
+        }
+    }
+
+    fn instance(path: &str, first: bool) -> io::Result<Instance> {
+        ServerOptions::new()
+            .first_pipe_instance(first)
+            .create(path)
+            .map(Instance::new)
+    }
+
+    /// How long [`PipeListener::close`] waits for the reactor to finish
+    /// with the instances whose connect was in flight; as long as an http
+    /// server's close waits for its accept loop to drop its listener.
+    const CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
     /// Listen on the named pipe `target`, as libuv's `uv_pipe_bind`: the
     /// first instance is created with FILE_FLAG_FIRST_PIPE_INSTANCE, so a
@@ -587,48 +629,138 @@ mod windows {
             Ok(())
         }
 
-        /// The next client to connect, on whichever waiting instance it took.
-        pub(crate) async fn accept(&mut self) -> io::Result<(PipeRead, PipeWrite)> {
+        /// The next client to connect, on whichever waiting instance it
+        /// took. Polled where the listener sits (see
+        /// `crate::tcp::tcp_accept`): an instance that is not taken keeps
+        /// waiting, armed, for the next poll.
+        pub(crate) fn poll_accept(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<(PipeRead, PipeWrite)>> {
+            use std::task::Poll;
             loop {
                 // A failure to make one more instance is reported only when
                 // none is left waiting: the ones there still take clients.
                 if let Err(e) = self.top_up()
                     && self.pending.is_empty()
                 {
-                    return Err(e);
+                    return Poll::Ready(Err(e));
                 }
-                // tokio's connect is cancel safe: the waits not taken here
-                // stay armed for the next accept.
-                let (index, connected) = {
-                    let mut waits: Vec<_> = self
-                        .pending
-                        .iter()
-                        .map(|server| Box::pin(server.connect()))
-                        .collect();
-                    std::future::poll_fn(|cx| {
-                        for (index, wait) in waits.iter_mut().enumerate() {
-                            if let std::task::Poll::Ready(connected) = wait.as_mut().poll(cx) {
-                                return std::task::Poll::Ready((index, connected));
-                            }
+                let ready = self
+                    .pending
+                    .iter_mut()
+                    .enumerate()
+                    .find_map(|(index, waiting)| {
+                        waiting.polled = true;
+                        match waiting.wait.as_mut().poll(cx) {
+                            Poll::Ready(connected) => Some((index, connected)),
+                            Poll::Pending => None,
                         }
-                        std::task::Poll::Pending
-                    })
-                    .await
+                    });
+                let Some((index, connected)) = ready else {
+                    return Poll::Pending;
                 };
-                let server = self.pending.swap_remove(index);
+                // Its wait is done: never polled again.
+                let server = self.pending.swap_remove(index).into_server();
                 match connected {
                     Ok(()) => {
                         // Its replacement before this one is handed out. If
                         // it cannot be had now, the next accept tries again.
                         let _ = self.top_up();
-                        return Ok(split(End::Server(server)));
+                        return Poll::Ready(Ok(split(End::Server(server))));
                     }
                     // A client that connected and went before the connect
-                    // was seen: nothing to hand out; the instance is spent.
+                    // was seen: nothing to hand out; the instance is spent,
+                    // and the loop polls its replacement.
                     Err(e) if e.raw_os_error() == Some(ERROR_NO_DATA as i32) => {}
-                    Err(e) => return Err(e),
+                    Err(e) => return Poll::Ready(Err(e)),
                 }
             }
+        }
+
+        /// [`Self::poll_accept`] as a future, for a server that owns its
+        /// listener outright (the http servers over a pipe).
+        pub(crate) async fn accept(&mut self) -> io::Result<(PipeRead, PipeWrite)> {
+            std::future::poll_fn(|cx| self.poll_accept(cx)).await
+        }
+
+        /// Close the listener before returning, as libuv's `uv_close`
+        /// closes a pipe server's pending instances: a client that dials the
+        /// name right after it finds no such pipe (ENOENT), where it used to
+        /// connect to an instance the closed server still had open (#388).
+        ///
+        /// An instance whose connect was never issued closes when it is
+        /// dropped. One whose connect is in flight does not: the reactor
+        /// keeps it open until it has taken the connect's completion, which
+        /// it does on its own thread, a moment later. So each such instance
+        /// is first disconnected -- from then on it takes no client (a dial
+        /// finds the pipe busy, then gone), and its connect completes -- and
+        /// the close waits, bounded, until the reactor has taken that
+        /// completion (it marks the instance ready), after which dropping
+        /// the instance closes it. The bound only keeps a starved runtime
+        /// from holding the close up.
+        pub(crate) fn close(mut self) {
+            let deadline = std::time::Instant::now() + CLOSE_BUDGET;
+            let in_flight: Vec<NamedPipeServer> = std::mem::take(&mut self.pending)
+                .into_iter()
+                .filter(|waiting| waiting.polled)
+                .map(|waiting| {
+                    let server = waiting.into_server();
+                    let _ = server.disconnect();
+                    server
+                })
+                .collect();
+            for server in &in_flight {
+                block_until(deadline, |cx| {
+                    if server.poll_write_ready(cx).is_ready()
+                        || server.poll_read_ready(cx).is_ready()
+                    {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                });
+            }
+        }
+    }
+
+    impl Drop for PipeListener {
+        /// A listener dropped without [`PipeListener::close`] (an http
+        /// server's accept loop ending): every instance whose connect is in
+        /// flight is disconnected, so it takes no client while the reactor
+        /// still holds it open.
+        fn drop(&mut self) {
+            for waiting in self.pending.drain(..) {
+                if waiting.polled {
+                    let _ = waiting.into_server().disconnect();
+                }
+            }
+        }
+    }
+
+    /// Poll `poll` on this thread, parked between polls, until it is ready
+    /// or `deadline` passes.
+    fn block_until(
+        deadline: std::time::Instant,
+        mut poll: impl FnMut(&mut std::task::Context<'_>) -> std::task::Poll<()>,
+    ) {
+        struct Unpark(std::thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut cx = std::task::Context::from_waker(&waker);
+        while poll(&mut cx).is_pending() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            std::thread::park_timeout(left);
         }
     }
 
