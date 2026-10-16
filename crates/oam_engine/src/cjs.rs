@@ -59,10 +59,6 @@ pub(crate) struct CjsCache {
     /// program that deletes an entry gets a fresh load and one that plants an
     /// entry gets its `exports`, as in node. Created on first use.
     require_cache: Option<v8::Global<v8::Object>>,
-    /// The module whose CommonJS compile last failed, with the source that
-    /// was compiled: require_callback reads it to tell a file with no
-    /// declared type that is an ES module from a broken CommonJS one.
-    compile_failed: Option<(PathBuf, String)>,
     /// Whether the --trace-require-module warning has been emitted (node
     /// emits it once per process).
     warned_require_module: bool,
@@ -586,52 +582,22 @@ fn require_callback(
             // syntax only an ES module has, loads it as one
             // (compileFunctionForCJSLoader's retry, the same test as
             // contains_module_syntax). Done in that order, a CommonJS file
-            // pays for one compile, as before.
+            // pays for one compile, as before. `load_cjs_or_detect` runs that
+            // detection inside the one compile, so the retry is not a second
+            // parse of the same source.
             v8::tc_scope!(let tc, scope);
-            clear_compile_failure(tc);
-            if let Some(exports) = load_cjs(tc, &path) {
-                rv.set(exports);
-                return;
+            match load_cjs_or_detect(tc, &path) {
+                CjsLoad::Exports(exports) => rv.set(exports),
+                CjsLoad::Esm => {
+                    if let Some(exports) = require_esm(tc, &path, &referrer) {
+                        rv.set(exports);
+                    }
+                }
+                CjsLoad::Threw => {
+                    tc.rethrow();
+                }
             }
-            if tc.has_terminated() || !failed_on_module_syntax(tc, &path) {
-                tc.rethrow();
-                return;
-            }
-            tc.reset();
-            if let Some(exports) = require_esm(tc, &path, &referrer) {
-                rv.set(exports);
-                return;
-            }
-            tc.rethrow();
         }
-    }
-}
-
-/// Forget the last CommonJS compile failure, before a load_cjs whose own
-/// failure [`failed_on_module_syntax`] will be asked about.
-pub(crate) fn clear_compile_failure(scope: &mut v8::PinScope<'_, '_>) {
-    if let Some(cache) = scope.get_slot_mut::<CjsCache>() {
-        cache.compile_failed = None;
-    }
-}
-
-/// After load_cjs of `path` failed: whether it failed because the file is an
-/// ES module node would detect -- no "type" declares what it is (no
-/// package.json "type", and not .cjs/.mjs), the CommonJS compile of this
-/// very file is what failed, and node's containsModuleSyntax says module.
-/// The failure stays caught either way; the caller resets or rethrows it.
-pub(crate) fn failed_on_module_syntax(scope: &mut v8::PinScope<'_, '_>, path: &Path) -> bool {
-    if oam_loader::node_declared_module_kind(path).is_some() {
-        return false;
-    }
-    let failed = scope
-        .get_slot_mut::<CjsCache>()
-        .and_then(|cache| cache.compile_failed.take());
-    match (failed, module_key(path)) {
-        (Some((failed_key, source)), Ok(key)) if failed_key == key => {
-            contains_module_syntax(scope, &source, &key.to_string_lossy())
-        }
-        _ => false,
     }
 }
 
@@ -1247,6 +1213,10 @@ fn load_cjs_inner<'s>(
             .modules
             .insert(key.clone(), global);
     }
+    // node's Module._load puts every module it loads into Module._cache before
+    // running it, so `require.cache` lists a required `.js`/`.cjs` -- and the
+    // entry -- by filename, unloaded, and `loaded: true` once the body returns.
+    cache_store(scope, &file, module);
     record_main(scope, &key, module);
 
     let source_v8 = match v8::String::new(scope, &source) {
@@ -1289,9 +1259,6 @@ fn load_cjs_inner<'s>(
     ) else {
         // Syntax error is pending; a broken module must not stay cached.
         evict(scope, &key);
-        if let Some(cache) = scope.get_slot_mut::<CjsCache>() {
-            cache.compile_failed = Some((key, source));
-        }
         return None;
     };
 

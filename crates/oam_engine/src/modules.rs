@@ -2623,7 +2623,6 @@ fn load_module_graph_overlapped(
             // ES module from it can tell which of this graph's modules node
             // would have in evaluation (evaluating_in_loads).
             set_executing_cjs(tc, Some(path.clone()));
-            crate::cjs::clear_compile_failure(tc);
             let loaded = crate::cjs::load_cjs_or_detect(tc, &path);
             set_executing_cjs(tc, None);
             // The body may have loaded and evaluated modules (a require() or
