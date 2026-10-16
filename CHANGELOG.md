@@ -16,6 +16,26 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A repeated permission flag adds its grant, as node's does.** Under `--permission`,
+  `--allow-fs-write=A --allow-fs-write=B` kept only the last occurrence, so writes under `A` were
+  refused; every occurrence of `--allow-fs-read`, `--allow-fs-write`, `--allow-net` and
+  `--allow-env` now grants its entries, from the command line and `NODE_OPTIONS` together.
+  `process.execArgv` lists each occurrence, so a child started under `--permission` inherits all
+  of them (#363).
+- **An `ERR_ACCESS_DENIED` message names the flag that grants the permission.** It stopped at
+  `Access to this API has been restricted`; it now reads as node's does, `Access to this API has
+  been restricted. Use --allow-fs-write to manage permissions.`, with `--allow-fs-read`,
+  `--allow-child-process`, `--allow-worker` and `--allow-addons` for their refusals, and oam's own
+  `--allow-net` and `--allow-env` (#363).
+- **A `*` in an fs grant entry is a wildcard, as in node.** `--allow-fs-read=C:\T\*` (or `dir/*`)
+  granted only a file named `*`, so every read under the directory was refused. The text before
+  the first `*` is now a prefix: `dir/*` and `dir\*` grant `dir` and everything under it, `dir*`
+  every path starting with `dir`, and `/*` or `C:\*` the whole root, for `--allow-fs-read` and
+  `--allow-fs-write` alike (#376). On POSIX a `\` in a grant entry or a path is now part of the
+  name, as node and the OS read it, rather than a separator.
+
 ## [0.19.1] - 2026-10-13
 
 ### Changed

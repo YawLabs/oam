@@ -228,8 +228,17 @@ Differences from Node's model:
 
 - **Node's grant flags are implemented**: `--allow-fs-read=`, `--allow-fs-write=`,
   `--allow-child-process`, `--allow-worker` and `--allow-addons`. `*` grants everything,
-  anything else is a comma-separated allow-list, and they round-trip through
-  `process.execArgv`. `process.execve` is gated on the ChildProcess permission, since
+  and they round-trip through `process.execArgv`. A list flag given more than once
+  grants every value, from the command line and `NODE_OPTIONS` alike, as in Node. An fs
+  entry with a `*` in it is read as Node reads it: what precedes the first `*` is a prefix,
+  so `dir/*` (and `dir\*` on Windows) grants `dir` and everything under it, `dir*` also
+  `dir-other`, and `/*` the whole root. **One difference: a value is a comma-separated
+  allow-list.** `--allow-fs-read=/a,/b` grants `/a` and `/b` in oam; Node v22 takes the
+  value as the single path `/a,/b`, so it grants neither, and when that is the flag's only
+  value it prints `Warning: The --allow-fs-read CLI flag has changed. Passing a
+  comma-separated list of paths is no longer valid.` oam keeps the list form it has always
+  documented; give each path its own flag to write a command line both runtimes read the
+  same way. `process.execve` is gated on the ChildProcess permission, since
   replacing the process image hands control to a binary this permission set does not
   describe.
 - **oam adds two grants Node does not have**: `--allow-net[=list]` and
