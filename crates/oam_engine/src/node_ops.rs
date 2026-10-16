@@ -413,6 +413,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tcpShutdown", op_tcp_shutdown),
         ("tcpListen", op_tcp_listen),
         ("tcpAccept", op_tcp_accept),
+        ("tcpAcceptTake", op_tcp_accept_take),
         ("tcpServerClose", op_tcp_server_close),
         ("tcpSetRef", op_tcp_set_ref),
         ("tcpServerSetRef", op_tcp_server_set_ref),
@@ -5663,6 +5664,21 @@ fn op_tcp_accept(
         oam_core::HandleKey::TcpServer(server_id),
         oam_core::tcp::tcp_accept(tcp, server_id, ids),
     );
+}
+
+/// `__oam.node.tcpAcceptTake(serverId, handle) -> boolean`: JS takes the
+/// connection an accept answered with, before handing it to the server, so
+/// the server's close no longer closes it with the server (#388). False if
+/// that close came first.
+fn op_tcp_accept_take(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = args.get(1).number_value(scope).unwrap_or(0.0) as u64;
+    let tcp = core_runtime!(scope).tcp();
+    rv.set_bool(oam_core::tcp::tcp_accept_take(&tcp, server_id, handle));
 }
 
 fn op_tcp_server_close(

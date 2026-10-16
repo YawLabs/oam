@@ -409,6 +409,12 @@ pub struct TcpState {
     /// The last turn out removes the entry.
     write_tail: HashMap<u64, (u64, tokio::sync::oneshot::Receiver<()>)>,
     write_seq: u64,
+    /// Per server id, the connections its accepts have answered with that
+    /// JS has not yet taken ([`tcp_accept_take`]). A close of the server
+    /// closes them with it (#388): JS, reading the answer a tick later,
+    /// would only have reset them, and a Windows pipe server's connection
+    /// held the pipe's name until then.
+    untaken: HashMap<u64, HashSet<u64>>,
 }
 
 impl TcpState {
@@ -1338,19 +1344,50 @@ enum Accepted {
     Pipe(ReadHalf, WriteHalf),
 }
 
-/// The next connection on server `server_id`, or None once the server is
-/// closed. The listener is polled where it sits in the registry
-/// ([`Listener::poll_in_place`]), so the close that removes it closes it.
+/// The next connection on server `server_id`, registered as the handle
+/// `stream_ids` gives it, as the accept's answer for JS; or None once the
+/// server is closed. The listener is polled where it sits in the registry
+/// ([`Listener::poll_in_place`]), so the close that removes it closes it,
+/// and a connection is registered as untaken under the same lock it is
+/// accepted under, so the close closes it too until JS takes it (#388):
+/// registered under a lock of its own, it was in neither place for a moment
+/// and a close then left it open.
 async fn next_connection(
     registry: &TcpRegistry,
     server_id: u64,
-) -> Option<std::io::Result<Accepted>> {
+    stream_ids: &std::sync::atomic::AtomicU64,
+) -> Option<std::io::Result<serde_json::Value>> {
     std::future::poll_fn(|cx| {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.listeners.get_mut(&server_id) {
-            Some(listener) => listener.poll_in_place(cx).map(Some),
-            None => std::task::Poll::Ready(None),
-        }
+        let Some(listener) = guard.listeners.get_mut(&server_id) else {
+            return std::task::Poll::Ready(None);
+        };
+        let accepted = match listener.poll_in_place(cx) {
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+            std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Some(Err(e))),
+            std::task::Poll::Ready(Ok(accepted)) => accepted,
+        };
+        let handle = stream_ids.fetch_add(1, Ordering::Relaxed);
+        let (reader, writer, payload) = match accepted {
+            Accepted::Tcp(stream, peer_addr) => {
+                let local_addr = stream.local_addr().ok();
+                let (reader, writer) = stream.into_split();
+                let mut payload = serde_json::json!({
+                    "handle": handle,
+                    "remoteAddr": addr_to_json(peer_addr),
+                });
+                if let Some(la) = local_addr {
+                    payload["localAddr"] = addr_to_json(la);
+                }
+                (ReadHalf::Tcp(reader), WriteHalf::Tcp(writer), payload)
+            }
+            Accepted::Pipe(reader, writer) => {
+                (reader, writer, serde_json::json!({ "handle": handle }))
+            }
+        };
+        guard.register_raw_stream(handle, reader, writer);
+        guard.untaken.entry(server_id).or_default().insert(handle);
+        std::task::Poll::Ready(Some(Ok(payload)))
     })
     .await
 }
@@ -1407,43 +1444,51 @@ pub async fn tcp_accept(
     };
 
     let next = tokio::select! {
-        next = next_connection(&registry, server_id) => next,
+        next = next_connection(&registry, server_id, &stream_ids) => next,
         _ = in_flight.notify.notified() => None,
     };
     drop(in_flight);
-    let accepted = match next {
-        None => return OpOutcome::Done,
-        Some(Err(e)) => return tcp_fail(e, "accept"),
-        Some(Ok(accepted)) => accepted,
-    };
-    let handle = stream_ids.fetch_add(1, Ordering::Relaxed);
-    match accepted {
-        Accepted::Tcp(stream, peer_addr) => {
-            let local_addr = stream.local_addr().ok();
-            let (reader, writer) = stream.into_split();
-            registry
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .register_stream(handle, reader, writer);
-
-            let mut payload = serde_json::json!({
-                "handle": handle,
-                "remoteAddr": addr_to_json(peer_addr),
-            });
-            if let Some(la) = local_addr {
-                payload["localAddr"] = addr_to_json(la);
-            }
-            OpOutcome::Json(payload.to_string())
-        }
-        Accepted::Pipe(reader, writer) => {
-            {
-                let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-                guard.readers.insert(handle, reader);
-                guard.writers.insert(handle, writer);
-            }
-            OpOutcome::Json(serde_json::json!({ "handle": handle }).to_string())
-        }
+    match next {
+        None => OpOutcome::Done,
+        Some(Err(e)) => tcp_fail(e, "accept"),
+        Some(Ok(payload)) => OpOutcome::Json(payload.to_string()),
     }
+}
+
+/// JS takes connection `handle`, the answer of an accept on server
+/// `server_id`, before it hands it to the server: from now on the server's
+/// close leaves it be. False if the close came first and closed it.
+pub fn tcp_accept_take(registry: &TcpRegistry, server_id: u64, handle: u64) -> bool {
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(untaken) = guard.untaken.get_mut(&server_id) else {
+        return false;
+    };
+    let taken = untaken.remove(&handle);
+    if untaken.is_empty() {
+        guard.untaken.remove(&server_id);
+    }
+    taken
+}
+
+/// Close a connection accepted for a server that closed before JS took
+/// it, before returning: a TCP connection with a reset, as JS's reset of
+/// it was (#338); a Windows pipe's instance at once, as libuv's `uv_close`
+/// closes every instance a pipe server holds (#388,
+/// [`crate::pipe::close_untaken`]).
+fn close_untaken(reader: ReadHalf, writer: WriteHalf) {
+    #[cfg(windows)]
+    let (reader, writer) = match (reader, writer) {
+        (ReadHalf::Pipe(reader), WriteHalf::Pipe(writer)) => {
+            crate::pipe::close_untaken(reader, writer);
+            return;
+        }
+        other => other,
+    };
+    if let Some(stream) = reader.tcp() {
+        arm_reset(stream);
+    }
+    writer.forget();
+    drop(reader);
 }
 
 /// Close a server at once, as libuv's `uv_close` closes the listening
@@ -1454,16 +1499,29 @@ pub async fn tcp_accept(
 /// connected, to nothing, or saw a reset. Remove the listener and close it
 /// -- every accept polls it where it sits, a Windows pipe server's waiting
 /// instances included ([`crate::pipe::PipeListener::close`]) -- and wake an
-/// accept in flight. A server closed leaves nothing behind (#139).
+/// accept in flight. The connections its accepts answered with that JS has
+/// not taken yet go with it ([`close_untaken`]): a Windows pipe server's
+/// held the name until JS reset it a tick later (#388). A server closed
+/// leaves nothing behind (#139).
 pub fn tcp_server_close(registry: &TcpRegistry, server_id: u64) {
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     let listener = guard.listeners.remove(&server_id);
     if let Some(notify) = guard.cancel.remove(&server_id) {
         notify.notify_one();
     }
+    let untaken: Vec<(ReadHalf, WriteHalf)> = guard
+        .untaken
+        .remove(&server_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|handle| guard.take_raw_halves(handle))
+        .collect();
     drop(guard);
     if let Some(listener) = listener {
         listener.close();
+    }
+    for (reader, writer) in untaken {
+        close_untaken(reader, writer);
     }
 }
 
@@ -1820,6 +1878,47 @@ mod tests {
             "(closed, cancel, in_flight, readers, writers)"
         );
         drop(client);
+    }
+
+    /// #388's other side: a connection JS has taken (`tcp_accept_take`)
+    /// is the server's to keep, and outlives the server's close, as an
+    /// accepted socket outlives node's; one it had not taken is closed with
+    /// the server, and taking it then answers false.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pipe_connection_taken_outlives_its_servers_close() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let path = test_pipe_path("taken");
+        let server_id = json(
+            pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await,
+        )["serverId"]
+            .as_u64()
+            .unwrap();
+        let dial = || {
+            let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
+            let connecting =
+                pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone());
+            async move {
+                let client = json(connecting.await)["handle"].as_u64().unwrap();
+                let server = json(accepting.await.unwrap())["handle"].as_u64().unwrap();
+                (client, server)
+            }
+        };
+        let (kept_client, kept) = dial().await;
+        assert!(tcp_accept_take(&registry, server_id, kept));
+        let (_, untaken) = dial().await;
+        tcp_server_close(&registry, server_id);
+        assert!(!tcp_accept_take(&registry, server_id, untaken));
+
+        assert!(matches!(
+            tcp_write(registry.clone(), kept_client, b"ping".to_vec()).await,
+            OpOutcome::Done
+        ));
+        assert!(matches!(
+            tcp_read(registry.clone(), kept, 64).await,
+            OpOutcome::Bytes(b) if b == b"ping"
+        ));
+        assert!(registry.lock().unwrap().untaken.is_empty());
     }
 
     /// #139, the duplex case the single-half tests miss: a handle closed

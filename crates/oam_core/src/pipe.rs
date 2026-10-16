@@ -90,7 +90,7 @@ pub(crate) fn refuse_nul(syscall: &str, target: &str, path: &str) -> Result<(), 
 }
 
 #[cfg(windows)]
-pub(crate) use windows::{PipeListener, PipeRead, PipeWrite, bind, connect};
+pub(crate) use windows::{PipeListener, PipeRead, PipeWrite, bind, close_untaken, connect};
 
 #[cfg(unix)]
 pub(crate) use unix::{PipeListener, bind, connect};
@@ -699,17 +699,41 @@ mod windows {
         /// completion (it marks the instance ready), after which dropping
         /// the instance closes it. The bound only keeps a starved runtime
         /// from holding the close up.
+        ///
+        /// An instance a client has connected to already, its connect done
+        /// but not yet accepted, is not disconnected: its client would read
+        /// ERROR_PIPE_NOT_CONNECTED, an EPIPE error, where node's reads the
+        /// end of the stream. It is closed as a connection never handed out
+        /// is ([`close_untaken`]), whether the reactor has seen its connect
+        /// done or the pipe itself says it has a client ([`has_client`]).
+        /// A client that connects between that answer and the disconnect
+        /// -- the width of two system calls -- reads the EPIPE.
         pub(crate) fn close(mut self) {
             let deadline = std::time::Instant::now() + CLOSE_BUDGET;
-            let in_flight: Vec<NamedPipeServer> = std::mem::take(&mut self.pending)
-                .into_iter()
-                .filter(|waiting| waiting.polled)
-                .map(|waiting| {
-                    let server = waiting.into_server();
-                    let _ = server.disconnect();
-                    server
-                })
-                .collect();
+            let mut connected = Vec::new();
+            let mut in_flight = Vec::new();
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            for mut waiting in std::mem::take(&mut self.pending) {
+                if !waiting.polled {
+                    continue;
+                }
+                let done = waiting.wait.as_mut().poll(&mut cx);
+                let server = waiting.into_server();
+                match done {
+                    std::task::Poll::Ready(Ok(())) => connected.push(server),
+                    // Its client came and went: nothing in flight on it.
+                    std::task::Poll::Ready(Err(_)) => {}
+                    // Done, but not yet seen done by the reactor.
+                    std::task::Poll::Pending if has_client(&server) => connected.push(server),
+                    std::task::Poll::Pending => {
+                        let _ = server.disconnect();
+                        in_flight.push(server);
+                    }
+                }
+            }
+            for server in connected {
+                close_connected(server, deadline);
+            }
             for server in &in_flight {
                 block_until(deadline, |cx| {
                     if server.poll_write_ready(cx).is_ready()
@@ -722,6 +746,74 @@ mod windows {
                 });
             }
         }
+    }
+
+    /// Close, before returning, a connection a pipe server accepted but
+    /// never handed out -- its server closed first (#388) -- as libuv's
+    /// `uv_close` closes every instance the server holds, connected or not.
+    ///
+    /// A connected instance has a read in flight from the moment it
+    /// connected (the reactor reads ahead), and dropping it, like dropping
+    /// one whose connect is in flight ([`PipeListener::close`]), leaves the
+    /// reactor to close it once it has taken that read's completion. So the
+    /// read is cancelled first, and the close waits, bounded, until the
+    /// reactor has taken its completion (it marks the instance readable),
+    /// after which dropping the instance closes it: the client reads the end
+    /// of the stream, as from node's closed instance. Disconnecting it
+    /// instead (as [`PipeListener::close`] does an instance with no client)
+    /// would end the read too, but the client would read ERROR_PIPE_NOT_
+    /// CONNECTED -- an EPIPE error where node's client reads 'end'.
+    pub(crate) fn close_untaken(reader: PipeRead, writer: PipeWrite) {
+        drop(writer);
+        let Ok(shared) = Arc::try_unwrap(reader.0) else {
+            return;
+        };
+        if let End::Server(server) = shared.end {
+            close_connected(server, std::time::Instant::now() + CLOSE_BUDGET);
+        }
+    }
+
+    /// Whether a client is connected to server instance `server` now,
+    /// whatever the reactor has seen: PeekNamedPipe answers on a connected
+    /// instance and fails on one that is listening, disconnected or whose
+    /// client has gone.
+    fn has_client(server: &NamedPipeServer) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: the handle is the instance's own, open for as long as
+        // `server` lives, which is past the call; every out-pointer is null
+        // and the buffer size 0, so PeekNamedPipe writes nothing.
+        let peeked = unsafe {
+            windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                server.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        peeked != 0
+    }
+
+    /// Close a connected server instance before returning, its client
+    /// reading the end of the stream ([`close_untaken`]); the waits for the
+    /// reactor are bounded by `deadline`. First until the reactor has taken
+    /// the connect's completion, which issues the read-ahead and marks the
+    /// instance writable (at once for an accepted one); then the read-ahead
+    /// is cancelled.
+    fn close_connected(server: NamedPipeServer, deadline: std::time::Instant) {
+        use std::os::windows::io::AsRawHandle;
+        block_until(deadline, |cx| server.poll_write_ready(cx).map(|_| ()));
+        // SAFETY: the handle is the instance's own, open for as long as
+        // `server` lives, which is past the call. A null OVERLAPPED cancels
+        // every I/O this process has in flight on it -- here only the
+        // reactor's read-ahead: a connection never handed out has had no
+        // write. The reactor takes a cancelled read's completion as any
+        // other (mio's own drop of an instance cancels it the same way).
+        unsafe {
+            windows_sys::Win32::System::IO::CancelIoEx(server.as_raw_handle(), std::ptr::null());
+        }
+        block_until(deadline, |cx| server.poll_read_ready(cx).map(|_| ()));
     }
 
     impl Drop for PipeListener {
