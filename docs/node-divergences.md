@@ -1307,7 +1307,8 @@ entries below were executed on both runtimes unless marked.
 Matching node v22.22.2 (no longer divergences; conformance cases 490 and 491):
 
 - **A Worker's process flags (#370).** A Worker given neither `env` (other than `SHARE_ENV` or
-  `process.env` itself) nor `execArgv` shares its creator's options; given either, it starts from
+  `process.env` itself) nor `execArgv` shares its creator's options (the creating worker's own,
+  when a worker creates it); given either, it starts from
   node's defaults, takes `NODE_PENDING_DEPRECATION` and `NODE_OPTIONS` from the environment it is
   given (its creator's, when it is given none), then its `execArgv` (its creator's
   `process.execArgv`, when it is given none). `NODE_NO_WARNINGS` is read from the worker's own
@@ -1318,8 +1319,10 @@ Matching node v22.22.2 (no longer divergences; conformance cases 490 and 491):
   printer included, goes to `worker.stderr`.
 - **A fatal run (#399 items 3 and 4).** The worker emits `'exit'` with 1 on its own `process`
   before the parent's `'error'` (nothing an `'exit'` listener queues runs; the thread exits with
-  the `exitCode` the listeners leave), the parent's `'error'` carries the error as node's error
-  serializer rebuilds it, and nothing is printed.
+  the `exitCode` the listeners leave; no `'exit'` when an `'uncaughtException'` listener threw),
+  the parent's `'error'` carries the error that ended the run (not a failed `import()` the worker
+  caught) as node's error serializer rebuilds it, a cause chain of any depth included, and nothing
+  is printed.
 
 What still differs, measured on Windows:
 
@@ -1334,6 +1337,18 @@ What still differs, measured on Windows:
   `undefined`, a `BigInt` and a non-finite number are kept. The `UnhandledPromiseRejection` error
   for a non-`Error` rejection names an object reason `#<Constructor>`, which is what V8's
   NoSideEffectsToString gives for a plain object, and its `stack` lists oam's frames, not node's.
+- **A thrown `DOMException`, and an `AggregateError`'s `errors`.** node's parent gets a
+  `DOMException` back as an `Error` with message `''` and one own key, `stack`; oam's parent gets
+  the plain object `{ name: 'AbortError' }` (an `Object`, `message` undefined), since a
+  `DOMException` is not `[object Error]` to the serializer. An `AggregateError` arrives as one in
+  both, but node's `errors` entries are rebuilt `Error`s (own keys `stack,message`) where oam's are
+  empty plain objects, the JSON form of an `Error`. Both follow from JSON standing in for the V8
+  serializer (the item above).
+- **`worker.stderr` without `stderr: true`.** node pipes the worker's stderr through
+  `worker.stderr` to `process.stderr`, so a parent listening for `'data'` on it sees the output
+  too (measured: `console.error('ce3')` in a worker, parent collects `"ce3\n"`). oam writes the
+  worker's stderr straight to the process's stderr; the text is printed but `worker.stderr` emits
+  nothing. This predates #370, which only changed `stderr: true`.
 - **A synchronous throw from a CommonJS worker entry's top level.** node runs the ticks queued
   before the throw first, then handles the throw, and calls each of the worker's
   `'uncaughtException'` listeners twice for it (measured: `tick 1 | caught #1 | caught #2`, then
