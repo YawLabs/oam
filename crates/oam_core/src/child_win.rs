@@ -1049,8 +1049,9 @@ mod env_block_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{RawChildRegistry, StdioFd, raw_kill, spawn_extra};
+    use super::{FdEnd, RawChild, RawChildRegistry, StdioFd, raw_close_fd, raw_kill, spawn_extra};
     use std::collections::HashMap;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::{
@@ -1059,6 +1060,112 @@ mod tests {
     };
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
+
+    /// A registry holding one child whose fd `fd` is a parent-WRITE pipe end,
+    /// with the child's READ end returned so a test can watch the pipe break.
+    /// `process: None` so `raw_close_fd` removes the whole entry once its fds
+    /// are gone (the shape a spawned child has after `raw_wait`).
+    fn write_end_registry(fd: u32) -> (RawChildRegistry, HANDLE) {
+        // SAFETY: `SECURITY_ATTRIBUTES` is plain-old-data; zeroed then filled.
+        let mut sa: SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
+        sa.bInheritHandle = 1;
+        let mut read_end: HANDLE = std::ptr::null_mut();
+        let mut write_end: HANDLE = std::ptr::null_mut();
+        // SAFETY: both out-params are live locals; the SECURITY_ATTRIBUTES is
+        // fully initialized above.
+        let ok = unsafe { CreatePipe(&mut read_end, &mut write_end, &sa, 0) };
+        // SAFETY: the error code of the CreatePipe call just above, same thread.
+        let pipe_err = unsafe { GetLastError() };
+        assert_ne!(ok, 0, "CreatePipe failed: {pipe_err}");
+        let mut fds = HashMap::new();
+        // SAFETY: `write_end` is a fresh pipe handle this test owns and hands
+        // to the OwnedHandle exactly once.
+        fds.insert(
+            fd,
+            FdEnd::Write(Some(unsafe {
+                OwnedHandle::from_raw_handle(write_end as _)
+            })),
+        );
+        let child = RawChild {
+            process: None,
+            pid: 0,
+            fds,
+            kill_signal: None,
+        };
+        let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
+        reg.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(1u64, child);
+        (reg, read_end)
+    }
+
+    /// `raw_close_fd` on an idle write end removes the fd entry (and, with no
+    /// process left, the whole child) and drops the handle, which breaks the
+    /// pipe: the child's read end sees ERROR_BROKEN_PIPE.
+    #[test]
+    fn raw_close_fd_of_an_idle_write_end_closes_the_pipe() {
+        let (reg, read_end) = write_end_registry(3);
+        raw_close_fd(&reg, 1, 3);
+        assert!(
+            reg.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "the entry goes with its last fd"
+        );
+        let mut avail: u32 = 0;
+        // SAFETY: `read_end` is a live pipe handle; the null args are the
+        // documented "no buffer, no bytes, no overlapped" form.
+        let ok = unsafe {
+            PeekNamedPipe(
+                read_end,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut avail,
+                std::ptr::null_mut(),
+            )
+        };
+        // SAFETY: the last call's error code; read immediately after it, on the
+        // same thread, with no intervening Win32 call to overwrite it.
+        let err = unsafe { GetLastError() };
+        // SAFETY: `read_end` is still owned by this test and closed once.
+        unsafe { CloseHandle(read_end) };
+        assert!(
+            ok == 0 && err == ERROR_BROKEN_PIPE,
+            "the write handle must be closed (pipe broken), got ok={ok} err={err}"
+        );
+    }
+
+    /// The resurrection bug: a `raw_write` in flight has TAKEN the handle out
+    /// of the slot, so the slot is `Write(None)`. The old close
+    /// (`drop(h.take())`) then dropped `None`, so it left the entry present --
+    /// and when the write finished it RE-INSERTED its handle, resurrecting a
+    /// pipe the caller had closed (`destroy()`). Modelling the in-flight state
+    /// directly (rather than racing a real write) keeps the test deterministic:
+    /// the slot is exactly what a pending write leaves, and the close must
+    /// remove the entry so the write's re-insert no-ops.
+    #[test]
+    fn raw_close_fd_during_a_write_does_not_resurrect_the_pipe() {
+        let (reg, read_end) = write_end_registry(3);
+        // Move the handle out of the slot, as `raw_write` does before it blocks
+        // in `WriteFile`; the slot is now `Write(None)`.
+        {
+            let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
+            let child = guard.get_mut(&1).expect("child");
+            let Some(FdEnd::Write(slot)) = child.fds.get_mut(&3) else {
+                panic!("fd 3 is a write end");
+            };
+            let taken = slot.take();
+            assert!(taken.is_some(), "the write handle was in the slot");
+        }
+        raw_close_fd(&reg, 1, 3);
+        assert!(
+            reg.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "a close during a write must remove the entry, not leave Write(None) \
+             for the write to re-insert"
+        );
+        // SAFETY: `read_end` is owned by this test, closed once.
+        unsafe { CloseHandle(read_end) };
+    }
 
     /// Regression for the spawn handle-inheritance race: a child must inherit
     /// ONLY the handles named in its stdio list, never an unrelated inheritable
