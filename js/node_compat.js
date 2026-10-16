@@ -34545,8 +34545,13 @@
   // name contains "/node_modules/", builtin frames skipped, and the default
   // when the stack is too deep to search. Only the forward-slash spelling
   // counts, which is why node on Windows, whose paths are written with
-  // backslashes, warns even when a package loads punycode (probed: v22.22.2
-  // on win32 warns, on linux it does not).
+  // backslashes, warns even when a package's CommonJS loads punycode
+  // (probed: v22.22.2 on win32 warns, on linux it does not). It is the
+  // script's name (StackFrame::GetScriptName), never a //# sourceURL=. And
+  // node names an ES module's frame by its file:// URL, where oam names it
+  // by its path, so such a frame is read with forward slashes: a package's
+  // ES module is skipped on win32 too, as in node.
+  let isEsModuleSource = null;
   function isInsideNodeModules(frameLimit, defaultValue) {
     let frames;
     const savedLimit = Error.stackTraceLimit;
@@ -34566,10 +34571,12 @@
       } catch { /* a frozen Error keeps what it had */ }
     }
     if (!Array.isArray(frames) || frames.length >= frameLimit) return defaultValue;
+    if (isEsModuleSource === null) isEsModuleSource = globalThis.__oam.node.isEsModuleSource;
     for (const frame of frames) {
-      const name = frame.getScriptNameOrSourceURL?.() ?? frame.getFileName?.();
+      let name = frame.getFileName?.();
       if (typeof name !== "string" || name === "") continue;
       if (name.startsWith("node:") || name.startsWith("oam:")) continue;
+      if (name.includes("\\") && isEsModuleSource(name)) name = name.replaceAll("\\", "/");
       if (name.includes("/node_modules/")) return true;
     }
     return false;
