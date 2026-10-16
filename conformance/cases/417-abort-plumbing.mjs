@@ -24,7 +24,9 @@
 //    constructors node:worker_threads exports, and a port is node's
 //    NodeEventTarget: queued until started, on() handed the data and
 //    addEventListener / onmessage a MessageEvent, delivered after the
-//    microtasks, a close that reaches the other end behind what was sent;
+//    microtasks, a close that reaches the other end behind what was sent
+//    (an unstarted end too, when nothing is queued ahead of it), and the
+//    rest of a batch kept when the last listener goes part way through;
 //    MessagePort and MessageChannel are node's function constructors, and
 //    a worker's parentPort lets the worker exit once its last 'message'
 //    listener is gone.
@@ -618,6 +620,45 @@ console.log("-- 4. MessageChannel / MessagePort");
       console.log(err.constructor.name, err.code, err.message);
     }
     await tick();
+  }
+  // A port that is not started still takes a close with nothing ahead of it
+  // (a ref'd one too: it lets go when the close lands); its last 'message'
+  // listener going part way through a batch -- a once() that ran, an off()
+  // in the listener -- keeps the rest queued for the next listener, and a
+  // close behind them waits too.
+  {
+    const { port1, port2 } = new MessageChannel();
+    port2.ref();
+    port2.on("close", () => console.log("unstarted twin close", port2.hasRef()));
+    port1.close();
+    await tick(20);
+    console.log("unstarted twin hasRef", port2.hasRef());
+    port2.unref();
+  }
+  {
+    const { port1, port2 } = new MessageChannel();
+    port2.once("message", (v) => console.log("once got", v));
+    port2.on("close", () => console.log("once close"));
+    for (const v of ["a", "b", "c"]) port1.postMessage(v);
+    port1.close();
+    await tick(20);
+    console.log("after once", port2.hasRef(), port2.listenerCount("message"));
+    port2.on("message", (v) => console.log("later got", v));
+    await tick(20);
+  }
+  {
+    const { port1, port2 } = new MessageChannel();
+    const f = (v) => {
+      console.log("off got", v);
+      port2.off("message", f);
+    };
+    port2.on("message", f);
+    for (const v of [1, 2, 3]) port1.postMessage(v);
+    await tick(20);
+    port2.on("message", (v) => console.log("re-added got", v));
+    await tick(20);
+    port1.close();
+    await tick(20);
   }
   // A listener that throws: the error is uncaught, the next listener runs.
   {
