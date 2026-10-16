@@ -239,7 +239,95 @@ fn park_entry_evaluation(
 
 #[derive(Default)]
 pub(crate) struct UncaughtLedger {
-    entries: Vec<(v8::Global<v8::Value>, String)>,
+    entries: Vec<UncaughtEntry>,
+    /// Set by the queueMicrotask wrapper ([`dispatch_microtask_throw`]) just
+    /// before its fatal throw reaches [`message_listener`].
+    next_fatal: Option<FatalThrow>,
+    /// The throw-site frame for a `next_fatal` that a listener threw.
+    next_frame: Option<String>,
+    /// The listener ended a checkpoint at a fatal throw
+    /// ([`host_checkpoint`] lifts the termination).
+    terminated: bool,
+}
+
+/// One throw V8 reported outside any TryCatch.
+pub(crate) struct UncaughtEntry {
+    value: v8::Global<v8::Value>,
+    /// `file:line: message`, the fallback report text.
+    text: String,
+    /// Already dispatched by the queueMicrotask wrapper, and fatal: the
+    /// drain reports it without running the ladder a second time.
+    fatal: Option<FatalThrow>,
+    /// The throw site's frame, for a listener's own throw: its report
+    /// names the listener's line, as node's does.
+    frame: Option<String>,
+}
+
+/// Why a microtask throw the wrapper already dispatched is fatal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FatalThrow {
+    /// Nothing consumed it.
+    NoConsumer,
+    /// An 'uncaughtException' (or monitor) listener threw; node exits 7.
+    ListenerThrew,
+}
+
+/// `natives.dispatchMicrotaskThrow(err)`, from the queueMicrotask wrapper's
+/// catch: run the uncaught ladder on a microtask's throw. Ok(true): a
+/// listener took it. Ok(false): nothing did; the wrapper rethrows `err`,
+/// noted here as an already-dispatched fatal (#398). Err(thrown): a
+/// listener threw; the caller throws that, noted the same way, with its
+/// throw-site frame kept here -- by the time V8 reports a microtask's throw
+/// it has rebuilt the Message from the error's stack, which points at
+/// `new Error` rather than the `throw` node's report shows.
+pub(crate) fn dispatch_microtask_throw(
+    scope: &mut v8::PinScope<'_, '_>,
+    err: v8::Local<'_, v8::Value>,
+) -> Result<bool, v8::Global<v8::Value>> {
+    v8::tc_scope!(let tc, scope);
+    let (fatal, frame, outcome) = match dispatch_uncaught(tc, err) {
+        Uncaught::Handled => return Ok(true),
+        Uncaught::Fatal => (FatalThrow::NoConsumer, None, Ok(false)),
+        Uncaught::HandlerThrew { value, frame, .. } => {
+            (FatalThrow::ListenerThrew, frame, Err(value))
+        }
+    };
+    if let Some(ledger) = tc.get_slot_mut::<UncaughtLedger>() {
+        ledger.next_fatal = Some(fatal);
+        ledger.next_frame = frame;
+    }
+    outcome
+}
+
+/// A microtask checkpoint the host runs with no JS on the stack. A fatal
+/// microtask throw ends it where it happens: node exits at the throw, so no
+/// later promise job of the same drain runs (#398). The message listener
+/// terminates execution for that; this lifts the termination again, so the
+/// report and the 'exit' listeners can run. The fatal entry stays on the
+/// ledger for the caller's drain ([`drain_uncaught`]).
+pub(crate) fn host_checkpoint(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) {
+    tc.perform_microtask_checkpoint();
+    lift_fatal_termination(tc);
+}
+
+/// Undo the termination [`message_listener`] requested for a fatal throw.
+fn lift_fatal_termination(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>) {
+    let terminated = tc
+        .get_slot_mut::<UncaughtLedger>()
+        .is_some_and(|ledger| std::mem::take(&mut ledger.terminated));
+    if terminated {
+        tc.cancel_terminate_execution();
+        tc.reset();
+    }
+}
+
+/// Whether the ledger holds a fatal throw the wrapper already dispatched.
+fn fatal_pending(scope: &mut v8::PinScope<'_, '_>) -> bool {
+    scope
+        .get_slot::<UncaughtLedger>()
+        .is_some_and(|ledger| ledger.entries.iter().any(|entry| entry.fatal.is_some()))
 }
 
 /// V8 message listener. Zero capture, raw C ABI.
@@ -269,10 +357,29 @@ pub(crate) unsafe extern "C" fn message_listener(
         line = src_line as usize;
     }
     let value = v8::Global::new(scope, exception);
+    let (fatal, frame) = scope
+        .get_slot_mut::<UncaughtLedger>()
+        .map(|ledger| (ledger.next_fatal.take(), ledger.next_frame.take()))
+        .unwrap_or_default();
+    // End the checkpoint at a fatal throw, when the host runs it with no JS
+    // on the stack ([`host_checkpoint`] lifts the termination): the next
+    // microtask stops at its first instruction and V8 drops the rest of the
+    // queue. With JS on the stack (a checkpoint inside a dynamic import) the
+    // termination would unwind that JS too, so the throw is only recorded
+    // there and reported at the next drain.
+    let terminate = fatal.is_some()
+        && v8::StackTrace::current_stack_trace(scope, 1).is_none_or(|t| t.get_frame_count() == 0);
     if let Some(ledger) = scope.get_slot_mut::<UncaughtLedger>() {
-        ledger
-            .entries
-            .push((value, format!("{file}:{line}: {text}")));
+        ledger.entries.push(UncaughtEntry {
+            value,
+            text: format!("{file}:{line}: {text}"),
+            fatal,
+            frame,
+        });
+        ledger.terminated |= terminate;
+    }
+    if terminate {
+        scope.terminate_execution();
     }
 }
 
@@ -642,22 +749,44 @@ pub(crate) fn handle_uncaught_throw(
 pub(crate) fn drain_uncaught(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
 ) -> Option<Vec<Diagnostic>> {
+    lift_fatal_termination(tc);
     let mut fatal = Vec::new();
     // Loop: a listener may queue microtasks/ticks (flushed below under the
     // explicit policy) whose throws land NEW ledger entries; quiesce before
     // returning. Terminates because each pass drains the ledger and only
     // fresh throws refill it.
     loop {
-        let captured: Vec<(v8::Global<v8::Value>, String)> = tc
+        let captured: Vec<UncaughtEntry> = tc
             .get_slot_mut::<UncaughtLedger>()
             .map(|ledger| std::mem::take(&mut ledger.entries))
             .unwrap_or_default();
         if captured.is_empty() {
             break;
         }
-        for (value, text) in captured {
+        for entry in captured {
+            let UncaughtEntry {
+                value,
+                text,
+                fatal: already,
+                frame,
+            } = entry;
+            // A later entry than a fatal one is not reached: node exited.
+            if !fatal.is_empty() {
+                break;
+            }
             let local = v8::Local::new(tc, &value);
-            let (local, frame, message) = match dispatch_uncaught(tc, local) {
+            let outcome = match already {
+                // The wrapper ran the ladder already; running it again would
+                // fire 'uncaughtExceptionMonitor' twice.
+                Some(FatalThrow::NoConsumer) => Uncaught::Fatal,
+                Some(FatalThrow::ListenerThrew) => Uncaught::HandlerThrew {
+                    value: value.clone(),
+                    frame,
+                    message: format!("Uncaught {text}"),
+                },
+                None => dispatch_uncaught(tc, local),
+            };
+            let (local, frame, message) = match outcome {
                 Uncaught::Handled => continue,
                 // No stored frame: for a microtask-thrown error V8 has no
                 // throw-site Message at all (probe-verified -- file
@@ -921,7 +1050,7 @@ impl JsRuntime {
             // before the tick queue is reached: `process.nextTick` there
             // runs after them, not ahead (#345). A bare checkpoint first,
             // then the tick point.
-            tc.perform_microtask_checkpoint();
+            host_checkpoint(tc);
             // A promise job in that drain that threw: fatal, it ends the run
             // before any tick, as node exits at it; handled, it is delivered
             // before the ticks.
@@ -986,7 +1115,7 @@ impl JsRuntime {
                         // promise jobs first: in node it runs inside the
                         // drain, ahead of the ticks.
                         if esm_in_node {
-                            tc.perform_microtask_checkpoint();
+                            host_checkpoint(tc);
                             if let Some(failure) = drain_uncaught(tc) {
                                 return Err(failure);
                             }
@@ -1430,12 +1559,20 @@ pub(crate) fn run_ticks_and_microtasks(
                 // listener-queued microtask flushes instead of stranding
                 // until some unrelated JS-running site checkpoints.
                 if !has_pending_ticks(tc) {
-                    tc.perform_microtask_checkpoint();
+                    host_checkpoint(tc);
+                    if fatal_pending(tc) {
+                        return drain_uncaught(tc);
+                    }
                 }
                 return None;
             }
         }
-        tc.perform_microtask_checkpoint();
+        host_checkpoint(tc);
+        // A fatal microtask throw ended the checkpoint: node exits at it, so
+        // no tick queued since runs either (#398).
+        if fatal_pending(tc) {
+            return drain_uncaught(tc);
+        }
         if !has_pending_ticks(tc) || entry_rejected(tc) {
             return None;
         }

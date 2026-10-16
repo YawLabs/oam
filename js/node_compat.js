@@ -16484,17 +16484,6 @@
     // (via the __oamDispatchUncaught global).
     const dispatchUncaught = (err, origin) => {
       origin = origin || "uncaughtException";
-      // A throw that already escaped a handler INSIDE this ladder (marked
-      // below) must not re-enter it: Node treats a throwing
-      // uncaughtException/monitor handler as immediately fatal, exit 7 --
-      // never re-emitting the monitor or re-invoking listeners.
-      if (
-        err !== null && (typeof err === "object" || typeof err === "function") &&
-        err.__oamHandlerThrow
-      ) {
-        process.__oamFatalCode = 7;
-        return false;
-      }
       // Node's TriggerUncaughtException refuses to run when
       // process._fatalException was monkeypatched to a non-function:
       // exit code 6 (kInvalidFatalExceptionMonkeyPatching). oam's ladder
@@ -16505,6 +16494,13 @@
         process.__oamFatalCode = 6;
         return false;
       }
+      // A listener in the ladder that throws is fatal, exit 7
+      // (kExceptionInFatalExceptionHandler), and the report names ITS throw:
+      // so try/finally and no catch -- V8 rethrows from a finally keeping the
+      // original Message, where a catch-and-rethrow would point the report at
+      // this file (#399 item 5). `settled` is set on every way out that
+      // returns.
+      let settled = false;
       try {
         // Monitor first, ALWAYS -- including for domain-handled errors
         // (probe-verified: node emits uncaughtExceptionMonitor before the
@@ -16525,6 +16521,7 @@
             if (typeof registry._domainUncaughtClear === "function") {
               registry._domainUncaughtClear();
             }
+            settled = true;
             return true;
           } catch (e2) {
             if (e2 !== err) throw e2; // domain 'error' listener threw: fatal
@@ -16543,26 +16540,18 @@
         }
         if (process._uncaughtCaptureCb) {
           process._uncaughtCaptureCb(err);
+          settled = true;
           return true;
         }
         if (process.listenerCount("uncaughtException") > 0) {
           process.emit("uncaughtException", err, origin);
+          settled = true;
           return true;
         }
+        settled = true;
         return false;
-      } catch (e2) {
-        // A handler inside the ladder threw. Mark the escaping error so a
-        // ledger re-dispatch recognizes it as handler-throw (fatal 7)
-        // instead of re-running the ladder. Primitive throws can't carry
-        // the mark -- they take the legacy re-dispatch path.
-        if (e2 !== null && (typeof e2 === "object" || typeof e2 === "function")) {
-          try {
-            Object.defineProperty(e2, "__oamHandlerThrow", {
-              value: true, writable: false, configurable: false, enumerable: false,
-            });
-          } catch { /* frozen -- best effort */ }
-        }
-        throw e2;
+      } finally {
+        if (!settled) process.__oamFatalCode = 7;
       }
     };
     Object.defineProperty(globalThis, "__oamDispatchUncaught", {
@@ -46007,12 +45996,16 @@
                 // Node delivers a microtask throw to uncaughtException
                 // BETWEEN sibling microtasks, not after the checkpoint --
                 // the same canonical ladder as the nextTick drain (monitor +
-                // origin arg included). No consumer = rethrow into the
-                // engine ledger (fatal path unchanged).
-                const dispatch = globalThis.__oamDispatchUncaught;
-                if (typeof dispatch === "function" && dispatch(e, "uncaughtException")) {
-                  return;
-                }
+                // origin arg included).
+                //
+                // No consumer, or a listener that threw: fatal, and node
+                // exits right there -- no later promise job of the same
+                // drain runs (#398). The engine runs the ladder, notes the
+                // throw that comes next as an already-dispatched fatal, and
+                // ends the checkpoint at it. A listener's own throw it
+                // throws from here itself, having kept its throw site for
+                // the report, as node's names the listener's line.
+                if (natives.dispatchMicrotaskThrow(e)) return;
                 throw e;
               }
             });
