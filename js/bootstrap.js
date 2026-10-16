@@ -1144,6 +1144,41 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   }
 
   // -------------------------------------------------------------------- Blob
+  // node's Blob and File [util.inspect.custom] (lib/internal/blob.js,
+  // lib/internal/file.js): `Blob { size: 1, type: '' }`, the fields one level
+  // deeper and the label fixed whatever the subclass. Below depth 0 node's
+  // hook hands the value back and util.inspect collapses it by its
+  // constructor and tag -- `[Blob]`, `[MyBlob [Blob]]` -- because node's
+  // Blob carries enumerable symbol-keyed fields. Ours has none to show, so
+  // the hook spells that collapse itself rather than render `Blob {}`.
+  function inspectBlobLike(self, label, fields, depth, options, inspect) {
+    if (depth < 0) {
+      let ctor;
+      let tag;
+      try {
+        ctor = Object.getPrototypeOf(self)?.constructor?.name;
+        tag = self[Symbol.toStringTag];
+      } catch {
+        // A throwing getter on a subclass: fall back to the label.
+      }
+      if (typeof ctor !== "string" || ctor === "") ctor = label;
+      // node's getPrefix: the tag rides along unless the constructor name
+      // already contains it as a whole word (`MyBlob` does, `Xlob` not).
+      let name = ctor;
+      if (typeof tag === "string" && tag !== "") {
+        const at = ctor.indexOf(tag);
+        const end = at + tag.length;
+        if (at === -1 || (end !== ctor.length && ctor[end] === ctor[end].toLowerCase())) {
+          name += ` [${tag}]`;
+        }
+      }
+      return options.stylize(`[${name}]`, "special");
+    }
+    inspect ??= globalThis.__oamNode?.get?.("util")?.inspect;
+    if (typeof inspect !== "function") return label;
+    const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
+    return `${label} ${inspect(fields, opts)}`;
+  }
   // WHATWG Blob: an immutable byte sequence with a type string. Backed by
   // a flat Uint8Array, zero-copy subarray for slice(). text/arrayBuffer/stream
   // return the expected types. size and type are read-only.
@@ -1262,6 +1297,9 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       // toStringTag already makes String() "[object Blob]", and an own
       // toString made util.format's %s String() a Blob that node inspects
       // (hasBuiltInToString, #401).
+      [Symbol.for("nodejs.util.inspect.custom")](depth, options, inspect) {
+        return inspectBlobLike(this, "Blob", { size: this.size, type: this.type }, depth, options, inspect);
+      }
     }
     brand(Blob, "Blob");
     globalThis.Blob = Blob;
@@ -1272,13 +1310,22 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     class File extends globalThis.Blob {
       constructor(parts, name, options) {
         super(parts, options);
-        this._name = String(name);
-        this._lastModified = (options && typeof options.lastModified === "number")
+        this.#name = String(name);
+        this.#lastModified = (options && typeof options.lastModified === "number")
           ? options.lastModified : Date.now();
       }
-      get name() { return this._name; }
-      get lastModified() { return this._lastModified; }
-      toString() { return "[object File]"; }
+      // Private, as node's are: an own `_name` showed up in Object.keys and
+      // in util.inspect.
+      #name;
+      #lastModified;
+      get name() { return this.#name; }
+      get lastModified() { return this.#lastModified; }
+      // No toString of its own, as for Blob: an own one made util.format's %s
+      // print "[object File]" where node inspects the File (#401).
+      [Symbol.for("nodejs.util.inspect.custom")](depth, options, inspect) {
+        const fields = { size: this.size, type: this.type, name: this.#name, lastModified: this.#lastModified };
+        return inspectBlobLike(this, "File", fields, depth, options, inspect);
+      }
     }
     brand(File, "File");
     globalThis.File = File;

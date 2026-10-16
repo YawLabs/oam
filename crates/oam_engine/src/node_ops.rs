@@ -3035,6 +3035,11 @@ fn op_v8_is(
         "argumentsObject" => value.is_arguments_object(),
         "weakMap" => value.is_weak_map(),
         "weakSet" => value.is_weak_set(),
+        "numberObject" => value.is_number_object(),
+        "stringObject" => value.is_string_object(),
+        "booleanObject" => value.is_boolean_object(),
+        "bigIntObject" => value.is_big_int_object(),
+        "symbolObject" => value.is_symbol_object(),
         _ => false,
     };
     rv.set_bool(answer);

@@ -200,7 +200,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `Event`. `MessageChannel` and `MessagePort` are globals, and a port is node's
   `NodeEventTarget`, delivering messages as node's does. `worker_threads.receiveMessageOnPort`
   works. A worker exits once its `parentPort` has no `'message'` listener left. `structuredClone`
-  of a function or a symbol throws `DataCloneError`.
+  of a function or a symbol throws `DataCloneError`. `util.inspect` (and so `%s`) prints a boxed
+  BigInt or Symbol as node does (`[BigInt: 1n]`, `[Symbol: Symbol(q)]`, recognised by internal
+  slot like the other boxes, so `[Number (null prototype): 5]`), a `Blob` or `File` as
+  `Blob { size: 1, type: '' }`, and an error whose `stack` is not a string with node's
+  one-entry-per-line layout. `util.types.isBigIntObject` exists, and `isBoxedPrimitive` counts
+  BigInt and Symbol boxes.
 - **A `SystemError` code is an instance of its own `NodeError` class, as node's is (#288).**
   node raises `fs.cp`'s `ERR_FS_CP_*` and `ERR_FS_EISDIR`, and `os.getPriority`'s
   `ERR_SYSTEM_ERROR`, as a per-code `class NodeError extends SystemError`. oam built every one

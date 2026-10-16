@@ -5906,6 +5906,16 @@
     // character; built via fromCharCode so the table reads unambiguously.
     const INSPECT_BS = String.fromCharCode(92);
     const INSPECT_CUSTOM_SYMBOL = Symbol.for("nodejs.util.inspect.custom");
+    // The primitive wrappers: each with the V8 kind that recognises its box by
+    // internal slot (node's isNumberObject and friends) and the valueOf that
+    // unwraps it.
+    const BOXED_KINDS = [
+      ["Number", "numberObject", Number.prototype.valueOf],
+      ["String", "stringObject", String.prototype.valueOf],
+      ["Boolean", "booleanObject", Boolean.prototype.valueOf],
+      ["BigInt", "bigIntObject", BigInt.prototype.valueOf],
+      ["Symbol", "symbolObject", Symbol.prototype.valueOf],
+    ];
     const strEscapeMeta = (() => {
       const hex = (i) => `${INSPECT_BS}x${i.toString(16).toUpperCase().padStart(2, "0")}`;
       const m = [];
@@ -6250,7 +6260,7 @@
         }
         return keys;
       }
-      function formatString(s) {
+      function formatString(s, fn = stylize) {
         let trailer = "";
         if (s.length > maxStringLength) {
           const remaining = s.length - maxStringLength;
@@ -6263,11 +6273,11 @@
           return (
             s
               .split(/(?<=\n)/)
-              .map((line) => stylize(strEscape(line), "string"))
+              .map((line) => fn(strEscape(line), "string"))
               .join(` +\n${" ".repeat(ictx.indentationLvl + 2)}`) + trailer
           );
         }
-        return stylize(strEscape(s), "string") + trailer;
+        return fn(strEscape(s), "string") + trailer;
       }
       function isBelowBreakLength(output, start, base) {
         // Port of Node isBelowBreakLength (entry count approximates the ", "
@@ -6735,7 +6745,13 @@
                 ictx.indentationLvl += 4;
                 let shown;
                 try {
-                  shown = walk(stack, level);
+                  // node's getStackString calls formatValue(ctx, err.stack)
+                  // with no recurseTimes: undefined there, NaN once a level
+                  // deeper. Every depth comparison is then false, so the
+                  // stack is walked with no depth limit and every non-empty
+                  // object or array in it breaks one entry per line -- and
+                  // NaN here is that same arithmetic.
+                  shown = walk(stack, NaN);
                 } finally {
                   ictx.indentationLvl -= 4;
                   seen.pop();
@@ -7022,36 +7038,45 @@
           return reduce([stylize("<items unknown>", "special")], refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
         }
         {
-          // Boxed primitives render as `[Boolean: false]`, not `Boolean {}`.
-          const boxType =
-            v instanceof Number
-              ? "Number"
-              : v instanceof String
-                ? "String"
-                : v instanceof Boolean
-                  ? "Boolean"
-                  : null;
+          // Node getBoxedBase: a boxed primitive renders as `[Boolean: false]`,
+          // `[BigInt: 1n]` or `[Symbol: Symbol(q)]`, not `Boolean {}`. The box
+          // is recognised by its internal slot, as node's isNumberObject and
+          // friends do, so a box whose prototype was swapped or nulled still
+          // renders as one (`[BigInt (null prototype): 5n]`).
+          let boxType = null;
+          let prim;
+          for (const [type, kind, valueOf] of BOXED_KINDS) {
+            if (natives.v8Is(v, kind)) {
+              boxType = type;
+              prim = valueOf.call(v);
+              break;
+            }
+          }
           if (boxType !== null) {
-            const prim = boxType === "Number" ? Number.prototype.valueOf.call(v)
-              : boxType === "String" ? String.prototype.valueOf.call(v)
-                : Boolean.prototype.valueOf.call(v);
             const ctor = safeCtorName(v);
             let base = `[${boxType}`;
             if (boxType !== ctor) base += ctor === undefined ? " (null prototype)" : ` (${ctor})`;
-            // Node formatPrimitive for the boxed base. Only the separator-ON
-            // branch routes through inspectNumberStr: with the separator off Node
-            // prints `[Number: -0]` where this String(prim) prints `[Number: 0]`,
-            // a PRE-EXISTING -0 divergence left alone on purpose, because closing
-            // it here would change default-path output.
+            // Node formats the primitive with stylizeNoColor and colours the
+            // whole base instead, and only when no keys follow it. Node's
+            // formatNumber prints -0 as `-0`, but `0` under numericSeparator,
+            // which is what inspectNumberStr does too.
             const primStr =
-              typeof prim === "number" && numericSeparator ? inspectNumberStr(prim, true) : String(prim);
-            base += `: ${typeof prim === "string" ? formatString(prim) : stylize(primStr, boxType.toLowerCase())}]`;
+              boxType === "Number"
+                ? inspectNumberStr(prim, numericSeparator)
+                : boxType === "String"
+                  ? formatString(prim, (str) => str)
+                  : boxType === "BigInt"
+                    ? inspectBigIntStr(prim, numericSeparator)
+                    : boxType === "Symbol"
+                      ? prim.toString()
+                      : String(prim);
+            base += `: ${primStr}]`;
             const tg = tagOf(v);
             if (tg !== "" && tg !== ctor) base += ` [${tg}]`;
             let bkeys = getKeys(v, showHidden);
             // Drop the 0..n-1 index entries a boxed String exposes.
             if (boxType === "String") bkeys = bkeys.slice(prim.length);
-            if (bkeys.length === 0) return base;
+            if (bkeys.length === 0) return stylize(base, boxType.toLowerCase());
             if (depth !== null && level > depth) return collapsed(v);
             return entriesTail(v, bkeys, base, level);
           }
@@ -8782,14 +8807,22 @@
         isModuleNamespaceObject: (v) => natives.v8Is(v, "moduleNamespaceObject"),
         isExternal: () => false,
         isArgumentsObject: (v) => Object.prototype.toString.call(v) === "[object Arguments]",
-        isBooleanObject: (v) => v instanceof Boolean,
-        isNumberObject: (v) => v instanceof Number,
-        isStringObject: (v) => v instanceof String,
-        isSymbolObject: (v) => Object.prototype.toString.call(v) === "[object Symbol]" && typeof v === "object",
+        // Internal-slot checks, as node's are: a box with its prototype
+        // swapped still answers yes, and an object that only inherits from
+        // Number.prototype (or forges Symbol's toStringTag) answers no.
+        isBooleanObject: (v) => natives.v8Is(v, "booleanObject"),
+        isNumberObject: (v) => natives.v8Is(v, "numberObject"),
+        isStringObject: (v) => natives.v8Is(v, "stringObject"),
+        isSymbolObject: (v) => natives.v8Is(v, "symbolObject"),
+        isBigIntObject: (v) => natives.v8Is(v, "bigIntObject"),
         isCryptoKey: (v) => typeof CryptoKey !== "undefined" && v instanceof CryptoKey,
         isKeyObject: () => false,
         isBoxedPrimitive: (v) =>
-          v instanceof Number || v instanceof String || v instanceof Boolean,
+          natives.v8Is(v, "numberObject") ||
+          natives.v8Is(v, "stringObject") ||
+          natives.v8Is(v, "booleanObject") ||
+          natives.v8Is(v, "bigIntObject") ||
+          natives.v8Is(v, "symbolObject"),
       },
     };
   };
