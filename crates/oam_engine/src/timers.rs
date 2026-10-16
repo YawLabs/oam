@@ -61,11 +61,10 @@ enum PendingGate {
 pub(crate) enum Due {
     /// A `timerPending` callback (libuv's pending phase).
     Pending,
-    Timer,
+    /// A timer due at `deadline`.
+    Timer { deadline: Instant },
     /// An immediate queued at `queued` (for `popped`: its phase's start).
-    Immediate {
-        queued: Instant,
-    },
+    Immediate { queued: Instant },
 }
 
 /// The timer or immediate whose callback is running, with the ticks and
@@ -303,7 +302,7 @@ impl TimerQueue {
             (Some(timer), Some(immediate)) if immediate < timer => Some(Due::Immediate {
                 queued: immediate.0,
             }),
-            (Some(_), _) => Some(Due::Timer),
+            (Some((deadline, _)), _) => Some(Due::Timer { deadline }),
             (None, Some((queued, _))) => Some(Due::Immediate { queued }),
             (None, None) => None,
         }
@@ -315,7 +314,7 @@ impl TimerQueue {
     /// pending callback.
     pub(crate) fn popped(&self) -> Option<Due> {
         match self.running? {
-            Running::Timer { .. } => Some(Due::Timer),
+            Running::Timer { deadline, .. } => Some(Due::Timer { deadline }),
             Running::Immediate { now } => Some(Due::Immediate { queued: now }),
         }
     }

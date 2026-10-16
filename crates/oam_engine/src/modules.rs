@@ -1825,7 +1825,9 @@ fn emit_before_exit(
 enum LastRan {
     /// Nothing yet: the entry (or whatever ran before the loop).
     Entry,
-    Timer,
+    /// A timer, with the instant its timers phase began: the timers due by
+    /// then run in that phase.
+    Timer(std::time::Instant),
     /// An immediate, with the instant its check phase began.
     Immediate(std::time::Instant),
     /// An I/O callback, a V8 foreground task, or a pending callback.
@@ -1939,9 +1941,13 @@ pub(crate) fn pump_event_loop(
         };
         // Ticks left queued by a handled throw run at node's next tick
         // point, which falls before this turn's callback when that callback
-        // opens a phase node reaches only after its check phase: an
-        // immediate of a new check phase, or a timer after an I/O callback
-        // (the poll phase is followed by the check phase).
+        // opens a phase node reaches only after its check phase (an
+        // immediate of a new check phase, or a timer after an I/O callback:
+        // the poll phase is followed by the check phase), or when it opens
+        // a new timers phase (node runs the queue as a timers phase ends).
+        // A timer due in the phase of the timer before it runs first: after
+        // a throw node's timers phase goes on to its next due timer (#399
+        // item 8).
         if !only_unref_timers_left && has_pending_ticks(tc) {
             let next = tc
                 .get_slot_mut::<crate::timers::TimerQueue>()
@@ -1950,7 +1956,11 @@ pub(crate) fn pump_event_loop(
                 Some(crate::timers::Due::Immediate { queued }) => {
                     !matches!(last_ran, LastRan::Immediate(began) if queued <= began)
                 }
-                Some(crate::timers::Due::Timer) => last_ran == LastRan::Other,
+                Some(crate::timers::Due::Timer { deadline }) => match last_ran {
+                    LastRan::Other => true,
+                    LastRan::Timer(began) => deadline > began,
+                    LastRan::Entry | LastRan::Immediate(_) => false,
+                },
                 _ => false,
             };
             if check_phase_first {
@@ -1968,7 +1978,10 @@ pub(crate) fn pump_event_loop(
                 .get_slot::<crate::timers::TimerQueue>()
                 .and_then(|queue| queue.popped())
             {
-                Some(crate::timers::Due::Timer) => LastRan::Timer,
+                Some(crate::timers::Due::Timer { deadline }) => match last_ran {
+                    LastRan::Timer(began) if deadline <= began => LastRan::Timer(began),
+                    _ => LastRan::Timer(now),
+                },
                 Some(crate::timers::Due::Immediate { queued }) => LastRan::Immediate(queued),
                 _ => LastRan::Other,
             };
@@ -2007,6 +2020,25 @@ pub(crate) fn pump_event_loop(
         // no other callback of this turn runs first (#345).
         if entry_promise.is_some_and(|promise| promise.state() == v8::PromiseState::Rejected) {
             break;
+        }
+
+        // A timer of the timers phase that just ran is still due: node
+        // finishes that phase before its poll phase, so the V8 tasks and
+        // the op completion below wait for the next turn -- their tick
+        // drains would otherwise run a batch a handled throw left queued
+        // ahead of that timer (#399 item 8). The phase is bounded: only
+        // timers due when it began belong to it.
+        if let LastRan::Timer(began) = last_ran
+            && progressed
+            && tc
+                .get_slot_mut::<crate::timers::TimerQueue>()
+                .and_then(|queue| queue.peek_due(now))
+                .is_some_and(|next| {
+                    matches!(next, crate::timers::Due::Timer { deadline } if deadline <= began)
+                })
+        {
+            before_exit_emitted = false;
+            continue;
         }
 
         // V8's foreground tasks (platform.rs) -- node runs them from its
