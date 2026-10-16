@@ -795,11 +795,33 @@ node:internal/modules/run_main:123
 oam prints the value alone (`42`, and `'a string'` for the string, as `util.inspect`
 renders it), exit 1 as in node. Node's frame is the line of its own loader that rethrows
 the module's rejection; oam has no such source to point at, and a primitive carries no
-stack to place the throw by, so there is nothing true to print in its place. The hint
-names a flag oam does not have, as in #51; from a CommonJS entry oam prints node's frame
-(the user's `throw` line) and the value, and only the hint is missing (conformance case
-473, which takes the hint line out of both sides). Measured 2026-10-16 on Windows (#399
+stack to place the throw by, so there is nothing true to print in its place. A primitive
+thrown from a `queueMicrotask` callback is the same kind of case: node's frame there is
+`<anonymous_script>:0` and an empty line, which name no source either, and oam prints the
+value alone.
+
+The hint names a flag oam does not have, as in #51. Everywhere oam has the throw's source
+frame -- a CommonJS entry, a timer, a tick, an `'uncaughtException'` listener -- the report
+of a value that is not a native Error is node's line for line apart from that hint: an
+empty line first, the value right under the caret, a primitive as `String()` gives it (a
+Symbol as an empty line), an object inspected (conformance case 473, which keeps the empty
+lines and takes the hint line out of both sides). Measured 2026-10-16 on Windows (#399
 item 6); `--trace-uncaught` is #364's kind of flag work.
+
+### 55. An unhandled rejection: oam's own report, and no `'uncaughtException'` for it
+
+node v22.22.2 (the default `--unhandled-rejections=throw`) turns a rejection nothing
+handles into an uncaught exception: an `'uncaughtException'` listener receives the reason
+with origin `'unhandledRejection'` and the process goes on, and with no listener the report
+is node's fatal one, the source frame of the rejecting call and the error, exit 1. oam
+prints `error[OAM-RT0004]: unhandled promise rejection: <reason>` and exits 1, and an
+`'uncaughtException'` listener is not offered the rejection. Measured 2026-10-16 on
+Windows: `process.on("uncaughtException", (e, o) => console.log(o));
+Promise.reject(new Error("x"))` prints `unhandledRejection` and exits 0 under node, and the
+RT0004 line with exit 1 under oam. The same holds for a promise an `'exit'` listener rejects
+and leaves unhandled, which oam began reporting in #399 (it was silent, exit 0): the exit
+code is node's, the report and the listener routing are not (conformance case 472 compares
+the status only). Not yet fixed; it needs its own change to the rejection path.
 
 ---
 
@@ -4088,6 +4110,17 @@ jobs, and its `process.nextTick` callbacks run ahead of ticks the importer queue
 call. From CommonJS they also run before the importer's continuation: `micro | tick | after
 import` where node prints `micro | after import | tick`. Only an ES module that awaits
 `import()` as its first step lines up with node. Tracked in #397.
+
+The same evaluation inside the import keeps a fatal `queueMicrotask` throw from ending the
+run where node does (#398). A microtask the imported module queues runs in a checkpoint
+taken while the importer's frame is on the stack, and oam cannot stop that checkpoint at the
+throw without unwinding the importer's JavaScript too; so the throw is recorded and reported
+at the next drain, after the rest of that checkpoint and the importer's continuation have
+run. `queueMicrotask(() => { throw new Error("qm"); });
+Promise.resolve().then(() => console.log("p-after"))` in a module loaded by `await
+import()` or `import().then()` prints only the report under node, and `p-after`, the
+importer's next line, then the report under oam (measured 2026-10-16 on Windows; exit 1
+under both). A module the entry imports statically is not affected (conformance case 471).
 
 An ES module's own top level orders ticks after its promise jobs, as node's does (#345,
 conformance case 411). A `.js` or `.ts` file with no package.json "type" runs as an ES module

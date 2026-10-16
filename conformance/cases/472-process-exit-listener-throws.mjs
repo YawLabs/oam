@@ -92,7 +92,9 @@ try {
   }
   // A promise an 'exit' listener rejects and leaves unhandled is fatal too.
   // Only the status and stdout: oam reports an unhandled rejection in its
-  // own `error[OAM-RT0004]` format, not as node's fatal report.
+  // own `error[OAM-RT0004]` format, not as node's fatal report, and does
+  // not offer it to an 'uncaughtException' listener
+  // (docs/node-divergences.md #55).
   fs.writeFileSync(path.join(dir, "rejection-in-exit.cjs"), `
 process.on("exit", () => Promise.reject(new Error("rejected in exit")));
 `);
