@@ -31,7 +31,7 @@ the daemon-cache timings in act 3).
 
 ## The four acts (human edition)
 
-1. **The typed loop** — `oam run main.ts`: executes immediately (wrong
+1. **The typed loop** — `oam run --check=warn main.ts`: executes immediately (wrong
    answer and all), then the concurrent type check lands `OAM-TS2322` with
    file:line as a trailer. Execution never waited for the checker.
 2. **The CI gate** — `oam run --check=block`: same bug, never executes.

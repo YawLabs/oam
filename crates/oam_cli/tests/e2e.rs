@@ -14547,7 +14547,7 @@ fn run_warn_reports_type_errors_without_blocking() {
         "typed_loop.ts",
         "const n: number = 'oops';\nconsole.log('ran anyway');",
     );
-    let out = oam(&["run", main.to_str().unwrap(), "--json"]);
+    let out = oam(&["run", main.to_str().unwrap(), "--check", "warn", "--json"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     if stderr.contains("OAM-TS0000") {
         eprintln!("skipping: tsgo not installed");
@@ -14606,10 +14606,30 @@ fn run_no_check_stays_silent() {
     );
 }
 
+/// `oam run` does not type-check unless asked, as node runs TypeScript:
+/// warn mode's report comes after the program ends, so its exit waited on
+/// the checker -- seconds for a file with no tsconfig, which starts a fresh
+/// tsgo each run. A type-broken file runs with nothing from the checker.
+#[test]
+fn run_typescript_is_unchecked_by_default() {
+    let main = write_temp(
+        "typed_default.ts",
+        "const n: number = 'oops';\nconsole.log('ran');",
+    );
+    let out = oam(&["run", main.to_str().unwrap(), "--json"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "",
+        "no checker output by default"
+    );
+}
+
 #[test]
 fn run_clean_typescript_adds_no_noise() {
     let main = write_temp("typed_clean.ts", "const n: number = 42;\nconsole.log(n);");
-    let out = oam(&["run", main.to_str().unwrap()]);
+    let out = oam(&["run", main.to_str().unwrap(), "--check", "warn"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     if stderr.contains("OAM-TS0000") || stderr.contains("type check skipped") {
         eprintln!("skipping: tsgo not installed");
@@ -16616,7 +16636,7 @@ fn a_killed_oam_run_does_not_leave_its_type_check_holding_stdout() {
     let _release = ReleaseOnDrop(stop.clone());
     let tsgo = stand_in_tsgo("killed_run_check");
 
-    let mut child = oam_command(&["run", script.to_str().unwrap()])
+    let mut child = oam_command(&["run", "--check=warn", script.to_str().unwrap()])
         .env("OAM_TSGO", &tsgo)
         .env("OAM_FAKE_TSGO_MARK", &mark)
         .env("OAM_FAKE_TSGO_STOP", &stop)
@@ -16687,7 +16707,7 @@ fn a_spawn_with_extra_stdio_works_once_the_type_check_has_started() {
     let tsgo = stand_in_tsgo("spawn_after_check");
 
     let out = bounded_output(
-        oam_command(&["run", script.to_str().unwrap()])
+        oam_command(&["run", "--check=warn", script.to_str().unwrap()])
             .env("OAM_TSGO", &tsgo)
             .env("OAM_FAKE_TSGO_MARK", &mark)
             .env("OAM_FAKE_TSGO_STOP", &stop)
