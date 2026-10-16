@@ -171,17 +171,25 @@ impl super::JsRuntime {
     /// workerOnGlobalUncaughtException does (lib/internal/main/worker_thread.js,
     /// #399): unless the process is already exiting, set process.exitCode to
     /// 1 and emit 'exit' with it -- a throw from a listener is ignored, and
-    /// nothing a listener queues runs -- then serialize what the run threw,
-    /// for the parent's 'error' event. `None` when the failure threw no value
-    /// (or the serializer could not run).
-    pub(crate) fn worker_fatal_exit(&mut self) -> Option<serde_json::Value> {
+    /// nothing a listener queues runs; when an 'uncaughtException' listener
+    /// threw (the fatal sub-code 7 dispatch_uncaught stamps), 'exit' is not
+    /// emitted at all, as node's `handlerThrew` skips it -- then serialize
+    /// what the run threw, for the parent's 'error' event. The serialized
+    /// form is JSON text, parsed only by the parent's JS (serde_json's
+    /// nesting limit would refuse a deep cause chain). `None` when the
+    /// failure threw no value (or the serializer could not run).
+    pub(crate) fn worker_fatal_exit(&mut self) -> Option<String> {
         let _ = self.execute_script_draining(
             "<worker-fatal-exit>",
             "(function () { \
                var p = globalThis.__oamProcessRef || globalThis.process; \
+               var g = globalThis.process; \
+               var handlerThrew = (g && g.__oamFatalCode === 7) || (p && p.__oamFatalCode === 7); \
                if (p && !p._exiting) { \
-                 try { p._exiting = true; p.exitCode = 1; p.emit('exit', p.exitCode); } \
-                 catch (_) {} \
+                 try { \
+                   p._exiting = true; p.exitCode = 1; \
+                   if (!handlerThrew) p.emit('exit', p.exitCode); \
+                 } catch (_) {} \
                } \
              })();",
             crate::AfterScript::Nothing,
@@ -200,8 +208,7 @@ impl super::JsRuntime {
         let thrown = v8::Local::new(tc, &thrown);
         let from_promise: v8::Local<v8::Value> = v8::Boolean::new(tc, from_promise).into();
         let json = serialize.call(tc, recv, &[thrown, from_promise])?;
-        let json = json.to_rust_string_lossy(tc);
-        serde_json::from_str(&json).ok()
+        json.is_string().then(|| json.to_rust_string_lossy(tc))
     }
 }
 

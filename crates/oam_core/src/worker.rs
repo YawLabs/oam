@@ -17,8 +17,10 @@ pub enum WorkerEvent {
     Error(WorkerError),
     /// What a worker's run threw when it failed fatally, as the worker's JS
     /// serialized it (node's error serializer, lib/internal/error_serdes.js):
-    /// the parent rebuilds it for its 'error' event (#399).
-    Thrown(serde_json::Value),
+    /// the parent rebuilds it for its 'error' event (#399). JSON text, kept
+    /// as text: only the parent's JS parses it, so a cause chain of any depth
+    /// arrives whole.
+    Thrown(String),
     Exit(i32),
     /// Worker stdout/stderr, when the parent asked for it with
     /// `new Worker(..., { stdout: true })`. Without this the worker writes
@@ -155,9 +157,11 @@ pub async fn parent_recv(registry: WorkerRegistry, worker_id: u64) -> OpOutcome 
             match event {
                 WorkerEvent::Message(data) => OpOutcome::Bytes(data),
                 WorkerEvent::Error(error) => OpOutcome::Json(error.to_json()),
-                WorkerEvent::Thrown(serialized) => OpOutcome::Json(
-                    serde_json::json!({ "type": "error", "serialized": serialized }).to_string(),
-                ),
+                // Spliced, not re-encoded: the worker's serializer already
+                // produced JSON text.
+                WorkerEvent::Thrown(serialized) => {
+                    OpOutcome::Json(format!(r#"{{"type":"error","serialized":{serialized}}}"#))
+                }
                 WorkerEvent::Exit(code) => {
                     OpOutcome::Json(serde_json::json!({"type": "exit", "code": code}).to_string())
                 }

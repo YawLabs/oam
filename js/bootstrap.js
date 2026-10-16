@@ -4520,6 +4520,9 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     if (object === null) return all;
     Object.assign(all, allProperties(Object.getPrototypeOf(object), target));
     for (const key of Object.getOwnPropertyNames(object)) {
+      // oam's own mark on an error an 'uncaughtException' listener threw
+      // (dispatchUncaught in node_compat.js) is not the program's.
+      if (key === "__oamHandlerThrow") continue;
       let descriptor;
       try {
         descriptor = Object.getOwnPropertyDescriptor(object, key);

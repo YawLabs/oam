@@ -3204,9 +3204,19 @@ fn dyn_import_load(
     resolved: PathBuf,
     spec: &str,
 ) -> DynResult {
+    // A graph that fails to load here only rejects the import() promise, so
+    // the throw load_module_graph noted as the run's fatal error is not one
+    // (#399 review): a worker that catches it must not later hand its parent
+    // this error in place of the one that ends its run.
+    let noted_before = tc
+        .get_slot::<FatalThrown>()
+        .is_some_and(|noted| noted.0.is_some());
     // Pull the rest of the graph in (idempotent: already-loaded paths skip).
     tc.set_slot(CaughtDuringLoad(None));
     if let Err(diags) = load_module_graph(tc, host, resolved.clone(), false) {
+        if !noted_before && let Some(noted) = tc.get_slot_mut::<FatalThrown>() {
+            noted.0 = None;
+        }
         store_pending_code_cache(tc);
         let caught = tc
             .get_slot_mut::<CaughtDuringLoad>()
