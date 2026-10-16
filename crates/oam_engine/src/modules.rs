@@ -242,6 +242,30 @@ pub(crate) struct UncaughtLedger {
     entries: Vec<(v8::Global<v8::Value>, String)>,
 }
 
+/// What the run's first fatal error was: the value thrown (or rejected, for
+/// an unhandled rejection: `from_promise`). The diagnostics carry the
+/// rendered report; a worker hands its parent the value itself, as node's
+/// does (#399).
+#[derive(Default)]
+pub(crate) struct FatalThrown(pub(crate) Option<(v8::Global<v8::Value>, bool)>);
+
+/// Note `value` as the run's fatal error, unless one is noted already (node
+/// reports the first).
+fn note_fatal_thrown(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+    from_promise: bool,
+) {
+    if scope
+        .get_slot::<FatalThrown>()
+        .is_some_and(|noted| noted.0.is_some())
+    {
+        return;
+    }
+    let value = v8::Global::new(scope, value);
+    scope.set_slot(FatalThrown(Some((value, from_promise))));
+}
+
 /// V8 message listener. Zero capture, raw C ABI.
 ///
 /// # Safety
@@ -545,6 +569,7 @@ fn fatal_report(
     frame: Option<String>,
     fallback: &str,
 ) -> String {
+    note_fatal_thrown(tc, exception, false);
     // An ESM top-level throw arrives as a rejected evaluation promise, with
     // no live Message on the scope -- rebuild one from the exception so the
     // report still opens with Node's source frame.
@@ -828,6 +853,7 @@ impl JsRuntime {
         self.isolate.set_slot(ModuleMap::default());
         self.isolate.set_slot(RejectionLedger::default());
         self.isolate.set_slot(UncaughtLedger::default());
+        self.isolate.set_slot(FatalThrown::default());
         self.isolate.set_slot(crate::timers::TimerQueue::default());
         self.isolate.set_slot(crate::cjs::CjsCache::default());
         self.isolate
@@ -1939,6 +1965,7 @@ pub(crate) fn unhandled_rejection_failures(
         ) {
             continue;
         }
+        note_fatal_thrown(tc, reason_local, true);
         fatal.push(Diagnostic::new(
             "OAM-RT0004",
             Severity::Error,
@@ -4228,6 +4255,7 @@ pub(crate) fn catch_to_diagnostic(
     name: &str,
 ) -> Diagnostic {
     if let Some(exception) = tc.exception() {
+        note_fatal_thrown(tc, exception, false);
         let exception = v8::Global::new(tc, exception);
         tc.set_slot(CaughtDuringLoad(Some(exception)));
     }

@@ -44800,7 +44800,39 @@
     const WORKER_ERROR_CLASSES = {
       Error, TypeError, RangeError, SyntaxError, ReferenceError, EvalError, URIError,
     };
+    /** What a worker's fatal run threw, rebuilt from the form
+     *  __oamSerializeWorkerError (bootstrap.js) sent, as node's
+     *  deserializeError rebuilds it (#399): an error is an object of the
+     *  named built-in class carrying the sent properties and an own
+     *  Symbol.toStringTag 'Error'; a Symbol is Symbol.for its description;
+     *  any other value is itself, or the string it was inspected as. */
+    function decodeWorkerValue(encoded) {
+      if ("u" in encoded) return undefined;
+      if ("big" in encoded) return BigInt(encoded.big);
+      if ("num" in encoded) return Number(encoded.num);
+      if ("err" in encoded) return deserializeWorkerError(encoded.err);
+      if ("s" in encoded) return encoded.s;
+      return encoded.j;
+    }
+    function deserializeWorkerError(serialized) {
+      if (serialized.kind === "string") return serialized.value;
+      if (serialized.kind === "symbol") return Symbol.for(serialized.value);
+      if (serialized.kind === "value") return decodeWorkerValue(serialized.value);
+      const Class = Object.hasOwn(WORKER_ERROR_CLASSES, serialized.ctor)
+        ? WORKER_ERROR_CLASSES[serialized.ctor]
+        : Error;
+      const properties = { __proto__: null };
+      for (const [key, value, enumerable, writable, configurable] of serialized.props) {
+        properties[key] = { value: decodeWorkerValue(value), enumerable, writable, configurable };
+      }
+      Object.defineProperty(properties, Symbol.toStringTag, {
+        value: { value: "Error", configurable: true },
+        enumerable: true,
+      });
+      return Object.create(Class.prototype, properties);
+    }
     function workerError(raw) {
+      if (raw.serialized !== undefined) return deserializeWorkerError(raw.serialized);
       const Class = Object.hasOwn(WORKER_ERROR_CLASSES, raw.name) ? WORKER_ERROR_CLASSES[raw.name] : Error;
       const err = new Class(raw.message);
       for (const [key, value] of raw.props || []) err[key] = value;

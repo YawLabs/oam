@@ -145,11 +145,14 @@ impl super::JsRuntime {
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
 
-        if crate::cjs::load_cjs(tc, entry).is_none() {
-            return Err(vec![crate::modules::catch_to_diagnostic(
-                tc,
-                &entry.to_string_lossy(),
-            )]);
+        // A synchronous throw from the entry's top level is offered to the
+        // worker's own 'uncaughtException' listeners first, as the main
+        // thread's is (run_cjs_entry); only an unhandled one fails the run.
+        if crate::cjs::load_cjs(tc, entry).is_none()
+            && let Some(failure) =
+                crate::modules::handle_uncaught_throw(tc, &entry.to_string_lossy())
+        {
+            return Err(failure);
         }
         if let Some(failure) = crate::modules::run_ticks_and_microtasks(tc) {
             return Err(failure);
@@ -162,6 +165,43 @@ impl super::JsRuntime {
             Some(failures) => Err(failures),
             None => Ok(()),
         }
+    }
+
+    /// End a worker whose run failed fatally as node's
+    /// workerOnGlobalUncaughtException does (lib/internal/main/worker_thread.js,
+    /// #399): unless the process is already exiting, set process.exitCode to
+    /// 1 and emit 'exit' with it -- a throw from a listener is ignored, and
+    /// nothing a listener queues runs -- then serialize what the run threw,
+    /// for the parent's 'error' event. `None` when the failure threw no value
+    /// (or the serializer could not run).
+    pub(crate) fn worker_fatal_exit(&mut self) -> Option<serde_json::Value> {
+        let _ = self.execute_script_draining(
+            "<worker-fatal-exit>",
+            "(function () { \
+               var p = globalThis.__oamProcessRef || globalThis.process; \
+               if (p && !p._exiting) { \
+                 try { p._exiting = true; p.exitCode = 1; p.emit('exit', p.exitCode); } \
+                 catch (_) {} \
+               } \
+             })();",
+            crate::AfterScript::Nothing,
+        );
+        let (thrown, from_promise) = self
+            .isolate
+            .get_slot_mut::<crate::modules::FatalThrown>()
+            .and_then(|noted| noted.0.take())?;
+        v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
+        v8::tc_scope!(let tc, scope);
+        let context = tc.get_current_context();
+        let global = context.global(tc);
+        let key = v8::String::new(tc, "__oamSerializeWorkerError")?;
+        let serialize = v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()?;
+        let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+        let thrown = v8::Local::new(tc, &thrown);
+        let from_promise: v8::Local<v8::Value> = v8::Boolean::new(tc, from_promise).into();
+        let json = serialize.call(tc, recv, &[thrown, from_promise])?;
+        let json = json.to_rust_string_lossy(tc);
+        serde_json::from_str(&json).ok()
     }
 }
 
@@ -544,16 +584,25 @@ fn run_worker(
         }
     };
     if let Err(diagnostics) = rt.execute_worker_as(&entry, kind, ctx) {
-        for d in &diagnostics {
-            eprintln!("worker {thread_id}: {}", d.message);
-        }
-        let _ = to_parent.send(WorkerEvent::Error(oam_core::worker::WorkerError::message(
-            diagnostics
-                .first()
-                .map(|d| d.message.clone())
-                .unwrap_or_else(|| "unknown worker error".to_string()),
-        )));
-        return 1;
+        // The run failed fatally. node's worker ends as
+        // workerOnGlobalUncaughtException has it (#399): 'exit' with 1 on the
+        // worker's own process first, then the error itself -- serialized,
+        // not a rendered report, and printed by no one but a parent that
+        // leaves 'error' unhandled -- and the thread exits with the exitCode
+        // the listeners leave. A failure no value was thrown for (a module
+        // that cannot be found or linked, a top-level await that never
+        // settles) is reported by its message.
+        let event = match rt.worker_fatal_exit() {
+            Some(serialized) => WorkerEvent::Thrown(serialized),
+            None => WorkerEvent::Error(oam_core::worker::WorkerError::message(
+                diagnostics
+                    .first()
+                    .map(|d| d.message.clone())
+                    .unwrap_or_else(|| "unknown worker error".to_string()),
+            )),
+        };
+        let _ = to_parent.send(event);
+        return rt.process_exit_code().unwrap_or(1);
     }
     // Node emits 'exit' on the worker's own process object before the thread
     // ends, and re-reads exitCode after (a handler may set it).
