@@ -16,8 +16,8 @@
 //
 // The error the parent gets is the one that ended the run: what an
 // uncaughtException listener threw in place of the original (with nothing of
-// oam's own bookkeeping on it), not a failed dynamic import() the worker
-// caught; and a cause chain 40 deep arrives whole.
+// oam's own bookkeeping on it), not a failed dynamic import() or require()
+// of an ES module the worker caught; and a cause chain 40 deep arrives whole.
 //
 // (The listener writes to a file, not through parentPort: node delivers the
 // error on the worker's internal port, so its order against a user message
@@ -71,6 +71,12 @@ if (kind === "handler-rethrow") {
 if (kind === "dyn-import") {
   const bad = require("node:url").pathToFileURL(require("node:path").join(__dirname, "bad.mjs")).href;
   import(bad).catch(() => setTimeout(() => { throw new Error("after a caught import"); }, 1));
+}
+if (kind === "require-esm") {
+  for (const name of ["bad.mjs", "throws.mjs"]) {
+    try { require(require("node:path").join(__dirname, name)); } catch {}
+  }
+  setTimeout(() => { throw new Error("after a caught require"); }, 1);
 }
 `;
 
@@ -134,7 +140,7 @@ if (!isMainThread) {
   const kinds = [
     "sync", "timer", "reject", "reject-string", "throw-42", "throw-object",
     "custom", "exitcode", "throw-symbol", "throw-undefined", "throw-function", "cause", "deep-cause",
-    "handler-rethrow", "dyn-import", "esm", "esm-dyn-import",
+    "handler-rethrow", "dyn-import", "require-esm", "esm", "esm-dyn-import",
   ];
   for (const kind of kinds) {
     await new Promise((resolve) => {
