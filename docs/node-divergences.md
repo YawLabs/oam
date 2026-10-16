@@ -1313,16 +1313,17 @@ Matching node v22.22.2 (no longer divergences; conformance cases 490 and 491):
   given (its creator's, when it is given none), then its `execArgv` (its creator's
   `process.execArgv`, when it is given none). `NODE_NO_WARNINGS` is read from the worker's own
   `process.env`. This covers the per-environment flags oam has: `--no-warnings`,
-  `--no-deprecation`, `--pending-deprecation`, `--disable-warning`, `--redirect-warnings` and the
-  `--tls-min/max-v1.x` defaults. `--title` and `--zero-fill-buffers` are the whole process's.
+  `--no-deprecation`, `--pending-deprecation`, `--disable-warning`, `--redirect-warnings`,
+  `--trace-require-module` and the `--tls-min/max-v1.x` defaults. `--title` and
+  `--zero-fill-buffers` are the whole process's.
 - **`stderr: true` (#370).** What the worker writes to `process.stderr`, the default warning
   printer included, goes to `worker.stderr`.
 - **A fatal run (#399 items 3 and 4).** The worker emits `'exit'` with 1 on its own `process`
   before the parent's `'error'` (nothing an `'exit'` listener queues runs; the thread exits with
   the `exitCode` the listeners leave; no `'exit'` when an `'uncaughtException'` listener threw),
-  the parent's `'error'` carries the error that ended the run (not a failed `import()` the worker
-  caught) as node's error serializer rebuilds it, a cause chain of any depth included, and nothing
-  is printed.
+  the parent's `'error'` carries the error that ended the run (not a failed `import()`, or
+  `require()` of an ES module, that the worker caught) as node's error serializer rebuilds it, a
+  cause chain of any depth included, and nothing is printed.
 
 What still differs, measured on Windows:
 
