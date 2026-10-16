@@ -1785,6 +1785,54 @@ mod tests {
         );
     }
 
+    /// #388, the Windows named-pipe twin of the two tests above: closing
+    /// the server while an accept is parked on it closes every waiting pipe
+    /// instance before close returns, so a dial right after it finds no
+    /// such pipe (ENOENT), as libuv's `uv_close` gives node's. A close that
+    /// only woke the accept, leaving the instances to it to drop, let the
+    /// dial connect to one -- to be dropped a moment later. Multi-threaded,
+    /// as oam's runtime is: the reactor that finishes with an instance whose
+    /// connect was in flight runs on another thread than the close.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_named_pipe_server_closed_with_an_accept_parked_is_gone_at_once() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let path = test_pipe_path("closed-parked");
+        let server =
+            json(pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await);
+        let server_id = server["serverId"].as_u64().unwrap();
+        let parked = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let closing = std::time::Instant::now();
+        tcp_server_close(&registry, server_id);
+        // Not by running out its bound: the reactor answers in microseconds.
+        let took = closing.elapsed();
+        assert!(took < std::time::Duration::from_millis(250), "{took:?}");
+        let refused = tokio::net::windows::named_pipe::ClientOptions::new().open(&path);
+        assert_eq!(
+            refused.as_ref().err().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound),
+            "connected to a closed server: {refused:?}"
+        );
+        assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+        // Closed with no accept parked: the same, at once.
+        let server =
+            json(pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await);
+        tcp_server_close(&registry, server["serverId"].as_u64().unwrap());
+        let refused = tokio::net::windows::named_pipe::ClientOptions::new().open(&path);
+        assert_eq!(
+            refused.as_ref().err().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound),
+            "connected to a closed server: {refused:?}"
+        );
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+    }
+
     /// #139, the duplex case the single-half tests miss: a handle closed
     /// while BOTH a read and a write are in flight (in_flight == 2) keeps
     /// its closed marker until the SECOND half returns, not the first. This

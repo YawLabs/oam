@@ -689,6 +689,31 @@ mod windows {
             drop(server);
         }
 
+        /// #385, decided: oam's pipe server keeps tokio's
+        /// PIPE_REJECT_REMOTE_CLIENTS, which libuv does not set. A client
+        /// that names the pipe through a UNC server name -- even the loopback
+        /// `\\localhost\pipe\x` -- comes in through the SMB redirector and
+        /// counts as remote, so it is refused with ERROR_ACCESS_DENIED
+        /// (node's EPERM), where a node server hands it an fd (measured on
+        /// v22.22.2). A client on the local name connects as before. See
+        /// docs/node-divergences.md, entry 50.
+        #[tokio::test]
+        async fn a_client_dialling_through_a_unc_server_name_is_refused_as_remote() {
+            let name = pipe_name("remote");
+            let leaf = name.strip_prefix(r"\\.\pipe\").unwrap();
+            let _listener = bind(&name, &name).unwrap();
+            assert!(ClientOptions::new().open(&name).is_ok(), "the local name");
+            for server in ["localhost", "127.0.0.1"] {
+                let unc = format!(r"\\{server}\pipe\{leaf}");
+                let refused = ClientOptions::new().open(&unc);
+                assert_eq!(
+                    refused.as_ref().err().and_then(io::Error::raw_os_error),
+                    Some(ERROR_ACCESS_DENIED as i32),
+                    "{unc}: {refused:?}"
+                );
+            }
+        }
+
         fn has_gate(name: &str) -> bool {
             busy_gates()
                 .lock()
