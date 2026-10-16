@@ -28513,8 +28513,13 @@ fn worker_threads_message_channel() {
         });
         ch.port1.postMessage({ hello: 'world' });
 
-        // Message is delivered via queueMicrotask, so wait a tick
+        // As in node (#401), a port message is a task of its own: it is not
+        // there yet when the microtasks of this turn run, and it is there by
+        // the time a setImmediate callback runs.
         queueMicrotask(() => {
+            console.log('micro_got=' + (received !== null));
+        });
+        setImmediate(() => {
             console.log('got_msg=' + (received !== null));
             ch.port1.close();
             ch.port2.close();
@@ -28522,6 +28527,7 @@ fn worker_threads_message_channel() {
     "#,
     );
     assert!(stdout.contains(r#"received={"hello":"world"}"#), "{stdout}");
+    assert!(stdout.contains("micro_got=false"), "{stdout}");
     assert!(stdout.contains("got_msg=true"), "{stdout}");
 }
 #[test]
@@ -28737,7 +28743,8 @@ fn worker_threads_message_channel_clone() {
         ch.port1.postMessage(obj);
         // Mutate after sending
         obj.val = 'mutated';
-        queueMicrotask(() => {
+        // Delivery is a task, as in node (#401), so wait for a setImmediate.
+        setImmediate(() => {
             // Receiver should see original, not mutated
             console.log('received_val=' + received.val);
             console.log('sender_val=' + obj.val);
@@ -28794,17 +28801,23 @@ fn worker_threads_message_port_close_event() {
         const { MessageChannel } = require('worker_threads');
         const ch = new MessageChannel();
         let closed = false;
-        ch.port2.on('close', () => { closed = true; });
+        ch.port2.on('close', () => {
+            closed = true;
+            console.log('close_fired=true');
+        });
+        // node's start() returns undefined, and 'close' is emitted later,
+        // not inside close() (#401).
+        console.log('start_returns=' + ch.port1.start());
         ch.port1.close();
         ch.port2.close();
-        console.log('close_fired=' + closed);
-        console.log('start_returns_this=' + (ch.port1.start() === ch.port1));
+        console.log('close_sync=' + closed);
     "#,
     );
     assert!(stdout.contains("close_fired=true"), "close event: {stdout}");
+    assert!(stdout.contains("close_sync=false"), "close is async: {stdout}");
     assert!(
-        stdout.contains("start_returns_this=true"),
-        "start returns this: {stdout}"
+        stdout.contains("start_returns=undefined"),
+        "start returns undefined: {stdout}"
     );
 }
 // ── oam install ─────────────────────────────────────────────────────────
