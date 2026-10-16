@@ -8893,8 +8893,9 @@ fn op_fs_fstat_sync(
 // ------------------------------------------------- permission helpers / query
 
 /// Throw Node's `ERR_ACCESS_DENIED`: message "Access to this API has been
-/// restricted", plus the `permission` and `resource` own properties Node
-/// attaches (and its fatal reporter prints).
+/// restricted. Use --allow-fs-read to manage permissions." (naming the flag
+/// that grants the permission), plus the `permission` and `resource` own
+/// properties Node attaches (and its fatal reporter prints).
 pub(crate) fn throw_permission_denied(
     scope: &mut v8::PinScope<'_, '_>,
     denial: &crate::permissions::PermissionDenial,
@@ -8914,7 +8915,8 @@ pub(crate) fn access_denied_error<'s>(
     permission: &str,
     resource: &str,
 ) -> v8::Local<'s, v8::Value> {
-    let msg_v8 = v8::String::new(scope, crate::permissions::ACCESS_DENIED_MESSAGE)
+    let message = crate::permissions::access_denied_message(permission);
+    let msg_v8 = v8::String::new(scope, &message)
         .unwrap_or_else(|| v8::String::new(scope, "ERR_ACCESS_DENIED").unwrap());
     let exception = v8::Exception::error(scope, msg_v8);
     if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {

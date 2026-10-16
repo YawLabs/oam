@@ -388,13 +388,15 @@ fn main() -> ExitCode {
                 flags.permission = true;
                 i += 1;
             } else if let Some(list) = arg.strip_prefix("--allow-fs-read=") {
-                flags.allow_fs_read = Some(list.to_string());
+                // Each occurrence of a list flag adds to the earlier ones, as
+                // node's do (#363): they were replaced, dropping a grant.
+                flags.allow_fs_read.push(list.to_string());
                 i += 1;
             } else if let Some(list) = arg.strip_prefix("--allow-fs-write=") {
-                flags.allow_fs_write = Some(list.to_string());
+                flags.allow_fs_write.push(list.to_string());
                 i += 1;
             } else if let Some(list) = arg.strip_prefix("--allow-net=") {
-                flags.allow_net = Some(list.to_string());
+                flags.allow_net.push(list.to_string());
                 i += 1;
             } else if arg == "--allow-net" {
                 // Bare form grants everything, stored as the same "*" the list
@@ -403,17 +405,17 @@ fn main() -> ExitCode {
                     eprintln!("{msg}");
                     return ExitCode::from(9);
                 }
-                flags.allow_net = Some("*".to_string());
+                flags.allow_net.push("*".to_string());
                 i += 1;
             } else if let Some(list) = arg.strip_prefix("--allow-env=") {
-                flags.allow_env = Some(list.to_string());
+                flags.allow_env.push(list.to_string());
                 i += 1;
             } else if arg == "--allow-env" {
                 if let Some(msg) = space_form_hint("--allow-env", raw.get(i + 1)) {
                     eprintln!("{msg}");
                     return ExitCode::from(9);
                 }
-                flags.allow_env = Some("*".to_string());
+                flags.allow_env.push("*".to_string());
                 i += 1;
             } else if arg == "--allow-child-process" {
                 flags.allow_child_process = true;
@@ -1870,21 +1872,21 @@ fn apply_node_options(flags: &mut NodeFlags, raw: &str) -> bool {
             // copies here for a child process (child_process.js,
             // copyPermissionModelFlagsToEnv), so a child started under
             // `--permission` runs under it too. Spelled as process.execArgv
-            // spells them; a repeated list flag keeps its last value, as on
-            // the command line.
+            // spells them; a repeated list flag adds to the earlier values, as
+            // on the command line.
             flags.permission = true;
         } else if let Some(list) = tok.strip_prefix("--allow-fs-read=") {
-            flags.allow_fs_read = Some(list.to_string());
+            flags.allow_fs_read.push(list.to_string());
         } else if let Some(list) = tok.strip_prefix("--allow-fs-write=") {
-            flags.allow_fs_write = Some(list.to_string());
+            flags.allow_fs_write.push(list.to_string());
         } else if let Some(list) = tok.strip_prefix("--allow-net=") {
-            flags.allow_net = Some(list.to_string());
+            flags.allow_net.push(list.to_string());
         } else if tok == "--allow-net" {
-            flags.allow_net = Some("*".to_string());
+            flags.allow_net.push("*".to_string());
         } else if let Some(list) = tok.strip_prefix("--allow-env=") {
-            flags.allow_env = Some(list.to_string());
+            flags.allow_env.push(list.to_string());
         } else if tok == "--allow-env" {
-            flags.allow_env = Some("*".to_string());
+            flags.allow_env.push("*".to_string());
         } else if tok == "--allow-child-process" {
             flags.allow_child_process = true;
         } else if tok == "--allow-worker" {
@@ -2614,11 +2616,13 @@ struct NodeFlags {
     expose_gc: bool,
     permission: bool,
     /// Node's granular grants. Only meaningful under `--permission`, which
-    /// denies everything first.
-    allow_fs_read: Option<String>,
-    allow_fs_write: Option<String>,
-    /// `--allow-net[=list]` and `--allow-env[=list]`. Bare form grants
-    /// everything (stored as `Some("*")`); `=a,b` grants a list.
+    /// denies everything first. One value per occurrence of the flag, in
+    /// order: a repeated flag adds to the earlier ones, as node's does.
+    allow_fs_read: Vec<String>,
+    allow_fs_write: Vec<String>,
+    /// `--allow-net[=list]` and `--allow-env[=list]`, one value per
+    /// occurrence. Bare form grants everything (stored as `"*"`); `=a,b`
+    /// grants a list.
     ///
     /// Without these, `permissions()` hardcoded net and env closed, so
     /// `--permission` denied all network access with no way to open it. That
@@ -2632,8 +2636,8 @@ struct NodeFlags {
     /// through it, so a denied variable is absent from `process.env` rather
     /// than throwing: it is a snapshot object with no per-property hook, and
     /// an exception would leak the names of variables the script may not see.
-    allow_net: Option<String>,
-    allow_env: Option<String>,
+    allow_net: Vec<String>,
+    allow_env: Vec<String>,
     allow_child_process: bool,
     allow_worker: bool,
     allow_addons: bool,
@@ -2702,7 +2706,8 @@ impl NodeFlags {
     /// NODE_OPTIONS's flags (`self`) under argv's: a value argv gave wins,
     /// a toggle either gave is on, a list holds the environment's entries
     /// then argv's (node applies NODE_OPTIONS first, so a later `--env-file`
-    /// on the command line still wins), and `argv` is kept for execArgv.
+    /// on the command line still wins, and a permission grant in either
+    /// holds), and `argv` is kept for execArgv.
     fn merged(self, argv: NodeFlags) -> NodeFlags {
         let env = self;
         let (max_http_header_size, max_http_header_size_spaced) =
@@ -2732,10 +2737,10 @@ impl NodeFlags {
             pending_deprecation: env.pending_deprecation || argv.pending_deprecation,
             expose_gc: env.expose_gc || argv.expose_gc,
             permission: env.permission || argv.permission,
-            allow_fs_read: argv.allow_fs_read.clone().or(env.allow_fs_read),
-            allow_fs_write: argv.allow_fs_write.clone().or(env.allow_fs_write),
-            allow_net: argv.allow_net.clone().or(env.allow_net),
-            allow_env: argv.allow_env.clone().or(env.allow_env),
+            allow_fs_read: [env.allow_fs_read, argv.allow_fs_read.clone()].concat(),
+            allow_fs_write: [env.allow_fs_write, argv.allow_fs_write.clone()].concat(),
+            allow_net: [env.allow_net, argv.allow_net.clone()].concat(),
+            allow_env: [env.allow_env, argv.allow_env.clone()].concat(),
             allow_child_process: env.allow_child_process || argv.allow_child_process,
             allow_worker: env.allow_worker || argv.allow_worker,
             allow_addons: env.allow_addons || argv.allow_addons,
@@ -2906,20 +2911,27 @@ impl NodeFlags {
         if !self.permission {
             return None;
         }
-        // `--allow-fs-read=*` is "everything"; anything else is a
-        // comma-separated allow-list, which is how node spells it.
-        fn grant(list: &Option<String>) -> oam_engine::BoolOrList {
-            match list {
-                None => oam_engine::BoolOrList::Bool(false),
-                Some(spec) if spec == "*" => oam_engine::BoolOrList::Bool(true),
-                Some(spec) => oam_engine::BoolOrList::List(
-                    spec.split(',')
-                        .map(str::trim)
-                        .filter(|entry| !entry.is_empty())
-                        .map(str::to_string)
-                        .collect(),
-                ),
+        // Every occurrence of a flag grants its entries (`values`, in
+        // order). A value `*` is "everything", beside any other value, as in
+        // node; any other value is a comma-separated allow-list, oam's
+        // spelling (node v22 takes a value as one path:
+        // docs/node-divergences.md, section 4).
+        fn grant(values: &[String]) -> oam_engine::BoolOrList {
+            if values.is_empty() {
+                return oam_engine::BoolOrList::Bool(false);
             }
+            if values.iter().any(|value| value == "*") {
+                return oam_engine::BoolOrList::Bool(true);
+            }
+            oam_engine::BoolOrList::List(
+                values
+                    .iter()
+                    .flat_map(|value| value.split(','))
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            )
         }
         Some(oam_engine::PermissionsOptions {
             read: grant(&self.allow_fs_read),
@@ -2959,23 +2971,23 @@ impl NodeFlags {
         if self.permission {
             out.push("--permission".into());
         }
-        if let Some(list) = &self.allow_fs_read {
+        for list in &self.allow_fs_read {
             out.push(format!("--allow-fs-read={list}"));
         }
-        if let Some(list) = &self.allow_fs_write {
+        for list in &self.allow_fs_write {
             out.push(format!("--allow-fs-write={list}"));
         }
         // Round-trip the bare form as bare: a script reading process.execArgv
         // to re-spawn itself should get back the flags it was given, not a
         // `=*` spelling node never produces.
-        if let Some(list) = &self.allow_net {
+        for list in &self.allow_net {
             out.push(if list == "*" {
                 "--allow-net".into()
             } else {
                 format!("--allow-net={list}")
             });
         }
-        if let Some(list) = &self.allow_env {
+        for list in &self.allow_env {
             out.push(if list == "*" {
                 "--allow-env".into()
             } else {
@@ -3822,10 +3834,10 @@ mod tests {
         let mut flags = super::NodeFlags::default();
         assert!(super::apply_node_options(&mut flags, &raw));
         assert!(flags.permission);
-        assert_eq!(flags.allow_fs_read.as_deref(), Some("C:/a,C:/b"));
-        assert_eq!(flags.allow_fs_write.as_deref(), Some("*"));
-        assert_eq!(flags.allow_net.as_deref(), Some("*"));
-        assert_eq!(flags.allow_env.as_deref(), Some("HOME"));
+        assert_eq!(flags.allow_fs_read, ["C:/a,C:/b"]);
+        assert_eq!(flags.allow_fs_write, ["*"]);
+        assert_eq!(flags.allow_net, ["*"]);
+        assert_eq!(flags.allow_env, ["HOME"]);
         assert!(flags.allow_child_process && flags.allow_worker);
         let p = perms_for(&flags);
         assert!(matches!(p.write, oam_engine::BoolOrList::Bool(true)));
@@ -3916,8 +3928,8 @@ mod tests {
     fn bare_allow_net_and_allow_env_grant_everything() {
         let flags = super::NodeFlags {
             permission: true,
-            allow_net: Some("*".into()),
-            allow_env: Some("*".into()),
+            allow_net: vec!["*".into()],
+            allow_env: vec!["*".into()],
             ..Default::default()
         };
         let p = perms_for(&flags);
@@ -3929,8 +3941,8 @@ mod tests {
     fn list_form_grants_only_the_listed_entries() {
         let flags = super::NodeFlags {
             permission: true,
-            allow_net: Some("127.0.0.1:5432, example.com".into()),
-            allow_env: Some("DATABASE_URL".into()),
+            allow_net: vec!["127.0.0.1:5432, example.com".into()],
+            allow_env: vec!["DATABASE_URL".into()],
             ..Default::default()
         };
         let p = perms_for(&flags);
@@ -3957,7 +3969,7 @@ mod tests {
         // without it must not silently enable the restrictive mode.
         let flags = super::NodeFlags {
             permission: false,
-            allow_net: Some("*".into()),
+            allow_net: vec!["*".into()],
             ..Default::default()
         };
         assert!(flags.permissions().is_none());
@@ -3969,8 +3981,8 @@ mod tests {
         // it was given -- bare stays bare, a list stays a list.
         let bare = super::NodeFlags {
             permission: true,
-            allow_net: Some("*".into()),
-            allow_env: Some("*".into()),
+            allow_net: vec!["*".into()],
+            allow_env: vec!["*".into()],
             ..Default::default()
         };
         let argv = bare.exec_argv();
@@ -3980,7 +3992,7 @@ mod tests {
 
         let listed = super::NodeFlags {
             permission: true,
-            allow_net: Some("a,b".into()),
+            allow_net: vec!["a,b".into()],
             ..Default::default()
         };
         assert!(listed.exec_argv().contains(&"--allow-net=a,b".to_string()));
