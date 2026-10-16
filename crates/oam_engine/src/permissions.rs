@@ -2200,7 +2200,10 @@ mod tests {
         let denial = p.check_read("/etc/passwd").unwrap_err();
         assert_eq!(denial.permission, "FileSystemRead");
         assert_eq!(denial.resource, "/etc/passwd");
-        assert_eq!(denial.to_string(), "Access to this API has been restricted");
+        assert_eq!(
+            denial.to_string(),
+            "Access to this API has been restricted. Use --allow-fs-read to manage permissions."
+        );
     }
 
     // ------------------------------------------- fs keys: case, anchoring
@@ -2246,6 +2249,196 @@ mod tests {
             .into_owned();
         assert!(p.check_read(&shouted).is_err());
         assert_eq!(p.query_state("read", Some(&shouted)), "denied");
+    }
+
+    // ------------------------------------------- `*` in a grant entry (#376)
+    //
+    // Measured with `--permission --allow-fs-read=<entry>` and
+    // `--allow-fs-write=<entry>` against node v22.22.2 on Windows and
+    // v22.23.2 on Linux (conformance case 511 holds the same rows).
+
+    /// A read grant and a write grant of the same entries.
+    fn read_and_write_grants(entries: &[String]) -> [(&'static str, Permissions); 2] {
+        let list: Vec<String> = entries.to_vec();
+        [
+            (
+                "read",
+                Permissions::from_opts(Some(opts_read_only(
+                    list.iter().map(String::as_str).collect(),
+                ))),
+            ),
+            (
+                "write",
+                Permissions::from_opts(Some(opts_write_only(list.clone()))),
+            ),
+        ]
+    }
+
+    fn allowed(p: &Permissions, kind: &str, target: &str) -> bool {
+        match kind {
+            "read" => p.check_read(target).is_ok(),
+            _ => p.check_write(target).is_ok(),
+        }
+    }
+
+    #[test]
+    fn a_trailing_separator_and_star_grants_the_directory_and_its_tree() {
+        let base = std::path::PathBuf::from(cwd()).join("wild");
+        let dir = base.join("T");
+        let d = dir.to_string_lossy().into_owned();
+        let at = |rel: &str| base.join(rel).to_string_lossy().into_owned();
+        let sep = std::path::MAIN_SEPARATOR;
+        // `T/*`, the platform's own `T\*` on Windows, `T/**`, and anything
+        // after the first `*` ignored.
+        for entry in [
+            format!("{d}/*"),
+            format!("{d}{sep}*"),
+            format!("{d}/**"),
+            format!("{d}/*/f.txt"),
+        ] {
+            for (kind, p) in read_and_write_grants(std::slice::from_ref(&entry)) {
+                for inside in [at("T"), at("T/f.txt"), at("T/sub/f.txt")] {
+                    assert!(allowed(&p, kind, &inside), "{kind} {entry}: {inside}");
+                }
+                for outside in [at(""), at("Tx/f.txt"), at("Tf.txt"), at("U/f.txt")] {
+                    assert!(!allowed(&p, kind, &outside), "{kind} {entry}: {outside}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_star_after_a_name_grants_every_path_that_starts_with_it() {
+        // `T*` is a prefix of the path, not of a component list: `Tx` and
+        // `Tf.txt` start with `T` too. The parent itself does not.
+        let base = std::path::PathBuf::from(cwd()).join("wild");
+        let at = |rel: &str| base.join(rel).to_string_lossy().into_owned();
+        let entry = format!("{}*", at("T"));
+        for (kind, p) in read_and_write_grants(std::slice::from_ref(&entry)) {
+            for inside in [at("T"), at("T/f.txt"), at("Tx/f.txt"), at("Tf.txt")] {
+                assert!(allowed(&p, kind, &inside), "{kind} {entry}: {inside}");
+            }
+            for outside in [at(""), at("U/f.txt"), at("S")] {
+                assert!(!allowed(&p, kind, &outside), "{kind} {entry}: {outside}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_root_followed_by_a_star_grants_that_roots_whole_tree() {
+        // `/*` keeps its root: the entry is the root, not an empty grant.
+        let here = cwd();
+        let root = if cfg!(windows) {
+            here[..3].to_string()
+        } else {
+            "/".to_string()
+        };
+        let mut entries = vec![format!("{root}*")];
+        if cfg!(windows) {
+            // `\*` is the root of the cwd's drive, and `C:/*` its own root.
+            entries.push(r"\*".to_string());
+            entries.push(format!("{}/*", &here[..2]));
+        }
+        for entry in entries {
+            for (kind, p) in read_and_write_grants(std::slice::from_ref(&entry)) {
+                assert!(allowed(&p, kind, &root), "{kind} {entry}: the root");
+                assert!(allowed(&p, kind, &here), "{kind} {entry}: {here}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_relative_star_entry_is_the_cwds_contents() {
+        let here = std::path::PathBuf::from(cwd());
+        let inside = here.join("f.txt").to_string_lossy().into_owned();
+        for entry in [
+            "./*".to_string(),
+            format!(".{}*", std::path::MAIN_SEPARATOR),
+        ] {
+            for (kind, p) in read_and_write_grants(std::slice::from_ref(&entry)) {
+                assert!(allowed(&p, kind, &inside), "{kind} {entry}");
+                assert!(allowed(&p, kind, "f.txt"), "{kind} {entry}: relative");
+                assert!(!allowed(&p, kind, "../f.txt"), "{kind} {entry}: outside");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_wildcard_entry_on_windows_matches_the_namespaced_path_an_op_opens() {
+        // An fs op hands the OS `\\?\C:\...`: the wildcard grant admits it
+        // as it admits the plain spelling, and a device spelling still
+        // matches nothing.
+        let base = std::path::PathBuf::from(cwd()).join("wild");
+        let d = base.join("T").to_string_lossy().into_owned();
+        for (kind, p) in read_and_write_grants(&[format!(r"{d}\*")]) {
+            let inside = os(&format!(r"{d}\f.txt"));
+            let ok = match kind {
+                "read" => p.check_read_path(&inside).is_ok(),
+                _ => p.check_write_path(&inside).is_ok(),
+            };
+            assert!(ok, "{kind}");
+            assert!(!allowed(&p, kind, &format!(r"\\.\{d}\f.txt")), "{kind}");
+            assert!(!allowed(&p, kind, &format!(r"{d}x\f.txt")), "{kind}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_backslash_is_a_file_name_character_on_posix() {
+        // node v22 on Linux: `\` separates nothing, so `<dir>\*` grants the
+        // names in `<dir>`'s parent that start with `<dir>\` and nothing
+        // inside `<dir>`; a grant of `a\b` is the one entry named `a\b`,
+        // never `a/b`; and a target spelt with `\` is that one name.
+        let base = std::path::PathBuf::from(cwd()).join("wild");
+        let at = |rel: &str| base.join(rel).to_string_lossy().into_owned();
+        for (kind, p) in read_and_write_grants(&[format!(r"{}\*", at("T"))]) {
+            assert!(!allowed(&p, kind, &at("T/f")), "{kind}");
+            assert!(allowed(&p, kind, &at(r"T\x")), "{kind}");
+        }
+        for (kind, p) in read_and_write_grants(&[at(r"a\b")]) {
+            assert!(allowed(&p, kind, &at(r"a\b/f")), "{kind}");
+            assert!(!allowed(&p, kind, &at("a/b/f")), "{kind}");
+        }
+        for (kind, p) in read_and_write_grants(&[at("a/b")]) {
+            assert!(allowed(&p, kind, &at("a/b/f")), "{kind}");
+            assert!(!allowed(&p, kind, &at(r"a\b/f")), "{kind}");
+        }
+        for (kind, p) in read_and_write_grants(&[at("T")]) {
+            assert!(!allowed(&p, kind, &at(r"T\x")), "{kind}");
+            // `a\..\T` is one name under the base, not a way to `T`.
+            assert!(!allowed(&p, kind, &at(r"a\..\T/f")), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_denial_names_the_flag_that_grants_it() {
+        // node v22.22.2: `Access to this API has been restricted. Use
+        // --allow-fs-write to manage permissions.`, one flag per permission.
+        // `Net` and `Environment` are oam's own grants, named the same way.
+        let p = Permissions::from_opts(Some(PermissionsOptions {
+            read: BoolOrList::Bool(false),
+            write: BoolOrList::Bool(false),
+            net: BoolOrList::Bool(false),
+            env: BoolOrList::Bool(false),
+            ffi: BoolOrList::Bool(false),
+            child: BoolOrList::Bool(false),
+            worker: BoolOrList::Bool(false),
+        }));
+        let message = |flag: &str| {
+            format!("Access to this API has been restricted. Use {flag} to manage permissions.")
+        };
+        for (denial, flag) in [
+            (p.check_read("/x").unwrap_err(), "--allow-fs-read"),
+            (p.check_write("/x").unwrap_err(), "--allow-fs-write"),
+            (p.check_child("x").unwrap_err(), "--allow-child-process"),
+            (p.check_worker("x").unwrap_err(), "--allow-worker"),
+            (p.check_ffi("x").unwrap_err(), "--allow-addons"),
+            (p.check_net("x").unwrap_err(), "--allow-net"),
+            (p.check_env("X").unwrap_err(), "--allow-env"),
+        ] {
+            assert_eq!(denial.to_string(), message(flag), "{}", denial.permission);
+        }
     }
 
     // ------------------------------------------- Windows: node's resolve

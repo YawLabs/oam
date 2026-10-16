@@ -11955,7 +11955,8 @@ console.log(lines.join('\n'));
     let granted = "--allow-net=127.0.0.1,granted.invalid";
     let (stdout, stderr, inner_seen, inner6_seen, (inner, inner6)) =
         run(&["--permission", granted], "full");
-    let denied = "Error|Access to this API has been restricted|code,permission,resource";
+    let denied = "Error|Access to this API has been restricted. Use --allow-net to manage \
+                  permissions.|code,permission,resource";
     // A refusal names the hop's `host:port`, as net.connect's does.
     assert_eq!(
         stdout,

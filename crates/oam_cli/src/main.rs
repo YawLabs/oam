@@ -3841,6 +3841,77 @@ mod tests {
         assert!(is_denied(&p.read) && is_denied(&p.write) && is_denied(&p.child));
     }
 
+    /// The entries a list grant holds, or a panic naming what it was.
+    fn listed(grant: &oam_engine::BoolOrList) -> Vec<String> {
+        match grant {
+            oam_engine::BoolOrList::List(v) => v.clone(),
+            other => panic!("expected a list grant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_repeated_list_flag_adds_its_entries_to_the_earlier_ones() {
+        // node v22.22.2: `--allow-fs-write=A --allow-fs-write=B` admits
+        // writes under A and under B (#363). oam kept only B. The same holds
+        // for every list-valued permission flag, oam's own two included.
+        let raw = [
+            "--permission",
+            "--allow-fs-read=/r1",
+            "--allow-fs-read=/r2",
+            "--allow-fs-write=/w1",
+            "--allow-fs-write=/w2",
+            "--allow-fs-write=/w3",
+            "--allow-net=a.test",
+            "--allow-net=b.test:80",
+            "--allow-env=ONE",
+            "--allow-env=TWO",
+        ]
+        .join(" ");
+        let mut flags = super::NodeFlags::default();
+        assert!(super::apply_node_options(&mut flags, &raw));
+        let p = perms_for(&flags);
+        assert_eq!(listed(&p.read), ["/r1", "/r2"]);
+        assert_eq!(listed(&p.write), ["/w1", "/w2", "/w3"]);
+        assert_eq!(listed(&p.net), ["a.test", "b.test:80"]);
+        assert_eq!(listed(&p.env), ["ONE", "TWO"]);
+        // A `*` among them grants everything, as node's does.
+        let mut star = super::NodeFlags::default();
+        super::apply_node_options(
+            &mut star,
+            "--permission --allow-fs-read=/r1 --allow-fs-read=* --allow-net=a.test --allow-net",
+        );
+        let p = perms_for(&star);
+        assert!(matches!(p.read, oam_engine::BoolOrList::Bool(true)));
+        assert!(matches!(p.net, oam_engine::BoolOrList::Bool(true)));
+    }
+
+    #[test]
+    fn node_options_grants_add_to_argvs_and_exec_argv_lists_every_occurrence() {
+        // node applies NODE_OPTIONS and then argv, and a list flag in both
+        // grants both; process.execArgv holds argv's occurrences, each as it
+        // was given, which is what a child under `--permission` inherits.
+        let mut env = super::NodeFlags::default();
+        super::apply_node_options(&mut env, "--allow-fs-write=/env --allow-env=E");
+        let mut argv = super::NodeFlags::default();
+        super::apply_node_options(
+            &mut argv,
+            "--permission --allow-fs-write=/a --allow-fs-write=/b --allow-env=A",
+        );
+        let merged = env.merged(argv);
+        let p = perms_for(&merged);
+        assert_eq!(listed(&p.write), ["/env", "/a", "/b"]);
+        assert_eq!(listed(&p.env), ["E", "A"]);
+        assert_eq!(
+            merged.exec_argv(),
+            [
+                "--permission",
+                "--allow-fs-write=/a",
+                "--allow-fs-write=/b",
+                "--allow-env=A",
+            ]
+        );
+    }
+
     #[test]
     fn bare_allow_net_and_allow_env_grant_everything() {
         let flags = super::NodeFlags {
