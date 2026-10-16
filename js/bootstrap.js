@@ -707,9 +707,11 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     } else if (object instanceof globalThis.Blob) {
       state.kind = "blob";
       if (object.type !== "") state.type = object.type;
-      // oam's own Blob holds its bytes, and they never change. Anything else
-      // that passes for one is read through its stream.
-      if (object._bytes instanceof Uint8Array && !object._unreadableSize) state.bytes = object._bytes;
+      // An oam Blob of in-memory parts gives its bytes, which never change.
+      // A file-backed one, or anything else that passes for a Blob, is read
+      // through its stream, when the body is.
+      const bytes = blobMemoryBytes(object);
+      if (bytes !== null) state.bytes = bytes;
       else {
         state.stream = object.stream();
         // What fetch sends as its content-length, as undici does.
@@ -724,11 +726,17 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     } else if (object instanceof globalThis.FormData) {
       state.kind = "formdata";
       const boundary = multipartBoundary();
-      // A file in it that cannot be read: the body is made, and reading it
-      // fails, as node's does.
-      const unreadable = [...object.values()].some((v) => typeof v !== "string" && v._unreadableSize);
-      if (unreadable) state.stream = new globalThis.Blob([unreadableBlobMarker(1)]).stream();
-      else state.bytes = multipartBytes(object, boundary);
+      // A file-backed file in it is read when the body is, and the body
+      // fails as the file's read does (NotReadableError once it changed),
+      // as node's does: the encoding is then a Blob of the pieces, streamed.
+      const pieces = multipartPieces(object, boundary);
+      if (pieces.every((piece) => piece instanceof Uint8Array)) state.bytes = concatBytes(pieces);
+      else {
+        const encoded = new globalThis.Blob(pieces);
+        state.stream = encoded.stream();
+        // Its content-length, as undici's (a file's size is known).
+        state.size = encoded.size;
+      }
       state.type = `multipart/form-data; boundary=${boundary}`;
     } else if (
       typeof globalThis.URLSearchParams === "function" &&
@@ -773,7 +781,9 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     return `----formdata-oam-0${digits}`;
   }
 
-  function multipartBytes(form, boundary) {
+  // The encoding's pieces: bytes, and for a file whose parts are not all in
+  // memory the File itself.
+  function multipartPieces(form, boundary) {
     const encoder = new TextEncoder();
     const crlf = (text) => text.replace(/\r?\n|\r/g, "\r\n");
     const escape = (text) =>
@@ -787,19 +797,12 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         const filename = value.name ? `; filename="${escape(value.name)}"` : "";
         const type = value.type || "application/octet-stream";
         parts.push(encoder.encode(`${head}${filename}\r\nContent-Type: ${type}\r\n\r\n`));
-        parts.push(value._bytes);
+        parts.push(blobMemoryBytes(value) ?? value);
         parts.push(encoder.encode("\r\n"));
       }
     }
     parts.push(encoder.encode(`--${boundary}--\r\n`));
-    return concatBytes(parts);
-  }
-
-  // A Blob of `size` bytes that cannot be read (see the Blob class).
-  function unreadableBlobMarker(size) {
-    const blob = new globalThis.Blob([]);
-    blob._unreadableSize = size;
-    return blob;
+    return parts;
   }
 
   function concatBytes(chunks) {
@@ -1089,18 +1092,17 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         }
         if (v === null || typeof v !== "object") return v;
         if (memo.has(v)) return memo.get(v);
-        // A file-backed Blob (fs.openAsBlob) is NOT cloneable in node -- it
-        // holds a file reference, not bytes, so a clone would outlive the
-        // guarantee. node throws a plain TypeError, not a DataCloneError:
+        // A Blob clones as a Blob with the same parts (see cloneBlob). A
+        // file-backed one from fs.openAsBlob is NOT cloneable in node, and
+        // throws a TypeError with code ERR_INVALID_STATE, not a
+        // DataCloneError:
         //   TypeError: Invalid state: File-backed Blobs are not cloneable
-        // Marked with a cross-realm registered symbol because the marker is set
-        // in node_compat's fs factory, which cannot see this scope. A symbol
-        // key also keeps it out of Object.keys, so it introduces no structural
-        // difference of its own. Checked HERE rather than at the entry point so
-        // a blob nested inside a cloned object throws too, as node's does.
-        if (v[Symbol.for("oam.blob.fileBacked")] === true) {
-          throw new TypeError("Invalid state: File-backed Blobs are not cloneable");
-        }
+        // Only the Blob openAsBlob returned is marked (a registered symbol,
+        // set in node_compat's fs factory, which cannot see this scope); a
+        // slice of it, or a Blob made of it, clones, as node's do. Checked
+        // HERE rather than at the entry point so a blob nested inside a
+        // cloned object throws too, as node's does.
+        if (blobStates.has(v)) { const c = cloneBlob(v); memo.set(v, c); return c; }
         if (v instanceof Date) { const c = new Date(v); memo.set(v, c); return c; }
         if (v instanceof RegExp) { const c = new RegExp(v.source, v.flags); memo.set(v, c); return c; }
         if (typeof ArrayBuffer !== "undefined" && v instanceof ArrayBuffer) {
@@ -1184,119 +1186,308 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
     return `${label} ${inspect(fields, opts)}`;
   }
-  // WHATWG Blob: an immutable byte sequence with a type string. Backed by
-  // a flat Uint8Array, zero-copy subarray for slice(). text/arrayBuffer/stream
-  // return the expected types. size and type are read-only.
+  // WHATWG Blob, as node's (lib/internal/blob.js, v22.22.2): an immutable
+  // list of parts. An in-memory part is a copy made at construction (a
+  // string encoded, a buffer or view copied); a Blob given as a part gives
+  // its own parts, shared, not copied; a file part (fs.openAsBlob) is a
+  // range of a file, read only when the Blob is. Reads walk the parts in
+  // order -- one chunk per in-memory part, a file part in 64 KiB chunks --
+  // which is also how stream() hands them out.
+  //
+  // The state lives in a WeakMap, not on the object: node's Blob has no own
+  // properties, so `Object.keys(blob)` is [] and `JSON.stringify(blob)` is
+  // {} -- a log line carrying a Blob must never dump its payload.
+  const blobStates = new WeakMap(); // Blob -> { parts, size, type }
+  const kBlobFileBacked = Symbol.for("oam.blob.fileBacked");
+  let BlobClass;
+  let TransferableBlobPrototype;
+  const blobCodes = () => globalThis.__oamNode.get("internal/errors").codes;
+  const blobNotReadable = () => new DOMException("The blob could not be read", "NotReadableError");
+  // node's disallowedTypeCharacters: a type with anything outside
+  // U+0020-U+007E is "", any other is lowercased.
+  const disallowedTypeCharacters = /[^ -~]/;
+  const normalizeBlobType = (type) => {
+    type = `${type}`;
+    return disallowedTypeCharacters.test(type) ? "" : type.toLowerCase();
+  };
+
+  // node's webidl convertToInt(name, value, 64, { signed: true }): the
+  // conversion slice() gives its start and end.
+  function blobSliceInt(value) {
+    let x = +value;
+    if (Number.isNaN(x) || x === 0 || x === Infinity || x === -Infinity) return 0;
+    x = Math.trunc(x) % 2 ** 64;
+    if (x === 0) return 0;
+    return x >= 2 ** 63 ? x - 2 ** 64 : x;
+  }
+
+  // The parts of [start, end) of a part list: a part that contributes no
+  // bytes is dropped, so a slice of nothing has no part at all (and an
+  // empty file's part, kept by a Blob made of it, goes from a slice).
+  function sliceBlobParts(parts, start, end) {
+    const out = [];
+    let offset = 0;
+    for (const part of parts) {
+      const length = part.bytes !== undefined ? part.bytes.length : part.end - part.start;
+      const from = Math.max(start, offset);
+      const to = Math.min(end, offset + length);
+      if (to > from) {
+        if (part.bytes !== undefined) {
+          out.push({ bytes: part.bytes.subarray(from - offset, to - offset) });
+        } else {
+          out.push({ file: part.file, start: part.start + from - offset, end: part.start + to - offset });
+        }
+      }
+      offset += length;
+      if (offset >= end) break;
+    }
+    return out;
+  }
+
+  // node's createBlob: an instance of an internal subclass of Blob, with an
+  // own (enumerable) `constructor` pointing back at Blob -- so a slice's
+  // `Object.keys` is ["constructor"] and its constructor's name "Blob".
+  function createBlob(parts, size, type) {
+    const blob = Object.create(TransferableBlobPrototype);
+    blobStates.set(blob, { parts, size, type });
+    blob.constructor = BlobClass;
+    return blob;
+  }
+
+  // A reader over a part list, node's DataQueue reader in shape:
+  // pull(cb) calls back cb(1, chunk) for each chunk, cb(0) at the end and
+  // cb(-1) on a failure -- synchronously for an in-memory part (as node's
+  // does), when the read completes for a file part.
+  function blobPartsReader(parts) {
+    let index = 0;
+    let file = null;
+    const reader = {
+      pull(cb) {
+        while (index < parts.length) {
+          const part = parts[index];
+          if (part.bytes !== undefined) {
+            index++;
+            cb(1, part.bytes, false);
+            return;
+          }
+          file ??= part.file.open(part.start, part.end);
+          file.pull((status, chunk) => {
+            if (status === 0) {
+              file = null;
+              index++;
+              reader.pull(cb);
+              return;
+            }
+            if (status < 0) {
+              file = null;
+              index = parts.length;
+            }
+            cb(status, chunk, true);
+          });
+          return;
+        }
+        cb(0);
+      },
+      cancel() {
+        file?.cancel();
+        file = null;
+        index = parts.length;
+      },
+    };
+    return reader;
+  }
+
+  // node's arrayBuffer(blob): every chunk, one microtask apart, then joined.
+  function readBlobParts(parts) {
+    return new Promise((resolve, reject) => {
+      const reader = blobPartsReader(parts);
+      const chunks = [];
+      const next = () => {
+        reader.pull((status, chunk) => {
+          if (status === 0) {
+            resolve(concatBytes(chunks).buffer);
+            return;
+          }
+          if (status < 0) {
+            reject(blobNotReadable());
+            return;
+          }
+          chunks.push(chunk);
+          queueMicrotask(next);
+        });
+      };
+      next();
+    });
+  }
+
+  // The bytes of an oam Blob whose parts are all in memory (an empty Blob's
+  // included), or null: what a body made from it can send as it is.
+  function blobMemoryBytes(blob) {
+    const state = blobStates.get(blob);
+    if (state === undefined) return null;
+    const { parts } = state;
+    for (const part of parts) if (part.bytes === undefined) return null;
+    return parts.length === 1 ? parts[0].bytes : concatBytes(parts.map((part) => part.bytes));
+  }
+
+  // structuredClone of a Blob: a Blob (a File too, as node's deserializes)
+  // with the same parts. A file-backed one from fs.openAsBlob refuses.
+  function cloneBlob(blob) {
+    if (blob[kBlobFileBacked] === true) {
+      throw new (blobCodes().ERR_INVALID_STATE.TypeError)("File-backed Blobs are not cloneable");
+    }
+    const { parts, size, type } = blobStates.get(blob);
+    const clone = Object.create(BlobClass.prototype);
+    blobStates.set(clone, { parts, size, type });
+    return clone;
+  }
+
   if (typeof globalThis.Blob !== "function") {
     class Blob {
-      constructor(parts, options) {
+      constructor(sources = [], options = undefined) {
+        // (The coded errors are looked up only to throw one: a Blob made
+        // before node_compat's registry exists must not need it.)
+        if (sources === null || typeof sources[Symbol.iterator] !== "function" || typeof sources === "string") {
+          throw new (blobCodes().ERR_INVALID_ARG_TYPE)("sources", "a sequence", sources);
+        }
+        // node's validateDictionary.
+        if (options != null && typeof options !== "object" && typeof options !== "function") {
+          throw new (blobCodes().ERR_INVALID_ARG_TYPE)("options", "a dictionary", options);
+        }
+        let { type = "", endings = "transparent" } = options ?? {};
+        endings = `${endings}`;
+        if (endings !== "transparent" && endings !== "native") {
+          throw new (blobCodes().ERR_INVALID_ARG_VALUE)("options.endings", endings);
+        }
+        const parts = [];
         let size = 0;
-        let unreadable = false;
-        const pieces = [];
-        if (parts != null) {
-          for (const part of parts) {
-            if (typeof part === "string") {
-              const enc = new TextEncoder().encode(part);
-              pieces.push(enc);
-              size += enc.length;
-            } else if (part instanceof Blob) {
-              if (part._unreadableSize) unreadable = true;
-              else pieces.push(part._bytes);
-              size += part.size;
-            } else if (part instanceof ArrayBuffer) {
-              const view = new Uint8Array(part);
-              pieces.push(view);
-              size += view.length;
-            } else if (ArrayBuffer.isView(part)) {
-              const view = new Uint8Array(part.buffer, part.byteOffset, part.byteLength);
-              pieces.push(view);
-              size += view.length;
-            } else {
-              const enc = new TextEncoder().encode(String(part));
-              pieces.push(enc);
-              size += enc.length;
-            }
+        Array.from(sources, (source) => {
+          const state = typeof source === "object" && source !== null ? blobStates.get(source) : undefined;
+          if (state !== undefined) {
+            for (const part of state.parts) parts.push(part);
+            size += state.size;
+            return;
           }
-        }
-        const bytes = new Uint8Array(unreadable ? 0 : size);
-        let offset = 0;
-        if (!unreadable) for (const piece of pieces) { bytes.set(piece, offset); offset += piece.length; }
-        // NON-ENUMERABLE, and that is load-bearing rather than tidiness.
-        // These were plain assignments, so a Blob's internals were own
-        // ENUMERABLE properties: `Object.keys(blob)` returned
-        // ["_bytes","_type"] where node returns [], and -- much worse --
-        // `JSON.stringify(blob)` serialised the ENTIRE payload as a numeric
-        // object ({"0":104,"1":105,...}) where node gives {}. Any log line or
-        // API response carrying an object with a Blob in it dumped the whole
-        // buffer: a memory blowup, and file contents in places they should
-        // never reach. Same reasoning for `writable` -- `slice` below reassigns
-        // `_bytes`, which needs the property to already exist and be writable
-        // or the assignment would create a fresh enumerable one.
-        Object.defineProperty(this, "_bytes", {
-          value: bytes,
-          writable: true,
-          enumerable: false,
-          configurable: true,
+          let bytes;
+          if (source instanceof ArrayBuffer || (typeof SharedArrayBuffer === "function" && source instanceof SharedArrayBuffer)) {
+            bytes = new Uint8Array(source.byteLength);
+            bytes.set(new Uint8Array(source));
+          } else if (ArrayBuffer.isView(source)) {
+            bytes = new Uint8Array(source.byteLength);
+            bytes.set(new Uint8Array(source.buffer, source.byteOffset, source.byteLength));
+          } else {
+            let text = `${source}`;
+            if (endings === "native") {
+              text = text.replace(/\n|\r\n/g, globalThis.process?.platform === "win32" ? "\r\n" : "\n");
+            }
+            bytes = new TextEncoder().encode(text);
+          }
+          size += bytes.length;
+          if (bytes.length > 0) parts.push({ bytes });
         });
-        // A Blob that has a size and cannot be read: what fs.openAsBlob gives
-        // for a directory, and anything made with one as a part. 0 for
-        // every other Blob. Its reads fail NotReadableError, as node's do.
-        Object.defineProperty(this, "_unreadableSize", {
-          value: unreadable ? size : 0,
-          writable: true,
-          enumerable: false,
-          configurable: true,
-        });
-        Object.defineProperty(this, "_type", {
-          value: (options && typeof options.type === "string") ? options.type.toLowerCase() : "",
-          writable: true,
-          enumerable: false,
-          configurable: true,
-        });
+        blobStates.set(this, { parts, size, type: normalizeBlobType(type) });
       }
-      get size() { return this._unreadableSize || this._bytes.length; }
-      get type() { return this._type; }
-      slice(start, end, type) {
-        const len = this.size;
-        let s = start === undefined ? 0 : start < 0 ? Math.max(0, len + start) : Math.min(start, len);
-        let e = end === undefined ? len : end < 0 ? Math.max(0, len + end) : Math.min(end, len);
-        if (s >= e) s = e = 0;
-        const result = new Blob([], { type: type !== undefined ? String(type) : this._type });
-        if (this._unreadableSize) result._unreadableSize = e - s;
-        else result._bytes = this._bytes.subarray(s, e);
-        return result;
+      // (In node's order, which is the prototype's key order.)
+      get type() {
+        const state = blobStates.get(this);
+        if (state === undefined) throw new (blobCodes().ERR_INVALID_THIS)("Blob");
+        return state.type;
       }
-      #unreadable() {
-        return new DOMException("The blob could not be read", "NotReadableError");
+      get size() {
+        const state = blobStates.get(this);
+        if (state === undefined) throw new (blobCodes().ERR_INVALID_THIS)("Blob");
+        return state.size;
       }
-      async arrayBuffer() {
-        if (this._unreadableSize) throw this.#unreadable();
-        return this._bytes.buffer.slice(this._bytes.byteOffset, this._bytes.byteOffset + this._bytes.length);
+      // node's: start and end converted as WebIDL `long long`s (NaN and the
+      // infinities are 0), negative from the end, clamped; the content type
+      // normalized as the constructor's, and "" when omitted -- not this
+      // Blob's type.
+      slice(start = 0, end = undefined, contentType = "") {
+        const state = blobStates.get(this);
+        if (state === undefined) throw new (blobCodes().ERR_INVALID_THIS)("Blob");
+        const length = state.size;
+        start = blobSliceInt(start);
+        end = end === undefined ? length : blobSliceInt(end);
+        start = start < 0 ? Math.max(length + start, 0) : Math.min(start, length);
+        end = end < 0 ? Math.max(length + end, 0) : Math.min(end, length);
+        contentType = normalizeBlobType(contentType);
+        const span = Math.max(end - start, 0);
+        return createBlob(sliceBlobParts(state.parts, start, start + span), span, contentType);
       }
-      async bytes() {
-        if (this._unreadableSize) throw this.#unreadable();
-        return this._bytes.slice();
+      arrayBuffer() {
+        const state = blobStates.get(this);
+        if (state === undefined) return Promise.reject(new (blobCodes().ERR_INVALID_THIS)("Blob"));
+        return readBlobParts(state.parts);
       }
-      async text() {
-        if (this._unreadableSize) throw this.#unreadable();
-        return new TextDecoder().decode(this._bytes);
+      text() {
+        const state = blobStates.get(this);
+        if (state === undefined) return Promise.reject(new (blobCodes().ERR_INVALID_THIS)("Blob"));
+        return readBlobParts(state.parts).then((buffer) => new TextDecoder().decode(buffer));
       }
+      bytes() {
+        const state = blobStates.get(this);
+        if (state === undefined) return Promise.reject(new (blobCodes().ERR_INVALID_THIS)("Blob"));
+        return readBlobParts(state.parts).then((buffer) => new Uint8Array(buffer));
+      }
+      // node's stream(): a byte stream with a high-water mark of 0, so
+      // nothing is read before a read asks. Each pull reads on -- a chunk
+      // per in-memory part, a file part in 64 KiB chunks -- until the queue
+      // is over its mark; at the end it closes and answers a pending BYOB
+      // read with respond(0). A chunk is the reader's own: an in-memory
+      // part is copied, so writing to it leaves the Blob as it was.
       stream() {
-        const bytes = this._bytes;
-        if (this._unreadableSize) {
-          const failure = this.#unreadable();
-          return new ReadableStream({ type: "bytes", pull: (controller) => controller.error(failure) });
-        }
-        return new ReadableStream({
-          type: "bytes", // node's Blob#stream() is a byte stream
-          // A copy: what the stream hands out belongs to its reader, and a
-          // Blob does not change. Nothing at all for an empty one, as node's
-          // gives no chunk.
-          start(controller) {
-            if (bytes.length > 0) controller.enqueue(bytes.slice());
-            controller.close();
+        const state = blobStates.get(this);
+        if (state === undefined) throw new (blobCodes().ERR_INVALID_THIS)("Blob");
+        const reader = blobPartsReader(state.parts);
+        return new ReadableStream(
+          {
+            type: "bytes",
+            start() {
+              this.pendingPulls = [];
+            },
+            pull(c) {
+              const source = this;
+              return new Promise((resolve, reject) => {
+                source.pendingPulls.push({ resolve, reject });
+                const readNext = () => {
+                  reader.pull((status, buffer, owned) => {
+                    if (source.pendingPulls.length === 0) return;
+                    if (status === 0) {
+                      c.close();
+                      c.byobRequest?.respond(0);
+                      source.pendingPulls.shift().resolve();
+                      return;
+                    }
+                    if (status < 0) {
+                      const error = blobNotReadable();
+                      const pending = source.pendingPulls.shift();
+                      c.error(error);
+                      pending.reject(error);
+                      return;
+                    }
+                    if (buffer !== undefined && buffer.byteLength !== 0) {
+                      c.enqueue(owned ? buffer : buffer.slice());
+                    }
+                    queueMicrotask(() => {
+                      if (c.desiredSize < 0) {
+                        if (source.pendingPulls.length !== 0) source.pendingPulls.shift().resolve();
+                        return;
+                      }
+                      readNext();
+                    });
+                  });
+                };
+                readNext();
+              });
+            },
+            cancel(reason) {
+              for (const pending of this.pendingPulls) pending.reject(reason);
+              this.pendingPulls = [];
+              reader.cancel();
+            },
           },
-        });
+          { highWaterMark: 0 },
+        );
       }
       // No toString of its own, as node's Blob has none: the brand's
       // toStringTag already makes String() "[object Blob]", and an own
@@ -1305,8 +1496,21 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       [Symbol.for("nodejs.util.inspect.custom")](depth, options, inspect) {
         return inspectBlobLike(this, "Blob", { size: this.size, type: this.type }, depth, options, inspect);
       }
+      // fs.openAsBlob's Blob (node's createBlobFromFilePath): one file part
+      // over `file` -- { open(start, end) } returning a reader with
+      // pull(cb) / cancel(), made by the fs module -- of the size the open's
+      // fstat said, its type as given (node does not normalize it here).
+      static [Symbol.for("oam.blob.fromFile")](file, size, type) {
+        return createBlob([{ file, start: 0, end: size }], size, type);
+      }
+    }
+    // node marks these enumerable (kEnumerableProperty).
+    for (const name of ["size", "type", "slice", "stream", "text", "arrayBuffer", "bytes"]) {
+      Object.defineProperty(Blob.prototype, name, { enumerable: true });
     }
     brand(Blob, "Blob");
+    BlobClass = Blob;
+    TransferableBlobPrototype = Object.create(Blob.prototype);
     globalThis.Blob = Blob;
   }
 
@@ -3190,7 +3394,8 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       cache: state.cache,
     };
     const body = bodyStates.get(request) ?? null;
-    // A Blob that is not oam's own: its bytes are read before the request
+    // A Blob that is not oam's own or not all in memory (a file-backed one),
+    // or a FormData with such a file: its bytes are read before the request
     // goes out (oamFetch), as `flat.body` stays its stream until then.
     let collect = false;
     if (body !== null) {
@@ -3211,8 +3416,11 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         flat.body = body.stream;
         flat.duplex = "half";
         // undici sends a Blob's size as its content-length, and reads it
-        // again for a redirect.
-        if (body.kind === "blob" && untouched) collect = { size: body.size };
+        // again for a redirect; a FormData with a file-backed file in it
+        // has a known length too.
+        if ((body.kind === "blob" || body.kind === "formdata") && untouched) {
+          collect = { size: body.size };
+        }
       } else {
         flat.body = body.text ?? body.bytes;
       }
