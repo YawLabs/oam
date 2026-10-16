@@ -12963,7 +12963,8 @@
   // Where cpSync's C++ fails in a way that depends on the platform's
   // std::filesystem -- an error code or message the C++ library chooses,
   // or, for a directory to be made where a file is, an exception that
-  // aborts node -- oam fails as node does on Linux; see
+  // aborts node -- oam fails as node does on Linux (save the destination
+  // that cannot be made, which on Windows fails as node's does there); see
   // docs/node-divergences.md.
 
   // node's getValidatedPath for a copy's paths: checked as any path is, a
@@ -13192,8 +13193,10 @@
 
   // node's ErrnoException for a std::filesystem failure in cpSync's C++
   // (Environment::ThrowStdErrException): `<CODE>, <text> '<path>'`, with
-  // errno, code, syscall and path. The code and text are Linux's
-  // (libstdc++'s errno and strerror); see docs/node-divergences.md.
+  // errno, code, path and syscall. The code and text are Linux's
+  // (libstdc++'s errno and strerror), save the destination's
+  // create_directories on Windows (cpStdMkdirError); see
+  // docs/node-divergences.md.
   const CP_STRERROR = {
     EACCES: "Permission denied",
     EBUSY: "Device or resource busy",
@@ -13213,16 +13216,38 @@
     EACCES: 13, EBUSY: 16, EEXIST: 17, EINVAL: 22, EIO: 5, EISDIR: 21, ELOOP: 40, ENAMETOOLONG: 36, ENOENT: 2,
     ENOTDIR: 20, ENOTEMPTY: 39, ENOTSUP: 95, EPERM: 1,
   };
-  function cpStdError(code, syscall, path) {
-    const err = new Error(`${code}, ${CP_STRERROR[code] ?? code} '${path}'`);
-    err.errno = CP_LINUX_ERRNO[code];
+  // node's ErrnoException sets errno, code, path and then syscall (#360;
+  // measured on Windows and Linux): the order Object.keys shows.
+  function cpErrnoException(errno, code, text, syscall, path) {
+    const err = new Error(`${code}, ${text} '${path}'`);
+    err.errno = errno;
     err.code = code;
-    err.syscall = syscall;
     err.path = path;
+    err.syscall = syscall;
     return err;
+  }
+  function cpStdError(code, syscall, path) {
+    return cpErrnoException(CP_LINUX_ERRNO[code], code, CP_STRERROR[code] ?? code, syscall, path);
   }
   // The std::filesystem failure an fs call's error stands for.
   const cpStdErrorOf = (e, syscall, path) => cpStdError(e && typeof e.code === "string" ? e.code : "EIO", syscall, path);
+  // std::filesystem::create_directories failing for cpSync's destination.
+  // On Windows node reports MSVC's error: the Win32 code as `errno`, the
+  // name the CRT's errno table gives that number as `code` (none for 183,
+  // EIO for 5), and the system's message (measured on v22.22.2, Windows
+  // 11): a file in the way of the directory is ERROR_ALREADY_EXISTS, a
+  // directory that may not be written in ERROR_ACCESS_DENIED. Elsewhere,
+  // and for any other failure, libstdc++'s.
+  const CP_WIN_MKDIR = {
+    ENOTDIR: [183, "", "Cannot create a file when that file already exists."],
+    EACCES: [5, "EIO", "Access is denied."],
+    EPERM: [5, "EIO", "Access is denied."],
+  };
+  function cpStdMkdirError(e, path) {
+    const win = process.platform === "win32" && e ? CP_WIN_MKDIR[e.code] : undefined;
+    if (win) return cpErrnoException(win[0], win[1], win[2], "cp", path);
+    return cpStdErrorOf(e, "cp", path);
+  }
 
   // CpSyncCheckPaths: the checks cpSync makes once, on the paths it was
   // given, and the destination's parent made when it is missing.
@@ -13479,7 +13504,7 @@
     try {
       fs.mkdirSync(dest, { recursive: true });
     } catch (e) {
-      throw cpStdErrorOf(e, "cp", cpNs(dest));
+      throw cpStdMkdirError(e, cpNs(dest));
     }
     const statOrNull = (p, follow) => {
       try {
