@@ -4102,11 +4102,33 @@ differ by platform. oam fails each as node does on Linux (libstdc++), on every p
   in: node's C++ follows it until the path is too long, and aborts; oam fails `ELOOP`.
 
 The texts of oam's other std::filesystem-shaped failures in that copy (a link that
-cannot be made, a directory that cannot be created) are glibc's `strerror`, which is
-what node prints on Linux; on Windows node prints the system's message. Measured against
-v22.22.2 on Windows and Linux; macOS (libc++) is not measured. cp's and
+cannot be made, a directory below the top that cannot be created) are glibc's `strerror`,
+which is what node prints on Linux; on Windows node prints the system's message. The one
+exception is the destination itself when it cannot be created (`create_directories`): on
+Windows oam fails as node does there (#360, conformance case 532) -- a file in the way is
+`errno` 183, an empty `code` and `, Cannot create a file when that file already exists.
+'<path>'`, a directory that may not be written in `errno` 5, `EIO`, `Access is denied.` --
+and any other failure of it is Linux-shaped. All of them have node's key order (`errno`,
+`code`, `path`, `syscall`). Measured against v22.22.2 on Windows and Linux; macOS (libc++)
+is not measured. cp's and
 `fs.promises.cp`'s copies, and cpSync with a `filter`, are node's JS and match it
 (conformance case 410).
+
+### File streams through `options.fs`: what still differs
+
+`fs.ReadStream` and `fs.WriteStream` open, read, write, writev, fsync and close through
+`options.fs`, or the live `fs.*`, as node's do, with node's arguments and node's checks of
+`options.fs` (#356, conformance cases 530, 531 and 533). What is left is the timing of oam's
+own callback forms when such a stream calls them: oam's `fs.write` (and `fs.writev`) writes
+synchronously and calls back on a `process.nextTick`, where node's calls back from the thread
+pool, on a later turn of the event loop. So a stream whose `options.fs.write` forwards to
+`fs.write` has its write land sooner than node's, and batches what is written meanwhile
+differently. Measured on v22.22.2, Windows 11: `write("one")` before `'ready'`, then
+`cork()`, `write("two")`, `write("three")`, `uncork()`, `end("!")` after `'ready'` -- node
+writes `one`, then one writev of `two`, `three` and `!`; oam writes `one`, a writev of `two`
+and `three`, then `!`. The bytes in the file and `bytesWritten` are the same. A stream left
+on oam's own `fs` functions (the default) does not call them: it uses the natives behind
+them directly.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 

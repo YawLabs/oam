@@ -16,6 +16,28 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Fixed
+
+- **File streams open, read, write and close through `options.fs`, or the live `fs.*`, as node's
+  do.** `fs.createReadStream` and `fs.createWriteStream` opened, read, wrote and closed natively, so
+  neither an `options.fs` nor a function assigned over `fs.open`, `fs.read`, `fs.write`,
+  `fs.writev`, `fs.fsync` or `fs.close` (graceful-fs, mock-fs and test spies patch them) was ever
+  called. Each is now called with node's arguments -- `open` with the stream's path, flags and mode
+  as given; `read` into a buffer of the stream's own at its position; node's write loop, with a
+  short write followed by one for the rest -- and the `options.fs` methods a stream needs are
+  checked to be functions, in node's order, with node's `ERR_INVALID_ARG_TYPE`. A stream whose
+  `open` is its own (a subclass's, or one assigned) opens by calling it, and
+  `ReadStream.prototype.open` / `WriteStream.prototype.open` are node's deprecated no-ops
+  (DEP0135). `fs.writev` no longer calls a patched `fs.write`. (#356)
+- **`fs.cpSync` of a directory whose destination cannot be made fails as node's does.** The error
+  node's C++ raises has its keys in node's order (`errno`, `code`, `path`, `syscall`; oam put
+  `syscall` before `path`), and on Windows it is MSVC's, as node's is: a file in the way is
+  `errno` 183 with an empty `code` and "Cannot create a file when that file already exists.", a
+  directory that may not be written in `errno` 5, `EIO`, "Access is denied." -- where oam gave
+  Linux's `ENOTDIR` and `EPERM`. `fs.cp`, `cpSync` and `fs.promises.cp` making a missing
+  destination parent, and the async forms' `ENOTDIR` from `mkdir`, are now guarded by a
+  conformance case. (#360)
+
 ## [0.19.1] - 2026-10-13
 
 ### Changed
