@@ -414,6 +414,19 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   opens. The sync and promise forms skip an empty write in both runtimes.
 - **On Windows `stat` reports a directory's size as 0.** `statSync("C:\\").size` was the
   root's index allocation (12288 on NTFS); libuv reports 0 for every directory.
+- **Windows child processes honour `windowsHide` and stop paying for a console each.** Every child
+  was started with `CREATE_NO_WINDOW`, so each console child got a hidden conhost.exe of its own
+  (~35 ms a spawn), and `windowsHide` was ignored. The flags now follow libuv: `CREATE_NO_WINDOW`
+  only for `windowsHide: true` with no inherited slot, so by default a child shares oam's console;
+  a console-less oam still starts children windowless (divergence 53). `spawn`, `spawnSync` and
+  `fork` reject a non-boolean `windowsHide` with `ERR_INVALID_ARG_TYPE`, as node does. A spawn with
+  more than three stdio slots (CDP over pipes) read its pipes by polling with a 50 ms sleep; a read
+  now blocks in `ReadFile` and returns as data arrives, `destroy()` on such a stream closes the
+  pipe and cancels the read, and output written just before the child exits is read to the end.
+  Debug build, medians of 5 interleaved with node on a loaded box (ms): 20 echo round trips over
+  four slots 979 -> 8 (node 13); 20 `spawnSync` of `cmd /c exit` 3252 -> 1745 (node 1975), 20
+  `spawn` 3087 -> 1937; conformance case 394 102751 -> 44660 (node 33971), case 395 57015 ->
+  41855 (node 36880). Cases 450-452.
 
 ## [0.19.0] - 2026-10-11
 

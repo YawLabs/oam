@@ -170,6 +170,7 @@ pub(crate) fn signal_name(num: i32) -> String {
 /// `_detached` keeps the signature shared with child_win.rs, where it decides
 /// kill-on-close job membership. It is not yet honored here (node would
 /// `setsid()` the child); a POSIX child outlives its parent either way.
+/// `_windows_hide` is node's `windowsHide`, which node ignores on POSIX too.
 pub fn spawn_extra(
     command: &str,
     args: &[String],
@@ -177,6 +178,7 @@ pub fn spawn_extra(
     env: Option<&[(String, String)]>,
     stdio: &[StdioFd],
     _detached: bool,
+    _windows_hide: bool,
 ) -> Result<RawChild, String> {
     // Relocate child ends above every target index so the pre_exec dup2 cannot
     // alias a source onto another target.

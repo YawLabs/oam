@@ -22,7 +22,9 @@ use oam_core::child::child_kill;
 use oam_core::child_unix::{RawChildRegistry, StdioFd, raw_kill, raw_wait, spawn_extra};
 // The Windows raw backend exposes the same surface through the shared alias.
 #[cfg(windows)]
-use oam_core::child_extra::{RawChildRegistry, StdioFd, raw_kill, raw_wait, spawn_extra};
+use oam_core::child_extra::{
+    RawChildRegistry, StdioFd, raw_close_fd, raw_kill, raw_read, raw_wait, spawn_extra,
+};
 
 /// Spawn a child through `spawn_child` that BLOCKS draining stdin, and only
 /// after stdin EOF writes `marker` to stdout and exits. Gating the output on
@@ -48,7 +50,17 @@ fn spawn_echoer(marker: &str) -> (tokio::process::Child, u32) {
             format!("cat >/dev/null; printf '%s' '{marker}'"),
         ],
     );
-    spawn_child(command, args, None, None, false, stdio_pipe_all(), false).expect("spawn echoer")
+    spawn_child(
+        command,
+        args,
+        None,
+        None,
+        false,
+        stdio_pipe_all(),
+        false,
+        false,
+    )
+    .expect("spawn echoer")
 }
 
 /// Insert a spawned child into a fresh registry and return (registry, handle).
@@ -200,6 +212,7 @@ async fn deliver_kill_does_not_signal_exited_child() {
         false,
         stdio_pipe_all(),
         false,
+        false,
     )
     .expect("spawn immediate-exit child");
     let (reg, handle) = register(child, pid);
@@ -242,6 +255,7 @@ async fn raw_kill_after_exit_reports_real_exit() {
         None,
         None,
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
+        false,
         false,
     )
     .expect("spawn_extra immediate-exit child");
@@ -287,6 +301,7 @@ async fn raw_kill_during_wait_delivers_signal() {
         None,
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
         false,
+        false,
     )
     .expect("spawn_extra sleeper child");
     let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -316,6 +331,107 @@ async fn raw_kill_during_wait_delivers_signal() {
     );
 }
 
+/// Windows raw backend: a read blocked in ReadFile on a pipe the child never
+/// writes to is ended by a close of that end (a stream's `destroy()`), as
+/// EOF, instead of holding a pool thread for the child's whole life.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_close_fd_cancels_a_blocked_read_win() {
+    // cmd's stdout is the pipe; ping writes to NUL, so nothing ever arrives.
+    let raw = spawn_extra(
+        "cmd",
+        &["/c".to_string(), "ping -n 30 127.0.0.1 >nul".to_string()],
+        None,
+        None,
+        &[StdioFd::Ignore, StdioFd::ChildWrite, StdioFd::Ignore],
+        false,
+        false,
+    )
+    .expect("spawn_extra quiet sleeper");
+    let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = 1u64;
+    reg.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, raw);
+
+    let read = tokio::spawn(raw_read(reg.clone(), id, 1));
+    // Long enough for the read to be parked in ReadFile on the pool. A close
+    // that lands earlier is covered as well: the read then sees `closing`.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !read.is_finished(),
+        "nothing was written, so the read must still be blocked"
+    );
+    raw_close_fd(&reg, id, 1);
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+        .await
+        .expect("the close must cancel the blocked read (ping would hold it 30 s)")
+        .expect("read task join");
+    assert!(
+        matches!(outcome, OpOutcome::Done),
+        "a cancelled read is EOF, got {outcome:?}"
+    );
+
+    raw_kill(&reg, id, Some("SIGTERM".to_string()));
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), raw_wait(reg, id)).await;
+}
+
+/// Windows raw backend: what a child wrote before it exited is still read
+/// after its exit has been collected. raw_wait used to drop the whole entry,
+/// read ends included, so a read issued after it reported EOF with the
+/// child's output still sitting in the pipe.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_read_after_wait_still_drains_the_pipe_win() {
+    let raw = spawn_extra(
+        "cmd",
+        &["/c".to_string(), "echo drained".to_string()],
+        None,
+        None,
+        &[StdioFd::Ignore, StdioFd::ChildWrite, StdioFd::Ignore],
+        false,
+        false,
+    )
+    .expect("spawn_extra echo");
+    let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = 1u64;
+    reg.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, raw);
+
+    let exit = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        raw_wait(reg.clone(), id),
+    )
+    .await
+    .expect("cmd /c echo exits");
+    assert!(
+        matches!(exit, OpOutcome::Json(_)),
+        "exit report, got {exit:?}"
+    );
+
+    let mut got = Vec::new();
+    loop {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            raw_read(reg.clone(), id, 1),
+        )
+        .await
+        .expect("the read reaches EOF: the child is gone")
+        {
+            OpOutcome::Bytes(b) => got.extend_from_slice(&b),
+            OpOutcome::Done => break,
+            other => panic!("unexpected read outcome {other:?}"),
+        }
+    }
+    assert_eq!(String::from_utf8_lossy(&got), "drained\r\n");
+    assert!(
+        reg.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "the entry goes with its last read end"
+    );
+}
+
 /// T6 (windows): T5's shape on the Windows raw backend. child_win avoids the
 /// Unix bug by construction -- raw_wait only COPIES the process handle, so
 /// raw_kill still sees it during an in-flight wait -- but nothing executed
@@ -332,6 +448,7 @@ async fn raw_kill_during_wait_delivers_signal_win() {
         None,
         None,
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
+        false,
         false,
     )
     .expect("spawn_extra ping sleeper");
@@ -374,6 +491,7 @@ async fn raw_kill_before_wait_delivers_signal() {
         None,
         None,
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
+        false,
         false,
     )
     .expect("spawn_extra sleeper child");
@@ -420,6 +538,7 @@ async fn raw_kill_trapped_signal_reports_clean_exit() {
         None,
         None,
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
+        false,
         false,
     )
     .expect("spawn_extra trapping child");
