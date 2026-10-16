@@ -16410,6 +16410,12 @@
         const step = async () => {
           if (held.fd === undefined) {
             const info = await natives.fsOpen(file, flags, 0o666);
+            // A cancel that landed while the open was in flight found no fd
+            // to close: close this one here, or it stays open until GC.
+            if (done) {
+              natives.fsClose(info.handle);
+              return 0;
+            }
             held.fd = info.handle;
             blobFileFinalizer().register(reader, held, held);
           }
