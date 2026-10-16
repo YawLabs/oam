@@ -4162,12 +4162,13 @@ Measured on all three release platforms:
 
 | host | export names present | missing by name | in absent modules | modules absent |
 |---|---|---|---|---|
-| windows-aarch64 (Node v22.22.2) | 1500 / 1874 | 315 | 59 | 5 |
-| linux-x64 (Node v22.22.2) | 1480 / 1888 | 349 | 59 | 5 |
-| darwin-arm64 (Node v22.22.2) | 1480 / 1884 | 345 | 59 | 5 |
+| windows-aarch64 (Node v22.22.2) | 1555 / 1874 | 309 | 10 | 4 |
+| linux-x64 (Node v22.22.2) | 1530 / 1888 | 348 | 10 | 4 |
+| darwin-arm64 (Node v22.22.2) | 1530 / 1884 | 344 | 10 | 4 |
 
-"Present" subtracts both columns: the per-name gaps *and* the 59 export names living
-inside the 5 modules oam does not register at all (`sys` alone accounts for 49). The
+"Present" subtracts both columns: the per-name gaps *and* the 10 export names living
+inside the 4 modules oam does not register at all (`sys`, which held 49 of them, is
+`util` under its deprecated name since #368). The
 Node versions differ between hosts, which is part of why the totals do — the gate prints
 a note when a section's recorded Node does not match the one it is running against, so a
 version bump does not get read as an oam regression.
@@ -4195,8 +4196,8 @@ gate, and says so loudly. It also refuses to record a section whose gap count ha
 unless you pass `--allow-regression`, since laundering a regression into "known debt" is
 the one thing the ratchet exists to prevent.
 
-Five modules are absent outright rather than partial: `_stream_wrap`, `inspector/promises`,
-`sys` (the deprecated `util` alias), `wasi`, and `global:fetch.prototype`. The six `_http_*`
+Four modules are absent outright rather than partial: `_stream_wrap`, `inspector/promises`,
+`wasi`, and `global:fetch.prototype`. The six `_http_*`
 legacy names, `_tls_common` and `_tls_wrap` landed in 0.17.2 (divergence 49), with the few
 names of node's own plumbing they still lack recorded per name.
 
@@ -4208,7 +4209,7 @@ The largest per-module gaps (counts from windows-aarch64), all tracked in that f
 | `dns/promises` | 31 | `Resolver`, `getServers`/`setServers`, `lookupService`, `resolveTlsa`, and the `BADNAME`/`NOTFOUND`/… error-code constants. |
 | `module` | 25 | The `Module._*` loader internals (`_load`, `_resolveFilename`, `_cache`, `_extensions`), `register`, `SourceMap`/`findSourceMap`, the compile-cache API. |
 | `fs` | **0** | Closed in 0.9.1–0.9.2. Ownership and fd metadata (`chown`/`fchown`/`lchown`, `fchmod`/`lchmod`), durability (`fsync`/`fdatasync`), `ftruncate`, the `utimes`/`futimes`/`lutimes` family, `readv`/`writev`, `openAsBlob`, `statfs` and `glob`/`globSync` all landed. `node:fs` now has no missing export names on any platform, and `fs/promises` none since `watch` landed after 0.19.0. |
-| `crypto` | 12 | The legacy class constructors (`Hash`, `Hmac`, `Cipher(iv)`, `Decipher(iv)`), `diffieHellman`, `getCipherInfo`, `randomFill`. |
+| `crypto` | 10 | The legacy class constructors `Cipher(iv)` and `Decipher(iv)`, `diffieHellman`, `getCipherInfo`, `randomFill`. |
 | `stream/web` | 12 | The controller/reader/writer constructors and the queuing-strategy classes — the same constructors listed in the Web globals row above. |
 | `v8` | 8 | `DefaultSerializer`/`DefaultDeserializer`, `GCProfiler`, `promiseHooks`, `queryObjects`, `setHeapSnapshotNearHeapLimit`. |
 | `path` | 3 (one per of `path`, `path/posix`, `path/win32`) | `_makeLong` (a Windows long-path helper; not surfaced by `fs.glob`, which is in pure JS). |

@@ -7592,6 +7592,18 @@
       Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
     }
 
+    // node's util._extend: the source's own enumerable keys, assigned last
+    // to first; a source that is not an object leaves the target as it is.
+    function _extend(target, source) {
+      if (source === null || typeof source !== "object") return target;
+      const keys = Object.keys(source);
+      let i = keys.length;
+      while (i--) {
+        target[keys[i]] = source[keys[i]];
+      }
+      return target;
+    }
+
     // Codes that have already warned live in deprecationCodesWarned (above
     // the util factory): Node warns once per CODE, not once per wrapper.
     function deprecate(fn, msg, code) {
@@ -8611,7 +8623,18 @@
       deprecate,
       debuglog,
       debug: debuglog,
-      isArray: Array.isArray,
+      // Runtime-deprecated in node v22.22.2 (lib/util.js), each warning on
+      // its first call.
+      isArray: deprecate(
+        Array.isArray,
+        "The `util.isArray` API is deprecated. Please use `Array.isArray()` instead.",
+        "DEP0044",
+      ),
+      _extend: deprecate(
+        _extend,
+        "The `util._extend` API is deprecated. Please use Object.assign() instead.",
+        "DEP0060",
+      ),
       isDeepStrictEqual: (a, b) => deepEqualImpl(a, b, true),
       toUSVString: (val) => {
         var s = String(val);
@@ -18320,6 +18343,7 @@
       "_tls_common",
       "_tls_wrap",
       "string_decoder",
+      "sys",
       "timers",
       "timers/promises",
       "tls",
@@ -20638,12 +20662,34 @@
     }
 
     function createHash(algorithm) {
-      return new Hash(natives.cryptoHashCreate(String(algorithm)));
+      if (typeof algorithm !== "string") {
+        throw new codes.ERR_INVALID_ARG_TYPE("algorithm", "string", algorithm);
+      }
+      return new Hash(natives.cryptoHashCreate(algorithm));
     }
 
     function createHmac(algorithm, key) {
-      return new Hmac(natives.cryptoHmacCreate(String(algorithm), toBytes(key)));
+      if (typeof algorithm !== "string") {
+        throw new codes.ERR_INVALID_ARG_TYPE("hmac", "string", algorithm);
+      }
+      return new Hmac(natives.cryptoHmacCreate(algorithm, toBytes(key)));
     }
+
+    // node's crypto.Hash / crypto.Hmac: constructors that work with or
+    // without `new`, deprecated as constructors (DEP0179 / DEP0181) and
+    // exported behind util.deprecate, so `createHash(...) instanceof
+    // crypto.Hash` holds. Each builds what createHash / createHmac build.
+    function PublicHash(algorithm, options) {
+      return createHash(algorithm, options);
+    }
+    PublicHash.prototype = Hash.prototype;
+    function PublicHmac(hmac, key, options) {
+      return createHmac(hmac, key, options);
+    }
+    PublicHmac.prototype = Hmac.prototype;
+    const utilDeprecate = registry.get("util").deprecate;
+    const DeprecatedHash = utilDeprecate(PublicHash, "crypto.Hash constructor is deprecated.", "DEP0179");
+    const DeprecatedHmac = utilDeprecate(PublicHmac, "crypto.Hmac constructor is deprecated.", "DEP0181");
 
     function randomBytes(size, callback) {
       // Chunked: the native caps one call at 64KiB.
@@ -21755,6 +21801,8 @@
       },
       createHash,
       createHmac,
+      Hash: DeprecatedHash,
+      Hmac: DeprecatedHmac,
       randomBytes,
       pseudoRandomBytes: randomBytes,
       rng: randomBytes,
@@ -33894,7 +33942,27 @@
       socketWrite: Socket.prototype.write,
     };
 
+    // node's net._setSimultaneousAccepts (DEP0121): a libuv accept-mode knob
+    // for Windows pipe/TCP handles, which oam's servers do not have, so only
+    // its deprecation is real -- one warning, on the first call, and nothing
+    // returned. It takes `handle` on Windows and nothing elsewhere, as node's.
+    let warnSimultaneousAccepts = true;
+    function warnSetSimultaneousAccepts() {
+      if (warnSimultaneousAccepts) {
+        warnSimultaneousAccepts = false;
+        process.emitWarning(
+          "net._setSimultaneousAccepts() is deprecated and will be removed.",
+          "DeprecationWarning",
+          "DEP0121",
+        );
+      }
+    }
+    const _setSimultaneousAccepts = natives.platform === "win32"
+      ? function _setSimultaneousAccepts(handle) { warnSetSimultaneousAccepts(); }
+      : function _setSimultaneousAccepts() { warnSetSimultaneousAccepts(); };
+
     return {
+      _setSimultaneousAccepts,
       isIPv4, isIPv6, isIP,
       getDefaultAutoSelectFamilyAttemptTimeout,
       setDefaultAutoSelectFamilyAttemptTimeout,
@@ -34466,9 +34534,52 @@
   };
 
   // ------------------------------------------------------------- punycode
-  // Pure-JS Punycode (RFC 3492). Node marks this deprecated but it is still
-  // in widespread use via the `url` module and idn-related libraries.
+  // Whether code under node_modules is on the stack, as node's
+  // isInsideNodeModules(frameLimit, defaultValue) binding (node_util.cc,
+  // v22.22.2) answers it for the punycode deprecation: any frame whose script
+  // name contains "/node_modules/", builtin frames skipped, and the default
+  // when the stack is too deep to search. Only the forward-slash spelling
+  // counts, which is why node on Windows, whose paths are written with
+  // backslashes, warns even when a package loads punycode (probed: v22.22.2
+  // on win32 warns, on linux it does not).
+  function isInsideNodeModules(frameLimit, defaultValue) {
+    let frames;
+    const savedLimit = Error.stackTraceLimit;
+    const savedPrepare = Error.prepareStackTrace;
+    try {
+      Error.stackTraceLimit = frameLimit;
+      Error.prepareStackTrace = (_, callSites) => callSites;
+      const holder = {};
+      Error.captureStackTrace(holder, isInsideNodeModules);
+      frames = holder.stack;
+    } catch {
+      return defaultValue;
+    } finally {
+      try {
+        Error.stackTraceLimit = savedLimit;
+        Error.prepareStackTrace = savedPrepare;
+      } catch { /* a frozen Error keeps what it had */ }
+    }
+    if (!Array.isArray(frames) || frames.length >= frameLimit) return defaultValue;
+    for (const frame of frames) {
+      const name = frame.getScriptNameOrSourceURL?.() ?? frame.getFileName?.();
+      if (typeof name !== "string" || name === "") continue;
+      if (name.startsWith("node:") || name.startsWith("oam:")) continue;
+      if (name.includes("/node_modules/")) return true;
+    }
+    return false;
+  }
+
+  // Pure-JS Punycode (RFC 3492), node's punycode.js 2.1.0. Runtime-deprecated
+  // (DEP0040) when it is first loaded, unless a package is loading it.
   registry.factories.punycode = () => {
+    if (!isInsideNodeModules(100, true)) {
+      process.emitWarning(
+        "The `punycode` module is deprecated. Please use a userland alternative instead.",
+        "DeprecationWarning",
+        "DEP0040",
+      );
+    }
     const BASE = 36, TMIN = 1, TMAX = 26, SKEW = 38, DAMP = 700, BIAS_INIT = 72;
     const MAXINT = 2147483647;
     const DELIMITER = "\x2D";
@@ -34588,12 +34699,22 @@
     }
 
     return {
-      decode, encode, toASCII, toUnicode,
+      version: "2.1.0",
       ucs2: {
         decode: (str) => [...str].map((c) => c.codePointAt(0)),
         encode: (cps) => String.fromCodePoint(...cps),
       },
+      decode, encode, toASCII, toUnicode,
     };
+  };
+
+  // ------------------------------------------------------------------ sys
+  // node's lib/sys.js: util under its old name, deprecated (DEP0025) when it
+  // is first loaded.
+  registry.factories.sys = () => {
+    const util = registry.get("util");
+    process.emitWarning("sys is deprecated. Use util instead.", "DeprecationWarning", "DEP0025");
+    return util;
   };
 
   // ----------------------------------------------------------- perf_hooks
