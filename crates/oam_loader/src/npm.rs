@@ -1587,6 +1587,101 @@ mod tests {
         assert!(!kind_from_syntax(&jsx_outside));
     }
 
+    /// node never reads a `package.json` that sits directly in a `node_modules`
+    /// directory: `TraverseParent` stops AT the boundary and
+    /// `GetPackageScopeConfig` refuses a `/node_modules/package.json` path. The
+    /// guard order in `package_scope` is what enforces it, and swapping the two
+    /// guards leaves the boundary test above green (it plants the manifest only
+    /// in `proj/`), so this pins the behavior on the exact file that regressed.
+    #[test]
+    fn package_scope_ignores_a_manifest_directly_in_node_modules() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-nm1-{}", std::process::id()));
+        let nm = dir.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        // A manifest IN node_modules declared CommonJS, the shape that makes a
+        // swapped guard misclassify an `export` file as CommonJS.
+        std::fs::write(
+            nm.join("package.json"),
+            serde_json::to_string(&json!({ "type": "commonjs" })).unwrap(),
+        )
+        .unwrap();
+        let dep = nm.join("dep.js");
+        std::fs::write(&dep, "export const v = 1;\n").unwrap();
+        // No project manifest above, so the walk must find nothing.
+        assert_eq!(
+            package_scope(&dep),
+            None,
+            "a package.json directly in node_modules must not scope its files"
+        );
+        // And the file's kind follows node: decided by syntax (module), not the
+        // ignored CommonJS "type".
+        assert!(kind_from_syntax(&dep));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the same guard: a REAL package's own manifest under
+    /// `node_modules/pkg/package.json` is still read (node reads it; only the
+    /// file literally at `node_modules/package.json` is skipped). A fix that
+    /// skipped every manifest under a `node_modules` path would pass the test
+    /// above but break package-level `"type"`.
+    #[test]
+    fn package_scope_reads_a_real_package_manifest_under_node_modules() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-nm2-{}", std::process::id()));
+        let pkg = dir.join("node_modules").join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            serde_json::to_string(&json!({ "type": "module" })).unwrap(),
+        )
+        .unwrap();
+        let index = pkg.join("index.js");
+        std::fs::write(&index, "console.log(typeof require);\n").unwrap();
+        assert_eq!(
+            package_scope(&index),
+            Some(pkg.join("package.json")),
+            "a real package's own manifest under node_modules is read"
+        );
+        assert_eq!(module_kind(&index), ModuleKind::Esm);
+        assert!(
+            !kind_from_syntax(&index),
+            "a declared \"type\" means node never tests the syntax"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The walk STOPS at a `node_modules` directory rather than continuing past
+    /// it to an outer manifest: a file directly in `node_modules` (not inside a
+    /// package dir) finds no scope even when a project manifest exists directly
+    /// above, because node's `TraverseParent` breaks at the boundary instead of
+    /// climbing to `dir/package.json`.
+    #[test]
+    fn package_scope_stops_at_the_node_modules_boundary() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-nm3-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            serde_json::to_string(&json!({ "type": "module" })).unwrap(),
+        )
+        .unwrap();
+        let dep = dir.join("node_modules").join("dep.js");
+        std::fs::write(&dep, "console.log(typeof require);\n").unwrap();
+        assert_eq!(
+            package_scope(&dep),
+            None,
+            "the walk must stop at node_modules, not climb to the project manifest"
+        );
+        // No scope found, so node decides this typeless .js by its syntax --
+        // the walk stopping means the project's "type": "module" does NOT reach
+        // a file in node_modules.
+        assert!(kind_from_syntax(&dep));
+        // A file in the project (outside node_modules) still finds the manifest.
+        let src = dir.join("src").join("app.js");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(&src, "").unwrap();
+        assert_eq!(package_scope(&src), Some(dir.join("package.json")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn kind_from_syntax_follows_the_package_type() {
         let dir = std::env::temp_dir().join(format!("oam-npm-9b-{}", std::process::id()));

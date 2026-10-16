@@ -119,13 +119,8 @@ fn throw_syntax_error_with_code(scope: &mut v8::PinScope<'_, '_>, code: &str, me
 /// top-level `const global = ...` (or `let`/`class global`) in a typeless `.js`
 /// into `Identifier 'global' has already been declared`, where node runs it.
 /// `global` is reachable as `globalThis.global` (set in js/node_compat.js).
-pub(crate) const CJS_PARAMS: [&str; 5] = [
-    "exports",
-    "require",
-    "module",
-    "__filename",
-    "__dirname",
-];
+pub(crate) const CJS_PARAMS: [&str; 5] =
+    ["exports", "require", "module", "__filename", "__dirname"];
 
 /// Replace a leading `#!` shebang with a `//` comment, byte-for-byte so every
 /// source offset is preserved. Shared so the loader, the bytecode producer, and
@@ -1409,5 +1404,26 @@ impl crate::JsRuntime {
             Some(failures) => Err(failures),
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CJS_PARAMS;
+
+    /// The wrapper must be node's `Module.wrapper` exactly -- the five names,
+    /// nothing extra. An added `global` (oam carried one) makes a typeless
+    /// `.js` with a top-level `const global` fail `Identifier 'global' has
+    /// already been declared`, where node runs it; a missing name breaks
+    /// `require`/`module`/`__dirname` in every CJS module. The conformance case
+    /// covers the behavior; this pins the list itself so a one-line edit is
+    /// caught even if the case's fixture drifts.
+    #[test]
+    fn wrapper_params_are_node_s_exact_list() {
+        assert_eq!(
+            CJS_PARAMS,
+            ["exports", "require", "module", "__filename", "__dirname"],
+            "the CommonJS wrapper parameters must match node's Module.wrapper"
+        );
     }
 }

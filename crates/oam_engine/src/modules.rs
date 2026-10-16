@@ -3272,3 +3272,74 @@ mod fs_os_path_agreement_tests {
         }
     }
 }
+
+/// `path_to_file_url` must percent-encode exactly what node's `ada` path
+/// encoder does, since it feeds `import.meta.url` and the
+/// MODULE_TYPELESS_PACKAGE_JSON warning. The expected set is the one node
+/// v22.22.2's `url.pathToFileURL` produces (measured over every printable
+/// ASCII character plus é/中/😀); the `[`/`]`/`~` entries are the ones a
+/// minimal "space/#/?/%" encoder missed, and `[`/`]` appear in real names (a
+/// Next.js `[id].js` route). Backslashes are normalized to `/` before the
+/// percent pass, so a rooted Windows path yields no `%5C`.
+#[cfg(test)]
+mod path_to_file_url_tests {
+    use super::path_to_file_url;
+    use std::path::Path;
+
+    #[test]
+    fn encodes_ada_s_ascii_set_and_not_the_rest() {
+        // (char, expected encoded form) for the full ada set. A backslash is
+        // NOT here: it is normalized to `/` before the percent pass (see
+        // `normalizes_backslashes_without_percent_encoding_them`).
+        let encoded = [
+            (' ', "%20"),
+            ('"', "%22"),
+            ('#', "%23"),
+            ('%', "%25"),
+            ('<', "%3C"),
+            ('>', "%3E"),
+            ('?', "%3F"),
+            ('[', "%5B"),
+            (']', "%5D"),
+            ('^', "%5E"),
+            ('`', "%60"),
+            ('{', "%7B"),
+            ('|', "%7C"),
+            ('}', "%7D"),
+            ('~', "%7E"),
+        ];
+        for (ch, want) in encoded {
+            let url = path_to_file_url(Path::new(&format!("/p/a{ch}b.js")));
+            assert!(
+                url.ends_with(&format!("a{want}b.js")),
+                "{ch:?} must encode to {want}, got {url}"
+            );
+        }
+        // Characters ada leaves literal must NOT be encoded.
+        for ch in [
+            '!', '$', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/', ':', ';', '=', '@', '_',
+        ] {
+            let url = path_to_file_url(Path::new(&format!("/p/a{ch}b.js")));
+            assert!(
+                url.ends_with(&format!("a{ch}b.js")),
+                "{ch:?} must stay literal, got {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn encodes_non_ascii_as_utf8_bytes() {
+        assert!(path_to_file_url(Path::new("/p/café.js")).ends_with("caf%C3%A9.js"));
+        assert!(path_to_file_url(Path::new("/p/中.js")).ends_with("%E4%B8%AD.js"));
+        assert!(path_to_file_url(Path::new("/p/😀.js")).ends_with("%F0%9F%98%80.js"));
+    }
+
+    #[test]
+    fn normalizes_backslashes_without_percent_encoding_them() {
+        // A Windows path: separators become `/`, and the drive is prefixed so a
+        // bare `C:` does not read as a URL scheme.
+        let url = path_to_file_url(Path::new(r"C:\Users\app\mod.js"));
+        assert_eq!(url, "file:///C:/Users/app/mod.js");
+        assert!(!url.contains("%5C"), "no encoded backslash: {url}");
+    }
+}
