@@ -12426,6 +12426,12 @@
     // -- `options.fs`, or the fs module itself; null over a FileHandle,
     // which goes through the handle.
     const kFs = Symbol("kFs");
+    // node's ReadStream.prototype.open and WriteStream.prototype.open:
+    // deprecated no-ops (DEP0135), there so that a stream can tell an
+    // `open` of its own from them.
+    const { deprecate } = registry.get("util");
+    const openReadFs = deprecate(function () {}, "ReadStream.prototype.open() is deprecated", "DEP0135");
+    const openWriteFs = deprecate(function () {}, "WriteStream.prototype.open() is deprecated", "DEP0135");
     // node's validateFunction on one of the `options.fs` methods it needs.
     const validateFsMethod = (ops, name) => {
       const fn = ops[name];
@@ -12490,6 +12496,27 @@
     // the open, not the constructor.
     function constructStream(stream, callback) {
       if (stream[kSupplied]) { callback(); return; }
+      if (stream.open !== openWriteFs && stream.open !== openReadFs) {
+        // node's backwards compatibility for a stream whose `open` is its
+        // own (a subclass's, or one assigned): that open is called, and the
+        // stream is constructed at the first 'open' it emits, or failed at
+        // the first 'error'.
+        const orgEmit = stream.emit;
+        stream.emit = function (...args) {
+          if (args[0] === "open") {
+            this.emit = orgEmit;
+            callback();
+            Reflect.apply(orgEmit, this, args);
+          } else if (args[0] === "error") {
+            this.emit = orgEmit;
+            callback(args[1]);
+          } else {
+            Reflect.apply(orgEmit, this, args);
+          }
+        };
+        stream.open();
+        return;
+      }
       const open = fsOverride(stream, "open");
       if (open) {
         // node's: the path, flags and mode as the stream holds them, and
@@ -12783,6 +12810,7 @@
       }
     }
     Object.defineProperty(ReadStream.prototype, "autoClose", autoCloseOver("_readableState"));
+    ReadStream.prototype.open = openReadFs;
 
     class WriteStream extends Writable {
       // Node v22 WriteStream.prototype.close: end, then wait for 'close'. A
@@ -12921,6 +12949,7 @@
       }
     }
     Object.defineProperty(WriteStream.prototype, "autoClose", autoCloseOver("_writableState"));
+    WriteStream.prototype.open = openWriteFs;
     // node: `WriteStream.prototype.destroySoon = WriteStream.prototype.end`.
     WriteStream.prototype.destroySoon = WriteStream.prototype.end;
     _rwStreams = { ReadStream, WriteStream };
