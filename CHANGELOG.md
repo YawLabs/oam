@@ -16,6 +16,39 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Added
+
+- **`--trace-warnings` and `--trace-deprecation`, and node's hint that names them.** Both flags
+  are accepted on the command line and in `NODE_OPTIONS`, set `process.traceProcessWarnings` /
+  `process.traceDeprecation`, and make the default warning printer write the warning's stack (for
+  every warning, or for deprecations only) in place of its one-line text. Without them, the first
+  warning printed carries node's one-time hint, `(Use \`oam --trace-warnings ...\` to show where
+  the warning was created)`, naming the flag for its kind (#364).
+
+### Fixed
+
+- **`MaxListenersExceededWarning` is a process warning, as in node.** Past an `EventEmitter`'s
+  listener limit oam printed its own line with `console.warn`, which `--no-warnings` and a program
+  handling warnings itself could not stop. It now goes through `process.emitWarning` with node's
+  text and the `emitter`, `type` and `count` fields, and an `EventTarget` (including an
+  `AbortSignal` given a limit) warns too, once per target, with `target` in place of `emitter`. A
+  target takes `events.defaultMaxListeners` when it is made; `events.setMaxListeners(n)` with no
+  target sets that default, and it validates `n` and its targets as node's does. An `EventTarget`
+  and an `AbortSignal` now inspect as node's (`EventTarget {}`, `AbortSignal { aborted: false }`)
+  (#365).
+- **`process.emitWarning` reads its type and code as node's does.** An empty or falsy `type`
+  (positional, or in the options form) gives the name `Warning` instead of an empty name, and a
+  bad `type` or `code` is reported as the `"type"` / `"code"` argument, never as an `options.`
+  property; a `DeprecationWarning` under `process.noDeprecation` is dropped even when
+  `process.throwDeprecation` is set (#367).
+- **The deprecations node v22.22.2 emits at runtime, and the legacy names they guard.** `punycode`
+  warns DEP0040 when first loaded (not when a package loads it, outside Windows -- node's own
+  check), and has its `version`; `util.isArray` warns DEP0044; `util._extend` (DEP0060),
+  `net._setSimultaneousAccepts` (DEP0121) and `require("sys")` (DEP0025, `util` under its old
+  name, in `module.builtinModules` too) are there; `crypto.Hash` and `crypto.Hmac` construct, with
+  or without `new`, and warn DEP0179 / DEP0181. `createHash` / `createHmac` throw node's
+  `ERR_INVALID_ARG_TYPE` for a non-string algorithm (#368).
+
 ## [0.19.1] - 2026-10-13
 
 ### Changed
