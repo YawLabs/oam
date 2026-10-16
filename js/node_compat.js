@@ -4328,10 +4328,15 @@
 
     // node's events.setMaxListeners(n = defaultMaxListeners, ...eventTargets):
     // with no target it sets the default; a new limit lets a target warn
-    // again.
+    // again. n is checked as node's validateNumber(n, 'setMaxListeners', 0)
+    // checks it, and setMaxListeners is read off any other target as node
+    // reads it, so a null or undefined one is V8's own TypeError.
     function setMaxListeners(n = EventEmitter.defaultMaxListeners, ...eventTargets) {
-      if (typeof n !== "number" || n < 0 || Number.isNaN(n)) {
-        throw new codes.ERR_OUT_OF_RANGE("n", "a non-negative number", n);
+      if (typeof n !== "number") {
+        throw new codes.ERR_INVALID_ARG_TYPE("setMaxListeners", "number", n);
+      }
+      if (n < 0 || Number.isNaN(n)) {
+        throw new codes.ERR_OUT_OF_RANGE("setMaxListeners", ">= 0", n);
       }
       if (eventTargets.length === 0) {
         EventEmitter.defaultMaxListeners = n;
@@ -4341,7 +4346,7 @@
         if (target instanceof EventTarget) {
           target[kMaxEventTargetListeners] = n;
           target[kMaxEventTargetListenersWarned] = false;
-        } else if (typeof target?.setMaxListeners === "function") {
+        } else if (typeof target.setMaxListeners === "function") {
           target.setMaxListeners(n);
         } else {
           throw new codes.ERR_INVALID_ARG_TYPE("eventTargets", ["EventEmitter", "EventTarget"], target);
