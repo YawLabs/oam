@@ -31,56 +31,134 @@
 "use strict";
 (() => {
   // ---------------------------------------------------------------- utf-8
+  // The one UTF-8 encoder behind TextEncoder, Buffer.from / write /
+  // byteLength and the utf8Write family. It writes straight into the
+  // destination: encoding into a temporary and copying that over made
+  // Buffer.from(string) ~4x and Buffer.byteLength ~10x slower than node.
+  //
+  // Semantics are V8's String::WriteUtf8 with REPLACE_INVALID_UTF8 (what node
+  // calls) and WHATWG's encodeInto, which agree: a surrogate pair is one
+  // 4-byte character, a LONE surrogate is U+FFFD (3 bytes), and a character
+  // that does not fit in the room left is not written at all -- never a
+  // partial sequence -- and ends the write.
+
+  // UTF-16 code units consumed by the last utf8WriteInto: TextEncoder's
+  // encodeInto reports it as `read`. A side channel rather than a returned
+  // pair, so the Buffer hot paths allocate nothing.
+  let utf8Read = 0;
+
+  // Strings longer than this many code units are counted by V8 natively
+  // (crates/oam_engine/src/buffer_ops.rs): its count is several times faster
+  // per code unit than the loop below, which wins on short strings because
+  // a native call has a fixed cost of its own (~0.5 us in a debug build).
+  const NATIVE_UTF8_LENGTH = 128;
+  let nativeUtf8Length = null;
+
+  // Bytes `str` encodes to: node's Buffer.byteLength(str), V8's Utf8Length.
+  function utf8Length(str) {
+    const n = str.length;
+    if (n > NATIVE_UTF8_LENGTH) {
+      // Looked up on first use: __oam.node is installed after the snapshot
+      // is restored, and nothing counts a long string before that.
+      if (nativeUtf8Length === null) nativeUtf8Length = globalThis.__oam.node.bufferUtf8Length;
+      return nativeUtf8Length(str);
+    }
+    let len = n;
+    for (let i = 0; i < n; i++) {
+      const c = str.charCodeAt(i);
+      if (c < 0x80) continue;
+      if (c < 0x800) {
+        len += 1;
+      } else if (
+        c >= 0xd800 &&
+        c <= 0xdbff &&
+        i + 1 < n &&
+        (str.charCodeAt(i + 1) & 0xfc00) === 0xdc00
+      ) {
+        // A pair: two code units, four bytes.
+        len += 2;
+        i++;
+      } else {
+        // The rest of the BMP and a lone surrogate (U+FFFD): three bytes.
+        len += 2;
+      }
+    }
+    return len;
+  }
+
+  // Encode `str` into `dst` from index `offset`, at most `max` bytes; return
+  // the bytes written. `dst` must have room for offset + max.
+  function utf8WriteInto(dst, str, offset, max) {
+    const n = str.length;
+    const end = offset + max;
+    let o = offset;
+    let i = 0;
+    for (; i < n; i++) {
+      let c = str.charCodeAt(i);
+      if (c < 0x80) {
+        if (o >= end) break;
+        dst[o++] = c;
+        continue;
+      }
+      if (c < 0x800) {
+        if (o + 2 > end) break;
+        dst[o++] = 0xc0 | (c >> 6);
+        dst[o++] = 0x80 | (c & 63);
+        continue;
+      }
+      if ((c & 0xf800) === 0xd800) {
+        if (c <= 0xdbff && i + 1 < n) {
+          const d = str.charCodeAt(i + 1);
+          if ((d & 0xfc00) === 0xdc00) {
+            if (o + 4 > end) break;
+            const cp = ((c - 0xd800) << 10) + (d - 0xdc00) + 0x10000;
+            dst[o++] = 0xf0 | (cp >> 18);
+            dst[o++] = 0x80 | ((cp >> 12) & 63);
+            dst[o++] = 0x80 | ((cp >> 6) & 63);
+            dst[o++] = 0x80 | (cp & 63);
+            i++;
+            continue;
+          }
+        }
+        c = 0xfffd;
+      }
+      if (o + 3 > end) break;
+      dst[o++] = 0xe0 | (c >> 12);
+      dst[o++] = 0x80 | ((c >> 6) & 63);
+      dst[o++] = 0x80 | (c & 63);
+    }
+    utf8Read = i;
+    return o - offset;
+  }
+
   class TextEncoder {
     get encoding() {
       return "utf-8";
     }
     encode(input = "") {
       const str = String(input);
-      const out = new Uint8Array(str.length * 3);
-      let o = 0;
-      for (let i = 0; i < str.length; i++) {
-        let cp = str.codePointAt(i);
-        if (cp > 0xffff) i++;
-        // Lone surrogates encode as U+FFFD, per WHATWG.
-        if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd;
-        if (cp < 0x80) {
-          out[o++] = cp;
-        } else if (cp < 0x800) {
-          out[o++] = 0xc0 | (cp >> 6);
-          out[o++] = 0x80 | (cp & 63);
-        } else if (cp < 0x10000) {
-          out[o++] = 0xe0 | (cp >> 12);
-          out[o++] = 0x80 | ((cp >> 6) & 63);
-          out[o++] = 0x80 | (cp & 63);
-        } else {
-          out[o++] = 0xf0 | (cp >> 18);
-          out[o++] = 0x80 | ((cp >> 12) & 63);
-          out[o++] = 0x80 | ((cp >> 6) & 63);
-          out[o++] = 0x80 | (cp & 63);
-        }
-      }
-      return out.slice(0, o);
+      // Measure, then encode into an exact-size array: no over-allocation
+      // and no trailing slice copy.
+      const out = new Uint8Array(utf8Length(str));
+      utf8WriteInto(out, str, 0, out.length);
+      return out;
     }
     encodeInto(source, destination) {
-      const bytes = this.encode(source);
-      const written = Math.min(bytes.length, destination.length);
-      destination.set(bytes.subarray(0, written));
-      // `read` is approximate when truncation splits a code point; exact
-      // accounting arrives with the native encoder.
-      let read = 0;
-      let count = 0;
-      const str = String(source);
-      while (read < str.length) {
-        const cp = str.codePointAt(read);
-        const size = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
-        if (count + size > written) break;
-        count += size;
-        read += cp > 0xffff ? 2 : 1;
+      // node validates both (validateString, isUint8Array) before encoding.
+      if (typeof source !== "string") throw argTypeOfError("src", "string", source);
+      if (typedArrayTag.call(destination) !== "Uint8Array") {
+        throw argTypeError("dest", "Uint8Array", destination);
       }
-      return { read, written: count };
+      const written = utf8WriteInto(destination, source, 0, destination.length);
+      return { read: utf8Read, written };
     }
   }
+  // %TypedArray%.prototype[@@toStringTag]: the realm-independent brand check
+  // node's isUint8Array makes (undefined for anything not a TypedArray).
+  const typedArrayTag = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(Uint8Array.prototype),
+    Symbol.toStringTag,
+  ).get;
 
   // WHATWG Encoding "get an encoding": labels are ASCII-whitespace-trimmed
   // and ASCII-lowercased before lookup. oam implements two of the standard's
@@ -201,75 +279,84 @@
       ) {
         i = 3;
       }
-      let out = "";
-      const fail = (at) => {
-        if (this.fatal) throw new TypeError(`TextDecoder: invalid UTF-8 at byte ${at}`);
-        out += "�";
-      };
-      while (i < bytes.length) {
-        const b = bytes[i];
-        if (b < 0x80) {
-          out += String.fromCharCode(b);
-          i++;
-        } else if (b >= 0xc2 && b <= 0xdf) {
-          if (i + 1 < bytes.length && (bytes[i + 1] & 0xc0) === 0x80) {
-            out += String.fromCharCode(((b & 31) << 6) | (bytes[i + 1] & 63));
-            i += 2;
-          } else {
-            fail(i);
-            i++;
-          }
-        } else if (b >= 0xe0 && b <= 0xef) {
-          const b1 = bytes[i + 1];
-          const b2 = bytes[i + 2];
-          const lower = b === 0xe0 ? 0xa0 : 0x80;
-          const upper = b === 0xed ? 0x9f : 0xbf;
-          if (
-            i + 2 < bytes.length &&
-            b1 >= lower &&
-            b1 <= upper &&
-            (b2 & 0xc0) === 0x80
-          ) {
-            out += String.fromCharCode(((b & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63));
-            i += 3;
-          } else {
-            // WHATWG "maximal subpart": one U+FFFD stands for the whole
-            // invalid prefix, so resume PAST the bytes that were valid.
-            // Advancing a single byte re-decoded the continuation bytes as
-            // fresh leads and emitted extra replacement characters.
-            fail(i);
-            i += i + 1 < bytes.length && b1 >= lower && b1 <= upper ? 2 : 1;
-          }
-        } else if (b >= 0xf0 && b <= 0xf4) {
-          const b1 = bytes[i + 1];
-          const b2 = bytes[i + 2];
-          const b3 = bytes[i + 3];
-          const lower = b === 0xf0 ? 0x90 : 0x80;
-          const upper = b === 0xf4 ? 0x8f : 0xbf;
-          if (
-            i + 3 < bytes.length &&
-            b1 >= lower &&
-            b1 <= upper &&
-            (b2 & 0xc0) === 0x80 &&
-            (b3 & 0xc0) === 0x80
-          ) {
-            const cp =
-              ((b & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63);
-            out += String.fromCodePoint(cp);
-            i += 4;
-          } else {
-            fail(i);
-            if (!(i + 1 < bytes.length && b1 >= lower && b1 <= upper)) i += 1;
-            else if (!(i + 2 < bytes.length && (b2 & 0xc0) === 0x80)) i += 2;
-            else i += 3;
-          }
+      return utf8DecodeRange(bytes, i, bytes.length, this.fatal);
+    }
+  }
+
+  // The JS UTF-8 decoder, shared by TextDecoder and by Buffer's short spans
+  // (decodeRange): bytes [i, end) of `bytes`, with WHATWG replacement -- one
+  // U+FFFD per maximal invalid subpart, which is also what V8's decoder (the
+  // one node's Buffer#toString uses) emits -- or, when `fatal`, a TypeError
+  // at the first invalid byte.
+  function utf8DecodeRange(bytes, i, end, fatal) {
+    let out = "";
+    const fail = (at) => {
+      if (fatal) throw new TypeError(`TextDecoder: invalid UTF-8 at byte ${at}`);
+      out += "�";
+    };
+    while (i < end) {
+      const b = bytes[i];
+      if (b < 0x80) {
+        out += String.fromCharCode(b);
+        i++;
+      } else if (b >= 0xc2 && b <= 0xdf) {
+        if (i + 1 < end && (bytes[i + 1] & 0xc0) === 0x80) {
+          out += String.fromCharCode(((b & 31) << 6) | (bytes[i + 1] & 63));
+          i += 2;
         } else {
           fail(i);
           i++;
         }
+      } else if (b >= 0xe0 && b <= 0xef) {
+        const b1 = bytes[i + 1];
+        const b2 = bytes[i + 2];
+        const lower = b === 0xe0 ? 0xa0 : 0x80;
+        const upper = b === 0xed ? 0x9f : 0xbf;
+        if (
+          i + 2 < end &&
+          b1 >= lower &&
+          b1 <= upper &&
+          (b2 & 0xc0) === 0x80
+        ) {
+          out += String.fromCharCode(((b & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63));
+          i += 3;
+        } else {
+          // WHATWG "maximal subpart": one U+FFFD stands for the whole
+          // invalid prefix, so resume PAST the bytes that were valid.
+          // Advancing a single byte re-decoded the continuation bytes as
+          // fresh leads and emitted extra replacement characters.
+          fail(i);
+          i += i + 1 < end && b1 >= lower && b1 <= upper ? 2 : 1;
+        }
+      } else if (b >= 0xf0 && b <= 0xf4) {
+        const b1 = bytes[i + 1];
+        const b2 = bytes[i + 2];
+        const b3 = bytes[i + 3];
+        const lower = b === 0xf0 ? 0x90 : 0x80;
+        const upper = b === 0xf4 ? 0x8f : 0xbf;
+        if (
+          i + 3 < end &&
+          b1 >= lower &&
+          b1 <= upper &&
+          (b2 & 0xc0) === 0x80 &&
+          (b3 & 0xc0) === 0x80
+        ) {
+          const cp =
+            ((b & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63);
+          out += String.fromCodePoint(cp);
+          i += 4;
+        } else {
+          fail(i);
+          if (!(i + 1 < end && b1 >= lower && b1 <= upper)) i += 1;
+          else if (!(i + 2 < end && (b2 & 0xc0) === 0x80)) i += 2;
+          else i += 3;
+        }
+      } else {
+        fail(i);
+        i++;
       }
-      return out;
     }
+    return out;
   }
 
   // node brands each of these with Symbol.toStringTag, so
@@ -287,14 +374,26 @@
   });
   globalThis.TextEncoder = TextEncoder;
   globalThis.TextDecoder = TextDecoder;
-  const utf8Encoder = new TextEncoder();
-  // Buffer#toString never strips a BOM (Node parity) â€” only the WHATWG
-  // TextDecoder default does.
-  const utf8Decoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
   // ---------------------------------------------------------------- Buffer
   function normalizeEncoding(enc) {
-    const e = String(enc === undefined ? "utf8" : enc).toLowerCase();
+    if (enc === undefined) return "utf8";
+    // The canonical spellings first, compared as given: lower-casing every
+    // label allocated a string on every toString(enc) / from(str, enc), a
+    // measurable share of a short buffer's whole encode or decode.
+    switch (enc) {
+      case "utf8":
+        return "utf8";
+      case "hex":
+        return "hex";
+      case "base64":
+        return "base64";
+      case "latin1":
+        return "latin1";
+      case "ascii":
+        return "ascii";
+    }
+    const e = String(enc).toLowerCase();
     switch (e) {
       case "utf8":
       case "utf-8":
@@ -331,25 +430,30 @@
     return table;
   })();
 
-  function decodeBase64Lenient(str) {
-    const out = new Uint8Array(((str.length * 3) >> 2) + 3);
-    let o = 0;
+  // Decode base64 / base64url `str` straight into `dst` from `offset`, at
+  // most `max` bytes; return the bytes written. Like hex, node decodes from a
+  // one-byte copy of the string, so only a code unit's LOW byte counts:
+  // U+013D reads as '=' and ends the data, U+0151 reads as 'Q' (measured on
+  // v22.22.2).
+  function base64WriteInto(dst, str, offset, max) {
+    let o = offset;
+    const end = offset + max;
     let acc = 0;
     let bits = 0;
-    for (let i = 0; i < str.length; i++) {
-      const c = str.charCodeAt(i);
+    for (let i = 0; i < str.length && o < end; i++) {
+      const c = str.charCodeAt(i) & 0xff;
       if (c === 0x3d) break; // '=' ends the data
-      if (c === 0x20 || (c >= 0x09 && c <= 0x0d)) continue; // whitespace
-      const v = c < 256 ? B64_LOOKUP[c] : -1;
-      if (v === -1) continue; // Node SKIPS junk (only '=' terminates), not break
-      acc = (acc << 6) | v;
+      const v = B64_LOOKUP[c];
+      // Node SKIPS junk and whitespace alike (only '=' terminates).
+      if (v === -1) continue;
+      acc = ((acc << 6) | v) & 0xffffff;
       bits += 6;
       if (bits >= 8) {
         bits -= 8;
-        out[o++] = (acc >> bits) & 0xff;
+        dst[o++] = (acc >> bits) & 0xff;
       }
     }
-    return out.subarray(0, o);
+    return o - offset;
   }
 
   // Node-shaped error codes: each entry creates a typed error with .code
@@ -1658,118 +1762,216 @@
   });
 
 
-  function bytesFromString(str, enc) {
-    const encoding = normalizeEncoding(enc);
-    switch (encoding) {
+  // ------------------------------------------------- Buffer string codecs
+  // Every string<->bytes path of Buffer (from, write, byteLength, toString,
+  // fill, indexOf and the *Slice / *Write natives) goes through the three
+  // functions below, keyed on a NORMALIZED encoding name.
+
+  // Node's per-encoding `ops.byteLength` (lib/buffer.js encodingOps): what
+  // Buffer.byteLength reports and what Buffer.from sizes its allocation by.
+  // For hex and base64 it is an upper bound the decode may fall short of.
+  function byteLengthOf(str, norm) {
+    switch (norm) {
       case "utf8":
-        return utf8Encoder.encode(str);
-      case "hex": {
-        // Node is lenient: parse stops at the first invalid pair.
-        const len = str.length >>> 1;
-        const out = new Uint8Array(len);
-        let o = 0;
-        // Each pair must be two hex DIGITS: parseInt would read "aG", " 1"
-        // or "+1" as a byte where node stops. Node decodes from a one-byte
-        // copy of the string (StringBytes casts each code unit to uint8), so
-        // only a code unit's LOW byte is a digit: U+0661 reads as "a",
-        // U+0130 as "0", and U+0100 (low byte 0x00) stops the decode.
-        const digit = (c) =>
-          c >= 48 && c <= 57 ? c - 48 : c >= 97 && c <= 102 ? c - 87 : c >= 65 && c <= 70 ? c - 55 : -1;
-        for (let i = 0; i + 1 < str.length; i += 2) {
-          const hi = digit(str.charCodeAt(i) & 0xff);
-          const lo = digit(str.charCodeAt(i + 1) & 0xff);
-          if (hi < 0 || lo < 0) break;
-          out[o++] = (hi << 4) | lo;
-        }
-        return out.subarray(0, o);
+        return utf8Length(str);
+      case "latin1":
+      case "ascii":
+        return str.length;
+      case "utf16le":
+        return str.length * 2;
+      case "hex":
+        return str.length >>> 1;
+      default: {
+        // base64 / base64url: node's base64ByteLength. At most TWO trailing
+        // '=' are discounted, so "QQ===" is 2 (not 1): a regex stripping
+        // every trailing '=' undercounted.
+        let bytes = str.length;
+        if (str.charCodeAt(bytes - 1) === 0x3d) bytes--;
+        if (bytes > 1 && str.charCodeAt(bytes - 1) === 0x3d) bytes--;
+        return (bytes * 3) >>> 2;
       }
-      case "base64":
-      case "base64url":
-        // Node's lenient decoder for BOTH labels: either alphabet accepted
-        // ('-'/'_' alongside '+'/'/'), whitespace skipped, '=' or junk
-        // terminates, trailing partial groups decode greedily. JWT-era code
-        // decodes base64url payloads via 'base64' constantly â€” the strict
-        // Uint8Array.fromBase64 path returned EMPTY for those.
-        return decodeBase64Lenient(str);
-      case "latin1": {
-        const out = new Uint8Array(str.length);
-        for (let i = 0; i < str.length; i++) out[i] = str.charCodeAt(i) & 0xff;
-        return out;
-      }
-      case "ascii": {
-        // Node's ascii ENCODE writes the low 8 bits (charCode & 0xff), same as
-        // latin1 -- it is the DECODE side (toString) that masks to 7 bits.
-        const out = new Uint8Array(str.length);
-        for (let i = 0; i < str.length; i++) out[i] = str.charCodeAt(i) & 0xff;
-        return out;
-      }
-      case "utf16le": {
-        const out = new Uint8Array(str.length * 2);
-        for (let i = 0; i < str.length; i++) {
-          const c = str.charCodeAt(i);
-          out[i * 2] = c & 0xff;
-          out[i * 2 + 1] = c >> 8;
-        }
-        return out;
-      }
-      default:
-        throw codes.ERR_UNKNOWN_ENCODING(enc);
     }
   }
 
-  // Decode `view`'s bytes as `encoding` (any label normalizeEncoding takes).
-  // The one byte-to-string codec behind Buffer#toString and node's native
-  // *Slice family (asciiSlice, utf8Slice, ...) on Buffer.prototype.
-  function decodeSpan(view, encoding) {
-    switch (normalizeEncoding(encoding)) {
-      case "hex":
-        return view.toHex();
-      case "base64":
-        return view.toBase64();
-      case "base64url":
-        return view.toBase64({ alphabet: "base64url", omitPadding: true });
-      case "latin1": {
-        let out = "";
-        for (let i = 0; i < view.length; i++) out += String.fromCharCode(view[i]);
-        return out;
-      }
+  // Encode `str` as `norm` straight into `dst` (any Uint8Array) at
+  // `offset`, at most `max` bytes, and return the count written. Node never
+  // writes a partial character: a UTF-8 sequence or a UTF-16 code unit that
+  // does not fit is left out whole. No temporary: the bytes land in `dst`.
+  function writeString(dst, str, offset, max, norm) {
+    switch (norm) {
+      case "utf8":
+        return utf8WriteInto(dst, str, offset, max);
+      case "latin1":
       case "ascii": {
-        let out = "";
-        for (let i = 0; i < view.length; i++) out += String.fromCharCode(view[i] & 0x7f);
-        return out;
+        // Node's ascii ENCODE writes the low 8 bits (charCode & 0xff), same
+        // as latin1 -- it is the DECODE side (toString) that masks to 7 bits.
+        const n = Math.min(str.length, max);
+        for (let i = 0; i < n; i++) dst[offset + i] = str.charCodeAt(i) & 0xff;
+        return n;
       }
       case "utf16le": {
-        let out = "";
-        for (let i = 0; i + 1 < view.length; i += 2) {
-          out += String.fromCharCode(view[i] | (view[i + 1] << 8));
+        const n = Math.min(str.length, max >>> 1);
+        for (let i = 0; i < n; i++) {
+          const c = str.charCodeAt(i);
+          dst[offset + 2 * i] = c & 0xff;
+          dst[offset + 2 * i + 1] = c >> 8;
         }
-        return out;
+        return n * 2;
       }
-      case "utf8":
-        return utf8Decoder.decode(view);
+      case "hex": {
+        // Node is lenient: parse stops at the first invalid pair. Each pair
+        // must be two hex DIGITS: parseInt would read "aG", " 1" or "+1" as a
+        // byte where node stops. Node decodes from a one-byte copy of the
+        // string (StringBytes casts each code unit to uint8), so only a code
+        // unit's LOW byte is a digit: U+0661 reads as "a", U+0130 as "0",
+        // and U+0100 (low byte 0x00) stops the decode.
+        const n = Math.min(str.length >>> 1, max);
+        let o = 0;
+        for (; o < n; o++) {
+          const hi = hexDigit(str.charCodeAt(2 * o) & 0xff);
+          const lo = hexDigit(str.charCodeAt(2 * o + 1) & 0xff);
+          if (hi < 0 || lo < 0) break;
+          dst[offset + o] = (hi << 4) | lo;
+        }
+        return o;
+      }
+      default:
+        // base64 / base64url: node's lenient decoder for BOTH labels --
+        // either alphabet accepted ('-'/'_' alongside '+'/'/'), whitespace
+        // skipped, '=' terminates, trailing partial groups decode greedily.
+        // JWT-era code decodes base64url payloads via 'base64' constantly.
+        return base64WriteInto(dst, str, offset, max);
+    }
+  }
+  const hexDigit = (c) =>
+    c >= 48 && c <= 57 ? c - 48 : c >= 97 && c <= 102 ? c - 87 : c >= 65 && c <= 70 ? c - 55 : -1;
+
+  // The bytes of `str` as `enc` in a fresh Uint8Array (fill and indexOf
+  // patterns). Throws ERR_UNKNOWN_ENCODING for an unknown label.
+  function bytesFromString(str, enc) {
+    const norm = normalizeEncoding(enc);
+    if (norm === undefined) throw codes.ERR_UNKNOWN_ENCODING(enc);
+    const out = new Uint8Array(byteLengthOf(str, norm));
+    const written = writeString(out, str, 0, out.length, norm);
+    return written === out.length ? out : out.subarray(0, written);
+  }
+
+  // The `kind` argument of the native bufferDecode (crates/oam_engine/src/
+  // buffer_ops.rs).
+  const DECODE_KIND = { utf8: 0, latin1: 1, ascii: 2, utf16le: 3 };
+
+  // Spans up to this many bytes decode in JS, longer ones natively. A call
+  // into a native op has a fixed cost (measured at ~0.4-0.9 us per call in a
+  // debug build, where it took buf.toString() of 17 bytes from 25 to 53 ms
+  // per 100k), while JIT'd JS decodes a short span in well under that; past
+  // a few dozen bytes the native decoder's per-byte speed wins. A per-kind
+  // crossover (ucs2's JS loop emits one character per two bytes and so runs
+  // longest) did not separate from noise on this host at these spans.
+  const SHORT_DECODE = 32;
+  let nativeDecode = null;
+
+  // Decode bytes [start, end) of `view` (a Uint8Array; the caller has
+  // clamped the range) as `encoding` (any label normalizeEncoding takes).
+  // The one byte-to-string codec behind Buffer#toString and node's native
+  // *Slice family. Long utf8 / latin1 / ascii / ucs2 spans decode with V8's
+  // own decoders -- the ones node itself calls -- because a JS decoder
+  // building the string a character at a time was several times slower
+  // than node on them. The JS paths below produce the same strings.
+  function decodeRange(view, start, end, encoding) {
+    const norm = normalizeEncoding(encoding);
+    const kind = DECODE_KIND[norm];
+    if (kind !== undefined) {
+      if (end <= start) return "";
+      if (end - start <= SHORT_DECODE) return decodeShort(view, start, end, kind);
+      // Looked up on first use, not at snapshot time: __oam.node is
+      // installed after the snapshot is restored.
+      if (nativeDecode === null) nativeDecode = globalThis.__oam.node.bufferDecode;
+      const decoded = nativeDecode(view, start, end, kind);
+      // undefined: a view over a SharedArrayBuffer, which the native op
+      // will not borrow as a Rust slice while another thread may write it
+      // (crates/oam_engine/src/buffer_ops.rs); the element-wise JS decode
+      // gives the same string.
+      return decoded === undefined ? decodeShort(view, start, end, kind) : decoded;
+    }
+    const span = start === 0 && end === view.length ? view : view.subarray(start, end);
+    switch (norm) {
+      case "hex":
+        return span.toHex();
+      case "base64":
+        return span.toBase64();
+      case "base64url":
+        return span.toBase64({ alphabet: "base64url", omitPadding: true });
       default:
         throw codes.ERR_UNKNOWN_ENCODING(encoding);
     }
   }
 
+  // Buffer#toString's dispatch, as node's lib/buffer.js does it: node calls
+  // the receiver's own `<enc>Slice` method (`this.utf8Slice(...)` with no
+  // encoding, `buf.<enc>Slice(...)` through getEncodingOps otherwise), so a
+  // receiver that lacks it -- Buffer.prototype.toString.call(uint8Array),
+  // or a Uint16Array -- is a TypeError, and one that overrides it gets the
+  // override. Only a Uint8Array whose method is still the native one takes
+  // the direct decode, which is what that native would do with it.
+  const SLICE_METHOD = {
+    utf8: "utf8Slice",
+    latin1: "latin1Slice",
+    ascii: "asciiSlice",
+    utf16le: "ucs2Slice",
+    hex: "hexSlice",
+    base64: "base64Slice",
+    base64url: "base64urlSlice",
+  };
+  // Filled in where the natives are installed on Buffer.prototype.
+  const nativeSlices = {};
+  function sliceVia(receiver, norm, method, start, end, via) {
+    if (method === nativeSlices[SLICE_METHOD[norm]] && receiver instanceof Uint8Array) {
+      // node refuses UP FRONT when the result cannot fit in a V8 string
+      // (kStringMaxLength = 0x1fffffe8): without this guard the decode is
+      // attempted and the process dies with a V8 heap OOM instead of
+      // throwing a catchable error -- e.g. readFileSync(bigFile).toString().
+      // The check is on the BYTE span, matching node: a multi-byte encoding
+      // can only produce fewer characters, and node throws on the span too.
+      if (end - start > 0x1fffffe8) {
+        const err = new Error("Cannot create a string longer than 0x1fffffe8 characters");
+        err.code = "ERR_STRING_TOO_LONG";
+        throw err;
+      }
+      return decodeRange(receiver, start, end, norm);
+    }
+    if (typeof method !== "function") {
+      throw new TypeError(`${via}.${SLICE_METHOD[norm]} is not a function`);
+    }
+    return method.call(receiver, start, end);
+  }
+
+  // decodeRange's JS path for a short span, per DECODE_KIND.
+  function decodeShort(view, start, end, kind) {
+    let out = "";
+    switch (kind) {
+      case 0: // utf8
+        return utf8DecodeRange(view, start, end, false);
+      case 1: // latin1: every byte is its own code point
+        for (let i = start; i < end; i++) out += String.fromCharCode(view[i]);
+        return out;
+      case 2: // ascii: node clears the high bit
+        for (let i = start; i < end; i++) out += String.fromCharCode(view[i] & 0x7f);
+        return out;
+      default: // utf16le: an odd trailing byte is dropped
+        for (let i = start; i + 1 < end; i += 2) {
+          out += String.fromCharCode(view[i] | (view[i + 1] << 8));
+        }
+        return out;
+    }
+  }
+
   // Encode `string` as `encoding` into `view` at `offset`, at most `max`
-  // bytes, and return the count written. Node never writes a partial
-  // character: a UTF-8 sequence or a UTF-16 code unit that does not fit is
-  // left out whole. The one string-to-byte write behind Buffer#write and
+  // bytes, and return the count written: the write behind Buffer#write and
   // node's *Write family on Buffer.prototype.
   function encodeInto(view, string, offset, max, encoding) {
-    const bytes = bytesFromString(string, encoding);
-    let writable = Math.min(bytes.length, max);
-    if (writable < bytes.length) {
-      const norm = normalizeEncoding(encoding);
-      if (norm === "utf8") {
-        while (writable > 0 && (bytes[writable] & 0xc0) === 0x80) writable--;
-      } else if (norm === "utf16le") {
-        writable &= ~1;
-      }
-    }
-    view.set(bytes.subarray(0, writable), offset);
-    return writable;
+    const norm = normalizeEncoding(encoding);
+    if (norm === undefined) throw codes.ERR_UNKNOWN_ENCODING(encoding);
+    return writeString(view, string, offset, max, norm);
   }
 
   // Mutable buffer-module state shared between the Buffer class and the
@@ -2138,6 +2340,12 @@
   // this (it is why .buffer must never be handed out unsliced), and code
   // that assumes otherwise is already wrong against Node.
   let allocPool = null;
+  // A byte view of the whole pool: Buffer.from(string) encodes straight into
+  // it. Its length is also the CURRENT pool's size -- node's module-level
+  // `poolSize`, fixed when the pool was made -- which is what the room
+  // checks must use: Buffer.poolSize can change after the pool exists, and
+  // checking against the new value could carve a slice past the pool's end.
+  let allocPoolBytes = null;
   let poolOffset = 0;
   // Objects that must never appear in a postMessage transfer list. The
   // Buffer pool is the reason this exists: transferring it would detach the
@@ -2145,6 +2353,7 @@
   const untransferable = new WeakSet();
   function createPool() {
     allocPool = new ArrayBuffer(poolSizeRef.value);
+    allocPoolBytes = new Uint8Array(allocPool);
     untransferable.add(allocPool);
     poolOffset = 0;
   }
@@ -2157,12 +2366,74 @@
   function poolAllocate(BufferCtor, size) {
     if (size <= 0) return new BufferCtor(0);
     if (size >= (poolSizeRef.value >>> 1)) return new BufferCtor(size);
-    if (allocPool === null) createPool();
-    if (size > poolSizeRef.value - poolOffset) createPool();
+    if (allocPool === null || size > allocPoolBytes.length - poolOffset) createPool();
     const b = new BufferCtor(allocPool, poolOffset, size);
     poolOffset += size;
     alignPool();
     return b;
+  }
+
+  // Node's fromStringFast (lib/buffer.js, v22.22.2), step for step, because
+  // where a string Buffer lands is observable (byteOffset, .buffer):
+  //  - a string of >= poolSize/2 CODE UNITS gets its own buffer before any
+  //    byte is counted (so a 5000-char hex string does, at 2500 bytes);
+  //  - under that, the room reserved in the pool is 4 bytes per code unit
+  //    when that is < poolSize/2 -- an overestimate that decides whether a
+  //    fresh pool is opened -- and the exact byteLength otherwise;
+  //  - the bytes are encoded straight into the pool and only what was
+  //    written is consumed.
+  // The encoder writes into the pool directly; a temporary that was then
+  // copied over made this ~4x slower than node.
+  function fromString(string, norm) {
+    if (string.length === 0) return new Buffer(0);
+    const maxLength = poolSizeRef.value >>> 1;
+    let length = string.length;
+    if (length >= maxLength) return fromStringOwn(string, norm, byteLengthOf(string, norm));
+    length *= 4;
+    if (length >= maxLength) {
+      // node counts the exact bytes here -- a full pass over the string --
+      // to pick own buffer vs pool and to check the pool's room, then
+      // encodes in a second pass. For utf8 that count is bounded by 3 bytes
+      // per code unit, so when the bound fits in the room left the string
+      // is encoded straight into the pool in ONE pass and the count read
+      // off the result: the room check passes for the exact count too (no
+      // fresh pool, as in node), and a count of >= poolSize/2 still gets
+      // its own buffer, copied out -- and the pool bytes it was encoded
+      // into are zeroed again, because oam's allocUnsafe hands out the
+      // unused pool as zeroes (docs/node-divergences.md, 29).
+      if (
+        norm === "utf8" &&
+        allocPool !== null &&
+        string.length * 3 <= allocPoolBytes.length - poolOffset
+      ) {
+        const actual = utf8WriteInto(allocPoolBytes, string, poolOffset, string.length * 3);
+        if (actual < maxLength) return carvePool(actual);
+        const own = new Buffer(actual);
+        own.set(allocPoolBytes.subarray(poolOffset, poolOffset + actual));
+        allocPoolBytes.fill(0, poolOffset, poolOffset + actual);
+        return own;
+      }
+      length = byteLengthOf(string, norm);
+      if (length >= maxLength) return fromStringOwn(string, norm, length);
+    }
+    if (allocPool === null || length > allocPoolBytes.length - poolOffset) createPool();
+    return carvePool(writeString(allocPoolBytes, string, poolOffset, length, norm));
+  }
+  // The `length` bytes just written at poolOffset, as a Buffer; the pool
+  // moves past them (aligned, as node aligns).
+  function carvePool(length) {
+    const b = new Buffer(allocPool, poolOffset, length);
+    poolOffset += length;
+    alignPool();
+    return b;
+  }
+  // node's createFromString: a buffer of byteLength bytes of its own. When
+  // the decode falls short of that bound (bad hex, base64 whitespace) node
+  // returns a SHORTER view and keeps the full allocation as .buffer.
+  function fromStringOwn(string, norm, length) {
+    const buf = new Buffer(length);
+    const actual = writeString(buf, string, 0, length, norm);
+    return actual === length ? buf : new Buffer(buf.buffer, 0, actual);
   }
 
   class Buffer extends Uint8Array {
@@ -2239,12 +2510,11 @@
         // Node fromString: a non-string (or empty-string) encoding silently
         // defaults to utf8 (`Buffer.from('asd', 1)` is allowed); a non-empty
         // unknown string encoding throws ERR_UNKNOWN_ENCODING.
-        let enc = encodingOrOffset;
-        if (typeof enc !== "string" || enc.length === 0) enc = undefined;
-        const bytes = bytesFromString(value, enc);
-        const out = poolAllocate(Buffer, bytes.length);
-        out.set(bytes);
-        return out;
+        const enc = encodingOrOffset;
+        if (typeof enc !== "string" || enc.length === 0) return fromString(value, "utf8");
+        const norm = normalizeEncoding(enc);
+        if (norm === undefined) throw codes.ERR_UNKNOWN_ENCODING(enc);
+        return fromString(value, norm);
       }
       if (value instanceof Uint8Array) {
         // Buffer / Uint8Array: COPIES its bytes, per Node (from(typedArray)
@@ -2361,22 +2631,10 @@
           "ERR_INVALID_ARG_TYPE",
         );
       }
-      switch (normalizeEncoding(encoding)) {
-        case "latin1":
-        case "ascii":
-          return value.length;
-        case "utf16le":
-          return value.length * 2;
-        case "hex":
-          return value.length >>> 1;
-        case "base64":
-        case "base64url": {
-          const trimmed = value.replace(/=+$/, "");
-          return Math.floor((trimmed.length * 3) / 4);
-        }
-        default:
-          return utf8Encoder.encode(value).length;
-      }
+      if (value.length === 0) return 0;
+      // An unknown encoding counts as utf8, as in node (its TODO says it
+      // should throw; it does not).
+      return byteLengthOf(value, normalizeEncoding(encoding) ?? "utf8");
     }
 
     static concat(list, totalLength) {
@@ -2395,14 +2653,29 @@
         total = 0;
         for (const item of list) total += item.length;
       }
-      const out = new Buffer(total);
+      // node allocates the result with allocUnsafe -- from the pool when it
+      // is small -- and zero-fills whatever the list did not cover.
+      // (A totalLength that is not a non-negative integer keeps its old
+      // route, the typed-array constructor's own RangeError.)
+      const out =
+        globalThis.__oamZeroFillBuffers || !(Number.isInteger(total) && total >= 0)
+          ? new Buffer(total)
+          : poolAllocate(Buffer, total);
       let offset = 0;
       for (const item of list) {
         if (offset >= total) break;
-        const chunk = item.subarray(0, Math.min(item.length, total - offset));
-        out.set(chunk, offset);
-        offset += chunk.length;
+        const room = total - offset;
+        // A whole item copies as is; only one that overruns totalLength is
+        // cut, so the common case makes no subarray.
+        if (item.length <= room) {
+          out.set(item, offset);
+          offset += item.length;
+        } else {
+          out.set(item.subarray(0, room), offset);
+          offset = total;
+        }
       }
+      if (offset < total) Uint8Array.prototype.fill.call(out, 0, offset, total);
       return out;
     }
 
@@ -2413,6 +2686,14 @@
     }
 
     toString(encoding, start, end) {
+      // node: `if (arguments.length === 0) return this.utf8Slice(0,
+      // this.length)` -- before any range logic, so even an empty receiver
+      // without the method throws. The method is read before the length, as
+      // V8 evaluates node's call.
+      if (arguments.length === 0) {
+        const method = this.utf8Slice;
+        return sliceVia(this, "utf8", method, 0, this.length, "this");
+      }
       // Node coerces start/end with Number(): NaN/non-numeric -> 0, fractional
       // truncates toward zero, negative clamps to 0, > length clamps to length;
       // an undefined end defaults to length. end <= start yields "".
@@ -2432,19 +2713,14 @@
         if (e < 0) e = 0;
         else if (e > len) e = len;
       }
-      // Node refuses UP FRONT when the result cannot fit in a V8 string
-      // (kStringMaxLength = 0x1fffffe8): without this guard the decode is
-      // attempted and the process dies with a V8 heap OOM instead of
-      // throwing a catchable error -- e.g. readFileSync(bigFile).toString().
-      // The check is on the BYTE span, matching node: a multi-byte encoding
-      // can only produce fewer characters, and node throws on the span too.
-      if (e - s > 0x1fffffe8) {
-        const err = new Error("Cannot create a string longer than 0x1fffffe8 characters");
-        err.code = "ERR_STRING_TOO_LONG";
-        throw err;
-      }
-      const view = e <= s ? this.subarray(0, 0) : this.subarray(s, e);
-      return decodeSpan(view, encoding);
+      // An empty range is "" before the encoding is looked at, as in node:
+      // buf.toString('bogus', buf.length) does not throw there.
+      if (e <= s) return "";
+      if (encoding === undefined) return sliceVia(this, "utf8", this.utf8Slice, s, e, "this");
+      const norm = normalizeEncoding(encoding);
+      if (norm === undefined) throw codes.ERR_UNKNOWN_ENCODING(encoding);
+      // No subarray: the decode reads [s, e) of the buffer in place.
+      return sliceVia(this, norm, this[SLICE_METHOD[norm]], s, e, "buf");
     }
 
     // Node Buffer#slice is a VIEW (Uint8Array#slice copies).
@@ -2781,7 +3057,7 @@
   // errors: a plain TypeError/RangeError carrying `code`, no `[CODE]` in the
   // name. ascii/latin1/utf8 *Write are JS wrappers that bounds-check offset
   // and length against byteLength first, then run the same native write.
-  // Every one goes through decodeSpan / encodeInto, the codec Buffer#toString
+  // Every one goes through decodeRange / encodeInto, the codec Buffer#toString
   // and Buffer#write use.
   {
     const nativeError = (Ctor, code, message) => {
@@ -2817,7 +3093,7 @@
       let to = arrayIndex(end, length);
       if (to < from) to = from;
       if (to > length) throw indexOutOfRange();
-      return decodeSpan(bytes.subarray(from, to), encoding);
+      return decodeRange(bytes, from, to, encoding);
     }
     // StringWrite: an offset past the end is ERR_BUFFER_OUT_OF_BOUNDS, a
     // length past it is clamped, and nothing is encoded for zero room.
@@ -2857,6 +3133,9 @@
       ucs2Write() { return rawWrite(this, arguments[0], arguments[1], arguments[2], "utf16le"); },
     };
     for (const name of Object.keys(natives)) Buffer.prototype[name] = natives[name];
+    // Buffer#toString decodes directly only while the receiver's method is
+    // one of these (sliceVia).
+    for (const name of Object.values(SLICE_METHOD)) nativeSlices[name] = natives[name];
     // The JS wrappers: length defaults to byteLength (the native clamps it
     // to the room past offset), and the range checks compare the RAW
     // arguments -- a NaN, an object or a numeric string passes them and is
@@ -11000,10 +11279,14 @@
   /// it looks the encoding up -- so with the `"buffer"` encoding (which the
   /// options check lets through) nothing read is "", and something read is
   /// ERR_UNKNOWN_ENCODING. fs.promises.readFile settles the encoding first
-  /// and refuses `"buffer"` whatever was read (measured on v22.22.2).
+  /// and refuses `"buffer"` whatever was read (measured on v22.22.2), so the
+  /// promise path (`!emptyIsString`) looks the label up before it decodes.
   function decodeRead(bytes, encoding, emptyIsString) {
     const BufferCtor = globalThis.Buffer;
     const buf = BufferCtor.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (!emptyIsString && encoding && normalizeEncoding(encoding) === undefined) {
+      throw codes.ERR_UNKNOWN_ENCODING(encoding);
+    }
     if (emptyIsString && encoding && buf.length === 0) return "";
     return encoding ? buf.toString(encoding) : buf;
   }
