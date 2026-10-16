@@ -27893,6 +27893,61 @@ fn vm_run_in_new_context_sandbox() {
     assert!(stdout.contains("product=200"), "{stdout}");
 }
 
+/// V8 runs a vm global's interceptors while `Context::new` is still building
+/// the context (Genesis reads `Atomics` off the new global), and the
+/// interceptors used to find their sandbox through the context's embedder
+/// data -- an unchecked read that, before the data was set, came from past the
+/// end of the array. Whether it faulted depended on the heap layout, so an
+/// unrelated snapshot change turned `vm_run_in_new_context_sandbox` into a
+/// segfault (#401). Many contexts, sandboxes that shadow the names Genesis
+/// reads, and every cross-context shape the sandbox link serves, against
+/// node 22.22.2's output.
+#[test]
+fn vm_contexts_cross_context_shapes() {
+    let stdout = run_ok(
+        "vm_cross_context.cjs",
+        r#"
+        const vm = require('vm');
+        const util = require('util');
+        const t = util.types;
+        const s = { x: 10, y: 20, Atomics: 'mine' };
+        console.log('A', vm.runInNewContext('x + y', s), vm.runInNewContext('x * y', s));
+        console.log('B', vm.runInNewContext('typeof Atomics', s), vm.runInNewContext('Atomics', s), typeof Atomics.wait);
+        const c = vm.createContext({ a: 1 });
+        vm.runInContext('var b = 2; globalThis.c = 3', c);
+        console.log('C', vm.runInContext('a + b + c', c), vm.createContext(c) === c, vm.isContext(c));
+        const sc = new vm.Script('a * 10');
+        console.log('D', sc.runInNewContext({ a: 4 }), sc.runInNewContext({ a: 5 }), sc.runInContext(c));
+        console.log('E', util.inspect(c), util.inspect(s));
+        const vals = vm.runInNewContext('({ n: Object(1), b: Object(2n), sy: Object(Symbol("q")), st: Object("s"), bo: Object(false), m: new Map([[1, 2]]), arr: [1, 2], err: new TypeError("t"), d: new Date(0), re: /x/g })');
+        console.log('F', [t.isNumberObject(vals.n), t.isBigIntObject(vals.b), t.isSymbolObject(vals.sy), t.isStringObject(vals.st), t.isBooleanObject(vals.bo), t.isBoxedPrimitive(vals.b), t.isMap(vals.m), t.isDate(vals.d), t.isRegExp(vals.re), t.isNativeError(vals.err)].join());
+        console.log('G', util.inspect(vals.n), util.inspect(vals.b), util.inspect(vals.sy), util.inspect(vals.st), util.inspect(vals.bo), util.inspect(vals.m), util.inspect(vals.arr));
+        console.log('H', util.format('%s %s %s', vals.n, vals.b, vals.arr), vals.arr instanceof Array, Array.isArray(vals.arr));
+        console.log('I', t.isNumberObject(c), t.isBoxedPrimitive(s), t.isProxy(vm.runInContext('this', c)));
+        let sum = 0;
+        for (let i = 0; i < 200; i++) {
+          const box = { i, Atomics: i, SharedArrayBuffer: i, Object: i % 2 ? undefined : i };
+          sum += vm.runInNewContext('i', box) + vm.runInNewContext('i + 1', box);
+        }
+        console.log('J', sum);
+    "#,
+    );
+    let expected = [
+        "A 30 200",
+        "B string mine function",
+        "C 6 true true",
+        "D 40 50 10",
+        "E { a: 1, b: 2, c: 3 } { x: 10, y: 20, Atomics: 'mine' }",
+        "F true,true,true,true,true,true,true,true,true,true",
+        "G [Number: 1] [BigInt: 2n] [Symbol: Symbol(q)] [String: 's'] [Boolean: false] Map(1) { 1 => 2 } [ 1, 2 ]",
+        "H [Number: 1] [BigInt: 2n] [ 1, 2 ] false true",
+        "I false false false",
+        "J 40000",
+    ];
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines, expected, "{stdout}");
+}
+
 #[test]
 fn vm_create_context_is_context() {
     let stdout = run_ok(

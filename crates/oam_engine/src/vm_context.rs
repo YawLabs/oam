@@ -11,12 +11,13 @@
 //! ## Ownership
 //!
 //! Nothing here is rooted from Rust. A contextified sandbox holds its context's
-//! global proxy under a private symbol, and the context holds the sandbox in
-//! embedder data -- a cycle entirely inside the V8 heap, which the GC collects
-//! once the sandbox goes unreachable. That matters because the sandbox is the
-//! only handle JS ever has on a vm context (`createContext` returns it and
-//! every `runInContext` takes it), so a Rust-side registry would pin every
-//! context ever created for the life of the isolate.
+//! global proxy under a private symbol, and the global's interceptors hold the
+//! sandbox through their `data` link object -- a cycle entirely inside the V8
+//! heap, which the GC collects once the sandbox goes unreachable. That matters
+//! because the sandbox is the only handle JS ever has on a vm context
+//! (`createContext` returns it and every `runInContext` takes it), so a
+//! Rust-side registry would pin every context ever created for the life of
+//! the isolate.
 
 /// Terminates a runaway script after `timeout` ms.
 ///
@@ -123,11 +124,22 @@ pub(crate) fn with_timeout<'s, T>(
     }
 }
 
-/// Embedder-data slot on a contextified context, holding its sandbox.
+/// Name of the private symbol under which an interceptor's link object holds
+/// its sandbox.
 ///
-/// rusty_v8 offsets every embedder slot past its own internal ones, so 0 is the
-/// first slot we own -- it is not the debugger's index 0.
-const SANDBOX_SLOT: i32 = 0;
+/// The sandbox reaches the interceptors through the handler's `data` -- a
+/// link object made before the context and filled in only once
+/// `Context::new` has returned. It used to be read back out of the context's
+/// embedder data, by way of the holder's creation context. But V8 runs the
+/// interceptors while it is still building that context (Genesis reads
+/// properties off the new global, e.g. `Atomics` for
+/// `js_atomics_pause`), and `Context::GetEmbedderData` reads its slot with
+/// no bounds check: before the embedder data had been set, that read came
+/// from past the end of the array, or from a context still half-built, and
+/// whether it faulted depended on the heap layout -- a segfault that came
+/// and went with unrelated changes to the snapshot (#401). An empty link is
+/// the "not attached yet" answer, with no context consulted at all.
+const SANDBOX_PRIVATE: &str = "oam:vm:sandbox";
 
 /// Name of the private symbol linking a sandbox to its context's global proxy.
 ///
@@ -163,18 +175,25 @@ pub(crate) fn context_of_sandbox<'s>(
     proxy.get_creation_context(scope)
 }
 
-/// The sandbox behind the object an interceptor fired on.
+fn sandbox_private<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Private> {
+    let name = v8::String::new(scope, SANDBOX_PRIVATE).unwrap();
+    v8::Private::for_api(scope, Some(name))
+}
+
+/// The sandbox behind the global an interceptor fired on, or `None` while
+/// `Context::new` is still building that global (see [`SANDBOX_PRIVATE`]).
 ///
-/// Keyed off the holder's *creation* context rather than the isolate's current
-/// one: the host reads properties off a vm global too (that is what
-/// `runInContext` returns), and there the current context is the host's.
+/// Read off the handler's `data` rather than any context, so it answers the
+/// same whether the access comes from inside the vm context or from the host
+/// reading a vm global (which is what `runInContext` can return).
 fn sandbox_of<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: &v8::PropertyCallbackArguments<'s>,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    let context = args.holder().get_creation_context(scope)?;
-    let data = context.get_embedder_data(scope, SANDBOX_SLOT)?;
-    v8::Local::<v8::Object>::try_from(data).ok()
+    let link = v8::Local::<v8::Object>::try_from(args.data()).ok()?;
+    let key = sandbox_private(scope);
+    let sandbox = link.get_private(scope, key)?;
+    v8::Local::<v8::Object>::try_from(sandbox).ok()
 }
 
 fn is_read_only(attributes: v8::PropertyAttribute) -> bool {
@@ -196,7 +215,7 @@ fn named_getter<'s>(
     mut rv: v8::ReturnValue<v8::Value>,
 ) -> v8::Intercepted {
     let Some(sandbox) = sandbox_of(scope, &args) else {
-        // `Context::new` walks the global before we have attached the sandbox.
+        // `Context::new` reads the global before the sandbox is attached.
         return v8::Intercepted::kNo;
     };
     // A real-named lookup walks the prototype chain but skips interceptors, so
@@ -501,9 +520,13 @@ pub(crate) fn op_vm_create_context<'s>(
         return;
     }
 
+    // Empty until the context exists: every interceptor call `Context::new`
+    // makes declines (see SANDBOX_PRIVATE).
+    let link = v8::Object::new(scope);
     let template = v8::ObjectTemplate::new(scope);
     template.set_named_property_handler(
         v8::NamedPropertyHandlerConfiguration::new()
+            .data(link.into())
             .getter(named_getter)
             .setter(named_setter)
             .query(named_query)
@@ -514,6 +537,7 @@ pub(crate) fn op_vm_create_context<'s>(
     );
     template.set_indexed_property_handler(
         v8::IndexedPropertyHandlerConfiguration::new()
+            .data(link.into())
             .getter(indexed_getter)
             .setter(indexed_setter)
             .query(indexed_query)
@@ -537,7 +561,8 @@ pub(crate) fn op_vm_create_context<'s>(
     // not a security sandbox -- Node says the same in its own docs, and code
     // that needs isolation wants a separate process.
     context.set_security_token(token);
-    context.set_embedder_data(SANDBOX_SLOT, sandbox.into());
+    let key = sandbox_private(scope);
+    link.set_private(scope, key, sandbox.into());
 
     let proxy = context.global(scope);
     let key = proxy_private(scope);
