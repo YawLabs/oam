@@ -9,7 +9,9 @@
 // load failure on turn 6, a missing export on turn 23; a top-level await
 // settles import() seven turns after the module's last await; a namespace
 // that exports `then` is a thenable, one turn more. The same from a
-// CommonJS importer.
+// CommonJS importer. A "type" attribute is checked whether or not the
+// module is already loaded, and a polluted Object.prototype.then does not
+// reach the loader's own objects.
 //
 // Regression guard: oam evaluated the module inside the import hook, on
 // turn 0, and settled import() at once.
@@ -64,10 +66,17 @@ const which = process.argv[2];
 require("./required.cjs");
 const { start } = require("./counter.cjs");
 start();
+const self = "./" + require("node:path").basename(process.argv[1]);
+if (process.argv[3] === "tamper") Object.prototype.then = function () { __log.push("then-on-object@" + __n); };
 const call = which === "./data.json" ? import(which, { with: { type: "json" } })
   : which === "./bad-type" ? import("./leaf2.mjs", { with: { type: "css" } })
+  : which === "./loaded-json" ? import("./loaded.mjs", { with: { type: "json" } })
+  : which === "./loaded-css" ? import("./loaded.mjs", { with: { type: "css" } })
+  : which === "./builtin-json" ? import("node:os", { with: { type: "json" } })
+  : which === "./self-json" ? import(self, { with: { type: "json" } })
   : import(which);
 call.then(() => __log.push("settled@" + __n), () => __log.push("rejected@" + __n));
+if (process.argv[3] === "tamper") call.finally(() => delete Object.prototype.then);
 if (process.argv[3] === "twice") import(which).then(() => __log.push("settled-again@" + __n));
 setTimeout(() => console.log(__log.join(" ")), 20);
 `;
@@ -102,6 +111,11 @@ try {
     ["syntax error", "./syntax.mjs"],
     ["missing export", "./no-export.mjs"],
     ["unsupported type attribute", "./bad-type"],
+    ["type json on a loaded module", "./loaded-json"],
+    ["unsupported type on a loaded module", "./loaded-css"],
+    ["type json on a builtin", "./builtin-json"],
+    ["type json on the importer itself", "./self-json"],
+    ["Object.prototype.then set", "./leaf.mjs", "tamper"],
   ];
   for (const importer of ["importer.mjs", "importer.cjs"]) {
     for (const [label, ...args] of shapes) {
