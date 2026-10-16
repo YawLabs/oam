@@ -23,11 +23,13 @@
 //   it watches both sides for errors and closes, as node's does.
 //
 // Scope (documented in docs/node-divergences.md):
-// - Default readers only. `type: 'bytes'` streams get the byte controller's
-//   queuing -- high-water mark 0 by default, desiredSize in bytes, chunks
-//   must be ArrayBufferViews and are read as Uint8Arrays -- but there is no
-//   byobRequest, no BYOB reader, and an enqueued buffer is not transferred
-//   (node detaches it).
+// - `type: 'bytes'` streams get the byte controller: its queuing --
+//   high-water mark 0 by default, desiredSize in bytes, chunks must be
+//   ArrayBufferViews and are read as Uint8Arrays -- BYOB readers
+//   (getReader({ mode: 'byob' })) with node's pull-into algorithms, and
+//   controller.byobRequest. Not there: `autoAllocateChunkSize` (read and 0
+//   refused, but a default read gets no byobRequest), and an enqueued
+//   buffer is not transferred (node detaches it).
 // - The reader, writer and controller classes are not exposed as globals.
 //
 // The async-iteration path is the load-bearing one: `for await (const
@@ -184,6 +186,13 @@
       }
       return item;
     }
+    // A BYOB read took `count` bytes off the head chunk: the rest of it
+    // stays at the head (a byte stream's queue; its sizes are byte counts).
+    consumeHead(rest, count) {
+      this._items[this._head] = rest;
+      this._sizes[this._head] -= count;
+      this.totalSize = Math.max(0, this.totalSize - count);
+    }
     clear() {
       this._items = [];
       this._sizes = [];
@@ -267,8 +276,11 @@
     }
     enqueue(chunk) {
       const stream = this._stream;
-      if (stream._isBytes) chunk = byteEnqueueChunk(stream, chunk);
-      else if (!readableCanCloseOrEnqueue(stream)) throw invalidState("Controller is already closed");
+      if (stream._isBytes) {
+        byteEnqueue(stream, byteEnqueueChunk(stream, chunk));
+        return;
+      }
+      if (!readableCanCloseOrEnqueue(stream)) throw invalidState("Controller is already closed");
       readableEnqueue(stream, chunk);
     }
     close() {
@@ -283,6 +295,22 @@
     }
     error(reason) {
       readableError(this._stream, reason);
+    }
+  }
+
+  // A byte stream's controller: the default one's queuing, plus the
+  // byobRequest a source answers a BYOB read through (node's
+  // ReadableByteStreamController getter: made on first ask while a read is
+  // pending, the same object until it is answered).
+  class ReadableByteStreamController extends ReadableStreamDefaultController {
+    get byobRequest() {
+      const stream = this._stream;
+      if (stream._byobRequest === null && stream._pullIntos.length > 0) {
+        const { buffer, byteOffset, bytesFilled, byteLength } = stream._pullIntos[0];
+        const view = new Uint8Array(buffer, byteOffset + bytesFilled, byteLength - bytesFilled);
+        stream._byobRequest = new ReadableStreamBYOBRequest(stream, view);
+      }
+      return stream._byobRequest;
     }
   }
 
@@ -312,7 +340,15 @@
     stream._disturbed = false;
     stream._resolveClosed = undefined;
     stream._rejectClosed = undefined;
-    stream._controller = new ReadableStreamDefaultController(stream);
+    // A byte stream's pending BYOB reads: the standard's pull-into
+    // descriptors (the controller's), the reads waiting on them (the BYOB
+    // reader's readIntoRequests), and the byobRequest made for the first.
+    stream._pullIntos = [];
+    stream._readIntos = new Queue();
+    stream._byobRequest = null;
+    stream._controller = isBytes
+      ? new ReadableByteStreamController(stream)
+      : new ReadableStreamDefaultController(stream);
   }
 
   // start() runs SYNCHRONOUSLY, inside the constructor (WHATWG "set up
@@ -353,7 +389,9 @@
 
   function readableShouldCallPull(stream) {
     if (!readableCanCloseOrEnqueue(stream) || !stream._started) return false;
-    if (stream._reader !== null && stream._waiters.length > 0) return true;
+    if (stream._reader !== null && (stream._waiters.length > 0 || stream._readIntos.length > 0)) {
+      return true;
+    }
     return readableDesiredSize(stream) > 0;
   }
 
@@ -418,6 +456,18 @@
       stream._closeRequested = true;
       return;
     }
+    // node's ReadableByteStreamControllerClose: a BYOB read holding part of
+    // an element can never be completed, so the stream errors. A pending
+    // read otherwise stays pending until the source answers its
+    // byobRequest with respond(0).
+    if (stream._pullIntos.length > 0) {
+      const first = stream._pullIntos[0];
+      if (first.bytesFilled % first.elementSize !== 0) {
+        const error = invalidState("Partial read");
+        readableError(stream, error);
+        throw error;
+      }
+    }
     readableClearAlgorithms(stream);
     readableClose(stream);
   }
@@ -435,6 +485,7 @@
 
   function readableError(stream, reason) {
     if (stream._state !== "readable") return;
+    clearPendingPullIntos(stream);
     resetReadableQueue(stream);
     readableClearAlgorithms(stream);
     stream._state = "errored";
@@ -444,6 +495,9 @@
     while (stream._waiters.length > 0) {
       stream._waiters.shift().reject(reason);
     }
+    while (stream._readIntos.length > 0) {
+      stream._readIntos.shift().reject(reason);
+    }
   }
 
   function readableCancel(stream, reason) {
@@ -451,6 +505,13 @@
     if (stream._state === "closed") return Promise.resolve();
     if (stream._state === "errored") return Promise.reject(stream._error);
     readableClose(stream);
+    // A BYOB read pending at a cancel is done, with no view at all (node's
+    // ReadableStreamCancel); the controller's cancel steps drop the
+    // descriptors with the queue.
+    while (stream._readIntos.length > 0) {
+      stream._readIntos.shift().resolve({ value: undefined, done: true });
+    }
+    clearPendingPullIntos(stream);
     resetReadableQueue(stream);
     const result = stream._cancelAlgorithm(reason);
     readableClearAlgorithms(stream);
@@ -534,9 +595,400 @@
     if (stream._state === "readable") stream._rejectClosed(released);
     else reader.closed = Promise.reject(released);
     markHandled(reader.closed);
+    // The byte controller's release steps: a BYOB read still pending stays
+    // as a descriptor of type "none", so what the source writes into it is
+    // not lost (it is queued when answered); any after it go.
+    if (stream._pullIntos.length > 0) {
+      const first = stream._pullIntos[0];
+      first.type = "none";
+      stream._pullIntos = [first];
+    }
     stream._reader = null;
     stream._resolveClosed = undefined;
     stream._rejectClosed = undefined;
+  }
+
+  // ------------------------------------------------- BYOB reads (bytes)
+  //
+  // node's ReadableStreamBYOBReader and the byte controller's pull-into
+  // algorithms (lib/internal/webstreams/readablestream.js, v22.22.2), step
+  // for step. A read(view) transfers the view's buffer into a descriptor;
+  // queued bytes are copied into it -- at most the view's length, across
+  // chunks, the rest left queued -- and once it holds `min` elements it is
+  // handed back as a view of the caller's type over the transferred buffer.
+  // A read the queue cannot satisfy waits: an enqueue fills it, or the
+  // source writes into controller.byobRequest.view and answers respond().
+  const ArrayBufferPrototypeTransfer = ArrayBuffer.prototype.transfer;
+  const transferBuffer = (buffer) => ArrayBufferPrototypeTransfer.call(buffer);
+  const isDataView = (view) => view instanceof DataView;
+
+  function invalidateBYOBRequest(stream) {
+    const request = stream._byobRequest;
+    if (request === null) return;
+    request._stream = undefined;
+    request._view = null;
+    stream._byobRequest = null;
+  }
+
+  function clearPendingPullIntos(stream) {
+    invalidateBYOBRequest(stream);
+    stream._pullIntos = [];
+  }
+
+  // A descriptor's bytes as the view its read asked for.
+  function convertPullInto(desc) {
+    const { bytesFilled, byteLength, byteOffset, ctor, elementSize } = desc;
+    if (bytesFilled > byteLength) {
+      throw new (codes().ERR_INVALID_STATE.RangeError)("The buffer size is invalid");
+    }
+    const transferred = transferBuffer(desc.buffer);
+    if (ctor === globalThis.Buffer) {
+      return globalThis.Buffer.from(transferred, byteOffset, bytesFilled / elementSize);
+    }
+    return new ctor(transferred, byteOffset, bytesFilled / elementSize);
+  }
+
+  function commitPullInto(stream, desc) {
+    const done = stream._state === "closed";
+    const filled = convertPullInto(desc);
+    const request = stream._readIntos.shift();
+    request.resolve({ value: filled, done });
+  }
+
+  function commitPullIntos(stream, descs) {
+    for (let i = 0; i < descs.length; i++) commitPullInto(stream, descs[i]);
+  }
+
+  // The standard's ReadableByteStreamControllerFillPullIntoDescriptorFromQueue:
+  // true when the descriptor now holds its minimum (whole elements only).
+  function fillPullIntoFromQueue(stream, desc) {
+    const queue = stream._queue;
+    const maxBytesToCopy = Math.min(queue.totalSize, desc.byteLength - desc.bytesFilled);
+    const maxBytesFilled = desc.bytesFilled + maxBytesToCopy;
+    const maxAlignedBytes = maxBytesFilled - (maxBytesFilled % desc.elementSize);
+    let remaining = maxBytesToCopy;
+    let ready = false;
+    if (maxAlignedBytes >= desc.minimumFill) {
+      remaining = maxAlignedBytes - desc.bytesFilled;
+      ready = true;
+    }
+    const dest = new Uint8Array(desc.buffer);
+    while (remaining > 0) {
+      const head = queue.peek();
+      const count = Math.min(remaining, head.byteLength);
+      if (count === head.byteLength) {
+        dest.set(head, desc.byteOffset + desc.bytesFilled);
+        queue.shift();
+      } else {
+        dest.set(head.subarray(0, count), desc.byteOffset + desc.bytesFilled);
+        queue.consumeHead(head.subarray(count), count);
+      }
+      desc.bytesFilled += count;
+      remaining -= count;
+    }
+    return ready;
+  }
+
+  function processPullIntosUsingQueue(stream) {
+    const filled = [];
+    while (stream._pullIntos.length > 0) {
+      if (stream._queue.totalSize === 0) break;
+      const desc = stream._pullIntos[0];
+      if (fillPullIntoFromQueue(stream, desc)) {
+        stream._pullIntos.shift();
+        filled.push(desc);
+      }
+    }
+    return filled;
+  }
+
+  // ReadableByteStreamControllerHandleQueueDrain.
+  function byteHandleQueueDrain(stream) {
+    if (stream._queue.totalSize === 0 && stream._closeRequested) {
+      resetReadableQueue(stream);
+      readableClearAlgorithms(stream);
+      readableClose(stream);
+      return;
+    }
+    readableCallPullIfNeeded(stream);
+  }
+
+  // A released BYOB read's bytes (type "none") go to the queue as a copy.
+  function enqueueDetachedPullIntoToQueue(stream, desc) {
+    if (desc.bytesFilled > 0) {
+      const copy = new Uint8Array(desc.buffer.slice(desc.byteOffset, desc.byteOffset + desc.bytesFilled));
+      stream._queue.push(copy, copy.byteLength);
+    }
+    stream._pullIntos.shift();
+  }
+
+  // ReadableByteStreamControllerEnqueue, past the controller's checks.
+  function byteEnqueue(stream, chunk) {
+    if (stream._pullIntos.length > 0) {
+      const first = stream._pullIntos[0];
+      if (first.buffer.detached) throw invalidState("Destination ArrayBuffer is detached");
+      invalidateBYOBRequest(stream);
+      first.buffer = transferBuffer(first.buffer);
+      if (first.type === "none") enqueueDetachedPullIntoToQueue(stream, first);
+    }
+    if (stream._reader !== null && byobReaders.has(stream._reader)) {
+      stream._queue.push(chunk, chunk.byteLength);
+      commitPullIntos(stream, processPullIntosUsingQueue(stream));
+      readableCallPullIfNeeded(stream);
+      return;
+    }
+    // A default reader, or none: what a released BYOB read left queued is
+    // read first, then the chunk goes to a waiting read or the queue.
+    while (stream._waiters.length > 0 && stream._queue.length > 0) {
+      const value = stream._queue.shift();
+      stream._waiters.shift().resolve({ value, done: false });
+    }
+    readableEnqueue(stream, chunk);
+  }
+
+  // ReadableByteStreamControllerPullInto.
+  function bytePullInto(stream, view, min, request) {
+    let elementSize = 1;
+    let ctor = DataView;
+    if (!isDataView(view)) {
+      elementSize = view.constructor.BYTES_PER_ELEMENT;
+      ctor = view.constructor;
+    }
+    const buffer = view.buffer;
+    const byteOffset = view.byteOffset;
+    const byteLength = view.byteLength;
+    const bufferByteLength = buffer.byteLength;
+    let transferred;
+    try {
+      transferred = transferBuffer(buffer);
+    } catch (error) {
+      request.reject(error);
+      return;
+    }
+    const desc = {
+      buffer: transferred,
+      bufferByteLength,
+      byteOffset,
+      byteLength,
+      bytesFilled: 0,
+      minimumFill: min * elementSize,
+      elementSize,
+      ctor,
+      type: "byob",
+    };
+    if (stream._pullIntos.length > 0) {
+      stream._pullIntos.push(desc);
+      stream._readIntos.push(request);
+      return;
+    }
+    if (stream._state === "closed") {
+      request.resolve({ value: new ctor(desc.buffer, byteOffset, 0), done: true });
+      return;
+    }
+    if (stream._queue.totalSize > 0) {
+      if (fillPullIntoFromQueue(stream, desc)) {
+        const filled = convertPullInto(desc);
+        byteHandleQueueDrain(stream);
+        request.resolve({ value: filled, done: false });
+        return;
+      }
+      if (stream._closeRequested) {
+        const error = invalidState("ReadableStream closed");
+        readableError(stream, error);
+        request.reject(error);
+        return;
+      }
+    }
+    stream._pullIntos.push(desc);
+    stream._readIntos.push(request);
+    readableCallPullIfNeeded(stream);
+  }
+
+  function respondInClosedState(stream, desc) {
+    if (desc.type === "none") stream._pullIntos.shift();
+    if (stream._reader !== null && byobReaders.has(stream._reader)) {
+      const filled = [];
+      const pending = stream._readIntos.length;
+      for (let i = 0; i < pending; i++) filled.push(stream._pullIntos.shift());
+      commitPullIntos(stream, filled);
+    }
+  }
+
+  function respondInReadableState(stream, bytesWritten, desc) {
+    if (desc.bytesFilled + bytesWritten > desc.byteLength) {
+      throw new (codes().ERR_INVALID_STATE.RangeError)("The buffer size is invalid");
+    }
+    desc.bytesFilled += bytesWritten;
+    if (desc.type === "none") {
+      enqueueDetachedPullIntoToQueue(stream, desc);
+      commitPullIntos(stream, processPullIntosUsingQueue(stream));
+      return;
+    }
+    if (desc.bytesFilled < desc.minimumFill) return;
+    stream._pullIntos.shift();
+    const remainderSize = desc.bytesFilled % desc.elementSize;
+    if (remainderSize) {
+      const end = desc.byteOffset + desc.bytesFilled;
+      const remainder = new Uint8Array(desc.buffer.slice(end - remainderSize, end));
+      stream._queue.push(remainder, remainder.byteLength);
+    }
+    desc.bytesFilled -= remainderSize;
+    const filled = processPullIntosUsingQueue(stream);
+    commitPullInto(stream, desc);
+    commitPullIntos(stream, filled);
+  }
+
+  function respondInternal(stream, bytesWritten) {
+    const desc = stream._pullIntos[0];
+    invalidateBYOBRequest(stream);
+    if (stream._state === "closed") {
+      if (bytesWritten) throw invalidState("Controller is closed but view is not zero-length");
+      respondInClosedState(stream, desc);
+    } else {
+      if (!bytesWritten) throw invalidState("View cannot be zero-length");
+      respondInReadableState(stream, bytesWritten, desc);
+    }
+    readableCallPullIfNeeded(stream);
+  }
+
+  // node's ReadableStreamBYOBRequest: the view the source writes into, and
+  // its two answers. Invalidated (no stream, no view) once answered, or
+  // when an enqueue, an error or a cancel makes it moot.
+  class ReadableStreamBYOBRequest {
+    constructor(stream, view) {
+      this._stream = stream;
+      this._view = view;
+    }
+    get view() {
+      return this._view;
+    }
+    respond(bytesWritten) {
+      const stream = this._stream;
+      if (stream === undefined) throw invalidState("This BYOB request has been invalidated");
+      if (this._view.buffer.detached) throw invalidState("Viewed ArrayBuffer is detached");
+      byteRespond(stream, bytesWritten);
+    }
+    respondWithNewView(view) {
+      const stream = this._stream;
+      if (stream === undefined) throw invalidState("This BYOB request has been invalidated");
+      if (!ArrayBuffer.isView(view)) {
+        throw new (codes().ERR_INVALID_ARG_TYPE)("view", ["Buffer", "TypedArray", "DataView"], view);
+      }
+      if (view.buffer.detached) throw invalidState("Viewed ArrayBuffer is detached");
+      byteRespondWithNewView(stream, view);
+    }
+  }
+
+  // ReadableByteStreamControllerRespond.
+  function byteRespond(stream, bytesWritten) {
+    const desc = stream._pullIntos[0];
+    if (stream._state === "closed") {
+      if (bytesWritten !== 0) throw new (codes().ERR_INVALID_ARG_VALUE)("bytesWritten", bytesWritten);
+    } else {
+      if (!bytesWritten) throw new (codes().ERR_INVALID_ARG_VALUE)("bytesWritten", bytesWritten);
+      if (desc.bytesFilled + bytesWritten > desc.byteLength) {
+        throw new (codes().ERR_INVALID_ARG_VALUE.RangeError)("bytesWritten", bytesWritten);
+      }
+    }
+    desc.buffer = transferBuffer(desc.buffer);
+    respondInternal(stream, bytesWritten);
+  }
+
+  // ReadableByteStreamControllerRespondWithNewView.
+  function byteRespondWithNewView(stream, view) {
+    const desc = stream._pullIntos[0];
+    const viewByteLength = view.byteLength;
+    if (stream._state === "closed") {
+      if (viewByteLength !== 0) throw invalidState("View is not zero-length");
+    } else if (viewByteLength === 0) {
+      throw invalidState("View is zero-length");
+    }
+    if (
+      desc.byteOffset + desc.bytesFilled !== view.byteOffset ||
+      desc.bytesFilled + viewByteLength > desc.byteLength ||
+      desc.bufferByteLength !== view.buffer.byteLength
+    ) {
+      throw new (codes().ERR_INVALID_ARG_VALUE.RangeError)("view", view);
+    }
+    desc.buffer = transferBuffer(view.buffer);
+    respondInternal(stream, viewByteLength);
+  }
+  Object.defineProperty(ReadableStreamBYOBRequest.prototype, Symbol.toStringTag, {
+    value: "ReadableStreamBYOBRequest",
+    configurable: true,
+  });
+
+  // The readers getReader({ mode: 'byob' }) has made, told apart from
+  // default readers by the controller's algorithms.
+  const byobReaders = new WeakSet();
+  const BYOBReaderPrototype = Object.create(Object.prototype, {
+    [Symbol.toStringTag]: { value: "ReadableStreamBYOBReader", configurable: true },
+  });
+
+  // node's setupReadableStreamBYOBReader and the reader's methods. Shaped as
+  // the default reader is (acquireDefaultReader): own read / cancel /
+  // releaseLock / closed.
+  function acquireBYOBReader(stream) {
+    if (stream._reader !== null) throw invalidState("ReadableStream is locked");
+    if (!stream._isBytes) {
+      throw new (codes().ERR_INVALID_ARG_VALUE)("stream", stream, "must be a byte stream");
+    }
+    let closedResolve;
+    let closedReject;
+    const closed = new Promise((resolve, reject) => {
+      closedResolve = resolve;
+      closedReject = reject;
+    });
+    markHandled(closed);
+    if (stream._state === "closed") closedResolve();
+    if (stream._state === "errored") closedReject(stream._error);
+    stream._resolveClosed = closedResolve;
+    stream._rejectClosed = closedReject;
+
+    const reader = Object.create(BYOBReaderPrototype);
+    reader.closed = closed;
+    // An async function, as node's is: every check rejects.
+    reader.read = async function read(view, options = {}) {
+      if (!ArrayBuffer.isView(view)) {
+        throw new (codes().ERR_INVALID_ARG_TYPE)("view", ["Buffer", "TypedArray", "DataView"], view);
+      }
+      validateObjectArg(options, "options", true);
+      if (view.byteLength === 0 || view.buffer.byteLength === 0) {
+        throw invalidState("View or Viewed ArrayBuffer is zero-length or detached");
+      }
+      const min = options?.min ?? 1;
+      if (typeof min !== "number") throw new (codes().ERR_INVALID_ARG_TYPE)("options.min", "number", min);
+      if (!Number.isInteger(min)) {
+        throw new (codes().ERR_INVALID_ARG_VALUE)("options.min", min, "must be an integer");
+      }
+      if (min <= 0) throw new (codes().ERR_INVALID_ARG_VALUE)("options.min", min, "must be greater than 0");
+      if (!isDataView(view)) {
+        if (min > view.length) throw new (codes().ERR_OUT_OF_RANGE)("options.min", "<= view.length", min);
+      } else if (min > view.byteLength) {
+        throw new (codes().ERR_OUT_OF_RANGE)("options.min", "<= view.byteLength", min);
+      }
+      if (stream._reader !== reader) throw invalidState("The reader is not attached to a stream");
+      return new Promise((resolve, reject) => {
+        stream._disturbed = true;
+        if (stream._state === "errored") reject(stream._error);
+        else bytePullInto(stream, view, min, { resolve, reject });
+      });
+    };
+    reader.cancel = function cancel(reason) {
+      if (stream._reader !== reader) {
+        return Promise.reject(invalidState("The reader is not attached to a stream"));
+      }
+      return readableCancel(stream, reason);
+    };
+    reader.releaseLock = function releaseLock() {
+      if (stream._reader !== reader) return;
+      readableReaderGenericRelease(stream, reader);
+      const releasing = readerReleasingError();
+      while (stream._readIntos.length > 0) stream._readIntos.shift().reject(releasing);
+    };
+    byobReaders.add(reader);
+    stream._reader = reader;
+    return reader;
   }
 
   // node's validateAbortSignal: duck-typed on `aborted`.
@@ -748,8 +1200,8 @@
       const pull = source.pull;
       const cancel = source.cancel;
       if (isBytes) {
-        // Read, and 0 refused, as node does; there is no byobRequest for
-        // it to size (docs/node-divergences.md).
+        // Read, and 0 refused, as node does; a default read gets no
+        // byobRequest for it to size (docs/node-divergences.md).
         const autoAllocateChunkSize = source.autoAllocateChunkSize;
         if (autoAllocateChunkSize === 0) {
           throw new (codes().ERR_INVALID_ARG_VALUE)(
@@ -770,8 +1222,14 @@
       return this._reader !== null;
     }
 
-    getReader() {
-      return acquireDefaultReader(this);
+    // node's checks: options an object (or null), then the mode -- absent
+    // for a default reader, else it must stringify to "byob".
+    getReader(options = {}) {
+      validateObjectArg(options, "options", true);
+      const mode = options?.mode;
+      if (mode === undefined) return acquireDefaultReader(this);
+      if (`${mode}` !== "byob") throw new (codes().ERR_INVALID_ARG_VALUE)("options.mode", mode);
+      return acquireBYOBReader(this);
     }
 
     cancel(reason) {

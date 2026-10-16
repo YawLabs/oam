@@ -14139,17 +14139,14 @@
       // warning text carries node's own typo ("steam"), reproduced here so
       // a caller matching on it sees the same bytes.
       //
-      // DIVERGENCE, deliberate, and the only one: node's stream is a BYTE
-      // stream (`type: 'bytes'`, autoAllocateChunkSize 16384), so
-      // `getReader({ mode: 'byob' })` there returns a real
-      // ReadableStreamBYOBReader. oam's web-streams layer (js/streams.js)
-      // is default-reader-only -- a `type: 'bytes'` stream queues bytes
-      // and pulls as node's does, but has no byobRequest -- so this
-      // returns a stream read through a default reader, carrying the same 16 KiB
-      // plain-Uint8Array chunks, at the same boundaries, off the same read
-      // path. Everything reachable through a default reader or async
-      // iteration matches node; a BYOB reader does not. The fix belongs in
-      // js/streams.js's controller, not in a second reader here.
+      // node's stream is a BYTE stream (`type: 'bytes'`,
+      // autoAllocateChunkSize 16384) whose pull reads into
+      // controller.byobRequest.view and answers respond(bytesRead). A BYOB
+      // read does exactly that here (js/streams.js has the byobRequest). A
+      // default read has no byobRequest in oam -- autoAllocateChunkSize is
+      // not implemented -- so it reads a 16 KiB view of its own and enqueues
+      // it: the same plain-Uint8Array chunks, at the same boundaries, off
+      // the same read path.
       readableWebStream(options = undefined) {
         const fh = this, h = this[kNative];
         if (fh[kFd] === -1) throw codes.ERR_INVALID_STATE("The FileHandle is closed");
@@ -14202,7 +14199,25 @@
             // chunk is dropped, exactly as a cancel drops it).
             if (gone()) {
               controller.close();
+              // A BYOB read waiting is done (a closed byte stream answers
+              // a pending one only through respond(0)).
+              controller.byobRequest?.respond(0);
               await ondone();
+              return;
+            }
+            var request = controller.byobRequest;
+            if (request !== null) {
+              // node's pull, as it is: the view's own byteOffset passed as
+              // the offset into the view.
+              var target = request.view;
+              var got = await fh.read(target, target.byteOffset, target.byteLength);
+              if (gone() || got.bytesRead === 0) {
+                controller.close();
+                await ondone();
+                controller.byobRequest?.respond(0);
+                return;
+              }
+              controller.byobRequest.respond(got.bytesRead);
               return;
             }
             var view = new Uint8Array(CHUNK);

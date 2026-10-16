@@ -673,6 +673,8 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
           const { done, value } = await iterator.next();
           if (done) {
             controller.close();
+            // A BYOB read waiting on it is done (undici's ReadableStreamFrom).
+            controller.byobRequest?.respond(0);
             return;
           }
           const B = globalThis.Buffer;
@@ -2052,6 +2054,8 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
           if (chunk === undefined) {
             bodyOver();
             controller.close();
+            // A BYOB read waiting on the end is done, as undici answers it.
+            controller.byobRequest?.respond(0);
           } else controller.enqueue(chunk);
         },
         cancel() {
