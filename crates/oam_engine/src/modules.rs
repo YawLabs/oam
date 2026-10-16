@@ -1676,9 +1676,10 @@ pub(crate) fn run_ticks_and_microtasks(
                 // timer callback's throw (handle_uncaught_throw): handled
                 // continues the run, fatal/handler-threw fails it. Handled
                 // ALSO defers the interrupted batch -- node keeps the
-                // remaining ticks queued and drains them at the next tick
-                // point, AFTER the next macrotask (probe-verified), so do
-                // not checkpoint-drain them in place.
+                // remaining ticks queued and drains them at its next tick
+                // point: after the next callback, or at its check phase
+                // (pump_event_loop places that), so do not checkpoint-drain
+                // them in place.
                 if let Some(failure) = handle_uncaught_throw(tc, "process.nextTick") {
                     return Some(failure);
                 }
@@ -1736,6 +1737,14 @@ pub(crate) fn run_platform_tasks(
         }
         if let Some(failure) = drain_uncaught(tc) {
             return Err(failure);
+        }
+        // This task's drain rejected the ES module entry: it is reported
+        // next, and node runs nothing before that -- not the rest of this
+        // batch, whose tasks (another async WebAssembly compile's
+        // continuation) would run user code first (#399 item 11). The
+        // tasks left are dropped with the run.
+        if entry_rejected(tc) {
+            break;
         }
     }
     Ok(ran)
@@ -1806,6 +1815,35 @@ fn emit_before_exit(
     Ok((emitted, handled_throw))
 }
 
+/// The kind of callback the event loop ran last ([`pump_event_loop`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LastRan {
+    /// Nothing yet: the entry (or whatever ran before the loop).
+    Entry,
+    Timer,
+    /// An immediate, with the instant its check phase began.
+    Immediate(std::time::Instant),
+    /// An I/O callback, a V8 foreground task, or a pending callback.
+    Other,
+}
+
+/// Run the ticks a handled throw left queued, as node's check phase does:
+/// its callback scope's close runs the whole queue, delivering each handled
+/// throw and going on with the rest (#366).
+fn drain_deferred_ticks(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> Result<(), Vec<Diagnostic>> {
+    while has_pending_ticks(tc) && !entry_rejected(tc) {
+        if let Some(failure) = run_ticks_and_microtasks(tc) {
+            return Err(failure);
+        }
+        if let Some(failure) = drain_uncaught(tc) {
+            return Err(failure);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn pump_event_loop(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     entry_promise: Option<v8::Local<'_, v8::Promise>>,
@@ -1816,6 +1854,8 @@ pub(crate) fn pump_event_loop(
     // handler-scheduled work re-arms the NEXT drain's emission while a
     // handler that schedules nothing exits after a single emission.
     let mut before_exit_emitted = false;
+    // What the loop ran last, for where a deferred tick batch drains.
+    let mut last_ran = LastRan::Entry;
     loop {
         // One HandleScope per turn. Every Local a turn creates -- the
         // resolver a completion settles and the value it settles with, a
@@ -1892,6 +1932,26 @@ pub(crate) fn pump_event_loop(
                 .is_some_and(|core| core.has_inflight());
             !has_ref && !has_inflight && !has_pending_ticks(tc)
         };
+        // Ticks left queued by a handled throw run at node's next tick
+        // point, which falls before this turn's callback when that callback
+        // opens a phase node reaches only after its check phase: an
+        // immediate of a new check phase, or a timer after an I/O callback
+        // (the poll phase is followed by the check phase).
+        if !only_unref_timers_left && has_pending_ticks(tc) {
+            let next = tc
+                .get_slot_mut::<crate::timers::TimerQueue>()
+                .and_then(|queue| queue.peek_due(now));
+            let check_phase_first = match next {
+                Some(crate::timers::Due::Immediate { queued }) => {
+                    !matches!(last_ran, LastRan::Immediate(began) if queued <= began)
+                }
+                Some(crate::timers::Due::Timer) => last_ran == LastRan::Other,
+                _ => false,
+            };
+            if check_phase_first {
+                drain_deferred_ticks(tc)?;
+            }
+        }
         let due = if only_unref_timers_left {
             None
         } else {
@@ -1899,6 +1959,14 @@ pub(crate) fn pump_event_loop(
                 .and_then(|queue| queue.pop_due(now))
         };
         if let Some((callback, extra)) = due {
+            last_ran = match tc
+                .get_slot::<crate::timers::TimerQueue>()
+                .and_then(|queue| queue.popped())
+            {
+                Some(crate::timers::Due::Timer) => LastRan::Timer,
+                Some(crate::timers::Due::Immediate { queued }) => LastRan::Immediate(queued),
+                _ => LastRan::Other,
+            };
             let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
             let callback = v8::Local::new(tc, &callback);
             let args: Vec<v8::Local<v8::Value>> =
@@ -1939,6 +2007,7 @@ pub(crate) fn pump_event_loop(
         // V8's foreground tasks (platform.rs) -- node runs them from its
         // loop's poll phase, each followed by a tick + microtask drain.
         if run_platform_tasks(tc)? {
+            last_ran = LastRan::Other;
             progressed = true;
         }
         if entry_promise.is_some_and(|promise| promise.state() == v8::PromiseState::Rejected) {
@@ -1966,10 +2035,21 @@ pub(crate) fn pump_event_loop(
             if let Some(failure) = drain_uncaught(tc) {
                 return Err(failure);
             }
+            last_ran = LastRan::Other;
             progressed = true;
         }
         if progressed {
             before_exit_emitted = false;
+            continue;
+        }
+        // Nothing is due. Ticks a handled throw left queued in a callback
+        // run at the check phase node passes through before it waits again
+        // (#399 item 8: a 1 ms timer's batch drains before a 5 ms timer).
+        // Not after the entry: node's first timers phase comes before that
+        // check phase, and a timer the entry set is due in it by node's
+        // loop clock -- draining here put "after" ahead of a 1 ms timer.
+        if last_ran != LastRan::Entry && has_pending_ticks(tc) {
+            drain_deferred_ticks(tc)?;
             continue;
         }
 
