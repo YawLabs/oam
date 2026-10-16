@@ -844,8 +844,11 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       const bytes = state.used ? null : state.bytes;
       state.stream = new globalThis.ReadableStream({
         type: "bytes", // undici's body streams are byte streams
+        // A copy: the bytes are shared -- with a clone() of this body, and
+        // with the Blob they came from -- and what a reader is handed is its
+        // own to write to (undici's enqueue transfers its own copy).
         start(controller) {
-          if (bytes !== null && bytes.length > 0) controller.enqueue(bytes);
+          if (bytes !== null && bytes.length > 0) controller.enqueue(bytes.slice());
           controller.close();
         },
       });

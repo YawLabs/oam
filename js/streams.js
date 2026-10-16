@@ -991,6 +991,207 @@
     return reader;
   }
 
+  // node's internal ReadableByteStreamControllerEnqueue / Close: nothing on
+  // a stream that is closing or no longer readable.
+  function byteControllerEnqueue(stream, chunk) {
+    if (stream._closeRequested || stream._state !== "readable") return;
+    byteEnqueue(stream, chunk);
+  }
+  function byteControllerClose(stream) {
+    if (stream._closeRequested || stream._state !== "readable") return;
+    readableControllerClose(stream);
+  }
+
+  // node's readableByteStreamTee (the standard's ReadableByteStreamTee): two
+  // byte streams over one reader of the source. A branch's default read
+  // reads the source through a default reader and the second branch is
+  // handed a copy of each chunk; a branch's BYOB read reads the source
+  // through a BYOB reader into that read's own view, and the other branch
+  // is handed a copy of what was read -- so both see the same bytes, in the
+  // sizes the reading branch asked for, and neither sees the other's
+  // writes.
+  function byteStreamTee(stream) {
+    let reader = acquireDefaultReader(stream);
+    let reading = false;
+    let readAgainForBranch1 = false;
+    let readAgainForBranch2 = false;
+    let canceled1 = false;
+    let canceled2 = false;
+    let reason1;
+    let reason2;
+    const cancelDeferred = deferred();
+    const cloneAsUint8Array = (chunk) =>
+      new Uint8Array(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
+
+    function forwardReaderError(thisReader) {
+      then(thisReader.closed, undefined, (error) => {
+        if (thisReader !== reader) return;
+        readableError(branch1, error);
+        readableError(branch2, error);
+        if (!canceled1 || !canceled2) cancelDeferred.resolve();
+      });
+    }
+
+    function cloneFailed(error) {
+      readableError(branch1, error);
+      readableError(branch2, error);
+      cancelDeferred.resolve(readableCancel(stream, error));
+    }
+
+    function readAgain() {
+      if (readAgainForBranch1) pull1Algorithm();
+      else if (readAgainForBranch2) pull2Algorithm();
+    }
+
+    function pullWithDefaultReader() {
+      if (byobReaders.has(reader)) {
+        reader.releaseLock();
+        reader = acquireDefaultReader(stream);
+        forwardReaderError(reader);
+      }
+      readableReaderRead(stream, {
+        resolve({ value: chunk, done }) {
+          if (done) {
+            reading = false;
+            if (!canceled1) byteControllerClose(branch1);
+            if (!canceled2) byteControllerClose(branch2);
+            if (branch1._pullIntos.length > 0) byteRespond(branch1, 0);
+            if (branch2._pullIntos.length > 0) byteRespond(branch2, 0);
+            if (!canceled1 || !canceled2) cancelDeferred.resolve();
+            return;
+          }
+          queueMicrotask(() => {
+            readAgainForBranch1 = false;
+            readAgainForBranch2 = false;
+            const chunk1 = chunk;
+            let chunk2 = chunk;
+            if (!canceled1 && !canceled2) {
+              try {
+                chunk2 = cloneAsUint8Array(chunk);
+              } catch (error) {
+                cloneFailed(error);
+                return;
+              }
+            }
+            if (!canceled1) byteControllerEnqueue(branch1, chunk1);
+            if (!canceled2) byteControllerEnqueue(branch2, chunk2);
+            reading = false;
+            readAgain();
+          });
+        },
+        reject() {
+          reading = false;
+        },
+      });
+    }
+
+    function pullWithBYOBReader(view, forBranch2) {
+      if (!byobReaders.has(reader)) {
+        reader.releaseLock();
+        reader = acquireBYOBReader(stream);
+        forwardReaderError(reader);
+      }
+      const byobBranch = forBranch2 ? branch2 : branch1;
+      const otherBranch = forBranch2 ? branch1 : branch2;
+      const request = {
+        resolve({ value: chunk, done }) {
+          const byobCanceled = forBranch2 ? canceled2 : canceled1;
+          const otherCanceled = forBranch2 ? canceled1 : canceled2;
+          if (done) {
+            reading = false;
+            if (!byobCanceled) byteControllerClose(byobBranch);
+            if (!otherCanceled) byteControllerClose(otherBranch);
+            if (chunk !== undefined) {
+              if (!byobCanceled) byteRespondWithNewView(byobBranch, chunk);
+              if (!otherCanceled && otherBranch._pullIntos.length > 0) byteRespond(otherBranch, 0);
+            }
+            if (!byobCanceled || !otherCanceled) cancelDeferred.resolve();
+            return;
+          }
+          queueMicrotask(() => {
+            readAgainForBranch1 = false;
+            readAgainForBranch2 = false;
+            const byobCanceledNow = forBranch2 ? canceled2 : canceled1;
+            const otherCanceledNow = forBranch2 ? canceled1 : canceled2;
+            if (!otherCanceledNow) {
+              let cloned;
+              try {
+                cloned = cloneAsUint8Array(chunk);
+              } catch (error) {
+                cloneFailed(error);
+                return;
+              }
+              if (!byobCanceledNow) byteRespondWithNewView(byobBranch, chunk);
+              byteControllerEnqueue(otherBranch, cloned);
+            } else if (!byobCanceledNow) {
+              byteRespondWithNewView(byobBranch, chunk);
+            }
+            reading = false;
+            readAgain();
+          });
+        },
+        reject() {
+          reading = false;
+        },
+      };
+      stream._disturbed = true;
+      if (stream._state === "errored") request.reject(stream._error);
+      else bytePullInto(stream, view, 1, request);
+    }
+
+    function pull1Algorithm() {
+      if (reading) {
+        readAgainForBranch1 = true;
+        return Promise.resolve();
+      }
+      reading = true;
+      const byobRequest = branch1._controller.byobRequest;
+      if (byobRequest === null) pullWithDefaultReader();
+      else pullWithBYOBReader(byobRequest._view, false);
+      return Promise.resolve();
+    }
+
+    function pull2Algorithm() {
+      if (reading) {
+        readAgainForBranch2 = true;
+        return Promise.resolve();
+      }
+      reading = true;
+      const byobRequest = branch2._controller.byobRequest;
+      if (byobRequest === null) pullWithDefaultReader();
+      else pullWithBYOBReader(byobRequest._view, true);
+      return Promise.resolve();
+    }
+
+    function cancel1Algorithm(reason) {
+      canceled1 = true;
+      reason1 = reason;
+      if (canceled2) cancelDeferred.resolve(readableCancel(stream, [reason1, reason2]));
+      return cancelDeferred.promise;
+    }
+
+    function cancel2Algorithm(reason) {
+      canceled2 = true;
+      reason2 = reason;
+      if (canceled1) cancelDeferred.resolve(readableCancel(stream, [reason1, reason2]));
+      return cancelDeferred.promise;
+    }
+
+    const branch1 = createByteReadable(pull1Algorithm, cancel1Algorithm);
+    const branch2 = createByteReadable(pull2Algorithm, cancel2Algorithm);
+    forwardReaderError(reader);
+    return [branch1, branch2];
+  }
+
+  // A byte stream built over internal algorithms, as node's
+  // createReadableByteStream builds one (high-water mark 0).
+  function createByteReadable(pullAlgorithm, cancelAlgorithm) {
+    const stream = Object.create(ReadableStream.prototype);
+    initReadable(stream, 0, byteChunkSize, true);
+    setupReadable(stream, nonOpStart, pullAlgorithm, cancelAlgorithm);
+    return stream;
+  }
+
   // node's validateAbortSignal: duck-typed on `aborted`.
   function validateAbortSignal(signal, name) {
     if (signal === null || typeof signal !== "object" || !("aborted" in signal)) {
@@ -1258,7 +1459,10 @@
       return this[Symbol.asyncIterator](options);
     }
 
+    // A byte stream tees as the standard's ReadableByteStreamTee (below); a
+    // default stream's branches share each chunk.
     tee() {
+      if (this._isBytes) return byteStreamTee(this);
       const reader = this.getReader();
       const queues = [new Queue(), new Queue()];
       let pulling = null;
