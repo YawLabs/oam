@@ -972,12 +972,29 @@ pub struct PermissionDenial {
     pub resource: String,
 }
 
-/// Node's message for `ERR_ACCESS_DENIED`.
-pub const ACCESS_DENIED_MESSAGE: &str = "Access to this API has been restricted";
+/// Node's message for `ERR_ACCESS_DENIED` of `permission`: its sentence,
+/// then the flag that grants the scope (node's CreateAccessDeniedError and
+/// its per-scope flag table), or nothing after the sentence's trailing space
+/// for a scope with no flag. `Net` and `Environment` are oam's own scopes, so
+/// they name oam's own flags in node's form.
+pub fn access_denied_message(permission: &str) -> String {
+    let flag = match permission {
+        "FileSystemRead" => "--allow-fs-read",
+        "FileSystemWrite" => "--allow-fs-write",
+        "ChildProcess" => "--allow-child-process",
+        "WorkerThreads" => "--allow-worker",
+        "WASI" => "--allow-wasi",
+        "Addon" => "--allow-addons",
+        "Net" => "--allow-net",
+        "Environment" => "--allow-env",
+        _ => return "Access to this API has been restricted. ".to_string(),
+    };
+    format!("Access to this API has been restricted. Use {flag} to manage permissions.")
+}
 
 impl std::fmt::Display for PermissionDenial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(ACCESS_DENIED_MESSAGE)
+        f.write_str(&access_denied_message(self.permission))
     }
 }
 
