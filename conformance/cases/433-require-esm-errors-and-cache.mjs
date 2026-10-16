@@ -61,7 +61,12 @@ require.cache[require('path').join(__dirname, 'planted.cjs')] = { exports: 'PLAN
 show('planted entry', require('./planted.cjs'));
 require('./j.json');
 show('listed', Object.keys(require.cache).map(clean));
+// The same planted entry, seen through the ESM side: an import() of a .cjs
+// goes through the generated facade, whose __oam.requireCjs reads the shared
+// require.cache first, so the import gets the planted exports too (node).
+import('./uses-planted.mjs').catch((e) => show('import error', e.message));
 `,
+  "uses-planted.mjs": "import x from './planted.cjs';\nconsole.log('import of planted dep:', JSON.stringify(x));\n",
 };
 
 try {
