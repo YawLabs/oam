@@ -37,6 +37,17 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   after its last output. `--check=warn` and `--check=block` still check, as does `oam check`;
   `oam serve` no longer checks either. The bare form `oam x.ts` never checked.
 
+### Added
+
+- **`v8.getHeapSnapshot()` and `v8.writeHeapSnapshot()` take real heap snapshots, as node's do.**
+  `getHeapSnapshot` was missing, so importing it was a link-time `SyntaxError`, and
+  `writeHeapSnapshot` wrote nothing and returned `""`. Both now serialize V8's own snapshot, the
+  `.heapsnapshot` JSON Chrome DevTools loads: a `HeapSnapshotStream` of Buffers, or a file named as
+  node names it (`Heap.<date>.<time>.<pid>.<threadId>.<seq>.heapsnapshot`, one process-wide `seq`),
+  in a worker too, with node's argument checks and errors. The `exposeInternals` and
+  `exposeNumericValues` options are checked but not honoured, and `worker.getHeapSnapshot()` rejects
+  rather than resolve an empty array; see docs/node-divergences.md.
+
 ### Fixed
 
 - **Buffer's string paths no longer encode into a temporary, and match node where they did not.**

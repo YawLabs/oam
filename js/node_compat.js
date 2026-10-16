@@ -1167,6 +1167,9 @@
   codes.ERR_METHOD_NOT_IMPLEMENTED = E("ERR_METHOD_NOT_IMPLEMENTED", TypeError, function(name) {
     return 'The ' + name + ' method is not implemented';
   });
+  codes.ERR_WORKER_NOT_RUNNING = E("ERR_WORKER_NOT_RUNNING", Error, function() {
+    return 'Worker instance not running';
+  });
   codes.ERR_SOCKET_BAD_TYPE = E("ERR_SOCKET_BAD_TYPE", TypeError, function() {
     return 'Bad socket type specified. Valid types are: udp4, udp6';
   });
@@ -34246,9 +34249,9 @@
   };
 
   // ---------------------------------------------------------------------- v8
-  // v8 module stub: expose minimal heap / serialization surface. Real V8
-  // bindings land with the diagnostics wave; for now, feature-detect callers
-  // get safe defaults and serialization uses JSON under a V8 wire header.
+  // v8 module: heap statistics and heap snapshots are V8's own (natives);
+  // the rest is a minimal surface -- feature-detect callers get safe
+  // defaults and serialization uses JSON under a V8 wire header.
   registry.factories.v8 = (natives) => {
     // V8 serialization wire format sentinel bytes: 0xff 0x0d (version 13).
     function serialize(value) {
@@ -34295,7 +34298,101 @@
       return { code_and_metadata_size: 0, bytecode_and_metadata_size: 0, external_script_source_size: 0 };
     }
     function setFlagsFromString() {}
-    function writeHeapSnapshot() { return ""; }
+    // node's getHeapSnapshotOptions (lib/internal/heap_utils.js): an options
+    // object whose two flags must be booleans when present. Validated exactly
+    // as node does so a bad call throws the same TypeError here. The flags
+    // themselves are not honoured: the snapshot is taken through the v8
+    // crate's take_heap_snapshot, which passes V8 its default options (no
+    // internals exposed, no numeric values) -- see docs/node-divergences.md.
+    function heapSnapshotOptions(options) {
+      if (options === undefined) return;
+      if (options === null || typeof options !== "object" || Array.isArray(options)) {
+        throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+      }
+      for (const name of ["exposeInternals", "exposeNumericValues"]) {
+        const value = options[name];
+        if (value !== undefined && typeof value !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE(`options.${name}`, "boolean", value);
+        }
+      }
+    }
+    // node's DiagnosticFilename (src/node_report.cc / util.cc):
+    // `Heap.YYYYMMDD.HHMMSS.<pid>.<threadId>.<seq>.heapsnapshot`, local time,
+    // seq zero-padded to three digits from ONE process-wide counter (a
+    // worker's file continues the main thread's numbering).
+    function diagnosticFilename(prefix, ext) {
+      const d = new Date();
+      const p2 = (n) => String(n).padStart(2, "0");
+      const date = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}`;
+      const time = `${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
+      const tid = natives.workerThreadId();
+      const seq = String(natives.heapSnapshotSeq()).padStart(3, "0");
+      return `${prefix}.${date}.${time}.${process.pid}.${tid}.${seq}.${ext}`;
+    }
+    // v8.writeHeapSnapshot([filename[, options]]): node validates the path
+    // (getValidatedPath: string, Buffer or file: URL), writes the snapshot, and
+    // returns the filename AS VALIDATED -- the string, the very Buffer passed,
+    // or the URL's path -- or, with no filename, the generated name, which is
+    // relative to (and written into) the cwd.
+    function writeHeapSnapshot(filename, options) {
+      let path;
+      if (filename !== undefined) path = toPath(filename);
+      heapSnapshotOptions(options);
+      if (path === undefined) {
+        const name = diagnosticFilename("Heap", "heapsnapshot");
+        natives.fsWriteHeapSnapshot(name, true);
+        return name;
+      }
+      natives.fsWriteHeapSnapshot(path, false);
+      return filename instanceof Uint8Array ? filename : path;
+    }
+    // v8.getHeapSnapshot([options]): a Readable over the snapshot JSON. node
+    // takes the snapshot synchronously in the call and then streams the
+    // serialized bytes out as Buffers; so does this, in 64 KiB chunks (node's
+    // first chunk measured 65536 bytes). The class name is node's own, which
+    // is what `stream.constructor.name` shows.
+    let HeapSnapshotStream;
+    function heapSnapshotStreamOf(bytes) {
+      if (HeapSnapshotStream === undefined) {
+        const { Readable } = registry.get("stream");
+        HeapSnapshotStream = class HeapSnapshotStream extends Readable {
+          constructor(json) {
+            super({ autoDestroy: true });
+            this._json = json;
+            this._offset = 0;
+          }
+          _read() {
+            const json = this._json;
+            if (json === null) return;
+            if (this._offset >= json.length) {
+              this._json = null;
+              this.push(null);
+              return;
+            }
+            const end = Math.min(this._offset + 65536, json.length);
+            // A copy, not a view: a view would keep the whole snapshot's
+            // buffer alive for as long as any one chunk is held (a queued
+            // pipe write, a kept last chunk). node's chunks are separate
+            // allocations, so `chunk.buffer.byteLength > chunk.length` is
+            // false there; one 64 KiB memcpy per chunk is noise next to
+            // taking the snapshot.
+            const chunk = Buffer.from(json.subarray(this._offset, end));
+            this._offset = end;
+            this.push(chunk);
+          }
+          _destroy(err, callback) {
+            this._json = null;
+            callback(err);
+          }
+        };
+      }
+      return new HeapSnapshotStream(bytes);
+    }
+    registry._heapSnapshotOptions = heapSnapshotOptions;
+    function getHeapSnapshot(options) {
+      heapSnapshotOptions(options);
+      return heapSnapshotStreamOf(natives.heapSnapshot());
+    }
     function cachedDataVersionTag() { return 0; }
     function stopCoverage() {}
     function takeCoverage() {}
@@ -34307,7 +34404,7 @@
     return {
       serialize, deserialize, Serializer, Deserializer,
       getHeapStatistics, getHeapSpaceStatistics, getHeapCodeStatistics,
-      setFlagsFromString, writeHeapSnapshot, cachedDataVersionTag,
+      setFlagsFromString, writeHeapSnapshot, getHeapSnapshot, cachedDataVersionTag,
       stopCoverage, takeCoverage, startupSnapshot,
       constants: {
         ALL_PROPERTIES: 0, ONLY_WRITABLE: 1, ONLY_ENUMERABLE: 2, ONLY_CONFIGURABLE: 4,
@@ -42909,6 +43006,13 @@
         );
         this._workerId = result.workerId;
         this.threadId = result.threadId;
+        // Running state for getHeapSnapshot(), which node refuses with
+        // ERR_WORKER_NOT_RUNNING both before the worker is up and once it is
+        // gone (its takeHeapSnapshot finds no running environment either way).
+        // 'online' is the point oam treats as started; every way out of
+        // _recvLoop and terminate() mark it exited.
+        this._started = false;
+        this._exited = false;
 
         // Expose performance reference (mirrors Node behavior)
         this.performance = globalThis.performance;
@@ -42916,7 +43020,10 @@
         this._recvLoop();
 
         // Emit 'online' asynchronously after construction, matching Node
-        queueMicrotask(() => this.emit("online"));
+        queueMicrotask(() => {
+          if (!this._exited) this._started = true;
+          this.emit("online");
+        });
       }
       // An emit from the receive loop whose listener throws -- or an
       // 'error' with no listener -- is an uncaughtException, as node raises
@@ -42934,8 +43041,10 @@
       async _recvLoop() {
         while (true) {
           let raw;
-          try { raw = await natives.workerRecvMessage(this._workerId); } catch { break; }
-          if (raw === undefined) { this._emitFromLoop("exit", 0); break; }
+          try { raw = await natives.workerRecvMessage(this._workerId); } catch { this._exited = true; break; }
+          // undefined: the channel is gone -- terminate() removed it, or the
+          // worker thread dropped it. Either way the worker no longer runs.
+          if (raw === undefined) { this._exited = true; this._emitFromLoop("exit", 0); break; }
           if (raw instanceof Uint8Array) {
             const text = new TextDecoder().decode(raw);
             try {
@@ -42951,6 +43060,7 @@
               this[raw.type].push(Buffer.from(raw.data, "latin1"));
             }
             if (raw.type === "exit") {
+              this._exited = true;
               // EOF both streams so a waiting 'end' listener fires.
               this.stdout.push(null);
               this.stderr.push(null);
@@ -42964,12 +43074,33 @@
         natives.workerPostMessage(this._workerId, JSON.stringify(data));
       }
       terminate() {
+        // Marked here, not only when 'exit' arrives: the promise below
+        // resolves at once, and node's worker reports not-running as soon
+        // as terminate() has settled.
+        this._exited = true;
         natives.workerTerminate(this._workerId);
         return Promise.resolve(0);
       }
       ref() { return this; }
       unref() { return this; }
-      getHeapSnapshot() { return Promise.resolve(new Uint8Array(0)); }
+      // node snapshots a RUNNING worker's isolate by interrupting it from the
+      // parent (Isolate::RequestInterrupt), which works even mid-loop. oam's
+      // worker has no such cross-thread request: its inbox is serviced only
+      // by JS that listens for messages, and an interrupt needs FFI the
+      // unsafe budget does not admit. So the call is refused honestly --
+      // it used to resolve an empty Uint8Array, which is not a snapshot nor
+      // even node's stream type. Options are validated first, as node does,
+      // and a worker that is not running -- not yet online, terminated, or
+      // exited -- rejects with ERR_WORKER_NOT_RUNNING as node's does. Inside
+      // the worker, v8.getHeapSnapshot()/writeHeapSnapshot() are real.
+      getHeapSnapshot(options) {
+        registry.get("v8");
+        registry._heapSnapshotOptions(options);
+        return new Promise((resolve, reject) => {
+          if (this._exited || !this._started) return reject(codes.ERR_WORKER_NOT_RUNNING());
+          reject(codes.ERR_METHOD_NOT_IMPLEMENTED("getHeapSnapshot()"));
+        });
+      }
     }
 
     // Symbol.dispose support for the 'using' keyword
