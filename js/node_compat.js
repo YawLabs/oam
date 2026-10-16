@@ -10476,10 +10476,22 @@
   }
 
   // A listing from the natives is `[names, kinds]` (oam_core's DirListing).
-  function wrapDirents(parent, listing, withFileTypes) {
-    // The names array is the listing's own, made for this call.
-    if (!withFileTypes) return listing[0];
+  //
+  // `encoding: "buffer"` names each entry by `Buffer.from(name)` -- the raw
+  // UTF-8 bytes libuv hands node -- and a Dirent's `name` becomes that Buffer
+  // too (node v22.22.2, measured). Every other encoding, the default here,
+  // leaves the string node's binding already decoded.
+  function wrapDirents(parent, listing, withFileTypes, encoding) {
     const [names, kinds] = listing;
+    if (encoding === "buffer") {
+      const bufs = names.map((n) => Buffer.from(n));
+      if (!withFileTypes) return bufs;
+      const dirents = [];
+      for (let i = 0; i < bufs.length; i++) dirents.push(new Dirent(bufs[i], parent, kinds[i]));
+      return dirents;
+    }
+    // The names array is the listing's own, made for this call.
+    if (!withFileTypes) return names;
     const dirents = [];
     for (let i = 0; i < names.length; i++) dirents.push(new Dirent(names[i], parent, kinds[i]));
     return dirents;
@@ -10898,13 +10910,17 @@
       return false;
     }
   }
-  function readdirFound(natives, base, dir, listing, withFileTypes, out, queue, direntFollows = true) {
+  function readdirFound(natives, base, dir, listing, withFileTypes, encoding, out, queue, direntFollows = true) {
     const join = registry.get("path").join;
     const [names, kinds] = listing;
+    const bufferNames = encoding === "buffer";
     for (let i = 0; i < names.length; i++) {
-      const full = join(dir, names[i]);
+      // With `encoding: "buffer"` the name is a Buffer, so `join` throws node's
+      // ERR_INVALID_ARG_TYPE -- the walker never reaches past the first entry.
+      const name = bufferNames ? Buffer.from(names[i]) : names[i];
+      const full = join(dir, name);
       if (withFileTypes) {
-        const dirent = new Dirent(names[i], dir, kinds[i]);
+        const dirent = new Dirent(name, dir, kinds[i]);
         out.push(dirent);
         if (dirent.isDirectory() || (direntFollows && readdirIsDir(natives, full))) queue.push(full);
       } else {
@@ -10913,29 +10929,29 @@
       }
     }
   }
-  function readdirRecursiveSync(natives, base, withFileTypes) {
+  function readdirRecursiveSync(natives, base, withFileTypes, encoding) {
     const out = [];
     const queue = [base];
     for (let i = 0; i < queue.length; i++) {
-      readdirFound(natives, base, queue[i], natives.fsReaddirSync(queue[i]), withFileTypes, out, queue);
+      readdirFound(natives, base, queue[i], natives.fsReaddirSync(queue[i]), withFileTypes, encoding, out, queue);
     }
     return out;
   }
-  async function readdirRecursiveBreadthFirst(natives, base, withFileTypes) {
+  async function readdirRecursiveBreadthFirst(natives, base, withFileTypes, encoding) {
     const out = [];
     const queue = [base];
     for (let i = 0; i < queue.length; i++) {
-      readdirFound(natives, base, queue[i], await natives.fsReaddir(queue[i]), withFileTypes, out, queue);
+      readdirFound(natives, base, queue[i], await natives.fsReaddir(queue[i]), withFileTypes, encoding, out, queue);
     }
     return out;
   }
-  async function readdirRecursiveLastFirst(natives, base, withFileTypes) {
+  async function readdirRecursiveLastFirst(natives, base, withFileTypes, encoding) {
     const out = [];
     const pending = [[base, await natives.fsReaddir(base)]];
     while (pending.length > 0) {
       const [dir, entries] = pending.pop();
       const found = [];
-      readdirFound(natives, base, dir, entries, withFileTypes, out, found, false);
+      readdirFound(natives, base, dir, entries, withFileTypes, encoding, out, found, false);
       for (const next of found) pending.push([next, await natives.fsReaddir(next)]);
     }
     return out;
@@ -14119,10 +14135,10 @@
       }),
       statfs: withPath(async (file, options) => wrapStatFs(await natives.fsStatfs(file), options)),
       readdir: withPath(async (file, options) => {
-        const { withFileTypes, recursive } = readOptions(options);
-        if (recursive === true) return readdirRecursiveLastFirst(natives, file, withFileTypes === true);
+        const { withFileTypes, recursive, encoding } = readOptions(options);
+        if (recursive === true) return readdirRecursiveLastFirst(natives, file, withFileTypes === true, encoding);
         const entries = await natives.fsReaddir(file);
-        return wrapDirents(file, entries, withFileTypes === true);
+        return wrapDirents(file, entries, withFileTypes === true, encoding);
       }),
       // node's promise form (lib/internal/fs/promises.js): the options are
       // read, then the path is checked, then `recursive`, then the mode --
@@ -14879,8 +14895,10 @@
     const symlinkByCallback = callbackify1(promises.symlink, CB_LAST);
     const readdirByPath = callbackify1(promises.readdir, 1, 1);
     const readdirBreadthFirstByPath = callbackify1(
-      (path, options) =>
-        readdirRecursiveBreadthFirst(natives, toPath(path), readOptions(options).withFileTypes === true),
+      (path, options) => {
+        const { withFileTypes, encoding } = readOptions(options);
+        return readdirRecursiveBreadthFirst(natives, toPath(path), withFileTypes === true, encoding);
+      },
       1,
       1,
     );
@@ -15000,12 +15018,15 @@
       lstatSync: (path, options = STAT_SYNC_DEFAULT_OPTIONS) => statSyncAt(path, options, true),
       statfsSync: (path, options) => wrapStatFs(natives.fsStatfsSync(toPath(path)), options),
       readdirSync: (path, options) => {
-        const { withFileTypes, recursive } = readOptions(options);
-        if (recursive === true) return readdirRecursiveSync(natives, toPath(path), withFileTypes === true);
+        const { withFileTypes, recursive, encoding } = readOptions(options);
+        if (recursive === true) {
+          return readdirRecursiveSync(natives, toPath(path), withFileTypes === true, encoding);
+        }
         return wrapDirents(
           toPath(path),
           natives.fsReaddirSync(toPath(path)),
           withFileTypes === true,
+          encoding,
         );
       },
       globSync: (pattern, options) => globSyncRaw(pattern, options, natives),
