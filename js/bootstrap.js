@@ -22,6 +22,20 @@
 // startup snapshot, where no native bindings exist. Anything from __oam
 // must be looked up at CALL time, never captured at eval time.
 "use strict";
+// node's inspect `builtInObjects` (lib/internal/util/inspect.js) is the
+// capitalized names on globalThis when that module loads: V8's own globals
+// and none of node's (URL, Buffer, DOMException, the web classes are not in
+// it -- measured on v22.22.2). util.format's %s decides from it whether a
+// toString is built in (hasBuiltInToString), so it is taken here, before
+// this file defines a global of its own (#401).
+Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
+  value: Object.freeze(
+    Object.getOwnPropertyNames(globalThis).filter((e) => /^[A-Z][a-zA-Z0-9]+$/.test(e)),
+  ),
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
 (() => {
 
   // Every web class node ships carries a Symbol.toStringTag, so
@@ -253,6 +267,16 @@
       })
     : null;
 
+  // node's objectToWeakListenerMap: a weak listener is held weakly by the
+  // target but strongly by the object its kWeakHandler names (a stream,
+  // util.aborted's resource), so it lives exactly as long as that object.
+  // Held by nothing, the listener -- often a promise's resolve -- could be
+  // collected while the object it serves was still alive, and the abort it
+  // waited for never seen (#401).
+  const weakListenerOwners = new WeakMap();
+
+  const kNewListener = Symbol.for("oam.kNewListener");
+  const kRemoveListener = Symbol.for("oam.kRemoveListener");
   class EventTarget {
     constructor() {
       this._listeners = new Map(); // type -> [{ fn, once }]
@@ -271,8 +295,10 @@
       // accepting the option and storing a strong reference anyway would
       // retain exactly what the caller asked to be droppable, which is the
       // opposite of what it was set for.
-      const weak = options !== true && options != null &&
-        options[Symbol.for("oam.kWeakHandler")] != null;
+      const weakOwner = options !== true && options != null
+        ? options[Symbol.for("oam.kWeakHandler")]
+        : undefined;
+      const weak = weakOwner != null;
       // Node-internal kIsNodeStyleListener (a MessagePort's on/once): the
       // listener is handed a dispatch's node value -- a message's data --
       // instead of the event (#401). dispatchEvent's node value is the event.
@@ -290,11 +316,29 @@
           // alive, so it holds the target weakly too.
           collectedListeners.register(listener, { target: new WeakRef(this), type, entry });
         }
+        if (weak && (typeof weakOwner === "object" || typeof weakOwner === "function")) {
+          let held = weakListenerOwners.get(weakOwner);
+          if (held === undefined) weakListenerOwners.set(weakOwner, (held = new Set()));
+          held.add(listener);
+        }
+        // node's kNewListener hook (lib/internal/event_target.js): a
+        // subclass hears of each listener added with the count it brings
+        // the type to, through a symbol-keyed method, so a MessagePort
+        // refs and starts on its first 'message' listener without an
+        // addEventListener of its own on its prototype, which node's has
+        // not (#401).
+        if (typeof this[kNewListener] === "function") this[kNewListener](list.length, type);
       }
     }
     removeEventListener(type, listener) {
       const list = this._listeners.get(type);
-      if (list) this._listeners.set(type, list.filter((e) => listenerOf(e) !== listener));
+      if (!list) return;
+      const kept = list.filter((e) => listenerOf(e) !== listener);
+      this._listeners.set(type, kept);
+      // node's kRemoveListener hook, the counterpart of kNewListener (#401).
+      if (kept.length !== list.length && typeof this[kRemoveListener] === "function") {
+        this[kRemoveListener](kept.length, type);
+      }
     }
     dispatchEvent(event) {
       event.target = this;
@@ -1214,7 +1258,10 @@
           },
         });
       }
-      toString() { return "[object Blob]"; }
+      // No toString of its own, as node's Blob has none: the brand's
+      // toStringTag already makes String() "[object Blob]", and an own
+      // toString made util.format's %s String() a Blob that node inspects
+      // (hasBuiltInToString, #401).
     }
     brand(Blob, "Blob");
     globalThis.Blob = Blob;
@@ -1877,7 +1924,17 @@
     // up later is cancelled on arrival instead of holding its connection.
     let bodyAborted = false;
     let onAbort = null;
-    const abortReason = () => defaultAbortReason(signal.reason);
+    // The body path is the one place undici still swaps the reason out:
+    // its fetch controller's abort(error) does `if (!error) error = new
+    // DOMException(...)`, and the body is errored with that. So
+    // `ac.abort(null)` -- or 0, false, '' -- rejects the fetch promise with
+    // the reason itself but errors a body being read with undici's own
+    // AbortError, message "The operation was aborted." with the period:
+    // measured on node v22.22.2 for a read in flight, a reader taken after
+    // the abort and a pending reader.read() (#401). A signal aborted with no
+    // reason already carries its (truthy) DOMException.
+    const abortReason = () =>
+      signal.reason || new globalThis.DOMException("The operation was aborted.", "AbortError");
     // Read to the end, failed or cancelled: nothing is left for an abort to
     // stop. Stop listening, so a signal shared by many fetches does not
     // collect one listener per response, and a late abort does not leave a
@@ -4393,15 +4450,17 @@
   const kIsNodeError = globalThis.__oamKIsNodeError;
   const errorToString = Error.prototype.toString;
   Error.prepareStackTrace = function (err, frames) {
-    let head;
-    try {
-      head =
-        err !== null && typeof err === "object" && kIsNodeError in err
-          ? `${err.name} [${err.code}]: ${err.message}`
-          : errorToString.call(err);
-    } catch {
-      head = "<error>";
-    }
+    // A header that cannot be built (a Symbol `name`, a throwing `name`
+    // getter) throws out of the `stack` read, as node's does: V8 then keeps
+    // the stack unformatted and tries again on the next read, and
+    // util.inspect falls back to `[object Error]` as node's formatError
+    // does. A "<error>" header stood in before, which made `stack` look
+    // like a regular error's and sent inspect down the improveStack path
+    // that threw on the Symbol name (#401).
+    const head =
+      err !== null && typeof err === "object" && kIsNodeError in err
+        ? `${err.name} [${err.code}]: ${err.message}`
+        : errorToString.call(err);
     let out = head;
     for (const frame of frames) {
       let text = `${frame}`;

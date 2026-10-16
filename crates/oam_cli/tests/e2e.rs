@@ -28814,7 +28814,10 @@ fn worker_threads_message_port_close_event() {
     "#,
     );
     assert!(stdout.contains("close_fired=true"), "close event: {stdout}");
-    assert!(stdout.contains("close_sync=false"), "close is async: {stdout}");
+    assert!(
+        stdout.contains("close_sync=false"),
+        "close is async: {stdout}"
+    );
     assert!(
         stdout.contains("start_returns=undefined"),
         "start returns undefined: {stdout}"
