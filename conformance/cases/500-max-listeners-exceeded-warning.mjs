@@ -6,6 +6,10 @@
 // listener off, leaves it unprinted (#365). The text names the emitter as
 // util.inspect does at depth -1.
 //
+// events.setMaxListeners(n, ...targets) checks n as node's validateNumber(n,
+// 'setMaxListeners', 0) does, and reads setMaxListeners off a target that is
+// not an EventTarget, so a null or undefined target is a plain TypeError.
+//
 // The printing goes to stderr, which the harness does not compare, so each
 // scenario runs as a child and its stderr is printed here, with the pid and
 // the program name in the one-time hint taken out.
@@ -103,6 +107,28 @@ if (scenario === "emitter") {
     t.addEventListener("e", () => {});
   }
   EventEmitter.defaultMaxListeners = 10;
+} else if (scenario === "validate") {
+  const show = (label, f) => {
+    try {
+      f();
+      console.log(label, "ok");
+    } catch (e) {
+      console.log(label, e.name, e.code, e.message);
+    }
+  };
+  for (const v of [-1, "a", "3", NaN, null, Infinity, -0, 1.5, 2n]) {
+    const label =
+      typeof v === "string" ? JSON.stringify(v) : typeof v === "bigint" ? `${v}n` : Object.is(v, -0) ? "-0" : String(v);
+    show(`n=${label}`, () => setMaxListeners(v, new EventEmitter()));
+  }
+  show("no target, n=-1", () => setMaxListeners(-1));
+  show("target null", () => setMaxListeners(1, null));
+  show("target undefined", () => setMaxListeners(1, undefined));
+  show("target {}", () => setMaxListeners(1, {}));
+  setMaxListeners(7);
+  console.log("default after setMaxListeners(7):", EventEmitter.defaultMaxListeners);
+  setMaxListeners();
+  console.log("default after setMaxListeners():", EventEmitter.defaultMaxListeners);
 } else {
   const normalize = (text) =>
     text
@@ -124,4 +150,5 @@ if (scenario === "emitter") {
     run(name, [], ["removed"]);
     run(name, ["--disable-warning=MaxListenersExceededWarning"]);
   }
+  run("validate");
 }

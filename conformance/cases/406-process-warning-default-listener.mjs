@@ -14,9 +14,11 @@
 // NODE_OPTIONS) the printer writes the warning's stack in place of its
 // toString(), for the warnings the flag covers, and prints no hint for those.
 // Each stack is cut to its first frame, given as file:line:column: the frames
-// below it are each runtime's own module loader.
+// below it are each runtime's own module loader. A Worker given either flag
+// in its own execArgv traces as if its process had been (node applies a
+// worker's execArgv to that worker).
 import { spawnSync } from "node:child_process";
-import { Worker, isMainThread, parentPort } from "node:worker_threads";
+import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
 
 const scenario = process.argv[2];
 
@@ -41,7 +43,15 @@ function normalize(text) {
   return out;
 }
 
-if (!isMainThread) {
+if (!isMainThread && workerData === "traced") {
+  parentPort.postMessage(
+    ["traceProcessWarnings", "traceDeprecation"].map(
+      (name) => `${name} ${JSON.stringify(Object.getOwnPropertyDescriptor(process, name))}`,
+    ),
+  );
+  process.emitWarning("from a worker");
+  process.emitWarning("deprecated in a worker", "DeprecationWarning", "DEP_W");
+} else if (!isMainThread) {
   parentPort.postMessage(process.listeners("warning").map((f) => `${f.name}/${f.length}`));
 } else if (scenario === "captured") {
   // The printing goes through process.stderr: a program that has taken that
@@ -107,6 +117,16 @@ if (!isMainThread) {
     const quiet = new Worker(new URL(import.meta.url), { execArgv: ["--no-warnings"] });
     quiet.on("message", (none) => console.log("in a worker with execArgv --no-warnings:", none));
   });
+} else if (scenario === "traced-worker") {
+  // One worker after the other, so their stderr does not interleave.
+  const next = (list) => {
+    if (list.length === 0) return;
+    const [execArgv, ...rest] = list;
+    const worker = new Worker(new URL(import.meta.url), { execArgv, workerData: "traced" });
+    worker.on("message", (props) => console.log(`worker with execArgv ${execArgv.join(" ")}:`, props));
+    worker.on("exit", () => next(rest));
+  };
+  next([["--trace-warnings"], ["--trace-deprecation"], ["--trace-warnings", "--trace-deprecation"]]);
 } else {
   const run = (name, flags = [], env = {}) => {
     const child = spawnSync(process.execPath, [...flags, import.meta.filename, name], {
@@ -144,4 +164,5 @@ if (!isMainThread) {
   run("captured", ["--trace-warnings"]);
   run("worker");
   run("worker", ["--no-warnings"]);
+  run("traced-worker");
 }

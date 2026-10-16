@@ -4,6 +4,11 @@
 //     file under node_modules loads it first; it looks for "/node_modules/" in
 //     the stack, so on Windows, where the paths are written with backslashes,
 //     it warns all the same (probed: v22.22.2 on win32 warns, on linux not).
+//     An ES module's frame is named by its file:// URL, which is written with
+//     forward slashes everywhere, so a package's ES module that loads it
+//     (process.getBuiltinModule in its body) is skipped on every platform. The
+//     name is the script's, not a `//# sourceURL=`: eval'd code that names
+//     itself under node_modules is still warned about.
 //   - DEP0044 util.isArray and DEP0060 util._extend, each on its first call.
 //   - DEP0121 net._setSimultaneousAccepts, on its first call.
 //   - DEP0025 the `sys` module (util under its old name), when first loaded.
@@ -29,6 +34,7 @@ write("package.json", JSON.stringify({ name: "case-502", type: "commonjs" }));
 write("node_modules/dep/package.json", JSON.stringify({ name: "dep", main: "index.js" }));
 write("node_modules/dep/index.js", `module.exports = require("punycode").encode("münchen");\n`);
 write("node_modules/dep/esm.mjs", `import punycode from "punycode";\nexport default punycode.decode("mnchen-3ya");\n`);
+write("node_modules/dep/gbm.mjs", `export default process.getBuiltinModule("punycode").encode("mañana");\n`);
 write(
   "punycode.js",
   `${hear}const punycode = require("punycode");
@@ -46,6 +52,14 @@ console.log("then the program's own require:", typeof require("punycode").encode
 write(
   "punycode-esm-from-node-modules.mjs",
   `${hear}import decoded from "dep/esm.mjs";\nconsole.log("dep says", decoded);\n`,
+);
+write(
+  "punycode-esm-builtin-from-node-modules.mjs",
+  `${hear}import encoded from "dep/gbm.mjs";\nconsole.log("dep says", encoded);\n`,
+);
+write(
+  "punycode-eval-sourceurl.js",
+  `${hear}eval("require('punycode')\\n//# sourceURL=/x/node_modules/y.js");\nconsole.log("evaluated");\n`,
 );
 write("punycode-import.mjs", `${hear}import punycode from "punycode";\nconsole.log("imported", typeof punycode.encode);\n`);
 write(
@@ -120,6 +134,8 @@ try {
     "punycode.js",
     "punycode-from-node-modules.js",
     "punycode-esm-from-node-modules.mjs",
+    "punycode-esm-builtin-from-node-modules.mjs",
+    "punycode-eval-sourceurl.js",
     "punycode-import.mjs",
     "punycode-builtin.js",
     "util.js",
