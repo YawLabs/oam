@@ -2390,9 +2390,10 @@ fn run_file_with_flags(
                 return Err((diagnostics, code));
             }
             // Regular fatal: Node forces process.exitCode = 1 at
-            // TriggerUncaughtException (UNCONDITIONALLY -- an earlier script
-            // assignment loses), emits 'exit', then re-reads: a handler
-            // mutating exitCode (98, or back to 0) decides the final code.
+            // TriggerUncaughtException (an earlier script assignment loses,
+            // unless process.exit() was already exiting -- fatal_exit_shape),
+            // emits 'exit', then re-reads: a handler mutating exitCode (98,
+            // or back to 0) decides the final code.
             let (exit_code_script, after_exit) = fatal_exit_shape(&diagnostics);
             let _ = rt.execute_script_draining(
                 "<fatal-exit-code>",
@@ -2411,7 +2412,10 @@ fn run_file_with_flags(
 ///
 /// A fatal exception: node forces exitCode 1 (TriggerUncaughtException,
 /// unconditionally -- an earlier assignment loses), emits 'exit', and runs
-/// nothing after it, no promise job, no tick. A top-level await that never
+/// nothing after it, no promise job, no tick. Unless the process is already
+/// exiting -- the throw came out of `process.exit()`'s own 'exit' emit --
+/// when `_fatalException` leaves exitCode alone: `process.exit(3)` with a
+/// throwing listener exits 3 (#399 item 7). A top-level await that never
 /// settled is no exception to node: it exits naturally, with the exitCode
 /// the script set or else 13 (kUnsettledTopLevelAwait), and drains the
 /// promise jobs the 'exit' listeners queue. Either way a listener that
@@ -2427,7 +2431,7 @@ fn fatal_exit_shape(
         )
     } else {
         (
-            "(function () { var p = globalThis.process; if (p) { p.exitCode = 1; } })();",
+            "(function () { var p = globalThis.process; if (p && !p._exiting) { p.exitCode = 1; } })();",
             oam_engine::AfterScript::Nothing,
         )
     }
@@ -3166,9 +3170,6 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
             ExitCode::from(rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
         }
         Err(diagnostics) => {
-            for d in &diagnostics {
-                render(d, false);
-            }
             let sub_code = rt
                 .execute_script_draining(
                     "<fatal-sub-code>",
@@ -3180,6 +3181,9 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
             if let Some(code) = sub_code {
                 // Skips `emit_process_exit` -- see the run_file site above.
                 oam_engine::run_exit_hooks();
+                for d in &diagnostics {
+                    render(d, false);
+                }
                 return ExitCode::from(code);
             }
             let (exit_code_script, after_exit) = fatal_exit_shape(&diagnostics);
@@ -3188,7 +3192,13 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
                 exit_code_script,
                 oam_engine::AfterScript::Nothing,
             );
+            // node runs the 'exit' listeners, then prints the report
+            // (TriggerUncaughtException: _fatalException, then
+            // ReportFatalException), as run_file's caller does (#399 item 10).
             rt.emit_process_exit_after(after_exit);
+            for d in &diagnostics {
+                render(d, false);
+            }
             ExitCode::from(rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8)
         }
     }
@@ -3315,9 +3325,6 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
             ExitCode::from(rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
         }
         Err(diagnostics) => {
-            for d in &diagnostics {
-                render(d, false);
-            }
             let sub_code = rt
                 .execute_script_draining(
                     "<fatal-sub-code>",
@@ -3329,6 +3336,9 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
             if let Some(code) = sub_code {
                 // Skips `emit_process_exit` -- see the run_file site above.
                 oam_engine::run_exit_hooks();
+                for d in &diagnostics {
+                    render(d, false);
+                }
                 return ExitCode::from(code);
             }
             let (exit_code_script, after_exit) = fatal_exit_shape(&diagnostics);
@@ -3337,7 +3347,13 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
                 exit_code_script,
                 oam_engine::AfterScript::Nothing,
             );
+            // node runs the 'exit' listeners, then prints the report
+            // (TriggerUncaughtException: _fatalException, then
+            // ReportFatalException), as run_file's caller does (#399 item 10).
             rt.emit_process_exit_after(after_exit);
+            for d in &diagnostics {
+                render(d, false);
+            }
             ExitCode::from(rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8)
         }
     }

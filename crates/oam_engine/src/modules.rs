@@ -743,6 +743,137 @@ pub(crate) fn handle_uncaught_throw(
     )])
 }
 
+/// Emit process `'exit'` once (`process._exiting` is the guard shared with
+/// `process.exit()`), with `process.exitCode` or 0.
+///
+/// `natural`: the loop drained, or a top-level await never settled -- node's
+/// `EmitProcessExit`. A listener's throw is an uncaught exception like any
+/// other: offered to the 'uncaughtException' listeners, reported when
+/// nothing takes it, and the code is the `process.exitCode` already set or
+/// else 1 (7 when a listener of the ladder threw). Either way the emit ends
+/// there -- later listeners, and the promise jobs the listeners queued, do
+/// not run. Without a throw node drains those promise jobs, and a throw from
+/// one of them goes the same way (#399 items 1 and 7), as does a promise
+/// they reject and leave unhandled. The tick queue takes nothing once the
+/// process is exiting, so there are no ticks to run.
+///
+/// Not natural: past a fatal exception, where node's `_fatalException`
+/// emits `'exit'` inside a try/catch that drops a listener's throw -- the
+/// original report stays the only one (#399 item 9) -- and runs nothing
+/// after it.
+///
+/// A report raised here goes straight to stderr: node prints it at this
+/// point of the exit.
+pub(crate) fn emit_exit_event(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    natural: bool,
+) {
+    // A function expression compiled and called, so the locals stay function
+    // scoped (a top-level `var` would land on globalThis) and the call's
+    // exception is ours to read.
+    const EMIT: &str = "(function () { \
+        var p = globalThis.__oamProcessRef || globalThis.process; \
+        if (!p || p._exiting) return; \
+        p._exiting = true; \
+        p.emit('exit', typeof p.exitCode === 'number' ? p.exitCode : 0); \
+      })";
+    let Some(emit) = compile_host_function(tc, "<process-exit>", EMIT) else {
+        tc.reset();
+        return;
+    };
+    let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+    if emit.call(tc, recv, &[]).is_some() {
+        if natural {
+            host_checkpoint(tc);
+            if let Some(failures) = drain_uncaught(tc) {
+                report_at_exit(tc, &failures);
+                return;
+            }
+            // node's rejection processing runs after the listeners too: a
+            // promise they reject and leave unhandled is fatal.
+            if let Some(failures) = unhandled_rejection_failures(tc) {
+                report_at_exit(tc, &failures);
+            }
+        }
+        return;
+    }
+    if !natural {
+        tc.reset();
+        return;
+    }
+    let Some(exception) = tc.exception() else {
+        tc.reset();
+        return;
+    };
+    let value = v8::Global::new(tc, exception);
+    let message = crate::exception_to_error(tc, "'exit' listener").to_string();
+    let frame = tc.message().and_then(|m| source_frame(tc, m));
+    tc.reset();
+    let local = v8::Local::new(tc, &value);
+    let (local, frame, message) = match dispatch_uncaught(tc, local) {
+        Uncaught::Handled => return,
+        Uncaught::Fatal => (local, frame, message),
+        Uncaught::HandlerThrew {
+            value,
+            frame,
+            message,
+        } => (v8::Local::new(tc, &value), frame, message),
+    };
+    let report = Diagnostic::new(
+        FATAL_CODE,
+        Severity::Error,
+        Origin::Runtime,
+        fatal_report(tc, local, frame, &message),
+    );
+    report_at_exit(tc, &[report]);
+}
+
+/// Print fatal reports raised while exiting, and set the code node exits
+/// with: 7 when a listener of the uncaught ladder threw
+/// (kExceptionInFatalExceptionHandler), else `process.exitCode` when set,
+/// else 1 -- node's `env->exit_code(kGenericUserError)`. Its
+/// `_fatalException` does not force 1 once `process._exiting` is set.
+fn report_at_exit(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    failures: &[Diagnostic],
+) {
+    // As the CLI renders them: a fatal report verbatim, anything else (an
+    // unhandled rejection) as `error[CODE]: message`.
+    for failure in failures {
+        if failure.code == FATAL_CODE {
+            eprint!("{}", failure.message);
+        } else {
+            eprintln!("error[{}]: {}", failure.code, failure.message);
+        }
+    }
+    const CODE: &str = "(function () { \
+        var p = globalThis.__oamProcessRef || globalThis.process; \
+        if (!p) return; \
+        if (p.__oamFatalCode === 7) p.exitCode = 7; \
+        else if (p.exitCode == null) p.exitCode = 1; \
+      })";
+    if let Some(set_code) = compile_host_function(tc, "<exit-code>", CODE) {
+        let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+        let _ = set_code.call(tc, recv, &[]);
+    }
+    tc.reset();
+}
+
+/// Compile `source` (a parenthesized function expression) as a classic
+/// script and return the function it evaluates to.
+fn compile_host_function<'s>(
+    tc: &mut v8::PinnedRef<'s, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    name: &str,
+    source: &str,
+) -> Option<v8::Local<'s, v8::Function>> {
+    let source = v8::String::new(tc, source)?;
+    let name: v8::Local<v8::Value> = v8::String::new(tc, name)?.into();
+    let origin = v8::ScriptOrigin::new(tc, name, 0, 0, false, 0, None, false, false, false, None);
+    let script = v8::Script::compile(tc, source, Some(&origin))?;
+    let value = script.run(tc)?;
+    v8::Local::<v8::Function>::try_from(value).ok()
+}
+
 /// Take any uncaught-exception reports (from the message listener, i.e.
 /// exceptions swallowed by the microtask checkpoint) and either deliver
 /// them to an 'uncaughtException' listener or fail the run.

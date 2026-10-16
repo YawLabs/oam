@@ -864,10 +864,11 @@ impl JsRuntime {
     /// Run process 'exit' listeners (Node natural-termination semantics): sets
     /// `process._exiting` and emits `'exit'` synchronously, exactly once (the JS
     /// side guards re-entry). Call after the event loop drains, before reading
-    /// the final exit code. Touches `globalThis.process` first so a lazily-built
-    /// process is instantiated. A throwing listener is printed to stderr (Node
-    /// prints uncaught exit-handler errors); `process.exit()` inside a handler
-    /// still terminates via the native path.
+    /// the final exit code. A throwing listener is an uncaught exception, as
+    /// in node: reported to stderr unless an 'uncaughtException' listener
+    /// takes it, and the exit code is the `process.exitCode` already set or
+    /// else 1; `process.exit()` inside a handler still terminates via the
+    /// native path.
     pub fn emit_process_exit(&mut self) {
         self.emit_process_exit_after(AfterScript::Microtasks);
     }
@@ -876,34 +877,14 @@ impl JsRuntime {
     /// natural exit node drains the promise jobs the 'exit' listeners queue
     /// (`Microtasks`); past a fatal exception it runs nothing (`Nothing`).
     pub fn emit_process_exit_after(&mut self, after: AfterScript) {
-        // A throw from an 'exit' listener is fatal in Node: it reports the
-        // error and exits 1, whatever the handler set exitCode to.
-        // Inline the emit (no leaked global): touch process to build it if
-        // lazy, guard on process._exiting so it fires once, emit 'exit' with the
-        // current exitCode. Mirrors the JS-side emitProcessExit used by
-        // process.exit(); process._exiting is the shared once-guard.
-        // IIFE so the locals stay function-scoped: top-level `var` in a classic
-        // script would leak onto globalThis (and trip Node common's leak check).
-        // node emits 'exit' and drains the promise jobs its listeners queue,
-        // but never reaches the tick queue again: a nextTick from an 'exit'
-        // listener does not run (#345 review).
-        if let Err(e) = self.execute_script_draining(
-            "<process-exit>",
-            "(function () { \
-               var p = globalThis.__oamProcessRef || globalThis.process; \
-               if (p && !p._exiting) { \
-                 p._exiting = true; \
-                 var c = typeof p.exitCode === 'number' ? p.exitCode : 0; \
-                 try { p.emit('exit', c); } catch (e) { \
-                   p.exitCode = 1; \
-                   try { console.error(globalThis.__oamFormatFatal(e)); } catch (_) {} \
-                 } \
-               } \
-             })();",
-            after,
-        ) {
-            eprintln!("{e}");
-        }
+        // Mirrors the JS-side emitProcessExit used by process.exit();
+        // process._exiting is the shared once-guard. What a listener's throw
+        // does, and what runs after the emit, is node's
+        // (`modules::emit_exit_event`): `Nothing` is the fatal path.
+        self.clear_active_host();
+        v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
+        v8::tc_scope!(let tc, scope);
+        crate::modules::emit_exit_event(tc, after != AfterScript::Nothing);
     }
 
     /// Compile and run `source` as a classic script. Returns the stringified

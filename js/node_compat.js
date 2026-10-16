@@ -17314,6 +17314,10 @@
         if (typeof fn !== "function") {
           throw new codes.ERR_INVALID_ARG_TYPE("callback", "Function", fn);
         }
+        // node's nextTick enqueues nothing once the process is exiting: the
+        // callback would never get to run. So a warning emitted from an
+        // 'exit' listener (delivered on a tick) is never printed (#366).
+        if (process._exiting) return;
         // Capture the ALS frame as DATA. Wrapping the callback in a binder
         // closure (the old shape) put an extra "at Array.<anonymous>" frame
         // between the user's frame and the drain -- Node has no such frame,
