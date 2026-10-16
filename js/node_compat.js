@@ -3807,12 +3807,17 @@
       const max = this.getMaxListeners();
       if (max > 0 && count > max && !this._events[type].warned) {
         this._events[type].warned = true;
-        if (globalThis.console) {
-          globalThis.console.warn(
-            `(oam) MaxListenersExceededWarning: ${count} ${String(type)} listeners added to EventEmitter. ` +
-              `Use emitter.setMaxListeners() to increase limit`,
-          );
-        }
+        // A process warning, as node's (_addListener, lib/events.js): an
+        // Error carrying the emitter, type and count, through emitWarning,
+        // so 'warning' listeners hear it and --no-warnings silences it.
+        // No error code: it is a warning.
+        const w = new Error(
+          `Possible EventEmitter memory leak detected. ${count} ${String(type)} listeners ` +
+            `added to ${registry.get("util").inspect(this, { depth: -1 })}. MaxListeners is ${max}. ` +
+            "Use emitter.setMaxListeners() to increase limit",
+        );
+        Object.assign(w, { name: "MaxListenersExceededWarning", emitter: this, type, count });
+        globalThis.process.emitWarning(w);
       }
       return this;
     };
@@ -4313,26 +4318,33 @@
       return [];
     }
 
-    // Internal slot used to attach a max-listeners value to a native
-    // EventTarget (which has no get/setMaxListeners method of its own), the way
-    // Node stores it via kMaxEventTargetListeners.
-    const kMaxEventTargetListeners = Symbol("kMaxEventTargetListeners");
+    // The slots an EventTarget (which has no get/setMaxListeners method of
+    // its own) keeps its listener limit, and whether it warned, in -- node's
+    // kMaxEventTargetListeners / kMaxEventTargetListenersWarned:
+    // bootstrap.js's EventTarget sets them when made and reads them in
+    // addEventListener to warn past the limit.
+    const { kMaxEventTargetListeners, kMaxEventTargetListenersWarned } =
+      globalThis.__oamEventTargetLimitSymbols;
 
-    function setMaxListeners(n) {
-      if (arguments.length > 1) {
-        for (var i = 1; i < arguments.length; i++) {
-          const target = arguments[i];
-          if (typeof target.setMaxListeners === "function") {
-            target.setMaxListeners(n);
-          } else {
-            // Native EventTarget / AbortSignal: stash the value in a slot.
-            Object.defineProperty(target, kMaxEventTargetListeners, {
-              value: n,
-              writable: true,
-              configurable: true,
-              enumerable: false,
-            });
-          }
+    // node's events.setMaxListeners(n = defaultMaxListeners, ...eventTargets):
+    // with no target it sets the default; a new limit lets a target warn
+    // again.
+    function setMaxListeners(n = EventEmitter.defaultMaxListeners, ...eventTargets) {
+      if (typeof n !== "number" || n < 0 || Number.isNaN(n)) {
+        throw new codes.ERR_OUT_OF_RANGE("n", "a non-negative number", n);
+      }
+      if (eventTargets.length === 0) {
+        EventEmitter.defaultMaxListeners = n;
+        return;
+      }
+      for (const target of eventTargets) {
+        if (target instanceof EventTarget) {
+          target[kMaxEventTargetListeners] = n;
+          target[kMaxEventTargetListenersWarned] = false;
+        } else if (typeof target?.setMaxListeners === "function") {
+          target.setMaxListeners(n);
+        } else {
+          throw new codes.ERR_INVALID_ARG_TYPE("eventTargets", ["EventEmitter", "EventTarget"], target);
         }
       }
     }
