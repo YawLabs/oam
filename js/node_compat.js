@@ -12439,12 +12439,20 @@
     };
     // The `options.fs` (or patched `fs`) method a stream must call, or null
     // while it is oam's own and the native does the same. Looked up at each
-    // call, as node's `this[kFs].open(...)` is.
+    // call, as node's `this[kFs].open(...)` is. One that is missing (or not
+    // a function) is node's call failing: a function throwing node's
+    // TypeError, which names the call as node's source spells it -- never
+    // the native, which would close a descriptor `options.fs` handed out.
+    const fsCallee = { open: "stream", close: "stream", fsync: "stream", read: "this", write: "this", writev: "this" };
     const fsOverride = (stream, name) => {
       const ops = stream[kFs];
       if (!ops) return null;
       const fn = ops[name];
-      return fn === fsStreamOriginals[name] ? null : fn;
+      if (fn === fsStreamOriginals[name]) return null;
+      if (typeof fn === "function") return fn;
+      return () => {
+        throw new TypeError(`${fsCallee[name]}[kFs].${name} is not a function`);
+      };
     };
     // node's errorOrDestroy for a failed read: a stream that does not
     // destroy itself (autoClose: false) reports the error and keeps its
