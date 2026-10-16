@@ -960,7 +960,7 @@ pub(crate) fn stat_record_array<'s>(
 /// the JS side constructs the Stats from it at once -- no allocation, and no
 /// JSON for V8 to parse, per stat. Throws a TypeError (and answers None)
 /// when the argument is not one with room for a whole record past its
-/// offset.
+/// offset, or is a view over a SharedArrayBuffer.
 fn stat_values_arg<'a>(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments<'a>,
@@ -978,11 +978,30 @@ fn stat_values_arg<'a>(
             scope,
             "stat values must be a Float64Array with room for a stat",
         );
+        return None;
+    }
+    // Shared memory: the write below goes through the backing store as
+    // `&[Cell<u8>]`, which promises nothing else writes those bytes for the
+    // borrow's life -- a promise a SharedArrayBuffer cannot keep, since a
+    // Worker may store into it while the record is written (the same hazard
+    // bufferDecode declines). The sync stat's only caller is oam's own JS
+    // side, which always passes a buffer of its own; a shared view is
+    // refused rather than raced.
+    let shared = array
+        .and_then(|array| array.buffer(scope))
+        .is_some_and(|buffer| buffer.get_backing_store().is_shared());
+    if shared {
+        throw_type_error(scope, "stat values must not be a SharedArrayBuffer view");
+        return None;
     }
     array
 }
 
 /// Writes `record` into `values` (from stat_values_arg) and returns it.
+///
+/// Unreachable arms: `stat_values_arg` already required a non-detached,
+/// non-shared buffer with room, so `buffer`/`cells.get(..)` cannot fail here;
+/// the early returns are defensive, not a silent `undefined` contract.
 fn return_stat_record(
     scope: &mut v8::PinScope<'_, '_>,
     rv: &mut v8::ReturnValue<'_, v8::Value>,
