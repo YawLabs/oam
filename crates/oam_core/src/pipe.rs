@@ -923,6 +923,7 @@ mod windows {
         /// docs/node-divergences.md, entry 50.
         #[tokio::test]
         async fn a_client_dialling_through_a_unc_server_name_is_refused_as_remote() {
+            use windows_sys::Win32::Foundation::{ERROR_BAD_NET_NAME, ERROR_BAD_NETPATH};
             let name = pipe_name("remote");
             let leaf = name.strip_prefix(r"\\.\pipe\").unwrap();
             let _listener = bind(&name, &name).unwrap();
@@ -930,6 +931,16 @@ mod windows {
             for server in ["localhost", "127.0.0.1"] {
                 let unc = format!(r"\\{server}\pipe\{leaf}");
                 let refused = ClientOptions::new().open(&unc);
+                // A host whose SMB client (the Workstation service) is off
+                // has no way to the UNC name at all: nothing to pin there.
+                // A regression -- the remote client let in -- shows as a
+                // success, never as one of these.
+                let code = refused.as_ref().err().and_then(io::Error::raw_os_error);
+                if code == Some(ERROR_BAD_NETPATH as i32) || code == Some(ERROR_BAD_NET_NAME as i32)
+                {
+                    eprintln!("skipped {unc}: no SMB client on this host ({refused:?})");
+                    continue;
+                }
                 assert_eq!(
                     refused.as_ref().err().and_then(io::Error::raw_os_error),
                     Some(ERROR_ACCESS_DENIED as i32),
