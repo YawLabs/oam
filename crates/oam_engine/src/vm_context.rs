@@ -124,8 +124,7 @@ pub(crate) fn with_timeout<'s, T>(
     }
 }
 
-/// Name of the private symbol under which an interceptor's link object holds
-/// its sandbox.
+/// The internal field of an interceptor's link object that holds its sandbox.
 ///
 /// The sandbox reaches the interceptors through the handler's `data` -- a
 /// link object made before the context and filled in only once
@@ -139,7 +138,12 @@ pub(crate) fn with_timeout<'s, T>(
 /// whether it faulted depended on the heap layout -- a segfault that came
 /// and went with unrelated changes to the snapshot (#401). An empty link is
 /// the "not attached yet" answer, with no context consulted at all.
-const SANDBOX_PRIVATE: &str = "oam:vm:sandbox";
+///
+/// An internal field, not a private symbol: every global read or write in a
+/// vm context goes through these interceptors, and a field read is a slot
+/// load where a private symbol meant a string allocation and a registry
+/// lookup on every access.
+const LINK_SANDBOX_FIELD: usize = 0;
 
 /// Name of the private symbol linking a sandbox to its context's global proxy.
 ///
@@ -175,13 +179,8 @@ pub(crate) fn context_of_sandbox<'s>(
     proxy.get_creation_context(scope)
 }
 
-fn sandbox_private<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Private> {
-    let name = v8::String::new(scope, SANDBOX_PRIVATE).unwrap();
-    v8::Private::for_api(scope, Some(name))
-}
-
 /// The sandbox behind the global an interceptor fired on, or `None` while
-/// `Context::new` is still building that global (see [`SANDBOX_PRIVATE`]).
+/// `Context::new` is still building that global (see [`LINK_SANDBOX_FIELD`]).
 ///
 /// Read off the handler's `data` rather than any context, so it answers the
 /// same whether the access comes from inside the vm context or from the host
@@ -191,8 +190,9 @@ fn sandbox_of<'s>(
     args: &v8::PropertyCallbackArguments<'s>,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let link = v8::Local::<v8::Object>::try_from(args.data()).ok()?;
-    let key = sandbox_private(scope);
-    let sandbox = link.get_private(scope, key)?;
+    // Undefined until attached; get_internal_field bounds-checks the index.
+    let field = link.get_internal_field(scope, LINK_SANDBOX_FIELD)?;
+    let sandbox = v8::Local::<v8::Value>::try_from(field).ok()?;
     v8::Local::<v8::Object>::try_from(sandbox).ok()
 }
 
@@ -521,8 +521,12 @@ pub(crate) fn op_vm_create_context<'s>(
     }
 
     // Empty until the context exists: every interceptor call `Context::new`
-    // makes declines (see SANDBOX_PRIVATE).
-    let link = v8::Object::new(scope);
+    // makes declines (see LINK_SANDBOX_FIELD).
+    let link_template = v8::ObjectTemplate::new(scope);
+    link_template.set_internal_field_count(LINK_SANDBOX_FIELD + 1);
+    let Some(link) = link_template.new_instance(scope) else {
+        return;
+    };
     let template = v8::ObjectTemplate::new(scope);
     template.set_named_property_handler(
         v8::NamedPropertyHandlerConfiguration::new()
@@ -561,8 +565,7 @@ pub(crate) fn op_vm_create_context<'s>(
     // not a security sandbox -- Node says the same in its own docs, and code
     // that needs isolation wants a separate process.
     context.set_security_token(token);
-    let key = sandbox_private(scope);
-    link.set_private(scope, key, sandbox.into());
+    link.set_internal_field(LINK_SANDBOX_FIELD, sandbox.into());
 
     let proxy = context.global(scope);
     let key = proxy_private(scope);
