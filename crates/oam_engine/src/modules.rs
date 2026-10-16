@@ -679,6 +679,28 @@ fn fatal_report(
         tc.reset();
     }
     let body = body.unwrap_or_else(|| fallback.to_string());
+    // A value that is not a native Error: node prints the source frame
+    // itself, opened by an empty line and with the value right under the
+    // caret, and a primitive as String() renders it (a Symbol, which has
+    // no string conversion, as nothing). An object is still inspected.
+    // Measured on node v22.22.2; conformance case 473.
+    let (frame, body) = match frame {
+        Some(frame) if !exception.is_native_error() => {
+            let body = if exception.is_object() {
+                body
+            } else if exception.is_symbol() {
+                String::new()
+            } else {
+                exception
+                    .to_string(tc)
+                    .map(|s| s.to_rust_string_lossy(tc))
+                    .unwrap_or(body)
+            };
+            let frame = frame.strip_suffix('\n').unwrap_or(&frame);
+            (Some(format!("\n{frame}")), body)
+        }
+        frame => (frame, body),
+    };
     // Node closes a fatal report with its runtime banner ("Node.js vX.Y.Z").
     // oam prints its OWN -- same structural role, and claiming to be Node
     // here would be a lie about which runtime produced the crash.
