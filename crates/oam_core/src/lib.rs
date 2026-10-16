@@ -3007,11 +3007,14 @@ impl OpenFlags {
     ///
     /// - the open's `mode`: libuv adds FILE_ATTRIBUTE_READONLY for a creating
     ///   open whose mode lacks the owner's write bit (#324);
-    /// - UV_FS_O_FILEMAP is accepted and ignored. libuv opens such a file
-    ///   read-write, without the append swap, and does its reads and writes
-    ///   through a mapping, emulating append and the access mode there; here
-    ///   it is an ordinary handle, which differs only together with O_APPEND
-    ///   or O_DIRECT (docs/node-divergences.md).
+    /// - UV_FS_O_FILEMAP opens as libuv opens it -- a write-only open asks
+    ///   read access too, and a handle without standard information (a
+    ///   console, the pipe namespace) fails the open -- but no mapping is
+    ///   made: libuv does its reads and writes through one, emulating append
+    ///   and the access mode there, and opens an append-mode file read-write
+    ///   without the append swap; here it is an ordinary handle, which
+    ///   differs only together with O_APPEND or O_DIRECT
+    ///   (docs/node-divergences.md).
     #[cfg(windows)]
     pub fn open_with_mode(
         self,
@@ -3037,6 +3040,10 @@ impl OpenFlags {
 
         let mut access = match bits & (o_flag::WRONLY | o_flag::RDWR) {
             o_flag::RDONLY => FILE_GENERIC_READ,
+            // A mapping is always read: libuv opens a write-only
+            // UV_FS_O_FILEMAP file read-write (a console then refuses the
+            // open EINVAL, as it refuses any read-write open).
+            o_flag::WRONLY if has(o_flag::FILEMAP) => FILE_GENERIC_READ | FILE_GENERIC_WRITE,
             o_flag::WRONLY => FILE_GENERIC_WRITE,
             o_flag::RDWR => FILE_GENERIC_READ | FILE_GENERIC_WRITE,
             _ => return Err(invalid()),
@@ -3132,7 +3139,15 @@ impl OpenFlags {
         // the one ownership of it. It was not opened FILE_FLAG_OVERLAPPED, which
         // is what File's synchronous reads and writes need.
         let file = unsafe { std::fs::File::from_raw_handle(handle) };
-        as_the_crt_takes_it(file)
+        let file = as_the_crt_takes_it(file)?;
+        // libuv sizes a UV_FS_O_FILEMAP file for its mapping by asking its
+        // standard information, and fails the open with that call's error:
+        // a console has none (ERROR_INVALID_FUNCTION, EISDIR), the pipe
+        // namespace refuses it (ERROR_INVALID_PARAMETER, EINVAL).
+        if has(o_flag::FILEMAP) {
+            ops::file_info::<windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO>(&file)?;
+        }
+        Ok(file)
     }
 
     #[cfg(not(any(unix, windows)))]
