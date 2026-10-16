@@ -733,11 +733,12 @@ reads it without setting its own mode.
 _(source)_ Read out of both implementations, not measured side by side. Unix is unaffected:
 there oam applies libuv's `UV_TTY_MODE_RAW` recipe exactly (`raw_mode_bits`, same file).
 
-### 51. A process warning's trace hint -- FIXED, no longer a divergence
+### 51. A process warning's trace hint -- FIXED; what still differs about the trace flags
 
 This entry used to record that oam printed a process warning without node's one-time hint
 line, because oam had neither flag the hint names. oam now has `--trace-warnings` and
-`--trace-deprecation`, on the command line and in `NODE_OPTIONS`; they set
+`--trace-deprecation`, on the command line, in `NODE_OPTIONS` and in a `Worker`'s own
+`execArgv`; they set
 `process.traceProcessWarnings` / `process.traceDeprecation`, and the default printer
 writes the warning's stack for the warnings they cover. Otherwise the first warning it
 prints carries node's hint, once per thread, naming the flag for that warning's kind
@@ -750,6 +751,24 @@ after the program's name -- `basename(process.argv0)`, as node takes it, which i
 
 Conformance case 406 compares the hint with node's apart from that name, and each traced
 stack to its first frame (the frames below are each runtime's own module loader) (#364).
+
+What still differs (measured against node v22.22.2 on win32-arm64):
+
+- **`process.execArgv` lists the two flags in oam's fixed order**, after `--no-warnings` and
+  `--no-deprecation`, where node keeps the order they were given in: `--trace-deprecation
+  --no-warnings --trace-warnings a.js` reads back as `[--no-warnings, --trace-warnings,
+  --trace-deprecation]`. Every flag oam takes is listed this way (the `--tls-*` flags too, entry
+  34): `execArgv` is rebuilt from the parsed flags, not kept as typed.
+- **The `=value` spellings are refused.** node takes `--trace-warnings=<anything>` as the flag
+  set, the value ignored (probed: `=1`, `=0`, `=false`, `=foo` and a bare `=` all set
+  `process.traceProcessWarnings`, and `execArgv` keeps the spelling); oam stops with `unexpected
+  argument` (exit 2). `--no-warnings=1` is refused the same way. Taking them needs `execArgv` to
+  keep each flag as typed, the item above.
+- **Of the warning flags in a `Worker`'s own `execArgv`, oam applies `--no-warnings`,
+  `--trace-warnings` and `--trace-deprecation`.** `--no-deprecation` and `--disable-warning=X`
+  given there are listed in the worker's `execArgv` but not applied: the worker still prints
+  the deprecation, where node's sets `process.noDeprecation` / drops the warning. The same flags
+  given to the parent are inherited and applied.
 
 ### 53. Windows child windows: no console popup from a console-less oam, no `SW_HIDE` on std spawns
 
@@ -4158,13 +4177,16 @@ dependency tree touches, so one absent name takes down a program that would neve
 called it. (This is exactly how `statfsSync` — added to Node in v18.15 — killed a CLI on
 oam that never called it.)
 
-Measured on all three release platforms:
+Per release platform (the windows row measured; the linux and darwin rows counted from their
+sections' lists, which #368 edited by hand -- `sys` moved from an absent module to a partial
+one, and five names landed -- and which are to be regenerated on those hosts before the next
+release):
 
 | host | export names present | missing by name | in absent modules | modules absent |
 |---|---|---|---|---|
 | windows-aarch64 (Node v22.22.2) | 1555 / 1874 | 309 | 10 | 4 |
-| linux-x64 (Node v22.22.2) | 1530 / 1888 | 348 | 10 | 4 |
-| darwin-arm64 (Node v22.22.2) | 1530 / 1884 | 344 | 10 | 4 |
+| linux-x64 (Node v22.22.2), not re-measured | 1558 / 1888 | 320 | 10 | 4 |
+| darwin-arm64 (Node v22.22.2), not re-measured | 1558 / 1884 | 316 | 10 | 4 |
 
 "Present" subtracts both columns: the per-name gaps *and* the 10 export names living
 inside the 4 modules oam does not register at all (`sys`, which held 49 of them, is

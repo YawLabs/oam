@@ -19,7 +19,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 ### Added
 
 - **`--trace-warnings` and `--trace-deprecation`, and node's hint that names them.** Both flags
-  are accepted on the command line and in `NODE_OPTIONS`, set `process.traceProcessWarnings` /
+  are accepted on the command line, in `NODE_OPTIONS` and in a `Worker`'s own `execArgv`, set
+  `process.traceProcessWarnings` /
   `process.traceDeprecation`, and make the default warning printer write the warning's stack (for
   every warning, or for deprecations only) in place of its one-line text. Without them, the first
   warning printed carries node's one-time hint, `(Use \`oam --trace-warnings ...\` to show where
@@ -33,7 +34,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   text and the `emitter`, `type` and `count` fields, and an `EventTarget` (including an
   `AbortSignal` given a limit) warns too, once per target, with `target` in place of `emitter`. A
   target takes `events.defaultMaxListeners` when it is made; `events.setMaxListeners(n)` with no
-  target sets that default, and it validates `n` and its targets as node's does. An `EventTarget`
+  target sets that default, and it checks `n` as node's does (`ERR_INVALID_ARG_TYPE` /
+  `ERR_OUT_OF_RANGE` naming `"setMaxListeners"`). An `EventTarget`
   and an `AbortSignal` now inspect as node's (`EventTarget {}`, `AbortSignal { aborted: false }`)
   (#365).
 - **`process.emitWarning` reads its type and code as node's does.** An empty or falsy `type`
@@ -42,8 +44,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   property; a `DeprecationWarning` under `process.noDeprecation` is dropped even when
   `process.throwDeprecation` is set (#367).
 - **The deprecations node v22.22.2 emits at runtime, and the legacy names they guard.** `punycode`
-  warns DEP0040 when first loaded (not when a package loads it, outside Windows -- node's own
-  check), and has its `version`; `util.isArray` warns DEP0044; `util._extend` (DEP0060),
+  warns DEP0040 when first loaded (not when a package loads it -- node's own check, which looks
+  for `/node_modules/` in each frame's script name, so on Windows only a package's ES modules,
+  named by their `file://` URLs, are skipped), and has its `version`; `util.isArray` warns DEP0044; `util._extend` (DEP0060),
   `net._setSimultaneousAccepts` (DEP0121) and `require("sys")` (DEP0025, `util` under its old
   name, in `module.builtinModules` too) are there; `crypto.Hash` and `crypto.Hmac` construct, with
   or without `new`, and warn DEP0179 / DEP0181. `createHash` / `createHmac` throw node's
