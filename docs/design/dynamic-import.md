@@ -77,7 +77,9 @@ whole event loop runs there) or on a path that clears the slot before running JS
 `repl_eval`, `execute_script`, `run_registered_tests`). An op therefore finds the live pointer or
 None; with None it throws the old "not wired up on this entry path" error, which rejects the
 import. A job left over from a run whose `execute_*` returned early reads whatever the slot
-holds when it runs, never the old pointer.
+holds when it runs, never the old pointer. `require()` of an ES module reads the host through
+the same `with_active_host` (falling back to the embedder's host factory when none is parked);
+it runs synchronously inside the requiring statement, so the same argument covers it.
 
 **The sync-graph fast path relied on the mid-hook flush.** There is no fast path left to feed:
 nothing evaluates inside the hook, so nothing needs a checkpoint there, and `run` simply
@@ -88,11 +90,36 @@ module bodies, never inside one, so `evaluate` always meets a module that is lin
 the stack (the op still refuses the two states V8 would abort on). A cycle under top-level
 await is now a deadlock, as in node (exit 13); a cycle without one settles.
 
+## With `require()` of an ES module
+
+`require()` of an ES module (#426) loads, instantiates and evaluates a graph synchronously,
+through the static graph loader, and shares the module map with `import()`. The two meet in
+three places:
+
+- **An `import()` inside a `require()`.** A CommonJS module in a required graph, or the required
+  module's body, may call `import()`. The hook only resolves; the chain's jobs wait for a
+  microtask drain, and `require()` runs none before it returns, so the import's graph loads and
+  evaluates after the `require()` has returned, as node's does (conformance case 441). The old
+  hook loaded and evaluated it inside the `require()`, which needed the require-depth guard on
+  its checkpoint; with no checkpoint in the hook there is nothing to guard.
+- **The graph-load stack.** `require()`'s cycle check replays which modules node would have in
+  evaluation while a CommonJS dependency runs, from the stack of graph loads and the dependency
+  each one is running. `load` pushes a load of its own around `compile_module`, so a CommonJS
+  body it runs is recorded against that load, never against an outer one a drain happens to run
+  inside.
+- **Load failures.** A CommonJS body's throw or a syntax error rejects `import()` with the thrown
+  value itself (the graph loader keeps it beside the diagnostic), and a CommonJS body that threw
+  is not run again: a later `import()` or `require()` of it rethrows the same object, as node's
+  does.
+
+`load` runs `compile_module` with its CommonJS tick point off, and the graph loader's own tick
+point stays off inside any `require()`: neither runs ticks or promise jobs where node runs none.
+
 ## What stays different
 
 - CommonJS runs as oam loads it (to name its facade's exports), on turn 1 of `import()` and
   before its ES siblings in a static graph; node runs it as the graph evaluates. Recorded in
-  docs/node-divergences.md.
+  docs/node-divergences.md (entry 52).
 - node rewrites the message of a missing named export of a CommonJS module, resolving and
   loading it again to find out; oam keeps V8's message but keeps the two awaits, so the
   rejection lands on node's turn.
