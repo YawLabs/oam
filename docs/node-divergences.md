@@ -222,7 +222,10 @@ That is the documented default, not an oversight.
 With `--permission`, filesystem read, filesystem write, network, and environment access
 are denied unless granted, enforced in the native ops rather than in JavaScript, so
 monkey-patching `fs` does not route around it. Denials throw Node's `ERR_ACCESS_DENIED`
-carrying `permission` and `resource`.
+carrying `permission` and `resource`, with node's message naming the flag that grants the
+scope ("Access to this API has been restricted. Use --allow-fs-read to manage
+permissions."); a denial of oam's own net or environment scope names `--allow-net` or
+`--allow-env` in the same form.
 
 Differences from Node's model:
 

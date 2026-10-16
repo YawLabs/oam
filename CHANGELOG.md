@@ -46,6 +46,14 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   File's name and lastModified) rather than `Blob {}`. A chunk read from a `Response` body made from
   bytes or a Blob is the reader's own copy, so writing to it no longer changes the Blob or a
   `clone()`.
+- **`util.inspect` of a `ReadableStream` is node's summary.** It printed every internal field of
+  the stream; it is now `ReadableStream { locked, state, supportsBYOB }`, as node's is, and so is
+  the stream in the message of `getReader({ mode: "byob" })`'s "must be a byte stream" error.
+- **A `--permission` denial's message names the flag that grants it.** `ERR_ACCESS_DENIED` said
+  only "Access to this API has been restricted"; it now goes on, as node's does, "Use
+  --allow-fs-read to manage permissions." with the flag of the denied scope (`--allow-fs-write`,
+  `--allow-child-process`, `--allow-worker`, ...). oam's own net and environment scopes name
+  `--allow-net` and `--allow-env`.
 
 ## [0.19.1] - 2026-10-13
 
