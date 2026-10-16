@@ -44871,6 +44871,14 @@
               ? opts.execArgv.map(String)
               : (process.execArgv || []).map(String),
             env,
+            // node's Worker shares its creator's options only when it is
+            // given neither: an `env` (other than SHARE_ENV or process.env
+            // itself) or an `execArgv` starts it from the defaults, with
+            // NODE_OPTIONS from that environment and then the execArgv
+            // (#370; src/node_worker.cc).
+            inheritFlags:
+              (opts.env == null || opts.env === SHARE_ENV || opts.env === process.env) &&
+              !Array.isArray(opts.execArgv),
           }),
         );
         this._workerId = result.workerId;

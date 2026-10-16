@@ -333,6 +333,29 @@ impl WorkerEnv {
             base: pairs("base")?,
         })
     }
+
+    /// The value of `name` in this environment: the worker's own pairs, or
+    /// the shared store as it is now; folding case where the store does.
+    pub(crate) fn get(&self, name: &str) -> Option<String> {
+        let shared;
+        let pairs = match self.shared {
+            Some(id) => {
+                shared = shared_env_read(id)?.1;
+                &shared
+            }
+            None => &self.pairs,
+        };
+        pairs
+            .iter()
+            .find(|(key, _)| {
+                if self.fold {
+                    key.eq_ignore_ascii_case(name)
+                } else {
+                    key == name
+                }
+            })
+            .map(|(_, value)| value.clone())
+    }
 }
 
 /// An environment store shared between threads through SHARE_ENV. The
@@ -400,6 +423,9 @@ pub(crate) struct WorkerOptions {
     /// `None` only for a caller that passed no `env` (the worker then reads
     /// the process environment, as before).
     pub env: Option<WorkerEnv>,
+    /// The Worker was given neither `env` (or SHARE_ENV) nor `execArgv`:
+    /// it runs with its creator's options, as node's does (#370).
+    pub inherit_flags: bool,
 }
 
 pub(crate) fn spawn_worker(
@@ -442,7 +468,17 @@ fn run_worker(
         pipe_stderr,
         exec_argv,
         env,
+        inherit_flags,
     } = options;
+    // Decided before `env` moves into the runtime: the flags read the
+    // environment the worker starts with.
+    let flags_js = crate::worker_flags_builder().map(|build| {
+        let lookup = |name: &str| match &env {
+            Some(env) => env.get(name),
+            None => std::env::var(name).ok(),
+        };
+        build(inherit_flags, &exec_argv, &lookup)
+    });
     // Worker isolate: no fork pool (same recursion hazard as the prewarm
     // path -- a worker that installed a pool would spawn prewarm threads that
     // each spawn more pools). A nested oam.fork() inside a worker cold-spawns
@@ -473,20 +509,29 @@ fn run_worker(
             &format!("globalThis.process.execArgv = {json};"),
         );
     }
-    // Inherit the parent's process-level flags (--no-warnings etc.); a
-    // fresh isolate would otherwise start with none of them.
-    if let Some(js) = crate::inherited_flags_js() {
-        let _ = rt.execute_script("<flags>", js);
-    }
-    // The worker's own `execArgv: ["--no-warnings"]`: its process has no
-    // default 'warning' listener, as node's has none. (The other flags a
-    // worker may be given are not applied per worker.)
-    if exec_argv.iter().any(|arg| arg == "--no-warnings") {
-        let _ = rt.execute_script(
-            "<worker-flags>",
-            "for (const f of globalThis.process.listeners('warning')) \
-               if (f.name === 'onWarning') globalThis.process.removeListener('warning', f);",
-        );
+    // The worker's process-level flags (--no-warnings etc.), decided by its
+    // own `execArgv` and `env` as node decides them (#370); a fresh isolate
+    // would otherwise start with none of them.
+    match flags_js {
+        Some(js) => {
+            if !js.is_empty() {
+                let _ = rt.execute_script("<flags>", &js);
+            }
+        }
+        // No builder registered (an embedder without the CLI): the parent's
+        // flags, and the worker's own `execArgv: ["--no-warnings"]`.
+        None => {
+            if let Some(js) = crate::inherited_flags_js() {
+                let _ = rt.execute_script("<flags>", js);
+            }
+            if exec_argv.iter().any(|arg| arg == "--no-warnings") {
+                let _ = rt.execute_script(
+                    "<worker-flags>",
+                    "for (const f of globalThis.process.listeners('warning')) \
+                       if (f.name === 'onWarning') globalThis.process.removeListener('warning', f);",
+                );
+            }
+        }
     }
     // The entry is looked for on the worker's own thread, as node's is
     // (#287): its failure is the thread's error, handed to the parent whole,

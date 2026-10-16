@@ -95,6 +95,22 @@ pub(crate) fn inherited_flags_js() -> Option<&'static str> {
     INHERITED_FLAGS_JS.get().map(String::as_str)
 }
 
+/// Builds a worker_threads Worker's flags prelude: `(inherit, exec_argv,
+/// env)`, where `inherit` is a Worker given neither `env` nor `execArgv`,
+/// `exec_argv` the options it runs with, and `env` looks a name up in the
+/// environment it starts with. The CLI owns flag parsing, so it registers
+/// this; without one a worker takes [`inherited_flags_js`].
+pub type WorkerFlagsBuilder = fn(bool, &[String], &dyn Fn(&str) -> Option<String>) -> String;
+static WORKER_FLAGS_BUILDER: std::sync::OnceLock<WorkerFlagsBuilder> = std::sync::OnceLock::new();
+
+pub fn set_worker_flags_builder(builder: WorkerFlagsBuilder) {
+    let _ = WORKER_FLAGS_BUILDER.set(builder);
+}
+
+pub(crate) fn worker_flags_builder() -> Option<WorkerFlagsBuilder> {
+    WORKER_FLAGS_BUILDER.get().copied()
+}
+
 pub fn set_worker_host_factory(factory: WorkerHostFactory) {
     let _ = WORKER_HOST_FACTORY.set(factory);
 }
