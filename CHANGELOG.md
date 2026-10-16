@@ -16,6 +16,30 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A fatal microtask throw ends the run at the throw, as in node.** `queueMicrotask(() => { throw
+  e })` with no `uncaughtException` listener let the rest of the drain run first -- a sibling
+  `.then`, a later `queueMicrotask` callback, an async function's continuation -- so their output
+  came before the report. Nothing queued after the throw runs now, from an ES module or CommonJS,
+  and `uncaughtExceptionMonitor` hears the throw once, not twice (#398).
+- **Throws on the way out behave as node's.** A promise job an `'exit'` listener queues that throws
+  is reported and exits 1 (it was lost, exit 0), and an `uncaughtException` listener sees it; so
+  is a promise such a listener rejects and leaves unhandled. A
+  throw from an `'exit'` listener goes to the `uncaughtException` listeners, is reported with its
+  source frame and node's report, keeps a `process.exitCode` already set (`process.exit(3)` exits
+  3; it was always 1), and stops the emit: later listeners and the promise jobs the listeners
+  queued no longer run. Past a fatal throw, a throwing `'exit'` listener is no longer reported
+  after the original error. `oam -e` runs the `'exit'` listeners before printing the report, as
+  `oam run` does (#399).
+- **A throwing `uncaughtException` listener's report names the listener's line**, not a line of
+  oam's internal dispatcher (#399).
+- **The nextTick queue around exits and handled throws matches node.** `process.nextTick` queues
+  nothing once the process is exiting, so a warning emitted from an `'exit'` listener is not
+  printed. After an `uncaughtException` listener handles a tick's throw, the rest of the batch
+  runs at node's next tick point -- before the next immediate, and before the loop waits for a
+  timer that is not due yet -- where it ran after them (#366, #399).
+
 ## [0.19.1] - 2026-10-13
 
 ### Changed

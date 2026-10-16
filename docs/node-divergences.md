@@ -779,6 +779,28 @@ On POSIX a read in flight holds the parent's end until it returns (`child_unix.r
 with a blocking `poll`), so the pipe closes after the child's next write rather than at
 once, and that write is read and dropped; on Windows the close cancels the read.
 
+### 54. A primitive thrown from an ES module entry: no source frame, no trace hint
+
+A value that is not an Error -- `throw 42`, `throw "a string"` -- thrown at an ES module
+entry's top level is reported by node v22.22.2 as:
+
+```
+node:internal/modules/run_main:123
+    triggerUncaughtException(
+    ^
+42
+(Use `node --trace-uncaught ...` to show where the exception was thrown)
+```
+
+oam prints the value alone (`42`, and `'a string'` for the string, as `util.inspect`
+renders it), exit 1 as in node. Node's frame is the line of its own loader that rethrows
+the module's rejection; oam has no such source to point at, and a primitive carries no
+stack to place the throw by, so there is nothing true to print in its place. The hint
+names a flag oam does not have, as in #51; from a CommonJS entry oam prints node's frame
+(the user's `throw` line) and the value, and only the hint is missing (conformance case
+473, which takes the hint line out of both sides). Measured 2026-10-16 on Windows (#399
+item 6); `--trace-uncaught` is #364's kind of flag work.
+
 ---
 
 ## Module loading and the CLI
