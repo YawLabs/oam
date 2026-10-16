@@ -17530,77 +17530,61 @@
         }
         if (!condition) throw new codes.ERR_ASSERTION(message);
       },
-      emitWarning(warning, typeOrOptions, codeArg, ctorArg) {
-        // Normalize the (warning, type, code, ctor) / (warning, options)
-        // overloads the way Node does.
-        let type = "Warning";
-        let code;
-        let ctor;
+      emitWarning(warning, type, code, ctor) {
+        // The (warning, type, code, ctor) / (warning, ctor) / (warning,
+        // options) overloads, as node's emitWarning reads them
+        // (lib/internal/process/warning.js, v22.22.2): the options form takes
+        // `options.type || 'Warning'`, so an empty or falsy type is Warning,
+        // and the type and code are validated under the ARGUMENT's name in
+        // every form, before the warning itself is looked at.
         let detail;
-        if (typeOrOptions !== null && typeof typeOrOptions === "object" && !Array.isArray(typeOrOptions)) {
-          // options form
-          if (typeOrOptions.type !== undefined) {
-            if (typeof typeOrOptions.type !== "string") {
-              throw new codes.ERR_INVALID_ARG_TYPE("options.type", "string", typeOrOptions.type);
-            }
-            type = typeOrOptions.type;
-          }
-          if (typeOrOptions.code !== undefined) {
-            if (typeof typeOrOptions.code !== "string") {
-              throw new codes.ERR_INVALID_ARG_TYPE("options.code", "string", typeOrOptions.code);
-            }
-            code = typeOrOptions.code;
-          }
-          if (typeof typeOrOptions.ctor === "function") ctor = typeOrOptions.ctor;
-          if (typeof typeOrOptions.detail === "string") detail = typeOrOptions.detail;
-        } else if (typeof typeOrOptions === "function") {
-          // emitWarning(msg, ctor): a FUNCTION in the type position is the
-          // constructor used to trim the stack, not a type name. Node
-          // shifts it and leaves type at 'Warning'; oam used to throw
-          // ERR_INVALID_ARG_TYPE and reject a documented call form.
-          ctor = typeOrOptions;
-        } else {
-          if (typeOrOptions !== undefined) {
-            if (typeof typeOrOptions !== "string") {
-              throw new codes.ERR_INVALID_ARG_TYPE("type", "string", typeOrOptions);
-            }
-            type = typeOrOptions;
-          }
-          if (typeof codeArg === "function") {
-            ctor = codeArg;
-          } else if (codeArg !== undefined) {
-            if (typeof codeArg !== "string") {
-              throw new codes.ERR_INVALID_ARG_TYPE("code", "string", codeArg);
-            }
-            code = codeArg;
-          }
-          if (typeof ctorArg === "function") ctor = ctorArg;
+        if (type !== null && typeof type === "object" && !Array.isArray(type)) {
+          ctor = type.ctor;
+          code = type.code;
+          if (typeof type.detail === "string") detail = type.detail;
+          type = type.type || "Warning";
+        } else if (typeof type === "function") {
+          // emitWarning(msg, ctor): the constructor that trims the stack.
+          ctor = type;
+          code = undefined;
+          type = "Warning";
+        }
+        if (type !== undefined && typeof type !== "string") {
+          throw new codes.ERR_INVALID_ARG_TYPE("type", "string", type);
+        }
+        if (typeof code === "function") {
+          ctor = code;
+          code = undefined;
+        } else if (code !== undefined && typeof code !== "string") {
+          throw new codes.ERR_INVALID_ARG_TYPE("code", "string", code);
         }
 
         let warningObj;
-        if (warning instanceof Error) {
-          warningObj = warning;
-        } else if (typeof warning === "string") {
+        if (typeof warning === "string") {
+          // createWarningObject: a positional empty type is Warning too.
           warningObj = new Error(warning);
-          warningObj.name = String(type);
+          warningObj.name = String(type || "Warning");
           if (code !== undefined) warningObj.code = code;
           if (detail !== undefined) warningObj.detail = detail;
           if (typeof Error.captureStackTrace === "function") {
             Error.captureStackTrace(warningObj, ctor || process.emitWarning);
           }
+        } else if (warning instanceof Error) {
+          warningObj = warning;
         } else {
           throw new codes.ERR_INVALID_ARG_TYPE("warning", ["Error", "string"], warning);
         }
 
+        // noDeprecation first: a dropped deprecation is not thrown either.
         // throwDeprecation: a DeprecationWarning surfaces as an async throw
         // (uncaughtException), NOT a synchronous throw from emitWarning --
         // test-process-warning asserts the call site does not throw.
         if (warningObj.name === "DeprecationWarning") {
+          if (process.noDeprecation) return;
           if (process.throwDeprecation) {
             process.nextTick(() => { throw warningObj; });
             return;
           }
-          if (process.noDeprecation) return;
         }
 
         // Deferred, as node's is, so a listener attached after the call
