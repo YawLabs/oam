@@ -201,16 +201,11 @@ const codes = {
   ),
 };
 
-class AbortError extends Error {
-  constructor(message = "The operation was aborted", options = undefined) {
-    if (options !== undefined && typeof options !== "object") {
-      throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
-    }
-    super(message, options);
-    this.code = "ABORT_ERR";
-    this.name = "AbortError";
-  }
-}
+// node's one internal AbortError, which bootstrap.js defines for every
+// module that rejects with it: an AbortError from stream.finished has the
+// same constructor as one from events.once or timers/promises, as in node
+// (#401).
+const AbortError = globalThis.__oamAbortError;
 
 // v22 aggregateTwoErrors: prefer the outer error's identity/code, carry the
 // inner one alongside.

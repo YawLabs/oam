@@ -3979,17 +3979,10 @@
     // AbortError (code ABORT_ERR, the signal's reason as `cause`), not a
     // DOMException. Listeners on an EventTarget (an AbortSignal, say) as on
     // an EventEmitter; the abort listener resists stopImmediatePropagation,
-    // and every settle path unhooks all three listeners.
-    class AbortError extends Error {
-      constructor(message = "The operation was aborted", options = undefined) {
-        if (options !== undefined && typeof options !== "object") {
-          throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
-        }
-        super(message, options);
-        this.code = "ABORT_ERR";
-        this.name = "AbortError";
-      }
-    }
+    // and every settle path unhooks all three listeners. The AbortError is
+    // node's one internal class (bootstrap.js), shared with every other
+    // module that rejects with it (#401).
+    const AbortError = globalThis.__oamAbortError;
     const kResistStopPropagation = Symbol.for("oam.kResistStopPropagation");
     function eventTargetAgnosticAddListener(emitter, name, listener, flags) {
       if (typeof emitter.on === "function") {
@@ -4144,16 +4137,12 @@
         else error = err;
         closeHandler();
       }
+      // node's AbortError, the one class once() and the rest share, with
+      // the reason as its `cause`. A plain Error renamed to look like one
+      // had no AbortError constructor and put `cause` last among its keys
+      // (#401).
       function abortHandler() {
-        errorHandler(makeAbortErrorForOn(signal && signal.reason));
-      }
-
-      function makeAbortErrorForOn(reason) {
-        var err = new Error("The operation was aborted");
-        err.code = "ABORT_ERR";
-        err.name = "AbortError";
-        if (reason !== undefined) err.cause = reason;
-        return err;
+        errorHandler(new AbortError(undefined, { cause: signal?.reason }));
       }
 
       // EventTarget has no .on/.removeListener. on() only ever spoke the
@@ -4193,7 +4182,7 @@
         // async error path handed back an iterator that looked usable
         // and only failed on first next(), so `assert.throws(() => on(...))`
         // saw nothing thrown.
-        throw makeAbortErrorForOn(signal.reason);
+        throw new AbortError(undefined, { cause: signal.reason });
       }
       attach(event, eventHandler);
       if (event !== "error") attach("error", errorHandler);
@@ -6171,6 +6160,58 @@
         const cn = safeCtorName(v);
         return cn || "TypedArray";
       }
+      // Port of node's improveStack (lib/internal/util/inspect.js, v22.22.2):
+      // only a "regular" stack -- one that starts with `name`, an Error
+      // name, followed by ':' or a newline or nothing -- is touched, and
+      // then the header gains the constructor (and tag) when they differ
+      // from the name: `DOMException [AbortError]: x`, `Foo [Error]: x`,
+      // `BarError: x` for a BarError named "Error". A null-prototype error
+      // is labelled from its stack's own first word (#401).
+      // The [[ErrorData]] slot, read by Error.isError (util.types.isNativeError
+      // reads it the same way): an error is one whatever its prototype.
+      const errorIsError = Error.isError;
+      const isNativeErrorSlot = (v) =>
+        typeof errorIsError === "function" ? errorIsError(v) : false;
+      function improveErrorStack(stack, constructor, name, tag) {
+        const strEndsWith = String.prototype.endsWith;
+        const strStartsWith = String.prototype.startsWith;
+        let len = name.length;
+        if (typeof name !== "string") {
+          stack = stack.replace(
+            `${name}`,
+            `${name} [${inspectPrefix(constructor, tag, "Error").slice(0, -1)}]`,
+          );
+        }
+        if (
+          constructor === null ||
+          (strEndsWith.call(name, "Error") &&
+            strStartsWith.call(stack, name) &&
+            (stack.length === len || stack[len] === ":" || stack[len] === "\n"))
+        ) {
+          let fallback = "Error";
+          if (constructor === null) {
+            const start =
+              /^([A-Z][a-z_ A-Z0-9[\]()-]+)(?::|\n {4}at)/.exec(stack) ||
+              /^([a-z_A-Z0-9-]*Error)$/.exec(stack);
+            fallback = start?.[1] || "";
+            len = fallback.length;
+            fallback ||= "Error";
+          }
+          const prefix = inspectPrefix(constructor, tag, fallback).slice(0, -1);
+          if (name !== prefix) {
+            if (prefix.includes(name)) {
+              if (len === 0) {
+                stack = `${prefix}: ${stack}`;
+              } else {
+                stack = `${prefix}${stack.slice(len)}`;
+              }
+            } else {
+              stack = `${prefix} [${name}]${stack.slice(len)}`;
+            }
+          }
+        }
+        return stack;
+      }
       function inspectPrefix(constructor, tag, fallback, size = "") {
         // Port of Node getPrefix.
         if (constructor === undefined || constructor === null) {
@@ -6666,7 +6707,11 @@
           if (keys.length === 0 || (depth !== null && level > depth)) return base;
           return entriesTail(v, keys, base, level);
         }
-        if (v instanceof Error) {
+        // node's isError: an Error by its prototype chain, or a native error
+        // whatever its prototype -- one whose prototype was nulled renders
+        // as `[Error: null prototype]: msg`, labelled by improveStack, not
+        // as an empty null-prototype object (#401).
+        if (v instanceof Error || isNativeErrorSlot(v)) {
           let base;
           try {
             base = v.stack ? String(v.stack) : Error.prototype.toString.call(v);
@@ -6679,14 +6724,11 @@
           } catch {
             msg = undefined;
           }
-          // Node wraps the render in brackets when the stack carries no
-          // call-frame lines (searching past the message).
-          let pos = (msg && base.indexOf(msg)) || -1;
-          if (pos !== -1) pos += msg.length;
-          if (base.indexOf("\n    at", pos) === -1) base = `[${base}]`;
-          // Nested errors get their stack lines indented (Node formatError).
-          if (ictx.indentationLvl !== 0) {
-            base = base.split("\n").join(`\n${" ".repeat(ictx.indentationLvl)}`);
+          let errName;
+          try {
+            errName = v.name;
+          } catch {
+            errName = undefined;
           }
           let keys = getKeys(v, showHidden);
           if (!showHidden && keys.length !== 0) {
@@ -6720,6 +6762,21 @@
             }
           } catch {
             // A throwing `errors` getter is ignored, exactly like Node.
+          }
+          // Node's improveStack: the header names the constructor when it
+          // is not what `name` says, `DOMException [AbortError]: x` for a
+          // DOMException, `Foo [Error]: x` for a subclass that kept the name
+          // "Error" (#401). After the duplicate keys are judged, against the
+          // stack as the error carries it, as in node.
+          base = improveErrorStack(base, safeCtorName(v) ?? null, errName ?? "Error", tagOf(v));
+          // Node wraps the render in brackets when the stack carries no
+          // call-frame lines (searching past the message).
+          let pos = (msg && base.indexOf(msg)) || -1;
+          if (pos !== -1) pos += msg.length;
+          if (base.indexOf("\n    at", pos) === -1) base = `[${base}]`;
+          // Nested errors get their stack lines indented (Node formatError).
+          if (ictx.indentationLvl !== 0) {
+            base = base.split("\n").join(`\n${" ".repeat(ictx.indentationLvl)}`);
           }
           if (keys.length === 0) return base;
           if (depth !== null && level > depth) {
@@ -11768,15 +11825,12 @@
   const kFhRef = Symbol("kRef");
   const kFhUnref = Symbol("kUnref");
 
-  // node's AbortError for an fs call given a signal that is aborted: named
-  // and coded as such, with the signal's reason as its cause.
-  const FsAbortError = class AbortError extends Error {
-    constructor(signal) {
-      super("The operation was aborted", { cause: signal.reason });
-      this.code = "ABORT_ERR";
-      this.name = "AbortError";
-    }
-  };
+  // node's AbortError for an fs call given a signal that is aborted, with
+  // the signal's reason as its cause: the one internal class every module
+  // shares (bootstrap.js), not one of fs's own (#401).
+  function fsAbortError(signal) {
+    return new globalThis.__oamAbortError(undefined, { cause: signal.reason });
+  }
 
   // node's getOptions (lib/internal/fs/utils.js, v22.22.2): null, undefined
   // or a function is the defaults, a string is the encoding, anything else
@@ -13465,7 +13519,7 @@
           return this[kNative];
         };
         const checkAborted = () => {
-          if (signal && signal.aborted) throw new FsAbortError(signal);
+          if (signal && signal.aborted) throw fsAbortError(signal);
         };
         checkAborted();
         const stat = wrapStat(await natives.fsFstat(descriptor()));
@@ -13497,7 +13551,7 @@
       async writeFile(data, options) {
         const fh = this, h = this[kNative];
         options = writeFileOptions(options, false);
-        await writeHandleData(h, writeFileData(data, options, true), options.encoding);
+        await writeHandleData(h, writeFileData(data, options, true), options.encoding, options.signal);
       }
       // NOT an append. node documents FileHandle.appendFile as an ALIAS of
       // writeFile ("the mode cannot be changed from what it was set to
@@ -14058,7 +14112,7 @@
         const chunks = [];
         for (;;) {
           // node looks at the signal again between reads.
-          if (signal && signal.aborted) throw new FsAbortError(signal);
+          if (signal && signal.aborted) throw fsAbortError(signal);
           const chunk = await natives.fsReadChunk(handle, 65536);
           if (chunk === undefined) break;
           chunks.push(chunk);
@@ -14071,13 +14125,18 @@
     };
     // node's writeFileHandle (lib/internal/fs/promises.js, v22.22.2): a view
     // in one write -- none at all for an empty one -- or each chunk of an
-    // iterable in turn, a string chunk in the call's encoding.
-    async function writeHandleData(h, data, encoding) {
+    // iterable in turn, a string chunk in the call's encoding. The call's
+    // signal is looked at first and before every chunk, as node's
+    // checkAborted does; a writeFile given an aborted signal wrote the file
+    // anyway (#401).
+    async function writeHandleData(h, data, encoding, signal) {
+      if (signal && signal.aborted) throw fsAbortError(signal);
       if (!isCustomIterable(data)) {
         if (data.byteLength !== 0) await natives.fsWriteChunk(h, data);
         return;
       }
       for await (const chunk of data) {
+        if (signal && signal.aborted) throw fsAbortError(signal);
         const bytes = ArrayBuffer.isView(chunk) ? chunk : globalThis.Buffer.from(chunk, encoding || "utf8");
         if (bytes.byteLength !== 0) await natives.fsWriteChunk(h, bytes);
       }
@@ -14094,6 +14153,9 @@
     const writeFileAt = (path, data, options, append) => {
       data = writeFileData(data, options, true);
       if (fileHandles.has(path)) return path.writeFile(data, options);
+      // node's checkAborted, before the path is opened (and so before the
+      // file is created or emptied).
+      if (options.signal && options.signal.aborted) return Promise.reject(fsAbortError(options.signal));
       const file = toPath(path);
       const flag = openFlags(options.flag || (append ? "a" : "w"), natives);
       const mode = parseFileMode(options.mode, "mode", 0o666);
@@ -14103,7 +14165,7 @@
       return (async () => {
         const { handle } = await natives.fsOpen(file, flag, mode);
         try {
-          await writeHandleData(handle, data, options.encoding);
+          await writeHandleData(handle, data, options.encoding, options.signal);
         } finally {
           natives.fsClose(handle);
         }
@@ -14118,7 +14180,7 @@
       readFile: (path, options) => {
         const opts = fsGetOptions(options, {});
         if (fileHandles.has(path)) return readFileOfHandle(path, options);
-        if (opts.signal && opts.signal.aborted) return Promise.reject(new FsAbortError(opts.signal));
+        if (opts.signal && opts.signal.aborted) return Promise.reject(fsAbortError(opts.signal));
         return readFileAt(toPath(path), opts, true);
       },
       writeFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, false), false),
@@ -14621,6 +14683,13 @@
         validateCb(cb);
         options = writeFileOptions(options, append);
         const bytes = writeFileData(data, options, false);
+        // An aborted signal ends the call before anything is opened or
+        // written, with the callback run synchronously -- node's
+        // checkAborted for a path, its writeAll for a descriptor (lib/fs.js,
+        // v22.22.2). The signal was not looked at, and the data was written
+        // (#401).
+        const signal = options.signal;
+        if (signal && signal.aborted) return void cb(fsAbortError(signal));
         if (!isInt32(path) && bytes.byteLength === 0) {
           // Nothing to write is still one write: node's writeAll issues it
           // before it looks at what is left, so the descriptor answers --
@@ -15216,7 +15285,7 @@
         validateCb(cb);
         const opts = fsGetOptions(options, {});
         if (!isInt32(path)) {
-          if (opts.signal && opts.signal.aborted) return void cb(new FsAbortError(opts.signal));
+          if (opts.signal && opts.signal.aborted) return void cb(fsAbortError(opts.signal));
           if (typeof opts.flag === "number") validateInt32(opts.flag, "options.flag");
           else if (opts.flag !== undefined) openFlags(opts.flag, natives);
           return readFileByPath(path, opts, cb);
@@ -22338,18 +22407,11 @@
 
   // ------------------------------------------------- node:timers/promises
   registry.factories["timers/promises"] = () => {
-    // Node's internal AbortError shape: a real Error SUBCLASS (constructor
-    // name 'AbortError') with code ABORT_ERR, signal.reason carried as
-    // cause. timers/promises rejects with THIS, never with signal.reason.
-    class AbortError extends Error {
-      constructor(message = "The operation was aborted", options = undefined) {
-        super(message, options);
-        this.code = "ABORT_ERR";
-        this.name = "AbortError";
-      }
-    }
+    // Node's internal AbortError, the one class every module shares
+    // (bootstrap.js, #401), with signal.reason carried as cause.
+    // timers/promises rejects with THIS, never with signal.reason.
     function makeAbortError(cause) {
-      return cause !== undefined ? new AbortError(undefined, { cause }) : new AbortError();
+      return new globalThis.__oamAbortError(undefined, { cause });
     }
     // Node validates every argument BEFORE scheduling and surfaces the
     // failure as a REJECTION (these are async functions there), so a typo
@@ -33863,21 +33925,14 @@
   // -------------------------------------------------------------- readline
   // Minimal stub: enough for `readline.createInterface` and the async-
   // iterator line-reading pattern used by CLI utilities.
-  // node's internal AbortError: a real Error SUBCLASS (name 'AbortError',
-  // code ABORT_ERR) carrying the signal's reason as `cause`. What
-  // readline's question() rejects with on an aborted signal -- NOT a
-  // DOMException: `if (err.code !== 'ABORT_ERR') throw err` is the idiom
-  // callers branch on, and a DOMException's numeric code 20 crashed it.
-  // Shared by node:readline and node:readline/promises.
-  class ReadlineAbortError extends Error {
-    constructor(options) {
-      super("The operation was aborted", options);
-      this.code = "ABORT_ERR";
-      this.name = "AbortError";
-    }
-  }
+  // node's internal AbortError (the one class, bootstrap.js, #401)
+  // carrying the signal's reason as `cause`. What readline's question()
+  // rejects with on an aborted signal -- NOT a DOMException: `if (err.code
+  // !== 'ABORT_ERR') throw err` is the idiom callers branch on, and a
+  // DOMException's numeric code 20 crashed it. Shared by node:readline and
+  // node:readline/promises.
   function readlineAbortError(signal) {
-    return new ReadlineAbortError({ cause: signal.reason });
+    return new globalThis.__oamAbortError(undefined, { cause: signal.reason });
   }
 
   registry.factories.readline = () => {
@@ -37629,7 +37684,7 @@
   registry.factories["dns/promises"] = () => registry.get("dns").promises;
 
   // internal/errors -- some packages (readable-stream, undici) import this
-  registry.factories["internal/errors"] = () => ({ codes });
+  registry.factories["internal/errors"] = () => ({ codes, AbortError: globalThis.__oamAbortError });
 
   // internal/assert/myers_diff (--expose-internals) -- the SAME port that
   // produces oam's real assert diffs, published under node's internal id.
@@ -40477,11 +40532,9 @@
         if (options.endStream) stream.end();
         var signal = options.signal;
         if (signal) {
+          // node's AbortError, the one class every module shares (#401).
           var aborter = function () {
-            var abort = new Error("The operation was aborted", { cause: signal.reason });
-            abort.name = "AbortError";
-            abort.code = "ABORT_ERR";
-            stream.destroy(abort);
+            stream.destroy(new globalThis.__oamAbortError(undefined, { cause: signal.reason }));
           };
           if (signal.aborted) aborter();
           else {
@@ -43104,8 +43157,397 @@
     return tlsExports;
   };
 
+  // ----------------------------------------- MessageChannel / MessagePort
+  // node's MessageChannel and MessagePort (lib/internal/worker/io.js and
+  // event_target.js, v22.22.2), in-process: globals, and the very
+  // constructors node:worker_threads exports, as in node. There was no
+  // global MessageChannel at all, the global MessagePort was an empty
+  // placeholder class, and worker_threads' port was an EventEmitter, so
+  // `onmessage` did nothing and an addEventListener listener was handed the
+  // data instead of a MessageEvent (#401).
+  //
+  // A port is a NodeEventTarget: an EventTarget with node's on / once /
+  // off / emit family, whose node-style listeners are handed a message's
+  // data and whose DOM listeners a MessageEvent. What it does, measured on
+  // v22.22.2:
+  // - a message posted to a port waits in that port's queue until the port
+  //   is started -- by its first 'message' listener (on, addEventListener
+  //   or onmessage) or by start() -- and is then delivered from an
+  //   immediate, after the microtasks and before a setImmediate queued
+  //   after the post; removing the last 'message' listener stops it again;
+  // - a 'message' listener refs the port (it holds the event loop open, as
+  //   node's handle does) and removing the last one unrefs it;
+  // - close() closes both ends: the port's own queue is dropped and it
+  //   fires 'close', and the other end is told by a close that waits in its
+  //   queue behind the messages already sent, so those are still delivered
+  //   once it reads them;
+  // - postMessage clones with structuredClone (a DataCloneError for what
+  //   cannot be cloned) and, with no argument at all, throws node's
+  //   ERR_MISSING_ARGS TypeError; a post on or to a closed port is dropped.
+  const kIsNodeStyleListener = Symbol.for("oam.kIsNodeStyleListener");
+  const kNewPort = Symbol("kNewPort");
+  const kNodeTargetMaxListeners = Symbol("events.maxEventTargetListeners");
+  const kPortClose = Symbol("kPortClose");
+  // Port state, out of sight of inspect and Object.keys.
+  const portStates = new WeakMap();
+  function portState(port) {
+    const state = portStates.get(port);
+    if (state === undefined) {
+      throw new codes.ERR_INVALID_THIS("MessagePort");
+    }
+    return state;
+  }
+  function eventTargetListenerCount(target, type) {
+    const list = target._listeners.get(type);
+    return list === undefined ? 0 : list.length;
+  }
+  // A listener's error is the process's uncaught exception, as node's
+  // emitUncaughtException makes it; the listeners after it still run.
+  function reportListenerError(err) {
+    process.nextTick(() => {
+      throw err;
+    });
+  }
+  // node's kHybridDispatch: node-style listeners get `nodeValue`, the others
+  // an event, made once and only if one of them is there to take it.
+  function hybridDispatch(target, nodeValue, type, makeEvent) {
+    const list = target._listeners.get(type);
+    if (list === undefined || list.length === 0) return;
+    let event;
+    for (const entry of list.slice()) {
+      // Removed by a listener that ran before it.
+      if (!(target._listeners.get(type) ?? []).includes(entry)) continue;
+      if (event !== undefined && event._stopImmediate && !entry.resist) continue;
+      const fn = entry.ref ? entry.ref.deref() : entry.fn;
+      if (fn === undefined) continue;
+      if (entry.once) target.removeEventListener(type, fn);
+      let arg;
+      if (entry.nodeStyle) {
+        arg = nodeValue;
+      } else {
+        if (event === undefined) {
+          event = makeEvent();
+          event.target = target;
+          event.currentTarget = target;
+          event.eventPhase = 2; // AT_TARGET
+        }
+        arg = event;
+      }
+      try {
+        if (typeof fn === "function") fn.call(target, arg);
+        else fn.handleEvent.call(fn, arg);
+      } catch (err) {
+        reportListenerError(err);
+      }
+    }
+    if (event !== undefined) {
+      event.eventPhase = 0; // NONE
+      event.currentTarget = null;
+    }
+  }
+  class NodeEventTarget extends EventTarget {
+    setMaxListeners(n) {
+      if (typeof n !== "number" || n < 0 || Number.isNaN(n)) {
+        throw new codes.ERR_OUT_OF_RANGE("n", "a non-negative number", n);
+      }
+      Object.defineProperty(this, kNodeTargetMaxListeners, {
+        value: n,
+        writable: true,
+        configurable: true,
+        enumerable: false,
+      });
+    }
+    getMaxListeners() {
+      return this[kNodeTargetMaxListeners] ?? 10;
+    }
+    eventNames() {
+      return Array.from(this._listeners.keys()).filter(
+        (type) => eventTargetListenerCount(this, type) > 0,
+      );
+    }
+    listenerCount(type) {
+      return eventTargetListenerCount(this, String(type));
+    }
+    off(type, listener, options) {
+      this.removeEventListener(type, listener, options);
+      return this;
+    }
+    removeListener(type, listener, options) {
+      this.removeEventListener(type, listener, options);
+      return this;
+    }
+    on(type, listener) {
+      this.addEventListener(type, listener, { [kIsNodeStyleListener]: true });
+      return this;
+    }
+    addListener(type, listener) {
+      this.addEventListener(type, listener, { [kIsNodeStyleListener]: true });
+      return this;
+    }
+    emit(type, arg) {
+      if (typeof type !== "string") throw new codes.ERR_INVALID_ARG_TYPE("type", "string", type);
+      const hadListeners = this.listenerCount(type) > 0;
+      hybridDispatch(this, arg, type, () => this[kPortCreateEvent](arg, type));
+      return hadListeners;
+    }
+    once(type, listener) {
+      this.addEventListener(type, listener, { once: true, [kIsNodeStyleListener]: true });
+      return this;
+    }
+    // node clears the listener table without telling the port, so a port
+    // whose 'message' listeners go this way stays started and ref'd.
+    removeAllListeners(type) {
+      if (type !== undefined) this._listeners.delete(String(type));
+      else this._listeners.clear();
+      return this;
+    }
+  }
+  const kPortCreateEvent = Symbol("kCreateEvent");
+  NodeEventTarget.prototype[kPortCreateEvent] = function (nodeValue, type) {
+    return new globalThis.CustomEvent(type, { detail: nodeValue });
+  };
+
+  function portKeepAlive(port, state) {
+    const want = state.refed && !state.closed && !state.external;
+    if (want && state.keepAlive === null) {
+      // A ref'd timer that never comes due holds the loop open, as the
+      // port's ref'd handle does in node. Re-armed if it ever does.
+      const setTimer = registry._setTimeout ?? globalThis.setTimeout;
+      const arm = () => {
+        state.keepAlive = setTimer(arm, 0x7fffffff);
+      };
+      arm();
+    } else if (!want && state.keepAlive !== null) {
+      (registry._clearTimeout ?? globalThis.clearTimeout)(state.keepAlive);
+      state.keepAlive = null;
+    }
+  }
+  function portScheduleDrain(port, state) {
+    if (state.drainScheduled || !state.started || state.closed || state.queue.length === 0) return;
+    state.drainScheduled = true;
+    (registry._setImmediate ?? globalThis.setImmediate)(() => {
+      state.drainScheduled = false;
+      if (!state.started || state.closed) return;
+      // What is queued now goes out as one batch, every message of it even
+      // if a listener closes the port part way (node delivers a batch it
+      // has read whole); a message posted from a listener waits for the
+      // next turn.
+      const batch = state.queue.splice(0, state.queue.length);
+      for (const item of batch) {
+        if (item === kPortClose) {
+          portCloseLocal(port, state);
+          return;
+        }
+        hybridDispatch(port, item, "message", () => port[kPortCreateEvent](item, "message"));
+      }
+      portScheduleDrain(port, state);
+    });
+  }
+  // This end closes: its queue goes, and its 'close' event follows, which
+  // is when its handle is gone (hasRef() still answers true until then, as
+  // node's does).
+  function portCloseLocal(port, state) {
+    if (state.closed) return;
+    state.closed = true;
+    state.queue.length = 0;
+    portKeepAlive(port, state);
+    (registry._setImmediate ?? globalThis.setImmediate)(() => {
+      state.handleClosed = true;
+      port.dispatchEvent(new MessagePortCloseEvent());
+    });
+  }
+  // node's 'close' event for a port, a class of its own.
+  class MessagePortCloseEvent extends globalThis.Event {
+    constructor() {
+      super("close");
+    }
+  }
+
+  class MessagePort extends NodeEventTarget {
+    constructor(token) {
+      // Only a MessageChannel (or the runtime) makes a port: node's C++
+      // constructor refuses a script, with a plain TypeError carrying the
+      // code.
+      if (token !== kNewPort) {
+        const err = new TypeError("Constructor cannot be called");
+        err.code = "ERR_CONSTRUCT_CALL_INVALID";
+        throw err;
+      }
+      super();
+      portStates.set(this, {
+        twin: null,
+        queue: [],
+        started: false,
+        closed: false,
+        handleClosed: false,
+        // A port fed from outside this thread (a worker's parentPort),
+        // whose pending receive holds the loop instead of a ref.
+        external: false,
+        refed: false,
+        keepAlive: null,
+        drainScheduled: false,
+        onmessage: null,
+        onmessageerror: null,
+        // The runtime's hook for a port whose messages come from elsewhere
+        // (a worker's parentPort): called when the port first starts.
+        onStart: null,
+      });
+    }
+    // node's setupPortReferencing: the first 'message' listener refs and
+    // starts the port, and the last one going stops and unrefs it.
+    addEventListener(type, listener, options) {
+      const before = eventTargetListenerCount(this, type);
+      super.addEventListener(type, listener, options);
+      if (type === "message" && before === 0 && eventTargetListenerCount(this, type) > 0) {
+        this.ref();
+        this.start();
+      }
+    }
+    removeEventListener(type, listener, options) {
+      const before = eventTargetListenerCount(this, type);
+      super.removeEventListener(type, listener, options);
+      if (type === "message" && before > 0 && eventTargetListenerCount(this, type) === 0) {
+        portState(this).started = false;
+        this.unref();
+      }
+    }
+    postMessage(message, transfer) {
+      const state = portState(this);
+      if (arguments.length === 0) {
+        const err = new TypeError("Not enough arguments to MessagePort.postMessage");
+        err.code = "ERR_MISSING_ARGS";
+        throw err;
+      }
+      // node's second argument: a transfer list, or an options bag with one.
+      const list =
+        transfer != null && !Array.isArray(transfer) && typeof transfer === "object"
+          ? transfer.transfer
+          : transfer;
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          if (untransferable.has(item)) {
+            throw new DOMException("Cannot transfer object of unsupported type.", "DataCloneError");
+          }
+        }
+      }
+      const cloned =
+        Array.isArray(list) && list.length > 0
+          ? structuredClone(message, { transfer: list })
+          : structuredClone(message);
+      const twin = state.twin;
+      if (state.closed || twin === null) return;
+      const twinState = portState(twin);
+      if (twinState.closed) return;
+      twinState.queue.push(cloned);
+      portScheduleDrain(twin, twinState);
+    }
+    start() {
+      const state = portState(this);
+      if (state.closed) return;
+      if (!state.started) {
+        state.started = true;
+        if (typeof state.onStart === "function") state.onStart();
+      }
+      portScheduleDrain(this, state);
+    }
+    close(cb) {
+      if (typeof cb === "function") this.once("close", cb);
+      const state = portState(this);
+      if (state.closed) return;
+      const twin = state.twin;
+      portCloseLocal(this, state);
+      if (twin !== null) {
+        // The other end hears of it in order, behind what was sent to it.
+        const twinState = portState(twin);
+        if (!twinState.closed) {
+          twinState.queue.push(kPortClose);
+          portScheduleDrain(twin, twinState);
+        }
+      }
+    }
+    ref() {
+      const state = portState(this);
+      state.refed = true;
+      portKeepAlive(this, state);
+    }
+    unref() {
+      const state = portState(this);
+      state.refed = false;
+      portKeepAlive(this, state);
+    }
+    hasRef() {
+      const state = portState(this);
+      return state.refed && !state.handleClosed;
+    }
+    get onmessage() {
+      return portState(this).onmessage;
+    }
+    set onmessage(handler) {
+      setPortHandler(this, "message", handler);
+    }
+    get onmessageerror() {
+      return portState(this).onmessageerror;
+    }
+    set onmessageerror(handler) {
+      setPortHandler(this, "messageerror", handler);
+    }
+  }
+  // node's defineEventHandler: the handler is one listener, added when it
+  // is first set (where it then keeps its place) and taken off when it is
+  // set to anything that is not a function.
+  function setPortHandler(port, type, handler) {
+    const state = portState(port);
+    const key = `on${type}`;
+    const wrapperKey = `${key}Wrapper`;
+    const value = typeof handler === "function" ? handler : null;
+    if (value === null) {
+      if (state[wrapperKey]) port.removeEventListener(type, state[wrapperKey]);
+      state[wrapperKey] = null;
+    } else if (!state[wrapperKey]) {
+      const wrapper = function (event) {
+        const current = state[key];
+        if (typeof current === "function") return current.call(this, event);
+      };
+      state[wrapperKey] = wrapper;
+      port.addEventListener(type, wrapper);
+    }
+    state[key] = value;
+  }
+  // A 'message' or 'messageerror' event is a MessageEvent with the data.
+  MessagePort.prototype[kPortCreateEvent] = function (data, type) {
+    if (type !== "message" && type !== "messageerror") {
+      return NodeEventTarget.prototype[kPortCreateEvent].call(this, data, type);
+    }
+    return new globalThis.MessageEvent(type, { data, ports: [] });
+  };
+  // A port the runtime makes for itself (a worker's parentPort).
+  function newMessagePort() {
+    return new MessagePort(kNewPort);
+  }
+  function messagePortState(port) {
+    return portState(port);
+  }
+
+  class MessageChannel {
+    constructor() {
+      this.port1 = new MessagePort(kNewPort);
+      this.port2 = new MessagePort(kNewPort);
+      portState(this.port1).twin = this.port2;
+      portState(this.port2).twin = this.port1;
+    }
+  }
+  // Globals as node defines them: writable, configurable, not enumerable.
+  for (const [name, value] of [["MessageChannel", MessageChannel], ["MessagePort", MessagePort]]) {
+    Object.defineProperty(globalThis, name, {
+      value,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+
   // --------------------------------------------------------- worker_threads
-  // MessageChannel / MessagePort are fully functional (in-process). Worker
+  // MessageChannel / MessagePort are the globals above (in-process). Worker
   // class has native-backed thread spawning via workerNew/workerRecvMessage/
   // workerPostMessage/workerTerminate ops.
   registry.factories.worker_threads = () => {
@@ -43122,40 +43564,6 @@
     // can check (actual enforcement is future; the mark is the contract).
     const _untransferableSet = untransferable;
 
-    class MessagePort extends EventEmitter {
-      constructor() { super(); this._twin = null; this._active = true; }
-      postMessage(data, transferList) {
-        if (Array.isArray(transferList)) {
-          for (const item of transferList) {
-            if (untransferable.has(item)) {
-              throw new DOMException(
-                "Cannot transfer object of unsupported type.",
-                "DataCloneError",
-              );
-            }
-          }
-        }
-        const twin = this._twin;
-        if (twin && twin._active) {
-          const cloned = (typeof data === "object" && data !== null) ? structuredClone(data) : data;
-          queueMicrotask(() => twin.emit("message", cloned));
-        }
-      }
-      start() { return this; }
-      close() { this._active = false; this.emit("close"); }
-      ref() { return this; }
-      unref() { return this; }
-      addEventListener(type, fn) { this.on(type, fn); }
-      removeEventListener(type, fn) { this.off(type, fn); }
-    }
-    class MessageChannel {
-      constructor() {
-        this.port1 = new MessagePort();
-        this.port2 = new MessagePort();
-        this.port1._twin = this.port2;
-        this.port2._twin = this.port1;
-      }
-    }
     const natives = globalThis.__oam.node;
     const pathMod = registry.get("path");
     /** The environment a new worker starts with, from the Worker's `env`
@@ -43414,10 +43822,14 @@
 
     let parentPort = null;
     if (!isMain) {
-      parentPort = new MessagePort();
+      parentPort = newMessagePort();
       parentPort.postMessage = function postMessage(data) {
         natives.parentPortPostMessage(JSON.stringify(data));
       };
+      // Its messages come from the parent thread, and the receive below is
+      // what holds the loop while it waits, not the port's own ref.
+      const parentPortState = messagePortState(parentPort);
+      parentPortState.external = true;
       // Start the receive loop LAZILY. It awaits a message that may never
       // come, and that pending op keeps the worker's event loop alive -- so
       // starting it eagerly meant any worker that merely required
@@ -43441,13 +43853,9 @@
           }
         })();
       };
-      parentPort.on("newListener", (type) => {
-        if (type === "message") startRecvLoop();
-      });
-      parentPort.start = function start() {
-        startRecvLoop();
-        return this;
-      };
+      // A 'message' listener (any of on, addEventListener, onmessage) or
+      // start() starts the port, which starts the receive.
+      parentPortState.onStart = startRecvLoop;
     }
 
     const _bc = typeof globalThis.BroadcastChannel !== "undefined" ? globalThis.BroadcastChannel : null;
@@ -43462,7 +43870,20 @@
       MessagePort,
       Worker,
       BroadcastChannel: _bc || class BroadcastChannel { constructor() { throw new Error("BroadcastChannel not available"); } },
-      receiveMessageOnPort: () => undefined,
+      // node's receiveMessageOnPort: the next message waiting on the port,
+      // taken off its queue, as { message } -- undefined when none is (or
+      // the next thing waiting is the other end's close). It always
+      // answered undefined (#401). The refusal is node's C++ one.
+      receiveMessageOnPort: (port) => {
+        const state = port !== null && typeof port === "object" ? portStates.get(port) : undefined;
+        if (state === undefined) {
+          const err = new TypeError('The "port" argument must be a MessagePort instance');
+          err.code = "ERR_INVALID_ARG_TYPE";
+          throw err;
+        }
+        if (state.closed || state.queue.length === 0 || state.queue[0] === kPortClose) return undefined;
+        return { message: state.queue.shift() };
+      },
       markAsUntransferable,
       moveMessagePortToContext: () => { throw new Error("moveMessagePortToContext is not supported in oam"); },
       getEnvironmentData,
@@ -44354,6 +44775,11 @@
       // mock.timers) replaces the global: AbortSignal.timeout arms and unrefs
       // its timer with this, as node's arms it with its internal timers.
       registry._setTimeout = globalThis.setTimeout;
+      // The same for a MessagePort: its deliveries and close events run as
+      // immediates, and a ref'd port holds the loop with a timer, whatever a
+      // program has put in place of the globals (#401).
+      registry._setImmediate = globalThis.setImmediate;
+      registry._clearTimeout = globalThis.clearTimeout;
       // Exported for process.nextTick's per-entry ALS frame binding: each
       // queued tick captures the frame of ITS nextTick() call, not the frame
       // of whichever call scheduled the drain microtask.

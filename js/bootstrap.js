@@ -70,6 +70,18 @@
     globalThis.DOMException = DOMException;
   }
 
+  // The reason an abort carries: the caller's, unless it gave none. Only
+  // `undefined` means "none" (the spec's "if reason is not given"): node
+  // keeps `ac.abort(null)`'s reason as null, and it reaches every consumer
+  // that way -- signal.reason, throwIfAborted, fetch's rejection, the
+  // `cause` of an events.once AbortError. A `reason ?? ...` default turned
+  // null into this DOMException everywhere (#401).
+  function defaultAbortReason(reason) {
+    return reason === undefined
+      ? new globalThis.DOMException("This operation was aborted", "AbortError")
+      : reason;
+  }
+
   // ----------------------------------------------- Event / EventTarget
   // The DOM event primitives AbortController is built on. Minimal but
   // spec-shaped: once listeners, stopImmediatePropagation, dispatchEvent
@@ -261,11 +273,16 @@
       // opposite of what it was set for.
       const weak = options !== true && options != null &&
         options[Symbol.for("oam.kWeakHandler")] != null;
+      // Node-internal kIsNodeStyleListener (a MessagePort's on/once): the
+      // listener is handed a dispatch's node value -- a message's data --
+      // instead of the event (#401). dispatchEvent's node value is the event.
+      const nodeStyle = options !== true && options != null &&
+        options[Symbol.for("oam.kIsNodeStyleListener")] === true;
       const list = this._listeners.get(type) ?? [];
       if (!list.some((e) => listenerOf(e) === listener)) {
         const entry = weak
-          ? { ref: new WeakRef(listener), once, resist }
-          : { fn: listener, once, resist };
+          ? { ref: new WeakRef(listener), once, resist, nodeStyle }
+          : { fn: listener, once, resist, nodeStyle };
         list.push(entry);
         this._listeners.set(type, list);
         if (weak && collectedListeners) {
@@ -334,8 +351,7 @@
     static abort(reason) {
       const signal = new AbortSignal();
       signal.aborted = true;
-      signal.reason =
-        reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      signal.reason = defaultAbortReason(reason);
       return signal;
     }
     static timeout(delay) {
@@ -388,8 +404,7 @@
     _fire(reason) {
       if (this.aborted) return;
       this.aborted = true;
-      this.reason =
-        reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      this.reason = defaultAbortReason(reason);
       const event = new Event("abort");
       if (typeof this.onabort === "function") this.onabort.call(this, event);
       this.dispatchEvent(event);
@@ -1016,7 +1031,14 @@
         for (const t of transfers) memo.set(t, t.slice(0));
       }
       function cloneInner(v) {
-        if (v === null || (typeof v !== "object" && typeof v !== "function")) return v;
+        // A function or a symbol cannot be serialized: V8's serializer, under
+        // node's structuredClone and postMessage alike, throws a
+        // DataCloneError naming it. A function was cloned as an empty
+        // object, and a symbol passed through as itself (#401).
+        if (typeof v === "function" || typeof v === "symbol") {
+          throw new DOMException(`${String(v)} could not be cloned.`, "DataCloneError");
+        }
+        if (v === null || typeof v !== "object") return v;
         if (memo.has(v)) return memo.get(v);
         // A file-backed Blob (fs.openAsBlob) is NOT cloneable in node -- it
         // holds a file reference, not bytes, so a clone would outlive the
@@ -1071,9 +1093,7 @@
       }
       // Serialize first (primitives pass through); only on success detach
       // the transfer-list sources. A throw above leaves them intact.
-      const out = (value === null || (typeof value !== "object" && typeof value !== "function"))
-        ? value
-        : cloneInner(value);
+      const out = cloneInner(value);
       if (transfers) for (const t of transfers) t.transfer();
       return out;
     };
@@ -1215,10 +1235,6 @@
     }
     brand(File, "File");
     globalThis.File = File;
-  }
-
-  if (typeof globalThis.MessagePort === "undefined") {
-    globalThis.MessagePort = class MessagePort {};
   }
 
   // ----------------------------------------------------------------- FormData
@@ -1861,8 +1877,7 @@
     // up later is cancelled on arrival instead of holding its connection.
     let bodyAborted = false;
     let onAbort = null;
-    const abortReason = () =>
-      signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+    const abortReason = () => defaultAbortReason(signal.reason);
     // Read to the end, failed or cancelled: nothing is left for an abort to
     // stop. Stop listening, so a signal shared by many fetches does not
     // collect one listener per response, and a late abort does not leave a
@@ -2664,8 +2679,7 @@
   // it arrived on) instead of a Response.
   async function settleRaw(pending, lookup, signal, connector) {
     const internal = globalThis.__oam;
-    const aborted = () =>
-      signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+    const aborted = () => defaultAbortReason(signal.reason);
     let raw;
     try {
       raw = await pending;
@@ -2929,8 +2943,7 @@
       let stopped = false;
       let failure = null;
       let written = 0;
-      const aborted = () =>
-        signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      const aborted = () => defaultAbortReason(signal.reason);
       if (signal?.aborted) return reject(aborted());
       const channel = node.fetchBodyChannelNew();
       request.body_stream = channel;
@@ -3116,8 +3129,7 @@
   async function collectBlobStream(stream, size, signal) {
     const reader = stream.getReader();
     const chunks = [];
-    const reasonOf = () =>
-      signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+    const reasonOf = () => defaultAbortReason(signal.reason);
     let onAbort = null;
     const aborted = signal
       ? new Promise((_resolve, reject) => {
@@ -3231,7 +3243,7 @@
     const signal = init.signal;
     // Already-aborted: reject before touching the network (spec).
     if (signal?.aborted) {
-      throw signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      throw defaultAbortReason(signal.reason);
     }
     if (collect) init.body = await collectBlobStream(init.body, collect.size, signal);
     // undici's DISPATCH-level rules are a smaller set that node applies to
@@ -3612,9 +3624,7 @@
         signal.addEventListener(
           "abort",
           () => {
-            reject(
-              signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError"),
-            );
+            reject(defaultAbortReason(signal.reason));
             cancel();
           },
           { once: true },
@@ -4288,6 +4298,34 @@
   });
   Object.defineProperty(globalThis, "__oamNodeErrorPrototype", {
     value: nodeErrorPrototype,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+
+  // node's internal AbortError (lib/internal/errors.js, v22.22.2), the ONE
+  // class: events.once/on, timers/promises, the streams (finished,
+  // pipeline, addAbortSignal, the operators), fs, readline, child_process
+  // and http2 all reject with it, so `e.constructor` is the same object
+  // whichever raised it, as in node. Each module carried a class of its own
+  // with the same name and code, and an `instanceof` or constructor check
+  // against one missed the others (#401). Own keys in node's order: stack,
+  // message, cause (when given), code, name.
+  class AbortError extends ErrorCtor {
+    constructor(message = "The operation was aborted", options = undefined) {
+      if (options !== undefined && typeof options !== "object") {
+        // The codes live in node_compat.js, evaluated after this file, so
+        // they are looked up at call time.
+        const { codes } = globalThis.__oamNode.get("internal/errors");
+        throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+      }
+      super(message, options);
+      this.code = "ABORT_ERR";
+      this.name = "AbortError";
+    }
+  }
+  Object.defineProperty(globalThis, "__oamAbortError", {
+    value: AbortError,
     writable: false,
     enumerable: false,
     configurable: false,
