@@ -634,9 +634,18 @@
   /// oam asks the OS for the whole path at once (`realpath`, which is what
   /// node's `.native` forms and `fs/promises.realpath` report). When that
   /// fails, this walk finds the error node's would have: the first component
-  /// whose lstat fails. If every component stats, the native error stands.
-  /// The walk yields `[op, path]` for the caller to run -- "lstat", "stat" or
-  /// "readlink", sync or async -- so one walk serves both forms.
+  /// whose lstat fails. If every component stats, the walk's own answer is
+  /// node's: the path it resolved, which the OS may have refused (NUL, on
+  /// Windows, resolves to itself). The walk yields `[op, path]` for the
+  /// caller to run -- "lstat", "stat" or "readlink", sync or async -- so one
+  /// walk serves both forms, and returns the resolved path, or null when it
+  /// gave up on a chain of links (the native error then stands).
+  ///
+  /// On Windows a path in a device namespace (`\\?\`, `\\.\`) is walked
+  /// first, whatever the OS says of it (`realpathWalksFirst`): node's root
+  /// there is two components deep (`\\?\C:\`, `\\.\pipe\`), and its lstat
+  /// fails where the OS resolves the whole path -- `\\?\C:\x` is
+  /// `EISDIR, lstat 'C:'` on v22.22.2 (#361).
   function* realpathWalk(path) {
     const pathMod = registry.get("path");
     let full = pathMod.resolve(path);
@@ -654,7 +663,7 @@
         if (statKind(stat) === "symlink") {
           // node stats the link (so a dangling one fails `stat`), reads it,
           // and starts over from the resolved path.
-          if (++hops > 40) return;
+          if (++hops > 40) return null;
           yield ["stat", current];
           const target = yield ["readlink", current];
           full = pathMod.resolve(pathMod.dirname(current), target, ...parts.slice(i + 1));
@@ -662,8 +671,17 @@
           break;
         }
       }
-      if (!relinked) return;
+      if (!relinked) return full;
     }
+  }
+
+  /// Whether node's realpath walk answers for `path` before the OS is asked
+  /// (realpathWalk): on Windows, a path that resolves into a device
+  /// namespace.
+  function realpathWalksFirst(path) {
+    if (globalThis.__oam.node.platform !== "win32" || typeof path !== "string") return false;
+    const full = registry.get("path").resolve(path);
+    return full.startsWith("\\\\?\\") || full.startsWith("\\\\.\\");
   }
 
   /// Captured when node_compat.js is evaluated, so a script that replaces
@@ -13313,11 +13331,26 @@
     dest = cpString(dest);
     const fs = registry.get("fs");
     const path = registry.get("path");
+    // node's UVException names the path as its binding shows any path: the
+    // namespaced one, with the `\\?\` prefix taken off.
+    const srcFailed = (e) => cpUvError(e, dereference ? "stat" : "lstat", globalThis.__oam.node.fsShownPathOf(src));
+    // On Windows MSVC's std::filesystem stat asks the path's attributes
+    // first (GetFileAttributesExW), as access does: a device refuses it
+    // EINVAL -- NUL too, which stats -- and a share root that is no disk
+    // ENOTSUP. A sharing violation sends it on to a directory search,
+    // which is the stat below.
+    if (process.platform === "win32") {
+      try {
+        fs.accessSync(src);
+      } catch (e) {
+        if (e.code !== "EBUSY") throw srcFailed(e);
+      }
+    }
     let srcStat;
     try {
       srcStat = dereference ? fs.lstatSync(src) : fs.statSync(src);
     } catch (e) {
-      throw cpUvError(e, dereference ? "stat" : "lstat", cpNs(src));
+      throw srcFailed(e);
     }
     let destStat = null;
     try {
@@ -14881,37 +14914,66 @@
       return toPath(typeof path === "string" || isUrl ? path : path + "");
     }
 
-    function realpathWalkErrorSync(path, original) {
+    // realpathWalk run synchronously: its answer, or null; a failing lstat /
+    // readlink throws its own error.
+    function realpathWalkSync(path) {
       const walk = realpathWalk(path);
       let step = walk.next();
-      try {
-        while (!step.done) {
-          const [op, at] = step.value;
-          step = walk.next(
-            op === "readlink"
-              ? natives.fsReadlinkSync(at)
-              : natives.fsStatSync(at, op === "lstat", true, statSyncValues),
-          );
-        }
-      } catch (e) {
-        return e;
+      while (!step.done) {
+        const [op, at] = step.value;
+        step = walk.next(
+          op === "readlink"
+            ? natives.fsReadlinkSync(at)
+            : natives.fsStatSync(at, op === "lstat", true, statSyncValues),
+        );
       }
-      return original;
+      return step.value;
     }
 
+    // As realpathWalkSync, each step off the loop thread.
+    async function realpathWalkAsync(path) {
+      const walk = realpathWalk(path);
+      let step = walk.next();
+      while (!step.done) {
+        const [op, at] = step.value;
+        step = walk.next(op === "readlink" ? await natives.fsReadlink(at) : await natives.fsStat(at, op === "lstat"));
+      }
+      return step.value;
+    }
+
+    // node's realpathSync: the OS's answer where node's walk reaches the
+    // same one, else the walk's own (realpathWalk).
+    function realpathWalkingSync(path) {
+      if (realpathWalksFirst(path)) {
+        const walked = realpathWalkSync(path);
+        if (walked !== null) return walked;
+      }
+      let original;
+      try {
+        return realpathJsShape(natives.fsRealpathSync(path));
+      } catch (e) {
+        original = e;
+      }
+      const walked = realpathWalkSync(path);
+      if (walked !== null) return walked;
+      throw original;
+    }
+
+    // node's callback realpath, as realpathWalkingSync.
     async function realpathWalking(path) {
+      if (realpathWalksFirst(path)) {
+        const walked = await realpathWalkAsync(path);
+        if (walked !== null) return walked;
+      }
+      let original;
       try {
         return realpathJsShape(await natives.fsRealpath(path));
-      } catch (original) {
-        // A failing lstat / readlink rejects with its own error.
-        const walk = realpathWalk(path);
-        let step = walk.next();
-        while (!step.done) {
-          const [op, at] = step.value;
-          step = walk.next(op === "readlink" ? await natives.fsReadlink(at) : await natives.fsStat(at, op === "lstat"));
-        }
-        throw original;
+      } catch (e) {
+        original = e;
       }
+      const walked = await realpathWalkAsync(path);
+      if (walked !== null) return walked;
+      throw original;
     }
 
     // DEP0081, once per process as node warns it.
@@ -15578,14 +15640,7 @@
       accessSync: (path, mode) => natives.fsAccessSync(toPath(path), mode ?? 0),
       // node's realpathSync stringifies rather than type-checks (`p += ''`),
       // and on failure reports what its component walk hit (realpathWalk).
-      realpathSync: (path) => {
-        const file = realpathArg(path);
-        try {
-          return realpathJsShape(natives.fsRealpathSync(file));
-        } catch (e) {
-          throw realpathWalkErrorSync(file, e);
-        }
-      },
+      realpathSync: (path) => realpathWalkingSync(realpathArg(path)),
       mkdtempSync: (prefix, options) => {
         const [valid, encoding] = mkdtempArgs(prefix, options);
         return mkdtempResult(natives.fsMkdtempSync(valid), encoding);
