@@ -2375,8 +2375,8 @@ mod tests {
     // ------------------------------------------- `*` in a grant entry (#376)
     //
     // Measured with `--permission --allow-fs-read=<entry>` and
-    // `--allow-fs-write=<entry>` against node v22.22.2 on Windows and
-    // v22.23.2 on Linux (conformance case 511 holds the same rows).
+    // `--allow-fs-write=<entry>` against node v22.22.2 on Windows and on
+    // Linux (conformance case 511 holds the same rows).
 
     /// A read grant and a write grant of the same entries.
     fn read_and_write_grants(entries: &[String]) -> [(&'static str, Permissions); 2] {
