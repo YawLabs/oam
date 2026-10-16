@@ -4105,10 +4105,14 @@ The texts of oam's other std::filesystem-shaped failures in that copy (a link th
 cannot be made, a directory below the top that cannot be created) are glibc's `strerror`,
 which is what node prints on Linux; on Windows node prints the system's message. The one
 exception is the destination itself when it cannot be created (`create_directories`): on
-Windows oam fails as node does there (#360, conformance case 532) -- a file in the way is
-`errno` 183, an empty `code` and `, Cannot create a file when that file already exists.
-'<path>'`, a directory that may not be written in `errno` 5, `EIO`, `Access is denied.` --
-and any other failure of it is Linux-shaped. All of them have node's key order (`errno`,
+Windows oam fails as node does there (#360, conformance cases 532 and 535) -- a file in the
+way is `errno` 183, an empty `code` and `, Cannot create a file when that file already exists.
+'<path>'`, a directory that may not be written in `errno` 5, `EIO`, `Access is denied.`, a
+missing drive or a name too long `errno` 3, `ESRCH`, `The system cannot find the path
+specified.`, and a name with a character Windows does not allow `errno` 123, `ENOPROTOOPT`,
+`The filename, directory name, or volume label syntax is incorrect.` (a missing drive wins
+over a bad name below it). mkdir reports those last two as one `ENOENT`, so oam tells them
+apart by the drive root and the names in the path. Any other failure of it is Linux-shaped. All of them have node's key order (`errno`,
 `code`, `path`, `syscall`). Measured against v22.22.2 on Windows and Linux; macOS (libc++)
 is not measured. cp's and
 `fs.promises.cp`'s copies, and cpSync with a `filter`, are node's JS and match it

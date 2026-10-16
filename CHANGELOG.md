@@ -28,13 +28,17 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   checked to be functions, in node's order, with node's `ERR_INVALID_ARG_TYPE`. A stream whose
   `open` is its own (a subclass's, or one assigned) opens by calling it, and
   `ReadStream.prototype.open` / `WriteStream.prototype.open` are node's deprecated no-ops
-  (DEP0135). `fs.writev` no longer calls a patched `fs.write`. (#356)
+  (DEP0135). `fs.writev` no longer calls a patched `fs.write`. A method the constructor does not
+  check (`close` with `autoClose: false`, `fsync` with `flush` set later) that is missing fails
+  the call with node's `TypeError`, where oam closed natively the descriptor `options.fs.open`
+  handed out. (#356)
 - **`fs.cpSync` of a directory whose destination cannot be made fails as node's does.** The error
   node's C++ raises has its keys in node's order (`errno`, `code`, `path`, `syscall`; oam put
   `syscall` before `path`), and on Windows it is MSVC's, as node's is: a file in the way is
   `errno` 183 with an empty `code` and "Cannot create a file when that file already exists.", a
-  directory that may not be written in `errno` 5, `EIO`, "Access is denied." -- where oam gave
-  Linux's `ENOTDIR` and `EPERM`. `fs.cp`, `cpSync` and `fs.promises.cp` making a missing
+  directory that may not be written in `errno` 5, `EIO`, "Access is denied.", a missing drive or a
+  name too long `errno` 3, `ESRCH`, and a name Windows does not allow `errno` 123, `ENOPROTOOPT`
+  -- where oam gave Linux's `ENOTDIR`, `EPERM` and `ENOENT`. `fs.cp`, `cpSync` and `fs.promises.cp` making a missing
   destination parent, and the async forms' `ENOTDIR` from `mkdir`, are now guarded by a
   conformance case. (#360)
 
