@@ -778,15 +778,8 @@ fn dup_inherited(fd: u64) -> Option<std::fs::File> {
     if raw < 0 {
         return None;
     }
-    // F_GETFD is the cheapest "is this open" question, and it is deliberately
-    // still the RAW call: it is the probe that establishes openness, so it is
-    // the one place that cannot presuppose it. `fcntl` on an arbitrary integer
-    // is fully defined -- a closed or never-opened descriptor answers EBADF.
-    //
-    // SAFETY: `fcntl(F_GETFD)` only reads the flags of the integer fd `raw`; no
-    // pointers are involved, and an invalid `raw` is reported as -1/EBADF
-    // rather than being undefined.
-    if unsafe { libc::fcntl(raw, libc::F_GETFD) } == -1 {
+    // F_GETFD is the cheapest "is this open" question; see fd_is_open.
+    if !fd_is_open(raw) {
         return None;
     }
     // SAFETY: the F_GETFD probe on the line above returned successfully, so
@@ -956,9 +949,7 @@ fn probe_open(fd: u64) -> bool {
     };
     #[cfg(unix)]
     {
-        // SAFETY: `fcntl(F_GETFD)` only reads the flags of the integer fd `raw`
-        // to test whether it is open; no pointers are involved.
-        unsafe { libc::fcntl(raw, libc::F_GETFD) != -1 }
+        fd_is_open(raw)
     }
     #[cfg(windows)]
     {
@@ -969,6 +960,145 @@ fn probe_open(fd: u64) -> bool {
         let _ = raw;
         false
     }
+}
+
+/// Is the integer descriptor `raw` open? The unix twin of `crt_fd::osfhandle`'s
+/// -1 test.
+///
+/// Safe: `fcntl(F_GETFD)` takes only an integer and reads that descriptor's
+/// flags, changing nothing. It is fully defined on any `i32` -- a closed or
+/// never-opened descriptor answers -1/EBADF -- so no caller obligation is left.
+/// It has to be the raw call: it is the probe that establishes openness, which
+/// a `BorrowedFd` would already presuppose.
+#[cfg(unix)]
+fn fd_is_open(raw: i32) -> bool {
+    // SAFETY: `fcntl(F_GETFD)` only reads the flags of the integer fd `raw`; no
+    // pointers are involved, and an invalid `raw` is reported as -1/EBADF
+    // rather than being undefined.
+    unsafe { libc::fcntl(raw, libc::F_GETFD) != -1 }
+}
+
+/// Make the descriptors we were born holding non-inheritable, as node's
+/// startup does with uv_disable_stdio_inheritance. Call ONCE, right after
+/// `snapshot_inherited_fds` (whose record it reads) and before any child is
+/// spawned.
+///
+/// Without it every child oam starts takes a copy of whatever its parent
+/// handed oam, whatever that child's `stdio` says: a detached Windows child
+/// with `stdio: 'ignore'` kept oam's stdout pipe, and any child kept an
+/// extra-fd pipe (`stdio: [..., 'pipe']`), so the parent's read of that pipe
+/// ended when the last such child exited instead of when oam did. Only the
+/// inheritance flag changes. oam's own use is unaffected: its writes to 0-2
+/// look the handle up each time, and an adopted fd is a dup made at first use
+/// (`dup_inherited`), which never depended on the original's flag. A child
+/// that is GIVEN one of these descriptors still gets it: `stdio: 'inherit'`
+/// and `stdio: [..., n]` both hand the child a fresh inheritable duplicate
+/// (Rust std, child_win), or dup2 it into place (child_unix), which clears
+/// FD_CLOEXEC on the target.
+///
+/// - Windows: clears HANDLE_FLAG_INHERIT on the three std handles
+///   (GetStdHandle), on the OS handles behind CRT fds 0-2, and on the OS
+///   handle behind every CRT fd in the snapshot -- together, every CRT fd
+///   from 0 to `MAX_INHERITED_FD` the parent passed in
+///   STARTUPINFO.lpReserved2, which libuv walks entry by entry. CRT fds 0-2
+///   are covered separately because a parent may pass a different handle
+///   there than in STARTUPINFO's hStd* fields.
+/// - unix: sets FD_CLOEXEC on every fd in the snapshot, which holds fds 3 and
+///   up only. NEVER 0-2, unlike libuv: libuv's spawn always dup2s a child's
+///   stdio into place, but Rust std's `Stdio::inherit` leaves fds 0-2 as they
+///   are, so a close-on-exec flag there would close every `stdio: 'inherit'`
+///   child's stdio at exec.
+///
+/// Coverage is the snapshot's window, fds 3 through `MAX_INHERITED_FD` (63):
+/// a descriptor a parent passes at 64 or above stays inheritable (see
+/// docs/node-divergences.md #19). An fd already closed through
+/// `close_inherited_fd` is skipped, so a number the OS has since reissued to
+/// one of oam's own descriptors is never touched.
+pub fn disable_stdio_inheritance() {
+    debug_assert!(
+        INHERITED_AT_START.get().is_some(),
+        "disable_stdio_inheritance needs snapshot_inherited_fds to have run first"
+    );
+    let consumed = INHERITED_CONSUMED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let inherited: Vec<i32> = INHERITED_AT_START
+        .get()
+        .into_iter()
+        .flatten()
+        .filter(|fd| !consumed.contains(fd))
+        .filter_map(|&fd| i32::try_from(fd).ok())
+        // The snapshot starts at 3; restated so the unix rule above can never
+        // be broken by a change to the snapshot.
+        .filter(|&fd| fd >= 3)
+        .collect();
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+        };
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        // The OS handles behind CRT fds 0-2 and the inherited CRT fds 3 and
+        // up, looked up with the safe probe. A real handle is positive; -1 is
+        // "not open" and -2 is the CRT's "std fd with no stream", neither of
+        // which is ours to touch. 0-2 usually repeat a GetStdHandle handle
+        // below; clearing a flag twice is harmless.
+        let crt_handles: Vec<HANDLE> = (0..=2)
+            .chain(inherited.iter().copied())
+            .map(crt_fd::osfhandle)
+            .filter(|&h| h > 0)
+            .map(|h| h as HANDLE)
+            .collect();
+        // SAFETY: GetStdHandle takes a constant and returns this process's
+        // std handle (or null / INVALID_HANDLE_VALUE, both skipped).
+        // SetHandleInformation with mask HANDLE_FLAG_INHERIT and flags 0 only
+        // clears the inheritance bit of a handle this process holds: the std
+        // handles just fetched, and the CRT-table handles of fds 0-2 and of
+        // the inherited fds probed just above (fds oam has closed are
+        // filtered out before the probe) -- and at
+        // worst a stale handle value makes the call fail with
+        // ERROR_INVALID_HANDLE. No pointer is passed or
+        // dereferenced. A failure is ignored: it leaves that handle
+        // inheritable, which is the behaviour before this call.
+        unsafe {
+            for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                let h = GetStdHandle(id);
+                if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                    SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+            for h in crt_handles {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    for raw in inherited {
+        // SAFETY: fcntl F_GETFD / F_SETFD take only the integer fd `raw` and an
+        // integer flag word; no pointer is involved, and a descriptor closed
+        // since the snapshot answers -1/EBADF, which is checked. `raw` is a
+        // descriptor the parent handed us (fd >= 3, in the startup snapshot,
+        // not since closed by oam); an adopted fd is a separate dup, so this
+        // is the parent's original. Setting its close-on-exec flag breaks no
+        // owner's invariant -- Rust std sets FD_CLOEXEC on every descriptor it
+        // creates -- it only stops children inheriting it, as node's startup
+        // does. A failed F_SETFD leaves it inheritable, the behaviour before
+        // this call.
+        unsafe {
+            let flags = libc::fcntl(raw, libc::F_GETFD);
+            if flags != -1 && flags & libc::FD_CLOEXEC == 0 {
+                libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    let _ = inherited;
 }
 
 /// Adopt an fd the parent handed us into `registry`, so the ordinary fs ops can

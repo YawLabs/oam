@@ -355,14 +355,12 @@ fn eof_while_detached_grandchild_lives(stream: Stream) {
 /// oam's stdout reaches EOF when oam exits, not when a detached child it
 /// started (with every stdio slot ignored) exits.
 #[test]
-#[ignore = "gap 2: fails until oam makes its std handles non-inheritable at startup; the fix removes this attribute and nothing else"]
 fn detached_child_does_not_hold_oam_stdout() {
     eof_while_detached_grandchild_lives(Stream::Stdout);
 }
 
 /// The same for oam's stderr (std handle -12 as well as -11).
 #[test]
-#[ignore = "gap 2: fails until oam makes its std handles non-inheritable at startup; the fix removes this attribute and nothing else"]
 fn detached_child_does_not_hold_oam_stderr() {
     eof_while_detached_grandchild_lives(Stream::Stderr);
 }
