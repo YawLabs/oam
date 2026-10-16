@@ -36,7 +36,8 @@ table:
 | op | node step | work |
 |---|---|---|
 | `resolve(spec, referrer)` | `#cachedDefaultResolve` | `ModuleHost::resolve`, keyed as the module map keys |
-| `load(path, type, spec)` | `loadAndTranslate` | check the `type` attribute; `compile_module` |
+| `checkType(path, type, spec)` | `validateAttributes` (in load) | throw unless `type` is absent, or `json` for a .json file |
+| `load(path, spec)` | `loadAndTranslate` | `compile_module` |
 | `requests(path)` | `getModuleRequests()` | the compiled module's requests |
 | `link(path, specs, paths)` | `module.link(modules)` | record the module map's edges |
 | `instantiate(path)` | `module.instantiate()` | `instantiate_module` |
@@ -47,7 +48,13 @@ table:
 A module oam loaded outside the chain (the entry's static graph, a facade it imports) is one
 node's loader holds a linked, instantiated job for; the chain adopts a job of that shape for it,
 with its dependencies' jobs, so a new module that imports the static graph walks it on node's
-turns.
+turns. Every miss of the load cache runs `checkType` first, adopted or not: node's cache is keyed
+by `type` too, so `import(x, { with: { type: "json" } })` of a loaded JavaScript module misses it
+and reaches load, which rejects.
+
+`ModuleJob.prototype` has a null prototype, as in node: `getModuleJobForImport` is async and
+returns a job, so its promise reads `job.then`, which a polluted `Object.prototype.then` must not
+answer.
 
 The hook hands back a promise resolved with the chain's, not the chain's own: node's `import()`
 settles one thenable link after its loader's promise does (a patched `Promise.prototype.then`

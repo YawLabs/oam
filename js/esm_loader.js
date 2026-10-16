@@ -182,6 +182,9 @@ globalThis.__oamEsmLoader = function (ops) {
       return { __proto__: null, module: this.module };
     }
   }
+  // As node's module_job.js does: a job is what an async function returns,
+  // and its promise reads job.then, which Object.prototype must not supply.
+  ObjectSetPrototypeOf(ModuleJob.prototype, null);
 
   // A module the host loaded outside this loader -- the entry's static
   // graph, a builtin or CommonJS facade it imports -- is a module node's
@@ -224,7 +227,7 @@ globalThis.__oamEsmLoader = function (ops) {
 
   function createModuleJob(url, importAttributes, specifier) {
     // Load and translate: synchronous, as node's default load is.
-    ops.load(url, importAttributes.type, specifier);
+    ops.load(url, specifier);
     const job = new ModuleJob(url, importAttributes, url);
     MapPrototypeSet(cache(), cacheKey(url, importAttributes.type), job);
     return job;
@@ -234,6 +237,9 @@ globalThis.__oamEsmLoader = function (ops) {
     const { url } = resolveResult;
     let job = MapPrototypeGet(cache(), cacheKey(url, importAttributes.type));
     if (job === undefined) {
+      // node's load validates the attributes, and every miss of this cache
+      // reaches it, a module loaded under another "type" included.
+      ops.checkType(url, importAttributes.type, specifier);
       job = ops.isLoaded(url)
         ? adoptLoadedJob(url, importAttributes.type)
         : createModuleJob(url, importAttributes, specifier);

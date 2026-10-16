@@ -3150,39 +3150,54 @@ fn op_dyn_resolve(
     rv.set(text.into());
 }
 
-/// `ops.load(path, type, specifier)`: load and translate one module into the
-/// module map (node's load + translate), checking its "type" attribute
-/// first. A CommonJS file runs here (see compile_module). Throws on failure.
-fn op_dyn_load(
+/// `ops.checkType(path, type, specifier)`: throw unless the import()'s
+/// "type" attribute fits the module at `path` -- none, or "json" for a .json
+/// file. node validates in its load, which every import() whose (path, type)
+/// pair has no module job yet reaches, so the loader calls this on each such
+/// miss: a module already loaded under another type is checked too.
+fn op_dyn_check_type(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let path = arg_path(scope, &args, 0);
     let declared = args.get(1);
-    let declared = (!declared.is_undefined()).then(|| declared.to_rust_string_lossy(scope));
-    let spec = args.get(2).to_rust_string_lossy(scope);
-    if let Some(value) = &declared {
-        if value != "json" {
-            return throw_dyn_error(
-                scope,
-                &format!(
-                    "oam: dynamic import('{spec}') declares type \"{value}\" \
-                     — the only supported import-attribute type is \"json\""
-                ),
-            );
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            return throw_dyn_error(
-                scope,
-                &format!(
-                    "oam: dynamic import('{spec}') is imported with type \"json\" \
-                     but resolves to {} (only .json files load as JSON modules today)",
-                    path.display()
-                ),
-            );
-        }
+    if declared.is_undefined() {
+        return;
     }
+    let value = declared.to_rust_string_lossy(scope);
+    let spec = args.get(2).to_rust_string_lossy(scope);
+    if value != "json" {
+        return throw_dyn_error(
+            scope,
+            &format!(
+                "oam: dynamic import('{spec}') declares type \"{value}\" \
+                 — the only supported import-attribute type is \"json\""
+            ),
+        );
+    }
+    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        throw_dyn_error(
+            scope,
+            &format!(
+                "oam: dynamic import('{spec}') is imported with type \"json\" \
+                 but resolves to {} (only .json files load as JSON modules today)",
+                path.display()
+            ),
+        );
+    }
+}
+
+/// `ops.load(path, specifier)`: load and translate one module into the
+/// module map (node's load + translate); `ops.checkType` has run first. A
+/// CommonJS file runs here (see compile_module). Throws on failure.
+fn op_dyn_load(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let path = arg_path(scope, &args, 0);
+    let spec = args.get(1).to_rust_string_lossy(scope);
     if dyn_module(scope, &path).is_some() {
         return;
     }
@@ -4060,6 +4075,7 @@ pub(crate) fn install_dynamic_import(
     let bindings = [
         ("generation", v8::Function::new(scope, op_dyn_generation)),
         ("resolve", v8::Function::new(scope, op_dyn_resolve)),
+        ("checkType", v8::Function::new(scope, op_dyn_check_type)),
         ("load", v8::Function::new(scope, op_dyn_load)),
         ("requests", v8::Function::new(scope, op_dyn_requests)),
         ("link", v8::Function::new(scope, op_dyn_link)),
