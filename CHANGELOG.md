@@ -21,11 +21,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **`tty.WriteStream` and `tty.ReadStream` over a console opened by name refuse what node's refuse,
   with node's errno (#381).** On Windows they took any descriptor `tty.isatty` called a terminal and
   refused the rest with `EBADF`. They now ask the console what libuv's `uv_tty_init` asks: a console
-  opened write-only (`\\.\CONOUT$` with `w` or `a`, `\\.\CONIN$` with `w`), and a screen buffer opened
-  without write access (`\\.\CONOUT$` with `r`, `a+` or `as+`, which is still a terminal to
-  `isatty`), are `ERR_TTY_INIT_FAILED` with `EPERM`, and `EBADF` is left to a descriptor with no
-  console behind it. `tty.isatty` of a console opened by name, and of a descriptor once it is closed,
-  already answered as node's does (#379); both are now pinned in a console test.
+  opened write-only (`\\.\CON` with `w`, `\\.\CONOUT$` and `\\.\CONIN$` with `w` or `a`), and a
+  screen buffer opened without write access (`\\.\CONOUT$` with `r`, `a+` or `as+`, which is still
+  a terminal to `isatty`), are `ERR_TTY_INIT_FAILED` with `EPERM`, and `EBADF` is left to a
+  descriptor with no console behind it. `tty.isatty` of a console opened by name, and of a
+  descriptor once it is closed, already answered as node's does (#379); both are now pinned in a
+  console test.
 
 ## [0.19.1] - 2026-10-13
 
