@@ -129,6 +129,11 @@ fn node_runs_as_esm(scope: &mut v8::PinScope<'_, '_>, host: &dyn ModuleHost, pat
     if let Some(kind) = oam_loader::node_declared_module_kind(path) {
         return kind == oam_loader::ModuleKind::Esm;
     }
+    // A typeless .js oam has already decided as node does.
+    let key = module_key(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(kind) = crate::cjs::detected_kind(scope, &key) {
+        return kind == oam_loader::ModuleKind::Esm;
+    }
     let typescript = matches!(
         path.extension().and_then(|e| e.to_str()),
         Some("ts" | "tsx" | "mts" | "cts")
@@ -2033,7 +2038,14 @@ impl<'scope, 'env> GraphPrefetcher<'scope, 'env> {
         if path.extension().and_then(|e| e.to_str()) == Some("json") {
             return false;
         }
+        // A file node decides by its syntax is only known to be an ES module
+        // once the isolate has tested it, so it is front-run on a guess: a
+        // typeless project file an ES module imports is usually one, a
+        // typeless file under node_modules usually CommonJS. A guess that
+        // loses costs a read nobody takes (the CommonJS branch loads it).
         oam_loader::module_kind(path) != oam_loader::ModuleKind::Cjs
+            || (oam_loader::kind_from_syntax(path)
+                && !path.components().any(|c| c.as_os_str() == "node_modules"))
     }
 
     /// Hand `path` to the pool if it is eligible and not already requested.
@@ -2153,6 +2165,28 @@ fn load_module_graph_overlapped(
         // Set when the pool loaded this path: the worker's cache probe
         // (key + blob) rides along so nothing is hashed or read twice.
         let mut prefetched = None;
+        // A file CommonJS by its kind runs through the require machinery;
+        // one node decides by its syntax is tested as it is about to, and
+        // with module syntax comes back to load below as the ES module it
+        // is (load_cjs_or_detect).
+        let cjs_exports = if builtin.is_none()
+            && !is_json
+            && oam_loader::module_kind(&path) == oam_loader::ModuleKind::Cjs
+        {
+            match crate::cjs::load_cjs_or_detect(tc, &path) {
+                crate::cjs::CjsLoad::Exports(exports) => Some(exports),
+                crate::cjs::CjsLoad::Threw => {
+                    return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
+                }
+                crate::cjs::CjsLoad::Esm => {
+                    let key = module_key(&path).unwrap_or_else(|_| path.clone());
+                    crate::cjs::warn_typeless_package_json(tc, &key);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let code = if let Some(name) = builtin {
             let Some(exports) = crate::cjs::get_builtin(tc, &name) else {
                 return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
@@ -2168,10 +2202,7 @@ fn load_module_graph_overlapped(
                 return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
             };
             crate::cjs::facade_source(tc, &path, exports)
-        } else if oam_loader::module_kind(&path) == oam_loader::ModuleKind::Cjs {
-            let Some(exports) = crate::cjs::load_cjs(tc, &path) else {
-                return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
-            };
+        } else if let Some(exports) = cjs_exports {
             if let Some(failure) = run_ticks_and_microtasks(tc) {
                 return Err(failure);
             }
@@ -3006,7 +3037,7 @@ pub(crate) fn dynamic_import_callback<'s>(
 }
 
 /// Windows-safe file:// URL with minimal percent-encoding (space, #, ?, %).
-fn path_to_file_url(path: &Path) -> String {
+pub(crate) fn path_to_file_url(path: &Path) -> String {
     let slashed = path.to_string_lossy().replace('\\', "/");
     let mut out = String::from("file://");
     if !slashed.starts_with('/') {

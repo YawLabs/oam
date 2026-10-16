@@ -130,10 +130,6 @@ protocol surface ships in the binary instead of being installed from npm.
   macos-x64, macos-arm64, linux-x64. linux-arm64 builds from the same tree but
   the V8 snapshot forbids cross-compiling, so it needs a native ARM Linux
   builder. The installer refuses that target by name rather than guessing.
-- **A typeless `.js` file is ESM in oam and CommonJS in Node.** The divergence
-  most likely to hit you first: `require` is not defined in such a file. Files
-  inside `node_modules` keep Node's CommonJS default. Fix with
-  `"type": "commonjs"`, a `.cjs` rename, or `import`.
 - **`require()` of an ES module throws `ERR_REQUIRE_ESM`.** Node 22 supports it;
   oam does not yet. Use `await import()`.
 - **`oam install` skips lifecycle scripts**, so a package that compiles an addon

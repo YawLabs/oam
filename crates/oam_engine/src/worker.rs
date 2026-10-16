@@ -22,10 +22,10 @@ impl super::JsRuntime {
         // An ESM entry has to go through the module graph. load_cjs compiles
         // it as a classic script, so `new Worker('x.mjs')` threw on its first
         // import statement -- the ESM guard lives in the require() callback,
-        // which an entry never passes through. Asked of the file's real path,
-        // as the CLI routes a program's entry (entry_module_kind in oam_cli).
-        let real = crate::modules::module_key(entry).unwrap_or_else(|_| entry.to_path_buf());
-        let kind = oam_loader::module_kind(&real);
+        // which an entry never passes through. Decided as the CLI routes a
+        // program's entry: on the file's real path, a typeless .js by its
+        // syntax.
+        let kind = self.entry_module_kind(entry);
         self.execute_worker_as(entry, kind, ctx)
     }
 
@@ -81,7 +81,8 @@ impl super::JsRuntime {
         let loader_knows = matches!(extension, ".js" | ".mjs" | ".cjs" | ".json" | ".node")
             || oam_loader::is_transpiled_source(&real);
         if loader_knows {
-            return Ok((found, oam_loader::module_kind(&real)));
+            // A typeless .js by its syntax, as node's runMain decides it.
+            return Ok((found, self.entry_module_kind(&real)));
         }
         let type_module = oam_loader::node_declared_module_kind(&real) == Some(ModuleKind::Esm);
         let module_syntax = !type_module && {

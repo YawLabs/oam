@@ -787,49 +787,62 @@ fn probe_require(raw: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Is the file at `path` an ES module or CommonJS?
+/// The kind the file at `path` runs as before its source is looked at.
 ///
 /// Extensions are authoritative: .mjs/.mts/.ts/.tsx are ESM, .cjs/.cts are
-/// CJS (TypeScript is always ESM in oam unless explicitly .cts). For
-/// .js/.jsx the nearest package.json "type" decides, walking up and
-/// stopping at a node_modules boundary, per Node.
+/// CJS (TypeScript is always ESM in oam unless explicitly .cts). Otherwise
+/// the nearest package.json "type" decides, walking up and stopping at a
+/// node_modules boundary, per node.
 ///
-/// Documented divergence on the MISSING-"type" default: inside
-/// node_modules it is CJS (Node-exact — typeless packages ship CJS), but
-/// for project files it is ESM. `npm init -y` writes no "type" field, and
-/// punishing modern project code with require semantics for that is the
-/// wrong default in 2026. Write .cjs (or "type": "commonjs") to opt
-/// project files into CJS.
+/// A file with no "type" to go by (none, or a value other than "module" or
+/// "commonjs", which node reads as none) is one node decides by its syntax
+/// ([`kind_from_syntax`]): CommonJS unless it has module syntax. This
+/// function cannot read the syntax, so it answers CommonJS -- node's answer
+/// for every such file without an import, export, import.meta or top-level
+/// await -- and the engine, which can, asks `contains_module_syntax` for
+/// the rest. (oam once ran a typeless project .js as ESM regardless; that
+/// divergence is gone.) The one exception is a typeless .jsx outside
+/// node_modules: node runs no JSX at all, so there is no node answer to
+/// follow, and it stays ESM -- like .ts/.tsx -- as JSX is written.
 pub fn module_kind(path: &Path) -> ModuleKind {
-    match path.extension().and_then(|e| e.to_str()) {
+    let extension = path.extension().and_then(|e| e.to_str());
+    match extension {
         Some("mjs" | "mts" | "ts" | "tsx") => return ModuleKind::Esm,
         // .node addons ride the CJS/require machinery, per Node.
         Some("cjs" | "cts" | "node") => return ModuleKind::Cjs,
         _ => {}
     }
-    // Any "type" but "module" runs as CommonJS here, as oam always has; node
-    // takes a value other than "module" or "commonjs" for none and detects
-    // the syntax (node_declared_module_kind), which for the CommonJS such a
-    // package holds comes to the same.
     match declared_package_type(path) {
-        Some(PackageType::Module) => return ModuleKind::Esm,
-        Some(PackageType::Commonjs | PackageType::Other) => return ModuleKind::Cjs,
-        None => {}
+        Some(PackageType::Module) => ModuleKind::Esm,
+        Some(PackageType::Commonjs | PackageType::Other) => ModuleKind::Cjs,
+        None if extension == Some("jsx") && !in_node_modules(path) => ModuleKind::Esm,
+        None => ModuleKind::Cjs,
     }
-    let in_node_modules = path.components().any(|c| c.as_os_str() == "node_modules");
-    if in_node_modules {
-        ModuleKind::Cjs
-    } else {
-        ModuleKind::Esm
-    }
+}
+
+/// Whether node decides the kind of the file at `path` by its syntax -- its
+/// containsModuleSyntax test -- rather than by its extension or package.json
+/// "type": a .js (or extensionless, or otherwise unknown-extension) file
+/// whose nearest package.json has no "type" (or one that is neither "module"
+/// nor "commonjs"), or that has no package.json above it at all. node does
+/// this inside node_modules too. TypeScript and JSX are left to
+/// [`module_kind`]'s extension policy, and JSON, addons and WebAssembly are
+/// never source to test.
+pub fn kind_from_syntax(path: &Path) -> bool {
+    let fixed = matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("mjs" | "mts" | "ts" | "tsx" | "cjs" | "cts" | "jsx" | "node" | "json" | "wasm")
+    );
+    !fixed && matches!(declared_package_type(path), None | Some(PackageType::Other))
 }
 
 /// The kind node itself takes a file for before it looks at its syntax:
 /// .mjs/.mts ESM, .cjs/.cts CJS, and otherwise the nearest package.json
 /// "type" -- None for a file with none (a typeless .js/.jsx/.ts/.tsx), the
-/// files node decides by whether their syntax is a module's. oam runs those
-/// as ESM outside node_modules ([`module_kind`]); where the difference is
-/// observable (when nextTick runs, #345) oam follows node's decision.
+/// files node decides by whether their syntax is a module's. oam decides a
+/// typeless .js the same way ([`kind_from_syntax`]); a typeless .ts/.tsx it
+/// runs as ESM ([`module_kind`]), so where the difference is observable for
+/// one (when nextTick runs, #345) oam follows node's decision.
 pub fn node_declared_module_kind(path: &Path) -> Option<ModuleKind> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("mjs" | "mts") => Some(ModuleKind::Esm),
@@ -842,6 +855,11 @@ pub fn node_declared_module_kind(path: &Path) -> Option<ModuleKind> {
     }
 }
 
+/// Whether `path` lies under a node_modules directory.
+fn in_node_modules(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == "node_modules")
+}
+
 /// A package.json "type": "module", "commonjs", or another string -- which
 /// node's package.json reader takes for none.
 enum PackageType {
@@ -850,26 +868,16 @@ enum PackageType {
     Other,
 }
 
-/// The nearest package.json "type" above `path`, up to a node_modules
-/// boundary, or None where the nearest package.json declares none (or there
-/// is none).
-fn declared_package_type(path: &Path) -> Option<PackageType> {
+/// The package.json that scopes `path`, as node's getPackageScopeConfig finds
+/// it: the nearest one above the file, the walk stopping at a node_modules
+/// directory. None when there is none. It is the file node names in its
+/// MODULE_TYPELESS_PACKAGE_JSON warning, and whose "type" decides a .js.
+pub fn package_scope(path: &Path) -> Option<PathBuf> {
     let mut dir = path.parent();
     while let Some(current) = dir {
         let manifest_path = current.join("package.json");
         if manifest_path.is_file() {
-            let declared = cached_manifest(&manifest_path).and_then(|manifest| {
-                manifest
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            });
-            return match declared.as_deref() {
-                Some("module") => Some(PackageType::Module),
-                Some("commonjs") => Some(PackageType::Commonjs),
-                Some(_) => Some(PackageType::Other),
-                None => None,
-            };
+            return Some(manifest_path);
         }
         if current
             .file_name()
@@ -880,6 +888,25 @@ fn declared_package_type(path: &Path) -> Option<PackageType> {
         dir = current.parent();
     }
     None
+}
+
+/// The nearest package.json "type" above `path`, up to a node_modules
+/// boundary, or None where the nearest package.json declares none (or there
+/// is none).
+fn declared_package_type(path: &Path) -> Option<PackageType> {
+    let manifest_path = package_scope(path)?;
+    let declared = cached_manifest(&manifest_path).and_then(|manifest| {
+        manifest
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    match declared.as_deref() {
+        Some("module") => Some(PackageType::Module),
+        Some("commonjs") => Some(PackageType::Commonjs),
+        Some(_) => Some(PackageType::Other),
+        None => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1536,8 +1563,60 @@ mod tests {
         let outside = proj.join("src/index.js");
         std::fs::write(&inside, "").unwrap();
         std::fs::write(&outside, "").unwrap();
+        // A typeless .js is node's to decide by syntax on both sides of the
+        // boundary; with no source to read, both are CommonJS.
         assert_eq!(module_kind(&inside), ModuleKind::Cjs);
-        assert_eq!(module_kind(&outside), ModuleKind::Esm);
+        assert_eq!(module_kind(&outside), ModuleKind::Cjs);
+        assert!(kind_from_syntax(&inside));
+        assert!(kind_from_syntax(&outside));
+        assert_eq!(package_scope(&outside), Some(proj.join("package.json")));
+        // The walk stops at the node_modules directory: lodash has no
+        // package.json of its own here, and proj's does not scope it.
+        assert_eq!(package_scope(&inside), None);
+        // JSX keeps oam's extension policy: ESM outside node_modules (node
+        // runs no JSX to follow), CommonJS inside.
+        let jsx_inside = proj.join("node_modules/lodash/view.jsx");
+        let jsx_outside = proj.join("src/view.jsx");
+        assert_eq!(module_kind(&jsx_inside), ModuleKind::Cjs);
+        assert_eq!(module_kind(&jsx_outside), ModuleKind::Esm);
+        assert!(!kind_from_syntax(&jsx_outside));
+    }
+
+    #[test]
+    fn kind_from_syntax_follows_the_package_type() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-9b-{}", std::process::id()));
+        for (sub, manifest) in [
+            ("module", Some(json!({ "type": "module" }))),
+            ("commonjs", Some(json!({ "type": "commonjs" }))),
+            // node reads a "type" it does not know as none.
+            ("odd", Some(json!({ "type": "cjs" }))),
+            ("typeless", Some(json!({ "name": "t" }))),
+        ] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+            if let Some(manifest) = manifest {
+                std::fs::write(
+                    dir.join(sub).join("package.json"),
+                    serde_json::to_string(&manifest).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        assert!(!kind_from_syntax(&dir.join("module/a.js")));
+        assert!(!kind_from_syntax(&dir.join("commonjs/a.js")));
+        assert!(kind_from_syntax(&dir.join("odd/a.js")));
+        assert!(kind_from_syntax(&dir.join("typeless/a.js")));
+        assert!(kind_from_syntax(&dir.join("typeless/bin")));
+        for fixed in [
+            "a.mjs", "a.cjs", "a.ts", "a.tsx", "a.mts", "a.cts", "a.json", "a.node",
+        ] {
+            assert!(
+                !kind_from_syntax(&dir.join("typeless").join(fixed)),
+                "{fixed}"
+            );
+        }
+        assert_eq!(module_kind(&dir.join("odd/a.js")), ModuleKind::Cjs);
+        assert_eq!(module_kind(&dir.join("module/a.js")), ModuleKind::Esm);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

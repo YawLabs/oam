@@ -18,6 +18,18 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [0.19.1] - 2026-10-13
 
+### Changed
+
+- **A typeless `.js` file is CommonJS unless it has module syntax, as in node.** A `.js` file whose
+  nearest `package.json` has no `"type"`, or that has none above it, ran as an ES module in oam
+  (ESM-first). It is now decided by node v22.22.2's own test: an `import` or `export` statement,
+  `import.meta` or a top-level `await` makes it an ES module, anything else is CommonJS. This holds
+  for the entry, `import`, `import()`, `require()`, `createRequire`, a Worker's entry and files
+  under `node_modules`. Like node, oam emits a `MODULE_TYPELESS_PACKAGE_JSON` warning, once per
+  `package.json`, when the test makes a file an ES module. If you relied on ESM-first: a file that
+  uses `import`/`export` needs nothing. Otherwise add `"type": "module"` to `package.json` or rename
+  the file to `.mjs`, and do the same to drop the warning.
+
 ### Fixed
 
 - **`fs.opendir`, `fs.opendirSync` and `fs.promises.opendir` honour `recursive`, as node's do
