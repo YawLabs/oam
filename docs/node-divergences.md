@@ -352,6 +352,7 @@ still wins. Only these tokens are accepted:
 
 ```
 --pending-deprecation   --no-warnings   --no-deprecation   --expose-gc
+--trace-warnings   --trace-deprecation
 --disable-warning[=]    --redirect-warnings[=]
 --max-http-header-size[=]   --insecure-http-parser   --trace-require-module[=]
 --tls-min-v1.0  --tls-min-v1.1  --tls-min-v1.2  --tls-min-v1.3  --tls-max-v1.2  --tls-max-v1.3
@@ -732,23 +733,23 @@ reads it without setting its own mode.
 _(source)_ Read out of both implementations, not measured side by side. Unix is unaffected:
 there oam applies libuv's `UV_TTY_MODE_RAW` recipe exactly (`raw_mode_bits`, same file).
 
-### 51. A process warning is printed without node's trace hint
+### 51. A process warning's trace hint -- FIXED, no longer a divergence
 
-After the first warning of a process node prints, once, a line saying how to see where it
-came from:
+This entry used to record that oam printed a process warning without node's one-time hint
+line, because oam had neither flag the hint names. oam now has `--trace-warnings` and
+`--trace-deprecation`, on the command line and in `NODE_OPTIONS`; they set
+`process.traceProcessWarnings` / `process.traceDeprecation`, and the default printer
+writes the warning's stack for the warnings they cover. Otherwise the first warning it
+prints carries node's hint, once per thread, naming the flag for that warning's kind
+after the program's name -- `basename(process.argv0)`, as node takes it, which is `oam`:
 
 ```
 (node:1234) [DEP_X] DeprecationWarning: first
-(Use `node --trace-deprecation ...` to show where the warning was created)
+(Use `oam --trace-deprecation ...` to show where the warning was created)
 ```
 
-oam prints the warning and not the hint. The hint names a flag (`--trace-deprecation`, or
-`--trace-warnings` for a warning that is not a deprecation) and oam has neither, so there
-is nothing true for it to say; printing node's line as it stands would send the reader to
-another program. Everything else about the printer is node's: it is the `onWarning`
-listener on `process`, removable like any other, absent under `--no-warnings` and
-`NODE_NO_WARNINGS=1` (conformance case 406, which takes the hint line out of both sides).
-The flags and the hint are #364.
+Conformance case 406 compares the hint with node's apart from that name, and each traced
+stack to its first frame (the frames below are each runtime's own module loader) (#364).
 
 ### 53. Windows child windows: no console popup from a console-less oam, no `SW_HIDE` on std spawns
 
@@ -807,7 +808,7 @@ and not for a file under `node_modules`, a `require()`, or a file with no `packa
 Conformance cases 462-465 pin the shapes byte for byte against Node.
 
 What still differs: `require()` of such a file that has module syntax throws
-`ERR_REQUIRE_ESM` (entry 9), and the warning has no trace hint line (entry 51). A typeless
+`ERR_REQUIRE_ESM` (entry 9). A typeless
 `.ts`/`.tsx` is still an ES module whatever its syntax (entry 24), and a typeless `.jsx`
 outside `node_modules` too: Node runs no JSX to follow.
 

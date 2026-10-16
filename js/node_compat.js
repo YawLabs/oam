@@ -16693,9 +16693,13 @@
     // It prints whatever Error the event carries -- one emitted directly
     // too, not only through emitWarning -- and nothing that is not one.
     //
-    // Not here: node's one-time hint naming `--trace-warnings` /
-    // `--trace-deprecation`. oam has neither flag, so there is nothing true
-    // for the hint to say (docs/node-divergences.md).
+    // Under --trace-warnings (process.traceProcessWarnings), or
+    // --trace-deprecation (process.traceDeprecation) for a deprecation, it
+    // prints the warning's stack in place of its toString(). Otherwise the
+    // first warning it prints carries node's one-time hint naming the flag
+    // for its kind, after the program's name: basename(process.argv0), which
+    // is `oam` for oam. Once per thread, as node's module-level flag is.
+    let traceWarningHelperShown = false;
     function onWarning(warning) {
       if (!(warning instanceof Error)) return;
       const isDeprecation = warning.name === "DeprecationWarning";
@@ -16716,12 +16720,23 @@
       // The (node:PID) prefix is node's own (`process.release.name`), kept
       // so tooling that greps warnings still finds them. A warning whose
       // toString is not a function is printed as an Error prints.
+      const trace = process.traceProcessWarnings || (isDeprecation && process.traceDeprecation);
       let line = `(node:${process.pid}) `;
       if (warning.code) line += `[${warning.code}] `;
-      line += typeof warning.toString === "function"
-        ? `${warning.toString()}`
-        : Error.prototype.toString.call(warning);
+      if (trace && warning.stack) {
+        line += `${warning.stack}`;
+      } else {
+        line += typeof warning.toString === "function"
+          ? `${warning.toString()}`
+          : Error.prototype.toString.call(warning);
+      }
       if (typeof warning.detail === "string") line += `\n${warning.detail}`;
+      if (!trace && !traceWarningHelperShown) {
+        const flag = isDeprecation ? "--trace-deprecation" : "--trace-warnings";
+        const argv0 = registry.get("path").basename(process.argv0 || "node", ".exe");
+        line += `\n(Use \`${argv0} ${flag} ...\` to show where the warning was created)`;
+        traceWarningHelperShown = true;
+      }
       line += "\n";
       // NODE_REDIRECT_WARNINGS: append the formatted warning to the named
       // file instead of stderr. Read from natives.env() (the real OS
