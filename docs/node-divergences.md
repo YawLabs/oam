@@ -4054,6 +4054,22 @@ or `lstat '\\.\C:'`), because its module loader's realpath is that same walk, wh
 the first component after the prefix for a directory to lstat. oam's loader resolves in
 Rust; reproducing a failure of node's own there was not worth it.
 
+### Windows: a stat of the paging file
+
+The system holds `pagefile.sys`, `swapfile.sys`, `hiberfil.sys` and `DumpStack.log.tmp`
+open with no sharing. node v22.22.2 fails `lstatSync`, `statSync`, `fs.promises.stat` and
+`realpathSync` of them `EPERM` (`lstat` for realpath), and `existsSync` is `false`. oam's
+`lstatSync` succeeds (std's stat falls back to a directory listing on the sharing
+violation), so `existsSync` is `true`; its `statSync` and `fs.promises.stat` fail `EBUSY`,
+and so do `realpathSync` and `fs.realpath` (`EBUSY, realpath`, the OS's error: node's
+component walk, which oam runs for node's error, completes on oam's lstat). `accessSync`
+is `EBUSY` in both. Measured on Windows 11 build 26200 arm64. libuv opens such a file,
+meets the sharing violation and looks the name up in its directory instead
+(fs__stat_directory); where node's `EPERM` comes from on that path was not pinned down,
+so oam does not imitate it. An ordinary file another process holds with no sharing stats
+alike in both. The e2e test `realpath_of_the_paging_file_fails_as_the_os_does` holds oam's
+realpath to failing.
+
 ### Windows `fs.symlink(target, path, 'junction')` makes a directory symlink
 
 node makes an NTFS junction. oam stores the same target node does (resolved against the

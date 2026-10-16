@@ -22,8 +22,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   in node.** `statSync`, `lstatSync`, `fs.stat` and `fs.promises.stat` of `\\.\NUL` (and
   `\\?\NUL`, `\\.\Global\NUL`, `\\.\GLOBALROOT\Device\Null`) failed `EISDIR`; they now give
   the shape `fstat` of an open NUL gives (`mode` 0o20666, `rdev` 1376256, `blksize` 4096). The
-  pipe and mailslot namespaces, `KsecDD` and a volume (`\\.\C:`) fail `EINVAL` where oam said
-  `EISDIR`, and `readdirSync` of `KsecDD` is `EISDIR` (was `ENOTDIR`). oam asks what libuv asks:
+  pipe and mailslot namespaces and `KsecDD` fail `EINVAL` where oam said `EISDIR` (a volume,
+  `\\.\C:`, stays `EISDIR`, as in node), and `readdirSync` of `KsecDD` is `EISDIR` (was
+  `ENOTDIR`). oam asks what libuv asks:
   the path by name (GetFileInformationByName, Windows 11 24H2 and later), then the handle's device
   type and its file information (#380, #383).
 - **Windows: a stat of a path that goes on past a looping symlink is `ENOENT`, as in node.**
@@ -31,8 +32,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   three forms) failed `ELOOP`; they are `ENOENT`, and `statSync("l")` stays `ELOOP` (#362).
 - **Windows: `fs.access` and `fs.chmod` read and set a path's own attributes, as libuv does.**
   A dangling or looping symlink is accessible (`existsSync` still says `false`) and `chmod`
-  changes the link rather than failing `ENOENT`; a read-only directory passes `W_OK`; a device is
-  `EINVAL` (was `EISDIR`) and a share root that is no disk (`\\localhost\IPC$`) `ENOTSUP` (was
+  changes the link rather than failing `ENOENT`; a read-only directory passes `W_OK`; a device or
+  a volume (`\\.\C:`) is `EINVAL` (was `EISDIR`) and a share root that is no disk (`\\localhost\IPC$`) `ENOTSUP` (was
   `EINVAL`). `cpSync` from any of these reports the same code, under `lstat`, and names the path
   without its `\\?\` prefix, as node's does (#383).
 - **Windows: `fs.realpathSync` and `fs.realpath` of a `\\?\` or `\\.\` path follow node's walk.**
