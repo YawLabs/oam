@@ -8,9 +8,10 @@
 //   * the parent's 'error' event carries the worker's error, not a rendered
 //     report: an Error comes back as an object of the nearest built-in error
 //     class in its prototype chain, with its own message, name, stack and
-//     other own properties (node's error serializer), any other thrown
-//     value as itself, and an unhandled rejection of a non-Error as node's
-//     ERR_UNHANDLED_REJECTION error;
+//     other own properties (node's error serializer; a `cause` rebuilt the
+//     same way), a Symbol as Symbol.for its description, a function as its
+//     inspection string, any other thrown value as itself, and an unhandled
+//     rejection of a non-Error as node's ERR_UNHANDLED_REJECTION error;
 //   * nothing is printed by the runtime itself (the parent handles 'error').
 //
 // (The listener writes to a file, not through parentPort: node delivers the
@@ -49,9 +50,14 @@ if (kind === "throw-42") throw 42;
 if (kind === "throw-object") throw { a: 1, b: [2] };
 if (kind === "custom") { const e = new MyError("mine"); e.code = "E_MINE"; throw e; }
 if (kind === "exitcode") throw new Error("boom exitcode");
+if (kind === "throw-symbol") throw Symbol("s");
+if (kind === "throw-undefined") throw undefined;
+if (kind === "throw-function") throw function named() {};
+if (kind === "cause") throw new Error("outer", { cause: new TypeError("inner") });
 `;
 
 function describe(e) {
+  if (typeof e === "symbol") return `symbol ${String(e)} registered ${Symbol.keyFor(e)}`;
   if (e === null || typeof e !== "object") return `${typeof e} ${String(e)}`;
   const proto = Object.getPrototypeOf(e);
   const parts = [
@@ -66,6 +72,10 @@ function describe(e) {
     const first = e.stack.split("\n")[0];
     const where = e.stack.includes("w.cjs") || e.stack.includes("491-");
     parts.push(`stack ${JSON.stringify(first)} ${where}`);
+  }
+  if ("cause" in e) {
+    const cause = e.cause;
+    parts.push(`cause ${Object.getPrototypeOf(cause).constructor.name} ${cause.message}`);
   }
   if (e instanceof Error) {
     const tag = Object.getOwnPropertyDescriptor(e, Symbol.toStringTag);
@@ -89,7 +99,7 @@ if (!isMainThread) {
   fs.writeFileSync(file, fixture);
   const kinds = [
     "sync", "timer", "reject", "reject-string", "throw-42", "throw-object",
-    "custom", "exitcode", "esm",
+    "custom", "exitcode", "throw-symbol", "throw-undefined", "throw-function", "cause", "esm",
   ];
   for (const kind of kinds) {
     await new Promise((resolve) => {
