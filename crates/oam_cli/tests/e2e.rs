@@ -28956,11 +28956,14 @@ fn oam_test_runs_each_commonjs_file_as_the_main_module() {
 // A worker's entry is routed on the file's real path too. Windows file names
 // are case-insensitive, so `W.CJS` names an on-disk `w.cjs` -- CommonJS to
 // node, which runs it as the worker's main module. Judged by the extension as
-// typed, the same entry falls to the typeless default and runs without a main
-// module. Windows only: elsewhere `W.CJS` does not name the file at all.
+// typed, the same entry falls to the package's "type": "module" and runs as an
+// ES module, without require. (A typeless package would not tell the two
+// apart: there the file's CommonJS syntax makes it CommonJS either way.)
+// Windows only: elsewhere `W.CJS` does not name the file at all.
 #[cfg(windows)]
 #[test]
 fn worker_entry_is_routed_on_its_real_path() {
+    write_temp("worker_real_path/package.json", "{\"type\": \"module\"}\n");
     write_temp(
         "worker_real_path/w.cjs",
         "require('worker_threads').parentPort.postMessage(\n\
