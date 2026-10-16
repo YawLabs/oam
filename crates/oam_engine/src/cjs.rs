@@ -1,9 +1,9 @@
 //! CommonJS interop: the bridge that makes the installed npm ecosystem run.
 //!
 //! Execution model: CJS modules are compiled with V8's CompileFunction
-//! (real line numbers, no textual wrapper) against the Node parameter list
-//! plus `global` — (exports, require, module, __filename, __dirname,
-//! global) — and executed EAGERLY: `require()` is synchronous by
+//! (real line numbers, no textual wrapper) against node's own parameter list
+//! (exports, require, module, __filename, __dirname) and executed EAGERLY:
+//! `require()` is synchronous by
 //! definition, and when the ESM graph loader hits a CJS file it executes
 //! it at load time, then reflects the ACTUAL runtime keys of
 //! `module.exports` as named exports through a generated ESM facade. ES2022
@@ -110,16 +110,21 @@ fn throw_syntax_error_with_code(scope: &mut v8::PinScope<'_, '_>, code: &str, me
     scope.throw_exception(exception);
 }
 
-/// CJS wrapper parameters, in order. Shared between the require() loader and
-/// the `oam compile` bytecode producer so their compiled functions -- and thus
-/// their V8 code-cache blobs -- are interchangeable.
-pub(crate) const CJS_PARAMS: [&str; 6] = [
+/// CJS wrapper parameters, in order: node's `Module.wrapper` list exactly
+/// (`(exports, require, module, __filename, __dirname)`). Shared between the
+/// require() loader and the `oam compile` bytecode producer so their compiled
+/// functions -- and thus their V8 code-cache blobs -- are interchangeable.
+///
+/// `global` is deliberately NOT a parameter. An extra wrapper name would turn a
+/// top-level `const global = ...` (or `let`/`class global`) in a typeless `.js`
+/// into `Identifier 'global' has already been declared`, where node runs it.
+/// `global` is reachable as `globalThis.global` (set in js/node_compat.js).
+pub(crate) const CJS_PARAMS: [&str; 5] = [
     "exports",
     "require",
     "module",
     "__filename",
     "__dirname",
-    "global",
 ];
 
 /// Replace a leading `#!` shebang with a `//` comment, byte-for-byte so every
@@ -218,9 +223,9 @@ pub(crate) fn contains_module_syntax(
     // `if (await x)` read as a call or a token out of place to a function.
     const MAYBE_TOP_LEVEL_AWAIT_ERRORS: [&str; 2] =
         ["missing ) after argument list", "SyntaxError: Unexpected"];
-    // node's GetCJSParameters: the wrapper's five names. oam's own wrapper
-    // adds `global`, which would make a top-level `const global` fail here
-    // where node's does not.
+    // node's GetCJSParameters: the wrapper's five names, which `CJS_PARAMS`
+    // now matches exactly (a `global` parameter would make a top-level
+    // `const global` fail here where node's does not).
     const NODE_CJS_PARAMS: [&str; 5] = ["exports", "require", "module", "__filename", "__dirname"];
     let source = strip_shebang(source.to_string());
     v8::tc_scope!(let tc, scope);
@@ -363,8 +368,8 @@ pub(crate) fn module_kind_of(
         return oam_loader::module_kind(&key);
     };
     // A CommonJS bytecode blob for this exact source means it compiled as a
-    // CommonJS wrapper before -- with oam's parameters, a superset of node's
-    // -- so node's detection would find no module syntax: no test compile.
+    // CommonJS wrapper before -- with node's parameters -- so node's detection
+    // would find no module syntax: no test compile.
     if crate::code_cache::enabled() {
         let stripped = strip_shebang(source.clone());
         let blob_key = crate::code_cache::key_for(&stripped, crate::code_cache::Kind::Function);
@@ -965,17 +970,14 @@ fn load_cjs_inner<'s>(
     let paths = v8::Array::new_with_elements(scope, &lookup);
     let paths_key = v8::String::new(scope, "paths")?;
     module.set(scope, paths_key.into(), paths.into());
-    let context = scope.get_current_context();
-    let global_obj = context.global(scope);
 
     let recv: v8::Local<v8::Value> = exports.into();
-    let call_args: [v8::Local<v8::Value>; 6] = [
+    let call_args: [v8::Local<v8::Value>; 5] = [
         exports.into(),
         require.into(),
         module.into(),
         filename_v8.into(),
         dirname_v8.into(),
-        global_obj.into(),
     ];
     if wrapper.call(scope, recv, &call_args).is_none() {
         // The body threw: exception stays pending, cache entry goes (Node

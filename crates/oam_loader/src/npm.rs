@@ -875,15 +875,20 @@ enum PackageType {
 pub fn package_scope(path: &Path) -> Option<PathBuf> {
     let mut dir = path.parent();
     while let Some(current) = dir {
-        let manifest_path = current.join("package.json");
-        if manifest_path.is_file() {
-            return Some(manifest_path);
-        }
+        // node's TraverseParent stops AT a `node_modules` directory, before it
+        // would join `package.json` (src/node_modules.cc), and GetPackageScopeConfig
+        // refuses a package.json whose path ends `/node_modules/package.json`. So
+        // a `package.json` sitting directly in a `node_modules` directory is never
+        // read -- only a real package's own `node_modules/pkg/package.json` is.
         if current
             .file_name()
             .is_some_and(|name| name == "node_modules")
         {
             break;
+        }
+        let manifest_path = current.join("package.json");
+        if manifest_path.is_file() {
+            return Some(manifest_path);
         }
         dir = current.parent();
     }

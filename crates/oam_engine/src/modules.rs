@@ -3036,7 +3036,9 @@ pub(crate) fn dynamic_import_callback<'s>(
     Some(promise)
 }
 
-/// Windows-safe file:// URL with minimal percent-encoding (space, #, ?, %).
+/// Windows-safe file:// URL, percent-encoding what node's `ada` does: a space,
+/// `#`, `?`, `%`, and every non-ASCII code point as its UTF-8 bytes (node names
+/// the warning's file as `file:///.../caf%C3%A9.js`).
 pub(crate) fn path_to_file_url(path: &Path) -> String {
     let slashed = path.to_string_lossy().replace('\\', "/");
     let mut out = String::from("file://");
@@ -3049,6 +3051,12 @@ pub(crate) fn path_to_file_url(path: &Path) -> String {
             '#' => out.push_str("%23"),
             '?' => out.push_str("%3F"),
             '%' => out.push_str("%25"),
+            c if !c.is_ascii() => {
+                let mut buf = [0u8; 4];
+                for byte in c.encode_utf8(&mut buf).bytes() {
+                    out.push_str(&format!("%{byte:02X}"));
+                }
+            }
             _ => out.push(ch),
         }
     }
