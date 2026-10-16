@@ -428,16 +428,8 @@
           "threadName"
         ],
         "zlib": [
-          "ZstdCompress",
-          "ZstdDecompress",
           "codes",
-          "crc32",
-          "createZstdCompress",
-          "createZstdDecompress",
-          "zstdCompress",
-          "zstdCompressSync",
-          "zstdDecompress",
-          "zstdDecompressSync"
+          "crc32"
         ]
       }
     },
@@ -872,16 +864,8 @@
           "threadName"
         ],
         "zlib": [
-          "ZstdCompress",
-          "ZstdDecompress",
           "codes",
-          "crc32",
-          "createZstdCompress",
-          "createZstdDecompress",
-          "zstdCompress",
-          "zstdCompressSync",
-          "zstdDecompress",
-          "zstdDecompressSync"
+          "crc32"
         ]
       }
     },
@@ -1305,16 +1289,8 @@
           "threadName"
         ],
         "zlib": [
-          "ZstdCompress",
-          "ZstdDecompress",
           "codes",
-          "crc32",
-          "createZstdCompress",
-          "createZstdDecompress",
-          "zstdCompress",
-          "zstdCompressSync",
-          "zstdDecompress",
-          "zstdDecompressSync"
+          "crc32"
         ]
       }
     }

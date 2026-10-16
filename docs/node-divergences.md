@@ -88,7 +88,7 @@ something false.
 // oam — compat claims, identity, then the REAL dependency tree
 { node: '22.16.0', oam: <oam version>, v8: '15.0.245.2-rusty',
   ada, brotli, flate2, h2, hickory, hyper, icu, oxc, reqwest, ring, rustls,
-  tokio, unicode, url }
+  tokio, unicode, url, zstd }
 
 // Node v22.22.2 — 27 keys
 { node, acorn, ada, amaro, ares, brotli, cjs_module_lexer, cldr, icu, llhttp, modules,
@@ -125,6 +125,12 @@ vendored C++ ada read from the pinned `ada-url` crate's own `deps/ada.h` at
 build time, NOT the Rust binding crate's version, which moves independently and
 would put a number under a Node-owned name that means something else. oam's ada
 is simply newer than the one Node 22 bundles (3.4.4 vs 2.9.2).
+
+`zstd` IS published for the same reason: `node:zlib`'s zstd engine is libzstd itself,
+the C library Node links (`crates/oam_core/src/zstd.rs`, through the `zstd-safe`
+binding). The version is the vendored libzstd's, read from the pinned `zstd-sys`
+crate's own `zstd/lib/zstd.h` at build time, not either binding crate's version. It is
+the same libzstd as Node v22.22.2's: `1.5.7`.
 
 `icu` and `unicode` ARE published, because V8's bundled ICU is real: the values are
 read at build time from the version headers of the exact `v8` crate pinned in
@@ -1266,7 +1272,9 @@ entries below were executed on both runtimes unless marked.
 | `zlib` one-shot forms (`deflateSync`, `gunzip`, `brotliCompress`, ...): stream options | Checked as Node's engine checks them (`highWaterMark` and its readable / writable forms, then a truthy `signal`), and a callback form honours its `signal`: an abort before the output calls back `AbortError` with the reason as `cause`. Nothing else in the options reaches a stream, because the work is not done by one: a `transform`, `flush` or `final` function in the options is not called. The `info` engine is built without the `signal`. | The call runs on a stream built from the options, so such functions replace the stream's own (`zlib.deflate('x', { transform(c, e, cb) { cb(null, Buffer.from('zz')) } }, cb)` calls back 4 bytes, not the 9 of the deflated `'x'`). |
 | `zlib` stream `params()` with writes before its callback | The `Z_SYNC_FLUSH` and the new level take their place in the write order: every write made after the `params()` call compresses at the new level. Writes made from the callback (or later) behave as in Node. | The level changes when the callback runs, so a write queued behind the flush goes at the old level, and one in progress then fails the stream: `deflate.params(6, 0, cb); deflate.end(data)` is `Z_STREAM_ERROR` (errno `-2`) `stream error`, and the same on a `Gzip` is `Z_OK` `unexpected end of file`. |
 | `zlib` Brotli stream `params()` | Validated as in Node, then a no-op: the stream carries on. | Node's `BrotliCompress` inherits `params()` from the zlib streams; after it, the stream fails with `ERR_BROTLI_COMPRESSION_FAILED` `Compression failed`. |
-| `zlib` stream `flush()`, `reset()`, `close()` | Absent on oam's zlib and brotli streams (`params()` flushes internally). `destroy()` and `end()` work. | Present. |
+| `zlib` stream `flush()`, `reset()`, `close()` | Absent on oam's zlib and brotli streams (`params()` flushes internally). `destroy()` and `end()` work. The zstd streams have all three, as in Node. | Present. |
+| `zlib` zstd: `params[ZSTD_c_enableLongDistanceMatching]` of `2` | Accepted, as in Node, but applied as `0` ("auto") rather than "disable": the binding oam drives libzstd through takes the parameter as a boolean. The two differ only where libzstd's auto mode turns long-distance matching on (strategy `ZSTD_btopt` or above with a window of 2^27 or more), and there the compressed bytes differ while the data still round-trips. Every other zstd parameter value reaches libzstd 1.5.7 as Node passes it, so the compressed bytes are Node's. | Disables long-distance matching. |
+| `zlib` zstd: a chunk changed while it is being compressed | The handle copies each chunk once, when it starts on it, and reads that copy until the chunk is consumed, so a write to the caller's buffer between two of the stream's libzstd calls (possible only with the asynchronous forms, which run each call on the thread pool) is not seen. Reading the caller's buffer afresh on every call would mean copying the unconsumed rest of the chunk once per 16 KiB output window, which is quadratic in the chunk's size. | Reads the caller's buffer in place on every call, so a later call sees the change. |
 | `TextDecoder` | **utf-8 and windows-1252 only** (`fatal` and `ignoreBOM` honored on utf-8; windows-1252 is total, so neither applies). Both take the full standard label set for their encoding, so `latin1` / `iso-8859-1` / `ascii` resolve to windows-1252 as the standard requires. Any other label throws a `RangeError` with `code: 'ERR_ENCODING_NOT_SUPPORTED'`. | Also utf-16le/be, the ISO-8859-* family, the CJK legacy encodings, ... |
 | Web streams: start / pull / write / ready ordering | **Matches node** (no longer a divergence). The controllers follow the standard's algorithms in node's shape: a `ReadableStream` makes its initial pull once `start()` settles and fills to its high-water mark; a `WritableStream` honors its strategy (`desiredSize`, `ready`, backpressure) and writes one chunk at a time after `start()`; a `TransformStream`'s readable side defaults to a high-water mark of 0, so `transform()` waits for a read. `size()` is consulted and validated as node validates it. `pipeTo()` / `pipeThrough()` follow node's `readableStreamPipeTo`: each step waits for the destination's `ready` and starts its write without awaiting it, so the destination fills to its high-water mark; errors and closes on either side, and `options.signal`, shut the pipe down with node's actions. Pinned microtask for microtask by `conformance/cases/298-web-streams-initial-pull.mjs`, `299-web-streams-writable-transform-backpressure.mjs` and `343-web-streams-pipe-to.mjs`. | Same. |
 | `worker_threads.receiveMessageOnPort` | Always returns `undefined`. | Returns `{ message }`. |

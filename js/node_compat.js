@@ -1242,6 +1242,11 @@
   codes.ERR_BROTLI_INVALID_PARAM = E("ERR_BROTLI_INVALID_PARAM", RangeError, function(param) {
     return param + " is not a valid Brotli parameter";
   });
+  // node:zlib's Zstd constructor: a `params` key that is not a number in
+  // 0..kMaxZstdCParam (or kMaxZstdDParam), or names one already set.
+  codes.ERR_ZSTD_INVALID_PARAM = E("ERR_ZSTD_INVALID_PARAM", RangeError, function(param) {
+    return param + " is not a valid zstd parameter";
+  });
   codes.ERR_ZLIB_INITIALIZATION_FAILED = E("ERR_ZLIB_INITIALIZATION_FAILED", Error, "Initialization failed");
   // node: E('ERR_INVALID_FD', '"fd" must be a positive integer: %s',
   // RangeError) -- a format string, so the value goes through util.format's
@@ -1251,6 +1256,21 @@
   });
   codes.ERR_INVALID_CURSOR_POS = E("ERR_INVALID_CURSOR_POS", TypeError,
     "Cannot set cursor row without setting its column");
+  // node's internal `assert(value, message)` failing (internal/assert.js):
+  // the message, then node's "this is a bug" suffix (internal/errors.js).
+  codes.ERR_INTERNAL_ASSERTION = E("ERR_INTERNAL_ASSERTION", Error, function(message) {
+    const suffix = "This is caused by either a bug in Node.js " +
+      "or incorrect usage of Node.js internals.\n" +
+      "Please open an issue with this stack trace at " +
+      "https://github.com/nodejs/node/issues\n";
+    return message === undefined ? suffix : message + "\n" + suffix;
+  });
+  // node:zlib's `rejectGarbageAfterEnd` option: input left over once the
+  // compressed stream ended. A TypeError in node (measured on v22.22.2).
+  codes.ERR_TRAILING_JUNK_AFTER_STREAM_END = E(
+    "ERR_TRAILING_JUNK_AFTER_STREAM_END", TypeError,
+    "Trailing junk found after the end of the compressed stream",
+  );
   codes.ERR_BUFFER_OUT_OF_BOUNDS = E("ERR_BUFFER_OUT_OF_BOUNDS", RangeError, function(name) {
     return name ? '"' + name + '" is outside of buffer bounds' : 'Attempt to access memory outside buffer bounds';
   });
@@ -22141,7 +22161,627 @@
       BrotliCompress, BrotliDecompress,
     });
 
-    return {
+    // ---- zstd: node v22.22.2's lib/zlib.js, ported --------------------------
+    // Unlike the classes above, zstd is node's own JavaScript run over a
+    // binding of node's shape (oam_core/src/zstd.rs): ZlibBase, the Zstd
+    // classes, processChunkSync / processChunk / processCallback and the
+    // convenience wrappers, with a handle whose write() is ONE libzstd call
+    // into the output window it is given. node's observable zstd behaviour
+    // is mostly that loop's -- a one-shot decompress stops after the first
+    // frame (the library returns at a frame's end and the loop only calls
+    // again when the window filled), a stream whose end() was queued behind
+    // a write finishes with an extra empty frame, a frame split across writes
+    // decodes, one followed by more input in the same write ends the stream
+    // -- so the loop is node's, line for line, rather than re-derived.
+    const ZSTD_COMPRESS = 10;
+    const ZSTD_DECOMPRESS = 11;
+    const ZSTD_e_continue = 0;
+    const ZSTD_e_flush = 1;
+    const ZSTD_e_end = 2;
+    // node's zlib.constants, zstd part, in node's order. The ZSTD_c_* and
+    // ZSTD_d_* keys also size the params arrays below (kMaxZstdCParam,
+    // kMaxZstdDParam), as node's are sized from its constants.
+    const ZSTD_CONSTANTS = {
+      ZSTD_DECOMPRESS, ZSTD_COMPRESS,
+      ZSTD_e_continue, ZSTD_e_flush, ZSTD_e_end,
+      ZSTD_fast: 1, ZSTD_dfast: 2, ZSTD_greedy: 3, ZSTD_lazy: 4, ZSTD_lazy2: 5,
+      ZSTD_btlazy2: 6, ZSTD_btopt: 7, ZSTD_btultra: 8, ZSTD_btultra2: 9,
+      ZSTD_c_compressionLevel: 100, ZSTD_c_windowLog: 101, ZSTD_c_hashLog: 102,
+      ZSTD_c_chainLog: 103, ZSTD_c_searchLog: 104, ZSTD_c_minMatch: 105,
+      ZSTD_c_targetLength: 106, ZSTD_c_strategy: 107,
+      ZSTD_c_enableLongDistanceMatching: 160, ZSTD_c_ldmHashLog: 161,
+      ZSTD_c_ldmMinMatch: 162, ZSTD_c_ldmBucketSizeLog: 163, ZSTD_c_ldmHashRateLog: 164,
+      ZSTD_c_contentSizeFlag: 200, ZSTD_c_checksumFlag: 201, ZSTD_c_dictIDFlag: 202,
+      ZSTD_c_nbWorkers: 400, ZSTD_c_jobSize: 401, ZSTD_c_overlapLog: 402,
+      ZSTD_d_windowLogMax: 100,
+      ZSTD_CLEVEL_DEFAULT: 3,
+      ZSTD_error_no_error: 0, ZSTD_error_GENERIC: 1, ZSTD_error_prefix_unknown: 10,
+      ZSTD_error_version_unsupported: 12, ZSTD_error_frameParameter_unsupported: 14,
+      ZSTD_error_frameParameter_windowTooLarge: 16, ZSTD_error_corruption_detected: 20,
+      ZSTD_error_checksum_wrong: 22, ZSTD_error_literals_headerWrong: 24,
+      ZSTD_error_dictionary_corrupted: 30, ZSTD_error_dictionary_wrong: 32,
+      ZSTD_error_dictionaryCreation_failed: 34, ZSTD_error_parameter_unsupported: 40,
+      ZSTD_error_parameter_combination_unsupported: 41, ZSTD_error_parameter_outOfBound: 42,
+      ZSTD_error_tableLog_tooLarge: 44, ZSTD_error_maxSymbolValue_tooLarge: 46,
+      ZSTD_error_maxSymbolValue_tooSmall: 48, ZSTD_error_stabilityCondition_notRespected: 50,
+      ZSTD_error_stage_wrong: 60, ZSTD_error_init_missing: 62,
+      ZSTD_error_memory_allocation: 64, ZSTD_error_workSpace_tooSmall: 66,
+      ZSTD_error_dstSize_tooSmall: 70, ZSTD_error_srcSize_wrong: 72,
+      ZSTD_error_dstBuffer_null: 74, ZSTD_error_noForwardProgress_destFull: 80,
+      ZSTD_error_noForwardProgress_inputEmpty: 82,
+    };
+
+    // internal/async_hooks owner_symbol: handle -> its stream.
+    const kOwner = Symbol("owner_symbol");
+    const kFlushFlag = Symbol("kFlushFlag");
+    const kError = Symbol("kError");
+    const isUint8ArrayValue = (value) => value instanceof Uint8Array;
+
+    // A native libzstd context is not memory V8 sees, so a zstd stream that
+    // is dropped without close() (or whose constructor throws after init,
+    // or a one-shot call whose argument fails validation) would keep it for
+    // the life of the process; node's GC frees its handle. The registry frees
+    // it when the handle object is collected; close() unregisters.
+    const zstdContexts = typeof FinalizationRegistry === "function"
+      ? new FinalizationRegistry((id) => natives.zlibStreamClose(id))
+      : null;
+
+    // node's binding classes ZstdCompress / ZstdDecompress (what a stream's
+    // `_handle` is), over the natives. write() and writeSync() take node's
+    // arguments and report through the write-state array as node's do; a
+    // codec failure goes to `onerror(message, errno, code)`.
+    const zstdHandleClass = (name, compress) => {
+      const Handle = class {
+        constructor() {
+          this._id = null;
+          this._writing = false;
+          this._pendingClose = false;
+          // The chunk the native handle holds a copy of, and the inOff and
+          // inLen a call that reads on through it would pass (see _input).
+          this._inChunk = null;
+          this._inNext = 0;
+          this._inLeft = 0;
+        }
+        init(params, pledgedSrcSize, writeState, processCallback, dictionary) {
+          this._writeState = writeState;
+          this._processCallback = processCallback;
+          this._id = natives.zstdHandleCreate(compress, params, pledgedSrcSize, dictionary);
+          zstdContexts?.register(this, this._id, this);
+        }
+        // The window [outOff, outOff + outLen) of `out` receives the output;
+        // writeState gets [availOutAfter, availInAfter]. The natives answer
+        // the output followed by the input consumed (8 bytes, little-endian).
+        _apply(result, inOff, inLen, out, outOff, outLen) {
+          const produced = result.length - 8;
+          if (produced > 0) out.set(result.subarray(0, produced), outOff);
+          const view = new DataView(result.buffer, result.byteOffset + produced, 8);
+          const consumed = Number(view.getBigUint64(0, true));
+          this._writeState[0] = outLen - produced;
+          this._writeState[1] = inLen - consumed;
+          this._inNext = inOff + consumed;
+          this._inLeft = inLen - consumed;
+        }
+        // node's loop (processChunkSync, processCallback) calls once per
+        // output window and passes the same chunk back at inOff + consumed
+        // each time. The native handle keeps its own copy of the chunk from
+        // the first call, so such a call passes undefined and the native
+        // reads on; anything else (a new chunk, or the same one written
+        // again from its start) is a new input, copied once. Passing the
+        // rest of the chunk on every call copied it once per 16 KiB window:
+        // quadratic in the chunk's size.
+        _input(chunk, inOff, inLen) {
+          if (chunk === this._inChunk && inOff === this._inNext && inLen === this._inLeft) {
+            return undefined;
+          }
+          this._inChunk = chunk;
+          return new Uint8Array(chunk.buffer, chunk.byteOffset + inOff, inLen);
+        }
+        writeSync(flush, chunk, inOff, inLen, out, outOff, outLen) {
+          let result;
+          try {
+            result = natives.zstdHandleWriteSync(
+              this._id, flush, this._input(chunk, inOff, inLen), outLen,
+            );
+          } catch (err) {
+            this._inChunk = null;
+            this.onerror(err.message, err.errno, err.code);
+            return;
+          }
+          this._apply(result, inOff, inLen, out, outOff, outLen);
+        }
+        // node runs the call on the threadpool and calls the write callback
+        // back on the loop; a close() that lands meanwhile waits for it.
+        write(flush, chunk, inOff, inLen, out, outOff, outLen) {
+          this._writing = true;
+          natives.zstdHandleWrite(
+            this._id, flush, this._input(chunk, inOff, inLen), outLen,
+          ).then((result) => {
+            this._writing = false;
+            this._apply(result, inOff, inLen, out, outOff, outLen);
+            this._processCallback();
+            if (this._pendingClose) this.close();
+          }, (err) => {
+            this._writing = false;
+            this._inChunk = null;
+            if (this._pendingClose) this.close();
+            this.onerror(err.message, err.errno, err.code);
+          });
+        }
+        // node's reset(): a fresh context with only the pledged size; a
+        // refusal is reported as node's binding reports it.
+        reset() {
+          // The native reset drops the chunk it held.
+          this._inChunk = null;
+          const failure = natives.zstdHandleReset(this._id);
+          if (failure !== undefined) {
+            this.onerror(failure, -1, "ERR_ZLIB_INITIALIZATION_FAILED");
+          }
+        }
+        close() {
+          if (this._writing) {
+            this._pendingClose = true;
+            return;
+          }
+          this._pendingClose = false;
+          this._inChunk = null;
+          if (this._id !== null) {
+            zstdContexts?.unregister(this);
+            natives.zlibStreamClose(this._id);
+            this._id = null;
+          }
+        }
+      };
+      Object.defineProperty(Handle, "name", { value: name });
+      return Handle;
+    };
+    const binding = {
+      ZstdCompress: zstdHandleClass("ZstdCompress", true),
+      ZstdDecompress: zstdHandleClass("ZstdDecompress", false),
+    };
+
+    function zlibBuffer(engine, buffer, callback) {
+      validateCallback(callback);
+      if (ArrayBuffer.isView(buffer) && !isUint8ArrayValue(buffer)) {
+        buffer = BufferCtor.from(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+      } else if (isAnyArrayBuffer(buffer)) {
+        buffer = BufferCtor.from(buffer);
+      }
+      engine.buffers = null;
+      engine.nread = 0;
+      engine.cb = callback;
+      engine.on("data", zlibBufferOnData);
+      engine.on("error", zlibBufferOnError);
+      engine.on("end", zlibBufferOnEnd);
+      engine.end(buffer);
+    }
+    function zlibBufferOnData(chunk) {
+      if (!this.buffers) {
+        this.buffers = [chunk];
+      } else {
+        this.buffers.push(chunk);
+      }
+      this.nread += chunk.length;
+      if (this.nread > this._maxOutputLength) {
+        this.close();
+        this.removeAllListeners("end");
+        this.cb(bufferTooLarge(this._maxOutputLength));
+      }
+    }
+    function zlibBufferOnError(err) {
+      this.removeAllListeners("end");
+      this.cb(err);
+    }
+    function zlibBufferOnEnd() {
+      let buf;
+      if (this.nread === 0) {
+        buf = BufferCtor.alloc(0);
+      } else {
+        const bufs = this.buffers;
+        buf = (bufs.length === 1 ? bufs[0] : BufferCtor.concat(bufs, this.nread));
+      }
+      this.close();
+      if (this._info) {
+        this.cb(null, { buffer: buf, engine: this });
+      } else {
+        this.cb(null, buf);
+      }
+    }
+    function zlibBufferSync(engine, buffer) {
+      if (typeof buffer === "string") {
+        buffer = BufferCtor.from(buffer);
+      } else if (!ArrayBuffer.isView(buffer)) {
+        if (isAnyArrayBuffer(buffer)) {
+          buffer = BufferCtor.from(buffer);
+        } else {
+          throw codes.ERR_INVALID_ARG_TYPE(
+            "buffer", ["string", "Buffer", "TypedArray", "DataView", "ArrayBuffer"], buffer,
+          );
+        }
+      }
+      buffer = processChunkSync(engine, buffer, engine._finishFlushFlag);
+      if (engine._info) return { buffer, engine };
+      return buffer;
+    }
+    // node's genericNodeError(message, { errno, code }), then the same two
+    // own properties set again (lib/zlib.js zlibOnError).
+    function zlibOnError(message, errno, code) {
+      const self = this[kOwner];
+      const error = new Error(message);
+      Object.assign(error, { errno, code });
+      error.errno = errno;
+      error.code = code;
+      self.destroy(error);
+      self[kError] = error;
+    }
+
+    // node's ZlibBase: a constructor function, called through Reflect.apply
+    // by the engine classes, whose own Transform call runs on `this`.
+    const { Transform: ZlibTransform, finished: zlibFinished } = registry.get("stream");
+    function ZlibBase(opts, mode, handle, { flush, finishFlush, fullFlush }) {
+      let chunkSize = Z_DEFAULT_CHUNK;
+      let maxOutputLength = K_MAX_LENGTH;
+      // zstd is the one user: its flush bound is [ZSTD_e_continue, ZSTD_e_end].
+      if (opts) {
+        chunkSize = opts.chunkSize;
+        if (!checkFiniteNumber(chunkSize, "options.chunkSize")) {
+          chunkSize = Z_DEFAULT_CHUNK;
+        } else if (chunkSize < Z_MIN_CHUNK) {
+          throw codes.ERR_OUT_OF_RANGE("options.chunkSize", ">= " + Z_MIN_CHUNK, chunkSize);
+        }
+        flush = checkRangesOrGetDefault(
+          opts.flush, "options.flush", ZSTD_e_continue, ZSTD_e_end, flush,
+        );
+        finishFlush = checkRangesOrGetDefault(
+          opts.finishFlush, "options.finishFlush", ZSTD_e_continue, ZSTD_e_end, finishFlush,
+        );
+        maxOutputLength = checkRangesOrGetDefault(
+          opts.maxOutputLength, "options.maxOutputLength", 1, K_MAX_LENGTH, K_MAX_LENGTH,
+        );
+        if (opts.encoding || opts.objectMode || opts.writableObjectMode) {
+          opts = { ...opts };
+          opts.encoding = null;
+          opts.objectMode = false;
+          opts.writableObjectMode = false;
+        }
+      }
+      Reflect.apply(ZlibTransform, this, [{ autoDestroy: true, ...opts }]);
+      this[kError] = null;
+      this.bytesWritten = 0;
+      this._handle = handle;
+      handle[kOwner] = this;
+      handle.onerror = zlibOnError;
+      this._outBuffer = BufferCtor.allocUnsafe(chunkSize);
+      this._outOffset = 0;
+      this._chunkSize = chunkSize;
+      this._defaultFlushFlag = flush;
+      this._finishFlushFlag = finishFlush;
+      this._defaultFullFlushFlag = fullFlush;
+      this._info = opts?.info;
+      this._maxOutputLength = maxOutputLength;
+      this._rejectGarbageAfterEnd = opts?.rejectGarbageAfterEnd === true;
+    }
+    Object.setPrototypeOf(ZlibBase.prototype, ZlibTransform.prototype);
+    Object.setPrototypeOf(ZlibBase, ZlibTransform);
+    Object.defineProperty(ZlibBase.prototype, "_closed", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return !this._handle;
+      },
+    });
+    let bytesReadAccessors;
+    const bytesReadAccessor = (which) => {
+      bytesReadAccessors ??= {
+        get: registry.get("util").deprecate(function() {
+          return this.bytesWritten;
+        }, "zlib.bytesRead is deprecated and will change its meaning in the " +
+           "future. Use zlib.bytesWritten instead.", "DEP0108"),
+        set: registry.get("util").deprecate(function(value) {
+          this.bytesWritten = value;
+        }, "Setting zlib.bytesRead is deprecated. " +
+           "This feature will be removed in the future.", "DEP0108"),
+      };
+      return bytesReadAccessors[which];
+    };
+    Object.defineProperty(ZlibBase.prototype, "bytesRead", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return bytesReadAccessor("get").call(this);
+      },
+      set(value) {
+        bytesReadAccessor("set").call(this, value);
+      },
+    });
+    ZlibBase.prototype.reset = function() {
+      // node: assert(this._handle, 'zlib binding closed'), an internal
+      // assertion (ERR_INTERNAL_ASSERTION), not a plain Error.
+      if (!this._handle) throw codes.ERR_INTERNAL_ASSERTION("zlib binding closed");
+      return this._handle.reset();
+    };
+    ZlibBase.prototype._flush = function(callback) {
+      this._transform(BufferCtor.alloc(0), "", callback);
+    };
+    ZlibBase.prototype._final = function(callback) {
+      callback();
+    };
+    // node's flushiness order over zlib's flush values; zstd's 0..2 (and the
+    // zlib values a caller may still pass to flush()) rank through it.
+    const flushiness = [];
+    const kFlushFlagList = [Z_NO_FLUSH, Z_BLOCK, Z_PARTIAL_FLUSH, Z_SYNC_FLUSH, Z_FULL_FLUSH, Z_FINISH];
+    for (let i = 0; i < kFlushFlagList.length; i++) flushiness[kFlushFlagList[i]] = i;
+    const maxFlush = (a, b) => (flushiness[a] > flushiness[b] ? a : b);
+    const kFlushBuffers = [];
+    {
+      const dummyArrayBuffer = new ArrayBuffer(0);
+      for (const flushFlag of kFlushFlagList) {
+        kFlushBuffers[flushFlag] = BufferCtor.from(dummyArrayBuffer);
+        kFlushBuffers[flushFlag][kFlushFlag] = flushFlag;
+      }
+    }
+    ZlibBase.prototype.flush = function(kind, callback) {
+      if (typeof kind === "function" || (kind === undefined && !callback)) {
+        callback = kind;
+        kind = this._defaultFullFlushFlag;
+      }
+      if (this.writableFinished) {
+        if (callback) process.nextTick(callback);
+      } else if (this.writableEnded) {
+        if (callback) this.once("end", callback);
+      } else {
+        this.write(kFlushBuffers[kind], "", callback);
+      }
+    };
+    ZlibBase.prototype.close = function(callback) {
+      if (callback) zlibFinished(this, callback);
+      this.destroy();
+    };
+    ZlibBase.prototype._destroy = function(err, callback) {
+      zlibClose(this);
+      callback(err);
+    };
+    ZlibBase.prototype._transform = function(chunk, encoding, cb) {
+      let flushFlag = this._defaultFlushFlag;
+      // A flush() marker carries its flush value.
+      if (typeof chunk[kFlushFlag] === "number") flushFlag = chunk[kFlushFlag];
+      // The last chunk of an ended stream finishes it.
+      if (this.writableEnded && this.writableLength === chunk.byteLength) {
+        flushFlag = maxFlush(flushFlag, this._finishFlushFlag);
+      }
+      processChunk(this, chunk, flushFlag, cb);
+    };
+    ZlibBase.prototype._processChunk = function(chunk, flushFlag, cb) {
+      if (typeof cb === "function") {
+        processChunk(this, chunk, flushFlag, cb);
+      } else {
+        return processChunkSync(this, chunk, flushFlag);
+      }
+    };
+    function processChunkSync(self, chunk, flushFlag) {
+      let availInBefore = chunk.byteLength;
+      let availOutBefore = self._chunkSize - self._outOffset;
+      let inOff = 0;
+      let availOutAfter;
+      let availInAfter;
+      const buffers = [];
+      let nread = 0;
+      let inputRead = 0;
+      const state = self._writeState;
+      const handle = self._handle;
+      let buffer = self._outBuffer;
+      let offset = self._outOffset;
+      const chunkSize = self._chunkSize;
+      let error;
+      self.on("error", function onError(er) {
+        error = er;
+      });
+      while (true) {
+        handle.writeSync(flushFlag, chunk, inOff, availInBefore, buffer, offset, availOutBefore);
+        if (error) {
+          throw error;
+        } else if (self[kError]) {
+          throw self[kError];
+        }
+        availOutAfter = state[0];
+        availInAfter = state[1];
+        const inDelta = (availInBefore - availInAfter);
+        inputRead += inDelta;
+        const have = availOutBefore - availOutAfter;
+        if (have > 0) {
+          const out = buffer.slice(offset, offset + have);
+          offset += have;
+          buffers.push(out);
+          nread += out.byteLength;
+          if (nread > self._maxOutputLength) {
+            zlibClose(self);
+            throw bufferTooLarge(self._maxOutputLength);
+          }
+        }
+        // Exhausted the output buffer, or used all the input: a new one.
+        if (availOutAfter === 0 || offset >= chunkSize) {
+          availOutBefore = chunkSize;
+          offset = 0;
+          buffer = BufferCtor.allocUnsafe(chunkSize);
+        }
+        if (availOutAfter === 0) {
+          // Not actually done: the window filled, so call again.
+          inOff += inDelta;
+          availInBefore = availInAfter;
+        } else {
+          break;
+        }
+      }
+      self.bytesWritten = inputRead;
+      zlibClose(self);
+      if (nread === 0) return BufferCtor.alloc(0);
+      return (buffers.length === 1 ? buffers[0] : BufferCtor.concat(buffers, nread));
+    }
+    function processChunk(self, chunk, flushFlag, cb) {
+      const handle = self._handle;
+      if (!handle) return process.nextTick(cb);
+      handle.buffer = chunk;
+      handle.cb = cb;
+      handle.availOutBefore = self._chunkSize - self._outOffset;
+      handle.availInBefore = chunk.byteLength;
+      handle.inOff = 0;
+      handle.flushFlag = flushFlag;
+      handle.write(
+        flushFlag, chunk, 0, handle.availInBefore, self._outBuffer, self._outOffset,
+        handle.availOutBefore,
+      );
+    }
+    function processCallback() {
+      // `this` is the handle.
+      const handle = this;
+      const self = this[kOwner];
+      const state = self._writeState;
+      if (self.destroyed) {
+        this.buffer = null;
+        this.cb();
+        return;
+      }
+      const availOutAfter = state[0];
+      const availInAfter = state[1];
+      const inDelta = handle.availInBefore - availInAfter;
+      self.bytesWritten += inDelta;
+      const have = handle.availOutBefore - availOutAfter;
+      let streamBufferIsFull = false;
+      if (have > 0) {
+        const out = self._outBuffer.slice(self._outOffset, self._outOffset + have);
+        self._outOffset += have;
+        streamBufferIsFull = !self.push(out);
+      }
+      if (self.destroyed) {
+        this.cb();
+        return;
+      }
+      // Exhausted the output buffer, or used all the input: a new one.
+      if (availOutAfter === 0 || self._outOffset >= self._chunkSize) {
+        handle.availOutBefore = self._chunkSize;
+        self._outOffset = 0;
+        self._outBuffer = BufferCtor.allocUnsafe(self._chunkSize);
+      }
+      if (availOutAfter === 0) {
+        // Not actually done: call again, now or once the reader drains.
+        handle.inOff += inDelta;
+        handle.availInBefore = availInAfter;
+        if (!streamBufferIsFull) {
+          this.write(
+            handle.flushFlag, this.buffer, handle.inOff, handle.availInBefore,
+            self._outBuffer, self._outOffset, self._chunkSize,
+          );
+        } else {
+          const oldRead = self._read;
+          self._read = (n) => {
+            self._read = oldRead;
+            this.write(
+              handle.flushFlag, this.buffer, handle.inOff, handle.availInBefore,
+              self._outBuffer, self._outOffset, self._chunkSize,
+            );
+            self._read(n);
+          };
+        }
+        return;
+      }
+      if (availInAfter > 0) {
+        // Output room left but input unread: the library was not interested
+        // in more (a zstd frame ended), so the stream ends here.
+        if (self._rejectGarbageAfterEnd) {
+          const err = codes.ERR_TRAILING_JUNK_AFTER_STREAM_END();
+          self.destroy(err);
+          this.cb(err);
+          return;
+        }
+        self.push(null);
+      }
+      // Finished with the chunk.
+      this.buffer = null;
+      this.cb();
+    }
+    function zlibClose(engine) {
+      engine._handle?.close();
+      engine._handle = null;
+    }
+
+    const zstdDefaultOpts = {
+      flush: ZSTD_e_continue,
+      finishFlush: ZSTD_e_end,
+      fullFlush: ZSTD_e_flush,
+    };
+    class Zstd extends ZlibBase {
+      constructor(opts, mode, initParamsArray, maxParam) {
+        initParamsArray.fill(-1);
+        if (opts?.params) {
+          Object.keys(opts.params).forEach((origKey) => {
+            const key = +origKey;
+            if (Number.isNaN(key) || key < 0 || key > maxParam ||
+                (initParamsArray[key] | 0) !== -1) {
+              throw codes.ERR_ZSTD_INVALID_PARAM(origKey);
+            }
+            const value = opts.params[origKey];
+            if (typeof value !== "number" && typeof value !== "boolean") {
+              throw codes.ERR_INVALID_ARG_TYPE("options.params[key]", "number", opts.params[origKey]);
+            }
+            initParamsArray[key] = value;
+          });
+        }
+        const handle = mode === ZSTD_COMPRESS ?
+          new binding.ZstdCompress() : new binding.ZstdDecompress();
+        const pledgedSrcSize = opts?.pledgedSrcSize ?? undefined;
+        const writeState = new Uint32Array(2);
+        handle.init(
+          initParamsArray,
+          pledgedSrcSize,
+          writeState,
+          processCallback,
+          opts?.dictionary && ArrayBuffer.isView(opts.dictionary) ? opts.dictionary : undefined,
+        );
+        super(opts, mode, handle, zstdDefaultOpts);
+        this._writeState = writeState;
+      }
+    }
+    const maxConstant = (prefix) => Math.max(...Object.keys(ZSTD_CONSTANTS).map(
+      (key) => (key.startsWith(prefix) ? ZSTD_CONSTANTS[key] : 0),
+    ));
+    const kMaxZstdCParam = maxConstant("ZSTD_c_");
+    const zstdInitCParamsArray = new Uint32Array(kMaxZstdCParam + 1);
+    class ZstdCompress extends Zstd {
+      constructor(opts) {
+        super(opts, ZSTD_COMPRESS, zstdInitCParamsArray, kMaxZstdCParam);
+      }
+    }
+    const kMaxZstdDParam = maxConstant("ZSTD_d_");
+    const zstdInitDParamsArray = new Uint32Array(kMaxZstdDParam + 1);
+    class ZstdDecompress extends Zstd {
+      constructor(opts) {
+        super(opts, ZSTD_DECOMPRESS, zstdInitDParamsArray, kMaxZstdDParam);
+      }
+    }
+    function createConvenienceMethod(ctor, sync) {
+      if (sync) {
+        return function syncBufferWrapper(buffer, opts) {
+          return zlibBufferSync(new ctor(opts), buffer);
+        };
+      }
+      return function asyncBufferWrapper(buffer, opts, callback) {
+        if (typeof opts === "function") {
+          callback = opts;
+          opts = {};
+        }
+        return zlibBuffer(new ctor(opts), buffer, callback);
+      };
+    }
+    // node's createProperty: a non-writable, enumerable `create*` whose
+    // function is named "value".
+    const createProperty = (ctor) => ({
+      configurable: true,
+      enumerable: true,
+      value: function(options) {
+        return new ctor(options);
+      },
+    });
+
+    const zlibExports = {
       gzipSync: sync("gzip", true, "Gzip"),
       gunzipSync: sync("gzip", false, "Gunzip"),
       deflateSync: sync("deflate", true, "Deflate"),
@@ -22215,8 +22855,29 @@
         BROTLI_DEFAULT_WINDOW: 22,
         BROTLI_MIN_WINDOW_BITS: 10,
         BROTLI_MAX_WINDOW_BITS: 24,
+        ...ZSTD_CONSTANTS,
       },
+      ZstdCompress,
+      ZstdDecompress,
+      zstdCompress: createConvenienceMethod(ZstdCompress, false),
+      zstdCompressSync: createConvenienceMethod(ZstdCompress, true),
+      zstdDecompress: createConvenienceMethod(ZstdDecompress, false),
+      zstdDecompressSync: createConvenienceMethod(ZstdDecompress, true),
     };
+    Object.defineProperties(zlibExports, {
+      createZstdCompress: createProperty(ZstdCompress),
+      createZstdDecompress: createProperty(ZstdDecompress),
+    });
+    // node's deprecated top-level copies of its constants (every one but
+    // BROTLI_*): non-enumerable and read-only.
+    for (const key of Object.keys(ZSTD_CONSTANTS)) {
+      Object.defineProperty(zlibExports, key, {
+        enumerable: false,
+        value: ZSTD_CONSTANTS[key],
+        writable: false,
+      });
+    }
+    return zlibExports;
   };
 
   // ----------------------------------------------------- node:querystring
