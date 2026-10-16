@@ -634,15 +634,16 @@
   /// oam asks the OS for the whole path at once (`realpath`, which is what
   /// node's `.native` forms and `fs/promises.realpath` report). When that
   /// fails, this walk finds the error node's would have: the first component
-  /// whose lstat fails. If every component stats, the walk's own answer is
-  /// node's: the path it resolved, which the OS may have refused (NUL, on
-  /// Windows, resolves to itself). The walk yields `[op, path]` for the
-  /// caller to run -- "lstat", "stat" or "readlink", sync or async -- so one
-  /// walk serves both forms, and returns the resolved path, or null when it
-  /// gave up on a chain of links (the native error then stands).
+  /// whose lstat fails. If every component stats, the native error stands:
+  /// oam's lstat succeeds on some paths node's refuses (the Windows paging
+  /// file), so the walked path is not node's answer there. The walk yields
+  /// `[op, path]` for the caller to run -- "lstat", "stat" or "readlink",
+  /// sync or async -- so one walk serves both forms, and returns the
+  /// resolved path, or null when it gave up on a chain of links.
   ///
   /// On Windows a path in a device namespace (`\\?\`, `\\.\`) is walked
-  /// first, whatever the OS says of it (`realpathWalksFirst`): node's root
+  /// first, whatever the OS says of it, and the walked path is the answer
+  /// (`realpathWalksFirst`; NUL resolves to itself): node's root
   /// there is two components deep (`\\?\C:\`, `\\.\pipe\`), and its lstat
   /// fails where the OS resolves the whole path -- `\\?\C:\x` is
   /// `EISDIR, lstat 'C:'` on v22.22.2 (#361).
@@ -14941,22 +14942,22 @@
       return step.value;
     }
 
-    // node's realpathSync: the OS's answer where node's walk reaches the
-    // same one, else the walk's own (realpathWalk).
+    // node's realpathSync: on Windows a device-namespace path is the walk's
+    // (realpathWalksFirst); any other is the OS's answer, and when the OS
+    // refuses it the walk finds node's error. A walk that completes leaves
+    // the OS's error standing: oam's lstat succeeds where node's fails (the
+    // paging file, EPERM in node), so the walked path is not node's answer.
     function realpathWalkingSync(path) {
       if (realpathWalksFirst(path)) {
         const walked = realpathWalkSync(path);
         if (walked !== null) return walked;
       }
-      let original;
       try {
         return realpathJsShape(natives.fsRealpathSync(path));
-      } catch (e) {
-        original = e;
+      } catch (original) {
+        realpathWalkSync(path);
+        throw original;
       }
-      const walked = realpathWalkSync(path);
-      if (walked !== null) return walked;
-      throw original;
     }
 
     // node's callback realpath, as realpathWalkingSync.
@@ -14965,15 +14966,12 @@
         const walked = await realpathWalkAsync(path);
         if (walked !== null) return walked;
       }
-      let original;
       try {
         return realpathJsShape(await natives.fsRealpath(path));
-      } catch (e) {
-        original = e;
+      } catch (original) {
+        await realpathWalkAsync(path);
+        throw original;
       }
-      const walked = await realpathWalkAsync(path);
-      if (walked !== null) return walked;
-      throw original;
     }
 
     // DEP0081, once per process as node warns it.
