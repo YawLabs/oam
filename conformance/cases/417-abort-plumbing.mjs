@@ -381,6 +381,15 @@ console.log("-- 3. one AbortError class");
         fs.readFile(new URL(import.meta.url), { signal: sig() }, (e) => (e ? rej(e) : res())),
       ),
     );
+    // fs.promises.watch: aborted before the first next(), and while waiting.
+    await grab("fsp.watch", async () => {
+      for await (const _ of fsp.watch(dir, { signal: sig() }));
+    });
+    await grab("fsp.watch late", async () => {
+      const ac = new AbortController();
+      setTimeout(() => ac.abort("late"), 5);
+      for await (const _ of fsp.watch(dir, { signal: ac.signal }));
+    });
     await grab("rl.question", () => {
       const rl = rlp.createInterface({ input: new stream.PassThrough() });
       return rl.question("", { signal: sig() }).finally(() => rl.close());
