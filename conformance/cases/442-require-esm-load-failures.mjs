@@ -25,6 +25,10 @@ const files = {
   "missingpkg.mjs": "import 'no-such-package-here';\n",
   "t.cjs": "console.log('t.cjs body ran');\nthrow new TypeError('t.cjs threw');\n",
   "cjsthrow.mjs": "import './t.cjs';\nexport const unreachable = 1;\n",
+  // A TYPELESS .js with module syntax: require() decides it by its syntax
+  // (the Detect path), and its graph cannot load. Its own failing import is
+  // what node reports -- not a silent undefined from a dropped exception.
+  "broken.js": "import './nope.mjs';\nexport const v = 1;\n",
   "main.cjs": `
 const clean = (s) => String(s).split(__dirname).join('<D>').split('\\\\').join('/')
   .split(require('url').pathToFileURL(__dirname).href).join('<URL>');
@@ -42,6 +46,8 @@ attempt('missing module', './missing.mjs');
 attempt('missing module again', './missing.mjs');
 attempt('missing package', './missingpkg.mjs');
 attempt('missing package again', './missingpkg.mjs');
+attempt('typeless js with module syntax', './broken.js');
+attempt('typeless js again', './broken.js');
 const first = attempt('commonjs dependency threw', './cjsthrow.mjs');
 const second = attempt('again', './cjsthrow.mjs');
 console.log('same error object', first === second, first instanceof TypeError);

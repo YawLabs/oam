@@ -588,11 +588,16 @@ fn require_callback(
             v8::tc_scope!(let tc, scope);
             match load_cjs_or_detect(tc, &path) {
                 CjsLoad::Exports(exports) => rv.set(exports),
-                CjsLoad::Esm => {
-                    if let Some(exports) = require_esm(tc, &path, &referrer) {
-                        rv.set(exports);
+                CjsLoad::Esm => match require_esm(tc, &path, &referrer) {
+                    Some(exports) => rv.set(exports),
+                    // A load that fails -- a missing import, a package that
+                    // does not resolve -- leaves a JS exception pending. Drop
+                    // without rethrowing and the TryCatch swallows it, so the
+                    // require() would return undefined instead of throwing.
+                    None => {
+                        tc.rethrow();
                     }
-                }
+                },
                 CjsLoad::Threw => {
                     tc.rethrow();
                 }
