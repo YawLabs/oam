@@ -188,6 +188,19 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   junction, as libuv does, where it failed `EPERM`. Where node's cpSync fails by its
   platform's std::filesystem, or aborts, oam fails as node does on Linux; see
   docs/node-divergences.md.
+- **Abort reasons, error headers, `AbortError` and `MessageChannel` are node's (#401).**
+  `ac.abort(null)` keeps null as the reason everywhere node does (`signal.reason`,
+  `throwIfAborted`, `AbortSignal.any`, an `AbortError`'s `cause`, fetch's rejection); a fetch body
+  being read still fails with undici's `DOMException`, "The operation was aborted.".
+  `util.inspect` heads an error with its constructor as node does (`DOMException [AbortError]: x`,
+  `Foo [Error]: x`), an error whose stack cannot be built prints `[object Error]` instead of
+  throwing, and `%s` in `util.format` and `console.log` inspects errors. events, timers/promises,
+  the streams, fs and readline reject with one `AbortError` class, and the `fs.writeFile` family
+  honours an aborted signal before it opens anything. `util.aborted` resolves with the abort
+  `Event`. `MessageChannel` and `MessagePort` are globals, and a port is node's
+  `NodeEventTarget`, delivering messages as node's does. `worker_threads.receiveMessageOnPort`
+  works. A worker exits once its `parentPort` has no `'message'` listener left. `structuredClone`
+  of a function or a symbol throws `DataCloneError`.
 - **A `SystemError` code is an instance of its own `NodeError` class, as node's is (#288).**
   node raises `fs.cp`'s `ERR_FS_CP_*` and `ERR_FS_EISDIR`, and `os.getPriority`'s
   `ERR_SYSTEM_ERROR`, as a per-code `class NodeError extends SystemError`. oam built every one
