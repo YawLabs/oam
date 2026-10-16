@@ -439,6 +439,19 @@ fn synthetic_spawn_errno(code: &str) -> Option<i32> {
 /// no-console rule is skipped there.
 #[cfg(windows)]
 pub(crate) fn windows_creation_flags(detached: bool, windows_hide: bool, inherits: bool) -> u32 {
+    creation_flags_for(detached, windows_hide, inherits, has_console)
+}
+
+/// `windows_creation_flags` with the console probe passed in, so the table
+/// can be tested whatever console the test runner has. The probe runs only
+/// when its answer matters.
+#[cfg(windows)]
+fn creation_flags_for(
+    detached: bool,
+    windows_hide: bool,
+    inherits: bool,
+    has_console: impl FnOnce() -> bool,
+) -> u32 {
     use windows_sys::Win32::System::Threading::{
         CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
     };
@@ -450,6 +463,49 @@ pub(crate) fn windows_creation_flags(detached: bool, windows_hide: bool, inherit
         flags |= DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
     }
     flags
+}
+
+#[cfg(all(test, windows))]
+mod creation_flags_tests {
+    use super::creation_flags_for;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+    };
+    const DETACHED: u32 = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+
+    #[test]
+    fn follows_libuv_with_a_console() {
+        let with = || true;
+        // node's default: no flag, so the child shares this console.
+        assert_eq!(creation_flags_for(false, false, false, with), 0);
+        // windowsHide with every slot piped or ignored.
+        assert_eq!(
+            creation_flags_for(false, true, false, with),
+            CREATE_NO_WINDOW
+        );
+        // An inherited slot vetoes it, as UV_INHERIT_FD does in libuv.
+        assert_eq!(creation_flags_for(false, true, true, with), 0);
+        assert_eq!(creation_flags_for(true, false, false, with), DETACHED);
+        assert_eq!(
+            creation_flags_for(true, true, false, with),
+            DETACHED | CREATE_NO_WINDOW
+        );
+    }
+
+    #[test]
+    fn a_console_less_parent_never_gives_a_child_a_window() {
+        let without = || false;
+        assert_eq!(
+            creation_flags_for(false, false, false, without),
+            CREATE_NO_WINDOW
+        );
+        assert_eq!(
+            creation_flags_for(false, true, true, without),
+            CREATE_NO_WINDOW
+        );
+        // DETACHED_PROCESS already means no console at all.
+        assert_eq!(creation_flags_for(true, false, false, without), DETACHED);
+    }
 }
 
 /// Whether this process is attached to a console. `GetConsoleWindow` is not
