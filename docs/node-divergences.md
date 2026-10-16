@@ -937,6 +937,46 @@ work in oam: the first never runs, and the second runs in every module. Use
 `require.main === module`, which Node's documentation recommends. `module.parent` is
 deprecated in Node (DEP0144).
 
+### The compile cache is on by default, and keeps oam's own layout
+
+node's compile cache is opt-in: nothing is cached until `module.enableCompileCache()` or
+`NODE_COMPILE_CACHE` turns it on. oam has its own V8 bytecode cache, on by default, and the
+node API (`enableCompileCache`, `getCompileCacheDir`, `flushCompileCache`,
+`constants.compileCacheStatus`, `NODE_COMPILE_CACHE`, `NODE_DISABLE_COMPILE_CACHE`) steers
+that cache instead of starting a second one. The return shapes, statuses and messages are
+node v22.22.2's; what differs is where and when the entries are written:
+
+- **On without the API.** With neither the call nor the variable, oam still caches every
+  CommonJS and ES module under its default root (`%LOCALAPPDATA%\oam\bytecode`,
+  `$XDG_CACHE_HOME/oam/bytecode` or `~/.cache/oam/bytecode`). `getCompileCacheDir()` still
+  returns `undefined` there, as node's does, so a program that tests it before enabling a
+  cache takes node's branch. `NODE_DISABLE_COMPILE_CACHE` (any value, as in node) or
+  `OAM_CODE_CACHE=0` turns the cache off completely; with the second, a DISABLED answer reads
+  `Disabled by OAM_CODE_CACHE`.
+- **`enableCompileCache()` with no directory.** node picks `<tmpdir>/node-compile-cache`. oam
+  answers ENABLED with its default root and does not move the cache, so a warm cache stays
+  warm. With a directory both runtimes create a per-build subdirectory inside it, and
+  `getCompileCacheDir()` names that: node's `v22.22.2-arm64-<hash>`, oam's
+  `oam-v<version>-<arch>-<V8 tag>`.
+- **The entries.** oam's are content-addressed (`<aa>/<sha256>.v8c`, keyed by V8's version
+  tag and flags, oam's cache format and version, the module kind and the source text), not
+  one per file name. node and oam can share one directory: their subdirectories differ, and
+  neither could use the other's entries anyway, because their V8 builds differ.
+- **Modules compiled before the call.** node caches only what it compiles after
+  `enableCompileCache(dir)`: the module making the call, and an ES entry's static imports,
+  are never cached (measured). oam caches them in the root they were looked up in, the
+  default root or `NODE_COMPILE_CACHE`'s, so they are warm on the next run; only what is
+  compiled after the call goes to the named directory. `oam cache info` and `oam cache clean`
+  cover the default root only.
+- **When they are written.** node writes its entries at exit and on `flushCompileCache()`.
+  oam writes a CommonJS module's entry as soon as its body returns, and an ES module's after
+  its graph evaluates, on `flushCompileCache()` or at `process.exit()`; those two also write
+  the CommonJS modules whose body is still running, so a CommonJS bin that ends in
+  `process.exit()` is cached as under node. In both runtimes a
+  cache directory that cannot be written only costs the next run a compile, and a
+  `NODE_COMPILE_CACHE` that cannot be created is ignored (`getCompileCacheDir()` is
+  `undefined`); oam then keeps caching in its default root.
+
 ---
 
 ### 16. GET/HEAD body writes are dropped, not sent unframed
@@ -4108,7 +4148,7 @@ The largest per-module gaps (counts from windows-aarch64), all tracked in that f
 |---|---|---|
 | `constants` | 54 win32 / 65 linux / 61 darwin | The legacy all-in-one table. Platform-conditional values — the `WSA*` block on Windows, `RTLD_*` on POSIX, plus `UV_DIRENT_*` and the `SSL_OP_*`/`ENGINE_METHOD_*` OpenSSL set everywhere. This module is the *entire* reason the ratchet is keyed by platform: a Windows-only baseline reports 16 phantom new gaps on Linux and 12 on darwin, every one of them here. `fs.constants` and `os.constants` are separately correct — see *Platform constant tables* above. |
 | `dns/promises` | 31 | `Resolver`, `getServers`/`setServers`, `lookupService`, `resolveTlsa`, and the `BADNAME`/`NOTFOUND`/… error-code constants. |
-| `module` | 25 | The `Module._*` loader internals (`_load`, `_resolveFilename`, `_cache`, `_extensions`), `register`, `SourceMap`/`findSourceMap`, the compile-cache API. |
+| `module` | 21 | The `Module._*` loader internals (`_load`, `_resolveFilename`, `_cache`, `_extensions`), `register`, `SourceMap`/`findSourceMap`. The compile-cache API landed in 0.19.1 (see *The compile cache is on by default* above). |
 | `fs` | **0** | Closed in 0.9.1–0.9.2. Ownership and fd metadata (`chown`/`fchown`/`lchown`, `fchmod`/`lchmod`), durability (`fsync`/`fdatasync`), `ftruncate`, the `utimes`/`futimes`/`lutimes` family, `readv`/`writev`, `openAsBlob`, `statfs` and `glob`/`globSync` all landed. `node:fs` now has no missing export names on any platform, and `fs/promises` none since `watch` landed after 0.19.0. |
 | `crypto` | 12 | The legacy class constructors (`Hash`, `Hmac`, `Cipher(iv)`, `Decipher(iv)`), `diffieHellman`, `getCipherInfo`, `randomFill`. |
 | `stream/web` | 12 | The controller/reader/writer constructors and the queuing-strategy classes — the same constructors listed in the Web globals row above. |

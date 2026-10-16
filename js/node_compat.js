@@ -17819,6 +17819,92 @@
       "zlib",
     ];
 
+    // node's compile-cache API (v22.1), over oam's V8 bytecode cache
+    // (crates/oam_engine/src/code_cache.rs). The cache itself is on by
+    // default in oam; this API reports and steers it the way node's does:
+    // getCompileCacheDir() is undefined until enableCompileCache() or
+    // NODE_COMPILE_CACHE turns node's cache on, a named directory moves the
+    // cache into `<dir>/oam-v<version>-<arch>-<v8 tag>`, and
+    // NODE_DISABLE_COMPILE_CACHE (or OAM_CODE_CACHE=0) answers DISABLED.
+    // Both bags are frozen null-prototype objects, as in node.
+    const compileCacheStatus = Object.freeze({
+      __proto__: null,
+      FAILED: 0,
+      ENABLED: 1,
+      ALREADY_ENABLED: 2,
+      DISABLED: 3,
+    });
+    const constants = Object.freeze({ __proto__: null, compileCacheStatus });
+
+    // The shape and order node builds: status first, then message or
+    // directory, each present only when set.
+    function compileCacheResult(status, message, directory) {
+      const result = { status };
+      if (message !== undefined) result.message = message;
+      if (directory !== undefined) result.directory = directory;
+      return result;
+    }
+
+    function enableCompileCache(cacheDir) {
+      // node checks the type in C++ with its own wording -- not the usual
+      // ERR_INVALID_ARG_TYPE message -- and only `undefined` means "use the
+      // default"; null throws (measured on v22.22.2).
+      if (cacheDir !== undefined && typeof cacheDir !== "string") {
+        const err = new TypeError("cacheDir should be a string");
+        err.code = "ERR_INVALID_ARG_TYPE";
+        throw err;
+      }
+      const [disabledBy, directory, defaultDir, versionDir] = natives.compileCacheState();
+      if (disabledBy !== undefined) {
+        return compileCacheResult(compileCacheStatus.DISABLED, `Disabled by ${disabledBy}`);
+      }
+      if (directory !== undefined) {
+        return compileCacheResult(compileCacheStatus.ALREADY_ENABLED, undefined, directory);
+      }
+      // No directory: node falls back to <tmpdir>/node-compile-cache. oam
+      // keeps the root it already caches into, so enabling node's API never
+      // throws away a warm cache; the root already carries the version in
+      // every key, so it needs no per-build subdirectory.
+      let base = defaultDir;
+      let root = defaultDir;
+      if (cacheDir !== undefined) {
+        // node resolves against the cwd ("" is the cwd itself, measured).
+        base = registry.get("path").resolve(cacheDir);
+        root = registry.get("path").join(base, versionDir);
+      }
+      try {
+        // The native op, not fs.mkdirSync: a program that patched fs (mocks,
+        // graceful-fs) must not decide whether the cache can be enabled.
+        natives.fsMkdirSync(root, true, 0o777);
+      } catch (err) {
+        const reason = UV_ERROR_MESSAGES[err && err.code] ?? String(err && err.message);
+        return compileCacheResult(compileCacheStatus.FAILED, `Cannot create cache directory: ${reason}`);
+      }
+      if (!natives.compileCacheEnable(root)) {
+        // This thread's cache is already on (the state read above makes
+        // this unreachable today; kept so the answer never depends on it).
+        // The state is per thread, as node's is per Environment: a worker
+        // enables its own directory and never moves the main thread's.
+        const [, current] = natives.compileCacheState();
+        return compileCacheResult(compileCacheStatus.ALREADY_ENABLED, undefined, current);
+      }
+      // node's first answer names the directory as given (resolved); only
+      // later answers and getCompileCacheDir() name the versioned one.
+      return compileCacheResult(compileCacheStatus.ENABLED, undefined, base);
+    }
+
+    function getCompileCacheDir() {
+      return natives.compileCacheState()[1];
+    }
+
+    // Writes the ESM entries still waiting for their post-evaluate store and
+    // the CommonJS modules whose body is still running (the rest are written
+    // as each body returns). Never throws: a write failure only costs the
+    // next run a compile.
+    function flushCompileCache() {
+      natives.compileCacheFlush();
+    }
+
     return {
       createRequire(filename) {
         let base = String(filename);
@@ -17833,6 +17919,10 @@
         return builtinModules.includes(bare);
       },
       syncBuiltinESMExports: () => {},
+      constants,
+      enableCompileCache,
+      flushCompileCache,
+      getCompileCacheDir,
       Module,
     };
   };

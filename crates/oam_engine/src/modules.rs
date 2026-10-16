@@ -1893,7 +1893,14 @@ pub(crate) fn unhandled_rejection_failures(
 /// captured -- that is the residual lazy compile. Best-effort: a failed
 /// produce/write just means the next run pays the compile. Drains the list,
 /// so a repeat call is a no-op.
-fn store_pending_code_cache(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>) {
+///
+/// Also the body of `module.flushCompileCache()` and of `process.exit()`'s
+/// last step ([`flush_code_cache`]): node persists its compile cache when a
+/// program exits through `process.exit()` mid-graph (measured: an ESM entry
+/// that imports a module and then calls `process.exit(0)` leaves both
+/// entries on disk), and a CLI that ends that way would otherwise never get
+/// a warm start in oam.
+fn store_pending_code_cache(tc: &mut v8::PinScope<'_, '_>) {
     let pending = match tc.get_slot_mut::<ModuleMap>() {
         Some(map) => std::mem::take(&mut map.pending_code_cache),
         None => return,
@@ -1910,6 +1917,19 @@ fn store_pending_code_cache(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::
             crate::code_cache::store(&key, &cd);
         }
     }
+}
+
+/// Write every pending bytecode entry now: `module.flushCompileCache()` and
+/// `process.exit()`. The ESM list is drained like the post-evaluate store,
+/// so the store that follows evaluation finds nothing left to write -- the
+/// blob written here is a valid entry for its source, just without the
+/// inner functions the rest of evaluation would have compiled. A CJS entry
+/// is otherwise stored when its body returns; the ones whose body is still
+/// running (the module calling `process.exit()`, and every module that
+/// required it) are stored here too (see `cjs::flush_in_flight_code_cache`).
+pub(crate) fn flush_code_cache(scope: &mut v8::PinScope<'_, '_>) {
+    store_pending_code_cache(scope);
+    crate::cjs::flush_in_flight_code_cache(scope);
 }
 
 // ------------------------------------------------------------- prefetch
@@ -1978,7 +1998,11 @@ fn prefetch_lock(shared: &PrefetchShared) -> std::sync::MutexGuard<'_, PrefetchS
 /// Worker loop: pull a path, run `host.load` + the bytecode-cache probe,
 /// park the result. No V8 handle is touched here — `host.load` is fs + oxc,
 /// and the cache probe is SHA-256 plus a disk/seed lookup.
-fn prefetch_worker(host: &dyn ModuleHost, shared: &PrefetchShared) {
+fn prefetch_worker(
+    host: &dyn ModuleHost,
+    shared: &PrefetchShared,
+    cache_root: &std::sync::Arc<Path>,
+) {
     loop {
         let path = {
             let mut state = prefetch_lock(shared);
@@ -1996,8 +2020,13 @@ fn prefetch_worker(host: &dyn ModuleHost, shared: &PrefetchShared) {
         // so nothing observes state the panic may have torn.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             host.load(&path).map(|code| {
-                let key = crate::code_cache::enabled()
-                    .then(|| crate::code_cache::key_for(&code, crate::code_cache::Kind::Module));
+                let key = crate::code_cache::enabled().then(|| {
+                    crate::code_cache::key_for(
+                        &code,
+                        crate::code_cache::Kind::Module,
+                        Arc::clone(cache_root),
+                    )
+                });
                 let cached = key.as_ref().and_then(crate::code_cache::load);
                 (code, key, cached)
             })
@@ -2030,10 +2059,19 @@ struct GraphPrefetcher<'scope, 'env> {
     requested: HashSet<PathBuf>,
     workers: usize,
     max_workers: usize,
+    /// The isolate's bytecode cache root, read on the isolate thread when
+    /// the graph load starts (workers cannot reach the isolate's slot). No
+    /// module body runs during a graph load, so `enableCompileCache` cannot
+    /// move the root under a pending prefetch.
+    cache_root: Arc<Path>,
 }
 
 impl<'scope, 'env> GraphPrefetcher<'scope, 'env> {
-    fn new(scope: &'scope std::thread::Scope<'scope, 'env>, host: &'env dyn ModuleHost) -> Self {
+    fn new(
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        host: &'env dyn ModuleHost,
+        cache_root: Arc<Path>,
+    ) -> Self {
         // Small on purpose: transpile jobs are short and the isolate thread
         // consumes serially; more threads would just contend.
         let max_workers = if prefetch_enabled() {
@@ -2051,6 +2089,7 @@ impl<'scope, 'env> GraphPrefetcher<'scope, 'env> {
             requested: HashSet::new(),
             workers: 0,
             max_workers,
+            cache_root,
         }
     }
 
@@ -2092,7 +2131,9 @@ impl<'scope, 'env> GraphPrefetcher<'scope, 'env> {
             self.workers += 1;
             let host = self.host;
             let shared = Arc::clone(&self.shared);
-            self.scope.spawn(move || prefetch_worker(host, &shared));
+            let cache_root = Arc::clone(&self.cache_root);
+            self.scope
+                .spawn(move || prefetch_worker(host, &shared, &cache_root));
         }
     }
 
@@ -2148,8 +2189,9 @@ fn load_module_graph(
     // workers spawn lazily as prefetchable imports are discovered, and the
     // scope joins them on every exit path (the prefetcher's Drop closes the
     // queue, error returns included).
+    let cache_root = crate::code_cache::root_for(tc);
     std::thread::scope(|scope| {
-        let mut prefetch = GraphPrefetcher::new(scope, host);
+        let mut prefetch = GraphPrefetcher::new(scope, host, cache_root);
         load_module_graph_overlapped(tc, host, entry, &mut prefetch)
     })
 }
@@ -2283,8 +2325,12 @@ fn load_module_graph_overlapped(
             // exact source; reuse both.
             Some((key, cached)) => (key, cached),
             None => {
-                let key = crate::code_cache::enabled()
-                    .then(|| crate::code_cache::key_for(&code, crate::code_cache::Kind::Module));
+                // Root read at lookup and carried to the post-evaluate store
+                // in the key (see code_cache::CacheKey).
+                let key = crate::code_cache::enabled().then(|| {
+                    let root = crate::code_cache::root_for(tc);
+                    crate::code_cache::key_for(&code, crate::code_cache::Kind::Module, root)
+                });
                 let cached = key.as_ref().and_then(crate::code_cache::load);
                 (key, cached)
             }
