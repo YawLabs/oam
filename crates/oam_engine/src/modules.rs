@@ -366,8 +366,13 @@ pub(crate) unsafe extern "C" fn message_listener(
     // microtask stops at its first instruction and V8 drops the rest of the
     // queue. With JS on the stack (a checkpoint inside a dynamic import) the
     // termination would unwind that JS too, so the throw is only recorded
-    // there and reported at the next drain.
+    // there and reported at the next drain. Not in a worker: node's worker
+    // still runs the rest of the drain before it stops (conformance case
+    // 474).
     let terminate = fatal.is_some()
+        && scope
+            .get_slot::<oam_core::worker::WorkerContext>()
+            .is_none()
         && v8::StackTrace::current_stack_trace(scope, 1).is_none_or(|t| t.get_frame_count() == 0);
     if let Some(ledger) = scope.get_slot_mut::<UncaughtLedger>() {
         ledger.entries.push(UncaughtEntry {

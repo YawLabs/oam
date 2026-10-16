@@ -881,10 +881,47 @@ impl JsRuntime {
         // process._exiting is the shared once-guard. What a listener's throw
         // does, and what runs after the emit, is node's
         // (`modules::emit_exit_event`): `Nothing` is the fatal path.
+        if self
+            .isolate
+            .get_slot::<oam_core::worker::WorkerContext>()
+            .is_some()
+        {
+            self.emit_worker_process_exit(after);
+            return;
+        }
         self.clear_active_host();
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
         crate::modules::emit_exit_event(tc, after != AfterScript::Nothing);
+    }
+
+    /// A worker's 'exit' emit, as before the main thread's took node's
+    /// uncaught-exception semantics: a listener's throw is printed and
+    /// sets exitCode 1, and a throw from a promise job the listeners queue
+    /// does not change the code (node's worker exits 0 for it, conformance
+    /// case 474). The main thread's path reports at exit straight to OS
+    /// stderr, which a worker must not do: its errors go to the parent.
+    /// The worker's error shape is #399 items 3 and 4.
+    fn emit_worker_process_exit(&mut self, after: AfterScript) {
+        // IIFE so the locals stay function-scoped: a top-level `var` in a
+        // classic script would land on globalThis.
+        if let Err(e) = self.execute_script_draining(
+            "<process-exit>",
+            "(function () { \
+               var p = globalThis.__oamProcessRef || globalThis.process; \
+               if (p && !p._exiting) { \
+                 p._exiting = true; \
+                 var c = typeof p.exitCode === 'number' ? p.exitCode : 0; \
+                 try { p.emit('exit', c); } catch (e) { \
+                   p.exitCode = 1; \
+                   try { console.error(globalThis.__oamFormatFatal(e)); } catch (_) {} \
+                 } \
+               } \
+             })();",
+            after,
+        ) {
+            eprintln!("{e}");
+        }
     }
 
     /// Compile and run `source` as a classic script. Returns the stringified
