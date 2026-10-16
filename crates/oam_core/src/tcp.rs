@@ -1774,6 +1774,54 @@ mod tests {
         );
     }
 
+    /// #388, the rest of it: a client that connected just before the close,
+    /// whose accept had answered but whose connection JS had not yet taken,
+    /// is closed with the server, as libuv's `uv_close` closes every
+    /// instance the server holds. The name is gone when close returns -- a
+    /// dial finds no such pipe and a listen on it succeeds -- and the
+    /// connection leaves the registry. Left for JS to reset when it read the
+    /// answer a tick later, the instance held the name meanwhile: a dial
+    /// waited for it (WaitNamedPipeW) and a listen was EADDRINUSE.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_named_pipe_server_closed_with_a_connection_not_yet_taken_closes_it() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let path = test_pipe_path("closed-untaken");
+        let server =
+            json(pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await);
+        let server_id = server["serverId"].as_u64().unwrap();
+        let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
+        let client = tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(&path)
+            .unwrap();
+        // Answered, and not taken: what JS sees a tick later.
+        let accepted = json(accepting.await.unwrap());
+        assert!(accepted["handle"].as_u64().is_some(), "{accepted}");
+        let closing = std::time::Instant::now();
+        tcp_server_close(&registry, server_id);
+        let took = closing.elapsed();
+        assert!(took < std::time::Duration::from_millis(250), "{took:?}");
+        let refused = tokio::net::windows::named_pipe::ClientOptions::new().open(&path);
+        assert_eq!(
+            refused.as_ref().err().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound),
+            "connected to a closed server: {refused:?}"
+        );
+        let again = pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await;
+        let OpOutcome::Json(again) = again else {
+            panic!("the closed server's name could not be listened on again");
+        };
+        let again: serde_json::Value = serde_json::from_str(&again).unwrap();
+        tcp_server_close(&registry, again["serverId"].as_u64().unwrap());
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+        drop(client);
+    }
+
     /// #139, the duplex case the single-half tests miss: a handle closed
     /// while BOTH a read and a write are in flight (in_flight == 2) keeps
     /// its closed marker until the SECOND half returns, not the first. This
