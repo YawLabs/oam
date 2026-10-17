@@ -3939,10 +3939,14 @@ refused, and a name the binding does not know (`'bogus'`) writes UTF-8 -- so
 `ERR_UNKNOWN_ENCODING`.
 What still differs:
 
-- **`UV_FS_O_FILEMAP` is accepted and ignored (Windows).** libuv opens such a file
-  read-write and does its reads and writes through a file mapping, emulating `O_APPEND`
-  and the access mode there. oam opens an ordinary handle. The two agree except together
-  with `O_APPEND` (node's descriptor can `ftruncate`, and a write through
+- **`UV_FS_O_FILEMAP` opens no file mapping (Windows).** libuv does a
+  `UV_FS_O_FILEMAP` descriptor's reads and writes through a file mapping, emulating
+  `O_APPEND` and the access mode there. oam opens the file as libuv does -- a write-only
+  open asks read access too, and a handle with no standard information fails the open
+  with that query's error, so a console is `EISDIR` and the pipe namespace `EINVAL`, as
+  in node v22.22.2 (#384, conformance case 543) -- but then hands out an ordinary
+  handle. The two agree except together with `O_APPEND` (libuv opens that read-write
+  without the append swap: node's descriptor can `ftruncate`, and a write through
   `O_RDONLY | O_APPEND | UV_FS_O_FILEMAP` is `EBADF` where oam's appends) or `O_DIRECT`.
 - **An open under `--permission` needs the write grant unless it can only read.** node
   asks for it when the flags name a write (`O_WRONLY`, `O_RDWR`, `O_APPEND`, `O_CREAT`,
@@ -4170,10 +4174,29 @@ entry, `oam.readTextFile` and native addon loading: `readFileSync("sub/")` fails
 `writeFileSync("g.txt.", ...)` creates `g.txt.`, and `require("./mod.js.")` fails
 `MODULE_NOT_FOUND`, as in node v22.22.2 (conformance case 377).
 
-One corner is left. `require` of an absolute `\\?\C:\...`, `\\.\C:\...` or `//?/C:/...`
+`fs.realpathSync` and `fs.realpath` of such a path run node's component walk before asking
+the OS, and fail as node's do (`EISDIR`, `lstat 'C:'`; #361, conformance case 542). One
+corner is left. `require` of an absolute `\\?\C:\...`, `\\.\C:\...` or `//?/C:/...`
 spelling of an existing module loads it on oam; node v22.22.2 fails `EISDIR` (`lstat 'C:'`,
-or `lstat '\\.\C:'`), because its realpath walk takes the first component after the prefix
-for a directory to lstat. Reproducing a failure of node's own was not worth it.
+or `lstat '\\.\C:'`), because its module loader's realpath is that same walk, which takes
+the first component after the prefix for a directory to lstat. oam's loader resolves in
+Rust; reproducing a failure of node's own there was not worth it.
+
+### Windows: a stat of the paging file
+
+The system holds `pagefile.sys`, `swapfile.sys`, `hiberfil.sys` and `DumpStack.log.tmp`
+open with no sharing. node v22.22.2 fails `lstatSync`, `statSync`, `fs.promises.stat` and
+`realpathSync` of them `EPERM` (`lstat` for realpath), and `existsSync` is `false`. oam's
+`lstatSync` succeeds (std's stat falls back to a directory listing on the sharing
+violation), so `existsSync` is `true`; its `statSync` and `fs.promises.stat` fail `EBUSY`,
+and so do `realpathSync` and `fs.realpath` (`EBUSY, realpath`, the OS's error: node's
+component walk, which oam runs for node's error, completes on oam's lstat). `accessSync`
+is `EBUSY` in both. Measured on Windows 11 build 26200 arm64. libuv opens such a file,
+meets the sharing violation and looks the name up in its directory instead
+(fs__stat_directory); where node's `EPERM` comes from on that path was not pinned down,
+so oam does not imitate it. An ordinary file another process holds with no sharing stats
+alike in both. The e2e test `realpath_of_the_paging_file_fails_as_the_os_does` holds oam's
+realpath to failing.
 
 ### Windows `fs.symlink(target, path, 'junction')` makes a directory symlink
 

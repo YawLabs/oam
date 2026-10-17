@@ -37710,6 +37710,51 @@ fn chdir_moves_the_drive_cwd_that_drive_relative_paths_use() {
     );
 }
 
+// realpathSync and callback realpath of a file the system holds open with no
+// sharing (the paging file): node's fail, `EPERM, lstat` on v22.22.2. oam's
+// realpath asks the OS first (EBUSY) and on a failure runs node's component
+// walk for node's error; the walk's lstat succeeds there where node's does
+// not (docs/node-divergences.md), so a walk that completes must leave the
+// OS's error standing, not turn it into the walked path. Skips where no
+// paging file lies at the system drive's root.
+#[cfg(windows)]
+#[test]
+fn realpath_of_the_paging_file_fails_as_the_os_does() {
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    let root = format!("{drive}\\");
+    let Some(locked) = std::fs::read_dir(&root).ok().and_then(|entries| {
+        entries.flatten().map(|entry| entry.path()).find(|path| {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            ["pagefile.sys", "swapfile.sys"]
+                .iter()
+                .any(|known| name.eq_ignore_ascii_case(known))
+                && std::fs::File::open(path).is_err()
+        })
+    }) else {
+        eprintln!("no locked paging file at {root}; skipping");
+        return;
+    };
+    let script = write_temp(
+        "realpath_paging_file/main.cjs",
+        "const fs = require('fs');\n\
+         const p = process.argv[2];\n\
+         try { fs.realpathSync(p); console.log('sync resolved'); }\n\
+         catch (e) { console.log('sync threw'); }\n\
+         fs.realpath(p, (e) => console.log(e ? 'callback threw' : 'callback resolved'));\n",
+    );
+    let out = bounded_output(&mut oam_command(&[
+        script.to_str().unwrap(),
+        locked.to_str().unwrap(),
+    ]));
+    let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(
+        stdout,
+        "sync threw\ncallback threw\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // process.env and the hidden `=X:` drive-cwd variables, as node has them
 // (node_env_var.cc; measured on v22.22.2): the names are not enumerated, a
 // read goes to the live environment -- so it follows a chdir -- an assignment

@@ -89,6 +89,10 @@ pub use child_win as child_extra;
 /// backs `child_process` or `cluster` goes through it.
 #[cfg(windows)]
 mod job_win;
+/// libuv's stat, access, chmod and directory-listing questions of a Windows
+/// path, where std asks others (device paths, link loops).
+#[cfg(windows)]
+mod win_fs;
 
 pub type OpId = u64;
 
@@ -3003,11 +3007,14 @@ impl OpenFlags {
     ///
     /// - the open's `mode`: libuv adds FILE_ATTRIBUTE_READONLY for a creating
     ///   open whose mode lacks the owner's write bit (#324);
-    /// - UV_FS_O_FILEMAP is accepted and ignored. libuv opens such a file
-    ///   read-write, without the append swap, and does its reads and writes
-    ///   through a mapping, emulating append and the access mode there; here
-    ///   it is an ordinary handle, which differs only together with O_APPEND
-    ///   or O_DIRECT (docs/node-divergences.md).
+    /// - UV_FS_O_FILEMAP opens as libuv opens it -- a write-only open asks
+    ///   read access too, and a handle without standard information (a
+    ///   console, the pipe namespace) fails the open -- but no mapping is
+    ///   made: libuv does its reads and writes through one, emulating append
+    ///   and the access mode there, and opens an append-mode file read-write
+    ///   without the append swap; here it is an ordinary handle, which
+    ///   differs only together with O_APPEND or O_DIRECT
+    ///   (docs/node-divergences.md).
     #[cfg(windows)]
     pub fn open_with_mode(
         self,
@@ -3033,6 +3040,10 @@ impl OpenFlags {
 
         let mut access = match bits & (o_flag::WRONLY | o_flag::RDWR) {
             o_flag::RDONLY => FILE_GENERIC_READ,
+            // A mapping is always read: libuv opens a write-only
+            // UV_FS_O_FILEMAP file read-write (a console then refuses the
+            // open EINVAL, as it refuses any read-write open).
+            o_flag::WRONLY if has(o_flag::FILEMAP) => FILE_GENERIC_READ | FILE_GENERIC_WRITE,
             o_flag::WRONLY => FILE_GENERIC_WRITE,
             o_flag::RDWR => FILE_GENERIC_READ | FILE_GENERIC_WRITE,
             _ => return Err(invalid()),
@@ -3128,7 +3139,15 @@ impl OpenFlags {
         // the one ownership of it. It was not opened FILE_FLAG_OVERLAPPED, which
         // is what File's synchronous reads and writes need.
         let file = unsafe { std::fs::File::from_raw_handle(handle) };
-        as_the_crt_takes_it(file)
+        let file = as_the_crt_takes_it(file)?;
+        // libuv sizes a UV_FS_O_FILEMAP file for its mapping by asking its
+        // standard information, and fails the open with that call's error:
+        // a console has none (ERROR_INVALID_FUNCTION, EISDIR), the pipe
+        // namespace refuses it (ERROR_INVALID_PARAMETER, EINVAL).
+        if has(o_flag::FILEMAP) {
+            ops::file_info::<windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO>(&file)?;
+        }
+        Ok(file)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -3852,9 +3871,16 @@ pub fn make_dir(
             });
             error
         };
-        match std::fs::metadata(&next) {
+        // The stat node's (libuv's) would make: on Windows a path that goes
+        // on past a looping link is ENOENT there, where std's says ELOOP.
+        let is_dir = std::fs::metadata(&next).map(|meta| meta.is_dir());
+        #[cfg(windows)]
+        let is_dir = is_dir.or_else(|failed| {
+            ops::as_libuv_stats(&next, false, failed).map(|stat| stat.kind() == ops::EntryKind::Dir)
+        });
+        match is_dir {
             // Already a directory: nothing to make here.
-            Ok(meta) if meta.is_dir() => {}
+            Ok(true) => {}
             Ok(_) => return Err(fail(in_the_way(component), &next)),
             Err(_) if asynchronous && component => return Err(fail(in_the_way(true), &next)),
             Err(stat) => return Err(fail(stat, &next)),
@@ -4704,17 +4730,35 @@ pub fn fd_error_code(error: &std::io::Error) -> &'static str {
 ///
 /// The message names the path as `path.shown()` reports it, and so must the
 /// caller's `path` property.
+///
+/// On Windows it is libuv's fs__access: the path's own attributes
+/// (GetFileAttributesW, which does not follow a link -- a dangling one is
+/// accessible), and W_OK refused only for a read-only FILE (directories
+/// cannot be read-only on Windows, libuv says).
 pub fn check_access(path: &FsPath, mode: i32) -> Result<(), (String, String, Option<i32>)> {
     let shown = path.shown();
-    let meta = std::fs::metadata(path).map_err(|e| {
+    let failed = |e: std::io::Error| {
         let code = node_error_code(&e);
         (
             code.to_string(),
             node_error_message(code, "access", &shown, &e),
             node_errno(code, &e),
         )
-    })?;
-    if mode & 2 != 0 && meta.permissions().readonly() {
+    };
+    #[cfg(windows)]
+    let read_only = {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
+        };
+        let attributes = win_fs::file_attributes(path.os()).map_err(failed)?;
+        attributes & FILE_ATTRIBUTE_READONLY != 0 && attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+    };
+    #[cfg(not(windows))]
+    let read_only = std::fs::metadata(path)
+        .map_err(failed)?
+        .permissions()
+        .readonly();
+    if mode & 2 != 0 && read_only {
         let code = if cfg!(windows) { "EPERM" } else { "EACCES" };
         return Err((
             code.to_string(),
@@ -4725,6 +4769,28 @@ pub fn check_access(path: &FsPath, mode: i32) -> Result<(), (String, String, Opt
         ));
     }
     Ok(())
+}
+
+/// node's `fs.chmod` of a path. On Windows it is libuv's (the CRT's
+/// _wchmod): only the read-only attribute, set or cleared by the owner's
+/// write bit, on the path's own attributes -- a link's, not its target's
+/// (`win_fs::chmod`).
+pub fn chmod_path(path: &FsPath, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(windows)]
+    {
+        win_fs::chmod(path.os(), mode)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_readonly(mode & 0o200 == 0);
+        std::fs::set_permissions(path, perms)
+    }
 }
 
 /// unlink as libuv's: a file, or on Windows a directory symlink or junction
@@ -5884,7 +5950,10 @@ pub mod ops {
     /// DIRECTORY (which needs BACKUP_SEMANTICS) or a symlink itself rather than
     /// its target (OPEN_REPARSE_POINT).
     #[cfg(windows)]
-    fn open_for_stat(path: &str, keep_reparse_point: bool) -> std::io::Result<std::fs::File> {
+    pub(crate) fn open_for_stat(
+        path: &str,
+        keep_reparse_point: bool,
+    ) -> std::io::Result<std::fs::File> {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
@@ -5907,6 +5976,57 @@ pub mod ops {
     ///
     /// Blocking; async callers must run it on a blocking thread.
     pub fn stat_path_record(path: &str, lstat: bool) -> std::io::Result<StatRecord> {
+        #[cfg(windows)]
+        return stat_path_record_std(path, lstat)
+            .or_else(|failed| as_libuv_stats(path, lstat, failed));
+        #[cfg(not(windows))]
+        stat_path_record_std(path, lstat)
+    }
+
+    /// What libuv's stat makes of a path std could not stat
+    /// (`win_fs::stat_verdict`): NUL's fixed shape, libuv's own error, or
+    /// std's. Not asked when std found nothing there -- the answer libuv
+    /// gives such a path as it is, and the one an existence probe meets
+    /// most -- so a missing path costs no more than it did.
+    #[cfg(windows)]
+    pub(crate) fn as_libuv_stats(
+        path: &str,
+        lstat: bool,
+        failed: std::io::Error,
+    ) -> std::io::Result<StatRecord> {
+        use crate::win_fs::{StatVerdict, stat_verdict};
+        use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+        if failed.raw_os_error().is_some_and(|code| {
+            code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_PATH_NOT_FOUND as i32
+        }) {
+            return Err(failed);
+        }
+        match stat_verdict(path, lstat) {
+            StatVerdict::NullDevice => Ok(null_device_record()),
+            StatVerdict::Failed(error) => Err(error),
+            StatVerdict::Unexplained => Err(failed),
+        }
+    }
+
+    /// The stat libuv gives NUL, by path or by descriptor
+    /// (`fs__stat_assign_statbuf_null`, node v22.22.2): a character device,
+    /// mode 0o20666, nlink 1, blksize 4096, rdev FILE_DEVICE_NULL << 16,
+    /// every other number and every time 0.
+    #[cfg(windows)]
+    fn null_device_record() -> StatRecord {
+        let rdev = u64::from(crate::win_fs::FILE_DEVICE_NULL) << 16;
+        // dev, nlink, uid, gid, rdev, blksize, ino, blocks.
+        StatRecord::new(
+            EntryKind::File,
+            0o020666,
+            0,
+            Some([0, 1, 0, 0, rdev, 4096, 0, 0]),
+            [Timespec::default(); 4],
+            None,
+        )
+    }
+
+    fn stat_path_record_std(path: &str, lstat: bool) -> std::io::Result<StatRecord> {
         // On Windows a plain stat reads EVERYTHING off one handle. Calling
         // std::fs::metadata first and then opening again for dev/ino/blocks
         // meant two opens per stat -- measured at 2x the cost -- because
@@ -6318,13 +6438,14 @@ pub mod ops {
         }
     }
 
-    /// fs__scandir's open of `path` and its first question of what opened:
-    /// the open's own failure; `ENOTDIR` for what answers and is no
-    /// directory, and for what answers ERROR_INVALID_PARAMETER (libuv reads
-    /// its directory query's STATUS_INVALID_PARAMETER so: the pipe
-    /// namespace, `\\.\pipe`); what any other handle says when it cannot
-    /// answer (a device: `\\.\NUL` is ERROR_INVALID_FUNCTION, the table's
-    /// `EISDIR`, which is what node reports); and nothing for a directory.
+    /// fs__scandir's open of `path` and its first question of what opened,
+    /// the directory query itself (`win_fs::directory_query`): the open's
+    /// own failure; `ENOTDIR` for what the query refuses
+    /// STATUS_INVALID_PARAMETER (a file, the pipe namespace `\\.\pipe`);
+    /// what any other handle says when it cannot answer (a device: `\\.\NUL`
+    /// and KsecDD are STATUS_INVALID_DEVICE_REQUEST, ERROR_INVALID_FUNCTION,
+    /// the table's `EISDIR`, which is what node reports); and nothing for a
+    /// directory.
     #[cfg(windows)]
     fn scandir_open(path: &str) -> std::io::Result<()> {
         use std::os::windows::fs::OpenOptionsExt;
@@ -6335,16 +6456,7 @@ pub mod ops {
         let mut options = std::fs::OpenOptions::new();
         options.access_mode(FILE_LIST_DIRECTORY | SYNCHRONIZE);
         let opened = super::opens_as_libuv(&mut options).open(path)?;
-        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
-        let not_a_directory = || std::io::Error::from(std::io::ErrorKind::NotADirectory);
-        match opened.metadata() {
-            Ok(meta) if meta.is_dir() => Ok(()),
-            Ok(_) => Err(not_a_directory()),
-            Err(asked) if asked.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => {
-                Err(not_a_directory())
-            }
-            Err(asked) => Err(asked),
-        }
+        crate::win_fs::directory_query(&opened)
     }
 
     /// A path std lists that libuv's scandir refuses (#332): a prefix with
@@ -6591,20 +6703,20 @@ pub mod ops {
             // FILE_DEVICE_* from winioctl.h.
             const FILE_DEVICE_CONSOLE: u64 = 0x50;
             const FILE_DEVICE_NAMED_PIPE: u64 = 0x11;
-            const FILE_DEVICE_NULL: u64 = 0x15;
             let handle = file.as_raw_handle();
             let device = match crate::child_win::file_type(handle) {
                 FILE_TYPE_CHAR if file.is_terminal() => {
-                    Some((0o020000, FILE_DEVICE_CONSOLE, handle as u64, 0))
+                    Some((0o020000, FILE_DEVICE_CONSOLE, handle as u64))
                 }
+                // NUL: the shape a path stat gives it too.
                 FILE_TYPE_CHAR => {
                     standard_info(file)?;
-                    Some((0o020666, FILE_DEVICE_NULL, 0, 4096))
+                    return Ok(null_device_record());
                 }
-                FILE_TYPE_PIPE => Some((0o010000, FILE_DEVICE_NAMED_PIPE, handle as u64, 0)),
+                FILE_TYPE_PIPE => Some((0o010000, FILE_DEVICE_NAMED_PIPE, handle as u64)),
                 _ => None,
             };
-            if let Some((mode, device_type, ino, blksize)) = device {
+            if let Some((mode, device_type, ino)) = device {
                 let rdev = device_type << 16;
                 // dev, nlink, uid, gid, rdev, blksize, ino, blocks; every
                 // time 0.
@@ -6612,7 +6724,7 @@ pub mod ops {
                     EntryKind::File,
                     mode,
                     0,
-                    Some([0, 1, 0, 0, rdev, blksize, ino, 0]),
+                    Some([0, 1, 0, 0, rdev, 0, ino, 0]),
                     [Timespec::default(); 4],
                     None,
                 ));
@@ -6810,29 +6922,13 @@ pub mod ops {
     }
 
     pub async fn fs_chmod(path: super::FsPath, mode: u32) -> OpOutcome {
-        #[cfg(unix)]
+        let owned = path.clone();
+        match tokio::task::spawn_blocking(move || super::chmod_path(&owned, mode))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
         {
-            use std::os::unix::fs::PermissionsExt;
-            match tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).await {
-                Ok(()) => OpOutcome::Done,
-                Err(e) => node_fail(e, "chmod", &path),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = mode;
-            let readonly = mode & 0o200 == 0;
-            match tokio::fs::metadata(&path).await {
-                Ok(meta) => {
-                    let mut perms = meta.permissions();
-                    perms.set_readonly(readonly);
-                    match tokio::fs::set_permissions(&path, perms).await {
-                        Ok(()) => OpOutcome::Done,
-                        Err(e) => node_fail(e, "chmod", &path),
-                    }
-                }
-                Err(e) => node_fail(e, "chmod", &path),
-            }
+            Ok(()) => OpOutcome::Done,
+            Err(e) => node_fail(e, "chmod", &path),
         }
     }
 

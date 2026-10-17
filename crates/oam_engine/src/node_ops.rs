@@ -8537,26 +8537,8 @@ fn op_fs_chmod_sync(
         return;
     };
     let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)) {
-            throw_node_error(scope, "chmod", &path, &e);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = mode;
-        match std::fs::metadata(&path) {
-            Ok(meta) => {
-                let mut perms = meta.permissions();
-                perms.set_readonly(mode & 0o200 == 0);
-                if let Err(e) = std::fs::set_permissions(&path, perms) {
-                    throw_node_error(scope, "chmod", &path, &e);
-                }
-            }
-            Err(e) => throw_node_error(scope, "chmod", &path, &e),
-        }
+    if let Err(e) = oam_core::chmod_path(&path, mode) {
+        throw_node_error(scope, "chmod", &path, &e);
     }
 }
 
