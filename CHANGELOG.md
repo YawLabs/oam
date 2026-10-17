@@ -580,6 +580,42 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   name, in `module.builtinModules` too) are there; `crypto.Hash` and `crypto.Hmac` construct, with
   or without `new`, and warn DEP0179 / DEP0181. `createHash` / `createHmac` throw node's
   `ERR_INVALID_ARG_TYPE` for a non-string algorithm (#368).
+- **A BYOB read fills at most the view it is given, as node's does (#372).** `getReader({ mode:
+  "byob" })` ignored the mode and returned a default reader, so `read(new Uint8Array(2))` of a
+  3-byte chunk handed back all 3 bytes. A byte stream now has node's BYOB reader: `read(view, {
+  min })` transfers the view's buffer and fills it from the queue -- at most the view, across
+  chunks, the rest left for the next read -- or waits for the source, which can answer through
+  `controller.byobRequest` (`respond()`, `respondWithNewView()`); `tee()` of a byte stream gives
+  two byte streams and a copy of each chunk to the second branch, as node's does. A `Blob`'s
+  stream, a `fetch` body and `FileHandle.readableWebStream()` read the same way.
+- **`fs.openAsBlob` gives a file-backed Blob that is read only when it is (#373).** It read the
+  whole file into memory at the call. The Blob now holds the path and the size and mtime the
+  open's fstat gave; each read opens the file then and fails `NotReadableError` once the file has
+  changed, as node's does, and so do slices of it, Blobs made of it and `Response`, `Request` and
+  `FormData` bodies (a `fetch` sends them with their content-length, and fails once the file
+  changed). A large file costs no memory until it is read.
+- **`fs.openAsBlob` checks its arguments and opens the file at the call (#374).** It checked the
+  options and the path asynchronously and turned every failure into `ERR_INVALID_ARG_VALUE`. Bad
+  options, a bad type, a bad path and a missing file now throw at the call, as node's do, and a
+  `--permission` denial is node's `ERR_ACCESS_DENIED`. `openAsBlob` of `\\.\NUL` is a 0-byte
+  Blob on Windows (#383).
+- **`Blob` matches node's in its parts, slices, types and clones (#375).** `stream()` gives one
+  chunk per part (a file in 64 KiB chunks) rather than the whole Blob at once; `slice()` converts
+  its arguments as node does (`slice(NaN, Infinity)` is empty) and an omitted content type is
+  `""`, not the Blob's; the constructor validates `sources` and `options` and honours `endings`;
+  `structuredClone` of a Blob gives a working Blob (it gave a broken one), and of `fs.openAsBlob`'s
+  Blob throws with `code: "ERR_INVALID_STATE"`; `util.inspect` shows `Blob { size, type }` (and a
+  File's name and lastModified) rather than `Blob {}`. A chunk read from a `Response` body made from
+  bytes or a Blob is the reader's own copy, so writing to it no longer changes the Blob or a
+  `clone()`.
+- **`util.inspect` of a `ReadableStream` is node's summary.** It printed every internal field of
+  the stream; it is now `ReadableStream { locked, state, supportsBYOB }`, as node's is, and so is
+  the stream in the message of `getReader({ mode: "byob" })`'s "must be a byte stream" error.
+- **A `--permission` denial's message names the flag that grants it.** `ERR_ACCESS_DENIED` said
+  only "Access to this API has been restricted"; it now goes on, as node's does, "Use
+  --allow-fs-read to manage permissions." with the flag of the denied scope (`--allow-fs-write`,
+  `--allow-child-process`, `--allow-worker`, ...). oam's own net and environment scopes name
+  `--allow-net` and `--allow-env`.
 
 ### Performance
 

@@ -14184,17 +14184,14 @@
       // warning text carries node's own typo ("steam"), reproduced here so
       // a caller matching on it sees the same bytes.
       //
-      // DIVERGENCE, deliberate, and the only one: node's stream is a BYTE
-      // stream (`type: 'bytes'`, autoAllocateChunkSize 16384), so
-      // `getReader({ mode: 'byob' })` there returns a real
-      // ReadableStreamBYOBReader. oam's web-streams layer (js/streams.js)
-      // is default-reader-only -- a `type: 'bytes'` stream queues bytes
-      // and pulls as node's does, but has no byobRequest -- so this
-      // returns a stream read through a default reader, carrying the same 16 KiB
-      // plain-Uint8Array chunks, at the same boundaries, off the same read
-      // path. Everything reachable through a default reader or async
-      // iteration matches node; a BYOB reader does not. The fix belongs in
-      // js/streams.js's controller, not in a second reader here.
+      // node's stream is a BYTE stream (`type: 'bytes'`,
+      // autoAllocateChunkSize 16384) whose pull reads into
+      // controller.byobRequest.view and answers respond(bytesRead). A BYOB
+      // read does exactly that here (js/streams.js has the byobRequest). A
+      // default read has no byobRequest in oam -- autoAllocateChunkSize is
+      // not implemented -- so it reads a 16 KiB view of its own and enqueues
+      // it: the same plain-Uint8Array chunks, at the same boundaries, off
+      // the same read path.
       readableWebStream(options = undefined) {
         const fh = this, h = this[kNative];
         if (fh[kFd] === -1) throw codes.ERR_INVALID_STATE("The FileHandle is closed");
@@ -14247,7 +14244,25 @@
             // chunk is dropped, exactly as a cancel drops it).
             if (gone()) {
               controller.close();
+              // A BYOB read waiting is done (a closed byte stream answers
+              // a pending one only through respond(0)).
+              controller.byobRequest?.respond(0);
               await ondone();
+              return;
+            }
+            var request = controller.byobRequest;
+            if (request !== null) {
+              // node's pull, as it is: the view's own byteOffset passed as
+              // the offset into the view.
+              var target = request.view;
+              var got = await fh.read(target, target.byteOffset, target.byteLength);
+              if (gone() || got.bytesRead === 0) {
+                controller.close();
+                await ondone();
+                controller.byobRequest?.respond(0);
+                return;
+              }
+              controller.byobRequest.respond(got.bytesRead);
               return;
             }
             var view = new Uint8Array(CHUNK);
@@ -16336,67 +16351,156 @@
 
     // ---- openAsBlob
     //
-    // Shapes measured against node v22.22.2 rather than inferred:
-    //   - `options.type` is coerced with `|| ''` BEFORE the string check, so
+    // node's openAsBlob (lib/fs.js + src/node_blob.cc, v22.22.2), measured:
+    //   - everything happens at the call, so every failure THROWS there
+    //     rather than rejecting the promise it returns: the options are
+    //     validated (an object: not null, an array or a function), then
+    //     `options.type` -- coerced with `|| ''` BEFORE the string check, so
     //     {type: 0 | false | null | NaN | undefined} all yield "" and only a
-    //     truthy non-string (e.g. 123) throws ERR_INVALID_ARG_TYPE. node's own
-    //     source is `const type = options.type || ''; validateString(...)`.
-    //   - an unreadable path does NOT surface the fs error. node throws a
-    //     TypeError with code ERR_INVALID_ARG_VALUE, message "Unable to open
-    //     file as blob", and `code` as its ONLY own property -- no errno, no
-    //     syscall, no path.
-    //   - the arguments are checked SYNCHRONOUSLY -- node's openAsBlob is a
-    //     plain function returning a promise, so a bad type or path throws
-    //     at the call.
-    fs.openAsBlob = (p, options) => {
-      const type = (options && options.type) || "";
+    //     truthy non-string throws -- then the path, then the file is opened
+    //     and fstat'ed (and closed again).
+    //   - a path it cannot open does NOT surface the fs error: a TypeError
+    //     with code ERR_INVALID_ARG_VALUE, message "Unable to open file as
+    //     blob", and `code` as its ONLY own property -- no errno, no syscall,
+    //     no path. Except a --permission denial, which keeps its own
+    //     ERR_ACCESS_DENIED.
+    //   - the Blob is file-backed: nothing is read at the call. Each read
+    //     opens the file again, and every chunk read (64 KiB) is preceded by
+    //     an fstat that must give the size, and the NANOSECOND part of the
+    //     mtime, the open's fstat gave -- that is node's FdEntry
+    //     CheckModified, which compares st_size and st_mtim.tv_nsec only --
+    //     or the read fails NotReadableError. A directory (#335) is the same
+    //     model: its open and fstat succeed, so a Blob of the size the fstat
+    //     says is made (0 on Windows, the directory's own size on Linux and
+    //     macOS), a non-empty one fails as reading a directory does, and a
+    //     changed one fails the check. The NUL device is a Blob of no bytes.
+    //   - the type is the given string, not normalized.
+    fs.openAsBlob = (p, options = {}) => {
+      if (options === null || typeof options !== "object" || Array.isArray(options)) {
+        throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+      }
+      const type = options.type || "";
       if (typeof type !== "string") {
         throw codes.ERR_INVALID_ARG_TYPE("options.type", "string", type);
       }
-      return openAsBlobPath(toPath(p), type);
+      const file = toPath(p);
+      return Promise.resolve(openAsBlobPath(file, type));
     };
-    // What node's openAsBlob gives for a directory (#335): its open and fstat
-    // succeed, so the Blob is made, with the size the fstat says -- 0 on
-    // Windows, the directory's own size on Linux and macOS -- and reading a
-    // non-empty one fails NotReadableError, as reading a directory does. The
-    // Blob class carries that state (`_unreadableSize`), so a Blob, a body or
-    // a form made with this one as a part fails the same way. A size of 0
-    // has nothing to read, so on Windows it reads as empty.
-    const directoryBlob = (size, type) => {
-      const blob = new Blob([], { type });
-      if (size > 0) blob._unreadableSize = size;
-      return markFileBacked(blob);
+    const unableToOpenAsBlob = () => {
+      const err = new TypeError("Unable to open file as blob");
+      err.code = "ERR_INVALID_ARG_VALUE";
+      return err;
     };
-    const markFileBacked = (blob) => {
-      // node returns an instance of an INTERNAL TransferableBlob subclass and
-      // plants an own `constructor` back-pointing at Blob so the subclass does
-      // not leak through `b.constructor.name`. Measured descriptor:
-      // {value: Blob, writable: true, enumerable: true, configurable: true} --
-      // enumerable, so `Object.keys(blob)` is ["constructor"], which a
-      // structural comparison would otherwise see as a difference. A plain
-      // assignment produces exactly that descriptor.
-      blob.constructor = Blob;
-      // Marks it un-structuredClone-able, which node's file-backed blob is.
-      // A registered symbol so bootstrap.js's cloner can see it across scopes,
-      // and a symbol key so it stays out of Object.keys.
+    const openAsBlobPath = (file, type) => {
+      const flags = openFlags("r", natives);
+      let fd;
+      try {
+        fd = natives.fsOpenSync(file, flags, 0o666);
+      } catch (e) {
+        if (e && e.code === "ERR_ACCESS_DENIED") throw e;
+        // Deliberately swallowing the underlying error: node reports none of
+        // it, and leaking ENOENT here would be a divergence, not a courtesy.
+        throw unableToOpenAsBlob();
+      }
+      let size;
+      let reference;
+      try {
+        natives.fsFstatSync(fd, statSyncValues);
+        size = statSyncValues[STAT_SIZE];
+        reference = blobFileReference(statSyncExact);
+      } catch {
+        throw unableToOpenAsBlob();
+      } finally {
+        natives.fsCloseSync(fd);
+      }
+      const blob = globalThis.Blob[Symbol.for("oam.blob.fromFile")](blobFile(file, flags, reference), size, type);
+      // Marks it un-structuredClone-able, which node's file-backed blob is
+      // (the one openAsBlob returns; a slice of it, or a Blob made of it,
+      // clones). A registered symbol so bootstrap.js's cloner can see it
+      // across scopes, and a symbol key so it stays out of Object.keys (which
+      // is ["constructor"], as node's createBlob makes it).
       blob[Symbol.for("oam.blob.fileBacked")] = true;
       return blob;
     };
-    const openAsBlobPath = async (file, type) => {
-      let bytes;
-      try {
-        const raw = await natives.fsStat(file, false);
-        if (statKind(raw) === "dir") return directoryBlob(Number(raw[STAT_SIZE]), type);
-        bytes = await natives.fsReadFile(file);
-      } catch {
-        // Deliberately swallowing the underlying error: node reports none of
-        // it, and leaking ENOENT here would be a divergence, not a courtesy.
-        const err = new TypeError("Unable to open file as blob");
-        err.code = "ERR_INVALID_ARG_VALUE";
-        throw err;
-      }
-      return markFileBacked(new Blob([bytes], { type }));
+    // What a later fstat must match: the size and the mtime's nanoseconds.
+    const blobFileReference = (exact) => ({ size: exact[8], mtimeNsec: exact[13] });
+    const blobFileUnchanged = (record, reference) => {
+      const exact = statExactValues(record);
+      return exact[8] === reference.size && exact[13] === reference.mtimeNsec;
     };
+    // A descriptor a reader still held when it was dropped unfinished (a
+    // stream nobody read to the end) is closed when the reader is collected.
+    // Made on first use, so a context that never reads one has none.
+    let blobFileFinalizerRegistry;
+    const blobFileFinalizer = () =>
+      (blobFileFinalizerRegistry ??= new FinalizationRegistry((held) => {
+        if (held.fd !== undefined) natives.fsClose(held.fd);
+      }));
+    // The file part's source (bootstrap.js's Blob): open(start, end) gives a
+    // reader of [start, end) whose pull(cb) calls back cb(1, chunk), cb(0) at
+    // the end or cb(-1) on any failure, as node's FdEntry reader does.
+    const blobFile = (file, flags, reference) => ({
+      open(start, end) {
+        const held = { fd: undefined };
+        let position = start;
+        let done = false;
+        const finish = () => {
+          done = true;
+          if (held.fd !== undefined) {
+            natives.fsClose(held.fd);
+            held.fd = undefined;
+          }
+          blobFileFinalizer().unregister(held);
+        };
+        const step = async () => {
+          if (held.fd === undefined) {
+            const info = await natives.fsOpen(file, flags, 0o666);
+            // A cancel that landed while the open was in flight found no fd
+            // to close: close this one here, or it stays open until GC.
+            if (done) {
+              natives.fsClose(info.handle);
+              return 0;
+            }
+            held.fd = info.handle;
+            blobFileFinalizer().register(reader, held, held);
+          }
+          if (!blobFileUnchanged(await natives.fsFstat(held.fd), reference)) return -1;
+          if (position >= end) return 0;
+          const chunk = await natives.fsReadChunk(held.fd, Math.min(65536, end - position), position);
+          if (chunk === undefined || chunk.length === 0) return 0;
+          position += chunk.length;
+          return chunk;
+        };
+        const reader = {
+          pull(cb) {
+            if (done) {
+              cb(-1);
+              return;
+            }
+            step().then(
+              (result) => {
+                if (done) return;
+                if (result === 0 || result === -1) {
+                  finish();
+                  cb(result);
+                } else {
+                  cb(1, result);
+                }
+              },
+              () => {
+                if (done) return;
+                finish();
+                cb(-1);
+              },
+            );
+          },
+          cancel() {
+            finish();
+          },
+        };
+        return reader;
+      },
+    });
 
     // The `.native` forms are the OS realpath: node type-checks their path
     // (getValidatedPath) and reports `realpath` with the whole path.

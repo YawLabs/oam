@@ -6264,6 +6264,55 @@ cl-late-end-silent finalized=false"##;
     );
 }
 
+/// A reader of an `fs.openAsBlob` Blob that is cancelled while its first
+/// open is still in flight closes the descriptor that open brings back. It
+/// used to keep it: cancel ran while there was no fd yet, the open then
+/// landed and stored one, and nothing closed it until the reader was
+/// collected. The check looks at file descriptors alone, not the process's
+/// whole handle count: 300 cancels can grow tokio's blocking pool by up to a
+/// thread per in-flight open, which idles out on its own and is no leak. On
+/// Windows an open file keeps its directory from being renamed, so the
+/// directory must become renamable; elsewhere the /dev/fd entries must come
+/// back to their count before the loop. Either is polled for up to 5 s, the
+/// time the in-flight opens need to land and close.
+#[test]
+fn open_as_blob_cancel_during_open_closes_the_fd() {
+    let stdout = run_ok(
+        "open_as_blob_cancel_fd.mjs",
+        "import fs from 'node:fs';\n\
+         import os from 'node:os';\n\
+         import path from 'node:path';\n\
+         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-blob-cancel-'));\n\
+         const file = path.join(dir, 'a.bin');\n\
+         fs.writeFileSync(file, Buffer.alloc(1000, 1));\n\
+         const blob = await fs.openAsBlob(file);\n\
+         const fds = () => fs.readdirSync('/dev/fd').length;\n\
+         const before = process.platform === 'win32' ? 0 : fds();\n\
+         let moved = dir;\n\
+         const closed = () => {\n\
+           if (process.platform !== 'win32') return fds() <= before;\n\
+           try { fs.renameSync(dir, dir + '-moved'); moved = dir + '-moved'; return true; }\n\
+           catch { return false; }\n\
+         };\n\
+         for (let i = 0; i < 300; i++) {\n\
+           const stream = blob.stream();\n\
+           await new Promise((r) => setImmediate(r));\n\
+           const reader = stream.getReader();\n\
+           const read = reader.read().catch(() => {});\n\
+           await reader.cancel();\n\
+           await read;\n\
+         }\n\
+         let ok = false;\n\
+         for (let t = 0; t < 100 && !(ok = closed()); t++) await new Promise((r) => setTimeout(r, 50));\n\
+         console.log('fds closed:', ok ? 'ok' : 'leaked');\n\
+         fs.rmSync(moved, { recursive: true });\n",
+    );
+    assert!(
+        stdout.contains("fds closed: ok"),
+        "a cancel during the first open must close the fd it brings back: {stdout}"
+    );
+}
+
 /// `fetch()` sends a Blob or File as its bytes, with its `type` as the
 /// Content-Type unless the caller set one or it is empty; a URLSearchParams
 /// as its serialization, `application/x-www-form-urlencoded;charset=UTF-8`
@@ -11956,7 +12005,7 @@ console.log(lines.join('\n'));
     let granted = "--allow-net=127.0.0.1,granted.invalid";
     let (stdout, stderr, inner_seen, inner6_seen, (inner, inner6)) =
         run(&["--permission", granted], "full");
-    let denied = "Error|Access to this API has been restricted|code,permission,resource";
+    let denied = "Error|Access to this API has been restricted. Use --allow-net to manage permissions.|code,permission,resource";
     // A refusal names the hop's `host:port`, as net.connect's does.
     assert_eq!(
         stdout,

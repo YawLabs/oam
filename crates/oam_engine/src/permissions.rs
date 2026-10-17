@@ -972,12 +972,29 @@ pub struct PermissionDenial {
     pub resource: String,
 }
 
-/// Node's message for `ERR_ACCESS_DENIED`.
-pub const ACCESS_DENIED_MESSAGE: &str = "Access to this API has been restricted";
+/// Node's message for `ERR_ACCESS_DENIED` of `permission`: its sentence,
+/// then the flag that grants the scope (node's CreateAccessDeniedError and
+/// its per-scope flag table), or nothing after the sentence's trailing space
+/// for a scope with no flag. `Net` and `Environment` are oam's own scopes, so
+/// they name oam's own flags in node's form.
+pub fn access_denied_message(permission: &str) -> String {
+    let flag = match permission {
+        "FileSystemRead" => "--allow-fs-read",
+        "FileSystemWrite" => "--allow-fs-write",
+        "ChildProcess" => "--allow-child-process",
+        "WorkerThreads" => "--allow-worker",
+        "WASI" => "--allow-wasi",
+        "Addon" => "--allow-addons",
+        "Net" => "--allow-net",
+        "Environment" => "--allow-env",
+        _ => return "Access to this API has been restricted. ".to_string(),
+    };
+    format!("Access to this API has been restricted. Use {flag} to manage permissions.")
+}
 
 impl std::fmt::Display for PermissionDenial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(ACCESS_DENIED_MESSAGE)
+        f.write_str(&access_denied_message(self.permission))
     }
 }
 
@@ -2200,7 +2217,41 @@ mod tests {
         let denial = p.check_read("/etc/passwd").unwrap_err();
         assert_eq!(denial.permission, "FileSystemRead");
         assert_eq!(denial.resource, "/etc/passwd");
-        assert_eq!(denial.to_string(), "Access to this API has been restricted");
+        assert_eq!(
+            denial.to_string(),
+            "Access to this API has been restricted. Use --allow-fs-read to manage permissions."
+        );
+    }
+
+    /// The message names the flag that grants the permission, as node
+    /// v22.22.2's does (measured for each of node's scopes); a scope with no
+    /// flag keeps node's bare sentence and its trailing space. `Net` and
+    /// `Environment` are oam's own scopes and name oam's own flags.
+    #[test]
+    fn denial_message_names_the_granting_flag() {
+        for (permission, flag) in [
+            ("FileSystemRead", Some("--allow-fs-read")),
+            ("FileSystemWrite", Some("--allow-fs-write")),
+            ("ChildProcess", Some("--allow-child-process")),
+            ("WorkerThreads", Some("--allow-worker")),
+            ("WASI", Some("--allow-wasi")),
+            ("Addon", Some("--allow-addons")),
+            ("Net", Some("--allow-net")),
+            ("Environment", Some("--allow-env")),
+            ("Inspector", None),
+        ] {
+            let denial = PermissionDenial {
+                permission,
+                resource: String::new(),
+            };
+            let expected = match flag {
+                Some(flag) => format!(
+                    "Access to this API has been restricted. Use {flag} to manage permissions."
+                ),
+                None => "Access to this API has been restricted. ".to_string(),
+            };
+            assert_eq!(denial.to_string(), expected, "{permission}");
+        }
     }
 
     // ------------------------------------------- fs keys: case, anchoring
