@@ -7,9 +7,9 @@
 // one of those two values (exit 9 otherwise), and execArgv hands it back as
 // given.
 //
-// Only the warning's own lines are compared: node's stderr also carries its
-// one-time `--trace-warnings` hint, which oam does not print (oam has no
-// such flag; docs/node-divergences.md).
+// Only the warning's own lines are compared: the one-time `--trace-warnings`
+// hint that follows them names the program (`node` / `oam`), and is case
+// 406's to compare.
 //
 // Regression guard: require() of an ES module threw ERR_REQUIRE_ESM, and the
 // flag was refused as unknown.

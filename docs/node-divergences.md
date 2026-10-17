@@ -826,8 +826,7 @@ oam emits Node's `MODULE_TYPELESS_PACKAGE_JSON` warning, once per `package.json`
 and not for a file under `node_modules`, a `require()`, or a file with no `package.json`.
 Conformance cases 462-465 pin the shapes byte for byte against Node.
 
-What still differs: `require()` of such a file that has module syntax throws
-`ERR_REQUIRE_ESM` (entry 9). A typeless
+What still differs: a typeless
 `.ts`/`.tsx` is still an ES module whatever its syntax (entry 24), and a typeless `.jsx`
 outside `node_modules` too: Node runs no JSX to follow.
 
@@ -4179,14 +4178,15 @@ oam that never called it.)
 
 Per release platform (the windows row measured; the linux and darwin rows counted from their
 sections' lists, which #368 edited by hand -- `sys` moved from an absent module to a partial
-one, and five names landed -- and which are to be regenerated on those hosts before the next
+one, and five names landed -- as require() of ES modules (`Module._cache`) and zlib zstd (eight
+names) did before it, and which are to be regenerated on those hosts before the next
 release):
 
 | host | export names present | missing by name | in absent modules | modules absent |
 |---|---|---|---|---|
-| windows-aarch64 (Node v22.22.2) | 1555 / 1874 | 309 | 10 | 4 |
-| linux-x64 (Node v22.22.2), not re-measured | 1558 / 1888 | 320 | 10 | 4 |
-| darwin-arm64 (Node v22.22.2), not re-measured | 1558 / 1884 | 316 | 10 | 4 |
+| windows-aarch64 (Node v22.22.2) | 1564 / 1874 | 300 | 10 | 4 |
+| linux-x64 (Node v22.22.2), not re-measured | 1567 / 1888 | 311 | 10 | 4 |
+| darwin-arm64 (Node v22.22.2), not re-measured | 1567 / 1884 | 307 | 10 | 4 |
 
 "Present" subtracts both columns: the per-name gaps *and* the 10 export names living
 inside the 4 modules oam does not register at all (`sys`, which held 49 of them, is
@@ -4229,7 +4229,7 @@ The largest per-module gaps (counts from windows-aarch64), all tracked in that f
 |---|---|---|
 | `constants` | 54 win32 / 65 linux / 61 darwin | The legacy all-in-one table. Platform-conditional values — the `WSA*` block on Windows, `RTLD_*` on POSIX, plus `UV_DIRENT_*` and the `SSL_OP_*`/`ENGINE_METHOD_*` OpenSSL set everywhere. This module is the *entire* reason the ratchet is keyed by platform: a Windows-only baseline reports 16 phantom new gaps on Linux and 12 on darwin, every one of them here. `fs.constants` and `os.constants` are separately correct — see *Platform constant tables* above. |
 | `dns/promises` | 31 | `Resolver`, `getServers`/`setServers`, `lookupService`, `resolveTlsa`, and the `BADNAME`/`NOTFOUND`/… error-code constants. |
-| `module` | 25 | The `Module._*` loader internals (`_load`, `_resolveFilename`, `_cache`, `_extensions`), `register`, `SourceMap`/`findSourceMap`, the compile-cache API. |
+| `module` | 24 | The `Module._*` loader internals (`_load`, `_resolveFilename`, `_extensions`), `register`, `SourceMap`/`findSourceMap`, the compile-cache API. |
 | `fs` | **0** | Closed in 0.9.1–0.9.2. Ownership and fd metadata (`chown`/`fchown`/`lchown`, `fchmod`/`lchmod`), durability (`fsync`/`fdatasync`), `ftruncate`, the `utimes`/`futimes`/`lutimes` family, `readv`/`writev`, `openAsBlob`, `statfs` and `glob`/`globSync` all landed. `node:fs` now has no missing export names on any platform, and `fs/promises` none since `watch` landed after 0.19.0. |
 | `crypto` | 10 | The legacy class constructors `Cipher(iv)` and `Decipher(iv)`, `diffieHellman`, `getCipherInfo`, `randomFill`. |
 | `stream/web` | 12 | The controller/reader/writer constructors and the queuing-strategy classes — the same constructors listed in the Web globals row above. |

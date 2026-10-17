@@ -5,8 +5,8 @@
       "generatedAgainst": "v22.22.2 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1558,
-        "missing": 316,
+        "present": 1567,
+        "missing": 307,
         "absentModules": 4,
         "absentModuleExportNames": 10
       },
@@ -437,8 +437,8 @@
       "generatedAgainst": "v22.22.2 on linux-x64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1558,
-        "missing": 320,
+        "present": 1567,
+        "missing": 311,
         "absentModules": 4,
         "absentModuleExportNames": 10
       },
@@ -873,8 +873,8 @@
       "generatedAgainst": "v22.22.2 on win32-arm64",
       "counts": {
         "nodeExportNames": 1874,
-        "present": 1555,
-        "missing": 309,
+        "present": 1564,
+        "missing": 300,
         "absentModules": 4,
         "absentModuleExportNames": 10
       },
