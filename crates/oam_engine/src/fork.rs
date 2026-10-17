@@ -257,6 +257,7 @@ fn run_fork_request(rt: &mut super::JsRuntime, req: ForkRequest) -> i32 {
     if let Some(js) = crate::inherited_flags_js() {
         let _ = rt.execute_script("<flags>", js);
     }
+    rt.sync_trace_uncaught();
     if let Err(diagnostics) = rt.execute_worker(&req.script, ctx) {
         for d in &diagnostics {
             eprintln!("fork worker {}: {}", req.worker_id, d.message);

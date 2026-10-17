@@ -252,8 +252,8 @@ pub(crate) struct UncaughtLedger {
     /// Set by the queueMicrotask wrapper ([`dispatch_microtask_throw`]) just
     /// before its fatal throw reaches [`message_listener`].
     next_fatal: Option<FatalThrow>,
-    /// The throw-site frame for a `next_fatal` that a listener threw.
-    next_frame: Option<String>,
+    /// The throw site for a `next_fatal` that a listener threw.
+    next_site: ThrowSite,
     /// The listener ended a checkpoint at a fatal throw
     /// ([`host_checkpoint`] lifts the termination).
     terminated: bool,
@@ -267,9 +267,116 @@ pub(crate) struct UncaughtEntry {
     /// Already dispatched by the queueMicrotask wrapper, and fatal: the
     /// drain reports it without running the ladder a second time.
     fatal: Option<FatalThrow>,
-    /// The throw site's frame, for a listener's own throw: its report
-    /// names the listener's line, as node's does.
+    /// Where it was thrown: the source frame for a listener's own throw
+    /// (its report names the listener's line, as node's does), and the
+    /// `--trace-uncaught` stack of the throw V8 reported.
+    site: ThrowSite,
+}
+
+/// Where a reported throw happened, rendered while V8's Message for it is
+/// alive (it is gone once the TryCatch resets): node's source frame
+/// (`<file>:<line>`, the line, a caret) and, under `--trace-uncaught`, the
+/// `Thrown at:` stack.
+#[derive(Default, Clone)]
+pub(crate) struct ThrowSite {
     frame: Option<String>,
+    thrown_at: Option<String>,
+}
+
+/// [`ThrowSite`] of `message`, or an empty one without a Message.
+fn throw_site(
+    scope: &v8::PinScope<'_, '_>,
+    message: Option<v8::Local<'_, v8::Message>>,
+) -> ThrowSite {
+    match message {
+        Some(message) => ThrowSite {
+            frame: source_frame(scope, message),
+            thrown_at: thrown_at(scope, message),
+        },
+        None => ThrowSite::default(),
+    }
+}
+
+/// Isolate slot: this thread runs with `--trace-uncaught` (node keeps the
+/// flag per environment, so a worker's own `execArgv` decides its own).
+struct TraceUncaught;
+
+/// Pick up `--trace-uncaught` from the flags snippet just run on this
+/// isolate (`__oamTraceUncaught`, defined by the CLI's flags prelude), and
+/// have V8 capture the stack of an uncaught throw from now on, as node's
+/// environment does under the flag (`SetCaptureStackTraceForUncaughtExceptions`,
+/// 10 frames). Called after every flags snippet -- the main thread's, a
+/// worker's, an `oam.fork` pool isolate's -- and before any user code.
+pub(crate) fn sync_trace_uncaught(scope: &mut v8::PinScope<'_, '_>) {
+    let on = (|| {
+        let context = scope.get_current_context();
+        let global = context.global(scope);
+        let key = v8::String::new(scope, "__oamTraceUncaught")?;
+        Some(global.get(scope, key.into())?.is_true())
+    })()
+    .unwrap_or(false);
+    if on && scope.get_slot::<TraceUncaught>().is_none() {
+        scope.set_slot(TraceUncaught);
+        scope.set_capture_stack_trace_for_uncaught_exceptions(true, 10);
+    }
+}
+
+fn tracing_uncaught(scope: &v8::PinScope<'_, '_>) -> bool {
+    scope.get_slot::<TraceUncaught>().is_some()
+}
+
+/// The `Thrown at:` block of node's fatal report under `--trace-uncaught`:
+/// the frames V8 captured at the throw, as node's `FormatStackTrace`
+/// prints them -- `    at <fn> (<script>:<line>:<col>)`, or without the
+/// function name and parentheses when it has none, and an eval frame as
+/// `[eval]` and the last one printed. None without the flag, or when V8
+/// captured no trace (node then prints no block either); an empty trace is
+/// still a block, with no frames, as node's is. Positions in a transpiled
+/// file are mapped back to its source, as the report's source frame is.
+fn thrown_at(scope: &v8::PinScope<'_, '_>, message: v8::Local<'_, v8::Message>) -> Option<String> {
+    if !tracing_uncaught(scope) {
+        return None;
+    }
+    let trace = message.get_stack_trace(scope)?;
+    let mut out = String::new();
+    for i in 0..trace.get_frame_count() {
+        let Some(frame) = trace.get_frame(scope, i) else {
+            continue;
+        };
+        let function = frame
+            .get_function_name(scope)
+            .map(|name| name.to_rust_string_lossy(scope))
+            .unwrap_or_default();
+        // The script's own name, as node's FormatStackTrace takes it
+        // (GetScriptName): a `//# sourceURL=` comment renames the report's
+        // source frame but not these lines, and an eval's name is empty.
+        let script = frame
+            .get_script_name(scope)
+            .map(|name| name.to_rust_string_lossy(scope))
+            .unwrap_or_default();
+        let (mut line, mut column) = (frame.get_line_number(), frame.get_column());
+        if line > 0
+            && column > 0
+            && let Some((src_line, src_col)) =
+                oam_loader::sourcemap::lookup(&script, line as u32, column as u32 - 1)
+        {
+            (line, column) = (src_line as usize, src_col as usize + 1);
+        }
+        if frame.is_eval() {
+            if frame.get_script_id() == 0 {
+                out.push_str(&format!("    at [eval]:{line}:{column}\n"));
+            } else {
+                out.push_str(&format!("    at [eval] ({script}:{line}:{column})\n"));
+            }
+            break;
+        }
+        if function.is_empty() {
+            out.push_str(&format!("    at {script}:{line}:{column}\n"));
+        } else {
+            out.push_str(&format!("    at {function} ({script}:{line}:{column})\n"));
+        }
+    }
+    Some(out)
 }
 
 /// Why a microtask throw the wrapper already dispatched is fatal.
@@ -294,16 +401,14 @@ pub(crate) fn dispatch_microtask_throw(
     err: v8::Local<'_, v8::Value>,
 ) -> Result<bool, v8::Global<v8::Value>> {
     v8::tc_scope!(let tc, scope);
-    let (fatal, frame, outcome) = match dispatch_uncaught(tc, err) {
+    let (fatal, site, outcome) = match dispatch_uncaught(tc, err) {
         Uncaught::Handled => return Ok(true),
-        Uncaught::Fatal => (FatalThrow::NoConsumer, None, Ok(false)),
-        Uncaught::HandlerThrew { value, frame, .. } => {
-            (FatalThrow::ListenerThrew, frame, Err(value))
-        }
+        Uncaught::Fatal => (FatalThrow::NoConsumer, ThrowSite::default(), Ok(false)),
+        Uncaught::HandlerThrew { value, site, .. } => (FatalThrow::ListenerThrew, site, Err(value)),
     };
     if let Some(ledger) = tc.get_slot_mut::<UncaughtLedger>() {
         ledger.next_fatal = Some(fatal);
-        ledger.next_frame = frame;
+        ledger.next_site = site;
     }
     outcome
 }
@@ -390,10 +495,20 @@ pub(crate) unsafe extern "C" fn message_listener(
         line = src_line as usize;
     }
     let value = v8::Global::new(scope, exception);
-    let (fatal, frame) = scope
+    let (fatal, mut site) = scope
         .get_slot_mut::<UncaughtLedger>()
-        .map(|ledger| (ledger.next_fatal.take(), ledger.next_frame.take()))
+        .map(|ledger| {
+            (
+                ledger.next_fatal.take(),
+                std::mem::take(&mut ledger.next_site),
+            )
+        })
         .unwrap_or_default();
+    // A listener's own throw keeps the stack captured at it; any other
+    // throw's is this Message's.
+    if site.thrown_at.is_none() {
+        site.thrown_at = thrown_at(scope, message);
+    }
     // End the checkpoint at a fatal throw, when the host runs it with no JS
     // on the stack ([`host_checkpoint`] lifts the termination): the next
     // microtask stops at its first instruction and V8 drops the rest of the
@@ -412,7 +527,7 @@ pub(crate) unsafe extern "C" fn message_listener(
             value,
             text: format!("{file}:{line}: {text}"),
             fatal,
-            frame,
+            site,
         });
         ledger.terminated |= terminate;
     }
@@ -537,7 +652,7 @@ pub(crate) enum Uncaught {
     /// not the original, and exits 7.
     HandlerThrew {
         value: v8::Global<v8::Value>,
-        frame: Option<String>,
+        site: ThrowSite,
         message: String,
     },
 }
@@ -589,8 +704,8 @@ pub(crate) fn dispatch_uncaught_from(
                 let value = v8::Global::new(tc, e);
                 let message =
                     crate::exception_to_error(tc, "uncaughtException handler").to_string();
-                let frame = tc.message().and_then(|m| source_frame(tc, m));
-                (value, frame, message)
+                let site = throw_site(tc, tc.message());
+                (value, site, message)
             });
             tc.reset();
             // Node exits 7 when the uncaughtException handler itself throws
@@ -607,9 +722,9 @@ pub(crate) fn dispatch_uncaught_from(
                 process.set(tc, key.into(), seven)
             })();
             match thrown {
-                Some((value, frame, message)) => Uncaught::HandlerThrew {
+                Some((value, site, message)) => Uncaught::HandlerThrew {
                     value,
-                    frame,
+                    site,
                     message,
                 },
                 None => Uncaught::Fatal,
@@ -687,17 +802,23 @@ fn read_source_line(file: &str, line: u32) -> Option<String> {
 fn fatal_report(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     exception: v8::Local<'_, v8::Value>,
-    frame: Option<String>,
+    site: ThrowSite,
     fallback: &str,
 ) -> String {
     note_fatal_thrown(tc, exception, false);
     // An ESM top-level throw arrives as a rejected evaluation promise, with
     // no live Message on the scope -- rebuild one from the exception so the
-    // report still opens with Node's source frame.
-    let frame = frame.or_else(|| {
+    // report still opens with Node's source frame (and, under
+    // --trace-uncaught, the stack V8 captured with an Error).
+    let ThrowSite {
+        mut frame,
+        mut thrown_at,
+    } = site;
+    if frame.is_none() || (thrown_at.is_none() && tracing_uncaught(tc)) {
         let message = v8::Exception::create_message(tc, exception);
-        source_frame(tc, message)
-    });
+        frame = frame.or_else(|| source_frame(tc, message));
+        thrown_at = thrown_at.or_else(|| self::thrown_at(tc, message));
+    }
     let body = (|| {
         let context = tc.get_current_context();
         let global = context.global(tc);
@@ -718,22 +839,41 @@ fn fatal_report(
     // caret, and a primitive as String() renders it (a Symbol, which has
     // no string conversion, as nothing). An object is still inspected.
     // Measured on node v22.22.2; conformance case 473.
-    let (frame, body) = match frame {
+    // The primitive's String() holds with no source frame too (an ES module
+    // entry's, a queueMicrotask callback's: docs/node-divergences.md #54),
+    // where node prints it under a frame of its own.
+    let body = if exception.is_object() {
+        body
+    } else if exception.is_symbol() {
+        String::new()
+    } else {
+        exception
+            .to_string(tc)
+            .map(|s| s.to_rust_string_lossy(tc))
+            .unwrap_or(body)
+    };
+    let frame = match frame {
         Some(frame) if !exception.is_native_error() => {
-            let body = if exception.is_object() {
-                body
-            } else if exception.is_symbol() {
-                String::new()
-            } else {
-                exception
-                    .to_string(tc)
-                    .map(|s| s.to_rust_string_lossy(tc))
-                    .unwrap_or(body)
-            };
             let frame = frame.strip_suffix('\n').unwrap_or(&frame);
-            (Some(format!("\n{frame}")), body)
+            Some(format!("\n{frame}"))
         }
-        frame => (frame, body),
+        frame => frame,
+    };
+    // node's two closing notes (src/node_errors.cc ReportFatalException):
+    // under --trace-uncaught the throw's captured stack; otherwise, for a
+    // thrown primitive -- which carries no stack of its own -- the hint
+    // naming that flag, with the program as node names it,
+    // basename(argv0) without `.exe`. An object (an Error, or a plain
+    // object without a stack) gets no hint. Measured on node v22.22.2.
+    let body = match thrown_at {
+        Some(frames) => format!("{body}\nThrown at:\n{frames}"),
+        None if !tracing_uncaught(tc) && !exception.is_object() => {
+            let program = program_name(tc);
+            format!(
+                "{body}\n(Use `{program} --trace-uncaught ...` to show where the exception was thrown)"
+            )
+        }
+        None => body,
     };
     // Node closes a fatal report with its runtime banner ("Node.js vX.Y.Z").
     // oam prints its OWN -- same structural role, and claiming to be Node
@@ -747,6 +887,57 @@ oam v{}
         body,
         env!("CARGO_PKG_VERSION")
     )
+}
+
+/// The program name node's `--trace-uncaught` hint shows:
+/// `basename(process.argv0)` with a `.exe` suffix dropped (`oam`, or a
+/// compiled binary's own name), as the warning printer's hint takes it; `oam`
+/// when `process.argv0` is unreadable or empty.
+fn program_name(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>) -> String {
+    let argv0 = (|| {
+        let context = tc.get_current_context();
+        let global = context.global(tc);
+        let process_key = v8::String::new(tc, "process")?;
+        let process =
+            v8::Local::<v8::Object>::try_from(global.get(tc, process_key.into())?).ok()?;
+        let key = v8::String::new(tc, "argv0")?;
+        let argv0 = process.get(tc, key.into())?;
+        argv0.is_string().then(|| argv0.to_rust_string_lossy(tc))
+    })();
+    if tc.has_caught() {
+        tc.reset();
+    }
+    program_basename(argv0.as_deref().unwrap_or(""))
+}
+
+/// Pure half of [`program_name`]: node's `fs::Basename(argv0, ".exe")`,
+/// splitting on both separators on Windows as path.basename does there.
+///
+/// Measured on node v22.22.2 on Windows: the suffix is dropped whatever its
+/// case (`b.Exe` is `b`) but not when it is the whole name (`.exe` stays),
+/// an empty basename stays empty (`dir/` names nothing), and only an empty
+/// argv0 falls back -- to `node` there, `oam` here. The suffix compare is
+/// exact elsewhere (inferred, not measured off Windows).
+fn program_basename(argv0: &str) -> String {
+    if argv0.is_empty() {
+        return "oam".to_string();
+    }
+    let separators: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+    let base = argv0.rsplit(separators).next().unwrap_or("");
+    const SUFFIX: &str = ".exe";
+    let stem_len = base.len().saturating_sub(SUFFIX.len());
+    let has_suffix = base.len() > SUFFIX.len()
+        && base.is_char_boundary(stem_len)
+        && if cfg!(windows) {
+            base[stem_len..].eq_ignore_ascii_case(SUFFIX)
+        } else {
+            &base[stem_len..] == SUFFIX
+        };
+    if has_suffix {
+        base[..stem_len].to_string()
+    } else {
+        base.to_string()
+    }
 }
 
 /// `util.inspect(value)` via the JS side. ToString is wrong for a rejection
@@ -781,26 +972,26 @@ pub(crate) fn handle_uncaught_throw(
     };
     let value = v8::Global::new(tc, exception);
     let message = crate::exception_to_error(tc, context).to_string();
-    let frame = tc.message().and_then(|m| source_frame(tc, m));
+    let site = throw_site(tc, tc.message());
     tc.reset();
 
     let local = v8::Local::new(tc, &value);
     // A handler that threw replaces what gets reported (Node reports the
     // secondary exception, not the original).
-    let (local, frame, message) = match dispatch_uncaught(tc, local) {
+    let (local, site, message) = match dispatch_uncaught(tc, local) {
         Uncaught::Handled => return None,
-        Uncaught::Fatal => (local, frame, message),
+        Uncaught::Fatal => (local, site, message),
         Uncaught::HandlerThrew {
             value,
-            frame,
+            site,
             message,
-        } => (v8::Local::new(tc, &value), frame, message),
+        } => (v8::Local::new(tc, &value), site, message),
     };
     Some(vec![Diagnostic::new(
         FATAL_CODE,
         Severity::Error,
         Origin::Runtime,
-        fatal_report(tc, local, frame, &message),
+        fatal_report(tc, local, site, &message),
     )])
 }
 
@@ -868,23 +1059,23 @@ pub(crate) fn emit_exit_event(
     };
     let value = v8::Global::new(tc, exception);
     let message = crate::exception_to_error(tc, "'exit' listener").to_string();
-    let frame = tc.message().and_then(|m| source_frame(tc, m));
+    let site = throw_site(tc, tc.message());
     tc.reset();
     let local = v8::Local::new(tc, &value);
-    let (local, frame, message) = match dispatch_uncaught(tc, local) {
+    let (local, site, message) = match dispatch_uncaught(tc, local) {
         Uncaught::Handled => return,
-        Uncaught::Fatal => (local, frame, message),
+        Uncaught::Fatal => (local, site, message),
         Uncaught::HandlerThrew {
             value,
-            frame,
+            site,
             message,
-        } => (v8::Local::new(tc, &value), frame, message),
+        } => (v8::Local::new(tc, &value), site, message),
     };
     let report = Diagnostic::new(
         FATAL_CODE,
         Severity::Error,
         Origin::Runtime,
-        fatal_report(tc, local, frame, &message),
+        fatal_report(tc, local, site, &message),
     );
     report_at_exit(tc, &[report]);
 }
@@ -960,7 +1151,7 @@ pub(crate) fn drain_uncaught(
                 value,
                 text,
                 fatal: already,
-                frame,
+                site,
             } = entry;
             // A later entry than a fatal one is not reached: node exited.
             if !fatal.is_empty() {
@@ -973,12 +1164,12 @@ pub(crate) fn drain_uncaught(
                 Some(FatalThrow::NoConsumer) => Uncaught::Fatal,
                 Some(FatalThrow::ListenerThrew) => Uncaught::HandlerThrew {
                     value: value.clone(),
-                    frame,
+                    site: site.clone(),
                     message: format!("Uncaught {text}"),
                 },
                 None => dispatch_uncaught(tc, local),
             };
-            let (local, frame, message) = match outcome {
+            let (local, site, message) = match outcome {
                 Uncaught::Handled => continue,
                 // No stored frame: for a microtask-thrown error V8 has no
                 // throw-site Message at all (probe-verified -- file
@@ -986,18 +1177,27 @@ pub(crate) fn drain_uncaught(
                 // prints `<anonymous_script>:0` the same way). The report's
                 // create_message fallback derives the position from the
                 // error's own stack, which is exactly node's derivation.
-                Uncaught::Fatal => (local, None, format!("Uncaught (in microtask) {text}")),
+                // The --trace-uncaught stack is the one V8 captured with
+                // this throw's Message, kept on the entry.
+                Uncaught::Fatal => (
+                    local,
+                    ThrowSite {
+                        frame: None,
+                        thrown_at: site.thrown_at,
+                    },
+                    format!("Uncaught (in microtask) {text}"),
+                ),
                 Uncaught::HandlerThrew {
                     value,
-                    frame,
+                    site,
                     message,
-                } => (v8::Local::new(tc, &value), frame, message),
+                } => (v8::Local::new(tc, &value), site, message),
             };
             fatal.push(Diagnostic::new(
                 FATAL_CODE,
                 Severity::Error,
                 Origin::Runtime,
-                fatal_report(tc, local, frame, &message),
+                fatal_report(tc, local, site, &message),
             ));
         }
         // A fatal throw ends the run here: node exits at it, and nothing
@@ -1301,7 +1501,7 @@ impl JsRuntime {
                 } else {
                     "uncaughtException"
                 };
-                let (exception, frame) = match dispatch_uncaught_from(tc, exception, origin) {
+                let (exception, site) = match dispatch_uncaught_from(tc, exception, origin) {
                     Uncaught::Handled => {
                         // A listener suppressed the fatal exit: continue like
                         // a clean run -- drain ticks + microtasks the handler
@@ -1328,9 +1528,9 @@ impl JsRuntime {
                             None => Ok(()),
                         };
                     }
-                    Uncaught::Fatal => (exception, None),
-                    Uncaught::HandlerThrew { value, frame, .. } => {
-                        (v8::Local::new(tc, &value), frame)
+                    Uncaught::Fatal => (exception, ThrowSite::default()),
+                    Uncaught::HandlerThrew { value, site, .. } => {
+                        (v8::Local::new(tc, &value), site)
                     }
                 };
                 let text = exception
@@ -1340,7 +1540,7 @@ impl JsRuntime {
                 let fallback = format!("{}: Uncaught {text}", entry.display());
                 Err(rt_diag(
                     FATAL_CODE,
-                    fatal_report(tc, exception, frame, &fallback),
+                    fatal_report(tc, exception, site, &fallback),
                 ))
             }
             v8::PromiseState::Pending => Err(rt_diag(
@@ -4965,5 +5165,32 @@ mod path_to_file_url_tests {
         let url = path_to_file_url(Path::new(r"C:\Users\app\mod.js"));
         assert_eq!(url, "file:///C:/Users/app/mod.js");
         assert!(!url.contains("%5C"), "no encoded backslash: {url}");
+    }
+}
+
+#[cfg(test)]
+mod program_name_tests {
+    use super::program_basename;
+
+    #[test]
+    fn program_basename_is_nodes_basename_without_exe() {
+        assert_eq!(program_basename("oam"), "oam");
+        assert_eq!(program_basename("/usr/local/bin/oam"), "oam");
+        assert_eq!(program_basename("oam.exe"), "oam");
+        // node's Basename(argv0, ".exe") drops one suffix.
+        assert_eq!(program_basename("my-app.exe.exe"), "my-app.exe");
+        // Only an empty argv0 falls back; an empty basename stays empty, and
+        // a name that is all suffix keeps it (measured on node, Windows).
+        assert_eq!(program_basename(""), "oam");
+        assert_eq!(program_basename("dir/"), "");
+        assert_eq!(program_basename(".exe"), ".exe");
+        if cfg!(windows) {
+            assert_eq!(program_basename(r"C:\tools\app.exe"), "app");
+            assert_eq!(program_basename("b.Exe"), "b");
+            assert_eq!(program_basename("a/b.EXE"), "b");
+            assert_eq!(program_basename(r"trail\"), "");
+        } else {
+            assert_eq!(program_basename("b.Exe"), "b.Exe");
+        }
     }
 }

@@ -619,6 +619,15 @@ fn run_worker(
                        if (f.name === 'onWarning') globalThis.process.removeListener('warning', f);",
                 );
             }
+            // Its own `--trace-uncaught`, as the CLI's flags prelude defines
+            // it (picked up below with the rest).
+            if exec_argv.iter().any(|arg| arg == "--trace-uncaught") {
+                let _ = rt.execute_script(
+                    "<worker-flags>",
+                    "Object.defineProperty(globalThis, '__oamTraceUncaught', \
+                       { value: true, writable: false, enumerable: false, configurable: false });",
+                );
+            }
             // Its own `--trace-warnings` / `--trace-deprecation`, defined on
             // its process as the CLI defines them on the main thread's, which
             // is where the default printer reads them. (With a builder, the
@@ -639,6 +648,7 @@ fn run_worker(
             }
         }
     }
+    rt.sync_trace_uncaught();
     // The entry is looked for on the worker's own thread, as node's is
     // (#287): its failure is the thread's error, handed to the parent whole,
     // and the thread exits 1.

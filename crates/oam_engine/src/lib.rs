@@ -963,6 +963,16 @@ impl JsRuntime {
     /// Compile and run `source` as a classic script. Returns the stringified
     /// completion value. Exceptions come back as `Err` with script:line info.
     /// A tick point follows, as after any JS the host runs.
+    /// Apply `--trace-uncaught` once the flags snippet that defines it
+    /// (`__oamTraceUncaught`) has run on this isolate: V8 captures the
+    /// stack of every uncaught throw from then on, and the fatal report
+    /// prints it as node's `Thrown at:` instead of the flag's hint. A no-op
+    /// without the flag. Call before any user code runs.
+    pub fn sync_trace_uncaught(&mut self) {
+        v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
+        crate::modules::sync_trace_uncaught(scope);
+    }
+
     pub fn execute_script(&mut self, name: &str, source: &str) -> Result<String> {
         self.execute_script_draining(name, source, AfterScript::TicksAndMicrotasks)
     }
