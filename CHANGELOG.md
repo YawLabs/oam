@@ -16,6 +16,24 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Added
+
+- **`--trace-uncaught`, and the hint that names it.** oam refused the flag, and a fatal
+  report of a thrown primitive (`throw 42`, `throw null`) ended at the value, without node's
+  `(Use \`node --trace-uncaught ...\` to show where the exception was thrown)`. The flag is
+  accepted on the command line, in `NODE_OPTIONS` and in a `Worker`'s `execArgv`, and lists
+  in `process.execArgv` as node's does. Without it the hint follows a primitive's report,
+  naming the program as node does (`oam`); with it every fatal report of an uncaught
+  exception ends with `Thrown at:` and the stack V8 captured at the throw, in node's frame
+  format. A binary built with `oam compile` honours it from `NODE_OPTIONS`, its arguments
+  being the app's own. A primitive
+  thrown from an ES module entry or a `queueMicrotask` callback is now printed as
+  `String()` gives it (`a string`, not `'a string'`), as node prints it. Node's frame
+  above those two still has no oam counterpart, and a CommonJS module that throws while an
+  ES module entry's imports load is still reported by oam's one-line `error[OAM-RT0001]`;
+  see docs/node-divergences.md #54.
+  Conformance case 573.
+
 ## [0.19.1] - 2026-10-13
 
 ### Changed

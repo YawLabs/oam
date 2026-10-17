@@ -556,6 +556,9 @@ fn main() -> ExitCode {
             } else if arg == "--trace-deprecation" {
                 flags.trace_deprecation = true;
                 i += 1;
+            } else if arg == "--trace-uncaught" {
+                flags.trace_uncaught = true;
+                i += 1;
             } else if let Some(v) = arg.strip_prefix("--disable-warning=") {
                 flags.disabled_warnings.push(v.to_string());
                 i += 1;
@@ -1916,6 +1919,8 @@ fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
             flags.trace_warnings = true;
         } else if tok == "--trace-deprecation" {
             flags.trace_deprecation = true;
+        } else if tok == "--trace-uncaught" {
+            flags.trace_uncaught = true;
         } else if tok == "--expose-gc" {
             flags.expose_gc = true;
         } else if tok == "--tls-min-v1.0" {
@@ -2729,6 +2734,9 @@ struct NodeFlags {
     /// read from `process.traceProcessWarnings` / `process.traceDeprecation`.
     trace_warnings: bool,
     trace_deprecation: bool,
+    /// `--trace-uncaught`: a fatal report ends with the stack V8 captured
+    /// at the throw (`Thrown at:`) instead of the hint naming this flag.
+    trace_uncaught: bool,
     disabled_warnings: Vec<String>,
     redirect_warnings: Option<String>,
     /// Node flags that are really V8 flags: forwarded verbatim before
@@ -2829,6 +2837,7 @@ impl NodeFlags {
             no_deprecation: env.no_deprecation || argv.no_deprecation,
             trace_warnings: env.trace_warnings || argv.trace_warnings,
             trace_deprecation: env.trace_deprecation || argv.trace_deprecation,
+            trace_uncaught: env.trace_uncaught || argv.trace_uncaught,
             disabled_warnings: [env.disabled_warnings, argv.disabled_warnings.clone()].concat(),
             redirect_warnings: argv.redirect_warnings.clone().or(env.redirect_warnings),
             allow_natives_syntax: env.allow_natives_syntax || argv.allow_natives_syntax,
@@ -2904,6 +2913,7 @@ impl NodeFlags {
         js.push_str(&self.process_js());
         if !js.is_empty() {
             let _ = rt.execute_script("<flags>", &js);
+            rt.sync_trace_uncaught();
             // oam.fork()'s in-process pool gets its own isolate; publish the
             // same snippet so it inherits the flags instead of starting
             // clean. (A worker_threads Worker decides its own: see
@@ -2955,6 +2965,12 @@ impl NodeFlags {
                        {{ value: true, writable: false, enumerable: true, configurable: true }});"
                 ));
             }
+        }
+        // The engine reads it once the snippet has run
+        // (JsRuntime::sync_trace_uncaught), to capture uncaught throws'
+        // stacks before any user code runs.
+        if self.trace_uncaught {
+            js.push_str(&def("__oamTraceUncaught", "true".into()));
         }
         if !self.disabled_warnings.is_empty() {
             let list =
@@ -3133,6 +3149,9 @@ impl NodeFlags {
         }
         if self.trace_deprecation {
             out.push("--trace-deprecation".into());
+        }
+        if self.trace_uncaught {
+            out.push("--trace-uncaught".into());
         }
         for w in &self.disabled_warnings {
             out.push(format!("--disable-warning={w}"));
@@ -3404,6 +3423,19 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
     // the temp file below.
     if let Some(blob) = bytecode {
         oam_engine::seed_cjs_bytecode(source, blob);
+    }
+    // The app's argv is its own, so the one node option a compiled binary
+    // honours, --trace-uncaught, comes from NODE_OPTIONS -- the form a
+    // primitive's fatal report has a user reach for (its hint names the
+    // flag). Nothing else in NODE_OPTIONS is applied here.
+    let mut env_flags = NodeFlags::default();
+    apply_node_options_env(&mut env_flags);
+    if env_flags.trace_uncaught {
+        let _ = rt.execute_script(
+            "<flags>",
+            &define_flag_global("__oamTraceUncaught", "true".into()),
+        );
+        rt.sync_trace_uncaught();
     }
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
@@ -4284,6 +4316,28 @@ mod tests {
         assert_eq!(
             argv_both.exec_argv(),
             vec!["--trace-warnings", "--trace-deprecation"]
+        );
+    }
+
+    #[test]
+    fn trace_uncaught_comes_from_node_options_and_argv_and_only_argv_reflects_it() {
+        let mut env = super::NodeFlags::default();
+        assert!(super::apply_node_options(&mut env, "--trace-uncaught"));
+        assert!(env.trace_uncaught);
+        assert!(env.environment_js(false).contains("__oamTraceUncaught"));
+        // NODE_OPTIONS turns it on but is not execArgv; argv's is.
+        let merged = env.merged(super::NodeFlags::default());
+        assert!(merged.trace_uncaught);
+        assert!(merged.exec_argv().is_empty());
+        let argv = super::NodeFlags::default().merged(super::NodeFlags {
+            trace_uncaught: true,
+            ..Default::default()
+        });
+        assert_eq!(argv.exec_argv(), vec!["--trace-uncaught"]);
+        assert!(
+            !super::NodeFlags::default()
+                .environment_js(false)
+                .contains("__oamTraceUncaught")
         );
     }
 
