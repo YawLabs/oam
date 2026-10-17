@@ -868,7 +868,7 @@ fn fatal_report(
     let body = match thrown_at {
         Some(frames) => format!("{body}\nThrown at:\n{frames}"),
         None if !tracing_uncaught(tc) && !exception.is_object() => {
-            let program = program_name(tc);
+            let program = program_name();
             format!(
                 "{body}\n(Use `{program} --trace-uncaught ...` to show where the exception was thrown)"
             )
@@ -889,25 +889,18 @@ oam v{}
     )
 }
 
-/// The program name node's `--trace-uncaught` hint shows:
-/// `basename(process.argv0)` with a `.exe` suffix dropped (`oam`, or a
-/// compiled binary's own name), as the warning printer's hint takes it; `oam`
-/// when `process.argv0` is unreadable or empty.
-fn program_name(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>) -> String {
-    let argv0 = (|| {
-        let context = tc.get_current_context();
-        let global = context.global(tc);
-        let process_key = v8::String::new(tc, "process")?;
-        let process =
-            v8::Local::<v8::Object>::try_from(global.get(tc, process_key.into())?).ok()?;
-        let key = v8::String::new(tc, "argv0")?;
-        let argv0 = process.get(tc, key.into())?;
-        argv0.is_string().then(|| argv0.to_rust_string_lossy(tc))
-    })();
-    if tc.has_caught() {
-        tc.reset();
-    }
-    program_basename(argv0.as_deref().unwrap_or(""))
+/// The program name node's `--trace-uncaught` hint shows: the process's own
+/// `argv[0]`, as node takes `env->argv()[0]`, through [`program_basename`]
+/// (`oam`, or a compiled binary's own name). Read from the OS, not from
+/// `process.argv0`: the report runs no user code (a getter on `process`
+/// could otherwise print, or never return, in the middle of it), and a
+/// spawn's `argv0` override is what node shows.
+fn program_name() -> String {
+    let argv0 = std::env::args_os()
+        .next()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    program_basename(&argv0)
 }
 
 /// Pure half of [`program_name`]: node's `fs::Basename(argv0, ".exe")`,

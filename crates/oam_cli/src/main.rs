@@ -3424,6 +3424,19 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
     if let Some(blob) = bytecode {
         oam_engine::seed_cjs_bytecode(source, blob);
     }
+    // The app's argv is its own, so the one node option a compiled binary
+    // honours, --trace-uncaught, comes from NODE_OPTIONS -- the form a
+    // primitive's fatal report has a user reach for (its hint names the
+    // flag). Nothing else in NODE_OPTIONS is applied here.
+    let mut env_flags = NodeFlags::default();
+    apply_node_options_env(&mut env_flags);
+    if env_flags.trace_uncaught {
+        let _ = rt.execute_script(
+            "<flags>",
+            &define_flag_global("__oamTraceUncaught", "true".into()),
+        );
+        rt.sync_trace_uncaught();
+    }
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "oam-compiled".to_string());
