@@ -94,23 +94,6 @@ struct ModuleMap {
     /// node's does), so the graph load replays this record instead of
     /// running the body a second time.
     failed_cjs: HashMap<PathBuf, (v8::Global<v8::Value>, Diagnostic)>,
-    /// The script names of the modules compiled from a file's own ES module
-    /// source -- not the facades over builtins, JSON or CommonJS, which are
-    /// registered under the same path as the CommonJS script that runs.
-    /// A stack frame with one of these names is one node names by its
-    /// file:// URL (`is_es_module_source`).
-    es_sources: HashSet<String>,
-}
-
-/// Whether `name`, a stack frame's script name, is a module compiled from a
-/// file's ES module source in this isolate. node names such a frame by the
-/// module's file:// URL where oam names it by its path, so a caller matching
-/// node's view of a frame (the punycode deprecation's node_modules check)
-/// asks this first.
-pub(crate) fn is_es_module_source(isolate: &v8::Isolate, name: &str) -> bool {
-    isolate
-        .get_slot::<ModuleMap>()
-        .is_some_and(|map| map.es_sources.contains(name))
 }
 
 /// The module graph loads on the stack, innermost last. A load can nest: a
@@ -3193,11 +3176,6 @@ fn compile_module(
     // Set when the pool loaded this path: the worker's cache probe
     // (key + blob) rides along so nothing is hashed or read twice.
     let mut prefetched = None;
-    // Whether the code compiled below is the file's own ES module
-    // source, not a facade over a builtin, JSON or CommonJS module: such
-    // a module's frames are ones node names by file:// URL
-    // (is_es_module_source).
-    let mut es_source = false;
     let code = if let Some(name) = builtin {
         let Some(exports) = crate::cjs::get_builtin(tc, &name) else {
             return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
@@ -3269,7 +3247,6 @@ fn compile_module(
             crate::cjs::CjsLoad::Esm => {
                 let wkey = module_key(path).unwrap_or_else(|_| path.to_path_buf());
                 crate::cjs::warn_typeless_package_json(tc, &wkey);
-                es_source = true;
                 host.load(path)?
             }
             crate::cjs::CjsLoad::Threw => {
@@ -3287,7 +3264,6 @@ fn compile_module(
             }
         }
     } else {
-        es_source = true;
         match prefetch.as_mut().and_then(|prefetch| prefetch.take(path)) {
             // A parked Err surfaces HERE — when the path is popped, not
             // when the worker hit it — so error content and ordering are
@@ -3390,9 +3366,6 @@ fn compile_module(
             .get_slot_mut::<ModuleMap>()
             .expect("module map installed");
         map.by_path.insert(path.to_path_buf(), global);
-        if es_source {
-            map.es_sources.insert(file.clone());
-        }
         map.paths_by_hash
             .entry(hash)
             .or_default()

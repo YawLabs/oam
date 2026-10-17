@@ -3675,7 +3675,7 @@
     _activeRequests: new Set(),
     /// Re-entry guard for internal/* resolution (see get()).
     _internalResolving: new Set(),
-    get(name) {
+    get(name, via) {
       if (registry.cache.has(name)) return registry.cache.get(name);
       // internal/* (only reachable under --expose-internals; the resolver
       // refuses the specifier otherwise) comes from the vendored internal
@@ -3712,7 +3712,9 @@
       if (!factory) {
         throw new Error(`oam internal: no builtin factory registered for '${name}'`);
       }
-      const mod = factory(globalThis.__oam.node);
+      // `via`: the route a user load took, for a factory whose behaviour
+      // depends on it (punycode's DEP0040); internal loads pass none.
+      const mod = factory(globalThis.__oam.node, via);
       registry.cache.set(name, mod);
       return mod;
     },
@@ -17692,7 +17694,7 @@
         // 'test' / 'sea' / 'sqlite' / 'test/reporters' are undefined
         // (probe-verified against v22.22.2).
         if (!prefixed && PREFIX_ONLY_BUILTINS.has(bare)) return undefined;
-        if (registry.factories[bare]) return registry.get(bare);
+        if (registry.factories[bare]) return registry.get(bare, "getBuiltinModule");
         return undefined;
       },
       _rawDebug(...args) {
@@ -34697,53 +34699,56 @@
   };
 
   // ------------------------------------------------------------- punycode
-  // Whether code under node_modules is on the stack, as node's
-  // isInsideNodeModules(frameLimit, defaultValue) binding (node_util.cc,
-  // v22.22.2) answers it for the punycode deprecation: any frame whose script
-  // name contains "/node_modules/", builtin frames skipped, and the default
-  // when the stack is too deep to search. Only the forward-slash spelling
-  // counts, which is why node on Windows, whose paths are written with
-  // backslashes, warns even when a package's CommonJS loads punycode
-  // (probed: v22.22.2 on win32 warns, on linux it does not). It is the
-  // script's name (StackFrame::GetScriptName), never a //# sourceURL=. And
-  // node names an ES module's frame by its file:// URL, where oam names it
-  // by its path, so such a frame is read with forward slashes: a package's
-  // ES module is skipped on win32 too, as in node.
-  let isEsModuleSource = null;
-  function isInsideNodeModules(frameLimit, defaultValue) {
+  // Whether a package loaded punycode, as node v22.22.2 answers it for the
+  // DEP0040 warning: lib/punycode.js calls isInsideNodeModules() with no
+  // arguments, so node_util.cc looks at the first 10 stack frames only,
+  // skips unnamed and "node:" ones, and lets the first other frame decide,
+  // by "node_modules" between any mix of / and \ (a win32 path and a file://
+  // URL both count). Most of those 10 are node's own loader frames, so who
+  // the caller is depends on the route the load took (probed on win32 and
+  // linux alike): require() spends all 10 in the CJS loader and import its
+  // ESM loader, so node warns whoever loads it that way; module.require
+  // leaves its caller 1 frame and process.getBuiltinModule 6. `via` names
+  // that route ("moduleRequire" from the native require called with a module
+  // as its receiver, "getBuiltinModule"); oam's own frames stand in for
+  // node's loader frames and are skipped, then the window starts.
+  const PUNYCODE_CALLER_FRAMES = { moduleRequire: 1, getBuiltinModule: 6 };
+  function punycodeLoadedByAPackage(via) {
+    const window = PUNYCODE_CALLER_FRAMES[via] ?? 0;
+    if (window === 0) return false;
     let frames;
     const savedLimit = Error.stackTraceLimit;
     const savedPrepare = Error.prepareStackTrace;
     try {
-      Error.stackTraceLimit = frameLimit;
+      Error.stackTraceLimit = 64;
       Error.prepareStackTrace = (_, callSites) => callSites;
       const holder = {};
-      Error.captureStackTrace(holder, isInsideNodeModules);
+      Error.captureStackTrace(holder, punycodeLoadedByAPackage);
       frames = holder.stack;
     } catch {
-      return defaultValue;
+      return false;
     } finally {
       try {
         Error.stackTraceLimit = savedLimit;
         Error.prepareStackTrace = savedPrepare;
       } catch { /* a frozen Error keeps what it had */ }
     }
-    if (!Array.isArray(frames) || frames.length >= frameLimit) return defaultValue;
-    if (isEsModuleSource === null) isEsModuleSource = globalThis.__oam.node.isEsModuleSource;
-    for (const frame of frames) {
-      let name = frame.getFileName?.();
-      if (typeof name !== "string" || name === "") continue;
-      if (name.startsWith("node:") || name.startsWith("oam:")) continue;
-      if (name.includes("\\") && isEsModuleSource(name)) name = name.replaceAll("\\", "/");
-      if (name.includes("/node_modules/")) return true;
+    if (!Array.isArray(frames)) return false;
+    const runtime = (name) => typeof name === "string" && (name.startsWith("oam:") || name.startsWith("node:"));
+    let i = 0;
+    while (i < frames.length && runtime(frames[i].getFileName?.())) i++;
+    for (const end = Math.min(frames.length, i + window); i < end; i++) {
+      const name = frames[i].getFileName?.();
+      if (typeof name !== "string" || name === "" || runtime(name)) continue;
+      return /[\\/]node_modules[\\/]/.test(name);
     }
     return false;
   }
 
   // Pure-JS Punycode (RFC 3492), node's punycode.js 2.1.0. Runtime-deprecated
   // (DEP0040) when it is first loaded, unless a package is loading it.
-  registry.factories.punycode = () => {
-    if (!isInsideNodeModules(100, true)) {
+  registry.factories.punycode = (_node, via) => {
+    if (!punycodeLoadedByAPackage(via)) {
       process.emitWarning(
         "The `punycode` module is deprecated. Please use a userland alternative instead.",
         "DeprecationWarning",

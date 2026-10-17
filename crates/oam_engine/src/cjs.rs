@@ -560,7 +560,14 @@ fn require_callback(
             .or_else(|| s.starts_with("oam:").then(|| s.to_string()))
     });
     if let Some(name) = registry_key {
-        if let Some(builtin) = get_builtin(scope, &name) {
+        // Called with a module as its receiver -- `module.require(x)`,
+        // `require.main.require(x)` -- rather than as the bare `require`:
+        // node's DEP0040 check sees the caller of the one but not the other
+        // (node_compat.js, punycodeLoadedByAPackage), so the route rides to
+        // the builtin's factory.
+        let global = scope.get_current_context().global(scope);
+        let via = (!args.this().strict_equals(global.into())).then_some("moduleRequire");
+        if let Some(builtin) = get_builtin_via(scope, &name, via) {
             rv.set(builtin);
         }
         return;
@@ -1579,6 +1586,16 @@ pub(crate) fn get_builtin<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
 ) -> Option<v8::Local<'s, v8::Value>> {
+    get_builtin_via(scope, name, None)
+}
+
+/// `get_builtin`, naming the route a user load took (`registry.get`'s
+/// `via`) for a factory whose behaviour depends on it.
+fn get_builtin_via<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+    via: Option<&str>,
+) -> Option<v8::Local<'s, v8::Value>> {
     let context = scope.get_current_context();
     let global = context.global(scope);
     let registry_key = v8::String::new(scope, "__oamNode")?;
@@ -1594,8 +1611,12 @@ pub(crate) fn get_builtin<'s>(
         return None;
     };
     let name_v8 = v8::String::new(scope, name)?;
+    let via: v8::Local<v8::Value> = match via {
+        Some(via) => v8::String::new(scope, via)?.into(),
+        None => v8::undefined(scope).into(),
+    };
     let recv: v8::Local<v8::Value> = registry.into();
-    get.call(scope, recv, &[name_v8.into()])
+    get.call(scope, recv, &[name_v8.into(), via])
 }
 
 /// Generate the ESM facade for an already-executed CJS module. Named

@@ -8,9 +8,14 @@
 //   and after a 'warning' listener's throw the second queued warning is not.
 // - A throw an 'uncaughtException' listener handles leaves the rest of the
 //   batch queued, and node runs it at its next tick point: the end of the
-//   next timer or immediate callback, or its check phase -- which comes
-//   before the next immediate, and before node waits for a timer that is
-//   not due yet. So both handled warnings print before an immediate.
+//   next timer or immediate callback, or its check phase. An immediate
+//   already queued when the throw is handled sits at that boundary, and
+//   whether it runs before or after the resumed batch is node's platform
+//   detail, not the queue's contract -- probed, v22.22.2, 100 runs per
+//   platform, an entry-queued immediate comes before the batch on Linux and
+//   macOS but after it on Windows. So the scenario queues its immediate from
+//   the batch's own last tick: not there to interpose, the resumed batch
+//   finishes first on every platform (probed on all three).
 // - A timer due in the same timers phase runs before that rest: node's
 //   timers phase goes on to its next due timer after the throw, and runs
 //   the queue when the phase ends. The entry busy-waits so both timers are
@@ -52,7 +57,12 @@ process.emitWarning("second");
 setImmediate(() => console.log("immediate"));
 `,
   // The same through plain ticks: where the rest of a batch runs after a
-  // handled throw.
+  // handled throw. The immediate is queued from the batch's last tick, not
+  // from the entry: whether an immediate already queued when a throw is
+  // handled interposes before the resumed batch is node's platform detail
+  // (probed, v22.22.2, 100 runs each: an entry-queued immediate comes after
+  // the batch on Windows but before it on Linux and macOS). Queued late it
+  // is not there to interpose, so the batch finishes first everywhere.
   "main-then-immediate.cjs": `
 process.on("uncaughtException", (e) => console.log("uncaughtException", e.message));
 process.nextTick(() => { throw new Error("t1"); });
@@ -63,8 +73,7 @@ setImmediate(() => console.log("immediate"));
 process.on("uncaughtException", (e) => console.log("uncaughtException", e.message));
 process.nextTick(() => { throw new Error("t1"); });
 process.nextTick(() => { throw new Error("t2"); });
-process.nextTick(() => console.log("t3"));
-setImmediate(() => console.log("immediate"));
+process.nextTick(() => { console.log("t3"); setImmediate(() => console.log("immediate")); });
 `,
   "timer-then-later-timer.cjs": `
 process.on("uncaughtException", (e) => console.log("uncaughtException", e.message));
