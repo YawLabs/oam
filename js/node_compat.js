@@ -12316,6 +12316,12 @@
   // wrapper), while node's FileHandle uses the internal class regardless of
   // what userland last assigned.
   let _rwStreams;
+  // The fs module's own open, read, write, writev, fsync and close, as the
+  // fs factory made them. A file stream calls `options.fs`'s, or the live
+  // `fs.*`, as node's does; while the one it would call is still oam's own
+  // it goes to the native instead, which is the same operation without the
+  // argument parsing.
+  let fsStreamOriginals = null;
   function rwStreams(natives) {
     if (_rwStreams) return _rwStreams;
     const { Readable, Writable, finished } = registry.get("stream");
@@ -12416,21 +12422,72 @@
     const kIsPerformingIO = Symbol("kIsPerformingIO");
     const kIoDone = Symbol("kIoDone");
     const kSupplied = Symbol("kSupplied");
+    // node's kFs: what the stream opens, reads, writes and closes through
+    // -- `options.fs`, or the fs module itself; null over a FileHandle,
+    // which goes through the handle.
+    const kFs = Symbol("kFs");
+    // node's ReadStream.prototype.open and WriteStream.prototype.open:
+    // deprecated no-ops (DEP0135), there so that a stream can tell an
+    // `open` of its own from them.
+    const { deprecate } = registry.get("util");
+    const openReadFs = deprecate(function () {}, "ReadStream.prototype.open() is deprecated", "DEP0135");
+    const openWriteFs = deprecate(function () {}, "WriteStream.prototype.open() is deprecated", "DEP0135");
+    // node's validateFunction on one of the `options.fs` methods it needs.
+    const validateFsMethod = (ops, name) => {
+      const fn = ops[name];
+      if (typeof fn !== "function") throw codes.ERR_INVALID_ARG_TYPE("options.fs." + name, "Function", fn);
+    };
+    // The `options.fs` (or patched `fs`) method a stream must call, or null
+    // while it is oam's own and the native does the same. Looked up at each
+    // call, as node's `this[kFs].open(...)` is. One that is missing (or not
+    // a function) is node's call failing: a function throwing node's
+    // TypeError, which names the call as node's source spells it -- never
+    // the native, which would close a descriptor `options.fs` handed out.
+    const fsCallee = { open: "stream", close: "stream", fsync: "stream", read: "this", write: "this", writev: "this" };
+    const fsOverride = (stream, name) => {
+      const ops = stream[kFs];
+      if (!ops) return null;
+      const fn = ops[name];
+      if (fn === fsStreamOriginals[name]) return null;
+      if (typeof fn === "function") return fn;
+      return () => {
+        throw new TypeError(`${fsCallee[name]}[kFs].${name} is not a function`);
+      };
+    };
+    // node's errorOrDestroy for a failed read: a stream that does not
+    // destroy itself (autoClose: false) reports the error and keeps its
+    // descriptor -- over a FileHandle, the handle the caller asked to keep.
+    const readFailed = (stream, e) => {
+      if (stream._readableState.autoDestroy) stream.destroy(e);
+      else {
+        stream._readableState.errored ??= e;
+        stream.emit("error", e);
+      }
+    };
 
     // node's importFd half of both constructors: with no descriptor the
     // stream gets `path`, `flags` and `mode`, and the path is validated
     // here, so a bad one throws from the constructor; handed a descriptor it
     // gets none of the three.
+    //
+    // What it goes through is `options.fs` when that is truthy (node's
+    // `options.fs || fs`), else the fs module; `open` is checked to be a
+    // function before the path is checked, and over a FileHandle
+    // `options.fs` is refused (suppliedFd).
     function importFdOrPath(stream, path, opts, defaultFlags) {
-      const supplied = suppliedFd(opts);
-      stream[kSupplied] = supplied;
-      if (!supplied) {
+      if (opts.fd == null) {
+        stream[kSupplied] = null;
+        stream[kFs] = opts.fs || registry.get("fs");
+        validateFsMethod(stream[kFs], "open");
         stream.fd = null;
         stream.path = pathProperty(path);
         stream.flags = opts.flags === undefined ? defaultFlags : opts.flags;
         stream.mode = opts.mode === undefined ? 0o666 : opts.mode;
         toPath(stream.path);
       } else {
+        const supplied = suppliedFd(opts);
+        stream[kSupplied] = supplied;
+        stream[kFs] = supplied.fileHandle ? null : opts.fs || registry.get("fs");
         stream.fd = supplied.handle;
       }
     }
@@ -12447,6 +12504,43 @@
     // the open, not the constructor.
     function constructStream(stream, callback) {
       if (stream[kSupplied]) { callback(); return; }
+      if (stream.open !== openWriteFs && stream.open !== openReadFs) {
+        // node's backwards compatibility for a stream whose `open` is its
+        // own (a subclass's, or one assigned): that open is called, and the
+        // stream is constructed at the first 'open' it emits, or failed at
+        // the first 'error'.
+        const orgEmit = stream.emit;
+        stream.emit = function (...args) {
+          if (args[0] === "open") {
+            this.emit = orgEmit;
+            callback();
+            Reflect.apply(orgEmit, this, args);
+          } else if (args[0] === "error") {
+            this.emit = orgEmit;
+            callback(args[1]);
+          } else {
+            Reflect.apply(orgEmit, this, args);
+          }
+        };
+        stream.open();
+        return;
+      }
+      const open = fsOverride(stream, "open");
+      if (open) {
+        // node's: the path, flags and mode as the stream holds them, and
+        // the descriptor from the callback.
+        open.call(stream[kFs], stream.path, stream.flags, stream.mode, (er, fd) => {
+          if (er) {
+            callback(er);
+          } else {
+            stream.fd = fd;
+            callback();
+            stream.emit("open", stream.fd);
+            stream.emit("ready");
+          }
+        });
+        return;
+      }
       const opening = new Promise((resolve) => {
         const flags = openFlags(stream.flags, natives);
         resolve(natives.fsOpen(toPath(stream.path), flags, parseFileMode(stream.mode, "mode", 0o666)));
@@ -12474,6 +12568,12 @@
       if (stream.fd === null || stream.fd === undefined) { cb(err); return; }
       const fd = stream.fd;
       const supplied = stream[kSupplied];
+      const closeFs = fsOverride(stream, "close");
+      const fsyncFs = stream.flush ? fsOverride(stream, "fsync") : null;
+      if (closeFs || fsyncFs) {
+        closeThroughFs(stream, fd, err, cb, closeFs, fsyncFs);
+        return;
+      }
       stream.fd = null;
       // Over a FileHandle the answer is the handle's close(), which is
       // already settled for the stream that gave back the last reference
@@ -12490,6 +12590,112 @@
       } else {
         close();
       }
+    }
+    // node's close() and closeFsStream() where `options.fs` (or a patched
+    // fs) supplies the close or the sync: `fd` stays set until the close is
+    // issued, and the close's error wins over the one the stream was
+    // destroyed with, which wins over the sync's.
+    function closeThroughFs(stream, fd, err, cb, closeFs, fsyncFs) {
+      const ops = stream[kFs];
+      const close = (e) => {
+        if (closeFs) {
+          closeFs.call(ops, fd, (er) => cb(er || e));
+        } else {
+          const supplied = stream[kSupplied];
+          new Promise((resolve) => resolve(supplied ? supplied.close() : natives.fsClose(fd))).then(
+            () => setImmediate(cb, e),
+            (er) => setImmediate(cb, er || e),
+          );
+        }
+        stream.fd = null;
+      };
+      if (!stream.flush) {
+        close(err);
+      } else if (fsyncFs) {
+        fsyncFs.call(ops, fd, (flushErr) => close(err || flushErr));
+      } else {
+        new Promise((resolve) => resolve(natives.fsFsync(fd))).then(
+          () => close(err),
+          (flushErr) => close(err || flushErr),
+        );
+      }
+    }
+    // node's _read through `options.fs.read`: into a buffer of the stream's
+    // own, the callback's buffer pushed (copied to fit when the read was
+    // short), and a read of nothing the end.
+    function readThroughFs(stream, read, n) {
+      const buf = globalThis.Buffer.allocUnsafeSlow(n);
+      stream[kIsPerformingIO] = true;
+      read.call(stream[kFs], stream.fd, buf, 0, n, stream.pos, (er, bytesRead, buf) => {
+        stream[kIsPerformingIO] = false;
+        if (stream.destroyed) {
+          stream.emit(kIoDone, er);
+          return;
+        }
+        if (er) {
+          readFailed(stream, er);
+        } else if (bytesRead > 0) {
+          if (stream.pos !== undefined) stream.pos += bytesRead;
+          stream.bytesRead += bytesRead;
+          if (bytesRead !== buf.length) {
+            const dst = globalThis.Buffer.allocUnsafeSlow(bytesRead);
+            buf.copy(dst, 0, 0, bytesRead);
+            buf = dst;
+          }
+          stream.push(buf);
+        } else {
+          stream.push(null);
+        }
+      });
+    }
+    // node's writeAll / writevAll: a short write is followed by one for the
+    // rest, EAGAIN counts as a write of nothing, and six writes of nothing
+    // in a row fail the stream. writevAll passes the stream's `pos`, not
+    // the advancing one, as node's does.
+    function writeAllThroughFs(stream, write, data, size, pos, cb, retries = 0) {
+      write.call(stream[kFs], stream.fd, data, 0, size, pos, (er, bytesWritten, buffer) => {
+        if (er?.code === "EAGAIN") {
+          er = null;
+          bytesWritten = 0;
+        }
+        if (stream.destroyed || er) return cb(er || codes.ERR_STREAM_DESTROYED("write"));
+        stream.bytesWritten += bytesWritten;
+        retries = bytesWritten ? 0 : retries + 1;
+        size -= bytesWritten;
+        pos += bytesWritten;
+        if (retries > 5) cb(systemErrorWithCode("ERR_SYSTEM_ERROR", "write failed"));
+        else if (size) writeAllThroughFs(stream, write, buffer.slice(bytesWritten), size, pos, cb, retries);
+        else cb();
+      });
+    }
+    function writevAllThroughFs(stream, writev, chunks, size, pos, cb, retries = 0) {
+      writev.call(stream[kFs], stream.fd, chunks, stream.pos, (er, bytesWritten, buffers) => {
+        if (er?.code === "EAGAIN") {
+          er = null;
+          bytesWritten = 0;
+        }
+        if (stream.destroyed || er) return cb(er || codes.ERR_STREAM_DESTROYED("writev"));
+        stream.bytesWritten += bytesWritten;
+        retries = bytesWritten ? 0 : retries + 1;
+        size -= bytesWritten;
+        pos += bytesWritten;
+        if (retries > 5) cb(systemErrorWithCode("ERR_SYSTEM_ERROR", "writev failed"));
+        else if (size) {
+          const rest = globalThis.Buffer.concat(buffers).slice(bytesWritten);
+          writevAllThroughFs(stream, writev, [rest], size, pos, cb, retries);
+        } else cb();
+      });
+    }
+    // node's _write / _writev around those: the in-flight mark, the destroy
+    // waiting on it told, and `pos` moved on once the write is issued.
+    function writeThroughFs(stream, all, fn, data, size, cb) {
+      stream[kIsPerformingIO] = true;
+      all(stream, fn, data, size, stream.pos, (er) => {
+        stream[kIsPerformingIO] = false;
+        cb(er);
+        if (stream.destroyed) stream.emit(kIoDone, er);
+      });
+      if (stream.pos !== undefined) stream.pos += size;
     }
     // node's _destroy for both: a read or write still in flight lands first.
     // Closing under it lost the write (and raced the read).
@@ -12528,6 +12734,11 @@
         // assigned in node's order below.
         const own = {};
         importFdOrPath(own, path, opts, "r");
+        const autoClose = opts.autoClose === undefined ? true : opts.autoClose;
+        if (own[kFs]) {
+          validateFsMethod(own[kFs], "read");
+          if (autoClose) validateFsMethod(own[kFs], "close");
+        }
         const start = opts.start;
         let end = opts.end;
         if (start !== undefined) validateInteger(start, "start", 0);
@@ -12543,7 +12754,7 @@
           // autoDestroy -> destroy() -> the close -> 'close'. The stream
           // machine owns 'close' (single emission). autoClose:false keeps
           // the stream alive past EOF and an error, descriptor and all.
-          autoDestroy: opts.autoClose === undefined ? true : opts.autoClose,
+          autoDestroy: autoClose,
           emitClose: opts.emitClose,
           highWaterMark: opts.highWaterMark,
           encoding: opts.encoding ?? null,
@@ -12559,6 +12770,8 @@
               ? Math.min(this.end - this.pos + 1, size)
               : Math.min(this.end - this.bytesRead + 1, size);
             if (want <= 0) { this.push(null); return; }
+            const readFs = fsOverride(this, "read");
+            if (readFs) { readThroughFs(this, readFs, want); return; }
             this[kIsPerformingIO] = true;
             settled(
               new Promise((resolve) => resolve(natives.fsReadChunk(this.fd, want, this.pos))),
@@ -12579,15 +12792,7 @@
                 (e) => {
                   this[kIsPerformingIO] = false;
                   if (this.destroyed) { this.emit(kIoDone, e); return; }
-                  // node's errorOrDestroy: a stream that does not destroy
-                  // itself (autoClose: false) reports the error and keeps
-                  // its descriptor -- over a FileHandle, the handle the
-                  // caller asked to keep.
-                  if (this._readableState.autoDestroy) this.destroy(e);
-                  else {
-                    this._readableState.errored ??= e;
-                    this.emit("error", e);
-                  }
+                  readFailed(this, e);
                 },
               );
           },
@@ -12597,6 +12802,7 @@
         });
         // The properties node's ReadStream has, in its order.
         this[kSupplied] = own[kSupplied];
+        this[kFs] = own[kFs];
         followHandle(this, own[kSupplied]);
         this.fd = own.fd;
         if (!own[kSupplied]) {
@@ -12612,6 +12818,7 @@
       }
     }
     Object.defineProperty(ReadStream.prototype, "autoClose", autoCloseOver("_readableState"));
+    ReadStream.prototype.open = openReadFs;
 
     class WriteStream extends Writable {
       // Node v22 WriteStream.prototype.close: end, then wait for 'close'. A
@@ -12633,8 +12840,20 @@
         const opts = streamOptions(options);
         const own = {};
         importFdOrPath(own, path, opts, "w");
+        const autoClose = opts.autoClose === undefined ? true : opts.autoClose;
+        // node's: either of write and writev will do, but one that is given
+        // must be a function; then close, unless the stream keeps its
+        // descriptor; then `flush`, and with it fsync.
+        const ops = own[kFs];
+        if (ops) {
+          if (!ops.write && !ops.writev) throw codes.ERR_INVALID_ARG_TYPE("options.fs.write", "Function", ops.write);
+          if (ops.write) validateFsMethod(ops, "write");
+          if (ops.writev) validateFsMethod(ops, "writev");
+          if (autoClose) validateFsMethod(ops, "close");
+        }
         const flush = opts.flush ?? false;
         if (typeof flush !== "boolean") throw codes.ERR_INVALID_ARG_TYPE("options.flush", "boolean", flush);
+        if (flush && ops) validateFsMethod(ops, "fsync");
         const start = opts.start;
         if (start !== undefined) validateInteger(start, "start", 0);
         // One native write at the stream's position, counted when it lands.
@@ -12668,7 +12887,7 @@
           // Node's fs.WriteStream flow: construct (the open) -> writes ->
           // end() -> 'finish' -> autoDestroy -> destroy(), which closes the
           // descriptor -> 'close'. The machine owns 'close'.
-          autoDestroy: opts.autoClose === undefined ? true : opts.autoClose,
+          autoDestroy: autoClose,
           emitClose: opts.emitClose,
           highWaterMark: opts.highWaterMark,
           decodeStrings: true,
@@ -12686,6 +12905,8 @@
           // as the write is issued; without it the descriptor's own cursor
           // does the placing.
           write(chunk, _encoding, cb) {
+            const writeFs = fsOverride(this, "write");
+            if (writeFs) { writeThroughFs(this, writeAllThroughFs, writeFs, chunk, chunk.length, cb); return; }
             const at = this.pos;
             if (at !== undefined) this.pos = at + chunk.length;
             writeAt(this, chunk, at, cb);
@@ -12694,6 +12915,13 @@
           // write, as node's _writev does: `bytesWritten` moves once, and
           // two streams on one descriptor do not interleave inside a batch.
           writev(chunks, cb) {
+            const writevFs = fsOverride(this, "writev");
+            if (writevFs) {
+              const list = chunks.map((entry) => entry.chunk);
+              const size = list.reduce((sum, chunk) => sum + chunk.length, 0);
+              writeThroughFs(this, writevAllThroughFs, writevFs, list, size, cb);
+              return;
+            }
             const bytes = globalThis.Buffer.concat(chunks.map((entry) => entry.chunk));
             const at = this.pos;
             if (at !== undefined) this.pos = at + bytes.length;
@@ -12705,6 +12933,7 @@
         });
         // The properties node's WriteStream has, in its order.
         this[kSupplied] = own[kSupplied];
+        this[kFs] = own[kFs];
         followHandle(this, own[kSupplied]);
         this.fd = own.fd;
         if (!own[kSupplied]) {
@@ -12717,12 +12946,18 @@
         this.pos = start;
         this.bytesWritten = 0;
         this[kIsPerformingIO] = false;
+        // node: with only one of write and writev in `options.fs` the
+        // stream has only that one (with `_write` null a lone chunk fails
+        // in the stream machine, as node's does).
+        if (ops && !ops.write) this._write = null;
+        if (ops && !ops.writev) this._writev = null;
         // node: the `encoding` option is what a string written without one
         // is encoded as.
         if (opts.encoding) this.setDefaultEncoding(opts.encoding);
       }
     }
     Object.defineProperty(WriteStream.prototype, "autoClose", autoCloseOver("_writableState"));
+    WriteStream.prototype.open = openWriteFs;
     // node: `WriteStream.prototype.destroySoon = WriteStream.prototype.end`.
     WriteStream.prototype.destroySoon = WriteStream.prototype.end;
     _rwStreams = { ReadStream, WriteStream };
@@ -12765,7 +13000,8 @@
   // Where cpSync's C++ fails in a way that depends on the platform's
   // std::filesystem -- an error code or message the C++ library chooses,
   // or, for a directory to be made where a file is, an exception that
-  // aborts node -- oam fails as node does on Linux; see
+  // aborts node -- oam fails as node does on Linux (save the destination
+  // that cannot be made, which on Windows fails as node's does there); see
   // docs/node-divergences.md.
 
   // node's getValidatedPath for a copy's paths: checked as any path is, a
@@ -12994,8 +13230,10 @@
 
   // node's ErrnoException for a std::filesystem failure in cpSync's C++
   // (Environment::ThrowStdErrException): `<CODE>, <text> '<path>'`, with
-  // errno, code, syscall and path. The code and text are Linux's
-  // (libstdc++'s errno and strerror); see docs/node-divergences.md.
+  // errno, code, path and syscall. The code and text are Linux's
+  // (libstdc++'s errno and strerror), save the destination's
+  // create_directories on Windows (cpStdMkdirError); see
+  // docs/node-divergences.md.
   const CP_STRERROR = {
     EACCES: "Permission denied",
     EBUSY: "Device or resource busy",
@@ -13015,16 +13253,54 @@
     EACCES: 13, EBUSY: 16, EEXIST: 17, EINVAL: 22, EIO: 5, EISDIR: 21, ELOOP: 40, ENAMETOOLONG: 36, ENOENT: 2,
     ENOTDIR: 20, ENOTEMPTY: 39, ENOTSUP: 95, EPERM: 1,
   };
-  function cpStdError(code, syscall, path) {
-    const err = new Error(`${code}, ${CP_STRERROR[code] ?? code} '${path}'`);
-    err.errno = CP_LINUX_ERRNO[code];
+  // node's ErrnoException sets errno, code, path and then syscall (#360;
+  // measured on Windows and Linux): the order Object.keys shows.
+  function cpErrnoException(errno, code, text, syscall, path) {
+    const err = new Error(`${code}, ${text} '${path}'`);
+    err.errno = errno;
     err.code = code;
-    err.syscall = syscall;
     err.path = path;
+    err.syscall = syscall;
     return err;
+  }
+  function cpStdError(code, syscall, path) {
+    return cpErrnoException(CP_LINUX_ERRNO[code], code, CP_STRERROR[code] ?? code, syscall, path);
   }
   // The std::filesystem failure an fs call's error stands for.
   const cpStdErrorOf = (e, syscall, path) => cpStdError(e && typeof e.code === "string" ? e.code : "EIO", syscall, path);
+  // std::filesystem::create_directories failing for cpSync's destination.
+  // On Windows node reports MSVC's error: the Win32 code as `errno`, the
+  // name the CRT's errno table gives that number as `code` (none for 183,
+  // EIO for 5), and the system's message (measured on v22.22.2, Windows
+  // 11): a file in the way of the directory is ERROR_ALREADY_EXISTS, a
+  // directory that may not be written in ERROR_ACCESS_DENIED. What mkdir
+  // calls ENOENT is ERROR_PATH_NOT_FOUND (a missing drive, a name too
+  // long; a missing drive wins over a bad name below it) or, for a name
+  // with a character Windows does not allow, ERROR_INVALID_NAME. Elsewhere,
+  // and for any other failure, libstdc++'s.
+  const CP_WIN_MKDIR = {
+    ENOTDIR: [183, "", "Cannot create a file when that file already exists."],
+    EACCES: [5, "EIO", "Access is denied."],
+    EPERM: [5, "EIO", "Access is denied."],
+  };
+  const CP_WIN_PATH_NOT_FOUND = [3, "ESRCH", "The system cannot find the path specified."];
+  const CP_WIN_INVALID_NAME = [123, "ENOPROTOOPT", "The filename, directory name, or volume label syntax is incorrect."];
+  function cpWinMkdirNotFound(dest) {
+    const { win32 } = registry.get("path");
+    const full = win32.resolve(dest);
+    const { root } = win32.parse(full);
+    if (!registry.get("fs").existsSync(root)) return CP_WIN_PATH_NOT_FOUND;
+    const names = full.slice(root.length).split(/[\\/]/);
+    return names.some((name) => /[<>:"|?*\x00-\x1f]/.test(name)) ? CP_WIN_INVALID_NAME : CP_WIN_PATH_NOT_FOUND;
+  }
+  function cpStdMkdirError(e, dest, path) {
+    let win;
+    if (process.platform === "win32" && e) {
+      win = e.code === "ENOENT" ? cpWinMkdirNotFound(dest) : CP_WIN_MKDIR[e.code];
+    }
+    if (win) return cpErrnoException(win[0], win[1], win[2], "cp", path);
+    return cpStdErrorOf(e, "cp", path);
+  }
 
   // CpSyncCheckPaths: the checks cpSync makes once, on the paths it was
   // given, and the destination's parent made when it is missing.
@@ -13281,7 +13557,7 @@
     try {
       fs.mkdirSync(dest, { recursive: true });
     } catch (e) {
-      throw cpStdErrorOf(e, "cp", cpNs(dest));
+      throw cpStdMkdirError(e, dest, cpNs(dest));
     }
     const statOrNull = (p, follow) => {
       try {
@@ -15977,6 +16253,9 @@
     // the callback. Routing both through the callback meant a try/catch around
     // fs.readv silently stopped firing. node's order is descriptor (its JS
     // check, see validateFd), buffers, callback.
+    // fs.write as this factory made it: node's writev is its own call, so a
+    // function assigned over fs.write is not called by fs.writev (#356).
+    const ownWrite = fs.write;
     fs.writev = function (fd, buffers, position, cb) {
       validateFd(fd, false);
       const total = asViewArray(buffers);
@@ -15984,7 +16263,7 @@
       validateCb(cb);
       if (emptyList(buffers)) { process.nextTick(() => cb(null, 0, buffers)); return; }
       // Reuses fs.write, so the position handling lives in exactly one place.
-      fs.write(fd, flattenViews(buffers, total), 0, total, fsPositionArg(position), (err, written) =>
+      ownWrite(fd, flattenViews(buffers, total), 0, total, fsPositionArg(position), (err, written) =>
         err ? cb(err, 0, buffers) : cb(null, written, buffers),
       );
     };
@@ -16104,6 +16383,14 @@
         enumerable: true,
       });
     }
+    fsStreamOriginals = {
+      open: fs.open,
+      read: fs.read,
+      write: fs.write,
+      writev: fs.writev,
+      fsync: fs.fsync,
+      close: fs.close,
+    };
     return fs;
   };
 
