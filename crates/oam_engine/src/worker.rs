@@ -461,6 +461,42 @@ pub(crate) fn shared_env_set(id: u64, name: &str, value: Option<String>) -> Opti
     Some(env.version)
 }
 
+/// The stack every thread that runs a non-main isolate is spawned with (a
+/// worker, a fork's prewarmed or cold-started isolate): 4 MiB, node's own
+/// worker thread size (`kStackSize` in src/node_worker.cc, the default of
+/// `resourceLimits.stackSizeMb`).
+///
+/// Rust's default for a spawned thread is 2 MiB. V8 puts its JS stack limit
+/// ~984 KiB below where the isolate starts and checks only JS frames against
+/// it, so the native frames of an op called at that limit get whatever lies
+/// below. 4 MiB leaves ~3 MiB, so deep recursion through a sync op on a
+/// worker ends in V8's RangeError and never in a native stack overflow that
+/// kills the process (#395, the main thread's side is oam_cli/build.rs).
+///
+/// It is a reservation: pages are committed as the stack grows into them.
+/// node additionally moves the worker's V8 limit down to 192 KiB above the
+/// stack's end, giving worker JS ~3.8 MiB to recurse in where oam's keeps
+/// V8's default; that depth difference is recorded in
+/// docs/node-divergences.md.
+pub(crate) const ISOLATE_THREAD_STACK_SIZE: usize = 4 * 1024 * 1024;
+
+/// Spawn a thread that will run a non-main isolate, with
+/// [`ISOLATE_THREAD_STACK_SIZE`]. Every such thread (a worker, a fork's
+/// prewarmed isolate) goes through here, so the size is set in one place and
+/// `isolate_threads_get_node_sized_stacks` below pins it.
+pub(crate) fn spawn_isolate_thread<F>(
+    name: String,
+    f: F,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name)
+        .stack_size(ISOLATE_THREAD_STACK_SIZE)
+        .spawn(f)
+}
+
 /// Spawn a worker thread. Returns (worker_id, thread_id). The caller
 /// must store the returned handles in the parent's WorkerRegistry.
 pub(crate) struct WorkerOptions {
@@ -487,21 +523,19 @@ pub(crate) fn spawn_worker(
     options: WorkerOptions,
     permissions: std::sync::Arc<crate::permissions::Permissions>,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name(format!("oam-worker-{worker_id}"))
-        .spawn(move || {
-            let exit_code = run_worker(
-                &script_path,
-                worker_data,
-                worker_id,
-                parent_rx,
-                worker_tx.clone(),
-                options,
-                permissions,
-            );
-            let _ = worker_tx.send(WorkerEvent::Exit(exit_code));
-        })
-        .expect("worker thread spawns")
+    spawn_isolate_thread(format!("oam-worker-{worker_id}"), move || {
+        let exit_code = run_worker(
+            &script_path,
+            worker_data,
+            worker_id,
+            parent_rx,
+            worker_tx.clone(),
+            options,
+            permissions,
+        );
+        let _ = worker_tx.send(WorkerEvent::Exit(exit_code));
+    })
+    .expect("worker thread spawns")
 }
 
 fn run_worker(
@@ -640,6 +674,41 @@ fn run_worker(
     // ends, and re-reads exitCode after (a handler may set it).
     rt.emit_process_exit();
     rt.process_exit_code().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+
+    /// Use `frames` x 64 KiB of native stack, so the thread dies of a stack
+    /// overflow if it has less than that.
+    #[inline(never)]
+    fn burn(frames: usize) -> u8 {
+        let mut buf = [0u8; 64 * 1024];
+        std::hint::black_box(&mut buf);
+        if frames == 0 {
+            buf[0]
+        } else {
+            burn(frames - 1).wrapping_add(std::hint::black_box(buf[1]))
+        }
+    }
+
+    /// #395: an op called at V8's JS limit runs its native frames in what the
+    /// thread has left under that limit (~984 KiB below where the isolate
+    /// starts). An isolate thread must be node's 4 MiB worker size, not Rust's
+    /// 2 MiB default. 3 MiB of native frames fit only in the former; under
+    /// the default this test process dies of "has overflowed its stack".
+    #[test]
+    fn isolate_threads_get_node_sized_stacks() {
+        assert_eq!(ISOLATE_THREAD_STACK_SIZE, 4 * 1024 * 1024);
+        let handle = spawn_isolate_thread("oam-stack-test".to_string(), || {
+            std::hint::black_box(burn(48));
+        })
+        .expect("isolate thread spawns");
+        handle
+            .join()
+            .expect("3 MiB of frames fit an isolate thread");
+    }
 }
 
 #[cfg(test)]

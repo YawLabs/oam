@@ -38212,3 +38212,117 @@ fn write_heap_snapshot_needs_the_write_grant() {
         "a snapshot was written despite the denial"
     );
 }
+
+// #395: recursion that calls a sync native op near the bottom of V8's JS
+// stack used to overflow the NATIVE stack on Windows and kill the process
+// ("thread 'main' has overflowed its stack", 0xC00000FD) instead of throwing
+// V8's catchable RangeError. oam.exe's main thread had the linker's 1 MiB
+// default reserve under V8's ~984 KiB JS limit, so the native frames of an op
+// called at the limit had a few tens of KiB to live in; node.exe reserves
+// 8 MiB. Measured on Windows 11 arm64 before the fix: copyFileSync, cpSync and
+// zlib.deflateSync aborted a release build, readdirSync and opendirSync a
+// debug one too. The probe recurses with no op until V8 throws, then calls
+// the op once at the deepest level whose JS frames still fit (the same worst
+// case as an op at every level, for a handful of calls). The worker half runs
+// the same probe on a worker thread.
+const DEEP_NATIVE_PROBE: &str = "const fs = require('node:fs');\n\
+     const path = require('node:path');\n\
+     const zlib = require('node:zlib');\n\
+     const wt = require('node:worker_threads');\n\
+     const file = path.join(__dirname, 'f.txt');\n\
+     if (wt.isMainThread) fs.writeFileSync(file, 'x');\n\
+     function probe(op) {\n\
+       let called = false;\n\
+       function recurse() {\n\
+         try { recurse(); } catch (err) {\n\
+           if (!called) { try { op(); called = true; } catch (inner) { if (!(inner instanceof RangeError)) throw inner; } }\n\
+           throw err;\n\
+         }\n\
+       }\n\
+       try { recurse(); return 'returned'; } catch (err) { return err.constructor.name + ' ' + called; }\n\
+     }\n\
+     const ops = {\n\
+       readdirSync: () => fs.readdirSync(__dirname),\n\
+       copyFileSync: () => fs.copyFileSync(file, path.join(__dirname, 'copy.txt')),\n\
+       deflateSync: () => zlib.deflateSync('abc'),\n\
+     };\n\
+     const out = Object.entries(ops).map(([name, op]) => name + ' ' + probe(op)).join('\\n');\n\
+     if (wt.isMainThread) {\n\
+       console.log(out);\n\
+       const w = new wt.Worker(__filename);\n\
+       w.on('message', (m) => console.log('worker\\n' + m));\n\
+     } else {\n\
+       wt.parentPort.postMessage(out);\n\
+     }\n";
+
+#[test]
+fn deep_recursion_through_native_ops_throws_range_error_not_a_native_overflow() {
+    let script = write_temp("deep_native_395/probe.cjs", DEEP_NATIVE_PROBE);
+    let out = oam(&[script.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let expected = "readdirSync RangeError true\n\
+                    copyFileSync RangeError true\n\
+                    deflateSync RangeError true";
+    assert_eq!(
+        stdout.trim(),
+        format!("{expected}\nworker\n{expected}"),
+        "status {:?}, stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "status {:?}", out.status);
+}
+
+/// The fix itself, read off the binary: oam.exe's PE header reserves the same
+/// 8 MiB main-thread stack node.exe's does (node v22.22.2's header, measured:
+/// SizeOfStackReserve 8388608). Without it the linker's 1 MiB default applies.
+#[cfg(windows)]
+#[test]
+fn windows_exe_reserves_node_sized_main_thread_stack() {
+    let bytes = std::fs::read(env!("CARGO_BIN_EXE_oam")).expect("read oam.exe");
+    let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    assert_eq!(&bytes[pe..pe + 4], b"PE\0\0", "PE signature");
+    let optional = pe + 24;
+    let magic = u16::from_le_bytes(bytes[optional..optional + 2].try_into().unwrap());
+    assert_eq!(magic, 0x20b, "PE32+ optional header");
+    // PE32+: SizeOfStackReserve is the u64 at offset 72 of the optional header.
+    let reserve = u64::from_le_bytes(bytes[optional + 72..optional + 80].try_into().unwrap());
+    assert_eq!(reserve, 8 * 1024 * 1024, "SizeOfStackReserve");
+}
+
+/// #395's own reproducer: `fs.cpSync` of a directory chain 2500 deep with a
+/// `filter`, whose walk is node's JS and recurses once per level. It runs
+/// out of JS stack partway down, and the ops it calls there (opendirSync,
+/// lstatSync, mkdirSync, copyFileSync) run their native frames under V8's
+/// limit -- with oam.exe's old 1 MiB main-thread reserve that overflowed the
+/// native stack and killed the process. node v22.22.2 throws RangeError here
+/// (measured, Windows 11 arm64; it does at 1500 deep too, where oam's walk
+/// still fits -- see docs/node-divergences.md). The chain is made natively so
+/// the test spends its time in the copy.
+#[test]
+fn deep_cp_sync_with_filter_throws_range_error_not_a_native_overflow() {
+    let script = write_temp(
+        "deep_cp_395/cp.cjs",
+        "const fs = require('node:fs');\n\
+         const path = require('node:path');\n\
+         try {\n\
+           fs.cpSync(path.join(__dirname, 'src'), path.join(__dirname, 'dst'),\n\
+             { recursive: true, filter: () => true });\n\
+           console.log('ok');\n\
+         } catch (err) { console.log(err.constructor.name + ': ' + err.message); }\n",
+    );
+    let mut chain = script.parent().unwrap().join("src");
+    for _ in 0..2500 {
+        chain.push("d");
+    }
+    std::fs::create_dir_all(&chain).expect("create the 2500-deep chain");
+    let out = oam(&[script.to_str().unwrap()]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "RangeError: Maximum call stack size exceeded",
+        "status {:?}, stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "status {:?}", out.status);
+}
