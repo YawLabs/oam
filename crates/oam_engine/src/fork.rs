@@ -225,6 +225,8 @@ fn cold_spawn(
             exec_argv: Vec::new(),
             // oam.fork() reads the process environment.
             env: None,
+            inherit_flags: true,
+            creator_flags: None,
         },
         permissions,
     );

@@ -1321,6 +1321,65 @@ entries below were executed on both runtimes unless marked.
 | Web globals | Missing vs Node 22: `CompressionStream`, `DecompressionStream`, `Crypto`, `CryptoKey`, `SubtleCrypto`, `Navigator`, `Performance`, `PerformanceObserver` (and the `Performance*` entry classes), and the `ReadableStream*`/`WritableStream*`/`TransformStream*` controller and reader constructors. The lowercase instances (`crypto`, `performance`, `navigator`) are present, and `getReader()` works — only the constructors are unexposed. | Present. |
 | `ReadableStream` byte streams | Default readers only. `new ReadableStream({ type: 'bytes' })` queues as node's byte controller does -- a high-water mark of 0 unless the strategy names one, `desiredSize` counted in bytes, a chunk that is not an `ArrayBufferView` refused with node's `ERR_INVALID_ARG_TYPE` before anything is queued (the stream stays readable, and a read already waiting is not handed it), and every chunk handed to a reader a `Uint8Array` over the enqueued view's bytes -- so it pulls exactly when node's does and reads what node's reads. What it lacks: the controller is a `ReadableStreamDefaultController` with no `byobRequest`, so `source.autoAllocateChunkSize` is read and 0 refused as node refuses it, but otherwise has nothing to size; `getReader({ mode: 'byob' })` ignores the mode and returns a default reader rather than a `ReadableStreamBYOBReader`; an enqueued view's buffer is not transferred (node detaches it, so the caller's view reads `byteLength` 0 afterwards), so the chunk a reader gets shares memory with the enqueued view, and an enqueued `Uint8Array` is handed on as the same object where node hands on a new view; and a zero-length chunk is accepted where node throws `ERR_INVALID_STATE` (`chunk ArrayBuffer is zero-length or detached`). The byte streams the runtime builds -- `fetch` response bodies, `Response`/`Request` bodies, `Blob#stream()`, `fsPromises.FileHandle.readableWebStream()` -- are byte streams in this sense, as node's are, so none of them reads before a read asks; default-reader and `for await` consumption match byte for byte (`readableWebStream()` on node's 16384-byte `autoAllocateChunkSize` boundaries, from the handle's current cursor), and only a BYOB reader diverges. | Real byte streams, `byobRequest`, buffer transfer, and BYOB readers. |
 
+### 54. `worker_threads`: a Worker's options and its fatal exit, what still differs
+
+Matching node v22.22.2 (no longer divergences; conformance cases 490 and 491):
+
+- **A Worker's process flags (#370).** A Worker given neither `env` (other than `SHARE_ENV` or
+  `process.env` itself) nor `execArgv` shares its creator's options (the creating worker's own,
+  when a worker creates it); given either, it starts from
+  node's defaults, takes `NODE_PENDING_DEPRECATION` and `NODE_OPTIONS` from the environment it is
+  given (its creator's, when it is given none), then its `execArgv` (its creator's
+  `process.execArgv`, when it is given none). `NODE_NO_WARNINGS` is read from the worker's own
+  `process.env`. This covers the per-environment flags oam has: `--no-warnings`,
+  `--no-deprecation`, `--pending-deprecation`, `--disable-warning`, `--redirect-warnings`,
+  `--trace-require-module` and the `--tls-min/max-v1.x` defaults. `--title` and
+  `--zero-fill-buffers` are the whole process's.
+- **`stderr: true` (#370).** What the worker writes to `process.stderr`, the default warning
+  printer included, goes to `worker.stderr`.
+- **A fatal run (#399 items 3 and 4).** The worker emits `'exit'` with 1 on its own `process`
+  before the parent's `'error'` (nothing an `'exit'` listener queues runs; the thread exits with
+  the `exitCode` the listeners leave; no `'exit'` when an `'uncaughtException'` listener threw),
+  the parent's `'error'` carries the error that ended the run (not a failed `import()`, or
+  `require()` of an ES module, that the worker caught) as node's error serializer rebuilds it, a
+  cause chain of any depth included, and nothing is printed.
+
+What still differs, measured on Windows:
+
+- **An `execArgv` flag node refuses.** node's constructor throws `ERR_WORKER_INVALID_EXEC_ARGV`
+  for a flag that is not a per-environment option (`--title=x`, `--expose-gc`) or that it does not
+  know (`--bogus-flag`). oam starts the worker; the flag appears in its `process.execArgv` and has
+  no effect. Only the per-environment flags above, read with the same allowlist as `NODE_OPTIONS`
+  (section 5), take effect.
+- **Values the V8 serializer would keep.** JSON stands in for it, as for `postMessage`: an error
+  property or a thrown object that holds a `Map`, `Set`, `Date`, typed array or `undefined` member
+  reaches the parent as its JSON form (a cyclic one as its `util.inspect` string). Top-level
+  `undefined`, a `BigInt` and a non-finite number are kept. The `UnhandledPromiseRejection` error
+  for a non-`Error` rejection names an object reason `#<Constructor>`, which is what V8's
+  NoSideEffectsToString gives for a plain object, and its `stack` lists oam's frames, not node's.
+- **A thrown `DOMException`, and an `AggregateError`'s `errors`.** node's parent gets a
+  `DOMException` back as an `Error` with message `''` and one own key, `stack`; oam's parent gets
+  the plain object `{ name: 'AbortError' }` (an `Object`, `message` undefined), since a
+  `DOMException` is not `[object Error]` to the serializer. An `AggregateError` arrives as one in
+  both, but node's `errors` entries are rebuilt `Error`s (own keys `stack,message`) where oam's are
+  empty plain objects, the JSON form of an `Error`. Both follow from JSON standing in for the V8
+  serializer (the item above).
+- **`worker.stderr` without `stderr: true`.** node pipes the worker's stderr through
+  `worker.stderr` to `process.stderr`, so a parent listening for `'data'` on it sees the output
+  too (measured: `console.error('ce3')` in a worker, parent collects `"ce3\n"`). oam writes the
+  worker's stderr straight to the process's stderr; the text is printed but `worker.stderr` emits
+  nothing. This predates #370, which only changed `stderr: true`.
+- **A synchronous throw from a CommonJS worker entry's top level.** node runs the ticks queued
+  before the throw first, then handles the throw, and calls each of the worker's
+  `'uncaughtException'` listeners twice for it (measured: `tick 1 | caught #1 | caught #2`, then
+  the promise jobs). oam handles it at once and calls each listener once; on a fatal throw the
+  queued ticks do not run. A throw from an ES module entry, a timer or a promise job matches.
+- **`process.exit()` inside a worker ends the whole process.** node ends only the worker's thread
+  (its `'exit'` event gets the code, and a fatal run whose `'exit'` listener calls
+  `process.exit(4)` exits 4 with no `'error'` event). oam's `process.exit` is the process's
+  `exit`, from any thread. Not addressed by #370 or #399; needs its own change (stopping a
+  worker's isolate from inside an op).
+
 ### 34. `tls.TLSSocket` is a `net.Socket` by brand, not by prototype
 
 In Node `tls.TLSSocket extends net.Socket`. In oam the two cannot share a base: `net.Socket`

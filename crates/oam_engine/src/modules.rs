@@ -259,6 +259,30 @@ pub(crate) struct UncaughtLedger {
     entries: Vec<(v8::Global<v8::Value>, String)>,
 }
 
+/// What the run's first fatal error was: the value thrown (or rejected, for
+/// an unhandled rejection: `from_promise`). The diagnostics carry the
+/// rendered report; a worker hands its parent the value itself, as node's
+/// does (#399).
+#[derive(Default)]
+pub(crate) struct FatalThrown(pub(crate) Option<(v8::Global<v8::Value>, bool)>);
+
+/// Note `value` as the run's fatal error, unless one is noted already (node
+/// reports the first).
+fn note_fatal_thrown(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+    from_promise: bool,
+) {
+    if scope
+        .get_slot::<FatalThrown>()
+        .is_some_and(|noted| noted.0.is_some())
+    {
+        return;
+    }
+    let value = v8::Global::new(scope, value);
+    scope.set_slot(FatalThrown(Some((value, from_promise))));
+}
+
 /// V8 message listener. Zero capture, raw C ABI.
 ///
 /// # Safety
@@ -562,6 +586,7 @@ fn fatal_report(
     frame: Option<String>,
     fallback: &str,
 ) -> String {
+    note_fatal_thrown(tc, exception, false);
     // An ESM top-level throw arrives as a rejected evaluation promise, with
     // no live Message on the scope -- rebuild one from the exception so the
     // report still opens with Node's source frame.
@@ -845,6 +870,7 @@ impl JsRuntime {
         self.isolate.set_slot(ModuleMap::default());
         self.isolate.set_slot(RejectionLedger::default());
         self.isolate.set_slot(UncaughtLedger::default());
+        self.isolate.set_slot(FatalThrown::default());
         self.isolate.set_slot(crate::timers::TimerQueue::default());
         self.isolate.set_slot(crate::cjs::CjsCache::default());
         self.isolate
@@ -1956,6 +1982,7 @@ pub(crate) fn unhandled_rejection_failures(
         ) {
             continue;
         }
+        note_fatal_thrown(tc, reason_local, true);
         fatal.push(Diagnostic::new(
             "OAM-RT0004",
             Severity::Error,
@@ -3204,9 +3231,19 @@ fn dyn_import_load(
     resolved: PathBuf,
     spec: &str,
 ) -> DynResult {
+    // A graph that fails to load here only rejects the import() promise, so
+    // the throw load_module_graph noted as the run's fatal error is not one
+    // (#399 review): a worker that catches it must not later hand its parent
+    // this error in place of the one that ends its run.
+    let noted_before = tc
+        .get_slot::<FatalThrown>()
+        .is_some_and(|noted| noted.0.is_some());
     // Pull the rest of the graph in (idempotent: already-loaded paths skip).
     tc.set_slot(CaughtDuringLoad(None));
     if let Err(diags) = load_module_graph(tc, host, resolved.clone(), false) {
+        if !noted_before && let Some(noted) = tc.get_slot_mut::<FatalThrown>() {
+            noted.0 = None;
+        }
         store_pending_code_cache(tc);
         let caught = tc
             .get_slot_mut::<CaughtDuringLoad>()
@@ -3580,9 +3617,23 @@ fn require_esm_sync(
     tc.get_slot_mut::<RequireDepth>()
         .expect("require depth installed")
         .0 += 1;
+    // A graph that fails here only throws from the require() call, so a
+    // throw its load noted as the run's fatal error is not one (#399, as
+    // dyn_import_load has it): a worker that catches it must not later hand
+    // its parent this error in place of the one that ends its run. One left
+    // uncaught is noted again on the fatal path it takes.
+    let noted_before = tc
+        .get_slot::<FatalThrown>()
+        .is_some_and(|noted| noted.0.is_some());
     let required = require_esm_sync_inner(tc, host, key, parent);
     if let Some(depth) = tc.get_slot_mut::<RequireDepth>() {
         depth.0 -= 1;
+    }
+    if required.is_err()
+        && !noted_before
+        && let Some(noted) = tc.get_slot_mut::<FatalThrown>()
+    {
+        noted.0 = None;
     }
     required
 }
@@ -4255,6 +4306,7 @@ pub(crate) fn catch_to_diagnostic(
     name: &str,
 ) -> Diagnostic {
     if let Some(exception) = tc.exception() {
+        note_fatal_thrown(tc, exception, false);
         let exception = v8::Global::new(tc, exception);
         tc.set_slot(CaughtDuringLoad(Some(exception)));
     }

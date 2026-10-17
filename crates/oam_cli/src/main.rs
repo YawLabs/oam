@@ -785,6 +785,60 @@ fn main() -> ExitCode {
 /// run paths to install (set at most once, before dispatch).
 static NODE_FLAGS: std::sync::OnceLock<NodeFlags> = std::sync::OnceLock::new();
 
+/// The options this process runs with (argv's and NODE_OPTIONS's, with
+/// NODE_PENDING_DEPRECATION folded in), set by the first `install`: what a
+/// worker_threads Worker that is given neither `env` nor `execArgv` runs with.
+static PARENT_OPTIONS: std::sync::OnceLock<NodeFlags> = std::sync::OnceLock::new();
+
+/// A non-enumerable, read-only global the JS side reads a flag from.
+fn define_flag_global(name: &str, value: String) -> String {
+    format!(
+        "Object.defineProperty(globalThis, '{name}', \
+           {{ value: {value}, writable: false, enumerable: false, configurable: false }});"
+    )
+}
+
+/// The flags prelude of a new worker_threads Worker (#370), decided as node's
+/// Worker constructor decides its options (src/node_worker.cc): one given
+/// neither `env` nor `execArgv` (`inherit`) shares its creator's options --
+/// `creator`'s, the creating worker's as it resolved them, or this process's
+/// when the main thread creates it; otherwise it starts from the defaults,
+/// applies NODE_PENDING_DEPRECATION and NODE_OPTIONS from the environment it
+/// starts with, then `exec_argv` (its own, or its creator's process.execArgv
+/// when it was given none). A worker never takes its creator's
+/// per-environment flags otherwise. NODE_NO_WARNINGS is read from the
+/// worker's own environment either way, as node's JS reads it from the
+/// worker's process.env. The process-wide flags (`--title`,
+/// `--zero-fill-buffers`) are every thread's. Returns the prelude and the
+/// options the worker resolved to, for the workers it creates in turn.
+fn worker_flags_js(
+    creator: Option<&oam_engine::WorkerFlagsOptions>,
+    inherit: bool,
+    exec_argv: &[String],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> (String, oam_engine::WorkerFlagsOptions) {
+    let process = PARENT_OPTIONS.get().cloned().unwrap_or_default();
+    let options = if inherit {
+        creator
+            .and_then(|creator| creator.downcast_ref::<NodeFlags>())
+            .unwrap_or(&process)
+            .clone()
+    } else {
+        let mut options = NodeFlags {
+            pending_deprecation: env("NODE_PENDING_DEPRECATION").as_deref() == Some("1"),
+            ..NodeFlags::default()
+        };
+        if let Some(raw) = env("NODE_OPTIONS") {
+            apply_node_options(&mut options, &raw);
+        }
+        apply_node_option_tokens(&mut options, exec_argv);
+        options
+    };
+    let mut js = options.environment_js(env("NODE_NO_WARNINGS").as_deref() == Some("1"));
+    js.push_str(&process.process_js());
+    (js, std::sync::Arc::new(options))
+}
+
 fn dispatch(cli: Cli) -> ExitCode {
     let Some(command) = &cli.command else {
         return repl_command();
@@ -1807,8 +1861,13 @@ fn apply_node_options_env(flags: &mut NodeFlags) -> bool {
 
 /// [`apply_node_options_env`] on a given NODE_OPTIONS value.
 fn apply_node_options(flags: &mut NodeFlags, raw: &str) -> bool {
+    apply_node_option_tokens(flags, &split_node_options(raw))
+}
+
+/// Fold the allowlisted option tokens into `flags` -- NODE_OPTIONS's, once
+/// split, or a worker's `execArgv`. Anything else is ignored.
+fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
     let before = flags.clone();
-    let tokens = split_node_options(raw);
     let mut it = tokens.iter().peekable();
     while let Some(tok) = it.next() {
         let tok = tok.as_str();
@@ -1940,6 +1999,7 @@ struct CliHost;
 /// hand it a constructor (see oam_engine::set_worker_host_factory).
 fn register_worker_host() {
     oam_engine::set_worker_host_factory(|| Box::new(CliHost));
+    oam_engine::set_worker_flags_builder(worker_flags_js);
 }
 
 impl oam_engine::ModuleHost for CliHost {
@@ -2826,29 +2886,49 @@ impl NodeFlags {
     }
 
     fn install(&self, rt: &mut oam_engine::JsRuntime) {
-        let pending = self.pending_deprecation
-            || std::env::var("NODE_PENDING_DEPRECATION").as_deref() == Ok("1");
-        let def = |name: &str, value: String| {
-            format!(
-                "Object.defineProperty(globalThis, '{name}', \
-                   {{ value: {value}, writable: false, enumerable: false, configurable: false }});"
-            )
-        };
+        let env_is_1 = |name: &str| std::env::var(name).as_deref() == Ok("1");
+        // NODE_PENDING_DEPRECATION is one of node's options, read once at
+        // startup; a worker that inherits this process's options inherits it.
+        let mut options = self.clone();
+        options.pending_deprecation |= env_is_1("NODE_PENDING_DEPRECATION");
+        let mut js = options.environment_js(env_is_1("NODE_NO_WARNINGS"));
+        js.push_str(&self.process_js());
+        if !js.is_empty() {
+            let _ = rt.execute_script("<flags>", &js);
+            // oam.fork()'s in-process pool gets its own isolate; publish the
+            // same snippet so it inherits the flags instead of starting
+            // clean. (A worker_threads Worker decides its own: see
+            // worker_flags_js.)
+            oam_engine::set_inherited_flags_js(js);
+        }
+        PARENT_OPTIONS.set(options).ok();
+    }
+
+    /// The flags node keeps per environment -- each worker_threads Worker has
+    /// its own, decided by its `execArgv` and `env` -- as the JS snippet that
+    /// installs them. `no_warnings_env` is NODE_NO_WARNINGS=1 in that
+    /// environment's process.env.
+    fn environment_js(&self, no_warnings_env: bool) -> String {
         let mut js = String::new();
-        if pending {
-            js.push_str(&def("__oamPendingDeprecation", "true".into()));
+        if self.pending_deprecation {
+            js.push_str(&define_flag_global(
+                "__oamPendingDeprecation",
+                "true".into(),
+            ));
         }
         // --no-warnings, and NODE_NO_WARNINGS=1 which is the same thing to
         // node: the default 'warning' listener is not there at all, so
         // `process.listenerCount("warning")` is 0 (the event is still
         // emitted to a program's own listeners).
-        if self.no_warnings || std::env::var("NODE_NO_WARNINGS").as_deref() == Ok("1") {
+        if self.no_warnings || no_warnings_env {
+            let def = define_flag_global;
             js.push_str(&def("__oamNoWarnings", "true".into()));
             js.push_str(
                 "for (const f of globalThis.process.listeners('warning')) \
                    if (f.name === 'onWarning') globalThis.process.removeListener('warning', f);",
             );
         }
+        let def = define_flag_global;
         if self.no_deprecation {
             js.push_str(&def("__oamNoDeprecation", "true".into()));
             js.push_str("globalThis.process.noDeprecation = true;");
@@ -2876,12 +2956,10 @@ impl NodeFlags {
             let p = serde_json::to_string(path).unwrap_or_else(|_| "\"\"".into());
             js.push_str(&def("__oamRedirectWarnings", p));
         }
-        if self.zero_fill_buffers {
-            js.push_str(&def("__oamZeroFillBuffers", "true".into()));
-        }
-        // cjs.rs reads it on the first require() of an ES module. The value
-        // is one of node's two words, so quoting it is all the escaping it
-        // needs.
+        // cjs.rs reads it on the first require() of an ES module. node keeps
+        // it per environment, so a worker's own execArgv / NODE_OPTIONS
+        // decide it. The value is one of node's two words, so quoting it is
+        // all the escaping it needs.
         if let Some(mode) = &self.trace_require_module {
             js.push_str(&def("__oamTraceRequireModule", format!("\"{mode}\"")));
         }
@@ -2895,16 +2973,22 @@ impl NodeFlags {
         if let Some(v) = tls_max {
             js.push_str(&def("__oamTlsMaxVersion", format!("\"{v}\"")));
         }
+        js
+    }
+
+    /// The flags node keeps for the whole process (a Worker refuses them in
+    /// its `execArgv` with ERR_WORKER_INVALID_EXEC_ARGV, and every thread
+    /// has them), as the JS snippet that installs them.
+    fn process_js(&self) -> String {
+        let mut js = String::new();
+        if self.zero_fill_buffers {
+            js.push_str(&define_flag_global("__oamZeroFillBuffers", "true".into()));
+        }
         if let Some(title) = &self.title {
             let t = serde_json::to_string(title).unwrap_or_else(|_| "\"\"".into());
             js.push_str(&format!("globalThis.process.title = {t};"));
         }
-        if !js.is_empty() {
-            let _ = rt.execute_script("<flags>", &js);
-            // Workers and forks get their own isolate; publish the same
-            // snippet so they inherit the flags instead of starting clean.
-            oam_engine::set_inherited_flags_js(js);
-        }
+        js
     }
 
     /// Apply `--env-file` before the program runs. Node parses these in C++
@@ -4168,6 +4252,63 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(spaced.exec_argv(), vec!["--v8-pool-size", "4"]);
+    }
+
+    #[test]
+    fn a_worker_given_env_or_exec_argv_decides_its_own_flags() {
+        // #370, node v22.22.2's Worker: given either, the worker starts from
+        // the defaults, takes NODE_OPTIONS from the environment it is given,
+        // then its execArgv; NODE_NO_WARNINGS is its own environment's.
+        // (The main thread's inheriting path reads PARENT_OPTIONS,
+        // process-global state conformance case 490 covers end to end.)
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (none, _) = super::worker_flags_js(None, false, &[], &env(&[]));
+        assert!(!none.contains("__oamNoWarnings"), "{none}");
+        let (quiet, _) =
+            super::worker_flags_js(None, false, &[], &env(&[("NODE_NO_WARNINGS", "1")]));
+        assert!(quiet.contains("__oamNoWarnings"), "{quiet}");
+        let (argv, _) = super::worker_flags_js(None, false, &args(&["--no-warnings"]), &env(&[]));
+        assert!(argv.contains("__oamNoWarnings"), "{argv}");
+        let (options, _) = super::worker_flags_js(
+            None,
+            false,
+            &args(&["--tls-min-v1.3"]),
+            &env(&[("NODE_OPTIONS", "--no-deprecation --tls-min-v1.0")]),
+        );
+        assert!(options.contains("__oamNoDeprecation"), "{options}");
+        // Both minimums set: node's precedence takes the lowest.
+        assert!(options.contains("\"TLSv1\""), "{options}");
+        let (pending, _) =
+            super::worker_flags_js(None, false, &[], &env(&[("NODE_PENDING_DEPRECATION", "1")]));
+        assert!(pending.contains("__oamPendingDeprecation"), "{pending}");
+        // --trace-require-module is per environment in node too: a worker's
+        // own execArgv sets it, and one given execArgv: [] does not have it.
+        let (traced, _) = super::worker_flags_js(
+            None,
+            false,
+            &args(&["--trace-require-module=all"]),
+            &env(&[]),
+        );
+        assert!(traced.contains("__oamTraceRequireModule"), "{traced}");
+        assert!(!none.contains("__oamTraceRequireModule"), "{none}");
+        // A worker that inherits takes its creator's resolved options: a
+        // worker given `--no-warnings` creates one with no options, and that
+        // one has no 'warning' listener either. Given an execArgv instead, it
+        // starts from the defaults again.
+        let (_, creator) =
+            super::worker_flags_js(None, false, &args(&["--no-warnings"]), &env(&[]));
+        let (inner, _) = super::worker_flags_js(Some(&creator), true, &[], &env(&[]));
+        assert!(inner.contains("__oamNoWarnings"), "{inner}");
+        let (fresh, _) = super::worker_flags_js(Some(&creator), false, &[], &env(&[]));
+        assert!(!fresh.contains("__oamNoWarnings"), "{fresh}");
     }
 }
 

@@ -145,11 +145,14 @@ impl super::JsRuntime {
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
 
-        if crate::cjs::load_cjs(tc, entry).is_none() {
-            return Err(vec![crate::modules::catch_to_diagnostic(
-                tc,
-                &entry.to_string_lossy(),
-            )]);
+        // A synchronous throw from the entry's top level is offered to the
+        // worker's own 'uncaughtException' listeners first, as the main
+        // thread's is (run_cjs_entry); only an unhandled one fails the run.
+        if crate::cjs::load_cjs(tc, entry).is_none()
+            && let Some(failure) =
+                crate::modules::handle_uncaught_throw(tc, &entry.to_string_lossy())
+        {
+            return Err(failure);
         }
         if let Some(failure) = crate::modules::run_ticks_and_microtasks(tc) {
             return Err(failure);
@@ -162,6 +165,50 @@ impl super::JsRuntime {
             Some(failures) => Err(failures),
             None => Ok(()),
         }
+    }
+
+    /// End a worker whose run failed fatally as node's
+    /// workerOnGlobalUncaughtException does (lib/internal/main/worker_thread.js,
+    /// #399): unless the process is already exiting, set process.exitCode to
+    /// 1 and emit 'exit' with it -- a throw from a listener is ignored, and
+    /// nothing a listener queues runs; when an 'uncaughtException' listener
+    /// threw (the fatal sub-code 7 dispatch_uncaught stamps), 'exit' is not
+    /// emitted at all, as node's `handlerThrew` skips it -- then serialize
+    /// what the run threw, for the parent's 'error' event. The serialized
+    /// form is JSON text, parsed only by the parent's JS (serde_json's
+    /// nesting limit would refuse a deep cause chain). `None` when the
+    /// failure threw no value (or the serializer could not run).
+    pub(crate) fn worker_fatal_exit(&mut self) -> Option<String> {
+        let _ = self.execute_script_draining(
+            "<worker-fatal-exit>",
+            "(function () { \
+               var p = globalThis.__oamProcessRef || globalThis.process; \
+               var g = globalThis.process; \
+               var handlerThrew = (g && g.__oamFatalCode === 7) || (p && p.__oamFatalCode === 7); \
+               if (p && !p._exiting) { \
+                 try { \
+                   p._exiting = true; p.exitCode = 1; \
+                   if (!handlerThrew) p.emit('exit', p.exitCode); \
+                 } catch (_) {} \
+               } \
+             })();",
+            crate::AfterScript::Nothing,
+        );
+        let (thrown, from_promise) = self
+            .isolate
+            .get_slot_mut::<crate::modules::FatalThrown>()
+            .and_then(|noted| noted.0.take())?;
+        v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
+        v8::tc_scope!(let tc, scope);
+        let context = tc.get_current_context();
+        let global = context.global(tc);
+        let key = v8::String::new(tc, "__oamSerializeWorkerError")?;
+        let serialize = v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()?;
+        let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+        let thrown = v8::Local::new(tc, &thrown);
+        let from_promise: v8::Local<v8::Value> = v8::Boolean::new(tc, from_promise).into();
+        let json = serialize.call(tc, recv, &[thrown, from_promise])?;
+        json.is_string().then(|| json.to_rust_string_lossy(tc))
     }
 }
 
@@ -333,6 +380,29 @@ impl WorkerEnv {
             base: pairs("base")?,
         })
     }
+
+    /// The value of `name` in this environment: the worker's own pairs, or
+    /// the shared store as it is now; folding case where the store does.
+    pub(crate) fn get(&self, name: &str) -> Option<String> {
+        let shared;
+        let pairs = match self.shared {
+            Some(id) => {
+                shared = shared_env_read(id)?.1;
+                &shared
+            }
+            None => &self.pairs,
+        };
+        pairs
+            .iter()
+            .find(|(key, _)| {
+                if self.fold {
+                    key.eq_ignore_ascii_case(name)
+                } else {
+                    key == name
+                }
+            })
+            .map(|(_, value)| value.clone())
+    }
 }
 
 /// An environment store shared between threads through SHARE_ENV. The
@@ -400,6 +470,12 @@ pub(crate) struct WorkerOptions {
     /// `None` only for a caller that passed no `env` (the worker then reads
     /// the process environment, as before).
     pub env: Option<WorkerEnv>,
+    /// The Worker was given neither `env` (or SHARE_ENV) nor `execArgv`:
+    /// it runs with its creator's options, as node's does (#370).
+    pub inherit_flags: bool,
+    /// The creating worker's resolved options; `None` when the main thread
+    /// (or oam.fork()) creates it.
+    pub creator_flags: Option<crate::WorkerFlagsOptions>,
 }
 
 pub(crate) fn spawn_worker(
@@ -442,7 +518,18 @@ fn run_worker(
         pipe_stderr,
         exec_argv,
         env,
+        inherit_flags,
+        creator_flags,
     } = options;
+    // Decided before `env` moves into the runtime: the flags read the
+    // environment the worker starts with.
+    let flags_js = crate::worker_flags_builder().map(|build| {
+        let lookup = |name: &str| match &env {
+            Some(env) => env.get(name),
+            None => std::env::var(name).ok(),
+        };
+        build(creator_flags.as_ref(), inherit_flags, &exec_argv, &lookup)
+    });
     // Worker isolate: no fork pool (same recursion hazard as the prewarm
     // path -- a worker that installed a pool would spawn prewarm threads that
     // each spawn more pools). A nested oam.fork() inside a worker cold-spawns
@@ -473,36 +560,49 @@ fn run_worker(
             &format!("globalThis.process.execArgv = {json};"),
         );
     }
-    // Inherit the parent's process-level flags (--no-warnings etc.); a
-    // fresh isolate would otherwise start with none of them.
-    if let Some(js) = crate::inherited_flags_js() {
-        let _ = rt.execute_script("<flags>", js);
-    }
-    // The worker's own `execArgv: ["--no-warnings"]`: its process has no
-    // default 'warning' listener, as node's has none.
-    if exec_argv.iter().any(|arg| arg == "--no-warnings") {
-        let _ = rt.execute_script(
-            "<worker-flags>",
-            "for (const f of globalThis.process.listeners('warning')) \
-               if (f.name === 'onWarning') globalThis.process.removeListener('warning', f);",
-        );
-    }
-    // Its own `--trace-warnings` / `--trace-deprecation`: defined on its
-    // process as the CLI defines them on the main thread's, which is where
-    // the default printer reads them. (The other flags a worker may be given
-    // are not applied per worker.)
-    for (flag, name) in [
-        ("--trace-warnings", "traceProcessWarnings"),
-        ("--trace-deprecation", "traceDeprecation"),
-    ] {
-        if exec_argv.iter().any(|arg| arg == flag) {
-            let _ = rt.execute_script(
-                "<worker-flags>",
-                &format!(
-                    "Object.defineProperty(globalThis.process, '{name}', \
-                       {{ value: true, writable: false, enumerable: true, configurable: true }});"
-                ),
-            );
+    // The worker's process-level flags (--no-warnings etc.), decided by its
+    // own `execArgv` and `env` as node decides them (#370); a fresh isolate
+    // would otherwise start with none of them.
+    match flags_js {
+        Some((js, resolved)) => {
+            if !js.is_empty() {
+                let _ = rt.execute_script("<flags>", &js);
+            }
+            // What a Worker this one creates with neither `env` nor
+            // `execArgv` inherits.
+            rt.isolate.set_slot(crate::CreatorFlags(resolved));
+        }
+        // No builder registered (an embedder without the CLI): the parent's
+        // flags, and the worker's own `execArgv: ["--no-warnings"]`.
+        None => {
+            if let Some(js) = crate::inherited_flags_js() {
+                let _ = rt.execute_script("<flags>", js);
+            }
+            if exec_argv.iter().any(|arg| arg == "--no-warnings") {
+                let _ = rt.execute_script(
+                    "<worker-flags>",
+                    "for (const f of globalThis.process.listeners('warning')) \
+                       if (f.name === 'onWarning') globalThis.process.removeListener('warning', f);",
+                );
+            }
+            // Its own `--trace-warnings` / `--trace-deprecation`, defined on
+            // its process as the CLI defines them on the main thread's, which
+            // is where the default printer reads them. (With a builder, the
+            // worker's resolved options carry them.)
+            for (flag, name) in [
+                ("--trace-warnings", "traceProcessWarnings"),
+                ("--trace-deprecation", "traceDeprecation"),
+            ] {
+                if exec_argv.iter().any(|arg| arg == flag) {
+                    let _ = rt.execute_script(
+                        "<worker-flags>",
+                        &format!(
+                            "Object.defineProperty(globalThis.process, '{name}', \
+                               {{ value: true, writable: false, enumerable: true, configurable: true }});"
+                        ),
+                    );
+                }
+            }
         }
     }
     // The entry is looked for on the worker's own thread, as node's is
@@ -516,16 +616,25 @@ fn run_worker(
         }
     };
     if let Err(diagnostics) = rt.execute_worker_as(&entry, kind, ctx) {
-        for d in &diagnostics {
-            eprintln!("worker {thread_id}: {}", d.message);
-        }
-        let _ = to_parent.send(WorkerEvent::Error(oam_core::worker::WorkerError::message(
-            diagnostics
-                .first()
-                .map(|d| d.message.clone())
-                .unwrap_or_else(|| "unknown worker error".to_string()),
-        )));
-        return 1;
+        // The run failed fatally. node's worker ends as
+        // workerOnGlobalUncaughtException has it (#399): 'exit' with 1 on the
+        // worker's own process first, then the error itself -- serialized,
+        // not a rendered report, and printed by no one but a parent that
+        // leaves 'error' unhandled -- and the thread exits with the exitCode
+        // the listeners leave. A failure no value was thrown for (a module
+        // that cannot be found or linked, a top-level await that never
+        // settles) is reported by its message.
+        let event = match rt.worker_fatal_exit() {
+            Some(serialized) => WorkerEvent::Thrown(serialized),
+            None => WorkerEvent::Error(oam_core::worker::WorkerError::message(
+                diagnostics
+                    .first()
+                    .map(|d| d.message.clone())
+                    .unwrap_or_else(|| "unknown worker error".to_string()),
+            )),
+        };
+        let _ = to_parent.send(event);
+        return rt.process_exit_code().unwrap_or(1);
     }
     // Node emits 'exit' on the worker's own process object before the thread
     // ends, and re-reads exitCode after (a handler may set it).

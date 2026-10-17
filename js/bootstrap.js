@@ -4543,6 +4543,173 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   });
 })();
 
+// What a worker thread's fatal error becomes for its parent's 'error' event
+// (#399): node's serializeError (lib/internal/error_serdes.js, v22.22.2), with
+// JSON standing in for the V8 serializer as it does for oam's postMessage.
+// An Error whose prototype chain holds one of the seven built-in error
+// constructors is sent as that constructor's name plus every data property
+// along its chain (node's TryGetAllProperties: getters read, functions and
+// symbols dropped, a `cause` serialized in turn); a Symbol, a value with a
+// custom inspect, and anything structuredClone refuses (a function) are sent
+// as their util.inspect string (a Symbol comes back as Symbol.for of its
+// description); anything else as itself. A rejection that is
+// not error-like (no own `stack`) becomes node's UnhandledPromiseRejection
+// error first. The parent half is workerError in node_compat.js.
+(() => {
+  const ERROR_NAMES = new Set([
+    "Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError",
+  ]);
+  const inspect = (value) => {
+    try {
+      return globalThis.__oamNode.get("util").inspect(value);
+    } catch {
+      try {
+        return String(value);
+      } catch {
+        return "<unprintable value>";
+      }
+    }
+  };
+  // A property value, tagged where JSON alone would lose it.
+  function encodeValue(value) {
+    if (value === undefined) return { u: 1 };
+    if (typeof value === "bigint") return { big: String(value) };
+    if (typeof value === "number" && !Number.isFinite(value)) return { num: String(value) };
+    try {
+      const json = JSON.stringify(value);
+      if (json !== undefined) return { j: JSON.parse(json) };
+    } catch {
+      // cyclic, or a BigInt inside: fall back to its inspection
+    }
+    return { s: inspect(value) };
+  }
+  function allProperties(object, target) {
+    const all = { __proto__: null };
+    if (object === null) return all;
+    Object.assign(all, allProperties(Object.getPrototypeOf(object), target));
+    for (const key of Object.getOwnPropertyNames(object)) {
+      // oam's own mark on an error an 'uncaughtException' listener threw
+      // (dispatchUncaught in node_compat.js) is not the program's.
+      if (key === "__oamHandlerThrow") continue;
+      let descriptor;
+      try {
+        descriptor = Object.getOwnPropertyDescriptor(object, key);
+      } catch {
+        continue;
+      }
+      const getter = descriptor.get;
+      if (getter && key !== "__proto__") {
+        try {
+          descriptor.value = getter.call(target);
+          delete descriptor.get;
+          delete descriptor.set;
+        } catch {
+          // left as the accessor it is, and so dropped below
+        }
+      }
+      if (key === "cause" && "value" in descriptor) {
+        descriptor.value = { cause: serialize(descriptor.value) };
+      }
+      if (
+        "value" in descriptor &&
+        typeof descriptor.value !== "function" &&
+        typeof descriptor.value !== "symbol"
+      ) {
+        delete descriptor.get;
+        delete descriptor.set;
+        all[key] = descriptor;
+      }
+    }
+    return all;
+  }
+  function serialize(error) {
+    // node sends a Symbol as its inspection and the parent makes it
+    // Symbol.for(<the description>) again.
+    if (typeof error === "symbol") return { kind: "symbol", value: error.description ?? "" };
+    try {
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        Object.prototype.toString.call(error) === "[object Error]"
+      ) {
+        for (let current = error; current !== null; current = Object.getPrototypeOf(current)) {
+          const constructor = Object.getOwnPropertyDescriptor(current, "constructor");
+          const name = constructor && constructor.value &&
+            Object.getOwnPropertyDescriptor(constructor.value, "name");
+          if (name && ERROR_NAMES.has(name.value)) {
+            const props = [];
+            const all = allProperties(error, error);
+            for (const key of Object.keys(all)) {
+              const d = all[key];
+              const value = key === "cause" && d.value && "cause" in d.value
+                ? { err: d.value.cause }
+                : encodeValue(d.value);
+              props.push([key, value, !!d.enumerable, !!d.writable, !!d.configurable]);
+            }
+            return { kind: "error", ctor: name.value, props };
+          }
+        }
+      }
+    } catch {
+      // continue regardless, as node's does
+    }
+    try {
+      if (error != null && Object.prototype.hasOwnProperty.call(error, Symbol.for("nodejs.util.inspect.custom"))) {
+        return { kind: "string", value: inspect(error) };
+      }
+    } catch {
+      // continue
+    }
+    try {
+      globalThis.structuredClone(error);
+      return { kind: "value", value: encodeValue(error) };
+    } catch {
+      return { kind: "string", value: inspect(error) };
+    }
+  }
+  // node's UnhandledPromiseRejection (lib/internal/process/promises.js); the
+  // reason is named as V8's NoSideEffectsToString names it, for a primitive
+  // its string and for an object `#<Constructor>`.
+  function unhandledRejection(reason) {
+    let named;
+    if (reason !== null && (typeof reason === "object" || typeof reason === "function")) {
+      let constructor;
+      try {
+        constructor = reason.constructor && reason.constructor.name;
+      } catch {
+        constructor = undefined;
+      }
+      named = `#<${constructor || "Object"}>`;
+    } else {
+      named = String(reason);
+    }
+    const err = new Error(
+      "This error originated either by throwing inside of an async function without a catch block, " +
+        "or by rejecting a promise which was not handled with .catch()." +
+        ` The promise rejected with the reason "${named}".`,
+    );
+    err.code = "ERR_UNHANDLED_REJECTION";
+    err.name = "UnhandledPromiseRejection";
+    return err;
+  }
+  function __oamSerializeWorkerError(thrown, fromPromise) {
+    let error = thrown;
+    if (
+      fromPromise &&
+      !(typeof thrown === "object" && thrown !== null && Object.prototype.hasOwnProperty.call(thrown, "stack"))
+    ) {
+      error = unhandledRejection(thrown);
+    }
+    return JSON.stringify(serialize(error));
+  }
+  Object.defineProperty(globalThis, "__oamSerializeWorkerError", {
+    value: __oamSerializeWorkerError,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+})();
+
 // Source-position remap for transpiled files, Node --enable-source-maps
 // style but on by default: oam's codegen REFLOWS .ts/.tsx/.cts (Node's
 // strip-only pipeline preserves positions), so without this every

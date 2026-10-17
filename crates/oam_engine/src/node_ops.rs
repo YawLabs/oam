@@ -1990,6 +1990,16 @@ fn op_stderr_write(
 ) {
     if let Some(bytes) = arg_bytes(scope, &args, 0) {
         use std::io::Write;
+        // In a worker started with { stderr: true }, output -- its warnings
+        // included -- belongs to the parent's worker.stderr stream (#370).
+        if let Some(ctx) = scope.get_slot::<oam_core::worker::WorkerContext>()
+            && ctx.pipe_stderr
+        {
+            let _ = ctx
+                .outbox
+                .send(oam_core::worker::WorkerEvent::Stderr(bytes));
+            return;
+        }
         // A stderr the program closed is EBADF, as for stdout: std's stderr
         // would report the write to a closed descriptor as done.
         if let Some(e) = oam_core::closed_stdio_error(2) {
@@ -9187,6 +9197,15 @@ fn op_worker_new(
             })
             .unwrap_or_default(),
         env,
+        // Absent (an older caller): the creator's options, as before.
+        inherit_flags: options
+            .get("inheritFlags")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        // A worker creating one hands it its own options to inherit.
+        creator_flags: scope
+            .get_slot::<crate::CreatorFlags>()
+            .map(|flags| flags.0.clone()),
     };
 
     // Not looked for here: node's Worker constructor never opens its entry,
