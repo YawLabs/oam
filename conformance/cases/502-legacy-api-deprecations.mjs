@@ -1,14 +1,16 @@
 // Deprecations node v22.22.2 emits at runtime that oam was missing (#368):
 //   - DEP0040, the `punycode` module, once, when it is first loaded -- by
-//     require, import or process.getBuiltinModule. node does not warn when a
-//     file under node_modules loads it first; it looks for "/node_modules/" in
-//     the stack, so on Windows, where the paths are written with backslashes,
-//     it warns all the same (probed: v22.22.2 on win32 warns, on linux not).
-//     An ES module's frame is named by its file:// URL, which is written with
-//     forward slashes everywhere, so a package's ES module that loads it
-//     (process.getBuiltinModule in its body) is skipped on every platform. The
-//     name is the script's, not a `//# sourceURL=`: eval'd code that names
-//     itself under node_modules is still warned about.
+//     require, import, module.require or process.getBuiltinModule. node
+//     skips the warning when a file under node_modules loads it, but its
+//     check (isInsideNodeModules, node_util.cc) looks at only the first 10
+//     stack frames and lets the first non-builtin one decide: require()
+//     spends all 10 in node's CommonJS loader and import its ES module
+//     loader, so node warns even when a package loads it that way (probed:
+//     v22.22.2 on win32 and linux alike); module.require and
+//     process.getBuiltinModule reach their caller, so a package -- CommonJS
+//     or ES module -- that loads it either of those ways is not warned
+//     about. The name is the script's, not a `//# sourceURL=`: eval'd code
+//     that names itself under node_modules is still warned about.
 //   - DEP0044 util.isArray and DEP0060 util._extend, each on its first call.
 //   - DEP0121 net._setSimultaneousAccepts, on its first call.
 //   - DEP0025 the `sys` module (util under its old name), when first loaded.
@@ -35,6 +37,8 @@ write("node_modules/dep/package.json", JSON.stringify({ name: "dep", main: "inde
 write("node_modules/dep/index.js", `module.exports = require("punycode").encode("münchen");\n`);
 write("node_modules/dep/esm.mjs", `import punycode from "punycode";\nexport default punycode.decode("mnchen-3ya");\n`);
 write("node_modules/dep/gbm.mjs", `export default process.getBuiltinModule("punycode").encode("mañana");\n`);
+write("node_modules/dep/gbm.js", `module.exports = process.getBuiltinModule("punycode").encode("mañana");\n`);
+write("node_modules/dep/mr.js", `module.exports = module.require("punycode").encode("ab-");\n`);
 write(
   "punycode.js",
   `${hear}const punycode = require("punycode");
@@ -56,6 +60,14 @@ write(
 write(
   "punycode-esm-builtin-from-node-modules.mjs",
   `${hear}import encoded from "dep/gbm.mjs";\nconsole.log("dep says", encoded);\n`,
+);
+write(
+  "punycode-cjs-builtin-from-node-modules.js",
+  `${hear}console.log("dep says", require("dep/gbm.js"));\n`,
+);
+write(
+  "punycode-module-require-from-node-modules.js",
+  `${hear}console.log("dep says", require("dep/mr.js"));\n`,
 );
 write(
   "punycode-eval-sourceurl.js",
@@ -135,6 +147,8 @@ try {
     "punycode-from-node-modules.js",
     "punycode-esm-from-node-modules.mjs",
     "punycode-esm-builtin-from-node-modules.mjs",
+    "punycode-cjs-builtin-from-node-modules.js",
+    "punycode-module-require-from-node-modules.js",
     "punycode-eval-sourceurl.js",
     "punycode-import.mjs",
     "punycode-builtin.js",

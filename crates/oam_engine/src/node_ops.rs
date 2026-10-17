@@ -235,9 +235,6 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("stopSignal", op_stop_signal),
         // V8 Object::GetConstructorName -- used by util.inspect for null-proto labels.
         ("getConstructorName", op_get_constructor_name),
-        // Whether a stack frame's script name is an ES module's own source,
-        // which node names by its file:// URL (modules.rs).
-        ("isEsModuleSource", op_is_es_module_source),
         // Buffer#toString / *Slice for utf8, latin1, ascii and ucs2: V8's own
         // decoders, the ones node calls (buffer_ops.rs).
         ("bufferDecode", op_buffer_decode),
@@ -7172,17 +7169,6 @@ fn op_get_constructor_name(
     }
 }
 
-fn op_is_es_module_source(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let found = args.get(0).is_string()
-        && arg_string(scope, &args, 0)
-            .is_some_and(|name| crate::modules::is_es_module_source(scope, &name));
-    rv.set(v8::Boolean::new(scope, found).into());
-}
-
 fn op_make_require(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -7351,8 +7337,12 @@ fn op_fs_stat_sync(
     };
     // statSync / lstatSync's `throwIfNoEntry`, passed as the caller gave
     // it: as in node's binding only `false` itself turns the throw off, and
-    // then only for a path that is not there -- ENOENT, or ENOTDIR for one
-    // under a file -- which answers undefined (#392). Returning undefined
+    // then only for a path that is not there, which answers undefined
+    // (#392): ENOENT, and for statSync alone ENOTDIR (a path under a file).
+    // node's Stat binding spares both, its LStat binding ENOENT only
+    // (is_uv_error_except_no_entry_dir vs is_uv_error_except_no_entry,
+    // src/node_file.cc), so lstatSync('<file>/x', { throwIfNoEntry: false })
+    // still throws ENOTDIR on POSIX. Returning undefined
     // here rather than catching in JS spares the existence check the error
     // object and its stack, which is the point of the option.
     let no_throw_if_no_entry = args.get(2).is_false();
@@ -7360,7 +7350,11 @@ fn op_fs_stat_sync(
         Ok(record) => return_stat_record(scope, &mut rv, values, &record),
         Err(e)
             if no_throw_if_no_entry
-                && matches!(oam_core::node_error_code(&e), "ENOENT" | "ENOTDIR") =>
+                && match oam_core::node_error_code(&e) {
+                    "ENOENT" => true,
+                    "ENOTDIR" => !lstat,
+                    _ => false,
+                } =>
         {
             rv.set_undefined();
         }

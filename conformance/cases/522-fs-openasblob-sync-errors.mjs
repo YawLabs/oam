@@ -10,7 +10,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-const D = fs.mkdtempSync(path.join(os.tmpdir(), "oam-case-522-"));
+// Real path, as cases 510/511: macOS's tmpdir sits under the /var ->
+// /private/var symlink, and node --permission refuses a main-module path
+// that crosses a symlink (resolveMainPath's realpathSync stats it), so the
+// child would die before its first row.
+const D = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "oam-case-522-")));
 const scrub = (s) => String(s).replaceAll(D, "<D>");
 const desc = (e) => `${e.constructor.name} ${e.code} ${JSON.stringify(scrub(e.message))} own=${Object.keys(e).join("|")}`;
 async function call(label, fn) {
