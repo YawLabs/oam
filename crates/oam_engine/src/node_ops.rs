@@ -215,6 +215,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // data, propagated across promise continuations by V8 itself.
         ("getContinuationData", op_get_continuation_data),
         ("setContinuationData", op_set_continuation_data),
+        // The queueMicrotask wrapper's catch: the uncaught ladder, with a
+        // fatal outcome noted for the throw that follows (#398).
+        ("dispatchMicrotaskThrow", op_dispatch_microtask_throw),
         // Timer ref/unref: flip the native TimerQueue ref flag so an unref'd
         // timer no longer keeps the event loop alive (Node Timeout#ref/#unref).
         ("timerRef", timer_ref),
@@ -7110,6 +7113,20 @@ fn op_get_continuation_data(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     rv.set(scope.get_continuation_preserved_embedder_data());
+}
+
+fn op_dispatch_microtask_throw(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    match crate::modules::dispatch_microtask_throw(scope, args.get(0)) {
+        Ok(handled) => rv.set_bool(handled),
+        Err(thrown) => {
+            let thrown = v8::Local::new(scope, &thrown);
+            scope.throw_exception(thrown);
+        }
+    }
 }
 
 fn op_set_continuation_data(

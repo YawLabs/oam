@@ -256,7 +256,95 @@ fn park_entry_evaluation(
 
 #[derive(Default)]
 pub(crate) struct UncaughtLedger {
-    entries: Vec<(v8::Global<v8::Value>, String)>,
+    entries: Vec<UncaughtEntry>,
+    /// Set by the queueMicrotask wrapper ([`dispatch_microtask_throw`]) just
+    /// before its fatal throw reaches [`message_listener`].
+    next_fatal: Option<FatalThrow>,
+    /// The throw-site frame for a `next_fatal` that a listener threw.
+    next_frame: Option<String>,
+    /// The listener ended a checkpoint at a fatal throw
+    /// ([`host_checkpoint`] lifts the termination).
+    terminated: bool,
+}
+
+/// One throw V8 reported outside any TryCatch.
+pub(crate) struct UncaughtEntry {
+    value: v8::Global<v8::Value>,
+    /// `file:line: message`, the fallback report text.
+    text: String,
+    /// Already dispatched by the queueMicrotask wrapper, and fatal: the
+    /// drain reports it without running the ladder a second time.
+    fatal: Option<FatalThrow>,
+    /// The throw site's frame, for a listener's own throw: its report
+    /// names the listener's line, as node's does.
+    frame: Option<String>,
+}
+
+/// Why a microtask throw the wrapper already dispatched is fatal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FatalThrow {
+    /// Nothing consumed it.
+    NoConsumer,
+    /// An 'uncaughtException' (or monitor) listener threw; node exits 7.
+    ListenerThrew,
+}
+
+/// `natives.dispatchMicrotaskThrow(err)`, from the queueMicrotask wrapper's
+/// catch: run the uncaught ladder on a microtask's throw. Ok(true): a
+/// listener took it. Ok(false): nothing did; the wrapper rethrows `err`,
+/// noted here as an already-dispatched fatal (#398). Err(thrown): a
+/// listener threw; the caller throws that, noted the same way, with its
+/// throw-site frame kept here -- by the time V8 reports a microtask's throw
+/// it has rebuilt the Message from the error's stack, which points at
+/// `new Error` rather than the `throw` node's report shows.
+pub(crate) fn dispatch_microtask_throw(
+    scope: &mut v8::PinScope<'_, '_>,
+    err: v8::Local<'_, v8::Value>,
+) -> Result<bool, v8::Global<v8::Value>> {
+    v8::tc_scope!(let tc, scope);
+    let (fatal, frame, outcome) = match dispatch_uncaught(tc, err) {
+        Uncaught::Handled => return Ok(true),
+        Uncaught::Fatal => (FatalThrow::NoConsumer, None, Ok(false)),
+        Uncaught::HandlerThrew { value, frame, .. } => {
+            (FatalThrow::ListenerThrew, frame, Err(value))
+        }
+    };
+    if let Some(ledger) = tc.get_slot_mut::<UncaughtLedger>() {
+        ledger.next_fatal = Some(fatal);
+        ledger.next_frame = frame;
+    }
+    outcome
+}
+
+/// A microtask checkpoint the host runs with no JS on the stack. A fatal
+/// microtask throw ends it where it happens: node exits at the throw, so no
+/// later promise job of the same drain runs (#398). The message listener
+/// terminates execution for that; this lifts the termination again, so the
+/// report and the 'exit' listeners can run. The fatal entry stays on the
+/// ledger for the caller's drain ([`drain_uncaught`]).
+pub(crate) fn host_checkpoint(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) {
+    tc.perform_microtask_checkpoint();
+    lift_fatal_termination(tc);
+}
+
+/// Undo the termination [`message_listener`] requested for a fatal throw.
+fn lift_fatal_termination(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>) {
+    let terminated = tc
+        .get_slot_mut::<UncaughtLedger>()
+        .is_some_and(|ledger| std::mem::take(&mut ledger.terminated));
+    if terminated {
+        tc.cancel_terminate_execution();
+        tc.reset();
+    }
+}
+
+/// Whether the ledger holds a fatal throw the wrapper already dispatched.
+fn fatal_pending(scope: &mut v8::PinScope<'_, '_>) -> bool {
+    scope
+        .get_slot::<UncaughtLedger>()
+        .is_some_and(|ledger| ledger.entries.iter().any(|entry| entry.fatal.is_some()))
 }
 
 /// What the run's first fatal error was: the value thrown (or rejected, for
@@ -310,10 +398,34 @@ pub(crate) unsafe extern "C" fn message_listener(
         line = src_line as usize;
     }
     let value = v8::Global::new(scope, exception);
+    let (fatal, frame) = scope
+        .get_slot_mut::<UncaughtLedger>()
+        .map(|ledger| (ledger.next_fatal.take(), ledger.next_frame.take()))
+        .unwrap_or_default();
+    // End the checkpoint at a fatal throw, when the host runs it with no JS
+    // on the stack ([`host_checkpoint`] lifts the termination): the next
+    // microtask stops at its first instruction and V8 drops the rest of the
+    // queue. With JS on the stack (a checkpoint inside a dynamic import) the
+    // termination would unwind that JS too, so the throw is only recorded
+    // there and reported at the next drain. Not in a worker: node's worker
+    // still runs the rest of the drain before it stops (conformance case
+    // 474).
+    let terminate = fatal.is_some()
+        && scope
+            .get_slot::<oam_core::worker::WorkerContext>()
+            .is_none()
+        && v8::StackTrace::current_stack_trace(scope, 1).is_none_or(|t| t.get_frame_count() == 0);
     if let Some(ledger) = scope.get_slot_mut::<UncaughtLedger>() {
-        ledger
-            .entries
-            .push((value, format!("{file}:{line}: {text}")));
+        ledger.entries.push(UncaughtEntry {
+            value,
+            text: format!("{file}:{line}: {text}"),
+            fatal,
+            frame,
+        });
+        ledger.terminated |= terminate;
+    }
+    if terminate {
+        scope.terminate_execution();
     }
 }
 
@@ -609,6 +721,28 @@ fn fatal_report(
         tc.reset();
     }
     let body = body.unwrap_or_else(|| fallback.to_string());
+    // A value that is not a native Error: node prints the source frame
+    // itself, opened by an empty line and with the value right under the
+    // caret, and a primitive as String() renders it (a Symbol, which has
+    // no string conversion, as nothing). An object is still inspected.
+    // Measured on node v22.22.2; conformance case 473.
+    let (frame, body) = match frame {
+        Some(frame) if !exception.is_native_error() => {
+            let body = if exception.is_object() {
+                body
+            } else if exception.is_symbol() {
+                String::new()
+            } else {
+                exception
+                    .to_string(tc)
+                    .map(|s| s.to_rust_string_lossy(tc))
+                    .unwrap_or(body)
+            };
+            let frame = frame.strip_suffix('\n').unwrap_or(&frame);
+            (Some(format!("\n{frame}")), body)
+        }
+        frame => (frame, body),
+    };
     // Node closes a fatal report with its runtime banner ("Node.js vX.Y.Z").
     // oam prints its OWN -- same structural role, and claiming to be Node
     // here would be a lie about which runtime produced the crash.
@@ -678,28 +812,181 @@ pub(crate) fn handle_uncaught_throw(
     )])
 }
 
+/// Emit process `'exit'` once (`process._exiting` is the guard shared with
+/// `process.exit()`), with `process.exitCode` or 0.
+///
+/// `natural`: the loop drained, or a top-level await never settled -- node's
+/// `EmitProcessExit`. A listener's throw is an uncaught exception like any
+/// other: offered to the 'uncaughtException' listeners, reported when
+/// nothing takes it, and the code is the `process.exitCode` already set or
+/// else 1 (7 when a listener of the ladder threw). Either way the emit ends
+/// there -- later listeners, and the promise jobs the listeners queued, do
+/// not run. Without a throw node drains those promise jobs, and a throw from
+/// one of them goes the same way (#399 items 1 and 7), as does a promise
+/// they reject and leave unhandled. The tick queue takes nothing once the
+/// process is exiting, so there are no ticks to run.
+///
+/// Not natural: past a fatal exception, where node's `_fatalException`
+/// emits `'exit'` inside a try/catch that drops a listener's throw -- the
+/// original report stays the only one (#399 item 9) -- and runs nothing
+/// after it.
+///
+/// A report raised here goes straight to stderr: node prints it at this
+/// point of the exit.
+pub(crate) fn emit_exit_event(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    natural: bool,
+) {
+    // A function expression compiled and called, so the locals stay function
+    // scoped (a top-level `var` would land on globalThis) and the call's
+    // exception is ours to read.
+    const EMIT: &str = "(function () { \
+        var p = globalThis.__oamProcessRef || globalThis.process; \
+        if (!p || p._exiting) return; \
+        p._exiting = true; \
+        p.emit('exit', typeof p.exitCode === 'number' ? p.exitCode : 0); \
+      })";
+    let Some(emit) = compile_host_function(tc, "<process-exit>", EMIT) else {
+        tc.reset();
+        return;
+    };
+    let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+    if emit.call(tc, recv, &[]).is_some() {
+        if natural {
+            host_checkpoint(tc);
+            if let Some(failures) = drain_uncaught(tc) {
+                report_at_exit(tc, &failures);
+                return;
+            }
+            // node's rejection processing runs after the listeners too: a
+            // promise they reject and leave unhandled is fatal.
+            if let Some(failures) = unhandled_rejection_failures(tc) {
+                report_at_exit(tc, &failures);
+            }
+        }
+        return;
+    }
+    if !natural {
+        tc.reset();
+        return;
+    }
+    let Some(exception) = tc.exception() else {
+        tc.reset();
+        return;
+    };
+    let value = v8::Global::new(tc, exception);
+    let message = crate::exception_to_error(tc, "'exit' listener").to_string();
+    let frame = tc.message().and_then(|m| source_frame(tc, m));
+    tc.reset();
+    let local = v8::Local::new(tc, &value);
+    let (local, frame, message) = match dispatch_uncaught(tc, local) {
+        Uncaught::Handled => return,
+        Uncaught::Fatal => (local, frame, message),
+        Uncaught::HandlerThrew {
+            value,
+            frame,
+            message,
+        } => (v8::Local::new(tc, &value), frame, message),
+    };
+    let report = Diagnostic::new(
+        FATAL_CODE,
+        Severity::Error,
+        Origin::Runtime,
+        fatal_report(tc, local, frame, &message),
+    );
+    report_at_exit(tc, &[report]);
+}
+
+/// Print fatal reports raised while exiting, and set the code node exits
+/// with: 7 when a listener of the uncaught ladder threw
+/// (kExceptionInFatalExceptionHandler), else `process.exitCode` when set,
+/// else 1 -- node's `env->exit_code(kGenericUserError)`. Its
+/// `_fatalException` does not force 1 once `process._exiting` is set.
+fn report_at_exit(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    failures: &[Diagnostic],
+) {
+    // As the CLI renders them: a fatal report verbatim, anything else (an
+    // unhandled rejection) as `error[CODE]: message`.
+    for failure in failures {
+        if failure.code == FATAL_CODE {
+            eprint!("{}", failure.message);
+        } else {
+            eprintln!("error[{}]: {}", failure.code, failure.message);
+        }
+    }
+    const CODE: &str = "(function () { \
+        var p = globalThis.__oamProcessRef || globalThis.process; \
+        if (!p) return; \
+        if (p.__oamFatalCode === 7) p.exitCode = 7; \
+        else if (p.exitCode == null) p.exitCode = 1; \
+      })";
+    if let Some(set_code) = compile_host_function(tc, "<exit-code>", CODE) {
+        let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+        let _ = set_code.call(tc, recv, &[]);
+    }
+    tc.reset();
+}
+
+/// Compile `source` (a parenthesized function expression) as a classic
+/// script and return the function it evaluates to.
+fn compile_host_function<'s>(
+    tc: &mut v8::PinnedRef<'s, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    name: &str,
+    source: &str,
+) -> Option<v8::Local<'s, v8::Function>> {
+    let source = v8::String::new(tc, source)?;
+    let name: v8::Local<v8::Value> = v8::String::new(tc, name)?.into();
+    let origin = v8::ScriptOrigin::new(tc, name, 0, 0, false, 0, None, false, false, false, None);
+    let script = v8::Script::compile(tc, source, Some(&origin))?;
+    let value = script.run(tc)?;
+    v8::Local::<v8::Function>::try_from(value).ok()
+}
+
 /// Take any uncaught-exception reports (from the message listener, i.e.
 /// exceptions swallowed by the microtask checkpoint) and either deliver
 /// them to an 'uncaughtException' listener or fail the run.
 pub(crate) fn drain_uncaught(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
 ) -> Option<Vec<Diagnostic>> {
+    lift_fatal_termination(tc);
     let mut fatal = Vec::new();
     // Loop: a listener may queue microtasks/ticks (flushed below under the
     // explicit policy) whose throws land NEW ledger entries; quiesce before
     // returning. Terminates because each pass drains the ledger and only
     // fresh throws refill it.
     loop {
-        let captured: Vec<(v8::Global<v8::Value>, String)> = tc
+        let captured: Vec<UncaughtEntry> = tc
             .get_slot_mut::<UncaughtLedger>()
             .map(|ledger| std::mem::take(&mut ledger.entries))
             .unwrap_or_default();
         if captured.is_empty() {
             break;
         }
-        for (value, text) in captured {
+        for entry in captured {
+            let UncaughtEntry {
+                value,
+                text,
+                fatal: already,
+                frame,
+            } = entry;
+            // A later entry than a fatal one is not reached: node exited.
+            if !fatal.is_empty() {
+                break;
+            }
             let local = v8::Local::new(tc, &value);
-            let (local, frame, message) = match dispatch_uncaught(tc, local) {
+            let outcome = match already {
+                // The wrapper ran the ladder already; running it again would
+                // fire 'uncaughtExceptionMonitor' twice.
+                Some(FatalThrow::NoConsumer) => Uncaught::Fatal,
+                Some(FatalThrow::ListenerThrew) => Uncaught::HandlerThrew {
+                    value: value.clone(),
+                    frame,
+                    message: format!("Uncaught {text}"),
+                },
+                None => dispatch_uncaught(tc, local),
+            };
+            let (local, frame, message) = match outcome {
                 Uncaught::Handled => continue,
                 // No stored frame: for a microtask-thrown error V8 has no
                 // throw-site Message at all (probe-verified -- file
@@ -964,7 +1251,7 @@ impl JsRuntime {
             // before the tick queue is reached: `process.nextTick` there
             // runs after them, not ahead (#345). A bare checkpoint first,
             // then the tick point.
-            tc.perform_microtask_checkpoint();
+            host_checkpoint(tc);
             // A promise job in that drain that threw: fatal, it ends the run
             // before any tick, as node exits at it; handled, it is delivered
             // before the ticks.
@@ -1029,7 +1316,7 @@ impl JsRuntime {
                         // promise jobs first: in node it runs inside the
                         // drain, ahead of the ticks.
                         if esm_in_node {
-                            tc.perform_microtask_checkpoint();
+                            host_checkpoint(tc);
                             if let Some(failure) = drain_uncaught(tc) {
                                 return Err(failure);
                             }
@@ -1459,9 +1746,10 @@ pub(crate) fn run_ticks_and_microtasks(
                 // timer callback's throw (handle_uncaught_throw): handled
                 // continues the run, fatal/handler-threw fails it. Handled
                 // ALSO defers the interrupted batch -- node keeps the
-                // remaining ticks queued and drains them at the next tick
-                // point, AFTER the next macrotask (probe-verified), so do
-                // not checkpoint-drain them in place.
+                // remaining ticks queued and drains them at its next tick
+                // point: after the next callback, or at its check phase
+                // (pump_event_loop places that), so do not checkpoint-drain
+                // them in place.
                 if let Some(failure) = handle_uncaught_throw(tc, "process.nextTick") {
                     return Some(failure);
                 }
@@ -1473,12 +1761,20 @@ pub(crate) fn run_ticks_and_microtasks(
                 // listener-queued microtask flushes instead of stranding
                 // until some unrelated JS-running site checkpoints.
                 if !has_pending_ticks(tc) {
-                    tc.perform_microtask_checkpoint();
+                    host_checkpoint(tc);
+                    if fatal_pending(tc) {
+                        return drain_uncaught(tc);
+                    }
                 }
                 return None;
             }
         }
-        tc.perform_microtask_checkpoint();
+        host_checkpoint(tc);
+        // A fatal microtask throw ended the checkpoint: node exits at it, so
+        // no tick queued since runs either (#398).
+        if fatal_pending(tc) {
+            return drain_uncaught(tc);
+        }
         if !has_pending_ticks(tc) || entry_rejected(tc) {
             return None;
         }
@@ -1511,6 +1807,14 @@ pub(crate) fn run_platform_tasks(
         }
         if let Some(failure) = drain_uncaught(tc) {
             return Err(failure);
+        }
+        // This task's drain rejected the ES module entry: it is reported
+        // next, and node runs nothing before that -- not the rest of this
+        // batch, whose tasks (another async WebAssembly compile's
+        // continuation) would run user code first (#399 item 11). The
+        // tasks left are dropped with the run.
+        if entry_rejected(tc) {
+            break;
         }
     }
     Ok(ran)
@@ -1581,6 +1885,37 @@ fn emit_before_exit(
     Ok((emitted, handled_throw))
 }
 
+/// The kind of callback the event loop ran last ([`pump_event_loop`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LastRan {
+    /// Nothing yet: the entry (or whatever ran before the loop).
+    Entry,
+    /// A timer, with the instant its timers phase began: the timers due by
+    /// then run in that phase.
+    Timer(std::time::Instant),
+    /// An immediate, with the instant its check phase began.
+    Immediate(std::time::Instant),
+    /// An I/O callback, a V8 foreground task, or a pending callback.
+    Other,
+}
+
+/// Run the ticks a handled throw left queued, as node's check phase does:
+/// its callback scope's close runs the whole queue, delivering each handled
+/// throw and going on with the rest (#366).
+fn drain_deferred_ticks(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> Result<(), Vec<Diagnostic>> {
+    while has_pending_ticks(tc) && !entry_rejected(tc) {
+        if let Some(failure) = run_ticks_and_microtasks(tc) {
+            return Err(failure);
+        }
+        if let Some(failure) = drain_uncaught(tc) {
+            return Err(failure);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn pump_event_loop(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     entry_promise: Option<v8::Local<'_, v8::Promise>>,
@@ -1591,6 +1926,8 @@ pub(crate) fn pump_event_loop(
     // handler-scheduled work re-arms the NEXT drain's emission while a
     // handler that schedules nothing exits after a single emission.
     let mut before_exit_emitted = false;
+    // What the loop ran last, for where a deferred tick batch drains.
+    let mut last_ran = LastRan::Entry;
     loop {
         // One HandleScope per turn. Every Local a turn creates -- the
         // resolver a completion settles and the value it settles with, a
@@ -1667,6 +2004,34 @@ pub(crate) fn pump_event_loop(
                 .is_some_and(|core| core.has_inflight());
             !has_ref && !has_inflight && !has_pending_ticks(tc)
         };
+        // Ticks left queued by a handled throw run at node's next tick
+        // point, which falls before this turn's callback when that callback
+        // opens a phase node reaches only after its check phase (an
+        // immediate of a new check phase, or a timer after an I/O callback:
+        // the poll phase is followed by the check phase), or when it opens
+        // a new timers phase (node runs the queue as a timers phase ends).
+        // A timer due in the phase of the timer before it runs first: after
+        // a throw node's timers phase goes on to its next due timer (#399
+        // item 8).
+        if !only_unref_timers_left && has_pending_ticks(tc) {
+            let next = tc
+                .get_slot_mut::<crate::timers::TimerQueue>()
+                .and_then(|queue| queue.peek_due(now));
+            let check_phase_first = match next {
+                Some(crate::timers::Due::Immediate { queued }) => {
+                    !matches!(last_ran, LastRan::Immediate(began) if queued <= began)
+                }
+                Some(crate::timers::Due::Timer { deadline }) => match last_ran {
+                    LastRan::Other => true,
+                    LastRan::Timer(began) => deadline > began,
+                    LastRan::Entry | LastRan::Immediate(_) => false,
+                },
+                _ => false,
+            };
+            if check_phase_first {
+                drain_deferred_ticks(tc)?;
+            }
+        }
         let due = if only_unref_timers_left {
             None
         } else {
@@ -1674,6 +2039,17 @@ pub(crate) fn pump_event_loop(
                 .and_then(|queue| queue.pop_due(now))
         };
         if let Some((callback, extra)) = due {
+            last_ran = match tc
+                .get_slot::<crate::timers::TimerQueue>()
+                .and_then(|queue| queue.popped())
+            {
+                Some(crate::timers::Due::Timer { deadline }) => match last_ran {
+                    LastRan::Timer(began) if deadline <= began => LastRan::Timer(began),
+                    _ => LastRan::Timer(now),
+                },
+                Some(crate::timers::Due::Immediate { queued }) => LastRan::Immediate(queued),
+                _ => LastRan::Other,
+            };
             let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
             let callback = v8::Local::new(tc, &callback);
             let args: Vec<v8::Local<v8::Value>> =
@@ -1711,9 +2087,29 @@ pub(crate) fn pump_event_loop(
             break;
         }
 
+        // A timer of the timers phase that just ran is still due: node
+        // finishes that phase before its poll phase, so the V8 tasks and
+        // the op completion below wait for the next turn -- their tick
+        // drains would otherwise run a batch a handled throw left queued
+        // ahead of that timer (#399 item 8). The phase is bounded: only
+        // timers due when it began belong to it.
+        if let LastRan::Timer(began) = last_ran
+            && progressed
+            && tc
+                .get_slot_mut::<crate::timers::TimerQueue>()
+                .and_then(|queue| queue.peek_due(now))
+                .is_some_and(|next| {
+                    matches!(next, crate::timers::Due::Timer { deadline } if deadline <= began)
+                })
+        {
+            before_exit_emitted = false;
+            continue;
+        }
+
         // V8's foreground tasks (platform.rs) -- node runs them from its
         // loop's poll phase, each followed by a tick + microtask drain.
         if run_platform_tasks(tc)? {
+            last_ran = LastRan::Other;
             progressed = true;
         }
         if entry_promise.is_some_and(|promise| promise.state() == v8::PromiseState::Rejected) {
@@ -1741,10 +2137,21 @@ pub(crate) fn pump_event_loop(
             if let Some(failure) = drain_uncaught(tc) {
                 return Err(failure);
             }
+            last_ran = LastRan::Other;
             progressed = true;
         }
         if progressed {
             before_exit_emitted = false;
+            continue;
+        }
+        // Nothing is due. Ticks a handled throw left queued in a callback
+        // run at the check phase node passes through before it waits again
+        // (#399 item 8: a 1 ms timer's batch drains before a 5 ms timer).
+        // Not after the entry: node's first timers phase comes before that
+        // check phase, and a timer the entry set is due in it by node's
+        // loop clock -- draining here put "after" ahead of a 1 ms timer.
+        if last_ran != LastRan::Entry && has_pending_ticks(tc) {
+            drain_deferred_ticks(tc)?;
             continue;
         }
 

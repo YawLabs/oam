@@ -29274,6 +29274,56 @@ fn compiled_binary_runs_its_embedded_script_as_the_main_module() {
     );
 }
 
+// #399 item 10: node runs the 'exit' listeners and then prints the fatal
+// report (_fatalException, then ReportFatalException). A compiled binary
+// printed the report first. Conformance case 473 holds `-e` and `oam run`
+// to node; a compiled binary has no node counterpart, so it is held here.
+#[test]
+fn compiled_binary_runs_exit_listeners_before_the_fatal_report() {
+    let entry = write_temp(
+        "compile_exit_order/app.cjs",
+        "process.on('exit', (c) => console.error('exit listener', c));\n\
+         throw new Error('embedded fatal');\n",
+    );
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let output = std::env::temp_dir().join(format!(
+        "oam-compile-exit-order-{}-{nanos}{ext}",
+        std::process::id()
+    ));
+    let compile_out = oam(&[
+        "compile",
+        entry.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert!(
+        compile_out.status.success(),
+        "oam compile failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&compile_out.stdout),
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+    let run_out = std::process::Command::new(&output)
+        .output()
+        .expect("compiled binary runs");
+    let _ = std::fs::remove_file(&output);
+    let stderr = String::from_utf8_lossy(&run_out.stderr);
+    assert_eq!(run_out.status.code(), Some(1), "stderr={stderr}");
+    let listener = stderr
+        .find("exit listener 1")
+        .unwrap_or_else(|| panic!("the 'exit' listener did not run: stderr=<<{stderr}>>"));
+    let report = stderr
+        .find("Error: embedded fatal")
+        .unwrap_or_else(|| panic!("no fatal report: stderr=<<{stderr}>>"));
+    assert!(
+        listener < report,
+        "the report was printed before the 'exit' listener ran: stderr=<<{stderr}>>"
+    );
+}
+
 // A plain `.js` test file, named relative to a working directory BELOW the
 // package.json that makes it CommonJS: `oam test` has to decide the file's
 // kind from where it really is (the "type" lookup used to stop at the

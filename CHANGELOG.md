@@ -547,6 +547,39 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `message` was the whole rendered report, which oam also printed to stderr under `worker N:`;
   nothing is printed now unless the parent leaves `'error'` unhandled. A synchronous throw from a
   CommonJS worker entry now reaches the worker's own `'uncaughtException'` listeners too.
+- **A fatal microtask throw ends the run at the throw, as in node.** `queueMicrotask(() => { throw
+  e })` with no `uncaughtException` listener let the rest of the drain run first -- a sibling
+  `.then`, a later `queueMicrotask` callback, an async function's continuation -- so their output
+  came before the report. Nothing queued after the throw runs now, from an ES module or CommonJS
+  entry and the modules it imports statically, and `uncaughtExceptionMonitor` hears the throw
+  once, not twice (#398). A module loaded by `import()` still lets its checkpoint and the
+  importer's continuation run before the report (docs/node-divergences.md, the `import()`
+  evaluation entry), and a worker keeps running the rest of the drain, as node's does.
+- **Throws on the way out behave as node's.** A promise job an `'exit'` listener queues that throws
+  is reported and exits 1 (it was lost, exit 0), and an `uncaughtException` listener sees it. A
+  promise such a listener rejects and leaves unhandled now exits 1, as in node, though it is
+  reported as oam's `OAM-RT0004` line and not offered to an `uncaughtException` listener
+  (divergence #55). A throw from an `'exit'` listener goes to the `uncaughtException` listeners,
+  is reported with its source frame and node's report, keeps a `process.exitCode` already set
+  (`process.exit(3)` exits 3; it was always 1), and stops the emit: later listeners and the
+  promise jobs the listeners queued no longer run. Past a fatal throw, a throwing `'exit'`
+  listener is no longer reported after the original error. `oam -e` and compiled binaries run the
+  `'exit'` listeners before printing the report, as `oam run` does. A worker's own `'exit'`
+  listeners keep their earlier handling; a worker whose run fails fatally is the worker entry
+  above (#399).
+- **A throwing `uncaughtException` listener's report names the listener's line**, not a line of
+  oam's internal dispatcher (#399).
+- **The report of a thrown value that is not an Error is node's.** `throw 42`, `throw "text"`, `throw
+  { a: 1 }` and the like open with an empty line and put the value right under the caret, and a
+  primitive prints as `String()` gives it (`text`, not `'text'`; `5`, not `5n`), wherever oam has
+  the throw's source frame. Node's `--trace-uncaught` hint is still not printed (#399).
+- **The nextTick queue around exits and handled throws matches node.** `process.nextTick` queues
+  nothing once the process is exiting, so a warning emitted from an `'exit'` listener is not
+  printed. After an `uncaughtException` listener handles a tick's throw, the rest of the batch
+  runs at node's next tick point -- before the next immediate, at the end of the timers phase,
+  and before the loop waits for a timer that is not due yet -- where it ran after them; a timer
+  due in the same timers phase runs before it, and V8's tasks and I/O callbacks no longer run in
+  the middle of a timers phase (#366, #399).
 
 - **`tty.WriteStream` and `tty.ReadStream` over a console opened by name refuse what node's refuse,
   with node's errno (#381).** On Windows they took any descriptor `tty.isatty` called a terminal and
