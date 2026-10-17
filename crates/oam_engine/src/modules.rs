@@ -3198,6 +3198,8 @@ fn op_dyn_load(
 ) {
     let path = arg_path(scope, &args, 0);
     let spec = args.get(1).to_rust_string_lossy(scope);
+    // Already compiled: by an earlier load, or by a require() whose graph
+    // then failed, which left it uninstantiated; its job links it afresh.
     if dyn_module(scope, &path).is_some() {
         return;
     }
@@ -3983,18 +3985,6 @@ fn default_facade<'s>(
     Ok(facade.get_module_namespace())
 }
 
-/// `ops.isLoaded(path)`: whether the module map holds the module -- the
-/// entry's graph, or a module an earlier import() loaded.
-fn op_dyn_is_loaded(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let path = arg_path(scope, &args, 0);
-    let loaded = dyn_module(scope, &path).is_some();
-    rv.set_bool(loaded);
-}
-
 /// `ops.isInstantiated(path)`: whether the module is linked in V8.
 fn op_dyn_is_instantiated(
     scope: &mut v8::PinScope<'_, '_>,
@@ -4082,7 +4072,6 @@ pub(crate) fn install_dynamic_import(
         ("instantiate", v8::Function::new(scope, op_dyn_instantiate)),
         ("evaluate", v8::Function::new(scope, op_dyn_evaluate)),
         ("namespace", v8::Function::new(scope, op_dyn_namespace)),
-        ("isLoaded", v8::Function::new(scope, op_dyn_is_loaded)),
         (
             "isInstantiated",
             v8::Function::new(scope, op_dyn_is_instantiated),

@@ -186,10 +186,11 @@ globalThis.__oamEsmLoader = function (ops) {
   // and its promise reads job.then, which Object.prototype must not supply.
   ObjectSetPrototypeOf(ModuleJob.prototype, null);
 
-  // A module the host loaded outside this loader -- the entry's static
-  // graph, a builtin or CommonJS facade it imports -- is a module node's
-  // loader holds a linked, instantiated job for. Adopt one the same shape,
-  // its dependencies' jobs included.
+  // A module the host loaded and instantiated outside this loader -- the
+  // entry's static graph, a builtin or CommonJS facade it imports, a graph a
+  // require() evaluated -- is a module node's loader holds a linked,
+  // instantiated job for. Adopt one the same shape, its dependencies' jobs
+  // included (an instantiated module's graph is complete and instantiated).
   // A worklist, not recursion: a static graph can be deep.
   function adoptLoadedJob(url, type) {
     const adopted = [];
@@ -226,7 +227,12 @@ globalThis.__oamEsmLoader = function (ops) {
   }
 
   function createModuleJob(url, importAttributes, specifier) {
-    // Load and translate: synchronous, as node's default load is.
+    // Load and translate: synchronous, as node's default load is. A module
+    // the host compiled but never instantiated -- left by a require() whose
+    // graph failed to load or link -- is not loaded again; its job links its
+    // requests afresh, so a dependency that never loaded is loaded now (a
+    // CommonJS one that threw rethrows the same error) and one that did not
+    // resolve fails to again.
     ops.load(url, specifier);
     const job = new ModuleJob(url, importAttributes, url);
     MapPrototypeSet(cache(), cacheKey(url, importAttributes.type), job);
@@ -240,7 +246,7 @@ globalThis.__oamEsmLoader = function (ops) {
       // node's load validates the attributes, and every miss of this cache
       // reaches it, a module loaded under another "type" included.
       ops.checkType(url, importAttributes.type, specifier);
-      job = ops.isLoaded(url)
+      job = ops.isInstantiated(url)
         ? adoptLoadedJob(url, importAttributes.type)
         : createModuleJob(url, importAttributes, specifier);
     }

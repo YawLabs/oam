@@ -43,7 +43,7 @@ table:
 | `instantiate(path)` | `module.instantiate()` | `instantiate_module` |
 | `evaluate(path)` | `module.evaluate()` | `Module::evaluate`, its promise |
 | `namespace(path)` | `getNamespace()` | the namespace object |
-| `isLoaded` / `isInstantiated` / `loadedDependencies` | (the load cache) | adopt a module the static graph loaded |
+| `isInstantiated` / `loadedDependencies` | (the load cache) | adopt a module the static graph loaded |
 
 A module oam loaded outside the chain (the entry's static graph, a facade it imports) is one
 node's loader holds a linked, instantiated job for; the chain adopts a job of that shape for it,
@@ -107,6 +107,11 @@ three places:
   each one is running. `load` pushes a load of its own around `compile_module`, so a CommonJS
   body it runs is recorded against that load, never against an outer one a drain happens to run
   inside.
+- **A graph a `require()` left behind.** A `require()` whose graph failed to load or link leaves
+  its modules compiled and uninstantiated, some of their dependencies never loaded. Only an
+  instantiated module is adopted (its graph is complete); a compiled one gets an ordinary job,
+  which links its requests afresh, so the dependency that failed fails again (conformance case
+  442).
 - **Load failures.** A CommonJS body's throw or a syntax error rejects `import()` with the thrown
   value itself (the graph loader keeps it beside the diagnostic), and a CommonJS body that threw
   is not run again: a later `import()` or `require()` of it rethrows the same object, as node's
