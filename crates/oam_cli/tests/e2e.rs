@@ -32608,6 +32608,94 @@ fn compile_cache_unusable_env_dir_is_ignored() {
     let _ = std::fs::remove_dir_all(&project);
 }
 
+// `oam cache info|clean` under NODE_COMPILE_CACHE name the per-build
+// subdirectory a run actually filled. `oam cache` builds no isolate, and the
+// subdirectory carries V8's version tag, which hashes the V8 flags: read
+// before the platform's init, it named a directory no run uses, so info
+// counted nothing (and created that stray directory) and clean removed
+// nothing. An info before any run creates nothing.
+#[test]
+fn compile_cache_cli_reports_the_node_compile_cache_dir() {
+    let project = compile_cache_scratch("cc-cli");
+    let oam_cache = project.join("oam-cache");
+    let ncc = project.join("ncc");
+    let cache_cmd = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(args)
+            .current_dir(&project)
+            .without_ambient_compile_cache()
+            .env("OAM_CACHE_DIR", &oam_cache)
+            .env("NODE_COMPILE_CACHE", &ncc)
+            .output()
+            .expect("oam binary runs")
+    };
+
+    let cold = cache_cmd(&["cache", "info"]);
+    assert!(
+        cold.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cold.stderr)
+    );
+    assert!(
+        !ncc.exists(),
+        "info must not create the directory it reports"
+    );
+
+    std::fs::write(project.join("lib.cjs"), "module.exports = 7;\n").unwrap();
+    let entry = project.join("main.cjs");
+    std::fs::write(&entry, "console.log('v=' + require('./lib.cjs'));\n").unwrap();
+    let out = run_compile_cache(
+        &project,
+        &entry,
+        &[],
+        &[("OAM_CACHE_DIR", &oam_cache), ("NODE_COMPILE_CACHE", &ncc)],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dirs = oam_version_dirs(&ncc);
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    let filled = &dirs[0];
+    assert!(
+        count_v8c(filled) >= 2,
+        "the run cached main.cjs and lib.cjs"
+    );
+
+    let info = cache_cmd(&["cache", "info"]);
+    let stdout = String::from_utf8_lossy(&info.stdout).into_owned();
+    assert!(info.status.success(), "{stdout}");
+    assert!(
+        stdout.contains(&filled.display().to_string()),
+        "info must print the directory the run filled ({}): {stdout}",
+        filled.display()
+    );
+    let entries: usize = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("entries:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no entries line in: {stdout}"));
+    assert!(entries >= 2, "info must count the run's blobs: {stdout}");
+    assert_eq!(
+        oam_version_dirs(&ncc).len(),
+        1,
+        "info must not create a second subdirectory"
+    );
+
+    let clean = cache_cmd(&["cache", "clean"]);
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+    assert!(
+        !filled.exists(),
+        "clean must remove the filled subdirectory"
+    );
+    let _ = std::fs::remove_dir_all(&project);
+}
+
 // Several processes filling one cold compile cache at once all run
 // correctly -- each blob is written to a private temp file and renamed into
 // place, so no reader ever sees a half-written entry -- leave no temp file
