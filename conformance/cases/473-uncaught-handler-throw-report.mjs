@@ -10,10 +10,11 @@
 //   from the entry and its ticks, from timers (far enough apart that the
 //   second is never due in the first's timers phase) and from I/O.
 // - `throw 42` from a CommonJS entry: the source frame, then the value,
-//   and the report's blank lines as node's, for each kind of thrown value.
-//   (node then names `--trace-uncaught`, which oam does not have; the hint
-//   is taken out as in case 406. A primitive from an ES module entry is
-//   docs/node-divergences.md #54.)
+//   and the report's blank lines as node's, for each kind of thrown value,
+//   and after a primitive node's hint naming `--trace-uncaught` (its
+//   program name made `node` on both sides, as in case 406; the flag
+//   itself is case 573). A primitive from an ES module entry is
+//   docs/node-divergences.md #54.
 // - `-e`: the 'exit' listeners run, then the report is printed.
 // - An ES module entry rejected in one V8 task's drain is reported before
 //   any other task of the batch runs.
@@ -81,8 +82,12 @@ for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir
 function report(stderr) {
   return stderr
     .split(/\r?\n/)
-    .filter((l) => l !== "" && !/^\s+at /.test(l) && !/^(Node\.js|oam) v\d/.test(l) && !l.startsWith("(Use `"))
-    .map((l) => l.replace(/(?:file:\/\/\/)?(?:[A-Za-z]:)?[^\s:]*[\\/]([^\\/\s:]+\.[cm]?js)/g, "$1"));
+    .filter((l) => l !== "" && !/^\s+at /.test(l) && !/^(Node\.js|oam) v\d/.test(l))
+    .map((l) =>
+      l
+        .replace(/(?:file:\/\/\/)?(?:[A-Za-z]:)?[^\s:]*[\\/]([^\\/\s:]+\.[cm]?js)/g, "$1")
+        .replace(/^\(Use `(node|oam) /, "(Use `node "),
+    );
 }
 
 function show(label, args) {
@@ -101,8 +106,8 @@ try {
   // the blank lines kept: node opens the report with an empty line, puts the
   // value right under the caret, and prints a primitive as String() does
   // (a Symbol as nothing); an object is inspected. A native Error keeps the
-  // empty line after the caret. Only the stack, the banner and node's
-  // `--trace-uncaught` hint (which follows a primitive) are taken out.
+  // empty line after the caret, and only a primitive gets the
+  // `--trace-uncaught` hint. Only the stack and the banner are taken out.
   const values = {
     "number.cjs": "throw 42;",
     "string.cjs": 'throw "a string";',
@@ -122,8 +127,12 @@ try {
     console.log(`## ${name} lines (status ${run.status})`);
     const lines = run.stderr
       .split(/\r?\n/)
-      .filter((l) => !/^\s+at /.test(l) && !/^(Node\.js|oam) v\d/.test(l) && !l.startsWith("(Use `"))
-      .map((l) => l.replace(/(?:[A-Za-z]:)?[^\s:]*[\\/]([^\\/\s:]+\.cjs)/g, "$1"));
+      .filter((l) => !/^\s+at /.test(l) && !/^(Node\.js|oam) v\d/.test(l))
+      .map((l) =>
+        l
+          .replace(/(?:[A-Za-z]:)?[^\s:]*[\\/]([^\\/\s:]+\.cjs)/g, "$1")
+          .replace(/^\(Use `(node|oam) /, "(Use `node "),
+      );
     for (const line of lines) console.log(`  err | ${JSON.stringify(line)}`);
   }
   const evalRun = spawnSync(
