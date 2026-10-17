@@ -4363,8 +4363,13 @@
     EventEmitter.listenerCount = (emitter, type, listener) =>
       EventEmitter.prototype.listenerCount.call(emitter, type, listener);
     EventEmitter.getMaxListeners = function getMaxListeners(emitterOrTarget) {
-      if (typeof emitterOrTarget.getMaxListeners === "function") {
-        return emitterOrTarget.getMaxListeners();
+      // node reads an object with a getMaxListeners method as an emitter,
+      // through its _maxListeners, without calling the method -- so a
+      // NodeEventTarget (a MessagePort) answers the module default here
+      // whatever its own limit is, as it does under node.
+      if (typeof emitterOrTarget?.getMaxListeners === "function") {
+        const n = emitterOrTarget._maxListeners;
+        return n === undefined ? EventEmitter.defaultMaxListeners : n;
       }
       if (
         emitterOrTarget != null &&
@@ -44413,7 +44418,6 @@
   //   ERR_MISSING_ARGS TypeError; a post on or to a closed port is dropped.
   const kIsNodeStyleListener = Symbol.for("oam.kIsNodeStyleListener");
   const kNewPort = Symbol("kNewPort");
-  const kNodeTargetMaxListeners = Symbol("events.maxEventTargetListeners");
   const kPortClose = Symbol("kPortClose");
   // Port state, out of sight of inspect and Object.keys.
   const portStates = new WeakMap();
@@ -44473,19 +44477,15 @@
     }
   }
   class NodeEventTarget extends EventTarget {
+    // node's NodeEventTarget keeps no limit of its own: setMaxListeners is
+    // events.setMaxListeners(n, this) -- its checks, its default n, and the
+    // EventTarget slot addEventListener warns against -- and getMaxListeners
+    // reads that slot back.
     setMaxListeners(n) {
-      if (typeof n !== "number" || n < 0 || Number.isNaN(n)) {
-        throw new codes.ERR_OUT_OF_RANGE("n", "a non-negative number", n);
-      }
-      Object.defineProperty(this, kNodeTargetMaxListeners, {
-        value: n,
-        writable: true,
-        configurable: true,
-        enumerable: false,
-      });
+      registry.get("events").setMaxListeners(n, this);
     }
     getMaxListeners() {
-      return this[kNodeTargetMaxListeners] ?? 10;
+      return this[globalThis.__oamEventTargetLimitSymbols.kMaxEventTargetListeners];
     }
     eventNames() {
       return Array.from(this._listeners.keys()).filter(
