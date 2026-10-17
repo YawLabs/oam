@@ -16,21 +16,6 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
-### Fixed
-
-- **Deep recursion through a sync op throws a `RangeError` on Windows instead of killing the
-  process (#395).** Recursion that called a native op at the bottom of the JS stack could overflow
-  the native stack first: the process died with `thread 'main' has overflowed its stack`
-  (`0xC00000FD`) where node throws a catchable `RangeError: Maximum call stack size exceeded`.
-  Measured on a release build with `fs.copyFileSync`, `fs.cpSync` and `zlib.deflateSync`, and on a
-  debug build with `fs.readdirSync` and `fs.opendirSync` too. oam.exe's main thread had the
-  linker's 1 MiB stack, of which V8 takes ~984 KiB for JS; it now reserves 8 MiB, as node.exe's
-  header does. Worker threads (and `oam.fork` isolates) get node's 4 MiB worker stack, up from
-  2 MiB. How deep JS can recurse is unchanged on every thread: V8 sets that, not the stack size.
-  It is not node's depth: a worker recurses a quarter to a third as deep as node's, and the main
-  thread somewhat deeper, so a 1500-deep `fs.cpSync` with a `filter` or `fs.rmSync` recursive
-  completes in oam where node throws `RangeError` (see docs/node-divergences.md).
-
 ## [0.19.1] - 2026-10-13
 
 ### Changed
@@ -551,6 +536,19 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   descriptor with no console behind it. `tty.isatty` of a console opened by name, and of a
   descriptor once it is closed, already answered as node's does (#379); both are now pinned in a
   console test.
+
+- **Deep recursion through a sync op throws a `RangeError` on Windows instead of killing the
+  process (#395).** Recursion that called a native op at the bottom of the JS stack could overflow
+  the native stack first: the process died with `thread 'main' has overflowed its stack`
+  (`0xC00000FD`) where node throws a catchable `RangeError: Maximum call stack size exceeded`.
+  Measured on a release build with `fs.copyFileSync`, `fs.cpSync` and `zlib.deflateSync`, and on a
+  debug build with `fs.readdirSync` and `fs.opendirSync` too. oam.exe's main thread had the
+  linker's 1 MiB stack, of which V8 takes ~984 KiB for JS; it now reserves 8 MiB, as node.exe's
+  header does. Worker threads (and `oam.fork` isolates) get node's 4 MiB worker stack, up from
+  2 MiB. How deep JS can recurse is unchanged on every thread: V8 sets that, not the stack size.
+  It is not node's depth: a worker recurses a quarter to a third as deep as node's, and the main
+  thread somewhat deeper, so a 1500-deep `fs.cpSync` with a `filter` or `fs.rmSync` recursive
+  completes in oam where node throws `RangeError` (see docs/node-divergences.md).
 
 ### Performance
 
