@@ -5202,14 +5202,17 @@ fn dynamic_import_attributes_match_static_path() {
     assert!(stdout.contains("json_on_nonjson rejected"), "{stdout}");
 }
 
-// A dynamic-import cycle (A dyn-imports B, B dyn-imports A while A is still
-// Evaluating) must resolve to A's PARTIAL namespace -- the bindings B reads
-// from A must be the ones already initialized in A (fromA). Pre-fix oam
-// rejected this cycle with "top-level await not supported yet" because A's
-// eval promise was still pending. Post-fix, dyn_import_load detects the
-// Evaluating status and returns the partial namespace.
+// A dynamic-import cycle under top-level await (A awaits import(B), B awaits
+// import(A) back) is a deadlock, as in node: B's import() of A runs in a
+// promise job after A's synchronous body (#397), when A is evaluating
+// asynchronously, so B waits on A's evaluation, which waits on B's. Neither
+// settles, and the run ends as a top-level await that never settles does,
+// exit 13 (node v22.22.2 prints its "unsettled top-level await" warning and
+// exits 13 on these files). oam used to hand B A's partial namespace
+// instead, because it evaluated B inside the hook with A's body on the
+// stack.
 #[test]
-fn dynamic_import_cycle_resolves_to_partial_namespace() {
+fn dynamic_import_cycle_under_top_level_await_deadlocks_as_node_does() {
     write_temp(
         "dynimp_cycle/a.mjs",
         "export const fromA = 'A';\n\
@@ -5218,20 +5221,48 @@ fn dynamic_import_cycle_resolves_to_partial_namespace() {
     );
     write_temp(
         "dynimp_cycle/b.mjs",
-        // B only reads bindings of A that are ALREADY initialized at the
-        // point B runs (fromA is the only one set before A's TLA suspends).
         "const a = await import('./a.mjs');\n\
          export const sawFromA = a && a.fromA === 'A';\n\
          export const fromB = 'B';\n",
     );
     let main = write_temp(
         "dynimp_cycle/main.mjs",
+        "process.on('exit', (code) => console.log('exit', code));\n\
+         const a = await import('./a.mjs');\n\
+         console.log('settled', a.fromA);\n",
+    );
+    let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(13),
+        "a top-level await deadlock exits 13: {stdout}\n{stderr}"
+    );
+    assert!(!stdout.contains("settled"), "{stdout}");
+    assert!(stdout.contains("exit 13"), "{stdout}");
+}
+
+// A cycle with no top-level await settles, as in node: A import()s B without
+// waiting, B awaits import(A), which resolves once A has evaluated -- the
+// whole namespace, `after` included, since A's body finished before B ran.
+#[test]
+fn dynamic_import_cycle_without_top_level_await_settles() {
+    write_temp(
+        "dynimp_cycle_sync/a.mjs",
+        "export const fromA = 'A';\n\
+         export const b = import('./b.mjs');\n\
+         export const after = 'after';\n",
+    );
+    write_temp(
+        "dynimp_cycle_sync/b.mjs",
         "const a = await import('./a.mjs');\n\
-         const b = a.bResult;\n\
-         console.log('a_fromA', a.fromA === 'A');\n\
-         console.log('a_after', a.after === 'after-await');\n\
-         console.log('b_sawFromA', b && b.sawFromA === true);\n\
-         console.log('b_fromB', b && b.fromB === 'B');\n",
+         export const saw = a.fromA + ' ' + a.after;\n",
+    );
+    let main = write_temp(
+        "dynimp_cycle_sync/main.mjs",
+        "const a = await import('./a.mjs');\n\
+         console.log('b saw', (await a.b).saw);\n",
     );
     let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -5241,10 +5272,7 @@ fn dynamic_import_cycle_resolves_to_partial_namespace() {
         "exit {}: {stdout}\n{stderr}",
         out.status
     );
-    assert!(stdout.contains("a_fromA true"), "{stdout}");
-    assert!(stdout.contains("a_after true"), "{stdout}");
-    assert!(stdout.contains("b_sawFromA true"), "{stdout}");
-    assert!(stdout.contains("b_fromB true"), "{stdout}");
+    assert!(stdout.contains("b saw A after"), "{stdout}");
 }
 
 // Regression for the ActiveHost slot-clear contract: a dynamic import() from

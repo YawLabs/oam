@@ -650,6 +650,21 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `--allow-child-process`, `--allow-worker`, ...). oam's own net and environment scopes name
   `--allow-net` and `--allow-env`.
 
+- **`import()` loads and evaluates its module in promise jobs after the call, as node's does
+  (#397).** oam evaluated the module inside the import hook, with the importer's frame on the
+  stack, and ran a microtask checkpoint there. So the module's top level ran before the importer's
+  next statement, its `process.nextTick` callbacks ran before the importer's continuation (from
+  CommonJS `micro | tick | after import`, where node prints `micro | after import | tick`), and a
+  CommonJS importer's own promise jobs ran ahead of its ticks. `import()` now runs node v22.22.2's
+  loader chain -- resolve in the call, then load, link, instantiate and evaluate in promise jobs --
+  so every step lands on node's microtask turn: a module with no imports of its own evaluates on
+  the 8th turn after the call and `import()` settles on the 14th, as in node. A module whose
+  top-level await waits on a timer can now be imported (oam rejected it as unsupported), and a
+  dynamic import cycle under top-level await deadlocks and exits 13, as node's does, where oam
+  handed back a partial namespace. A CommonJS module still runs when oam loads it, not when node
+  would (docs/node-divergences.md, entry 52); an `import()` such a module makes inside a
+  `require()` of an ES module now loads its graph after the `require()` returns, as node's does.
+
 ### Performance
 
 - **`stat` and `readdir` results no longer make a JSON round trip.** `stat`, `lstat` and `fstat`
