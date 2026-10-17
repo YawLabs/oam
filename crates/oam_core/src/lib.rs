@@ -1195,6 +1195,10 @@ pub enum HandleKey {
     /// An `fs.watch` watcher: its parked `fsWatchNext` (see
     /// [`crate::fs_watch`]).
     FsWatch(u64),
+    /// A worker's `parentPort`: its parked receive. node unrefs the port
+    /// when its last 'message' listener goes, and the worker may then exit
+    /// with the receive still waiting (#401).
+    ParentPort,
 }
 
 /// What [`CoreRuntime`] remembers per [`HandleKey`].

@@ -22368,19 +22368,22 @@ events.addAbortListener(ac2.signal, () => { fired2 = true; });
 await new Promise(r => setTimeout(r, 10));
 console.log('pre_aborted_fired=' + fired2);
 
-// -- util.aborted --
+// -- util.aborted -- node's (#401): resolves with the abort Event,
+// undefined when already aborted, and a resource is required.
 const ac3 = new AbortController();
-let abortedReason = null;
-const p = util.aborted(ac3.signal).then(r => { abortedReason = r; });
+let abortedEvent = null;
+const p = util.aborted(ac3.signal, {}).then(r => { abortedEvent = r; });
 ac3.abort('test reason');
 await p;
-console.log('aborted_reason=' + abortedReason);
+console.log('aborted_event=' + abortedEvent.type + ':' + (abortedEvent.target === ac3.signal));
 
 // util.aborted on already-aborted
 const ac4 = new AbortController();
 ac4.abort('already');
-const r4 = await util.aborted(ac4.signal);
+const r4 = await util.aborted(ac4.signal, {});
 console.log('aborted_already=' + r4);
+const noResource = await util.aborted(ac4.signal).catch((err) => err.code);
+console.log('aborted_no_resource=' + noResource);
 
 // -- util.parseEnv --
 const env = util.parseEnv('FOO=bar\nBAZ="hello world"\n# comment\nEMPTY=\nQUOTED=\'single\'');
@@ -22412,8 +22415,9 @@ console.log('captureRejection=' + typeof events.captureRejectionSymbol);
         "disposable_has_dispose=true",
         "abort_fired=true",
         "pre_aborted_fired=true",
-        "aborted_reason=test reason",
-        "aborted_already=already",
+        "aborted_event=abort:true",
+        "aborted_already=undefined",
+        "aborted_no_resource=ERR_INVALID_ARG_TYPE",
         "parseEnv_FOO=bar",
         "parseEnv_BAZ=hello world",
         "parseEnv_EMPTY=\"\"",
@@ -28056,6 +28060,61 @@ fn vm_run_in_new_context_sandbox() {
     assert!(stdout.contains("product=200"), "{stdout}");
 }
 
+/// V8 runs a vm global's interceptors while `Context::new` is still building
+/// the context (Genesis reads `Atomics` off the new global), and the
+/// interceptors used to find their sandbox through the context's embedder
+/// data -- an unchecked read that, before the data was set, came from past the
+/// end of the array. Whether it faulted depended on the heap layout, so an
+/// unrelated snapshot change turned `vm_run_in_new_context_sandbox` into a
+/// segfault (#401). Many contexts, sandboxes that shadow the names Genesis
+/// reads, and every cross-context shape the sandbox link serves, against
+/// node 22.22.2's output.
+#[test]
+fn vm_contexts_cross_context_shapes() {
+    let stdout = run_ok(
+        "vm_cross_context.cjs",
+        r#"
+        const vm = require('vm');
+        const util = require('util');
+        const t = util.types;
+        const s = { x: 10, y: 20, Atomics: 'mine' };
+        console.log('A', vm.runInNewContext('x + y', s), vm.runInNewContext('x * y', s));
+        console.log('B', vm.runInNewContext('typeof Atomics', s), vm.runInNewContext('Atomics', s), typeof Atomics.wait);
+        const c = vm.createContext({ a: 1 });
+        vm.runInContext('var b = 2; globalThis.c = 3', c);
+        console.log('C', vm.runInContext('a + b + c', c), vm.createContext(c) === c, vm.isContext(c));
+        const sc = new vm.Script('a * 10');
+        console.log('D', sc.runInNewContext({ a: 4 }), sc.runInNewContext({ a: 5 }), sc.runInContext(c));
+        console.log('E', util.inspect(c), util.inspect(s));
+        const vals = vm.runInNewContext('({ n: Object(1), b: Object(2n), sy: Object(Symbol("q")), st: Object("s"), bo: Object(false), m: new Map([[1, 2]]), arr: [1, 2], err: new TypeError("t"), d: new Date(0), re: /x/g })');
+        console.log('F', [t.isNumberObject(vals.n), t.isBigIntObject(vals.b), t.isSymbolObject(vals.sy), t.isStringObject(vals.st), t.isBooleanObject(vals.bo), t.isBoxedPrimitive(vals.b), t.isMap(vals.m), t.isDate(vals.d), t.isRegExp(vals.re), t.isNativeError(vals.err)].join());
+        console.log('G', util.inspect(vals.n), util.inspect(vals.b), util.inspect(vals.sy), util.inspect(vals.st), util.inspect(vals.bo), util.inspect(vals.m), util.inspect(vals.arr));
+        console.log('H', util.format('%s %s %s', vals.n, vals.b, vals.arr), vals.arr instanceof Array, Array.isArray(vals.arr));
+        console.log('I', t.isNumberObject(c), t.isBoxedPrimitive(s), t.isProxy(vm.runInContext('this', c)));
+        let sum = 0;
+        for (let i = 0; i < 200; i++) {
+          const box = { i, Atomics: i, SharedArrayBuffer: i, Object: i % 2 ? undefined : i };
+          sum += vm.runInNewContext('i', box) + vm.runInNewContext('i + 1', box);
+        }
+        console.log('J', sum);
+    "#,
+    );
+    let expected = [
+        "A 30 200",
+        "B string mine function",
+        "C 6 true true",
+        "D 40 50 10",
+        "E { a: 1, b: 2, c: 3 } { x: 10, y: 20, Atomics: 'mine' }",
+        "F true,true,true,true,true,true,true,true,true,true",
+        "G [Number: 1] [BigInt: 2n] [Symbol: Symbol(q)] [String: 's'] [Boolean: false] Map(1) { 1 => 2 } [ 1, 2 ]",
+        "H [Number: 1] [BigInt: 2n] [ 1, 2 ] false true",
+        "I false false false",
+        "J 40000",
+    ];
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines, expected, "{stdout}");
+}
+
 #[test]
 fn vm_create_context_is_context() {
     let stdout = run_ok(
@@ -28680,8 +28739,13 @@ fn worker_threads_message_channel() {
         });
         ch.port1.postMessage({ hello: 'world' });
 
-        // Message is delivered via queueMicrotask, so wait a tick
+        // As in node (#401), a port message is a task of its own: it is not
+        // there yet when the microtasks of this turn run, and it is there by
+        // the time a setImmediate callback runs.
         queueMicrotask(() => {
+            console.log('micro_got=' + (received !== null));
+        });
+        setImmediate(() => {
             console.log('got_msg=' + (received !== null));
             ch.port1.close();
             ch.port2.close();
@@ -28689,6 +28753,7 @@ fn worker_threads_message_channel() {
     "#,
     );
     assert!(stdout.contains(r#"received={"hello":"world"}"#), "{stdout}");
+    assert!(stdout.contains("micro_got=false"), "{stdout}");
     assert!(stdout.contains("got_msg=true"), "{stdout}");
 }
 #[test]
@@ -28904,7 +28969,8 @@ fn worker_threads_message_channel_clone() {
         ch.port1.postMessage(obj);
         // Mutate after sending
         obj.val = 'mutated';
-        queueMicrotask(() => {
+        // Delivery is a task, as in node (#401), so wait for a setImmediate.
+        setImmediate(() => {
             // Receiver should see original, not mutated
             console.log('received_val=' + received.val);
             console.log('sender_val=' + obj.val);
@@ -28961,17 +29027,26 @@ fn worker_threads_message_port_close_event() {
         const { MessageChannel } = require('worker_threads');
         const ch = new MessageChannel();
         let closed = false;
-        ch.port2.on('close', () => { closed = true; });
+        ch.port2.on('close', () => {
+            closed = true;
+            console.log('close_fired=true');
+        });
+        // node's start() returns undefined, and 'close' is emitted later,
+        // not inside close() (#401).
+        console.log('start_returns=' + ch.port1.start());
         ch.port1.close();
         ch.port2.close();
-        console.log('close_fired=' + closed);
-        console.log('start_returns_this=' + (ch.port1.start() === ch.port1));
+        console.log('close_sync=' + closed);
     "#,
     );
     assert!(stdout.contains("close_fired=true"), "close event: {stdout}");
     assert!(
-        stdout.contains("start_returns_this=true"),
-        "start returns this: {stdout}"
+        stdout.contains("close_sync=false"),
+        "close is async: {stdout}"
+    );
+    assert!(
+        stdout.contains("start_returns=undefined"),
+        "start returns undefined: {stdout}"
     );
 }
 // ── oam install ─────────────────────────────────────────────────────────

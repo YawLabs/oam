@@ -404,7 +404,6 @@
           "transferableAbortSignal"
         ],
         "util/types": [
-          "isBigIntObject",
           "isFloat16Array"
         ],
         "v8": [
@@ -840,7 +839,6 @@
           "transferableAbortSignal"
         ],
         "util/types": [
-          "isBigIntObject",
           "isFloat16Array"
         ],
         "v8": [
@@ -1265,7 +1263,6 @@
           "transferableAbortSignal"
         ],
         "util/types": [
-          "isBigIntObject",
           "isFloat16Array"
         ],
         "v8": [

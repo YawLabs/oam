@@ -22,6 +22,20 @@
 // startup snapshot, where no native bindings exist. Anything from __oam
 // must be looked up at CALL time, never captured at eval time.
 "use strict";
+// node's inspect `builtInObjects` (lib/internal/util/inspect.js) is the
+// capitalized names on globalThis when that module loads: V8's own globals
+// and none of node's (URL, Buffer, DOMException, the web classes are not in
+// it -- measured on v22.22.2). util.format's %s decides from it whether a
+// toString is built in (hasBuiltInToString), so it is taken here, before
+// this file defines a global of its own (#401).
+Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
+  value: Object.freeze(
+    Object.getOwnPropertyNames(globalThis).filter((e) => /^[A-Z][a-zA-Z0-9]+$/.test(e)),
+  ),
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
 (() => {
 
   // Every web class node ships carries a Symbol.toStringTag, so
@@ -68,6 +82,18 @@
     }
     brand(DOMException, "DOMException");
     globalThis.DOMException = DOMException;
+  }
+
+  // The reason an abort carries: the caller's, unless it gave none. Only
+  // `undefined` means "none" (the spec's "if reason is not given"): node
+  // keeps `ac.abort(null)`'s reason as null, and it reaches every consumer
+  // that way -- signal.reason, throwIfAborted, fetch's rejection, the
+  // `cause` of an events.once AbortError. A `reason ?? ...` default turned
+  // null into this DOMException everywhere (#401).
+  function defaultAbortReason(reason) {
+    return reason === undefined
+      ? new globalThis.DOMException("This operation was aborted", "AbortError")
+      : reason;
   }
 
   // ----------------------------------------------- Event / EventTarget
@@ -241,6 +267,16 @@
       })
     : null;
 
+  // node's objectToWeakListenerMap: a weak listener is held weakly by the
+  // target but strongly by the object its kWeakHandler names (a stream,
+  // util.aborted's resource), so it lives exactly as long as that object.
+  // Held by nothing, the listener -- often a promise's resolve -- could be
+  // collected while the object it serves was still alive, and the abort it
+  // waited for never seen (#401).
+  const weakListenerOwners = new WeakMap();
+
+  const kNewListener = Symbol.for("oam.kNewListener");
+  const kRemoveListener = Symbol.for("oam.kRemoveListener");
   class EventTarget {
     constructor() {
       this._listeners = new Map(); // type -> [{ fn, once }]
@@ -259,13 +295,20 @@
       // accepting the option and storing a strong reference anyway would
       // retain exactly what the caller asked to be droppable, which is the
       // opposite of what it was set for.
-      const weak = options !== true && options != null &&
-        options[Symbol.for("oam.kWeakHandler")] != null;
+      const weakOwner = options !== true && options != null
+        ? options[Symbol.for("oam.kWeakHandler")]
+        : undefined;
+      const weak = weakOwner != null;
+      // Node-internal kIsNodeStyleListener (a MessagePort's on/once): the
+      // listener is handed a dispatch's node value -- a message's data --
+      // instead of the event (#401). dispatchEvent's node value is the event.
+      const nodeStyle = options !== true && options != null &&
+        options[Symbol.for("oam.kIsNodeStyleListener")] === true;
       const list = this._listeners.get(type) ?? [];
       if (!list.some((e) => listenerOf(e) === listener)) {
         const entry = weak
-          ? { ref: new WeakRef(listener), once, resist }
-          : { fn: listener, once, resist };
+          ? { ref: new WeakRef(listener), once, resist, nodeStyle }
+          : { fn: listener, once, resist, nodeStyle };
         list.push(entry);
         this._listeners.set(type, list);
         if (weak && collectedListeners) {
@@ -273,11 +316,29 @@
           // alive, so it holds the target weakly too.
           collectedListeners.register(listener, { target: new WeakRef(this), type, entry });
         }
+        if (weak && (typeof weakOwner === "object" || typeof weakOwner === "function")) {
+          let held = weakListenerOwners.get(weakOwner);
+          if (held === undefined) weakListenerOwners.set(weakOwner, (held = new Set()));
+          held.add(listener);
+        }
+        // node's kNewListener hook (lib/internal/event_target.js): a
+        // subclass hears of each listener added with the count it brings
+        // the type to, through a symbol-keyed method, so a MessagePort
+        // refs and starts on its first 'message' listener without an
+        // addEventListener of its own on its prototype, which node's has
+        // not (#401).
+        if (typeof this[kNewListener] === "function") this[kNewListener](list.length, type);
       }
     }
     removeEventListener(type, listener) {
       const list = this._listeners.get(type);
-      if (list) this._listeners.set(type, list.filter((e) => listenerOf(e) !== listener));
+      if (!list) return;
+      const kept = list.filter((e) => listenerOf(e) !== listener);
+      this._listeners.set(type, kept);
+      // node's kRemoveListener hook, the counterpart of kNewListener (#401).
+      if (kept.length !== list.length && typeof this[kRemoveListener] === "function") {
+        this[kRemoveListener](kept.length, type);
+      }
     }
     dispatchEvent(event) {
       event.target = this;
@@ -334,8 +395,7 @@
     static abort(reason) {
       const signal = new AbortSignal();
       signal.aborted = true;
-      signal.reason =
-        reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      signal.reason = defaultAbortReason(reason);
       return signal;
     }
     static timeout(delay) {
@@ -388,8 +448,7 @@
     _fire(reason) {
       if (this.aborted) return;
       this.aborted = true;
-      this.reason =
-        reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      this.reason = defaultAbortReason(reason);
       const event = new Event("abort");
       if (typeof this.onabort === "function") this.onabort.call(this, event);
       this.dispatchEvent(event);
@@ -1016,7 +1075,14 @@
         for (const t of transfers) memo.set(t, t.slice(0));
       }
       function cloneInner(v) {
-        if (v === null || (typeof v !== "object" && typeof v !== "function")) return v;
+        // A function or a symbol cannot be serialized: V8's serializer, under
+        // node's structuredClone and postMessage alike, throws a
+        // DataCloneError naming it. A function was cloned as an empty
+        // object, and a symbol passed through as itself (#401).
+        if (typeof v === "function" || typeof v === "symbol") {
+          throw new DOMException(`${String(v)} could not be cloned.`, "DataCloneError");
+        }
+        if (v === null || typeof v !== "object") return v;
         if (memo.has(v)) return memo.get(v);
         // A file-backed Blob (fs.openAsBlob) is NOT cloneable in node -- it
         // holds a file reference, not bytes, so a clone would outlive the
@@ -1071,15 +1137,48 @@
       }
       // Serialize first (primitives pass through); only on success detach
       // the transfer-list sources. A throw above leaves them intact.
-      const out = (value === null || (typeof value !== "object" && typeof value !== "function"))
-        ? value
-        : cloneInner(value);
+      const out = cloneInner(value);
       if (transfers) for (const t of transfers) t.transfer();
       return out;
     };
   }
 
   // -------------------------------------------------------------------- Blob
+  // node's Blob and File [util.inspect.custom] (lib/internal/blob.js,
+  // lib/internal/file.js): `Blob { size: 1, type: '' }`, the fields one level
+  // deeper and the label fixed whatever the subclass. Below depth 0 node's
+  // hook hands the value back and util.inspect collapses it by its
+  // constructor and tag -- `[Blob]`, `[MyBlob [Blob]]` -- because node's
+  // Blob carries enumerable symbol-keyed fields. Ours has none to show, so
+  // the hook spells that collapse itself rather than render `Blob {}`.
+  function inspectBlobLike(self, label, fields, depth, options, inspect) {
+    if (depth < 0) {
+      let ctor;
+      let tag;
+      try {
+        ctor = Object.getPrototypeOf(self)?.constructor?.name;
+        tag = self[Symbol.toStringTag];
+      } catch {
+        // A throwing getter on a subclass: fall back to the label.
+      }
+      if (typeof ctor !== "string" || ctor === "") ctor = label;
+      // node's getPrefix: the tag rides along unless the constructor name
+      // already contains it as a whole word (`MyBlob` does, `Xlob` not).
+      let name = ctor;
+      if (typeof tag === "string" && tag !== "") {
+        const at = ctor.indexOf(tag);
+        const end = at + tag.length;
+        if (at === -1 || (end !== ctor.length && ctor[end] === ctor[end].toLowerCase())) {
+          name += ` [${tag}]`;
+        }
+      }
+      return options.stylize(`[${name}]`, "special");
+    }
+    inspect ??= globalThis.__oamNode?.get?.("util")?.inspect;
+    if (typeof inspect !== "function") return label;
+    const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
+    return `${label} ${inspect(fields, opts)}`;
+  }
   // WHATWG Blob: an immutable byte sequence with a type string. Backed by
   // a flat Uint8Array, zero-copy subarray for slice(). text/arrayBuffer/stream
   // return the expected types. size and type are read-only.
@@ -1194,7 +1293,13 @@
           },
         });
       }
-      toString() { return "[object Blob]"; }
+      // No toString of its own, as node's Blob has none: the brand's
+      // toStringTag already makes String() "[object Blob]", and an own
+      // toString made util.format's %s String() a Blob that node inspects
+      // (hasBuiltInToString, #401).
+      [Symbol.for("nodejs.util.inspect.custom")](depth, options, inspect) {
+        return inspectBlobLike(this, "Blob", { size: this.size, type: this.type }, depth, options, inspect);
+      }
     }
     brand(Blob, "Blob");
     globalThis.Blob = Blob;
@@ -1205,20 +1310,25 @@
     class File extends globalThis.Blob {
       constructor(parts, name, options) {
         super(parts, options);
-        this._name = String(name);
-        this._lastModified = (options && typeof options.lastModified === "number")
+        this.#name = String(name);
+        this.#lastModified = (options && typeof options.lastModified === "number")
           ? options.lastModified : Date.now();
       }
-      get name() { return this._name; }
-      get lastModified() { return this._lastModified; }
-      toString() { return "[object File]"; }
+      // Private, as node's are: an own `_name` showed up in Object.keys and
+      // in util.inspect.
+      #name;
+      #lastModified;
+      get name() { return this.#name; }
+      get lastModified() { return this.#lastModified; }
+      // No toString of its own, as for Blob: an own one made util.format's %s
+      // print "[object File]" where node inspects the File (#401).
+      [Symbol.for("nodejs.util.inspect.custom")](depth, options, inspect) {
+        const fields = { size: this.size, type: this.type, name: this.#name, lastModified: this.#lastModified };
+        return inspectBlobLike(this, "File", fields, depth, options, inspect);
+      }
     }
     brand(File, "File");
     globalThis.File = File;
-  }
-
-  if (typeof globalThis.MessagePort === "undefined") {
-    globalThis.MessagePort = class MessagePort {};
   }
 
   // ----------------------------------------------------------------- FormData
@@ -1861,8 +1971,17 @@
     // up later is cancelled on arrival instead of holding its connection.
     let bodyAborted = false;
     let onAbort = null;
+    // The body path is the one place undici still swaps the reason out:
+    // its fetch controller's abort(error) does `if (!error) error = new
+    // DOMException(...)`, and the body is errored with that. So
+    // `ac.abort(null)` -- or 0, false, '' -- rejects the fetch promise with
+    // the reason itself but errors a body being read with undici's own
+    // AbortError, message "The operation was aborted." with the period:
+    // measured on node v22.22.2 for a read in flight, a reader taken after
+    // the abort and a pending reader.read() (#401). A signal aborted with no
+    // reason already carries its (truthy) DOMException.
     const abortReason = () =>
-      signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      signal.reason || new globalThis.DOMException("The operation was aborted.", "AbortError");
     // Read to the end, failed or cancelled: nothing is left for an abort to
     // stop. Stop listening, so a signal shared by many fetches does not
     // collect one listener per response, and a late abort does not leave a
@@ -2664,8 +2783,7 @@
   // it arrived on) instead of a Response.
   async function settleRaw(pending, lookup, signal, connector) {
     const internal = globalThis.__oam;
-    const aborted = () =>
-      signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+    const aborted = () => defaultAbortReason(signal.reason);
     let raw;
     try {
       raw = await pending;
@@ -2929,8 +3047,7 @@
       let stopped = false;
       let failure = null;
       let written = 0;
-      const aborted = () =>
-        signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      const aborted = () => defaultAbortReason(signal.reason);
       if (signal?.aborted) return reject(aborted());
       const channel = node.fetchBodyChannelNew();
       request.body_stream = channel;
@@ -3116,8 +3233,7 @@
   async function collectBlobStream(stream, size, signal) {
     const reader = stream.getReader();
     const chunks = [];
-    const reasonOf = () =>
-      signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+    const reasonOf = () => defaultAbortReason(signal.reason);
     let onAbort = null;
     const aborted = signal
       ? new Promise((_resolve, reject) => {
@@ -3231,7 +3347,7 @@
     const signal = init.signal;
     // Already-aborted: reject before touching the network (spec).
     if (signal?.aborted) {
-      throw signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      throw defaultAbortReason(signal.reason);
     }
     if (collect) init.body = await collectBlobStream(init.body, collect.size, signal);
     // undici's DISPATCH-level rules are a smaller set that node applies to
@@ -3612,9 +3728,7 @@
         signal.addEventListener(
           "abort",
           () => {
-            reject(
-              signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError"),
-            );
+            reject(defaultAbortReason(signal.reason));
             cancel();
           },
           { once: true },
@@ -4294,6 +4408,34 @@
     enumerable: false,
     configurable: false,
   });
+
+  // node's internal AbortError (lib/internal/errors.js, v22.22.2), the ONE
+  // class: events.once/on, timers/promises, the streams (finished,
+  // pipeline, addAbortSignal, the operators), fs, readline, child_process
+  // and http2 all reject with it, so `e.constructor` is the same object
+  // whichever raised it, as in node. Each module carried a class of its own
+  // with the same name and code, and an `instanceof` or constructor check
+  // against one missed the others (#401). Own keys in node's order: stack,
+  // message, cause (when given), code, name.
+  class AbortError extends ErrorCtor {
+    constructor(message = "The operation was aborted", options = undefined) {
+      if (options !== undefined && typeof options !== "object") {
+        // The codes live in node_compat.js, evaluated after this file, so
+        // they are looked up at call time.
+        const { codes } = globalThis.__oamNode.get("internal/errors");
+        throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+      }
+      super(message, options);
+      this.code = "ABORT_ERR";
+      this.name = "AbortError";
+    }
+  }
+  Object.defineProperty(globalThis, "__oamAbortError", {
+    value: AbortError,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
 })();
 
 // Node reports an uncaught exception as util.inspect(err): the stack, then a
@@ -4357,15 +4499,17 @@
   const kIsNodeError = globalThis.__oamKIsNodeError;
   const errorToString = Error.prototype.toString;
   Error.prepareStackTrace = function (err, frames) {
-    let head;
-    try {
-      head =
-        err !== null && typeof err === "object" && kIsNodeError in err
-          ? `${err.name} [${err.code}]: ${err.message}`
-          : errorToString.call(err);
-    } catch {
-      head = "<error>";
-    }
+    // A header that cannot be built (a Symbol `name`, a throwing `name`
+    // getter) throws out of the `stack` read, as node's does: V8 then keeps
+    // the stack unformatted and tries again on the next read, and
+    // util.inspect falls back to `[object Error]` as node's formatError
+    // does. A "<error>" header stood in before, which made `stack` look
+    // like a regular error's and sent inspect down the improveStack path
+    // that threw on the Symbol name (#401).
+    const head =
+      err !== null && typeof err === "object" && kIsNodeError in err
+        ? `${err.name} [${err.code}]: ${err.message}`
+        : errorToString.call(err);
     let out = head;
     for (const frame of frames) {
       let text = `${frame}`;

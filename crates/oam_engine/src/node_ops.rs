@@ -507,6 +507,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("workerTerminate", op_worker_terminate),
         ("parentPortPostMessage", op_parent_port_post_message),
         ("parentPortRecvMessage", op_parent_port_recv_message),
+        ("parentPortSetRef", op_parent_port_set_ref),
         ("workerThreadId", op_worker_thread_id),
         ("workerIsMainThread", op_worker_is_main_thread),
         ("workerGetData", op_worker_get_data),
@@ -3040,6 +3041,11 @@ fn op_v8_is(
         "argumentsObject" => value.is_arguments_object(),
         "weakMap" => value.is_weak_map(),
         "weakSet" => value.is_weak_set(),
+        "numberObject" => value.is_number_object(),
+        "stringObject" => value.is_string_object(),
+        "booleanObject" => value.is_boolean_object(),
+        "bigIntObject" => value.is_big_int_object(),
+        "symbolObject" => value.is_symbol_object(),
         _ => false,
     };
     rv.set_bool(answer);
@@ -9181,7 +9187,28 @@ fn op_parent_port_recv_message(
         return;
     };
     let inbox = ctx.inbox.clone();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::worker::worker_recv(inbox));
+    // Filed under the parentPort handle, so `parentPortSetRef(false)` --
+    // the port's last 'message' listener going -- stops the parked receive
+    // holding the worker's loop open, as node's unref'd port does (#401).
+    crate::ops::spawn_handle_op(
+        scope,
+        &mut rv,
+        oam_core::HandleKey::ParentPort,
+        oam_core::worker::worker_recv(inbox),
+    );
+}
+
+/// `__oam.node.parentPortSetRef(referenced)`: a worker's `parentPort.ref()`
+/// / `.unref()`, which its first 'message' listener and the removal of its
+/// last one do. Nothing is cancelled: an unref'd receive still delivers a
+/// message that arrives, it just no longer keeps the worker alive (#401).
+fn op_parent_port_set_ref(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let referenced = args.get(0).boolean_value(scope);
+    core_runtime_mut!(scope).set_handle_ref(oam_core::HandleKey::ParentPort, referenced);
 }
 
 fn op_worker_thread_id(
