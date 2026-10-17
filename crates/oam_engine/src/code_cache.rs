@@ -263,18 +263,53 @@ fn env_selection() -> &'static (PathBuf, bool) {
     static ROOT: OnceLock<(PathBuf, bool)> = OnceLock::new();
     ROOT.get_or_init(|| {
         let mut env = CacheEnv::from_process();
-        let version_dir = version_dir_name();
         // A disabled cache creates nothing, as node's does: the DISABLED
         // answer still asks for the default root, and must not mkdir.
         if env.node_compile_cache.is_some() && enabled() {
-            let root = resolve_cache_root(&env, cfg!(windows), &version_dir);
+            let root = resolve_cache_root(&env, cfg!(windows), &version_dir_name());
             if std::fs::create_dir_all(&root).is_ok() {
                 return (root, true);
             }
-            env.node_compile_cache = None;
         }
-        (resolve_cache_root(&env, cfg!(windows), &version_dir), false)
+        // Only NODE_COMPILE_CACHE's root carries the per-build subdirectory,
+        // so the default root never reads V8's version tag.
+        env.node_compile_cache = None;
+        (resolve_cache_root(&env, cfg!(windows), ""), false)
     })
+}
+
+/// The root `oam cache info|clean` reports and cleans: the one a flagless
+/// `oam run` with this environment caches into (see [`env_selection`]),
+/// worked out without creating anything -- `oam cache info` must not mkdir
+/// the directory it reports.
+///
+/// `oam cache` never builds an isolate, and the per-build subdirectory name
+/// carries V8's version tag, which hashes the V8 flags in force when it is
+/// read. Read before [`crate::init_platform`], it names a directory no run
+/// uses, so the platform is initialized first, with no flags, as `oam run`
+/// does without `--expose-gc` and friends (a run with one of those caches
+/// under that build's own subdirectory, as node keys its cache on flags).
+///
+/// Whether `NODE_COMPILE_CACHE` is usable is judged by its nearest existing
+/// ancestor being a directory: the path through a file that a run falls back
+/// from. A read-only parent is not detected; info then reports the named
+/// directory with no entries.
+fn cli_root() -> PathBuf {
+    let mut env = CacheEnv::from_process();
+    if let Some(dir) = &env.node_compile_cache
+        && enabled()
+    {
+        let creatable = dir
+            .ancestors()
+            .find(|p| p.exists())
+            .is_some_and(Path::is_dir);
+        if creatable {
+            crate::init_platform();
+            return resolve_cache_root(&env, cfg!(windows), &version_dir_name());
+        }
+    }
+    env.node_compile_cache = None;
+    resolve_cache_root(&env, cfg!(windows), "")
 }
 
 /// The root `module.enableCompileCache(dir)` chose for one isolate, kept in
@@ -765,7 +800,7 @@ fn dir_stats(root: &Path) -> (usize, u64) {
 /// and cleans. A directory a program picks with `enableCompileCache(dir)` is
 /// that program's to manage, as under node.
 pub(crate) fn dir() -> PathBuf {
-    env_root().to_path_buf()
+    cli_root()
 }
 
 /// Location, entry count and total size of this process's bytecode cache.
@@ -783,7 +818,7 @@ pub(crate) fn stats() -> CodeCacheStats {
 /// optimization, so the next run recompiles and repopulates. A missing
 /// directory is success.
 pub(crate) fn clean() -> std::io::Result<()> {
-    match std::fs::remove_dir_all(env_root()) {
+    match std::fs::remove_dir_all(cli_root()) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
