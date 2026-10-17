@@ -38299,6 +38299,13 @@ fn windows_exe_reserves_node_sized_main_thread_stack() {
 /// (measured, Windows 11 arm64; it does at 1500 deep too, where oam's walk
 /// still fits -- see docs/node-divergences.md). The chain is made natively so
 /// the test spends its time in the copy.
+///
+/// Windows only, like the PE-reserve test above it: the chain's path is ~5000
+/// characters, past PATH_MAX on macOS (1024) and Linux (4096), so neither node
+/// nor oam can walk it there -- every syscall on it fails ENAMETOOLONG, and the
+/// mkdir that builds it fails first. The cross-platform half of #395 (running
+/// out ends in a catchable RangeError) is conformance cases 570 and 571.
+#[cfg(windows)]
 #[test]
 fn deep_cp_sync_with_filter_throws_range_error_not_a_native_overflow() {
     let script = write_temp(
