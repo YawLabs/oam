@@ -29,10 +29,23 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   being the app's own. A primitive
   thrown from an ES module entry or a `queueMicrotask` callback is now printed as
   `String()` gives it (`a string`, not `'a string'`), as node prints it. Node's frame
-  above those two still has no oam counterpart, and a CommonJS module that throws while an
-  ES module entry's imports load is still reported by oam's one-line `error[OAM-RT0001]`;
-  see docs/node-divergences.md #54.
+  above those two still has no oam counterpart; see docs/node-divergences.md #54.
   Conformance case 573.
+
+### Fixed
+
+- **A CommonJS module that throws while an ES module entry's imports load is an uncaught
+  exception, as in node (#437).** `import "./dep.cjs"` where `dep.cjs` throws ended the run
+  with oam's one-line `error[OAM-RT0001]: ...: Uncaught <value>` and offered the throw to no
+  listener. It now goes the way of the entry's own throw: `uncaughtExceptionMonitor`, a
+  capture callback and the `'uncaughtException'` listeners see it with origin
+  `unhandledRejection`, a listener that takes it lets the run go on without the entry's
+  body, and otherwise the report is node's fatal one (the source frame and stack of an
+  Error, the `--trace-uncaught` hint after a primitive, `Thrown at:` under the flag), exit
+  1, or 7 when a listener throws. A `Worker`'s entry hands its parent the value. An ES
+  module entry's throw, this one included, now gives the monitor origin
+  `uncaughtException` when a capture callback is set, as node's loader does. What still
+  differs is docs/node-divergences.md #52 and #54. Conformance case 574.
 
 ## [0.19.1] - 2026-10-13
 

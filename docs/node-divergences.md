@@ -857,13 +857,23 @@ object -- gets no hint, as in node. Two things still differ under the flag:
 - **An unhandled rejection.** node's report of one is an uncaught exception's, so it ends
   with `Thrown at:` too; oam's is its own one-line report (#55), which has no stack block.
 
-One path has neither the hint nor the stack yet: a CommonJS module that throws while an ES
-module entry's import graph loads (`import "./dep.cjs"` where `dep.cjs` throws). node
-rejects the entry's evaluation with the value and reports it like any other ES module entry
-throw, after offering it to the `'uncaughtException'` listeners (origin
-`unhandledRejection`); oam ends the run with its own one-line `error[OAM-RT0001]: ...:
-Uncaught <value>`, for an Error and a primitive alike, and offers it to no listener.
-Measured 2026-10-17 on Windows; a gap of its own, not of the trace flag.
+A CommonJS module that throws from its body while an ES module entry's import graph runs it
+(`import "./dep.cjs"` where `dep.cjs` throws, at any depth of the graph) is one of these
+ES module entry throws, in node and in oam (#437): node rejects the entry's evaluation with
+the value, and oam takes the throw down the same path as that rejection. The ladder runs
+with origin `unhandledRejection` (`uncaughtException` when a capture callback is set, which
+node's loader hands the error to directly), a listener that takes it lets the run go on
+without the entry's body, and with nothing to take it the report is the one above, exit 1,
+or 7 when a listener throws. An Error's report opens with the source frame its stack gives
+(the `new Error` line), as node's does. The same throw reached through `import()` rejects
+the promise with the value, and from a `Worker`'s entry hands the parent's `'error'` the
+value, worker exit 1 (conformance case 574). It used to end the run with oam's own
+one-line `error[OAM-RT0001]: ...: Uncaught <value>` and offer the throw to no listener.
+What still differs follows from #52 -- oam runs the CommonJS module while the graph loads,
+not while it evaluates: the ES modules node evaluates ahead of it (those imported before
+it) have not run when it throws, and so never run in oam, and the ticks of a CommonJS
+module that ran before it have already run, where node runs them after the listener.
+Measured 2026-10-17 on Windows.
 
 Everywhere oam has the throw's source frame -- a CommonJS entry, a timer, a tick, an
 `'uncaughtException'` listener -- the report of a value that is not a native Error is
@@ -994,7 +1004,13 @@ things follow:
   until the `require()` returns, as in node (conformance case 441). What still differs is
   when a CommonJS module that `import()` loads runs: on the first microtask turn after the
   call in oam, where node runs it on the eighth (with the evaluation of an ES module in the
-  same place). When that `import()` settles is node's either way (conformance case 481).
+  same place). When that `import()` settles is node's either way (conformance case 481);
+- in a graph the entry imports, the ticks and promise jobs a CommonJS module queues run
+  right after its body, while the graph loads, where node runs them after the whole graph
+  has evaluated (`import "./t.cjs"; import "./p.mjs"`: node prints t's body, p's body, the
+  entry's body, t's promise job, t's tick; oam t's body, t's tick, t's promise job, then
+  the two bodies). When such a module throws, the ES modules ahead of it have not run
+  and never do (#54 has the rest of that case). Measured 2026-10-17 on Windows.
 
 One message differs on its own: an unresolved bare specifier whose package was found but
 whose file was not is `ERR_MODULE_NOT_FOUND` with oam's message, which lists the
