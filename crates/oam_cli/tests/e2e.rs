@@ -32979,6 +32979,71 @@ fn compile_cache_unusable_env_dir_is_ignored() {
     let _ = std::fs::remove_dir_all(&project);
 }
 
+// A CommonJS module an ES module graph runs can call enableCompileCache(dir)
+// partway through the graph load; the ES modules compiled after it are
+// cached in the named directory whether or not the prefetch pool loaded
+// them first. The pool keys its probe under the root current when the load
+// began, so a prefetched module used to be stored in the old root -- and
+// whether one was prefetched depends on worker timing. With the pool off
+// every lookup reads the root then in force: the two runs must agree.
+#[test]
+fn compile_cache_enable_mid_graph_load_holds_for_prefetched_modules() {
+    let named_blobs = |prefetch: &str| {
+        let project = compile_cache_scratch(&format!("cc-midgraph-{prefetch}"));
+        let oam_cache = project.join("oam-cache");
+        let named = project.join("named");
+        std::fs::write(
+            project.join("a.cjs"),
+            "require('node:module').enableCompileCache(require('node:path').join(__dirname, 'named'));\n",
+        )
+        .unwrap();
+        for name in ["b", "c", "d"] {
+            std::fs::write(
+                project.join(format!("{name}.mjs")),
+                format!("export const {name} = '{name}';\n"),
+            )
+            .unwrap();
+        }
+        let entry = project.join("main.mjs");
+        std::fs::write(
+            &entry,
+            "import './a.cjs';\nimport { b } from './b.mjs';\nimport { c } from './c.mjs';\n\
+             import { d } from './d.mjs';\nconsole.log(b + c + d);\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .arg("run")
+            .arg(&entry)
+            .current_dir(&project)
+            .without_ambient_compile_cache()
+            .env("OAM_CACHE_DIR", &oam_cache)
+            .env("OAM_GRAPH_PREFETCH", prefetch)
+            .output()
+            .expect("oam binary runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "bcd\n");
+        let dirs = oam_version_dirs(&named);
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        let n = count_v8c(&dirs[0]);
+        let _ = std::fs::remove_dir_all(&project);
+        n
+    };
+    let serial = named_blobs("0");
+    assert!(
+        serial >= 3,
+        "b, c and d are cached in the named dir: {serial}"
+    );
+    assert_eq!(
+        named_blobs("1"),
+        serial,
+        "prefetched modules land in the named dir as unprefetched ones do"
+    );
+}
+
 // `oam cache info|clean` under NODE_COMPILE_CACHE name the per-build
 // subdirectory a run actually filled. `oam cache` builds no isolate, and the
 // subdirectory carries V8's version tag, which hashes the V8 flags: read
