@@ -811,7 +811,7 @@ On POSIX a read in flight holds the parent's end until it returns (`child_unix.r
 with a blocking `poll`), so the pipe closes after the child's next write rather than at
 once, and that write is read and dropped; on Windows the close cancels the read.
 
-### 54. A primitive thrown from an ES module entry: no source frame, no trace hint
+### 54. A primitive thrown from an ES module entry: no source frame (the trace hint is FIXED)
 
 A value that is not an Error -- `throw 42`, `throw "a string"` -- thrown at an ES module
 entry's top level is reported by node v22.22.2 as:
@@ -824,21 +824,47 @@ node:internal/modules/run_main:123
 (Use `node --trace-uncaught ...` to show where the exception was thrown)
 ```
 
-oam prints the value alone (`42`, and `'a string'` for the string, as `util.inspect`
-renders it), exit 1 as in node. Node's frame is the line of its own loader that rethrows
-the module's rejection; oam has no such source to point at, and a primitive carries no
-stack to place the throw by, so there is nothing true to print in its place. A primitive
-thrown from a `queueMicrotask` callback is the same kind of case: node's frame there is
-`<anonymous_script>:0` and an empty line, which name no source either, and oam prints the
-value alone.
+oam prints the same report without the three lines of the frame, exit 1 as in node. Node's
+frame is the line of its own loader that rethrows the module's rejection; oam has no such
+source to point at, and a primitive carries no stack to place the throw by, so there is
+nothing true to print in its place. A primitive thrown from a `queueMicrotask` callback is
+the same kind of case: node's frame there is `<anonymous_script>:0` and an empty line,
+which name no source either, and oam leaves them out. The value itself is node's line in
+both cases: a primitive as `String()` gives it, a Symbol as nothing.
 
-The hint names a flag oam does not have, as in #51. Everywhere oam has the throw's source
-frame -- a CommonJS entry, a timer, a tick, an `'uncaughtException'` listener -- the report
-of a value that is not a native Error is node's line for line apart from that hint: an
-empty line first, the value right under the caret, a primitive as `String()` gives it (a
-Symbol as an empty line), an object inspected (conformance case 473, which keeps the empty
-lines and takes the hint line out of both sides). Measured 2026-10-16 on Windows (#399
-item 6); `--trace-uncaught` is #364's kind of flag work.
+This entry used to record that oam printed no hint, because it had no `--trace-uncaught`.
+It has the flag now, on the command line, in `NODE_OPTIONS` and in a `Worker`'s own
+`execArgv` (with #51's limits on the forms it accepts): without it a thrown primitive's
+report ends with node's hint, naming the program as node does (`basename(process.argv0)`,
+`oam`); with it every fatal report ends with `Thrown at:` and the stack V8 captured at
+the throw, in node's frame format, in place of the hint. An object -- an Error, or a plain
+object -- gets no hint, as in node. Two things still differ under the flag:
+
+- **The frames past the program's own.** node's stack goes on into its loader and timers
+  (`Module._compile`, `listOnTimeout`, ...); oam's into its own runtime (`oam:...`
+  frames), or ends there. The program's frames are node's, function names and positions
+  alike, mapped back to a transpiled file's source as the report's frame is (case 573,
+  which keeps only the frames in its own files).
+- **An ES module entry's throw.** It reaches the host as the rejection of the module's
+  evaluation, after V8 has decided it was caught, so neither runtime has the throw's
+  stack: node prints its loader's frame, oam an empty `Thrown at:`. An Error keeps its
+  own stack in the report either way. A `queueMicrotask` callback's primitive gets an
+  empty `Thrown at:` in both.
+
+One path has neither the hint nor the stack yet: a CommonJS module that throws while an ES
+module entry's import graph loads (`import "./dep.cjs"` where `dep.cjs` throws). node
+rejects the entry's evaluation with the value and reports it like any other ES module entry
+throw, after offering it to the `'uncaughtException'` listeners (origin
+`unhandledRejection`); oam ends the run with its own one-line `error[OAM-RT0001]: ...:
+Uncaught <value>`, for an Error and a primitive alike, and offers it to no listener.
+Measured 2026-10-17 on Windows; a gap of its own, not of the trace flag.
+
+Everywhere oam has the throw's source frame -- a CommonJS entry, a timer, a tick, an
+`'uncaughtException'` listener -- the report of a value that is not a native Error is
+node's line for line: an empty line first, the value right under the caret, a primitive
+as `String()` gives it (a Symbol as an empty line), an object inspected, and the hint
+after a primitive (conformance cases 473 and 573). Measured 2026-10-17 on Windows (#399
+item 6).
 
 ### 55. An unhandled rejection: oam's own report, and no `'uncaughtException'` for it
 
