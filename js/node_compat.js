@@ -33938,9 +33938,12 @@
           // loop) and answered after it: a connection node's listener still
           // had in its backlog when it closed, which the client sees reset.
           // Handed to the closed server, it left the client connected to
-          // nothing (#338).
+          // nothing (#338). The close has already closed it (#388); the
+          // reset is for a stream the close did not reach. Otherwise taken
+          // now, before the server sees it, so its close leaves it be.
           const superseded = generation !== this._listenGeneration;
-          if (superseded || !this.listening) {
+          if (superseded || !this.listening
+              || !natives.tcpAcceptTake(this._serverId, accepted.handle)) {
             natives.tcpReset(accepted.handle, false);
             if (superseded) return;
             break;
@@ -44202,9 +44205,11 @@
             if (accepted === undefined) break;
             // Accepted before close() (or the listen() that superseded
             // this loop) and answered after it: reset, as net.Server's
-            // accept loop resets one (#338).
+            // accept loop resets one (#338). Otherwise taken now, before
+            // the server sees it, so its close leaves it be (#388).
             var superseded = generation !== this._listenGeneration;
-            if (superseded || this._closed) {
+            if (superseded || this._closed
+                || !natives.tcpAcceptTake(serverId, accepted.handle)) {
               natives.tcpReset(accepted.handle, false);
               if (superseded) return;
               break;

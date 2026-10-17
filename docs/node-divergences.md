@@ -3787,8 +3787,18 @@ listens on is `connect ENOENT <path>` (errno, code, syscall, address), one alrea
 in it is `connect EINVAL <path> - Local (undefined:undefined)` or `listen EINVAL: invalid
 argument <path>` before anything is opened (libuv refuses it, as the OS would read the name
 only up to the NUL; e2e test `a_pipe_path_with_a_nul_byte_is_einval_as_on_node`), and a
-closed server's path dials `ENOENT` again (on Unix the socket file is unlinked on close, as
-libuv does). On Windows the name goes to the OS as written: `\\.\pipe\x`, `\\?\pipe\x`,
+closed server's path dials `ENOENT` again, from the moment `close()` returns (on Unix the
+socket file is unlinked on close, as libuv does; on Windows the close closes every pipe
+instance still waiting for a client before it returns, as libuv's does -- up to 0.19.1 they
+stayed open until the server's accept woke, and a dial right after `close()` could connect
+to one and be dropped; #388, `conformance/cases/560-net-pipe-closed-server-gone-at-once.mjs`).
+So does one a client has connected to that the server has not yet emitted `'connection'`
+for: it is closed with the server, its client reads `'end'`, and the name can be listened
+on again in the same tick -- up to 0.19.1 it stayed open until the server's accept loop
+reset it a tick later, so a same-tick open was `EBUSY`, a same-tick `listen` `EADDRINUSE`,
+and a dial waited out `WaitNamedPipeW`'s 30 s to `ETIMEDOUT`
+(`conformance/cases/561-net-pipe-closed-server-drops-unaccepted-client.mjs`).
+On Windows the name goes to the OS as written: `\\.\pipe\x`, `\\?\pipe\x`,
 `//./pipe/x` and another letter case name one pipe; a name that is not a pipe's cannot be
 listened on (`listen EACCES`), and dialling a regular file is `ENOTSOCK`, a directory
 `EPERM`. A named pipe has no half-close, so `end()` behaves as libuv's shutdown does: it
@@ -3854,7 +3864,26 @@ booting and then failing every browser tool.
 - **Windows: remote clients and impersonation.** oam's pipe server refuses clients on other
   machines (`PIPE_REJECT_REMOTE_CLIENTS`) and its client lets the server identify, not
   impersonate, it (`SECURITY_IDENTIFICATION`); libuv sets neither, so a Node server takes
-  `\\host\pipe\x` clients. _(source)_
+  `\\host\pipe\x` clients. A client that names a local pipe through a UNC server name counts
+  as remote too -- it comes in through the SMB redirector -- even the loopback one: with a
+  server listening on `\\.\pipe\x`, `fs.openSync('\\\\localhost\\pipe\\x', 'r')` (or
+  `\\127.0.0.1\pipe\x`) is refused with `EPERM` by an oam server and gets an fd from a Node
+  one; `\\.\pipe\x` opens on both (measured on v22.22.2, Windows 11; #385). Kept by
+  decision: matching Node would open every oam pipe server to clients on the network, which
+  a local IPC endpoint -- an MCP server, a browser's control pipe -- does not expect and
+  rarely authenticates; a script that wants remote clients should listen on TCP. Pinned by
+  the unit test `a_client_dialling_through_a_unc_server_name_is_refused_as_remote`
+  (`crates/oam_core/src/pipe.rs`). _(measured)_
+- **Windows: which side of an in-process pipe connection hears first.** When a script dials
+  its own pipe server, Node always runs the client's `'connect'` callback before the server
+  emits `'connection'` (libuv runs the dial's callback from its pending queue, ahead of the
+  completion port the accept comes in on); on oam the server's `'connection'` can come
+  first -- in 7 of 20 rounds of a dial-then-`close()` probe, against 0 of 20 on v22.22.2.
+  A script that closes the server in the client's `'connect'` callback then finds the
+  connection already handed to the server, which, as on Node, outlives the close: the name
+  stays taken until the connection goes (a dial waits for an instance and gets `ETIMEDOUT`
+  after 30 s, a `listen` is `EADDRINUSE`). Case 561 counts only the rounds where the server
+  has not emitted `'connection'` yet. Not yet worked on. _(measured)_
 - **Windows: many clients at once.** As libuv, oam keeps four pipe instances waiting for
   clients, makes the next as soon as a client takes one, and a client that finds every
   instance taken waits for one with `WaitNamedPipeW`, up to 30 s (`ETIMEDOUT` after that). At
