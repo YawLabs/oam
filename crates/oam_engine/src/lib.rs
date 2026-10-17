@@ -1082,9 +1082,12 @@ pub fn code_cache_stats() -> CodeCacheStats {
     crate::code_cache::stats()
 }
 
-/// The V8 bytecode cache directory this process would use (`OAM_CACHE_DIR`
-/// wins, then the platform cache dir, then the system temp dir). Cheap: no
-/// directory walk.
+/// The V8 bytecode cache directory a flagless run with this environment
+/// would use (`NODE_COMPILE_CACHE`'s per-build subdirectory wins, then
+/// `OAM_CACHE_DIR`, then the platform cache dir, then the system temp dir).
+/// Cheap: no directory walk, and nothing is created. Initializes the V8
+/// platform when `NODE_COMPILE_CACHE` is set (the subdirectory names V8's
+/// version tag).
 pub fn code_cache_dir() -> std::path::PathBuf {
     crate::code_cache::dir()
 }

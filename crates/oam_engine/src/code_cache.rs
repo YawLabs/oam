@@ -23,7 +23,13 @@
 //!
 //! Store layout: `<cache_root>/bytecode/<aa>/<rest>.v8c`, where `cache_root`
 //! is `OAM_CACHE_DIR` if set (tests), else the platform cache dir, else the
-//! system temp dir (see [`resolve_cache_root`]). A sibling `<rest>.seedrej`
+//! system temp dir (see [`resolve_cache_root`]). node's compile-cache API
+//! moves it: `NODE_COMPILE_CACHE=<dir>` or `module.enableCompileCache(dir)`
+//! puts the same `<aa>/<rest>.v8c` tree in `<dir>/oam-v<ver>-<arch>-<tag>`
+//! (see [`version_dir_name`]). The cache stays ON by default either way --
+//! node's is opt-in, oam's predates the API and costs nothing measurable on
+//! a first run -- and `NODE_DISABLE_COMPILE_CACHE` turns it off like
+//! `OAM_CODE_CACHE=0`. A sibling `<rest>.seedrej`
 //! tombstone records that V8 rejected the embedded SEED for that key, which
 //! is what lets a refreshed disk blob supersede the seed without giving the
 //! user-writable cache dir priority over a compiled binary's embedded
@@ -34,8 +40,9 @@
 
 use oam_diagnostics::own_files::{self, Audience};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 /// oam-side format stamp folded into every cache key. Bump it whenever the
@@ -60,13 +67,37 @@ const CODE_CACHE_FORMAT: u32 = 1;
 /// serialize work too, not just the read/write -- a true off switch leaves no
 /// residual cost.
 pub(crate) fn enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !matches!(
-            std::env::var("OAM_CODE_CACHE").as_deref(),
-            Ok("0") | Ok("off") | Ok("false") | Ok("no")
+    disabled_by().is_none()
+}
+
+/// The variable that turned the cache off, if one did: node's
+/// `NODE_DISABLE_COMPILE_CACHE`, or oam's own `OAM_CODE_CACHE` switch.
+/// `module.enableCompileCache()` names it in its DISABLED message ("Disabled
+/// by NODE_DISABLE_COMPILE_CACHE", node's exact wording). Read once, like
+/// every other cache input.
+pub(crate) fn disabled_by() -> Option<&'static str> {
+    static WHY: OnceLock<Option<&'static str>> = OnceLock::new();
+    *WHY.get_or_init(|| {
+        disabled_reason(
+            std::env::var_os("NODE_DISABLE_COMPILE_CACHE").is_some(),
+            std::env::var("OAM_CODE_CACHE").ok().as_deref(),
         )
     })
+}
+
+/// Pure half of [`disabled_by`]. node tests `NODE_DISABLE_COMPILE_CACHE` for
+/// PRESENCE, not truthiness -- v22.22.2 reports DISABLED for `=1` and `=0`
+/// alike (measured) -- so a set variable disables whatever its value. It is
+/// checked first because a program that asks node's API why the cache is off
+/// should be told about node's variable when both are set.
+fn disabled_reason(node_disable: bool, oam_code_cache: Option<&str>) -> Option<&'static str> {
+    if node_disable {
+        Some("NODE_DISABLE_COMPILE_CACHE")
+    } else if matches!(oam_code_cache, Some("0" | "off" | "false" | "no")) {
+        Some("OAM_CODE_CACHE")
+    } else {
+        None
+    }
 }
 
 /// What was compiled. ESM modules and CJS require-wrappers produce different
@@ -89,11 +120,50 @@ impl Kind {
 }
 
 /// Opaque content-addressed key for one `(source, kind)` pair under the
-/// current V8 build and oam format. Computed once by [`key_for`] and handed to
-/// [`load`], [`store`] and [`forget_seed`], so a load-then-store pair hashes
-/// the source a single time and never re-derives the cache root.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct CacheKey(String);
+/// current V8 build and oam format, plus the cache root its lookup used.
+/// Computed once by [`key_for`] and handed to [`load`], [`store`] and
+/// [`forget_seed`], so a load-then-store pair hashes the source a single
+/// time and never re-derives the cache root.
+///
+/// The root rides in the key because the root can move between a lookup and
+/// its store: `module.enableCompileCache(dir)` runs from inside a module
+/// body, after the entry (and an ESM entry's whole static graph) has been
+/// looked up but before any of them is stored -- ESM blobs are produced
+/// after evaluation, a CJS blob after its body returns. Re-reading the root
+/// at store time filed those entries under the new root while every later
+/// run looked them up under the old one, so the bin that follows node's
+/// advice (call `enableCompileCache` at its top) recompiled and rewrote its
+/// own entry on every run. A store now lands where its lookup looked.
+///
+/// Equality and hashing use the content hash alone: the in-memory seed map
+/// is keyed by content, and a seed must match whichever root the lookup
+/// that finds it used.
+#[derive(Clone, Debug)]
+pub(crate) struct CacheKey {
+    hash: String,
+    root: Arc<Path>,
+}
+
+impl CacheKey {
+    /// Whether this key looks up and stores under `root`.
+    pub(crate) fn is_under(&self, root: &Arc<Path>) -> bool {
+        Arc::ptr_eq(&self.root, root) || *self.root == **root
+    }
+}
+
+impl PartialEq for CacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash
+    }
+}
+
+impl Eq for CacheKey {}
+
+impl std::hash::Hash for CacheKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
+}
 
 /// A blob returned by [`load`]: the raw bytes plus where they came from.
 /// `seeded` is true when the bytes are the in-process seed (embedded bytecode
@@ -111,6 +181,9 @@ pub(crate) struct Loaded {
 /// to a relative `oam/` under the CWD, the exact failure the temp fallback
 /// exists to prevent.
 struct CacheEnv {
+    /// `NODE_COMPILE_CACHE`, made absolute against the start-up working
+    /// directory (node resolves a relative value the same way; measured).
+    node_compile_cache: Option<PathBuf>,
     cache_dir: Option<String>,
     local_app_data: Option<String>,
     xdg_cache_home: Option<String>,
@@ -122,6 +195,8 @@ impl CacheEnv {
     fn from_process() -> Self {
         let var = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
         Self {
+            node_compile_cache: var("NODE_COMPILE_CACHE")
+                .map(|dir| std::path::absolute(&dir).unwrap_or_else(|_| PathBuf::from(dir))),
             cache_dir: var("OAM_CACHE_DIR"),
             local_app_data: var("LOCALAPPDATA"),
             xdg_cache_home: var("XDG_CACHE_HOME"),
@@ -131,8 +206,9 @@ impl CacheEnv {
     }
 }
 
-/// Pure path logic behind [`cache_root`]: `OAM_CACHE_DIR` override (tests),
-/// else the platform cache dir (`%LOCALAPPDATA%\oam` on Windows,
+/// Pure path logic behind [`env_root`]: node's `NODE_COMPILE_CACHE`, as
+/// `<dir>/<version_dir>` (see [`version_dir_name`]), else the
+/// `OAM_CACHE_DIR` override (tests), else the platform cache dir (`%LOCALAPPDATA%\oam` on Windows,
 /// `$XDG_CACHE_HOME/oam` or `~/.cache/oam` elsewhere), else the system temp
 /// dir -- never the process CWD. A scrubbed environment (`env -i`, a minimal
 /// container, some systemd units) has no `HOME`/`LOCALAPPDATA`; before the
@@ -143,7 +219,15 @@ impl CacheEnv {
 /// Mirrors `oam_ts::daemon::cache_root` deliberately (kept local to avoid a
 /// dependency from the v8-bound engine into the tsgo crate); the two must
 /// agree on the base dir so `oam cache` and the daemon's state share one root.
-fn resolve_cache_root(env: &CacheEnv, windows: bool) -> PathBuf {
+///
+/// `NODE_COMPILE_CACHE` outranks `OAM_CACHE_DIR` because it is the narrower
+/// request: it names where compiled code goes, where `OAM_CACHE_DIR` moves
+/// all of oam's caches (and is what a test harness sets to isolate a run, so
+/// a program that names its own compile-cache dir must still get it).
+fn resolve_cache_root(env: &CacheEnv, windows: bool, version_dir: &str) -> PathBuf {
+    if let Some(dir) = &env.node_compile_cache {
+        return dir.join(version_dir);
+    }
     let base = if let Some(dir) = &env.cache_dir {
         PathBuf::from(dir)
     } else {
@@ -160,13 +244,170 @@ fn resolve_cache_root(env: &CacheEnv, windows: bool) -> PathBuf {
     base.join("bytecode")
 }
 
-/// Bytecode cache root for this process. Resolved once: the env is fixed for
-/// a process lifetime (no in-process `set_var` of `OAM_CACHE_DIR` exists; tests
+/// The root the environment selects. Resolved once: the env is fixed for a
+/// process lifetime (no in-process `set_var` of `OAM_CACHE_DIR` exists; tests
 /// pass it via `Command::env`), and the per-load path derivation used to cost
 /// two env reads plus allocations on every miss.
-fn cache_root() -> &'static Path {
-    static ROOT: OnceLock<PathBuf> = OnceLock::new();
-    ROOT.get_or_init(|| resolve_cache_root(&CacheEnv::from_process(), cfg!(windows)))
+fn env_root() -> &'static Path {
+    &env_selection().0
+}
+
+/// [`env_root`] as the shared handle a [`CacheKey`] carries, built once so
+/// a key costs a refcount bump, not a path copy.
+fn env_root_arc() -> Arc<Path> {
+    static ROOT: OnceLock<Arc<Path>> = OnceLock::new();
+    Arc::clone(ROOT.get_or_init(|| Arc::from(env_root())))
+}
+
+/// [`env_root`], and whether `NODE_COMPILE_CACHE` chose it. node creates the
+/// `NODE_COMPILE_CACHE` directory at start-up and, when it cannot (the path
+/// runs through a file, a read-only parent), runs with its compile cache off:
+/// `getCompileCacheDir()` is undefined and a later `enableCompileCache()`
+/// answers ENABLED (measured on v22.22.2). oam does the same create here and,
+/// on failure, keeps its default root instead -- the cache stays on, but
+/// node's API reports what node's would.
+fn env_selection() -> &'static (PathBuf, bool) {
+    static ROOT: OnceLock<(PathBuf, bool)> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let mut env = CacheEnv::from_process();
+        // A disabled cache creates nothing, as node's does: the DISABLED
+        // answer still asks for the default root, and must not mkdir.
+        if env.node_compile_cache.is_some() && enabled() {
+            let root = resolve_cache_root(&env, cfg!(windows), &version_dir_name());
+            if std::fs::create_dir_all(&root).is_ok() {
+                return (root, true);
+            }
+        }
+        // Only NODE_COMPILE_CACHE's root carries the per-build subdirectory,
+        // so the default root never reads V8's version tag.
+        env.node_compile_cache = None;
+        (resolve_cache_root(&env, cfg!(windows), ""), false)
+    })
+}
+
+/// The root `oam cache info|clean` reports and cleans: the one a flagless
+/// `oam run` with this environment caches into (see [`env_selection`]),
+/// worked out without creating anything -- `oam cache info` must not mkdir
+/// the directory it reports.
+///
+/// `oam cache` never builds an isolate, and the per-build subdirectory name
+/// carries V8's version tag, which hashes the V8 flags in force when it is
+/// read. Read before [`crate::init_platform`], it names a directory no run
+/// uses, so the platform is initialized first, with no flags, as `oam run`
+/// does without `--expose-gc` and friends (a run with one of those caches
+/// under that build's own subdirectory, as node keys its cache on flags).
+///
+/// Whether `NODE_COMPILE_CACHE` is usable is judged by its nearest existing
+/// ancestor being a directory: the path through a file that a run falls back
+/// from. A read-only parent is not detected; info then reports the named
+/// directory with no entries.
+fn cli_root() -> PathBuf {
+    let mut env = CacheEnv::from_process();
+    if let Some(dir) = &env.node_compile_cache
+        && enabled()
+    {
+        let creatable = dir
+            .ancestors()
+            .find(|p| p.exists())
+            .is_some_and(Path::is_dir);
+        if creatable {
+            crate::init_platform();
+            return resolve_cache_root(&env, cfg!(windows), &version_dir_name());
+        }
+    }
+    env.node_compile_cache = None;
+    resolve_cache_root(&env, cfg!(windows), "")
+}
+
+/// The root `module.enableCompileCache(dir)` chose for one isolate, kept in
+/// that isolate's slot. Per isolate, not per process, because node's
+/// compile-cache state is per Environment (measured on v22.22.2): a
+/// `worker_threads` Worker sees `getCompileCacheDir()` undefined after the
+/// main thread enabled the cache, can enable a directory of its own, and its
+/// call never moves the main thread's cache. A process-wide root let a
+/// worker's call redirect the main thread's lookups and stores mid-run.
+/// Set at most once per isolate: every later `enableCompileCache` call
+/// answers ALREADY_ENABLED with the first directory, as node's does.
+struct ApiRoot(Arc<Path>);
+
+/// The bytecode cache root for code compiled in `isolate`: the directory its
+/// `module.enableCompileCache` chose, else the environment's. Read on the
+/// isolate thread at lookup time and carried in the [`CacheKey`] from there
+/// (see its doc); graph-prefetch workers get the value their isolate read.
+pub(crate) fn root_for(isolate: &v8::Isolate) -> Arc<Path> {
+    match isolate.get_slot::<ApiRoot>() {
+        Some(ApiRoot(root)) => Arc::clone(root),
+        None => env_root_arc(),
+    }
+}
+
+/// oam's version, folded into every key and into [`version_dir_name`].
+const OAM_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// V8's `cached_data_version_tag()`: a pure function of the V8 build and its
+/// flags, both fixed once init has run. Read through V8 exactly once instead
+/// of paying an FFI call per key (keys are also derived on graph-prefetch
+/// workers, and one cached read keeps the off-isolate-thread V8 surface
+/// minimal).
+fn version_tag() -> u32 {
+    static VERSION_TAG: OnceLock<u32> = OnceLock::new();
+    *VERSION_TAG.get_or_init(v8::script_compiler::cached_data_version_tag)
+}
+
+/// The per-build subdirectory oam keeps inside a directory the user names
+/// (`NODE_COMPILE_CACHE`, `module.enableCompileCache(dir)`):
+/// `oam-v<version>-<arch>-<v8 tag>`. node does the same with
+/// `v22.22.2-arm64-<hash>`; the `oam-` prefix keeps the two apart when node
+/// and oam share one directory -- their V8 builds differ, so neither could
+/// use the other's entries, and a shared name would mix the two formats in
+/// one folder.
+fn version_dir_name() -> String {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    format!("oam-v{OAM_VERSION}-{arch}-{:08x}", version_tag())
+}
+
+/// What `module.getCompileCacheDir()` reports: the directory node's API
+/// considers enabled -- by an earlier `enableCompileCache` or by
+/// `NODE_COMPILE_CACHE` -- or `None`. oam's default cache (on without either)
+/// is not reported: node's API answers for node's opt-in cache, and a program
+/// that branches on `getCompileCacheDir() === undefined` to decide whether to
+/// enable one must see the same answer it sees under node.
+pub(crate) fn api_dir(isolate: &v8::Isolate) -> Option<PathBuf> {
+    if !enabled() {
+        return None;
+    }
+    if let Some(ApiRoot(root)) = isolate.get_slot::<ApiRoot>() {
+        return Some(root.to_path_buf());
+    }
+    let (root, node_selected) = env_selection();
+    node_selected.then(|| root.clone())
+}
+
+/// What `module.enableCompileCache()` uses with no directory: the root oam
+/// already caches into, so enabling node's API does not move a warm cache.
+pub(crate) fn default_dir() -> PathBuf {
+    env_root().to_path_buf()
+}
+
+/// The subdirectory name `enableCompileCache(dir)` creates inside `dir`.
+pub(crate) fn api_version_dir() -> String {
+    version_dir_name()
+}
+
+/// Make `root` the cache root for code `isolate` compiles from now on, as
+/// `enableCompileCache` does. Returns false when this isolate already chose
+/// one; the caller then reports ALREADY_ENABLED with [`api_dir`]. Keys
+/// already handed out keep the root their lookup used (see [`CacheKey`]).
+pub(crate) fn enable_at(isolate: &mut v8::Isolate, root: PathBuf) -> bool {
+    if isolate.get_slot::<ApiRoot>().is_some() {
+        return false;
+    }
+    isolate.set_slot(ApiRoot(Arc::from(root)));
+    true
 }
 
 /// Lowercase hex of a 32-byte digest (no `hex` crate dependency).
@@ -182,22 +423,24 @@ fn hex32(bytes: &[u8; 32]) -> String {
 /// Content-addressed hash for a (source, kind) pair under the current V8 build
 /// and oam format, as 64 lowercase hex chars. Folds in, in order: V8's version
 /// tag (a blob from a different engine build never collides with -- or is
-/// served to -- this one), [`CODE_CACHE_FORMAT`], the kind byte, and for
+/// served to -- this one), [`CODE_CACHE_FORMAT`], oam's version, the kind
+/// byte, and for
 /// `Kind::Function` the CJS wrapper parameter list -- V8 does not check the
 /// wrapper's argument names on consume, so a renamed or reordered
 /// `CJS_PARAMS` on the same V8 build would otherwise be served bytecode with
 /// the previous scope layout.
 fn entry_hash(source: &str, kind: Kind) -> String {
     use sha2::{Digest, Sha256};
-    // The tag is a pure function of the V8 build + flags, both fixed once
-    // init has run; read it through V8 exactly once instead of paying an FFI
-    // call per key (keys are now also derived on graph-prefetch workers, and
-    // one cached read keeps the off-isolate-thread V8 surface minimal).
-    static VERSION_TAG: OnceLock<u32> = OnceLock::new();
-    let tag = *VERSION_TAG.get_or_init(v8::script_compiler::cached_data_version_tag);
     let mut hasher = Sha256::new();
-    hasher.update(tag.to_le_bytes());
+    hasher.update(version_tag().to_le_bytes());
     hasher.update(CODE_CACHE_FORMAT.to_le_bytes());
+    // oam's own version, NUL-terminated so it cannot run into the kind byte.
+    // The V8 tag cannot see an oam release that changes what a produce site
+    // compiles without a CODE_CACHE_FORMAT bump; keying on the release makes
+    // a forgotten bump cost one recompile per upgrade instead of stale
+    // bytecode.
+    hasher.update(OAM_VERSION.as_bytes());
+    hasher.update([0]);
     hasher.update([kind.tag()]);
     if let Kind::Function = kind {
         hasher.update(crate::cjs::CJS_PARAMS.join(",").as_bytes());
@@ -207,25 +450,29 @@ fn entry_hash(source: &str, kind: Kind) -> String {
     hex32(&hasher.finalize().into())
 }
 
-/// The key for `source` compiled as `kind`. One SHA-256 pass; hand the result
-/// to every cache call for this compile.
-pub(crate) fn key_for(source: &str, kind: Kind) -> CacheKey {
-    CacheKey(entry_hash(source, kind))
+/// The key for `source` compiled as `kind`, looked up and stored under
+/// `root` (normally [`root_for`] the compiling isolate). One SHA-256 pass;
+/// hand the result to every cache call for this compile.
+pub(crate) fn key_for(source: &str, kind: Kind, root: Arc<Path>) -> CacheKey {
+    CacheKey {
+        hash: entry_hash(source, kind),
+        root,
+    }
 }
 
-/// Disk path for a key: `<cache_root>/<aa>/<rest>.v8c`.
+/// Disk path for a key: `<key root>/<aa>/<rest>.v8c`.
 fn path_for_key(key: &CacheKey) -> PathBuf {
-    cache_root()
-        .join(&key.0[..2])
-        .join(format!("{}.v8c", &key.0[2..]))
+    key.root
+        .join(&key.hash[..2])
+        .join(format!("{}.v8c", &key.hash[2..]))
 }
 
 /// Disk path for a key's seed-rejection tombstone:
-/// `<cache_root>/<aa>/<rest>.seedrej`. See [`record_seed_rejection`].
+/// `<key root>/<aa>/<rest>.seedrej`. See [`record_seed_rejection`].
 fn tombstone_path(key: &CacheKey) -> PathBuf {
-    cache_root()
-        .join(&key.0[..2])
-        .join(format!("{}.seedrej", &key.0[2..]))
+    key.root
+        .join(&key.hash[..2])
+        .join(format!("{}.seedrej", &key.hash[2..]))
 }
 
 /// Read the disk blob for a key. `None` on miss, any I/O error, or an empty
@@ -255,7 +502,8 @@ pub(crate) fn seed(source: &str, kind: Kind, blob: Vec<u8>) {
     if blob.is_empty() {
         return;
     }
-    let key = key_for(source, kind);
+    // The root is irrelevant here: seeds match on content (see CacheKey).
+    let key = key_for(source, kind, env_root_arc());
     if let Ok(mut map) = seed_map().lock() {
         map.insert(key, blob);
     }
@@ -307,7 +555,7 @@ pub(crate) fn load(key: &CacheKey) -> Option<Loaded> {
     if !enabled() {
         return None;
     }
-    maybe_sweep();
+    maybe_sweep(&key.root);
     let seeded = seed_map()
         .lock()
         .ok()
@@ -391,19 +639,31 @@ const BLOB_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// already stamped, so the leftover work waits for the next interval rather
 /// than the next process. Concurrent
 /// processes may walk at once -- a file deleted twice is a swallowed error.
-fn maybe_sweep() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let root = cache_root().to_path_buf();
-        let _ = std::thread::Builder::new()
-            .name("oam-code-cache-sweep".into())
-            .spawn(move || {
-                let now = SystemTime::now();
-                if sweep_due(&root, now) {
-                    sweep(&root, now);
-                }
-            });
-    });
+fn maybe_sweep(root: &Path) {
+    // One gate per root, not per process: an isolate's
+    // `enableCompileCache(dir)` points its keys at a new root after the
+    // environment's may have been swept, and a directory a program names
+    // needs the same housekeeping or it grows without bound. The gate and
+    // the swept path are the same value, so no root is skipped or walked
+    // twice when a root is chosen between the two.
+    static SWEPT: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let first = SWEPT
+        .get_or_init(Mutex::default)
+        .lock()
+        .map(|mut swept| swept.insert(root.to_path_buf()))
+        .unwrap_or(false);
+    if !first {
+        return;
+    }
+    let root = root.to_path_buf();
+    let _ = std::thread::Builder::new()
+        .name("oam-code-cache-sweep".into())
+        .spawn(move || {
+            let now = SystemTime::now();
+            if sweep_due(&root, now) {
+                sweep(&root, now);
+            }
+        });
 }
 
 /// Whether a sweep of `root` is due at `now`: the root exists (nothing to do
@@ -543,9 +803,11 @@ fn dir_stats(root: &Path) -> (usize, u64) {
     (entries, bytes)
 }
 
-/// The bytecode directory this process uses.
+/// The bytecode directory the environment selects: what `oam cache` reports
+/// and cleans. A directory a program picks with `enableCompileCache(dir)` is
+/// that program's to manage, as under node.
 pub(crate) fn dir() -> PathBuf {
-    cache_root().to_path_buf()
+    cli_root()
 }
 
 /// Location, entry count and total size of this process's bytecode cache.
@@ -563,7 +825,7 @@ pub(crate) fn stats() -> CodeCacheStats {
 /// optimization, so the next run recompiles and repopulates. A missing
 /// directory is success.
 pub(crate) fn clean() -> std::io::Result<()> {
-    match std::fs::remove_dir_all(cache_root()) {
+    match std::fs::remove_dir_all(cli_root()) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -581,6 +843,7 @@ mod tests {
         home: Option<&str>,
     ) -> CacheEnv {
         CacheEnv {
+            node_compile_cache: None,
             cache_dir: cache_dir.map(str::to_string),
             local_app_data: local_app_data.map(str::to_string),
             xdg_cache_home: xdg.map(str::to_string),
@@ -598,29 +861,76 @@ mod tests {
             Some("/home/u"),
         );
         assert_eq!(
-            resolve_cache_root(&e, true),
+            resolve_cache_root(&e, true, "SUB"),
             PathBuf::from("/override").join("bytecode")
         );
         assert_eq!(
-            resolve_cache_root(&e, false),
+            resolve_cache_root(&e, false, "SUB"),
             PathBuf::from("/override").join("bytecode")
         );
+    }
+
+    #[test]
+    fn node_compile_cache_wins_and_gets_the_version_dir() {
+        // NODE_COMPILE_CACHE names where compiled code goes; it outranks the
+        // broader OAM_CACHE_DIR and every platform default, and the blobs go
+        // in the per-build subdirectory, never the named directory itself.
+        let mut e = env(
+            Some("/override"),
+            Some("C:/lad"),
+            Some("/xdg"),
+            Some("/home/u"),
+        );
+        e.node_compile_cache = Some(PathBuf::from("/ncc"));
+        for windows in [true, false] {
+            assert_eq!(
+                resolve_cache_root(&e, windows, "SUB"),
+                PathBuf::from("/ncc").join("SUB")
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_reason_matches_node_presence_rule() {
+        // node: any NODE_DISABLE_COMPILE_CACHE value disables, "0" included.
+        assert_eq!(
+            disabled_reason(true, None),
+            Some("NODE_DISABLE_COMPILE_CACHE")
+        );
+        assert_eq!(
+            disabled_reason(true, Some("0")),
+            Some("NODE_DISABLE_COMPILE_CACHE")
+        );
+        for off in ["0", "off", "false", "no"] {
+            assert_eq!(disabled_reason(false, Some(off)), Some("OAM_CODE_CACHE"));
+        }
+        assert_eq!(disabled_reason(false, Some("1")), None);
+        assert_eq!(disabled_reason(false, None), None);
+    }
+
+    #[test]
+    fn version_dir_names_oam_arch_and_v8_tag() {
+        let _rt = crate::JsRuntime::new();
+        let name = version_dir_name();
+        let tag = format!("{:08x}", v8::script_compiler::cached_data_version_tag());
+        assert!(name.starts_with(&format!("oam-v{OAM_VERSION}-")), "{name}");
+        assert!(name.ends_with(&format!("-{tag}")), "{name}");
     }
 
     #[test]
     fn cache_root_platform_dirs() {
         let e = env(None, Some("C:/lad"), Some("/xdg"), Some("/home/u"));
         assert_eq!(
-            resolve_cache_root(&e, true),
+            resolve_cache_root(&e, true, "SUB"),
             PathBuf::from("C:/lad").join("oam").join("bytecode")
         );
         assert_eq!(
-            resolve_cache_root(&e, false),
+            resolve_cache_root(&e, false, "SUB"),
             PathBuf::from("/xdg").join("oam").join("bytecode")
         );
         let e = env(None, None, None, Some("/home/u"));
         assert_eq!(
-            resolve_cache_root(&e, false),
+            resolve_cache_root(&e, false, "SUB"),
             PathBuf::from("/home/u")
                 .join(".cache")
                 .join("oam")
@@ -637,7 +947,7 @@ mod tests {
         e.temp_dir = std::env::temp_dir();
         let expected = std::env::temp_dir().join("oam").join("bytecode");
         for windows in [true, false] {
-            let root = resolve_cache_root(&e, windows);
+            let root = resolve_cache_root(&e, windows, "SUB");
             assert_eq!(root, expected);
             assert!(
                 root.is_absolute(),
@@ -666,31 +976,50 @@ mod tests {
         // Production hits every cache call through a constructed JsRuntime, so
         // pinning that order here mirrors the real call shape.
         let _rt = crate::JsRuntime::new();
-        let a = key_for("x", Kind::Function);
-        let b = key_for("x", Kind::Module);
+        let a = key_for("x", Kind::Function, env_root_arc());
+        let b = key_for("x", Kind::Module, env_root_arc());
         assert_ne!(a, b, "kind must key apart identical source");
-        assert_eq!(a, key_for("x", Kind::Function), "key is deterministic");
+        assert_eq!(
+            a,
+            key_for("x", Kind::Function, env_root_arc()),
+            "key is deterministic"
+        );
         // The Function key depends on the wrapper parameter list: the manual
         // digest below with a different param list must differ from `a`.
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(v8::script_compiler::cached_data_version_tag().to_le_bytes());
         h.update(CODE_CACHE_FORMAT.to_le_bytes());
+        h.update(OAM_VERSION.as_bytes());
+        h.update([0]);
         h.update([Kind::Function.tag()]);
         h.update(b"exports,require,module,__filename,__dirname,global,extra");
         h.update([0]);
         h.update(b"x");
-        let other = CacheKey(hex32(&h.finalize().into()));
-        assert_ne!(a, other, "a changed CJS_PARAMS must change the key");
+        let other = hex32(&h.finalize().into());
+        assert_ne!(a.hash, other, "a changed CJS_PARAMS must change the key");
         // And the current list reproduces the real key exactly.
         let mut h = Sha256::new();
         h.update(v8::script_compiler::cached_data_version_tag().to_le_bytes());
         h.update(CODE_CACHE_FORMAT.to_le_bytes());
+        h.update(OAM_VERSION.as_bytes());
+        h.update([0]);
         h.update([Kind::Function.tag()]);
         h.update(crate::cjs::CJS_PARAMS.join(",").as_bytes());
         h.update([0]);
         h.update(b"x");
-        assert_eq!(a, CacheKey(hex32(&h.finalize().into())));
+        assert_eq!(a.hash, hex32(&h.finalize().into()));
+        // A different oam release keys the same source apart.
+        let mut h = Sha256::new();
+        h.update(v8::script_compiler::cached_data_version_tag().to_le_bytes());
+        h.update(CODE_CACHE_FORMAT.to_le_bytes());
+        h.update(b"0.0.0-other");
+        h.update([0]);
+        h.update([Kind::Function.tag()]);
+        h.update(crate::cjs::CJS_PARAMS.join(",").as_bytes());
+        h.update([0]);
+        h.update(b"x");
+        assert_ne!(a.hash, hex32(&h.finalize().into()));
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -867,7 +1196,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let source = format!("seedfirst-{}-{nanos}", std::process::id());
-        let key = key_for(&source, Kind::Function);
+        let key = key_for(&source, Kind::Function, env_root_arc());
         seed(&source, Kind::Function, b"seed-bytes".to_vec());
         store(&key, b"disk-bytes");
         let got = load(&key).expect("seeded key loads");

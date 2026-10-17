@@ -3715,7 +3715,8 @@ fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitC
 /// `oam cache info|clean`: inspect or delete the V8 bytecode cache. The cache
 /// is a pure optimization, so `clean` is safe at any time -- the next run
 /// recompiles and repopulates it. `info` reports the directory this process
-/// would use (`OAM_CACHE_DIR` wins, then the platform cache dir), the number
+/// would use (`NODE_COMPILE_CACHE`'s per-build subdirectory wins, then
+/// `OAM_CACHE_DIR`, then the platform cache dir), the number
 /// of blobs and their total size; `--json` emits the same as one object.
 fn cache_command(action: &CacheAction, json: bool) -> ExitCode {
     match action {

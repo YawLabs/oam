@@ -45,6 +45,16 @@ pub(crate) struct CjsCache {
     /// `process.mainModule`, handed to every `require` built afterwards as
     /// `require.main`. None leaves `require.main` undefined, as node does.
     main: Option<v8::Global<v8::Object>>,
+    /// Wrappers whose body is running now and whose bytecode is still to be
+    /// stored (a cache miss or a rejected blob), innermost last. A body that
+    /// ends the process -- `process.exit()` as a CLI's last line -- never
+    /// returns to the post-body store, so `process.exit()` and
+    /// `module.flushCompileCache()` store these too
+    /// ([`flush_in_flight_code_cache`]). node writes such an entry on exit
+    /// (measured on v22.22.2: `require('./dep.cjs'); process.exit(0)` leaves
+    /// both entries on disk); without this a CJS bin that exits from its
+    /// body never got a warm start.
+    in_flight_code_cache: Vec<(v8::Global<v8::Function>, crate::code_cache::CacheKey)>,
     /// The modules whose body is running (node's kIsExecuting): a graph a
     /// `require()` loads may not import one of these.
     executing: HashSet<PathBuf>,
@@ -398,7 +408,9 @@ pub(crate) fn module_kind_of(
     // would find no module syntax: no test compile.
     if crate::code_cache::enabled() {
         let stripped = strip_shebang(source.clone());
-        let blob_key = crate::code_cache::key_for(&stripped, crate::code_cache::Kind::Function);
+        let root = crate::code_cache::root_for(scope);
+        let blob_key =
+            crate::code_cache::key_for(&stripped, crate::code_cache::Kind::Function, root);
         if crate::code_cache::load(&blob_key).is_some() {
             syntax_kinds(scope)
                 .kinds
@@ -1196,8 +1208,13 @@ fn load_cjs_inner<'s>(
     // over the full source per require, least of all in the cold-compile
     // benchmarks the off switch exists for. `cached` is held for the whole
     // compile because `CachedData` borrows it (BufferNotOwned).
-    let cache_key = crate::code_cache::enabled()
-        .then(|| crate::code_cache::key_for(&source, crate::code_cache::Kind::Function));
+    // The root is read now, at lookup, and carried to the store in the key:
+    // a body that calls `enableCompileCache(dir)` must not file its own entry
+    // under a root later runs never look in (see code_cache::CacheKey).
+    let cache_key = crate::code_cache::enabled().then(|| {
+        let root = crate::code_cache::root_for(scope);
+        crate::code_cache::key_for(&source, crate::code_cache::Kind::Function, root)
+    });
     let cached = cache_key.as_ref().and_then(crate::code_cache::load);
     let consuming = cached.is_some();
 
@@ -1332,25 +1349,47 @@ fn load_cjs_inner<'s>(
         filename_v8.into(),
         dirname_v8.into(),
     ];
+    // Registered for the duration of the body only, so an exit from inside
+    // it still stores this entry (see CjsCache::in_flight_code_cache).
+    let in_flight = if refresh_cache && let Some(cache_key) = &cache_key {
+        let global = v8::Global::new(scope, wrapper);
+        match scope.get_slot_mut::<CjsCache>() {
+            Some(cache) => {
+                cache.in_flight_code_cache.push((global, cache_key.clone()));
+                true
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
     set_executing(scope, &key, true);
-    let ran = wrapper.call(scope, recv, &call_args);
+    let returned = wrapper.call(scope, recv, &call_args).is_some();
     set_executing(scope, &key, false);
-    if ran.is_none() {
-        // The body threw: exception stays pending, cache entry goes (Node
-        // re-executes on the next require).
-        evict(scope, &key);
-        return None;
+    if in_flight && let Some(cache) = scope.get_slot_mut::<CjsCache>() {
+        cache.in_flight_code_cache.pop();
     }
-
-    // Persist the bytecode now that the body has executed, so the cached blob
-    // includes the body and not just the outer wrapper. Best-effort: a failed
-    // produce or write just means the next run pays the compile again. A None
-    // key means the cache is off, which skips the serialize work entirely.
+    // Persist the bytecode now that the body has run, so the cached blob
+    // includes the body and not just the outer wrapper. This runs for a body
+    // that returned OR threw: node keeps the compile artifact either way and
+    // drops only the module RECORD on a throw (Module._load's try/finally
+    // deletes the cache entry, not the on-disk blob), so a throwing module did
+    // not pay a fresh compile on every run. Best-effort: a failed produce or
+    // write just means the next run pays the compile again. A None key means
+    // the cache is off, which skips the serialize work entirely.
     if refresh_cache
         && let Some(cache_key) = &cache_key
         && let Some(cd) = wrapper.create_code_cache()
     {
         crate::code_cache::store(cache_key, &cd);
+    }
+
+    if !returned {
+        // The body threw: the exception stays pending and the module's records
+        // go, in oam's map and in require.cache, so node re-executes it on the
+        // next require. The compile blob stored above is deliberately kept.
+        evict(scope, &key);
+        return None;
     }
 
     let loaded_key = v8::String::new(scope, "loaded")?;
@@ -1359,6 +1398,23 @@ fn load_cjs_inner<'s>(
 
     // Re-read: `module.exports = ...` reassignment is the common idiom.
     module_exports(scope, module)
+}
+
+/// Store the bytecode of every CommonJS wrapper whose body is running now:
+/// `process.exit()` and `module.flushCompileCache()` (through
+/// `modules::flush_code_cache`). The entries stay registered, so a body that
+/// does return still stores its fuller post-body blob over this one.
+pub(crate) fn flush_in_flight_code_cache(scope: &mut v8::PinScope<'_, '_>) {
+    let in_flight = match scope.get_slot::<CjsCache>() {
+        Some(cache) => cache.in_flight_code_cache.clone(),
+        None => return,
+    };
+    for (wrapper, key) in in_flight {
+        let wrapper = v8::Local::new(scope, &wrapper);
+        if let Some(cd) = wrapper.create_code_cache() {
+            crate::code_cache::store(&key, &cd);
+        }
+    }
 }
 
 fn set_executing(scope: &mut v8::PinScope<'_, '_>, key: &Path, running: bool) {

@@ -48,6 +48,19 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `exposeNumericValues` options are checked but not honoured, and `worker.getHeapSnapshot()` rejects
   rather than resolve an empty array; see docs/node-divergences.md.
 
+- **node's compile-cache API, over oam's V8 bytecode cache.** `node:module` has
+  `enableCompileCache`, `getCompileCacheDir`, `flushCompileCache` and
+  `constants.compileCacheStatus`, with node v22.22.2's return shapes, statuses and messages;
+  `module.enableCompileCache()` threw "is not a function", and importing any of the names failed at
+  link time. `NODE_COMPILE_CACHE` and `enableCompileCache(dir)` move the cache into a per-build
+  `oam-v<version>-<arch>-<V8 tag>` directory, and `NODE_DISABLE_COMPILE_CACHE` turns it off. The
+  existing cache backs it for CommonJS and ES modules alike: entries keyed by content hash, V8
+  version and flags and now oam's version, written atomically, and a corrupt or unwritable cache
+  only costs a compile. `process.exit()` and `flushCompileCache()` now write the ES module entries
+  still pending and the CommonJS modules whose body is still running. Each worker thread has its
+  own API state, as in node. The cache stays on by default, unlike node's; see
+  `docs/node-divergences.md`. Conformance cases 438-439.
+
 ### Added
 
 - **`require()` of an ES module, with node 22's semantics.** Every such `require()` threw
