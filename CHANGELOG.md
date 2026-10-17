@@ -23,8 +23,10 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `(Use \`node --trace-uncaught ...\` to show where the exception was thrown)`. The flag is
   accepted on the command line, in `NODE_OPTIONS` and in a `Worker`'s `execArgv`, and lists
   in `process.execArgv` as node's does. Without it the hint follows a primitive's report,
-  naming the program as node does (`oam`); with it every fatal report ends with
-  `Thrown at:` and the stack V8 captured at the throw, in node's frame format. A primitive
+  naming the program as node does (`oam`); with it every fatal report of an uncaught
+  exception ends with `Thrown at:` and the stack V8 captured at the throw, in node's frame
+  format. A binary built with `oam compile` honours it from `NODE_OPTIONS`, its arguments
+  being the app's own. A primitive
   thrown from an ES module entry or a `queueMicrotask` callback is now printed as
   `String()` gives it (`a string`, not `'a string'`), as node prints it. Node's frame
   above those two still has no oam counterpart, and a CommonJS module that throws while an

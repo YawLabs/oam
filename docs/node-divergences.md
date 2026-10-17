@@ -824,7 +824,8 @@ node:internal/modules/run_main:123
 (Use `node --trace-uncaught ...` to show where the exception was thrown)
 ```
 
-oam prints the same report without the three lines of the frame, exit 1 as in node. Node's
+oam prints the same report without the frame -- its opening empty line and the three lines
+after it -- exit 1 as in node. Node's
 frame is the line of its own loader that rethrows the module's rejection; oam has no such
 source to point at, and a primitive carries no stack to place the throw by, so there is
 nothing true to print in its place. A primitive thrown from a `queueMicrotask` callback is
@@ -835,9 +836,11 @@ both cases: a primitive as `String()` gives it, a Symbol as nothing.
 This entry used to record that oam printed no hint, because it had no `--trace-uncaught`.
 It has the flag now, on the command line, in `NODE_OPTIONS` and in a `Worker`'s own
 `execArgv` (with #51's limits on the forms it accepts): without it a thrown primitive's
-report ends with node's hint, naming the program as node does (`basename(process.argv0)`,
-`oam`); with it every fatal report ends with `Thrown at:` and the stack V8 captured at
-the throw, in node's frame format, in place of the hint. An object -- an Error, or a plain
+report ends with node's hint, naming the program as node does (the basename of the
+process's own `argv[0]`, `oam`); with it every fatal report of an uncaught exception ends
+with `Thrown at:` and the stack V8 captured at the throw, in node's frame format, in place
+of the hint. A binary built with `oam compile` takes its arguments as the app's own, so
+there it is `NODE_OPTIONS=--trace-uncaught` alone that turns the flag on. An object -- an Error, or a plain
 object -- gets no hint, as in node. Two things still differ under the flag:
 
 - **The frames past the program's own.** node's stack goes on into its loader and timers
@@ -845,11 +848,14 @@ object -- gets no hint, as in node. Two things still differ under the flag:
   frames), or ends there. The program's frames are node's, function names and positions
   alike, mapped back to a transpiled file's source as the report's frame is (case 573,
   which keeps only the frames in its own files).
-- **An ES module entry's throw.** It reaches the host as the rejection of the module's
-  evaluation, after V8 has decided it was caught, so neither runtime has the throw's
-  stack: node prints its loader's frame, oam an empty `Thrown at:`. An Error keeps its
-  own stack in the report either way. A `queueMicrotask` callback's primitive gets an
-  empty `Thrown at:` in both.
+- **A primitive thrown at an ES module entry's top level.** It reaches the host as the
+  rejection of the module's evaluation, after V8 has decided it was caught, so neither
+  runtime has the throw's stack: node prints its loader's frame, oam an empty
+  `Thrown at:`. An Error thrown there carries its own stack, and both print its frames
+  under `Thrown at:`. A `queueMicrotask` callback's primitive gets an empty `Thrown at:`
+  in both.
+- **An unhandled rejection.** node's report of one is an uncaught exception's, so it ends
+  with `Thrown at:` too; oam's is its own one-line report (#55), which has no stack block.
 
 One path has neither the hint nor the stack yet: a CommonJS module that throws while an ES
 module entry's import graph loads (`import "./dep.cjs"` where `dep.cjs` throws). node
