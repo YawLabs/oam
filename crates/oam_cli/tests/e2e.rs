@@ -1102,15 +1102,107 @@ fn cjs_failure_modes_surface_clearly() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // require() of an ES module points at import (ERR_REQUIRE_ESM).
+    // require() of an ES module loads it, as node 22's does; one with a
+    // top-level await is the failure, and it points at import()
+    // (ERR_REQUIRE_ASYNC_MODULE).
     std::fs::write(proj.join("esm_target.mjs"), "export const x = 1;").unwrap();
-    std::fs::write(proj.join("reqesm.cjs"), "require('./esm_target.mjs');").unwrap();
+    std::fs::write(
+        proj.join("reqesm.cjs"),
+        "console.log(require('./esm_target.mjs').x);",
+    )
+    .unwrap();
     let out = oam(&["run", proj.join("reqesm.cjs").to_str().unwrap()]);
-    assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("ERR_REQUIRE_ESM"),
+        out.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
+    std::fs::write(proj.join("esm_tla.mjs"), "await 0; export const x = 1;").unwrap();
+    std::fs::write(proj.join("reqtla.cjs"), "require('./esm_tla.mjs');").unwrap();
+    let out = oam(&["run", proj.join("reqtla.cjs").to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ERR_REQUIRE_ASYNC_MODULE") && stderr.contains("Use import() instead"),
+        "stderr: {stderr}"
+    );
+}
+
+/// `--trace-require-module` is node's opt-in for the ExperimentalWarning a
+/// require() of an ES module used to print: none without it, one per
+/// process with it (two different ES modules required still warn once), and
+/// `no-node-modules` leaves out a require made inside node_modules. The value
+/// is required and is one of two words (node's exit 9 otherwise), and
+/// execArgv hands it back as given.
+#[test]
+fn trace_require_module_flag_warns_once_when_asked() {
+    let root = "trace-require-module";
+    write_temp(
+        &format!("{root}/node_modules/pkg/inner.mjs"),
+        "export const inner = 1;",
+    );
+    write_temp(
+        &format!("{root}/node_modules/pkg/index.cjs"),
+        "module.exports = require('./inner.mjs');",
+    );
+    write_temp(
+        &format!("{root}/node_modules/pkg/package.json"),
+        r#"{ "name": "pkg", "main": "index.cjs" }"#,
+    );
+    write_temp(&format!("{root}/a.mjs"), "export const a = 1;");
+    write_temp(&format!("{root}/b.mjs"), "export const b = 2;");
+    let main = write_temp(
+        &format!("{root}/main.cjs"),
+        "require('pkg'); require('./a.mjs'); require('./b.mjs'); console.log('ran');",
+    );
+    let main = main.to_str().unwrap();
+    let warnings = |args: &[&str]| {
+        let out = oam(args);
+        assert!(
+            out.status.success(),
+            "{args:?} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let lines: Vec<String> = stderr
+            .lines()
+            .filter(|l| l.contains("ExperimentalWarning"))
+            .map(str::to_string)
+            .collect();
+        lines
+    };
+    assert!(warnings(&[main]).is_empty());
+    let all = warnings(&["--trace-require-module=all", main]);
+    assert_eq!(all.len(), 1, "{all:?}");
+    assert!(
+        all[0].contains("CommonJS module") && all[0].contains("inner.mjs using require()."),
+        "{all:?}"
+    );
+    let spaced = warnings(&["--trace-require-module", "no-node-modules", main]);
+    assert_eq!(spaced.len(), 1, "{spaced:?}");
+    assert!(spaced[0].contains("a.mjs using require()."), "{spaced:?}");
+
+    let out = oam(&["--trace-require-module"]);
+    assert_eq!(out.status.code(), Some(9));
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("--trace-require-module requires an argument")
+    );
+    let out = oam(&["--trace-require-module=some", "-e", "1"]);
+    assert_eq!(out.status.code(), Some(9));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid value for --trace-require-module")
+    );
+    let argv = write_temp(
+        &format!("{root}/argv.cjs"),
+        "console.log(JSON.stringify(process.execArgv));",
+    );
+    let out = oam(&["--trace-require-module", "all", argv.to_str().unwrap()]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        r#"["--trace-require-module","all"]"#
     );
 }
 
@@ -1131,10 +1223,11 @@ fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
     );
 
     // Shipped builtins resolve; the MOD0006 gate covers the rest, prefixed
-    // or bare. `sys` (the ancient alias for util) is a permanent canary -- it
-    // will never ship, so it keeps this test from chasing the support list.
-    // (constants used to serve this role but now ships, for graceful-fs.)
-    std::fs::write(proj.join("builtin_main.ts"), "import 'node:sys';").unwrap();
+    // or bare. `wasi` is the canary: a builtin node has that oam does not
+    // ship. (constants, then sys -- node's deprecated alias for util -- used
+    // to serve this role, but both now ship: constants for graceful-fs, sys
+    // for its DEP0025 deprecation, #368.)
+    std::fs::write(proj.join("builtin_main.ts"), "import 'node:wasi';").unwrap();
     let out = oam(&[
         "run",
         proj.join("builtin_main.ts").to_str().unwrap(),
@@ -1152,7 +1245,7 @@ fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
         "gate message present: {stderr}"
     );
 
-    std::fs::write(proj.join("bare_builtin.ts"), "import 'sys';").unwrap();
+    std::fs::write(proj.join("bare_builtin.ts"), "import 'wasi';").unwrap();
     let out = oam(&[
         "run",
         proj.join("bare_builtin.ts").to_str().unwrap(),
@@ -5110,14 +5203,17 @@ fn dynamic_import_attributes_match_static_path() {
     assert!(stdout.contains("json_on_nonjson rejected"), "{stdout}");
 }
 
-// A dynamic-import cycle (A dyn-imports B, B dyn-imports A while A is still
-// Evaluating) must resolve to A's PARTIAL namespace -- the bindings B reads
-// from A must be the ones already initialized in A (fromA). Pre-fix oam
-// rejected this cycle with "top-level await not supported yet" because A's
-// eval promise was still pending. Post-fix, dyn_import_load detects the
-// Evaluating status and returns the partial namespace.
+// A dynamic-import cycle under top-level await (A awaits import(B), B awaits
+// import(A) back) is a deadlock, as in node: B's import() of A runs in a
+// promise job after A's synchronous body (#397), when A is evaluating
+// asynchronously, so B waits on A's evaluation, which waits on B's. Neither
+// settles, and the run ends as a top-level await that never settles does,
+// exit 13 (node v22.22.2 prints its "unsettled top-level await" warning and
+// exits 13 on these files). oam used to hand B A's partial namespace
+// instead, because it evaluated B inside the hook with A's body on the
+// stack.
 #[test]
-fn dynamic_import_cycle_resolves_to_partial_namespace() {
+fn dynamic_import_cycle_under_top_level_await_deadlocks_as_node_does() {
     write_temp(
         "dynimp_cycle/a.mjs",
         "export const fromA = 'A';\n\
@@ -5126,20 +5222,48 @@ fn dynamic_import_cycle_resolves_to_partial_namespace() {
     );
     write_temp(
         "dynimp_cycle/b.mjs",
-        // B only reads bindings of A that are ALREADY initialized at the
-        // point B runs (fromA is the only one set before A's TLA suspends).
         "const a = await import('./a.mjs');\n\
          export const sawFromA = a && a.fromA === 'A';\n\
          export const fromB = 'B';\n",
     );
     let main = write_temp(
         "dynimp_cycle/main.mjs",
+        "process.on('exit', (code) => console.log('exit', code));\n\
+         const a = await import('./a.mjs');\n\
+         console.log('settled', a.fromA);\n",
+    );
+    let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(13),
+        "a top-level await deadlock exits 13: {stdout}\n{stderr}"
+    );
+    assert!(!stdout.contains("settled"), "{stdout}");
+    assert!(stdout.contains("exit 13"), "{stdout}");
+}
+
+// A cycle with no top-level await settles, as in node: A import()s B without
+// waiting, B awaits import(A), which resolves once A has evaluated -- the
+// whole namespace, `after` included, since A's body finished before B ran.
+#[test]
+fn dynamic_import_cycle_without_top_level_await_settles() {
+    write_temp(
+        "dynimp_cycle_sync/a.mjs",
+        "export const fromA = 'A';\n\
+         export const b = import('./b.mjs');\n\
+         export const after = 'after';\n",
+    );
+    write_temp(
+        "dynimp_cycle_sync/b.mjs",
         "const a = await import('./a.mjs');\n\
-         const b = a.bResult;\n\
-         console.log('a_fromA', a.fromA === 'A');\n\
-         console.log('a_after', a.after === 'after-await');\n\
-         console.log('b_sawFromA', b && b.sawFromA === true);\n\
-         console.log('b_fromB', b && b.fromB === 'B');\n",
+         export const saw = a.fromA + ' ' + a.after;\n",
+    );
+    let main = write_temp(
+        "dynimp_cycle_sync/main.mjs",
+        "const a = await import('./a.mjs');\n\
+         console.log('b saw', (await a.b).saw);\n",
     );
     let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -5149,10 +5273,7 @@ fn dynamic_import_cycle_resolves_to_partial_namespace() {
         "exit {}: {stdout}\n{stderr}",
         out.status
     );
-    assert!(stdout.contains("a_fromA true"), "{stdout}");
-    assert!(stdout.contains("a_after true"), "{stdout}");
-    assert!(stdout.contains("b_sawFromA true"), "{stdout}");
-    assert!(stdout.contains("b_fromB true"), "{stdout}");
+    assert!(stdout.contains("b saw A after"), "{stdout}");
 }
 
 // Regression for the ActiveHost slot-clear contract: a dynamic import() from
@@ -6169,6 +6290,55 @@ cl-late-end-silent finalized=false"##;
         stdout.trim().replace("\r\n", "\n"),
         expected,
         "stderr: {stderr}"
+    );
+}
+
+/// A reader of an `fs.openAsBlob` Blob that is cancelled while its first
+/// open is still in flight closes the descriptor that open brings back. It
+/// used to keep it: cancel ran while there was no fd yet, the open then
+/// landed and stored one, and nothing closed it until the reader was
+/// collected. The check looks at file descriptors alone, not the process's
+/// whole handle count: 300 cancels can grow tokio's blocking pool by up to a
+/// thread per in-flight open, which idles out on its own and is no leak. On
+/// Windows an open file keeps its directory from being renamed, so the
+/// directory must become renamable; elsewhere the /dev/fd entries must come
+/// back to their count before the loop. Either is polled for up to 5 s, the
+/// time the in-flight opens need to land and close.
+#[test]
+fn open_as_blob_cancel_during_open_closes_the_fd() {
+    let stdout = run_ok(
+        "open_as_blob_cancel_fd.mjs",
+        "import fs from 'node:fs';\n\
+         import os from 'node:os';\n\
+         import path from 'node:path';\n\
+         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-blob-cancel-'));\n\
+         const file = path.join(dir, 'a.bin');\n\
+         fs.writeFileSync(file, Buffer.alloc(1000, 1));\n\
+         const blob = await fs.openAsBlob(file);\n\
+         const fds = () => fs.readdirSync('/dev/fd').length;\n\
+         const before = process.platform === 'win32' ? 0 : fds();\n\
+         let moved = dir;\n\
+         const closed = () => {\n\
+           if (process.platform !== 'win32') return fds() <= before;\n\
+           try { fs.renameSync(dir, dir + '-moved'); moved = dir + '-moved'; return true; }\n\
+           catch { return false; }\n\
+         };\n\
+         for (let i = 0; i < 300; i++) {\n\
+           const stream = blob.stream();\n\
+           await new Promise((r) => setImmediate(r));\n\
+           const reader = stream.getReader();\n\
+           const read = reader.read().catch(() => {});\n\
+           await reader.cancel();\n\
+           await read;\n\
+         }\n\
+         let ok = false;\n\
+         for (let t = 0; t < 100 && !(ok = closed()); t++) await new Promise((r) => setTimeout(r, 50));\n\
+         console.log('fds closed:', ok ? 'ok' : 'leaked');\n\
+         fs.rmSync(moved, { recursive: true });\n",
+    );
+    assert!(
+        stdout.contains("fds closed: ok"),
+        "a cancel during the first open must close the fd it brings back: {stdout}"
     );
 }
 
@@ -11864,7 +12034,8 @@ console.log(lines.join('\n'));
     let granted = "--allow-net=127.0.0.1,granted.invalid";
     let (stdout, stderr, inner_seen, inner6_seen, (inner, inner6)) =
         run(&["--permission", granted], "full");
-    let denied = "Error|Access to this API has been restricted|code,permission,resource";
+    let denied = "Error|Access to this API has been restricted. Use --allow-net to manage \
+                  permissions.|code,permission,resource";
     // A refusal names the hop's `host:port`, as net.connect's does.
     assert_eq!(
         stdout,
@@ -20257,10 +20428,14 @@ fn process_versions_honest_keys() {
          const versionish = /^\\d+\\.\\d+\\.\\d+/;\n\
          const real = ['node', 'oam', 'v8', 'ada', 'brotli', 'flate2', 'h2',\n\
                        'hickory', 'hyper', 'oxc', 'reqwest', 'ring', 'rustls',\n\
-                       'tokio', 'url'];\n\
+                       'tokio', 'url', 'zstd'];\n\
          for (const k of real) {\n\
            console.log('has_' + k + ':', typeof v[k] === 'string' && versionish.test(v[k]));\n\
          }\n\
+         // zstd is node's own key for libzstd, which oam links too (node:zlib's\n\
+         // zstd engine): the vendored C library's 1.x version, as node reports\n\
+         // it, not the binding crates' (zstd-safe 7.x, zstd-sys 2.x).\n\
+         console.log('zstd_is_libzstd:', /^1\\.\\d+\\.\\d+$/.test(v.zstd));\n\
          // icu/unicode are x.y shaped (77.1, 16.0), verified from the pinned\n\
          // v8 crate's own headers at build time.\n\
          for (const k of ['icu', 'unicode']) {\n\
@@ -20269,7 +20444,7 @@ fn process_versions_honest_keys() {
          // cldr/tz live in ICU DATA files the v8 crate does not vendor, so\n\
          // their versions cannot be verified -- they must stay absent.\n\
          const lying = ['uv', 'openssl', 'llhttp', 'ares', 'nghttp2', 'napi',\n\
-                        'modules', 'undici', 'zlib', 'acorn', 'zstd',\n\
+                        'modules', 'undici', 'zlib', 'acorn',\n\
                         'cldr', 'tz'];\n\
          for (const k of lying) {\n\
            console.log('absent_' + k + ':', !(k in v));\n\
@@ -20282,6 +20457,77 @@ fn process_versions_honest_keys() {
             "assertion failed: {line}\nfull output: {stdout}"
         );
     }
+}
+
+// node:zlib's zstd loop calls the handle once per output window (16 KiB by
+// default) and passes the same chunk back at a growing offset. Each call used
+// to copy the whole unconsumed rest of the chunk, so a 16 MB one-shot took
+// ~10 s against ~45 ms for the same data in one window: quadratic. Now the
+// handle copies a chunk once and reads on through it, so the default window
+// costs a small multiple of one window at most. Timed against itself in the
+// same process (not against a wall-clock budget) so a slow machine does not
+// fail it; the quadratic version was over 200x.
+#[test]
+fn zstd_large_chunk_costs_linear_time() {
+    let stdout = run_ok(
+        "zstd_linear.cjs",
+        "const zlib = require('zlib');\n\
+         const data = require('crypto').randomBytes(16 << 20);\n\
+         const time = (fn) => { const t = process.hrtime.bigint(); const r = fn();\n\
+           return [Number(process.hrtime.bigint() - t) / 1e6, r]; };\n\
+         const one = { chunkSize: 32 << 20, params: { 100: 1 } };\n\
+         const [cOne, packed] = time(() => zlib.zstdCompressSync(data, one));\n\
+         const [cWin, packedWin] = time(() => zlib.zstdCompressSync(data, { params: { 100: 1 } }));\n\
+         const [dOne] = time(() => zlib.zstdDecompressSync(packed, { chunkSize: 32 << 20 }));\n\
+         const [dWin, back] = time(() => zlib.zstdDecompressSync(packed));\n\
+         console.log('same_bytes:', packed.equals(packedWin));\n\
+         console.log('round_trip:', back.equals(data));\n\
+         const ok = (win, single) => win < single * 8 + 250;\n\
+         console.log('compress_linear:', ok(cWin, cOne), cWin, cOne);\n\
+         console.log('decompress_linear:', ok(dWin, dOne), dWin, dOne);",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.split_whitespace().nth(1) == Some("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+    assert_eq!(stdout.lines().count(), 4, "{stdout}");
+}
+
+// A zstd context is native memory V8 does not see. A stream dropped without
+// close() kept its libzstd context in the registry for the life of the
+// process (~0.8 MB each, never reclaimed); node's GC frees its handle. A
+// FinalizationRegistry on the handle now frees it. 600 abandoned streams
+// after the first 200: ~480 MB of growth when they leak, a few MB when not.
+#[test]
+fn zstd_dropped_stream_frees_its_context() {
+    let main = write_temp(
+        "zstd_dropped.mjs",
+        "import zlib from 'node:zlib';\n\
+         const tick = () => new Promise((r) => setImmediate(r));\n\
+         const rss = () => process.memoryUsage().rss / 1048576;\n\
+         let base;\n\
+         for (let round = 0; round < 4; round++) {\n\
+           for (let i = 0; i < 200; i++) {\n\
+             const s = zlib.createZstdCompress();\n\
+             await new Promise((r) => s.write('x', r));\n\
+           }\n\
+           for (let i = 0; i < 3; i++) { globalThis.gc(); await tick(); }\n\
+           if (round === 0) base = rss();\n\
+         }\n\
+         const growth = Math.round(rss() - base);\n\
+         console.log('reclaimed:', growth < 150, growth);",
+    );
+    let out = oam(&["--expose-gc", "run", main.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "exit {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.starts_with("reclaimed: true"), "{stdout}");
 }
 
 #[test]
@@ -22202,19 +22448,22 @@ events.addAbortListener(ac2.signal, () => { fired2 = true; });
 await new Promise(r => setTimeout(r, 10));
 console.log('pre_aborted_fired=' + fired2);
 
-// -- util.aborted --
+// -- util.aborted -- node's (#401): resolves with the abort Event,
+// undefined when already aborted, and a resource is required.
 const ac3 = new AbortController();
-let abortedReason = null;
-const p = util.aborted(ac3.signal).then(r => { abortedReason = r; });
+let abortedEvent = null;
+const p = util.aborted(ac3.signal, {}).then(r => { abortedEvent = r; });
 ac3.abort('test reason');
 await p;
-console.log('aborted_reason=' + abortedReason);
+console.log('aborted_event=' + abortedEvent.type + ':' + (abortedEvent.target === ac3.signal));
 
 // util.aborted on already-aborted
 const ac4 = new AbortController();
 ac4.abort('already');
-const r4 = await util.aborted(ac4.signal);
+const r4 = await util.aborted(ac4.signal, {});
 console.log('aborted_already=' + r4);
+const noResource = await util.aborted(ac4.signal).catch((err) => err.code);
+console.log('aborted_no_resource=' + noResource);
 
 // -- util.parseEnv --
 const env = util.parseEnv('FOO=bar\nBAZ="hello world"\n# comment\nEMPTY=\nQUOTED=\'single\'');
@@ -22246,8 +22495,9 @@ console.log('captureRejection=' + typeof events.captureRejectionSymbol);
         "disposable_has_dispose=true",
         "abort_fired=true",
         "pre_aborted_fired=true",
-        "aborted_reason=test reason",
-        "aborted_already=already",
+        "aborted_event=abort:true",
+        "aborted_already=undefined",
+        "aborted_no_resource=ERR_INVALID_ARG_TYPE",
         "parseEnv_FOO=bar",
         "parseEnv_BAZ=hello world",
         "parseEnv_EMPTY=\"\"",
@@ -23030,7 +23280,7 @@ console.log('e5_msg=' + e5.message);
 // ERR_MODULE_NOT_FOUND
 const e6 = codes.ERR_MODULE_NOT_FOUND('foo', '/bar');
 console.log('e6_code=' + e6.code);
-console.log('e6_msg_has_foo=' + e6.message.includes('"foo"'));
+console.log('e6_msg_has_foo=' + e6.message.includes("'foo'"));
 
 // -- util.types expansions --
 console.log('isArrayBufferView=' + util.types.isArrayBufferView(new Uint8Array(1)));
@@ -27890,6 +28140,61 @@ fn vm_run_in_new_context_sandbox() {
     assert!(stdout.contains("product=200"), "{stdout}");
 }
 
+/// V8 runs a vm global's interceptors while `Context::new` is still building
+/// the context (Genesis reads `Atomics` off the new global), and the
+/// interceptors used to find their sandbox through the context's embedder
+/// data -- an unchecked read that, before the data was set, came from past the
+/// end of the array. Whether it faulted depended on the heap layout, so an
+/// unrelated snapshot change turned `vm_run_in_new_context_sandbox` into a
+/// segfault (#401). Many contexts, sandboxes that shadow the names Genesis
+/// reads, and every cross-context shape the sandbox link serves, against
+/// node 22.22.2's output.
+#[test]
+fn vm_contexts_cross_context_shapes() {
+    let stdout = run_ok(
+        "vm_cross_context.cjs",
+        r#"
+        const vm = require('vm');
+        const util = require('util');
+        const t = util.types;
+        const s = { x: 10, y: 20, Atomics: 'mine' };
+        console.log('A', vm.runInNewContext('x + y', s), vm.runInNewContext('x * y', s));
+        console.log('B', vm.runInNewContext('typeof Atomics', s), vm.runInNewContext('Atomics', s), typeof Atomics.wait);
+        const c = vm.createContext({ a: 1 });
+        vm.runInContext('var b = 2; globalThis.c = 3', c);
+        console.log('C', vm.runInContext('a + b + c', c), vm.createContext(c) === c, vm.isContext(c));
+        const sc = new vm.Script('a * 10');
+        console.log('D', sc.runInNewContext({ a: 4 }), sc.runInNewContext({ a: 5 }), sc.runInContext(c));
+        console.log('E', util.inspect(c), util.inspect(s));
+        const vals = vm.runInNewContext('({ n: Object(1), b: Object(2n), sy: Object(Symbol("q")), st: Object("s"), bo: Object(false), m: new Map([[1, 2]]), arr: [1, 2], err: new TypeError("t"), d: new Date(0), re: /x/g })');
+        console.log('F', [t.isNumberObject(vals.n), t.isBigIntObject(vals.b), t.isSymbolObject(vals.sy), t.isStringObject(vals.st), t.isBooleanObject(vals.bo), t.isBoxedPrimitive(vals.b), t.isMap(vals.m), t.isDate(vals.d), t.isRegExp(vals.re), t.isNativeError(vals.err)].join());
+        console.log('G', util.inspect(vals.n), util.inspect(vals.b), util.inspect(vals.sy), util.inspect(vals.st), util.inspect(vals.bo), util.inspect(vals.m), util.inspect(vals.arr));
+        console.log('H', util.format('%s %s %s', vals.n, vals.b, vals.arr), vals.arr instanceof Array, Array.isArray(vals.arr));
+        console.log('I', t.isNumberObject(c), t.isBoxedPrimitive(s), t.isProxy(vm.runInContext('this', c)));
+        let sum = 0;
+        for (let i = 0; i < 200; i++) {
+          const box = { i, Atomics: i, SharedArrayBuffer: i, Object: i % 2 ? undefined : i };
+          sum += vm.runInNewContext('i', box) + vm.runInNewContext('i + 1', box);
+        }
+        console.log('J', sum);
+    "#,
+    );
+    let expected = [
+        "A 30 200",
+        "B string mine function",
+        "C 6 true true",
+        "D 40 50 10",
+        "E { a: 1, b: 2, c: 3 } { x: 10, y: 20, Atomics: 'mine' }",
+        "F true,true,true,true,true,true,true,true,true,true",
+        "G [Number: 1] [BigInt: 2n] [Symbol: Symbol(q)] [String: 's'] [Boolean: false] Map(1) { 1 => 2 } [ 1, 2 ]",
+        "H [Number: 1] [BigInt: 2n] [ 1, 2 ] false true",
+        "I false false false",
+        "J 40000",
+    ];
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines, expected, "{stdout}");
+}
+
 #[test]
 fn vm_create_context_is_context() {
     let stdout = run_ok(
@@ -28514,8 +28819,13 @@ fn worker_threads_message_channel() {
         });
         ch.port1.postMessage({ hello: 'world' });
 
-        // Message is delivered via queueMicrotask, so wait a tick
+        // As in node (#401), a port message is a task of its own: it is not
+        // there yet when the microtasks of this turn run, and it is there by
+        // the time a setImmediate callback runs.
         queueMicrotask(() => {
+            console.log('micro_got=' + (received !== null));
+        });
+        setImmediate(() => {
             console.log('got_msg=' + (received !== null));
             ch.port1.close();
             ch.port2.close();
@@ -28523,6 +28833,7 @@ fn worker_threads_message_channel() {
     "#,
     );
     assert!(stdout.contains(r#"received={"hello":"world"}"#), "{stdout}");
+    assert!(stdout.contains("micro_got=false"), "{stdout}");
     assert!(stdout.contains("got_msg=true"), "{stdout}");
 }
 #[test]
@@ -28738,7 +29049,8 @@ fn worker_threads_message_channel_clone() {
         ch.port1.postMessage(obj);
         // Mutate after sending
         obj.val = 'mutated';
-        queueMicrotask(() => {
+        // Delivery is a task, as in node (#401), so wait for a setImmediate.
+        setImmediate(() => {
             // Receiver should see original, not mutated
             console.log('received_val=' + received.val);
             console.log('sender_val=' + obj.val);
@@ -28795,17 +29107,26 @@ fn worker_threads_message_port_close_event() {
         const { MessageChannel } = require('worker_threads');
         const ch = new MessageChannel();
         let closed = false;
-        ch.port2.on('close', () => { closed = true; });
+        ch.port2.on('close', () => {
+            closed = true;
+            console.log('close_fired=true');
+        });
+        // node's start() returns undefined, and 'close' is emitted later,
+        // not inside close() (#401).
+        console.log('start_returns=' + ch.port1.start());
         ch.port1.close();
         ch.port2.close();
-        console.log('close_fired=' + closed);
-        console.log('start_returns_this=' + (ch.port1.start() === ch.port1));
+        console.log('close_sync=' + closed);
     "#,
     );
     assert!(stdout.contains("close_fired=true"), "close event: {stdout}");
     assert!(
-        stdout.contains("start_returns_this=true"),
-        "start returns this: {stdout}"
+        stdout.contains("close_sync=false"),
+        "close is async: {stdout}"
+    );
+    assert!(
+        stdout.contains("start_returns=undefined"),
+        "start returns undefined: {stdout}"
     );
 }
 // ── oam install ─────────────────────────────────────────────────────────
@@ -28980,6 +29301,56 @@ fn compiled_binary_runs_its_embedded_script_as_the_main_module() {
     assert!(
         stdout.contains("ran as the main module"),
         "the embedded script's main guard did not run: stdout=<<{stdout}>>"
+    );
+}
+
+// #399 item 10: node runs the 'exit' listeners and then prints the fatal
+// report (_fatalException, then ReportFatalException). A compiled binary
+// printed the report first. Conformance case 473 holds `-e` and `oam run`
+// to node; a compiled binary has no node counterpart, so it is held here.
+#[test]
+fn compiled_binary_runs_exit_listeners_before_the_fatal_report() {
+    let entry = write_temp(
+        "compile_exit_order/app.cjs",
+        "process.on('exit', (c) => console.error('exit listener', c));\n\
+         throw new Error('embedded fatal');\n",
+    );
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let output = std::env::temp_dir().join(format!(
+        "oam-compile-exit-order-{}-{nanos}{ext}",
+        std::process::id()
+    ));
+    let compile_out = oam(&[
+        "compile",
+        entry.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert!(
+        compile_out.status.success(),
+        "oam compile failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&compile_out.stdout),
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+    let run_out = std::process::Command::new(&output)
+        .output()
+        .expect("compiled binary runs");
+    let _ = std::fs::remove_file(&output);
+    let stderr = String::from_utf8_lossy(&run_out.stderr);
+    assert_eq!(run_out.status.code(), Some(1), "stderr={stderr}");
+    let listener = stderr
+        .find("exit listener 1")
+        .unwrap_or_else(|| panic!("the 'exit' listener did not run: stderr=<<{stderr}>>"));
+    let report = stderr
+        .find("Error: embedded fatal")
+        .unwrap_or_else(|| panic!("no fatal report: stderr=<<{stderr}>>"));
+    assert!(
+        listener < report,
+        "the report was printed before the 'exit' listener ran: stderr=<<{stderr}>>"
     );
 }
 
@@ -38008,6 +38379,51 @@ fn chdir_moves_the_drive_cwd_that_drive_relative_paths_use() {
     );
 }
 
+// realpathSync and callback realpath of a file the system holds open with no
+// sharing (the paging file): node's fail, `EPERM, lstat` on v22.22.2. oam's
+// realpath asks the OS first (EBUSY) and on a failure runs node's component
+// walk for node's error; the walk's lstat succeeds there where node's does
+// not (docs/node-divergences.md), so a walk that completes must leave the
+// OS's error standing, not turn it into the walked path. Skips where no
+// paging file lies at the system drive's root.
+#[cfg(windows)]
+#[test]
+fn realpath_of_the_paging_file_fails_as_the_os_does() {
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    let root = format!("{drive}\\");
+    let Some(locked) = std::fs::read_dir(&root).ok().and_then(|entries| {
+        entries.flatten().map(|entry| entry.path()).find(|path| {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            ["pagefile.sys", "swapfile.sys"]
+                .iter()
+                .any(|known| name.eq_ignore_ascii_case(known))
+                && std::fs::File::open(path).is_err()
+        })
+    }) else {
+        eprintln!("no locked paging file at {root}; skipping");
+        return;
+    };
+    let script = write_temp(
+        "realpath_paging_file/main.cjs",
+        "const fs = require('fs');\n\
+         const p = process.argv[2];\n\
+         try { fs.realpathSync(p); console.log('sync resolved'); }\n\
+         catch (e) { console.log('sync threw'); }\n\
+         fs.realpath(p, (e) => console.log(e ? 'callback threw' : 'callback resolved'));\n",
+    );
+    let out = bounded_output(&mut oam_command(&[
+        script.to_str().unwrap(),
+        locked.to_str().unwrap(),
+    ]));
+    let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(
+        stdout,
+        "sync threw\ncallback threw\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // process.env and the hidden `=X:` drive-cwd variables, as node has them
 // (node_env_var.cc; measured on v22.22.2): the names are not enumerated, a
 // read goes to the live environment -- so it follows a chdir -- an assignment
@@ -38463,4 +38879,125 @@ fn write_heap_snapshot_needs_the_write_grant() {
         written.is_empty(),
         "a snapshot was written despite the denial"
     );
+}
+
+// #395: recursion that calls a sync native op near the bottom of V8's JS
+// stack used to overflow the NATIVE stack on Windows and kill the process
+// ("thread 'main' has overflowed its stack", 0xC00000FD) instead of throwing
+// V8's catchable RangeError. oam.exe's main thread had the linker's 1 MiB
+// default reserve under V8's ~984 KiB JS limit, so the native frames of an op
+// called at the limit had a few tens of KiB to live in; node.exe reserves
+// 8 MiB. Measured on Windows 11 arm64 before the fix: copyFileSync, cpSync and
+// zlib.deflateSync aborted a release build, readdirSync and opendirSync a
+// debug one too. The probe recurses with no op until V8 throws, then calls
+// the op once at the deepest level whose JS frames still fit (the same worst
+// case as an op at every level, for a handful of calls). The worker half runs
+// the same probe on a worker thread.
+const DEEP_NATIVE_PROBE: &str = "const fs = require('node:fs');\n\
+     const path = require('node:path');\n\
+     const zlib = require('node:zlib');\n\
+     const wt = require('node:worker_threads');\n\
+     const file = path.join(__dirname, 'f.txt');\n\
+     if (wt.isMainThread) fs.writeFileSync(file, 'x');\n\
+     function probe(op) {\n\
+       let called = false;\n\
+       function recurse() {\n\
+         try { recurse(); } catch (err) {\n\
+           if (!called) { try { op(); called = true; } catch (inner) { if (!(inner instanceof RangeError)) throw inner; } }\n\
+           throw err;\n\
+         }\n\
+       }\n\
+       try { recurse(); return 'returned'; } catch (err) { return err.constructor.name + ' ' + called; }\n\
+     }\n\
+     const ops = {\n\
+       readdirSync: () => fs.readdirSync(__dirname),\n\
+       copyFileSync: () => fs.copyFileSync(file, path.join(__dirname, 'copy.txt')),\n\
+       deflateSync: () => zlib.deflateSync('abc'),\n\
+     };\n\
+     const out = Object.entries(ops).map(([name, op]) => name + ' ' + probe(op)).join('\\n');\n\
+     if (wt.isMainThread) {\n\
+       console.log(out);\n\
+       const w = new wt.Worker(__filename);\n\
+       w.on('message', (m) => console.log('worker\\n' + m));\n\
+     } else {\n\
+       wt.parentPort.postMessage(out);\n\
+     }\n";
+
+#[test]
+fn deep_recursion_through_native_ops_throws_range_error_not_a_native_overflow() {
+    let script = write_temp("deep_native_395/probe.cjs", DEEP_NATIVE_PROBE);
+    let out = oam(&[script.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let expected = "readdirSync RangeError true\n\
+                    copyFileSync RangeError true\n\
+                    deflateSync RangeError true";
+    assert_eq!(
+        stdout.trim(),
+        format!("{expected}\nworker\n{expected}"),
+        "status {:?}, stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "status {:?}", out.status);
+}
+
+/// The fix itself, read off the binary: oam.exe's PE header reserves the same
+/// 8 MiB main-thread stack node.exe's does (node v22.22.2's header, measured:
+/// SizeOfStackReserve 8388608). Without it the linker's 1 MiB default applies.
+#[cfg(windows)]
+#[test]
+fn windows_exe_reserves_node_sized_main_thread_stack() {
+    let bytes = std::fs::read(env!("CARGO_BIN_EXE_oam")).expect("read oam.exe");
+    let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    assert_eq!(&bytes[pe..pe + 4], b"PE\0\0", "PE signature");
+    let optional = pe + 24;
+    let magic = u16::from_le_bytes(bytes[optional..optional + 2].try_into().unwrap());
+    assert_eq!(magic, 0x20b, "PE32+ optional header");
+    // PE32+: SizeOfStackReserve is the u64 at offset 72 of the optional header.
+    let reserve = u64::from_le_bytes(bytes[optional + 72..optional + 80].try_into().unwrap());
+    assert_eq!(reserve, 8 * 1024 * 1024, "SizeOfStackReserve");
+}
+
+/// #395's own reproducer: `fs.cpSync` of a directory chain 2500 deep with a
+/// `filter`, whose walk is node's JS and recurses once per level. It runs
+/// out of JS stack partway down, and the ops it calls there (opendirSync,
+/// lstatSync, mkdirSync, copyFileSync) run their native frames under V8's
+/// limit -- with oam.exe's old 1 MiB main-thread reserve that overflowed the
+/// native stack and killed the process. node v22.22.2 throws RangeError here
+/// (measured, Windows 11 arm64; it does at 1500 deep too, where oam's walk
+/// still fits -- see docs/node-divergences.md). The chain is made natively so
+/// the test spends its time in the copy.
+///
+/// Windows only, like the PE-reserve test above it: the chain's path is ~5000
+/// characters, past PATH_MAX on macOS (1024) and Linux (4096), so neither node
+/// nor oam can walk it there -- every syscall on it fails ENAMETOOLONG, and the
+/// mkdir that builds it fails first. The cross-platform half of #395 (running
+/// out ends in a catchable RangeError) is conformance cases 570 and 571.
+#[cfg(windows)]
+#[test]
+fn deep_cp_sync_with_filter_throws_range_error_not_a_native_overflow() {
+    let script = write_temp(
+        "deep_cp_395/cp.cjs",
+        "const fs = require('node:fs');\n\
+         const path = require('node:path');\n\
+         try {\n\
+           fs.cpSync(path.join(__dirname, 'src'), path.join(__dirname, 'dst'),\n\
+             { recursive: true, filter: () => true });\n\
+           console.log('ok');\n\
+         } catch (err) { console.log(err.constructor.name + ': ' + err.message); }\n",
+    );
+    let mut chain = script.parent().unwrap().join("src");
+    for _ in 0..2500 {
+        chain.push("d");
+    }
+    std::fs::create_dir_all(&chain).expect("create the 2500-deep chain");
+    let out = oam(&[script.to_str().unwrap()]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "RangeError: Maximum call stack size exceeded",
+        "status {:?}, stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "status {:?}", out.status);
 }

@@ -43,6 +43,9 @@ futures-util = { workspace = true }
 sha1 = { workspace = true }
 # node:zlib brotli backend (pure-Rust; default features only).
 brotli = { workspace = true }
+# node:zlib zstd backend (src/zstd.rs): libzstd 1.5.7 through its safe
+# binding; the workspace manifest has why it is not a pure-Rust crate.
+zstd-safe = { workspace = true }
 # DNS record-type resolution.
 hickory-resolver = { workspace = true }
 # Base64 decoding for binary fetch request bodies.
@@ -132,6 +135,13 @@ windows-sys = { version = "0.61", features = [
     # Declarations only: the WSA* error constants node_error_code's libuv
     # table matches on.
     "Win32_Networking_WinSock",
+    # GetModuleHandleW / GetProcAddress, to find GetFileInformationByName
+    # where Windows has it, as libuv does (win_fs.rs).
+    "Win32_System_LibraryLoader",
+    # NtQueryInformationFile, NtQueryVolumeInformationFile and
+    # NtQueryDirectoryFile: the questions libuv's stat and scandir ask
+    # (win_fs.rs). Declarations only; ntdll is linked already.
+    "Wdk_Storage_FileSystem",
 ] }
 
 # Unix extra-fd stdio (child_unix.rs): the signal-number table, the pollfd for

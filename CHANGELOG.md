@@ -61,6 +61,21 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   own API state, as in node. The cache stays on by default, unlike node's; see
   `docs/node-divergences.md`. Conformance cases 438-439.
 
+### Added
+
+- **`require()` of an ES module, with node 22's semantics.** Every such `require()` threw
+  `ERR_REQUIRE_ESM` while `process.features.require_module` said `true`. The graph now loads and
+  evaluates synchronously inside the `require()`, sharing one module map with `import()` and
+  running no ticks or promise jobs, for a `.mjs`, a `.js` under `"type": "module"` and a typeless
+  `.js` with module syntax (in node_modules too). It returns the namespace, the facade that adds
+  `__esModule: true` when there is a default export, or an export named `'module.exports'`. A
+  graph with top-level await is `ERR_REQUIRE_ASYNC_MODULE` even once an `import()` has run it, a
+  cycle is `ERR_REQUIRE_CYCLE_MODULE` in node's wordings, an unresolved import is
+  `ERR_MODULE_NOT_FOUND`, and an evaluation error is rethrown as the same object on every
+  `require()`. `--trace-require-module` gives node's once-per-process warning, silent by default.
+  `require.cache` is now node's `Module._cache`, shared and live, ES modules included. A CommonJS
+  dependency still runs before the ES modules ahead of it; see docs/node-divergences.md.
+
 ### Fixed
 
 - **`fs.readdir` honours `encoding: "buffer"`, as node's does.** Each entry was returned as a
@@ -201,6 +216,24 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   junction, as libuv does, where it failed `EPERM`. Where node's cpSync fails by its
   platform's std::filesystem, or aborts, oam fails as node does on Linux; see
   docs/node-divergences.md.
+- **Abort reasons, error headers, `AbortError` and `MessageChannel` are node's (#401).**
+  `ac.abort(null)` keeps null as the reason everywhere node does (`signal.reason`,
+  `throwIfAborted`, `AbortSignal.any`, an `AbortError`'s `cause`, fetch's rejection); a fetch body
+  being read still fails with undici's `DOMException`, "The operation was aborted.".
+  `util.inspect` heads an error with its constructor as node does (`DOMException [AbortError]: x`,
+  `Foo [Error]: x`), an error whose stack cannot be built prints `[object Error]` instead of
+  throwing, and `%s` in `util.format` and `console.log` inspects errors. events, timers/promises,
+  the streams, fs and readline reject with one `AbortError` class, and the `fs.writeFile` family
+  honours an aborted signal before it opens anything. `util.aborted` resolves with the abort
+  `Event`. `MessageChannel` and `MessagePort` are globals, and a port is node's
+  `NodeEventTarget`, delivering messages as node's does. `worker_threads.receiveMessageOnPort`
+  works. A worker exits once its `parentPort` has no `'message'` listener left. `structuredClone`
+  of a function or a symbol throws `DataCloneError`. `util.inspect` (and so `%s`) prints a boxed
+  BigInt or Symbol as node does (`[BigInt: 1n]`, `[Symbol: Symbol(q)]`, recognised by internal
+  slot like the other boxes, so `[Number (null prototype): 5]`), a `Blob` or `File` as
+  `Blob { size: 1, type: '' }`, and an error whose `stack` is not a string with node's
+  one-entry-per-line layout. `util.types.isBigIntObject` exists, and `isBoxedPrimitive` counts
+  BigInt and Symbol boxes.
 - **A `SystemError` code is an instance of its own `NodeError` class, as node's is (#288).**
   node raises `fs.cp`'s `ERR_FS_CP_*` and `ERR_FS_EISDIR`, and `os.getPriority`'s
   `ERR_SYSTEM_ERROR`, as a per-code `class NodeError extends SystemError`. oam built every one
@@ -256,7 +289,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   any `Error` the event carries, one emitted with `process.emit("warning", err)` included
   (those were not printed). Under `--no-warnings` it is not installed, and
   `NODE_NO_WARNINGS=1` now means the same, as it does to node. Node's one-time hint naming
-  `--trace-warnings` is not printed: oam has no such flag yet (#364).
+  `--trace-warnings` is printed too, now that oam has the flag (see Added, #364).
 
 - **`fs.mkdir` applies its mode, checks its options, and says what it made.** In all three
   forms (`mkdirSync`, `fs.mkdir`, `fs.promises.mkdir`):
@@ -506,6 +539,207 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   four slots 979 -> 8 (node 13); 20 `spawnSync` of `cmd /c exit` 3252 -> 1745 (node 1975), 20
   `spawn` 3087 -> 1937; conformance case 394 102751 -> 44660 (node 33971), case 395 57015 ->
   41855 (node 36880). Cases 450-452.
+- **A worker_threads Worker's own `execArgv` and `env` decide its process flags, as node's do
+  (#370).** Every worker ran with the flags of its parent's command line, whatever it was given:
+  `execArgv: []` under a parent run with `--no-warnings` had no default `'warning'` listener, and
+  `env: { NODE_NO_WARNINGS: "1" }` did not remove it. Now a Worker given neither option shares its
+  creator's options (a worker's own, when a worker creates it); given either, it starts from the
+  defaults, takes `NODE_OPTIONS` from the environment it is given, then its `execArgv`, and reads
+  `NODE_NO_WARNINGS` from its own `process.env` -- for `--no-warnings`, `--no-deprecation`,
+  `--pending-deprecation`, `--disable-warning`, `--redirect-warnings`, `--trace-require-module`
+  and the `--tls-min/max-v1.x` defaults. `--title` and `--zero-fill-buffers` stay the whole
+  process's, as in node. `stderr: true` now sends the worker's `process.stderr` output, its
+  warnings included, to `worker.stderr`; it went to the process's stderr.
+- **A worker whose run fails fatally ends as node's does (#399).** It now emits `'exit'` with code 1
+  on its own `process` before the parent hears of the error (nothing an `'exit'` listener queues
+  runs, the thread exits with the `exitCode` the listeners leave, and no `'exit'` is emitted when an
+  `'uncaughtException'` listener threw), and the parent's `'error'` event gets the error itself: an
+  `Error` of the nearest built-in class with its own `message`, `name`, `stack`, `code` and other
+  properties, a `cause` rebuilt the same way, any other thrown value as itself, and an unhandled
+  rejection of a non-`Error` as node's `ERR_UNHANDLED_REJECTION` error. It was a plain `Error` whose
+  `message` was the whole rendered report, which oam also printed to stderr under `worker N:`;
+  nothing is printed now unless the parent leaves `'error'` unhandled. A synchronous throw from a
+  CommonJS worker entry now reaches the worker's own `'uncaughtException'` listeners too.
+- **A fatal microtask throw ends the run at the throw, as in node.** `queueMicrotask(() => { throw
+  e })` with no `uncaughtException` listener let the rest of the drain run first -- a sibling
+  `.then`, a later `queueMicrotask` callback, an async function's continuation -- so their output
+  came before the report. Nothing queued after the throw runs now, from an ES module or CommonJS
+  entry and the modules it imports statically, and `uncaughtExceptionMonitor` hears the throw
+  once, not twice (#398). A module loaded by `import()` still lets its checkpoint and the
+  importer's continuation run before the report (docs/node-divergences.md, the `import()`
+  evaluation entry), and a worker keeps running the rest of the drain, as node's does.
+- **Throws on the way out behave as node's.** A promise job an `'exit'` listener queues that throws
+  is reported and exits 1 (it was lost, exit 0), and an `uncaughtException` listener sees it. A
+  promise such a listener rejects and leaves unhandled now exits 1, as in node, though it is
+  reported as oam's `OAM-RT0004` line and not offered to an `uncaughtException` listener
+  (divergence #55). A throw from an `'exit'` listener goes to the `uncaughtException` listeners,
+  is reported with its source frame and node's report, keeps a `process.exitCode` already set
+  (`process.exit(3)` exits 3; it was always 1), and stops the emit: later listeners and the
+  promise jobs the listeners queued no longer run. Past a fatal throw, a throwing `'exit'`
+  listener is no longer reported after the original error. `oam -e` and compiled binaries run the
+  `'exit'` listeners before printing the report, as `oam run` does. A worker's own `'exit'`
+  listeners keep their earlier handling; a worker whose run fails fatally is the worker entry
+  above (#399).
+- **A throwing `uncaughtException` listener's report names the listener's line**, not a line of
+  oam's internal dispatcher (#399).
+- **The report of a thrown value that is not an Error is node's.** `throw 42`, `throw "text"`, `throw
+  { a: 1 }` and the like open with an empty line and put the value right under the caret, and a
+  primitive prints as `String()` gives it (`text`, not `'text'`; `5`, not `5n`), wherever oam has
+  the throw's source frame. Node's `--trace-uncaught` hint is still not printed (#399).
+- **The nextTick queue around exits and handled throws matches node.** `process.nextTick` queues
+  nothing once the process is exiting, so a warning emitted from an `'exit'` listener is not
+  printed. After an `uncaughtException` listener handles a tick's throw, the rest of the batch
+  runs at node's next tick point -- before the next immediate, at the end of the timers phase,
+  and before the loop waits for a timer that is not due yet -- where it ran after them; a timer
+  due in the same timers phase runs before it, and V8's tasks and I/O callbacks no longer run in
+  the middle of a timers phase (#366, #399).
+- **Windows: `fs.stat` of NUL gives its character-device stat, and other device paths fail as
+  in node.** `statSync`, `lstatSync`, `fs.stat` and `fs.promises.stat` of `\\.\NUL` (and
+  `\\?\NUL`, `\\.\Global\NUL`, `\\.\GLOBALROOT\Device\Null`) failed `EISDIR`; they now give
+  the shape `fstat` of an open NUL gives (`mode` 0o20666, `rdev` 1376256, `blksize` 4096). The
+  pipe and mailslot namespaces and `KsecDD` fail `EINVAL` where oam said `EISDIR` (a volume,
+  `\\.\C:`, stays `EISDIR`, as in node), and `readdirSync` of `KsecDD` is `EISDIR` (was
+  `ENOTDIR`). oam asks what libuv asks:
+  the path by name (GetFileInformationByName, Windows 11 24H2 and later), then the handle's device
+  type and its file information (#380, #383).
+- **Windows: a stat of a path that goes on past a looping symlink is `ENOENT`, as in node.**
+  With `l` a link to itself, `statSync("l/a")` and `mkdirSync("l/a", { recursive: true })` (all
+  three forms) failed `ELOOP`; they are `ENOENT`, and `statSync("l")` stays `ELOOP` (#362).
+- **Windows: `fs.access` and `fs.chmod` read and set a path's own attributes, as libuv does.**
+  A dangling or looping symlink is accessible (`existsSync` still says `false`) and `chmod`
+  changes the link rather than failing `ENOENT`; a read-only directory passes `W_OK`; a device or
+  a volume (`\\.\C:`) is `EINVAL` (was `EISDIR`) and a share root that is no disk (`\\localhost\IPC$`) `ENOTSUP` (was
+  `EINVAL`). `cpSync` from any of these reports the same code, under `lstat`, and names the path
+  without its `\\?\` prefix, as node's does (#383).
+- **Windows: `fs.realpathSync` and `fs.realpath` of a `\\?\` or `\\.\` path follow node's walk.**
+  The path a recursive `mkdirSync` returns (`\\?\C:\...`) resolved in oam; node v22.22.2's
+  component walk fails it `EISDIR: ..., lstat 'C:'`, and oam now does too. NUL resolves to itself
+  (oam failed `EISDIR`). The `.native` forms and `fs.promises.realpath` still resolve such a path
+  (#361, #383).
+- **Windows: an open with `UV_FS_O_FILEMAP` of a console or the pipe namespace fails, as in
+  node.** libuv asks such a handle for its standard information and fails the open when it has
+  none: a console is `EISDIR`, `\\.\pipe\` `EINVAL`; oam handed out a descriptor. A write-only
+  `UV_FS_O_FILEMAP` open also asks read access, as libuv's does (#384).
+- **A repeated permission flag adds its grant, as node's does.** Under `--permission`,
+  `--allow-fs-write=A --allow-fs-write=B` kept only the last occurrence, so writes under `A` were
+  refused; every occurrence of `--allow-fs-read`, `--allow-fs-write`, `--allow-net` and
+  `--allow-env` now grants its entries, from the command line and `NODE_OPTIONS` together.
+  `process.execArgv` lists each occurrence, so a child started under `--permission` inherits all
+  of them (#363).
+- **A `*` in an fs grant entry is a wildcard, as in node.** `--allow-fs-read=C:\T\*` (or `dir/*`)
+  granted only a file named `*`, so every read under the directory was refused. The text before
+  the first `*` is now a prefix: `dir/*` and `dir\*` grant `dir` and everything under it, `dir*`
+  every path starting with `dir`, and `/*` or `C:\*` the whole root, for `--allow-fs-read` and
+  `--allow-fs-write` alike (#376). On POSIX a `\` in a grant entry or a path is now part of the
+  name, as node and the OS read it, rather than a separator.
+- **A Windows named-pipe server's `close()` closes the pipe before it returns, as node's does.**
+  The pipe instances still waiting for a client stayed open until the server's pending accept woke
+  and dropped them, so a client that dialled the name right after `close()` could connect to one
+  and then see the pipe dropped (or, from `fs.openSync`, get an fd) where node gives `ENOENT`. The
+  close now disconnects every waiting instance, so none takes a client, and returns once they are
+  closed (#388). A client that had connected but not yet been handed to the server (no
+  `'connection'` yet) is closed with it too and reads `'end'`; its pipe instance used to stay open
+  until the next tick, so a dial right after `close()` waited 30 s for `ETIMEDOUT`, and a `listen`
+  on the name in the same tick was `EADDRINUSE`. Unchanged, by decision: an oam pipe server still
+  refuses clients that reach it through a UNC server name, `\\localhost\pipe\x` included, with
+  `EPERM`, where node's accepts them (#385; see `docs/node-divergences.md`, entry 50).
+
+- **`tty.WriteStream` and `tty.ReadStream` over a console opened by name refuse what node's refuse,
+  with node's errno (#381).** On Windows they took any descriptor `tty.isatty` called a terminal and
+  refused the rest with `EBADF`. They now ask the console what libuv's `uv_tty_init` asks: a console
+  opened write-only (`\\.\CON` with `w`, `\\.\CONOUT$` and `\\.\CONIN$` with `w` or `a`), and a
+  screen buffer opened without write access (`\\.\CONOUT$` with `r`, `a+` or `as+`, which is still
+  a terminal to `isatty`), are `ERR_TTY_INIT_FAILED` with `EPERM`, and `EBADF` is left to a
+  descriptor with no console behind it. `tty.isatty` of a console opened by name, and of a
+  descriptor once it is closed, already answered as node's does (#379); both are now pinned in a
+  console test.
+- **`MaxListenersExceededWarning` is a process warning, as in node.** Past an `EventEmitter`'s
+  listener limit oam printed its own line with `console.warn`, which `--no-warnings` and a program
+  handling warnings itself could not stop. It now goes through `process.emitWarning` with node's
+  text and the `emitter`, `type` and `count` fields, and an `EventTarget` (including an
+  `AbortSignal` given a limit) warns too, once per target, with `target` in place of `emitter`. A
+  target takes `events.defaultMaxListeners` when it is made; `events.setMaxListeners(n)` with no
+  target sets that default, and it checks `n` as node's does (`ERR_INVALID_ARG_TYPE` /
+  `ERR_OUT_OF_RANGE` naming `"setMaxListeners"`). An `EventTarget`
+  and an `AbortSignal` now inspect as node's (`EventTarget {}`, `AbortSignal { aborted: false }`)
+  (#365).
+- **`process.emitWarning` reads its type and code as node's does.** An empty or falsy `type`
+  (positional, or in the options form) gives the name `Warning` instead of an empty name, and a
+  bad `type` or `code` is reported as the `"type"` / `"code"` argument, never as an `options.`
+  property; a `DeprecationWarning` under `process.noDeprecation` is dropped even when
+  `process.throwDeprecation` is set (#367).
+- **The deprecations node v22.22.2 emits at runtime, and the legacy names they guard.** `punycode`
+  warns DEP0040 when first loaded (not when a package loads it -- node's own check, which looks
+  for `/node_modules/` in each frame's script name, so on Windows only a package's ES modules,
+  named by their `file://` URLs, are skipped), and has its `version`; `util.isArray` warns DEP0044; `util._extend` (DEP0060),
+  `net._setSimultaneousAccepts` (DEP0121) and `require("sys")` (DEP0025, `util` under its old
+  name, in `module.builtinModules` too) are there; `crypto.Hash` and `crypto.Hmac` construct, with
+  or without `new`, and warn DEP0179 / DEP0181. `createHash` / `createHmac` throw node's
+  `ERR_INVALID_ARG_TYPE` for a non-string algorithm (#368).
+- **A BYOB read fills at most the view it is given, as node's does (#372).** `getReader({ mode:
+  "byob" })` ignored the mode and returned a default reader, so `read(new Uint8Array(2))` of a
+  3-byte chunk handed back all 3 bytes. A byte stream now has node's BYOB reader: `read(view, {
+  min })` transfers the view's buffer and fills it from the queue -- at most the view, across
+  chunks, the rest left for the next read -- or waits for the source, which can answer through
+  `controller.byobRequest` (`respond()`, `respondWithNewView()`); `tee()` of a byte stream gives
+  two byte streams and a copy of each chunk to the second branch, as node's does. A `Blob`'s
+  stream, a `fetch` body and `FileHandle.readableWebStream()` read the same way.
+- **`fs.openAsBlob` gives a file-backed Blob that is read only when it is (#373).** It read the
+  whole file into memory at the call. The Blob now holds the path and the size and mtime the
+  open's fstat gave; each read opens the file then and fails `NotReadableError` once the file has
+  changed, as node's does, and so do slices of it, Blobs made of it and `Response`, `Request` and
+  `FormData` bodies (a `fetch` sends them with their content-length, and fails once the file
+  changed). A large file costs no memory until it is read.
+- **`fs.openAsBlob` checks its arguments and opens the file at the call (#374).** It checked the
+  options and the path asynchronously and turned every failure into `ERR_INVALID_ARG_VALUE`. Bad
+  options, a bad type, a bad path and a missing file now throw at the call, as node's do, and a
+  `--permission` denial is node's `ERR_ACCESS_DENIED`. `openAsBlob` of `\\.\NUL` is a 0-byte
+  Blob on Windows (#383).
+- **`Blob` matches node's in its parts, slices, types and clones (#375).** `stream()` gives one
+  chunk per part (a file in 64 KiB chunks) rather than the whole Blob at once; `slice()` converts
+  its arguments as node does (`slice(NaN, Infinity)` is empty) and an omitted content type is
+  `""`, not the Blob's; the constructor validates `sources` and `options` and honours `endings`;
+  `structuredClone` of a Blob gives a working Blob (it gave a broken one), and of `fs.openAsBlob`'s
+  Blob throws with `code: "ERR_INVALID_STATE"`; `util.inspect` shows `Blob { size, type }` (and a
+  File's name and lastModified) rather than `Blob {}`. A chunk read from a `Response` body made from
+  bytes or a Blob is the reader's own copy, so writing to it no longer changes the Blob or a
+  `clone()`.
+- **`util.inspect` of a `ReadableStream` is node's summary.** It printed every internal field of
+  the stream; it is now `ReadableStream { locked, state, supportsBYOB }`, as node's is, and so is
+  the stream in the message of `getReader({ mode: "byob" })`'s "must be a byte stream" error.
+- **A `--permission` denial's message names the flag that grants it.** `ERR_ACCESS_DENIED` said
+  only "Access to this API has been restricted"; it now goes on, as node's does, "Use
+  --allow-fs-read to manage permissions." with the flag of the denied scope (`--allow-fs-write`,
+  `--allow-child-process`, `--allow-worker`, ...). oam's own net and environment scopes name
+  `--allow-net` and `--allow-env` (#363).
+
+- **`import()` loads and evaluates its module in promise jobs after the call, as node's does
+  (#397).** oam evaluated the module inside the import hook, with the importer's frame on the
+  stack, and ran a microtask checkpoint there. So the module's top level ran before the importer's
+  next statement, its `process.nextTick` callbacks ran before the importer's continuation (from
+  CommonJS `micro | tick | after import`, where node prints `micro | after import | tick`), and a
+  CommonJS importer's own promise jobs ran ahead of its ticks. `import()` now runs node v22.22.2's
+  loader chain -- resolve in the call, then load, link, instantiate and evaluate in promise jobs --
+  so every step lands on node's microtask turn: a module with no imports of its own evaluates on
+  the 8th turn after the call and `import()` settles on the 14th, as in node. A module whose
+  top-level await waits on a timer can now be imported (oam rejected it as unsupported), and a
+  dynamic import cycle under top-level await deadlocks and exits 13, as node's does, where oam
+  handed back a partial namespace. A CommonJS module still runs when oam loads it, not when node
+  would (docs/node-divergences.md, entry 52); an `import()` such a module makes inside a
+  `require()` of an ES module now loads its graph after the `require()` returns, as node's does.
+
+- **Deep recursion through a sync op throws a `RangeError` on Windows instead of killing the
+  process (#395).** Recursion that called a native op at the bottom of the JS stack could overflow
+  the native stack first: the process died with `thread 'main' has overflowed its stack`
+  (`0xC00000FD`) where node throws a catchable `RangeError: Maximum call stack size exceeded`.
+  Measured on a release build with `fs.copyFileSync`, `fs.cpSync` and `zlib.deflateSync`, and on a
+  debug build with `fs.readdirSync` and `fs.opendirSync` too. oam.exe's main thread had the
+  linker's 1 MiB stack, of which V8 takes ~984 KiB for JS; it now reserves 8 MiB, as node.exe's
+  header does. Worker threads (and `oam.fork` isolates) get node's 4 MiB worker stack, up from
+  2 MiB. How deep JS can recurse is unchanged on every thread: V8 sets that, not the stack size.
+  It is not node's depth: a worker recurses a quarter to a third as deep as node's, and the main
+  thread somewhat deeper, so a 1500-deep `fs.cpSync` with a `filter` or `fs.rmSync` recursive
+  completes in oam where node throws `RangeError` (see docs/node-divergences.md).
 
 ### Performance
 
@@ -518,6 +752,29 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   side builds `Stats` / `BigIntStats` from it. A listing is two arrays, names and internalized kind
   names, so a plain `readdir` returns the names array as it is. The win is largest for `readdir` on a
   wide directory and for the sync stat forms, which now allocate nothing per call.
+- **File streams open, read, write and close through `options.fs`, or the live `fs.*`, as node's
+  do.** `fs.createReadStream` and `fs.createWriteStream` opened, read, wrote and closed natively, so
+  neither an `options.fs` nor a function assigned over `fs.open`, `fs.read`, `fs.write`,
+  `fs.writev`, `fs.fsync` or `fs.close` (graceful-fs, mock-fs and test spies patch them) was ever
+  called. Each is now called with node's arguments -- `open` with the stream's path, flags and mode
+  as given; `read` into a buffer of the stream's own at its position; node's write loop, with a
+  short write followed by one for the rest -- and the `options.fs` methods a stream needs are
+  checked to be functions, in node's order, with node's `ERR_INVALID_ARG_TYPE`. A stream whose
+  `open` is its own (a subclass's, or one assigned) opens by calling it, and
+  `ReadStream.prototype.open` / `WriteStream.prototype.open` are node's deprecated no-ops
+  (DEP0135). `fs.writev` no longer calls a patched `fs.write`. A method the constructor does not
+  check (`close` with `autoClose: false`, `fsync` with `flush` set later) that is missing fails
+  the call with node's `TypeError`, where oam closed natively the descriptor `options.fs.open`
+  handed out. (#356)
+- **`fs.cpSync` of a directory whose destination cannot be made fails as node's does.** The error
+  node's C++ raises has its keys in node's order (`errno`, `code`, `path`, `syscall`; oam put
+  `syscall` before `path`), and on Windows it is MSVC's, as node's is: a file in the way is
+  `errno` 183 with an empty `code` and "Cannot create a file when that file already exists.", a
+  directory that may not be written in `errno` 5, `EIO`, "Access is denied.", a missing drive or a
+  name too long `errno` 3, `ESRCH`, and a name Windows does not allow `errno` 123, `ENOPROTOOPT`
+  -- where oam gave Linux's `ENOTDIR`, `EPERM` and `ENOENT`. `fs.cp`, `cpSync` and
+  `fs.promises.cp` making a missing destination parent, and the async forms' `ENOTDIR` from
+  `mkdir`, are now guarded by a conformance case. (#360)
 
 ### Added
 
@@ -532,6 +789,25 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   polled the path's mtime every 100 ms: no `rename`, nothing from inside a directory, and a watcher
   that kept the process alive however it was unref'd. Conformance cases 421 and 422; what still
   differs is in docs/node-divergences.md.
+
+### Added
+
+- **`node:zlib` zstd, as Node v22.22.2 has it.** `zstdCompress`, `zstdCompressSync`,
+  `zstdDecompress`, `zstdDecompressSync`, `createZstdCompress`, `createZstdDecompress`, the
+  `ZstdCompress` / `ZstdDecompress` classes and the `ZSTD_*` constants, over libzstd 1.5.7
+  -- the library Node links, through the `zstd-safe` binding -- so the compressed bytes,
+  every `ZSTD_c_*` / `ZSTD_d_*` parameter and the `ZSTD_error_*` errors are Node's. The
+  streams run Node's own `ZlibBase` loop, so its quirks match too: a one-shot decompress
+  returns the first frame only, a frame cut short decodes without error, and `flush()`,
+  `reset()` and `close()` work. `process.versions.zstd` reports the linked libzstd.
+  Conformance cases 435-437.
+- **`--trace-warnings` and `--trace-deprecation`, and node's hint that names them.** Both flags
+  are accepted on the command line, in `NODE_OPTIONS` and in a `Worker`'s own `execArgv`, set
+  `process.traceProcessWarnings` /
+  `process.traceDeprecation`, and make the default warning printer write the warning's stack (for
+  every warning, or for deprecations only) in place of its one-line text. Without them, the first
+  warning printed carries node's one-time hint, `(Use \`oam --trace-warnings ...\` to show where
+  the warning was created)`, naming the flag for its kind (#364).
 
 ## [0.19.0] - 2026-10-11
 

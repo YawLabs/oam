@@ -634,9 +634,19 @@
   /// oam asks the OS for the whole path at once (`realpath`, which is what
   /// node's `.native` forms and `fs/promises.realpath` report). When that
   /// fails, this walk finds the error node's would have: the first component
-  /// whose lstat fails. If every component stats, the native error stands.
-  /// The walk yields `[op, path]` for the caller to run -- "lstat", "stat" or
-  /// "readlink", sync or async -- so one walk serves both forms.
+  /// whose lstat fails. If every component stats, the native error stands:
+  /// oam's lstat succeeds on some paths node's refuses (the Windows paging
+  /// file), so the walked path is not node's answer there. The walk yields
+  /// `[op, path]` for the caller to run -- "lstat", "stat" or "readlink",
+  /// sync or async -- so one walk serves both forms, and returns the
+  /// resolved path, or null when it gave up on a chain of links.
+  ///
+  /// On Windows a path in a device namespace (`\\?\`, `\\.\`) is walked
+  /// first, whatever the OS says of it, and the walked path is the answer
+  /// (`realpathWalksFirst`; NUL resolves to itself): node's root
+  /// there is two components deep (`\\?\C:\`, `\\.\pipe\`), and its lstat
+  /// fails where the OS resolves the whole path -- `\\?\C:\x` is
+  /// `EISDIR, lstat 'C:'` on v22.22.2 (#361).
   function* realpathWalk(path) {
     const pathMod = registry.get("path");
     let full = pathMod.resolve(path);
@@ -654,7 +664,7 @@
         if (statKind(stat) === "symlink") {
           // node stats the link (so a dangling one fails `stat`), reads it,
           // and starts over from the resolved path.
-          if (++hops > 40) return;
+          if (++hops > 40) return null;
           yield ["stat", current];
           const target = yield ["readlink", current];
           full = pathMod.resolve(pathMod.dirname(current), target, ...parts.slice(i + 1));
@@ -662,8 +672,17 @@
           break;
         }
       }
-      if (!relinked) return;
+      if (!relinked) return full;
     }
+  }
+
+  /// Whether node's realpath walk answers for `path` before the OS is asked
+  /// (realpathWalk): on Windows, a path that resolves into a device
+  /// namespace.
+  function realpathWalksFirst(path) {
+    if (globalThis.__oam.node.platform !== "win32" || typeof path !== "string") return false;
+    const full = registry.get("path").resolve(path);
+    return full.startsWith("\\\\?\\") || full.startsWith("\\\\.\\");
   }
 
   /// Captured when node_compat.js is evaluated, so a script that replaces
@@ -1242,6 +1261,11 @@
   codes.ERR_BROTLI_INVALID_PARAM = E("ERR_BROTLI_INVALID_PARAM", RangeError, function(param) {
     return param + " is not a valid Brotli parameter";
   });
+  // node:zlib's Zstd constructor: a `params` key that is not a number in
+  // 0..kMaxZstdCParam (or kMaxZstdDParam), or names one already set.
+  codes.ERR_ZSTD_INVALID_PARAM = E("ERR_ZSTD_INVALID_PARAM", RangeError, function(param) {
+    return param + " is not a valid zstd parameter";
+  });
   codes.ERR_ZLIB_INITIALIZATION_FAILED = E("ERR_ZLIB_INITIALIZATION_FAILED", Error, "Initialization failed");
   // node: E('ERR_INVALID_FD', '"fd" must be a positive integer: %s',
   // RangeError) -- a format string, so the value goes through util.format's
@@ -1251,6 +1275,21 @@
   });
   codes.ERR_INVALID_CURSOR_POS = E("ERR_INVALID_CURSOR_POS", TypeError,
     "Cannot set cursor row without setting its column");
+  // node's internal `assert(value, message)` failing (internal/assert.js):
+  // the message, then node's "this is a bug" suffix (internal/errors.js).
+  codes.ERR_INTERNAL_ASSERTION = E("ERR_INTERNAL_ASSERTION", Error, function(message) {
+    const suffix = "This is caused by either a bug in Node.js " +
+      "or incorrect usage of Node.js internals.\n" +
+      "Please open an issue with this stack trace at " +
+      "https://github.com/nodejs/node/issues\n";
+    return message === undefined ? suffix : message + "\n" + suffix;
+  });
+  // node:zlib's `rejectGarbageAfterEnd` option: input left over once the
+  // compressed stream ended. A TypeError in node (measured on v22.22.2).
+  codes.ERR_TRAILING_JUNK_AFTER_STREAM_END = E(
+    "ERR_TRAILING_JUNK_AFTER_STREAM_END", TypeError,
+    "Trailing junk found after the end of the compressed stream",
+  );
   codes.ERR_BUFFER_OUT_OF_BOUNDS = E("ERR_BUFFER_OUT_OF_BOUNDS", RangeError, function(name) {
     return name ? '"' + name + '" is outside of buffer bounds' : 'Attempt to access memory outside buffer bounds';
   });
@@ -1740,8 +1779,28 @@
     }
     return new RmIsADirectory(context);
   };
-  codes.ERR_MODULE_NOT_FOUND = E("ERR_MODULE_NOT_FOUND", Error, function(path, base) {
-    return 'Cannot find module "' + path + '"' + (base ? ' imported from ' + base : '');
+  // Node's text (v22.22.2 lib/internal/errors.js): with the URL of the
+  // file a relative or absolute specifier named it is a module, kept as
+  // `url`; without one, the package a bare specifier named.
+  codes.ERR_MODULE_NOT_FOUND = E("ERR_MODULE_NOT_FOUND", Error, function(path, base, exactUrl) {
+    if (exactUrl) this.url = `${exactUrl}`;
+    return `Cannot find ${exactUrl ? "module" : "package"} '${path}' imported from ${base}`;
+  });
+  // require() of an ES module (cjs.rs / modules.rs require_esm raise these
+  // through this table so they carry node's shape). Node's texts, v22.22.2
+  // lib/internal/errors.js: the async one names the requiring and the
+  // required file, each line ending in a space as node's does; the cycle one
+  // is a '%s' code whose whole message the loader composes.
+  codes.ERR_REQUIRE_ASYNC_MODULE = E("ERR_REQUIRE_ASYNC_MODULE", Error, function(filename, parentFilename) {
+    let message = "require() cannot be used on an ESM " +
+      "graph with top-level await. Use import() instead. To see where the" +
+      " top-level await comes from, use --experimental-print-required-tla.";
+    if (parentFilename) message += `\n  From ${parentFilename} `;
+    if (filename) message += `\n  Requiring ${filename} `;
+    return message;
+  });
+  codes.ERR_REQUIRE_CYCLE_MODULE = E("ERR_REQUIRE_CYCLE_MODULE", Error, function(message) {
+    return message;
   });
   codes.ERR_PACKAGE_PATH_NOT_EXPORTED = E("ERR_PACKAGE_PATH_NOT_EXPORTED", Error, function(pkgPath, subpath) {
     return 'Package subpath "' + subpath + '" is not defined by "exports" in ' + pkgPath;
@@ -3616,7 +3675,7 @@
     _activeRequests: new Set(),
     /// Re-entry guard for internal/* resolution (see get()).
     _internalResolving: new Set(),
-    get(name) {
+    get(name, via) {
       if (registry.cache.has(name)) return registry.cache.get(name);
       // internal/* (only reachable under --expose-internals; the resolver
       // refuses the specifier otherwise) comes from the vendored internal
@@ -3653,7 +3712,9 @@
       if (!factory) {
         throw new Error(`oam internal: no builtin factory registered for '${name}'`);
       }
-      const mod = factory(globalThis.__oam.node);
+      // `via`: the route a user load took, for a factory whose behaviour
+      // depends on it (punycode's DEP0040); internal loads pass none.
+      const mod = factory(globalThis.__oam.node, via);
       registry.cache.set(name, mod);
       return mod;
     },
@@ -3767,12 +3828,17 @@
       const max = this.getMaxListeners();
       if (max > 0 && count > max && !this._events[type].warned) {
         this._events[type].warned = true;
-        if (globalThis.console) {
-          globalThis.console.warn(
-            `(oam) MaxListenersExceededWarning: ${count} ${String(type)} listeners added to EventEmitter. ` +
-              `Use emitter.setMaxListeners() to increase limit`,
-          );
-        }
+        // A process warning, as node's (_addListener, lib/events.js): an
+        // Error carrying the emitter, type and count, through emitWarning,
+        // so 'warning' listeners hear it and --no-warnings silences it.
+        // No error code: it is a warning.
+        const w = new Error(
+          `Possible EventEmitter memory leak detected. ${count} ${String(type)} listeners ` +
+            `added to ${registry.get("util").inspect(this, { depth: -1 })}. MaxListeners is ${max}. ` +
+            "Use emitter.setMaxListeners() to increase limit",
+        );
+        Object.assign(w, { name: "MaxListenersExceededWarning", emitter: this, type, count });
+        globalThis.process.emitWarning(w);
       }
       return this;
     };
@@ -3979,17 +4045,10 @@
     // AbortError (code ABORT_ERR, the signal's reason as `cause`), not a
     // DOMException. Listeners on an EventTarget (an AbortSignal, say) as on
     // an EventEmitter; the abort listener resists stopImmediatePropagation,
-    // and every settle path unhooks all three listeners.
-    class AbortError extends Error {
-      constructor(message = "The operation was aborted", options = undefined) {
-        if (options !== undefined && typeof options !== "object") {
-          throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
-        }
-        super(message, options);
-        this.code = "ABORT_ERR";
-        this.name = "AbortError";
-      }
-    }
+    // and every settle path unhooks all three listeners. The AbortError is
+    // node's one internal class (bootstrap.js), shared with every other
+    // module that rejects with it (#401).
+    const AbortError = globalThis.__oamAbortError;
     const kResistStopPropagation = Symbol.for("oam.kResistStopPropagation");
     function eventTargetAgnosticAddListener(emitter, name, listener, flags) {
       if (typeof emitter.on === "function") {
@@ -4144,16 +4203,12 @@
         else error = err;
         closeHandler();
       }
+      // node's AbortError, the one class once() and the rest share, with
+      // the reason as its `cause`. A plain Error renamed to look like one
+      // had no AbortError constructor and put `cause` last among its keys
+      // (#401).
       function abortHandler() {
-        errorHandler(makeAbortErrorForOn(signal && signal.reason));
-      }
-
-      function makeAbortErrorForOn(reason) {
-        var err = new Error("The operation was aborted");
-        err.code = "ABORT_ERR";
-        err.name = "AbortError";
-        if (reason !== undefined) err.cause = reason;
-        return err;
+        errorHandler(new AbortError(undefined, { cause: signal?.reason }));
       }
 
       // EventTarget has no .on/.removeListener. on() only ever spoke the
@@ -4193,7 +4248,7 @@
         // async error path handed back an iterator that looked usable
         // and only failed on first next(), so `assert.throws(() => on(...))`
         // saw nothing thrown.
-        throw makeAbortErrorForOn(signal.reason);
+        throw new AbortError(undefined, { cause: signal.reason });
       }
       attach(event, eventHandler);
       if (event !== "error") attach("error", errorHandler);
@@ -4284,26 +4339,38 @@
       return [];
     }
 
-    // Internal slot used to attach a max-listeners value to a native
-    // EventTarget (which has no get/setMaxListeners method of its own), the way
-    // Node stores it via kMaxEventTargetListeners.
-    const kMaxEventTargetListeners = Symbol("kMaxEventTargetListeners");
+    // The slots an EventTarget (which has no get/setMaxListeners method of
+    // its own) keeps its listener limit, and whether it warned, in -- node's
+    // kMaxEventTargetListeners / kMaxEventTargetListenersWarned:
+    // bootstrap.js's EventTarget sets them when made and reads them in
+    // addEventListener to warn past the limit.
+    const { kMaxEventTargetListeners, kMaxEventTargetListenersWarned } =
+      globalThis.__oamEventTargetLimitSymbols;
 
-    function setMaxListeners(n) {
-      if (arguments.length > 1) {
-        for (var i = 1; i < arguments.length; i++) {
-          const target = arguments[i];
-          if (typeof target.setMaxListeners === "function") {
-            target.setMaxListeners(n);
-          } else {
-            // Native EventTarget / AbortSignal: stash the value in a slot.
-            Object.defineProperty(target, kMaxEventTargetListeners, {
-              value: n,
-              writable: true,
-              configurable: true,
-              enumerable: false,
-            });
-          }
+    // node's events.setMaxListeners(n = defaultMaxListeners, ...eventTargets):
+    // with no target it sets the default; a new limit lets a target warn
+    // again. n is checked as node's validateNumber(n, 'setMaxListeners', 0)
+    // checks it, and setMaxListeners is read off any other target as node
+    // reads it, so a null or undefined one is V8's own TypeError.
+    function setMaxListeners(n = EventEmitter.defaultMaxListeners, ...eventTargets) {
+      if (typeof n !== "number") {
+        throw new codes.ERR_INVALID_ARG_TYPE("setMaxListeners", "number", n);
+      }
+      if (n < 0 || Number.isNaN(n)) {
+        throw new codes.ERR_OUT_OF_RANGE("setMaxListeners", ">= 0", n);
+      }
+      if (eventTargets.length === 0) {
+        EventEmitter.defaultMaxListeners = n;
+        return;
+      }
+      for (const target of eventTargets) {
+        if (target instanceof EventTarget) {
+          target[kMaxEventTargetListeners] = n;
+          target[kMaxEventTargetListenersWarned] = false;
+        } else if (typeof target.setMaxListeners === "function") {
+          target.setMaxListeners(n);
+        } else {
+          throw new codes.ERR_INVALID_ARG_TYPE("eventTargets", ["EventEmitter", "EventTarget"], target);
         }
       }
     }
@@ -4317,8 +4384,13 @@
     EventEmitter.listenerCount = (emitter, type, listener) =>
       EventEmitter.prototype.listenerCount.call(emitter, type, listener);
     EventEmitter.getMaxListeners = function getMaxListeners(emitterOrTarget) {
-      if (typeof emitterOrTarget.getMaxListeners === "function") {
-        return emitterOrTarget.getMaxListeners();
+      // node reads an object with a getMaxListeners method as an emitter,
+      // through its _maxListeners, without calling the method -- so a
+      // NodeEventTarget (a MessagePort) answers the module default here
+      // whatever its own limit is, as it does under node.
+      if (typeof emitterOrTarget?.getMaxListeners === "function") {
+        const n = emitterOrTarget._maxListeners;
+        return n === undefined ? EventEmitter.defaultMaxListeners : n;
       }
       if (
         emitterOrTarget != null &&
@@ -5917,6 +5989,16 @@
     // character; built via fromCharCode so the table reads unambiguously.
     const INSPECT_BS = String.fromCharCode(92);
     const INSPECT_CUSTOM_SYMBOL = Symbol.for("nodejs.util.inspect.custom");
+    // The primitive wrappers: each with the V8 kind that recognises its box by
+    // internal slot (node's isNumberObject and friends) and the valueOf that
+    // unwraps it.
+    const BOXED_KINDS = [
+      ["Number", "numberObject", Number.prototype.valueOf],
+      ["String", "stringObject", String.prototype.valueOf],
+      ["Boolean", "booleanObject", Boolean.prototype.valueOf],
+      ["BigInt", "bigIntObject", BigInt.prototype.valueOf],
+      ["Symbol", "symbolObject", Symbol.prototype.valueOf],
+    ];
     const strEscapeMeta = (() => {
       const hex = (i) => `${INSPECT_BS}x${i.toString(16).toUpperCase().padStart(2, "0")}`;
       const m = [];
@@ -6171,6 +6253,58 @@
         const cn = safeCtorName(v);
         return cn || "TypedArray";
       }
+      // Port of node's improveStack (lib/internal/util/inspect.js, v22.22.2):
+      // only a "regular" stack -- one that starts with `name`, an Error
+      // name, followed by ':' or a newline or nothing -- is touched, and
+      // then the header gains the constructor (and tag) when they differ
+      // from the name: `DOMException [AbortError]: x`, `Foo [Error]: x`,
+      // `BarError: x` for a BarError named "Error". A null-prototype error
+      // is labelled from its stack's own first word (#401).
+      // The [[ErrorData]] slot, read by Error.isError (util.types.isNativeError
+      // reads it the same way): an error is one whatever its prototype.
+      const errorIsError = Error.isError;
+      const isNativeErrorSlot = (v) =>
+        typeof errorIsError === "function" ? errorIsError(v) : false;
+      function improveErrorStack(stack, constructor, name, tag) {
+        const strEndsWith = String.prototype.endsWith;
+        const strStartsWith = String.prototype.startsWith;
+        let len = name.length;
+        if (typeof name !== "string") {
+          stack = stack.replace(
+            `${name}`,
+            `${name} [${inspectPrefix(constructor, tag, "Error").slice(0, -1)}]`,
+          );
+        }
+        if (
+          constructor === null ||
+          (strEndsWith.call(name, "Error") &&
+            strStartsWith.call(stack, name) &&
+            (stack.length === len || stack[len] === ":" || stack[len] === "\n"))
+        ) {
+          let fallback = "Error";
+          if (constructor === null) {
+            const start =
+              /^([A-Z][a-z_ A-Z0-9[\]()-]+)(?::|\n {4}at)/.exec(stack) ||
+              /^([a-z_A-Z0-9-]*Error)$/.exec(stack);
+            fallback = start?.[1] || "";
+            len = fallback.length;
+            fallback ||= "Error";
+          }
+          const prefix = inspectPrefix(constructor, tag, fallback).slice(0, -1);
+          if (name !== prefix) {
+            if (prefix.includes(name)) {
+              if (len === 0) {
+                stack = `${prefix}: ${stack}`;
+              } else {
+                stack = `${prefix}${stack.slice(len)}`;
+              }
+            } else {
+              stack = `${prefix} [${name}]${stack.slice(len)}`;
+            }
+          }
+        }
+        return stack;
+      }
       function inspectPrefix(constructor, tag, fallback, size = "") {
         // Port of Node getPrefix.
         if (constructor === undefined || constructor === null) {
@@ -6209,7 +6343,7 @@
         }
         return keys;
       }
-      function formatString(s) {
+      function formatString(s, fn = stylize) {
         let trailer = "";
         if (s.length > maxStringLength) {
           const remaining = s.length - maxStringLength;
@@ -6222,11 +6356,11 @@
           return (
             s
               .split(/(?<=\n)/)
-              .map((line) => stylize(strEscape(line), "string"))
+              .map((line) => fn(strEscape(line), "string"))
               .join(` +\n${" ".repeat(ictx.indentationLvl + 2)}`) + trailer
           );
         }
-        return stylize(strEscape(s), "string") + trailer;
+        return fn(strEscape(s), "string") + trailer;
       }
       function isBelowBreakLength(output, start, base) {
         // Port of Node isBelowBreakLength (entry count approximates the ", "
@@ -6666,41 +6800,81 @@
           if (keys.length === 0 || (depth !== null && level > depth)) return base;
           return entriesTail(v, keys, base, level);
         }
-        if (v instanceof Error) {
+        // node's isError: an Error by its prototype chain, or a native error
+        // whatever its prototype -- one whose prototype was nulled renders
+        // as `[Error: null prototype]: msg`, labelled by improveStack, not
+        // as an empty null-prototype object (#401).
+        if (v instanceof Error || isNativeErrorSlot(v)) {
+          // node's formatError and getStackString (v22.22.2): a stack getter
+          // that throws counts as no stack, a non-string stack is inspected
+          // under the `Error.prototype.toString` header, and when even that
+          // throws (V8 builds a lazy stack, and toString, from `name`: a
+          // Symbol name or a throwing name getter) the error renders as
+          // `[object Error]` with its keys, rather than throwing out of
+          // console.log (#401).
+          let keys = getKeys(v, showHidden);
           let base;
           try {
-            base = v.stack ? String(v.stack) : Error.prototype.toString.call(v);
+            let stack;
+            try {
+              stack = v.stack;
+            } catch {
+              stack = undefined;
+            }
+            if (stack) {
+              if (typeof stack === "string") base = stack;
+              else {
+                seen.push(v);
+                ictx.indentationLvl += 4;
+                let shown;
+                try {
+                  // node's getStackString calls formatValue(ctx, err.stack)
+                  // with no recurseTimes: undefined there, NaN once a level
+                  // deeper. Every depth comparison is then false, so the
+                  // stack is walked with no depth limit and every non-empty
+                  // object or array in it breaks one entry per line -- and
+                  // NaN here is that same arithmetic.
+                  shown = walk(stack, NaN);
+                } finally {
+                  ictx.indentationLvl -= 4;
+                  seen.pop();
+                }
+                base = `${Error.prototype.toString.call(v)}\n    ${shown}`;
+              }
+            } else {
+              base = Error.prototype.toString.call(v);
+            }
           } catch {
-            base = "[Error]";
+            base = Object.prototype.toString.call(v);
+            if (keys.length === 0) return base;
+            if (depth !== null && level > depth) {
+              return stylize(`[${safeCtorName(v) || "Error"}]`, "special");
+            }
+            return entriesTail(v, keys, base, level);
           }
           let msg;
+          let msgThrows = false;
           try {
             msg = v.message;
           } catch {
-            msg = undefined;
+            msgThrows = true;
           }
-          // Node wraps the render in brackets when the stack carries no
-          // call-frame lines (searching past the message).
-          let pos = (msg && base.indexOf(msg)) || -1;
-          if (pos !== -1) pos += msg.length;
-          if (base.indexOf("\n    at", pos) === -1) base = `[${base}]`;
-          // Nested errors get their stack lines indented (Node formatError).
-          if (ictx.indentationLvl !== 0) {
-            base = base.split("\n").join(`\n${" ".repeat(ictx.indentationLvl)}`);
+          let errName;
+          let nameThrows = false;
+          try {
+            errName = v.name;
+          } catch {
+            nameThrows = true;
           }
-          let keys = getKeys(v, showHidden);
           if (!showHidden && keys.length !== 0) {
             // Node removeDuplicateErrorKeys: hide stack/message/name entries
-            // already mirrored in the stack render.
+            // already mirrored in the stack render; a getter that throws is
+            // kept as a key.
             keys = keys.filter((k) => {
               if (k === "stack") return false;
-              if (k === "message" || k === "name") {
-                try {
-                  const val = v[k];
-                  return typeof val === "string" && !base.includes(val);
-                } catch {
-                  return true;
-                }
+              if (k === "message" && !msgThrows) return typeof msg === "string" && !base.includes(msg);
+              if (k === "name" && !nameThrows) {
+                return typeof errName === "string" && !base.includes(errName);
               }
               return true;
             });
@@ -6720,6 +6894,21 @@
             }
           } catch {
             // A throwing `errors` getter is ignored, exactly like Node.
+          }
+          // Node's improveStack: the header names the constructor when it
+          // is not what `name` says, `DOMException [AbortError]: x` for a
+          // DOMException, `Foo [Error]: x` for a subclass that kept the name
+          // "Error" (#401). After the duplicate keys are judged, against the
+          // stack as the error carries it, as in node.
+          base = improveErrorStack(base, safeCtorName(v) ?? null, errName ?? "Error", tagOf(v));
+          // Node wraps the render in brackets when the stack carries no
+          // call-frame lines (searching past the message).
+          let pos = (msg && base.indexOf(msg)) || -1;
+          if (pos !== -1) pos += msg.length;
+          if (base.indexOf("\n    at", pos) === -1) base = `[${base}]`;
+          // Nested errors get their stack lines indented (Node formatError).
+          if (ictx.indentationLvl !== 0) {
+            base = base.split("\n").join(`\n${" ".repeat(ictx.indentationLvl)}`);
           }
           if (keys.length === 0) return base;
           if (depth !== null && level > depth) {
@@ -6932,36 +7121,45 @@
           return reduce([stylize("<items unknown>", "special")], refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
         }
         {
-          // Boxed primitives render as `[Boolean: false]`, not `Boolean {}`.
-          const boxType =
-            v instanceof Number
-              ? "Number"
-              : v instanceof String
-                ? "String"
-                : v instanceof Boolean
-                  ? "Boolean"
-                  : null;
+          // Node getBoxedBase: a boxed primitive renders as `[Boolean: false]`,
+          // `[BigInt: 1n]` or `[Symbol: Symbol(q)]`, not `Boolean {}`. The box
+          // is recognised by its internal slot, as node's isNumberObject and
+          // friends do, so a box whose prototype was swapped or nulled still
+          // renders as one (`[BigInt (null prototype): 5n]`).
+          let boxType = null;
+          let prim;
+          for (const [type, kind, valueOf] of BOXED_KINDS) {
+            if (natives.v8Is(v, kind)) {
+              boxType = type;
+              prim = valueOf.call(v);
+              break;
+            }
+          }
           if (boxType !== null) {
-            const prim = boxType === "Number" ? Number.prototype.valueOf.call(v)
-              : boxType === "String" ? String.prototype.valueOf.call(v)
-                : Boolean.prototype.valueOf.call(v);
             const ctor = safeCtorName(v);
             let base = `[${boxType}`;
             if (boxType !== ctor) base += ctor === undefined ? " (null prototype)" : ` (${ctor})`;
-            // Node formatPrimitive for the boxed base. Only the separator-ON
-            // branch routes through inspectNumberStr: with the separator off Node
-            // prints `[Number: -0]` where this String(prim) prints `[Number: 0]`,
-            // a PRE-EXISTING -0 divergence left alone on purpose, because closing
-            // it here would change default-path output.
+            // Node formats the primitive with stylizeNoColor and colours the
+            // whole base instead, and only when no keys follow it. Node's
+            // formatNumber prints -0 as `-0`, but `0` under numericSeparator,
+            // which is what inspectNumberStr does too.
             const primStr =
-              typeof prim === "number" && numericSeparator ? inspectNumberStr(prim, true) : String(prim);
-            base += `: ${typeof prim === "string" ? formatString(prim) : stylize(primStr, boxType.toLowerCase())}]`;
+              boxType === "Number"
+                ? inspectNumberStr(prim, numericSeparator)
+                : boxType === "String"
+                  ? formatString(prim, (str) => str)
+                  : boxType === "BigInt"
+                    ? inspectBigIntStr(prim, numericSeparator)
+                    : boxType === "Symbol"
+                      ? prim.toString()
+                      : String(prim);
+            base += `: ${primStr}]`;
             const tg = tagOf(v);
             if (tg !== "" && tg !== ctor) base += ` [${tg}]`;
             let bkeys = getKeys(v, showHidden);
             // Drop the 0..n-1 index entries a boxed String exposes.
             if (boxType === "String") bkeys = bkeys.slice(prim.length);
-            if (bkeys.length === 0) return base;
+            if (bkeys.length === 0) return stylize(base, boxType.toLowerCase());
             if (depth !== null && level > depth) return collapsed(v);
             return entriesTail(v, bkeys, base, level);
           }
@@ -7157,6 +7355,54 @@
       }
     }
 
+    // node's hasBuiltInToString (lib/internal/util/inspect.js, v22.22.2),
+    // what %s asks before it inspects an object rather than String() it: the
+    // object's own toString / Symbol.toPrimitive make it user-defined;
+    // otherwise the nearest prototype owning either decides, built in when
+    // its constructor is one of V8's globals. Error.prototype.toString is
+    // one, so an error inspects -- `DOMException [AbortError]: x`, its stack
+    // -- where a list of three toStrings String()-coerced it, as did a
+    // boxed primitive and a Promise; a typed array (TypedArray is no global)
+    // and a URL or Buffer (node's own) are String()-coerced (#401).
+    const v8BuiltInObjects = new Set(globalThis.__oamV8BuiltInNames ?? []);
+    const returnFalse = () => false;
+    const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+    function hasBuiltInToString(value) {
+      // A Proxy is probed through its target, never its traps: formatting a
+      // value must not be observable to it. A revoked one counts as built in
+      // and inspects to <Revoked Proxy>.
+      if (proxyDetails !== undefined) {
+        const target = proxyDetails(value, false);
+        if (target !== undefined) {
+          if (target === null) return true;
+          value = target;
+        }
+      }
+      let hasOwnToString = hasOwn;
+      let hasOwnToPrimitive = hasOwn;
+      if (typeof value.toString !== "function") {
+        if (typeof value[Symbol.toPrimitive] !== "function") return true;
+        if (hasOwn(value, Symbol.toPrimitive)) return false;
+        hasOwnToString = returnFalse;
+      } else if (hasOwn(value, "toString")) {
+        return false;
+      } else if (typeof value[Symbol.toPrimitive] !== "function") {
+        hasOwnToPrimitive = returnFalse;
+      } else if (hasOwn(value, Symbol.toPrimitive)) {
+        return false;
+      }
+      let pointer = value;
+      do {
+        pointer = Object.getPrototypeOf(pointer);
+      } while (!hasOwnToString(pointer, "toString") && !hasOwnToPrimitive(pointer, Symbol.toPrimitive));
+      const descriptor = Object.getOwnPropertyDescriptor(pointer, "constructor");
+      return (
+        descriptor !== undefined &&
+        typeof descriptor.value === "function" &&
+        v8BuiltInObjects.has(descriptor.value.name)
+      );
+    }
+
     function format(f, ...args) {
       _fmtOpts = inspect.defaultOptions;
       // util.format() with no arguments returns '' (Node parity).
@@ -7183,34 +7429,9 @@
             // Node %s: only an object with a BUILT-IN toString (plain object /
             // array) inspects at depth 0; everything else (primitives, functions,
             // symbols, objects with a custom toString) is String()-coerced.
-            const isObj = arg !== null && typeof arg === "object";
-            let builtIn = false;
-            if (isObj) {
-              // Node hasBuiltInToString resolves a Proxy to its TARGET before
-              // probing: reading `.toString` or Symbol.toPrimitive off the
-              // proxy would fire its get trap, and formatting a value must not
-              // be observable to that value. A revoked proxy has no target to
-              // probe and counts as built-in, so it inspects to
-              // <Revoked Proxy> instead of throwing out of String().
-              let probe = arg;
-              let revoked = false;
-              if (proxyDetails !== undefined) {
-                const target = proxyDetails(arg, false);
-                if (target === null) revoked = true;
-                else if (target !== undefined) probe = target;
-              }
-              if (revoked) {
-                builtIn = true;
-              } else {
-                const ts = probe.toString;
-                // Date has a Symbol.toPrimitive but Node %s INSPECTS it (ISO form),
-                // so it counts as built-in here.
-                const hasToPrim = typeof probe[Symbol.toPrimitive] === "function" && !(probe instanceof Date);
-                builtIn = !hasToPrim &&
-                  (typeof ts !== "function" || ts === Object.prototype.toString || ts === Array.prototype.toString || probe instanceof Date);
-              }
+            if (arg === null || typeof arg !== "object" || !hasBuiltInToString(arg)) {
+              return String(arg);
             }
-            if (!builtIn) return String(arg);
             return inspect(arg, { ..._fmtOpts, depth: 0, colors: false, compact: 3, bare: true });
           }
           case "%d":
@@ -7400,6 +7621,18 @@
       }
       Object.defineProperty(ctor, "super_", { value: superCtor, writable: true, configurable: true });
       Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
+    }
+
+    // node's util._extend: the source's own enumerable keys, assigned last
+    // to first; a source that is not an object leaves the target as it is.
+    function _extend(target, source) {
+      if (source === null || typeof source !== "object") return target;
+      const keys = Object.keys(source);
+      let i = keys.length;
+      while (i--) {
+        target[keys[i]] = source[keys[i]];
+      }
+      return target;
     }
 
     // Codes that have already warned live in deprecationCodesWarned (above
@@ -8239,11 +8472,30 @@
         return getCallSites(...args);
       },
       parseArgs,
-      aborted: (signal, resource) => {
-        return new Promise((resolve) => {
-          if (signal.aborted) { resolve(signal.reason); return; }
-          signal.addEventListener("abort", () => resolve(signal.reason), { once: true });
+      // node's util.aborted (lib/internal/abort_controller.js, v22.22.2), an
+      // async function: an already-aborted signal resolves with undefined,
+      // a later abort with the abort Event (the promise's resolve is the
+      // listener itself), and the listener lives only as long as `resource`
+      // (kWeakHandler). It resolved with signal.reason, which with a null
+      // reason is null, and checked neither argument (#401).
+      aborted: async (signal, resource) => {
+        if (signal === undefined) {
+          throw new codes.ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
+        }
+        if (signal === null || typeof signal !== "object" || !("aborted" in signal)) {
+          throw new codes.ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
+        }
+        if (resource === null || (typeof resource !== "object" && typeof resource !== "function")) {
+          throw new codes.ERR_INVALID_ARG_TYPE("resource", "object", resource);
+        }
+        if (signal.aborted) return undefined;
+        const { promise, resolve } = Promise.withResolvers();
+        signal.addEventListener("abort", resolve, {
+          once: true,
+          [Symbol.for("oam.kWeakHandler")]: resource,
+          [Symbol.for("oam.kResistStopPropagation")]: true,
         });
+        return promise;
       },
       // JS port of Node v22.22.2 Dotenv::ParseContent, tuned against the
       // LIVE binary (the shipped parser trims remaining content after
@@ -8402,7 +8654,18 @@
       deprecate,
       debuglog,
       debug: debuglog,
-      isArray: Array.isArray,
+      // Runtime-deprecated in node v22.22.2 (lib/util.js), each warning on
+      // its first call.
+      isArray: deprecate(
+        Array.isArray,
+        "The `util.isArray` API is deprecated. Please use `Array.isArray()` instead.",
+        "DEP0044",
+      ),
+      _extend: deprecate(
+        _extend,
+        "The `util._extend` API is deprecated. Please use Object.assign() instead.",
+        "DEP0060",
+      ),
       isDeepStrictEqual: (a, b) => deepEqualImpl(a, b, true),
       toUSVString: (val) => {
         var s = String(val);
@@ -8650,14 +8913,22 @@
         isModuleNamespaceObject: (v) => natives.v8Is(v, "moduleNamespaceObject"),
         isExternal: () => false,
         isArgumentsObject: (v) => Object.prototype.toString.call(v) === "[object Arguments]",
-        isBooleanObject: (v) => v instanceof Boolean,
-        isNumberObject: (v) => v instanceof Number,
-        isStringObject: (v) => v instanceof String,
-        isSymbolObject: (v) => Object.prototype.toString.call(v) === "[object Symbol]" && typeof v === "object",
+        // Internal-slot checks, as node's are: a box with its prototype
+        // swapped still answers yes, and an object that only inherits from
+        // Number.prototype (or forges Symbol's toStringTag) answers no.
+        isBooleanObject: (v) => natives.v8Is(v, "booleanObject"),
+        isNumberObject: (v) => natives.v8Is(v, "numberObject"),
+        isStringObject: (v) => natives.v8Is(v, "stringObject"),
+        isSymbolObject: (v) => natives.v8Is(v, "symbolObject"),
+        isBigIntObject: (v) => natives.v8Is(v, "bigIntObject"),
         isCryptoKey: (v) => typeof CryptoKey !== "undefined" && v instanceof CryptoKey,
         isKeyObject: () => false,
         isBoxedPrimitive: (v) =>
-          v instanceof Number || v instanceof String || v instanceof Boolean,
+          natives.v8Is(v, "numberObject") ||
+          natives.v8Is(v, "stringObject") ||
+          natives.v8Is(v, "booleanObject") ||
+          natives.v8Is(v, "bigIntObject") ||
+          natives.v8Is(v, "symbolObject"),
       },
     };
   };
@@ -11768,15 +12039,12 @@
   const kFhRef = Symbol("kRef");
   const kFhUnref = Symbol("kUnref");
 
-  // node's AbortError for an fs call given a signal that is aborted: named
-  // and coded as such, with the signal's reason as its cause.
-  const FsAbortError = class AbortError extends Error {
-    constructor(signal) {
-      super("The operation was aborted", { cause: signal.reason });
-      this.code = "ABORT_ERR";
-      this.name = "AbortError";
-    }
-  };
+  // node's AbortError for an fs call given a signal that is aborted, with
+  // the signal's reason as its cause: the one internal class every module
+  // shares (bootstrap.js), not one of fs's own (#401).
+  function fsAbortError(signal) {
+    return new globalThis.__oamAbortError(undefined, { cause: signal.reason });
+  }
 
   // node's getOptions (lib/internal/fs/utils.js, v22.22.2): null, undefined
   // or a function is the defaults, a string is the encoding, anything else
@@ -12114,6 +12382,12 @@
   // wrapper), while node's FileHandle uses the internal class regardless of
   // what userland last assigned.
   let _rwStreams;
+  // The fs module's own open, read, write, writev, fsync and close, as the
+  // fs factory made them. A file stream calls `options.fs`'s, or the live
+  // `fs.*`, as node's does; while the one it would call is still oam's own
+  // it goes to the native instead, which is the same operation without the
+  // argument parsing.
+  let fsStreamOriginals = null;
   function rwStreams(natives) {
     if (_rwStreams) return _rwStreams;
     const { Readable, Writable, finished } = registry.get("stream");
@@ -12214,21 +12488,72 @@
     const kIsPerformingIO = Symbol("kIsPerformingIO");
     const kIoDone = Symbol("kIoDone");
     const kSupplied = Symbol("kSupplied");
+    // node's kFs: what the stream opens, reads, writes and closes through
+    // -- `options.fs`, or the fs module itself; null over a FileHandle,
+    // which goes through the handle.
+    const kFs = Symbol("kFs");
+    // node's ReadStream.prototype.open and WriteStream.prototype.open:
+    // deprecated no-ops (DEP0135), there so that a stream can tell an
+    // `open` of its own from them.
+    const { deprecate } = registry.get("util");
+    const openReadFs = deprecate(function () {}, "ReadStream.prototype.open() is deprecated", "DEP0135");
+    const openWriteFs = deprecate(function () {}, "WriteStream.prototype.open() is deprecated", "DEP0135");
+    // node's validateFunction on one of the `options.fs` methods it needs.
+    const validateFsMethod = (ops, name) => {
+      const fn = ops[name];
+      if (typeof fn !== "function") throw codes.ERR_INVALID_ARG_TYPE("options.fs." + name, "Function", fn);
+    };
+    // The `options.fs` (or patched `fs`) method a stream must call, or null
+    // while it is oam's own and the native does the same. Looked up at each
+    // call, as node's `this[kFs].open(...)` is. One that is missing (or not
+    // a function) is node's call failing: a function throwing node's
+    // TypeError, which names the call as node's source spells it -- never
+    // the native, which would close a descriptor `options.fs` handed out.
+    const fsCallee = { open: "stream", close: "stream", fsync: "stream", read: "this", write: "this", writev: "this" };
+    const fsOverride = (stream, name) => {
+      const ops = stream[kFs];
+      if (!ops) return null;
+      const fn = ops[name];
+      if (fn === fsStreamOriginals[name]) return null;
+      if (typeof fn === "function") return fn;
+      return () => {
+        throw new TypeError(`${fsCallee[name]}[kFs].${name} is not a function`);
+      };
+    };
+    // node's errorOrDestroy for a failed read: a stream that does not
+    // destroy itself (autoClose: false) reports the error and keeps its
+    // descriptor -- over a FileHandle, the handle the caller asked to keep.
+    const readFailed = (stream, e) => {
+      if (stream._readableState.autoDestroy) stream.destroy(e);
+      else {
+        stream._readableState.errored ??= e;
+        stream.emit("error", e);
+      }
+    };
 
     // node's importFd half of both constructors: with no descriptor the
     // stream gets `path`, `flags` and `mode`, and the path is validated
     // here, so a bad one throws from the constructor; handed a descriptor it
     // gets none of the three.
+    //
+    // What it goes through is `options.fs` when that is truthy (node's
+    // `options.fs || fs`), else the fs module; `open` is checked to be a
+    // function before the path is checked, and over a FileHandle
+    // `options.fs` is refused (suppliedFd).
     function importFdOrPath(stream, path, opts, defaultFlags) {
-      const supplied = suppliedFd(opts);
-      stream[kSupplied] = supplied;
-      if (!supplied) {
+      if (opts.fd == null) {
+        stream[kSupplied] = null;
+        stream[kFs] = opts.fs || registry.get("fs");
+        validateFsMethod(stream[kFs], "open");
         stream.fd = null;
         stream.path = pathProperty(path);
         stream.flags = opts.flags === undefined ? defaultFlags : opts.flags;
         stream.mode = opts.mode === undefined ? 0o666 : opts.mode;
         toPath(stream.path);
       } else {
+        const supplied = suppliedFd(opts);
+        stream[kSupplied] = supplied;
+        stream[kFs] = supplied.fileHandle ? null : opts.fs || registry.get("fs");
         stream.fd = supplied.handle;
       }
     }
@@ -12245,6 +12570,43 @@
     // the open, not the constructor.
     function constructStream(stream, callback) {
       if (stream[kSupplied]) { callback(); return; }
+      if (stream.open !== openWriteFs && stream.open !== openReadFs) {
+        // node's backwards compatibility for a stream whose `open` is its
+        // own (a subclass's, or one assigned): that open is called, and the
+        // stream is constructed at the first 'open' it emits, or failed at
+        // the first 'error'.
+        const orgEmit = stream.emit;
+        stream.emit = function (...args) {
+          if (args[0] === "open") {
+            this.emit = orgEmit;
+            callback();
+            Reflect.apply(orgEmit, this, args);
+          } else if (args[0] === "error") {
+            this.emit = orgEmit;
+            callback(args[1]);
+          } else {
+            Reflect.apply(orgEmit, this, args);
+          }
+        };
+        stream.open();
+        return;
+      }
+      const open = fsOverride(stream, "open");
+      if (open) {
+        // node's: the path, flags and mode as the stream holds them, and
+        // the descriptor from the callback.
+        open.call(stream[kFs], stream.path, stream.flags, stream.mode, (er, fd) => {
+          if (er) {
+            callback(er);
+          } else {
+            stream.fd = fd;
+            callback();
+            stream.emit("open", stream.fd);
+            stream.emit("ready");
+          }
+        });
+        return;
+      }
       const opening = new Promise((resolve) => {
         const flags = openFlags(stream.flags, natives);
         resolve(natives.fsOpen(toPath(stream.path), flags, parseFileMode(stream.mode, "mode", 0o666)));
@@ -12272,6 +12634,12 @@
       if (stream.fd === null || stream.fd === undefined) { cb(err); return; }
       const fd = stream.fd;
       const supplied = stream[kSupplied];
+      const closeFs = fsOverride(stream, "close");
+      const fsyncFs = stream.flush ? fsOverride(stream, "fsync") : null;
+      if (closeFs || fsyncFs) {
+        closeThroughFs(stream, fd, err, cb, closeFs, fsyncFs);
+        return;
+      }
       stream.fd = null;
       // Over a FileHandle the answer is the handle's close(), which is
       // already settled for the stream that gave back the last reference
@@ -12288,6 +12656,112 @@
       } else {
         close();
       }
+    }
+    // node's close() and closeFsStream() where `options.fs` (or a patched
+    // fs) supplies the close or the sync: `fd` stays set until the close is
+    // issued, and the close's error wins over the one the stream was
+    // destroyed with, which wins over the sync's.
+    function closeThroughFs(stream, fd, err, cb, closeFs, fsyncFs) {
+      const ops = stream[kFs];
+      const close = (e) => {
+        if (closeFs) {
+          closeFs.call(ops, fd, (er) => cb(er || e));
+        } else {
+          const supplied = stream[kSupplied];
+          new Promise((resolve) => resolve(supplied ? supplied.close() : natives.fsClose(fd))).then(
+            () => setImmediate(cb, e),
+            (er) => setImmediate(cb, er || e),
+          );
+        }
+        stream.fd = null;
+      };
+      if (!stream.flush) {
+        close(err);
+      } else if (fsyncFs) {
+        fsyncFs.call(ops, fd, (flushErr) => close(err || flushErr));
+      } else {
+        new Promise((resolve) => resolve(natives.fsFsync(fd))).then(
+          () => close(err),
+          (flushErr) => close(err || flushErr),
+        );
+      }
+    }
+    // node's _read through `options.fs.read`: into a buffer of the stream's
+    // own, the callback's buffer pushed (copied to fit when the read was
+    // short), and a read of nothing the end.
+    function readThroughFs(stream, read, n) {
+      const buf = globalThis.Buffer.allocUnsafeSlow(n);
+      stream[kIsPerformingIO] = true;
+      read.call(stream[kFs], stream.fd, buf, 0, n, stream.pos, (er, bytesRead, buf) => {
+        stream[kIsPerformingIO] = false;
+        if (stream.destroyed) {
+          stream.emit(kIoDone, er);
+          return;
+        }
+        if (er) {
+          readFailed(stream, er);
+        } else if (bytesRead > 0) {
+          if (stream.pos !== undefined) stream.pos += bytesRead;
+          stream.bytesRead += bytesRead;
+          if (bytesRead !== buf.length) {
+            const dst = globalThis.Buffer.allocUnsafeSlow(bytesRead);
+            buf.copy(dst, 0, 0, bytesRead);
+            buf = dst;
+          }
+          stream.push(buf);
+        } else {
+          stream.push(null);
+        }
+      });
+    }
+    // node's writeAll / writevAll: a short write is followed by one for the
+    // rest, EAGAIN counts as a write of nothing, and six writes of nothing
+    // in a row fail the stream. writevAll passes the stream's `pos`, not
+    // the advancing one, as node's does.
+    function writeAllThroughFs(stream, write, data, size, pos, cb, retries = 0) {
+      write.call(stream[kFs], stream.fd, data, 0, size, pos, (er, bytesWritten, buffer) => {
+        if (er?.code === "EAGAIN") {
+          er = null;
+          bytesWritten = 0;
+        }
+        if (stream.destroyed || er) return cb(er || codes.ERR_STREAM_DESTROYED("write"));
+        stream.bytesWritten += bytesWritten;
+        retries = bytesWritten ? 0 : retries + 1;
+        size -= bytesWritten;
+        pos += bytesWritten;
+        if (retries > 5) cb(systemErrorWithCode("ERR_SYSTEM_ERROR", "write failed"));
+        else if (size) writeAllThroughFs(stream, write, buffer.slice(bytesWritten), size, pos, cb, retries);
+        else cb();
+      });
+    }
+    function writevAllThroughFs(stream, writev, chunks, size, pos, cb, retries = 0) {
+      writev.call(stream[kFs], stream.fd, chunks, stream.pos, (er, bytesWritten, buffers) => {
+        if (er?.code === "EAGAIN") {
+          er = null;
+          bytesWritten = 0;
+        }
+        if (stream.destroyed || er) return cb(er || codes.ERR_STREAM_DESTROYED("writev"));
+        stream.bytesWritten += bytesWritten;
+        retries = bytesWritten ? 0 : retries + 1;
+        size -= bytesWritten;
+        pos += bytesWritten;
+        if (retries > 5) cb(systemErrorWithCode("ERR_SYSTEM_ERROR", "writev failed"));
+        else if (size) {
+          const rest = globalThis.Buffer.concat(buffers).slice(bytesWritten);
+          writevAllThroughFs(stream, writev, [rest], size, pos, cb, retries);
+        } else cb();
+      });
+    }
+    // node's _write / _writev around those: the in-flight mark, the destroy
+    // waiting on it told, and `pos` moved on once the write is issued.
+    function writeThroughFs(stream, all, fn, data, size, cb) {
+      stream[kIsPerformingIO] = true;
+      all(stream, fn, data, size, stream.pos, (er) => {
+        stream[kIsPerformingIO] = false;
+        cb(er);
+        if (stream.destroyed) stream.emit(kIoDone, er);
+      });
+      if (stream.pos !== undefined) stream.pos += size;
     }
     // node's _destroy for both: a read or write still in flight lands first.
     // Closing under it lost the write (and raced the read).
@@ -12326,6 +12800,11 @@
         // assigned in node's order below.
         const own = {};
         importFdOrPath(own, path, opts, "r");
+        const autoClose = opts.autoClose === undefined ? true : opts.autoClose;
+        if (own[kFs]) {
+          validateFsMethod(own[kFs], "read");
+          if (autoClose) validateFsMethod(own[kFs], "close");
+        }
         const start = opts.start;
         let end = opts.end;
         if (start !== undefined) validateInteger(start, "start", 0);
@@ -12341,7 +12820,7 @@
           // autoDestroy -> destroy() -> the close -> 'close'. The stream
           // machine owns 'close' (single emission). autoClose:false keeps
           // the stream alive past EOF and an error, descriptor and all.
-          autoDestroy: opts.autoClose === undefined ? true : opts.autoClose,
+          autoDestroy: autoClose,
           emitClose: opts.emitClose,
           highWaterMark: opts.highWaterMark,
           encoding: opts.encoding ?? null,
@@ -12357,6 +12836,8 @@
               ? Math.min(this.end - this.pos + 1, size)
               : Math.min(this.end - this.bytesRead + 1, size);
             if (want <= 0) { this.push(null); return; }
+            const readFs = fsOverride(this, "read");
+            if (readFs) { readThroughFs(this, readFs, want); return; }
             this[kIsPerformingIO] = true;
             settled(
               new Promise((resolve) => resolve(natives.fsReadChunk(this.fd, want, this.pos))),
@@ -12377,15 +12858,7 @@
                 (e) => {
                   this[kIsPerformingIO] = false;
                   if (this.destroyed) { this.emit(kIoDone, e); return; }
-                  // node's errorOrDestroy: a stream that does not destroy
-                  // itself (autoClose: false) reports the error and keeps
-                  // its descriptor -- over a FileHandle, the handle the
-                  // caller asked to keep.
-                  if (this._readableState.autoDestroy) this.destroy(e);
-                  else {
-                    this._readableState.errored ??= e;
-                    this.emit("error", e);
-                  }
+                  readFailed(this, e);
                 },
               );
           },
@@ -12395,6 +12868,7 @@
         });
         // The properties node's ReadStream has, in its order.
         this[kSupplied] = own[kSupplied];
+        this[kFs] = own[kFs];
         followHandle(this, own[kSupplied]);
         this.fd = own.fd;
         if (!own[kSupplied]) {
@@ -12410,6 +12884,7 @@
       }
     }
     Object.defineProperty(ReadStream.prototype, "autoClose", autoCloseOver("_readableState"));
+    ReadStream.prototype.open = openReadFs;
 
     class WriteStream extends Writable {
       // Node v22 WriteStream.prototype.close: end, then wait for 'close'. A
@@ -12431,8 +12906,20 @@
         const opts = streamOptions(options);
         const own = {};
         importFdOrPath(own, path, opts, "w");
+        const autoClose = opts.autoClose === undefined ? true : opts.autoClose;
+        // node's: either of write and writev will do, but one that is given
+        // must be a function; then close, unless the stream keeps its
+        // descriptor; then `flush`, and with it fsync.
+        const ops = own[kFs];
+        if (ops) {
+          if (!ops.write && !ops.writev) throw codes.ERR_INVALID_ARG_TYPE("options.fs.write", "Function", ops.write);
+          if (ops.write) validateFsMethod(ops, "write");
+          if (ops.writev) validateFsMethod(ops, "writev");
+          if (autoClose) validateFsMethod(ops, "close");
+        }
         const flush = opts.flush ?? false;
         if (typeof flush !== "boolean") throw codes.ERR_INVALID_ARG_TYPE("options.flush", "boolean", flush);
+        if (flush && ops) validateFsMethod(ops, "fsync");
         const start = opts.start;
         if (start !== undefined) validateInteger(start, "start", 0);
         // One native write at the stream's position, counted when it lands.
@@ -12466,7 +12953,7 @@
           // Node's fs.WriteStream flow: construct (the open) -> writes ->
           // end() -> 'finish' -> autoDestroy -> destroy(), which closes the
           // descriptor -> 'close'. The machine owns 'close'.
-          autoDestroy: opts.autoClose === undefined ? true : opts.autoClose,
+          autoDestroy: autoClose,
           emitClose: opts.emitClose,
           highWaterMark: opts.highWaterMark,
           decodeStrings: true,
@@ -12484,6 +12971,8 @@
           // as the write is issued; without it the descriptor's own cursor
           // does the placing.
           write(chunk, _encoding, cb) {
+            const writeFs = fsOverride(this, "write");
+            if (writeFs) { writeThroughFs(this, writeAllThroughFs, writeFs, chunk, chunk.length, cb); return; }
             const at = this.pos;
             if (at !== undefined) this.pos = at + chunk.length;
             writeAt(this, chunk, at, cb);
@@ -12492,6 +12981,13 @@
           // write, as node's _writev does: `bytesWritten` moves once, and
           // two streams on one descriptor do not interleave inside a batch.
           writev(chunks, cb) {
+            const writevFs = fsOverride(this, "writev");
+            if (writevFs) {
+              const list = chunks.map((entry) => entry.chunk);
+              const size = list.reduce((sum, chunk) => sum + chunk.length, 0);
+              writeThroughFs(this, writevAllThroughFs, writevFs, list, size, cb);
+              return;
+            }
             const bytes = globalThis.Buffer.concat(chunks.map((entry) => entry.chunk));
             const at = this.pos;
             if (at !== undefined) this.pos = at + bytes.length;
@@ -12503,6 +12999,7 @@
         });
         // The properties node's WriteStream has, in its order.
         this[kSupplied] = own[kSupplied];
+        this[kFs] = own[kFs];
         followHandle(this, own[kSupplied]);
         this.fd = own.fd;
         if (!own[kSupplied]) {
@@ -12515,12 +13012,18 @@
         this.pos = start;
         this.bytesWritten = 0;
         this[kIsPerformingIO] = false;
+        // node: with only one of write and writev in `options.fs` the
+        // stream has only that one (with `_write` null a lone chunk fails
+        // in the stream machine, as node's does).
+        if (ops && !ops.write) this._write = null;
+        if (ops && !ops.writev) this._writev = null;
         // node: the `encoding` option is what a string written without one
         // is encoded as.
         if (opts.encoding) this.setDefaultEncoding(opts.encoding);
       }
     }
     Object.defineProperty(WriteStream.prototype, "autoClose", autoCloseOver("_writableState"));
+    WriteStream.prototype.open = openWriteFs;
     // node: `WriteStream.prototype.destroySoon = WriteStream.prototype.end`.
     WriteStream.prototype.destroySoon = WriteStream.prototype.end;
     _rwStreams = { ReadStream, WriteStream };
@@ -12563,7 +13066,8 @@
   // Where cpSync's C++ fails in a way that depends on the platform's
   // std::filesystem -- an error code or message the C++ library chooses,
   // or, for a directory to be made where a file is, an exception that
-  // aborts node -- oam fails as node does on Linux; see
+  // aborts node -- oam fails as node does on Linux (save the destination
+  // that cannot be made, which on Windows fails as node's does there); see
   // docs/node-divergences.md.
 
   // node's getValidatedPath for a copy's paths: checked as any path is, a
@@ -12792,8 +13296,10 @@
 
   // node's ErrnoException for a std::filesystem failure in cpSync's C++
   // (Environment::ThrowStdErrException): `<CODE>, <text> '<path>'`, with
-  // errno, code, syscall and path. The code and text are Linux's
-  // (libstdc++'s errno and strerror); see docs/node-divergences.md.
+  // errno, code, path and syscall. The code and text are Linux's
+  // (libstdc++'s errno and strerror), save the destination's
+  // create_directories on Windows (cpStdMkdirError); see
+  // docs/node-divergences.md.
   const CP_STRERROR = {
     EACCES: "Permission denied",
     EBUSY: "Device or resource busy",
@@ -12813,16 +13319,54 @@
     EACCES: 13, EBUSY: 16, EEXIST: 17, EINVAL: 22, EIO: 5, EISDIR: 21, ELOOP: 40, ENAMETOOLONG: 36, ENOENT: 2,
     ENOTDIR: 20, ENOTEMPTY: 39, ENOTSUP: 95, EPERM: 1,
   };
-  function cpStdError(code, syscall, path) {
-    const err = new Error(`${code}, ${CP_STRERROR[code] ?? code} '${path}'`);
-    err.errno = CP_LINUX_ERRNO[code];
+  // node's ErrnoException sets errno, code, path and then syscall (#360;
+  // measured on Windows and Linux): the order Object.keys shows.
+  function cpErrnoException(errno, code, text, syscall, path) {
+    const err = new Error(`${code}, ${text} '${path}'`);
+    err.errno = errno;
     err.code = code;
-    err.syscall = syscall;
     err.path = path;
+    err.syscall = syscall;
     return err;
+  }
+  function cpStdError(code, syscall, path) {
+    return cpErrnoException(CP_LINUX_ERRNO[code], code, CP_STRERROR[code] ?? code, syscall, path);
   }
   // The std::filesystem failure an fs call's error stands for.
   const cpStdErrorOf = (e, syscall, path) => cpStdError(e && typeof e.code === "string" ? e.code : "EIO", syscall, path);
+  // std::filesystem::create_directories failing for cpSync's destination.
+  // On Windows node reports MSVC's error: the Win32 code as `errno`, the
+  // name the CRT's errno table gives that number as `code` (none for 183,
+  // EIO for 5), and the system's message (measured on v22.22.2, Windows
+  // 11): a file in the way of the directory is ERROR_ALREADY_EXISTS, a
+  // directory that may not be written in ERROR_ACCESS_DENIED. What mkdir
+  // calls ENOENT is ERROR_PATH_NOT_FOUND (a missing drive, a name too
+  // long; a missing drive wins over a bad name below it) or, for a name
+  // with a character Windows does not allow, ERROR_INVALID_NAME. Elsewhere,
+  // and for any other failure, libstdc++'s.
+  const CP_WIN_MKDIR = {
+    ENOTDIR: [183, "", "Cannot create a file when that file already exists."],
+    EACCES: [5, "EIO", "Access is denied."],
+    EPERM: [5, "EIO", "Access is denied."],
+  };
+  const CP_WIN_PATH_NOT_FOUND = [3, "ESRCH", "The system cannot find the path specified."];
+  const CP_WIN_INVALID_NAME = [123, "ENOPROTOOPT", "The filename, directory name, or volume label syntax is incorrect."];
+  function cpWinMkdirNotFound(dest) {
+    const { win32 } = registry.get("path");
+    const full = win32.resolve(dest);
+    const { root } = win32.parse(full);
+    if (!registry.get("fs").existsSync(root)) return CP_WIN_PATH_NOT_FOUND;
+    const names = full.slice(root.length).split(/[\\/]/);
+    return names.some((name) => /[<>:"|?*\x00-\x1f]/.test(name)) ? CP_WIN_INVALID_NAME : CP_WIN_PATH_NOT_FOUND;
+  }
+  function cpStdMkdirError(e, dest, path) {
+    let win;
+    if (process.platform === "win32" && e) {
+      win = e.code === "ENOENT" ? cpWinMkdirNotFound(dest) : CP_WIN_MKDIR[e.code];
+    }
+    if (win) return cpErrnoException(win[0], win[1], win[2], "cp", path);
+    return cpStdErrorOf(e, "cp", path);
+  }
 
   // CpSyncCheckPaths: the checks cpSync makes once, on the paths it was
   // given, and the destination's parent made when it is missing.
@@ -12835,11 +13379,26 @@
     dest = cpString(dest);
     const fs = registry.get("fs");
     const path = registry.get("path");
+    // node's UVException names the path as its binding shows any path: the
+    // namespaced one, with the `\\?\` prefix taken off.
+    const srcFailed = (e) => cpUvError(e, dereference ? "stat" : "lstat", globalThis.__oam.node.fsShownPathOf(src));
+    // On Windows MSVC's std::filesystem stat asks the path's attributes
+    // first (GetFileAttributesExW), as access does: a device refuses it
+    // EINVAL -- NUL too, which stats -- and a share root that is no disk
+    // ENOTSUP. A sharing violation sends it on to a directory search,
+    // which is the stat below.
+    if (process.platform === "win32") {
+      try {
+        fs.accessSync(src);
+      } catch (e) {
+        if (e.code !== "EBUSY") throw srcFailed(e);
+      }
+    }
     let srcStat;
     try {
       srcStat = dereference ? fs.lstatSync(src) : fs.statSync(src);
     } catch (e) {
-      throw cpUvError(e, dereference ? "stat" : "lstat", cpNs(src));
+      throw srcFailed(e);
     }
     let destStat = null;
     try {
@@ -13079,7 +13638,7 @@
     try {
       fs.mkdirSync(dest, { recursive: true });
     } catch (e) {
-      throw cpStdErrorOf(e, "cp", cpNs(dest));
+      throw cpStdMkdirError(e, dest, cpNs(dest));
     }
     const statOrNull = (p, follow) => {
       try {
@@ -13465,7 +14024,7 @@
           return this[kNative];
         };
         const checkAborted = () => {
-          if (signal && signal.aborted) throw new FsAbortError(signal);
+          if (signal && signal.aborted) throw fsAbortError(signal);
         };
         checkAborted();
         const stat = wrapStat(await natives.fsFstat(descriptor()));
@@ -13497,7 +14056,7 @@
       async writeFile(data, options) {
         const fh = this, h = this[kNative];
         options = writeFileOptions(options, false);
-        await writeHandleData(h, writeFileData(data, options, true), options.encoding);
+        await writeHandleData(h, writeFileData(data, options, true), options.encoding, options.signal);
       }
       // NOT an append. node documents FileHandle.appendFile as an ALIAS of
       // writeFile ("the mode cannot be changed from what it was set to
@@ -13661,17 +14220,14 @@
       // warning text carries node's own typo ("steam"), reproduced here so
       // a caller matching on it sees the same bytes.
       //
-      // DIVERGENCE, deliberate, and the only one: node's stream is a BYTE
-      // stream (`type: 'bytes'`, autoAllocateChunkSize 16384), so
-      // `getReader({ mode: 'byob' })` there returns a real
-      // ReadableStreamBYOBReader. oam's web-streams layer (js/streams.js)
-      // is default-reader-only -- a `type: 'bytes'` stream queues bytes
-      // and pulls as node's does, but has no byobRequest -- so this
-      // returns a stream read through a default reader, carrying the same 16 KiB
-      // plain-Uint8Array chunks, at the same boundaries, off the same read
-      // path. Everything reachable through a default reader or async
-      // iteration matches node; a BYOB reader does not. The fix belongs in
-      // js/streams.js's controller, not in a second reader here.
+      // node's stream is a BYTE stream (`type: 'bytes'`,
+      // autoAllocateChunkSize 16384) whose pull reads into
+      // controller.byobRequest.view and answers respond(bytesRead). A BYOB
+      // read does exactly that here (js/streams.js has the byobRequest). A
+      // default read has no byobRequest in oam -- autoAllocateChunkSize is
+      // not implemented -- so it reads a 16 KiB view of its own and enqueues
+      // it: the same plain-Uint8Array chunks, at the same boundaries, off
+      // the same read path.
       readableWebStream(options = undefined) {
         const fh = this, h = this[kNative];
         if (fh[kFd] === -1) throw codes.ERR_INVALID_STATE("The FileHandle is closed");
@@ -13724,7 +14280,25 @@
             // chunk is dropped, exactly as a cancel drops it).
             if (gone()) {
               controller.close();
+              // A BYOB read waiting is done (a closed byte stream answers
+              // a pending one only through respond(0)).
+              controller.byobRequest?.respond(0);
               await ondone();
+              return;
+            }
+            var request = controller.byobRequest;
+            if (request !== null) {
+              // node's pull, as it is: the view's own byteOffset passed as
+              // the offset into the view.
+              var target = request.view;
+              var got = await fh.read(target, target.byteOffset, target.byteLength);
+              if (gone() || got.bytesRead === 0) {
+                controller.close();
+                await ondone();
+                controller.byobRequest?.respond(0);
+                return;
+              }
+              controller.byobRequest.respond(got.bytesRead);
               return;
             }
             var view = new Uint8Array(CHUNK);
@@ -13979,7 +14553,7 @@
       if (encoding && !globalThis.Buffer.isEncoding(encoding)) {
         throw codes.ERR_INVALID_ARG_VALUE(encoding, "encoding", "is invalid encoding");
       }
-      if (signal && signal.aborted) throw new FsAbortError(signal);
+      if (signal && signal.aborted) throw fsAbortError(signal);
       const handle = new FSEvent();
       const queue = [];
       let failure = null;
@@ -13993,7 +14567,7 @@
       };
       const oncancel = () => {
         handle.close();
-        failure = new FsAbortError(signal);
+        failure = fsAbortError(signal);
         settle();
       };
       try {
@@ -14031,7 +14605,7 @@
           if (failure !== null) throw failure;
           while (queue.length) yield queue.shift();
         }
-        throw new FsAbortError(signal);
+        throw fsAbortError(signal);
       } finally {
         handle.close();
         if (signal) signal.removeEventListener("abort", oncancel);
@@ -14058,7 +14632,7 @@
         const chunks = [];
         for (;;) {
           // node looks at the signal again between reads.
-          if (signal && signal.aborted) throw new FsAbortError(signal);
+          if (signal && signal.aborted) throw fsAbortError(signal);
           const chunk = await natives.fsReadChunk(handle, 65536);
           if (chunk === undefined) break;
           chunks.push(chunk);
@@ -14071,13 +14645,18 @@
     };
     // node's writeFileHandle (lib/internal/fs/promises.js, v22.22.2): a view
     // in one write -- none at all for an empty one -- or each chunk of an
-    // iterable in turn, a string chunk in the call's encoding.
-    async function writeHandleData(h, data, encoding) {
+    // iterable in turn, a string chunk in the call's encoding. The call's
+    // signal is looked at first and before every chunk, as node's
+    // checkAborted does; a writeFile given an aborted signal wrote the file
+    // anyway (#401).
+    async function writeHandleData(h, data, encoding, signal) {
+      if (signal && signal.aborted) throw fsAbortError(signal);
       if (!isCustomIterable(data)) {
         if (data.byteLength !== 0) await natives.fsWriteChunk(h, data);
         return;
       }
       for await (const chunk of data) {
+        if (signal && signal.aborted) throw fsAbortError(signal);
         const bytes = ArrayBuffer.isView(chunk) ? chunk : globalThis.Buffer.from(chunk, encoding || "utf8");
         if (bytes.byteLength !== 0) await natives.fsWriteChunk(h, bytes);
       }
@@ -14094,6 +14673,9 @@
     const writeFileAt = (path, data, options, append) => {
       data = writeFileData(data, options, true);
       if (fileHandles.has(path)) return path.writeFile(data, options);
+      // node's checkAborted, before the path is opened (and so before the
+      // file is created or emptied).
+      if (options.signal && options.signal.aborted) return Promise.reject(fsAbortError(options.signal));
       const file = toPath(path);
       const flag = openFlags(options.flag || (append ? "a" : "w"), natives);
       const mode = parseFileMode(options.mode, "mode", 0o666);
@@ -14103,7 +14685,7 @@
       return (async () => {
         const { handle } = await natives.fsOpen(file, flag, mode);
         try {
-          await writeHandleData(handle, data, options.encoding);
+          await writeHandleData(handle, data, options.encoding, options.signal);
         } finally {
           natives.fsClose(handle);
         }
@@ -14118,7 +14700,7 @@
       readFile: (path, options) => {
         const opts = fsGetOptions(options, {});
         if (fileHandles.has(path)) return readFileOfHandle(path, options);
-        if (opts.signal && opts.signal.aborted) return Promise.reject(new FsAbortError(opts.signal));
+        if (opts.signal && opts.signal.aborted) return Promise.reject(fsAbortError(opts.signal));
         return readFileAt(toPath(path), opts, true);
       },
       writeFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, false), false),
@@ -14395,35 +14977,61 @@
       return toPath(typeof path === "string" || isUrl ? path : path + "");
     }
 
-    function realpathWalkErrorSync(path, original) {
+    // realpathWalk run synchronously: its answer, or null; a failing lstat /
+    // readlink throws its own error.
+    function realpathWalkSync(path) {
       const walk = realpathWalk(path);
       let step = walk.next();
-      try {
-        while (!step.done) {
-          const [op, at] = step.value;
-          step = walk.next(
-            op === "readlink"
-              ? natives.fsReadlinkSync(at)
-              : natives.fsStatSync(at, op === "lstat", true, statSyncValues),
-          );
-        }
-      } catch (e) {
-        return e;
+      while (!step.done) {
+        const [op, at] = step.value;
+        step = walk.next(
+          op === "readlink"
+            ? natives.fsReadlinkSync(at)
+            : natives.fsStatSync(at, op === "lstat", true, statSyncValues),
+        );
       }
-      return original;
+      return step.value;
     }
 
+    // As realpathWalkSync, each step off the loop thread.
+    async function realpathWalkAsync(path) {
+      const walk = realpathWalk(path);
+      let step = walk.next();
+      while (!step.done) {
+        const [op, at] = step.value;
+        step = walk.next(op === "readlink" ? await natives.fsReadlink(at) : await natives.fsStat(at, op === "lstat"));
+      }
+      return step.value;
+    }
+
+    // node's realpathSync: on Windows a device-namespace path is the walk's
+    // (realpathWalksFirst); any other is the OS's answer, and when the OS
+    // refuses it the walk finds node's error. A walk that completes leaves
+    // the OS's error standing: oam's lstat succeeds where node's fails (the
+    // paging file, EPERM in node), so the walked path is not node's answer.
+    function realpathWalkingSync(path) {
+      if (realpathWalksFirst(path)) {
+        const walked = realpathWalkSync(path);
+        if (walked !== null) return walked;
+      }
+      try {
+        return realpathJsShape(natives.fsRealpathSync(path));
+      } catch (original) {
+        realpathWalkSync(path);
+        throw original;
+      }
+    }
+
+    // node's callback realpath, as realpathWalkingSync.
     async function realpathWalking(path) {
+      if (realpathWalksFirst(path)) {
+        const walked = await realpathWalkAsync(path);
+        if (walked !== null) return walked;
+      }
       try {
         return realpathJsShape(await natives.fsRealpath(path));
       } catch (original) {
-        // A failing lstat / readlink rejects with its own error.
-        const walk = realpathWalk(path);
-        let step = walk.next();
-        while (!step.done) {
-          const [op, at] = step.value;
-          step = walk.next(op === "readlink" ? await natives.fsReadlink(at) : await natives.fsStat(at, op === "lstat"));
-        }
+        await realpathWalkAsync(path);
         throw original;
       }
     }
@@ -14621,6 +15229,13 @@
         validateCb(cb);
         options = writeFileOptions(options, append);
         const bytes = writeFileData(data, options, false);
+        // An aborted signal ends the call before anything is opened or
+        // written, with the callback run synchronously -- node's
+        // checkAborted for a path, its writeAll for a descriptor (lib/fs.js,
+        // v22.22.2). The signal was not looked at, and the data was written
+        // (#401).
+        const signal = options.signal;
+        if (signal && signal.aborted) return void cb(fsAbortError(signal));
         if (!isInt32(path) && bytes.byteLength === 0) {
           // Nothing to write is still one write: node's writeAll issues it
           // before it looks at what is left, so the descriptor answers --
@@ -15085,14 +15700,7 @@
       accessSync: (path, mode) => natives.fsAccessSync(toPath(path), mode ?? 0),
       // node's realpathSync stringifies rather than type-checks (`p += ''`),
       // and on failure reports what its component walk hit (realpathWalk).
-      realpathSync: (path) => {
-        const file = realpathArg(path);
-        try {
-          return realpathJsShape(natives.fsRealpathSync(file));
-        } catch (e) {
-          throw realpathWalkErrorSync(file, e);
-        }
-      },
+      realpathSync: (path) => realpathWalkingSync(realpathArg(path)),
       mkdtempSync: (prefix, options) => {
         const [valid, encoding] = mkdtempArgs(prefix, options);
         return mkdtempResult(natives.fsMkdtempSync(valid), encoding);
@@ -15216,7 +15824,7 @@
         validateCb(cb);
         const opts = fsGetOptions(options, {});
         if (!isInt32(path)) {
-          if (opts.signal && opts.signal.aborted) return void cb(new FsAbortError(opts.signal));
+          if (opts.signal && opts.signal.aborted) return void cb(fsAbortError(opts.signal));
           if (typeof opts.flag === "number") validateInt32(opts.flag, "options.flag");
           else if (opts.flag !== undefined) openFlags(opts.flag, natives);
           return readFileByPath(path, opts, cb);
@@ -15760,6 +16368,9 @@
     // the callback. Routing both through the callback meant a try/catch around
     // fs.readv silently stopped firing. node's order is descriptor (its JS
     // check, see validateFd), buffers, callback.
+    // fs.write as this factory made it: node's writev is its own call, so a
+    // function assigned over fs.write is not called by fs.writev (#356).
+    const ownWrite = fs.write;
     fs.writev = function (fd, buffers, position, cb) {
       validateFd(fd, false);
       const total = asViewArray(buffers);
@@ -15767,7 +16378,7 @@
       validateCb(cb);
       if (emptyList(buffers)) { process.nextTick(() => cb(null, 0, buffers)); return; }
       // Reuses fs.write, so the position handling lives in exactly one place.
-      fs.write(fd, flattenViews(buffers, total), 0, total, fsPositionArg(position), (err, written) =>
+      ownWrite(fd, flattenViews(buffers, total), 0, total, fsPositionArg(position), (err, written) =>
         err ? cb(err, 0, buffers) : cb(null, written, buffers),
       );
     };
@@ -15795,67 +16406,156 @@
 
     // ---- openAsBlob
     //
-    // Shapes measured against node v22.22.2 rather than inferred:
-    //   - `options.type` is coerced with `|| ''` BEFORE the string check, so
+    // node's openAsBlob (lib/fs.js + src/node_blob.cc, v22.22.2), measured:
+    //   - everything happens at the call, so every failure THROWS there
+    //     rather than rejecting the promise it returns: the options are
+    //     validated (an object: not null, an array or a function), then
+    //     `options.type` -- coerced with `|| ''` BEFORE the string check, so
     //     {type: 0 | false | null | NaN | undefined} all yield "" and only a
-    //     truthy non-string (e.g. 123) throws ERR_INVALID_ARG_TYPE. node's own
-    //     source is `const type = options.type || ''; validateString(...)`.
-    //   - an unreadable path does NOT surface the fs error. node throws a
-    //     TypeError with code ERR_INVALID_ARG_VALUE, message "Unable to open
-    //     file as blob", and `code` as its ONLY own property -- no errno, no
-    //     syscall, no path.
-    //   - the arguments are checked SYNCHRONOUSLY -- node's openAsBlob is a
-    //     plain function returning a promise, so a bad type or path throws
-    //     at the call.
-    fs.openAsBlob = (p, options) => {
-      const type = (options && options.type) || "";
+    //     truthy non-string throws -- then the path, then the file is opened
+    //     and fstat'ed (and closed again).
+    //   - a path it cannot open does NOT surface the fs error: a TypeError
+    //     with code ERR_INVALID_ARG_VALUE, message "Unable to open file as
+    //     blob", and `code` as its ONLY own property -- no errno, no syscall,
+    //     no path. Except a --permission denial, which keeps its own
+    //     ERR_ACCESS_DENIED.
+    //   - the Blob is file-backed: nothing is read at the call. Each read
+    //     opens the file again, and every chunk read (64 KiB) is preceded by
+    //     an fstat that must give the size, and the NANOSECOND part of the
+    //     mtime, the open's fstat gave -- that is node's FdEntry
+    //     CheckModified, which compares st_size and st_mtim.tv_nsec only --
+    //     or the read fails NotReadableError. A directory (#335) is the same
+    //     model: its open and fstat succeed, so a Blob of the size the fstat
+    //     says is made (0 on Windows, the directory's own size on Linux and
+    //     macOS), a non-empty one fails as reading a directory does, and a
+    //     changed one fails the check. The NUL device is a Blob of no bytes.
+    //   - the type is the given string, not normalized.
+    fs.openAsBlob = (p, options = {}) => {
+      if (options === null || typeof options !== "object" || Array.isArray(options)) {
+        throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+      }
+      const type = options.type || "";
       if (typeof type !== "string") {
         throw codes.ERR_INVALID_ARG_TYPE("options.type", "string", type);
       }
-      return openAsBlobPath(toPath(p), type);
+      const file = toPath(p);
+      return Promise.resolve(openAsBlobPath(file, type));
     };
-    // What node's openAsBlob gives for a directory (#335): its open and fstat
-    // succeed, so the Blob is made, with the size the fstat says -- 0 on
-    // Windows, the directory's own size on Linux and macOS -- and reading a
-    // non-empty one fails NotReadableError, as reading a directory does. The
-    // Blob class carries that state (`_unreadableSize`), so a Blob, a body or
-    // a form made with this one as a part fails the same way. A size of 0
-    // has nothing to read, so on Windows it reads as empty.
-    const directoryBlob = (size, type) => {
-      const blob = new Blob([], { type });
-      if (size > 0) blob._unreadableSize = size;
-      return markFileBacked(blob);
+    const unableToOpenAsBlob = () => {
+      const err = new TypeError("Unable to open file as blob");
+      err.code = "ERR_INVALID_ARG_VALUE";
+      return err;
     };
-    const markFileBacked = (blob) => {
-      // node returns an instance of an INTERNAL TransferableBlob subclass and
-      // plants an own `constructor` back-pointing at Blob so the subclass does
-      // not leak through `b.constructor.name`. Measured descriptor:
-      // {value: Blob, writable: true, enumerable: true, configurable: true} --
-      // enumerable, so `Object.keys(blob)` is ["constructor"], which a
-      // structural comparison would otherwise see as a difference. A plain
-      // assignment produces exactly that descriptor.
-      blob.constructor = Blob;
-      // Marks it un-structuredClone-able, which node's file-backed blob is.
-      // A registered symbol so bootstrap.js's cloner can see it across scopes,
-      // and a symbol key so it stays out of Object.keys.
+    const openAsBlobPath = (file, type) => {
+      const flags = openFlags("r", natives);
+      let fd;
+      try {
+        fd = natives.fsOpenSync(file, flags, 0o666);
+      } catch (e) {
+        if (e && e.code === "ERR_ACCESS_DENIED") throw e;
+        // Deliberately swallowing the underlying error: node reports none of
+        // it, and leaking ENOENT here would be a divergence, not a courtesy.
+        throw unableToOpenAsBlob();
+      }
+      let size;
+      let reference;
+      try {
+        natives.fsFstatSync(fd, statSyncValues);
+        size = statSyncValues[STAT_SIZE];
+        reference = blobFileReference(statSyncExact);
+      } catch {
+        throw unableToOpenAsBlob();
+      } finally {
+        natives.fsCloseSync(fd);
+      }
+      const blob = globalThis.Blob[Symbol.for("oam.blob.fromFile")](blobFile(file, flags, reference), size, type);
+      // Marks it un-structuredClone-able, which node's file-backed blob is
+      // (the one openAsBlob returns; a slice of it, or a Blob made of it,
+      // clones). A registered symbol so bootstrap.js's cloner can see it
+      // across scopes, and a symbol key so it stays out of Object.keys (which
+      // is ["constructor"], as node's createBlob makes it).
       blob[Symbol.for("oam.blob.fileBacked")] = true;
       return blob;
     };
-    const openAsBlobPath = async (file, type) => {
-      let bytes;
-      try {
-        const raw = await natives.fsStat(file, false);
-        if (statKind(raw) === "dir") return directoryBlob(Number(raw[STAT_SIZE]), type);
-        bytes = await natives.fsReadFile(file);
-      } catch {
-        // Deliberately swallowing the underlying error: node reports none of
-        // it, and leaking ENOENT here would be a divergence, not a courtesy.
-        const err = new TypeError("Unable to open file as blob");
-        err.code = "ERR_INVALID_ARG_VALUE";
-        throw err;
-      }
-      return markFileBacked(new Blob([bytes], { type }));
+    // What a later fstat must match: the size and the mtime's nanoseconds.
+    const blobFileReference = (exact) => ({ size: exact[8], mtimeNsec: exact[13] });
+    const blobFileUnchanged = (record, reference) => {
+      const exact = statExactValues(record);
+      return exact[8] === reference.size && exact[13] === reference.mtimeNsec;
     };
+    // A descriptor a reader still held when it was dropped unfinished (a
+    // stream nobody read to the end) is closed when the reader is collected.
+    // Made on first use, so a context that never reads one has none.
+    let blobFileFinalizerRegistry;
+    const blobFileFinalizer = () =>
+      (blobFileFinalizerRegistry ??= new FinalizationRegistry((held) => {
+        if (held.fd !== undefined) natives.fsClose(held.fd);
+      }));
+    // The file part's source (bootstrap.js's Blob): open(start, end) gives a
+    // reader of [start, end) whose pull(cb) calls back cb(1, chunk), cb(0) at
+    // the end or cb(-1) on any failure, as node's FdEntry reader does.
+    const blobFile = (file, flags, reference) => ({
+      open(start, end) {
+        const held = { fd: undefined };
+        let position = start;
+        let done = false;
+        const finish = () => {
+          done = true;
+          if (held.fd !== undefined) {
+            natives.fsClose(held.fd);
+            held.fd = undefined;
+          }
+          blobFileFinalizer().unregister(held);
+        };
+        const step = async () => {
+          if (held.fd === undefined) {
+            const info = await natives.fsOpen(file, flags, 0o666);
+            // A cancel that landed while the open was in flight found no fd
+            // to close: close this one here, or it stays open until GC.
+            if (done) {
+              natives.fsClose(info.handle);
+              return 0;
+            }
+            held.fd = info.handle;
+            blobFileFinalizer().register(reader, held, held);
+          }
+          if (!blobFileUnchanged(await natives.fsFstat(held.fd), reference)) return -1;
+          if (position >= end) return 0;
+          const chunk = await natives.fsReadChunk(held.fd, Math.min(65536, end - position), position);
+          if (chunk === undefined || chunk.length === 0) return 0;
+          position += chunk.length;
+          return chunk;
+        };
+        const reader = {
+          pull(cb) {
+            if (done) {
+              cb(-1);
+              return;
+            }
+            step().then(
+              (result) => {
+                if (done) return;
+                if (result === 0 || result === -1) {
+                  finish();
+                  cb(result);
+                } else {
+                  cb(1, result);
+                }
+              },
+              () => {
+                if (done) return;
+                finish();
+                cb(-1);
+              },
+            );
+          },
+          cancel() {
+            finish();
+          },
+        };
+        return reader;
+      },
+    });
 
     // The `.native` forms are the OS realpath: node type-checks their path
     // (getValidatedPath) and reports `realpath` with the whole path.
@@ -15887,6 +16587,14 @@
         enumerable: true,
       });
     }
+    fsStreamOriginals = {
+      open: fs.open,
+      read: fs.read,
+      write: fs.write,
+      writev: fs.writev,
+      fsync: fs.fsync,
+      close: fs.close,
+    };
     return fs;
   };
 
@@ -15980,17 +16688,6 @@
     // (via the __oamDispatchUncaught global).
     const dispatchUncaught = (err, origin) => {
       origin = origin || "uncaughtException";
-      // A throw that already escaped a handler INSIDE this ladder (marked
-      // below) must not re-enter it: Node treats a throwing
-      // uncaughtException/monitor handler as immediately fatal, exit 7 --
-      // never re-emitting the monitor or re-invoking listeners.
-      if (
-        err !== null && (typeof err === "object" || typeof err === "function") &&
-        err.__oamHandlerThrow
-      ) {
-        process.__oamFatalCode = 7;
-        return false;
-      }
       // Node's TriggerUncaughtException refuses to run when
       // process._fatalException was monkeypatched to a non-function:
       // exit code 6 (kInvalidFatalExceptionMonkeyPatching). oam's ladder
@@ -16001,6 +16698,13 @@
         process.__oamFatalCode = 6;
         return false;
       }
+      // A listener in the ladder that throws is fatal, exit 7
+      // (kExceptionInFatalExceptionHandler), and the report names ITS throw:
+      // so try/finally and no catch -- V8 rethrows from a finally keeping the
+      // original Message, where a catch-and-rethrow would point the report at
+      // this file (#399 item 5). `settled` is set on every way out that
+      // returns.
+      let settled = false;
       try {
         // Monitor first, ALWAYS -- including for domain-handled errors
         // (probe-verified: node emits uncaughtExceptionMonitor before the
@@ -16021,6 +16725,7 @@
             if (typeof registry._domainUncaughtClear === "function") {
               registry._domainUncaughtClear();
             }
+            settled = true;
             return true;
           } catch (e2) {
             if (e2 !== err) throw e2; // domain 'error' listener threw: fatal
@@ -16039,26 +16744,18 @@
         }
         if (process._uncaughtCaptureCb) {
           process._uncaughtCaptureCb(err);
+          settled = true;
           return true;
         }
         if (process.listenerCount("uncaughtException") > 0) {
           process.emit("uncaughtException", err, origin);
+          settled = true;
           return true;
         }
+        settled = true;
         return false;
-      } catch (e2) {
-        // A handler inside the ladder threw. Mark the escaping error so a
-        // ledger re-dispatch recognizes it as handler-throw (fatal 7)
-        // instead of re-running the ladder. Primitive throws can't carry
-        // the mark -- they take the legacy re-dispatch path.
-        if (e2 !== null && (typeof e2 === "object" || typeof e2 === "function")) {
-          try {
-            Object.defineProperty(e2, "__oamHandlerThrow", {
-              value: true, writable: false, configurable: false, enumerable: false,
-            });
-          } catch { /* frozen -- best effort */ }
-        }
-        throw e2;
+      } finally {
+        if (!settled) process.__oamFatalCode = 7;
       }
     };
     Object.defineProperty(globalThis, "__oamDispatchUncaught", {
@@ -16189,16 +16886,20 @@
     // It prints whatever Error the event carries -- one emitted directly
     // too, not only through emitWarning -- and nothing that is not one.
     //
-    // Not here: node's one-time hint naming `--trace-warnings` /
-    // `--trace-deprecation`. oam has neither flag, so there is nothing true
-    // for the hint to say (docs/node-divergences.md).
+    // Under --trace-warnings (process.traceProcessWarnings), or
+    // --trace-deprecation (process.traceDeprecation) for a deprecation, it
+    // prints the warning's stack in place of its toString(). Otherwise the
+    // first warning it prints carries node's one-time hint naming the flag
+    // for its kind, after the program's name: basename(process.argv0), which
+    // is `oam` for oam. Once per thread, as node's module-level flag is.
+    let traceWarningHelperShown = false;
     function onWarning(warning) {
       if (!(warning instanceof Error)) return;
       const isDeprecation = warning.name === "DeprecationWarning";
       if (isDeprecation && process.noDeprecation) return;
-      // --no-warnings takes the listener off at startup (the CLI's prelude,
-      // which a worker inherits); the check is for whatever still holds a
-      // reference to this function and calls it.
+      // --no-warnings takes the listener off at startup (the CLI's prelude;
+      // a worker's own, decided by its execArgv and env, #370); the check is
+      // for whatever still holds a reference to this function and calls it.
       if (globalThis.__oamNoWarnings) return;
       if (globalThis.__oamNoDeprecation && isDeprecation) return;
       // --disable-warning=<name|code>: still emitted, not printed.
@@ -16212,12 +16913,23 @@
       // The (node:PID) prefix is node's own (`process.release.name`), kept
       // so tooling that greps warnings still finds them. A warning whose
       // toString is not a function is printed as an Error prints.
+      const trace = process.traceProcessWarnings || (isDeprecation && process.traceDeprecation);
       let line = `(node:${process.pid}) `;
       if (warning.code) line += `[${warning.code}] `;
-      line += typeof warning.toString === "function"
-        ? `${warning.toString()}`
-        : Error.prototype.toString.call(warning);
+      if (trace && warning.stack) {
+        line += `${warning.stack}`;
+      } else {
+        line += typeof warning.toString === "function"
+          ? `${warning.toString()}`
+          : Error.prototype.toString.call(warning);
+      }
       if (typeof warning.detail === "string") line += `\n${warning.detail}`;
+      if (!trace && !traceWarningHelperShown) {
+        const flag = isDeprecation ? "--trace-deprecation" : "--trace-warnings";
+        const argv0 = registry.get("path").basename(process.argv0 || "node", ".exe");
+        line += `\n(Use \`${argv0} ${flag} ...\` to show where the warning was created)`;
+        traceWarningHelperShown = true;
+      }
       line += "\n";
       // NODE_REDIRECT_WARNINGS: append the formatted warning to the named
       // file instead of stderr. Read from natives.env() (the real OS
@@ -16821,6 +17533,10 @@
         if (typeof fn !== "function") {
           throw new codes.ERR_INVALID_ARG_TYPE("callback", "Function", fn);
         }
+        // node's nextTick enqueues nothing once the process is exiting: the
+        // callback would never get to run. So a warning emitted from an
+        // 'exit' listener (delivered on a tick) is never printed (#366).
+        if (process._exiting) return;
         // Capture the ALS frame as DATA. Wrapping the callback in a binder
         // closure (the old shape) put an extra "at Array.<anonymous>" frame
         // between the user's frame and the drain -- Node has no such frame,
@@ -16978,7 +17694,7 @@
         // 'test' / 'sea' / 'sqlite' / 'test/reporters' are undefined
         // (probe-verified against v22.22.2).
         if (!prefixed && PREFIX_ONLY_BUILTINS.has(bare)) return undefined;
-        if (registry.factories[bare]) return registry.get(bare);
+        if (registry.factories[bare]) return registry.get(bare, "getBuiltinModule");
         return undefined;
       },
       _rawDebug(...args) {
@@ -17011,77 +17727,61 @@
         }
         if (!condition) throw new codes.ERR_ASSERTION(message);
       },
-      emitWarning(warning, typeOrOptions, codeArg, ctorArg) {
-        // Normalize the (warning, type, code, ctor) / (warning, options)
-        // overloads the way Node does.
-        let type = "Warning";
-        let code;
-        let ctor;
+      emitWarning(warning, type, code, ctor) {
+        // The (warning, type, code, ctor) / (warning, ctor) / (warning,
+        // options) overloads, as node's emitWarning reads them
+        // (lib/internal/process/warning.js, v22.22.2): the options form takes
+        // `options.type || 'Warning'`, so an empty or falsy type is Warning,
+        // and the type and code are validated under the ARGUMENT's name in
+        // every form, before the warning itself is looked at.
         let detail;
-        if (typeOrOptions !== null && typeof typeOrOptions === "object" && !Array.isArray(typeOrOptions)) {
-          // options form
-          if (typeOrOptions.type !== undefined) {
-            if (typeof typeOrOptions.type !== "string") {
-              throw new codes.ERR_INVALID_ARG_TYPE("options.type", "string", typeOrOptions.type);
-            }
-            type = typeOrOptions.type;
-          }
-          if (typeOrOptions.code !== undefined) {
-            if (typeof typeOrOptions.code !== "string") {
-              throw new codes.ERR_INVALID_ARG_TYPE("options.code", "string", typeOrOptions.code);
-            }
-            code = typeOrOptions.code;
-          }
-          if (typeof typeOrOptions.ctor === "function") ctor = typeOrOptions.ctor;
-          if (typeof typeOrOptions.detail === "string") detail = typeOrOptions.detail;
-        } else if (typeof typeOrOptions === "function") {
-          // emitWarning(msg, ctor): a FUNCTION in the type position is the
-          // constructor used to trim the stack, not a type name. Node
-          // shifts it and leaves type at 'Warning'; oam used to throw
-          // ERR_INVALID_ARG_TYPE and reject a documented call form.
-          ctor = typeOrOptions;
-        } else {
-          if (typeOrOptions !== undefined) {
-            if (typeof typeOrOptions !== "string") {
-              throw new codes.ERR_INVALID_ARG_TYPE("type", "string", typeOrOptions);
-            }
-            type = typeOrOptions;
-          }
-          if (typeof codeArg === "function") {
-            ctor = codeArg;
-          } else if (codeArg !== undefined) {
-            if (typeof codeArg !== "string") {
-              throw new codes.ERR_INVALID_ARG_TYPE("code", "string", codeArg);
-            }
-            code = codeArg;
-          }
-          if (typeof ctorArg === "function") ctor = ctorArg;
+        if (type !== null && typeof type === "object" && !Array.isArray(type)) {
+          ctor = type.ctor;
+          code = type.code;
+          if (typeof type.detail === "string") detail = type.detail;
+          type = type.type || "Warning";
+        } else if (typeof type === "function") {
+          // emitWarning(msg, ctor): the constructor that trims the stack.
+          ctor = type;
+          code = undefined;
+          type = "Warning";
+        }
+        if (type !== undefined && typeof type !== "string") {
+          throw new codes.ERR_INVALID_ARG_TYPE("type", "string", type);
+        }
+        if (typeof code === "function") {
+          ctor = code;
+          code = undefined;
+        } else if (code !== undefined && typeof code !== "string") {
+          throw new codes.ERR_INVALID_ARG_TYPE("code", "string", code);
         }
 
         let warningObj;
-        if (warning instanceof Error) {
-          warningObj = warning;
-        } else if (typeof warning === "string") {
+        if (typeof warning === "string") {
+          // createWarningObject: a positional empty type is Warning too.
           warningObj = new Error(warning);
-          warningObj.name = String(type);
+          warningObj.name = String(type || "Warning");
           if (code !== undefined) warningObj.code = code;
           if (detail !== undefined) warningObj.detail = detail;
           if (typeof Error.captureStackTrace === "function") {
             Error.captureStackTrace(warningObj, ctor || process.emitWarning);
           }
+        } else if (warning instanceof Error) {
+          warningObj = warning;
         } else {
           throw new codes.ERR_INVALID_ARG_TYPE("warning", ["Error", "string"], warning);
         }
 
+        // noDeprecation first: a dropped deprecation is not thrown either.
         // throwDeprecation: a DeprecationWarning surfaces as an async throw
         // (uncaughtException), NOT a synchronous throw from emitWarning --
         // test-process-warning asserts the call site does not throw.
         if (warningObj.name === "DeprecationWarning") {
+          if (process.noDeprecation) return;
           if (process.throwDeprecation) {
             process.nextTick(() => { throw warningObj; });
             return;
           }
-          if (process.noDeprecation) return;
         }
 
         // Deferred, as node's is, so a listener attached after the call
@@ -17805,6 +18505,7 @@
       "_tls_common",
       "_tls_wrap",
       "string_decoder",
+      "sys",
       "timers",
       "timers/promises",
       "tls",
@@ -17905,6 +18606,10 @@
       natives.compileCacheFlush();
     }
 
+    // Module._cache is require.cache: one object, so a program that deletes
+    // or plants an entry through either name is seen by every require().
+    Module._cache = natives.requireCache();
+
     return {
       createRequire(filename) {
         let base = String(filename);
@@ -17924,6 +18629,9 @@
       flushCompileCache,
       getCompileCacheDir,
       Module,
+      // node's require('module') is Module itself, so _cache is reachable
+      // from both names.
+      _cache: Module._cache,
     };
   };
 
@@ -20206,12 +20914,34 @@
     }
 
     function createHash(algorithm) {
-      return new Hash(natives.cryptoHashCreate(String(algorithm)));
+      if (typeof algorithm !== "string") {
+        throw new codes.ERR_INVALID_ARG_TYPE("algorithm", "string", algorithm);
+      }
+      return new Hash(natives.cryptoHashCreate(algorithm));
     }
 
     function createHmac(algorithm, key) {
-      return new Hmac(natives.cryptoHmacCreate(String(algorithm), toBytes(key)));
+      if (typeof algorithm !== "string") {
+        throw new codes.ERR_INVALID_ARG_TYPE("hmac", "string", algorithm);
+      }
+      return new Hmac(natives.cryptoHmacCreate(algorithm, toBytes(key)));
     }
+
+    // node's crypto.Hash / crypto.Hmac: constructors that work with or
+    // without `new`, deprecated as constructors (DEP0179 / DEP0181) and
+    // exported behind util.deprecate, so `createHash(...) instanceof
+    // crypto.Hash` holds. Each builds what createHash / createHmac build.
+    function PublicHash(algorithm, options) {
+      return createHash(algorithm, options);
+    }
+    PublicHash.prototype = Hash.prototype;
+    function PublicHmac(hmac, key, options) {
+      return createHmac(hmac, key, options);
+    }
+    PublicHmac.prototype = Hmac.prototype;
+    const utilDeprecate = registry.get("util").deprecate;
+    const DeprecatedHash = utilDeprecate(PublicHash, "crypto.Hash constructor is deprecated.", "DEP0179");
+    const DeprecatedHmac = utilDeprecate(PublicHmac, "crypto.Hmac constructor is deprecated.", "DEP0181");
 
     function randomBytes(size, callback) {
       // Chunked: the native caps one call at 64KiB.
@@ -21323,6 +22053,8 @@
       },
       createHash,
       createHmac,
+      Hash: DeprecatedHash,
+      Hmac: DeprecatedHmac,
       randomBytes,
       pseudoRandomBytes: randomBytes,
       rng: randomBytes,
@@ -22204,7 +22936,627 @@
       BrotliCompress, BrotliDecompress,
     });
 
-    return {
+    // ---- zstd: node v22.22.2's lib/zlib.js, ported --------------------------
+    // Unlike the classes above, zstd is node's own JavaScript run over a
+    // binding of node's shape (oam_core/src/zstd.rs): ZlibBase, the Zstd
+    // classes, processChunkSync / processChunk / processCallback and the
+    // convenience wrappers, with a handle whose write() is ONE libzstd call
+    // into the output window it is given. node's observable zstd behaviour
+    // is mostly that loop's -- a one-shot decompress stops after the first
+    // frame (the library returns at a frame's end and the loop only calls
+    // again when the window filled), a stream whose end() was queued behind
+    // a write finishes with an extra empty frame, a frame split across writes
+    // decodes, one followed by more input in the same write ends the stream
+    // -- so the loop is node's, line for line, rather than re-derived.
+    const ZSTD_COMPRESS = 10;
+    const ZSTD_DECOMPRESS = 11;
+    const ZSTD_e_continue = 0;
+    const ZSTD_e_flush = 1;
+    const ZSTD_e_end = 2;
+    // node's zlib.constants, zstd part, in node's order. The ZSTD_c_* and
+    // ZSTD_d_* keys also size the params arrays below (kMaxZstdCParam,
+    // kMaxZstdDParam), as node's are sized from its constants.
+    const ZSTD_CONSTANTS = {
+      ZSTD_DECOMPRESS, ZSTD_COMPRESS,
+      ZSTD_e_continue, ZSTD_e_flush, ZSTD_e_end,
+      ZSTD_fast: 1, ZSTD_dfast: 2, ZSTD_greedy: 3, ZSTD_lazy: 4, ZSTD_lazy2: 5,
+      ZSTD_btlazy2: 6, ZSTD_btopt: 7, ZSTD_btultra: 8, ZSTD_btultra2: 9,
+      ZSTD_c_compressionLevel: 100, ZSTD_c_windowLog: 101, ZSTD_c_hashLog: 102,
+      ZSTD_c_chainLog: 103, ZSTD_c_searchLog: 104, ZSTD_c_minMatch: 105,
+      ZSTD_c_targetLength: 106, ZSTD_c_strategy: 107,
+      ZSTD_c_enableLongDistanceMatching: 160, ZSTD_c_ldmHashLog: 161,
+      ZSTD_c_ldmMinMatch: 162, ZSTD_c_ldmBucketSizeLog: 163, ZSTD_c_ldmHashRateLog: 164,
+      ZSTD_c_contentSizeFlag: 200, ZSTD_c_checksumFlag: 201, ZSTD_c_dictIDFlag: 202,
+      ZSTD_c_nbWorkers: 400, ZSTD_c_jobSize: 401, ZSTD_c_overlapLog: 402,
+      ZSTD_d_windowLogMax: 100,
+      ZSTD_CLEVEL_DEFAULT: 3,
+      ZSTD_error_no_error: 0, ZSTD_error_GENERIC: 1, ZSTD_error_prefix_unknown: 10,
+      ZSTD_error_version_unsupported: 12, ZSTD_error_frameParameter_unsupported: 14,
+      ZSTD_error_frameParameter_windowTooLarge: 16, ZSTD_error_corruption_detected: 20,
+      ZSTD_error_checksum_wrong: 22, ZSTD_error_literals_headerWrong: 24,
+      ZSTD_error_dictionary_corrupted: 30, ZSTD_error_dictionary_wrong: 32,
+      ZSTD_error_dictionaryCreation_failed: 34, ZSTD_error_parameter_unsupported: 40,
+      ZSTD_error_parameter_combination_unsupported: 41, ZSTD_error_parameter_outOfBound: 42,
+      ZSTD_error_tableLog_tooLarge: 44, ZSTD_error_maxSymbolValue_tooLarge: 46,
+      ZSTD_error_maxSymbolValue_tooSmall: 48, ZSTD_error_stabilityCondition_notRespected: 50,
+      ZSTD_error_stage_wrong: 60, ZSTD_error_init_missing: 62,
+      ZSTD_error_memory_allocation: 64, ZSTD_error_workSpace_tooSmall: 66,
+      ZSTD_error_dstSize_tooSmall: 70, ZSTD_error_srcSize_wrong: 72,
+      ZSTD_error_dstBuffer_null: 74, ZSTD_error_noForwardProgress_destFull: 80,
+      ZSTD_error_noForwardProgress_inputEmpty: 82,
+    };
+
+    // internal/async_hooks owner_symbol: handle -> its stream.
+    const kOwner = Symbol("owner_symbol");
+    const kFlushFlag = Symbol("kFlushFlag");
+    const kError = Symbol("kError");
+    const isUint8ArrayValue = (value) => value instanceof Uint8Array;
+
+    // A native libzstd context is not memory V8 sees, so a zstd stream that
+    // is dropped without close() (or whose constructor throws after init,
+    // or a one-shot call whose argument fails validation) would keep it for
+    // the life of the process; node's GC frees its handle. The registry frees
+    // it when the handle object is collected; close() unregisters.
+    const zstdContexts = typeof FinalizationRegistry === "function"
+      ? new FinalizationRegistry((id) => natives.zlibStreamClose(id))
+      : null;
+
+    // node's binding classes ZstdCompress / ZstdDecompress (what a stream's
+    // `_handle` is), over the natives. write() and writeSync() take node's
+    // arguments and report through the write-state array as node's do; a
+    // codec failure goes to `onerror(message, errno, code)`.
+    const zstdHandleClass = (name, compress) => {
+      const Handle = class {
+        constructor() {
+          this._id = null;
+          this._writing = false;
+          this._pendingClose = false;
+          // The chunk the native handle holds a copy of, and the inOff and
+          // inLen a call that reads on through it would pass (see _input).
+          this._inChunk = null;
+          this._inNext = 0;
+          this._inLeft = 0;
+        }
+        init(params, pledgedSrcSize, writeState, processCallback, dictionary) {
+          this._writeState = writeState;
+          this._processCallback = processCallback;
+          this._id = natives.zstdHandleCreate(compress, params, pledgedSrcSize, dictionary);
+          zstdContexts?.register(this, this._id, this);
+        }
+        // The window [outOff, outOff + outLen) of `out` receives the output;
+        // writeState gets [availOutAfter, availInAfter]. The natives answer
+        // the output followed by the input consumed (8 bytes, little-endian).
+        _apply(result, inOff, inLen, out, outOff, outLen) {
+          const produced = result.length - 8;
+          if (produced > 0) out.set(result.subarray(0, produced), outOff);
+          const view = new DataView(result.buffer, result.byteOffset + produced, 8);
+          const consumed = Number(view.getBigUint64(0, true));
+          this._writeState[0] = outLen - produced;
+          this._writeState[1] = inLen - consumed;
+          this._inNext = inOff + consumed;
+          this._inLeft = inLen - consumed;
+        }
+        // node's loop (processChunkSync, processCallback) calls once per
+        // output window and passes the same chunk back at inOff + consumed
+        // each time. The native handle keeps its own copy of the chunk from
+        // the first call, so such a call passes undefined and the native
+        // reads on; anything else (a new chunk, or the same one written
+        // again from its start) is a new input, copied once. Passing the
+        // rest of the chunk on every call copied it once per 16 KiB window:
+        // quadratic in the chunk's size.
+        _input(chunk, inOff, inLen) {
+          if (chunk === this._inChunk && inOff === this._inNext && inLen === this._inLeft) {
+            return undefined;
+          }
+          this._inChunk = chunk;
+          return new Uint8Array(chunk.buffer, chunk.byteOffset + inOff, inLen);
+        }
+        writeSync(flush, chunk, inOff, inLen, out, outOff, outLen) {
+          let result;
+          try {
+            result = natives.zstdHandleWriteSync(
+              this._id, flush, this._input(chunk, inOff, inLen), outLen,
+            );
+          } catch (err) {
+            this._inChunk = null;
+            this.onerror(err.message, err.errno, err.code);
+            return;
+          }
+          this._apply(result, inOff, inLen, out, outOff, outLen);
+        }
+        // node runs the call on the threadpool and calls the write callback
+        // back on the loop; a close() that lands meanwhile waits for it.
+        write(flush, chunk, inOff, inLen, out, outOff, outLen) {
+          this._writing = true;
+          natives.zstdHandleWrite(
+            this._id, flush, this._input(chunk, inOff, inLen), outLen,
+          ).then((result) => {
+            this._writing = false;
+            this._apply(result, inOff, inLen, out, outOff, outLen);
+            this._processCallback();
+            if (this._pendingClose) this.close();
+          }, (err) => {
+            this._writing = false;
+            this._inChunk = null;
+            if (this._pendingClose) this.close();
+            this.onerror(err.message, err.errno, err.code);
+          });
+        }
+        // node's reset(): a fresh context with only the pledged size; a
+        // refusal is reported as node's binding reports it.
+        reset() {
+          // The native reset drops the chunk it held.
+          this._inChunk = null;
+          const failure = natives.zstdHandleReset(this._id);
+          if (failure !== undefined) {
+            this.onerror(failure, -1, "ERR_ZLIB_INITIALIZATION_FAILED");
+          }
+        }
+        close() {
+          if (this._writing) {
+            this._pendingClose = true;
+            return;
+          }
+          this._pendingClose = false;
+          this._inChunk = null;
+          if (this._id !== null) {
+            zstdContexts?.unregister(this);
+            natives.zlibStreamClose(this._id);
+            this._id = null;
+          }
+        }
+      };
+      Object.defineProperty(Handle, "name", { value: name });
+      return Handle;
+    };
+    const binding = {
+      ZstdCompress: zstdHandleClass("ZstdCompress", true),
+      ZstdDecompress: zstdHandleClass("ZstdDecompress", false),
+    };
+
+    function zlibBuffer(engine, buffer, callback) {
+      validateCallback(callback);
+      if (ArrayBuffer.isView(buffer) && !isUint8ArrayValue(buffer)) {
+        buffer = BufferCtor.from(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+      } else if (isAnyArrayBuffer(buffer)) {
+        buffer = BufferCtor.from(buffer);
+      }
+      engine.buffers = null;
+      engine.nread = 0;
+      engine.cb = callback;
+      engine.on("data", zlibBufferOnData);
+      engine.on("error", zlibBufferOnError);
+      engine.on("end", zlibBufferOnEnd);
+      engine.end(buffer);
+    }
+    function zlibBufferOnData(chunk) {
+      if (!this.buffers) {
+        this.buffers = [chunk];
+      } else {
+        this.buffers.push(chunk);
+      }
+      this.nread += chunk.length;
+      if (this.nread > this._maxOutputLength) {
+        this.close();
+        this.removeAllListeners("end");
+        this.cb(bufferTooLarge(this._maxOutputLength));
+      }
+    }
+    function zlibBufferOnError(err) {
+      this.removeAllListeners("end");
+      this.cb(err);
+    }
+    function zlibBufferOnEnd() {
+      let buf;
+      if (this.nread === 0) {
+        buf = BufferCtor.alloc(0);
+      } else {
+        const bufs = this.buffers;
+        buf = (bufs.length === 1 ? bufs[0] : BufferCtor.concat(bufs, this.nread));
+      }
+      this.close();
+      if (this._info) {
+        this.cb(null, { buffer: buf, engine: this });
+      } else {
+        this.cb(null, buf);
+      }
+    }
+    function zlibBufferSync(engine, buffer) {
+      if (typeof buffer === "string") {
+        buffer = BufferCtor.from(buffer);
+      } else if (!ArrayBuffer.isView(buffer)) {
+        if (isAnyArrayBuffer(buffer)) {
+          buffer = BufferCtor.from(buffer);
+        } else {
+          throw codes.ERR_INVALID_ARG_TYPE(
+            "buffer", ["string", "Buffer", "TypedArray", "DataView", "ArrayBuffer"], buffer,
+          );
+        }
+      }
+      buffer = processChunkSync(engine, buffer, engine._finishFlushFlag);
+      if (engine._info) return { buffer, engine };
+      return buffer;
+    }
+    // node's genericNodeError(message, { errno, code }), then the same two
+    // own properties set again (lib/zlib.js zlibOnError).
+    function zlibOnError(message, errno, code) {
+      const self = this[kOwner];
+      const error = new Error(message);
+      Object.assign(error, { errno, code });
+      error.errno = errno;
+      error.code = code;
+      self.destroy(error);
+      self[kError] = error;
+    }
+
+    // node's ZlibBase: a constructor function, called through Reflect.apply
+    // by the engine classes, whose own Transform call runs on `this`.
+    const { Transform: ZlibTransform, finished: zlibFinished } = registry.get("stream");
+    function ZlibBase(opts, mode, handle, { flush, finishFlush, fullFlush }) {
+      let chunkSize = Z_DEFAULT_CHUNK;
+      let maxOutputLength = K_MAX_LENGTH;
+      // zstd is the one user: its flush bound is [ZSTD_e_continue, ZSTD_e_end].
+      if (opts) {
+        chunkSize = opts.chunkSize;
+        if (!checkFiniteNumber(chunkSize, "options.chunkSize")) {
+          chunkSize = Z_DEFAULT_CHUNK;
+        } else if (chunkSize < Z_MIN_CHUNK) {
+          throw codes.ERR_OUT_OF_RANGE("options.chunkSize", ">= " + Z_MIN_CHUNK, chunkSize);
+        }
+        flush = checkRangesOrGetDefault(
+          opts.flush, "options.flush", ZSTD_e_continue, ZSTD_e_end, flush,
+        );
+        finishFlush = checkRangesOrGetDefault(
+          opts.finishFlush, "options.finishFlush", ZSTD_e_continue, ZSTD_e_end, finishFlush,
+        );
+        maxOutputLength = checkRangesOrGetDefault(
+          opts.maxOutputLength, "options.maxOutputLength", 1, K_MAX_LENGTH, K_MAX_LENGTH,
+        );
+        if (opts.encoding || opts.objectMode || opts.writableObjectMode) {
+          opts = { ...opts };
+          opts.encoding = null;
+          opts.objectMode = false;
+          opts.writableObjectMode = false;
+        }
+      }
+      Reflect.apply(ZlibTransform, this, [{ autoDestroy: true, ...opts }]);
+      this[kError] = null;
+      this.bytesWritten = 0;
+      this._handle = handle;
+      handle[kOwner] = this;
+      handle.onerror = zlibOnError;
+      this._outBuffer = BufferCtor.allocUnsafe(chunkSize);
+      this._outOffset = 0;
+      this._chunkSize = chunkSize;
+      this._defaultFlushFlag = flush;
+      this._finishFlushFlag = finishFlush;
+      this._defaultFullFlushFlag = fullFlush;
+      this._info = opts?.info;
+      this._maxOutputLength = maxOutputLength;
+      this._rejectGarbageAfterEnd = opts?.rejectGarbageAfterEnd === true;
+    }
+    Object.setPrototypeOf(ZlibBase.prototype, ZlibTransform.prototype);
+    Object.setPrototypeOf(ZlibBase, ZlibTransform);
+    Object.defineProperty(ZlibBase.prototype, "_closed", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return !this._handle;
+      },
+    });
+    let bytesReadAccessors;
+    const bytesReadAccessor = (which) => {
+      bytesReadAccessors ??= {
+        get: registry.get("util").deprecate(function() {
+          return this.bytesWritten;
+        }, "zlib.bytesRead is deprecated and will change its meaning in the " +
+           "future. Use zlib.bytesWritten instead.", "DEP0108"),
+        set: registry.get("util").deprecate(function(value) {
+          this.bytesWritten = value;
+        }, "Setting zlib.bytesRead is deprecated. " +
+           "This feature will be removed in the future.", "DEP0108"),
+      };
+      return bytesReadAccessors[which];
+    };
+    Object.defineProperty(ZlibBase.prototype, "bytesRead", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return bytesReadAccessor("get").call(this);
+      },
+      set(value) {
+        bytesReadAccessor("set").call(this, value);
+      },
+    });
+    ZlibBase.prototype.reset = function() {
+      // node: assert(this._handle, 'zlib binding closed'), an internal
+      // assertion (ERR_INTERNAL_ASSERTION), not a plain Error.
+      if (!this._handle) throw codes.ERR_INTERNAL_ASSERTION("zlib binding closed");
+      return this._handle.reset();
+    };
+    ZlibBase.prototype._flush = function(callback) {
+      this._transform(BufferCtor.alloc(0), "", callback);
+    };
+    ZlibBase.prototype._final = function(callback) {
+      callback();
+    };
+    // node's flushiness order over zlib's flush values; zstd's 0..2 (and the
+    // zlib values a caller may still pass to flush()) rank through it.
+    const flushiness = [];
+    const kFlushFlagList = [Z_NO_FLUSH, Z_BLOCK, Z_PARTIAL_FLUSH, Z_SYNC_FLUSH, Z_FULL_FLUSH, Z_FINISH];
+    for (let i = 0; i < kFlushFlagList.length; i++) flushiness[kFlushFlagList[i]] = i;
+    const maxFlush = (a, b) => (flushiness[a] > flushiness[b] ? a : b);
+    const kFlushBuffers = [];
+    {
+      const dummyArrayBuffer = new ArrayBuffer(0);
+      for (const flushFlag of kFlushFlagList) {
+        kFlushBuffers[flushFlag] = BufferCtor.from(dummyArrayBuffer);
+        kFlushBuffers[flushFlag][kFlushFlag] = flushFlag;
+      }
+    }
+    ZlibBase.prototype.flush = function(kind, callback) {
+      if (typeof kind === "function" || (kind === undefined && !callback)) {
+        callback = kind;
+        kind = this._defaultFullFlushFlag;
+      }
+      if (this.writableFinished) {
+        if (callback) process.nextTick(callback);
+      } else if (this.writableEnded) {
+        if (callback) this.once("end", callback);
+      } else {
+        this.write(kFlushBuffers[kind], "", callback);
+      }
+    };
+    ZlibBase.prototype.close = function(callback) {
+      if (callback) zlibFinished(this, callback);
+      this.destroy();
+    };
+    ZlibBase.prototype._destroy = function(err, callback) {
+      zlibClose(this);
+      callback(err);
+    };
+    ZlibBase.prototype._transform = function(chunk, encoding, cb) {
+      let flushFlag = this._defaultFlushFlag;
+      // A flush() marker carries its flush value.
+      if (typeof chunk[kFlushFlag] === "number") flushFlag = chunk[kFlushFlag];
+      // The last chunk of an ended stream finishes it.
+      if (this.writableEnded && this.writableLength === chunk.byteLength) {
+        flushFlag = maxFlush(flushFlag, this._finishFlushFlag);
+      }
+      processChunk(this, chunk, flushFlag, cb);
+    };
+    ZlibBase.prototype._processChunk = function(chunk, flushFlag, cb) {
+      if (typeof cb === "function") {
+        processChunk(this, chunk, flushFlag, cb);
+      } else {
+        return processChunkSync(this, chunk, flushFlag);
+      }
+    };
+    function processChunkSync(self, chunk, flushFlag) {
+      let availInBefore = chunk.byteLength;
+      let availOutBefore = self._chunkSize - self._outOffset;
+      let inOff = 0;
+      let availOutAfter;
+      let availInAfter;
+      const buffers = [];
+      let nread = 0;
+      let inputRead = 0;
+      const state = self._writeState;
+      const handle = self._handle;
+      let buffer = self._outBuffer;
+      let offset = self._outOffset;
+      const chunkSize = self._chunkSize;
+      let error;
+      self.on("error", function onError(er) {
+        error = er;
+      });
+      while (true) {
+        handle.writeSync(flushFlag, chunk, inOff, availInBefore, buffer, offset, availOutBefore);
+        if (error) {
+          throw error;
+        } else if (self[kError]) {
+          throw self[kError];
+        }
+        availOutAfter = state[0];
+        availInAfter = state[1];
+        const inDelta = (availInBefore - availInAfter);
+        inputRead += inDelta;
+        const have = availOutBefore - availOutAfter;
+        if (have > 0) {
+          const out = buffer.slice(offset, offset + have);
+          offset += have;
+          buffers.push(out);
+          nread += out.byteLength;
+          if (nread > self._maxOutputLength) {
+            zlibClose(self);
+            throw bufferTooLarge(self._maxOutputLength);
+          }
+        }
+        // Exhausted the output buffer, or used all the input: a new one.
+        if (availOutAfter === 0 || offset >= chunkSize) {
+          availOutBefore = chunkSize;
+          offset = 0;
+          buffer = BufferCtor.allocUnsafe(chunkSize);
+        }
+        if (availOutAfter === 0) {
+          // Not actually done: the window filled, so call again.
+          inOff += inDelta;
+          availInBefore = availInAfter;
+        } else {
+          break;
+        }
+      }
+      self.bytesWritten = inputRead;
+      zlibClose(self);
+      if (nread === 0) return BufferCtor.alloc(0);
+      return (buffers.length === 1 ? buffers[0] : BufferCtor.concat(buffers, nread));
+    }
+    function processChunk(self, chunk, flushFlag, cb) {
+      const handle = self._handle;
+      if (!handle) return process.nextTick(cb);
+      handle.buffer = chunk;
+      handle.cb = cb;
+      handle.availOutBefore = self._chunkSize - self._outOffset;
+      handle.availInBefore = chunk.byteLength;
+      handle.inOff = 0;
+      handle.flushFlag = flushFlag;
+      handle.write(
+        flushFlag, chunk, 0, handle.availInBefore, self._outBuffer, self._outOffset,
+        handle.availOutBefore,
+      );
+    }
+    function processCallback() {
+      // `this` is the handle.
+      const handle = this;
+      const self = this[kOwner];
+      const state = self._writeState;
+      if (self.destroyed) {
+        this.buffer = null;
+        this.cb();
+        return;
+      }
+      const availOutAfter = state[0];
+      const availInAfter = state[1];
+      const inDelta = handle.availInBefore - availInAfter;
+      self.bytesWritten += inDelta;
+      const have = handle.availOutBefore - availOutAfter;
+      let streamBufferIsFull = false;
+      if (have > 0) {
+        const out = self._outBuffer.slice(self._outOffset, self._outOffset + have);
+        self._outOffset += have;
+        streamBufferIsFull = !self.push(out);
+      }
+      if (self.destroyed) {
+        this.cb();
+        return;
+      }
+      // Exhausted the output buffer, or used all the input: a new one.
+      if (availOutAfter === 0 || self._outOffset >= self._chunkSize) {
+        handle.availOutBefore = self._chunkSize;
+        self._outOffset = 0;
+        self._outBuffer = BufferCtor.allocUnsafe(self._chunkSize);
+      }
+      if (availOutAfter === 0) {
+        // Not actually done: call again, now or once the reader drains.
+        handle.inOff += inDelta;
+        handle.availInBefore = availInAfter;
+        if (!streamBufferIsFull) {
+          this.write(
+            handle.flushFlag, this.buffer, handle.inOff, handle.availInBefore,
+            self._outBuffer, self._outOffset, self._chunkSize,
+          );
+        } else {
+          const oldRead = self._read;
+          self._read = (n) => {
+            self._read = oldRead;
+            this.write(
+              handle.flushFlag, this.buffer, handle.inOff, handle.availInBefore,
+              self._outBuffer, self._outOffset, self._chunkSize,
+            );
+            self._read(n);
+          };
+        }
+        return;
+      }
+      if (availInAfter > 0) {
+        // Output room left but input unread: the library was not interested
+        // in more (a zstd frame ended), so the stream ends here.
+        if (self._rejectGarbageAfterEnd) {
+          const err = codes.ERR_TRAILING_JUNK_AFTER_STREAM_END();
+          self.destroy(err);
+          this.cb(err);
+          return;
+        }
+        self.push(null);
+      }
+      // Finished with the chunk.
+      this.buffer = null;
+      this.cb();
+    }
+    function zlibClose(engine) {
+      engine._handle?.close();
+      engine._handle = null;
+    }
+
+    const zstdDefaultOpts = {
+      flush: ZSTD_e_continue,
+      finishFlush: ZSTD_e_end,
+      fullFlush: ZSTD_e_flush,
+    };
+    class Zstd extends ZlibBase {
+      constructor(opts, mode, initParamsArray, maxParam) {
+        initParamsArray.fill(-1);
+        if (opts?.params) {
+          Object.keys(opts.params).forEach((origKey) => {
+            const key = +origKey;
+            if (Number.isNaN(key) || key < 0 || key > maxParam ||
+                (initParamsArray[key] | 0) !== -1) {
+              throw codes.ERR_ZSTD_INVALID_PARAM(origKey);
+            }
+            const value = opts.params[origKey];
+            if (typeof value !== "number" && typeof value !== "boolean") {
+              throw codes.ERR_INVALID_ARG_TYPE("options.params[key]", "number", opts.params[origKey]);
+            }
+            initParamsArray[key] = value;
+          });
+        }
+        const handle = mode === ZSTD_COMPRESS ?
+          new binding.ZstdCompress() : new binding.ZstdDecompress();
+        const pledgedSrcSize = opts?.pledgedSrcSize ?? undefined;
+        const writeState = new Uint32Array(2);
+        handle.init(
+          initParamsArray,
+          pledgedSrcSize,
+          writeState,
+          processCallback,
+          opts?.dictionary && ArrayBuffer.isView(opts.dictionary) ? opts.dictionary : undefined,
+        );
+        super(opts, mode, handle, zstdDefaultOpts);
+        this._writeState = writeState;
+      }
+    }
+    const maxConstant = (prefix) => Math.max(...Object.keys(ZSTD_CONSTANTS).map(
+      (key) => (key.startsWith(prefix) ? ZSTD_CONSTANTS[key] : 0),
+    ));
+    const kMaxZstdCParam = maxConstant("ZSTD_c_");
+    const zstdInitCParamsArray = new Uint32Array(kMaxZstdCParam + 1);
+    class ZstdCompress extends Zstd {
+      constructor(opts) {
+        super(opts, ZSTD_COMPRESS, zstdInitCParamsArray, kMaxZstdCParam);
+      }
+    }
+    const kMaxZstdDParam = maxConstant("ZSTD_d_");
+    const zstdInitDParamsArray = new Uint32Array(kMaxZstdDParam + 1);
+    class ZstdDecompress extends Zstd {
+      constructor(opts) {
+        super(opts, ZSTD_DECOMPRESS, zstdInitDParamsArray, kMaxZstdDParam);
+      }
+    }
+    function createConvenienceMethod(ctor, sync) {
+      if (sync) {
+        return function syncBufferWrapper(buffer, opts) {
+          return zlibBufferSync(new ctor(opts), buffer);
+        };
+      }
+      return function asyncBufferWrapper(buffer, opts, callback) {
+        if (typeof opts === "function") {
+          callback = opts;
+          opts = {};
+        }
+        return zlibBuffer(new ctor(opts), buffer, callback);
+      };
+    }
+    // node's createProperty: a non-writable, enumerable `create*` whose
+    // function is named "value".
+    const createProperty = (ctor) => ({
+      configurable: true,
+      enumerable: true,
+      value: function(options) {
+        return new ctor(options);
+      },
+    });
+
+    const zlibExports = {
       gzipSync: sync("gzip", true, "Gzip"),
       gunzipSync: sync("gzip", false, "Gunzip"),
       deflateSync: sync("deflate", true, "Deflate"),
@@ -22278,8 +23630,29 @@
         BROTLI_DEFAULT_WINDOW: 22,
         BROTLI_MIN_WINDOW_BITS: 10,
         BROTLI_MAX_WINDOW_BITS: 24,
+        ...ZSTD_CONSTANTS,
       },
+      ZstdCompress,
+      ZstdDecompress,
+      zstdCompress: createConvenienceMethod(ZstdCompress, false),
+      zstdCompressSync: createConvenienceMethod(ZstdCompress, true),
+      zstdDecompress: createConvenienceMethod(ZstdDecompress, false),
+      zstdDecompressSync: createConvenienceMethod(ZstdDecompress, true),
     };
+    Object.defineProperties(zlibExports, {
+      createZstdCompress: createProperty(ZstdCompress),
+      createZstdDecompress: createProperty(ZstdDecompress),
+    });
+    // node's deprecated top-level copies of its constants (every one but
+    // BROTLI_*): non-enumerable and read-only.
+    for (const key of Object.keys(ZSTD_CONSTANTS)) {
+      Object.defineProperty(zlibExports, key, {
+        enumerable: false,
+        value: ZSTD_CONSTANTS[key],
+        writable: false,
+      });
+    }
+    return zlibExports;
   };
 
   // ----------------------------------------------------- node:querystring
@@ -22428,18 +23801,11 @@
 
   // ------------------------------------------------- node:timers/promises
   registry.factories["timers/promises"] = () => {
-    // Node's internal AbortError shape: a real Error SUBCLASS (constructor
-    // name 'AbortError') with code ABORT_ERR, signal.reason carried as
-    // cause. timers/promises rejects with THIS, never with signal.reason.
-    class AbortError extends Error {
-      constructor(message = "The operation was aborted", options = undefined) {
-        super(message, options);
-        this.code = "ABORT_ERR";
-        this.name = "AbortError";
-      }
-    }
+    // Node's internal AbortError, the one class every module shares
+    // (bootstrap.js, #401), with signal.reason carried as cause.
+    // timers/promises rejects with THIS, never with signal.reason.
     function makeAbortError(cause) {
-      return cause !== undefined ? new AbortError(undefined, { cause }) : new AbortError();
+      return new globalThis.__oamAbortError(undefined, { cause });
     }
     // Node validates every argument BEFORE scheduling and surfaces the
     // failure as a REJECTION (these are async functions there), so a typo
@@ -32664,9 +34030,12 @@
           // loop) and answered after it: a connection node's listener still
           // had in its backlog when it closed, which the client sees reset.
           // Handed to the closed server, it left the client connected to
-          // nothing (#338).
+          // nothing (#338). The close has already closed it (#388); the
+          // reset is for a stream the close did not reach. Otherwise taken
+          // now, before the server sees it, so its close leaves it be.
           const superseded = generation !== this._listenGeneration;
-          if (superseded || !this.listening) {
+          if (superseded || !this.listening
+              || !natives.tcpAcceptTake(this._serverId, accepted.handle)) {
             natives.tcpReset(accepted.handle, false);
             if (superseded) return;
             break;
@@ -32828,7 +34197,27 @@
       socketWrite: Socket.prototype.write,
     };
 
+    // node's net._setSimultaneousAccepts (DEP0121): a libuv accept-mode knob
+    // for Windows pipe/TCP handles, which oam's servers do not have, so only
+    // its deprecation is real -- one warning, on the first call, and nothing
+    // returned. It takes `handle` on Windows and nothing elsewhere, as node's.
+    let warnSimultaneousAccepts = true;
+    function warnSetSimultaneousAccepts() {
+      if (warnSimultaneousAccepts) {
+        warnSimultaneousAccepts = false;
+        process.emitWarning(
+          "net._setSimultaneousAccepts() is deprecated and will be removed.",
+          "DeprecationWarning",
+          "DEP0121",
+        );
+      }
+    }
+    const _setSimultaneousAccepts = natives.platform === "win32"
+      ? function _setSimultaneousAccepts(handle) { warnSetSimultaneousAccepts(); }
+      : function _setSimultaneousAccepts() { warnSetSimultaneousAccepts(); };
+
     return {
+      _setSimultaneousAccepts,
       isIPv4, isIPv6, isIP,
       getDefaultAutoSelectFamilyAttemptTimeout,
       setDefaultAutoSelectFamilyAttemptTimeout,
@@ -33400,9 +34789,62 @@
   };
 
   // ------------------------------------------------------------- punycode
-  // Pure-JS Punycode (RFC 3492). Node marks this deprecated but it is still
-  // in widespread use via the `url` module and idn-related libraries.
-  registry.factories.punycode = () => {
+  // Whether a package loaded punycode, as node v22.22.2 answers it for the
+  // DEP0040 warning: lib/punycode.js calls isInsideNodeModules() with no
+  // arguments, so node_util.cc looks at the first 10 stack frames only,
+  // skips unnamed and "node:" ones, and lets the first other frame decide,
+  // by "node_modules" between any mix of / and \ (a win32 path and a file://
+  // URL both count). Most of those 10 are node's own loader frames, so who
+  // the caller is depends on the route the load took (probed on win32 and
+  // linux alike): require() spends all 10 in the CJS loader and import its
+  // ESM loader, so node warns whoever loads it that way; module.require
+  // leaves its caller 1 frame and process.getBuiltinModule 6. `via` names
+  // that route ("moduleRequire" from the native require called with a module
+  // as its receiver, "getBuiltinModule"); oam's own frames stand in for
+  // node's loader frames and are skipped, then the window starts.
+  const PUNYCODE_CALLER_FRAMES = { moduleRequire: 1, getBuiltinModule: 6 };
+  function punycodeLoadedByAPackage(via) {
+    const window = PUNYCODE_CALLER_FRAMES[via] ?? 0;
+    if (window === 0) return false;
+    let frames;
+    const savedLimit = Error.stackTraceLimit;
+    const savedPrepare = Error.prepareStackTrace;
+    try {
+      Error.stackTraceLimit = 64;
+      Error.prepareStackTrace = (_, callSites) => callSites;
+      const holder = {};
+      Error.captureStackTrace(holder, punycodeLoadedByAPackage);
+      frames = holder.stack;
+    } catch {
+      return false;
+    } finally {
+      try {
+        Error.stackTraceLimit = savedLimit;
+        Error.prepareStackTrace = savedPrepare;
+      } catch { /* a frozen Error keeps what it had */ }
+    }
+    if (!Array.isArray(frames)) return false;
+    const runtime = (name) => typeof name === "string" && (name.startsWith("oam:") || name.startsWith("node:"));
+    let i = 0;
+    while (i < frames.length && runtime(frames[i].getFileName?.())) i++;
+    for (const end = Math.min(frames.length, i + window); i < end; i++) {
+      const name = frames[i].getFileName?.();
+      if (typeof name !== "string" || name === "" || runtime(name)) continue;
+      return /[\\/]node_modules[\\/]/.test(name);
+    }
+    return false;
+  }
+
+  // Pure-JS Punycode (RFC 3492), node's punycode.js 2.1.0. Runtime-deprecated
+  // (DEP0040) when it is first loaded, unless a package is loading it.
+  registry.factories.punycode = (_node, via) => {
+    if (!punycodeLoadedByAPackage(via)) {
+      process.emitWarning(
+        "The `punycode` module is deprecated. Please use a userland alternative instead.",
+        "DeprecationWarning",
+        "DEP0040",
+      );
+    }
     const BASE = 36, TMIN = 1, TMAX = 26, SKEW = 38, DAMP = 700, BIAS_INIT = 72;
     const MAXINT = 2147483647;
     const DELIMITER = "\x2D";
@@ -33522,12 +34964,22 @@
     }
 
     return {
-      decode, encode, toASCII, toUnicode,
+      version: "2.1.0",
       ucs2: {
         decode: (str) => [...str].map((c) => c.codePointAt(0)),
         encode: (cps) => String.fromCodePoint(...cps),
       },
+      decode, encode, toASCII, toUnicode,
     };
+  };
+
+  // ------------------------------------------------------------------ sys
+  // node's lib/sys.js: util under its old name, deprecated (DEP0025) when it
+  // is first loaded.
+  registry.factories.sys = () => {
+    const util = registry.get("util");
+    process.emitWarning("sys is deprecated. Use util instead.", "DeprecationWarning", "DEP0025");
+    return util;
   };
 
   // ----------------------------------------------------------- perf_hooks
@@ -33953,21 +35405,14 @@
   // -------------------------------------------------------------- readline
   // Minimal stub: enough for `readline.createInterface` and the async-
   // iterator line-reading pattern used by CLI utilities.
-  // node's internal AbortError: a real Error SUBCLASS (name 'AbortError',
-  // code ABORT_ERR) carrying the signal's reason as `cause`. What
-  // readline's question() rejects with on an aborted signal -- NOT a
-  // DOMException: `if (err.code !== 'ABORT_ERR') throw err` is the idiom
-  // callers branch on, and a DOMException's numeric code 20 crashed it.
-  // Shared by node:readline and node:readline/promises.
-  class ReadlineAbortError extends Error {
-    constructor(options) {
-      super("The operation was aborted", options);
-      this.code = "ABORT_ERR";
-      this.name = "AbortError";
-    }
-  }
+  // node's internal AbortError (the one class, bootstrap.js, #401)
+  // carrying the signal's reason as `cause`. What readline's question()
+  // rejects with on an aborted signal -- NOT a DOMException: `if (err.code
+  // !== 'ABORT_ERR') throw err` is the idiom callers branch on, and a
+  // DOMException's numeric code 20 crashed it. Shared by node:readline and
+  // node:readline/promises.
   function readlineAbortError(signal) {
-    return new ReadlineAbortError({ cause: signal.reason });
+    return new globalThis.__oamAbortError(undefined, { cause: signal.reason });
   }
 
   registry.factories.readline = () => {
@@ -37719,7 +39164,7 @@
   registry.factories["dns/promises"] = () => registry.get("dns").promises;
 
   // internal/errors -- some packages (readable-stream, undici) import this
-  registry.factories["internal/errors"] = () => ({ codes });
+  registry.factories["internal/errors"] = () => ({ codes, AbortError: globalThis.__oamAbortError });
 
   // internal/assert/myers_diff (--expose-internals) -- the SAME port that
   // produces oam's real assert diffs, published under node's internal id.
@@ -40567,11 +42012,9 @@
         if (options.endStream) stream.end();
         var signal = options.signal;
         if (signal) {
+          // node's AbortError, the one class every module shares (#401).
           var aborter = function () {
-            var abort = new Error("The operation was aborted", { cause: signal.reason });
-            abort.name = "AbortError";
-            abort.code = "ABORT_ERR";
-            stream.destroy(abort);
+            stream.destroy(new globalThis.__oamAbortError(undefined, { cause: signal.reason }));
           };
           if (signal.aborted) aborter();
           else {
@@ -42857,9 +44300,11 @@
             if (accepted === undefined) break;
             // Accepted before close() (or the listen() that superseded
             // this loop) and answered after it: reset, as net.Server's
-            // accept loop resets one (#338).
+            // accept loop resets one (#338). Otherwise taken now, before
+            // the server sees it, so its close leaves it be (#388).
             var superseded = generation !== this._listenGeneration;
-            if (superseded || this._closed) {
+            if (superseded || this._closed
+                || !natives.tcpAcceptTake(serverId, accepted.handle)) {
               natives.tcpReset(accepted.handle, false);
               if (superseded) return;
               break;
@@ -43194,8 +44639,492 @@
     return tlsExports;
   };
 
+  // ----------------------------------------- MessageChannel / MessagePort
+  // node's MessageChannel and MessagePort (lib/internal/worker/io.js and
+  // event_target.js, v22.22.2), in-process: globals, and the very
+  // constructors node:worker_threads exports, as in node. There was no
+  // global MessageChannel at all, the global MessagePort was an empty
+  // placeholder class, and worker_threads' port was an EventEmitter, so
+  // `onmessage` did nothing and an addEventListener listener was handed the
+  // data instead of a MessageEvent (#401).
+  //
+  // A port is a NodeEventTarget: an EventTarget with node's on / once /
+  // off / emit family, whose node-style listeners are handed a message's
+  // data and whose DOM listeners a MessageEvent. What it does, measured on
+  // v22.22.2:
+  // - a message posted to a port waits in that port's queue until the port
+  //   is started -- by its first 'message' listener (on, addEventListener
+  //   or onmessage) or by start() -- and is then delivered from an
+  //   immediate, after the microtasks and before a setImmediate queued
+  //   after the post; removing the last 'message' listener stops it again;
+  // - a 'message' listener refs the port (it holds the event loop open, as
+  //   node's handle does) and removing the last one unrefs it;
+  // - close() closes both ends: the port's own queue is dropped and it
+  //   fires 'close', and the other end is told by a close that waits in its
+  //   queue behind the messages already sent, so those are still delivered
+  //   once it reads them;
+  // - postMessage clones with structuredClone (a DataCloneError for what
+  //   cannot be cloned) and, with no argument at all, throws node's
+  //   ERR_MISSING_ARGS TypeError; a post on or to a closed port is dropped.
+  const kIsNodeStyleListener = Symbol.for("oam.kIsNodeStyleListener");
+  const kNewPort = Symbol("kNewPort");
+  const kPortClose = Symbol("kPortClose");
+  // Port state, out of sight of inspect and Object.keys.
+  const portStates = new WeakMap();
+  function portState(port) {
+    const state = portStates.get(port);
+    if (state === undefined) {
+      throw new codes.ERR_INVALID_THIS("MessagePort");
+    }
+    return state;
+  }
+  function eventTargetListenerCount(target, type) {
+    const list = target._listeners.get(type);
+    return list === undefined ? 0 : list.length;
+  }
+  // A listener's error is the process's uncaught exception, as node's
+  // emitUncaughtException makes it; the listeners after it still run.
+  function reportListenerError(err) {
+    process.nextTick(() => {
+      throw err;
+    });
+  }
+  // node's kHybridDispatch: node-style listeners get `nodeValue`, the others
+  // an event, made once and only if one of them is there to take it.
+  function hybridDispatch(target, nodeValue, type, makeEvent) {
+    const list = target._listeners.get(type);
+    if (list === undefined || list.length === 0) return;
+    let event;
+    for (const entry of list.slice()) {
+      // Removed by a listener that ran before it.
+      if (!(target._listeners.get(type) ?? []).includes(entry)) continue;
+      if (event !== undefined && event._stopImmediate && !entry.resist) continue;
+      const fn = entry.ref ? entry.ref.deref() : entry.fn;
+      if (fn === undefined) continue;
+      if (entry.once) target.removeEventListener(type, fn);
+      let arg;
+      if (entry.nodeStyle) {
+        arg = nodeValue;
+      } else {
+        if (event === undefined) {
+          event = makeEvent();
+          event.target = target;
+          event.currentTarget = target;
+          event.eventPhase = 2; // AT_TARGET
+        }
+        arg = event;
+      }
+      try {
+        if (typeof fn === "function") fn.call(target, arg);
+        else fn.handleEvent.call(fn, arg);
+      } catch (err) {
+        reportListenerError(err);
+      }
+    }
+    if (event !== undefined) {
+      event.eventPhase = 0; // NONE
+      event.currentTarget = null;
+    }
+  }
+  class NodeEventTarget extends EventTarget {
+    // node's NodeEventTarget keeps no limit of its own: setMaxListeners is
+    // events.setMaxListeners(n, this) -- its checks, its default n, and the
+    // EventTarget slot addEventListener warns against -- and getMaxListeners
+    // reads that slot back.
+    setMaxListeners(n) {
+      registry.get("events").setMaxListeners(n, this);
+    }
+    getMaxListeners() {
+      return this[globalThis.__oamEventTargetLimitSymbols.kMaxEventTargetListeners];
+    }
+    eventNames() {
+      return Array.from(this._listeners.keys()).filter(
+        (type) => eventTargetListenerCount(this, type) > 0,
+      );
+    }
+    listenerCount(type) {
+      return eventTargetListenerCount(this, String(type));
+    }
+    off(type, listener, options) {
+      this.removeEventListener(type, listener, options);
+      return this;
+    }
+    removeListener(type, listener, options) {
+      this.removeEventListener(type, listener, options);
+      return this;
+    }
+    on(type, listener) {
+      this.addEventListener(type, listener, { [kIsNodeStyleListener]: true });
+      return this;
+    }
+    addListener(type, listener) {
+      this.addEventListener(type, listener, { [kIsNodeStyleListener]: true });
+      return this;
+    }
+    emit(type, arg) {
+      if (typeof type !== "string") throw new codes.ERR_INVALID_ARG_TYPE("type", "string", type);
+      const hadListeners = this.listenerCount(type) > 0;
+      hybridDispatch(this, arg, type, () => this[kPortCreateEvent](arg, type));
+      return hadListeners;
+    }
+    once(type, listener) {
+      this.addEventListener(type, listener, { once: true, [kIsNodeStyleListener]: true });
+      return this;
+    }
+    // node clears the listener table without telling the port, so a port
+    // whose 'message' listeners go this way stays started and ref'd.
+    removeAllListeners(type) {
+      if (type !== undefined) this._listeners.delete(String(type));
+      else this._listeners.clear();
+      return this;
+    }
+  }
+  const kPortCreateEvent = Symbol("kCreateEvent");
+  NodeEventTarget.prototype[kPortCreateEvent] = function (nodeValue, type) {
+    return new globalThis.CustomEvent(type, { detail: nodeValue });
+  };
+
+  function portKeepAlive(port, state) {
+    // A port fed from outside (a worker's parentPort) is held open by its
+    // parked receive, not a timer: ref() and unref() reach that receive,
+    // so a worker whose last 'message' listener went exits, as node's does
+    // (#401).
+    if (state.external) {
+      if (typeof state.onRef === "function") state.onRef(state.refed && !state.closed);
+      return;
+    }
+    const want = state.refed && !state.closed;
+    if (want && state.keepAlive === null) {
+      // A ref'd timer that never comes due holds the loop open, as the
+      // port's ref'd handle does in node. Re-armed if it ever does.
+      const setTimer = registry._setTimeout ?? globalThis.setTimeout;
+      const arm = () => {
+        state.keepAlive = setTimer(arm, 0x7fffffff);
+      };
+      arm();
+    } else if (!want && state.keepAlive !== null) {
+      (registry._clearTimeout ?? globalThis.clearTimeout)(state.keepAlive);
+      state.keepAlive = null;
+    }
+  }
+  function portScheduleDrain(port, state) {
+    if (state.drainScheduled || state.closed || state.queue.length === 0) return;
+    // A port that is not started still reads a close at the head of its
+    // queue -- node's ReceiveMessage lets a close message through when
+    // receiving is off -- but nothing else, and nothing behind a message.
+    if (!state.started && state.queue[0] !== kPortClose) return;
+    state.drainScheduled = true;
+    // From the loop's pending phase (timerPending): after the ticks and
+    // microtasks the poster queued and before the immediates, where node's
+    // port reads its messages (its uv_async comes in the poll phase, ahead
+    // of the check phase).
+    const later = (fn) => {
+      const natives = globalThis.__oam.node;
+      if (typeof natives.timerPending === "function") natives.timerPending(fn);
+      else (registry._setImmediate ?? globalThis.setImmediate)(fn);
+    };
+    later(() => {
+      if (state.closed) {
+        state.drainScheduled = false;
+        return;
+      }
+      if (!state.started) {
+        state.drainScheduled = false;
+        if (state.queue[0] === kPortClose) portCloseLocal(port, state);
+        return;
+      }
+      // What is queued now goes out as one batch, every message of it even
+      // if a listener closes the port part way (node delivers a batch it
+      // has read whole), each from a pending callback of its own, so the
+      // ticks and microtasks a listener queues all run before the next
+      // message, as they do after each of node's callbacks, and nothing
+      // else -- a timer, an immediate -- comes between. A message posted
+      // from a listener waits for the next batch.
+      const batch = state.queue.splice(0, state.queue.length);
+      const deliver = (i) => {
+        if (i === batch.length) {
+          state.drainScheduled = false;
+          portScheduleDrain(port, state);
+          return;
+        }
+        const item = batch[i];
+        if (item === kPortClose) {
+          state.drainScheduled = false;
+          portCloseLocal(port, state);
+          return;
+        }
+        // The last 'message' listener went part way (a once() that ran, an
+        // off() in a listener): node stops reading, so the rest of the
+        // batch stays queued, ahead of anything posted since, for the next
+        // listener to start the port again.
+        if (!state.started) {
+          state.queue = batch.slice(i).concat(state.queue);
+          state.drainScheduled = false;
+          portScheduleDrain(port, state);
+          return;
+        }
+        hybridDispatch(port, item, "message", () => port[kPortCreateEvent](item, "message"));
+        if (i + 1 === batch.length) deliver(i + 1);
+        else later(() => deliver(i + 1));
+      };
+      deliver(0);
+    });
+  }
+  // This end closes: its queue goes, and its 'close' event follows, which
+  // is when its handle is gone (hasRef() still answers true until then, as
+  // node's does).
+  function portCloseLocal(port, state) {
+    if (state.closed) return;
+    state.closed = true;
+    state.queue.length = 0;
+    portKeepAlive(port, state);
+    (registry._setImmediate ?? globalThis.setImmediate)(() => {
+      state.handleClosed = true;
+      port.dispatchEvent(new MessagePortCloseEvent());
+    });
+  }
+  // node's 'close' event for a port, a class of its own.
+  class MessagePortCloseEvent extends globalThis.Event {
+    constructor() {
+      super("close");
+    }
+  }
+
+  // node's MessagePort is a C++ function constructor, not a class: its
+  // length is 0, a call without `new` gets the same ERR_CONSTRUCT_CALL_INVALID
+  // a script's `new` does, and its prototype carries its own eight members
+  // (enumerable, as node's are) and none of EventTarget's -- the
+  // listener-count hooks are symbol-keyed (#401).
+  function MessagePort(...args) {
+    // Only a MessageChannel (or the runtime) makes a port: node's C++
+    // constructor refuses a script, with a plain TypeError carrying the
+    // code.
+    if (args[0] !== kNewPort) {
+      const err = new TypeError("Constructor cannot be called");
+      err.code = "ERR_CONSTRUCT_CALL_INVALID";
+      throw err;
+    }
+    const port = Reflect.construct(NodeEventTarget, [], new.target);
+    portStates.set(port, {
+        twin: null,
+        queue: [],
+        started: false,
+        closed: false,
+        handleClosed: false,
+        // A port fed from outside this thread (a worker's parentPort),
+        // whose pending receive holds the loop instead of a ref.
+        external: false,
+        refed: false,
+        keepAlive: null,
+        drainScheduled: false,
+        onmessage: null,
+        onmessageerror: null,
+        // The runtime's hook for a port whose messages come from elsewhere
+        // (a worker's parentPort): called when the port first starts.
+        onStart: null,
+        // The runtime's hook for such a port's ref() / unref().
+        onRef: null,
+      });
+    return port;
+  }
+  Object.setPrototypeOf(MessagePort, NodeEventTarget);
+  MessagePort.prototype = Object.create(NodeEventTarget.prototype, {
+    constructor: { value: MessagePort, writable: true, enumerable: false, configurable: true },
+  });
+  const messagePortMembers = {
+    postMessage(message, transfer) {
+      const state = portState(this);
+      if (arguments.length === 0) {
+        const err = new TypeError("Not enough arguments to MessagePort.postMessage");
+        err.code = "ERR_MISSING_ARGS";
+        throw err;
+      }
+      // node's second argument: a transfer list, or an options bag with one.
+      const list =
+        transfer != null && !Array.isArray(transfer) && typeof transfer === "object"
+          ? transfer.transfer
+          : transfer;
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          if (untransferable.has(item)) {
+            throw new DOMException("Cannot transfer object of unsupported type.", "DataCloneError");
+          }
+        }
+      }
+      const cloned =
+        Array.isArray(list) && list.length > 0
+          ? structuredClone(message, { transfer: list })
+          : structuredClone(message);
+      const twin = state.twin;
+      if (state.closed || twin === null) return;
+      const twinState = portState(twin);
+      if (twinState.closed) return;
+      twinState.queue.push(cloned);
+      portScheduleDrain(twin, twinState);
+    },
+    start() {
+      const state = portState(this);
+      if (state.closed) return;
+      if (!state.started) {
+        state.started = true;
+        if (typeof state.onStart === "function") state.onStart();
+      }
+      portScheduleDrain(this, state);
+    },
+    close(cb) {
+      if (typeof cb === "function") this.once("close", cb);
+      const state = portState(this);
+      if (state.closed) return;
+      const twin = state.twin;
+      portCloseLocal(this, state);
+      if (twin !== null) {
+        // The other end hears of it in order, behind what was sent to it.
+        const twinState = portState(twin);
+        if (!twinState.closed) {
+          twinState.queue.push(kPortClose);
+          portScheduleDrain(twin, twinState);
+        }
+      }
+    },
+    ref() {
+      const state = portState(this);
+      state.refed = true;
+      portKeepAlive(this, state);
+    },
+    unref() {
+      const state = portState(this);
+      state.refed = false;
+      portKeepAlive(this, state);
+    },
+    hasRef() {
+      const state = portState(this);
+      return state.refed && !state.handleClosed;
+    },
+    get onmessage() {
+      return portState(this).onmessage;
+    },
+    set onmessage(handler) {
+      setPortHandler(this, "message", handler);
+    },
+    get onmessageerror() {
+      return portState(this).onmessageerror;
+    },
+    set onmessageerror(handler) {
+      setPortHandler(this, "messageerror", handler);
+    },
+  };
+  // node's order: postMessage, start, ref, unref, hasRef, onmessage,
+  // onmessageerror, close.
+  for (const name of [
+    "postMessage",
+    "start",
+    "ref",
+    "unref",
+    "hasRef",
+    "onmessage",
+    "onmessageerror",
+    "close",
+  ]) {
+    const desc = Object.getOwnPropertyDescriptor(messagePortMembers, name);
+    desc.enumerable = true;
+    Object.defineProperty(MessagePort.prototype, name, desc);
+  }
+  // node's setupPortReferencing, through the EventTarget's symbol hooks:
+  // the first 'message' listener refs and starts the port, and the last one
+  // going stops and unrefs it -- however it goes (off, a once listener that
+  // ran, onmessage = null) (#401).
+  // Non-enumerable, so inspecting the prototype shows node's members only.
+  Object.defineProperty(MessagePort.prototype, Symbol.for("oam.kNewListener"), {
+    value(size, type) {
+      if (type === "message" && size === 1) {
+        this.ref();
+        this.start();
+      }
+    },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  Object.defineProperty(MessagePort.prototype, Symbol.for("oam.kRemoveListener"), {
+    value(size, type) {
+      if (type === "message" && size === 0) {
+        portState(this).started = false;
+        this.unref();
+      }
+    },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  // node's defineEventHandler: the handler is one listener, added when it
+  // is first set (where it then keeps its place) and taken off when it is
+  // set to anything that is not a function.
+  function setPortHandler(port, type, handler) {
+    const state = portState(port);
+    const key = `on${type}`;
+    const wrapperKey = `${key}Wrapper`;
+    const value = typeof handler === "function" ? handler : null;
+    if (value === null) {
+      if (state[wrapperKey]) port.removeEventListener(type, state[wrapperKey]);
+      state[wrapperKey] = null;
+    } else if (!state[wrapperKey]) {
+      const wrapper = function (event) {
+        const current = state[key];
+        if (typeof current === "function") return current.call(this, event);
+      };
+      state[wrapperKey] = wrapper;
+      port.addEventListener(type, wrapper);
+    }
+    state[key] = value;
+  }
+  // A 'message' or 'messageerror' event is a MessageEvent with the data.
+  Object.defineProperty(MessagePort.prototype, kPortCreateEvent, {
+    value(data, type) {
+      if (type !== "message" && type !== "messageerror") {
+        return NodeEventTarget.prototype[kPortCreateEvent].call(this, data, type);
+      }
+      return new globalThis.MessageEvent(type, { data, ports: [] });
+    },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  // A port the runtime makes for itself (a worker's parentPort).
+  function newMessagePort() {
+    return new MessagePort(kNewPort);
+  }
+  function messagePortState(port) {
+    return portState(port);
+  }
+
+  // node's MessageChannel is a C++ function constructor too: called without
+  // `new` it throws node's ERR_CONSTRUCT_CALL_REQUIRED, not V8's "Class
+  // constructor cannot be invoked without 'new'" (#401).
+  function MessageChannel() {
+    if (new.target === undefined) {
+      // node's C++ THROW_ERR_CONSTRUCT_CALL_REQUIRED: a plain TypeError with
+      // the code set on it, as the port's refusal above is.
+      const err = new TypeError("Cannot call constructor without `new`");
+      err.code = "ERR_CONSTRUCT_CALL_REQUIRED";
+      throw err;
+    }
+    this.port1 = new MessagePort(kNewPort);
+    this.port2 = new MessagePort(kNewPort);
+    portState(this.port1).twin = this.port2;
+    portState(this.port2).twin = this.port1;
+  }
+  // Globals as node defines them: writable, configurable, not enumerable.
+  for (const [name, value] of [["MessageChannel", MessageChannel], ["MessagePort", MessagePort]]) {
+    Object.defineProperty(globalThis, name, {
+      value,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+
   // --------------------------------------------------------- worker_threads
-  // MessageChannel / MessagePort are fully functional (in-process). Worker
+  // MessageChannel / MessagePort are the globals above (in-process). Worker
   // class has native-backed thread spawning via workerNew/workerRecvMessage/
   // workerPostMessage/workerTerminate ops.
   registry.factories.worker_threads = () => {
@@ -43212,40 +45141,6 @@
     // can check (actual enforcement is future; the mark is the contract).
     const _untransferableSet = untransferable;
 
-    class MessagePort extends EventEmitter {
-      constructor() { super(); this._twin = null; this._active = true; }
-      postMessage(data, transferList) {
-        if (Array.isArray(transferList)) {
-          for (const item of transferList) {
-            if (untransferable.has(item)) {
-              throw new DOMException(
-                "Cannot transfer object of unsupported type.",
-                "DataCloneError",
-              );
-            }
-          }
-        }
-        const twin = this._twin;
-        if (twin && twin._active) {
-          const cloned = (typeof data === "object" && data !== null) ? structuredClone(data) : data;
-          queueMicrotask(() => twin.emit("message", cloned));
-        }
-      }
-      start() { return this; }
-      close() { this._active = false; this.emit("close"); }
-      ref() { return this; }
-      unref() { return this; }
-      addEventListener(type, fn) { this.on(type, fn); }
-      removeEventListener(type, fn) { this.off(type, fn); }
-    }
-    class MessageChannel {
-      constructor() {
-        this.port1 = new MessagePort();
-        this.port2 = new MessagePort();
-        this.port1._twin = this.port2;
-        this.port2._twin = this.port1;
-      }
-    }
     const natives = globalThis.__oam.node;
     const pathMod = registry.get("path");
     /** The environment a new worker starts with, from the Worker's `env`
@@ -43299,7 +45194,39 @@
     const WORKER_ERROR_CLASSES = {
       Error, TypeError, RangeError, SyntaxError, ReferenceError, EvalError, URIError,
     };
+    /** What a worker's fatal run threw, rebuilt from the form
+     *  __oamSerializeWorkerError (bootstrap.js) sent, as node's
+     *  deserializeError rebuilds it (#399): an error is an object of the
+     *  named built-in class carrying the sent properties and an own
+     *  Symbol.toStringTag 'Error'; a Symbol is Symbol.for its description;
+     *  any other value is itself, or the string it was inspected as. */
+    function decodeWorkerValue(encoded) {
+      if ("u" in encoded) return undefined;
+      if ("big" in encoded) return BigInt(encoded.big);
+      if ("num" in encoded) return Number(encoded.num);
+      if ("err" in encoded) return deserializeWorkerError(encoded.err);
+      if ("s" in encoded) return encoded.s;
+      return encoded.j;
+    }
+    function deserializeWorkerError(serialized) {
+      if (serialized.kind === "string") return serialized.value;
+      if (serialized.kind === "symbol") return Symbol.for(serialized.value);
+      if (serialized.kind === "value") return decodeWorkerValue(serialized.value);
+      const Class = Object.hasOwn(WORKER_ERROR_CLASSES, serialized.ctor)
+        ? WORKER_ERROR_CLASSES[serialized.ctor]
+        : Error;
+      const properties = { __proto__: null };
+      for (const [key, value, enumerable, writable, configurable] of serialized.props) {
+        properties[key] = { value: decodeWorkerValue(value), enumerable, writable, configurable };
+      }
+      Object.defineProperty(properties, Symbol.toStringTag, {
+        value: { value: "Error", configurable: true },
+        enumerable: true,
+      });
+      return Object.create(Class.prototype, properties);
+    }
     function workerError(raw) {
+      if (raw.serialized !== undefined) return deserializeWorkerError(raw.serialized);
       const Class = Object.hasOwn(WORKER_ERROR_CLASSES, raw.name) ? WORKER_ERROR_CLASSES[raw.name] : Error;
       const err = new Class(raw.message);
       for (const [key, value] of raw.props || []) err[key] = value;
@@ -43370,6 +45297,14 @@
               ? opts.execArgv.map(String)
               : (process.execArgv || []).map(String),
             env,
+            // node's Worker shares its creator's options only when it is
+            // given neither: an `env` (other than SHARE_ENV or process.env
+            // itself) or an `execArgv` starts it from the defaults, with
+            // NODE_OPTIONS from that environment and then the execArgv
+            // (#370; src/node_worker.cc).
+            inheritFlags:
+              (opts.env == null || opts.env === SHARE_ENV || opts.env === process.env) &&
+              !Array.isArray(opts.execArgv),
           }),
         );
         this._workerId = result.workerId;
@@ -43504,20 +45439,34 @@
 
     let parentPort = null;
     if (!isMain) {
-      parentPort = new MessagePort();
+      parentPort = newMessagePort();
       parentPort.postMessage = function postMessage(data) {
         natives.parentPortPostMessage(JSON.stringify(data));
       };
+      // Its messages come from the parent thread, and the receive below is
+      // what holds the loop while it waits, not the port's own ref: the
+      // port's ref() / unref() -- its first 'message' listener, the last one
+      // going (off, a once listener that ran, onmessage = null) -- ref and
+      // unref that receive, so the worker exits once nothing listens, as
+      // node's does (#401).
+      const parentPortState = messagePortState(parentPort);
+      parentPortState.external = true;
+      parentPortState.onRef = (referenced) => natives.parentPortSetRef(referenced);
       // Start the receive loop LAZILY. It awaits a message that may never
       // come, and that pending op keeps the worker's event loop alive -- so
       // starting it eagerly meant any worker that merely required
       // worker_threads never exited, and a parent waiting on 'exit' hung
       // forever. Node refs the port when a 'message' listener is attached
       // (or start() is called), which is what this mirrors.
+      // start() alone does not ref the port (node's hasRef() stays false and
+      // the worker still exits), so the receive starts with the port's own
+      // ref-ness. A message that arrives while the port is stopped waits in
+      // its queue until a listener starts it again, as a port's does.
       let recvLoopStarted = false;
       const startRecvLoop = () => {
         if (recvLoopStarted) return;
         recvLoopStarted = true;
+        natives.parentPortSetRef(parentPortState.refed && !parentPortState.closed);
         (async () => {
           while (true) {
             let raw;
@@ -43525,19 +45474,19 @@
             if (raw === undefined) break;
             if (raw instanceof Uint8Array) {
               const text = new TextDecoder().decode(raw);
-              try { parentPort.emit("message", JSON.parse(text)); }
-              catch { parentPort.emit("message", text); }
+              let data;
+              try { data = JSON.parse(text); }
+              catch { data = text; }
+              if (parentPortState.closed) continue;
+              parentPortState.queue.push(data);
+              portScheduleDrain(parentPort, parentPortState);
             }
           }
         })();
       };
-      parentPort.on("newListener", (type) => {
-        if (type === "message") startRecvLoop();
-      });
-      parentPort.start = function start() {
-        startRecvLoop();
-        return this;
-      };
+      // A 'message' listener (any of on, addEventListener, onmessage) or
+      // start() starts the port, which starts the receive.
+      parentPortState.onStart = startRecvLoop;
     }
 
     const _bc = typeof globalThis.BroadcastChannel !== "undefined" ? globalThis.BroadcastChannel : null;
@@ -43552,7 +45501,20 @@
       MessagePort,
       Worker,
       BroadcastChannel: _bc || class BroadcastChannel { constructor() { throw new Error("BroadcastChannel not available"); } },
-      receiveMessageOnPort: () => undefined,
+      // node's receiveMessageOnPort: the next message waiting on the port,
+      // taken off its queue, as { message } -- undefined when none is (or
+      // the next thing waiting is the other end's close). It always
+      // answered undefined (#401). The refusal is node's C++ one.
+      receiveMessageOnPort: (port) => {
+        const state = port !== null && typeof port === "object" ? portStates.get(port) : undefined;
+        if (state === undefined) {
+          const err = new TypeError('The "port" argument must be a MessagePort instance');
+          err.code = "ERR_INVALID_ARG_TYPE";
+          throw err;
+        }
+        if (state.closed || state.queue.length === 0 || state.queue[0] === kPortClose) return undefined;
+        return { message: state.queue.shift() };
+      },
       markAsUntransferable,
       moveMessagePortToContext: () => { throw new Error("moveMessagePortToContext is not supported in oam"); },
       getEnvironmentData,
@@ -44444,6 +46406,11 @@
       // mock.timers) replaces the global: AbortSignal.timeout arms and unrefs
       // its timer with this, as node's arms it with its internal timers.
       registry._setTimeout = globalThis.setTimeout;
+      // The same for a MessagePort: its deliveries and close events run as
+      // immediates, and a ref'd port holds the loop with a timer, whatever a
+      // program has put in place of the globals (#401).
+      registry._setImmediate = globalThis.setImmediate;
+      registry._clearTimeout = globalThis.clearTimeout;
       // Exported for process.nextTick's per-entry ALS frame binding: each
       // queued tick captures the frame of ITS nextTick() call, not the frame
       // of whichever call scheduled the drain microtask.
@@ -44474,12 +46441,16 @@
                 // Node delivers a microtask throw to uncaughtException
                 // BETWEEN sibling microtasks, not after the checkpoint --
                 // the same canonical ladder as the nextTick drain (monitor +
-                // origin arg included). No consumer = rethrow into the
-                // engine ledger (fatal path unchanged).
-                const dispatch = globalThis.__oamDispatchUncaught;
-                if (typeof dispatch === "function" && dispatch(e, "uncaughtException")) {
-                  return;
-                }
+                // origin arg included).
+                //
+                // No consumer, or a listener that threw: fatal, and node
+                // exits right there -- no later promise job of the same
+                // drain runs (#398). The engine runs the ladder, notes the
+                // throw that comes next as an already-dispatched fatal, and
+                // ends the checkpoint at it. A listener's own throw it
+                // throws from here itself, having kept its throw site for
+                // the report, as node's names the listener's line.
+                if (natives.dispatchMicrotaskThrow(e)) return;
                 throw e;
               }
             });

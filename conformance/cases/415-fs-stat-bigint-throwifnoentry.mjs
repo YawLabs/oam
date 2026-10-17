@@ -1,6 +1,8 @@
 // fs's stat forms honour their options as node's do (#392):
 // `throwIfNoEntry` (statSync / lstatSync only: `false` itself answers
-// undefined for a path that is not there, ENOENT or ENOTDIR), `bigint` in
+// undefined for a path that is not there -- ENOENT, or for statSync alone
+// ENOTDIR, so lstatSync under a file still throws ENOTDIR on POSIX, where
+// that path is ENOTDIR rather than Windows' ENOENT), `bigint` in
 // every form (statSync, lstatSync, fstatSync, stat, lstat, fstat,
 // fs.promises.stat / lstat, FileHandle.stat) giving a BigIntStats with the
 // `*Ns` fields, node's unvalidated option reads (null throws reading them,

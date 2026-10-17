@@ -90,7 +90,7 @@ pub(crate) fn refuse_nul(syscall: &str, target: &str, path: &str) -> Result<(), 
 }
 
 #[cfg(windows)]
-pub(crate) use windows::{PipeListener, PipeRead, PipeWrite, bind, connect};
+pub(crate) use windows::{PipeListener, PipeRead, PipeWrite, bind, close_untaken, connect};
 
 #[cfg(unix)]
 pub(crate) use unix::{PipeListener, bind, connect};
@@ -538,17 +538,59 @@ mod windows {
 
     /// A listening named pipe: the instances waiting for the next clients,
     /// [`PENDING_INSTANCES`] of them as libuv keeps. Each connected instance
-    /// is handed out by [`PipeListener::accept`] and a fresh one takes its
-    /// place at once, so the name is never without a listening instance
+    /// is handed out by [`PipeListener::poll_accept`] and a fresh one takes
+    /// its place at once, so the name is never without a listening instance
     /// while the server is open.
+    ///
+    /// The instances wait inside the listener ([`Instance`]), so it is
+    /// accepted from where it sits, through `&mut self`, and never taken out
+    /// to be waited on: [`PipeListener::close`] reaches every one of them.
     pub(crate) struct PipeListener {
         path: String,
-        pending: Vec<NamedPipeServer>,
+        pending: Vec<Instance>,
     }
 
-    fn instance(path: &str, first: bool) -> io::Result<NamedPipeServer> {
-        ServerOptions::new().first_pipe_instance(first).create(path)
+    /// One instance waiting for a client: the instance, and the wait for a
+    /// client to connect to it, which holds the instance too.
+    struct Instance {
+        server: Arc<NamedPipeServer>,
+        wait: std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>>,
+        /// Whether the wait has been polled: from then on its connect
+        /// (ConnectNamedPipe) is in flight.
+        polled: bool,
     }
+
+    impl Instance {
+        fn new(server: NamedPipeServer) -> Instance {
+            let server = Arc::new(server);
+            let held = server.clone();
+            Instance {
+                server,
+                wait: Box::pin(async move { held.connect().await }),
+                polled: false,
+            }
+        }
+
+        /// The instance itself, its wait dropped.
+        fn into_server(self) -> NamedPipeServer {
+            let Instance { server, wait, .. } = self;
+            // The wait was the only other owner.
+            drop(wait);
+            Arc::into_inner(server).expect("an instance's wait is its only other owner")
+        }
+    }
+
+    fn instance(path: &str, first: bool) -> io::Result<Instance> {
+        ServerOptions::new()
+            .first_pipe_instance(first)
+            .create(path)
+            .map(Instance::new)
+    }
+
+    /// How long [`PipeListener::close`] waits for the reactor to finish
+    /// with the instances whose connect was in flight; as long as an http
+    /// server's close waits for its accept loop to drop its listener.
+    const CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
     /// Listen on the named pipe `target`, as libuv's `uv_pipe_bind`: the
     /// first instance is created with FILE_FLAG_FIRST_PIPE_INSTANCE, so a
@@ -587,48 +629,230 @@ mod windows {
             Ok(())
         }
 
-        /// The next client to connect, on whichever waiting instance it took.
-        pub(crate) async fn accept(&mut self) -> io::Result<(PipeRead, PipeWrite)> {
+        /// The next client to connect, on whichever waiting instance it
+        /// took. Polled where the listener sits (see
+        /// `crate::tcp::tcp_accept`): an instance that is not taken keeps
+        /// waiting, armed, for the next poll.
+        pub(crate) fn poll_accept(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<(PipeRead, PipeWrite)>> {
+            use std::task::Poll;
             loop {
                 // A failure to make one more instance is reported only when
                 // none is left waiting: the ones there still take clients.
                 if let Err(e) = self.top_up()
                     && self.pending.is_empty()
                 {
-                    return Err(e);
+                    return Poll::Ready(Err(e));
                 }
-                // tokio's connect is cancel safe: the waits not taken here
-                // stay armed for the next accept.
-                let (index, connected) = {
-                    let mut waits: Vec<_> = self
-                        .pending
-                        .iter()
-                        .map(|server| Box::pin(server.connect()))
-                        .collect();
-                    std::future::poll_fn(|cx| {
-                        for (index, wait) in waits.iter_mut().enumerate() {
-                            if let std::task::Poll::Ready(connected) = wait.as_mut().poll(cx) {
-                                return std::task::Poll::Ready((index, connected));
-                            }
+                let ready = self
+                    .pending
+                    .iter_mut()
+                    .enumerate()
+                    .find_map(|(index, waiting)| {
+                        waiting.polled = true;
+                        match waiting.wait.as_mut().poll(cx) {
+                            Poll::Ready(connected) => Some((index, connected)),
+                            Poll::Pending => None,
                         }
-                        std::task::Poll::Pending
-                    })
-                    .await
+                    });
+                let Some((index, connected)) = ready else {
+                    return Poll::Pending;
                 };
-                let server = self.pending.swap_remove(index);
+                // Its wait is done: never polled again.
+                let server = self.pending.swap_remove(index).into_server();
                 match connected {
                     Ok(()) => {
                         // Its replacement before this one is handed out. If
                         // it cannot be had now, the next accept tries again.
                         let _ = self.top_up();
-                        return Ok(split(End::Server(server)));
+                        return Poll::Ready(Ok(split(End::Server(server))));
                     }
                     // A client that connected and went before the connect
-                    // was seen: nothing to hand out; the instance is spent.
+                    // was seen: nothing to hand out; the instance is spent,
+                    // and the loop polls its replacement.
                     Err(e) if e.raw_os_error() == Some(ERROR_NO_DATA as i32) => {}
-                    Err(e) => return Err(e),
+                    Err(e) => return Poll::Ready(Err(e)),
                 }
             }
+        }
+
+        /// [`Self::poll_accept`] as a future, for a server that owns its
+        /// listener outright (the http servers over a pipe).
+        pub(crate) async fn accept(&mut self) -> io::Result<(PipeRead, PipeWrite)> {
+            std::future::poll_fn(|cx| self.poll_accept(cx)).await
+        }
+
+        /// Close the listener before returning, as libuv's `uv_close`
+        /// closes a pipe server's pending instances: a client that dials the
+        /// name right after it finds no such pipe (ENOENT), where it used to
+        /// connect to an instance the closed server still had open (#388).
+        ///
+        /// An instance whose connect was never issued closes when it is
+        /// dropped. One whose connect is in flight does not: the reactor
+        /// keeps it open until it has taken the connect's completion, which
+        /// it does on its own thread, a moment later. So each such instance
+        /// is first disconnected -- from then on it takes no client (a dial
+        /// finds the pipe busy, then gone), and its connect completes -- and
+        /// the close waits, bounded, until the reactor has taken that
+        /// completion (it marks the instance ready), after which dropping
+        /// the instance closes it. The bound only keeps a starved runtime
+        /// from holding the close up.
+        ///
+        /// An instance a client has connected to already, its connect done
+        /// but not yet accepted, is not disconnected: its client would read
+        /// ERROR_PIPE_NOT_CONNECTED, an EPIPE error, where node's reads the
+        /// end of the stream. It is closed as a connection never handed out
+        /// is ([`close_untaken`]), whether the reactor has seen its connect
+        /// done or the pipe itself says it has a client ([`has_client`]).
+        /// A client that connects between that answer and the disconnect
+        /// -- the width of two system calls -- reads the EPIPE.
+        pub(crate) fn close(mut self) {
+            let deadline = std::time::Instant::now() + CLOSE_BUDGET;
+            let mut connected = Vec::new();
+            let mut in_flight = Vec::new();
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            for mut waiting in std::mem::take(&mut self.pending) {
+                if !waiting.polled {
+                    continue;
+                }
+                let done = waiting.wait.as_mut().poll(&mut cx);
+                let server = waiting.into_server();
+                match done {
+                    std::task::Poll::Ready(Ok(())) => connected.push(server),
+                    // Its client came and went: nothing in flight on it.
+                    std::task::Poll::Ready(Err(_)) => {}
+                    // Done, but not yet seen done by the reactor.
+                    std::task::Poll::Pending if has_client(&server) => connected.push(server),
+                    std::task::Poll::Pending => {
+                        let _ = server.disconnect();
+                        in_flight.push(server);
+                    }
+                }
+            }
+            for server in connected {
+                close_connected(server, deadline);
+            }
+            for server in &in_flight {
+                block_until(deadline, |cx| {
+                    if server.poll_write_ready(cx).is_ready()
+                        || server.poll_read_ready(cx).is_ready()
+                    {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                });
+            }
+        }
+    }
+
+    /// Close, before returning, a connection a pipe server accepted but
+    /// never handed out -- its server closed first (#388) -- as libuv's
+    /// `uv_close` closes every instance the server holds, connected or not.
+    ///
+    /// A connected instance has a read in flight from the moment it
+    /// connected (the reactor reads ahead), and dropping it, like dropping
+    /// one whose connect is in flight ([`PipeListener::close`]), leaves the
+    /// reactor to close it once it has taken that read's completion. So the
+    /// read is cancelled first, and the close waits, bounded, until the
+    /// reactor has taken its completion (it marks the instance readable),
+    /// after which dropping the instance closes it: the client reads the end
+    /// of the stream, as from node's closed instance. Disconnecting it
+    /// instead (as [`PipeListener::close`] does an instance with no client)
+    /// would end the read too, but the client would read ERROR_PIPE_NOT_
+    /// CONNECTED -- an EPIPE error where node's client reads 'end'.
+    pub(crate) fn close_untaken(reader: PipeRead, writer: PipeWrite) {
+        drop(writer);
+        let Ok(shared) = Arc::try_unwrap(reader.0) else {
+            return;
+        };
+        if let End::Server(server) = shared.end {
+            close_connected(server, std::time::Instant::now() + CLOSE_BUDGET);
+        }
+    }
+
+    /// Whether a client is connected to server instance `server` now,
+    /// whatever the reactor has seen: PeekNamedPipe answers on a connected
+    /// instance and fails on one that is listening, disconnected or whose
+    /// client has gone.
+    fn has_client(server: &NamedPipeServer) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: the handle is the instance's own, open for as long as
+        // `server` lives, which is past the call; every out-pointer is null
+        // and the buffer size 0, so PeekNamedPipe writes nothing.
+        let peeked = unsafe {
+            windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                server.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        peeked != 0
+    }
+
+    /// Close a connected server instance before returning, its client
+    /// reading the end of the stream ([`close_untaken`]); the waits for the
+    /// reactor are bounded by `deadline`. First until the reactor has taken
+    /// the connect's completion, which issues the read-ahead and marks the
+    /// instance writable (at once for an accepted one); then the read-ahead
+    /// is cancelled.
+    fn close_connected(server: NamedPipeServer, deadline: std::time::Instant) {
+        use std::os::windows::io::AsRawHandle;
+        block_until(deadline, |cx| server.poll_write_ready(cx).map(|_| ()));
+        // SAFETY: the handle is the instance's own, open for as long as
+        // `server` lives, which is past the call. A null OVERLAPPED cancels
+        // every I/O this process has in flight on it -- here only the
+        // reactor's read-ahead: a connection never handed out has had no
+        // write. The reactor takes a cancelled read's completion as any
+        // other (mio's own drop of an instance cancels it the same way).
+        unsafe {
+            windows_sys::Win32::System::IO::CancelIoEx(server.as_raw_handle(), std::ptr::null());
+        }
+        block_until(deadline, |cx| server.poll_read_ready(cx).map(|_| ()));
+    }
+
+    impl Drop for PipeListener {
+        /// A listener dropped without [`PipeListener::close`] (an http
+        /// server's accept loop ending): every instance whose connect is in
+        /// flight is disconnected, so it takes no client while the reactor
+        /// still holds it open.
+        fn drop(&mut self) {
+            for waiting in self.pending.drain(..) {
+                if waiting.polled {
+                    let _ = waiting.into_server().disconnect();
+                }
+            }
+        }
+    }
+
+    /// Poll `poll` on this thread, parked between polls, until it is ready
+    /// or `deadline` passes.
+    fn block_until(
+        deadline: std::time::Instant,
+        mut poll: impl FnMut(&mut std::task::Context<'_>) -> std::task::Poll<()>,
+    ) {
+        struct Unpark(std::thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut cx = std::task::Context::from_waker(&waker);
+        while poll(&mut cx).is_pending() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            std::thread::park_timeout(left);
         }
     }
 
@@ -687,6 +911,42 @@ mod windows {
                 "the late flush was not cancelled"
             );
             drop(server);
+        }
+
+        /// #385, decided: oam's pipe server keeps tokio's
+        /// PIPE_REJECT_REMOTE_CLIENTS, which libuv does not set. A client
+        /// that names the pipe through a UNC server name -- even the loopback
+        /// `\\localhost\pipe\x` -- comes in through the SMB redirector and
+        /// counts as remote, so it is refused with ERROR_ACCESS_DENIED
+        /// (node's EPERM), where a node server hands it an fd (measured on
+        /// v22.22.2). A client on the local name connects as before. See
+        /// docs/node-divergences.md, entry 50.
+        #[tokio::test]
+        async fn a_client_dialling_through_a_unc_server_name_is_refused_as_remote() {
+            use windows_sys::Win32::Foundation::{ERROR_BAD_NET_NAME, ERROR_BAD_NETPATH};
+            let name = pipe_name("remote");
+            let leaf = name.strip_prefix(r"\\.\pipe\").unwrap();
+            let _listener = bind(&name, &name).unwrap();
+            assert!(ClientOptions::new().open(&name).is_ok(), "the local name");
+            for server in ["localhost", "127.0.0.1"] {
+                let unc = format!(r"\\{server}\pipe\{leaf}");
+                let refused = ClientOptions::new().open(&unc);
+                // A host whose SMB client (the Workstation service) is off
+                // has no way to the UNC name at all: nothing to pin there.
+                // A regression -- the remote client let in -- shows as a
+                // success, never as one of these.
+                let code = refused.as_ref().err().and_then(io::Error::raw_os_error);
+                if code == Some(ERROR_BAD_NETPATH as i32) || code == Some(ERROR_BAD_NET_NAME as i32)
+                {
+                    eprintln!("skipped {unc}: no SMB client on this host ({refused:?})");
+                    continue;
+                }
+                assert_eq!(
+                    refused.as_ref().err().and_then(io::Error::raw_os_error),
+                    Some(ERROR_ACCESS_DENIED as i32),
+                    "{unc}: {refused:?}"
+                );
+            }
         }
 
         fn has_gate(name: &str) -> bool {

@@ -88,7 +88,7 @@ something false.
 // oam — compat claims, identity, then the REAL dependency tree
 { node: '22.16.0', oam: <oam version>, v8: '15.0.245.2-rusty',
   ada, brotli, flate2, h2, hickory, hyper, icu, oxc, reqwest, ring, rustls,
-  tokio, unicode, url }
+  tokio, unicode, url, zstd }
 
 // Node v22.22.2 — 27 keys
 { node, acorn, ada, amaro, ares, brotli, cjs_module_lexer, cldr, icu, llhttp, modules,
@@ -125,6 +125,12 @@ vendored C++ ada read from the pinned `ada-url` crate's own `deps/ada.h` at
 build time, NOT the Rust binding crate's version, which moves independently and
 would put a number under a Node-owned name that means something else. oam's ada
 is simply newer than the one Node 22 bundles (3.4.4 vs 2.9.2).
+
+`zstd` IS published for the same reason: `node:zlib`'s zstd engine is libzstd itself,
+the C library Node links (`crates/oam_core/src/zstd.rs`, through the `zstd-safe`
+binding). The version is the vendored libzstd's, read from the pinned `zstd-sys`
+crate's own `zstd/lib/zstd.h` at build time, not either binding crate's version. It is
+the same libzstd as Node v22.22.2's: `1.5.7`.
 
 `icu` and `unicode` ARE published, because V8's bundled ICU is real: the values are
 read at build time from the version headers of the exact `v8` crate pinned in
@@ -216,14 +222,26 @@ That is the documented default, not an oversight.
 With `--permission`, filesystem read, filesystem write, network, and environment access
 are denied unless granted, enforced in the native ops rather than in JavaScript, so
 monkey-patching `fs` does not route around it. Denials throw Node's `ERR_ACCESS_DENIED`
-carrying `permission` and `resource`.
+carrying `permission` and `resource`, with node's message naming the flag that grants the
+scope ("Access to this API has been restricted. Use --allow-fs-read to manage
+permissions."); a denial of oam's own net or environment scope names `--allow-net` or
+`--allow-env` in the same form.
 
 Differences from Node's model:
 
 - **Node's grant flags are implemented**: `--allow-fs-read=`, `--allow-fs-write=`,
   `--allow-child-process`, `--allow-worker` and `--allow-addons`. `*` grants everything,
-  anything else is a comma-separated allow-list, and they round-trip through
-  `process.execArgv`. `process.execve` is gated on the ChildProcess permission, since
+  and they round-trip through `process.execArgv`. A list flag given more than once
+  grants every value, from the command line and `NODE_OPTIONS` alike, as in Node. An fs
+  entry with a `*` in it is read as Node reads it: what precedes the first `*` is a prefix,
+  so `dir/*` (and `dir\*` on Windows) grants `dir` and everything under it, `dir*` also
+  `dir-other`, and `/*` the whole root. **One difference: a value is a comma-separated
+  allow-list.** `--allow-fs-read=/a,/b` grants `/a` and `/b` in oam; Node v22 takes the
+  value as the single path `/a,/b`, so it grants neither, and when that is the flag's only
+  value it prints `Warning: The --allow-fs-read CLI flag has changed. Passing a
+  comma-separated list of paths is no longer valid.` oam keeps the list form it has always
+  documented; give each path its own flag to write a command line both runtimes read the
+  same way. `process.execve` is gated on the ChildProcess permission, since
   replacing the process image hands control to a binary this permission set does not
   describe.
 - **oam adds two grants Node does not have**: `--allow-net[=list]` and
@@ -346,14 +364,18 @@ still wins. Only these tokens are accepted:
 
 ```
 --pending-deprecation   --no-warnings   --no-deprecation   --expose-gc
+--trace-warnings   --trace-deprecation
 --disable-warning[=]    --redirect-warnings[=]
---max-http-header-size[=]   --insecure-http-parser
+--max-http-header-size[=]   --insecure-http-parser   --trace-require-module[=]
 --tls-min-v1.0  --tls-min-v1.1  --tls-min-v1.2  --tls-min-v1.3  --tls-max-v1.2  --tls-max-v1.3
 ```
 
 Everything else in the variable is **ignored, not rejected** — `NODE_OPTIONS` is usually
 set globally in a shell profile and legitimately carries flags oam has no opinion on, so
-an unknown token must not brick every `oam` invocation on the machine.
+an unknown token must not brick every `oam` invocation on the machine. For the same reason
+an allowlisted flag with a value node refuses -- `--trace-require-module=bogus`, an empty
+`--max-http-header-size=` -- is ignored there, where node exits 9 (`node: invalid value
+for --trace-require-module`); on the command line oam refuses it with exit 9 as node does.
 
 The exclusions are the point: nothing that **executes code or names a file** is accepted
 from the environment. `-e` / `--eval` / `-p` / `--input-type` / `--env-file` /
@@ -723,23 +745,42 @@ reads it without setting its own mode.
 _(source)_ Read out of both implementations, not measured side by side. Unix is unaffected:
 there oam applies libuv's `UV_TTY_MODE_RAW` recipe exactly (`raw_mode_bits`, same file).
 
-### 51. A process warning is printed without node's trace hint
+### 51. A process warning's trace hint -- FIXED; what still differs about the trace flags
 
-After the first warning of a process node prints, once, a line saying how to see where it
-came from:
+This entry used to record that oam printed a process warning without node's one-time hint
+line, because oam had neither flag the hint names. oam now has `--trace-warnings` and
+`--trace-deprecation`, on the command line, in `NODE_OPTIONS` and in a `Worker`'s own
+`execArgv`; they set
+`process.traceProcessWarnings` / `process.traceDeprecation`, and the default printer
+writes the warning's stack for the warnings they cover. Otherwise the first warning it
+prints carries node's hint, once per thread, naming the flag for that warning's kind
+after the program's name -- `basename(process.argv0)`, as node takes it, which is `oam`:
 
 ```
 (node:1234) [DEP_X] DeprecationWarning: first
-(Use `node --trace-deprecation ...` to show where the warning was created)
+(Use `oam --trace-deprecation ...` to show where the warning was created)
 ```
 
-oam prints the warning and not the hint. The hint names a flag (`--trace-deprecation`, or
-`--trace-warnings` for a warning that is not a deprecation) and oam has neither, so there
-is nothing true for it to say; printing node's line as it stands would send the reader to
-another program. Everything else about the printer is node's: it is the `onWarning`
-listener on `process`, removable like any other, absent under `--no-warnings` and
-`NODE_NO_WARNINGS=1` (conformance case 406, which takes the hint line out of both sides).
-The flags and the hint are #364.
+Conformance case 406 compares the hint with node's apart from that name, and each traced
+stack to its first frame (the frames below are each runtime's own module loader) (#364).
+
+What still differs (measured against node v22.22.2 on win32-arm64):
+
+- **`process.execArgv` lists the two flags in oam's fixed order**, after `--no-warnings` and
+  `--no-deprecation`, where node keeps the order they were given in: `--trace-deprecation
+  --no-warnings --trace-warnings a.js` reads back as `[--no-warnings, --trace-warnings,
+  --trace-deprecation]`. Every flag oam takes is listed this way (the `--tls-*` flags too, entry
+  34): `execArgv` is rebuilt from the parsed flags, not kept as typed.
+- **The `=value` spellings are refused.** node takes `--trace-warnings=<anything>` as the flag
+  set, the value ignored (probed: `=1`, `=0`, `=false`, `=foo` and a bare `=` all set
+  `process.traceProcessWarnings`, and `execArgv` keeps the spelling); oam stops with `unexpected
+  argument` (exit 2). `--no-warnings=1` is refused the same way. Taking them needs `execArgv` to
+  keep each flag as typed, the item above.
+- **Of the warning flags in a `Worker`'s own `execArgv`, oam applies `--no-warnings`,
+  `--trace-warnings` and `--trace-deprecation`.** `--no-deprecation` and `--disable-warning=X`
+  given there are listed in the worker's `execArgv` but not applied: the worker still prints
+  the deprecation, where node's sets `process.noDeprecation` / drops the warning. The same flags
+  given to the parent are inherited and applied.
 
 ### 53. Windows child windows: no console popup from a console-less oam, no `SW_HIDE` on std spawns
 
@@ -770,6 +811,50 @@ On POSIX a read in flight holds the parent's end until it returns (`child_unix.r
 with a blocking `poll`), so the pipe closes after the child's next write rather than at
 once, and that write is read and dropped; on Windows the close cancels the read.
 
+### 54. A primitive thrown from an ES module entry: no source frame, no trace hint
+
+A value that is not an Error -- `throw 42`, `throw "a string"` -- thrown at an ES module
+entry's top level is reported by node v22.22.2 as:
+
+```
+node:internal/modules/run_main:123
+    triggerUncaughtException(
+    ^
+42
+(Use `node --trace-uncaught ...` to show where the exception was thrown)
+```
+
+oam prints the value alone (`42`, and `'a string'` for the string, as `util.inspect`
+renders it), exit 1 as in node. Node's frame is the line of its own loader that rethrows
+the module's rejection; oam has no such source to point at, and a primitive carries no
+stack to place the throw by, so there is nothing true to print in its place. A primitive
+thrown from a `queueMicrotask` callback is the same kind of case: node's frame there is
+`<anonymous_script>:0` and an empty line, which name no source either, and oam prints the
+value alone.
+
+The hint names a flag oam does not have, as in #51. Everywhere oam has the throw's source
+frame -- a CommonJS entry, a timer, a tick, an `'uncaughtException'` listener -- the report
+of a value that is not a native Error is node's line for line apart from that hint: an
+empty line first, the value right under the caret, a primitive as `String()` gives it (a
+Symbol as an empty line), an object inspected (conformance case 473, which keeps the empty
+lines and takes the hint line out of both sides). Measured 2026-10-16 on Windows (#399
+item 6); `--trace-uncaught` is #364's kind of flag work.
+
+### 55. An unhandled rejection: oam's own report, and no `'uncaughtException'` for it
+
+node v22.22.2 (the default `--unhandled-rejections=throw`) turns a rejection nothing
+handles into an uncaught exception: an `'uncaughtException'` listener receives the reason
+with origin `'unhandledRejection'` and the process goes on, and with no listener the report
+is node's fatal one, the source frame of the rejecting call and the error, exit 1. oam
+prints `error[OAM-RT0004]: unhandled promise rejection: <reason>` and exits 1, and an
+`'uncaughtException'` listener is not offered the rejection. Measured 2026-10-16 on
+Windows: `process.on("uncaughtException", (e, o) => console.log(o));
+Promise.reject(new Error("x"))` prints `unhandledRejection` and exits 0 under node, and the
+RT0004 line with exit 1 under oam. The same holds for a promise an `'exit'` listener rejects
+and leaves unhandled, which oam began reporting in #399 (it was silent, exit 0): the exit
+code is node's, the report and the listener routing are not (conformance case 472 compares
+the status only). Not yet fixed; it needs its own change to the rejection path.
+
 ---
 
 ## Module loading and the CLI
@@ -797,13 +882,19 @@ oam emits Node's `MODULE_TYPELESS_PACKAGE_JSON` warning, once per `package.json`
 and not for a file under `node_modules`, a `require()`, or a file with no `package.json`.
 Conformance cases 462-465 pin the shapes byte for byte against Node.
 
-What still differs: `require()` of such a file that has module syntax throws
-`ERR_REQUIRE_ESM` (entry 9), and the warning has no trace hint line (entry 51). A typeless
+What still differs: a typeless
 `.ts`/`.tsx` is still an ES module whatever its syntax (entry 24), and a typeless `.jsx`
 outside `node_modules` too: Node runs no JSX to follow.
 
 To keep a file an ES module without the warning, add `"type": "module"` to its
 `package.json` or name it `.mjs`.
+
+`require()` of a typeless project `.js` decides as node does: CommonJS, unless it has
+syntax only an ES module has, in which case it is loaded as one (entry 9). The difference
+is in how oam runs such a file as the entry point or through `import`.
+
+Fixes, in order of preference: add `"type": "commonjs"` to your `package.json`, rename the
+file to `.cjs`, or convert it to `import`.
 
 ### 8. The `"module"` field is preferred over `"main"`
 
@@ -821,14 +912,61 @@ and this is invisible (it also avoids a needless CJS-to-ESM hop). It is observab
 package's two builds genuinely differ. `"exports"`-bearing packages — nearly everything
 modern — are unaffected, because `"exports"` wins in both runtimes.
 
-### 9. `require()` of an ES module throws
+### 9. `require()` of an ES module -- FIXED, no longer a divergence
+
+This entry used to record that oam threw `ERR_REQUIRE_ESM` for every `require()` of an ES
+module while `process.features.require_module` said `true`. It now does what node 22 does
+by default: the graph loads and evaluates synchronously inside the `require()`, which
+returns the namespace -- or the facade namespace that adds `__esModule: true` when there
+is a default export and no own `__esModule`, or the value of an export named
+`'module.exports'`. A graph with a top-level await is `ERR_REQUIRE_ASYNC_MODULE`, whether
+it never ran, is part-way through its await, or has finished under an `import`; a cycle
+through a module still loading or evaluating is `ERR_REQUIRE_CYCLE_MODULE` (node's
+wordings); an evaluation error, or the throw of a CommonJS module the graph imports, is
+rethrown as the same object on every later `require()` or `import()` without running
+anything again; an import that does not resolve is `ERR_MODULE_NOT_FOUND`, every time. A
+typeless file with module syntax is detected as an ES module, inside `node_modules` too.
+No ticks or promise jobs run before `require()` returns, and the module shares the one
+module map with `import()`. The ExperimentalWarning is printed only under
+`--trace-require-module`. `require.cache` is node's `Module._cache`, ES modules loaded
+through `require()` included: deleting an entry reloads, a planted entry is returned.
+Conformance cases 430-434 and 440-442. What still differs is entry 52.
+
+### 52. `require()` of an ES module: a CommonJS dependency runs early, and what follows from it
 
 ```js
-require('./thing.mjs')   // oam: ERR_REQUIRE_ESM.  Node 22: works.
+// e.mjs:  import './a.mjs'; import './c.cjs';     (a.mjs imports b.mjs)
+//   node: b, a, c, e        oam: c, b, a, e
+// t.mjs:  import c from './c.cjs'; await 0; export const x = c;
+require('./t.mjs')   // both: ERR_REQUIRE_ASYNC_MODULE.  oam prints c's output first; node does not.
 ```
 
-Node 22 added synchronous `require()` of an ESM graph. oam has not implemented it yet;
-use `await import()`. This is a gap, not a policy — it is on the roadmap.
+oam runs a CommonJS module an ES graph imports while it loads the graph (its exports
+become the facade's named exports), where node runs it when the graph evaluates. So in
+any graph, `require()`d or imported, a CommonJS dependency runs before the ES modules
+that come ahead of it in the graph's evaluation order -- the modules imported earlier in
+source order, and what they import. The ES modules themselves run in node's order. Three
+things follow:
+
+- a graph `require()` refuses for a top-level await has already run its CommonJS modules
+  (node finds the await after instantiating the graph and runs none of it); its ES modules
+  run in neither;
+- the cycle check replays the evaluation node would be in when the CommonJS module runs,
+  so `ERR_REQUIRE_CYCLE_MODULE` is raised for the same graphs, but where the two runtimes
+  reach the cycle at different points it can name a different module and use the other
+  wording of the two node has: oam's `Cannot import Module ./e.mjs in a cycle. (from
+  b.mjs)` where node says `Cannot require() ES Module b.mjs in a cycle. (from c.cjs)`;
+- an `import()` that such a CommonJS module makes is only resolved inside the
+  `require()`; its graph loads and evaluates in promise jobs after the `require()` has
+  returned, as node's does (#397). The requiring code's own ticks and promise jobs wait
+  until the `require()` returns, as in node (conformance case 441). What still differs is
+  when a CommonJS module that `import()` loads runs: on the first microtask turn after the
+  call in oam, where node runs it on the eighth (with the evaluation of an ES module in the
+  same place). When that `import()` settles is node's either way (conformance case 481).
+
+One message differs on its own: an unresolved bare specifier whose package was found but
+whose file was not is `ERR_MODULE_NOT_FOUND` with oam's message, which lists the
+candidates tried, where node names the one file it resolved to.
 
 ### 24. TypeScript module kind: `.ts`/`.mts` are always ES modules
 
@@ -838,7 +976,7 @@ including `"type": "commonjs"`.
 
 ```js
 // package.json: { "type": "commonjs" }
-require('./util.ts')   // oam: ERR_REQUIRE_ESM.  Node 22 type stripping: works (CommonJS).
+require('./util.ts')   // oam: loaded as an ES module.  Node 22 type stripping: CommonJS.
 ```
 
 Node 22's type stripping honors the package `"type"` walk for `.ts`, so the same file is
@@ -847,6 +985,11 @@ require()d, or `import` it. (`.tsx`/`.jsx` DO follow the package `"type"` walk, 
 `.js`, and transpile on whichever path they land.) Under a `package.json` with no `"type"`,
 Node decides a `.ts` file by its syntax, as it does a `.js` file (entry 7); oam does not,
 and runs it as an ES module.
+
+CommonJS there. oam's `require()` loads it as the ES module it takes it to be (entry 9), so
+a file written as CommonJS (`module.exports = ...`) fails there with `module is not
+defined`. In oam, use `.cts` for TypeScript written as CommonJS. (`.tsx`/`.jsx` DO follow the package `"type"` walk, like
+`.js`, and transpile on whichever path they land.)
 
 ### 25. Source maps are always on, so `Error.prepareStackTrace` is pre-installed
 
@@ -1246,12 +1389,17 @@ entries below were executed on both runtimes unless marked.
 | `zlib` one-shot forms (`deflateSync`, `gunzip`, `brotliCompress`, ...): stream options | Checked as Node's engine checks them (`highWaterMark` and its readable / writable forms, then a truthy `signal`), and a callback form honours its `signal`: an abort before the output calls back `AbortError` with the reason as `cause`. Nothing else in the options reaches a stream, because the work is not done by one: a `transform`, `flush` or `final` function in the options is not called. The `info` engine is built without the `signal`. | The call runs on a stream built from the options, so such functions replace the stream's own (`zlib.deflate('x', { transform(c, e, cb) { cb(null, Buffer.from('zz')) } }, cb)` calls back 4 bytes, not the 9 of the deflated `'x'`). |
 | `zlib` stream `params()` with writes before its callback | The `Z_SYNC_FLUSH` and the new level take their place in the write order: every write made after the `params()` call compresses at the new level. Writes made from the callback (or later) behave as in Node. | The level changes when the callback runs, so a write queued behind the flush goes at the old level, and one in progress then fails the stream: `deflate.params(6, 0, cb); deflate.end(data)` is `Z_STREAM_ERROR` (errno `-2`) `stream error`, and the same on a `Gzip` is `Z_OK` `unexpected end of file`. |
 | `zlib` Brotli stream `params()` | Validated as in Node, then a no-op: the stream carries on. | Node's `BrotliCompress` inherits `params()` from the zlib streams; after it, the stream fails with `ERR_BROTLI_COMPRESSION_FAILED` `Compression failed`. |
-| `zlib` stream `flush()`, `reset()`, `close()` | Absent on oam's zlib and brotli streams (`params()` flushes internally). `destroy()` and `end()` work. | Present. |
+| `zlib` stream `flush()`, `reset()`, `close()` | Absent on oam's zlib and brotli streams (`params()` flushes internally). `destroy()` and `end()` work. The zstd streams have all three, as in Node. | Present. |
+| `zlib` zstd: `params[ZSTD_c_enableLongDistanceMatching]` of `2` | Accepted, as in Node, but applied as `0` ("auto") rather than "disable": the binding oam drives libzstd through takes the parameter as a boolean. The two differ only where libzstd's auto mode turns long-distance matching on (strategy `ZSTD_btopt` or above with a window of 2^27 or more), and there the compressed bytes differ while the data still round-trips. Every other zstd parameter value reaches libzstd 1.5.7 as Node passes it, so the compressed bytes are Node's. | Disables long-distance matching. |
+| `zlib` zstd: a chunk changed while it is being compressed | The handle copies each chunk once, when it starts on it, and reads that copy until the chunk is consumed, so a write to the caller's buffer between two of the stream's libzstd calls (possible only with the asynchronous forms, which run each call on the thread pool) is not seen. Reading the caller's buffer afresh on every call would mean copying the unconsumed rest of the chunk once per 16 KiB output window, which is quadratic in the chunk's size. | Reads the caller's buffer in place on every call, so a later call sees the change. |
 | `TextDecoder` | **utf-8 and windows-1252 only** (`fatal` and `ignoreBOM` honored on utf-8; windows-1252 is total, so neither applies). Both take the full standard label set for their encoding, so `latin1` / `iso-8859-1` / `ascii` resolve to windows-1252 as the standard requires. Any other label throws a `RangeError` with `code: 'ERR_ENCODING_NOT_SUPPORTED'`. | Also utf-16le/be, the ISO-8859-* family, the CJK legacy encodings, ... |
 | Web streams: start / pull / write / ready ordering | **Matches node** (no longer a divergence). The controllers follow the standard's algorithms in node's shape: a `ReadableStream` makes its initial pull once `start()` settles and fills to its high-water mark; a `WritableStream` honors its strategy (`desiredSize`, `ready`, backpressure) and writes one chunk at a time after `start()`; a `TransformStream`'s readable side defaults to a high-water mark of 0, so `transform()` waits for a read. `size()` is consulted and validated as node validates it. `pipeTo()` / `pipeThrough()` follow node's `readableStreamPipeTo`: each step waits for the destination's `ready` and starts its write without awaiting it, so the destination fills to its high-water mark; errors and closes on either side, and `options.signal`, shut the pipe down with node's actions. Pinned microtask for microtask by `conformance/cases/298-web-streams-initial-pull.mjs`, `299-web-streams-writable-transform-backpressure.mjs` and `343-web-streams-pipe-to.mjs`. | Same. |
-| `worker_threads.receiveMessageOnPort` | Always returns `undefined`. | Returns `{ message }`. |
+| `MessageChannel` / `MessagePort` | **In-process only.** The globals are the constructors `node:worker_threads` exports, and a port is node's `NodeEventTarget` (#401): queued until started (a `'message'` listener of any kind, or `start()`), `on()` handed the data and `addEventListener` / `onmessage` a `MessageEvent`, a batch delivered from the loop's pending phase with every tick and microtask a listener queued run before the next message, ref'd while it has a `'message'` listener, `close()` reaching the other end behind what was already sent, and `receiveMessageOnPort` taking from the queue (`conformance/cases/417-abort-plumbing.mjs`). What differs: a port cannot be transferred -- a `MessagePort` in a port's transfer list is a `DataCloneError` -- so a channel cannot span two threads; the hold on the loop is a timer, so `process.getActiveResourcesInfo()` lists a `Timeout` where node lists a `MessagePort`; `eventNames()` lists the types with listeners, without node's own `newListener` / `removeListener` entries; and `util.inspect(port)` prints oam's `EventTarget` form, not node's `MessagePort [EventTarget] { active, refed, ... }`. A worker's `parentPort.close()` does not end the worker while its receive is pending (its last `'message'` listener going does, as in node). A `MessagePort` inside a posted message (or passed to `structuredClone`) without being in the transfer list is cloned into a broken stand-in where node throws `DataCloneError` ("Object that needs transfer was found in message but not listed in transferList"), and `structuredClone` clones host objects node refuses (`URL`, `Headers`, `Response`, `URLSearchParams`, a `Proxy`) and keeps prototypes. `MessagePort` and `MessageChannel` are function constructors with node's `length`, own members and refusals, but strict ones (no own `arguments` / `caller`), and the `NodeEventTarget` / `EventTarget` methods under them are not enumerable as node's are. The abort `Event` (what `util.aborted` resolves with) has `isTrusted` false. | Ports transfer between threads; a native handle. |
+| An error whose stack cannot be built; `util.format('%s')` | Inspecting an error whose `name` is a Symbol or a throwing getter prints `[object Error]` with its keys, as node's `formatError` does (#401), and `%s` inspects what node's `hasBuiltInToString` calls built in. What differs: thrown uncaught, such an error is reported as that inspect form (`[object Error] { name: Symbol(q) }`) where node prints `: s`; and the inspect form `%s` hands on still differs where `util.inspect` does -- a settled Promise at depth 0 `Promise {}` (node `Promise { 1 }`), and `Headers`, `AbortSignal`, `TextEncoder` and an `EventEmitter` print oam's internal fields. | Same as `util.inspect`. |
 | `worker_threads.moveMessagePortToContext` | Throws `not supported in oam`. | Supported. |
 | `new Worker(source, { eval: true })` | Throws `new Worker(source, { eval: true }) is not supported in oam` from the constructor. (Before #287 the source was resolved as a path and the constructor threw `worker script not found`.) A `data:` URL entry is not run either: it throws `ERR_INVALID_URL_SCHEME`. | Runs the source (or the `data:` URL) as the worker's script. |
+| A Worker's JS stack depth (#395) | **A quarter to a third of node's worker depth.** Since #395 a worker thread has node's 4 MiB stack, so deep recursion through a sync op on a worker ends in a catchable `RangeError` and never aborts the process (conformance case 571). V8's JS limit on that thread is its default, ~984 KiB below where the isolate starts, as on the main thread. Measured on Windows 11 arm64, a bare `function r() { n++; r(); }` reaches 10,100-15,000 levels in an oam worker (it varies from run to run, debug and release alike) and 41,588 in a node v22.22.2 worker, every run. Matching it means handing V8 the thread's real stack bounds when the isolate is made (`CreateParams::set_stack_limit`, an `unsafe` call the v8 crate exposes, against the unsafe budget), so it waits on that decision. `resourceLimits.stackSizeMb` is not honoured either: every worker gets 4 MiB. | The worker thread is 4 MiB (`resourceLimits.stackSizeMb`), and V8's limit is moved to 192 KiB above the stack's end, so worker JS has ~3.8 MiB to recurse in. |
+| Where deep JS recursion runs out (#395) | **Not at node's depth.** V8 sets the JS limit (~984 KiB below where the isolate starts) in both, but oam's frames for the same JS are not node's: on Windows 11 arm64 a bare `function r() { n++; r(); }` on the main thread reaches 10,100-11,700 levels in oam (varying from run to run) against node v22.22.2's 9,180 (every run). So JS-recursive walks that run out in node can finish in oam. `fs.cpSync(src, dst, { recursive: true, filter })` of a directory chain 1500 deep completes in oam where node throws `RangeError: Maximum call stack size exceeded`; at 2500 and 3000 deep both throw it. `fs.rmSync(dir, { recursive: true })` of a chain 1500 or 3000 deep completes in oam, whose removal is native and iterative, where node's JS rimraf (`internal/fs/rimraf`) throws `RangeError`. Without a `filter`, `cpSync` of either depth completes in both. What oam guarantees, as node does, is that running out ends in a catchable `RangeError` and never kills the process (conformance cases 570 and 571, and, on Windows, the e2e test of a 2500-deep `cpSync` with a filter, whose ~5000-character path is past PATH_MAX on macOS and Linux). | The JS-recursive walks (`cpSync` with a `filter`, `rmSync` recursive) throw `RangeError` once a chain is deep enough for node's frames, 1500 levels on Windows. |
 | `new Worker(filename)`: how the entry runs | Found and run as Node does (#287, `conformance/cases/413-worker-entry-resolution.mjs`): `ERR_WORKER_PATH` for a string that is not absolute or `./` / `../`-relative; a missing entry makes the Worker, which emits `'error'` with `MODULE_NOT_FOUND` and exits 1; `.js` and a directory's index are searched; an unknown extension (`x.txt`, `x.js.`) runs as CommonJS, or fails `ERR_UNKNOWN_FILE_EXTENSION` in a `"type": "module"` package or when it has module syntax. A directory entry reads its package.json as Node's does: one that is not a JSON object fails `ERR_INVALID_PACKAGE_CONFIG`, and a `main` that resolves to nothing, with no index, fails `MODULE_NOT_FOUND` with Node's "Please verify that the package.json has a valid \"main\" entry" message and `path` / `requestPath`. Five differences remain: an extensionless entry (`bin`, `.hidden`) that Node runs as an ES module (in a `"type": "module"` package, or for its syntax) fails `unsupported module type`, oam's ES module host loading no extensionless file; a `.json` entry in a `"type": "module"` package runs (and does nothing) where Node fails `ERR_IMPORT_ATTRIBUTE_MISSING`; and a Windows `\\?\` entry path runs the file it names, where Node's main-entry realpath fails it with `EISDIR` `lstat 'C:'`; a bad `main` that falls back to the index runs it without Node's `DEP0128` deprecation warning (oam's `require()` of such a directory does not emit it either); and an entry run as CommonJS (`.cjs`, and the `x.txt` / `x.js.` / extensionless files #287 made runnable) has no dynamic `import()`: it rejects `oam: dynamic import('...') is not wired up on this entry path`, where Node's resolves. An error the entry's own code throws reaches `'error'` as an `Error` carrying oam's diagnostic text, not as the thrown object's class and properties. | The worker's error object, serialized, in every case. |
 | `http.Server.setTimeout(ms, cb)` | Stores the value; the callback never fires and no `'timeout'` is emitted. The native HTTP layer owns connection sockets. | Fires. |
 | `process.stdout` / `process.stderr`: the reader goes away (`EPIPE`) | The program exits 0, quietly -- including when a Windows pipe server disconnects (`ERROR_PIPE_NOT_CONNECTED`, which node names `EPIPE`). | `'error'` with `EPIPE`; with no listener the program dies of it. |
@@ -1263,6 +1411,7 @@ entries below were executed on both runtimes unless marked.
 | `fs.lstat` of a symlink, Windows | `size` is 0 (both forms). | `size` is the byte length of the link target. |
 | `fs.watchFile` | The listener fires only when `mtimeMs` changes; a chmod, and the file being deleted, report nothing. | libuv's fs_poll fires on any change to the stat (mode, size, ctime, ...), and on deletion with an all-zero `curr`. |
 | `fs.fstat` on a closed but in-range descriptor | `EBADF` reaches the callback on the next tick, ahead of stats queued earlier, with a multi-line stack. | `EBADF` arrives from the threadpool in submission order, with a one-line stack. |
+| `fs.openAsBlob` | **Matches node** (#373, #374) apart from the one case here: the call validates, opens and fstats synchronously, so every failure throws at the call (`ERR_INVALID_ARG_VALUE` "Unable to open file as blob", a `--permission` denial its own `ERR_ACCESS_DENIED`); the Blob is file-backed, read only when it is, and each read fails `NotReadableError` once the file's size or the nanosecond part of its mtime differs from the open's (node's `CheckModified`); slices, Blobs made of it and bodies keep the file part; `\\.\NUL` is a 0-byte Blob (#383). Conformance cases 521, 522 and 524. What differs: a bare DOS device name given as a relative path (`openAsBlob('NUL')`, Windows) is resolved against the working directory, as `fs.openSync` resolves it in both runtimes, and so fails `ERR_INVALID_ARG_VALUE`. | node's binding opens that path unresolved, so `openAsBlob('NUL')` is the NUL device's 0-byte Blob. |
 | `os.cpus()[n].times` | All zeroes. | Real tick counters. |
 | `os.loadavg()` | Always `[0, 0, 0]` _(source)_. Matches Node on Windows; diverges on Linux/macOS. | Real load average on POSIX. |
 | `node:v8` `serialize`/`deserialize` | JSON under a V8-shaped header — a `Map` does not round-trip as a `Map`. | Real structured serialization. |
@@ -1270,8 +1419,67 @@ entries below were executed on both runtimes unless marked.
 | `node:inspector` `Session` | **Not backed in-process.** `post()` fails the request with `ERR_INSPECTOR_NOT_AVAILABLE` rather than invoking the callback with an empty CDP result — a fabricated success is worse than a refusal, because the caller reads it as "the command ran and returned nothing". `url()` no longer answers a fixed `ws://127.0.0.1:9229/0` for a socket that was never bound. The real inspector is a CLI flag: `oam run --inspect` / `--inspect-brk`. | Full CDP over the in-process session. |
 | `node:trace_events` | `createTracing().enable()` succeeds but `getEnabledCategories()` stays empty — there is no trace backend. | Real tracing. |
 | `node:repl`, `node:readline` | Minimal: enough to import, construct, and iterate lines. | Full. |
-| Web globals | Missing vs Node 22: `CompressionStream`, `DecompressionStream`, `Crypto`, `CryptoKey`, `SubtleCrypto`, `CustomEvent`, `MessageChannel`, `Navigator`, `Performance`, `PerformanceObserver` (and the `Performance*` entry classes), and the `ReadableStream*`/`WritableStream*`/`TransformStream*` controller and reader constructors. The lowercase instances (`crypto`, `performance`, `navigator`) are present, and `getReader()` works — only the constructors are unexposed. | Present. |
-| `ReadableStream` byte streams | Default readers only. `new ReadableStream({ type: 'bytes' })` queues as node's byte controller does -- a high-water mark of 0 unless the strategy names one, `desiredSize` counted in bytes, a chunk that is not an `ArrayBufferView` refused with node's `ERR_INVALID_ARG_TYPE` before anything is queued (the stream stays readable, and a read already waiting is not handed it), and every chunk handed to a reader a `Uint8Array` over the enqueued view's bytes -- so it pulls exactly when node's does and reads what node's reads. What it lacks: the controller is a `ReadableStreamDefaultController` with no `byobRequest`, so `source.autoAllocateChunkSize` is read and 0 refused as node refuses it, but otherwise has nothing to size; `getReader({ mode: 'byob' })` ignores the mode and returns a default reader rather than a `ReadableStreamBYOBReader`; an enqueued view's buffer is not transferred (node detaches it, so the caller's view reads `byteLength` 0 afterwards), so the chunk a reader gets shares memory with the enqueued view, and an enqueued `Uint8Array` is handed on as the same object where node hands on a new view; and a zero-length chunk is accepted where node throws `ERR_INVALID_STATE` (`chunk ArrayBuffer is zero-length or detached`). The byte streams the runtime builds -- `fetch` response bodies, `Response`/`Request` bodies, `Blob#stream()`, `fsPromises.FileHandle.readableWebStream()` -- are byte streams in this sense, as node's are, so none of them reads before a read asks; default-reader and `for await` consumption match byte for byte (`readableWebStream()` on node's 16384-byte `autoAllocateChunkSize` boundaries, from the handle's current cursor), and only a BYOB reader diverges. | Real byte streams, `byobRequest`, buffer transfer, and BYOB readers. |
+| Web globals | Missing vs Node 22: `CompressionStream`, `DecompressionStream`, `Crypto`, `CryptoKey`, `SubtleCrypto`, `Navigator`, `Performance`, `PerformanceObserver` (and the `Performance*` entry classes), and the `ReadableStream*`/`WritableStream*`/`TransformStream*` controller and reader constructors. The lowercase instances (`crypto`, `performance`, `navigator`) are present, and `getReader()` works — only the constructors are unexposed. | Present. |
+| `ReadableStream` byte streams | `new ReadableStream({ type: 'bytes' })` queues as node's byte controller does -- a high-water mark of 0 unless the strategy names one, `desiredSize` counted in bytes, a chunk that is not an `ArrayBufferView` refused with node's `ERR_INVALID_ARG_TYPE` before anything is queued (the stream stays readable, and a read already waiting is not handed it), and every chunk handed to a reader a `Uint8Array` over the enqueued view's bytes -- so it pulls exactly when node's does and reads what node's reads. BYOB reads are node's (#372): `getReader({ mode: 'byob' })` gives a reader whose `read(view, { min })` transfers the view's buffer and is filled from the queue -- at most the view, across chunks, the rest left queued, whole elements only -- or waits for an enqueue or for the source's answer through `controller.byobRequest` (`view`, `respond()`, `respondWithNewView()`); a close with a read pending leaves it for `respond(0)`, as node's does, and `tee()` of a byte stream is node's `ReadableByteStreamTee` (two byte streams, a copy for the other branch). Conformance case 520. What it lacks: `source.autoAllocateChunkSize` is read and 0 refused as node refuses it, but a default read is given no `byobRequest` to fill; an enqueued view's buffer is not transferred (node detaches it, so the caller's view reads `byteLength` 0 afterwards), so the chunk a reader gets shares memory with the enqueued view, and an enqueued `Uint8Array` is handed on as the same object where node hands on a new view; a zero-length chunk is accepted where node throws `ERR_INVALID_STATE` (`chunk ArrayBuffer is zero-length or detached`); and the reader, request and controller classes are not globals (the row above). The byte streams the runtime builds -- `fetch` response bodies, `Response`/`Request` bodies, `Blob#stream()`, `fsPromises.FileHandle.readableWebStream()` -- are byte streams in this sense, as node's are, so none of them reads before a read asks; default-reader and `for await` consumption match byte for byte (`readableWebStream()` on node's 16384-byte `autoAllocateChunkSize` boundaries, from the handle's current cursor), and a BYOB read of `readableWebStream()` reads into the view, as node's does. | `autoAllocateChunkSize` and buffer transfer on enqueue. |
+
+### 58. `worker_threads`: a Worker's options and its fatal exit, what still differs
+
+Matching node v22.22.2 (no longer divergences; conformance cases 490 and 491):
+
+- **A Worker's process flags (#370).** A Worker given neither `env` (other than `SHARE_ENV` or
+  `process.env` itself) nor `execArgv` shares its creator's options (the creating worker's own,
+  when a worker creates it); given either, it starts from
+  node's defaults, takes `NODE_PENDING_DEPRECATION` and `NODE_OPTIONS` from the environment it is
+  given (its creator's, when it is given none), then its `execArgv` (its creator's
+  `process.execArgv`, when it is given none). `NODE_NO_WARNINGS` is read from the worker's own
+  `process.env`. This covers the per-environment flags oam has: `--no-warnings`,
+  `--no-deprecation`, `--pending-deprecation`, `--disable-warning`, `--redirect-warnings`,
+  `--trace-require-module` and the `--tls-min/max-v1.x` defaults. `--title` and
+  `--zero-fill-buffers` are the whole process's.
+- **`stderr: true` (#370).** What the worker writes to `process.stderr`, the default warning
+  printer included, goes to `worker.stderr`.
+- **A fatal run (#399 items 3 and 4).** The worker emits `'exit'` with 1 on its own `process`
+  before the parent's `'error'` (nothing an `'exit'` listener queues runs; the thread exits with
+  the `exitCode` the listeners leave; no `'exit'` when an `'uncaughtException'` listener threw),
+  the parent's `'error'` carries the error that ended the run (not a failed `import()`, or
+  `require()` of an ES module, that the worker caught) as node's error serializer rebuilds it, a
+  cause chain of any depth included, and nothing is printed.
+
+What still differs, measured on Windows:
+
+- **An `execArgv` flag node refuses.** node's constructor throws `ERR_WORKER_INVALID_EXEC_ARGV`
+  for a flag that is not a per-environment option (`--title=x`, `--expose-gc`) or that it does not
+  know (`--bogus-flag`). oam starts the worker; the flag appears in its `process.execArgv` and has
+  no effect. Only the per-environment flags above, read with the same allowlist as `NODE_OPTIONS`
+  (section 5), take effect.
+- **Values the V8 serializer would keep.** JSON stands in for it, as for `postMessage`: an error
+  property or a thrown object that holds a `Map`, `Set`, `Date`, typed array or `undefined` member
+  reaches the parent as its JSON form (a cyclic one as its `util.inspect` string). Top-level
+  `undefined`, a `BigInt` and a non-finite number are kept. The `UnhandledPromiseRejection` error
+  for a non-`Error` rejection names an object reason `#<Constructor>`, which is what V8's
+  NoSideEffectsToString gives for a plain object, and its `stack` lists oam's frames, not node's.
+- **A thrown `DOMException`, and an `AggregateError`'s `errors`.** node's parent gets a
+  `DOMException` back as an `Error` with message `''` and one own key, `stack`; oam's parent gets
+  the plain object `{ name: 'AbortError' }` (an `Object`, `message` undefined), since a
+  `DOMException` is not `[object Error]` to the serializer. An `AggregateError` arrives as one in
+  both, but node's `errors` entries are rebuilt `Error`s (own keys `stack,message`) where oam's are
+  empty plain objects, the JSON form of an `Error`. Both follow from JSON standing in for the V8
+  serializer (the item above).
+- **`worker.stderr` without `stderr: true`.** node pipes the worker's stderr through
+  `worker.stderr` to `process.stderr`, so a parent listening for `'data'` on it sees the output
+  too (measured: `console.error('ce3')` in a worker, parent collects `"ce3\n"`). oam writes the
+  worker's stderr straight to the process's stderr; the text is printed but `worker.stderr` emits
+  nothing. This predates #370, which only changed `stderr: true`.
+- **A synchronous throw from a CommonJS worker entry's top level.** node runs the ticks queued
+  before the throw first, then handles the throw, and calls each of the worker's
+  `'uncaughtException'` listeners twice for it (measured: `tick 1 | caught #1 | caught #2`, then
+  the promise jobs). oam handles it at once and calls each listener once; on a fatal throw the
+  queued ticks do not run. A throw from an ES module entry, a timer or a promise job matches.
+- **`process.exit()` inside a worker ends the whole process.** node ends only the worker's thread
+  (its `'exit'` event gets the code, and a fatal run whose `'exit'` listener calls
+  `process.exit(4)` exits 4 with no `'error'` event). oam's `process.exit` is the process's
+  `exit`, from any thread. Not addressed by #370 or #399; needs its own change (stopping a
+  worker's isolate from inside an op).
 
 ### 34. `tls.TLSSocket` is a `net.Socket` by brand, not by prototype
 
@@ -1435,16 +1643,18 @@ builds the certificate from it exactly as `getPeerCertificate(true)` does, `issu
 linked. A chain-build failure (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) leaves `err.cert` undefined
 (no `cert` key, the error's own keys being `[code]`), as Node does.
 
-### 52. `tty.ReadStream` / `tty.WriteStream` are `stream.Duplex` with a `net.Socket` brand (#391)
+### 56. `tty.ReadStream` / `tty.WriteStream` are `stream.Duplex` with a `net.Socket` brand (#391)
 
 node's are `net.Socket` subclasses over a libuv TTY handle. They are node's constructors
 in oam -- callable without `new`, `ERR_INVALID_FD` for a descriptor that is no int32 >= 0,
-`ERR_TTY_INIT_FAILED` (uv_tty_init's errno: EBADF on Windows for anything that is not a
-console, an msys/cygwin pty pipe included, EINVAL elsewhere for a file, the null device or
-an unopened descriptor, a pipe or socket taken on POSIX), node's prototype surface, and on a
-terminal `process.stdout`, `stderr` and `stdin`
-are instances (`conformance/cases/418-tty-stream-classes.mjs`, and the ConPTY test
-`stdio_on_a_console_are_the_tty_stream_classes`). oam's `net.Socket` is the TCP-native
+`ERR_TTY_INIT_FAILED` (uv_tty_init's errno: on Windows EBADF for anything that is not a
+console, an msys/cygwin pty pipe included, and EPERM for a console whose access libuv cannot
+use -- write-only, or a screen buffer opened without write access (#381); EINVAL elsewhere
+for a file, the null device or an unopened descriptor, a pipe or socket taken on POSIX),
+node's prototype surface, and on a terminal `process.stdout`, `stderr` and `stdin` are
+instances (`conformance/cases/418-tty-stream-classes.mjs` and `550-tty-closed-and-null-descriptors.mjs`,
+and the ConPTY tests `stdio_on_a_console_are_the_tty_stream_classes` and
+`tty_streams_over_a_console_opened_by_name_init_as_node`). oam's `net.Socket` is the TCP-native
 `EventEmitter` of entry 34, so these cannot extend it. What differs:
 
 - **The chain.** `Object.getPrototypeOf(tty.WriteStream.prototype)` is `stream.Duplex.prototype`,
@@ -1591,7 +1801,7 @@ _(source: `crates/oam_core/src/net_connect.rs`, `dns.rs`, `js/node_compat.js`
 Node on Windows and on Linux (WSL, no routable IPv6: `localhost` resolves to `127.0.0.1` alone
 on both runtimes).)_
 
-### 52. A server's `listen()` binds asynchronously: `listening` and `address()` wait for it (#387)
+### 57. A server's `listen()` binds asynchronously: `listening` and `address()` wait for it (#387)
 
 Node binds a `listen()` given no host -- `listen(port)`, `listen()`, `listen(path)` --
 synchronously, inside the call: on the next line `server.listening` is `true` and
@@ -3619,8 +3829,18 @@ listens on is `connect ENOENT <path>` (errno, code, syscall, address), one alrea
 in it is `connect EINVAL <path> - Local (undefined:undefined)` or `listen EINVAL: invalid
 argument <path>` before anything is opened (libuv refuses it, as the OS would read the name
 only up to the NUL; e2e test `a_pipe_path_with_a_nul_byte_is_einval_as_on_node`), and a
-closed server's path dials `ENOENT` again (on Unix the socket file is unlinked on close, as
-libuv does). On Windows the name goes to the OS as written: `\\.\pipe\x`, `\\?\pipe\x`,
+closed server's path dials `ENOENT` again, from the moment `close()` returns (on Unix the
+socket file is unlinked on close, as libuv does; on Windows the close closes every pipe
+instance still waiting for a client before it returns, as libuv's does -- up to 0.19.1 they
+stayed open until the server's accept woke, and a dial right after `close()` could connect
+to one and be dropped; #388, `conformance/cases/560-net-pipe-closed-server-gone-at-once.mjs`).
+So does one a client has connected to that the server has not yet emitted `'connection'`
+for: it is closed with the server, its client reads `'end'`, and the name can be listened
+on again in the same tick -- up to 0.19.1 it stayed open until the server's accept loop
+reset it a tick later, so a same-tick open was `EBUSY`, a same-tick `listen` `EADDRINUSE`,
+and a dial waited out `WaitNamedPipeW`'s 30 s to `ETIMEDOUT`
+(`conformance/cases/561-net-pipe-closed-server-drops-unaccepted-client.mjs`).
+On Windows the name goes to the OS as written: `\\.\pipe\x`, `\\?\pipe\x`,
 `//./pipe/x` and another letter case name one pipe; a name that is not a pipe's cannot be
 listened on (`listen EACCES`), and dialling a regular file is `ENOTSOCK`, a directory
 `EPERM`. A named pipe has no half-close, so `end()` behaves as libuv's shutdown does: it
@@ -3686,7 +3906,26 @@ booting and then failing every browser tool.
 - **Windows: remote clients and impersonation.** oam's pipe server refuses clients on other
   machines (`PIPE_REJECT_REMOTE_CLIENTS`) and its client lets the server identify, not
   impersonate, it (`SECURITY_IDENTIFICATION`); libuv sets neither, so a Node server takes
-  `\\host\pipe\x` clients. _(source)_
+  `\\host\pipe\x` clients. A client that names a local pipe through a UNC server name counts
+  as remote too -- it comes in through the SMB redirector -- even the loopback one: with a
+  server listening on `\\.\pipe\x`, `fs.openSync('\\\\localhost\\pipe\\x', 'r')` (or
+  `\\127.0.0.1\pipe\x`) is refused with `EPERM` by an oam server and gets an fd from a Node
+  one; `\\.\pipe\x` opens on both (measured on v22.22.2, Windows 11; #385). Kept by
+  decision: matching Node would open every oam pipe server to clients on the network, which
+  a local IPC endpoint -- an MCP server, a browser's control pipe -- does not expect and
+  rarely authenticates; a script that wants remote clients should listen on TCP. Pinned by
+  the unit test `a_client_dialling_through_a_unc_server_name_is_refused_as_remote`
+  (`crates/oam_core/src/pipe.rs`). _(measured)_
+- **Windows: which side of an in-process pipe connection hears first.** When a script dials
+  its own pipe server, Node always runs the client's `'connect'` callback before the server
+  emits `'connection'` (libuv runs the dial's callback from its pending queue, ahead of the
+  completion port the accept comes in on); on oam the server's `'connection'` can come
+  first -- in 7 of 20 rounds of a dial-then-`close()` probe, against 0 of 20 on v22.22.2.
+  A script that closes the server in the client's `'connect'` callback then finds the
+  connection already handed to the server, which, as on Node, outlives the close: the name
+  stays taken until the connection goes (a dial waits for an instance and gets `ETIMEDOUT`
+  after 30 s, a `listen` is `EADDRINUSE`). Case 561 counts only the rounds where the server
+  has not emitted `'connection'` yet. Not yet worked on. _(measured)_
 - **Windows: many clients at once.** As libuv, oam keeps four pipe instances waiting for
   clients, makes the next as soon as a client takes one, and a client that finds every
   instance taken waits for one with `WaitNamedPipeW`, up to 30 s (`ETIMEDOUT` after that). At
@@ -3780,10 +4019,14 @@ refused, and a name the binding does not know (`'bogus'`) writes UTF-8 -- so
 `ERR_UNKNOWN_ENCODING`.
 What still differs:
 
-- **`UV_FS_O_FILEMAP` is accepted and ignored (Windows).** libuv opens such a file
-  read-write and does its reads and writes through a file mapping, emulating `O_APPEND`
-  and the access mode there. oam opens an ordinary handle. The two agree except together
-  with `O_APPEND` (node's descriptor can `ftruncate`, and a write through
+- **`UV_FS_O_FILEMAP` opens no file mapping (Windows).** libuv does a
+  `UV_FS_O_FILEMAP` descriptor's reads and writes through a file mapping, emulating
+  `O_APPEND` and the access mode there. oam opens the file as libuv does -- a write-only
+  open asks read access too, and a handle with no standard information fails the open
+  with that query's error, so a console is `EISDIR` and the pipe namespace `EINVAL`, as
+  in node v22.22.2 (#384, conformance case 543) -- but then hands out an ordinary
+  handle. The two agree except together with `O_APPEND` (libuv opens that read-write
+  without the append swap: node's descriptor can `ftruncate`, and a write through
   `O_RDONLY | O_APPEND | UV_FS_O_FILEMAP` is `EBADF` where oam's appends) or `O_DIRECT`.
 - **An open under `--permission` needs the write grant unless it can only read.** node
   asks for it when the flags name a write (`O_WRONLY`, `O_RDWR`, `O_APPEND`, `O_CREAT`,
@@ -4011,10 +4254,29 @@ entry, `oam.readTextFile` and native addon loading: `readFileSync("sub/")` fails
 `writeFileSync("g.txt.", ...)` creates `g.txt.`, and `require("./mod.js.")` fails
 `MODULE_NOT_FOUND`, as in node v22.22.2 (conformance case 377).
 
-One corner is left. `require` of an absolute `\\?\C:\...`, `\\.\C:\...` or `//?/C:/...`
+`fs.realpathSync` and `fs.realpath` of such a path run node's component walk before asking
+the OS, and fail as node's do (`EISDIR`, `lstat 'C:'`; #361, conformance case 542). One
+corner is left. `require` of an absolute `\\?\C:\...`, `\\.\C:\...` or `//?/C:/...`
 spelling of an existing module loads it on oam; node v22.22.2 fails `EISDIR` (`lstat 'C:'`,
-or `lstat '\\.\C:'`), because its realpath walk takes the first component after the prefix
-for a directory to lstat. Reproducing a failure of node's own was not worth it.
+or `lstat '\\.\C:'`), because its module loader's realpath is that same walk, which takes
+the first component after the prefix for a directory to lstat. oam's loader resolves in
+Rust; reproducing a failure of node's own there was not worth it.
+
+### Windows: a stat of the paging file
+
+The system holds `pagefile.sys`, `swapfile.sys`, `hiberfil.sys` and `DumpStack.log.tmp`
+open with no sharing. node v22.22.2 fails `lstatSync`, `statSync`, `fs.promises.stat` and
+`realpathSync` of them `EPERM` (`lstat` for realpath), and `existsSync` is `false`. oam's
+`lstatSync` succeeds (std's stat falls back to a directory listing on the sharing
+violation), so `existsSync` is `true`; its `statSync` and `fs.promises.stat` fail `EBUSY`,
+and so do `realpathSync` and `fs.realpath` (`EBUSY, realpath`, the OS's error: node's
+component walk, which oam runs for node's error, completes on oam's lstat). `accessSync`
+is `EBUSY` in both. Measured on Windows 11 build 26200 arm64. libuv opens such a file,
+meets the sharing violation and looks the name up in its directory instead
+(fs__stat_directory); where node's `EPERM` comes from on that path was not pinned down,
+so oam does not imitate it. An ordinary file another process holds with no sharing stats
+alike in both. The e2e test `realpath_of_the_paging_file_fails_as_the_os_does` holds oam's
+realpath to failing.
 
 ### Windows `fs.symlink(target, path, 'junction')` makes a directory symlink
 
@@ -4025,16 +4287,28 @@ way; the difference is that a symlink needs the create-symlink privilege (Develo
 an elevated process), which a junction does not, so where that privilege is missing oam's
 call fails `EPERM` and node's succeeds. Measured against v22.22.2 (conformance case 377).
 
-### A module `import()` loads is evaluated inside the import
+### A module `import()` loads is evaluated inside the import -- FIXED, no longer a divergence (#397)
 
-oam evaluates a module that `import()` loads synchronously, inside its import hook, while the
-importer's frame is still on the stack. node loads and evaluates it in a later job, inside a
-microtask drain. So the imported module's synchronous top level runs before the importer's
-next statement, where in node it runs after the importer's own synchronous code and promise
-jobs, and its `process.nextTick` callbacks run ahead of ticks the importer queued after the
-call. From CommonJS they also run before the importer's continuation: `micro | tick | after
-import` where node prints `micro | after import | tick`. Only an ES module that awaits
-`import()` as its first step lines up with node. Tracked in #397.
+This entry used to record that oam evaluated a module `import()` loads synchronously, inside
+its import hook, with the importer's frame on the stack, and checkpointed microtasks there: the
+module's top level ran before the importer's next statement, its `process.nextTick` callbacks
+ran before the importer's continuation (`micro | tick | after import` where node prints `micro
+| after import | tick`), and a CommonJS importer's own promise jobs ran ahead of its ticks.
+`import()` now runs node's loader chain (js/esm_loader.js, docs/design/dynamic-import.md): the
+specifier is resolved inside the call and everything else happens in promise jobs, on the turns
+node's do (conformance cases 480 and 481). What is left is when a CommonJS module the graph
+imports runs, which entry 52 records.
+
+The same evaluation inside the import keeps a fatal `queueMicrotask` throw from ending the
+run where node does (#398). A microtask the imported module queues runs in a checkpoint
+taken while the importer's frame is on the stack, and oam cannot stop that checkpoint at the
+throw without unwinding the importer's JavaScript too; so the throw is recorded and reported
+at the next drain, after the rest of that checkpoint and the importer's continuation have
+run. `queueMicrotask(() => { throw new Error("qm"); });
+Promise.resolve().then(() => console.log("p-after"))` in a module loaded by `await
+import()` or `import().then()` prints only the report under node, and `p-after`, the
+importer's next line, then the report under oam (measured 2026-10-16 on Windows; exit 1
+under both). A module the entry imports statically is not affected (conformance case 471).
 
 An ES module's own top level orders ticks after its promise jobs, as node's does (#345,
 conformance case 411). A `.js` or `.ts` file with no package.json "type" runs as an ES module
@@ -4073,11 +4347,39 @@ differ by platform. oam fails each as node does on Linux (libstdc++), on every p
   in: node's C++ follows it until the path is too long, and aborts; oam fails `ELOOP`.
 
 The texts of oam's other std::filesystem-shaped failures in that copy (a link that
-cannot be made, a directory that cannot be created) are glibc's `strerror`, which is
-what node prints on Linux; on Windows node prints the system's message. Measured against
-v22.22.2 on Windows and Linux; macOS (libc++) is not measured. cp's and
+cannot be made, a directory below the top that cannot be created) are glibc's `strerror`,
+which is what node prints on Linux; on Windows node prints the system's message. The one
+exception is the destination itself when it cannot be created (`create_directories`): on
+Windows oam fails as node does there (#360, conformance cases 532 and 535) -- a file in the
+way is `errno` 183, an empty `code` and `, Cannot create a file when that file already exists.
+'<path>'`, a directory that may not be written in `errno` 5, `EIO`, `Access is denied.`, a
+missing drive or a name too long `errno` 3, `ESRCH`, `The system cannot find the path
+specified.`, and a name with a character Windows does not allow `errno` 123, `ENOPROTOOPT`,
+`The filename, directory name, or volume label syntax is incorrect.` (a missing drive wins
+over a bad name below it). mkdir reports those last two as one `ENOENT`, so oam tells them
+apart by the drive root and the names in the path. Any other failure of it is Linux-shaped. All of them have node's key order (`errno`,
+`code`, `path`, `syscall`). Measured against v22.22.2 on Windows and Linux; macOS (libc++)
+is not measured. cp's and
 `fs.promises.cp`'s copies, and cpSync with a `filter`, are node's JS and match it
-(conformance case 410).
+(conformance case 410), except where a deep tree runs out of JS stack: oam's frames differ
+from node's, so a 1500-deep chain that throws `RangeError` in node's filter walk copies in
+oam's (see "Where deep JS recursion runs out" in the narrowed-surfaces table).
+
+### File streams through `options.fs`: what still differs
+
+`fs.ReadStream` and `fs.WriteStream` open, read, write, writev, fsync and close through
+`options.fs`, or the live `fs.*`, as node's do, with node's arguments and node's checks of
+`options.fs` (#356, conformance cases 530, 531 and 533). What is left is the timing of oam's
+own callback forms when such a stream calls them: oam's `fs.write` (and `fs.writev`) writes
+synchronously and calls back on a `process.nextTick`, where node's calls back from the thread
+pool, on a later turn of the event loop. So a stream whose `options.fs.write` forwards to
+`fs.write` has its write land sooner than node's, and batches what is written meanwhile
+differently. Measured on v22.22.2, Windows 11: `write("one")` before `'ready'`, then
+`cork()`, `write("two")`, `write("three")`, `uncork()`, `end("!")` after `'ready'` -- node
+writes `one`, then one writev of `two`, `three` and `!`; oam writes `one`, a writev of `two`
+and `three`, then `!`. The bytes in the file and `bytesWritten` are the same. A stream left
+on oam's own `fs` functions (the default) does not call them: it uses the natives behind
+them directly.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 
@@ -4100,16 +4402,21 @@ dependency tree touches, so one absent name takes down a program that would neve
 called it. (This is exactly how `statfsSync` — added to Node in v18.15 — killed a CLI on
 oam that never called it.)
 
-Measured on all three release platforms:
+Per release platform (the windows row measured; the linux and darwin rows counted from their
+sections' lists, which #368 edited by hand -- `sys` moved from an absent module to a partial
+one, and five names landed -- as require() of ES modules (`Module._cache`) and zlib zstd (eight
+names) did before it, and which are to be regenerated on those hosts before the next
+release):
 
 | host | export names present | missing by name | in absent modules | modules absent |
 |---|---|---|---|---|
-| windows-aarch64 (Node v22.22.2) | 1500 / 1874 | 315 | 59 | 5 |
-| linux-x64 (Node v22.22.2) | 1480 / 1888 | 349 | 59 | 5 |
-| darwin-arm64 (Node v22.22.2) | 1480 / 1884 | 345 | 59 | 5 |
+| windows-aarch64 (Node v22.22.2) | 1564 / 1874 | 300 | 10 | 4 |
+| linux-x64 (Node v22.22.2), not re-measured | 1567 / 1888 | 311 | 10 | 4 |
+| darwin-arm64 (Node v22.22.2), not re-measured | 1567 / 1884 | 307 | 10 | 4 |
 
-"Present" subtracts both columns: the per-name gaps *and* the 59 export names living
-inside the 5 modules oam does not register at all (`sys` alone accounts for 49). The
+"Present" subtracts both columns: the per-name gaps *and* the 10 export names living
+inside the 4 modules oam does not register at all (`sys`, which held 49 of them, is
+`util` under its deprecated name since #368). The
 Node versions differ between hosts, which is part of why the totals do — the gate prints
 a note when a section's recorded Node does not match the one it is running against, so a
 version bump does not get read as an oam regression.
@@ -4137,8 +4444,8 @@ gate, and says so loudly. It also refuses to record a section whose gap count ha
 unless you pass `--allow-regression`, since laundering a regression into "known debt" is
 the one thing the ratchet exists to prevent.
 
-Five modules are absent outright rather than partial: `_stream_wrap`, `inspector/promises`,
-`sys` (the deprecated `util` alias), `wasi`, and `global:fetch.prototype`. The six `_http_*`
+Four modules are absent outright rather than partial: `_stream_wrap`, `inspector/promises`,
+`wasi`, and `global:fetch.prototype`. The six `_http_*`
 legacy names, `_tls_common` and `_tls_wrap` landed in 0.17.2 (divergence 49), with the few
 names of node's own plumbing they still lack recorded per name.
 
@@ -4148,9 +4455,9 @@ The largest per-module gaps (counts from windows-aarch64), all tracked in that f
 |---|---|---|
 | `constants` | 54 win32 / 65 linux / 61 darwin | The legacy all-in-one table. Platform-conditional values — the `WSA*` block on Windows, `RTLD_*` on POSIX, plus `UV_DIRENT_*` and the `SSL_OP_*`/`ENGINE_METHOD_*` OpenSSL set everywhere. This module is the *entire* reason the ratchet is keyed by platform: a Windows-only baseline reports 16 phantom new gaps on Linux and 12 on darwin, every one of them here. `fs.constants` and `os.constants` are separately correct — see *Platform constant tables* above. |
 | `dns/promises` | 31 | `Resolver`, `getServers`/`setServers`, `lookupService`, `resolveTlsa`, and the `BADNAME`/`NOTFOUND`/… error-code constants. |
-| `module` | 21 | The `Module._*` loader internals (`_load`, `_resolveFilename`, `_cache`, `_extensions`), `register`, `SourceMap`/`findSourceMap`. The compile-cache API landed in 0.19.1 (see *The compile cache is on by default* above). |
+| `module` | 20 | The `Module._*` loader internals (`_load`, `_resolveFilename`, `_extensions`), `register`, `SourceMap`/`findSourceMap`. The compile-cache API landed in 0.19.1 (see *The compile cache is on by default* above). |
 | `fs` | **0** | Closed in 0.9.1–0.9.2. Ownership and fd metadata (`chown`/`fchown`/`lchown`, `fchmod`/`lchmod`), durability (`fsync`/`fdatasync`), `ftruncate`, the `utimes`/`futimes`/`lutimes` family, `readv`/`writev`, `openAsBlob`, `statfs` and `glob`/`globSync` all landed. `node:fs` now has no missing export names on any platform, and `fs/promises` none since `watch` landed after 0.19.0. |
-| `crypto` | 12 | The legacy class constructors (`Hash`, `Hmac`, `Cipher(iv)`, `Decipher(iv)`), `diffieHellman`, `getCipherInfo`, `randomFill`. |
+| `crypto` | 10 | The legacy class constructors `Cipher(iv)` and `Decipher(iv)`, `diffieHellman`, `getCipherInfo`, `randomFill`. |
 | `stream/web` | 12 | The controller/reader/writer constructors and the queuing-strategy classes — the same constructors listed in the Web globals row above. |
 | `v8` | 8 | `DefaultSerializer`/`DefaultDeserializer`, `GCProfiler`, `promiseHooks`, `queryObjects`, `setHeapSnapshotNearHeapLimit`. |
 | `path` | 3 (one per of `path`, `path/posix`, `path/win32`) | `_makeLong` (a Windows long-path helper; not surfaced by `fs.glob`, which is in pure JS). |

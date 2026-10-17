@@ -56,6 +56,17 @@ enum PendingGate {
     Immediates(Instant),
 }
 
+/// What [`TimerQueue::peek_due`] finds due, or [`TimerQueue::popped`] ran.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Due {
+    /// A `timerPending` callback (libuv's pending phase).
+    Pending,
+    /// A timer due at `deadline`.
+    Timer { deadline: Instant },
+    /// An immediate queued at `queued` (for `popped`: its phase's start).
+    Immediate { queued: Instant },
+}
+
 /// The timer or immediate whose callback is running, with the ticks and
 /// microtasks after it: the phase a pending callback queued now belongs to.
 #[derive(Clone, Copy)]
@@ -275,6 +286,37 @@ impl TimerQueue {
         }
         self.running = Some(Running::Immediate { now });
         Some((entry.callback, entry.args))
+    }
+
+    /// What `pop_due(now)` would run next, without running it: how the event
+    /// loop places a tick point that falls between phases (see
+    /// `pump_event_loop`). A waiting pending callback reads as `Pending`
+    /// whatever its gate would pick.
+    pub(crate) fn peek_due(&mut self, now: Instant) -> Option<Due> {
+        if !self.pending.is_empty() {
+            return Some(Due::Pending);
+        }
+        let timer = self.front_timer().filter(|&(deadline, _)| deadline <= now);
+        let immediate = self.front_immediate().filter(|&(queued, _)| queued <= now);
+        match (timer, immediate) {
+            (Some(timer), Some(immediate)) if immediate < timer => Some(Due::Immediate {
+                queued: immediate.0,
+            }),
+            (Some((deadline, _)), _) => Some(Due::Timer { deadline }),
+            (None, Some((queued, _))) => Some(Due::Immediate { queued }),
+            (None, None) => None,
+        }
+    }
+
+    /// The kind of callback the last `pop_due` returned, while it runs: a
+    /// timer, or an immediate with the instant its check phase began (the
+    /// immediates queued by then belong to the same phase). None for a
+    /// pending callback.
+    pub(crate) fn popped(&self) -> Option<Due> {
+        match self.running? {
+            Running::Timer { deadline, .. } => Some(Due::Timer { deadline }),
+            Running::Immediate { now } => Some(Due::Immediate { queued: now }),
+        }
     }
 
     /// The callback `pop_due` returned has run, with the ticks and

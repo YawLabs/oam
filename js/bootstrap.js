@@ -22,6 +22,20 @@
 // startup snapshot, where no native bindings exist. Anything from __oam
 // must be looked up at CALL time, never captured at eval time.
 "use strict";
+// node's inspect `builtInObjects` (lib/internal/util/inspect.js) is the
+// capitalized names on globalThis when that module loads: V8's own globals
+// and none of node's (URL, Buffer, DOMException, the web classes are not in
+// it -- measured on v22.22.2). util.format's %s decides from it whether a
+// toString is built in (hasBuiltInToString), so it is taken here, before
+// this file defines a global of its own (#401).
+Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
+  value: Object.freeze(
+    Object.getOwnPropertyNames(globalThis).filter((e) => /^[A-Z][a-zA-Z0-9]+$/.test(e)),
+  ),
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
 (() => {
 
   // Every web class node ships carries a Symbol.toStringTag, so
@@ -68,6 +82,18 @@
     }
     brand(DOMException, "DOMException");
     globalThis.DOMException = DOMException;
+  }
+
+  // The reason an abort carries: the caller's, unless it gave none. Only
+  // `undefined` means "none" (the spec's "if reason is not given"): node
+  // keeps `ac.abort(null)`'s reason as null, and it reaches every consumer
+  // that way -- signal.reason, throwIfAborted, fetch's rejection, the
+  // `cause` of an events.once AbortError. A `reason ?? ...` default turned
+  // null into this DOMException everywhere (#401).
+  function defaultAbortReason(reason) {
+    return reason === undefined
+      ? new globalThis.DOMException("This operation was aborted", "AbortError")
+      : reason;
   }
 
   // ----------------------------------------------- Event / EventTarget
@@ -241,9 +267,59 @@
       })
     : null;
 
+  // node's objectToWeakListenerMap: a weak listener is held weakly by the
+  // target but strongly by the object its kWeakHandler names (a stream,
+  // util.aborted's resource), so it lives exactly as long as that object.
+  // Held by nothing, the listener -- often a promise's resolve -- could be
+  // collected while the object it serves was still alive, and the abort it
+  // waited for never seen (#401).
+  const weakListenerOwners = new WeakMap();
+
+  const kNewListener = Symbol.for("oam.kNewListener");
+  const kRemoveListener = Symbol.for("oam.kRemoveListener");
+  // A target's listener limit and whether it has warned (node's
+  // kMaxEventTargetListeners / kMaxEventTargetListenersWarned). The limit is
+  // events.defaultMaxListeners when the target is made, 0 (none) for an
+  // AbortSignal, and events.setMaxListeners(n, target) sets it -- which is why
+  // node_compat.js reaches the symbols through __oamEventTargetLimitSymbols.
+  const kMaxEventTargetListeners = Symbol("events.maxEventTargetListeners");
+  const kMaxEventTargetListenersWarned = Symbol("events.maxEventTargetListenersWarned");
+  Object.defineProperty(globalThis, "__oamEventTargetLimitSymbols", {
+    value: Object.freeze({ kMaxEventTargetListeners, kMaxEventTargetListenersWarned }),
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+  // events.defaultMaxListeners, read without loading the module: until
+  // something loads it nobody can have changed it from 10.
+  function defaultMaxListeners() {
+    const events = globalThis.__oamNode?.cache?.get("events");
+    const n = events?.defaultMaxListeners;
+    return typeof n === "number" ? n : 10;
+  }
+
+  const kInspect = Symbol.for("nodejs.util.inspect.custom");
+
   class EventTarget {
     constructor() {
       this._listeners = new Map(); // type -> [{ fn, once }]
+      this[kMaxEventTargetListeners] = defaultMaxListeners();
+      this[kMaxEventTargetListenersWarned] = false;
+    }
+    // node's EventTarget inspection (lib/internal/event_target.js): the
+    // constructor's name, then `{}` -- nothing of the target's state -- and
+    // the name alone past the depth limit, which is how a
+    // MaxListenersExceededWarning names the target.
+    [kInspect](depth, options, inspect) {
+      if (!(this instanceof EventTarget)) {
+        throw new (globalThis.__oamNode.get("internal/errors").codes.ERR_INVALID_THIS)("EventTarget");
+      }
+      const name = this.constructor.name;
+      if (depth < 0) return name;
+      const opts = Object.assign({}, options, {
+        depth: Number.isInteger(options.depth) ? options.depth - 1 : options.depth,
+      });
+      return `${name} ${inspect({}, opts)}`;
     }
     addEventListener(type, listener, options) {
       if (typeof listener !== "function" && typeof listener?.handleEvent !== "function") return;
@@ -259,13 +335,20 @@
       // accepting the option and storing a strong reference anyway would
       // retain exactly what the caller asked to be droppable, which is the
       // opposite of what it was set for.
-      const weak = options !== true && options != null &&
-        options[Symbol.for("oam.kWeakHandler")] != null;
+      const weakOwner = options !== true && options != null
+        ? options[Symbol.for("oam.kWeakHandler")]
+        : undefined;
+      const weak = weakOwner != null;
+      // Node-internal kIsNodeStyleListener (a MessagePort's on/once): the
+      // listener is handed a dispatch's node value -- a message's data --
+      // instead of the event (#401). dispatchEvent's node value is the event.
+      const nodeStyle = options !== true && options != null &&
+        options[Symbol.for("oam.kIsNodeStyleListener")] === true;
       const list = this._listeners.get(type) ?? [];
       if (!list.some((e) => listenerOf(e) === listener)) {
         const entry = weak
-          ? { ref: new WeakRef(listener), once, resist }
-          : { fn: listener, once, resist };
+          ? { ref: new WeakRef(listener), once, resist, nodeStyle }
+          : { fn: listener, once, resist, nodeStyle };
         list.push(entry);
         this._listeners.set(type, list);
         if (weak && collectedListeners) {
@@ -273,11 +356,46 @@
           // alive, so it holds the target weakly too.
           collectedListeners.register(listener, { target: new WeakRef(this), type, entry });
         }
+        if (weak && (typeof weakOwner === "object" || typeof weakOwner === "function")) {
+          let held = weakListenerOwners.get(weakOwner);
+          if (held === undefined) weakListenerOwners.set(weakOwner, (held = new Set()));
+          held.add(listener);
+        }
+        // node's kNewListener hook (lib/internal/event_target.js): a
+        // subclass hears of each listener added with the count it brings
+        // the type to, through a symbol-keyed method, so a MessagePort
+        // refs and starts on its first 'message' listener without an
+        // addEventListener of its own on its prototype, which node's has
+        // not (#401).
+        if (typeof this[kNewListener] === "function") this[kNewListener](list.length, type);
+        // Past the limit: one process warning per target, whatever the
+        // type, as node's EventTarget.addEventListener emits it.
+        const max = this[kMaxEventTargetListeners];
+        if (max > 0 && list.length > max && !this[kMaxEventTargetListenersWarned]) {
+          this[kMaxEventTargetListenersWarned] = true;
+          const inspect = globalThis.__oamNode.get("util").inspect;
+          const w = new Error(
+            `Possible EventTarget memory leak detected. ${list.length} ${type} listeners ` +
+              `added to ${inspect(this, { depth: -1 })}. MaxListeners is ${max}. Use ` +
+              "events.setMaxListeners() to increase limit",
+          );
+          w.name = "MaxListenersExceededWarning";
+          w.target = this;
+          w.type = type;
+          w.count = list.length;
+          globalThis.process.emitWarning(w);
+        }
       }
     }
     removeEventListener(type, listener) {
       const list = this._listeners.get(type);
-      if (list) this._listeners.set(type, list.filter((e) => listenerOf(e) !== listener));
+      if (!list) return;
+      const kept = list.filter((e) => listenerOf(e) !== listener);
+      this._listeners.set(type, kept);
+      // node's kRemoveListener hook, the counterpart of kNewListener (#401).
+      if (kept.length !== list.length && typeof this[kRemoveListener] === "function") {
+        this[kRemoveListener](kept.length, type);
+      }
     }
     dispatchEvent(event) {
       event.target = this;
@@ -330,12 +448,22 @@
       this.aborted = false;
       this.reason = undefined;
       this.onabort = null;
+      this[kMaxEventTargetListeners] = 0;
+    }
+    // node's AbortSignal inspection (lib/internal/abort_controller.js
+    // customInspect): `AbortSignal { aborted: <bool> }`, and the signal
+    // itself past the depth limit, which renders as `[AbortSignal]`.
+    [kInspect](depth, options, inspect) {
+      if (depth < 0) return this;
+      const opts = Object.assign({}, options, {
+        depth: options.depth === null ? null : options.depth - 1,
+      });
+      return `${this.constructor.name} ${inspect({ aborted: this.aborted }, opts)}`;
     }
     static abort(reason) {
       const signal = new AbortSignal();
       signal.aborted = true;
-      signal.reason =
-        reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      signal.reason = defaultAbortReason(reason);
       return signal;
     }
     static timeout(delay) {
@@ -388,8 +516,7 @@
     _fire(reason) {
       if (this.aborted) return;
       this.aborted = true;
-      this.reason =
-        reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      this.reason = defaultAbortReason(reason);
       const event = new Event("abort");
       if (typeof this.onabort === "function") this.onabort.call(this, event);
       this.dispatchEvent(event);
@@ -614,6 +741,8 @@
           const { done, value } = await iterator.next();
           if (done) {
             controller.close();
+            // A BYOB read waiting on it is done (undici's ReadableStreamFrom).
+            controller.byobRequest?.respond(0);
             return;
           }
           const B = globalThis.Buffer;
@@ -646,9 +775,11 @@
     } else if (object instanceof globalThis.Blob) {
       state.kind = "blob";
       if (object.type !== "") state.type = object.type;
-      // oam's own Blob holds its bytes, and they never change. Anything else
-      // that passes for one is read through its stream.
-      if (object._bytes instanceof Uint8Array && !object._unreadableSize) state.bytes = object._bytes;
+      // An oam Blob of in-memory parts gives its bytes, which never change.
+      // A file-backed one, or anything else that passes for a Blob, is read
+      // through its stream, when the body is.
+      const bytes = blobMemoryBytes(object);
+      if (bytes !== null) state.bytes = bytes;
       else {
         state.stream = object.stream();
         // What fetch sends as its content-length, as undici does.
@@ -663,11 +794,17 @@
     } else if (object instanceof globalThis.FormData) {
       state.kind = "formdata";
       const boundary = multipartBoundary();
-      // A file in it that cannot be read: the body is made, and reading it
-      // fails, as node's does.
-      const unreadable = [...object.values()].some((v) => typeof v !== "string" && v._unreadableSize);
-      if (unreadable) state.stream = new globalThis.Blob([unreadableBlobMarker(1)]).stream();
-      else state.bytes = multipartBytes(object, boundary);
+      // A file-backed file in it is read when the body is, and the body
+      // fails as the file's read does (NotReadableError once it changed),
+      // as node's does: the encoding is then a Blob of the pieces, streamed.
+      const pieces = multipartPieces(object, boundary);
+      if (pieces.every((piece) => piece instanceof Uint8Array)) state.bytes = concatBytes(pieces);
+      else {
+        const encoded = new globalThis.Blob(pieces);
+        state.stream = encoded.stream();
+        // Its content-length, as undici's (a file's size is known).
+        state.size = encoded.size;
+      }
       state.type = `multipart/form-data; boundary=${boundary}`;
     } else if (
       typeof globalThis.URLSearchParams === "function" &&
@@ -712,7 +849,9 @@
     return `----formdata-oam-0${digits}`;
   }
 
-  function multipartBytes(form, boundary) {
+  // The encoding's pieces: bytes, and for a file whose parts are not all in
+  // memory the File itself.
+  function multipartPieces(form, boundary) {
     const encoder = new TextEncoder();
     const crlf = (text) => text.replace(/\r?\n|\r/g, "\r\n");
     const escape = (text) =>
@@ -726,19 +865,12 @@
         const filename = value.name ? `; filename="${escape(value.name)}"` : "";
         const type = value.type || "application/octet-stream";
         parts.push(encoder.encode(`${head}${filename}\r\nContent-Type: ${type}\r\n\r\n`));
-        parts.push(value._bytes);
+        parts.push(blobMemoryBytes(value) ?? value);
         parts.push(encoder.encode("\r\n"));
       }
     }
     parts.push(encoder.encode(`--${boundary}--\r\n`));
-    return concatBytes(parts);
-  }
-
-  // A Blob of `size` bytes that cannot be read (see the Blob class).
-  function unreadableBlobMarker(size) {
-    const blob = new globalThis.Blob([]);
-    blob._unreadableSize = size;
-    return blob;
+    return parts;
   }
 
   function concatBytes(chunks) {
@@ -783,8 +915,11 @@
       const bytes = state.used ? null : state.bytes;
       state.stream = new globalThis.ReadableStream({
         type: "bytes", // undici's body streams are byte streams
+        // A copy: the bytes are shared -- with a clone() of this body, and
+        // with the Blob they came from -- and what a reader is handed is its
+        // own to write to (undici's enqueue transfers its own copy).
         start(controller) {
-          if (bytes !== null && bytes.length > 0) controller.enqueue(bytes);
+          if (bytes !== null && bytes.length > 0) controller.enqueue(bytes.slice());
           controller.close();
         },
       });
@@ -1016,20 +1151,26 @@
         for (const t of transfers) memo.set(t, t.slice(0));
       }
       function cloneInner(v) {
-        if (v === null || (typeof v !== "object" && typeof v !== "function")) return v;
-        if (memo.has(v)) return memo.get(v);
-        // A file-backed Blob (fs.openAsBlob) is NOT cloneable in node -- it
-        // holds a file reference, not bytes, so a clone would outlive the
-        // guarantee. node throws a plain TypeError, not a DataCloneError:
-        //   TypeError: Invalid state: File-backed Blobs are not cloneable
-        // Marked with a cross-realm registered symbol because the marker is set
-        // in node_compat's fs factory, which cannot see this scope. A symbol
-        // key also keeps it out of Object.keys, so it introduces no structural
-        // difference of its own. Checked HERE rather than at the entry point so
-        // a blob nested inside a cloned object throws too, as node's does.
-        if (v[Symbol.for("oam.blob.fileBacked")] === true) {
-          throw new TypeError("Invalid state: File-backed Blobs are not cloneable");
+        // A function or a symbol cannot be serialized: V8's serializer, under
+        // node's structuredClone and postMessage alike, throws a
+        // DataCloneError naming it. A function was cloned as an empty
+        // object, and a symbol passed through as itself (#401).
+        if (typeof v === "function" || typeof v === "symbol") {
+          throw new DOMException(`${String(v)} could not be cloned.`, "DataCloneError");
         }
+        if (v === null || typeof v !== "object") return v;
+        if (memo.has(v)) return memo.get(v);
+        // A Blob clones as a Blob with the same parts (see cloneBlob). A
+        // file-backed one from fs.openAsBlob is NOT cloneable in node, and
+        // throws a TypeError with code ERR_INVALID_STATE, not a
+        // DataCloneError:
+        //   TypeError: Invalid state: File-backed Blobs are not cloneable
+        // Only the Blob openAsBlob returned is marked (a registered symbol,
+        // set in node_compat's fs factory, which cannot see this scope); a
+        // slice of it, or a Blob made of it, clones, as node's do. Checked
+        // HERE rather than at the entry point so a blob nested inside a
+        // cloned object throws too, as node's does.
+        if (blobStates.has(v)) { const c = cloneBlob(v); memo.set(v, c); return c; }
         if (v instanceof Date) { const c = new Date(v); memo.set(v, c); return c; }
         if (v instanceof RegExp) { const c = new RegExp(v.source, v.flags); memo.set(v, c); return c; }
         if (typeof ArrayBuffer !== "undefined" && v instanceof ArrayBuffer) {
@@ -1071,132 +1212,373 @@
       }
       // Serialize first (primitives pass through); only on success detach
       // the transfer-list sources. A throw above leaves them intact.
-      const out = (value === null || (typeof value !== "object" && typeof value !== "function"))
-        ? value
-        : cloneInner(value);
+      const out = cloneInner(value);
       if (transfers) for (const t of transfers) t.transfer();
       return out;
     };
   }
 
   // -------------------------------------------------------------------- Blob
-  // WHATWG Blob: an immutable byte sequence with a type string. Backed by
-  // a flat Uint8Array, zero-copy subarray for slice(). text/arrayBuffer/stream
-  // return the expected types. size and type are read-only.
+  // node's Blob and File [util.inspect.custom] (lib/internal/blob.js,
+  // lib/internal/file.js): `Blob { size: 1, type: '' }`, the fields one level
+  // deeper and the label fixed whatever the subclass. Below depth 0 node's
+  // hook hands the value back and util.inspect collapses it by its
+  // constructor and tag -- `[Blob]`, `[MyBlob [Blob]]` -- because node's
+  // Blob carries enumerable symbol-keyed fields. Ours has none to show, so
+  // the hook spells that collapse itself rather than render `Blob {}`.
+  function inspectBlobLike(self, label, fields, depth, options, inspect) {
+    if (depth < 0) {
+      let ctor;
+      let tag;
+      try {
+        ctor = Object.getPrototypeOf(self)?.constructor?.name;
+        tag = self[Symbol.toStringTag];
+      } catch {
+        // A throwing getter on a subclass: fall back to the label.
+      }
+      if (typeof ctor !== "string" || ctor === "") ctor = label;
+      // node's getPrefix: the tag rides along unless the constructor name
+      // already contains it as a whole word (`MyBlob` does, `Xlob` not).
+      let name = ctor;
+      if (typeof tag === "string" && tag !== "") {
+        const at = ctor.indexOf(tag);
+        const end = at + tag.length;
+        if (at === -1 || (end !== ctor.length && ctor[end] === ctor[end].toLowerCase())) {
+          name += ` [${tag}]`;
+        }
+      }
+      return options.stylize(`[${name}]`, "special");
+    }
+    inspect ??= globalThis.__oamNode?.get?.("util")?.inspect;
+    if (typeof inspect !== "function") return label;
+    const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
+    return `${label} ${inspect(fields, opts)}`;
+  }
+  // WHATWG Blob, as node's (lib/internal/blob.js, v22.22.2): an immutable
+  // list of parts. An in-memory part is a copy made at construction (a
+  // string encoded, a buffer or view copied); a Blob given as a part gives
+  // its own parts, shared, not copied; a file part (fs.openAsBlob) is a
+  // range of a file, read only when the Blob is. Reads walk the parts in
+  // order -- one chunk per in-memory part, a file part in 64 KiB chunks --
+  // which is also how stream() hands them out.
+  //
+  // The state lives in a WeakMap, not on the object: node's Blob has no own
+  // properties, so `Object.keys(blob)` is [] and `JSON.stringify(blob)` is
+  // {} -- a log line carrying a Blob must never dump its payload.
+  const blobStates = new WeakMap(); // Blob -> { parts, size, type }
+  const kBlobFileBacked = Symbol.for("oam.blob.fileBacked");
+  let BlobClass;
+  let TransferableBlobPrototype;
+  const blobCodes = () => globalThis.__oamNode.get("internal/errors").codes;
+  const blobNotReadable = () => new DOMException("The blob could not be read", "NotReadableError");
+  // node's disallowedTypeCharacters: a type with anything outside
+  // U+0020-U+007E is "", any other is lowercased.
+  const disallowedTypeCharacters = /[^ -~]/;
+  const normalizeBlobType = (type) => {
+    type = `${type}`;
+    return disallowedTypeCharacters.test(type) ? "" : type.toLowerCase();
+  };
+
+  // node's webidl convertToInt(name, value, 64, { signed: true }): the
+  // conversion slice() gives its start and end.
+  function blobSliceInt(value) {
+    let x = +value;
+    if (Number.isNaN(x) || x === 0 || x === Infinity || x === -Infinity) return 0;
+    x = Math.trunc(x) % 2 ** 64;
+    if (x === 0) return 0;
+    return x >= 2 ** 63 ? x - 2 ** 64 : x;
+  }
+
+  // The parts of [start, end) of a part list: a part that contributes no
+  // bytes is dropped, so a slice of nothing has no part at all (and an
+  // empty file's part, kept by a Blob made of it, goes from a slice).
+  function sliceBlobParts(parts, start, end) {
+    const out = [];
+    let offset = 0;
+    for (const part of parts) {
+      const length = part.bytes !== undefined ? part.bytes.length : part.end - part.start;
+      const from = Math.max(start, offset);
+      const to = Math.min(end, offset + length);
+      if (to > from) {
+        if (part.bytes !== undefined) {
+          out.push({ bytes: part.bytes.subarray(from - offset, to - offset) });
+        } else {
+          out.push({ file: part.file, start: part.start + from - offset, end: part.start + to - offset });
+        }
+      }
+      offset += length;
+      if (offset >= end) break;
+    }
+    return out;
+  }
+
+  // node's createBlob: an instance of an internal subclass of Blob, with an
+  // own (enumerable) `constructor` pointing back at Blob -- so a slice's
+  // `Object.keys` is ["constructor"] and its constructor's name "Blob".
+  function createBlob(parts, size, type) {
+    const blob = Object.create(TransferableBlobPrototype);
+    blobStates.set(blob, { parts, size, type });
+    blob.constructor = BlobClass;
+    return blob;
+  }
+
+  // A reader over a part list, node's DataQueue reader in shape:
+  // pull(cb) calls back cb(1, chunk) for each chunk, cb(0) at the end and
+  // cb(-1) on a failure -- synchronously for an in-memory part (as node's
+  // does), when the read completes for a file part.
+  function blobPartsReader(parts) {
+    let index = 0;
+    let file = null;
+    const reader = {
+      pull(cb) {
+        while (index < parts.length) {
+          const part = parts[index];
+          if (part.bytes !== undefined) {
+            index++;
+            cb(1, part.bytes, false);
+            return;
+          }
+          file ??= part.file.open(part.start, part.end);
+          file.pull((status, chunk) => {
+            if (status === 0) {
+              file = null;
+              index++;
+              reader.pull(cb);
+              return;
+            }
+            if (status < 0) {
+              file = null;
+              index = parts.length;
+            }
+            cb(status, chunk, true);
+          });
+          return;
+        }
+        cb(0);
+      },
+      cancel() {
+        file?.cancel();
+        file = null;
+        index = parts.length;
+      },
+    };
+    return reader;
+  }
+
+  // node's arrayBuffer(blob): every chunk, one microtask apart, then joined.
+  function readBlobParts(parts) {
+    return new Promise((resolve, reject) => {
+      const reader = blobPartsReader(parts);
+      const chunks = [];
+      const next = () => {
+        reader.pull((status, chunk) => {
+          if (status === 0) {
+            resolve(concatBytes(chunks).buffer);
+            return;
+          }
+          if (status < 0) {
+            reject(blobNotReadable());
+            return;
+          }
+          chunks.push(chunk);
+          queueMicrotask(next);
+        });
+      };
+      next();
+    });
+  }
+
+  // The bytes of an oam Blob whose parts are all in memory (an empty Blob's
+  // included), or null: what a body made from it can send as it is.
+  function blobMemoryBytes(blob) {
+    const state = blobStates.get(blob);
+    if (state === undefined) return null;
+    const { parts } = state;
+    for (const part of parts) if (part.bytes === undefined) return null;
+    return parts.length === 1 ? parts[0].bytes : concatBytes(parts.map((part) => part.bytes));
+  }
+
+  // structuredClone of a Blob: a Blob (a File too, as node's deserializes)
+  // with the same parts. A file-backed one from fs.openAsBlob refuses.
+  function cloneBlob(blob) {
+    if (blob[kBlobFileBacked] === true) {
+      throw new (blobCodes().ERR_INVALID_STATE.TypeError)("File-backed Blobs are not cloneable");
+    }
+    const { parts, size, type } = blobStates.get(blob);
+    const clone = Object.create(BlobClass.prototype);
+    blobStates.set(clone, { parts, size, type });
+    return clone;
+  }
+
   if (typeof globalThis.Blob !== "function") {
     class Blob {
-      constructor(parts, options) {
+      constructor(sources = [], options = undefined) {
+        // (The coded errors are looked up only to throw one: a Blob made
+        // before node_compat's registry exists must not need it.)
+        if (sources === null || typeof sources[Symbol.iterator] !== "function" || typeof sources === "string") {
+          throw new (blobCodes().ERR_INVALID_ARG_TYPE)("sources", "a sequence", sources);
+        }
+        // node's validateDictionary.
+        if (options != null && typeof options !== "object" && typeof options !== "function") {
+          throw new (blobCodes().ERR_INVALID_ARG_TYPE)("options", "a dictionary", options);
+        }
+        let { type = "", endings = "transparent" } = options ?? {};
+        endings = `${endings}`;
+        if (endings !== "transparent" && endings !== "native") {
+          throw new (blobCodes().ERR_INVALID_ARG_VALUE)("options.endings", endings);
+        }
+        const parts = [];
         let size = 0;
-        let unreadable = false;
-        const pieces = [];
-        if (parts != null) {
-          for (const part of parts) {
-            if (typeof part === "string") {
-              const enc = new TextEncoder().encode(part);
-              pieces.push(enc);
-              size += enc.length;
-            } else if (part instanceof Blob) {
-              if (part._unreadableSize) unreadable = true;
-              else pieces.push(part._bytes);
-              size += part.size;
-            } else if (part instanceof ArrayBuffer) {
-              const view = new Uint8Array(part);
-              pieces.push(view);
-              size += view.length;
-            } else if (ArrayBuffer.isView(part)) {
-              const view = new Uint8Array(part.buffer, part.byteOffset, part.byteLength);
-              pieces.push(view);
-              size += view.length;
-            } else {
-              const enc = new TextEncoder().encode(String(part));
-              pieces.push(enc);
-              size += enc.length;
-            }
+        Array.from(sources, (source) => {
+          const state = typeof source === "object" && source !== null ? blobStates.get(source) : undefined;
+          if (state !== undefined) {
+            for (const part of state.parts) parts.push(part);
+            size += state.size;
+            return;
           }
-        }
-        const bytes = new Uint8Array(unreadable ? 0 : size);
-        let offset = 0;
-        if (!unreadable) for (const piece of pieces) { bytes.set(piece, offset); offset += piece.length; }
-        // NON-ENUMERABLE, and that is load-bearing rather than tidiness.
-        // These were plain assignments, so a Blob's internals were own
-        // ENUMERABLE properties: `Object.keys(blob)` returned
-        // ["_bytes","_type"] where node returns [], and -- much worse --
-        // `JSON.stringify(blob)` serialised the ENTIRE payload as a numeric
-        // object ({"0":104,"1":105,...}) where node gives {}. Any log line or
-        // API response carrying an object with a Blob in it dumped the whole
-        // buffer: a memory blowup, and file contents in places they should
-        // never reach. Same reasoning for `writable` -- `slice` below reassigns
-        // `_bytes`, which needs the property to already exist and be writable
-        // or the assignment would create a fresh enumerable one.
-        Object.defineProperty(this, "_bytes", {
-          value: bytes,
-          writable: true,
-          enumerable: false,
-          configurable: true,
+          let bytes;
+          if (source instanceof ArrayBuffer || (typeof SharedArrayBuffer === "function" && source instanceof SharedArrayBuffer)) {
+            bytes = new Uint8Array(source.byteLength);
+            bytes.set(new Uint8Array(source));
+          } else if (ArrayBuffer.isView(source)) {
+            bytes = new Uint8Array(source.byteLength);
+            bytes.set(new Uint8Array(source.buffer, source.byteOffset, source.byteLength));
+          } else {
+            let text = `${source}`;
+            if (endings === "native") {
+              text = text.replace(/\n|\r\n/g, globalThis.process?.platform === "win32" ? "\r\n" : "\n");
+            }
+            bytes = new TextEncoder().encode(text);
+          }
+          size += bytes.length;
+          if (bytes.length > 0) parts.push({ bytes });
         });
-        // A Blob that has a size and cannot be read: what fs.openAsBlob gives
-        // for a directory, and anything made with one as a part. 0 for
-        // every other Blob. Its reads fail NotReadableError, as node's do.
-        Object.defineProperty(this, "_unreadableSize", {
-          value: unreadable ? size : 0,
-          writable: true,
-          enumerable: false,
-          configurable: true,
-        });
-        Object.defineProperty(this, "_type", {
-          value: (options && typeof options.type === "string") ? options.type.toLowerCase() : "",
-          writable: true,
-          enumerable: false,
-          configurable: true,
-        });
+        blobStates.set(this, { parts, size, type: normalizeBlobType(type) });
       }
-      get size() { return this._unreadableSize || this._bytes.length; }
-      get type() { return this._type; }
-      slice(start, end, type) {
-        const len = this.size;
-        let s = start === undefined ? 0 : start < 0 ? Math.max(0, len + start) : Math.min(start, len);
-        let e = end === undefined ? len : end < 0 ? Math.max(0, len + end) : Math.min(end, len);
-        if (s >= e) s = e = 0;
-        const result = new Blob([], { type: type !== undefined ? String(type) : this._type });
-        if (this._unreadableSize) result._unreadableSize = e - s;
-        else result._bytes = this._bytes.subarray(s, e);
-        return result;
+      // (In node's order, which is the prototype's key order.)
+      get type() {
+        const state = blobStates.get(this);
+        if (state === undefined) throw new (blobCodes().ERR_INVALID_THIS)("Blob");
+        return state.type;
       }
-      #unreadable() {
-        return new DOMException("The blob could not be read", "NotReadableError");
+      get size() {
+        const state = blobStates.get(this);
+        if (state === undefined) throw new (blobCodes().ERR_INVALID_THIS)("Blob");
+        return state.size;
       }
-      async arrayBuffer() {
-        if (this._unreadableSize) throw this.#unreadable();
-        return this._bytes.buffer.slice(this._bytes.byteOffset, this._bytes.byteOffset + this._bytes.length);
+      // node's: start and end converted as WebIDL `long long`s (NaN and the
+      // infinities are 0), negative from the end, clamped; the content type
+      // normalized as the constructor's, and "" when omitted -- not this
+      // Blob's type.
+      slice(start = 0, end = undefined, contentType = "") {
+        const state = blobStates.get(this);
+        if (state === undefined) throw new (blobCodes().ERR_INVALID_THIS)("Blob");
+        const length = state.size;
+        start = blobSliceInt(start);
+        end = end === undefined ? length : blobSliceInt(end);
+        start = start < 0 ? Math.max(length + start, 0) : Math.min(start, length);
+        end = end < 0 ? Math.max(length + end, 0) : Math.min(end, length);
+        contentType = normalizeBlobType(contentType);
+        const span = Math.max(end - start, 0);
+        return createBlob(sliceBlobParts(state.parts, start, start + span), span, contentType);
       }
-      async bytes() {
-        if (this._unreadableSize) throw this.#unreadable();
-        return this._bytes.slice();
+      arrayBuffer() {
+        const state = blobStates.get(this);
+        if (state === undefined) return Promise.reject(new (blobCodes().ERR_INVALID_THIS)("Blob"));
+        return readBlobParts(state.parts);
       }
-      async text() {
-        if (this._unreadableSize) throw this.#unreadable();
-        return new TextDecoder().decode(this._bytes);
+      text() {
+        const state = blobStates.get(this);
+        if (state === undefined) return Promise.reject(new (blobCodes().ERR_INVALID_THIS)("Blob"));
+        return readBlobParts(state.parts).then((buffer) => new TextDecoder().decode(buffer));
       }
+      bytes() {
+        const state = blobStates.get(this);
+        if (state === undefined) return Promise.reject(new (blobCodes().ERR_INVALID_THIS)("Blob"));
+        return readBlobParts(state.parts).then((buffer) => new Uint8Array(buffer));
+      }
+      // node's stream(): a byte stream with a high-water mark of 0, so
+      // nothing is read before a read asks. Each pull reads on -- a chunk
+      // per in-memory part, a file part in 64 KiB chunks -- until the queue
+      // is over its mark; at the end it closes and answers a pending BYOB
+      // read with respond(0). A chunk is the reader's own: an in-memory
+      // part is copied, so writing to it leaves the Blob as it was.
       stream() {
-        const bytes = this._bytes;
-        if (this._unreadableSize) {
-          const failure = this.#unreadable();
-          return new ReadableStream({ type: "bytes", pull: (controller) => controller.error(failure) });
-        }
-        return new ReadableStream({
-          type: "bytes", // node's Blob#stream() is a byte stream
-          // A copy: what the stream hands out belongs to its reader, and a
-          // Blob does not change. Nothing at all for an empty one, as node's
-          // gives no chunk.
-          start(controller) {
-            if (bytes.length > 0) controller.enqueue(bytes.slice());
-            controller.close();
+        const state = blobStates.get(this);
+        if (state === undefined) throw new (blobCodes().ERR_INVALID_THIS)("Blob");
+        const reader = blobPartsReader(state.parts);
+        return new ReadableStream(
+          {
+            type: "bytes",
+            start() {
+              this.pendingPulls = [];
+            },
+            pull(c) {
+              const source = this;
+              return new Promise((resolve, reject) => {
+                source.pendingPulls.push({ resolve, reject });
+                const readNext = () => {
+                  reader.pull((status, buffer, owned) => {
+                    if (source.pendingPulls.length === 0) return;
+                    if (status === 0) {
+                      c.close();
+                      c.byobRequest?.respond(0);
+                      source.pendingPulls.shift().resolve();
+                      return;
+                    }
+                    if (status < 0) {
+                      const error = blobNotReadable();
+                      const pending = source.pendingPulls.shift();
+                      c.error(error);
+                      pending.reject(error);
+                      return;
+                    }
+                    if (buffer !== undefined && buffer.byteLength !== 0) {
+                      c.enqueue(owned ? buffer : buffer.slice());
+                    }
+                    queueMicrotask(() => {
+                      if (c.desiredSize < 0) {
+                        if (source.pendingPulls.length !== 0) source.pendingPulls.shift().resolve();
+                        return;
+                      }
+                      readNext();
+                    });
+                  });
+                };
+                readNext();
+              });
+            },
+            cancel(reason) {
+              for (const pending of this.pendingPulls) pending.reject(reason);
+              this.pendingPulls = [];
+              reader.cancel();
+            },
           },
-        });
+          { highWaterMark: 0 },
+        );
       }
-      toString() { return "[object Blob]"; }
+      // No toString of its own, as node's Blob has none: the brand's
+      // toStringTag already makes String() "[object Blob]", and an own
+      // toString made util.format's %s String() a Blob that node inspects
+      // (hasBuiltInToString, #401).
+      [Symbol.for("nodejs.util.inspect.custom")](depth, options, inspect) {
+        return inspectBlobLike(this, "Blob", { size: this.size, type: this.type }, depth, options, inspect);
+      }
+      // fs.openAsBlob's Blob (node's createBlobFromFilePath): one file part
+      // over `file` -- { open(start, end) } returning a reader with
+      // pull(cb) / cancel(), made by the fs module -- of the size the open's
+      // fstat said, its type as given (node does not normalize it here).
+      static [Symbol.for("oam.blob.fromFile")](file, size, type) {
+        return createBlob([{ file, start: 0, end: size }], size, type);
+      }
+    }
+    // node marks these enumerable (kEnumerableProperty).
+    for (const name of ["size", "type", "slice", "stream", "text", "arrayBuffer", "bytes"]) {
+      Object.defineProperty(Blob.prototype, name, { enumerable: true });
     }
     brand(Blob, "Blob");
+    BlobClass = Blob;
+    TransferableBlobPrototype = Object.create(Blob.prototype);
     globalThis.Blob = Blob;
   }
 
@@ -1205,20 +1587,25 @@
     class File extends globalThis.Blob {
       constructor(parts, name, options) {
         super(parts, options);
-        this._name = String(name);
-        this._lastModified = (options && typeof options.lastModified === "number")
+        this.#name = String(name);
+        this.#lastModified = (options && typeof options.lastModified === "number")
           ? options.lastModified : Date.now();
       }
-      get name() { return this._name; }
-      get lastModified() { return this._lastModified; }
-      toString() { return "[object File]"; }
+      // Private, as node's are: an own `_name` showed up in Object.keys and
+      // in util.inspect.
+      #name;
+      #lastModified;
+      get name() { return this.#name; }
+      get lastModified() { return this.#lastModified; }
+      // No toString of its own, as for Blob: an own one made util.format's %s
+      // print "[object File]" where node inspects the File (#401).
+      [Symbol.for("nodejs.util.inspect.custom")](depth, options, inspect) {
+        const fields = { size: this.size, type: this.type, name: this.#name, lastModified: this.#lastModified };
+        return inspectBlobLike(this, "File", fields, depth, options, inspect);
+      }
     }
     brand(File, "File");
     globalThis.File = File;
-  }
-
-  if (typeof globalThis.MessagePort === "undefined") {
-    globalThis.MessagePort = class MessagePort {};
   }
 
   // ----------------------------------------------------------------- FormData
@@ -1861,8 +2248,17 @@
     // up later is cancelled on arrival instead of holding its connection.
     let bodyAborted = false;
     let onAbort = null;
+    // The body path is the one place undici still swaps the reason out:
+    // its fetch controller's abort(error) does `if (!error) error = new
+    // DOMException(...)`, and the body is errored with that. So
+    // `ac.abort(null)` -- or 0, false, '' -- rejects the fetch promise with
+    // the reason itself but errors a body being read with undici's own
+    // AbortError, message "The operation was aborted." with the period:
+    // measured on node v22.22.2 for a read in flight, a reader taken after
+    // the abort and a pending reader.read() (#401). A signal aborted with no
+    // reason already carries its (truthy) DOMException.
     const abortReason = () =>
-      signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      signal.reason || new globalThis.DOMException("The operation was aborted.", "AbortError");
     // Read to the end, failed or cancelled: nothing is left for an abort to
     // stop. Stop listening, so a signal shared by many fetches does not
     // collect one listener per response, and a late abort does not leave a
@@ -1933,6 +2329,8 @@
           if (chunk === undefined) {
             bodyOver();
             controller.close();
+            // A BYOB read waiting on the end is done, as undici answers it.
+            controller.byobRequest?.respond(0);
           } else controller.enqueue(chunk);
         },
         cancel() {
@@ -2664,8 +3062,7 @@
   // it arrived on) instead of a Response.
   async function settleRaw(pending, lookup, signal, connector) {
     const internal = globalThis.__oam;
-    const aborted = () =>
-      signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+    const aborted = () => defaultAbortReason(signal.reason);
     let raw;
     try {
       raw = await pending;
@@ -2929,8 +3326,7 @@
       let stopped = false;
       let failure = null;
       let written = 0;
-      const aborted = () =>
-        signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      const aborted = () => defaultAbortReason(signal.reason);
       if (signal?.aborted) return reject(aborted());
       const channel = node.fetchBodyChannelNew();
       request.body_stream = channel;
@@ -3066,7 +3462,8 @@
       cache: state.cache,
     };
     const body = bodyStates.get(request) ?? null;
-    // A Blob that is not oam's own: its bytes are read before the request
+    // A Blob that is not oam's own or not all in memory (a file-backed one),
+    // or a FormData with such a file: its bytes are read before the request
     // goes out (oamFetch), as `flat.body` stays its stream until then.
     let collect = false;
     if (body !== null) {
@@ -3087,8 +3484,11 @@
         flat.body = body.stream;
         flat.duplex = "half";
         // undici sends a Blob's size as its content-length, and reads it
-        // again for a redirect.
-        if (body.kind === "blob" && untouched) collect = { size: body.size };
+        // again for a redirect; a FormData with a file-backed file in it
+        // has a known length too.
+        if ((body.kind === "blob" || body.kind === "formdata") && untouched) {
+          collect = { size: body.size };
+        }
       } else {
         flat.body = body.text ?? body.bytes;
       }
@@ -3116,8 +3516,7 @@
   async function collectBlobStream(stream, size, signal) {
     const reader = stream.getReader();
     const chunks = [];
-    const reasonOf = () =>
-      signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+    const reasonOf = () => defaultAbortReason(signal.reason);
     let onAbort = null;
     const aborted = signal
       ? new Promise((_resolve, reject) => {
@@ -3231,7 +3630,7 @@
     const signal = init.signal;
     // Already-aborted: reject before touching the network (spec).
     if (signal?.aborted) {
-      throw signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      throw defaultAbortReason(signal.reason);
     }
     if (collect) init.body = await collectBlobStream(init.body, collect.size, signal);
     // undici's DISPATCH-level rules are a smaller set that node applies to
@@ -3612,9 +4011,7 @@
         signal.addEventListener(
           "abort",
           () => {
-            reject(
-              signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError"),
-            );
+            reject(defaultAbortReason(signal.reason));
             cancel();
           },
           { once: true },
@@ -4252,6 +4649,7 @@
     "ERR_BUFFER_OUT_OF_BOUNDS",
     "ERR_FALSY_VALUE_REJECTION",
     "ERR_HTTP2_STREAM_CANCEL",
+    "ERR_INTERNAL_ASSERTION",
     "ERR_INVALID_ADDRESS_FAMILY",
     "ERR_INVALID_ARG_TYPE",
     "ERR_INVALID_ARG_VALUE",
@@ -4265,6 +4663,7 @@
     "ERR_OUT_OF_RANGE",
     "ERR_PACKAGE_IMPORT_NOT_DEFINED",
     "ERR_PACKAGE_PATH_NOT_EXPORTED",
+    "ERR_REQUIRE_ASYNC_MODULE",
     "ERR_SOCKET_BAD_PORT",
     "ERR_TLS_CERT_ALTNAME_INVALID",
     "ERR_UNHANDLED_ERROR",
@@ -4288,6 +4687,34 @@
   });
   Object.defineProperty(globalThis, "__oamNodeErrorPrototype", {
     value: nodeErrorPrototype,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+
+  // node's internal AbortError (lib/internal/errors.js, v22.22.2), the ONE
+  // class: events.once/on, timers/promises, the streams (finished,
+  // pipeline, addAbortSignal, the operators), fs, readline, child_process
+  // and http2 all reject with it, so `e.constructor` is the same object
+  // whichever raised it, as in node. Each module carried a class of its own
+  // with the same name and code, and an `instanceof` or constructor check
+  // against one missed the others (#401). Own keys in node's order: stack,
+  // message, cause (when given), code, name.
+  class AbortError extends ErrorCtor {
+    constructor(message = "The operation was aborted", options = undefined) {
+      if (options !== undefined && typeof options !== "object") {
+        // The codes live in node_compat.js, evaluated after this file, so
+        // they are looked up at call time.
+        const { codes } = globalThis.__oamNode.get("internal/errors");
+        throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+      }
+      super(message, options);
+      this.code = "ABORT_ERR";
+      this.name = "AbortError";
+    }
+  }
+  Object.defineProperty(globalThis, "__oamAbortError", {
+    value: AbortError,
     writable: false,
     enumerable: false,
     configurable: false,
@@ -4331,6 +4758,173 @@
   });
 })();
 
+// What a worker thread's fatal error becomes for its parent's 'error' event
+// (#399): node's serializeError (lib/internal/error_serdes.js, v22.22.2), with
+// JSON standing in for the V8 serializer as it does for oam's postMessage.
+// An Error whose prototype chain holds one of the seven built-in error
+// constructors is sent as that constructor's name plus every data property
+// along its chain (node's TryGetAllProperties: getters read, functions and
+// symbols dropped, a `cause` serialized in turn); a Symbol, a value with a
+// custom inspect, and anything structuredClone refuses (a function) are sent
+// as their util.inspect string (a Symbol comes back as Symbol.for of its
+// description); anything else as itself. A rejection that is
+// not error-like (no own `stack`) becomes node's UnhandledPromiseRejection
+// error first. The parent half is workerError in node_compat.js.
+(() => {
+  const ERROR_NAMES = new Set([
+    "Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError",
+  ]);
+  const inspect = (value) => {
+    try {
+      return globalThis.__oamNode.get("util").inspect(value);
+    } catch {
+      try {
+        return String(value);
+      } catch {
+        return "<unprintable value>";
+      }
+    }
+  };
+  // A property value, tagged where JSON alone would lose it.
+  function encodeValue(value) {
+    if (value === undefined) return { u: 1 };
+    if (typeof value === "bigint") return { big: String(value) };
+    if (typeof value === "number" && !Number.isFinite(value)) return { num: String(value) };
+    try {
+      const json = JSON.stringify(value);
+      if (json !== undefined) return { j: JSON.parse(json) };
+    } catch {
+      // cyclic, or a BigInt inside: fall back to its inspection
+    }
+    return { s: inspect(value) };
+  }
+  function allProperties(object, target) {
+    const all = { __proto__: null };
+    if (object === null) return all;
+    Object.assign(all, allProperties(Object.getPrototypeOf(object), target));
+    for (const key of Object.getOwnPropertyNames(object)) {
+      // oam's own mark on an error an 'uncaughtException' listener threw
+      // (dispatchUncaught in node_compat.js) is not the program's.
+      if (key === "__oamHandlerThrow") continue;
+      let descriptor;
+      try {
+        descriptor = Object.getOwnPropertyDescriptor(object, key);
+      } catch {
+        continue;
+      }
+      const getter = descriptor.get;
+      if (getter && key !== "__proto__") {
+        try {
+          descriptor.value = getter.call(target);
+          delete descriptor.get;
+          delete descriptor.set;
+        } catch {
+          // left as the accessor it is, and so dropped below
+        }
+      }
+      if (key === "cause" && "value" in descriptor) {
+        descriptor.value = { cause: serialize(descriptor.value) };
+      }
+      if (
+        "value" in descriptor &&
+        typeof descriptor.value !== "function" &&
+        typeof descriptor.value !== "symbol"
+      ) {
+        delete descriptor.get;
+        delete descriptor.set;
+        all[key] = descriptor;
+      }
+    }
+    return all;
+  }
+  function serialize(error) {
+    // node sends a Symbol as its inspection and the parent makes it
+    // Symbol.for(<the description>) again.
+    if (typeof error === "symbol") return { kind: "symbol", value: error.description ?? "" };
+    try {
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        Object.prototype.toString.call(error) === "[object Error]"
+      ) {
+        for (let current = error; current !== null; current = Object.getPrototypeOf(current)) {
+          const constructor = Object.getOwnPropertyDescriptor(current, "constructor");
+          const name = constructor && constructor.value &&
+            Object.getOwnPropertyDescriptor(constructor.value, "name");
+          if (name && ERROR_NAMES.has(name.value)) {
+            const props = [];
+            const all = allProperties(error, error);
+            for (const key of Object.keys(all)) {
+              const d = all[key];
+              const value = key === "cause" && d.value && "cause" in d.value
+                ? { err: d.value.cause }
+                : encodeValue(d.value);
+              props.push([key, value, !!d.enumerable, !!d.writable, !!d.configurable]);
+            }
+            return { kind: "error", ctor: name.value, props };
+          }
+        }
+      }
+    } catch {
+      // continue regardless, as node's does
+    }
+    try {
+      if (error != null && Object.prototype.hasOwnProperty.call(error, Symbol.for("nodejs.util.inspect.custom"))) {
+        return { kind: "string", value: inspect(error) };
+      }
+    } catch {
+      // continue
+    }
+    try {
+      globalThis.structuredClone(error);
+      return { kind: "value", value: encodeValue(error) };
+    } catch {
+      return { kind: "string", value: inspect(error) };
+    }
+  }
+  // node's UnhandledPromiseRejection (lib/internal/process/promises.js); the
+  // reason is named as V8's NoSideEffectsToString names it, for a primitive
+  // its string and for an object `#<Constructor>`.
+  function unhandledRejection(reason) {
+    let named;
+    if (reason !== null && (typeof reason === "object" || typeof reason === "function")) {
+      let constructor;
+      try {
+        constructor = reason.constructor && reason.constructor.name;
+      } catch {
+        constructor = undefined;
+      }
+      named = `#<${constructor || "Object"}>`;
+    } else {
+      named = String(reason);
+    }
+    const err = new Error(
+      "This error originated either by throwing inside of an async function without a catch block, " +
+        "or by rejecting a promise which was not handled with .catch()." +
+        ` The promise rejected with the reason "${named}".`,
+    );
+    err.code = "ERR_UNHANDLED_REJECTION";
+    err.name = "UnhandledPromiseRejection";
+    return err;
+  }
+  function __oamSerializeWorkerError(thrown, fromPromise) {
+    let error = thrown;
+    if (
+      fromPromise &&
+      !(typeof thrown === "object" && thrown !== null && Object.prototype.hasOwnProperty.call(thrown, "stack"))
+    ) {
+      error = unhandledRejection(thrown);
+    }
+    return JSON.stringify(serialize(error));
+  }
+  Object.defineProperty(globalThis, "__oamSerializeWorkerError", {
+    value: __oamSerializeWorkerError,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+})();
+
 // Source-position remap for transpiled files, Node --enable-source-maps
 // style but on by default: oam's codegen REFLOWS .ts/.tsx/.cts (Node's
 // strip-only pipeline preserves positions), so without this every
@@ -4355,15 +4949,17 @@
   const kIsNodeError = globalThis.__oamKIsNodeError;
   const errorToString = Error.prototype.toString;
   Error.prepareStackTrace = function (err, frames) {
-    let head;
-    try {
-      head =
-        err !== null && typeof err === "object" && kIsNodeError in err
-          ? `${err.name} [${err.code}]: ${err.message}`
-          : errorToString.call(err);
-    } catch {
-      head = "<error>";
-    }
+    // A header that cannot be built (a Symbol `name`, a throwing `name`
+    // getter) throws out of the `stack` read, as node's does: V8 then keeps
+    // the stack unformatted and tries again on the next read, and
+    // util.inspect falls back to `[object Error]` as node's formatError
+    // does. A "<error>" header stood in before, which made `stack` look
+    // like a regular error's and sent inspect down the improveStack path
+    // that threw on the Symbol name (#401).
+    const head =
+      err !== null && typeof err === "object" && kIsNodeError in err
+        ? `${err.name} [${err.code}]: ${err.message}`
+        : errorToString.call(err);
     let out = head;
     for (const frame of frames) {
       let text = `${frame}`;

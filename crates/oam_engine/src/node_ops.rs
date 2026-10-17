@@ -196,6 +196,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("compileCacheState", op_compile_cache_state),
         ("compileCacheEnable", op_compile_cache_enable),
         ("compileCacheFlush", op_compile_cache_flush),
+        ("requireCache", op_require_cache),
         // WHATWG URL (ada parser, same as Node.js): parse + mutation.
         // urlParseHref: validate + return canonical href (no component extraction).
         // urlParse: full extraction (called lazily on first property access).
@@ -218,6 +219,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // data, propagated across promise continuations by V8 itself.
         ("getContinuationData", op_get_continuation_data),
         ("setContinuationData", op_set_continuation_data),
+        // The queueMicrotask wrapper's catch: the uncaught ladder, with a
+        // fatal outcome noted for the throw that follows (#398).
+        ("dispatchMicrotaskThrow", op_dispatch_microtask_throw),
         // Timer ref/unref: flip the native TimerQueue ref flag so an unref'd
         // timer no longer keeps the event loop alive (Node Timeout#ref/#unref).
         ("timerRef", timer_ref),
@@ -334,6 +338,11 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // node:zlib handle (sync incremental, for ssh2/native binding compat)
         ("zlibHandleCreate", op_zlib_handle_create),
         ("zlibHandleWriteSync", op_zlib_handle_write_sync),
+        // node:zlib zstd handle (node's ZstdCompress/ZstdDecompress binding)
+        ("zstdHandleCreate", op_zstd_handle_create),
+        ("zstdHandleWriteSync", op_zstd_handle_write_sync),
+        ("zstdHandleWrite", op_zstd_handle_write),
+        ("zstdHandleReset", op_zstd_handle_reset),
         // HTTP server
         ("httpServe", op_http_serve),
         // The same server on a named pipe / Unix domain socket (#282).
@@ -411,6 +420,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tcpShutdown", op_tcp_shutdown),
         ("tcpListen", op_tcp_listen),
         ("tcpAccept", op_tcp_accept),
+        ("tcpAcceptTake", op_tcp_accept_take),
         ("tcpServerClose", op_tcp_server_close),
         ("tcpSetRef", op_tcp_set_ref),
         ("tcpServerSetRef", op_tcp_server_set_ref),
@@ -505,6 +515,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("workerTerminate", op_worker_terminate),
         ("parentPortPostMessage", op_parent_port_post_message),
         ("parentPortRecvMessage", op_parent_port_recv_message),
+        ("parentPortSetRef", op_parent_port_set_ref),
         ("workerThreadId", op_worker_thread_id),
         ("workerIsMainThread", op_worker_is_main_thread),
         ("workerGetData", op_worker_get_data),
@@ -2049,6 +2060,16 @@ fn op_stderr_write(
 ) {
     if let Some(bytes) = arg_bytes(scope, &args, 0) {
         use std::io::Write;
+        // In a worker started with { stderr: true }, output -- its warnings
+        // included -- belongs to the parent's worker.stderr stream (#370).
+        if let Some(ctx) = scope.get_slot::<oam_core::worker::WorkerContext>()
+            && ctx.pipe_stderr
+        {
+            let _ = ctx
+                .outbox
+                .send(oam_core::worker::WorkerEvent::Stderr(bytes));
+            return;
+        }
         // A stderr the program closed is EBADF, as for stdout: std's stderr
         // would report the write to a closed descriptor as done.
         if let Some(e) = oam_core::closed_stdio_error(2) {
@@ -2110,18 +2131,23 @@ fn op_tty_init(
     rv.set_int32(tty_init_verdict(file.as_deref()));
 }
 
-/// `uv_tty_init` (src/win/tty.c): a descriptor with no OS handle is EBADF,
-/// and a handle that is no console fails `GetConsoleScreenBufferInfo` with
-/// ERROR_INVALID_HANDLE, which is EBADF too. Measured under node v22.22.2: an
-/// unopened descriptor, a disk file, NUL, a pipe and an msys/cygwin pty pipe
-/// all answer EBADF -- the last is why this asks guess_handle (a console
-/// character device) and not std's IsTerminal, which takes that pipe (#391).
+/// `uv_tty_init` (src/win/tty.c): a descriptor with no OS handle is EBADF;
+/// any other handle is asked what libuv asks it ([`probe_console`]) and
+/// refused with the first failing call's error. Measured under node v22.22.2:
+/// an unopened descriptor, a disk file, NUL, a pipe and an msys/cygwin pty
+/// pipe all answer EBADF (#391) -- the pipe even though std's IsTerminal
+/// takes it -- and a console opened by name is EPERM when its access does
+/// not let libuv use it: write-only, or a screen buffer opened without
+/// write access, which `isatty` still calls a terminal (#381).
 #[cfg(windows)]
 fn tty_init_verdict(file: Option<&std::fs::File>) -> i32 {
-    use oam_core::stdin::{HandleType, guess_handle};
+    use std::os::windows::io::AsRawHandle;
     match file {
-        Some(file) if guess_handle(file) == HandleType::Tty => 0,
-        _ => -4083,
+        Some(file) => tty_init_errno(probe_console(
+            file.as_raw_handle() as isize,
+            ConsoleAsk::TtyInit,
+        )),
+        None => -4083,
     }
 }
 
@@ -2595,6 +2621,49 @@ fn file_win_size(file: &std::fs::File) -> Option<(i32, i32)> {
 /// is no console screen buffer (an input handle, a pipe, a file).
 #[cfg(windows)]
 fn console_win_size(h: isize) -> Option<(i32, i32)> {
+    match probe_console(h, ConsoleAsk::WindowSize) {
+        ConsoleProbe::Screen { cols, rows } if cols > 0 && rows > 0 => Some((cols, rows)),
+        _ => None,
+    }
+}
+
+/// What [`probe_console`] is asked for.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsoleAsk {
+    /// The screen buffer's visible window, and nothing else.
+    WindowSize,
+    /// What libuv's `uv_tty_init` asks of the handle, in its order.
+    TtyInit,
+}
+
+/// A console handle's answer to [`probe_console`].
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsoleProbe {
+    /// GetNumberOfConsoleInputEvents answered (asked under `TtyInit` only):
+    /// a console input buffer opened for reading. uv_tty_init stops there.
+    ReadableInput,
+    /// A screen buffer, with its visible window's size; under `TtyInit` its
+    /// cursor info could be read too.
+    Screen { cols: i32, rows: i32 },
+    /// The Win32 error of the first call that failed.
+    Failed(i32),
+}
+
+/// Ask the console behind `h`. One FFI site for the window size and for the
+/// uv_tty_init question, which both start from GetConsoleScreenBufferInfo.
+///
+/// uv_tty_init (src/win/tty.c) takes a handle GetNumberOfConsoleInputEvents
+/// answers -- console input with read access -- and asks anything else for
+/// its screen buffer info and then its cursor info, returning the first
+/// failure. Measured on Windows 11 26200 under ConPTY: GetConsoleCursorInfo
+/// is ERROR_ACCESS_DENIED on a screen buffer opened without write access
+/// (CONOUT$ `r`, `a+`), GetConsoleScreenBufferInfo ERROR_ACCESS_DENIED on one
+/// opened without read access (`w`, `a`, CONIN$ `w` included) and
+/// ERROR_INVALID_HANDLE on anything that is no console (NUL, a file, a pipe).
+#[cfg(windows)]
+fn probe_console(h: isize, ask: ConsoleAsk) -> ConsoleProbe {
     #[allow(dead_code)]
     #[repr(C)]
     struct Coord {
@@ -2617,29 +2686,95 @@ fn console_win_size(h: isize) -> Option<(i32, i32)> {
         window: SmallRect,
         max_window: Coord,
     }
-    // ABI: the signature matches the Win32 ABI (HANDLE + out
-    // CONSOLE_SCREEN_BUFFER_INFO*), and the `#[repr(C)]` Csbi/Coord/SmallRect
-    // layout mirrors the OS struct so the out-write lands in the right fields.
-    unsafe extern "system" {
-        fn GetConsoleScreenBufferInfo(h: isize, info: *mut Csbi) -> i32;
+    #[allow(dead_code)]
+    #[repr(C)]
+    struct CursorInfo {
+        size: u32,
+        visible: i32,
     }
-    // SAFETY: Csbi is `#[repr(C)]` plain integer data, so an all-zero bit
-    // pattern is a valid instance. `info` is a live stack struct passed by
-    // `&mut`; its fields are only read after the return is checked non-zero.
-    // `h` is passed by value and only named to the kernel: a std handle
-    // already checked for 0 / -1, or the live handle of a file the caller
-    // holds. One that is no console fails the call and is never dereferenced.
+    let failed =
+        || ConsoleProbe::Failed(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+    // ABI: the signatures match the Win32 console ABI (HANDLE + out
+    // DWORD* / CONSOLE_SCREEN_BUFFER_INFO* / CONSOLE_CURSOR_INFO*), and the
+    // `#[repr(C)]` Csbi/Coord/SmallRect/CursorInfo layouts mirror the OS
+    // structs so each out-write lands in the right fields.
+    unsafe extern "system" {
+        fn GetNumberOfConsoleInputEvents(h: isize, events: *mut u32) -> i32;
+        fn GetConsoleScreenBufferInfo(h: isize, info: *mut Csbi) -> i32;
+        fn GetConsoleCursorInfo(h: isize, info: *mut CursorInfo) -> i32;
+    }
+    // SAFETY: Csbi and CursorInfo are `#[repr(C)]` plain integer data, so an
+    // all-zero bit pattern is a valid instance of each. Every out-parameter
+    // is a live stack value passed by `&mut`, read only after its call's
+    // return is checked non-zero. `h` is passed by value and only named to
+    // the kernel: a std handle already checked for 0 / -1, or the live
+    // handle of a file the caller holds. One that is no console fails the
+    // calls and is never dereferenced. `failed` reads GetLastError straight
+    // after the call that failed, before anything can move it.
     unsafe {
+        if ask == ConsoleAsk::TtyInit {
+            let mut events: u32 = 0;
+            if GetNumberOfConsoleInputEvents(h, &mut events) != 0 {
+                return ConsoleProbe::ReadableInput;
+            }
+        }
         let mut info: Csbi = std::mem::zeroed();
         if GetConsoleScreenBufferInfo(h, &mut info) == 0 {
-            return None;
+            return failed();
         }
-        let cols = info.window.right as i32 - info.window.left as i32 + 1;
-        let rows = info.window.bottom as i32 - info.window.top as i32 + 1;
-        if cols <= 0 || rows <= 0 {
-            return None;
+        if ask == ConsoleAsk::TtyInit {
+            let mut cursor: CursorInfo = std::mem::zeroed();
+            if GetConsoleCursorInfo(h, &mut cursor) == 0 {
+                return failed();
+            }
         }
-        Some((cols, rows))
+        ConsoleProbe::Screen {
+            cols: info.window.right as i32 - info.window.left as i32 + 1,
+            rows: info.window.bottom as i32 - info.window.top as i32 + 1,
+        }
+    }
+}
+
+/// uv_tty_init's return for a probe's answer: 0 for a console it takes, the
+/// failing call's error translated as libuv's uv_translate_sys_error does
+/// otherwise (ERROR_ACCESS_DENIED is EPERM, ERROR_INVALID_HANDLE EBADF).
+#[cfg(windows)]
+fn tty_init_errno(probe: ConsoleProbe) -> i32 {
+    match probe {
+        ConsoleProbe::ReadableInput | ConsoleProbe::Screen { .. } => 0,
+        ConsoleProbe::Failed(code) => {
+            let err = std::io::Error::from_raw_os_error(code);
+            // libuv's UV_UNKNOWN for an error it cannot name.
+            oam_core::node_errno(oam_core::node_error_code(&err), &err).unwrap_or(-4094)
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tty_init_tests {
+    use super::{ConsoleProbe, tty_init_errno};
+
+    #[test]
+    fn a_console_uv_tty_init_takes_is_zero() {
+        assert_eq!(tty_init_errno(ConsoleProbe::ReadableInput), 0);
+        assert_eq!(
+            tty_init_errno(ConsoleProbe::Screen {
+                cols: 120,
+                rows: 40
+            }),
+            0
+        );
+        // A zero-sized window is still a console uv_tty_init takes; only the
+        // size read refuses it.
+        assert_eq!(tty_init_errno(ConsoleProbe::Screen { cols: 0, rows: 0 }), 0);
+    }
+
+    #[test]
+    fn a_refusal_is_the_failing_calls_error_as_libuv_names_it() {
+        // ERROR_ACCESS_DENIED: a console whose access libuv cannot use.
+        assert_eq!(tty_init_errno(ConsoleProbe::Failed(5)), -4048);
+        // ERROR_INVALID_HANDLE: no console at all.
+        assert_eq!(tty_init_errno(ConsoleProbe::Failed(6)), -4083);
     }
 }
 
@@ -3103,6 +3238,11 @@ fn op_v8_is(
         "argumentsObject" => value.is_arguments_object(),
         "weakMap" => value.is_weak_map(),
         "weakSet" => value.is_weak_set(),
+        "numberObject" => value.is_number_object(),
+        "stringObject" => value.is_string_object(),
+        "booleanObject" => value.is_boolean_object(),
+        "bigIntObject" => value.is_big_int_object(),
+        "symbolObject" => value.is_symbol_object(),
         _ => false,
     };
     rv.set_bool(answer);
@@ -5608,6 +5748,21 @@ fn op_tcp_accept(
     );
 }
 
+/// `__oam.node.tcpAcceptTake(serverId, handle) -> boolean`: JS takes the
+/// connection an accept answered with, before handing it to the server, so
+/// the server's close no longer closes it with the server (#388). False if
+/// that close came first.
+fn op_tcp_accept_take(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = args.get(1).number_value(scope).unwrap_or(0.0) as u64;
+    let tcp = core_runtime!(scope).tcp();
+    rv.set_bool(oam_core::tcp::tcp_accept_take(&tcp, server_id, handle));
+}
+
 fn op_tcp_server_close(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -6621,6 +6776,200 @@ fn op_zlib_handle_write_sync(
     }
 }
 
+/// Throw an `Error` with `message` and an own `code`, the shape node's C++
+/// `THROW_ERR_*` helpers give (no `[CODE]` in the stack's first line).
+fn throw_coded_error(scope: &mut v8::PinScope<'_, '_>, message: &str, code: &str) {
+    let message = v8::String::new(scope, message).unwrap();
+    let exception = v8::Exception::error(scope, message);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+        let code_key = v8::String::new(scope, "code").unwrap();
+        let code = v8::String::new(scope, code).unwrap();
+        obj.create_data_property(scope, code_key.into(), code.into());
+    }
+    scope.throw_exception(exception);
+}
+
+/// Throw node's zstd codec error: libzstd's message with own `errno` then
+/// `code` (lib/zlib.js `zlibOnError`).
+fn throw_zstd_error(scope: &mut v8::PinScope<'_, '_>, error: &oam_core::zstd::ZstdError) {
+    throw_zlib_coded(
+        scope,
+        &oam_core::zlib::ZlibError {
+            code: error.code,
+            errno: error.errno,
+            message: error.message,
+        },
+    );
+}
+
+/// The zstd engine `handle` names, or a thrown Error when it is closed (the
+/// shim never writes to a closed handle; node's binding CHECKs the same).
+fn zstd_engine(
+    scope: &mut v8::PinScope<'_, '_>,
+    handle: u64,
+) -> Option<std::sync::Arc<std::sync::Mutex<oam_core::zstd::ZstdHandle>>> {
+    // Not `core_runtime!`: that macro's early `return;` only fits a `()` op.
+    let Some(core) = scope.get_slot::<oam_core::CoreRuntime>() else {
+        throw_type_error(scope, "internal: runtime not initialized");
+        return None;
+    };
+    let streams = core.zlib_streams();
+    let engine = oam_core::ops::zstd_handle(&streams, handle);
+    if engine.is_none() {
+        let message = v8::String::new(scope, &format!("zstd handle {handle} is closed")).unwrap();
+        let exception = v8::Exception::error(scope, message);
+        scope.throw_exception(exception);
+    }
+    engine
+}
+
+/// zstdHandleCreate(compress, params, pledgedSrcSize?, dictionary?) -> handle.
+/// node's zstd binding `init()`. `params` is node's `initParamsArray` (a
+/// Uint32Array indexed by parameter key, 0xFFFFFFFF for "not set"); each set
+/// entry goes to libzstd as the int32 node's binding passes. The shim has
+/// already validated the keys; `pledgedSrcSize` is the caller's value, read
+/// here as node's binding reads it. A step libzstd refuses
+/// throws node's `ERR_ZLIB_INITIALIZATION_FAILED` with node's message.
+fn op_zstd_handle_create(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let compress = args.get(0).is_true();
+    let mut params = Vec::new();
+    if let Ok(array) = v8::Local::<v8::Uint32Array>::try_from(args.get(1)) {
+        for index in 0..array.length() as u32 {
+            let Some(value) = array.get_index(scope, index) else {
+                continue;
+            };
+            let value = value.uint32_value(scope).unwrap_or(u32::MAX);
+            if value != u32::MAX {
+                params.push((index, value as i32));
+            }
+        }
+    }
+    // node's binding reads a number `pledgedSrcSize` with V8's IntegerValue
+    // (truncating, NaN as 0, saturating at the int64 range: what `as i64`
+    // does) and refuses a negative one; any other type is "unknown".
+    let pledged = args.get(2);
+    let pledged = if pledged.is_number() {
+        let size = pledged.number_value(scope).unwrap_or(0.0) as i64;
+        if size < 0 {
+            let message = v8::String::new(scope, "pledgedSrcSize may not be negative").unwrap();
+            let exception = v8::Exception::type_error(scope, message);
+            if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+                let code_key = v8::String::new(scope, "code").unwrap();
+                let code = v8::String::new(scope, "ERR_INVALID_ARG_VALUE").unwrap();
+                obj.create_data_property(scope, code_key.into(), code.into());
+            }
+            scope.throw_exception(exception);
+            return;
+        }
+        Some(size as u64)
+    } else {
+        None
+    };
+    let dictionary = arg_bytes(scope, &args, 3);
+    let core = core_runtime!(scope);
+    let streams = core.zlib_streams();
+    let ids = core.body_ids();
+    match oam_core::ops::zstd_handle_create(
+        &streams,
+        &ids,
+        compress,
+        pledged,
+        dictionary.as_deref(),
+        &params,
+    ) {
+        Ok(handle) => {
+            let value = v8::Number::new(scope, handle as f64);
+            rv.set(value.into());
+        }
+        Err(message) => throw_coded_error(scope, message, "ERR_ZLIB_INITIALIZATION_FAILED"),
+    }
+}
+
+/// zstdHandleWriteSync(handle, flush, input, outLen) -> Uint8Array: one
+/// libzstd call on the isolate thread (node's `writeSync`), answered as
+/// `oam_core::ops::zstd_write_result` lays it out. `input` is a new chunk
+/// (copied into the handle once) or undefined to read on through the chunk
+/// the handle holds, so node's once-per-output-window loop does not copy the
+/// unconsumed rest of a large chunk on every call. A codec failure throws
+/// node's coded zstd error.
+fn op_zstd_handle_write_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let flush = args.get(1).int32_value(scope).unwrap_or(0);
+    let input = arg_bytes(scope, &args, 2);
+    let out_len = args.get(3).uint32_value(scope).unwrap_or(0) as usize;
+    let Some(engine) = zstd_engine(scope, handle) else {
+        return;
+    };
+    let result = {
+        let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(input) = input {
+            engine.set_input(input);
+        }
+        engine.write(flush, out_len)
+    };
+    match result {
+        Ok((consumed, output)) => {
+            let bytes = oam_core::ops::zstd_write_result(consumed, output);
+            if let Some(value) = bytes_to_uint8array(scope, bytes) {
+                rv.set(value);
+            }
+        }
+        Err(error) => throw_zstd_error(scope, &error),
+    }
+}
+
+/// zstdHandleWrite(handle, flush, input, outLen) -> Promise<Uint8Array>:
+/// node's async `write()`, the libzstd call on the blocking pool. `input`
+/// is as the sync form takes it. Resolves as the sync form returns; rejects
+/// with node's coded zstd error.
+fn op_zstd_handle_write(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let flush = args.get(1).int32_value(scope).unwrap_or(0);
+    let input = arg_bytes(scope, &args, 2);
+    let out_len = args.get(3).uint32_value(scope).unwrap_or(0) as usize;
+    let Some(engine) = zstd_engine(scope, handle) else {
+        return;
+    };
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::zstd_handle_write(engine, flush, input, out_len),
+    );
+}
+
+/// zstdHandleReset(handle) -> undefined | string: node's `reset()`, a fresh
+/// context with only the pledged source size. Returns node's message when
+/// libzstd refuses it, which the shim reports as node's binding does (an
+/// error on the stream), or undefined.
+fn op_zstd_handle_reset(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(engine) = zstd_engine(scope, handle) else {
+        return;
+    };
+    let result = engine.lock().unwrap_or_else(|e| e.into_inner()).reset();
+    if let Err(message) = result
+        && let Some(text) = v8::String::new(scope, message)
+    {
+        rv.set(text.into());
+    }
+}
+
 fn op_url_parse_href(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -6848,6 +7197,20 @@ fn op_get_continuation_data(
     rv.set(scope.get_continuation_preserved_embedder_data());
 }
 
+fn op_dispatch_microtask_throw(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    match crate::modules::dispatch_microtask_throw(scope, args.get(0)) {
+        Ok(handled) => rv.set_bool(handled),
+        Err(thrown) => {
+            let thrown = v8::Local::new(scope, &thrown);
+            scope.throw_exception(thrown);
+        }
+    }
+}
+
 fn op_set_continuation_data(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -6886,6 +7249,17 @@ fn op_make_require(
     };
     if let Some(require) = crate::cjs::make_require(scope, &filename) {
         rv.set(require.into());
+    }
+}
+
+/// node:module's `Module._cache`: the same object every `require.cache` is.
+fn op_require_cache(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if let Some(cache) = crate::cjs::require_cache(scope) {
+        rv.set(cache.into());
     }
 }
 
@@ -7032,8 +7406,12 @@ fn op_fs_stat_sync(
     };
     // statSync / lstatSync's `throwIfNoEntry`, passed as the caller gave
     // it: as in node's binding only `false` itself turns the throw off, and
-    // then only for a path that is not there -- ENOENT, or ENOTDIR for one
-    // under a file -- which answers undefined (#392). Returning undefined
+    // then only for a path that is not there, which answers undefined
+    // (#392): ENOENT, and for statSync alone ENOTDIR (a path under a file).
+    // node's Stat binding spares both, its LStat binding ENOENT only
+    // (is_uv_error_except_no_entry_dir vs is_uv_error_except_no_entry,
+    // src/node_file.cc), so lstatSync('<file>/x', { throwIfNoEntry: false })
+    // still throws ENOTDIR on POSIX. Returning undefined
     // here rather than catching in JS spares the existence check the error
     // object and its stack, which is the point of the option.
     let no_throw_if_no_entry = args.get(2).is_false();
@@ -7041,7 +7419,11 @@ fn op_fs_stat_sync(
         Ok(record) => return_stat_record(scope, &mut rv, values, &record),
         Err(e)
             if no_throw_if_no_entry
-                && matches!(oam_core::node_error_code(&e), "ENOENT" | "ENOTDIR") =>
+                && match oam_core::node_error_code(&e) {
+                    "ENOENT" => true,
+                    "ENOTDIR" => !lstat,
+                    _ => false,
+                } =>
         {
             rv.set_undefined();
         }
@@ -8234,26 +8616,8 @@ fn op_fs_chmod_sync(
         return;
     };
     let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)) {
-            throw_node_error(scope, "chmod", &path, &e);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = mode;
-        match std::fs::metadata(&path) {
-            Ok(meta) => {
-                let mut perms = meta.permissions();
-                perms.set_readonly(mode & 0o200 == 0);
-                if let Err(e) = std::fs::set_permissions(&path, perms) {
-                    throw_node_error(scope, "chmod", &path, &e);
-                }
-            }
-            Err(e) => throw_node_error(scope, "chmod", &path, &e),
-        }
+    if let Err(e) = oam_core::chmod_path(&path, mode) {
+        throw_node_error(scope, "chmod", &path, &e);
     }
 }
 
@@ -8631,7 +8995,9 @@ fn op_fs_fstat_sync(
 // ------------------------------------------------- permission helpers / query
 
 /// Throw Node's `ERR_ACCESS_DENIED`: message "Access to this API has been
-/// restricted", plus the `permission` and `resource` own properties Node
+/// restricted. Use <flag> to manage permissions."
+/// ([`crate::permissions::access_denied_message`]), plus the `permission`
+/// and `resource` own properties Node
 /// attaches (and its fatal reporter prints).
 pub(crate) fn throw_permission_denied(
     scope: &mut v8::PinScope<'_, '_>,
@@ -8652,8 +9018,11 @@ pub(crate) fn access_denied_error<'s>(
     permission: &str,
     resource: &str,
 ) -> v8::Local<'s, v8::Value> {
-    let msg_v8 = v8::String::new(scope, crate::permissions::ACCESS_DENIED_MESSAGE)
-        .unwrap_or_else(|| v8::String::new(scope, "ERR_ACCESS_DENIED").unwrap());
+    let msg_v8 = v8::String::new(
+        scope,
+        &crate::permissions::access_denied_message(permission),
+    )
+    .unwrap_or_else(|| v8::String::new(scope, "ERR_ACCESS_DENIED").unwrap());
     let exception = v8::Exception::error(scope, msg_v8);
     if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
         for (key, value) in [
@@ -8911,6 +9280,15 @@ fn op_worker_new(
             })
             .unwrap_or_default(),
         env,
+        // Absent (an older caller): the creator's options, as before.
+        inherit_flags: options
+            .get("inheritFlags")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        // A worker creating one hands it its own options to inherit.
+        creator_flags: scope
+            .get_slot::<crate::CreatorFlags>()
+            .map(|flags| flags.0.clone()),
     };
 
     // Not looked for here: node's Worker constructor never opens its entry,
@@ -9039,7 +9417,28 @@ fn op_parent_port_recv_message(
         return;
     };
     let inbox = ctx.inbox.clone();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::worker::worker_recv(inbox));
+    // Filed under the parentPort handle, so `parentPortSetRef(false)` --
+    // the port's last 'message' listener going -- stops the parked receive
+    // holding the worker's loop open, as node's unref'd port does (#401).
+    crate::ops::spawn_handle_op(
+        scope,
+        &mut rv,
+        oam_core::HandleKey::ParentPort,
+        oam_core::worker::worker_recv(inbox),
+    );
+}
+
+/// `__oam.node.parentPortSetRef(referenced)`: a worker's `parentPort.ref()`
+/// / `.unref()`, which its first 'message' listener and the removal of its
+/// last one do. Nothing is cancelled: an unref'd receive still delivers a
+/// message that arrives, it just no longer keeps the worker alive (#401).
+fn op_parent_port_set_ref(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let referenced = args.get(0).boolean_value(scope);
+    core_runtime_mut!(scope).set_handle_ref(oam_core::HandleKey::ParentPort, referenced);
 }
 
 fn op_worker_thread_id(

@@ -55,6 +55,7 @@ fn dep_versions_json() -> String {
     }
     entries.extend(icu_versions(&lock));
     entries.push(ada_version(&lock));
+    entries.push(zstd_version(&lock));
     entries.sort();
     let mut json = String::from("{");
     for (i, (key, version)) in entries.iter().enumerate() {
@@ -135,6 +136,49 @@ fn ada_version(lock: &str) -> (String, String) {
     (
         "ada".to_string(),
         header_define(&src.join("deps").join("ada.h"), "ADA_VERSION"),
+    )
+}
+
+/// `zstd` for process.versions: node's own key for the libzstd it links, and
+/// oam links libzstd too (node:zlib's zstd engine, oam_core/src/zstd.rs), so
+/// withholding it would be as wrong as publishing a library oam lacks.
+///
+/// The value is the version of the VENDORED C libzstd, read from the pinned
+/// `zstd-sys` crate's own `zstd/lib/zstd.h` (ZSTD_VERSION_MAJOR/MINOR/RELEASE),
+/// not the binding crate's version -- the same rule, and the same
+/// registry-layout limitation, as `ada_version` above.
+fn zstd_version(lock: &str) -> (String, String) {
+    let crate_version = match lock_package_versions(lock, "zstd-sys").as_slice() {
+        [one] => one.clone(),
+        other => panic!("expected exactly one zstd-sys crate in Cargo.lock, found {other:?}"),
+    };
+    let src = crate_src_dir(&format!("zstd-sys-{crate_version}")).unwrap_or_else(|registry_src| {
+        panic!(
+            "zstd-sys-{crate_version} not found under {} -- cannot verify the \
+             linked libzstd version; if the registry layout changed, update crate_src_dir() \
+             (do NOT hardcode a version string)",
+            registry_src.display()
+        )
+    });
+    let header = src.join("zstd").join("lib").join("zstd.h");
+    let text = std::fs::read_to_string(&header)
+        .unwrap_or_else(|e| panic!("read {}: {e}", header.display()));
+    let part = |name: &str| -> String {
+        let needle = format!("#define {name} ");
+        text.lines()
+            .find_map(|line| line.strip_prefix(&needle))
+            .map(|rest| rest.trim().to_string())
+            .filter(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+            .unwrap_or_else(|| panic!("{name} not found in {}", header.display()))
+    };
+    (
+        "zstd".to_string(),
+        format!(
+            "{}.{}.{}",
+            part("ZSTD_VERSION_MAJOR"),
+            part("ZSTD_VERSION_MINOR"),
+            part("ZSTD_VERSION_RELEASE")
+        ),
     )
 }
 
@@ -267,6 +311,12 @@ fn main() {
     let js_files: &[(&str, Option<&str>)] = &[
         (
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/bootstrap.js"),
+            None,
+        ),
+        // import()'s loader chain: a factory the runtime calls once at
+        // construction (modules::install_dynamic_import).
+        (
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/esm_loader.js"),
             None,
         ),
         // Before node_compat.js, which picks the factory up off globalThis.

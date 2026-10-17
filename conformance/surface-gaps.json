@@ -5,16 +5,15 @@
       "generatedAgainst": "v22.22.2 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1487,
-        "missing": 338,
-        "absentModules": 5,
-        "absentModuleExportNames": 59
+        "present": 1572,
+        "missing": 302,
+        "absentModules": 4,
+        "absentModuleExportNames": 10
       },
       "absentModules": [
         "_stream_wrap",
         "global:fetch.prototype",
         "inspector/promises",
-        "sys",
         "wasi"
       ],
       "missingExports": {
@@ -119,8 +118,6 @@
           "Decipher",
           "Decipheriv",
           "DiffieHellmanGroup",
-          "Hash",
-          "Hmac",
           "createDiffieHellmanGroup",
           "diffieHellman",
           "getCipherInfo",
@@ -285,7 +282,6 @@
         ],
         "module": [
           "SourceMap",
-          "_cache",
           "_debug",
           "_extensions",
           "_findPath",
@@ -310,7 +306,6 @@
           "Stream",
           "_createServerHandle",
           "_normalizeArgs",
-          "_setSimultaneousAccepts",
           "getDefaultAutoSelectFamily",
           "setDefaultAutoSelectFamily"
         ],
@@ -342,9 +337,6 @@
           "openStdin",
           "sourceMapsEnabled"
         ],
-        "punycode": [
-          "version"
-        ],
         "querystring": [
           "unescapeBuffer"
         ],
@@ -375,6 +367,15 @@
           "WritableStreamDefaultController",
           "WritableStreamDefaultWriter"
         ],
+        "sys": [
+          "MIMEParams",
+          "_errnoException",
+          "_exceptionWithHostPort",
+          "diff",
+          "setTraceSigInt",
+          "transferableAbortController",
+          "transferableAbortSignal"
+        ],
         "test": [
           "assert",
           "run",
@@ -394,14 +395,12 @@
           "MIMEParams",
           "_errnoException",
           "_exceptionWithHostPort",
-          "_extend",
           "diff",
           "setTraceSigInt",
           "transferableAbortController",
           "transferableAbortSignal"
         ],
         "util/types": [
-          "isBigIntObject",
           "isFloat16Array"
         ],
         "v8": [
@@ -425,16 +424,8 @@
           "threadName"
         ],
         "zlib": [
-          "ZstdCompress",
-          "ZstdDecompress",
           "codes",
-          "crc32",
-          "createZstdCompress",
-          "createZstdDecompress",
-          "zstdCompress",
-          "zstdCompressSync",
-          "zstdDecompress",
-          "zstdDecompressSync"
+          "crc32"
         ]
       }
     },
@@ -442,16 +433,15 @@
       "generatedAgainst": "v22.22.2 on linux-x64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1487,
-        "missing": 342,
-        "absentModules": 5,
-        "absentModuleExportNames": 59
+        "present": 1572,
+        "missing": 306,
+        "absentModules": 4,
+        "absentModuleExportNames": 10
       },
       "absentModules": [
         "_stream_wrap",
         "global:fetch.prototype",
         "inspector/promises",
-        "sys",
         "wasi"
       ],
       "missingExports": {
@@ -560,8 +550,6 @@
           "Decipher",
           "Decipheriv",
           "DiffieHellmanGroup",
-          "Hash",
-          "Hmac",
           "createDiffieHellmanGroup",
           "diffieHellman",
           "getCipherInfo",
@@ -726,7 +714,6 @@
         ],
         "module": [
           "SourceMap",
-          "_cache",
           "_debug",
           "_extensions",
           "_findPath",
@@ -751,7 +738,6 @@
           "Stream",
           "_createServerHandle",
           "_normalizeArgs",
-          "_setSimultaneousAccepts",
           "getDefaultAutoSelectFamily",
           "setDefaultAutoSelectFamily"
         ],
@@ -783,9 +769,6 @@
           "openStdin",
           "sourceMapsEnabled"
         ],
-        "punycode": [
-          "version"
-        ],
         "querystring": [
           "unescapeBuffer"
         ],
@@ -816,6 +799,15 @@
           "WritableStreamDefaultController",
           "WritableStreamDefaultWriter"
         ],
+        "sys": [
+          "MIMEParams",
+          "_errnoException",
+          "_exceptionWithHostPort",
+          "diff",
+          "setTraceSigInt",
+          "transferableAbortController",
+          "transferableAbortSignal"
+        ],
         "test": [
           "assert",
           "run",
@@ -835,14 +827,12 @@
           "MIMEParams",
           "_errnoException",
           "_exceptionWithHostPort",
-          "_extend",
           "diff",
           "setTraceSigInt",
           "transferableAbortController",
           "transferableAbortSignal"
         ],
         "util/types": [
-          "isBigIntObject",
           "isFloat16Array"
         ],
         "v8": [
@@ -866,16 +856,8 @@
           "threadName"
         ],
         "zlib": [
-          "ZstdCompress",
-          "ZstdDecompress",
           "codes",
-          "crc32",
-          "createZstdCompress",
-          "createZstdDecompress",
-          "zstdCompress",
-          "zstdCompressSync",
-          "zstdDecompress",
-          "zstdDecompressSync"
+          "crc32"
         ]
       }
     },
@@ -883,16 +865,15 @@
       "generatedAgainst": "v22.22.2 on win32-arm64",
       "counts": {
         "nodeExportNames": 1874,
-        "present": 1507,
-        "missing": 308,
-        "absentModules": 5,
-        "absentModuleExportNames": 59
+        "present": 1569,
+        "missing": 295,
+        "absentModules": 4,
+        "absentModuleExportNames": 10
       },
       "absentModules": [
         "_stream_wrap",
         "global:fetch.prototype",
         "inspector/promises",
-        "sys",
         "wasi"
       ],
       "missingExports": {
@@ -990,8 +971,6 @@
           "Decipher",
           "Decipheriv",
           "DiffieHellmanGroup",
-          "Hash",
-          "Hmac",
           "createDiffieHellmanGroup",
           "diffieHellman",
           "getCipherInfo",
@@ -1156,7 +1135,6 @@
         ],
         "module": [
           "SourceMap",
-          "_cache",
           "_debug",
           "_extensions",
           "_findPath",
@@ -1181,7 +1159,6 @@
           "Stream",
           "_createServerHandle",
           "_normalizeArgs",
-          "_setSimultaneousAccepts",
           "getDefaultAutoSelectFamily",
           "setDefaultAutoSelectFamily"
         ],
@@ -1213,9 +1190,6 @@
           "openStdin",
           "sourceMapsEnabled"
         ],
-        "punycode": [
-          "version"
-        ],
         "querystring": [
           "unescapeBuffer"
         ],
@@ -1246,6 +1220,15 @@
           "WritableStreamDefaultController",
           "WritableStreamDefaultWriter"
         ],
+        "sys": [
+          "MIMEParams",
+          "_errnoException",
+          "_exceptionWithHostPort",
+          "diff",
+          "setTraceSigInt",
+          "transferableAbortController",
+          "transferableAbortSignal"
+        ],
         "test": [
           "assert",
           "run",
@@ -1265,14 +1248,12 @@
           "MIMEParams",
           "_errnoException",
           "_exceptionWithHostPort",
-          "_extend",
           "diff",
           "setTraceSigInt",
           "transferableAbortController",
           "transferableAbortSignal"
         ],
         "util/types": [
-          "isBigIntObject",
           "isFloat16Array"
         ],
         "v8": [
@@ -1296,16 +1277,8 @@
           "threadName"
         ],
         "zlib": [
-          "ZstdCompress",
-          "ZstdDecompress",
           "codes",
-          "crc32",
-          "createZstdCompress",
-          "createZstdDecompress",
-          "zstdCompress",
-          "zstdCompressSync",
-          "zstdDecompress",
-          "zstdDecompressSync"
+          "crc32"
         ]
       }
     }

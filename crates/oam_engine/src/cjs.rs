@@ -26,7 +26,7 @@
 //! runs, so a cycle sees partial exports. A module whose body throws is
 //! evicted from the cache (Node retries on the next require).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::modules::module_key;
@@ -55,6 +55,37 @@ pub(crate) struct CjsCache {
     /// both entries on disk); without this a CJS bin that exits from its
     /// body never got a warm start.
     in_flight_code_cache: Vec<(v8::Global<v8::Function>, crate::code_cache::CacheKey)>,
+    /// The modules whose body is running (node's kIsExecuting): a graph a
+    /// `require()` loads may not import one of these.
+    executing: HashSet<PathBuf>,
+    /// ES modules a `require()` is loading right now, by module key, each
+    /// with the filename of the module whose `require()` started the load
+    /// (node's cycle error names it). A second `require()` of one of these
+    /// is node's getExportsForCircularRequire refusal.
+    requiring_esm: HashMap<PathBuf, String>,
+    /// `require.cache` (node's Module._cache): one object, with no
+    /// prototype, shared by every `require` and `module.Module._cache`.
+    /// load_cjs and require_esm consult it before their own records, so a
+    /// program that deletes an entry gets a fresh load and one that plants an
+    /// entry gets its `exports`, as in node. Created on first use.
+    require_cache: Option<v8::Global<v8::Object>>,
+    /// Whether the --trace-require-module warning has been emitted (node
+    /// emits it once per process).
+    warned_require_module: bool,
+}
+
+/// Whether a `require()` is loading the module at `key` as an ES module.
+pub(crate) fn is_requiring_esm(scope: &mut v8::PinScope<'_, '_>, key: &Path) -> bool {
+    scope
+        .get_slot::<CjsCache>()
+        .is_some_and(|cache| cache.requiring_esm.contains_key(key))
+}
+
+/// Whether the body of the module at `key` is running.
+pub(crate) fn is_executing(scope: &mut v8::PinScope<'_, '_>, key: &Path) -> bool {
+    scope
+        .get_slot::<CjsCache>()
+        .is_some_and(|cache| cache.executing.contains(key))
 }
 
 /// Name `entry` as this run's main module. Call after reset_run_slots
@@ -461,7 +492,17 @@ fn op_require_cjs(
         throw_error(scope, "oam internal: requireCjs needs a path");
         return;
     };
-    let key = PathBuf::from(path.to_rust_string_lossy(scope));
+    let file = path.to_rust_string_lossy(scope);
+    // The graph load ran this module through load_cjs, which answers from
+    // `require.cache` first; read the same entry, so a module the program
+    // planted there is what the import sees too.
+    if let Some(entry) = cache_entry(scope, &file) {
+        if let Some(exports) = entry_exports(scope, entry) {
+            rv.set(exports);
+        }
+        return;
+    }
+    let key = PathBuf::from(file);
     let cached = scope
         .get_slot::<CjsCache>()
         .and_then(|cache| cache.modules.get(&key).cloned());
@@ -531,22 +572,333 @@ fn require_callback(
             .or_else(|| s.starts_with("oam:").then(|| s.to_string()))
     });
     if let Some(name) = registry_key {
-        if let Some(builtin) = get_builtin(scope, &name) {
+        // Called with a module as its receiver -- `module.require(x)`,
+        // `require.main.require(x)` -- rather than as the bare `require`:
+        // node's DEP0040 check sees the caller of the one but not the other
+        // (node_compat.js, punycodeLoadedByAPackage), so the route rides to
+        // the builtin's factory.
+        let global = scope.get_current_context().global(scope);
+        let via = (!args.this().strict_equals(global.into())).then_some("moduleRequire");
+        if let Some(builtin) = get_builtin_via(scope, &name, via) {
             rv.set(builtin);
         }
         return;
     }
-    let is_json = path.extension().and_then(|e| e.to_str()) == Some("json");
-    if !is_json && oam_loader::module_kind(&path) == oam_loader::ModuleKind::Esm {
-        throw_require_esm(scope, &path, Some(&referrer));
+    let referrer = referrer.to_string_lossy().into_owned();
+    match require_format(&path) {
+        RequireFormat::Esm => {
+            if let Some(exports) = require_esm(scope, &path, &referrer) {
+                rv.set(exports);
+            }
+        }
+        RequireFormat::CommonJs => {
+            if let Some(exports) = load_cjs(scope, &path) {
+                rv.set(exports);
+            }
+        }
+        RequireFormat::Detect => {
+            // node compiles the file as CommonJS and, when that fails on
+            // syntax only an ES module has, loads it as one
+            // (compileFunctionForCJSLoader's retry, the same test as
+            // contains_module_syntax). Done in that order, a CommonJS file
+            // pays for one compile, as before. `load_cjs_or_detect` runs that
+            // detection inside the one compile, so the retry is not a second
+            // parse of the same source.
+            v8::tc_scope!(let tc, scope);
+            match load_cjs_or_detect(tc, &path) {
+                CjsLoad::Exports(exports) => rv.set(exports),
+                CjsLoad::Esm => match require_esm(tc, &path, &referrer) {
+                    Some(exports) => rv.set(exports),
+                    // A load that fails -- a missing import, a package that
+                    // does not resolve -- leaves a JS exception pending. Drop
+                    // without rethrowing and the TryCatch swallows it, so the
+                    // require() would return undefined instead of throwing.
+                    None => {
+                        tc.rethrow();
+                    }
+                },
+                CjsLoad::Threw => {
+                    tc.rethrow();
+                }
+            }
+        }
+    }
+}
+
+/// How `require()` loads a file, decided as node's `.js` handler decides it
+/// (Module._extensions['.js'], v22.22.2), for the files node and oam agree
+/// on: `.mjs` is an ES module; `.cjs`, `.json` and `.node` are not; a `.js`
+/// (or `.jsx`, or any other extension, which node's `.js` handler takes) is
+/// what the nearest package.json "type" declares, and with no "type" it is
+/// decided by its syntax. TypeScript keeps oam's own kinds
+/// (oam_loader::module_kind: `.ts`/`.mts`/`.tsx` ES modules, `.cts`
+/// CommonJS), which node 22 without type stripping has no answer for.
+enum RequireFormat {
+    Esm,
+    CommonJs,
+    Detect,
+}
+
+fn require_format(path: &Path) -> RequireFormat {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("mjs") => return RequireFormat::Esm,
+        Some("cjs" | "json" | "node") => return RequireFormat::CommonJs,
+        Some("ts" | "mts" | "tsx" | "cts") => {
+            return match oam_loader::module_kind(path) {
+                oam_loader::ModuleKind::Esm => RequireFormat::Esm,
+                oam_loader::ModuleKind::Cjs => RequireFormat::CommonJs,
+            };
+        }
+        _ => {}
+    }
+    match oam_loader::node_declared_module_kind(path) {
+        Some(oam_loader::ModuleKind::Esm) => RequireFormat::Esm,
+        Some(oam_loader::ModuleKind::Cjs) => RequireFormat::CommonJs,
+        None => RequireFormat::Detect,
+    }
+}
+
+/// `require()` of the ES module at `path` from `parent` (the requiring
+/// module's filename): node's loadESMFromCJS, behind Module._load's cache.
+/// While the load is in flight a second `require()` of the module -- a
+/// CommonJS dependency of its graph requiring it back -- is node's
+/// getExportsForCircularRequire refusal, ERR_REQUIRE_CYCLE_MODULE naming the
+/// module that started the load. Once loaded, the module's `require.cache`
+/// entry answers: its `exports` is what every later `require()` returns,
+/// until the program deletes the entry, after which the next `require()`
+/// runs loadESMFromCJS again (the module itself is not re-evaluated -- the
+/// module map keeps it -- but a default facade is new, as node's is). The
+/// load itself is [`crate::modules::require_esm`]. None: an exception is
+/// pending.
+fn require_esm<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    path: &Path,
+    parent: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let key = match module_key(path) {
+        Ok(key) => key,
+        Err(e) => {
+            throw_error(scope, &format!("bad module path {}: {e}", path.display()));
+            return None;
+        }
+    };
+    let file = key.to_string_lossy().into_owned();
+    let in_flight = scope
+        .get_slot::<CjsCache>()
+        .and_then(|cache| cache.requiring_esm.get(&key).cloned());
+    if let Some(first_parent) = in_flight {
+        throw_node_error(
+            scope,
+            "ERR_REQUIRE_CYCLE_MODULE",
+            &[&format!(
+                "Cannot require() ES Module {} in a cycle. (from {first_parent})",
+                key.display()
+            )],
+        );
+        return None;
+    }
+    if let Some(entry) = cache_entry(scope, &file) {
+        return entry_exports(scope, entry);
+    }
+    trace_require_module(scope, parent, &key);
+    // node's Module._load puts the module in Module._cache before loading
+    // it, unloaded, and drops it again if the load throws.
+    let module = esm_cache_entry(scope, &key, &file)?;
+    cache_store(scope, &file, module);
+    if let Some(cache) = scope.get_slot_mut::<CjsCache>() {
+        cache.requiring_esm.insert(key.clone(), parent.to_string());
+    }
+    let loaded = crate::modules::require_esm(scope, &key, parent);
+    if let Some(cache) = scope.get_slot_mut::<CjsCache>() {
+        cache.requiring_esm.remove(&key);
+    }
+    let Some(exports) = loaded else {
+        cache_remove(scope, &file);
+        return None;
+    };
+    let exports = v8::Local::new(scope, &exports);
+    let exports_key = v8::String::new(scope, "exports")?;
+    module.set(scope, exports_key.into(), exports);
+    let loaded_key = v8::String::new(scope, "loaded")?;
+    let true_v8 = v8::Boolean::new(scope, true);
+    module.set(scope, loaded_key.into(), true_v8.into());
+    Some(exports)
+}
+
+/// The `require.cache` entry node's Module._load makes for an ES module it
+/// loads: a module object like the ones load_cjs makes (filename and id,
+/// loaded, exports, path, paths), whose `exports` becomes what `require()`
+/// returns once the load is done.
+fn esm_cache_entry<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    key: &Path,
+    file: &str,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let module = v8::Object::new(scope);
+    let filename_v8 = v8::String::new(scope, file)?;
+    for prop in ["filename", "id"] {
+        let prop_key = v8::String::new(scope, prop)?;
+        module.set(scope, prop_key.into(), filename_v8.into());
+    }
+    let loaded_key = v8::String::new(scope, "loaded")?;
+    let false_v8 = v8::Boolean::new(scope, false);
+    module.set(scope, loaded_key.into(), false_v8.into());
+    let exports = v8::Object::new(scope);
+    let exports_key = v8::String::new(scope, "exports")?;
+    module.set(scope, exports_key.into(), exports.into());
+    let dirname = key
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dirname_v8 = v8::String::new(scope, &dirname)?;
+    let path_key = v8::String::new(scope, "path")?;
+    module.set(scope, path_key.into(), dirname_v8.into());
+    let lookup: Vec<v8::Local<v8::Value>> = node_modules_lookup(key)
+        .iter()
+        .filter_map(|p| v8::String::new(scope, p).map(v8::Local::<v8::Value>::from))
+        .collect();
+    let paths = v8::Array::new_with_elements(scope, &lookup);
+    let paths_key = v8::String::new(scope, "paths")?;
+    module.set(scope, paths_key.into(), paths.into());
+    Some(module)
+}
+
+/// `require.cache` itself, created on first use: an object with no
+/// prototype, as node's Module._cache is (`{ __proto__: null }`), so a
+/// filename such as `constructor` can never hit an inherited property.
+pub(crate) fn require_cache<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let existing = scope
+        .get_slot::<CjsCache>()
+        .and_then(|cache| cache.require_cache.clone());
+    if let Some(object) = existing {
+        return Some(v8::Local::new(scope, &object));
+    }
+    let null = v8::null(scope);
+    let object = v8::Object::with_prototype_and_properties(scope, null.into(), &[], &[]);
+    let global = v8::Global::new(scope, object);
+    scope.get_slot_mut::<CjsCache>()?.require_cache = Some(global);
+    Some(object)
+}
+
+/// The `require.cache` entry for `file`, when it holds one (anything but
+/// undefined, as node's `Module._cache[filename]` test is a truthiness one
+/// on an object it expects).
+fn cache_entry<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    file: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let cache = require_cache(scope)?;
+    let name = v8::String::new(scope, file)?;
+    cache
+        .get(scope, name.into())
+        .filter(|entry| !entry.is_null_or_undefined())
+}
+
+/// What `require()` returns for a `require.cache` hit: the entry's
+/// `exports`, read now, so `module.exports =` reassignment and a planted
+/// entry both answer as in node. None: an exception is pending.
+fn entry_exports<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    entry: v8::Local<'s, v8::Value>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let Ok(entry) = v8::Local::<v8::Object>::try_from(entry) else {
+        return Some(v8::undefined(scope).into());
+    };
+    module_exports(scope, entry)
+}
+
+fn cache_store(scope: &mut v8::PinScope<'_, '_>, file: &str, module: v8::Local<v8::Object>) {
+    if let (Some(cache), Some(name)) = (require_cache(scope), v8::String::new(scope, file)) {
+        cache.set(scope, name.into(), module.into());
+    }
+}
+
+fn cache_remove(scope: &mut v8::PinScope<'_, '_>, file: &str) {
+    if let (Some(cache), Some(name)) = (require_cache(scope), v8::String::new(scope, file)) {
+        cache.delete(scope, name.into());
+    }
+}
+
+/// node's `--trace-require-module` (off unless the flag is given): an
+/// ExperimentalWarning, once per process, naming the CommonJS module that
+/// loaded an ES module with require(). With `no-node-modules` a require from
+/// inside node_modules is not reported. The CLI publishes the flag's value as
+/// `__oamTraceRequireModule`.
+fn trace_require_module(scope: &mut v8::PinScope<'_, '_>, parent: &str, key: &Path) {
+    if scope
+        .get_slot::<CjsCache>()
+        .is_none_or(|cache| cache.warned_require_module)
+    {
         return;
     }
-    // A typeless .js is CommonJS to require() unless its syntax says module,
-    // as node decides it (load_cjs_or_detect).
-    match load_cjs_or_detect(scope, &path) {
-        CjsLoad::Exports(exports) => rv.set(exports),
-        CjsLoad::Esm => throw_require_esm(scope, &path, Some(&referrer)),
-        CjsLoad::Threw => {}
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let Some(mode) = v8::String::new(scope, "__oamTraceRequireModule")
+        .and_then(|k| global.get(scope, k.into()))
+        .filter(|v| v.is_string())
+        .map(|v| v.to_rust_string_lossy(scope))
+    else {
+        return;
+    };
+    let from_node_modules = Path::new(parent)
+        .components()
+        .any(|c| c.as_os_str() == "node_modules");
+    if mode == "no-node-modules" && from_node_modules {
+        return;
+    }
+    if let Some(cache) = scope.get_slot_mut::<CjsCache>() {
+        cache.warned_require_module = true;
+    }
+    let message = format!(
+        "CommonJS module {parent} is loading ES Module {} using require().\n\
+         Support for loading ES Module in require() is an experimental feature and might \
+         change at any time",
+        key.display()
+    );
+    let process = v8::String::new(scope, "process")
+        .and_then(|k| global.get(scope, k.into()))
+        .and_then(|p| v8::Local::<v8::Object>::try_from(p).ok());
+    let Some(process) = process else { return };
+    let emit = v8::String::new(scope, "emitWarning")
+        .and_then(|k| process.get(scope, k.into()))
+        .and_then(|f| v8::Local::<v8::Function>::try_from(f).ok());
+    let (Some(emit), Some(message), Some(kind)) = (
+        emit,
+        v8::String::new(scope, &message),
+        v8::String::new(scope, "ExperimentalWarning"),
+    ) else {
+        return;
+    };
+    emit.call(scope, process.into(), &[message.into(), kind.into()]);
+}
+
+/// Throw node's coded error `code`, built by node_compat.js's own factory
+/// (`codes[code]` in its internal/errors registry) from `args`, so it has
+/// node's shape: the code's NodeError prototype, `Error [CODE]: ...` as the
+/// stack header, own keys in node's order. A plain Error carrying `.code` if
+/// the factory cannot be reached.
+pub(crate) fn throw_node_error(scope: &mut v8::PinScope<'_, '_>, code: &str, args: &[&str]) {
+    let constructor = get_builtin(scope, "internal/errors")
+        .and_then(|e| v8::Local::<v8::Object>::try_from(e).ok())
+        .and_then(|errors| {
+            let key = v8::String::new(scope, "codes")?;
+            let codes = errors.get(scope, key.into())?;
+            let codes = v8::Local::<v8::Object>::try_from(codes).ok()?;
+            let key = v8::String::new(scope, code)?;
+            let constructor = codes.get(scope, key.into())?;
+            v8::Local::<v8::Function>::try_from(constructor).ok()
+        });
+    let argv: Vec<v8::Local<v8::Value>> = args
+        .iter()
+        .filter_map(|a| v8::String::new(scope, a).map(Into::into))
+        .collect();
+    match constructor.and_then(|c| c.new_instance(scope, &argv)) {
+        Some(error) => {
+            scope.throw_exception(error.into());
+        }
+        None => throw_error_with_code(scope, code, &args.join(" ")),
     }
 }
 
@@ -630,12 +982,11 @@ fn load_cjs_inner<'s>(
     };
     let file = key.to_string_lossy().into_owned();
 
-    let cached = scope
-        .get_slot::<CjsCache>()
-        .and_then(|cache| cache.modules.get(&key).cloned());
-    if let Some(module) = cached {
-        let module = v8::Local::new(scope, &module);
-        return module_exports(scope, module);
+    // `require.cache` decides, as Module._cache does in node: an entry
+    // answers with its `exports` (the module's own, or one the program
+    // planted), and a module whose entry the program deleted loads afresh.
+    if let Some(entry) = cache_entry(scope, &file) {
+        return entry_exports(scope, entry);
     }
     // Detection already made it an ES module (an import of it, or an
     // earlier require).
@@ -644,6 +995,7 @@ fn load_cjs_inner<'s>(
         *esm = true;
         return None;
     }
+    evict(scope, &key);
 
     // N-API addons: dlopen + register, cached like any CJS module.
     if key.extension().and_then(|e| e.to_str()) == Some("node") {
@@ -720,6 +1072,7 @@ fn load_cjs_inner<'s>(
                 .expect("cjs cache installed")
                 .modules
                 .insert(key, global);
+            cache_store(scope, &file, module);
             return Some(exports_value);
         }
     }
@@ -838,6 +1191,7 @@ fn load_cjs_inner<'s>(
             .expect("cjs cache installed")
             .modules
             .insert(key, global);
+        cache_store(scope, &file, module);
         return Some(parsed);
     }
 
@@ -888,6 +1242,10 @@ fn load_cjs_inner<'s>(
             .modules
             .insert(key.clone(), global);
     }
+    // node's Module._load puts every module it loads into Module._cache before
+    // running it, so `require.cache` lists a required `.js`/`.cjs` -- and the
+    // entry -- by filename, unloaded, and `loaded: true` once the body returns.
+    cache_store(scope, &file, module);
     record_main(scope, &key, module);
 
     let source_v8 = match v8::String::new(scope, &source) {
@@ -1005,7 +1363,9 @@ fn load_cjs_inner<'s>(
     } else {
         false
     };
+    set_executing(scope, &key, true);
     let returned = wrapper.call(scope, recv, &call_args).is_some();
+    set_executing(scope, &key, false);
     if in_flight && let Some(cache) = scope.get_slot_mut::<CjsCache>() {
         cache.in_flight_code_cache.pop();
     }
@@ -1057,9 +1417,25 @@ pub(crate) fn flush_in_flight_code_cache(scope: &mut v8::PinScope<'_, '_>) {
     }
 }
 
-fn evict(scope: &mut v8::PinScope<'_, '_>, key: &Path) {
+fn set_executing(scope: &mut v8::PinScope<'_, '_>, key: &Path, running: bool) {
     if let Some(cache) = scope.get_slot_mut::<CjsCache>() {
-        cache.modules.remove(key);
+        if running {
+            cache.executing.insert(key.to_path_buf());
+        } else {
+            cache.executing.remove(key);
+        }
+    }
+}
+
+/// Forget the module at `key`, in oam's records and in `require.cache`, so
+/// the next `require()` loads it again.
+fn evict(scope: &mut v8::PinScope<'_, '_>, key: &Path) {
+    let known = scope
+        .get_slot_mut::<CjsCache>()
+        .and_then(|cache| cache.modules.remove(key))
+        .is_some();
+    if known {
+        cache_remove(scope, &key.to_string_lossy());
     }
 }
 
@@ -1113,10 +1489,10 @@ pub(crate) fn make_require<'s>(
     let resolve_key = v8::String::new(scope, "resolve")?;
     require.set(scope, resolve_key.into(), resolve.into());
 
-    // oam keys its CJS cache in Rust, so `require.cache` is a plain object:
-    // `delete require.cache[id]` idioms become no-ops instead of crashes.
-    // `extensions` is Node's own deprecated stub shape.
-    let cache = v8::Object::new(scope);
+    // `require.cache` is the one shared Module._cache (require_cache), so
+    // `delete require.cache[id]` reloads as in node. `extensions` is Node's
+    // own deprecated stub shape.
+    let cache = require_cache(scope)?;
     let cache_key = v8::String::new(scope, "cache")?;
     require.set(scope, cache_key.into(), cache.into());
     let extensions = v8::Object::new(scope);
@@ -1266,6 +1642,16 @@ pub(crate) fn get_builtin<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
 ) -> Option<v8::Local<'s, v8::Value>> {
+    get_builtin_via(scope, name, None)
+}
+
+/// `get_builtin`, naming the route a user load took (`registry.get`'s
+/// `via`) for a factory whose behaviour depends on it.
+fn get_builtin_via<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+    via: Option<&str>,
+) -> Option<v8::Local<'s, v8::Value>> {
     let context = scope.get_current_context();
     let global = context.global(scope);
     let registry_key = v8::String::new(scope, "__oamNode")?;
@@ -1281,8 +1667,12 @@ pub(crate) fn get_builtin<'s>(
         return None;
     };
     let name_v8 = v8::String::new(scope, name)?;
+    let via: v8::Local<v8::Value> = match via {
+        Some(via) => v8::String::new(scope, via)?.into(),
+        None => v8::undefined(scope).into(),
+    };
     let recv: v8::Local<v8::Value> = registry.into();
-    get.call(scope, recv, &[name_v8.into()])
+    get.call(scope, recv, &[name_v8.into(), via])
 }
 
 /// Generate the ESM facade for an already-executed CJS module. Named

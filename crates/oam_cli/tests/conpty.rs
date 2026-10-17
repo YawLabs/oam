@@ -1204,12 +1204,18 @@ console.log('[done]');
 /// information it asks for and a console has none of: `EISDIR`, syscall
 /// `fstat`. NUL answers either way. Measured against node v22.22.2 in a
 /// console; the opens themselves are conformance case 394's.
+///
+/// #379: `tty.isatty` of each descriptor agrees with that `fstat` -- true for
+/// a console libuv can read the mode of, false for one opened write-only and
+/// for NUL -- and, asked again once the descriptor is closed, is false
+/// without throwing.
 #[test]
 fn fstat_of_a_console_opened_by_name_answers_as_node() {
     let script = write_temp(
         "conpty_console_fstat.mjs",
         r#"
 import fs from 'node:fs';
+import tty from 'node:tty';
 const rows = [];
 for (const [name, flag] of [
   ['\\\\.\\CON', 'w'], ['\\\\.\\CON', 'r'],
@@ -1225,18 +1231,21 @@ for (const [name, flag] of [
   } catch (e) {
     row = `${e.code} ${e.syscall}`;
   }
+  const atty = tty.isatty(fd);
   fs.closeSync(fd);
-  rows.push(`${name.slice(4)} ${flag}: ${row}`);
+  rows.push(`${name.slice(4)} ${flag}: ${row} ${atty}/${tty.isatty(fd)}`);
 }
 console.log('[fstat ' + rows.join('; ') + ']');
 "#,
     );
     let pty = ConPty::spawn(&script);
     pty.wait_for(
-        "[fstat CON w: EISDIR fstat; CON r: chr 20000; \
-         CONOUT$ w: EISDIR fstat; CONOUT$ a: EISDIR fstat; CONOUT$ r+: chr 20000; CONOUT$ r: chr 20000; \
-         CONIN$ r: chr 20000; CONIN$ r+: chr 20000; CONIN$ w: EISDIR fstat; \
-         NUL w: chr 20666; NUL r: chr 20666]",
+        "[fstat CON w: EISDIR fstat false/false; CON r: chr 20000 true/false; \
+         CONOUT$ w: EISDIR fstat false/false; CONOUT$ a: EISDIR fstat false/false; \
+         CONOUT$ r+: chr 20000 true/false; CONOUT$ r: chr 20000 true/false; \
+         CONIN$ r: chr 20000 true/false; CONIN$ r+: chr 20000 true/false; \
+         CONIN$ w: EISDIR fstat false/false; \
+         NUL w: chr 20666 false/false; NUL r: chr 20666 false/false]",
     );
     assert_eq!(pty.wait_exit(), 0);
 }
@@ -1285,7 +1294,7 @@ console.log('[named ' + [
   tty.isatty(fd), c.columns + 'x' + c.rows, c.getWindowSize().join('x'),
   so.listenerCount('newListener'), so.listenerCount('removeListener'),
   so.listenerCount('resize'),
-  // node's carry an internal 'end' listener oam's do not (docs entry 52).
+  // node's carry an internal 'end' listener oam's do not (docs entry 56).
   new tty.WriteStream(1).eventNames().filter((name) => name !== 'end').length,
 ].join(',') + ']');
 ",
@@ -1296,5 +1305,113 @@ console.log('[named ' + [
     pty.wait_for("[hex]");
     pty.wait_for("[base64]");
     pty.wait_for("[named true,120x40,120x40,0,0,1,0]");
+    assert_eq!(pty.wait_exit(), 0);
+}
+
+/// #381: `new tty.WriteStream(fd)` and `new tty.ReadStream(fd)` over a
+/// console opened by name ask what libuv's `uv_tty_init` asks, in its order:
+/// a console input buffer that answers GetNumberOfConsoleInputEvents (read
+/// access) is taken at once; anything else must answer
+/// GetConsoleScreenBufferInfo (read access) and then GetConsoleCursorInfo,
+/// which a screen buffer opened without write access fails. A refusal is
+/// `ERR_TTY_INIT_FAILED` with the failing call's errno: EPERM for
+/// ERROR_ACCESS_DENIED (a console the open's access does not let libuv use),
+/// EBADF for ERROR_INVALID_HANDLE (NUL, no console at all). So a console that
+/// IS a terminal to `isatty` -- CONOUT$ opened `r` or `a+` -- can still be
+/// refused. Every row is node v22.22.2's in this same pseudoconsole; the two
+/// constructors answer alike, and a mismatch between them prints as one.
+#[test]
+fn tty_streams_over_a_console_opened_by_name_init_as_node() {
+    let script = write_temp(
+        "conpty_tty_init.mjs",
+        r#"
+import fs from 'node:fs';
+import tty from 'node:tty';
+import net from 'node:net';
+const verdict = (C, fd) => {
+  try {
+    new C(fd);
+    return 'ok';
+  } catch (e) {
+    return e.code === 'ERR_TTY_INIT_FAILED' ? e.info.code : `${e.code}?`;
+  }
+};
+for (const name of ['CON', 'CONOUT$', 'CONIN$', 'NUL']) {
+  const row = [];
+  for (const flag of ['r', 'r+', 'rs+', 'w', 'w+', 'a', 'a+', 'as+']) {
+    let fd;
+    try {
+      fd = fs.openSync('\\\\.\\' + name, flag);
+    } catch (e) {
+      row.push(`${flag}=${e.code}`);
+      continue;
+    }
+    const w = verdict(tty.WriteStream, fd);
+    const r = verdict(tty.ReadStream, fd);
+    row.push(`${flag}=${tty.isatty(fd) ? 'T' : 'F'}:${w === r ? w : `W${w}/R${r}`}`);
+    fs.closeSync(fd);
+  }
+  console.log(`[init ${name} ${row.join(' ')}]`);
+}
+// The whole error, for an EPERM and an EBADF refusal.
+for (const [name, flag] of [['CONOUT$', 'r'], ['NUL', 'r+']]) {
+  const fd = fs.openSync('\\\\.\\' + name, flag);
+  try {
+    new tty.WriteStream(fd);
+  } catch (e) {
+    console.log(`[error ${[e.name, e.code, e.syscall, e.errno, e.info.code, e.info.errno, e.info.syscall].join(',')}]`);
+    console.log(`[message ${e.message}]`);
+  }
+  fs.closeSync(fd);
+}
+// node's net.Socket shape for a console it takes: a screen buffer has a
+// size, an input buffer none.
+const shape = (s) => [
+  s instanceof net.Socket, s.isTTY, s.columns + 'x' + s.rows,
+  s.getWindowSize ? s.getWindowSize().join('x') : '-',
+  s.getColorDepth ? typeof s.getColorDepth() : '-', s.isRaw, typeof s.setRawMode,
+].join(',');
+for (const [name, flag] of [['CONOUT$', 'r+'], ['CONIN$', 'r']]) {
+  const fd = fs.openSync('\\\\.\\' + name, flag);
+  console.log(`[shape ${name} W ${shape(new tty.WriteStream(fd))} R ${shape(new tty.ReadStream(fd))}]`);
+  fs.closeSync(fd);
+  // A descriptor that is closed is no terminal, and asking does not throw.
+  console.log(`[closed ${name} ${tty.isatty(fd)}]`);
+}
+"#,
+    );
+    let pty = ConPty::spawn(&script);
+    pty.wait_for(
+        "[init CON r=T:ok r+=EINVAL rs+=EINVAL w=F:EPERM w+=EINVAL a=EINVAL a+=T:ok as+=T:ok]",
+    );
+    pty.wait_for(
+        "[init CONOUT$ r=T:EPERM r+=T:ok rs+=T:ok w=F:EPERM w+=T:ok a=F:EPERM a+=T:EPERM as+=T:EPERM]",
+    );
+    pty.wait_for(
+        "[init CONIN$ r=T:ok r+=T:ok rs+=T:ok w=F:EPERM w+=T:ok a=F:EPERM a+=T:ok as+=T:ok]",
+    );
+    pty.wait_for(
+        "[init NUL r=F:EBADF r+=F:EBADF rs+=F:EBADF w=F:EBADF w+=F:EBADF a=F:EBADF a+=F:EBADF as+=F:EBADF]",
+    );
+    pty.wait_for(
+        "[error SystemError,ERR_TTY_INIT_FAILED,uv_tty_init,-4048,EPERM,-4048,uv_tty_init]",
+    );
+    pty.wait_for(
+        "[message TTY initialization failed: uv_tty_init returned EPERM (operation not permitted)]",
+    );
+    pty.wait_for(
+        "[error SystemError,ERR_TTY_INIT_FAILED,uv_tty_init,-4083,EBADF,-4083,uv_tty_init]",
+    );
+    pty.wait_for(
+        "[message TTY initialization failed: uv_tty_init returned EBADF (bad file descriptor)]",
+    );
+    pty.wait_for(
+        "[shape CONOUT$ W true,true,120x40,120x40,number,,undefined R true,true,undefinedxundefined,-,-,false,function]",
+    );
+    pty.wait_for("[closed CONOUT$ false]");
+    pty.wait_for(
+        "[shape CONIN$ W true,true,undefinedxundefined,x,number,,undefined R true,true,undefinedxundefined,-,-,false,function]",
+    );
+    pty.wait_for("[closed CONIN$ false]");
     assert_eq!(pty.wait_exit(), 0);
 }

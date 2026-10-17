@@ -388,13 +388,15 @@ fn main() -> ExitCode {
                 flags.permission = true;
                 i += 1;
             } else if let Some(list) = arg.strip_prefix("--allow-fs-read=") {
-                flags.allow_fs_read = Some(list.to_string());
+                // Each occurrence of a list flag adds to the earlier ones, as
+                // node's do (#363): they were replaced, dropping a grant.
+                flags.allow_fs_read.push(list.to_string());
                 i += 1;
             } else if let Some(list) = arg.strip_prefix("--allow-fs-write=") {
-                flags.allow_fs_write = Some(list.to_string());
+                flags.allow_fs_write.push(list.to_string());
                 i += 1;
             } else if let Some(list) = arg.strip_prefix("--allow-net=") {
-                flags.allow_net = Some(list.to_string());
+                flags.allow_net.push(list.to_string());
                 i += 1;
             } else if arg == "--allow-net" {
                 // Bare form grants everything, stored as the same "*" the list
@@ -403,17 +405,17 @@ fn main() -> ExitCode {
                     eprintln!("{msg}");
                     return ExitCode::from(9);
                 }
-                flags.allow_net = Some("*".to_string());
+                flags.allow_net.push("*".to_string());
                 i += 1;
             } else if let Some(list) = arg.strip_prefix("--allow-env=") {
-                flags.allow_env = Some(list.to_string());
+                flags.allow_env.push(list.to_string());
                 i += 1;
             } else if arg == "--allow-env" {
                 if let Some(msg) = space_form_hint("--allow-env", raw.get(i + 1)) {
                     eprintln!("{msg}");
                     return ExitCode::from(9);
                 }
-                flags.allow_env = Some("*".to_string());
+                flags.allow_env.push("*".to_string());
                 i += 1;
             } else if arg == "--allow-child-process" {
                 flags.allow_child_process = true;
@@ -520,6 +522,25 @@ fn main() -> ExitCode {
             } else if arg == "--insecure-http-parser" {
                 flags.insecure_http_parser = true;
                 i += 1;
+            } else if arg == "--trace-require-module" || arg.starts_with("--trace-require-module=")
+            {
+                // node's two values; anything else, or no value, is node's
+                // exit 9 (the value is not optional, unlike most trace flags).
+                let (value, spaced) = match arg.strip_prefix("--trace-require-module=") {
+                    Some(v) => (Some(v.to_string()), false),
+                    None => (raw.get(i + 1).cloned(), true),
+                };
+                let Some(value) = value else {
+                    eprintln!("oam: --trace-require-module requires an argument");
+                    return ExitCode::from(9);
+                };
+                if !is_trace_require_module_value(&value) {
+                    eprintln!("oam: invalid value for --trace-require-module");
+                    return ExitCode::from(9);
+                }
+                flags.trace_require_module = Some(value);
+                flags.trace_require_module_spaced = spaced;
+                i += if spaced { 2 } else { 1 };
             } else if let Some(v) = arg.strip_prefix("--title=") {
                 flags.title = Some(v.to_string());
                 i += 1;
@@ -528,6 +549,12 @@ fn main() -> ExitCode {
                 i += 1;
             } else if arg == "--no-deprecation" {
                 flags.no_deprecation = true;
+                i += 1;
+            } else if arg == "--trace-warnings" {
+                flags.trace_warnings = true;
+                i += 1;
+            } else if arg == "--trace-deprecation" {
+                flags.trace_deprecation = true;
                 i += 1;
             } else if let Some(v) = arg.strip_prefix("--disable-warning=") {
                 flags.disabled_warnings.push(v.to_string());
@@ -759,6 +786,60 @@ fn main() -> ExitCode {
 /// Node process-level flags parsed before the subcommand, stashed for the
 /// run paths to install (set at most once, before dispatch).
 static NODE_FLAGS: std::sync::OnceLock<NodeFlags> = std::sync::OnceLock::new();
+
+/// The options this process runs with (argv's and NODE_OPTIONS's, with
+/// NODE_PENDING_DEPRECATION folded in), set by the first `install`: what a
+/// worker_threads Worker that is given neither `env` nor `execArgv` runs with.
+static PARENT_OPTIONS: std::sync::OnceLock<NodeFlags> = std::sync::OnceLock::new();
+
+/// A non-enumerable, read-only global the JS side reads a flag from.
+fn define_flag_global(name: &str, value: String) -> String {
+    format!(
+        "Object.defineProperty(globalThis, '{name}', \
+           {{ value: {value}, writable: false, enumerable: false, configurable: false }});"
+    )
+}
+
+/// The flags prelude of a new worker_threads Worker (#370), decided as node's
+/// Worker constructor decides its options (src/node_worker.cc): one given
+/// neither `env` nor `execArgv` (`inherit`) shares its creator's options --
+/// `creator`'s, the creating worker's as it resolved them, or this process's
+/// when the main thread creates it; otherwise it starts from the defaults,
+/// applies NODE_PENDING_DEPRECATION and NODE_OPTIONS from the environment it
+/// starts with, then `exec_argv` (its own, or its creator's process.execArgv
+/// when it was given none). A worker never takes its creator's
+/// per-environment flags otherwise. NODE_NO_WARNINGS is read from the
+/// worker's own environment either way, as node's JS reads it from the
+/// worker's process.env. The process-wide flags (`--title`,
+/// `--zero-fill-buffers`) are every thread's. Returns the prelude and the
+/// options the worker resolved to, for the workers it creates in turn.
+fn worker_flags_js(
+    creator: Option<&oam_engine::WorkerFlagsOptions>,
+    inherit: bool,
+    exec_argv: &[String],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> (String, oam_engine::WorkerFlagsOptions) {
+    let process = PARENT_OPTIONS.get().cloned().unwrap_or_default();
+    let options = if inherit {
+        creator
+            .and_then(|creator| creator.downcast_ref::<NodeFlags>())
+            .unwrap_or(&process)
+            .clone()
+    } else {
+        let mut options = NodeFlags {
+            pending_deprecation: env("NODE_PENDING_DEPRECATION").as_deref() == Some("1"),
+            ..NodeFlags::default()
+        };
+        if let Some(raw) = env("NODE_OPTIONS") {
+            apply_node_options(&mut options, &raw);
+        }
+        apply_node_option_tokens(&mut options, exec_argv);
+        options
+    };
+    let mut js = options.environment_js(env("NODE_NO_WARNINGS").as_deref() == Some("1"));
+    js.push_str(&process.process_js());
+    (js, std::sync::Arc::new(options))
+}
 
 fn dispatch(cli: Cli) -> ExitCode {
     let Some(command) = &cli.command else {
@@ -1782,8 +1863,13 @@ fn apply_node_options_env(flags: &mut NodeFlags) -> bool {
 
 /// [`apply_node_options_env`] on a given NODE_OPTIONS value.
 fn apply_node_options(flags: &mut NodeFlags, raw: &str) -> bool {
+    apply_node_option_tokens(flags, &split_node_options(raw))
+}
+
+/// Fold the allowlisted option tokens into `flags` -- NODE_OPTIONS's, once
+/// split, or a worker's `execArgv`. Anything else is ignored.
+fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
     let before = flags.clone();
-    let tokens = split_node_options(raw);
     let mut it = tokens.iter().peekable();
     while let Some(tok) = it.next() {
         let tok = tok.as_str();
@@ -1811,10 +1897,25 @@ fn apply_node_options(flags: &mut NodeFlags, raw: &str) -> bool {
             flags.v8_pool_size = Some(v.clone());
         } else if tok == "--insecure-http-parser" {
             flags.insecure_http_parser = true;
+        } else if let Some(v) = tok.strip_prefix("--trace-require-module=") {
+            // A value node refuses (exit 9) is ignored here instead.
+            if is_trace_require_module_value(v) {
+                flags.trace_require_module = Some(v.to_string());
+            }
+        } else if tok == "--trace-require-module"
+            && let Some(v) = it.next()
+        {
+            if is_trace_require_module_value(v) {
+                flags.trace_require_module = Some(v.clone());
+            }
         } else if tok == "--no-warnings" {
             flags.no_warnings = true;
         } else if tok == "--no-deprecation" {
             flags.no_deprecation = true;
+        } else if tok == "--trace-warnings" {
+            flags.trace_warnings = true;
+        } else if tok == "--trace-deprecation" {
+            flags.trace_deprecation = true;
         } else if tok == "--expose-gc" {
             flags.expose_gc = true;
         } else if tok == "--tls-min-v1.0" {
@@ -1840,21 +1941,21 @@ fn apply_node_options(flags: &mut NodeFlags, raw: &str) -> bool {
             // copies here for a child process (child_process.js,
             // copyPermissionModelFlagsToEnv), so a child started under
             // `--permission` runs under it too. Spelled as process.execArgv
-            // spells them; a repeated list flag keeps its last value, as on
-            // the command line.
+            // spells them; a repeated list flag adds to the earlier values, as
+            // on the command line.
             flags.permission = true;
         } else if let Some(list) = tok.strip_prefix("--allow-fs-read=") {
-            flags.allow_fs_read = Some(list.to_string());
+            flags.allow_fs_read.push(list.to_string());
         } else if let Some(list) = tok.strip_prefix("--allow-fs-write=") {
-            flags.allow_fs_write = Some(list.to_string());
+            flags.allow_fs_write.push(list.to_string());
         } else if let Some(list) = tok.strip_prefix("--allow-net=") {
-            flags.allow_net = Some(list.to_string());
+            flags.allow_net.push(list.to_string());
         } else if tok == "--allow-net" {
-            flags.allow_net = Some("*".to_string());
+            flags.allow_net.push("*".to_string());
         } else if let Some(list) = tok.strip_prefix("--allow-env=") {
-            flags.allow_env = Some(list.to_string());
+            flags.allow_env.push(list.to_string());
         } else if tok == "--allow-env" {
-            flags.allow_env = Some("*".to_string());
+            flags.allow_env.push("*".to_string());
         } else if tok == "--allow-child-process" {
             flags.allow_child_process = true;
         } else if tok == "--allow-worker" {
@@ -1873,6 +1974,11 @@ fn apply_node_options(flags: &mut NodeFlags, raw: &str) -> bool {
         // Anything else: ignored on purpose (see the call site).
     }
     before != *flags
+}
+
+/// The values node's `--trace-require-module` takes.
+fn is_trace_require_module_value(value: &str) -> bool {
+    matches!(value, "all" | "no-node-modules")
 }
 
 fn find_project_dir(start: &Path, target: &str) -> Option<PathBuf> {
@@ -1895,6 +2001,7 @@ struct CliHost;
 /// hand it a constructor (see oam_engine::set_worker_host_factory).
 fn register_worker_host() {
     oam_engine::set_worker_host_factory(|| Box::new(CliHost));
+    oam_engine::set_worker_flags_builder(worker_flags_js);
 }
 
 impl oam_engine::ModuleHost for CliHost {
@@ -2355,9 +2462,10 @@ fn run_file_with_flags(
                 return Err((diagnostics, code));
             }
             // Regular fatal: Node forces process.exitCode = 1 at
-            // TriggerUncaughtException (UNCONDITIONALLY -- an earlier script
-            // assignment loses), emits 'exit', then re-reads: a handler
-            // mutating exitCode (98, or back to 0) decides the final code.
+            // TriggerUncaughtException (an earlier script assignment loses,
+            // unless process.exit() was already exiting -- fatal_exit_shape),
+            // emits 'exit', then re-reads: a handler mutating exitCode (98,
+            // or back to 0) decides the final code.
             let (exit_code_script, after_exit) = fatal_exit_shape(&diagnostics);
             let _ = rt.execute_script_draining(
                 "<fatal-exit-code>",
@@ -2376,7 +2484,10 @@ fn run_file_with_flags(
 ///
 /// A fatal exception: node forces exitCode 1 (TriggerUncaughtException,
 /// unconditionally -- an earlier assignment loses), emits 'exit', and runs
-/// nothing after it, no promise job, no tick. A top-level await that never
+/// nothing after it, no promise job, no tick. Unless the process is already
+/// exiting -- the throw came out of `process.exit()`'s own 'exit' emit --
+/// when `_fatalException` leaves exitCode alone: `process.exit(3)` with a
+/// throwing listener exits 3 (#399 item 7). A top-level await that never
 /// settled is no exception to node: it exits naturally, with the exitCode
 /// the script set or else 13 (kUnsettledTopLevelAwait), and drains the
 /// promise jobs the 'exit' listeners queue. Either way a listener that
@@ -2392,7 +2503,7 @@ fn fatal_exit_shape(
         )
     } else {
         (
-            "(function () { var p = globalThis.process; if (p) { p.exitCode = 1; } })();",
+            "(function () { var p = globalThis.process; if (p && !p._exiting) { p.exitCode = 1; } })();",
             oam_engine::AfterScript::Nothing,
         )
     }
@@ -2579,11 +2690,13 @@ struct NodeFlags {
     expose_gc: bool,
     permission: bool,
     /// Node's granular grants. Only meaningful under `--permission`, which
-    /// denies everything first.
-    allow_fs_read: Option<String>,
-    allow_fs_write: Option<String>,
-    /// `--allow-net[=list]` and `--allow-env[=list]`. Bare form grants
-    /// everything (stored as `Some("*")`); `=a,b` grants a list.
+    /// denies everything first. One value per occurrence of the flag, in
+    /// order: a repeated flag adds to the earlier ones, as node's does.
+    allow_fs_read: Vec<String>,
+    allow_fs_write: Vec<String>,
+    /// `--allow-net[=list]` and `--allow-env[=list]`, one value per
+    /// occurrence. Bare form grants everything (stored as `"*"`); `=a,b`
+    /// grants a list.
     ///
     /// Without these, `permissions()` hardcoded net and env closed, so
     /// `--permission` denied all network access with no way to open it. That
@@ -2597,8 +2710,8 @@ struct NodeFlags {
     /// through it, so a denied variable is absent from `process.env` rather
     /// than throwing: it is a snapshot object with no per-property hook, and
     /// an exception would leak the names of variables the script may not see.
-    allow_net: Option<String>,
-    allow_env: Option<String>,
+    allow_net: Vec<String>,
+    allow_env: Vec<String>,
     allow_child_process: bool,
     allow_worker: bool,
     allow_addons: bool,
@@ -2611,6 +2724,11 @@ struct NodeFlags {
     input_type: Option<String>,
     no_warnings: bool,
     no_deprecation: bool,
+    /// `--trace-warnings` / `--trace-deprecation`: the default warning
+    /// printer writes the warning's stack (every warning / deprecations),
+    /// read from `process.traceProcessWarnings` / `process.traceDeprecation`.
+    trace_warnings: bool,
+    trace_deprecation: bool,
     disabled_warnings: Vec<String>,
     redirect_warnings: Option<String>,
     /// Node flags that are really V8 flags: forwarded verbatim before
@@ -2639,6 +2757,12 @@ struct NodeFlags {
     v8_pool_size_spaced: bool,
     /// `--insecure-http-parser`.
     insecure_http_parser: bool,
+    /// `--trace-require-module=all|no-node-modules`: the once-per-process
+    /// ExperimentalWarning when a CommonJS module require()s an ES module
+    /// (node 22 prints none without it). `no-node-modules` leaves out a
+    /// require made from inside node_modules. Spaced as for the header size.
+    trace_require_module: Option<String>,
+    trace_require_module_spaced: bool,
     /// `--tls-min-v1.0` / `--tls-min-v1.1` / `--tls-min-v1.2` /
     /// `--tls-min-v1.3` and `--tls-max-v1.2` / `--tls-max-v1.3`: the initial
     /// `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION`, so the default
@@ -2661,7 +2785,8 @@ impl NodeFlags {
     /// NODE_OPTIONS's flags (`self`) under argv's: a value argv gave wins,
     /// a toggle either gave is on, a list holds the environment's entries
     /// then argv's (node applies NODE_OPTIONS first, so a later `--env-file`
-    /// on the command line still wins), and `argv` is kept for execArgv.
+    /// on the command line still wins, and a permission grant in either
+    /// holds), and `argv` is kept for execArgv.
     fn merged(self, argv: NodeFlags) -> NodeFlags {
         let env = self;
         let (max_http_header_size, max_http_header_size_spaced) =
@@ -2673,6 +2798,15 @@ impl NodeFlags {
             } else {
                 (env.max_http_header_size, env.max_http_header_size_spaced)
             };
+        let (trace_require_module, trace_require_module_spaced) =
+            if argv.trace_require_module.is_some() {
+                (
+                    argv.trace_require_module.clone(),
+                    argv.trace_require_module_spaced,
+                )
+            } else {
+                (env.trace_require_module, env.trace_require_module_spaced)
+            };
         let (v8_pool_size, v8_pool_size_spaced) = if argv.v8_pool_size.is_some() {
             (argv.v8_pool_size.clone(), argv.v8_pool_size_spaced)
         } else {
@@ -2682,10 +2816,10 @@ impl NodeFlags {
             pending_deprecation: env.pending_deprecation || argv.pending_deprecation,
             expose_gc: env.expose_gc || argv.expose_gc,
             permission: env.permission || argv.permission,
-            allow_fs_read: argv.allow_fs_read.clone().or(env.allow_fs_read),
-            allow_fs_write: argv.allow_fs_write.clone().or(env.allow_fs_write),
-            allow_net: argv.allow_net.clone().or(env.allow_net),
-            allow_env: argv.allow_env.clone().or(env.allow_env),
+            allow_fs_read: [env.allow_fs_read, argv.allow_fs_read.clone()].concat(),
+            allow_fs_write: [env.allow_fs_write, argv.allow_fs_write.clone()].concat(),
+            allow_net: [env.allow_net, argv.allow_net.clone()].concat(),
+            allow_env: [env.allow_env, argv.allow_env.clone()].concat(),
             allow_child_process: env.allow_child_process || argv.allow_child_process,
             allow_worker: env.allow_worker || argv.allow_worker,
             allow_addons: env.allow_addons || argv.allow_addons,
@@ -2693,6 +2827,8 @@ impl NodeFlags {
             input_type: argv.input_type.clone().or(env.input_type),
             no_warnings: env.no_warnings || argv.no_warnings,
             no_deprecation: env.no_deprecation || argv.no_deprecation,
+            trace_warnings: env.trace_warnings || argv.trace_warnings,
+            trace_deprecation: env.trace_deprecation || argv.trace_deprecation,
             disabled_warnings: [env.disabled_warnings, argv.disabled_warnings.clone()].concat(),
             redirect_warnings: argv.redirect_warnings.clone().or(env.redirect_warnings),
             allow_natives_syntax: env.allow_natives_syntax || argv.allow_natives_syntax,
@@ -2705,6 +2841,8 @@ impl NodeFlags {
             max_http_header_size_spaced,
             v8_pool_size,
             v8_pool_size_spaced,
+            trace_require_module,
+            trace_require_module_spaced,
             insecure_http_parser: env.insecure_http_parser || argv.insecure_http_parser,
             tls_min_v1_0: env.tls_min_v1_0 || argv.tls_min_v1_0,
             tls_min_v1_1: env.tls_min_v1_1 || argv.tls_min_v1_1,
@@ -2757,32 +2895,66 @@ impl NodeFlags {
     }
 
     fn install(&self, rt: &mut oam_engine::JsRuntime) {
-        let pending = self.pending_deprecation
-            || std::env::var("NODE_PENDING_DEPRECATION").as_deref() == Ok("1");
-        let def = |name: &str, value: String| {
-            format!(
-                "Object.defineProperty(globalThis, '{name}', \
-                   {{ value: {value}, writable: false, enumerable: false, configurable: false }});"
-            )
-        };
+        let env_is_1 = |name: &str| std::env::var(name).as_deref() == Ok("1");
+        // NODE_PENDING_DEPRECATION is one of node's options, read once at
+        // startup; a worker that inherits this process's options inherits it.
+        let mut options = self.clone();
+        options.pending_deprecation |= env_is_1("NODE_PENDING_DEPRECATION");
+        let mut js = options.environment_js(env_is_1("NODE_NO_WARNINGS"));
+        js.push_str(&self.process_js());
+        if !js.is_empty() {
+            let _ = rt.execute_script("<flags>", &js);
+            // oam.fork()'s in-process pool gets its own isolate; publish the
+            // same snippet so it inherits the flags instead of starting
+            // clean. (A worker_threads Worker decides its own: see
+            // worker_flags_js.)
+            oam_engine::set_inherited_flags_js(js);
+        }
+        PARENT_OPTIONS.set(options).ok();
+    }
+
+    /// The flags node keeps per environment -- each worker_threads Worker has
+    /// its own, decided by its `execArgv` and `env` -- as the JS snippet that
+    /// installs them. `no_warnings_env` is NODE_NO_WARNINGS=1 in that
+    /// environment's process.env.
+    fn environment_js(&self, no_warnings_env: bool) -> String {
         let mut js = String::new();
-        if pending {
-            js.push_str(&def("__oamPendingDeprecation", "true".into()));
+        if self.pending_deprecation {
+            js.push_str(&define_flag_global(
+                "__oamPendingDeprecation",
+                "true".into(),
+            ));
         }
         // --no-warnings, and NODE_NO_WARNINGS=1 which is the same thing to
         // node: the default 'warning' listener is not there at all, so
         // `process.listenerCount("warning")` is 0 (the event is still
         // emitted to a program's own listeners).
-        if self.no_warnings || std::env::var("NODE_NO_WARNINGS").as_deref() == Ok("1") {
+        if self.no_warnings || no_warnings_env {
+            let def = define_flag_global;
             js.push_str(&def("__oamNoWarnings", "true".into()));
             js.push_str(
                 "for (const f of globalThis.process.listeners('warning')) \
                    if (f.name === 'onWarning') globalThis.process.removeListener('warning', f);",
             );
         }
+        let def = define_flag_global;
         if self.no_deprecation {
             js.push_str(&def("__oamNoDeprecation", "true".into()));
             js.push_str("globalThis.process.noDeprecation = true;");
+        }
+        // node defines these only when the flag is given (absent otherwise,
+        // not false), read-only, enumerable and configurable; the printer
+        // reads them on each warning, so a program can set them too.
+        for (set, name) in [
+            (self.trace_warnings, "traceProcessWarnings"),
+            (self.trace_deprecation, "traceDeprecation"),
+        ] {
+            if set {
+                js.push_str(&format!(
+                    "Object.defineProperty(globalThis.process, '{name}', \
+                       {{ value: true, writable: false, enumerable: true, configurable: true }});"
+                ));
+            }
         }
         if !self.disabled_warnings.is_empty() {
             let list =
@@ -2793,8 +2965,12 @@ impl NodeFlags {
             let p = serde_json::to_string(path).unwrap_or_else(|_| "\"\"".into());
             js.push_str(&def("__oamRedirectWarnings", p));
         }
-        if self.zero_fill_buffers {
-            js.push_str(&def("__oamZeroFillBuffers", "true".into()));
+        // cjs.rs reads it on the first require() of an ES module. node keeps
+        // it per environment, so a worker's own execArgv / NODE_OPTIONS
+        // decide it. The value is one of node's two words, so quoting it is
+        // all the escaping it needs.
+        if let Some(mode) = &self.trace_require_module {
+            js.push_str(&def("__oamTraceRequireModule", format!("\"{mode}\"")));
         }
         // node:tls reads these as the initial DEFAULT_MIN_VERSION /
         // DEFAULT_MAX_VERSION (the names are node's own four, so quoting
@@ -2806,16 +2982,22 @@ impl NodeFlags {
         if let Some(v) = tls_max {
             js.push_str(&def("__oamTlsMaxVersion", format!("\"{v}\"")));
         }
+        js
+    }
+
+    /// The flags node keeps for the whole process (a Worker refuses them in
+    /// its `execArgv` with ERR_WORKER_INVALID_EXEC_ARGV, and every thread
+    /// has them), as the JS snippet that installs them.
+    fn process_js(&self) -> String {
+        let mut js = String::new();
+        if self.zero_fill_buffers {
+            js.push_str(&define_flag_global("__oamZeroFillBuffers", "true".into()));
+        }
         if let Some(title) = &self.title {
             let t = serde_json::to_string(title).unwrap_or_else(|_| "\"\"".into());
             js.push_str(&format!("globalThis.process.title = {t};"));
         }
-        if !js.is_empty() {
-            let _ = rt.execute_script("<flags>", &js);
-            // Workers and forks get their own isolate; publish the same
-            // snippet so they inherit the flags instead of starting clean.
-            oam_engine::set_inherited_flags_js(js);
-        }
+        js
     }
 
     /// Apply `--env-file` before the program runs. Node parses these in C++
@@ -2848,20 +3030,27 @@ impl NodeFlags {
         if !self.permission {
             return None;
         }
-        // `--allow-fs-read=*` is "everything"; anything else is a
-        // comma-separated allow-list, which is how node spells it.
-        fn grant(list: &Option<String>) -> oam_engine::BoolOrList {
-            match list {
-                None => oam_engine::BoolOrList::Bool(false),
-                Some(spec) if spec == "*" => oam_engine::BoolOrList::Bool(true),
-                Some(spec) => oam_engine::BoolOrList::List(
-                    spec.split(',')
-                        .map(str::trim)
-                        .filter(|entry| !entry.is_empty())
-                        .map(str::to_string)
-                        .collect(),
-                ),
+        // Every occurrence of a flag grants its entries (`values`, in
+        // order). A value `*` is "everything", beside any other value, as in
+        // node; any other value is a comma-separated allow-list, oam's
+        // spelling (node v22 takes a value as one path:
+        // docs/node-divergences.md, section 4).
+        fn grant(values: &[String]) -> oam_engine::BoolOrList {
+            if values.is_empty() {
+                return oam_engine::BoolOrList::Bool(false);
             }
+            if values.iter().any(|value| value == "*") {
+                return oam_engine::BoolOrList::Bool(true);
+            }
+            oam_engine::BoolOrList::List(
+                values
+                    .iter()
+                    .flat_map(|value| value.split(','))
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            )
         }
         Some(oam_engine::PermissionsOptions {
             read: grant(&self.allow_fs_read),
@@ -2901,23 +3090,23 @@ impl NodeFlags {
         if self.permission {
             out.push("--permission".into());
         }
-        if let Some(list) = &self.allow_fs_read {
+        for list in &self.allow_fs_read {
             out.push(format!("--allow-fs-read={list}"));
         }
-        if let Some(list) = &self.allow_fs_write {
+        for list in &self.allow_fs_write {
             out.push(format!("--allow-fs-write={list}"));
         }
         // Round-trip the bare form as bare: a script reading process.execArgv
         // to re-spawn itself should get back the flags it was given, not a
         // `=*` spelling node never produces.
-        if let Some(list) = &self.allow_net {
+        for list in &self.allow_net {
             out.push(if list == "*" {
                 "--allow-net".into()
             } else {
                 format!("--allow-net={list}")
             });
         }
-        if let Some(list) = &self.allow_env {
+        for list in &self.allow_env {
             out.push(if list == "*" {
                 "--allow-env".into()
             } else {
@@ -2939,6 +3128,12 @@ impl NodeFlags {
         if self.no_deprecation {
             out.push("--no-deprecation".into());
         }
+        if self.trace_warnings {
+            out.push("--trace-warnings".into());
+        }
+        if self.trace_deprecation {
+            out.push("--trace-deprecation".into());
+        }
         for w in &self.disabled_warnings {
             out.push(format!("--disable-warning={w}"));
         }
@@ -2959,6 +3154,14 @@ impl NodeFlags {
                 out.push(v.clone());
             } else {
                 out.push(format!("--v8-pool-size={v}"));
+            }
+        }
+        if let Some(v) = &self.trace_require_module {
+            if self.trace_require_module_spaced {
+                out.push("--trace-require-module".into());
+                out.push(v.clone());
+            } else {
+                out.push(format!("--trace-require-module={v}"));
             }
         }
         if self.insecure_http_parser {
@@ -3100,9 +3303,6 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
             ExitCode::from(rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
         }
         Err(diagnostics) => {
-            for d in &diagnostics {
-                render(d, false);
-            }
             let sub_code = rt
                 .execute_script_draining(
                     "<fatal-sub-code>",
@@ -3114,6 +3314,9 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
             if let Some(code) = sub_code {
                 // Skips `emit_process_exit` -- see the run_file site above.
                 oam_engine::run_exit_hooks();
+                for d in &diagnostics {
+                    render(d, false);
+                }
                 return ExitCode::from(code);
             }
             let (exit_code_script, after_exit) = fatal_exit_shape(&diagnostics);
@@ -3122,7 +3325,13 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
                 exit_code_script,
                 oam_engine::AfterScript::Nothing,
             );
+            // node runs the 'exit' listeners, then prints the report
+            // (TriggerUncaughtException: _fatalException, then
+            // ReportFatalException), as run_file's caller does (#399 item 10).
             rt.emit_process_exit_after(after_exit);
+            for d in &diagnostics {
+                render(d, false);
+            }
             ExitCode::from(rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8)
         }
     }
@@ -3249,9 +3458,6 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
             ExitCode::from(rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
         }
         Err(diagnostics) => {
-            for d in &diagnostics {
-                render(d, false);
-            }
             let sub_code = rt
                 .execute_script_draining(
                     "<fatal-sub-code>",
@@ -3263,6 +3469,9 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
             if let Some(code) = sub_code {
                 // Skips `emit_process_exit` -- see the run_file site above.
                 oam_engine::run_exit_hooks();
+                for d in &diagnostics {
+                    render(d, false);
+                }
                 return ExitCode::from(code);
             }
             let (exit_code_script, after_exit) = fatal_exit_shape(&diagnostics);
@@ -3271,7 +3480,13 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
                 exit_code_script,
                 oam_engine::AfterScript::Nothing,
             );
+            // node runs the 'exit' listeners, then prints the report
+            // (TriggerUncaughtException: _fatalException, then
+            // ReportFatalException), as run_file's caller does (#399 item 10).
             rt.emit_process_exit_after(after_exit);
+            for d in &diagnostics {
+                render(d, false);
+            }
             ExitCode::from(rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8)
         }
     }
@@ -3757,10 +3972,10 @@ mod tests {
         let mut flags = super::NodeFlags::default();
         assert!(super::apply_node_options(&mut flags, &raw));
         assert!(flags.permission);
-        assert_eq!(flags.allow_fs_read.as_deref(), Some("C:/a,C:/b"));
-        assert_eq!(flags.allow_fs_write.as_deref(), Some("*"));
-        assert_eq!(flags.allow_net.as_deref(), Some("*"));
-        assert_eq!(flags.allow_env.as_deref(), Some("HOME"));
+        assert_eq!(flags.allow_fs_read, ["C:/a,C:/b"]);
+        assert_eq!(flags.allow_fs_write, ["*"]);
+        assert_eq!(flags.allow_net, ["*"]);
+        assert_eq!(flags.allow_env, ["HOME"]);
         assert!(flags.allow_child_process && flags.allow_worker);
         let p = perms_for(&flags);
         assert!(matches!(p.write, oam_engine::BoolOrList::Bool(true)));
@@ -3776,12 +3991,83 @@ mod tests {
         assert!(is_denied(&p.read) && is_denied(&p.write) && is_denied(&p.child));
     }
 
+    /// The entries a list grant holds, or a panic naming what it was.
+    fn listed(grant: &oam_engine::BoolOrList) -> Vec<String> {
+        match grant {
+            oam_engine::BoolOrList::List(v) => v.clone(),
+            other => panic!("expected a list grant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_repeated_list_flag_adds_its_entries_to_the_earlier_ones() {
+        // node v22.22.2: `--allow-fs-write=A --allow-fs-write=B` admits
+        // writes under A and under B (#363). oam kept only B. The same holds
+        // for every list-valued permission flag, oam's own two included.
+        let raw = [
+            "--permission",
+            "--allow-fs-read=/r1",
+            "--allow-fs-read=/r2",
+            "--allow-fs-write=/w1",
+            "--allow-fs-write=/w2",
+            "--allow-fs-write=/w3",
+            "--allow-net=a.test",
+            "--allow-net=b.test:80",
+            "--allow-env=ONE",
+            "--allow-env=TWO",
+        ]
+        .join(" ");
+        let mut flags = super::NodeFlags::default();
+        assert!(super::apply_node_options(&mut flags, &raw));
+        let p = perms_for(&flags);
+        assert_eq!(listed(&p.read), ["/r1", "/r2"]);
+        assert_eq!(listed(&p.write), ["/w1", "/w2", "/w3"]);
+        assert_eq!(listed(&p.net), ["a.test", "b.test:80"]);
+        assert_eq!(listed(&p.env), ["ONE", "TWO"]);
+        // A `*` among them grants everything, as node's does.
+        let mut star = super::NodeFlags::default();
+        super::apply_node_options(
+            &mut star,
+            "--permission --allow-fs-read=/r1 --allow-fs-read=* --allow-net=a.test --allow-net",
+        );
+        let p = perms_for(&star);
+        assert!(matches!(p.read, oam_engine::BoolOrList::Bool(true)));
+        assert!(matches!(p.net, oam_engine::BoolOrList::Bool(true)));
+    }
+
+    #[test]
+    fn node_options_grants_add_to_argvs_and_exec_argv_lists_every_occurrence() {
+        // node applies NODE_OPTIONS and then argv, and a list flag in both
+        // grants both; process.execArgv holds argv's occurrences, each as it
+        // was given, which is what a child under `--permission` inherits.
+        let mut env = super::NodeFlags::default();
+        super::apply_node_options(&mut env, "--allow-fs-write=/env --allow-env=E");
+        let mut argv = super::NodeFlags::default();
+        super::apply_node_options(
+            &mut argv,
+            "--permission --allow-fs-write=/a --allow-fs-write=/b --allow-env=A",
+        );
+        let merged = env.merged(argv);
+        let p = perms_for(&merged);
+        assert_eq!(listed(&p.write), ["/env", "/a", "/b"]);
+        assert_eq!(listed(&p.env), ["E", "A"]);
+        assert_eq!(
+            merged.exec_argv(),
+            [
+                "--permission",
+                "--allow-fs-write=/a",
+                "--allow-fs-write=/b",
+                "--allow-env=A",
+            ]
+        );
+    }
+
     #[test]
     fn bare_allow_net_and_allow_env_grant_everything() {
         let flags = super::NodeFlags {
             permission: true,
-            allow_net: Some("*".into()),
-            allow_env: Some("*".into()),
+            allow_net: vec!["*".into()],
+            allow_env: vec!["*".into()],
             ..Default::default()
         };
         let p = perms_for(&flags);
@@ -3793,8 +4079,8 @@ mod tests {
     fn list_form_grants_only_the_listed_entries() {
         let flags = super::NodeFlags {
             permission: true,
-            allow_net: Some("127.0.0.1:5432, example.com".into()),
-            allow_env: Some("DATABASE_URL".into()),
+            allow_net: vec!["127.0.0.1:5432, example.com".into()],
+            allow_env: vec!["DATABASE_URL".into()],
             ..Default::default()
         };
         let p = perms_for(&flags);
@@ -3821,7 +4107,7 @@ mod tests {
         // without it must not silently enable the restrictive mode.
         let flags = super::NodeFlags {
             permission: false,
-            allow_net: Some("*".into()),
+            allow_net: vec!["*".into()],
             ..Default::default()
         };
         assert!(flags.permissions().is_none());
@@ -3833,8 +4119,8 @@ mod tests {
         // it was given -- bare stays bare, a list stays a list.
         let bare = super::NodeFlags {
             permission: true,
-            allow_net: Some("*".into()),
-            allow_env: Some("*".into()),
+            allow_net: vec!["*".into()],
+            allow_env: vec!["*".into()],
             ..Default::default()
         };
         let argv = bare.exec_argv();
@@ -3844,7 +4130,7 @@ mod tests {
 
         let listed = super::NodeFlags {
             permission: true,
-            allow_net: Some("a,b".into()),
+            allow_net: vec!["a,b".into()],
             ..Default::default()
         };
         assert!(listed.exec_argv().contains(&"--allow-net=a,b".to_string()));
@@ -3970,6 +4256,38 @@ mod tests {
     }
 
     #[test]
+    fn trace_flags_come_from_node_options_and_argv_and_only_argv_reflects_them() {
+        // NODE_OPTIONS carries --trace-warnings / --trace-deprecation, as
+        // node's does (#364).
+        let mut env = super::NodeFlags::default();
+        assert!(super::apply_node_options(&mut env, "--trace-deprecation"));
+        assert!(env.trace_deprecation && !env.trace_warnings);
+        let mut both = super::NodeFlags::default();
+        assert!(super::apply_node_options(
+            &mut both,
+            "--trace-warnings --trace-deprecation"
+        ));
+        assert!(both.trace_warnings && both.trace_deprecation);
+        // Merged under argv's: either source turns a flag on, and execArgv
+        // lists argv's alone.
+        let merged = env.merged(super::NodeFlags {
+            trace_warnings: true,
+            ..Default::default()
+        });
+        assert!(merged.trace_warnings && merged.trace_deprecation);
+        assert_eq!(merged.exec_argv(), vec!["--trace-warnings"]);
+        let argv_both = super::NodeFlags::default().merged(super::NodeFlags {
+            trace_warnings: true,
+            trace_deprecation: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            argv_both.exec_argv(),
+            vec!["--trace-warnings", "--trace-deprecation"]
+        );
+    }
+
+    #[test]
     fn node_options_takes_v8_pool_size_in_both_forms_and_ignores_an_empty_one() {
         // Pins the NODE_OPTIONS arms for --v8-pool-size, which mirror the
         // header-size ones: an empty `=` value is node's exit 9, but the
@@ -4034,6 +4352,63 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(spaced.exec_argv(), vec!["--v8-pool-size", "4"]);
+    }
+
+    #[test]
+    fn a_worker_given_env_or_exec_argv_decides_its_own_flags() {
+        // #370, node v22.22.2's Worker: given either, the worker starts from
+        // the defaults, takes NODE_OPTIONS from the environment it is given,
+        // then its execArgv; NODE_NO_WARNINGS is its own environment's.
+        // (The main thread's inheriting path reads PARENT_OPTIONS,
+        // process-global state conformance case 490 covers end to end.)
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (none, _) = super::worker_flags_js(None, false, &[], &env(&[]));
+        assert!(!none.contains("__oamNoWarnings"), "{none}");
+        let (quiet, _) =
+            super::worker_flags_js(None, false, &[], &env(&[("NODE_NO_WARNINGS", "1")]));
+        assert!(quiet.contains("__oamNoWarnings"), "{quiet}");
+        let (argv, _) = super::worker_flags_js(None, false, &args(&["--no-warnings"]), &env(&[]));
+        assert!(argv.contains("__oamNoWarnings"), "{argv}");
+        let (options, _) = super::worker_flags_js(
+            None,
+            false,
+            &args(&["--tls-min-v1.3"]),
+            &env(&[("NODE_OPTIONS", "--no-deprecation --tls-min-v1.0")]),
+        );
+        assert!(options.contains("__oamNoDeprecation"), "{options}");
+        // Both minimums set: node's precedence takes the lowest.
+        assert!(options.contains("\"TLSv1\""), "{options}");
+        let (pending, _) =
+            super::worker_flags_js(None, false, &[], &env(&[("NODE_PENDING_DEPRECATION", "1")]));
+        assert!(pending.contains("__oamPendingDeprecation"), "{pending}");
+        // --trace-require-module is per environment in node too: a worker's
+        // own execArgv sets it, and one given execArgv: [] does not have it.
+        let (traced, _) = super::worker_flags_js(
+            None,
+            false,
+            &args(&["--trace-require-module=all"]),
+            &env(&[]),
+        );
+        assert!(traced.contains("__oamTraceRequireModule"), "{traced}");
+        assert!(!none.contains("__oamTraceRequireModule"), "{none}");
+        // A worker that inherits takes its creator's resolved options: a
+        // worker given `--no-warnings` creates one with no options, and that
+        // one has no 'warning' listener either. Given an execArgv instead, it
+        // starts from the defaults again.
+        let (_, creator) =
+            super::worker_flags_js(None, false, &args(&["--no-warnings"]), &env(&[]));
+        let (inner, _) = super::worker_flags_js(Some(&creator), true, &[], &env(&[]));
+        assert!(inner.contains("__oamNoWarnings"), "{inner}");
+        let (fresh, _) = super::worker_flags_js(Some(&creator), false, &[], &env(&[]));
+        assert!(!fresh.contains("__oamNoWarnings"), "{fresh}");
     }
 }
 

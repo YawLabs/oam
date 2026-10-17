@@ -11,7 +11,7 @@
 // what a strict brand check reads.
 //
 // Only classes oam ships are listed; node's Performance, Crypto,
-// SubtleCrypto, CryptoKey and MessageChannel have tags oam has no class for.
+// SubtleCrypto and CryptoKey have tags oam has no class for.
 const named = [
   "URL", "URLSearchParams", "Headers", "Request", "Response",
   "AbortSignal", "AbortController", "FormData", "Blob", "File",
@@ -31,8 +31,11 @@ for (const name of named) {
           ` w=${d.writable} e=${d.enumerable} c=${d.configurable}`,
   );
 }
-// Classes node leaves untagged: they read as the base class they extend.
-for (const name of ["BroadcastChannel", "MessagePort", "TextEncoderStream", "TextDecoderStream"]) {
+// Classes node leaves untagged: they read as the base class they extend
+// (MessageChannel, which extends nothing, as a plain Object).
+for (const name of [
+  "BroadcastChannel", "MessageChannel", "MessagePort", "TextEncoderStream", "TextDecoderStream",
+]) {
   const ctor = globalThis[name];
   const d = Object.getOwnPropertyDescriptor(ctor.prototype, Symbol.toStringTag);
   console.log(name, d === undefined ? "NO TAG" : `value=${JSON.stringify(d.value)}`);

@@ -1105,7 +1105,10 @@ fn is_process_warning(line: &str) -> bool {
     {
         return true;
     }
-    line.starts_with("(Use `") && line.contains("--trace-warnings")
+    // The hint names --trace-deprecation after a deprecation, and the
+    // program's own name (`oam` under oam) before the flag.
+    line.starts_with("(Use `")
+        && (line.contains("--trace-warnings") || line.contains("--trace-deprecation"))
 }
 
 /// The first row of oam's code frame: a bare `<file>:<line>` location with no
@@ -1989,6 +1992,17 @@ mod tests {
         assert_eq!(
             first_error_line(&c),
             "AssertionError [ERR_ASSERTION]: mismatch: false vs true for Uint8Array"
+        );
+        // oam's printer names itself, and a deprecation's hint names
+        // --trace-deprecation.
+        let c = cap(concat!(
+            "(node:13288) [DEP0040] DeprecationWarning: The `punycode` module is deprecated.\n",
+            "(Use `oam --trace-deprecation ...` to show where the warning was created)\n",
+            "AssertionError [ERR_ASSERTION]: the real failure\n",
+        ));
+        assert_eq!(
+            first_error_line(&c),
+            "AssertionError [ERR_ASSERTION]: the real failure"
         );
     }
 
