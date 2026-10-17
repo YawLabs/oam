@@ -144,6 +144,13 @@ pub(crate) struct CacheKey {
     root: Arc<Path>,
 }
 
+impl CacheKey {
+    /// Whether this key looks up and stores under `root`.
+    pub(crate) fn is_under(&self, root: &Arc<Path>) -> bool {
+        Arc::ptr_eq(&self.root, root) || *self.root == **root
+    }
+}
+
 impl PartialEq for CacheKey {
     fn eq(&self, other: &Self) -> bool {
         self.hash == other.hash

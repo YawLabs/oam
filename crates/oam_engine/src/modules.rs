@@ -2586,9 +2586,10 @@ struct GraphPrefetcher<'scope, 'env> {
     workers: usize,
     max_workers: usize,
     /// The isolate's bytecode cache root, read on the isolate thread when
-    /// the graph load starts (workers cannot reach the isolate's slot). No
-    /// module body runs during a graph load, so `enableCompileCache` cannot
-    /// move the root under a pending prefetch.
+    /// the graph load starts (workers cannot reach the isolate's slot). A
+    /// CommonJS body the load runs can move the root (`enableCompileCache`),
+    /// so compile_module drops a probe keyed under a root no longer in force
+    /// and looks the source up again.
     cache_root: Arc<Path>,
 }
 
@@ -3343,15 +3344,22 @@ fn compile_module(
     // AND the generated builtin/CJS/JSON facades, all of which are
     // deterministic for a given source string (a different facade is a
     // different key, hence a miss, never a wrong hit).
+    // A prefetched probe was keyed under the root current when the graph
+    // load began; a CommonJS body this load ran since (compile_module runs
+    // them in place) may have moved it with `enableCompileCache(dir)`.
+    let root_now = crate::code_cache::enabled().then(|| crate::code_cache::root_for(tc));
+    let prefetched = prefetched.filter(|(key, _)| match (key, &root_now) {
+        (Some(key), Some(root)) => key.is_under(root),
+        _ => true,
+    });
     let (cache_key, cached) = match prefetched {
         // The pool already derived the key and probed the cache for this
-        // exact source; reuse both.
+        // exact source under the root still in force; reuse both.
         Some((key, cached)) => (key, cached),
         None => {
             // Root read at lookup and carried to the post-evaluate store in
             // the key (see code_cache::CacheKey).
-            let key = crate::code_cache::enabled().then(|| {
-                let root = crate::code_cache::root_for(tc);
+            let key = root_now.map(|root| {
                 crate::code_cache::key_for(&code, crate::code_cache::Kind::Module, root)
             });
             let cached = key.as_ref().and_then(crate::code_cache::load);
