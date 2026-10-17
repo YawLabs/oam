@@ -607,6 +607,18 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   node.** libuv asks such a handle for its standard information and fails the open when it has
   none: a console is `EISDIR`, `\\.\pipe\` `EINVAL`; oam handed out a descriptor. A write-only
   `UV_FS_O_FILEMAP` open also asks read access, as libuv's does (#384).
+- **A repeated permission flag adds its grant, as node's does.** Under `--permission`,
+  `--allow-fs-write=A --allow-fs-write=B` kept only the last occurrence, so writes under `A` were
+  refused; every occurrence of `--allow-fs-read`, `--allow-fs-write`, `--allow-net` and
+  `--allow-env` now grants its entries, from the command line and `NODE_OPTIONS` together.
+  `process.execArgv` lists each occurrence, so a child started under `--permission` inherits all
+  of them (#363).
+- **A `*` in an fs grant entry is a wildcard, as in node.** `--allow-fs-read=C:\T\*` (or `dir/*`)
+  granted only a file named `*`, so every read under the directory was refused. The text before
+  the first `*` is now a prefix: `dir/*` and `dir\*` grant `dir` and everything under it, `dir*`
+  every path starting with `dir`, and `/*` or `C:\*` the whole root, for `--allow-fs-read` and
+  `--allow-fs-write` alike (#376). On POSIX a `\` in a grant entry or a path is now part of the
+  name, as node and the OS read it, rather than a separator.
 
 - **`tty.WriteStream` and `tty.ReadStream` over a console opened by name refuse what node's refuse,
   with node's errno (#381).** On Windows they took any descriptor `tty.isatty` called a terminal and
@@ -675,7 +687,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   only "Access to this API has been restricted"; it now goes on, as node's does, "Use
   --allow-fs-read to manage permissions." with the flag of the denied scope (`--allow-fs-write`,
   `--allow-child-process`, `--allow-worker`, ...). oam's own net and environment scopes name
-  `--allow-net` and `--allow-env`.
+  `--allow-net` and `--allow-env` (#363).
 
 - **`import()` loads and evaluates its module in promise jobs after the call, as node's does
   (#397).** oam evaluated the module inside the import hook, with the importer's frame on the

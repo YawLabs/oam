@@ -162,7 +162,9 @@ pub struct NodeSysError {
 ///
 /// The engine rejects with the same error its synchronous gates throw
 /// (`throw_permission_denied`): Node's `ERR_ACCESS_DENIED`, message `Access to
-/// this API has been restricted`, carrying `permission` and `resource`. oam_core
+/// this API has been restricted. Use --allow-net to manage permissions.`
+/// (naming the flag that grants the permission), carrying `permission` and
+/// `resource`. oam_core
 /// has no permission model of its own (the grant lives in the engine), so this
 /// only carries the verdict the engine's check returned.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
