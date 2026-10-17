@@ -5,16 +5,15 @@
       "generatedAgainst": "v22.22.2 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1483,
-        "missing": 342,
-        "absentModules": 5,
-        "absentModuleExportNames": 59
+        "present": 1567,
+        "missing": 307,
+        "absentModules": 4,
+        "absentModuleExportNames": 10
       },
       "absentModules": [
         "_stream_wrap",
         "global:fetch.prototype",
         "inspector/promises",
-        "sys",
         "wasi"
       ],
       "missingExports": {
@@ -119,8 +118,6 @@
           "Decipher",
           "Decipheriv",
           "DiffieHellmanGroup",
-          "Hash",
-          "Hmac",
           "createDiffieHellmanGroup",
           "diffieHellman",
           "getCipherInfo",
@@ -313,7 +310,6 @@
           "Stream",
           "_createServerHandle",
           "_normalizeArgs",
-          "_setSimultaneousAccepts",
           "getDefaultAutoSelectFamily",
           "setDefaultAutoSelectFamily"
         ],
@@ -345,9 +341,6 @@
           "openStdin",
           "sourceMapsEnabled"
         ],
-        "punycode": [
-          "version"
-        ],
         "querystring": [
           "unescapeBuffer"
         ],
@@ -378,6 +371,15 @@
           "WritableStreamDefaultController",
           "WritableStreamDefaultWriter"
         ],
+        "sys": [
+          "MIMEParams",
+          "_errnoException",
+          "_exceptionWithHostPort",
+          "diff",
+          "setTraceSigInt",
+          "transferableAbortController",
+          "transferableAbortSignal"
+        ],
         "test": [
           "assert",
           "run",
@@ -397,7 +399,6 @@
           "MIMEParams",
           "_errnoException",
           "_exceptionWithHostPort",
-          "_extend",
           "diff",
           "setTraceSigInt",
           "transferableAbortController",
@@ -436,16 +437,15 @@
       "generatedAgainst": "v22.22.2 on linux-x64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1483,
-        "missing": 346,
-        "absentModules": 5,
-        "absentModuleExportNames": 59
+        "present": 1567,
+        "missing": 311,
+        "absentModules": 4,
+        "absentModuleExportNames": 10
       },
       "absentModules": [
         "_stream_wrap",
         "global:fetch.prototype",
         "inspector/promises",
-        "sys",
         "wasi"
       ],
       "missingExports": {
@@ -554,8 +554,6 @@
           "Decipher",
           "Decipheriv",
           "DiffieHellmanGroup",
-          "Hash",
-          "Hmac",
           "createDiffieHellmanGroup",
           "diffieHellman",
           "getCipherInfo",
@@ -748,7 +746,6 @@
           "Stream",
           "_createServerHandle",
           "_normalizeArgs",
-          "_setSimultaneousAccepts",
           "getDefaultAutoSelectFamily",
           "setDefaultAutoSelectFamily"
         ],
@@ -780,9 +777,6 @@
           "openStdin",
           "sourceMapsEnabled"
         ],
-        "punycode": [
-          "version"
-        ],
         "querystring": [
           "unescapeBuffer"
         ],
@@ -813,6 +807,15 @@
           "WritableStreamDefaultController",
           "WritableStreamDefaultWriter"
         ],
+        "sys": [
+          "MIMEParams",
+          "_errnoException",
+          "_exceptionWithHostPort",
+          "diff",
+          "setTraceSigInt",
+          "transferableAbortController",
+          "transferableAbortSignal"
+        ],
         "test": [
           "assert",
           "run",
@@ -832,7 +835,6 @@
           "MIMEParams",
           "_errnoException",
           "_exceptionWithHostPort",
-          "_extend",
           "diff",
           "setTraceSigInt",
           "transferableAbortController",
@@ -871,16 +873,15 @@
       "generatedAgainst": "v22.22.2 on win32-arm64",
       "counts": {
         "nodeExportNames": 1874,
-        "present": 1503,
-        "missing": 312,
-        "absentModules": 5,
-        "absentModuleExportNames": 59
+        "present": 1564,
+        "missing": 300,
+        "absentModules": 4,
+        "absentModuleExportNames": 10
       },
       "absentModules": [
         "_stream_wrap",
         "global:fetch.prototype",
         "inspector/promises",
-        "sys",
         "wasi"
       ],
       "missingExports": {
@@ -978,8 +979,6 @@
           "Decipher",
           "Decipheriv",
           "DiffieHellmanGroup",
-          "Hash",
-          "Hmac",
           "createDiffieHellmanGroup",
           "diffieHellman",
           "getCipherInfo",
@@ -1172,7 +1171,6 @@
           "Stream",
           "_createServerHandle",
           "_normalizeArgs",
-          "_setSimultaneousAccepts",
           "getDefaultAutoSelectFamily",
           "setDefaultAutoSelectFamily"
         ],
@@ -1204,9 +1202,6 @@
           "openStdin",
           "sourceMapsEnabled"
         ],
-        "punycode": [
-          "version"
-        ],
         "querystring": [
           "unescapeBuffer"
         ],
@@ -1237,6 +1232,15 @@
           "WritableStreamDefaultController",
           "WritableStreamDefaultWriter"
         ],
+        "sys": [
+          "MIMEParams",
+          "_errnoException",
+          "_exceptionWithHostPort",
+          "diff",
+          "setTraceSigInt",
+          "transferableAbortController",
+          "transferableAbortSignal"
+        ],
         "test": [
           "assert",
           "run",
@@ -1256,7 +1260,6 @@
           "MIMEParams",
           "_errnoException",
           "_exceptionWithHostPort",
-          "_extend",
           "diff",
           "setTraceSigInt",
           "transferableAbortController",

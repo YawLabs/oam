@@ -548,6 +548,12 @@ fn main() -> ExitCode {
             } else if arg == "--no-deprecation" {
                 flags.no_deprecation = true;
                 i += 1;
+            } else if arg == "--trace-warnings" {
+                flags.trace_warnings = true;
+                i += 1;
+            } else if arg == "--trace-deprecation" {
+                flags.trace_deprecation = true;
+                i += 1;
             } else if let Some(v) = arg.strip_prefix("--disable-warning=") {
                 flags.disabled_warnings.push(v.to_string());
                 i += 1;
@@ -1845,6 +1851,10 @@ fn apply_node_options(flags: &mut NodeFlags, raw: &str) -> bool {
             flags.no_warnings = true;
         } else if tok == "--no-deprecation" {
             flags.no_deprecation = true;
+        } else if tok == "--trace-warnings" {
+            flags.trace_warnings = true;
+        } else if tok == "--trace-deprecation" {
+            flags.trace_deprecation = true;
         } else if tok == "--expose-gc" {
             flags.expose_gc = true;
         } else if tok == "--tls-min-v1.0" {
@@ -2646,6 +2656,11 @@ struct NodeFlags {
     input_type: Option<String>,
     no_warnings: bool,
     no_deprecation: bool,
+    /// `--trace-warnings` / `--trace-deprecation`: the default warning
+    /// printer writes the warning's stack (every warning / deprecations),
+    /// read from `process.traceProcessWarnings` / `process.traceDeprecation`.
+    trace_warnings: bool,
+    trace_deprecation: bool,
     disabled_warnings: Vec<String>,
     redirect_warnings: Option<String>,
     /// Node flags that are really V8 flags: forwarded verbatim before
@@ -2743,6 +2758,8 @@ impl NodeFlags {
             input_type: argv.input_type.clone().or(env.input_type),
             no_warnings: env.no_warnings || argv.no_warnings,
             no_deprecation: env.no_deprecation || argv.no_deprecation,
+            trace_warnings: env.trace_warnings || argv.trace_warnings,
+            trace_deprecation: env.trace_deprecation || argv.trace_deprecation,
             disabled_warnings: [env.disabled_warnings, argv.disabled_warnings.clone()].concat(),
             redirect_warnings: argv.redirect_warnings.clone().or(env.redirect_warnings),
             allow_natives_syntax: env.allow_natives_syntax || argv.allow_natives_syntax,
@@ -2835,6 +2852,20 @@ impl NodeFlags {
         if self.no_deprecation {
             js.push_str(&def("__oamNoDeprecation", "true".into()));
             js.push_str("globalThis.process.noDeprecation = true;");
+        }
+        // node defines these only when the flag is given (absent otherwise,
+        // not false), read-only, enumerable and configurable; the printer
+        // reads them on each warning, so a program can set them too.
+        for (set, name) in [
+            (self.trace_warnings, "traceProcessWarnings"),
+            (self.trace_deprecation, "traceDeprecation"),
+        ] {
+            if set {
+                js.push_str(&format!(
+                    "Object.defineProperty(globalThis.process, '{name}', \
+                       {{ value: true, writable: false, enumerable: true, configurable: true }});"
+                ));
+            }
         }
         if !self.disabled_warnings.is_empty() {
             let list =
@@ -2996,6 +3027,12 @@ impl NodeFlags {
         }
         if self.no_deprecation {
             out.push("--no-deprecation".into());
+        }
+        if self.trace_warnings {
+            out.push("--trace-warnings".into());
+        }
+        if self.trace_deprecation {
+            out.push("--trace-deprecation".into());
         }
         for w in &self.disabled_warnings {
             out.push(format!("--disable-warning={w}"));
@@ -4032,6 +4069,38 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(argv_only.exec_argv(), vec!["--no-warnings"]);
+    }
+
+    #[test]
+    fn trace_flags_come_from_node_options_and_argv_and_only_argv_reflects_them() {
+        // NODE_OPTIONS carries --trace-warnings / --trace-deprecation, as
+        // node's does (#364).
+        let mut env = super::NodeFlags::default();
+        assert!(super::apply_node_options(&mut env, "--trace-deprecation"));
+        assert!(env.trace_deprecation && !env.trace_warnings);
+        let mut both = super::NodeFlags::default();
+        assert!(super::apply_node_options(
+            &mut both,
+            "--trace-warnings --trace-deprecation"
+        ));
+        assert!(both.trace_warnings && both.trace_deprecation);
+        // Merged under argv's: either source turns a flag on, and execArgv
+        // lists argv's alone.
+        let merged = env.merged(super::NodeFlags {
+            trace_warnings: true,
+            ..Default::default()
+        });
+        assert!(merged.trace_warnings && merged.trace_deprecation);
+        assert_eq!(merged.exec_argv(), vec!["--trace-warnings"]);
+        let argv_both = super::NodeFlags::default().merged(super::NodeFlags {
+            trace_warnings: true,
+            trace_deprecation: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            argv_both.exec_argv(),
+            vec!["--trace-warnings", "--trace-deprecation"]
+        );
     }
 
     #[test]

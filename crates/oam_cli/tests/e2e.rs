@@ -1222,10 +1222,11 @@ fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
     );
 
     // Shipped builtins resolve; the MOD0006 gate covers the rest, prefixed
-    // or bare. `sys` (the ancient alias for util) is a permanent canary -- it
-    // will never ship, so it keeps this test from chasing the support list.
-    // (constants used to serve this role but now ships, for graceful-fs.)
-    std::fs::write(proj.join("builtin_main.ts"), "import 'node:sys';").unwrap();
+    // or bare. `wasi` is the canary: a builtin node has that oam does not
+    // ship. (constants, then sys -- node's deprecated alias for util -- used
+    // to serve this role, but both now ship: constants for graceful-fs, sys
+    // for its DEP0025 deprecation, #368.)
+    std::fs::write(proj.join("builtin_main.ts"), "import 'node:wasi';").unwrap();
     let out = oam(&[
         "run",
         proj.join("builtin_main.ts").to_str().unwrap(),
@@ -1243,7 +1244,7 @@ fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
         "gate message present: {stderr}"
     );
 
-    std::fs::write(proj.join("bare_builtin.ts"), "import 'sys';").unwrap();
+    std::fs::write(proj.join("bare_builtin.ts"), "import 'wasi';").unwrap();
     let out = oam(&[
         "run",
         proj.join("bare_builtin.ts").to_str().unwrap(),

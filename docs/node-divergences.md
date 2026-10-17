@@ -352,6 +352,7 @@ still wins. Only these tokens are accepted:
 
 ```
 --pending-deprecation   --no-warnings   --no-deprecation   --expose-gc
+--trace-warnings   --trace-deprecation
 --disable-warning[=]    --redirect-warnings[=]
 --max-http-header-size[=]   --insecure-http-parser   --trace-require-module[=]
 --tls-min-v1.0  --tls-min-v1.1  --tls-min-v1.2  --tls-min-v1.3  --tls-max-v1.2  --tls-max-v1.3
@@ -732,23 +733,42 @@ reads it without setting its own mode.
 _(source)_ Read out of both implementations, not measured side by side. Unix is unaffected:
 there oam applies libuv's `UV_TTY_MODE_RAW` recipe exactly (`raw_mode_bits`, same file).
 
-### 51. A process warning is printed without node's trace hint
+### 51. A process warning's trace hint -- FIXED; what still differs about the trace flags
 
-After the first warning of a process node prints, once, a line saying how to see where it
-came from:
+This entry used to record that oam printed a process warning without node's one-time hint
+line, because oam had neither flag the hint names. oam now has `--trace-warnings` and
+`--trace-deprecation`, on the command line, in `NODE_OPTIONS` and in a `Worker`'s own
+`execArgv`; they set
+`process.traceProcessWarnings` / `process.traceDeprecation`, and the default printer
+writes the warning's stack for the warnings they cover. Otherwise the first warning it
+prints carries node's hint, once per thread, naming the flag for that warning's kind
+after the program's name -- `basename(process.argv0)`, as node takes it, which is `oam`:
 
 ```
 (node:1234) [DEP_X] DeprecationWarning: first
-(Use `node --trace-deprecation ...` to show where the warning was created)
+(Use `oam --trace-deprecation ...` to show where the warning was created)
 ```
 
-oam prints the warning and not the hint. The hint names a flag (`--trace-deprecation`, or
-`--trace-warnings` for a warning that is not a deprecation) and oam has neither, so there
-is nothing true for it to say; printing node's line as it stands would send the reader to
-another program. Everything else about the printer is node's: it is the `onWarning`
-listener on `process`, removable like any other, absent under `--no-warnings` and
-`NODE_NO_WARNINGS=1` (conformance case 406, which takes the hint line out of both sides).
-The flags and the hint are #364.
+Conformance case 406 compares the hint with node's apart from that name, and each traced
+stack to its first frame (the frames below are each runtime's own module loader) (#364).
+
+What still differs (measured against node v22.22.2 on win32-arm64):
+
+- **`process.execArgv` lists the two flags in oam's fixed order**, after `--no-warnings` and
+  `--no-deprecation`, where node keeps the order they were given in: `--trace-deprecation
+  --no-warnings --trace-warnings a.js` reads back as `[--no-warnings, --trace-warnings,
+  --trace-deprecation]`. Every flag oam takes is listed this way (the `--tls-*` flags too, entry
+  34): `execArgv` is rebuilt from the parsed flags, not kept as typed.
+- **The `=value` spellings are refused.** node takes `--trace-warnings=<anything>` as the flag
+  set, the value ignored (probed: `=1`, `=0`, `=false`, `=foo` and a bare `=` all set
+  `process.traceProcessWarnings`, and `execArgv` keeps the spelling); oam stops with `unexpected
+  argument` (exit 2). `--no-warnings=1` is refused the same way. Taking them needs `execArgv` to
+  keep each flag as typed, the item above.
+- **Of the warning flags in a `Worker`'s own `execArgv`, oam applies `--no-warnings`,
+  `--trace-warnings` and `--trace-deprecation`.** `--no-deprecation` and `--disable-warning=X`
+  given there are listed in the worker's `execArgv` but not applied: the worker still prints
+  the deprecation, where node's sets `process.noDeprecation` / drops the warning. The same flags
+  given to the parent are inherited and applied.
 
 ### 53. Windows child windows: no console popup from a console-less oam, no `SW_HIDE` on std spawns
 
@@ -806,8 +826,7 @@ oam emits Node's `MODULE_TYPELESS_PACKAGE_JSON` warning, once per `package.json`
 and not for a file under `node_modules`, a `require()`, or a file with no `package.json`.
 Conformance cases 462-465 pin the shapes byte for byte against Node.
 
-What still differs: `require()` of such a file that has module syntax throws
-`ERR_REQUIRE_ESM` (entry 9), and the warning has no trace hint line (entry 51). A typeless
+What still differs: a typeless
 `.ts`/`.tsx` is still an ES module whatever its syntax (entry 24), and a typeless `.jsx`
 outside `node_modules` too: Node runs no JSX to follow.
 
@@ -4157,16 +4176,21 @@ dependency tree touches, so one absent name takes down a program that would neve
 called it. (This is exactly how `statfsSync` — added to Node in v18.15 — killed a CLI on
 oam that never called it.)
 
-Measured on all three release platforms:
+Per release platform (the windows row measured; the linux and darwin rows counted from their
+sections' lists, which #368 edited by hand -- `sys` moved from an absent module to a partial
+one, and five names landed -- as require() of ES modules (`Module._cache`) and zlib zstd (eight
+names) did before it, and which are to be regenerated on those hosts before the next
+release):
 
 | host | export names present | missing by name | in absent modules | modules absent |
 |---|---|---|---|---|
-| windows-aarch64 (Node v22.22.2) | 1500 / 1874 | 315 | 59 | 5 |
-| linux-x64 (Node v22.22.2) | 1480 / 1888 | 349 | 59 | 5 |
-| darwin-arm64 (Node v22.22.2) | 1480 / 1884 | 345 | 59 | 5 |
+| windows-aarch64 (Node v22.22.2) | 1564 / 1874 | 300 | 10 | 4 |
+| linux-x64 (Node v22.22.2), not re-measured | 1567 / 1888 | 311 | 10 | 4 |
+| darwin-arm64 (Node v22.22.2), not re-measured | 1567 / 1884 | 307 | 10 | 4 |
 
-"Present" subtracts both columns: the per-name gaps *and* the 59 export names living
-inside the 5 modules oam does not register at all (`sys` alone accounts for 49). The
+"Present" subtracts both columns: the per-name gaps *and* the 10 export names living
+inside the 4 modules oam does not register at all (`sys`, which held 49 of them, is
+`util` under its deprecated name since #368). The
 Node versions differ between hosts, which is part of why the totals do — the gate prints
 a note when a section's recorded Node does not match the one it is running against, so a
 version bump does not get read as an oam regression.
@@ -4194,8 +4218,8 @@ gate, and says so loudly. It also refuses to record a section whose gap count ha
 unless you pass `--allow-regression`, since laundering a regression into "known debt" is
 the one thing the ratchet exists to prevent.
 
-Five modules are absent outright rather than partial: `_stream_wrap`, `inspector/promises`,
-`sys` (the deprecated `util` alias), `wasi`, and `global:fetch.prototype`. The six `_http_*`
+Four modules are absent outright rather than partial: `_stream_wrap`, `inspector/promises`,
+`wasi`, and `global:fetch.prototype`. The six `_http_*`
 legacy names, `_tls_common` and `_tls_wrap` landed in 0.17.2 (divergence 49), with the few
 names of node's own plumbing they still lack recorded per name.
 
@@ -4205,9 +4229,9 @@ The largest per-module gaps (counts from windows-aarch64), all tracked in that f
 |---|---|---|
 | `constants` | 54 win32 / 65 linux / 61 darwin | The legacy all-in-one table. Platform-conditional values — the `WSA*` block on Windows, `RTLD_*` on POSIX, plus `UV_DIRENT_*` and the `SSL_OP_*`/`ENGINE_METHOD_*` OpenSSL set everywhere. This module is the *entire* reason the ratchet is keyed by platform: a Windows-only baseline reports 16 phantom new gaps on Linux and 12 on darwin, every one of them here. `fs.constants` and `os.constants` are separately correct — see *Platform constant tables* above. |
 | `dns/promises` | 31 | `Resolver`, `getServers`/`setServers`, `lookupService`, `resolveTlsa`, and the `BADNAME`/`NOTFOUND`/… error-code constants. |
-| `module` | 25 | The `Module._*` loader internals (`_load`, `_resolveFilename`, `_cache`, `_extensions`), `register`, `SourceMap`/`findSourceMap`, the compile-cache API. |
+| `module` | 24 | The `Module._*` loader internals (`_load`, `_resolveFilename`, `_extensions`), `register`, `SourceMap`/`findSourceMap`, the compile-cache API. |
 | `fs` | **0** | Closed in 0.9.1–0.9.2. Ownership and fd metadata (`chown`/`fchown`/`lchown`, `fchmod`/`lchmod`), durability (`fsync`/`fdatasync`), `ftruncate`, the `utimes`/`futimes`/`lutimes` family, `readv`/`writev`, `openAsBlob`, `statfs` and `glob`/`globSync` all landed. `node:fs` now has no missing export names on any platform, and `fs/promises` none since `watch` landed after 0.19.0. |
-| `crypto` | 12 | The legacy class constructors (`Hash`, `Hmac`, `Cipher(iv)`, `Decipher(iv)`), `diffieHellman`, `getCipherInfo`, `randomFill`. |
+| `crypto` | 10 | The legacy class constructors `Cipher(iv)` and `Decipher(iv)`, `diffieHellman`, `getCipherInfo`, `randomFill`. |
 | `stream/web` | 12 | The controller/reader/writer constructors and the queuing-strategy classes — the same constructors listed in the Web globals row above. |
 | `v8` | 8 | `DefaultSerializer`/`DefaultDeserializer`, `GCProfiler`, `promiseHooks`, `queryObjects`, `setHeapSnapshotNearHeapLimit`. |
 | `path` | 3 (one per of `path`, `path/posix`, `path/win32`) | `_makeLong` (a Windows long-path helper; not surfaced by `fs.glob`, which is in pure JS). |

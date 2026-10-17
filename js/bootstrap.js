@@ -277,9 +277,49 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
 
   const kNewListener = Symbol.for("oam.kNewListener");
   const kRemoveListener = Symbol.for("oam.kRemoveListener");
+  // A target's listener limit and whether it has warned (node's
+  // kMaxEventTargetListeners / kMaxEventTargetListenersWarned). The limit is
+  // events.defaultMaxListeners when the target is made, 0 (none) for an
+  // AbortSignal, and events.setMaxListeners(n, target) sets it -- which is why
+  // node_compat.js reaches the symbols through __oamEventTargetLimitSymbols.
+  const kMaxEventTargetListeners = Symbol("events.maxEventTargetListeners");
+  const kMaxEventTargetListenersWarned = Symbol("events.maxEventTargetListenersWarned");
+  Object.defineProperty(globalThis, "__oamEventTargetLimitSymbols", {
+    value: Object.freeze({ kMaxEventTargetListeners, kMaxEventTargetListenersWarned }),
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+  // events.defaultMaxListeners, read without loading the module: until
+  // something loads it nobody can have changed it from 10.
+  function defaultMaxListeners() {
+    const events = globalThis.__oamNode?.cache?.get("events");
+    const n = events?.defaultMaxListeners;
+    return typeof n === "number" ? n : 10;
+  }
+
+  const kInspect = Symbol.for("nodejs.util.inspect.custom");
+
   class EventTarget {
     constructor() {
       this._listeners = new Map(); // type -> [{ fn, once }]
+      this[kMaxEventTargetListeners] = defaultMaxListeners();
+      this[kMaxEventTargetListenersWarned] = false;
+    }
+    // node's EventTarget inspection (lib/internal/event_target.js): the
+    // constructor's name, then `{}` -- nothing of the target's state -- and
+    // the name alone past the depth limit, which is how a
+    // MaxListenersExceededWarning names the target.
+    [kInspect](depth, options, inspect) {
+      if (!(this instanceof EventTarget)) {
+        throw new (globalThis.__oamNode.get("internal/errors").codes.ERR_INVALID_THIS)("EventTarget");
+      }
+      const name = this.constructor.name;
+      if (depth < 0) return name;
+      const opts = Object.assign({}, options, {
+        depth: Number.isInteger(options.depth) ? options.depth - 1 : options.depth,
+      });
+      return `${name} ${inspect({}, opts)}`;
     }
     addEventListener(type, listener, options) {
       if (typeof listener !== "function" && typeof listener?.handleEvent !== "function") return;
@@ -328,6 +368,23 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         // addEventListener of its own on its prototype, which node's has
         // not (#401).
         if (typeof this[kNewListener] === "function") this[kNewListener](list.length, type);
+        // Past the limit: one process warning per target, whatever the
+        // type, as node's EventTarget.addEventListener emits it.
+        const max = this[kMaxEventTargetListeners];
+        if (max > 0 && list.length > max && !this[kMaxEventTargetListenersWarned]) {
+          this[kMaxEventTargetListenersWarned] = true;
+          const inspect = globalThis.__oamNode.get("util").inspect;
+          const w = new Error(
+            `Possible EventTarget memory leak detected. ${list.length} ${type} listeners ` +
+              `added to ${inspect(this, { depth: -1 })}. MaxListeners is ${max}. Use ` +
+              "events.setMaxListeners() to increase limit",
+          );
+          w.name = "MaxListenersExceededWarning";
+          w.target = this;
+          w.type = type;
+          w.count = list.length;
+          globalThis.process.emitWarning(w);
+        }
       }
     }
     removeEventListener(type, listener) {
@@ -391,6 +448,17 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       this.aborted = false;
       this.reason = undefined;
       this.onabort = null;
+      this[kMaxEventTargetListeners] = 0;
+    }
+    // node's AbortSignal inspection (lib/internal/abort_controller.js
+    // customInspect): `AbortSignal { aborted: <bool> }`, and the signal
+    // itself past the depth limit, which renders as `[AbortSignal]`.
+    [kInspect](depth, options, inspect) {
+      if (depth < 0) return this;
+      const opts = Object.assign({}, options, {
+        depth: options.depth === null ? null : options.depth - 1,
+      });
+      return `${this.constructor.name} ${inspect({ aborted: this.aborted }, opts)}`;
     }
     static abort(reason) {
       const signal = new AbortSignal();

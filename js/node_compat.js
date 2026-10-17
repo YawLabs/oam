@@ -3807,12 +3807,17 @@
       const max = this.getMaxListeners();
       if (max > 0 && count > max && !this._events[type].warned) {
         this._events[type].warned = true;
-        if (globalThis.console) {
-          globalThis.console.warn(
-            `(oam) MaxListenersExceededWarning: ${count} ${String(type)} listeners added to EventEmitter. ` +
-              `Use emitter.setMaxListeners() to increase limit`,
-          );
-        }
+        // A process warning, as node's (_addListener, lib/events.js): an
+        // Error carrying the emitter, type and count, through emitWarning,
+        // so 'warning' listeners hear it and --no-warnings silences it.
+        // No error code: it is a warning.
+        const w = new Error(
+          `Possible EventEmitter memory leak detected. ${count} ${String(type)} listeners ` +
+            `added to ${registry.get("util").inspect(this, { depth: -1 })}. MaxListeners is ${max}. ` +
+            "Use emitter.setMaxListeners() to increase limit",
+        );
+        Object.assign(w, { name: "MaxListenersExceededWarning", emitter: this, type, count });
+        globalThis.process.emitWarning(w);
       }
       return this;
     };
@@ -4313,26 +4318,38 @@
       return [];
     }
 
-    // Internal slot used to attach a max-listeners value to a native
-    // EventTarget (which has no get/setMaxListeners method of its own), the way
-    // Node stores it via kMaxEventTargetListeners.
-    const kMaxEventTargetListeners = Symbol("kMaxEventTargetListeners");
+    // The slots an EventTarget (which has no get/setMaxListeners method of
+    // its own) keeps its listener limit, and whether it warned, in -- node's
+    // kMaxEventTargetListeners / kMaxEventTargetListenersWarned:
+    // bootstrap.js's EventTarget sets them when made and reads them in
+    // addEventListener to warn past the limit.
+    const { kMaxEventTargetListeners, kMaxEventTargetListenersWarned } =
+      globalThis.__oamEventTargetLimitSymbols;
 
-    function setMaxListeners(n) {
-      if (arguments.length > 1) {
-        for (var i = 1; i < arguments.length; i++) {
-          const target = arguments[i];
-          if (typeof target.setMaxListeners === "function") {
-            target.setMaxListeners(n);
-          } else {
-            // Native EventTarget / AbortSignal: stash the value in a slot.
-            Object.defineProperty(target, kMaxEventTargetListeners, {
-              value: n,
-              writable: true,
-              configurable: true,
-              enumerable: false,
-            });
-          }
+    // node's events.setMaxListeners(n = defaultMaxListeners, ...eventTargets):
+    // with no target it sets the default; a new limit lets a target warn
+    // again. n is checked as node's validateNumber(n, 'setMaxListeners', 0)
+    // checks it, and setMaxListeners is read off any other target as node
+    // reads it, so a null or undefined one is V8's own TypeError.
+    function setMaxListeners(n = EventEmitter.defaultMaxListeners, ...eventTargets) {
+      if (typeof n !== "number") {
+        throw new codes.ERR_INVALID_ARG_TYPE("setMaxListeners", "number", n);
+      }
+      if (n < 0 || Number.isNaN(n)) {
+        throw new codes.ERR_OUT_OF_RANGE("setMaxListeners", ">= 0", n);
+      }
+      if (eventTargets.length === 0) {
+        EventEmitter.defaultMaxListeners = n;
+        return;
+      }
+      for (const target of eventTargets) {
+        if (target instanceof EventTarget) {
+          target[kMaxEventTargetListeners] = n;
+          target[kMaxEventTargetListenersWarned] = false;
+        } else if (typeof target.setMaxListeners === "function") {
+          target.setMaxListeners(n);
+        } else {
+          throw new codes.ERR_INVALID_ARG_TYPE("eventTargets", ["EventEmitter", "EventTarget"], target);
         }
       }
     }
@@ -4346,8 +4363,13 @@
     EventEmitter.listenerCount = (emitter, type, listener) =>
       EventEmitter.prototype.listenerCount.call(emitter, type, listener);
     EventEmitter.getMaxListeners = function getMaxListeners(emitterOrTarget) {
-      if (typeof emitterOrTarget.getMaxListeners === "function") {
-        return emitterOrTarget.getMaxListeners();
+      // node reads an object with a getMaxListeners method as an emitter,
+      // through its _maxListeners, without calling the method -- so a
+      // NodeEventTarget (a MessagePort) answers the module default here
+      // whatever its own limit is, as it does under node.
+      if (typeof emitterOrTarget?.getMaxListeners === "function") {
+        const n = emitterOrTarget._maxListeners;
+        return n === undefined ? EventEmitter.defaultMaxListeners : n;
       }
       if (
         emitterOrTarget != null &&
@@ -7580,6 +7602,18 @@
       Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
     }
 
+    // node's util._extend: the source's own enumerable keys, assigned last
+    // to first; a source that is not an object leaves the target as it is.
+    function _extend(target, source) {
+      if (source === null || typeof source !== "object") return target;
+      const keys = Object.keys(source);
+      let i = keys.length;
+      while (i--) {
+        target[keys[i]] = source[keys[i]];
+      }
+      return target;
+    }
+
     // Codes that have already warned live in deprecationCodesWarned (above
     // the util factory): Node warns once per CODE, not once per wrapper.
     function deprecate(fn, msg, code) {
@@ -8599,7 +8633,18 @@
       deprecate,
       debuglog,
       debug: debuglog,
-      isArray: Array.isArray,
+      // Runtime-deprecated in node v22.22.2 (lib/util.js), each warning on
+      // its first call.
+      isArray: deprecate(
+        Array.isArray,
+        "The `util.isArray` API is deprecated. Please use `Array.isArray()` instead.",
+        "DEP0044",
+      ),
+      _extend: deprecate(
+        _extend,
+        "The `util._extend` API is deprecated. Please use Object.assign() instead.",
+        "DEP0060",
+      ),
       isDeepStrictEqual: (a, b) => deepEqualImpl(a, b, true),
       toUSVString: (val) => {
         var s = String(val);
@@ -16693,9 +16738,13 @@
     // It prints whatever Error the event carries -- one emitted directly
     // too, not only through emitWarning -- and nothing that is not one.
     //
-    // Not here: node's one-time hint naming `--trace-warnings` /
-    // `--trace-deprecation`. oam has neither flag, so there is nothing true
-    // for the hint to say (docs/node-divergences.md).
+    // Under --trace-warnings (process.traceProcessWarnings), or
+    // --trace-deprecation (process.traceDeprecation) for a deprecation, it
+    // prints the warning's stack in place of its toString(). Otherwise the
+    // first warning it prints carries node's one-time hint naming the flag
+    // for its kind, after the program's name: basename(process.argv0), which
+    // is `oam` for oam. Once per thread, as node's module-level flag is.
+    let traceWarningHelperShown = false;
     function onWarning(warning) {
       if (!(warning instanceof Error)) return;
       const isDeprecation = warning.name === "DeprecationWarning";
@@ -16716,12 +16765,23 @@
       // The (node:PID) prefix is node's own (`process.release.name`), kept
       // so tooling that greps warnings still finds them. A warning whose
       // toString is not a function is printed as an Error prints.
+      const trace = process.traceProcessWarnings || (isDeprecation && process.traceDeprecation);
       let line = `(node:${process.pid}) `;
       if (warning.code) line += `[${warning.code}] `;
-      line += typeof warning.toString === "function"
-        ? `${warning.toString()}`
-        : Error.prototype.toString.call(warning);
+      if (trace && warning.stack) {
+        line += `${warning.stack}`;
+      } else {
+        line += typeof warning.toString === "function"
+          ? `${warning.toString()}`
+          : Error.prototype.toString.call(warning);
+      }
       if (typeof warning.detail === "string") line += `\n${warning.detail}`;
+      if (!trace && !traceWarningHelperShown) {
+        const flag = isDeprecation ? "--trace-deprecation" : "--trace-warnings";
+        const argv0 = registry.get("path").basename(process.argv0 || "node", ".exe");
+        line += `\n(Use \`${argv0} ${flag} ...\` to show where the warning was created)`;
+        traceWarningHelperShown = true;
+      }
       line += "\n";
       // NODE_REDIRECT_WARNINGS: append the formatted warning to the named
       // file instead of stderr. Read from natives.env() (the real OS
@@ -17515,77 +17575,61 @@
         }
         if (!condition) throw new codes.ERR_ASSERTION(message);
       },
-      emitWarning(warning, typeOrOptions, codeArg, ctorArg) {
-        // Normalize the (warning, type, code, ctor) / (warning, options)
-        // overloads the way Node does.
-        let type = "Warning";
-        let code;
-        let ctor;
+      emitWarning(warning, type, code, ctor) {
+        // The (warning, type, code, ctor) / (warning, ctor) / (warning,
+        // options) overloads, as node's emitWarning reads them
+        // (lib/internal/process/warning.js, v22.22.2): the options form takes
+        // `options.type || 'Warning'`, so an empty or falsy type is Warning,
+        // and the type and code are validated under the ARGUMENT's name in
+        // every form, before the warning itself is looked at.
         let detail;
-        if (typeOrOptions !== null && typeof typeOrOptions === "object" && !Array.isArray(typeOrOptions)) {
-          // options form
-          if (typeOrOptions.type !== undefined) {
-            if (typeof typeOrOptions.type !== "string") {
-              throw new codes.ERR_INVALID_ARG_TYPE("options.type", "string", typeOrOptions.type);
-            }
-            type = typeOrOptions.type;
-          }
-          if (typeOrOptions.code !== undefined) {
-            if (typeof typeOrOptions.code !== "string") {
-              throw new codes.ERR_INVALID_ARG_TYPE("options.code", "string", typeOrOptions.code);
-            }
-            code = typeOrOptions.code;
-          }
-          if (typeof typeOrOptions.ctor === "function") ctor = typeOrOptions.ctor;
-          if (typeof typeOrOptions.detail === "string") detail = typeOrOptions.detail;
-        } else if (typeof typeOrOptions === "function") {
-          // emitWarning(msg, ctor): a FUNCTION in the type position is the
-          // constructor used to trim the stack, not a type name. Node
-          // shifts it and leaves type at 'Warning'; oam used to throw
-          // ERR_INVALID_ARG_TYPE and reject a documented call form.
-          ctor = typeOrOptions;
-        } else {
-          if (typeOrOptions !== undefined) {
-            if (typeof typeOrOptions !== "string") {
-              throw new codes.ERR_INVALID_ARG_TYPE("type", "string", typeOrOptions);
-            }
-            type = typeOrOptions;
-          }
-          if (typeof codeArg === "function") {
-            ctor = codeArg;
-          } else if (codeArg !== undefined) {
-            if (typeof codeArg !== "string") {
-              throw new codes.ERR_INVALID_ARG_TYPE("code", "string", codeArg);
-            }
-            code = codeArg;
-          }
-          if (typeof ctorArg === "function") ctor = ctorArg;
+        if (type !== null && typeof type === "object" && !Array.isArray(type)) {
+          ctor = type.ctor;
+          code = type.code;
+          if (typeof type.detail === "string") detail = type.detail;
+          type = type.type || "Warning";
+        } else if (typeof type === "function") {
+          // emitWarning(msg, ctor): the constructor that trims the stack.
+          ctor = type;
+          code = undefined;
+          type = "Warning";
+        }
+        if (type !== undefined && typeof type !== "string") {
+          throw new codes.ERR_INVALID_ARG_TYPE("type", "string", type);
+        }
+        if (typeof code === "function") {
+          ctor = code;
+          code = undefined;
+        } else if (code !== undefined && typeof code !== "string") {
+          throw new codes.ERR_INVALID_ARG_TYPE("code", "string", code);
         }
 
         let warningObj;
-        if (warning instanceof Error) {
-          warningObj = warning;
-        } else if (typeof warning === "string") {
+        if (typeof warning === "string") {
+          // createWarningObject: a positional empty type is Warning too.
           warningObj = new Error(warning);
-          warningObj.name = String(type);
+          warningObj.name = String(type || "Warning");
           if (code !== undefined) warningObj.code = code;
           if (detail !== undefined) warningObj.detail = detail;
           if (typeof Error.captureStackTrace === "function") {
             Error.captureStackTrace(warningObj, ctor || process.emitWarning);
           }
+        } else if (warning instanceof Error) {
+          warningObj = warning;
         } else {
           throw new codes.ERR_INVALID_ARG_TYPE("warning", ["Error", "string"], warning);
         }
 
+        // noDeprecation first: a dropped deprecation is not thrown either.
         // throwDeprecation: a DeprecationWarning surfaces as an async throw
         // (uncaughtException), NOT a synchronous throw from emitWarning --
         // test-process-warning asserts the call site does not throw.
         if (warningObj.name === "DeprecationWarning") {
+          if (process.noDeprecation) return;
           if (process.throwDeprecation) {
             process.nextTick(() => { throw warningObj; });
             return;
           }
-          if (process.noDeprecation) return;
         }
 
         // Deferred, as node's is, so a listener attached after the call
@@ -18309,6 +18353,7 @@
       "_tls_common",
       "_tls_wrap",
       "string_decoder",
+      "sys",
       "timers",
       "timers/promises",
       "tls",
@@ -20627,12 +20672,34 @@
     }
 
     function createHash(algorithm) {
-      return new Hash(natives.cryptoHashCreate(String(algorithm)));
+      if (typeof algorithm !== "string") {
+        throw new codes.ERR_INVALID_ARG_TYPE("algorithm", "string", algorithm);
+      }
+      return new Hash(natives.cryptoHashCreate(algorithm));
     }
 
     function createHmac(algorithm, key) {
-      return new Hmac(natives.cryptoHmacCreate(String(algorithm), toBytes(key)));
+      if (typeof algorithm !== "string") {
+        throw new codes.ERR_INVALID_ARG_TYPE("hmac", "string", algorithm);
+      }
+      return new Hmac(natives.cryptoHmacCreate(algorithm, toBytes(key)));
     }
+
+    // node's crypto.Hash / crypto.Hmac: constructors that work with or
+    // without `new`, deprecated as constructors (DEP0179 / DEP0181) and
+    // exported behind util.deprecate, so `createHash(...) instanceof
+    // crypto.Hash` holds. Each builds what createHash / createHmac build.
+    function PublicHash(algorithm, options) {
+      return createHash(algorithm, options);
+    }
+    PublicHash.prototype = Hash.prototype;
+    function PublicHmac(hmac, key, options) {
+      return createHmac(hmac, key, options);
+    }
+    PublicHmac.prototype = Hmac.prototype;
+    const utilDeprecate = registry.get("util").deprecate;
+    const DeprecatedHash = utilDeprecate(PublicHash, "crypto.Hash constructor is deprecated.", "DEP0179");
+    const DeprecatedHmac = utilDeprecate(PublicHmac, "crypto.Hmac constructor is deprecated.", "DEP0181");
 
     function randomBytes(size, callback) {
       // Chunked: the native caps one call at 64KiB.
@@ -21744,6 +21811,8 @@
       },
       createHash,
       createHmac,
+      Hash: DeprecatedHash,
+      Hmac: DeprecatedHmac,
       randomBytes,
       pseudoRandomBytes: randomBytes,
       rng: randomBytes,
@@ -33883,7 +33952,27 @@
       socketWrite: Socket.prototype.write,
     };
 
+    // node's net._setSimultaneousAccepts (DEP0121): a libuv accept-mode knob
+    // for Windows pipe/TCP handles, which oam's servers do not have, so only
+    // its deprecation is real -- one warning, on the first call, and nothing
+    // returned. It takes `handle` on Windows and nothing elsewhere, as node's.
+    let warnSimultaneousAccepts = true;
+    function warnSetSimultaneousAccepts() {
+      if (warnSimultaneousAccepts) {
+        warnSimultaneousAccepts = false;
+        process.emitWarning(
+          "net._setSimultaneousAccepts() is deprecated and will be removed.",
+          "DeprecationWarning",
+          "DEP0121",
+        );
+      }
+    }
+    const _setSimultaneousAccepts = natives.platform === "win32"
+      ? function _setSimultaneousAccepts(handle) { warnSetSimultaneousAccepts(); }
+      : function _setSimultaneousAccepts() { warnSetSimultaneousAccepts(); };
+
     return {
+      _setSimultaneousAccepts,
       isIPv4, isIPv6, isIP,
       getDefaultAutoSelectFamilyAttemptTimeout,
       setDefaultAutoSelectFamilyAttemptTimeout,
@@ -34455,9 +34544,59 @@
   };
 
   // ------------------------------------------------------------- punycode
-  // Pure-JS Punycode (RFC 3492). Node marks this deprecated but it is still
-  // in widespread use via the `url` module and idn-related libraries.
+  // Whether code under node_modules is on the stack, as node's
+  // isInsideNodeModules(frameLimit, defaultValue) binding (node_util.cc,
+  // v22.22.2) answers it for the punycode deprecation: any frame whose script
+  // name contains "/node_modules/", builtin frames skipped, and the default
+  // when the stack is too deep to search. Only the forward-slash spelling
+  // counts, which is why node on Windows, whose paths are written with
+  // backslashes, warns even when a package's CommonJS loads punycode
+  // (probed: v22.22.2 on win32 warns, on linux it does not). It is the
+  // script's name (StackFrame::GetScriptName), never a //# sourceURL=. And
+  // node names an ES module's frame by its file:// URL, where oam names it
+  // by its path, so such a frame is read with forward slashes: a package's
+  // ES module is skipped on win32 too, as in node.
+  let isEsModuleSource = null;
+  function isInsideNodeModules(frameLimit, defaultValue) {
+    let frames;
+    const savedLimit = Error.stackTraceLimit;
+    const savedPrepare = Error.prepareStackTrace;
+    try {
+      Error.stackTraceLimit = frameLimit;
+      Error.prepareStackTrace = (_, callSites) => callSites;
+      const holder = {};
+      Error.captureStackTrace(holder, isInsideNodeModules);
+      frames = holder.stack;
+    } catch {
+      return defaultValue;
+    } finally {
+      try {
+        Error.stackTraceLimit = savedLimit;
+        Error.prepareStackTrace = savedPrepare;
+      } catch { /* a frozen Error keeps what it had */ }
+    }
+    if (!Array.isArray(frames) || frames.length >= frameLimit) return defaultValue;
+    if (isEsModuleSource === null) isEsModuleSource = globalThis.__oam.node.isEsModuleSource;
+    for (const frame of frames) {
+      let name = frame.getFileName?.();
+      if (typeof name !== "string" || name === "") continue;
+      if (name.startsWith("node:") || name.startsWith("oam:")) continue;
+      if (name.includes("\\") && isEsModuleSource(name)) name = name.replaceAll("\\", "/");
+      if (name.includes("/node_modules/")) return true;
+    }
+    return false;
+  }
+
+  // Pure-JS Punycode (RFC 3492), node's punycode.js 2.1.0. Runtime-deprecated
+  // (DEP0040) when it is first loaded, unless a package is loading it.
   registry.factories.punycode = () => {
+    if (!isInsideNodeModules(100, true)) {
+      process.emitWarning(
+        "The `punycode` module is deprecated. Please use a userland alternative instead.",
+        "DeprecationWarning",
+        "DEP0040",
+      );
+    }
     const BASE = 36, TMIN = 1, TMAX = 26, SKEW = 38, DAMP = 700, BIAS_INIT = 72;
     const MAXINT = 2147483647;
     const DELIMITER = "\x2D";
@@ -34577,12 +34716,22 @@
     }
 
     return {
-      decode, encode, toASCII, toUnicode,
+      version: "2.1.0",
       ucs2: {
         decode: (str) => [...str].map((c) => c.codePointAt(0)),
         encode: (cps) => String.fromCodePoint(...cps),
       },
+      decode, encode, toASCII, toUnicode,
     };
+  };
+
+  // ------------------------------------------------------------------ sys
+  // node's lib/sys.js: util under its old name, deprecated (DEP0025) when it
+  // is first loaded.
+  registry.factories.sys = () => {
+    const util = registry.get("util");
+    process.emitWarning("sys is deprecated. Use util instead.", "DeprecationWarning", "DEP0025");
+    return util;
   };
 
   // ----------------------------------------------------------- perf_hooks
@@ -44269,7 +44418,6 @@
   //   ERR_MISSING_ARGS TypeError; a post on or to a closed port is dropped.
   const kIsNodeStyleListener = Symbol.for("oam.kIsNodeStyleListener");
   const kNewPort = Symbol("kNewPort");
-  const kNodeTargetMaxListeners = Symbol("events.maxEventTargetListeners");
   const kPortClose = Symbol("kPortClose");
   // Port state, out of sight of inspect and Object.keys.
   const portStates = new WeakMap();
@@ -44329,19 +44477,15 @@
     }
   }
   class NodeEventTarget extends EventTarget {
+    // node's NodeEventTarget keeps no limit of its own: setMaxListeners is
+    // events.setMaxListeners(n, this) -- its checks, its default n, and the
+    // EventTarget slot addEventListener warns against -- and getMaxListeners
+    // reads that slot back.
     setMaxListeners(n) {
-      if (typeof n !== "number" || n < 0 || Number.isNaN(n)) {
-        throw new codes.ERR_OUT_OF_RANGE("n", "a non-negative number", n);
-      }
-      Object.defineProperty(this, kNodeTargetMaxListeners, {
-        value: n,
-        writable: true,
-        configurable: true,
-        enumerable: false,
-      });
+      registry.get("events").setMaxListeners(n, this);
     }
     getMaxListeners() {
-      return this[kNodeTargetMaxListeners] ?? 10;
+      return this[globalThis.__oamEventTargetLimitSymbols.kMaxEventTargetListeners];
     }
     eventNames() {
       return Array.from(this._listeners.keys()).filter(
