@@ -161,6 +161,17 @@ struct UnresolvedDuringLoad(Option<(String, PathBuf)>);
 #[derive(Default)]
 struct CaughtDuringLoad(Option<v8::Global<v8::Value>>);
 
+/// The last CommonJS body a graph load ran that threw (or whose earlier
+/// throw a load replayed, `ModuleMap::failed_cjs`): the value and the
+/// diagnostic the load failed with. The entry's load reads it to tell that
+/// throw -- which node reaches as the rejection of the entry's evaluation
+/// (#437) -- from a link or syntax error, which stays a load failure. The
+/// diagnostic must be the very one the load returned: a body the program
+/// caught the throw of (a `require()` in a try) leaves its record here
+/// while the load goes on, and may fail later of something else.
+#[derive(Default)]
+struct CjsBodyThrew(Option<(v8::Global<v8::Value>, Diagnostic)>);
+
 /// The diagnostic code a load uses for node's ERR_REQUIRE_CYCLE_MODULE, which
 /// [`require_esm`] turns back into that error.
 const REQUIRE_CYCLE_CODE: &str = "ERR_REQUIRE_CYCLE_MODULE";
@@ -1396,10 +1407,30 @@ impl JsRuntime {
             shared.wait_for_attach();
         }
 
+        tc.set_slot(CjsBodyThrew(None));
         if let Err(diags) = load_module_graph(tc, host, entry.clone(), false) {
             // Modules compiled before the failure still have unbound scripts;
             // cache them so the corrected run skips their compile.
             store_pending_code_cache(tc);
+            // A CommonJS module of the graph threw from its body. node runs
+            // it while the graph evaluates, so the throw rejects the entry's
+            // evaluation and goes the way of the entry's own throw (#437):
+            // the uncaught ladder, then node's fatal report. oam ran it
+            // while the graph loaded, before any ES module of it evaluated
+            // (docs/node-divergences.md #52), so none of them runs here --
+            // node runs those ahead of it in evaluation order. A link or
+            // syntax error stays the load failure it is.
+            let threw = tc
+                .get_slot_mut::<CjsBodyThrew>()
+                .and_then(|threw| threw.0.take())
+                .filter(|(_, diagnostic)| diags.len() == 1 && diags[0] == *diagnostic);
+            if let Some((value, _)) = threw {
+                // The load's TryCatch still holds what it caught.
+                tc.reset();
+                let exception = v8::Local::new(tc, &value);
+                let esm_in_node = node_runs_as_esm(tc, host, &entry);
+                return entry_threw(tc, &entry, exception, esm_in_node);
+            }
             return Err(diags);
         }
 
@@ -1483,58 +1514,7 @@ impl JsRuntime {
                 // ALSO route this promise to the unhandled-rejection ledger.
                 promise.mark_as_handled();
                 let exception = promise.result(tc);
-                // The full ladder, same as the CJS path: monitor -> capture
-                // callback -> listeners. A bare emit here skipped
-                // uncaughtExceptionMonitor entirely and mis-reported a
-                // throwing handler. node's origin for an ES module's is
-                // 'unhandledRejection': its loader sees the evaluation's
-                // rejection.
-                let origin = if esm_in_node {
-                    "unhandledRejection"
-                } else {
-                    "uncaughtException"
-                };
-                let (exception, site) = match dispatch_uncaught_from(tc, exception, origin) {
-                    Uncaught::Handled => {
-                        // A listener suppressed the fatal exit: continue like
-                        // a clean run -- drain ticks + microtasks the handler
-                        // queued (delivering any fresh throws), pump any
-                        // pending timers/ops, then report unhandled
-                        // rejections. For an ES module the handler's
-                        // promise jobs first: in node it runs inside the
-                        // drain, ahead of the ticks.
-                        if esm_in_node {
-                            host_checkpoint(tc);
-                            if let Some(failure) = drain_uncaught(tc) {
-                                return Err(failure);
-                            }
-                        }
-                        if let Some(failure) = run_ticks_and_microtasks(tc) {
-                            return Err(failure);
-                        }
-                        if let Some(failure) = drain_uncaught(tc) {
-                            return Err(failure);
-                        }
-                        pump_event_loop(tc, None, true)?;
-                        return match unhandled_rejection_failures(tc) {
-                            Some(failures) => Err(failures),
-                            None => Ok(()),
-                        };
-                    }
-                    Uncaught::Fatal => (exception, ThrowSite::default()),
-                    Uncaught::HandlerThrew { value, site, .. } => {
-                        (v8::Local::new(tc, &value), site)
-                    }
-                };
-                let text = exception
-                    .to_string(tc)
-                    .map(|s| s.to_rust_string_lossy(tc))
-                    .unwrap_or_else(|| "unknown exception".to_string());
-                let fallback = format!("{}: Uncaught {text}", entry.display());
-                Err(rt_diag(
-                    FATAL_CODE,
-                    fatal_report(tc, exception, site, &fallback),
-                ))
+                entry_threw(tc, &entry, exception, esm_in_node)
             }
             v8::PromiseState::Pending => Err(rt_diag(
                 "OAM-RT0003",
@@ -1542,6 +1522,91 @@ impl JsRuntime {
             )),
         }
     }
+}
+
+/// The ES module graph rooted at `entry` threw `exception` -- the entry's
+/// evaluation rejected, or a CommonJS module of the graph threw from its
+/// body while it loaded (#437). `esm_in_node`: node runs the entry as an ES
+/// module ([`node_runs_as_esm`]).
+fn entry_threw(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    entry: &Path,
+    exception: v8::Local<'_, v8::Value>,
+    esm_in_node: bool,
+) -> Result<(), Vec<Diagnostic>> {
+    // The full ladder, same as the CJS path: monitor -> capture callback ->
+    // listeners. A bare emit here skipped uncaughtExceptionMonitor entirely
+    // and mis-reported a throwing handler. node's origin for an ES module's
+    // is 'unhandledRejection': its loader sees the evaluation's rejection --
+    // except with a capture callback set, when that loader calls
+    // `process._fatalException(err)` with no fromPromise, so the monitor
+    // sees 'uncaughtException' (node v22.22.2,
+    // lib/internal/modules/run_main.js asyncRunEntryPointWithESMLoader;
+    // conformance case 574).
+    let origin = if esm_in_node && !capture_callback_set(tc) {
+        "unhandledRejection"
+    } else {
+        "uncaughtException"
+    };
+    let (exception, site) = match dispatch_uncaught_from(tc, exception, origin) {
+        Uncaught::Handled => {
+            // A listener suppressed the fatal exit: continue like a clean
+            // run -- drain ticks + microtasks the handler queued (delivering
+            // any fresh throws), pump any pending timers/ops, then report
+            // unhandled rejections. For an ES module the handler's promise
+            // jobs first: in node it runs inside the drain, ahead of the
+            // ticks.
+            if esm_in_node {
+                host_checkpoint(tc);
+                if let Some(failure) = drain_uncaught(tc) {
+                    return Err(failure);
+                }
+            }
+            if let Some(failure) = run_ticks_and_microtasks(tc) {
+                return Err(failure);
+            }
+            if let Some(failure) = drain_uncaught(tc) {
+                return Err(failure);
+            }
+            pump_event_loop(tc, None, true)?;
+            return match unhandled_rejection_failures(tc) {
+                Some(failures) => Err(failures),
+                None => Ok(()),
+            };
+        }
+        Uncaught::Fatal => (exception, ThrowSite::default()),
+        Uncaught::HandlerThrew { value, site, .. } => (v8::Local::new(tc, &value), site),
+    };
+    let text = exception
+        .to_string(tc)
+        .map(|s| s.to_rust_string_lossy(tc))
+        .unwrap_or_else(|| "unknown exception".to_string());
+    let fallback = format!("{}: Uncaught {text}", entry.display());
+    Err(rt_diag(
+        FATAL_CODE,
+        fatal_report(tc, exception, site, &fallback),
+    ))
+}
+
+/// `process.hasUncaughtExceptionCaptureCallback()`, false when it cannot be
+/// asked (early boot, stripped globals) or throws.
+fn capture_callback_set(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> bool {
+    const ASK: &str = "(function () { \
+        var p = globalThis.__oamProcessRef || globalThis.process; \
+        return !!(p && typeof p.hasUncaughtExceptionCaptureCallback === 'function' \
+          && p.hasUncaughtExceptionCaptureCallback()); \
+      })";
+    let set = compile_host_function(tc, "<capture-callback>", ASK).and_then(|ask| {
+        let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+        ask.call(tc, recv, &[])
+    });
+    let set = set.is_some_and(|value| value.is_true());
+    if tc.has_caught() {
+        tc.reset();
+    }
+    set
 }
 
 impl JsRuntime {
@@ -3444,7 +3509,8 @@ fn compile_module(
         {
             // Its body threw in an earlier load: that error again, the
             // body not run again (see ModuleMap::failed_cjs).
-            tc.set_slot(CaughtDuringLoad(Some(value)));
+            tc.set_slot(CaughtDuringLoad(Some(value.clone())));
+            tc.set_slot(CjsBodyThrew(Some((value, diagnostic.clone()))));
             return Err(vec![diagnostic]);
         }
         // Recorded for the duration of the body, so a `require()` of an
@@ -3491,6 +3557,7 @@ fn compile_module(
                 if let Some(value) = caught
                     && !tc.has_terminated()
                 {
+                    tc.set_slot(CjsBodyThrew(Some((value.clone(), diagnostic.clone()))));
                     tc.get_slot_mut::<ModuleMap>()
                         .expect("module map installed")
                         .failed_cjs
