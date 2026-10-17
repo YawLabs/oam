@@ -119,6 +119,13 @@ loop is allowed to end -- Node's exit semantics.
    error is marked (__oamHandlerThrow) so the ledger re-dispatch goes
    straight to Node's fatal exit 7 instead of re-running the ladder (pinned
    by e2e throwing_uncaught_exception_handler_is_fatal_exit_7).
+   Superseded (#398, #399): the dispatcher no longer catches a listener's
+   throw (try/finally keeps its throw site for the report), the
+   queueMicrotask wrapper runs the ladder through
+   `natives.dispatchMicrotaskThrow`, which notes a fatal outcome on the
+   ledger before the throw reaches V8, and the message listener ends a
+   host checkpoint at that throw (`modules::host_checkpoint`), so no later
+   promise job of the drain runs.
 
 Shipped numbers: suite 338 -> 339/402 (84.3%), stream bucket 159 -> 160/164
 (98%, compose-operator flipped), ratchet 336 -> 337, differential 55/55 with

@@ -3,9 +3,8 @@
 // promise jobs -- and the code after a top-level await they settle -- run
 // before any nextTick callback, in the main module, in a worker's, and in a
 // module an ES module import()s. In CommonJS and in a timer callback ticks
-// run first, as at every other tick point. (A module CommonJS import()s is
-// left out: oam evaluates it inside the import hook, and its ticks run
-// before the importer's continuation -- #397, docs/node-divergences.md.)
+// run first, as at every other tick point. (A module CommonJS import()s,
+// and an importer that goes on after the call, are case 480's -- #397.)
 //
 // And on the way out, as node: an ES module entry that throws -- at its
 // top level, or after a top-level await -- runs no tick before the

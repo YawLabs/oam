@@ -89,34 +89,32 @@ impl ForkPool {
         let (tx, rx) = mpsc::sync_channel::<ForkRequest>(1);
         let pool_weak = Arc::downgrade(pool);
         let permissions = pool.permissions.clone();
-        std::thread::Builder::new()
-            .name("oam-fork-prewarm".to_string())
-            .spawn(move || {
-                // Pre-warm: pay the JsRuntime::new() cost before a request arrives.
-                // Use the worker constructor (NO fork pool) -- a prewarm
-                // isolate that installed its own pool would spawn more prewarm
-                // threads, recursing until the stack overflows.
-                super::init_platform();
-                let mut rt = super::JsRuntime::new_worker_runtime_with(permissions);
+        super::worker::spawn_isolate_thread("oam-fork-prewarm".to_string(), move || {
+            // Pre-warm: pay the JsRuntime::new() cost before a request arrives.
+            // Use the worker constructor (NO fork pool) -- a prewarm
+            // isolate that installed its own pool would spawn more prewarm
+            // threads, recursing until the stack overflows.
+            super::init_platform();
+            let mut rt = super::JsRuntime::new_worker_runtime_with(permissions);
 
-                // Block until a ForkRequest arrives or the pool drops (recv Err).
-                let req = match rx.recv() {
-                    Ok(req) => req,
-                    Err(_) => return, // pool dropped: exit cleanly
-                };
+            // Block until a ForkRequest arrives or the pool drops (recv Err).
+            let req = match rx.recv() {
+                Ok(req) => req,
+                Err(_) => return, // pool dropped: exit cleanly
+            };
 
-                // Run the worker script on this pre-warmed isolate.
-                run_fork_request(&mut rt, req);
+            // Run the worker script on this pre-warmed isolate.
+            run_fork_request(&mut rt, req);
 
-                // Refill: spawn a fresh slot so the pool stays at `capacity`.
-                // This thread's isolate has now run a script -- it may carry
-                // stale JS state, so a fresh slot gets a new isolate.
-                if let Some(pool) = pool_weak.upgrade() {
-                    Self::add_slot(&pool);
-                }
-                // Thread exits; JsRuntime drops cleanly.
-            })
-            .expect("fork prewarm thread spawns");
+            // Refill: spawn a fresh slot so the pool stays at `capacity`.
+            // This thread's isolate has now run a script -- it may carry
+            // stale JS state, so a fresh slot gets a new isolate.
+            if let Some(pool) = pool_weak.upgrade() {
+                Self::add_slot(&pool);
+            }
+            // Thread exits; JsRuntime drops cleanly.
+        })
+        .expect("fork prewarm thread spawns");
 
         // Push the slot so the pool can dispatch to it. We push after
         // spawning (not before) so the slot is only visible once the thread
@@ -225,6 +223,8 @@ fn cold_spawn(
             exec_argv: Vec::new(),
             // oam.fork() reads the process environment.
             env: None,
+            inherit_flags: true,
+            creator_flags: None,
         },
         permissions,
     );

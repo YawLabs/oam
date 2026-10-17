@@ -41,10 +41,15 @@ pub trait ModuleHost: Sync {
 }
 
 /// Raw pointer to the active `ModuleHost`, parked in an isolate slot so the
-/// zero-capture `dynamic_import_callback` can resolve+load on demand the same
-/// way the static graph does. The pointer is valid ONLY while `execute_module`
-/// is on the stack (the host is borrowed for that whole call, and the callback
-/// can only fire synchronously during the module evaluation it drives).
+/// zero-capture import() ops (`op_dyn_resolve`, `op_dyn_load`) and
+/// `require()` of an ES module ([`require_esm`]) can resolve and load on
+/// demand the same way the static graph does. The pointer is valid
+/// ONLY while the `execute_*` call that parked it is on the stack (the host is
+/// borrowed for that whole call). The ops run from JS -- the import() hook and
+/// the promise jobs js/esm_loader.js queues -- and every microtask checkpoint
+/// that can run those jobs is inside an `execute_*` call or on a path that
+/// clears the slot first, so an op either finds the live pointer or None. Each
+/// op reads the slot when it runs ([`with_active_host`]); none keeps it.
 ///
 /// SAFETY contract -- enforced by EVERY entry point that runs JS on the
 /// isolate:
@@ -56,11 +61,14 @@ pub trait ModuleHost: Sync {
 ///    have no host of their own.
 ///
 /// If a new JS-running entry point is added, it MUST clear this slot before
-/// running any JS, or `dynamic_import_callback` will deref a stale pointer.
+/// running any JS (microtask checkpoints included), or an import() op will
+/// deref a stale pointer.
 struct ActiveHost(Option<*const (dyn ModuleHost + 'static)>);
 
 #[derive(Default)]
 struct ModuleMap {
+    /// Which run's map this is, for js/esm_loader.js's job cache.
+    generation: u32,
     by_path: HashMap<PathBuf, v8::Global<v8::Module>>,
     /// Identity hashes are NOT unique (V8 documents this); collisions are
     /// disambiguated in the resolve callback by module identity comparison.
@@ -86,12 +94,31 @@ struct ModuleMap {
     /// node's does), so the graph load replays this record instead of
     /// running the body a second time.
     failed_cjs: HashMap<PathBuf, (v8::Global<v8::Value>, Diagnostic)>,
+    /// The script names of the modules compiled from a file's own ES module
+    /// source -- not the facades over builtins, JSON or CommonJS, which are
+    /// registered under the same path as the CommonJS script that runs.
+    /// A stack frame with one of these names is one node names by its
+    /// file:// URL (`is_es_module_source`).
+    es_sources: HashSet<String>,
+}
+
+/// Whether `name`, a stack frame's script name, is a module compiled from a
+/// file's ES module source in this isolate. node names such a frame by the
+/// module's file:// URL where oam names it by its path, so a caller matching
+/// node's view of a frame (the punycode deprecation's node_modules check)
+/// asks this first.
+pub(crate) fn is_es_module_source(isolate: &v8::Isolate, name: &str) -> bool {
+    isolate
+        .get_slot::<ModuleMap>()
+        .is_some_and(|map| map.es_sources.contains(name))
 }
 
 /// The module graph loads on the stack, innermost last. A load can nest: a
 /// CommonJS dependency runs while its graph is loading (oam runs it at load
 /// time, where node runs it while the graph evaluates), and a `require()` of
-/// an ES module, or an `import()`, inside it loads a graph of its own. What
+/// an ES module inside it loads a graph of its own. (An `import()` there is
+/// only resolved; its promise jobs load the graph later, one module at a
+/// time, each a load of its own on this stack -- op_dyn_load.) What
 /// `require()` of an ES module needs from the outer loads is which of their
 /// modules node would have in evaluation at that point
 /// ([`evaluating_in_loads`]), so a load records its entry and the CommonJS
@@ -128,9 +155,8 @@ struct EvaluatingInLoads {
 /// How many synchronous `require()`s of an ES module are running
 /// ([`require_esm_sync`], from its load to the end of evaluation). node's
 /// require() runs no ticks and no promise jobs before it returns, so no
-/// load nested anywhere inside one -- an `import()` a CommonJS dependency or
-/// the required module's body makes -- may drain them, whichever load is
-/// innermost.
+/// load nested anywhere inside one -- a `require()` a CommonJS dependency of
+/// the required graph makes -- may drain them, whichever load is innermost.
 #[derive(Default)]
 struct RequireDepth(usize);
 
@@ -239,7 +265,119 @@ fn park_entry_evaluation(
 
 #[derive(Default)]
 pub(crate) struct UncaughtLedger {
-    entries: Vec<(v8::Global<v8::Value>, String)>,
+    entries: Vec<UncaughtEntry>,
+    /// Set by the queueMicrotask wrapper ([`dispatch_microtask_throw`]) just
+    /// before its fatal throw reaches [`message_listener`].
+    next_fatal: Option<FatalThrow>,
+    /// The throw-site frame for a `next_fatal` that a listener threw.
+    next_frame: Option<String>,
+    /// The listener ended a checkpoint at a fatal throw
+    /// ([`host_checkpoint`] lifts the termination).
+    terminated: bool,
+}
+
+/// One throw V8 reported outside any TryCatch.
+pub(crate) struct UncaughtEntry {
+    value: v8::Global<v8::Value>,
+    /// `file:line: message`, the fallback report text.
+    text: String,
+    /// Already dispatched by the queueMicrotask wrapper, and fatal: the
+    /// drain reports it without running the ladder a second time.
+    fatal: Option<FatalThrow>,
+    /// The throw site's frame, for a listener's own throw: its report
+    /// names the listener's line, as node's does.
+    frame: Option<String>,
+}
+
+/// Why a microtask throw the wrapper already dispatched is fatal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FatalThrow {
+    /// Nothing consumed it.
+    NoConsumer,
+    /// An 'uncaughtException' (or monitor) listener threw; node exits 7.
+    ListenerThrew,
+}
+
+/// `natives.dispatchMicrotaskThrow(err)`, from the queueMicrotask wrapper's
+/// catch: run the uncaught ladder on a microtask's throw. Ok(true): a
+/// listener took it. Ok(false): nothing did; the wrapper rethrows `err`,
+/// noted here as an already-dispatched fatal (#398). Err(thrown): a
+/// listener threw; the caller throws that, noted the same way, with its
+/// throw-site frame kept here -- by the time V8 reports a microtask's throw
+/// it has rebuilt the Message from the error's stack, which points at
+/// `new Error` rather than the `throw` node's report shows.
+pub(crate) fn dispatch_microtask_throw(
+    scope: &mut v8::PinScope<'_, '_>,
+    err: v8::Local<'_, v8::Value>,
+) -> Result<bool, v8::Global<v8::Value>> {
+    v8::tc_scope!(let tc, scope);
+    let (fatal, frame, outcome) = match dispatch_uncaught(tc, err) {
+        Uncaught::Handled => return Ok(true),
+        Uncaught::Fatal => (FatalThrow::NoConsumer, None, Ok(false)),
+        Uncaught::HandlerThrew { value, frame, .. } => {
+            (FatalThrow::ListenerThrew, frame, Err(value))
+        }
+    };
+    if let Some(ledger) = tc.get_slot_mut::<UncaughtLedger>() {
+        ledger.next_fatal = Some(fatal);
+        ledger.next_frame = frame;
+    }
+    outcome
+}
+
+/// A microtask checkpoint the host runs with no JS on the stack. A fatal
+/// microtask throw ends it where it happens: node exits at the throw, so no
+/// later promise job of the same drain runs (#398). The message listener
+/// terminates execution for that; this lifts the termination again, so the
+/// report and the 'exit' listeners can run. The fatal entry stays on the
+/// ledger for the caller's drain ([`drain_uncaught`]).
+pub(crate) fn host_checkpoint(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) {
+    tc.perform_microtask_checkpoint();
+    lift_fatal_termination(tc);
+}
+
+/// Undo the termination [`message_listener`] requested for a fatal throw.
+fn lift_fatal_termination(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>) {
+    let terminated = tc
+        .get_slot_mut::<UncaughtLedger>()
+        .is_some_and(|ledger| std::mem::take(&mut ledger.terminated));
+    if terminated {
+        tc.cancel_terminate_execution();
+        tc.reset();
+    }
+}
+
+/// Whether the ledger holds a fatal throw the wrapper already dispatched.
+fn fatal_pending(scope: &mut v8::PinScope<'_, '_>) -> bool {
+    scope
+        .get_slot::<UncaughtLedger>()
+        .is_some_and(|ledger| ledger.entries.iter().any(|entry| entry.fatal.is_some()))
+}
+
+/// What the run's first fatal error was: the value thrown (or rejected, for
+/// an unhandled rejection: `from_promise`). The diagnostics carry the
+/// rendered report; a worker hands its parent the value itself, as node's
+/// does (#399).
+#[derive(Default)]
+pub(crate) struct FatalThrown(pub(crate) Option<(v8::Global<v8::Value>, bool)>);
+
+/// Note `value` as the run's fatal error, unless one is noted already (node
+/// reports the first).
+fn note_fatal_thrown(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+    from_promise: bool,
+) {
+    if scope
+        .get_slot::<FatalThrown>()
+        .is_some_and(|noted| noted.0.is_some())
+    {
+        return;
+    }
+    let value = v8::Global::new(scope, value);
+    scope.set_slot(FatalThrown(Some((value, from_promise))));
 }
 
 /// V8 message listener. Zero capture, raw C ABI.
@@ -269,10 +407,34 @@ pub(crate) unsafe extern "C" fn message_listener(
         line = src_line as usize;
     }
     let value = v8::Global::new(scope, exception);
+    let (fatal, frame) = scope
+        .get_slot_mut::<UncaughtLedger>()
+        .map(|ledger| (ledger.next_fatal.take(), ledger.next_frame.take()))
+        .unwrap_or_default();
+    // End the checkpoint at a fatal throw, when the host runs it with no JS
+    // on the stack ([`host_checkpoint`] lifts the termination): the next
+    // microtask stops at its first instruction and V8 drops the rest of the
+    // queue. With JS on the stack (a checkpoint inside a dynamic import) the
+    // termination would unwind that JS too, so the throw is only recorded
+    // there and reported at the next drain. Not in a worker: node's worker
+    // still runs the rest of the drain before it stops (conformance case
+    // 474).
+    let terminate = fatal.is_some()
+        && scope
+            .get_slot::<oam_core::worker::WorkerContext>()
+            .is_none()
+        && v8::StackTrace::current_stack_trace(scope, 1).is_none_or(|t| t.get_frame_count() == 0);
     if let Some(ledger) = scope.get_slot_mut::<UncaughtLedger>() {
-        ledger
-            .entries
-            .push((value, format!("{file}:{line}: {text}")));
+        ledger.entries.push(UncaughtEntry {
+            value,
+            text: format!("{file}:{line}: {text}"),
+            fatal,
+            frame,
+        });
+        ledger.terminated |= terminate;
+    }
+    if terminate {
+        scope.terminate_execution();
     }
 }
 
@@ -545,6 +707,7 @@ fn fatal_report(
     frame: Option<String>,
     fallback: &str,
 ) -> String {
+    note_fatal_thrown(tc, exception, false);
     // An ESM top-level throw arrives as a rejected evaluation promise, with
     // no live Message on the scope -- rebuild one from the exception so the
     // report still opens with Node's source frame.
@@ -567,6 +730,28 @@ fn fatal_report(
         tc.reset();
     }
     let body = body.unwrap_or_else(|| fallback.to_string());
+    // A value that is not a native Error: node prints the source frame
+    // itself, opened by an empty line and with the value right under the
+    // caret, and a primitive as String() renders it (a Symbol, which has
+    // no string conversion, as nothing). An object is still inspected.
+    // Measured on node v22.22.2; conformance case 473.
+    let (frame, body) = match frame {
+        Some(frame) if !exception.is_native_error() => {
+            let body = if exception.is_object() {
+                body
+            } else if exception.is_symbol() {
+                String::new()
+            } else {
+                exception
+                    .to_string(tc)
+                    .map(|s| s.to_rust_string_lossy(tc))
+                    .unwrap_or(body)
+            };
+            let frame = frame.strip_suffix('\n').unwrap_or(&frame);
+            (Some(format!("\n{frame}")), body)
+        }
+        frame => (frame, body),
+    };
     // Node closes a fatal report with its runtime banner ("Node.js vX.Y.Z").
     // oam prints its OWN -- same structural role, and claiming to be Node
     // here would be a lie about which runtime produced the crash.
@@ -636,28 +821,181 @@ pub(crate) fn handle_uncaught_throw(
     )])
 }
 
+/// Emit process `'exit'` once (`process._exiting` is the guard shared with
+/// `process.exit()`), with `process.exitCode` or 0.
+///
+/// `natural`: the loop drained, or a top-level await never settled -- node's
+/// `EmitProcessExit`. A listener's throw is an uncaught exception like any
+/// other: offered to the 'uncaughtException' listeners, reported when
+/// nothing takes it, and the code is the `process.exitCode` already set or
+/// else 1 (7 when a listener of the ladder threw). Either way the emit ends
+/// there -- later listeners, and the promise jobs the listeners queued, do
+/// not run. Without a throw node drains those promise jobs, and a throw from
+/// one of them goes the same way (#399 items 1 and 7), as does a promise
+/// they reject and leave unhandled. The tick queue takes nothing once the
+/// process is exiting, so there are no ticks to run.
+///
+/// Not natural: past a fatal exception, where node's `_fatalException`
+/// emits `'exit'` inside a try/catch that drops a listener's throw -- the
+/// original report stays the only one (#399 item 9) -- and runs nothing
+/// after it.
+///
+/// A report raised here goes straight to stderr: node prints it at this
+/// point of the exit.
+pub(crate) fn emit_exit_event(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    natural: bool,
+) {
+    // A function expression compiled and called, so the locals stay function
+    // scoped (a top-level `var` would land on globalThis) and the call's
+    // exception is ours to read.
+    const EMIT: &str = "(function () { \
+        var p = globalThis.__oamProcessRef || globalThis.process; \
+        if (!p || p._exiting) return; \
+        p._exiting = true; \
+        p.emit('exit', typeof p.exitCode === 'number' ? p.exitCode : 0); \
+      })";
+    let Some(emit) = compile_host_function(tc, "<process-exit>", EMIT) else {
+        tc.reset();
+        return;
+    };
+    let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+    if emit.call(tc, recv, &[]).is_some() {
+        if natural {
+            host_checkpoint(tc);
+            if let Some(failures) = drain_uncaught(tc) {
+                report_at_exit(tc, &failures);
+                return;
+            }
+            // node's rejection processing runs after the listeners too: a
+            // promise they reject and leave unhandled is fatal.
+            if let Some(failures) = unhandled_rejection_failures(tc) {
+                report_at_exit(tc, &failures);
+            }
+        }
+        return;
+    }
+    if !natural {
+        tc.reset();
+        return;
+    }
+    let Some(exception) = tc.exception() else {
+        tc.reset();
+        return;
+    };
+    let value = v8::Global::new(tc, exception);
+    let message = crate::exception_to_error(tc, "'exit' listener").to_string();
+    let frame = tc.message().and_then(|m| source_frame(tc, m));
+    tc.reset();
+    let local = v8::Local::new(tc, &value);
+    let (local, frame, message) = match dispatch_uncaught(tc, local) {
+        Uncaught::Handled => return,
+        Uncaught::Fatal => (local, frame, message),
+        Uncaught::HandlerThrew {
+            value,
+            frame,
+            message,
+        } => (v8::Local::new(tc, &value), frame, message),
+    };
+    let report = Diagnostic::new(
+        FATAL_CODE,
+        Severity::Error,
+        Origin::Runtime,
+        fatal_report(tc, local, frame, &message),
+    );
+    report_at_exit(tc, &[report]);
+}
+
+/// Print fatal reports raised while exiting, and set the code node exits
+/// with: 7 when a listener of the uncaught ladder threw
+/// (kExceptionInFatalExceptionHandler), else `process.exitCode` when set,
+/// else 1 -- node's `env->exit_code(kGenericUserError)`. Its
+/// `_fatalException` does not force 1 once `process._exiting` is set.
+fn report_at_exit(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    failures: &[Diagnostic],
+) {
+    // As the CLI renders them: a fatal report verbatim, anything else (an
+    // unhandled rejection) as `error[CODE]: message`.
+    for failure in failures {
+        if failure.code == FATAL_CODE {
+            eprint!("{}", failure.message);
+        } else {
+            eprintln!("error[{}]: {}", failure.code, failure.message);
+        }
+    }
+    const CODE: &str = "(function () { \
+        var p = globalThis.__oamProcessRef || globalThis.process; \
+        if (!p) return; \
+        if (p.__oamFatalCode === 7) p.exitCode = 7; \
+        else if (p.exitCode == null) p.exitCode = 1; \
+      })";
+    if let Some(set_code) = compile_host_function(tc, "<exit-code>", CODE) {
+        let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+        let _ = set_code.call(tc, recv, &[]);
+    }
+    tc.reset();
+}
+
+/// Compile `source` (a parenthesized function expression) as a classic
+/// script and return the function it evaluates to.
+fn compile_host_function<'s>(
+    tc: &mut v8::PinnedRef<'s, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    name: &str,
+    source: &str,
+) -> Option<v8::Local<'s, v8::Function>> {
+    let source = v8::String::new(tc, source)?;
+    let name: v8::Local<v8::Value> = v8::String::new(tc, name)?.into();
+    let origin = v8::ScriptOrigin::new(tc, name, 0, 0, false, 0, None, false, false, false, None);
+    let script = v8::Script::compile(tc, source, Some(&origin))?;
+    let value = script.run(tc)?;
+    v8::Local::<v8::Function>::try_from(value).ok()
+}
+
 /// Take any uncaught-exception reports (from the message listener, i.e.
 /// exceptions swallowed by the microtask checkpoint) and either deliver
 /// them to an 'uncaughtException' listener or fail the run.
 pub(crate) fn drain_uncaught(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
 ) -> Option<Vec<Diagnostic>> {
+    lift_fatal_termination(tc);
     let mut fatal = Vec::new();
     // Loop: a listener may queue microtasks/ticks (flushed below under the
     // explicit policy) whose throws land NEW ledger entries; quiesce before
     // returning. Terminates because each pass drains the ledger and only
     // fresh throws refill it.
     loop {
-        let captured: Vec<(v8::Global<v8::Value>, String)> = tc
+        let captured: Vec<UncaughtEntry> = tc
             .get_slot_mut::<UncaughtLedger>()
             .map(|ledger| std::mem::take(&mut ledger.entries))
             .unwrap_or_default();
         if captured.is_empty() {
             break;
         }
-        for (value, text) in captured {
+        for entry in captured {
+            let UncaughtEntry {
+                value,
+                text,
+                fatal: already,
+                frame,
+            } = entry;
+            // A later entry than a fatal one is not reached: node exited.
+            if !fatal.is_empty() {
+                break;
+            }
             let local = v8::Local::new(tc, &value);
-            let (local, frame, message) = match dispatch_uncaught(tc, local) {
+            let outcome = match already {
+                // The wrapper ran the ladder already; running it again would
+                // fire 'uncaughtExceptionMonitor' twice.
+                Some(FatalThrow::NoConsumer) => Uncaught::Fatal,
+                Some(FatalThrow::ListenerThrew) => Uncaught::HandlerThrew {
+                    value: value.clone(),
+                    frame,
+                    message: format!("Uncaught {text}"),
+                },
+                None => dispatch_uncaught(tc, local),
+            };
+            let (local, frame, message) = match outcome {
                 Uncaught::Handled => continue,
                 // No stored frame: for a microtask-thrown error V8 has no
                 // throw-site Message at all (probe-verified -- file
@@ -798,15 +1136,15 @@ impl JsRuntime {
         self.isolate.set_slot(ActiveHost(None));
     }
 
-    /// Park the host pointer for `dynamic_import_callback`, so `import()`
+    /// Park the host pointer for the import() ops, so `import()`
     /// works from BOTH entry paths (ESM and CJS -- a CJS entry that awaits
     /// an `import()` is ordinary code, not an error). Call right after
     /// `reset_run_slots`, which clears the slot.
     ///
-    /// SAFETY: `host` outlives the whole `execute_*` call, and the callback
-    /// only fires synchronously during that evaluation; the slot is reset to
-    /// None by reset_run_slots / tick() / repl_eval() so no later turn can
-    /// read a stale pointer. The single `unsafe` for this lives here.
+    /// SAFETY: `host` outlives the whole `execute_*` call, and the ops only
+    /// read the slot while JS runs inside it; the slot is reset to None by
+    /// reset_run_slots / tick() / repl_eval() so no later turn can read a
+    /// stale pointer.
     pub(crate) fn park_active_host(&mut self, host: &dyn ModuleHost) {
         // SAFETY: a lifetime-only transmute of a fat pointer -- only the erased
         // lifetime changes, the (data, vtable) halves keep identical layout, so
@@ -825,9 +1163,13 @@ impl JsRuntime {
         // import from CJS/worker code rejects cleanly instead of dereffing a
         // stale ptr. execute_module re-parks Some(ptr) right after this returns.
         self.isolate.set_slot(ActiveHost(None));
-        self.isolate.set_slot(ModuleMap::default());
+        self.isolate.set_slot(ModuleMap {
+            generation: next_module_map_generation(),
+            ..ModuleMap::default()
+        });
         self.isolate.set_slot(RejectionLedger::default());
         self.isolate.set_slot(UncaughtLedger::default());
+        self.isolate.set_slot(FatalThrown::default());
         self.isolate.set_slot(crate::timers::TimerQueue::default());
         self.isolate.set_slot(crate::cjs::CjsCache::default());
         self.isolate
@@ -921,7 +1263,7 @@ impl JsRuntime {
             // before the tick queue is reached: `process.nextTick` there
             // runs after them, not ahead (#345). A bare checkpoint first,
             // then the tick point.
-            tc.perform_microtask_checkpoint();
+            host_checkpoint(tc);
             // A promise job in that drain that threw: fatal, it ends the run
             // before any tick, as node exits at it; handled, it is delivered
             // before the ticks.
@@ -986,7 +1328,7 @@ impl JsRuntime {
                         // promise jobs first: in node it runs inside the
                         // drain, ahead of the ticks.
                         if esm_in_node {
-                            tc.perform_microtask_checkpoint();
+                            host_checkpoint(tc);
                             if let Some(failure) = drain_uncaught(tc) {
                                 return Err(failure);
                             }
@@ -1416,9 +1758,10 @@ pub(crate) fn run_ticks_and_microtasks(
                 // timer callback's throw (handle_uncaught_throw): handled
                 // continues the run, fatal/handler-threw fails it. Handled
                 // ALSO defers the interrupted batch -- node keeps the
-                // remaining ticks queued and drains them at the next tick
-                // point, AFTER the next macrotask (probe-verified), so do
-                // not checkpoint-drain them in place.
+                // remaining ticks queued and drains them at its next tick
+                // point: after the next callback, or at its check phase
+                // (pump_event_loop places that), so do not checkpoint-drain
+                // them in place.
                 if let Some(failure) = handle_uncaught_throw(tc, "process.nextTick") {
                     return Some(failure);
                 }
@@ -1430,12 +1773,20 @@ pub(crate) fn run_ticks_and_microtasks(
                 // listener-queued microtask flushes instead of stranding
                 // until some unrelated JS-running site checkpoints.
                 if !has_pending_ticks(tc) {
-                    tc.perform_microtask_checkpoint();
+                    host_checkpoint(tc);
+                    if fatal_pending(tc) {
+                        return drain_uncaught(tc);
+                    }
                 }
                 return None;
             }
         }
-        tc.perform_microtask_checkpoint();
+        host_checkpoint(tc);
+        // A fatal microtask throw ended the checkpoint: node exits at it, so
+        // no tick queued since runs either (#398).
+        if fatal_pending(tc) {
+            return drain_uncaught(tc);
+        }
         if !has_pending_ticks(tc) || entry_rejected(tc) {
             return None;
         }
@@ -1468,6 +1819,14 @@ pub(crate) fn run_platform_tasks(
         }
         if let Some(failure) = drain_uncaught(tc) {
             return Err(failure);
+        }
+        // This task's drain rejected the ES module entry: it is reported
+        // next, and node runs nothing before that -- not the rest of this
+        // batch, whose tasks (another async WebAssembly compile's
+        // continuation) would run user code first (#399 item 11). The
+        // tasks left are dropped with the run.
+        if entry_rejected(tc) {
+            break;
         }
     }
     Ok(ran)
@@ -1538,6 +1897,37 @@ fn emit_before_exit(
     Ok((emitted, handled_throw))
 }
 
+/// The kind of callback the event loop ran last ([`pump_event_loop`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LastRan {
+    /// Nothing yet: the entry (or whatever ran before the loop).
+    Entry,
+    /// A timer, with the instant its timers phase began: the timers due by
+    /// then run in that phase.
+    Timer(std::time::Instant),
+    /// An immediate, with the instant its check phase began.
+    Immediate(std::time::Instant),
+    /// An I/O callback, a V8 foreground task, or a pending callback.
+    Other,
+}
+
+/// Run the ticks a handled throw left queued, as node's check phase does:
+/// its callback scope's close runs the whole queue, delivering each handled
+/// throw and going on with the rest (#366).
+fn drain_deferred_ticks(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> Result<(), Vec<Diagnostic>> {
+    while has_pending_ticks(tc) && !entry_rejected(tc) {
+        if let Some(failure) = run_ticks_and_microtasks(tc) {
+            return Err(failure);
+        }
+        if let Some(failure) = drain_uncaught(tc) {
+            return Err(failure);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn pump_event_loop(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     entry_promise: Option<v8::Local<'_, v8::Promise>>,
@@ -1548,6 +1938,8 @@ pub(crate) fn pump_event_loop(
     // handler-scheduled work re-arms the NEXT drain's emission while a
     // handler that schedules nothing exits after a single emission.
     let mut before_exit_emitted = false;
+    // What the loop ran last, for where a deferred tick batch drains.
+    let mut last_ran = LastRan::Entry;
     loop {
         // One HandleScope per turn. Every Local a turn creates -- the
         // resolver a completion settles and the value it settles with, a
@@ -1624,6 +2016,34 @@ pub(crate) fn pump_event_loop(
                 .is_some_and(|core| core.has_inflight());
             !has_ref && !has_inflight && !has_pending_ticks(tc)
         };
+        // Ticks left queued by a handled throw run at node's next tick
+        // point, which falls before this turn's callback when that callback
+        // opens a phase node reaches only after its check phase (an
+        // immediate of a new check phase, or a timer after an I/O callback:
+        // the poll phase is followed by the check phase), or when it opens
+        // a new timers phase (node runs the queue as a timers phase ends).
+        // A timer due in the phase of the timer before it runs first: after
+        // a throw node's timers phase goes on to its next due timer (#399
+        // item 8).
+        if !only_unref_timers_left && has_pending_ticks(tc) {
+            let next = tc
+                .get_slot_mut::<crate::timers::TimerQueue>()
+                .and_then(|queue| queue.peek_due(now));
+            let check_phase_first = match next {
+                Some(crate::timers::Due::Immediate { queued }) => {
+                    !matches!(last_ran, LastRan::Immediate(began) if queued <= began)
+                }
+                Some(crate::timers::Due::Timer { deadline }) => match last_ran {
+                    LastRan::Other => true,
+                    LastRan::Timer(began) => deadline > began,
+                    LastRan::Entry | LastRan::Immediate(_) => false,
+                },
+                _ => false,
+            };
+            if check_phase_first {
+                drain_deferred_ticks(tc)?;
+            }
+        }
         let due = if only_unref_timers_left {
             None
         } else {
@@ -1631,6 +2051,17 @@ pub(crate) fn pump_event_loop(
                 .and_then(|queue| queue.pop_due(now))
         };
         if let Some((callback, extra)) = due {
+            last_ran = match tc
+                .get_slot::<crate::timers::TimerQueue>()
+                .and_then(|queue| queue.popped())
+            {
+                Some(crate::timers::Due::Timer { deadline }) => match last_ran {
+                    LastRan::Timer(began) if deadline <= began => LastRan::Timer(began),
+                    _ => LastRan::Timer(now),
+                },
+                Some(crate::timers::Due::Immediate { queued }) => LastRan::Immediate(queued),
+                _ => LastRan::Other,
+            };
             let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
             let callback = v8::Local::new(tc, &callback);
             let args: Vec<v8::Local<v8::Value>> =
@@ -1668,9 +2099,29 @@ pub(crate) fn pump_event_loop(
             break;
         }
 
+        // A timer of the timers phase that just ran is still due: node
+        // finishes that phase before its poll phase, so the V8 tasks and
+        // the op completion below wait for the next turn -- their tick
+        // drains would otherwise run a batch a handled throw left queued
+        // ahead of that timer (#399 item 8). The phase is bounded: only
+        // timers due when it began belong to it.
+        if let LastRan::Timer(began) = last_ran
+            && progressed
+            && tc
+                .get_slot_mut::<crate::timers::TimerQueue>()
+                .and_then(|queue| queue.peek_due(now))
+                .is_some_and(|next| {
+                    matches!(next, crate::timers::Due::Timer { deadline } if deadline <= began)
+                })
+        {
+            before_exit_emitted = false;
+            continue;
+        }
+
         // V8's foreground tasks (platform.rs) -- node runs them from its
         // loop's poll phase, each followed by a tick + microtask drain.
         if run_platform_tasks(tc)? {
+            last_ran = LastRan::Other;
             progressed = true;
         }
         if entry_promise.is_some_and(|promise| promise.state() == v8::PromiseState::Rejected) {
@@ -1698,10 +2149,21 @@ pub(crate) fn pump_event_loop(
             if let Some(failure) = drain_uncaught(tc) {
                 return Err(failure);
             }
+            last_ran = LastRan::Other;
             progressed = true;
         }
         if progressed {
             before_exit_emitted = false;
+            continue;
+        }
+        // Nothing is due. Ticks a handled throw left queued in a callback
+        // run at the check phase node passes through before it waits again
+        // (#399 item 8: a 1 ms timer's batch drains before a 5 ms timer).
+        // Not after the entry: node's first timers phase comes before that
+        // check phase, and a timer the entry set is due in it by node's
+        // loop clock -- draining here put "after" ahead of a 1 ms timer.
+        if last_ran != LastRan::Entry && has_pending_ticks(tc) {
+            drain_deferred_ticks(tc)?;
             continue;
         }
 
@@ -1939,6 +2401,7 @@ pub(crate) fn unhandled_rejection_failures(
         ) {
             continue;
         }
+        note_fatal_thrown(tc, reason_local, true);
         fatal.push(Diagnostic::new(
             "OAM-RT0004",
             Severity::Error,
@@ -2225,18 +2688,7 @@ fn load_module_graph(
     entry: PathBuf,
     for_require: bool,
 ) -> Result<(), Vec<Diagnostic>> {
-    if tc.get_slot::<GraphLoads>().is_none() {
-        tc.set_slot(GraphLoads::default());
-    }
-    tc.get_slot_mut::<GraphLoads>()
-        .expect("graph loads installed")
-        .0
-        .push(GraphLoad {
-            entry: entry.clone(),
-            for_require,
-            executing_cjs: None,
-            evaluating_memo: None,
-        });
+    push_graph_load(tc, entry.clone(), for_require);
     // The prefetch pool borrows `host`, so it lives inside a thread scope:
     // workers spawn lazily as prefetchable imports are discovered, and the
     // scope joins them on every exit path (the prefetcher's Drop closes the
@@ -2245,10 +2697,32 @@ fn load_module_graph(
         let mut prefetch = GraphPrefetcher::new(scope, host);
         load_module_graph_overlapped(tc, host, entry, &mut prefetch)
     });
-    if let Some(loads) = tc.get_slot_mut::<GraphLoads>() {
+    pop_graph_load(tc);
+    loaded
+}
+
+/// Push a load of `entry` on the [`GraphLoads`] stack.
+fn push_graph_load(scope: &mut v8::PinScope<'_, '_>, entry: PathBuf, for_require: bool) {
+    if scope.get_slot::<GraphLoads>().is_none() {
+        scope.set_slot(GraphLoads::default());
+    }
+    scope
+        .get_slot_mut::<GraphLoads>()
+        .expect("graph loads installed")
+        .0
+        .push(GraphLoad {
+            entry,
+            for_require,
+            executing_cjs: None,
+            evaluating_memo: None,
+        });
+}
+
+/// Pop the innermost load [`push_graph_load`] pushed.
+fn pop_graph_load(scope: &mut v8::PinScope<'_, '_>) {
+    if let Some(loads) = scope.get_slot_mut::<GraphLoads>() {
         loads.0.pop();
     }
-    loaded
 }
 
 /// Set (or, with None, clear) the CommonJS dependency the innermost graph
@@ -2530,10 +3004,11 @@ fn load_module_graph_overlapped(
         if let Some(present) = present {
             // Compiled by an earlier load, whose recorded imports stand. One
             // not yet instantiated may belong to a load still on the stack --
-            // a `require()` or `import()` from a CommonJS dependency it is
-            // running -- whose worklist still holds that module's imports
-            // unloaded; this load needs them now, so it walks on through the
-            // recorded edges. (An instantiated module's graph is complete.)
+            // a `require()` from a CommonJS dependency it is running -- whose
+            // worklist still holds that module's imports unloaded, or to an
+            // `import()` whose promise jobs are still loading its graph; this
+            // load needs them now, so it walks on through the recorded edges.
+            // (An instantiated module's graph is complete.)
             let module = v8::Local::new(tc, &present);
             if module.get_status() == v8::ModuleStatus::Uninstantiated {
                 let recorded = recorded_imports(tc, &path, module);
@@ -2563,224 +3038,12 @@ fn load_module_graph_overlapped(
             continue;
         }
 
-        // Virtual modules (node builtins + oam: runtime modules):
-        // instantiate via the snapshot registry, compile a facade module
-        // under the virtual path. Registry keys are stripped for node:
-        // ("fs") and full for oam: ("oam:test").
-        let builtin = path.to_str().and_then(|s| {
-            if let Some(stripped) = s.strip_prefix("node:") {
-                Some(stripped.to_string())
-            } else if s.starts_with("oam:") {
-                Some(s.to_string())
-            } else {
-                None
-            }
-        });
-        // CJS files take the interop path: execute eagerly through the
-        // require machinery, then compile a generated ESM facade (real
-        // runtime export names) as the module at this path. JSON files
-        // ride the same branch when they arrive via npm resolution.
-        let is_json = path.extension().and_then(|e| e.to_str()) == Some("json");
-        // Set when the pool loaded this path: the worker's cache probe
-        // (key + blob) rides along so nothing is hashed or read twice.
-        let mut prefetched = None;
-        let code = if let Some(name) = builtin {
-            let Some(exports) = crate::cjs::get_builtin(tc, &name) else {
-                return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
-            };
-            crate::cjs::builtin_facade_source(tc, &name, exports)
-        } else if is_json {
-            // JSON modules: parsed once through the CJS json loader (same
-            // cache require() uses), exposed via the facade — default is
-            // the parsed value; top-level keys are ALSO named exports, a
-            // documented superset of Node's default-only shape (TS's
-            // resolveJsonModule idiom expects the named form).
-            let Some(exports) = crate::cjs::load_cjs(tc, &path) else {
-                return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
-            };
-            crate::cjs::facade_source(tc, &path, exports)
-        } else if oam_loader::module_kind(&path) == oam_loader::ModuleKind::Cjs
-            // A typeless file inside node_modules, which oam takes for
-            // CommonJS, that a `require()` is loading as an ES module: the
-            // require() already compiled it as CommonJS and found module
-            // syntax (node's detection), so it is not run as CommonJS here --
-            // that would answer from the placeholder `require.cache` entry
-            // the require() made and build a facade around its empty
-            // exports.
-            && !crate::cjs::is_requiring_esm(tc, &path)
-        {
-            if let Some((value, diagnostic)) = tc
-                .get_slot::<ModuleMap>()
-                .and_then(|map| map.failed_cjs.get(&path))
-                .map(|(value, diagnostic)| (value.clone(), diagnostic.clone()))
-            {
-                // Its body threw in an earlier load: that error again, the
-                // body not run again (see ModuleMap::failed_cjs).
-                tc.set_slot(CaughtDuringLoad(Some(value)));
-                return Err(vec![diagnostic]);
-            }
-            // Recorded for the duration of the body, so a `require()` of an
-            // ES module from it can tell which of this graph's modules node
-            // would have in evaluation (evaluating_in_loads).
-            set_executing_cjs(tc, Some(path.clone()));
-            let loaded = crate::cjs::load_cjs_or_detect(tc, &path);
-            set_executing_cjs(tc, None);
-            // The body may have loaded and evaluated modules (a require() or
-            // import() of its own), which the memo's walk read.
-            invalidate_evaluating_memo(tc, None);
-            match loaded {
-                crate::cjs::CjsLoad::Exports(exports) => {
-                    // A graph a `require()` loads runs inside the requiring
-                    // statement, and node's require never runs ticks or
-                    // promise jobs before it returns -- nor does a load
-                    // nested inside one (an import() from a CommonJS
-                    // dependency of the required graph). Only a top-level or
-                    // import() load outside any require() drains here.
-                    if !inside_require(tc) {
-                        if let Some(failure) = run_ticks_and_microtasks(tc) {
-                            return Err(failure);
-                        }
-                        if let Some(failure) = drain_uncaught(tc) {
-                            return Err(failure);
-                        }
-                    }
-                    crate::cjs::facade_source(tc, &path, exports)
-                }
-                // node decides the file by its syntax and it has module
-                // syntax: an ES module, not run. node's
-                // MODULE_TYPELESS_PACKAGE_JSON warning goes out, then it
-                // loads as the module it is.
-                crate::cjs::CjsLoad::Esm => {
-                    let wkey = module_key(&path).unwrap_or_else(|_| path.clone());
-                    crate::cjs::warn_typeless_package_json(tc, &wkey);
-                    host.load(&path)?
-                }
-                crate::cjs::CjsLoad::Threw => {
-                    let caught = tc.exception().map(|value| v8::Global::new(tc, value));
-                    let diagnostic = catch_to_diagnostic(tc, &path.to_string_lossy());
-                    if let Some(value) = caught
-                        && !tc.has_terminated()
-                    {
-                        tc.get_slot_mut::<ModuleMap>()
-                            .expect("module map installed")
-                            .failed_cjs
-                            .insert(path.clone(), (value, diagnostic.clone()));
-                    }
-                    return Err(vec![diagnostic]);
-                }
-            }
-        } else {
-            match prefetch.take(&path) {
-                // A parked Err surfaces HERE — when the path is popped, not
-                // when the worker hit it — so error content and ordering are
-                // byte-identical to the inline call below.
-                Some(Prefetched::Loaded { code, key, cached }) => {
-                    prefetched = Some((key, cached));
-                    code
-                }
-                Some(Prefetched::Failed(diags)) => return Err(diags),
-                Some(Prefetched::Panicked(payload)) => std::panic::resume_unwind(payload),
-                None => host.load(&path)?,
-            }
+        compile_module(tc, host, &path, Some(&mut *prefetch), true)?;
+        let module = {
+            let map = tc.get_slot::<ModuleMap>().expect("module map installed");
+            let global = map.by_path.get(&path).expect("just compiled").clone();
+            v8::Local::new(tc, &global)
         };
-        let file = path.to_string_lossy().into_owned();
-
-        let source_str = v8::String::new(tc, &code).ok_or_else(|| {
-            rt_diag(
-                "OAM-RT0001",
-                format!("{file}: source too long for V8 string"),
-            )
-        })?;
-        let name: v8::Local<v8::Value> = v8::String::new(tc, &file)
-            .ok_or_else(|| rt_diag("OAM-RT0001", format!("{file}: path too long for V8 string")))?
-            .into();
-        let origin = v8::ScriptOrigin::new(
-            tc, name, 0, 0, false, 0, None, false, false, /* is_module */ true, None,
-        );
-        // V8 bytecode cache (B3b): consume a stored blob for this module
-        // source if present (skips parse + top-level compile), else compile
-        // fresh. Keyed by source + V8 version + oam format, so a foreign blob
-        // is never deserialized here; V8's rejected() guards a stale one. The
-        // key is computed once and kept for the post-evaluate store. `cached`
-        // is held across the compile because CachedData borrows it
-        // (BufferNotOwned). Applies to every module source -- real ESM files
-        // AND the generated builtin/CJS/JSON facades, all of which are
-        // deterministic for a given source string (a different facade is a
-        // different key, hence a miss, never a wrong hit).
-        let (cache_key, cached) = match prefetched {
-            // The pool already derived the key and probed the cache for this
-            // exact source; reuse both.
-            Some((key, cached)) => (key, cached),
-            None => {
-                let key = crate::code_cache::enabled()
-                    .then(|| crate::code_cache::key_for(&code, crate::code_cache::Kind::Module));
-                let cached = key.as_ref().and_then(crate::code_cache::load);
-                (key, cached)
-            }
-        };
-        let consuming = cached.is_some();
-        let seeded = cached.as_ref().is_some_and(|c| c.seeded);
-        let mut source = match cached {
-            Some(ref c) => v8::script_compiler::Source::new_with_cached_data(
-                source_str,
-                Some(&origin),
-                v8::script_compiler::CachedData::new(&c.bytes),
-            ),
-            None => v8::script_compiler::Source::new(source_str, Some(&origin)),
-        };
-        let compile_options = if consuming {
-            v8::script_compiler::CompileOptions::ConsumeCodeCache
-        } else {
-            v8::script_compiler::CompileOptions::NoCompileOptions
-        };
-
-        let Some(module) = v8::script_compiler::compile_module2(
-            tc,
-            &mut source,
-            compile_options,
-            v8::script_compiler::NoCacheReason::NoReason,
-        ) else {
-            return Err(vec![catch_to_diagnostic(tc, &file)]);
-        };
-
-        // On a miss (or if V8 rejected a stale blob) remember the key: the
-        // blob is produced AFTER the graph evaluates (store_pending_code_cache)
-        // so it carries bytecode for the functions evaluation compiled, not
-        // just the top level -- the same produce-after-run shape as the CJS
-        // site. Nothing is serialized here. A rejected SEED is dropped AND
-        // recorded on disk (tombstone) so neither a later load in this
-        // process nor a later run of the same binary is handed the rejected
-        // bytes again. A None key means the cache is off (OAM_CODE_CACHE=0),
-        // which leaves no residual bookkeeping.
-        let rejected = consuming
-            && source
-                .get_cached_data()
-                .map(|cd| cd.rejected())
-                .unwrap_or(true);
-        if rejected
-            && seeded
-            && let Some(cache_key) = &cache_key
-        {
-            crate::code_cache::record_seed_rejection(cache_key);
-        }
-        let refresh_cache = !consuming || rejected;
-
-        let hash = module.get_identity_hash();
-        let global = v8::Global::new(tc, module);
-        {
-            let map = tc
-                .get_slot_mut::<ModuleMap>()
-                .expect("module map installed");
-            map.by_path.insert(path.clone(), global);
-            map.paths_by_hash
-                .entry(hash)
-                .or_default()
-                .push(path.clone());
-            if refresh_cache && let Some(cache_key) = cache_key {
-                map.pending_code_cache.push((path.clone(), cache_key));
-            }
-        }
-
         invalidate_evaluating_memo(tc, Some(&path));
         resolve_imports(tc, host, &path, module, prefetch, &mut work)?;
     }
@@ -2895,6 +3158,252 @@ fn resolve_imports(
     Ok(())
 }
 
+/// Compile the module at `path` (not yet in the module map) and register it:
+/// an ES module from its source, a builtin, JSON or CommonJS file as a facade
+/// over its exports -- which runs a CommonJS file, then and there. Its
+/// requests are left for the caller: the graph loader resolves and loads them
+/// next, and import() links them in its own jobs (js/esm_loader.js).
+/// `prefetch` hands over a source the pool already loaded; `tick_point` runs
+/// the ticks and microtasks a CommonJS body queued, as node does after one.
+fn compile_module(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    host: &dyn ModuleHost,
+    path: &Path,
+    mut prefetch: Option<&mut GraphPrefetcher<'_, '_>>,
+    tick_point: bool,
+) -> Result<(), Vec<Diagnostic>> {
+    // Virtual modules (node builtins + oam: runtime modules):
+    // instantiate via the snapshot registry, compile a facade module
+    // under the virtual path. Registry keys are stripped for node:
+    // ("fs") and full for oam: ("oam:test").
+    let builtin = path.to_str().and_then(|s| {
+        if let Some(stripped) = s.strip_prefix("node:") {
+            Some(stripped.to_string())
+        } else if s.starts_with("oam:") {
+            Some(s.to_string())
+        } else {
+            None
+        }
+    });
+    // CJS files take the interop path: execute eagerly through the
+    // require machinery, then compile a generated ESM facade (real
+    // runtime export names) as the module at this path. JSON files
+    // ride the same branch when they arrive via npm resolution.
+    let is_json = path.extension().and_then(|e| e.to_str()) == Some("json");
+    // Set when the pool loaded this path: the worker's cache probe
+    // (key + blob) rides along so nothing is hashed or read twice.
+    let mut prefetched = None;
+    // Whether the code compiled below is the file's own ES module
+    // source, not a facade over a builtin, JSON or CommonJS module: such
+    // a module's frames are ones node names by file:// URL
+    // (is_es_module_source).
+    let mut es_source = false;
+    let code = if let Some(name) = builtin {
+        let Some(exports) = crate::cjs::get_builtin(tc, &name) else {
+            return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
+        };
+        crate::cjs::builtin_facade_source(tc, &name, exports)
+    } else if is_json {
+        // JSON modules: parsed once through the CJS json loader (same
+        // cache require() uses), exposed via the facade — default is
+        // the parsed value; top-level keys are ALSO named exports, a
+        // documented superset of Node's default-only shape (TS's
+        // resolveJsonModule idiom expects the named form).
+        let Some(exports) = crate::cjs::load_cjs(tc, path) else {
+            return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
+        };
+        crate::cjs::facade_source(tc, path, exports)
+    } else if oam_loader::module_kind(path) == oam_loader::ModuleKind::Cjs
+        // A typeless file inside node_modules, which oam takes for
+        // CommonJS, that a `require()` is loading as an ES module: the
+        // require() already compiled it as CommonJS and found module
+        // syntax (node's detection), so it is not run as CommonJS here --
+        // that would answer from the placeholder `require.cache` entry
+        // the require() made and build a facade around its empty
+        // exports.
+        && !crate::cjs::is_requiring_esm(tc, path)
+    {
+        if let Some((value, diagnostic)) = tc
+            .get_slot::<ModuleMap>()
+            .and_then(|map| map.failed_cjs.get(path))
+            .map(|(value, diagnostic)| (value.clone(), diagnostic.clone()))
+        {
+            // Its body threw in an earlier load: that error again, the
+            // body not run again (see ModuleMap::failed_cjs).
+            tc.set_slot(CaughtDuringLoad(Some(value)));
+            return Err(vec![diagnostic]);
+        }
+        // Recorded for the duration of the body, so a `require()` of an
+        // ES module from it can tell which of this graph's modules node
+        // would have in evaluation (evaluating_in_loads).
+        set_executing_cjs(tc, Some(path.to_path_buf()));
+        let loaded = crate::cjs::load_cjs_or_detect(tc, path);
+        set_executing_cjs(tc, None);
+        // The body may have loaded and evaluated modules (a require() or
+        // import() of its own), which the memo's walk read.
+        invalidate_evaluating_memo(tc, None);
+        match loaded {
+            crate::cjs::CjsLoad::Exports(exports) => {
+                // A tick point after the body, as after any CommonJS
+                // module node runs -- but not when import() loads it:
+                // that runs in a promise job, inside a microtask drain,
+                // where node runs no tick (#397). Nor inside a graph a
+                // `require()` loads: that runs inside the requiring
+                // statement, and node's require never runs ticks or
+                // promise jobs before it returns -- nor does a load
+                // nested inside one.
+                if tick_point && !inside_require(tc) {
+                    if let Some(failure) = run_ticks_and_microtasks(tc) {
+                        return Err(failure);
+                    }
+                    if let Some(failure) = drain_uncaught(tc) {
+                        return Err(failure);
+                    }
+                }
+                crate::cjs::facade_source(tc, path, exports)
+            }
+            // node decides the file by its syntax and it has module
+            // syntax: an ES module, not run. node's
+            // MODULE_TYPELESS_PACKAGE_JSON warning goes out, then it
+            // loads as the module it is.
+            crate::cjs::CjsLoad::Esm => {
+                let wkey = module_key(path).unwrap_or_else(|_| path.to_path_buf());
+                crate::cjs::warn_typeless_package_json(tc, &wkey);
+                es_source = true;
+                host.load(path)?
+            }
+            crate::cjs::CjsLoad::Threw => {
+                let caught = tc.exception().map(|value| v8::Global::new(tc, value));
+                let diagnostic = catch_to_diagnostic(tc, &path.to_string_lossy());
+                if let Some(value) = caught
+                    && !tc.has_terminated()
+                {
+                    tc.get_slot_mut::<ModuleMap>()
+                        .expect("module map installed")
+                        .failed_cjs
+                        .insert(path.to_path_buf(), (value, diagnostic.clone()));
+                }
+                return Err(vec![diagnostic]);
+            }
+        }
+    } else {
+        es_source = true;
+        match prefetch.as_mut().and_then(|prefetch| prefetch.take(path)) {
+            // A parked Err surfaces HERE — when the path is popped, not
+            // when the worker hit it — so error content and ordering are
+            // byte-identical to the inline call below.
+            Some(Prefetched::Loaded { code, key, cached }) => {
+                prefetched = Some((key, cached));
+                code
+            }
+            Some(Prefetched::Failed(diags)) => return Err(diags),
+            Some(Prefetched::Panicked(payload)) => std::panic::resume_unwind(payload),
+            None => host.load(path)?,
+        }
+    };
+    let file = path.to_string_lossy().into_owned();
+
+    let source_str = v8::String::new(tc, &code).ok_or_else(|| {
+        rt_diag(
+            "OAM-RT0001",
+            format!("{file}: source too long for V8 string"),
+        )
+    })?;
+    let name: v8::Local<v8::Value> = v8::String::new(tc, &file)
+        .ok_or_else(|| rt_diag("OAM-RT0001", format!("{file}: path too long for V8 string")))?
+        .into();
+    let origin = v8::ScriptOrigin::new(
+        tc, name, 0, 0, false, 0, None, false, false, /* is_module */ true, None,
+    );
+    // V8 bytecode cache (B3b): consume a stored blob for this module
+    // source if present (skips parse + top-level compile), else compile
+    // fresh. Keyed by source + V8 version + oam format, so a foreign blob
+    // is never deserialized here; V8's rejected() guards a stale one. The
+    // key is computed once and kept for the post-evaluate store. `cached`
+    // is held across the compile because CachedData borrows it
+    // (BufferNotOwned). Applies to every module source -- real ESM files
+    // AND the generated builtin/CJS/JSON facades, all of which are
+    // deterministic for a given source string (a different facade is a
+    // different key, hence a miss, never a wrong hit).
+    let (cache_key, cached) = match prefetched {
+        // The pool already derived the key and probed the cache for this
+        // exact source; reuse both.
+        Some((key, cached)) => (key, cached),
+        None => {
+            let key = crate::code_cache::enabled()
+                .then(|| crate::code_cache::key_for(&code, crate::code_cache::Kind::Module));
+            let cached = key.as_ref().and_then(crate::code_cache::load);
+            (key, cached)
+        }
+    };
+    let consuming = cached.is_some();
+    let seeded = cached.as_ref().is_some_and(|c| c.seeded);
+    let mut source = match cached {
+        Some(ref c) => v8::script_compiler::Source::new_with_cached_data(
+            source_str,
+            Some(&origin),
+            v8::script_compiler::CachedData::new(&c.bytes),
+        ),
+        None => v8::script_compiler::Source::new(source_str, Some(&origin)),
+    };
+    let compile_options = if consuming {
+        v8::script_compiler::CompileOptions::ConsumeCodeCache
+    } else {
+        v8::script_compiler::CompileOptions::NoCompileOptions
+    };
+
+    let Some(module) = v8::script_compiler::compile_module2(
+        tc,
+        &mut source,
+        compile_options,
+        v8::script_compiler::NoCacheReason::NoReason,
+    ) else {
+        return Err(vec![catch_to_diagnostic(tc, &file)]);
+    };
+
+    // On a miss (or if V8 rejected a stale blob) remember the key: the
+    // blob is produced AFTER the graph evaluates (store_pending_code_cache)
+    // so it carries bytecode for the functions evaluation compiled, not
+    // just the top level -- the same produce-after-run shape as the CJS
+    // site. Nothing is serialized here. A rejected SEED is dropped AND
+    // recorded on disk (tombstone) so neither a later load in this
+    // process nor a later run of the same binary is handed the rejected
+    // bytes again. A None key means the cache is off (OAM_CODE_CACHE=0),
+    // which leaves no residual bookkeeping.
+    let rejected = consuming
+        && source
+            .get_cached_data()
+            .map(|cd| cd.rejected())
+            .unwrap_or(true);
+    if rejected
+        && seeded
+        && let Some(cache_key) = &cache_key
+    {
+        crate::code_cache::record_seed_rejection(cache_key);
+    }
+    let refresh_cache = !consuming || rejected;
+
+    let hash = module.get_identity_hash();
+    let global = v8::Global::new(tc, module);
+    {
+        let map = tc
+            .get_slot_mut::<ModuleMap>()
+            .expect("module map installed");
+        map.by_path.insert(path.to_path_buf(), global);
+        if es_source {
+            map.es_sources.insert(file.clone());
+        }
+        map.paths_by_hash
+            .entry(hash)
+            .or_default()
+            .push(path.to_path_buf());
+        if refresh_cache && let Some(cache_key) = cache_key {
+            map.pending_code_cache.push((path.to_path_buf(), cache_key));
+        }
+    }
+    Ok(())
+}
+
 /// V8 resolve callback: pure lookup of preload-recorded edges. Zero capture.
 /// Identity-hash collisions are disambiguated by comparing module identity.
 /// On a lookup miss (should be unreachable) we throw a named error so the
@@ -2948,454 +3457,484 @@ fn resolve_module_callback<'s>(
     }
 }
 
-/// Outcome of loading a dynamically-imported module, carried out of the child
-/// TryCatch scope as scope-independent Globals so the parent scope can settle
-/// the import promise after the child scope drops.
-enum DynResult {
-    /// Module evaluated cleanly; carries its namespace object.
-    Namespace(v8::Global<v8::Value>),
-    /// Module (or its graph) threw during evaluation; carries the reason value.
-    Rejected(v8::Global<v8::Value>),
-    /// oam-side failure (resolve/load/instantiate, or an unsupported shape);
-    /// the message becomes an Error the import promise rejects with.
-    Error(String),
-    /// The import target is in kEvaluating (on our call stack). The caller
-    /// (dynamic_import_callback) stores the resolver in PendingCycleImports so
-    /// it can be resolved once the outer module finishes its synchronous body
-    /// and transitions to kEvaluatingAsync.
-    Deferred,
-    /// The imported module has top-level await that is still pending because it
-    /// is waiting for a cycle import (stored in PendingCycleImports). The outer
-    /// dyn_import_load will flush the cycle and settle this module's resolver.
-    /// Carries the module's resolved path for later lookup.
-    EvalAsync(PathBuf),
+// ---------------------------------------------------------------- import()
+//
+// import() runs node's loader chain (js/esm_loader.js): the hook below calls
+// it and returns its promise, and every later step -- loading, linking,
+// instantiating, evaluating -- runs in the promise jobs that chain queues, in
+// the importer's microtask drain, through the ops here (#397). Nothing in
+// this section runs a checkpoint or a tick: the importer's frame is on the
+// stack during the hook, and the jobs run inside a drain.
+
+/// The import() entry of js/esm_loader.js, taken off the global at runtime
+/// construction ([`install_dynamic_import`]) so user code cannot reach or
+/// replace it.
+struct DynamicImportHook(v8::Global<v8::Function>);
+
+/// A distinct number per module map, so js/esm_loader.js drops its job
+/// cache when a run starts a new map.
+static MODULE_MAP_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn next_module_map_generation() -> u32 {
+    MODULE_MAP_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Deferred import resolvers for modules currently in kEvaluating status.
-/// Flushed by flush_cycle_imports once the target reaches kEvaluatingAsync.
-#[derive(Default)]
-struct PendingCycleImports(Vec<(PathBuf, v8::Global<v8::PromiseResolver>)>);
+/// Run `f` with the parked [`ModuleHost`], or return None when there is none
+/// (the REPL, a timer the REPL runs, a test body). The reference lives only
+/// for the call: the slot is read again on every op and every `require()` of
+/// an ES module, never kept.
+fn with_active_host<R>(
+    scope: &mut v8::PinScope<'_, '_>,
+    f: impl FnOnce(&mut v8::PinScope<'_, '_>, &dyn ModuleHost) -> R,
+) -> Option<R> {
+    let host_ptr = scope.get_slot::<ActiveHost>().and_then(|h| h.0)?;
+    // SAFETY: a Some pointer is parked only for the length of an execute_*
+    // call that borrows the host, and is cleared before any JS runs outside
+    // one (see ActiveHost). This op is running JS-called code now, so the
+    // execute_* call that parked the pointer is on the stack, and the host it
+    // borrows is alive; the reference does not escape `f`.
+    let host: &dyn ModuleHost = unsafe { &*host_ptr };
+    Some(f(scope, host))
+}
 
-/// Deferred import resolvers for modules that have pending TLA.
-/// Flushed by flush_tla_imports once the module reaches kEvaluated/kErrored.
-#[derive(Default)]
-struct PendingTLAImports(Vec<(PathBuf, v8::Global<v8::PromiseResolver>)>);
+fn throw_dyn_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+    let text = v8::String::new(scope, message).unwrap_or_else(|| v8::String::empty(scope));
+    let exception = v8::Exception::error(scope, text);
+    scope.throw_exception(exception);
+}
 
-/// Parse the [key, value, source_offset] triples for the one supported import
-/// attribute (type=json). Returns Ok(true) when type:"json" is set, Ok(false)
-/// when no relevant attributes, Err(msg) when an unsupported type value is
-/// declared. Mirrors the static-path validation in load_module_graph so dynamic
-/// import has the same semantics.
-fn dyn_parse_import_attributes(
+fn not_wired_up(spec: &str) -> String {
+    format!(
+        "oam: dynamic import('{spec}') is not wired up on this entry path \
+         (REPL, timer, op callback, or test body)"
+    )
+}
+
+/// The module at `path` in this run's module map.
+fn dyn_module<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    path: &Path,
+) -> Option<v8::Local<'s, v8::Module>> {
+    let global = scope.get_slot::<ModuleMap>()?.by_path.get(path)?.clone();
+    Some(v8::Local::new(scope, &global))
+}
+
+fn arg_path(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+) -> PathBuf {
+    PathBuf::from(args.get(index).to_rust_string_lossy(scope))
+}
+
+/// The "type" import attribute of a module request or an import() call
+/// (`[key, value, source offset]` triples for a request, `[key, value]` pairs
+/// for a call), or None. Other keys are ignored, as the static path does.
+fn import_type(
     scope: &mut v8::PinScope<'_, '_>,
     attributes: v8::Local<'_, v8::FixedArray>,
-    spec: &str,
-) -> Result<bool, String> {
-    let mut typed_json = false;
+    stride: usize,
+) -> Option<String> {
     let mut index = 0;
     while index + 1 < attributes.length() {
-        let key = attributes
-            .get(scope, index)
-            .and_then(|d| v8::Local::<v8::Value>::try_from(d).ok())
-            .and_then(|v| v.to_string(scope))
-            .map(|s| s.to_rust_string_lossy(scope))
-            .unwrap_or_default();
-        let value = attributes
-            .get(scope, index + 1)
-            .and_then(|d| v8::Local::<v8::Value>::try_from(d).ok())
-            .and_then(|v| v.to_string(scope))
-            .map(|s| s.to_rust_string_lossy(scope))
-            .unwrap_or_default();
-        if key == "type" {
-            if value == "json" {
-                typed_json = true;
-            } else {
-                return Err(format!(
-                    "oam: dynamic import('{spec}') declares type \"{value}\" \
-                     — the only supported import-attribute type is \"json\""
-                ));
-            }
+        let text = |scope: &mut v8::PinScope<'_, '_>, at: usize| {
+            attributes
+                .get(scope, at)
+                .and_then(|d| v8::Local::<v8::Value>::try_from(d).ok())
+                .and_then(|v| v.to_string(scope))
+                .map(|s| s.to_rust_string_lossy(scope))
+                .unwrap_or_default()
+        };
+        if text(scope, index) == "type" {
+            return Some(text(scope, index + 1));
         }
-        index += 3;
+        index += stride;
     }
-    Ok(typed_json)
+    None
 }
 
-/// Reject `resolver` with a freshly-built Error carrying `msg`. Defense in
-/// depth: if v8::String::new fails (message exceeds v8::String's max length),
-/// fall back to an Error with an empty string rather than silently leaving the
-/// resolver unsettled (which would hang the caller's awaited promise).
-fn reject_with_message(
+/// `ops.generation()`: this run's module map.
+fn op_dyn_generation(
     scope: &mut v8::PinScope<'_, '_>,
-    resolver: &v8::Local<'_, v8::PromiseResolver>,
-    msg: &str,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let s = v8::String::new(scope, msg).unwrap_or_else(|| v8::String::empty(scope));
-    let exception = v8::Exception::error(scope, s);
-    resolver.reject(scope, exception);
+    let generation = scope.get_slot::<ModuleMap>().map_or(0, |m| m.generation);
+    rv.set(v8::Integer::new_from_unsigned(scope, generation).into());
 }
 
-/// Flush PendingCycleImports: resolve any whose target is now kEvaluatingAsync
-/// or kEvaluated. Skips (puts back) items whose target is still kEvaluating
-/// (we are still on its call stack). Returns (flushed, skipped) counts.
-fn flush_cycle_imports(
-    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
-) -> (usize, usize) {
-    let pending = match tc.get_slot_mut::<PendingCycleImports>() {
-        Some(p) => std::mem::take(&mut p.0),
-        None => return (0, 0),
-    };
-    let mut flushed = 0;
-    let mut skipped: Vec<(PathBuf, v8::Global<v8::PromiseResolver>)> = Vec::new();
-
-    for (path, resolver_global) in pending {
-        // Clone the module Global while holding an immutable slot borrow.
-        let module_global: Option<v8::Global<v8::Module>> = {
-            tc.get_slot::<ModuleMap>()
-                .and_then(|m| m.by_path.get(&path))
-                .cloned()
-        };
-        let resolver = v8::Local::new(tc, &resolver_global);
-        match module_global {
-            None => {
-                let s = v8::String::new(tc, "oam: internal: cycle module not in map")
-                    .unwrap_or_else(|| v8::String::empty(tc));
-                let e = v8::Exception::error(tc, s);
-                resolver.reject(tc, e);
-                flushed += 1;
-            }
-            Some(mg) => {
-                let module = v8::Local::new(tc, &mg);
-                let status = module.get_status();
-                match status {
-                    v8::ModuleStatus::Evaluated => {
-                        let ns = module.get_module_namespace();
-                        let ns_val: v8::Local<v8::Value> = ns;
-                        resolver.resolve(tc, ns_val);
-                        flushed += 1;
-                    }
-                    v8::ModuleStatus::Errored => {
-                        let exc = module.get_exception();
-                        resolver.reject(tc, exc);
-                        flushed += 1;
-                    }
-                    v8::ModuleStatus::Evaluating => {
-                        // Still evaluating (sync body or TLA) -- defer.
-                        skipped.push((path, resolver_global));
-                    }
-                    _ => {
-                        let s = v8::String::new(
-                            tc,
-                            &format!("oam: cycle import: unexpected module status {status:?}"),
-                        )
-                        .unwrap_or_else(|| v8::String::empty(tc));
-                        let e = v8::Exception::error(tc, s);
-                        resolver.reject(tc, e);
-                        flushed += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    // Put back any items that couldn't be flushed yet.
-    let skipped_len = skipped.len();
-    if !skipped.is_empty()
-        && let Some(p) = tc.get_slot_mut::<PendingCycleImports>()
-    {
-        p.0.extend(skipped);
-    }
-    (flushed, skipped_len)
-}
-
-/// Flush PendingTLAImports: resolve any whose module has reached kEvaluated
-/// or kErrored. Skips (puts back) modules still in kEvaluatingAsync.
-/// Returns number of items flushed.
-fn flush_tla_imports(
-    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
-) -> usize {
-    let pending = match tc.get_slot_mut::<PendingTLAImports>() {
-        Some(p) => std::mem::take(&mut p.0),
-        None => return 0,
-    };
-    let mut flushed = 0;
-    let mut still_pending: Vec<(PathBuf, v8::Global<v8::PromiseResolver>)> = Vec::new();
-
-    for (path, resolver_global) in pending {
-        let module_global: Option<v8::Global<v8::Module>> = {
-            tc.get_slot::<ModuleMap>()
-                .and_then(|m| m.by_path.get(&path))
-                .cloned()
-        };
-        let resolver = v8::Local::new(tc, &resolver_global);
-        match module_global {
-            None => {
-                let s = v8::String::new(tc, "oam: internal: TLA module not in map")
-                    .unwrap_or_else(|| v8::String::empty(tc));
-                let e = v8::Exception::error(tc, s);
-                resolver.reject(tc, e);
-                flushed += 1;
-            }
-            Some(mg) => {
-                let module = v8::Local::new(tc, &mg);
-                let status = module.get_status();
-                match status {
-                    v8::ModuleStatus::Evaluated => {
-                        let ns = module.get_module_namespace();
-                        let ns_val: v8::Local<v8::Value> = ns;
-                        resolver.resolve(tc, ns_val);
-                        flushed += 1;
-                    }
-                    v8::ModuleStatus::Errored => {
-                        let exc = module.get_exception();
-                        resolver.reject(tc, exc);
-                        flushed += 1;
-                    }
-                    _ => {
-                        // Still evaluating — keep in the queue.
-                        still_pending.push((path, resolver_global));
-                    }
-                }
-            }
-        }
-    }
-
-    if !still_pending.is_empty()
-        && let Some(p) = tc.get_slot_mut::<PendingTLAImports>()
-    {
-        p.0.extend(still_pending);
-    }
-    flushed
-}
-
-/// Load + instantiate + evaluate a dynamically-imported module through the same
-/// machinery as the static graph, under the caller's TryCatch scope. Returns a
-/// DynResult of Globals so the namespace/reason survives the scope drop.
-fn dyn_import_load(
-    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
-    host: &dyn ModuleHost,
-    resolved: PathBuf,
-    spec: &str,
-) -> DynResult {
-    // Pull the rest of the graph in (idempotent: already-loaded paths skip).
-    tc.set_slot(CaughtDuringLoad(None));
-    if let Err(diags) = load_module_graph(tc, host, resolved.clone(), false) {
-        store_pending_code_cache(tc);
-        let caught = tc
-            .get_slot_mut::<CaughtDuringLoad>()
-            .and_then(|c| c.0.take());
-        // The load caught a JS value -- a CommonJS dependency's throw, a
-        // syntax error -- which is what node's import() rejects with. A
-        // CommonJS dependency's throw is replayed on a later load
-        // (ModuleMap::failed_cjs), so a second import() rejects with the
-        // same object, as node's does.
-        if let Some(value) = caught
-            && diags.first().is_some_and(|d| d.code == "OAM-RT0001")
-        {
-            return DynResult::Rejected(value);
-        }
-        let msg = if diags.is_empty() {
-            format!("failed to load '{spec}'")
-        } else {
-            diags
-                .iter()
+/// `ops.resolve(specifier, referrer)`: the module's key in the module map (a
+/// path, or `node:` / `oam:` for a builtin), or a throw. Inside the import()
+/// call itself, as node resolves.
+fn op_dyn_resolve(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let spec = args.get(0).to_rust_string_lossy(scope);
+    let referrer = arg_path(scope, &args, 1);
+    let resolved = with_active_host(scope, |_, host| host.resolve(&spec, &referrer));
+    let resolved = match resolved {
+        None => return throw_dyn_error(scope, &not_wired_up(&spec)),
+        Some(Err(diags)) => {
+            let msg = diags
+                .first()
                 .map(|d| format!("{}: {}", d.code, d.message))
-                .collect::<Vec<_>>()
-                .join("; ")
-        };
-        return DynResult::Error(format!("oam: dynamic import('{spec}'): {msg}"));
-    }
-
-    let module = {
-        let map = tc.get_slot::<ModuleMap>().expect("module map installed");
-        match map.by_path.get(&resolved) {
-            Some(global) => v8::Local::new(tc, global),
-            None => {
-                return DynResult::Error(format!(
-                    "oam internal: dynamic import('{spec}') loaded but not registered at {}",
-                    resolved.display()
-                ));
+                .unwrap_or_else(|| format!("cannot resolve '{spec}'"));
+            return throw_dyn_error(scope, &format!("oam: dynamic import('{spec}'): {msg}"));
+        }
+        Some(Ok(path)) => path,
+    };
+    // Virtual builtin paths bypass filesystem normalization (module_key /
+    // absolute() would anchor "node:fs" at cwd); everything else is keyed.
+    let key = if resolved
+        .to_str()
+        .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"))
+    {
+        resolved
+    } else {
+        match module_key(&resolved) {
+            Ok(key) => key,
+            Err(e) => {
+                return throw_dyn_error(
+                    scope,
+                    &format!(
+                        "oam: dynamic import('{spec}'): bad resolved path {}: {e}",
+                        resolved.display()
+                    ),
+                );
             }
         }
     };
+    let text =
+        v8::String::new(scope, &key.to_string_lossy()).unwrap_or_else(|| v8::String::empty(scope));
+    rv.set(text.into());
+}
 
-    // Handle cycle cases BEFORE calling evaluate() or get_module_namespace(),
-    // both of which CHECK-fail on kEvaluating in all V8 builds:
-    //
-    // kEvaluatingAsync -- the module's TLA is in progress. evaluate() on this
-    //   state returns the existing (pending) TLA promise, and get_module_namespace()
-    //   is safe. Return the partial namespace now: bindings initialized before
-    //   the TLA suspended are live; unset ones are TDZ. This is the correct
-    //   ES2022 semantics for a TLA cycle (A imports B imports A-while-A's-TLA
-    //   is pending).
-    //
-    // kEvaluating -- the module's synchronous body is currently executing
-    //   (we are on its call stack). Calling evaluate() again triggers a V8
-    //   CHECK failure. get_module_namespace() is also forbidden for this
-    //   status. Report as a hard-sync cycle error rather than crashing.
+/// `ops.checkType(path, type, specifier)`: throw unless the import()'s
+/// "type" attribute fits the module at `path` -- none, or "json" for a .json
+/// file. node validates in its load, which every import() whose (path, type)
+/// pair has no module job yet reaches, so the loader calls this on each such
+/// miss: a module already loaded under another type is checked too.
+fn op_dyn_check_type(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let path = arg_path(scope, &args, 0);
+    let declared = args.get(1);
+    if declared.is_undefined() {
+        return;
+    }
+    let value = declared.to_rust_string_lossy(scope);
+    let spec = args.get(2).to_rust_string_lossy(scope);
+    if value != "json" {
+        return throw_dyn_error(
+            scope,
+            &format!(
+                "oam: dynamic import('{spec}') declares type \"{value}\" \
+                 — the only supported import-attribute type is \"json\""
+            ),
+        );
+    }
+    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        throw_dyn_error(
+            scope,
+            &format!(
+                "oam: dynamic import('{spec}') is imported with type \"json\" \
+                 but resolves to {} (only .json files load as JSON modules today)",
+                path.display()
+            ),
+        );
+    }
+}
+
+/// `ops.load(path, specifier)`: load and translate one module into the
+/// module map (node's load + translate); `ops.checkType` has run first. A
+/// CommonJS file runs here (see compile_module). Throws on failure.
+fn op_dyn_load(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let path = arg_path(scope, &args, 0);
+    let spec = args.get(1).to_rust_string_lossy(scope);
+    // Already compiled: by an earlier load, or by a require() whose graph
+    // then failed, which left it uninstantiated; its job links it afresh.
+    if dyn_module(scope, &path).is_some() {
+        return;
+    }
+    let loaded = with_active_host(scope, |scope, host| {
+        v8::tc_scope!(let tc, scope);
+        // A module that fails to load here only rejects the import()
+        // promise, so the throw compile_module noted as the run's fatal
+        // error is not one (#399 review): a worker that catches it must not
+        // later hand its parent this error in place of the one that ends
+        // its run.
+        let noted_before = tc
+            .get_slot::<FatalThrown>()
+            .is_some_and(|noted| noted.0.is_some());
+        tc.set_slot(CaughtDuringLoad(None));
+        // A load of its own on the graph-load stack, so a CommonJS body this
+        // runs is recorded against it (set_executing_cjs), not against a
+        // load further out, and a require() inside that body walks no graph
+        // this load does not have. Not one a require() started: import()
+        // jobs never run inside one.
+        push_graph_load(tc, path.clone(), false);
+        let loaded = compile_module(tc, host, &path, None, false);
+        pop_graph_load(tc);
+        match loaded {
+            Ok(()) => Ok(()),
+            Err(diags) => {
+                if !noted_before && let Some(noted) = tc.get_slot_mut::<FatalThrown>() {
+                    noted.0 = None;
+                }
+                store_pending_code_cache(tc);
+                let caught = tc
+                    .get_slot_mut::<CaughtDuringLoad>()
+                    .and_then(|c| c.0.take());
+                Err((diags, caught))
+            }
+        }
+    });
+    match loaded {
+        None => throw_dyn_error(scope, &not_wired_up(&spec)),
+        // The load caught a JS value -- a CommonJS body's throw, a syntax
+        // error -- which is what node's import() rejects with. A CommonJS
+        // body's throw is replayed on a later load (ModuleMap::failed_cjs),
+        // so a second import() rejects with the same object, as node's does.
+        Some(Err((diags, Some(caught))))
+            if diags.first().is_some_and(|d| d.code == "OAM-RT0001") =>
+        {
+            let caught = v8::Local::new(scope, &caught);
+            scope.throw_exception(caught);
+        }
+        Some(Err((diags, _))) => {
+            let msg = if diags.is_empty() {
+                format!("failed to load '{spec}'")
+            } else {
+                diags
+                    .iter()
+                    .map(|d| format!("{}: {}", d.code, d.message))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            throw_dyn_error(scope, &format!("oam: dynamic import('{spec}'): {msg}"));
+        }
+        Some(Ok(())) => {}
+    }
+}
+
+/// `ops.requests(path)`: the module's requests, `[specifier, type, ...]`
+/// (type undefined when the request declares none).
+fn op_dyn_requests(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let path = arg_path(scope, &args, 0);
+    let Some(module) = dyn_module(scope, &path) else {
+        return throw_dyn_error(
+            scope,
+            &format!("oam internal: {} is not loaded", path.display()),
+        );
+    };
+    let requests = module.get_module_requests();
+    let mut out: Vec<v8::Local<v8::Value>> = Vec::new();
+    for i in 0..requests.length() {
+        let Some(request) = requests
+            .get(scope, i)
+            .and_then(|r| v8::Local::<v8::ModuleRequest>::try_from(r).ok())
+        else {
+            continue;
+        };
+        out.push(request.get_specifier().into());
+        let declared = import_type(scope, request.get_import_attributes(), 3);
+        out.push(match declared {
+            Some(value) => v8::String::new(scope, &value)
+                .unwrap_or_else(|| v8::String::empty(scope))
+                .into(),
+            None => v8::undefined(scope).into(),
+        });
+    }
+    rv.set(v8::Array::new_with_elements(scope, &out).into());
+}
+
+/// The strings of a JS array argument.
+fn arg_strings(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+) -> Vec<String> {
+    let Ok(array) = v8::Local::<v8::Array>::try_from(args.get(index)) else {
+        return Vec::new();
+    };
+    (0..array.length())
+        .filter_map(|i| array.get_index(scope, i))
+        .map(|v| v.to_rust_string_lossy(scope))
+        .collect()
+}
+
+/// `ops.link(path, specifiers, paths)`: record which module each request
+/// names, for the resolve callback instantiation uses (node's
+/// `module.link(modules)`).
+fn op_dyn_link(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let path = arg_path(scope, &args, 0);
+    let specifiers = arg_strings(scope, &args, 1);
+    let targets = arg_strings(scope, &args, 2);
+    if let Some(map) = scope.get_slot_mut::<ModuleMap>() {
+        for (specifier, target) in specifiers.into_iter().zip(targets) {
+            map.edges
+                .insert((path.clone(), specifier), PathBuf::from(target));
+        }
+    }
+}
+
+/// Throw (again) on `scope` what a TryCatch caught, or `fallback`.
+fn rethrow_caught(
+    scope: &mut v8::PinScope<'_, '_>,
+    caught: Option<v8::Global<v8::Value>>,
+    fallback: &str,
+) {
+    match caught {
+        Some(exception) => {
+            let exception = v8::Local::new(scope, &exception);
+            scope.throw_exception(exception);
+        }
+        None => throw_dyn_error(scope, fallback),
+    }
+}
+
+/// `ops.instantiate(path)`: link the graph in V8; throws its SyntaxError.
+fn op_dyn_instantiate(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let path = arg_path(scope, &args, 0);
+    let Some(module) = dyn_module(scope, &path) else {
+        return throw_dyn_error(
+            scope,
+            &format!("oam internal: {} is not loaded", path.display()),
+        );
+    };
+    // Instantiate only from a fresh module; one already linked (the static
+    // graph's, or this loader's from an earlier import) is left as it is.
+    if module.get_status() != v8::ModuleStatus::Uninstantiated {
+        return;
+    }
+    let failed = {
+        v8::tc_scope!(let tc, scope);
+        if module.instantiate_module(tc, resolve_module_callback) == Some(true) {
+            None
+        } else {
+            let caught = tc.exception().map(|e| v8::Global::new(tc, e));
+            store_pending_code_cache(tc);
+            Some(caught)
+        }
+    };
+    if let Some(caught) = failed {
+        rethrow_caught(
+            scope,
+            caught,
+            &format!("oam: import of {}: instantiation failed", path.display()),
+        );
+    }
+}
+
+/// `ops.evaluate(path)`: V8's evaluation promise for the module (its
+/// top-level await, already settled for a synchronous graph).
+fn op_dyn_evaluate(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let path = arg_path(scope, &args, 0);
+    let Some(module) = dyn_module(scope, &path) else {
+        return throw_dyn_error(
+            scope,
+            &format!("oam internal: {} is not loaded", path.display()),
+        );
+    };
     match module.get_status() {
-        v8::ModuleStatus::Evaluated => {
-            // Already complete (including any TLA): return the namespace immediately.
-            return DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()));
+        // V8 CHECK-fails evaluating a module before it is linked, or while
+        // its own body is running. Neither reaches here: a job runs between
+        // module bodies, never inside one, and run() instantiates first.
+        v8::ModuleStatus::Uninstantiated | v8::ModuleStatus::Instantiating => {
+            return throw_dyn_error(
+                scope,
+                &format!(
+                    "oam internal: import of {}: module is not linked",
+                    path.display()
+                ),
+            );
         }
         v8::ModuleStatus::Evaluating => {
-            // Either the sync body is on our call stack, or TLA is in progress.
-            // In both cases defer and let flush_cycle_imports retry once the outer
-            // evaluate() returns and the module reaches Evaluated.
-            return DynResult::Deferred;
+            return throw_dyn_error(
+                scope,
+                &format!(
+                    "oam internal: import of {}: module is still evaluating",
+                    path.display()
+                ),
+            );
         }
         _ => {}
     }
-
-    // Instantiate only from a fresh module; a statically-loaded one is already
-    // (at least) Instantiated and re-instantiating would error.
-    if module.get_status() == v8::ModuleStatus::Uninstantiated
-        && module.instantiate_module(tc, resolve_module_callback) != Some(true)
-    {
-        let caught = dyn_caught_value(tc);
-        store_pending_code_cache(tc);
-        return match caught {
-            Some(v) => DynResult::Rejected(v),
-            None => DynResult::Error(format!(
-                "oam: dynamic import('{spec}'): instantiation failed"
-            )),
+    let evaluated = {
+        v8::tc_scope!(let tc, scope);
+        let value = module.evaluate(tc);
+        // Bytecode for the freshly compiled subgraph is produced right after
+        // evaluate, on both arms (see store_pending_code_cache); the caught
+        // value is read first so the TryCatch is consulted before any further
+        // V8 call.
+        let outcome = match value {
+            Some(value) => Ok(v8::Global::new(tc, value)),
+            None => Err(tc.exception().map(|e| v8::Global::new(tc, e))),
         };
-    }
-    if module.get_status() == v8::ModuleStatus::Errored {
         store_pending_code_cache(tc);
-        return DynResult::Rejected(v8::Global::new(tc, module.get_exception()));
-    }
-    // Cycle: the module is currently being evaluated (cycle from itself or a
-    // mutual dynamic-import dependency). Per the import() spec / Node parity,
-    // the dynamic-import promise resolves with the module's PARTIAL namespace,
-    // not "TLA not supported yet" -- the latter is what the post-evaluate
-    // Pending branch below would otherwise report. get_module_namespace() is
-    // safe here: status is >= Instantiated (Evaluating).
-    if module.get_status() == v8::ModuleStatus::Evaluating {
-        return DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()));
-    }
-
-    // Bytecode for the freshly compiled subgraph is produced right after
-    // evaluate, on both arms (see store_pending_code_cache); the caught value
-    // is read first so the TryCatch is consulted before any further V8 call.
-    let Some(value) = module.evaluate(tc) else {
-        let caught = dyn_caught_value(tc);
-        store_pending_code_cache(tc);
-        return match caught {
-            Some(v) => DynResult::Rejected(v),
-            None => DynResult::Error(format!("oam: dynamic import('{spec}'): evaluation failed")),
-        };
+        outcome
     };
-    store_pending_code_cache(tc);
-    // Bare checkpoint, NO tick drain: this hook fires synchronously with
-    // the importer's JS frame still on the stack, and Node never runs
-    // process.nextTick callbacks mid-statement. Ticks scheduled by the
-    // imported module wait for the caller's next real tick point. (The
-    // mid-hook microtask flush itself is a documented pre-existing
-    // divergence the sync-graph fast path depends on.)
-    //
-    // Inside a synchronous `require()` of an ES module (an import() a
-    // CommonJS dependency of the required graph, or its body, makes) not
-    // even that: node's require runs no promise jobs before it returns, and
-    // the checkpoint would run the requiring code's own. A graph without
-    // top-level await has settled within evaluate() and needs none; one
-    // with it still takes the checkpoint, which it cannot settle without.
-    let settled = v8::Local::<v8::Promise>::try_from(value)
-        .is_ok_and(|p| p.state() != v8::PromiseState::Pending);
-    if !(settled && inside_require(tc)) {
-        tc.perform_microtask_checkpoint();
-    }
-
-    // evaluate() yields the module's top-level-await promise.
-    let Ok(eval_promise) = v8::Local::<v8::Promise>::try_from(value) else {
-        // Non-promise return is unexpected for a SourceText module; treat the
-        // value as the namespace fallback rather than failing.
-        return DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()));
-    };
-    match eval_promise.state() {
-        v8::PromiseState::Fulfilled => {
-            // The module's evaluation promise is the channel we consumed for
-            // the namespace; mark it handled so V8 doesn't ALSO report it as
-            // an unhandled rejection (it was Fulfilled, but a defensive
-            // mark here is symmetric with the Rejected arm).
-            eval_promise.mark_as_handled();
-            DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()))
+    match evaluated {
+        Ok(value) => {
+            let value = v8::Local::new(scope, &value);
+            rv.set(value);
         }
-        v8::PromiseState::Rejected => {
-            // We're consuming the rejection reason into the import promise;
-            // mark the eval promise handled so V8 doesn't also report it as
-            // a separate unhandled rejection (the user catches via the
-            // dynamically-imported promise we return).
-            eval_promise.mark_as_handled();
-            DynResult::Rejected(v8::Global::new(tc, eval_promise.result(tc)))
-        }
-        // Synchronous graphs settle within the microtask checkpoint above.
-        // A pending promise means the module has TLA. If there are deferred
-        // cycle imports (PendingCycleImports), run a flush loop: resolve them
-        // once the target modules reach kEvaluatingAsync, then drain the
-        // resulting microtasks. Repeat until quiescent. If the flush makes
-        // no progress because all cycle items are still kEvaluating (we are
-        // on their call stack), signal EvalAsync upward so the outer level
-        // can flush after its module's evaluate() returns.
-        v8::PromiseState::Pending => {
-            let mut did_something = true;
-            while did_something {
-                did_something = false;
-                let (cycle_flushed, cycle_skipped) = flush_cycle_imports(tc);
-                if cycle_flushed > 0 {
-                    // Bare checkpoint, no tick drain: still inside the
-                    // dynamic-import host hook (importer JS on the stack).
-                    tc.perform_microtask_checkpoint();
-                    did_something = true;
-                } else if cycle_skipped > 0 {
-                    // All pending cycle imports are still kEvaluating (we're on
-                    // their call stack). Tell the caller to stash our resolver
-                    // in PendingTLAImports; the outer level will flush us.
-                    return DynResult::EvalAsync(resolved);
-                }
-                let tla_flushed = flush_tla_imports(tc);
-                if tla_flushed > 0 {
-                    // Bare checkpoint, no tick drain (see above).
-                    tc.perform_microtask_checkpoint();
-                    did_something = true;
-                }
-            }
-            // Re-check after all rounds.
-            match eval_promise.state() {
-                v8::PromiseState::Fulfilled => {
-                    DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()))
-                }
-                v8::PromiseState::Rejected => {
-                    DynResult::Rejected(v8::Global::new(tc, eval_promise.result(tc)))
-                }
-                v8::PromiseState::Pending => DynResult::Error(format!(
-                    "oam: dynamic import('{spec}') of a module with top-level \
-                     await is not supported yet"
-                )),
-            }
-        }
+        Err(caught) => rethrow_caught(
+            scope,
+            caught,
+            &format!("oam: import of {}: evaluation failed", path.display()),
+        ),
     }
 }
 
-/// The currently-caught exception (if any) as a Global, for reporting an
-/// instantiate/evaluate failure as a promise rejection with the real value.
-fn dyn_caught_value(
-    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
-) -> Option<v8::Global<v8::Value>> {
-    let exception = tc.exception()?;
-    Some(v8::Global::new(tc, exception))
-}
-
-/// The host parked by the running `execute_*` call (see [`ActiveHost`]), for
-/// the callbacks that load modules on demand: `import()` and `require()` of
-/// an ES module.
-fn active_host<'a>(scope: &mut v8::PinScope<'_, '_>) -> Option<&'a dyn ModuleHost> {
-    let host_ptr = scope.get_slot::<ActiveHost>().and_then(|h| h.0)?;
-    // SAFETY: the pointer is valid for the whole execute_* call that parked
-    // it (the host is borrowed there), and the callbacks that read it only
-    // fire synchronously during the evaluation that call drives; every entry
-    // point without a host clears the slot first. See ActiveHost.
-    Some(unsafe { &*host_ptr })
+/// `ops.namespace(path)`: the module's namespace object.
+fn op_dyn_namespace(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let path = arg_path(scope, &args, 0);
+    match dyn_module(scope, &path) {
+        Some(module)
+            if !matches!(
+                module.get_status(),
+                v8::ModuleStatus::Uninstantiated | v8::ModuleStatus::Instantiating
+            ) =>
+        {
+            rv.set(module.get_module_namespace());
+        }
+        _ => throw_dyn_error(
+            scope,
+            &format!(
+                "oam internal: import of {}: module is not linked",
+                path.display()
+            ),
+        ),
+    }
 }
 
 /// Why a `require()` of an ES module failed, carried out of its TryCatch
@@ -3448,13 +3987,16 @@ pub(crate) fn require_esm(
     // The running entry's host, or -- on a path that parks none (the REPL,
     // a timer after the entry returned) -- a fresh one from the embedder's
     // factory, which reads modules the same way.
-    let owned;
-    let host: &dyn ModuleHost = match active_host(scope) {
-        Some(host) => host,
+    let parked = with_active_host(scope, |scope, host| {
+        v8::tc_scope!(let tc, scope);
+        require_esm_sync(tc, host, key, parent)
+    });
+    let outcome = match parked {
+        Some(outcome) => outcome,
         None => match crate::worker_host() {
             Some(host) => {
-                owned = host;
-                &*owned
+                v8::tc_scope!(let tc, scope);
+                require_esm_sync(tc, &*host, key, parent)
             }
             None => {
                 let message = format!(
@@ -3468,10 +4010,6 @@ pub(crate) fn require_esm(
                 return None;
             }
         },
-    };
-    let outcome = {
-        v8::tc_scope!(let tc, scope);
-        require_esm_sync(tc, host, key, parent)
     };
     match outcome {
         Ok(value) => Some(value),
@@ -3553,9 +4091,23 @@ fn require_esm_sync(
     tc.get_slot_mut::<RequireDepth>()
         .expect("require depth installed")
         .0 += 1;
+    // A graph that fails here only throws from the require() call, so a
+    // throw its load noted as the run's fatal error is not one (#399, as
+    // dyn_import_load has it): a worker that catches it must not later hand
+    // its parent this error in place of the one that ends its run. One left
+    // uncaught is noted again on the fatal path it takes.
+    let noted_before = tc
+        .get_slot::<FatalThrown>()
+        .is_some_and(|noted| noted.0.is_some());
     let required = require_esm_sync_inner(tc, host, key, parent);
     if let Some(depth) = tc.get_slot_mut::<RequireDepth>() {
         depth.0 -= 1;
+    }
+    if required.is_err()
+        && !noted_before
+        && let Some(noted) = tc.get_slot_mut::<FatalThrown>()
+    {
+        noted.0 = None;
     }
     required
 }
@@ -3919,12 +4471,120 @@ fn default_facade<'s>(
     Ok(facade.get_module_namespace())
 }
 
-/// Dynamic import() host callback. Resolves `specifier` relative to the
-/// importing module, then loads/instantiates/evaluates it through the same
-/// path as the static graph and settles the import promise with the module
-/// namespace. Synchronous graphs (incl. node:/oam: builtins and CJS) resolve
-/// inline; a module whose own top-level await is still pending is rejected
-/// with a clear message (nested-pump support is a follow-up).
+/// `ops.isInstantiated(path)`: whether the module is linked in V8.
+fn op_dyn_is_instantiated(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let path = arg_path(scope, &args, 0);
+    let linked = dyn_module(scope, &path).is_some_and(|module| {
+        !matches!(
+            module.get_status(),
+            v8::ModuleStatus::Uninstantiated | v8::ModuleStatus::Instantiating
+        )
+    });
+    rv.set_bool(linked);
+}
+
+/// `ops.loadedDependencies(path)`: for a module the module map holds, the
+/// module each request was linked to, `[path, type, ...]` -- requests not
+/// linked yet (a graph still loading) left out, and none for a module the
+/// map does not hold (yet).
+fn op_dyn_loaded_dependencies(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let path = arg_path(scope, &args, 0);
+    let mut out: Vec<v8::Local<v8::Value>> = Vec::new();
+    let Some(module) = dyn_module(scope, &path) else {
+        rv.set(v8::Array::new_with_elements(scope, &out).into());
+        return;
+    };
+    let requests = module.get_module_requests();
+    for i in 0..requests.length() {
+        let Some(request) = requests
+            .get(scope, i)
+            .and_then(|r| v8::Local::<v8::ModuleRequest>::try_from(r).ok())
+        else {
+            continue;
+        };
+        let specifier = request.get_specifier().to_rust_string_lossy(scope);
+        let target = scope
+            .get_slot::<ModuleMap>()
+            .and_then(|map| map.edges.get(&(path.clone(), specifier)).cloned());
+        let Some(target) = target else {
+            continue;
+        };
+        out.push(
+            v8::String::new(scope, &target.to_string_lossy())
+                .unwrap_or_else(|| v8::String::empty(scope))
+                .into(),
+        );
+        let declared = import_type(scope, request.get_import_attributes(), 3);
+        out.push(match declared {
+            Some(value) => v8::String::new(scope, &value)
+                .unwrap_or_else(|| v8::String::empty(scope))
+                .into(),
+            None => v8::undefined(scope).into(),
+        });
+    }
+    rv.set(v8::Array::new_with_elements(scope, &out).into());
+}
+
+/// Build js/esm_loader.js's loader against the ops above and keep its
+/// import() entry for [`dynamic_import_callback`]. Once per runtime, at
+/// construction, before any user code; the factory global is deleted.
+pub(crate) fn install_dynamic_import(
+    scope: &mut v8::PinScope<'_, '_>,
+    context: v8::Local<v8::Context>,
+) {
+    let global = context.global(scope);
+    let key = v8::String::new(scope, "__oamEsmLoader").unwrap();
+    let factory = global
+        .get(scope, key.into())
+        .and_then(|v| v8::Local::<v8::Function>::try_from(v).ok())
+        .expect("__oamEsmLoader in snapshot");
+    global.delete(scope, key.into());
+    let ops = v8::Object::new(scope);
+    let bindings = [
+        ("generation", v8::Function::new(scope, op_dyn_generation)),
+        ("resolve", v8::Function::new(scope, op_dyn_resolve)),
+        ("checkType", v8::Function::new(scope, op_dyn_check_type)),
+        ("load", v8::Function::new(scope, op_dyn_load)),
+        ("requests", v8::Function::new(scope, op_dyn_requests)),
+        ("link", v8::Function::new(scope, op_dyn_link)),
+        ("instantiate", v8::Function::new(scope, op_dyn_instantiate)),
+        ("evaluate", v8::Function::new(scope, op_dyn_evaluate)),
+        ("namespace", v8::Function::new(scope, op_dyn_namespace)),
+        (
+            "isInstantiated",
+            v8::Function::new(scope, op_dyn_is_instantiated),
+        ),
+        (
+            "loadedDependencies",
+            v8::Function::new(scope, op_dyn_loaded_dependencies),
+        ),
+    ];
+    for (name, function) in bindings {
+        let name = v8::String::new(scope, name).unwrap();
+        let function = function.expect("op function");
+        ops.set(scope, name.into(), function.into());
+    }
+    let recv: v8::Local<v8::Value> = v8::undefined(scope).into();
+    let hook = factory
+        .call(scope, recv, &[ops.into()])
+        .and_then(|v| v8::Local::<v8::Function>::try_from(v).ok())
+        .expect("the ES module loader factory returns the import() entry");
+    let hook = v8::Global::new(scope, hook);
+    scope.set_slot(DynamicImportHook(hook));
+}
+
+/// V8's import() hook. Hands the call to js/esm_loader.js and returns its
+/// promise: the specifier is resolved inside this call, as node resolves it,
+/// and nothing else -- no load, no evaluation, no checkpoint -- happens until
+/// the importer's code has returned to a microtask drain (#397).
 pub(crate) fn dynamic_import_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     _host_defined_options: v8::Local<'s, v8::Data>,
@@ -3932,143 +4592,40 @@ pub(crate) fn dynamic_import_callback<'s>(
     specifier: v8::Local<'s, v8::String>,
     import_attributes: v8::Local<'s, v8::FixedArray>,
 ) -> Option<v8::Local<'s, v8::Promise>> {
+    // An import() call's attributes come as [key, value] pairs.
+    let declared = import_type(scope, import_attributes, 2);
+    let declared: v8::Local<v8::Value> = match declared {
+        Some(value) => v8::String::new(scope, &value)
+            .unwrap_or_else(|| v8::String::empty(scope))
+            .into(),
+        None => v8::undefined(scope).into(),
+    };
+    let hook = scope.get_slot::<DynamicImportHook>().map(|h| h.0.clone());
+    let Some(hook) = hook else {
+        let resolver = v8::PromiseResolver::new(scope)?;
+        let promise = resolver.get_promise(scope);
+        let text = v8::String::new(scope, "oam internal: import() loader not installed")
+            .unwrap_or_else(|| v8::String::empty(scope));
+        let exception = v8::Exception::error(scope, text);
+        resolver.reject(scope, exception);
+        return Some(promise);
+    };
+    let hook = v8::Local::new(scope, &hook);
+    let recv: v8::Local<v8::Value> = v8::undefined(scope).into();
+    // The loader's entry is an async function: it returns a promise, and
+    // throws only when V8 cannot run it at all (termination, a stack
+    // overflow), which V8 then reports from the import() expression.
+    let loaded = hook
+        .call(scope, recv, &[specifier.into(), resource_name, declared])
+        .and_then(|value| v8::Local::<v8::Promise>::try_from(value).ok())?;
+    // node's import() hands back a promise resolved WITH the loader's, not
+    // the loader's own: one more thenable link, so it settles a turn after
+    // the loader's promise does, and the link calls `then` on it (measured
+    // on v22.22.2: a module with no imports settles on turn 14, and a
+    // patched Promise.prototype.then sees four calls).
     let resolver = v8::PromiseResolver::new(scope)?;
-    let promise = resolver.get_promise(scope);
-    let spec = specifier.to_rust_string_lossy(scope);
-    let referrer = resource_name.to_rust_string_lossy(scope);
-
-    // Parse import attributes (type=json) the same way the static path does.
-    // Unknown keys are silently ignored per spec; an unsupported type VALUE is
-    // an error before we even try to resolve.
-    let typed_json = match dyn_parse_import_attributes(scope, import_attributes, &spec) {
-        Ok(flag) => flag,
-        Err(msg) => {
-            reject_with_message(scope, &resolver, &msg);
-            return Some(promise);
-        }
-    };
-
-    // The active host is parked by execute_module; absent on the REPL/timer
-    // paths and from inside run_registered_tests (which clears the slot so
-    // test bodies cannot dereference the stale pointer from execute_module).
-    let Some(host) = active_host(scope) else {
-        reject_with_message(
-            scope,
-            &resolver,
-            &format!(
-                "oam: dynamic import('{spec}') is not wired up on this entry path \
-                 (REPL, timer, op callback, or test body)"
-            ),
-        );
-        return Some(promise);
-    };
-
-    // Resolve the specifier relative to the importing module.
-    let referrer_path = PathBuf::from(&referrer);
-    let resolved = match host.resolve(&spec, &referrer_path) {
-        Ok(p) => p,
-        Err(diags) => {
-            let msg = diags
-                .first()
-                .map(|d| format!("{}: {}", d.code, d.message))
-                .unwrap_or_else(|| format!("cannot resolve '{spec}'"));
-            reject_with_message(
-                scope,
-                &resolver,
-                &format!("oam: dynamic import('{spec}'): {msg}"),
-            );
-            return Some(promise);
-        }
-    };
-    // Virtual builtin paths bypass filesystem normalization (module_key /
-    // absolute() would anchor "node:fs" at cwd); everything else is keyed.
-    let resolved = if resolved
-        .to_str()
-        .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"))
-    {
-        resolved
-    } else {
-        match module_key(&resolved) {
-            Ok(k) => k,
-            Err(e) => {
-                reject_with_message(
-                    scope,
-                    &resolver,
-                    &format!(
-                        "oam: dynamic import('{spec}'): bad resolved path {}: {e}",
-                        resolved.display()
-                    ),
-                );
-                return Some(promise);
-            }
-        }
-    };
-
-    // type:"json" requires a .json target (parity with the static path).
-    if typed_json && resolved.extension().and_then(|e| e.to_str()) != Some("json") {
-        reject_with_message(
-            scope,
-            &resolver,
-            &format!(
-                "oam: dynamic import('{spec}') is imported with type \"json\" \
-                 but resolves to {} (only .json files load as JSON modules today)",
-                resolved.display()
-            ),
-        );
-        return Some(promise);
-    }
-
-    // Heavy V8 work under a child TryCatch; carry the result out as Globals.
-    // Clone resolved so it is available for the Deferred/EvalAsync branches
-    // after the tc scope (and borrow) drops.
-    let resolved_for_defer = resolved.clone();
-    let result = {
-        v8::tc_scope!(let tc, scope);
-        dyn_import_load(tc, host, resolved, &spec)
-    };
-
-    match result {
-        DynResult::Namespace(ns) => {
-            let value = v8::Local::new(scope, &ns);
-            resolver.resolve(scope, value);
-        }
-        DynResult::Rejected(reason) => {
-            let value = v8::Local::new(scope, &reason);
-            resolver.reject(scope, value);
-        }
-        DynResult::Error(msg) => reject_with_message(scope, &resolver, &msg),
-        DynResult::Deferred => {
-            // The target module is kEvaluating (we are on its call stack).
-            // Stash the resolver; flush_cycle_imports() will resolve it once the
-            // outer module reaches kEvaluatingAsync.
-            let global_resolver = v8::Global::new(scope, resolver);
-            if scope.get_slot::<PendingCycleImports>().is_none() {
-                scope.set_slot(PendingCycleImports::default());
-            }
-            scope
-                .get_slot_mut::<PendingCycleImports>()
-                .expect("just set")
-                .0
-                .push((resolved_for_defer, global_resolver));
-            // Return the unsettled promise — it will be resolved by the flush.
-        }
-        DynResult::EvalAsync(path) => {
-            // The module has pending TLA that will settle once the cycle import
-            // it is waiting for is resolved by the outer level. Stash the
-            // resolver in PendingTLAImports.
-            let global_resolver = v8::Global::new(scope, resolver);
-            if scope.get_slot::<PendingTLAImports>().is_none() {
-                scope.set_slot(PendingTLAImports::default());
-            }
-            scope
-                .get_slot_mut::<PendingTLAImports>()
-                .expect("just set")
-                .0
-                .push((path, global_resolver));
-            // Return the unsettled promise — it will be resolved by the flush.
-        }
-    }
-    Some(promise)
+    resolver.resolve(scope, loaded.into());
+    Some(resolver.get_promise(scope))
 }
 
 /// Windows-safe file:// URL, percent-encoding exactly the characters node's
@@ -4228,6 +4785,7 @@ pub(crate) fn catch_to_diagnostic(
     name: &str,
 ) -> Diagnostic {
     if let Some(exception) = tc.exception() {
+        note_fatal_thrown(tc, exception, false);
         let exception = v8::Global::new(tc, exception);
         tc.set_slot(CaughtDuringLoad(Some(exception)));
     }

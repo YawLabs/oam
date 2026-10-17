@@ -215,6 +215,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // data, propagated across promise continuations by V8 itself.
         ("getContinuationData", op_get_continuation_data),
         ("setContinuationData", op_set_continuation_data),
+        // The queueMicrotask wrapper's catch: the uncaught ladder, with a
+        // fatal outcome noted for the throw that follows (#398).
+        ("dispatchMicrotaskThrow", op_dispatch_microtask_throw),
         // Timer ref/unref: flip the native TimerQueue ref flag so an unref'd
         // timer no longer keeps the event loop alive (Node Timeout#ref/#unref).
         ("timerRef", timer_ref),
@@ -232,6 +235,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("stopSignal", op_stop_signal),
         // V8 Object::GetConstructorName -- used by util.inspect for null-proto labels.
         ("getConstructorName", op_get_constructor_name),
+        // Whether a stack frame's script name is an ES module's own source,
+        // which node names by its file:// URL (modules.rs).
+        ("isEsModuleSource", op_is_es_module_source),
         // Buffer#toString / *Slice for utf8, latin1, ascii and ucs2: V8's own
         // decoders, the ones node calls (buffer_ops.rs).
         ("bufferDecode", op_buffer_decode),
@@ -413,6 +419,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tcpShutdown", op_tcp_shutdown),
         ("tcpListen", op_tcp_listen),
         ("tcpAccept", op_tcp_accept),
+        ("tcpAcceptTake", op_tcp_accept_take),
         ("tcpServerClose", op_tcp_server_close),
         ("tcpSetRef", op_tcp_set_ref),
         ("tcpServerSetRef", op_tcp_server_set_ref),
@@ -1987,6 +1994,16 @@ fn op_stderr_write(
 ) {
     if let Some(bytes) = arg_bytes(scope, &args, 0) {
         use std::io::Write;
+        // In a worker started with { stderr: true }, output -- its warnings
+        // included -- belongs to the parent's worker.stderr stream (#370).
+        if let Some(ctx) = scope.get_slot::<oam_core::worker::WorkerContext>()
+            && ctx.pipe_stderr
+        {
+            let _ = ctx
+                .outbox
+                .send(oam_core::worker::WorkerEvent::Stderr(bytes));
+            return;
+        }
         // A stderr the program closed is EBADF, as for stdout: std's stderr
         // would report the write to a closed descriptor as done.
         if let Some(e) = oam_core::closed_stdio_error(2) {
@@ -5665,6 +5682,21 @@ fn op_tcp_accept(
     );
 }
 
+/// `__oam.node.tcpAcceptTake(serverId, handle) -> boolean`: JS takes the
+/// connection an accept answered with, before handing it to the server, so
+/// the server's close no longer closes it with the server (#388). False if
+/// that close came first.
+fn op_tcp_accept_take(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = args.get(1).number_value(scope).unwrap_or(0.0) as u64;
+    let tcp = core_runtime!(scope).tcp();
+    rv.set_bool(oam_core::tcp::tcp_accept_take(&tcp, server_id, handle));
+}
+
 fn op_tcp_server_close(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -7099,6 +7131,20 @@ fn op_get_continuation_data(
     rv.set(scope.get_continuation_preserved_embedder_data());
 }
 
+fn op_dispatch_microtask_throw(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    match crate::modules::dispatch_microtask_throw(scope, args.get(0)) {
+        Ok(handled) => rv.set_bool(handled),
+        Err(thrown) => {
+            let thrown = v8::Local::new(scope, &thrown);
+            scope.throw_exception(thrown);
+        }
+    }
+}
+
 fn op_set_continuation_data(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -7124,6 +7170,17 @@ fn op_get_constructor_name(
         let empty = v8::String::empty(scope);
         rv.set(empty.into());
     }
+}
+
+fn op_is_es_module_source(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let found = args.get(0).is_string()
+        && arg_string(scope, &args, 0)
+            .is_some_and(|name| crate::modules::is_es_module_source(scope, &name));
+    rv.set(v8::Boolean::new(scope, found).into());
 }
 
 fn op_make_require(
@@ -8496,26 +8553,8 @@ fn op_fs_chmod_sync(
         return;
     };
     let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)) {
-            throw_node_error(scope, "chmod", &path, &e);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = mode;
-        match std::fs::metadata(&path) {
-            Ok(meta) => {
-                let mut perms = meta.permissions();
-                perms.set_readonly(mode & 0o200 == 0);
-                if let Err(e) = std::fs::set_permissions(&path, perms) {
-                    throw_node_error(scope, "chmod", &path, &e);
-                }
-            }
-            Err(e) => throw_node_error(scope, "chmod", &path, &e),
-        }
+    if let Err(e) = oam_core::chmod_path(&path, mode) {
+        throw_node_error(scope, "chmod", &path, &e);
     }
 }
 
@@ -8893,7 +8932,9 @@ fn op_fs_fstat_sync(
 // ------------------------------------------------- permission helpers / query
 
 /// Throw Node's `ERR_ACCESS_DENIED`: message "Access to this API has been
-/// restricted", plus the `permission` and `resource` own properties Node
+/// restricted. Use <flag> to manage permissions."
+/// ([`crate::permissions::access_denied_message`]), plus the `permission`
+/// and `resource` own properties Node
 /// attaches (and its fatal reporter prints).
 pub(crate) fn throw_permission_denied(
     scope: &mut v8::PinScope<'_, '_>,
@@ -8914,8 +8955,11 @@ pub(crate) fn access_denied_error<'s>(
     permission: &str,
     resource: &str,
 ) -> v8::Local<'s, v8::Value> {
-    let msg_v8 = v8::String::new(scope, crate::permissions::ACCESS_DENIED_MESSAGE)
-        .unwrap_or_else(|| v8::String::new(scope, "ERR_ACCESS_DENIED").unwrap());
+    let msg_v8 = v8::String::new(
+        scope,
+        &crate::permissions::access_denied_message(permission),
+    )
+    .unwrap_or_else(|| v8::String::new(scope, "ERR_ACCESS_DENIED").unwrap());
     let exception = v8::Exception::error(scope, msg_v8);
     if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
         for (key, value) in [
@@ -9173,6 +9217,15 @@ fn op_worker_new(
             })
             .unwrap_or_default(),
         env,
+        // Absent (an older caller): the creator's options, as before.
+        inherit_flags: options
+            .get("inheritFlags")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        // A worker creating one hands it its own options to inherit.
+        creator_flags: scope
+            .get_slot::<crate::CreatorFlags>()
+            .map(|flags| flags.0.clone()),
     };
 
     // Not looked for here: node's Worker constructor never opens its entry,

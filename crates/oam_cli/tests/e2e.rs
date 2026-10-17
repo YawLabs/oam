@@ -1222,10 +1222,11 @@ fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
     );
 
     // Shipped builtins resolve; the MOD0006 gate covers the rest, prefixed
-    // or bare. `sys` (the ancient alias for util) is a permanent canary -- it
-    // will never ship, so it keeps this test from chasing the support list.
-    // (constants used to serve this role but now ships, for graceful-fs.)
-    std::fs::write(proj.join("builtin_main.ts"), "import 'node:sys';").unwrap();
+    // or bare. `wasi` is the canary: a builtin node has that oam does not
+    // ship. (constants, then sys -- node's deprecated alias for util -- used
+    // to serve this role, but both now ship: constants for graceful-fs, sys
+    // for its DEP0025 deprecation, #368.)
+    std::fs::write(proj.join("builtin_main.ts"), "import 'node:wasi';").unwrap();
     let out = oam(&[
         "run",
         proj.join("builtin_main.ts").to_str().unwrap(),
@@ -1243,7 +1244,7 @@ fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
         "gate message present: {stderr}"
     );
 
-    std::fs::write(proj.join("bare_builtin.ts"), "import 'sys';").unwrap();
+    std::fs::write(proj.join("bare_builtin.ts"), "import 'wasi';").unwrap();
     let out = oam(&[
         "run",
         proj.join("bare_builtin.ts").to_str().unwrap(),
@@ -5201,14 +5202,17 @@ fn dynamic_import_attributes_match_static_path() {
     assert!(stdout.contains("json_on_nonjson rejected"), "{stdout}");
 }
 
-// A dynamic-import cycle (A dyn-imports B, B dyn-imports A while A is still
-// Evaluating) must resolve to A's PARTIAL namespace -- the bindings B reads
-// from A must be the ones already initialized in A (fromA). Pre-fix oam
-// rejected this cycle with "top-level await not supported yet" because A's
-// eval promise was still pending. Post-fix, dyn_import_load detects the
-// Evaluating status and returns the partial namespace.
+// A dynamic-import cycle under top-level await (A awaits import(B), B awaits
+// import(A) back) is a deadlock, as in node: B's import() of A runs in a
+// promise job after A's synchronous body (#397), when A is evaluating
+// asynchronously, so B waits on A's evaluation, which waits on B's. Neither
+// settles, and the run ends as a top-level await that never settles does,
+// exit 13 (node v22.22.2 prints its "unsettled top-level await" warning and
+// exits 13 on these files). oam used to hand B A's partial namespace
+// instead, because it evaluated B inside the hook with A's body on the
+// stack.
 #[test]
-fn dynamic_import_cycle_resolves_to_partial_namespace() {
+fn dynamic_import_cycle_under_top_level_await_deadlocks_as_node_does() {
     write_temp(
         "dynimp_cycle/a.mjs",
         "export const fromA = 'A';\n\
@@ -5217,20 +5221,48 @@ fn dynamic_import_cycle_resolves_to_partial_namespace() {
     );
     write_temp(
         "dynimp_cycle/b.mjs",
-        // B only reads bindings of A that are ALREADY initialized at the
-        // point B runs (fromA is the only one set before A's TLA suspends).
         "const a = await import('./a.mjs');\n\
          export const sawFromA = a && a.fromA === 'A';\n\
          export const fromB = 'B';\n",
     );
     let main = write_temp(
         "dynimp_cycle/main.mjs",
+        "process.on('exit', (code) => console.log('exit', code));\n\
+         const a = await import('./a.mjs');\n\
+         console.log('settled', a.fromA);\n",
+    );
+    let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(13),
+        "a top-level await deadlock exits 13: {stdout}\n{stderr}"
+    );
+    assert!(!stdout.contains("settled"), "{stdout}");
+    assert!(stdout.contains("exit 13"), "{stdout}");
+}
+
+// A cycle with no top-level await settles, as in node: A import()s B without
+// waiting, B awaits import(A), which resolves once A has evaluated -- the
+// whole namespace, `after` included, since A's body finished before B ran.
+#[test]
+fn dynamic_import_cycle_without_top_level_await_settles() {
+    write_temp(
+        "dynimp_cycle_sync/a.mjs",
+        "export const fromA = 'A';\n\
+         export const b = import('./b.mjs');\n\
+         export const after = 'after';\n",
+    );
+    write_temp(
+        "dynimp_cycle_sync/b.mjs",
         "const a = await import('./a.mjs');\n\
-         const b = a.bResult;\n\
-         console.log('a_fromA', a.fromA === 'A');\n\
-         console.log('a_after', a.after === 'after-await');\n\
-         console.log('b_sawFromA', b && b.sawFromA === true);\n\
-         console.log('b_fromB', b && b.fromB === 'B');\n",
+         export const saw = a.fromA + ' ' + a.after;\n",
+    );
+    let main = write_temp(
+        "dynimp_cycle_sync/main.mjs",
+        "const a = await import('./a.mjs');\n\
+         console.log('b saw', (await a.b).saw);\n",
     );
     let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -5240,10 +5272,7 @@ fn dynamic_import_cycle_resolves_to_partial_namespace() {
         "exit {}: {stdout}\n{stderr}",
         out.status
     );
-    assert!(stdout.contains("a_fromA true"), "{stdout}");
-    assert!(stdout.contains("a_after true"), "{stdout}");
-    assert!(stdout.contains("b_sawFromA true"), "{stdout}");
-    assert!(stdout.contains("b_fromB true"), "{stdout}");
+    assert!(stdout.contains("b saw A after"), "{stdout}");
 }
 
 // Regression for the ActiveHost slot-clear contract: a dynamic import() from
@@ -6260,6 +6289,55 @@ cl-late-end-silent finalized=false"##;
         stdout.trim().replace("\r\n", "\n"),
         expected,
         "stderr: {stderr}"
+    );
+}
+
+/// A reader of an `fs.openAsBlob` Blob that is cancelled while its first
+/// open is still in flight closes the descriptor that open brings back. It
+/// used to keep it: cancel ran while there was no fd yet, the open then
+/// landed and stored one, and nothing closed it until the reader was
+/// collected. The check looks at file descriptors alone, not the process's
+/// whole handle count: 300 cancels can grow tokio's blocking pool by up to a
+/// thread per in-flight open, which idles out on its own and is no leak. On
+/// Windows an open file keeps its directory from being renamed, so the
+/// directory must become renamable; elsewhere the /dev/fd entries must come
+/// back to their count before the loop. Either is polled for up to 5 s, the
+/// time the in-flight opens need to land and close.
+#[test]
+fn open_as_blob_cancel_during_open_closes_the_fd() {
+    let stdout = run_ok(
+        "open_as_blob_cancel_fd.mjs",
+        "import fs from 'node:fs';\n\
+         import os from 'node:os';\n\
+         import path from 'node:path';\n\
+         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-blob-cancel-'));\n\
+         const file = path.join(dir, 'a.bin');\n\
+         fs.writeFileSync(file, Buffer.alloc(1000, 1));\n\
+         const blob = await fs.openAsBlob(file);\n\
+         const fds = () => fs.readdirSync('/dev/fd').length;\n\
+         const before = process.platform === 'win32' ? 0 : fds();\n\
+         let moved = dir;\n\
+         const closed = () => {\n\
+           if (process.platform !== 'win32') return fds() <= before;\n\
+           try { fs.renameSync(dir, dir + '-moved'); moved = dir + '-moved'; return true; }\n\
+           catch { return false; }\n\
+         };\n\
+         for (let i = 0; i < 300; i++) {\n\
+           const stream = blob.stream();\n\
+           await new Promise((r) => setImmediate(r));\n\
+           const reader = stream.getReader();\n\
+           const read = reader.read().catch(() => {});\n\
+           await reader.cancel();\n\
+           await read;\n\
+         }\n\
+         let ok = false;\n\
+         for (let t = 0; t < 100 && !(ok = closed()); t++) await new Promise((r) => setTimeout(r, 50));\n\
+         console.log('fds closed:', ok ? 'ok' : 'leaked');\n\
+         fs.rmSync(moved, { recursive: true });\n",
+    );
+    assert!(
+        stdout.contains("fds closed: ok"),
+        "a cancel during the first open must close the fd it brings back: {stdout}"
     );
 }
 
@@ -11955,7 +12033,8 @@ console.log(lines.join('\n'));
     let granted = "--allow-net=127.0.0.1,granted.invalid";
     let (stdout, stderr, inner_seen, inner6_seen, (inner, inner6)) =
         run(&["--permission", granted], "full");
-    let denied = "Error|Access to this API has been restricted|code,permission,resource";
+    let denied = "Error|Access to this API has been restricted. Use --allow-net to manage \
+                  permissions.|code,permission,resource";
     // A refusal names the hop's `host:port`, as net.connect's does.
     assert_eq!(
         stdout,
@@ -29224,6 +29303,56 @@ fn compiled_binary_runs_its_embedded_script_as_the_main_module() {
     );
 }
 
+// #399 item 10: node runs the 'exit' listeners and then prints the fatal
+// report (_fatalException, then ReportFatalException). A compiled binary
+// printed the report first. Conformance case 473 holds `-e` and `oam run`
+// to node; a compiled binary has no node counterpart, so it is held here.
+#[test]
+fn compiled_binary_runs_exit_listeners_before_the_fatal_report() {
+    let entry = write_temp(
+        "compile_exit_order/app.cjs",
+        "process.on('exit', (c) => console.error('exit listener', c));\n\
+         throw new Error('embedded fatal');\n",
+    );
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let output = std::env::temp_dir().join(format!(
+        "oam-compile-exit-order-{}-{nanos}{ext}",
+        std::process::id()
+    ));
+    let compile_out = oam(&[
+        "compile",
+        entry.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert!(
+        compile_out.status.success(),
+        "oam compile failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&compile_out.stdout),
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+    let run_out = std::process::Command::new(&output)
+        .output()
+        .expect("compiled binary runs");
+    let _ = std::fs::remove_file(&output);
+    let stderr = String::from_utf8_lossy(&run_out.stderr);
+    assert_eq!(run_out.status.code(), Some(1), "stderr={stderr}");
+    let listener = stderr
+        .find("exit listener 1")
+        .unwrap_or_else(|| panic!("the 'exit' listener did not run: stderr=<<{stderr}>>"));
+    let report = stderr
+        .find("Error: embedded fatal")
+        .unwrap_or_else(|| panic!("no fatal report: stderr=<<{stderr}>>"));
+    assert!(
+        listener < report,
+        "the report was printed before the 'exit' listener ran: stderr=<<{stderr}>>"
+    );
+}
+
 // A plain `.js` test file, named relative to a working directory BELOW the
 // package.json that makes it CommonJS: `oam test` has to decide the file's
 // kind from where it really is (the "type" lookup used to stop at the
@@ -37582,6 +37711,51 @@ fn chdir_moves_the_drive_cwd_that_drive_relative_paths_use() {
     );
 }
 
+// realpathSync and callback realpath of a file the system holds open with no
+// sharing (the paging file): node's fail, `EPERM, lstat` on v22.22.2. oam's
+// realpath asks the OS first (EBUSY) and on a failure runs node's component
+// walk for node's error; the walk's lstat succeeds there where node's does
+// not (docs/node-divergences.md), so a walk that completes must leave the
+// OS's error standing, not turn it into the walked path. Skips where no
+// paging file lies at the system drive's root.
+#[cfg(windows)]
+#[test]
+fn realpath_of_the_paging_file_fails_as_the_os_does() {
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    let root = format!("{drive}\\");
+    let Some(locked) = std::fs::read_dir(&root).ok().and_then(|entries| {
+        entries.flatten().map(|entry| entry.path()).find(|path| {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            ["pagefile.sys", "swapfile.sys"]
+                .iter()
+                .any(|known| name.eq_ignore_ascii_case(known))
+                && std::fs::File::open(path).is_err()
+        })
+    }) else {
+        eprintln!("no locked paging file at {root}; skipping");
+        return;
+    };
+    let script = write_temp(
+        "realpath_paging_file/main.cjs",
+        "const fs = require('fs');\n\
+         const p = process.argv[2];\n\
+         try { fs.realpathSync(p); console.log('sync resolved'); }\n\
+         catch (e) { console.log('sync threw'); }\n\
+         fs.realpath(p, (e) => console.log(e ? 'callback threw' : 'callback resolved'));\n",
+    );
+    let out = bounded_output(&mut oam_command(&[
+        script.to_str().unwrap(),
+        locked.to_str().unwrap(),
+    ]));
+    let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(
+        stdout,
+        "sync threw\ncallback threw\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // process.env and the hidden `=X:` drive-cwd variables, as node has them
 // (node_env_var.cc; measured on v22.22.2): the names are not enumerated, a
 // read goes to the live environment -- so it follows a chdir -- an assignment
@@ -38037,4 +38211,118 @@ fn write_heap_snapshot_needs_the_write_grant() {
         written.is_empty(),
         "a snapshot was written despite the denial"
     );
+}
+
+// #395: recursion that calls a sync native op near the bottom of V8's JS
+// stack used to overflow the NATIVE stack on Windows and kill the process
+// ("thread 'main' has overflowed its stack", 0xC00000FD) instead of throwing
+// V8's catchable RangeError. oam.exe's main thread had the linker's 1 MiB
+// default reserve under V8's ~984 KiB JS limit, so the native frames of an op
+// called at the limit had a few tens of KiB to live in; node.exe reserves
+// 8 MiB. Measured on Windows 11 arm64 before the fix: copyFileSync, cpSync and
+// zlib.deflateSync aborted a release build, readdirSync and opendirSync a
+// debug one too. The probe recurses with no op until V8 throws, then calls
+// the op once at the deepest level whose JS frames still fit (the same worst
+// case as an op at every level, for a handful of calls). The worker half runs
+// the same probe on a worker thread.
+const DEEP_NATIVE_PROBE: &str = "const fs = require('node:fs');\n\
+     const path = require('node:path');\n\
+     const zlib = require('node:zlib');\n\
+     const wt = require('node:worker_threads');\n\
+     const file = path.join(__dirname, 'f.txt');\n\
+     if (wt.isMainThread) fs.writeFileSync(file, 'x');\n\
+     function probe(op) {\n\
+       let called = false;\n\
+       function recurse() {\n\
+         try { recurse(); } catch (err) {\n\
+           if (!called) { try { op(); called = true; } catch (inner) { if (!(inner instanceof RangeError)) throw inner; } }\n\
+           throw err;\n\
+         }\n\
+       }\n\
+       try { recurse(); return 'returned'; } catch (err) { return err.constructor.name + ' ' + called; }\n\
+     }\n\
+     const ops = {\n\
+       readdirSync: () => fs.readdirSync(__dirname),\n\
+       copyFileSync: () => fs.copyFileSync(file, path.join(__dirname, 'copy.txt')),\n\
+       deflateSync: () => zlib.deflateSync('abc'),\n\
+     };\n\
+     const out = Object.entries(ops).map(([name, op]) => name + ' ' + probe(op)).join('\\n');\n\
+     if (wt.isMainThread) {\n\
+       console.log(out);\n\
+       const w = new wt.Worker(__filename);\n\
+       w.on('message', (m) => console.log('worker\\n' + m));\n\
+     } else {\n\
+       wt.parentPort.postMessage(out);\n\
+     }\n";
+
+#[test]
+fn deep_recursion_through_native_ops_throws_range_error_not_a_native_overflow() {
+    let script = write_temp("deep_native_395/probe.cjs", DEEP_NATIVE_PROBE);
+    let out = oam(&[script.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let expected = "readdirSync RangeError true\n\
+                    copyFileSync RangeError true\n\
+                    deflateSync RangeError true";
+    assert_eq!(
+        stdout.trim(),
+        format!("{expected}\nworker\n{expected}"),
+        "status {:?}, stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "status {:?}", out.status);
+}
+
+/// The fix itself, read off the binary: oam.exe's PE header reserves the same
+/// 8 MiB main-thread stack node.exe's does (node v22.22.2's header, measured:
+/// SizeOfStackReserve 8388608). Without it the linker's 1 MiB default applies.
+#[cfg(windows)]
+#[test]
+fn windows_exe_reserves_node_sized_main_thread_stack() {
+    let bytes = std::fs::read(env!("CARGO_BIN_EXE_oam")).expect("read oam.exe");
+    let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    assert_eq!(&bytes[pe..pe + 4], b"PE\0\0", "PE signature");
+    let optional = pe + 24;
+    let magic = u16::from_le_bytes(bytes[optional..optional + 2].try_into().unwrap());
+    assert_eq!(magic, 0x20b, "PE32+ optional header");
+    // PE32+: SizeOfStackReserve is the u64 at offset 72 of the optional header.
+    let reserve = u64::from_le_bytes(bytes[optional + 72..optional + 80].try_into().unwrap());
+    assert_eq!(reserve, 8 * 1024 * 1024, "SizeOfStackReserve");
+}
+
+/// #395's own reproducer: `fs.cpSync` of a directory chain 2500 deep with a
+/// `filter`, whose walk is node's JS and recurses once per level. It runs
+/// out of JS stack partway down, and the ops it calls there (opendirSync,
+/// lstatSync, mkdirSync, copyFileSync) run their native frames under V8's
+/// limit -- with oam.exe's old 1 MiB main-thread reserve that overflowed the
+/// native stack and killed the process. node v22.22.2 throws RangeError here
+/// (measured, Windows 11 arm64; it does at 1500 deep too, where oam's walk
+/// still fits -- see docs/node-divergences.md). The chain is made natively so
+/// the test spends its time in the copy.
+#[test]
+fn deep_cp_sync_with_filter_throws_range_error_not_a_native_overflow() {
+    let script = write_temp(
+        "deep_cp_395/cp.cjs",
+        "const fs = require('node:fs');\n\
+         const path = require('node:path');\n\
+         try {\n\
+           fs.cpSync(path.join(__dirname, 'src'), path.join(__dirname, 'dst'),\n\
+             { recursive: true, filter: () => true });\n\
+           console.log('ok');\n\
+         } catch (err) { console.log(err.constructor.name + ': ' + err.message); }\n",
+    );
+    let mut chain = script.parent().unwrap().join("src");
+    for _ in 0..2500 {
+        chain.push("d");
+    }
+    std::fs::create_dir_all(&chain).expect("create the 2500-deep chain");
+    let out = oam(&[script.to_str().unwrap()]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "RangeError: Maximum call stack size exceeded",
+        "status {:?}, stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "status {:?}", out.status);
 }

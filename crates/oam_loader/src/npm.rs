@@ -139,7 +139,7 @@ const PREFIX_ONLY_BUILTINS: [&str; 3] = ["sea", "sqlite", "test/reporters"];
 /// node:NAME paths the engine instantiates from the snapshot registry.
 /// Recognized names outside this list gate on OAM-MOD0006 with a precise
 /// pointer.
-const SUPPORTED_BUILTINS: [&str; 66] = [
+const SUPPORTED_BUILTINS: [&str; 67] = [
     "assert",
     "assert/strict",
     "async_hooks",
@@ -180,6 +180,7 @@ const SUPPORTED_BUILTINS: [&str; 66] = [
     "stream/promises",
     "stream/web",
     "string_decoder",
+    "sys",
     "test",
     "timers",
     "timers/promises",
@@ -1479,27 +1480,21 @@ mod tests {
     }
 
     #[test]
-    fn node_sys_still_in_builtins_list() {
-        // `sys` is in NODE_BUILTINS (the legacy alias for 'util' was removed
-        // from Node in 2017, but the resolver still recognizes it). That puts
-        // `node:sys` on the "recognized builtin, not yet shipped" branch
-        // (OAM-MOD0006 with the wave-N preview message), NOT the bare-
-        // specifier / "cannot find package" branch. If a future change drops
-        // `sys` from NODE_BUILTINS, this assertion becomes OAM-MOD0002 with
-        // a "tsconfig paths were consulted" suffix — flip it then.
+    fn sys_resolves_as_a_builtin() {
+        // `sys` is node's deprecated (DEP0025) name for `util`, still a
+        // builtin in v22.22.2 under both spellings, for require and import:
+        // a virtual path the engine fills from the `sys` registry factory,
+        // never a package in node_modules.
         let dir = std::env::temp_dir().join(format!("oam-npm-8b-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let entry = dir.join("entry.ts");
         std::fs::write(&entry, "").unwrap();
-        let err = resolve_bare("node:sys", &entry, ResolveMode::Import)
-            .expect_err("node:sys should not resolve to a real file");
-        assert_eq!(err.code, "OAM-MOD0006");
-        assert!(
-            err.message.contains("does not implement yet")
-                || err.message.contains("is not a known node: builtin module"),
-            "message was: {}",
-            err.message
-        );
+        for spec in ["sys", "node:sys"] {
+            for mode in [ResolveMode::Import, ResolveMode::Require] {
+                let got = resolve_bare(spec, &entry, mode).expect(spec);
+                assert_eq!(got, PathBuf::from("node:sys"), "{spec}");
+            }
+        }
     }
 
     /// A name node has as a builtin is never a package to go and install:

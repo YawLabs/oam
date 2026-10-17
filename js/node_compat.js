@@ -634,9 +634,19 @@
   /// oam asks the OS for the whole path at once (`realpath`, which is what
   /// node's `.native` forms and `fs/promises.realpath` report). When that
   /// fails, this walk finds the error node's would have: the first component
-  /// whose lstat fails. If every component stats, the native error stands.
-  /// The walk yields `[op, path]` for the caller to run -- "lstat", "stat" or
-  /// "readlink", sync or async -- so one walk serves both forms.
+  /// whose lstat fails. If every component stats, the native error stands:
+  /// oam's lstat succeeds on some paths node's refuses (the Windows paging
+  /// file), so the walked path is not node's answer there. The walk yields
+  /// `[op, path]` for the caller to run -- "lstat", "stat" or "readlink",
+  /// sync or async -- so one walk serves both forms, and returns the
+  /// resolved path, or null when it gave up on a chain of links.
+  ///
+  /// On Windows a path in a device namespace (`\\?\`, `\\.\`) is walked
+  /// first, whatever the OS says of it, and the walked path is the answer
+  /// (`realpathWalksFirst`; NUL resolves to itself): node's root
+  /// there is two components deep (`\\?\C:\`, `\\.\pipe\`), and its lstat
+  /// fails where the OS resolves the whole path -- `\\?\C:\x` is
+  /// `EISDIR, lstat 'C:'` on v22.22.2 (#361).
   function* realpathWalk(path) {
     const pathMod = registry.get("path");
     let full = pathMod.resolve(path);
@@ -654,7 +664,7 @@
         if (statKind(stat) === "symlink") {
           // node stats the link (so a dangling one fails `stat`), reads it,
           // and starts over from the resolved path.
-          if (++hops > 40) return;
+          if (++hops > 40) return null;
           yield ["stat", current];
           const target = yield ["readlink", current];
           full = pathMod.resolve(pathMod.dirname(current), target, ...parts.slice(i + 1));
@@ -662,8 +672,17 @@
           break;
         }
       }
-      if (!relinked) return;
+      if (!relinked) return full;
     }
+  }
+
+  /// Whether node's realpath walk answers for `path` before the OS is asked
+  /// (realpathWalk): on Windows, a path that resolves into a device
+  /// namespace.
+  function realpathWalksFirst(path) {
+    if (globalThis.__oam.node.platform !== "win32" || typeof path !== "string") return false;
+    const full = registry.get("path").resolve(path);
+    return full.startsWith("\\\\?\\") || full.startsWith("\\\\.\\");
   }
 
   /// Captured when node_compat.js is evaluated, so a script that replaces
@@ -3807,12 +3826,17 @@
       const max = this.getMaxListeners();
       if (max > 0 && count > max && !this._events[type].warned) {
         this._events[type].warned = true;
-        if (globalThis.console) {
-          globalThis.console.warn(
-            `(oam) MaxListenersExceededWarning: ${count} ${String(type)} listeners added to EventEmitter. ` +
-              `Use emitter.setMaxListeners() to increase limit`,
-          );
-        }
+        // A process warning, as node's (_addListener, lib/events.js): an
+        // Error carrying the emitter, type and count, through emitWarning,
+        // so 'warning' listeners hear it and --no-warnings silences it.
+        // No error code: it is a warning.
+        const w = new Error(
+          `Possible EventEmitter memory leak detected. ${count} ${String(type)} listeners ` +
+            `added to ${registry.get("util").inspect(this, { depth: -1 })}. MaxListeners is ${max}. ` +
+            "Use emitter.setMaxListeners() to increase limit",
+        );
+        Object.assign(w, { name: "MaxListenersExceededWarning", emitter: this, type, count });
+        globalThis.process.emitWarning(w);
       }
       return this;
     };
@@ -4313,26 +4337,38 @@
       return [];
     }
 
-    // Internal slot used to attach a max-listeners value to a native
-    // EventTarget (which has no get/setMaxListeners method of its own), the way
-    // Node stores it via kMaxEventTargetListeners.
-    const kMaxEventTargetListeners = Symbol("kMaxEventTargetListeners");
+    // The slots an EventTarget (which has no get/setMaxListeners method of
+    // its own) keeps its listener limit, and whether it warned, in -- node's
+    // kMaxEventTargetListeners / kMaxEventTargetListenersWarned:
+    // bootstrap.js's EventTarget sets them when made and reads them in
+    // addEventListener to warn past the limit.
+    const { kMaxEventTargetListeners, kMaxEventTargetListenersWarned } =
+      globalThis.__oamEventTargetLimitSymbols;
 
-    function setMaxListeners(n) {
-      if (arguments.length > 1) {
-        for (var i = 1; i < arguments.length; i++) {
-          const target = arguments[i];
-          if (typeof target.setMaxListeners === "function") {
-            target.setMaxListeners(n);
-          } else {
-            // Native EventTarget / AbortSignal: stash the value in a slot.
-            Object.defineProperty(target, kMaxEventTargetListeners, {
-              value: n,
-              writable: true,
-              configurable: true,
-              enumerable: false,
-            });
-          }
+    // node's events.setMaxListeners(n = defaultMaxListeners, ...eventTargets):
+    // with no target it sets the default; a new limit lets a target warn
+    // again. n is checked as node's validateNumber(n, 'setMaxListeners', 0)
+    // checks it, and setMaxListeners is read off any other target as node
+    // reads it, so a null or undefined one is V8's own TypeError.
+    function setMaxListeners(n = EventEmitter.defaultMaxListeners, ...eventTargets) {
+      if (typeof n !== "number") {
+        throw new codes.ERR_INVALID_ARG_TYPE("setMaxListeners", "number", n);
+      }
+      if (n < 0 || Number.isNaN(n)) {
+        throw new codes.ERR_OUT_OF_RANGE("setMaxListeners", ">= 0", n);
+      }
+      if (eventTargets.length === 0) {
+        EventEmitter.defaultMaxListeners = n;
+        return;
+      }
+      for (const target of eventTargets) {
+        if (target instanceof EventTarget) {
+          target[kMaxEventTargetListeners] = n;
+          target[kMaxEventTargetListenersWarned] = false;
+        } else if (typeof target.setMaxListeners === "function") {
+          target.setMaxListeners(n);
+        } else {
+          throw new codes.ERR_INVALID_ARG_TYPE("eventTargets", ["EventEmitter", "EventTarget"], target);
         }
       }
     }
@@ -4346,8 +4382,13 @@
     EventEmitter.listenerCount = (emitter, type, listener) =>
       EventEmitter.prototype.listenerCount.call(emitter, type, listener);
     EventEmitter.getMaxListeners = function getMaxListeners(emitterOrTarget) {
-      if (typeof emitterOrTarget.getMaxListeners === "function") {
-        return emitterOrTarget.getMaxListeners();
+      // node reads an object with a getMaxListeners method as an emitter,
+      // through its _maxListeners, without calling the method -- so a
+      // NodeEventTarget (a MessagePort) answers the module default here
+      // whatever its own limit is, as it does under node.
+      if (typeof emitterOrTarget?.getMaxListeners === "function") {
+        const n = emitterOrTarget._maxListeners;
+        return n === undefined ? EventEmitter.defaultMaxListeners : n;
       }
       if (
         emitterOrTarget != null &&
@@ -7580,6 +7621,18 @@
       Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
     }
 
+    // node's util._extend: the source's own enumerable keys, assigned last
+    // to first; a source that is not an object leaves the target as it is.
+    function _extend(target, source) {
+      if (source === null || typeof source !== "object") return target;
+      const keys = Object.keys(source);
+      let i = keys.length;
+      while (i--) {
+        target[keys[i]] = source[keys[i]];
+      }
+      return target;
+    }
+
     // Codes that have already warned live in deprecationCodesWarned (above
     // the util factory): Node warns once per CODE, not once per wrapper.
     function deprecate(fn, msg, code) {
@@ -8599,7 +8652,18 @@
       deprecate,
       debuglog,
       debug: debuglog,
-      isArray: Array.isArray,
+      // Runtime-deprecated in node v22.22.2 (lib/util.js), each warning on
+      // its first call.
+      isArray: deprecate(
+        Array.isArray,
+        "The `util.isArray` API is deprecated. Please use `Array.isArray()` instead.",
+        "DEP0044",
+      ),
+      _extend: deprecate(
+        _extend,
+        "The `util._extend` API is deprecated. Please use Object.assign() instead.",
+        "DEP0060",
+      ),
       isDeepStrictEqual: (a, b) => deepEqualImpl(a, b, true),
       toUSVString: (val) => {
         var s = String(val);
@@ -13313,11 +13377,26 @@
     dest = cpString(dest);
     const fs = registry.get("fs");
     const path = registry.get("path");
+    // node's UVException names the path as its binding shows any path: the
+    // namespaced one, with the `\\?\` prefix taken off.
+    const srcFailed = (e) => cpUvError(e, dereference ? "stat" : "lstat", globalThis.__oam.node.fsShownPathOf(src));
+    // On Windows MSVC's std::filesystem stat asks the path's attributes
+    // first (GetFileAttributesExW), as access does: a device refuses it
+    // EINVAL -- NUL too, which stats -- and a share root that is no disk
+    // ENOTSUP. A sharing violation sends it on to a directory search,
+    // which is the stat below.
+    if (process.platform === "win32") {
+      try {
+        fs.accessSync(src);
+      } catch (e) {
+        if (e.code !== "EBUSY") throw srcFailed(e);
+      }
+    }
     let srcStat;
     try {
       srcStat = dereference ? fs.lstatSync(src) : fs.statSync(src);
     } catch (e) {
-      throw cpUvError(e, dereference ? "stat" : "lstat", cpNs(src));
+      throw srcFailed(e);
     }
     let destStat = null;
     try {
@@ -14139,17 +14218,14 @@
       // warning text carries node's own typo ("steam"), reproduced here so
       // a caller matching on it sees the same bytes.
       //
-      // DIVERGENCE, deliberate, and the only one: node's stream is a BYTE
-      // stream (`type: 'bytes'`, autoAllocateChunkSize 16384), so
-      // `getReader({ mode: 'byob' })` there returns a real
-      // ReadableStreamBYOBReader. oam's web-streams layer (js/streams.js)
-      // is default-reader-only -- a `type: 'bytes'` stream queues bytes
-      // and pulls as node's does, but has no byobRequest -- so this
-      // returns a stream read through a default reader, carrying the same 16 KiB
-      // plain-Uint8Array chunks, at the same boundaries, off the same read
-      // path. Everything reachable through a default reader or async
-      // iteration matches node; a BYOB reader does not. The fix belongs in
-      // js/streams.js's controller, not in a second reader here.
+      // node's stream is a BYTE stream (`type: 'bytes'`,
+      // autoAllocateChunkSize 16384) whose pull reads into
+      // controller.byobRequest.view and answers respond(bytesRead). A BYOB
+      // read does exactly that here (js/streams.js has the byobRequest). A
+      // default read has no byobRequest in oam -- autoAllocateChunkSize is
+      // not implemented -- so it reads a 16 KiB view of its own and enqueues
+      // it: the same plain-Uint8Array chunks, at the same boundaries, off
+      // the same read path.
       readableWebStream(options = undefined) {
         const fh = this, h = this[kNative];
         if (fh[kFd] === -1) throw codes.ERR_INVALID_STATE("The FileHandle is closed");
@@ -14202,7 +14278,25 @@
             // chunk is dropped, exactly as a cancel drops it).
             if (gone()) {
               controller.close();
+              // A BYOB read waiting is done (a closed byte stream answers
+              // a pending one only through respond(0)).
+              controller.byobRequest?.respond(0);
               await ondone();
+              return;
+            }
+            var request = controller.byobRequest;
+            if (request !== null) {
+              // node's pull, as it is: the view's own byteOffset passed as
+              // the offset into the view.
+              var target = request.view;
+              var got = await fh.read(target, target.byteOffset, target.byteLength);
+              if (gone() || got.bytesRead === 0) {
+                controller.close();
+                await ondone();
+                controller.byobRequest?.respond(0);
+                return;
+              }
+              controller.byobRequest.respond(got.bytesRead);
               return;
             }
             var view = new Uint8Array(CHUNK);
@@ -14881,35 +14975,61 @@
       return toPath(typeof path === "string" || isUrl ? path : path + "");
     }
 
-    function realpathWalkErrorSync(path, original) {
+    // realpathWalk run synchronously: its answer, or null; a failing lstat /
+    // readlink throws its own error.
+    function realpathWalkSync(path) {
       const walk = realpathWalk(path);
       let step = walk.next();
-      try {
-        while (!step.done) {
-          const [op, at] = step.value;
-          step = walk.next(
-            op === "readlink"
-              ? natives.fsReadlinkSync(at)
-              : natives.fsStatSync(at, op === "lstat", true, statSyncValues),
-          );
-        }
-      } catch (e) {
-        return e;
+      while (!step.done) {
+        const [op, at] = step.value;
+        step = walk.next(
+          op === "readlink"
+            ? natives.fsReadlinkSync(at)
+            : natives.fsStatSync(at, op === "lstat", true, statSyncValues),
+        );
       }
-      return original;
+      return step.value;
     }
 
+    // As realpathWalkSync, each step off the loop thread.
+    async function realpathWalkAsync(path) {
+      const walk = realpathWalk(path);
+      let step = walk.next();
+      while (!step.done) {
+        const [op, at] = step.value;
+        step = walk.next(op === "readlink" ? await natives.fsReadlink(at) : await natives.fsStat(at, op === "lstat"));
+      }
+      return step.value;
+    }
+
+    // node's realpathSync: on Windows a device-namespace path is the walk's
+    // (realpathWalksFirst); any other is the OS's answer, and when the OS
+    // refuses it the walk finds node's error. A walk that completes leaves
+    // the OS's error standing: oam's lstat succeeds where node's fails (the
+    // paging file, EPERM in node), so the walked path is not node's answer.
+    function realpathWalkingSync(path) {
+      if (realpathWalksFirst(path)) {
+        const walked = realpathWalkSync(path);
+        if (walked !== null) return walked;
+      }
+      try {
+        return realpathJsShape(natives.fsRealpathSync(path));
+      } catch (original) {
+        realpathWalkSync(path);
+        throw original;
+      }
+    }
+
+    // node's callback realpath, as realpathWalkingSync.
     async function realpathWalking(path) {
+      if (realpathWalksFirst(path)) {
+        const walked = await realpathWalkAsync(path);
+        if (walked !== null) return walked;
+      }
       try {
         return realpathJsShape(await natives.fsRealpath(path));
       } catch (original) {
-        // A failing lstat / readlink rejects with its own error.
-        const walk = realpathWalk(path);
-        let step = walk.next();
-        while (!step.done) {
-          const [op, at] = step.value;
-          step = walk.next(op === "readlink" ? await natives.fsReadlink(at) : await natives.fsStat(at, op === "lstat"));
-        }
+        await realpathWalkAsync(path);
         throw original;
       }
     }
@@ -15578,14 +15698,7 @@
       accessSync: (path, mode) => natives.fsAccessSync(toPath(path), mode ?? 0),
       // node's realpathSync stringifies rather than type-checks (`p += ''`),
       // and on failure reports what its component walk hit (realpathWalk).
-      realpathSync: (path) => {
-        const file = realpathArg(path);
-        try {
-          return realpathJsShape(natives.fsRealpathSync(file));
-        } catch (e) {
-          throw realpathWalkErrorSync(file, e);
-        }
-      },
+      realpathSync: (path) => realpathWalkingSync(realpathArg(path)),
       mkdtempSync: (prefix, options) => {
         const [valid, encoding] = mkdtempArgs(prefix, options);
         return mkdtempResult(natives.fsMkdtempSync(valid), encoding);
@@ -16291,67 +16404,156 @@
 
     // ---- openAsBlob
     //
-    // Shapes measured against node v22.22.2 rather than inferred:
-    //   - `options.type` is coerced with `|| ''` BEFORE the string check, so
+    // node's openAsBlob (lib/fs.js + src/node_blob.cc, v22.22.2), measured:
+    //   - everything happens at the call, so every failure THROWS there
+    //     rather than rejecting the promise it returns: the options are
+    //     validated (an object: not null, an array or a function), then
+    //     `options.type` -- coerced with `|| ''` BEFORE the string check, so
     //     {type: 0 | false | null | NaN | undefined} all yield "" and only a
-    //     truthy non-string (e.g. 123) throws ERR_INVALID_ARG_TYPE. node's own
-    //     source is `const type = options.type || ''; validateString(...)`.
-    //   - an unreadable path does NOT surface the fs error. node throws a
-    //     TypeError with code ERR_INVALID_ARG_VALUE, message "Unable to open
-    //     file as blob", and `code` as its ONLY own property -- no errno, no
-    //     syscall, no path.
-    //   - the arguments are checked SYNCHRONOUSLY -- node's openAsBlob is a
-    //     plain function returning a promise, so a bad type or path throws
-    //     at the call.
-    fs.openAsBlob = (p, options) => {
-      const type = (options && options.type) || "";
+    //     truthy non-string throws -- then the path, then the file is opened
+    //     and fstat'ed (and closed again).
+    //   - a path it cannot open does NOT surface the fs error: a TypeError
+    //     with code ERR_INVALID_ARG_VALUE, message "Unable to open file as
+    //     blob", and `code` as its ONLY own property -- no errno, no syscall,
+    //     no path. Except a --permission denial, which keeps its own
+    //     ERR_ACCESS_DENIED.
+    //   - the Blob is file-backed: nothing is read at the call. Each read
+    //     opens the file again, and every chunk read (64 KiB) is preceded by
+    //     an fstat that must give the size, and the NANOSECOND part of the
+    //     mtime, the open's fstat gave -- that is node's FdEntry
+    //     CheckModified, which compares st_size and st_mtim.tv_nsec only --
+    //     or the read fails NotReadableError. A directory (#335) is the same
+    //     model: its open and fstat succeed, so a Blob of the size the fstat
+    //     says is made (0 on Windows, the directory's own size on Linux and
+    //     macOS), a non-empty one fails as reading a directory does, and a
+    //     changed one fails the check. The NUL device is a Blob of no bytes.
+    //   - the type is the given string, not normalized.
+    fs.openAsBlob = (p, options = {}) => {
+      if (options === null || typeof options !== "object" || Array.isArray(options)) {
+        throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+      }
+      const type = options.type || "";
       if (typeof type !== "string") {
         throw codes.ERR_INVALID_ARG_TYPE("options.type", "string", type);
       }
-      return openAsBlobPath(toPath(p), type);
+      const file = toPath(p);
+      return Promise.resolve(openAsBlobPath(file, type));
     };
-    // What node's openAsBlob gives for a directory (#335): its open and fstat
-    // succeed, so the Blob is made, with the size the fstat says -- 0 on
-    // Windows, the directory's own size on Linux and macOS -- and reading a
-    // non-empty one fails NotReadableError, as reading a directory does. The
-    // Blob class carries that state (`_unreadableSize`), so a Blob, a body or
-    // a form made with this one as a part fails the same way. A size of 0
-    // has nothing to read, so on Windows it reads as empty.
-    const directoryBlob = (size, type) => {
-      const blob = new Blob([], { type });
-      if (size > 0) blob._unreadableSize = size;
-      return markFileBacked(blob);
+    const unableToOpenAsBlob = () => {
+      const err = new TypeError("Unable to open file as blob");
+      err.code = "ERR_INVALID_ARG_VALUE";
+      return err;
     };
-    const markFileBacked = (blob) => {
-      // node returns an instance of an INTERNAL TransferableBlob subclass and
-      // plants an own `constructor` back-pointing at Blob so the subclass does
-      // not leak through `b.constructor.name`. Measured descriptor:
-      // {value: Blob, writable: true, enumerable: true, configurable: true} --
-      // enumerable, so `Object.keys(blob)` is ["constructor"], which a
-      // structural comparison would otherwise see as a difference. A plain
-      // assignment produces exactly that descriptor.
-      blob.constructor = Blob;
-      // Marks it un-structuredClone-able, which node's file-backed blob is.
-      // A registered symbol so bootstrap.js's cloner can see it across scopes,
-      // and a symbol key so it stays out of Object.keys.
+    const openAsBlobPath = (file, type) => {
+      const flags = openFlags("r", natives);
+      let fd;
+      try {
+        fd = natives.fsOpenSync(file, flags, 0o666);
+      } catch (e) {
+        if (e && e.code === "ERR_ACCESS_DENIED") throw e;
+        // Deliberately swallowing the underlying error: node reports none of
+        // it, and leaking ENOENT here would be a divergence, not a courtesy.
+        throw unableToOpenAsBlob();
+      }
+      let size;
+      let reference;
+      try {
+        natives.fsFstatSync(fd, statSyncValues);
+        size = statSyncValues[STAT_SIZE];
+        reference = blobFileReference(statSyncExact);
+      } catch {
+        throw unableToOpenAsBlob();
+      } finally {
+        natives.fsCloseSync(fd);
+      }
+      const blob = globalThis.Blob[Symbol.for("oam.blob.fromFile")](blobFile(file, flags, reference), size, type);
+      // Marks it un-structuredClone-able, which node's file-backed blob is
+      // (the one openAsBlob returns; a slice of it, or a Blob made of it,
+      // clones). A registered symbol so bootstrap.js's cloner can see it
+      // across scopes, and a symbol key so it stays out of Object.keys (which
+      // is ["constructor"], as node's createBlob makes it).
       blob[Symbol.for("oam.blob.fileBacked")] = true;
       return blob;
     };
-    const openAsBlobPath = async (file, type) => {
-      let bytes;
-      try {
-        const raw = await natives.fsStat(file, false);
-        if (statKind(raw) === "dir") return directoryBlob(Number(raw[STAT_SIZE]), type);
-        bytes = await natives.fsReadFile(file);
-      } catch {
-        // Deliberately swallowing the underlying error: node reports none of
-        // it, and leaking ENOENT here would be a divergence, not a courtesy.
-        const err = new TypeError("Unable to open file as blob");
-        err.code = "ERR_INVALID_ARG_VALUE";
-        throw err;
-      }
-      return markFileBacked(new Blob([bytes], { type }));
+    // What a later fstat must match: the size and the mtime's nanoseconds.
+    const blobFileReference = (exact) => ({ size: exact[8], mtimeNsec: exact[13] });
+    const blobFileUnchanged = (record, reference) => {
+      const exact = statExactValues(record);
+      return exact[8] === reference.size && exact[13] === reference.mtimeNsec;
     };
+    // A descriptor a reader still held when it was dropped unfinished (a
+    // stream nobody read to the end) is closed when the reader is collected.
+    // Made on first use, so a context that never reads one has none.
+    let blobFileFinalizerRegistry;
+    const blobFileFinalizer = () =>
+      (blobFileFinalizerRegistry ??= new FinalizationRegistry((held) => {
+        if (held.fd !== undefined) natives.fsClose(held.fd);
+      }));
+    // The file part's source (bootstrap.js's Blob): open(start, end) gives a
+    // reader of [start, end) whose pull(cb) calls back cb(1, chunk), cb(0) at
+    // the end or cb(-1) on any failure, as node's FdEntry reader does.
+    const blobFile = (file, flags, reference) => ({
+      open(start, end) {
+        const held = { fd: undefined };
+        let position = start;
+        let done = false;
+        const finish = () => {
+          done = true;
+          if (held.fd !== undefined) {
+            natives.fsClose(held.fd);
+            held.fd = undefined;
+          }
+          blobFileFinalizer().unregister(held);
+        };
+        const step = async () => {
+          if (held.fd === undefined) {
+            const info = await natives.fsOpen(file, flags, 0o666);
+            // A cancel that landed while the open was in flight found no fd
+            // to close: close this one here, or it stays open until GC.
+            if (done) {
+              natives.fsClose(info.handle);
+              return 0;
+            }
+            held.fd = info.handle;
+            blobFileFinalizer().register(reader, held, held);
+          }
+          if (!blobFileUnchanged(await natives.fsFstat(held.fd), reference)) return -1;
+          if (position >= end) return 0;
+          const chunk = await natives.fsReadChunk(held.fd, Math.min(65536, end - position), position);
+          if (chunk === undefined || chunk.length === 0) return 0;
+          position += chunk.length;
+          return chunk;
+        };
+        const reader = {
+          pull(cb) {
+            if (done) {
+              cb(-1);
+              return;
+            }
+            step().then(
+              (result) => {
+                if (done) return;
+                if (result === 0 || result === -1) {
+                  finish();
+                  cb(result);
+                } else {
+                  cb(1, result);
+                }
+              },
+              () => {
+                if (done) return;
+                finish();
+                cb(-1);
+              },
+            );
+          },
+          cancel() {
+            finish();
+          },
+        };
+        return reader;
+      },
+    });
 
     // The `.native` forms are the OS realpath: node type-checks their path
     // (getValidatedPath) and reports `realpath` with the whole path.
@@ -16484,17 +16686,6 @@
     // (via the __oamDispatchUncaught global).
     const dispatchUncaught = (err, origin) => {
       origin = origin || "uncaughtException";
-      // A throw that already escaped a handler INSIDE this ladder (marked
-      // below) must not re-enter it: Node treats a throwing
-      // uncaughtException/monitor handler as immediately fatal, exit 7 --
-      // never re-emitting the monitor or re-invoking listeners.
-      if (
-        err !== null && (typeof err === "object" || typeof err === "function") &&
-        err.__oamHandlerThrow
-      ) {
-        process.__oamFatalCode = 7;
-        return false;
-      }
       // Node's TriggerUncaughtException refuses to run when
       // process._fatalException was monkeypatched to a non-function:
       // exit code 6 (kInvalidFatalExceptionMonkeyPatching). oam's ladder
@@ -16505,6 +16696,13 @@
         process.__oamFatalCode = 6;
         return false;
       }
+      // A listener in the ladder that throws is fatal, exit 7
+      // (kExceptionInFatalExceptionHandler), and the report names ITS throw:
+      // so try/finally and no catch -- V8 rethrows from a finally keeping the
+      // original Message, where a catch-and-rethrow would point the report at
+      // this file (#399 item 5). `settled` is set on every way out that
+      // returns.
+      let settled = false;
       try {
         // Monitor first, ALWAYS -- including for domain-handled errors
         // (probe-verified: node emits uncaughtExceptionMonitor before the
@@ -16525,6 +16723,7 @@
             if (typeof registry._domainUncaughtClear === "function") {
               registry._domainUncaughtClear();
             }
+            settled = true;
             return true;
           } catch (e2) {
             if (e2 !== err) throw e2; // domain 'error' listener threw: fatal
@@ -16543,26 +16742,18 @@
         }
         if (process._uncaughtCaptureCb) {
           process._uncaughtCaptureCb(err);
+          settled = true;
           return true;
         }
         if (process.listenerCount("uncaughtException") > 0) {
           process.emit("uncaughtException", err, origin);
+          settled = true;
           return true;
         }
+        settled = true;
         return false;
-      } catch (e2) {
-        // A handler inside the ladder threw. Mark the escaping error so a
-        // ledger re-dispatch recognizes it as handler-throw (fatal 7)
-        // instead of re-running the ladder. Primitive throws can't carry
-        // the mark -- they take the legacy re-dispatch path.
-        if (e2 !== null && (typeof e2 === "object" || typeof e2 === "function")) {
-          try {
-            Object.defineProperty(e2, "__oamHandlerThrow", {
-              value: true, writable: false, configurable: false, enumerable: false,
-            });
-          } catch { /* frozen -- best effort */ }
-        }
-        throw e2;
+      } finally {
+        if (!settled) process.__oamFatalCode = 7;
       }
     };
     Object.defineProperty(globalThis, "__oamDispatchUncaught", {
@@ -16693,16 +16884,20 @@
     // It prints whatever Error the event carries -- one emitted directly
     // too, not only through emitWarning -- and nothing that is not one.
     //
-    // Not here: node's one-time hint naming `--trace-warnings` /
-    // `--trace-deprecation`. oam has neither flag, so there is nothing true
-    // for the hint to say (docs/node-divergences.md).
+    // Under --trace-warnings (process.traceProcessWarnings), or
+    // --trace-deprecation (process.traceDeprecation) for a deprecation, it
+    // prints the warning's stack in place of its toString(). Otherwise the
+    // first warning it prints carries node's one-time hint naming the flag
+    // for its kind, after the program's name: basename(process.argv0), which
+    // is `oam` for oam. Once per thread, as node's module-level flag is.
+    let traceWarningHelperShown = false;
     function onWarning(warning) {
       if (!(warning instanceof Error)) return;
       const isDeprecation = warning.name === "DeprecationWarning";
       if (isDeprecation && process.noDeprecation) return;
-      // --no-warnings takes the listener off at startup (the CLI's prelude,
-      // which a worker inherits); the check is for whatever still holds a
-      // reference to this function and calls it.
+      // --no-warnings takes the listener off at startup (the CLI's prelude;
+      // a worker's own, decided by its execArgv and env, #370); the check is
+      // for whatever still holds a reference to this function and calls it.
       if (globalThis.__oamNoWarnings) return;
       if (globalThis.__oamNoDeprecation && isDeprecation) return;
       // --disable-warning=<name|code>: still emitted, not printed.
@@ -16716,12 +16911,23 @@
       // The (node:PID) prefix is node's own (`process.release.name`), kept
       // so tooling that greps warnings still finds them. A warning whose
       // toString is not a function is printed as an Error prints.
+      const trace = process.traceProcessWarnings || (isDeprecation && process.traceDeprecation);
       let line = `(node:${process.pid}) `;
       if (warning.code) line += `[${warning.code}] `;
-      line += typeof warning.toString === "function"
-        ? `${warning.toString()}`
-        : Error.prototype.toString.call(warning);
+      if (trace && warning.stack) {
+        line += `${warning.stack}`;
+      } else {
+        line += typeof warning.toString === "function"
+          ? `${warning.toString()}`
+          : Error.prototype.toString.call(warning);
+      }
       if (typeof warning.detail === "string") line += `\n${warning.detail}`;
+      if (!trace && !traceWarningHelperShown) {
+        const flag = isDeprecation ? "--trace-deprecation" : "--trace-warnings";
+        const argv0 = registry.get("path").basename(process.argv0 || "node", ".exe");
+        line += `\n(Use \`${argv0} ${flag} ...\` to show where the warning was created)`;
+        traceWarningHelperShown = true;
+      }
       line += "\n";
       // NODE_REDIRECT_WARNINGS: append the formatted warning to the named
       // file instead of stderr. Read from natives.env() (the real OS
@@ -17325,6 +17531,10 @@
         if (typeof fn !== "function") {
           throw new codes.ERR_INVALID_ARG_TYPE("callback", "Function", fn);
         }
+        // node's nextTick enqueues nothing once the process is exiting: the
+        // callback would never get to run. So a warning emitted from an
+        // 'exit' listener (delivered on a tick) is never printed (#366).
+        if (process._exiting) return;
         // Capture the ALS frame as DATA. Wrapping the callback in a binder
         // closure (the old shape) put an extra "at Array.<anonymous>" frame
         // between the user's frame and the drain -- Node has no such frame,
@@ -17515,77 +17725,61 @@
         }
         if (!condition) throw new codes.ERR_ASSERTION(message);
       },
-      emitWarning(warning, typeOrOptions, codeArg, ctorArg) {
-        // Normalize the (warning, type, code, ctor) / (warning, options)
-        // overloads the way Node does.
-        let type = "Warning";
-        let code;
-        let ctor;
+      emitWarning(warning, type, code, ctor) {
+        // The (warning, type, code, ctor) / (warning, ctor) / (warning,
+        // options) overloads, as node's emitWarning reads them
+        // (lib/internal/process/warning.js, v22.22.2): the options form takes
+        // `options.type || 'Warning'`, so an empty or falsy type is Warning,
+        // and the type and code are validated under the ARGUMENT's name in
+        // every form, before the warning itself is looked at.
         let detail;
-        if (typeOrOptions !== null && typeof typeOrOptions === "object" && !Array.isArray(typeOrOptions)) {
-          // options form
-          if (typeOrOptions.type !== undefined) {
-            if (typeof typeOrOptions.type !== "string") {
-              throw new codes.ERR_INVALID_ARG_TYPE("options.type", "string", typeOrOptions.type);
-            }
-            type = typeOrOptions.type;
-          }
-          if (typeOrOptions.code !== undefined) {
-            if (typeof typeOrOptions.code !== "string") {
-              throw new codes.ERR_INVALID_ARG_TYPE("options.code", "string", typeOrOptions.code);
-            }
-            code = typeOrOptions.code;
-          }
-          if (typeof typeOrOptions.ctor === "function") ctor = typeOrOptions.ctor;
-          if (typeof typeOrOptions.detail === "string") detail = typeOrOptions.detail;
-        } else if (typeof typeOrOptions === "function") {
-          // emitWarning(msg, ctor): a FUNCTION in the type position is the
-          // constructor used to trim the stack, not a type name. Node
-          // shifts it and leaves type at 'Warning'; oam used to throw
-          // ERR_INVALID_ARG_TYPE and reject a documented call form.
-          ctor = typeOrOptions;
-        } else {
-          if (typeOrOptions !== undefined) {
-            if (typeof typeOrOptions !== "string") {
-              throw new codes.ERR_INVALID_ARG_TYPE("type", "string", typeOrOptions);
-            }
-            type = typeOrOptions;
-          }
-          if (typeof codeArg === "function") {
-            ctor = codeArg;
-          } else if (codeArg !== undefined) {
-            if (typeof codeArg !== "string") {
-              throw new codes.ERR_INVALID_ARG_TYPE("code", "string", codeArg);
-            }
-            code = codeArg;
-          }
-          if (typeof ctorArg === "function") ctor = ctorArg;
+        if (type !== null && typeof type === "object" && !Array.isArray(type)) {
+          ctor = type.ctor;
+          code = type.code;
+          if (typeof type.detail === "string") detail = type.detail;
+          type = type.type || "Warning";
+        } else if (typeof type === "function") {
+          // emitWarning(msg, ctor): the constructor that trims the stack.
+          ctor = type;
+          code = undefined;
+          type = "Warning";
+        }
+        if (type !== undefined && typeof type !== "string") {
+          throw new codes.ERR_INVALID_ARG_TYPE("type", "string", type);
+        }
+        if (typeof code === "function") {
+          ctor = code;
+          code = undefined;
+        } else if (code !== undefined && typeof code !== "string") {
+          throw new codes.ERR_INVALID_ARG_TYPE("code", "string", code);
         }
 
         let warningObj;
-        if (warning instanceof Error) {
-          warningObj = warning;
-        } else if (typeof warning === "string") {
+        if (typeof warning === "string") {
+          // createWarningObject: a positional empty type is Warning too.
           warningObj = new Error(warning);
-          warningObj.name = String(type);
+          warningObj.name = String(type || "Warning");
           if (code !== undefined) warningObj.code = code;
           if (detail !== undefined) warningObj.detail = detail;
           if (typeof Error.captureStackTrace === "function") {
             Error.captureStackTrace(warningObj, ctor || process.emitWarning);
           }
+        } else if (warning instanceof Error) {
+          warningObj = warning;
         } else {
           throw new codes.ERR_INVALID_ARG_TYPE("warning", ["Error", "string"], warning);
         }
 
+        // noDeprecation first: a dropped deprecation is not thrown either.
         // throwDeprecation: a DeprecationWarning surfaces as an async throw
         // (uncaughtException), NOT a synchronous throw from emitWarning --
         // test-process-warning asserts the call site does not throw.
         if (warningObj.name === "DeprecationWarning") {
+          if (process.noDeprecation) return;
           if (process.throwDeprecation) {
             process.nextTick(() => { throw warningObj; });
             return;
           }
-          if (process.noDeprecation) return;
         }
 
         // Deferred, as node's is, so a listener attached after the call
@@ -18309,6 +18503,7 @@
       "_tls_common",
       "_tls_wrap",
       "string_decoder",
+      "sys",
       "timers",
       "timers/promises",
       "tls",
@@ -20627,12 +20822,34 @@
     }
 
     function createHash(algorithm) {
-      return new Hash(natives.cryptoHashCreate(String(algorithm)));
+      if (typeof algorithm !== "string") {
+        throw new codes.ERR_INVALID_ARG_TYPE("algorithm", "string", algorithm);
+      }
+      return new Hash(natives.cryptoHashCreate(algorithm));
     }
 
     function createHmac(algorithm, key) {
-      return new Hmac(natives.cryptoHmacCreate(String(algorithm), toBytes(key)));
+      if (typeof algorithm !== "string") {
+        throw new codes.ERR_INVALID_ARG_TYPE("hmac", "string", algorithm);
+      }
+      return new Hmac(natives.cryptoHmacCreate(algorithm, toBytes(key)));
     }
+
+    // node's crypto.Hash / crypto.Hmac: constructors that work with or
+    // without `new`, deprecated as constructors (DEP0179 / DEP0181) and
+    // exported behind util.deprecate, so `createHash(...) instanceof
+    // crypto.Hash` holds. Each builds what createHash / createHmac build.
+    function PublicHash(algorithm, options) {
+      return createHash(algorithm, options);
+    }
+    PublicHash.prototype = Hash.prototype;
+    function PublicHmac(hmac, key, options) {
+      return createHmac(hmac, key, options);
+    }
+    PublicHmac.prototype = Hmac.prototype;
+    const utilDeprecate = registry.get("util").deprecate;
+    const DeprecatedHash = utilDeprecate(PublicHash, "crypto.Hash constructor is deprecated.", "DEP0179");
+    const DeprecatedHmac = utilDeprecate(PublicHmac, "crypto.Hmac constructor is deprecated.", "DEP0181");
 
     function randomBytes(size, callback) {
       // Chunked: the native caps one call at 64KiB.
@@ -21744,6 +21961,8 @@
       },
       createHash,
       createHmac,
+      Hash: DeprecatedHash,
+      Hmac: DeprecatedHmac,
       randomBytes,
       pseudoRandomBytes: randomBytes,
       rng: randomBytes,
@@ -33719,9 +33938,12 @@
           // loop) and answered after it: a connection node's listener still
           // had in its backlog when it closed, which the client sees reset.
           // Handed to the closed server, it left the client connected to
-          // nothing (#338).
+          // nothing (#338). The close has already closed it (#388); the
+          // reset is for a stream the close did not reach. Otherwise taken
+          // now, before the server sees it, so its close leaves it be.
           const superseded = generation !== this._listenGeneration;
-          if (superseded || !this.listening) {
+          if (superseded || !this.listening
+              || !natives.tcpAcceptTake(this._serverId, accepted.handle)) {
             natives.tcpReset(accepted.handle, false);
             if (superseded) return;
             break;
@@ -33883,7 +34105,27 @@
       socketWrite: Socket.prototype.write,
     };
 
+    // node's net._setSimultaneousAccepts (DEP0121): a libuv accept-mode knob
+    // for Windows pipe/TCP handles, which oam's servers do not have, so only
+    // its deprecation is real -- one warning, on the first call, and nothing
+    // returned. It takes `handle` on Windows and nothing elsewhere, as node's.
+    let warnSimultaneousAccepts = true;
+    function warnSetSimultaneousAccepts() {
+      if (warnSimultaneousAccepts) {
+        warnSimultaneousAccepts = false;
+        process.emitWarning(
+          "net._setSimultaneousAccepts() is deprecated and will be removed.",
+          "DeprecationWarning",
+          "DEP0121",
+        );
+      }
+    }
+    const _setSimultaneousAccepts = natives.platform === "win32"
+      ? function _setSimultaneousAccepts(handle) { warnSetSimultaneousAccepts(); }
+      : function _setSimultaneousAccepts() { warnSetSimultaneousAccepts(); };
+
     return {
+      _setSimultaneousAccepts,
       isIPv4, isIPv6, isIP,
       getDefaultAutoSelectFamilyAttemptTimeout,
       setDefaultAutoSelectFamilyAttemptTimeout,
@@ -34455,9 +34697,59 @@
   };
 
   // ------------------------------------------------------------- punycode
-  // Pure-JS Punycode (RFC 3492). Node marks this deprecated but it is still
-  // in widespread use via the `url` module and idn-related libraries.
+  // Whether code under node_modules is on the stack, as node's
+  // isInsideNodeModules(frameLimit, defaultValue) binding (node_util.cc,
+  // v22.22.2) answers it for the punycode deprecation: any frame whose script
+  // name contains "/node_modules/", builtin frames skipped, and the default
+  // when the stack is too deep to search. Only the forward-slash spelling
+  // counts, which is why node on Windows, whose paths are written with
+  // backslashes, warns even when a package's CommonJS loads punycode
+  // (probed: v22.22.2 on win32 warns, on linux it does not). It is the
+  // script's name (StackFrame::GetScriptName), never a //# sourceURL=. And
+  // node names an ES module's frame by its file:// URL, where oam names it
+  // by its path, so such a frame is read with forward slashes: a package's
+  // ES module is skipped on win32 too, as in node.
+  let isEsModuleSource = null;
+  function isInsideNodeModules(frameLimit, defaultValue) {
+    let frames;
+    const savedLimit = Error.stackTraceLimit;
+    const savedPrepare = Error.prepareStackTrace;
+    try {
+      Error.stackTraceLimit = frameLimit;
+      Error.prepareStackTrace = (_, callSites) => callSites;
+      const holder = {};
+      Error.captureStackTrace(holder, isInsideNodeModules);
+      frames = holder.stack;
+    } catch {
+      return defaultValue;
+    } finally {
+      try {
+        Error.stackTraceLimit = savedLimit;
+        Error.prepareStackTrace = savedPrepare;
+      } catch { /* a frozen Error keeps what it had */ }
+    }
+    if (!Array.isArray(frames) || frames.length >= frameLimit) return defaultValue;
+    if (isEsModuleSource === null) isEsModuleSource = globalThis.__oam.node.isEsModuleSource;
+    for (const frame of frames) {
+      let name = frame.getFileName?.();
+      if (typeof name !== "string" || name === "") continue;
+      if (name.startsWith("node:") || name.startsWith("oam:")) continue;
+      if (name.includes("\\") && isEsModuleSource(name)) name = name.replaceAll("\\", "/");
+      if (name.includes("/node_modules/")) return true;
+    }
+    return false;
+  }
+
+  // Pure-JS Punycode (RFC 3492), node's punycode.js 2.1.0. Runtime-deprecated
+  // (DEP0040) when it is first loaded, unless a package is loading it.
   registry.factories.punycode = () => {
+    if (!isInsideNodeModules(100, true)) {
+      process.emitWarning(
+        "The `punycode` module is deprecated. Please use a userland alternative instead.",
+        "DeprecationWarning",
+        "DEP0040",
+      );
+    }
     const BASE = 36, TMIN = 1, TMAX = 26, SKEW = 38, DAMP = 700, BIAS_INIT = 72;
     const MAXINT = 2147483647;
     const DELIMITER = "\x2D";
@@ -34577,12 +34869,22 @@
     }
 
     return {
-      decode, encode, toASCII, toUnicode,
+      version: "2.1.0",
       ucs2: {
         decode: (str) => [...str].map((c) => c.codePointAt(0)),
         encode: (cps) => String.fromCodePoint(...cps),
       },
+      decode, encode, toASCII, toUnicode,
     };
+  };
+
+  // ------------------------------------------------------------------ sys
+  // node's lib/sys.js: util under its old name, deprecated (DEP0025) when it
+  // is first loaded.
+  registry.factories.sys = () => {
+    const util = registry.get("util");
+    process.emitWarning("sys is deprecated. Use util instead.", "DeprecationWarning", "DEP0025");
+    return util;
   };
 
   // ----------------------------------------------------------- perf_hooks
@@ -43903,9 +44205,11 @@
             if (accepted === undefined) break;
             // Accepted before close() (or the listen() that superseded
             // this loop) and answered after it: reset, as net.Server's
-            // accept loop resets one (#338).
+            // accept loop resets one (#338). Otherwise taken now, before
+            // the server sees it, so its close leaves it be (#388).
             var superseded = generation !== this._listenGeneration;
-            if (superseded || this._closed) {
+            if (superseded || this._closed
+                || !natives.tcpAcceptTake(serverId, accepted.handle)) {
               natives.tcpReset(accepted.handle, false);
               if (superseded) return;
               break;
@@ -44269,7 +44573,6 @@
   //   ERR_MISSING_ARGS TypeError; a post on or to a closed port is dropped.
   const kIsNodeStyleListener = Symbol.for("oam.kIsNodeStyleListener");
   const kNewPort = Symbol("kNewPort");
-  const kNodeTargetMaxListeners = Symbol("events.maxEventTargetListeners");
   const kPortClose = Symbol("kPortClose");
   // Port state, out of sight of inspect and Object.keys.
   const portStates = new WeakMap();
@@ -44329,19 +44632,15 @@
     }
   }
   class NodeEventTarget extends EventTarget {
+    // node's NodeEventTarget keeps no limit of its own: setMaxListeners is
+    // events.setMaxListeners(n, this) -- its checks, its default n, and the
+    // EventTarget slot addEventListener warns against -- and getMaxListeners
+    // reads that slot back.
     setMaxListeners(n) {
-      if (typeof n !== "number" || n < 0 || Number.isNaN(n)) {
-        throw new codes.ERR_OUT_OF_RANGE("n", "a non-negative number", n);
-      }
-      Object.defineProperty(this, kNodeTargetMaxListeners, {
-        value: n,
-        writable: true,
-        configurable: true,
-        enumerable: false,
-      });
+      registry.get("events").setMaxListeners(n, this);
     }
     getMaxListeners() {
-      return this[kNodeTargetMaxListeners] ?? 10;
+      return this[globalThis.__oamEventTargetLimitSymbols.kMaxEventTargetListeners];
     }
     eventNames() {
       return Array.from(this._listeners.keys()).filter(
@@ -44800,7 +45099,39 @@
     const WORKER_ERROR_CLASSES = {
       Error, TypeError, RangeError, SyntaxError, ReferenceError, EvalError, URIError,
     };
+    /** What a worker's fatal run threw, rebuilt from the form
+     *  __oamSerializeWorkerError (bootstrap.js) sent, as node's
+     *  deserializeError rebuilds it (#399): an error is an object of the
+     *  named built-in class carrying the sent properties and an own
+     *  Symbol.toStringTag 'Error'; a Symbol is Symbol.for its description;
+     *  any other value is itself, or the string it was inspected as. */
+    function decodeWorkerValue(encoded) {
+      if ("u" in encoded) return undefined;
+      if ("big" in encoded) return BigInt(encoded.big);
+      if ("num" in encoded) return Number(encoded.num);
+      if ("err" in encoded) return deserializeWorkerError(encoded.err);
+      if ("s" in encoded) return encoded.s;
+      return encoded.j;
+    }
+    function deserializeWorkerError(serialized) {
+      if (serialized.kind === "string") return serialized.value;
+      if (serialized.kind === "symbol") return Symbol.for(serialized.value);
+      if (serialized.kind === "value") return decodeWorkerValue(serialized.value);
+      const Class = Object.hasOwn(WORKER_ERROR_CLASSES, serialized.ctor)
+        ? WORKER_ERROR_CLASSES[serialized.ctor]
+        : Error;
+      const properties = { __proto__: null };
+      for (const [key, value, enumerable, writable, configurable] of serialized.props) {
+        properties[key] = { value: decodeWorkerValue(value), enumerable, writable, configurable };
+      }
+      Object.defineProperty(properties, Symbol.toStringTag, {
+        value: { value: "Error", configurable: true },
+        enumerable: true,
+      });
+      return Object.create(Class.prototype, properties);
+    }
     function workerError(raw) {
+      if (raw.serialized !== undefined) return deserializeWorkerError(raw.serialized);
       const Class = Object.hasOwn(WORKER_ERROR_CLASSES, raw.name) ? WORKER_ERROR_CLASSES[raw.name] : Error;
       const err = new Class(raw.message);
       for (const [key, value] of raw.props || []) err[key] = value;
@@ -44871,6 +45202,14 @@
               ? opts.execArgv.map(String)
               : (process.execArgv || []).map(String),
             env,
+            // node's Worker shares its creator's options only when it is
+            // given neither: an `env` (other than SHARE_ENV or process.env
+            // itself) or an `execArgv` starts it from the defaults, with
+            // NODE_OPTIONS from that environment and then the execArgv
+            // (#370; src/node_worker.cc).
+            inheritFlags:
+              (opts.env == null || opts.env === SHARE_ENV || opts.env === process.env) &&
+              !Array.isArray(opts.execArgv),
           }),
         );
         this._workerId = result.workerId;
@@ -46007,12 +46346,16 @@
                 // Node delivers a microtask throw to uncaughtException
                 // BETWEEN sibling microtasks, not after the checkpoint --
                 // the same canonical ladder as the nextTick drain (monitor +
-                // origin arg included). No consumer = rethrow into the
-                // engine ledger (fatal path unchanged).
-                const dispatch = globalThis.__oamDispatchUncaught;
-                if (typeof dispatch === "function" && dispatch(e, "uncaughtException")) {
-                  return;
-                }
+                // origin arg included).
+                //
+                // No consumer, or a listener that threw: fatal, and node
+                // exits right there -- no later promise job of the same
+                // drain runs (#398). The engine runs the ladder, notes the
+                // throw that comes next as an already-dispatched fatal, and
+                // ends the checkpoint at it. A listener's own throw it
+                // throws from here itself, having kept its throw site for
+                // the report, as node's names the listener's line.
+                if (natives.dispatchMicrotaskThrow(e)) return;
                 throw e;
               }
             });

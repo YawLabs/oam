@@ -313,6 +313,12 @@ fn main() {
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/bootstrap.js"),
             None,
         ),
+        // import()'s loader chain: a factory the runtime calls once at
+        // construction (modules::install_dynamic_import).
+        (
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/esm_loader.js"),
+            None,
+        ),
         // Before node_compat.js, which picks the factory up off globalThis.
         (
             concat!(

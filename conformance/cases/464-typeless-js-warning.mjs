@@ -11,8 +11,8 @@
 //
 // stdout only is compared, so each run reports what its stderr held: how many
 // warnings, and their text with the process id and this run's directory
-// taken out. (node's printer adds a trace hint line oam's does not --
-// docs/node-divergences.md -- so only the warning's own lines are kept.)
+// taken out. Only the warning's own lines are kept: the printer's one-time
+// trace hint is case 406's to compare.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";

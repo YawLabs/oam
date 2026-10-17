@@ -345,33 +345,35 @@ enum Listener {
 }
 
 impl Listener {
-    /// The next connection, polled where the listener sits in the registry,
-    /// or None for a listener that has to be taken out to accept: a Windows
-    /// pipe server, whose accept hands out the waiting pipe instance and
-    /// creates the next.
+    /// The next connection, polled where the listener sits in the registry
+    /// -- a Windows pipe server's too, whose waiting instances live in it
+    /// (#388) -- so the close that removes the listener closes it.
     fn poll_in_place(
-        &self,
+        &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> Option<std::task::Poll<std::io::Result<Accepted>>> {
+    ) -> std::task::Poll<std::io::Result<Accepted>> {
         match self {
-            Listener::Tcp(listener) => Some(
-                listener
-                    .poll_accept(cx)
-                    .map_ok(|(stream, peer)| Accepted::Tcp(stream, peer)),
-            ),
-            #[cfg(unix)]
-            Listener::Pipe(listener) => Some(listener.poll_accept(cx).map_ok(|halves| {
+            Listener::Tcp(listener) => listener
+                .poll_accept(cx)
+                .map_ok(|(stream, peer)| Accepted::Tcp(stream, peer)),
+            Listener::Pipe(listener) => listener.poll_accept(cx).map_ok(|halves| {
                 let (reader, writer) = pipe_halves(halves);
                 Accepted::Pipe(reader, writer)
-            })),
-            #[cfg(windows)]
-            Listener::Pipe(_) => None,
+            }),
         }
     }
 
-    /// Whether [`Self::poll_in_place`] can accept from it, without polling.
-    fn accepts_in_place(&self) -> bool {
-        cfg!(unix) || matches!(self, Listener::Tcp(_))
+    /// Close it before returning. Dropping closes a TCP listener or a Unix
+    /// socket; a Windows pipe server's waiting instances need
+    /// [`crate::pipe::PipeListener::close`].
+    fn close(self) {
+        match self {
+            Listener::Tcp(listener) => drop(listener),
+            #[cfg(windows)]
+            Listener::Pipe(listener) => listener.close(),
+            #[cfg(unix)]
+            Listener::Pipe(listener) => drop(listener),
+        }
     }
 }
 
@@ -381,10 +383,9 @@ pub struct TcpState {
     writers: HashMap<u64, WriteHalf>,
     listeners: HashMap<u64, Listener>,
     /// Stream handles closed while a half was checked out for an await
-    /// (the last half back removes the marker), plus the ids of Windows pipe
-    /// servers closed while an accept held their listener (the accept
-    /// removes those). A stream id used to stay here for the life of the
-    /// process once closed (#139).
+    /// (the last half back removes the marker). A stream id used to stay
+    /// here for the life of the process once closed (#139). Servers need no
+    /// marker: every accept polls its listener where it sits (#388).
     closed: HashSet<u64>,
     /// The closed stream handles among `closed` that were closed by
     /// [`tcp_reset`]: a half that comes back from its await drops without
@@ -408,6 +409,12 @@ pub struct TcpState {
     /// The last turn out removes the entry.
     write_tail: HashMap<u64, (u64, tokio::sync::oneshot::Receiver<()>)>,
     write_seq: u64,
+    /// Per server id, the connections its accepts have answered with that
+    /// JS has not yet taken ([`tcp_accept_take`]). A close of the server
+    /// closes them with it (#388): JS, reading the answer a tick later,
+    /// would only have reset them, and a Windows pipe server's connection
+    /// held the pipe's name until then.
+    untaken: HashMap<u64, HashSet<u64>>,
 }
 
 impl TcpState {
@@ -658,18 +665,6 @@ fn discard_writer_reset(writer: WriteHalf) {
         let _ = set_linger_zero(stream);
     }
     writer.forget();
-}
-
-/// Reinsert a listener ONLY if it was not closed mid-flight.
-fn reinsert_listener(registry: &TcpRegistry, server_id: u64, listener: Listener) -> bool {
-    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.closed.remove(&server_id) {
-        drop(listener);
-        false
-    } else {
-        guard.listeners.insert(server_id, listener);
-        true
-    }
 }
 
 /// Format a SocketAddr as a Node-style structured address object. Shared
@@ -1349,47 +1344,52 @@ enum Accepted {
     Pipe(ReadHalf, WriteHalf),
 }
 
-async fn accept_one(listener: &mut Listener) -> std::io::Result<Accepted> {
-    match listener {
-        Listener::Tcp(listener) => {
-            let (stream, peer) = listener.accept().await?;
-            Ok(Accepted::Tcp(stream, peer))
-        }
-        Listener::Pipe(listener) => {
-            let (reader, writer) = pipe_halves(listener.accept().await?);
-            Ok(Accepted::Pipe(reader, writer))
-        }
-    }
-}
-
-/// The next connection on server `server_id`, or None once the server is
-/// closed. `held` is a listener the accept took out of the registry to
-/// wait on (see [`Listener::poll_in_place`]): put back when the accept is
-/// done, unless the server was closed meanwhile -- and then what it accepted
-/// goes too, as a connection still in a closed listener's backlog does.
-/// Every other listener is polled where it sits, so the close that removes
-/// it closes it.
+/// The next connection on server `server_id`, registered as the handle
+/// `stream_ids` gives it, as the accept's answer for JS; or None once the
+/// server is closed. The listener is polled where it sits in the registry
+/// ([`Listener::poll_in_place`]), so the close that removes it closes it,
+/// and a connection is registered as untaken under the same lock it is
+/// accepted under, so the close closes it too until JS takes it (#388):
+/// registered under a lock of its own, it was in neither place for a moment
+/// and a close then left it open.
 async fn next_connection(
     registry: &TcpRegistry,
     server_id: u64,
-    held: Option<Listener>,
-) -> Option<std::io::Result<Accepted>> {
-    let Some(mut listener) = held else {
-        return std::future::poll_fn(|cx| {
-            let guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-            match guard
-                .listeners
-                .get(&server_id)
-                .and_then(|l| l.poll_in_place(cx))
-            {
-                Some(polled) => polled.map(Some),
-                None => std::task::Poll::Ready(None),
+    stream_ids: &std::sync::atomic::AtomicU64,
+) -> Option<std::io::Result<serde_json::Value>> {
+    std::future::poll_fn(|cx| {
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(listener) = guard.listeners.get_mut(&server_id) else {
+            return std::task::Poll::Ready(None);
+        };
+        let accepted = match listener.poll_in_place(cx) {
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+            std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Some(Err(e))),
+            std::task::Poll::Ready(Ok(accepted)) => accepted,
+        };
+        let handle = stream_ids.fetch_add(1, Ordering::Relaxed);
+        let (reader, writer, payload) = match accepted {
+            Accepted::Tcp(stream, peer_addr) => {
+                let local_addr = stream.local_addr().ok();
+                let (reader, writer) = stream.into_split();
+                let mut payload = serde_json::json!({
+                    "handle": handle,
+                    "remoteAddr": addr_to_json(peer_addr),
+                });
+                if let Some(la) = local_addr {
+                    payload["localAddr"] = addr_to_json(la);
+                }
+                (ReadHalf::Tcp(reader), WriteHalf::Tcp(writer), payload)
             }
-        })
-        .await;
-    };
-    let result = accept_one(&mut listener).await;
-    reinsert_listener(registry, server_id, listener).then_some(result)
+            Accepted::Pipe(reader, writer) => {
+                (reader, writer, serde_json::json!({ "handle": handle }))
+            }
+        };
+        guard.register_raw_stream(handle, reader, writer);
+        guard.untaken.entry(server_id).or_default().insert(handle);
+        std::task::Poll::Ready(Some(Ok(payload)))
+    })
+    .await
 }
 
 /// An accept in flight on a server, as its registered wake-up: removed when
@@ -1424,26 +1424,18 @@ pub async fn tcp_accept(
     server_id: u64,
     stream_ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> OpOutcome {
-    let (held, notify) = {
+    let notify = {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
         // Closed, or another accept is already in flight on it. Checked
         // BEFORE the cancel Notify is created: an accept that lands after
         // `tcp_server_close` removed the server's Notify would otherwise
         // insert a fresh one that nothing ever removes (#139).
-        let Some(listener) = guard.listeners.get(&server_id) else {
-            return OpOutcome::Done;
-        };
-        if guard.cancel.contains_key(&server_id) {
+        if !guard.listeners.contains_key(&server_id) || guard.cancel.contains_key(&server_id) {
             return OpOutcome::Done;
         }
-        let held = if listener.accepts_in_place() {
-            None
-        } else {
-            guard.listeners.remove(&server_id)
-        };
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
         guard.cancel.insert(server_id, notify.clone());
-        (held, notify)
+        notify
     };
     let in_flight = AcceptInFlight {
         registry: &registry,
@@ -1452,78 +1444,85 @@ pub async fn tcp_accept(
     };
 
     let next = tokio::select! {
-        next = next_connection(&registry, server_id, held) => next,
-        _ = in_flight.notify.notified() => {
-            // A held listener went with the future; the close that woke
-            // this accept marked the server closed for it, and the marker
-            // has nothing left to guard.
-            registry
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .closed
-                .remove(&server_id);
-            None
-        }
+        next = next_connection(&registry, server_id, &stream_ids) => next,
+        _ = in_flight.notify.notified() => None,
     };
     drop(in_flight);
-    let accepted = match next {
-        None => return OpOutcome::Done,
-        Some(Err(e)) => return tcp_fail(e, "accept"),
-        Some(Ok(accepted)) => accepted,
-    };
-    let handle = stream_ids.fetch_add(1, Ordering::Relaxed);
-    match accepted {
-        Accepted::Tcp(stream, peer_addr) => {
-            let local_addr = stream.local_addr().ok();
-            let (reader, writer) = stream.into_split();
-            registry
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .register_stream(handle, reader, writer);
-
-            let mut payload = serde_json::json!({
-                "handle": handle,
-                "remoteAddr": addr_to_json(peer_addr),
-            });
-            if let Some(la) = local_addr {
-                payload["localAddr"] = addr_to_json(la);
-            }
-            OpOutcome::Json(payload.to_string())
-        }
-        Accepted::Pipe(reader, writer) => {
-            {
-                let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-                guard.readers.insert(handle, reader);
-                guard.writers.insert(handle, writer);
-            }
-            OpOutcome::Json(serde_json::json!({ "handle": handle }).to_string())
-        }
+    match next {
+        None => OpOutcome::Done,
+        Some(Err(e)) => tcp_fail(e, "accept"),
+        Some(Ok(payload)) => OpOutcome::Json(payload.to_string()),
     }
+}
+
+/// JS takes connection `handle`, the answer of an accept on server
+/// `server_id`, before it hands it to the server: from now on the server's
+/// close leaves it be. False if the close came first and closed it.
+pub fn tcp_accept_take(registry: &TcpRegistry, server_id: u64, handle: u64) -> bool {
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(untaken) = guard.untaken.get_mut(&server_id) else {
+        return false;
+    };
+    let taken = untaken.remove(&handle);
+    if untaken.is_empty() {
+        guard.untaken.remove(&server_id);
+    }
+    taken
+}
+
+/// Close a connection accepted for a server that closed before JS took
+/// it, before returning: a TCP connection with a reset, as JS's reset of
+/// it was (#338); a Windows pipe's instance at once, as libuv's `uv_close`
+/// closes every instance a pipe server holds (#388,
+/// [`crate::pipe::close_untaken`]).
+fn close_untaken(reader: ReadHalf, writer: WriteHalf) {
+    #[cfg(windows)]
+    let (reader, writer) = match (reader, writer) {
+        (ReadHalf::Pipe(reader), WriteHalf::Pipe(writer)) => {
+            crate::pipe::close_untaken(reader, writer);
+            return;
+        }
+        other => other,
+    };
+    if let Some(stream) = reader.tcp() {
+        arm_reset(stream);
+    }
+    writer.forget();
+    drop(reader);
 }
 
 /// Close a server at once, as libuv's `uv_close` closes the listening
 /// socket before it returns: a connect made after `server.close()` is
-/// refused (#338). It used to land in the backlog of a listener a parked
-/// accept still held, to be accepted and handed to the closed server -- the
-/// client connected, to nothing, or saw a reset. Remove the listener, which
-/// closes it -- an accept polls it where it sits -- and wake an accept in
-/// flight. A Windows pipe server's accept holds its listener while it
-/// waits; that server is marked closed, so the accept does not put the
-/// listener back but drops it when it wakes. The marker lives only while
-/// that accept is in flight, and a server closed with no accept parked
+/// refused (#338), and a dial of a closed pipe server's name is ENOENT
+/// (#388). It used to land in the backlog of a listener a parked accept
+/// still held, to be accepted and handed to the closed server -- the client
+/// connected, to nothing, or saw a reset. Remove the listener and close it
+/// -- every accept polls it where it sits, a Windows pipe server's waiting
+/// instances included ([`crate::pipe::PipeListener::close`]) -- and wake an
+/// accept in flight. The connections its accepts answered with that JS has
+/// not taken yet go with it ([`close_untaken`]): a Windows pipe server's
+/// held the name until JS reset it a tick later (#388). A server closed
 /// leaves nothing behind (#139).
 pub fn tcp_server_close(registry: &TcpRegistry, server_id: u64) {
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     let listener = guard.listeners.remove(&server_id);
     if let Some(notify) = guard.cancel.remove(&server_id) {
-        // An accept in flight with no listener in the map is one holding it.
-        if listener.is_none() {
-            guard.closed.insert(server_id);
-        }
         notify.notify_one();
     }
+    let untaken: Vec<(ReadHalf, WriteHalf)> = guard
+        .untaken
+        .remove(&server_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|handle| guard.take_raw_halves(handle))
+        .collect();
     drop(guard);
-    drop(listener);
+    if let Some(listener) = listener {
+        listener.close();
+    }
+    for (reader, writer) in untaken {
+        close_untaken(reader, writer);
+    }
 }
 
 #[cfg(test)]
@@ -1783,6 +1782,143 @@ mod tests {
             (0, 0, 0, 0, 0),
             "(closed, cancel, in_flight, readers, writers)"
         );
+    }
+
+    /// #388, the Windows named-pipe twin of the two tests above: closing
+    /// the server while an accept is parked on it closes every waiting pipe
+    /// instance before close returns, so a dial right after it finds no
+    /// such pipe (ENOENT), as libuv's `uv_close` gives node's. A close that
+    /// only woke the accept, leaving the instances to it to drop, let the
+    /// dial connect to one -- to be dropped a moment later. Multi-threaded,
+    /// as oam's runtime is: the reactor that finishes with an instance whose
+    /// connect was in flight runs on another thread than the close.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_named_pipe_server_closed_with_an_accept_parked_is_gone_at_once() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let path = test_pipe_path("closed-parked");
+        let server =
+            json(pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await);
+        let server_id = server["serverId"].as_u64().unwrap();
+        let parked = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let closing = std::time::Instant::now();
+        tcp_server_close(&registry, server_id);
+        // Not by running out its bound: the reactor answers in microseconds.
+        let took = closing.elapsed();
+        assert!(took < std::time::Duration::from_millis(250), "{took:?}");
+        let refused = tokio::net::windows::named_pipe::ClientOptions::new().open(&path);
+        assert_eq!(
+            refused.as_ref().err().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound),
+            "connected to a closed server: {refused:?}"
+        );
+        assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+        // Closed with no accept parked: the same, at once.
+        let server =
+            json(pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await);
+        tcp_server_close(&registry, server["serverId"].as_u64().unwrap());
+        let refused = tokio::net::windows::named_pipe::ClientOptions::new().open(&path);
+        assert_eq!(
+            refused.as_ref().err().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound),
+            "connected to a closed server: {refused:?}"
+        );
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+    }
+
+    /// #388, the rest of it: a client that connected just before the close,
+    /// whose accept had answered but whose connection JS had not yet taken,
+    /// is closed with the server, as libuv's `uv_close` closes every
+    /// instance the server holds. The name is gone when close returns -- a
+    /// dial finds no such pipe and a listen on it succeeds -- and the
+    /// connection leaves the registry. Left for JS to reset when it read the
+    /// answer a tick later, the instance held the name meanwhile: a dial
+    /// waited for it (WaitNamedPipeW) and a listen was EADDRINUSE.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_named_pipe_server_closed_with_a_connection_not_yet_taken_closes_it() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let path = test_pipe_path("closed-untaken");
+        let server =
+            json(pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await);
+        let server_id = server["serverId"].as_u64().unwrap();
+        let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
+        let client = tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(&path)
+            .unwrap();
+        // Answered, and not taken: what JS sees a tick later.
+        let accepted = json(accepting.await.unwrap());
+        assert!(accepted["handle"].as_u64().is_some(), "{accepted}");
+        let closing = std::time::Instant::now();
+        tcp_server_close(&registry, server_id);
+        let took = closing.elapsed();
+        assert!(took < std::time::Duration::from_millis(250), "{took:?}");
+        let refused = tokio::net::windows::named_pipe::ClientOptions::new().open(&path);
+        assert_eq!(
+            refused.as_ref().err().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound),
+            "connected to a closed server: {refused:?}"
+        );
+        let again = pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await;
+        let OpOutcome::Json(again) = again else {
+            panic!("the closed server's name could not be listened on again");
+        };
+        let again: serde_json::Value = serde_json::from_str(&again).unwrap();
+        tcp_server_close(&registry, again["serverId"].as_u64().unwrap());
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+        drop(client);
+    }
+
+    /// #388's other side: a connection JS has taken (`tcp_accept_take`)
+    /// is the server's to keep, and outlives the server's close, as an
+    /// accepted socket outlives node's; one it had not taken is closed with
+    /// the server, and taking it then answers false.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pipe_connection_taken_outlives_its_servers_close() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let path = test_pipe_path("taken");
+        let server_id = json(
+            pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await,
+        )["serverId"]
+            .as_u64()
+            .unwrap();
+        let dial = || {
+            let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
+            let connecting =
+                pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone());
+            async move {
+                let client = json(connecting.await)["handle"].as_u64().unwrap();
+                let server = json(accepting.await.unwrap())["handle"].as_u64().unwrap();
+                (client, server)
+            }
+        };
+        let (kept_client, kept) = dial().await;
+        assert!(tcp_accept_take(&registry, server_id, kept));
+        let (_, untaken) = dial().await;
+        tcp_server_close(&registry, server_id);
+        assert!(!tcp_accept_take(&registry, server_id, untaken));
+
+        assert!(matches!(
+            tcp_write(registry.clone(), kept_client, b"ping".to_vec()).await,
+            OpOutcome::Done
+        ));
+        assert!(matches!(
+            tcp_read(registry.clone(), kept, 64).await,
+            OpOutcome::Bytes(b) if b == b"ping"
+        ));
+        assert!(registry.lock().unwrap().untaken.is_empty());
     }
 
     /// #139, the duplex case the single-half tests miss: a handle closed
