@@ -527,6 +527,16 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `spawn` 3087 -> 1937; conformance case 394 102751 -> 44660 (node 33971), case 395 57015 ->
   41855 (node 36880). Cases 450-452.
 
+- **`tty.WriteStream` and `tty.ReadStream` over a console opened by name refuse what node's refuse,
+  with node's errno (#381).** On Windows they took any descriptor `tty.isatty` called a terminal and
+  refused the rest with `EBADF`. They now ask the console what libuv's `uv_tty_init` asks: a console
+  opened write-only (`\\.\CON` with `w`, `\\.\CONOUT$` and `\\.\CONIN$` with `w` or `a`), and a
+  screen buffer opened without write access (`\\.\CONOUT$` with `r`, `a+` or `as+`, which is still
+  a terminal to `isatty`), are `ERR_TTY_INIT_FAILED` with `EPERM`, and `EBADF` is left to a
+  descriptor with no console behind it. `tty.isatty` of a console opened by name, and of a
+  descriptor once it is closed, already answered as node's does (#379); both are now pinned in a
+  console test.
+
 ### Performance
 
 - **`stat` and `readdir` results no longer make a JSON round trip.** `stat`, `lstat` and `fstat`

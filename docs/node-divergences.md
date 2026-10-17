@@ -1468,12 +1468,14 @@ linked. A chain-build failure (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) leaves `err.ce
 
 node's are `net.Socket` subclasses over a libuv TTY handle. They are node's constructors
 in oam -- callable without `new`, `ERR_INVALID_FD` for a descriptor that is no int32 >= 0,
-`ERR_TTY_INIT_FAILED` (uv_tty_init's errno: EBADF on Windows for anything that is not a
-console, an msys/cygwin pty pipe included, EINVAL elsewhere for a file, the null device or
-an unopened descriptor, a pipe or socket taken on POSIX), node's prototype surface, and on a
-terminal `process.stdout`, `stderr` and `stdin`
-are instances (`conformance/cases/418-tty-stream-classes.mjs`, and the ConPTY test
-`stdio_on_a_console_are_the_tty_stream_classes`). oam's `net.Socket` is the TCP-native
+`ERR_TTY_INIT_FAILED` (uv_tty_init's errno: on Windows EBADF for anything that is not a
+console, an msys/cygwin pty pipe included, and EPERM for a console whose access libuv cannot
+use -- write-only, or a screen buffer opened without write access (#381); EINVAL elsewhere
+for a file, the null device or an unopened descriptor, a pipe or socket taken on POSIX),
+node's prototype surface, and on a terminal `process.stdout`, `stderr` and `stdin` are
+instances (`conformance/cases/418-tty-stream-classes.mjs` and `550-tty-closed-and-null-descriptors.mjs`,
+and the ConPTY tests `stdio_on_a_console_are_the_tty_stream_classes` and
+`tty_streams_over_a_console_opened_by_name_init_as_node`). oam's `net.Socket` is the TCP-native
 `EventEmitter` of entry 34, so these cannot extend it. What differs:
 
 - **The chain.** `Object.getPrototypeOf(tty.WriteStream.prototype)` is `stream.Duplex.prototype`,
