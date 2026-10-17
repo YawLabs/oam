@@ -1382,7 +1382,7 @@ entries below were executed on both runtimes unless marked.
 | Web globals | Missing vs Node 22: `CompressionStream`, `DecompressionStream`, `Crypto`, `CryptoKey`, `SubtleCrypto`, `Navigator`, `Performance`, `PerformanceObserver` (and the `Performance*` entry classes), and the `ReadableStream*`/`WritableStream*`/`TransformStream*` controller and reader constructors. The lowercase instances (`crypto`, `performance`, `navigator`) are present, and `getReader()` works — only the constructors are unexposed. | Present. |
 | `ReadableStream` byte streams | `new ReadableStream({ type: 'bytes' })` queues as node's byte controller does -- a high-water mark of 0 unless the strategy names one, `desiredSize` counted in bytes, a chunk that is not an `ArrayBufferView` refused with node's `ERR_INVALID_ARG_TYPE` before anything is queued (the stream stays readable, and a read already waiting is not handed it), and every chunk handed to a reader a `Uint8Array` over the enqueued view's bytes -- so it pulls exactly when node's does and reads what node's reads. BYOB reads are node's (#372): `getReader({ mode: 'byob' })` gives a reader whose `read(view, { min })` transfers the view's buffer and is filled from the queue -- at most the view, across chunks, the rest left queued, whole elements only -- or waits for an enqueue or for the source's answer through `controller.byobRequest` (`view`, `respond()`, `respondWithNewView()`); a close with a read pending leaves it for `respond(0)`, as node's does, and `tee()` of a byte stream is node's `ReadableByteStreamTee` (two byte streams, a copy for the other branch). Conformance case 520. What it lacks: `source.autoAllocateChunkSize` is read and 0 refused as node refuses it, but a default read is given no `byobRequest` to fill; an enqueued view's buffer is not transferred (node detaches it, so the caller's view reads `byteLength` 0 afterwards), so the chunk a reader gets shares memory with the enqueued view, and an enqueued `Uint8Array` is handed on as the same object where node hands on a new view; a zero-length chunk is accepted where node throws `ERR_INVALID_STATE` (`chunk ArrayBuffer is zero-length or detached`); and the reader, request and controller classes are not globals (the row above). The byte streams the runtime builds -- `fetch` response bodies, `Response`/`Request` bodies, `Blob#stream()`, `fsPromises.FileHandle.readableWebStream()` -- are byte streams in this sense, as node's are, so none of them reads before a read asks; default-reader and `for await` consumption match byte for byte (`readableWebStream()` on node's 16384-byte `autoAllocateChunkSize` boundaries, from the handle's current cursor), and a BYOB read of `readableWebStream()` reads into the view, as node's does. | `autoAllocateChunkSize` and buffer transfer on enqueue. |
 
-### 54. `worker_threads`: a Worker's options and its fatal exit, what still differs
+### 58. `worker_threads`: a Worker's options and its fatal exit, what still differs
 
 Matching node v22.22.2 (no longer divergences; conformance cases 490 and 491):
 
@@ -1603,7 +1603,7 @@ builds the certificate from it exactly as `getPeerCertificate(true)` does, `issu
 linked. A chain-build failure (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) leaves `err.cert` undefined
 (no `cert` key, the error's own keys being `[code]`), as Node does.
 
-### 52. `tty.ReadStream` / `tty.WriteStream` are `stream.Duplex` with a `net.Socket` brand (#391)
+### 56. `tty.ReadStream` / `tty.WriteStream` are `stream.Duplex` with a `net.Socket` brand (#391)
 
 node's are `net.Socket` subclasses over a libuv TTY handle. They are node's constructors
 in oam -- callable without `new`, `ERR_INVALID_FD` for a descriptor that is no int32 >= 0,
@@ -1761,7 +1761,7 @@ _(source: `crates/oam_core/src/net_connect.rs`, `dns.rs`, `js/node_compat.js`
 Node on Windows and on Linux (WSL, no routable IPv6: `localhost` resolves to `127.0.0.1` alone
 on both runtimes).)_
 
-### 52. A server's `listen()` binds asynchronously: `listening` and `address()` wait for it (#387)
+### 57. A server's `listen()` binds asynchronously: `listening` and `address()` wait for it (#387)
 
 Node binds a `listen()` given no host -- `listen(port)`, `listen()`, `listen(path)` --
 synchronously, inside the call: on the next line `server.listening` is `true` and

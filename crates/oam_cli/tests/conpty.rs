@@ -1294,7 +1294,7 @@ console.log('[named ' + [
   tty.isatty(fd), c.columns + 'x' + c.rows, c.getWindowSize().join('x'),
   so.listenerCount('newListener'), so.listenerCount('removeListener'),
   so.listenerCount('resize'),
-  // node's carry an internal 'end' listener oam's do not (docs entry 52).
+  // node's carry an internal 'end' listener oam's do not (docs entry 56).
   new tty.WriteStream(1).eventNames().filter((name) => name !== 'end').length,
 ].join(',') + ']');
 ",
