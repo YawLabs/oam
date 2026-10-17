@@ -36,16 +36,17 @@ use x509_parser::parse_x509_certificate;
 use x509_parser::time::ASN1Time;
 
 mod chain;
+mod flight;
 mod keys;
 pub mod names;
 pub mod roots;
 pub mod server;
 
-type ClientStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
+type ClientStream = tokio_rustls::client::TlsStream<flight::HeldFlight<tokio::net::TcpStream>>;
 type ServerStream = tokio_rustls::server::TlsStream<server::ServerIo>;
 /// A client over a pipe JS pumps to a socket it already has
 /// (`tls.connect({ socket })`, crate::byte_pipe).
-type WrappedStream = tokio_rustls::client::TlsStream<tokio::io::DuplexStream>;
+type WrappedStream = tokio_rustls::client::TlsStream<flight::HeldFlight<tokio::io::DuplexStream>>;
 
 enum TlsReader {
     Client(ReadHalf<ClientStream>),
@@ -85,6 +86,9 @@ pub struct TlsState {
     /// Client secure contexts by id (`ClientContext`), one per
     /// `tls.createSecureContext` that carries a key, a certificate or a pfx.
     client_contexts: HashMap<u64, Arc<ClientContext>>,
+    /// A client connection's held final handshake flight (flight.rs), until
+    /// the first read, write or shutdown on it lets it go.
+    flight_gates: HashMap<u64, Arc<flight::FlightGate>>,
 }
 
 impl TlsState {
@@ -92,6 +96,14 @@ impl TlsState {
         let reader = self.readers.remove(&handle)?;
         *self.in_flight.entry(handle).or_insert(0) += 1;
         Some(reader)
+    }
+
+    /// The connection is in use: its held final flight goes out ahead of
+    /// what is asked of it (flight.rs).
+    fn release_flight(&mut self, handle: u64) {
+        if let Some(gate) = self.flight_gates.remove(&handle) {
+            gate.release();
+        }
     }
 
     fn take_writer(&mut self, handle: u64) -> Option<TlsWriter> {
@@ -725,6 +737,10 @@ struct NodeCertVerifier {
     /// JS layer calls it and the chain is all that is judged here.
     check_name: bool,
     outcome: VerifySlot,
+    /// Armed once the server's TLS 1.3 CertificateVerify is accepted, so
+    /// the client's final flight waits for the socket's first use
+    /// (flight.rs).
+    flight: Arc<flight::FlightGate>,
 }
 
 impl ServerCertVerifier for NodeCertVerifier {
@@ -779,7 +795,9 @@ impl ServerCertVerifier for NodeCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
+        let valid = rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)?;
+        self.flight.arm();
+        Ok(valid)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -945,6 +963,9 @@ impl ExtraCaVerifier {
                 advisory: false,
                 check_name: true,
                 outcome: Arc::new(Mutex::new(None)),
+                // No tls.connect transport holds on it: these clients
+                // (fetch, the installer) send their flight as rustls does.
+                flight: Arc::default(),
             },
         })
     }
@@ -1478,6 +1499,7 @@ fn build_client_config(
     reject_unauthorized: bool,
     check_name: bool,
     versions: &[&'static rustls::SupportedProtocolVersion],
+    flight: Arc<flight::FlightGate>,
 ) -> Result<(rustls::ClientConfig, VerifySlot), String> {
     let mut root_store = rustls::RootCertStore::empty();
     let extras = extra_ca_certs();
@@ -1553,6 +1575,7 @@ fn build_client_config(
         advisory: !reject_unauthorized,
         check_name,
         outcome: outcome.clone(),
+        flight,
     });
     // The suites go out in Node's order (`node_crypto_provider`); the
     // versions were narrowed by `protocol_versions`, which never leaves a
@@ -1899,7 +1922,7 @@ pub async fn tls_connect_pinned(
         Err(_) => return no_protocols(),
     };
     let name = server_name.as_deref().unwrap_or(&host);
-    let (tls_stream, mut payload) = match client_handshake(
+    let (tls_stream, mut payload, gate) = match client_handshake(
         tcp,
         name,
         ca_pem.as_deref(),
@@ -1917,6 +1940,7 @@ pub async fn tls_connect_pinned(
     };
 
     let (tcp, _) = tls_stream.get_ref();
+    let tcp = tcp.get_ref();
     let local_addr = tcp.local_addr().ok();
     let remote_addr = tcp.peer_addr().ok();
 
@@ -1926,6 +1950,7 @@ pub async fn tls_connect_pinned(
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
         guard.readers.insert(handle, TlsReader::Client(reader));
         guard.writers.insert(handle, TlsWriter::Client(writer));
+        guard.flight_gates.insert(handle, gate);
     }
     payload["handle"] = serde_json::Value::from(handle);
     if let Some(la) = local_addr {
@@ -1967,7 +1992,7 @@ async fn client_handshake<IO>(
     versions: &[&'static rustls::SupportedProtocolVersion],
     target: &str,
     alpn: Vec<Vec<u8>>,
-) -> Result<(tokio_rustls::client::TlsStream<IO>, serde_json::Value), OpOutcome>
+) -> Result<HandshakeDone<IO>, OpOutcome>
 where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -1981,14 +2006,22 @@ where
         }
     };
 
-    let (mut config, verdict) =
-        match build_client_config(ca_pem, identity, reject_unauthorized, check_name, versions) {
-            Ok(built) => built,
-            Err(e) => return Err(OpOutcome::Failed(e)),
-        };
+    let gate = Arc::new(flight::FlightGate::default());
+    let (mut config, verdict) = match build_client_config(
+        ca_pem,
+        identity,
+        reject_unauthorized,
+        check_name,
+        versions,
+        gate.clone(),
+    ) {
+        Ok(built) => built,
+        Err(e) => return Err(OpOutcome::Failed(e)),
+    };
     config.alpn_protocols = alpn;
 
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let io = flight::HeldFlight::new(io, gate.clone());
     let tls_stream = match connector.connect(server_name, io).await {
         Ok(s) => s,
         Err(e) => {
@@ -2102,8 +2135,16 @@ where
             payload["storeIssuers"] = serde_json::Value::from(issuers);
         }
     }
-    Ok((tls_stream, payload))
+    Ok((tls_stream, payload, gate))
 }
+
+/// A finished client handshake: the stream, what the TLSSocket reports of
+/// it, and the gate holding its final flight (flight.rs).
+type HandshakeDone<IO> = (
+    tokio_rustls::client::TlsStream<flight::HeldFlight<IO>>,
+    serde_json::Value,
+    Arc<flight::FlightGate>,
+);
 
 /// `tls.connect({ socket })`: the client handshake over a pipe JS pumps to
 /// the socket it already has (crate::byte_pipe), registered under a new
@@ -2132,7 +2173,7 @@ pub async fn tls_connect_over(
     let Some(near) = crate::byte_pipe::take_near(&pipes, pipe) else {
         return OpOutcome::Failed(format!("tls: pipe {pipe} is gone"));
     };
-    let (tls_stream, mut payload) = match client_handshake(
+    let (tls_stream, mut payload, gate) = match client_handshake(
         near,
         &server_name,
         ca_pem.as_deref(),
@@ -2154,6 +2195,7 @@ pub async fn tls_connect_over(
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
         guard.readers.insert(handle, TlsReader::Wrapped(reader));
         guard.writers.insert(handle, TlsWriter::Wrapped(writer));
+        guard.flight_gates.insert(handle, gate);
     }
     payload["handle"] = serde_json::Value::from(handle);
     OpOutcome::Json(payload.to_string())
@@ -2162,6 +2204,9 @@ pub async fn tls_connect_over(
 pub async fn tls_read(registry: TlsRegistry, handle: u64, len: usize) -> OpOutcome {
     let (reader, notify) = {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        // A read is a use of the connection: the held final flight goes
+        // first (flight.rs), drained by this read's own poll of the stream.
+        guard.release_flight(handle);
         let Some(reader) = guard.take_reader(handle) else {
             // Closed (or never existed): no cancel Notify for a read that
             // will not park -- one created here outlived the handle (#139).
@@ -2232,10 +2277,12 @@ where
 }
 
 pub async fn tls_write(registry: TlsRegistry, handle: u64, data: Vec<u8>) -> OpOutcome {
-    let writer = registry
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take_writer(handle);
+    let writer = {
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        // The held final flight goes ahead of this data (flight.rs).
+        guard.release_flight(handle);
+        guard.take_writer(handle)
+    };
     let Some(writer) = writer else {
         return OpOutcome::Failed(format!("tls: write handle {handle} is gone"));
     };
@@ -2273,10 +2320,12 @@ where
 }
 
 pub async fn tls_shutdown(registry: TlsRegistry, handle: u64) -> OpOutcome {
-    let writer = registry
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take_writer(handle);
+    let writer = {
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        // The held final flight goes ahead of the close_notify (flight.rs).
+        guard.release_flight(handle);
+        guard.take_writer(handle)
+    };
     let Some(writer) = writer else {
         return OpOutcome::Done;
     };
@@ -2302,6 +2351,8 @@ pub fn tls_close(registry: &TlsRegistry, handle: u64) {
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     guard.readers.remove(&handle);
     guard.writers.remove(&handle);
+    // A flight still held goes with the connection, unsent (flight.rs).
+    guard.flight_gates.remove(&handle);
     // Only a half that is out for an await can resurrect the handle; mark
     // the close for it, and let its return clear the mark (#139).
     if guard.in_flight.get(&handle).is_some_and(|n| *n > 0) {
