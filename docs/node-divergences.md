@@ -873,7 +873,39 @@ What still differs follows from #52 -- oam runs the CommonJS module while the gr
 not while it evaluates: the ES modules node evaluates ahead of it (those imported before
 it) have not run when it throws, and so never run in oam, and the ticks of a CommonJS
 module that ran before it have already run, where node runs them after the listener.
-Measured 2026-10-17 on Windows.
+When the rest of the graph does not load, compile or link (an import of a name a module
+does not export, a syntax error, an import that does not resolve, in a module before or
+after the CommonJS one), node reports that failure, exit 1, and evaluates nothing, so no
+listener sees the value. oam reports the same failure, in its own one-line form as for
+any graph that fails to link, and offers the value to no listener; but by then it has
+run the CommonJS modules ahead of the throwing one, and that body: what they did stands
+(an `'exit'` listener one of them added prints `exit 1`). oam checks the rest of the
+graph without running another CommonJS body, and so differs in two places:
+
+- a named import of a CommonJS module not run (the one that threw, or one after it) is
+  taken to be there, whether it names that module or reaches it through `export *` (a
+  chain of them, or a cycle). oam has no cjs-module-lexer, so such a module provides
+  every name asked of it, where node's lexer may find no such export and refuse the link:
+  `import { foo } from "./dep.cjs"` with dep.cjs `throw 42` is node's `SyntaxError: Named
+  export 'foo' not found`, oam's report of `42`, and `import { q } from "./r.mjs"` with
+  r.mjs `export * from "./dep.cjs"` is node's `does not provide an export named 'q'`.
+  For the same reason a name such a module shares, through `export *`, with a module
+  that ran or an ES module is that module's in oam, where node's lexer may find it in
+  both and refuse the link with `contains conflicting star exports`;
+- through `import()`, the throw still rejects the promise ahead of a link failure of the
+  rest of the graph, where node rejects with that failure.
+
+Measured 2026-10-17 on Windows (conformance case 574).
+
+A capture callback (`process.setUncaughtExceptionCaptureCallback`) that throws on such a
+value, or on an ES module entry's own throw, is no longer the end of the run -- FIXED.
+node's loader calls it from an async function, so its throw (or a monitor's) rejects that
+function's promise: the ticks run, then node's rejection pass offers it to an
+`'unhandledRejection'` listener and, with none, to the ladder once more, origin
+`unhandledRejection` -- the callback again while it is set, the listeners once it has
+cleared itself. Exit 7 stands only when that second round throws as well; oam used to go
+straight to the report of the first throw, exit 7. Measured 2026-10-17 on Windows
+(conformance case 574).
 
 Everywhere oam has the throw's source frame -- a CommonJS entry, a timer, a tick, an
 `'uncaughtException'` listener -- the report of a value that is not a native Error is

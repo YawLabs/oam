@@ -42,10 +42,15 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `unhandledRejection`, a listener that takes it lets the run go on without the entry's
   body, and otherwise the report is node's fatal one (the source frame and stack of an
   Error, the `--trace-uncaught` hint after a primitive, `Thrown at:` under the flag), exit
-  1, or 7 when a listener throws. A `Worker`'s entry hands its parent the value. An ES
+  1, or 7 when a listener throws. A `Worker`'s entry hands its parent the value. When the
+  rest of the graph does not load, compile or link, that failure is the report and no
+  listener sees the value, as in node, which links the whole graph before it runs any of
+  it; oam checks the rest without running another CommonJS body. An ES
   module entry's throw, this one included, now gives the monitor origin
-  `uncaughtException` when a capture callback is set, as node's loader does. What still
-  differs is docs/node-divergences.md #52 and #54. Conformance case 574.
+  `uncaughtException` when a capture callback is set, as node's loader does, and a
+  callback that throws there is offered its throw once more, origin `unhandledRejection`
+  (its exit 7 stands only if it throws again), where oam ended the run at the first. What
+  still differs is docs/node-divergences.md #52 and #54. Conformance case 574.
 
 ## [0.19.1] - 2026-10-13
 
