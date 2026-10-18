@@ -1,7 +1,7 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "d86f5bc",
-  "oamVersion": "oam 0.19.0",
+  "commit": "e90862af",
+  "oamVersion": "oam 0.19.1",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
   "suites": {
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 313,
-      "total": 314,
+      "pass": 406,
+      "total": 408,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -692,7 +692,7 @@
         },
         {
           "case": "271-http-request-header-bytes.mjs",
-          "status": "pass"
+          "status": "timeout"
         },
         {
           "case": "272-http-server-connection-close-order.mjs",
@@ -1032,7 +1032,79 @@
           "status": "pass"
         },
         {
+          "case": "392-fs-windows-directory-descriptors.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "393-fs-readdir-not-a-directory.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "394-fs-windows-truncating-open.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "395-fs-windows-fchmod-any-descriptor.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "396-readline-input-error.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "397-fs-write-stream-opens-at-construction.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "398-fs-numeric-open-flags.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "399-fs-readfile-flag.mjs",
+          "status": "pass"
+        },
+        {
           "case": "40-string-decoder-streaming.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "400-fs-readfile-descriptor-read-failure.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "401-fs-filehandle-events-and-streams.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "402-fs-filehandle-readfile-options.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "403-fs-open-mode-on-create.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "404-process-umask.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "405-fs-mkdir-mode-options-return.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "406-process-warning-default-listener.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "407-fs-openasblob-directory.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "408-fs-open-device-namespace.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "409-system-error-node-error-class.mjs",
           "status": "pass"
         },
         {
@@ -1040,7 +1112,55 @@
           "status": "pass"
         },
         {
+          "case": "410-fs-cp-options.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "411-esm-top-level-nexttick-order.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "412-events-once-async-abort.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "413-worker-entry-resolution.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "414-fs-opendir-recursive.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "415-fs-stat-bigint-throwifnoentry.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "416-server-close-before-bind.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "417-abort-plumbing.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "418-tty-stream-classes.mjs",
+          "status": "pass"
+        },
+        {
           "case": "42-process-env-coercion.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "421-fs-watch-native.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "422-fs-watch-callback-per-event.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "425-v8-heap-snapshot.mjs",
           "status": "pass"
         },
         {
@@ -1048,7 +1168,59 @@
           "status": "pass"
         },
         {
+          "case": "430-require-esm-namespace.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "431-require-esm-top-level-await.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "432-require-esm-cycles.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "433-require-esm-errors-and-cache.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "434-require-esm-trace-warning.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "435-zlib-zstd-one-shot.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "436-zlib-zstd-options-and-errors.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "437-zlib-zstd-streams.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "438-module-compile-cache-api.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "439-module-compile-cache-warm-run.mjs",
+          "status": "pass"
+        },
+        {
           "case": "44-review-followup-fixes.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "440-require-esm-async-graph-already-loaded.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "441-require-esm-typeless-package-and-ticks.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "442-require-esm-load-failures.mjs",
           "status": "pass"
         },
         {
@@ -1056,7 +1228,63 @@
           "status": "pass"
         },
         {
+          "case": "450-child-windows-hide-option.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "451-child-extra-fd-round-trips.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "452-child-extra-fd-destroy.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "456-buffer-string-codec-edges.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "457-buffer-tostring-receiver-and-spans.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "459-fs-stat-results-independent.mjs",
+          "status": "pass"
+        },
+        {
           "case": "46-stream-callable-constructors.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "460-fs-readdir-results.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "461-fs-stat-kind-checks.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "462-typeless-js-entry.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "463-typeless-js-import-require.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "464-typeless-js-warning.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "465-typeless-js-worker-fork.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "466-fs-readdir-buffer-encoding.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "467-buffer-tostring-adjacent-receivers.mjs",
           "status": "pass"
         },
         {
@@ -1064,7 +1292,35 @@
           "status": "pass"
         },
         {
+          "case": "470-process-tick-queue-at-exit-and-after-throws.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "471-microtask-fatal-ends-drain.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "472-process-exit-listener-throws.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "473-uncaught-handler-throw-report.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "474-worker-fatal-microtask-and-exit-job.mjs",
+          "status": "pass"
+        },
+        {
           "case": "48-stream-legacy-aliases.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "480-dynamic-import-evaluates-in-a-job.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "481-dynamic-import-microtask-turns.mjs",
           "status": "pass"
         },
         {
@@ -1072,7 +1328,27 @@
           "status": "pass"
         },
         {
+          "case": "490-worker-process-flags.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "491-worker-fatal-exit.mjs",
+          "status": "pass"
+        },
+        {
           "case": "50-stream-destroyed-settable.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "500-max-listeners-exceeded-warning.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "501-emit-warning-type-and-arguments.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "502-legacy-api-deprecations.mjs",
           "status": "pass"
         },
         {
@@ -1080,7 +1356,35 @@
           "status": "pass"
         },
         {
+          "case": "510-permission-repeated-grants.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "511-permission-wildcard-grants.mjs",
+          "status": "pass"
+        },
+        {
           "case": "52-stream-compose-operator.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "520-web-streams-byob-reader.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "521-fs-openasblob-lazy-file.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "522-fs-openasblob-sync-errors.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "523-blob-slice-type-tee-chunks.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "524-blob-inspect-and-file-bodies.mjs",
           "status": "pass"
         },
         {
@@ -1088,7 +1392,47 @@
           "status": "pass"
         },
         {
+          "case": "530-fs-stream-options-fs.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "531-fs-stream-patched-fs.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "532-fs-cp-missing-parent.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "533-fs-stream-prototype-open.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "534-fs-stream-options-fs-missing-method.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "535-fs-cpsync-windows-mkdir-errors.mjs",
+          "status": "pass"
+        },
+        {
           "case": "54-stream-async-iterator-helpers.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "540-fs-stat-device-paths.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "541-fs-stat-past-symlink-loop.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "542-fs-realpath-device-namespace.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "543-fs-open-filemap-devices.mjs",
           "status": "pass"
         },
         {
@@ -1096,11 +1440,43 @@
           "status": "pass"
         },
         {
+          "case": "550-tty-closed-and-null-descriptors.mjs",
+          "status": "pass"
+        },
+        {
           "case": "56-child-stdio-inherit.mjs",
           "status": "pass"
         },
         {
+          "case": "560-net-pipe-closed-server-gone-at-once.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "561-net-pipe-closed-server-drops-unaccepted-client.mjs",
+          "status": "pass"
+        },
+        {
           "case": "57-exec-maxbuffer.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "570-deep-recursion-native-ops-range-error.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "571-deep-recursion-native-ops-worker.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "572-tls-client-destroyed-in-secure-connect.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "573-trace-uncaught.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "574-cjs-graph-throw.mjs",
           "status": "pass"
         },
         {
@@ -1375,7 +1751,7 @@
         "platform": "win32",
         "noBaseline": false,
         "nodeTotal": 1874,
-        "knownMissing": 313,
+        "knownMissing": 295,
         "newMissing": [],
         "staleRatchet": [],
         "absentModules": [],
@@ -1384,9 +1760,6 @@
           {
             "module": "constants",
             "names": [
-              "O_DIRECTORY",
-              "O_NOFOLLOW",
-              "O_SYNC",
               "RSA_PKCS1_SHA256_PADDING",
               "SIGALRM",
               "SIGBUS",
@@ -1430,8 +1803,7 @@
           {
             "module": "fs/promises",
             "names": [
-              "Dirent",
-              "_globAsPromise"
+              "Dirent"
             ]
           },
           {
@@ -1451,6 +1823,13 @@
             "module": "repl",
             "names": [
               "builtinModules"
+            ]
+          },
+          {
+            "module": "sys",
+            "names": [
+              "_deepEqual",
+              "_partialDeepEqual"
             ]
           },
           {
@@ -1556,12 +1935,6 @@
               "BUBBLING_PHASE",
               "CAPTURING_PHASE",
               "NONE"
-            ]
-          },
-          {
-            "module": "global:Blob.prototype",
-            "names": [
-              "toString"
             ]
           },
           {
