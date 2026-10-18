@@ -1396,5 +1396,24 @@ mod tests {
             vec!["./star.cjs".to_string(), "./star2.cjs".to_string()]
         );
         assert_eq!(super::module_links("export const = 1;"), None);
+        // Import attributes are module syntax (node runs such a file): a link
+        // check must parse them and keep their asks, not return None and
+        // silently drop the module -- that re-creates the false SyntaxError
+        // #437 just fixed, one syntax feature wider.
+        let attributed = super::module_links(
+            r#"import x from "./a.json" with { type: "json" };
+               import { q } from "./x.cjs";
+               export const y = 1;
+            "#,
+        )
+        .expect("import attributes parse as module syntax");
+        assert_eq!(
+            attributed.requested,
+            vec![
+                ("./a.json".to_string(), vec!["default".to_string()]),
+                ("./x.cjs".to_string(), vec!["q".to_string()]),
+            ]
+        );
+        assert_eq!(attributed.exports, vec!["y".to_string()]);
     }
 }

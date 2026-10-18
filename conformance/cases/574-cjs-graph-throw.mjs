@@ -147,6 +147,34 @@ const files = {
   // It links: the throw is the report, and later.cjs never runs.
   "laterok.mjs":
     'import "./uelis.cjs";\nimport "./dep.cjs";\nimport { yes } from "./x.mjs";\nimport { later } from "./later.cjs";\nconsole.log("entry body", yes, later);\n',
+  // The ask reaches an ES module that does not provide the name (it re-exports
+  // only from a module that has none): no stand-in may answer it -- node's link
+  // error, the value never reported. NOT a star into the throwing CommonJS
+  // itself: that is divergence #54's stand-in, where oam's report of the value
+  // differs from node's refusal by design.
+  "ro.mjs": 'export * from "./x.mjs";\n',
+  "starvia.mjs": 'import "./dep.cjs";\nimport { q } from "./ro.mjs";\nconsole.log("entry body", q);\n',
+  // The capture callback takes the value, clears itself and throws: the throw
+  // is offered once more (origin 'unhandledRejection') and the
+  // 'unhandledRejection' listener takes it -- exit 0, no fatal report.
+  "capurl.cjs": [
+    "process.setUncaughtExceptionCaptureCallback((e) => {",
+    '  console.log("capture", e instanceof Error ? e.message : e);',
+    "  process.setUncaughtExceptionCaptureCallback(null);",
+    '  throw new Error("capture boom");',
+    "});",
+    'process.on("unhandledRejection", (e) => console.log("url", e instanceof Error ? e.message : e));',
+    'process.on("uncaughtException", (e) => console.log("listener", e instanceof Error ? e.message : e));',
+    'process.on("exit", (c) => console.log("exit", c));',
+    "",
+  ].join("\n"),
+  "capurl.mjs": 'import "./capurl.cjs";\nimport "./dep.cjs";\n',
+  // A require() inside the graph catches a CommonJS throw during the load --
+  // nothing reached the ladder -- and the rest of the graph then fails to
+  // load: that failure is the report, and the caught value is not re-offered
+  // (the throw's diagnostic is not the load's).
+  "catchreq.cjs": 'try { require("./dep.cjs"); } catch {}\n',
+  "stale.mjs": 'import "./uelis.cjs";\nimport "./catchreq.cjs";\nimport "./m.mjs";\n',
 };
 for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text);
 const own = new Set(Object.keys(files));
@@ -230,10 +258,19 @@ try {
     "nestedsyntax.mjs",
     "unres.mjs",
     "missinglis.mjs",
+    "starvia.mjs",
+    "stale.mjs",
   ]) {
     showFailure(name, [name]);
   }
-  for (const name of ["laterok.mjs", "star.mjs", "starnolis.mjs", "starchain.mjs", "starcycle.mjs", "starlater.mjs"]) {
+  for (const name of [
+    "laterok.mjs",
+    "star.mjs",
+    "starnolis.mjs",
+    "starchain.mjs",
+    "starcycle.mjs",
+    "starlater.mjs",
+  ]) {
     show(name, [name]);
   }
   for (const name of ["capthrow.mjs", "capthrowown.mjs"]) {
@@ -251,6 +288,7 @@ try {
     "handlederr.mjs",
     "throws.mjs",
     "capture.mjs",
+    "capurl.mjs",
     "code.mjs",
     "nestedlis.mjs",
     "dyn.mjs",
