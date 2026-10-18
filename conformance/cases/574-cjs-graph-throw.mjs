@@ -180,13 +180,19 @@ function lines(stderr) {
   return out;
 }
 
+// A hung scenario child is a child-level failure: killed here (25s) and
+// printed with its signal, rather than blocking until the harness's
+// CASE_CEILING kills this case and truncates one side's whole output.
+const CHILD_MS = 25_000;
+
 function show(label, args) {
   const run = spawnSync(process.execPath, args, {
     cwd: dir,
     encoding: "utf8",
+    timeout: CHILD_MS,
     env: { ...process.env, NODE_OPTIONS: "" },
   });
-  console.log(`## ${label} (status ${run.status})`);
+  console.log(`## ${label} (status ${run.status}${run.signal ? ` signal ${run.signal}` : ""})`);
   for (const line of run.stdout.split(/\r?\n/)) {
     if (line !== "") console.log(`  out | ${line.replace(/(?:[A-Za-z]:)?[^\s:]*[\\/]([^\\/\s:]+\.(?:cjs|mjs))/g, "$1")}`);
   }
@@ -200,9 +206,10 @@ function showFailure(label, args, env = {}) {
   const run = spawnSync(process.execPath, args, {
     cwd: dir,
     encoding: "utf8",
+    timeout: CHILD_MS,
     env: { ...process.env, NODE_OPTIONS: "", ...env },
   });
-  console.log(`## ${label} (status ${run.status})`);
+  console.log(`## ${label} (status ${run.status}${run.signal ? ` signal ${run.signal}` : ""})`);
   for (const line of run.stdout.split(/\r?\n/)) {
     if (line !== "") console.log(`  out | ${line}`);
   }
