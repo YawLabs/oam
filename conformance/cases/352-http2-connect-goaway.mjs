@@ -101,13 +101,29 @@ function startServer(mode) {
 async function run(mode) {
   const { server, port } = await startServer(mode);
   const lines = [];
+  // Each distinct GOAWAY frame identity (code, last stream id, debug data)
+  // is reported once, at its first 'goaway': node's server session.close()
+  // can put the SAME NO_ERROR GOAWAY on the wire twice (the explicit
+  // submit, then nghttp2's graceful close once its streams drain -- both
+  // racing the session's destroy), and node's client reports every frame it
+  // receives. Whether the second frame survives that race is a platform
+  // detail of the ORACLE server (probed: v22.22.2, linux P=8, 10 of 24 runs
+  // sent it, 14 did not; none on Windows), so a repeat of a frame identity
+  // already reported carries no information this case pins -- the frame's
+  // contents, and where it sits among the stream events, are the contract.
+  const goawayFrames = new Set();
   const session = http2.connect("https://localhost:" + port, { ca: CA });
   session.on("error", (e) => lines.push("session error " + e.code + " " + e.message));
-  session.on("goaway", (code, last, data) => lines.push(
-    "session goaway code=" + code + " lastStreamID=" + last +
-    " opaqueData=" + (data === undefined ? "undefined" : JSON.stringify(data.toString())) +
-    " closed=" + session.closed + " destroyed=" + session.destroyed,
-  ));
+  session.on("goaway", (code, last, data) => {
+    const identity = code + "|" + last + "|" + (data === undefined ? "" : data.toString());
+    if (goawayFrames.has(identity)) return;
+    goawayFrames.add(identity);
+    lines.push(
+      "session goaway code=" + code + " lastStreamID=" + last +
+      " opaqueData=" + (data === undefined ? "undefined" : JSON.stringify(data.toString())) +
+      " closed=" + session.closed + " destroyed=" + session.destroyed,
+    );
+  });
   session.on("close", () => lines.push("session close"));
   const one = () => new Promise((resolve) => {
     const req = session.request({ ":path": "/" });

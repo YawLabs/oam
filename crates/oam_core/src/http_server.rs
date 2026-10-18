@@ -117,8 +117,10 @@ pub struct IncomingRequest {
     /// For an upgrade or CONNECT: the bytes that came after the head (node's
     /// `head` argument), already read off the socket.
     pub head: Vec<u8>,
-    /// The request has no body: an HTTP/2 request whose HEADERS frame ended
-    /// the stream (node's `endAfterHeaders`, END_STREAM in 'stream' flags).
+    /// The request declares no body: an HTTP/2 request whose HEADERS frame
+    /// ended the stream (node's `endAfterHeaders`, END_STREAM in 'stream'
+    /// flags), or an HTTP/1 request whose framing says bodyless (node's
+    /// parser completes the message right after 'request' returns).
     pub end_stream: bool,
     /// On an https server: what the connection's TLS handshake settled
     /// (`HandshakeInfo::to_json`), which `req.socket` reports --
@@ -2394,8 +2396,13 @@ async fn dispatch_request(
         .map(|target| target.iter().map(|&b| char::from(b)).collect::<String>());
     let (parts, body) = req.into_parts();
     let http10 = parts.version == hyper::Version::HTTP_10;
-    let end_stream =
-        parts.version == hyper::Version::HTTP_2 && hyper::body::Body::is_end_stream(&body);
+    // The request declares no body (HTTP/1: content length zero or no
+    // framing that says there is one; h2: END_STREAM on the HEADERS frame).
+    // node's parser runs on_message_complete the moment the handler has
+    // returned from 'request', so JS knows a bodyless request is over before
+    // any later connection event can arrive -- see IncomingMessage._endBody,
+    // which is fed from here.
+    let end_stream = hyper::body::Body::is_end_stream(&body);
     // Collect the body, enforcing MAX_REQUEST_BODY.  When the cap is hit we
     // drain up to DRAIN_BUDGET additional bytes before returning 413.
     //

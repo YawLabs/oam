@@ -24524,6 +24524,33 @@
         if (!this._bodyDone) natives.httpRequestBodyCancel(this._requestId);
         this.resume();
       }
+      // node's parserOnMessageComplete for a request whose head declares no
+      // body (meta.endStream): `complete = true`, then push(null) -- run the
+      // moment 'request' has returned, before any connection event that
+      // follows in the same turn. The body-end round trip is normally what
+      // marks this, and while it is in flight a connection event that lands
+      // first (conformance case 272's client away after the response
+      // started) destroys the request first: 'req aborted' for a request
+      // node's parser had already completed, ahead of the socket's 'close'
+      // where node emits nothing. Ends the stream whether or not a read is
+      // in flight -- node's parser does the same, and a second push(null)
+      // from that read's callback is a no-op on an ended stream. With the
+      // handler's own resume() the flow emits 'end' on the next tick,
+      // which drains before any connection event can be delivered.
+      _endBody() {
+        if (this._bodyDone) return;
+        this._bodyDone = true;
+        this.complete = true;
+        // No reader in flight: nothing will ever drain the engine's stream
+        // entry (the guard leaves dispatched streams to JS to reap), so
+        // drop it now -- the pump for a bodyless request is already done.
+        // A read that is in flight holds the entry itself and its terminal
+        // callback reaps it.
+        if (!this._reading && typeof this._requestId === "number") {
+          natives.httpRequestBodyCancel(this._requestId);
+        }
+        this.push(null);
+      }
       _destroy(err, callback) {
         if ((!this.readableEnded || !this.complete) && !this._dumped) {
           this.aborted = true;
@@ -26268,6 +26295,10 @@
         } catch (e) {
           raiseFromListener(e);
         }
+        // node's parser completes a bodyless message the moment the handler
+        // returns from 'request', before anything that follows in this turn
+        // (see _endBody).
+        if (meta.endStream === true) req._endBody();
       }
       stopConnectionsCheck(server);
       // The queue has ended, which the native side lets happen only once
@@ -40959,6 +40990,9 @@
             res.once("finish", answered);
             res.once("close", answered);
             server.emit("request", req, res);
+            // Same as the TCP loop above: node's parser completes a
+            // bodyless message the moment 'request' returns (see _endBody).
+            if (meta.endStream === true) req._endBody();
           }
           conns.delete(socket);
           natives.httpClose(served.sessionId);

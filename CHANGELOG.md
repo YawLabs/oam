@@ -96,6 +96,17 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **A bodyless HTTP/1 request the handler never reads ends the moment `request` returns, as node's
+  does.** The request learned its body was over only from an async round trip to the engine, so a
+  connection event that arrived first (a client that goes away after the response started,
+  conformance case 272) destroyed the request first and oam emitted `req aborted` -- ahead of the
+  socket's `'close'`, where node's parser had already run `on_message_complete` and emits nothing.
+  The engine now reports a request that declares no body (content length 0, or no framing that
+  says there is one) at dispatch, as it already did for an h2 `END_STREAM`, and JS completes the
+  message as node's parser does as soon as the handler has returned. A handler that reads the
+  request is untouched: its read drains before any connection event can be delivered. Measured on
+  the linux builder: the racy exchange diverged 5/480 runs before and 0/480 after (node 0/960).
+
 - **`fs.readdir` honours `encoding: "buffer"`, as node's does.** Each entry was returned as a
   string regardless of the option, so `Buffer.isBuffer(entry)` was false; with `{ encoding:
   "buffer" }` (and with `withFileTypes`) a name is now a `Buffer` of its raw UTF-8 bytes, as node
