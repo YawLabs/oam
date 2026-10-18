@@ -8,6 +8,21 @@
 // CommonJS one and the CommonJS modules ahead of it queue no tick: oam runs it
 // while the graph loads, so those differ (docs/node-divergences.md #52, #54).
 //
+// node links the whole graph before it evaluates any of it, so when the graph
+// also has a link or syntax error -- or an import that does not resolve --
+// that error is the report, exit 1, and no listener sees the CommonJS value.
+// oam has run the CommonJS modules ahead of the failure by then (#52), so of
+// those scenarios only the status, the listener's lines and the SyntaxError's
+// own line are compared, and the listener registers for 'uncaughtException'
+// only. A CommonJS module after the throwing one is never run, by either, and
+// a named import of it -- or of the throwing one, directly or through
+// `export *` -- that its exports have is no link error.
+//
+// A capture callback that throws on the value: node's loader called it from
+// an async function, so the throw rejects that function's promise and node's
+// rejection pass offers it to the monitor and the callback again, origin
+// 'unhandledRejection' -- the same for an ES module entry's own throw.
+//
 // Each scenario runs as a child; its stdout, status and stderr are printed
 // line for line, blank lines kept. As in case 573: the hint's program name is
 // made `node` on both sides, paths are cut to the file name, and of a stack
@@ -71,7 +86,7 @@ const files = {
   // a listener in the worker takes it and the worker exits 0.
   "worker.mjs": [
     'import { Worker } from "node:worker_threads";',
-    'for (const entry of ["imp.mjs", "imperr.mjs", "handled.mjs"]) {',
+    'for (const entry of ["imp.mjs", "imperr.mjs", "handled.mjs", "link.mjs"]) {',
     "  await new Promise((resolve) => {",
     "    const w = new Worker(new URL(`./${entry}`, import.meta.url));",
     '    w.on("error", (e) => console.log(entry, "error", e instanceof Error ? e.message : e));',
@@ -83,6 +98,55 @@ const files = {
     "}",
     "",
   ].join("\n"),
+  // The graph fails to link or load as well: that failure is the report.
+  "uelis.cjs": 'process.on("uncaughtException", (e, o) => console.log("listener", e, o));\n',
+  "x.mjs": "export const yes = 1;\n",
+  "bad.mjs": "export const = 1;\n",
+  "later.cjs": 'console.log("later body");\nexports.later = 1;\n',
+  "link.mjs": 'import "./dep.cjs";\nimport { nope } from "./x.mjs";\n',
+  "linklis.mjs": 'import "./uelis.cjs";\nimport "./dep.cjs";\nimport { nope } from "./x.mjs";\n',
+  "syntax.mjs": 'import "./dep.cjs";\nimport "./bad.mjs";\n',
+  "syntaxlis.mjs": 'import "./uelis.cjs";\nimport "./dep.cjs";\nimport "./bad.mjs";\n',
+  "nestedsyntax.mjs": 'import "./uelis.cjs";\nimport "./a.mjs";\nimport "./c.mjs";\n',
+  "c.mjs": 'import "./bad.mjs";\n',
+  "m.mjs": 'import "./missing.mjs";\n',
+  "missinglis.mjs": 'import "./uelis.cjs";\nimport "./dep.cjs";\nimport "./m.mjs";\n',
+  "nestedlink.mjs": 'import "./uelis.cjs";\nimport "./dep.cjs";\nimport "./n.mjs";\n',
+  "n.mjs": 'import { nope } from "./x.mjs";\n',
+  "unres.mjs": 'import "./dep.cjs";\nimport "./m.mjs";\n',
+  // A name asked through `export *` of the module that throws, or of one
+  // after it, links: the throw is the report.
+  "t.cjs": "exports.x = 1;\nthrow 43;\n",
+  "r.mjs": 'export * from "./t.cjs";\n',
+  "r2.mjs": 'export * from "./r.mjs";\n',
+  "cyc.mjs": 'export * from "./cyc2.mjs";\nexport * from "./t.cjs";\n',
+  "cyc2.mjs": 'export * from "./cyc.mjs";\n',
+  "star.mjs": 'import "./uelis.cjs";\nimport { x } from "./r.mjs";\nconsole.log("entry body", x);\n',
+  "starnolis.mjs": 'import { x } from "./r.mjs";\nconsole.log("entry body", x);\n',
+  "starchain.mjs": 'import "./uelis.cjs";\nimport { x } from "./r2.mjs";\nconsole.log("entry body", x);\n',
+  "starcycle.mjs": 'import "./uelis.cjs";\nimport { x } from "./cyc2.mjs";\nconsole.log("entry body", x);\n',
+  "starlater.mjs":
+    'import "./uelis.cjs";\nimport "./dep.cjs";\nimport { later } from "./rl.mjs";\nconsole.log("entry body", later);\n',
+  "rl.mjs": 'export * from "./later.cjs";\n',
+  // A capture callback that throws: node's loader called it from an async
+  // function, so its throw is an unhandled rejection -- the monitor and the
+  // callback see it once more, origin 'unhandledRejection'. Thrown once,
+  // the second call takes it; thrown each time, the report, exit 7.
+  "capthrow.cjs": [
+    "let calls = 0;",
+    'process.on("uncaughtExceptionMonitor", (e, o) => console.log("monitor", e instanceof Error ? e.message : e, o));',
+    "process.setUncaughtExceptionCaptureCallback((e) => {",
+    '  console.log("capture", e instanceof Error ? e.message : e);',
+    '  if (calls++ === 0 || process.env.CAPTURE_THROWS) throw new Error("capture boom");',
+    "});",
+    'process.on("exit", (c) => console.log("exit", c));',
+    "",
+  ].join("\n"),
+  "capthrow.mjs": 'import "./capthrow.cjs";\nimport "./dep.cjs";\n',
+  "capthrowown.mjs": 'import "./capthrow.cjs";\nthrow 44;\n',
+  // It links: the throw is the report, and later.cjs never runs.
+  "laterok.mjs":
+    'import "./uelis.cjs";\nimport "./dep.cjs";\nimport { yes } from "./x.mjs";\nimport { later } from "./later.cjs";\nconsole.log("entry body", yes, later);\n',
 };
 for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text);
 const own = new Set(Object.keys(files));
@@ -129,7 +193,48 @@ function show(label, args) {
   for (const line of lines(run.stderr)) console.log(`  err | ${JSON.stringify(line)}`);
 }
 
+// For a graph that fails to link or load: the status, stdout, and of stderr
+// only the SyntaxError's own line and whether the CommonJS value is what it
+// reports.
+function showFailure(label, args, env = {}) {
+  const run = spawnSync(process.execPath, args, {
+    cwd: dir,
+    encoding: "utf8",
+    env: { ...process.env, NODE_OPTIONS: "", ...env },
+  });
+  console.log(`## ${label} (status ${run.status})`);
+  for (const line of run.stdout.split(/\r?\n/)) {
+    if (line !== "") console.log(`  out | ${line}`);
+  }
+  for (const line of run.stderr.split(/\r?\n/)) {
+    const error = /(SyntaxError: .*)$/.exec(line);
+    if (error) console.log(`  err | ${JSON.stringify(error[1])}`);
+  }
+  console.log(`  reports the value: ${/^(?:.*Uncaught )?4[234]$/m.test(run.stderr)}`);
+}
+
 try {
+  for (const name of [
+    "link.mjs",
+    "linklis.mjs",
+    "nestedlink.mjs",
+    "syntax.mjs",
+    "syntaxlis.mjs",
+    "nestedsyntax.mjs",
+    "unres.mjs",
+    "missinglis.mjs",
+  ]) {
+    showFailure(name, [name]);
+  }
+  for (const name of ["laterok.mjs", "star.mjs", "starnolis.mjs", "starchain.mjs", "starcycle.mjs", "starlater.mjs"]) {
+    show(name, [name]);
+  }
+  for (const name of ["capthrow.mjs", "capthrowown.mjs"]) {
+    show(name, [name]);
+    // The callback's frames name it differently (node's captureFn, oam's
+    // own), so of this report only the status and stdout.
+    showFailure(`${name}, thrown each time`, [name], { CAPTURE_THROWS: "1" });
+  }
   for (const name of ["imp.mjs", "imperr.mjs", "nested.mjs"]) {
     show(`${name}, no flag`, [name]);
     show(`${name}, --trace-uncaught`, ["--trace-uncaught", name]);
