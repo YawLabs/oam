@@ -19,7 +19,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "cc438-"));
+// Real path, as cases 510/511/522: macOS's tmpdir sits under the /var ->
+// /private/var symlink, so the env probes below (cwd = scratch) would see a
+// getcwd()-resolved cwd that path.relative cannot relativize against the
+// os.tmpdir()-spelled scratch, leaking the whole temp path and its random
+// mkdtemp suffix into the differential.
+const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cc438-")));
 // The per-build subdirectory's name is runtime-specific (node's is
 // v<version>-<arch>-<hash>, oam's oam-v<version>-<arch>-<v8 tag>); show
 // where it sits, never its spelling.
