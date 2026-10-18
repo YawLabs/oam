@@ -541,6 +541,117 @@ pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagn
     default_resolver().resolve_import(specifier, referrer)
 }
 
+/// What an ES module's static declarations link to: the module record's
+/// imports and exports, by name ([`module_links`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ModuleLinks {
+    /// The export names the module asks of each module it names, by
+    /// specifier in source order: `import { a, b as c }` asks for `a` and
+    /// `b`, `import d` and `export { default } from` for `default`,
+    /// `export { e as f } from` for `e`. A namespace import, a bare import,
+    /// `export * from` and `export * as ns from` ask for no name (the
+    /// specifier is listed all the same).
+    pub requested: Vec<(String, Vec<String>)>,
+    /// The names the module exports itself, by its own declarations or a
+    /// named re-export (`default` and `export * as ns from`'s `ns` among
+    /// them), sorted -- not the names it re-exports through `export *`.
+    pub exports: Vec<String>,
+    /// The specifiers of its `export * from` declarations, in source order.
+    pub stars: Vec<String>,
+}
+
+/// The static imports and exports of the ES module `source`, JavaScript (a
+/// TypeScript module already transpiled); None when it does not parse as a
+/// module.
+///
+/// The engine's link check over an entry graph whose CommonJS modules it
+/// has not run (#437) gives each such module the names asked of it,
+/// directly or through `export *`, so linking fails only where it would
+/// without them.
+pub fn module_links(source: &str) -> Option<ModuleLinks> {
+    use oxc_syntax::module_record::{ExportExportName, ExportImportName, ImportImportName};
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
+    if parsed.panicked || !parsed.errors.is_empty() {
+        return None;
+    }
+    let record = &parsed.module_record;
+    let mut specifiers: Vec<(u32, String)> = record
+        .requested_modules
+        .iter()
+        .map(|(specifier, uses)| {
+            let first = uses.iter().map(|r| r.span.start).min().unwrap_or(0);
+            (first, specifier.to_string())
+        })
+        .collect();
+    specifiers.sort();
+    let mut requested: Vec<(String, Vec<String>)> = specifiers
+        .into_iter()
+        .map(|(_, specifier)| (specifier, Vec::new()))
+        .collect();
+    let mut ask = |specifier: &str, name: String| {
+        if let Some((_, names)) = requested.iter_mut().find(|(s, _)| s == specifier) {
+            names.push(name);
+        }
+    };
+    // Source order across both kinds of entry: they ask in the order their
+    // statements stand.
+    let mut asks: Vec<(u32, &str, String)> = Vec::new();
+    for entry in &record.import_entries {
+        let name = match &entry.import_name {
+            ImportImportName::Name(name) => name.name.to_string(),
+            ImportImportName::Default(_) => "default".to_string(),
+            ImportImportName::NamespaceObject => continue,
+        };
+        asks.push((
+            entry.local_name.span.start,
+            entry.module_request.name.as_str(),
+            name,
+        ));
+    }
+    let mut exports: Vec<String> = Vec::new();
+    for entry in record
+        .local_export_entries
+        .iter()
+        .chain(record.indirect_export_entries.iter())
+    {
+        match &entry.export_name {
+            ExportExportName::Name(name) => exports.push(name.name.to_string()),
+            ExportExportName::Default(_) => exports.push("default".to_string()),
+            ExportExportName::Null => {}
+        }
+        if let (Some(request), ExportImportName::Name(name)) =
+            (&entry.module_request, &entry.import_name)
+        {
+            asks.push((
+                entry.span.start,
+                request.name.as_str(),
+                name.name.to_string(),
+            ));
+        }
+    }
+    asks.sort_by_key(|(start, _, _)| *start);
+    for (_, specifier, name) in asks {
+        ask(specifier, name);
+    }
+    exports.sort();
+    exports.dedup();
+    let mut stars: Vec<(u32, String)> = record
+        .star_export_entries
+        .iter()
+        .filter_map(|entry| {
+            let request = entry.module_request.as_ref()?;
+            Some((entry.span.start, request.name.to_string()))
+        })
+        .collect();
+    stars.sort();
+    Some(ModuleLinks {
+        requested,
+        exports,
+        stars: stars.into_iter().map(|(_, specifier)| specifier).collect(),
+    })
+}
+
 /// Check if a candidate path is a file, consulting the negative cache first.
 /// On miss from `is_file()`, insert into the negative set. On hit, remove
 /// from the negative set (in case a file was created since last check).
@@ -1237,5 +1348,72 @@ mod tests {
             .expect_err("explicit .d.ts import must still be filtered");
         assert_eq!(err.code, "OAM-MOD0001", "got: {err:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn module_links_reads_imports_exports_and_stars() {
+        let source = r#"
+            import "./bare.cjs";
+            import d, { a, b as c, "s-t" as u } from "./x.cjs";
+            import * as ns from "./ns.cjs";
+            export { e as f, default as yd } from "./y.cjs";
+            export * from "./star.cjs";
+            export * as whole from "./whole.cjs";
+            import { g } from "./x.cjs";
+            export const local = 1;
+            export let { p, q: [r] } = {};
+            export function fn() {}
+            export default class {}
+            export * from "./star2.cjs";
+        "#;
+        let links = super::module_links(source).expect("parses");
+        let want: Vec<(String, Vec<String>)> = vec![
+            ("./bare.cjs".into(), vec![]),
+            (
+                "./x.cjs".into(),
+                vec![
+                    "default".into(),
+                    "a".into(),
+                    "b".into(),
+                    "s-t".into(),
+                    "g".into(),
+                ],
+            ),
+            ("./ns.cjs".into(), vec![]),
+            ("./y.cjs".into(), vec!["e".into(), "default".into()]),
+            ("./star.cjs".into(), vec![]),
+            ("./whole.cjs".into(), vec![]),
+            ("./star2.cjs".into(), vec![]),
+        ];
+        assert_eq!(links.requested, want);
+        let exports: Vec<String> = ["default", "f", "fn", "local", "p", "r", "whole", "yd"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(links.exports, exports);
+        assert_eq!(
+            links.stars,
+            vec!["./star.cjs".to_string(), "./star2.cjs".to_string()]
+        );
+        assert_eq!(super::module_links("export const = 1;"), None);
+        // Import attributes are module syntax (node runs such a file): a link
+        // check must parse them and keep their asks, not return None and
+        // silently drop the module -- that re-creates the false SyntaxError
+        // #437 just fixed, one syntax feature wider.
+        let attributed = super::module_links(
+            r#"import x from "./a.json" with { type: "json" };
+               import { q } from "./x.cjs";
+               export const y = 1;
+            "#,
+        )
+        .expect("import attributes parse as module syntax");
+        assert_eq!(
+            attributed.requested,
+            vec![
+                ("./a.json".to_string(), vec!["default".to_string()]),
+                ("./x.cjs".to_string(), vec!["q".to_string()]),
+            ]
+        );
+        assert_eq!(attributed.exports, vec!["y".to_string()]);
     }
 }

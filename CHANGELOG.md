@@ -16,24 +16,6 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
-### Added
-
-- **`--trace-uncaught`, and the hint that names it.** oam refused the flag, and a fatal
-  report of a thrown primitive (`throw 42`, `throw null`) ended at the value, without node's
-  `(Use \`node --trace-uncaught ...\` to show where the exception was thrown)`. The flag is
-  accepted on the command line, in `NODE_OPTIONS` and in a `Worker`'s `execArgv`, and lists
-  in `process.execArgv` as node's does. Without it the hint follows a primitive's report,
-  naming the program as node does (`oam`); with it every fatal report of an uncaught
-  exception ends with `Thrown at:` and the stack V8 captured at the throw, in node's frame
-  format. A binary built with `oam compile` honours it from `NODE_OPTIONS`, its arguments
-  being the app's own. A primitive
-  thrown from an ES module entry or a `queueMicrotask` callback is now printed as
-  `String()` gives it (`a string`, not `'a string'`), as node prints it. Node's frame
-  above those two still has no oam counterpart, and a CommonJS module that throws while an
-  ES module entry's imports load is still reported by oam's one-line `error[OAM-RT0001]`;
-  see docs/node-divergences.md #54.
-  Conformance case 573.
-
 ## [0.19.1] - 2026-10-13
 
 ### Changed
@@ -78,6 +60,22 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   still pending and the CommonJS modules whose body is still running. Each worker thread has its
   own API state, as in node. The cache stays on by default, unlike node's; see
   `docs/node-divergences.md`. Conformance cases 438-439.
+
+### Added
+
+- **`--trace-uncaught`, and the hint that names it.** oam refused the flag, and a fatal
+  report of a thrown primitive (`throw 42`, `throw null`) ended at the value, without node's
+  `(Use \`node --trace-uncaught ...\` to show where the exception was thrown)`. The flag is
+  accepted on the command line, in `NODE_OPTIONS` and in a `Worker`'s `execArgv`, and lists
+  in `process.execArgv` as node's does. Without it the hint follows a primitive's report,
+  naming the program as node does (`oam`); with it every fatal report of an uncaught
+  exception ends with `Thrown at:` and the stack V8 captured at the throw, in node's frame
+  format. A binary built with `oam compile` honours it from `NODE_OPTIONS`, its arguments
+  being the app's own. A primitive
+  thrown from an ES module entry or a `queueMicrotask` callback is now printed as
+  `String()` gives it (`a string`, not `'a string'`), as node prints it. Node's frame
+  above those two still has no oam counterpart; see docs/node-divergences.md #54.
+  Conformance case 573.
 
 ### Added
 
@@ -769,6 +767,23 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   It is not node's depth: a worker recurses a quarter to a third as deep as node's, and the main
   thread somewhat deeper, so a 1500-deep `fs.cpSync` with a `filter` or `fs.rmSync` recursive
   completes in oam where node throws `RangeError` (see docs/node-divergences.md).
+- **A CommonJS module that throws while an ES module entry's imports load is an uncaught
+  exception, as in node (#437).** `import "./dep.cjs"` where `dep.cjs` throws ended the run
+  with oam's one-line `error[OAM-RT0001]: ...: Uncaught <value>` and offered the throw to no
+  listener. It now goes the way of the entry's own throw: `uncaughtExceptionMonitor`, a
+  capture callback and the `'uncaughtException'` listeners see it with origin
+  `unhandledRejection`, a listener that takes it lets the run go on without the entry's
+  body, and otherwise the report is node's fatal one (the source frame and stack of an
+  Error, the `--trace-uncaught` hint after a primitive, `Thrown at:` under the flag), exit
+  1, or 7 when a listener throws. A `Worker`'s entry hands its parent the value. When the
+  rest of the graph does not load, compile or link, that failure is the report and no
+  listener sees the value, as in node, which links the whole graph before it runs any of
+  it; oam checks the rest without running another CommonJS body. An ES
+  module entry's throw, this one included, now gives the monitor origin
+  `uncaughtException` when a capture callback is set, as node's loader does, and a
+  callback that throws there is offered its throw once more, origin `unhandledRejection`
+  (its exit 7 stands only if it throws again), where oam ended the run at the first. What
+  still differs is docs/node-divergences.md #52 and #54. Conformance case 574.
 
 ### Performance
 

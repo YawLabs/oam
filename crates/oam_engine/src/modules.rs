@@ -161,6 +161,17 @@ struct UnresolvedDuringLoad(Option<(String, PathBuf)>);
 #[derive(Default)]
 struct CaughtDuringLoad(Option<v8::Global<v8::Value>>);
 
+/// The last CommonJS body a graph load ran that threw (or whose earlier
+/// throw a load replayed, `ModuleMap::failed_cjs`): the value and the
+/// diagnostic the load failed with. The entry's load reads it to tell that
+/// throw -- which node reaches as the rejection of the entry's evaluation
+/// (#437) -- from a link or syntax error, which stays a load failure. The
+/// diagnostic must be the very one the load returned: a body the program
+/// caught the throw of (a `require()` in a try) leaves its record here
+/// while the load goes on, and may fail later of something else.
+#[derive(Default)]
+struct CjsBodyThrew(Option<(v8::Global<v8::Value>, Diagnostic)>);
+
 /// The diagnostic code a load uses for node's ERR_REQUIRE_CYCLE_MODULE, which
 /// [`require_esm`] turns back into that error.
 const REQUIRE_CYCLE_CODE: &str = "ERR_REQUIRE_CYCLE_MODULE";
@@ -1396,10 +1407,50 @@ impl JsRuntime {
             shared.wait_for_attach();
         }
 
+        tc.set_slot(CjsBodyThrew(None));
         if let Err(diags) = load_module_graph(tc, host, entry.clone(), false) {
             // Modules compiled before the failure still have unbound scripts;
             // cache them so the corrected run skips their compile.
             store_pending_code_cache(tc);
+            // A CommonJS module of the graph threw from its body. node runs
+            // it while the graph evaluates, so the throw rejects the entry's
+            // evaluation and goes the way of the entry's own throw (#437):
+            // the uncaught ladder, then node's fatal report. oam ran it
+            // while the graph loaded, before any ES module of it evaluated
+            // (docs/node-divergences.md #52), so none of them runs here --
+            // node runs those ahead of it in evaluation order. A link or
+            // syntax error stays the load failure it is, here or anywhere
+            // else in the graph.
+            let threw = tc
+                .get_slot_mut::<CjsBodyThrew>()
+                .and_then(|threw| threw.0.take())
+                .filter(|(_, diagnostic)| diags.len() == 1 && diags[0] == *diagnostic);
+            if let Some((value, _)) = threw {
+                // The load's TryCatch still holds what it caught.
+                tc.reset();
+                // node links the whole graph before it evaluates any of
+                // it, so a module of it that does not load, compile or
+                // link is the failure, and the CommonJS body never runs
+                // there. The check runs no further CommonJS body. The
+                // failure, not the throw, is then what the run ended of (a
+                // Worker's parent is handed it), so the throw's notes are
+                // set aside while the check runs.
+                let noted = tc
+                    .get_slot_mut::<FatalThrown>()
+                    .and_then(|noted| noted.0.take());
+                let caught = tc
+                    .get_slot_mut::<CaughtDuringLoad>()
+                    .and_then(|caught| caught.0.take());
+                if let Err(diags) = check_entry_graph(tc, host, &entry) {
+                    store_pending_code_cache(tc);
+                    return Err(diags);
+                }
+                tc.set_slot(FatalThrown(noted));
+                tc.set_slot(CaughtDuringLoad(caught));
+                let exception = v8::Local::new(tc, &value);
+                let esm_in_node = node_runs_as_esm(tc, host, &entry);
+                return entry_threw(tc, &entry, exception, esm_in_node);
+            }
             return Err(diags);
         }
 
@@ -1483,58 +1534,7 @@ impl JsRuntime {
                 // ALSO route this promise to the unhandled-rejection ledger.
                 promise.mark_as_handled();
                 let exception = promise.result(tc);
-                // The full ladder, same as the CJS path: monitor -> capture
-                // callback -> listeners. A bare emit here skipped
-                // uncaughtExceptionMonitor entirely and mis-reported a
-                // throwing handler. node's origin for an ES module's is
-                // 'unhandledRejection': its loader sees the evaluation's
-                // rejection.
-                let origin = if esm_in_node {
-                    "unhandledRejection"
-                } else {
-                    "uncaughtException"
-                };
-                let (exception, site) = match dispatch_uncaught_from(tc, exception, origin) {
-                    Uncaught::Handled => {
-                        // A listener suppressed the fatal exit: continue like
-                        // a clean run -- drain ticks + microtasks the handler
-                        // queued (delivering any fresh throws), pump any
-                        // pending timers/ops, then report unhandled
-                        // rejections. For an ES module the handler's
-                        // promise jobs first: in node it runs inside the
-                        // drain, ahead of the ticks.
-                        if esm_in_node {
-                            host_checkpoint(tc);
-                            if let Some(failure) = drain_uncaught(tc) {
-                                return Err(failure);
-                            }
-                        }
-                        if let Some(failure) = run_ticks_and_microtasks(tc) {
-                            return Err(failure);
-                        }
-                        if let Some(failure) = drain_uncaught(tc) {
-                            return Err(failure);
-                        }
-                        pump_event_loop(tc, None, true)?;
-                        return match unhandled_rejection_failures(tc) {
-                            Some(failures) => Err(failures),
-                            None => Ok(()),
-                        };
-                    }
-                    Uncaught::Fatal => (exception, ThrowSite::default()),
-                    Uncaught::HandlerThrew { value, site, .. } => {
-                        (v8::Local::new(tc, &value), site)
-                    }
-                };
-                let text = exception
-                    .to_string(tc)
-                    .map(|s| s.to_rust_string_lossy(tc))
-                    .unwrap_or_else(|| "unknown exception".to_string());
-                let fallback = format!("{}: Uncaught {text}", entry.display());
-                Err(rt_diag(
-                    FATAL_CODE,
-                    fatal_report(tc, exception, site, &fallback),
-                ))
+                entry_threw(tc, &entry, exception, esm_in_node)
             }
             v8::PromiseState::Pending => Err(rt_diag(
                 "OAM-RT0003",
@@ -1542,6 +1542,440 @@ impl JsRuntime {
             )),
         }
     }
+}
+
+/// The ES module graph rooted at `entry` threw `exception` -- the entry's
+/// evaluation rejected, or a CommonJS module of the graph threw from its
+/// body while it loaded (#437). `esm_in_node`: node runs the entry as an ES
+/// module ([`node_runs_as_esm`]).
+fn entry_threw(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    entry: &Path,
+    exception: v8::Local<'_, v8::Value>,
+    esm_in_node: bool,
+) -> Result<(), Vec<Diagnostic>> {
+    // The full ladder, same as the CJS path: monitor -> capture callback ->
+    // listeners. A bare emit here skipped uncaughtExceptionMonitor entirely
+    // and mis-reported a throwing handler. node's origin for an ES module's
+    // is 'unhandledRejection': its loader sees the evaluation's rejection --
+    // except with a capture callback set, when that loader calls
+    // `process._fatalException(err)` with no fromPromise, so the monitor
+    // sees 'uncaughtException' (node v22.22.2,
+    // lib/internal/modules/run_main.js asyncRunEntryPointWithESMLoader;
+    // conformance case 574).
+    let captured = esm_in_node && capture_callback_set(tc);
+    let origin = if esm_in_node && !captured {
+        "unhandledRejection"
+    } else {
+        "uncaughtException"
+    };
+    let mut exception = exception;
+    let mut outcome = dispatch_uncaught_from(tc, exception, origin);
+    if captured && let Uncaught::HandlerThrew { value, .. } = &outcome {
+        // node's loader makes that `_fatalException` call inside an async
+        // function, so what the ladder throws (the capture callback, or the
+        // monitor) rejects that function's promise: the ticks run, then
+        // node's rejection pass offers the throw to 'unhandledRejection'
+        // and, unhandled, to the ladder again, origin 'unhandledRejection'
+        // -- with the callback still set, the callback once more. Its exit
+        // 7 stands only if that throws as well.
+        let value = value.clone();
+        clear_fatal_code(tc);
+        host_checkpoint(tc);
+        if let Some(failure) = drain_uncaught(tc) {
+            return Err(failure);
+        }
+        if let Some(failure) = run_ticks_and_microtasks(tc) {
+            return Err(failure);
+        }
+        if let Some(failure) = drain_uncaught(tc) {
+            return Err(failure);
+        }
+        exception = v8::Local::new(tc, &value);
+        let promise = v8::PromiseResolver::new(tc).map(|resolver| {
+            let promise = resolver.get_promise(tc);
+            promise.mark_as_handled();
+            resolver.reject(tc, exception);
+            promise
+        });
+        let reported = match promise {
+            Some(promise) => {
+                emit_process_event(tc, "unhandledRejection", &[exception, promise.into()])
+            }
+            None => false,
+        };
+        outcome = if reported {
+            Uncaught::Handled
+        } else {
+            dispatch_uncaught_from(tc, exception, "unhandledRejection")
+        };
+    }
+    let (exception, site) = match outcome {
+        Uncaught::Handled => {
+            // A listener suppressed the fatal exit: continue like a clean
+            // run -- drain ticks + microtasks the handler queued (delivering
+            // any fresh throws), pump any pending timers/ops, then report
+            // unhandled rejections. For an ES module the handler's promise
+            // jobs first: in node it runs inside the drain, ahead of the
+            // ticks.
+            if esm_in_node {
+                host_checkpoint(tc);
+                if let Some(failure) = drain_uncaught(tc) {
+                    return Err(failure);
+                }
+            }
+            if let Some(failure) = run_ticks_and_microtasks(tc) {
+                return Err(failure);
+            }
+            if let Some(failure) = drain_uncaught(tc) {
+                return Err(failure);
+            }
+            pump_event_loop(tc, None, true)?;
+            return match unhandled_rejection_failures(tc) {
+                Some(failures) => Err(failures),
+                None => Ok(()),
+            };
+        }
+        Uncaught::Fatal => (exception, ThrowSite::default()),
+        Uncaught::HandlerThrew { value, site, .. } => (v8::Local::new(tc, &value), site),
+    };
+    let text = exception
+        .to_string(tc)
+        .map(|s| s.to_rust_string_lossy(tc))
+        .unwrap_or_else(|| "unknown exception".to_string());
+    let fallback = format!("{}: Uncaught {text}", entry.display());
+    Err(rt_diag(
+        FATAL_CODE,
+        fatal_report(tc, exception, site, &fallback),
+    ))
+}
+
+/// Undo [`dispatch_uncaught_from`]'s exit-7 stamp: the throw it stood for
+/// went on to be handled, or to a fatal report of its own.
+fn clear_fatal_code(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>) {
+    const CLEAR: &str = "(function () { \
+        var g = globalThis.process, p = globalThis.__oamProcessRef; \
+        if (g) delete g.__oamFatalCode; \
+        if (p) delete p.__oamFatalCode; \
+      })";
+    if let Some(clear) = compile_host_function(tc, "<fatal-code>", CLEAR) {
+        let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+        let _ = clear.call(tc, recv, &[]);
+    }
+    if tc.has_caught() {
+        tc.reset();
+    }
+}
+
+/// `process.hasUncaughtExceptionCaptureCallback()`, false when it cannot be
+/// asked (early boot, stripped globals) or throws.
+fn capture_callback_set(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> bool {
+    const ASK: &str = "(function () { \
+        var p = globalThis.__oamProcessRef || globalThis.process; \
+        return !!(p && typeof p.hasUncaughtExceptionCaptureCallback === 'function' \
+          && p.hasUncaughtExceptionCaptureCallback()); \
+      })";
+    let set = compile_host_function(tc, "<capture-callback>", ASK).and_then(|ask| {
+        let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+        ask.call(tc, recv, &[])
+    });
+    let set = set.is_some_and(|value| value.is_true());
+    if tc.has_caught() {
+        tc.reset();
+    }
+    set
+}
+
+/// The modules a link check ([`check_entry_graph`]) links, by path and by
+/// identity hash, for [`resolve_module_callback`] while it runs. Empty
+/// otherwise.
+#[derive(Default)]
+struct LinkCheck {
+    modules: HashMap<PathBuf, v8::Global<v8::Module>>,
+    paths_by_hash: HashMap<NonZeroI32, Vec<PathBuf>>,
+}
+
+/// Check the rest of the ES module graph rooted at `entry`, whose load
+/// stopped at a CommonJS body's throw (#437): Err with the failure when a
+/// module of it does not load, compile or link, as node -- which loads and
+/// links the whole graph before it evaluates any of it -- reports that
+/// failure instead of the throw.
+///
+/// The load goes on from where it stopped but runs no CommonJS body: node
+/// never runs one after the throw, and oam's facade over a module's exports
+/// needs its body run (docs/node-divergences.md #52). So the link is made
+/// over copies -- the graph's own modules stay unlinked, as they are when
+/// its load fails -- in which each CommonJS module not run (the one that
+/// threw among them) is a stand-in exporting exactly the names asked of it:
+/// by its importers, or of a module that re-exports it through `export *`
+/// and provides the name no other way ([`provider_of`]). A module that took
+/// no part in the failed load (it has no imports, or is linked already) is
+/// linked as itself.
+fn check_entry_graph(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    host: &dyn ModuleHost,
+    entry: &Path,
+) -> Result<(), Vec<Diagnostic>> {
+    let mut unrun = HashSet::new();
+    load_module_graph_with(tc, host, entry.to_path_buf(), false, Some(&mut unrun))?;
+
+    // The graph's compiled modules, from the entry over the recorded edges.
+    // A path not in the map is a CommonJS module not run.
+    let mut graph: Vec<(PathBuf, v8::Global<v8::Module>)> = Vec::new();
+    let mut seen = HashSet::from([entry.to_path_buf()]);
+    let mut queue = VecDeque::from([entry.to_path_buf()]);
+    while let Some(path) = queue.pop_front() {
+        let global = tc
+            .get_slot::<ModuleMap>()
+            .and_then(|map| map.by_path.get(&path).cloned());
+        let Some(global) = global else {
+            continue;
+        };
+        let module = v8::Local::new(tc, &global);
+        if module.get_status() == v8::ModuleStatus::Uninstantiated {
+            for (_, resolved) in recorded_imports(tc, &path, module) {
+                if seen.insert(resolved.clone()) {
+                    queue.push_back(resolved);
+                }
+            }
+        }
+        graph.push((path, global));
+    }
+
+    // What each module of the graph exports itself and re-exports through
+    // `export *`, and the names its imports ask of which module.
+    let mut check = LinkCheck::default();
+    let mut exports: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    let mut stars: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    let mut asks: Vec<(PathBuf, String)> = Vec::new();
+    for (path, global) in graph {
+        let module = v8::Local::new(tc, &global);
+        let copied = module.get_status() == v8::ModuleStatus::Uninstantiated
+            && module.get_module_requests().length() > 0;
+        let global = if copied {
+            let code = host.load(&path)?;
+            let recorded = recorded_imports(tc, &path, module);
+            let resolved = |specifier: &str| {
+                recorded
+                    .iter()
+                    .find(|(s, _)| s == specifier)
+                    .map(|(_, resolved)| resolved.clone())
+            };
+            if let Some(links) = oam_loader::module_links(&code) {
+                for (specifier, names) in links.requested {
+                    if let Some(target) = resolved(&specifier) {
+                        asks.extend(names.into_iter().map(|name| (target.clone(), name)));
+                    }
+                }
+                let reexported = links.stars.iter().filter_map(|s| resolved(s)).collect();
+                stars.insert(path.clone(), reexported);
+                exports.insert(path.clone(), links.exports.into_iter().collect());
+            }
+            compile_check_module(tc, &path, &code)?
+        } else {
+            exports.insert(path.clone(), namespace_names(tc, module));
+            global
+        };
+        insert_check_module(tc, &mut check, path, global);
+    }
+
+    // Each name asked goes to the stand-in that provides it: the module
+    // asked, or one that module re-exports through `export *` (#437) --
+    // unless a module that ran, or an ES module, provides it there, as a
+    // stand-in that provided it as well would make it ambiguous.
+    let mut asked: HashMap<PathBuf, Vec<String>> = unrun
+        .iter()
+        .map(|path| (path.clone(), Vec::new()))
+        .collect();
+    for (target, name) in asks {
+        let mut visited = HashSet::new();
+        let found = provider_of(&target, &name, &unrun, &exports, &stars, &mut visited);
+        if let Provider::StandIn(path) = found
+            && let Some(names) = asked.get_mut(&path)
+        {
+            names.push(name);
+        }
+    }
+    for (path, mut names) in asked {
+        names.sort();
+        names.dedup();
+        // `let x; export { x as "a", x as "b" };` -- string export names, so
+        // any name a module may ask for is one.
+        let code = if names.is_empty() {
+            String::new()
+        } else {
+            let list: Vec<String> = names
+                .into_iter()
+                .map(|name| format!("x as {}", serde_json::Value::String(name)))
+                .collect();
+            format!("let x;\nexport {{ {} }};\n", list.join(", "))
+        };
+        let global = compile_check_module(tc, &path, &code)?;
+        insert_check_module(tc, &mut check, path, global);
+    }
+
+    let Some(root) = check.modules.get(entry).cloned() else {
+        return Ok(());
+    };
+    tc.set_slot(check);
+    let root = v8::Local::new(tc, &root);
+    let linked = root.instantiate_module(tc, resolve_module_callback);
+    tc.set_slot(LinkCheck::default());
+    if linked != Some(true) {
+        return Err(vec![catch_to_diagnostic(tc, &entry.to_string_lossy())]);
+    }
+    Ok(())
+}
+
+/// Who provides an export name in a link check ([`provider_of`]).
+enum Provider {
+    /// A module the check has the exports of: one that ran, or an ES module.
+    Module,
+    /// The stand-in for this CommonJS module not run.
+    StandIn(PathBuf),
+    /// No module of the graph.
+    None,
+}
+
+/// Which module provides the export `name` asked of `path` in a link
+/// check, after the ECMAScript ResolveExport: the module's own export,
+/// else the first of its `export *` re-exports that has it (never
+/// `default`). A CommonJS module not run (`unrun`) provides every name asked
+/// of it -- oam has no cjs-module-lexer to say which it would export
+/// (docs/node-divergences.md #54). A module that provides it outranks a
+/// stand-in, so the check gives no stand-in a name that would make the
+/// export ambiguous. `visited` breaks `export *` cycles.
+fn provider_of(
+    path: &Path,
+    name: &str,
+    unrun: &HashSet<PathBuf>,
+    exports: &HashMap<PathBuf, HashSet<String>>,
+    stars: &HashMap<PathBuf, Vec<PathBuf>>,
+    visited: &mut HashSet<PathBuf>,
+) -> Provider {
+    if unrun.contains(path) {
+        return Provider::StandIn(path.to_path_buf());
+    }
+    if exports.get(path).is_some_and(|names| names.contains(name)) {
+        return Provider::Module;
+    }
+    if name == "default" || !visited.insert(path.to_path_buf()) {
+        return Provider::None;
+    }
+    let mut stand_in = None;
+    for star in stars.get(path).into_iter().flatten() {
+        match provider_of(star, name, unrun, exports, stars, visited) {
+            Provider::Module => return Provider::Module,
+            Provider::StandIn(path) => {
+                stand_in.get_or_insert(path);
+            }
+            Provider::None => {}
+        }
+    }
+    stand_in.map_or(Provider::None, Provider::StandIn)
+}
+
+/// The export names of `module`, which a link check links as itself: a
+/// module already linked, or one with no imports -- linked here, which
+/// cannot fail and runs nothing. Empty when they cannot be read.
+fn namespace_names(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    module: v8::Local<'_, v8::Module>,
+) -> HashSet<String> {
+    fn no_imports<'s>(
+        _context: v8::Local<'s, v8::Context>,
+        _specifier: v8::Local<'s, v8::String>,
+        _attributes: v8::Local<'s, v8::FixedArray>,
+        _referrer: v8::Local<'s, v8::Module>,
+    ) -> Option<v8::Local<'s, v8::Module>> {
+        None
+    }
+    let mut names = HashSet::new();
+    if module.get_status() == v8::ModuleStatus::Uninstantiated
+        && module.get_module_requests().length() == 0
+        && module.instantiate_module(tc, no_imports) != Some(true)
+    {
+        tc.reset();
+        return names;
+    }
+    if !matches!(
+        module.get_status(),
+        v8::ModuleStatus::Instantiated | v8::ModuleStatus::Evaluating | v8::ModuleStatus::Evaluated
+    ) {
+        return names;
+    }
+    let Ok(namespace) = v8::Local::<v8::Object>::try_from(module.get_module_namespace()) else {
+        return names;
+    };
+    // Every own key, read without a descriptor: a module linked here has
+    // not evaluated, and its `let` and `const` bindings are in their TDZ.
+    let args = v8::GetPropertyNamesArgs {
+        mode: v8::KeyCollectionMode::OwnOnly,
+        property_filter: v8::PropertyFilter::ALL_PROPERTIES | v8::PropertyFilter::SKIP_SYMBOLS,
+        index_filter: v8::IndexFilter::IncludeIndices,
+        key_conversion: v8::KeyConversionMode::ConvertToString,
+    };
+    if let Some(keys) = namespace.get_property_names(tc, args) {
+        for i in 0..keys.length() {
+            if let Some(key) = keys.get_index(tc, i) {
+                names.insert(key.to_rust_string_lossy(tc));
+            }
+        }
+    }
+    if tc.has_caught() {
+        tc.reset();
+    }
+    names
+}
+
+/// Compile `code` as the ES module at `path` for a link check, uncached and
+/// out of the module map.
+fn compile_check_module(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    path: &Path,
+    code: &str,
+) -> Result<v8::Global<v8::Module>, Vec<Diagnostic>> {
+    let file = path.to_string_lossy().into_owned();
+    let source_str = v8::String::new(tc, code).ok_or_else(|| {
+        rt_diag(
+            "OAM-RT0001",
+            format!("{file}: source too long for V8 string"),
+        )
+    })?;
+    let name: v8::Local<v8::Value> = v8::String::new(tc, &file)
+        .ok_or_else(|| rt_diag("OAM-RT0001", format!("{file}: path too long for V8 string")))?
+        .into();
+    let origin = v8::ScriptOrigin::new(
+        tc, name, 0, 0, false, 0, None, false, false, /* is_module */ true, None,
+    );
+    let mut source = v8::script_compiler::Source::new(source_str, Some(&origin));
+    let Some(module) = v8::script_compiler::compile_module2(
+        tc,
+        &mut source,
+        v8::script_compiler::CompileOptions::NoCompileOptions,
+        v8::script_compiler::NoCacheReason::NoReason,
+    ) else {
+        return Err(vec![catch_to_diagnostic(tc, &file)]);
+    };
+    Ok(v8::Global::new(tc, module))
+}
+
+/// Add `global`, the link check's module for `path`, to `check`.
+fn insert_check_module(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    check: &mut LinkCheck,
+    path: PathBuf,
+    global: v8::Global<v8::Module>,
+) {
+    let hash = v8::Local::new(tc, &global).get_identity_hash();
+    check
+        .paths_by_hash
+        .entry(hash)
+        .or_default()
+        .push(path.clone());
+    check.modules.insert(path, global);
 }
 
 impl JsRuntime {
@@ -2906,6 +3340,20 @@ fn load_module_graph(
     entry: PathBuf,
     for_require: bool,
 ) -> Result<(), Vec<Diagnostic>> {
+    load_module_graph_with(tc, host, entry, for_require, None)
+}
+
+/// [`load_module_graph`], and with `unrun` a load that runs no CommonJS
+/// body: a CommonJS module not yet in the module map is put in `unrun`
+/// instead of compiled, and stays a leaf of the walk. For the link check
+/// after a CommonJS body of the entry graph threw ([`check_entry_graph`]).
+fn load_module_graph_with(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    host: &dyn ModuleHost,
+    entry: PathBuf,
+    for_require: bool,
+    unrun: Option<&mut HashSet<PathBuf>>,
+) -> Result<(), Vec<Diagnostic>> {
     push_graph_load(tc, entry.clone(), for_require);
     // The prefetch pool borrows `host`, so it lives inside a thread scope:
     // workers spawn lazily as prefetchable imports are discovered, and the
@@ -2914,7 +3362,7 @@ fn load_module_graph(
     let cache_root = crate::code_cache::root_for(tc);
     let loaded = std::thread::scope(|scope| {
         let mut prefetch = GraphPrefetcher::new(scope, host, cache_root);
-        load_module_graph_overlapped(tc, host, entry, &mut prefetch)
+        load_module_graph_overlapped(tc, host, entry, &mut prefetch, unrun)
     });
     pop_graph_load(tc);
     loaded
@@ -3207,6 +3655,7 @@ fn load_module_graph_overlapped(
     host: &dyn ModuleHost,
     entry: PathBuf,
     prefetch: &mut GraphPrefetcher<'_, '_>,
+    mut unrun: Option<&mut HashSet<PathBuf>>,
 ) -> Result<(), Vec<Diagnostic>> {
     let mut work = VecDeque::from([entry]);
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -3257,6 +3706,12 @@ fn load_module_graph_overlapped(
             continue;
         }
 
+        if let Some(unrun) = unrun.as_deref_mut()
+            && runs_as_commonjs(tc, &path)
+        {
+            unrun.insert(path);
+            continue;
+        }
         compile_module(tc, host, &path, Some(&mut *prefetch), true)?;
         let module = {
             let map = tc.get_slot::<ModuleMap>().expect("module map installed");
@@ -3377,6 +3832,24 @@ fn resolve_imports(
     Ok(())
 }
 
+/// Whether [`compile_module`] runs the file at `path` as CommonJS: not a
+/// virtual module (`node:`, `oam:`) nor JSON, and CommonJS by oam's module
+/// kind -- unless a `require()` is loading it as an ES module: a typeless
+/// file inside node_modules, which oam takes for CommonJS, that the
+/// require() already compiled as CommonJS and found module syntax in
+/// (node's detection). Running it as CommonJS then would answer from the
+/// placeholder `require.cache` entry the require() made and build a facade
+/// around its empty exports.
+fn runs_as_commonjs(scope: &mut v8::PinScope<'_, '_>, path: &Path) -> bool {
+    let virtual_module = path
+        .to_str()
+        .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"));
+    !virtual_module
+        && path.extension().and_then(|e| e.to_str()) != Some("json")
+        && oam_loader::module_kind(path) == oam_loader::ModuleKind::Cjs
+        && !crate::cjs::is_requiring_esm(scope, path)
+}
+
 /// Compile the module at `path` (not yet in the module map) and register it:
 /// an ES module from its source, a builtin, JSON or CommonJS file as a facade
 /// over its exports -- which runs a CommonJS file, then and there. Its
@@ -3427,16 +3900,7 @@ fn compile_module(
             return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
         };
         crate::cjs::facade_source(tc, path, exports)
-    } else if oam_loader::module_kind(path) == oam_loader::ModuleKind::Cjs
-        // A typeless file inside node_modules, which oam takes for
-        // CommonJS, that a `require()` is loading as an ES module: the
-        // require() already compiled it as CommonJS and found module
-        // syntax (node's detection), so it is not run as CommonJS here --
-        // that would answer from the placeholder `require.cache` entry
-        // the require() made and build a facade around its empty
-        // exports.
-        && !crate::cjs::is_requiring_esm(tc, path)
-    {
+    } else if runs_as_commonjs(tc, path) {
         if let Some((value, diagnostic)) = tc
             .get_slot::<ModuleMap>()
             .and_then(|map| map.failed_cjs.get(path))
@@ -3444,7 +3908,8 @@ fn compile_module(
         {
             // Its body threw in an earlier load: that error again, the
             // body not run again (see ModuleMap::failed_cjs).
-            tc.set_slot(CaughtDuringLoad(Some(value)));
+            tc.set_slot(CaughtDuringLoad(Some(value.clone())));
+            tc.set_slot(CjsBodyThrew(Some((value, diagnostic.clone()))));
             return Err(vec![diagnostic]);
         }
         // Recorded for the duration of the body, so a `require()` of an
@@ -3491,6 +3956,7 @@ fn compile_module(
                 if let Some(value) = caught
                     && !tc.has_terminated()
                 {
+                    tc.set_slot(CjsBodyThrew(Some((value.clone(), diagnostic.clone()))));
                     tc.get_slot_mut::<ModuleMap>()
                         .expect("module map installed")
                         .failed_cjs
@@ -3643,12 +4109,23 @@ fn resolve_module_callback<'s>(
     // Identity-hash collisions: find the referrer's path by comparing module
     // identity among same-hash candidates. Slot borrows are cloned out before
     // any Local is created so they never overlap scope use.
+    // A link check ([`check_entry_graph`]) links its own modules, over the
+    // same edges.
+    let checking = scope
+        .get_slot::<LinkCheck>()
+        .is_some_and(|check| !check.modules.is_empty());
     let candidates: Vec<(PathBuf, v8::Global<v8::Module>)> = {
-        let map = scope.get_slot::<ModuleMap>()?;
-        let paths = map.paths_by_hash.get(&referrer.get_identity_hash())?;
+        let (paths_by_hash, modules) = if checking {
+            let check = scope.get_slot::<LinkCheck>()?;
+            (&check.paths_by_hash, &check.modules)
+        } else {
+            let map = scope.get_slot::<ModuleMap>()?;
+            (&map.paths_by_hash, &map.by_path)
+        };
+        let paths = paths_by_hash.get(&referrer.get_identity_hash())?;
         paths
             .iter()
-            .filter_map(|p| map.by_path.get(p).map(|g| (p.clone(), g.clone())))
+            .filter_map(|p| modules.get(p).map(|g| (p.clone(), g.clone())))
             .collect()
     };
     let referrer_path = candidates.into_iter().find_map(|(path, global)| {
@@ -3659,7 +4136,15 @@ fn resolve_module_callback<'s>(
     let target: Option<v8::Global<v8::Module>> = referrer_path.and_then(|referrer_path| {
         let map = scope.get_slot::<ModuleMap>()?;
         let resolved = map.edges.get(&(referrer_path, spec.clone()))?;
-        map.by_path.get(resolved).cloned()
+        if checking {
+            scope
+                .get_slot::<LinkCheck>()?
+                .modules
+                .get(resolved)
+                .cloned()
+        } else {
+            map.by_path.get(resolved).cloned()
+        }
     });
 
     match target {
