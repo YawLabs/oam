@@ -179,6 +179,7 @@ pub fn spawn_extra(
     stdio: &[StdioFd],
     _detached: bool,
     _windows_hide: bool,
+    argv0: Option<&str>,
 ) -> Result<RawChild, String> {
     // Relocate child ends above every target index so the pre_exec dup2 cannot
     // alias a source onto another target.
@@ -278,6 +279,9 @@ pub fn spawn_extra(
 
     let mut cmd = Command::new(command);
     cmd.args(args);
+    if let Some(argv0) = argv0 {
+        cmd.arg0(argv0);
+    }
     // 0/1/2 inherit by default; pre_exec overrides them when the spec says so.
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())

@@ -37198,6 +37198,7 @@
         input: opts.input != null
           ? (typeof opts.input === "string" ? Buffer.from(opts.input, opts.encoding || "utf8") : opts.input)
           : undefined,
+        argv0: opts.argv0 || undefined,
       };
       const modes = stdioModes(opts.stdio);
       nativeOpts.stdio = modes;
@@ -37441,6 +37442,7 @@
         env: childEnv(opts.env, spawnArgv(norm)),
         detached: !!opts.detached,
         windowsHide: !!opts.windowsHide,
+        argv0: opts.argv0 || undefined,
       };
 
       cp.stdio = new Array(stdioArr.length).fill(null);
@@ -37827,6 +37829,7 @@
         // with this process, as under node; a detached one is left out.
         detached: !!opts.detached,
         windowsHide: !!opts.windowsHide,
+        argv0: opts.argv0 || undefined,
       };
 
       const readStdout = async (handle) => {

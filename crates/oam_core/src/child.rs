@@ -150,6 +150,7 @@ pub fn spawn_child(
     stdio: StdioSpec,
     detached: bool,
     windows_hide: bool,
+    argv0: Option<String>,
 ) -> Result<(tokio::process::Child, u32), String> {
     let (prog, final_args) = if shell {
         #[cfg(windows)]
@@ -241,7 +242,13 @@ pub fn spawn_child(
         cmd.creation_flags(windows_creation_flags(detached, windows_hide, inherits));
     }
     #[cfg(not(windows))]
-    let _ = (detached, windows_hide);
+    {
+        if let Some(ref argv0) = argv0 {
+            use std::os::unix::process::CommandExt;
+            cmd.arg0(argv0);
+        }
+        let _ = (detached, windows_hide);
+    }
 
     let child = cmd.spawn().map_err(|e| spawn_failure_json(&e))?;
     // Right after spawn, not suspended: tokio's Command cannot resume a
@@ -543,6 +550,7 @@ pub fn spawn_sync(
     stdio: StdioSpec,
     detached: bool,
     windows_hide: bool,
+    argv0: Option<String>,
 ) -> SpawnSyncResult {
     let (prog, final_args) = if shell {
         #[cfg(windows)]
@@ -635,9 +643,25 @@ pub fn spawn_sync(
         use std::os::windows::process::CommandExt;
         // windowsHide as spawn_child applies it (and with the same SW_HIDE gap).
         cmd.creation_flags(windows_creation_flags(detached, windows_hide, inherits));
+        if let Some(ref argv0) = argv0 {
+            // On Windows the first token of lpCommandLine IS argv0. Build the
+            // command line string and set it via cmd_line().
+            let mut cmdline = format!("\"{}\"", argv0);
+            for a in &final_args {
+                cmdline.push(' ');
+                cmdline.push_str(a);
+            }
+            cmd.cmd_line(&cmdline);
+        }
     }
     #[cfg(not(windows))]
-    let _ = (detached, windows_hide);
+    {
+        if let Some(ref argv0) = argv0 {
+            use std::os::unix::process::CommandExt;
+            cmd.arg0(argv0);
+        }
+        let _ = (detached, windows_hide);
+    }
 
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);

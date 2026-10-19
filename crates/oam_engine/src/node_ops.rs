@@ -9631,6 +9631,12 @@ fn op_spawn_sync(
 
     let stdio = arg_stdio_spec(scope, opts, &core_runtime!(scope).sync_files());
 
+    // Read argv0 from the options object (node's spawn/child_process API).
+    let argv0: Option<String> = opts
+        .get(scope, v8::String::new(scope, "argv0").unwrap().into())
+        .and_then(|v| v.to_string(scope).map(|s| s.to_rust_string_lossy(scope)))
+        .ok();
+
     let result = oam_core::child::spawn_sync(
         &command,
         &child_args,
@@ -9643,6 +9649,7 @@ fn op_spawn_sync(
         stdio,
         detached,
         windows_hide,
+        argv0,
     );
 
     let obj = v8::Object::new(scope);
@@ -9756,6 +9763,17 @@ fn op_spawn_async(
     let detached = opt_detached(scope, opts);
     let windows_hide = opt_windows_hide(scope, opts);
 
+    // Read argv0 from the options object (node's spawn/child_process API).
+    let argv0: Option<String> = opts
+        .and_then(|o| {
+            let key = v8::String::new(scope, "argv0")?;
+            let val = o.get(scope, key.into())?;
+            if val.is_null_or_undefined() {
+                return None;
+            }
+            val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
+        });
+
     let children = core_runtime!(scope).children();
     let ids = core_runtime!(scope).body_ids();
 
@@ -9776,6 +9794,7 @@ fn op_spawn_async(
             stdio,
             detached,
             windows_hide,
+            argv0,
         )
     };
     match spawned {
@@ -10104,6 +10123,17 @@ fn op_spawn_extra(
 
     let detached = opt_detached(scope, opts);
     let windows_hide = opt_windows_hide(scope, opts);
+
+    // Read argv0 from the options object (node's spawn/child_process API).
+    let argv0: Option<String> = opts.and_then(|o| {
+        let key = v8::String::new(scope, "argv0")?;
+        let val = o.get(scope, key.into())?;
+        if val.is_null_or_undefined() {
+            return None;
+        }
+        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
+    });
+
     let reg = core_runtime!(scope).raw_children();
     let ids = core_runtime!(scope).body_ids();
     match oam_core::child_extra::spawn_extra(
@@ -10114,6 +10144,7 @@ fn op_spawn_extra(
         &stdio,
         detached,
         windows_hide,
+        argv0.as_deref(),
     ) {
         Ok(child) => {
             let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

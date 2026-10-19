@@ -384,6 +384,7 @@ pub fn spawn_extra(
     stdio: &[StdioFd],
     detached: bool,
     windows_hide: bool,
+    argv0: Option<&str>,
 ) -> Result<RawChild, String> {
     // Same program search as the std-backed spawns (see child.rs).
     let resolved = match super::child::resolve_windows_program(command, cwd) {
@@ -632,9 +633,11 @@ pub fn spawn_extra(
         si.StartupInfo.lpReserved2 = blob.as_mut_ptr();
         si.lpAttributeList = attr_list;
 
-        // Command line.
+        // Command line. On Windows the first token of lpCommandLine IS argv0,
+        // so we use argv0 (when given) as the first quoted token instead of the
+        // program name node's CreateProcessW call would get from its first arg.
         let mut cmdline = String::new();
-        append_quoted(command, &mut cmdline);
+        append_quoted(argv0.unwrap_or(command), &mut cmdline);
         for a in args {
             cmdline.push(' ');
             append_quoted(a, &mut cmdline);
