@@ -9768,15 +9768,14 @@ fn op_spawn_async(
     let windows_hide = opt_windows_hide(scope, opts);
 
     // Read argv0 from the options object (node's spawn/child_process API).
-    let argv0: Option<String> = opts
-        .and_then(|o| {
-            let key = v8::String::new(scope, "argv0")?;
-            let val = o.get(scope, key.into())?;
-            if val.is_null_or_undefined() {
-                return None;
-            }
-            val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
-        });
+    let argv0: Option<String> = opts.and_then(|o| {
+        let key = v8::String::new(scope, "argv0")?;
+        let val = o.get(scope, key.into())?;
+        if val.is_null_or_undefined() {
+            return None;
+        }
+        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
+    });
 
     let children = core_runtime!(scope).children();
     let ids = core_runtime!(scope).body_ids();
@@ -9801,12 +9800,8 @@ fn op_spawn_async(
             let mut out = Vec::with_capacity(3);
             for (i, slot) in stdio.iter().enumerate() {
                 out.push(match slot {
-                    oam_core::child::StdioMode::Ignore => {
-                        oam_core::child_extra::StdioFd::Ignore
-                    }
-                    oam_core::child::StdioMode::Inherit => {
-                        oam_core::child_extra::StdioFd::Inherit
-                    }
+                    oam_core::child::StdioMode::Ignore => oam_core::child_extra::StdioFd::Ignore,
+                    oam_core::child::StdioMode::Inherit => oam_core::child_extra::StdioFd::Inherit,
                     oam_core::child::StdioMode::Pipe => {
                         if i == 0 {
                             // stdin: parent writes to child's fd 0.
@@ -9817,10 +9812,10 @@ fn op_spawn_async(
                         }
                     }
                     oam_core::child::StdioMode::File(file) => {
-                        #[cfg(windows)]
-                        use std::os::windows::io::AsRawHandle;
                         #[cfg(unix)]
                         use std::os::fd::AsRawFd;
+                        #[cfg(windows)]
+                        use std::os::windows::io::AsRawHandle;
                         #[cfg(windows)]
                         let raw = file.as_raw_handle() as isize;
                         #[cfg(unix)]
