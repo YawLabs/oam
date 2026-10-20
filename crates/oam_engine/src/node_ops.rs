@@ -9632,10 +9632,14 @@ fn op_spawn_sync(
     let stdio = arg_stdio_spec(scope, opts, &core_runtime!(scope).sync_files());
 
     // Read argv0 from the options object (node's spawn/child_process API).
-    let argv0: Option<String> = opts
-        .get(scope, v8::String::new(scope, "argv0").unwrap().into())
-        .and_then(|v| v.to_string(scope).map(|s| s.to_rust_string_lossy(scope)))
-        .ok();
+    let argv0: Option<String> = opts.and_then(|o| {
+        let key = v8::String::new(scope, "argv0").unwrap();
+        let val = o.get(scope, key.into())?;
+        if val.is_null_or_undefined() {
+            return None;
+        }
+        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
+    });
 
     let result = oam_core::child::spawn_sync(
         &command,
@@ -9782,6 +9786,83 @@ fn op_spawn_async(
     // immediately -- execa, tree-kill and pidusage all read it the instant
     // spawn() returns. The runtime-context guard is required: tokio's
     // Command::spawn registers the child with the signal-driver reactor.
+    //
+    // On Windows argv0 requires raw CreateProcessW (lpCommandLine), so when
+    // argv0 is provided we route through spawn_extra instead of spawn_child.
+    #[cfg(windows)]
+    let use_spawn_extra = argv0.is_some();
+    #[cfg(not(windows))]
+    let use_spawn_extra = false;
+
+    if use_spawn_extra {
+        // argv0 on Windows needs raw CreateProcessW — spawn_extra handles it.
+        // Convert [StdioMode; 3] → Vec<StdioFd>: slot 0=stdin, 1=stdout, 2=stderr.
+        let stdio_fds: Vec<oam_core::child_extra::StdioFd> = {
+            let mut out = Vec::with_capacity(3);
+            for (i, slot) in stdio.iter().enumerate() {
+                out.push(match slot {
+                    oam_core::child::StdioMode::Ignore => {
+                        oam_core::child_extra::StdioFd::Ignore
+                    }
+                    oam_core::child::StdioMode::Inherit => {
+                        oam_core::child_extra::StdioFd::Inherit
+                    }
+                    oam_core::child::StdioMode::Pipe => {
+                        if i == 0 {
+                            // stdin: parent writes to child's fd 0.
+                            oam_core::child_extra::StdioFd::ChildWrite
+                        } else {
+                            // stdout/stderr: parent reads from child's fd 1/2.
+                            oam_core::child_extra::StdioFd::ChildRead
+                        }
+                    }
+                    oam_core::child::StdioMode::File(file) => {
+                        #[cfg(windows)]
+                        use std::os::windows::io::AsRawHandle;
+                        #[cfg(unix)]
+                        use std::os::fd::AsRawFd;
+                        #[cfg(windows)]
+                        let raw = file.as_raw_handle() as isize;
+                        #[cfg(unix)]
+                        let raw = file.as_raw_fd();
+                        oam_core::child_extra::StdioFd::Descriptor(raw)
+                    }
+                });
+            }
+            out
+        };
+        let reg = core_runtime!(scope).raw_children();
+        let ids = core_runtime!(scope).body_ids();
+        match oam_core::child_extra::spawn_extra(
+            &command,
+            &child_args,
+            cwd.as_deref(),
+            env_pairs.as_deref(),
+            &stdio_fds,
+            detached,
+            windows_hide,
+            argv0.as_deref(),
+        ) {
+            Ok(child) => {
+                let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let pid = child.pid;
+                reg.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(handle, child);
+                let json = serde_json::json!({ "handle": handle, "pid": pid });
+                if let Some(s) = v8::String::new(scope, &json.to_string()) {
+                    rv.set(s.into());
+                }
+            }
+            Err(msg) => {
+                let text = v8::String::new(scope, &msg).unwrap();
+                let err = v8::Exception::error(scope, text);
+                scope.throw_exception(err);
+            }
+        }
+        return;
+    }
+
     let spawned = {
         let core = core_runtime!(scope);
         let _guard = core.enter();

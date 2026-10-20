@@ -257,6 +257,7 @@ async fn raw_kill_after_exit_reports_real_exit() {
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
         false,
         false,
+        None::<&str>,
     )
     .expect("spawn_extra immediate-exit child");
     let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -302,6 +303,7 @@ async fn raw_kill_during_wait_delivers_signal() {
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
         false,
         false,
+        None::<&str>,
     )
     .expect("spawn_extra sleeper child");
     let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -346,6 +348,7 @@ async fn raw_close_fd_cancels_a_blocked_read_win() {
         &[StdioFd::Ignore, StdioFd::ChildWrite, StdioFd::Ignore],
         false,
         false,
+        None::<&str>,
     )
     .expect("spawn_extra quiet sleeper");
     let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -392,6 +395,7 @@ async fn raw_read_after_wait_still_drains_the_pipe_win() {
         &[StdioFd::Ignore, StdioFd::ChildWrite, StdioFd::Ignore],
         false,
         false,
+        None::<&str>,
     )
     .expect("spawn_extra echo");
     let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -450,6 +454,7 @@ async fn raw_kill_during_wait_delivers_signal_win() {
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
         false,
         false,
+        None::<&str>,
     )
     .expect("spawn_extra ping sleeper");
     let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -493,6 +498,7 @@ async fn raw_kill_before_wait_delivers_signal() {
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
         false,
         false,
+        None::<&str>,
     )
     .expect("spawn_extra sleeper child");
     let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -540,6 +546,7 @@ async fn raw_kill_trapped_signal_reports_clean_exit() {
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
         false,
         false,
+        None::<&str>,
     )
     .expect("spawn_extra trapping child");
     let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
