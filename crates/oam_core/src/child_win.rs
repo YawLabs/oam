@@ -1213,6 +1213,7 @@ mod tests {
                 &[StdioFd::ChildRead, StdioFd::Ignore, StdioFd::Ignore],
                 false,
                 false,
+                None::<&str>,
             )
             .expect("spawn_extra");
 

@@ -59,6 +59,7 @@ fn spawn_echoer(marker: &str) -> (tokio::process::Child, u32) {
         stdio_pipe_all(),
         false,
         false,
+        None,
     )
     .expect("spawn echoer")
 }
@@ -213,6 +214,7 @@ async fn deliver_kill_does_not_signal_exited_child() {
         stdio_pipe_all(),
         false,
         false,
+        None,
     )
     .expect("spawn immediate-exit child");
     let (reg, handle) = register(child, pid);
