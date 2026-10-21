@@ -247,9 +247,10 @@ pub fn spawn_child(
     #[cfg(not(windows))]
     {
         if let Some(ref argv0) = argv0 {
-            use std::os::unix::process::CommandExt;
+            // tokio's Command::arg0 is inherent on Unix (no CommandExt needed).
             cmd.arg0(argv0);
         }
+        let _ = (detached, windows_hide);
     }
 
     let child = cmd.spawn().map_err(|e| spawn_failure_json(&e))?;

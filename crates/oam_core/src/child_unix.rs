@@ -171,6 +171,7 @@ pub(crate) fn signal_name(num: i32) -> String {
 /// kill-on-close job membership. It is not yet honored here (node would
 /// `setsid()` the child); a POSIX child outlives its parent either way.
 /// `_windows_hide` is node's `windowsHide`, which node ignores on POSIX too.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_extra(
     command: &str,
     args: &[String],
