@@ -17234,14 +17234,14 @@
     // writable after. It must therefore be independent of process.argv: a CLI
     // harness doing `process.argv = ["node", "cli.js"]` retargets argv only,
     // and on node argv0 still reports the name the process was invoked under.
-    // So this reads the NATIVE argv, not argv() -- the argv setter above
-    // replaces that cache, and sharing it made an assignment rewrite argv0.
-    // Still lazy, and for the same reason argv() is: the embedder declares
-    // argv after this module instantiates, so the snapshot is taken on the
-    // first read rather than at construction time.
+    // It is also independent of argv[0] here: the native argv's [0] IS
+    // execPath, and node's argv0 is the RAW command-line token a spawn's
+    // `argv0` sets, so this reads natives.argv0() (the OS token), not argv().
+    // Still lazy, and for the same reason argv() is: a snapshot taken at
+    // construction time would run before the embedder finishes setup.
     let argv0Cache;
     Object.defineProperty(process, "argv0", {
-      get: () => (argv0Cache ??= natives.argv()[0]),
+      get: () => (argv0Cache ??= natives.argv0()),
       enumerable: true,
       configurable: true,
     });
@@ -37769,6 +37769,24 @@
           stdioSpec.splice(ipcIndex, 1);
         }
       }
+      // argv0 needs the RAW create path (Windows CreateProcessW; the raw-child
+      // machinery spawnExtra drives). Route through it so the JS side uses the
+      // extra-fd ops: the plain path's spawnReadStdout/... ops read a DIFFERENT
+      // native registry than the raw child an argv0 spawn registers in, so a
+      // plain-path argv0 child came back as "unknown child handle". Gated on
+      // the same platforms the extra-fd branch trusts.
+      if (
+        opts.argv0 &&
+        !wantsIpc &&
+        (natives.platform === "win32" ||
+          natives.platform === "linux" ||
+          natives.platform === "darwin")
+      ) {
+        let arr = stdioSpec;
+        if (typeof arr === "string") arr = [arr, arr, arr];
+        if (!Array.isArray(arr)) arr = ["pipe", "pipe", "pipe"];
+        return spawnExtra(norm, arr, false, -1);
+      }
       // Extra-fd stdio (Chromium CDP pipe): an array with >3 entries routes to
       // the raw extra-fd spawn (CreateProcessW+lpReserved2 on Windows, Command+
       // pre_exec dup2 on Unix). Gated to platforms with a real native backend.
@@ -37982,6 +38000,11 @@
       const spawnOpts = Object.assign({}, opts);
       delete spawnOpts.stdio;
       delete spawnOpts.detached;
+      // `argv0` is off the whitelist too: node's execFile rebuilds the options
+      // it hands spawn without it (child_process.js), so an argv0 here is
+      // silently dropped -- execFileSync keeps it (it passes options straight
+      // to spawnSync). Match node: drop it.
+      delete spawnOpts.argv0;
       // The whitelist hands spawn `!!options.windowsHide`, so exec never
       // throws spawn's type check for it.
       spawnOpts.windowsHide = !!opts.windowsHide;
@@ -38136,10 +38159,11 @@
       // happen to appear inside an argument. `shell` stays honored if the
       // caller explicitly asks for one, which node also supports.
       const spawnOpts = Object.assign({}, opts, { shell: !!opts.shell });
-      // Same whitelist as exec(): neither stdio nor detached reaches spawn,
-      // and windowsHide arrives as a boolean.
+      // Same whitelist as exec(): none of stdio, detached or argv0 reaches
+      // spawn, and windowsHide arrives as a boolean.
       delete spawnOpts.stdio;
       delete spawnOpts.detached;
+      delete spawnOpts.argv0;
       spawnOpts.windowsHide = !!opts.windowsHide;
       const display = norm.args.length
         ? `${norm.command} ${norm.args.join(" ")}`

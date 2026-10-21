@@ -145,6 +145,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("envSharedRead", op_env_shared_read),
         ("envSharedSet", op_env_shared_set),
         ("argv", op_argv),
+        ("argv0", op_argv0),
         ("cwd", op_cwd),
         ("chdir", op_chdir),
         ("exit", op_exit),
@@ -1370,6 +1371,25 @@ fn op_argv(
         .collect();
     let array = v8::Array::new_with_elements(scope, &elements);
     rv.set(array.into());
+}
+
+/// `natives.argv0() -> string`: node's bootstrap `process.argv0`, captured once
+/// from the OS command line's first token before node overwrites `argv[0]`
+/// with execPath. That token is what a spawn's `argv0` sets, and node's
+/// `process.argv0` reports it while `process.argv[0]` stays execPath -- so
+/// this reads the raw token, NOT the embedder-declared argv (whose [0] IS
+/// execPath), keeping the two properties independent as node keeps them.
+/// std's `args_os` on Windows parses `GetCommandLineW`'s first token exactly
+/// as the CRT does; on unix it is the raw argv[0].
+fn op_argv0(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let raw = std::env::args_os().next().unwrap_or_default();
+    let s =
+        v8::String::new(scope, &raw.to_string_lossy()).unwrap_or_else(|| v8::String::empty(scope));
+    rv.set(s.into());
 }
 
 fn op_cwd(
@@ -9512,6 +9532,25 @@ fn opt_windows_hide(
     .is_some_and(|v| v.is_true())
 }
 
+/// The `argv0` spawn option: the name the child's command line starts with.
+/// Node unshifts it onto the child's argv (lib/child_process.js, after any
+/// `shell` rewrite), so it becomes the child's `process.argv0` and -- under an
+/// interpreter -- its `process.argv[0]`; the program node runs is still
+/// `command`. Only a string is honored, as node honors it.
+fn opt_argv0(
+    scope: &mut v8::PinScope<'_, '_>,
+    opts: Option<v8::Local<'_, v8::Object>>,
+) -> Option<String> {
+    opts.and_then(|o| {
+        let key = v8::String::new(scope, "argv0")?;
+        let val = o.get(scope, key.into())?;
+        if !val.is_string() {
+            return None;
+        }
+        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
+    })
+}
+
 /// The `env` spawn option: the child's whole environment, as the JS layer
 /// built it (child_process's childEnv -- the caller's env or process.env, with
 /// node's and libuv's adjustments). Absent only for a caller that wants this
@@ -9632,14 +9671,61 @@ fn op_spawn_sync(
     let stdio = arg_stdio_spec(scope, opts, &core_runtime!(scope).sync_files());
 
     // Read argv0 from the options object (node's spawn/child_process API).
-    let argv0: Option<String> = opts.and_then(|o| {
-        let key = v8::String::new(scope, "argv0").unwrap();
-        let val = o.get(scope, key.into())?;
-        if val.is_null_or_undefined() {
-            return None;
-        }
-        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
-    });
+    let argv0 = opt_argv0(scope, opts);
+
+    // A sync spawn with an argv0: the raw-create path when the platform has
+    // one (Windows CreateProcessW is the only way to set the first token), the
+    // std path -- which carries argv0 through CommandExt::arg0 -- otherwise.
+    #[cfg(any(windows, unix))]
+    if let Some(argv0) = argv0.as_deref() {
+        let [slot0, slot1, slot2] = stdio;
+        let to_fd = |i: usize, m: &oam_core::child::StdioMode| {
+            use oam_core::child_extra::StdioFd;
+            match m {
+                oam_core::child::StdioMode::Ignore => StdioFd::Ignore,
+                oam_core::child::StdioMode::Inherit => StdioFd::Inherit,
+                oam_core::child::StdioMode::Pipe => {
+                    // `ChildRead` == the CHILD reads this fd (parent writes):
+                    // stdin. `ChildWrite` == the child writes, the parent
+                    // reads: stdout/stderr. (spawn_extra / child_win.rs.)
+                    if i == 0 {
+                        StdioFd::ChildRead
+                    } else {
+                        StdioFd::ChildWrite
+                    }
+                }
+                oam_core::child::StdioMode::File(file) => {
+                    #[cfg(windows)]
+                    let raw = {
+                        use std::os::windows::io::AsRawHandle;
+                        file.as_raw_handle() as isize
+                    };
+                    #[cfg(unix)]
+                    let raw = {
+                        use std::os::fd::AsRawFd;
+                        file.as_raw_fd()
+                    };
+                    StdioFd::Descriptor(raw)
+                }
+            }
+        };
+        let stdio_fds = vec![to_fd(0, &slot0), to_fd(1, &slot1), to_fd(2, &slot2)];
+        let result = oam_core::child_extra::spawn_sync_argv0(
+            &command,
+            &child_args,
+            cwd.as_deref(),
+            env_pairs.as_deref(),
+            input.as_deref(),
+            &stdio_fds,
+            detached,
+            windows_hide,
+            Some(argv0),
+            timeout_ms,
+            max_buffer,
+        );
+        rv.set(spawn_sync_result_to_js(scope, result).into());
+        return;
+    }
 
     let result = oam_core::child::spawn_sync(
         &command,
@@ -9656,6 +9742,18 @@ fn op_spawn_sync(
         argv0,
     );
 
+    let obj = spawn_sync_result_to_js(scope, result);
+    rv.set(obj.into());
+}
+
+/// The JS object `spawnSync` returns: stdout/stderr buffers (piped slots
+/// only), pid, status, signal, and -- on failure -- the {code,errno,message}
+/// error node puts on `result.error`. Shared by the std path and the
+/// raw-create argv0 path so both report identically.
+fn spawn_sync_result_to_js<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    result: oam_core::child::SpawnSyncResult,
+) -> v8::Local<'s, v8::Object> {
     let obj = v8::Object::new(scope);
     if let Some(stdout) = bytes_to_uint8array(scope, result.stdout) {
         let key = v8::String::new(scope, "stdout").unwrap();
@@ -9708,7 +9806,7 @@ fn op_spawn_sync(
         obj.set(scope, key.into(), err_obj.into());
     }
 
-    rv.set(obj.into());
+    obj
 }
 
 fn op_spawn_async(
@@ -9768,14 +9866,7 @@ fn op_spawn_async(
     let windows_hide = opt_windows_hide(scope, opts);
 
     // Read argv0 from the options object (node's spawn/child_process API).
-    let argv0: Option<String> = opts.and_then(|o| {
-        let key = v8::String::new(scope, "argv0")?;
-        let val = o.get(scope, key.into())?;
-        if val.is_null_or_undefined() {
-            return None;
-        }
-        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
-    });
+    let argv0 = opt_argv0(scope, opts);
 
     let children = core_runtime!(scope).children();
     let ids = core_runtime!(scope).body_ids();
@@ -9804,11 +9895,11 @@ fn op_spawn_async(
                     oam_core::child::StdioMode::Inherit => oam_core::child_extra::StdioFd::Inherit,
                     oam_core::child::StdioMode::Pipe => {
                         if i == 0 {
-                            // stdin: parent writes to child's fd 0.
-                            oam_core::child_extra::StdioFd::ChildWrite
-                        } else {
-                            // stdout/stderr: parent reads from child's fd 1/2.
+                            // stdin: the CHILD reads fd 0, the parent writes.
                             oam_core::child_extra::StdioFd::ChildRead
+                        } else {
+                            // stdout/stderr: the child writes fd 1/2, the parent reads.
+                            oam_core::child_extra::StdioFd::ChildWrite
                         }
                     }
                     oam_core::child::StdioMode::File(file) => {
@@ -10201,14 +10292,7 @@ fn op_spawn_extra(
     let windows_hide = opt_windows_hide(scope, opts);
 
     // Read argv0 from the options object (node's spawn/child_process API).
-    let argv0: Option<String> = opts.and_then(|o| {
-        let key = v8::String::new(scope, "argv0")?;
-        let val = o.get(scope, key.into())?;
-        if val.is_null_or_undefined() {
-            return None;
-        }
-        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
-    });
+    let argv0 = opt_argv0(scope, opts);
 
     let reg = core_runtime!(scope).raw_children();
     let ids = core_runtime!(scope).body_ids();

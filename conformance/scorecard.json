@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "e90862af",
+  "commit": "57ed1a0b+wip",
   "oamVersion": "oam 0.19.1",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 406,
-      "total": 408,
+      "pass": 408,
+      "total": 409,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -692,7 +692,7 @@
         },
         {
           "case": "271-http-request-header-bytes.mjs",
-          "status": "timeout"
+          "status": "pass"
         },
         {
           "case": "272-http-server-connection-close-order.mjs",
@@ -1477,6 +1477,10 @@
         },
         {
           "case": "574-cjs-graph-throw.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "575-child-argv0.mjs",
           "status": "pass"
         },
         {

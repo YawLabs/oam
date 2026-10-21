@@ -1,19 +1,29 @@
 // node's `argv0` spawn option, end to end.
 //
-// When `options.argv0` is set, the child's process.argv[0] (and on POSIX,
-// argv[0] / the process image name reported by getcwd() -- no, by reading
-// /proc/self/comm -- but we only check what scripts can observe:
-//   - process.argv[0] inside the child
-//   - `node -e "process.argv[0]"` inside the child
+// node sets the child's RAW command-line first token to `options.argv0`: it
+// unshifts argv0 onto the child's argv (lib/child_process.js
+// normalizeSpawnArguments, after any `shell` rewrite), and the program it runs
+// is still `file`. What the child then observes:
 //
-// On Windows argv0 is set via lpCommandLine (the first token); on POSIX via
-// arg0(3) / CommandExt::arg0(). This case covers:
+//   - process.argv0 === the argv0 token (node captures argv0 from the OS
+//     command line before overwriting argv[0]);
+//   - process.argv[0] === process.execPath -- node overwrites argv[0] with the
+//     resolved execPath on EVERY platform, so the two stay independent. A spawn
+//     with argv0 does NOT change argv[0].
 //
-//   1. spawnSync, spawn, and the extra-fd spawn path all respect argv0.
-//   2. execFileSync and execFile also pass it through (they delegate to
-//      spawn/exec under the hood).
-//   3. The default (absent) leaves process.argv[0] as node's own binary path.
+// Spawned WITHOUT argv0 the first token is the program as invoked, so
+// process.argv0 is that string -- execPath when the call passes an absolute
+// path -- while process.argv[0] is still execPath.
 //
+// Every value printed here is a runtime-INDEPENDENT relation (a token the call
+// chose, or a boolean against process.execPath), never an absolute path:
+// node's and oam's execPath differ, so printing them would diverge on the path
+// alone. This case covers:
+//
+//   1. spawnSync, spawn, and an explicit-stdio spawn all set process.argv0.
+//   2. execFileSync keeps argv0 (it passes options straight to spawnSync).
+//   3. execFile DROPS argv0 -- node rebuilds the spawn options without it -- so
+//      its child sees execPath, not the token.
 import {
   execFile,
   execFileSync,
@@ -26,54 +36,50 @@ import path from "node:path";
 
 const dir = os.tmpdir();
 const child = path.join(dir, `oam-conf-575-${process.pid}.cjs`);
-writeFileSync(child, "console.log(process.argv[0]);");
-
-// 1. spawnSync -- default (no argv0) vs explicit argv0.
-const rDefault = spawnSync(process.execPath, [child]);
-const defaultArgv0 = String(rDefault.stdout).trim();
-
-const customArgv0 = `oam-child-${process.pid}`;
-const rCustom = spawnSync(process.execPath, [child], { argv0: customArgv0 });
-const childArgv0 = String(rCustom.stdout).trim();
-
-console.log(
-  "spawnSync default",
-  JSON.stringify(defaultArgv0),
-  JSON.stringify(customArgv0),
-  JSON.stringify(childArgv0),
+// The child reports its own argv0 and whether its argv[0] is its execPath --
+// never the path itself.
+writeFileSync(
+  child,
+  "process.stdout.write(JSON.stringify({" +
+    "a0: process.argv0, firstIsExec: process.argv[0] === process.execPath }));",
 );
 
-// Verify: without argv0 the child sees the real binary; with argv0 it sees
-// whatever we passed.
-if (defaultArgv0 === customArgv0) {
-  console.error("FAIL: default should differ from custom argv0");
-  process.exitCode = 1;
-}
-if (childArgv0 !== customArgv0) {
-  console.error(
-    "FAIL: child argv[0] expected",
-    customArgv0,
-    "got",
-    childArgv0,
-  );
-  process.exitCode = 1;
+let ok = true;
+// `expectedArgv0` is the token the caller chose (or process.execPath when none
+// was given, which is what argv0 reports then).
+function report(label, out, expectedArgv0) {
+  let o = {};
+  try {
+    o = JSON.parse(String(out).trim());
+  } catch {
+    /* leave o empty: both relations read false and the line is a divergence */
+  }
+  const argv0Matches = o.a0 === expectedArgv0;
+  const firstIsExec = o.firstIsExec === true;
+  console.log(label, "argv0-matches", argv0Matches, "argv0-is-execPath", firstIsExec);
+  if (!argv0Matches || !firstIsExec) ok = false;
 }
 
-// 2. async spawn -- same test over the async path.
+// 1. spawnSync -- explicit argv0, then the default (argv0 is execPath).
+report(
+  "spawnSync argv0  ",
+  spawnSync(process.execPath, [child], { argv0: "sync-child" }).stdout,
+  "sync-child",
+);
+report(
+  "spawnSync default",
+  spawnSync(process.execPath, [child]).stdout,
+  process.execPath,
+);
+
+// 2. async spawn -- same over the async path.
 const cp = spawn(process.execPath, [child], { argv0: "async-child" });
 let out = "";
 cp.stdout.on("data", (d) => (out += d));
 await new Promise((resolve) => cp.on("close", resolve));
+report("async spawn argv0", out, "async-child");
 
-if (out.trim() !== "async-child") {
-  console.error(
-    "FAIL: async spawn argv0 expected 'async-child' got",
-    out.trim(),
-  );
-  process.exitCode = 1;
-}
-
-// 3. extra-fd spawn path (more than three stdio slots).
+// 3. explicit stdio (an 'ignore' stdin beside piped stdout/stderr).
 const cp2 = spawn(process.execPath, [child], {
   argv0: "extra-fd-child",
   stdio: ["ignore", "pipe", "pipe"],
@@ -81,29 +87,18 @@ const cp2 = spawn(process.execPath, [child], {
 let out2 = "";
 cp2.stdout.on("data", (d) => (out2 += d));
 await new Promise((resolve) => cp2.on("close", resolve));
+report("stdio spawn argv0", out2, "extra-fd-child");
 
-if (out2.trim() !== "extra-fd-child") {
-  console.error(
-    "FAIL: extra-fd spawn argv0 expected 'extra-fd-child' got",
-    out2.trim(),
-  );
-  process.exitCode = 1;
-}
+// 4. execFileSync keeps argv0 (options pass straight through to spawnSync).
+report(
+  "execFileSync argv0",
+  execFileSync(process.execPath, [child], { argv0: "exec-sync-child" }),
+  "exec-sync-child",
+);
 
-// 4. execFileSync -- delegates to spawn, should inherit argv0.
-const rExecSync = execFileSync(process.execPath, [child], {
-  argv0: "exec-sync-child",
-});
-if (String(rExecSync).trim() !== "exec-sync-child") {
-  console.error(
-    "FAIL: execFileSync argv0 expected 'exec-sync-child' got",
-    String(rExecSync).trim(),
-  );
-  process.exitCode = 1;
-}
-
-// 5. execFile (async) -- same, delegates to spawn.
-const rExec = await new Promise((resolve, reject) => {
+// 5. execFile (async) DROPS argv0: node rebuilds the options it hands spawn
+//    without it, so the child sees its execPath, not the token.
+const execOut = await new Promise((resolve, reject) => {
   execFile(
     process.execPath,
     [child],
@@ -111,13 +106,8 @@ const rExec = await new Promise((resolve, reject) => {
     (err, stdout) => (err ? reject(err) : resolve(stdout)),
   );
 });
-if (String(rExec).trim() !== "exec-async-child") {
-  console.error(
-    "FAIL: execFile argv0 expected 'exec-async-child' got",
-    String(rExec).trim(),
-  );
-  process.exitCode = 1;
-}
+report("execFile drop argv0", execOut, process.execPath);
 
 rmSync(child);
-console.log("PASS");
+console.log(ok ? "PASS" : "FAIL");
+process.exitCode = ok ? 0 : 1;

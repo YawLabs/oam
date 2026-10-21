@@ -359,6 +359,96 @@ pub(crate) fn resolve_windows_program(
     ))
 }
 
+/// The concrete executable path for `prog`, after libuv's program search --
+/// the value `CreateProcessW` needs as `lpApplicationName` when an argv0 has
+/// taken over the command line's first token (CreateProcessW does NOT search
+/// the application name on PATH, and falls back to the first token only when
+/// the application name is NULL).
+///
+/// Mirrors `search_path` in libuv src/win/process.c: a name with a path in it
+/// is tried only in its own directory; a bare name is tried in `cwd` and then
+/// in every `path_env` (`;`-separated) directory; in each directory the name
+/// as given (only when its last component carries an extension), then `.com`,
+/// then `.exe`; a directory never names a program; nothing found is ENOENT.
+///
+/// One deliberate simplification: libuv drops `cwd` from a bare-name search
+/// when `NeedCurrentDirectoryForExePathW` says to (a security policy that is
+/// off by default); this always searches `cwd` first.
+#[cfg(windows)]
+pub(crate) fn resolve_program_path(
+    prog: &str,
+    cwd: Option<&str>,
+    path_env: Option<&str>,
+) -> std::io::Result<String> {
+    use std::os::windows::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+
+    let runnable = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_DIRECTORY == 0)
+    };
+    let base_dir = || {
+        cwd.map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+    };
+
+    let has_dir = prog.contains(['/', '\\']) || prog == "." || prog == "..";
+    let name: &str;
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if has_dir {
+        let (dir, leaf) = match prog.rfind(['/', '\\']) {
+            Some(i) => (&prog[..i], &prog[i + 1..]),
+            None => ("", prog),
+        };
+        name = if leaf.is_empty() { prog } else { leaf };
+        let dir_path = Path::new(if dir.is_empty() { "." } else { dir });
+        dirs.push(if dir_path.is_absolute() {
+            dir_path.to_path_buf()
+        } else {
+            base_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(dir_path)
+        });
+    } else {
+        name = prog;
+        if let Some(c) = base_dir() {
+            dirs.push(c);
+        }
+        if let Some(pe) = path_env {
+            for entry in pe.split(';') {
+                if entry.is_empty() {
+                    continue;
+                }
+                let e = Path::new(entry);
+                dirs.push(if e.is_absolute() {
+                    e.to_path_buf()
+                } else {
+                    base_dir().unwrap_or_else(|| PathBuf::from(".")).join(e)
+                });
+            }
+        }
+    }
+
+    let name_has_ext = name.rfind('.').is_some_and(|dot| dot + 1 < name.len());
+    for dir in &dirs {
+        let mut candidates: Vec<PathBuf> = Vec::with_capacity(3);
+        if name_has_ext {
+            candidates.push(dir.join(name));
+        }
+        candidates.push(dir.join(format!("{name}.com")));
+        candidates.push(dir.join(format!("{name}.exe")));
+        for cand in candidates {
+            if runnable(&cand) {
+                return Ok(cand.to_string_lossy().into_owned());
+            }
+        }
+    }
+    Err(std::io::Error::from_raw_os_error(
+        windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND as i32,
+    ))
+}
+
 #[cfg(all(test, windows))]
 mod program_search_tests {
     use super::resolve_windows_program as resolve;
@@ -405,11 +495,50 @@ mod program_search_tests {
 
         std::fs::remove_dir_all(&root).unwrap();
     }
+
+    #[test]
+    fn a_bare_name_is_found_on_path_like_libuv() {
+        use super::resolve_program_path as resolve;
+        let root = std::env::temp_dir().join(format!("oam-path-search-{}", std::process::id()));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("mytool.exe"), b"MZ").unwrap();
+        std::fs::write(bin.join("shim.cmd"), b"@exit 0\r\n").unwrap();
+        std::fs::create_dir_all(bin.join("tool.exe")).unwrap(); // a DIRECTORY named tool.exe
+        std::fs::write(bin.join("noext"), b"hi").unwrap();
+        let path = bin.to_str().unwrap();
+        let path_b = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let not_found =
+            |result: std::io::Result<String>| result.unwrap_err().raw_os_error() == Some(2);
+
+        // A bare name with an extension: found only via PATH (not cwd).
+        assert_eq!(
+            resolve("mytool.exe", None, Some(path)).unwrap(),
+            path_b(&bin.join("mytool.exe"))
+        );
+        // Extensionless bare name: libuv appends .exe and finds it.
+        assert_eq!(
+            resolve("mytool", None, Some(path)).unwrap(),
+            path_b(&bin.join("mytool.exe"))
+        );
+        // A directory never names a program, even when its name has .exe.
+        assert!(not_found(resolve("tool.exe", None, Some(path))));
+        // Nothing on PATH: ENOENT.
+        assert!(not_found(resolve("nosuchtool", None, Some(path))));
+        // A name with a path in it is NOT searched on PATH.
+        assert!(not_found(resolve("mytool.exe", None, Some(""))));
+        // `cwd` is searched first for a bare name.
+        assert_eq!(
+            resolve("mytool.exe", Some(path), None).unwrap(),
+            path_b(&bin.join("mytool.exe"))
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
 
 /// The errno for a spawnSync failure oam detects itself (a timeout, an
 /// overflowing buffer), which has no OS error to take it from.
-fn synthetic_spawn_errno(code: &str) -> Option<i32> {
+pub(crate) fn synthetic_spawn_errno(code: &str) -> Option<i32> {
     #[cfg(windows)]
     {
         // The windows table is keyed on the code alone.
