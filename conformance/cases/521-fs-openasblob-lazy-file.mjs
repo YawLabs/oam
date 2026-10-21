@@ -93,8 +93,19 @@ fs.writeFileSync(e, "grown");
 console.log("empty file grown:", await show(eb.text()), await show(eslice.text()), await show(ewrap.text()), await show(emixed.text()));
 
 // A directory: the size the open's fstat said, and a change to it fails the read.
+// The first row pins the mtime along with its add: NTFS applies a directory's
+// mtime update lazily, so the add alone moved it in only 6-29 of 100 attempts
+// here. Each side holds its own directory, so an unpinned add printed
+// NotReadableError on one side and "" on the other and failed the
+// byte-compare on the host's schedule rather than on any runtime's behaviour.
 for (const [label, change] of [
-  ["a file added", (d) => fs.writeFileSync(path.join(d, "x"), "x")],
+  [
+    "a file added, mtime pinned",
+    (d) => {
+      fs.writeFileSync(path.join(d, "x"), "x");
+      fs.utimesSync(d, 1000000000, 1000000000);
+    },
+  ],
   ["utimes", (d) => fs.utimesSync(d, 1000000000, 1000000000)],
   ["removed", (d) => fs.rmdirSync(d)],
 ]) {

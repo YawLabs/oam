@@ -32,12 +32,23 @@ const files = {
   "listener.cjs":
     'process.on("uncaughtException", function onUncaught() {\n  throw 43;\n});\nthrow new Error("x");\n',
   "exec-argv.cjs": "console.log(JSON.stringify(process.execArgv));\nthrow 42;\n",
+  // The ORDER the parent's three handlers run in is node's to choose: under
+  // CPU saturation node delivered 'message' after 'error' in 163 of 2032
+  // measured runs, so printing each handler as it fired made line 127 race and
+  // the two sides -- separate processes, separate load -- disagreed. The lines
+  // are collected and sorted instead: the SET of events (the worker accepted
+  // execArgv, the parent's 'error' got the value itself, exit 1) is the
+  // contract; the arrival order never was, and node does not guarantee it.
   "worker-main.cjs": [
     'const { Worker } = require("node:worker_threads");',
     'const w = new Worker(require("node:path").join(__dirname, "worker.cjs"), { execArgv: ["--trace-uncaught"] });',
-    'w.on("message", (m) => console.log("worker execArgv", JSON.stringify(m)));',
-    'w.on("error", (e) => console.log("worker error", e));',
-    'w.on("exit", (c) => console.log("worker exit", c));',
+    "const lines = [];",
+    'w.on("message", (m) => lines.push(`worker execArgv ${JSON.stringify(m)}`));',
+    'w.on("error", (e) => lines.push(`worker error ${e}`));',
+    'w.on("exit", (c) => {',
+    "  lines.push(`worker exit ${c}`);",
+    "  for (const line of lines.sort()) console.log(line);",
+    "});",
     "",
   ].join("\n"),
   "worker.cjs": 'require("node:worker_threads").parentPort.postMessage(process.execArgv);\nthrow 42;\n',

@@ -42,11 +42,18 @@ const path = require('node:path');
 (async () => {
   for (const f of ['worker-cjs.js', 'worker-esm.js']) {
     const w = new Worker(path.join(__dirname, f));
+    // 'exit' is attached in the same tick as the constructor: these workers
+    // are a one-line postMessage, and a listener attached after the message
+    // await below can miss the event outright -- measured 28 of 48 runs here
+    // under load -- which left this script waiting forever and exiting 0 with
+    // no output (the byte-compare then differed on the host's schedule, not
+    // on any runtime's behaviour).
+    const exited = new Promise((r) => w.on('exit', r));
     const message = await new Promise((resolve) => {
       w.on('message', resolve);
       w.on('error', (e) => resolve('error ' + e.message.split('\\n')[0]));
     });
-    await new Promise((r) => w.on('exit', r));
+    await exited;
     console.log(f, '->', message);
   }
 })();

@@ -61,6 +61,20 @@ const show = (label, f) => {
   }
   console.log(label + ": " + line);
 };
+// A row whose errno the host itself varies between runs: only the refusal,
+// its syscall and the path it names are stable enough to compare (both of
+// those are the same whichever errno the open came back with; code, errno
+// and message are not).
+const showRefused = (label, f) => {
+  let line;
+  try {
+    f();
+    line = "opened?!";
+  } catch (e) {
+    line = "refused " + [e.syscall, "path=" + JSON.stringify(scrub(e.path))].join(" ");
+  }
+  console.log(label + ": " + line);
+};
 const later = async (label, f) => {
   let line;
   try {
@@ -419,8 +433,19 @@ for (const flag of ["r", "r+", "a"]) {
 // --- a share that is no disk has no root to open ------------------------------
 if (fs.existsSync(share)) {
   for (const ipc of ["\\\\localhost\\IPC$", "\\\\localhost\\IPC$\\"]) {
-    for (const flag of ["r", "r+", "a", "ax", "w", "wx"]) {
+    for (const flag of ["r", "r+", "a", "w"]) {
       show("openSync " + ipc + " " + flag, () => fs.openSync(ipc, flag));
+    }
+    // An exclusive create answers with whichever errno the SMB server has for
+    // it on this attempt: measured 4 flips between EINVAL and EEXIST in ~272
+    // runs of node alone -- same binary, same flags, both answers. The two
+    // sides issue the same CREATE_NEW, so what the share reports depends on
+    // the host's own IPC$ session state (services open and close one in the
+    // background), not on either runtime: only the refusal is compared here.
+    // The full errno shape stays covered by every flag above and by the disk
+    // paths below, where the server's answer does not vary.
+    for (const flag of ["ax", "wx"]) {
+      showRefused("openSync " + ipc + " " + flag, () => fs.openSync(ipc, flag));
     }
     show("readFileSync " + ipc, () => fs.readFileSync(ipc));
     show("writeFileSync " + ipc, () => fs.writeFileSync(ipc, ""));

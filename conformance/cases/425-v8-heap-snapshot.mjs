@@ -116,6 +116,12 @@ fs.writeFileSync(
     "parentPort.postMessage(v8.writeHeapSnapshot());\n",
 );
 const worker = new Worker(path.join(dir, "w.cjs"));
+// 'exit' attached in the same tick as the constructor: the `await` on the
+// message below lets this worker finish writing its snapshot and exit first,
+// and a listener attached after the event has already fired never resolves --
+// measured on the same shape in case 465 (28 of 48 runs). The later `await`
+// on it then hangs the case and truncates its output.
+const exited = new Promise((resolve) => worker.once("exit", resolve));
 const rejection = (label, p) =>
   p.then(
     (s) => console.log(label, "resolved", s.constructor.name),
@@ -124,7 +130,7 @@ const rejection = (label, p) =>
 // Called in the same tick as the constructor: not running yet.
 const preOnline = rejection("pre-online", worker.getHeapSnapshot());
 const [fromWorker] = await new Promise((resolve) => worker.once("message", (m) => resolve([m])));
-await new Promise((resolve) => worker.once("exit", resolve));
+await exited;
 await preOnline;
 console.log("worker", showName(fromWorker), fs.existsSync(fromWorker));
 await rejection("exited", worker.getHeapSnapshot());
