@@ -33,3 +33,5 @@ node_modules/
 # invisibly until a later cleanup deleted them and dirtied the release
 # preflight. Ignored at any depth, since the cwd is wherever oam was invoked.
 .oam-eval-*
+
+.repro/
