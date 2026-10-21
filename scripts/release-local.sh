@@ -93,6 +93,13 @@
 #                           never write THIRD_PARTY_LICENSES.md; hard-fail on
 #                           drift with the regenerate command instead
 #   OAM_SKIP_LOCAL_GATE=1   skip the local ci-local.sh run
+#   OAM_RELEASE_LEG_ATTEMPTS=2
+#                           run the local gate and each remote leg up to N
+#                           times (default 1 = fail-closed). Transient leg
+#                           deaths (a flaky test, a dropped ssh) cost one
+#                           bounded re-run instead of the whole release;
+#                           >1 also exports OAM_TEST_THREADS=1, keeping the
+#                           re-run deterministic (see the knob's comment)
 #   OAM_SKIP_WIN_X64=1      drop the win-x64 asset (emulated build is slow)
 #   OAM_SKIP_MAC=1          drop both mac assets (Air unreachable)
 #   OAM_SKIP_MAC_X64=1      drop only the mac-x64 asset
@@ -282,6 +289,42 @@ origin_tag_object() {
   return 1
 }
 
+# run_with_attempts <attempts> <context> <cmd...>
+# Runs cmd up to <attempts> times with an `attempt n/m` line per try; returns
+# the exit status of the last attempt (0 or non-zero -- the caller keeps its
+# existing `|| fail ...`, which therefore still fires exactly as before when
+# attempts = 1). `set -e` does not apply inside: the run is guarded by `if`,
+# and the status is captured inside so the loop itself cannot trip it.
+#
+# cmd must be re-runnable from scratch -- see the OAM_RELEASE_LEG_ATTEMPTS
+# comment for what that means here. NOTHING with a persistent side effect
+# (bump, tag, sign, publish) may be passed to this.
+run_with_attempts() {
+  local attempts="$1" ctx="$2" rc=0 attempt
+  shift 2
+  for attempt in $(seq 1 "$attempts"); do
+    if [ "$attempts" -gt 1 ]; then
+      if [ "$attempt" -gt 1 ]; then
+        warn "$ctx: attempt $attempt/$attempts (the previous run exited non-zero)"
+      else
+        note "$ctx: attempt $attempt/$attempts"
+      fi
+    fi
+    if "$@"; then rc=0; else rc=$?; fi
+    if [ "$rc" -eq 0 ]; then
+      [ "$attempt" -gt 1 ] && ok "$ctx: attempt $attempt/$attempts passed"
+      return 0
+    fi
+    [ "$attempt" -lt "$attempts" ] || break
+  done
+  return "$rc"
+}
+
+# note() prints to STDOUT on purpose: the leg drivers capture their caller's
+# stdout to read back the artifact dir as the LAST line, and only artifacts' own
+# final echo may live there. Everything this script narrates goes to stderr.
+note(){ echo -e "${YEL}  [note]${NC} $*" >&2; }
+
 SKIP_LOCAL_GATE="${OAM_SKIP_LOCAL_GATE:-0}"
 SKIP_WIN_X64="${OAM_SKIP_WIN_X64:-0}"
 SKIP_MAC="${OAM_SKIP_MAC:-0}"
@@ -294,6 +337,24 @@ SKIP_WIN_SIGN="${OAM_SKIP_WIN_SIGN:-0}"
 # Exported because the libs and build-platforms-tailnet.sh read it from the
 # environment; an explicit OAM_SIGN_REQUIRED=0 still wins.
 export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"
+# Attempts per remote leg and per local-gate run. 1 (the default) keeps the
+# old fail-closed shape: one failure kills the run. 2 buys one re-run of a leg
+# that died on something transient -- every retried step is run-id scoped (fresh
+# mktemp stage dirs, the remote drivers wipe-and-extract the same run's source
+# tarball, so a second attempt re-syncs and REBUILDS rather than resuming), and
+# it never wraps the bump, the tag, signing or publish, so there is no
+# persistent side effect to double-apply. A retry demands serial tests: a
+# release must not burn its second attempt on a cross-test race the first
+# attempt happened to lose (see CONTRIBUTING.md, "Tests touching
+# process-global state"). OAM_TEST_THREADS is exported, not just read: the
+# local gate spawns ci-local.sh, whose step 6 re-reads it from the environment.
+case "${OAM_RELEASE_LEG_ATTEMPTS:-}" in
+  '' | 0) OAM_RELEASE_LEG_ATTEMPTS=1 ;;
+  *[!0-9]*) fail "invalid OAM_RELEASE_LEG_ATTEMPTS='$OAM_RELEASE_LEG_ATTEMPTS' (want a whole number of attempts, 1 or more)" ;;
+esac
+if [ "$OAM_RELEASE_LEG_ATTEMPTS" -gt 1 ]; then
+  export OAM_TEST_THREADS="${OAM_TEST_THREADS:-1}"
+fi
 
 RELEASE_DIR="$(mktemp -d -t oam-release-"$TAG"-XXXXXX)"
 # Separate from RELEASE_DIR on purpose: `gh release create "$RELEASE_DIR"/*`
@@ -1034,7 +1095,14 @@ if [ "$SKIP_LOCAL_GATE" = "1" ]; then
   warn "OAM_SKIP_LOCAL_GATE=1 -- skipping the local CI gate"
 else
   step "Local CI gate (scripts/ci-local.sh)"
-  bash "$SCRIPT_DIR/ci-local.sh" || fail "local CI gate failed -- fix before releasing"
+  # Retried as a WHOLE -- not per ci-local.sh step: the step ledger records a
+  # pass only on success, and a partial re-run would splice steps measured on
+  # different trees, exactly what the ledger's re-keying exists to prevent.
+  # Rerunning the script from the top re-reads the tree and skips every step
+  # already recorded against it, so attempt 2 is cheap when attempt 1 died
+  # late. Serial tests apply from OAM_RELEASE_LEG_ATTEMPTS > 1 (see the knob).
+  run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "local CI gate" \
+    bash "$SCRIPT_DIR/ci-local.sh" || fail "local CI gate failed -- fix before releasing"
   # If the gate's conformance or node-suite results differ from the committed
   # receipts, xtask has just rewritten those files, stamped with the commit and
   # version the gate measured. If the results are unchanged it wrote nothing:
@@ -1130,7 +1198,10 @@ oam_reap_parked target/debug/deps
 for asset in "${conpty_assets[@]}"; do
   # A native Windows path: the harness checks the value with a Rust is_file(),
   # which knows nothing of MSYS's /tmp.
-  OAM_CONPTY_BIN="$(cygpath -w "$asset")" cargo test -p oam_cli --test conpty \
+  # --test-threads=1: a release leg dies once for a flake a re-run might not
+  # repeat, so every cargo test on this path runs serial (the cross-test
+  # interference class -- see build-remote.sh run_test).
+  OAM_CONPTY_BIN="$(cygpath -w "$asset")" cargo test -p oam_cli --test conpty -- --test-threads=1 \
     || fail "console raw-mode e2e failed against $(basename "$asset") -- see above; nothing has been published"
   ok "console raw-mode e2e passed against $(basename "$asset")"
 done
@@ -1140,7 +1211,14 @@ if [ "$SKIP_MAC" = "1" ]; then
   warn "OAM_SKIP_MAC=1 -- mac assets dropped this release"
 else
   step "Mac legs (tailnet: $OAM_MAC_HOST)"
-  MAC_ART=$(bash "$SCRIPT_DIR/build-platforms-tailnet.sh" --mode=release) \
+  # Retried whole: sync_src re-extracts this run's source tarball over the same
+  # remote dir (keeping only target/), and every stage/pull path is a fresh
+  # mktemp under THIS run's STAGE_DIR, so attempt 2 rebuilds from scratch
+  # instead of resuming a half-built leg. The [fail]/log-path message on
+  # final failure is the driver's own -- it prints the log tail above it, per
+  # attempt.
+  MAC_ART=$(run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "mac leg" \
+    bash "$SCRIPT_DIR/build-platforms-tailnet.sh" --mode=release) \
     || fail "mac leg failed -- see its log output above"
   MAC_ART="${MAC_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line
   # The two exact asset names, never a glob: whatever else lands in the leg's
@@ -1155,7 +1233,13 @@ if [ "$SKIP_LINUX" = "1" ]; then
   warn "OAM_SKIP_LINUX=1 -- linux asset dropped this release"
 else
   step "Linux leg (GCP: direct ssh, IAP fallback)"
-  LINUX_ART=$(bash "$SCRIPT_DIR/build-platforms-gcp-iap.sh" --mode=release) \
+  # Retried whole: this driver already retries each REMOTE STEP internally
+  # (OAM_REMOTE_STEP_ATTEMPTS, default 3, covering transport drops and a VM
+  # stopped under a step) -- this loop is the outer shell around the leg as a
+  # whole, re-syncing the same run's source tarball like the mac leg does.
+  # Sub-caption only: `[fail]` and the log path come from the driver itself.
+  LINUX_ART=$(run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "linux leg" \
+    bash "$SCRIPT_DIR/build-platforms-gcp-iap.sh" --mode=release) \
     || fail "linux leg failed -- see its log output above"
   LINUX_ART="${LINUX_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line
   cp "$LINUX_ART/oam-x86_64-unknown-linux-gnu" "$RELEASE_DIR/"

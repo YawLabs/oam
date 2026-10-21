@@ -237,6 +237,18 @@ park_link_targets() {
     || ko "target/debug/deps/oam.exe is locked and could not be parked -- $hint"
 }
 
+# `cargo test` args, appended to every invocation: release legs set
+# OAM_TEST_THREADS=1 so their run is deterministic -- tests sharing
+# process-global state (see CONTRIBUTING.md, "Tests touching process-global
+# state") race only under parallel threads, and a release must not die on a
+# flake a re-run might not repeat. This script default stays PARALLEL: step 6's
+# parallel run is the daily loop that surfaces exactly that interference class.
+# A caller-named `--test-threads` already beats the env var, so an explicit
+# choice wins over this default either way.
+test_thread_args() {
+  if [ "${OAM_TEST_THREADS:-}" = "1" ]; then printf '%s\n' -- --test-threads=1; fi
+}
+
 # ci.yml bounded a hung test at 15 min (the deadlocked/lingering test class).
 # Git Bash ships coreutils timeout; macOS needs brew coreutils (gtimeout) --
 # unbounded as the last resort.
@@ -518,7 +530,8 @@ if ! step_done_earlier 04-feature-off; then
   fi
   if [ "$SKIP_TESTS" -eq 0 ]; then
     nodefault_status=0
-    bounded_cargo_test -p oam_cli -p oam_engine --no-default-features || nodefault_status=$?
+    # shellcheck disable=SC2046  # word-splitting of the empty default is intended
+    bounded_cargo_test -p oam_cli -p oam_engine --no-default-features $(test_thread_args) || nodefault_status=$?
     clear_debug_holders
     [ "$nodefault_status" -eq 0 ] \
       || ko "napi-off tests failed (status $nodefault_status -- 124 means it hit the 15-min hang ceiling)"
@@ -586,7 +599,8 @@ if [ "$SKIP_TESTS" -eq 0 ]; then
     # run's orphans are still executing.
     clear_debug_holders
     test_status=0
-    bounded_cargo_test --workspace || test_status=$?
+    # shellcheck disable=SC2046  # word-splitting of the empty default is intended
+    bounded_cargo_test --workspace $(test_thread_args) || test_status=$?
     # Unconditional, and BEFORE the failure exit: a failed or timed-out run leaks
     # more orphans than a clean one, and the smoke step below executes
     # target/debug/oam.

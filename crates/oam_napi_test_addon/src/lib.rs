@@ -1371,8 +1371,29 @@ pub unsafe extern "C" fn napi_register_module_v1(env: NapiEnv, exports: NapiValu
 mod tests {
     use super::*;
 
+    /// The four tests below share the process-global `COUNTERS` table, whose
+    /// keys are heap addresses. Run concurrently, one test's `counter_release`
+    /// frees an address the allocator hands straight to a sibling's
+    /// `counter_register`, and a later lookup finds a foreign counter
+    /// (observed on the mac release leg as `counter_value` returning
+    /// `Some(1)` after release). Holding this lock keeps each
+    /// register/increment/release/assert sequence exclusive. Serializing these
+    /// four tests is the deliberate trade against cargo's default parallel
+    /// test threads: the exclusivity matters more than the wall-clock time.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Recover a poisoned `TEST_LOCK` rather than unwind: a sibling that
+    /// panicked already failed the run, and masking its real assertion
+    /// behind a lock-poison message helps nobody.
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn counter_registry_roundtrip() {
+        let _guard = test_guard();
         let native = counter_register();
         assert_eq!(counter_value(native), Some(0));
         assert!(counter_increment(native));
@@ -1387,6 +1408,7 @@ mod tests {
 
     #[test]
     fn foreign_pointer_is_never_treated_as_a_counter() {
+        let _guard = test_guard();
         // A pointer this addon never registered -- e.g. another addon's wrap --
         // must not be read or written as an i64.
         let mut foreign = [0u8; 3];
@@ -1400,6 +1422,7 @@ mod tests {
 
     #[test]
     fn counters_are_independent() {
+        let _guard = test_guard();
         let a = counter_register();
         let b = counter_register();
         assert_ne!(a, b);
@@ -1414,6 +1437,7 @@ mod tests {
 
     #[test]
     fn poisoned_lock_still_serves_every_caller() {
+        let _guard = test_guard();
         // `counters()` must recover a poisoned lock instead of unwinding: its
         // callers are `extern "C"` callbacks where a panic aborts the host.
         // Poison the lock once, then prove the registry keeps working.

@@ -71,3 +71,16 @@ rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=libcmt.lib"]
 
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=libcmt.lib"]
+
+# Test-thread count for every `cargo test` in this repo, pinned deliberately
+# rather than left to cargo's default (cpus). "4": bounded and identical on
+# every machine, and >1 so ci-local.sh step 6 keeps its PARALLEL run -- the
+# cross-test-interference class (tests sharing process-global state, worst when
+# a registry keys on heap addresses: a released key is re-issued to a sibling
+# within microseconds) only shows up when tests run concurrently. The release
+# path does not read this: its legs pass `-- --test-threads=1` on the command
+# line, which always beats the env, because a release must not die on a flake
+# a re-run might not repeat. See CONTRIBUTING.md, "Tests touching
+# process-global state".
+[env]
+RUST_TEST_THREADS = "4"

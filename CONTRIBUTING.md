@@ -39,3 +39,21 @@ CI is script-driven, not GitHub Actions: `./scripts/ci-local.sh` runs the full g
 THIRD_PARTY_LICENSES drift, unsafe audit) and installs as a pre-push hook. Cross-platform legs run on remote
 build hosts via `scripts/release-local.sh` / `scripts/node-compat-measure.sh` /
 `scripts/bench-platforms.sh`.
+
+### Tests touching process-global state
+
+Cargo runs unit tests in one process on parallel threads by default, so tests sharing a
+process-global race with each other: registries keyed by heap address, static caches, lazily
+initialized once-cell state. Address-keyed tables are the worst case -- a key freed by one test
+is instantly re-issued by the allocator to a sibling, so a lookup finds a foreign entry and an
+assertion fails only under parallelism (a release-leg flake, not a local one).
+
+The pattern: a `#[cfg(test)] static TEST_LOCK: std::sync::Mutex<()>` taken as the first
+statement of every test that touches the state, plus a guard helper that locks with
+`.unwrap_or_else(std::sync::PoisonError::into_inner)` so one test's panic doesn't cascade into
+misleading lock-poison failures in the others. Serializing those tests is the deliberate trade
+against cargo's parallelism.
+
+Working exemplar: `crates/oam_napi_test_addon/src/lib.rs` (`mod tests`, the `TEST_LOCK` /
+`test_guard` pair). Don't bother when the state is private to a single test, or when the tests
+have been proven independent.

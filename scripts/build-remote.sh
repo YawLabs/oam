@@ -290,7 +290,13 @@ run_test() {
   # ci.yml bounded a hung test at 15 min (deadlocked/lingering test class).
   command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1 \
     || warn "no timeout/gtimeout on this host -- a deadlocked test hangs instead of dying at 15 min (mac: brew install coreutils)"
-  with_timeout 900 cargo test --workspace
+  # --test-threads=1 on every release leg (mac-release calls run_test):
+  # parallel tests sharing process-global state race on freed-then-reused
+  # registry keys (see CONTRIBUTING.md, "Tests touching process-global
+  # state"), and that killed a release at 08:19Z on 2026-10-21. libtest beats
+  # the RUST_TEST_THREADS env .cargo/config.toml pins for everyone else, so
+  # the daily CI loop stays parallel where the interference is meant to show.
+  with_timeout 900 cargo test --workspace -- --test-threads=1
   smoke "target/debug/oam"
 }
 

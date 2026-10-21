@@ -393,15 +393,23 @@ async fn an_unread_response_body_pushes_back_on_the_socket() {
 
 /// What `out` hands over until `done` says the progress is where the caller
 /// wants it. A completion with no bytes is progress alone.
+///
+/// The check runs AFTER `out`, never before it: `complete` is published by the
+/// same flush that makes the final bytes readable, so a predicate that is
+/// already true at entry means those bytes are in the pipe waiting -- checking
+/// first returned an empty `wire` whenever the response task's flush beat the
+/// test task's first check (observed once in a release leg, reproducible with
+/// a sleep after `reg.response`). `out` is biased toward bytes, so a `done`
+/// satisfied by a flush is observed only once its bytes have been handed over.
 async fn pump_until(reg: &Reg, id: u64, done: impl Fn(bridge::Progress) -> bool) -> Vec<u8> {
     let mut wire = Vec::new();
     loop {
-        if bridge::progress(&reg.bridges, id).is_some_and(&done) {
-            return wire;
-        }
         match bridge::out(reg.bridges.clone(), id).await {
             OpOutcome::Bytes(bytes) => wire.extend_from_slice(&bytes),
             other => panic!("out ended early: {other:?} after {} bytes", wire.len()),
+        }
+        if bridge::progress(&reg.bridges, id).is_some_and(&done) {
+            return wire;
         }
     }
 }

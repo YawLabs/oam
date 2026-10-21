@@ -3118,8 +3118,13 @@ else fail "rekey_after calls: $LG_REKEYS (conformance@${LG_L_CONF:-?} rekey8@${L
 it "the final line says how many steps ran and how many were skipped"
 ck grep -qF 'All local CI gates passed ($STEPS_RAN steps ran, $STEPS_SKIPPED skipped' scripts/ci-local.sh
 
-it "release-local.sh runs the gate unchanged, and its header says a same-tree re-run skips the passed steps"
-if grep -qxF '  bash "$SCRIPT_DIR/ci-local.sh" || fail "local CI gate failed -- fix before releasing"' scripts/release-local.sh \
+it "release-local.sh runs the gate through the retry helper, still fails closed on it, and its header says a same-tree re-run skips the passed steps"
+# The gate call used to be pinned as one exact line; OAM_RELEASE_LEG_ATTEMPTS
+# wraps it in run_with_attempts now, so the same two claims are asserted
+# (ci-local.sh is what runs; its failure still fails the release) plus the
+# wrapper that replaced the plain call.
+if grep -qxF '  run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "local CI gate" \' scripts/release-local.sh \
+   && grep -qxF '    bash "$SCRIPT_DIR/ci-local.sh" || fail "local CI gate failed -- fix before releasing"' scripts/release-local.sh \
    && grep -q '^#.*target/ci-local/passed' scripts/release-local.sh; then pass
 else fail "release-local.sh's gate call changed, or its header no longer mentions the ledger"; fi
 
