@@ -152,16 +152,17 @@ try {
   }
   clearInterval(timer);
   console.log("after break:", JSON.stringify(await it.next()));
-  // A fresh, quiet directory: a late event from the writes above would
-  // settle the pending next() before the abort does.
+  // A signal aborted before the generator starts. A signal aborted on a
+  // timer raced the watched directory's own macOS creation event: FSEvents
+  // reports a fresh directory's creation to its own watcher, and whichever
+  // runtime's stream fires first won the 50 ms window (mac leg 2026-10-21).
+  // The pre-aborted shape asserts the same contract -- the abort rejects the
+  // pending next() with node's AbortError, cause carried -- with no window.
   const quiet = path.join(root, "q");
   fs.mkdirSync(quiet);
-  const ac = new AbortController();
-  const it2 = fsp.watch(quiet, { signal: ac.signal });
-  const pending = it2.next();
-  setTimeout(() => ac.abort("stop"), 50);
   try {
-    await pending;
+    await fsp.watch(quiet, { signal: AbortSignal.abort("stop") }).next();
+    console.log("RESOLVED (unexpected)");
   } catch (e) {
     console.log("aborted:", e.name, e.code, e.cause, Object.keys(e).join(","));
   }
