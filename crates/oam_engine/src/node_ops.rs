@@ -9676,7 +9676,8 @@ fn op_spawn_sync(
     // A sync spawn with an argv0: the raw-create path when the platform has
     // one (Windows CreateProcessW is the only way to set the first token), the
     // std path -- which carries argv0 through CommandExt::arg0 -- otherwise.
-    #[cfg(any(windows, unix))]
+    // `spawn_sync_argv0` exists only in child_win.rs, so this is Windows-only.
+    #[cfg(windows)]
     if let Some(argv0) = argv0.as_deref() {
         let [slot0, slot1, slot2] = stdio;
         let to_fd = |i: usize, m: &oam_core::child::StdioMode| {
