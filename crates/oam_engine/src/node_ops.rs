@@ -555,6 +555,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("osRelease", op_os_release),
         ("osTotalMem", op_os_total_mem),
         ("osFreeMem", op_os_free_mem),
+        ("osLoadavg", op_os_loadavg),
         ("osGetPriority", op_os_get_priority),
         ("osSetPriority", op_os_set_priority),
         // v8 heap / process memory
@@ -564,9 +565,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsWriteHeapSnapshot", op_fs_write_heap_snapshot),
         ("heapSnapshotSeq", op_heap_snapshot_seq),
         ("processRss", op_process_rss),
-        // cpu info
-        ("cpuModel", op_cpu_model),
-        ("cpuSpeed", op_cpu_speed),
+        // cpu info (os.cpus(): model, speed and times per CPU)
+        ("cpuInfo", op_cpu_info),
         // network interfaces
         ("networkInterfaces", op_network_interfaces),
         // process.cpuUsage / process.kill
@@ -11142,27 +11142,176 @@ fn process_rss() -> usize {
 }
 
 // ============================================================= CPU info
+//
+// `os.cpus()`: one entry per logical CPU -- model, speed in MHz, and the
+// five cumulative time counters node reports, in milliseconds. Each
+// platform follows libuv 1.51.0's `uv_cpu_info`, the libuv node v22.22.2
+// ships (src/win/util.c, src/unix/linux.c, src/unix/darwin.c; MIT, notice
+// in THIRD_PARTY_LICENSES.md under "libuv"), so a sampler that differences
+// two calls reads the same quantities under oam as under node (#441).
+// node's lib/os.js folds the same seven values per CPU into these objects
+// and answers `[]` when the call fails; node_compat.js does the same with
+// the array this op returns.
 
-fn op_cpu_model(
-    scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let model = cpu_model();
-    let val = v8::String::new(scope, &model).unwrap();
-    rv.set(val.into());
+/// One `os.cpus()` entry, in node's key order.
+#[derive(serde::Serialize)]
+struct CpuInfo {
+    model: String,
+    speed: u32,
+    times: CpuTimes,
 }
 
-fn op_cpu_speed(
+/// node's `times`: cumulative milliseconds per state since boot. Windows has
+/// no `nice` and macOS no `irq` counter; libuv reports those as 0.
+#[derive(serde::Serialize, Debug, Default, PartialEq, Eq)]
+struct CpuTimes {
+    user: u64,
+    nice: u64,
+    sys: u64,
+    idle: u64,
+    irq: u64,
+}
+
+fn op_cpu_info(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    rv.set(v8::Number::new(scope, cpu_speed_mhz() as f64).into());
+    let json = serde_json::to_string(&cpu_info()).unwrap_or_else(|_| "[]".to_string());
+    return_json(scope, &mut rv, &json);
+}
+
+/// Windows: one `SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION` record, as
+/// `NtQuerySystemInformation(SystemProcessorPerformanceInformation)` fills
+/// one per logical processor of the caller's processor group. All five
+/// counters are 100 ns units, and `kernel` INCLUDES `idle`. winternl.h
+/// documents the first three and names the rest Reserved1[2] / Reserved2;
+/// libuv reads them as DpcTime, InterruptTime and InterruptCount.
+#[cfg(any(windows, test))]
+#[repr(C)]
+struct SystemProcessorPerformance {
+    idle: i64,
+    kernel: i64,
+    user: i64,
+    dpc: i64,
+    interrupt: i64,
+    interrupt_count: u32,
+}
+
+#[cfg(any(windows, test))]
+impl SystemProcessorPerformance {
+    const ZERO: Self = Self {
+        idle: 0,
+        kernel: 0,
+        user: 0,
+        dpc: 0,
+        interrupt: 0,
+        interrupt_count: 0,
+    };
+
+    /// libuv's arithmetic (src/win/util.c): 100 ns to ms, system time as
+    /// kernel minus the idle it includes, no `nice`. A counter that is not
+    /// positive -- which the kernel does not produce -- reads as 0 rather
+    /// than wrapping.
+    fn times(&self) -> CpuTimes {
+        const TICKS_PER_MS: i64 = 10_000;
+        let ms = |ticks: i64| u64::try_from(ticks / TICKS_PER_MS).unwrap_or(0);
+        CpuTimes {
+            user: ms(self.user),
+            nice: 0,
+            sys: ms(self.kernel.saturating_sub(self.idle)),
+            idle: ms(self.idle),
+            irq: ms(self.interrupt),
+        }
+    }
 }
 
 #[cfg(windows)]
-fn cpu_model() -> String {
+fn cpu_info() -> Vec<CpuInfo> {
+    const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION: u32 = 8;
+    // A processor group holds at most 64 logical processors (KAFFINITY is a
+    // 64-bit mask) and this class describes the caller's group only, so 64
+    // records is a ceiling, not a guess. It cannot be probed for: the
+    // kernel fills as many whole records as fit and returns success with
+    // ReturnLength set to what it wrote, so an undersized buffer is never
+    // reported as STATUS_INFO_LENGTH_MISMATCH (measured on Windows 11
+    // arm64). libuv sizes its buffer from GetSystemInfo's processor count
+    // and asserts the two agree.
+    const MAX_GROUP_CPUS: usize = 64;
+
+    // ABI: the signature matches the ntdll ABI (NtQuerySystemInformation
+    // with a class, a byte buffer and its length, and a ReturnLength
+    // out-param).
+    unsafe extern "system" {
+        fn NtQuerySystemInformation(
+            SystemInformationClass: u32,
+            SystemInformation: *mut u8,
+            SystemInformationLength: u32,
+            ReturnLength: *mut u32,
+        ) -> i32;
+    }
+
+    let mut records = [SystemProcessorPerformance::ZERO; MAX_GROUP_CPUS];
+    let record_size = std::mem::size_of::<SystemProcessorPerformance>();
+    let buf_len = (record_size * MAX_GROUP_CPUS) as u32;
+    let mut ret_len: u32 = 0;
+    // SAFETY: `records` is a live, zero-initialized array of `#[repr(C)]`
+    // records in the class's documented 48-byte layout and `buf_len` is
+    // exactly its byte size, so the kernel writes within bounds; `ret_len`
+    // is a live out-u32. The class reads system counters and changes
+    // nothing.
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION,
+            records.as_mut_ptr().cast::<u8>(),
+            buf_len,
+            &mut ret_len,
+        )
+    };
+    let written = ret_len as usize;
+    if status != 0
+        || written == 0
+        || !written.is_multiple_of(record_size)
+        || written > buf_len as usize
+    {
+        return Vec::new();
+    }
+    let count = written / record_size;
+
+    // Model and speed per processor from the registry, as libuv reads them
+    // (`HARDWARE\DESCRIPTION\System\CentralProcessor\<n>`). node abandons
+    // the whole call when one key is unreadable; oam reuses processor 0's
+    // values for that entry so the counters are still reported. Processor
+    // 0 itself falls back to PROCESSOR_IDENTIFIER and 0 MHz, as before #441.
+    let model0 =
+        cpu_model(0).unwrap_or_else(|| std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default());
+    let speed0 = cpu_speed_mhz(0).unwrap_or(0);
+    records[..count]
+        .iter()
+        .enumerate()
+        .map(|(cpu, record)| {
+            let (model, speed) = if cpu == 0 {
+                (model0.clone(), speed0)
+            } else {
+                (
+                    cpu_model(cpu).unwrap_or_else(|| model0.clone()),
+                    cpu_speed_mhz(cpu).unwrap_or(speed0),
+                )
+            };
+            CpuInfo {
+                model,
+                speed,
+                times: record.times(),
+            }
+        })
+        .collect()
+}
+
+/// Windows: the raw bytes of one value under
+/// `HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\<cpu>`, or None when
+/// the key or the value cannot be read.
+#[cfg(windows)]
+fn cpu_registry_value(cpu: usize, value_name: &str) -> Option<Vec<u8>> {
     use std::ptr;
 
     const KEY_READ: u32 = 0x20019;
@@ -11194,8 +11343,10 @@ fn cpu_model() -> String {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    let sub_key = to_wide("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0");
-    let value_name = to_wide("ProcessorNameString");
+    let sub_key = to_wide(&format!(
+        "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\{cpu}"
+    ));
+    let value_name = to_wide(value_name);
     let mut hkey: isize = 0;
 
     // SAFETY: `sub_key` is a live NUL-terminated UTF-16 vec valid for the read;
@@ -11203,16 +11354,18 @@ fn cpu_model() -> String {
     // are the documented predefined-key / access constants. On non-zero (error)
     // the handle is not used; on success `hkey` is closed below.
     if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub_key.as_ptr(), 0, KEY_READ, &mut hkey) } != 0 {
-        return std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default();
+        return None;
     }
 
-    let mut buf = vec![0u8; 256];
+    // 512 bytes holds any ProcessorNameString (libuv reads it into 256
+    // WCHARs) and the 4-byte ~MHz DWORD.
+    let mut buf = vec![0u8; 512];
     let mut buf_len = buf.len() as u32;
     let mut reg_type: u32 = 0;
 
     // SAFETY: `hkey` is the open key from the checked RegOpenKeyExW above.
     // `value_name` is a live NUL-terminated UTF-16 vec; `buf` is a live
-    // 256-byte vec and `buf_len` holds its length, so the API writes at most
+    // 512-byte vec and `buf_len` holds its length, so the API writes at most
     // `buf_len` bytes into valid storage and updates `buf_len` in place.
     // `reg_type` is a live out-u32; the reserved arg is NULL as required.
     let result = unsafe {
@@ -11230,119 +11383,515 @@ fn cpu_model() -> String {
     // not needed.
     unsafe { RegCloseKey(hkey) };
 
-    if result != 0 || buf_len < 2 {
-        return std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default();
+    if result != 0 {
+        return None;
     }
+    buf.truncate((buf_len as usize).min(buf.len()));
+    Some(buf)
+}
 
-    let wide: Vec<u16> = buf[..buf_len as usize]
+/// Windows: the `ProcessorNameString` of processor `cpu`, verbatim -- node
+/// does not trim it either (older Intel strings carry leading spaces).
+#[cfg(windows)]
+fn cpu_model(cpu: usize) -> Option<String> {
+    let bytes = cpu_registry_value(cpu, "ProcessorNameString")?;
+    let wide: Vec<u16> = bytes
         .as_chunks::<2>()
         .0
         .iter()
         .map(|&pair| u16::from_le_bytes(pair))
         .take_while(|&c| c != 0)
         .collect();
-    String::from_utf16_lossy(&wide).trim().to_string()
+    Some(String::from_utf16_lossy(&wide))
 }
 
+/// Windows: the `~MHz` DWORD of processor `cpu`.
 #[cfg(windows)]
-fn cpu_speed_mhz() -> u32 {
-    use std::ptr;
+fn cpu_speed_mhz(cpu: usize) -> Option<u32> {
+    let bytes = cpu_registry_value(cpu, "~MHz")?;
+    let dword: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(dword))
+}
 
-    const KEY_READ: u32 = 0x20019;
-    const HKEY_LOCAL_MACHINE: isize = 0x80000002u32 as i32 as isize;
+/// Linux: the `cpu<N>` lines of /proc/stat as libuv reads them
+/// (src/unix/linux.c `uv_cpu_info`): after the label, column 0 is user, 1
+/// nice, 2 system, 3 idle, 4 iowait (skipped) and 5 irq (hard IRQs only;
+/// softirq, steal and the guest columns are not added). The columns are
+/// USER_HZ ticks, which the kernel fixes at 100 for the /proc ABI, so a tick
+/// is 10 ms; libuv hard-codes the same multiplier. The kernel lists online
+/// CPUs only, which is also node's count. Returns (processor number, times)
+/// sorted by processor number; the aggregate `cpu ` line is skipped.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_stat(text: &str) -> Vec<(usize, CpuTimes)> {
+    const MS_PER_TICK: u64 = 10;
+    let mut cpus: Vec<(usize, CpuTimes)> = text
+        .lines()
+        .filter_map(|line| {
+            let (label, columns) = line.strip_prefix("cpu")?.split_once(' ')?;
+            let cpu: usize = label.parse().ok()?;
+            let mut ticks = columns.split_whitespace().map(|c| c.parse::<u64>().ok());
+            let mut next = || ticks.next().flatten();
+            let user = next()?;
+            let nice = next()?;
+            let sys = next()?;
+            let idle = next()?;
+            let _iowait = next()?;
+            let irq = next()?;
+            Some((
+                cpu,
+                CpuTimes {
+                    user: user.saturating_mul(MS_PER_TICK),
+                    nice: nice.saturating_mul(MS_PER_TICK),
+                    sys: sys.saturating_mul(MS_PER_TICK),
+                    idle: idle.saturating_mul(MS_PER_TICK),
+                    irq: irq.saturating_mul(MS_PER_TICK),
+                },
+            ))
+        })
+        .collect();
+    cpus.sort_by_key(|(cpu, _)| *cpu);
+    cpus
+}
 
-    // ABI: the signatures match the advapi32 registry ABI (RegOpenKeyExW,
-    // RegQueryValueExW, RegCloseKey); every pointer argument is validated at
-    // its call site below.
-    unsafe extern "system" {
-        fn RegOpenKeyExW(
-            hKey: isize,
-            lpSubKey: *const u16,
-            ulOptions: u32,
-            samDesired: u32,
-            phkResult: *mut isize,
-        ) -> i32;
-        fn RegQueryValueExW(
-            hKey: isize,
-            lpValueName: *const u16,
-            lpReserved: *mut u32,
-            lpType: *mut u32,
-            lpData: *mut u8,
-            lpcbData: *mut u32,
-        ) -> i32;
-        fn RegCloseKey(hKey: isize) -> i32;
-    }
+/// Linux: the blank-line-separated blocks of /proc/cpuinfo that carry a
+/// `processor` number, with that number.
+#[cfg(any(target_os = "linux", test))]
+fn proc_cpuinfo_blocks(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    text.split("\n\n").filter_map(|block| {
+        let cpu = block
+            .lines()
+            .find_map(|line| line.strip_prefix("processor"))?
+            .split_once(':')?
+            .1
+            .trim()
+            .parse()
+            .ok()?;
+        Some((cpu, block))
+    })
+}
 
-    fn to_wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
+/// Linux: the model of each /proc/cpuinfo block, keyed by processor number.
+/// libuv picks one marker per architecture when it is compiled; the same
+/// markers are tried here in order at runtime, so one build covers every
+/// architecture: "model name" (x86, arm), "Processor" (older arm), "CPU
+/// part" (aarch64: a part code, translated through `arm_part_name`), "cpu
+/// model" (mips), "cpu family" (loongarch), "cpu" (powerpc). A block with
+/// none of them is "unknown", as libuv's is. Where libuv differs: it
+/// reports the FIRST block's model for every CPU (an artefact of its model
+/// dedup) and cuts a name at 63 bytes; oam reports each block's own name
+/// whole. And libuv compiles in ONE marker per architecture (aarch64 reads
+/// only "CPU part"), where oam tries them all: an aarch64 block that also
+/// carries a "model name" or "Processor" line is named from that line here
+/// and from the part table in node.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_cpuinfo_models(text: &str) -> Vec<(usize, String)> {
+    const ARM_PART: &str = "CPU part\t: ";
+    const MARKERS: [&str; 6] = [
+        "model name\t: ",
+        "Processor\t: ",
+        ARM_PART,
+        "cpu model\t\t: ",
+        "cpu family\t\t: ",
+        "cpu\t\t: ",
+    ];
+    proc_cpuinfo_blocks(text)
+        .map(|(cpu, block)| {
+            let model = MARKERS.iter().find_map(|marker| {
+                let value = block.lines().find_map(|line| line.strip_prefix(marker))?;
+                Some(if *marker == ARM_PART {
+                    arm_part_name(value.trim()).to_string()
+                } else {
+                    value.trim().to_string()
+                })
+            });
+            (cpu, model.unwrap_or_else(|| "unknown".to_string()))
+        })
+        .collect()
+}
 
-    let sub_key = to_wide("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0");
-    let value_name = to_wide("~MHz");
-    let mut hkey: isize = 0;
+/// Linux: the `cpu MHz` of each /proc/cpuinfo block (x86 writes one), keyed
+/// by processor number -- oam's speed where cpufreq is absent.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_cpuinfo_mhz(text: &str) -> Vec<(usize, u32)> {
+    proc_cpuinfo_blocks(text)
+        .filter_map(|(cpu, block)| {
+            let mhz: f64 = block
+                .lines()
+                .find(|line| line.starts_with("cpu MHz"))?
+                .split_once(':')?
+                .1
+                .trim()
+                .parse()
+                .ok()?;
+            Some((cpu, mhz as u32))
+        })
+        .collect()
+}
 
-    // SAFETY: `sub_key` is a live NUL-terminated UTF-16 vec valid for the read;
-    // `&mut hkey` is a live stack out-handle. HKEY_LOCAL_MACHINE and KEY_READ
-    // are the documented predefined-key / access constants. On non-zero (error)
-    // the handle is not used; on success `hkey` is closed below.
-    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub_key.as_ptr(), 0, KEY_READ, &mut hkey) } != 0 {
-        return 0;
-    }
-
-    let mut val: u32 = 0;
-    let mut val_len = 4u32;
-    let mut reg_type: u32 = 0;
-
-    // SAFETY: `hkey` is the open key from the checked RegOpenKeyExW above.
-    // `value_name` is a live NUL-terminated UTF-16 vec; the data out-pointer is
-    // a live `u32` (`val`) and `val_len` is set to 4 (its byte size), so the
-    // API writes at most 4 bytes into valid storage. `reg_type` is a live
-    // out-u32; the reserved arg is NULL as required.
-    let result = unsafe {
-        RegQueryValueExW(
-            hkey,
-            value_name.as_ptr(),
-            ptr::null_mut(),
-            &mut reg_type,
-            &mut val as *mut u32 as *mut u8,
-            &mut val_len,
-        )
-    };
-    // SAFETY: `hkey` was successfully opened by RegOpenKeyExW above and has not
-    // been closed; closing it exactly once here releases the key. The return is
-    // not needed.
-    unsafe { RegCloseKey(hkey) };
-
-    if result != 0 { 0 } else { val }
+/// Linux: the model name node reports for an aarch64 `CPU part` code --
+/// libuv's table (src/unix/linux.c, `parts`), reproduced so the two
+/// runtimes name a core the same way. A code it does not list is
+/// "unknown"; as of libuv 1.51.0 that is every Apple, Qualcomm and
+/// post-2020 Arm core.
+#[cfg(any(target_os = "linux", test))]
+fn arm_part_name(code: &str) -> &'static str {
+    const PARTS: &[(&str, &str)] = &[
+        ("0x811", "ARM810"),
+        ("0x920", "ARM920"),
+        ("0x922", "ARM922"),
+        ("0x926", "ARM926"),
+        ("0x940", "ARM940"),
+        ("0x946", "ARM946"),
+        ("0x966", "ARM966"),
+        ("0xa20", "ARM1020"),
+        ("0xa22", "ARM1022"),
+        ("0xa26", "ARM1026"),
+        ("0xb02", "ARM11 MPCore"),
+        ("0xb36", "ARM1136"),
+        ("0xb56", "ARM1156"),
+        ("0xb76", "ARM1176"),
+        ("0xc05", "Cortex-A5"),
+        ("0xc07", "Cortex-A7"),
+        ("0xc08", "Cortex-A8"),
+        ("0xc09", "Cortex-A9"),
+        // libuv: "Originally A12"
+        ("0xc0d", "Cortex-A17"),
+        ("0xc0f", "Cortex-A15"),
+        ("0xc0e", "Cortex-A17"),
+        ("0xc14", "Cortex-R4"),
+        ("0xc15", "Cortex-R5"),
+        ("0xc17", "Cortex-R7"),
+        ("0xc18", "Cortex-R8"),
+        ("0xc20", "Cortex-M0"),
+        ("0xc21", "Cortex-M1"),
+        ("0xc23", "Cortex-M3"),
+        ("0xc24", "Cortex-M4"),
+        ("0xc27", "Cortex-M7"),
+        ("0xc60", "Cortex-M0+"),
+        ("0xd01", "Cortex-A32"),
+        ("0xd03", "Cortex-A53"),
+        ("0xd04", "Cortex-A35"),
+        ("0xd05", "Cortex-A55"),
+        ("0xd06", "Cortex-A65"),
+        ("0xd07", "Cortex-A57"),
+        ("0xd08", "Cortex-A72"),
+        ("0xd09", "Cortex-A73"),
+        ("0xd0a", "Cortex-A75"),
+        ("0xd0b", "Cortex-A76"),
+        ("0xd0c", "Neoverse-N1"),
+        ("0xd0d", "Cortex-A77"),
+        ("0xd0e", "Cortex-A76AE"),
+        ("0xd13", "Cortex-R52"),
+        ("0xd20", "Cortex-M23"),
+        ("0xd21", "Cortex-M33"),
+        ("0xd41", "Cortex-A78"),
+        ("0xd42", "Cortex-A78AE"),
+        ("0xd4a", "Neoverse-E1"),
+        ("0xd4b", "Cortex-A78C"),
+    ];
+    PARTS
+        .iter()
+        .find(|(part, _)| *part == code)
+        .map_or("unknown", |(_, name)| name)
 }
 
 #[cfg(target_os = "linux")]
-fn cpu_model() -> String {
+fn cpu_info() -> Vec<CpuInfo> {
     use std::fs;
-    fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("model name"))
-                .and_then(|l| l.split(':').nth(1))
-                .map(|v| v.trim().to_string())
+    let stat = fs::read_to_string("/proc/stat").unwrap_or_default();
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let models = parse_proc_cpuinfo_models(&cpuinfo);
+    let mhz = parse_proc_cpuinfo_mhz(&cpuinfo);
+    parse_proc_stat(&stat)
+        .into_iter()
+        .map(|(cpu, times)| {
+            let model = models
+                .iter()
+                .find(|(n, _)| *n == cpu)
+                .map_or_else(|| "unknown".to_string(), |(_, m)| m.clone());
+            // libuv: the current cpufreq frequency in kHz, else 0. Where
+            // cpufreq is absent (most VMs) oam falls back to the block's
+            // "cpu MHz", a line node does not read.
+            let speed = fs::read_to_string(format!(
+                "/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_cur_freq"
+            ))
+            .ok()
+            .and_then(|khz| khz.trim().parse::<u64>().ok())
+            .map(|khz| u32::try_from(khz / 1000).unwrap_or(u32::MAX))
+            .or_else(|| mhz.iter().find(|(n, _)| *n == cpu).map(|(_, m)| *m))
+            .unwrap_or(0);
+            CpuInfo {
+                model,
+                speed,
+                times,
+            }
         })
-        .unwrap_or_default()
+        .collect()
 }
 
-#[cfg(target_os = "linux")]
-fn cpu_speed_mhz() -> u32 {
-    use std::fs;
-    fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("cpu MHz"))
-                .and_then(|l| l.split(':').nth(1))
-                .and_then(|v| v.trim().parse::<f64>().ok())
-                .map(|f| f as u32)
+/// macOS: CPU_STATE_MAX, the counters per processor in a
+/// PROCESSOR_CPU_LOAD_INFO row.
+#[cfg(any(target_vendor = "apple", test))]
+const CPU_STATES: usize = 4;
+
+/// macOS: `cpu_ticks` rows into node's times (libuv darwin.c: user = [0],
+/// sys = [1], idle = [2], nice = [3], irq = 0), each counter times the ms
+/// per tick. The counters are `natural_t`, unsigned 32-bit: taken as u32 so
+/// a counter past 2^31 does not sign-extend. A trailing partial row is
+/// dropped.
+#[cfg(any(target_vendor = "apple", test))]
+fn mach_cpu_times(ticks: &[u32], ms_per_tick: u64) -> Vec<CpuTimes> {
+    ticks
+        .as_chunks::<CPU_STATES>()
+        .0
+        .iter()
+        .map(|&[user, system, idle, nice]| CpuTimes {
+            user: u64::from(user) * ms_per_tick,
+            nice: u64::from(nice) * ms_per_tick,
+            sys: u64::from(system) * ms_per_tick,
+            idle: u64::from(idle) * ms_per_tick,
+            irq: 0,
         })
-        .unwrap_or(0)
+        .collect()
+}
+
+#[cfg(test)]
+mod cpu_info_tests {
+    use super::*;
+
+    // Every column distinct, so a swapped or shifted field is caught rather
+    // than masked; cpu1 and cpu2 out of order to pin the sort.
+    const PROC_STAT: &str = "cpu  190 0 494 4594 243 0 23 0 0 0\n\
+                             cpu0 11 2 33 444 55 6 77 8 9 10\n\
+                             cpu2 21 22 23 24 25 26 27 28 29 30\n\
+                             cpu1 31 32 33 34 35 36 37 38 39 40\n\
+                             intr 12345 0 1\n\
+                             ctxt 777\n\
+                             btime 1700000000\n";
+
+    #[test]
+    fn proc_stat_columns_multiplier_order_and_aggregate_line() {
+        let cpus = parse_proc_stat(PROC_STAT);
+        assert_eq!(
+            cpus.len(),
+            3,
+            "the aggregate `cpu ` line and the other rows are not CPUs"
+        );
+        assert_eq!(
+            cpus[0],
+            (
+                0,
+                CpuTimes {
+                    user: 110,
+                    nice: 20,
+                    sys: 330,
+                    idle: 4440,
+                    irq: 60,
+                }
+            )
+        );
+        assert_eq!(cpus[1].0, 1, "sorted by processor number, not file order");
+        assert_eq!(
+            cpus[2],
+            (
+                2,
+                CpuTimes {
+                    user: 210,
+                    nice: 220,
+                    sys: 230,
+                    idle: 240,
+                    irq: 260,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn proc_stat_skips_a_short_or_malformed_cpu_line() {
+        assert!(parse_proc_stat("cpu0 1 2 3 4 5\n").is_empty());
+        assert!(parse_proc_stat("cpu0 1 x 3 4 5 6 7\n").is_empty());
+        assert!(parse_proc_stat("cpux 1 2 3 4 5 6 7\n").is_empty());
+        assert!(parse_proc_stat("").is_empty());
+    }
+
+    const CPUINFO_X86: &str = "processor\t: 0\n\
+                               vendor_id\t: GenuineIntel\n\
+                               cpu family\t: 6\n\
+                               model\t\t: 158\n\
+                               model name\t: Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz\n\
+                               cpu MHz\t\t: 2592.008\n\
+                               \n\
+                               processor\t: 1\n\
+                               vendor_id\t: GenuineIntel\n\
+                               cpu family\t: 6\n\
+                               model name\t: Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz\n\
+                               cpu MHz\t\t: 2600.000\n\
+                               \n";
+
+    #[test]
+    fn cpuinfo_x86_model_name_and_mhz_per_block() {
+        let name = "Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz".to_string();
+        assert_eq!(
+            parse_proc_cpuinfo_models(CPUINFO_X86),
+            vec![(0, name.clone()), (1, name)]
+        );
+        assert_eq!(
+            parse_proc_cpuinfo_mhz(CPUINFO_X86),
+            vec![(0, 2592), (1, 2600)]
+        );
+    }
+
+    // Captured on WSL (aarch64, a Qualcomm part libuv does not list), plus a
+    // second block with a listed Arm part.
+    const CPUINFO_AARCH64: &str = "processor\t: 0\n\
+                                   BogoMIPS\t: 38.40\n\
+                                   Features\t: fp asimd\n\
+                                   CPU implementer\t: 0x51\n\
+                                   CPU architecture: 8\n\
+                                   CPU variant\t: 0x2\n\
+                                   CPU part\t: 0x001\n\
+                                   CPU revision\t: 1\n\
+                                   \n\
+                                   processor\t: 1\n\
+                                   BogoMIPS\t: 38.40\n\
+                                   CPU implementer\t: 0x41\n\
+                                   CPU architecture: 8\n\
+                                   CPU part\t: 0xd0c\n\
+                                   CPU revision\t: 1\n\
+                                   \n";
+
+    #[test]
+    fn cpuinfo_aarch64_part_codes_go_through_libuvs_table() {
+        assert_eq!(
+            parse_proc_cpuinfo_models(CPUINFO_AARCH64),
+            vec![(0, "unknown".to_string()), (1, "Neoverse-N1".to_string())]
+        );
+        assert!(parse_proc_cpuinfo_mhz(CPUINFO_AARCH64).is_empty());
+    }
+
+    #[test]
+    fn cpuinfo_other_markers_and_no_marker() {
+        // arm32 "Processor", mips "cpu model", and a block with no marker.
+        let text = "processor\t: 0\n\
+                    Processor\t: ARMv7 Processor rev 4 (v7l)\n\
+                    \n\
+                    processor\t: 1\n\
+                    cpu model\t\t: MIPS 74Kc V4.12\n\
+                    \n\
+                    processor\t: 2\n\
+                    flags\t\t: fpu\n\
+                    \n";
+        assert_eq!(
+            parse_proc_cpuinfo_models(text),
+            vec![
+                (0, "ARMv7 Processor rev 4 (v7l)".to_string()),
+                (1, "MIPS 74Kc V4.12".to_string()),
+                (2, "unknown".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn arm_part_table_matches_libuv() {
+        assert_eq!(arm_part_name("0xd03"), "Cortex-A53");
+        assert_eq!(arm_part_name("0xc0d"), "Cortex-A17");
+        assert_eq!(arm_part_name("0xd4b"), "Cortex-A78C");
+        assert_eq!(arm_part_name("0x001"), "unknown");
+        assert_eq!(
+            arm_part_name("0xd0"),
+            "unknown",
+            "a prefix of a listed code is not a match"
+        );
+    }
+
+    #[test]
+    fn windows_record_layout_and_times_math() {
+        assert_eq!(std::mem::size_of::<SystemProcessorPerformance>(), 48);
+        assert_eq!(std::mem::align_of::<SystemProcessorPerformance>(), 8);
+        // the zero record (the buffer's initial state) is zero times
+        assert_eq!(
+            SystemProcessorPerformance::ZERO.times(),
+            CpuTimes::default()
+        );
+        let record = SystemProcessorPerformance {
+            idle: 20_000_000,
+            kernel: 50_000_000,
+            user: 70_000_000,
+            dpc: 1,
+            interrupt: 1_234_567,
+            interrupt_count: 9,
+        };
+        assert_eq!(
+            record.times(),
+            CpuTimes {
+                user: 7000,
+                nice: 0,
+                sys: 3000,
+                idle: 2000,
+                irq: 123,
+            }
+        );
+        // kernel below idle cannot happen; it reads as 0 rather than wrapping.
+        let odd = SystemProcessorPerformance {
+            idle: 30_000_000,
+            kernel: 20_000_000,
+            user: -1,
+            dpc: 0,
+            interrupt: 0,
+            interrupt_count: 0,
+        };
+        assert_eq!(
+            odd.times(),
+            CpuTimes {
+                user: 0,
+                nice: 0,
+                sys: 0,
+                idle: 3000,
+                irq: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn mach_rows_are_unsigned_and_in_libuvs_order() {
+        let ticks: [u32; 9] = [1, 2, 3, 4, 0x8000_0001, 5, 6, 7, 99];
+        let times = mach_cpu_times(&ticks, 10);
+        assert_eq!(times.len(), 2, "a trailing partial row is dropped");
+        assert_eq!(
+            times[0],
+            CpuTimes {
+                user: 10,
+                nice: 40,
+                sys: 20,
+                idle: 30,
+                irq: 0,
+            }
+        );
+        assert_eq!(
+            times[1].user,
+            0x8000_0001u64 * 10,
+            "read as u32, not sign-extended"
+        );
+    }
+
+    #[test]
+    fn cpu_info_serializes_in_nodes_key_order() {
+        let entry = CpuInfo {
+            model: "m\"q".to_string(),
+            speed: 2976,
+            times: CpuTimes {
+                user: 1,
+                nice: 2,
+                sys: 3,
+                idle: 4,
+                irq: 5,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&entry).unwrap(),
+            r#"{"model":"m\"q","speed":2976,"times":{"user":1,"nice":2,"sys":3,"idle":4,"irq":5}}"#
+        );
+    }
 }
 
 // ====================================================== network interfaces
@@ -11487,9 +12036,10 @@ fn parent_pid() -> u32 {
 // ================================ sysinfo-backed os/process natives (macOS +
 // other non-linux unix). Windows uses FFI/registry above; linux reads /proc.
 // sysinfo's API is platform-identical, so these compile and verify on Windows
-// even though they are cfg-gated off there in the shipped build. A fresh
-// System per call is fine -- these ops are infrequent and each refreshes only
-// the slice it needs.
+// even though they are cfg-gated off there in the shipped build -- except the
+// Mach-backed `cpu_info` below, which is Apple-only FFI and first compiles on
+// the mac release leg. A fresh System per call is fine -- these ops are
+// infrequent and each refreshes only the slice it needs.
 
 #[cfg(not(any(windows, target_os = "linux")))]
 fn sysinfo_total_mem() -> u64 {
@@ -11517,8 +12067,10 @@ fn sysinfo_cpu_model() -> String {
 
 #[cfg(not(any(windows, target_os = "linux")))]
 fn sysinfo_cpu_speed_mhz() -> u32 {
-    // Apple Silicon reports 0 here (no exposed CPU frequency); Node behaves
-    // the same, so the e2e assertion is relaxed for darwin.
+    // `hw.cpufrequency`, which Apple Silicon does not expose; there sysinfo
+    // reads the power manager's top voltage state instead (a real hardware
+    // value), where node reports libuv's 2400 MHz placeholder -- see
+    // docs/node-divergences.md. The e2e assertion stays relaxed for darwin.
     let mut sys = sysinfo::System::new();
     sys.refresh_cpu_all();
     sys.cpus()
@@ -11567,14 +12119,114 @@ fn process_rss() -> usize {
     sysinfo_process_rss()
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
-fn cpu_model() -> String {
-    sysinfo_cpu_model()
+/// macOS: `host_processor_info(PROCESSOR_CPU_LOAD_INFO)`, as libuv's darwin
+/// `uv_cpu_info` reads it -- a `cpu_ticks[CPU_STATE_MAX]` row per processor,
+/// in `sysconf(_SC_CLK_TCK)` ticks (100 Hz), converted by `mach_cpu_times`.
+/// The model and speed are the sysinfo readers above. Mach FFI, so unlike the
+/// rest of this block it compiles only on Apple targets and is verified on
+/// the mac release leg.
+#[cfg(target_vendor = "apple")]
+#[expect(
+    deprecated,
+    reason = "libc 0.2 deprecates mach_host_self/mach_task_self in favour of the mach2 crate; both are stable libSystem exports, and mach2 would be a new compilation unit for two symbols"
+)]
+fn cpu_info() -> Vec<CpuInfo> {
+    const _: () = assert!(libc::CPU_STATE_MAX as usize == CPU_STATES);
+    let mut cpu_count: libc::natural_t = 0;
+    let mut info: libc::processor_info_array_t = std::ptr::null_mut();
+    let mut info_count: libc::mach_msg_type_number_t = 0;
+    // SAFETY: the three out-params are live locals, mach_host_self() is this
+    // task's host port, and PROCESSOR_CPU_LOAD_INFO is the documented flavor
+    // whose array the kernel allocates in this task and describes by
+    // `info_count` integers; it is released below.
+    let kr = unsafe {
+        libc::host_processor_info(
+            libc::mach_host_self(),
+            libc::PROCESSOR_CPU_LOAD_INFO,
+            &mut cpu_count,
+            &mut info,
+            &mut info_count,
+        )
+    };
+    if kr != libc::KERN_SUCCESS || info.is_null() {
+        return Vec::new();
+    }
+    let len = (info_count as usize).min(cpu_count as usize * CPU_STATES);
+    // SAFETY: the kernel filled `info_count` integers at `info`, so a view of
+    // at most that many is in bounds; they are the struct's unsigned
+    // `natural_t` ticks, read as u32. The view is copied here and not used
+    // after the deallocation below.
+    let ticks: Vec<u32> = unsafe { std::slice::from_raw_parts(info.cast::<u32>(), len) }.to_vec();
+    let bytes =
+        info_count as libc::vm_size_t * std::mem::size_of::<libc::integer_t>() as libc::vm_size_t;
+    // SAFETY: `info` is the array host_processor_info allocated in this task
+    // and `bytes` its size (the integer count the call returned, in bytes,
+    // which is what vm_deallocate takes); it is released exactly once, after
+    // its contents were copied into `ticks`.
+    unsafe { libc::vm_deallocate(libc::mach_task_self(), info as libc::vm_address_t, bytes) };
+    let model = sysinfo_cpu_model();
+    let speed = sysinfo_cpu_speed_mhz();
+    mach_cpu_times(&ticks, ms_per_clock_tick())
+        .into_iter()
+        .map(|times| CpuInfo {
+            model: model.clone(),
+            speed,
+            times,
+        })
+        .collect()
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
-fn cpu_speed_mhz() -> u32 {
-    sysinfo_cpu_speed_mhz()
+/// macOS: milliseconds per scheduler tick, 1000 / CLK_TCK -- 10 at the
+/// 100 Hz every macOS reports -- libuv's multiplier. rustix wraps the
+/// sysconf safely.
+#[cfg(target_vendor = "apple")]
+fn ms_per_clock_tick() -> u64 {
+    match rustix::param::clock_ticks_per_second() {
+        0 => 10,
+        hz => 1000 / hz,
+    }
+}
+
+/// Other unix (no shipped target reaches this): sysinfo gives the model and
+/// speed but no raw per-CPU counters, so the times stay 0, as they were for
+/// every platform before #441.
+#[cfg(not(any(windows, target_os = "linux", target_vendor = "apple")))]
+fn cpu_info() -> Vec<CpuInfo> {
+    let model = sysinfo_cpu_model();
+    let speed = sysinfo_cpu_speed_mhz();
+    let count = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (0..count)
+        .map(|_| CpuInfo {
+            model: model.clone(),
+            speed,
+            times: CpuTimes::default(),
+        })
+        .collect()
+}
+
+/// `os.loadavg()`: the 1, 5 and 15 minute load averages. libuv cannot
+/// compute them on Windows ("Can't be implemented") and reports zeros
+/// there, as oam does; on unix sysinfo reads /proc/loadavg (Linux) or
+/// getloadavg (macOS), the same sources libuv uses.
+fn op_os_loadavg(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let avg = load_average().map(|v| if v.is_finite() { v } else { 0.0 });
+    let json = serde_json::to_string(&avg).unwrap_or_else(|_| "[0,0,0]".to_string());
+    return_json(scope, &mut rv, &json);
+}
+
+#[cfg(windows)]
+fn load_average() -> [f64; 3] {
+    [0.0; 3]
+}
+
+#[cfg(unix)]
+fn load_average() -> [f64; 3] {
+    let avg = sysinfo::System::load_average();
+    [avg.one, avg.five, avg.fifteen]
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]

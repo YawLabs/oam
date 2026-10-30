@@ -5868,19 +5868,16 @@
       // oam targets x86/arm64 (both LE); hardcoded -- revisit for BE platforms
       endianness: () => "LE",
       availableParallelism: () => natives.cpuCount,
-      cpus: () => {
-        const model = natives.cpuModel();
-        const speed = natives.cpuSpeed();
-        return Array.from({ length: natives.cpuCount }, () => ({
-          model,
-          speed,
-          times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 },
-        }));
-      },
+      // libuv's uv_cpu_info per platform (#441): one entry per CPU the OS
+      // lists, with the cumulative `times` in ms. node's lib/os.js folds the
+      // same values into these objects and answers [] when the call fails.
+      cpus: () => natives.cpuInfo() ?? [],
       totalmem: () => natives.osTotalMem(),
       freemem: () => natives.osFreeMem(),
       uptime: () => natives.uptimeMs() / 1000,
-      loadavg: () => [0, 0, 0],
+      // libuv's uv_loadavg: zeros on Windows ("Can't be implemented"), the
+      // real 1/5/15 minute averages on unix.
+      loadavg: () => natives.osLoadavg() ?? [0, 0, 0],
       // node's lib/os.js (v22.22.2): validate, call libuv, and turn a failure
       // into ERR_SYSTEM_ERROR naming uv_os_{get,set}priority. Priorities are
       // node's -20..19 scale; on Windows libuv maps them onto priority
