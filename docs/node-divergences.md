@@ -929,6 +929,51 @@ and leaves unhandled, which oam began reporting in #399 (it was silent, exit 0):
 code is node's, the report and the listener routing are not (conformance case 472 compares
 the status only). Not yet fixed; it needs its own change to the rejection path.
 
+### 59. Windows: a system error libuv can only call `UNKNOWN` carries its Win32 code as `err.winError` (#442)
+
+libuv translates a Win32 or Winsock error through `uv_translate_sys_error`'s table, and a
+code the table does not list becomes `UV_UNKNOWN`: node reports `UNKNOWN: unknown error,
+<syscall>`, `code: 'UNKNOWN'`, `errno: -4094`, and nothing on the error says which code it
+was. oam's table mirrors libuv's row for row (`windows_error_code`,
+`crates/oam_core/src/lib.rs`), so it reports the same. Measured 2026-10-31 on Windows 11
+with node v22.22.2: a `process.stdout.write` to a named pipe's server end that no client has
+opened fails `WriteFile` with `ERROR_PIPE_LISTENING` (536), and node and oam both deliver
+`UNKNOWN: unknown error, write`, errno -4094, own keys `errno, syscall, code`, to the write
+callback and the `'error'` event, exit 0 while the event is heard.
+
+A system error oam builds synchronously -- the sync fs natives, `fs.accessSync`, and the
+stdout and stderr write failures (`process.stdout.write`'s callback and `'error'` event,
+`fs.writeSync(1)`, `fs.write(1)`'s callback) -- carries the raw code as an own `winError`
+when, and only when, its `code` is `UNKNOWN` and a real Win32 code is behind it
+(`unknown_win32_error` in `crates/oam_core/src/lib.rs`, `keep_win32_code` in
+`crates/oam_engine/src/node_ops.rs`; `carryWinError` in js/node_compat.js for the re-wraps
+that rebuild an error from its fields). The property is non-enumerable, writable and
+configurable, and defined last, so `message`, `errno`, `code`, `syscall`, `path`,
+`Object.keys(err)`, `JSON.stringify(err)`, `assert.deepStrictEqual` and `util.inspect(err)`
+are node's as before, and node's own-name order is a prefix of oam's. `err.winError`,
+`Object.getOwnPropertyNames(err)`, `Object.getOwnPropertyDescriptor` and
+`util.inspect(err, { showHidden: true })` (`[winError]: 536`) show it. The report of an
+uncaught one -- the unheard `'error'` on stdout that prompted #442 -- and of an unhandled
+rejection whose reason carries it, gains one line node's has not, after `util.inspect`'s
+body and before oam's version banner: `winError: 536 (oam: the Win32 error code behind
+UNKNOWN)`. A worker's fatal error reaches the parent's `'error'` event with the property,
+still non-enumerable, as node's error serialization would carry it; `postMessage` and
+`structuredClone` drop it, as they drop `errno` and `code` on both runtimes. The e2e tests
+pin the stdout and stderr write paths and the report
+(`an_unknown_write_error_keeps_its_win32_code`,
+`an_unknown_stderr_write_error_keeps_its_win32_code`,
+`an_unheard_unknown_write_error_reports_its_win32_code`, crates/oam_cli/tests/e2e.rs);
+`fs.accessSync` and the other re-wraps go through the same two helpers, which unit tests
+pin on their own.
+
+What still differs, and where the property is not: never on Linux or macOS, where `errno`
+is the raw number and oam never maps a raw errno to `UNKNOWN`. Absent where libuv itself
+has no Win32 code: an open of `\\.\mailslot`, which libuv reports as `UV_UNKNOWN` with no
+code behind it (conformance case 408). Not yet on async rejections (`fs.promises.*`, the
+callback fs ops that go through ops, `net`, `dns`, `tls`, `udp`) nor on child-spawn
+failures (`spawn UNKNOWN`, for one a binary built for another architecture,
+`ERROR_EXE_MACHINE_TYPE_MISMATCH`); those drop the code today and are a follow-up.
+
 ---
 
 ## Module loading and the CLI

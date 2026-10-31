@@ -11843,7 +11843,25 @@
     out.code = e.code;
     if (e.path !== undefined) out.path = e.path;
     try { out.stack = e.stack; } catch { /* frozen stack: keep our own */ }
-    return out;
+    return carryWinError(e, out);
+  }
+
+  // The Win32 code behind an `UNKNOWN` system error, which the native keeps
+  // on the error as a non-enumerable `winError` (#442, docs/node-divergences.md
+  // #59). A re-wrap that rebuilds the error from its fields would drop it, so
+  // every one of them carries it over here: last, and still non-enumerable,
+  // so node's own-key order stays a prefix of oam's and Object.keys,
+  // JSON.stringify and deepStrictEqual see what node's see.
+  function carryWinError(from, to) {
+    if (from !== null && typeof from === "object" && Object.hasOwn(from, "winError")) {
+      Object.defineProperty(to, "winError", {
+        value: from.winError,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+    return to;
   }
 
   // The checks fs.read and fs.readSync share once their overloads are
@@ -13453,7 +13471,7 @@
     err.code = e.code;
     err.syscall = syscall;
     err.path = path;
-    return err;
+    return carryWinError(e, err);
   }
 
   // The sync copy: lib/internal/fs/cp/cp-sync.js's cpSyncFn.
@@ -14446,7 +14464,7 @@
           err.code = e.code;
           err.path = shown;
           err.filename = given;
-          throw err;
+          throw carryWinError(e, err);
         }
         this[kFsEventId] = id;
         this[kFsEventEncoding] = encoding || "utf8";
@@ -14511,7 +14529,7 @@
         err.code = e.code;
       }
       err.filename = filename;
-      return err;
+      return carryWinError(e, err);
     };
 
     // fs.promises.watch (lib/internal/fs/watchers.js `watch`, v22.22.2): an
@@ -17525,7 +17543,7 @@
           err.syscall = "chdir";
           err.path = oldCwd;
           err.dest = dir;
-          throw err;
+          throw carryWinError(e, err);
         }
       },
       nextTick(fn, ...args) {

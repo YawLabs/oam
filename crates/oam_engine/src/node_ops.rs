@@ -740,13 +740,15 @@ fn throw_node_error_dest(
 ) {
     let code = node_error_code(error);
     let message = oam_core::node_error_message_dest(code, syscall, path, dest, error);
-    let exception = system_error(scope, code, &message, syscall, Some(path), error);
-    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception)
-        && let (Some(key), Some(value)) =
-            (v8::String::new(scope, "dest"), v8::String::new(scope, dest))
-    {
-        obj.set(scope, key.into(), value.into());
-    }
+    let exception = system_error(
+        scope,
+        code,
+        &message,
+        syscall,
+        Some(path),
+        Some(dest),
+        error,
+    );
     scope.throw_exception(exception);
 }
 
@@ -824,18 +826,21 @@ fn throw_system_error(
     path: Option<&str>,
     error: &std::io::Error,
 ) {
-    let exception = system_error(scope, code, message, syscall, path, error);
+    let exception = system_error(scope, code, message, syscall, path, None, error);
     scope.throw_exception(exception);
 }
 
 /// node's system-error object, built and handed back rather than thrown: for
 /// an op that returns a failure to its JS caller (see `stdio_write_failed`).
+/// `dest` is the second path of a two-path call (rename, copyfile, link,
+/// symlink), set after `path` as node sets it; `None` for every other call.
 fn system_error<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     code: &str,
     message: &str,
     syscall: &str,
     path: Option<&str>,
+    dest: Option<&str>,
     error: &std::io::Error,
 ) -> v8::Local<'s, v8::Value> {
     let message_v8 =
@@ -857,11 +862,13 @@ fn system_error<'s>(
         }
         // `path` is present only for a path operation. An fd error has no path
         // in node at all -- it is not an empty one -- and emitting `path: ''`
-        // put a fourth key on `Object.keys(err)` that node never has.
+        // put a fourth key on `Object.keys(err)` that node never has. `dest`
+        // follows `path` for a two-path call, in node's order.
         let props = [
             Some(("code", code)),
             Some(("syscall", syscall)),
             path.map(|p| ("path", p)),
+            dest.map(|d| ("dest", d)),
         ];
         for (name, value) in props.into_iter().flatten() {
             let key = v8::String::new(scope, name).unwrap();
@@ -869,8 +876,38 @@ fn system_error<'s>(
                 obj.set(scope, key.into(), value.into());
             }
         }
+        keep_win32_code(scope, obj, oam_core::unknown_win32_error(code, error));
     }
     exception
+}
+
+/// The Win32 code behind an `UNKNOWN`, kept on the error as a non-enumerable
+/// own `winError` (#442; docs/node-divergences.md #59). libuv calls a code
+/// UNKNOWN when its table has no row for it, and node's error then says
+/// nothing about which code it was; this keeps the code where a catch can
+/// read it -- `err.winError`, `util.inspect(err, { showHidden: true })`,
+/// `Object.getOwnPropertyNames` -- without touching the node-facing shape:
+/// `Object.keys`, `JSON.stringify`, `assert.deepStrictEqual` and plain
+/// `util.inspect` see enumerable keys only. Defined LAST, so node's own-name
+/// order is a prefix of oam's; writable and configurable, as an assignment
+/// would leave it. `None` -- a named code, no OS code, or not Windows -- adds
+/// nothing.
+fn keep_win32_code<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    obj: v8::Local<'s, v8::Object>,
+    win_error: Option<u32>,
+) {
+    if let Some(raw) = win_error
+        && let Some(key) = v8::String::new(scope, "winError")
+    {
+        let value = v8::Integer::new_from_unsigned(scope, raw);
+        obj.define_own_property(
+            scope,
+            key.into(),
+            value.into(),
+            v8::PropertyAttribute::DONT_ENUM,
+        );
+    }
 }
 
 /// An optional non-negative POSITION argument: a number seeks (pread/pwrite),
@@ -1599,6 +1636,10 @@ fn op_stdout_write(
 /// success and its bytes were gone without a sign. Measured on node v22.22.2
 /// (Windows) and v22.23.2 (Linux): a stdout opened read-only fails EBADF, a
 /// pipe's read end on Windows EBADF, /dev/full ENOSPC, each with that shape.
+/// A write to a named pipe's server end before any client has opened it fails
+/// ERROR_PIPE_LISTENING, which libuv's table does not name: `UNKNOWN: unknown
+/// error, write`, errno -4094, on node and oam alike -- and oam keeps the
+/// Win32 code as `err.winError` (`keep_win32_code`, #442).
 ///
 /// Not raised at all, as in node: a stdout that was never there. A NULL or
 /// invalid handle cannot be duplicated, so the write goes through std's
@@ -1616,7 +1657,7 @@ fn stdio_write_failed(
         oam_core::exit_process(0);
     }
     let message = oam_core::node_error_message_fd(code, "write", error);
-    let failure = system_error(scope, code, &message, "write", None, error);
+    let failure = system_error(scope, code, &message, "write", None, None, error);
     rv.set(failure);
 }
 
@@ -7748,7 +7789,7 @@ fn op_fs_access_sync(
     let mode = args.get(1).int32_value(scope).unwrap_or(0);
     match oam_core::check_access(&path, mode) {
         Ok(()) => {}
-        Err((code, message, errno)) => {
+        Err((code, message, errno, win_error)) => {
             // EPERM/EACCES with the path attached, same shape as
             // throw_node_error but with the access-specific code: errno
             // FIRST, then code, syscall, path, as node orders them (errno
@@ -7772,6 +7813,7 @@ fn op_fs_access_sync(
                         obj.set(scope, key.into(), value.into());
                     }
                 }
+                keep_win32_code(scope, obj, win_error);
             }
             scope.throw_exception(exception);
         }

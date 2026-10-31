@@ -37870,14 +37870,10 @@ fn unique_name(tag: &str) -> String {
 /// after `\\.\pipe\`.
 #[cfg(windows)]
 fn named_pipe(name: &str, message: bool) -> (std::fs::File, std::fs::File) {
-    use std::os::windows::io::FromRawHandle;
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
     use windows_sys::Win32::System::Pipes::{
-        CreateNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_TYPE_BYTE, PIPE_TYPE_MESSAGE,
+        PIPE_READMODE_MESSAGE, PIPE_TYPE_BYTE, PIPE_TYPE_MESSAGE,
     };
-    let path = format!(r"\\.\pipe\{name}");
-    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     // Blocking (PIPE_WAIT) either way; that flag, like PIPE_READMODE_BYTE, is
     // the zero default.
     let mode = if message {
@@ -37885,14 +37881,43 @@ fn named_pipe(name: &str, message: bool) -> (std::fs::File, std::fs::File) {
     } else {
         PIPE_TYPE_BYTE
     };
+    let server = pipe_server(name, PIPE_ACCESS_INBOUND, mode);
+    // Opening the client end IS the connection. ConnectNamedPipe is for a
+    // server that wants to wait for one; called after this it reports
+    // ERROR_PIPE_CONNECTED, which the docs call a good connection.
+    let path = pipe_path(name);
+    let client = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("open {path}: {e}"));
+    (server, client)
+}
+
+/// `\\.\pipe\<name>`.
+#[cfg(windows)]
+fn pipe_path(name: &str) -> String {
+    format!(r"\\.\pipe\{name}")
+}
+
+/// A named pipe's server end: one instance, 64 KiB buffers each way,
+/// blocking. `access` is PIPE_ACCESS_INBOUND / OUTBOUND / DUPLEX, `mode` the
+/// PIPE_TYPE_* and PIPE_READMODE_* flags. The one CreateNamedPipeW in this
+/// file; every pipe a test makes comes through it.
+#[cfg(windows)]
+fn pipe_server(name: &str, access: u32, mode: u32) -> std::fs::File {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Pipes::CreateNamedPipeW;
+    let path = pipe_path(name);
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: `wide` is a live NUL-terminated UTF-16 name that outlives the
     // call, and the null security attributes are the documented default. The
     // handle is checked against INVALID_HANDLE_VALUE before it is wrapped,
     // and it is wrapped exactly once.
-    let server = unsafe {
+    unsafe {
         let handle = CreateNamedPipeW(
             wide.as_ptr(),
-            PIPE_ACCESS_INBOUND,
+            access,
             mode,
             1,
             65536,
@@ -37906,15 +37931,19 @@ fn named_pipe(name: &str, message: bool) -> (std::fs::File, std::fs::File) {
             std::io::Error::last_os_error()
         );
         std::fs::File::from_raw_handle(handle)
-    };
-    // Opening the client end IS the connection. ConnectNamedPipe is for a
-    // server that wants to wait for one; called after this it reports
-    // ERROR_PIPE_CONNECTED, which the docs call a good connection.
-    let client = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .unwrap_or_else(|e| panic!("open {path}: {e}"));
-    (server, client)
+    }
+}
+
+/// A named pipe's server end that no client has opened, and none will: a
+/// WriteFile on it fails ERROR_PIPE_LISTENING (536), a Win32 code neither of
+/// libuv's tables names, so node and oam both report it `UNKNOWN` (#442). As a
+/// child's stdout it is the deterministic form of the failure the issue
+/// describes.
+#[cfg(windows)]
+fn listening_pipe(name: &str) -> std::fs::File {
+    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_OUTBOUND;
+    use windows_sys::Win32::System::Pipes::PIPE_TYPE_BYTE;
+    pipe_server(name, PIPE_ACCESS_OUTBOUND, PIPE_TYPE_BYTE)
 }
 
 /// A stdout for the child that keeps write boundaries, and the reader of it:
@@ -38381,6 +38410,219 @@ setTimeout(() => say('END'), 20);
             format!("writeSync threw: {shape}"),
             format!("write cb: {shape}"),
             format!("error event: {shape}"),
+            "END".to_string(),
+        ],
+        "stdout:\n{stdout}"
+    );
+}
+
+/// node's UNKNOWN for a failed write, as the scripts here print an error:
+/// code | errno | syscall | message | its own keys. The keys come in
+/// fs.writeSync's order from writeSync and from process.stdout, and in the
+/// common order from fs.write's callback, as for EBADF above.
+#[cfg(windows)]
+fn unknown_write_shape(keys: &str) -> String {
+    format!("UNKNOWN | -4094 | write | UNKNOWN: unknown error, write | {keys}")
+}
+
+/// A stdout write that fails with a Win32 code libuv's table does not name
+/// (#442). The stdout is a named pipe's server end that no client has opened:
+/// WriteFile fails ERROR_PIPE_LISTENING (536), and node v22.22.2 reports it
+/// exactly as oam does -- `UNKNOWN: unknown error, write`, errno -4094, own
+/// keys errno, syscall, code, write callback and 'error' event alike, exit 0
+/// with a listener (measured with this fixture). That shape is asserted
+/// unchanged. What oam adds is the code itself, as a non-enumerable own
+/// `winError`, on every surface the failure reaches: the write callback and
+/// the 'error' event (the error ctxOrderError rebuilds), fs.writeSync's throw
+/// (the same rebuild), and fs.write's callback (the native object itself, so
+/// the attribute set natively is what shows). It is absent from Object.keys,
+/// JSON.stringify and util.inspect, present under showHidden, and absent
+/// altogether where libuv's own UNKNOWN has no Win32 code behind it: the
+/// `\\.\mailslot` open (as_the_crt_takes_it's UV_UNKNOWN).
+#[cfg(windows)]
+#[test]
+fn an_unknown_write_error_keeps_its_win32_code() {
+    let script = write_temp(
+        "stdout_unknown.mjs",
+        r"
+import assert from 'node:assert';
+import fs from 'node:fs';
+import util from 'node:util';
+const say = (s) => fs.writeSync(2, s + '\n');
+const shape = (e) => e ? [e.code, e.errno, e.syscall, e.message, Object.keys(e).join(',')].join(' | ') : 'none';
+const deep = (e) => {
+  try { assert.deepStrictEqual(e, Object.assign(new Error(e.message), { errno: e.errno, syscall: e.syscall, code: e.code })); return 'deepEqual'; }
+  catch { return 'deepDiff'; }
+};
+const kept = (e) => {
+  const d = Object.getOwnPropertyDescriptor(e, 'winError');
+  const flags = d ? (d.writable ? 'w' : '-') + (d.enumerable ? 'e' : '-') + (d.configurable ? 'c' : '-') : 'absent';
+  return [e.winError, flags, JSON.stringify(Object.getOwnPropertyNames(e)), JSON.stringify(e),
+    util.inspect(e).includes('winError'), util.inspect(e, { showHidden: true }).includes('[winError]: 536'), deep(e)].join(' | ');
+};
+process.stdout.on('error', (e) => { say('error event: ' + shape(e)); say('error event kept: ' + kept(e)); });
+process.stdout.write('one\n', (e) => { say('write cb: ' + shape(e)); say('write cb kept: ' + kept(e)); });
+try { fs.writeSync(1, 'two\n'); say('writeSync returned'); } catch (e) { say('writeSync threw: ' + shape(e)); say('writeSync kept: ' + kept(e)); }
+fs.write(1, 'three\n', (e) => { say('fs.write cb: ' + shape(e)); say('fs.write cb kept: ' + kept(e)); });
+try { fs.openSync('\\\\.\\mailslot', 'r'); say('mailslot opened'); }
+catch (e) { say('mailslot: ' + [e.code, e.errno, e.syscall, Object.keys(e).join(','), 'winError' in e, JSON.stringify(Object.getOwnPropertyNames(e))].join(' | ')); }
+setTimeout(() => say('END'), 20);
+",
+    );
+    let stdout = listening_pipe(&unique_name("unknown"));
+    let (mut child, stderr) = spawn_oam_with_stdout(&script, std::process::Stdio::from(stdout));
+    let status = wait_within(&mut child, OAM_DEADLINE, || {
+        format!(
+            "stderr so far: {:?}",
+            String::from_utf8_lossy(&stderr.taken())
+        )
+    });
+    let stderr = stderr_text(&stderr);
+    assert!(status.success(), "exit {status}; stderr:\n{stderr}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    // ctxOrderError's rebuild: node's own names, then winError last. The
+    // trailing deepEqual is deepStrictEqual against an error with node's three
+    // enumerable keys and nothing else: it compares enumerable keys only, so
+    // the hidden property does not show (nor does key order).
+    let rebuilt = r#"536 | w-c | ["stack","message","errno","syscall","code","winError"] | {"errno":-4094,"syscall":"write","code":"UNKNOWN"} | false | true | deepEqual"#;
+    // fs.write hands the native error through: its own order, winError last.
+    let native = r#"536 | w-c | ["stack","message","errno","code","syscall","winError"] | {"errno":-4094,"code":"UNKNOWN","syscall":"write"} | false | true | deepEqual"#;
+    let shape = unknown_write_shape(WRITE_SYNC_KEYS);
+    for want in [
+        format!("write cb: {shape}"),
+        format!("write cb kept: {rebuilt}"),
+        format!("error event: {shape}"),
+        format!("error event kept: {rebuilt}"),
+        format!("writeSync threw: {shape}"),
+        format!("writeSync kept: {rebuilt}"),
+        format!("fs.write cb: {}", unknown_write_shape(COMMON_KEYS)),
+        format!("fs.write cb kept: {native}"),
+        // libuv's own UNKNOWN: no Win32 code behind it, nothing to keep.
+        r#"mailslot: UNKNOWN | -4094 | open | errno,code,syscall,path | false | ["stack","message","errno","code","syscall","path"]"#.to_string(),
+        "END".to_string(),
+    ] {
+        assert!(
+            lines.contains(&want.as_str()),
+            "missing {want:?}; stderr:\n{stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains("writeSync returned") && !stderr.contains("mailslot opened"),
+        "stderr:\n{stderr}"
+    );
+    // One 'error' for the one failed stream write, as node emits it.
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("error event: "))
+            .count(),
+        1,
+        "stderr:\n{stderr}"
+    );
+}
+
+/// The same failure with nobody listening for 'error': the program dies of it
+/// as node's does (exit 1, the UNKNOWN on stderr), and oam's report -- which
+/// util.inspect alone would print without the non-enumerable code -- carries
+/// one line node's does not, after inspect's body and before oam's version
+/// banner: the Win32 code, the one line the issue asked for.
+#[cfg(windows)]
+#[test]
+fn an_unheard_unknown_write_error_reports_its_win32_code() {
+    let script = write_temp(
+        "stdout_unknown_unheard.mjs",
+        r"
+import fs from 'node:fs';
+process.stdout.write('one\n');
+setTimeout(() => fs.writeSync(2, 'STILL_RUNNING\n'), 200);
+",
+    );
+    let stdout = listening_pipe(&unique_name("unknown-unheard"));
+    let (mut child, stderr) = spawn_oam_with_stdout(&script, std::process::Stdio::from(stdout));
+    let status = wait_within(&mut child, OAM_DEADLINE, || {
+        format!(
+            "stderr so far: {:?}",
+            String::from_utf8_lossy(&stderr.taken())
+        )
+    });
+    let stderr = stderr_text(&stderr);
+    assert_eq!(status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(!stderr.contains("STILL_RUNNING"), "stderr:\n{stderr}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    let line = "winError: 536 (oam: the Win32 error code behind UNKNOWN)";
+    let at = lines
+        .iter()
+        .position(|l| *l == line)
+        .unwrap_or_else(|| panic!("no winError line; stderr:\n{stderr}"));
+    // Once, below the inspect body (node's report, UNKNOWN message included),
+    // and right before oam's banner: nothing of node's report follows it.
+    assert_eq!(
+        lines.iter().filter(|l| l.contains("winError")).count(),
+        1,
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        lines[..at]
+            .iter()
+            .any(|l| l.contains("UNKNOWN: unknown error, write")),
+        "stderr:\n{stderr}"
+    );
+    assert_eq!(lines.get(at + 1).copied(), Some(""), "stderr:\n{stderr}");
+    assert!(
+        lines.get(at + 2).is_some_and(|l| l.starts_with("oam v")),
+        "stderr:\n{stderr}"
+    );
+}
+
+/// The same on stderr: a listening pipe as the child's stderr, the findings
+/// said on stdout. stderr's writes take another road to `stdio_write_failed`
+/// (std's stderr rather than the stdout natives), and arrive with the code
+/// kept all the same; the lines come in the order the sibling EBADF test
+/// pins, the synchronous throw first.
+#[cfg(windows)]
+#[test]
+fn an_unknown_stderr_write_error_keeps_its_win32_code() {
+    let script = write_temp(
+        "stderr_unknown.mjs",
+        r"
+import fs from 'node:fs';
+const say = (s) => fs.writeSync(1, s + '\n');
+const shape = (e) => e ? [e.code, e.errno, e.syscall, e.message, Object.keys(e).join(',')].join(' | ') : 'none';
+const kept = (e) => [e.winError, JSON.stringify(Object.getOwnPropertyNames(e)), JSON.stringify(e)].join(' | ');
+process.stderr.on('error', (e) => { say('error event: ' + shape(e)); say('error event kept: ' + kept(e)); });
+process.stderr.write('one\n', (e) => { say('write cb: ' + shape(e)); say('write cb kept: ' + kept(e)); });
+try { fs.writeSync(2, 'two\n'); say('writeSync returned'); } catch (e) { say('writeSync threw: ' + shape(e)); say('writeSync kept: ' + kept(e)); }
+setTimeout(() => say('END'), 20);
+",
+    );
+    let stderr = listening_pipe(&unique_name("unknown-stderr"));
+    let mut cmd = oam_command(&["run", script.to_str().unwrap(), "--no-check"]);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::from(stderr));
+    let mut child = cmd.spawn().expect("oam binary runs");
+    drop(cmd);
+    let stdout = drain_pipe(child.stdout.take().expect("piped stdout"));
+    let status = wait_within(&mut child, OAM_DEADLINE, || {
+        format!(
+            "stdout so far: {:?}",
+            String::from_utf8_lossy(&stdout.taken())
+        )
+    });
+    let stdout = stderr_text(&stdout);
+    assert!(status.success(), "exit {status}; stdout:\n{stdout}");
+    let shape = unknown_write_shape(WRITE_SYNC_KEYS);
+    let kept = r#"536 | ["stack","message","errno","syscall","code","winError"] | {"errno":-4094,"syscall":"write","code":"UNKNOWN"}"#;
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            format!("writeSync threw: {shape}"),
+            format!("writeSync kept: {kept}"),
+            format!("write cb: {shape}"),
+            format!("write cb kept: {kept}"),
+            format!("error event: {shape}"),
+            format!("error event kept: {kept}"),
             "END".to_string(),
         ],
         "stdout:\n{stdout}"
