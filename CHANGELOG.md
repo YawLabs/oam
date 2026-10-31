@@ -18,6 +18,18 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`os.cpus()` reports each CPU's real `times`, as node's does (#441).** Every `times` field was 0 on
+  every platform, so a sampler that differences two calls (`busy = 1 - idleDelta / totalDelta`)
+  divided by zero and never read a value. The counters are now the ones libuv reports, in
+  milliseconds: Windows reads `SystemProcessorPerformanceInformation` (system time is kernel time
+  minus idle; `nice` is 0), Linux the `cpuN` lines of `/proc/stat`, macOS `host_processor_info`
+  (`irq` is 0). The entry count is the OS's online CPU list, as in node, where it used to be the
+  `os.availableParallelism()` count (on Linux the affinity- and cgroup-aware one). On Windows and
+  Linux `model` and `speed` are read per CPU (macOS exposes one brand string and one frequency, as
+  in node), and on Windows the model is the registry string verbatim, no longer trimmed, as node
+  reports it. `os.availableParallelism()` itself is unchanged.
+- **`os.loadavg()` returns the real load averages on Linux and macOS (#441).** It was `[0, 0, 0]`
+  everywhere; it stays so on Windows, where node reports zeros too.
 - **`undici.fetch` decodes `content-encoding: zstd`, as undici 7.11 and later do (#443).** oam
   shadows the npm `undici` package and runs its `fetch` on oam's own client, which decoded `gzip`,
   `deflate` and `br` by undici 6's rules. So a program on undici 8 got a zstd response's raw frame

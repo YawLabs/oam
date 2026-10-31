@@ -72,6 +72,38 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## libuv
+
+`os.cpus()` and `os.loadavg()` follow libuv 1.51.0, the libuv Node.js v22.22.2
+ships: the per-platform reading of the CPU time counters in `src/win/util.c`,
+`src/unix/linux.c` and `src/unix/darwin.c` (`uv_cpu_info`, `uv_loadavg`),
+including its table of ARM part codes, ported to Rust in
+`crates/oam_engine/src/node_ops.rs` and marked there by comments naming the
+source. libuv is not a cargo dependency, so its notice is carried by this
+hand-maintained section. libuv is distributed under the MIT license:
+
+```text
+Copyright (c) 2015-present libuv project contributors.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to
+deal in the Software without restriction, including without limitation the
+rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.
+```
+
 ## Zstandard (libzstd)
 
 `node:zlib`'s zstd engine is libzstd 1.5.7's C source, vendored by the

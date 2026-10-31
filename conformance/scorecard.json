@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "bd44e5fd+wip",
+  "commit": "ef2e39bd",
   "oamVersion": "oam 0.19.1",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 408,
-      "total": 409,
+      "pass": 410,
+      "total": 411,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -1481,6 +1481,14 @@
         },
         {
           "case": "575-child-argv0.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "576-os-cpus-times.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "577-os-loadavg.mjs",
           "status": "pass"
         },
         {

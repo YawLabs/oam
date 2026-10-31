@@ -19940,8 +19940,21 @@ fn os_and_process_native_values() {
          // os.cpus() returns correct count with real model\n\
          const cpus = os.cpus();\n\
          console.log('cpu_count:', cpus.length > 0);\n\
-         console.log('cpu_model:', cpus[0].model.length > 0 && cpus[0].model !== 'unknown');\n\
-         console.log('cpu_speed:', cpus[0].speed > 0 || process.platform === 'darwin');\n\
+         // aarch64 Linux: node names a core only when libuv's part table lists it\n\
+         // ('unknown' otherwise) and oam follows; with no cpufreq and no 'cpu MHz'\n\
+         // line there, speed is 0 as in node.\n\
+         const arm64Linux = process.platform === 'linux' && process.arch === 'arm64';\n\
+         console.log('cpu_model:', cpus[0].model.length > 0 && (cpus[0].model !== 'unknown' || arm64Linux));\n\
+         console.log('cpu_speed:', cpus[0].speed > 0 || process.platform === 'darwin' || arm64Linux);\n\
+         \n\
+         // os.cpus().times: cumulative ms per state that advance between samples (#441)\n\
+         const FIELDS = ['user', 'nice', 'sys', 'idle', 'irq'];\n\
+         const total = (list) => list.reduce((n, c) => FIELDS.reduce((m, k) => m + c.times[k], n), 0);\n\
+         console.log('cpu_times_integers:', cpus.every(c => FIELDS.every(k => Number.isInteger(c.times[k]) && c.times[k] >= 0)));\n\
+         console.log('cpu_times_nonzero:', total(cpus) > 0);\n\
+         const spinUntil = performance.now() + 150;\n\
+         while (performance.now() < spinUntil) {}\n\
+         console.log('cpu_times_advance:', total(os.cpus()) > total(cpus));\n\
          \n\
          // os.networkInterfaces has loopback\n\
          const ni = os.networkInterfaces();\n\

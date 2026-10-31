@@ -219,7 +219,8 @@ libloading = "0.8"
 clap = { version = "4", features = ["derive"] }
 # os/process native values on macOS + other non-linux unix: total/free mem,
 # CPU model/speed, process RSS, parent PID. Windows uses FFI/registry and
-# linux reads /proc directly; sysinfo backs only the remaining unix targets.
+# linux reads /proc directly; sysinfo backs the remaining unix targets, plus
+# os.loadavg() on every unix (a safe wrapper over /proc/loadavg / getloadavg).
 sysinfo = "0.39"
 
 # TypeScript strip/transform pipeline (the wedge): pinned as a family —
