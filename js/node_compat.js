@@ -38910,23 +38910,28 @@
       const e = new Error(
         hostname ? `${syscall} ${code} ${hostname}` : `${syscall} ${code}`,
       );
+      // node's DNSException assigns errno FIRST and always: a number on the
+      // getaddrinfo path, an own `undefined` for a query or reverse (keys
+      // errno, code, syscall, hostname on every path; measured on v22.22.2).
+      // On the lookup path it is the resolver's own number when the native
+      // side reports one: libuv's UV_EAI_* for the code getaddrinfo returned
+      // (EAI_NODATA is ENOTFOUND with -3007 where EAI_NONAME is -3008), or
+      // this platform's EINVAL for a name ToASCII refused. Else the code's
+      // usual number.
+      let errno;
+      if (lookupPath) {
+        errno = typeof err.errno === "number" ? err.errno : _dnsLookupErrno(code);
+      }
+      e.errno = errno;
       e.code = code;
       e.syscall = syscall;
       // node omits .hostname entirely rather than setting it to "" when the
       // caller looked up an empty name.
       if (hostname) e.hostname = hostname;
-      if (lookupPath) {
-        // The resolver's own number when the native side reports one: libuv's
-        // UV_EAI_* for the code getaddrinfo returned (EAI_NODATA is ENOTFOUND
-        // with -3007 where EAI_NONAME is -3008), or this platform's EINVAL
-        // for a name ToASCII refused. Else the code's usual number.
-        if (typeof err.errno === "number") e.errno = err.errno;
-        else {
-          const errno = _dnsLookupErrno(code);
-          if (errno !== undefined) e.errno = errno;
-        }
-      }
-      return e;
+      // The Win32 code behind an UNKNOWN the resolver could not name (an
+      // unlisted WSA code falls through to libuv's generic table, #450):
+      // rebuilding the error must not drop it.
+      return carryWinError(err, e);
     }
 
     // The three native entry points, each wrapped once so the callback API, the

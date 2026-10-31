@@ -952,7 +952,8 @@ callback fs ops that go through ops, `fs.watch`'s running-failure error, `net`, 
 `__oamMakeSysError` factory (`node_failed_io` builds it from the one `io::Error` the errno
 also comes from); and child-spawn failures through the spawn failure's JSON body and
 `spawnSync`'s result record (#450). The re-wraps that rebuild an error from its fields
-(`carryWinError` in js/node_compat.js) carry it over. The property is non-enumerable,
+(`carryWinError` in js/node_compat.js) carry it over, node:dns's reshape of every resolver
+rejection into node's DNSException shape (`_shapeDnsError`) among them. The property is non-enumerable,
 writable and configurable, and defined last, so `message`, `errno`, `code`, `syscall`,
 `path`, `Object.keys(err)`, `JSON.stringify(err)`, `assert.deepStrictEqual` and
 `util.inspect(err)` are node's as before, and node's own-name order is a prefix of oam's.

@@ -37,6 +37,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **A dns error's own keys come in node's order: `errno`, `code`, `syscall`, `hostname`.** node's
+  DNSException assigns `errno` first and always, a number on the `dns.lookup` path and an own
+  `undefined` on the `resolve*` and `reverse` paths. oam assigned it last on the lookup path and
+  not at all on the others, so `Object.keys(err)` read `code, syscall, hostname, errno` or
+  `code, syscall, hostname`. Conformance case 579 pins it.
 - **`os.cpus()` reports each CPU's real `times`, as node's does (#441).** Every `times` field was 0 on
   every platform, so a sampler that differences two calls (`busy = 1 - idleDelta / totalDelta`)
   divided by zero and never read a value. The counters are now the ones libuv reports, in

@@ -38765,6 +38765,99 @@ catch (e) {{ console.log('mailslot: ' + [e.code, e.errno, e.syscall, 'winError' 
 /// run on the real rejection, which fs/promises then re-frames on the same
 /// object. No deterministic async UNKNOWN exists from JS alone; this is the
 /// one way to drive the path with a chosen outcome.
+/// The same through node:dns (#450, review of #451): a resolver failure whose
+/// WSA code libuv's getaddrinfo translation does not name is an UNKNOWN with
+/// the code kept on the native rejection, and the dns module rebuilds every
+/// rejection into node's DNSException shape (`_shapeDnsError`), which must
+/// carry the code over. A recorded failing `dns.promises.lookup` is rewritten
+/// into that UNKNOWN (with `win_error`, and without) and replayed, so the
+/// native path and the reshape both run; every OS.
+#[test]
+fn a_dns_rejection_keeps_the_win32_code_through_the_reshape() {
+    let script = write_temp(
+        "replay_dns_win_error.mjs",
+        r"
+import dns from 'node:dns';
+try { await dns.promises.lookup('no-such-host.invalid'); console.log('lookup resolved'); }
+catch (e) {
+  const d = Object.getOwnPropertyDescriptor(e, 'winError');
+  const flags = d ? (d.writable ? 'w' : '-') + (d.enumerable ? 'e' : '-') + (d.configurable ? 'c' : '-') : 'absent';
+  console.log([e.code, e.errno, e.syscall, e.message, String(e.winError), flags,
+    JSON.stringify(Object.keys(e)), JSON.stringify(Object.getOwnPropertyNames(e)), JSON.stringify(e)].join(' | '));
+}
+",
+    );
+    let trace = write_temp("replay_dns_win_error.jsonl", "");
+    let run = |args: &[&str]| {
+        let out = oam(args);
+        assert!(
+            out.status.success(),
+            "exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let recorded = run(&[
+        "run",
+        "--record",
+        trace.to_str().unwrap(),
+        script.to_str().unwrap(),
+        "--no-check",
+    ]);
+    assert!(recorded.contains(" | getaddrinfo | "), "{recorded}");
+    // The lookup's one Op event: whatever the host's resolver said (ENOTFOUND
+    // or EAI_AGAIN), make it the UNKNOWN an unlisted WSA code produces.
+    let ops: Vec<serde_json::Value> = std::fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let failed: Vec<usize> = (0..ops.len())
+        .filter(|&i| {
+            ops[i]["type"] == "Op"
+                && ops[i]["outcome_json"]
+                    .as_str()
+                    .is_some_and(|o| o.contains("NodeFailed"))
+        })
+        .collect();
+    assert_eq!(failed.len(), 1, "one failed op in the trace: {ops:?}");
+    let mut outcome: serde_json::Value =
+        serde_json::from_str(ops[failed[0]]["outcome_json"].as_str().unwrap()).unwrap();
+    outcome["NodeFailed"]["code"] = "UNKNOWN".into();
+    outcome["NodeFailed"]["errno"] = (-4094).into();
+    outcome["NodeFailed"]["message"] = "getaddrinfo UNKNOWN no-such-host.invalid".into();
+    let replay = |tag: &str, outcome: &serde_json::Value| {
+        let mut events = ops.clone();
+        events[failed[0]]["outcome_json"] = serde_json::to_string(outcome).unwrap().into();
+        let body: String = events
+            .iter()
+            .map(|e| format!("{}\n", serde_json::to_string(e).unwrap()))
+            .collect();
+        let edited = write_temp(&format!("replay_dns_win_error.{tag}.jsonl"), &body);
+        // The replayer falls back to the live op if an edited outcome fails to
+        // parse, so the UNKNOWN in the expected lines is what proves the
+        // rewrite took.
+        run(&[
+            "run",
+            "--replay",
+            edited.to_str().unwrap(),
+            script.to_str().unwrap(),
+            "--no-check",
+        ])
+    };
+    let mut with_code = outcome.clone();
+    with_code["NodeFailed"]["win_error"] = 10041.into();
+    assert_eq!(
+        replay("with", &with_code),
+        r#"UNKNOWN | -4094 | getaddrinfo | getaddrinfo UNKNOWN no-such-host.invalid | 10041 | w-c | ["errno","code","syscall","hostname"] | ["stack","message","errno","code","syscall","hostname","winError"] | {"errno":-4094,"code":"UNKNOWN","syscall":"getaddrinfo","hostname":"no-such-host.invalid"}"#
+    );
+    assert_eq!(
+        replay("without", &outcome),
+        r#"UNKNOWN | -4094 | getaddrinfo | getaddrinfo UNKNOWN no-such-host.invalid | undefined | absent | ["errno","code","syscall","hostname"] | ["stack","message","errno","code","syscall","hostname"] | {"errno":-4094,"code":"UNKNOWN","syscall":"getaddrinfo","hostname":"no-such-host.invalid"}"#
+    );
+}
+
 #[test]
 fn an_async_rejection_keeps_the_win32_code_through_replay() {
     let script = write_temp(
