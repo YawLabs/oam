@@ -30,6 +30,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   reports it. `os.availableParallelism()` itself is unchanged.
 - **`os.loadavg()` returns the real load averages on Linux and macOS (#441).** It was `[0, 0, 0]`
   everywhere; it stays so on Windows, where node reports zeros too.
+- **`os.uptime()` is the system's uptime, as node's is (found reviewing #444).** It returned this
+  process's uptime, the clock behind `process.uptime()`, so a freshly started oam reported an uptime
+  of milliseconds on a machine up for days. It now follows libuv's `uv_uptime`: `GetTickCount64` on
+  Windows (millisecond resolution), `/proc/uptime` on Linux, and on macOS the time since the kernel's
+  boot time in whole seconds. `process.uptime()` is unchanged.
 - **`undici.fetch` decodes `content-encoding: zstd`, as undici 7.11 and later do (#443).** oam
   shadows the npm `undici` package and runs its `fetch` on oam's own client, which decoded `gzip`,
   `deflate` and `br` by undici 6's rules. So a program on undici 8 got a zstd response's raw frame
