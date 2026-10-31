@@ -11279,13 +11279,15 @@ fn cpu_info() -> Vec<CpuInfo> {
     let count = written / record_size;
 
     // Model and speed per processor from the registry, as libuv reads them
-    // (`HARDWARE\DESCRIPTION\System\CentralProcessor\<n>`). node abandons
-    // the whole call when one key is unreadable; oam reuses processor 0's
-    // values for that entry so the counters are still reported. Processor
-    // 0 itself falls back to PROCESSOR_IDENTIFIER and 0 MHz, as before #441.
+    // (`HARDWARE\DESCRIPTION\System\CentralProcessor\<n>`, one open per
+    // processor). node abandons the whole call when one key is unreadable;
+    // oam reuses processor 0's values for that entry so the counters are
+    // still reported. Processor 0 itself falls back to PROCESSOR_IDENTIFIER
+    // and 0 MHz, as before #441.
+    let (model0, speed0) = cpu_registry_entry(0).unwrap_or((None, None));
     let model0 =
-        cpu_model(0).unwrap_or_else(|| std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default());
-    let speed0 = cpu_speed_mhz(0).unwrap_or(0);
+        model0.unwrap_or_else(|| std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default());
+    let speed0 = speed0.unwrap_or(0);
     records[..count]
         .iter()
         .enumerate()
@@ -11293,9 +11295,10 @@ fn cpu_info() -> Vec<CpuInfo> {
             let (model, speed) = if cpu == 0 {
                 (model0.clone(), speed0)
             } else {
+                let (model, speed) = cpu_registry_entry(cpu).unwrap_or((None, None));
                 (
-                    cpu_model(cpu).unwrap_or_else(|| model0.clone()),
-                    cpu_speed_mhz(cpu).unwrap_or(speed0),
+                    model.unwrap_or_else(|| model0.clone()),
+                    speed.unwrap_or(speed0),
                 )
             };
             CpuInfo {
@@ -11307,11 +11310,14 @@ fn cpu_info() -> Vec<CpuInfo> {
         .collect()
 }
 
-/// Windows: the raw bytes of one value under
-/// `HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\<cpu>`, or None when
-/// the key or the value cannot be read.
+/// Windows: processor `cpu`'s `ProcessorNameString` (verbatim -- node does not
+/// trim it either; older Intel strings carry leading spaces) and `~MHz`, read
+/// from `HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\<cpu>` the way libuv
+/// reads them: the key opened once, both values queried on that handle, the
+/// key closed. None when the key cannot be opened; a value that cannot be read
+/// is None inside.
 #[cfg(windows)]
-fn cpu_registry_value(cpu: usize, value_name: &str) -> Option<Vec<u8>> {
+fn cpu_registry_entry(cpu: usize) -> Option<(Option<String>, Option<u32>)> {
     use std::ptr;
 
     const KEY_READ: u32 = 0x20019;
@@ -11343,10 +11349,33 @@ fn cpu_registry_value(cpu: usize, value_name: &str) -> Option<Vec<u8>> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    /// One value of the open key `hkey` into `buf`: the byte count written, or
+    /// None when the value is absent or larger than `buf`.
+    fn query_value(hkey: isize, name: &str, buf: &mut [u8]) -> Option<usize> {
+        let name = to_wide(name);
+        let mut len = buf.len() as u32;
+        let mut reg_type: u32 = 0;
+        // SAFETY: `hkey` is a key the caller opened and has not yet closed.
+        // `name` is a live NUL-terminated UTF-16 vec; `buf` is live storage
+        // and `len` its length, so the API writes at most `len` bytes into it
+        // and updates `len` in place. `reg_type` is a live out-u32; the
+        // reserved arg is NULL as required.
+        let result = unsafe {
+            RegQueryValueExW(
+                hkey,
+                name.as_ptr(),
+                ptr::null_mut(),
+                &mut reg_type,
+                buf.as_mut_ptr(),
+                &mut len,
+            )
+        };
+        (result == 0).then_some((len as usize).min(buf.len()))
+    }
+
     let sub_key = to_wide(&format!(
         "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\{cpu}"
     ));
-    let value_name = to_wide(value_name);
     let mut hkey: isize = 0;
 
     // SAFETY: `sub_key` is a live NUL-terminated UTF-16 vec valid for the read;
@@ -11359,58 +11388,27 @@ fn cpu_registry_value(cpu: usize, value_name: &str) -> Option<Vec<u8>> {
 
     // 512 bytes holds any ProcessorNameString (libuv reads it into 256
     // WCHARs) and the 4-byte ~MHz DWORD.
-    let mut buf = vec![0u8; 512];
-    let mut buf_len = buf.len() as u32;
-    let mut reg_type: u32 = 0;
-
-    // SAFETY: `hkey` is the open key from the checked RegOpenKeyExW above.
-    // `value_name` is a live NUL-terminated UTF-16 vec; `buf` is a live
-    // 512-byte vec and `buf_len` holds its length, so the API writes at most
-    // `buf_len` bytes into valid storage and updates `buf_len` in place.
-    // `reg_type` is a live out-u32; the reserved arg is NULL as required.
-    let result = unsafe {
-        RegQueryValueExW(
-            hkey,
-            value_name.as_ptr(),
-            ptr::null_mut(),
-            &mut reg_type,
-            buf.as_mut_ptr(),
-            &mut buf_len,
-        )
-    };
+    let mut buf = [0u8; 512];
+    let model = query_value(hkey, "ProcessorNameString", &mut buf).map(|len| {
+        let wide: Vec<u16> = buf[..len]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| u16::from_le_bytes(pair))
+            .take_while(|&c| c != 0)
+            .collect();
+        String::from_utf16_lossy(&wide)
+    });
+    let speed = query_value(hkey, "~MHz", &mut buf).and_then(|len| {
+        let dword: [u8; 4] = buf.get(..len)?.get(..4)?.try_into().ok()?;
+        Some(u32::from_le_bytes(dword))
+    });
     // SAFETY: `hkey` was successfully opened by RegOpenKeyExW above and has not
     // been closed; closing it exactly once here releases the key. The return is
     // not needed.
     unsafe { RegCloseKey(hkey) };
 
-    if result != 0 {
-        return None;
-    }
-    buf.truncate((buf_len as usize).min(buf.len()));
-    Some(buf)
-}
-
-/// Windows: the `ProcessorNameString` of processor `cpu`, verbatim -- node
-/// does not trim it either (older Intel strings carry leading spaces).
-#[cfg(windows)]
-fn cpu_model(cpu: usize) -> Option<String> {
-    let bytes = cpu_registry_value(cpu, "ProcessorNameString")?;
-    let wide: Vec<u16> = bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|&pair| u16::from_le_bytes(pair))
-        .take_while(|&c| c != 0)
-        .collect();
-    Some(String::from_utf16_lossy(&wide))
-}
-
-/// Windows: the `~MHz` DWORD of processor `cpu`.
-#[cfg(windows)]
-fn cpu_speed_mhz(cpu: usize) -> Option<u32> {
-    let bytes = cpu_registry_value(cpu, "~MHz")?;
-    let dword: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
-    Some(u32::from_le_bytes(dword))
+    Some((model, speed))
 }
 
 /// Linux: the `cpu<N>` lines of /proc/stat as libuv reads them
@@ -12039,7 +12037,8 @@ fn parent_pid() -> u32 {
 // even though they are cfg-gated off there in the shipped build -- except the
 // Mach-backed `cpu_info` below, which is Apple-only FFI and first compiles on
 // the mac release leg. A fresh System per call is fine -- these ops are
-// infrequent and each refreshes only the slice it needs.
+// infrequent and each refreshes only the slice it needs -- except the CPU
+// brand and frequency, which os.cpus() polls and which are read once.
 
 #[cfg(not(any(windows, target_os = "linux")))]
 fn sysinfo_total_mem() -> u64 {
@@ -12055,28 +12054,27 @@ fn sysinfo_free_mem() -> u64 {
     sys.available_memory()
 }
 
+/// The CPU brand string and frequency in MHz sysinfo finds, read once: both
+/// are constants for the life of the process, and os.cpus() is what load
+/// samplers poll, so a fresh System per call -- two Mach calls, about ten
+/// sysctls and, on Apple Silicon, two IOKit registry walks -- would be paid on
+/// every sample. The frequency is `hw.cpufrequency`, which Apple Silicon does
+/// not expose; there sysinfo reads the power manager's top voltage state
+/// instead (a real hardware value), where node reports libuv's 2400 MHz
+/// placeholder -- see docs/node-divergences.md. The e2e assertion stays
+/// relaxed for darwin.
 #[cfg(not(any(windows, target_os = "linux")))]
-fn sysinfo_cpu_model() -> String {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_cpu_all();
-    sys.cpus()
-        .first()
-        .map(|c| c.brand().to_string())
-        .unwrap_or_default()
-}
-
-#[cfg(not(any(windows, target_os = "linux")))]
-fn sysinfo_cpu_speed_mhz() -> u32 {
-    // `hw.cpufrequency`, which Apple Silicon does not expose; there sysinfo
-    // reads the power manager's top voltage state instead (a real hardware
-    // value), where node reports libuv's 2400 MHz placeholder -- see
-    // docs/node-divergences.md. The e2e assertion stays relaxed for darwin.
-    let mut sys = sysinfo::System::new();
-    sys.refresh_cpu_all();
-    sys.cpus()
-        .first()
-        .map(|c| c.frequency() as u32)
-        .unwrap_or(0)
+fn sysinfo_cpu_model_and_speed() -> &'static (String, u32) {
+    static CPU: std::sync::OnceLock<(String, u32)> = std::sync::OnceLock::new();
+    CPU.get_or_init(|| {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_cpu_all();
+        let first = sys.cpus().first();
+        (
+            first.map(|c| c.brand().to_string()).unwrap_or_default(),
+            first.map_or(0, |c| c.frequency() as u32),
+        )
+    })
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
@@ -12164,13 +12162,12 @@ fn cpu_info() -> Vec<CpuInfo> {
     // which is what vm_deallocate takes); it is released exactly once, after
     // its contents were copied into `ticks`.
     unsafe { libc::vm_deallocate(libc::mach_task_self(), info as libc::vm_address_t, bytes) };
-    let model = sysinfo_cpu_model();
-    let speed = sysinfo_cpu_speed_mhz();
+    let (model, speed) = sysinfo_cpu_model_and_speed();
     mach_cpu_times(&ticks, ms_per_clock_tick())
         .into_iter()
         .map(|times| CpuInfo {
             model: model.clone(),
-            speed,
+            speed: *speed,
             times,
         })
         .collect()
@@ -12192,13 +12189,12 @@ fn ms_per_clock_tick() -> u64 {
 /// every platform before #441.
 #[cfg(not(any(windows, target_os = "linux", target_vendor = "apple")))]
 fn cpu_info() -> Vec<CpuInfo> {
-    let model = sysinfo_cpu_model();
-    let speed = sysinfo_cpu_speed_mhz();
+    let (model, speed) = sysinfo_cpu_model_and_speed();
     let count = std::thread::available_parallelism().map_or(1, |n| n.get());
     (0..count)
         .map(|_| CpuInfo {
             model: model.clone(),
-            speed,
+            speed: *speed,
             times: CpuTimes::default(),
         })
         .collect()

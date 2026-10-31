@@ -24,8 +24,10 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   milliseconds: Windows reads `SystemProcessorPerformanceInformation` (system time is kernel time
   minus idle; `nice` is 0), Linux the `cpuN` lines of `/proc/stat`, macOS `host_processor_info`
   (`irq` is 0). The entry count is the OS's online CPU list, as in node, where it used to be the
-  `os.availableParallelism()` count (on Linux the affinity- and cgroup-aware one), and `model` and
-  `speed` are read per CPU. `os.availableParallelism()` itself is unchanged.
+  `os.availableParallelism()` count (on Linux the affinity- and cgroup-aware one). On Windows and
+  Linux `model` and `speed` are read per CPU (macOS exposes one brand string and one frequency, as
+  in node), and on Windows the model is the registry string verbatim, no longer trimmed, as node
+  reports it. `os.availableParallelism()` itself is unchanged.
 - **`os.loadavg()` returns the real load averages on Linux and macOS (#441).** It was `[0, 0, 0]`
   everywhere; it stays so on Windows, where node reports zeros too.
 - **`undici.fetch` decodes `content-encoding: zstd`, as undici 7.11 and later do (#443).** oam
