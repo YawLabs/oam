@@ -556,6 +556,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("osTotalMem", op_os_total_mem),
         ("osFreeMem", op_os_free_mem),
         ("osLoadavg", op_os_loadavg),
+        ("osUptime", op_os_uptime),
         ("osGetPriority", op_os_get_priority),
         ("osSetPriority", op_os_set_priority),
         // v8 heap / process memory
@@ -12223,6 +12224,67 @@ fn load_average() -> [f64; 3] {
 fn load_average() -> [f64; 3] {
     let avg = sysinfo::System::load_average();
     [avg.one, avg.five, avg.fifteen]
+}
+
+/// `os.uptime()`: seconds since the system booted, as libuv's `uv_uptime`
+/// reports them -- not this process's uptime, which is `process.uptime()`
+/// (`op_uptime_ms`) and was what this answered before.
+fn op_os_uptime(
+    _scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    rv.set_double(system_uptime_secs());
+}
+
+/// Windows: `GetTickCount64() / 1000.0` (libuv src/win/util.c), so the value
+/// carries the millisecond fraction node reports.
+#[cfg(windows)]
+fn system_uptime_secs() -> f64 {
+    // ABI: the signature matches the kernel32 ABI (GetTickCount64 takes no
+    // arguments and returns the 64-bit millisecond tick count).
+    unsafe extern "system" {
+        fn GetTickCount64() -> u64;
+    }
+    // SAFETY: GetTickCount64 takes no arguments, touches no caller memory and
+    // cannot fail; it reads the kernel's tick counter.
+    let ms = unsafe { GetTickCount64() };
+    ms as f64 / 1000.0
+}
+
+/// Linux: /proc/uptime's first field, with its fraction (libuv src/unix/linux.c
+/// reads it first because CLOCK_BOOTTIME is wrong under some containers);
+/// sysinfo's whole seconds when /proc is not there.
+#[cfg(target_os = "linux")]
+fn system_uptime_secs() -> f64 {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+        .unwrap_or_else(|| sysinfo::System::uptime() as f64)
+}
+
+/// macOS and other unix: now minus the kernel's boot time in whole seconds,
+/// the arithmetic libuv's darwin `uv_uptime` does on `KERN_BOOTTIME`, through
+/// sysinfo's safe wrapper.
+#[cfg(not(any(windows, target_os = "linux")))]
+fn system_uptime_secs() -> f64 {
+    sysinfo::System::uptime() as f64
+}
+
+#[cfg(test)]
+mod os_uptime_tests {
+    use super::*;
+
+    #[test]
+    fn system_uptime_is_positive_and_not_this_process_s() {
+        let up = system_uptime_secs();
+        assert!(up.is_finite() && up > 0.0, "uptime {up}");
+        // The machine booted before this test binary started, by far more
+        // than a second; the process clock (`START`) is what the old code
+        // answered with.
+        let process = START.get_or_init(Instant::now).elapsed().as_secs_f64();
+        assert!(up > process + 1.0, "system {up} vs process {process}");
+    }
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]

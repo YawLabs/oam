@@ -5874,7 +5874,9 @@
       cpus: () => natives.cpuInfo() ?? [],
       totalmem: () => natives.osTotalMem(),
       freemem: () => natives.osFreeMem(),
-      uptime: () => natives.uptimeMs() / 1000,
+      // libuv's uv_uptime: seconds since the system booted, not since this
+      // process started (that is process.uptime()).
+      uptime: () => natives.osUptime(),
       // libuv's uv_loadavg: zeros on Windows ("Can't be implemented"), the
       // real 1/5/15 minute averages on unix.
       loadavg: () => natives.osLoadavg() ?? [0, 0, 0],
