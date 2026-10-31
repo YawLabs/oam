@@ -38858,6 +38858,297 @@ catch (e) {
     );
 }
 
+/// Record `source` under oam, pick the one recorded op `select` matches, and
+/// replay the trace once per `(tag, outcome)` with that op's outcome swapped
+/// for `outcome`. Returns each replay's trimmed stdout. Replay feeds the
+/// recorded completion to the live engine, so this drives the real native
+/// rejection and the JS that shapes it with a chosen outcome; the replayer
+/// falls back to the live op if an outcome does not parse, which is why
+/// callers assert values the live op could not produce.
+fn replay_with_outcomes(
+    tag: &str,
+    source: &str,
+    select: impl Fn(&serde_json::Value) -> bool,
+    outcomes: &[(&str, serde_json::Value)],
+) -> Vec<String> {
+    let script = write_temp(&format!("{tag}.mjs"), source);
+    let trace = write_temp(&format!("{tag}.jsonl"), "");
+    let run = |args: &[&str]| {
+        let out = oam(args);
+        assert!(
+            out.status.success(),
+            "exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    run(&[
+        "run",
+        "--record",
+        trace.to_str().unwrap(),
+        script.to_str().unwrap(),
+        "--no-check",
+    ]);
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let picked: Vec<usize> = (0..events.len())
+        .filter(|&i| {
+            events[i]["type"] == "Op"
+                && events[i]["outcome_json"]
+                    .as_str()
+                    .and_then(|o| serde_json::from_str::<serde_json::Value>(o).ok())
+                    .is_some_and(|o| select(&o))
+        })
+        .collect();
+    assert_eq!(picked.len(), 1, "exactly one op matches: {events:?}");
+    outcomes
+        .iter()
+        .map(|(name, outcome)| {
+            let mut edited = events.clone();
+            edited[picked[0]]["outcome_json"] = serde_json::to_string(outcome).unwrap().into();
+            let body: String = edited
+                .iter()
+                .map(|e| format!("{}\n", serde_json::to_string(e).unwrap()))
+                .collect();
+            let file = write_temp(&format!("{tag}.{name}.jsonl"), &body);
+            run(&[
+                "run",
+                "--replay",
+                file.to_str().unwrap(),
+                script.to_str().unwrap(),
+                "--no-check",
+            ])
+        })
+        .collect()
+}
+
+/// A pipe server's listen failure that carries a Win32 code: node's
+/// uvExceptionWithHostPort shape (code, errno, syscall, address, then port
+/// -1, which every server class adds in JS) with `winError` still the LAST
+/// own property (#450). The port used to be added after the factory had
+/// defined `winError`, which put it second to last. Every OS: the recorded
+/// EADDRINUSE of a second listen on the same pipe is replayed as an UNKNOWN.
+#[test]
+fn a_pipe_listen_error_keeps_win_error_last_after_the_port() {
+    let outputs = replay_with_outcomes(
+        "pipe_listen_win_error",
+        r"
+import net from 'node:net';
+const p = process.platform === 'win32' ? '\\\\?\\pipe\\oam-e2e-listen-' + process.pid : '/tmp/oam-e2e-listen-' + process.pid + '.sock';
+const a = net.createServer();
+a.listen(p, () => {
+  const b = net.createServer();
+  b.on('error', (e) => {
+    const d = Object.getOwnPropertyDescriptor(e, 'winError');
+    const flags = d ? (d.writable ? 'w' : '-') + (d.enumerable ? 'e' : '-') + (d.configurable ? 'c' : '-') : 'absent';
+    console.log([e.code, e.errno, e.port, String(e.winError), flags, JSON.stringify(Object.keys(e)),
+      JSON.stringify(Object.getOwnPropertyNames(e))].join(' | '));
+    a.close();
+  });
+  b.listen(p);
+});
+",
+        |o| o["NodeFailed"]["syscall"] == "listen",
+        &[
+            ("with", {
+                serde_json::json!({"NodeFailed": {
+                    "code": "UNKNOWN", "message": "listen UNKNOWN: unknown error pipe",
+                    "syscall": "listen", "errno": -4094, "address": "pipe", "win_error": 536,
+                }})
+            }),
+            ("without", {
+                serde_json::json!({"NodeFailed": {
+                    "code": "UNKNOWN", "message": "listen UNKNOWN: unknown error pipe",
+                    "syscall": "listen", "errno": -4094, "address": "pipe",
+                }})
+            }),
+        ],
+    );
+    assert_eq!(
+        outputs,
+        [
+            r#"UNKNOWN | -4094 | -1 | 536 | w-c | ["code","errno","syscall","address","port"] | ["stack","message","code","errno","syscall","address","port","winError"]"#,
+            r#"UNKNOWN | -4094 | -1 | undefined | absent | ["code","errno","syscall","address","port"] | ["stack","message","code","errno","syscall","address","port"]"#,
+        ]
+    );
+}
+
+/// A connect whose every address fails rejects with node's AggregateError;
+/// each child is built through the same factory as a single failure, so a
+/// child with a Win32 code behind its UNKNOWN carries its own non-enumerable
+/// `winError` and a named-code sibling none, and the aggregate itself none
+/// (#450). Every OS: whatever the recorded connect failed with is replayed as
+/// a two-child aggregate.
+#[test]
+fn an_aggregate_connect_failure_keeps_each_childs_win_error() {
+    let outputs = replay_with_outcomes(
+        "aggregate_win_error",
+        r"
+import net from 'node:net';
+const srv = net.createServer().listen(0, '127.0.0.1', () => {
+  const port = srv.address().port;
+  srv.close(() => {
+    net.connect(port, 'localhost').on('error', (e) => {
+      const child = (c) => {
+        const d = Object.getOwnPropertyDescriptor(c, 'winError');
+        const flags = d ? (d.writable ? 'w' : '-') + (d.enumerable ? 'e' : '-') + (d.configurable ? 'c' : '-') : 'absent';
+        return [c.code, String(c.winError), flags, JSON.stringify(Object.getOwnPropertyNames(c))].join(' ');
+      };
+      console.log([e.constructor.name, e.code, Object.hasOwn(e, 'winError'), ...(e.errors || []).map(child)].join(' | '));
+    });
+  });
+});
+",
+        |o| o.get("NodeFailed").is_some() || o.get("NodeAggregateFailed").is_some(),
+        &[(
+            "agg",
+            serde_json::json!({"NodeAggregateFailed": {"errors": [
+                {"code": "UNKNOWN", "message": "connect UNKNOWN ::1:1", "errno": -4094,
+                 "syscall": "connect", "address": "::1", "port": 1, "win_error": 10041},
+                {"code": "ECONNREFUSED", "message": "connect ECONNREFUSED 127.0.0.1:1", "errno": -4078,
+                 "syscall": "connect", "address": "127.0.0.1", "port": 1},
+            ]}}),
+        )],
+    );
+    assert_eq!(
+        outputs,
+        [
+            r#"AggregateError | UNKNOWN | false | UNKNOWN 10041 w-c ["stack","message","errno","code","syscall","address","port","winError"] | ECONNREFUSED undefined absent ["stack","message","errno","code","syscall","address","port"]"#
+        ]
+    );
+}
+
+/// A UNC path to a share that does not exist fails with ERROR_BAD_NET_NAME
+/// (67), which libuv's table does not name: node v22.22.2 reports UNKNOWN,
+/// -4094 on every fs path. This pins oam's `winError` 67 on each kind of
+/// producer with a PATH -- the sync natives (one path, two paths), the
+/// hand-built accessSync error, the JS rebuilds (process.chdir, fs.watch's
+/// start, cpSync and fs.promises.cp), a real async rejection (fs.promises)
+/// and a callback -- after node's own names, which are asserted as node
+/// gives them (chdir's errno now first, as node's uvException assigns it).
+/// The host decides whether the trigger works: skipped with a reason unless
+/// std's own metadata call gets 67.
+#[cfg(windows)]
+#[test]
+fn a_unc_failure_keeps_its_win32_code_on_every_path() {
+    let bad = r"\\localhost\nosuchshare\x";
+    match std::fs::metadata(bad) {
+        Err(e) if e.raw_os_error() == Some(67) => {}
+        other => {
+            eprintln!("skipping: {bad} gives {other:?} on this host, not ERROR_BAD_NET_NAME");
+            return;
+        }
+    }
+    let stdout = run_ok(
+        "unc_win_error.mjs",
+        r"
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+const bad = '\\\\localhost\\nosuchshare\\x';
+const sh = (l, e) => {
+  const d = Object.getOwnPropertyDescriptor(e, 'winError');
+  const flags = d ? (d.writable ? 'w' : '-') + (d.enumerable ? 'e' : '-') + (d.configurable ? 'c' : '-') : 'absent';
+  console.log([l, e.code, e.errno, e.syscall, String(e.winError), flags, JSON.stringify(Object.getOwnPropertyNames(e))].join(' | '));
+};
+const t = (l, f) => { try { f(); console.log(l, 'ok'); } catch (e) { sh(l, e); } };
+t('statSync', () => fs.statSync(bad));
+t('accessSync', () => fs.accessSync(bad));
+t('copyFileSync', () => fs.copyFileSync(bad, bad + '2'));
+t('chdir', () => process.chdir(bad));
+t('watch', () => fs.watch(bad));
+t('cpSync', () => fs.cpSync(bad, bad + '2'));
+for (const [l, f] of [['p.stat', () => fsp.stat(bad)], ['p.copyFile', () => fsp.copyFile(bad, bad + '2')], ['p.cp', () => fsp.cp(bad, bad + '2')]]) {
+  try { await f(); console.log(l, 'ok'); } catch (e) { sh(l, e); }
+}
+await new Promise((r) => fs.stat(bad, (e) => { sh('cb.stat', e); r(); }));
+",
+    );
+    let one = r#"["stack","message","errno","code","syscall","path","winError"]"#;
+    let two = r#"["stack","message","errno","code","syscall","path","dest","winError"]"#;
+    let want = [
+        format!("statSync | UNKNOWN | -4094 | stat | 67 | w-c | {one}"),
+        format!("accessSync | UNKNOWN | -4094 | access | 67 | w-c | {one}"),
+        format!("copyFileSync | UNKNOWN | -4094 | copyfile | 67 | w-c | {two}"),
+        format!("chdir | UNKNOWN | -4094 | chdir | 67 | w-c | {two}"),
+        r#"watch | UNKNOWN | -4094 | watch | 67 | w-c | ["stack","message","errno","syscall","code","path","filename","winError"]"#.to_string(),
+        format!("cpSync | UNKNOWN | -4094 | lstat | 67 | w-c | {one}"),
+        format!("p.stat | UNKNOWN | -4094 | stat | 67 | w-c | {one}"),
+        format!("p.copyFile | UNKNOWN | -4094 | copyfile | 67 | w-c | {two}"),
+        format!("p.cp | UNKNOWN | -4094 | lstat | 67 | w-c | {one}"),
+        format!("cb.stat | UNKNOWN | -4094 | stat | 67 | w-c | {one}"),
+    ];
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        want,
+        "stdout:\n{stdout}"
+    );
+}
+
+/// The fatal report names the Win32 code for every way an UNKNOWN can end
+/// the program, not only an unheard stream 'error': an uncaught synchronous
+/// throw (reported through fatal_report, which ends with oam's version
+/// banner) and an unhandled rejection (OAM-RT0004, whose reason is rendered
+/// through the same formatter by another caller and has no banner). One line
+/// each, right after the inspected error. Skipped like the UNC test above
+/// where the host does not answer 67.
+#[cfg(windows)]
+#[test]
+fn every_fatal_unknown_report_names_its_win32_code() {
+    let bad = r"\\localhost\nosuchshare\x";
+    if !matches!(std::fs::metadata(bad), Err(e) if e.raw_os_error() == Some(67)) {
+        eprintln!("skipping: {bad} does not give ERROR_BAD_NET_NAME on this host");
+        return;
+    }
+    let line = "winError: 67 (oam: the Win32 error code behind UNKNOWN)";
+    for (tag, src) in [
+        (
+            "thrown",
+            "import fs from 'node:fs';\nsetTimeout(() => fs.statSync('\\\\\\\\localhost\\\\nosuchshare\\\\x'));\n",
+        ),
+        (
+            "rejected",
+            "import fsp from 'node:fs/promises';\nfsp.stat('\\\\\\\\localhost\\\\nosuchshare\\\\x');\nsetTimeout(() => {}, 200);\n",
+        ),
+    ] {
+        let script = write_temp(&format!("fatal_unknown_{tag}.mjs"), src);
+        let out = oam(&["run", script.to_str().unwrap(), "--no-check"]);
+        let stderr = String::from_utf8_lossy(&out.stderr).replace("\r\n", "\n");
+        assert_eq!(out.status.code(), Some(1), "{tag}: stderr:\n{stderr}");
+        let lines: Vec<&str> = stderr.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| *l == line)
+            .unwrap_or_else(|| panic!("{tag}: no winError line; stderr:\n{stderr}"));
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("winError")).count(),
+            1,
+            "{tag}: stderr:\n{stderr}"
+        );
+        assert!(
+            lines[..at].iter().any(|l| l.contains("UNKNOWN")),
+            "{tag}: stderr:\n{stderr}"
+        );
+        // Right after the inspected error, whose block closes the line before.
+        assert_eq!(lines[at - 1], "}", "{tag}: stderr:\n{stderr}");
+        let rest: Vec<&str> = lines[at + 1..]
+            .iter()
+            .copied()
+            .filter(|l| !l.is_empty())
+            .collect();
+        match tag {
+            "thrown" => assert!(
+                rest.first().is_some_and(|l| l.starts_with("oam v")),
+                "{tag}: stderr:\n{stderr}"
+            ),
+            _ => assert!(rest.is_empty(), "{tag}: stderr:\n{stderr}"),
+        }
+    }
+}
+
 #[test]
 fn an_async_rejection_keeps_the_win32_code_through_replay() {
     let script = write_temp(
