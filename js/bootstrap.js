@@ -4742,7 +4742,7 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       const reg = globalThis.__oamNode;
       const util = reg && typeof reg.get === "function" ? reg.get("util") : null;
       if (util && typeof util.inspect === "function") {
-        return util.inspect(err, { colors: false, depth: 2 });
+        return util.inspect(err, { colors: false, depth: 2 }) + winErrorLine(err);
       }
     } catch {
       // fall through to the stack
@@ -4757,6 +4757,29 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     } catch {
       return "<unprintable exception>";
     }
+  }
+  // oam's one line past node's report, after inspect's body and before the
+  // version banner: the Win32 code behind an `UNKNOWN` system error, kept on
+  // the error as a non-enumerable `winError` (#442, docs/node-divergences.md
+  // #59). inspect prints enumerable keys, so without this the code the
+  // property exists to preserve would be missing exactly where the failure is
+  // first seen -- an unhandled 'error' on stdout. Only oam's own shape earns
+  // the line: code UNKNOWN and a numeric winError, as keep_win32_code and
+  // carryWinError define it, never a program's own property of that name.
+  function winErrorLine(err) {
+    try {
+      if (
+        err !== null &&
+        typeof err === "object" &&
+        err.code === "UNKNOWN" &&
+        typeof err.winError === "number"
+      ) {
+        return `\nwinError: ${err.winError} (oam: the Win32 error code behind UNKNOWN)`;
+      }
+    } catch {
+      // a thrown Proxy can trap the lookups
+    }
+    return "";
   }
   Object.defineProperty(globalThis, "__oamFormatFatal", {
     value: __oamFormatFatal,

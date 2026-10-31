@@ -2134,6 +2134,44 @@ pub fn node_error_code(error: &std::io::Error) -> &'static str {
     }
 }
 
+/// The Win32 code behind a system error node can only call `UNKNOWN`: the raw
+/// code (`GetLastError` / `WSAGetLastError`, as winerror.h writes it) when
+/// libuv's table has no row for it; `None` for every named code, and off
+/// Windows.
+///
+/// `UNKNOWN` says only that libuv has no name for the code, and the code is
+/// then the one clue to a failure nobody can reproduce (#442: a console write
+/// that died `UNKNOWN: unknown error, write`). The engine hangs it on the
+/// error as a non-enumerable `winError` (`keep_win32_code`,
+/// docs/node-divergences.md #59), so node's shape -- `errno`, `code`,
+/// `syscall`, `message`, `Object.keys` -- is as it was. `code` is the caller's,
+/// not derived here again: `fd_error_code` rewrites a PermissionDenied to
+/// EBADF, and that error carries no code worth keeping.
+///
+/// Two raw values are not Win32 codes and are refused: 0, NO_ERROR, which
+/// `windows_error_code` also calls UNKNOWN but which names no failure; and
+/// `UV_UNKNOWN` itself, oam's stand-in for libuv's own UV_UNKNOWN
+/// (`as_the_crt_takes_it`, the `\\.\mailslot` open), which reported as a Win32
+/// code would be a libuv errno in disguise. Everything else is the DWORD the
+/// OS set, the HRESULT-shaped ones std stores negative included.
+pub fn unknown_win32_error(code: &str, error: &std::io::Error) -> Option<u32> {
+    #[cfg(windows)]
+    {
+        if code != "UNKNOWN" {
+            return None;
+        }
+        match error.raw_os_error()? {
+            0 | UV_UNKNOWN => None,
+            raw => Some(raw as u32),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (code, error);
+        None
+    }
+}
+
 /// The node code for a raw unix errno: the name libuv gives it. Only codes
 /// libuv names are listed, and only one spelling of an alias (EAGAIN, not
 /// EWOULDBLOCK; ENOTSUP, not EOPNOTSUPP, which is the same number on Linux).
@@ -4721,14 +4759,16 @@ pub fn fd_error_code(error: &std::io::Error) -> &'static str {
 /// fs.access semantics: existence always; W_OK (mode & 2) additionally
 /// requires the file not be read-only — Node throws EPERM on Windows for
 /// W_OK against a read-only file, and programs gate writes on exactly this
-/// call. X_OK is approximated as existence (wave 1). Err is (code, message).
-/// Node's `fs.access`. On failure returns (code, message, errno).
+/// call. X_OK is approximated as existence (wave 1).
+/// Node's `fs.access`. On failure returns (code, message, errno, and the Win32
+/// code behind an `UNKNOWN` -- `unknown_win32_error` -- or `None`).
 ///
 /// The errno rides along because both callers need it to build node's system-
 /// error shape and only this function still holds the `io::Error` it came
 /// from. Without it `fs.access`/`fs.promises.access` rejected with no `errno`
 /// at all (and the async form with no `syscall` or `path` either), where every
-/// sibling fs op carries all four.
+/// sibling fs op carries all four. The Win32 code rides along for the same
+/// reason (#442); the sync caller keeps it, the async one does not yet.
 ///
 /// The message names the path as `path.shown()` reports it, and so must the
 /// caller's `path` property.
@@ -4737,7 +4777,10 @@ pub fn fd_error_code(error: &std::io::Error) -> &'static str {
 /// (GetFileAttributesW, which does not follow a link -- a dangling one is
 /// accessible), and W_OK refused only for a read-only FILE (directories
 /// cannot be read-only on Windows, libuv says).
-pub fn check_access(path: &FsPath, mode: i32) -> Result<(), (String, String, Option<i32>)> {
+pub fn check_access(
+    path: &FsPath,
+    mode: i32,
+) -> Result<(), (String, String, Option<i32>, Option<u32>)> {
     let shown = path.shown();
     let failed = |e: std::io::Error| {
         let code = node_error_code(&e);
@@ -4745,6 +4788,7 @@ pub fn check_access(path: &FsPath, mode: i32) -> Result<(), (String, String, Opt
             code.to_string(),
             node_error_message(code, "access", &shown, &e),
             node_errno(code, &e),
+            unknown_win32_error(code, &e),
         )
     };
     #[cfg(windows)]
@@ -4768,6 +4812,7 @@ pub fn check_access(path: &FsPath, mode: i32) -> Result<(), (String, String, Opt
             // Synthesised (no io::Error behind it): the libuv numbers node
             // reports for these two.
             Some(if cfg!(windows) { -4048 } else { -13 }),
+            None,
         ));
     }
     Ok(())
@@ -6835,7 +6880,10 @@ pub mod ops {
     pub async fn fs_access(path: super::FsPath, mode: i32) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || match super::check_access(&path, mode) {
             Ok(()) => OpOutcome::Done,
-            Err((code, message, errno)) => {
+            // The Win32 code behind an UNKNOWN is dropped here: `NodeFailed`
+            // does not carry one yet (the async half of #442 is a follow-up;
+            // the sync accessSync keeps it).
+            Err((code, message, errno, _win_error)) => {
                 let shown = path.shown();
                 OpOutcome::node_failed_at(code, message, "access", Some(&*shown), errno)
             }
@@ -8298,6 +8346,70 @@ mod os_error_code_tests {
         std::io::Error::from_raw_os_error(code as i32)
     }
 
+    /// `unknown_win32_error` (#442): the raw code rides along exactly when
+    /// libuv's table says UNKNOWN and the code is a real one. ERROR_PIPE_LISTENING
+    /// is a WriteFile on a named pipe's server end before any client opened it
+    /// (the e2e's trigger); ERROR_EXE_MACHINE_TYPE_MISMATCH a spawn of a binary
+    /// built for another architecture. libuv names neither.
+    #[cfg(windows)]
+    #[test]
+    fn an_unknown_code_keeps_its_win32_number() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_EXE_MACHINE_TYPE_MISMATCH, ERROR_PIPE_LISTENING,
+        };
+        for win32 in [ERROR_PIPE_LISTENING, ERROR_EXE_MACHINE_TYPE_MISMATCH] {
+            let e = raw(win32);
+            let code = node_error_code(&e);
+            assert_eq!(code, "UNKNOWN");
+            assert_eq!(unknown_win32_error(code, &e), Some(win32));
+        }
+        // A code libuv names: the name says it all, nothing rides along.
+        let denied = raw(ERROR_ACCESS_DENIED);
+        assert_eq!(node_error_code(&denied), "EPERM");
+        assert_eq!(unknown_win32_error("EPERM", &denied), None);
+        // The caller's code decides, not the table's: fd_error_code's EBADF for
+        // a wrong-mode descriptor keeps nothing.
+        assert_eq!(
+            unknown_win32_error("EBADF", &raw(ERROR_PIPE_LISTENING)),
+            None
+        );
+        // oam's own UV_UNKNOWN stand-in (the mailslot open) and NO_ERROR are
+        // not Win32 codes; neither is an error with no OS code behind it.
+        let sentinel = std::io::Error::from_raw_os_error(UV_UNKNOWN);
+        assert_eq!(node_error_code(&sentinel), "UNKNOWN");
+        assert_eq!(unknown_win32_error("UNKNOWN", &sentinel), None);
+        assert_eq!(unknown_win32_error("UNKNOWN", &raw(0)), None);
+        assert_eq!(
+            unknown_win32_error("UNKNOWN", &std::io::Error::other("x")),
+            None
+        );
+        // An HRESULT-shaped code, which std stores negative, comes back as the
+        // DWORD winerror.h documents.
+        let hresult = std::io::Error::from_raw_os_error(0x8007_0005_u32 as i32);
+        assert_eq!(node_error_code(&hresult), "UNKNOWN");
+        assert_eq!(unknown_win32_error("UNKNOWN", &hresult), Some(0x8007_0005));
+        // An unlisted Winsock code goes the same way: the WSA arm of the table
+        // has no row for WSAEPROTOTYPE, and the Win32 arm none either.
+        use windows_sys::Win32::Networking::WinSock::WSAEPROTOTYPE;
+        let wsa = std::io::Error::from_raw_os_error(WSAEPROTOTYPE);
+        assert_eq!(node_error_code(&wsa), "UNKNOWN");
+        assert_eq!(
+            unknown_win32_error("UNKNOWN", &wsa),
+            Some(WSAEPROTOTYPE as u32)
+        );
+    }
+
+    /// Off Windows there is no Win32 code to keep, whatever the raw errno, and
+    /// `node_error_code` never says UNKNOWN for one anyway.
+    #[cfg(not(windows))]
+    #[test]
+    fn no_win32_code_off_windows() {
+        let e = std::io::Error::from_raw_os_error(536);
+        assert_eq!(unknown_win32_error("UNKNOWN", &e), None);
+        assert_ne!(node_error_code(&e), "UNKNOWN");
+        assert_eq!(unknown_win32_error(node_error_code(&e), &e), None);
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_codes_follow_libuv() {
@@ -8311,6 +8423,9 @@ mod os_error_code_tests {
             (ERROR_PIPE_BUSY, "EBUSY"),
             (ERROR_BAD_EXE_FORMAT, "EFTYPE"),
             (ERROR_EXE_MACHINE_TYPE_MISMATCH, "UNKNOWN"),
+            // A WriteFile on a named pipe's server end before any client has
+            // opened it: the e2e trigger for #442, in neither of libuv's tables.
+            (ERROR_PIPE_LISTENING, "UNKNOWN"),
             (ERROR_ELEVATION_REQUIRED, "EACCES"),
             (ERROR_CANT_ACCESS_FILE, "EACCES"),
             (ERROR_FILE_NOT_FOUND, "ENOENT"),
