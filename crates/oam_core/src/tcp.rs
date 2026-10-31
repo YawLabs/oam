@@ -803,6 +803,7 @@ fn listen_error(error: &std::io::Error, address: &str, port: u16) -> NodeSysErro
         hostname: None,
         address: Some(address.to_string()),
         port: (port > 0).then_some(port),
+        win_error: crate::unknown_win32_error(code, error),
     }
 }
 
@@ -824,13 +825,7 @@ pub(crate) fn errno_failure(error: &std::io::Error, syscall: &str) -> OpOutcome 
     let code = node_error_code(error);
     // syscall + errno, but no `path`: a host:port is not a filesystem path,
     // and node does not put one on a net error.
-    OpOutcome::node_failed_at(
-        code,
-        format!("{syscall} {code}"),
-        syscall,
-        None,
-        node_errno(code, error),
-    )
+    OpOutcome::node_failed_io(code, format!("{syscall} {code}"), syscall, None, error)
 }
 
 /// net.connect / net.createConnection: establish a TCP client connection.

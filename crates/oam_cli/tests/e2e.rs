@@ -38629,6 +38629,346 @@ setTimeout(() => say('END'), 20);
     );
 }
 
+/// A spawn that fails with a Win32 code libuv's table does not name (#450).
+/// The program is `%SystemRoot%\SysWOW64\where.exe` (x86, PE32) with its COFF
+/// machine field rewritten to ARMNT: a machine type the loader knows and this
+/// Windows cannot run, so CreateProcessW fails ERROR_EXE_MACHINE_TYPE_MISMATCH
+/// (216). node v22.22.2 reports it as spawn() THROWING `spawn UNKNOWN` (errno
+/// -4094, code, syscall) and as spawnSync's `result.error`, `spawnSync <path>
+/// UNKNOWN` with path and spawnargs (measured with this fixture; every other
+/// rewritten machine type, on either architecture's where.exe, is
+/// ERROR_BAD_EXE_FORMAT, EFTYPE). oam reports the same shape and adds the code
+/// as a non-enumerable `winError` 216, last, carried through the spawn
+/// failure's JSON body and spawnSync's result record. A host with no SysWOW64,
+/// or one that runs ARM32 code, cannot stage the failure: the test says so on
+/// stderr and passes vacuously rather than guess at it. The `\\.\mailslot`
+/// open on fs.promises is the negative control: libuv's own UNKNOWN, no Win32
+/// code behind it, so no `winError` on the async path either.
+#[cfg(windows)]
+#[test]
+fn a_spawn_that_fails_with_an_unmapped_win32_error_keeps_the_code() {
+    const ERROR_EXE_MACHINE_TYPE_MISMATCH: i32 = 216;
+    let root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    let source = root.join("SysWOW64").join("where.exe");
+    let Ok(mut image) = std::fs::read(&source) else {
+        eprintln!("skipping: no {} on this host", source.display());
+        return;
+    };
+    // e_lfanew at 0x3c; the COFF Machine field sits 4 bytes past the PE
+    // signature it points at, the optional header's magic 24 past it.
+    let pe = u32::from_le_bytes([image[0x3c], image[0x3d], image[0x3e], image[0x3f]]) as usize;
+    let is_pe32_x86 = image.starts_with(b"MZ")
+        && image.get(pe..pe + 4) == Some(b"PE\0\0".as_slice())
+        && image.get(pe + 4..pe + 6) == Some(0x014cu16.to_le_bytes().as_slice())
+        && image.get(pe + 24..pe + 26) == Some(0x010bu16.to_le_bytes().as_slice());
+    if !is_pe32_x86 {
+        eprintln!("skipping: {} is not an x86 PE32 image", source.display());
+        return;
+    }
+    image[pe + 4..pe + 6].copy_from_slice(&0x01c4u16.to_le_bytes());
+    let exe = write_temp("wrong-machine.exe", "");
+    std::fs::write(&exe, &image).expect("patched image written");
+    // The host decides, not oam: only a loader that refuses the image with
+    // ERROR_EXE_MACHINE_TYPE_MISMATCH stages the UNKNOWN this test is about.
+    match std::process::Command::new(&exe).arg("/?").spawn() {
+        Err(e) if e.raw_os_error() == Some(ERROR_EXE_MACHINE_TYPE_MISMATCH) => {}
+        Err(e) => {
+            eprintln!("skipping: this host refuses the ARM32 image with {e}, not 216");
+            return;
+        }
+        Ok(mut child) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("skipping: this host runs ARM32 images");
+            return;
+        }
+    }
+    let exe_json = serde_json::to_string(exe.to_str().unwrap()).unwrap();
+    let module = write_temp("wrong-machine-child.mjs", "process.exit(0);\n");
+    let module_json = serde_json::to_string(module.to_str().unwrap()).unwrap();
+    let stdout = run_ok(
+        "spawn_unknown.mjs",
+        &format!(
+            r"
+import {{ fork, spawn, spawnSync }} from 'node:child_process';
+import fsp from 'node:fs/promises';
+const exe = {exe_json};
+const mod = {module_json};
+const hide = (s) => typeof s === 'string' ? s.replaceAll(exe, '<exe>').replaceAll(JSON.stringify(exe).slice(1, -1), '<exe>').replaceAll(JSON.stringify(mod).slice(1, -1), '<mod>') : s;
+const shape = (e) => e ? [e.code, e.errno, hide(e.syscall), hide(e.message), Object.keys(e).join(',')].join(' | ') : 'none';
+const kept = (e) => {{
+  const d = Object.getOwnPropertyDescriptor(e, 'winError');
+  const flags = d ? (d.writable ? 'w' : '-') + (d.enumerable ? 'e' : '-') + (d.configurable ? 'c' : '-') : 'absent';
+  // spawnargs is node's for spawn and spawnSync and oam's own argv for fork;
+  // its presence is the point, not its text.
+  const json = JSON.stringify(e, (k, v) => (k === 'spawnargs' && Array.isArray(v) ? 'array' : v));
+  return [String(e.winError), flags, JSON.stringify(Object.getOwnPropertyNames(e)), hide(json)].join(' | ');
+}};
+const r = spawnSync(exe, ['/?']);
+console.log('spawnSync: ' + shape(r.error) + ' | status ' + r.status);
+if (r.error) console.log('spawnSync kept: ' + kept(r.error));
+const a = spawnSync(exe, ['/?'], {{ argv0: 'renamed' }});
+console.log('spawnSync argv0: ' + shape(a.error));
+if (a.error) console.log('spawnSync argv0 kept: ' + kept(a.error));
+try {{ spawn(exe, ['/?']); console.log('spawn returned'); }}
+catch (e) {{ console.log('spawn threw: ' + shape(e)); console.log('spawn kept: ' + kept(e)); }}
+await new Promise((done) => {{
+  const cp = fork(mod, [], {{ execPath: exe, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] }});
+  cp.on('error', (e) => {{ console.log('fork emitted: ' + shape(e)); console.log('fork kept: ' + kept(e)); }});
+  cp.on('close', (code) => {{ console.log('fork close ' + code); done(); }});
+}});
+await new Promise((done) => spawn('oam-no-such-binary-450', []).on('error', (e) => {{
+  console.log('enoent: ' + [e.code, 'winError' in e, JSON.stringify(Object.getOwnPropertyNames(e))].join(' | ')); done();
+}}));
+try {{ await fsp.open('\\\\.\\mailslot', 'r'); console.log('mailslot opened'); }}
+catch (e) {{ console.log('mailslot: ' + [e.code, e.errno, e.syscall, 'winError' in e, JSON.stringify(Object.getOwnPropertyNames(e))].join(' | ')); }}
+"
+        ),
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    for want in [
+        // node's shape (measured), with the code kept.
+        "spawnSync: UNKNOWN | -4094 | spawnSync <exe> | spawnSync <exe> UNKNOWN | errno,code,syscall,path,spawnargs | status null",
+        r#"spawnSync kept: 216 | w-c | ["stack","message","errno","code","syscall","path","spawnargs","winError"] | {"errno":-4094,"code":"UNKNOWN","syscall":"spawnSync <exe>","path":"<exe>","spawnargs":"array"}"#,
+        // The argv0 form takes the raw CreateProcessW path and re-parses the
+        // JSON body; the code must survive that too.
+        "spawnSync argv0: UNKNOWN | -4094 | spawnSync <exe> | spawnSync <exe> UNKNOWN | errno,code,syscall,path,spawnargs",
+        r#"spawnSync argv0 kept: 216 | w-c | ["stack","message","errno","code","syscall","path","spawnargs","winError"] | {"errno":-4094,"code":"UNKNOWN","syscall":"spawnSync <exe>","path":"<exe>","spawnargs":"array"}"#,
+        "spawn threw: UNKNOWN | -4094 | spawn | spawn UNKNOWN | errno,code,syscall",
+        r#"spawn kept: 216 | w-c | ["stack","message","errno","code","syscall","winError"] | {"errno":-4094,"code":"UNKNOWN","syscall":"spawn"}"#,
+        // fork with an ipc slot: oam EMITS the failure where node throws it
+        // (docs row 59 records that split); the emitted error carries the code
+        // after spawnargs.
+        "fork emitted: UNKNOWN | -4094 | spawn <exe> | spawn <exe> UNKNOWN | errno,code,syscall,path,spawnargs",
+        r#"fork kept: 216 | w-c | ["stack","message","errno","code","syscall","path","spawnargs","winError"] | {"errno":-4094,"code":"UNKNOWN","syscall":"spawn <exe>","path":"<exe>","spawnargs":"array"}"#,
+        "fork close -4094",
+        // A named code keeps nothing; libuv's own UNKNOWN has no Win32 code.
+        r#"enoent: ENOENT | false | ["stack","message","errno","code","syscall","path","spawnargs"]"#,
+        r#"mailslot: UNKNOWN | -4094 | open | false | ["stack","message","errno","code","syscall","path"]"#,
+    ] {
+        assert!(lines.contains(&want), "missing {want:?}; stdout:\n{stdout}");
+    }
+    assert!(
+        !stdout.contains("spawn returned") && !stdout.contains("mailslot opened"),
+        "stdout:\n{stdout}"
+    );
+}
+
+/// The engine's own async path, end to end and on every OS (#450): an
+/// `OpOutcome::NodeFailed` with the Win32 code, handed to the live engine by
+/// record/replay. The trace of a failing `fs.promises.stat` is rewritten into
+/// the `UNKNOWN` a Win32 code libuv does not name would produce -- with
+/// `win_error` and, as a pre-#450 recording, without -- and replayed, so the
+/// NodeFailed arm, `SysFields`, `sys_error`'s record and the JS factory all
+/// run on the real rejection, which fs/promises then re-frames on the same
+/// object. No deterministic async UNKNOWN exists from JS alone; this is the
+/// one way to drive the path with a chosen outcome.
+/// The same through node:dns (#450, review of #451): a resolver failure whose
+/// WSA code libuv's getaddrinfo translation does not name is an UNKNOWN with
+/// the code kept on the native rejection, and the dns module rebuilds every
+/// rejection into node's DNSException shape (`_shapeDnsError`), which must
+/// carry the code over. A recorded failing `dns.promises.lookup` is rewritten
+/// into that UNKNOWN (with `win_error`, and without) and replayed, so the
+/// native path and the reshape both run; every OS.
+#[test]
+fn a_dns_rejection_keeps_the_win32_code_through_the_reshape() {
+    let script = write_temp(
+        "replay_dns_win_error.mjs",
+        r"
+import dns from 'node:dns';
+try { await dns.promises.lookup('no-such-host.invalid'); console.log('lookup resolved'); }
+catch (e) {
+  const d = Object.getOwnPropertyDescriptor(e, 'winError');
+  const flags = d ? (d.writable ? 'w' : '-') + (d.enumerable ? 'e' : '-') + (d.configurable ? 'c' : '-') : 'absent';
+  console.log([e.code, e.errno, e.syscall, e.message, String(e.winError), flags,
+    JSON.stringify(Object.keys(e)), JSON.stringify(Object.getOwnPropertyNames(e)), JSON.stringify(e)].join(' | '));
+}
+",
+    );
+    let trace = write_temp("replay_dns_win_error.jsonl", "");
+    let run = |args: &[&str]| {
+        let out = oam(args);
+        assert!(
+            out.status.success(),
+            "exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let recorded = run(&[
+        "run",
+        "--record",
+        trace.to_str().unwrap(),
+        script.to_str().unwrap(),
+        "--no-check",
+    ]);
+    assert!(recorded.contains(" | getaddrinfo | "), "{recorded}");
+    // The lookup's one Op event: whatever the host's resolver said (ENOTFOUND
+    // or EAI_AGAIN), make it the UNKNOWN an unlisted WSA code produces.
+    let ops: Vec<serde_json::Value> = std::fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let failed: Vec<usize> = (0..ops.len())
+        .filter(|&i| {
+            ops[i]["type"] == "Op"
+                && ops[i]["outcome_json"]
+                    .as_str()
+                    .is_some_and(|o| o.contains("NodeFailed"))
+        })
+        .collect();
+    assert_eq!(failed.len(), 1, "one failed op in the trace: {ops:?}");
+    let mut outcome: serde_json::Value =
+        serde_json::from_str(ops[failed[0]]["outcome_json"].as_str().unwrap()).unwrap();
+    outcome["NodeFailed"]["code"] = "UNKNOWN".into();
+    outcome["NodeFailed"]["errno"] = (-4094).into();
+    outcome["NodeFailed"]["message"] = "getaddrinfo UNKNOWN no-such-host.invalid".into();
+    let replay = |tag: &str, outcome: &serde_json::Value| {
+        let mut events = ops.clone();
+        events[failed[0]]["outcome_json"] = serde_json::to_string(outcome).unwrap().into();
+        let body: String = events
+            .iter()
+            .map(|e| format!("{}\n", serde_json::to_string(e).unwrap()))
+            .collect();
+        let edited = write_temp(&format!("replay_dns_win_error.{tag}.jsonl"), &body);
+        // The replayer falls back to the live op if an edited outcome fails to
+        // parse, so the UNKNOWN in the expected lines is what proves the
+        // rewrite took.
+        run(&[
+            "run",
+            "--replay",
+            edited.to_str().unwrap(),
+            script.to_str().unwrap(),
+            "--no-check",
+        ])
+    };
+    let mut with_code = outcome.clone();
+    with_code["NodeFailed"]["win_error"] = 10041.into();
+    assert_eq!(
+        replay("with", &with_code),
+        r#"UNKNOWN | -4094 | getaddrinfo | getaddrinfo UNKNOWN no-such-host.invalid | 10041 | w-c | ["errno","code","syscall","hostname"] | ["stack","message","errno","code","syscall","hostname","winError"] | {"errno":-4094,"code":"UNKNOWN","syscall":"getaddrinfo","hostname":"no-such-host.invalid"}"#
+    );
+    assert_eq!(
+        replay("without", &outcome),
+        r#"UNKNOWN | -4094 | getaddrinfo | getaddrinfo UNKNOWN no-such-host.invalid | undefined | absent | ["errno","code","syscall","hostname"] | ["stack","message","errno","code","syscall","hostname"] | {"errno":-4094,"code":"UNKNOWN","syscall":"getaddrinfo","hostname":"no-such-host.invalid"}"#
+    );
+}
+
+#[test]
+fn an_async_rejection_keeps_the_win32_code_through_replay() {
+    let script = write_temp(
+        "replay_win_error.mjs",
+        r"
+import fsp from 'node:fs/promises';
+try { await fsp.stat('missing-for-450'); console.log('stat resolved'); }
+catch (e) {
+  const d = Object.getOwnPropertyDescriptor(e, 'winError');
+  const flags = d ? (d.writable ? 'w' : '-') + (d.enumerable ? 'e' : '-') + (d.configurable ? 'c' : '-') : 'absent';
+  console.log([e.code, e.errno, String(e.winError), flags, JSON.stringify(Object.keys(e)),
+    JSON.stringify(Object.getOwnPropertyNames(e)), String(e.stack).includes('\n    at ')].join(' | '));
+}
+",
+    );
+    let trace = write_temp("replay_win_error.jsonl", "");
+    let run = |args: &[&str]| {
+        let out = oam(args);
+        assert!(
+            out.status.success(),
+            "exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let recorded = run(&[
+        "run",
+        "--record",
+        trace.to_str().unwrap(),
+        script.to_str().unwrap(),
+        "--no-check",
+    ]);
+    assert!(
+        recorded.starts_with("ENOENT | ") && recorded.contains(" | undefined | absent | "),
+        "{recorded}"
+    );
+    // The one Op event is the stat's NodeFailed; make it the UNKNOWN that a
+    // Win32 code libuv has no row for produces.
+    let line = std::fs::read_to_string(&trace).unwrap();
+    let mut event: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    let mut outcome: serde_json::Value =
+        serde_json::from_str(event["outcome_json"].as_str().unwrap()).unwrap();
+    let path = outcome["NodeFailed"]["path"].as_str().unwrap().to_string();
+    outcome["NodeFailed"]["code"] = "UNKNOWN".into();
+    outcome["NodeFailed"]["errno"] = (-4094).into();
+    outcome["NodeFailed"]["message"] = format!("UNKNOWN: unknown error, stat '{path}'").into();
+    let mut with_code = outcome.clone();
+    with_code["NodeFailed"]["win_error"] = 536.into();
+    let mut replay = |tag: &str, outcome: &serde_json::Value| {
+        event["outcome_json"] = serde_json::to_string(outcome).unwrap().into();
+        let edited = write_temp(
+            &format!("replay_win_error.{tag}.jsonl"),
+            &format!("{}\n", serde_json::to_string(&event).unwrap()),
+        );
+        run(&[
+            "run",
+            "--replay",
+            edited.to_str().unwrap(),
+            script.to_str().unwrap(),
+            "--no-check",
+        ])
+    };
+    assert_eq!(
+        replay("with", &with_code),
+        r#"UNKNOWN | -4094 | 536 | w-c | ["errno","code","syscall","path"] | ["stack","message","errno","code","syscall","path","winError"] | true"#
+    );
+    // A recording from before the field: the same error, nothing kept.
+    assert_eq!(
+        replay("without", &outcome),
+        r#"UNKNOWN | -4094 | undefined | absent | ["errno","code","syscall","path"] | ["stack","message","errno","code","syscall","path"] | true"#
+    );
+}
+
+/// The locked factory every async rejection is built through (`__oamMakeSysError`,
+/// js/bootstrap.js) carries the Win32 code the engine hands it (#450): a record
+/// with a numeric `winError` yields an error with that non-enumerable own
+/// property, last, and node's keys, JSON and class untouched; a record without
+/// one, or with a null, yields none. Called directly, as the factory test
+/// above calls it, since no deterministic Win32 UNKNOWN reaches an async fs
+/// op from JS; the spawn test covers the end-to-end path.
+#[test]
+fn async_rejections_keep_the_win32_code_the_factory_is_handed() {
+    let stdout = run_ok(
+        "factory_win_error.mjs",
+        r#"
+const rec = (o) => Object.assign(Object.create(null), o);
+const base = { message: 'UNKNOWN: unknown error, read', errno: -4094, code: 'UNKNOWN', syscall: 'read' };
+const kept = (e) => {
+  const d = Object.getOwnPropertyDescriptor(e, 'winError');
+  const flags = d ? (d.writable ? 'w' : '-') + (d.enumerable ? 'e' : '-') + (d.configurable ? 'c' : '-') : 'absent';
+  return [String(e.winError), flags, JSON.stringify(Object.keys(e)), JSON.stringify(Object.getOwnPropertyNames(e)), JSON.stringify(e), e.constructor === Error].join(' | ');
+};
+console.log('with: ' + kept(__oamMakeSysError(rec({ ...base, winError: 536 }))));
+console.log('without: ' + kept(__oamMakeSysError(rec(base))));
+console.log('null: ' + kept(__oamMakeSysError(rec({ ...base, winError: null }))));
+console.log('connect: ' + kept(__oamMakeSysError(rec({ message: 'connect UNKNOWN 127.0.0.1:1', errno: -4094, code: 'UNKNOWN', syscall: 'connect', address: '127.0.0.1', port: 1, winError: 10041 }))));
+"#,
+    );
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            r#"with: 536 | w-c | ["errno","code","syscall"] | ["stack","message","errno","code","syscall","winError"] | {"errno":-4094,"code":"UNKNOWN","syscall":"read"} | true"#,
+            r#"without: undefined | absent | ["errno","code","syscall"] | ["stack","message","errno","code","syscall"] | {"errno":-4094,"code":"UNKNOWN","syscall":"read"} | true"#,
+            r#"null: undefined | absent | ["errno","code","syscall"] | ["stack","message","errno","code","syscall"] | {"errno":-4094,"code":"UNKNOWN","syscall":"read"} | true"#,
+            r#"connect: 10041 | w-c | ["errno","code","syscall","address","port"] | ["stack","message","errno","code","syscall","address","port","winError"] | {"errno":-4094,"code":"UNKNOWN","syscall":"connect","address":"127.0.0.1","port":1} | true"#,
+        ],
+        "stdout:\n{stdout}"
+    );
+}
+
 /// The reader goes away another way: the pipe's server end disconnects
 /// (DisconnectNamedPipe). The writer's next WriteFile fails
 /// ERROR_PIPE_NOT_CONNECTED, which std does not call BrokenPipe but libuv

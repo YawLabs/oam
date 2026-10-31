@@ -19,21 +19,29 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 ### Added
 
 - **A Windows system error libuv's table cannot name carries its Win32 code as `err.winError`
-  (#442).** A stdout write that failed with a Win32 error libuv does not list was reported
+  (#442, #450).** A stdout write that failed with a Win32 error libuv does not list was reported
   `UNKNOWN: unknown error, write`, errno -4094, as node reports it, and nothing on the error said
-  which Win32 error it was. A system error oam builds synchronously -- the sync fs natives and the
-  stdout/stderr write failures -- now has a non-enumerable own `winError` with the raw code when
-  its `code` is `UNKNOWN` (536, `ERROR_PIPE_LISTENING`, for a write to a named pipe no client has
-  opened), and the report of an uncaught one, or of an unhandled rejection, gains a line naming it
-  before oam's version banner. `message`, `errno`,
-  `code`, `syscall`, `path`, `Object.keys(err)`, `JSON.stringify(err)` and `util.inspect(err)` are
-  node's as before; `err.winError`, `Object.getOwnPropertyNames(err)` and
-  `util.inspect(err, { showHidden: true })` show it. Windows only, and only where a Win32 code
-  exists: the `UNKNOWN` libuv itself reports for `\\.\mailslot` has none, and async rejections and
-  child-spawn failures do not carry it yet. See docs/node-divergences.md #59.
+  which Win32 error it was. A system error whose `code` is `UNKNOWN` now has a non-enumerable own
+  `winError` with the raw code (536, `ERROR_PIPE_LISTENING`, for a write to a named pipe no client
+  has opened), and the report of an uncaught one, or of an unhandled rejection, gains a line
+  naming it before oam's version banner. `message`, `errno`, `code`, `syscall`, `path`,
+  `Object.keys(err)`, `JSON.stringify(err)` and `util.inspect(err)` are node's as before;
+  `err.winError`, `Object.getOwnPropertyNames(err)` and `util.inspect(err, { showHidden: true })`
+  show it. It is on the errors the sync natives and the stdout/stderr write failures build (#442),
+  on the async rejections -- `fs.promises.*`, the callback fs ops, `fs.watch`, `net`, `dns`, `tls`,
+  `udp`, the http client's response-body read -- and on child-spawn failures (#450): `spawn()`'s
+  thrown `spawn UNKNOWN`, the `'error'` event's error and `spawnSync`'s `result.error` carry it last (216,
+  `ERROR_EXE_MACHINE_TYPE_MISMATCH`, for a program built for a machine this Windows cannot run).
+  Windows only, and only where a Win32 code exists: the `UNKNOWN` libuv itself reports for
+  `\\.\mailslot` has none. See docs/node-divergences.md #59.
 
 ### Fixed
 
+- **A dns error's own keys come in node's order: `errno`, `code`, `syscall`, `hostname`.** node's
+  DNSException assigns `errno` first and always, a number on the `dns.lookup` path and an own
+  `undefined` on the `resolve*` and `reverse` paths. oam assigned it last on the lookup path and
+  not at all on the others, so `Object.keys(err)` read `code, syscall, hostname, errno` or
+  `code, syscall, hostname`. Conformance case 579 pins it.
 - **`os.cpus()` reports each CPU's real `times`, as node's does (#441).** Every `times` field was 0 on
   every platform, so a sampler that differences two calls (`busy = 1 - idleDelta / totalDelta`)
   divided by zero and never read a value. The counters are now the ones libuv reports, in

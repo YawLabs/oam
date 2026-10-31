@@ -929,7 +929,7 @@ and leaves unhandled, which oam began reporting in #399 (it was silent, exit 0):
 code is node's, the report and the listener routing are not (conformance case 472 compares
 the status only). Not yet fixed; it needs its own change to the rejection path.
 
-### 59. Windows: a system error libuv can only call `UNKNOWN` carries its Win32 code as `err.winError` (#442)
+### 59. Windows: a system error libuv can only call `UNKNOWN` carries its Win32 code as `err.winError` (#442, #450)
 
 libuv translates a Win32 or Winsock error through `uv_translate_sys_error`'s table, and a
 code the table does not list becomes `UV_UNKNOWN`: node reports `UNKNOWN: unknown error,
@@ -941,38 +941,59 @@ opened fails `WriteFile` with `ERROR_PIPE_LISTENING` (536), and node and oam bot
 `UNKNOWN: unknown error, write`, errno -4094, own keys `errno, syscall, code`, to the write
 callback and the `'error'` event, exit 0 while the event is heard.
 
-A system error oam builds synchronously -- the sync fs natives, `fs.accessSync`, and the
-stdout and stderr write failures (`process.stdout.write`'s callback and `'error'` event,
-`fs.writeSync(1)`, `fs.write(1)`'s callback) -- carries the raw code as an own `winError`
-when, and only when, its `code` is `UNKNOWN` and a real Win32 code is behind it
-(`unknown_win32_error` in `crates/oam_core/src/lib.rs`, `keep_win32_code` in
-`crates/oam_engine/src/node_ops.rs`; `carryWinError` in js/node_compat.js for the re-wraps
-that rebuild an error from its fields). The property is non-enumerable, writable and
-configurable, and defined last, so `message`, `errno`, `code`, `syscall`, `path`,
-`Object.keys(err)`, `JSON.stringify(err)`, `assert.deepStrictEqual` and `util.inspect(err)`
-are node's as before, and node's own-name order is a prefix of oam's. `err.winError`,
-`Object.getOwnPropertyNames(err)`, `Object.getOwnPropertyDescriptor` and
+A system error whose `code` is `UNKNOWN` carries the raw code as an own `winError` when, and
+only when, a real Win32 code is behind it (`unknown_win32_error` in
+`crates/oam_core/src/lib.rs`). That is every producer oam has: the sync fs natives,
+`fs.accessSync` and the stdout and stderr write failures (`process.stdout.write`'s callback
+and `'error'` event, `fs.writeSync(1)`, `fs.write(1)`'s callback) through `keep_win32_code`
+in `crates/oam_engine/src/node_ops.rs` (#442); the async rejections -- `fs.promises.*`, the
+callback fs ops that go through ops, `fs.watch`'s running-failure error, `net`, `dns`,
+`tls`, `udp` and the http client's response-body read (`fetch`, `http.request`) -- through `OpOutcome::NodeFailed`'s and `NodeSysError`'s `win_error` and the
+`__oamMakeSysError` factory (`node_failed_io` builds it from the one `io::Error` the errno
+also comes from); and child-spawn failures through the spawn failure's JSON body and
+`spawnSync`'s result record (#450). The re-wraps that rebuild an error from its fields
+(`carryWinError` in js/node_compat.js) carry it over, node:dns's reshape of every resolver
+rejection into node's DNSException shape (`_shapeDnsError`) among them. The property is non-enumerable,
+writable and configurable, and defined last, so `message`, `errno`, `code`, `syscall`,
+`path`, `Object.keys(err)`, `JSON.stringify(err)`, `assert.deepStrictEqual` and
+`util.inspect(err)` are node's as before, and node's own-name order is a prefix of oam's.
+`err.winError`, `Object.getOwnPropertyNames(err)`, `Object.getOwnPropertyDescriptor` and
 `util.inspect(err, { showHidden: true })` (`[winError]: 536`) show it. The report of an
 uncaught one -- the unheard `'error'` on stdout that prompted #442 -- and of an unhandled
 rejection whose reason carries it, gains one line node's has not, after `util.inspect`'s
 body and before oam's version banner: `winError: 536 (oam: the Win32 error code behind
 UNKNOWN)`. A worker's fatal error reaches the parent's `'error'` event with the property,
 still non-enumerable, as node's error serialization would carry it; `postMessage` and
-`structuredClone` drop it, as they drop `errno` and `code` on both runtimes. The e2e tests
-pin the stdout and stderr write paths and the report
+`structuredClone` drop it, as they drop `errno` and `code` on both runtimes.
+
+Measured 2026-10-31 for the spawn path: `%SystemRoot%\SysWOW64\where.exe` with its PE machine
+field rewritten to ARM32, a type the loader knows and this Windows cannot run, fails
+`CreateProcessW` with `ERROR_EXE_MACHINE_TYPE_MISMATCH` (216); node v22.22.2 THROWS `spawn
+UNKNOWN` from `spawn()` (errno -4094, own keys `errno, code, syscall`) and puts `spawnSync
+<path> UNKNOWN` (keys `errno, code, syscall, path, spawnargs`) on `spawnSync`'s
+`result.error`. oam reports the same and adds `winError` 216 as the last own property
+(after `spawnargs` where there is one). One difference of oam's own on that path: with an
+`'ipc'` stdio slot, `fork()` included, oam EMITS the failure as the child's `'error'` event
+(with the code), then `'close'` with the errno, where node throws it from the call. By
+design: oam binds the ipc channel before the exec, so the failure lands after `spawn()` has
+returned, where a throw would escape into an event callback (the comments at `spawnExtra`
+and `fork` in js/node_compat.js). Conformance does not cover it.
+
+The e2e tests pin the stdout and stderr write paths and the report
 (`an_unknown_write_error_keeps_its_win32_code`,
 `an_unknown_stderr_write_error_keeps_its_win32_code`,
-`an_unheard_unknown_write_error_reports_its_win32_code`, crates/oam_cli/tests/e2e.rs);
-`fs.accessSync` and the other re-wraps go through the same two helpers, which unit tests
-pin on their own.
+`an_unheard_unknown_write_error_reports_its_win32_code`), the spawn path with the rewritten
+image (`a_spawn_that_fails_with_an_unmapped_win32_error_keeps_the_code`, skipped with a reason
+on a host that runs or refuses the image differently), and the engine's async path by
+replaying a recorded trace rewritten into such an error
+(`an_async_rejection_keeps_the_win32_code_through_replay`, every OS), crates/oam_cli/tests/e2e.rs;
+the factory alone by `async_rejections_keep_the_win32_code_the_factory_is_handed`.
 
 What still differs, and where the property is not: never on Linux or macOS, where `errno`
 is the raw number and oam never maps a raw errno to `UNKNOWN`. Absent where libuv itself
 has no Win32 code: an open of `\\.\mailslot`, which libuv reports as `UV_UNKNOWN` with no
-code behind it (conformance case 408). Not yet on async rejections (`fs.promises.*`, the
-callback fs ops that go through ops, `net`, `dns`, `tls`, `udp`) nor on child-spawn
-failures (`spawn UNKNOWN`, for one a binary built for another architecture,
-`ERROR_EXE_MACHINE_TYPE_MISMATCH`); those drop the code today and are a follow-up.
+code behind it (conformance case 408), a `spawnSync` whose wait failed (a message, no code),
+and the `UNKNOWN`-free coded failures (zlib, zstd, http2) that never had one.
 
 ---
 

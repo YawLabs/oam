@@ -40,6 +40,7 @@ fn connect_error_coded(
         hostname: None,
         address: Some(path.to_string()),
         port: None,
+        win_error: crate::unknown_win32_error(code, error),
     })
 }
 
@@ -62,6 +63,7 @@ pub(crate) fn listen_error(
         hostname: None,
         address: Some(path.to_string()),
         port: None,
+        win_error: crate::unknown_win32_error(code, error),
     })
 }
 

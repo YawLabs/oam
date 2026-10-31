@@ -4486,6 +4486,7 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
 (() => {
   const ErrorCtor = Error;
   const captureStackTrace = ErrorCtor.captureStackTrace;
+  const defineProperty = Object.defineProperty;
   const AggregateErrorCtor = AggregateError;
   const SymbolIterator = Symbol.iterator;
   const kIsNodeError = Symbol("kIsNodeError");
@@ -4533,6 +4534,17 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     if (fields.hostname !== undefined) err.hostname = fields.hostname;
     if (fields.address !== undefined) err.address = fields.address;
     if (fields.port) err.port = fields.port;
+    // The Win32 code behind an UNKNOWN (#442, #450): non-enumerable and last,
+    // so node's own-name order stays a prefix of oam's and Object.keys,
+    // JSON.stringify and deepStrictEqual see what node's see.
+    if (typeof fields.winError === "number") {
+      defineProperty(err, "winError", {
+        value: fields.winError,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+    }
     return err;
   }
 

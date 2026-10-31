@@ -1058,6 +1058,7 @@ fn settle_outcome(
             address,
             port,
             dest,
+            win_error,
         } => {
             let fields = SysFields {
                 code: &code,
@@ -1069,6 +1070,7 @@ fn settle_outcome(
                 hostname: hostname.as_deref(),
                 address: address.as_deref(),
                 port,
+                win_error,
             };
             let error = sys_error(tc, &fields);
             let error = v8::Local::new(tc, &error);
@@ -1099,6 +1101,7 @@ fn settle_outcome(
                 hostname: None,
                 address: None,
                 port: None,
+                win_error: None,
             };
             let error = sys_error(tc, &fields);
             let error = v8::Local::new(tc, &error);
@@ -1124,6 +1127,7 @@ fn settle_outcome(
                 address: None,
                 port: None,
                 dest: None,
+                win_error: None,
             };
             let error = sys_error(tc, &fields);
             let error = v8::Local::new(tc, &error);
@@ -1163,6 +1167,9 @@ struct SysFields<'a> {
     hostname: Option<&'a str>,
     address: Option<&'a str>,
     port: Option<u16>,
+    /// The Win32 code behind an `UNKNOWN` (#450): a non-enumerable `winError`
+    /// on the error, as the sync natives' `keep_win32_code` sets it.
+    win_error: Option<u32>,
 }
 
 impl<'a> SysFields<'a> {
@@ -1177,6 +1184,7 @@ impl<'a> SysFields<'a> {
             hostname: err.hostname.as_deref(),
             address: err.address.as_deref(),
             port: err.port,
+            win_error: err.win_error,
         }
     }
 }
@@ -1273,18 +1281,28 @@ fn sys_error(
             v8::Integer::new_from_unsigned(tc, u32::from(port)).into(),
         ));
     }
+    // The Win32 code behind an UNKNOWN (#450) is not one of node's properties:
+    // the factory gets it as one more record field and defines it
+    // non-enumerable, last; the fallback below does the same itself.
+    let win_error = fields
+        .win_error
+        .map(|win32| v8::Integer::new_from_unsigned(tc, win32));
 
     if let Some(factory) = locked_factory(tc, "__oamMakeSysError") {
         // A null-prototype record: the factory tests fields for presence, and
         // an Object.prototype a user script extended must not answer for an
         // absent one.
-        let mut names: Vec<v8::Local<v8::Name>> = Vec::with_capacity(props.len() + 1);
-        let mut values: Vec<v8::Local<v8::Value>> = Vec::with_capacity(props.len() + 1);
+        let mut names: Vec<v8::Local<v8::Name>> = Vec::with_capacity(props.len() + 2);
+        let mut values: Vec<v8::Local<v8::Value>> = Vec::with_capacity(props.len() + 2);
         names.push(v8::String::new(tc, "message").unwrap().into());
         values.push(message.into());
         for (name, value) in &props {
             names.push(v8::String::new(tc, name).unwrap().into());
             values.push(*value);
+        }
+        if let Some(win32) = win_error {
+            names.push(v8::String::new(tc, "winError").unwrap().into());
+            values.push(win32.into());
         }
         let null = v8::null(tc).into();
         let record = v8::Object::with_prototype_and_properties(tc, null, &names, &values);
@@ -1307,6 +1325,18 @@ fn sys_error(
             if let Some(key) = v8::String::new(tc, name) {
                 obj.create_data_property(tc, key.into(), value);
             }
+        }
+        // Non-enumerable and last, as `keep_win32_code` (node_ops.rs) sets it on
+        // the sync natives' errors (#442, #450).
+        if let Some(win32) = win_error
+            && let Some(key) = v8::String::new(tc, "winError")
+        {
+            obj.define_own_property(
+                tc,
+                key.into(),
+                win32.into(),
+                v8::PropertyAttribute::DONT_ENUM,
+            );
         }
     }
     // Defining on a fresh extensible Error does not throw; clear defensively

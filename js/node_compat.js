@@ -11847,21 +11847,34 @@
   }
 
   // The Win32 code behind an `UNKNOWN` system error, which the native keeps
-  // on the error as a non-enumerable `winError` (#442, docs/node-divergences.md
-  // #59). A re-wrap that rebuilds the error from its fields would drop it, so
-  // every one of them carries it over here: last, and still non-enumerable,
+  // on the error as a non-enumerable `winError` (#442, #450,
+  // docs/node-divergences.md #59). A re-wrap that rebuilds the error from its
+  // fields would drop it, so every one of them carries it over here -- from
+  // the native's error, or from the record a spawn failure's JSON body or
+  // spawnSync's result.error is parsed into -- last, and still non-enumerable,
   // so node's own-key order stays a prefix of oam's and Object.keys,
-  // JSON.stringify and deepStrictEqual see what node's see.
+  // JSON.stringify and deepStrictEqual see what node's see. Only `from`'s OWN
+  // numeric winError counts: the records have Object.prototype, which a script
+  // may have extended.
   function carryWinError(from, to) {
     if (from !== null && typeof from === "object" && Object.hasOwn(from, "winError")) {
-      Object.defineProperty(to, "winError", {
-        value: from.winError,
+      withWinError(to, from.winError);
+    }
+    return to;
+  }
+
+  // The definition itself: last and non-enumerable; anything but a number
+  // (absent, null) defines nothing.
+  function withWinError(err, value) {
+    if (typeof value === "number") {
+      Object.defineProperty(err, "winError", {
+        value,
         writable: true,
         enumerable: false,
         configurable: true,
       });
     }
-    return to;
+    return err;
   }
 
   // The checks fs.read and fs.readSync share once their overloads are
@@ -37078,7 +37091,9 @@
       shaped.syscall = `spawn ${command}`;
       shaped.path = command;
       shaped.spawnargs = args ? args.slice() : [];
-      return shaped;
+      // The body's own winError only: `parsed` has Object.prototype, which a
+      // script may have extended.
+      return carryWinError(parsed, shaped);
     }
 
     // The spawn failures node reports as an 'error' event. Every other code is
@@ -37104,7 +37119,7 @@
       if (typeof parsed.errno === "number") thrown.errno = parsed.errno;
       thrown.code = parsed.code;
       thrown.syscall = "spawn";
-      return thrown;
+      return carryWinError(parsed, thrown);
     }
 
     // Native per-fd stdio direction codes, shared with spawnExtra's stdioCode.
@@ -37237,6 +37252,7 @@
         error.syscall = `spawnSync ${target.file}`;
         error.path = target.file;
         error.spawnargs = target.args;
+        carryWinError(result.error, error);
       }
       return {
         pid: result.pid,
@@ -38894,23 +38910,28 @@
       const e = new Error(
         hostname ? `${syscall} ${code} ${hostname}` : `${syscall} ${code}`,
       );
+      // node's DNSException assigns errno FIRST and always: a number on the
+      // getaddrinfo path, an own `undefined` for a query or reverse (keys
+      // errno, code, syscall, hostname on every path; measured on v22.22.2).
+      // On the lookup path it is the resolver's own number when the native
+      // side reports one: libuv's UV_EAI_* for the code getaddrinfo returned
+      // (EAI_NODATA is ENOTFOUND with -3007 where EAI_NONAME is -3008), or
+      // this platform's EINVAL for a name ToASCII refused. Else the code's
+      // usual number.
+      let errno;
+      if (lookupPath) {
+        errno = typeof err.errno === "number" ? err.errno : _dnsLookupErrno(code);
+      }
+      e.errno = errno;
       e.code = code;
       e.syscall = syscall;
       // node omits .hostname entirely rather than setting it to "" when the
       // caller looked up an empty name.
       if (hostname) e.hostname = hostname;
-      if (lookupPath) {
-        // The resolver's own number when the native side reports one: libuv's
-        // UV_EAI_* for the code getaddrinfo returned (EAI_NODATA is ENOTFOUND
-        // with -3007 where EAI_NONAME is -3008), or this platform's EINVAL
-        // for a name ToASCII refused. Else the code's usual number.
-        if (typeof err.errno === "number") e.errno = err.errno;
-        else {
-          const errno = _dnsLookupErrno(code);
-          if (errno !== undefined) e.errno = errno;
-        }
-      }
-      return e;
+      // The Win32 code behind an UNKNOWN the resolver could not name (an
+      // unlisted WSA code falls through to libuv's generic table, #450):
+      // rebuilding the error must not drop it.
+      return carryWinError(err, e);
     }
 
     // The three native entry points, each wrapped once so the callback API, the

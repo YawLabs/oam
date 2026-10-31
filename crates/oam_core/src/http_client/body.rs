@@ -143,10 +143,12 @@ pub enum BodyReadError {
     /// socket.
     TimedOut,
     /// The connection failed with an OS error (a reset): node's `read
-    /// ECONNRESET`, with this code and its errno.
+    /// ECONNRESET`, with this code and its errno, and the Win32 code behind
+    /// an `UNKNOWN` (#450) should the raw code be one libuv does not name.
     Io {
         code: &'static str,
         errno: Option<i32>,
+        win_error: Option<u32>,
     },
     /// A response the server does not keep alive ended short of its
     /// content-length: undici's `ResponseContentLengthMismatchError`.
@@ -199,6 +201,7 @@ impl BodyReadError {
                         BodyReadError::Io {
                             code,
                             errno: crate::node_errno(code, io),
+                            win_error: crate::unknown_win32_error(code, io),
                         }
                     }
                     _ => BodyReadError::Other(error.to_string()),
@@ -231,6 +234,7 @@ impl BodyReadError {
                     address: None,
                     port: None,
                     dest: None,
+                    win_error: None,
                 },
                 None => OpOutcome::Failed(error.message().to_string()),
             },
@@ -248,7 +252,11 @@ impl BodyReadError {
             BodyReadError::EndedAtClose => {
                 OpOutcome::node_failed(ENDED_AT_CLOSE_CODE, OTHER_SIDE_CLOSED)
             }
-            BodyReadError::Io { code, errno } => OpOutcome::NodeFailed {
+            BodyReadError::Io {
+                code,
+                errno,
+                win_error,
+            } => OpOutcome::NodeFailed {
                 code: code.to_string(),
                 message: format!("read {code}"),
                 syscall: Some("read".to_string()),
@@ -258,6 +266,7 @@ impl BodyReadError {
                 address: None,
                 port: None,
                 dest: None,
+                win_error: *win_error,
             },
             BodyReadError::TimedOut => {
                 OpOutcome::node_failed("UND_ERR_BODY_TIMEOUT", "Body Timeout Error")

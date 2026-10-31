@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "123c3051",
+  "commit": "ccf36fff",
   "oamVersion": "oam 0.19.1",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 411,
-      "total": 412,
+      "pass": 412,
+      "total": 413,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -1493,6 +1493,10 @@
         },
         {
           "case": "578-os-uptime.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "579-dns-error-key-order.mjs",
           "status": "pass"
         },
         {

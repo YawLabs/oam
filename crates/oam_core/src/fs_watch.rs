@@ -224,14 +224,13 @@ pub fn next(registry: &FsWatchRegistry, id: u64) -> impl Future<Output = OpOutco
 /// knows the filename the watcher was started with.
 fn failed(error: std::io::Error) -> OpOutcome {
     let code = crate::node_error_code(&error);
-    let errno = crate::node_errno(code, &error);
     let reason = crate::node_error_reason(code, &error);
-    OpOutcome::node_failed_at(
+    OpOutcome::node_failed_io(
         code,
         format!("{code}: {reason}, watch"),
         "watch",
         None,
-        errno,
+        &error,
     )
 }
 
