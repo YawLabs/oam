@@ -154,6 +154,10 @@ pub struct NodeSysError {
     pub address: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// The Win32 code behind an `UNKNOWN` (`unknown_win32_error`, #450), for
+    /// the builders that still hold the `io::Error`; `None` elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub win_error: Option<u32>,
 }
 
 /// A `--permission` refusal an async op raised after its synchronous gate had
@@ -260,6 +264,13 @@ pub enum OpOutcome {
         /// `err.dest`. A serde default, like the three above.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dest: Option<String>,
+        /// The Win32 code behind an `UNKNOWN` (`unknown_win32_error`, #450):
+        /// the engine hangs it on the error as a non-enumerable `winError`,
+        /// as the sync natives do (#442). A serde default, like the four
+        /// above, so a recording from before it loads and one without it is
+        /// byte-identical to what an older oam wrote.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        win_error: Option<u32>,
     },
     /// Every address of a multi-address connect failed: node's
     /// `NodeAggregateError` (lib/net.js `internalConnectMultiple`), one child
@@ -329,6 +340,7 @@ impl OpOutcome {
             address: None,
             port: None,
             dest: None,
+            win_error: None,
         }
     }
 
@@ -345,6 +357,7 @@ impl OpOutcome {
             address: err.address,
             port: err.port,
             dest: None,
+            win_error: err.win_error,
         }
     }
 
@@ -374,6 +387,7 @@ impl OpOutcome {
             address: None,
             port: None,
             dest: None,
+            win_error: None,
         }
     }
 
@@ -397,7 +411,47 @@ impl OpOutcome {
             address: None,
             port: None,
             dest: Some(dest.to_string()),
+            win_error: None,
         }
+    }
+
+    /// `node_failed_at` for a failure whose `io::Error` is still in hand: the
+    /// errno and the Win32 code behind an `UNKNOWN` (`unknown_win32_error`,
+    /// #450) come from that one error, so they cannot disagree. `code` is the
+    /// caller's -- `fd_error_code` may have rewritten it.
+    pub fn node_failed_io(
+        code: &str,
+        message: impl Into<String>,
+        syscall: &str,
+        path: Option<&str>,
+        error: &std::io::Error,
+    ) -> Self {
+        OpOutcome::node_failed_at(code, message, syscall, path, node_errno(code, error))
+            .with_win_error(unknown_win32_error(code, error))
+    }
+
+    /// `node_failed_dest` with the `io::Error` still in hand (see
+    /// `node_failed_io`).
+    pub fn node_failed_dest_io(
+        code: &str,
+        message: impl Into<String>,
+        syscall: &str,
+        path: &str,
+        dest: &str,
+        error: &std::io::Error,
+    ) -> Self {
+        OpOutcome::node_failed_dest(code, message, syscall, path, dest, node_errno(code, error))
+            .with_win_error(unknown_win32_error(code, error))
+    }
+
+    /// The Win32 code behind an `UNKNOWN` on a `NodeFailed` (#450), for a
+    /// caller that already has it (`check_access`). Any other outcome is
+    /// returned as it is.
+    pub fn with_win_error(mut self, win32: Option<u32>) -> Self {
+        if let OpOutcome::NodeFailed { win_error, .. } = &mut self {
+            *win_error = win32;
+        }
+        self
     }
 }
 
@@ -5516,12 +5570,12 @@ pub mod ops {
     /// template node does not resolve.
     fn node_fail_as_passed(error: std::io::Error, syscall: &str, path: &str) -> OpOutcome {
         let code = super::node_error_code(&error);
-        OpOutcome::node_failed_at(
+        OpOutcome::node_failed_io(
             code,
             super::node_error_message(code, syscall, path, &error),
             syscall,
             Some(path),
-            super::node_errno(code, &error),
+            &error,
         )
     }
 
@@ -5529,13 +5583,13 @@ pub mod ops {
     /// sets `dest`. The caller passes them as they are to be shown.
     fn node_fail_dest(error: std::io::Error, syscall: &str, path: &str, dest: &str) -> OpOutcome {
         let code = super::node_error_code(&error);
-        OpOutcome::node_failed_dest(
+        OpOutcome::node_failed_dest_io(
             code,
             super::node_error_message_dest(code, syscall, path, dest, &error),
             syscall,
             path,
             dest,
-            super::node_errno(code, &error),
+            &error,
         )
     }
 
@@ -5548,12 +5602,12 @@ pub mod ops {
     ) -> OpOutcome {
         let failure = super::whole_file_error(site, path.os(), &error);
         let shown = path.shown();
-        OpOutcome::node_failed_at(
+        OpOutcome::node_failed_io(
             failure.code,
             super::fs_error_message(failure, &shown, error.io()),
             failure.syscall,
             failure.has_path.then_some(&*shown),
-            super::node_errno(failure.code, error.io()),
+            error.io(),
         )
     }
 
@@ -5567,12 +5621,12 @@ pub mod ops {
     ) -> OpOutcome {
         let failure = super::fs_error_at(site, syscall, path.os(), &error);
         let shown = path.shown();
-        OpOutcome::node_failed_at(
+        OpOutcome::node_failed_io(
             failure.code,
             super::fs_error_message(failure, &shown, &error),
             failure.syscall,
             failure.has_path.then_some(&*shown),
-            super::node_errno(failure.code, &error),
+            &error,
         )
     }
 
@@ -5607,23 +5661,23 @@ pub mod ops {
     /// error and `, fsync ''` at the end of its message.
     fn node_fail_fd_op(error: std::io::Error, syscall: &str) -> OpOutcome {
         let code = super::node_error_code(&error);
-        OpOutcome::node_failed_at(
+        OpOutcome::node_failed_io(
             code,
             super::node_error_message_fd(code, syscall, &error),
             syscall,
             None,
-            super::node_errno(code, &error),
+            &error,
         )
     }
 
     fn node_fail_fd(error: std::io::Error, syscall: &str) -> OpOutcome {
         let code = super::fd_error_code(&error);
-        OpOutcome::node_failed_at(
+        OpOutcome::node_failed_io(
             code,
             super::node_error_message_fd(code, syscall, &error),
             syscall,
             None,
-            super::node_errno(code, &error),
+            &error,
         )
     }
 
@@ -6880,12 +6934,10 @@ pub mod ops {
     pub async fn fs_access(path: super::FsPath, mode: i32) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || match super::check_access(&path, mode) {
             Ok(()) => OpOutcome::Done,
-            // The Win32 code behind an UNKNOWN is dropped here: `NodeFailed`
-            // does not carry one yet (the async half of #442 is a follow-up;
-            // the sync accessSync keeps it).
-            Err((code, message, errno, _win_error)) => {
+            Err((code, message, errno, win_error)) => {
                 let shown = path.shown();
                 OpOutcome::node_failed_at(code, message, "access", Some(&*shown), errno)
+                    .with_win_error(win_error)
             }
         })
         .await;
@@ -7724,6 +7776,7 @@ pub mod ops {
                 address: None,
                 port: None,
                 dest: None,
+                win_error: None,
             },
             None => OpOutcome::Failed(format!("{context}: {error}")),
         }
@@ -7886,6 +7939,7 @@ pub mod ops {
             address: None,
             port: None,
             dest: None,
+            win_error: None,
         }
     }
 
@@ -10209,6 +10263,7 @@ mod op_outcome_serde_tests {
             hostname: None,
             address: Some("127.0.0.1".to_string()),
             port: Some(8080),
+            win_error: None,
         }
     }
 
@@ -10227,7 +10282,9 @@ mod op_outcome_serde_tests {
                 address,
                 port,
                 dest,
+                win_error,
             } => {
+                assert_eq!(win_error, None);
                 assert_eq!(code, "ENOENT");
                 assert_eq!(message, "ENOENT: no such file or directory, open 'x'");
                 assert_eq!(syscall.as_deref(), Some("open"));
@@ -10271,11 +10328,92 @@ mod op_outcome_serde_tests {
             hostname: None,
             address: None,
             port: None,
+            win_error: None,
         };
         assert_eq!(
             serde_json::to_string(&bare).unwrap(),
             r#"{"code":"EAI_AGAIN","message":"getaddrinfo EAI_AGAIN"}"#
         );
+    }
+
+    /// The Win32 code behind an UNKNOWN (#450) is written only when there is
+    /// one -- a recording without it is what an older oam wrote -- and a
+    /// recording that has it loads with it, as does one from before the field.
+    #[test]
+    fn win_error_is_written_only_when_present() {
+        let with = OpOutcome::node_failed_at("UNKNOWN", "m", "write", None, Some(-4094))
+            .with_win_error(Some(536));
+        let json = serde_json::to_string(&with).unwrap();
+        assert_eq!(
+            json,
+            r#"{"NodeFailed":{"code":"UNKNOWN","message":"m","syscall":"write","errno":-4094,"win_error":536}}"#
+        );
+        match serde_json::from_str::<OpOutcome>(&json).unwrap() {
+            OpOutcome::NodeFailed { win_error, .. } => assert_eq!(win_error, Some(536)),
+            other => panic!("{other:?}"),
+        }
+        let old =
+            r#"{"NodeFailed":{"code":"UNKNOWN","message":"m","syscall":"write","errno":-4094}}"#;
+        match serde_json::from_str::<OpOutcome>(old).unwrap() {
+            OpOutcome::NodeFailed { win_error, .. } => assert_eq!(win_error, None),
+            other => panic!("{other:?}"),
+        }
+        // `with_win_error` leaves any other outcome alone.
+        assert!(matches!(
+            OpOutcome::Done.with_win_error(Some(1)),
+            OpOutcome::Done
+        ));
+        let mut sys_err = sys("UNKNOWN");
+        sys_err.win_error = Some(10041);
+        assert!(
+            serde_json::to_string(&sys_err)
+                .unwrap()
+                .ends_with(r#""win_error":10041}"#)
+        );
+        match OpOutcome::sys(sys_err) {
+            OpOutcome::NodeFailed { win_error, .. } => assert_eq!(win_error, Some(10041)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `node_failed_io` reads errno and the Win32 code off one error (#450):
+    /// on Windows an unlisted code carries both, a named one its errno alone.
+    #[cfg(windows)]
+    #[test]
+    fn node_failed_io_keeps_the_win32_code_behind_unknown() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_PIPE_LISTENING};
+        let listening = std::io::Error::from_raw_os_error(ERROR_PIPE_LISTENING as i32);
+        let code = node_error_code(&listening);
+        match OpOutcome::node_failed_io(code, "write UNKNOWN", "write", None, &listening) {
+            OpOutcome::NodeFailed {
+                code,
+                errno,
+                win_error,
+                ..
+            } => {
+                assert_eq!(code, "UNKNOWN");
+                assert_eq!(errno, Some(-4094));
+                assert_eq!(win_error, Some(ERROR_PIPE_LISTENING));
+            }
+            other => panic!("{other:?}"),
+        }
+        let denied = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
+        let code = node_error_code(&denied);
+        match OpOutcome::node_failed_dest_io(code, "m", "rename", "a", "b", &denied) {
+            OpOutcome::NodeFailed {
+                code,
+                errno,
+                win_error,
+                dest,
+                ..
+            } => {
+                assert_eq!(code, "EPERM");
+                assert_eq!(errno, Some(-4048));
+                assert_eq!(win_error, None);
+                assert_eq!(dest.as_deref(), Some("b"));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -10291,11 +10429,13 @@ mod op_outcome_serde_tests {
                 address,
                 port,
                 dest,
+                win_error,
             } => {
                 assert_eq!(code, "ECONNREFUSED");
                 assert_eq!(message, "connect ECONNREFUSED 127.0.0.1:8080");
                 assert_eq!(syscall.as_deref(), Some("connect"));
                 assert_eq!((path, dest), (None, None));
+                assert_eq!(win_error, None);
                 assert_eq!(errno, Some(-4078));
                 assert_eq!(hostname, None);
                 assert_eq!(address.as_deref(), Some("127.0.0.1"));

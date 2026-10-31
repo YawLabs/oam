@@ -625,6 +625,7 @@ fn stream_error(error: &hyper::Error, after_goaway: bool) -> OpOutcome {
         address: None,
         port: None,
         dest: None,
+        win_error: None,
     };
     if let Some(h2) = find_h2(error) {
         if h2.is_reset()
@@ -726,6 +727,7 @@ pub async fn request(
         address: None,
         port: None,
         dest: None,
+        win_error: None,
     };
     if after_goaway() {
         return fail(&mut slot, refused());

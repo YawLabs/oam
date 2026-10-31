@@ -907,6 +907,7 @@ pub fn drain_sync(
                 code: "ETIMEDOUT".to_string(),
                 errno: super::child::synthetic_spawn_errno("ETIMEDOUT"),
                 message: format!("spawnSync timed out after {timeout_ms}ms"),
+                win_error: None,
             }),
         };
     }
@@ -921,6 +922,8 @@ pub fn drain_sync(
                 code: "UNKNOWN".to_string(),
                 errno: None,
                 message: e,
+                // A wait failure carries its text, not a Win32 code.
+                win_error: None,
             }),
         };
     }
@@ -939,6 +942,7 @@ pub fn drain_sync(
                 code: "ENOBUFS".to_string(),
                 errno: super::child::synthetic_spawn_errno("ENOBUFS"),
                 message: format!("spawnSync {command} ENOBUFS"),
+                win_error: None,
             }),
         };
     }
@@ -996,6 +1000,11 @@ pub fn spawn_sync_argv0(
                     code: body["code"].as_str().unwrap_or("UNKNOWN").to_string(),
                     errno: body["errno"].as_i64().map(|n| n as i32),
                     message: body["message"].as_str().unwrap_or(&msg).to_string(),
+                    // The Win32 code behind an UNKNOWN rides the same body
+                    // (spawn_failure_json_with, #450), present only when there is one.
+                    win_error: body["winError"]
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok()),
                 }),
             }
         }
@@ -1314,6 +1323,35 @@ mod env_block_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The spawn failure body's contract (#450), which the JS builders and the
+    /// argv0 path's re-parse both read, pinned without depending on what this
+    /// host's loader answers: `winError` only for an UNKNOWN with a real Win32
+    /// code behind it, absent (not null) otherwise.
+    #[test]
+    fn spawn_failure_body_carries_the_win32_code_only_behind_unknown() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_EXE_MACHINE_TYPE_MISMATCH, ERROR_FILE_NOT_FOUND,
+        };
+        let body = |raw: i32| -> serde_json::Value {
+            serde_json::from_str(&crate::child::spawn_failure_json_with(
+                &std::io::Error::from_raw_os_error(raw),
+                "m",
+            ))
+            .unwrap()
+        };
+        let mismatch = body(ERROR_EXE_MACHINE_TYPE_MISMATCH as i32);
+        assert_eq!(mismatch["code"], "UNKNOWN");
+        assert_eq!(mismatch["errno"], -4094);
+        assert_eq!(mismatch["winError"], ERROR_EXE_MACHINE_TYPE_MISMATCH);
+        let missing = body(ERROR_FILE_NOT_FOUND as i32);
+        assert_eq!(missing["code"], "ENOENT");
+        assert!(missing.get("winError").is_none(), "{missing}");
+        // oam's UV_UNKNOWN stand-in has no Win32 code behind it.
+        let sentinel = body(-4094);
+        assert_eq!(sentinel["code"], "UNKNOWN");
+        assert!(sentinel.get("winError").is_none(), "{sentinel}");
+    }
+
     use super::{FdEnd, RawChild, RawChildRegistry, StdioFd, raw_close_fd, raw_kill, spawn_extra};
     use std::collections::HashMap;
     use std::os::windows::io::{FromRawHandle, OwnedHandle};

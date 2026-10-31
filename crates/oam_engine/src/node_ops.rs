@@ -9846,6 +9846,13 @@ fn spawn_sync_result_to_js<'s>(
         let k = v8::String::new(scope, "message").unwrap();
         let v = v8::String::new(scope, &error.message).unwrap();
         err_obj.set(scope, k.into(), v.into());
+        // The Win32 code behind an UNKNOWN (#450), a plain field of this
+        // record: the JS puts it on result.error non-enumerably.
+        if let Some(win32) = error.win_error {
+            let k = v8::String::new(scope, "winError").unwrap();
+            let v = v8::Integer::new_from_unsigned(scope, win32);
+            err_obj.set(scope, k.into(), v.into());
+        }
         let key = v8::String::new(scope, "error").unwrap();
         obj.set(scope, key.into(), err_obj.into());
     }

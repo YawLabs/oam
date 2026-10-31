@@ -275,14 +275,24 @@ pub(crate) fn spawn_failure_json(e: &std::io::Error) -> String {
 }
 
 /// `spawn_failure_json` with a message of the caller's own.
+///
+/// `winError`, the Win32 code behind an `UNKNOWN` (`unknown_win32_error`,
+/// #450), rides along only when there is one -- a body without it is what an
+/// older oam wrote -- and the JS builders define it on the error
+/// non-enumerably, as the sync natives do (#442).
 pub(crate) fn spawn_failure_json_with(e: &std::io::Error, message: &str) -> String {
     let code = super::node_error_code(e);
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "code": code,
         "errno": super::node_errno(code, e),
         "message": message,
-    })
-    .to_string()
+    });
+    if let Some(win32) = super::unknown_win32_error(code, e)
+        && let Some(fields) = body.as_object_mut()
+    {
+        fields.insert("winError".to_string(), serde_json::Value::from(win32));
+    }
+    body.to_string()
 }
 
 /// What spawning `prog` must run on Windows: libuv's program search
@@ -820,6 +830,7 @@ pub fn spawn_sync(
                     code: code.to_string(),
                     errno: super::node_errno(code, &e),
                     message: e.to_string(),
+                    win_error: super::unknown_win32_error(code, &e),
                 }),
             };
         }
@@ -914,6 +925,7 @@ pub fn spawn_sync(
                     code: "ETIMEDOUT".to_string(),
                     errno: synthetic_spawn_errno("ETIMEDOUT"),
                     message: format!("spawnSync timed out after {timeout_ms}ms"),
+                    win_error: None,
                 }),
             };
         }
@@ -956,6 +968,7 @@ pub fn spawn_sync(
                         code: "ENOBUFS".to_string(),
                         errno: synthetic_spawn_errno("ENOBUFS"),
                         message: format!("spawnSync {command} ENOBUFS"),
+                        win_error: None,
                     }),
                 };
             }
@@ -969,18 +982,22 @@ pub fn spawn_sync(
                 error: None,
             }
         }
-        Err(e) => SpawnSyncResult {
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            status: None,
-            signal: None,
-            pid,
-            error: Some(SpawnSyncError {
-                code: super::node_error_code(&e).to_string(),
-                errno: super::node_errno(super::node_error_code(&e), &e),
-                message: e.to_string(),
-            }),
-        },
+        Err(e) => {
+            let code = super::node_error_code(&e);
+            SpawnSyncResult {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                status: None,
+                signal: None,
+                pid,
+                error: Some(SpawnSyncError {
+                    code: code.to_string(),
+                    errno: super::node_errno(code, &e),
+                    message: e.to_string(),
+                    win_error: super::unknown_win32_error(code, &e),
+                }),
+            }
+        }
     }
 }
 
@@ -998,6 +1015,9 @@ pub struct SpawnSyncError {
     /// The libuv errno node puts on `result.error.errno`.
     pub errno: Option<i32>,
     pub message: String,
+    /// The Win32 code behind an `UNKNOWN` (`unknown_win32_error`, #450); the
+    /// JS puts it on `result.error` as a non-enumerable `winError`.
+    pub win_error: Option<u32>,
 }
 
 pub async fn child_read_stdout(children: ChildRegistry, handle: u64) -> OpOutcome {

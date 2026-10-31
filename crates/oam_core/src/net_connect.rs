@@ -758,6 +758,7 @@ pub(crate) async fn connect_with<D: Dialer>(
                 hostname: None,
                 address: None,
                 port: None,
+                win_error: None,
             })));
         }
         Some(pin) => {
@@ -812,6 +813,7 @@ pub(crate) async fn connect_with<D: Dialer>(
                     errors.push(connect_error(
                         "ETIMEDOUT",
                         Some(UV_ETIMEDOUT),
+                        None,
                         &address,
                         port,
                         None,
@@ -918,15 +920,30 @@ fn fallback_errno(code: &str) -> Option<i32> {
 fn attempt_error(address: &str, port: u16, failure: &DialFailure) -> NodeSysError {
     let code = node_error_code(&failure.error);
     let errno = node_errno(code, &failure.error).or_else(|| fallback_errno(code));
+    // The Win32 code behind an UNKNOWN (#450), read off the same error.
+    let win_error = crate::unknown_win32_error(code, &failure.error);
     if let Some((local_address, local_port)) = &failure.bind {
-        return bind_error(code, errno, local_address, *local_port);
+        return bind_error(code, errno, win_error, local_address, *local_port);
     }
-    connect_error(code, errno, address, port, failure.local.as_deref())
+    connect_error(
+        code,
+        errno,
+        win_error,
+        address,
+        port,
+        failure.local.as_deref(),
+    )
 }
 
 /// `ExceptionWithHostPort(err, 'bind', localAddress, localPort)`: `bind CODE
 /// address`, then `:port` (and a `port` key) only for a non-zero port.
-fn bind_error(code: &str, errno: Option<i32>, address: &str, port: u16) -> NodeSysError {
+fn bind_error(
+    code: &str,
+    errno: Option<i32>,
+    win_error: Option<u32>,
+    address: &str,
+    port: u16,
+) -> NodeSysError {
     let mut message = format!("bind {code} {address}");
     if port > 0 {
         message.push_str(&format!(":{port}"));
@@ -939,6 +956,7 @@ fn bind_error(code: &str, errno: Option<i32>, address: &str, port: u16) -> NodeS
         hostname: None,
         address: Some(address.to_string()),
         port: (port > 0).then_some(port),
+        win_error,
     }
 }
 
@@ -949,6 +967,7 @@ fn bind_error(code: &str, errno: Option<i32>, address: &str, port: u16) -> NodeS
 fn connect_error(
     code: &str,
     errno: Option<i32>,
+    win_error: Option<u32>,
     address: &str,
     port: u16,
     local: Option<&str>,
@@ -968,10 +987,14 @@ fn connect_error(
         hostname: None,
         address: Some(address.to_string()),
         port: (port > 0).then_some(port),
+        win_error,
     }
 }
 
-/// lib/internal/errors.js `DNSException`: `getaddrinfo CODE host`.
+/// lib/internal/errors.js `DNSException`: `getaddrinfo CODE host`. No Win32
+/// code here: `resolve_error`, the one builder with the `io::Error` in hand,
+/// adds it after (an unlisted WSA code falls through `classify_resolve` to
+/// `UNKNOWN`, as libuv's getaddrinfo translation does).
 fn dns_error(host: &str, code: &str, errno: i32) -> NodeSysError {
     NodeSysError {
         code: code.to_string(),
@@ -981,6 +1004,7 @@ fn dns_error(host: &str, code: &str, errno: i32) -> NodeSysError {
         hostname: Some(host.to_string()),
         address: None,
         port: None,
+        win_error: None,
     }
 }
 
@@ -1005,7 +1029,9 @@ fn dns_error(host: &str, code: &str, errno: i32) -> NodeSysError {
 /// (either case) is EAI_AGAIN/-3001, and anything else EAI_FAIL/-3004.
 pub(crate) fn resolve_error(host: &str, error: &std::io::Error) -> NodeSysError {
     let (code, errno) = classify_resolve(error);
-    dns_error(host, code, errno)
+    let mut failure = dns_error(host, code, errno);
+    failure.win_error = crate::unknown_win32_error(code, error);
+    failure
 }
 
 /// libuv's `UV_EAI_*` numbers (include/uv/errno.h), node's `errno` for a
@@ -1559,6 +1585,7 @@ mod tests {
                 hostname: None,
                 address: Some("::1".to_string()),
                 port: Some(8080),
+                win_error: None,
             }
         );
 
@@ -1936,6 +1963,7 @@ mod tests {
                 hostname: None,
                 address: Some("127.0.0.1".to_string()),
                 port: None,
+                win_error: None,
             }
         );
         // Inside an aggregate too; an asynchronous failure has no detail.
@@ -1993,6 +2021,7 @@ mod tests {
                     hostname: Some("nowhere.invalid".to_string()),
                     address: None,
                     port: None,
+                    win_error: None,
                 }
             );
             assert!(script.dialled().is_empty());
@@ -2060,6 +2089,7 @@ mod tests {
         let single = ConnectError::Single(Box::new(connect_error(
             "ECONNREFUSED",
             Some(-4078),
+            None,
             "127.0.0.1",
             8080,
             None,
@@ -2075,11 +2105,13 @@ mod tests {
                 address,
                 port,
                 dest,
+                win_error,
             } => {
                 assert_eq!(code, "ECONNREFUSED");
                 assert_eq!(message, "connect ECONNREFUSED 127.0.0.1:8080");
                 assert_eq!(syscall.as_deref(), Some("connect"));
                 assert_eq!((path, hostname, dest), (None, None, None));
+                assert_eq!(win_error, None);
                 assert_eq!(errno, Some(-4078));
                 assert_eq!((address.as_deref(), port), (Some("127.0.0.1"), Some(8080)));
             }
@@ -2088,8 +2120,8 @@ mod tests {
         assert_eq!(single.to_string(), "connect ECONNREFUSED 127.0.0.1:8080");
 
         let children = vec![
-            connect_error("ECONNREFUSED", Some(-4078), "::1", 80, None),
-            connect_error("ECONNREFUSED", Some(-4078), "127.0.0.1", 80, None),
+            connect_error("ECONNREFUSED", Some(-4078), None, "::1", 80, None),
+            connect_error("ECONNREFUSED", Some(-4078), None, "127.0.0.1", 80, None),
         ];
         let multi = ConnectError::Multi(children.clone());
         assert!(matches!(

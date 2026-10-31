@@ -314,12 +314,12 @@ fn tls_fail(error: std::io::Error, syscall: &str, target: &str) -> OpOutcome {
     let code = node_error_code(&error);
     // syscall + errno, but no `path`: a host:port is not a filesystem path,
     // and node does not put one on a net error.
-    OpOutcome::node_failed_at(
+    OpOutcome::node_failed_io(
         code,
         node_error_message(code, syscall, target, &error),
         syscall,
         None,
-        node_errno(code, &error),
+        &error,
     )
 }
 
@@ -3539,11 +3539,13 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
                 address,
                 port,
                 dest,
+                win_error,
             } => {
                 assert_eq!(code, "DEPTH_ZERO_SELF_SIGNED_CERT");
                 assert_eq!(message, "self-signed certificate");
                 assert_eq!((syscall, path, errno, dest), (None, None, None, None));
                 assert_eq!((hostname, address, port), (None, None, None));
+                assert_eq!(win_error, None);
             }
             other => panic!("expected a node-coded rejection, got {other:?}"),
         }
