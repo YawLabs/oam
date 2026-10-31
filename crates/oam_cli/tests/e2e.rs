@@ -39158,3 +39158,22 @@ fn deep_cp_sync_with_filter_throws_range_error_not_a_native_overflow() {
     );
     assert!(out.status.success(), "status {:?}", out.status);
 }
+
+#[test]
+fn os_uptime_is_the_system_uptime_not_the_process_uptime() {
+    let stdout = run_ok(
+        "os_uptime.mjs",
+        "import os from 'node:os';\n\
+         const up = os.uptime();\n\
+         console.log('number:', Number.isFinite(up) && up > 0);\n\
+         // the machine has been up longer than this process -- by far more than a second\n\
+         console.log('system_not_process:', up > process.uptime() + 1);\n\
+         console.log('monotone:', os.uptime() >= up);",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}
