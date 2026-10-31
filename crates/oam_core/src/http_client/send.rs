@@ -141,6 +141,11 @@ pub struct FetchRequest {
     /// what `http.request` sends, node's http client decoding nothing (#148).
     #[serde(default = "yes")]
     pub decode: bool,
+    /// True for `undici.fetch`: `zstd` is a coding it decodes, as undici 7.11
+    /// and later do. Global `fetch` is node 22's bundled undici 6.24.1, which
+    /// leaves a zstd body as it came (#443). Meaningless without `decode`.
+    #[serde(default)]
+    pub decode_zstd: bool,
     /// False sends the caller's headers alone: what `http.request` sends,
     /// node's http client adding no `accept` / `user-agent` /
     /// `accept-encoding` of its own (#148).
@@ -422,6 +427,8 @@ struct LoopState {
     hops: u32,
     redirect: RedirectMode,
     decode: bool,
+    /// [`FetchRequest::decode_zstd`].
+    decode_zstd: bool,
     /// The `--permission` net grant, asked about every hop's host before it
     /// is dialled. Carried across a park, so a resumed fetch keeps enforcing
     /// it. `None`: every host is granted.
@@ -627,6 +634,7 @@ pub async fn fetch(
         hops: 0,
         redirect: req.redirect,
         decode: req.decode,
+        decode_zstd: req.decode_zstd,
         net_check,
         max_header_size: req
             .max_header_size
@@ -1332,7 +1340,12 @@ fn respond(
             .iter()
             .map(|v| v.as_bytes())
             .collect();
-        match decode::plan(&state.method, status.as_u16(), &encodings) {
+        match decode::plan(
+            &state.method,
+            status.as_u16(),
+            &encodings,
+            state.decode_zstd,
+        ) {
             Plan::TooMany(n) => {
                 state.source.request_failed();
                 return OpOutcome::Failed(format!(

@@ -8943,6 +8943,63 @@ mock sees {"x-up":"A","content-length":"3"}"##;
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// `undici.fetch` decodes `content-encoding: zstd`, as undici 7.11 and later
+/// do, and global fetch does not, as node 22's bundled undici 6.24.1 does not
+/// (#443). oam's fetch used to leave every zstd body as the raw frame. The
+/// bodies are small and sent in one write, so where a frame ends never
+/// depends on how the transport splits reads. Expected output is node
+/// v22.22.2 + undici 8.10.2's, line for line.
+#[test]
+fn undici_fetch_decodes_zstd_and_global_fetch_does_not() {
+    let script = write_temp(
+        "undici_fetch_zstd/main.mjs",
+        r##"import http from 'node:http';
+import zlib from 'node:zlib';
+import { fetch as undiciFetch } from 'undici';
+const text = 'zstd body '.repeat(300);
+const bodies = {
+  zstd: ['zstd', zlib.zstdCompressSync(text)],
+  upper: ['ZSTD', zlib.zstdCompressSync(text)],
+  stacked: ['gzip, zstd', zlib.zstdCompressSync(zlib.gzipSync(text))],
+  unknown: ['zstd, identity', zlib.zstdCompressSync(text)],
+  empty: ['zstd', Buffer.alloc(0)],
+  bad: ['zstd', Buffer.from('plain text, not zstd')],
+};
+const srv = http.createServer((q, s) => {
+  const [enc, body] = bodies[q.url.slice(1)];
+  s.writeHead(200, { 'content-encoding': enc, 'content-length': body.length });
+  s.end(body);
+});
+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const origin = 'http://127.0.0.1:' + srv.address().port;
+const show = async (name, f, path) => {
+  try {
+    const r = await f(origin + '/' + path);
+    const b = Buffer.from(await r.arrayBuffer());
+    console.log(name, path, r.status, b.toString() === text ? 'decoded' : 'raw ' + b.length + ' ' + (b.subarray(0, 4).toString('hex') || '-'));
+  } catch (e) {
+    console.log(name, path, 'rejected', e.name, e.message, e.cause?.message, e.cause?.code, e.cause?.errno);
+  }
+};
+for (const path of Object.keys(bodies)) await show('undici.fetch', undiciFetch, path);
+await show('fetch', fetch, 'zstd');
+await show('fetch', fetch, 'bad');
+srv.close();
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "undici.fetch zstd 200 decoded
+undici.fetch upper 200 decoded
+undici.fetch stacked 200 decoded
+undici.fetch unknown 200 raw 27 28b52ffd
+undici.fetch empty 200 raw 0 -
+undici.fetch bad rejected TypeError terminated Unknown frame descriptor ZSTD_error_prefix_unknown 10
+fetch zstd 200 raw 27 28b52ffd
+fetch bad 200 raw 20 706c6169";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// A dispatcher after close() (or destroy()) sends nothing: undici's dispatch()
 /// refuses every request with ClientDestroyedError -- wrapped by fetch,
 /// as itself from undici.request and the dispatcher's request() -- for an

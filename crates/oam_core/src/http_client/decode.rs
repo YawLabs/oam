@@ -1,6 +1,7 @@
 //! Response body decoding for the `fetch` op: undici 6.24.1's content-coding
 //! rules (fetch/index.js:2131-2172) over a streaming decoder whose output is
-//! bounded per call.
+//! bounded per call. `undici.fetch` adds `zstd`, as undici 7.11 and later do
+//! (#443; see [`plan`]).
 //!
 //! Two halves:
 //!
@@ -43,9 +44,11 @@
 use std::borrow::Cow;
 
 use crate::inflate::{self, InflateFailure};
+use crate::zstd::ZstdError;
 use brotli_decompressor::{BrotliDecompressStream, BrotliResult, BrotliState, StandardAlloc};
 use bytes::{Buf, Bytes};
 use flate2::Crc;
+use zstd_safe::{DCtx, InBuffer, OutBuffer};
 
 /// undici fetch/index.js:2140: more content-codings than this fails the fetch
 /// ("too many content-encodings in response: N, maximum allowed is 5"), a
@@ -79,6 +82,9 @@ pub enum Coding {
     Deflate,
     /// `br`.
     Brotli,
+    /// `zstd`: `undici.fetch` only (undici 7.11 and later decode it; node 22's
+    /// bundled undici 6.24.1, behind global `fetch`, does not).
+    Zstd,
 }
 
 /// Decide how to decode a body. `encodings` is every `content-encoding` field
@@ -94,7 +100,12 @@ pub enum Coding {
 /// - each token is trimmed; `gzip`/`x-gzip`, `deflate` and `br` decode, and
 ///   ANY other token -- `identity` and the empty token included -- turns
 ///   decoding off altogether (node returns `gzip, identity` still encoded).
-pub fn plan(method: &http::Method, status: u16, encodings: &[&[u8]]) -> Plan {
+///
+/// `zstd` is true for `undici.fetch`: undici 7.11+ (fetch/index.js, the same
+/// loop) also decodes `zstd` when `zlib.createZstdDecompress` exists, which
+/// on oam it always does. Global `fetch` is node 22's bundled undici 6.24.1,
+/// where `zstd` is an unknown token like any other (#443).
+pub fn plan(method: &http::Method, status: u16, encodings: &[&[u8]], zstd: bool) -> Plan {
     if *method == http::Method::HEAD
         || *method == http::Method::CONNECT
         || matches!(status, 101 | 204 | 205 | 304)
@@ -121,6 +132,8 @@ pub fn plan(method: &http::Method, status: u16, encodings: &[&[u8]]) -> Plan {
             Coding::Deflate
         } else if token.eq_ignore_ascii_case(b"br") {
             Coding::Brotli
+        } else if zstd && token.eq_ignore_ascii_case(b"zstd") {
+            Coding::Zstd
         } else {
             return Plan::Identity;
         };
@@ -195,6 +208,19 @@ impl DecodeError {
         }
     }
 
+    /// libzstd's own failure, as node's zstd stream reports it: libzstd's
+    /// message, node's `ZSTD_error_*` name as the `code` and the
+    /// `ZSTD_ErrorCode` as the `errno` (measured on node v22.22.2 + undici
+    /// 8.10.2: a body that is not zstd is `Unknown frame descriptor`,
+    /// `ZSTD_error_prefix_unknown`, 10). The decoder is the one node's
+    /// binding drives (crate::zstd), so the error picked is the same.
+    fn zstd(error: ZstdError) -> DecodeError {
+        DecodeError {
+            message: error.message,
+            node: Some((Cow::Borrowed(error.code), error.errno)),
+        }
+    }
+
     const fn internal(message: &'static str) -> DecodeError {
         DecodeError {
             message,
@@ -224,8 +250,10 @@ impl std::error::Error for DecodeError {}
 ///
 /// Memory is bounded independently of the body: one [`OUT_CAP`] window per
 /// stage, the inflate state (its 32 KiB window plus one chunk of room, and
-/// miniz's 10.5 KB of decoder state) or the brotli state (its
-/// ring buffer, at most the stream's declared window), and nothing that grows
+/// miniz's 10.5 KB of decoder state), the brotli state (its
+/// ring buffer, at most the stream's declared window) or the zstd context
+/// (its window, at most the frame's declared one and refused above libzstd's
+/// default limit of 2^27 = 128 MiB, as node's is), and nothing that grows
 /// with the input or output size.
 pub struct Decoder {
     /// Stages in application order: `stages[0]` reads the wire bytes.
@@ -432,6 +460,7 @@ enum Stage {
     // 2.6 KB of state: boxed so the enum stays small (clippy
     // large_enum_variant).
     Brotli(Box<BrotliStage>),
+    Zstd(Box<ZstdStage>),
 }
 
 impl Stage {
@@ -440,6 +469,7 @@ impl Stage {
             Coding::Gzip => Stage::Gzip(Box::new(GzipStage::new())),
             Coding::Deflate => Stage::Deflate(DeflateStage::Detect),
             Coding::Brotli => Stage::Brotli(Box::new(BrotliStage::new())),
+            Coding::Zstd => Stage::Zstd(Box::new(ZstdStage::new())),
         }
     }
 
@@ -449,6 +479,7 @@ impl Stage {
             Stage::Gzip(s) => s.at == Gz::Ignore,
             Stage::Deflate(s) => matches!(s, DeflateStage::Overrun),
             Stage::Brotli(s) => s.overrun,
+            Stage::Zstd(s) => s.overrun,
         }
     }
 
@@ -460,6 +491,7 @@ impl Stage {
             Stage::Gzip(s) => s.run(src, dst),
             Stage::Deflate(s) => s.run(src, dst),
             Stage::Brotli(s) => s.run(src, dst),
+            Stage::Zstd(s) => s.run(src, dst),
         }
     }
 }
@@ -869,6 +901,72 @@ impl BrotliStage {
     }
 }
 
+// ---------------------------------------------------------------------------
+// zstd
+// ---------------------------------------------------------------------------
+
+/// undici 7.11+'s `zlib.createZstdDecompress` stage: libzstd's
+/// `ZSTD_decompressStream` (the library and call node's zstd binding makes,
+/// crate::zstd), one [`OUT_CAP`] window per step, as node's 16 KiB
+/// `chunkSize` is.
+///
+/// Where a frame ends is node's stream loop (lib/zlib.js `processCallback`)
+/// over libzstd, which returns at each frame's end:
+///
+/// - a frame that ends with input left in the same write AND output room to
+///   spare ends the stream -- node pushes null -- so whatever follows in that
+///   write is dropped, a second frame included;
+/// - a frame that ends exactly where the write does leaves the stream open,
+///   and the next write starts a new frame (a second frame decodes; anything
+///   else fails as libzstd fails it, `Unknown frame descriptor`);
+/// - a frame that ends with the output window exactly full calls again, so
+///   the rest of the same write is read as the next frame.
+///
+/// Measured on node v22.22.2 + undici 8.10.2. Truncated input is not an
+/// error (nothing checks for an unfinished frame) and an empty body is "".
+struct ZstdStage {
+    dctx: DCtx<'static>,
+    /// A frame ended with input left over and output room: the body is over.
+    overrun: bool,
+}
+
+impl ZstdStage {
+    fn new() -> ZstdStage {
+        ZstdStage {
+            dctx: DCtx::create(),
+            overrun: false,
+        }
+    }
+
+    fn run(&mut self, src: &[u8], dst: &mut [u8]) -> Result<Step, DecodeError> {
+        if self.overrun {
+            return Ok(Step {
+                consumed: src.len(),
+                produced: 0,
+            });
+        }
+        // Called with no input too: libzstd may hold decoded bytes from a
+        // step whose window filled, and an empty call flushes them.
+        let mut input = InBuffer::around(src);
+        let (result, produced) = {
+            let mut output = OutBuffer::around(&mut *dst);
+            let result = self.dctx.decompress_stream(&mut output, &mut input);
+            (result, output.pos())
+        };
+        let frame_ended =
+            result.map_err(|code| DecodeError::zstd(ZstdError::from_code(code)))? == 0;
+        let consumed = input.pos();
+        if frame_ended && consumed < src.len() && produced < dst.len() {
+            self.overrun = true;
+            return Ok(Step {
+                consumed: src.len(),
+                produced,
+            });
+        }
+        Ok(Step { consumed, produced })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,7 +977,7 @@ mod tests {
 
     fn plan_get(values: &[&str]) -> Plan {
         let raw: Vec<&[u8]> = values.iter().map(|v| v.as_bytes()).collect();
-        plan(&http::Method::GET, 200, &raw)
+        plan(&http::Method::GET, 200, &raw, false)
     }
 
     #[test]
@@ -924,31 +1022,68 @@ mod tests {
     #[test]
     fn plan_trims_like_string_trim_over_latin1() {
         assert_eq!(
-            plan(&http::Method::GET, 200, &[b"\xa0br\x0b"]),
+            plan(&http::Method::GET, 200, &[b"\xa0br\x0b"], false),
             Plan::Decode(vec![Coding::Brotli])
         );
         // U+0085 (NEL) is not JS whitespace.
-        assert_eq!(plan(&http::Method::GET, 200, &[b"br\x85"]), Plan::Identity);
+        assert_eq!(
+            plan(&http::Method::GET, 200, &[b"br\x85"], false),
+            Plan::Identity
+        );
     }
 
     #[test]
     fn plan_exempt_methods_and_statuses() {
         let gz: &[&[u8]] = &[b"gzip"];
         for m in [http::Method::HEAD, http::Method::CONNECT] {
-            assert_eq!(plan(&m, 200, gz), Plan::Identity);
+            assert_eq!(plan(&m, 200, gz, false), Plan::Identity);
         }
         for s in [101, 204, 205, 304] {
-            assert_eq!(plan(&http::Method::GET, s, gz), Plan::Identity, "{s}");
+            assert_eq!(
+                plan(&http::Method::GET, s, gz, false),
+                Plan::Identity,
+                "{s}"
+            );
         }
         for s in [200, 201, 202, 206, 301, 404, 500] {
             assert_eq!(
-                plan(&http::Method::GET, s, gz),
+                plan(&http::Method::GET, s, gz, false),
                 Plan::Decode(vec![Coding::Gzip])
             );
         }
         // The count check does not run for exempt responses either.
         let many: &[&[u8]] = &[b"gzip,gzip,gzip,gzip,gzip,gzip"];
-        assert_eq!(plan(&http::Method::HEAD, 200, many), Plan::Identity);
+        assert_eq!(plan(&http::Method::HEAD, 200, many, false), Plan::Identity);
+    }
+
+    /// `undici.fetch` (undici 7.11+) decodes zstd by the same token rules;
+    /// global fetch (undici 6.24.1) leaves it undecoded. Measured on node
+    /// v22.22.2 + undici 8.10.2 (#443).
+    #[test]
+    fn plan_decodes_zstd_for_undici_fetch_only() {
+        use Coding::*;
+        let zstd = |values: &[&str]| {
+            let raw: Vec<&[u8]> = values.iter().map(|v| v.as_bytes()).collect();
+            plan(&http::Method::GET, 200, &raw, true)
+        };
+        assert_eq!(plan_get(&["zstd"]), Plan::Identity);
+        assert_eq!(plan_get(&["gzip, zstd"]), Plan::Identity);
+        assert_eq!(zstd(&["zstd"]), Plan::Decode(vec![Zstd]));
+        assert_eq!(zstd(&["ZSTD"]), Plan::Decode(vec![Zstd]));
+        assert_eq!(zstd(&[" zstd\t"]), Plan::Decode(vec![Zstd]));
+        assert_eq!(zstd(&["gzip, zstd"]), Plan::Decode(vec![Gzip, Zstd]));
+        assert_eq!(zstd(&["zstd", "br"]), Plan::Decode(vec![Zstd, Brotli]));
+        assert_eq!(zstd(&["zstd, identity"]), Plan::Identity);
+        assert_eq!(zstd(&["zstd,"]), Plan::Identity);
+        assert_eq!(zstd(&["zstd,zstd,zstd,zstd,zstd,zstd"]), Plan::TooMany(6));
+        assert_eq!(
+            plan(&http::Method::HEAD, 200, &[b"zstd"], true),
+            Plan::Identity
+        );
+        assert_eq!(
+            plan(&http::Method::GET, 304, &[b"zstd"], true),
+            Plan::Identity
+        );
     }
 
     // -- vector builders ----------------------------------------------------
@@ -1073,6 +1208,14 @@ mod tests {
             let mut enc = brotli::CompressorWriter::new(&mut out, 4096, 5, 22);
             enc.write_all(data).unwrap();
         }
+        out
+    }
+
+    /// libzstd at its default level, as `zlib.zstdCompressSync` makes it.
+    fn zstd(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; zstd_safe::compress_bound(data.len())];
+        let n = zstd_safe::compress(&mut out[..], data, 3).unwrap();
+        out.truncate(n);
         out
     }
 
@@ -1381,6 +1524,80 @@ mod tests {
         let failed = decode_all(&[Coding::Gzip], b"NOTGZIPATALL").unwrap_err();
         assert_eq!(failed.message(), "incorrect header check");
         assert_eq!(failed.node_code(), Some(("Z_DATA_ERROR", -3)));
+    }
+
+    /// node v22.22.2 + undici 8.10.2's `undici.fetch` over the same bodies
+    /// (#443): where a frame ends decides what follows it (see ZstdStage).
+    #[test]
+    fn zstd_decodes_like_undici_fetch() {
+        let a = text(50_000, 13);
+        let b = b"SECOND".to_vec();
+        let (za, zb) = (zstd(&a), zstd(&b));
+        assert_eq!(decode_all(&[Coding::Zstd], &za), Ok(a.clone()));
+        assert_eq!(decode_all(&[Coding::Zstd], b""), Ok(Vec::new()));
+        // Truncated: what decoded, never an error (here nothing: the frame's
+        // one block never completed).
+        let cut = decode_all(&[Coding::Zstd], &za[..za.len() / 2]).unwrap();
+        assert!(a.starts_with(&cut));
+        // A frame ending with more in the same write, and output room: the
+        // body ends there, whatever follows.
+        for after in [&zb[..], b"JUNK", b"\0"] {
+            assert_eq!(
+                decode_all(&[Coding::Zstd], &cat(&[&za, after])),
+                Ok(a.clone())
+            );
+        }
+        // A frame ending with its write: the next write is the next frame.
+        let mut sizes = [za.len(), usize::MAX].into_iter();
+        let two = decode_split(&[Coding::Zstd], &cat(&[&za, &zb]), || sizes.next().unwrap());
+        assert_eq!(two, Ok(cat(&[&a, &b])));
+        let mut sizes = [za.len(), usize::MAX].into_iter();
+        let junk = decode_split(&[Coding::Zstd], &cat(&[&za, b"JUNK"]), || {
+            sizes.next().unwrap()
+        });
+        let failed = junk.unwrap_err();
+        assert_eq!(failed.message(), "Unknown frame descriptor");
+        assert_eq!(failed.node_code(), Some(("ZSTD_error_prefix_unknown", 10)));
+        let failed = decode_all(&[Coding::Zstd], b"plain text, not zstd").unwrap_err();
+        assert_eq!(failed.node_code(), Some(("ZSTD_error_prefix_unknown", 10)));
+        // A frame that ends exactly on a full 16 KiB window reads on into the
+        // next frame in the same write; one byte either side does not.
+        for (len, both) in [
+            (OUT_CAP, true),
+            (2 * OUT_CAP, true),
+            (OUT_CAP - 1, false),
+            (OUT_CAP + 1, false),
+        ] {
+            let x = vec![b'x'; len];
+            let wire = cat(&[&zstd(&x), &zb]);
+            let want = if both { cat(&[&x, &b]) } else { x.clone() };
+            assert_eq!(decode_all(&[Coding::Zstd], &wire), Ok(want), "{len}");
+        }
+        // Stacked: `gzip, zstd` is zstd over gzip.
+        assert_eq!(
+            decode_all(&[Coding::Gzip, Coding::Zstd], &zstd(&gzip(&a))),
+            Ok(a.clone())
+        );
+    }
+
+    /// 64 MiB of zeros is a few KB of zstd; it comes out OUT_CAP at a time.
+    #[test]
+    fn zstd_bomb_is_delivered_in_bounded_chunks() {
+        let wire = zstd(&vec![0u8; 64 * 1024 * 1024]);
+        assert!(wire.len() < 8 * 1024, "{}", wire.len());
+        let mut d = Decoder::new(&[Coding::Zstd]);
+        let mut frame = Bytes::from(wire);
+        let (mut total, mut max) = (0usize, 0usize);
+        while let Some(chunk) = d.push(&mut frame).unwrap() {
+            max = max.max(chunk.len());
+            total += chunk.len();
+        }
+        while let Some(chunk) = d.finish().unwrap() {
+            max = max.max(chunk.len());
+            total += chunk.len();
+        }
+        assert_eq!(total, 64 * 1024 * 1024);
+        assert_eq!(max, OUT_CAP);
     }
 
     #[test]

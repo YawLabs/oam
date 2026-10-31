@@ -16,6 +16,19 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`undici.fetch` decodes `content-encoding: zstd`, as undici 7.11 and later do (#443).** oam
+  shadows the npm `undici` package and runs its `fetch` on oam's own client, which decoded `gzip`,
+  `deflate` and `br` by undici 6's rules. So a program on undici 8 got a zstd response's raw frame
+  as the body on oam, where node decodes it. The fetch decoder now has a zstd stage over libzstd
+  (the library node:zlib's zstd uses), bounded to 16 KiB chunks like the others. It ends the body
+  where node's stream loop does: a frame that ends with more of the same read and room in its
+  window ends it, and a frame in a later read is decoded, or fails with libzstd's
+  `ZSTD_error_prefix_unknown`. Global `fetch` is unchanged: node 22's bundled undici 6.24.1 does
+  not decode zstd either. `accept-encoding` is unchanged too; undici 8 adds `zstd` to it, oam does
+  not. See docs/node-divergences.md.
+
 ## [0.19.1] - 2026-10-13
 
 ### Changed
