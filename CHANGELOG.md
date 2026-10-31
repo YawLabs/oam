@@ -27,7 +27,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   window ends it, and a frame in a later read is decoded, or fails with libzstd's
   `ZSTD_error_prefix_unknown`. Global `fetch` is unchanged: node 22's bundled undici 6.24.1 does
   not decode zstd either. `accept-encoding` is unchanged too; undici 8 adds `zstd` to it, oam does
-  not. See docs/node-divergences.md.
+  not. See docs/node-divergences.md. A zstd stage under another coding (`content-encoding: zstd,
+  gzip`) no longer calls libzstd for reads the coding above it outputs nothing for, which after
+  16 in a row failed a valid body with `noForwardProgress_inputEmpty`.
 
 ## [0.19.1] - 2026-10-13
 

@@ -928,6 +928,8 @@ struct ZstdStage {
     dctx: DCtx<'static>,
     /// A frame ended with input left over and output room: the body is over.
     overrun: bool,
+    /// The last call filled its window, so libzstd may hold more output.
+    full: bool,
 }
 
 impl ZstdStage {
@@ -935,6 +937,7 @@ impl ZstdStage {
         ZstdStage {
             dctx: DCtx::create(),
             overrun: false,
+            full: false,
         }
     }
 
@@ -945,14 +948,23 @@ impl ZstdStage {
                 produced: 0,
             });
         }
-        // Called with no input too: libzstd may hold decoded bytes from a
-        // step whose window filled, and an empty call flushes them.
+        // With no input, call only to flush what a filled window left behind:
+        // libzstd fails a stream on its 16th call in a row that moves nothing
+        // (`noForwardProgress_inputEmpty`), and a downstream stage sees an
+        // empty call for every read the stage above it outputs nothing for.
+        if src.is_empty() && !self.full {
+            return Ok(Step {
+                consumed: 0,
+                produced: 0,
+            });
+        }
         let mut input = InBuffer::around(src);
         let (result, produced) = {
             let mut output = OutBuffer::around(&mut *dst);
             let result = self.dctx.decompress_stream(&mut output, &mut input);
             (result, output.pos())
         };
+        self.full = produced == dst.len();
         let frame_ended =
             result.map_err(|code| DecodeError::zstd(ZstdError::from_code(code)))? == 0;
         let consumed = input.pos();
@@ -1578,6 +1590,36 @@ mod tests {
             decode_all(&[Coding::Gzip, Coding::Zstd], &zstd(&gzip(&a))),
             Ok(a.clone())
         );
+    }
+
+    /// `content-encoding: zstd, gzip` puts zstd downstream of gzip, where it
+    /// sees a push for every network read. libzstd fails a stream on its 16th
+    /// call in a row that moves nothing, so reads that give gzip nothing to
+    /// output (empty sync flushes, a block header trickling in) must not reach
+    /// it; node never writes an empty chunk to its zstd stream.
+    #[test]
+    fn zstd_downstream_survives_reads_with_nothing_for_it() {
+        let a = text(50_000, 17);
+        let z = zstd(&a);
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&z[..z.len() / 2]).unwrap();
+        enc.flush().unwrap();
+        let head = enc.get_ref().len();
+        enc.write_all(&z[z.len() / 2..]).unwrap();
+        let gz = enc.finish().unwrap();
+        // 40 empty stored blocks where the sync flush left gzip byte-aligned.
+        let empty: &[u8] = &[0x00, 0x00, 0x00, 0xff, 0xff];
+        let wire = cat(&[&gz[..head], &empty.repeat(40), &gz[head..]]);
+        let mut sizes = std::iter::once(head)
+            .chain(std::iter::repeat_n(empty.len(), 40))
+            .chain(std::iter::repeat(usize::MAX));
+        let out = decode_split(&[Coding::Zstd, Coding::Gzip], &wire, || {
+            sizes.next().unwrap()
+        });
+        assert_eq!(out, Ok(a.clone()));
+        // One byte per read: most reads give gzip nothing to output.
+        let out = decode_split(&[Coding::Zstd, Coding::Gzip], &gzip(&z), || 1);
+        assert_eq!(out, Ok(a));
     }
 
     /// 64 MiB of zeros is a few KB of zstd; it comes out OUT_CAP at a time.
