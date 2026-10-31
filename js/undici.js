@@ -102,6 +102,7 @@
     // fetch() itself, so replacing globalThis.fetch (nock's fetch
     // interception, a test's wrapper) must not answer, block or see them.
     const ownFetch = G.__oamFetchInternal.undiciFetch;
+    const ZSTD_FETCH = Object.freeze({ zstd: true });
     // Where a mock connection leaves its reply's header lines for fetch,
     // which reports them in place of the ones that framed the wire
     // (bootstrap.js connectorReplyHeaders).
@@ -2557,7 +2558,9 @@ ${pendingInterceptorsFormatter.format(pending)}
 
     // ---- web globals undici re-exports -----------------------------------
     const mod = {
-      fetch: (input, init) => ownFetch(input, init),
+      // undici.fetch decodes `content-encoding: zstd`, as undici 7.11 and
+      // later do; global fetch (node 22's undici 6.24.1) does not (#443).
+      fetch: (input, init) => ownFetch(input, init, ZSTD_FETCH),
       request,
       stream,
       Dispatcher,

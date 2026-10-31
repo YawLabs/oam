@@ -1309,6 +1309,18 @@ decode keeps both headers, as in Node: a HEAD or CONNECT request, a 101, 204, 20
 and a coding list holding any other token -- `identity`, an unknown coding, or the empty
 token of `gzip,`.
 
+`undici.fetch` (the npm package's export, which oam shadows) also decodes `zstd`, as undici
+7.11 and later do, so a program on undici 8 gets the same body on both runtimes (#443). Global
+`fetch` does not: node 22's bundled undici is 6.24.1, where `zstd` is an unknown token, and it
+leaves the body as it came. Where a zstd frame ends decides what follows it, as in node's
+stream loop: a frame ending with more of the same network read left, and room in its 16 KiB
+output window, ends the body there (the rest is dropped, a second frame included); a frame
+ending with its read lets the next read start a new frame, or fail as libzstd fails anything
+else (`Unknown frame descriptor`, `ZSTD_error_prefix_unknown`, 10). How node's socket and oam's
+transport split a body into reads can differ, so a body holding more than one zstd frame is the
+one case where the two can disagree. `undici.fetch` still sends the `accept-encoding` above:
+undici 8 adds `zstd` to it, oam does not.
+
 This is `fetch` only. `http.request` goes through the same native op but asks it for the
 raw exchange (#148): the body arrives as the server sent it with both headers intact, as
 in Node, so its callers decode for themselves (`res.pipe(zlib.createGunzip())` when

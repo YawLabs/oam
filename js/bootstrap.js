@@ -3280,11 +3280,12 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // undici.request and a dispatcher's request(): fetch itself, out of reach
   // the same way -- node's undici never calls globalThis.fetch, so a
   // replacement of it (nock's fetch interception, a test's wrapper) neither
-  // answers, blocks nor sees them there.
+  // answers, blocks nor sees them there. `undici` is the shim's own options:
+  // `{ zstd: true }` from undici.fetch (#443).
   Object.defineProperty(globalThis, "__oamFetchInternal", {
     value: Object.freeze({
       fetch: (input, init) => oamFetch(input, init, true),
-      undiciFetch: (input, init) => oamFetch(input, init, false),
+      undiciFetch: (input, init, undici) => oamFetch(input, init, false, undici),
       Headers,
       connectorReply: kConnectorReply,
     }),
@@ -3620,7 +3621,7 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     }
   }
 
-  async function oamFetch(input, init, rawPayload) {
+  async function oamFetch(input, init, rawPayload, undici) {
     // Internal callers that are not fetch in node (http.request, the http2
     // client, undici.request) opt out of every Fetch-level rule below.
     const fetchSemantics = init?.__oamFetchSemantics !== false;
@@ -3757,6 +3758,13 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         headers.unshift(["connection", "keep-alive"]);
       }
     }
+    // undici.fetch decodes `zstd` too, as undici 7.11 and later do
+    // (fetch/index.js: `coding === 'zstd' && typeof
+    // zlib.createZstdDecompress === 'function'`, which oam's zlib has).
+    // Global fetch is node 22's bundled undici 6.24.1, which does not, so it
+    // stays as it is. The accept-encoding fetch sends is unchanged: undici
+    // 7.x sends the list above; only 8.x adds `zstd` (#443).
+    if (fetchSemantics && undici?.zstd === true) request.decode_zstd = true;
     // fetch's own `redirect: "manual"` returns the 3xx (its status, headers
     // and body; `redirected` false, `url` the request's) and `"error"` fails
     // on a redirect status with cause `unexpected redirect`, as node's do:

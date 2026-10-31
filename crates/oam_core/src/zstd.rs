@@ -49,7 +49,7 @@ impl ZstdError {
     /// zstd_errors.h defines `ZSTD_getErrorCode(code)` as `0 - code`, so the
     /// enum value is computed here with the same wrapping arithmetic instead
     /// of through FFI.
-    fn from_code(code: usize) -> Self {
+    pub(crate) fn from_code(code: usize) -> Self {
         let errno = 0usize.wrapping_sub(code) as i32;
         Self {
             errno,
