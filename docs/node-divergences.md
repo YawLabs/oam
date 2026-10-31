@@ -1314,7 +1314,7 @@ token of `gzip,`.
 `fetch` does not: node 22's bundled undici is 6.24.1, where `zstd` is an unknown token, and it
 leaves the body as it came. Where a zstd frame ends decides what follows it, as in node's
 stream loop: a frame ending with more of the same network read left, and room in its 16 KiB
-output window, ends the body there (the rest is dropped, a second frame included); a frame
+output window (what earlier reads left of it, as node keeps the buffer), ends the body there (the rest is dropped, a second frame included); a frame
 ending with its read lets the next read start a new frame, or fail as libzstd fails anything
 else (`Unknown frame descriptor`, `ZSTD_error_prefix_unknown`, 10). How node's socket and oam's
 transport split a body into reads can differ, so a body holding more than one zstd frame is the

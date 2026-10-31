@@ -30,6 +30,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   not. See docs/node-divergences.md. A zstd stage under another coding (`content-encoding: zstd,
   gzip`) no longer calls libzstd for reads the coding above it outputs nothing for, which after
   16 in a row failed a valid body with `noForwardProgress_inputEmpty`.
+  Whether a frame end stops the body is judged against the room node's 16 KiB output buffer has
+  left after earlier reads, as node keeps it from one write to the next, not a fresh 16 KiB.
 
 ## [0.19.1] - 2026-10-13
 

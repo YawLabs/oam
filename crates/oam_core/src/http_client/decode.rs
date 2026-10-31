@@ -922,6 +922,10 @@ impl BrotliStage {
 /// - a frame that ends with the output window exactly full calls again, so
 ///   the rest of the same write is read as the next frame.
 ///
+/// The window is node's `_outBuffer`, which a write that leaves room in it
+/// hands on to the next write: "room" is what is left of the 16 KiB after
+/// everything decoded since it last filled, not a fresh 16 KiB per write.
+///
 /// Measured on node v22.22.2 + undici 8.10.2. Truncated input is not an
 /// error (nothing checks for an unfinished frame) and an empty body is "".
 struct ZstdStage {
@@ -930,6 +934,8 @@ struct ZstdStage {
     overrun: bool,
     /// The last call filled its window, so libzstd may hold more output.
     full: bool,
+    /// Bytes of node's current 16 KiB window already used by earlier calls.
+    used: usize,
 }
 
 impl ZstdStage {
@@ -938,6 +944,7 @@ impl ZstdStage {
             dctx: DCtx::create(),
             overrun: false,
             full: false,
+            used: 0,
         }
     }
 
@@ -958,6 +965,8 @@ impl ZstdStage {
                 produced: 0,
             });
         }
+        let room = (OUT_CAP - self.used).min(dst.len());
+        let dst = &mut dst[..room];
         let mut input = InBuffer::around(src);
         let (result, produced) = {
             let mut output = OutBuffer::around(&mut *dst);
@@ -965,6 +974,7 @@ impl ZstdStage {
             (result, output.pos())
         };
         self.full = produced == dst.len();
+        self.used = if self.full { 0 } else { self.used + produced };
         let frame_ended =
             result.map_err(|code| DecodeError::zstd(ZstdError::from_code(code)))? == 0;
         let consumed = input.pos();
@@ -1584,6 +1594,25 @@ mod tests {
             let wire = cat(&[&zstd(&x), &zb]);
             let want = if both { cat(&[&x, &b]) } else { x.clone() };
             assert_eq!(decode_all(&[Coding::Zstd], &wire), Ok(want), "{len}");
+        }
+        // The window carries over between writes: after a write that decoded
+        // 100 bytes, a frame of 16284 fills what is left of it and one of
+        // 16384 does not, the reverse of a first write.
+        let first = zstd(&[b'a'; 100]);
+        for (len, ok) in [(OUT_CAP - 100, false), (OUT_CAP, true)] {
+            let wire = cat(&[&first, &zstd(&vec![b'a'; len]), b"JUNK"]);
+            let mut sizes = [first.len(), usize::MAX].into_iter();
+            let out = decode_split(&[Coding::Zstd], &wire, || sizes.next().unwrap());
+            if ok {
+                assert_eq!(out, Ok(vec![b'a'; 100 + len]), "{len}");
+            } else {
+                let failed = out.unwrap_err();
+                assert_eq!(
+                    failed.node_code(),
+                    Some(("ZSTD_error_prefix_unknown", 10)),
+                    "{len}"
+                );
+            }
         }
         // Stacked: `gzip, zstd` is zstd over gzip.
         assert_eq!(
