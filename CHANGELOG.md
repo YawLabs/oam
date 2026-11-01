@@ -24,7 +24,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   which Win32 error it was. A system error whose `code` is `UNKNOWN` now has a non-enumerable own
   `winError` with the raw code (536, `ERROR_PIPE_LISTENING`, for a write to a named pipe no client
   has opened), and the report of an uncaught one, or of an unhandled rejection, gains a line
-  naming it before oam's version banner. `message`, `errno`, `code`, `syscall`, `path`,
+  naming it right after the error. `message`, `errno`, `code`, `syscall`, `path`,
   `Object.keys(err)`, `JSON.stringify(err)` and `util.inspect(err)` are node's as before;
   `err.winError`, `Object.getOwnPropertyNames(err)` and `util.inspect(err, { showHidden: true })`
   show it. It is on the errors the sync natives and the stdout/stderr write failures build (#442),
@@ -37,6 +37,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **A `process.chdir` error's own keys come in node's order: `errno`, `code`, `syscall`, `path`,
+  `dest`.** oam's rebuild of the error set `code` before `errno`.
+- **A pipe server's listen error keeps `winError` last.** Every server class adds node's `port: -1`
+  to a pipe's listen error in JS, after the error had already been given its `winError` (#450), so
+  the Win32 code came second to last. It is defined again after the port.
 - **A dns error's own keys come in node's order: `errno`, `code`, `syscall`, `hostname`.** node's
   DNSException assigns `errno` first and always, a number on the `dns.lookup` path and an own
   `undefined` on the `resolve*` and `reverse` paths. oam assigned it last on the lookup path and

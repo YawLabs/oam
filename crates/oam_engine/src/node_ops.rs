@@ -11648,9 +11648,29 @@ fn cpu_info() -> Vec<CpuInfo> {
     use std::fs;
     let stat = fs::read_to_string("/proc/stat").unwrap_or_default();
     let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-    let models = parse_proc_cpuinfo_models(&cpuinfo);
-    let mhz = parse_proc_cpuinfo_mhz(&cpuinfo);
-    parse_proc_stat(&stat)
+    linux_cpu_info(&stat, &cpuinfo, |cpu| {
+        fs::read_to_string(format!(
+            "/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_cur_freq"
+        ))
+        .ok()
+    })
+}
+
+/// Linux: one entry per `cpuN` row of /proc/stat (the online CPUs, by
+/// processor number, which can have gaps), each with the model and the
+/// `cpu MHz` of the /proc/cpuinfo block with the SAME processor number, never
+/// the block in the same position. `cur_freq_khz(cpu)` is that CPU's cpufreq
+/// `scaling_cur_freq` file, if it has one. Split from `cpu_info` so the join
+/// can be tested without the host's /proc and /sys.
+#[cfg(any(target_os = "linux", test))]
+fn linux_cpu_info(
+    stat: &str,
+    cpuinfo: &str,
+    cur_freq_khz: impl Fn(usize) -> Option<String>,
+) -> Vec<CpuInfo> {
+    let models = parse_proc_cpuinfo_models(cpuinfo);
+    let mhz = parse_proc_cpuinfo_mhz(cpuinfo);
+    parse_proc_stat(stat)
         .into_iter()
         .map(|(cpu, times)| {
             let model = models
@@ -11660,14 +11680,11 @@ fn cpu_info() -> Vec<CpuInfo> {
             // libuv: the current cpufreq frequency in kHz, else 0. Where
             // cpufreq is absent (most VMs) oam falls back to the block's
             // "cpu MHz", a line node does not read.
-            let speed = fs::read_to_string(format!(
-                "/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_cur_freq"
-            ))
-            .ok()
-            .and_then(|khz| khz.trim().parse::<u64>().ok())
-            .map(|khz| u32::try_from(khz / 1000).unwrap_or(u32::MAX))
-            .or_else(|| mhz.iter().find(|(n, _)| *n == cpu).map(|(_, m)| *m))
-            .unwrap_or(0);
+            let speed = cur_freq_khz(cpu)
+                .and_then(|khz| khz.trim().parse::<u64>().ok())
+                .map(|khz| u32::try_from(khz / 1000).unwrap_or(u32::MAX))
+                .or_else(|| mhz.iter().find(|(n, _)| *n == cpu).map(|(_, m)| *m))
+                .unwrap_or(0);
             CpuInfo {
                 model,
                 speed,
@@ -11706,6 +11723,41 @@ fn mach_cpu_times(ticks: &[u32], ms_per_tick: u64) -> Vec<CpuTimes> {
 #[cfg(test)]
 mod cpu_info_tests {
     use super::*;
+
+    /// The Linux join: CPUs 0 and 3 online (1 and 2 offline, so /proc/stat
+    /// and /proc/cpuinfo both skip them), the blocks listed out of order.
+    /// Each CPU takes the model and MHz of the block with its own processor
+    /// number; cpufreq's kHz wins over `cpu MHz` and is divided by 1000; a
+    /// CPU with neither speed source is 0; an unparsable cpufreq file falls
+    /// back; a value past u32 saturates rather than wrapping.
+    #[test]
+    fn linux_join_matches_by_processor_number_and_converts_khz() {
+        let stat = "cpu  2 0 2 2 0 0 0 0 0 0\n\
+                    cpu0 1 0 1 1 0 0 0 0 0 0\n\
+                    cpu3 1 0 1 1 0 0 0 0 0 0\n";
+        let cpuinfo = "processor\t: 3\nmodel name\t: Big Core\ncpu MHz\t\t: 2400.000\n\n\
+                       processor\t: 0\nmodel name\t: Little Core\ncpu MHz\t\t: 1200.000\n\n";
+        let freq = |cpu: usize| match cpu {
+            3 => Some("3187200\n".to_string()),
+            _ => None,
+        };
+        let cpus = linux_cpu_info(stat, cpuinfo, freq);
+        let got: Vec<(&str, u32)> = cpus.iter().map(|c| (c.model.as_str(), c.speed)).collect();
+        assert_eq!(got, [("Little Core", 1200), ("Big Core", 3187)]);
+
+        // No speed source at all; a garbage cpufreq file falls back to MHz;
+        // a kHz value past u32::MAX * 1000 saturates.
+        let bare = linux_cpu_info(stat, "processor\t: 0\nmodel name\t: X\n\n", |_| None);
+        assert_eq!(bare.iter().map(|c| c.speed).collect::<Vec<_>>(), [0, 0]);
+        assert_eq!(bare[1].model, "unknown");
+        let junk = linux_cpu_info(stat, cpuinfo, |_| Some("n/a".to_string()));
+        assert_eq!(
+            junk.iter().map(|c| c.speed).collect::<Vec<_>>(),
+            [1200, 2400]
+        );
+        let huge = linux_cpu_info(stat, cpuinfo, |_| Some("99999999999999".to_string()));
+        assert_eq!(huge[0].speed, u32::MAX);
+    }
 
     // Every column distinct, so a swapped or shifted field is caught rather
     // than masked; cpu1 and cpu2 out of order to pin the sort.

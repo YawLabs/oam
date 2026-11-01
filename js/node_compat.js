@@ -11863,6 +11863,22 @@
     return to;
   }
 
+  // node's uvExceptionWithHostPort(err, 'listen', path, -1): a PIPE's listen
+  // error carries port -1, last of node's keys. The native error may already
+  // carry winError (#450), which must stay last of all, so it is defined
+  // again after the port. Used by every server class's pipe-bind rejection.
+  function markPipeListenError(err) {
+    if (err !== null && typeof err === "object" && err.syscall === "listen") {
+      err.port = -1;
+      if (Object.hasOwn(err, "winError")) {
+        const win32 = err.winError;
+        delete err.winError;
+        withWinError(err, win32);
+      }
+    }
+    return err;
+  }
+
   // The definition itself: last and non-enumerable; anything but a number
   // (absent, null) defines nothing.
   function withWinError(err, value) {
@@ -17551,8 +17567,10 @@
             .replace(/^[A-Z][A-Z0-9_]*:\s*/, "")
             .replace(/,\s*chdir\b.*$/, "");
           const err = new Error(`${code}: ${desc}, chdir '${oldCwd}' -> '${dir}'`);
-          err.code = code;
+          // errno first, as node's uvException assigns it (own keys errno,
+          // code, syscall, path, dest; measured on v22.22.2).
           if (e.errno !== undefined) err.errno = e.errno;
+          err.code = code;
           err.syscall = "chdir";
           err.path = oldCwd;
           err.dest = dir;
@@ -26579,7 +26597,7 @@
             // node's uvExceptionWithHostPort: a PIPE's bind error carries
             // port -1 (last of its keys), as net's own pipe path reports --
             // a TCP bind error keeps the real port.
-            if (path !== undefined && err && err.syscall === "listen") err.port = -1;
+            if (path !== undefined) markPipeListenError(err);
             if (serverBindCancelled(this, bind, null, () => emitClosedServerClose(this), err)) return;
             emitServerBindError(this, err);
           },
@@ -34059,7 +34077,7 @@
           (err) => {
             // node's uvExceptionWithHostPort(err, 'listen', path, -1): a
             // pipe's listen error carries port -1, last of its keys.
-            if (path !== undefined && err && err.syscall === "listen") err.port = -1;
+            if (path !== undefined) markPipeListenError(err);
             if (serverBindCancelled(
               this, bind, null, () => emitServerCloseIfDrained(this, live), err,
             )) return;
@@ -36471,7 +36489,7 @@
             // node's uvExceptionWithHostPort: a PIPE's bind error carries
             // port -1, as net's own pipe path reports -- a TCP bind error
             // keeps the real port.
-            if (path !== undefined && e && e.syscall === "listen") e.port = -1;
+            if (path !== undefined) markPipeListenError(e);
             if (serverBindCancelled(this, bind, null, emitClosed, e)) return;
             emitServerBindError(this, e);
           },
@@ -39819,7 +39837,7 @@
             // node's uvExceptionWithHostPort: a PIPE's bind error carries
             // port -1, as net's own pipe path reports -- a TCP bind error
             // keeps the real port.
-            if (path !== undefined && err && err.syscall === "listen") err.port = -1;
+            if (path !== undefined) markPipeListenError(err);
             if (serverBindCancelled(self, bind, null, emitClosed, err)) return;
             emitServerBindError(self, err);
           },
@@ -44369,7 +44387,7 @@
           (err) => {
             // node's uvExceptionWithHostPort(err, 'listen', path, -1): a
             // pipe's listen error carries port -1, last of its keys.
-            if (path !== undefined && err && err.syscall === "listen") err.port = -1;
+            if (path !== undefined) markPipeListenError(err);
             var e = typeof err === "string" ? new Error(err) : err;
             if (serverBindCancelled(
               this, bind, null, () => emitServerCloseIfDrained(this, live), e,

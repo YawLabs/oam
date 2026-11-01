@@ -960,9 +960,9 @@ writable and configurable, and defined last, so `message`, `errno`, `code`, `sys
 `err.winError`, `Object.getOwnPropertyNames(err)`, `Object.getOwnPropertyDescriptor` and
 `util.inspect(err, { showHidden: true })` (`[winError]: 536`) show it. The report of an
 uncaught one -- the unheard `'error'` on stdout that prompted #442 -- and of an unhandled
-rejection whose reason carries it, gains one line node's has not, after `util.inspect`'s
-body and before oam's version banner: `winError: 536 (oam: the Win32 error code behind
-UNKNOWN)`. A worker's fatal error reaches the parent's `'error'` event with the property,
+rejection whose reason carries it, gains one line node's has not, right after
+`util.inspect`'s body (before oam's version banner, in the uncaught report that has one):
+`winError: 536 (oam: the Win32 error code behind UNKNOWN)`. A worker's fatal error reaches the parent's `'error'` event with the property,
 still non-enumerable, as node's error serialization would carry it; `postMessage` and
 `structuredClone` drop it, as they drop `errno` and `code` on both runtimes.
 

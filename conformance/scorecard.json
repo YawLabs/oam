@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "ccf36fff",
+  "commit": "523e4bad",
   "oamVersion": "oam 0.19.1",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 412,
-      "total": 413,
+      "pass": 413,
+      "total": 414,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -1501,6 +1501,10 @@
         },
         {
           "case": "58-child-extra-fd-ipc.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "580-os-cpus-count-and-sources.mjs",
           "status": "pass"
         },
         {
