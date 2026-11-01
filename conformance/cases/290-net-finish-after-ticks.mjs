@@ -93,6 +93,13 @@ for (const [from, schedule] of [
 // (oam once ran 'finish' at the very next turn, ahead of a sibling timer or
 // immediate already due, so the sibling's resetAndDestroy() reset a socket
 // node refuses to reset.)
+//
+// Each sibling-timer scenario spins after arming both timers. Node stamps
+// every setTimeout() with a fresh clock read, so a millisecond boundary
+// falling between the two calls leaves the sibling 1 ms short of due when
+// the timers phase that runs t1 begins; it then runs after 'finish' (node
+// itself printed "t1 end | finish | t2" on the linux release builder,
+// 2026-11-01). Spinning past both deadlines makes both due in that phase.
 const spin = (ms) => {
   const start = Date.now();
   while (Date.now() - start < ms);
@@ -108,10 +115,12 @@ for (const [name, act] of [
   ["timer end(), sibling timer", (s, log) => {
     setTimeout(() => { log.push("t1 end"); s.end(); }, 5);
     setTimeout(() => log.push("t2"), 5);
+    spin(10);
   }],
   ["timer end() in a tick, sibling timer", (s, log) => {
     setTimeout(() => { log.push("t1"); process.nextTick(() => s.end()); }, 5);
     setTimeout(() => log.push("t2"), 5);
+    spin(10);
   }],
   ["timer end(), immediate from it, sibling timer", (s, log) => {
     setTimeout(() => {
@@ -120,6 +129,7 @@ for (const [name, act] of [
       setImmediate(() => log.push("immediate"));
     }, 5);
     setTimeout(() => log.push("t2"), 5);
+    spin(10);
   }],
   ["timer end(), a timer it sets due before it returns", (s, log) => {
     setTimeout(() => {
@@ -132,6 +142,7 @@ for (const [name, act] of [
   ["timer end(), sibling timer resetAndDestroy()", (s, log) => {
     setTimeout(() => { log.push("t1 end"); s.end(); }, 5);
     setTimeout(() => { log.push("t2 reset"); reset(s, log); }, 5);
+    spin(10);
   }],
   ["immediate end(), sibling immediates, one from it", (s, log) => {
     setImmediate(() => {
