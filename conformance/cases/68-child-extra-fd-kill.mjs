@@ -34,23 +34,41 @@ if (!supported) {
   const r1 = await new Promise((done) => {
     const cp = spawn(process.execPath, [sleeper], { stdio });
     cp.on("spawn", () => setTimeout(() => cp.kill("SIGTERM"), 150));
-    cp.on("close", (code, signal) => done(`sigterm code=${code} signal=${signal}`));
-    setTimeout(() => done("sigterm TIMEOUT"), 8000);
+    cp.on("close", (code, signal) => {
+      clearTimeout(watchdog);
+      done(`sigterm code=${code} signal=${signal}`);
+    });
+    const watchdog = setTimeout(() => done("sigterm TIMEOUT"), 8000);
   });
   console.log(r1);
   rmSync(sleeper, { force: true });
 
   // 2. Trapped SIGUSR1 -> the child survives the signal and exits 0 on its own.
+  //    The kill waits for a ready byte the child writes on stdout only AFTER
+  //    process.on('SIGUSR1') is installed. It used to fire a fixed 200 ms after
+  //    'spawn', which raced the child's startup: on a slow host (an x86_64
+  //    Linux container under Rosetta) an oam child took ~250 ms to install the
+  //    handler, so SIGUSR1's default action killed it and the line read
+  //    code=null signal=SIGUSR1 against node's code=0. A host-timing defect in
+  //    the case, not a runtime one -- same family as the other node-differential
+  //    flake fixes (cases 392/425/465/521/573). The 8 s watchdog stays.
   const trapper = path.join(dir, `oam-conf-kill-trap-${process.pid}.cjs`);
   writeFileSync(
     trapper,
-    "process.on('SIGUSR1', () => process.exit(0)); setTimeout(()=>process.exit(9), 30000);",
+    "process.on('SIGUSR1', () => process.exit(0)); require('fs').writeSync(1, 'r');" +
+      " setTimeout(()=>process.exit(9), 30000);",
   );
   const r2 = await new Promise((done) => {
     const cp = spawn(process.execPath, [trapper], { stdio });
-    cp.on("spawn", () => setTimeout(() => cp.kill("SIGUSR1"), 200));
-    cp.on("close", (code, signal) => done(`trapped code=${code} signal=${signal}`));
-    setTimeout(() => done("trapped TIMEOUT"), 8000);
+    cp.stdout.once("data", () => cp.kill("SIGUSR1"));
+    // Drain stderr so a chatty child cannot fill the pipe and stall into the
+    // watchdog.
+    cp.stderr.resume();
+    cp.on("close", (code, signal) => {
+      clearTimeout(watchdog);
+      done(`trapped code=${code} signal=${signal}`);
+    });
+    const watchdog = setTimeout(() => done("trapped TIMEOUT"), 8000);
   });
   console.log(r2);
   rmSync(trapper, { force: true });
@@ -65,9 +83,10 @@ if (!supported) {
       // The child is already reaped by the time close fires; a late kill must
       // not change the report.
       cp.kill("SIGTERM");
+      clearTimeout(watchdog);
       done(`late-kill code=${code} signal=${signal}`);
     });
-    setTimeout(() => done("late-kill TIMEOUT"), 8000);
+    const watchdog = setTimeout(() => done("late-kill TIMEOUT"), 8000);
   });
   console.log(r3);
   rmSync(quick, { force: true });
