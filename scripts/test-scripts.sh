@@ -1100,7 +1100,30 @@ if [ -f "$MLM/mkdir-race" ] && [ "\$1" = "$MLM/home/.lima-build.lock" ]; then
 fi
 exec "$ML_REAL_MKDIR" "\$@"
 EOF
-chmod +x "$MLM/bin/limactl" "$MLM/bin/stat" "$MLM/bin/mkdir"
+# ...and an mv that, with $MLM/mv-race, plays the run that slips in while
+# this one renames the lock aside (to .stale.<pid> or .release.<pid>): once,
+# right after that rename, the moved dir's owner becomes another run's
+# (y-new), and with "retake" in the file yet another run (y-third) also
+# takes the freed path, so nothing can be put back.
+ML_REAL_MV="$(command -v mv)"
+cat > "$MLM/bin/mv" <<EOF
+#!/bin/bash
+if [ -f "$MLM/mv-race" ] && [ "\$#" = 2 ] && [ "\$1" = "$MLM/home/.lima-build.lock" ]; then
+  case "\$2" in
+    "$MLM/home/.lima-build.lock.stale."*|"$MLM/home/.lima-build.lock.release."*)
+      mode="\$(cat "$MLM/mv-race")"; rm -f "$MLM/mv-race"
+      "$ML_REAL_MV" "\$1" "\$2" || exit
+      printf 'repo=yaw\ninstance=yaw-linux\nrun=y-new\nhost=other-box\npid=4545\nstarted=2026-11-01T00:00:00Z\n' > "\$2/owner"
+      if [ "\$mode" = "retake" ]; then
+        "$ML_REAL_MKDIR" "\$1"
+        printf 'repo=yaw\ninstance=yaw-linux\nrun=y-third\nhost=other-box\npid=4646\nstarted=2026-11-01T00:00:00Z\n' > "\$1/owner"
+      fi
+      exit 0 ;;
+  esac
+fi
+exec "$ML_REAL_MV" "\$@"
+EOF
+chmod +x "$MLM/bin/limactl" "$MLM/bin/stat" "$MLM/bin/mkdir" "$MLM/bin/mv"
 cat > "$ML/bin/ssh" <<EOF
 #!/bin/bash
 cmd="\${!#}"
@@ -1183,8 +1206,8 @@ ml(){
 ml_calls_of(){ grep -c -- "$1" <<<"$ML_CALLS"; }
 ml_reset(){
   rm -f "$ML"/fail-* "$ML"/drop-* "$ML"/drops-* "$ML/sum-override" "$ML/status-others-none" "$MLM/list-fail" \
-        "$ML/lock-drop" "$ML/stop-fails" "$MLM/stat-mode" "$MLM/mkdir-race" "$MLM/mkdir-attempts"
-  rm -rf "$MLM/home/.lima-build.lock"
+        "$ML/lock-drop" "$ML/stop-fails" "$MLM/stat-mode" "$MLM/mkdir-race" "$MLM/mkdir-attempts" "$MLM/mv-race"
+  rm -rf "$MLM/home/.lima-build.lock" "$MLM/home/.lima-build.lock".*
   printf '%s\n' "$ML_ST_STOPPED" > "$ML/status"; printf '%s\n' "$ML_GLIBC_OK" > "$ML/glibc"
   echo "oam-linux Stopped" > "$MLM/lima"
 }
@@ -1423,7 +1446,7 @@ if [ -z "$ML_LEFT" ] && [ ! -e scripts/build-platforms-g''cp-iap.sh ] && [ ! -e 
 else fail "still there: $ML_LEFT"; fi
 
 # =============================================================================
-group "the Mac build lock (protocol v1) -- mac-linux-vm.sh lock/unlock and the leg"
+group "the Mac build lock (protocol v1.1) -- mac-linux-vm.sh lock/unlock and the leg"
 # =============================================================================
 # ~/.lima-build.lock on the build Mac, shared with the Yaw repo's linux leg.
 # The driver's lock verbs run for real against the fake Mac set up in the
@@ -1485,37 +1508,111 @@ if [ "$LK_RC" = "3" ] && grep -qF 'BUSY' <<<"$LK_ERR" \
    && grep -qxF 'run=y-run-9' "$LK/owner"; then pass
 else fail "rc=$LK_RC err: $LK_ERR"; fi
 
+# STALE needs BOTH: the owner's instance not Running AND the lock dir over
+# 15 minutes (900 s) old. A fresh lock whose VM is stopped is a run that
+# provisions or preflights with its VM down: BUSY.
 ml_reset
 lk_plant yaw yaw-linux y-run-9
 printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk_age 840
 lk lock r1 oam oam-linux box-1 77
-LK_STOPPED="$LK_RC|$(grep -c 'STALE.*run=y-run-9' <<<"$LK_ERR")|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)"
+it "lock: an owned lock under 15 min whose instance is Stopped is BUSY (exit 3) -- not taken over, owner untouched"
+if [ "$LK_RC" = "3" ] && grep -qF 'only' <<<"$LK_ERR" && grep -qF 'run=y-run-9' <<<"$LK_ERR" \
+   && ! grep -qF 'STALE' <<<"$LK_ERR" && grep -qxF 'run=y-run-9' "$LK/owner"; then pass
+else fail "rc=$LK_RC err: $LK_ERR"; fi
+
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk_age 1000
+lk lock r1 oam oam-linux box-1 77
+LK_STOPPED="$LK_RC|$(grep -c 'STALE.*run=y-run-9' <<<"$LK_ERR")|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
 ml_reset
 lk_plant yaw yaw-gone y-run-8
+lk_age 1000
 lk lock r1 oam oam-linux box-1 77
-LK_MISSING="$LK_RC|$(grep -c 'STALE' <<<"$LK_ERR")|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)"
-it "lock: held by a run whose instance is Stopped, or missing from limactl, is STALE -- logged, taken over"
-if [ "$LK_STOPPED" = "0|1|1" ] && [ "$LK_MISSING" = "0|1|1" ]; then pass
+LK_MISSING="$LK_RC|$(grep -c 'STALE' <<<"$LK_ERR")|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+it "lock: an owned lock over 15 min whose instance is Stopped, or missing from limactl, is STALE -- logged, taken over, nothing left aside"
+if [ "$LK_STOPPED" = "0|1|1|0" ] && [ "$LK_MISSING" = "0|1|1|0" ]; then pass
 else fail "stopped: $LK_STOPPED missing: $LK_MISSING err: $LK_ERR"; fi
 
 ml_reset
-mkdir -p "$LK"
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
+lk_age 100000
 lk lock r1 oam oam-linux box-1 77
-LK_YOUNG="$LK_RC|$(grep -c 'mid-acquire' <<<"$LK_ERR")|$([ -e "$LK/owner" ] && echo owner)"
-lk_age 120
-lk lock r1 oam oam-linux box-1 77
-LK_OLD="$LK_RC|$(grep -c 'STALE' <<<"$LK_ERR")|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)"
-it "lock: an ownerless lock dir is BUSY under 60 s (someone mid-acquire), STALE and taken over past it"
-if [ "$LK_YOUNG" = "3|1|" ] && [ "$LK_OLD" = "0|1|1" ]; then pass
-else fail "young: $LK_YOUNG old: $LK_OLD err: $LK_ERR"; fi
+it "lock: an owned lock however old is BUSY while its instance is Running"
+if [ "$LK_RC" = "3" ] && ! grep -qF 'STALE' <<<"$LK_ERR" && grep -qF 'yaw-linux is Running' <<<"$LK_ERR" \
+   && grep -qxF 'run=y-run-9' "$LK/owner"; then pass
+else fail "rc=$LK_RC err: $LK_ERR"; fi
 
 ml_reset
-mkdir -p "$LK"; lk_age 120
+mkdir -p "$LK"
+lk_age 840
+lk lock r1 oam oam-linux box-1 77
+LK_YOUNG="$LK_RC|$(grep -c 'mid-acquire' <<<"$LK_ERR")|$([ -e "$LK/owner" ] && echo owner)|$([ -d "$LK" ] && echo kept)"
+lk_age 1000
+lk lock r1 oam oam-linux box-1 77
+LK_OLD="$LK_RC|$(grep -c 'STALE' <<<"$LK_ERR")|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)"
+it "lock: an ownerless lock dir is BUSY under 15 min (someone mid-acquire), STALE and taken over past it"
+if [ "$LK_YOUNG" = "3|1||kept" ] && [ "$LK_OLD" = "0|1|1" ]; then pass
+else fail "young: $LK_YOUNG old: $LK_OLD err: $LK_ERR"; fi
+
+# The takeover renames the lock aside and re-reads it there: a lock that
+# changed hands between the judgement and the rename goes back, untouched.
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk_age 1000
+: > "$MLM/mv-race"
+lk lock r1 oam oam-linux box-1 77
+LK_TR="$LK_RC|$(grep -c 'changed hands' <<<"$LK_ERR")|$(grep -c 'put back' <<<"$LK_ERR")|$(grep -c '^run=y-new$' "$LK/owner" 2>/dev/null)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+ml_reset
+mkdir -p "$LK"; lk_age 1000
+: > "$MLM/mv-race"
+lk lock r1 oam oam-linux box-1 77
+LK_TR_OWNERLESS="$LK_RC|$(grep -c '^run=y-new$' "$LK/owner" 2>/dev/null)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+it "lock: a stale lock that changes hands while it is renamed aside (run= differs, or an ownerless one gains an owner) is put back -- BUSY"
+if [ "$LK_TR" = "3|1|1|1|0" ] && [ "$LK_TR_OWNERLESS" = "3|1|0" ]; then pass
+else fail "owned: $LK_TR ownerless: $LK_TR_OWNERLESS err: $LK_ERR"; fi
+
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk_age 1000
+echo retake > "$MLM/mv-race"
+lk lock r1 oam oam-linux box-1 77
+LK_ASIDE="$(ls -d "$LK".stale.* 2>/dev/null | head -n1)"
+it "lock: ...and when the path is taken again before it can go back, the displaced lock stays aside, reported, not deleted -- BUSY"
+if [ "$LK_RC" = "3" ] && [ -n "$LK_ASIDE" ] && grep -qxF 'run=y-new' "$LK_ASIDE/owner" 2>/dev/null \
+   && grep -qxF 'run=y-third' "$LK/owner" && grep -qF 'not deleted' <<<"$LK_ERR" \
+   && grep -qF "${LK_ASIDE##*/}" <<<"$LK_ERR"; then pass
+else fail "rc=$LK_RC aside='$LK_ASIDE' err: $LK_ERR"; fi
+
+# Unlock renames the lock aside too, and removes it only when the moved
+# owner's run= is this run's.
+ml_reset
+lk lock r1 oam oam-linux box-1 77
+: > "$MLM/mv-race"
+lk unlock r1
+LK_UN_SWAP="$LK_RC|$(grep -c 'changed hands' <<<"$LK_ERR")|$(grep -c '^run=y-new$' "$LK/owner" 2>/dev/null)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+ml_reset
+lk lock r1 oam oam-linux box-1 77
+echo retake > "$MLM/mv-race"
+lk unlock r1
+LK_ASIDE="$(ls -d "$LK".release.* 2>/dev/null | head -n1)"
+LK_UN_RETAKE="$LK_RC|$(grep -c '^run=y-third$' "$LK/owner" 2>/dev/null)|$(grep -c '^run=y-new$' "$LK_ASIDE/owner" 2>/dev/null)|$(grep -c 'NOT deleted' <<<"$LK_ERR")"
+it "unlock: a lock whose run= differs once renamed aside is put back (exit 3); with the path re-taken it stays aside, reported (exit 4); nothing of another run's deleted"
+if [ "$LK_UN_SWAP" = "3|1|1|0" ] && [ "$LK_UN_RETAKE" = "4|1|1|1" ]; then pass
+else fail "swap: $LK_UN_SWAP retake: $LK_UN_RETAKE err: $LK_ERR"; fi
+
+ml_reset
+mkdir -p "$LK"; lk_age 1000
 echo gnu > "$MLM/stat-mode"
 lk lock r1 oam oam-linux box-1 77
 LK_GNU="$LK_RC|$(grep -c 'STALE' <<<"$LK_ERR")|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)"
 ml_reset
-mkdir -p "$LK"; lk_age 120
+mkdir -p "$LK"; lk_age 1000
 echo none > "$MLM/stat-mode"
 lk lock r1 oam oam-linux box-1 77
 LK_NOSTAT="$LK_RC|$(grep -c "age could not be read" <<<"$LK_ERR")|$([ -d "$LK" ] && echo kept)|$([ -e "$LK/owner" ] && echo owner)"
@@ -1528,6 +1625,7 @@ else fail "gnu: $LK_GNU none: $LK_NOSTAT err: $LK_ERR"; fi
 ml_reset
 lk_plant yaw yaw-linux y-run-9
 printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk_age 1000
 : > "$MLM/mkdir-race"
 lk lock r1 oam oam-linux box-1 77
 LK_RACE_N="$(wc -l < "$MLM/mkdir-attempts" 2>/dev/null | tr -d ' ')"
@@ -1670,6 +1768,40 @@ it "leg: a BUSY lock verb leaves the other run's lock alone -- no unlock call; t
 if [ "$ML_RC" = "1" ] && [ "$(ml_calls_of ' unlock ')" = "0" ] && grep -qxF 'run=y-run-9' "$LK/owner" \
    && grep -qF '/opt/homebrew/bin/limactl stop yaw-linux' <<<"$ML_ERR"; then pass
 else fail "rc=$ML_RC calls: $ML_CALLS stderr: $ML_ERR"; fi
+
+# The lock verb takes over a stale lock (its STALE note names that lock's
+# instance), then finds a neighbour Running and refuses: the leg names the
+# NEIGHBOUR to stop, and prints no rm hint -- the lock verb released the
+# lock, so there is none to clear.
+ml_reset
+lk_plant yaw yaw-old y-run-7
+lk_age 1000
+printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
+: > "$ML/status-others-none"
+ml -- --preflight-only
+ML_NB_FAIL="$(grep -F '[fail]' <<<"$ML_ERR")"
+it "leg: a STALE takeover then a neighbour refusal names the neighbour to stop, not the stale owner, and no rm hint"
+if [ "$ML_RC" = "1" ] && [ ! -e "$LK" ] && grep -qF 'STALE' <<<"$ML_ERR" \
+   && grep -qF '/opt/homebrew/bin/limactl stop yaw-linux' <<<"$ML_ERR" \
+   && ! grep -qF 'limactl stop yaw-old' <<<"$ML_ERR" && ! grep -qF 'rm -rf ~/.lima-build.lock' <<<"$ML_ERR" \
+   && grep -qF 'yaw-linux' <<<"$ML_NB_FAIL" && [ "$(ml_calls_of ' unlock ')" = "0" ]; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS stderr: $ML_ERR"; fi
+
+# The status saw one owner (y-run-9, stale); by the lock verb's retry another
+# run (y-race) had the lock. The BUSY message's owner and stop command are
+# the Mac's answer, not the pre-lock snapshot.
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+lk_age 1000
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+: > "$MLM/mkdir-race"
+ml -- --preflight-only
+ML_OWNER_LINE="$(grep -F 'Owner:' <<<"$ML_ERR")"
+it "leg: on BUSY the Owner line comes from the Mac's BUSY answer, not the status taken before the lock"
+if [ "$ML_RC" = "1" ] && grep -qF 'run=y-race' <<<"$ML_OWNER_LINE" && ! grep -qF 'run=y-run-9' <<<"$ML_OWNER_LINE" \
+   && grep -qF '/opt/homebrew/bin/limactl stop yaw-linux' <<<"$ML_ERR" && grep -qF 'rm -rf ~/.lima-build.lock' <<<"$ML_ERR" \
+   && grep -qxF 'run=y-race' "$LK/owner"; then pass
+else fail "rc=$ML_RC owner-line: $ML_OWNER_LINE stderr: $ML_ERR"; fi
 ml_reset
 
 # =============================================================================

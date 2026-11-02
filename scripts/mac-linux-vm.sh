@@ -68,7 +68,7 @@
 #                                Mac-home relative>
 #
 # The Mac build lock (shared with the Yaw repo's linux leg, which drives its
-# own Lima instance on the same Mac; protocol v1, agreed between the two):
+# own Lima instance on the same Mac; protocol v1.1, agreed between the two):
 #   lock <runid> <repo> <instance> [<host> <pid>]
 #                                take ~/.lima-build.lock for this run; exit 0
 #                                acquired, 3 BUSY (the owner on stderr), 1 an
@@ -76,7 +76,10 @@
 #                                in the owner file (default unknown / 0).
 #   unlock <runid>               remove the lock only if its owner is <runid>;
 #                                exit 0 released (or no lock), 3 held by
-#                                another run (left alone, owner on stderr)
+#                                another run (left alone, owner on stderr),
+#                                4 another run's lock was moved aside and the
+#                                path was re-taken before it could go back
+#                                (left aside, reported, never deleted)
 # These two take their own arguments, not <instance> second. See do_lock.
 # status also reports others=<other Running instances, comma-separated|none>
 # and lock=<none|ownerless|held>, with lock.<key>=<value> per owner line.
@@ -218,15 +221,28 @@ do_status() {
   fi
 }
 
-# --- the Mac build lock (protocol v1) -------------------------------------------
+# --- the Mac build lock (protocol v1.1) -----------------------------------------
 # One lock for the whole Mac, a directory in the build user's home: what two
 # repos' linux legs share is the Mac's memory and disk, not any name
 # (yaw-linux and oam-linux share none). mkdir is the atomic step; the owner
 # file is written beside it and renamed into place, so a reader sees a whole
-# owner or none. Whether a held lock may be taken over is decided from the
-# owner's own instance alone: Running is BUSY; anything else (Stopped,
-# missing, limactl erroring on it) means that run is over -- STALE. A lock
-# whose owner file never appeared is a run mid-acquire for 60 s, STALE after.
+# owner or none.
+#
+# A held lock is STALE -- taken over -- only when BOTH its owner's Lima
+# instance is not Running (Stopped, missing, limactl erroring on it) AND the
+# lock dir is older than LOCK_STALE_AFTER: a run holds the lock with its VM
+# stopped while it provisions or preflights, and must not lose it then.
+# Anything else is BUSY, and so is a lock whose age cannot be read. A lock
+# dir with no owner file is a run mid-acquire: STALE past the same age, BUSY
+# before it.
+#
+# Nothing removes a lock in place. A takeover renames the lock aside
+# (~/.lima-build.lock.stale.<pid>) and removes it only if the renamed dir is
+# still the one judged stale (the same run=, or still ownerless); a release
+# renames it to ~/.lima-build.lock.release.<pid> and removes it only if its
+# run= is this run's. On a mismatch the dir goes back if the path is still
+# free; if not, it is left where it is and reported, never deleted.
+LOCK_STALE_AFTER=900
 
 # lima_others <instance>  -- the OTHER Running instances, comma-separated, or
 # "none"; non-zero when limactl cannot list them.
@@ -236,49 +252,88 @@ lima_others() {
   awk -v n="$1" '$1 != n && $2 == "Running" { printf "%s%s", sep, $1; sep = "," } END { if (sep == "") printf "none" }' <<<"$list"
 }
 
-# owner_field <key>  -- one key of the owner file; empty when absent.
-owner_field() {
-  awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$LOCK_DIR/owner" 2>/dev/null || true
+# kv_of <key> <text>  -- one key of an owner file's text; empty when absent.
+kv_of() {
+  printf '%s\n' "$2" | awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; exit }'
+}
+
+# lock_ident <dir>  -- whose lock dir this is: run=<id> (it has an owner
+# file), ownerless, or gone.
+lock_ident() {
+  local owner
+  if owner="$(cat "$1/owner" 2>/dev/null)"; then echo "run=$(kv_of run "$owner")"
+  elif [ -d "$1" ]; then echo ownerless
+  else echo gone
+  fi
+}
+
+# lock_owner_text <dir>  -- the owner file on one line; empty when there is none.
+lock_owner_text() {
+  local t
+  t="$(tr '\n' ' ' < "$1/owner" 2>/dev/null || true)"
+  printf '%s' "${t% }"
+}
+
+# lock_age  -- the lock dir's age in seconds; non-zero when it cannot be read.
+# macOS stat (-f %m) first, then GNU stat (-c %Y), for a Mac with coreutils'
+# stat first on PATH -- where `-f %m` means file-system status of a file named
+# %m, fails, and may still print text -- so each answer counts only when it
+# is a number.
+lock_age() {
+  local mt
+  mt="$(stat -f %m "$LOCK_DIR" 2>/dev/null || true)"
+  [[ "$mt" =~ ^[0-9]+$ ]] || mt="$(stat -c %Y "$LOCK_DIR" 2>/dev/null || true)"
+  [[ "$mt" =~ ^[0-9]+$ ]] || return 1
+  echo $(( $(date +%s) - mt ))
 }
 
 # lock_classify  -- the lock dir was there when this run's mkdir ran: sets
-# LOCK_CLASS to busy, stale or gone (released meanwhile) and LOCK_OWNER to
-# the owner on one line, for the message.
+# LOCK_CLASS to busy, stale or gone (released meanwhile), LOCK_IDENT to what
+# lock_ident says of it, and LOCK_OWNER to the owner and the reason on one
+# line, for the message.
 lock_classify() {
-  local owner inst st mt age
-  owner="$(cat "$LOCK_DIR/owner" 2>/dev/null || true)"
-  if [ -n "$owner" ]; then
+  local owner inst st age
+  LOCK_CLASS=busy
+  if owner="$(cat "$LOCK_DIR/owner" 2>/dev/null)"; then
+    LOCK_IDENT="run=$(kv_of run "$owner")"
     LOCK_OWNER="$(printf '%s\n' "$owner" | tr '\n' ' ')"; LOCK_OWNER="${LOCK_OWNER% }"
-    inst="$(owner_field instance)"
+    inst="$(kv_of instance "$owner")"
     st=""
     # A name that is not a Lima name is not an instance limactl could report
-    # Running: stale, like a missing one. (It never reaches limactl's argv.)
+    # Running, like a missing one. (It never reaches limactl's argv.)
     if [[ "$inst" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]]; then
       st="$(limactl list --format '{{.Status}}' "$inst" 2>/dev/null | head -n1 || true)"
     fi
-    if [ "$st" = "Running" ]; then LOCK_CLASS=busy; else LOCK_CLASS=stale; fi
+    if [ "$st" = "Running" ]; then
+      LOCK_OWNER="$LOCK_OWNER -- its VM $inst is Running"
+      return 0
+    fi
+    if ! age="$(lock_age)"; then
+      if [ ! -d "$LOCK_DIR" ]; then LOCK_CLASS=gone; LOCK_OWNER="<released while it was read>"; return 0; fi
+      LOCK_OWNER="$LOCK_OWNER -- its VM is ${st:-not listed}, but the lock's age could not be read (neither 'stat -f %m' nor 'stat -c %Y' gave a number) -- if that run is over: rm -rf ~/.lima-build.lock"
+      return 0
+    fi
+    if [ "$age" -gt "$LOCK_STALE_AFTER" ]; then
+      LOCK_CLASS=stale
+      LOCK_OWNER="$LOCK_OWNER -- its VM is ${st:-not listed} and the lock is ${age}s old"
+    else
+      LOCK_OWNER="$LOCK_OWNER -- its VM is ${st:-not listed}, but the lock is only ${age}s old (stale only after ${LOCK_STALE_AFTER}s with no VM Running)"
+    fi
     return 0
   fi
   if [ ! -d "$LOCK_DIR" ]; then LOCK_CLASS=gone; LOCK_OWNER="<released while it was read>"; return 0; fi
-  # The dir's mtime in epoch seconds: macOS stat (-f %m) first, then GNU stat
-  # (-c %Y), for a Mac with coreutils' stat first on PATH -- where `-f %m`
-  # means file-system status of a file named %m, fails, and may still print
-  # text, so each answer counts only when it is a number.
-  mt="$(stat -f %m "$LOCK_DIR" 2>/dev/null || true)"
-  [[ "$mt" =~ ^[0-9]+$ ]] || mt="$(stat -c %Y "$LOCK_DIR" 2>/dev/null || true)"
-  if ! [[ "$mt" =~ ^[0-9]+$ ]]; then
+  LOCK_IDENT=ownerless
+  if ! age="$(lock_age)"; then
     if [ ! -d "$LOCK_DIR" ]; then LOCK_CLASS=gone; LOCK_OWNER="<released while it was read>"; return 0; fi
     # Unknown age is never taken over and never retried: BUSY, and a human
     # looks at it.
-    LOCK_CLASS=busy
     LOCK_OWNER="<no owner file, and its age could not be read (neither 'stat -f %m' nor 'stat -c %Y' gave a number) -- if no run is mid-acquire: rm -rf ~/.lima-build.lock>"
     return 0
   fi
-  age=$(( $(date +%s) - mt ))
-  if [ "$age" -gt 60 ]; then
+  if [ "$age" -gt "$LOCK_STALE_AFTER" ]; then
     LOCK_CLASS=stale; LOCK_OWNER="<no owner file; the lock dir is ${age}s old>"
   else
-    LOCK_CLASS=busy; LOCK_OWNER="<no owner file; the lock dir is ${age}s old -- another run is mid-acquire>"
+    LOCK_OWNER="<no owner file; the lock dir is ${age}s old -- another run is mid-acquire (stale only after ${LOCK_STALE_AFTER}s)>"
   fi
 }
 
@@ -287,9 +342,84 @@ lock_busy() {
   exit 3
 }
 
+# lock_put_back <moved-dir>  -- rename a dir this run moved aside back to
+# ~/.lima-build.lock, only while that path is free. mv onto a dir that
+# appeared in between would land INSIDE it; that is undone and counts as not
+# put back. Non-zero when it is not back.
+lock_put_back() {
+  local moved="$1"
+  [ ! -e "$LOCK_DIR" ] || return 1
+  mv "$moved" "$LOCK_DIR" 2>/dev/null || return 1
+  if [ -e "$LOCK_DIR/${moved##*/}" ]; then
+    mv "$LOCK_DIR/${moved##*/}" "$moved" 2>/dev/null || true
+    return 1
+  fi
+  return 0
+}
+
+# lock_take_over <judged-ident>  -- move the lock judged stale aside, and
+# remove it only if it is still the one judged (lock_ident unchanged). If it
+# changed hands in between, it goes back (or, with the path taken again,
+# stays aside) and the run is BUSY. Returns 0 when the path is free for the
+# one retry.
+lock_take_over() {
+  local judged="$1" moved="$LOCK_DIR.stale.$$" got owner
+  # A leftover of an earlier run with this pid: mv onto it would nest.
+  rm -rf "$moved"
+  if ! mv "$LOCK_DIR" "$moved" 2>/dev/null; then
+    note "the Mac build lock went away while it was being taken over -- trying again"
+    return 0
+  fi
+  got="$(lock_ident "$moved")"
+  if [ "$got" = "$judged" ]; then
+    rm -rf "$moved"
+    return 0
+  fi
+  owner="$(lock_owner_text "$moved")"
+  if lock_put_back "$moved"; then
+    lock_busy "${owner:-<no owner file>} (it changed hands while this run took over the stale lock of $judged; put back untouched)"
+  fi
+  lock_busy "${owner:-<no owner file>} (it changed hands while this run took over the stale lock of $judged, and the path was taken again before it could go back: that lock is left at ~/.lima-build.lock.stale.$$, not deleted)"
+}
+
+# lock_release <runid>  -- release the lock only if its run= is <runid>.
+# 0 released (or there was no lock), 3 another run's (left alone, or put
+# back), 4 another run's lock was moved aside and could not go back (left at
+# ~/.lima-build.lock.release.<pid>, reported, not deleted).
+lock_release() {
+  local run="$1" moved="$LOCK_DIR.release.$$" got owner
+  # A look first: a lock that is plainly another run's is not moved at all.
+  got="$(lock_ident "$LOCK_DIR")"
+  case "$got" in
+    gone) note "no Mac build lock to release"; return 0 ;;
+    "run=$run") ;;
+    *) owner="$(lock_owner_text "$LOCK_DIR")"
+       echo "[mac] BUSY: not releasing the Mac build lock -- it belongs to another run: ${owner:-<no owner file>}" >&2
+       return 3 ;;
+  esac
+  rm -rf "$moved"
+  if ! mv "$LOCK_DIR" "$moved" 2>/dev/null; then
+    note "the Mac build lock went away before this run released it"
+    return 0
+  fi
+  got="$(lock_ident "$moved")"
+  if [ "$got" = "run=$run" ]; then
+    rm -rf "$moved"
+    note "Mac build lock released (run $run)"
+    return 0
+  fi
+  owner="$(lock_owner_text "$moved")"
+  if lock_put_back "$moved"; then
+    echo "[mac] BUSY: not releasing the Mac build lock -- it changed hands to another run while this run released it (put back untouched): ${owner:-<no owner file>}" >&2
+    return 3
+  fi
+  echo "[mac] WARNING: the Mac build lock changed hands to another run (${owner:-<no owner file>}) while this run released it, and ~/.lima-build.lock was taken again before it could go back: that lock is left at ~/.lima-build.lock.release.$$, NOT deleted -- its run has lost the lock; clear it by hand once that run is over" >&2
+  return 4
+}
+
 # do_lock <runid> <repo> <instance> [<host> <pid>]
 do_lock() {
-  local run="${1:-}" repo="${2:-}" inst="${3:-}" host="${4:-unknown}" pid="${5:-0}" started others
+  local run="${1:-}" repo="${2:-}" inst="${3:-}" host="${4:-unknown}" pid="${5:-0}" started others rel=0 said
   [[ "$run" =~ ^[A-Za-z0-9._-]+$ ]] || die "lock wants a run id of letters, digits, '.', '_' and '-', got '$run'"
   [[ "$repo" =~ ^(yaw|oam)$ ]] || die "lock wants the repo, yaw or oam, got '$repo'"
   [[ "$inst" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || die "lock wants a Lima instance name, got '$inst'"
@@ -301,8 +431,8 @@ do_lock() {
     case "$LOCK_CLASS" in
       busy) lock_busy "$LOCK_OWNER" ;;
       stale)
-        note "STALE Mac build lock (its VM is not Running): $LOCK_OWNER -- taking it over"
-        rm -rf "$LOCK_DIR" ;;
+        note "STALE Mac build lock: $LOCK_OWNER -- taking it over"
+        lock_take_over "$LOCK_IDENT" ;;
       gone) note "the Mac build lock was released while it was read -- trying again" ;;
     esac
     # ONE retry; losing it means another run took the lock in between.
@@ -315,17 +445,23 @@ do_lock() {
   if ! printf 'repo=%s\ninstance=%s\nrun=%s\nhost=%s\npid=%s\nstarted=%s\n' \
        "$repo" "$inst" "$run" "$host" "$pid" "$started" > "$LOCK_DIR/owner.tmp" \
      || ! mv -f "$LOCK_DIR/owner.tmp" "$LOCK_DIR/owner"; then
-    rm -rf "$LOCK_DIR"
+    # Still ownerless, and so BUSY to every other run for 15 minutes: rmdir
+    # removes it only while it is the empty dir this run made.
+    rm -f "$LOCK_DIR/owner.tmp"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
     die "could not write the Mac build lock's owner file"
   fi
-  # A VM started outside the protocol holds the memory all the same.
+  # A VM started outside the protocol holds the memory all the same. Either
+  # refusal below releases the lock by this run's run= alone.
   if ! others="$(lima_others "$inst")"; then
-    rm -rf "$LOCK_DIR"
-    die "limactl cannot list the Lima instances, so a neighbour VM cannot be ruled out -- released the lock"
+    lock_release "$run" || rel=$?
+    said="released the lock"; [ "$rel" = "0" ] || said="the lock was NOT released (see above)"
+    die "limactl cannot list the Lima instances, so a neighbour VM cannot be ruled out -- $said"
   fi
   if [ "$others" != "none" ]; then
-    rm -rf "$LOCK_DIR"
-    echo "[mac] BUSY: another Lima instance is Running on this Mac ($others) -- released the lock; it must stop first" >&2
+    lock_release "$run" || rel=$?
+    said="released the lock"; [ "$rel" = "0" ] || said="the lock was NOT released (see above)"
+    echo "[mac] BUSY: another Lima instance is Running on this Mac ($others) -- $said; it must stop first" >&2
     exit 3
   fi
   note "Mac build lock taken: repo=$repo instance=$inst run=$run host=$host pid=$pid started=$started"
@@ -333,18 +469,10 @@ do_lock() {
 
 # do_unlock <runid>  -- never removes another run's lock.
 do_unlock() {
-  local run="${1:-}" owner_run owner
+  local run="${1:-}" rc=0
   [[ "$run" =~ ^[A-Za-z0-9._-]+$ ]] || die "unlock wants a run id, got '$run'"
-  if [ ! -d "$LOCK_DIR" ]; then note "no Mac build lock to release"; return 0; fi
-  owner_run="$(owner_field run)"
-  if [ -n "$owner_run" ] && [ "$owner_run" = "$run" ]; then
-    rm -rf "$LOCK_DIR"
-    note "Mac build lock released (run $run)"
-    return 0
-  fi
-  owner="$(tr '\n' ' ' < "$LOCK_DIR/owner" 2>/dev/null || true)"
-  echo "[mac] BUSY: not releasing the Mac build lock -- it belongs to another run: ${owner:-<no owner file>}" >&2
-  exit 3
+  lock_release "$run" || rc=$?
+  exit "$rc"
 }
 
 do_provision() {
