@@ -66,6 +66,15 @@ else
 fi
 
 # --- remote legs (advisory: warn-and-continue on failure) -------------------------
+# A linux-leg VM left running (an earlier run with OAM_KEEP_VM=1) would hold
+# the build Mac's memory through the mac leg. The linux leg's preflight stops
+# one it finds Running, as release-local does before its mac legs; it leaves
+# it be when OAM_KEEP_VM=1 is set here too.
+if [ "${OAM_SKIP_MAC:-0}" != "1" ] && [ "${OAM_SKIP_LINUX:-0}" != "1" ]; then
+  bash "$SCRIPT_DIR/build-platforms-mac-linux.sh" --preflight-only \
+    || warn "linux leg preflight failed (see above) -- a VM it could not stop would slow the mac leg; continuing"
+fi
+
 if [ "${OAM_SKIP_MAC:-0}" = "1" ]; then
   warn "OAM_SKIP_MAC=1 -- mac leg skipped"
 else

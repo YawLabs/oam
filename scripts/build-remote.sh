@@ -257,7 +257,7 @@ remote_prep() {
   # tsgo for the `oam check` tests: ci.yml ran this continue-on-error, so
   # best-effort here too. A USER prefix, not npm's system prefix: stock
   # Ubuntu has prefix=/usr and `npm install -g` EACCESes there (observed on
-  # the GCP builder -- the failure was silent and the oam-check e2e test
+  # the linux builder -- the failure was silent and the oam-check e2e test
   # then failed instead of skipping). PATH for it is exported at the top of
   # this script so every later dispatch finds tsgo.
   if command -v tsgo >/dev/null 2>&1; then
@@ -446,9 +446,10 @@ run_io_uring_ab() {
 #
 # `rm -rf target/debug` after each build is the obvious move and the wrong one:
 # the orchestrators deliberately preserve target/ across syncs so the dependency
-# graph and the rusty_v8 static lib survive (a cold build on the GCP builder is
-# ~30 min, an incremental one minutes). Deleting the tree buys disk by spending
-# that 30 min on EVERY subsequent release.
+# graph and the rusty_v8 static lib survive (a cold build on the linux builder
+# compiles all of them again, in every profile the dispatches use; an
+# incremental one takes minutes). Deleting the tree buys disk by spending that
+# cold build on EVERY subsequent release.
 #
 # gc-target.sh is the surgical version and recovers the same disk: incremental/
 # is pure cache and goes wholesale, while deps/ keeps each family`s current

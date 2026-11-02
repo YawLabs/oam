@@ -1256,7 +1256,10 @@ else
   step "Linux leg (Lima VM on the build Mac: $OAM_MAC_HOST)"
   # AFTER the mac legs, never beside them: the VM and a mac build do not fit
   # in the Air's memory together, and the leg stops its VM on every exit.
-  # Retried whole, like the mac leg: each attempt starts the VM, re-syncs this
+  # A dropped ssh connection during one step costs that step once over, not
+  # the leg: the driver retries a step whose ssh exits 255 a single time
+  # (build-platforms-mac-linux.sh, remote_step_run). Any other failure is
+  # retried whole, like the mac leg: each attempt starts the VM, re-syncs this
   # run's source tarball over the build tree (keeping only target/) and runs
   # every step again. Sub-caption only: `[fail]` and the log path come from
   # the driver itself.

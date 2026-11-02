@@ -55,7 +55,7 @@ OPERATOR_KNOBS="OAM_SIGN_REQUIRED OAM_RELEASE_SIGNING_KEY
   OAM_DRY_RUN OAM_NO_AUTO_BUMP OAM_NO_AUTO_ATTRIBUTION
   OAM_INSECURE_SKIP_SIGNATURE OAM_SKIP_PATH_SHADOW
   OAM_KEEP_VM OAM_LINUX_FAST OAM_LINUX_GLIBC_MAX OAM_LIMA_INSTANCE
-  OAM_LIMA_CPUS OAM_LIMA_MEMORY_GIB OAM_LIMA_DISK_GIB"
+  OAM_LIMA_CPUS OAM_LIMA_MEMORY_GIB OAM_LIMA_DISK_GIB OAM_LINUX_RETRY_DELAY"
 scrub_operator_knobs(){
   local k
   for k in $OPERATOR_KNOBS; do unset "$k"; done
@@ -899,7 +899,7 @@ it "the container is x86_64, rootless, uid 1000, host network, with its own reso
 ML_CTR="$(sed -n '/^do_container() {/,/^}/p' scripts/mac-linux-vm.sh)"
 ML_MISS=""
 for want in '--platform=linux/amd64' '--network host' 'resolv.conf:/etc/resolv.conf:ro' 'useradd -u 1000' \
-            '[ "$arch" = "x86_64" ]' 'echo $spec > /etc/oam-spec'; do
+            '[ "$arch" = "x86_64" ]' 'echo $spec > /etc/oam-spec' '--ulimit "nofile='; do
   grep -qF -- "$want" <<<"$ML_CTR" || ML_MISS="$ML_MISS [$want]"
 done
 grep -q 'sudo' <<<"$ML_CTR" && ML_MISS="$ML_MISS [sudo appears: nerdctl is rootless]"
@@ -923,6 +923,113 @@ for argv in "bogus oam-linux" "status oam;x" "status" "run oam-linux gc;rm 22.22
 done
 if [ -z "$ML_DRV_BAD" ]; then pass; else fail "$ML_DRV_BAD"; fi
 
+# The driver's VM-side scripts, run for real here against a fake limactl
+# (which runs the `bash -s` it is handed locally) and a fake nerdctl that
+# answers from a state directory and logs every call. Nothing reaches a Mac
+# or a VM; what is exercised is the shell the driver ships into the VM --
+# its quoting, its order and its failure paths.
+MD="$SUITE_TMP/mldrv"
+mkdir -p "$MD/bin" "$MD/st" "$MD/home"
+cat > "$MD/bin/limactl" <<EOF
+#!/bin/bash
+# limactl shell --workdir / <instance> bash -s [args...]
+[ "\$1" = "shell" ] || { echo "fake limactl: unexpected: \$*" >&2; exit 97; }
+shift 4
+exec "\$@"
+EOF
+cat > "$MD/bin/nerdctl" <<EOF
+#!/bin/bash
+S="$MD/st"
+echo "\$*" >> "\$S/log"
+case "\$1" in
+  info) exit 0 ;;
+  container)
+    case "\$2" in
+      ls) [ -f "\$S/names" ] && cat "\$S/names"; exit 0 ;;
+      inspect) [ -f "\$S/inspect-fail" ] && { echo "inspect: containerd not ready" >&2; exit 1; }; cat "\$S/running"; exit 0 ;;
+    esac ;;
+  start) echo true > "\$S/running"; exit 0 ;;
+  rm) rm -f "\$S/names"; echo absent > "\$S/running"; exit 0 ;;
+  run) echo "\$*" > "\$S/run-args"; echo test-build > "\$S/names"; echo true > "\$S/running"
+       cp "\$S/resolv-after-run" "\$S/resolv"; exit 0 ;;
+  exec)
+    shift
+    while :; do case "\$1" in -u|-w|-e) shift 2 ;; -i) shift ;; *) break ;; esac; done
+    shift  # the container
+    case "\$1" in
+      cat) [ "\$2" = /etc/oam-spec ] && { cat "\$S/spec" 2>/dev/null; exit 0; } ;;
+      pgrep) [ -f "\$S/procs" ]; exit \$? ;;
+      pkill) rm -f "\$S/procs"; exit 0 ;;
+      awk) awk "\$2" "\$S/resolv"; exit 0 ;;
+      uname) echo x86_64; exit 0 ;;
+      sh)
+        case "\$3" in
+          "ulimit -Hn") cat "\$S/nofile"; exit 0 ;;
+          *"> /etc/oam-spec") set -- \$3; echo "\$2" > "\$S/spec"; exit 0 ;;
+          *) exit 0 ;;
+        esac ;;
+      bash) echo "build-remote \$3" >> "\$S/built"; exit 0 ;;
+    esac ;;
+esac
+echo "fake nerdctl: unexpected: \$*" >&2; exit 97
+EOF
+chmod +x "$MD/bin/limactl" "$MD/bin/nerdctl"
+# mldrv <verb> [args...]  -- the driver with instance "test"; sets MD_RC,
+# MD_ERR and MD_LOG (the nerdctl calls, one per line).
+mldrv(){
+  : > "$MD/st/log"
+  MD_ERR="$(HOME="$MD/home" PATH="$MD/bin:$PATH" bash scripts/mac-linux-vm.sh "$1" test "${@:2}" 2>&1 >/dev/null </dev/null)"
+  MD_RC=$?
+  MD_LOG="$(cat "$MD/st/log")"
+}
+mldrv_reset(){
+  rm -f "$MD"/st/*
+  printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$MD/st/resolv-after-run"
+  echo 65536 > "$MD/st/nofile"
+}
+
+mldrv_reset
+mldrv container
+MD_NEW_RUN="$(cat "$MD/st/run-args" 2>/dev/null)"
+it "driver container: an absent container is created with the open-file limit and the resolv.conf mount, then checked"
+if [ "$MD_RC" = "0" ] && grep -qF -- '--ulimit nofile=65536:65536' <<<"$MD_NEW_RUN" \
+   && grep -qF -- 'resolv.conf:/etc/resolv.conf:ro' <<<"$MD_NEW_RUN" && [ -s "$MD/st/spec" ] \
+   && grep -qF 'dns 1.1.1.1 8.8.8.8, nofile 65536' <<<"$MD_ERR"; then pass
+else fail "rc=$MD_RC run: $MD_NEW_RUN out: $MD_ERR"; fi
+
+: > "$MD/st/procs"; rm -f "$MD/st/run-args"
+mldrv container
+it "driver container: a current container is reused, and a build left running in it is killed first"
+if [ "$MD_RC" = "0" ] && [ ! -e "$MD/st/run-args" ] && [ ! -e "$MD/st/procs" ] \
+   && grep -qF 'pkill -KILL -u 1000' <<<"$MD_LOG" && grep -qF 'is current' <<<"$MD_ERR"; then pass
+else fail "rc=$MD_RC log: ${MD_LOG//$'\n'/ | } out: $MD_ERR"; fi
+
+: > "$MD/st/inspect-fail"
+mldrv container
+it "driver container: an inspect error on a listed container is fatal, never read as absent"
+if [ "$MD_RC" != "0" ] && ! grep -qE '^(run|rm) ' <<<"$MD_LOG" && grep -qF 'containerd not ready' <<<"$MD_ERR"; then pass
+else fail "rc=$MD_RC log: ${MD_LOG//$'\n'/ | } out: $MD_ERR"; fi
+
+mldrv_reset
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 192.168.5.2\n' > "$MD/st/resolv-after-run"
+mldrv container
+MD_DNS="$MD_RC|$(grep -c 'bind mount did not take' <<<"$MD_ERR")"
+mldrv_reset
+echo 1024 > "$MD/st/nofile"
+mldrv container
+MD_NOF="$MD_RC|$(grep -c 'hard open-file limit of 1024' <<<"$MD_ERR")"
+it "driver container: a resolv.conf that is not the public pair, or a low open-file limit, fails with the reason"
+if [ "$MD_DNS" = "1|1" ] && [ "$MD_NOF" = "1|1" ]; then pass
+else fail "dns: $MD_DNS nofile: $MD_NOF out: $MD_ERR"; fi
+
+mldrv_reset
+: > "$MD/st/procs"
+mldrv run prep 22.22.2
+it "driver run: a dispatch cut off mid-step is killed before the next one starts"
+if [ "$MD_RC" = "0" ] && [ ! -e "$MD/st/procs" ] && [ "$(cat "$MD/st/built" 2>/dev/null)" = "build-remote prep" ] \
+   && [ "$(grep -nF 'pkill' <<<"$MD_LOG" | cut -d: -f1)" -lt "$(grep -nF 'build-remote.sh' <<<"$MD_LOG" | cut -d: -f1)" ]; then pass
+else fail "rc=$MD_RC log: ${MD_LOG//$'\n'/ | } out: $MD_ERR"; fi
+
 # =============================================================================
 group "build-platforms-mac-linux.sh -- the leg against a stubbed Mac"
 # =============================================================================
@@ -938,6 +1045,7 @@ mkdir -p "$ML/bin" "$ML/tmp" "$ML/files"
 : > "$ML/key"
 printf 'fake linux binary\n' > "$ML/files/oam-x86_64-unknown-linux-gnu"
 for f in scorecard.json node-suite-scorecard.json CONFORMANCE.md CONFORMANCE-NODE.md; do printf '{"f":"%s"}\n' "$f" > "$ML/files/$f"; done
+printf '{"platforms":{"linux":{"counts":{"present":1,"nodeExportNames":1},"generatedAgainst":"stub"}}}\n' > "$ML/files/surface-gaps.json"
 cat > "$ML/bin/ssh" <<EOF
 #!/bin/bash
 cmd="\${!#}"
@@ -951,7 +1059,10 @@ case "\$1" in
     case "\$4" in
       status) cat "$ML/status"; exit 0 ;;
       provision|start|stop|container|sync) echo "[mac] \$4" >&2; exit 0 ;;
-      run) echo "[remote] \$6"; [ -f "$ML/fail-\$6" ] && exit 1; exit 0 ;;
+      run) echo "[remote] \$6"; [ -f "$ML/fail-\$6" ] && exit 1
+           [ -f "$ML/drop-\$6" ] && { rm -f "$ML/drop-\$6"; exit 255; }
+           [ -f "$ML/drops-\$6" ] && exit 255
+           exit 0 ;;
       free-gb) printf 'Avail\n  50G\n'; exit 0 ;;
       glibc) cat "$ML/glibc"; exit 0 ;;
       fetch)
@@ -990,7 +1101,7 @@ ml(){
   ML_LAST="${ML_OUT##*$'\n'}"
 }
 ml_calls_of(){ grep -c -- "$1" <<<"$ML_CALLS"; }
-ml_reset(){ rm -f "$ML"/fail-* "$ML/sum-override"; printf '%s\n' "$ML_ST_STOPPED" > "$ML/status"; printf '%s\n' "$ML_GLIBC_OK" > "$ML/glibc"; }
+ml_reset(){ rm -f "$ML"/fail-* "$ML"/drop-* "$ML"/drops-* "$ML/sum-override"; printf '%s\n' "$ML_ST_STOPPED" > "$ML/status"; printf '%s\n' "$ML_GLIBC_OK" > "$ML/glibc"; }
 ml_reset
 
 ml -- --bogus
@@ -1100,16 +1211,40 @@ ml_reset
 
 : > "$ML/fail-test"
 ml -- --mode=release
-it "release: a failing step ends the run naming its log, runs nothing after it, and stops the VM"
+it "release: a failing step ends the run naming its log, is not retried, runs nothing after it, and stops the VM"
 if [ "$ML_RC" != "0" ] && [ -z "$ML_OUT" ] && grep -qE "remote 'test' failed -- see .*/logs/test\.log" <<<"$ML_ERR" \
-   && [ "$(ml_calls_of ' run oam-linux conformance')" = "0" ] \
+   && [ "$(ml_calls_of ' run oam-linux test ')" = "1" ] && [ "$(ml_calls_of ' run oam-linux conformance')" = "0" ] \
    && [ "$(tail -1 <<<"$ML_CALLS")" = "bash -s -- stop oam-linux " ]; then pass
 else fail "rc=$ML_RC calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
 ml_reset
 
+: > "$ML/drop-conformance"
+ml OAM_LINUX_RETRY_DELAY=0 -- --mode=release
+it "release: a step whose ssh connection drops (exit 255) is retried once, alone, and the leg goes on"
+if [ "$ML_RC" = "0" ] && [ -d "$ML_LAST" ] && [ "$(ml_calls_of ' run oam-linux conformance ')" = "2" ] \
+   && [ "$(ml_calls_of ' run oam-linux prep ')" = "1" ] && [ "$(ml_calls_of ' sync oam-linux')" = "1" ] \
+   && grep -qF "remote 'conformance': the ssh connection" <<<"$ML_ERR" \
+   && [ -f "${ML_LAST%/artifacts}/logs/conformance.dropped.log" ]; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+ml_reset
+
+: > "$ML/drops-conformance"
+ml OAM_LINUX_RETRY_DELAY=0 -- --mode=release
+it "release: a second drop fails the step -- one retry, never a loop -- and the VM is still stopped"
+if [ "$ML_RC" != "0" ] && [ -z "$ML_OUT" ] && [ "$(ml_calls_of ' run oam-linux conformance ')" = "2" ] \
+   && grep -qF "remote 'conformance' failed" <<<"$ML_ERR" && [ "$(ml_calls_of ' run oam-linux node-suite')" = "0" ] \
+   && [ "$(tail -1 <<<"$ML_CALLS")" = "bash -s -- stop oam-linux " ]; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+ml_reset
+
+ml OAM_LINUX_RETRY_DELAY=soon -- --mode=release
+it "release: a bad OAM_LINUX_RETRY_DELAY fails before any ssh"
+if [ "$ML_RC" = "1" ] && [ -z "$ML_CALLS" ] && grep -qF 'invalid OAM_LINUX_RETRY_DELAY' <<<"$ML_ERR"; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS"; fi
+
 ml OAM_KEEP_VM=1 -- --mode=release
 it "release: OAM_KEEP_VM=1 leaves the VM running, and says how to stop it"
-if [ "$ML_RC" = "0" ] && [ "$(ml_calls_of ' stop oam-linux')" = "0" ] && grep -qF 'limactl stop oam-linux' <<<"$ML_ERR"; then pass
+if [ "$ML_RC" = "0" ] && [ "$(ml_calls_of ' stop oam-linux')" = "0" ] && grep -qF '/opt/homebrew/bin/limactl stop oam-linux' <<<"$ML_ERR"; then pass
 else fail "rc=$ML_RC calls: $ML_CALLS"; fi
 
 printf '%064d\n' 0 > "$ML/sum-override"
@@ -1117,6 +1252,22 @@ ml -- --mode=release
 it "release: a pulled binary whose hash is not the container's is refused"
 if [ "$ML_RC" != "0" ] && [ -z "$ML_OUT" ] && grep -qF 'refusing a file that changed on the way' <<<"$ML_ERR"; then pass
 else fail "rc=$ML_RC stderr: $(tail -5 <<<"$ML_ERR")"; fi
+ml_reset
+
+# surface-gaps pulls into this checkout's tracked conformance/surface-gaps.json,
+# so a copy that fails the hash check must leave that file as it was. The
+# file is put back by hand if the case breaks it, so a regression here fails
+# the case without dirtying the tree.
+ML_SG="conformance/surface-gaps.json"
+ML_SG_BEFORE="$(sha256sum "$ML_SG" | cut -d' ' -f1)"
+cp "$ML_SG" "$ML/sg-backup"
+printf '%064d\n' 0 > "$ML/sum-override"
+ml -- --mode=surface-gaps
+ML_SG_AFTER="$(sha256sum "$ML_SG" | cut -d' ' -f1)"
+[ "$ML_SG_AFTER" = "$ML_SG_BEFORE" ] || cp "$ML/sg-backup" "$ML_SG"
+it "surface-gaps: a pulled ratchet whose hash is not the container's never lands on the tracked file"
+if [ "$ML_RC" != "0" ] && [ "$ML_SG_AFTER" = "$ML_SG_BEFORE" ] && grep -qF 'refusing a file that changed on the way' <<<"$ML_ERR"; then pass
+else fail "rc=$ML_RC before=$ML_SG_BEFORE after=$ML_SG_AFTER stderr: $(tail -5 <<<"$ML_ERR")"; fi
 ml_reset
 
 ml OAM_LINUX_FAST=1 -- --mode=release
@@ -1144,6 +1295,15 @@ for f in scripts/release-local.sh scripts/node-compat-measure.sh scripts/bench-p
   grep -qF 'build-platforms-mac-linux.sh" --mode=' "$f" || ML_CALLERS_BAD="$ML_CALLERS_BAD $f"
 done
 if [ -z "$ML_CALLERS_BAD" ]; then pass; else fail "not repointed:$ML_CALLERS_BAD"; fi
+
+it "node-compat-measure and bench-platforms run the linux preflight (which stops a left-running VM) before the mac leg"
+ML_PRE_BAD=""
+for f in scripts/node-compat-measure.sh scripts/bench-platforms.sh; do
+  pre="$(grep -nF 'build-platforms-mac-linux.sh" --preflight-only' "$f" | head -1 | cut -d: -f1)"
+  mac="$(grep -nF 'build-platforms-tailnet.sh" --mode=' "$f" | head -1 | cut -d: -f1)"
+  if [ -z "$pre" ] || [ -z "$mac" ] || [ "$pre" -ge "$mac" ]; then ML_PRE_BAD="$ML_PRE_BAD $f(preflight@${pre:-none} mac@${mac:-none})"; fi
+done
+if [ -z "$ML_PRE_BAD" ]; then pass; else fail "$ML_PRE_BAD"; fi
 
 it "release-local.sh: the linux leg runs after the mac legs, and copies the one exact asset name"
 ml_rl(){ grep -nF -- "$1" scripts/release-local.sh | head -1 | cut -d: -f1; }

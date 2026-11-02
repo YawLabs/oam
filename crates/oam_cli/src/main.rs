@@ -1131,7 +1131,7 @@ fn run_command(
                 // fail a successful run over it. JSON mode emits the ODIF
                 // (stable OAM-TS0000, the documented skip signal for tooling
                 // and the e2e suite); human mode gets one quiet line. Fully
-                // silent json output here masked a missing tsgo on the GCP
+                // silent json output here masked a missing tsgo on the linux
                 // builder as "typecheck ran clean".
                 if json {
                     render(&failure, json);

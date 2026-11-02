@@ -48,12 +48,16 @@
 #                                set the resolver and size settings; idempotent
 #   start | stop                 limactl start / stop, each a no-op when the VM
 #                                is already there
-#   container                    the container above, created or reused
+#   container                    the container above, created or reused (a
+#                                build left running in a reused one is
+#                                killed); its resolv.conf and open-file
+#                                limit are checked either way
 #   sync <tarball>               extract ~/<tarball> (Mac home, relative) into
 #                                the build tree, keeping target/; removes it
 #   run <dispatch> <node-ver>    bash scripts/build-remote.sh <dispatch> in the
 #                                build tree as the build user, with the pinned
-#                                Node FIRST on PATH (see run_dispatch)
+#                                Node FIRST on PATH (see do_run), after killing
+#                                whatever a cut-off dispatch left running
 #   free-gb                      df -BG of the build user's home, for the
 #                                orchestrator's disk headroom check
 #   glibc <path>                 the GLIBC_ versions objdump -T finds in
@@ -109,10 +113,41 @@ die(){  echo "[mac] FATAL: $*" >&2; exit 1; }
 # container whose setup died half way is rebuilt rather than trusted, and any
 # change here rebuilds it on the next run.
 IMAGE="debian:12"
-PACKAGES="build-essential binutils curl ca-certificates git xz-utils python3 pkg-config procps nodejs npm"
+# unzip: the bun installer build-remote.sh bench runs needs it, and that
+# install is best-effort, so without it a bench quietly loses its bun column.
+PACKAGES="build-essential binutils curl ca-certificates git xz-utils python3 pkg-config procps unzip nodejs npm"
 BUILD_HOME="/home/builder"
-SPEC_SRC() { printf 'v1|%s|linux/amd64|%s|builder:1000|%s=%s|dns=1.1.1.1,8.8.8.8|net=host' \
-  "$IMAGE" "$PACKAGES" "$BUILD_HOME" "$VOLUME"; }
+# The open-file limit, set explicitly rather than inherited from rootless
+# containerd's user service (soft 1024 there unless something raised it):
+# the http_server_wire flood tests need thousands of descriptors, and
+# build-remote.sh's own `ulimit -n 4096` can only raise the soft limit up
+# to whatever hard limit the container was given.
+NOFILE=65536
+SPEC_SRC() { printf 'v1|%s|linux/amd64|%s|builder:1000|%s=%s|dns=1.1.1.1,8.8.8.8|net=host|nofile=%s' \
+  "$IMAGE" "$PACKAGES" "$BUILD_HOME" "$VOLUME" "$NOFILE"; }
+
+# The VM-side shell lines that kill whatever the build user (uid 1000) left
+# running in the container, and wait for it to go. Killing a `nerdctl exec`
+# client -- which is what a dropped ssh or tailnet link does -- leaves the
+# process it started running inside the container, so a dispatch cut off
+# mid-step goes on building. Every verb that starts work as uid 1000 (the
+# container check before a sync, and each run) clears that first, so a retry
+# never runs beside, or syncs under, the one it replaces. Nothing else runs as
+# uid 1000 there: the container's own process is root's `sleep infinity`.
+# Expects $c (the container name) set in the VM-side script.
+# shellcheck disable=SC2016  # expanded inside the VM, not here
+REAP='
+if nerdctl exec "$c" pgrep -u 1000 >/dev/null 2>&1; then
+  echo "[vm] killing a build left running in $c (a dispatch cut off mid-step)" >&2
+  nerdctl exec "$c" pkill -KILL -u 1000 >/dev/null 2>&1 || true
+  n=0
+  while nerdctl exec "$c" pgrep -u 1000 >/dev/null 2>&1; do
+    n=$((n + 1))
+    [ "$n" -le 30 ] || { echo "[vm] FATAL: uid 1000 processes in $c survive SIGKILL after 30 s" >&2; exit 1; }
+    sleep 1
+  done
+fi
+'
 
 # relpath_ok <path>  -- a relative path with no `..`, spaces or shell syntax.
 relpath_ok() {
@@ -199,29 +234,59 @@ do_container() {
   # shellcheck disable=SC2016  # expanded inside the VM, not here
   vm '
 set -euo pipefail
-c="$1" vol="$2" spec="$3" image="$4" pkgs="$5" home="$6"
+c="$1" vol="$2" spec="$3" image="$4" pkgs="$5" home="$6" nofile="$7"
 mkdir -p "$HOME/.oam-linux"
 printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > "$HOME/.oam-linux/resolv.conf"
-running="$(nerdctl container inspect --format "{{.State.Running}}" "$c" 2>/dev/null || echo absent)"
+# Right after limactl start the rootless containerd may still be coming up;
+# wait for it (bounded) so a slow start is not read as anything else.
+n=0
+until nerdctl info >/dev/null 2>&1; do
+  n=$((n + 1))
+  [ "$n" -le 60 ] || { echo "[vm] FATAL: nerdctl cannot reach containerd 60 s after the VM started: $(nerdctl info 2>&1 | tail -1)" >&2; exit 1; }
+  sleep 1
+done
+# Whether the container exists is asked of the listing, which succeeds
+# either way; an inspect error past that point is a real failure, never
+# "absent".
+names="$(nerdctl container ls -a --format "{{.Names}}")" \
+  || { echo "[vm] FATAL: nerdctl container ls failed" >&2; exit 1; }
+running=absent
+if printf "%s\n" "$names" | grep -qxF -- "$c"; then
+  running="$(nerdctl container inspect --format "{{.State.Running}}" "$c")"
+fi
 if [ "$running" = "false" ]; then nerdctl start "$c" >/dev/null; running=true; fi
 have=""
 if [ "$running" = "true" ]; then have="$(nerdctl exec "$c" cat /etc/oam-spec 2>/dev/null || true)"; fi
-if [ "$have" = "$spec" ]; then echo "[vm] container $c is current (spec $spec)" >&2; exit 0; fi
-if [ "$running" != "absent" ]; then
-  echo "[vm] container $c has spec ${have:-<none>}, want $spec -- recreating (the home volume $vol, and the build tree in it, stay)" >&2
-  nerdctl rm -f "$c" >/dev/null
+if [ "$have" = "$spec" ]; then
+  echo "[vm] container $c is current (spec $spec)" >&2
+'"$REAP"'
+else
+  if [ "$running" != "absent" ]; then
+    echo "[vm] container $c has spec ${have:-<none>}, want $spec -- recreating (the home volume $vol, and the build tree in it, stay)" >&2
+    nerdctl rm -f "$c" >/dev/null
+  fi
+  echo "[vm] creating container $c from $image (linux/amd64)" >&2
+  nerdctl run -d --name "$c" --network host --platform=linux/amd64 \
+    --ulimit "nofile=$nofile:$nofile" \
+    -v "$vol:$home" -v "$HOME/.oam-linux/resolv.conf:/etc/resolv.conf:ro" \
+    "$image" sleep infinity >/dev/null
+  arch="$(nerdctl exec "$c" uname -m)"
+  [ "$arch" = "x86_64" ] || { echo "[vm] FATAL: the container runs as $arch, not x86_64 -- is Rosetta enabled for this instance?" >&2; exit 1; }
+  nerdctl exec -e DEBIAN_FRONTEND=noninteractive "$c" sh -c "apt-get update -qq && apt-get install -y -qq $pkgs >/dev/null"
+  nerdctl exec "$c" sh -c "id -u builder >/dev/null 2>&1 || useradd -u 1000 -d $home -M -s /bin/bash builder; chown 1000:1000 $home"
+  nerdctl exec "$c" sh -c "echo $spec > /etc/oam-spec"
+  echo "[vm] container $c ready (spec $spec)" >&2
 fi
-echo "[vm] creating container $c from $image (linux/amd64)" >&2
-nerdctl run -d --name "$c" --network host --platform=linux/amd64 \
-  -v "$vol:$home" -v "$HOME/.oam-linux/resolv.conf:/etc/resolv.conf:ro" \
-  "$image" sleep infinity >/dev/null
-arch="$(nerdctl exec "$c" uname -m)"
-[ "$arch" = "x86_64" ] || { echo "[vm] FATAL: the container runs as $arch, not x86_64 -- is Rosetta enabled for this instance?" >&2; exit 1; }
-nerdctl exec -e DEBIAN_FRONTEND=noninteractive "$c" sh -c "apt-get update -qq && apt-get install -y -qq $pkgs >/dev/null"
-nerdctl exec "$c" sh -c "id -u builder >/dev/null 2>&1 || useradd -u 1000 -d $home -M -s /bin/bash builder; chown 1000:1000 $home"
-nerdctl exec "$c" sh -c "echo $spec > /etc/oam-spec"
-echo "[vm] container $c ready (spec $spec)" >&2
-' "$CONTAINER" "$VOLUME" "$spec" "$IMAGE" "$PACKAGES" "$BUILD_HOME"
+# Checked on every call, not assumed: under --network host nerdctl manages
+# /etc/resolv.conf itself, and the dns conformance cases need the public
+# servers only (the Lima forwarder answers no PTR or CAA). A mount that did
+# not take would otherwise fail the leg ~40 minutes later in those cases.
+ns="$(nerdctl exec "$c" awk "\$1 == \"nameserver\" { printf \"%s \", \$2 }" /etc/resolv.conf)"
+[ "$ns" = "1.1.1.1 8.8.8.8 " ] || { echo "[vm] FATAL: $c resolves through [${ns% }], not [1.1.1.1 8.8.8.8] -- the resolv.conf bind mount did not take (the dns conformance cases would fail late)" >&2; exit 1; }
+lim="$(nerdctl exec -u 1000 "$c" sh -c "ulimit -Hn")"
+[ "$lim" = "$nofile" ] || { echo "[vm] FATAL: $c gives uid 1000 a hard open-file limit of $lim, not $nofile -- the flood tests need it" >&2; exit 1; }
+echo "[vm] container $c: dns 1.1.1.1 8.8.8.8, nofile $lim" >&2
+' "$CONTAINER" "$VOLUME" "$spec" "$IMAGE" "$PACKAGES" "$BUILD_HOME" "$NOFILE"
 }
 
 do_sync() {
@@ -253,7 +318,9 @@ do_run() {
   [[ "$nv" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "run wants the pinned Node version, got '$nv'"
   # shellcheck disable=SC2016
   vm '
+set -euo pipefail
 c="$1" d="$2" nv="$3" h="$4"
+'"$REAP"'
 exec nerdctl exec -u 1000 -w "$h/oam-build" -e HOME="$h" -e USER=builder -e LANG=C.UTF-8 \
   -e PATH="$h/.cache/oam-node/node-v$nv-linux-x64/bin:$h/.npm-oam/bin:$h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   "$c" bash scripts/build-remote.sh "$d"

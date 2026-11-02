@@ -84,6 +84,9 @@
 #   OAM_KEEP_VM=1         leave the VM running when this script exits
 #                         (default: stop it, whatever state it was found in)
 #   OAM_LINUX_FAST=1      see --mode=release
+#   OAM_LINUX_RETRY_DELAY 15 (default) -- seconds to wait before the one
+#                         retry a remote step gets when its ssh connection
+#                         drops (ssh exits 255); see remote_step_run
 #
 # Prereqs on the Mac: Lima (brew install lima; 2.2.1 measured), Rosetta 2
 # (the mac-x64 leg needs it too), outbound HTTPS from the VM. rustup, the
@@ -128,6 +131,7 @@ LIMA_DISK="${OAM_LIMA_DISK_GIB:-80}"
 GLIBC_MAX="${OAM_LINUX_GLIBC_MAX:-2.34}"
 KEEP_VM="${OAM_KEEP_VM:-0}"
 LINUX_FAST="${OAM_LINUX_FAST:-0}"
+RETRY_DELAY="${OAM_LINUX_RETRY_DELAY:-15}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -152,6 +156,8 @@ lima_name_valid "$INSTANCE" \
 for knob in "OAM_LIMA_CPUS=$LIMA_CPUS" "OAM_LIMA_MEMORY_GIB=$LIMA_MEM" "OAM_LIMA_DISK_GIB=$LIMA_DISK"; do
   uint_valid "${knob#*=}" || fail "invalid ${knob%%=*}='${knob#*=}' (want a whole number, 1 or more)"
 done
+[[ "$RETRY_DELAY" =~ ^[0-9]+$ ]] \
+  || fail "invalid OAM_LINUX_RETRY_DELAY='$RETRY_DELAY' (want a whole number of seconds)"
 for knob in "OAM_KEEP_VM=$KEEP_VM" "OAM_LINUX_FAST=$LINUX_FAST"; do
   case "${knob#*=}" in 0|1) ;; *) fail "invalid ${knob%%=*}='${knob#*=}' (want 0 or 1)" ;; esac
 done
@@ -246,7 +252,7 @@ mkdir -p "$STAGE_DIR/logs" "$ARTIFACTS_DIR"
 # writes to stdout: the last stdout line is the artifact dir.
 cleanup(){
   if [ "$KEEP_VM" = "1" ]; then
-    warn "OAM_KEEP_VM=1 -- leaving $INSTANCE running on $HP; stop it before the mac legs run: ssh $HP limactl stop $INSTANCE"
+    warn "OAM_KEEP_VM=1 -- leaving $INSTANCE running on $HP; stop it before the mac legs run: ssh $HP /opt/homebrew/bin/limactl stop $INSTANCE"
     return 0
   fi
   if mac_vm stop >"$STAGE_DIR/logs/vm-stop.log" 2>&1; then
@@ -332,9 +338,29 @@ fi
 # --- remote steps ---------------------------------------------------------------
 # remote_step_run <dispatch>: one `build-remote.sh <dispatch>` in the
 # container, its whole output in its own log, the tail surfaced on failure.
+#
+# A dropped connection gets ONE retry of that step, not of the leg. ssh exits
+# 255 for a connection-level failure (the tailnet link or the Mac's sshd went
+# away, ServerAlive gave up) and passes any other exit code through from the
+# remote command, so 255 is the one status that says the step itself did not
+# fail. Without this, one blip during the ~800 s conformance step costs the
+# whole leg again through release-local's OAM_RELEASE_LEG_ATTEMPTS: VM start,
+# sync, prep, gate and test, ~45 minutes. The retry is safe to run because the
+# driver's run verb first kills whatever the cut-off dispatch left running in
+# the container (a dropped `nerdctl exec` client does not stop it), and every
+# dispatch re-runs from scratch over the same tree. A second failure of any
+# kind fails the step.
 remote_step_run(){
-  local dispatch="$1" log="$STAGE_DIR/logs/$1.log"
-  if mac_vm run "$dispatch" "$NODE_VERSION" >"$log" 2>&1; then return 0; fi
+  local dispatch="$1" log="$STAGE_DIR/logs/$1.log" rc=0
+  mac_vm run "$dispatch" "$NODE_VERSION" >"$log" 2>&1 || rc=$?
+  if [ "$rc" = "255" ]; then
+    mv -f "$log" "$STAGE_DIR/logs/$dispatch.dropped.log"
+    warn "remote '$dispatch': the ssh connection to $HP dropped (exit 255; that attempt's log: $STAGE_DIR/logs/$dispatch.dropped.log) -- retrying the step once in ${RETRY_DELAY}s"
+    sleep "$RETRY_DELAY"
+    rc=0
+    mac_vm run "$dispatch" "$NODE_VERSION" >"$log" 2>&1 || rc=$?
+  fi
+  [ "$rc" = "0" ] && return 0
   tail -30 "$log" >&2
   return 1
 }
@@ -352,7 +378,9 @@ remote_step_advisory(){
 
 # pull <build-tree-path> <local-dir>: out of the container to the Mac
 # (mac-linux-vm.sh fetch, which checks the Mac copy against the container's
-# sha256), then here, checked against the same hash.
+# sha256), then here into the stage dir, checked against the same hash, and
+# only then moved into <local-dir> -- which for surface-gaps is a tracked file
+# in this checkout, so a copy that fails the check must never land there.
 sha256_of(){
   { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1"; } | awk '{ print $1; exit }'
 }
@@ -363,10 +391,14 @@ pull(){
   if ! sum="$(kv_field "$out" sha256)" || ! path="$(kv_field "$out" path)"; then
     fail "the Mac's answer to fetching $rel carries no sha256/path: $out"
   fi
-  scp "${SSH_OPTS[@]}" -q "$HP:$path" "$dest/" || fail "scp of $path from $HP failed"
-  got="$(sha256_of "$dest/${rel##*/}")"
+  local base="${rel##*/}" pulled="$STAGE_DIR/pulled"
+  mkdir -p "$pulled"
+  rm -f "$pulled/$base"
+  scp "${SSH_OPTS[@]}" -q "$HP:$path" "$pulled/" || fail "scp of $path from $HP failed"
+  got="$(sha256_of "$pulled/$base")"
   [ "$got" = "$sum" ] \
-    || fail "$rel arrived with sha256 ${got:-<none>}, but the container's copy is $sum -- refusing a file that changed on the way"
+    || fail "$rel arrived with sha256 ${got:-<none>}, but the container's copy is $sum -- refusing a file that changed on the way (left in $pulled, not in $dest)"
+  mv -f "$pulled/$base" "$dest/$base" || fail "could not move the checked $base into $dest"
 }
 
 remote_step prep
