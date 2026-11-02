@@ -123,7 +123,7 @@ BUILD_HOME="/home/builder"
 # build-remote.sh's own `ulimit -n 4096` can only raise the soft limit up
 # to whatever hard limit the container was given.
 NOFILE=65536
-SPEC_SRC() { printf 'v1|%s|linux/amd64|%s|builder:1000|%s=%s|dns=1.1.1.1,8.8.8.8|net=host|nofile=%s' \
+SPEC_SRC() { printf 'v2|%s|linux/amd64|%s|builder:1000|%s=%s|dns=1.1.1.1,8.8.8.8|net=host|nofile=%s|init=1' \
   "$IMAGE" "$PACKAGES" "$BUILD_HOME" "$VOLUME" "$NOFILE"; }
 
 # The VM-side shell lines that kill whatever the build user (uid 1000) left
@@ -134,14 +134,18 @@ SPEC_SRC() { printf 'v1|%s|linux/amd64|%s|builder:1000|%s=%s|dns=1.1.1.1,8.8.8.8
 # container check before a sync, and each run) clears that first, so a retry
 # never runs beside, or syncs under, the one it replaces. Nothing else runs as
 # uid 1000 there: the container's own process is root's `sleep infinity`.
+# The container runs under --init, so the orphans of a killed build are reaped
+# rather than left as zombies of `sleep`; pgrep still counts only live states
+# (-r R,S,D,T), because a zombie waiting for that reap is not a build that
+# survived SIGKILL and must not fail the wait below.
 # Expects $c (the container name) set in the VM-side script.
 # shellcheck disable=SC2016  # expanded inside the VM, not here
 REAP='
-if nerdctl exec "$c" pgrep -u 1000 >/dev/null 2>&1; then
+if nerdctl exec "$c" pgrep -r R,S,D,T -u 1000 >/dev/null 2>&1; then
   echo "[vm] killing a build left running in $c (a dispatch cut off mid-step)" >&2
   nerdctl exec "$c" pkill -KILL -u 1000 >/dev/null 2>&1 || true
   n=0
-  while nerdctl exec "$c" pgrep -u 1000 >/dev/null 2>&1; do
+  while nerdctl exec "$c" pgrep -r R,S,D,T -u 1000 >/dev/null 2>&1; do
     n=$((n + 1))
     [ "$n" -le 30 ] || { echo "[vm] FATAL: uid 1000 processes in $c survive SIGKILL after 30 s" >&2; exit 1; }
     sleep 1
@@ -266,7 +270,7 @@ else
     nerdctl rm -f "$c" >/dev/null
   fi
   echo "[vm] creating container $c from $image (linux/amd64)" >&2
-  nerdctl run -d --name "$c" --network host --platform=linux/amd64 \
+  nerdctl run -d --init --name "$c" --network host --platform=linux/amd64 \
     --ulimit "nofile=$nofile:$nofile" \
     -v "$vol:$home" -v "$HOME/.oam-linux/resolv.conf:/etc/resolv.conf:ro" \
     "$image" sleep infinity >/dev/null
