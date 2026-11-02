@@ -2,6 +2,7 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Duration;
 
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{
@@ -55,10 +56,12 @@ use super::OpOutcome;
 // server and then stops (the pool deadline IS the per-server timeout), and
 // every retry starts at the same dead server again.
 //
-// The try budget is the system one: `attempts` retries after the first round,
-// one round being every server once. For a single server that is exactly what
-// hickory's own pool and retry handle did, so a dead lone nameserver takes as
-// long as before.
+// The try budget and the per-server timeout are c-ares's as node configures
+// it (`CaresTiming`): node always passes ARES_OPT_TRIES = 4, so a query runs
+// four rounds, one round being every server once, and each send waits c-ares's
+// server timeout -- 2 s, or resolv.conf's / RES_OPTIONS' `timeout:` -- doubled
+// per round (`round_timeout`). hickory's own timeout (5 s, glibc's default)
+// and attempts no longer decide anything.
 
 /// One nameserver of a channel.
 struct Server {
@@ -72,32 +75,171 @@ struct Channel {
     servers: Vec<Server>,
     /// What `getServers()` reports, in node's string form and config order.
     display: Vec<String>,
-    /// Rounds after the first, as hickory's `ResolverOpts::attempts`.
-    attempts: usize,
+    timing: CaresTiming,
     ndots: usize,
 }
 
-/// The system configuration every channel is built from: search domains and
-/// resolver options, read once. Only the nameserver list differs per channel.
+/// The try budget and server timeout of a channel, as c-ares 1.34.6 runs them
+/// under node v22.22.2.
+///
+/// Measured against silent fake servers on 127.0.0.1 (node polls c-ares's
+/// timeouts on a 1 s timer, so every measured wait is the real one rounded up
+/// to that tick):
+///
+/// * tries: a lone silent server is asked 4 times before ETIMEOUT, and two
+///   silent servers 4 times each. node's ChannelWrap always passes
+///   ARES_OPT_TRIES (its `tries` option, default 4), and an explicit option
+///   beats the system one, so `attempts:` in resolv.conf or RES_OPTIONS
+///   changes nothing (measured: RES_OPTIONS="attempts:1" still asks 4 times).
+/// * timeout: [silent, live] fails over after 2.9 s (a 2 s timeout); with
+///   RES_OPTIONS="timeout:4" after 4.9 s, with "timeout:1" after 1.9 s, and
+///   with "timeout:7" after 5.9 s -- c-ares clamps the server timeout to
+///   250 ms..5 s when no maxTimeout is set (node sets none).
+/// * doubling: round `r` waits `timeout << r`, cut by a random jitter to
+///   between half and all of that, never below `timeout` (measured waits on
+///   one silent server: 2.9, 3.0, 5.0, 11.1 s against nominal 2, 4, 8, 16).
+///
+/// Not modelled: c-ares also shortens a server's timeout from the latency it
+/// measured on earlier answers (ares_metrics), so a server that answered fast
+/// and then goes silent can fail over sooner in node than in oam.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CaresTiming {
+    /// The round-0 wait for one server.
+    timeout: Duration,
+    /// Rounds over the whole server list.
+    tries: usize,
+}
+
+impl CaresTiming {
+    /// c-ares's DEFAULT_TIMEOUT.
+    const DEFAULT_TIMEOUT: Duration = Duration::from_millis(2000);
+    /// node's ChannelWrap default `tries`, always passed as ARES_OPT_TRIES.
+    const NODE_TRIES: usize = 4;
+    /// The bounds c-ares puts on a server's timeout when the channel has no
+    /// maxTimeout (measured upper bound; the lower one is c-ares's 250 ms).
+    const MIN_TIMEOUT: Duration = Duration::from_millis(250);
+    const MAX_TIMEOUT: Duration = Duration::from_millis(5000);
+
+    /// The timing for a system whose `timeout:` option (seconds) is
+    /// `timeout_secs`; `None` or 0 is "not set", as c-ares treats a zero.
+    fn from_timeout_option(timeout_secs: Option<u64>) -> CaresTiming {
+        let timeout = match timeout_secs {
+            Some(secs) if secs > 0 => Duration::from_secs(secs),
+            _ => Self::DEFAULT_TIMEOUT,
+        };
+        CaresTiming {
+            timeout: timeout.clamp(Self::MIN_TIMEOUT, Self::MAX_TIMEOUT),
+            tries: Self::NODE_TRIES,
+        }
+    }
+
+    /// The system's timing: the last `timeout:` among resolv.conf's `options`
+    /// lines (not on Windows, which has none), overridden by one in the
+    /// RES_OPTIONS environment variable, which c-ares reads on every platform
+    /// (measured on Windows).
+    fn system() -> CaresTiming {
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut timeout = None;
+        #[cfg(unix)]
+        if let Ok(conf) = std::fs::read_to_string("/etc/resolv.conf") {
+            for line in conf.lines() {
+                let mut words = line.split_whitespace();
+                if words.next() == Some("options") {
+                    timeout = timeout_option(words).or(timeout);
+                }
+            }
+        }
+        if let Ok(env) = std::env::var("RES_OPTIONS") {
+            timeout = timeout_option(env.split_whitespace()).or(timeout);
+        }
+        Self::from_timeout_option(timeout)
+    }
+
+    /// The longest single wait: the last round's, before jitter.
+    fn longest(&self) -> Duration {
+        round_timeout(self.timeout, self.tries.saturating_sub(1), 0)
+    }
+}
+
+/// The last `timeout:N` among `options` words; an unparseable value is
+/// skipped.
+fn timeout_option<'a>(options: impl Iterator<Item = &'a str>) -> Option<u64> {
+    options
+        .filter_map(|o| o.strip_prefix("timeout:"))
+        .filter_map(|v| v.parse::<u64>().ok())
+        .last()
+}
+
+/// How long round `round` (0-based) waits for one server, as c-ares's
+/// ares_calc_query_timeout computes it: round 0 waits `timeout`; a later round
+/// doubles it per round and then takes off a jitter of up to half -- `jitter`
+/// in 0..=1000 is that cut in thousandths of the half -- and never waits less
+/// than `timeout`.
+fn round_timeout(timeout: Duration, round: usize, jitter: u32) -> Duration {
+    let factor = u32::try_from(round)
+        .ok()
+        .and_then(|r| 1u32.checked_shl(r))
+        .unwrap_or(u32::MAX);
+    let full = timeout.saturating_mul(factor);
+    if round == 0 {
+        return full;
+    }
+    let cut = (full / 2).mul_f64(f64::from(jitter.min(1000)) / 1000.0);
+    full.saturating_sub(cut).max(timeout)
+}
+
+/// A random jitter for `round_timeout`. Without a random source it is 0, the
+/// longest wait.
+fn random_jitter() -> u32 {
+    getrandom::u32().map_or(0, |r| r % 1001)
+}
+
+/// The system configuration every channel is built from: search domains,
+/// resolver options and c-ares timing, read once. Only the nameserver list
+/// differs per channel.
 struct Base {
     domain: Option<Name>,
     search: Vec<Name>,
     options: ResolverOpts,
     name_servers: Vec<NameServerConfig>,
+    timing: CaresTiming,
 }
 
-fn base() -> &'static Base {
-    static BASE: OnceLock<Base> = OnceLock::new();
-    BASE.get_or_init(|| {
-        let (config, options) = hickory_resolver::system_conf::read_system_conf()
-            .expect("read system DNS configuration");
+impl Base {
+    /// The base for a system DNS configuration read. A host that has none
+    /// (no resolv.conf, or one with no `nameserver` line -- hickory then
+    /// errors "no nameservers found in config") gets an empty system server
+    /// list and default options: every query on the system channel fails,
+    /// and dns.setServers() still works, as in node. Panicking here aborted
+    /// the process from inside a V8 callback.
+    fn from_system<E>(
+        conf: Result<(ResolverConfig, ResolverOpts), E>,
+        timing: CaresTiming,
+    ) -> Base {
+        let (config, options) = conf.unwrap_or_else(|_| {
+            (
+                ResolverConfig::from_parts(None, Vec::new(), Vec::new()),
+                ResolverOpts::default(),
+            )
+        });
         let (domain, search, name_servers) = config.into_parts();
         Base {
             domain,
             search,
             options,
             name_servers,
+            timing,
         }
+    }
+}
+
+fn base() -> &'static Base {
+    static BASE: OnceLock<Base> = OnceLock::new();
+    BASE.get_or_init(|| {
+        Base::from_system(
+            hickory_resolver::system_conf::read_system_conf(),
+            CaresTiming::system(),
+        )
     })
 }
 
@@ -149,9 +291,12 @@ fn build_channel(base: &Base, name_servers: Vec<NameServerConfig>) -> Channel {
         // covers the same forwarder shape for answers past the EDNS size.
         opts.edns0 = true;
         opts.try_tcp_on_error = true;
-        // One server per resolver and one try per call: the retries and the
-        // server walk are the channel's (`walk`), so they follow c-ares.
+        // One server per resolver and one try per call: the retries, the
+        // server walk and the timeout are the channel's (`walk`), so they
+        // follow c-ares. hickory's own timeout is set past the longest round
+        // so it never fires first; `walk` cuts each send at its round's.
         opts.attempts = 0;
+        opts.timeout = base.timing.longest();
         opts.num_concurrent_reqs = 1;
         opts.server_ordering_strategy = ServerOrderingStrategy::UserProvidedOrder;
         servers.push(Server {
@@ -162,7 +307,7 @@ fn build_channel(base: &Base, name_servers: Vec<NameServerConfig>) -> Channel {
     Channel {
         servers,
         display,
-        attempts: base.options.attempts,
+        timing: base.timing,
         ndots: base.options.ndots,
     }
 }
@@ -259,13 +404,24 @@ pub fn dns_set_servers(api: Api, servers: &[(IpAddr, u16)]) {
     }
 }
 
-/// True when `e` means the server did not answer at all, so c-ares would try
-/// the next one. Any DNS response -- an answer, NODATA, NXDOMAIN, SERVFAIL,
-/// REFUSED -- is final (node's ARES_FLAG_NOCHECKRESP).
+/// True when `e` means the server gave no usable answer, so c-ares would try
+/// the next one: no answer at all (timeout, network error), or a reply that
+/// does not parse (hickory's `Proto`). Any DNS response -- an answer, NODATA,
+/// NXDOMAIN, SERVFAIL, REFUSED -- is final (node's ARES_FLAG_NOCHECKRESP).
+///
+/// The malformed reply was measured on node v22.22.2 against fake servers
+/// sending a truncated datagram and a three-byte one: [malformed, good] gets
+/// the good server's records at once, the malformed server is demoted for the
+/// next query, and a malformed server alone fails EBADRESP after node's 4
+/// tries.
 fn is_no_answer(e: &NetError) -> bool {
     matches!(
         e,
-        NetError::Timeout | NetError::Io(_) | NetError::NoConnections | NetError::Busy
+        NetError::Timeout
+            | NetError::Io(_)
+            | NetError::NoConnections
+            | NetError::Busy
+            | NetError::Proto(_)
     )
 }
 
@@ -278,15 +434,16 @@ fn try_order(failures: &[u32]) -> Vec<usize> {
 }
 
 /// Sends one query over `channel` the way c-ares does: one server at a time,
-/// best first, moving on only when a server does not answer, for
-/// `attempts + 1` rounds. The caller has checked the channel is not empty.
+/// best first, moving on only when a server gives no usable answer, for
+/// `timing.tries` rounds, each send cut at its round's timeout. The caller
+/// has checked the channel is not empty.
 async fn walk<T, F, Fut>(channel: &Channel, mut send: F) -> Result<T, NetError>
 where
     F: FnMut(TokioResolver) -> Fut,
     Fut: Future<Output = Result<T, NetError>>,
 {
     let mut last = NetError::NoConnections;
-    for _round in 0..=channel.attempts {
+    for round in 0..channel.timing.tries {
         let failures: Vec<u32> = channel
             .servers
             .iter()
@@ -294,7 +451,11 @@ where
             .collect();
         for i in try_order(&failures) {
             let server = &channel.servers[i];
-            match send(server.resolver.clone()).await {
+            let wait = round_timeout(channel.timing.timeout, round, random_jitter());
+            let result = tokio::time::timeout(wait, send(server.resolver.clone()))
+                .await
+                .unwrap_or(Err(NetError::Timeout));
+            match result {
                 Err(e) if is_no_answer(&e) => {
                     server.failures.fetch_add(1, Ordering::Relaxed);
                     last = e;
@@ -315,9 +476,16 @@ async fn channel_lookup(
     name: &str,
     rtype: RecordType,
 ) -> Result<hickory_resolver::lookup::Lookup, NetError> {
+    // Parse the name before any server is asked: a name that does not parse
+    // is the caller's error, not a server's, so it must not walk the list --
+    // as a `Proto` error it would, demoting every server on the way.
+    let name = match hickory_resolver::proto::rr::IntoName::into_name(name) {
+        Ok(name) => name,
+        Err(e) => return Err(NetError::Msg(format!("invalid name: {e}"))),
+    };
     walk(channel, |r| {
-        let name = name.to_owned();
-        async move { r.lookup(name.as_str(), rtype).await }
+        let name = name.clone();
+        async move { r.lookup(name, rtype).await }
     })
     .await
 }
@@ -734,7 +902,9 @@ pub async fn dns_reverse(ip_str: String, api: Api) -> OpOutcome {
 /// type is ENODATA, SERVFAIL ESERVFAIL, REFUSED EREFUSED, NOTIMP ENOTIMP,
 /// FORMERR EFORMERR, and any other rcode (YXDOMAIN, ...) leaves c-ares's
 /// status at success with nothing to parse, which node reports as ENODATA.
-/// No answer at all is ETIMEOUT, and a port that refuses ECONNREFUSED.
+/// No answer at all is ETIMEOUT, a port that refuses ECONNREFUSED, and a
+/// reply that does not parse EBADRESP (measured: a lone server sending a
+/// truncated datagram).
 fn query_error_code(e: &NetError) -> &'static str {
     use hickory_resolver::net::DnsError;
     use hickory_resolver::proto::op::ResponseCode;
@@ -755,6 +925,7 @@ fn query_error_code(e: &NetError) -> &'static str {
         {
             return "ECONNREFUSED";
         }
+        NetError::Proto(_) => return "EBADRESP",
         _ => return "ESERVFAIL",
     };
     match rcode {
@@ -848,6 +1019,9 @@ mod tests {
         Empty(u8),
         /// Never answer.
         Silent,
+        /// An A answer cut 6 bytes short: the header, ID and question are
+        /// right, the record does not parse.
+        Truncated,
     }
 
     struct Fake {
@@ -874,6 +1048,17 @@ mod tests {
         let qtype = u16::from_be_bytes([query[off + 1], query[off + 2]]);
         let qend = off + 5;
         let (rcode, answer) = match reply {
+            Reply::Truncated => {
+                let mut full = respond(
+                    query,
+                    Reply::Answer {
+                        octet: 9,
+                        delay_ms: 0,
+                    },
+                );
+                full.truncate(full.len() - 6);
+                return full;
+            }
             Reply::Answer { octet, .. } if qtype == 1 => (0u8, Some((1u16, vec![10, 0, 0, octet]))),
             Reply::Answer { .. } if qtype == 12 => (0, Some((12, encode_name("host.example")))),
             Reply::Answer { .. } => (0, None),
@@ -923,16 +1108,21 @@ mod tests {
         Fake { port, asked }
     }
 
-    fn test_channel(fakes: &[&Fake], attempts: usize) -> Channel {
-        let mut options = ResolverOpts::default();
-        options.timeout = Duration::from_millis(300);
-        options.attempts = attempts;
-        let base = Base {
+    fn test_base(tries: usize) -> Base {
+        Base {
             domain: None,
             search: Vec::new(),
-            options,
+            options: ResolverOpts::default(),
             name_servers: Vec::new(),
-        };
+            timing: CaresTiming {
+                timeout: Duration::from_millis(300),
+                tries,
+            },
+        }
+    }
+
+    fn test_channel(fakes: &[&Fake], tries: usize) -> Channel {
+        let base = test_base(tries);
         let servers = fakes
             .iter()
             .map(|f| {
@@ -968,7 +1158,7 @@ mod tests {
         })
         .await;
         let broken = fake(Reply::Empty(0)).await;
-        let ch = test_channel(&[&good, &broken], 1);
+        let ch = test_channel(&[&good, &broken], 2);
         let lookup = channel_lookup(&ch, "a.example.", RecordType::A)
             .await
             .unwrap();
@@ -976,7 +1166,7 @@ mod tests {
         assert_eq!(broken.asked.load(Ordering::SeqCst), 0);
 
         // In the other order the broken server's NODATA is the answer.
-        let ch = test_channel(&[&broken, &good], 1);
+        let ch = test_channel(&[&broken, &good], 2);
         let err = channel_lookup(&ch, "b.example.", RecordType::A)
             .await
             .unwrap_err();
@@ -997,7 +1187,7 @@ mod tests {
         .await;
         for (rcode, code) in [(2u8, "ESERVFAIL"), (5, "EREFUSED")] {
             let failing = fake(Reply::Empty(rcode)).await;
-            let ch = test_channel(&[&failing, &good], 1);
+            let ch = test_channel(&[&failing, &good], 2);
             let err = channel_lookup(&ch, "c.example.", RecordType::A)
                 .await
                 .unwrap_err();
@@ -1016,7 +1206,7 @@ mod tests {
             delay_ms: 0,
         })
         .await;
-        let ch = test_channel(&[&dead, &live], 0);
+        let ch = test_channel(&[&dead, &live], 1);
         let lookup = channel_lookup(&ch, "d.example.", RecordType::A)
             .await
             .unwrap();
@@ -1038,14 +1228,117 @@ mod tests {
     async fn every_server_silent_is_a_timeout_after_every_round() {
         let a = fake(Reply::Silent).await;
         let b = fake(Reply::Silent).await;
-        // attempts = 1: two rounds over both servers.
-        let ch = test_channel(&[&a, &b], 1);
+        // tries = 2: two rounds over both servers.
+        let ch = test_channel(&[&a, &b], 2);
         let err = channel_lookup(&ch, "f.example.", RecordType::A)
             .await
             .unwrap_err();
         assert_eq!(query_error_code(&err), "ETIMEOUT");
         assert_eq!(ch.servers[0].failures.load(Ordering::SeqCst), 2);
         assert_eq!(ch.servers[1].failures.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_reply_fails_over_and_alone_is_ebadresp() {
+        let bad = fake(Reply::Truncated).await;
+        let live = fake(Reply::Answer {
+            octet: 3,
+            delay_ms: 0,
+        })
+        .await;
+        let ch = test_channel(&[&bad, &live], 4);
+        let started = std::time::Instant::now();
+        let lookup = channel_lookup(&ch, "m.example.", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(first_a(&lookup), "10.0.0.3");
+        // At once, not after the server timeout.
+        assert!(started.elapsed() < Duration::from_millis(300));
+        assert_eq!(bad.asked.load(Ordering::SeqCst), 1);
+        // Demoted: the next query goes straight to the live server.
+        channel_lookup(&ch, "n.example.", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(bad.asked.load(Ordering::SeqCst), 1);
+        assert_eq!(live.asked.load(Ordering::SeqCst), 2);
+
+        // Alone: every try, then EBADRESP (node: 4 sends, "queryA EBADRESP").
+        let alone = fake(Reply::Truncated).await;
+        let ch = test_channel(&[&alone], 4);
+        let err = channel_lookup(&ch, "o.example.", RecordType::A)
+            .await
+            .unwrap_err();
+        assert_eq!(query_error_code(&err), "EBADRESP");
+        assert_eq!(alone.asked.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn a_name_that_does_not_parse_asks_no_server() {
+        let live = fake(Reply::Answer {
+            octet: 4,
+            delay_ms: 0,
+        })
+        .await;
+        let ch = test_channel(&[&live], 4);
+        let err = channel_lookup(&ch, "a..b.example.", RecordType::A)
+            .await
+            .unwrap_err();
+        assert_eq!(query_error_code(&err), "ESERVFAIL");
+        assert_eq!(live.asked.load(Ordering::SeqCst), 0);
+        assert_eq!(ch.servers[0].failures.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn timing_follows_c_ares_under_node() {
+        let secs = Duration::from_secs;
+        // Default: 2 s and node's 4 tries.
+        let default = CaresTiming::from_timeout_option(None);
+        assert_eq!(default.timeout, secs(2));
+        assert_eq!(default.tries, 4);
+        // A zero is "not set"; the timeout is clamped to 250 ms..5 s.
+        assert_eq!(CaresTiming::from_timeout_option(Some(0)), default);
+        assert_eq!(CaresTiming::from_timeout_option(Some(1)).timeout, secs(1));
+        assert_eq!(CaresTiming::from_timeout_option(Some(4)).timeout, secs(4));
+        assert_eq!(CaresTiming::from_timeout_option(Some(7)).timeout, secs(5));
+        // The last parseable timeout: wins; attempts: is not read at all.
+        let opts = |s: &'static str| timeout_option(s.split_whitespace());
+        assert_eq!(opts("edns0 timeout:3 attempts:1"), Some(3));
+        assert_eq!(opts("timeout:3 timeout:4"), Some(4));
+        assert_eq!(opts("timeout:3 timeout:x"), Some(3));
+        assert_eq!(opts("attempts:5 rotate"), None);
+    }
+
+    #[test]
+    fn each_round_doubles_the_wait_less_a_jitter_of_up_to_half() {
+        let t = Duration::from_secs(2);
+        assert_eq!(round_timeout(t, 0, 1000), t, "round 0 has no jitter");
+        assert_eq!(round_timeout(t, 1, 0), t * 2);
+        assert_eq!(round_timeout(t, 1, 1000), t, "never below the timeout");
+        assert_eq!(round_timeout(t, 2, 1000), t * 2);
+        assert_eq!(round_timeout(t, 3, 500), t * 6);
+        assert_eq!(round_timeout(t, 3, 0), t * 8);
+        // hickory's own timeout covers the longest round.
+        assert_eq!(
+            CaresTiming::from_timeout_option(None).longest(),
+            Duration::from_secs(16)
+        );
+        // A huge round saturates instead of overflowing.
+        assert!(round_timeout(t, 200, 0) >= t);
+    }
+
+    #[test]
+    fn a_host_without_dns_config_gets_an_empty_system_channel() {
+        let timing = CaresTiming::from_timeout_option(None);
+        let base = Base::from_system::<std::io::Error>(
+            Err(std::io::Error::other("no nameservers found in config")),
+            timing,
+        );
+        assert!(base.name_servers.is_empty());
+        assert!(base.search.is_empty());
+        let ch = build_channel(&base, base.name_servers.clone());
+        assert!(ch.servers.is_empty());
+        assert!(ch.display.is_empty());
+        assert_eq!(ch.timing, timing);
     }
 
     #[tokio::test]

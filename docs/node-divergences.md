@@ -1340,9 +1340,20 @@ errors and `getServers()` formatting, and the same split between them —
 `dns.setServers()` replaces the default nameservers of both the callback API and
 `dns.promises`, `dns.promises.setServers()` only those of `dns.promises`. Queries walk the
 list the way Node's c-ares does: one server at a time, first server first, moving on only
-when a server does not answer (a SERVFAIL or REFUSED answer is final), with a server that
-timed out tried last on later queries. Conformance case 581 pins all of it against fake
-nameservers on 127.0.0.1.
+when a server gives no usable answer (a timeout, a network error or a reply that does not
+parse; a SERVFAIL or REFUSED answer is final), with a server that failed tried last on
+later queries. Conformance case 581 pins all of it against fake nameservers on 127.0.0.1.
+
+The timing is c-ares's under Node too: four rounds over the list (Node always passes
+`tries: 4`, so `attempts:` in resolv.conf or `RES_OPTIONS` changes nothing), each server
+waited on for 2 s or the system's `timeout:` (clamped to 250 ms–5 s), doubled per round
+less a random jitter of up to half. Three timing differences remain, none of which changes
+a result. Node checks c-ares's timeouts on a 1 s timer, so its waits run up to a second
+longer than the nominal ones oam keeps (a dead first server costs 2.0 s in oam, 2.1–2.9 s
+in Node). hickory retransmits a UDP query to a silent server about every 340 ms within one
+wait, where c-ares sends it once. And c-ares shortens a server's timeout from the latency
+it measured on earlier answers, which oam does not model. The `timeout` and `tries`
+options of `new dns.Resolver(options)` are not read.
 
 What is left is per-instance servers. Node gives every `new dns.Resolver()` its own
 channel; oam's instances share one channel built from the system configuration, so oam

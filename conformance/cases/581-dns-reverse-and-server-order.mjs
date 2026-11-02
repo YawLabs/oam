@@ -13,7 +13,9 @@
 //    servers (hickory's default) and took whichever answered first, so a
 //    broken forwarder listed second that answered NOERROR-empty instantly won
 //    over a correct first server -- a CAA query came back ENODATA under oam
-//    and with records under node.
+//    and with records under node. A reply that does not parse (a truncated
+//    datagram) counts as no answer: the walk moves on at once, the bad server
+//    is demoted, and a bad server alone fails EBADRESP.
 //
 // 3) dns.setServers() itself: node's parsing and getServers() formatting
 //    (port only when not 53, IPv6 bracketed only with a port, duplicates
@@ -105,7 +107,12 @@ const servfail = await fakeServer((q, m, send) => send(response(q, m, 2)));
 const refused = await fakeServer((q, m, send) => send(response(q, m, 5)));
 const fast = await fakeServer((q, m, send) => send(response(q, m, 0, goodAnswers(q, [10, 0, 0, 2]))));
 const dead = await fakeServer(() => {});
-const all = { good, nodata, nxdomain, servfail, refused, fast, dead };
+// A right header and question, then an A record cut 6 bytes short.
+const truncated = await fakeServer((q, m, send) => {
+  const full = response(q, m, 0, goodAnswers(q, [10, 0, 0, 9]));
+  send(full.subarray(0, full.length - 6));
+});
+const all = { good, nodata, nxdomain, servfail, refused, fast, dead, truncated };
 
 function asked() {
   const out = [];
@@ -172,6 +179,20 @@ for (const name of ["f.example", "g.example"]) {
   console.log(`[dead, fast] resolve4 ${name}: ${line} | dead asked ${dead.asked > 0} fast asked ${fast.asked > 0}`);
   asked();
 }
+// A malformed reply is no answer: on to the next server at once, and the
+// malformed server is demoted for the next query on the same list.
+dns.setServers([truncated.addr, fast.addr]);
+for (const name of ["t.example", "u.example"]) {
+  let line;
+  try {
+    line = JSON.stringify(await dns.promises.resolve4(name));
+  } catch (e) {
+    line = errLine(e);
+  }
+  console.log(`[truncated, fast] resolve4 ${name}: ${line} | asked ${asked()}`);
+}
+await check("[truncated] resolve4", [truncated], () => dns.promises.resolve4("v.example"));
+await check("[truncated] reverse", [truncated], () => dns.promises.reverse(PTR_IP));
 
 // ---- 3) setServers itself ------------------------------------------------
 
@@ -206,6 +227,11 @@ dns.setServers([
   "[2001:db8::2]:5353",
 ]);
 console.log("parsed and formatted:", JSON.stringify(dns.getServers()));
+
+// An IPv6 zone is accepted and dropped (c-ares's server node has no scope
+// field), and a port that narrows to 0 is the default port.
+dns.setServers(["fe80::1%1", "[fe80::2%1]:5353", "192.0.2.9:65536", "[2001:db8::9]:65536"]);
+console.log("zones and port 0:", JSON.stringify(dns.getServers()));
 
 for (const bad of ["192.0.2.1", [192], ["bogus"], ["192.0.2.1:port"], ["[2001:db8::1"]]) {
   const before = JSON.stringify(dns.getServers());

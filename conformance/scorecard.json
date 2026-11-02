@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 413,
-      "total": 414,
+      "pass": 414,
+      "total": 415,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -1505,6 +1505,10 @@
         },
         {
           "case": "580-os-cpus-count-and-sources.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "581-dns-reverse-and-server-order.mjs",
           "status": "pass"
         },
         {

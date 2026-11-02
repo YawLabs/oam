@@ -39208,10 +39208,22 @@
     // `v4:port` -- and, as node's regexes allow, `[v4]:port`. The port
     // defaults to 53, and one past 65535 keeps its low 16 bits, as node's
     // cares_wrap narrows it (measured: "192.0.2.1:70000" reports as
-    // "192.0.2.1:4464"). Port 0 trips an assertion that aborts node; oam
-    // keeps it, as no server will answer.
+    // "192.0.2.1:4464"). A port that narrows to 0 is c-ares's "default
+    // port", 53 (measured: "192.0.2.1:65536" reports as "192.0.2.1", and
+    // "[2001:db8::1]:65536" as "2001:db8::1"); oam maps a literal 0 the same
+    // way, where node trips an assertion and aborts.
+    //
+    // An IPv6 zone (`fe80::1%1`, `[fe80::1%eth0]:5353`) passes node's isIP
+    // and is then dropped: node hands c-ares an ares_addr_port_node, which
+    // has no scope field (measured: getServers() reports "fe80::1" and
+    // "[fe80::1]:5353"). oam drops it at the same point.
     const DNS_IPV6_RE = /^\[([^[\]]*)\]/;
     const DNS_ADDR_SPLIT_RE = /(^.+?)(?::(\d+))?$/;
+    const dnsServerAddress = (ip) => {
+      const zone = ip.indexOf("%");
+      return zone === -1 ? ip : ip.slice(0, zone);
+    };
+    const dnsServerPort = (port) => (port & 0xffff) || 53;
     function setServersFor(api, servers) {
       if (!Array.isArray(servers)) {
         throw new codes.ERR_INVALID_ARG_TYPE("servers", "Array", servers);
@@ -39221,15 +39233,15 @@
         if (typeof serv !== "string") {
           throw new codes.ERR_INVALID_ARG_TYPE(`servers[${index}]`, "string", serv);
         }
-        if (isIP(serv) !== 0) return [serv, 53];
+        if (isIP(serv) !== 0) return [dnsServerAddress(serv), 53];
         const bracketed = DNS_IPV6_RE.exec(serv);
         if (bracketed && isIP(bracketed[1]) !== 0) {
           const port = Number.parseInt(serv.replace(DNS_ADDR_SPLIT_RE, "$2")) || 53;
-          return [bracketed[1], port & 0xffff];
+          return [dnsServerAddress(bracketed[1]), dnsServerPort(port)];
         }
         const split = DNS_ADDR_SPLIT_RE.exec(serv);
         if (split && isIP(split[1]) !== 0) {
-          return [split[1], Number.parseInt(split[2] || "53") & 0xffff];
+          return [dnsServerAddress(split[1]), dnsServerPort(Number.parseInt(split[2] || "53"))];
         }
         throw new codes.ERR_INVALID_IP_ADDRESS(serv);
       });
