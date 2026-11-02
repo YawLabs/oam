@@ -1416,14 +1416,20 @@ mod tests {
         .expect("the first request timed out")
         .unwrap_or_else(|e| panic!("first request failed: {}", e.error));
         let released = response.extensions().get::<Released>().cloned().unwrap();
+        // `phase` -- the body drain to the pop below -- bounds the entry's
+        // age when the age is read inside it, so it starts BEFORE the drain:
+        // the entry parks while the body drains, not after the collect
+        // returns. Started after the collect, it under-counted the age by the
+        // collect's tail, and a slow host (an x86_64 Linux container under
+        // Rosetta: a 220us wait against a 383us floor) failed a checkout that
+        // had waited out exactly what was left of the gate.
+        let phase_started = Instant::now();
         http_body_util::BodyExt::collect(response.into_body())
             .await
             .unwrap();
         // The entry is just parked. Measure the checkout DIRECTLY, not
         // through a whole request (whose debug round trip exceeds the 1ms
-        // window): `reuse_h1` is what sleeps. `phase` -- the body drain to
-        // that pop -- bounds the entry's age when the age is read inside it.
-        let phase_started = Instant::now();
+        // window): `reuse_h1` is what sleeps.
         released.settled().await;
         let phase = phase_started.elapsed();
         let key = pool_key(&uri, Alpn::default()).unwrap();
