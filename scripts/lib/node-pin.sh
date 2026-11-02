@@ -41,7 +41,7 @@
 # refusal into a loud warning, and the receipts then name the node that really
 # ran. The remote orchestrators deliberately do NOT forward it.
 #
-# Same convention as lib/iap-helpers.sh and lib/src-sync.sh: sourced, never
+# Same convention as lib/host-helpers.sh and lib/src-sync.sh: sourced, never
 # executed. Functions RETURN status and put the reason on stderr; the caller
 # owns fail()/warn()/die().
 # =============================================================================

@@ -35,8 +35,8 @@
 # exported: every ssh-add / ssh-keygen call that needs the agent gets it as a
 # per-command prefix. Exporting it would hand the release key to every child of
 # the release -- including the ssh sessions the remote build legs open to the
-# Mac and the GCP VM, which would then offer it to (and, with agent forwarding,
-# lend it to) hosts that have no business seeing it.
+# build Mac, which would then offer it to (and, with agent forwarding, lend it
+# to) a host that has no business seeing it.
 #
 # Bootstrap: until a key is committed to allowed_signers there is nothing to
 # sign with, and the manifest step is skipped with a loud warning (fatal under
@@ -721,9 +721,9 @@ WIN_SIGN_DLIB=""
 WIN_DOTNET_X64=""
 
 # kill_proc_tree <pid>: the repo's one process-tree reaper, tested where it
-# lives. iap-helpers.sh defines functions and two OAM_DISK_* defaults only.
-# shellcheck source=iap-helpers.sh
-. "$(dirname "${BASH_SOURCE[0]}")/iap-helpers.sh"
+# lives. host-helpers.sh defines functions and two OAM_DISK_* defaults only.
+# shellcheck source=host-helpers.sh
+. "$(dirname "${BASH_SOURCE[0]}")/host-helpers.sh"
 
 # _ws_winpath <path> -- the native Windows spelling, for arguments a Windows
 # program reads (signtool, powershell). $RELEASE_DIR is an MSYS /tmp path that
@@ -741,7 +741,7 @@ _ws_winpath() {
 # script around python.exe, a stand-in may be cmd.exe around ping.exe, and the
 # grandchild lives on holding the output pipe, so the caller blocks anyway
 # (measured: `timeout 3` on a script running `cmd //c ping -n 593` returned
-# only when ping did). So kill_proc_tree (lib/iap-helpers.sh: taskkill /T on
+# only when ping did). So kill_proc_tree (lib/host-helpers.sh: taskkill /T on
 # Windows, the ps-snapshot tree elsewhere) does the killing, and the output
 # goes through a file, not a pipe, so nothing that escaped could hold the
 # caller's $(...) open either.

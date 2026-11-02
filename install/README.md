@@ -136,6 +136,11 @@ RELEASE-MANIFEST                     (v0.18.0 on)
 RELEASE-MANIFEST.sig                 (v0.18.0 on)
 ```
 
+`oam-x86_64-unknown-linux-gnu` is built on Debian 12 and needs glibc 2.34 or
+newer (Debian 12, Ubuntu 22.04, RHEL 9 and later). The release gates on that:
+a build whose binary needs a newer `GLIBC_` symbol version fails the Linux leg
+(`OAM_LINUX_GLIBC_MAX` in `scripts/build-platforms-mac-linux.sh`).
+
 The installers and `oam self-update` all consume these exact
 names. If you change a target triple, change it in `scripts/release-local.sh`
 (+ `scripts/build-remote.sh`) and both install scripts together.

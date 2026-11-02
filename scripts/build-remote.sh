@@ -1,7 +1,8 @@
 #!/bin/bash
 # =============================================================================
 # Runs ON a remote build host (shipped in with the repo tree by
-# build-platforms-gcp-iap.sh / build-platforms-tailnet.sh). Recreates the
+# build-platforms-mac-linux.sh -- the linux leg, in a container in a Lima VM
+# on the build Mac -- and build-platforms-tailnet.sh). Recreates the
 # per-platform jobs of the deleted GitHub workflows (ci.yml, release.yml,
 # node-compat.yml, bench.yml) for whatever platform this host is. Kept as a
 # real script (not inline ssh strings) so it can use functions and case

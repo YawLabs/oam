@@ -67,8 +67,8 @@
 #                                            disciplines napi.rs relies on)
 #
 # Cross-platform coverage moved to the remote legs: scripts/release-local.sh
-# gates a release on this script PLUS gate+test+conformance on the GCP Linux
-# VM and the tailnet Mac (see scripts/build-remote.sh). For an on-demand
+# gates a release on this script PLUS gate+test+conformance on the tailnet
+# Mac and in the linux container in a VM on it (see scripts/build-remote.sh). For an on-demand
 # cross-platform sweep outside a release, use scripts/node-compat-measure.sh.
 #
 # Usage:

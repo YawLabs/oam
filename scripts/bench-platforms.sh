@@ -9,10 +9,13 @@
 # What it runs, per platform (a failed leg warns and the sweep continues):
 #   local (this box)      cargo run -p xtask -- bench --release --compare
 #   mac-arm64 (tailnet)   scripts/build-platforms-tailnet.sh --mode=bench
-#   linux-x64 (GCP)       scripts/build-platforms-gcp-iap.sh --mode=bench
-#                         (direct ssh to the VM, IAP tunnel fallback;
-#                         includes the Linux-only io_uring same-binary A/B --
-#                         bench.yml's io-uring-ab job)
+#   linux-x64 (Lima VM)   scripts/build-platforms-mac-linux.sh --mode=bench
+#                         (an x86_64 container under Rosetta in a VM on the
+#                         same Mac, run after the mac leg -- the two do not fit
+#                         in its memory together; includes the Linux-only
+#                         io_uring same-binary A/B -- bench.yml's io-uring-ab
+#                         job). Translated code: its numbers say less about an
+#                         x86_64 machine than the other legs' say about theirs.
 #
 # Runtime discovery is PATH-based: a missing bun just drops that column
 # (build-remote.sh attempts a best-effort bun install on the remotes).
@@ -28,7 +31,7 @@
 #   OAM_SKIP_LINUX=1 ...                         # drop the linux leg
 #   OAM_SKIP_LOCAL=1 ...                         # drop the local leg
 # Remote host config: same env as the two platform scripts (OAM_MAC_HOST,
-# OAM_MAC_USER, OAM_GCP_*, OAM_KEEP_VM, OAM_IAP_SSH_MODE).
+# OAM_MAC_USER, OAM_MAC_KEY, OAM_LIMA_INSTANCE, OAM_KEEP_VM).
 #
 # NOTE: the local leg overwrites the committed BENCHMARKS.md +
 # bench/results.json in the working tree (that is how the dev-host reference
@@ -86,8 +89,8 @@ fi
 if [ "${OAM_SKIP_LINUX:-0}" = "1" ]; then
   warn "OAM_SKIP_LINUX=1 -- linux leg skipped"
 else
-  step "Linux leg (GCP, --mode=bench, incl. io_uring A/B)"
-  if LINUX_ART=$(bash "$SCRIPT_DIR/build-platforms-gcp-iap.sh" --mode=bench); then
+  step "Linux leg (Lima VM on the build Mac, --mode=bench, incl. io_uring A/B)"
+  if LINUX_ART=$(bash "$SCRIPT_DIR/build-platforms-mac-linux.sh" --mode=bench); then
     LINUX_ART="${LINUX_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line
     cp -r "$LINUX_ART/linux-x64" "$STAGE_DIR/"
     ok "linux leg done"

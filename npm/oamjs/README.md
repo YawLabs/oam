@@ -48,7 +48,8 @@ plainly rather than failing as a broken install. Build from source, or use an
 x86_64 host.
 
 **musl (Alpine) is not published either.** The only Linux binary is the glibc
-one. The launcher detects a musl host and says so, because the alternative is
+one, and it needs glibc 2.34 or newer (Debian 12, Ubuntu 22.04, RHEL 9 and
+later). The launcher detects a musl host and says so, because the alternative is
 the dynamic loader reporting "No such file or directory" about a file that is
 plainly there.
 
