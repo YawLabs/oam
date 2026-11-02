@@ -628,7 +628,8 @@ pub fn drop_answer(answers: &ResolvedAnswers, token: u64) -> bool {
     lock_answers(answers).remove(&token).is_some()
 }
 
-/// How many answers are waiting to be redeemed or dropped.
+/// How many answers are waiting to be redeemed or dropped. Test-only.
+#[cfg(test)]
 pub fn pending_answers(answers: &ResolvedAnswers) -> usize {
     lock_answers(answers).len()
 }

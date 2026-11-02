@@ -653,17 +653,6 @@ mod port_arg_tests {
     }
 }
 
-/// Safely create a V8 string from a dynamic (possibly very large) Rust
-/// string. V8 rejects strings longer than ~1 GB; the fallback avoids a
-/// panic on the FFI boundary.
-#[allow(dead_code)]
-fn v8_string_or_fallback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    s: &str,
-) -> v8::Local<'s, v8::String> {
-    v8::String::new(scope, s).unwrap_or_else(|| v8::String::new(scope, "internal error").unwrap())
-}
-
 macro_rules! core_runtime {
     ($scope:expr) => {
         match $scope.get_slot::<oam_core::CoreRuntime>() {
@@ -676,7 +665,6 @@ macro_rules! core_runtime {
     };
 }
 
-#[allow(unused_macros)]
 macro_rules! core_runtime_mut {
     ($scope:expr) => {
         match $scope.get_slot_mut::<oam_core::CoreRuntime>() {
@@ -10740,8 +10728,13 @@ fn op_stdin_read(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     // The same per-handle ref accounting a socket's read uses, under the
-    // stdin key: see `CoreRuntime::spawn_stdin_op` for why one op spans the
-    // read's console-mode retries.
+    // stdin key. One op spans the whole of `oam_core::stdin_read`, the
+    // retries the pending-read gate drives included: when a console-mode
+    // switch cancels the blocked read, the discarded result is dropped and
+    // the read re-issued INSIDE this same op. So the id stays valid across a
+    // cancel, the gate and the handle bookkeeping never race over it, a read
+    // retired by `stdinSetRef(false)` stays retired across those retries, and
+    // a cancel never resurrects one.
     crate::ops::spawn_handle_op(
         scope,
         &mut rv,

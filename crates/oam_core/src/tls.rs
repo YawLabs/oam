@@ -688,7 +688,7 @@ fn named_refusal(reason: &CertificateError) -> Option<VerifyFailure> {
     })
 }
 
-/// Where the verifier leaves its verdict for `tls_connect` to read after
+/// Where the verifier leaves its verdict for `tls_connect_pinned` to read after
 /// the handshake: None means the certificate was accepted.
 type VerifySlot = Arc<Mutex<Option<(VerifyFailure, Vec<Vec<u8>>)>>>;
 
@@ -1800,17 +1800,10 @@ pub(crate) fn peer_cert_payload(
     )
 }
 
-/// tls.connect: TCP connect + TLS handshake.
-/// Returns Json {handle, protocol, cipher, cipherStandardName, authorized,
-/// authorizationError, alpnProtocol, ephemeralKeyInfo?, peerCertificates?,
-/// localAddr?, remoteAddr?} -- the names in Node's spelling (see above), the
-/// verifier's verdict (`authorized` is whether the peer's certificate passed,
-/// `authorizationError` its Node code or null), the peer chain as base64 DER
-/// leaf first, and the address pair in the same shape as tcp_connect's, so a
-/// TLSSocket can report `address()`, `localPort` and the resolved
-/// `remoteAddress` the way a net.Socket does. A certificate the verifier
-/// refuses (rejectUnauthorized true) rejects with Node's code and message and
-/// nothing else -- no syscall, no errno.
+/// [`tls_connect_pinned`] with no pin, no local bind and no ALPN: `host`
+/// goes through getaddrinfo. Test-only; the engine always calls the pinned
+/// form.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub async fn tls_connect(
     registry: TlsRegistry,
@@ -1868,7 +1861,20 @@ pub fn parse_alpn_protocols(json: &str) -> Result<Vec<Vec<u8>>, String> {
         .collect()
 }
 
-/// [`tls_connect`] with the addresses JS resolved for `host` standing in for
+/// tls.connect: TCP connect + TLS handshake.
+/// Returns Json {handle, protocol, cipher, cipherStandardName, authorized,
+/// authorizationError, alpnProtocol, ephemeralKeyInfo?, peerCertificates?,
+/// localAddr?, remoteAddr?} -- the names in Node's spelling (see above), the
+/// verifier's verdict (`authorized` is whether the peer's certificate passed,
+/// `authorizationError` its Node code or null), the peer chain as base64 DER
+/// leaf first, and the address pair in the same shape as
+/// [`crate::tcp::tcp_connect_pinned`]'s, so a TLSSocket can report
+/// `address()`, `localPort` and the resolved `remoteAddress` the way a
+/// net.Socket does. A certificate the verifier refuses (rejectUnauthorized
+/// true) rejects with Node's code and message and nothing else -- no
+/// syscall, no errno.
+///
+/// `pin` is the addresses JS resolved for `host`, standing in for
 /// getaddrinfo, as [`crate::tcp::tcp_connect_pinned`] takes them. The server
 /// name is still `server_name` or `host`, never an address from the pin.
 /// `local` is the `localAddress` / `localPort` bind made before dialling.
@@ -2149,7 +2155,7 @@ type HandshakeDone<IO> = (
 /// `tls.connect({ socket })`: the client handshake over a pipe JS pumps to
 /// the socket it already has (crate::byte_pipe), registered under a new
 /// handle that tls_read / tls_write / tls_shutdown / tls_close serve as they
-/// serve a connection oam opened. Resolves with tls_connect's payload less
+/// serve a connection oam opened. Resolves with tls_connect_pinned's payload less
 /// the addresses, which are the socket's own (JS has them).
 #[allow(clippy::too_many_arguments)]
 pub async fn tls_connect_over(

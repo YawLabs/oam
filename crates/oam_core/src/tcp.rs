@@ -109,7 +109,7 @@ impl WriteHalf {
         }
     }
 
-    /// The shutdown of the write side (see [`tcp_shutdown`]). A failure is
+    /// The shutdown of the write side (see [`tcp_shutdown_start`]). A failure is
     /// not reported: node's afterShutdown reports none.
     async fn shutdown(&mut self) {
         match self {
@@ -404,8 +404,8 @@ pub struct TcpState {
     /// wake-up of the reads and writes parked on it, which [`tcp_close`]
     /// and [`tcp_reset`] send (created by the first read or queued write).
     cancel: HashMap<u64, std::sync::Arc<tokio::sync::Notify>>,
-    /// The back of each stream handle's write queue: the latest `tcp_write`
-    /// or `tcp_shutdown` issued for it and still pending (see [`WriteTurn`]).
+    /// The back of each stream handle's write queue: the latest `tcp_write_start`
+    /// or `tcp_shutdown_start` issued for it and still pending (see [`WriteTurn`]).
     /// The last turn out removes the entry.
     write_tail: HashMap<u64, (u64, tokio::sync::oneshot::Receiver<()>)>,
     write_seq: u64,
@@ -533,7 +533,7 @@ impl Drop for InFlight {
 /// and sends it in the same loop turn (#156).
 ///
 /// The place is taken when the op is ISSUED -- synchronously, inside
-/// `tcp_write` / `tcp_shutdown`, before the future they return is first
+/// `tcp_write_start` / `tcp_shutdown_start`, before the future they return is first
 /// polled -- so the order is the order JS made the calls in, whatever order
 /// the runtime polls the futures in. Each turn waits for the one before it
 /// and releases the next when it is dropped: finished, failed, or abandoned
@@ -541,7 +541,8 @@ impl Drop for InFlight {
 /// happens when the runtime is dropping its tasks).
 ///
 /// An op issued while nothing is queued does not take a turn at all when the
-/// socket can finish it on the spot (see [`tcp_write`], [`tcp_shutdown`]).
+/// socket can finish it on the spot (see [`tcp_write_start`],
+/// [`tcp_shutdown_start`]).
 struct WriteTurn {
     registry: TcpRegistry,
     handle: u64,
@@ -828,15 +829,9 @@ pub(crate) fn errno_failure(error: &std::io::Error, syscall: &str) -> OpOutcome 
     OpOutcome::node_failed_io(code, format!("{syscall} {code}"), syscall, None, error)
 }
 
-/// net.connect / net.createConnection: establish a TCP client connection.
-/// Returns Json {handle, localAddr, remoteAddr}.
-///
-/// The connect itself is node's algorithm (crate::net_connect, shared with
-/// tls_connect): `attempt_timeout` is `net.getDefaultAutoSelectFamilyAttemptTimeout()`
-/// as JS read it for this call, and a failure rejects with node's own shape --
-/// `connect ECONNREFUSED 127.0.0.1:8080` with errno, code, syscall, address and
-/// port, a `getaddrinfo ENOTFOUND host` DNS error, or the NodeAggregateError of
-/// a name whose every address failed.
+/// [`tcp_connect_pinned`] with no pin and no local bind: `host` goes through
+/// getaddrinfo. Test-only; the engine always calls the pinned form.
+#[cfg(test)]
 pub async fn tcp_connect(
     registry: TcpRegistry,
     ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -847,7 +842,18 @@ pub async fn tcp_connect(
     tcp_connect_pinned(registry, ids, host, port, attempt_timeout, None, None).await
 }
 
-/// [`tcp_connect`] with the addresses JS resolved for `host` standing in for
+/// net.connect / net.createConnection: establish a TCP client connection.
+/// Returns Json {handle, localAddr, remoteAddr}.
+///
+/// The connect itself is node's algorithm (crate::net_connect, shared with
+/// tls_connect_pinned): `attempt_timeout` is
+/// `net.getDefaultAutoSelectFamilyAttemptTimeout()` as JS read it for this
+/// call, and a failure rejects with node's own shape -- `connect ECONNREFUSED
+/// 127.0.0.1:8080` with errno, code, syscall, address and port, a
+/// `getaddrinfo ENOTFOUND host` DNS error, or the NodeAggregateError of a
+/// name whose every address failed.
+///
+/// `pin` is the addresses JS resolved for `host`, standing in for
 /// getaddrinfo: net.connect's `lookup` option, a replaced `dns.lookup`, or a
 /// redeemed `netResolve` ticket (see `net_connect::ResolvedAnswers`). The
 /// engine has already checked every one of them against the net grant.
@@ -966,6 +972,17 @@ pub async fn tcp_read(registry: TcpRegistry, handle: u64, len: usize) -> OpOutco
     }
 }
 
+/// [`tcp_write_start`] as one future, whichever way the write left the call.
+/// Test-only; the engine settles a write that finished in the call itself.
+#[cfg(test)]
+pub fn tcp_write(
+    registry: TcpRegistry,
+    handle: u64,
+    data: Vec<u8>,
+) -> impl std::future::Future<Output = OpOutcome> + Send + 'static {
+    started_future(tcp_write_start(registry, handle, data))
+}
+
 /// Write bytes to a TCP stream. Remove-await-reinsert on the write half
 /// only -- reads proceed independently.
 ///
@@ -979,16 +996,9 @@ pub async fn tcp_read(registry: TcpRegistry, handle: u64, len: usize) -> OpOutco
 /// - What is left (or all of it, behind earlier writes) takes the next
 ///   place in the handle's write queue ([`WriteTurn`]): writes and the
 ///   shutdown of one handle run in the order they were issued.
-pub fn tcp_write(
-    registry: TcpRegistry,
-    handle: u64,
-    data: Vec<u8>,
-) -> impl std::future::Future<Output = OpOutcome> + Send + 'static {
-    started_future(tcp_write_start(registry, handle, data))
-}
-
-/// [`tcp_write`], telling the caller whether the write finished in the
-/// call: [`Started::Done`] when the socket took every byte at once (or the
+///
+/// The result tells the caller whether the write finished in the call:
+/// [`Started::Done`] when the socket took every byte at once (or the
 /// write failed on the spot), [`Started::Pending`] with the rest of the
 /// write otherwise. The engine settles a write that finished in the call
 /// without a trip through the event loop, as libuv reports a `uv_try_write`
@@ -1072,15 +1082,9 @@ pub fn tcp_write_start(
     })
 }
 
-/// Half-close the write side (sends FIN). Removes the write half and
-/// drops it -- no further writes are possible.
-///
-/// Like [`tcp_write`], it starts in the call. With nothing queued for the
-/// handle the FIN leaves at once; otherwise the shutdown takes the next
-/// place in the handle's write queue ([`WriteTurn`]), as libuv queues a
-/// shutdown behind its writes, and the FIN leaves as soon as the last byte
-/// before it has been written. Either way a caller asks for the FIN in the
-/// same turn as its last write, without waiting for that write to finish.
+/// [`tcp_shutdown_start`] as one future, whichever way the shutdown left the
+/// call. Test-only, as [`tcp_write`] is.
+#[cfg(test)]
 pub fn tcp_shutdown(
     registry: TcpRegistry,
     handle: u64,
@@ -1088,8 +1092,16 @@ pub fn tcp_shutdown(
     started_future(tcp_shutdown_start(registry, handle))
 }
 
-/// [`tcp_shutdown`], telling the caller whether it finished in the call
-/// (see [`tcp_write_start`]): with nothing queued the FIN leaves at once.
+/// Half-close the write side (sends FIN). Removes the write half and
+/// drops it -- no further writes are possible.
+///
+/// Like [`tcp_write_start`], it starts in the call. With nothing queued for
+/// the handle the FIN leaves at once; otherwise the shutdown takes the next
+/// place in the handle's write queue ([`WriteTurn`]), as libuv queues a
+/// shutdown behind its writes, and the FIN leaves as soon as the last byte
+/// before it has been written. Either way a caller asks for the FIN in the
+/// same turn as its last write, without waiting for that write to finish.
+/// The result tells the caller whether it finished in the call.
 pub fn tcp_shutdown_start(
     registry: TcpRegistry,
     handle: u64,
@@ -1162,6 +1174,7 @@ pub enum Started<F> {
 
 /// The single future [`tcp_write`] / [`tcp_shutdown`] return, whichever way
 /// the op left the call.
+#[cfg(test)]
 async fn started_future<F>(started: Started<F>) -> OpOutcome
 where
     F: std::future::Future<Output = OpOutcome>,

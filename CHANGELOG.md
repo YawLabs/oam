@@ -35,6 +35,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   broken second server could beat the real answer from the first. A server is now skipped
   only when it does not answer in time (2 s, doubling each round, or resolv.conf's `timeout:`)
   or sends a reply that does not parse.
+- **`process.abort()` ends the process with exit code 134, as node does on Windows.** It
+  called a native that does not exist, so it threw `TypeError: natives.processExit is not a
+  function`, ran the `'exit'` listeners and ended as an uncaught exception with exit code 1.
+  It now calls the immediate exit native with 134: no `'exit'` event, already-written output
+  kept. On POSIX a parent sees exit code 134 rather than a `SIGABRT` death, and no stack
+  report or core dump is written (docs/node-divergences.md #60).
 
 ## [0.19.2] - 2026-11-01
 

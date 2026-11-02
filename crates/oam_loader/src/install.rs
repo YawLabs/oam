@@ -30,10 +30,6 @@ pub(crate) struct LockfileEntry {
     version: Option<String>,
     resolved: Option<String>,
     integrity: Option<String>,
-    #[allow(dead_code)]
-    dev: Option<bool>,
-    #[allow(dead_code)]
-    optional: Option<bool>,
     /// The `bin` field inside the lockfile entry (npm v3 mirrors it from
     /// the package's own package.json).
     bin: Option<serde_json::Value>,
@@ -1859,8 +1855,6 @@ mod tests {
             version: Some("5.4.5".into()),
             resolved: Some("https://example.invalid/typescript-5.4.5.tgz".into()),
             integrity: None,
-            dev: None,
-            optional: None,
             bin: Some(serde_json::json!({
                 "tsc": "./bin/tsc",
                 "tsserver": "./bin/tsserver"
@@ -1931,8 +1925,6 @@ mod tests {
             version: Some("1.0.0".into()),
             resolved: Some("https://example.invalid/legacy-pkg-1.0.0.tgz".into()),
             integrity: None,
-            dev: None,
-            optional: None,
             bin: Some(serde_json::json!(["cmd1", "cmd2"])),
         };
         let packages: Vec<(&str, &LockfileEntry)> = vec![("node_modules/legacy-pkg", &entry)];

@@ -1730,27 +1730,6 @@ impl CoreRuntime {
         }
     }
 
-    /// The `process.stdin` read: [`Self::spawn_handle_op`] under
-    /// [`HandleKey::Stdin`]. One op spans the whole of
-    /// [`crate::stdin::stdin_read`], the retries the pending-read gate drives
-    /// included: when a console-mode switch cancels the blocked read, the
-    /// discarded result is dropped and the read re-issued INSIDE this same
-    /// op. So the id stays valid across a cancel, the gate and this
-    /// bookkeeping never race over it, a read retired here stays retired
-    /// across those retries, and a cancel never resurrects one.
-    pub fn spawn_stdin_op<F>(&mut self, op: F) -> OpId
-    where
-        F: Future<Output = OpOutcome> + Send + 'static,
-    {
-        self.spawn_handle_op(HandleKey::Stdin, op)
-    }
-
-    /// node's `stdin.ref()` / `stdin.unref()`, and what destroying the stream
-    /// does: [`Self::set_handle_ref`] on [`HandleKey::Stdin`].
-    pub fn set_stdin_ref(&mut self, referenced: bool) {
-        self.set_handle_ref(HandleKey::Stdin, referenced);
-    }
-
     pub fn has_inflight(&self) -> bool {
         self.inflight > 0
     }
@@ -3564,11 +3543,6 @@ impl FsPath {
     pub fn shown(&self) -> std::borrow::Cow<'_, str> {
         fs_shown_path(&self.os)
     }
-
-    /// The OS path, owned.
-    pub fn into_os(self) -> String {
-        self.os
-    }
 }
 
 impl AsRef<std::path::Path> for FsPath {
@@ -4043,7 +4017,9 @@ pub enum Win32ResolveMode {
 /// `Win32ResolveMode::Js`.
 ///
 /// Pure, so every rule is unit-tested on any host; only `fs_os_path` is
-/// Windows-only.
+/// Windows-only. Test-only: the runtime calls `win32_resolve_mode` with the
+/// mode each call site needs.
+#[cfg(test)]
 pub fn win32_resolve(path: &str, cwd: &str, drive_cwd: impl Fn(&str) -> Option<String>) -> String {
     win32_resolve_mode(path, || cwd.to_string(), drive_cwd, Win32ResolveMode::Js)
 }
@@ -5266,6 +5242,10 @@ pub mod zlib {
                 inner: Box::new(NodeInflate::with_dictionary(wrap, dictionary)),
             }
         }
+
+        /// An Unzip stream (gzip or zlib, decided on the first two bytes).
+        /// Test-only: the engine builds every stream through [`Self::new`].
+        #[cfg(test)]
         pub fn new_unzip() -> Self {
             Self::new(Wrap::Auto, None)
         }
@@ -9867,28 +9847,28 @@ mod tests {
     }
 
     #[test]
-    fn set_stdin_ref_retires_and_restores_the_live_read() {
+    fn stdin_handle_ref_retires_and_restores_the_live_read() {
         let mut core = CoreRuntime::new().unwrap();
-        let id = core.spawn_stdin_op(ops::sleep(60_000));
+        let id = core.spawn_handle_op(HandleKey::Stdin, ops::sleep(60_000));
         assert!(core.has_inflight(), "a stdin read pins the loop by default");
 
         // stdin.unref(): the read is still blocked in the OS, but the loop is
         // free to exit.
-        core.set_stdin_ref(false);
+        core.set_handle_ref(HandleKey::Stdin, false);
         assert!(!core.has_inflight());
         // Idempotent -- a second unref must not double-count.
-        core.set_stdin_ref(false);
+        core.set_handle_ref(HandleKey::Stdin, false);
         assert!(!core.has_inflight());
 
         // stdin.ref() puts it back.
-        core.set_stdin_ref(true);
+        core.set_handle_ref(HandleKey::Stdin, true);
         assert!(core.has_inflight());
-        core.set_stdin_ref(true);
+        core.set_handle_ref(HandleKey::Stdin, true);
         assert!(core.has_inflight());
 
         // The next read inherits the ref-ness in force when it is issued.
-        core.set_stdin_ref(false);
-        let next = core.spawn_stdin_op(ops::sleep(60_000));
+        core.set_handle_ref(HandleKey::Stdin, false);
+        let next = core.spawn_handle_op(HandleKey::Stdin, ops::sleep(60_000));
         assert_ne!(next, id);
         assert!(
             !core.has_inflight(),
@@ -9897,9 +9877,9 @@ mod tests {
     }
 
     #[test]
-    fn set_stdin_ref_after_the_read_settled_does_not_corrupt_inflight() {
+    fn stdin_handle_ref_after_the_read_settled_does_not_corrupt_inflight() {
         let mut core = CoreRuntime::new().unwrap();
-        core.spawn_stdin_op(ops::sleep(5));
+        core.spawn_handle_op(HandleKey::Stdin, ops::sleep(5));
         let completion = core
             .recv_deadline(Some(Instant::now() + Duration::from_secs(5)))
             .expect("the stdin read settles");
@@ -9907,9 +9887,9 @@ mod tests {
         // A destroy() landing after the read came back: the id is stale, so
         // both directions must be no-ops rather than underflow `inflight` or
         // resurrect a settled op.
-        core.set_stdin_ref(false);
+        core.set_handle_ref(HandleKey::Stdin, false);
         assert!(!core.has_inflight());
-        core.set_stdin_ref(true);
+        core.set_handle_ref(HandleKey::Stdin, true);
         assert!(!core.has_inflight());
         // An unrelated op still settles cleanly afterwards.
         let other = core.spawn_op(ops::sleep(5));

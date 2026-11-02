@@ -69,6 +69,8 @@ pub fn record(file: &str, map_json: String) {
 }
 
 /// True when a map has been recorded for `file` (regardless of validity).
+/// Test-only.
+#[cfg(test)]
 pub fn has_map(file: &str) -> bool {
     let table = registry().lock().unwrap_or_else(|e| e.into_inner());
     table.contains_key(file)

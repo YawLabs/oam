@@ -140,7 +140,8 @@ pub fn close(pipes: &Pipes, id: u64) -> bool {
     true
 }
 
-/// How many pipes are open.
+/// How many pipes are open. Test-only.
+#[cfg(test)]
 pub fn open_count(pipes: &Pipes) -> usize {
     lock(pipes).len()
 }

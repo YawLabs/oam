@@ -2,7 +2,7 @@
 //!
 //! What lives here:
 //!
-//! - TypeScript strip/transform via oxc (`transpile_typescript`). Source
+//! - TypeScript strip/transform via oxc (`transpile_typescript_mapped`). Source
 //!   comes in as .ts/.mts/.cts/.tsx/.jsx and comes out as plain JavaScript:
 //!   types removed, non-erasable syntax (enums, namespaces, parameter
 //!   properties) lowered -- strictly more than Node's strip-only support --
@@ -264,6 +264,11 @@ pub fn transpile_fingerprint_with(resolver: &Resolver, path: &Path) -> String {
 /// Thin shim over `transpile_typescript_with` on the current thread's
 /// default `Resolver`; long-lived consumers should own a `Resolver` so
 /// `clear_caches()` reaches the tsconfig state the JSX settings come from.
+///
+/// Test-only: the runtime takes the source map too
+/// (`transpile_typescript_mapped`) or the REPL metadata
+/// (`transpile_typescript_rich`), which run the same transform.
+#[cfg(test)]
 pub fn transpile_typescript(path: &Path, source: &str) -> Result<String, TranspileError> {
     transpile_typescript_with(default_resolver(), path, source)
 }
