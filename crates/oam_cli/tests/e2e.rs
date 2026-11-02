@@ -20623,36 +20623,38 @@ fn zstd_dropped_stream_frees_its_context() {
 }
 
 #[test]
-fn dns_set_servers_refuses_rather_than_lying() {
-    // A DELIBERATE divergence, so it cannot be a differential conformance case:
-    // node accepts setServers and honours it, oam throws ENOSYS.
+fn dns_resolver_set_servers_refuses_rather_than_lying() {
+    // A DELIBERATE divergence (docs/node-divergences.md #30), so it cannot be a
+    // differential conformance case: node gives every Resolver instance its
+    // own nameservers, oam's instances share the system channel, so
+    // Resolver.prototype.setServers throws ENOSYS. Recording the list and then
+    // querying the system servers anyway would be the worst option: a Resolver
+    // aimed at a blackhole address came back with real records, which is
+    // indistinguishable from a correct answer.
     //
-    // oam's resolver is process-global (one OnceLock<TokioResolver> built from
-    // the system config), and there is no per-Resolver plumbing to point a
-    // query at a caller-supplied nameserver. Recording the list and then
-    // querying the system servers anyway is the worst of the three options: a
-    // Resolver aimed at a blackhole address came back with real records, which
-    // is indistinguishable from a correct answer. Throwing sends the caller to
-    // its own fallback instead. getServers still reports the REAL configured
-    // servers, so the pair stays coherent.
+    // The module-level dns.setServers() is node's and is pinned against node
+    // by conformance case 581; here it only has to leave instances alone.
     let stdout = run_ok(
         "dns_set_servers.mjs",
         "import dns from 'node:dns';
          const grab = (fn) => { try { fn(); return null; } catch (e) { return e; } };
-         const modErr = grab(() => dns.setServers(['1.1.1.1']));
-         console.log('module_throws:', modErr !== null);
-         console.log('module_code:', modErr && modErr.code === 'ENOSYS');
+         const system = JSON.stringify(dns.getServers());
          const r = new dns.Resolver();
-         const resErr = grab(() => r.setServers(['1.1.1.1']));
+         const resErr = grab(() => r.setServers(['192.0.2.1']));
          console.log('resolver_throws:', resErr !== null);
          console.log('resolver_code:', resErr && resErr.code === 'ENOSYS');
          // The refusal must NOT have left a half-applied state behind.
-         const servers = dns.getServers();
+         console.log('resolver_getServers_unchanged:', JSON.stringify(r.getServers()) === system);
+         console.log('module_getServers_unchanged:', JSON.stringify(dns.getServers()) === system);
+         const servers = r.getServers();
          console.log('getServers_is_array:', Array.isArray(servers));
          console.log('getServers_nonempty:', servers.length > 0);
          console.log('getServers_strings:', servers.every((s) => typeof s === 'string'));
-         console.log('resolver_getServers_matches:',
-           JSON.stringify(r.getServers()) === JSON.stringify(servers));",
+         // The module-level setServers works and does not reach an instance.
+         const modErr = grab(() => dns.setServers(['192.0.2.1']));
+         console.log('module_accepts:', modErr === null);
+         console.log('module_getServers_set:', JSON.stringify(dns.getServers()) === '[\"192.0.2.1\"]');
+         console.log('resolver_keeps_system:', JSON.stringify(r.getServers()) === system);",
     );
     for line in stdout.lines() {
         assert!(

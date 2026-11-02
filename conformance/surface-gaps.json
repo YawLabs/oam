@@ -159,11 +159,9 @@
           "SERVFAIL",
           "TIMEOUT",
           "getDefaultResultOrder",
-          "getServers",
           "lookupService",
           "resolveTlsa",
-          "setDefaultResultOrder",
-          "setServers"
+          "setDefaultResultOrder"
         ],
         "domain": [
           "_stack",
@@ -591,11 +589,9 @@
           "SERVFAIL",
           "TIMEOUT",
           "getDefaultResultOrder",
-          "getServers",
           "lookupService",
           "resolveTlsa",
-          "setDefaultResultOrder",
-          "setServers"
+          "setDefaultResultOrder"
         ],
         "domain": [
           "_stack",
@@ -1012,11 +1008,9 @@
           "SERVFAIL",
           "TIMEOUT",
           "getDefaultResultOrder",
-          "getServers",
           "lookupService",
           "resolveTlsa",
-          "setDefaultResultOrder",
-          "setServers"
+          "setDefaultResultOrder"
         ],
         "domain": [
           "_stack",
