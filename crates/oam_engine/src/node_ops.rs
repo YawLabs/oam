@@ -547,6 +547,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("dnsResolve", op_dns_resolve),
         ("dnsReverse", op_dns_reverse),
         ("dnsGetServers", op_dns_get_servers),
+        ("dnsSetServers", op_dns_set_servers),
         // stdin
         ("stdinRead", op_stdin_read),
         ("stdinSetRef", op_stdin_set_ref),
@@ -10650,6 +10651,15 @@ fn op_dns_lookup(
     );
 }
 
+/// Which node dns API a call came through (0 callback, 1 promises, 2 a
+/// Resolver instance); it picks the channel, see `oam_core::dns::Api`.
+fn dns_api(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+) -> oam_core::dns::Api {
+    oam_core::dns::Api::from_index(value.uint32_value(scope).unwrap_or(0))
+}
+
 fn op_dns_resolve(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -10661,7 +10671,12 @@ fn op_dns_resolve(
         return;
     }
     let rrtype: String = args.get(1).to_rust_string_lossy(scope);
-    crate::ops::spawn_op(scope, &mut rv, oam_core::dns::dns_resolve(hostname, rrtype));
+    let api = dns_api(scope, args.get(2));
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::dns::dns_resolve(hostname, rrtype, api),
+    );
 }
 
 fn op_dns_reverse(
@@ -10670,7 +10685,8 @@ fn op_dns_reverse(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let ip: String = args.get(0).to_rust_string_lossy(scope);
-    crate::ops::spawn_op(scope, &mut rv, oam_core::dns::dns_reverse(ip));
+    let api = dns_api(scope, args.get(1));
+    crate::ops::spawn_op(scope, &mut rv, oam_core::dns::dns_reverse(ip, api));
 }
 
 /// `dns.getServers()` -- SYNCHRONOUS in node (it returns an array, not a
@@ -10678,10 +10694,10 @@ fn op_dns_reverse(
 /// through spawn_op.
 fn op_dns_get_servers(
     scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
+    args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let servers = oam_core::dns::dns_get_servers();
+    let servers = oam_core::dns::dns_get_servers(dns_api(scope, args.get(0)));
     let out = v8::Array::new(scope, servers.len() as i32);
     for (i, server) in servers.iter().enumerate() {
         let Some(value) = v8::String::new(scope, server) else {
@@ -10690,6 +10706,30 @@ fn op_dns_get_servers(
         out.set_index(scope, i as u32, value.into());
     }
     rv.set(out.into());
+}
+
+/// `dns.setServers()` / `dns.promises.setServers()` (the API in argument 0)
+/// -- replaces that API's default channel. The JS
+/// side has already validated and parsed node's string forms (ResolverBase
+/// .setServers) and hands over `[[address, port], ...]` as JSON, so anything
+/// unparseable here is an internal error, not a caller one.
+fn op_dns_set_servers(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let api = dns_api(scope, args.get(0));
+    let json = args.get(1).to_rust_string_lossy(scope);
+    let parsed: Result<Vec<(String, u16)>, _> = serde_json::from_str(&json);
+    let servers: Option<Vec<(std::net::IpAddr, u16)>> = parsed.ok().and_then(|list| {
+        list.into_iter()
+            .map(|(ip, port)| ip.parse().ok().map(|ip| (ip, port)))
+            .collect()
+    });
+    match servers {
+        Some(servers) => oam_core::dns::dns_set_servers(api, &servers),
+        None => throw_type_error(scope, "dnsSetServers: expected [[address, port], ...]"),
+    }
 }
 
 // ============================================================== stdin
