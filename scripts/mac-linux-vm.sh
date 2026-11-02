@@ -68,7 +68,7 @@
 #                                Mac-home relative>
 #
 # The Mac build lock (shared with the Yaw repo's linux leg, which drives its
-# own Lima instance on the same Mac; protocol v1.1, agreed between the two):
+# own Lima instance on the same Mac; protocol v1.2, agreed between the two):
 #   lock <runid> <repo> <instance> [<host> <pid>]
 #                                take ~/.lima-build.lock for this run; exit 0
 #                                acquired, 3 BUSY (the owner on stderr), 1 an
@@ -76,7 +76,8 @@
 #                                in the owner file (default unknown / 0).
 #   unlock <runid>               remove the lock only if its owner is <runid>;
 #                                exit 0 released (or no lock), 3 held by
-#                                another run (left alone, owner on stderr),
+#                                another run or ownerless (read in place and
+#                                left there, never moved; owner on stderr),
 #                                4 another run's lock was moved aside and the
 #                                path was re-taken before it could go back
 #                                (left aside, reported, never deleted)
@@ -227,7 +228,7 @@ do_status() {
   fi
 }
 
-# --- the Mac build lock (protocol v1.1) -----------------------------------------
+# --- the Mac build lock (protocol v1.2) -----------------------------------------
 # One lock for the whole Mac, a directory in the build user's home: what two
 # repos' linux legs share is the Mac's memory and disk, not any name
 # (yaw-linux and oam-linux share none). mkdir is the atomic step; the owner
@@ -244,14 +245,20 @@ do_status() {
 #
 # Nothing removes a lock in place. A takeover renames the lock aside
 # (~/.lima-build.lock.stale.<pid>) and removes it only if the renamed dir is
-# still the one judged stale: the same run= (or still ownerless) AND the same
-# inode. The inode is stricter than v1.1, which asks only "still ownerless":
-# two takers of one crash-left ownerless lock would otherwise let the second
-# remove the fresh, not-yet-owned lock dir the first had just made, and both
-# would build. A release renames it to ~/.lima-build.lock.release.<pid> and
-# removes it only if its run= is this run's. On a mismatch the dir goes back
-# if the path is still free; if not, it is left where it is and reported,
-# never deleted. An aside name already taken (a dir an earlier run with the
+# still the one judged stale: the same run= AND the same inode, and an
+# ownerless one must also still have no owner file and still be older than
+# LOCK_STALE_AFTER once moved (v1.2: a same-parent rename keeps a dir's mtime
+# and inode, measured on the build Mac's APFS; a fresh mkdir is new). The
+# inode is oam's own, stricter than the protocol: two takers of one
+# crash-left ownerless lock would otherwise let the second remove the fresh,
+# not-yet-owned lock dir the first had just made (a "replica" with the old
+# mtime passes the age test), and both would build. A release first reads
+# run= IN PLACE, and a lock that is not this run's -- or has no owner file --
+# is never moved at all (while it was aside, its path would be free for a
+# third run's mkdir); only this run's is renamed to
+# ~/.lima-build.lock.release.<pid>, re-read there, and removed if its run= is
+# still this run's. On a mismatch the dir goes back if the path is still
+# free; if not, it is left where it is and reported, never deleted. An aside name already taken (a dir an earlier run with the
 # same pid left there and reported) is never removed: the next free name,
 # <pid>.1, <pid>.2, ..., is used instead.
 #
@@ -291,15 +298,16 @@ lock_owner_text() {
   printf '%s' "${t% }"
 }
 
-# lock_age  -- the lock dir's age in seconds; non-zero when it cannot be read.
+# lock_age [<dir>]  -- a lock dir's age in seconds (default the lock itself);
+# non-zero when it cannot be read.
 # macOS stat (-f %m) first, then GNU stat (-c %Y), for a Mac with coreutils'
 # stat first on PATH -- where `-f %m` means file-system status of a file named
 # %m, fails, and may still print text -- so each answer counts only when it
 # is a number.
 lock_age() {
-  local mt
-  mt="$(stat -f %m "$LOCK_DIR" 2>/dev/null || true)"
-  [[ "$mt" =~ ^[0-9]+$ ]] || mt="$(stat -c %Y "$LOCK_DIR" 2>/dev/null || true)"
+  local d="${1:-$LOCK_DIR}" mt
+  mt="$(stat -f %m "$d" 2>/dev/null || true)"
+  [[ "$mt" =~ ^[0-9]+$ ]] || mt="$(stat -c %Y "$d" 2>/dev/null || true)"
   [[ "$mt" =~ ^[0-9]+$ ]] || return 1
   echo $(( $(date +%s) - mt ))
 }
@@ -392,28 +400,31 @@ lock_busy() {
 }
 
 # lock_put_back <moved-dir>  -- rename a dir this run moved aside back to
-# ~/.lima-build.lock, only while that path is free. mv onto a dir that
-# appeared in between would land INSIDE it; that is undone and counts as not
-# put back. Non-zero when it is not back.
+# ~/.lima-build.lock, only while that path is free. A run can mkdir the path
+# between that test and the mv, and then mv (BSD and GNU alike) lands the
+# moved dir INSIDE that fresh lock and succeeds: that nesting is detected,
+# moved back out to its aside name, and counts as not put back (the caller
+# reports BUSY, or unlock's 4). Non-zero when it is not back.
 lock_put_back() {
-  local moved="$1"
+  local moved="$1" nested="$LOCK_DIR/${1##*/}"
   [ ! -e "$LOCK_DIR" ] || return 1
   mv "$moved" "$LOCK_DIR" 2>/dev/null || return 1
-  if [ -e "$LOCK_DIR/${moved##*/}" ]; then
-    mv "$LOCK_DIR/${moved##*/}" "$moved" 2>/dev/null || true
-    return 1
-  fi
-  return 0
+  [ -e "$nested" ] || [ -L "$nested" ] || return 0
+  mv "$nested" "$moved" 2>/dev/null \
+    || echo "[mac] WARNING: a Mac build lock this run moved aside landed inside another run's new lock and could not be moved back out: it is at ~/${nested#"$HOME"/}, NOT deleted" >&2
+  return 1
 }
 
 # lock_take_over <judged-ident> <judged-inode>  -- move the lock judged
 # stale aside, and remove it only if it is still the one judged: lock_ident
 # unchanged AND the same inode (a lock dir made since -- above all a fresh,
-# still ownerless one -- has another). If not, it goes back (or, with the
-# path taken again, stays aside) and the run is BUSY. Returns 0 when the
-# path is free for the one retry.
+# still ownerless one -- has another), and, for an ownerless one, still no
+# owner file and still older than LOCK_STALE_AFTER (v1.2; an age that cannot
+# be read is not old). If not, it goes back (or, with the path taken again,
+# stays aside) and the run is BUSY. Returns 0 when the path is free for the
+# one retry.
 lock_take_over() {
-  local judged="$1" judged_ino="$2" moved got ino owner
+  local judged="$1" judged_ino="$2" moved got ino owner age old=1
   moved="$(lock_aside stale)" \
     || lock_busy "$judged (judged stale, but no free ~/.lima-build.lock.stale.$$.<n> name to rename it to -- clear the old ones by hand)"
   if ! mv "$LOCK_DIR" "$moved" 2>/dev/null; then
@@ -422,7 +433,10 @@ lock_take_over() {
   fi
   got="$(lock_ident "$moved")"
   ino="$(lock_inode "$moved" || true)"
-  if [ "$got" = "$judged" ] && [ -n "$ino" ] && [ "$ino" = "$judged_ino" ]; then
+  if [ "$judged" = "ownerless" ]; then
+    if [ -e "$moved/owner" ] || ! age="$(lock_age "$moved")" || [ "$age" -le "$LOCK_STALE_AFTER" ]; then old=0; fi
+  fi
+  if [ "$got" = "$judged" ] && [ "$old" = "1" ] && [ -n "$ino" ] && [ "$ino" = "$judged_ino" ]; then
     rm -rf "$moved"
     return 0
   fi
@@ -439,7 +453,9 @@ lock_take_over() {
 # ~/.lima-build.lock.release.<pid>, reported, not deleted).
 lock_release() {
   local run="$1" moved got owner
-  # A look first: a lock that is plainly another run's is not moved at all.
+  # run= read IN PLACE first (v1.2): a lock that is another run's, or has no
+  # owner file (a run mid-acquire), is not moved at all, not even for a
+  # moment. No lock dir at all is a release with nothing to do: exit 0.
   got="$(lock_ident "$LOCK_DIR")"
   case "$got" in
     gone) note "no Mac build lock to release"; return 0 ;;

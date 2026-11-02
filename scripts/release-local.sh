@@ -132,7 +132,8 @@
 #                           build Mac after the leg (default: stopped on every
 #                           exit -- the 8 GB Air cannot hold it and the mac
 #                           legs at once; the preflight stops one it finds
-#                           running, for the same reason)
+#                           running, for the same reason, whatever this is
+#                           set to)
 #   OAM_LIMA_INSTANCE=<name>  the linux leg's Lima instance (default
 #                           oam-linux); create it once with
 #                           scripts/build-platforms-mac-linux.sh --provision
@@ -757,10 +758,13 @@ fi
 # The linux leg runs in a Lima VM on the same Mac, so it needs the Mac even
 # when the mac assets are skipped. Its --preflight-only checks Lima, Rosetta
 # and the instance, and stops the VM if it is running: the mac legs run first
-# and need the memory.
+# and need the memory. OAM_KEEP_VM=0 here, whatever the caller exported:
+# under OAM_KEEP_VM=1 the preflight keeps the Mac build lock (protocol v1.2,
+# every mode), and this release's own linux leg would then find it BUSY. The
+# knob still applies to the linux leg itself, below.
 if [ "$SKIP_LINUX" != "1" ]; then
   [ -n "${OAM_MAC_HOST:-}" ] || fail "OAM_MAC_HOST not set -- the linux leg runs in a VM on the build Mac (or set OAM_SKIP_LINUX=1 to drop the linux asset)"
-  bash "$SCRIPT_DIR/build-platforms-mac-linux.sh" --preflight-only \
+  OAM_KEEP_VM=0 bash "$SCRIPT_DIR/build-platforms-mac-linux.sh" --preflight-only \
     || fail "the linux leg's VM on the build Mac cannot be used -- see above. Fix that, or set OAM_SKIP_LINUX=1 to drop the linux asset"
 fi
 

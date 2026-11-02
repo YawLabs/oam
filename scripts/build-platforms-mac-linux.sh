@@ -26,15 +26,18 @@
 # release-local.sh runs this leg after the mac legs, and --preflight-only
 # stops a VM it finds running.
 #
-# The Mac build lock (protocol v1.1, shared with the Yaw repo's linux leg,
+# The Mac build lock (protocol v1.2, shared with the Yaw repo's linux leg,
 # which runs its own Lima instance on the same Mac): ~/.lima-build.lock on
 # the Mac, one for the whole host -- what the two legs share is its memory
 # and disk. Taken (mac-linux-vm.sh lock) before anything starts, stops or
 # provisions a VM, in every mode including --preflight-only, and released
-# (unlock, only ever this run's own run id) in the EXIT trap after the VM is
-# stopped. Before it is taken, and again by the lock verb after, ANY other
-# Lima instance Running on the Mac refuses the run: BUSY, exit non-zero,
-# nothing stopped. A held lock is stale -- taken over -- only when its
+# (unlock, only ever this run's own run id) in the EXIT trap once this run's
+# VM is known to be down. It stays held while that VM may still be up, in
+# every mode: a stop that fails keeps it (the preflight's too), and
+# OAM_KEEP_VM=1 keeps it in every mode, --preflight-only included -- which
+# is why the callers run their preflight with OAM_KEEP_VM=0. Before it is
+# taken, and again by the lock verb after, ANY other Lima instance Running
+# on the Mac refuses the run: BUSY, exit non-zero, nothing stopped. A held lock is stale -- taken over -- only when its
 # owner's VM is not Running AND the lock is over 15 minutes old; anything
 # else is BUSY. The run id is <RUNID>-<pid>-<random>.
 #
@@ -65,10 +68,16 @@
 #                      stop there. Prints nothing on stdout; exit 0 means a
 #                      build could start. A VM found Running is stopped (the
 #                      mac legs run next and need the memory) unless
-#                      OAM_KEEP_VM=1. release-local.sh runs it before it tags.
-#                      It takes the Mac build lock for that (always, so exit 0
-#                      also means the lock was free) and always releases it:
-#                      it never starts a VM. Another repo's VM Running, or the
+#                      OAM_KEEP_VM=1. release-local.sh runs it before it tags
+#                      (with OAM_KEEP_VM=0, see below). It takes the Mac build
+#                      lock for that (always, so exit 0 also means the lock
+#                      was free) and releases it on exit -- except when the
+#                      VM it found Running would not stop, or OAM_KEEP_VM=1:
+#                      then the lock stays held, as after a build run, and
+#                      the command that releases it is printed (a caller
+#                      whose build leg follows must not pass OAM_KEEP_VM=1
+#                      to its preflight, or that leg finds the lock BUSY).
+#                      Another repo's VM Running, or the
 #                      lock held by any run that is not stale, is BUSY: it
 #                      exits non-zero and stops nothing, and prints the owner
 #                      and the commands that clear a lock whose run is over
@@ -103,10 +112,10 @@
 #                         older than the build image.
 #   OAM_KEEP_VM=1         leave the VM running when this script exits
 #                         (default: stop it, whatever state it was found in),
-#                         and the Mac build lock held with it -- the release
-#                         command is printed; the lock goes stale on its own
-#                         once that VM is stopped and the lock is 15 minutes
-#                         old
+#                         and the Mac build lock held with it, in every mode
+#                         (--preflight-only too) -- the release command is
+#                         printed; the lock goes stale on its own once that
+#                         VM is stopped and the lock is 15 minutes old
 #   OAM_LINUX_FAST=1      see --mode=release
 #   OAM_LINUX_RETRY_DELAY 15 (default) -- seconds to wait before the one
 #                         retry a remote step gets when its ssh connection
@@ -215,9 +224,11 @@ mac_vm(){
   local verb="$1"; shift
   ssh "${SSH_OPTS[@]}" "$HP" "bash -s -- $verb $INSTANCE $*" < "$DRIVER"
 }
-# The lock verbs take their own arguments (protocol v1.1): exit 0 taken /
-# released, 3 BUSY with the owner on stderr, unlock's 4 another run's lock
-# displaced and left aside (reported), anything else an error.
+# The lock verbs take their own arguments (protocol v1.2): exit 0 taken /
+# released, 3 BUSY with the owner on stderr (unlock: not this run's, left in
+# place), unlock's 4 another run's lock displaced and left aside (reported),
+# anything else (ssh's 255 among them) could not tell -- the lock may or may
+# not have been taken, so the EXIT trap still unlocks by this run's id.
 mac_lock(){
   ssh "${SSH_OPTS[@]}" "$HP" "bash -s -- lock $LOCK_RUN oam $INSTANCE $LOCK_HOST $$" < "$DRIVER"
 }
@@ -230,31 +241,45 @@ mac_refresh(){
   ssh "${SSH_OPTS[@]}" "$HP" "bash -s -- refresh $LOCK_RUN" < "$DRIVER"
 }
 
-# One EXIT trap for every path, set before the first ssh. In order: the VM
-# is stopped (once a build run holds the lock -- STOP_ON_EXIT -- unless
-# OAM_KEEP_VM=1), then the lock is released, but only when the VM is known
-# to be stopped or was never started by this run (a preflight): a lock left
-# with a Running VM stays BUSY until that VM stops, then goes stale. Nothing
+# One EXIT trap for every path, set before the first ssh (protocol v1.2: the
+# lock stays held while this run's VM may still be up, in every mode). In
+# order:
+#   - OAM_KEEP_VM=1 and this run took the lock (LOCK_TAKEN, set only on the
+#     lock verb's exit 0): nothing is stopped and nothing released, in every
+#     mode, --preflight-only included; the commands that undo it are printed.
+#   - a build run holding the lock (STOP_ON_EXIT) stops the VM;
+#   - the lock is released only when this run's VM is known to be down: a
+#     stop that failed -- the exit trap's, or the preflight's stop of a VM
+#     it found Running (PF_VM_UP, set across that stop) -- keeps it, BUSY to
+#     other runs until that VM stops, then stale.
+# LOCK_HELD says the unlock may be needed: set BEFORE the lock verb (an ssh
+# drop after the Mac took the lock must not leak it -- unlock removes only
+# this run's), cleared by a BUSY answer (exit 3), which took nothing. Nothing
 # here writes to stdout: the last stdout line is the artifact dir.
 LOCK_HELD=0
+LOCK_TAKEN=0
 STOP_ON_EXIT=0
+PF_VM_UP=0
 STAGE_DIR=""
 on_exit(){
   local stopped=1 log=/dev/stderr
-  if [ "$STOP_ON_EXIT" = "1" ]; then
-    if [ "$KEEP_VM" = "1" ]; then
+  if [ "$KEEP_VM" = "1" ] && [ "$LOCK_TAKEN" = "1" ]; then
+    if [ "$STOP_ON_EXIT" = "1" ]; then
       warn "OAM_KEEP_VM=1 -- leaving $INSTANCE running on $HP; stop it before the mac legs run: ssh $HP /opt/homebrew/bin/limactl stop $INSTANCE"
-      stopped=0
+    fi
+    warn "OAM_KEEP_VM=1 -- leaving the Mac build lock (run $LOCK_RUN) held, so no other linux leg starts beside a VM this run may have left up: other runs see BUSY until $INSTANCE is stopped, then it is stale. To release it now: $LOCK_PATH_HINT"
+    return 0
+  fi
+  if [ "$STOP_ON_EXIT" = "1" ]; then
+    [ -n "$STAGE_DIR" ] && log="$STAGE_DIR/logs/vm-stop.log"
+    if mac_vm stop >"$log" 2>&1; then
+      ok "stopped $INSTANCE on $HP"
     else
-      [ -n "$STAGE_DIR" ] && log="$STAGE_DIR/logs/vm-stop.log"
-      if mac_vm stop >"$log" 2>&1; then
-        ok "stopped $INSTANCE on $HP"
-      else
-        warn "could not stop $INSTANCE on $HP (see $log) -- it is holding memory the mac legs need. On the Mac: limactl stop $INSTANCE"
-        stopped=0
-      fi
+      warn "could not stop $INSTANCE on $HP (see $log) -- it is holding memory the mac legs need. On the Mac: limactl stop $INSTANCE"
+      stopped=0
     fi
   fi
+  [ "$PF_VM_UP" = "0" ] || stopped=0
   [ "$LOCK_HELD" = "1" ] || return 0
   if [ "$stopped" = "1" ]; then
     local urc=0
@@ -272,7 +297,7 @@ on_exit(){
       *) warn "could not release the Mac build lock (run $LOCK_RUN; unlock exit $urc, see above) -- if it is still this run's: $LOCK_PATH_HINT" ;;
     esac
   else
-    warn "leaving the Mac build lock (run $LOCK_RUN) held with $INSTANCE running: other runs see BUSY until it stops, then it is stale. To release it now: $LOCK_PATH_HINT"
+    warn "leaving the Mac build lock (run $LOCK_RUN) held with $INSTANCE possibly still running: other runs see BUSY until it stops, then it is stale. To release it now: $LOCK_PATH_HINT"
   fi
 }
 trap on_exit EXIT
@@ -346,8 +371,11 @@ esac
 # LOCK_HELD is set BEFORE the lock verb runs: if the Mac takes the lock and
 # the ssh connection then dies (255, or 130 on Ctrl-C), the EXIT trap still
 # unlocks -- unlock removes only a lock whose owner is this run's id, so it
-# is harmless when the Mac never took it. Only BUSY (3) clears it: the lock
-# is another run's.
+# is harmless when the Mac never took it. Only BUSY (3) clears it, before
+# failing: this run took nothing, and its EXIT trap must not unlock. Any
+# other non-zero exit fails the run with LOCK_HELD still set, so the trap
+# unlocks by this run's id -- even under OAM_KEEP_VM=1, which keeps only a
+# lock this run is known to have taken (LOCK_TAKEN).
 LOCK_HELD=1
 LOCK_RC=0
 LOCK_ERR="$(mac_lock 2>&1 >&2)" || LOCK_RC=$?
@@ -386,6 +414,7 @@ case "$LOCK_RC" in
     fail "BUSY: the build Mac is in use by another run -- this run starts, stops and provisions nothing.\n  Owner: $BUSY_OWNER\n  If that run is over (for example a lock this repo left with OAM_KEEP_VM=1), clear it by hand:$BUSY_STOP\n    $LOCK_PATH_HINT" ;;
   *) fail "could not take the Mac build lock on $HP (exit $LOCK_RC; the driver's message is above)" ;;
 esac
+LOCK_TAKEN=1
 ok "Mac build lock taken (run $LOCK_RUN)"
 # A build run stops the VM on every exit from here on -- success, failure,
 # Ctrl-C -- whatever state it was found in, unless OAM_KEEP_VM=1.
@@ -393,8 +422,14 @@ ok "Mac build lock taken (run $LOCK_RUN)"
 
 if [ "$PROVISION" = "1" ]; then
   step "Provision Lima instance $INSTANCE ($LIMA_CPUS CPUs, ${LIMA_MEM} GiB memory, ${LIMA_DISK} GiB disk)"
+  # The provision stops a Running instance before it edits it; a preflight
+  # whose provision fails may leave that VM up, so the lock stays (PF_VM_UP,
+  # as for the preflight's own stop below). A build run's EXIT trap stops
+  # the VM anyway.
+  [ "$PREFLIGHT_ONLY" != "1" ] || [ "$VM_STATUS" != "Running" ] || PF_VM_UP=1
   mac_vm provision "$LIMA_CPUS" "$LIMA_MEM" "$LIMA_DISK" >&2 \
     || fail "provisioning $INSTANCE on $HP failed -- see above"
+  PF_VM_UP=0
   VM_STATUS="Stopped"
   ok "instance $INSTANCE provisioned"
 fi
@@ -404,7 +439,11 @@ if [ "$PREFLIGHT_ONLY" = "1" ]; then
     if [ "$KEEP_VM" = "1" ]; then
       warn "$INSTANCE is Running and OAM_KEEP_VM=1 leaves it so -- the mac legs share that Mac's memory with it"
     else
-      mac_vm stop >&2 || fail "$INSTANCE is Running on $HP and would not stop -- the mac legs need that memory. On the Mac: limactl stop $INSTANCE"
+      # PF_VM_UP across the stop: if it fails (or the ssh drops, or Ctrl-C),
+      # the VM may still be up, and the EXIT trap keeps the lock.
+      PF_VM_UP=1
+      mac_vm stop >&2 || fail "$INSTANCE is Running on $HP and would not stop -- the mac legs need that memory, so the Mac build lock stays held by this run. On the Mac: limactl stop $INSTANCE"
+      PF_VM_UP=0
       ok "stopped $INSTANCE, found Running (the mac legs need the memory; OAM_KEEP_VM=1 leaves it)"
     fi
   fi

@@ -1111,7 +1111,10 @@ EOF
 # dir is instead REPLACED by a new, empty one (another taker's mkdir, which
 # a racing taker then renamed aside: still ownerless, a new inode, 0 s old);
 # with "replica" the replacement also carries the old dir's mtime, so only
-# its inode tells it apart. With $MLM/mv-nest, a new lock (y-third) appears
+# its inode tells it apart; with "touch" the moved dir itself (same inode,
+# still ownerless) gets a fresh mtime, so only its age tells it apart. With
+# $MLM/mv-log, every mv whose source is the lock path is logged there, so a
+# case can prove the lock was never moved. With $MLM/mv-nest, a new lock (y-third) appears
 # at the lock path just as a moved dir is put back there, so the put-back
 # lands INSIDE it. With $MLM/owner-mv-fail the owner.tmp -> owner rename
 # fails; with "swap" in it, the lock dir is first renamed away (a racing
@@ -1119,6 +1122,9 @@ EOF
 ML_REAL_MV="$(command -v mv)"
 cat > "$MLM/bin/mv" <<EOF
 #!/bin/bash
+if [ -f "$MLM/mv-log" ] && [ "\$#" = 2 ] && [ "\$1" = "$MLM/home/.lima-build.lock" ]; then
+  echo "\$1 -> \$2" >> "$MLM/mv-log"
+fi
 if [ -f "$MLM/owner-mv-fail" ] && [ "\$#" = 3 ] && [ "\$2" = "$MLM/home/.lima-build.lock/owner.tmp" ]; then
   mode="\$(cat "$MLM/owner-mv-fail")"; rm -f "$MLM/owner-mv-fail"
   if [ "\$mode" = "swap" ]; then
@@ -1140,6 +1146,7 @@ if [ -f "$MLM/mv-race" ] && [ "\$#" = 2 ] && [ "\$1" = "$MLM/home/.lima-build.lo
     "$MLM/home/.lima-build.lock.stale."*|"$MLM/home/.lima-build.lock.release."*)
       mode="\$(cat "$MLM/mv-race")"; rm -f "$MLM/mv-race"
       "$ML_REAL_MV" "\$1" "\$2" || exit
+      if [ "\$mode" = "touch" ]; then touch "\$2"; exit 0; fi
       if [ "\$mode" = "fresh" ] || [ "\$mode" = "replica" ]; then
         "$ML_REAL_MKDIR" "\$2.new"
         [ "\$mode" = "fresh" ] || touch -r "\$2" "\$2.new"
@@ -1195,6 +1202,7 @@ case "\$1" in
         awk -v n="\$5" '\$1 == n { \$2 = "Stopped" } { print }' "$MLM/lima" > "$MLM/lima.new" && mv -f "$MLM/lima.new" "$MLM/lima"
         echo "[mac] stop" >&2; exit 0 ;;
       provision)
+        [ -f "$ML/provision-fails" ] && { echo "[mac] limactl edit failed" >&2; exit 1; }
         # provision-steals: the provision outlives the lock's 15 minutes with
         # the VM down, and another run takes the lock over as stale.
         if [ -f "$ML/provision-steals" ]; then
@@ -1248,7 +1256,7 @@ ml_calls_of(){ grep -c -- "$1" <<<"$ML_CALLS"; }
 ml_reset(){
   rm -f "$ML"/fail-* "$ML"/drop-* "$ML"/drops-* "$ML/sum-override" "$ML/status-others-none" "$MLM/list-fail" \
         "$ML/lock-drop" "$ML/stop-fails" "$MLM/stat-mode" "$MLM/mkdir-race" "$MLM/mkdir-attempts" "$MLM/mv-race" \
-        "$MLM/mv-nest" "$MLM/owner-mv-fail" "$ML/provision-steals"
+        "$MLM/mv-nest" "$MLM/owner-mv-fail" "$ML/provision-steals" "$MLM/mv-log" "$ML/provision-fails"
   rm -rf "$MLM/home/.lima-build.lock" "$MLM/home/.lima-build.lock".* "$MLM/home/taker-aside"
   printf '%s\n' "$ML_ST_STOPPED" > "$ML/status"; printf '%s\n' "$ML_GLIBC_OK" > "$ML/glibc"
   echo "oam-linux Stopped" > "$MLM/lima"
@@ -1300,6 +1308,8 @@ ML_PF_KEEP="$ML_RC|$(ml_calls_of ' stop oam-linux')"
 it "preflight: a Running VM is stopped for the mac legs, unless OAM_KEEP_VM=1"
 if [ "$ML_PF_STOP" = "0|1" ] && [ "$ML_PF_KEEP" = "0|0" ] && grep -qF 'OAM_KEEP_VM=1 leaves it so' <<<"$ML_ERR"; then pass
 else fail "default: $ML_PF_STOP keep: $ML_PF_KEEP stderr: $ML_ERR"; fi
+# (OAM_KEEP_VM=1 keeps the lock too -- the protocol v1.2 group checks that.)
+rm -rf "$MLM/home/.lima-build.lock"
 
 printf '%s\n' "${ML_ST_STOPPED/Stopped/absent}" > "$ML/status"
 ml -- --preflight-only
@@ -1488,7 +1498,7 @@ if [ -z "$ML_LEFT" ] && [ ! -e scripts/build-platforms-g''cp-iap.sh ] && [ ! -e 
 else fail "still there: $ML_LEFT"; fi
 
 # =============================================================================
-group "the Mac build lock (protocol v1.1) -- mac-linux-vm.sh lock/unlock and the leg"
+group "the Mac build lock (protocol v1.2) -- mac-linux-vm.sh lock/unlock and the leg"
 # =============================================================================
 # ~/.lima-build.lock on the build Mac, shared with the Yaw repo's linux leg.
 # The driver's lock verbs run for real against the fake Mac set up in the
@@ -1539,6 +1549,27 @@ lk unlock r1
 it "unlock: only the owning run releases it; another run's unlock is BUSY and leaves it; no lock is a no-op"
 if [ "$LK_OTHER" = "3|kept|1" ] && [ "$LK_MINE" = "0|" ] && [ "$LK_RC" = "0" ]; then pass
 else fail "other: $LK_OTHER mine: $LK_MINE none: $LK_RC ($LK_ERR)"; fi
+
+# v1.2: unlock reads run= IN PLACE first. Another run's lock, or one with no
+# owner file (a run mid-acquire), is exit 3 and is never moved -- not even
+# renamed aside and put back, which would free the path for a moment. The
+# mv log proves no rename of the lock path ran at all.
+lk_ino(){ stat -c %i "$LK" 2>/dev/null || stat -f %i "$LK"; }
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+LK_INO0="$(lk_ino)"
+: > "$MLM/mv-log"
+lk unlock r1
+LK_UN_OTHER="$LK_RC|$(grep -c 'run=y-run-9' <<<"$LK_ERR")|$([ "$(lk_ino)" = "$LK_INO0" ] && echo same)|$(wc -l < "$MLM/mv-log" | tr -d ' ')|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+ml_reset
+mkdir -p "$LK"; lk_age 1000
+LK_INO0="$(lk_ino)"
+: > "$MLM/mv-log"
+lk unlock r1
+LK_UN_OWNERLESS="$LK_RC|$(grep -c 'no owner file' <<<"$LK_ERR")|$([ "$(lk_ino)" = "$LK_INO0" ] && echo same)|$([ -e "$LK/owner" ] && echo owner)|$(wc -l < "$MLM/mv-log" | tr -d ' ')|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+it "unlock (v1.2): another run's lock and an ownerless one are read in place -- exit 3, never moved (no rename at all), same dir"
+if [ "$LK_UN_OTHER" = "3|1|same|0|0" ] && [ "$LK_UN_OWNERLESS" = "3|1|same||0|0" ]; then pass
+else fail "other: $LK_UN_OTHER ownerless: $LK_UN_OWNERLESS err: $LK_ERR"; fi
 
 ml_reset
 lk_plant yaw yaw-linux y-run-9
@@ -1715,6 +1746,20 @@ done
 it "lock: an ownerless stale lock REPLACED by a new lock dir between the judgement and the rename (fresh, or with the old mtime) is put back, not removed -- BUSY"
 if [ "$LK_ABA" = " [fresh:3|kept||0|1] [replica:3|kept||0|1]" ]; then pass
 else fail "$LK_ABA err: $LK_ERR"; fi
+
+# v1.2: once moved, an ownerless lock must still have no owner file AND still
+# be older than 900 s. "touch" keeps the moved dir itself -- same inode, still
+# ownerless -- but gives it a fresh mtime, so only the age re-check catches
+# it: put back, BUSY, nothing removed.
+ml_reset
+mkdir -p "$LK"; lk_age 1000
+LK_INO0="$(lk_ino)"
+echo touch > "$MLM/mv-race"
+lk lock r1 oam oam-linux box-1 77
+LK_AGE_RECHECK="$LK_RC|$([ "$(lk_ino)" = "$LK_INO0" ] && echo same)|$([ -e "$LK/owner" ] && echo owner)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')|$(grep -c 'put back' <<<"$LK_ERR")"
+it "lock (v1.2): an ownerless stale lock that is no longer old once moved aside (same dir, fresh mtime) is put back, not removed -- BUSY"
+if [ "$LK_AGE_RECHECK" = "3|same||0|1" ]; then pass
+else fail "$LK_AGE_RECHECK err: $LK_ERR"; fi
 
 # The put-back's own race: a new lock appears at the path between the
 # "is it free" check and the rename back, so mv lands the displaced dir
@@ -1908,6 +1953,82 @@ if [ "$ML_RC" != "0" ] && [ "$(ml_calls_of ' lock ')" = "1" ] && [ "$(ml_calls_o
    && [ "$(ml_calls_of ' start ')" = "0" ] && [ ! -e "$LK" ] && grep -qF 'exit 255' <<<"$ML_ERR" \
    && [[ "$(tail -1 <<<"$ML_CALLS")" == "bash -s -- unlock "* ]]; then pass
 else fail "rc=$ML_RC lock-left=$([ -e "$LK" ] && cat "$LK/owner") calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+# v1.2: a lock call that is not a BUSY answer could not take -- and under
+# OAM_KEEP_VM=1 too, the EXIT trap still unlocks: KEEP_VM keeps only a lock
+# this run is known to have taken.
+ml_reset
+: > "$ML/lock-drop"
+ml OAM_KEEP_VM=1 -- --preflight-only
+ML_DROP_KEEP="$ML_RC|$(ml_calls_of ' lock ')|$(ml_calls_of ' unlock ')|$([ -e "$LK" ] && echo left)"
+ml_reset
+: > "$ML/lock-drop"
+ml OAM_KEEP_VM=1 -- --mode=release
+ML_DROP_KEEP_REL="$ML_RC|$(ml_calls_of ' unlock ')|$(ml_calls_of ' start ')|$([ -e "$LK" ] && echo left)"
+it "leg (v1.2): with OAM_KEEP_VM=1 an ssh drop on the lock call still unlocks on exit (preflight and release); nothing started"
+if [ "$ML_DROP_KEEP" = "1|1|1|" ] && [ "$ML_DROP_KEEP_REL" = "1|1|0|" ]; then pass
+else fail "preflight: $ML_DROP_KEEP release: $ML_DROP_KEEP_REL stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+# v1.2: the lock stays held while this run's VM may still be up, in every
+# mode. The preflight's stop of a VM it found Running fails: the lock is
+# kept by this run, no unlock, and the release command printed.
+ml_reset
+echo "oam-linux Running" > "$MLM/lima"
+printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
+: > "$ML/stop-fails"
+ml -- --preflight-only
+ML_PF_KEPT_RUN="$(grep -oE '^bash -s -- lock [^ ]+' <<<"$ML_CALLS" | awk '{print $5}')"
+it "leg (v1.2): preflight whose stop of a Running VM fails keeps the lock -- no unlock, this run the owner, the release command printed"
+if [ "$ML_RC" = "1" ] && [ "$(ml_calls_of ' stop oam-linux')" = "1" ] && [ "$(ml_calls_of ' unlock ')" = "0" ] \
+   && [ -n "$ML_PF_KEPT_RUN" ] && grep -qxF "run=$ML_PF_KEPT_RUN" "$LK/owner" 2>/dev/null \
+   && grep -qF 'would not stop' <<<"$ML_ERR" && grep -qF 'leaving the Mac build lock' <<<"$ML_ERR" \
+   && grep -qF "rm -rf ~/.lima-build.lock" <<<"$ML_ERR"; then pass
+else fail "rc=$ML_RC kept-run='$ML_PF_KEPT_RUN' calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+# ...and a preflight --provision that fails with the VM found Running (the
+# provision stops it first, so it may still be up) keeps the lock too.
+ml_reset
+echo "oam-linux Running" > "$MLM/lima"
+printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
+: > "$ML/provision-fails"
+ml -- --provision --preflight-only
+ML_PF_PROV_RUN="$(grep -oE '^bash -s -- lock [^ ]+' <<<"$ML_CALLS" | awk '{print $5}')"
+ML_PF_PROV="$ML_RC|$(ml_calls_of ' provision ')|$(ml_calls_of ' unlock ')|$([ -n "$ML_PF_PROV_RUN" ] && grep -qxF "run=$ML_PF_PROV_RUN" "$LK/owner" 2>/dev/null && echo held)"
+ml_reset
+: > "$ML/provision-fails"
+ml -- --provision --preflight-only
+ML_PF_PROV_STOPPED="$ML_RC|$(ml_calls_of ' unlock ')|$([ -e "$LK" ] && echo left)"
+it "leg (v1.2): a preflight --provision that fails with the VM found Running keeps the lock; with the VM found Stopped it releases it"
+if [ "$ML_PF_PROV" = "1|1|0|held" ] && [ "$ML_PF_PROV_STOPPED" = "1|1|" ]; then pass
+else fail "running: $ML_PF_PROV stopped: $ML_PF_PROV_STOPPED stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+# v1.2: OAM_KEEP_VM=1 keeps the lock in every mode, the preflight included --
+# with the VM Stopped (nothing to keep up, the lock still kept) and Running
+# (not stopped, lock kept).
+ml_reset
+ml OAM_KEEP_VM=1 -- --preflight-only
+ML_PFK_RUN="$(grep -oE '^bash -s -- lock [^ ]+' <<<"$ML_CALLS" | awk '{print $5}')"
+ML_PFK_STOPPED="$ML_RC|$(ml_calls_of ' stop ')|$(ml_calls_of ' unlock ')|$([ -n "$ML_PFK_RUN" ] && grep -qxF "run=$ML_PFK_RUN" "$LK/owner" 2>/dev/null && echo held)|$(grep -c 'OAM_KEEP_VM=1 -- leaving the Mac build lock' <<<"$ML_ERR")|$(grep -cF "rm -rf ~/.lima-build.lock" <<<"$ML_ERR")"
+ml_reset
+echo "oam-linux Running" > "$MLM/lima"
+printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
+ml OAM_KEEP_VM=1 -- --preflight-only
+ML_PFK_RUN="$(grep -oE '^bash -s -- lock [^ ]+' <<<"$ML_CALLS" | awk '{print $5}')"
+ML_PFK_RUNNING="$ML_RC|$(ml_calls_of ' stop ')|$(ml_calls_of ' unlock ')|$([ -n "$ML_PFK_RUN" ] && grep -qxF "run=$ML_PFK_RUN" "$LK/owner" 2>/dev/null && echo held)"
+it "leg (v1.2): preflight with OAM_KEEP_VM=1 keeps the lock it took, VM Stopped or Running -- no stop, no unlock, the release command printed"
+if [ "$ML_PFK_STOPPED" = "0|0|0|held|1|1" ] && [ "$ML_PFK_RUNNING" = "0|0|0|held" ]; then pass
+else fail "stopped: $ML_PFK_STOPPED running: $ML_PFK_RUNNING stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+# ...and so every caller whose own linux leg follows its preflight runs that
+# preflight with OAM_KEEP_VM=0, or a KEEP_VM run would block its own leg.
+it "leg (v1.2): release-local, node-compat-measure and bench-platforms run the linux preflight with OAM_KEEP_VM=0"
+ML_PFK_BAD=""
+for f in scripts/release-local.sh scripts/node-compat-measure.sh scripts/bench-platforms.sh; do
+  n_all="$(grep -v '^[[:space:]]*#' "$f" | grep -cF 'build-platforms-mac-linux.sh" --preflight-only')"
+  n_pin="$(grep -v '^[[:space:]]*#' "$f" | grep -cE '^[[:space:]]*OAM_KEEP_VM=0 bash "\$SCRIPT_DIR/build-platforms-mac-linux.sh" --preflight-only')"
+  { [ "$n_all" -ge 1 ] && [ "$n_all" = "$n_pin" ]; } || ML_PFK_BAD="$ML_PFK_BAD $f($n_pin/$n_all)"
+done
+if [ -z "$ML_PFK_BAD" ]; then pass; else fail "preflight not pinned to OAM_KEEP_VM=0:$ML_PFK_BAD"; fi
 
 # A lock verb refused as BUSY does not unlock: the lock is another run's.
 ml_reset
