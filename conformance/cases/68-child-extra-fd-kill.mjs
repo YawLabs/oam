@@ -34,8 +34,11 @@ if (!supported) {
   const r1 = await new Promise((done) => {
     const cp = spawn(process.execPath, [sleeper], { stdio });
     cp.on("spawn", () => setTimeout(() => cp.kill("SIGTERM"), 150));
-    cp.on("close", (code, signal) => done(`sigterm code=${code} signal=${signal}`));
-    setTimeout(() => done("sigterm TIMEOUT"), 8000);
+    cp.on("close", (code, signal) => {
+      clearTimeout(watchdog);
+      done(`sigterm code=${code} signal=${signal}`);
+    });
+    const watchdog = setTimeout(() => done("sigterm TIMEOUT"), 8000);
   });
   console.log(r1);
   rmSync(sleeper, { force: true });
@@ -58,8 +61,14 @@ if (!supported) {
   const r2 = await new Promise((done) => {
     const cp = spawn(process.execPath, [trapper], { stdio });
     cp.stdout.once("data", () => cp.kill("SIGUSR1"));
-    cp.on("close", (code, signal) => done(`trapped code=${code} signal=${signal}`));
-    setTimeout(() => done("trapped TIMEOUT"), 8000);
+    // Drain stderr so a chatty child cannot fill the pipe and stall into the
+    // watchdog.
+    cp.stderr.resume();
+    cp.on("close", (code, signal) => {
+      clearTimeout(watchdog);
+      done(`trapped code=${code} signal=${signal}`);
+    });
+    const watchdog = setTimeout(() => done("trapped TIMEOUT"), 8000);
   });
   console.log(r2);
   rmSync(trapper, { force: true });
@@ -74,9 +83,10 @@ if (!supported) {
       // The child is already reaped by the time close fires; a late kill must
       // not change the report.
       cp.kill("SIGTERM");
+      clearTimeout(watchdog);
       done(`late-kill code=${code} signal=${signal}`);
     });
-    setTimeout(() => done("late-kill TIMEOUT"), 8000);
+    const watchdog = setTimeout(() => done("late-kill TIMEOUT"), 8000);
   });
   console.log(r3);
   rmSync(quick, { force: true });
