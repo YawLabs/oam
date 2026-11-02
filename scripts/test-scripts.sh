@@ -1051,14 +1051,15 @@ printf '{"platforms":{"linux":{"counts":{"present":1,"nodeExportNames":1},"gener
 # a limactl that answers `list` from $ML/mac/lima ("<name> <status>" lines),
 # a stat that answers both macOS's `stat -f %m` and GNU's `stat -c %Y` from
 # this box's own stat, whichever kind it is ($MLM/stat-mode "gnu" makes it
-# a GNU stat first on a Mac's PATH, "none" a stat that answers neither), and
-# a mkdir that, with $MLM/mkdir-race, plants another run's lock just before
-# its second attempt at the lock dir.
+# a GNU stat first on a Mac's PATH, "none" a stat that answers neither; the
+# inode, -f %i / -c %i, follows the same modes), and a mkdir that, with
+# $MLM/mkdir-race, plants another run's lock just before its second attempt
+# at the lock dir.
 MLM="$ML/mac"
 mkdir -p "$MLM/bin" "$MLM/home"
 ML_REAL_STAT="$(command -v stat)"
 ML_REAL_MKDIR="$(command -v mkdir)"
-if "$ML_REAL_STAT" -c %Y . >/dev/null 2>&1; then ML_MTIME_FMT="-c %Y"; else ML_MTIME_FMT="-f %m"; fi
+if "$ML_REAL_STAT" -c %Y . >/dev/null 2>&1; then ML_MTIME_FMT="-c %Y" ML_INODE_FMT="-c %i"; else ML_MTIME_FMT="-f %m" ML_INODE_FMT="-f %i"; fi
 cat > "$MLM/bin/limactl" <<EOF
 #!/bin/bash
 case "\$1" in
@@ -1079,12 +1080,14 @@ cat > "$MLM/bin/stat" <<EOF
 #!/bin/bash
 mode="\$(cat "$MLM/stat-mode" 2>/dev/null || echo bsd)"
 case "\$1 \$2" in
-  "-f %m")
+  "-f %m"|"-f %i")
     # GNU stat reads -f as --file-system: it prints that, then fails on %m.
-    [ "\$mode" = "bsd" ] || { echo "  File: \"\$3\" ID: 0 Namelen: 255 Type: ext2/ext3"; echo "stat: cannot read file system information for '%m'" >&2; exit 1; } ;;
-  "-c %Y") [ "\$mode" != "none" ] || { echo "stat: illegal option -- c" >&2; exit 1; } ;;
+    [ "\$mode" = "bsd" ] || { echo "  File: \"\$3\" ID: 0 Namelen: 255 Type: ext2/ext3"; echo "stat: cannot read file system information for '\$2'" >&2; exit 1; } ;;
+  "-c %Y"|"-c %i") [ "\$mode" != "none" ] || { echo "stat: illegal option -- c" >&2; exit 1; } ;;
   *) echo "fake stat: unexpected: \$*" >&2; exit 97 ;;
 esac
+# shellcheck disable=SC2086
+if [ "\$2" = "%i" ]; then exec "$ML_REAL_STAT" $ML_INODE_FMT "\$3"; fi
 # shellcheck disable=SC2086
 exec "$ML_REAL_STAT" $ML_MTIME_FMT "\$3"
 EOF
@@ -1104,15 +1107,45 @@ EOF
 # this one renames the lock aside (to .stale.<pid> or .release.<pid>): once,
 # right after that rename, the moved dir's owner becomes another run's
 # (y-new), and with "retake" in the file yet another run (y-third) also
-# takes the freed path, so nothing can be put back.
+# takes the freed path, so nothing can be put back. With "fresh" the moved
+# dir is instead REPLACED by a new, empty one (another taker's mkdir, which
+# a racing taker then renamed aside: still ownerless, a new inode, 0 s old);
+# with "replica" the replacement also carries the old dir's mtime, so only
+# its inode tells it apart. With $MLM/mv-nest, a new lock (y-third) appears
+# at the lock path just as a moved dir is put back there, so the put-back
+# lands INSIDE it. With $MLM/owner-mv-fail the owner.tmp -> owner rename
+# fails; with "swap" in it, the lock dir is first renamed away (a racing
+# taker) and a new, empty one made at the path (a third run mid-acquire).
 ML_REAL_MV="$(command -v mv)"
 cat > "$MLM/bin/mv" <<EOF
 #!/bin/bash
+if [ -f "$MLM/owner-mv-fail" ] && [ "\$#" = 3 ] && [ "\$2" = "$MLM/home/.lima-build.lock/owner.tmp" ]; then
+  mode="\$(cat "$MLM/owner-mv-fail")"; rm -f "$MLM/owner-mv-fail"
+  if [ "\$mode" = "swap" ]; then
+    "$ML_REAL_MV" "$MLM/home/.lima-build.lock" "$MLM/home/taker-aside" && "$ML_REAL_MKDIR" "$MLM/home/.lima-build.lock"
+  fi
+  echo "mv: cannot move owner.tmp: No space left on device" >&2; exit 1
+fi
+if [ -f "$MLM/mv-nest" ] && [ "\$#" = 2 ] && [ "\$2" = "$MLM/home/.lima-build.lock" ]; then
+  case "\$1" in
+    "$MLM/home/.lima-build.lock.stale."*|"$MLM/home/.lima-build.lock.release."*)
+      rm -f "$MLM/mv-nest"
+      "$ML_REAL_MKDIR" "\$2"
+      printf 'repo=yaw\ninstance=yaw-linux\nrun=y-third\nhost=other-box\npid=4646\nstarted=2026-11-01T00:00:00Z\n' > "\$2/owner"
+      exec "$ML_REAL_MV" "\$1" "\$2" ;;
+  esac
+fi
 if [ -f "$MLM/mv-race" ] && [ "\$#" = 2 ] && [ "\$1" = "$MLM/home/.lima-build.lock" ]; then
   case "\$2" in
     "$MLM/home/.lima-build.lock.stale."*|"$MLM/home/.lima-build.lock.release."*)
       mode="\$(cat "$MLM/mv-race")"; rm -f "$MLM/mv-race"
       "$ML_REAL_MV" "\$1" "\$2" || exit
+      if [ "\$mode" = "fresh" ] || [ "\$mode" = "replica" ]; then
+        "$ML_REAL_MKDIR" "\$2.new"
+        [ "\$mode" = "fresh" ] || touch -r "\$2" "\$2.new"
+        rm -rf "\$2" && "$ML_REAL_MV" "\$2.new" "\$2"
+        exit 0
+      fi
       printf 'repo=yaw\ninstance=yaw-linux\nrun=y-new\nhost=other-box\npid=4545\nstarted=2026-11-01T00:00:00Z\n' > "\$2/owner"
       if [ "\$mode" = "retake" ]; then
         "$ML_REAL_MKDIR" "\$1"
@@ -1130,7 +1163,7 @@ cmd="\${!#}"
 echo "\$cmd" >> "$ML/calls"
 # shellcheck disable=SC2086
 set -- \$cmd
-if [ "\$1" = "bash" ] && { [ "\$4" = "lock" ] || [ "\$4" = "unlock" ]; }; then
+if [ "\$1" = "bash" ] && { [ "\$4" = "lock" ] || [ "\$4" = "unlock" ] || [ "\$4" = "refresh" ]; }; then
   verb="\$4"; shift 3
   # lock-drop: the Mac runs the verb (and takes the lock), then the
   # connection dies before its answer arrives.
@@ -1161,7 +1194,15 @@ case "\$1" in
         [ -f "$ML/stop-fails" ] && { echo "[mac] limactl stop failed" >&2; exit 1; }
         awk -v n="\$5" '\$1 == n { \$2 = "Stopped" } { print }' "$MLM/lima" > "$MLM/lima.new" && mv -f "$MLM/lima.new" "$MLM/lima"
         echo "[mac] stop" >&2; exit 0 ;;
-      provision|start|container|sync) echo "[mac] \$4" >&2; exit 0 ;;
+      provision)
+        # provision-steals: the provision outlives the lock's 15 minutes with
+        # the VM down, and another run takes the lock over as stale.
+        if [ -f "$ML/provision-steals" ]; then
+          rm -rf "$MLM/home/.lima-build.lock"; mkdir -p "$MLM/home/.lima-build.lock"
+          printf 'repo=yaw\ninstance=yaw-linux\nrun=y-thief\nhost=other-box\npid=4747\nstarted=2026-11-01T00:00:00Z\n' > "$MLM/home/.lima-build.lock/owner"
+        fi
+        echo "[mac] \$4" >&2; exit 0 ;;
+      start|container|sync) echo "[mac] \$4" >&2; exit 0 ;;
       run) echo "[remote] \$6"; [ -f "$ML/fail-\$6" ] && exit 1
            [ -f "$ML/drop-\$6" ] && { rm -f "$ML/drop-\$6"; exit 255; }
            [ -f "$ML/drops-\$6" ] && exit 255
@@ -1206,8 +1247,9 @@ ml(){
 ml_calls_of(){ grep -c -- "$1" <<<"$ML_CALLS"; }
 ml_reset(){
   rm -f "$ML"/fail-* "$ML"/drop-* "$ML"/drops-* "$ML/sum-override" "$ML/status-others-none" "$MLM/list-fail" \
-        "$ML/lock-drop" "$ML/stop-fails" "$MLM/stat-mode" "$MLM/mkdir-race" "$MLM/mkdir-attempts" "$MLM/mv-race"
-  rm -rf "$MLM/home/.lima-build.lock" "$MLM/home/.lima-build.lock".*
+        "$ML/lock-drop" "$ML/stop-fails" "$MLM/stat-mode" "$MLM/mkdir-race" "$MLM/mkdir-attempts" "$MLM/mv-race" \
+        "$MLM/mv-nest" "$MLM/owner-mv-fail" "$ML/provision-steals"
+  rm -rf "$MLM/home/.lima-build.lock" "$MLM/home/.lima-build.lock".* "$MLM/home/taker-aside"
   printf '%s\n' "$ML_ST_STOPPED" > "$ML/status"; printf '%s\n' "$ML_GLIBC_OK" > "$ML/glibc"
   echo "oam-linux Stopped" > "$MLM/lima"
 }
@@ -1657,6 +1699,100 @@ done
 it "lock/unlock refuse a bad run id, repo, instance, host or pid before touching anything"
 if [ -z "$LK_BAD" ]; then pass; else fail "$LK_BAD"; fi
 
+# Two takers judged the same crash-left ownerless lock stale; one removed it
+# and made a fresh lock dir, not yet owned, which the other then renamed
+# aside: still ownerless, but a new dir (new inode, and 0 s old). It is put
+# back, never removed -- the takeover checks the moved dir's inode against
+# the one judged. "replica" carries the old mtime too: only the inode tells.
+LK_ABA=""
+for mode in fresh replica; do
+  ml_reset
+  mkdir -p "$LK"; lk_age 1000
+  echo "$mode" > "$MLM/mv-race"
+  lk lock r1 oam oam-linux box-1 77
+  LK_ABA="$LK_ABA [$mode:$LK_RC|$([ -d "$LK" ] && echo kept)|$([ -e "$LK/owner" ] && echo owner)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')|$(grep -c 'put back' <<<"$LK_ERR")]"
+done
+it "lock: an ownerless stale lock REPLACED by a new lock dir between the judgement and the rename (fresh, or with the old mtime) is put back, not removed -- BUSY"
+if [ "$LK_ABA" = " [fresh:3|kept||0|1] [replica:3|kept||0|1]" ]; then pass
+else fail "$LK_ABA err: $LK_ERR"; fi
+
+# The put-back's own race: a new lock appears at the path between the
+# "is it free" check and the rename back, so mv lands the displaced dir
+# INSIDE it. That is undone: the displaced dir returns to its aside name.
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk_age 1000
+: > "$MLM/mv-race"; : > "$MLM/mv-nest"
+lk lock r1 oam oam-linux box-1 77
+LK_ASIDE="$(ls -d "$LK".stale.* 2>/dev/null | head -n1)"
+LK_NEST="$LK_RC|$(grep -c '^run=y-third$' "$LK/owner" 2>/dev/null)|$(grep -c '^run=y-new$' "$LK_ASIDE/owner" 2>/dev/null)|$(ls -d "$LK"/.lima-build.lock.* 2>/dev/null | wc -l | tr -d ' ')"
+ml_reset
+lk lock r1 oam oam-linux box-1 77
+: > "$MLM/mv-race"; : > "$MLM/mv-nest"
+lk unlock r1
+LK_ASIDE="$(ls -d "$LK".release.* 2>/dev/null | head -n1)"
+LK_UN_NEST="$LK_RC|$(grep -c '^run=y-third$' "$LK/owner" 2>/dev/null)|$(grep -c '^run=y-new$' "$LK_ASIDE/owner" 2>/dev/null)|$(ls -d "$LK"/.lima-build.lock.* 2>/dev/null | wc -l | tr -d ' ')"
+it "lock/unlock: a put-back that lands INSIDE a lock made at that instant is undone -- the displaced dir back at its aside name, nothing nested"
+if [ "$LK_NEST" = "3|1|1|0" ] && [ "$LK_UN_NEST" = "4|1|1|0" ]; then pass
+else fail "lock: $LK_NEST unlock: $LK_UN_NEST err: $LK_ERR"; fi
+
+# A dir left aside (and reported "not deleted") by an earlier run whose pid
+# this run now has: its aside name is taken, so this run picks another and
+# the leftover is kept. exec keeps the pid, so the planting shell knows it.
+lk_exec(){ # <leftover kind> <driver args...>  -- sets LK_RC, LK_ERR, LK_LEFT
+  local kind="$1"; shift
+  LK_ERR="$(HOME="$MLM/home" PATH="$MLM/bin:$PATH" LK="$LK" K="$kind" bash -c '
+    mkdir -p "$LK.$K.$$"
+    printf "repo=yaw\ninstance=yaw-linux\nrun=y-displaced\nhost=other-box\npid=4848\nstarted=2026-11-01T00:00:00Z\n" > "$LK.$K.$$/owner"
+    echo "$LK.$K.$$" > "$LK.left"
+    exec bash scripts/mac-linux-vm.sh "$@"' lk-exec "$@" 2>&1 >/dev/null </dev/null)"
+  LK_RC=$?
+  LK_LEFT="$(cat "$LK.left" 2>/dev/null)"; rm -f "$LK.left"
+}
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk_age 1000
+lk_exec stale lock r1 oam oam-linux box-1 77
+LK_KEEP_TO="$LK_RC|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)|$(grep -c '^run=y-displaced$' "$LK_LEFT/owner" 2>/dev/null)"
+ml_reset
+lk lock r1 oam oam-linux box-1 77
+lk_exec release unlock r1
+LK_KEEP_UN="$LK_RC|$([ -e "$LK" ] && echo kept)|$(grep -c '^run=y-displaced$' "$LK_LEFT/owner" 2>/dev/null)"
+it "lock/unlock: a leftover aside dir with this run's pid in its name is kept -- the takeover and the release rename to a new name"
+if [ "$LK_KEEP_TO" = "0|1|1" ] && [ "$LK_KEEP_UN" = "0||1" ]; then pass
+else fail "takeover: $LK_KEEP_TO release: $LK_KEEP_UN left='$LK_LEFT' err: $LK_ERR"; fi
+
+# The owner file cannot be written: the run removes the lock dir it made --
+# by its inode, renamed aside first -- and never a lock dir made since.
+ml_reset
+echo plain > "$MLM/owner-mv-fail"
+lk lock r1 oam oam-linux box-1 77
+LK_OW_PLAIN="$LK_RC|$([ -e "$LK" ] && echo kept)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+ml_reset
+echo swap > "$MLM/owner-mv-fail"
+lk lock r1 oam oam-linux box-1 77
+LK_OW_SWAP="$LK_RC|$([ -d "$LK" ] && echo kept)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+it "lock: an owner file that cannot be written removes this run's own lock dir, but not a new one another run made at the path meanwhile"
+if [ "$LK_OW_PLAIN" = "1||0" ] && [ "$LK_OW_SWAP" = "1|kept|0" ]; then pass
+else fail "plain: $LK_OW_PLAIN swap: $LK_OW_SWAP err: $LK_ERR"; fi
+
+ml_reset
+lk lock r1 oam oam-linux box-1 77
+lk_age 1000
+lk refresh r1
+LK_RF_MINE="$LK_RC|$(lk_mt=$(stat -c %Y "$LK" 2>/dev/null || stat -f %m "$LK"); [ $(( $(date +%s) - lk_mt )) -lt 60 ] && echo fresh)"
+lk_age 1000
+lk refresh r2
+LK_RF_OTHER="$LK_RC|$(lk_mt=$(stat -c %Y "$LK" 2>/dev/null || stat -f %m "$LK"); [ $(( $(date +%s) - lk_mt )) -gt 900 ] && echo old)|$(grep -c 'run=r1' <<<"$LK_ERR")"
+ml_reset
+lk refresh r1
+LK_RF_NONE="$LK_RC|$([ -e "$LK" ] && echo made)"
+it "refresh: renews the lock's mtime only while its run= is this run's; another run's (or no lock) is exit 3, untouched"
+if [ "$LK_RF_MINE" = "0|fresh" ] && [ "$LK_RF_OTHER" = "3|old|1" ] && [ "$LK_RF_NONE" = "3|" ]; then pass
+else fail "mine: $LK_RF_MINE other: $LK_RF_OTHER none: $LK_RF_NONE err: $LK_ERR"; fi
+
 ml_reset
 lk_plant yaw yaw-linux y-run-9
 printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
@@ -1677,6 +1813,21 @@ if [ "$ML_RC" = "0" ] && [ -n "$ML_LK_LINE" ] && [ -n "$ML_START_LINE" ] && [ "$
    && [ "$ML_LK_LINE" -lt "$ML_START_LINE" ] && ml_stop_then_unlock "$ML_CALLS" && [ ! -e "$LK" ] \
    && grep -qE "^bash -s -- lock [0-9]{8}-[0-9]{6}-[0-9]+-[0-9]+ oam oam-linux $ML_HOST [0-9]+$" <<<"$ML_CALLS"; then pass
 else fail "rc=$ML_RC calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+ml_reset
+ml -- --mode=release
+ML_RF_LINE="$(grep -nE '^bash -s -- refresh ' <<<"$ML_CALLS" | cut -d: -f1)"
+ML_START_LINE="$(grep -nF ' start oam-linux' <<<"$ML_CALLS" | cut -d: -f1)"
+ML_RF_OK="$ML_RC|$([ -n "$ML_RF_LINE" ] && [ -n "$ML_START_LINE" ] && [ $((ML_RF_LINE + 1)) = "$ML_START_LINE" ] && echo right-before)"
+ml_reset
+: > "$ML/provision-steals"
+ml -- --provision --mode=release
+it "leg: the lock is refreshed right before the VM starts; a lock taken over as stale during --provision stops the run before the start, and the release names it"
+if [ "$ML_RF_OK" = "0|right-before" ] && [ "$ML_RC" = "1" ] && [ "$(ml_calls_of ' start ')" = "0" ] \
+   && grep -qF 'no longer this run' <<<"$ML_ERR" && grep -qF 'taken over as stale' <<<"$ML_ERR" \
+   && grep -qF 'not this run'"'"'s (never taken, or taken over as stale) -- left alone' <<<"$ML_ERR" \
+   && grep -qxF 'run=y-thief' "$LK/owner"; then pass
+else fail "ok-run: $ML_RF_OK rc=$ML_RC calls: $ML_CALLS stderr: $(tail -6 <<<"$ML_ERR")"; fi
 
 ml_reset
 ml OAM_LIMA_CPUS=6 -- --provision --preflight-only

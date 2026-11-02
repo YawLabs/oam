@@ -224,6 +224,11 @@ mac_lock(){
 mac_unlock(){
   ssh "${SSH_OPTS[@]}" "$HP" "bash -s -- unlock $LOCK_RUN" < "$DRIVER"
 }
+# refresh (oam's own verb): renew the lock's mtime while it is this run's;
+# exit 0 renewed, 3 not this run's any more.
+mac_refresh(){
+  ssh "${SSH_OPTS[@]}" "$HP" "bash -s -- refresh $LOCK_RUN" < "$DRIVER"
+}
 
 # One EXIT trap for every path, set before the first ssh. In order: the VM
 # is stopped (once a build run holds the lock -- STOP_ON_EXIT -- unless
@@ -257,8 +262,9 @@ on_exit(){
     case "$urc" in
       0) ok "released the Mac build lock (run $LOCK_RUN), or found none of this run's to release" ;;
       # The lock is another run's: this run never took it (the lock verb
-      # failed before its mkdir won), so it is left alone.
-      3) ok "the Mac build lock is not this run's (run $LOCK_RUN never took it) -- left alone" ;;
+      # failed before its mkdir won), or another run took it over as stale
+      # (this run's VM down past 15 minutes). Either way it is left alone.
+      3) ok "the Mac build lock is not this run's (never taken, or taken over as stale) -- left alone (run $LOCK_RUN)" ;;
       # Another run's lock was moved aside by the release's rename and the
       # path was taken again before it could go back: the Mac said where it
       # is. Nothing of another run's is deleted.
@@ -424,6 +430,19 @@ vm_step(){
 }
 
 step "Start $INSTANCE and its build container"
+# The lock's age is its dir's mtime, set when it was taken and read by every
+# other run: a --provision (limactl create downloads the image) that keeps
+# the VM down past 15 minutes leaves it looking stale, and another run may
+# take it over and start its own VM. So it is renewed right before this
+# run's VM starts -- only while it is still this run's -- and a lock that is
+# not stops the run here, before two VMs share the Mac.
+REFRESH_RC=0
+mac_refresh >&2 2>&1 || REFRESH_RC=$?
+case "$REFRESH_RC" in
+  0) ;;
+  3) fail "the Mac build lock is no longer this run's (run $LOCK_RUN) -- another run took it over as stale while $INSTANCE was down (a --provision longer than 15 minutes?), so $INSTANCE is not started. Re-run once that run is over." ;;
+  *) fail "could not renew the Mac build lock on $HP (exit $REFRESH_RC; the driver's message is above) -- $INSTANCE is not started" ;;
+esac
 vm_step vm-start "$INSTANCE running" start
 vm_step container "build container $INSTANCE-build ready" container
 
