@@ -1,5 +1,5 @@
 //! Build-time capture of the oxc crate versions that shape
-//! `transpile_typescript` output, read from the workspace lockfile so
+//! `transpile_typescript_mapped` output, read from the workspace lockfile so
 //! `oam_loader::transpile_fingerprint` can never drift from what is actually
 //! linked. Same approach (and the same lockfile parser) as
 //! `oam_engine/build.rs` uses for `process.versions`: a missing or duplicated

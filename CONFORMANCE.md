@@ -14,7 +14,7 @@ Commit `523e4bad` | oam 0.19.1 | node v22.22.2 | host windows-aarch64
 
 ## Node differential (same script, both runtimes, byte-identical stdout)
 
-**414 / 415 cases identical to Node v22.22.2.**
+**415 / 416 cases identical to Node v22.22.2.**
 
 | case | status |
 |---|---|
@@ -390,6 +390,7 @@ Commit `523e4bad` | oam 0.19.1 | node v22.22.2 | host windows-aarch64
 | 58-child-extra-fd-ipc.mjs | pass |
 | 580-os-cpus-count-and-sources.mjs | pass |
 | 581-dns-reverse-and-server-order.mjs | pass |
+| 582-process-abort.mjs | pass |
 | 59-child-spawn-error-shape.mjs | pass |
 | 60-child-stdio-forms.mjs | pass |
 | 61-child-exec-nonpiped.mjs | pass |

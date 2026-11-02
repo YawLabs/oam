@@ -104,7 +104,7 @@ cargo test --workspace
 - `crates/oam_core` — event loop, op system, Promise<->Future bridge.
 - `crates/oam_diagnostics` — ODIF, the diagnostic envelope everything else speaks.
 - `crates/oam_cli` — the `oam` binary.
-- `xtask` — repo automation (V8 bump bot, snapshot rebuilds, packaging).
+- `xtask` — repo automation (`conformance`, `node-suite`, `bench`, `unsafe-budget`).
 
 Wider layout (loader, web/node compat, http, test runner, package manager, sandbox, tsgo
 sidecar, inspector) lands per the roadmap; crates are created when their workstream starts.

@@ -611,9 +611,10 @@ dump; silent acceptance would hand them a clean exit code, no dump, and nothing
 explaining the gap.
 
 oam has no abort primitive to build it on. `process.abort()` is the immediate exit
-native called with 134 (`natives.exit(134)` in `js/node_compat.js`; see #51) — not a
-raised `SIGABRT`, not Windows' `0x80000003` exception breakpoint — and everything reachable from oam's uncaught-exception path already runs
-after the stack unwound, which is precisely the frame this flag exists to preserve.
+native called with 134 (`natives.exit(134)` in `js/node_compat.js`; see #60) — not a
+raised `SIGABRT`, not Windows' `0x80000003` exception breakpoint — and everything
+reachable from oam's uncaught-exception path already runs after the stack unwound,
+which is precisely the frame this flag exists to preserve.
 Forwarding the token to V8 would be worse than inert: oam catches on the Rust side, so
 V8 sees `CAUGHT_BY_EXTERNAL`, which is inside its abort condition — it would abort on
 exceptions the program goes on to catch.
@@ -4145,7 +4146,7 @@ booting and then failing every browser tool.
   the `PipeWrap` but not Node's `ConnectWrap` -- as oam's TCP connect lists no
   `TCPConnectWrap`.
 
-### 51. `process.abort()`: exit code 134, not an abort
+### 60. `process.abort()`: exit code 134, not an abort
 
 node's `process.abort()` calls the C runtime's `abort()`. On Windows node v22.22.2 ends with
 exit code 134, runs no `'exit'` listener, keeps what was already written to stdout, and prints
@@ -4166,7 +4167,7 @@ differs:
 Builds through 0.19.2 called a native that does not exist (`processExit`), so
 `process.abort()` threw `TypeError: natives.processExit is not a function`, the `'exit'`
 listeners ran, and the run ended as an uncaught exception with exit code 1.
-`conformance/cases/581-process-abort.mjs` pins the exit code, the skipped `'exit'` listener and
+`conformance/cases/582-process-abort.mjs` pins the exit code, the skipped `'exit'` listener and
 the kept stdout on Windows, and the death (either form) on POSIX.
 
 ### `fs` descriptor arguments: what still differs

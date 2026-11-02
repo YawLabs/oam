@@ -7,7 +7,7 @@
 // listeners ran, and the run exited 1 as an uncaught exception.
 //
 // oam has no abort primitive, so on POSIX it exits 134 where node dies of
-// SIGABRT (docs/node-divergences.md #51). The POSIX leg therefore prints
+// SIGABRT (docs/node-divergences.md #60). The POSIX leg therefore prints
 // whether the child died of the abort in either form, not which form; the
 // Windows leg prints the exact status. stderr is not compared: node prints a
 // native and a JavaScript stack trace there, oam prints nothing.

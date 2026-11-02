@@ -2,7 +2,7 @@
 //!
 //! What lives here:
 //!
-//! - TypeScript strip/transform via oxc (`transpile_typescript`). Source
+//! - TypeScript strip/transform via oxc (`transpile_typescript_mapped`). Source
 //!   comes in as .ts/.mts/.cts/.tsx/.jsx and comes out as plain JavaScript:
 //!   types removed, non-erasable syntax (enums, namespaces, parameter
 //!   properties) lowered -- strictly more than Node's strip-only support --
@@ -267,8 +267,7 @@ pub fn transpile_fingerprint_with(resolver: &Resolver, path: &Path) -> String {
 ///
 /// Test-only: the runtime takes the source map too
 /// (`transpile_typescript_mapped`) or the REPL metadata
-/// (`transpile_typescript_rich`), which run the same transform. The other
-/// docs in this crate use the name for that shared transform.
+/// (`transpile_typescript_rich`), which run the same transform.
 #[cfg(test)]
 pub fn transpile_typescript(path: &Path, source: &str) -> Result<String, TranspileError> {
     transpile_typescript_with(default_resolver(), path, source)
