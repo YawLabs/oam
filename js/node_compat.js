@@ -17639,8 +17639,11 @@
         },
         { bigint: () => natives.hrtimeNanos() },
       ),
-      abort: () => { natives.processExit(134); },
-      abort: () => { natives.processExit(134); },
+      // node's abort() raises SIGABRT on POSIX; on Windows the process ends
+      // with exit code 134 (both measured on v22.22.2). oam has no abort
+      // primitive, so it takes the immediate exit -- no 'exit' event, as in
+      // node -- with 134 on every platform (docs/node-divergences.md #51).
+      abort: () => { natives.exit(134); },
       uptime: () => natives.uptimeMs() / 1000,
       debugPort: 9229,
       connected: false,

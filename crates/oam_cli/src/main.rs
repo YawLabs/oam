@@ -595,8 +595,8 @@ fn main() -> ExitCode {
                 // The whole value of this flag is that V8 aborts AT the throw
                 // site, with the throwing frame still on the stack, so a
                 // debugger breaks there or the OS writes a core dump. oam has
-                // no primitive to build that on: process.abort() is
-                // processExit(134) in js/node_compat.js -- not a raised
+                // no primitive to build that on: process.abort() is the
+                // immediate exit native, exit(134), in js/node_compat.js -- not a raised
                 // SIGABRT, and not Windows' 0x80000003 exception breakpoint --
                 // and anything reachable from the uncaught-exception path
                 // already runs after the stack unwound. Forwarding the token
