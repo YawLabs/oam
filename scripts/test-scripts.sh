@@ -353,10 +353,11 @@ else
             '!oam-bbbd000000000001' '!lib-bbbd000000000001.d' '!lib-bbbd000000000001.q.rcgu.o'
 fi
 
-# THE regression guard. mawk -- Ubuntu`s default awk, and the GCP builder`s --
-# matches NOTHING for /-[0-9a-f]{16}/ rather than erroring, so reintroducing an
-# interval expression silently returns Linux collection to zero with a green
-# run. Asserted on the source because the dev box has no mawk to run under.
+# THE regression guard. mawk -- the default awk on Debian and Ubuntu, and so
+# in the linux leg's debian:12 build container -- matched NOTHING for
+# /-[0-9a-f]{16}/ (the mawk 1.3.4 the bug was found on) rather than
+# erroring, so reintroducing an interval expression silently returns Linux
+# collection to zero with a green run. Asserted on the source because the dev box has no mawk to run under.
 # Comments are stripped first: the prose above the awk block necessarily quotes
 # the very pattern it warns against.
 it "the awk program uses no interval expressions"
@@ -402,9 +403,10 @@ if [ "$AWK_BAD" = "1" ]; then :
 elif [ -n "$AWK_TESTED" ]; then pass
 else fail "no awk implementation found to test with"; fi
 
-# mawk is the entire reason the guard above exists -- it is Ubuntu's default
-# and the GCP builder's, and it matches NOTHING for an interval expression
-# rather than erroring. The loop above silently covers whatever happens to be
+# mawk is the entire reason the guard above exists -- it is the default awk
+# on Debian and Ubuntu (the linux leg builds in a debian:12 container), and
+# the mawk 1.3.4 the bug was found on matches NOTHING for an interval
+# expression rather than erroring. The loop above silently covers whatever happens to be
 # installed, so on a host without mawk it reports a pass having never run the
 # implementation the 16GB bug came from. Name that gap instead of hiding it.
 it "mawk itself was available to test against"
@@ -2407,7 +2409,7 @@ group "src-sync.sh -- source tarball ceiling"
 . scripts/lib/src-sync.sh
 
 # The ceiling exists because on 2026-08-31 a release packed 11.6 GB and pushed
-# it over an IAP tunnel for 35 minutes before dying. 200MB default, real tree
+# it to the remote linux builder of the day for 35 minutes before dying. 200MB default, real tree
 # ~1.6MB.
 it "passes a realistically-sized tarball"; src_tarball_over_ceiling 2000000 && fail "2MB should pass" || pass
 it "passes right at the ceiling";         src_tarball_over_ceiling 209715200 && fail "200MB should pass" || pass
@@ -7234,9 +7236,9 @@ fi
 group "rust-pin.sh -- the pinned Rust toolchain"
 # =============================================================================
 # channel = "stable" resolved to different rustc versions per release leg
-# (1.96 on the Windows box, 1.97 on the GCP builder), and the builder's
-# clippy carried a lint the local one did not -- v0.18.1's linux leg died on
-# it an hour in. The pin must be exact, and every leg must assert it.
+# (1.96 on the Windows box, 1.97 on the linux leg's builder of the day, a
+# cloud VM then), and that builder's clippy carried a lint the local one did
+# not -- v0.18.1's linux leg died on it an hour in. The pin must be exact, and every leg must assert it.
 # shellcheck source=lib/rust-pin.sh
 . scripts/lib/rust-pin.sh
 

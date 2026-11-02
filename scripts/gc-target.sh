@@ -172,8 +172,9 @@ for tree in "${TREES[@]}"; do
       sort -rn |
       awk -v keep="$KEEP" -v now="$(date +%s)" -F'\t' '
         BEGIN {
-          # Interval expressions ({16}) are NOT portable. mawk is Ubuntu`s
-          # default awk -- and so the GCP builder`s -- and mawk 1.3.4 matches
+          # Interval expressions ({16}) are NOT portable. mawk is the default
+          # awk on Debian and Ubuntu -- the linux leg builds in a debian:12
+          # container -- and the mawk 1.3.4 this was found on matches
           # NOTHING for /-[0-9a-f]{16}/ rather than erroring, so this whole
           # prune was a silent no-op on Linux: it reported a clean deps/ while
           # collecting zero of 2535 files (21GB). A dynamic string regex

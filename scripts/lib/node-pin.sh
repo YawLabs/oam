@@ -14,8 +14,9 @@
 #   - MacBook Air       /usr/local/bin/node -- a hand-copied v22.23.1 binary
 #                       (NOT Homebrew's node@22, which is keg-only and never on
 #                       the non-interactive ssh PATH at all)
-#   - GCP linux builder the image's Node 22 -- v22.23.1 when the linux
-#                       surface-gaps section was recorded
+#   - linux builder     the image's Node 22 -- v22.23.1 when the linux
+#                       surface-gaps section was recorded (a cloud VM then;
+#                       the linux leg now runs in a Lima VM on the build Mac)
 # so the mac and linux receipts had never once compared against the target, and
 # nothing said so: every leg printed a version, none of them checked it.
 #
