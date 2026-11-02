@@ -14,6 +14,28 @@ gap between headings below is expected rather than a missing entry. Not every ta
 is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
 one, so `install.sh`, which resolves the latest Release, never handed them out.
 
+## [Unreleased]
+
+### Added
+
+- **`dns.setServers()` and `dns.promises.setServers()` work.** They refused with `ENOSYS`.
+  They now take node's address forms (`"1.2.3.4"`, `"1.2.3.4:5353"`, `"[::1]:5353"`, an IPv6
+  zone that node also drops, a port that narrows to 0 becoming 53) and `getServers()` reports
+  them back as node does. `dns.Resolver.prototype.setServers()` still refuses
+  (docs/node-divergences.md #30).
+
+### Fixed
+
+- **`dns.reverse()` fails with `ENOTFOUND` whenever the lookup fails, as node does.** A name
+  that exists but has no PTR record answered `ENODATA`; node's reverse goes through c-ares'
+  `ares_gethostbyaddr`, which reports every failed reverse lookup as `ENOTFOUND`.
+  `dns.resolvePtr()` keeps the `ENODATA` / `ENOTFOUND` split.
+- **Queries ask the configured DNS servers one at a time, first server first, as c-ares does.**
+  oam asked two servers at once and took whichever answered first, so an empty answer from a
+  broken second server could beat the real answer from the first. A server is now skipped
+  only when it does not answer in time (2 s, doubling each round, or resolv.conf's `timeout:`)
+  or sends a reply that does not parse.
+
 ## [0.19.2] - 2026-11-01
 
 ### Added
