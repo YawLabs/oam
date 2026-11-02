@@ -1385,23 +1385,6 @@
     }
     throw codes.ERR_INVALID_ARG_VALUE("options", options);
   }
-  // listen(path): node listens on that Unix domain socket or Windows named
-  // pipe. A net server does (net.Server#listen); oam's tls, http, https and
-  // http2 servers are native and TCP-only, so theirs fails -- on the next
-  // tick, as a bind that fails does -- instead of binding a TCP port nobody
-  // asked for (up to 0.17.1 the name was read as port 0). True when it
-  // refused.
-  function refusePipeListen(server, listen) {
-    if (listen.path === undefined) return false;
-    if (listen.cb !== null) server.once("listening", listen.cb);
-    var err = new Error(
-      "The feature listening on a Unix domain socket or named pipe (a `path`) " +
-      "is unavailable on the current platform, which is being used to run oam",
-    );
-    err.code = "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM";
-    process.nextTick(function() { server.emit("error", err); });
-    return true;
-  }
   // A server's bind while it is in flight (#387). Node binds a listen()
   // without a host -- a port alone, or a pipe -- synchronously, inside
   // listen(), so a close() in the same tick closes a bound handle: no
@@ -7323,10 +7306,6 @@
       return numericSeparator ? `${numSepStart(string)}n` : `${string}n`;
     }
     let _fmtOpts = {};
-    function formatValue(v) {
-      if (typeof v === "string") return v;
-      return inspect(v);
-    }
 
     // Node tryStringify: %j narrows its catch to circular-structure
     // TypeErrors (matched by first message line against a probe) and
@@ -10682,9 +10661,8 @@
   const STAT_KIND = 14;
   const STAT_IDS_KNOWN = 15;
   const STAT_REPARSE_TAG = 16;
-  // Two of the fourteen, read off a record without a Stats.
+  // One of the fourteen, read off a record without a Stats.
   const STAT_SIZE = 8;
-  const STAT_MTIME_MS = 11;
   const STAT_RECORD_BYTES = (STAT_NUMBERS + STAT_EXACT) * 8;
   // oam_core's EntryKind, by discriminant: the names a listing's kinds and
   // a Dirent's `_kind` use.
@@ -14100,7 +14078,7 @@
       // the data (a string, a view or an iterable), as every writeFile
       // form checks them; the flag and flush do not apply to a handle.
       async writeFile(data, options) {
-        const fh = this, h = this[kNative];
+        const h = this[kNative];
         options = writeFileOptions(options, false);
         await writeHandleData(h, writeFileData(data, options, true), options.encoding, options.signal);
       }
@@ -14111,7 +14089,7 @@
       // OVERWRITES from byte 0. Only the "a" flag at open() time appends.
       // Implemented as a real delegation so the two cannot drift.
       async appendFile(data, options) {
-        const fh = this, h = this[kNative];
+        const fh = this;
         return fh.writeFile(data, options);
       }
       // `position` is a pwrite/pread offset: it writes/reads THERE and
@@ -14127,7 +14105,7 @@
       // resolves 0 before anything is checked. The result has a null
       // prototype, as node's has.
       async write(buffer, offset, length, position) {
-        const fh = this, h = this[kNative];
+        const h = this[kNative];
         if (buffer?.byteLength === 0) return { __proto__: null, bytesWritten: 0, buffer: buffer };
         var bytes, pos;
         if (ArrayBuffer.isView(buffer)) {
@@ -14147,7 +14125,7 @@
       // too, and the range. Unlike fs.read the length is not `| 0`'d:
       // a missing one is the rest of the buffer.
       async read(buffer, offset, length, position) {
-        const fh = this, h = this[kNative];
+        const h = this[kNative];
         if (!ArrayBuffer.isView(buffer)) {
           if (buffer !== undefined) validateReadOptions(buffer);
           ({
@@ -14189,7 +14167,7 @@
       // in [-1, 2**32-1], truncate's length an integer (a negative one
       // is 0) -- the same checks as fchmod / fchown / ftruncate.
       async chmod(mode) {
-        const fh = this, h = this[kNative];
+        const h = this[kNative];
         await natives.fsFchmod(h, parseFileMode(mode, "mode"));
       }
       // POSIX-only in effect. libuv implements uv_fs_fchown on Windows as
@@ -14197,24 +14175,24 @@
       // there, it just does not change an owner Windows does not model
       // this way. Left unguarded so the resolve/reject shape matches.
       async chown(uid, gid) {
-        const fh = this, h = this[kNative];
+        const h = this[kNative];
         await natives.fsFchown(h, ...ownerArgs(uid, gid));
       }
       async truncate(len = 0) {
-        const fh = this, h = this[kNative];
+        const h = this[kNative];
         validateInteger(len, "len");
         await natives.fsFtruncate(h, Math.max(0, len));
       }
       async sync() {
-        const fh = this, h = this[kNative];
+        const h = this[kNative];
         await natives.fsFsync(h);
       }
       async datasync() {
-        const fh = this, h = this[kNative];
+        const h = this[kNative];
         await natives.fsFdatasync(h);
       }
       async utimes(atime, mtime) {
-        const fh = this, h = this[kNative];
+        const h = this[kNative];
         await natives.fsFutimes(h, toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
       }
       // The object-returning half of the vectored pair. node:fs's readv
@@ -14223,7 +14201,7 @@
       // gather/scatter as fs.readv/fs.writev (module-scope helpers), so a
       // fix to one lands on both.
       async readv(buffers, position) {
-        const fh = this, h = this[kNative];
+        const h = this[kNative];
         var total = asViewArray(buffers);
         // Before the descriptor, deliberately: node raises this even on a
         // closed handle -- but the fsCall guard above runs first there
@@ -14239,7 +14217,7 @@
         return { __proto__: null, bytesRead: n, buffers: buffers };
       }
       async writev(buffers, position) {
-        const fh = this, h = this[kNative];
+        const h = this[kNative];
         var total = asViewArray(buffers);
         // node reports 0 without touching the descriptor.
         if (emptyList(buffers)) return { __proto__: null, bytesWritten: 0, buffers: buffers };
@@ -14275,7 +14253,7 @@
       // it: the same plain-Uint8Array chunks, at the same boundaries, off
       // the same read path.
       readableWebStream(options = undefined) {
-        const fh = this, h = this[kNative];
+        const fh = this;
         if (fh[kFd] === -1) throw codes.ERR_INVALID_STATE("The FileHandle is closed");
         if (fh[kClosePromise]) throw codes.ERR_INVALID_STATE("The FileHandle is closing");
         if (fh[kLocked]) throw codes.ERR_INVALID_STATE("The FileHandle is locked");
@@ -14376,12 +14354,12 @@
       // EBADF the moment the stream is done. autoClose:false opts out and
       // leaves the descriptor to the caller.
       createReadStream(options = undefined) {
-        const fh = this, h = this[kNative];
+        const fh = this;
         guardStreamFd(fh);
         return new (rwStreams(natives).ReadStream)(undefined, { ...readOptions(options), fd: fh });
       }
       createWriteStream(options = undefined) {
-        const fh = this, h = this[kNative];
+        const fh = this;
         guardStreamFd(fh);
         return new (rwStreams(natives).WriteStream)(undefined, { ...readOptions(options), fd: fh });
       }
@@ -14392,7 +14370,7 @@
       // handle. Splitting on /\r?\n/ and dropping the empty tail after a
       // final newline is the Interface's job, already matching node.
       readLines(options = undefined) {
-        const fh = this, h = this[kNative];
+        const fh = this;
         guardStreamFd(fh);
         return registry.get("readline").createInterface({
           input: fh.createReadStream(options),
@@ -21090,6 +21068,10 @@
 
       async importKey(format, keyData, algorithm, extractable, keyUsages) {
         var algoObj = typeof algorithm === "string" ? { name: algorithm } : algorithm;
+        // Never read, but not dead: for an algorithm without a name this
+        // throws, the only refusal importKey has for one (node rejects it
+        // with ERR_MISSING_OPTION; oam's message differs). Remove it only
+        // with a real algorithm check in its place.
         var algoName = algoObj.name.toUpperCase();
         var id = _keyIdCounter++;
         var keyType;
@@ -21811,12 +21793,6 @@
       return asn1Seq([pkcs8Version, RSA_OID_BYTES, octetStr]);
     }
 
-    function rsaJwkToPkcs1(jwk) {
-      var n = new Uint8Array(base64urlDecode(jwk.n));
-      var e = new Uint8Array(base64urlDecode(jwk.e));
-      return asn1Seq([asn1Int(n), asn1Int(e)]);
-    }
-
     function publicEncrypt(keyOrOpts, buffer) {
       var key, padding = 4, oaepHash = "sha1";
       if (typeof keyOrOpts === "string") {
@@ -22115,37 +22091,6 @@
       randomInt,
       timingSafeEqual,
       getHashes: () => ["md5", "sha1", "sha224", "sha256", "sha384", "sha512"],
-      getCurves: () => ["prime256v1", "secp256k1", "secp384r1", "secp521r1", "ed25519", "ed448", "x25519", "x448"],
-      generateKeySync: (type, options) => {
-        if (type === "aes") {
-          var len = (options && options.length) || 256;
-          return createSecretKey(natives.cryptoRandomFill(len / 8));
-        }
-        if (type === "hmac") {
-          var hLen = (options && options.length) || 256;
-          return createSecretKey(natives.cryptoRandomFill(hLen / 8));
-        }
-        throw new Error("generateKeySync: unsupported type " + type);
-      },
-      generateKey: (type, options, callback) => {
-        try {
-          var result;
-          if (type === "aes") {
-            var len = (options && options.length) || 256;
-            result = createSecretKey(natives.cryptoRandomFill(len / 8));
-          } else if (type === "hmac") {
-            var hLen = (options && options.length) || 256;
-            result = createSecretKey(natives.cryptoRandomFill(hLen / 8));
-          } else {
-            throw new Error("generateKey: unsupported type " + type);
-          }
-          if (callback) queueMicrotask(() => callback(null, result));
-          else return result;
-        } catch (err) {
-          if (callback) queueMicrotask(() => callback(err));
-          else throw err;
-        }
-      },
       getCurves: () => ["prime256v1", "secp256k1", "secp384r1", "secp521r1", "ed25519", "ed448", "x25519", "x448"],
       generateKeySync: (type, options) => {
         if (type === "aes") {
@@ -31289,7 +31234,6 @@
       }
       const len = buf.length;
       let i = 0;
-      let mark = -1; // start of a span (url, reason, field, value) in buf
       const fail = (err) => {
         p.state = S_ERROR;
         p.error = err;
@@ -31350,7 +31294,6 @@
             }
             p.state = S_URL;
             p.urlPart = 0;
-            mark = i;
             continue;
           }
           case S_URL: {
@@ -31484,7 +31427,6 @@
           case S_STATUS_END: {
             if (c === 0x20) {
               p.state = S_REASON;
-              mark = i + 1;
               i++;
               continue;
             }
@@ -36314,9 +36256,9 @@
   // ops as plain HTTP. Client request/get delegate to fetch (which
   // supports HTTPS natively via reqwest+rustls).
   registry.factories.https = (natives) => {
-    const http = registry.get("http");
+    // Loaded first: the http factory is what sets registry._httpAgents.
+    registry.get("http");
     const agents = registry._httpAgents;
-    const EventEmitter = registry.get("events");
     // tls's minVersion / maxVersion / secureProtocol resolver (#144): the same
     // validation Node runs when it builds a SecureContext for a server or a
     // request, so the same calls throw synchronously here.

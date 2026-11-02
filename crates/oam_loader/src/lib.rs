@@ -264,6 +264,12 @@ pub fn transpile_fingerprint_with(resolver: &Resolver, path: &Path) -> String {
 /// Thin shim over `transpile_typescript_with` on the current thread's
 /// default `Resolver`; long-lived consumers should own a `Resolver` so
 /// `clear_caches()` reaches the tsconfig state the JSX settings come from.
+///
+/// Test-only: the runtime takes the source map too
+/// (`transpile_typescript_mapped`) or the REPL metadata
+/// (`transpile_typescript_rich`), which run the same transform. The other
+/// docs in this crate use the name for that shared transform.
+#[cfg(test)]
 pub fn transpile_typescript(path: &Path, source: &str) -> Result<String, TranspileError> {
     transpile_typescript_with(default_resolver(), path, source)
 }

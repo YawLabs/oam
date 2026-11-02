@@ -90,9 +90,6 @@ impl From<bool> for RedirectBody {
     }
 }
 
-/// [`STREAMED_BODY`] by the name fetch-body-headers' tests use for it.
-pub const UNREPLAYABLE_BODY: &str = STREAMED_BODY;
-
 /// What to do with a response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Next {

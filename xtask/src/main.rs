@@ -1,6 +1,6 @@
 //! Repo automation. Invoked as `cargo run -p xtask -- <command>`.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod bench;
@@ -70,12 +70,6 @@ enum Command {
         #[arg(long, alias = "bless")]
         regen: bool,
     },
-    /// Open a PR bumping the pinned rusty_v8/V8 version (4-week cadence; never >2 majors behind).
-    V8Bump,
-    /// Rebuild the startup snapshot blobs.
-    Snapshot,
-    /// Package release artifacts (signing + SLSA provenance later).
-    Package,
 }
 
 fn main() -> Result<()> {
@@ -89,8 +83,5 @@ fn main() -> Result<()> {
         Command::Conformance { release } => conformance::run(release),
         Command::NodeSuite { release } => node_suite::run(release),
         Command::UnsafeBudget { regen } => unsafe_budget::run(regen),
-        Command::V8Bump => bail!("not implemented: lands with CI (task: M0/CI)"),
-        Command::Snapshot => bail!("not implemented: lands with M1 snapshot pipeline"),
-        Command::Package => bail!("not implemented: lands with first public release"),
     }
 }

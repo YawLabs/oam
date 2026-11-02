@@ -94,13 +94,14 @@ impl Dispatched {
         Dispatched(Arc::new(watch::Sender::new(Checkouts::default())))
     }
 
-    /// A connection has the request: one more checkout.
+    /// [`fire_on`](Dispatched::fire_on) with no connection id. Test-only.
+    #[cfg(test)]
     pub fn fire(&self) {
         self.fire_on(None);
     }
 
-    /// [`fire`](Dispatched::fire), naming the connection that has the
-    /// request when the connector gave it an id.
+    /// A connection has the request: one more checkout, naming the
+    /// connection that has it when the connector gave it an id.
     pub(crate) fn fire_on(&self, connection: Option<u64>) {
         self.0.send_modify(|state| {
             state.count += 1;
@@ -110,7 +111,7 @@ impl Dispatched {
     }
 
     /// The connection handed the request back unsent, and the pool is
-    /// dialling another: until that one's [`fire`](Dispatched::fire), no
+    /// dialling another: until that one's [`fire_on`](Dispatched::fire_on), no
     /// connection has it. The checkout count stays -- node's request on a
     /// stale keep-alive socket has already finished.
     pub(crate) fn unsent(&self) {

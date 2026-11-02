@@ -19,7 +19,7 @@ use common::*;
 use hyper_util::client::proxy::matcher::Matcher;
 use oam_core::http_client::body::{self, FetchBodies};
 use oam_core::http_client::decode::OUT_CAP;
-use oam_core::http_client::redirect::{BAD_SCHEME, CREDENTIALS, UNREPLAYABLE_BODY};
+use oam_core::http_client::redirect::{BAD_SCHEME, CREDENTIALS, STREAMED_BODY};
 use oam_core::http_client::send::{self, FetchContinuations, FetchRequest};
 use oam_core::http_client::{HttpTransport, NetCheck, NetTarget, ProxySource};
 use oam_core::{AccessDenial, BodyCancelSignal, CancelledBodies, OpOutcome, OutboundBodies};
@@ -1455,7 +1455,7 @@ async fn streamed_body_redirects() {
                 }
                 None => assert_eq!(
                     failed(outcome),
-                    UNREPLAYABLE_BODY,
+                    STREAMED_BODY,
                     "{status} fetch={fetch_semantics}"
                 ),
             }
