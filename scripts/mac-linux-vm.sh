@@ -260,11 +260,19 @@ lock_classify() {
     return 0
   fi
   if [ ! -d "$LOCK_DIR" ]; then LOCK_CLASS=gone; LOCK_OWNER="<released while it was read>"; return 0; fi
-  # macOS stat: -f %m is the modification time in epoch seconds.
+  # The dir's mtime in epoch seconds: macOS stat (-f %m) first, then GNU stat
+  # (-c %Y), for a Mac with coreutils' stat first on PATH -- where `-f %m`
+  # means file-system status of a file named %m, fails, and may still print
+  # text, so each answer counts only when it is a number.
   mt="$(stat -f %m "$LOCK_DIR" 2>/dev/null || true)"
+  [[ "$mt" =~ ^[0-9]+$ ]] || mt="$(stat -c %Y "$LOCK_DIR" 2>/dev/null || true)"
   if ! [[ "$mt" =~ ^[0-9]+$ ]]; then
     if [ ! -d "$LOCK_DIR" ]; then LOCK_CLASS=gone; LOCK_OWNER="<released while it was read>"; return 0; fi
-    LOCK_CLASS=busy; LOCK_OWNER="<no owner file, and its age could not be read>"; return 0
+    # Unknown age is never taken over and never retried: BUSY, and a human
+    # looks at it.
+    LOCK_CLASS=busy
+    LOCK_OWNER="<no owner file, and its age could not be read (neither 'stat -f %m' nor 'stat -c %Y' gave a number) -- if no run is mid-acquire: rm -rf ~/.lima-build.lock>"
+    return 0
   fi
   age=$(( $(date +%s) - mt ))
   if [ "$age" -gt 60 ]; then

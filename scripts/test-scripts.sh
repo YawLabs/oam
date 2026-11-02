@@ -1049,10 +1049,16 @@ printf '{"platforms":{"linux":{"counts":{"present":1,"nodeExportNames":1},"gener
 # The Mac build lock's verbs run the REAL driver, piped in on stdin as on
 # the Mac, against a fake Mac: its home ($ML/mac/home, where the lock lives),
 # a limactl that answers `list` from $ML/mac/lima ("<name> <status>" lines),
-# and a stat that answers macOS's `stat -f %m` with this box's own stat.
+# a stat that answers both macOS's `stat -f %m` and GNU's `stat -c %Y` from
+# this box's own stat, whichever kind it is ($MLM/stat-mode "gnu" makes it
+# a GNU stat first on a Mac's PATH, "none" a stat that answers neither), and
+# a mkdir that, with $MLM/mkdir-race, plants another run's lock just before
+# its second attempt at the lock dir.
 MLM="$ML/mac"
 mkdir -p "$MLM/bin" "$MLM/home"
 ML_REAL_STAT="$(command -v stat)"
+ML_REAL_MKDIR="$(command -v mkdir)"
+if "$ML_REAL_STAT" -c %Y . >/dev/null 2>&1; then ML_MTIME_FMT="-c %Y"; else ML_MTIME_FMT="-f %m"; fi
 cat > "$MLM/bin/limactl" <<EOF
 #!/bin/bash
 case "\$1" in
@@ -1071,10 +1077,30 @@ cat "$MLM/lima"
 EOF
 cat > "$MLM/bin/stat" <<EOF
 #!/bin/bash
-[ "\$1" = "-f" ] && [ "\$2" = "%m" ] || { echo "fake stat: unexpected: \$*" >&2; exit 97; }
-exec "$ML_REAL_STAT" -c %Y "\$3"
+mode="\$(cat "$MLM/stat-mode" 2>/dev/null || echo bsd)"
+case "\$1 \$2" in
+  "-f %m")
+    # GNU stat reads -f as --file-system: it prints that, then fails on %m.
+    [ "\$mode" = "bsd" ] || { echo "  File: \"\$3\" ID: 0 Namelen: 255 Type: ext2/ext3"; echo "stat: cannot read file system information for '%m'" >&2; exit 1; } ;;
+  "-c %Y") [ "\$mode" != "none" ] || { echo "stat: illegal option -- c" >&2; exit 1; } ;;
+  *) echo "fake stat: unexpected: \$*" >&2; exit 97 ;;
+esac
+# shellcheck disable=SC2086
+exec "$ML_REAL_STAT" $ML_MTIME_FMT "\$3"
 EOF
-chmod +x "$MLM/bin/limactl" "$MLM/bin/stat"
+cat > "$MLM/bin/mkdir" <<EOF
+#!/bin/bash
+if [ -f "$MLM/mkdir-race" ] && [ "\$1" = "$MLM/home/.lima-build.lock" ]; then
+  echo x >> "$MLM/mkdir-attempts"
+  if [ "\$(wc -l < "$MLM/mkdir-attempts" | tr -d ' ')" = "2" ]; then
+    "$ML_REAL_MKDIR" -p "\$1"
+    printf 'repo=yaw\ninstance=yaw-linux\nrun=y-race\nhost=other-box\npid=4343\nstarted=2026-11-01T00:00:00Z\n' > "\$1/owner"
+    printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
+  fi
+fi
+exec "$ML_REAL_MKDIR" "\$@"
+EOF
+chmod +x "$MLM/bin/limactl" "$MLM/bin/stat" "$MLM/bin/mkdir"
 cat > "$ML/bin/ssh" <<EOF
 #!/bin/bash
 cmd="\${!#}"
@@ -1082,7 +1108,13 @@ echo "\$cmd" >> "$ML/calls"
 # shellcheck disable=SC2086
 set -- \$cmd
 if [ "\$1" = "bash" ] && { [ "\$4" = "lock" ] || [ "\$4" = "unlock" ]; }; then
-  shift 3
+  verb="\$4"; shift 3
+  # lock-drop: the Mac runs the verb (and takes the lock), then the
+  # connection dies before its answer arrives.
+  if [ "\$verb" = "lock" ] && [ -f "$ML/lock-drop" ]; then
+    HOME="$MLM/home" PATH="$MLM/bin:\$PATH" bash -s -- "\$@" >/dev/null 2>&1
+    echo "Connection to build-mac closed by remote host." >&2; exit 255
+  fi
   HOME="$MLM/home" PATH="$MLM/bin:\$PATH" exec bash -s -- "\$@"
 fi
 cat >/dev/null
@@ -1103,6 +1135,7 @@ case "\$1" in
         else echo "lock=ownerless"; fi
         exit 0 ;;
       stop)
+        [ -f "$ML/stop-fails" ] && { echo "[mac] limactl stop failed" >&2; exit 1; }
         awk -v n="\$5" '\$1 == n { \$2 = "Stopped" } { print }' "$MLM/lima" > "$MLM/lima.new" && mv -f "$MLM/lima.new" "$MLM/lima"
         echo "[mac] stop" >&2; exit 0 ;;
       provision|start|container|sync) echo "[mac] \$4" >&2; exit 0 ;;
@@ -1149,7 +1182,8 @@ ml(){
 }
 ml_calls_of(){ grep -c -- "$1" <<<"$ML_CALLS"; }
 ml_reset(){
-  rm -f "$ML"/fail-* "$ML"/drop-* "$ML"/drops-* "$ML/sum-override" "$ML/status-others-none" "$MLM/list-fail"
+  rm -f "$ML"/fail-* "$ML"/drop-* "$ML"/drops-* "$ML/sum-override" "$ML/status-others-none" "$MLM/list-fail" \
+        "$ML/lock-drop" "$ML/stop-fails" "$MLM/stat-mode" "$MLM/mkdir-race" "$MLM/mkdir-attempts"
   rm -rf "$MLM/home/.lima-build.lock"
   printf '%s\n' "$ML_ST_STOPPED" > "$ML/status"; printf '%s\n' "$ML_GLIBC_OK" > "$ML/glibc"
   echo "oam-linux Stopped" > "$MLM/lima"
@@ -1408,6 +1442,19 @@ lk_plant(){
   printf 'repo=%s\ninstance=%s\nrun=%s\nhost=other-box\npid=4242\nstarted=2026-11-01T00:00:00Z\n' "$1" "$2" "$3" > "$LK/owner"
 }
 ML_HOST="$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-')"; [ -n "$ML_HOST" ] || ML_HOST=unknown
+# lk_age <seconds>  -- backdate the lock dir's mtime, portably: touch -t takes
+# a local [[CC]YY]MMDDhhmm[.SS] on GNU and BSD alike; GNU date reads -d @N,
+# BSD date -r N.
+lk_age(){
+  local t=$(( $(date +%s) - $1 )) stamp
+  stamp="$(date -d "@$t" +%Y%m%d%H%M.%S 2>/dev/null || date -r "$t" +%Y%m%d%H%M.%S)"
+  touch -t "$stamp" "$LK"
+}
+# lk_owner_set <key> <value>  -- rewrite one owner key (no sed -i: BSD sed
+# wants a suffix argument GNU sed does not).
+lk_owner_set(){
+  sed "s/^$1=.*/$1=$2/" "$LK/owner" > "$LK/owner.edit" && mv -f "$LK/owner.edit" "$LK/owner"
+}
 
 ml_reset
 lk lock r1 oam oam-linux box-1 77
@@ -1455,12 +1502,39 @@ ml_reset
 mkdir -p "$LK"
 lk lock r1 oam oam-linux box-1 77
 LK_YOUNG="$LK_RC|$(grep -c 'mid-acquire' <<<"$LK_ERR")|$([ -e "$LK/owner" ] && echo owner)"
-touch -d "@$(( $(date +%s) - 120 ))" "$LK"
+lk_age 120
 lk lock r1 oam oam-linux box-1 77
 LK_OLD="$LK_RC|$(grep -c 'STALE' <<<"$LK_ERR")|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)"
 it "lock: an ownerless lock dir is BUSY under 60 s (someone mid-acquire), STALE and taken over past it"
 if [ "$LK_YOUNG" = "3|1|" ] && [ "$LK_OLD" = "0|1|1" ]; then pass
 else fail "young: $LK_YOUNG old: $LK_OLD err: $LK_ERR"; fi
+
+ml_reset
+mkdir -p "$LK"; lk_age 120
+echo gnu > "$MLM/stat-mode"
+lk lock r1 oam oam-linux box-1 77
+LK_GNU="$LK_RC|$(grep -c 'STALE' <<<"$LK_ERR")|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)"
+ml_reset
+mkdir -p "$LK"; lk_age 120
+echo none > "$MLM/stat-mode"
+lk lock r1 oam oam-linux box-1 77
+LK_NOSTAT="$LK_RC|$(grep -c "age could not be read" <<<"$LK_ERR")|$([ -d "$LK" ] && echo kept)|$([ -e "$LK/owner" ] && echo owner)"
+it "lock: an ownerless dir's age falls back to GNU stat -c %Y when stat -f %m is not BSD's; with neither, BUSY, untouched"
+if [ "$LK_GNU" = "0|1|1" ] && [ "$LK_NOSTAT" = "3|1|kept|" ]; then pass
+else fail "gnu: $LK_GNU none: $LK_NOSTAT err: $LK_ERR"; fi
+
+# Another run wins the lock between the stale takeover and the retry: the
+# fake mkdir plants its owner (with its VM Running) just before attempt two.
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+: > "$MLM/mkdir-race"
+lk lock r1 oam oam-linux box-1 77
+LK_RACE_N="$(wc -l < "$MLM/mkdir-attempts" 2>/dev/null | tr -d ' ')"
+it "lock: losing the one retried mkdir is BUSY after exactly one retry, naming the winner; the winner's lock untouched"
+if [ "$LK_RC" = "3" ] && [ "$LK_RACE_N" = "2" ] && grep -qF 'taken while this run retried' <<<"$LK_ERR" \
+   && grep -qF 'run=y-race' <<<"$LK_ERR" && grep -qxF 'run=y-race' "$LK/owner"; then pass
+else fail "rc=$LK_RC attempts=$LK_RACE_N err: $LK_ERR"; fi
 
 ml_reset
 printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
@@ -1538,37 +1612,63 @@ if [ "$ML_RC" != "0" ] && [ "$(ml_calls_of ' lock ')" = "1" ] && [ "$(ml_calls_o
    && [ "$(ml_calls_of ' stop ')" = "0" ] && [ ! -e "$LK" ] && grep -qF 'another Lima instance is Running on this Mac (yaw-linux)' <<<"$ML_ERR"; then pass
 else fail "rc=$ML_RC calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
 
-# The same repo and instance, but a run that is not over: on another box, or
-# here with its process alive. Preflight must not stop a VM a live run owns.
+# The same repo and instance, its VM Running: whether that run is over is not
+# judged from here (no pid checks across boxes, WSL, Git Bash or users), so
+# preflight and release are BUSY -- nothing stopped, nothing unlocked -- and
+# print the owner and the two commands that clear a dead run's lock.
 ml_reset
 echo "oam-linux Running" > "$MLM/lima"
 printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
 lk_plant oam oam-linux o-run-elsewhere
 ml -- --preflight-only
-ML_PF_ELSE="$ML_RC|$(ml_calls_of ' stop ')"
-sed -i "s/^host=.*/host=$ML_HOST/; s/^pid=.*/pid=$$/" "$LK/owner"
+ML_PF_ELSE="$ML_RC|$(ml_calls_of ' stop ')|$(ml_calls_of ' unlock ')"
+lk_owner_set host "$ML_HOST"
+lk_owner_set pid "$(bash -c 'echo $$')"
 ml -- --preflight-only
-ML_PF_ALIVE="$ML_RC|$(ml_calls_of ' stop ')"
-it "leg: preflight with the lock held by a live run (another box, or a live pid here) and its VM Running is BUSY, stops nothing"
-if [ "$ML_PF_ELSE" = "1|0" ] && [ "$ML_PF_ALIVE" = "1|0" ] && grep -qF 'BUSY' <<<"$ML_ERR" \
+ML_PF_HERE="$ML_RC|$(ml_calls_of ' stop ')|$(ml_calls_of ' unlock ')"
+ML_PF_HERE_ERR="$ML_ERR"
+ml -- --mode=release
+ML_REL_HERE="$ML_RC|$(ml_calls_of ' stop ')|$(ml_calls_of ' start ')|$(ml_calls_of ' unlock ')"
+it "leg: this repo's lock with its VM Running (another box, or this box with an exited pid) is BUSY with the clear-it commands; nothing stopped"
+if [ "$ML_PF_ELSE" = "1|0|0" ] && [ "$ML_PF_HERE" = "1|0|0" ] && [ "$ML_REL_HERE" = "1|0|0|0" ] \
+   && grep -qF 'BUSY' <<<"$ML_PF_HERE_ERR" && grep -qF 'run=o-run-elsewhere' <<<"$ML_PF_HERE_ERR" \
+   && grep -qF 'ssh builder@build-mac.example.invalid /opt/homebrew/bin/limactl stop oam-linux' <<<"$ML_PF_HERE_ERR" \
+   && grep -qF "ssh builder@build-mac.example.invalid 'rm -rf ~/.lima-build.lock'" <<<"$ML_PF_HERE_ERR" \
    && grep -qxF 'oam-linux Running' "$MLM/lima" && grep -qxF 'run=o-run-elsewhere' "$LK/owner"; then pass
-else fail "elsewhere: $ML_PF_ELSE alive: $ML_PF_ALIVE stderr: $ML_ERR"; fi
+else fail "elsewhere: $ML_PF_ELSE here: $ML_PF_HERE release: $ML_REL_HERE stderr: $ML_PF_HERE_ERR"; fi
 
-# An OAM_KEEP_VM=1 run's leftover: this repo, this instance, this box, its
-# process gone. Preflight stops that VM (what it is for), which makes the
-# lock stale, and takes it over.
+# The EXIT trap stops the VM first and unlocks only once it is stopped: a
+# stop that fails leaves the lock held (BUSY for others until the VM stops).
 ml_reset
-echo "oam-linux Running" > "$MLM/lima"
-printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
-lk_plant oam oam-linux o-run-kept
-ML_DEAD_PID="$(bash -c 'echo $$')"
-sed -i "s/^host=.*/host=$ML_HOST/; s/^pid=.*/pid=$ML_DEAD_PID/" "$LK/owner"
+: > "$ML/stop-fails"
+ml -- --mode=release
+ML_KEPT_RUN="$(grep -oE '^bash -s -- lock [^ ]+' <<<"$ML_CALLS" | awk '{print $5}')"
+it "leg: when the exit trap's VM stop fails, the lock is KEPT -- no unlock, the owner is this run, the release command printed"
+if [ "$(ml_calls_of ' stop oam-linux')" = "1" ] && [ "$(ml_calls_of ' unlock ')" = "0" ] && [ -n "$ML_KEPT_RUN" ] \
+   && grep -qxF "run=$ML_KEPT_RUN" "$LK/owner" 2>/dev/null && grep -qF 'leaving the Mac build lock' <<<"$ML_ERR" \
+   && grep -qF "rm -rf ~/.lima-build.lock" <<<"$ML_ERR"; then pass
+else fail "rc=$ML_RC kept-run='$ML_KEPT_RUN' calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+# The Mac takes the lock, then ssh drops (255) before its answer arrives:
+# the run fails, but its EXIT trap still releases the lock it owns.
+ml_reset
+: > "$ML/lock-drop"
+ml -- --mode=release
+it "leg: an ssh drop (255) right after the Mac took the lock fails the run and the EXIT trap still unlocks; nothing started"
+if [ "$ML_RC" != "0" ] && [ "$(ml_calls_of ' lock ')" = "1" ] && [ "$(ml_calls_of ' unlock ')" = "1" ] \
+   && [ "$(ml_calls_of ' start ')" = "0" ] && [ ! -e "$LK" ] && grep -qF 'exit 255' <<<"$ML_ERR" \
+   && [[ "$(tail -1 <<<"$ML_CALLS")" == "bash -s -- unlock "* ]]; then pass
+else fail "rc=$ML_RC lock-left=$([ -e "$LK" ] && cat "$LK/owner") calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+# A lock verb refused as BUSY does not unlock: the lock is another run's.
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
+: > "$ML/status-others-none"
 ml -- --preflight-only
-ML_STOP_LINE="$(grep -nF ' stop oam-linux' <<<"$ML_CALLS" | head -1 | cut -d: -f1)"
-ML_LK_LINE="$(grep -nE '^bash -s -- lock ' <<<"$ML_CALLS" | cut -d: -f1)"
-it "leg: this repo's own lock left by an exited OAM_KEEP_VM=1 run here -- its VM is stopped, the lock taken over and released"
-if [ "$ML_RC" = "0" ] && [ -n "$ML_STOP_LINE" ] && [ -n "$ML_LK_LINE" ] && [ "$ML_STOP_LINE" -lt "$ML_LK_LINE" ] \
-   && [ ! -e "$LK" ] && grep -qF 'STALE' <<<"$ML_ERR" && grep -qF 'run=o-run-kept' <<<"$ML_ERR"; then pass
+it "leg: a BUSY lock verb leaves the other run's lock alone -- no unlock call; the owner's instance named in the stop command"
+if [ "$ML_RC" = "1" ] && [ "$(ml_calls_of ' unlock ')" = "0" ] && grep -qxF 'run=y-run-9' "$LK/owner" \
+   && grep -qF '/opt/homebrew/bin/limactl stop yaw-linux' <<<"$ML_ERR"; then pass
 else fail "rc=$ML_RC calls: $ML_CALLS stderr: $ML_ERR"; fi
 ml_reset
 

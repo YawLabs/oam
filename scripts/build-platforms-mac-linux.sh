@@ -253,11 +253,15 @@ on_exit(){
   fi
   [ "$LOCK_HELD" = "1" ] || return 0
   if [ "$stopped" = "1" ]; then
-    if mac_unlock >&2 2>&1; then
-      ok "released the Mac build lock (run $LOCK_RUN)"
-    else
-      warn "could not release the Mac build lock (run $LOCK_RUN; see above) -- if it is still this run's: $LOCK_PATH_HINT"
-    fi
+    local urc=0
+    mac_unlock >&2 2>&1 || urc=$?
+    case "$urc" in
+      0) ok "released the Mac build lock (run $LOCK_RUN), or found none of this run's to release" ;;
+      # The lock is another run's: this run never took it (the lock verb
+      # failed before its mkdir won), so it is left alone.
+      3) ok "the Mac build lock is not this run's (run $LOCK_RUN never took it) -- left alone" ;;
+      *) warn "could not release the Mac build lock (run $LOCK_RUN; unlock exit $urc, see above) -- if it is still this run's: $LOCK_PATH_HINT" ;;
+    esac
   else
     warn "leaving the Mac build lock (run $LOCK_RUN) held with $INSTANCE running: other runs see BUSY until it stops, then it is stale. To release it now: $LOCK_PATH_HINT"
   fi
@@ -324,27 +328,35 @@ case "$OTHERS" in
     [ "$LOCK_STATE" = "held" ] && LOCK_NOTE=" The Mac build lock is held by: $(lock_owner_line)."
     fail "BUSY: another Lima instance is Running on $HP ($OTHERS) -- the Mac's memory is in use by another build, so this run starts, stops and provisions nothing.$LOCK_NOTE" ;;
 esac
-# This repo's own lock, left by an OAM_KEEP_VM=1 run on this box whose process
-# has exited, with its VM still Running: stopping that VM is what both a
-# preflight and a build would do anyway, and it makes the lock stale for the
-# lock verb to take over. Any other owner -- another repo, another box, a pid
-# still alive here -- is left alone, and the lock verb answers BUSY for it.
-if [ "$LOCK_STATE" = "held" ] && [ "$VM_STATUS" = "Running" ] && [ "$KEEP_VM" != "1" ]; then
-  L_PID="$(kv_field "$STATUS_OUT" lock.pid || true)"
-  if [ "$(kv_field "$STATUS_OUT" lock.repo || true)" = "oam" ] \
-     && [ "$(kv_field "$STATUS_OUT" lock.instance || true)" = "$INSTANCE" ] \
-     && [ "$(kv_field "$STATUS_OUT" lock.host || true)" = "$LOCK_HOST" ] \
-     && [[ "$L_PID" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$L_PID" 2>/dev/null; then
-    warn "the Mac build lock was left with $INSTANCE Running by an earlier run on this box (pid $L_PID has exited; OAM_KEEP_VM=1 leaves both) -- stopping $INSTANCE so the lock goes stale: $(lock_owner_line)"
-    mac_vm stop >&2 || fail "$INSTANCE is Running on $HP and would not stop -- the mac legs need that memory. On the Mac: limactl stop $INSTANCE"
-    VM_STATUS="Stopped"
-  fi
-fi
+# No self-heal before the lock: nothing here starts or stops a VM until this
+# run holds it, and a pid recorded by another run cannot be judged from this
+# box (WSL, Git Bash and other users each see their own pid namespace). A
+# lock this repo left with OAM_KEEP_VM=1 is cleared by a human, with the two
+# commands the BUSY message prints.
+#
+# LOCK_HELD is set BEFORE the lock verb runs: if the Mac takes the lock and
+# the ssh connection then dies (255, or 130 on Ctrl-C), the EXIT trap still
+# unlocks -- unlock removes only a lock whose owner is this run's id, so it
+# is harmless when the Mac never took it. Only BUSY (3) clears it: the lock
+# is another run's.
+LOCK_HELD=1
 LOCK_RC=0
-mac_lock >&2 || LOCK_RC=$?
+LOCK_ERR="$(mac_lock 2>&1 >&2)" || LOCK_RC=$?
+[ -z "$LOCK_ERR" ] || printf '%s\n' "$LOCK_ERR" >&2
 case "$LOCK_RC" in
-  0) LOCK_HELD=1 ;;
-  3) fail "BUSY: the build Mac is in use by another run (the Mac's answer is above) -- this run starts, stops and provisions nothing. A lock this repo left with OAM_KEEP_VM=1 goes stale once its VM stops (ssh $HP /opt/homebrew/bin/limactl stop $INSTANCE), or release it: $LOCK_PATH_HINT" ;;
+  0) ;;
+  3)
+    LOCK_HELD=0
+    # The instance to stop: the owner's, as the Mac's answer names it, else
+    # the one the status saw; the neighbour's when that is what refused.
+    BUSY_INST=""
+    [[ "$LOCK_ERR" =~ instance=([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?) ]] && BUSY_INST="${BASH_REMATCH[1]}"
+    if [ -z "$BUSY_INST" ] && [[ "$LOCK_ERR" =~ Running\ on\ this\ Mac\ \(([A-Za-z0-9-]+) ]]; then BUSY_INST="${BASH_REMATCH[1]}"; fi
+    [ -n "$BUSY_INST" ] || BUSY_INST="$(kv_field "$STATUS_OUT" lock.instance || true)"
+    lima_name_valid "${BUSY_INST:-x-}" || BUSY_INST="<the owner's instance>"
+    BUSY_OWNER="$(lock_owner_line)"
+    [ -n "$BUSY_OWNER" ] || BUSY_OWNER="see the Mac's answer above"
+    fail "BUSY: the build Mac is in use by another run -- this run starts, stops and provisions nothing.\n  Owner: $BUSY_OWNER\n  If that run is over (for example a lock this repo left with OAM_KEEP_VM=1), clear it by hand:\n    ssh $HP /opt/homebrew/bin/limactl stop $BUSY_INST\n    $LOCK_PATH_HINT" ;;
   *) fail "could not take the Mac build lock on $HP (exit $LOCK_RC; the driver's message is above)" ;;
 esac
 ok "Mac build lock taken (run $LOCK_RUN)"
