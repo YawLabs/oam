@@ -1046,19 +1046,66 @@ mkdir -p "$ML/bin" "$ML/tmp" "$ML/files"
 printf 'fake linux binary\n' > "$ML/files/oam-x86_64-unknown-linux-gnu"
 for f in scorecard.json node-suite-scorecard.json CONFORMANCE.md CONFORMANCE-NODE.md; do printf '{"f":"%s"}\n' "$f" > "$ML/files/$f"; done
 printf '{"platforms":{"linux":{"counts":{"present":1,"nodeExportNames":1},"generatedAgainst":"stub"}}}\n' > "$ML/files/surface-gaps.json"
+# The Mac build lock's verbs run the REAL driver, piped in on stdin as on
+# the Mac, against a fake Mac: its home ($ML/mac/home, where the lock lives),
+# a limactl that answers `list` from $ML/mac/lima ("<name> <status>" lines),
+# and a stat that answers macOS's `stat -f %m` with this box's own stat.
+MLM="$ML/mac"
+mkdir -p "$MLM/bin" "$MLM/home"
+ML_REAL_STAT="$(command -v stat)"
+cat > "$MLM/bin/limactl" <<EOF
+#!/bin/bash
+case "\$1" in
+  --version) echo "limactl version 2.2.1"; exit 0 ;;
+  list) ;;
+  *) echo "fake limactl: unexpected: \$*" >&2; exit 97 ;;
+esac
+# list --format <fmt> [<name>]
+if [ -n "\${4:-}" ]; then
+  s="\$(awk -v n="\$4" '\$1 == n { print \$2; exit }' "$MLM/lima")"
+  [ -n "\$s" ] || { echo "fake limactl: no instance \"\$4\"" >&2; exit 1; }
+  echo "\$s"; exit 0
+fi
+[ -f "$MLM/list-fail" ] && { echo "fake limactl: cannot list" >&2; exit 1; }
+cat "$MLM/lima"
+EOF
+cat > "$MLM/bin/stat" <<EOF
+#!/bin/bash
+[ "\$1" = "-f" ] && [ "\$2" = "%m" ] || { echo "fake stat: unexpected: \$*" >&2; exit 97; }
+exec "$ML_REAL_STAT" -c %Y "\$3"
+EOF
+chmod +x "$MLM/bin/limactl" "$MLM/bin/stat"
 cat > "$ML/bin/ssh" <<EOF
 #!/bin/bash
 cmd="\${!#}"
-cat >/dev/null
 echo "\$cmd" >> "$ML/calls"
 # shellcheck disable=SC2086
 set -- \$cmd
+if [ "\$1" = "bash" ] && { [ "\$4" = "lock" ] || [ "\$4" = "unlock" ]; }; then
+  shift 3
+  HOME="$MLM/home" PATH="$MLM/bin:\$PATH" exec bash -s -- "\$@"
+fi
+cat >/dev/null
 case "\$1" in
   true|mkdir) exit 0 ;;
   bash)
     case "\$4" in
-      status) cat "$ML/status"; exit 0 ;;
-      provision|start|stop|container|sync) echo "[mac] \$4" >&2; exit 0 ;;
+      status)
+        # The fixture's lines, then what the driver's status adds, read off
+        # the fake Mac (status-others-none hides a neighbour from it: a VM
+        # started between the status and the lock).
+        cat "$ML/status"
+        if [ -f "$ML/status-others-none" ]; then echo "others=none"
+        else echo "others=\$(awk -v n="\$5" '\$1 != n && \$2 == "Running" { printf "%s%s", c, \$1; c = "," } END { if (c == "") printf "none" }' "$MLM/lima")"; fi
+        lk="$MLM/home/.lima-build.lock"
+        if [ ! -d "\$lk" ]; then echo "lock=none"
+        elif [ -f "\$lk/owner" ]; then echo "lock=held"; sed 's/^/lock./' "\$lk/owner"
+        else echo "lock=ownerless"; fi
+        exit 0 ;;
+      stop)
+        awk -v n="\$5" '\$1 == n { \$2 = "Stopped" } { print }' "$MLM/lima" > "$MLM/lima.new" && mv -f "$MLM/lima.new" "$MLM/lima"
+        echo "[mac] stop" >&2; exit 0 ;;
+      provision|start|container|sync) echo "[mac] \$4" >&2; exit 0 ;;
       run) echo "[remote] \$6"; [ -f "$ML/fail-\$6" ] && exit 1
            [ -f "$ML/drop-\$6" ] && { rm -f "$ML/drop-\$6"; exit 255; }
            [ -f "$ML/drops-\$6" ] && exit 255
@@ -1101,7 +1148,17 @@ ml(){
   ML_LAST="${ML_OUT##*$'\n'}"
 }
 ml_calls_of(){ grep -c -- "$1" <<<"$ML_CALLS"; }
-ml_reset(){ rm -f "$ML"/fail-* "$ML"/drop-* "$ML"/drops-* "$ML/sum-override"; printf '%s\n' "$ML_ST_STOPPED" > "$ML/status"; printf '%s\n' "$ML_GLIBC_OK" > "$ML/glibc"; }
+ml_reset(){
+  rm -f "$ML"/fail-* "$ML"/drop-* "$ML"/drops-* "$ML/sum-override" "$ML/status-others-none" "$MLM/list-fail"
+  rm -rf "$MLM/home/.lima-build.lock"
+  printf '%s\n' "$ML_ST_STOPPED" > "$ML/status"; printf '%s\n' "$ML_GLIBC_OK" > "$ML/glibc"
+  echo "oam-linux Stopped" > "$MLM/lima"
+}
+# ml_stop_then_unlock <calls>  -- the run ended by stopping the VM and then
+# releasing its lock, in that order, as its last two calls.
+ml_stop_then_unlock(){
+  [ "$(tail -2 <<<"$1" | head -1)" = "bash -s -- stop oam-linux " ] && [[ "$(tail -1 <<<"$1")" == "bash -s -- unlock "* ]]
+}
 ml_reset
 
 ml -- --bogus
@@ -1129,8 +1186,11 @@ done
 if [ -z "$ML_KNOB_BAD" ]; then pass; else fail "$ML_KNOB_BAD"; fi
 
 ml -- --preflight-only
-it "preflight: a stopped VM -- the probe and the status only, stdout silent, the VM left alone"
-if [ "$ML_RC" = "0" ] && [ -z "$ML_OUT" ] && [ "$ML_CALLS" = $'true\nbash -s -- status oam-linux ' ]; then pass
+it "preflight: a stopped VM -- the probe, the status, the lock taken and released; stdout silent, the VM left alone"
+if [ "$ML_RC" = "0" ] && [ -z "$ML_OUT" ] && [ "$(wc -l <<<"$ML_CALLS" | tr -d ' ')" = "4" ] \
+   && [ "$(head -2 <<<"$ML_CALLS")" = $'true\nbash -s -- status oam-linux ' ] \
+   && [[ "$(sed -n 3p <<<"$ML_CALLS")" == "bash -s -- lock "*" oam oam-linux "* ]] \
+   && [[ "$(sed -n 4p <<<"$ML_CALLS")" == "bash -s -- unlock "* ]] && [ ! -e "$MLM/home/.lima-build.lock" ]; then pass
 else fail "rc=$ML_RC out='$ML_OUT' calls: $ML_CALLS stderr: $ML_ERR"; fi
 
 printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
@@ -1185,7 +1245,7 @@ ml_line(){ grep -nF -- "$1" <<<"$ML_REL_CALLS" | head -1 | cut -d: -f1; }
 ML_ORDER="$(ml_line ' start oam-linux') $(ml_line ' container oam-linux') $(ml_line 'scp-to .oam-linux-leg/src.tar.gz') $(ml_line ' sync oam-linux .oam-linux-leg/src.tar.gz') $(ml_line ' run oam-linux prep') $(ml_line ' run oam-linux build') $(ml_line ' glibc oam-linux dist/oam-x86_64-unknown-linux-gnu') $(ml_line ' fetch oam-linux dist/oam-x86_64-unknown-linux-gnu') $(ml_line 'scp-from .oam-linux-leg/out/oam-x86_64-unknown-linux-gnu')"
 ML_SORTED="$(tr ' ' '\n' <<<"$ML_ORDER" | sort -n | tr '\n' ' ')"
 if [ "$(wc -w <<<"$ML_ORDER" | tr -d ' ')" = "9" ] && [ "$ML_ORDER " = "$ML_SORTED" ] \
-   && [ "$(tail -1 <<<"$ML_REL_CALLS")" = "bash -s -- stop oam-linux " ] \
+   && ml_stop_then_unlock "$ML_REL_CALLS" \
    && grep -qF 'newest GLIBC_ symbol: 2.34 (floor 2.34)' <<<"$ML_ERR"; then pass
 else fail "order: $ML_ORDER calls: $ML_REL_CALLS"; fi
 
@@ -1193,7 +1253,7 @@ printf '%s\nGLIBC_2.38\n' "$ML_GLIBC_OK" > "$ML/glibc"
 ml -- --mode=release
 it "release: a binary that needs a newer glibc than the floor fails, ships nothing, and the VM is still stopped"
 if [ "$ML_RC" != "0" ] && [ -z "$ML_OUT" ] && grep -qF 'needs GLIBC_2.38, newer than the 2.34 floor' <<<"$ML_ERR" \
-   && [ "$(ml_calls_of ' fetch ')" = "0" ] && [ "$(tail -1 <<<"$ML_CALLS")" = "bash -s -- stop oam-linux " ]; then pass
+   && [ "$(ml_calls_of ' fetch ')" = "0" ] && ml_stop_then_unlock "$ML_CALLS"; then pass
 else fail "rc=$ML_RC out='$ML_OUT' calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
 
 ml OAM_LINUX_GLIBC_MAX=2.38 -- --mode=release
@@ -1214,7 +1274,7 @@ ml -- --mode=release
 it "release: a failing step ends the run naming its log, is not retried, runs nothing after it, and stops the VM"
 if [ "$ML_RC" != "0" ] && [ -z "$ML_OUT" ] && grep -qE "remote 'test' failed -- see .*/logs/test\.log" <<<"$ML_ERR" \
    && [ "$(ml_calls_of ' run oam-linux test ')" = "1" ] && [ "$(ml_calls_of ' run oam-linux conformance')" = "0" ] \
-   && [ "$(tail -1 <<<"$ML_CALLS")" = "bash -s -- stop oam-linux " ]; then pass
+   && ml_stop_then_unlock "$ML_CALLS"; then pass
 else fail "rc=$ML_RC calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
 ml_reset
 
@@ -1233,7 +1293,7 @@ ml OAM_LINUX_RETRY_DELAY=0 -- --mode=release
 it "release: a second drop fails the step -- one retry, never a loop -- and the VM is still stopped"
 if [ "$ML_RC" != "0" ] && [ -z "$ML_OUT" ] && [ "$(ml_calls_of ' run oam-linux conformance ')" = "2" ] \
    && grep -qF "remote 'conformance' failed" <<<"$ML_ERR" && [ "$(ml_calls_of ' run oam-linux node-suite')" = "0" ] \
-   && [ "$(tail -1 <<<"$ML_CALLS")" = "bash -s -- stop oam-linux " ]; then pass
+   && ml_stop_then_unlock "$ML_CALLS"; then pass
 else fail "rc=$ML_RC calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
 ml_reset
 
@@ -1246,6 +1306,13 @@ ml OAM_KEEP_VM=1 -- --mode=release
 it "release: OAM_KEEP_VM=1 leaves the VM running, and says how to stop it"
 if [ "$ML_RC" = "0" ] && [ "$(ml_calls_of ' stop oam-linux')" = "0" ] && grep -qF '/opt/homebrew/bin/limactl stop oam-linux' <<<"$ML_ERR"; then pass
 else fail "rc=$ML_RC calls: $ML_CALLS"; fi
+ML_KEEP_RUN="$(grep -oE '^bash -s -- lock [^ ]+' <<<"$ML_CALLS" | awk '{ print $5 }')"
+it "release: OAM_KEEP_VM=1 leaves the Mac build lock held by its run too, and prints how to release it"
+if [ "$(ml_calls_of ' unlock ')" = "0" ] && [ -n "$ML_KEEP_RUN" ] \
+   && grep -qxF "run=$ML_KEEP_RUN" "$MLM/home/.lima-build.lock/owner" 2>/dev/null \
+   && grep -qF "rm -rf ~/.lima-build.lock" <<<"$ML_ERR"; then pass
+else fail "run=$ML_KEEP_RUN calls: $ML_CALLS owner: $(cat "$MLM/home/.lima-build.lock/owner" 2>&1)"; fi
+ml_reset
 
 printf '%064d\n' 0 > "$ML/sum-override"
 ml -- --mode=release
@@ -1320,6 +1387,190 @@ it "no script still names the cloud orchestrator, its helpers or its CLI"
 ML_LEFT="$(grep -lE 'build-platforms-g''cp-iap|iap-hel''pers|gclo''ud|OAM_G''CP_|OAM_I''AP_' scripts/*.sh scripts/lib/*.sh 2>/dev/null || true)"
 if [ -z "$ML_LEFT" ] && [ ! -e scripts/build-platforms-g''cp-iap.sh ] && [ ! -e scripts/lib/iap-hel''pers.sh ]; then pass
 else fail "still there: $ML_LEFT"; fi
+
+# =============================================================================
+group "the Mac build lock (protocol v1) -- mac-linux-vm.sh lock/unlock and the leg"
+# =============================================================================
+# ~/.lima-build.lock on the build Mac, shared with the Yaw repo's linux leg.
+# The driver's lock verbs run for real against the fake Mac set up in the
+# group above ($MLM: home, limactl, stat); the leg's cases run the real
+# orchestrator against the stubbed ssh, whose lock/unlock calls reach that
+# same driver and fake Mac. Nothing here reaches a Mac.
+LK="$MLM/home/.lima-build.lock"
+# lk <verb> [args...]  -- the driver alone; sets LK_RC and LK_ERR.
+lk(){
+  LK_ERR="$(HOME="$MLM/home" PATH="$MLM/bin:$PATH" bash scripts/mac-linux-vm.sh "$@" 2>&1 >/dev/null </dev/null)"
+  LK_RC=$?
+}
+# lk_plant <repo> <instance> <run>  -- a lock some other run holds.
+lk_plant(){
+  mkdir -p "$LK"
+  printf 'repo=%s\ninstance=%s\nrun=%s\nhost=other-box\npid=4242\nstarted=2026-11-01T00:00:00Z\n' "$1" "$2" "$3" > "$LK/owner"
+}
+ML_HOST="$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-')"; [ -n "$ML_HOST" ] || ML_HOST=unknown
+
+ml_reset
+lk lock r1 oam oam-linux box-1 77
+LK_OWNER="$(cat "$LK/owner" 2>/dev/null)"
+it "lock: a free lock is taken -- the dir, then an owner with exactly the six keys, no temp file left"
+if [ "$LK_RC" = "0" ] && [ ! -e "$LK/owner.tmp" ] \
+   && [ "$(cut -d= -f1 <<<"$LK_OWNER" | tr '\n' ' ')" = "repo instance run host pid started " ] \
+   && [ "$(head -5 <<<"$LK_OWNER" | tr '\n' ' ')" = "repo=oam instance=oam-linux run=r1 host=box-1 pid=77 " ] \
+   && grep -qE '^started=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' <<<"$LK_OWNER"; then pass
+else fail "rc=$LK_RC owner: ${LK_OWNER//$'\n'/ } err: $LK_ERR"; fi
+
+lk unlock r2
+LK_OTHER="$LK_RC|$([ -d "$LK" ] && echo kept)|$(grep -c 'run=r1' <<<"$LK_ERR")"
+lk unlock r1
+LK_MINE="$LK_RC|$([ -d "$LK" ] && echo kept)"
+lk unlock r1
+it "unlock: only the owning run releases it; another run's unlock is BUSY and leaves it; no lock is a no-op"
+if [ "$LK_OTHER" = "3|kept|1" ] && [ "$LK_MINE" = "0|" ] && [ "$LK_RC" = "0" ]; then pass
+else fail "other: $LK_OTHER mine: $LK_MINE none: $LK_RC ($LK_ERR)"; fi
+
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
+lk lock r1 oam oam-linux box-1 77
+it "lock: held by a run whose instance is Running -- BUSY (exit 3) naming repo, instance, run, host, pid, started; untouched"
+if [ "$LK_RC" = "3" ] && grep -qF 'BUSY' <<<"$LK_ERR" \
+   && grep -qF 'repo=yaw instance=yaw-linux run=y-run-9 host=other-box pid=4242 started=2026-11-01T00:00:00Z' <<<"$LK_ERR" \
+   && grep -qxF 'run=y-run-9' "$LK/owner"; then pass
+else fail "rc=$LK_RC err: $LK_ERR"; fi
+
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk lock r1 oam oam-linux box-1 77
+LK_STOPPED="$LK_RC|$(grep -c 'STALE.*run=y-run-9' <<<"$LK_ERR")|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)"
+ml_reset
+lk_plant yaw yaw-gone y-run-8
+lk lock r1 oam oam-linux box-1 77
+LK_MISSING="$LK_RC|$(grep -c 'STALE' <<<"$LK_ERR")|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)"
+it "lock: held by a run whose instance is Stopped, or missing from limactl, is STALE -- logged, taken over"
+if [ "$LK_STOPPED" = "0|1|1" ] && [ "$LK_MISSING" = "0|1|1" ]; then pass
+else fail "stopped: $LK_STOPPED missing: $LK_MISSING err: $LK_ERR"; fi
+
+ml_reset
+mkdir -p "$LK"
+lk lock r1 oam oam-linux box-1 77
+LK_YOUNG="$LK_RC|$(grep -c 'mid-acquire' <<<"$LK_ERR")|$([ -e "$LK/owner" ] && echo owner)"
+touch -d "@$(( $(date +%s) - 120 ))" "$LK"
+lk lock r1 oam oam-linux box-1 77
+LK_OLD="$LK_RC|$(grep -c 'STALE' <<<"$LK_ERR")|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)"
+it "lock: an ownerless lock dir is BUSY under 60 s (someone mid-acquire), STALE and taken over past it"
+if [ "$LK_YOUNG" = "3|1|" ] && [ "$LK_OLD" = "0|1|1" ]; then pass
+else fail "young: $LK_YOUNG old: $LK_OLD err: $LK_ERR"; fi
+
+ml_reset
+printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
+lk lock r1 oam oam-linux box-1 77
+LK_NB="$LK_RC|$([ -d "$LK" ] && echo kept)|$(grep -c 'yaw-linux' <<<"$LK_ERR")"
+ml_reset
+: > "$MLM/list-fail"
+lk lock r1 oam oam-linux box-1 77
+LK_NOLIST="$LK_RC|$([ -d "$LK" ] && echo kept)"
+it "lock: another instance Running after the lock is taken releases it and refuses; an unlistable Mac does too"
+if [ "$LK_NB" = "3||1" ] && [ "$LK_NOLIST" = "1|" ]; then pass
+else fail "neighbour: $LK_NB unlistable: $LK_NOLIST err: $LK_ERR"; fi
+
+ml_reset
+LK_BAD=""
+for argv in "lock r1 git oam-linux" "lock r;1 oam oam-linux" "lock r1 oam -oam" "lock r1 oam oam-linux box/1 7" \
+            "lock r1 oam oam-linux box 7x" "lock" "unlock" "unlock ../x"; do
+  # shellcheck disable=SC2086  # word-split on purpose: each case is an argv
+  lk $argv
+  if [ "$LK_RC" != "1" ] || ! grep -q FATAL <<<"$LK_ERR" || [ -e "$LK" ]; then LK_BAD="$LK_BAD [$argv: rc=$LK_RC]"; fi
+done
+it "lock/unlock refuse a bad run id, repo, instance, host or pid before touching anything"
+if [ -z "$LK_BAD" ]; then pass; else fail "$LK_BAD"; fi
+
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
+LK_ST="$(HOME="$MLM/home" PATH="$MLM/bin:$PATH" bash scripts/mac-linux-vm.sh status oam-linux 2>/dev/null </dev/null)"
+it "status: reports the other Running instances and the lock's owner, key by key"
+if [ "$(kv_field "$LK_ST" others)" = "yaw-linux" ] && [ "$(kv_field "$LK_ST" lock)" = "held" ] \
+   && [ "$(kv_field "$LK_ST" lock.repo)/$(kv_field "$LK_ST" lock.run)/$(kv_field "$LK_ST" lock.pid)" = "yaw/y-run-9/4242" ]; then pass
+else fail "status: ${LK_ST//$'\n'/ | }"; fi
+
+# --- the leg ------------------------------------------------------------------------
+ml_reset
+ml -- --mode=release
+ML_LK_LINE="$(grep -nE '^bash -s -- lock ' <<<"$ML_CALLS" | cut -d: -f1)"
+ML_START_LINE="$(grep -nF ' start oam-linux' <<<"$ML_CALLS" | cut -d: -f1)"
+ML_ST_LINE="$(grep -nF ' status oam-linux' <<<"$ML_CALLS" | cut -d: -f1)"
+it "leg: a release run takes the lock after the status and before the VM starts, releases it last, and leaves none"
+if [ "$ML_RC" = "0" ] && [ -n "$ML_LK_LINE" ] && [ -n "$ML_START_LINE" ] && [ "$ML_ST_LINE" -lt "$ML_LK_LINE" ] \
+   && [ "$ML_LK_LINE" -lt "$ML_START_LINE" ] && ml_stop_then_unlock "$ML_CALLS" && [ ! -e "$LK" ] \
+   && grep -qE "^bash -s -- lock [0-9]{8}-[0-9]{6}-[0-9]+-[0-9]+ oam oam-linux $ML_HOST [0-9]+$" <<<"$ML_CALLS"; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+ml_reset
+ml OAM_LIMA_CPUS=6 -- --provision --preflight-only
+ML_LK_LINE="$(grep -nE '^bash -s -- lock ' <<<"$ML_CALLS" | cut -d: -f1)"
+ML_PROV_LINE="$(grep -nF ' provision oam-linux' <<<"$ML_CALLS" | cut -d: -f1)"
+it "leg: --provision takes the lock before it provisions"
+if [ "$ML_RC" = "0" ] && [ -n "$ML_LK_LINE" ] && [ -n "$ML_PROV_LINE" ] && [ "$ML_LK_LINE" -lt "$ML_PROV_LINE" ] && [ ! -e "$LK" ]; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS"; fi
+
+ml_reset
+printf 'oam-linux Running\nyaw-linux Running\n' > "$MLM/lima"
+printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
+lk_plant yaw yaw-linux y-run-9
+ml -- --preflight-only
+ML_PF_YAW="$ML_RC|$(ml_calls_of ' stop ')|$(ml_calls_of ' lock ')"
+ML_PF_YAW_ERR="$ML_ERR"
+ml -- --mode=release
+ML_REL_YAW="$ML_RC|$(ml_calls_of ' stop ')|$(ml_calls_of ' start ')|$(ml_calls_of ' lock ')"
+it "leg: another repo's VM Running (with the lock) -- preflight and release are BUSY before the lock and stop nothing"
+if [ "$ML_PF_YAW" = "1|0|0" ] && [ "$ML_REL_YAW" = "1|0|0|0" ] && grep -qF 'BUSY' <<<"$ML_PF_YAW_ERR" \
+   && grep -qF 'yaw-linux' <<<"$ML_PF_YAW_ERR" && grep -qF 'run=y-run-9' <<<"$ML_PF_YAW_ERR" \
+   && grep -qxF 'run=y-run-9' "$LK/owner" && grep -qxF 'oam-linux Running' "$MLM/lima"; then pass
+else fail "preflight: $ML_PF_YAW release: $ML_REL_YAW stderr: $ML_PF_YAW_ERR"; fi
+
+ml_reset
+printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
+: > "$ML/status-others-none"
+ml -- --mode=release
+it "leg: a neighbour VM that appears between the status and the lock is caught by the lock's re-check -- BUSY, nothing started, no lock left"
+if [ "$ML_RC" != "0" ] && [ "$(ml_calls_of ' lock ')" = "1" ] && [ "$(ml_calls_of ' start ')" = "0" ] \
+   && [ "$(ml_calls_of ' stop ')" = "0" ] && [ ! -e "$LK" ] && grep -qF 'another Lima instance is Running on this Mac (yaw-linux)' <<<"$ML_ERR"; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+# The same repo and instance, but a run that is not over: on another box, or
+# here with its process alive. Preflight must not stop a VM a live run owns.
+ml_reset
+echo "oam-linux Running" > "$MLM/lima"
+printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
+lk_plant oam oam-linux o-run-elsewhere
+ml -- --preflight-only
+ML_PF_ELSE="$ML_RC|$(ml_calls_of ' stop ')"
+sed -i "s/^host=.*/host=$ML_HOST/; s/^pid=.*/pid=$$/" "$LK/owner"
+ml -- --preflight-only
+ML_PF_ALIVE="$ML_RC|$(ml_calls_of ' stop ')"
+it "leg: preflight with the lock held by a live run (another box, or a live pid here) and its VM Running is BUSY, stops nothing"
+if [ "$ML_PF_ELSE" = "1|0" ] && [ "$ML_PF_ALIVE" = "1|0" ] && grep -qF 'BUSY' <<<"$ML_ERR" \
+   && grep -qxF 'oam-linux Running' "$MLM/lima" && grep -qxF 'run=o-run-elsewhere' "$LK/owner"; then pass
+else fail "elsewhere: $ML_PF_ELSE alive: $ML_PF_ALIVE stderr: $ML_ERR"; fi
+
+# An OAM_KEEP_VM=1 run's leftover: this repo, this instance, this box, its
+# process gone. Preflight stops that VM (what it is for), which makes the
+# lock stale, and takes it over.
+ml_reset
+echo "oam-linux Running" > "$MLM/lima"
+printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
+lk_plant oam oam-linux o-run-kept
+ML_DEAD_PID="$(bash -c 'echo $$')"
+sed -i "s/^host=.*/host=$ML_HOST/; s/^pid=.*/pid=$ML_DEAD_PID/" "$LK/owner"
+ml -- --preflight-only
+ML_STOP_LINE="$(grep -nF ' stop oam-linux' <<<"$ML_CALLS" | head -1 | cut -d: -f1)"
+ML_LK_LINE="$(grep -nE '^bash -s -- lock ' <<<"$ML_CALLS" | cut -d: -f1)"
+it "leg: this repo's own lock left by an exited OAM_KEEP_VM=1 run here -- its VM is stopped, the lock taken over and released"
+if [ "$ML_RC" = "0" ] && [ -n "$ML_STOP_LINE" ] && [ -n "$ML_LK_LINE" ] && [ "$ML_STOP_LINE" -lt "$ML_LK_LINE" ] \
+   && [ ! -e "$LK" ] && grep -qF 'STALE' <<<"$ML_ERR" && grep -qF 'run=o-run-kept' <<<"$ML_ERR"; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS stderr: $ML_ERR"; fi
+ml_reset
 
 # =============================================================================
 group "tailnet-helpers.sh -- the mac build host preflight"
