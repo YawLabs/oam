@@ -8,8 +8,10 @@
 # continues, matching the old workflow's continue-on-error):
 #   local (this box)      cargo run -p xtask -- conformance + node-suite
 #   mac-arm64 (tailnet)   scripts/build-platforms-tailnet.sh --mode=measure
-#   linux-x64 (GCP)       scripts/build-platforms-gcp-iap.sh --mode=measure
-#                         (direct ssh to the VM, IAP tunnel fallback)
+#   linux-x64 (Lima VM)   scripts/build-platforms-mac-linux.sh --mode=measure
+#                         (an x86_64 container under Rosetta in a VM on the
+#                         same Mac, run after the mac leg -- the two do not fit
+#                         in its memory together)
 #
 # The per-PR RATCHET gate (the only gating part of node-compat.yml) lives in
 # scripts/ci-local.sh step 7 -- this script is purely measurement.
@@ -23,7 +25,7 @@
 #   OAM_SKIP_LINUX=1 ...                             # drop the linux leg
 #   OAM_SKIP_LOCAL=1 ...                             # drop the local leg
 # Remote host config: same env as the two platform scripts (OAM_MAC_HOST,
-# OAM_MAC_USER, OAM_GCP_*, OAM_KEEP_VM, OAM_IAP_SSH_MODE).
+# OAM_MAC_USER, OAM_MAC_KEY, OAM_LIMA_INSTANCE, OAM_KEEP_VM).
 # =============================================================================
 
 set -euo pipefail
@@ -64,6 +66,21 @@ else
 fi
 
 # --- remote legs (advisory: warn-and-continue on failure) -------------------------
+# A linux-leg VM left running would hold the build Mac's memory through the
+# mac leg. The linux leg's preflight stops one it finds Running with no live
+# lock, as release-local does before its mac legs. A VM an earlier run left
+# with OAM_KEEP_VM=1 comes with that run's Mac build lock still held: this
+# preflight then warns BUSY and stops nothing, and this run's linux leg is
+# BUSY too -- clear it by hand first (the BUSY message prints the limactl
+# stop and rm -rf ~/.lima-build.lock commands). The preflight runs with
+# OAM_KEEP_VM=0 whatever is exported here: under OAM_KEEP_VM=1 the preflight
+# keeps the Mac build lock (protocol v1.2, every mode), and this run's own
+# linux leg would then find it BUSY. The knob still applies to that leg.
+if [ "${OAM_SKIP_MAC:-0}" != "1" ] && [ "${OAM_SKIP_LINUX:-0}" != "1" ]; then
+  OAM_KEEP_VM=0 bash "$SCRIPT_DIR/build-platforms-mac-linux.sh" --preflight-only \
+    || warn "linux leg preflight failed (see above) -- a VM it could not stop, or one an OAM_KEEP_VM=1 run left with the Mac build lock held (BUSY), would slow the mac leg; continuing"
+fi
+
 if [ "${OAM_SKIP_MAC:-0}" = "1" ]; then
   warn "OAM_SKIP_MAC=1 -- mac leg skipped"
 else
@@ -80,8 +97,8 @@ fi
 if [ "${OAM_SKIP_LINUX:-0}" = "1" ]; then
   warn "OAM_SKIP_LINUX=1 -- linux leg skipped"
 else
-  step "Linux leg (GCP, --mode=measure)"
-  if LINUX_ART=$(bash "$SCRIPT_DIR/build-platforms-gcp-iap.sh" --mode=measure); then
+  step "Linux leg (Lima VM on the build Mac, --mode=measure)"
+  if LINUX_ART=$(bash "$SCRIPT_DIR/build-platforms-mac-linux.sh" --mode=measure); then
     LINUX_ART="${LINUX_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line
     cp -r "$LINUX_ART/linux-x64" "$STAGE_DIR/"
     ok "linux leg done"

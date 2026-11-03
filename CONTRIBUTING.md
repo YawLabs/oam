@@ -38,7 +38,10 @@ CI is script-driven, not GitHub Actions: `./scripts/ci-local.sh` runs the full g
 (fmt, clippy `-D warnings`, build, tests, smoke, conformance, node-suite ratchet,
 THIRD_PARTY_LICENSES drift, unsafe audit) and installs as a pre-push hook. Cross-platform legs run on remote
 build hosts via `scripts/release-local.sh` / `scripts/node-compat-measure.sh` /
-`scripts/bench-platforms.sh`.
+`scripts/bench-platforms.sh`: the build Mac over the tailnet runs the macOS legs
+(`scripts/build-platforms-tailnet.sh`) and, in an x86_64 Debian 12 container under Rosetta in
+a Lima VM, the Linux leg (`scripts/build-platforms-mac-linux.sh`; `--provision` creates the VM
+once). The two run one after the other, never together.
 
 ### Tests touching process-global state
 

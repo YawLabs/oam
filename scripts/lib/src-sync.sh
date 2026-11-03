@@ -2,7 +2,7 @@
 # =============================================================================
 # What ships to a remote builder, and a ceiling on how much.
 # =============================================================================
-# Both platform orchestrators (build-platforms-gcp-iap.sh, the linux leg, and
+# Both platform orchestrators (build-platforms-mac-linux.sh, the linux leg, and
 # build-platforms-tailnet.sh, the mac leg) send the WORKING TREE to their
 # builder as a tarball. They used to do it with a hand-maintained deny-list,
 # duplicated verbatim in both files:
@@ -17,7 +17,7 @@
 # .claude/worktrees/, each a full checkout of this repo carrying its OWN
 # target/ -- one of them 4.9 GB. None were excluded, because none of them are
 # `./target`. The legitimate tree is ~1.6 MB. The release spent 35 minutes
-# packing and pushing build junk over an IAP tunnel and then died, and because
+# packing and pushing build junk to the cloud builder of the day and then died, and because
 # sync_src had no error handling it died SILENTLY: the only thing the operator
 # saw was the EXIT trap's "stopping VM" warning and release-local.sh's generic
 # "linux leg failed -- see its log output above", above which there was nothing
@@ -39,7 +39,7 @@
 # loud failure for a silent conformance regression. The git-driven list keeps
 # them, because git knows they are tracked.
 #
-# Same convention as lib/iap-helpers.sh and lib/build-locks.sh: sourced, never
+# Same convention as lib/host-helpers.sh and lib/build-locks.sh: sourced, never
 # executed. Functions RETURN status; the caller owns fail()/warn().
 # =============================================================================
 
@@ -84,7 +84,7 @@ OAM_SRC_TARBALL_MAX_MB="${OAM_SRC_TARBALL_MAX_MB:-200}"
 # src_tarball_over_ceiling <bytes>  -- 0 when the archive is implausibly large.
 # An empty or non-numeric reading is NOT treated as oversized: a failed `wc -c`
 # must not abort a release on a number nobody actually measured. Same inertness
-# rule as disk_needs_reclaim/disk_below_floor in lib/iap-helpers.sh.
+# rule as disk_needs_reclaim/disk_below_floor in lib/host-helpers.sh.
 src_tarball_over_ceiling() {
   case "$1" in '' | *[!0-9]*) return 1 ;; esac
   [ "$1" -gt "$((OAM_SRC_TARBALL_MAX_MB * 1048576))" ]

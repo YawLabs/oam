@@ -4,10 +4,9 @@
 # =============================================================================
 # Runs the mac legs of the deleted GitHub workflows on the Tailscale-reachable
 # Apple-Silicon MacBook Air (the same host that builds yaw's mac leg). The
-# Linux leg lives in scripts/build-platforms-gcp-iap.sh; this script exists
-# because the Air is a personal machine, not a GCP VM -- Tailscale stays the
-# right tool for it. Tailnet SSH is plain OpenSSH with keepalive, so the
-# remote work runs as ONE ssh call per mode (no IAP-style sub-step splitting).
+# Linux leg runs on the same Air, in a Lima VM, from
+# scripts/build-platforms-mac-linux.sh. Tailnet SSH is plain OpenSSH with
+# keepalive, so the remote work here runs as ONE ssh call per mode.
 #
 # Modes (remote dispatch in scripts/build-remote.sh):
 #   --mode=release (default)   mac-release: prep + gate + test + native arm64
@@ -111,8 +110,8 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=lib/src-sync.sh
 . "$SCRIPT_DIR/lib/src-sync.sh"
 # disk_needs_reclaim / disk_below_floor -- the same thresholds as the linux leg.
-# shellcheck source=lib/iap-helpers.sh
-. "$SCRIPT_DIR/lib/iap-helpers.sh"
+# shellcheck source=lib/host-helpers.sh
+. "$SCRIPT_DIR/lib/host-helpers.sh"
 # tailnet_ssh_failure / tailnet_peer_state -- what the host preflight tells the
 # operator when the Air cannot be used.
 # shellcheck source=lib/tailnet-helpers.sh

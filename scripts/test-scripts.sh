@@ -10,8 +10,8 @@
 # `cd ""` no-op), none of which any gate could have caught.
 #
 # Everything here runs the REAL scripts against real directories. No mocks: the
-# bugs that actually bit were external behaviour (mawk`s regex dialect, gcloud`s
-# output buffering) differing from what the code assumed, which is precisely
+# bugs that actually bit were external behaviour (mawk`s regex dialect, a cloud
+# CLI`s output buffering) differing from what the code assumed, which is precisely
 # what a mock would have encoded wrong.
 #
 # Cost matters, because this is a gate on every push and process spawn on the
@@ -53,7 +53,9 @@ OPERATOR_KNOBS="OAM_SIGN_REQUIRED OAM_RELEASE_SIGNING_KEY
   OAM_WIN_SIGN_METADATA OAM_WIN_SIGN_PUBLISHER OAM_SKIP_WIN_SIGN OAM_WIN_SIGN_TIMEOUT
   OAM_SKIP_WIN_X64 OAM_SKIP_LINUX OAM_SKIP_LOCAL_GATE
   OAM_DRY_RUN OAM_NO_AUTO_BUMP OAM_NO_AUTO_ATTRIBUTION
-  OAM_INSECURE_SKIP_SIGNATURE OAM_SKIP_PATH_SHADOW"
+  OAM_INSECURE_SKIP_SIGNATURE OAM_SKIP_PATH_SHADOW
+  OAM_KEEP_VM OAM_LINUX_FAST OAM_LINUX_GLIBC_MAX OAM_LIMA_INSTANCE
+  OAM_LIMA_CPUS OAM_LIMA_MEMORY_GIB OAM_LIMA_DISK_GIB OAM_LINUX_RETRY_DELAY"
 scrub_operator_knobs(){
   local k
   for k in $OPERATOR_KNOBS; do unset "$k"; done
@@ -351,10 +353,11 @@ else
             '!oam-bbbd000000000001' '!lib-bbbd000000000001.d' '!lib-bbbd000000000001.q.rcgu.o'
 fi
 
-# THE regression guard. mawk -- Ubuntu`s default awk, and the GCP builder`s --
-# matches NOTHING for /-[0-9a-f]{16}/ rather than erroring, so reintroducing an
-# interval expression silently returns Linux collection to zero with a green
-# run. Asserted on the source because the dev box has no mawk to run under.
+# THE regression guard. mawk -- the default awk on Debian and Ubuntu, and so
+# in the linux leg's debian:12 build container -- matched NOTHING for
+# /-[0-9a-f]{16}/ (the mawk 1.3.4 the bug was found on) rather than
+# erroring, so reintroducing an interval expression silently returns Linux
+# collection to zero with a green run. Asserted on the source because the dev box has no mawk to run under.
 # Comments are stripped first: the prose above the awk block necessarily quotes
 # the very pattern it warns against.
 it "the awk program uses no interval expressions"
@@ -400,9 +403,10 @@ if [ "$AWK_BAD" = "1" ]; then :
 elif [ -n "$AWK_TESTED" ]; then pass
 else fail "no awk implementation found to test with"; fi
 
-# mawk is the entire reason the guard above exists -- it is Ubuntu's default
-# and the GCP builder's, and it matches NOTHING for an interval expression
-# rather than erroring. The loop above silently covers whatever happens to be
+# mawk is the entire reason the guard above exists -- it is the default awk
+# on Debian and Ubuntu (the linux leg builds in a debian:12 container), and
+# the mawk 1.3.4 the bug was found on matches NOTHING for an interval
+# expression rather than erroring. The loop above silently covers whatever happens to be
 # installed, so on a host without mawk it reports a pass having never run the
 # implementation the 16GB bug came from. Name that gap instead of hiding it.
 it "mawk itself was available to test against"
@@ -585,75 +589,13 @@ if [ "$RC" = "0" ] && grep -q 'skipping target/ reclaim' <<<"$OUT"; then pass
 else fail "rc=$RC out=$OUT"; fi
 
 # =============================================================================
-group "iap-helpers.sh -- tunnel log parsing"
+group "host-helpers.sh -- disk headroom thresholds"
 # =============================================================================
-# shellcheck source=lib/iap-helpers.sh
-. scripts/lib/iap-helpers.sh
-
-# Captured verbatim from gcloud 577 on 2026-08-22. Note what is NOT here:
-# "Listening on port" never arrived, because it is the only line gcloud writes
-# to stdout and redirecting stdout to a file block-buffers it in Python. The
-# tunnel was fully functional and served SSH for 160s+ regardless.
-LOG="$SUITE_TMP/tunnel.log"
-cat > "$LOG" <<'FIXTURE'
-Picking local unused port [52528].
-WARNING:
-To increase the performance of the tunnel, consider installing NumPy.
-Testing if tunnel connection works.
-FIXTURE
-
-it "picked-port parses from a self-test-in-progress log"
-eq "$(iap_parse_picked_port "$LOG")" "52528"
-
-it "listening-port is absent while gcloud is still self-testing"
-iap_parse_listening_port "$LOG" >/dev/null 2>&1 && fail "reported a bound port that was never logged" || pass
-
-printf 'Listening on port [52528].\n' >> "$LOG"
-it "listening-port parses once gcloud has bound the socket"
-eq "$(iap_parse_listening_port "$LOG")" "52528"
-
-it "a missing log file is a clean miss, not a crash"
-iap_parse_picked_port "$SUITE_TMP/nonexistent.log" >/dev/null 2>&1 && fail "parsed a missing file" || pass
-
-# The same guard on the OTHER parser, which is the authoritative one: a bound
-# port is what proves the tunnel is up, so this is the function whose failure
-# means "do not proceed". Only picked_port's missing-file path was covered.
-it "a missing log file is a clean miss for the listening-port parser too"
-iap_parse_listening_port "$SUITE_TMP/nonexistent.log" >/dev/null 2>&1 && fail "parsed a missing file" || pass
-
-# =============================================================================
-group "iap-helpers.sh -- guest boot detection"
-# =============================================================================
-
-# Captured verbatim from yaw-linux-builder`s serial console, 2026-08-22.
-it "detects the Debian/Ubuntu systemd sshd banner"
-sshd_banner_seen "2026-08-22T22:40:44 yaw-linux-builder systemd[1]: Started ssh.service - OpenBSD Secure Shell server." \
-  && pass || fail "did not match the real builder banner"
-
-it "does not fire on the pre-sshd portion of a boot"
-sshd_banner_seen "systemd[1]: Starting ssh.service - OpenBSD Secure Shell server..." \
-  && fail "matched 'Starting', which precedes sshd actually accepting" || pass
-
-it "does not fire on unrelated ssh chatter"
-sshd_banner_seen "tailscaled[417]: pm: using backend prefs ssh=true routes=[]" \
-  && fail "matched unrelated output containing 'ssh'" || pass
-
-# The regex carries four alternations and only the Debian one was exercised.
-# Portability across distro unit namings is the entire reason the other three
-# are there, and narrowing the pattern turns cold-VM boot detection into a
-# silent 180s stall on every start rather than a visible failure.
-it "matches the RHEL-family sshd.service unit naming"
-sshd_banner_seen "systemd[1]: Started sshd.service - OpenSSH server daemon." \
-  && pass || fail "did not match the RHEL-family unit line"
-
-it "matches the bare OpenBSD and OpenSSH unit descriptions"
-if sshd_banner_seen "systemd[1]: Started OpenBSD Secure Shell server." \
-   && sshd_banner_seen "systemd[1]: Started OpenSSH Daemon."; then pass
-else fail "a distro naming the regex claims to cover did not match"; fi
-
-# =============================================================================
-group "iap-helpers.sh -- disk headroom thresholds"
-# =============================================================================
+# The helpers the orchestrators share (lib/host-helpers.sh). They lived
+# beside the old cloud linux leg's helpers until that leg moved to the build
+# Mac; these are their tests, unchanged where the code is.
+# shellcheck source=lib/host-helpers.sh
+. scripts/lib/host-helpers.sh
 
 it "reclaims below the reclaim threshold"; disk_needs_reclaim 14 && pass || fail "14GB should reclaim"
 it "does not reclaim at the threshold";    disk_needs_reclaim 20 && fail "20GB should not reclaim" || pass
@@ -666,7 +608,7 @@ it "proceeds at the floor";                disk_below_floor 10 && fail "10GB sho
 it "10GB free reclaims but still builds"
 if disk_needs_reclaim 10 && ! disk_below_floor 10; then pass; else fail "10GB should reclaim and proceed"; fi
 
-# df failing over a flaky tunnel must not silently trigger a prune, and must not
+# df failing over a flaky connection must not silently trigger a prune, and must not
 # abort a release either.
 it "an unreadable df result triggers neither a prune nor an abort"
 if ! disk_needs_reclaim "" && ! disk_below_floor "" \
@@ -678,8 +620,9 @@ else fail "empty/non-numeric readings must be inert"; fi
 # hardcoded 20/10 defaults. They are resolved at SOURCE time, so an override
 # only takes effect in a fresh shell -- assigning after the fact would silently
 # test nothing, which is why these go through `bash -c`.
-# #210: the linux leg's probe could answer nothing with exit 0 (df's failure
-# hidden behind a trailing `tr`), and the check then skipped itself in silence.
+# #210: the old linux leg's probe could answer nothing with exit 0 (df's
+# failure hidden behind a trailing `tr`), and the check then skipped itself in
+# silence.
 # Every reading is now either a number or a reason.
 it "a df answer in GB reads as its number"
 eq "$(disk_free_reading 0 "$(printf 'Avail\n  37G\n')")" "37"
@@ -689,204 +632,62 @@ out="$(disk_free_reading 0 "Avail")" && fail "a header-only answer must not read
 it "a df probe that printed nothing gives a reason"
 out="$(disk_free_reading 0 "")" && fail "an empty answer must not read as a size: $out" \
   || { case "$out" in *"printed nothing"*) pass ;; *) fail "no reason given: '$out'" ;; esac; }
-it "a failed probe (a dead tunnel's 255) gives a reason naming its status"
+it "a failed probe (a dead connection's 255) gives a reason naming its status"
 out="$(disk_free_reading 255 "")" && fail "a failed probe must not read as a size: $out" \
   || { case "$out" in *"exit 255"*) pass ;; *) fail "no reason given: '$out'" ;; esac; }
 it "a failed df with stray digits on stdout is still a failure"
 out="$(disk_free_reading 1 "  12G")" && fail "status 1 must not read as a size: $out" || pass
 it "the linux leg's probe keeps df's status and stderr, and says when it did not run"
-GCPLEG_CODE="$(sed 's/#.*//' scripts/build-platforms-gcp-iap.sh)"
-if grep -qE "df -BG[^\"]*\|" <<<"$GCPLEG_CODE" || grep -qE 'df -BG.*2>/dev/null' <<<"$GCPLEG_CODE"; then
+# The df runs in the container (mac-linux-vm.sh free-gb), alone; its answer
+# reaches disk_free_reading with ssh's status, and an unusable one warns.
+ML_DF_DRIVER="$(sed -n '/^do_free_gb() {/,/^}/p' scripts/mac-linux-vm.sh | sed 's/#.*//')"
+ML_DF_LEG="$(sed 's/#.*//' scripts/build-platforms-mac-linux.sh)"
+if ! grep -q 'df -BG --output=avail' <<<"$ML_DF_DRIVER"; then
+  fail "the driver's free-gb no longer runs df -BG --output=avail"
+elif grep -qE 'df -BG.*\|' <<<"$ML_DF_DRIVER" || grep -q '2>/dev/null' <<<"$ML_DF_DRIVER"; then
   fail "the df probe pipes or discards stderr again"
-elif ! grep -q 'disk headroom NOT CHECKED' <<<"$GCPLEG_CODE"; then
-  fail "an unreadable builder disk no longer warns"
+elif ! grep -qF 'disk_free_reading "$rc" "$out"' <<<"$ML_DF_LEG" || ! grep -q 'disk headroom NOT CHECKED' <<<"$ML_DF_LEG"; then
+  fail "an unreadable build disk no longer warns through disk_free_reading"
 else pass; fi
 
 it "OAM_DISK_RECLAIM_GB moves the reclaim threshold"
-eq "$(OAM_DISK_RECLAIM_GB=50 bash -c '. scripts/lib/iap-helpers.sh; disk_needs_reclaim 40 && echo reclaim || echo skip')" \
+eq "$(OAM_DISK_RECLAIM_GB=50 bash -c '. scripts/lib/host-helpers.sh; disk_needs_reclaim 40 && echo reclaim || echo skip')" \
    "reclaim"
 
 it "OAM_DISK_MIN_GB moves the abort floor"
-eq "$(OAM_DISK_MIN_GB=50 bash -c '. scripts/lib/iap-helpers.sh; disk_below_floor 40 && echo abort || echo proceed')" \
+eq "$(OAM_DISK_MIN_GB=50 bash -c '. scripts/lib/host-helpers.sh; disk_below_floor 40 && echo abort || echo proceed')" \
    "abort"
 
 # =============================================================================
-group "iap-helpers.sh -- instance schedules + ssh transport drops"
+group "host-helpers.sh -- what a failed command said"
 # =============================================================================
-# The reading gcloud gave for yaw-linux-builder on 2026-09-25. gcloud on
-# Windows terminates value() output with \r\n, so every parser here is fed the
-# \r too: a policy name carrying one would make `resource-policies describe`
-# look up a policy that does not exist, and the detach would silently skip.
-POLICY_URL='https://www.googleapis.com/compute/v1/projects/yaw-labs-prod/regions/us-west1/resourcePolicies/yaw-linux-builder-autostop'
 
-it "policy name comes off the selfLink"
-eq "$(iap_policy_name "$POLICY_URL")" "yaw-linux-builder-autostop"
-
-it "policy name survives a CRLF-terminated reading"
-eq "$(iap_policy_name "$POLICY_URL"$'\r')" "yaw-linux-builder-autostop"
-
-it "a bare policy name passes through as itself"
-eq "$(iap_policy_name "yaw-linux-builder-autostop")" "yaw-linux-builder-autostop"
-
-it "an empty reading is a clean miss, not an empty name"
-iap_policy_name "" >/dev/null 2>&1 && fail "named an empty policy" || pass
-
-it "policy region comes off the selfLink"
-eq "$(iap_policy_region "$POLICY_URL"$'\r')" "us-west1"
-
-it "a bare policy name has no region to read"
-iap_policy_region "yaw-linux-builder-autostop" >/dev/null 2>&1 && fail "invented a region" || pass
-
-it "two attached policies split into two URLs"
-eq "$(iap_policy_urls "$POLICY_URL;${POLICY_URL%autostop}snap"$'\r' | wc -l | tr -d ' ')" "2"
-
-it "the split URLs carry no CR"
-eq "$(iap_policy_urls "$POLICY_URL"$'\r' | tr -d '\n')" "$POLICY_URL"
-
-it "no attached policies yields no output at all"
-eq "$(iap_policy_urls "" | wc -c | tr -d ' ')" "0"
-
-# The last two lines of the 2026-09-25 node-suite log, verbatim.
-it "the scheduled-stop signature reads as a transport drop"
-if ssh_transport_dropped $'  PASS   test-stream-pipeline-with-empty-string.js\nConnection to localhost closed by remote host.'; then pass
-else fail "missed OpenSSH's closed-by-remote-host line"; fi
-
-it "a remote command that merely failed is not a transport drop"
-if ssh_transport_dropped $'error: test failed, to rerun pass ...\n[remote] node-suite FAILED'; then fail "a remote exit code is not a transport drop"
-else pass; fi
-
-it "empty text is not a transport drop"
-ssh_transport_dropped "" && fail "matched nothing" || pass
-
-# A remote step is run again only when the TRANSPORT dropped under it, the VM
-# is still RUNNING and attempts remain -- never for a command that exited.
-VMS_DROP=$'  PASS   test-stream-pipeline-with-empty-string.js\nConnection to localhost closed by remote host.'
-it "a transport drop (ssh exit 255) under a RUNNING VM, with attempts left, is run again"
-if remote_step_should_retry 1 3 255 "$VMS_DROP" RUNNING; then pass; else fail "not retried"; fi
-it "the last attempt is not run again"
-remote_step_should_retry 3 3 255 "$VMS_DROP" RUNNING && fail "retried past the last attempt" || pass
-it "a VM that is not RUNNING is not run again -- the postmortem says who stopped it"
-remote_step_should_retry 1 3 255 "$VMS_DROP" TERMINATED && fail "retried against a stopped VM" || pass
-it "a remote command that exited non-zero is never run again"
-remote_step_should_retry 1 3 1 $'error: test failed, to rerun pass ...\n[remote] test FAILED' RUNNING && fail "retried a real failure" || pass
-it "a remote command that exited 1 with a log that mentions a reset is a real failure, not a drop"
-remote_step_should_retry 1 3 1 "$VMS_DROP" RUNNING && fail "retried on the log's words alone" || pass
-it "a blank attempt count is not an invitation"
-remote_step_should_retry "" 3 255 "$VMS_DROP" RUNNING && fail "retried on a blank attempt" || pass
-
-# The same decision as the verdict word remote_step_run acts on. A VM that is
-# TERMINATED or STOPPING behind a drop was stopped under the step, and is
-# started again rather than left to the postmortem alone -- the 2026-09-25
-# schedule stop would have cost one restart, not the release.
-it "the verdict for a drop under a RUNNING VM is rerun, which is what should_retry answers to"
-eq "$(remote_step_verdict 1 3 255 "$VMS_DROP" RUNNING)" "rerun"
-it "a drop under a TERMINATED or STOPPING VM is restart: the VM was stopped under the step"
-eq "$(remote_step_verdict 1 3 255 "$VMS_DROP" TERMINATED)-$(remote_step_verdict 2 3 255 "$VMS_DROP" STOPPING)" "restart-restart"
-it "a stopped VM on the last attempt is no, as is one in a state the restart does not know"
-eq "$(remote_step_verdict 3 3 255 "$VMS_DROP" TERMINATED)-$(remote_step_verdict 1 3 255 "$VMS_DROP" STAGING)-$(remote_step_verdict 1 3 255 "$VMS_DROP" UNKNOWN)" "no-no-no"
-it "a command that exited against a stopped VM is no: the exit, not the stop, is the verdict"
-eq "$(remote_step_verdict 1 3 1 "$VMS_DROP" TERMINATED)-$(remote_step_verdict 1 3 1 $'[remote] test FAILED' TERMINATED)" "no-no"
-it "a blank attempt count is no, whatever the VM is doing"
-eq "$(remote_step_verdict "" 3 255 "$VMS_DROP" TERMINATED)" "no"
-
-# =============================================================================
-group "iap-helpers.sh -- ssh transport: direct first, IAP tunnel fallback"
-# =============================================================================
-# On 2026-09-25 the builder answered plain OpenSSH on its external IP in ~1s
-# while every IAP probe took 11-57s, and a release died after 1269s of them
-# reporting only "(empty stderr)". The orchestrator now goes direct and keeps
-# the tunnel as the fallback; these are the decisions that choose between them
-# and what the operator is told when the direct path does not answer.
-
-it "the three documented OAM_IAP_SSH_MODE values are accepted"
-if ssh_mode_valid auto && ssh_mode_valid direct && ssh_mode_valid tunnel; then pass
-else fail "a documented mode was rejected"; fi
-
-it "a typo, a wrong case, padding, an empty value and 'iap' are rejected"
-SSH_MODE_BAD=""
-for m in "" DIRECT Auto "auto " iap dirct; do
-  ssh_mode_valid "$m" && SSH_MODE_BAD="$SSH_MODE_BAD '$m'"
-done
-if [ -z "$SSH_MODE_BAD" ]; then pass; else fail "accepted:$SSH_MODE_BAD"; fi
-
-it "auto goes direct when the direct probe answered"
-eq "$(ssh_transport_pick auto 1)" "direct"
-
-it "auto falls back to the tunnel when it did not"
-eq "$(ssh_transport_pick auto 0)" "tunnel"
-
-it "forced direct uses direct when it answered"
-eq "$(ssh_transport_pick direct 1)" "direct"
-
-# The one outcome that must NOT degrade into a tunnel: an operator who forced
-# direct asked for the run to stop rather than crawl through the relay.
-it "forced direct picks nothing when direct did not answer"
-SSH_PICK_OUT="$(ssh_transport_pick direct 0)"; SSH_PICK_RC=$?
-if [ "$SSH_PICK_RC" != "0" ] && [ -z "$SSH_PICK_OUT" ]; then pass
-else fail "rc=$SSH_PICK_RC out='$SSH_PICK_OUT' -- forced direct fell back"; fi
-
-it "forced tunnel stays on the tunnel even when direct would answer"
-eq "$(ssh_transport_pick tunnel 1)" "tunnel"
-
-it "an invalid mode picks no transport"
-ssh_transport_pick bogus 1 >/dev/null 2>&1 && fail "picked a transport for an invalid mode" || pass
-
-# Captured 2026-09-25 from this orchestrator's own ssh (OpenSSH_10.2p1, Git
-# Bash) against yaw-linux-builder, with the CRLF endings Windows tools write.
+# The shapes OpenSSH_10.2p1 under Git Bash printed on 2026-09-25, with the CRLF
+# endings Windows tools write; the address is a documentation one (RFC 5737).
 it "a refused key reads back as ssh's own line, CR stripped"
-eq "$(last_nonblank_line $'nosuchuser@34.83.189.193: Permission denied (publickey).\r\n')" \
-   "nosuchuser@34.83.189.193: Permission denied (publickey)."
+eq "$(last_nonblank_line $'nosuchuser@192.0.2.10: Permission denied (publickey).\r\n')" \
+   "nosuchuser@192.0.2.10: Permission denied (publickey)."
 
 it "trailing blank and whitespace-only lines are skipped"
-eq "$(last_nonblank_line $'Warning: Permanently added \'34.83.189.193\' (ED25519) to the list of known hosts.\r\nssh: connect to host 34.83.189.193 port 22: Connection timed out\r\n\r\n \t \r\n')" \
-   "ssh: connect to host 34.83.189.193 port 22: Connection timed out"
+eq "$(last_nonblank_line $'Warning: Permanently added \'192.0.2.10\' (ED25519) to the list of known hosts.\r\nssh: connect to host 192.0.2.10 port 22: Connection timed out\r\n\r\n \t \r\n')" \
+   "ssh: connect to host 192.0.2.10 port 22: Connection timed out"
 
 it "a last line with no newline after it still counts"
 eq "$(last_nonblank_line $'first\nsecond')" "second"
 
 # The 2026-09-25 failure mode: the caller must be told there is NOTHING, so it
-# says what that means (killed by the timeout, or the exit code) instead of
-# printing "(empty stderr)".
+# says what that means (the exit code) instead of printing "(empty stderr)".
 it "empty or whitespace-only stderr is a miss, not a blank line"
 if ! last_nonblank_line "" >/dev/null && ! last_nonblank_line $' \r\n\t\n' >/dev/null \
    && [ -z "$(last_nonblank_line $'\r\n' || true)" ]; then pass
 else fail "reported a line for text that has none"; fi
 
-it "a changed host key is permanent -- polling cannot fix it"
-if ssh_error_is_permanent $'@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\nHost key verification failed.' \
-   && ssh_error_is_permanent 'Host key verification failed.'; then pass
-else fail "a changed host key would be retried for the whole boot budget"; fi
-
-it "the failures a booting guest gives are retried"
-SSH_PERM_BAD=""
-for e in "jeff@34.83.189.193: Permission denied (publickey)." \
-         "ssh: connect to host 34.83.189.193 port 22: Connection refused" \
-         "ssh: connect to host 34.83.189.193 port 22: Connection timed out" \
-         "kex_exchange_identification: read: Connection reset by peer" ""; do
-  ssh_error_is_permanent "$e" && SSH_PERM_BAD="$SSH_PERM_BAD [$e]"
-done
-if [ -z "$SSH_PERM_BAD" ]; then pass; else fail "treated as permanent:$SSH_PERM_BAD"; fi
-
-it "a firewall-shaped failure names tcp:22 and the address"
-SSH_HINT="$(direct_ssh_hint 'ssh: connect to host 34.83.189.193 port 22: Connection timed out' 34.83.189.193)"
-grep -qF 'tcp:22 on 34.83.189.193' <<<"$SSH_HINT" && pass || fail "hint: '$SSH_HINT'"
-
-it "a changed host key gets the exact command that clears it"
-SSH_HINT="$(direct_ssh_hint 'Host key verification failed.' 34.83.189.193)"
-grep -qF 'ssh-keygen -R 34.83.189.193 -f ~/.ssh/google_compute_known_hosts' <<<"$SSH_HINT" && pass || fail "hint: '$SSH_HINT'"
-
-it "a refused key points at the key, not the firewall"
-SSH_HINT="$(direct_ssh_hint 'jeff@34.83.189.193: Permission denied (publickey).' 34.83.189.193)"
-if grep -qF 'google_compute_engine' <<<"$SSH_HINT" && ! grep -qF 'tcp:22' <<<"$SSH_HINT"; then pass
-else fail "hint: '$SSH_HINT'"; fi
-
-it "an unrecognised failure gets no hint rather than a wrong one"
-eq "$(direct_ssh_hint 'kex_exchange_identification: read: Connection reset by peer' 34.83.189.193)" ""
-
-# Nothing executes the orchestrator (it runs against live GCP), so a syntax
-# error in it would first show up as a dead release leg.
-it "the linux-leg orchestrator parses"
-bash -n scripts/build-platforms-gcp-iap.sh 2>/dev/null && pass || fail "bash -n rejects scripts/build-platforms-gcp-iap.sh"
+# The orchestrators run against the build Mac, so a syntax error in one would
+# first show up as a dead release leg (the stubbed runs below cover the linux
+# leg's flow; this covers every line of both files).
+it "the linux-leg orchestrator and its Mac-side driver parse"
+if bash -n scripts/build-platforms-mac-linux.sh 2>/dev/null && bash -n scripts/mac-linux-vm.sh 2>/dev/null; then pass
+else fail "bash -n rejects scripts/build-platforms-mac-linux.sh or scripts/mac-linux-vm.sh"; fi
 
 it "the mac-leg orchestrator parses"
 bash -n scripts/build-platforms-tailnet.sh 2>/dev/null && pass || fail "bash -n rejects scripts/build-platforms-tailnet.sh"
@@ -910,7 +711,7 @@ if [ -n "$MAC_SYNC" ] && [ -n "$MAC_PRE" ] && [ -n "$MAC_ESAC" ] && [ -n "$MAC_P
 else fail "sync@${MAC_SYNC:-none} pre-check@${MAC_PRE:-none} esac@${MAC_ESAC:-none} post-reclaim@${MAC_POST:-none}"; fi
 
 # =============================================================================
-group "iap-helpers.sh -- background process-tree reaping"
+group "host-helpers.sh -- background process-tree reaping"
 # =============================================================================
 
 it "an empty pid is a no-op that succeeds"
@@ -934,20 +735,20 @@ kill_proc_tree "$KPT_PID"; KPT_RC=$?
 if [ "$KPT_RC" = "0" ] && ! kill -0 "$KPT_PID" 2>/dev/null; then pass
 else fail "rc=$KPT_RC, pid $KPT_PID still alive"; kill "$KPT_PID" 2>/dev/null; fi
 
-# The tunnel retry path reaps a gcloud that has usually exited already (a 4003
-# from a still-booting guest), so a dead pid must be a quiet success.
+# A reaper is often handed a job that has already exited (a timeout that
+# raced the job's own end), so a dead pid must be a quiet success.
 it "a job that has already exited is not an error"
 true & KPT_PID=$!
 sleep 1
 kill_proc_tree "$KPT_PID" && pass || fail "rc=$? for an exited job"
 
-# The real shape of the leak: the scoop gcloud shim is a /bin/sh script
-# running `cmd.exe /C gcloud.cmd`, and $! is that sh. This shim is built the
+# The real shape of the leak: a scoop shim is a /bin/sh script running
+# `cmd.exe /C <tool>.cmd`, and $! is that sh. This shim is built the
 # same way, and its cmd.exe leaf appends to a file about once a second -- so
 # the leaf is alive exactly as long as the file keeps growing. A plain `kill`
-# of the sh leaves it growing (the python.exe tunnels of the 2026-09-25 03:52
-# and 03:56 runs were still alive ten hours later). The loop is bounded, so a
-# regression leaks a process for a minute, not forever.
+# of the sh leaves it growing. The loop is bounded, so a
+# regression leaks a process for a minute, not forever. (The leak that found
+# this: two cloud-CLI tunnels of the 2026-09-25 runs still alive ten hours on.)
 it "a scoop-shaped shim tree (sh -> cmd.exe -> native leaf) is reaped whole"
 if [ -r "/proc/$$/winpid" ] && command -v cmd.exe >/dev/null 2>&1 \
    && command -v taskkill >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
@@ -1013,841 +814,1386 @@ else
 fi
 
 # =============================================================================
-group "iap-helpers.sh -- VM start: zone capacity, quota, fallback machine types"
+group "linux-vm-helpers.sh -- the linux leg's pure decisions"
 # =============================================================================
-# gcloud's stderr for the start that failed six times on 2026-09-30, verbatim,
-# and fed CRLF-terminated as gcloud on Windows prints it. The v0.17.1 release
-# stopped on this with the text thrown away and the log guessing.
-VMS_EXHAUSTED="$(cat <<'EOF'
-Starting instance(s) yaw-linux-builder...
-................................failed.
-ERROR: (gcloud.compute.instances.start) ---
-code: ZONE_RESOURCE_POOL_EXHAUSTED
-errorDetails:
-- help:
-    links:
-    - description: Troubleshooting documentation
-      url: https://cloud.google.com/compute/docs/resource-error
-- localizedMessage:
-    locale: en-US
-    message: A e2-highmem-4 VM instance is currently unavailable in the us-west1-b
-      zone. Alternatively, you can try your request again with a different VM hardware
-      configuration or at a later time. For more information, see the troubleshooting
-      documentation.
-- errorInfo:
-    domain: compute.googleapis.com
-    metadatas:
-      attachment: ''
-      vmType: e2-highmem-4
-      zone: us-west1-b
-      zonesAvailable: ''
-    reason: resource_availability
-message: The zone 'projects/yaw-labs-prod/zones/us-west1-b' does not have enough resources
-  available to fulfill the request.  Try a different zone, or try again later.
-EOF
-)"
-VMS_EXHAUSTED_CR="$(sed 's/$/\r/' <<<"$VMS_EXHAUSTED")"
-# The other capacity code, with a bare (unquoted) zonesAvailable: the body of
-# the 2026-09-28 13:48 operation in this project's operations log, laid out as
-# gcloud printed today's.
-VMS_DETAILS="$(cat <<'EOF'
-Starting instance(s) typed-arm-probe...
-................................failed.
-ERROR: (gcloud.compute.instances.start) ---
-code: ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS
-errorDetails:
-- help:
-    links:
-    - description: Troubleshooting documentation
-      url: https://cloud.google.com/compute/docs/resource-error
-- localizedMessage:
-    locale: en-US
-    message: A t2a-standard-2 VM instance is currently unavailable in the us-central1-f
-      zone. Consider trying your request in the us-central1-b, us-central1-a zone(s),
-      which currently has capacity to accommodate your request. Alternatively,
-      you can try your request again with a different VM hardware configuration
-      or at a later time. For more information, see the troubleshooting documentation.
-- errorInfo:
-    domain: compute.googleapis.com
-    metadatas:
-      attachment: ''
-      vmType: t2a-standard-2
-      zone: us-central1-f
-      zonesAvailable: us-central1-b,us-central1-a
-    reason: resource_availability
-message: The zone 'projects/yaw-labs-prod/zones/us-central1-f' does not have enough
-  resources available to fulfill the request.  'NULL:0/NULL:0/NULL:0 (state:STOCKOUT,
-  sub-state:STOCKOUT, resource type:compute)'.
-EOF
-)"
-VMS_DETAILS_CR="$(sed 's/$/\r/' <<<"$VMS_DETAILS")"
-# The HTTP-error shape gcloud prints for a synchronous refusal, with the
-# trailing blank line it ends on. Provenance, since the group's premise is
-# gcloud's own words: NOTFOUND is verbatim off a describe on this box
-# (2026-09-30); PERM is that text with start's verb (the wrapper is the same);
-# HTTP_CAPACITY is today's operation message in that wrapper; QUOTA, BADTYPE
-# and BACKEND are constructed from the documented API messages (none has ever
-# been logged here, and us-west1's CPU quotas leave no way to provoke one);
-# AUTH is the SDK's own text (core/credentials/store.py, exceptions.py:126);
-# INTERRUPTED is core/util/keyboard_interrupt.py:36.
-VMS_HTTP_CAPACITY=$'ERROR: (gcloud.compute.instances.start) Could not fetch resource:\r\n - The zone \'projects/yaw-labs-prod/zones/us-central1-a\' does not have enough resources available to fulfill the request.  Try a different zone, or try again later.\r\n\r\n'
-VMS_QUOTA=$'ERROR: (gcloud.compute.instances.start) Could not fetch resource:\r\n - Quota \'N2_CPUS\' exceeded.  Limit: 100.0 in region us-west1.\r\n\r\n'
-VMS_PERM=$'ERROR: (gcloud.compute.instances.start) Could not fetch resource:\r\n - Required \'compute.instances.start\' permission for \'projects/yaw-labs-prod/zones/us-west1-b/instances/yaw-linux-builder\'\r\n\r\n'
-VMS_NOTFOUND=$'ERROR: (gcloud.compute.instances.describe) Could not fetch resource:\r\n - The resource \'projects/yaw-labs-prod/zones/us-west1-b/instances/no-such-vm\' was not found\r\n\r\n'
-VMS_AUTH=$'ERROR: (gcloud.compute.instances.start) There was a problem refreshing your current auth tokens: (\'invalid_grant: Token has been expired or revoked.\', {\'error\': \'invalid_grant\'})\r\nPlease run:\r\n\r\n  $ gcloud auth login\r\n\r\nto obtain new access credentials.\r\n'
-VMS_BADTYPE=$'ERROR: (gcloud.compute.instances.set-machine-type) Could not fetch resource:\r\n - Invalid value for field \'resource.machineType\': \'zones/us-west1-b/machineTypes/c3-highmem-4\'. Machine type with name \'c3-highmem-4\' does not exist in zone \'us-west1-b\'.\r\n\r\n'
-# What gcloud prints on Windows for a Ctrl-C (core/util/keyboard_interrupt.py),
-# where it then exits 2 instead of dying of the signal.
-VMS_INTERRUPTED=$'Starting instance(s) yaw-linux-builder...\r\n\r\n\r\nCommand killed by keyboard interrupt\r\n'
-VMS_BACKEND=$'ERROR: (gcloud.compute.instances.start) Could not fetch resource:\r\n - Internal error. Please try again or contact support.\r\n\r\n'
+# The linux leg builds in an x86_64 Debian 12 container in a Lima VM on the
+# build Mac, and gates the binary on the newest GLIBC_ symbol it needs. These
+# are the decisions that gate reads, and the shapes the Mac's answers and the
+# knobs that reach its shell must have.
+# shellcheck source=lib/linux-vm-helpers.sh
+. scripts/lib/linux-vm-helpers.sh
 
-it "today's exhausted-zone stderr, CRs and all, reads as capacity"
-eq "$(vm_start_verdict "$VMS_EXHAUSTED_CR")" "capacity"
-
-it "the _WITH_DETAILS exhaustion of 2026-09-28 reads as capacity too"
-eq "$(vm_start_verdict "$VMS_DETAILS_CR")" "capacity"
-
-it "the HTTP-error shape of the capacity message reads as capacity"
-eq "$(vm_start_verdict "$VMS_HTTP_CAPACITY")" "capacity"
-
-it "a CPU-family quota reads as quota, not capacity"
-eq "$(vm_start_verdict "$VMS_QUOTA")" "quota"
-
-it "a missing permission and a missing instance are permanent, in the shape gcloud prints them"
-eq "$(vm_start_verdict "$VMS_PERM")-$(vm_start_verdict "$VMS_NOTFOUND")" "permanent-permanent"
-
-it "expired credentials are permanent -- no retry refreshes them"
-eq "$(vm_start_verdict "$VMS_AUTH")" "permanent"
-
-it "a machine type the API rejects is unsupported: out for the run, not the end of it"
-eq "$(vm_start_verdict "$VMS_BADTYPE")" "unsupported"
-
-it "a Ctrl-C that gcloud turned into an exit reads as interrupted, above every other verdict"
-eq "$(vm_start_verdict "$VMS_INTERRUPTED")-$(vm_start_verdict "$VMS_INTERRUPTED$VMS_EXHAUSTED_CR")" "interrupted-interrupted"
-
-it "a backend error, a bare failed line and empty text are unknown -- retried, never fatal"
-# A variable, not an inline $'...': beside the '' below, inside one "$(...)",
-# bash mis-nests the quotes and skips the whole line with a parse error.
-VMS_FAILED_LINE=$'................failed.\r\n'
-eq "$(vm_start_verdict "$VMS_BACKEND")-$(vm_start_verdict "$VMS_FAILED_LINE")-$(vm_start_verdict "")" "unknown-unknown-unknown"
-
-it "the operation error's folded message comes back as one CR-free line, not the localized one"
-eq "$(gcloud_error_message "$VMS_EXHAUSTED_CR")" \
-   "The zone 'projects/yaw-labs-prod/zones/us-west1-b' does not have enough resources available to fulfill the request.  Try a different zone, or try again later."
-
-it "a message folded over three lines joins the same way"
-eq "$(gcloud_error_message "$VMS_DETAILS_CR")" \
-   "The zone 'projects/yaw-labs-prod/zones/us-central1-f' does not have enough resources available to fulfill the request.  'NULL:0/NULL:0/NULL:0 (state:STOCKOUT, sub-state:STOCKOUT, resource type:compute)'."
-
-it "the HTTP-error shape yields its bullet, trailing blank line and all"
-eq "$(gcloud_error_message "$VMS_NOTFOUND")" \
-   "The resource 'projects/yaw-labs-prod/zones/us-west1-b/instances/no-such-vm' was not found"
-
-it "text with neither shape yields its last non-blank line, CR stripped"
-eq "$(gcloud_error_message $'ERROR: something else\r\n\r\n')" "ERROR: something else"
-
-it "empty text yields no message, non-zero"
-gcloud_error_message "" >/dev/null 2>&1 && fail "invented a message" || pass
-
-it "a quoted, empty zonesAvailable is a clean miss"
-vm_start_zones_available "$VMS_EXHAUSTED_CR" >/dev/null 2>&1 && fail "read zones off an empty field" || pass
-
-it "a bare zonesAvailable list comes back as it is, CR-free"
-eq "$(vm_start_zones_available "$VMS_DETAILS_CR")" "us-central1-b,us-central1-a"
-
-it "a quoted zonesAvailable list loses its quotes"
-eq "$(vm_start_zones_available $'    metadatas:\r\n      zonesAvailable: \'us-west1-a,us-west1-c\'\r\n    reason: resource_availability\r')" "us-west1-a,us-west1-c"
-
-it "the VM's own type is walked first, then the fallbacks in order"
-eq "$(vm_start_types $'e2-highmem-4\r' "n2-highmem-4 n2d-highmem-4" | tr '\n' ' ')" "e2-highmem-4 n2-highmem-4 n2d-highmem-4 "
-
-it "a fallback that repeats the VM's type, or another fallback, is walked once"
-eq "$(vm_start_types e2-highmem-4 "n2-highmem-4 e2-highmem-4 n2-highmem-4 n1-highmem-4" | tr '\n' ' ')" "e2-highmem-4 n2-highmem-4 n1-highmem-4 "
-
-it "an empty fallback list walks the VM's own type alone"
-eq "$(vm_start_types e2-highmem-4 "" | tr '\n' ' ')" "e2-highmem-4 "
-
-it "a blank current type is refused -- there would be nothing to restore to"
-vm_start_types "" "n2-highmem-4" >/dev/null 2>&1 && fail "walked types with no original" || pass
-
-# --- zone fallback: where a builder whose zone stayed out of capacity goes ----
-# A `zones list --format='value(name,status,region.basename())'` reading for
-# us-west1, tab-separated and CRLF-terminated as gcloud on Windows prints it,
-# with one zone DOWN: a clone must never be tried there.
-VMS_ZONES=$'us-west1-a\tUP\tus-west1\r\nus-west1-b\tUP\tus-west1\r\nus-west1-c\tUP\tus-west1\r\nus-west1-d\tDOWN\tus-west1\r\n'
-
-it "the region's other UP zones are the candidates, in list order, never the builder's own"
-eq "$(zone_fallback_candidates us-west1-b "" us-west1 "$VMS_ZONES" | tr '\n' ' ')" "us-west1-a us-west1-c "
-
-it "a zone of another region in the reading is not a candidate"
-eq "$(zone_fallback_candidates us-west1-b "" us-west1 "$VMS_ZONES"$'us-east1-b\tUP\tus-east1\r\n' | tr '\n' ' ')" "us-west1-a us-west1-c "
-
-it "an operator's OAM_GCP_FALLBACK_ZONES wins over the reading, minus the builder's zone and repeats"
-eq "$(zone_fallback_candidates us-west1-b "us-west1-c us-west1-b us-west1-a us-west1-c" us-west1 "$VMS_ZONES" | tr '\n' ' ')" "us-west1-c us-west1-a "
-
-it "no candidate at all is a clean miss, non-zero"
-zone_fallback_candidates us-west1-b "" us-west1 $'us-west1-b\tUP\tus-west1\r\nus-west1-c\tDOWN\tus-west1\r\n' >/dev/null 2>&1 && fail "invented a zone" || pass
-
-it "zone names are checked by shape, so a typo in OAM_GCP_FALLBACK_ZONES fails before any VM is touched"
-VMS_ZONE_SHAPES=""
-for z in us-west1-c northamerica-northeast1-a $'us-west1-c\r'; do gce_zone_name_valid "$z" || VMS_ZONE_SHAPES="$VMS_ZONE_SHAPES refused:${z//$'\r'/CR}"; done
-for z in us-west1 US-WEST1-C 'us-west1-c;rm' 'us-west1-c us-west1-a' ''; do gce_zone_name_valid "$z" && VMS_ZONE_SHAPES="$VMS_ZONE_SHAPES accepted:'$z'"; done
-if [ -z "$VMS_ZONE_SHAPES" ]; then pass; else fail "wrong verdicts:$VMS_ZONE_SHAPES"; fi
-
-# --- wiring: the orchestrator must decide through the lib ----------------------
-# Comment-stripped: the block above the loop describes the old loop, and a
-# negative grep must not match a description.
-VMS_SRC="$(sed 's/#.*//' scripts/build-platforms-gcp-iap.sh)"
-
-it "build-platforms-gcp-iap.sh starts the VM through the lib's verdicts and type walk"
-VMS_WIRE=""
-for want in 'vm_start_types "$ORIGINAL_MACHINE_TYPE"' 'vm_start_verdict "$start_err"' \
-            'vm_start_verdict "$set_err"' 'gcloud_error_message "$start_err"' \
-            'vm_start_zones_available "$start_err"' \
-            '${OAM_GCP_FALLBACK_MACHINE_TYPES-' 'OAM_VM_START_BUDGET_S:-1800' \
-            'remote_step_verdict "$attempt" "$REMOTE_STEP_ATTEMPTS"' 'reconnect_builder' \
-            'start_vm_walk "$VM_STATUS"' 'restart_builder "$status"' 'OAM_GCP_ZONE_FALLBACK:-1' \
-            'gce_zone_name_valid "$fz"' 'zone_fallback_candidates "$origin_zone" "$FALLBACK_ZONES"' \
-            'machine-images create "$img" --source-instance="$origin"' '--source-machine-image="$img"' \
-            '--filter="name~^${INSTANCE}\$"' "trap 'stop_vm; restore_machine_type || true; delete_machine_image' EXIT" \
-            'cleanup() { stop_iap_tunnel; reattach_stop_schedules; stop_vm; restore_machine_type || true; delete_machine_image; }' \
-            'vm_start_verdict "$img_err"' 'clone_leftover "$clone" "$zone"' 'restore_machine_type || origin_left="$UNRESTORED_TYPE"' \
-            'remote_step_postmortem "$log" "$attempt" "$reruns" "$restarts"' '[ "${fz%-*}" = "${ZONE%-*}" ]'; do
-  grep -qF -- "$want" <<<"$VMS_SRC" || VMS_WIRE="$VMS_WIRE [$want]"
+it "version_le compares field by field as numbers, not as text"
+VL_BAD=""
+for pair in "2.34 2.34" "2.17 2.34" "2.9 2.17" "2.34 2.34.0" "2.34.0 2.34" "1.99 2.0" "2.3.4 2.34"; do
+  version_le ${pair% *} ${pair#* } || VL_BAD="$VL_BAD [$pair]"
 done
-if [ -z "$VMS_WIRE" ]; then pass; else fail "build-platforms-gcp-iap.sh no longer carries:$VMS_WIRE"; fi
+for pair in "2.35 2.34" "2.34.1 2.34" "2.17 2.9" "3.0 2.99" "2.100 2.34"; do
+  version_le ${pair% *} ${pair#* } && VL_BAD="$VL_BAD ![$pair]"
+done
+if [ -z "$VL_BAD" ]; then pass; else fail "wrong verdict for:$VL_BAD"; fi
 
-# The reconnect and the restart are CALLED from the retry path, not merely
-# defined: a bare `reconnect_builder` line on its own, and `restart_builder
-# "$status"`, inside remote_step_run.
-it "remote_step_run reconnects, or restarts the VM, before it runs a dropped step again"
-VMS_RUN_BODY="$(awk '/^remote_step_run\(\)/ { f = 1 } f { print } f && /^}/ { exit }' scripts/build-platforms-gcp-iap.sh)"
-if grep -qE '^[[:space:]]+reconnect_builder[[:space:]]*$' <<<"$VMS_RUN_BODY" \
-   && grep -qE '^[[:space:]]+restart_builder "\$status"[[:space:]]*$' <<<"$VMS_RUN_BODY" \
-   && grep -qE 'remote_step_verdict .*"\$rc"' <<<"$VMS_RUN_BODY" \
-   && grep -qE '\|\| rc=\$\?' <<<"$VMS_RUN_BODY"; then pass
-else fail "remote_step_run must capture ssh's exit into rc, decide with it, and call reconnect_builder or restart_builder before the next attempt; body:$(printf '\n  %s' "$VMS_RUN_BODY")"; fi
+# "I could not tell" must never read as "old enough": a reading that is not a
+# version is its own status, which the gate fails on.
+it "version_le answers 2 for anything that is not digits and dots, on either side"
+VL_BAD=""
+for pair in "2.x|2.34" "2.34|" "|2.34" "GLIBC_2.34|2.34" "2.34 |2.34" "2..34|2.34" "2.34|v2.34" "-1|2.34"; do
+  version_le "${pair%|*}" "${pair#*|}"; rc=$?
+  [ "$rc" = "2" ] || VL_BAD="$VL_BAD [$pair]=$rc"
+done
+if [ -z "$VL_BAD" ]; then pass; else fail "not refused:$VL_BAD"; fi
 
-it "the VM start neither discards gcloud's stderr nor retries a fixed six times"
-if grep -E 'instances start ' <<<"$VMS_SRC" | grep -q '2>/dev/null' \
-   || ! grep -E 'instances start ' <<<"$VMS_SRC" | grep -q '2>&1' \
-   || grep -q 'for VM_ATTEMPT in 1 2 3 4 5 6' <<<"$VMS_SRC"; then
-  fail "the blind six-attempt start loop is back"
-else pass; fi
+it "a leading zero is a decimal field, not octal"
+if version_le 2.08 2.9 && version_le 2.09 2.10; then pass; else fail "2.08/2.09 misread"; fi
 
-# The restore needs the VM TERMINATED, so the type change has to be undone by an
-# EXIT trap armed BEFORE the first set-machine-type runs, and in cleanup() only
-# after the stop. The trap the walk arms also stops what the walk started and
-# deletes the zone fallback's image: the first start runs before cleanup() is
-# the trap, and the fallback with it. Both guard the restore with `|| true`,
-# since under `set -e` its non-zero status would end the trap right there.
-# Asserted by line order, since that is the property.
-it "the walk's trap (stop, restore, image) is armed before the first set-machine-type, and cleanup stops before it restores"
-VMS_TRAP_LINE="$(grep -nF "trap 'stop_vm; restore_machine_type || true; delete_machine_image' EXIT" scripts/build-platforms-gcp-iap.sh | head -1 | cut -d: -f1)"
-VMS_SET_LINE="$(grep -n -- '--machine-type="$vm_type"' scripts/build-platforms-gcp-iap.sh | head -1 | cut -d: -f1)"
-VMS_STOP_DEF_LINE="$(grep -n '^stop_vm() {' scripts/build-platforms-gcp-iap.sh | head -1 | cut -d: -f1)"
-VMS_IMG_DEF_LINE="$(grep -n '^delete_machine_image() {' scripts/build-platforms-gcp-iap.sh | head -1 | cut -d: -f1)"
-if [ -n "$VMS_TRAP_LINE" ] && [ -n "$VMS_SET_LINE" ] && [ "$VMS_TRAP_LINE" -lt "$VMS_SET_LINE" ] \
-   && [ -n "$VMS_STOP_DEF_LINE" ] && [ "$VMS_STOP_DEF_LINE" -lt "$VMS_TRAP_LINE" ] \
-   && [ -n "$VMS_IMG_DEF_LINE" ] && [ "$VMS_IMG_DEF_LINE" -lt "$VMS_TRAP_LINE" ] \
-   && grep -qF 'stop_vm; restore_machine_type || true; delete_machine_image; }' scripts/build-platforms-gcp-iap.sh; then pass
-else fail "order is stop_vm@${VMS_STOP_DEF_LINE:-?} delete_machine_image@${VMS_IMG_DEF_LINE:-?} trap@${VMS_TRAP_LINE:-?} set-machine-type@${VMS_SET_LINE:-?}; the trap's functions must be defined above it, and cleanup must run stop_vm, then restore_machine_type || true, then delete_machine_image"; fi
+# The shape objdump -T prints for the shipped binary: one line per dynamic
+# symbol, the version in parentheses, with GLIBC_PRIVATE and a non-glibc
+# version mixed in.
+GV_OBJDUMP=$'oam:     file format elf64-x86-64\n\nDYNAMIC SYMBOL TABLE:\n0000000000000000      DF *UND*\t0000000000000000 (GLIBC_2.2.5) malloc\r\n0000000000000000      DF *UND*\t0000000000000000 (GLIBC_2.34)  pthread_create\n0000000000000000      DF *UND*\t0000000000000000 (GLIBC_2.17)  clock_gettime\n0000000000000000      DO *UND*\t0000000000000000 (GLIBC_PRIVATE) _dl_argv\n0000000000000000      DF *UND*\t0000000000000000 (GCC_3.0)     _Unwind_Resume\n0000000000000000      DF *UND*\t0000000000000000 (GLIBC_2.9)   pipe2'
+it "glibc_max_version picks the newest GLIBC_ version, numerically, CRs and all"
+eq "$(glibc_max_version "$GV_OBJDUMP")" "2.34"
 
-# =============================================================================
-group "build-platforms-gcp-iap.sh -- the start loop against a stubbed gcloud"
-# =============================================================================
-# The loop itself, run for real under the script's `set -euo pipefail`, with
-# gcloud and ssh replaced by stubs that log every call and answer from a state
-# directory: a start on the "good" type turns the VM RUNNING, any other start
-# prints today's stderr and fails, a stop turns it TERMINATED, set-machine-type
-# records the type. Nothing here reaches GCP. TMPDIR is private to the run.
-VMS_BIN="$SUITE_TMP/vms-bin"; VMS_TMP="$SUITE_TMP/vms-tmp"; VMS_STATE="$SUITE_TMP/vms-state"
-mkdir -p "$VMS_BIN" "$VMS_TMP" "$VMS_STATE"
-# CR on every line, as gcloud prints it: sed into the file, since printf '%s\r\n'
-# would put one CR after the last line only, and $(...) drops a trailing CRLF.
-sed 's/$/\r/' <<<"$VMS_EXHAUSTED" > "$VMS_STATE/exhausted.txt"
-printf '%s' "$VMS_QUOTA" > "$VMS_STATE/quota.txt"
-cat > "$VMS_BIN/gcloud" <<EOF
+it "glibc_max_version reads the driver's one-version-per-line answer the same way"
+eq "$(glibc_max_version $'GLIBC_2.14\nGLIBC_2.2.5\nGLIBC_2.38\nGLIBC_2.9')" "2.38"
+
+it "no GLIBC_ version at all (objdump failed, the wrong file) is a miss, not an empty max"
+GV_OUT="$(glibc_max_version $'GLIBC_PRIVATE\nGCC_3.0\nnot an elf')"; GV_RC=$?
+if [ "$GV_RC" != "0" ] && [ -z "$GV_OUT" ] && ! glibc_max_version "" >/dev/null; then pass
+else fail "rc=$GV_RC out='$GV_OUT'"; fi
+
+it "the default floor admits the max a Debian 12 build has, and refuses one a newer distro would bring"
+if version_le "$(glibc_max_version "$GV_OBJDUMP")" 2.34 \
+   && ! version_le "$(glibc_max_version $'(GLIBC_2.36) arc4random\n(GLIBC_2.34) x')" 2.34; then pass
+else fail "the 2.34 floor misjudged a reading"; fi
+
+it "instance and container names: letters, digits and inner hyphens only"
+LN_BAD=""
+for n in oam-linux oam linux2 a a-b-c 0x; do lima_name_valid "$n" || LN_BAD="$LN_BAD [$n]"; done
+for n in "" -oam oam- "oam linux" 'oam;rm' 'oam$x' oam.linux oam_linux "oam"$'\n'; do lima_name_valid "$n" && LN_BAD="$LN_BAD ![$n]"; done
+if [ -z "$LN_BAD" ]; then pass; else fail "wrong verdict for:$LN_BAD"; fi
+
+it "kv_field reads one key of the Mac's answer, CRs stripped, the first line that has it"
+KV=$'limactl=2.2.1\r\narch=arm64\r\nstatus=Running\r\nstatus=Stopped\r\n'
+eq "$(kv_field "$KV" status)/$(kv_field "$KV" limactl)/$(kv_field "$KV" arch)" "Running/2.2.1/arm64"
+
+it "kv_field misses a key that is absent or only a prefix of another"
+if ! kv_field "$KV" rosetta >/dev/null && ! kv_field $'statusx=1' status >/dev/null && ! kv_field "" status >/dev/null; then pass
+else fail "invented a field"; fi
+
+it "uint_valid takes 1 and up, nothing else"
+UV_BAD=""
+for n in 1 4 80 128; do uint_valid "$n" || UV_BAD="$UV_BAD [$n]"; done
+for n in "" 0 00 04 -1 4.5 "4 " four; do uint_valid "$n" && UV_BAD="$UV_BAD ![$n]"; done
+if [ -z "$UV_BAD" ]; then pass; else fail "wrong verdict for:$UV_BAD"; fi
+
+# The driver puts the pinned Node first on PATH under the path it composes
+# itself, and prep provisions it where node-pin.sh says. The two must name the
+# same directory, or every dispatch falls back to Debian's node 18 -- which is
+# what failed the e2e NUL-byte pipe test on the first manual run.
+it "the driver's PATH names the directory node-pin.sh provisions into, first"
+ML_PIN_DIR="$( OAM_NODE_CACHE=/home/builder/.cache/oam-node; . scripts/lib/node-pin.sh; node_pin_dir 22.22.2 linux-x64 )"
+ML_DRV_PATH="$(sed -n '/^do_run() {/,/^}/p' scripts/mac-linux-vm.sh | grep -o 'PATH="[^"]*"' | head -1)"
+ML_DRV_FIRST="${ML_DRV_PATH#PATH=\"}"; ML_DRV_FIRST="${ML_DRV_FIRST%%:*}"
+ML_DRV_FIRST="${ML_DRV_FIRST//\$h//home/builder}"; ML_DRV_FIRST="${ML_DRV_FIRST//\$nv/22.22.2}"
+eq "$ML_DRV_FIRST" "$ML_PIN_DIR/bin"
+
+it "the container is x86_64, rootless, uid 1000, host network, with its own resolv.conf"
+ML_CTR="$(sed -n '/^do_container() {/,/^}/p' scripts/mac-linux-vm.sh)"
+ML_MISS=""
+for want in '--platform=linux/amd64' '--network host' 'resolv.conf:/etc/resolv.conf:ro' 'useradd -u 1000' \
+            '[ "$arch" = "x86_64" ]' 'echo $spec > /etc/oam-spec' '--ulimit "nofile='; do
+  grep -qF -- "$want" <<<"$ML_CTR" || ML_MISS="$ML_MISS [$want]"
+done
+grep -q 'sudo' <<<"$ML_CTR" && ML_MISS="$ML_MISS [sudo appears: nerdctl is rootless]"
+grep -qF -- '-u 1000' <<<"$(sed -n '/^do_run() {/,/^}/p' scripts/mac-linux-vm.sh)" || ML_MISS="$ML_MISS [run as uid 1000]"
+if [ -z "$ML_MISS" ]; then pass; else fail "missing:$ML_MISS"; fi
+
+# The driver runs on the Mac with arguments that came through its shell. The
+# orchestrator validates them first; the driver refuses a bad shape again
+# before anything reaches limactl. Run here, where no limactl exists: each
+# case must die on the shape, not on a missing command.
+it "the Mac-side driver refuses a bad verb, instance, dispatch, version or path before touching Lima"
+ML_DRV_BAD=""
+for argv in "bogus oam-linux" "status oam;x" "status" "run oam-linux gc;rm 22.22.2" "run oam-linux prep 22" \
+            "fetch oam-linux ../../etc/passwd" "fetch oam-linux /etc/passwd" "glibc oam-linux a\$b" \
+            "sync oam-linux ../x.tar.gz" "provision oam-linux 4 five 80"; do
+  # shellcheck disable=SC2086  # word-split on purpose: each case is an argv
+  out="$(bash scripts/mac-linux-vm.sh $argv 2>&1 </dev/null)"; rc=$?
+  if [ "$rc" = "0" ] || ! grep -q 'FATAL' <<<"$out" || grep -q 'limactl: command not found' <<<"$out"; then
+    ML_DRV_BAD="$ML_DRV_BAD [$argv: rc=$rc ${out//$'\n'/ }]"
+  fi
+done
+if [ -z "$ML_DRV_BAD" ]; then pass; else fail "$ML_DRV_BAD"; fi
+
+# The driver's VM-side scripts, run for real here against a fake limactl
+# (which runs the `bash -s` it is handed locally) and a fake nerdctl that
+# answers from a state directory and logs every call. Nothing reaches a Mac
+# or a VM; what is exercised is the shell the driver ships into the VM --
+# its quoting, its order and its failure paths.
+MD="$SUITE_TMP/mldrv"
+mkdir -p "$MD/bin" "$MD/st" "$MD/home"
+cat > "$MD/bin/limactl" <<EOF
 #!/bin/bash
-S="$VMS_STATE"
-printf '%s\n' "\$*" >> "\$S/log"
-a="\$*"
-# State reads are bash builtins, not cat: under a full ci-local.sh run one
-# forked cat came back empty (2026-10-04), and the orchestrator read that as
-# an unreadable VM. The orchestrator now re-asks a blank describe; the stub
-# still does not fork for a one-line file. blank-status-once makes the next
-# status describe answer blank, exit 0 -- the shape that bit.
-rd(){ local l; IFS= read -r l < "\$1" || true; printf '%s\n' "\$l"; }
-# Once the zone fallback has made a clone, a call that names it reads and
-# writes the clone's own status, type and IP; every other call is the
-# original's, which the clone must leave exactly as it was.
-ST="\$S/status"; TY="\$S/type"; IP=203.0.113.9
-if [ -e "\$S/clone" ]; then
-  case "\$a" in *" \$(rd "\$S/clone") "*) ST="\$S/clone-status"; TY="\$S/clone-type"; IP=203.0.113.10 ;; esac
-fi
-# An instance that moved zones: nothing answers in the old zone but the list.
-if [ -e "\$S/moved" ]; then
-  case "\$a" in
-    *"instances list"*"name~^yaw-linux-builder\$"*) printf 'us-west1-c\r\n'; exit 0 ;;
-    *"--zone=us-west1-b"*)
-      printf 'ERROR: (gcloud.compute.instances.describe) Could not fetch resource:\r\n - The resource '"'"'projects/yaw-labs-prod/zones/us-west1-b/instances/yaw-linux-builder'"'"' was not found\r\n\r\n' >&2; exit 1 ;;
-  esac
-fi
-case "\$a" in
-  *"instances describe"*"value(name)"*)                 echo yaw-linux-builder ;;
-  *"instances describe"*"value(status)"*)
-    if [ -e "\$S/blank-status-once" ]; then rm -f "\$S/blank-status-once"; exit 0; fi
-    # stopping-for=<n>: the next n status reads of the ORIGINAL answer STOPPING
-    # (a stop in progress -- the previous run's --async stop, a schedule's),
-    # then the state file speaks again. A clone's reads never go through it.
-    if [ "\$ST" = "\$S/status" ] && [ -e "\$S/stopping-for" ]; then
-      n="\$(rd "\$S/stopping-for")"
-      if [ "\${n:-0}" -gt 0 ] 2>/dev/null; then echo \$((n - 1)) > "\$S/stopping-for"; echo STOPPING; exit 0; fi
-    fi
-    rd "\$ST" ;;
-  *"instances describe"*"machineType.basename()"*)      rd "\$TY" ;;
-  *"instances describe"*"resourcePolicies"*)            echo ;;
-  *"instances describe"*"natIP"*)                       echo "\$IP" ;;
-  # The preflight's lookup for a clone an earlier run left behind: one,
-  # stopped in us-west1-a, when leftover-clone says so; else nothing.
-  *"instances list"*"-[a-z]+-[a-z]+[0-9]+-[a-z]\$"*)
-    if [ -e "\$S/leftover-clone" ]; then printf 'yaw-linux-builder-us-west1-a\tus-west1-a\tTERMINATED\r\n'; fi ;;
-  *"instances set-machine-type"*)
-    t="\${a##*--machine-type=}"; t="\${t%% *}"
-    # reject-set-<type>: the API refuses the type. interrupt-set-<type>: the
-    # change is applied, then gcloud reports a Ctrl-C the way Windows sees it.
-    if [ -e "\$S/reject-set-\$t" ]; then
-      printf "ERROR: (gcloud.compute.instances.set-machine-type) Could not fetch resource:\r\n - Invalid value for field 'resource.machineType': 'zones/us-west1-b/machineTypes/\$t'.\r\n\r\n" >&2; exit 1
-    fi
-    echo "\$t" > "\$TY"
-    if [ -e "\$S/interrupt-set-\$t" ]; then printf '\n\nCommand killed by keyboard interrupt\n' >&2; exit 2; fi ;;
-  *"instances start"*)
-    if [ "\$(rd "\$TY")" = "\$(rd "\$S/good-type")" ]; then echo RUNNING > "\$ST"
-    elif [ -e "\$S/start-quota" ]; then cat "\$S/quota.txt" >&2; exit 1
-    else cat "\$S/exhausted.txt" >&2; exit 1; fi ;;
-  *"instances stop"*)              echo 'Stopping instance(s) yaw-linux-builder...' >&2; echo TERMINATED > "\$ST" ;;
-  *"get-serial-port-output"*)      echo 'Started ssh.service - OpenBSD Secure Shell server.' ;;
-  # The postmortem's question after a drop -- the newest stop operation on
-  # the instance, insertTime and user -- answered as the 2026-09-25 schedule
-  # stop read in the operations log.
-  *"operations list"*)
-    printf '2026-10-04T03:00:00.000-07:00\tservice-123456789@compute-system.iam.gserviceaccount.com\r\n' ;;
-  # The zone fallback. zones=<names> is what \`zones list\` reports, each UP in
-  # us-west1 unless suffixed :DOWN; machine-images create records the image
-  # (interrupt-image: records it, then reports a Ctrl-C the way Windows sees
-  # it); instances create succeeds only in the zone clone-ok-zone names, and
-  # from then on the clone exists -- RUNNING, on the type asked for -- for
-  # every later call that names it; in the zone interrupt-create-zone names
-  # the clone comes up the same way but gcloud reports a Ctrl-C (the request
-  # went through, the answer did not); deny-create refuses every create for a
-  # missing permission; elsewhere the create is refused for capacity, and
-  # with leftover-clone set, us-west1-a already holds the earlier clone.
-  *"zones list"*)
-    for z in \$(rd "\$S/zones" 2>/dev/null); do
-      st=UP; case "\$z" in *:*) st="\${z#*:}"; z="\${z%%:*}" ;; esac
-      printf '%s\t%s\tus-west1\r\n' "\$z" "\$st"
-    done ;;
-  *"machine-images create"*)
-    i="\${a##*machine-images create }"; i="\${i%% *}"; echo "\$i" > "\$S/image"
-    if [ -e "\$S/interrupt-image" ]; then printf '\n\nCommand killed by keyboard interrupt\n' >&2; exit 2; fi
-    echo "Created [https://www.googleapis.com/compute/v1/projects/yaw-labs-prod/global/machineImages/\$i]." >&2 ;;
-  *"machine-images delete"*)       rm -f "\$S/image" ;;
-  *"instances create"*)
-    n="\${a##*instances create }"; n="\${n%% *}"
-    z="\${a##*--zone=}"; z="\${z%% *}"
-    t="\${a##*--machine-type=}"; t="\${t%% *}"
-    if [ -e "\$S/leftover-clone" ] && [ "\$n" = "yaw-linux-builder-us-west1-a" ]; then
-      printf "ERROR: (gcloud.compute.instances.create) Could not fetch resource:\r\n - The resource 'projects/yaw-labs-prod/zones/us-west1-a/instances/\$n' already exists\r\n\r\n" >&2; exit 1
-    elif [ -e "\$S/deny-create" ]; then
-      printf "ERROR: (gcloud.compute.instances.create) Could not fetch resource:\r\n - Required 'iam.serviceAccounts.actAs' permission for 'projects/yaw-labs-prod/serviceAccounts/123456789-compute@developer.gserviceaccount.com'\r\n\r\n" >&2; exit 1
-    elif [ -e "\$S/interrupt-create-zone" ] && [ "\$z" = "\$(rd "\$S/interrupt-create-zone")" ]; then
-      echo "\$n" > "\$S/clone"; echo RUNNING > "\$S/clone-status"; echo "\$t" > "\$S/clone-type"
-      printf '\n\nCommand killed by keyboard interrupt\n' >&2; exit 2
-    elif [ -e "\$S/clone-ok-zone" ] && [ "\$z" = "\$(rd "\$S/clone-ok-zone")" ]; then
-      echo "\$n" > "\$S/clone"; echo RUNNING > "\$S/clone-status"; echo "\$t" > "\$S/clone-type"
-    else cat "\$S/exhausted.txt" >&2; exit 1; fi ;;
-  *) echo "stub gcloud: unexpected call: \$a" >&2; exit 97 ;;
+# limactl shell --workdir / <instance> bash -s [args...]
+[ "\$1" = "shell" ] || { echo "fake limactl: unexpected: \$*" >&2; exit 97; }
+shift 4
+exec "\$@"
+EOF
+cat > "$MD/bin/nerdctl" <<EOF
+#!/bin/bash
+S="$MD/st"
+echo "\$*" >> "\$S/log"
+case "\$1" in
+  info) exit 0 ;;
+  container)
+    case "\$2" in
+      ls) [ -f "\$S/names" ] && cat "\$S/names"; exit 0 ;;
+      inspect) [ -f "\$S/inspect-fail" ] && { echo "inspect: containerd not ready" >&2; exit 1; }; cat "\$S/running"; exit 0 ;;
+    esac ;;
+  start) echo true > "\$S/running"; exit 0 ;;
+  rm) rm -f "\$S/names"; echo absent > "\$S/running"; exit 0 ;;
+  run) echo "\$*" > "\$S/run-args"; echo test-build > "\$S/names"; echo true > "\$S/running"
+       cp "\$S/resolv-after-run" "\$S/resolv"; exit 0 ;;
+  exec)
+    shift
+    while :; do case "\$1" in -u|-w|-e) shift 2 ;; -i) shift ;; *) break ;; esac; done
+    shift  # the container
+    case "\$1" in
+      cat) [ "\$2" = /etc/oam-spec ] && { cat "\$S/spec" 2>/dev/null; exit 0; } ;;
+      pgrep) [ -f "\$S/procs" ]; exit \$? ;;
+      pkill) rm -f "\$S/procs"; exit 0 ;;
+      awk) awk "\$2" "\$S/resolv"; exit 0 ;;
+      uname) echo x86_64; exit 0 ;;
+      sh)
+        case "\$3" in
+          "ulimit -Hn") cat "\$S/nofile"; exit 0 ;;
+          *"> /etc/oam-spec") set -- \$3; echo "\$2" > "\$S/spec"; exit 0 ;;
+          *) exit 0 ;;
+        esac ;;
+      bash) echo "build-remote \$3" >> "\$S/built"; exit 0 ;;
+    esac ;;
 esac
+echo "fake nerdctl: unexpected: \$*" >&2; exit 97
 EOF
-# ssh: by default one permanent failure, so a run ends at the connect step
-# with the start walk already judged. ssh-mode=builder answers as the builder
-# would -- the probe's `true`, the sync's extract, df, each build-remote.sh
-# dispatch -- and drops the next ssh-drop dispatches the way the 2026-09-25
-# schedule stop looked from here (OpenSSH's closing line, exit 255, the VM
-# TERMINATED behind it -- or in the state drop-status names, one word per
-# drop in turn; drop-stopping-for=<n> arms the gcloud stub's stopping-for at
-# the drop, for a stop still in progress behind it); fail-step-<dispatch>
-# makes that dispatch exit 1, a real failure that ends a run where a case
-# wants it to. Every call lands in the same log as gcloud's, so an order can
-# be asserted across both.
-cat > "$VMS_BIN/ssh" <<EOF
-#!/bin/bash
-S="$VMS_STATE"
-printf 'ssh %s\n' "\$*" >> "\$S/log"
-rd(){ local l; IFS= read -r l < "\$1" || true; printf '%s\n' "\$l"; }
-[ -e "\$S/ssh-mode" ] && [ "\$(rd "\$S/ssh-mode")" = "builder" ] || { echo 'Host key verification failed.' >&2; exit 255; }
-cmd="\${@: -1}"
-case "\$cmd" in
-  true) exit 0 ;;
-  "df -BG --output=avail /") printf 'Avail\n100G\n' ;;
-  *"tar xzf"*) exit 0 ;;
-  *build-remote.sh*)
-    d="\${cmd##* }"
-    left="\$(rd "\$S/ssh-drop" 2>/dev/null)"
-    if [ -n "\$left" ] && [ "\$left" -gt 0 ]; then
-      echo \$((left - 1)) > "\$S/ssh-drop"
-      echo "[remote] \$d: running..."
-      echo 'Connection to localhost closed by remote host.' >&2
-      ds="\$(rd "\$S/drop-status" 2>/dev/null)"; st="\${ds%% *}"; [ -n "\$st" ] || st=TERMINATED
-      case "\$ds" in *" "*) echo "\${ds#* }" > "\$S/drop-status" ;; *) rm -f "\$S/drop-status" ;; esac
-      echo "\$st" > "\$S/status"
-      if [ -e "\$S/drop-stopping-for" ]; then cp "\$S/drop-stopping-for" "\$S/stopping-for"; fi
-      exit 255
-    fi
-    if [ -e "\$S/fail-step-\$d" ]; then echo "[remote] \$d FAILED"; exit 1; fi
-    echo "[remote] \$d ok" ;;
-  *) echo "stub ssh: unexpected command: \$cmd" >&2; exit 97 ;;
-esac
-EOF
-# scp: the sync's upload, accepted and logged.
-cat > "$VMS_BIN/scp" <<EOF
-#!/bin/bash
-printf 'scp %s\n' "\$*" >> "$VMS_STATE/log"
-EOF
-chmod +x "$VMS_BIN/gcloud" "$VMS_BIN/ssh" "$VMS_BIN/scp"
-# vms_run <good-type|none> [flag...]  -- the orchestrator against the stubs,
-# from a TERMINATED e2-highmem-4, with n2-highmem-4 the one fallback and no
-# budget for a second pass. Flags are state files the stubs read: a bare name
-# is an empty file (moved, start-quota, reject-set-<type>, interrupt-set-<type>,
-# leftover-clone, fail-step-<dispatch>, interrupt-image, deny-create);
-# name=value writes the value (zones=, clone-ok-zone=, interrupt-create-zone=,
-# ssh-mode=builder, ssh-drop=<n>, drop-status=<states>, drop-stopping-for=<n>,
-# stopping-for=<n>, and the knob files zone-fallback, step-attempts,
-# fallback-zones, start-budget, keep-vm and keep-schedule, which feed
-# OAM_GCP_ZONE_FALLBACK, OAM_REMOTE_STEP_ATTEMPTS, OAM_GCP_FALLBACK_ZONES,
-# OAM_VM_START_BUDGET_S, OAM_KEEP_VM and OAM_KEEP_VM_SCHEDULE).
-# The zone fallback is pinned OFF unless a case turns it on: the stub's default
-# answers describe a same-zone walk, and the capacity cases assert that walk's
-# own failure. Every OAM_* knob the orchestrator reads is pinned, so a shell
-# that exports OAM_KEEP_VM=1 or another project cannot turn a run red. Stdout
-# to VMS_OUT, stderr to VMS_ERR, status to VMS_RC, the stubs' call log to
-# VMS_LOG.
-# vms_knob <file> <default> -- the knob file's first line, else the default.
-# The existence test comes first: a `read < missing` prints its error before a
-# trailing 2>/dev/null has been applied.
-vms_knob(){ local v; if [ -e "$VMS_STATE/$1" ] && IFS= read -r v < "$VMS_STATE/$1"; then printf '%s' "$v"; else printf '%s' "$2"; fi; }
-vms_run(){
-  rm -f "$VMS_STATE/log" "$VMS_STATE/moved" "$VMS_STATE/start-quota" "$VMS_STATE/blank-status-once" "$VMS_STATE"/reject-set-* "$VMS_STATE"/interrupt-set-* \
-        "$VMS_STATE"/clone* "$VMS_STATE/image" "$VMS_STATE/zones" "$VMS_STATE/leftover-clone" "$VMS_STATE/ssh-mode" "$VMS_STATE/ssh-drop" "$VMS_STATE"/fail-step-* \
-        "$VMS_STATE/zone-fallback" "$VMS_STATE/step-attempts" "$VMS_STATE/fallback-zones" \
-        "$VMS_STATE/stopping-for" "$VMS_STATE/drop-status" "$VMS_STATE/drop-stopping-for" "$VMS_STATE/interrupt-image" "$VMS_STATE/deny-create" \
-        "$VMS_STATE/interrupt-create-zone" "$VMS_STATE/start-budget" "$VMS_STATE/keep-vm" "$VMS_STATE/keep-schedule"
-  echo TERMINATED > "$VMS_STATE/status"; echo e2-highmem-4 > "$VMS_STATE/type"
-  echo "$1" > "$VMS_STATE/good-type"; shift
-  local flag
-  for flag in "$@"; do
-    case "$flag" in *=*) printf '%s\n' "${flag#*=}" > "$VMS_STATE/${flag%%=*}" ;; *) : > "$VMS_STATE/$flag" ;; esac
-  done
-  VMS_OUT="$(PATH="$VMS_BIN:$PATH" TMPDIR="$VMS_TMP" OAM_GCP_FALLBACK_MACHINE_TYPES=n2-highmem-4 \
-    OAM_VM_START_BUDGET_S="$(vms_knob start-budget 0)" OAM_IAP_SSH_MODE=direct OAM_GCP_BUILDER_ZONE=us-west1-b \
-    OAM_GCP_PROJECT=yaw-labs-prod OAM_GCP_BUILDER_INSTANCE=yaw-linux-builder OAM_LINUX_USER=jeff \
-    OAM_KEEP_VM="$(vms_knob keep-vm 0)" OAM_KEEP_VM_SCHEDULE="$(vms_knob keep-schedule 0)" OAM_LINUX_FAST=0 \
-    OAM_GCP_ZONE_FALLBACK="$(vms_knob zone-fallback 0)" OAM_REMOTE_STEP_ATTEMPTS="$(vms_knob step-attempts 3)" \
-    OAM_GCP_FALLBACK_ZONES="$(vms_knob fallback-zones '')" \
-    bash scripts/build-platforms-gcp-iap.sh --mode=release 2>"$SUITE_TMP/vms-err")"
-  VMS_RC=$?
-  VMS_ERR="$(sed 's/\x1b\[[0-9;]*m//g' "$SUITE_TMP/vms-err")"
-  VMS_LOG="$(cat "$VMS_STATE/log" 2>/dev/null)"
+chmod +x "$MD/bin/limactl" "$MD/bin/nerdctl"
+# mldrv <verb> [args...]  -- the driver with instance "test"; sets MD_RC,
+# MD_ERR and MD_LOG (the nerdctl calls, one per line).
+mldrv(){
+  : > "$MD/st/log"
+  MD_ERR="$(HOME="$MD/home" PATH="$MD/bin:$PATH" bash scripts/mac-linux-vm.sh "$1" test "${@:2}" 2>&1 >/dev/null </dev/null)"
+  MD_RC=$?
+  MD_LOG="$(cat "$MD/st/log")"
+}
+mldrv_reset(){
+  rm -f "$MD"/st/*
+  printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$MD/st/resolv-after-run"
+  echo 65536 > "$MD/st/nofile"
 }
 
-vms_run none
-it "a zone that stays exhausted ends the run with gcloud's own words, every type tried, and the VM's own type put back"
-if [ "$VMS_RC" != "0" ] && [ -z "$VMS_OUT" ] \
-   && grep -qF "no e2-highmem-4 capacity in us-west1-b (pass 1): The zone 'projects/yaw-labs-prod/zones/us-west1-b' does not have enough resources available to fulfill the request.  Try a different zone, or try again later." <<<"$VMS_ERR" \
-   && grep -qF "no n2-highmem-4 capacity in us-west1-b (pass 1)" <<<"$VMS_ERR" \
-   && grep -qF "could not start yaw-linux-builder in us-west1-b within 0s (tried: e2-highmem-4 n2-highmem-4; last: The zone" <<<"$VMS_ERR" \
-   && grep -qF "OAM_VM_START_BUDGET_S" <<<"$VMS_ERR" \
-   && grep -qF "set yaw-linux-builder back to e2-highmem-4" <<<"$VMS_ERR" \
-   && [[ "$(tail -1 <<<"$VMS_LOG")" == *"instances set-machine-type yaw-linux-builder"*"--machine-type=e2-highmem-4" ]] \
-   && ! grep -q 'instances stop' <<<"$VMS_LOG"; then pass
-else fail "rc=$VMS_RC stdout=[$VMS_OUT] log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+mldrv_reset
+mldrv container
+MD_NEW_RUN="$(cat "$MD/st/run-args" 2>/dev/null)"
+it "driver container: an absent container is created with the open-file limit and the resolv.conf mount, then checked"
+if [ "$MD_RC" = "0" ] && grep -qF -- '--ulimit nofile=65536:65536' <<<"$MD_NEW_RUN" \
+   && grep -qF -- 'resolv.conf:/etc/resolv.conf:ro' <<<"$MD_NEW_RUN" && [ -s "$MD/st/spec" ] \
+   && grep -qF 'dns 1.1.1.1 8.8.8.8, nofile 65536' <<<"$MD_ERR"; then pass
+else fail "rc=$MD_RC run: $MD_NEW_RUN out: $MD_ERR"; fi
 
-vms_run n2-highmem-4
-it "a start that succeeds on a fallback says so, and the exit stops the VM before putting its type back"
-VMS_STOP_LINE="$(grep -n 'instances stop' <<<"$VMS_LOG" | head -1 | cut -d: -f1)"
-VMS_BACK_LINE="$(grep -n -- 'set-machine-type yaw-linux-builder .*--machine-type=e2-highmem-4' <<<"$VMS_LOG" | tail -1 | cut -d: -f1)"
-if [ "$VMS_RC" != "0" ] && [ -z "$VMS_OUT" ] \
-   && grep -qF "VM started as n2-highmem-4 (its own type is e2-highmem-4; set back when this run stops it)" <<<"$VMS_ERR" \
-   && grep -qF "OAM_IAP_SSH_MODE=direct, but direct ssh to yaw-linux-builder did not answer: Host key verification failed." <<<"$VMS_ERR" \
-   && grep -qF -- "-- if this is interrupted, run: gcloud compute instances stop yaw-linux-builder --zone=us-west1-b --project=yaw-labs-prod && gcloud compute instances set-machine-type yaw-linux-builder --zone=us-west1-b --project=yaw-labs-prod --machine-type=e2-highmem-4" <<<"$VMS_ERR" \
-   && grep -qF "set yaw-linux-builder back to e2-highmem-4" <<<"$VMS_ERR" \
-   && [ -n "$VMS_STOP_LINE" ] && [ -n "$VMS_BACK_LINE" ] && [ "$VMS_STOP_LINE" -lt "$VMS_BACK_LINE" ] \
-   && ! grep -E 'instances stop.*--async' <<<"$VMS_LOG" >/dev/null \
-   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ] && [ "$(cat "$VMS_STATE/status")" = "TERMINATED" ]; then pass
-else fail "rc=$VMS_RC stop@${VMS_STOP_LINE:-?} restore@${VMS_BACK_LINE:-?} type=$(cat "$VMS_STATE/type") log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+: > "$MD/st/procs"; rm -f "$MD/st/run-args"
+mldrv container
+it "driver container: a current container is reused, and a build left running in it is killed first"
+if [ "$MD_RC" = "0" ] && [ ! -e "$MD/st/run-args" ] && [ ! -e "$MD/st/procs" ] \
+   && grep -qF 'pkill -KILL -u 1000' <<<"$MD_LOG" && grep -qF 'is current' <<<"$MD_ERR"; then pass
+else fail "rc=$MD_RC log: ${MD_LOG//$'\n'/ | } out: $MD_ERR"; fi
 
-it "and the way back is printed before the stop begins"
-VMS_HINT_LINE="$(grep -n -- '-- if this is interrupted, run:' <<<"$VMS_ERR" | head -1 | cut -d: -f1)"
-VMS_STOPPING_LINE="$(grep -n 'Stopping instance(s) yaw-linux-builder' <<<"$VMS_ERR" | head -1 | cut -d: -f1)"
-if [ -n "$VMS_HINT_LINE" ] && [ -n "$VMS_STOPPING_LINE" ] && [ "$VMS_HINT_LINE" -lt "$VMS_STOPPING_LINE" ]; then pass
-else fail "hint@${VMS_HINT_LINE:-?} stop@${VMS_STOPPING_LINE:-?} in stderr"; fi
+: > "$MD/st/inspect-fail"
+mldrv container
+it "driver container: an inspect error on a listed container is fatal, never read as absent"
+if [ "$MD_RC" != "0" ] && ! grep -qE '^(run|rm) ' <<<"$MD_LOG" && grep -qF 'containerd not ready' <<<"$MD_ERR"; then pass
+else fail "rc=$MD_RC log: ${MD_LOG//$'\n'/ | } out: $MD_ERR"; fi
 
-# The same start, with the very first status describe answering blank (exit
-# 0, no text): it is asked again and the run goes on exactly as above. Before
-# vm_describe this read as "unreadable, not TERMINATED" and, with no budget
-# left, ended the run -- the 2026-10-04 gate failure.
-vms_run n2-highmem-4 blank-status-once
-it "a status describe that answers blank once is asked again, not read as an unreadable VM"
-if [ "$VMS_RC" != "0" ] && [ -z "$VMS_OUT" ] \
-   && grep -qF "VM started as n2-highmem-4 (its own type is e2-highmem-4; set back when this run stops it)" <<<"$VMS_ERR" \
-   && ! grep -q "unreadable" <<<"$VMS_ERR" \
-   && [ "$(sed -n '2p;3p' <<<"$VMS_LOG" | grep -c 'value(status)')" = "2" ] \
-   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ] && [ "$(cat "$VMS_STATE/status")" = "TERMINATED" ]; then pass
-else fail "rc=$VMS_RC type=$(cat "$VMS_STATE/type") log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+mldrv_reset
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 192.168.5.2\n' > "$MD/st/resolv-after-run"
+mldrv container
+MD_DNS="$MD_RC|$(grep -c 'bind mount did not take' <<<"$MD_ERR")"
+mldrv_reset
+echo 1024 > "$MD/st/nofile"
+mldrv container
+MD_NOF="$MD_RC|$(grep -c 'hard open-file limit of 1024' <<<"$MD_ERR")"
+it "driver container: a resolv.conf that is not the public pair, or a low open-file limit, fails with the reason"
+if [ "$MD_DNS" = "1|1" ] && [ "$MD_NOF" = "1|1" ]; then pass
+else fail "dns: $MD_DNS nofile: $MD_NOF out: $MD_ERR"; fi
 
-vms_run n2-highmem-4 interrupt-set-n2-highmem-4
-it "a Ctrl-C that lands after set-machine-type was applied ends the run, and the VM's real type is what gets put back"
-if [ "$VMS_RC" != "0" ] \
-   && grep -qF "interrupted while setting yaw-linux-builder to n2-highmem-4" <<<"$VMS_ERR" \
-   && grep -qF "set yaw-linux-builder back to e2-highmem-4" <<<"$VMS_ERR" \
-   && [[ "$(tail -1 <<<"$VMS_LOG")" == *"instances set-machine-type yaw-linux-builder"*"--machine-type=e2-highmem-4" ]] \
-   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ]; then pass
-else fail "rc=$VMS_RC type=$(cat "$VMS_STATE/type") log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+mldrv_reset
+: > "$MD/st/procs"
+mldrv run prep 22.22.2
+it "driver run: a dispatch cut off mid-step is killed before the next one starts"
+if [ "$MD_RC" = "0" ] && [ ! -e "$MD/st/procs" ] && [ "$(cat "$MD/st/built" 2>/dev/null)" = "build-remote prep" ] \
+   && [ "$(grep -nF 'pkill' <<<"$MD_LOG" | cut -d: -f1)" -lt "$(grep -nF 'build-remote.sh' <<<"$MD_LOG" | cut -d: -f1)" ]; then pass
+else fail "rc=$MD_RC log: ${MD_LOG//$'\n'/ | } out: $MD_ERR"; fi
 
-vms_run none start-quota reject-set-n2-highmem-4
-it "a quota on the VM's type and a fallback the API rejects drop both, and the run ends with nothing left to try"
-if [ "$VMS_RC" != "0" ] \
-   && grep -qF "e2-highmem-4 is not usable here -- not trying it again this run: Quota 'N2_CPUS' exceeded." <<<"$VMS_ERR" \
-   && grep -qF "yaw-linux-builder cannot be set to n2-highmem-4 -- not trying it again this run: Invalid value for field" <<<"$VMS_ERR" \
-   && grep -qF "no machine type left to try for yaw-linux-builder in us-west1-b (tried: e2-highmem-4; last: Invalid value" <<<"$VMS_ERR" \
-   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ] && ! grep -q 'instances stop' <<<"$VMS_LOG"; then pass
-else fail "rc=$VMS_RC log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+# =============================================================================
+group "build-platforms-mac-linux.sh -- the leg against a stubbed Mac"
+# =============================================================================
+# ssh and scp replaced by stubs that log every call and answer the driver's
+# verbs from fixture files; nothing here reaches a Mac. The leg is the real
+# script, run from this checkout (so the source tarball is this tree's, packed
+# for real). What is asserted is the contract the callers rely on -- the
+# argument checks fail before any ssh, the last stdout line is the artifact
+# dir, the binary arrives byte-identical, the glibc floor gates it, and the VM
+# is stopped on every exit unless OAM_KEEP_VM=1.
+ML="$SUITE_TMP/ml"
+mkdir -p "$ML/bin" "$ML/tmp" "$ML/files"
+: > "$ML/key"
+printf 'fake linux binary\n' > "$ML/files/oam-x86_64-unknown-linux-gnu"
+for f in scorecard.json node-suite-scorecard.json CONFORMANCE.md CONFORMANCE-NODE.md; do printf '{"f":"%s"}\n' "$f" > "$ML/files/$f"; done
+printf '{"platforms":{"linux":{"counts":{"present":1,"nodeExportNames":1},"generatedAgainst":"stub"}}}\n' > "$ML/files/surface-gaps.json"
+# The Mac build lock's verbs run the REAL driver, piped in on stdin as on
+# the Mac, against a fake Mac: its home ($ML/mac/home, where the lock lives),
+# a limactl that answers `list` from $ML/mac/lima ("<name> <status>" lines),
+# a stat that answers both macOS's `stat -f %m` and GNU's `stat -c %Y` from
+# this box's own stat, whichever kind it is ($MLM/stat-mode "gnu" makes it
+# a GNU stat first on a Mac's PATH, "none" a stat that answers neither; the
+# inode, -f %i / -c %i, follows the same modes), and a mkdir that, with
+# $MLM/mkdir-race, plants another run's lock just before its second attempt
+# at the lock dir.
+MLM="$ML/mac"
+mkdir -p "$MLM/bin" "$MLM/home"
+ML_REAL_STAT="$(command -v stat)"
+ML_REAL_MKDIR="$(command -v mkdir)"
+if "$ML_REAL_STAT" -c %Y . >/dev/null 2>&1; then ML_MTIME_FMT="-c %Y" ML_INODE_FMT="-c %i"; else ML_MTIME_FMT="-f %m" ML_INODE_FMT="-f %i"; fi
+cat > "$MLM/bin/limactl" <<EOF
+#!/bin/bash
+case "\$1" in
+  --version) echo "limactl version 2.2.1"; exit 0 ;;
+  list) ;;
+  *) echo "fake limactl: unexpected: \$*" >&2; exit 97 ;;
+esac
+# list --format <fmt> [<name>]
+if [ -n "\${4:-}" ]; then
+  s="\$(awk -v n="\$4" '\$1 == n { print \$2; exit }' "$MLM/lima")"
+  [ -n "\$s" ] || { echo "fake limactl: no instance \"\$4\"" >&2; exit 1; }
+  echo "\$s"; exit 0
+fi
+[ -f "$MLM/list-fail" ] && { echo "fake limactl: cannot list" >&2; exit 1; }
+cat "$MLM/lima"
+EOF
+cat > "$MLM/bin/stat" <<EOF
+#!/bin/bash
+mode="\$(cat "$MLM/stat-mode" 2>/dev/null || echo bsd)"
+case "\$1 \$2" in
+  "-f %m"|"-f %i")
+    # GNU stat reads -f as --file-system: it prints that, then fails on %m.
+    [ "\$mode" = "bsd" ] || { echo "  File: \"\$3\" ID: 0 Namelen: 255 Type: ext2/ext3"; echo "stat: cannot read file system information for '\$2'" >&2; exit 1; } ;;
+  "-c %Y"|"-c %i") [ "\$mode" != "none" ] || { echo "stat: illegal option -- c" >&2; exit 1; } ;;
+  *) echo "fake stat: unexpected: \$*" >&2; exit 97 ;;
+esac
+# shellcheck disable=SC2086
+if [ "\$2" = "%i" ]; then exec "$ML_REAL_STAT" $ML_INODE_FMT "\$3"; fi
+# shellcheck disable=SC2086
+exec "$ML_REAL_STAT" $ML_MTIME_FMT "\$3"
+EOF
+cat > "$MLM/bin/mkdir" <<EOF
+#!/bin/bash
+if [ -f "$MLM/mkdir-race" ] && [ "\$1" = "$MLM/home/.lima-build.lock" ]; then
+  echo x >> "$MLM/mkdir-attempts"
+  if [ "\$(wc -l < "$MLM/mkdir-attempts" | tr -d ' ')" = "2" ]; then
+    "$ML_REAL_MKDIR" -p "\$1"
+    printf 'repo=yaw\ninstance=yaw-linux\nrun=y-race\nhost=other-box\npid=4343\nstarted=2026-11-01T00:00:00Z\n' > "\$1/owner"
+    printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
+  fi
+fi
+exec "$ML_REAL_MKDIR" "\$@"
+EOF
+# ...and an mv that, with $MLM/mv-race, plays the run that slips in while
+# this one renames the lock aside (to .stale.<pid> or .release.<pid>): once,
+# right after that rename, the moved dir's owner becomes another run's
+# (y-new), and with "retake" in the file yet another run (y-third) also
+# takes the freed path, so nothing can be put back. With "fresh" the moved
+# dir is instead REPLACED by a new, empty one (another taker's mkdir, which
+# a racing taker then renamed aside: still ownerless, a new inode, 0 s old);
+# with "replica" the replacement also carries the old dir's mtime, so only
+# its inode tells it apart; with "touch" the moved dir itself (same inode,
+# still ownerless) gets a fresh mtime, so only its age tells it apart. With
+# $MLM/mv-log, every mv whose source is the lock path is logged there, so a
+# case can prove the lock was never moved. With $MLM/mv-nest, a new lock (y-third) appears
+# at the lock path just as a moved dir is put back there, so the put-back
+# lands INSIDE it. With $MLM/owner-mv-fail the owner.tmp -> owner rename
+# fails; with "swap" in it, the lock dir is first renamed away (a racing
+# taker) and a new, empty one made at the path (a third run mid-acquire).
+ML_REAL_MV="$(command -v mv)"
+cat > "$MLM/bin/mv" <<EOF
+#!/bin/bash
+if [ -f "$MLM/mv-log" ] && [ "\$#" = 2 ] && [ "\$1" = "$MLM/home/.lima-build.lock" ]; then
+  echo "\$1 -> \$2" >> "$MLM/mv-log"
+fi
+if [ -f "$MLM/owner-mv-fail" ] && [ "\$#" = 3 ] && [ "\$2" = "$MLM/home/.lima-build.lock/owner.tmp" ]; then
+  mode="\$(cat "$MLM/owner-mv-fail")"; rm -f "$MLM/owner-mv-fail"
+  if [ "\$mode" = "swap" ]; then
+    "$ML_REAL_MV" "$MLM/home/.lima-build.lock" "$MLM/home/taker-aside" && "$ML_REAL_MKDIR" "$MLM/home/.lima-build.lock"
+  fi
+  echo "mv: cannot move owner.tmp: No space left on device" >&2; exit 1
+fi
+if [ -f "$MLM/mv-nest" ] && [ "\$#" = 2 ] && [ "\$2" = "$MLM/home/.lima-build.lock" ]; then
+  case "\$1" in
+    "$MLM/home/.lima-build.lock.stale."*|"$MLM/home/.lima-build.lock.release."*)
+      rm -f "$MLM/mv-nest"
+      "$ML_REAL_MKDIR" "\$2"
+      printf 'repo=yaw\ninstance=yaw-linux\nrun=y-third\nhost=other-box\npid=4646\nstarted=2026-11-01T00:00:00Z\n' > "\$2/owner"
+      exec "$ML_REAL_MV" "\$1" "\$2" ;;
+  esac
+fi
+if [ -f "$MLM/mv-race" ] && [ "\$#" = 2 ] && [ "\$1" = "$MLM/home/.lima-build.lock" ]; then
+  case "\$2" in
+    "$MLM/home/.lima-build.lock.stale."*|"$MLM/home/.lima-build.lock.release."*)
+      mode="\$(cat "$MLM/mv-race")"; rm -f "$MLM/mv-race"
+      "$ML_REAL_MV" "\$1" "\$2" || exit
+      if [ "\$mode" = "touch" ]; then touch "\$2"; exit 0; fi
+      if [ "\$mode" = "fresh" ] || [ "\$mode" = "replica" ]; then
+        "$ML_REAL_MKDIR" "\$2.new"
+        [ "\$mode" = "fresh" ] || touch -r "\$2" "\$2.new"
+        rm -rf "\$2" && "$ML_REAL_MV" "\$2.new" "\$2"
+        exit 0
+      fi
+      printf 'repo=yaw\ninstance=yaw-linux\nrun=y-new\nhost=other-box\npid=4545\nstarted=2026-11-01T00:00:00Z\n' > "\$2/owner"
+      if [ "\$mode" = "retake" ]; then
+        "$ML_REAL_MKDIR" "\$1"
+        printf 'repo=yaw\ninstance=yaw-linux\nrun=y-third\nhost=other-box\npid=4646\nstarted=2026-11-01T00:00:00Z\n' > "\$1/owner"
+      fi
+      exit 0 ;;
+  esac
+fi
+exec "$ML_REAL_MV" "\$@"
+EOF
+# ...and a touch that, with $MLM/touch-race, plays a stale taker renaming
+# the lock aside (to $MLM/home/taker-aside) just before this touch of the
+# lock path runs -- with "retake" in the file, a third run (y-third) then
+# also takes the freed path.
+ML_REAL_TOUCH="$(command -v touch)"
+cat > "$MLM/bin/touch" <<EOF
+#!/bin/bash
+if [ -f "$MLM/touch-race" ] && [ "\${!#}" = "$MLM/home/.lima-build.lock" ]; then
+  mode="\$(cat "$MLM/touch-race")"; rm -f "$MLM/touch-race"
+  "$ML_REAL_MV" "$MLM/home/.lima-build.lock" "$MLM/home/taker-aside"
+  if [ "\$mode" = "retake" ]; then
+    "$ML_REAL_MKDIR" "$MLM/home/.lima-build.lock"
+    printf 'repo=yaw\ninstance=yaw-linux\nrun=y-third\nhost=other-box\npid=4646\nstarted=2026-11-01T00:00:00Z\n' > "$MLM/home/.lima-build.lock/owner"
+  fi
+fi
+exec "$ML_REAL_TOUCH" "\$@"
+EOF
+chmod +x "$MLM/bin/limactl" "$MLM/bin/stat" "$MLM/bin/mkdir" "$MLM/bin/mv" "$MLM/bin/touch"
+cat > "$ML/bin/ssh" <<EOF
+#!/bin/bash
+cmd="\${!#}"
+echo "\$cmd" >> "$ML/calls"
+# shellcheck disable=SC2086
+set -- \$cmd
+if [ "\$1" = "bash" ] && { [ "\$4" = "lock" ] || [ "\$4" = "unlock" ] || [ "\$4" = "refresh" ]; }; then
+  verb="\$4"; shift 3
+  # lock-drop: the Mac runs the verb (and takes the lock), then the
+  # connection dies before its answer arrives.
+  if [ "\$verb" = "lock" ] && [ -f "$ML/lock-drop" ]; then
+    HOME="$MLM/home" PATH="$MLM/bin:\$PATH" bash -s -- "\$@" >/dev/null 2>&1
+    echo "Connection to build-mac closed by remote host." >&2; exit 255
+  fi
+  HOME="$MLM/home" PATH="$MLM/bin:\$PATH" exec bash -s -- "\$@"
+fi
+cat >/dev/null
+case "\$1" in
+  true|mkdir) exit 0 ;;
+  bash)
+    case "\$4" in
+      status)
+        # The fixture's lines, then what the driver's status adds, read off
+        # the fake Mac (status-others-none hides a neighbour from it: a VM
+        # started between the status and the lock).
+        cat "$ML/status"
+        if [ -f "$ML/status-others-none" ]; then echo "others=none"
+        else echo "others=\$(awk -v n="\$5" '\$1 != n && \$2 == "Running" { printf "%s%s", c, \$1; c = "," } END { if (c == "") printf "none" }' "$MLM/lima")"; fi
+        lk="$MLM/home/.lima-build.lock"
+        if [ ! -d "\$lk" ]; then echo "lock=none"
+        elif [ -f "\$lk/owner" ]; then echo "lock=held"; sed 's/^/lock./' "\$lk/owner"
+        else echo "lock=ownerless"; fi
+        exit 0 ;;
+      stop)
+        [ -f "$ML/stop-fails" ] && { echo "[mac] limactl stop failed" >&2; exit 1; }
+        awk -v n="\$5" '\$1 == n { \$2 = "Stopped" } { print }' "$MLM/lima" > "$MLM/lima.new" && mv -f "$MLM/lima.new" "$MLM/lima"
+        echo "[mac] stop" >&2; exit 0 ;;
+      provision)
+        [ -f "$ML/provision-fails" ] && { echo "[mac] limactl edit failed" >&2; exit 1; }
+        # provision-steals: the provision outlives the lock's 15 minutes with
+        # the VM down, and another run takes the lock over as stale.
+        # With "oam" in the file the thief is another oam run, on the same
+        # instance name, oam-linux.
+        if [ -f "$ML/provision-steals" ]; then
+          rm -rf "$MLM/home/.lima-build.lock"; mkdir -p "$MLM/home/.lima-build.lock"
+          if grep -qx oam "$ML/provision-steals"; then
+            printf 'repo=oam\ninstance=oam-linux\nrun=o-thief\nhost=other-box\npid=4747\nstarted=2026-11-01T00:00:00Z\n' > "$MLM/home/.lima-build.lock/owner"
+          else
+            printf 'repo=yaw\ninstance=yaw-linux\nrun=y-thief\nhost=other-box\npid=4747\nstarted=2026-11-01T00:00:00Z\n' > "$MLM/home/.lima-build.lock/owner"
+          fi
+        fi
+        echo "[mac] \$4" >&2; exit 0 ;;
+      start|container|sync) echo "[mac] \$4" >&2; exit 0 ;;
+      run) echo "[remote] \$6"; [ -f "$ML/fail-\$6" ] && exit 1
+           [ -f "$ML/fail-once-\$6" ] && { rm -f "$ML/fail-once-\$6"; exit 1; }
+           [ -f "$ML/drop-\$6" ] && { rm -f "$ML/drop-\$6"; exit 255; }
+           [ -f "$ML/drops-\$6" ] && exit 255
+           exit 0 ;;
+      free-gb) printf 'Avail\n  50G\n'; exit 0 ;;
+      glibc) cat "$ML/glibc"; exit 0 ;;
+      fetch)
+        base="\${6##*/}"
+        if [ -f "$ML/sum-override" ]; then echo "sha256=\$(cat "$ML/sum-override")"
+        else echo "sha256=\$(sha256sum "$ML/files/\$base" | cut -d' ' -f1)"; fi
+        echo "path=.oam-linux-leg/out/\$base"; exit 0 ;;
+    esac ;;
+esac
+echo "stub ssh: unexpected: \$cmd" >&2; exit 97
+EOF
+cat > "$ML/bin/scp" <<EOF
+#!/bin/bash
+args=("\$@"); dest="\${args[\${#args[@]}-1]}"; src="\${args[\${#args[@]}-2]}"
+case "\$src" in
+  *:*) echo "scp-from \${src#*:}" >> "$ML/calls"; base="\${src##*/}"; cp "$ML/files/\$base" "\$dest/\$base" ;;
+  *) echo "scp-to \${dest#*:}" >> "$ML/calls" ;;
+esac
+EOF
+chmod +x "$ML/bin/ssh" "$ML/bin/scp"
+ML_ST_STOPPED=$'limactl=2.2.1\narch=arm64\nrosetta=yes\nstatus=Stopped'
+ML_GLIBC_OK=$'GLIBC_2.14\nGLIBC_2.17\nGLIBC_2.2.5\nGLIBC_2.34\nGLIBC_2.9'
 
-vms_run none moved
-it "an instance that moved zones is found by name, and every later call goes to the zone it is in"
-if [ "$VMS_RC" != "0" ] \
-   && grep -qF "instance yaw-linux-builder is not in us-west1-b but in us-west1-c -- using that (OAM_GCP_BUILDER_ZONE=us-west1-c silences this)" <<<"$VMS_ERR" \
-   && grep -qF -- "--filter=name~^yaw-linux-builder$" <<<"$VMS_LOG" \
-   && [ "$(grep -c -- '--zone=us-west1-b' <<<"$VMS_LOG")" = "1" ] \
-   && grep -qF -- "instances start yaw-linux-builder --zone=us-west1-c" <<<"$VMS_LOG" \
-   && grep -qF "no e2-highmem-4 capacity in us-west1-c (pass 1)" <<<"$VMS_ERR"; then pass
-else fail "rc=$VMS_RC log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+# ml <env...> -- <args...>   -- sets ML_OUT, ML_ERR, ML_RC, ML_CALLS (one per
+# line) and ML_LAST (the last stdout line).
+ml(){
+  local envs=() a
+  while [ $# -gt 0 ]; do a="$1"; shift; [ "$a" = "--" ] && break; envs+=("$a"); done
+  : > "$ML/calls"
+  ML_OUT="$(env PATH="$ML/bin:$PATH" TMPDIR="$ML/tmp" OAM_MAC_KEY="$ML/key" \
+    OAM_MAC_HOST=build-mac.example.invalid OAM_MAC_USER=builder "${envs[@]}" \
+    bash scripts/build-platforms-mac-linux.sh "$@" </dev/null 2>"$ML/err")"
+  ML_RC=$?
+  ML_ERR="$(cat "$ML/err")"
+  ML_CALLS="$(cat "$ML/calls")"
+  ML_LAST="${ML_OUT##*$'\n'}"
+}
+ml_calls_of(){ grep -c -- "$1" <<<"$ML_CALLS"; }
+ml_reset(){
+  rm -f "$ML"/fail-* "$ML"/drop-* "$ML"/drops-* "$ML/sum-override" "$ML/status-others-none" "$MLM/list-fail" \
+        "$ML/lock-drop" "$ML/stop-fails" "$MLM/stat-mode" "$MLM/mkdir-race" "$MLM/mkdir-attempts" "$MLM/mv-race" \
+        "$MLM/mv-nest" "$MLM/owner-mv-fail" "$ML/provision-steals" "$MLM/mv-log" "$ML/provision-fails" "$MLM/touch-race"
+  rm -rf "$MLM/home/.lima-build.lock" "$MLM/home/.lima-build.lock".* "$MLM/home/taker-aside"
+  printf '%s\n' "$ML_ST_STOPPED" > "$ML/status"; printf '%s\n' "$ML_GLIBC_OK" > "$ML/glibc"
+  echo "oam-linux Stopped" > "$MLM/lima"
+}
+# ml_stop_then_unlock <calls>  -- the run ended by stopping the VM and then
+# releasing its lock, in that order, as its last two calls.
+ml_stop_then_unlock(){
+  [ "$(tail -2 <<<"$1" | head -1)" = "bash -s -- stop oam-linux " ] && [[ "$(tail -1 <<<"$1")" == "bash -s -- unlock "* ]]
+}
+ml_reset
 
-# --- a builder stopped under a step is started again ---------------------------
-# The whole leg against a builder that answers (ssh-mode=builder), the first
-# `prep` dropping the way the 2026-09-25 schedule stop looked with the VM
-# TERMINATED behind it, and `gate` then failing for real, which ends the run
-# where this case wants it. The claim is the ORDER across both stubs' calls:
-# the dropped step, the operations-list postmortem, the start, the reconnect
-# probe, the step again -- and only then gate.
-vms_line(){ grep -nE -- "$1" <<<"$VMS_LOG" | sed -n "${2:-1}p" | cut -d: -f1; }
-vms_run e2-highmem-4 ssh-mode=builder ssh-drop=1 fail-step-gate
-it "a builder stopped under a step is started again, reconnected to, and the step is run again -- in that order, after the postmortem"
-VMS_L_DROP="$(vms_line 'build-remote.sh prep$' 1)"
-VMS_L_OPS="$(vms_line 'operations list' 1)"
-VMS_L_START="$(vms_line 'instances start yaw-linux-builder' 2)"
-VMS_L_PROBE="$(grep -nE -- '^ssh .* true$' <<<"$VMS_LOG" | awk -F: -v s="${VMS_L_START:-0}" '$1 > s { print $1; exit }')"
-VMS_L_AGAIN="$(vms_line 'build-remote.sh prep$' 2)"
-VMS_L_GATE="$(vms_line 'build-remote.sh gate$' 1)"
-if [ "$VMS_RC" != "0" ] && [ -z "$VMS_OUT" ] \
-   && grep -qF "ssh transport dropped because yaw-linux-builder is TERMINATED -- last stop operation: 2026-10-04T03:00:00.000-07:00 service-123456789@compute-system.iam.gserviceaccount.com" <<<"$VMS_ERR" \
-   && grep -qF "remote 'prep' lost its ssh transport on attempt 1 of 3 because yaw-linux-builder was stopped under it (TERMINATED) -- starting it again, reconnecting and running it again" <<<"$VMS_ERR" \
-   && [ "$(grep -c 'Start VM yaw-linux-builder (status: TERMINATED)' <<<"$VMS_ERR")" = "2" ] \
-   && grep -qF "Reconnect to yaw-linux-builder after an ssh transport drop" <<<"$VMS_ERR" \
-   && grep -qF "remote prep ok" <<<"$VMS_ERR" && grep -qF "remote 'gate' failed" <<<"$VMS_ERR" \
-   && [ -n "$VMS_L_DROP" ] && [ -n "$VMS_L_OPS" ] && [ -n "$VMS_L_START" ] && [ -n "$VMS_L_PROBE" ] && [ -n "$VMS_L_AGAIN" ] && [ -n "$VMS_L_GATE" ] \
-   && [ "$VMS_L_DROP" -lt "$VMS_L_OPS" ] && [ "$VMS_L_OPS" -lt "$VMS_L_START" ] && [ "$VMS_L_START" -lt "$VMS_L_PROBE" ] \
-   && [ "$VMS_L_PROBE" -lt "$VMS_L_AGAIN" ] && [ "$VMS_L_AGAIN" -lt "$VMS_L_GATE" ] \
-   && grep -q 'instances stop yaw-linux-builder' <<<"$VMS_LOG"; then pass
-else fail "rc=$VMS_RC drop@${VMS_L_DROP:-?} ops@${VMS_L_OPS:-?} start@${VMS_L_START:-?} probe@${VMS_L_PROBE:-?} again@${VMS_L_AGAIN:-?} gate@${VMS_L_GATE:-?} log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+ml -- --bogus
+it "an unknown argument fails before anything touches the Mac"
+if [ "$ML_RC" = "1" ] && [ -z "$ML_CALLS" ] && grep -qF 'unknown arg: --bogus' <<<"$ML_ERR"; then pass
+else fail "rc=$ML_RC calls='$ML_CALLS' stderr: $ML_ERR"; fi
 
-# Two drops with two attempts in all: one restart, then the second drop is the
-# last attempt, and the run ends with the postmortem -- not a third start.
-vms_run e2-highmem-4 ssh-mode=builder ssh-drop=2 step-attempts=2
-it "a builder stopped under every attempt ends the run with the postmortem once the attempts are spent"
-if [ "$VMS_RC" != "0" ] && [ -z "$VMS_OUT" ] \
-   && [ "$(grep -c 'instances start yaw-linux-builder' <<<"$VMS_LOG")" = "2" ] \
-   && [ "$(grep -cE 'build-remote.sh prep$' <<<"$VMS_LOG")" = "2" ] \
-   && [ "$(grep -c 'ssh transport dropped because yaw-linux-builder is TERMINATED -- last stop operation:' <<<"$VMS_ERR")" = "2" ] \
-   && grep -qF "remote 'prep' lost its ssh transport on attempt 1 of 2 because yaw-linux-builder was stopped under it" <<<"$VMS_ERR" \
-   && ! grep -qF "attempt 2 of 2 because" <<<"$VMS_ERR" \
-   && grep -qF "remote 'prep' failed -- see" <<<"$VMS_ERR" \
-   && ! grep -qE 'build-remote.sh gate$' <<<"$VMS_LOG"; then pass
-else fail "rc=$VMS_RC log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+ml -- --help
+it "--help prints the header and touches nothing"
+if [ "$ML_RC" = "0" ] && [ -z "$ML_CALLS" ] && grep -qF 'oam linux-x64 platform-build orchestrator' <<<"$ML_OUT" \
+   && grep -qF -- '--provision' <<<"$ML_OUT"; then pass
+else fail "rc=$ML_RC calls='$ML_CALLS' out: $(head -3 <<<"$ML_OUT")"; fi
 
-# --- the zone fallback ---------------------------------------------------------
-# The exhausted zone of the first case with the fallback on. us-west1-a refuses
-# both types for capacity and us-west1-c takes the first; the DOWN zone and
-# the builder's own are never tried. The run then goes on against the clone:
-# the schedule read, the IP read and, at exit, the stop name the clone in its
-# zone; the original went back to its own type BEFORE it was imaged and is
-# never started, stopped or deleted; both delete commands are printed; the
-# exit deletes the image and not the clone.
-vms_run none zone-fallback=1 "zones=us-west1-a us-west1-b us-west1-c us-west1-d:DOWN" clone-ok-zone=us-west1-c
-it "a zone out of capacity for the whole budget clones the builder into the next zone that takes it, and the run goes on against the clone"
-VMS_IMG="$(grep -oE 'yaw-linux-builder-img-[0-9]{8}-[0-9]{6}' <<<"$VMS_LOG" | head -1)"
-VMS_L_BACK="$(grep -n -- 'set-machine-type yaw-linux-builder --zone=us-west1-b --project=yaw-labs-prod --machine-type=e2-highmem-4' <<<"$VMS_LOG" | tail -1 | cut -d: -f1)"
-VMS_L_IMG="$(vms_line 'machine-images create' 1)"
-VMS_L_CLONE_STOP="$(vms_line 'instances stop yaw-linux-builder-us-west1-c --zone=us-west1-c' 1)"
-VMS_L_IMG_DEL="$(vms_line 'machine-images delete' 1)"
-if [ "$VMS_RC" != "0" ] && [ -n "$VMS_IMG" ] \
-   && grep -qF -- "compute machine-images create $VMS_IMG --source-instance=yaw-linux-builder --source-instance-zone=us-west1-b --project=yaw-labs-prod" <<<"$VMS_LOG" \
-   && grep -qF -- "compute zones list --project=yaw-labs-prod --filter=region:us-west1 --format=value(name,status,region.basename())" <<<"$VMS_LOG" \
-   && grep -qF "zones to try, in order: us-west1-a us-west1-c" <<<"$VMS_ERR" \
-   && grep -qF -- "compute instances create yaw-linux-builder-us-west1-a --zone=us-west1-a --source-machine-image=$VMS_IMG --machine-type=e2-highmem-4 --project=yaw-labs-prod" <<<"$VMS_LOG" \
-   && grep -qF -- "compute instances create yaw-linux-builder-us-west1-a --zone=us-west1-a --source-machine-image=$VMS_IMG --machine-type=n2-highmem-4 --project=yaw-labs-prod" <<<"$VMS_LOG" \
-   && grep -qF -- "compute instances create yaw-linux-builder-us-west1-c --zone=us-west1-c --source-machine-image=$VMS_IMG --machine-type=e2-highmem-4 --project=yaw-labs-prod" <<<"$VMS_LOG" \
-   && [ "$(grep -c 'instances create ' <<<"$VMS_LOG")" = "3" ] \
-   && grep -qF "no e2-highmem-4 capacity in us-west1-a either:" <<<"$VMS_ERR" \
-   && grep -qF "THIS RUN NOW BUILDS ON yaw-linux-builder-us-west1-c IN us-west1-c (as e2-highmem-4), a clone of yaw-linux-builder (us-west1-b) made from machine image $VMS_IMG" <<<"$VMS_ERR" \
-   && grep -qF "gcloud compute instances delete yaw-linux-builder-us-west1-c --zone=us-west1-c --project=yaw-labs-prod && gcloud compute machine-images delete $VMS_IMG --project=yaw-labs-prod" <<<"$VMS_ERR" \
-   && grep -qF -- "instances describe yaw-linux-builder-us-west1-c --zone=us-west1-c --project=yaw-labs-prod --format=value(resourcePolicies)" <<<"$VMS_LOG" \
-   && grep -qF -- "instances describe yaw-linux-builder-us-west1-c --zone=us-west1-c --project=yaw-labs-prod --format=value(networkInterfaces[0].accessConfigs[0].natIP)" <<<"$VMS_LOG" \
-   && grep -qF "OAM_IAP_SSH_MODE=direct, but direct ssh to yaw-linux-builder-us-west1-c did not answer" <<<"$VMS_ERR" \
-   && [ -n "$VMS_L_BACK" ] && [ -n "$VMS_L_IMG" ] && [ "$VMS_L_BACK" -lt "$VMS_L_IMG" ] \
-   && [ -n "$VMS_L_CLONE_STOP" ] && [ -n "$VMS_L_IMG_DEL" ] && [ "$VMS_L_CLONE_STOP" -lt "$VMS_L_IMG_DEL" ] \
-   && grep -qF -- "instances stop yaw-linux-builder-us-west1-c --zone=us-west1-c --project=yaw-labs-prod --async" <<<"$VMS_LOG" \
-   && ! grep -q 'instances stop yaw-linux-builder ' <<<"$VMS_LOG" \
-   && ! grep -q 'instances delete' <<<"$VMS_LOG" \
-   && [ "$(grep -c 'instances start ' <<<"$VMS_LOG")" = "2" ] \
-   && grep -qF -- "machine-images delete $VMS_IMG --project=yaw-labs-prod --quiet" <<<"$VMS_LOG" \
-   && grep -qF "deleted machine image $VMS_IMG" <<<"$VMS_ERR" \
-   && grep -qF "yaw-linux-builder-us-west1-c in us-west1-c, this run's clone of yaw-linux-builder in us-west1-b, is left stopped and is yours to delete" <<<"$VMS_ERR" \
-   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ] && [ "$(cat "$VMS_STATE/status")" = "TERMINATED" ] && [ "$(cat "$VMS_STATE/clone-status")" = "TERMINATED" ]; then pass
-else fail "rc=$VMS_RC img=${VMS_IMG:-?} back@${VMS_L_BACK:-?} img@${VMS_L_IMG:-?} clone-stop@${VMS_L_CLONE_STOP:-?} img-del@${VMS_L_IMG_DEL:-?} log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+it "a missing host, a bad knob or a bad floor fails before any ssh, naming the knob"
+ML_KNOB_BAD=""
+for kv in "OAM_MAC_HOST=|set OAM_MAC_HOST" "OAM_MAC_USER=|set OAM_MAC_USER" \
+          "OAM_LIMA_INSTANCE=oam linux|invalid OAM_LIMA_INSTANCE" "OAM_LIMA_CPUS=0|invalid OAM_LIMA_CPUS" \
+          "OAM_LIMA_MEMORY_GIB=5G|invalid OAM_LIMA_MEMORY_GIB" "OAM_KEEP_VM=yes|invalid OAM_KEEP_VM" \
+          "OAM_LINUX_FAST=2|invalid OAM_LINUX_FAST" "OAM_LINUX_GLIBC_MAX=2.x|invalid OAM_LINUX_GLIBC_MAX"; do
+  ml "${kv%%|*}" -- --mode=release
+  if [ "$ML_RC" = "0" ] || [ -n "$ML_CALLS" ] || ! grep -qF "${kv#*|}" <<<"$ML_ERR"; then
+    ML_KNOB_BAD="$ML_KNOB_BAD [${kv%%|*}: rc=$ML_RC calls=${ML_CALLS//$'\n'/,}]"
+  fi
+done
+if [ -z "$ML_KNOB_BAD" ]; then pass; else fail "$ML_KNOB_BAD"; fi
 
-# The operator's own zone list: no zones list call, the zones in the order
-# given, the builder's own skipped.
-vms_run none zone-fallback=1 "fallback-zones=us-west1-c us-west1-b us-west1-a" clone-ok-zone=us-west1-a
-it "OAM_GCP_FALLBACK_ZONES names the zones to try, in order, and the region is not asked"
-VMS_IMG="$(grep -oE 'yaw-linux-builder-img-[0-9]{8}-[0-9]{6}' <<<"$VMS_LOG" | head -1)"
-if [ "$VMS_RC" != "0" ] && [ -n "$VMS_IMG" ] \
-   && ! grep -q 'zones list' <<<"$VMS_LOG" \
-   && grep -qF "zones to try, in order: us-west1-c us-west1-a" <<<"$VMS_ERR" \
-   && [ "$(grep -c 'instances create yaw-linux-builder-us-west1-c ' <<<"$VMS_LOG")" = "2" ] \
-   && [ "$(grep -c 'instances create yaw-linux-builder-us-west1-a ' <<<"$VMS_LOG")" = "1" ] \
-   && ! grep -q 'instances create yaw-linux-builder-us-west1-b ' <<<"$VMS_LOG" \
-   && grep -qF "THIS RUN NOW BUILDS ON yaw-linux-builder-us-west1-a IN us-west1-a (as e2-highmem-4)" <<<"$VMS_ERR" \
-   && grep -qF -- "machine-images delete $VMS_IMG --project=yaw-labs-prod --quiet" <<<"$VMS_LOG"; then pass
-else fail "rc=$VMS_RC log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+ml -- --preflight-only
+it "preflight: a stopped VM -- the probe, the status, the lock taken and released; stdout silent, the VM left alone"
+if [ "$ML_RC" = "0" ] && [ -z "$ML_OUT" ] && [ "$(wc -l <<<"$ML_CALLS" | tr -d ' ')" = "4" ] \
+   && [ "$(head -2 <<<"$ML_CALLS")" = $'true\nbash -s -- status oam-linux ' ] \
+   && [[ "$(sed -n 3p <<<"$ML_CALLS")" == "bash -s -- lock "*" oam oam-linux "* ]] \
+   && [[ "$(sed -n 4p <<<"$ML_CALLS")" == "bash -s -- unlock "* ]] && [ ! -e "$MLM/home/.lima-build.lock" ]; then pass
+else fail "rc=$ML_RC out='$ML_OUT' calls: $ML_CALLS stderr: $ML_ERR"; fi
 
-# No zone takes it: the original failure, the image KEPT and named with the
-# hand move, nothing stopped or deleted. The earlier run's clone in us-west1-a
-# is pointed out by the preflight, and that zone is skipped when the create
-# finds the name taken.
-vms_run none zone-fallback=1 "zones=us-west1-a us-west1-c" leftover-clone
-it "a clone no zone takes ends the run with the original message, the image kept and named with the hand move; an earlier run's clone is pointed out and not created over"
-VMS_IMG="$(grep -oE 'yaw-linux-builder-img-[0-9]{8}-[0-9]{6}' <<<"$VMS_LOG" | head -1)"
-if [ "$VMS_RC" != "0" ] && [ -n "$VMS_IMG" ] \
-   && grep -qF "a clone of yaw-linux-builder from an earlier run is still there: yaw-linux-builder-us-west1-a in us-west1-a (TERMINATED)" <<<"$VMS_ERR" \
-   && grep -qF "delete it: gcloud compute instances delete yaw-linux-builder-us-west1-a --zone=us-west1-a --project=yaw-labs-prod" <<<"$VMS_ERR" \
-   && grep -qF "yaw-linux-builder-us-west1-a already exists in us-west1-a -- an earlier run's clone" <<<"$VMS_ERR" \
-   && [ "$(grep -c 'instances create yaw-linux-builder-us-west1-a ' <<<"$VMS_LOG")" = "1" ] \
-   && [ "$(grep -c 'instances create yaw-linux-builder-us-west1-c ' <<<"$VMS_LOG")" = "2" ] \
-   && grep -qF "no n2-highmem-4 capacity in us-west1-c either:" <<<"$VMS_ERR" \
-   && grep -qF "could not start yaw-linux-builder in us-west1-b within 0s (tried: e2-highmem-4 n2-highmem-4; last: The zone" <<<"$VMS_ERR" \
-   && grep -qF "no zone of us-west1 took it (tried: us-west1-a us-west1-c). Machine image $VMS_IMG is KEPT for a move by hand -- gcloud compute instances create yaw-linux-builder-<zone> --zone=<zone> --source-machine-image=$VMS_IMG --project=yaw-labs-prod, then run again with OAM_GCP_BUILDER_INSTANCE=yaw-linux-builder-<zone> OAM_GCP_BUILDER_ZONE=<zone>" <<<"$VMS_ERR" \
-   && grep -qF "gcloud compute machine-images delete $VMS_IMG --project=yaw-labs-prod" <<<"$VMS_ERR" \
-   && ! grep -q 'machine-images delete' <<<"$VMS_LOG" \
-   && ! grep -qE 'instances (stop|delete)' <<<"$VMS_LOG" \
-   && [ -e "$VMS_STATE/image" ] \
-   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ]; then pass
-else fail "rc=$VMS_RC img=${VMS_IMG:-?} log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
+ml -- --preflight-only
+ML_PF_STOP="$ML_RC|$(ml_calls_of ' stop oam-linux')"
+ml OAM_KEEP_VM=1 -- --preflight-only
+ML_PF_KEEP="$ML_RC|$(ml_calls_of ' stop oam-linux')"
+it "preflight: a Running VM is stopped for the mac legs, unless OAM_KEEP_VM=1"
+if [ "$ML_PF_STOP" = "0|1" ] && [ "$ML_PF_KEEP" = "0|0" ] && grep -qF 'OAM_KEEP_VM=1 leaves it so' <<<"$ML_ERR"; then pass
+else fail "default: $ML_PF_STOP keep: $ML_PF_KEEP stderr: $ML_ERR"; fi
+# (OAM_KEEP_VM=1 keeps the lock too -- the protocol v1.2 group checks that.)
+rm -rf "$MLM/home/.lima-build.lock"
 
-vms_run none zone-fallback=0 "zones=us-west1-a us-west1-c" clone-ok-zone=us-west1-c
-it "OAM_GCP_ZONE_FALLBACK=0 keeps today's failure: no image, no clone, the knob named"
-if [ "$VMS_RC" != "0" ] \
-   && grep -qF "could not start yaw-linux-builder in us-west1-b within 0s (tried: e2-highmem-4 n2-highmem-4; last: The zone" <<<"$VMS_ERR" \
-   && grep -qF "OAM_GCP_ZONE_FALLBACK=1 (the default) clones the builder into another zone of us-west1 for the run instead." <<<"$VMS_ERR" \
-   && ! grep -qE 'machine-images|instances create|zones list' <<<"$VMS_LOG" \
-   && [[ "$(tail -1 <<<"$VMS_LOG")" == *"instances set-machine-type yaw-linux-builder"*"--machine-type=e2-highmem-4" ]]; then pass
-else fail "rc=$VMS_RC log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+printf '%s\n' "${ML_ST_STOPPED/Stopped/absent}" > "$ML/status"
+ml -- --preflight-only
+ML_PF_ABSENT="$ML_RC"; ML_PF_ABSENT_ERR="$ML_ERR"
+ml OAM_LIMA_CPUS=6 -- --preflight-only --provision
+it "preflight: a missing instance fails naming --provision, and --provision creates it with the knobs' sizes"
+if [ "$ML_PF_ABSENT" != "0" ] && grep -qF -- '--provision --preflight-only' <<<"$ML_PF_ABSENT_ERR" \
+   && [ "$ML_RC" = "0" ] && grep -qxF 'bash -s -- provision oam-linux 6 5 80' <<<"$ML_CALLS"; then pass
+else fail "absent rc=$ML_PF_ABSENT; provision rc=$ML_RC calls: $ML_CALLS stderr: $ML_ERR"; fi
 
-# Both knobs are checked before the first gcloud call, like the other knobs.
-vms_run none zone-fallback=2
-VMS_ERR_A="$VMS_ERR"; VMS_LOG_A="$VMS_LOG"
-vms_run none "fallback-zones=us-west1-c west1c"
-it "a bad OAM_GCP_ZONE_FALLBACK or OAM_GCP_FALLBACK_ZONES fails before anything touches a VM"
-if grep -qF "invalid OAM_GCP_ZONE_FALLBACK='2' (want 0 or 1)" <<<"$VMS_ERR_A" && [ -z "$VMS_LOG_A" ] \
-   && grep -qF "invalid zone 'west1c' in OAM_GCP_FALLBACK_ZONES='us-west1-c west1c' (want zone names like us-west1-c, space-separated)" <<<"$VMS_ERR" && [ -z "$VMS_LOG" ]; then pass
-else fail "fallback=2: log:[$VMS_LOG_A] stderr:$(printf '\n  %s' "$VMS_ERR_A") zones: log:[$VMS_LOG] stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+printf 'limactl=missing\narch=arm64\nrosetta=yes\nstatus=absent\n' > "$ML/status"
+ml -- --preflight-only
+ML_PF_NOLIMA="$ML_RC|$(grep -c 'brew install lima' <<<"$ML_ERR")"
+printf '%s\n' "${ML_ST_STOPPED/rosetta=yes/rosetta=no}" > "$ML/status"
+ml -- --preflight-only
+ML_PF_NOROS="$ML_RC|$(grep -c 'install-rosetta' <<<"$ML_ERR")"
+printf '%s\n' "${ML_ST_STOPPED/arch=arm64/arch=x86_64}" > "$ML/status"
+ml -- --preflight-only
+ML_PF_INTEL="$ML_RC|$(grep -c 'needs Apple Silicon' <<<"$ML_ERR")"
+it "preflight: no Lima, no Rosetta or an Intel Mac each fail with the fix"
+if [ "$ML_PF_NOLIMA" = "1|1" ] && [ "$ML_PF_NOROS" = "1|1" ] && [ "$ML_PF_INTEL" = "1|1" ]; then pass
+else fail "no lima: $ML_PF_NOLIMA, no rosetta: $ML_PF_NOROS, intel: $ML_PF_INTEL"; fi
+ml_reset
 
-# A zone of another region in OAM_GCP_FALLBACK_ZONES (a typo for us-west1-a)
-# fails once the builder's zone is final -- after the describe, before any
-# start -- rather than reaching `instances create` there once per machine
-# type, each refusal worded as the type's.
-vms_run none zone-fallback=1 "fallback-zones=us-central1-a us-west1-c" clone-ok-zone=us-west1-c
-it "a zone of another region in OAM_GCP_FALLBACK_ZONES fails once the builder's zone is known, before any start"
-if [ "$VMS_RC" != "0" ] \
-   && grep -qF "zone 'us-central1-a' in OAM_GCP_FALLBACK_ZONES='us-central1-a us-west1-c' is not in us-west1, the region of yaw-linux-builder's zone us-west1-b -- the zone fallback clones within the region (want other zones of us-west1)" <<<"$VMS_ERR" \
-   && grep -q 'instances describe' <<<"$VMS_LOG" \
-   && ! grep -qE 'instances (start|set-machine-type|create)|machine-images' <<<"$VMS_LOG"; then pass
-else fail "rc=$VMS_RC log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+# --- a release run ----------------------------------------------------------------
+ml -- --mode=release
+ML_REL_CALLS="$ML_CALLS"
+ML_RUNS="$(grep -oE '^bash -s -- run oam-linux [a-z-]+' <<<"$ML_CALLS" | awk '{ print $6 }' | tr '\n' ' ')"
+ML_NV="$(tr -d '[:space:]' < .node-version)"; ML_NV="${ML_NV#v}"
+it "release: the last stdout line is the artifact dir, and the binary in it is the container's, byte for byte"
+if [ "$ML_RC" = "0" ] && [ -d "$ML_LAST" ] && cmp -s "$ML_LAST/oam-x86_64-unknown-linux-gnu" "$ML/files/oam-x86_64-unknown-linux-gnu" \
+   && [ "$(find "$ML_LAST" -type f | wc -l | tr -d ' ')" = "1" ]; then pass
+else fail "rc=$ML_RC last='$ML_LAST' stderr: $(tail -5 <<<"$ML_ERR")"; fi
 
-# --- the walk and the clone under what the 2026-10-04 review found -------------
+it "release: the release steps in order, the pinned Node version on each, then the reclaim"
+if [ "$ML_RUNS" = "prep gate test conformance node-suite build gc " ] \
+   && [ "$(grep -cxF -f <(printf 'bash -s -- run oam-linux %s '"$ML_NV"'\n' $ML_RUNS) <<<"$ML_REL_CALLS")" = "7" ]; then pass
+else fail "runs: $ML_RUNS calls: $ML_REL_CALLS"; fi
 
-# A VM still STOPPING when the walk begins -- the previous run's exit stop is
-# --async, so a re-run inside the minute sees exactly this -- says nothing
-# about capacity. It reads STOPPING at the top and on pass 1, which settles;
-# pass 2 is refused for capacity on every type with the budget then spent, and
-# the zone fallback must follow -- not a refusal to clone because the zone 'was
-# not shown to be out of capacity'. Budget 5s: pass 1 (one describe) ends
-# inside it, and what is left is the pause before pass 2.
-vms_run none zone-fallback=1 "zones=us-west1-a us-west1-c" clone-ok-zone=us-west1-c stopping-for=2 start-budget=5
-it "a VM found STOPPING on the first pass does not cost the walk its zone fallback"
-if [ "$VMS_RC" != "0" ] \
-   && grep -qF "Start VM yaw-linux-builder (status: STOPPING)" <<<"$VMS_ERR" \
-   && grep -qF "yaw-linux-builder is STOPPING, not TERMINATED -- waiting for it to settle before the next pass" <<<"$VMS_ERR" \
-   && grep -qF "no e2-highmem-4 capacity in us-west1-b (pass 2)" <<<"$VMS_ERR" \
-   && ! grep -qF "was not shown to be out of capacity" <<<"$VMS_ERR" \
-   && grep -qF "THIS RUN NOW BUILDS ON yaw-linux-builder-us-west1-c IN us-west1-c" <<<"$VMS_ERR"; then pass
-else fail "rc=$VMS_RC log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+it "release: start, container and sync come first, the glibc gate between the build and the pull, and the stop last"
+ml_line(){ grep -nF -- "$1" <<<"$ML_REL_CALLS" | head -1 | cut -d: -f1; }
+ML_ORDER="$(ml_line ' start oam-linux') $(ml_line ' container oam-linux') $(ml_line 'scp-to .oam-linux-leg/src.tar.gz') $(ml_line ' sync oam-linux .oam-linux-leg/src.tar.gz') $(ml_line ' run oam-linux prep') $(ml_line ' run oam-linux build') $(ml_line ' glibc oam-linux dist/oam-x86_64-unknown-linux-gnu') $(ml_line ' fetch oam-linux dist/oam-x86_64-unknown-linux-gnu') $(ml_line 'scp-from .oam-linux-leg/out/oam-x86_64-unknown-linux-gnu')"
+ML_SORTED="$(tr ' ' '\n' <<<"$ML_ORDER" | sort -n | tr '\n' ' ')"
+if [ "$(wc -w <<<"$ML_ORDER" | tr -d ' ')" = "9" ] && [ "$ML_ORDER " = "$ML_SORTED" ] \
+   && ml_stop_then_unlock "$ML_REL_CALLS" \
+   && grep -qF 'newest GLIBC_ symbol: 2.34 (floor 2.34)' <<<"$ML_ERR"; then pass
+else fail "order: $ML_ORDER calls: $ML_REL_CALLS"; fi
 
-# A restart under a step walks again with the first walk's drops: e2 was
-# refused for quota on pass 1 (regional; a minute changes nothing), so the
-# second walk must not set the VM back to it and ask again -- one quota
-# warning, three starts in all (e2 refused, n2 up, n2 up again), and the only
-# set back to e2 is the exit's.
-vms_run n2-highmem-4 start-quota ssh-mode=builder ssh-drop=1 fail-step-gate
-it "a second walk, after a stop under a step, keeps the types the first walk dropped"
-if [ "$VMS_RC" != "0" ] \
-   && [ "$(grep -c "e2-highmem-4 is not usable here -- not trying it again this run" <<<"$VMS_ERR")" = "1" ] \
-   && [ "$(grep -c 'Start VM yaw-linux-builder (status: TERMINATED)' <<<"$VMS_ERR")" = "2" ] \
-   && [ "$(grep -c 'instances start yaw-linux-builder' <<<"$VMS_LOG")" = "3" ] \
-   && [ "$(grep -c -- 'set-machine-type yaw-linux-builder --zone=us-west1-b --project=yaw-labs-prod --machine-type=e2-highmem-4' <<<"$VMS_LOG")" = "1" ] \
-   && grep -qF "remote prep ok" <<<"$VMS_ERR" && grep -qF "remote 'gate' failed" <<<"$VMS_ERR" \
-   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ]; then pass
-else fail "rc=$VMS_RC type=$(cat "$VMS_STATE/type") log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+printf '%s\nGLIBC_2.38\n' "$ML_GLIBC_OK" > "$ML/glibc"
+ml -- --mode=release
+it "release: a binary that needs a newer glibc than the floor fails, ships nothing, and the VM is still stopped"
+if [ "$ML_RC" != "0" ] && [ -z "$ML_OUT" ] && grep -qF 'needs GLIBC_2.38, newer than the 2.34 floor' <<<"$ML_ERR" \
+   && [ "$(ml_calls_of ' fetch ')" = "0" ] && ml_stop_then_unlock "$ML_CALLS"; then pass
+else fail "rc=$ML_RC out='$ML_OUT' calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
 
-# A Ctrl-C during the clone's `instances create`: gcloud exits 2 with the
-# request already through, and the clone comes up RUNNING in the other zone
-# while INSTANCE still names the original. The run must look, name the clone
-# with its delete command (and stop it, since nothing will build on it), and
-# still delete the image -- on the FIRST start, where cleanup() is not yet the
-# EXIT trap and the failure text promised the delete all the same.
-vms_run none zone-fallback=1 "zones=us-west1-a us-west1-c" interrupt-create-zone=us-west1-a
-it "a Ctrl-C during the clone's create names and stops the clone that came up anyway, and the first-start exit deletes the image"
-VMS_IMG="$(grep -oE 'yaw-linux-builder-img-[0-9]{8}-[0-9]{6}' <<<"$VMS_LOG" | head -1)"
-if [ "$VMS_RC" != "0" ] && [ -n "$VMS_IMG" ] \
-   && grep -qF "interrupted while creating yaw-linux-builder-us-west1-a in us-west1-a -- yaw-linux-builder-us-west1-a EXISTS in us-west1-a (RUNNING; a stop was issued) and is yours to delete: gcloud compute instances delete yaw-linux-builder-us-west1-a --zone=us-west1-a --project=yaw-labs-prod; machine image $VMS_IMG is deleted on exit" <<<"$VMS_ERR" \
-   && grep -qF -- "instances describe yaw-linux-builder-us-west1-a --zone=us-west1-a --project=yaw-labs-prod --format=value(status)" <<<"$VMS_LOG" \
-   && grep -qF -- "instances stop yaw-linux-builder-us-west1-a --zone=us-west1-a --project=yaw-labs-prod --async" <<<"$VMS_LOG" \
-   && [ "$(grep -c 'instances create ' <<<"$VMS_LOG")" = "1" ] \
-   && grep -qF -- "machine-images delete $VMS_IMG --project=yaw-labs-prod --quiet" <<<"$VMS_LOG" \
-   && grep -qF "deleted machine image $VMS_IMG" <<<"$VMS_ERR" \
-   && [ ! -e "$VMS_STATE/image" ] && [ "$(cat "$VMS_STATE/clone-status")" = "TERMINATED" ] \
-   && ! grep -q 'instances stop yaw-linux-builder ' <<<"$VMS_LOG" \
-   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ]; then pass
-else fail "rc=$VMS_RC img=${VMS_IMG:-?} log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+ml OAM_LINUX_GLIBC_MAX=2.38 -- --mode=release
+it "release: OAM_LINUX_GLIBC_MAX raises the floor on purpose"
+if [ "$ML_RC" = "0" ] && grep -qF 'newest GLIBC_ symbol: 2.38 (floor 2.38)' <<<"$ML_ERR"; then pass
+else fail "rc=$ML_RC stderr: $(tail -5 <<<"$ML_ERR")"; fi
 
-# The cold-run case: the image made, the first create refused for a missing
-# actAs permission (permanent), on the first start. The image must go at exit
-# as the failure text says -- and go even though the restore of the original
-# before the image failed (reject-set-e2: the stub's API says no): under
-# `set -e` a restore that returned non-zero unguarded would end the trap
-# before the delete. The restore is warned twice, there and again at exit.
-vms_run none zone-fallback=1 "zones=us-west1-a us-west1-c" deny-create reject-set-e2-highmem-4
-it "a clone create refused for good on the first start deletes the image at exit, as the failure says, even after a failed restore"
-VMS_IMG="$(grep -oE 'yaw-linux-builder-img-[0-9]{8}-[0-9]{6}' <<<"$VMS_LOG" | head -1)"
-if [ "$VMS_RC" != "0" ] && [ -n "$VMS_IMG" ] \
-   && grep -qF "creating yaw-linux-builder-us-west1-a in us-west1-a failed, and retrying cannot help: Required 'iam.serviceAccounts.actAs' permission" <<<"$VMS_ERR" \
-   && grep -qF "(machine image $VMS_IMG is deleted on exit)" <<<"$VMS_ERR" \
-   && [ "$(grep -c 'yaw-linux-builder is still n2-highmem-4 (status TERMINATED) -- set it back with:' <<<"$VMS_ERR")" = "2" ] \
-   && grep -qF -- "machine-images delete $VMS_IMG --project=yaw-labs-prod --quiet" <<<"$VMS_LOG" \
-   && grep -qF "deleted machine image $VMS_IMG" <<<"$VMS_ERR" \
-   && [ ! -e "$VMS_STATE/image" ] \
-   && [ "$(grep -c 'instances create ' <<<"$VMS_LOG")" = "1" ] \
-   && [ "$(cat "$VMS_STATE/type")" = "n2-highmem-4" ]; then pass
-else fail "rc=$VMS_RC img=${VMS_IMG:-?} log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+printf 'GLIBC_PRIVATE\n' > "$ML/glibc"
+ml -- --mode=release
+it "release: an objdump reading with no GLIBC_ version fails closed"
+if [ "$ML_RC" != "0" ] && [ -z "$ML_OUT" ] && grep -qF 'found no GLIBC_ symbol versions' <<<"$ML_ERR" \
+   && [ "$(ml_calls_of ' fetch ')" = "0" ]; then pass
+else fail "rc=$ML_RC stderr: $(tail -5 <<<"$ML_ERR")"; fi
+ml_reset
 
-# A Ctrl-C during the minutes-long image create: an interrupt, not a refused
-# image. The image gcloud was polling exists, so the exit deletes it, and the
-# run stops on the interrupt rather than going on to 'could not be made'.
-vms_run none zone-fallback=1 "zones=us-west1-a us-west1-c" clone-ok-zone=us-west1-c interrupt-image
-it "a Ctrl-C during the machine image's create is an interrupt, and the image it left is deleted at exit"
-VMS_IMG="$(grep -oE 'yaw-linux-builder-img-[0-9]{8}-[0-9]{6}' <<<"$VMS_LOG" | head -1)"
-if [ "$VMS_RC" != "0" ] && [ -n "$VMS_IMG" ] \
-   && grep -qF "interrupted while creating machine image $VMS_IMG from yaw-linux-builder -- the request may have gone through, so the exit deletes the image if it exists" <<<"$VMS_ERR" \
-   && ! grep -qF "could not be made" <<<"$VMS_ERR" \
-   && ! grep -q 'instances create' <<<"$VMS_LOG" \
-   && grep -qF -- "machine-images delete $VMS_IMG --project=yaw-labs-prod --quiet" <<<"$VMS_LOG" \
-   && [ ! -e "$VMS_STATE/image" ] \
-   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ]; then pass
-else fail "rc=$VMS_RC img=${VMS_IMG:-?} log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+: > "$ML/fail-test"
+ml -- --mode=release
+it "release: a failing step ends the run naming its log, is not retried, runs nothing after it, and stops the VM"
+if [ "$ML_RC" != "0" ] && [ -z "$ML_OUT" ] && grep -qE "remote 'test' failed -- see .*/logs/test\.log" <<<"$ML_ERR" \
+   && [ "$(ml_calls_of ' run oam-linux test ')" = "1" ] && [ "$(ml_calls_of ' run oam-linux conformance')" = "0" ] \
+   && ml_stop_then_unlock "$ML_CALLS"; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+ml_reset
 
-# The walk left the original on n2-highmem-4 and the restore before the image
-# is refused (reject-set-e2), while OAM_KEEP_VM=1 keeps the clone up at exit.
-# The clone message and the closing word must say what is so: the original
-# still on the fallback type, with the command that puts it back, at the clone
-# and again at exit after the clone's own line; the clone RUNNING, with the
-# command that stops it, and no stop issued.
-vms_run none zone-fallback=1 "zones=us-west1-a us-west1-c" clone-ok-zone=us-west1-c reject-set-e2-highmem-4 keep-vm=1
-it "an original whose restore failed before the clone is named, at the clone and at exit, as still on the fallback type"
-VMS_IMG="$(grep -oE 'yaw-linux-builder-img-[0-9]{8}-[0-9]{6}' <<<"$VMS_LOG" | head -1)"
-VMS_ORIGIN_NOTE="yaw-linux-builder in us-west1-b is stopped but STILL ON n2-highmem-4, not its own e2-highmem-4: setting it back failed before the clone was made. Set it back with: gcloud compute instances stop yaw-linux-builder --zone=us-west1-b --project=yaw-labs-prod && gcloud compute instances set-machine-type yaw-linux-builder --zone=us-west1-b --project=yaw-labs-prod --machine-type=e2-highmem-4"
-VMS_L_CLONE_WORD="$(grep -nF "this run's clone of yaw-linux-builder in us-west1-b" <<<"$VMS_ERR" | head -1 | cut -d: -f1)"
-VMS_L_ORIGIN_WORD="$(grep -nF "$VMS_ORIGIN_NOTE" <<<"$VMS_ERR" | tail -1 | cut -d: -f1)"
-if [ "$VMS_RC" != "0" ] && [ -n "$VMS_IMG" ] \
-   && grep -qF "yaw-linux-builder is still n2-highmem-4 (status TERMINATED) -- set it back with:" <<<"$VMS_ERR" \
-   && [ "$(grep -cF "$VMS_ORIGIN_NOTE" <<<"$VMS_ERR")" = "2" ] \
-   && grep -qF "made from machine image $VMS_IMG. $VMS_ORIGIN_NOTE The next run finds it by name as before, and reads that type as its own." <<<"$VMS_ERR" \
-   && ! grep -qF "yaw-linux-builder is untouched" <<<"$VMS_ERR" \
-   && [ -n "$VMS_L_CLONE_WORD" ] && [ -n "$VMS_L_ORIGIN_WORD" ] && [ "$VMS_L_CLONE_WORD" -lt "$VMS_L_ORIGIN_WORD" ] \
-   && [ "$(cat "$VMS_STATE/type")" = "n2-highmem-4" ]; then pass
-else fail "rc=$VMS_RC clone-word@${VMS_L_CLONE_WORD:-?} origin-word@${VMS_L_ORIGIN_WORD:-?} type=$(cat "$VMS_STATE/type") log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+: > "$ML/drop-conformance"
+ml OAM_LINUX_RETRY_DELAY=0 -- --mode=release
+it "release: a step whose ssh connection drops (exit 255) is retried once, alone, and the leg goes on"
+if [ "$ML_RC" = "0" ] && [ -d "$ML_LAST" ] && [ "$(ml_calls_of ' run oam-linux conformance ')" = "2" ] \
+   && [ "$(ml_calls_of ' run oam-linux prep ')" = "1" ] && [ "$(ml_calls_of ' sync oam-linux')" = "1" ] \
+   && grep -qF "remote 'conformance': the ssh connection" <<<"$ML_ERR" \
+   && [ -f "${ML_LAST%/artifacts}/logs/conformance.dropped.log" ]; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+ml_reset
 
-it "with OAM_KEEP_VM=1 the clone is left RUNNING, and the clone message and the closing word say so, with the stop command"
-if grep -qF "The clone is left RUNNING when this run exits (OAM_KEEP_VM=1) and is NOT deleted; the image is." <<<"$VMS_ERR" \
-   && grep -qF "yaw-linux-builder-us-west1-c in us-west1-c, this run's clone of yaw-linux-builder in us-west1-b, is left RUNNING (OAM_KEEP_VM=1) -- it costs compute until: gcloud compute instances stop yaw-linux-builder-us-west1-c --zone=us-west1-c --project=yaw-labs-prod -- and is yours to delete when nothing needs it: gcloud compute instances delete yaw-linux-builder-us-west1-c --zone=us-west1-c --project=yaw-labs-prod" <<<"$VMS_ERR" \
-   && ! grep -qF "is left stopped" <<<"$VMS_ERR" \
-   && ! grep -q 'instances stop' <<<"$VMS_LOG" \
-   && [ "$(cat "$VMS_STATE/clone-status")" = "RUNNING" ] \
-   && grep -qF -- "machine-images delete $VMS_IMG --project=yaw-labs-prod --quiet" <<<"$VMS_LOG"; then pass
-else fail "rc=$VMS_RC clone-status=$(cat "$VMS_STATE/clone-status") log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+: > "$ML/drops-conformance"
+ml OAM_LINUX_RETRY_DELAY=0 -- --mode=release
+it "release: a second drop fails the step -- one retry, never a loop -- and the VM is still stopped"
+if [ "$ML_RC" != "0" ] && [ -z "$ML_OUT" ] && [ "$(ml_calls_of ' run oam-linux conformance ')" = "2" ] \
+   && grep -qF "remote 'conformance' failed" <<<"$ML_ERR" && [ "$(ml_calls_of ' run oam-linux node-suite')" = "0" ] \
+   && ml_stop_then_unlock "$ML_CALLS"; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+ml_reset
 
-# The VM read STOPPING behind the drop and came back RUNNING by someone else's
-# hand while the restart waited for the stop to settle: a guest seconds into
-# its boot. Its sshd is waited for on the serial console before the reconnect,
-# as after this run's own start -- and it is not started again. (The settle
-# wait polls every 10s, so this case costs one of those.)
-vms_run e2-highmem-4 ssh-mode=builder ssh-drop=1 fail-step-gate drop-status=RUNNING drop-stopping-for=2
-it "a VM that came back RUNNING on its own under the restart's settle wait is waited for like a fresh boot before the reconnect"
-VMS_L_OPS="$(vms_line 'operations list' 1)"
-VMS_L_SERIAL2="$(vms_line 'get-serial-port-output' 2)"
-VMS_L_PROBE2="$(grep -nE -- '^ssh .* true$' <<<"$VMS_LOG" | awk -F: -v s="${VMS_L_OPS:-0}" '$1 > s { print $1; exit }')"
-if [ "$VMS_RC" != "0" ] \
-   && grep -qF "ssh transport dropped because yaw-linux-builder is STOPPING -- last stop operation:" <<<"$VMS_ERR" \
-   && grep -qF "yaw-linux-builder is STOPPING -- waiting for it to settle before starting it again (0s of 180s)" <<<"$VMS_ERR" \
-   && grep -qF "yaw-linux-builder is RUNNING again -- someone else started it; waiting for its sshd, then reconnecting without starting it" <<<"$VMS_ERR" \
-   && [ "$(grep -c 'instances start yaw-linux-builder' <<<"$VMS_LOG")" = "1" ] \
-   && [ "$(grep -c 'guest sshd up' <<<"$VMS_ERR")" = "2" ] \
-   && [ -n "$VMS_L_OPS" ] && [ -n "$VMS_L_SERIAL2" ] && [ -n "$VMS_L_PROBE2" ] \
-   && [ "$VMS_L_OPS" -lt "$VMS_L_SERIAL2" ] && [ "$VMS_L_SERIAL2" -lt "$VMS_L_PROBE2" ] \
-   && grep -qF "remote prep ok" <<<"$VMS_ERR" && grep -qF "remote 'gate' failed" <<<"$VMS_ERR"; then pass
-else fail "rc=$VMS_RC ops@${VMS_L_OPS:-?} serial2@${VMS_L_SERIAL2:-?} probe2@${VMS_L_PROBE2:-?} log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+ml OAM_LINUX_RETRY_DELAY=soon -- --mode=release
+it "release: a bad OAM_LINUX_RETRY_DELAY fails before any ssh"
+if [ "$ML_RC" = "1" ] && [ -z "$ML_CALLS" ] && grep -qF 'invalid OAM_LINUX_RETRY_DELAY' <<<"$ML_ERR"; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS"; fi
 
-# Three attempts: the first drop a VM stop (started again), the next two with
-# the VM RUNNING. The closing postmortem is about the transport, so it counts
-# the two RUNNING drops and names the stop apart -- not 'three times in a row'
-# with advice to switch transports. OAM_KEEP_VM_SCHEDULE=1 on the same run:
-# its warning has to describe this restart, not a run the stop kills.
-vms_run e2-highmem-4 ssh-mode=builder ssh-drop=3 step-attempts=3 "drop-status=TERMINATED RUNNING RUNNING" keep-schedule=1
-it "the postmortem after a stop and two transport drops counts the two drops and names the stop apart"
-if [ "$VMS_RC" != "0" ] \
-   && grep -qF "remote 'prep' lost its ssh transport on attempt 1 of 3 because yaw-linux-builder was stopped under it (TERMINATED)" <<<"$VMS_ERR" \
-   && grep -qF "remote 'prep' lost its ssh transport on attempt 2 of 3 while yaw-linux-builder is RUNNING -- reconnecting and running it again" <<<"$VMS_ERR" \
-   && grep -qF "ssh transport dropped under this step 2 times while yaw-linux-builder was RUNNING, each time reconnected (1 of the 3 attempts ended with yaw-linux-builder stopped under the step instead, and it was started again each time) -- the path to the builder is not holding (last transport: direct, direct IP 203.0.113.9). Try the other one: OAM_IAP_SSH_MODE=tunnel or =direct" <<<"$VMS_ERR" \
-   && ! grep -qF "times in a row" <<<"$VMS_ERR" \
-   && [ "$(grep -c 'instances start yaw-linux-builder' <<<"$VMS_LOG")" = "2" ] \
-   && [ "$(grep -cE 'build-remote.sh prep$' <<<"$VMS_LOG")" = "3" ] \
-   && grep -qF "remote 'prep' failed -- see" <<<"$VMS_ERR"; then pass
-else fail "rc=$VMS_RC log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+ml OAM_KEEP_VM=1 -- --mode=release
+it "release: OAM_KEEP_VM=1 leaves the VM running, and says how to stop it"
+if [ "$ML_RC" = "0" ] && [ "$(ml_calls_of ' stop oam-linux')" = "0" ] && grep -qF '/opt/homebrew/bin/limactl stop oam-linux' <<<"$ML_ERR"; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS"; fi
+ML_KEEP_RUN="$(grep -oE '^bash -s -- lock [^ ]+' <<<"$ML_CALLS" | awk '{ print $5 }')"
+it "release: OAM_KEEP_VM=1 leaves the Mac build lock held by its run too, and prints how to release it"
+if [ "$(ml_calls_of ' unlock ')" = "0" ] && [ -n "$ML_KEEP_RUN" ] \
+   && grep -qxF "run=$ML_KEEP_RUN" "$MLM/home/.lima-build.lock/owner" 2>/dev/null \
+   && grep -qF "rm -rf ~/.lima-build.lock" <<<"$ML_ERR"; then pass
+else fail "run=$ML_KEEP_RUN calls: $ML_CALLS owner: $(cat "$MLM/home/.lima-build.lock/owner" 2>&1)"; fi
+ml_reset
 
-it "the OAM_KEEP_VM_SCHEDULE=1 warning describes the restart that follows a scheduled stop, not a run the stop kills"
-if grep -qF "OAM_KEEP_VM_SCHEDULE=1 -- leaving the VM's instance schedules attached. A scheduled stop under a remote step is followed by a start of the VM (the same walk as at the top, which can clone it into another zone) and the step again, counting against OAM_REMOTE_STEP_ATTEMPTS=3, and the VM is then this run's to stop on exit (OAM_KEEP_VM=1 keeps it); a stop outside a remote step, or on the last attempt, ends the run" <<<"$VMS_ERR" \
-   && ! grep -qF "will kill this run" <<<"$VMS_ERR" \
-   && ! grep -q 'value(resourcePolicies)' <<<"$VMS_LOG"; then pass
-else fail "rc=$VMS_RC log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+printf '%064d\n' 0 > "$ML/sum-override"
+ml -- --mode=release
+it "release: a pulled binary whose hash is not the container's is refused"
+if [ "$ML_RC" != "0" ] && [ -z "$ML_OUT" ] && grep -qF 'refusing a file that changed on the way' <<<"$ML_ERR"; then pass
+else fail "rc=$ML_RC stderr: $(tail -5 <<<"$ML_ERR")"; fi
+ml_reset
+
+# surface-gaps pulls into this checkout's tracked conformance/surface-gaps.json,
+# so a copy that fails the hash check must leave that file as it was. The
+# file is put back by hand if the case breaks it, so a regression here fails
+# the case without dirtying the tree.
+ML_SG="conformance/surface-gaps.json"
+ML_SG_BEFORE="$(sha256sum "$ML_SG" | cut -d' ' -f1)"
+cp "$ML_SG" "$ML/sg-backup"
+printf '%064d\n' 0 > "$ML/sum-override"
+ml -- --mode=surface-gaps
+ML_SG_AFTER="$(sha256sum "$ML_SG" | cut -d' ' -f1)"
+[ "$ML_SG_AFTER" = "$ML_SG_BEFORE" ] || cp "$ML/sg-backup" "$ML_SG"
+it "surface-gaps: a pulled ratchet whose hash is not the container's never lands on the tracked file"
+if [ "$ML_RC" != "0" ] && [ "$ML_SG_AFTER" = "$ML_SG_BEFORE" ] && grep -qF 'refusing a file that changed on the way' <<<"$ML_ERR"; then pass
+else fail "rc=$ML_RC before=$ML_SG_BEFORE after=$ML_SG_AFTER stderr: $(tail -5 <<<"$ML_ERR")"; fi
+ml_reset
+
+ml OAM_LINUX_FAST=1 -- --mode=release
+it "release: OAM_LINUX_FAST=1 builds without the gates, loudly, and still checks the glibc floor"
+ML_RUNS="$(grep -oE '^bash -s -- run oam-linux [a-z-]+' <<<"$ML_CALLS" | awk '{ print $6 }' | tr '\n' ' ')"
+if [ "$ML_RC" = "0" ] && [ "$ML_RUNS" = "prep build gc " ] && grep -qF 'NOT for a real release' <<<"$ML_ERR" \
+   && [ "$(ml_calls_of ' glibc oam-linux')" = "1" ]; then pass
+else fail "rc=$ML_RC runs: $ML_RUNS"; fi
+
+: > "$ML/fail-conformance"
+ml -- --mode=measure
+it "measure: a tripped gate is advisory, and the four scorecards still come back under linux-x64/"
+if [ "$ML_RC" = "0" ] && [ "$(find "$ML_LAST/linux-x64" -type f 2>/dev/null | wc -l | tr -d ' ')" = "4" ] \
+   && grep -qF "remote 'conformance' failed (advisory" <<<"$ML_ERR" \
+   && [ "$(ml_calls_of ' run oam-linux node-suite')" = "1" ] && [ "$(ml_calls_of ' glibc ')" = "0" ]; then pass
+else fail "rc=$ML_RC last='$ML_LAST' calls: $ML_CALLS"; fi
+ml_reset
+
+# The callers: every leg that used to name the cloud orchestrator now names
+# this one, release-local runs it after the mac legs, and nothing in the tree
+# still reaches for the deleted files or the cloud CLI.
+it "release-local, node-compat-measure and bench-platforms run the linux leg from build-platforms-mac-linux.sh"
+ML_CALLERS_BAD=""
+for f in scripts/release-local.sh scripts/node-compat-measure.sh scripts/bench-platforms.sh; do
+  grep -qF 'build-platforms-mac-linux.sh" --mode=' "$f" || ML_CALLERS_BAD="$ML_CALLERS_BAD $f"
+done
+if [ -z "$ML_CALLERS_BAD" ]; then pass; else fail "not repointed:$ML_CALLERS_BAD"; fi
+
+it "node-compat-measure and bench-platforms run the linux preflight (which stops a left-running VM) before the mac leg"
+ML_PRE_BAD=""
+for f in scripts/node-compat-measure.sh scripts/bench-platforms.sh; do
+  pre="$(grep -nF 'build-platforms-mac-linux.sh" --preflight-only' "$f" | head -1 | cut -d: -f1)"
+  mac="$(grep -nF 'build-platforms-tailnet.sh" --mode=' "$f" | head -1 | cut -d: -f1)"
+  if [ -z "$pre" ] || [ -z "$mac" ] || [ "$pre" -ge "$mac" ]; then ML_PRE_BAD="$ML_PRE_BAD $f(preflight@${pre:-none} mac@${mac:-none})"; fi
+done
+if [ -z "$ML_PRE_BAD" ]; then pass; else fail "$ML_PRE_BAD"; fi
+
+it "release-local.sh: the linux leg runs after the mac legs, and copies the one exact asset name"
+ml_rl(){ grep -nF -- "$1" scripts/release-local.sh | head -1 | cut -d: -f1; }
+ML_RL_MAC="$(ml_rl 'build-platforms-tailnet.sh" --mode=release')"
+ML_RL_LIN="$(ml_rl 'LINUX_ART=$(run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "linux leg" linux_leg_attempt)')"
+ML_RL_CP="$(ml_rl 'cp "$LINUX_ART/oam-x86_64-unknown-linux-gnu" "$RELEASE_DIR/"')"
+if [ -n "$ML_RL_MAC" ] && [ -n "$ML_RL_LIN" ] && [ -n "$ML_RL_CP" ] \
+   && [ "$ML_RL_MAC" -lt "$ML_RL_LIN" ] && [ "$ML_RL_LIN" -lt "$ML_RL_CP" ] \
+   && ! grep -v '^[[:space:]]*#' scripts/release-local.sh | grep -qF 'unknown-linux-gnu*'; then pass
+else fail "mac leg@${ML_RL_MAC:-none} linux leg@${ML_RL_LIN:-none} linux cp@${ML_RL_CP:-none}"; fi
+
+it "no script still names the cloud orchestrator, its helpers or its CLI"
+# The pattern is spelled in pieces so this file does not match itself.
+ML_LEFT="$(grep -lE 'build-platforms-g''cp-iap|iap-hel''pers|gclo''ud|OAM_G''CP_|OAM_I''AP_' scripts/*.sh scripts/lib/*.sh 2>/dev/null || true)"
+if [ -z "$ML_LEFT" ] && [ ! -e scripts/build-platforms-g''cp-iap.sh ] && [ ! -e scripts/lib/iap-hel''pers.sh ]; then pass
+else fail "still there: $ML_LEFT"; fi
+
+# =============================================================================
+group "the Mac build lock (protocol v1.2) -- mac-linux-vm.sh lock/unlock and the leg"
+# =============================================================================
+# ~/.lima-build.lock on the build Mac, shared with the Yaw repo's linux leg.
+# The driver's lock verbs run for real against the fake Mac set up in the
+# group above ($MLM: home, limactl, stat); the leg's cases run the real
+# orchestrator against the stubbed ssh, whose lock/unlock calls reach that
+# same driver and fake Mac. Nothing here reaches a Mac.
+LK="$MLM/home/.lima-build.lock"
+# lk <verb> [args...]  -- the driver alone; sets LK_RC and LK_ERR.
+lk(){
+  LK_ERR="$(HOME="$MLM/home" PATH="$MLM/bin:$PATH" bash scripts/mac-linux-vm.sh "$@" 2>&1 >/dev/null </dev/null)"
+  LK_RC=$?
+}
+# lk_plant <repo> <instance> <run>  -- a lock some other run holds.
+lk_plant(){
+  mkdir -p "$LK"
+  printf 'repo=%s\ninstance=%s\nrun=%s\nhost=other-box\npid=4242\nstarted=2026-11-01T00:00:00Z\n' "$1" "$2" "$3" > "$LK/owner"
+}
+ML_HOST="$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-')"; [ -n "$ML_HOST" ] || ML_HOST=unknown
+# lk_age <seconds>  -- backdate the lock dir's mtime, portably: touch -t takes
+# a local [[CC]YY]MMDDhhmm[.SS] on GNU and BSD alike; GNU date reads -d @N,
+# BSD date -r N.
+lk_age(){
+  local t=$(( $(date +%s) - $1 )) stamp
+  stamp="$(date -d "@$t" +%Y%m%d%H%M.%S 2>/dev/null || date -r "$t" +%Y%m%d%H%M.%S)"
+  touch -t "$stamp" "$LK"
+}
+# lk_owner_set <key> <value>  -- rewrite one owner key (no sed -i: BSD sed
+# wants a suffix argument GNU sed does not).
+lk_owner_set(){
+  sed "s/^$1=.*/$1=$2/" "$LK/owner" > "$LK/owner.edit" && mv -f "$LK/owner.edit" "$LK/owner"
+}
+
+ml_reset
+lk lock r1 oam oam-linux box-1 77
+LK_OWNER="$(cat "$LK/owner" 2>/dev/null)"
+it "lock: a free lock is taken -- the dir, then an owner with exactly the six keys, no temp file left"
+if [ "$LK_RC" = "0" ] && [ ! -e "$LK/owner.tmp" ] \
+   && [ "$(cut -d= -f1 <<<"$LK_OWNER" | tr '\n' ' ')" = "repo instance run host pid started " ] \
+   && [ "$(head -5 <<<"$LK_OWNER" | tr '\n' ' ')" = "repo=oam instance=oam-linux run=r1 host=box-1 pid=77 " ] \
+   && grep -qE '^started=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' <<<"$LK_OWNER"; then pass
+else fail "rc=$LK_RC owner: ${LK_OWNER//$'\n'/ } err: $LK_ERR"; fi
+
+lk unlock r2
+LK_OTHER="$LK_RC|$([ -d "$LK" ] && echo kept)|$(grep -c 'run=r1' <<<"$LK_ERR")"
+lk unlock r1
+LK_MINE="$LK_RC|$([ -d "$LK" ] && echo kept)"
+lk unlock r1
+it "unlock: only the owning run releases it; another run's unlock is BUSY and leaves it; no lock is a no-op"
+if [ "$LK_OTHER" = "3|kept|1" ] && [ "$LK_MINE" = "0|" ] && [ "$LK_RC" = "0" ]; then pass
+else fail "other: $LK_OTHER mine: $LK_MINE none: $LK_RC ($LK_ERR)"; fi
+
+# v1.2: unlock reads run= IN PLACE first. Another run's lock, or one with no
+# owner file (a run mid-acquire), is exit 3 and is never moved -- not even
+# renamed aside and put back, which would free the path for a moment. The
+# mv log proves no rename of the lock path ran at all.
+lk_ino(){ stat -c %i "$LK" 2>/dev/null || stat -f %i "$LK"; }
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+LK_INO0="$(lk_ino)"
+: > "$MLM/mv-log"
+lk unlock r1
+LK_UN_OTHER="$LK_RC|$(grep -c 'run=y-run-9' <<<"$LK_ERR")|$([ "$(lk_ino)" = "$LK_INO0" ] && echo same)|$(wc -l < "$MLM/mv-log" | tr -d ' ')|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+ml_reset
+mkdir -p "$LK"; lk_age 1000
+LK_INO0="$(lk_ino)"
+: > "$MLM/mv-log"
+lk unlock r1
+LK_UN_OWNERLESS="$LK_RC|$(grep -c 'no owner file' <<<"$LK_ERR")|$([ "$(lk_ino)" = "$LK_INO0" ] && echo same)|$([ -e "$LK/owner" ] && echo owner)|$(wc -l < "$MLM/mv-log" | tr -d ' ')|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+it "unlock (v1.2): another run's lock and an ownerless one are read in place -- exit 3, never moved (no rename at all), same dir"
+if [ "$LK_UN_OTHER" = "3|1|same|0|0" ] && [ "$LK_UN_OWNERLESS" = "3|1|same||0|0" ]; then pass
+else fail "other: $LK_UN_OTHER ownerless: $LK_UN_OWNERLESS err: $LK_ERR"; fi
+
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
+lk lock r1 oam oam-linux box-1 77
+it "lock: held by a run whose instance is Running -- BUSY (exit 3) naming repo, instance, run, host, pid, started; untouched"
+if [ "$LK_RC" = "3" ] && grep -qF 'BUSY' <<<"$LK_ERR" \
+   && grep -qF 'repo=yaw instance=yaw-linux run=y-run-9 host=other-box pid=4242 started=2026-11-01T00:00:00Z' <<<"$LK_ERR" \
+   && grep -qxF 'run=y-run-9' "$LK/owner"; then pass
+else fail "rc=$LK_RC err: $LK_ERR"; fi
+
+# STALE needs BOTH: the owner's instance not Running AND the lock dir over
+# 15 minutes (900 s) old. A fresh lock whose VM is stopped is a run that
+# provisions or preflights with its VM down: BUSY.
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk_age 840
+lk lock r1 oam oam-linux box-1 77
+it "lock: an owned lock under 15 min whose instance is Stopped is BUSY (exit 3) -- not taken over, owner untouched"
+if [ "$LK_RC" = "3" ] && grep -qF 'only' <<<"$LK_ERR" && grep -qF 'run=y-run-9' <<<"$LK_ERR" \
+   && ! grep -qF 'STALE' <<<"$LK_ERR" && grep -qxF 'run=y-run-9' "$LK/owner"; then pass
+else fail "rc=$LK_RC err: $LK_ERR"; fi
+
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk_age 1000
+lk lock r1 oam oam-linux box-1 77
+LK_STOPPED="$LK_RC|$(grep -c 'STALE.*run=y-run-9' <<<"$LK_ERR")|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+ml_reset
+lk_plant yaw yaw-gone y-run-8
+lk_age 1000
+lk lock r1 oam oam-linux box-1 77
+LK_MISSING="$LK_RC|$(grep -c 'STALE' <<<"$LK_ERR")|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+it "lock: an owned lock over 15 min whose instance is Stopped, or missing from limactl, is STALE -- logged, taken over, nothing left aside"
+if [ "$LK_STOPPED" = "0|1|1|0" ] && [ "$LK_MISSING" = "0|1|1|0" ]; then pass
+else fail "stopped: $LK_STOPPED missing: $LK_MISSING err: $LK_ERR"; fi
+
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
+lk_age 100000
+lk lock r1 oam oam-linux box-1 77
+it "lock: an owned lock however old is BUSY while its instance is Running"
+if [ "$LK_RC" = "3" ] && ! grep -qF 'STALE' <<<"$LK_ERR" && grep -qF 'yaw-linux is Running' <<<"$LK_ERR" \
+   && grep -qxF 'run=y-run-9' "$LK/owner"; then pass
+else fail "rc=$LK_RC err: $LK_ERR"; fi
+
+ml_reset
+mkdir -p "$LK"
+lk_age 840
+lk lock r1 oam oam-linux box-1 77
+LK_YOUNG="$LK_RC|$(grep -c 'mid-acquire' <<<"$LK_ERR")|$([ -e "$LK/owner" ] && echo owner)|$([ -d "$LK" ] && echo kept)"
+lk_age 1000
+lk lock r1 oam oam-linux box-1 77
+LK_OLD="$LK_RC|$(grep -c 'STALE' <<<"$LK_ERR")|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)"
+it "lock: an ownerless lock dir is BUSY under 15 min (someone mid-acquire), STALE and taken over past it"
+if [ "$LK_YOUNG" = "3|1||kept" ] && [ "$LK_OLD" = "0|1|1" ]; then pass
+else fail "young: $LK_YOUNG old: $LK_OLD err: $LK_ERR"; fi
+
+# The takeover renames the lock aside and re-reads it there: a lock that
+# changed hands between the judgement and the rename goes back, untouched.
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk_age 1000
+: > "$MLM/mv-race"
+lk lock r1 oam oam-linux box-1 77
+LK_TR="$LK_RC|$(grep -c 'changed hands' <<<"$LK_ERR")|$(grep -c 'put back' <<<"$LK_ERR")|$(grep -c '^run=y-new$' "$LK/owner" 2>/dev/null)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+ml_reset
+mkdir -p "$LK"; lk_age 1000
+: > "$MLM/mv-race"
+lk lock r1 oam oam-linux box-1 77
+LK_TR_OWNERLESS="$LK_RC|$(grep -c '^run=y-new$' "$LK/owner" 2>/dev/null)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+it "lock: a stale lock that changes hands while it is renamed aside (run= differs, or an ownerless one gains an owner) is put back -- BUSY"
+if [ "$LK_TR" = "3|1|1|1|0" ] && [ "$LK_TR_OWNERLESS" = "3|1|0" ]; then pass
+else fail "owned: $LK_TR ownerless: $LK_TR_OWNERLESS err: $LK_ERR"; fi
+
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk_age 1000
+echo retake > "$MLM/mv-race"
+lk lock r1 oam oam-linux box-1 77
+LK_ASIDE="$(ls -d "$LK".stale.* 2>/dev/null | head -n1)"
+it "lock: ...and when the path is taken again before it can go back, the displaced lock stays aside, reported, not deleted -- BUSY"
+if [ "$LK_RC" = "3" ] && [ -n "$LK_ASIDE" ] && grep -qxF 'run=y-new' "$LK_ASIDE/owner" 2>/dev/null \
+   && grep -qxF 'run=y-third' "$LK/owner" && grep -qF 'not deleted' <<<"$LK_ERR" \
+   && grep -qF "${LK_ASIDE##*/}" <<<"$LK_ERR"; then pass
+else fail "rc=$LK_RC aside='$LK_ASIDE' err: $LK_ERR"; fi
+
+# Unlock renames the lock aside too, and removes it only when the moved
+# owner's run= is this run's.
+ml_reset
+lk lock r1 oam oam-linux box-1 77
+: > "$MLM/mv-race"
+lk unlock r1
+LK_UN_SWAP="$LK_RC|$(grep -c 'changed hands' <<<"$LK_ERR")|$(grep -c '^run=y-new$' "$LK/owner" 2>/dev/null)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+ml_reset
+lk lock r1 oam oam-linux box-1 77
+echo retake > "$MLM/mv-race"
+lk unlock r1
+LK_ASIDE="$(ls -d "$LK".release.* 2>/dev/null | head -n1)"
+LK_UN_RETAKE="$LK_RC|$(grep -c '^run=y-third$' "$LK/owner" 2>/dev/null)|$(grep -c '^run=y-new$' "$LK_ASIDE/owner" 2>/dev/null)|$(grep -c 'NOT deleted' <<<"$LK_ERR")"
+it "unlock: a lock whose run= differs once renamed aside is put back (exit 3); with the path re-taken it stays aside, reported (exit 4); nothing of another run's deleted"
+if [ "$LK_UN_SWAP" = "3|1|1|0" ] && [ "$LK_UN_RETAKE" = "4|1|1|1" ]; then pass
+else fail "swap: $LK_UN_SWAP retake: $LK_UN_RETAKE err: $LK_ERR"; fi
+
+ml_reset
+mkdir -p "$LK"; lk_age 1000
+echo gnu > "$MLM/stat-mode"
+lk lock r1 oam oam-linux box-1 77
+LK_GNU="$LK_RC|$(grep -c 'STALE' <<<"$LK_ERR")|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)"
+ml_reset
+mkdir -p "$LK"; lk_age 1000
+echo none > "$MLM/stat-mode"
+lk lock r1 oam oam-linux box-1 77
+LK_NOSTAT="$LK_RC|$(grep -c "age could not be read" <<<"$LK_ERR")|$([ -d "$LK" ] && echo kept)|$([ -e "$LK/owner" ] && echo owner)"
+it "lock: an ownerless dir's age falls back to GNU stat -c %Y when stat -f %m is not BSD's; with neither, BUSY, untouched"
+if [ "$LK_GNU" = "0|1|1" ] && [ "$LK_NOSTAT" = "3|1|kept|" ]; then pass
+else fail "gnu: $LK_GNU none: $LK_NOSTAT err: $LK_ERR"; fi
+
+# Another run wins the lock between the stale takeover and the retry: the
+# fake mkdir plants its owner (with its VM Running) just before attempt two.
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk_age 1000
+: > "$MLM/mkdir-race"
+lk lock r1 oam oam-linux box-1 77
+LK_RACE_N="$(wc -l < "$MLM/mkdir-attempts" 2>/dev/null | tr -d ' ')"
+it "lock: losing the one retried mkdir is BUSY after exactly one retry, naming the winner; the winner's lock untouched"
+if [ "$LK_RC" = "3" ] && [ "$LK_RACE_N" = "2" ] && grep -qF 'taken while this run retried' <<<"$LK_ERR" \
+   && grep -qF 'run=y-race' <<<"$LK_ERR" && grep -qxF 'run=y-race' "$LK/owner"; then pass
+else fail "rc=$LK_RC attempts=$LK_RACE_N err: $LK_ERR"; fi
+
+ml_reset
+printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
+lk lock r1 oam oam-linux box-1 77
+LK_NB="$LK_RC|$([ -d "$LK" ] && echo kept)|$(grep -c 'yaw-linux' <<<"$LK_ERR")"
+ml_reset
+: > "$MLM/list-fail"
+lk lock r1 oam oam-linux box-1 77
+LK_NOLIST="$LK_RC|$([ -d "$LK" ] && echo kept)"
+it "lock: another instance Running after the lock is taken releases it and refuses; an unlistable Mac does too"
+if [ "$LK_NB" = "3||1" ] && [ "$LK_NOLIST" = "1|" ]; then pass
+else fail "neighbour: $LK_NB unlistable: $LK_NOLIST err: $LK_ERR"; fi
+
+ml_reset
+LK_BAD=""
+for argv in "lock r1 git oam-linux" "lock r;1 oam oam-linux" "lock r1 oam -oam" "lock r1 oam oam-linux box/1 7" \
+            "lock r1 oam oam-linux box 7x" "lock" "unlock" "unlock ../x"; do
+  # shellcheck disable=SC2086  # word-split on purpose: each case is an argv
+  lk $argv
+  if [ "$LK_RC" != "1" ] || ! grep -q FATAL <<<"$LK_ERR" || [ -e "$LK" ]; then LK_BAD="$LK_BAD [$argv: rc=$LK_RC]"; fi
+done
+it "lock/unlock refuse a bad run id, repo, instance, host or pid before touching anything"
+if [ -z "$LK_BAD" ]; then pass; else fail "$LK_BAD"; fi
+
+# Two takers judged the same crash-left ownerless lock stale; one removed it
+# and made a fresh lock dir, not yet owned, which the other then renamed
+# aside: still ownerless, but a new dir (new inode, and 0 s old). It is put
+# back, never removed -- the takeover checks the moved dir's inode against
+# the one judged. "replica" carries the old mtime too: only the inode tells.
+LK_ABA=""
+for mode in fresh replica; do
+  ml_reset
+  mkdir -p "$LK"; lk_age 1000
+  echo "$mode" > "$MLM/mv-race"
+  lk lock r1 oam oam-linux box-1 77
+  LK_ABA="$LK_ABA [$mode:$LK_RC|$([ -d "$LK" ] && echo kept)|$([ -e "$LK/owner" ] && echo owner)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')|$(grep -c 'put back' <<<"$LK_ERR")]"
+done
+it "lock: an ownerless stale lock REPLACED by a new lock dir between the judgement and the rename (fresh, or with the old mtime) is put back, not removed -- BUSY"
+if [ "$LK_ABA" = " [fresh:3|kept||0|1] [replica:3|kept||0|1]" ]; then pass
+else fail "$LK_ABA err: $LK_ERR"; fi
+
+# v1.2: once moved, an ownerless lock must still have no owner file AND still
+# be older than 900 s. "touch" keeps the moved dir itself -- same inode, still
+# ownerless -- but gives it a fresh mtime, so only the age re-check catches
+# it: put back, BUSY, nothing removed.
+ml_reset
+mkdir -p "$LK"; lk_age 1000
+LK_INO0="$(lk_ino)"
+echo touch > "$MLM/mv-race"
+lk lock r1 oam oam-linux box-1 77
+LK_AGE_RECHECK="$LK_RC|$([ "$(lk_ino)" = "$LK_INO0" ] && echo same)|$([ -e "$LK/owner" ] && echo owner)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')|$(grep -c 'put back' <<<"$LK_ERR")"
+it "lock (v1.2): an ownerless stale lock that is no longer old once moved aside (same dir, fresh mtime) is put back, not removed -- BUSY"
+if [ "$LK_AGE_RECHECK" = "3|same||0|1" ]; then pass
+else fail "$LK_AGE_RECHECK err: $LK_ERR"; fi
+
+# The put-back's own race: a new lock appears at the path between the
+# "is it free" check and the rename back, so mv lands the displaced dir
+# INSIDE it. That is undone: the displaced dir returns to its aside name.
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk_age 1000
+: > "$MLM/mv-race"; : > "$MLM/mv-nest"
+lk lock r1 oam oam-linux box-1 77
+LK_ASIDE="$(ls -d "$LK".stale.* 2>/dev/null | head -n1)"
+LK_NEST="$LK_RC|$(grep -c '^run=y-third$' "$LK/owner" 2>/dev/null)|$(grep -c '^run=y-new$' "$LK_ASIDE/owner" 2>/dev/null)|$(ls -d "$LK"/.lima-build.lock.* 2>/dev/null | wc -l | tr -d ' ')"
+ml_reset
+lk lock r1 oam oam-linux box-1 77
+: > "$MLM/mv-race"; : > "$MLM/mv-nest"
+lk unlock r1
+LK_ASIDE="$(ls -d "$LK".release.* 2>/dev/null | head -n1)"
+LK_UN_NEST="$LK_RC|$(grep -c '^run=y-third$' "$LK/owner" 2>/dev/null)|$(grep -c '^run=y-new$' "$LK_ASIDE/owner" 2>/dev/null)|$(ls -d "$LK"/.lima-build.lock.* 2>/dev/null | wc -l | tr -d ' ')"
+it "lock/unlock: a put-back that lands INSIDE a lock made at that instant is undone -- the displaced dir back at its aside name, nothing nested"
+if [ "$LK_NEST" = "3|1|1|0" ] && [ "$LK_UN_NEST" = "4|1|1|0" ]; then pass
+else fail "lock: $LK_NEST unlock: $LK_UN_NEST err: $LK_ERR"; fi
+
+# A dir left aside (and reported "not deleted") by an earlier run whose pid
+# this run now has: its aside name is taken, so this run picks another and
+# the leftover is kept. exec keeps the pid, so the planting shell knows it.
+lk_exec(){ # <leftover kind> <driver args...>  -- sets LK_RC, LK_ERR, LK_LEFT
+  local kind="$1"; shift
+  LK_ERR="$(HOME="$MLM/home" PATH="$MLM/bin:$PATH" LK="$LK" K="$kind" bash -c '
+    mkdir -p "$LK.$K.$$"
+    printf "repo=yaw\ninstance=yaw-linux\nrun=y-displaced\nhost=other-box\npid=4848\nstarted=2026-11-01T00:00:00Z\n" > "$LK.$K.$$/owner"
+    echo "$LK.$K.$$" > "$LK.left"
+    exec bash scripts/mac-linux-vm.sh "$@"' lk-exec "$@" 2>&1 >/dev/null </dev/null)"
+  LK_RC=$?
+  LK_LEFT="$(cat "$LK.left" 2>/dev/null)"; rm -f "$LK.left"
+}
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk_age 1000
+lk_exec stale lock r1 oam oam-linux box-1 77
+LK_KEEP_TO="$LK_RC|$(grep -c '^run=r1$' "$LK/owner" 2>/dev/null)|$(grep -c '^run=y-displaced$' "$LK_LEFT/owner" 2>/dev/null)"
+ml_reset
+lk lock r1 oam oam-linux box-1 77
+lk_exec release unlock r1
+LK_KEEP_UN="$LK_RC|$([ -e "$LK" ] && echo kept)|$(grep -c '^run=y-displaced$' "$LK_LEFT/owner" 2>/dev/null)"
+it "lock/unlock: a leftover aside dir with this run's pid in its name is kept -- the takeover and the release rename to a new name"
+if [ "$LK_KEEP_TO" = "0|1|1" ] && [ "$LK_KEEP_UN" = "0||1" ]; then pass
+else fail "takeover: $LK_KEEP_TO release: $LK_KEEP_UN left='$LK_LEFT' err: $LK_ERR"; fi
+
+# The owner file cannot be written: the run removes the lock dir it made --
+# by its inode, renamed aside first -- and never a lock dir made since.
+ml_reset
+echo plain > "$MLM/owner-mv-fail"
+lk lock r1 oam oam-linux box-1 77
+LK_OW_PLAIN="$LK_RC|$([ -e "$LK" ] && echo kept)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+ml_reset
+echo swap > "$MLM/owner-mv-fail"
+lk lock r1 oam oam-linux box-1 77
+LK_OW_SWAP="$LK_RC|$([ -d "$LK" ] && echo kept)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')"
+it "lock: an owner file that cannot be written removes this run's own lock dir, but not a new one another run made at the path meanwhile"
+if [ "$LK_OW_PLAIN" = "1||0" ] && [ "$LK_OW_SWAP" = "1|kept|0" ]; then pass
+else fail "plain: $LK_OW_PLAIN swap: $LK_OW_SWAP err: $LK_ERR"; fi
+
+ml_reset
+lk lock r1 oam oam-linux box-1 77
+lk_age 1000
+lk refresh r1
+LK_RF_MINE="$LK_RC|$(lk_mt=$(stat -c %Y "$LK" 2>/dev/null || stat -f %m "$LK"); [ $(( $(date +%s) - lk_mt )) -lt 60 ] && echo fresh)"
+lk_age 1000
+lk refresh r2
+LK_RF_OTHER="$LK_RC|$(lk_mt=$(stat -c %Y "$LK" 2>/dev/null || stat -f %m "$LK"); [ $(( $(date +%s) - lk_mt )) -gt 900 ] && echo old)|$(grep -c 'run=r1' <<<"$LK_ERR")"
+ml_reset
+lk refresh r1
+LK_RF_NONE="$LK_RC|$([ -e "$LK" ] && echo made)"
+it "refresh: renews the lock's mtime only while its run= is this run's; another run's (or no lock) is exit 3, untouched"
+if [ "$LK_RF_MINE" = "0|fresh" ] && [ "$LK_RF_OTHER" = "3|old|1" ] && [ "$LK_RF_NONE" = "3|" ]; then pass
+else fail "mine: $LK_RF_MINE other: $LK_RF_OTHER none: $LK_RF_NONE err: $LK_ERR"; fi
+
+# A stale taker renames the lock aside between refresh's read of run= and
+# its touch: the touch must not create the path (a plain touch leaves a
+# regular FILE at ~/.lima-build.lock -- no lock for this run, and every later
+# mkdir failing on it), and the refresh is exit 3. With the path re-taken by
+# a third run, the touch only makes that run's lock younger, and the
+# re-read still says exit 3.
+ml_reset
+lk lock r1 oam oam-linux box-1 77
+echo plain > "$MLM/touch-race"
+lk refresh r1
+LK_RFR_GONE="$LK_RC|$([ -e "$LK" ] && echo made)$([ -f "$LK" ] && echo -file)|$(grep -c '^run=r1$' "$MLM/home/taker-aside/owner" 2>/dev/null)"
+ml_reset
+lk lock r1 oam oam-linux box-1 77
+echo retake > "$MLM/touch-race"
+lk refresh r1
+LK_RFR_RETAKE="$LK_RC|$([ -d "$LK" ] && echo dir)|$(grep -c '^run=y-third$' "$LK/owner" 2>/dev/null)|$(grep -c 'run=y-third' <<<"$LK_ERR")"
+it "refresh: a lock renamed aside between the run= read and the touch is never re-created as a file -- exit 3; a third run's lock in its place is exit 3 too"
+if [ "$LK_RFR_GONE" = "3||1" ] && [ "$LK_RFR_RETAKE" = "3|dir|1|1" ]; then pass
+else fail "gone: $LK_RFR_GONE retake: $LK_RFR_RETAKE err: $LK_ERR"; fi
+
+# The other side of that window: an OWNED lock judged stale whose run then
+# refreshes it (fresh mtime, same dir) before the taker's rename. Same run=,
+# same inode -- only the age re-check on the moved dir sees it: put back,
+# BUSY, not removed (two VMs on the Mac otherwise).
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk_age 1000
+LK_INO0="$(lk_ino)"
+echo touch > "$MLM/mv-race"
+lk lock r1 oam oam-linux box-1 77
+LK_OWNED_RECHECK="$LK_RC|$([ "$(lk_ino)" = "$LK_INO0" ] && echo same)|$(grep -c '^run=y-run-9$' "$LK/owner" 2>/dev/null)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')|$(grep -c 'put back' <<<"$LK_ERR")"
+it "lock: an OWNED stale lock refreshed (fresh mtime, same dir and run=) between the judgement and the rename is put back, not removed -- BUSY"
+if [ "$LK_OWNED_RECHECK" = "3|same|1|0|1" ]; then pass
+else fail "$LK_OWNED_RECHECK err: $LK_ERR"; fi
+
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
+LK_ST="$(HOME="$MLM/home" PATH="$MLM/bin:$PATH" bash scripts/mac-linux-vm.sh status oam-linux 2>/dev/null </dev/null)"
+it "status: reports the other Running instances and the lock's owner, key by key"
+if [ "$(kv_field "$LK_ST" others)" = "yaw-linux" ] && [ "$(kv_field "$LK_ST" lock)" = "held" ] \
+   && [ "$(kv_field "$LK_ST" lock.repo)/$(kv_field "$LK_ST" lock.run)/$(kv_field "$LK_ST" lock.pid)" = "yaw/y-run-9/4242" ]; then pass
+else fail "status: ${LK_ST//$'\n'/ | }"; fi
+
+# --- the leg ------------------------------------------------------------------------
+ml_reset
+ml -- --mode=release
+ML_LK_LINE="$(grep -nE '^bash -s -- lock ' <<<"$ML_CALLS" | cut -d: -f1)"
+ML_START_LINE="$(grep -nF ' start oam-linux' <<<"$ML_CALLS" | cut -d: -f1)"
+ML_ST_LINE="$(grep -nF ' status oam-linux' <<<"$ML_CALLS" | cut -d: -f1)"
+it "leg: a release run takes the lock after the status and before the VM starts, releases it last, and leaves none"
+if [ "$ML_RC" = "0" ] && [ -n "$ML_LK_LINE" ] && [ -n "$ML_START_LINE" ] && [ "$ML_ST_LINE" -lt "$ML_LK_LINE" ] \
+   && [ "$ML_LK_LINE" -lt "$ML_START_LINE" ] && ml_stop_then_unlock "$ML_CALLS" && [ ! -e "$LK" ] \
+   && grep -qE "^bash -s -- lock [0-9]{8}-[0-9]{6}-[0-9]+-[0-9]+ oam oam-linux $ML_HOST [0-9]+$" <<<"$ML_CALLS"; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+ml_reset
+ml -- --mode=release
+ML_RF_LINE="$(grep -nE '^bash -s -- refresh ' <<<"$ML_CALLS" | cut -d: -f1)"
+ML_START_LINE="$(grep -nF ' start oam-linux' <<<"$ML_CALLS" | cut -d: -f1)"
+ML_RF_OK="$ML_RC|$([ -n "$ML_RF_LINE" ] && [ -n "$ML_START_LINE" ] && [ $((ML_RF_LINE + 1)) = "$ML_START_LINE" ] && echo right-before)"
+ml_reset
+: > "$ML/provision-steals"
+ml -- --provision --mode=release
+it "leg: the lock is refreshed right before the VM starts; a lock taken over as stale during --provision stops the run before the start, and the release names it"
+if [ "$ML_RF_OK" = "0|right-before" ] && [ "$ML_RC" = "1" ] && [ "$(ml_calls_of ' start ')" = "0" ] \
+   && grep -qF 'no longer this run' <<<"$ML_ERR" && grep -qF 'taken over as stale' <<<"$ML_ERR" \
+   && grep -qF 'not this run'"'"'s (never taken, or taken over as stale) -- left alone' <<<"$ML_ERR" \
+   && grep -qxF 'run=y-thief' "$LK/owner"; then pass
+else fail "ok-run: $ML_RF_OK rc=$ML_RC calls: $ML_CALLS stderr: $(tail -6 <<<"$ML_ERR")"; fi
+
+# The thief is another oam run: it shares the instance name, and may by now
+# have started oam-linux for its own build. This run never started it, and
+# the lock is not this run's: the EXIT trap stops nothing, and under
+# OAM_KEEP_VM=1 it does not claim to leave a lock held.
+ml_reset
+echo oam > "$ML/provision-steals"
+ml -- --provision --mode=release
+ML_STEAL_OAM="$ML_RC|$(ml_calls_of ' start ')|$(ml_calls_of ' stop ')|$(grep -c '^run=o-thief$' "$LK/owner" 2>/dev/null)"
+ml_reset
+echo oam > "$ML/provision-steals"
+ml OAM_KEEP_VM=1 -- --provision --mode=release
+ML_STEAL_OAM_KEEP="$ML_RC|$(ml_calls_of ' start ')|$(ml_calls_of ' stop ')|$(grep -c 'leaving the Mac build lock' <<<"$ML_ERR")|$(grep -c 'leaving oam-linux running' <<<"$ML_ERR")|$(grep -c '^run=o-thief$' "$LK/owner" 2>/dev/null)"
+it "leg: a refresh that finds the lock taken over stops no VM on exit (an oam taker shares oam-linux) and, under OAM_KEEP_VM=1, claims no lock held"
+if [ "$ML_STEAL_OAM" = "1|0|0|1" ] && [ "$ML_STEAL_OAM_KEEP" = "1|0|0|0|0|1" ]; then pass
+else fail "default: $ML_STEAL_OAM keep: $ML_STEAL_OAM_KEEP calls: $ML_CALLS stderr: $(tail -6 <<<"$ML_ERR")"; fi
+
+ml_reset
+ml OAM_LIMA_CPUS=6 -- --provision --preflight-only
+ML_LK_LINE="$(grep -nE '^bash -s -- lock ' <<<"$ML_CALLS" | cut -d: -f1)"
+ML_PROV_LINE="$(grep -nF ' provision oam-linux' <<<"$ML_CALLS" | cut -d: -f1)"
+it "leg: --provision takes the lock before it provisions"
+if [ "$ML_RC" = "0" ] && [ -n "$ML_LK_LINE" ] && [ -n "$ML_PROV_LINE" ] && [ "$ML_LK_LINE" -lt "$ML_PROV_LINE" ] && [ ! -e "$LK" ]; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS"; fi
+
+ml_reset
+printf 'oam-linux Running\nyaw-linux Running\n' > "$MLM/lima"
+printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
+lk_plant yaw yaw-linux y-run-9
+ml -- --preflight-only
+ML_PF_YAW="$ML_RC|$(ml_calls_of ' stop ')|$(ml_calls_of ' lock ')"
+ML_PF_YAW_ERR="$ML_ERR"
+ml -- --mode=release
+ML_REL_YAW="$ML_RC|$(ml_calls_of ' stop ')|$(ml_calls_of ' start ')|$(ml_calls_of ' lock ')"
+it "leg: another repo's VM Running (with the lock) -- preflight and release are BUSY before the lock and stop nothing"
+if [ "$ML_PF_YAW" = "1|0|0" ] && [ "$ML_REL_YAW" = "1|0|0|0" ] && grep -qF 'BUSY' <<<"$ML_PF_YAW_ERR" \
+   && grep -qF 'yaw-linux' <<<"$ML_PF_YAW_ERR" && grep -qF 'run=y-run-9' <<<"$ML_PF_YAW_ERR" \
+   && grep -qxF 'run=y-run-9' "$LK/owner" && grep -qxF 'oam-linux Running' "$MLM/lima"; then pass
+else fail "preflight: $ML_PF_YAW release: $ML_REL_YAW stderr: $ML_PF_YAW_ERR"; fi
+
+ml_reset
+printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
+: > "$ML/status-others-none"
+ml -- --mode=release
+it "leg: a neighbour VM that appears between the status and the lock is caught by the lock's re-check -- BUSY, nothing started, no lock left"
+if [ "$ML_RC" != "0" ] && [ "$(ml_calls_of ' lock ')" = "1" ] && [ "$(ml_calls_of ' start ')" = "0" ] \
+   && [ "$(ml_calls_of ' stop ')" = "0" ] && [ ! -e "$LK" ] && grep -qF 'another Lima instance is Running on this Mac (yaw-linux)' <<<"$ML_ERR"; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+# The same repo and instance, its VM Running: whether that run is over is not
+# judged from here (no pid checks across boxes, WSL, Git Bash or users), so
+# preflight and release are BUSY -- nothing stopped, nothing unlocked -- and
+# print the owner and the two commands that clear a dead run's lock.
+ml_reset
+echo "oam-linux Running" > "$MLM/lima"
+printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
+lk_plant oam oam-linux o-run-elsewhere
+ml -- --preflight-only
+ML_PF_ELSE="$ML_RC|$(ml_calls_of ' stop ')|$(ml_calls_of ' unlock ')"
+lk_owner_set host "$ML_HOST"
+lk_owner_set pid "$(bash -c 'echo $$')"
+ml -- --preflight-only
+ML_PF_HERE="$ML_RC|$(ml_calls_of ' stop ')|$(ml_calls_of ' unlock ')"
+ML_PF_HERE_ERR="$ML_ERR"
+ml -- --mode=release
+ML_REL_HERE="$ML_RC|$(ml_calls_of ' stop ')|$(ml_calls_of ' start ')|$(ml_calls_of ' unlock ')"
+it "leg: this repo's lock with its VM Running (another box, or this box with an exited pid) is BUSY with the clear-it commands; nothing stopped"
+if [ "$ML_PF_ELSE" = "1|0|0" ] && [ "$ML_PF_HERE" = "1|0|0" ] && [ "$ML_REL_HERE" = "1|0|0|0" ] \
+   && grep -qF 'BUSY' <<<"$ML_PF_HERE_ERR" && grep -qF 'run=o-run-elsewhere' <<<"$ML_PF_HERE_ERR" \
+   && grep -qF 'ssh builder@build-mac.example.invalid /opt/homebrew/bin/limactl stop oam-linux' <<<"$ML_PF_HERE_ERR" \
+   && grep -qF "ssh builder@build-mac.example.invalid 'rm -rf ~/.lima-build.lock'" <<<"$ML_PF_HERE_ERR" \
+   && grep -qxF 'oam-linux Running' "$MLM/lima" && grep -qxF 'run=o-run-elsewhere' "$LK/owner"; then pass
+else fail "elsewhere: $ML_PF_ELSE here: $ML_PF_HERE release: $ML_REL_HERE stderr: $ML_PF_HERE_ERR"; fi
+
+# The EXIT trap stops the VM first and unlocks only once it is stopped: a
+# stop that fails leaves the lock held (BUSY for others until the VM stops).
+ml_reset
+: > "$ML/stop-fails"
+ml -- --mode=release
+ML_KEPT_RUN="$(grep -oE '^bash -s -- lock [^ ]+' <<<"$ML_CALLS" | awk '{print $5}')"
+it "leg: when the exit trap's VM stop fails, the lock is KEPT -- no unlock, the owner is this run, the release command printed"
+if [ "$(ml_calls_of ' stop oam-linux')" = "1" ] && [ "$(ml_calls_of ' unlock ')" = "0" ] && [ -n "$ML_KEPT_RUN" ] \
+   && grep -qxF "run=$ML_KEPT_RUN" "$LK/owner" 2>/dev/null && grep -qF 'leaving the Mac build lock' <<<"$ML_ERR" \
+   && grep -qF "rm -rf ~/.lima-build.lock" <<<"$ML_ERR"; then pass
+else fail "rc=$ML_RC kept-run='$ML_KEPT_RUN' calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+# The Mac takes the lock, then ssh drops (255) before its answer arrives:
+# the run fails, but its EXIT trap still releases the lock it owns.
+ml_reset
+: > "$ML/lock-drop"
+ml -- --mode=release
+it "leg: an ssh drop (255) right after the Mac took the lock fails the run and the EXIT trap still unlocks; nothing started"
+if [ "$ML_RC" != "0" ] && [ "$(ml_calls_of ' lock ')" = "1" ] && [ "$(ml_calls_of ' unlock ')" = "1" ] \
+   && [ "$(ml_calls_of ' start ')" = "0" ] && [ ! -e "$LK" ] && grep -qF 'exit 255' <<<"$ML_ERR" \
+   && [[ "$(tail -1 <<<"$ML_CALLS")" == "bash -s -- unlock "* ]]; then pass
+else fail "rc=$ML_RC lock-left=$([ -e "$LK" ] && cat "$LK/owner") calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+# v1.2: a lock call that is not a BUSY answer could not take -- and under
+# OAM_KEEP_VM=1 too, the EXIT trap still unlocks: KEEP_VM keeps only a lock
+# this run is known to have taken.
+ml_reset
+: > "$ML/lock-drop"
+ml OAM_KEEP_VM=1 -- --preflight-only
+ML_DROP_KEEP="$ML_RC|$(ml_calls_of ' lock ')|$(ml_calls_of ' unlock ')|$([ -e "$LK" ] && echo left)"
+ml_reset
+: > "$ML/lock-drop"
+ml OAM_KEEP_VM=1 -- --mode=release
+ML_DROP_KEEP_REL="$ML_RC|$(ml_calls_of ' unlock ')|$(ml_calls_of ' start ')|$([ -e "$LK" ] && echo left)"
+it "leg (v1.2): with OAM_KEEP_VM=1 an ssh drop on the lock call still unlocks on exit (preflight and release); nothing started"
+if [ "$ML_DROP_KEEP" = "1|1|1|" ] && [ "$ML_DROP_KEEP_REL" = "1|1|0|" ]; then pass
+else fail "preflight: $ML_DROP_KEEP release: $ML_DROP_KEEP_REL stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+# v1.2: the lock stays held while this run's VM may still be up, in every
+# mode. The preflight's stop of a VM it found Running fails: the lock is
+# kept by this run, no unlock, and the release command printed.
+ml_reset
+echo "oam-linux Running" > "$MLM/lima"
+printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
+: > "$ML/stop-fails"
+ml -- --preflight-only
+ML_PF_KEPT_RUN="$(grep -oE '^bash -s -- lock [^ ]+' <<<"$ML_CALLS" | awk '{print $5}')"
+it "leg (v1.2): preflight whose stop of a Running VM fails keeps the lock -- no unlock, this run the owner, the release command printed"
+if [ "$ML_RC" = "1" ] && [ "$(ml_calls_of ' stop oam-linux')" = "1" ] && [ "$(ml_calls_of ' unlock ')" = "0" ] \
+   && [ -n "$ML_PF_KEPT_RUN" ] && grep -qxF "run=$ML_PF_KEPT_RUN" "$LK/owner" 2>/dev/null \
+   && grep -qF 'would not stop' <<<"$ML_ERR" && grep -qF 'leaving the Mac build lock' <<<"$ML_ERR" \
+   && grep -qF "rm -rf ~/.lima-build.lock" <<<"$ML_ERR"; then pass
+else fail "rc=$ML_RC kept-run='$ML_PF_KEPT_RUN' calls: $ML_CALLS stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+# ...and a preflight --provision that fails with the VM found Running (the
+# provision stops it first, so it may still be up) keeps the lock too.
+ml_reset
+echo "oam-linux Running" > "$MLM/lima"
+printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
+: > "$ML/provision-fails"
+ml -- --provision --preflight-only
+ML_PF_PROV_RUN="$(grep -oE '^bash -s -- lock [^ ]+' <<<"$ML_CALLS" | awk '{print $5}')"
+ML_PF_PROV="$ML_RC|$(ml_calls_of ' provision ')|$(ml_calls_of ' unlock ')|$([ -n "$ML_PF_PROV_RUN" ] && grep -qxF "run=$ML_PF_PROV_RUN" "$LK/owner" 2>/dev/null && echo held)"
+ml_reset
+: > "$ML/provision-fails"
+ml -- --provision --preflight-only
+ML_PF_PROV_STOPPED="$ML_RC|$(ml_calls_of ' unlock ')|$([ -e "$LK" ] && echo left)"
+it "leg (v1.2): a preflight --provision that fails with the VM found Running keeps the lock; with the VM found Stopped it releases it"
+if [ "$ML_PF_PROV" = "1|1|0|held" ] && [ "$ML_PF_PROV_STOPPED" = "1|1|" ]; then pass
+else fail "running: $ML_PF_PROV stopped: $ML_PF_PROV_STOPPED stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+# v1.2: OAM_KEEP_VM=1 keeps the lock in every mode, the preflight included --
+# with the VM Stopped (nothing to keep up, the lock still kept) and Running
+# (not stopped, lock kept).
+ml_reset
+ml OAM_KEEP_VM=1 -- --preflight-only
+ML_PFK_RUN="$(grep -oE '^bash -s -- lock [^ ]+' <<<"$ML_CALLS" | awk '{print $5}')"
+ML_PFK_STOPPED="$ML_RC|$(ml_calls_of ' stop ')|$(ml_calls_of ' unlock ')|$([ -n "$ML_PFK_RUN" ] && grep -qxF "run=$ML_PFK_RUN" "$LK/owner" 2>/dev/null && echo held)|$(grep -c 'OAM_KEEP_VM=1 -- leaving the Mac build lock' <<<"$ML_ERR")|$(grep -cF "rm -rf ~/.lima-build.lock" <<<"$ML_ERR")"
+ml_reset
+echo "oam-linux Running" > "$MLM/lima"
+printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
+ml OAM_KEEP_VM=1 -- --preflight-only
+ML_PFK_RUN="$(grep -oE '^bash -s -- lock [^ ]+' <<<"$ML_CALLS" | awk '{print $5}')"
+ML_PFK_RUNNING="$ML_RC|$(ml_calls_of ' stop ')|$(ml_calls_of ' unlock ')|$([ -n "$ML_PFK_RUN" ] && grep -qxF "run=$ML_PFK_RUN" "$LK/owner" 2>/dev/null && echo held)"
+it "leg (v1.2): preflight with OAM_KEEP_VM=1 keeps the lock it took, VM Stopped or Running -- no stop, no unlock, the release command printed"
+if [ "$ML_PFK_STOPPED" = "0|0|0|held|1|1" ] && [ "$ML_PFK_RUNNING" = "0|0|0|held" ]; then pass
+else fail "stopped: $ML_PFK_STOPPED running: $ML_PFK_RUNNING stderr: $(tail -5 <<<"$ML_ERR")"; fi
+
+# ...and so every caller whose own linux leg follows its preflight runs that
+# preflight with OAM_KEEP_VM=0, or a KEEP_VM run would block its own leg.
+it "leg (v1.2): release-local, node-compat-measure and bench-platforms run the linux preflight with OAM_KEEP_VM=0"
+ML_PFK_BAD=""
+for f in scripts/release-local.sh scripts/node-compat-measure.sh scripts/bench-platforms.sh; do
+  n_all="$(grep -v '^[[:space:]]*#' "$f" | grep -cF 'build-platforms-mac-linux.sh" --preflight-only')"
+  n_pin="$(grep -v '^[[:space:]]*#' "$f" | grep -cE '^[[:space:]]*OAM_KEEP_VM=0 bash "\$SCRIPT_DIR/build-platforms-mac-linux.sh" --preflight-only')"
+  { [ "$n_all" -ge 1 ] && [ "$n_all" = "$n_pin" ]; } || ML_PFK_BAD="$ML_PFK_BAD $f($n_pin/$n_all)"
+done
+if [ -z "$ML_PFK_BAD" ]; then pass; else fail "preflight not pinned to OAM_KEEP_VM=0:$ML_PFK_BAD"; fi
+
+# What the docs of OAM_KEEP_VM promise about the NEXT run: a VM an earlier
+# OAM_KEEP_VM=1 run left comes with that run's lock, so the preflight (pinned
+# to OAM_KEEP_VM=0) is BUSY on it, stops nothing, and prints how to clear it.
+ml_reset
+printf 'oam-linux Running\n' > "$MLM/lima"
+printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
+lk_plant oam oam-linux o-kept
+ml OAM_KEEP_VM=0 -- --preflight-only
+it "leg (v1.2): a VM left by an OAM_KEEP_VM=1 run keeps its lock -- the next preflight is BUSY, stops nothing, prints the limactl stop and lock-clear commands"
+if [ "$ML_RC" = "1" ] && [ "$(ml_calls_of ' stop ')" = "0" ] && grep -qF 'limactl stop oam-linux' <<<"$ML_ERR" \
+   && grep -qF 'rm -rf ~/.lima-build.lock' <<<"$ML_ERR" && grep -qxF 'run=o-kept' "$LK/owner" \
+   && grep -qxF 'oam-linux Running' "$MLM/lima"; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS stderr: $(tail -6 <<<"$ML_ERR")"; fi
+
+# release-local's linux leg under OAM_KEEP_VM=1 and two attempts: the first
+# fails after taking the lock and starting the VM. It must stop and release
+# (OAM_KEEP_VM=0 on every attempt but the last), or the second -- a new run
+# id -- is BUSY on the first's kept lock and the retry can never pass. The
+# real run_with_attempts and linux_leg_attempt, read out of release-local.sh,
+# drive the real orchestrator against the stubbed ssh and the fake Mac.
+RL_LEG_FNS="$(awk '/^run_with_attempts\(\) \{$/ || /^linux_leg_attempt\(\) \{$/ { f = 1 } f { print } f && /^}$/ { f = 0 }' scripts/release-local.sh)"
+ml_reset
+: > "$ML/fail-once-conformance"
+: > "$ML/calls"
+RL_LEG_OUT="$(env PATH="$ML/bin:$PATH" TMPDIR="$ML/tmp" OAM_MAC_KEY="$ML/key" OAM_MAC_HOST=build-mac.example.invalid \
+  OAM_MAC_USER=builder OAM_KEEP_VM=1 OAM_LINUX_RETRY_DELAY=0 \
+  bash -c "set -uo pipefail; warn(){ echo \"[warn] \$*\" >&2; }; note(){ :; }; ok(){ :; }; $RL_LEG_FNS"'
+    OAM_RELEASE_LEG_ATTEMPTS=2; SCRIPT_DIR="$1"
+    run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "linux leg" linux_leg_attempt' rl-leg "$PWD/scripts" </dev/null 2>"$ML/err")"
+RL_LEG_RC=$?
+RL_LEG_ERR="$(cat "$ML/err")"; RL_LEG_CALLS="$(cat "$ML/calls")"
+RL_LEG_RUN2="$(grep -oE '^bash -s -- lock [^ ]+' <<<"$RL_LEG_CALLS" | awk 'NR == 2 { print $5 }')"
+it "release-local: OAM_KEEP_VM=1 with two linux attempts -- a failed first attempt stops and releases, the second is not BUSY, and only the last keeps VM and lock"
+if [ "$(grep -c '() {$' <<<"$RL_LEG_FNS")" = "2" ] && [ "$RL_LEG_RC" = "0" ] \
+   && [ -d "${RL_LEG_OUT##*$'\n'}" ] && ! grep -qF 'BUSY:' <<<"$RL_LEG_ERR" \
+   && [ "$(grep -c '^bash -s -- lock ' <<<"$RL_LEG_CALLS")" = "2" ] && [ "$(grep -c '^bash -s -- unlock ' <<<"$RL_LEG_CALLS")" = "1" ] \
+   && [ "$(grep -c '^bash -s -- stop oam-linux' <<<"$RL_LEG_CALLS")" = "1" ] \
+   && [ -n "$RL_LEG_RUN2" ] && grep -qxF "run=$RL_LEG_RUN2" "$LK/owner" 2>/dev/null; then pass
+else fail "rc=$RL_LEG_RC fns=$(grep -c '() {$' <<<"$RL_LEG_FNS") calls: $RL_LEG_CALLS stderr: $(grep -E 'BUSY|fail|attempt' <<<"$RL_LEG_ERR" | tail -6)"; fi
+ml_reset
+
+# A lock verb refused as BUSY does not unlock: the lock is another run's.
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
+: > "$ML/status-others-none"
+ml -- --preflight-only
+it "leg: a BUSY lock verb leaves the other run's lock alone -- no unlock call; the owner's instance named in the stop command"
+if [ "$ML_RC" = "1" ] && [ "$(ml_calls_of ' unlock ')" = "0" ] && grep -qxF 'run=y-run-9' "$LK/owner" \
+   && grep -qF '/opt/homebrew/bin/limactl stop yaw-linux' <<<"$ML_ERR"; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS stderr: $ML_ERR"; fi
+
+# The lock verb takes over a stale lock (its STALE note names that lock's
+# instance), then finds a neighbour Running and refuses: the leg names the
+# NEIGHBOUR to stop, and prints no rm hint -- the lock verb released the
+# lock, so there is none to clear.
+ml_reset
+lk_plant yaw yaw-old y-run-7
+lk_age 1000
+printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
+: > "$ML/status-others-none"
+ml -- --preflight-only
+ML_NB_FAIL="$(grep -F '[fail]' <<<"$ML_ERR")"
+it "leg: a STALE takeover then a neighbour refusal names the neighbour to stop, not the stale owner, and no rm hint"
+if [ "$ML_RC" = "1" ] && [ ! -e "$LK" ] && grep -qF 'STALE' <<<"$ML_ERR" \
+   && grep -qF '/opt/homebrew/bin/limactl stop yaw-linux' <<<"$ML_ERR" \
+   && ! grep -qF 'limactl stop yaw-old' <<<"$ML_ERR" && ! grep -qF 'rm -rf ~/.lima-build.lock' <<<"$ML_ERR" \
+   && grep -qF 'yaw-linux' <<<"$ML_NB_FAIL" && [ "$(ml_calls_of ' unlock ')" = "0" ]; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS stderr: $ML_ERR"; fi
+
+# The status saw one owner (y-run-9, stale); by the lock verb's retry another
+# run (y-race) had the lock. The BUSY message's owner and stop command are
+# the Mac's answer, not the pre-lock snapshot.
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+lk_age 1000
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+: > "$MLM/mkdir-race"
+ml -- --preflight-only
+ML_OWNER_LINE="$(grep -F 'Owner:' <<<"$ML_ERR")"
+it "leg: on BUSY the Owner line comes from the Mac's BUSY answer, not the status taken before the lock"
+if [ "$ML_RC" = "1" ] && grep -qF 'run=y-race' <<<"$ML_OWNER_LINE" && ! grep -qF 'run=y-run-9' <<<"$ML_OWNER_LINE" \
+   && grep -qF '/opt/homebrew/bin/limactl stop yaw-linux' <<<"$ML_ERR" && grep -qF 'rm -rf ~/.lima-build.lock' <<<"$ML_ERR" \
+   && grep -qxF 'run=y-race' "$LK/owner"; then pass
+else fail "rc=$ML_RC owner-line: $ML_OWNER_LINE stderr: $ML_ERR"; fi
+ml_reset
 
 # =============================================================================
 group "tailnet-helpers.sh -- the mac build host preflight"
@@ -2180,7 +2526,7 @@ group "src-sync.sh -- source tarball ceiling"
 . scripts/lib/src-sync.sh
 
 # The ceiling exists because on 2026-08-31 a release packed 11.6 GB and pushed
-# it over an IAP tunnel for 35 minutes before dying. 200MB default, real tree
+# it to the remote linux builder of the day for 35 minutes before dying. 200MB default, real tree
 # ~1.6MB.
 it "passes a realistically-sized tarball"; src_tarball_over_ceiling 2000000 && fail "2MB should pass" || pass
 it "passes right at the ceiling";         src_tarball_over_ceiling 209715200 && fail "200MB should pass" || pass
@@ -2646,7 +2992,8 @@ it "ci-local.sh and the libs it sources parse"
 PARSE_BAD=""
 for s in scripts/ci-local.sh scripts/bump-taps.sh scripts/release-local.sh \
          scripts/lib/miri-gate.sh scripts/lib/build-locks.sh \
-         scripts/lib/crt-linkage.sh scripts/lib/iap-helpers.sh \
+         scripts/lib/crt-linkage.sh scripts/lib/host-helpers.sh \
+         scripts/lib/linux-vm-helpers.sh \
          scripts/lib/tap-verify.sh scripts/lib/attribution.sh \
          scripts/lib/ci-ledger.sh scripts/lib/rust-pin.sh \
          scripts/lib/signing.sh scripts/release-upload-local-arm64.sh; do
@@ -4274,8 +4621,9 @@ sg_order scripts/release-local.sh 'trap release_on_exit EXIT' 'release_agent_sta
 it "release-local.sh: the cheap preflight checks precede the mac, release-key and Windows signing probes"
 sg_order scripts/release-local.sh 'step "Preflight $TAG"' 'restore_gate_artifacts "preflight"' \
   'preflight_head="$(git rev-parse HEAD)"' 'if [ -f CHANGELOG.md ]; then' \
-  'assert_release_unpublished "preflight"' 'command -v gcloud >/dev/null 2>&1 || fail' \
-  'build-platforms-tailnet.sh" --preflight-only' 'release_agent_start || fail' \
+  'assert_release_unpublished "preflight"' \
+  'build-platforms-tailnet.sh" --preflight-only' 'build-platforms-mac-linux.sh" --preflight-only' \
+  'release_agent_start || fail' \
   'win_sign_preflight || fail' 'assert_tree_clean "preflight, after the signing probes"' \
   '[ "$(git rev-parse HEAD)" = "$preflight_head" ]' 'git fetch -q origin main 2>/dev/null || true' \
   'assert_release_unpublished "before the bump"' 'bumping Cargo.toml to' 'git tag -a "$TAG" -m "$TAG"'
@@ -4707,8 +5055,8 @@ au_git(){ git -C "$AU/work" -c user.name=t -c user.email=t@example.invalid -c co
   au_git tag v0.5.0    # before every range and not pinned: patchable unsigned
   sed 's#^REPO="YawLabs/oam"$#REPO="example-invalid/fixture"#' scripts/release-upload-local-arm64.sh \
     >"$AU/work/scripts/release-upload-local-arm64.sh"
-  # signing.sh sources iap-helpers.sh (kill_proc_tree).
-  cp scripts/lib/build-locks.sh scripts/lib/signing.sh scripts/lib/iap-helpers.sh "$AU/work/scripts/lib/"
+  # signing.sh sources host-helpers.sh (kill_proc_tree).
+  cp scripts/lib/build-locks.sh scripts/lib/signing.sh scripts/lib/host-helpers.sh "$AU/work/scripts/lib/"
   cp release-keys/allowed_signers release-keys/ranges release-keys/presigning-sums "$AU/work/release-keys/"
   printf 'target/\n' >"$AU/work/.gitignore"
   au_git add . && au_git commit -qm main
@@ -5554,7 +5902,7 @@ ms_reset
 it "every signing, skip and mac-host knob a release script reads is scrubbed at the suite's top"
 MS_MISS=""
 for f in scripts/release-local.sh scripts/release-upload-local-arm64.sh scripts/build-platforms-tailnet.sh \
-         scripts/build-remote.sh scripts/provision-mac-signing.sh scripts/lib/signing.sh scripts/lib/mac-signing.sh \
+         scripts/build-platforms-mac-linux.sh scripts/mac-linux-vm.sh scripts/build-remote.sh scripts/provision-mac-signing.sh scripts/lib/signing.sh scripts/lib/mac-signing.sh \
          install/install.sh; do
   for k in $(sed 's/#.*//' "$f" | grep -oE '[$][{]?OAM_[A-Z0-9_]+' | tr -d '${' | sort -u); do
     case "$k" in *SIGN*|*SKIP*|OAM_MAC_*) ;; *) continue ;; esac
@@ -5989,7 +6337,7 @@ else fail "$(grep -n 'MAC_ART' scripts/release-local.sh)"; fi
 MS_TN="$MS/tn"
 mkdir -p "$MS_TN/scripts/lib" "$MS_TN/bin" "$MS_TN/tmp"
 cp scripts/build-platforms-tailnet.sh scripts/provision-mac-signing.sh "$MS_TN/scripts/"
-cp scripts/lib/src-sync.sh scripts/lib/iap-helpers.sh scripts/lib/tailnet-helpers.sh scripts/lib/mac-signing.sh "$MS_TN/scripts/lib/"
+cp scripts/lib/src-sync.sh scripts/lib/host-helpers.sh scripts/lib/tailnet-helpers.sh scripts/lib/mac-signing.sh "$MS_TN/scripts/lib/"
 : > "$MS_TN/key"
 cat > "$MS_TN/bin/ssh" <<EOF
 #!/bin/bash
@@ -7005,9 +7353,9 @@ fi
 group "rust-pin.sh -- the pinned Rust toolchain"
 # =============================================================================
 # channel = "stable" resolved to different rustc versions per release leg
-# (1.96 on the Windows box, 1.97 on the GCP builder), and the builder's
-# clippy carried a lint the local one did not -- v0.18.1's linux leg died on
-# it an hour in. The pin must be exact, and every leg must assert it.
+# (1.96 on the Windows box, 1.97 on the linux leg's builder of the day, a
+# cloud VM then), and that builder's clippy carried a lint the local one did
+# not -- v0.18.1's linux leg died on it an hour in. The pin must be exact, and every leg must assert it.
 # shellcheck source=lib/rust-pin.sh
 . scripts/lib/rust-pin.sh
 

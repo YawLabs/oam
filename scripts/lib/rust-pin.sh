@@ -7,10 +7,10 @@
 # BETWEEN rustc versions. The v0.18.1 run on 2026-10-10 shipped on exactly
 # that trap: rust-toolchain.toml said channel = "stable", which rustup
 # resolves PER HOST at install time -- the Windows box had been stable long
-# enough to sit at 1.96, the GCP builder at 1.97. The builder's 1.97 clippy
-# carries manual_clamp; the local 1.96 did not -- so the tree the local gate
-# called clean failed the linux leg's `gate` dispatch, an hour into the
-# release, on a line that had never been touched by the release's commits.
+# enough to sit at 1.96, the linux leg's builder of the day (a cloud VM then)
+# at 1.97. That builder's 1.97 clippy carries manual_clamp; the local 1.96
+# did not -- so the tree the local gate called clean failed the linux leg's
+# `gate` dispatch, an hour into the release, on a line that had never been touched by the release's commits.
 #
 # The fix has two halves:
 #   1. rust-toolchain.toml pins an EXACT version ("1.99.0"), never a floating

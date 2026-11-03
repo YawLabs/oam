@@ -27,7 +27,7 @@
 # reached both machines. So the orchestrator now asks ssh alone -- the resolver
 # and the route every later scp uses -- and classifies what ssh says.
 #
-# Same convention as lib/iap-helpers.sh: sourced, never executed. All functions
+# Same convention as lib/host-helpers.sh: sourced, never executed. All functions
 # RETURN status rather than exiting; the caller owns fail()/warn().
 # =============================================================================
 

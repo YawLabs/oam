@@ -16,8 +16,10 @@
 #   oam-aarch64-apple-darwin          MacBook Air (tailnet), native
 #   oam-x86_64-apple-darwin           MacBook Air, x64 HOST toolchain under
 #                                     Rosetta 2
-#   oam-x86_64-unknown-linux-gnu      GCP Linux VM (direct ssh, IAP
-#                                     tunnel fallback), native
+#   oam-x86_64-unknown-linux-gnu      MacBook Air, Debian 12 x86_64
+#                                     container under Rosetta for Linux in
+#                                     a Lima VM (build-platforms-mac-linux.sh;
+#                                     glibc floor 2.34 gated)
 #   SHA256SUMS
 #   RELEASE-MANIFEST, RELEASE-MANIFEST.sig     (tag-bound signed manifest over
 #                                               SHA256SUMS -- see "Signing")
@@ -37,7 +39,8 @@
 # covered on a private repo -- scripts/release-upload-local-arm64.sh used to
 # patch it in after the fact; this script makes it a first-class asset).
 # aarch64-unknown-linux-gnu remains unshipped (it was public-repo-gated and
-# never released; needs an ARM Linux host, e.g. a GCP t2a VM, if wanted).
+# never released; needs an ARM Linux host -- a native arm64 Lima VM on the
+# build Mac would do -- if wanted).
 #
 # Gates before anything uploads (ci.yml lived on push; with GHA gone the
 # release IS the gate):
@@ -46,8 +49,9 @@
 #     A re-run of the gate on the same tree skips the steps that already
 #     passed (ci-local.sh's step ledger, target/ci-local/passed; OAM_CI_FRESH=1
 #     runs every step again)
-#   - gate+test+conformance+node-suite on the Linux VM (inside --mode=release
-#     -- the node-suite ratchet was node-compat.yml's ubuntu GATING job)
+#   - gate+test+conformance+node-suite in the linux container (inside
+#     --mode=release -- the node-suite ratchet was node-compat.yml's ubuntu
+#     GATING job), then the glibc floor on the binary it built
 #   - gate+test+conformance on the Mac (inside mac-release) -- conformance
 #     carries the builtin export-parity ratchet, and darwin has native code
 #     (fs statfs) that no other leg executes
@@ -101,7 +105,9 @@
 #                           >1 also exports OAM_TEST_THREADS=1, keeping the
 #                           re-run deterministic (see the knob's comment)
 #   OAM_SKIP_WIN_X64=1      drop the win-x64 asset (emulated build is slow)
-#   OAM_SKIP_MAC=1          drop both mac assets (Air unreachable)
+#   OAM_SKIP_MAC=1          drop both mac assets (Air unreachable -- the
+#                           linux leg runs on the Air too, so add
+#                           OAM_SKIP_LINUX=1 to release without it)
 #   OAM_SKIP_MAC_X64=1      drop only the mac-x64 asset
 #   OAM_SKIP_MAC_SIGN=1     ship the mac assets without the mac leg's codesign
 #                           step (loud; honored even with OAM_SIGN_REQUIRED=1).
@@ -122,11 +128,27 @@
 #                           same tag (the unpublished tag is re-pointed), or
 #                           ship that release with OAM_SKIP_MAC_SIGN=1
 #   OAM_SKIP_LINUX=1        drop the linux asset
-#   OAM_KEEP_VM=1           leave the GCP VM running after the linux leg
-#   OAM_IAP_SSH_MODE=direct|tunnel
-#                           force the linux leg's ssh transport (default auto:
-#                           direct ssh to the VM's external IP, falling back to
-#                           the IAP tunnel when that does not answer)
+#   OAM_KEEP_VM=1           leave the linux leg's Lima VM running on the
+#                           build Mac after the leg, with the Mac build lock
+#                           held by that run (default: stopped and released
+#                           on every exit -- the 8 GB Air cannot hold it and
+#                           the mac legs at once). The preflight stops a VM
+#                           it finds Running with no live lock, whatever this
+#                           is set to; a VM an earlier OAM_KEEP_VM=1 run left
+#                           keeps that run's lock, so the next preflight is
+#                           BUSY and prints the limactl stop and
+#                           rm -rf ~/.lima-build.lock commands that clear it.
+#                           With OAM_RELEASE_LEG_ATTEMPTS > 1 it applies to
+#                           the last linux attempt only: an earlier attempt
+#                           stops its VM and releases the lock, or the retry
+#                           would be BUSY on that attempt's own lock
+#   OAM_LIMA_INSTANCE=<name>  the linux leg's Lima instance (default
+#                           oam-linux); create it once with
+#                           scripts/build-platforms-mac-linux.sh --provision
+#                           --preflight-only
+#   OAM_LINUX_GLIBC_MAX=2.34  the newest GLIBC_ symbol version the linux
+#                           asset may need (default 2.34); over it, the leg
+#                           fails
 #   OAM_DRY_RUN=1           build + checksum everything, publish nothing
 #                           (release.yml's workflow_dispatch dry-run). Preflight
 #                           still runs in full -- it bumps, commits and tags, so
@@ -318,6 +340,23 @@ run_with_attempts() {
     [ "$attempt" -lt "$attempts" ] || break
   done
   return "$rc"
+}
+
+# linux_leg_attempt  -- one linux-leg attempt, for run_with_attempts (which
+# runs it in the same shell, so the count carries from try to try). Every
+# attempt but the last runs with OAM_KEEP_VM=0: under OAM_KEEP_VM=1 a failed
+# attempt keeps its VM and the Mac build lock (protocol v1.2), and the next
+# attempt -- a new process with a new run id -- would find that lock with
+# its VM up and be BUSY, so the retry the knob buys could never pass. The
+# caller's OAM_KEEP_VM applies to the last attempt; a pass before it leaves
+# the VM stopped.
+linux_leg_attempt() {
+  LINUX_LEG_TRY=$(( ${LINUX_LEG_TRY:-0} + 1 ))
+  if [ "$LINUX_LEG_TRY" -lt "$OAM_RELEASE_LEG_ATTEMPTS" ]; then
+    OAM_KEEP_VM=0 bash "$SCRIPT_DIR/build-platforms-mac-linux.sh" --mode=release
+  else
+    bash "$SCRIPT_DIR/build-platforms-mac-linux.sh" --mode=release
+  fi
 }
 
 # note() prints to STDOUT on purpose: the leg drivers capture their caller's
@@ -724,12 +763,11 @@ fi
 # right before the bump.
 assert_release_unpublished "preflight"
 
-[ "$SKIP_LINUX" = "1" ] || command -v gcloud >/dev/null 2>&1 || fail "gcloud CLI not found (or set OAM_SKIP_LINUX=1 to drop the linux asset)"
-
 # --- preflight, slow half: the build Mac, the release key, Windows signing ----
 # The mac build host, checked HERE for the reason the dirty-tree guard above
-# gives: never tag a tree we would refuse to build. This check (and the gcloud
-# one above) used to sit at the END of the preflight, after the bump was on
+# gives: never tag a tree we would refuse to build. This check (and a check
+# for the linux leg's cloud CLI, before that leg moved to the Mac) used to sit
+# at the END of the preflight, after the bump was on
 # main and the tag on origin, and asked only whether OAM_MAC_HOST was SET. The first
 # thing to actually reach the Air was the mac leg itself -- after the local
 # gate, both Windows builds and the console e2e. On 2026-09-30 that is where a
@@ -741,6 +779,20 @@ if [ "$SKIP_MAC" != "1" ]; then
   [ -n "${OAM_MAC_HOST:-}" ] || fail "OAM_MAC_HOST not set (or set OAM_SKIP_MAC=1 to drop the mac assets)"
   bash "$SCRIPT_DIR/build-platforms-tailnet.sh" --preflight-only \
     || fail "the mac build host or its signing setup cannot be used -- see above. Fix that, or set OAM_SKIP_MAC=1 to drop the mac assets"
+fi
+# The linux leg runs in a Lima VM on the same Mac, so it needs the Mac even
+# when the mac assets are skipped. Its --preflight-only checks Lima, Rosetta
+# and the instance, and stops the VM if it is running: the mac legs run first
+# and need the memory -- a VM Running with no live lock; one an earlier
+# OAM_KEEP_VM=1 run left still has that run's lock, and the preflight is BUSY
+# on it, stopping nothing. OAM_KEEP_VM=0 here, whatever the caller exported:
+# under OAM_KEEP_VM=1 the preflight keeps the Mac build lock (protocol v1.2,
+# every mode), and this release's own linux leg would then find it BUSY. The
+# knob still applies to the linux leg itself, below.
+if [ "$SKIP_LINUX" != "1" ]; then
+  [ -n "${OAM_MAC_HOST:-}" ] || fail "OAM_MAC_HOST not set -- the linux leg runs in a VM on the build Mac (or set OAM_SKIP_LINUX=1 to drop the linux asset)"
+  OAM_KEEP_VM=0 bash "$SCRIPT_DIR/build-platforms-mac-linux.sh" --preflight-only \
+    || fail "the linux leg's VM on the build Mac cannot be used -- see above. Fix that, or set OAM_SKIP_LINUX=1 to drop the linux asset"
 fi
 
 # Release signing, proven HERE for the same reason as the host checks above:
@@ -1232,14 +1284,21 @@ fi
 if [ "$SKIP_LINUX" = "1" ]; then
   warn "OAM_SKIP_LINUX=1 -- linux asset dropped this release"
 else
-  step "Linux leg (GCP: direct ssh, IAP fallback)"
-  # Retried whole: this driver already retries each REMOTE STEP internally
-  # (OAM_REMOTE_STEP_ATTEMPTS, default 3, covering transport drops and a VM
-  # stopped under a step) -- this loop is the outer shell around the leg as a
-  # whole, re-syncing the same run's source tarball like the mac leg does.
-  # Sub-caption only: `[fail]` and the log path come from the driver itself.
-  LINUX_ART=$(run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "linux leg" \
-    bash "$SCRIPT_DIR/build-platforms-gcp-iap.sh" --mode=release) \
+  step "Linux leg (Lima VM on the build Mac: $OAM_MAC_HOST)"
+  # AFTER the mac legs, never beside them: the VM and a mac build do not fit
+  # in the Air's memory together, and the leg stops its VM on every exit.
+  # A dropped ssh connection during one step costs that step once over, not
+  # the leg: the driver retries a step whose ssh exits 255 a single time
+  # (build-platforms-mac-linux.sh, remote_step_run). Any other failure is
+  # retried whole, like the mac leg: each attempt starts the VM, re-syncs this
+  # run's source tarball over the build tree (keeping only target/) and runs
+  # every step again (OAM_KEEP_VM=1 applies to the last attempt only -- see
+  # linux_leg_attempt). Sub-caption only: `[fail]` and the log path come from
+  # the driver itself.
+  if [ "${OAM_KEEP_VM:-0}" = "1" ] && [ "$OAM_RELEASE_LEG_ATTEMPTS" -gt 1 ]; then
+    note "OAM_KEEP_VM=1 applies to the last of the $OAM_RELEASE_LEG_ATTEMPTS linux attempts: an earlier one stops its VM and releases the Mac build lock, so a retry is not BUSY on it"
+  fi
+  LINUX_ART=$(run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "linux leg" linux_leg_attempt) \
     || fail "linux leg failed -- see its log output above"
   LINUX_ART="${LINUX_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line
   cp "$LINUX_ART/oam-x86_64-unknown-linux-gnu" "$RELEASE_DIR/"
