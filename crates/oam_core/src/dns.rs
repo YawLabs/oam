@@ -1871,6 +1871,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_query_reaches_the_server_with_its_ttl() {
+        // No answer cache (c-ares keeps none): a repeat is a datagram too, and
+        // the record's TTL comes through as served (the fake serves 60).
+        let reg = DnsInstances::default();
+        let one = fake(Reply::Answer {
+            octet: 1,
+            delay_ms: 0,
+        })
+        .await;
+        let api = Api::Instance(dns_resolver_new(&reg, -1, 4, 0));
+        dns_set_servers(&reg, api, &[("127.0.0.1".parse().unwrap(), one.port)]);
+        for _ in 0..3 {
+            match dns_resolve(&reg, "repeat.example".into(), "A".into(), api).await {
+                OpOutcome::Json(json) => assert_eq!(json, r#"[{"address":"10.0.0.1","ttl":60}]"#),
+                other => panic!("expected records, got {other:?}"),
+            }
+        }
+        assert_eq!(one.asked.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
     async fn a_silent_server_gets_one_datagram_per_try() {
         // hickory's UDP stream would resend inside a try (CaresProvider).
         let silent = fake(Reply::Silent).await;

@@ -5,7 +5,9 @@
 //   answers [{ certUsage, selector, match, data }] in wire order, `data` an
 //   ArrayBuffer (not a Buffer); a record with no certificate data fails the
 //   whole query EBADRESP; errors carry syscall queryTlsa. oam had no TLSA
-//   query at all (resolve(h,'TLSA') refused with ENOSYS).
+//   query at all (resolve(h,'TLSA') refused with ENOSYS). An answer with
+//   records of other types only (no TLSA at all) is left out: node answers
+//   [] and oam ENODATA (docs/node-divergences.md #30).
 // * resolve4 / resolve6 with { ttl: true } report each record's TTL as
 //   served, any u32; oam reported ttl: 0 for every address.
 // * c-ares keeps no answer cache: every query is a datagram to the server,
@@ -55,7 +57,6 @@ const ZONE = {
     record(1, 60, Buffer.from([10, 0, 0, 9])), record(1, 60, Buffer.from([10, 0, 0, 8])),
     record(52, 60, tlsa(3, 1, 1, [1])), record(1, 60, Buffer.from([10, 0, 0, 7])), record(52, 60, tlsa(3, 1, 1, [2])),
   ]],
-  "aonly.example/52": [0, [record(1, 60, Buffer.from([10, 0, 0, 9]))]],
   "multi.example/1": [0, [record(1, 300, Buffer.from([10, 0, 0, 1])), record(1, 5, Buffer.from([10, 0, 0, 2]))]],
   "multi.example/28": [0, [record(28, 120, v6(1)), record(28, 7, v6(2))]],
   "big.example/1": [0, [
@@ -115,7 +116,6 @@ showTlsa("promises two", await pr.resolveTlsa("two.example"));
 showTlsa("promises mixed answer", await pr.resolveTlsa("mixed.example"));
 showTlsa("promises trailing other record", await pr.resolveTlsa("trailing.example"));
 showTlsa("promises holes", await pr.resolveTlsa("holes.example"));
-showTlsa("promises only another type", await pr.resolveTlsa("aonly.example"));
 showTlsa("promises resolve TLSA", await pr.resolve("one.example", "TLSA"));
 showTlsa("module promises", await dns.promises.resolveTlsa("one.example"));
 showTlsa("ttl option ignored", await pr.resolveTlsa("one.example", { ttl: true }));

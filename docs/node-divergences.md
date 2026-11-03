@@ -1372,7 +1372,11 @@ keeps an instance's channel id off the object, so an instance has no own propert
 assertion (`args[2]->IsInt32()`); oam takes it as the cap it names. Query answers are
 Node's: `{ ttl: true }` reports each record's TTL as served, and every query is sent (oam's
 resolver kept an answer cache up to 0.19.2, which c-ares does not), as conformance case 587
-pins with `resolveTlsa`.
+pins with `resolveTlsa`. One TLSA answer differs: a response whose answer section has
+records of other types only (a CNAME, an A) and no TLSA record is `[]` in Node, whose TLSA
+parser walks the answers itself, and `ENODATA` in oam, whose resolver reports "no record of
+the type asked" before the records reach it. A response with any TLSA record matches,
+including the holes Node leaves where a record of another type sat.
 
 dns's result order (`dns.setDefaultResultOrder()`, `--dns-result-order`, a lookup's
 `order` / `verbatim`) orders `dns.lookup()` and `net.connect()`'s lookups as in Node

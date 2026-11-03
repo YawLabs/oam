@@ -105,11 +105,10 @@ console.log("base methods", JSON.stringify(Object.getOwnPropertyNames(base.proto
   JSON.stringify(Object.getOwnPropertyNames(base.prototype).map((n) => base.prototype[n].length)));
 console.log("base methods enumerable", Object.keys(base.prototype).length);
 for (const [label, C] of [["callback", dns.Resolver], ["promises", PR]]) {
-  // resolveTlsa is left out: oam has no TLSA query (a recorded surface gap).
-  const names = Object.getOwnPropertyNames(C.prototype).filter((n) => n !== "resolveTlsa");
+  const names = Object.getOwnPropertyNames(C.prototype);
   console.log(label, "methods", JSON.stringify(names));
   console.log(label, "lengths", JSON.stringify(names.map((n) => C.prototype[n].length)));
-  console.log(label, "enumerable", Object.keys(C.prototype).filter((n) => n !== "resolveTlsa").length);
+  console.log(label, "enumerable", Object.keys(C.prototype).length);
 }
 console.log("instance own symbols", Object.getOwnPropertySymbols(new PR()).length);
 threw("call without new", () => PR());
@@ -295,8 +294,7 @@ dns.setServers(system);
       console.log(label, e.name, e.code, e.message, "errno" in e ? typeof e.errno : "-", e.syscall);
     }
   }
-  const order = Object.keys(dns.promises).filter((k) => k.startsWith("resolve") || k === "reverse")
-    .filter((k) => k !== "resolveTlsa");
+  const order = Object.keys(dns.promises).filter((k) => k.startsWith("resolve") || k === "reverse");
   console.log("promises query keys", JSON.stringify(order));
 }
 

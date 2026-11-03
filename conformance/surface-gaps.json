@@ -5,8 +5,8 @@
       "generatedAgainst": "v22.22.2 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1597,
-        "missing": 277,
+        "present": 1602,
+        "missing": 272,
         "absentModules": 4,
         "absentModuleExportNames": 10
       },
@@ -128,15 +128,10 @@
           "_createSocketHandle"
         ],
         "dns": [
-          "getDefaultResultOrder",
-          "lookupService",
-          "resolveTlsa"
+          "lookupService"
         ],
         "dns/promises": [
-          "getDefaultResultOrder",
-          "lookupService",
-          "resolveTlsa",
-          "setDefaultResultOrder"
+          "lookupService"
         ],
         "domain": [
           "_stack",
@@ -406,8 +401,8 @@
       "generatedAgainst": "v22.22.2 on linux-x64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1597,
-        "missing": 281,
+        "present": 1602,
+        "missing": 276,
         "absentModules": 4,
         "absentModuleExportNames": 10
       },
@@ -533,15 +528,10 @@
           "_createSocketHandle"
         ],
         "dns": [
-          "getDefaultResultOrder",
-          "lookupService",
-          "resolveTlsa"
+          "lookupService"
         ],
         "dns/promises": [
-          "getDefaultResultOrder",
-          "lookupService",
-          "resolveTlsa",
-          "setDefaultResultOrder"
+          "lookupService"
         ],
         "domain": [
           "_stack",
@@ -811,8 +801,8 @@
       "generatedAgainst": "v22.22.2 on win32-arm64",
       "counts": {
         "nodeExportNames": 1874,
-        "present": 1596,
-        "missing": 268,
+        "present": 1601,
+        "missing": 263,
         "absentModules": 4,
         "absentModuleExportNames": 10
       },
@@ -927,15 +917,10 @@
           "_createSocketHandle"
         ],
         "dns": [
-          "getDefaultResultOrder",
-          "lookupService",
-          "resolveTlsa"
+          "lookupService"
         ],
         "dns/promises": [
-          "getDefaultResultOrder",
-          "lookupService",
-          "resolveTlsa",
-          "setDefaultResultOrder"
+          "lookupService"
         ],
         "domain": [
           "_stack",
