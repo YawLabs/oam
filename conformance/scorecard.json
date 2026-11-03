@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "a230d66b",
+  "commit": "0fcaa261",
   "oamVersion": "oam 0.19.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 416,
-      "total": 417,
+      "pass": 417,
+      "total": 418,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -1520,6 +1520,10 @@
           "status": "pass"
         },
         {
+          "case": "584-dns-resolver-instances.mjs",
+          "status": "pass"
+        },
+        {
           "case": "59-child-spawn-error-shape.mjs",
           "status": "pass"
         },
@@ -1787,7 +1791,7 @@
         "platform": "win32",
         "noBaseline": false,
         "nodeTotal": 1874,
-        "knownMissing": 293,
+        "knownMissing": 268,
         "newMissing": [],
         "staleRatchet": [],
         "absentModules": [],
