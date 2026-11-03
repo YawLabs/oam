@@ -415,6 +415,15 @@ fn build_channel_with(
         // covers the same forwarder shape for answers past the EDNS size.
         opts.edns0 = true;
         opts.try_tcp_on_error = true;
+        // c-ares keeps no answer cache: every query reaches the server
+        // (measured on node v22.22.2: five resolve4 calls, five datagrams,
+        // NXDOMAIN and NODATA included). hickory's cache answered repeats
+        // without asking, and with TTLs decremented by the time elapsed.
+        opts.cache_size = 0;
+        // ...and node reports a record's TTL as served, any u32 (measured:
+        // 100000, 2^31 and 2^32-1 come through), where hickory clamps every
+        // answer's TTL to its 86400 s cache ceiling even uncached.
+        opts.positive_max_ttl = Some(Duration::from_secs(u64::from(u32::MAX)));
         // One server per resolver and one try per call: the retries, the
         // server walk and the timeout are the channel's (`walk`), so they
         // follow c-ares. hickory's own timeout is set past the longest round
@@ -817,6 +826,39 @@ fn host(name: &hickory_resolver::proto::rr::Name) -> String {
     s.strip_suffix('.').map(str::to_owned).unwrap_or(s)
 }
 
+/// dns's result order (`dns.setDefaultResultOrder`, `--dns-result-order`, a
+/// lookup's `order` / `verbatim`): the resolver's own order, or a stable
+/// partition by family (measured on node v22.22.2: each family keeps its
+/// relative order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResultOrder {
+    Verbatim,
+    Ipv4First,
+    Ipv6First,
+}
+
+impl ResultOrder {
+    /// node's names; anything else (an absent argument) is verbatim. The JS
+    /// side has validated the name.
+    pub fn parse(name: &str) -> ResultOrder {
+        match name {
+            "ipv4first" => ResultOrder::Ipv4First,
+            "ipv6first" => ResultOrder::Ipv6First,
+            _ => ResultOrder::Verbatim,
+        }
+    }
+
+    /// Reorders `items` in place, `is_v4` telling the families apart.
+    pub fn apply<T>(self, items: &mut [T], is_v4: impl Fn(&T) -> bool) {
+        match self {
+            ResultOrder::Verbatim => {}
+            // sort_by_key is stable: equal keys keep their order.
+            ResultOrder::Ipv4First => items.sort_by_key(|item| !is_v4(item)),
+            ResultOrder::Ipv6First => items.sort_by_key(|item| is_v4(item)),
+        }
+    }
+}
+
 /// dns.lookup: getaddrinfo of `name`, the UTS #46 ToASCII form of `hostname`
 /// node's GetAddrInfo hands libuv; errors name `hostname` as written. An
 /// empty `name` is libuv's EINVAL (see `net_connect::resolve_as`).
@@ -945,7 +987,12 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
                     .answers()
                     .iter()
                     .filter_map(|rec| match &rec.data {
-                        RData::A(a) => Some(serde_json::json!(a.0.to_string())),
+                        // With its TTL: the JS side keeps it for node's
+                        // { ttl: true } and otherwise drops it.
+                        RData::A(a) => Some(serde_json::json!({
+                            "address": a.0.to_string(),
+                            "ttl": rec.ttl,
+                        })),
                         _ => None,
                     })
                     .collect();
@@ -959,7 +1006,12 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
                     .answers()
                     .iter()
                     .filter_map(|rec| match &rec.data {
-                        RData::AAAA(a) => Some(serde_json::json!(a.0.to_string())),
+                        // With its TTL: the JS side keeps it for node's
+                        // { ttl: true } and otherwise drops it.
+                        RData::AAAA(a) => Some(serde_json::json!({
+                            "address": a.0.to_string(),
+                            "ttl": rec.ttl,
+                        })),
                         _ => None,
                     })
                     .collect();
@@ -1152,6 +1204,51 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
                             "preference": naptr.preference,
                         })),
                         _ => None,
+                    })
+                    .collect();
+                OpOutcome::Json(serde_json::json!(records).to_string())
+            }
+            Err(e) => dns_err(&hostname, &e),
+        },
+        "TLSA" => match channel_lookup(&ch, &hostname, RecordType::TLSA).await {
+            Ok(lookup) => {
+                // One entry per answer record, null for a record of another
+                // type: node's array keeps the position, a hole where c-ares
+                // skipped a record (measured: [A, TLSA] answers a two-slot
+                // array with a hole first; [TLSA, A] one slot).
+                let records: Vec<Option<&hickory_resolver::proto::rr::rdata::TLSA>> = lookup
+                    .answers()
+                    .iter()
+                    .map(|rec| match &rec.data {
+                        RData::TLSA(tlsa) => Some(tlsa),
+                        _ => None,
+                    })
+                    .collect();
+                // c-ares refuses a TLSA record with no certificate data, and
+                // the whole answer with it (measured: "queryTlsa EBADRESP"
+                // even beside a well-formed record); hickory decodes it.
+                if records
+                    .iter()
+                    .flatten()
+                    .any(|tlsa| tlsa.cert_data.is_empty())
+                {
+                    return OpOutcome::node_failed(
+                        "EBADRESP",
+                        format!("EBADRESP {hostname}: TLSA record without certificate data"),
+                    );
+                }
+                // node's keys in its order (certUsage, selector, match,
+                // data); `data` is the bytes, made an ArrayBuffer in JS.
+                let records: Vec<serde_json::Value> = records
+                    .into_iter()
+                    .map(|tlsa| match tlsa {
+                        Some(tlsa) => serde_json::json!({
+                            "certUsage": u8::from(tlsa.cert_usage),
+                            "selector": u8::from(tlsa.selector),
+                            "match": u8::from(tlsa.matching),
+                            "data": tlsa.cert_data,
+                        }),
+                        None => serde_json::Value::Null,
                     })
                     .collect();
                 OpOutcome::Json(serde_json::json!(records).to_string())
@@ -1736,6 +1833,22 @@ mod tests {
     }
 
     #[test]
+    fn result_order_is_a_stable_partition_by_family() {
+        let mixed = ["6a", "4a", "6b", "4b", "6c"];
+        let v4 = |s: &&str| s.starts_with('4');
+        let mut verbatim = mixed;
+        ResultOrder::parse("verbatim").apply(&mut verbatim, v4);
+        assert_eq!(verbatim, mixed);
+        let mut first4 = mixed;
+        ResultOrder::parse("ipv4first").apply(&mut first4, v4);
+        assert_eq!(first4, ["4a", "4b", "6a", "6b", "6c"]);
+        let mut first6 = mixed;
+        ResultOrder::parse("ipv6first").apply(&mut first6, v4);
+        assert_eq!(first6, ["6a", "6b", "6c", "4a", "4b"]);
+        assert_eq!(ResultOrder::parse(""), ResultOrder::Verbatim);
+    }
+
+    #[test]
     fn resolver_options_map_to_cares_timing() {
         let system = CaresTiming::from_timeout_option(None);
         let t = |timeout, tries, max| CaresTiming::for_resolver(system, timeout, tries, max);
@@ -1794,7 +1907,7 @@ mod tests {
         );
         assert_eq!(dns_get_servers(&reg, Api::Callback), system);
         match dns_resolve(&reg, "x.example".into(), "A".into(), a).await {
-            OpOutcome::Json(json) => assert_eq!(json, r#"["10.0.0.1"]"#),
+            OpOutcome::Json(json) => assert_eq!(json, r#"[{"address":"10.0.0.1","ttl":60}]"#),
             other => panic!("expected records, got {other:?}"),
         }
 

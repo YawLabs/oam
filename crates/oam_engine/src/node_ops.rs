@@ -5011,6 +5011,10 @@ fn op_net_resolve(
         Some(hints) if hints.is_finite() => hints as i32,
         _ => 0,
     };
+    // args[5]: dns's result order for this lookup ("verbatim", "ipv4first"
+    // or "ipv6first"; dns.getDefaultResultOrder() as JS read it), applied
+    // before a single answer is picked, as node's dns.lookup applies it.
+    let order = oam_core::dns::ResultOrder::parse(&arg_string(scope, &args, 5).unwrap_or_default());
     if !check_net_perm(scope, &format!("{host}:{port}")) {
         return;
     }
@@ -5024,6 +5028,7 @@ fn op_net_resolve(
             Ok(addrs) => addrs,
             Err(e) => return e.to_outcome(),
         };
+        order.apply(&mut addrs, |ip| ip.is_ipv4());
         if !all {
             addrs.truncate(1);
         }

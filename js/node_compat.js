@@ -32053,6 +32053,24 @@
   // 'IPv4' / 'IPv6' or one of 0, 4, 6 (validateOneOf), and the number form
   // `dns.lookup(host, 6, cb)` is checked under the name 'family'. Returns
   // the family to use. net.connect reaches it with its own `family`.
+  // dns's default result order (dns.getDefaultResultOrder): "verbatim", or
+  // --dns-result-order's value (the CLI checked it). One per thread, shared
+  // by dns, dns.promises and net's own lookups, as node's is; a Worker starts
+  // from the flag again, not from its parent's setDefaultResultOrder().
+  const DNS_RESULT_ORDERS = ["verbatim", "ipv4first", "ipv6first"];
+  function dnsResultOrder() {
+    if (registry._dnsResultOrder === undefined) {
+      const flag = globalThis.__oamDnsResultOrder;
+      registry._dnsResultOrder = DNS_RESULT_ORDERS.includes(flag) ? flag : "verbatim";
+    }
+    return registry._dnsResultOrder;
+  }
+  function validateDnsOrder(order, name) {
+    if (!DNS_RESULT_ORDERS.includes(order)) {
+      throw codes.ERR_INVALID_ARG_VALUE(name, order, "must be one of: 'verbatim', 'ipv4first', 'ipv6first'");
+    }
+  }
+
   function validateDnsFamily(family, name) {
     if (family == null) return 0;
     if (family === "IPv4") return 4;
@@ -32501,7 +32519,9 @@
       const family = dnsopts.family === 4 || dnsopts.family === 6 ? dnsopts.family : 0;
       const hints = validateDnsHints(dnsopts.hints);
       validateDnsFamily(dnsopts.family, "options.family");
-      natives.netResolve(host, family, multiple, port, hints).then(
+      // dns's default result order, applied before one address is picked,
+      // as node's dns.lookup (which net calls) applies it.
+      natives.netResolve(host, family, multiple, port, hints, dnsResultOrder()).then(
         (answer) => {
           const token = answer.token;
           let redeemed = false;
@@ -38863,7 +38883,7 @@
     // rrtype leaves the error untouched below instead of guessing.
     const DNS_QUERY_SYSCALL = {
       A: "queryA", AAAA: "queryAaaa", ANY: "queryAny", CAA: "queryCaa",
-      CNAME: "queryCname", MX: "queryMx", NAPTR: "queryNaptr", NS: "queryNs",
+      CNAME: "queryCname", MX: "queryMx", NAPTR: "queryNaptr", NS: "queryNs", TLSA: "queryTlsa",
       PTR: "queryPtr", SOA: "querySoa", SRV: "querySrv", TXT: "queryTxt",
     };
 
@@ -38906,7 +38926,7 @@
     // promises API and the Resolver class all inherit the same shaped error --
     // dns.promises.lookup() used to hand back the bare op error because it
     // returned the native promise straight to the caller.
-    function _dnsLookup(hostname, family, all, flags = 0) {
+    function _dnsLookup(hostname, family, all, flags = 0, order = "verbatim") {
       const host = String(hostname);
       // node answers an IP literal itself, as written (no resolver, no
       // family filter): '0:0:0:0:0:0:0:1' stays that, '::1%1' keeps its zone.
@@ -38915,9 +38935,26 @@
         const answer = { address: host, family: literal };
         return Promise.resolve(all ? [answer] : answer);
       }
-      return natives.dnsLookup(host, family, all, flags).then(undefined, (err) => {
-        throw _shapeDnsError(err, "getaddrinfo", host, true);
-      });
+      // A non-verbatim order is a stable partition by family (measured on
+      // node v22.22.2: each family keeps its relative order), applied to the
+      // whole answer before a single address is picked. One family asked for
+      // leaves nothing to order.
+      const ordered = order !== "verbatim" && family === 0;
+      const lookup = natives.dnsLookup(host, family, all || ordered, flags);
+      return lookup.then(
+        (answer) => {
+          if (!ordered) return answer;
+          const first = order === "ipv4first" ? 4 : 6;
+          const sorted = [
+            ...answer.filter((a) => a.family === first),
+            ...answer.filter((a) => a.family !== first),
+          ];
+          return all ? sorted : sorted[0];
+        },
+        (err) => {
+          throw _shapeDnsError(err, "getaddrinfo", host, true);
+        },
+      );
     }
 
     // `api` is the node API a call came through, which picks the nameservers
@@ -38955,8 +38992,8 @@
     // address twice, and node reports both; emulating the flags over an
     // unflagged lookup answered it once (case 228 on the linux leg), and
     // ADDRCONFIG was dropped here up to 0.18.0 (#165).
-    function _dnsLookupHinted(hostname, family, all, hints) {
-      return _dnsLookup(hostname, family, all, hints);
+    function _dnsLookupHinted(hostname, family, all, hints, order) {
+      return _dnsLookup(hostname, family, all, hints, order);
     }
 
     // node's internal/dns/utils emitInvalidHostnameWarning: DEP0118 for a
@@ -38991,7 +39028,9 @@
       }
       if (typeof options === "number") {
         checkCallback();
-        return { family: validateDnsFamily(options, "family"), hints: 0, all: false };
+        return {
+          family: validateDnsFamily(options, "family"), hints: 0, all: false, order: dnsResultOrder(),
+        };
       }
       if (options !== undefined && typeof options !== "object") {
         checkCallback(true);
@@ -39011,20 +39050,21 @@
         }
         all = opts.all;
       }
-      // node's last two checks. They are validated only: oam has no result
-      // ordering (getDefaultResultOrder / setDefaultResultOrder are surface
-      // gaps), so the platform resolver's order is the answer either way.
-      if (opts.verbatim != null && typeof opts.verbatim !== "boolean") {
-        throw codes.ERR_INVALID_ARG_TYPE("options.verbatim", "boolean", opts.verbatim);
+      // node's last two checks, and the order they pick: the default
+      // (dns.getDefaultResultOrder()), then `verbatim` (true is verbatim,
+      // false ipv4first), then `order`, which wins over both.
+      let order = dnsResultOrder();
+      if (opts.verbatim != null) {
+        if (typeof opts.verbatim !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.verbatim", "boolean", opts.verbatim);
+        }
+        order = opts.verbatim ? "verbatim" : "ipv4first";
       }
-      if (opts.order != null && opts.order !== "verbatim" && opts.order !== "ipv4first" && opts.order !== "ipv6first") {
-        throw codes.ERR_INVALID_ARG_VALUE(
-          "options.order",
-          opts.order,
-          "must be one of: 'verbatim', 'ipv4first', 'ipv6first'",
-        );
+      if (opts.order != null) {
+        validateDnsOrder(opts.order, "options.order");
+        order = opts.order;
       }
-      return { family, hints, all };
+      return { family, hints, all, order };
     }
 
     function lookup(hostname, options, callback) {
@@ -39034,7 +39074,7 @@
           throw codes.ERR_INVALID_ARG_TYPE("hostname", "string", hostname);
         }
         callback = options;
-        parsed = { family: 0, hints: 0, all: false };
+        parsed = { family: 0, hints: 0, all: false, order: dnsResultOrder() };
       } else {
         // node validates the 2-argument form `lookup(host, notAFunction)` as
         // the callback it must then be, before it reports a bad options.
@@ -39046,7 +39086,7 @@
           }
         }, true);
       }
-      const { family, hints, all } = parsed;
+      const { family, hints, all, order } = parsed;
 
       // node answers a falsy hostname without the resolver, on the next tick,
       // and returns a bare object where a real lookup returns its request.
@@ -39057,7 +39097,7 @@
         return {};
       }
 
-      _dnsLookupHinted(hostname, family, all, hints).then(
+      _dnsLookupHinted(hostname, family, all, hints, order).then(
         (result) => {
           if (all) {
             callback(null, result);
@@ -39105,27 +39145,45 @@
       throw e;
     }
 
-    // The two record types oam cannot query, refused the same way from every
-    // entry point once the arguments pass: ANY (node deprecates it) and TLSA
-    // (no TLSA support yet; a recorded surface gap).
-    function unsupportedQuery(rrtype) {
-      const what = rrtype === "ANY"
-        ? "dns.resolveAny is not supported by oam (deprecated in Node.js)"
-        : "dns.resolveTlsa is not supported by oam";
-      return Object.assign(new Error(what), { code: "ENOSYS" });
+    // The record type oam cannot query, refused the same way from every entry
+    // point once the arguments pass: ANY (node deprecates it).
+    function unsupportedQuery() {
+      return Object.assign(
+        new Error("dns.resolveAny is not supported by oam (deprecated in Node.js)"),
+        { code: "ENOSYS" },
+      );
     }
 
-    // One query's answer, with node's `ttl` option for A / AAAA. oam's native
-    // answer carries no TTL, so it reads 0 (docs/node-divergences.md #30).
+    // One query's answer as node hands it over. A / AAAA come back from the
+    // native side as { address, ttl } with the record's TTL as served: node's
+    // `ttl` option keeps them, and otherwise they are the addresses alone.
+    // TLSA's certificate data comes back as its bytes, and node's is an
+    // ArrayBuffer (measured: not a Buffer).
     function withTtl(rrtype, options, records) {
-      if ((rrtype === "A" || rrtype === "AAAA") && options && options.ttl) {
-        return records.map((address) => ({ address, ttl: 0 }));
+      if (rrtype === "A" || rrtype === "AAAA") {
+        return options && options.ttl ? records : records.map((r) => r.address);
+      }
+      if (rrtype === "TLSA") {
+        // A slot per answer record up to the last TLSA one, a hole where the
+        // record was of another type (c-ares's parser, as node reports it).
+        const out = [];
+        records.forEach((r, i) => {
+          if (r) {
+            out[i] = {
+              certUsage: r.certUsage,
+              selector: r.selector,
+              match: r.match,
+              data: new Uint8Array(r.data).buffer,
+            };
+          }
+        });
+        return out;
       }
       return records;
     }
 
     function runQuery(api, rrtype, name) {
-      if (rrtype === "ANY" || rrtype === "TLSA") return Promise.reject(unsupportedQuery(rrtype));
+      if (rrtype === "ANY") return Promise.reject(unsupportedQuery());
       return _dnsQuery(name, rrtype, api);
     }
 
@@ -39134,10 +39192,13 @@
     // resolver(bindingName) wrapper: query(name[, options], callback).
     function _callbackApi(api) {
       function query(rrtype) {
-        return function (name, options, callback) {
-          if (arguments.length <= 2) {
-            callback = options;
-            options = undefined;
+        // node's query(name, callback), an options argument between them
+        // when there are three (so its length is 2, as node's).
+        return function (name, callback) {
+          let options;
+          if (arguments.length > 2) {
+            options = callback;
+            callback = arguments[2];
           }
           validateQueryName(name);
           validateQueryCallback(callback);
@@ -39162,8 +39223,8 @@
         resolveSrv: query("SRV"),
         resolveTlsa: query("TLSA"),
         resolveTxt: query("TXT"),
-        reverse(ip, options, callback) {
-          if (arguments.length <= 2) callback = options;
+        reverse(ip, callback) {
+          if (arguments.length > 2) callback = arguments[2];
           validateQueryName(ip);
           validateQueryCallback(callback);
           validateReverseIp(ip);
@@ -39189,7 +39250,7 @@
     }
 
     const {
-      resolve, resolve4, resolve6, resolveAny, resolveCname, resolveMx, resolveTxt, resolveNs, resolveSrv, resolveSoa, resolvePtr, resolveCaa, resolveNaptr, reverse,
+      resolve, resolve4, resolve6, resolveAny, resolveCaa, resolveCname, resolveMx, resolveNaptr, resolveNs, resolvePtr, resolveSoa, resolveSrv, resolveTlsa, resolveTxt, reverse,
     } = _callbackApi(DNS_API_CALLBACK);
 
 
@@ -39272,11 +39333,21 @@
       CANCELLED: "ECANCELLED",
     };
 
+    // dns.getDefaultResultOrder / setDefaultResultOrder: the same two
+    // functions on dns and dns.promises, over the one per-thread default.
+    function getDefaultResultOrder() {
+      return dnsResultOrder();
+    }
+    function setDefaultResultOrder(dnsOrder) {
+      validateDnsOrder(dnsOrder, "dnsOrder");
+      registry._dnsResultOrder = dnsOrder;
+    }
+
     const promises = {
       lookup(hostname, options) {
         // node validates before it returns a promise: a non-string hostname,
         // a bad options, `hints`, `family` or `all` throws.
-        const { family, hints, all } = parseLookupArgs(hostname, options, () => {}, false);
+        const { family, hints, all, order } = parseLookupArgs(hostname, options, () => {}, false);
         // A falsy hostname resolves without the resolver (node's
         // createLookupPromise): null with family 6 when 6 was asked for and 4
         // otherwise, or [] with `all`.
@@ -39284,10 +39355,12 @@
           warnInvalidHostname(hostname);
           return Promise.resolve(all ? [] : { address: null, family: family === 6 ? 6 : 4 });
         }
-        return _dnsLookupHinted(hostname, family, all, hints);
+        return _dnsLookupHinted(hostname, family, all, hints, order);
       },
       // Filled in below, once the class exists; the key keeps node's place.
       Resolver: undefined,
+      getDefaultResultOrder,
+      setDefaultResultOrder,
       // dns.setServers() reaches these too; this setServers reaches only
       // dns.promises (node's promises module rebinds only itself).
       setServers: (servers) => setServersFor(DNS_API_PROMISES, servers),
@@ -39295,9 +39368,6 @@
       getServers: () => natives.dnsGetServers(DNS_API_PROMISES),
       ..._promisesDefault,
     };
-    // oam has no TLSA query: the name stays absent (a recorded surface gap)
-    // rather than present and always failing.
-    delete promises.resolveTlsa;
 
     // dns.setServers / dns.promises.setServers: node's ResolverBase
     // .setServers (lib/internal/dns/utils.js) parses every entry before
@@ -39465,11 +39535,10 @@
     }
 
     // node assigns the query methods to each class's prototype (enumerable,
-    // after `constructor`) in this order. resolveTlsa is not here: oam has no
-    // TLSA query yet (a recorded surface gap for dns and dns/promises).
+    // after `constructor`) in this order.
     const RESOLVER_QUERY_METHODS = [
       "resolveAny", "resolve4", "resolve6", "resolveCaa", "resolveCname", "resolveMx",
-      "resolveNs", "resolveTxt", "resolveSrv", "resolvePtr", "resolveNaptr", "resolveSoa",
+      "resolveNs", "resolveTlsa", "resolveTxt", "resolveSrv", "resolvePtr", "resolveNaptr", "resolveSoa",
       "reverse",
     ];
 
@@ -39516,31 +39585,35 @@
       enumerable: false,
     });
 
+    // node's key order (Object.keys(dns), measured on v22.22.2).
+    // lookupService is still missing (a recorded surface gap).
     return {
       lookup,
+      Resolver,
+      getDefaultResultOrder,
+      setDefaultResultOrder,
+      setServers(servers) { setServersFor(DNS_API_CALLBACK, servers); },
+      ADDRCONFIG,
+      ALL,
+      V4MAPPED,
+      ...DNS_ERROR_CODES,
+      getServers: () => natives.dnsGetServers(DNS_API_CALLBACK),
       resolve,
       resolve4,
       resolve6,
+      resolveAny,
+      resolveCaa,
       resolveCname,
       resolveMx,
-      resolveTxt,
-      resolveNs,
-      resolveSrv,
-      resolveSoa,
-      resolvePtr,
-      resolveCaa,
       resolveNaptr,
-      resolveAny,
+      resolveNs,
+      resolvePtr,
+      resolveSoa,
+      resolveSrv,
+      resolveTlsa,
+      resolveTxt,
       reverse,
-      Resolver,
       promises,
-      setDefaultResultOrder() {},
-      setServers(servers) { setServersFor(DNS_API_CALLBACK, servers); },
-      getServers: () => natives.dnsGetServers(DNS_API_CALLBACK),
-      ADDRCONFIG,
-      V4MAPPED,
-      ALL,
-      ...DNS_ERROR_CODES,
     };
   };
 

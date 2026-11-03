@@ -32,13 +32,29 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   validated and set the instance's timing (they were ignored), `cancel()` fails the pending
   queries with `ECANCELLED` (it did nothing), and `setLocalAddress()` binds the queries'
   source address (it did not exist). `dns.promises` also gains the 24 c-ares error-code
-  constants (`NOTFOUND`, `TIMEOUT`, ...). `resolveTlsa` is still missing (#453).
+  constants (`NOTFOUND`, `TIMEOUT`, ...) (#453).
+- **`dns.resolveTlsa()`**, on `dns`, `dns.promises` and both `Resolver` classes, and
+  `resolve(name, 'TLSA')`, which refused with `ENOSYS`: node's `{ certUsage, selector, match,
+  data }` records, `data` an `ArrayBuffer`.
+- **`dns.getDefaultResultOrder()` and a working `dns.setDefaultResultOrder()`, on `dns` and
+  `dns.promises`, and `--dns-result-order`** (also from `NODE_OPTIONS`). `setDefaultResultOrder`
+  did nothing and the flag was refused; a lookup's `order` and `verbatim` options were checked
+  and then ignored. `dns.lookup()` and `net.connect()` now order their answers by them, as node
+  does.
+- **`--throw-deprecation`** (also from `NODE_OPTIONS` and a `Worker`'s `execArgv`): a
+  deprecation warning is thrown on the next tick instead of printed. It was refused with exit
+  code 2. `process.noDeprecation` under `--no-deprecation` is read-only, as in node.
 
 ### Fixed
 
 - **`dns.NOTFOUND` and the other c-ares error-code constants are the codes errors carry.**
   They were the bare names (`dns.NOTFOUND === "NOTFOUND"`), so `err.code === dns.NOTFOUND`
   never held; they are now node's strings (`"ENOTFOUND"`, `"ETIMEOUT"`, ...).
+- **`{ ttl: true }` on `resolve4()` / `resolve6()` reports each record's TTL as served.** It
+  reported `ttl: 0` for every address.
+- **Every DNS query is sent to the server, as c-ares sends it.** oam's resolver kept an answer
+  cache, so a repeated query (an NXDOMAIN or a NODATA answer included) was answered without
+  asking, and its TTLs were clamped to one day.
 - **The dns query functions check their arguments as node does, before anything is sent.**
   `dns.resolve4()` and the rest, on `dns`, `dns.promises` and both `Resolver` classes, took any
   name (a number was stringified and looked up) and no callback: a missing callback was found

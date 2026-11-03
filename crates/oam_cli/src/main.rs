@@ -541,6 +541,20 @@ fn main() -> ExitCode {
                 flags.trace_require_module = Some(value);
                 flags.trace_require_module_spaced = spaced;
                 i += if spaced { 2 } else { 1 };
+            } else if arg == "--dns-result-order" || arg.starts_with("--dns-result-order=") {
+                // The value is checked once both sources are in (below): node
+                // refuses a bad one from argv and NODE_OPTIONS alike, exit 1.
+                let (value, spaced) = match arg.strip_prefix("--dns-result-order=") {
+                    Some(v) => (Some(v.to_string()), false),
+                    None => (raw.get(i + 1).cloned(), true),
+                };
+                let Some(value) = value else {
+                    eprintln!("oam: --dns-result-order requires an argument");
+                    return ExitCode::from(9);
+                };
+                flags.dns_result_order = Some(value);
+                flags.dns_result_order_spaced = spaced;
+                i += if spaced { 2 } else { 1 };
             } else if let Some(v) = arg.strip_prefix("--title=") {
                 flags.title = Some(v.to_string());
                 i += 1;
@@ -721,6 +735,18 @@ fn main() -> ExitCode {
             let exe = argv.first().map(String::as_str).unwrap_or("oam");
             eprintln!("{exe}: either --tls-min-v1.3 or --tls-max-v1.2 can be used, not both");
             return ExitCode::from(9);
+        }
+        // node checks --dns-result-order in JS at startup (initializeDns),
+        // from argv or NODE_OPTIONS alike, and dies of the TypeError: exit 1,
+        // not 9 (measured on v22.22.2).
+        if let Some(order) = &flags.dns_result_order
+            && !matches!(order.as_str(), "verbatim" | "ipv4first" | "ipv6first")
+        {
+            eprintln!(
+                "TypeError [ERR_INVALID_ARG_VALUE]: The argument '--dns-result-order' must be one of: \
+                 'verbatim', 'ipv4first', 'ipv6first'. Received '{order}'"
+            );
+            return ExitCode::from(1);
         }
         if let Some(source) = eval_source {
             return run_eval(&source, print, &raw[i..], &flags);
@@ -1914,6 +1940,12 @@ fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
             if is_trace_require_module_value(v) {
                 flags.trace_require_module = Some(v.clone());
             }
+        } else if let Some(v) = tok.strip_prefix("--dns-result-order=") {
+            flags.dns_result_order = Some(v.to_string());
+        } else if tok == "--dns-result-order"
+            && let Some(v) = it.next()
+        {
+            flags.dns_result_order = Some(v.clone());
         } else if tok == "--no-warnings" {
             flags.no_warnings = true;
         } else if tok == "--no-deprecation" {
@@ -2780,6 +2812,11 @@ struct NodeFlags {
     /// require made from inside node_modules. Spaced as for the header size.
     trace_require_module: Option<String>,
     trace_require_module_spaced: bool,
+    /// `--dns-result-order=verbatim|ipv4first|ipv6first`: the initial
+    /// `dns.getDefaultResultOrder()`, per thread. Spaced as for the header
+    /// size.
+    dns_result_order: Option<String>,
+    dns_result_order_spaced: bool,
     /// `--tls-min-v1.0` / `--tls-min-v1.1` / `--tls-min-v1.2` /
     /// `--tls-min-v1.3` and `--tls-max-v1.2` / `--tls-max-v1.3`: the initial
     /// `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION`, so the default
@@ -2824,6 +2861,11 @@ impl NodeFlags {
             } else {
                 (env.trace_require_module, env.trace_require_module_spaced)
             };
+        let (dns_result_order, dns_result_order_spaced) = if argv.dns_result_order.is_some() {
+            (argv.dns_result_order.clone(), argv.dns_result_order_spaced)
+        } else {
+            (env.dns_result_order, env.dns_result_order_spaced)
+        };
         let (v8_pool_size, v8_pool_size_spaced) = if argv.v8_pool_size.is_some() {
             (argv.v8_pool_size.clone(), argv.v8_pool_size_spaced)
         } else {
@@ -2862,6 +2904,8 @@ impl NodeFlags {
             v8_pool_size_spaced,
             trace_require_module,
             trace_require_module_spaced,
+            dns_result_order,
+            dns_result_order_spaced,
             insecure_http_parser: env.insecure_http_parser || argv.insecure_http_parser,
             tls_min_v1_0: env.tls_min_v1_0 || argv.tls_min_v1_0,
             tls_min_v1_1: env.tls_min_v1_1 || argv.tls_min_v1_1,
@@ -3000,6 +3044,13 @@ impl NodeFlags {
         // all the escaping it needs.
         if let Some(mode) = &self.trace_require_module {
             js.push_str(&def("__oamTraceRequireModule", format!("\"{mode}\"")));
+        }
+        // node:dns reads it as the initial default result order; a value
+        // other than node's three (only a Worker's own execArgv can carry
+        // one this far) leaves the default, verbatim.
+        if let Some(order) = &self.dns_result_order {
+            let quoted = serde_json::to_string(order).unwrap_or_else(|_| "null".into());
+            js.push_str(&def("__oamDnsResultOrder", quoted));
         }
         // node:tls reads these as the initial DEFAULT_MIN_VERSION /
         // DEFAULT_MAX_VERSION (the names are node's own four, so quoting
@@ -3197,6 +3248,14 @@ impl NodeFlags {
                 out.push(v.clone());
             } else {
                 out.push(format!("--trace-require-module={v}"));
+            }
+        }
+        if let Some(v) = &self.dns_result_order {
+            if self.dns_result_order_spaced {
+                out.push("--dns-result-order".into());
+                out.push(v.clone());
+            } else {
+                out.push(format!("--dns-result-order={v}"));
             }
         }
         if self.insecure_http_parser {
