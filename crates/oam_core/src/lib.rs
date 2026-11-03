@@ -1345,6 +1345,8 @@ pub struct CoreRuntime {
     http_state: std::sync::Arc<http_server::HttpState>,
     tcp: tcp::TcpRegistry,
     tls: tls::TlsRegistry,
+    /// This runtime's dns.Resolver instances, freed with it.
+    dns_instances: dns::DnsInstances,
     udp: udp::UdpRegistry,
     ws: websocket::WsRegistry,
     workers: worker::WorkerRegistry,
@@ -1420,6 +1422,7 @@ impl CoreRuntime {
             http_state: std::sync::Arc::new(http_server::HttpState::default()),
             tcp: std::sync::Arc::new(std::sync::Mutex::new(tcp::TcpState::default())),
             tls: std::sync::Arc::new(std::sync::Mutex::new(tls::TlsState::default())),
+            dns_instances: dns::DnsInstances::default(),
             udp: std::sync::Arc::new(std::sync::Mutex::new(udp::UdpState::default())),
             ws: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             workers: std::sync::Arc::new(std::sync::Mutex::new(worker::WorkerState::default())),
@@ -1573,6 +1576,11 @@ impl CoreRuntime {
     /// TLS socket registry (Arc clone; dies with the run).
     pub fn tls(&self) -> tls::TlsRegistry {
         self.tls.clone()
+    }
+
+    /// This runtime's dns.Resolver instances (`dns::DnsInstances`).
+    pub fn dns_instances(&self) -> dns::DnsInstances {
+        self.dns_instances.clone()
     }
 
     /// UDP socket registry (Arc clone; dies with the run).

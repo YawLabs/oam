@@ -38852,9 +38852,10 @@
       return code.startsWith("EAI_") ? UV_FALLBACK_ERRNO[code] : undefined;
     }
 
+    // The two default APIs' channel numbers; a Resolver instance's channel is
+    // the id natives.dnsResolverNew gave it (2 and up).
     const DNS_API_CALLBACK = 0;
     const DNS_API_PROMISES = 1;
-    const DNS_API_RESOLVER = 2;
 
     // node's syscall names for the c-ares queries, from its own resolveMap.
     // Spelled out rather than derived from the rrtype so an rrtype node does
@@ -38923,8 +38924,7 @@
     // it goes to (oam_core::dns::Api): DNS_API_CALLBACK and DNS_API_PROMISES
     // each have a default that setServers replaces -- dns.setServers() both,
     // dns.promises.setServers() only the promises one, as node rebinds them --
-    // and every dns.Resolver instance (DNS_API_RESOLVER) keeps the system
-    // configuration.
+    // and a Resolver instance's id is its own channel.
     function _dnsQuery(hostname, rrtype, api = DNS_API_CALLBACK) {
       const host = String(hostname);
       return natives.dnsResolve(host, rrtype, api).then(undefined, (err) => {
@@ -39069,114 +39069,208 @@
       );
     }
 
+    // node's argument checks for a query (lib/internal/dns/callback_resolver.js
+    // and promises.js, v22.22.2), shared by every query method of the module
+    // APIs and of both Resolver classes; each throws synchronously, before
+    // anything is sent. Up to 0.19.2 none ran: a missing callback was found
+    // only when the answer came back, as an unhandled rejection that ended
+    // the process, and a non-string name was stringified and looked up.
+    function validateQueryName(name) {
+      if (typeof name !== "string") throw codes.ERR_INVALID_ARG_TYPE("name", "string", name);
+    }
+    function validateQueryCallback(callback) {
+      if (typeof callback !== "function") {
+        throw codes.ERR_INVALID_ARG_TYPE("callback", "function", callback);
+      }
+    }
+    // node's resolveMap keys, matched case-sensitively ('a' is refused).
+    const RESOLVE_RRTYPES = new Set([
+      "A", "AAAA", "ANY", "CAA", "CNAME", "MX", "NAPTR", "NS", "PTR", "SOA", "SRV", "TLSA", "TXT",
+    ]);
+    function validateRrtype(rrtype) {
+      if (typeof rrtype !== "string") throw codes.ERR_INVALID_ARG_TYPE("rrtype", "string", rrtype);
+      if (!RESOLVE_RRTYPES.has(rrtype)) throw codes.ERR_INVALID_ARG_VALUE("rrtype", rrtype);
+    }
+    // reverse() of something that is not an IP address: node's binding
+    // refuses it synchronously as a DNSException, "getHostByAddr EINVAL x",
+    // with the platform's EINVAL (measured: -4071 on Windows).
+    function validateReverseIp(ip) {
+      if (registry.get("net").isIP(ip) !== 0) return;
+      const e = new Error(`getHostByAddr EINVAL ${ip}`);
+      const entry = Array.from(uvErrnoTable(natives)).find(([, info]) => info[0] === "EINVAL");
+      e.errno = entry ? entry[0] : undefined;
+      e.code = "EINVAL";
+      e.syscall = "getHostByAddr";
+      e.hostname = ip;
+      throw e;
+    }
+
+    // The two record types oam cannot query, refused the same way from every
+    // entry point once the arguments pass: ANY (node deprecates it) and TLSA
+    // (no TLSA support yet; a recorded surface gap).
+    function unsupportedQuery(rrtype) {
+      const what = rrtype === "ANY"
+        ? "dns.resolveAny is not supported by oam (deprecated in Node.js)"
+        : "dns.resolveTlsa is not supported by oam";
+      return Object.assign(new Error(what), { code: "ENOSYS" });
+    }
+
+    // One query's answer, with node's `ttl` option for A / AAAA. oam's native
+    // answer carries no TTL, so it reads 0 (docs/node-divergences.md #30).
+    function withTtl(rrtype, options, records) {
+      if ((rrtype === "A" || rrtype === "AAAA") && options && options.ttl) {
+        return records.map((address) => ({ address, ttl: 0 }));
+      }
+      return records;
+    }
+
+    function runQuery(api, rrtype, name) {
+      if (rrtype === "ANY" || rrtype === "TLSA") return Promise.reject(unsupportedQuery(rrtype));
+      return _dnsQuery(name, rrtype, api);
+    }
+
     // The callback API over one channel: the module's functions and a
-    // dns.Resolver instance's differ only in `api`.
+    // dns.Resolver instance's differ only in `api`. Each method is node's
+    // resolver(bindingName) wrapper: query(name[, options], callback).
     function _callbackApi(api) {
-      function _resolveNative(hostname, rrtype, callback) {
-        _dnsQuery(hostname, rrtype, api).then(
-          (result) => callback(null, result),
-          (err) => callback(err),
-        );
+      function query(rrtype) {
+        return function (name, options, callback) {
+          if (arguments.length <= 2) {
+            callback = options;
+            options = undefined;
+          }
+          validateQueryName(name);
+          validateQueryCallback(callback);
+          runQuery(api, rrtype, name).then(
+            (records) => callback(null, withTtl(rrtype, options, records)),
+            (err) => callback(err),
+          );
+        };
       }
 
-      function resolve(hostname, rrtype, callback) {
+      const methods = {
+        resolve4: query("A"),
+        resolve6: query("AAAA"),
+        resolveAny: query("ANY"),
+        resolveCaa: query("CAA"),
+        resolveCname: query("CNAME"),
+        resolveMx: query("MX"),
+        resolveNaptr: query("NAPTR"),
+        resolveNs: query("NS"),
+        resolvePtr: query("PTR"),
+        resolveSoa: query("SOA"),
+        resolveSrv: query("SRV"),
+        resolveTlsa: query("TLSA"),
+        resolveTxt: query("TXT"),
+        reverse(ip, options, callback) {
+          if (arguments.length <= 2) callback = options;
+          validateQueryName(ip);
+          validateQueryCallback(callback);
+          validateReverseIp(ip);
+          _dnsReverse(ip, api).then(
+            (result) => callback(null, result),
+            (err) => callback(err),
+          );
+        },
+      };
+      // node's resolve(hostname, rrtype, callback): a function in place of
+      // the rrtype is an A query; any other non-string rrtype, or one that
+      // is not a resolveMap key, throws.
+      methods.resolve = function resolve(hostname, rrtype, callback) {
         if (typeof rrtype === "function") {
           callback = rrtype;
           rrtype = "A";
+        } else {
+          validateRrtype(rrtype);
         }
-        rrtype = (rrtype || "A").toUpperCase();
-        _resolveNative(hostname, rrtype, callback);
-      }
-
-      function resolve4(hostname, options, callback) {
-        if (typeof options === "function") { callback = options; options = {}; }
-        _dnsQuery(hostname, "A", api).then(
-          (results) => {
-            if (options && options.ttl) {
-              callback(null, results.map((r) => ({ address: r, ttl: 0 })));
-            } else {
-              callback(null, results);
-            }
-          },
-          (err) => callback(err),
-        );
-      }
-
-      function resolve6(hostname, options, callback) {
-        if (typeof options === "function") { callback = options; options = {}; }
-        _dnsQuery(hostname, "AAAA", api).then(
-          (results) => {
-            if (options && options.ttl) {
-              callback(null, results.map((r) => ({ address: r, ttl: 0 })));
-            } else {
-              callback(null, results);
-            }
-          },
-          (err) => callback(err),
-        );
-      }
-
-      function resolveCname(hostname, callback) {
-        _resolveNative(hostname, "CNAME", callback);
-      }
-
-      function resolveMx(hostname, callback) {
-        _resolveNative(hostname, "MX", callback);
-      }
-
-      function resolveTxt(hostname, callback) {
-        _resolveNative(hostname, "TXT", callback);
-      }
-
-      function resolveNs(hostname, callback) {
-        _resolveNative(hostname, "NS", callback);
-      }
-
-      function resolveSrv(hostname, callback) {
-        _resolveNative(hostname, "SRV", callback);
-      }
-
-      function resolveSoa(hostname, callback) {
-        _resolveNative(hostname, "SOA", callback);
-      }
-
-      function resolvePtr(hostname, callback) {
-        _resolveNative(hostname, "PTR", callback);
-      }
-
-      function resolveCaa(hostname, callback) {
-        _resolveNative(hostname, "CAA", callback);
-      }
-
-      function resolveNaptr(hostname, callback) {
-        _resolveNative(hostname, "NAPTR", callback);
-      }
-
-      function reverse(ip, callback) {
-        _dnsReverse(ip, api).then(
-          (result) => callback(null, result),
-          (err) => callback(err),
-        );
-      }
-
-      return {
-        resolve, resolve4, resolve6, resolveCname, resolveMx, resolveTxt, resolveNs, resolveSrv, resolveSoa, resolvePtr, resolveCaa, resolveNaptr, reverse,
+        return query(rrtype)(hostname, callback);
       };
+      return methods;
     }
 
     const {
-      resolve, resolve4, resolve6, resolveCname, resolveMx, resolveTxt, resolveNs, resolveSrv, resolveSoa, resolvePtr, resolveCaa, resolveNaptr, reverse,
+      resolve, resolve4, resolve6, resolveAny, resolveCname, resolveMx, resolveTxt, resolveNs, resolveSrv, resolveSoa, resolvePtr, resolveCaa, resolveNaptr, reverse,
     } = _callbackApi(DNS_API_CALLBACK);
-    const _resolverApi = _callbackApi(DNS_API_RESOLVER);
 
-    function resolveAny(hostname, callback) {
-      const err = Object.assign(
-        new Error("dns.resolveAny is not supported by oam (deprecated in Node.js)"),
-        { code: "ENOSYS" },
-      );
-      if (typeof callback === "function") queueMicrotask(() => callback(err));
-      else throw err;
+
+    // The promises API over one channel: dns.promises' functions and a
+    // dns.promises.Resolver instance's differ only in `api`. Each method is
+    // node's promises query(name, options): the name is checked before a
+    // promise exists, so a bad one throws rather than rejects. Declared in
+    // node's key order (Object.keys(dns.promises) lists them so).
+    function _promisesApi(api) {
+      function query(rrtype) {
+        return function (name, options) {
+          validateQueryName(name);
+          return runQuery(api, rrtype, name).then((records) => withTtl(rrtype, options, records));
+        };
+      }
+      const methods = {
+        resolve(hostname, rrtype) {
+          if (rrtype !== undefined) validateRrtype(rrtype);
+          else rrtype = "A";
+          return query(rrtype)(hostname);
+        },
+        resolve4: query("A"),
+        resolve6: query("AAAA"),
+        resolveAny: query("ANY"),
+        resolveCaa: query("CAA"),
+        resolveCname: query("CNAME"),
+        resolveMx: query("MX"),
+        resolveNaptr: query("NAPTR"),
+        resolveNs: query("NS"),
+        resolvePtr: query("PTR"),
+        resolveSoa: query("SOA"),
+        resolveSrv: query("SRV"),
+        resolveTlsa: query("TLSA"),
+        resolveTxt: query("TXT"),
+        reverse(ip) {
+          validateQueryName(ip);
+          // The address check runs inside the promise in node, so a name
+          // that is not an address rejects (the type check above throws).
+          try {
+            validateReverseIp(ip);
+          } catch (err) {
+            return Promise.reject(err);
+          }
+          return _dnsReverse(ip, api);
+        },
+      };
+      return methods;
     }
+    const _promisesDefault = _promisesApi(DNS_API_PROMISES);
+
+    // c-ares's error codes, each the exact string a DNS failure's .code
+    // carries (so `err.code === dns.NOTFOUND` holds), on both dns and
+    // dns.promises as in node (measured v22.22.2: NOTFOUND is "ENOTFOUND",
+    // EOF is "EOF"). These were the bare names ("NOTFOUND") up to 0.19.2.
+    // The getaddrinfo flags (ADDRCONFIG, V4MAPPED, ALL) are dns's alone.
+    const DNS_ERROR_CODES = {
+      NODATA: "ENODATA",
+      FORMERR: "EFORMERR",
+      SERVFAIL: "ESERVFAIL",
+      NOTFOUND: "ENOTFOUND",
+      NOTIMP: "ENOTIMP",
+      REFUSED: "EREFUSED",
+      BADQUERY: "EBADQUERY",
+      BADNAME: "EBADNAME",
+      BADFAMILY: "EBADFAMILY",
+      BADRESP: "EBADRESP",
+      CONNREFUSED: "ECONNREFUSED",
+      TIMEOUT: "ETIMEOUT",
+      EOF: "EOF",
+      FILE: "EFILE",
+      NOMEM: "ENOMEM",
+      DESTRUCTION: "EDESTRUCTION",
+      BADSTR: "EBADSTR",
+      BADFLAGS: "EBADFLAGS",
+      NONAME: "ENONAME",
+      BADHINTS: "EBADHINTS",
+      NOTINITIALIZED: "ENOTINITIALIZED",
+      LOADIPHLPAPI: "ELOADIPHLPAPI",
+      ADDRGETNETWORKPARAMS: "EADDRGETNETWORKPARAMS",
+      CANCELLED: "ECANCELLED",
+    };
 
     const promises = {
       lookup(hostname, options) {
@@ -39192,43 +39286,18 @@
         }
         return _dnsLookupHinted(hostname, family, all, hints);
       },
-      resolve(hostname, rrtype) {
-        rrtype = (rrtype || "A").toUpperCase();
-        return _dnsQuery(hostname, rrtype, DNS_API_PROMISES);
-      },
-      resolve4(hostname, options) {
-        return _dnsQuery(hostname, "A", DNS_API_PROMISES).then((r) => {
-          if (options && options.ttl) return r.map((x) => ({ address: x, ttl: 0 }));
-          return r;
-        });
-      },
-      resolve6(hostname, options) {
-        return _dnsQuery(hostname, "AAAA", DNS_API_PROMISES).then((r) => {
-          if (options && options.ttl) return r.map((x) => ({ address: x, ttl: 0 }));
-          return r;
-        });
-      },
-      resolveCname(hostname) { return _dnsQuery(hostname, "CNAME", DNS_API_PROMISES); },
-      resolveMx(hostname) { return _dnsQuery(hostname, "MX", DNS_API_PROMISES); },
-      resolveTxt(hostname) { return _dnsQuery(hostname, "TXT", DNS_API_PROMISES); },
-      resolveNs(hostname) { return _dnsQuery(hostname, "NS", DNS_API_PROMISES); },
-      resolveSrv(hostname) { return _dnsQuery(hostname, "SRV", DNS_API_PROMISES); },
-      resolveSoa(hostname) { return _dnsQuery(hostname, "SOA", DNS_API_PROMISES); },
-      resolvePtr(hostname) { return _dnsQuery(hostname, "PTR", DNS_API_PROMISES); },
-      resolveCaa(hostname) { return _dnsQuery(hostname, "CAA", DNS_API_PROMISES); },
-      resolveNaptr(hostname) { return _dnsQuery(hostname, "NAPTR", DNS_API_PROMISES); },
-      resolveAny() {
-        return Promise.reject(Object.assign(
-          new Error("dns.resolveAny is not supported by oam (deprecated in Node.js)"),
-          { code: "ENOSYS" },
-        ));
-      },
-      reverse(ip) { return _dnsReverse(ip, DNS_API_PROMISES); },
+      // Filled in below, once the class exists; the key keeps node's place.
+      Resolver: undefined,
       // dns.setServers() reaches these too; this setServers reaches only
       // dns.promises (node's promises module rebinds only itself).
-      getServers: () => natives.dnsGetServers(DNS_API_PROMISES),
       setServers: (servers) => setServersFor(DNS_API_PROMISES, servers),
+      ...DNS_ERROR_CODES,
+      getServers: () => natives.dnsGetServers(DNS_API_PROMISES),
+      ..._promisesDefault,
     };
+    // oam has no TLSA query: the name stays absent (a recorded surface gap)
+    // rather than present and always failing.
+    delete promises.resolveTlsa;
 
     // dns.setServers / dns.promises.setServers: node's ResolverBase
     // .setServers (lib/internal/dns/utils.js) parses every entry before
@@ -39277,45 +39346,161 @@
       natives.dnsSetServers(api, JSON.stringify(parsed));
     }
 
-    class Resolver {
-      constructor() {}
-      resolve(hostname, rrtype, cb) {
-        if (typeof rrtype === "function") { cb = rrtype; rrtype = "A"; }
-        _resolverApi.resolve(hostname, rrtype, cb);
+    // node's ResolverBase (lib/internal/dns/utils.js): the server state both
+    // Resolver classes share, each instance its own channel. Measured on
+    // v22.22.2: dns.Resolver and dns.promises.Resolver are different classes
+    // over this one base, whose four methods are the same functions on both;
+    // a new instance starts from the SYSTEM servers whatever dns.setServers()
+    // did, and its setServers() reaches no other instance and neither default.
+    //
+    // The instance's channel id lives in a WeakMap, not on the instance, so an
+    // instance has no own symbol (node's has none). It is freed with the
+    // instance; a query already sent holds its channel until it settles.
+    const resolverIds = new WeakMap();
+    const resolverCallbackApis = new WeakMap();
+    const resolverPromisesApis = new WeakMap();
+    const resolverRegistry = typeof FinalizationRegistry === "function"
+      ? new FinalizationRegistry((id) => natives.dnsResolverFree(id))
+      : null;
+
+    // The instance's channel id. A method called on something that is not an
+    // instance fails as node's does reading `this._handle` (measured:
+    // "Cannot read properties of undefined (reading 'getServers')").
+    function resolverId(resolver, method) {
+      const id = resolverIds.get(resolver);
+      if (id === undefined) {
+        throw new TypeError(`Cannot read properties of undefined (reading '${method}')`);
       }
-      resolve4(hostname, opts, cb) { _resolverApi.resolve4(hostname, opts, cb); }
-      resolve6(hostname, opts, cb) { _resolverApi.resolve6(hostname, opts, cb); }
-      resolveCname(hostname, cb) { _resolverApi.resolveCname(hostname, cb); }
-      resolveMx(hostname, cb) { _resolverApi.resolveMx(hostname, cb); }
-      resolveTxt(hostname, cb) { _resolverApi.resolveTxt(hostname, cb); }
-      resolveNs(hostname, cb) { _resolverApi.resolveNs(hostname, cb); }
-      resolveSrv(hostname, cb) { _resolverApi.resolveSrv(hostname, cb); }
-      resolveSoa(hostname, cb) { _resolverApi.resolveSoa(hostname, cb); }
-      resolvePtr(hostname, cb) { _resolverApi.resolvePtr(hostname, cb); }
-      resolveCaa(hostname, cb) { _resolverApi.resolveCaa(hostname, cb); }
-      resolveNaptr(hostname, cb) { _resolverApi.resolveNaptr(hostname, cb); }
-      reverse(ip, cb) { _resolverApi.reverse(ip, cb); }
-      cancel() {}
-      // The system nameservers every Resolver instance queries, from the same
-      // ResolverConfig its channel was built from -- dns.setServers() does not
-      // reach a Resolver, in node or here.
-      getServers() { return natives.dnsGetServers(DNS_API_RESOLVER); }
-      // Refused rather than recorded. Instances share one system channel and
-      // there is no per-instance server plumbing, so accepting the list and
-      // then querying the SYSTEM servers anyway is the worst outcome: a
-      // Resolver pointed at a blackhole returned real records. Throwing sends
-      // the caller to its own fallback (or to the module-level
-      // dns.setServers(), which is supported) instead of silently answering
-      // from the wrong nameserver.
-      setServers() {
-        const err = new Error(
-          "dns.Resolver.prototype.setServers is not supported by oam: Resolver instances " +
-            "share the system nameservers; use dns.setServers() to change the default resolver's",
-        );
-        err.code = "ENOSYS";
-        throw err;
+      return id;
+    }
+
+    // setLocalAddress's addresses: c-ares's own rule, as node's binding
+    // applies it (cares_wrap SetLocalAddress). The first argument may be
+    // either family; the second, if given, must be the other one; the family
+    // not given goes back to "any". A zone is accepted and dropped, as for a
+    // server address (there is no scope to bind by name).
+    function localAddressError(message) {
+      return applyNodeErrorShape(new TypeError(message), "ERR_INVALID_ARG_VALUE");
+    }
+
+    class ResolverBase {
+      constructor(options = undefined) {
+        // node destructures each option from a fresh spread, so a non-object
+        // options is accepted (and has none), and the checks run timeout,
+        // tries, maxTimeout.
+        const { timeout = -1 } = { ...options };
+        validateInt32(timeout, "options.timeout", -1);
+        const { tries = 4 } = { ...options };
+        validateInt32(tries, "options.tries", 1);
+        const { maxTimeout = 0 } = { ...options };
+        validateUint32(maxTimeout, "options.maxTimeout");
+        const id = natives.dnsResolverNew(timeout, tries, maxTimeout);
+        resolverIds.set(this, id);
+        if (resolverRegistry) resolverRegistry.register(this, id);
+      }
+
+      // Every query this instance has pending fails ECANCELLED
+      // ("queryA ECANCELLED <host>"); the instance stays usable.
+      cancel() {
+        natives.dnsCancel(resolverId(this, "cancel"));
+      }
+
+      getServers() {
+        return natives.dnsGetServers(resolverId(this, "getServers"));
+      }
+
+      setServers(servers) {
+        setServersFor(resolverId(this, "setServers"), servers);
+      }
+
+      setLocalAddress(ipv4, ipv6) {
+        if (typeof ipv4 !== "string") {
+          throw codes.ERR_INVALID_ARG_TYPE("ipv4", "string", ipv4);
+        }
+        if (ipv6 !== undefined && typeof ipv6 !== "string") {
+          throw codes.ERR_INVALID_ARG_TYPE("ipv6", "string", ipv6);
+        }
+        const id = resolverId(this, "setLocalAddress");
+        const isIP = registry.get("net").isIP;
+        let v4 = "";
+        let v6 = "";
+        const first = isIP(ipv4);
+        if (first === 4) v4 = ipv4;
+        else if (first === 6) v6 = dnsServerAddress(ipv4);
+        else throw localAddressError("Invalid IP address.");
+        if (ipv6 !== undefined) {
+          const second = isIP(ipv6);
+          if (second === 4) {
+            if (first === 4) throw localAddressError("Cannot specify two IPv4 addresses.");
+            v4 = ipv6;
+          } else if (second === 6) {
+            if (first === 6) throw localAddressError("Cannot specify two IPv6 addresses.");
+            v6 = dnsServerAddress(ipv6);
+          } else {
+            throw localAddressError("Invalid IP address.");
+          }
+        }
+        natives.dnsSetLocalAddress(id, v4, v6);
       }
     }
+
+    // The per-instance query functions, built on first use.
+    function resolverCallbackApi(resolver, method) {
+      const id = resolverId(resolver, method);
+      let api = resolverCallbackApis.get(resolver);
+      if (!api) {
+        api = _callbackApi(id);
+        resolverCallbackApis.set(resolver, api);
+      }
+      return api;
+    }
+    function resolverPromisesApi(resolver, method) {
+      const id = resolverId(resolver, method);
+      let api = resolverPromisesApis.get(resolver);
+      if (!api) {
+        api = _promisesApi(id);
+        resolverPromisesApis.set(resolver, api);
+      }
+      return api;
+    }
+
+    // node assigns the query methods to each class's prototype (enumerable,
+    // after `constructor`) in this order. resolveTlsa is not here: oam has no
+    // TLSA query yet (a recorded surface gap for dns and dns/promises).
+    const RESOLVER_QUERY_METHODS = [
+      "resolveAny", "resolve4", "resolve6", "resolveCaa", "resolveCname", "resolveMx",
+      "resolveNs", "resolveTxt", "resolveSrv", "resolvePtr", "resolveNaptr", "resolveSoa",
+      "reverse",
+    ];
+
+    class Resolver extends ResolverBase {}
+    for (const name of RESOLVER_QUERY_METHODS) {
+      Resolver.prototype[name] = {
+        [name](...args) {
+          return resolverCallbackApi(this, name)[name](...args);
+        },
+      }[name];
+      // node's query(name, options, callback) wrappers report 2.
+      Object.defineProperty(Resolver.prototype[name], "length", { value: 2 });
+    }
+    Resolver.prototype.resolve = function resolve(hostname, rrtype, callback) {
+      return resolverCallbackApi(this, "resolve").resolve(hostname, rrtype, callback);
+    };
+
+    // dns.promises.Resolver, the same class node:dns/promises exports. A
+    // class expression named Resolver, so V8's own messages ("Class
+    // constructor Resolver cannot be invoked without 'new'") name it as
+    // node's do.
+    const PromisesResolver = class Resolver extends ResolverBase {};
+    for (const name of [...RESOLVER_QUERY_METHODS, "resolve"]) {
+      PromisesResolver.prototype[name] = {
+        [name](...args) {
+          return resolverPromisesApi(this, name)[name](...args);
+        },
+      }[name];
+      Object.defineProperty(PromisesResolver.prototype[name], "length", { value: 2 });
+    }
+    promises.Resolver = PromisesResolver;
 
     // net.connect / tls.connect / http read `dns.lookup` at call time, as
     // node does; while it is still this function they use oam's own resolver
@@ -39355,30 +39540,7 @@
       ADDRCONFIG,
       V4MAPPED,
       ALL,
-      NODATA: "NODATA",
-      FORMERR: "FORMERR",
-      SERVFAIL: "SERVFAIL",
-      NOTFOUND: "NOTFOUND",
-      NOTIMP: "NOTIMP",
-      REFUSED: "REFUSED",
-      BADQUERY: "BADQUERY",
-      BADNAME: "BADNAME",
-      BADFAMILY: "BADFAMILY",
-      BADRESP: "BADRESP",
-      CONNREFUSED: "CONNREFUSED",
-      TIMEOUT: "TIMEOUT",
-      EOF: "EOF",
-      FILE: "FILE",
-      NOMEM: "NOMEM",
-      DESTRUCTION: "DESTRUCTION",
-      BADSTR: "BADSTR",
-      BADFLAGS: "BADFLAGS",
-      NONAME: "NONAME",
-      BADHINTS: "BADHINTS",
-      NOTINITIALIZED: "NOTINITIALIZED",
-      LOADIPHLPAPI: "LOADIPHLPAPI",
-      ADDRGETNETWORKPARAMS: "ADDRGETNETWORKPARAMS",
-      CANCELLED: "CANCELLED",
+      ...DNS_ERROR_CODES,
     };
   };
 

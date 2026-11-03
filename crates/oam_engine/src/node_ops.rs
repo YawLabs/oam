@@ -548,6 +548,10 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("dnsReverse", op_dns_reverse),
         ("dnsGetServers", op_dns_get_servers),
         ("dnsSetServers", op_dns_set_servers),
+        ("dnsResolverNew", op_dns_resolver_new),
+        ("dnsResolverFree", op_dns_resolver_free),
+        ("dnsCancel", op_dns_cancel),
+        ("dnsSetLocalAddress", op_dns_set_local_address),
         // stdin
         ("stdinRead", op_stdin_read),
         ("stdinSetRef", op_stdin_set_ref),
@@ -10639,8 +10643,9 @@ fn op_dns_lookup(
     );
 }
 
-/// Which node dns API a call came through (0 callback, 1 promises, 2 a
-/// Resolver instance); it picks the channel, see `oam_core::dns::Api`.
+/// Which node dns API a call came through (0 callback, 1 promises, or a
+/// Resolver instance's id from `dnsResolverNew`); it picks the channel, see
+/// `oam_core::dns::Api`.
 fn dns_api(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
@@ -10660,10 +10665,11 @@ fn op_dns_resolve(
     }
     let rrtype: String = args.get(1).to_rust_string_lossy(scope);
     let api = dns_api(scope, args.get(2));
+    let instances = core_runtime!(scope).dns_instances();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::dns::dns_resolve(hostname, rrtype, api),
+        oam_core::dns::dns_resolve(&instances, hostname, rrtype, api),
     );
 }
 
@@ -10674,7 +10680,12 @@ fn op_dns_reverse(
 ) {
     let ip: String = args.get(0).to_rust_string_lossy(scope);
     let api = dns_api(scope, args.get(1));
-    crate::ops::spawn_op(scope, &mut rv, oam_core::dns::dns_reverse(ip, api));
+    let instances = core_runtime!(scope).dns_instances();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::dns::dns_reverse(&instances, ip, api),
+    );
 }
 
 /// `dns.getServers()` -- SYNCHRONOUS in node (it returns an array, not a
@@ -10685,7 +10696,9 @@ fn op_dns_get_servers(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let servers = oam_core::dns::dns_get_servers(dns_api(scope, args.get(0)));
+    let api = dns_api(scope, args.get(0));
+    let instances = core_runtime!(scope).dns_instances();
+    let servers = oam_core::dns::dns_get_servers(&instances, api);
     let out = v8::Array::new(scope, servers.len() as i32);
     for (i, server) in servers.iter().enumerate() {
         let Some(value) = v8::String::new(scope, server) else {
@@ -10715,8 +10728,81 @@ fn op_dns_set_servers(
             .collect()
     });
     match servers {
-        Some(servers) => oam_core::dns::dns_set_servers(api, &servers),
+        Some(servers) => {
+            let instances = core_runtime!(scope).dns_instances();
+            oam_core::dns::dns_set_servers(&instances, api, &servers);
+        }
         None => throw_type_error(scope, "dnsSetServers: expected [[address, port], ...]"),
+    }
+}
+
+/// `new dns.Resolver(options)` / `new dns.promises.Resolver(options)`: a new
+/// instance channel, returning its id. The JS side has validated the options
+/// as node's ResolverBase does (timeout -1..=i32::MAX, tries >= 1,
+/// maxTimeout a uint32), so the values arrive in range.
+fn op_dns_resolver_new(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let timeout_ms = args.get(0).int32_value(scope).unwrap_or(-1);
+    let tries = args.get(1).uint32_value(scope).unwrap_or(4);
+    let max_timeout_ms = args.get(2).uint32_value(scope).unwrap_or(0);
+    let instances = core_runtime!(scope).dns_instances();
+    let id = oam_core::dns::dns_resolver_new(&instances, timeout_ms, tries, max_timeout_ms);
+    rv.set(v8::Integer::new_from_unsigned(scope, id).into());
+}
+
+/// A Resolver instance was collected (its FinalizationRegistry callback).
+fn op_dns_resolver_free(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if let Some(id) = args.get(0).uint32_value(scope) {
+        let instances = core_runtime!(scope).dns_instances();
+        oam_core::dns::dns_resolver_free(&instances, id);
+    }
+}
+
+/// `resolver.cancel()`: the instance's pending queries fail ECANCELLED.
+fn op_dns_cancel(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let api = dns_api(scope, args.get(0));
+    let instances = core_runtime!(scope).dns_instances();
+    oam_core::dns::dns_cancel(&instances, api);
+}
+
+/// `resolver.setLocalAddress()`: argument 1 is the IPv4 address and argument 2
+/// the IPv6 one, each "" for "any". The JS side has already applied node's
+/// rules (which argument is which family, two of one family refused), so an
+/// address that does not parse here is an internal error.
+fn op_dns_set_local_address(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let api = dns_api(scope, args.get(0));
+    let v4 = args.get(1).to_rust_string_lossy(scope);
+    let v6 = args.get(2).to_rust_string_lossy(scope);
+    let parse_v4 = |s: &str| (!s.is_empty()).then(|| s.parse::<std::net::Ipv4Addr>());
+    let parse_v6 = |s: &str| (!s.is_empty()).then(|| s.parse::<std::net::Ipv6Addr>());
+    match (parse_v4(&v4).transpose(), parse_v6(&v6).transpose()) {
+        (Ok(v4), Ok(v6)) => {
+            let instances = core_runtime!(scope).dns_instances();
+            oam_core::dns::dns_set_local_address(
+                &instances,
+                api,
+                oam_core::dns::LocalAddrs { v4, v6 },
+            );
+        }
+        _ => throw_type_error(
+            scope,
+            "dnsSetLocalAddress: expected an IPv4 and an IPv6 address",
+        ),
     }
 }
 
