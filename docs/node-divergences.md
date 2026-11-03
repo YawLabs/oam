@@ -364,7 +364,7 @@ still wins. Only these tokens are accepted:
 
 ```
 --pending-deprecation   --no-warnings   --no-deprecation   --expose-gc
---trace-warnings   --trace-deprecation
+--trace-warnings   --trace-deprecation   --throw-deprecation
 --disable-warning[=]    --redirect-warnings[=]
 --max-http-header-size[=]   --insecure-http-parser   --trace-require-module[=]
 --tls-min-v1.0  --tls-min-v1.1  --tls-min-v1.2  --tls-min-v1.3  --tls-max-v1.2  --tls-max-v1.3
@@ -1366,16 +1366,23 @@ server's timeout from the latency it measured on earlier answers, which oam does
 model. And c-ares resends a query with the same ID on each try, where oam sends each try
 with a new one.
 
-What a `Resolver` instance lacks: `resolveTlsa` (oam has no TLSA query at all; it is a
-recorded surface gap of `dns` and `dns/promises`), and the `_handle` own property Node's
-instances carry (oam keeps an instance's channel id off the object, so an instance has no
-own properties). A `maxTimeout` above 2147483647 passes Node's validator and then aborts
-Node on a native assertion (`args[2]->IsInt32()`); oam takes it as the cap it names.
+What a `Resolver` instance lacks: the `_handle` own property Node's instances carry (oam
+keeps an instance's channel id off the object, so an instance has no own properties). A
+`maxTimeout` above 2147483647 passes Node's validator and then aborts Node on a native
+assertion (`args[2]->IsInt32()`); oam takes it as the cap it names. Query answers are
+Node's: `{ ttl: true }` reports each record's TTL as served, and every query is sent (oam's
+resolver kept an answer cache up to 0.19.2, which c-ares does not), as conformance case 587
+pins with `resolveTlsa`. One TLSA answer differs: a response whose answer section has
+records of other types only (a CNAME, an A) and no TLSA record is `[]` in Node, whose TLSA
+parser walks the answers itself, and `ENODATA` in oam, whose resolver reports "no record of
+the type asked" before the records reach it. A response with any TLSA record matches,
+including the holes Node leaves where a record of another type sat.
 
-`resolve4` / `resolve6` with `{ ttl: true }` report `ttl: 0` for every address, from the
-module APIs and from both `Resolver` classes: oam's native answer does not carry the
-record's TTL yet, where Node reports the real one (measured: an A record served with TTL
-77 reads `{"address":"1.2.3.4","ttl":77}` in Node).
+dns's result order (`dns.setDefaultResultOrder()`, `--dns-result-order`, a lookup's
+`order` / `verbatim`) orders `dns.lookup()`, `net.connect()`'s lookups and `http`/`https`
+requests as in Node (case 588; a non-verbatim order sends a stock-agent request over the
+agent's socket, whose lookup applies it). `fetch()` resolves through oam's own transport and does not read it: Node's
+fetch connects through `net` and so follows it.
 
 ### 32. A decoded `fetch` response drops `content-encoding` and `content-length`
 
@@ -4665,7 +4672,7 @@ The largest per-module gaps (counts from windows-aarch64), all tracked in that f
 | Module | Missing | Shape of the gap |
 |---|---|---|
 | `constants` | 54 win32 / 65 linux / 61 darwin | The legacy all-in-one table. Platform-conditional values — the `WSA*` block on Windows, `RTLD_*` on POSIX, plus `UV_DIRENT_*` and the `SSL_OP_*`/`ENGINE_METHOD_*` OpenSSL set everywhere. This module is the *entire* reason the ratchet is keyed by platform: a Windows-only baseline reports 16 phantom new gaps on Linux and 12 on darwin, every one of them here. `fs.constants` and `os.constants` are separately correct — see *Platform constant tables* above. |
-| `dns/promises` | 4 | `lookupService`, `resolveTlsa`, `getDefaultResultOrder`, `setDefaultResultOrder` (the same four `dns` lacks, less `setDefaultResultOrder`, a no-op there). `Resolver` and the 24 error-code constants landed with #453. |
+| `dns/promises` | 1 | `lookupService` (missing from `dns` too). `Resolver` and the 24 error-code constants landed with #453; `resolveTlsa` and `get`/`setDefaultResultOrder` after it. |
 | `module` | 20 | The `Module._*` loader internals (`_load`, `_resolveFilename`, `_extensions`), `register`, `SourceMap`/`findSourceMap`. The compile-cache API landed in 0.19.1 (see *The compile cache is on by default* above). |
 | `fs` | **0** | Closed in 0.9.1–0.9.2. Ownership and fd metadata (`chown`/`fchown`/`lchown`, `fchmod`/`lchmod`), durability (`fsync`/`fdatasync`), `ftruncate`, the `utimes`/`futimes`/`lutimes` family, `readv`/`writev`, `openAsBlob`, `statfs` and `glob`/`globSync` all landed. `node:fs` now has no missing export names on any platform, and `fs/promises` none since `watch` landed after 0.19.0. |
 | `crypto` | 10 | The legacy class constructors `Cipher(iv)` and `Decipher(iv)`, `diffieHellman`, `getCipherInfo`, `randomFill`. |

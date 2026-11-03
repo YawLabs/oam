@@ -541,6 +541,31 @@ fn main() -> ExitCode {
                 flags.trace_require_module = Some(value);
                 flags.trace_require_module_spaced = spaced;
                 i += if spaced { 2 } else { 1 };
+            } else if arg == "--dns-result-order" || arg.starts_with("--dns-result-order=") {
+                // The value is checked once both sources are in (below): node
+                // refuses a bad one from argv and NODE_OPTIONS alike, exit 1.
+                // A missing one (none, an empty `=`, or a next token that is
+                // itself a flag) is node's option parser's exit 9 instead.
+                let (value, spaced) = match arg.strip_prefix("--dns-result-order=") {
+                    Some(v) => (Some(v.to_string()).filter(|v| !v.is_empty()), false),
+                    None => (
+                        raw.get(i + 1).filter(|v| !v.starts_with('-')).cloned(),
+                        true,
+                    ),
+                };
+                let Some(value) = value else {
+                    let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                    let flag = if spaced {
+                        "--dns-result-order"
+                    } else {
+                        "--dns-result-order="
+                    };
+                    eprintln!("{exe}: {flag} requires an argument");
+                    return ExitCode::from(9);
+                };
+                flags.dns_result_order = Some(value);
+                flags.dns_result_order_spaced = spaced;
+                i += if spaced { 2 } else { 1 };
             } else if let Some(v) = arg.strip_prefix("--title=") {
                 flags.title = Some(v.to_string());
                 i += 1;
@@ -555,6 +580,9 @@ fn main() -> ExitCode {
                 i += 1;
             } else if arg == "--trace-deprecation" {
                 flags.trace_deprecation = true;
+                i += 1;
+            } else if arg == "--throw-deprecation" {
+                flags.throw_deprecation = true;
                 i += 1;
             } else if arg == "--trace-uncaught" {
                 flags.trace_uncaught = true;
@@ -718,6 +746,26 @@ fn main() -> ExitCode {
             let exe = argv.first().map(String::as_str).unwrap_or("oam");
             eprintln!("{exe}: either --tls-min-v1.3 or --tls-max-v1.2 can be used, not both");
             return ExitCode::from(9);
+        }
+        // A --dns-result-order with no value in NODE_OPTIONS: node's option
+        // parser refuses it before anything runs, exit 9 (argv's is refused
+        // where it is parsed, above).
+        if let Some(flag) = flags.dns_result_order_missing {
+            let exe = argv.first().map(String::as_str).unwrap_or("oam");
+            eprintln!("{exe}: {flag} requires an argument");
+            return ExitCode::from(9);
+        }
+        // node checks --dns-result-order's value in JS at startup
+        // (initializeDns), from argv or NODE_OPTIONS alike, and dies of the
+        // TypeError: exit 1, not 9 (measured on v22.22.2).
+        if let Some(order) = &flags.dns_result_order
+            && !is_dns_result_order(order)
+        {
+            eprintln!(
+                "TypeError [ERR_INVALID_ARG_VALUE]: {}",
+                dns_result_order_message(order)
+            );
+            return ExitCode::from(1);
         }
         if let Some(source) = eval_source {
             return run_eval(&source, print, &raw[i..], &flags);
@@ -1911,6 +1959,19 @@ fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
             if is_trace_require_module_value(v) {
                 flags.trace_require_module = Some(v.clone());
             }
+        } else if let Some(v) = tok.strip_prefix("--dns-result-order=") {
+            if v.is_empty() {
+                flags.dns_result_order_missing = Some("--dns-result-order=");
+            } else {
+                flags.dns_result_order = Some(v.to_string());
+            }
+        } else if tok == "--dns-result-order" {
+            // node's parser takes the next token unless it is a flag, and
+            // refuses the option without one (exit 9), NODE_OPTIONS included.
+            match it.next_if(|v| !v.starts_with('-')) {
+                Some(v) => flags.dns_result_order = Some(v.clone()),
+                None => flags.dns_result_order_missing = Some("--dns-result-order"),
+            }
         } else if tok == "--no-warnings" {
             flags.no_warnings = true;
         } else if tok == "--no-deprecation" {
@@ -1919,6 +1980,8 @@ fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
             flags.trace_warnings = true;
         } else if tok == "--trace-deprecation" {
             flags.trace_deprecation = true;
+        } else if tok == "--throw-deprecation" {
+            flags.throw_deprecation = true;
         } else if tok == "--trace-uncaught" {
             flags.trace_uncaught = true;
         } else if tok == "--expose-gc" {
@@ -1979,6 +2042,20 @@ fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
         // Anything else: ignored on purpose (see the call site).
     }
     before != *flags
+}
+
+/// The values node's `--dns-result-order` takes.
+fn is_dns_result_order(value: &str) -> bool {
+    matches!(value, "verbatim" | "ipv4first" | "ipv6first")
+}
+
+/// node's ERR_INVALID_ARG_VALUE message for a bad `--dns-result-order`
+/// (the value as node's inspect quotes a plain string).
+fn dns_result_order_message(value: &str) -> String {
+    format!(
+        "The argument '--dns-result-order' must be one of: 'verbatim', 'ipv4first', \
+         'ipv6first'. Received '{value}'"
+    )
 }
 
 /// The values node's `--trace-require-module` takes.
@@ -2734,6 +2811,10 @@ struct NodeFlags {
     /// read from `process.traceProcessWarnings` / `process.traceDeprecation`.
     trace_warnings: bool,
     trace_deprecation: bool,
+    /// `--throw-deprecation`: `process.throwDeprecation`, which makes
+    /// process.emitWarning throw a deprecation on the next tick instead of
+    /// printing it (`--no-deprecation` still wins, as in node).
+    throw_deprecation: bool,
     /// `--trace-uncaught`: a fatal report ends with the stack V8 captured
     /// at the throw (`Thrown at:`) instead of the hint naming this flag.
     trace_uncaught: bool,
@@ -2771,6 +2852,14 @@ struct NodeFlags {
     /// require made from inside node_modules. Spaced as for the header size.
     trace_require_module: Option<String>,
     trace_require_module_spaced: bool,
+    /// `--dns-result-order=verbatim|ipv4first|ipv6first`: the initial
+    /// `dns.getDefaultResultOrder()`, per thread. Spaced as for the header
+    /// size.
+    dns_result_order: Option<String>,
+    dns_result_order_spaced: bool,
+    /// The spelling of a `--dns-result-order` given no value in
+    /// NODE_OPTIONS, which node refuses at startup with exit 9.
+    dns_result_order_missing: Option<&'static str>,
     /// `--tls-min-v1.0` / `--tls-min-v1.1` / `--tls-min-v1.2` /
     /// `--tls-min-v1.3` and `--tls-max-v1.2` / `--tls-max-v1.3`: the initial
     /// `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION`, so the default
@@ -2815,6 +2904,11 @@ impl NodeFlags {
             } else {
                 (env.trace_require_module, env.trace_require_module_spaced)
             };
+        let (dns_result_order, dns_result_order_spaced) = if argv.dns_result_order.is_some() {
+            (argv.dns_result_order.clone(), argv.dns_result_order_spaced)
+        } else {
+            (env.dns_result_order, env.dns_result_order_spaced)
+        };
         let (v8_pool_size, v8_pool_size_spaced) = if argv.v8_pool_size.is_some() {
             (argv.v8_pool_size.clone(), argv.v8_pool_size_spaced)
         } else {
@@ -2837,6 +2931,7 @@ impl NodeFlags {
             no_deprecation: env.no_deprecation || argv.no_deprecation,
             trace_warnings: env.trace_warnings || argv.trace_warnings,
             trace_deprecation: env.trace_deprecation || argv.trace_deprecation,
+            throw_deprecation: env.throw_deprecation || argv.throw_deprecation,
             trace_uncaught: env.trace_uncaught || argv.trace_uncaught,
             disabled_warnings: [env.disabled_warnings, argv.disabled_warnings.clone()].concat(),
             redirect_warnings: argv.redirect_warnings.clone().or(env.redirect_warnings),
@@ -2852,6 +2947,11 @@ impl NodeFlags {
             v8_pool_size_spaced,
             trace_require_module,
             trace_require_module_spaced,
+            dns_result_order,
+            dns_result_order_spaced,
+            dns_result_order_missing: env
+                .dns_result_order_missing
+                .or(argv.dns_result_order_missing),
             insecure_http_parser: env.insecure_http_parser || argv.insecure_http_parser,
             tls_min_v1_0: env.tls_min_v1_0 || argv.tls_min_v1_0,
             tls_min_v1_1: env.tls_min_v1_1 || argv.tls_min_v1_1,
@@ -2950,14 +3050,17 @@ impl NodeFlags {
         let def = define_flag_global;
         if self.no_deprecation {
             js.push_str(&def("__oamNoDeprecation", "true".into()));
-            js.push_str("globalThis.process.noDeprecation = true;");
         }
         // node defines these only when the flag is given (absent otherwise,
-        // not false), read-only, enumerable and configurable; the printer
-        // reads them on each warning, so a program can set them too.
+        // not false), read-only, enumerable and configurable (measured on
+        // v22.22.2, noDeprecation and throwDeprecation included; a plain
+        // assignment left noDeprecation writable); the printer reads them on
+        // each warning, so a program without the flag can still set them.
         for (set, name) in [
+            (self.no_deprecation, "noDeprecation"),
             (self.trace_warnings, "traceProcessWarnings"),
             (self.trace_deprecation, "traceDeprecation"),
+            (self.throw_deprecation, "throwDeprecation"),
         ] {
             if set {
                 js.push_str(&format!(
@@ -2987,6 +3090,24 @@ impl NodeFlags {
         // all the escaping it needs.
         if let Some(mode) = &self.trace_require_module {
             js.push_str(&def("__oamTraceRequireModule", format!("\"{mode}\"")));
+        }
+        // node:dns reads it as the initial default result order. A value
+        // other than node's three can only reach here from a Worker's own
+        // execArgv (the main thread refused it at startup), and node fails
+        // that worker as it starts (initializeDns): the throw ends this
+        // snippet, which the worker treats as its startup failing.
+        if let Some(order) = &self.dns_result_order {
+            if is_dns_result_order(order) {
+                let quoted = serde_json::to_string(order).unwrap_or_else(|_| "null".into());
+                js.push_str(&def("__oamDnsResultOrder", quoted));
+            } else {
+                let message = serde_json::to_string(&dns_result_order_message(order))
+                    .unwrap_or_else(|_| "\"\"".into());
+                js.push_str(&format!(
+                    "throw Object.assign(new TypeError({message}), \
+                       {{ code: 'ERR_INVALID_ARG_VALUE' }});"
+                ));
+            }
         }
         // node:tls reads these as the initial DEFAULT_MIN_VERSION /
         // DEFAULT_MAX_VERSION (the names are node's own four, so quoting
@@ -3150,6 +3271,9 @@ impl NodeFlags {
         if self.trace_deprecation {
             out.push("--trace-deprecation".into());
         }
+        if self.throw_deprecation {
+            out.push("--throw-deprecation".into());
+        }
         if self.trace_uncaught {
             out.push("--trace-uncaught".into());
         }
@@ -3181,6 +3305,14 @@ impl NodeFlags {
                 out.push(v.clone());
             } else {
                 out.push(format!("--trace-require-module={v}"));
+            }
+        }
+        if let Some(v) = &self.dns_result_order {
+            if self.dns_result_order_spaced {
+                out.push("--dns-result-order".into());
+                out.push(v.clone());
+            } else {
+                out.push(format!("--dns-result-order={v}"));
             }
         }
         if self.insecure_http_parser {
@@ -4317,6 +4449,21 @@ mod tests {
             argv_both.exec_argv(),
             vec!["--trace-warnings", "--trace-deprecation"]
         );
+    }
+
+    #[test]
+    fn throw_deprecation_comes_from_node_options_and_argv_and_only_argv_reflects_it() {
+        let mut env = super::NodeFlags::default();
+        assert!(super::apply_node_options(&mut env, "--throw-deprecation"));
+        assert!(env.throw_deprecation);
+        let merged = env.merged(super::NodeFlags::default());
+        assert!(merged.throw_deprecation);
+        assert!(merged.exec_argv().is_empty());
+        let argv = super::NodeFlags::default().merged(super::NodeFlags {
+            throw_deprecation: true,
+            ..Default::default()
+        });
+        assert_eq!(argv.exec_argv(), vec!["--throw-deprecation"]);
     }
 
     #[test]

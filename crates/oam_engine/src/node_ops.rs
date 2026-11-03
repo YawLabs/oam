@@ -3871,9 +3871,17 @@ fn op_hostname(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let host = std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "localhost".to_string());
+    // The system's host name, as libuv's uv_os_gethostname answers node:
+    // gethostname(2) on unix, the DNS host name on Windows (sysinfo asks
+    // GetComputerNameExW). oam read COMPUTERNAME / HOSTNAME instead, which is
+    // the upper-case NetBIOS name on Windows ("WOODS" where node says
+    // "woods") and unset on macOS, where it answered "localhost". The
+    // environment is only the fallback for a host that answers nothing.
+    let host = sysinfo::System::host_name()
+        .filter(|name| !name.is_empty())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "localhost".to_string());
     if let Some(value) = v8::String::new(scope, &host) {
         rv.set(value.into());
     }
@@ -5011,6 +5019,10 @@ fn op_net_resolve(
         Some(hints) if hints.is_finite() => hints as i32,
         _ => 0,
     };
+    // args[5]: dns's result order for this lookup ("verbatim", "ipv4first"
+    // or "ipv6first"; dns.getDefaultResultOrder() as JS read it), applied
+    // before a single answer is picked, as node's dns.lookup applies it.
+    let order = oam_core::dns::ResultOrder::parse(&arg_string(scope, &args, 5).unwrap_or_default());
     if !check_net_perm(scope, &format!("{host}:{port}")) {
         return;
     }
@@ -5024,6 +5036,7 @@ fn op_net_resolve(
             Ok(addrs) => addrs,
             Err(e) => return e.to_outcome(),
         };
+        order.apply(&mut addrs, |ip| ip.is_ipv4());
         if !all {
             addrs.truncate(1);
         }
