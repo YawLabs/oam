@@ -73,15 +73,19 @@ else
 fi
 
 # --- remote legs (advisory: warn-and-continue on failure) -------------------------
-# A linux-leg VM left running (an earlier run with OAM_KEEP_VM=1) would hold
-# the build Mac's memory through the mac leg. The linux leg's preflight stops
-# one it finds Running, as release-local does before its mac legs, with
+# A linux-leg VM left running would hold the build Mac's memory through the
+# mac leg. The linux leg's preflight stops one it finds Running with no live
+# lock, as release-local does before its mac legs. A VM an earlier run left
+# with OAM_KEEP_VM=1 comes with that run's Mac build lock still held: this
+# preflight then warns BUSY and stops nothing, and this run's linux leg is
+# BUSY too -- clear it by hand first (the BUSY message prints the limactl
+# stop and rm -rf ~/.lima-build.lock commands). The preflight runs with
 # OAM_KEEP_VM=0 whatever is exported here: under OAM_KEEP_VM=1 the preflight
 # keeps the Mac build lock (protocol v1.2, every mode), and this run's own
 # linux leg would then find it BUSY. The knob still applies to that leg.
 if [ "${OAM_SKIP_MAC:-0}" != "1" ] && [ "${OAM_SKIP_LINUX:-0}" != "1" ]; then
   OAM_KEEP_VM=0 bash "$SCRIPT_DIR/build-platforms-mac-linux.sh" --preflight-only \
-    || warn "linux leg preflight failed (see above) -- a VM it could not stop would slow the mac leg; continuing"
+    || warn "linux leg preflight failed (see above) -- a VM it could not stop, or one an OAM_KEEP_VM=1 run left with the Mac build lock held (BUSY), would slow the mac leg; continuing"
 fi
 
 if [ "${OAM_SKIP_MAC:-0}" = "1" ]; then

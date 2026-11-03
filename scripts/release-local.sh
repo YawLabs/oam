@@ -129,11 +129,19 @@
 #                           ship that release with OAM_SKIP_MAC_SIGN=1
 #   OAM_SKIP_LINUX=1        drop the linux asset
 #   OAM_KEEP_VM=1           leave the linux leg's Lima VM running on the
-#                           build Mac after the leg (default: stopped on every
-#                           exit -- the 8 GB Air cannot hold it and the mac
-#                           legs at once; the preflight stops one it finds
-#                           running, for the same reason, whatever this is
-#                           set to)
+#                           build Mac after the leg, with the Mac build lock
+#                           held by that run (default: stopped and released
+#                           on every exit -- the 8 GB Air cannot hold it and
+#                           the mac legs at once). The preflight stops a VM
+#                           it finds Running with no live lock, whatever this
+#                           is set to; a VM an earlier OAM_KEEP_VM=1 run left
+#                           keeps that run's lock, so the next preflight is
+#                           BUSY and prints the limactl stop and
+#                           rm -rf ~/.lima-build.lock commands that clear it.
+#                           With OAM_RELEASE_LEG_ATTEMPTS > 1 it applies to
+#                           the last linux attempt only: an earlier attempt
+#                           stops its VM and releases the lock, or the retry
+#                           would be BUSY on that attempt's own lock
 #   OAM_LIMA_INSTANCE=<name>  the linux leg's Lima instance (default
 #                           oam-linux); create it once with
 #                           scripts/build-platforms-mac-linux.sh --provision
@@ -332,6 +340,23 @@ run_with_attempts() {
     [ "$attempt" -lt "$attempts" ] || break
   done
   return "$rc"
+}
+
+# linux_leg_attempt  -- one linux-leg attempt, for run_with_attempts (which
+# runs it in the same shell, so the count carries from try to try). Every
+# attempt but the last runs with OAM_KEEP_VM=0: under OAM_KEEP_VM=1 a failed
+# attempt keeps its VM and the Mac build lock (protocol v1.2), and the next
+# attempt -- a new process with a new run id -- would find that lock with
+# its VM up and be BUSY, so the retry the knob buys could never pass. The
+# caller's OAM_KEEP_VM applies to the last attempt; a pass before it leaves
+# the VM stopped.
+linux_leg_attempt() {
+  LINUX_LEG_TRY=$(( ${LINUX_LEG_TRY:-0} + 1 ))
+  if [ "$LINUX_LEG_TRY" -lt "$OAM_RELEASE_LEG_ATTEMPTS" ]; then
+    OAM_KEEP_VM=0 bash "$SCRIPT_DIR/build-platforms-mac-linux.sh" --mode=release
+  else
+    bash "$SCRIPT_DIR/build-platforms-mac-linux.sh" --mode=release
+  fi
 }
 
 # note() prints to STDOUT on purpose: the leg drivers capture their caller's
@@ -758,7 +783,9 @@ fi
 # The linux leg runs in a Lima VM on the same Mac, so it needs the Mac even
 # when the mac assets are skipped. Its --preflight-only checks Lima, Rosetta
 # and the instance, and stops the VM if it is running: the mac legs run first
-# and need the memory. OAM_KEEP_VM=0 here, whatever the caller exported:
+# and need the memory -- a VM Running with no live lock; one an earlier
+# OAM_KEEP_VM=1 run left still has that run's lock, and the preflight is BUSY
+# on it, stopping nothing. OAM_KEEP_VM=0 here, whatever the caller exported:
 # under OAM_KEEP_VM=1 the preflight keeps the Mac build lock (protocol v1.2,
 # every mode), and this release's own linux leg would then find it BUSY. The
 # knob still applies to the linux leg itself, below.
@@ -1265,10 +1292,13 @@ else
   # (build-platforms-mac-linux.sh, remote_step_run). Any other failure is
   # retried whole, like the mac leg: each attempt starts the VM, re-syncs this
   # run's source tarball over the build tree (keeping only target/) and runs
-  # every step again. Sub-caption only: `[fail]` and the log path come from
+  # every step again (OAM_KEEP_VM=1 applies to the last attempt only -- see
+  # linux_leg_attempt). Sub-caption only: `[fail]` and the log path come from
   # the driver itself.
-  LINUX_ART=$(run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "linux leg" \
-    bash "$SCRIPT_DIR/build-platforms-mac-linux.sh" --mode=release) \
+  if [ "${OAM_KEEP_VM:-0}" = "1" ] && [ "$OAM_RELEASE_LEG_ATTEMPTS" -gt 1 ]; then
+    note "OAM_KEEP_VM=1 applies to the last of the $OAM_RELEASE_LEG_ATTEMPTS linux attempts: an earlier one stops its VM and releases the Mac build lock, so a retry is not BUSY on it"
+  fi
+  LINUX_ART=$(run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "linux leg" linux_leg_attempt) \
     || fail "linux leg failed -- see its log output above"
   LINUX_ART="${LINUX_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line
   cp "$LINUX_ART/oam-x86_64-unknown-linux-gnu" "$RELEASE_DIR/"

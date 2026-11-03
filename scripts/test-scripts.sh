@@ -1165,7 +1165,24 @@ if [ -f "$MLM/mv-race" ] && [ "\$#" = 2 ] && [ "\$1" = "$MLM/home/.lima-build.lo
 fi
 exec "$ML_REAL_MV" "\$@"
 EOF
-chmod +x "$MLM/bin/limactl" "$MLM/bin/stat" "$MLM/bin/mkdir" "$MLM/bin/mv"
+# ...and a touch that, with $MLM/touch-race, plays a stale taker renaming
+# the lock aside (to $MLM/home/taker-aside) just before this touch of the
+# lock path runs -- with "retake" in the file, a third run (y-third) then
+# also takes the freed path.
+ML_REAL_TOUCH="$(command -v touch)"
+cat > "$MLM/bin/touch" <<EOF
+#!/bin/bash
+if [ -f "$MLM/touch-race" ] && [ "\${!#}" = "$MLM/home/.lima-build.lock" ]; then
+  mode="\$(cat "$MLM/touch-race")"; rm -f "$MLM/touch-race"
+  "$ML_REAL_MV" "$MLM/home/.lima-build.lock" "$MLM/home/taker-aside"
+  if [ "\$mode" = "retake" ]; then
+    "$ML_REAL_MKDIR" "$MLM/home/.lima-build.lock"
+    printf 'repo=yaw\ninstance=yaw-linux\nrun=y-third\nhost=other-box\npid=4646\nstarted=2026-11-01T00:00:00Z\n' > "$MLM/home/.lima-build.lock/owner"
+  fi
+fi
+exec "$ML_REAL_TOUCH" "\$@"
+EOF
+chmod +x "$MLM/bin/limactl" "$MLM/bin/stat" "$MLM/bin/mkdir" "$MLM/bin/mv" "$MLM/bin/touch"
 cat > "$ML/bin/ssh" <<EOF
 #!/bin/bash
 cmd="\${!#}"
@@ -1207,13 +1224,20 @@ case "\$1" in
         [ -f "$ML/provision-fails" ] && { echo "[mac] limactl edit failed" >&2; exit 1; }
         # provision-steals: the provision outlives the lock's 15 minutes with
         # the VM down, and another run takes the lock over as stale.
+        # With "oam" in the file the thief is another oam run, on the same
+        # instance name, oam-linux.
         if [ -f "$ML/provision-steals" ]; then
           rm -rf "$MLM/home/.lima-build.lock"; mkdir -p "$MLM/home/.lima-build.lock"
-          printf 'repo=yaw\ninstance=yaw-linux\nrun=y-thief\nhost=other-box\npid=4747\nstarted=2026-11-01T00:00:00Z\n' > "$MLM/home/.lima-build.lock/owner"
+          if grep -qx oam "$ML/provision-steals"; then
+            printf 'repo=oam\ninstance=oam-linux\nrun=o-thief\nhost=other-box\npid=4747\nstarted=2026-11-01T00:00:00Z\n' > "$MLM/home/.lima-build.lock/owner"
+          else
+            printf 'repo=yaw\ninstance=yaw-linux\nrun=y-thief\nhost=other-box\npid=4747\nstarted=2026-11-01T00:00:00Z\n' > "$MLM/home/.lima-build.lock/owner"
+          fi
         fi
         echo "[mac] \$4" >&2; exit 0 ;;
       start|container|sync) echo "[mac] \$4" >&2; exit 0 ;;
       run) echo "[remote] \$6"; [ -f "$ML/fail-\$6" ] && exit 1
+           [ -f "$ML/fail-once-\$6" ] && { rm -f "$ML/fail-once-\$6"; exit 1; }
            [ -f "$ML/drop-\$6" ] && { rm -f "$ML/drop-\$6"; exit 255; }
            [ -f "$ML/drops-\$6" ] && exit 255
            exit 0 ;;
@@ -1258,7 +1282,7 @@ ml_calls_of(){ grep -c -- "$1" <<<"$ML_CALLS"; }
 ml_reset(){
   rm -f "$ML"/fail-* "$ML"/drop-* "$ML"/drops-* "$ML/sum-override" "$ML/status-others-none" "$MLM/list-fail" \
         "$ML/lock-drop" "$ML/stop-fails" "$MLM/stat-mode" "$MLM/mkdir-race" "$MLM/mkdir-attempts" "$MLM/mv-race" \
-        "$MLM/mv-nest" "$MLM/owner-mv-fail" "$ML/provision-steals" "$MLM/mv-log" "$ML/provision-fails"
+        "$MLM/mv-nest" "$MLM/owner-mv-fail" "$ML/provision-steals" "$MLM/mv-log" "$ML/provision-fails" "$MLM/touch-race"
   rm -rf "$MLM/home/.lima-build.lock" "$MLM/home/.lima-build.lock".* "$MLM/home/taker-aside"
   printf '%s\n' "$ML_ST_STOPPED" > "$ML/status"; printf '%s\n' "$ML_GLIBC_OK" > "$ML/glibc"
   echo "oam-linux Stopped" > "$MLM/lima"
@@ -1486,7 +1510,7 @@ if [ -z "$ML_PRE_BAD" ]; then pass; else fail "$ML_PRE_BAD"; fi
 it "release-local.sh: the linux leg runs after the mac legs, and copies the one exact asset name"
 ml_rl(){ grep -nF -- "$1" scripts/release-local.sh | head -1 | cut -d: -f1; }
 ML_RL_MAC="$(ml_rl 'build-platforms-tailnet.sh" --mode=release')"
-ML_RL_LIN="$(ml_rl 'build-platforms-mac-linux.sh" --mode=release')"
+ML_RL_LIN="$(ml_rl 'LINUX_ART=$(run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "linux leg" linux_leg_attempt)')"
 ML_RL_CP="$(ml_rl 'cp "$LINUX_ART/oam-x86_64-unknown-linux-gnu" "$RELEASE_DIR/"')"
 if [ -n "$ML_RL_MAC" ] && [ -n "$ML_RL_LIN" ] && [ -n "$ML_RL_CP" ] \
    && [ "$ML_RL_MAC" -lt "$ML_RL_LIN" ] && [ "$ML_RL_LIN" -lt "$ML_RL_CP" ] \
@@ -1840,6 +1864,42 @@ it "refresh: renews the lock's mtime only while its run= is this run's; another 
 if [ "$LK_RF_MINE" = "0|fresh" ] && [ "$LK_RF_OTHER" = "3|old|1" ] && [ "$LK_RF_NONE" = "3|" ]; then pass
 else fail "mine: $LK_RF_MINE other: $LK_RF_OTHER none: $LK_RF_NONE err: $LK_ERR"; fi
 
+# A stale taker renames the lock aside between refresh's read of run= and
+# its touch: the touch must not create the path (a plain touch leaves a
+# regular FILE at ~/.lima-build.lock -- no lock for this run, and every later
+# mkdir failing on it), and the refresh is exit 3. With the path re-taken by
+# a third run, the touch only makes that run's lock younger, and the
+# re-read still says exit 3.
+ml_reset
+lk lock r1 oam oam-linux box-1 77
+echo plain > "$MLM/touch-race"
+lk refresh r1
+LK_RFR_GONE="$LK_RC|$([ -e "$LK" ] && echo made)$([ -f "$LK" ] && echo -file)|$(grep -c '^run=r1$' "$MLM/home/taker-aside/owner" 2>/dev/null)"
+ml_reset
+lk lock r1 oam oam-linux box-1 77
+echo retake > "$MLM/touch-race"
+lk refresh r1
+LK_RFR_RETAKE="$LK_RC|$([ -d "$LK" ] && echo dir)|$(grep -c '^run=y-third$' "$LK/owner" 2>/dev/null)|$(grep -c 'run=y-third' <<<"$LK_ERR")"
+it "refresh: a lock renamed aside between the run= read and the touch is never re-created as a file -- exit 3; a third run's lock in its place is exit 3 too"
+if [ "$LK_RFR_GONE" = "3||1" ] && [ "$LK_RFR_RETAKE" = "3|dir|1|1" ]; then pass
+else fail "gone: $LK_RFR_GONE retake: $LK_RFR_RETAKE err: $LK_ERR"; fi
+
+# The other side of that window: an OWNED lock judged stale whose run then
+# refreshes it (fresh mtime, same dir) before the taker's rename. Same run=,
+# same inode -- only the age re-check on the moved dir sees it: put back,
+# BUSY, not removed (two VMs on the Mac otherwise).
+ml_reset
+lk_plant yaw yaw-linux y-run-9
+printf 'oam-linux Stopped\nyaw-linux Stopped\n' > "$MLM/lima"
+lk_age 1000
+LK_INO0="$(lk_ino)"
+echo touch > "$MLM/mv-race"
+lk lock r1 oam oam-linux box-1 77
+LK_OWNED_RECHECK="$LK_RC|$([ "$(lk_ino)" = "$LK_INO0" ] && echo same)|$(grep -c '^run=y-run-9$' "$LK/owner" 2>/dev/null)|$(ls -d "$LK".* 2>/dev/null | wc -l | tr -d ' ')|$(grep -c 'put back' <<<"$LK_ERR")"
+it "lock: an OWNED stale lock refreshed (fresh mtime, same dir and run=) between the judgement and the rename is put back, not removed -- BUSY"
+if [ "$LK_OWNED_RECHECK" = "3|same|1|0|1" ]; then pass
+else fail "$LK_OWNED_RECHECK err: $LK_ERR"; fi
+
 ml_reset
 lk_plant yaw yaw-linux y-run-9
 printf 'oam-linux Stopped\nyaw-linux Running\n' > "$MLM/lima"
@@ -1875,6 +1935,22 @@ if [ "$ML_RF_OK" = "0|right-before" ] && [ "$ML_RC" = "1" ] && [ "$(ml_calls_of 
    && grep -qF 'not this run'"'"'s (never taken, or taken over as stale) -- left alone' <<<"$ML_ERR" \
    && grep -qxF 'run=y-thief' "$LK/owner"; then pass
 else fail "ok-run: $ML_RF_OK rc=$ML_RC calls: $ML_CALLS stderr: $(tail -6 <<<"$ML_ERR")"; fi
+
+# The thief is another oam run: it shares the instance name, and may by now
+# have started oam-linux for its own build. This run never started it, and
+# the lock is not this run's: the EXIT trap stops nothing, and under
+# OAM_KEEP_VM=1 it does not claim to leave a lock held.
+ml_reset
+echo oam > "$ML/provision-steals"
+ml -- --provision --mode=release
+ML_STEAL_OAM="$ML_RC|$(ml_calls_of ' start ')|$(ml_calls_of ' stop ')|$(grep -c '^run=o-thief$' "$LK/owner" 2>/dev/null)"
+ml_reset
+echo oam > "$ML/provision-steals"
+ml OAM_KEEP_VM=1 -- --provision --mode=release
+ML_STEAL_OAM_KEEP="$ML_RC|$(ml_calls_of ' start ')|$(ml_calls_of ' stop ')|$(grep -c 'leaving the Mac build lock' <<<"$ML_ERR")|$(grep -c 'leaving oam-linux running' <<<"$ML_ERR")|$(grep -c '^run=o-thief$' "$LK/owner" 2>/dev/null)"
+it "leg: a refresh that finds the lock taken over stops no VM on exit (an oam taker shares oam-linux) and, under OAM_KEEP_VM=1, claims no lock held"
+if [ "$ML_STEAL_OAM" = "1|0|0|1" ] && [ "$ML_STEAL_OAM_KEEP" = "1|0|0|0|0|1" ]; then pass
+else fail "default: $ML_STEAL_OAM keep: $ML_STEAL_OAM_KEEP calls: $ML_CALLS stderr: $(tail -6 <<<"$ML_ERR")"; fi
 
 ml_reset
 ml OAM_LIMA_CPUS=6 -- --provision --preflight-only
@@ -2031,6 +2107,47 @@ for f in scripts/release-local.sh scripts/node-compat-measure.sh scripts/bench-p
   { [ "$n_all" -ge 1 ] && [ "$n_all" = "$n_pin" ]; } || ML_PFK_BAD="$ML_PFK_BAD $f($n_pin/$n_all)"
 done
 if [ -z "$ML_PFK_BAD" ]; then pass; else fail "preflight not pinned to OAM_KEEP_VM=0:$ML_PFK_BAD"; fi
+
+# What the docs of OAM_KEEP_VM promise about the NEXT run: a VM an earlier
+# OAM_KEEP_VM=1 run left comes with that run's lock, so the preflight (pinned
+# to OAM_KEEP_VM=0) is BUSY on it, stops nothing, and prints how to clear it.
+ml_reset
+printf 'oam-linux Running\n' > "$MLM/lima"
+printf '%s\n' "${ML_ST_STOPPED/Stopped/Running}" > "$ML/status"
+lk_plant oam oam-linux o-kept
+ml OAM_KEEP_VM=0 -- --preflight-only
+it "leg (v1.2): a VM left by an OAM_KEEP_VM=1 run keeps its lock -- the next preflight is BUSY, stops nothing, prints the limactl stop and lock-clear commands"
+if [ "$ML_RC" = "1" ] && [ "$(ml_calls_of ' stop ')" = "0" ] && grep -qF 'limactl stop oam-linux' <<<"$ML_ERR" \
+   && grep -qF 'rm -rf ~/.lima-build.lock' <<<"$ML_ERR" && grep -qxF 'run=o-kept' "$LK/owner" \
+   && grep -qxF 'oam-linux Running' "$MLM/lima"; then pass
+else fail "rc=$ML_RC calls: $ML_CALLS stderr: $(tail -6 <<<"$ML_ERR")"; fi
+
+# release-local's linux leg under OAM_KEEP_VM=1 and two attempts: the first
+# fails after taking the lock and starting the VM. It must stop and release
+# (OAM_KEEP_VM=0 on every attempt but the last), or the second -- a new run
+# id -- is BUSY on the first's kept lock and the retry can never pass. The
+# real run_with_attempts and linux_leg_attempt, read out of release-local.sh,
+# drive the real orchestrator against the stubbed ssh and the fake Mac.
+RL_LEG_FNS="$(awk '/^run_with_attempts\(\) \{$/ || /^linux_leg_attempt\(\) \{$/ { f = 1 } f { print } f && /^}$/ { f = 0 }' scripts/release-local.sh)"
+ml_reset
+: > "$ML/fail-once-conformance"
+: > "$ML/calls"
+RL_LEG_OUT="$(env PATH="$ML/bin:$PATH" TMPDIR="$ML/tmp" OAM_MAC_KEY="$ML/key" OAM_MAC_HOST=build-mac.example.invalid \
+  OAM_MAC_USER=builder OAM_KEEP_VM=1 OAM_LINUX_RETRY_DELAY=0 \
+  bash -c "set -uo pipefail; warn(){ echo \"[warn] \$*\" >&2; }; note(){ :; }; ok(){ :; }; $RL_LEG_FNS"'
+    OAM_RELEASE_LEG_ATTEMPTS=2; SCRIPT_DIR="$1"
+    run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "linux leg" linux_leg_attempt' rl-leg "$PWD/scripts" </dev/null 2>"$ML/err")"
+RL_LEG_RC=$?
+RL_LEG_ERR="$(cat "$ML/err")"; RL_LEG_CALLS="$(cat "$ML/calls")"
+RL_LEG_RUN2="$(grep -oE '^bash -s -- lock [^ ]+' <<<"$RL_LEG_CALLS" | awk 'NR == 2 { print $5 }')"
+it "release-local: OAM_KEEP_VM=1 with two linux attempts -- a failed first attempt stops and releases, the second is not BUSY, and only the last keeps VM and lock"
+if [ "$(grep -c '() {$' <<<"$RL_LEG_FNS")" = "2" ] && [ "$RL_LEG_RC" = "0" ] \
+   && [ -d "${RL_LEG_OUT##*$'\n'}" ] && ! grep -qF 'BUSY:' <<<"$RL_LEG_ERR" \
+   && [ "$(grep -c '^bash -s -- lock ' <<<"$RL_LEG_CALLS")" = "2" ] && [ "$(grep -c '^bash -s -- unlock ' <<<"$RL_LEG_CALLS")" = "1" ] \
+   && [ "$(grep -c '^bash -s -- stop oam-linux' <<<"$RL_LEG_CALLS")" = "1" ] \
+   && [ -n "$RL_LEG_RUN2" ] && grep -qxF "run=$RL_LEG_RUN2" "$LK/owner" 2>/dev/null; then pass
+else fail "rc=$RL_LEG_RC fns=$(grep -c '() {$' <<<"$RL_LEG_FNS") calls: $RL_LEG_CALLS stderr: $(grep -E 'BUSY|fail|attempt' <<<"$RL_LEG_ERR" | tail -6)"; fi
+ml_reset
 
 # A lock verb refused as BUSY does not unlock: the lock is another run's.
 ml_reset

@@ -245,9 +245,10 @@ do_status() {
 #
 # Nothing removes a lock in place. A takeover renames the lock aside
 # (~/.lima-build.lock.stale.<pid>) and removes it only if the renamed dir is
-# still the one judged stale: the same run= AND the same inode, and an
-# ownerless one must also still have no owner file and still be older than
-# LOCK_STALE_AFTER once moved (v1.2: a same-parent rename keeps a dir's mtime
+# still the one judged stale: the same run=, the same inode and still older
+# than LOCK_STALE_AFTER once moved (an owned one too, which v1.2 does not ask:
+# its run may have refreshed it in between), and an ownerless one must also
+# still have no owner file (v1.2: a same-parent rename keeps a dir's mtime
 # and inode, measured on the build Mac's APFS; a fresh mkdir is new). The
 # inode is oam's own, stricter than the protocol: two takers of one
 # crash-left ownerless lock would otherwise let the second remove the fresh,
@@ -418,11 +419,12 @@ lock_put_back() {
 # lock_take_over <judged-ident> <judged-inode>  -- move the lock judged
 # stale aside, and remove it only if it is still the one judged: lock_ident
 # unchanged AND the same inode (a lock dir made since -- above all a fresh,
-# still ownerless one -- has another), and, for an ownerless one, still no
-# owner file and still older than LOCK_STALE_AFTER (v1.2; an age that cannot
-# be read is not old). If not, it goes back (or, with the path taken again,
-# stays aside) and the run is BUSY. Returns 0 when the path is free for the
-# one retry.
+# still ownerless one -- has another) AND still older than LOCK_STALE_AFTER
+# (an age that cannot be read is not old), and, for an ownerless one, still
+# no owner file. (v1.2 asks the age re-check of an ownerless lock only; oam
+# asks it of an owned one too, against a `refresh` in between.) If not, it
+# goes back (or, with the path taken again, stays aside) and the run is
+# BUSY. Returns 0 when the path is free for the one retry.
 lock_take_over() {
   local judged="$1" judged_ino="$2" moved got ino owner age old=1
   moved="$(lock_aside stale)" \
@@ -433,9 +435,11 @@ lock_take_over() {
   fi
   got="$(lock_ident "$moved")"
   ino="$(lock_inode "$moved" || true)"
-  if [ "$judged" = "ownerless" ]; then
-    if [ -e "$moved/owner" ] || ! age="$(lock_age "$moved")" || [ "$age" -le "$LOCK_STALE_AFTER" ]; then old=0; fi
-  fi
+  # Still old once moved, owned or not: an owned lock's run can `refresh` it
+  # (a fresh mtime, right before it starts its VM) between this run's
+  # judgement and the rename -- same run=, same inode, and no longer stale.
+  if ! age="$(lock_age "$moved")" || [ "$age" -le "$LOCK_STALE_AFTER" ]; then old=0; fi
+  if [ "$judged" = "ownerless" ] && [ -e "$moved/owner" ]; then old=0; fi
   if [ "$got" = "$judged" ] && [ "$old" = "1" ] && [ -n "$ino" ] && [ "$ino" = "$judged_ino" ]; then
     rm -rf "$moved"
     return 0
@@ -567,15 +571,27 @@ do_unlock() {
 }
 
 # do_refresh <runid>  -- renew the lock dir's mtime while its run= is this
-# run's. (Checked, then touched: a lock that changes hands in between gets a
-# younger mtime, which delays its staleness and never lets two runs hold it.)
+# run's. Checked, touched, checked again: a stale taker can rename the lock
+# aside between the first read and the touch. `touch -c` never creates the
+# path (a plain touch would leave a regular FILE at ~/.lima-build.lock: no
+# lock for this run, and every later mkdir failing on it), and a lock that
+# changed hands in between -- gone, or a new run's dir that the touch only
+# made younger -- fails the second read: exit 3, and the VM is not started.
+# A takeover that renames the lock after the second read finds a fresh
+# mtime on the moved dir and puts it back (lock_take_over's age re-check).
 do_refresh() {
   local run="${1:-}" got owner
   [[ "$run" =~ ^[A-Za-z0-9._-]+$ ]] || die "refresh wants a run id, got '$run'"
   got="$(lock_ident "$LOCK_DIR")"
   case "$got" in
     "run=$run")
-      touch "$LOCK_DIR" || die "could not renew the Mac build lock's mtime"
+      touch -c "$LOCK_DIR" || die "could not renew the Mac build lock's mtime"
+      got="$(lock_ident "$LOCK_DIR")"
+      if [ "$got" != "run=$run" ] || [ ! -d "$LOCK_DIR" ]; then
+        owner="$(lock_owner_text "$LOCK_DIR")"
+        echo "[mac] BUSY: the Mac build lock changed hands while this run renewed it -- it is not this run's now: ${owner:-<none, or no owner file>}" >&2
+        exit 3
+      fi
       note "Mac build lock renewed (run $run)"
       exit 0 ;;
     gone)

@@ -479,7 +479,13 @@ REFRESH_RC=0
 mac_refresh >&2 2>&1 || REFRESH_RC=$?
 case "$REFRESH_RC" in
   0) ;;
-  3) fail "the Mac build lock is no longer this run's (run $LOCK_RUN) -- another run took it over as stale while $INSTANCE was down (a --provision longer than 15 minutes?), so $INSTANCE is not started. Re-run once that run is over." ;;
+  # Not this run's lock any more, and this run never started its VM (a stale
+  # takeover needs the owner's VM not Running): the EXIT trap must not stop
+  # $INSTANCE -- an oam taker shares the name and may have started it for
+  # its own build -- nor claim the lock under OAM_KEEP_VM=1. LOCK_HELD
+  # stays: the unlock reads run= in place and leaves another run's alone.
+  3) STOP_ON_EXIT=0; LOCK_TAKEN=0
+     fail "the Mac build lock is no longer this run's (run $LOCK_RUN) -- another run took it over as stale while $INSTANCE was down (a --provision longer than 15 minutes?), so $INSTANCE is not started. Re-run once that run is over." ;;
   *) fail "could not renew the Mac build lock on $HP (exit $REFRESH_RC; the driver's message is above) -- $INSTANCE is not started" ;;
 esac
 vm_step vm-start "$INSTANCE running" start
