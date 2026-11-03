@@ -19,7 +19,9 @@ use oam_core::child::{
 #[cfg(unix)]
 use oam_core::child::child_kill;
 #[cfg(unix)]
-use oam_core::child_unix::{RawChildRegistry, StdioFd, raw_kill, raw_wait, spawn_extra};
+use oam_core::child_unix::{
+    RawChildRegistry, StdioFd, raw_close_fd, raw_kill, raw_read, raw_wait, raw_write, spawn_extra,
+};
 // The Windows raw backend exposes the same surface through the shared alias.
 #[cfg(windows)]
 use oam_core::child_extra::{
@@ -576,5 +578,172 @@ async fn raw_kill_trapped_signal_reports_clean_exit() {
         report,
         serde_json::json!({ "code": 0, "signal": null }),
         "a trapped-and-survived kill must not be misreported as a signal death"
+    );
+}
+
+/// Read fd `fd` of child `id` to EOF, each read bounded so a regression hangs
+/// the test only for the bound.
+#[cfg(unix)]
+async fn read_to_eof(reg: &RawChildRegistry, id: u64, fd: u32) -> Vec<u8> {
+    let mut got = Vec::new();
+    loop {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            raw_read(reg.clone(), id, fd),
+        )
+        .await
+        .expect("the read reaches EOF: the child is gone")
+        {
+            OpOutcome::Bytes(b) => got.extend_from_slice(&b),
+            OpOutcome::Done => return got,
+            other => panic!("unexpected read outcome {other:?}"),
+        }
+    }
+}
+
+/// Unix raw backend (#456): what a child wrote before it exited is still read
+/// after its exit has been collected. raw_wait dropped the whole entry, read
+/// ends included, so a read issued after it reported EOF with the child's
+/// output still in the pipe. This order (wait, then read) is the losing one
+/// every time, not only under load.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_read_after_wait_still_drains_the_pipe() {
+    let raw = spawn_extra(
+        "sh",
+        &["-c".to_string(), "printf drained".to_string()],
+        None,
+        None,
+        &[StdioFd::Ignore, StdioFd::ChildWrite, StdioFd::Ignore],
+        false,
+        false,
+        None::<&str>,
+    )
+    .expect("spawn_extra printf");
+    let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = 1u64;
+    reg.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, raw);
+
+    let exit = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        raw_wait(reg.clone(), id),
+    )
+    .await
+    .expect("printf exits");
+    assert!(
+        matches!(exit, OpOutcome::Json(_)),
+        "exit report, got {exit:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&read_to_eof(&reg, id, 1).await),
+        "drained"
+    );
+    assert!(
+        reg.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "the entry goes with its last read end"
+    );
+}
+
+/// Case 63's shape (#456): the child writes, waits on stdin, writes again and
+/// exits. The parent's first read is done (its end back in the registry) when
+/// the child is reaped, which is the window the issue saw under load; the
+/// tail must still be read. Ordered by the child's own stdin, so it does not
+/// depend on timing.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tail_written_after_the_first_read_survives_the_reap() {
+    let raw = spawn_extra(
+        "sh",
+        &[
+            "-c".to_string(),
+            "printf A; cat >/dev/null; printf B".to_string(),
+        ],
+        None,
+        None,
+        &[StdioFd::ChildRead, StdioFd::ChildWrite, StdioFd::Ignore],
+        false,
+        false,
+        None::<&str>,
+    )
+    .expect("spawn_extra two-part writer");
+    let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = 1u64;
+    reg.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, raw);
+
+    let first = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        raw_read(reg.clone(), id, 1),
+    )
+    .await
+    .expect("the child writes A at once");
+    assert!(
+        matches!(&first, OpOutcome::Bytes(b) if b.as_slice() == b"A"),
+        "first read, got {first:?}"
+    );
+    // A stdin write is fine before the close; the child discards it.
+    assert!(matches!(
+        raw_write(reg.clone(), id, 0, b"in".to_vec()).await,
+        OpOutcome::Done
+    ));
+    raw_close_fd(&reg, id, 0);
+    let exit = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        raw_wait(reg.clone(), id),
+    )
+    .await
+    .expect("the child exits once stdin closes");
+    assert!(
+        matches!(exit, OpOutcome::Json(_)),
+        "exit report, got {exit:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&read_to_eof(&reg, id, 1).await),
+        "B"
+    );
+    assert!(reg.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+}
+
+/// A read end the caller closes after the reap (a destroyed stream) takes the
+/// entry with it, so a reaped child whose output nobody reads does not stay in
+/// the registry.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_the_last_read_end_after_the_reap_drops_the_entry() {
+    let raw = spawn_extra(
+        "sh",
+        &["-c".to_string(), "printf unread".to_string()],
+        None,
+        None,
+        &[StdioFd::Ignore, StdioFd::ChildWrite, StdioFd::ChildWrite],
+        false,
+        false,
+        None::<&str>,
+    )
+    .expect("spawn_extra printf");
+    let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = 1u64;
+    reg.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, raw);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        raw_wait(reg.clone(), id),
+    )
+    .await
+    .expect("printf exits");
+    assert!(
+        !reg.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "two read ends are still open"
+    );
+    raw_close_fd(&reg, id, 1);
+    assert!(!reg.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    raw_close_fd(&reg, id, 2);
+    assert!(
+        reg.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "the entry goes with its last end"
     );
 }
