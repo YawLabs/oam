@@ -39011,6 +39011,19 @@
         }
         all = opts.all;
       }
+      // node's last two checks. They are validated only: oam has no result
+      // ordering (getDefaultResultOrder / setDefaultResultOrder are surface
+      // gaps), so the platform resolver's order is the answer either way.
+      if (opts.verbatim != null && typeof opts.verbatim !== "boolean") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.verbatim", "boolean", opts.verbatim);
+      }
+      if (opts.order != null && opts.order !== "verbatim" && opts.order !== "ipv4first" && opts.order !== "ipv6first") {
+        throw codes.ERR_INVALID_ARG_VALUE(
+          "options.order",
+          opts.order,
+          "must be one of: 'verbatim', 'ipv4first', 'ipv6first'",
+        );
+      }
       return { family, hints, all };
     }
 
@@ -39308,6 +39321,15 @@
     // node does; while it is still this function they use oam's own resolver
     // directly (lookupAndConnect), and a replaced one is called instead.
     registry._dnsLookupOriginal = lookup;
+
+    // node's kCustomPromisifyArgs on dns.lookup: util.promisify(dns.lookup)
+    // resolves { address, family } rather than the bare address. node's
+    // descriptor: non-enumerable, non-writable, non-configurable -- and it is
+    // lookup's one own symbol there too.
+    Object.defineProperty(lookup, Symbol.for("nodejs.util.promisify.customArgs"), {
+      value: ["address", "family"],
+      enumerable: false,
+    });
 
     return {
       lookup,

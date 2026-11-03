@@ -41,6 +41,20 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   It now calls the immediate exit native with 134: no `'exit'` event, already-written output
   kept. On POSIX a parent sees exit code 134 rather than a `SIGABRT` death, and no stack
   report or core dump is written (docs/node-divergences.md #60).
+- **`dns.lookup()` and `dns.promises.lookup()` answer an empty hostname as node does.**
+  `dns.lookup("")` threw `TypeError: hostname must be between 1 and 253 characters`
+  synchronously out of both APIs, so an unguarded `await dns.promises.lookup(host)` ended the
+  program. Any falsy hostname (`""`, `undefined`, `null`, `false`, `0`, `NaN`, `0n`) now
+  answers `null` with family 4 (6 when family 6 was asked for), or `[]` with `all`, without
+  the resolver, and emits node's `DEP0118` deprecation warning once per process. Before,
+  every falsy value but `""` was looked up as its string (`"undefined"`, `"null"`) and failed
+  `ENOTFOUND`. The argument checks now follow node's too: a truthy non-string hostname, a
+  missing callback, an `options` that is neither a number nor an object, and a non-boolean
+  `options.all` or `options.verbatim` throw `ERR_INVALID_ARG_TYPE`, an `options.order` other
+  than `'verbatim'`, `'ipv4first'` or `'ipv6first'` throws `ERR_INVALID_ARG_VALUE`, and
+  `dns.promises.lookup()` refuses the callback API's `'IPv4'` / `'IPv6'` family names.
+  `util.promisify(dns.lookup)` resolves `{ address, family }` as node's does, where it
+  resolved the bare address (#452).
 
 ## [0.19.2] - 2026-11-01
 

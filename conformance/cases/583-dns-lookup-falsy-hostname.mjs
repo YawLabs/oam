@@ -7,8 +7,10 @@
 // not just "": undefined, null, false, 0, NaN, 0n. A TRUTHY non-string
 // hostname is a TypeError ERR_INVALID_ARG_TYPE, as are a non-function
 // callback, an options that is neither a number nor an object, and a
-// non-boolean `options.all`; the promises API also refuses the callback
-// API's 'IPv4' / 'IPv6' family names (measured on v22.22.2).
+// non-boolean `options.all` or `options.verbatim`; an `options.order` outside
+// node's three is ERR_INVALID_ARG_VALUE, and the promises API also refuses the
+// callback API's 'IPv4' / 'IPv6' family names. util.promisify(dns.lookup)
+// resolves { address, family } (measured on v22.22.2).
 //
 // oam handed "" to the native op, which threw `TypeError: hostname must be
 // between 1 and 253 characters` with no code, synchronously out of both
@@ -17,6 +19,7 @@
 //
 // Nothing here reaches a resolver, so the case is deterministic offline.
 import dns from "node:dns";
+import { promisify } from "node:util";
 
 const warnings = [];
 process.on("warning", (w) => warnings.push(`${w.name} ${w.code} ${w.message}`));
@@ -68,7 +71,16 @@ threw("promises bad options", () => dns.promises.lookup("", "x"));
 threw("promises bad family", () => dns.promises.lookup("", { family: 5 }));
 threw("promises bad all", () => dns.promises.lookup("", { all: "yes" }));
 threw("promises family name", () => dns.promises.lookup("", { family: "IPv6" }));
+threw("cb bad verbatim", () => dns.lookup("", { verbatim: 1 }, () => {}));
+threw("cb bad order", () => dns.lookup("", { order: "bogus" }, () => {}));
+threw("promises bad verbatim", () => dns.promises.lookup("", { verbatim: "x" }));
+threw("promises bad order", () => dns.promises.lookup("", { order: "x" }));
+threw("cb good order", () => dns.lookup("", { verbatim: false, order: "ipv6first" }, () => {}));
 threw("promises bad hints", () => dns.promises.lookup("", { hints: "x" }));
+
+const lookupP = promisify(dns.lookup);
+console.log("promisified", JSON.stringify(await lookupP("")), JSON.stringify(await lookupP("", 6)), JSON.stringify(await lookupP("", { all: true })));
+console.log("lookup own symbols", Object.getOwnPropertySymbols(dns.lookup).length);
 
 // The warning is delivered on a later tick; one for the whole run.
 await new Promise((resolve) => setImmediate(resolve));
