@@ -21,10 +21,27 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **`dns.setServers()` and `dns.promises.setServers()` work.** They refused with `ENOSYS`.
   They now take node's address forms (`"1.2.3.4"`, `"1.2.3.4:5353"`, `"[::1]:5353"`, an IPv6
   zone that node also drops, a port that narrows to 0 becoming 53) and `getServers()` reports
-  them back as node does. `dns.Resolver.prototype.setServers()` still refuses
-  (docs/node-divergences.md #30).
+  them back as node does.
+- **`dns.promises.Resolver`, and every `Resolver` instance its own nameservers.**
+  `new dns.promises.Resolver()` threw `TypeError: dns.promises.Resolver is not a
+  constructor`, and `import { Resolver } from "node:dns/promises"` failed at link time. It is
+  now node's class, the same one `node:dns/promises` exports, over the base it shares with
+  `dns.Resolver`. Each instance of either class is its own channel, as in node: it starts
+  from the system nameservers, and its `setServers()` (which refused with `ENOSYS`) reaches
+  no other instance and neither default. The `timeout`, `tries` and `maxTimeout` options are
+  validated and set the instance's timing (they were ignored), `cancel()` fails the pending
+  queries with `ECANCELLED` (it did nothing), and `setLocalAddress()` binds the queries'
+  source address (it did not exist). `dns.promises` also gains the 24 c-ares error-code
+  constants (`NOTFOUND`, `TIMEOUT`, ...). `resolveTlsa` is still missing (#453).
 
 ### Fixed
+
+- **`dns.NOTFOUND` and the other c-ares error-code constants are the codes errors carry.**
+  They were the bare names (`dns.NOTFOUND === "NOTFOUND"`), so `err.code === dns.NOTFOUND`
+  never held; they are now node's strings (`"ENOTFOUND"`, `"ETIMEOUT"`, ...).
+- **A DNS query to a server that does not answer is sent once per try, as c-ares sends it.**
+  oam's resolver resent an unanswered UDP query about every 340 ms within one wait, so a
+  silent server got up to three datagrams per try where node sends one.
 
 - **`dns.reverse()` fails with `ENOTFOUND` whenever the lookup fails, as node does.** A name
   that exists but has no PTR record answered `ENODATA`; node's reverse goes through c-ares'

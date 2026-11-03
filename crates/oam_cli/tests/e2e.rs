@@ -20623,40 +20623,44 @@ fn zstd_dropped_stream_frees_its_context() {
 }
 
 #[test]
-fn dns_resolver_set_servers_refuses_rather_than_lying() {
-    // A DELIBERATE divergence (docs/node-divergences.md #30), so it cannot be a
-    // differential conformance case: node gives every Resolver instance its
-    // own nameservers, oam's instances share the system channel, so
-    // Resolver.prototype.setServers throws ENOSYS. Recording the list and then
-    // querying the system servers anyway would be the worst option: a Resolver
-    // aimed at a blackhole address came back with real records, which is
-    // indistinguishable from a correct answer.
-    //
-    // The module-level dns.setServers() is node's and is pinned against node
-    // by conformance case 581; here it only has to leave instances alone.
+fn a_resolver_aimed_at_a_silent_server_never_answers_from_the_system_servers() {
+    // Up to 0.19.2 every Resolver instance shared the system channel, so
+    // Resolver.prototype.setServers refused with ENOSYS: recording the list
+    // and querying the system servers anyway would have answered a Resolver
+    // aimed at a blackhole with real records. Each instance now has its own
+    // channel (#453); this pins the property the refusal protected -- the
+    // instance's query goes to ITS server and fails there, for both classes --
+    // and that neither default nor another instance moved. The node-matching
+    // details (error shape, timing options, cancel) are conformance case 584.
     let stdout = run_ok(
-        "dns_set_servers.mjs",
-        "import dns from 'node:dns';
-         const grab = (fn) => { try { fn(); return null; } catch (e) { return e; } };
+        "dns_resolver_instance_servers.mjs",
+        "import dgram from 'node:dgram';
+         import dns from 'node:dns';
+         const silent = dgram.createSocket('udp4');
+         let asked = 0;
+         silent.on('message', () => { asked++; });
+         await new Promise((r) => silent.bind(0, '127.0.0.1', r));
+         const addr = `127.0.0.1:${silent.address().port}`;
          const system = JSON.stringify(dns.getServers());
-         const r = new dns.Resolver();
-         const resErr = grab(() => r.setServers(['192.0.2.1']));
-         console.log('resolver_throws:', resErr !== null);
-         console.log('resolver_code:', resErr && resErr.code === 'ENOSYS');
-         // The refusal must NOT have left a half-applied state behind.
-         console.log('resolver_getServers_unchanged:', JSON.stringify(r.getServers()) === system);
-         console.log('module_getServers_unchanged:', JSON.stringify(dns.getServers()) === system);
-         const servers = r.getServers();
-         console.log('getServers_is_array:', Array.isArray(servers));
-         console.log('getServers_nonempty:', servers.length > 0);
-         console.log('getServers_strings:', servers.every((s) => typeof s === 'string'));
-         // The module-level setServers works and does not reach an instance.
-         const modErr = grab(() => dns.setServers(['192.0.2.1']));
-         console.log('module_accepts:', modErr === null);
-         console.log('module_getServers_set:', JSON.stringify(dns.getServers()) === '[\"192.0.2.1\"]');
-         console.log('resolver_keeps_system:', JSON.stringify(r.getServers()) === system);",
+         const cb = new dns.Resolver({ timeout: 100, tries: 1 });
+         const pr = new dns.promises.Resolver({ timeout: 100, tries: 1 });
+         const bystander = new dns.promises.Resolver();
+         cb.setServers([addr]);
+         pr.setServers([addr]);
+         const cbErr = await new Promise((r) => cb.resolve4('example.com', (e, a) => r(e || a)));
+         console.log('callback_fails_etimeout:', cbErr instanceof Error && cbErr.code === 'ETIMEOUT');
+         const prErr = await pr.resolve4('example.com').then((a) => a, (e) => e);
+         console.log('promises_fails_etimeout:', prErr instanceof Error && prErr.code === 'ETIMEOUT');
+         console.log('silent_server_was_asked_twice:', asked === 2);
+         console.log('instance_reports_its_server:', JSON.stringify(pr.getServers()) === JSON.stringify([addr]));
+         console.log('bystander_keeps_system:', JSON.stringify(bystander.getServers()) === system);
+         console.log('callback_default_untouched:', JSON.stringify(dns.getServers()) === system);
+         console.log('promises_default_untouched:', JSON.stringify(dns.promises.getServers()) === system);
+         silent.close();",
     );
-    for line in stdout.lines() {
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 7, "{stdout}");
+    for line in lines {
         assert!(
             line.ends_with("true"),
             "assertion failed: {line}

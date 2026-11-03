@@ -1687,4 +1687,84 @@ mod tests {
             "UNKNOWN_ARES_ERROR"
         );
     }
+
+    #[test]
+    fn resolver_options_map_to_cares_timing() {
+        let system = CaresTiming::from_timeout_option(None);
+        let t = |timeout, tries, max| CaresTiming::for_resolver(system, timeout, tries, max);
+        // -1 and 0 keep the system timeout; tries is taken as given.
+        assert_eq!(t(-1, 4, 0), system);
+        assert_eq!(t(0, 2, 0).timeout, system.timeout);
+        assert_eq!(t(0, 2, 0).tries, 2);
+        // c-ares's 250 ms floor and, without a maxTimeout, its 5 s ceiling.
+        assert_eq!(t(50, 1, 0).timeout, Duration::from_millis(250));
+        assert_eq!(t(700, 1, 0).timeout, Duration::from_millis(700));
+        assert_eq!(t(9000, 1, 0).timeout, Duration::from_secs(5));
+        // A maxTimeout replaces the ceiling and cuts every round's wait.
+        let capped = t(9000, 3, 7000);
+        assert_eq!(capped.timeout, Duration::from_secs(7));
+        assert_eq!(capped.wait(2, 0), Duration::from_secs(7));
+        let small = t(100, 3, 150);
+        assert_eq!(small.timeout, Duration::from_millis(250));
+        assert_eq!(small.wait(1, 0), Duration::from_millis(150));
+        assert_eq!(system.wait(1, 0), Duration::from_secs(4));
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_gets_one_datagram_per_try() {
+        // hickory's UDP stream would resend inside a try (CaresProvider).
+        let silent = fake(Reply::Silent).await;
+        let mut ch = test_channel(&[&silent], 3);
+        ch.timing.timeout = Duration::from_millis(400);
+        let err = channel_lookup(&ch, "q.example.", RecordType::A)
+            .await
+            .unwrap_err();
+        assert_eq!(query_error_code(&err), "ETIMEOUT");
+        assert_eq!(silent.asked.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn an_instance_has_its_own_servers_and_cancel() {
+        let one = fake(Reply::Answer {
+            octet: 1,
+            delay_ms: 0,
+        })
+        .await;
+        let silent = fake(Reply::Silent).await;
+        let a = Api::Instance(dns_resolver_new(-1, 4, 0));
+        let b = Api::Instance(dns_resolver_new(100, 1, 0));
+        let system = dns_get_servers(Api::Instance(dns_resolver_new(-1, 4, 0)));
+        dns_set_servers(a, &[("127.0.0.1".parse().unwrap(), one.port)]);
+        dns_set_servers(b, &[("127.0.0.1".parse().unwrap(), silent.port)]);
+        assert_eq!(dns_get_servers(a), vec![format!("127.0.0.1:{}", one.port)]);
+        assert_eq!(
+            dns_get_servers(b),
+            vec![format!("127.0.0.1:{}", silent.port)]
+        );
+        assert_eq!(dns_get_servers(Api::Callback), system);
+        match dns_resolve("x.example".into(), "A".into(), a).await {
+            OpOutcome::Json(json) => assert_eq!(json, r#"["10.0.0.1"]"#),
+            other => panic!("expected records, got {other:?}"),
+        }
+
+        // A cancel() after the query is issued -- before its future is even
+        // polled -- fails it; the instance stays usable.
+        let pending = dns_resolve("c.example".into(), "A".into(), b);
+        dns_cancel(b);
+        match pending.await {
+            OpOutcome::NodeFailed { code, .. } => assert_eq!(code, "ECANCELLED"),
+            other => panic!("expected ECANCELLED, got {other:?}"),
+        }
+        let pending = dns_reverse("192.0.2.9".into(), b);
+        dns_cancel(a); // another instance's cancel does not reach it
+        match pending.await {
+            OpOutcome::NodeFailed { code, .. } => assert_eq!(code, "ENOTFOUND"),
+            other => panic!("expected the timeout's ENOTFOUND, got {other:?}"),
+        }
+
+        // A freed instance's id falls back to the system channel.
+        let Api::Instance(id) = a else { unreachable!() };
+        dns_resolver_free(id);
+        assert_eq!(dns_get_servers(a), system);
+    }
 }

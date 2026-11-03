@@ -1334,7 +1334,7 @@ Node-on-Windows.
 On Windows, oam returns `"10.0.26200"` (the same string as `os.release()`); Node returns
 `"Windows 11 Pro"`.
 
-### 30. `dns.Resolver.prototype.setServers()` refuses instead of pretending
+### 30. DNS channels: timing details, and what a `Resolver` instance lacks
 
 `dns.setServers()` and `dns.promises.setServers()` work as in Node: the same parsing,
 errors and `getServers()` formatting, and the same split between them —
@@ -1345,33 +1345,32 @@ when a server gives no usable answer (a timeout, a network error or a reply that
 parse; a SERVFAIL or REFUSED answer is final), with a server that failed tried last on
 later queries. Conformance case 581 pins all of it against fake nameservers on 127.0.0.1.
 
+Every `new dns.Resolver()` and `new dns.promises.Resolver()` (since #453; up to 0.19.2
+`dns.promises.Resolver` did not exist and an instance's `setServers()` threw `ENOSYS`) is
+its own channel, as in Node: it starts from the system nameservers whatever
+`dns.setServers()` did, its `setServers()` and `setLocalAddress()` reach no other instance
+and neither default, it keeps its own failure counts, its `timeout` / `tries` /
+`maxTimeout` options set its timing, and `cancel()` fails its pending queries with
+`ECANCELLED`. Conformance case 584 pins it.
+
 The timing is c-ares's under Node too: four rounds over the list (Node always passes
-`tries: 4`, so `attempts:` in resolv.conf or `RES_OPTIONS` changes nothing), each server
-waited on for 2 s or the system's `timeout:` (clamped to 250 ms–5 s), doubled per round
-less a random jitter of up to half. Three timing differences remain, none of which changes
-a result. Node checks c-ares's timeouts on a 1 s timer, so its waits run up to a second
-longer than the nominal ones oam keeps (a dead first server costs 2.0 s in oam, 2.1–2.9 s
-in Node). hickory retransmits a UDP query to a silent server about every 340 ms within one
-wait, where c-ares sends it once. And c-ares shortens a server's timeout from the latency
-it measured on earlier answers, which oam does not model. The `timeout` and `tries`
-options of `new dns.Resolver(options)` are not read.
+`tries: 4` unless a `Resolver` is given its own, so `attempts:` in resolv.conf or
+`RES_OPTIONS` changes nothing), each server waited on for 2 s, the system's `timeout:` or
+a `Resolver`'s `timeout` (clamped to 250 ms–5 s, or to 250 ms–`maxTimeout` when one is
+set), doubled per round less a random jitter of up to half, and one datagram per try (up
+to 0.19.2 hickory resent an unanswered UDP query about every 340 ms within one wait).
+Three timing differences remain, none of which changes a result. Node checks c-ares's
+timeouts on a 1 s timer, so its waits run up to a second longer than the nominal ones oam
+keeps (a dead first server costs 2.0 s in oam, 2.1–2.9 s in Node). c-ares shortens a
+server's timeout from the latency it measured on earlier answers, which oam does not
+model. And c-ares resends a query with the same ID on each try, where oam sends each try
+with a new one.
 
-What is left is per-instance servers. Node gives every `new dns.Resolver()` its own
-channel; oam's instances share one channel built from the system configuration, so oam
-throws an `Error` with `code: 'ENOSYS'` from `dns.Resolver.prototype.setServers()`.
-Refusing is the least bad of the options: recording the list and querying the system
-servers anyway is the one that actually hurts, because a `Resolver` aimed at a blackhole
-address (`192.0.2.99`, TEST-NET-1) came back with **real A records** — an answer from the
-wrong nameserver is indistinguishable from a correct one. A throw sends the caller to its
-own fallback branch, or to the module-level `dns.setServers()`.
-
-`Resolver#getServers()` reports the real system nameservers, taken from the same
-`ResolverConfig` the instances' channel is built from, so the two stay coherent; as in
-Node, `dns.setServers()` does not change it. Because the instances share that channel —
-with each other, and with the module-level APIs until a `setServers()` replaces theirs —
-they also share which servers have failed: after one query timed out on a server, a query
-through another instance tries that server last, where in Node only the channel that saw
-the timeout would.
+What a `Resolver` instance lacks: `resolveTlsa` (oam has no TLSA query at all; it is a
+recorded surface gap of `dns` and `dns/promises`), and the `_handle` own property Node's
+instances carry (oam keeps an instance's channel id off the object, so an instance has no
+own properties). A `maxTimeout` above 2147483647 passes Node's validator and then aborts
+Node on a native assertion (`args[2]->IsInt32()`); oam takes it as the cap it names.
 
 ### 32. A decoded `fetch` response drops `content-encoding` and `content-length`
 
@@ -4661,7 +4660,7 @@ The largest per-module gaps (counts from windows-aarch64), all tracked in that f
 | Module | Missing | Shape of the gap |
 |---|---|---|
 | `constants` | 54 win32 / 65 linux / 61 darwin | The legacy all-in-one table. Platform-conditional values — the `WSA*` block on Windows, `RTLD_*` on POSIX, plus `UV_DIRENT_*` and the `SSL_OP_*`/`ENGINE_METHOD_*` OpenSSL set everywhere. This module is the *entire* reason the ratchet is keyed by platform: a Windows-only baseline reports 16 phantom new gaps on Linux and 12 on darwin, every one of them here. `fs.constants` and `os.constants` are separately correct — see *Platform constant tables* above. |
-| `dns/promises` | 29 | `Resolver`, `lookupService`, `resolveTlsa`, and the `BADNAME`/`NOTFOUND`/… error-code constants. |
+| `dns/promises` | 4 | `lookupService`, `resolveTlsa`, `getDefaultResultOrder`, `setDefaultResultOrder` (the same four `dns` lacks, less `setDefaultResultOrder`, a no-op there). `Resolver` and the 24 error-code constants landed with #453. |
 | `module` | 20 | The `Module._*` loader internals (`_load`, `_resolveFilename`, `_extensions`), `register`, `SourceMap`/`findSourceMap`. The compile-cache API landed in 0.19.1 (see *The compile cache is on by default* above). |
 | `fs` | **0** | Closed in 0.9.1–0.9.2. Ownership and fd metadata (`chown`/`fchown`/`lchown`, `fchmod`/`lchmod`), durability (`fsync`/`fdatasync`), `ftruncate`, the `utimes`/`futimes`/`lutimes` family, `readv`/`writev`, `openAsBlob`, `statfs` and `glob`/`globSync` all landed. `node:fs` now has no missing export names on any platform, and `fs/promises` none since `watch` landed after 0.19.0. |
 | `crypto` | 10 | The legacy class constructors `Cipher(iv)` and `Decipher(iv)`, `diffieHellman`, `getCipherInfo`, `randomFill`. |
