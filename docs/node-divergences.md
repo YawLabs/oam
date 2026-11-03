@@ -1372,6 +1372,11 @@ instances carry (oam keeps an instance's channel id off the object, so an instan
 own properties). A `maxTimeout` above 2147483647 passes Node's validator and then aborts
 Node on a native assertion (`args[2]->IsInt32()`); oam takes it as the cap it names.
 
+`resolve4` / `resolve6` with `{ ttl: true }` report `ttl: 0` for every address, from the
+module APIs and from both `Resolver` classes: oam's native answer does not carry the
+record's TTL yet, where Node reports the real one (measured: an A record served with TTL
+77 reads `{"address":"1.2.3.4","ttl":77}` in Node).
+
 ### 32. A decoded `fetch` response drops `content-encoding` and `content-length`
 
 `fetch` negotiates and decodes compressed responses in both runtimes, and both hand

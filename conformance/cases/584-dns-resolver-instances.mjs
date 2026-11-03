@@ -228,4 +228,76 @@ dns.setServers(system);
   console.log("sent from", JSON.stringify(one.sources.slice(before)));
 }
 
+// A local address the host does not have: the socket cannot be bound, which
+// c-ares reports as ECONNREFUSED (192.0.2.0/24 is TEST-NET-1).
+{
+  const r = new PR({ timeout: 300, tries: 1 });
+  r.setServers([one.addr]);
+  r.setLocalAddress("192.0.2.77");
+  try {
+    await r.resolve4("unbound.example");
+    console.log("unbindable address answered?");
+  } catch (err) {
+    showError("unbindable local address", err);
+  }
+}
+
+// ---- 8. query arguments -----------------------------------------------------
+//
+// Checked before anything is sent, synchronously, for every query method of
+// both classes and of the module APIs (up to 0.19.2 none were: a missing
+// callback surfaced as an unhandled rejection when the answer came back).
+
+{
+  const cb = new dns.Resolver();
+  const pr = new PR();
+  for (const r of [cb, pr]) r.setServers([one.addr]);
+  const fn = () => {};
+  const cases = [
+    ["cb resolve4 no callback", () => cb.resolve4("x.example")],
+    ["cb resolve4 number name", () => cb.resolve4(1, fn)],
+    ["cb resolve4 options and callback", () => cb.resolve4("x.example", { ttl: true }, fn)],
+    ["cb resolveMx string callback", () => cb.resolveMx("x.example", "x")],
+    ["cb resolveMx bad third argument", () => cb.resolveMx("x.example", fn, "y")],
+    ["cb resolveAny number name", () => cb.resolveAny(1, fn)],
+    ["cb resolve undefined rrtype", () => cb.resolve("x.example", undefined, fn)],
+    ["cb resolve lowercase rrtype", () => cb.resolve("x.example", "a", fn)],
+    ["cb resolve unknown rrtype", () => cb.resolve("x.example", "BOGUS", fn)],
+    ["cb resolve number rrtype", () => cb.resolve("x.example", 5, fn)],
+    ["cb resolve no callback", () => cb.resolve("x.example", "A")],
+    ["cb reverse number", () => cb.reverse(1, fn)],
+    ["cb reverse not an address", () => cb.reverse("x", fn)],
+    ["cb reverse no callback", () => cb.reverse("192.0.2.1")],
+    ["pr resolve4 number name", () => pr.resolve4(1)],
+    ["pr resolve lowercase rrtype", () => pr.resolve("x.example", "a")],
+    ["pr resolve number rrtype", () => pr.resolve("x.example", 5)],
+    ["pr resolve null rrtype", () => pr.resolve("x.example", null)],
+    ["pr resolveAny number name", () => pr.resolveAny(1)],
+    ["pr reverse number", () => pr.reverse(1)],
+    ["pr reverse not an address", () => pr.reverse("x")],
+    ["module resolve4 number name", () => dns.resolve4(1, fn)],
+    ["module resolve lowercase rrtype", () => dns.resolve("x.example", "a", fn)],
+    ["module promises resolve lowercase rrtype", () => dns.promises.resolve("x.example", "a")],
+    ["module resolveAny no callback", () => dns.resolveAny("x.example")],
+  ];
+  for (const [label, call] of cases) {
+    try {
+      const out = call();
+      if (out && typeof out.then === "function") {
+        const err = await out.then(() => null, (e) => e);
+        if (err) {
+          console.log(label, "rejects", err.code, err.message, "errno" in err ? typeof err.errno : "-");
+          continue;
+        }
+      }
+      console.log(label, "ok");
+    } catch (e) {
+      console.log(label, e.name, e.code, e.message, "errno" in e ? typeof e.errno : "-", e.syscall);
+    }
+  }
+  const order = Object.keys(dns.promises).filter((k) => k.startsWith("resolve") || k === "reverse")
+    .filter((k) => k !== "resolveTlsa");
+  console.log("promises query keys", JSON.stringify(order));
+}
+
 for (const s of [one, two, silent]) s.close();

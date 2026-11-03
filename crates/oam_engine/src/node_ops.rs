@@ -10665,10 +10665,11 @@ fn op_dns_resolve(
     }
     let rrtype: String = args.get(1).to_rust_string_lossy(scope);
     let api = dns_api(scope, args.get(2));
+    let instances = core_runtime!(scope).dns_instances();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::dns::dns_resolve(hostname, rrtype, api),
+        oam_core::dns::dns_resolve(&instances, hostname, rrtype, api),
     );
 }
 
@@ -10679,7 +10680,12 @@ fn op_dns_reverse(
 ) {
     let ip: String = args.get(0).to_rust_string_lossy(scope);
     let api = dns_api(scope, args.get(1));
-    crate::ops::spawn_op(scope, &mut rv, oam_core::dns::dns_reverse(ip, api));
+    let instances = core_runtime!(scope).dns_instances();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::dns::dns_reverse(&instances, ip, api),
+    );
 }
 
 /// `dns.getServers()` -- SYNCHRONOUS in node (it returns an array, not a
@@ -10690,7 +10696,9 @@ fn op_dns_get_servers(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let servers = oam_core::dns::dns_get_servers(dns_api(scope, args.get(0)));
+    let api = dns_api(scope, args.get(0));
+    let instances = core_runtime!(scope).dns_instances();
+    let servers = oam_core::dns::dns_get_servers(&instances, api);
     let out = v8::Array::new(scope, servers.len() as i32);
     for (i, server) in servers.iter().enumerate() {
         let Some(value) = v8::String::new(scope, server) else {
@@ -10720,7 +10728,10 @@ fn op_dns_set_servers(
             .collect()
     });
     match servers {
-        Some(servers) => oam_core::dns::dns_set_servers(api, &servers),
+        Some(servers) => {
+            let instances = core_runtime!(scope).dns_instances();
+            oam_core::dns::dns_set_servers(&instances, api, &servers);
+        }
         None => throw_type_error(scope, "dnsSetServers: expected [[address, port], ...]"),
     }
 }
@@ -10737,7 +10748,8 @@ fn op_dns_resolver_new(
     let timeout_ms = args.get(0).int32_value(scope).unwrap_or(-1);
     let tries = args.get(1).uint32_value(scope).unwrap_or(4);
     let max_timeout_ms = args.get(2).uint32_value(scope).unwrap_or(0);
-    let id = oam_core::dns::dns_resolver_new(timeout_ms, tries, max_timeout_ms);
+    let instances = core_runtime!(scope).dns_instances();
+    let id = oam_core::dns::dns_resolver_new(&instances, timeout_ms, tries, max_timeout_ms);
     rv.set(v8::Integer::new_from_unsigned(scope, id).into());
 }
 
@@ -10748,7 +10760,8 @@ fn op_dns_resolver_free(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     if let Some(id) = args.get(0).uint32_value(scope) {
-        oam_core::dns::dns_resolver_free(id);
+        let instances = core_runtime!(scope).dns_instances();
+        oam_core::dns::dns_resolver_free(&instances, id);
     }
 }
 
@@ -10758,7 +10771,9 @@ fn op_dns_cancel(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    oam_core::dns::dns_cancel(dns_api(scope, args.get(0)));
+    let api = dns_api(scope, args.get(0));
+    let instances = core_runtime!(scope).dns_instances();
+    oam_core::dns::dns_cancel(&instances, api);
 }
 
 /// `resolver.setLocalAddress()`: argument 1 is the IPv4 address and argument 2
@@ -10777,7 +10792,12 @@ fn op_dns_set_local_address(
     let parse_v6 = |s: &str| (!s.is_empty()).then(|| s.parse::<std::net::Ipv6Addr>());
     match (parse_v4(&v4).transpose(), parse_v6(&v6).transpose()) {
         (Ok(v4), Ok(v6)) => {
-            oam_core::dns::dns_set_local_address(api, oam_core::dns::LocalAddrs { v4, v6 });
+            let instances = core_runtime!(scope).dns_instances();
+            oam_core::dns::dns_set_local_address(
+                &instances,
+                api,
+                oam_core::dns::LocalAddrs { v4, v6 },
+            );
         }
         _ => throw_type_error(
             scope,

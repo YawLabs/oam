@@ -39,6 +39,15 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **`dns.NOTFOUND` and the other c-ares error-code constants are the codes errors carry.**
   They were the bare names (`dns.NOTFOUND === "NOTFOUND"`), so `err.code === dns.NOTFOUND`
   never held; they are now node's strings (`"ENOTFOUND"`, `"ETIMEOUT"`, ...).
+- **The dns query functions check their arguments as node does, before anything is sent.**
+  `dns.resolve4()` and the rest, on `dns`, `dns.promises` and both `Resolver` classes, took any
+  name (a number was stringified and looked up) and no callback: a missing callback was found
+  only when the answer came back, as an unhandled rejection that ended the process. They now
+  throw node's `ERR_INVALID_ARG_TYPE` for a non-string name or a missing callback, and
+  `resolve()` refuses an rrtype that is not node's (`'a'`, `'BOGUS'`) with
+  `ERR_INVALID_ARG_VALUE`. `reverse()` of something that is not an IP address fails
+  `getHostByAddr EINVAL`, synchronously from the callback API and as a rejection from the
+  promises API, as in node.
 - **A DNS query to a server that does not answer is sent once per try, as c-ares sends it.**
   oam's resolver resent an unanswered UDP query about every 340 ms within one wait, so a
   silent server got up to three datagrams per try where node sends one.

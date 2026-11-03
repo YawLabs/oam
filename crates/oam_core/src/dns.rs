@@ -488,21 +488,31 @@ struct Instance {
 const FIRST_INSTANCE: u32 = 2;
 static NEXT_INSTANCE: AtomicU32 = AtomicU32::new(FIRST_INSTANCE);
 
-/// Every live Resolver instance, process-wide like the defaults (a worker's
-/// instances live here too; ids never repeat).
-fn instances() -> &'static Mutex<HashMap<u32, Instance>> {
-    static INSTANCES: OnceLock<Mutex<HashMap<u32, Instance>>> = OnceLock::new();
-    INSTANCES.get_or_init(|| Mutex::new(HashMap::new()))
-}
+/// One runtime's live Resolver instances (`CoreRuntime::dns_instances`). It
+/// is per runtime, not process-wide, so a worker's instances go with the
+/// worker: the FinalizationRegistry that frees an instance never runs for an
+/// isolate that is torn down with its instances still reachable, and a
+/// process-wide map kept every one of them (measured: 5000 Resolvers per
+/// worker left about 425 MB behind per worker). Ids come from one process-wide
+/// counter, so they never repeat across runtimes.
+#[derive(Clone, Default)]
+pub struct DnsInstances(Arc<Mutex<HashMap<u32, Instance>>>);
 
-fn with_instance<R>(id: u32, f: impl FnOnce(&mut Instance) -> R) -> Option<R> {
-    let mut map = instances().lock().unwrap_or_else(|e| e.into_inner());
-    map.get_mut(&id).map(f)
+impl DnsInstances {
+    fn with<R>(&self, id: u32, f: impl FnOnce(&mut Instance) -> R) -> Option<R> {
+        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        map.get_mut(&id).map(f)
+    }
 }
 
 /// `new dns.Resolver(options)`: a channel over the system nameservers with the
 /// options' timing (see `CaresTiming::for_resolver`). Returns its id.
-pub fn dns_resolver_new(timeout_ms: i32, tries: u32, max_timeout_ms: u32) -> u32 {
+pub fn dns_resolver_new(
+    instances: &DnsInstances,
+    timeout_ms: i32,
+    tries: u32,
+    max_timeout_ms: u32,
+) -> u32 {
     let base = base();
     let timing = CaresTiming::for_resolver(base.timing, timeout_ms, tries, max_timeout_ms);
     let name_servers = base.name_servers.clone();
@@ -515,7 +525,8 @@ pub fn dns_resolver_new(timeout_ms: i32, tries: u32, max_timeout_ms: u32) -> u32
     ));
     let id = NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed);
     let (cancel, _) = tokio::sync::watch::channel(0);
-    instances()
+    instances
+        .0
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(
@@ -534,8 +545,9 @@ pub fn dns_resolver_new(timeout_ms: i32, tries: u32, max_timeout_ms: u32) -> u32
 /// The instance was collected. A query still in flight keeps its channel and
 /// finishes; nothing can cancel it any more, as nothing can reach the
 /// instance.
-pub fn dns_resolver_free(id: u32) {
-    instances()
+pub fn dns_resolver_free(instances: &DnsInstances, id: u32) {
+    instances
+        .0
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&id);
@@ -544,9 +556,9 @@ pub fn dns_resolver_free(id: u32) {
 /// `resolver.cancel()`: every query the instance has pending fails with
 /// ECANCELLED; later ones are unaffected (measured: a query issued after
 /// cancel() runs, and a second cancel() cancels it).
-pub fn dns_cancel(api: Api) {
+pub fn dns_cancel(instances: &DnsInstances, api: Api) {
     if let Api::Instance(id) = api {
-        with_instance(id, |instance| {
+        instances.with(id, |instance| {
             instance.cancel.send_modify(|epoch| *epoch += 1);
         });
     }
@@ -555,9 +567,9 @@ pub fn dns_cancel(api: Api) {
 /// `resolver.setLocalAddress()`: the addresses later queries are sent from,
 /// as the JS side resolved node's two-argument form (each call sets both
 /// families; the one not given goes back to "any").
-pub fn dns_set_local_address(api: Api, local: LocalAddrs) {
+pub fn dns_set_local_address(instances: &DnsInstances, api: Api, local: LocalAddrs) {
     if let Api::Instance(id) = api {
-        with_instance(id, |instance| {
+        instances.with(id, |instance| {
             instance.local = local;
             instance.channel = Arc::new(build_channel_with(
                 base(),
@@ -574,11 +586,11 @@ type CancelToken = (tokio::sync::watch::Receiver<u64>, u64);
 
 /// The cancel token of the instance `api` names, taken when a query is
 /// issued; `None` for the default APIs, which have no cancel.
-fn cancel_token(api: Api) -> Option<CancelToken> {
+fn cancel_token(instances: &DnsInstances, api: Api) -> Option<CancelToken> {
     let Api::Instance(id) = api else {
         return None;
     };
-    with_instance(id, |instance| {
+    instances.with(id, |instance| {
         let rx = instance.cancel.subscribe();
         let epoch = *rx.borrow();
         (rx, epoch)
@@ -616,14 +628,15 @@ static PROMISES_DEFAULT: RwLock<Option<Arc<Channel>>> = RwLock::new(None);
 
 /// The channel a call through `api` goes to. A query holds its own `Arc`, so a
 /// setServers() during it changes the NEXT query, never one in flight.
-fn channel(api: Api) -> Arc<Channel> {
+fn channel(instances: &DnsInstances, api: Api) -> Arc<Channel> {
     let slot = match api {
         Api::Callback => &CALLBACK_DEFAULT,
         Api::Promises => &PROMISES_DEFAULT,
         // An id with no instance (one already freed) falls back to the system
         // channel; the JS side never issues one.
         Api::Instance(id) => {
-            return with_instance(id, |instance| instance.channel.clone())
+            return instances
+                .with(id, |instance| instance.channel.clone())
                 .unwrap_or_else(system_channel);
         }
     };
@@ -636,8 +649,8 @@ fn channel(api: Api) -> Arc<Channel> {
 ///
 /// The system list is taken from the same `ResolverConfig` the system channel
 /// is built from, so what is reported is by construction what is queried.
-pub fn dns_get_servers(api: Api) -> Vec<String> {
-    channel(api).display.clone()
+pub fn dns_get_servers(instances: &DnsInstances, api: Api) -> Vec<String> {
+    channel(instances, api).display.clone()
 }
 
 /// `setServers()` through `api`: replace the default channel with `servers`
@@ -647,7 +660,7 @@ pub fn dns_get_servers(api: Api) -> Vec<String> {
 /// instance, of that instance alone, keeping its timing and local addresses.
 /// An empty list is accepted, as node accepts it; every query then fails
 /// (`no_servers`).
-pub fn dns_set_servers(api: Api, servers: &[(IpAddr, u16)]) {
+pub fn dns_set_servers(instances: &DnsInstances, api: Api, servers: &[(IpAddr, u16)]) {
     let name_servers = servers
         .iter()
         .map(|&(ip, port)| {
@@ -662,7 +675,7 @@ pub fn dns_set_servers(api: Api, servers: &[(IpAddr, u16)]) {
         Api::Callback => None,
         Api::Promises => Some(&PROMISES_DEFAULT),
         Api::Instance(id) => {
-            with_instance(id, |instance| {
+            instances.with(id, |instance| {
                 instance.channel = Arc::new(build_channel_with(
                     base(),
                     name_servers.clone(),
@@ -884,12 +897,13 @@ pub async fn dns_lookup(
 /// polled: a setServers() or cancel() later in the same tick must find this
 /// query already issued, as c-ares does.
 pub fn dns_resolve(
+    instances: &DnsInstances,
     hostname: String,
     rrtype: String,
     api: Api,
 ) -> impl Future<Output = OpOutcome> + Send + 'static {
-    let ch = channel(api);
-    let token = cancel_token(api);
+    let ch = channel(instances, api);
+    let token = cancel_token(instances, api);
     let target = hostname.clone();
     cancellable(token, resolve_on(ch, hostname, rrtype), move || {
         cancelled(&target)
@@ -1162,9 +1176,13 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
 /// A cancel() is the one failure that is not ENOTFOUND (measured:
 /// "getHostByAddr ECANCELLED <ip>"). The channel and cancel token are taken
 /// at the call, as for `dns_resolve`.
-pub fn dns_reverse(ip_str: String, api: Api) -> impl Future<Output = OpOutcome> + Send + 'static {
-    let ch = channel(api);
-    let token = cancel_token(api);
+pub fn dns_reverse(
+    instances: &DnsInstances,
+    ip_str: String,
+    api: Api,
+) -> impl Future<Output = OpOutcome> + Send + 'static {
+    let ch = channel(instances, api);
+    let token = cancel_token(instances, api);
     let target = ip_str.clone();
     cancellable(token, reverse_on(ch, ip_str), move || cancelled(&target))
 }
@@ -1212,7 +1230,10 @@ async fn reverse_on(ch: Arc<Channel>, ip_str: String) -> OpOutcome {
 /// status at success with nothing to parse, which node reports as ENODATA.
 /// No answer at all is ETIMEOUT, a port that refuses ECONNREFUSED, and a
 /// reply that does not parse EBADRESP (measured: a lone server sending a
-/// truncated datagram).
+/// truncated datagram). A socket that cannot be bound to a Resolver's
+/// setLocalAddress() is ECONNREFUSED too, c-ares's code for any socket it
+/// cannot open (measured: setLocalAddress('192.0.2.77'), an address the host
+/// does not have).
 fn query_error_code(e: &NetError) -> &'static str {
     use hickory_resolver::net::DnsError;
     use hickory_resolver::proto::op::ResponseCode;
@@ -1225,10 +1246,17 @@ fn query_error_code(e: &NetError) -> &'static str {
         NetError::Dns(DnsError::NoRecordsFound(no_records)) => no_records.response_code,
         NetError::Dns(DnsError::ResponseCode(code)) => *code,
         NetError::Timeout => return "ETIMEOUT",
+        // hickory's word for "no connection to the server could be made":
+        // a UDP socket that cannot be bound to a setLocalAddress() address
+        // (measured).
+        NetError::NoConnections => return "ECONNREFUSED",
         NetError::Io(io)
             if matches!(
                 io.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::AddrNotAvailable
+                    | std::io::ErrorKind::AddrInUse
             ) =>
         {
             return "ECONNREFUSED";
@@ -1312,6 +1340,15 @@ mod tests {
         assert_eq!(
             query_error_code(&NetError::Io(Arc::new(std::io::Error::from(
                 std::io::ErrorKind::ConnectionRefused
+            )))),
+            "ECONNREFUSED"
+        );
+        // A local address that cannot be bound (setLocalAddress): hickory
+        // reports the failed socket as NoConnections, or as the io error.
+        assert_eq!(query_error_code(&NetError::NoConnections), "ECONNREFUSED");
+        assert_eq!(
+            query_error_code(&NetError::Io(Arc::new(std::io::Error::from(
+                std::io::ErrorKind::AddrNotAvailable
             )))),
             "ECONNREFUSED"
         );
@@ -1653,13 +1690,15 @@ mod tests {
     #[tokio::test]
     async fn reverse_reports_nodata_as_enotfound_where_resolve_ptr_keeps_enodata() {
         // Through the promises slot, which no other test touches.
+        let reg = DnsInstances::default();
         let nodata = fake(Reply::Empty(0)).await;
         dns_set_servers(
+            &reg,
             Api::Promises,
             &[("127.0.0.1".parse().unwrap(), nodata.port)],
         );
         assert_eq!(
-            dns_get_servers(Api::Promises),
+            dns_get_servers(&reg, Api::Promises),
             vec![format!("127.0.0.1:{}", nodata.port)]
         );
         let code = |outcome: OpOutcome| match outcome {
@@ -1667,23 +1706,31 @@ mod tests {
             _ => "not a NodeFailed".to_string(),
         };
         assert_eq!(
-            code(dns_reverse("192.0.2.5".into(), Api::Promises).await),
+            code(dns_reverse(&reg, "192.0.2.5".into(), Api::Promises).await),
             "ENOTFOUND"
         );
         assert_eq!(
-            code(dns_resolve("5.2.0.192.in-addr.arpa".into(), "PTR".into(), Api::Promises).await),
+            code(
+                dns_resolve(
+                    &reg,
+                    "5.2.0.192.in-addr.arpa".into(),
+                    "PTR".into(),
+                    Api::Promises
+                )
+                .await
+            ),
             "ENODATA"
         );
 
         // An empty list: a query is c-ares's ENOSERVER, a reverse ENOTFOUND.
-        dns_set_servers(Api::Promises, &[]);
-        assert!(dns_get_servers(Api::Promises).is_empty());
+        dns_set_servers(&reg, Api::Promises, &[]);
+        assert!(dns_get_servers(&reg, Api::Promises).is_empty());
         assert_eq!(
-            code(dns_reverse("192.0.2.5".into(), Api::Promises).await),
+            code(dns_reverse(&reg, "192.0.2.5".into(), Api::Promises).await),
             "ENOTFOUND"
         );
         assert_eq!(
-            code(dns_resolve("g.example".into(), "A".into(), Api::Promises).await),
+            code(dns_resolve(&reg, "g.example".into(), "A".into(), Api::Promises).await),
             "UNKNOWN_ARES_ERROR"
         );
     }
@@ -1725,38 +1772,42 @@ mod tests {
 
     #[tokio::test]
     async fn an_instance_has_its_own_servers_and_cancel() {
+        let reg = DnsInstances::default();
         let one = fake(Reply::Answer {
             octet: 1,
             delay_ms: 0,
         })
         .await;
         let silent = fake(Reply::Silent).await;
-        let a = Api::Instance(dns_resolver_new(-1, 4, 0));
-        let b = Api::Instance(dns_resolver_new(100, 1, 0));
-        let system = dns_get_servers(Api::Instance(dns_resolver_new(-1, 4, 0)));
-        dns_set_servers(a, &[("127.0.0.1".parse().unwrap(), one.port)]);
-        dns_set_servers(b, &[("127.0.0.1".parse().unwrap(), silent.port)]);
-        assert_eq!(dns_get_servers(a), vec![format!("127.0.0.1:{}", one.port)]);
+        let a = Api::Instance(dns_resolver_new(&reg, -1, 4, 0));
+        let b = Api::Instance(dns_resolver_new(&reg, 100, 1, 0));
+        let system = dns_get_servers(&reg, Api::Instance(dns_resolver_new(&reg, -1, 4, 0)));
+        dns_set_servers(&reg, a, &[("127.0.0.1".parse().unwrap(), one.port)]);
+        dns_set_servers(&reg, b, &[("127.0.0.1".parse().unwrap(), silent.port)]);
         assert_eq!(
-            dns_get_servers(b),
+            dns_get_servers(&reg, a),
+            vec![format!("127.0.0.1:{}", one.port)]
+        );
+        assert_eq!(
+            dns_get_servers(&reg, b),
             vec![format!("127.0.0.1:{}", silent.port)]
         );
-        assert_eq!(dns_get_servers(Api::Callback), system);
-        match dns_resolve("x.example".into(), "A".into(), a).await {
+        assert_eq!(dns_get_servers(&reg, Api::Callback), system);
+        match dns_resolve(&reg, "x.example".into(), "A".into(), a).await {
             OpOutcome::Json(json) => assert_eq!(json, r#"["10.0.0.1"]"#),
             other => panic!("expected records, got {other:?}"),
         }
 
         // A cancel() after the query is issued -- before its future is even
         // polled -- fails it; the instance stays usable.
-        let pending = dns_resolve("c.example".into(), "A".into(), b);
-        dns_cancel(b);
+        let pending = dns_resolve(&reg, "c.example".into(), "A".into(), b);
+        dns_cancel(&reg, b);
         match pending.await {
             OpOutcome::NodeFailed { code, .. } => assert_eq!(code, "ECANCELLED"),
             other => panic!("expected ECANCELLED, got {other:?}"),
         }
-        let pending = dns_reverse("192.0.2.9".into(), b);
-        dns_cancel(a); // another instance's cancel does not reach it
+        let pending = dns_reverse(&reg, "192.0.2.9".into(), b);
+        dns_cancel(&reg, a); // another instance's cancel does not reach it
         match pending.await {
             OpOutcome::NodeFailed { code, .. } => assert_eq!(code, "ENOTFOUND"),
             other => panic!("expected the timeout's ENOTFOUND, got {other:?}"),
@@ -1764,7 +1815,7 @@ mod tests {
 
         // A freed instance's id falls back to the system channel.
         let Api::Instance(id) = a else { unreachable!() };
-        dns_resolver_free(id);
-        assert_eq!(dns_get_servers(a), system);
+        dns_resolver_free(&reg, id);
+        assert_eq!(dns_get_servers(&reg, a), system);
     }
 }
