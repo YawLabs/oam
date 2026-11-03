@@ -48,6 +48,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `ERR_INVALID_ARG_VALUE`. `reverse()` of something that is not an IP address fails
   `getHostByAddr EINVAL`, synchronously from the callback API and as a rejection from the
   promises API, as in node.
+- **On Linux and macOS, what a child with extra stdio fds writes just before it exits is no
+  longer lost.** A child spawned with a `stdio` array past fd 2 had every parent-side pipe end
+  closed when its exit was collected, read ends included, so output the parent had not read
+  yet was dropped and the stream ended early (seen as conformance case 63 losing its second
+  stdout line under load). The read ends now stay open until their own EOF, as on Windows
+  since 0.19.1 (#456).
 - **A DNS query to a server that does not answer is sent once per try, as c-ares sends it.**
   oam's resolver resent an unanswered UDP query about every 340 ms within one wait, so a
   silent server got up to three datagrams per try where node sends one.

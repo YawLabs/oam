@@ -21,15 +21,17 @@
 //! reports what fd 4 carried and whether the sleeper's alive flag still
 //! existed when fd 4 reached its end.
 //!
-//! Why the handshake: oam's own reader of a child's extra-fd pipe ends the
-//! stream when the child is reaped if no read is in flight at that moment
-//! (raw_wait closes the parent's idle pipe end), which node does not do. A
-//! child that wrote `x` just before exiting raced that: the outer's read of
-//! `x` could complete after the reap, the pipe end was then closed, and fd 4
-//! "ended" at the child's exit whether or not the sleeper held it, so the
-//! oracle passed with the leak in place. Writing `x` first and waiting for
-//! the outer's got.flag puts the outer's next read in flight long before the
-//! child exits, and an in-flight read ends only at the pipe's real EOF. On
+//! Why the handshake: up to 0.19.2 oam's reader of a child's extra-fd pipe
+//! ended the stream when the child was reaped if no read was in flight at
+//! that moment (raw_wait closed the parent's idle pipe end; fixed on Windows
+//! by #419 and on unix by #456), which node does not do. A child that wrote
+//! `x` just before exiting raced that: the outer's read of `x` could complete
+//! after the reap, the pipe end was then closed, and fd 4 "ended" at the
+//! child's exit whether or not the sleeper held it, so the oracle passed with
+//! the leak in place. The handshake stays so the oracle does not depend on
+//! that fix: writing `x` first and waiting for the outer's got.flag puts the
+//! outer's next read in flight long before the child exits, and an in-flight
+//! read ends only at the pipe's real EOF. On
 //! Windows
 //! the sleeper is detached, since a non-detached child dies with its parent's
 //! kill-on-close job (child_job.rs); on unix it is an ordinary child, because

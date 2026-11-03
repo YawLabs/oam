@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "0fcaa261",
+  "commit": "6d5f6c3c",
   "oamVersion": "oam 0.19.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 417,
-      "total": 418,
+      "pass": 418,
+      "total": 419,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -1521,6 +1521,10 @@
         },
         {
           "case": "584-dns-resolver-instances.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "585-child-extra-fd-tail-after-reap.mjs",
           "status": "pass"
         },
         {

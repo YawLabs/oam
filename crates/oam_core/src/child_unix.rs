@@ -363,7 +363,31 @@ pub fn spawn_extra(
     })
 }
 
+/// A read end that is done (EOF, a read error, a join failure) or closed by
+/// the caller leaves the registry, and the entry goes with the last end once
+/// the child is reaped -- the Windows backend's `retire_read_end` (#419), here
+/// for #456. Until then the entry outlives the reap so the readers can drain
+/// what the child wrote just before it exited.
+///
+/// `reaped`, not `child.is_none()`, says the exit is collected: `raw_wait`
+/// takes the `Child` at its first poll, long before the child exits.
+fn retire_end(reg: &RawChildRegistry, id: u64, fd: u32) -> Option<OwnedFd> {
+    let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
+    let child = guard.get_mut(&id)?;
+    let end = child.fds.remove(&fd).and_then(|end| end.fd);
+    if child.fds.is_empty() && child.reaped {
+        guard.remove(&id);
+    }
+    // Returned so the caller closes it outside the lock.
+    end
+}
+
 /// Read up to 64 KiB from a parent-readable fd end. EOF (0 bytes) -> Done.
+///
+/// The end outlives `raw_wait`: a read after the child was reaped still gets
+/// whatever is buffered in the pipe, and EOF only when the pipe is empty and
+/// every write end is closed (a grandchild holding one keeps it open, as in
+/// node). EOF, an error or a join failure retires the end (`retire_end`).
 pub async fn raw_read(reg: RawChildRegistry, id: u64, fd: u32) -> OpOutcome {
     let raw = {
         let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
@@ -416,16 +440,26 @@ pub async fn raw_read(reg: RawChildRegistry, id: u64, fd: u32) -> OpOutcome {
             if let Some(end) = guard.get_mut(&id).and_then(|c| c.fds.get_mut(&fd)) {
                 end.fd = Some(end_fd);
             }
-            // else: the registry entry vanished mid-op, so `end_fd` has no other
-            // owner and closes as it goes out of scope here.
+            // else: the caller closed this end mid-read (raw_close_fd removed
+            // its slot), so `end_fd` has no other owner and closes as it goes
+            // out of scope here.
             OpOutcome::Bytes(bytes)
         }
-        // EOF: the end is not re-inserted, so it closes here.
-        Ok(Ok((_end_fd, None))) => OpOutcome::Done,
-        Ok(Err(e)) => OpOutcome::Failed(e),
+        // EOF: the end is not re-inserted, so it closes here; its slot goes.
+        Ok(Ok((_end_fd, None))) => {
+            retire_end(&reg, id, fd);
+            OpOutcome::Done
+        }
+        Ok(Err(e)) => {
+            retire_end(&reg, id, fd);
+            OpOutcome::Failed(e)
+        }
         // The blocking task took ownership of the end, so a join failure closed
         // it while unwinding.
-        Err(e) => OpOutcome::Failed(format!("read join: {e}")),
+        Err(e) => {
+            retire_end(&reg, id, fd);
+            OpOutcome::Failed(format!("read join: {e}"))
+        }
     }
 }
 
@@ -473,13 +507,13 @@ pub async fn raw_write(reg: RawChildRegistry, id: u64, fd: u32, data: Vec<u8>) -
     }
 }
 
-/// Close one parent-side fd end (e.g. end stdin / a CDP pipe).
+/// Close one parent-side fd end (e.g. end stdin / a CDP pipe, or a read
+/// stream the caller destroyed). The slot goes with it, so a reaped child's
+/// entry leaves the registry once its last end is closed. A read in flight on
+/// the end finds its slot gone and closes the descriptor when it returns.
 pub fn raw_close_fd(reg: &RawChildRegistry, id: u64, fd: u32) {
-    let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(end) = guard.get_mut(&id).and_then(|c| c.fds.get_mut(&fd)) {
-        // Taking the end out of the registry drops it here, which IS the close.
-        drop(end.fd.take());
-    }
+    // Dropping the returned end, outside the lock, IS the close.
+    drop(retire_end(reg, id, fd));
 }
 
 /// Deliver the kill signal. `raw_wait`'s blocking `Child::wait` then returns
@@ -550,8 +584,9 @@ pub(crate) fn deliver_signal(pid: u32, signum: i32) {
     let _ = rustix::process::kill_process(pid, sig);
 }
 
-/// Wait for exit; returns Node-shaped {code, signal}. Closes all remaining
-/// parent-side fds and drops the registry entry.
+/// Wait for exit; returns Node-shaped {code, signal}. Closes the parent's
+/// WRITE ends; the read ends stay until their readers reach EOF (or the caller
+/// closes them), and the registry entry goes with the last one.
 pub async fn raw_wait(reg: RawChildRegistry, id: u64) -> OpOutcome {
     let taken = {
         let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
@@ -582,21 +617,45 @@ pub async fn raw_wait(reg: RawChildRegistry, id: u64) -> OpOutcome {
         .await
     };
 
-    // Drop the entry, close every fd we still own. The recorded kill_signal is
-    // deliberately NOT consulted below: on Unix the real ExitStatus is the
-    // source of truth (mirrors `exit_report` in child.rs), so a child that
-    // caught our signal and exited 0 reports {code:0, signal:null} like Node,
-    // not a phantom signal death.
-    let fds = {
+    // Close the write ends (stdin and any parent-to-child fd: the child is gone,
+    // nothing reads them) and keep the read ends. Dropping the read ends here
+    // threw away whatever the child wrote between the parent's last read and
+    // its exit -- the next read found no entry and reported EOF with the tail
+    // still in the pipe (#456, conformance case 63 under load; the Windows
+    // backend had the same bug, #419). The entry stays while any end remains,
+    // including a read end out on an in-flight read (`fd: None`), so that read
+    // can put it back; `retire_end` drops the entry with the last one.
+    //
+    // The recorded kill_signal is deliberately NOT consulted below: on Unix
+    // the real ExitStatus is the source of truth (mirrors `exit_report` in
+    // child.rs), so a child that caught our signal and exited 0 reports
+    // {code:0, signal:null} like Node, not a phantom signal death.
+    let write_ends: Vec<FdEnd> = {
         let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.remove(&id) {
-            Some(c) => c.fds,
-            None => HashMap::new(),
+        match guard.get_mut(&id) {
+            Some(c) => {
+                let writable: Vec<u32> = c
+                    .fds
+                    .iter()
+                    .filter(|(_, end)| !end.readable)
+                    .map(|(&fd, _)| fd)
+                    .collect();
+                let ends = writable
+                    .into_iter()
+                    .filter_map(|fd| c.fds.remove(&fd))
+                    .collect();
+                if c.fds.is_empty() {
+                    guard.remove(&id);
+                }
+                ends
+            }
+            None => Vec::new(),
         }
     };
-    // Removed from the registry above, so this fn is the sole owner of every
-    // remaining pipe end -- dropping the map closes each exactly once.
-    drop(fds);
+    // Out of the registry, so this fn is their sole owner: dropping them,
+    // outside the lock, closes each exactly once. A write in flight holds its
+    // own end and closes it when it finds the slot gone.
+    drop(write_ends);
 
     match status {
         Ok(Ok(st)) => {
