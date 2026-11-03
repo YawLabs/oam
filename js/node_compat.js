@@ -38959,20 +38959,90 @@
       return _dnsLookup(hostname, family, all, hints);
     }
 
-    function lookup(hostname, options, callback) {
-      if (typeof options === "function") {
-        callback = options;
-        options = {};
+    // node's internal/dns/utils emitInvalidHostnameWarning: DEP0118 for a
+    // falsy hostname, once per process across dns.lookup and
+    // dns.promises.lookup. It goes through process.emitWarning, so
+    // noDeprecation drops it (and still spends the once) and throwDeprecation
+    // turns it into an uncaught exception on a later tick, as in node.
+    let invalidHostnameWarned = false;
+    function warnInvalidHostname(hostname) {
+      if (invalidHostnameWarned) return;
+      process.emitWarning(
+        `The provided hostname "${String(hostname)}" is not a valid ` +
+          "hostname, and is supported in the dns module solely for compatibility.",
+        "DeprecationWarning",
+        "DEP0118",
+      );
+      invalidHostnameWarned = true;
+    }
+
+    // node's lookup argument parsing, shared by both entry points (lib/dns.js
+    // lookup and internal/dns/promises.js lookup run the same checks in the
+    // same order): a truthy hostname must be a string -- a falsy one of any
+    // type is the compatibility case below -- and options is a family
+    // number, an object, null or undefined. `checkCallback` is the callback
+    // API's validateFunction, which node runs at the point it decides which
+    // argument is the callback. `namedFamilies` is the callback API's
+    // 'IPv4' / 'IPv6' spelling of options.family; the promises API takes only
+    // 0, 4 and 6. Returns { family, hints, all }.
+    function parseLookupArgs(hostname, options, checkCallback, namedFamilies) {
+      if (hostname && typeof hostname !== "string") {
+        throw codes.ERR_INVALID_ARG_TYPE("hostname", "string", hostname);
       }
-      let family;
       if (typeof options === "number") {
-        family = validateDnsFamily(options, "family");
-        options = {};
+        checkCallback();
+        return { family: validateDnsFamily(options, "family"), hints: 0, all: false };
       }
+      if (options !== undefined && typeof options !== "object") {
+        checkCallback(true);
+        throw codes.ERR_INVALID_ARG_TYPE("options", ["integer", "object"], options);
+      }
+      checkCallback();
       const opts = options || {};
       const hints = lookupHints(opts);
-      if (family === undefined) family = validateDnsFamily(opts.family, "options.family");
-      const all = !!opts.all;
+      if (!namedFamilies && typeof opts.family === "string") {
+        throw codes.ERR_INVALID_ARG_VALUE("options.family", opts.family, "must be one of: 0, 4, 6");
+      }
+      const family = validateDnsFamily(opts.family, "options.family");
+      let all = false;
+      if (opts.all != null) {
+        if (typeof opts.all !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.all", "boolean", opts.all);
+        }
+        all = opts.all;
+      }
+      return { family, hints, all };
+    }
+
+    function lookup(hostname, options, callback) {
+      let parsed;
+      if (typeof options === "function") {
+        if (hostname && typeof hostname !== "string") {
+          throw codes.ERR_INVALID_ARG_TYPE("hostname", "string", hostname);
+        }
+        callback = options;
+        parsed = { family: 0, hints: 0, all: false };
+      } else {
+        // node validates the 2-argument form `lookup(host, notAFunction)` as
+        // the callback it must then be, before it reports a bad options.
+        const twoArgs = arguments.length === 2;
+        parsed = parseLookupArgs(hostname, options, (badOptions) => {
+          const cb = badOptions && twoArgs ? options : callback;
+          if (typeof cb !== "function") {
+            throw codes.ERR_INVALID_ARG_TYPE("callback", "function", cb);
+          }
+        }, true);
+      }
+      const { family, hints, all } = parsed;
+
+      // node answers a falsy hostname without the resolver, on the next tick,
+      // and returns a bare object where a real lookup returns its request.
+      if (!hostname) {
+        warnInvalidHostname(hostname);
+        if (all) process.nextTick(callback, null, []);
+        else process.nextTick(callback, null, null, family === 6 ? 6 : 4);
+        return {};
+      }
 
       _dnsLookupHinted(hostname, family, all, hints).then(
         (result) => {
@@ -39097,15 +39167,16 @@
 
     const promises = {
       lookup(hostname, options) {
-        const numeric = typeof options === "number";
-        const opts = numeric ? {} : (options || {});
-        // node validates before it returns a promise: a bad `hints` or
-        // `family` throws.
-        const hints = lookupHints(opts);
-        const family = numeric
-          ? validateDnsFamily(options, "family")
-          : validateDnsFamily(opts.family, "options.family");
-        const all = !!opts.all;
+        // node validates before it returns a promise: a non-string hostname,
+        // a bad options, `hints`, `family` or `all` throws.
+        const { family, hints, all } = parseLookupArgs(hostname, options, () => {}, false);
+        // A falsy hostname resolves without the resolver (node's
+        // createLookupPromise): null with family 6 when 6 was asked for and 4
+        // otherwise, or [] with `all`.
+        if (!hostname) {
+          warnInvalidHostname(hostname);
+          return Promise.resolve(all ? [] : { address: null, family: family === 6 ? 6 : 4 });
+        }
         return _dnsLookupHinted(hostname, family, all, hints);
       },
       resolve(hostname, rrtype) {
