@@ -364,7 +364,7 @@ still wins. Only these tokens are accepted:
 
 ```
 --pending-deprecation   --no-warnings   --no-deprecation   --expose-gc
---trace-warnings   --trace-deprecation
+--trace-warnings   --trace-deprecation   --throw-deprecation
 --disable-warning[=]    --redirect-warnings[=]
 --max-http-header-size[=]   --insecure-http-parser   --trace-require-module[=]
 --tls-min-v1.0  --tls-min-v1.1  --tls-min-v1.2  --tls-min-v1.3  --tls-max-v1.2  --tls-max-v1.3

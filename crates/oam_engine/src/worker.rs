@@ -628,13 +628,15 @@ fn run_worker(
                        { value: true, writable: false, enumerable: false, configurable: false });",
                 );
             }
-            // Its own `--trace-warnings` / `--trace-deprecation`, defined on
+            // Its own `--trace-warnings` / `--trace-deprecation` /
+            // `--throw-deprecation`, defined on
             // its process as the CLI defines them on the main thread's, which
             // is where the default printer reads them. (With a builder, the
             // worker's resolved options carry them.)
             for (flag, name) in [
                 ("--trace-warnings", "traceProcessWarnings"),
                 ("--trace-deprecation", "traceDeprecation"),
+                ("--throw-deprecation", "throwDeprecation"),
             ] {
                 if exec_argv.iter().any(|arg| arg == flag) {
                     let _ = rt.execute_script(

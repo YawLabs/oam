@@ -556,6 +556,9 @@ fn main() -> ExitCode {
             } else if arg == "--trace-deprecation" {
                 flags.trace_deprecation = true;
                 i += 1;
+            } else if arg == "--throw-deprecation" {
+                flags.throw_deprecation = true;
+                i += 1;
             } else if arg == "--trace-uncaught" {
                 flags.trace_uncaught = true;
                 i += 1;
@@ -1919,6 +1922,8 @@ fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
             flags.trace_warnings = true;
         } else if tok == "--trace-deprecation" {
             flags.trace_deprecation = true;
+        } else if tok == "--throw-deprecation" {
+            flags.throw_deprecation = true;
         } else if tok == "--trace-uncaught" {
             flags.trace_uncaught = true;
         } else if tok == "--expose-gc" {
@@ -2734,6 +2739,10 @@ struct NodeFlags {
     /// read from `process.traceProcessWarnings` / `process.traceDeprecation`.
     trace_warnings: bool,
     trace_deprecation: bool,
+    /// `--throw-deprecation`: `process.throwDeprecation`, which makes
+    /// process.emitWarning throw a deprecation on the next tick instead of
+    /// printing it (`--no-deprecation` still wins, as in node).
+    throw_deprecation: bool,
     /// `--trace-uncaught`: a fatal report ends with the stack V8 captured
     /// at the throw (`Thrown at:`) instead of the hint naming this flag.
     trace_uncaught: bool,
@@ -2837,6 +2846,7 @@ impl NodeFlags {
             no_deprecation: env.no_deprecation || argv.no_deprecation,
             trace_warnings: env.trace_warnings || argv.trace_warnings,
             trace_deprecation: env.trace_deprecation || argv.trace_deprecation,
+            throw_deprecation: env.throw_deprecation || argv.throw_deprecation,
             trace_uncaught: env.trace_uncaught || argv.trace_uncaught,
             disabled_warnings: [env.disabled_warnings, argv.disabled_warnings.clone()].concat(),
             redirect_warnings: argv.redirect_warnings.clone().or(env.redirect_warnings),
@@ -2950,14 +2960,17 @@ impl NodeFlags {
         let def = define_flag_global;
         if self.no_deprecation {
             js.push_str(&def("__oamNoDeprecation", "true".into()));
-            js.push_str("globalThis.process.noDeprecation = true;");
         }
         // node defines these only when the flag is given (absent otherwise,
-        // not false), read-only, enumerable and configurable; the printer
-        // reads them on each warning, so a program can set them too.
+        // not false), read-only, enumerable and configurable (measured on
+        // v22.22.2, noDeprecation and throwDeprecation included; a plain
+        // assignment left noDeprecation writable); the printer reads them on
+        // each warning, so a program without the flag can still set them.
         for (set, name) in [
+            (self.no_deprecation, "noDeprecation"),
             (self.trace_warnings, "traceProcessWarnings"),
             (self.trace_deprecation, "traceDeprecation"),
+            (self.throw_deprecation, "throwDeprecation"),
         ] {
             if set {
                 js.push_str(&format!(
@@ -3149,6 +3162,9 @@ impl NodeFlags {
         }
         if self.trace_deprecation {
             out.push("--trace-deprecation".into());
+        }
+        if self.throw_deprecation {
+            out.push("--throw-deprecation".into());
         }
         if self.trace_uncaught {
             out.push("--trace-uncaught".into());
@@ -4317,6 +4333,21 @@ mod tests {
             argv_both.exec_argv(),
             vec!["--trace-warnings", "--trace-deprecation"]
         );
+    }
+
+    #[test]
+    fn throw_deprecation_comes_from_node_options_and_argv_and_only_argv_reflects_it() {
+        let mut env = super::NodeFlags::default();
+        assert!(super::apply_node_options(&mut env, "--throw-deprecation"));
+        assert!(env.throw_deprecation);
+        let merged = env.merged(super::NodeFlags::default());
+        assert!(merged.throw_deprecation);
+        assert!(merged.exec_argv().is_empty());
+        let argv = super::NodeFlags::default().merged(super::NodeFlags {
+            throw_deprecation: true,
+            ..Default::default()
+        });
+        assert_eq!(argv.exec_argv(), vec!["--throw-deprecation"]);
     }
 
     #[test]
