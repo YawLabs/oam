@@ -27657,6 +27657,12 @@
         // transport resolves with net's default for neither.
         (!literal && ((merged.hints != null && merged.hints !== 0) ||
           (merged.family != null && merged.family !== 0))) ||
+        // So does dns's result order (dns.setDefaultResultOrder(),
+        // --dns-result-order): net.connect's lookup applies it, oam's own
+        // transport does not, so a non-verbatim order takes the agent's
+        // socket (measured on node v22.22.2: http.get('localhost') under
+        // ipv4first dials 127.0.0.1).
+        (!literal && dnsResultOrder() !== "verbatim") ||
         socketLayerPatched(protocol === "https:") ||
         (protocol === "https:" && carriesTlsPolicy(merged)) ||
         // A socket an earlier request over this (stock) agent left in its

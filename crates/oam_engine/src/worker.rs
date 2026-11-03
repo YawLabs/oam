@@ -599,8 +599,15 @@ fn run_worker(
     // would otherwise start with none of them.
     match flags_js {
         Some((js, resolved)) => {
-            if !js.is_empty() {
-                let _ = rt.execute_script("<flags>", &js);
+            // A flag the worker's own options make it refuse (a bad
+            // --dns-result-order) throws here: node fails such a worker as it
+            // starts, its error printed by the worker and no 'error' event
+            // for the parent, which sees exit code 1 (measured on v22.22.2).
+            if !js.is_empty()
+                && let Err(error) = rt.execute_script("<flags>", &js)
+            {
+                eprintln!("{error}");
+                return 1;
             }
             // What a Worker this one creates with neither `env` nor
             // `execArgv` inherits.

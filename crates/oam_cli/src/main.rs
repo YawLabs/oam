@@ -544,12 +544,23 @@ fn main() -> ExitCode {
             } else if arg == "--dns-result-order" || arg.starts_with("--dns-result-order=") {
                 // The value is checked once both sources are in (below): node
                 // refuses a bad one from argv and NODE_OPTIONS alike, exit 1.
+                // A missing one (none, an empty `=`, or a next token that is
+                // itself a flag) is node's option parser's exit 9 instead.
                 let (value, spaced) = match arg.strip_prefix("--dns-result-order=") {
-                    Some(v) => (Some(v.to_string()), false),
-                    None => (raw.get(i + 1).cloned(), true),
+                    Some(v) => (Some(v.to_string()).filter(|v| !v.is_empty()), false),
+                    None => (
+                        raw.get(i + 1).filter(|v| !v.starts_with('-')).cloned(),
+                        true,
+                    ),
                 };
                 let Some(value) = value else {
-                    eprintln!("oam: --dns-result-order requires an argument");
+                    let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                    let flag = if spaced {
+                        "--dns-result-order"
+                    } else {
+                        "--dns-result-order="
+                    };
+                    eprintln!("{exe}: {flag} requires an argument");
                     return ExitCode::from(9);
                 };
                 flags.dns_result_order = Some(value);
@@ -736,15 +747,23 @@ fn main() -> ExitCode {
             eprintln!("{exe}: either --tls-min-v1.3 or --tls-max-v1.2 can be used, not both");
             return ExitCode::from(9);
         }
-        // node checks --dns-result-order in JS at startup (initializeDns),
-        // from argv or NODE_OPTIONS alike, and dies of the TypeError: exit 1,
-        // not 9 (measured on v22.22.2).
+        // A --dns-result-order with no value in NODE_OPTIONS: node's option
+        // parser refuses it before anything runs, exit 9 (argv's is refused
+        // where it is parsed, above).
+        if let Some(flag) = flags.dns_result_order_missing {
+            let exe = argv.first().map(String::as_str).unwrap_or("oam");
+            eprintln!("{exe}: {flag} requires an argument");
+            return ExitCode::from(9);
+        }
+        // node checks --dns-result-order's value in JS at startup
+        // (initializeDns), from argv or NODE_OPTIONS alike, and dies of the
+        // TypeError: exit 1, not 9 (measured on v22.22.2).
         if let Some(order) = &flags.dns_result_order
-            && !matches!(order.as_str(), "verbatim" | "ipv4first" | "ipv6first")
+            && !is_dns_result_order(order)
         {
             eprintln!(
-                "TypeError [ERR_INVALID_ARG_VALUE]: The argument '--dns-result-order' must be one of: \
-                 'verbatim', 'ipv4first', 'ipv6first'. Received '{order}'"
+                "TypeError [ERR_INVALID_ARG_VALUE]: {}",
+                dns_result_order_message(order)
             );
             return ExitCode::from(1);
         }
@@ -1941,11 +1960,18 @@ fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
                 flags.trace_require_module = Some(v.clone());
             }
         } else if let Some(v) = tok.strip_prefix("--dns-result-order=") {
-            flags.dns_result_order = Some(v.to_string());
-        } else if tok == "--dns-result-order"
-            && let Some(v) = it.next()
-        {
-            flags.dns_result_order = Some(v.clone());
+            if v.is_empty() {
+                flags.dns_result_order_missing = Some("--dns-result-order=");
+            } else {
+                flags.dns_result_order = Some(v.to_string());
+            }
+        } else if tok == "--dns-result-order" {
+            // node's parser takes the next token unless it is a flag, and
+            // refuses the option without one (exit 9), NODE_OPTIONS included.
+            match it.next_if(|v| !v.starts_with('-')) {
+                Some(v) => flags.dns_result_order = Some(v.clone()),
+                None => flags.dns_result_order_missing = Some("--dns-result-order"),
+            }
         } else if tok == "--no-warnings" {
             flags.no_warnings = true;
         } else if tok == "--no-deprecation" {
@@ -2016,6 +2042,20 @@ fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
         // Anything else: ignored on purpose (see the call site).
     }
     before != *flags
+}
+
+/// The values node's `--dns-result-order` takes.
+fn is_dns_result_order(value: &str) -> bool {
+    matches!(value, "verbatim" | "ipv4first" | "ipv6first")
+}
+
+/// node's ERR_INVALID_ARG_VALUE message for a bad `--dns-result-order`
+/// (the value as node's inspect quotes a plain string).
+fn dns_result_order_message(value: &str) -> String {
+    format!(
+        "The argument '--dns-result-order' must be one of: 'verbatim', 'ipv4first', \
+         'ipv6first'. Received '{value}'"
+    )
 }
 
 /// The values node's `--trace-require-module` takes.
@@ -2817,6 +2857,9 @@ struct NodeFlags {
     /// size.
     dns_result_order: Option<String>,
     dns_result_order_spaced: bool,
+    /// The spelling of a `--dns-result-order` given no value in
+    /// NODE_OPTIONS, which node refuses at startup with exit 9.
+    dns_result_order_missing: Option<&'static str>,
     /// `--tls-min-v1.0` / `--tls-min-v1.1` / `--tls-min-v1.2` /
     /// `--tls-min-v1.3` and `--tls-max-v1.2` / `--tls-max-v1.3`: the initial
     /// `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION`, so the default
@@ -2906,6 +2949,9 @@ impl NodeFlags {
             trace_require_module_spaced,
             dns_result_order,
             dns_result_order_spaced,
+            dns_result_order_missing: env
+                .dns_result_order_missing
+                .or(argv.dns_result_order_missing),
             insecure_http_parser: env.insecure_http_parser || argv.insecure_http_parser,
             tls_min_v1_0: env.tls_min_v1_0 || argv.tls_min_v1_0,
             tls_min_v1_1: env.tls_min_v1_1 || argv.tls_min_v1_1,
@@ -3045,12 +3091,23 @@ impl NodeFlags {
         if let Some(mode) = &self.trace_require_module {
             js.push_str(&def("__oamTraceRequireModule", format!("\"{mode}\"")));
         }
-        // node:dns reads it as the initial default result order; a value
-        // other than node's three (only a Worker's own execArgv can carry
-        // one this far) leaves the default, verbatim.
+        // node:dns reads it as the initial default result order. A value
+        // other than node's three can only reach here from a Worker's own
+        // execArgv (the main thread refused it at startup), and node fails
+        // that worker as it starts (initializeDns): the throw ends this
+        // snippet, which the worker treats as its startup failing.
         if let Some(order) = &self.dns_result_order {
-            let quoted = serde_json::to_string(order).unwrap_or_else(|_| "null".into());
-            js.push_str(&def("__oamDnsResultOrder", quoted));
+            if is_dns_result_order(order) {
+                let quoted = serde_json::to_string(order).unwrap_or_else(|_| "null".into());
+                js.push_str(&def("__oamDnsResultOrder", quoted));
+            } else {
+                let message = serde_json::to_string(&dns_result_order_message(order))
+                    .unwrap_or_else(|_| "\"\"".into());
+                js.push_str(&format!(
+                    "throw Object.assign(new TypeError({message}), \
+                       {{ code: 'ERR_INVALID_ARG_VALUE' }});"
+                ));
+            }
         }
         // node:tls reads these as the initial DEFAULT_MIN_VERSION /
         // DEFAULT_MAX_VERSION (the names are node's own four, so quoting
