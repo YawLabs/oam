@@ -18,10 +18,12 @@
 // printed is invariants, not address lists.
 import { spawnSync } from "node:child_process";
 import dns from "node:dns";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
+import { Worker, isMainThread } from "node:worker_threads";
 
-const scenario = process.argv[2];
+const scenario = isMainThread ? process.argv[2] : "in-worker";
 
 const families = (answer) => answer.map((a) => a.family).join("");
 // ipv4first / ipv6first of `verbatim`, by the definition node implements.
@@ -31,8 +33,20 @@ const partition = (verbatim, first) => [
 ];
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
-if (scenario === "report") {
+if (scenario === "in-worker") {
+  console.log("worker ran", dns.getDefaultResultOrder());
+} else if (scenario === "report") {
   console.log("default", dns.getDefaultResultOrder(), dns.promises.getDefaultResultOrder());
+} else if (scenario === "worker") {
+  // A Worker's own --dns-result-order: a bad one fails the worker as it
+  // starts (exit 1, no 'error' event); a good one is its default.
+  const start = (order) => new Promise((resolve) => {
+    const worker = new Worker(new URL(import.meta.url), { execArgv: [`--dns-result-order=${order}`] });
+    worker.on("error", (e) => console.log("worker error event", e.name, e.code));
+    worker.on("exit", (code) => { console.log(`worker with ${order} exit`, code); resolve(); });
+  });
+  await start("ipv6first");
+  await start("bogus");
 } else {
   console.log("default", dns.getDefaultResultOrder(), dns.promises.getDefaultResultOrder());
   console.log("same functions", dns.getDefaultResultOrder === dns.promises.getDefaultResultOrder,
@@ -97,15 +111,43 @@ if (scenario === "report") {
   dns.setDefaultResultOrder("verbatim");
   server.close();
 
+  // http.get over the stock agent follows the order too, to a server on
+  // both families: under ipv4first it arrives from 127.0.0.1.
+  const both = http.createServer((req, res) => res.end(req.socket.remoteAddress)).listen(0, "::");
+  await new Promise((resolve) => both.once("listening", resolve));
+  const get = () => new Promise((resolve) => {
+    http.get({ host: "localhost", port: both.address().port, agent: false }, (res) => {
+      let body = "";
+      res.on("data", (chunk) => (body += chunk));
+      res.on("end", () => resolve(body));
+    }).on("error", (e) => resolve(e.code));
+  });
+  for (const order of ["ipv4first", "ipv6first", "verbatim"]) {
+    dns.setDefaultResultOrder(order);
+    const from = await get();
+    const v4 = from === "::ffff:127.0.0.1" || from === "127.0.0.1";
+    const expect = order === "ipv4first"
+      ? true
+      : order === "ipv6first"
+        ? !localhost.some((a) => a.family === 6)
+        : localhost[0]?.family === 4;
+    console.log(`http.get under ${order} from IPv4`, v4 === expect);
+  }
+  dns.setDefaultResultOrder("verbatim");
+  both.close();
+
   // The flag.
   const run = (flags, env = {}) => {
     const child = spawnSync(process.execPath, [...flags, import.meta.filename, "report"], {
       encoding: "utf8",
       env: { ...process.env, ...env },
     });
-    const err = child.stderr.split(/\r?\n/).find((l) => l.includes("ERR_INVALID_ARG_VALUE")) ?? "";
+    const err = child.stderr.split(/\r?\n/)
+      .find((l) => l.includes("ERR_INVALID_ARG_VALUE") || l.includes("requires an argument")) ?? "";
     console.log(`## ${[...flags, ...Object.entries(env).map(([k, v]) => `${k}=${v}`)].join(" ")}`,
-      "exit", child.status, child.stdout.trim(), err.trim().replace(/^.*TypeError/, "TypeError"));
+      "exit", child.status, child.stdout.trim(),
+      // The executable's path heads node's option-parser line; it is not compared.
+      err.trim().replace(/^.*TypeError/, "TypeError").replace(/^.*?: (--dns-result-order)/, "$1"));
   };
   run(["--dns-result-order=ipv4first"]);
   run(["--dns-result-order", "ipv6first"]);
@@ -113,4 +155,14 @@ if (scenario === "report") {
   run(["--dns-result-order=ipv6first"], { NODE_OPTIONS: "--dns-result-order=ipv4first" });
   run(["--dns-result-order=bogus"]);
   run([], { NODE_OPTIONS: "--dns-result-order=bogus" });
+  // No value: node's option parser refuses it, exit 9.
+  run(["--dns-result-order="]);
+  run(["--dns-result-order", "--no-warnings"]);
+  run([], { NODE_OPTIONS: "--dns-result-order" });
+  run([], { NODE_OPTIONS: "--dns-result-order --no-warnings" });
+  run([], { NODE_OPTIONS: "--dns-result-order ipv6first" });
+
+  const worker = spawnSync(process.execPath, [import.meta.filename, "worker"], { encoding: "utf8" });
+  console.log("## worker", "exit", worker.status);
+  for (const line of worker.stdout.split(/\r?\n/)) if (line !== "") console.log(`  out | ${line}`);
 }

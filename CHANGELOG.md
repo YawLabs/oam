@@ -39,8 +39,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **`dns.getDefaultResultOrder()` and a working `dns.setDefaultResultOrder()`, on `dns` and
   `dns.promises`, and `--dns-result-order`** (also from `NODE_OPTIONS`). `setDefaultResultOrder`
   did nothing and the flag was refused; a lookup's `order` and `verbatim` options were checked
-  and then ignored. `dns.lookup()` and `net.connect()` now order their answers by them, as node
-  does.
+  and then ignored. `dns.lookup()`, `net.connect()` and `http`/`https` requests now order their
+  answers by them, as node does.
 - **`--throw-deprecation`** (also from `NODE_OPTIONS` and a `Worker`'s `execArgv`): a
   deprecation warning is thrown on the next tick instead of printed. It was refused with exit
   code 2. `process.noDeprecation` under `--no-deprecation` is read-only, as in node.
@@ -50,6 +50,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **`dns.NOTFOUND` and the other c-ares error-code constants are the codes errors carry.**
   They were the bare names (`dns.NOTFOUND === "NOTFOUND"`), so `err.code === dns.NOTFOUND`
   never held; they are now node's strings (`"ENOTFOUND"`, `"ETIMEOUT"`, ...).
+- **`os.hostname()` is the system's host name.** It read the `COMPUTERNAME` / `HOSTNAME`
+  environment variables, so it answered `localhost` on macOS, where neither is set, and the
+  upper-case NetBIOS name on Windows (`WOODS` where node says `woods`).
 - **`{ ttl: true }` on `resolve4()` / `resolve6()` reports each record's TTL as served.** It
   reported `ttl: 0` for every address.
 - **Every DNS query is sent to the server, as c-ares sends it.** oam's resolver kept an answer
