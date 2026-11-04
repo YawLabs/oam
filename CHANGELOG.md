@@ -88,6 +88,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   oam's resolver resent an unanswered UDP query about every 340 ms within one wait, so a
   silent server got up to three datagrams per try where node sends one.
 
+- **On Windows, a DNS answer no longer goes to another socket on the same port.** Each
+  query's random source port was bound without exclusive use, and Windows lets that bind
+  share a port another socket holds on 127.0.0.1, delivering the answer to that socket; the
+  query then waited out its timeout. The port is now bound exclusively and picked again when
+  taken.
+
 - **`dns.reverse()` fails with `ENOTFOUND` whenever the lookup fails, as node does.** A name
   that exists but has no PTR record answered `ENODATA`; node's reverse goes through c-ares'
   `ares_gethostbyaddr`, which reports every failed reverse lookup as `ENOTFOUND`.

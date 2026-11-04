@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
@@ -10,7 +12,7 @@ use hickory_resolver::config::{
     ServerOrderingStrategy,
 };
 use hickory_resolver::net::NetError;
-use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::runtime::{RuntimeProvider, TokioRuntimeProvider};
 use hickory_resolver::net::udp::UdpClientStream;
 use hickory_resolver::net::xfer::{DnsExchange, DnsHandle, FirstAnswer};
 use hickory_resolver::proto::op::{DnsRequestOptions, Query, ResponseCode};
@@ -76,14 +78,14 @@ use super::OpOutcome;
 /// node v22.22.2: `{timeout: 100, tries: 2}` against a silent server is asked
 /// exactly twice, where oam asked it three times). The walk already owns the
 /// tries, so the stream's own retransmission is turned off here; TCP and the
-/// rest are hickory's unchanged.
+/// rest are hickory's unchanged. Its UDP sockets come from `CaresRuntime`.
 #[derive(Clone, Default)]
-struct CaresProvider(TokioRuntimeProvider);
+struct CaresProvider(CaresRuntime);
 
 impl ConnectionProvider for CaresProvider {
-    type Conn = <TokioRuntimeProvider as ConnectionProvider>::Conn;
-    type FutureConn = <TokioRuntimeProvider as ConnectionProvider>::FutureConn;
-    type RuntimeProvider = TokioRuntimeProvider;
+    type Conn = <CaresRuntime as ConnectionProvider>::Conn;
+    type FutureConn = <CaresRuntime as ConnectionProvider>::FutureConn;
+    type RuntimeProvider = CaresRuntime;
 
     fn new_connection(
         &self,
@@ -102,7 +104,7 @@ impl ConnectionProvider for CaresProvider {
             .with_bind_addr(config.bind_addr)
             .with_max_retries(1);
         Ok(Box::pin(async move {
-            let exchange: DnsExchange<TokioRuntimeProvider> = stream.exchange();
+            let exchange: DnsExchange<CaresRuntime> = stream.exchange();
             Ok(exchange)
         }))
     }
@@ -110,6 +112,104 @@ impl ConnectionProvider for CaresProvider {
     fn runtime_provider(&self) -> &Self::RuntimeProvider {
         &self.0
     }
+}
+
+/// tokio's runtime for hickory, except that on Windows a UDP socket is bound
+/// with SO_EXCLUSIVEADDRUSE (`bind_udp_exclusive`).
+///
+/// hickory picks each query's source port itself, at random in 1024-65535,
+/// and binds the wildcard address (or setLocalAddress's). Windows lets a plain
+/// bind share a port that another socket holds on a more specific address, in
+/// either order, and delivers a datagram to the most specific socket (measured:
+/// with node:dgram on 127.0.0.1:P, a bind of 0.0.0.0:P succeeds and a datagram
+/// to 127.0.0.1:P reaches node's socket). So whenever hickory's pick landed on
+/// a port held on 127.0.0.1 -- one of the process's own dgram sockets, a local
+/// forwarder's, anything's -- the answer went to that socket and the query
+/// waited out its timeout (conformance case 581 caught it: a fake server was
+/// "asked" a reply meant for a query to another one). With
+/// SO_EXCLUSIVEADDRUSE the shared bind fails WSAEADDRINUSE, which hickory's
+/// bind loop already answers by picking another random port, and no socket can
+/// later bind the same port on a specific address while the query is out.
+///
+/// Letting the OS choose the port (hickory's os_port_selection, what c-ares
+/// and so node do) would also avoid a held port, but Windows hands out
+/// ephemeral UDP ports sequentially (measured: node's DNS queries came from
+/// 56827, 56828, 56829, ...), and a predictable source port leaves only the
+/// 16-bit query id against a spoofed answer. Linux and macOS refuse the shared
+/// bind with EADDRINUSE, so hickory's plain bind already moves on there.
+#[derive(Clone, Default)]
+struct CaresRuntime(TokioRuntimeProvider);
+
+impl RuntimeProvider for CaresRuntime {
+    type Handle = <TokioRuntimeProvider as RuntimeProvider>::Handle;
+    type Timer = <TokioRuntimeProvider as RuntimeProvider>::Timer;
+    type Udp = tokio::net::UdpSocket;
+    type Tcp = <TokioRuntimeProvider as RuntimeProvider>::Tcp;
+
+    fn create_handle(&self) -> Self::Handle {
+        self.0.create_handle()
+    }
+
+    fn connect_tcp(
+        &self,
+        server_addr: SocketAddr,
+        bind_addr: Option<SocketAddr>,
+        timeout: Option<Duration>,
+    ) -> Pin<Box<dyn Send + Future<Output = io::Result<Self::Tcp>>>> {
+        self.0.connect_tcp(server_addr, bind_addr, timeout)
+    }
+
+    #[cfg(windows)]
+    fn bind_udp(
+        &self,
+        local_addr: SocketAddr,
+        _server_addr: SocketAddr,
+    ) -> Pin<Box<dyn Send + Future<Output = io::Result<Self::Udp>>>> {
+        Box::pin(async move { bind_udp_exclusive(local_addr) })
+    }
+
+    #[cfg(not(windows))]
+    fn bind_udp(
+        &self,
+        local_addr: SocketAddr,
+        server_addr: SocketAddr,
+    ) -> Pin<Box<dyn Send + Future<Output = io::Result<Self::Udp>>>> {
+        self.0.bind_udp(local_addr, server_addr)
+    }
+}
+
+/// A tokio UDP socket bound to `local` with SO_EXCLUSIVEADDRUSE set first, so
+/// the bind fails WSAEADDRINUSE (`io::ErrorKind::AddrInUse`) when any socket
+/// holds the port on any address, and no other socket can bind the port on
+/// any address while this one lives. Otherwise what tokio's own bind does:
+/// socket2 creates the socket non-inheritable and overlapped, as std does.
+#[cfg(windows)]
+fn bind_udp_exclusive(local: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        SO_EXCLUSIVEADDRUSE, SOCKET, SOCKET_ERROR, SOL_SOCKET, setsockopt,
+    };
+    let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
+    let on: i32 = 1;
+    // SAFETY: a synchronous setsockopt on a socket `socket` owns for the whole
+    // call; the option value points at the live i32 `on` and the length is
+    // that i32's size; nothing is read after the call returns.
+    let rc = unsafe {
+        setsockopt(
+            socket.as_raw_socket() as SOCKET,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&on as *const i32).cast(),
+            std::mem::size_of::<i32>() as i32,
+        )
+    };
+    if rc == SOCKET_ERROR {
+        return Err(io::Error::last_os_error());
+    }
+    socket.bind(&local.into())?;
+    socket.set_nonblocking(true)?;
+    tokio::net::UdpSocket::from_std(socket.into())
 }
 
 /// The single-server resolver each channel server is.
@@ -1870,6 +1970,71 @@ mod tests {
             .unwrap_err();
         assert_eq!(query_error_code(&err), "EBADRESP");
         assert_eq!(alone.asked.load(Ordering::SeqCst), 4);
+    }
+
+    /// Windows lets a wildcard UDP bind share a port another socket holds on
+    /// 127.0.0.1, and delivers the reply to that other socket. With hickory
+    /// choosing source ports from 1024-65535, about 4000 squatters on
+    /// 127.0.0.1 took ~6% of its picks, so 100 clean queries happened about
+    /// 0.2% of the time (the shape of conformance case 581's flake). An
+    /// exclusive bind (`CaresRuntime`) fails on a held port and hickory picks
+    /// again. Windows only: Linux and macOS refuse the shared bind anyway, and
+    /// their default open-file limits do not fit the squatters.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_reply_never_lands_on_another_local_socket() {
+        let squatters: Vec<std::net::UdpSocket> = (0..4000)
+            .filter_map(|_| std::net::UdpSocket::bind("127.0.0.1:0").ok())
+            .collect();
+        assert!(squatters.len() > 3000, "bound {}", squatters.len());
+        let live = fake(Reply::Answer {
+            octet: 5,
+            delay_ms: 0,
+        })
+        .await;
+        // One try: a reply that went to a squatter is this query's timeout.
+        let ch = test_channel(&[&live], 1);
+        let mut failed = Vec::new();
+        for i in 0..100 {
+            if let Err(e) = channel_lookup(&ch, &format!("s{i}.example."), RecordType::A).await {
+                failed.push(format!("s{i}: {}", query_error_code(&e)));
+            }
+        }
+        let mut misdelivered = 0;
+        let mut buf = [0u8; 1500];
+        for s in &squatters {
+            s.set_nonblocking(true).unwrap();
+            while s.recv_from(&mut buf).is_ok() {
+                misdelivered += 1;
+            }
+        }
+        assert_eq!(misdelivered, 0, "replies delivered to squatters");
+        assert!(
+            failed.is_empty(),
+            "queries that lost their reply: {failed:?}"
+        );
+        assert_eq!(live.asked.load(Ordering::SeqCst), 100);
+    }
+
+    /// Both directions of the Windows overlap: the exclusive wildcard bind
+    /// fails on a port held on 127.0.0.1, and while it lives no socket can
+    /// take its port on 127.0.0.1.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_exclusive_bind_shares_its_port_with_no_socket() {
+        let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        // A plain bind shares it (the bug's precondition)...
+        assert!(std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok());
+        // ...the exclusive one does not.
+        let err = bind_udp_exclusive(SocketAddr::from(([0, 0, 0, 0], port))).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+
+        let ours = bind_udp_exclusive(SocketAddr::from(([0, 0, 0, 0], 0))).unwrap();
+        let port = ours.local_addr().unwrap().port();
+        // Windows refuses a bind beside an exclusive socket with WSAEACCES.
+        let err = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[tokio::test]
