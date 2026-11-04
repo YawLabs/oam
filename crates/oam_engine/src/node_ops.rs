@@ -2991,6 +2991,16 @@ fn tty_switch(fd: i32, enable: bool, at_exit: bool) -> i32 {
     // pthread_sigmask reads them through pointers to that live stack storage;
     // its old-set pointer on the restoring call is null, which it permits.
     unsafe {
+        // tcsetattr, again for as long as a signal interrupts it, as libuv's
+        // uv__tcsetattr does. A TCSADRAIN set waits for queued output to
+        // drain, so a signal can land mid-wait; reporting that EINTR failed
+        // setRawMode, and on disable left the tty raw until the exit hook.
+        let set_attr = |how: libc::c_int, term: &libc::termios| loop {
+            let rc = libc::tcsetattr(fd, how, term);
+            if rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break rc;
+            }
+        };
         // Held across the whole switch, so the mode check and the mode change
         // cannot interleave. Poisoning is recovered rather than swallowed: a
         // dropped `PoisonError` here used to skip the SAVE while still
@@ -3021,7 +3031,7 @@ fn tty_switch(fd: i32, enable: bool, at_exit: bool) -> i32 {
             raw_mode_bits(TtyModeBits::of(&term)).apply_to(&mut raw_term);
             // TCSADRAIN, as libuv: output already queued finishes under the
             // flags it was written for before the switch lands.
-            if libc::tcsetattr(fd, libc::TCSADRAIN, &raw_term) != 0 {
+            if set_attr(libc::TCSADRAIN, &raw_term) != 0 {
                 return last_os_tty_errno();
             }
             // Only once the switch actually landed: a failed enable leaves
@@ -3042,18 +3052,11 @@ fn tty_switch(fd: i32, enable: bool, at_exit: bool) -> i32 {
                 libc::sigemptyset(&mut block);
                 libc::sigaddset(&mut block, libc::SIGTTOU);
                 libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut prior);
-                let rc = loop {
-                    let rc = libc::tcsetattr(fd, libc::TCSANOW, &orig);
-                    if rc == 0
-                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
-                    {
-                        break rc;
-                    }
-                };
+                let rc = set_attr(libc::TCSANOW, &orig);
                 libc::pthread_sigmask(libc::SIG_SETMASK, &prior, std::ptr::null_mut());
                 rc
             } else {
-                libc::tcsetattr(fd, libc::TCSADRAIN, &orig)
+                set_attr(libc::TCSADRAIN, &orig)
             };
             if rc != 0 {
                 // Keep the snapshot: the tty is still raw, so a later attempt

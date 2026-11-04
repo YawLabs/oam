@@ -90,6 +90,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `SIGPIPE`. It now retries, as libuv does. Under Rosetta for Linux, where the blocking reads
   are interrupted constantly while children spawn, a parent running 16 such children at once
   got the full output of only one.
+- **A signal no longer fails a `process.stdin` read or `setRawMode()`.** A stdin read that a
+  signal interrupted (EINTR) failed the read and ended `process.stdin` with input still to
+  come; it now reads again. On Linux and macOS, `setRawMode()` reported the EINTR of a
+  terminal-mode switch that a signal interrupted, and a failed `setRawMode(false)` left the
+  terminal raw; the switch now retries, as libuv's does.
 - **A DNS query to a server that does not answer is sent once per try, as c-ares sends it.**
   oam's resolver resent an unanswered UDP query about every 340 ms within one wait, so a
   silent server got up to three datagrams per try where node sends one.
