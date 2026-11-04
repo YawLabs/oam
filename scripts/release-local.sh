@@ -1454,17 +1454,67 @@ else
   esac
 fi
 
+# draft_missing <draft asset list> -- every file in $RELEASE_DIR that the list
+# (gh's "<name> <size>" lines) does not carry at its staged name and size, one
+# path per line. Prints nothing when the draft is complete.
+draft_missing() {
+  local staged want
+  for staged in "$RELEASE_DIR"/*; do
+    want="$(basename "$staged") $(wc -c <"$staged" | tr -d ' ')"
+    grep -qxF -- "$want" <<<"$1" || printf '%s\n' "$staged"
+  done
+}
+
+# complete_draft -- after a `gh release create` that failed part-way, upload
+# what the draft lacks, at most three times. gh creates the draft FIRST and
+# uploads into it, so one transient refusal from uploads.github.com (v0.19.3:
+# an HTTP 404 on one asset while the other ten landed) used to end a run hours
+# into its legs with a draft one asset short -- and the only way out was to
+# delete it and rebuild every leg. The draft is still a draft throughout, and
+# the name-and-size check after this stays the gate before it goes live; this
+# only converges on it. Only an asset in state "uploaded" counts: a record an
+# interrupted upload left behind ("starter") is missing, and --clobber replaces
+# it. No draft of $TAG at all means gh failed before it made one, and that is
+# fatal: preflight proved no release of $TAG existed, so there is nothing here
+# that is ours to complete.
+complete_draft() {
+  local attempt assets missing p
+  local -a missing_paths
+  [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft -q .isDraft 2>/dev/null)" = "true" ] \
+    || fail "gh release create failed and no draft of $TAG could be found (or gh release view itself failed) -- nothing was published; check gh release view $TAG --repo $REPO, delete any draft it shows, and re-run"
+  for attempt in 1 2 3; do
+    assets="$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[] | select(.state == "uploaded") | "\(.name) \(.size)"')" \
+      || fail "could not list the draft's assets -- the release is still a DRAFT; inspect it (gh release view $TAG --repo $REPO), delete it and re-run"
+    missing="$(draft_missing "$assets")"
+    [ -n "$missing" ] || { ok "draft completed on attempt $attempt"; return 0; }
+    warn "attempt $attempt/3: the draft lacks $(printf '%s\n' "$missing" | xargs -n1 basename | paste -sd' ' -) -- uploading"
+    missing_paths=()
+    while IFS= read -r p; do missing_paths+=("$p"); done <<<"$missing"
+    gh release upload "$TAG" "${missing_paths[@]}" --repo "$REPO" --clobber \
+      || warn "upload attempt $attempt failed"
+    [ "$attempt" = "3" ] || sleep $((attempt * 15))
+  done
+  # The final check below names what is still missing and stops the run.
+  return 0
+}
+
 step "Cut GitHub Release $TAG"
 # Draft-first publish: assets upload while the release is still a draft, and
 # it goes live -- atomically, one API call -- only once every asset is up. A
-# mid-upload failure leaves a DRAFT (delete it and re-run), never a live
+# mid-upload failure is retried into the draft (complete_draft); one that
+# still fails leaves a DRAFT (delete it and re-run), never a live
 # half-release that install.sh / self-update could resolve.
+create_rc=0
 gh release create "$TAG" "$RELEASE_DIR"/* \
   --repo "$REPO" \
   --title "$TAG" \
   --generate-notes \
   --verify-tag \
-  --draft
+  --draft || create_rc=$?
+if [ "$create_rc" -ne 0 ]; then
+  warn "gh release create exited $create_rc -- re-uploading what the draft lacks"
+  complete_draft
+fi
 # Before it goes live: every staged file is on the draft, at its staged size.
 # `gh release create` stops on a failed upload, but it is the one thing between
 # the signed pair and a published release that cannot be re-checked afterwards
@@ -1472,13 +1522,11 @@ gh release create "$TAG" "$RELEASE_DIR"/* \
 # up would look like an unsigned one to every verifier still in warn mode. One
 # API call; the draft stays a draft
 # (delete it and re-run) when anything is off.
-draft_assets="$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[] | "\(.name) \(.size)"')" \
+draft_assets="$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[] | select(.state == "uploaded") | "\(.name) \(.size)"')" \
   || fail "could not list the draft's assets -- the release is still a DRAFT; inspect it (gh release view $TAG --repo $REPO), delete it and re-run"
-for staged in "$RELEASE_DIR"/*; do
-  want="$(basename "$staged") $(wc -c <"$staged" | tr -d ' ')"
-  grep -qxF -- "$want" <<<"$draft_assets" \
-    || fail "the draft lacks '$want' (name and size) -- the release is still a DRAFT; delete it (gh release delete $TAG --repo $REPO) and re-run"
-done
+draft_gap="$(draft_missing "$draft_assets")"
+[ -z "$draft_gap" ] \
+  || fail "the draft lacks (name and size): $(printf '%s\n' "$draft_gap" | xargs -n1 basename | paste -sd' ' -) -- the release is still a DRAFT; delete it (gh release delete $TAG --repo $REPO) and re-run"
 ok "draft carries every staged asset at its staged size"
 gh release edit "$TAG" --repo "$REPO" --draft=false
 # From here the signature is public; release_on_exit leaves the staged copy.
