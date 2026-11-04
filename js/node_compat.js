@@ -39193,6 +39193,37 @@
       return _dnsQuery(name, rrtype, api);
     }
 
+    // dns.lookupService(address, port, callback) / dns.promises'
+    // lookupService(address, port): getnameinfo, as node's lib/dns.js and
+    // internal/dns/promises.js check the arguments -- the exact count (node
+    // throws ERR_MISSING_ARGS for any other), an IP literal, a port node's
+    // validatePort takes (a numeric string too), a callback -- then +port.
+    // A failure is the DNSException node builds, syscall getnameinfo; the
+    // promises one carries no hostname, as node's does not (measured on
+    // v22.22.2).
+    function validateLookupServiceArgs(address, port) {
+      if (registry.get("net").isIP(address) === 0) {
+        throw codes.ERR_INVALID_ARG_VALUE("address", address);
+      }
+      validatePort(port);
+    }
+    function _dnsLookupService(address, port, withHostname) {
+      return natives.dnsLookupService(address, port).then(undefined, (err) => {
+        throw _shapeDnsError(err, "getnameinfo", withHostname ? address : undefined, true);
+      });
+    }
+    function lookupService(address, port, callback) {
+      if (arguments.length !== 3) throw new codes.ERR_MISSING_ARGS("address", "port", "callback");
+      validateLookupServiceArgs(address, port);
+      if (typeof callback !== "function") {
+        throw codes.ERR_INVALID_ARG_TYPE("callback", "function", callback);
+      }
+      _dnsLookupService(address, +port, true).then(
+        (answer) => callback(null, answer.hostname, answer.service),
+        (err) => callback(err),
+      );
+    }
+
     // The callback API over one channel: the module's functions and a
     // dns.Resolver instance's differ only in `api`. Each method is node's
     // resolver(bindingName) wrapper: query(name[, options], callback).
@@ -39362,6 +39393,11 @@
           return Promise.resolve(all ? [] : { address: null, family: family === 6 ? 6 : 4 });
         }
         return _dnsLookupHinted(hostname, family, all, hints, order);
+      },
+      lookupService(address, port) {
+        if (arguments.length !== 2) throw new codes.ERR_MISSING_ARGS("address", "port");
+        validateLookupServiceArgs(address, port);
+        return _dnsLookupService(address, +port, false);
       },
       // Filled in below, once the class exists; the key keeps node's place.
       Resolver: undefined,
@@ -39592,9 +39628,9 @@
     });
 
     // node's key order (Object.keys(dns), measured on v22.22.2).
-    // lookupService is still missing (a recorded surface gap).
     return {
       lookup,
+      lookupService,
       Resolver,
       getDefaultResultOrder,
       setDefaultResultOrder,

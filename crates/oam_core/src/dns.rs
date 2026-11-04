@@ -932,6 +932,18 @@ pub async fn dns_lookup(
     }
 }
 
+/// dns.lookupService(address, port): getnameinfo (`net_connect::getnameinfo`).
+/// A failure is node's DNSException for the resolver's code, the address as
+/// written its hostname; the JS side names the syscall getnameinfo.
+pub async fn dns_lookup_service(address: String, port: u16) -> OpOutcome {
+    match crate::net_connect::getnameinfo(&address, port).await {
+        Ok((hostname, service)) => OpOutcome::Json(
+            serde_json::json!({ "hostname": hostname, "service": service }).to_string(),
+        ),
+        Err(error) => OpOutcome::sys(crate::net_connect::resolve_error(&address, &error)),
+    }
+}
+
 /// dns.resolve(hostname, rrtype) -- query specific DNS record types.
 ///
 /// `api` picks the channel (see `channel`). The channel and an instance's

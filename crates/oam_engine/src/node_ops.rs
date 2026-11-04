@@ -544,6 +544,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("clusterIsWorker", op_cluster_is_worker),
         // dns
         ("dnsLookup", op_dns_lookup),
+        ("dnsLookupService", op_dns_lookup_service),
         ("dnsResolve", op_dns_resolve),
         ("dnsReverse", op_dns_reverse),
         ("dnsGetServers", op_dns_get_servers),
@@ -10653,6 +10654,26 @@ fn op_dns_lookup(
         scope,
         &mut rv,
         oam_core::dns::dns_lookup(hostname, name, family, all, flags),
+    );
+}
+
+/// `dns.lookupService(address, port)`: getnameinfo. The JS side has
+/// validated both as node does (an IP literal; a port 0..=65535).
+fn op_dns_lookup_service(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let address = args.get(0).to_rust_string_lossy(scope);
+    let port = args
+        .get(1)
+        .uint32_value(scope)
+        .and_then(|port| u16::try_from(port).ok())
+        .unwrap_or(0);
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::dns::dns_lookup_service(address, port),
     );
 }
 

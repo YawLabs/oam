@@ -168,6 +168,62 @@ pub(crate) async fn getaddrinfo(
     }
 }
 
+/// getnameinfo of `address` (an IP literal, an IPv6 zone allowed) at `port`,
+/// as libuv's uv_getnameinfo asks it for node's dns.lookupService: with
+/// NI_NAMEREQD, so an address with no name is a resolver failure (ENOTFOUND)
+/// rather than the address echoed back. Returns (hostname, service); the
+/// service is the port's name, or the number when it has none.
+///
+/// The zone is mapped to a scope id as libuv's uv_ip6_addr maps it: the
+/// CRT's atoi on Windows, the interface index elsewhere (sysfs on Linux, the
+/// system resolver on macOS and the BSDs, as [`zone_scope_id`] does).
+pub(crate) async fn getnameinfo(address: &str, port: u16) -> std::io::Result<(String, String)> {
+    let addr = match address.split_once('%') {
+        None => SocketAddr::new(
+            address
+                .parse()
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?,
+            port,
+        ),
+        Some((ip, zone)) => {
+            let ip: std::net::Ipv6Addr = ip
+                .parse()
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+            let scope = if cfg!(windows) {
+                c_atoi(zone) as u32
+            } else if cfg!(target_os = "linux") {
+                sysfs_ifindex(zone).unwrap_or(0)
+            } else {
+                match getaddrinfo(address, 0, None, 0).await {
+                    Ok(resolved) => resolved
+                        .iter()
+                        .find_map(|addr| match addr {
+                            SocketAddr::V6(v6) => Some(v6.scope_id()),
+                            SocketAddr::V4(_) => None,
+                        })
+                        .unwrap_or(0),
+                    Err(_) => 0,
+                }
+            };
+            SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, scope))
+        }
+    };
+    #[cfg(unix)]
+    let flags = libc::NI_NAMEREQD;
+    #[cfg(windows)]
+    let flags = windows_sys::Win32::Networking::WinSock::NI_NAMEREQD as i32;
+    #[cfg(not(any(unix, windows)))]
+    let flags = 0;
+    let answered = tokio::task::spawn_blocking(move || {
+        dns_lookup::getnameinfo(&addr, flags).map_err(gai_io_error)
+    })
+    .await;
+    match answered {
+        Ok(result) => result,
+        Err(join) => Err(std::io::Error::other(join)),
+    }
+}
+
 /// A getaddrinfo failure as [`getaddrinfo`] reports it: the `EAI_*` code
 /// (a `WSA*` code on Windows), with the resolver's own text.
 #[derive(Debug)]

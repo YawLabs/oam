@@ -41,6 +41,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   did nothing and the flag was refused; a lookup's `order` and `verbatim` options were checked
   and then ignored. `dns.lookup()`, `net.connect()` and `http`/`https` requests now order their
   answers by them, as node does.
+- **`dns.lookupService()` and `dns.promises.lookupService()`**: getnameinfo, with node's
+  argument checks and error shape (syscall `getnameinfo`). `node:dns` and `node:dns/promises`
+  now have every export name node's do.
 - **`--throw-deprecation`** (also from `NODE_OPTIONS` and a `Worker`'s `execArgv`): a
   deprecation warning is thrown on the next tick instead of printed. It was refused with exit
   code 2. `process.noDeprecation` under `--no-deprecation` is read-only, as in node.
