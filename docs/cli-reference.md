@@ -55,6 +55,13 @@ should drop it -- two declarations of one global are a redeclaration error.
 oam accepts the Node flags it implements, so existing invocations keep working.
 Notable ones:
 
+These are runtime options: like node takes them before the script, oam takes
+them **before the subcommand** — `oam --throw-deprecation run app.ts`. The
+same flags are also accepted right after the subcommand, the `deno run
+--flag` shape: `oam run --throw-deprecation app.ts` is the same run. `oam
+--help` lists the whole set. `--inspect` / `--inspect-brk` are `run`/`serve`
+options, as always. `--` after `run` still passes arguments to the script.
+
 | Flag | Notes |
 |---|---|
 | `--permission` | Denies everything, then grants back with the `--allow-*` flags below. |
