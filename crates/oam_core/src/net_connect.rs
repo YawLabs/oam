@@ -86,6 +86,12 @@ pub struct ConnectOptions {
     /// for it. The default is what node's `net` passes a connect given no
     /// `family` and no `hints`: [`default_connect_hints`].
     pub hints: i32,
+    /// dns's result order (`dns.setDefaultResultOrder()`) for the connect's
+    /// own lookup, applied to getaddrinfo's answer before the attempts are
+    /// interleaved, as node's dns.lookup applies it under net.connect. Not
+    /// applied to a [`Pin`]: a ticket is ordered already and a hook's answer
+    /// is used as given.
+    pub order: crate::dns::ResultOrder,
 }
 
 impl Default for ConnectOptions {
@@ -95,6 +101,7 @@ impl Default for ConnectOptions {
             pin: None,
             local: None,
             hints: default_connect_hints(),
+            order: crate::dns::ResultOrder::Verbatim,
         }
     }
 }
@@ -826,10 +833,13 @@ pub(crate) async fn connect_with<D: Dialer>(
             targets
         }
         None => match dialer.lookup(host, port, None, opts.hints).await {
-            Ok(resolved) => resolved
-                .into_iter()
-                .map(|addr| (addr, addr.ip().to_string()))
-                .collect(),
+            Ok(mut resolved) => {
+                opts.order.apply(&mut resolved, SocketAddr::is_ipv4);
+                resolved
+                    .into_iter()
+                    .map(|addr| (addr, addr.ip().to_string()))
+                    .collect()
+            }
             Err(error) => return Err(ConnectError::Resolve(Box::new(resolve_error(host, &error)))),
         },
     };

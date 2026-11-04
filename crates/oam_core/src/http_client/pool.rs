@@ -187,6 +187,10 @@ pub(crate) struct Dial {
     /// asks it once per connection), so the request takes no idle one, and
     /// it is spent on that one dial.
     pub(crate) pin: Option<HookPin>,
+    /// dns's result order, for this request's dials ([`DialParams`]). A
+    /// pooled connection is reused whatever order opened it, as undici's
+    /// origin-keyed pool reuses it (measured on node v22.22.2).
+    pub(crate) dns_order: crate::dns::ResultOrder,
 }
 
 /// A runtime's owned connection pool. Cloning shares the connections.
@@ -506,6 +510,7 @@ impl Pool {
         let params = DialParams {
             attempt_timeout: dial.attempt_timeout,
             pin,
+            dns_order: dial.dns_order,
         };
         self.connect(key, uri, dial.connect_timeout, params)
             .await
@@ -1278,6 +1283,7 @@ mod tests {
                     alpn: Alpn::default(),
                     attempt_timeout: Duration::from_millis(250),
                     pin: None,
+                    dns_order: crate::dns::ResultOrder::Verbatim,
                 };
                 let response = pool.request(req, false, dial, None).await.ok().unwrap();
                 let released = response.extensions().get::<Released>().cloned().unwrap();
@@ -1399,6 +1405,7 @@ mod tests {
             alpn: Alpn::default(),
             attempt_timeout: Duration::from_millis(250),
             pin: None,
+            dns_order: crate::dns::ResultOrder::Verbatim,
         };
         let uri: Uri = format!("http://127.0.0.1:{port}/").parse().unwrap();
         let get = || {

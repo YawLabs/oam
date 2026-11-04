@@ -1381,8 +1381,8 @@ including the holes Node leaves where a record of another type sat.
 dns's result order (`dns.setDefaultResultOrder()`, `--dns-result-order`, a lookup's
 `order` / `verbatim`) orders `dns.lookup()`, `net.connect()`'s lookups and `http`/`https`
 requests as in Node (case 588; a non-verbatim order sends a stock-agent request over the
-agent's socket, whose lookup applies it). `fetch()` resolves through oam's own transport and does not read it: Node's
-fetch connects through `net` and so follows it.
+agent's socket, whose lookup applies it), and `fetch()`'s new connections (case 591; a
+pooled connection is reused whatever order opened it, as undici reuses it).
 
 ### 32. A decoded `fetch` response drops `content-encoding` and `content-length`
 

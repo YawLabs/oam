@@ -256,6 +256,8 @@ impl HttpTransport {
             connect_timeout: None,
             tls_range,
             alpn: Alpn::default(),
+            // A `createConnection` route dials nothing itself.
+            dns_order: crate::dns::ResultOrder::Verbatim,
             hooked: None,
             supplied: Some(Supplied { conns, pool }),
         }
@@ -324,6 +326,7 @@ impl HttpTransport {
             alpn: route.alpn,
             attempt_timeout: route.attempt_timeout,
             pin,
+            dns_order: route.dns_order,
         };
         pool.request(request, close_requested, dial, follows)
             .await
@@ -371,6 +374,9 @@ pub struct Route {
     tls_range: TlsRange,
     /// What its https handshakes offer by ALPN (see [`Route::with_alpn`]).
     alpn: Alpn,
+    /// dns's result order for the connections it opens to a host it
+    /// resolves itself (see [`Route::with_dns_order`]).
+    dns_order: crate::dns::ResultOrder,
     hooked: Option<Hooked>,
     supplied: Option<Supplied>,
 }
@@ -394,6 +400,7 @@ impl Route {
             connect_timeout: None,
             tls_range,
             alpn: Alpn::default(),
+            dns_order: crate::dns::ResultOrder::Verbatim,
             hooked: hooked.map(|pool| Hooked {
                 pool,
                 pin: Mutex::new(None),
@@ -421,6 +428,15 @@ impl Route {
     /// socket, ALPN included, and this changes nothing.
     pub fn with_alpn(mut self, alpn: Alpn) -> Route {
         self.alpn = alpn;
+        self
+    }
+
+    /// Order the addresses of a host this route's connections resolve
+    /// themselves by dns's result order, as node's fetch (undici over
+    /// net.connect) orders them. A `connect.lookup` hook's answer is used
+    /// as given, as node uses it.
+    pub fn with_dns_order(mut self, order: crate::dns::ResultOrder) -> Route {
+        self.dns_order = order;
         self
     }
 

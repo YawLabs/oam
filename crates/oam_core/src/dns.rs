@@ -830,8 +830,9 @@ fn host(name: &hickory_resolver::proto::rr::Name) -> String {
 /// lookup's `order` / `verbatim`): the resolver's own order, or a stable
 /// partition by family (measured on node v22.22.2: each family keeps its
 /// relative order).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ResultOrder {
+    #[default]
     Verbatim,
     Ipv4First,
     Ipv6First,

@@ -39,8 +39,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **`dns.getDefaultResultOrder()` and a working `dns.setDefaultResultOrder()`, on `dns` and
   `dns.promises`, and `--dns-result-order`** (also from `NODE_OPTIONS`). `setDefaultResultOrder`
   did nothing and the flag was refused; a lookup's `order` and `verbatim` options were checked
-  and then ignored. `dns.lookup()`, `net.connect()` and `http`/`https` requests now order their
-  answers by them, as node does.
+  and then ignored. `dns.lookup()`, `net.connect()`, `http`/`https` requests and `fetch()` now
+  order their answers by them, as node does.
 - **`dns.lookupService()` and `dns.promises.lookupService()`**: getnameinfo, with node's
   argument checks and error shape (syscall `getnameinfo`). `node:dns` and `node:dns/promises`
   now have every export name node's do.
