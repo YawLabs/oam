@@ -426,6 +426,13 @@ pub(crate) fn read_through_gate<R: Read + ?Sized>(
             Err(_) => 0,
         };
         if gate.end(bytes_read) {
+            // EINTR: a signal arrived before the read transferred anything,
+            // so the stream says nothing yet and the read goes again. Passed
+            // up, it failed the stdin read op and ended process.stdin with
+            // input still to come; node's stdin stream never sees EINTR.
+            if matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::Interrupted) {
+                continue;
+            }
             return result;
         }
     }
@@ -759,6 +766,24 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(reader.reads, 2, "one retry, then the real error, no loop");
         assert!(!gate.is_pending());
+    }
+
+    /// An uncancelled read a signal interrupted (EINTR) goes again instead
+    /// of failing the stdin read op, and is not counted as a discard.
+    #[test]
+    fn interrupted_read_is_reissued_not_reported() {
+        let gate = ReadGate::new();
+        let eintr = || Err(io::Error::from(io::ErrorKind::Interrupted));
+        let mut reader = scripted(
+            &gate,
+            vec![(false, eintr()), (false, eintr()), (false, Ok(b"rest"))],
+        );
+        let mut buf = [0u8; 8];
+        let n = read_through_gate(&gate, &mut reader, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"rest");
+        assert_eq!(reader.reads, 3);
+        assert!(!gate.is_pending());
+        assert_eq!(gate.generation(), 0, "an EINTR is not a discard");
     }
 
     #[test]
