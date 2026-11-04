@@ -18785,10 +18785,16 @@ const all = await dnsPromises.lookup('localhost', { all: true });
 console.log('all-len:', all.length > 0);
 console.log('all-addr:', all[0].address);
 
-// 4. resolve4 (A records via OS resolver)
-const addrs = await dnsPromises.resolve4('localhost');
-console.log('resolve4-len:', addrs.length > 0);
-console.log('resolve4-type:', typeof addrs[0]);
+// 4. resolve4 asks the configured server for `localhost.` as it is, as
+// c-ares's ares_query does: whether it answers is the server's call.
+// systemd-resolved synthesizes 127.0.0.1; 1.1.1.1 and 8.8.8.8 (the linux
+// release leg's servers) say NXDOMAIN, and node fails ENOTFOUND there too.
+try {
+  const addrs = await dnsPromises.resolve4('localhost');
+  console.log('resolve4: answered', addrs.length > 0, typeof addrs[0]);
+} catch (e) {
+  console.log('resolve4: refused', e.code, e.syscall, e.hostname);
+}
 
 // 5. ENOTFOUND on bogus hostname
 try {
@@ -18824,12 +18830,13 @@ try {
         "all:true should return results: {stdout}"
     );
     assert!(
-        lines.iter().any(|l| l == &"resolve4-len: true"),
-        "resolve4 should return results: {stdout}"
-    );
-    assert!(
-        lines.iter().any(|l| l == &"resolve4-type: string"),
-        "resolve4 should return strings: {stdout}"
+        lines.iter().any(|l| [
+            "resolve4: answered true string",
+            "resolve4: refused ENOTFOUND queryA localhost",
+            "resolve4: refused ENODATA queryA localhost",
+        ]
+        .contains(l)),
+        "resolve4 should answer with strings or fail as node does: {stdout}"
     );
     assert!(
         lines.iter().any(|l| l == &"bogus-code: ENOTFOUND"),
