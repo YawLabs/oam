@@ -363,6 +363,22 @@ pub fn spawn_extra(
     })
 }
 
+/// Run a blocking syscall again for as long as it fails with EINTR.
+///
+/// EINTR says a signal arrived before the call did anything; the call itself
+/// did not fail. The pipe I/O below runs on blocking-pool threads, which take
+/// whatever signals the process gets, so every blocking call there goes
+/// through this. It loops without a bound because each EINTR is a separate
+/// signal, not a repeating error.
+fn retry_intr<T>(mut call: impl FnMut() -> rustix::io::Result<T>) -> rustix::io::Result<T> {
+    loop {
+        match call() {
+            Err(rustix::io::Errno::INTR) => continue,
+            other => return other,
+        }
+    }
+}
+
 /// A read end that is done (EOF, a read error, a join failure) or closed by
 /// the caller leaves the registry, and the entry goes with the last end once
 /// the child is reaped -- the Windows backend's `retire_read_end` (#419), here
@@ -416,14 +432,22 @@ pub async fn raw_read(reg: RawChildRegistry, id: u64, fd: u32) -> OpOutcome {
                 &end_fd,
                 rustix::event::PollFlags::IN,
             )];
-            // `None` is the infinite timeout the raw `-1` meant.
-            rustix::event::poll(&mut pfd, None)
+            // `None` is the infinite timeout the raw `-1` meant. EINTR is a
+            // wait cut short, not a failure: poll(2) is never restarted after
+            // a signal handler, SA_RESTART or not, and treating EINTR as an
+            // error closed the pipe end and ended the stream with the child's
+            // output still unread. Under Rosetta for Linux (the linux-x64
+            // release leg) a parent spawning extra-fd children sees a steady
+            // stream of EINTR here -- about 220 per run of conformance case
+            // 585, measured -- and lost the output of 15 of its 16 children.
+            retry_intr(|| rustix::event::poll(&mut pfd, None))
                 .map_err(|e| format!("poll: {}", super::io_from_errno(e)))?;
         }
         let mut buf = vec![0u8; 65536];
         // The fd is ready (POLLIN, or HUP when the write end closed), so this
-        // read cannot block; on HUP it returns 0 (EOF).
-        let n = rustix::io::read(&end_fd, &mut buf[..])
+        // read cannot block; on HUP it returns 0 (EOF). A signal can still
+        // land before it transfers anything, so EINTR retries here too.
+        let n = retry_intr(|| rustix::io::read(&end_fd, &mut buf[..]))
             .map_err(|e| format!("read: {}", super::io_from_errno(e)))?;
         if n == 0 {
             Ok((end_fd, None))
@@ -481,9 +505,8 @@ pub async fn raw_write(reg: RawChildRegistry, id: u64, fd: u32, data: Vec<u8>) -
     let result = tokio::task::spawn_blocking(move || {
         let mut off = 0usize;
         while off < data.len() {
-            match rustix::io::write(&end_fd, &data[off..]) {
-                // EINTR before any progress -- retry, as before.
-                Err(rustix::io::Errno::INTR) => continue,
+            // EINTR before any progress -- retry (`retry_intr`).
+            match retry_intr(|| rustix::io::write(&end_fd, &data[off..])) {
                 Err(e) => return Err(format!("write: {}", super::io_from_errno(e))),
                 Ok(0) => return Err("write wrote 0".to_string()),
                 Ok(n) => off += n,
@@ -678,7 +701,35 @@ pub async fn raw_wait(reg: RawChildRegistry, id: u64) -> OpOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::signal_number;
+    use super::{retry_intr, signal_number};
+
+    /// EINTR is retried until the call settles, and any other outcome --
+    /// success or a real error -- comes back on the first try. (raw_read's
+    /// poll and read treated EINTR as a failure and truncated the child's
+    /// stream; conformance case 585 is the end-to-end pin, on a host where
+    /// signals interrupt the blocking pool.)
+    #[test]
+    fn retry_intr_retries_only_eintr() {
+        let mut calls = 0;
+        let got = retry_intr(|| {
+            calls += 1;
+            if calls < 4 {
+                Err(rustix::io::Errno::INTR)
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(got, Ok(7));
+        assert_eq!(calls, 4);
+
+        let mut calls = 0;
+        let got: rustix::io::Result<()> = retry_intr(|| {
+            calls += 1;
+            Err(rustix::io::Errno::BADF)
+        });
+        assert_eq!(got, Err(rustix::io::Errno::BADF));
+        assert_eq!(calls, 1);
+    }
 
     /// Signal-name mapping covers the known names and rejects unknown/empty
     /// ones (the `None` arm is the divergence fix: unknown no longer silently
