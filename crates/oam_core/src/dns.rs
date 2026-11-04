@@ -12,9 +12,10 @@ use hickory_resolver::config::{
 use hickory_resolver::net::NetError;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::udp::UdpClientStream;
-use hickory_resolver::net::xfer::DnsExchange;
-use hickory_resolver::proto::rr::{Name, RData, RecordType};
-use hickory_resolver::{ConnectionProvider, PoolContext, Resolver};
+use hickory_resolver::net::xfer::{DnsExchange, DnsHandle, FirstAnswer};
+use hickory_resolver::proto::op::{DnsRequestOptions, Query, ResponseCode};
+use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
+use hickory_resolver::{ConnectionProvider, NameServerPool, PoolContext, Resolver, TlsConfig};
 
 use super::OpOutcome;
 
@@ -116,7 +117,14 @@ type ServerResolver = Resolver<CaresProvider>;
 
 /// One nameserver of a channel.
 struct Server {
+    /// For reverse() and a bare name's search-list walk.
     resolver: ServerResolver,
+    /// The same server's connection pool asked directly (`raw_lookup`): a
+    /// query and its response as served, without the resolver's answer
+    /// handling -- c-ares hands node the answer section as it came.
+    pool: Arc<NameServerPool<CaresProvider>>,
+    /// The request options the resolver would send with.
+    request: DnsRequestOptions,
     /// Consecutive failures to answer (timeouts, network errors); any answer
     /// resets it. The walk tries the server with the fewest first.
     failures: AtomicU32,
@@ -402,6 +410,7 @@ fn build_channel_with(
         for connection in &mut ns.connections {
             connection.bind_addr = bind;
         }
+        let pool_ns = ns.clone();
         let config = ResolverConfig::from_parts(base.domain.clone(), base.search.clone(), vec![ns]);
         let mut builder = Resolver::builder_with_config(config, CaresProvider::default());
         let opts = builder.options_mut();
@@ -432,8 +441,22 @@ fn build_channel_with(
         opts.timeout = timing.longest();
         opts.num_concurrent_reqs = 1;
         opts.server_ordering_strategy = ServerOrderingStrategy::UserProvidedOrder;
+        let pool_opts = builder.options_mut().clone();
+        let mut request = DnsRequestOptions::default();
+        request.recursion_desired = pool_opts.recursion_desired;
+        request.use_edns = pool_opts.edns0;
+        request.edns_payload_len = pool_opts.edns_payload_len;
+        request.case_randomization = pool_opts.case_randomization;
+        let tls = TlsConfig::new().expect("DNS pool TLS config");
+        let pool = NameServerPool::from_config(
+            [pool_ns],
+            Arc::new(PoolContext::new(pool_opts, tls)),
+            CaresProvider::default(),
+        );
         servers.push(Server {
             resolver: builder.build().expect("build DNS resolver"),
+            pool: Arc::new(pool),
+            request,
             failures: AtomicU32::new(0),
         });
     }
@@ -744,7 +767,7 @@ fn try_order(failures: &[u32]) -> Vec<usize> {
 /// has checked the channel is not empty.
 async fn walk<T, F, Fut>(channel: &Channel, mut send: F) -> Result<T, NetError>
 where
-    F: FnMut(ServerResolver) -> Fut,
+    F: FnMut(&Server) -> Fut,
     Fut: Future<Output = Result<T, NetError>>,
 {
     let mut last = NetError::NoConnections;
@@ -757,7 +780,7 @@ where
         for i in try_order(&failures) {
             let server = &channel.servers[i];
             let wait = channel.timing.wait(round, random_jitter());
-            let result = tokio::time::timeout(wait, send(server.resolver.clone()))
+            let result = tokio::time::timeout(wait, send(server))
                 .await
                 .unwrap_or(Err(NetError::Timeout));
             match result {
@@ -776,11 +799,21 @@ where
 }
 
 /// One `RecordType` query of `name` over `channel`.
+/// A query's answer section, as the server sent it.
+#[derive(Debug)]
+struct Answers(Vec<Record>);
+
+impl Answers {
+    fn answers(&self) -> &[Record] {
+        &self.0
+    }
+}
+
 async fn channel_lookup(
     channel: &Channel,
     name: &str,
     rtype: RecordType,
-) -> Result<hickory_resolver::lookup::Lookup, NetError> {
+) -> Result<Answers, NetError> {
     // Parse the name before any server is asked: a name that does not parse
     // is the caller's error, not a server's, so it must not walk the list --
     // as a `Proto` error it would, demoting every server on the way.
@@ -788,11 +821,129 @@ async fn channel_lookup(
         Ok(name) => name,
         Err(e) => return Err(NetError::Msg(format!("invalid name: {e}"))),
     };
-    walk(channel, |r| {
-        let name = name.clone();
-        async move { r.lookup(name, rtype).await }
+    // A fully qualified name (`resolve_on` qualifies one with ndots dots) is
+    // ONE query, its answer section as served, as c-ares sends it: the
+    // resolver would chase a CNAME with a second query, answer RFC 6761
+    // names (localhost, *.invalid) itself without asking, and drop an answer
+    // holding no record of the type asked (measured on node v22.22.2: one
+    // datagram per call, localhost asked of the server, an answer of other
+    // types [] or an error by type -- `empty_of_type`). A bare name keeps
+    // the resolver's search-list walk.
+    if name.is_fqdn() {
+        return raw_walk(channel, name, rtype).await;
+    }
+    // A bare name (fewer dots than ndots; `resolve_on` qualified the rest):
+    // c-ares's ares_search, which tries each search domain and then the name
+    // as given, each as one query. A name that is not found or has no record
+    // of the type moves on; the first answer wins; when every one fails it
+    // reports ENODATA if any said NODATA, else the last failure (measured on
+    // node v22.22.2 with no search domains: `localhost` is asked of the
+    // server as it is, ENOTFOUND, where hickory answered 127.0.0.1 itself).
+    let mut candidates: Vec<Name> = base()
+        .search
+        .iter()
+        .filter_map(|domain| name.clone().append_domain(domain).ok())
+        .collect();
+    let mut as_given = name;
+    as_given.set_fqdn(true);
+    candidates.push(as_given);
+    let mut nodata = None;
+    let mut last = None;
+    for candidate in candidates {
+        match raw_walk(channel, candidate, rtype).await {
+            Ok(answers) => return Ok(answers),
+            Err(e) if is_not_found(&e) => {
+                if query_error_code(&e) == "ENODATA" {
+                    nodata = Some(e);
+                } else {
+                    last = Some(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(nodata.or(last).unwrap_or(NetError::NoConnections))
+}
+
+/// The walk over `channel` of one query for `name`.
+async fn raw_walk(channel: &Channel, name: Name, rtype: RecordType) -> Result<Answers, NetError> {
+    walk(channel, |server| {
+        let pool = server.pool.clone();
+        let query = Query::query(name.clone(), rtype);
+        let request = server.request.clone();
+        async move { raw_lookup(&pool, query, request).await }
     })
     .await
+}
+
+/// A failure the search walk moves past: the name does not exist, or has
+/// no record of the type (NXDOMAIN / NODATA).
+fn is_not_found(e: &NetError) -> bool {
+    matches!(
+        e,
+        NetError::Dns(hickory_resolver::net::DnsError::NoRecordsFound(_))
+    )
+}
+
+/// One query to one server's pool. An empty answer is the pool's own
+/// `NoRecords` (ENODATA / ENOTFOUND by its rcode, as before); an NXDOMAIN
+/// that carries records (a CNAME to a name that does not exist) is
+/// ENOTFOUND, as c-ares reports the rcode.
+async fn raw_lookup(
+    pool: &NameServerPool<CaresProvider>,
+    query: Query,
+    request: DnsRequestOptions,
+) -> Result<Answers, NetError> {
+    let response = pool.lookup(query.clone(), request).first_answer().await?;
+    if response.metadata.response_code == ResponseCode::NXDomain {
+        return Err(NetError::Dns(
+            hickory_resolver::net::DnsError::NoRecordsFound(hickory_resolver::net::NoRecords::new(
+                query,
+                ResponseCode::NXDomain,
+            )),
+        ));
+    }
+    Ok(Answers(response.into_message().answers))
+}
+
+/// [`empty_of_type`]'s outcome when `answers` holds records but none of
+/// `rtype`.
+fn no_record_of_type(rtype: RecordType, hostname: &str, answers: &Answers) -> Option<OpOutcome> {
+    let records = answers.answers();
+    if records.is_empty() || records.iter().any(|r| r.record_type() == rtype) {
+        return None;
+    }
+    empty_of_type(rtype, hostname, records)
+}
+
+/// What node reports for a query whose answer section holds records, none
+/// of the type asked (measured on node v22.22.2 against a fake server, one
+/// datagram each): `None` is the type's empty array (TLSA, MX, TXT, SRV, CAA,
+/// NAPTR, and A / AAAA when a CNAME is among the records), `Some` the
+/// outcome otherwise -- ENODATA for A / AAAA without a CNAME, NS and PTR;
+/// EBADRESP for SOA; for CNAME, the name asked.
+fn empty_of_type(rtype: RecordType, hostname: &str, answers: &[Record]) -> Option<OpOutcome> {
+    let nodata = || {
+        OpOutcome::node_failed(
+            "ENODATA",
+            format!("ENODATA {hostname}: no record of the type asked"),
+        )
+    };
+    match rtype {
+        RecordType::A | RecordType::AAAA => {
+            let cname = answers.iter().any(|r| r.record_type() == RecordType::CNAME);
+            (!cname).then(nodata)
+        }
+        RecordType::NS | RecordType::PTR => Some(nodata()),
+        RecordType::SOA => Some(OpOutcome::node_failed(
+            "EBADRESP",
+            format!("EBADRESP {hostname}: no SOA record in the answer"),
+        )),
+        RecordType::CNAME => Some(OpOutcome::Json(
+            serde_json::json!([hostname.strip_suffix('.').unwrap_or(hostname)]).to_string(),
+        )),
+        _ => None,
+    }
 }
 
 /// A query on a channel with no nameservers (`dns.setServers([])`). c-ares
@@ -996,6 +1147,9 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
     match rrtype.as_str() {
         "A" => match channel_lookup(&ch, &hostname, RecordType::A).await {
             Ok(lookup) => {
+                if let Some(outcome) = no_record_of_type(RecordType::A, &hostname, &lookup) {
+                    return outcome;
+                }
                 let addrs: Vec<serde_json::Value> = lookup
                     .answers()
                     .iter()
@@ -1015,6 +1169,9 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
         },
         "AAAA" => match channel_lookup(&ch, &hostname, RecordType::AAAA).await {
             Ok(lookup) => {
+                if let Some(outcome) = no_record_of_type(RecordType::AAAA, &hostname, &lookup) {
+                    return outcome;
+                }
                 let addrs: Vec<serde_json::Value> = lookup
                     .answers()
                     .iter()
@@ -1034,6 +1191,9 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
         },
         "CNAME" => match channel_lookup(&ch, &hostname, RecordType::CNAME).await {
             Ok(lookup) => {
+                if let Some(outcome) = no_record_of_type(RecordType::CNAME, &hostname, &lookup) {
+                    return outcome;
+                }
                 let names: Vec<serde_json::Value> = lookup
                     .answers()
                     .iter()
@@ -1048,6 +1208,9 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
         },
         "MX" => match channel_lookup(&ch, &hostname, RecordType::MX).await {
             Ok(lookup) => {
+                if let Some(outcome) = no_record_of_type(RecordType::MX, &hostname, &lookup) {
+                    return outcome;
+                }
                 let records: Vec<serde_json::Value> = lookup
                     .answers()
                     .iter()
@@ -1069,6 +1232,9 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
         },
         "TXT" => match channel_lookup(&ch, &hostname, RecordType::TXT).await {
             Ok(lookup) => {
+                if let Some(outcome) = no_record_of_type(RecordType::TXT, &hostname, &lookup) {
+                    return outcome;
+                }
                 let records: Vec<serde_json::Value> = lookup
                     .answers()
                     .iter()
@@ -1090,6 +1256,9 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
         },
         "NS" => match channel_lookup(&ch, &hostname, RecordType::NS).await {
             Ok(lookup) => {
+                if let Some(outcome) = no_record_of_type(RecordType::NS, &hostname, &lookup) {
+                    return outcome;
+                }
                 let names: Vec<serde_json::Value> = lookup
                     .answers()
                     .iter()
@@ -1104,6 +1273,9 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
         },
         "SRV" => match channel_lookup(&ch, &hostname, RecordType::SRV).await {
             Ok(lookup) => {
+                if let Some(outcome) = no_record_of_type(RecordType::SRV, &hostname, &lookup) {
+                    return outcome;
+                }
                 let records: Vec<serde_json::Value> = lookup
                     .answers()
                     .iter()
@@ -1125,6 +1297,9 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
         },
         "SOA" => match channel_lookup(&ch, &hostname, RecordType::SOA).await {
             Ok(lookup) => {
+                if let Some(outcome) = no_record_of_type(RecordType::SOA, &hostname, &lookup) {
+                    return outcome;
+                }
                 if let Some(soa) = lookup.answers().iter().find_map(|rec| match &rec.data {
                     RData::SOA(soa) => Some(soa),
                     _ => None,
@@ -1149,6 +1324,9 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
         },
         "PTR" => match channel_lookup(&ch, &hostname, RecordType::PTR).await {
             Ok(lookup) => {
+                if let Some(outcome) = no_record_of_type(RecordType::PTR, &hostname, &lookup) {
+                    return outcome;
+                }
                 let names: Vec<serde_json::Value> = lookup
                     .answers()
                     .iter()
@@ -1163,6 +1341,9 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
         },
         "CAA" => match channel_lookup(&ch, &hostname, RecordType::CAA).await {
             Ok(lookup) => {
+                if let Some(outcome) = no_record_of_type(RecordType::CAA, &hostname, &lookup) {
+                    return outcome;
+                }
                 // node's shape is `{critical, <tag>: <value>}` -- the TAG is the
                 // KEY. This used to emit `{critical, issue: <tag>, value: <value>}`,
                 // which put the tag name where the value belongs, hardcoded the
@@ -1202,6 +1383,9 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
         },
         "NAPTR" => match channel_lookup(&ch, &hostname, RecordType::NAPTR).await {
             Ok(lookup) => {
+                if let Some(outcome) = no_record_of_type(RecordType::NAPTR, &hostname, &lookup) {
+                    return outcome;
+                }
                 let records: Vec<serde_json::Value> = lookup
                     .answers()
                     .iter()
@@ -1225,6 +1409,9 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
         },
         "TLSA" => match channel_lookup(&ch, &hostname, RecordType::TLSA).await {
             Ok(lookup) => {
+                if let Some(outcome) = no_record_of_type(RecordType::TLSA, &hostname, &lookup) {
+                    return outcome;
+                }
                 // One entry per answer record, null for a record of another
                 // type: node's array keeps the position, a hole where c-ares
                 // skipped a record (measured: [A, TLSA] answers a two-slot
@@ -1311,7 +1498,12 @@ async fn reverse_on(ch: Arc<Channel>, ip_str: String) -> OpOutcome {
     if ch.servers.is_empty() {
         return not_found(&"no nameservers configured");
     }
-    match walk(&ch, |r| async move { r.reverse_lookup(ip).await }).await {
+    match walk(&ch, |server| {
+        let resolver = server.resolver.clone();
+        async move { resolver.reverse_lookup(ip).await }
+    })
+    .await
+    {
         Ok(lookup) => {
             let names: Vec<serde_json::Value> = lookup
                 .answers()
@@ -1592,7 +1784,7 @@ mod tests {
         build_channel(&base, servers)
     }
 
-    fn first_a(lookup: &hickory_resolver::lookup::Lookup) -> String {
+    fn first_a(lookup: &Answers) -> String {
         lookup
             .answers()
             .iter()

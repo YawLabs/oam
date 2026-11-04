@@ -58,6 +58,13 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   upper-case NetBIOS name on Windows (`WOODS` where node says `woods`).
 - **`{ ttl: true }` on `resolve4()` / `resolve6()` reports each record's TTL as served.** It
   reported `ttl: 0` for every address.
+- **A DNS query's answer is the server's, as c-ares hands it to node.** oam's resolver chased
+  a CNAME with a second query and answered with the target's records (node sends one query
+  and answers `[]`), answered `localhost` and `*.invalid` itself without asking the server
+  (node asks; `resolve4('localhost')` against a server that has no such name is `ENOTFOUND`),
+  and reported `ENODATA` for an answer holding records of other types only, where node
+  reports `[]` (TLSA, MX, TXT, SRV, CAA, NAPTR, and A / AAAA beside a CNAME), `ENODATA` (NS,
+  PTR, A / AAAA otherwise) or, for CNAME, the name asked.
 - **Every DNS query is sent to the server, as c-ares sends it.** oam's resolver kept an answer
   cache, so a repeated query (an NXDOMAIN or a NODATA answer included) was answered without
   asking, and its TTLs were clamped to one day.

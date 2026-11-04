@@ -43,11 +43,16 @@ for (const [address, port] of [
   console.log("lookupService", show(address), show(port), "|", cb, "|", pr);
 }
 
-// Asynchronous, whatever the outcome.
+// Asynchronous, whatever the outcome (awaited on the callback itself: when
+// getnameinfo answers is the host's business).
 let sync = true;
-dns.lookupService("127.0.0.1", 80, () => console.log("callback sync", sync));
-sync = false;
-await new Promise((resolve) => setTimeout(resolve, 0));
+await new Promise((resolve) => {
+  dns.lookupService("127.0.0.1", 80, () => {
+    console.log("callback sync", sync);
+    resolve();
+  });
+  sync = false;
+});
 
 const fn = () => {};
 threw("no arguments", () => dns.lookupService());
