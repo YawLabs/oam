@@ -4664,6 +4664,68 @@ sg_order scripts/release-local.sh 'sha256sum oam-* > SHA256SUMS && cat SHA256SUM
   'release_verify_manifest "$RELEASE_DIR" "$TAG"' 'step "DRY RUN' 'gh release create "$TAG" "$RELEASE_DIR"/*' \
   'draft_assets="$(gh release view' 'gh release edit "$TAG" --repo "$REPO" --draft=false'
 
+it "release-local.sh: a failed gh release create goes to complete_draft, before the final draft check"
+sg_order scripts/release-local.sh 'complete_draft() {' 'step "Cut GitHub Release $TAG"' \
+  '--draft || create_rc=$?' '  complete_draft' 'draft_assets="$(gh release view' \
+  'draft_gap="$(draft_missing "$draft_assets")"' 'gh release edit "$TAG" --repo "$REPO" --draft=false'
+
+# complete_draft, RUN against a stub gh: the v0.19.3 failure was one asset's
+# upload answering 404 while the rest landed, which ended the run with a draft
+# one asset short.
+CDR="$SUITE_TMP/complete-draft"
+mkdir -p "$CDR/rel"
+printf a >"$CDR/rel/oam-a"; printf bb >"$CDR/rel/oam-b"
+awk '$0 == "draft_missing() {" || $0 == "complete_draft() {" { p = 1 } p { print } p && /^}$/ { p = 0 }' \
+  scripts/release-local.sh >"$CDR/fns.sh"
+# cdr_run <isDraft answer> <initial "<name> <size>" lines> <uploads that fail before one succeeds>
+cdr_run(){
+  (
+    set -euo pipefail  # release-local.sh's own mode, so an errexit abort in the functions shows here
+    RELEASE_DIR="$CDR/rel" TAG=v9.9.9 REPO=example-invalid/fixture
+    ok(){ echo "OK $*"; }; warn(){ echo "WARN $*"; }; fail(){ echo "FAIL $*"; exit 1; }; sleep(){ :; }
+    printf '%s' "$2" >"$CDR/assets"; echo "$3" >"$CDR/fails"
+    gh(){
+      if [ "$1 $2" = "release view" ]; then
+        case "$*" in *isDraft*) printf '%s\n' "$CDR_DRAFT" ;; *) cat "$CDR/assets" ;; esac
+      elif [ "$1 $2" = "release upload" ]; then
+        case " $* " in *" --clobber "*) ;; *) echo "NO-CLOBBER"; return 1 ;; esac
+        local f=() n; shift 3; n="$(cat "$CDR/fails")"
+        while [ "$1" != "--repo" ]; do echo "UPLOAD $(basename "$1")"; f+=("$1"); shift; done
+        if [ "$n" -gt 0 ]; then echo $((n - 1)) >"$CDR/fails"; return 1; fi
+        for p in "${f[@]}"; do printf '\n%s %s' "$(basename "$p")" "$(wc -c <"$p" | tr -d ' ')" >>"$CDR/assets"; done
+      fi
+    }
+    CDR_DRAFT="$1"
+    . "$CDR/fns.sh"
+    rc=0; complete_draft || rc=$?; echo "RC $rc"
+    echo "MISSING $(draft_missing "$(cat "$CDR/assets")" | xargs -r -n1 basename | paste -sd' ' -)"
+  ) 2>&1
+}
+
+it "complete_draft: uploads only what the draft lacks (name and size), then reports it complete"
+CDR_A="$(cdr_run true 'oam-a 1' 0)"
+if [ "$(grep -c '^UPLOAD' <<<"$CDR_A")" = "1" ] && grep -qx 'UPLOAD oam-b' <<<"$CDR_A" \
+   && grep -qx 'OK draft completed on attempt 2' <<<"$CDR_A" && grep -qx 'RC 0' <<<"$CDR_A" \
+   && grep -qx 'MISSING ' <<<"$CDR_A" && ! grep -q 'NO-CLOBBER' <<<"$CDR_A"; then pass; else fail "$CDR_A"; fi
+
+it "complete_draft: a wrong-size asset is re-uploaded; a failed upload is retried"
+CDR_A="$(cdr_run true $'oam-a 1\noam-b 7' 1)"
+if [ "$(grep -cx 'UPLOAD oam-b' <<<"$CDR_A")" = "2" ] && ! grep -q 'UPLOAD oam-a' <<<"$CDR_A" \
+   && grep -q '^WARN upload attempt 1 failed' <<<"$CDR_A" && grep -qx 'OK draft completed on attempt 3' <<<"$CDR_A"; then pass
+else fail "$CDR_A"; fi
+
+it "complete_draft: a record an interrupted upload left (state starter) counts as missing"
+if grep -qF "select(.state == \"uploaded\")" "$CDR/fns.sh" \
+   && [ "$(grep -c 'select(.state == "uploaded")' scripts/release-local.sh)" = "2" ]; then pass
+else fail "the draft asset queries no longer filter on state == uploaded"; fi
+
+it "complete_draft: three failed uploads leave the gap for the final check; no draft at all is fatal, uploading nothing"
+CDR_A="$(cdr_run true 'oam-a 1' 9)"
+CDR_B="$(cdr_run '' '' 0)"
+if [ "$(grep -c '^UPLOAD' <<<"$CDR_A")" = "3" ] && grep -qx 'RC 0' <<<"$CDR_A" && grep -qx 'MISSING oam-b' <<<"$CDR_A" \
+   && grep -q '^FAIL gh release create failed and no draft of v9.9.9 could be found' <<<"$CDR_B" && ! grep -q 'UPLOAD' <<<"$CDR_B"; then pass
+else fail "A: $CDR_A"$'\n'"B: $CDR_B"; fi
+
 it "release-local.sh: SHA256SUMS still checksums oam-* only"
 ck grep -qF '( cd "$RELEASE_DIR" && ls -lh oam-* >&2 && sha256sum oam-* > SHA256SUMS && cat SHA256SUMS >&2 )' scripts/release-local.sh
 
