@@ -84,6 +84,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   yet was dropped and the stream ended early (seen as conformance case 63 losing its second
   stdout line under load). The read ends now stay open until their own EOF, as on Windows
   since 0.19.1 (#456).
+- **On Linux and macOS, a signal no longer ends an extra-fd child's output stream.** A read of
+  a child's pipe that a signal interrupted (EINTR) was taken as a failed read: the pipe end
+  closed and the stream ended, so the child's later writes were lost, or killed it with
+  `SIGPIPE`. It now retries, as libuv does. Under Rosetta for Linux, where the blocking reads
+  are interrupted constantly while children spawn, a parent running 16 such children at once
+  got the full output of only one.
 - **A DNS query to a server that does not answer is sent once per try, as c-ares sends it.**
   oam's resolver resent an unanswered UDP query about every 340 ms within one wait, so a
   silent server got up to three datagrams per try where node sends one.
