@@ -39227,17 +39227,30 @@
         throw _shapeDnsError(err, "getnameinfo", withHostname ? address : undefined, true);
       });
     }
+    // The request object node's lookupService returns, and calls its
+    // callback on (node: a GetNameInfoReqWrap carrying the callback; a
+    // caller reads it as `this` in a sloppy-mode callback).
+    class GetNameInfoReqWrap {}
     function lookupService(address, port, callback) {
       if (arguments.length !== 3) throw new codes.ERR_MISSING_ARGS("address", "port", "callback");
       validateLookupServiceArgs(address, port);
       if (typeof callback !== "function") {
         throw codes.ERR_INVALID_ARG_TYPE("callback", "function", callback);
       }
+      const req = new GetNameInfoReqWrap();
+      req.callback = callback;
       _dnsLookupService(address, +port, true).then(
-        (answer) => callback(null, answer.hostname, answer.service),
-        (err) => callback(err),
+        (answer) => callback.call(req, null, answer.hostname, answer.service),
+        (err) => callback.call(req, err),
       );
+      return req;
     }
+    // node's kCustomPromisifyArgs: util.promisify(dns.lookupService)
+    // resolves { hostname, service }.
+    Object.defineProperty(lookupService, Symbol.for("nodejs.util.promisify.customArgs"), {
+      value: ["hostname", "service"],
+      enumerable: false,
+    });
 
     // The callback API over one channel: the module's functions and a
     // dns.Resolver instance's differ only in `api`. Each method is node's
@@ -45836,13 +45849,12 @@
         // Expose performance reference (mirrors Node behavior)
         this.performance = globalThis.performance;
 
+        // 'online' arrives from the worker thread once it is up (its
+        // startup checks passed, its entry not yet loaded), as node's
+        // UP_AND_RUNNING does: a worker that fails its startup never reports
+        // it. It used to be emitted from a microtask after construction,
+        // whether or not the thread ever ran.
         this._recvLoop();
-
-        // Emit 'online' asynchronously after construction, matching Node
-        queueMicrotask(() => {
-          if (!this._exited) this._started = true;
-          this.emit("online");
-        });
       }
       // An emit from the receive loop whose listener throws -- or an
       // 'error' with no listener -- is an uncaughtException, as node raises
@@ -45873,6 +45885,10 @@
               this._emitFromLoop("message", text);
             }
           } else if (typeof raw === "object" && raw !== null) {
+            if (raw.type === "online") {
+              if (!this._exited) this._started = true;
+              this._emitFromLoop("online");
+            }
             if (raw.type === "error") { this._emitFromLoop("error", workerError(raw)); }
             if (raw.type === "stdout" || raw.type === "stderr") {
               // latin1: the Rust side encoded each byte as one code unit.

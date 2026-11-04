@@ -414,13 +414,14 @@ fn build_channel_with(
         let mut builder = Resolver::builder_with_config(config, CaresProvider::default());
         let opts = builder.options_mut();
         *opts = base.options.clone();
-        // Node parity: c-ares always advertises EDNS0 (1232-byte UDP payloads,
-        // DNS flag day 2020). hickory's system-conf path mirrors glibc instead
-        // -- EDNS only with an `options edns0` line in resolv.conf -- and some
-        // forwarders (Tailscale MagicDNS) answer non-EDNS queries with
-        // oversized TC=1 datagrams that then fail to parse, so every large
-        // answer (TXT sets) errors where Node succeeds. try_tcp_on_error
-        // covers the same forwarder shape for answers past the EDNS size.
+        // EDNS0 with 1232-byte UDP payloads. NOT node's: node v22.22.2's
+        // channels send no OPT record (measured: an 800-byte answer is TC over
+        // UDP and then TCP in node, one UDP datagram here; the answer is the
+        // same; docs/node-divergences.md #30). Kept on purpose: some
+        // forwarders (Tailscale MagicDNS) answer a non-EDNS query with an
+        // oversized TC=1 datagram that hickory fails to parse, where c-ares
+        // retries over TCP, so large answers (TXT sets) failed without it.
+        // try_tcp_on_error covers the same forwarder shape past the EDNS size.
         opts.edns0 = true;
         opts.try_tcp_on_error = true;
         // c-ares keeps no answer cache: every query reaches the server
@@ -797,13 +798,17 @@ where
 }
 
 /// One `RecordType` query of `name` over `channel`.
-/// A query's answer section, as the server sent it.
+/// A query's answer section, as the server sent it, and the question name
+/// its response carried (node's c-ares reads names from the response).
 #[derive(Debug)]
-struct Answers(Vec<Record>);
+struct Answers {
+    records: Vec<Record>,
+    question: Option<Name>,
+}
 
 impl Answers {
     fn answers(&self) -> &[Record] {
-        &self.0
+        &self.records
     }
 }
 
@@ -861,7 +866,11 @@ async fn raw_lookup(
             )),
         ));
     }
-    Ok(Answers(response.into_message().answers))
+    let message = response.into_message();
+    Ok(Answers {
+        question: message.queries.first().map(|q| q.name().clone()),
+        records: message.answers,
+    })
 }
 
 /// [`empty_of_type`]'s outcome when `answers` holds records but none of
@@ -871,7 +880,12 @@ fn no_record_of_type(rtype: RecordType, hostname: &str, answers: &Answers) -> Op
     if records.is_empty() || records.iter().any(|r| r.record_type() == rtype) {
         return None;
     }
-    empty_of_type(rtype, hostname, records)
+    // node names the question as the response carries it, not as typed.
+    let asked = answers
+        .question
+        .as_ref()
+        .map_or_else(|| hostname.to_string(), host);
+    empty_of_type(rtype, &asked, records)
 }
 
 /// What node reports for a query whose answer section holds records, none

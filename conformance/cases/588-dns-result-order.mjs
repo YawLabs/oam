@@ -42,6 +42,8 @@ if (scenario === "in-worker") {
   // starts (exit 1, no 'error' event); a good one is its default.
   const start = (order) => new Promise((resolve) => {
     const worker = new Worker(new URL(import.meta.url), { execArgv: [`--dns-result-order=${order}`] });
+    // A worker refused at startup is never online.
+    worker.on("online", () => console.log(`worker with ${order} online`));
     worker.on("error", (e) => console.log("worker error event", e.name, e.code));
     worker.on("exit", (code) => { console.log(`worker with ${order} exit`, code); resolve(); });
   });

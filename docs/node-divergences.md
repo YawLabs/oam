@@ -1378,7 +1378,13 @@ type, a CNAME is not chased with a second query, and `localhost` / `*.invalid` a
 server, as c-ares asks them; and no search domain is tried for any name, as node's resolve*
 (c-ares's `ares_query`, not `ares_search`) tries none. One answer still differs: a SOA query answered with records of other
 types only is `EBADRESP` in Node and `ENODATA` in oam, whose resolver reports an answer with no
-SOA record as empty before the records reach it.
+SOA record as empty before the records reach it. Two wire differences do not change an
+answer: identical queries in flight at once on one channel share a datagram in oam
+(hickory's pool joins them; c-ares sends each), and oam's queries carry an EDNS0 OPT record
+(1232-byte UDP payloads) where Node's carry none, so an answer of 513 to 1232 bytes is one UDP
+datagram in oam and a truncated one retried over TCP in Node. oam keeps EDNS0 because some
+forwarders (Tailscale MagicDNS) answer a non-EDNS query with an oversized truncated datagram
+its resolver cannot parse.
 
 dns's result order (`dns.setDefaultResultOrder()`, `--dns-result-order`, a lookup's
 `order` / `verbatim`) orders `dns.lookup()`, `net.connect()`'s lookups and `http`/`https`

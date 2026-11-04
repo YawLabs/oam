@@ -100,6 +100,8 @@ async function ask(name, method) {
 const ALL = ["resolve4", "resolve6", "resolveCname", "resolveMx", "resolveTxt", "resolveNs",
   "resolveSrv", "resolvePtr", "resolveCaa", "resolveNaptr", "resolveTlsa"];
 for (const method of ALL) await ask("other.oamt.test", method);
+// The CNAME rule names the question as the response carries it, not as typed.
+await ask("Other.Oamt.Test", "resolveCname");
 for (const method of ["resolve4", "resolve6", "resolveMx", "resolveTxt", "resolveTlsa", "resolveNs"]) {
   await ask("cnamenodata.oamt.test", method);
 }

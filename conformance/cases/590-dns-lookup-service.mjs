@@ -8,6 +8,9 @@
 // (ERR_INVALID_ARG_TYPE). A failure is a DNSException with syscall
 // getnameinfo; the promises one has no hostname.
 //
+// The callback form returns the request object and calls back with it as
+// `this`; util.promisify(dns.lookupService) resolves { hostname, service }.
+//
 // Every address is on this host and both runtimes ask the same system
 // resolver, so the names themselves are compared.
 import dns from "node:dns";
@@ -53,6 +56,16 @@ await new Promise((resolve) => {
   });
   sync = false;
 });
+
+// The request object: returned, and the callback's `this`.
+await new Promise((resolve) => {
+  const req = dns.lookupService("127.0.0.1", 80, function () {
+    console.log("this is the returned request", this === req, typeof req);
+    resolve();
+  });
+});
+const { promisify } = await import("node:util");
+console.log("promisified", JSON.stringify(await promisify(dns.lookupService)("127.0.0.1", 22)));
 
 const fn = () => {};
 threw("no arguments", () => dns.lookupService());

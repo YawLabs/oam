@@ -661,6 +661,9 @@ fn run_worker(
         }
     }
     rt.sync_trace_uncaught();
+    // Up and running, as node's worker posts it before loading its entry:
+    // the parent's 'online' (after any message it could not have sent yet).
+    let _ = to_parent.send(WorkerEvent::Online);
     // The entry is looked for on the worker's own thread, as node's is
     // (#287): its failure is the thread's error, handed to the parent whole,
     // and the thread exits 1.
