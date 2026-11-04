@@ -64,7 +64,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   (node asks; `resolve4('localhost')` against a server that has no such name is `ENOTFOUND`),
   and reported `ENODATA` for an answer holding records of other types only, where node
   reports `[]` (TLSA, MX, TXT, SRV, CAA, NAPTR, and A / AAAA beside a CNAME), `ENODATA` (NS,
-  PTR, A / AAAA otherwise) or, for CNAME, the name asked.
+  PTR, A / AAAA otherwise) or, for CNAME, the name asked. No search domain is tried for any
+  name, as node's resolve* tries none (a bare name was walked through the search list).
 - **Every DNS query is sent to the server, as c-ares sends it.** oam's resolver kept an answer
   cache, so a repeated query (an NXDOMAIN or a NODATA answer included) was answered without
   asking, and its TTLs were clamped to one day.

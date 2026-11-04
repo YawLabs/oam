@@ -1375,8 +1375,8 @@ resolver kept an answer cache up to 0.19.2, which c-ares does not), as conforman
 pins with `resolveTlsa`. Each query is one datagram and its answer section is taken as
 served (case 592): an answer holding records of other types only is Node's `[]` or error by
 type, a CNAME is not chased with a second query, and `localhost` / `*.invalid` are asked of the
-server, as c-ares asks them; a bare name walks the search domains and then the name as given,
-as c-ares's search does. One answer still differs: a SOA query answered with records of other
+server, as c-ares asks them; and no search domain is tried for any name, as node's resolve*
+(c-ares's `ares_query`, not `ares_search`) tries none. One answer still differs: a SOA query answered with records of other
 types only is `EBADRESP` in Node and `ENODATA` in oam, whose resolver reports an answer with no
 SOA record as empty before the records reach it.
 

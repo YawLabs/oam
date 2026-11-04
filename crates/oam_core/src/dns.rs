@@ -135,7 +135,6 @@ struct Channel {
     /// What `getServers()` reports, in node's string form and config order.
     display: Vec<String>,
     timing: CaresTiming,
-    ndots: usize,
 }
 
 /// The try budget and server timeout of a channel, as c-ares 1.34.6 runs them
@@ -464,7 +463,6 @@ fn build_channel_with(
         servers,
         display,
         timing,
-        ndots: base.options.ndots,
     }
 }
 
@@ -821,48 +819,17 @@ async fn channel_lookup(
         Ok(name) => name,
         Err(e) => return Err(NetError::Msg(format!("invalid name: {e}"))),
     };
-    // A fully qualified name (`resolve_on` qualifies one with ndots dots) is
-    // ONE query, its answer section as served, as c-ares sends it: the
-    // resolver would chase a CNAME with a second query, answer RFC 6761
+    // ONE query for the name as given, its answer section as served, as
+    // c-ares's ares_query sends it for node's resolve* (not ares_search: no
+    // search domain is tried, measured on node v22.22.2 on a host with two --
+    // `localhost` is asked of the server as it is): the resolver would walk
+    // the search list, chase a CNAME with a second query, answer RFC 6761
     // names (localhost, *.invalid) itself without asking, and drop an answer
-    // holding no record of the type asked (measured on node v22.22.2: one
-    // datagram per call, localhost asked of the server, an answer of other
-    // types [] or an error by type -- `empty_of_type`). A bare name keeps
-    // the resolver's search-list walk.
-    if name.is_fqdn() {
-        return raw_walk(channel, name, rtype).await;
-    }
-    // A bare name (fewer dots than ndots; `resolve_on` qualified the rest):
-    // c-ares's ares_search, which tries each search domain and then the name
-    // as given, each as one query. A name that is not found or has no record
-    // of the type moves on; the first answer wins; when every one fails it
-    // reports ENODATA if any said NODATA, else the last failure (measured on
-    // node v22.22.2 with no search domains: `localhost` is asked of the
-    // server as it is, ENOTFOUND, where hickory answered 127.0.0.1 itself).
-    let mut candidates: Vec<Name> = base()
-        .search
-        .iter()
-        .filter_map(|domain| name.clone().append_domain(domain).ok())
-        .collect();
-    let mut as_given = name;
-    as_given.set_fqdn(true);
-    candidates.push(as_given);
-    let mut nodata = None;
-    let mut last = None;
-    for candidate in candidates {
-        match raw_walk(channel, candidate, rtype).await {
-            Ok(answers) => return Ok(answers),
-            Err(e) if is_not_found(&e) => {
-                if query_error_code(&e) == "ENODATA" {
-                    nodata = Some(e);
-                } else {
-                    last = Some(e);
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Err(nodata.or(last).unwrap_or(NetError::NoConnections))
+    // holding no record of the type asked (node: [] or an error by type --
+    // `empty_of_type`).
+    let mut name = name;
+    name.set_fqdn(true);
+    raw_walk(channel, name, rtype).await
 }
 
 /// The walk over `channel` of one query for `name`.
@@ -870,19 +837,10 @@ async fn raw_walk(channel: &Channel, name: Name, rtype: RecordType) -> Result<An
     walk(channel, |server| {
         let pool = server.pool.clone();
         let query = Query::query(name.clone(), rtype);
-        let request = server.request.clone();
+        let request = server.request;
         async move { raw_lookup(&pool, query, request).await }
     })
     .await
-}
-
-/// A failure the search walk moves past: the name does not exist, or has
-/// no record of the type (NXDOMAIN / NODATA).
-fn is_not_found(e: &NetError) -> bool {
-    matches!(
-        e,
-        NetError::Dns(hickory_resolver::net::DnsError::NoRecordsFound(_))
-    )
 }
 
 /// One query to one server's pool. An empty answer is the pool's own
@@ -1120,30 +1078,10 @@ async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOut
     if ch.servers.is_empty() {
         return no_servers(&hostname);
     }
-    // Query names with enough dots ABSOLUTELY, so a NODATA answer is final.
-    //
-    // c-ares (and therefore node) treats a name carrying at least `ndots`
-    // dots -- 1 by default -- as already qualified: it asks once and reports
-    // that answer, NODATA included. hickory instead walks the search list on
-    // any "no records" outcome (its own docs, resolver.rs: "Anything else will
-    // always incur the cost of querying the ResolverConfig::domain and
-    // ResolverConfig::search"), so the LAST attempt decides the error.
-    //
-    // That is invisible on a host with no search domains and wrong on one with
-    // them: on a Mac with `search tailddd0f3.ts.net lan`, resolveTxt of a name
-    // that exists but has no TXT returned NOERROR/no-answers, hickory then
-    // tried `<name>.tailddd0f3.ts.net` and `<name>.lan`, and the NXDOMAIN from
-    // those bogus names surfaced as ENOTFOUND where node reports ENODATA.
-    // Appending the root dot makes hickory issue exactly one query.
-    //
-    // A name with FEWER than ndots dots (a bare `myhost`) is left alone, so the
-    // search list still does its job for the case it exists for.
-    let ndots = ch.ndots;
-    let hostname = if hostname.ends_with('.') || hostname.matches('.').count() < ndots {
-        hostname
-    } else {
-        format!("{hostname}.")
-    };
+    // Every name is one query, as given (`channel_lookup`): node's resolve*
+    // is c-ares's ares_query, which tries no search domain, whatever the
+    // name's dots. (Up to 0.19.2 a name with dots was qualified here so
+    // hickory would not walk the search list; a bare one was walked.)
     match rrtype.as_str() {
         "A" => match channel_lookup(&ch, &hostname, RecordType::A).await {
             Ok(lookup) => {
