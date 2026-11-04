@@ -308,6 +308,26 @@ fn throw_site(
     }
 }
 
+/// The fatal report of the exception pending on `tc` (`fatal_report`),
+/// with the scope reset: for a throw out of the runtime's own startup -- an
+/// option node refuses as the environment starts (initializeDns), which no
+/// user code could have caught -- so no 'uncaughtException' listener is
+/// asked, as none can be registered yet.
+pub(crate) fn startup_report(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    context: &str,
+) -> String {
+    let Some(exception) = tc.exception() else {
+        return crate::exception_to_error(tc, context).to_string();
+    };
+    let value = v8::Global::new(tc, exception);
+    let message = crate::exception_to_error(tc, context).to_string();
+    let site = throw_site(tc, tc.message());
+    tc.reset();
+    let local = v8::Local::new(tc, &value);
+    fatal_report(tc, local, site, &message)
+}
+
 /// Isolate slot: this thread runs with `--trace-uncaught` (node keeps the
 /// flag per environment, so a worker's own `execArgv` decides its own).
 struct TraceUncaught;

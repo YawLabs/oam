@@ -3708,6 +3708,11 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
           : method,
       headers,
       attempt_timeout_ms: netAttemptTimeoutMs(),
+      // dns's result order as it stands now (dns.setDefaultResultOrder(),
+      // --dns-result-order): node's fetch connects through net, whose lookup
+      // applies it. Read per request; a process that never loaded node:dns
+      // has the flag's value, or verbatim.
+      dns_order: globalThis.__oamNode?._dnsResultOrder ?? globalThis.__oamDnsResultOrder ?? "verbatim",
       // undici's Fetch-spec bad-port block on the initial URL.
       fetch_semantics: fetchSemantics,
       // undici's response-head count and refusal (fetch, undici.request).

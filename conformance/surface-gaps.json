@@ -5,8 +5,8 @@
       "generatedAgainst": "v22.22.2 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1602,
-        "missing": 272,
+        "present": 1604,
+        "missing": 270,
         "absentModules": 4,
         "absentModuleExportNames": 10
       },
@@ -126,12 +126,6 @@
         ],
         "dgram": [
           "_createSocketHandle"
-        ],
-        "dns": [
-          "lookupService"
-        ],
-        "dns/promises": [
-          "lookupService"
         ],
         "domain": [
           "_stack",
@@ -401,8 +395,8 @@
       "generatedAgainst": "v22.22.2 on linux-x64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1602,
-        "missing": 276,
+        "present": 1604,
+        "missing": 274,
         "absentModules": 4,
         "absentModuleExportNames": 10
       },
@@ -526,12 +520,6 @@
         ],
         "dgram": [
           "_createSocketHandle"
-        ],
-        "dns": [
-          "lookupService"
-        ],
-        "dns/promises": [
-          "lookupService"
         ],
         "domain": [
           "_stack",
@@ -801,8 +789,8 @@
       "generatedAgainst": "v22.22.2 on win32-arm64",
       "counts": {
         "nodeExportNames": 1874,
-        "present": 1601,
-        "missing": 263,
+        "present": 1603,
+        "missing": 261,
         "absentModules": 4,
         "absentModuleExportNames": 10
       },
@@ -915,12 +903,6 @@
         ],
         "dgram": [
           "_createSocketHandle"
-        ],
-        "dns": [
-          "lookupService"
-        ],
-        "dns/promises": [
-          "lookupService"
         ],
         "domain": [
           "_stack",

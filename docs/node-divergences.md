@@ -1372,17 +1372,25 @@ keeps an instance's channel id off the object, so an instance has no own propert
 assertion (`args[2]->IsInt32()`); oam takes it as the cap it names. Query answers are
 Node's: `{ ttl: true }` reports each record's TTL as served, and every query is sent (oam's
 resolver kept an answer cache up to 0.19.2, which c-ares does not), as conformance case 587
-pins with `resolveTlsa`. One TLSA answer differs: a response whose answer section has
-records of other types only (a CNAME, an A) and no TLSA record is `[]` in Node, whose TLSA
-parser walks the answers itself, and `ENODATA` in oam, whose resolver reports "no record of
-the type asked" before the records reach it. A response with any TLSA record matches,
-including the holes Node leaves where a record of another type sat.
+pins with `resolveTlsa`. Each query is one datagram and its answer section is taken as
+served (case 592): an answer holding records of other types only is Node's `[]` or error by
+type, a CNAME is not chased with a second query, and `localhost` / `*.invalid` are asked of the
+server, as c-ares asks them; and no search domain is tried for any name, as node's resolve*
+(c-ares's `ares_query`, not `ares_search`) tries none. One answer still differs: a SOA query answered with records of other
+types only is `EBADRESP` in Node and `ENODATA` in oam, whose resolver reports an answer with no
+SOA record as empty before the records reach it. Two wire differences do not change an
+answer: identical queries in flight at once on one channel share a datagram in oam
+(hickory's pool joins them; c-ares sends each), and oam's queries carry an EDNS0 OPT record
+(1232-byte UDP payloads) where Node's carry none, so an answer of 513 to 1232 bytes is one UDP
+datagram in oam and a truncated one retried over TCP in Node. oam keeps EDNS0 because some
+forwarders (Tailscale MagicDNS) answer a non-EDNS query with an oversized truncated datagram
+its resolver cannot parse.
 
 dns's result order (`dns.setDefaultResultOrder()`, `--dns-result-order`, a lookup's
 `order` / `verbatim`) orders `dns.lookup()`, `net.connect()`'s lookups and `http`/`https`
 requests as in Node (case 588; a non-verbatim order sends a stock-agent request over the
-agent's socket, whose lookup applies it). `fetch()` resolves through oam's own transport and does not read it: Node's
-fetch connects through `net` and so follows it.
+agent's socket, whose lookup applies it), and `fetch()`'s new connections (case 591; a
+pooled connection is reused whatever order opened it, as undici reuses it).
 
 ### 32. A decoded `fetch` response drops `content-encoding` and `content-length`
 
@@ -4672,7 +4680,7 @@ The largest per-module gaps (counts from windows-aarch64), all tracked in that f
 | Module | Missing | Shape of the gap |
 |---|---|---|
 | `constants` | 54 win32 / 65 linux / 61 darwin | The legacy all-in-one table. Platform-conditional values — the `WSA*` block on Windows, `RTLD_*` on POSIX, plus `UV_DIRENT_*` and the `SSL_OP_*`/`ENGINE_METHOD_*` OpenSSL set everywhere. This module is the *entire* reason the ratchet is keyed by platform: a Windows-only baseline reports 16 phantom new gaps on Linux and 12 on darwin, every one of them here. `fs.constants` and `os.constants` are separately correct — see *Platform constant tables* above. |
-| `dns/promises` | 1 | `lookupService` (missing from `dns` too). `Resolver` and the 24 error-code constants landed with #453; `resolveTlsa` and `get`/`setDefaultResultOrder` after it. |
+| `dns/promises` | **0** | Closed after 0.19.2: `Resolver` and the 24 error-code constants (#453), then `resolveTlsa`, `get`/`setDefaultResultOrder` and `lookupService`. `node:dns` has no missing export names either. |
 | `module` | 20 | The `Module._*` loader internals (`_load`, `_resolveFilename`, `_extensions`), `register`, `SourceMap`/`findSourceMap`. The compile-cache API landed in 0.19.1 (see *The compile cache is on by default* above). |
 | `fs` | **0** | Closed in 0.9.1–0.9.2. Ownership and fd metadata (`chown`/`fchown`/`lchown`, `fchmod`/`lchmod`), durability (`fsync`/`fdatasync`), `ftruncate`, the `utimes`/`futimes`/`lutimes` family, `readv`/`writev`, `openAsBlob`, `statfs` and `glob`/`globSync` all landed. `node:fs` now has no missing export names on any platform, and `fs/promises` none since `watch` landed after 0.19.0. |
 | `crypto` | 10 | The legacy class constructors `Cipher(iv)` and `Decipher(iv)`, `diffieHellman`, `getCipherInfo`, `randomFill`. |

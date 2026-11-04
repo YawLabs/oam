@@ -39,8 +39,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **`dns.getDefaultResultOrder()` and a working `dns.setDefaultResultOrder()`, on `dns` and
   `dns.promises`, and `--dns-result-order`** (also from `NODE_OPTIONS`). `setDefaultResultOrder`
   did nothing and the flag was refused; a lookup's `order` and `verbatim` options were checked
-  and then ignored. `dns.lookup()`, `net.connect()` and `http`/`https` requests now order their
-  answers by them, as node does.
+  and then ignored. `dns.lookup()`, `net.connect()`, `http`/`https` requests and `fetch()` now
+  order their answers by them, as node does.
+- **`dns.lookupService()` and `dns.promises.lookupService()`**: getnameinfo, with node's
+  argument checks and error shape (syscall `getnameinfo`). `node:dns` and `node:dns/promises`
+  now have every export name node's do.
 - **`--throw-deprecation`** (also from `NODE_OPTIONS` and a `Worker`'s `execArgv`): a
   deprecation warning is thrown on the next tick instead of printed. It was refused with exit
   code 2. `process.noDeprecation` under `--no-deprecation` is read-only, as in node.
@@ -55,6 +58,14 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   upper-case NetBIOS name on Windows (`WOODS` where node says `woods`).
 - **`{ ttl: true }` on `resolve4()` / `resolve6()` reports each record's TTL as served.** It
   reported `ttl: 0` for every address.
+- **A DNS query's answer is the server's, as c-ares hands it to node.** oam's resolver chased
+  a CNAME with a second query and answered with the target's records (node sends one query
+  and answers `[]`), answered `localhost` and `*.invalid` itself without asking the server
+  (node asks; `resolve4('localhost')` against a server that has no such name is `ENOTFOUND`),
+  and reported `ENODATA` for an answer holding records of other types only, where node
+  reports `[]` (TLSA, MX, TXT, SRV, CAA, NAPTR, and A / AAAA beside a CNAME), `ENODATA` (NS,
+  PTR, A / AAAA otherwise) or, for CNAME, the name asked. No search domain is tried for any
+  name, as node's resolve* tries none (a bare name was walked through the search list).
 - **Every DNS query is sent to the server, as c-ares sends it.** oam's resolver kept an answer
   cache, so a repeated query (an NXDOMAIN or a NODATA answer included) was answered without
   asking, and its TTLs were clamped to one day.

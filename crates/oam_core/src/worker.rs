@@ -13,6 +13,10 @@ use std::sync::mpsc;
 /// Events flowing from a worker to its parent.
 #[derive(Debug)]
 pub enum WorkerEvent {
+    /// The worker thread is up and about to load its entry: node's
+    /// UP_AND_RUNNING, the parent's 'online'. Not sent by a worker that fails
+    /// its startup (an option it refuses), which node never reports online.
+    Online,
     Message(Vec<u8>),
     Error(WorkerError),
     /// What a worker's run threw when it failed fatally, as the worker's JS
@@ -155,6 +159,9 @@ pub async fn parent_recv(registry: WorkerRegistry, worker_id: u64) -> OpOutcome 
         Ok((rx, Ok(event))) => {
             reinsert_receiver(&registry, worker_id, rx);
             match event {
+                WorkerEvent::Online => {
+                    OpOutcome::Json(serde_json::json!({"type": "online"}).to_string())
+                }
                 WorkerEvent::Message(data) => OpOutcome::Bytes(data),
                 WorkerEvent::Error(error) => OpOutcome::Json(error.to_json()),
                 // Spliced, not re-encoded: the worker's serializer already

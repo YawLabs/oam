@@ -768,6 +768,9 @@ pub(crate) struct DialParams {
     pub(crate) attempt_timeout: Duration,
     /// On a lookup-hooked connector, the hook's answer for this dial's host.
     pub(crate) pin: Option<HookPin>,
+    /// dns's result order as the request's caller read it, for a dial that
+    /// resolves the host itself (`ConnectOptions::order`).
+    pub(crate) dns_order: crate::dns::ResultOrder,
 }
 
 /// A lookup-hooked connector was asked to open a connection to a host NAME
@@ -1021,13 +1024,21 @@ impl OamConnector {
                 if let Some(intercept) = self.shared.proxy.as_ref().and_then(|m| m.intercept(&dst))
                 {
                     return self
-                        .through_proxy(dst, &host, intercept, alpn, params.attempt_timeout)
+                        .through_proxy(
+                            dst,
+                            &host,
+                            intercept,
+                            alpn,
+                            params.attempt_timeout,
+                            params.dns_order,
+                        )
                         .await;
                 }
                 ConnectOptions {
                     attempt_timeout: params.attempt_timeout,
                     pin: None,
                     local: None,
+                    order: params.dns_order,
                     ..ConnectOptions::default()
                 }
             }
@@ -1084,6 +1095,7 @@ impl OamConnector {
         intercept: Intercept,
         alpn: Alpn,
         attempt_timeout: Duration,
+        dns_order: crate::dns::ResultOrder,
     ) -> Result<OamConn, BoxError> {
         if !matches!(intercept.uri().scheme_str(), Some("http" | "https")) {
             return Err(format!(
@@ -1095,6 +1107,7 @@ impl OamConnector {
         let mut transport = ProxyTransport {
             shared: self.shared.clone(),
             attempt_timeout,
+            dns_order,
         };
         if dst.scheme_str() != Some("https") {
             let mut conn = transport.call(intercept.uri().clone()).await?;
@@ -1146,6 +1159,9 @@ fn supplied(conns: &SuppliedConns, dst: &Uri) -> Result<OamConn, BoxError> {
 pub(crate) struct ProxyTransport {
     pub(crate) shared: Arc<Shared>,
     pub(crate) attempt_timeout: Duration,
+    /// dns's result order for the proxy's own lookup (node's ProxyAgent
+    /// connects to the proxy through net).
+    pub(crate) dns_order: crate::dns::ResultOrder,
 }
 
 impl Service<Uri> for ProxyTransport {
@@ -1172,6 +1188,7 @@ impl Service<Uri> for ProxyTransport {
                 attempt_timeout: this.attempt_timeout,
                 pin: None,
                 local: None,
+                order: this.dns_order,
                 ..ConnectOptions::default()
             };
             let tcp = dial(&host, port, &opts, &AttemptLog::default()).await?;
@@ -1723,6 +1740,7 @@ mod tests {
         let mut transport = ProxyTransport {
             shared: shared(Some(rules)),
             attempt_timeout: Duration::from_millis(250),
+            dns_order: crate::dns::ResultOrder::Verbatim,
         };
         let uri: Uri = format!("http://127.0.0.1:{port}/").parse().unwrap();
         let conn = transport.call(uri).await.unwrap();
@@ -1754,11 +1772,13 @@ mod tests {
                 addrs: vec!["127.0.0.1".parse().unwrap()],
                 gate: None,
             }),
+            dns_order: crate::dns::ResultOrder::Verbatim,
         };
         for dial in [
             DialParams {
                 attempt_timeout: Duration::from_millis(250),
                 pin: None,
+                dns_order: crate::dns::ResultOrder::Verbatim,
             },
             elsewhere("localhost:2"),
             elsewhere("other.test:1"),

@@ -32076,6 +32076,21 @@
       throw codes.ERR_INVALID_ARG_VALUE(name, order, "must be one of: 'verbatim', 'ipv4first', 'ipv6first'");
     }
   }
+  // node's initializeDns, as each environment starts (the main thread's
+  // and every Worker's): --dns-result-order's value must be one of the
+  // three. The runtime calls it right after the flags snippet
+  // (JsRuntime::check_startup_options) and, if it throws, prints the fatal
+  // report and exits 1, as node does.
+  function initializeDns() {
+    const flag = globalThis.__oamDnsResultOrder;
+    if (flag !== undefined) validateDnsOrder(flag, "--dns-result-order");
+  }
+  Object.defineProperty(globalThis, "__oamCheckStartupOptions", {
+    value: initializeDns,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
 
   function validateDnsFamily(family, name) {
     if (family == null) return 0;
@@ -39193,6 +39208,50 @@
       return _dnsQuery(name, rrtype, api);
     }
 
+    // dns.lookupService(address, port, callback) / dns.promises'
+    // lookupService(address, port): getnameinfo, as node's lib/dns.js and
+    // internal/dns/promises.js check the arguments -- the exact count (node
+    // throws ERR_MISSING_ARGS for any other), an IP literal, a port node's
+    // validatePort takes (a numeric string too), a callback -- then +port.
+    // A failure is the DNSException node builds, syscall getnameinfo; the
+    // promises one carries no hostname, as node's does not (measured on
+    // v22.22.2).
+    function validateLookupServiceArgs(address, port) {
+      if (registry.get("net").isIP(address) === 0) {
+        throw codes.ERR_INVALID_ARG_VALUE("address", address);
+      }
+      validatePort(port);
+    }
+    function _dnsLookupService(address, port, withHostname) {
+      return natives.dnsLookupService(address, port).then(undefined, (err) => {
+        throw _shapeDnsError(err, "getnameinfo", withHostname ? address : undefined, true);
+      });
+    }
+    // The request object node's lookupService returns, and calls its
+    // callback on (node: a GetNameInfoReqWrap carrying the callback; a
+    // caller reads it as `this` in a sloppy-mode callback).
+    class GetNameInfoReqWrap {}
+    function lookupService(address, port, callback) {
+      if (arguments.length !== 3) throw new codes.ERR_MISSING_ARGS("address", "port", "callback");
+      validateLookupServiceArgs(address, port);
+      if (typeof callback !== "function") {
+        throw codes.ERR_INVALID_ARG_TYPE("callback", "function", callback);
+      }
+      const req = new GetNameInfoReqWrap();
+      req.callback = callback;
+      _dnsLookupService(address, +port, true).then(
+        (answer) => callback.call(req, null, answer.hostname, answer.service),
+        (err) => callback.call(req, err),
+      );
+      return req;
+    }
+    // node's kCustomPromisifyArgs: util.promisify(dns.lookupService)
+    // resolves { hostname, service }.
+    Object.defineProperty(lookupService, Symbol.for("nodejs.util.promisify.customArgs"), {
+      value: ["hostname", "service"],
+      enumerable: false,
+    });
+
     // The callback API over one channel: the module's functions and a
     // dns.Resolver instance's differ only in `api`. Each method is node's
     // resolver(bindingName) wrapper: query(name[, options], callback).
@@ -39362,6 +39421,11 @@
           return Promise.resolve(all ? [] : { address: null, family: family === 6 ? 6 : 4 });
         }
         return _dnsLookupHinted(hostname, family, all, hints, order);
+      },
+      lookupService(address, port) {
+        if (arguments.length !== 2) throw new codes.ERR_MISSING_ARGS("address", "port");
+        validateLookupServiceArgs(address, port);
+        return _dnsLookupService(address, +port, false);
       },
       // Filled in below, once the class exists; the key keeps node's place.
       Resolver: undefined,
@@ -39592,9 +39656,9 @@
     });
 
     // node's key order (Object.keys(dns), measured on v22.22.2).
-    // lookupService is still missing (a recorded surface gap).
     return {
       lookup,
+      lookupService,
       Resolver,
       getDefaultResultOrder,
       setDefaultResultOrder,
@@ -45785,13 +45849,12 @@
         // Expose performance reference (mirrors Node behavior)
         this.performance = globalThis.performance;
 
+        // 'online' arrives from the worker thread once it is up (its
+        // startup checks passed, its entry not yet loaded), as node's
+        // UP_AND_RUNNING does: a worker that fails its startup never reports
+        // it. It used to be emitted from a microtask after construction,
+        // whether or not the thread ever ran.
         this._recvLoop();
-
-        // Emit 'online' asynchronously after construction, matching Node
-        queueMicrotask(() => {
-          if (!this._exited) this._started = true;
-          this.emit("online");
-        });
       }
       // An emit from the receive loop whose listener throws -- or an
       // 'error' with no listener -- is an uncaughtException, as node raises
@@ -45822,6 +45885,10 @@
               this._emitFromLoop("message", text);
             }
           } else if (typeof raw === "object" && raw !== null) {
+            if (raw.type === "online") {
+              if (!this._exited) this._started = true;
+              this._emitFromLoop("online");
+            }
             if (raw.type === "error") { this._emitFromLoop("error", workerError(raw)); }
             if (raw.type === "stdout" || raw.type === "stderr") {
               // latin1: the Rust side encoded each byte as one code unit.

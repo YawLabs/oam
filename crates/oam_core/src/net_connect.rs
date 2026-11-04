@@ -86,6 +86,12 @@ pub struct ConnectOptions {
     /// for it. The default is what node's `net` passes a connect given no
     /// `family` and no `hints`: [`default_connect_hints`].
     pub hints: i32,
+    /// dns's result order (`dns.setDefaultResultOrder()`) for the connect's
+    /// own lookup, applied to getaddrinfo's answer before the attempts are
+    /// interleaved, as node's dns.lookup applies it under net.connect. Not
+    /// applied to a [`Pin`]: a ticket is ordered already and a hook's answer
+    /// is used as given.
+    pub order: crate::dns::ResultOrder,
 }
 
 impl Default for ConnectOptions {
@@ -95,6 +101,7 @@ impl Default for ConnectOptions {
             pin: None,
             local: None,
             hints: default_connect_hints(),
+            order: crate::dns::ResultOrder::Verbatim,
         }
     }
 }
@@ -164,6 +171,62 @@ pub(crate) async fn getaddrinfo(
     match answered {
         Ok(result) => result,
         // The blocking task panicked or was cancelled: not a resolver answer.
+        Err(join) => Err(std::io::Error::other(join)),
+    }
+}
+
+/// getnameinfo of `address` (an IP literal, an IPv6 zone allowed) at `port`,
+/// as libuv's uv_getnameinfo asks it for node's dns.lookupService: with
+/// NI_NAMEREQD, so an address with no name is a resolver failure (ENOTFOUND)
+/// rather than the address echoed back. Returns (hostname, service); the
+/// service is the port's name, or the number when it has none.
+///
+/// The zone is mapped to a scope id as libuv's uv_ip6_addr maps it: the
+/// CRT's atoi on Windows, the interface index elsewhere (sysfs on Linux, the
+/// system resolver on macOS and the BSDs, as [`zone_scope_id`] does).
+pub(crate) async fn getnameinfo(address: &str, port: u16) -> std::io::Result<(String, String)> {
+    let addr = match address.split_once('%') {
+        None => SocketAddr::new(
+            address
+                .parse()
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?,
+            port,
+        ),
+        Some((ip, zone)) => {
+            let ip: std::net::Ipv6Addr = ip
+                .parse()
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+            let scope = if cfg!(windows) {
+                c_atoi(zone) as u32
+            } else if cfg!(target_os = "linux") {
+                sysfs_ifindex(zone).unwrap_or(0)
+            } else {
+                match getaddrinfo(address, 0, None, 0).await {
+                    Ok(resolved) => resolved
+                        .iter()
+                        .find_map(|addr| match addr {
+                            SocketAddr::V6(v6) => Some(v6.scope_id()),
+                            SocketAddr::V4(_) => None,
+                        })
+                        .unwrap_or(0),
+                    Err(_) => 0,
+                }
+            };
+            SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, scope))
+        }
+    };
+    #[cfg(unix)]
+    let flags = libc::NI_NAMEREQD;
+    #[cfg(windows)]
+    let flags = windows_sys::Win32::Networking::WinSock::NI_NAMEREQD as i32;
+    #[cfg(not(any(unix, windows)))]
+    let flags = 0;
+    let answered = tokio::task::spawn_blocking(move || {
+        dns_lookup::getnameinfo(&addr, flags).map_err(gai_io_error)
+    })
+    .await;
+    match answered {
+        Ok(result) => result,
         Err(join) => Err(std::io::Error::other(join)),
     }
 }
@@ -770,10 +833,13 @@ pub(crate) async fn connect_with<D: Dialer>(
             targets
         }
         None => match dialer.lookup(host, port, None, opts.hints).await {
-            Ok(resolved) => resolved
-                .into_iter()
-                .map(|addr| (addr, addr.ip().to_string()))
-                .collect(),
+            Ok(mut resolved) => {
+                opts.order.apply(&mut resolved, SocketAddr::is_ipv4);
+                resolved
+                    .into_iter()
+                    .map(|addr| (addr, addr.ip().to_string()))
+                    .collect()
+            }
             Err(error) => return Err(ConnectError::Resolve(Box::new(resolve_error(host, &error)))),
         },
     };

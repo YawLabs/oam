@@ -112,6 +112,11 @@ pub struct FetchRequest {
     /// Missing or not a positive number: node's 250 ms.
     #[serde(default)]
     pub attempt_timeout_ms: Option<f64>,
+    /// dns's result order when the request was made
+    /// (`dns.getDefaultResultOrder()`): "verbatim", "ipv4first" or
+    /// "ipv6first"; missing is verbatim.
+    #[serde(default)]
+    pub dns_order: Option<String>,
     /// undici's connect timeout, in ms: how long each connection this
     /// request opens has to be connected (for https, handshaken) before the
     /// request fails with undici's `ConnectTimeoutError`. JS sends it for
@@ -612,6 +617,9 @@ pub async fn fetch(
         }
         .with_connect_timeout(connect_timeout_from_ms(req.connect_timeout_ms))
         .with_alpn(req.alpn)
+        .with_dns_order(crate::dns::ResultOrder::parse(
+            req.dns_order.as_deref().unwrap_or("verbatim"),
+        ))
     };
     let pin = match req.pin_origin.as_deref().map(pin_origin) {
         None => None,
