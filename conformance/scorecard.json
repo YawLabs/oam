@@ -1,7 +1,7 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "38e87ef1",
-  "oamVersion": "oam 0.19.2",
+  "commit": "7d0c04db",
+  "oamVersion": "oam 0.19.3",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
   "suites": {
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 422,
-      "total": 423,
+      "pass": 425,
+      "total": 426,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -1548,6 +1548,18 @@
           "status": "pass"
         },
         {
+          "case": "590-dns-lookup-service.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "591-fetch-dns-result-order.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "592-dns-answer-section-as-served.mjs",
+          "status": "pass"
+        },
+        {
           "case": "60-child-stdio-forms.mjs",
           "status": "pass"
         },
@@ -1811,7 +1823,7 @@
         "platform": "win32",
         "noBaseline": false,
         "nodeTotal": 1874,
-        "knownMissing": 263,
+        "knownMissing": 261,
         "newMissing": [],
         "staleRatchet": [],
         "absentModules": [],
