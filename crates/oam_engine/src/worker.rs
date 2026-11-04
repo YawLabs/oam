@@ -599,14 +599,17 @@ fn run_worker(
     // would otherwise start with none of them.
     match flags_js {
         Some((js, resolved)) => {
-            // A flag the worker's own options make it refuse (a bad
-            // --dns-result-order) throws here: node fails such a worker as it
-            // starts, its error printed by the worker and no 'error' event
-            // for the parent, which sees exit code 1 (measured on v22.22.2).
-            if !js.is_empty()
-                && let Err(error) = rt.execute_script("<flags>", &js)
-            {
-                eprintln!("{error}");
+            if !js.is_empty() {
+                let _ = rt.execute_script("<flags>", &js);
+            }
+            // An option the worker's own flags make it refuse (a bad
+            // --dns-result-order): node fails such a worker as it starts
+            // (initializeDns), its fatal report printed by the worker and no
+            // 'error' event for the parent, which sees exit code 1 (measured
+            // on v22.22.2). Its own --trace-uncaught applies to the report.
+            rt.sync_trace_uncaught();
+            if let Err(report) = rt.check_startup_options() {
+                eprint!("{report}");
                 return 1;
             }
             // What a Worker this one creates with neither `env` nor

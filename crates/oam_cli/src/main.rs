@@ -755,18 +755,10 @@ fn main() -> ExitCode {
             eprintln!("{exe}: {flag} requires an argument");
             return ExitCode::from(9);
         }
-        // node checks --dns-result-order's value in JS at startup
-        // (initializeDns), from argv or NODE_OPTIONS alike, and dies of the
-        // TypeError: exit 1, not 9 (measured on v22.22.2).
-        if let Some(order) = &flags.dns_result_order
-            && !is_dns_result_order(order)
-        {
-            eprintln!(
-                "TypeError [ERR_INVALID_ARG_VALUE]: {}",
-                dns_result_order_message(order)
-            );
-            return ExitCode::from(1);
-        }
+        // A bad --dns-result-order VALUE is refused as the runtime starts
+        // (`install`: node checks it in JS, initializeDns, from argv or
+        // NODE_OPTIONS alike, and dies of the TypeError's fatal report with
+        // exit 1, not 9; measured on v22.22.2).
         if let Some(source) = eval_source {
             return run_eval(&source, print, &raw[i..], &flags);
         }
@@ -2044,20 +2036,6 @@ fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
     before != *flags
 }
 
-/// The values node's `--dns-result-order` takes.
-fn is_dns_result_order(value: &str) -> bool {
-    matches!(value, "verbatim" | "ipv4first" | "ipv6first")
-}
-
-/// node's ERR_INVALID_ARG_VALUE message for a bad `--dns-result-order`
-/// (the value as node's inspect quotes a plain string).
-fn dns_result_order_message(value: &str) -> String {
-    format!(
-        "The argument '--dns-result-order' must be one of: 'verbatim', 'ipv4first', \
-         'ipv6first'. Received '{value}'"
-    )
-}
-
 /// The values node's `--trace-require-module` takes.
 fn is_trace_require_module_value(value: &str) -> bool {
     matches!(value, "all" | "no-node-modules")
@@ -3014,6 +2992,14 @@ impl NodeFlags {
         if !js.is_empty() {
             let _ = rt.execute_script("<flags>", &js);
             rt.sync_trace_uncaught();
+            // node's initializeDns at startup: a refused option ends the
+            // process with the error's fatal report, exit 1, before any user
+            // code runs (nothing is written or registered yet).
+            if let Err(report) = rt.check_startup_options() {
+                eprint!("{report}");
+                oam_engine::run_exit_cleanup();
+                std::process::exit(1);
+            }
             // oam.fork()'s in-process pool gets its own isolate; publish the
             // same snippet so it inherits the flags instead of starting
             // clean. (A worker_threads Worker decides its own: see
@@ -3092,22 +3078,12 @@ impl NodeFlags {
             js.push_str(&def("__oamTraceRequireModule", format!("\"{mode}\"")));
         }
         // node:dns reads it as the initial default result order. A value
-        // other than node's three can only reach here from a Worker's own
-        // execArgv (the main thread refused it at startup), and node fails
-        // that worker as it starts (initializeDns): the throw ends this
-        // snippet, which the worker treats as its startup failing.
+        // other than node's three is refused by the environment's startup
+        // check (`__oamCheckStartupOptions`, node's initializeDns), which
+        // `install` and a worker run right after this snippet.
         if let Some(order) = &self.dns_result_order {
-            if is_dns_result_order(order) {
-                let quoted = serde_json::to_string(order).unwrap_or_else(|_| "null".into());
-                js.push_str(&def("__oamDnsResultOrder", quoted));
-            } else {
-                let message = serde_json::to_string(&dns_result_order_message(order))
-                    .unwrap_or_else(|_| "\"\"".into());
-                js.push_str(&format!(
-                    "throw Object.assign(new TypeError({message}), \
-                       {{ code: 'ERR_INVALID_ARG_VALUE' }});"
-                ));
-            }
+            let quoted = serde_json::to_string(order).unwrap_or_else(|_| "null".into());
+            js.push_str(&def("__oamDnsResultOrder", quoted));
         }
         // node:tls reads these as the initial DEFAULT_MIN_VERSION /
         // DEFAULT_MAX_VERSION (the names are node's own four, so quoting

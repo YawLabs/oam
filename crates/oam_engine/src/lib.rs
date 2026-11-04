@@ -973,6 +973,33 @@ impl JsRuntime {
         crate::modules::sync_trace_uncaught(scope);
     }
 
+    /// Run the environment's startup check (`__oamCheckStartupOptions`, the
+    /// node:dns flag's validation node runs as initializeDns): `Err` is the
+    /// fatal report node prints for an option it refuses there -- the source
+    /// frame, the error, its `{ code }`, the version trailer -- for the
+    /// caller to print before it exits 1.
+    pub fn check_startup_options(&mut self) -> std::result::Result<(), String> {
+        self.clear_active_host();
+        v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
+        v8::tc_scope!(let tc, scope);
+        let context = tc.get_current_context();
+        let global = context.global(tc);
+        let Some(key) = v8::String::new(tc, "__oamCheckStartupOptions") else {
+            return Ok(());
+        };
+        let Some(check) = global
+            .get(tc, key.into())
+            .and_then(|f| v8::Local::<v8::Function>::try_from(f).ok())
+        else {
+            return Ok(());
+        };
+        let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+        if check.call(tc, recv, &[]).is_some() && !tc.has_caught() {
+            return Ok(());
+        }
+        Err(crate::modules::startup_report(tc, "<startup>"))
+    }
+
     pub fn execute_script(&mut self, name: &str, source: &str) -> Result<String> {
         self.execute_script_draining(name, source, AfterScript::TicksAndMicrotasks)
     }

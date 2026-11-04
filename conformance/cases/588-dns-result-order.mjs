@@ -142,12 +142,15 @@ if (scenario === "in-worker") {
       encoding: "utf8",
       env: { ...process.env, ...env },
     });
-    const err = child.stderr.split(/\r?\n/)
-      .find((l) => l.includes("ERR_INVALID_ARG_VALUE") || l.includes("requires an argument")) ?? "";
+    // The error's own line (the report's source frame names a builtin of
+    // each runtime's), and whether the report carries the error's code.
+    const lines = child.stderr.split(/\r?\n/);
+    const err = lines.find((l) => l.startsWith("TypeError") || l.includes("requires an argument")) ?? "";
+    const coded = lines.some((l) => l.trim() === "code: 'ERR_INVALID_ARG_VALUE'");
     console.log(`## ${[...flags, ...Object.entries(env).map(([k, v]) => `${k}=${v}`)].join(" ")}`,
       "exit", child.status, child.stdout.trim(),
       // The executable's path heads node's option-parser line; it is not compared.
-      err.trim().replace(/^.*TypeError/, "TypeError").replace(/^.*?: (--dns-result-order)/, "$1"));
+      err.trim().replace(/^.*?: (--dns-result-order)/, "$1"), coded ? "{ code }" : "");
   };
   run(["--dns-result-order=ipv4first"]);
   run(["--dns-result-order", "ipv6first"]);

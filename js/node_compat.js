@@ -32076,6 +32076,21 @@
       throw codes.ERR_INVALID_ARG_VALUE(name, order, "must be one of: 'verbatim', 'ipv4first', 'ipv6first'");
     }
   }
+  // node's initializeDns, as each environment starts (the main thread's
+  // and every Worker's): --dns-result-order's value must be one of the
+  // three. The runtime calls it right after the flags snippet
+  // (JsRuntime::check_startup_options) and, if it throws, prints the fatal
+  // report and exits 1, as node does.
+  function initializeDns() {
+    const flag = globalThis.__oamDnsResultOrder;
+    if (flag !== undefined) validateDnsOrder(flag, "--dns-result-order");
+  }
+  Object.defineProperty(globalThis, "__oamCheckStartupOptions", {
+    value: initializeDns,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
 
   function validateDnsFamily(family, name) {
     if (family == null) return 0;
