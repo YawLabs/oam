@@ -34226,6 +34226,338 @@ fn v8_pool_size_env_warns_once_on_a_bad_value_and_yields_to_the_flag() {
     );
 }
 
+/// Issue #471: a node-style runtime flag given right after `run` works --
+/// the `deno run --flag` shape -- with the same runtime effect as the same
+/// flag before the subcommand. It must NEVER reach the script's argv and
+/// never die on clap's "use '-- --flag'" tip. `--` after `run` still means
+/// script args, and unknown flags still get clap's own error.
+#[test]
+fn node_flag_after_run_installs_like_before_the_subcommand() {
+    let script = write_temp(
+        "node_flag_position.mjs",
+        "import dns from 'node:dns';\n\
+         console.log('argv:', JSON.stringify(process.argv.slice(2)), \
+         'throwDeprecation:', process.throwDeprecation, \
+         'noDeprecation:', process.noDeprecation, \
+         'order:', dns.getDefaultResultOrder());",
+    );
+    let path = script.to_string_lossy().to_string();
+
+    // The canonical shape, unchanged: the flag installs.
+    let out = oam(&["--throw-deprecation", "run", &path]);
+    assert!(
+        out.status.success(),
+        "flag before the subcommand must still work: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("throwDeprecation: true"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // The #471 shape now works, with the same effect. Every spelling the
+    // issue reports: a boolean toggle, and a value flag in both `=` and
+    // spaced forms.
+    let run = |args: &[&str], needle: &str| {
+        let out = oam(args);
+        assert!(
+            out.status.success(),
+            "{args:?}: exit {:?}; stderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(needle),
+            "{args:?}: wanted {needle:?} in {stdout}"
+        );
+        // The flag must never leak into the script's argv.
+        assert!(
+            !stdout.contains(r#""--throw-deprecation""#)
+                && !stdout.contains(r#""--no-deprecation""#)
+                && !stdout.contains(r#""--dns-result-order""#),
+            "{args:?}: a runtime flag leaked into script argv: {stdout}"
+        );
+    };
+    run(
+        &["run", "--throw-deprecation", &path],
+        "throwDeprecation: true",
+    );
+    run(&["run", "--no-deprecation", &path], "noDeprecation: true");
+    run(
+        &["run", "--dns-result-order=ipv4first", &path],
+        "order: ipv4first",
+    );
+    run(
+        &["run", "--dns-result-order", "ipv6first", &path],
+        "order: ipv6first",
+    );
+    // Several flags after `run`, mixed with one before.
+    run(
+        &[
+            "--no-warnings",
+            "run",
+            "--throw-deprecation",
+            "--trace-deprecation",
+            &path,
+        ],
+        "throwDeprecation: true",
+    );
+    // A flag after the FILE is a script arg, untouched by the lift.
+    let out = oam(&["run", &path, "--throw-deprecation"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // `--throw-deprecation` after the file is handed to the script as argv
+    // only when preceded by `--`; without it, clap answers it. Accept either
+    // clap refusal (exit 2) or the node parser taking it (there is no file
+    // positional left, so refusal is expected); the point is it is NOT a
+    // silent no-op script arg.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a flag after the FILE is not a script arg and not a run option: {stdout}"
+    );
+
+    // The `--` separator after `run` still means script args (unchanged).
+    let out = oam(&["run", &path, "--", "--throw-deprecation"]);
+    assert!(
+        out.status.success(),
+        "script args after -- are untouched: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(r#""--throw-deprecation""#)
+            && stdout.contains("throwDeprecation: undefined"),
+        "the flag lands in script argv, not the runtime: {stdout}"
+    );
+
+    // A `run` option oam really takes is untouched: --inspect still parses
+    // after `run` (and a node flag before it still installs). --inspect
+    // (not -brk: that one waits for a debugger and would hang the run).
+    let out = oam(&["--no-warnings", "run", "--inspect=127.0.0.1:0", &path]);
+    assert!(
+        out.status.success(),
+        "--inspect after run + node flag before: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Debugger listening on")
+            && String::from_utf8_lossy(&out.stdout).contains("argv: []"),
+        "inspector attached and the script ran; stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // An unknown flag after `run` still gets clap's own error (the lift
+    // leaves it where it was).
+    let out = oam(&["run", "--definitely-not-a-flag", &path]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unexpected argument"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // oam's own --json global is transparent to the lift AND to the
+    // pre-parse: it can sit on either side of the subcommand or of a node
+    // flag, and every spelling reaches the same run. Previously
+    // `oam --json run --flag x` died on clap's tip because the pre-parse
+    // broke at the unknown --json before reaching the flag.
+    for args in [
+        vec!["--json", "run", "--throw-deprecation"],
+        vec!["run", "--json", "--throw-deprecation"],
+        vec!["run", "--throw-deprecation", "--json"],
+    ] {
+        let mut full: Vec<&str> = args.clone();
+        full.push(&path);
+        let out = oam(&full);
+        assert!(
+            out.status.success(),
+            "{args:?}: exit {:?}; stderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("throwDeprecation: true"),
+            "{args:?}: {stdout}"
+        );
+    }
+}
+
+/// More of the #471 matrix, on shapes the lift touches beyond the basic
+/// run-with-one-flag case: execArgv reflection, repeated grants, the
+/// bare-script argv shape, and the subcommands other than `run`.
+#[test]
+fn node_flag_lift_edge_shapes() {
+    let script = write_temp(
+        "node_flag_edges.mjs",
+        "import { isMainThread } from 'node:worker_threads';\n\
+         if (isMainThread) {\n\
+           console.log('argv:', JSON.stringify(process.argv.slice(2)),\n\
+             'throwDeprecation:', process.throwDeprecation,\n\
+             'execArgv:', JSON.stringify([...process.execArgv]));\n\
+         } else {\n\
+           console.log('child argv:', JSON.stringify(process.argv.slice(2)));\n\
+         }",
+    );
+    let path = script.to_string_lossy().to_string();
+
+    // execArgv reflects a lifted flag, as it reflects the same flag given
+    // before the subcommand: a fork()/re-spawn child replays it.
+    let out = oam(&["run", "--throw-deprecation", &path]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(r#"execArgv: ["--throw-deprecation"]"#),
+        "lifted flag must be reflected in execArgv: {stdout}"
+    );
+    // And in the canonical position, unchanged.
+    let out = oam(&["--throw-deprecation", "run", &path]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(r#"execArgv: ["--throw-deprecation"]"#),
+        "pre-subcommand flag still reflected: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Two occurrences of one list grant both lift and both survive.
+    let grant_a = format!("--allow-fs-read={}", path);
+    let grant_b = format!("--allow-fs-read={}", path);
+    let out = oam(&["run", &grant_a, &grant_b, &path]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(r#"execArgv: ["--throw-deprecation"]"#)
+            == false,
+        "sanity"
+    );
+
+    // The bare-script shape (node's execPath shape) is untouched: node
+    // gives `node x.js --no-warnings` the argv ["--no-warnings"], and so
+    // must oam -- a node-flag-shaped token after a SCRIPT PATH is a script
+    // arg, never a runtime flag (a lift regression here silently swallows
+    // child args in every spawnPromisified-shaped test).
+    let out = oam(&[&path, "--no-warnings"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(r#"argv: ["--no-warnings"]"#),
+        "bare-script args must pass through: {stdout}"
+    );
+    assert!(
+        !stdout.contains("throwDeprecation") || stdout.contains("throwDeprecation: undefined"),
+        "no runtime flag was installed from a script arg: {stdout}"
+    );
+
+    // The flag-then-json ordering the pre-parse's --json skip enables.
+    let out = oam(&["--throw-deprecation", "--json", "run", &path]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("throwDeprecation: true"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// The #471 refusals that stay refusals, and the shapes that must NEVER
+/// mis-dispatch: a trailing spaced-value flag (used to fall into the
+/// REPL), a Deno-style space grant after `run` (a worse error than the
+/// pre-fix one), and a node flag after an unknown flag (lift does
+/// nothing, clap answers the unknown).
+#[test]
+fn node_flag_lift_refusals_stay_refusals() {
+    let script = write_temp("node_flag_refusals.mjs", "console.log('ran');");
+    let path = script.to_string_lossy().to_string();
+
+    // A trailing spaced-value flag has no value: the pre-parse refuses it
+    // (exit 9), it never lifts, and the process NEVER falls into the REPL.
+    let out = oam(&["run", "--env-file"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "clap refuses the missing <FILE>: stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("typed REPL"),
+        "must not fall into the REPL: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A Deno-style space grant after `run`: `--allow-net` lifts alone (no
+    // `=` value), so the grant value reads as the FILE and clap refuses
+    // the leftover script path. The error names the script, not the flag
+    // -- recorded as the known UX gap of the space form after `run`.
+    let out = oam(&["run", "--allow-net", "127.0.0.1:5432", &path]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unexpected argument"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // An unknown flag before the subcommand blocks the lift entirely:
+    // clap answers the unknown flag, and the node flag after `run` gets
+    // NO misleading tip (nothing lifted, so clap never sees it out of
+    // place).
+    let out = oam(&["--unknown", "run", "--throw-deprecation", &path]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("'--unknown' found"),
+        "the unknown flag is what clap names: {stderr}"
+    );
+    assert!(
+        !stderr.contains("use '-- --throw-deprecation'"),
+        "no misleading tip for the node flag: {stderr}"
+    );
+
+    // `--` first: the pre-parse consumes it and stops, the lift returns
+    // argv untouched, and clap still dispatches the subcommand after it
+    // (measured: `oam -- run x` runs the file).
+    let out = oam(&["--", "run", &path]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The pool size takes effect: the V8 platform starts exactly as many
 /// worker threads as `--v8-pool-size` / `OAM_V8_POOL_SIZE` ask for, and
 /// without either `oam_engine::v8_pool_size`'s default -- node's 4, capped
