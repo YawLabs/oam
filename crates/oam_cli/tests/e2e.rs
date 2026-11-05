@@ -34434,7 +34434,9 @@ fn node_flag_lift_edge_shapes() {
         String::from_utf8_lossy(&out.stdout)
     );
 
-    // Two occurrences of one list grant both lift and both survive.
+    // Two occurrences of one list grant both lift and both survive into
+    // execArgv -- the contract a fork() child replays. (The unit test
+    // pins the lift's ordering; this pins the end-to-end reflection.)
     let grant_a = format!("--allow-fs-read={}", path);
     let grant_b = format!("--allow-fs-read={}", path);
     let out = oam(&["run", &grant_a, &grant_b, &path]);
@@ -34443,10 +34445,20 @@ fn node_flag_lift_edge_shapes() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains(r#"execArgv: ["--throw-deprecation"]"#)
-            == false,
-        "sanity"
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // execArgv keeps each grant AS GIVEN (probe: a relative spelling stays
+    // relative), but JSON.stringify doubles the backslashes of a Windows
+    // path in the printed array -- so match the JSON-escaped spelling.
+    let json_escaped = grant_a.replace('\\', "\\\\");
+    let execargv = stdout
+        .split("execArgv: ")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .unwrap_or("");
+    assert_eq!(
+        execargv.matches(&json_escaped).count(),
+        2,
+        "both repeated grants must survive into execArgv: {stdout}"
     );
 
     // The bare-script shape (node's execPath shape) is untouched: node
