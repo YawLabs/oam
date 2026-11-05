@@ -429,8 +429,6 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
                 "--env-file"
                     | "--env-file-if-exists"
                     | "--input-type"
-                    | "--allow-net"
-                    | "--allow-env"
                     | "--max-http-header-size"
                     | "--v8-pool-size"
                     | "--trace-require-module"
@@ -482,8 +480,6 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
                 "--env-file"
                     | "--env-file-if-exists"
                     | "--input-type"
-                    | "--allow-net"
-                    | "--allow-env"
                     | "--max-http-header-size"
                     | "--v8-pool-size"
                     | "--trace-require-module"
@@ -1084,7 +1080,7 @@ fn main() -> ExitCode {
         }
     }
 
-    dispatch(Cli::parse())
+    dispatch(Cli::parse_from(std::env::args()))
 }
 
 /// Node process-level flags parsed before the subcommand, stashed for the
