@@ -409,6 +409,8 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
     let mut i = 1;
     let mut subcommand_at: Option<usize> = None;
     let mut consumed_as_value = false;
+    let mut stopped_at_unknown_flag = false;
+    let mut is_bare_script = false;
     while i < argv.len() {
         let arg = argv[i].clone();
         if arg == "--json" {
@@ -424,9 +426,15 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
             continue;
         }
         if !arg.starts_with('-') {
-            // First bare token: the subcommand (or a bare script, which the
-            // scan below treats the same -- nothing lifts past it).
+            // First bare token. A real subcommand is liftable-around; a
+            // BARE SCRIPT is not: node passes everything after the script
+            // path to the script (`node x.js --no-warnings` gives argv
+            // ["--no-warnings"], measured on v22.22.2 and on main), so the
+            // second walk must not scan past a script. SUBCOMMANDS is the
+            // exact list the bare-script dispatch below uses, so the two
+            // agree by construction.
             subcommand_at = Some(i);
+            is_bare_script = !SUBCOMMANDS.contains(&arg.as_str());
             break;
         }
         if arg == "--" {
@@ -457,14 +465,26 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
             i += 1;
             continue;
         }
-        // An unknown flag before the subcommand: stop scanning (the
-        // pre-parse stops at it too -- nothing lifts from beyond it).
+        // An unknown flag before the subcommand: stop scanning. The
+        // pre-parse stops at the same token, so nothing from here on is
+        // read by it -- including anything after the subcommand. Mark the
+        // stop and let the second walk skip lifting entirely (blocked =
+        // argv[stop] is an unknown flag, not the subcommand): moving a
+        // flag from beyond the pre-parse's horizon would desync the two
+        // parsers and resurrect clap's misleading tip.
+        stopped_at_unknown_flag = true;
         subcommand_at = Some(i);
         break;
     }
     let Some(sub) = subcommand_at else {
         return argv; // flags only, no subcommand: nothing after them to lift
     };
+    if stopped_at_unknown_flag || is_bare_script {
+        // The pre-parse stopped before the subcommand (an unknown flag), or
+        // the bare token is a SCRIPT whose following args belong to the
+        // script, not to the runtime (node's argv shape). Lift nothing.
+        return argv;
+    }
     // Subcommand is at `sub` (never argv[0]). Walk the option block after
     // it: node-style flags (and their spaced values) lift to the front,
     // ahead of the subcommand, keeping their relative order; the first
@@ -496,7 +516,7 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
             break; // the file positional; the block is over
         }
         if is_node_style_flag(&arg) {
-            if matches!(
+            let takes_spaced_value = matches!(
                 arg.as_str(),
                 "--env-file"
                     | "--env-file-if-exists"
@@ -509,8 +529,18 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
                     | "--redirect-warnings"
                     | "--allow-fs-read"
                     | "--allow-fs-write"
-            ) && argv.get(j + 1).is_some_and(|v| !v.starts_with('-'))
-            {
+            );
+            // A spaced-value flag with NO value behind it is a mistake the
+            // pre-parse reports (exit 9, "requires an argument", node's
+            // shape) -- but only if it sees the flag where the user put it.
+            // A bare trailing `oam run --env-file` used to lift alone and
+            // then consume `run` as its value, sending a no-FILE clap
+            // parse into the REPL. Leave such a flag in place and stop:
+            // the run it belonged to cannot proceed anyway.
+            if takes_spaced_value && !argv.get(j + 1).is_some_and(|v| !v.starts_with('-')) {
+                break;
+            }
+            if takes_spaced_value {
                 value_pending = true;
             }
             lifted.push(arg);
@@ -4420,13 +4450,14 @@ mod tests {
 
     #[test]
     fn lift_does_not_swallow_a_flag_shaped_value() {
-        // `--env-file=-x.env` style values that START with '-' stay with
-        // their flag; and a spaced flag whose next token is a flag is NOT
-        // treated as its value (the pre-parse refuses it later, as node's
-        // parser would).
+        // A spaced flag whose next token is a flag is NOT treated as its
+        // value -- and since the P5 fix, a value-flag left without a value
+        // does not lift at all: the block ends at it, the pre-parse then
+        // refuses `--env-file` with exit 9 (node's shape), and nothing
+        // silently eats the flag that follows.
         assert_eq!(
             joined(&["run", "--env-file", "--throw-deprecation", "app.ts"]),
-            "oam --env-file --throw-deprecation run app.ts"
+            "oam run --env-file --throw-deprecation app.ts"
         );
     }
 
@@ -4436,6 +4467,77 @@ mod tests {
         assert_eq!(
             joined(&["serve", "--env-file=.env", "app.ts"]),
             "oam --env-file=.env serve app.ts"
+        );
+    }
+
+    #[test]
+    fn lift_does_not_lift_a_value_flag_left_with_no_value() {
+        // A spaced-value flag at the END of the option block has no value
+        // to take; lifting it alone made `oam run --env-file` consume `run`
+        // as the value in the pre-parse and fall into the REPL (a silent
+        // mis-dispatch). It stays where the user put it, and the pre-parse
+        // refuses it with exit 9 as it does before the subcommand.
+        assert_eq!(joined(&["run", "--env-file"]), "oam run --env-file");
+        // Same when an unknown flag follows: the block ends there anyway.
+        assert_eq!(
+            joined(&["run", "--v8-pool-size", "--no-warnings", "app.ts"]),
+            "oam run --v8-pool-size --no-warnings app.ts"
+        );
+    }
+
+    #[test]
+    fn lift_lifts_nothing_when_an_unknown_flag_precedes_the_subcommand() {
+        // `oam --unknown run --flag x`: the pre-parse breaks at --unknown,
+        // so a flag lifted from after `run` would move it in front of the
+        // unknown one and the two parsers would disagree. Nothing lifts;
+        // clap answers the unknown flag (measured: clap's error names
+        // --unknown, and the node flag never gets the misleading tip).
+        assert_eq!(
+            joined(&["--unknown", "run", "--throw-deprecation", "app.ts"]),
+            "oam --unknown run --throw-deprecation app.ts"
+        );
+    }
+
+    #[test]
+    fn lift_carries_repeated_occurrences_individually() {
+        // Two occurrences of one flag are two grants (the reassembly
+        // dedups by whole token, so identical strings WOULD collapse --
+        // this pins that a repeated flag still arrives twice).
+        assert_eq!(
+            joined(&["run", "--allow-fs-read=a", "--allow-fs-read=b", "app.ts"]),
+            "oam --allow-fs-read=a --allow-fs-read=b run app.ts"
+        );
+    }
+
+    #[test]
+    fn lift_is_a_no_op_for_the_bare_script_shape() {
+        // `oam script.mjs args` (node's execPath shape): everything after
+        // the script path belongs to the SCRIPT -- node gives
+        // `node x.js --no-warnings` the argv ["--no-warnings"] (measured
+        // v22.22.2, and main's bare-script dispatch passes raw args
+        // through) -- so the lift must never scan past a bare script, and
+        // a node-flag-shaped script arg must stay a script arg.
+        assert_eq!(
+            joined(&["script.mjs", "--no-warnings", "arg"]),
+            "oam script.mjs --no-warnings arg"
+        );
+        // While a real subcommand keeps lifting around itself.
+        assert_eq!(
+            joined(&["run", "--no-warnings", "app.ts"]),
+            "oam --no-warnings run app.ts"
+        );
+    }
+
+    #[test]
+    fn lift_treats_a_subcommand_shaped_value_as_a_value() {
+        // `oam run --env-file test`: `test` is the flag's VALUE here (a
+        // file named `test`), not the test-runner subcommand. The lift
+        // consumes it with its flag -- the pre-parse then reads --env-file
+        // test and the run dies on the missing <FILE>, naming the real
+        // mistake instead of silently running the wrong subcommand.
+        assert_eq!(
+            joined(&["run", "--env-file", "test"]),
+            "oam --env-file test run"
         );
     }
 
