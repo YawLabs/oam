@@ -34362,6 +34362,32 @@ fn node_flag_after_run_installs_like_before_the_subcommand() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // oam's own --json global is transparent to the lift AND to the
+    // pre-parse: it can sit on either side of the subcommand or of a node
+    // flag, and every spelling reaches the same run. Previously
+    // `oam --json run --flag x` died on clap's tip because the pre-parse
+    // broke at the unknown --json before reaching the flag.
+    for args in [
+        vec!["--json", "run", "--throw-deprecation"],
+        vec!["run", "--json", "--throw-deprecation"],
+        vec!["run", "--throw-deprecation", "--json"],
+    ] {
+        let mut full: Vec<&str> = args.clone();
+        full.push(&path);
+        let out = oam(&full);
+        assert!(
+            out.status.success(),
+            "{args:?}: exit {:?}; stderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("throwDeprecation: true"),
+            "{args:?}: {stdout}"
+        );
+    }
 }
 
 /// The pool size takes effect: the V8 platform starts exactly as many

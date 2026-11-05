@@ -397,11 +397,24 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
     // already precedes it, else the position the first non-flag token lands
     // at. Walk once, tracking whether a value-taking flag is waiting for
     // its value.
+    //
+    // `--json` is treated as transparent here: it is oam's own GLOBAL flag
+    // (clap takes it before or after the subcommand), not a node-style one,
+    // and leaving it out of the walk would make the first non-flag token
+    // the subcommand in `oam --json run --flag x` but an unknown-flag stop
+    // in `oam run --json --flag x`... no: --json is not bare, so without
+    // this arm BOTH spellings would stop the scan and nothing after a
+    // --json would lift. Skip it, wherever it appears, so the option block
+    // boundary does not depend on where the user put oam's own global.
     let mut i = 1;
     let mut subcommand_at: Option<usize> = None;
     let mut consumed_as_value = false;
     while i < argv.len() {
         let arg = argv[i].clone();
+        if arg == "--json" {
+            i += 1;
+            continue;
+        }
         if consumed_as_value {
             // The value of a spaced flag before the subcommand; not itself
             // a flag, and not the subcommand unless it spells one (which
@@ -471,6 +484,14 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
         if arg == "--" {
             break; // script-args separator: everything after stays put
         }
+        if arg == "--json" {
+            // oam's own global, transparent to the block scan (see the
+            // first walk). It stays where it is -- NOT lifted, so a
+            // `--json` given after the subcommand keeps arriving after it,
+            // which clap accepts for a global.
+            j += 1;
+            continue;
+        }
         if !arg.starts_with('-') {
             break; // the file positional; the block is over
         }
@@ -501,11 +522,16 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
     if lifted.is_empty() {
         return argv;
     }
-    // Reassemble: [exe, lifted..., rest-without-lifted...]. The rest keeps
-    // its order: the subcommand, then whatever followed the option block.
+    // Reassemble: [exe..sub, lifted..., subcommand, skipped --jsons, j..].
+    // Everything in the option block except the lifted flags stays in its
+    // original order: the skipped `--json` tokens (transparent to the scan)
+    // keep their position relative to the subcommand, and nothing between
+    // j and the end moves.
     let mut head = argv[..sub].to_vec();
-    head.extend(lifted);
-    let mut tail: Vec<String> = argv[sub..sub + 1].to_vec();
+    head.extend(lifted.iter().cloned());
+    let lifted_set: std::collections::HashSet<&String> = lifted.iter().collect();
+    let mut tail: Vec<String> = argv[sub..j].to_vec();
+    tail.retain(|t| !lifted_set.contains(t));
     tail.extend_from_slice(&argv[j..]);
     argv = head;
     argv.extend(tail);
@@ -600,6 +626,14 @@ fn main() -> ExitCode {
         let mut warned_abort_on_uncaught = false;
         while i < raw.len() {
             let arg = raw[i].as_str();
+            if arg == "--json" {
+                // oam's own global (clap takes it anywhere); transparent to
+                // this scan so a node flag after it is still read -- the
+                // same transparency `lift_node_flags_after_subcommand`
+                // gives it. Not consumed: clap still sees it.
+                i += 1;
+                continue;
+            }
             if arg == "--pending-deprecation" {
                 flags.pending_deprecation = true;
                 i += 1;
@@ -4266,6 +4300,30 @@ mod tests {
 
     fn joined(args: &[&str]) -> String {
         lift(args).join(" ")
+    }
+
+    #[test]
+    fn lift_treats_oams_own_json_global_as_transparent() {
+        // --json is clap's global, accepted anywhere; it must not end the
+        // option block the lift scans, wherever the user put it.
+        assert_eq!(
+            joined(&["--json", "run", "--throw-deprecation", "app.ts"]),
+            "oam --json --throw-deprecation run app.ts"
+        );
+        // Given after the subcommand it is skipped (not lifted), so the
+        // subcommand keeps its position and the lifted flag lands before it.
+        assert_eq!(
+            joined(&["run", "--json", "--throw-deprecation", "app.ts"]),
+            "oam --throw-deprecation run --json app.ts"
+        );
+        // It is not lifted itself: when it sat inside the option block it
+        // keeps its place between the lifted flags and the file (a position
+        // clap still accepts for a global; the e2e pins that it reaches the
+        // same run).
+        assert_eq!(
+            joined(&["run", "--throw-deprecation", "--json", "app.ts"]),
+            "oam --throw-deprecation run --json app.ts"
+        );
     }
 
     #[test]
