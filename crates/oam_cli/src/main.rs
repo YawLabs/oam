@@ -281,10 +281,11 @@ enum TrustAction {
 /// both `--flag=v` and `--flag v`, and `--inspect`/`--inspect-brk` (whose
 /// `=`-value is optional) accept a value only with `=`.
 ///
-/// This is the list the #471 guard in `main` checks a post-subcommand token
-/// against, and `NODE_FLAGS_HELP` restates it for `oam --help`: add a flag
-/// to the pre-parse in `main` here, or the guard misses it and clap prints
-/// its misleading `-- <flag>` tip for the exact shape this issue reports.
+/// This is the list `lift_node_flags_after_subcommand` lifts from after a
+/// subcommand to the front of argv (#471), and `NODE_FLAGS_HELP` restates
+/// it for `oam --help`: add a flag to the pre-parse in `main` here too, or
+/// a flag accepted before the subcommand is silently refused after one
+/// (clap's misleading `-- <flag>` tip is what the user then sees).
 /// (`--inspect`/`--inspect-brk` are NOT here: they are `run`/`serve`
 /// options, accepted after the subcommand.)
 const NODE_STYLE_FLAGS: &[&str] = &[
