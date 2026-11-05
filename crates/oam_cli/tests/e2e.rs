@@ -33685,6 +33685,73 @@ fn cache_subcommand_info_and_clean() {
     let _ = std::fs::remove_dir_all(&project_dir);
 }
 
+// `--json` written BEFORE the subcommand (or before the bare script/eval)
+// must mean exactly what it means after: a machine-readable payload. The
+// pre-parse treats the flag as transparent, but the argv it hands clap past
+// the subcommand used to be rebuilt from the scan position alone, so the
+// flag sat BEFORE that position and was dropped -- `oam --json cache info`
+// printed the human block (#473). The same skip left the pre-parse's own
+// dispatch paths (bare script, eval) rendering pretty errors. Every
+// spelling, every path: JSON in, JSON out.
+#[test]
+fn json_flag_before_subcommand_reaches_every_path() {
+    // 1. Subcommand path: cache info answers with one JSON object.
+    let warm = write_temp("json-front-cache/main.cjs", "console.log(1);\n");
+    let run = oam(&["run", warm.to_str().unwrap()]);
+    assert!(run.status.success(), "warm-up failed to run");
+    let out = oam(&["--json", "cache", "info"]);
+    assert!(out.status.success(), "cache info must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("--json cache info must be one JSON object ({e}): {stdout}"));
+    assert!(
+        parsed.get("entries").is_some(),
+        "machine-readable object must carry entries: {stdout}"
+    );
+
+    // 2. Subcommand path: a runtime diagnostic renders as JSONL (stderr),
+    // not the pretty block.
+    let out = oam(&["--json", "run", "no-such-file-here.mjs"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stderr.trim()).is_ok(),
+        "--json run must emit JSONL on stderr: {stderr}"
+    );
+
+    // 3. Bare-script path (pre-parse dispatch, never reaches clap): the
+    // same flag must reach the renderer.
+    let bad = write_temp("json-front-bad.js", "this is not javascript !!\n");
+    let out = oam(&["--json", bad.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.trim_start().starts_with('{'),
+        "--json bare script must emit JSONL: {stderr}"
+    );
+
+    // 4. Eval path (also pre-parse dispatch): same contract.
+    let out = oam(&["--json", "-e", "missingGlobal.x"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.trim_start().starts_with('{'),
+        "--json eval must emit JSONL: {stderr}"
+    );
+
+    // 5. The flag is not sticky: without it every spelling stays human.
+    let out = oam(&["cache", "info"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("entries:"),
+        "plain cache info stays human-readable"
+    );
+    let out = oam(&["run", "no-such-file-here.mjs"]);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).starts_with("error["),
+        "plain run error stays human-readable"
+    );
+}
+
 // -- gated regression guards for runtime-lifecycle + node-compat behaviors that
 // the advisory conformance/node-suite suites cover but per-PR CI does not. --
 

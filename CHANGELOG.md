@@ -15,7 +15,16 @@ is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged withou
 one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [0.19.4] - 2026-11-04
-- Addressed Issue #471: the node compatibility flags    
+- Addressed Issue #471: the node compatibility flags
+
+### Fixed
+
+- **`--json` written before the subcommand (or before a bare script or `-e`) is honored
+  everywhere.** The #471 pre-parse reads the flag as transparent and skips over it, but the
+  argv it then handed clap started at the scan position, so `oam --json cache info` and
+  `oam --json run x` ran as if the flag had never been given (human-format output, pretty
+  errors). The skipped tokens are now carried through to clap, and the paths the pre-parse
+  dispatches itself -- a bare script and `--eval` -- render JSONL too.
     
 ## [0.19.3] - 2026-11-03
 

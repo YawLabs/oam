@@ -655,6 +655,13 @@ fn main() -> ExitCode {
         let mut saw_eval_flag = false;
         let mut bad_flag: Option<&str> = None;
         let mut warned_abort_on_uncaught = false;
+        // oam's own --json global, transparent to this scan. Remembering it
+        // matters twice: the paths this scan dispatches itself (eval, bare
+        // script) must render machine-readable too, and the scan position
+        // below must not READ a skipped --json as if a node flag had been
+        // consumed (#473: `i > 1` sent `oam --json run x` down the filtered
+        // path, which dropped the flag before clap ever saw it).
+        let mut json_flag = false;
         while i < raw.len() {
             let arg = raw[i].as_str();
             if arg == "--json" {
@@ -662,6 +669,7 @@ fn main() -> ExitCode {
                 // this scan so a node flag after it is still read -- the
                 // same transparency `lift_node_flags_after_subcommand`
                 // gives it. Not consumed: clap still sees it.
+                json_flag = true;
                 i += 1;
                 continue;
             }
@@ -1082,7 +1090,7 @@ fn main() -> ExitCode {
         // NODE_OPTIONS alike, and dies of the TypeError's fatal report with
         // exit 1, not 9; measured on v22.22.2).
         if let Some(source) = eval_source {
-            return run_eval(&source, print, &raw[i..], &flags);
+            return run_eval(&source, print, &raw[i..], &flags, json_flag);
         }
         if saw_eval_flag {
             // Node: `-e` with no code exits 9; bare `-p` reads stdin, which
@@ -1105,7 +1113,7 @@ fn main() -> ExitCode {
             // test runner even if a file named `test` sits in the cwd.
             if !flag.starts_with('-') && !SUBCOMMANDS.contains(&flag) && script_is_file(flag) {
                 let file = PathBuf::from(flag);
-                drain_loader_warnings_on_hard_exit(false);
+                drain_loader_warnings_on_hard_exit(json_flag);
                 let outcome = run_file_with_flags(
                     &file,
                     &raw[i + 1..],
@@ -1113,12 +1121,12 @@ fn main() -> ExitCode {
                     oam_engine::ReplayMode::Off,
                     &flags,
                 );
-                report_loader_warnings(false);
+                report_loader_warnings(json_flag);
                 return match outcome {
                     Ok(code) => ExitCode::from(code),
                     Err((diagnostics, code)) => {
                         for d in &diagnostics {
-                            render(d, false);
+                            render(d, json_flag);
                         }
                         ExitCode::from(code)
                     }
@@ -1137,7 +1145,19 @@ fn main() -> ExitCode {
             NODE_FLAGS.set(flags.clone()).ok();
         }
         if saw_node_flag {
+            // The scan skipped over any `--json` before `i` (transparent,
+            // never consumed); raw[i..] alone would drop it before clap ever
+            // sees it -- `oam --json cache info` ran as if --json were never
+            // given (#473). Re-inject those tokens: clap's global accepts
+            // --json anywhere, so placing them right after argv[0] is the
+            // same flag, in front of the subcommand.
+            let kept_jsons: Vec<String> = raw[1..i]
+                .iter()
+                .filter(|a| a.as_str() == "--json")
+                .cloned()
+                .collect();
             let filtered: Vec<String> = std::iter::once(argv[0].clone())
+                .chain(kept_jsons)
                 .chain(raw[i..].iter().cloned())
                 .collect();
             let cli = Cli::parse_from(filtered);
@@ -3647,7 +3667,13 @@ fn cleanup_eval_artifacts(tmp_dir: Option<&Path>, tmp_file: &Path) {
     }
 }
 
-fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags) -> ExitCode {
+fn run_eval(
+    source: &str,
+    print: bool,
+    extra_args: &[String],
+    flags: &NodeFlags,
+    json: bool,
+) -> ExitCode {
     // Node's eval module resolves from CWD; oam executes a real file, so
     // place it in the CWD (unique name, cleaned up below).
     // Node reads --input-type to decide how to parse --eval source; oam runs
@@ -3682,7 +3708,7 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
     oam_engine::register_exit_cleanup(tmp_dir.clone().unwrap_or_else(|| tmp_file.clone()));
     // Queued loader warnings must survive a `process.exit()` inside the eval
     // the same way the temp file must be removed by one.
-    drain_loader_warnings_on_hard_exit(false);
+    drain_loader_warnings_on_hard_exit(json);
     // -p evaluates through a DIRECT eval, which yields the completion value
     // of a statement list the way node's script evaluation does
     // (`-p "a(); b"` prints b) AND inherits the enclosing module scope. It
@@ -3743,7 +3769,7 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
         rt.execute_cjs_eval(&tmp_file, &CliHost)
     };
     cleanup_eval_artifacts(tmp_dir.as_deref(), &tmp_file);
-    report_loader_warnings(false);
+    report_loader_warnings(json);
     // Same fatal-path shape as run_file: sub-codes skip 'exit', a regular
     // fatal forces 1 + honors exit-handler mutations.
     match result {
@@ -3764,7 +3790,7 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
                 // Skips `emit_process_exit` -- see the run_file site above.
                 oam_engine::run_exit_hooks();
                 for d in &diagnostics {
-                    render(d, false);
+                    render(d, json);
                 }
                 return ExitCode::from(code);
             }
@@ -3779,7 +3805,7 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
             // ReportFatalException), as run_file's caller does (#399 item 10).
             rt.emit_process_exit_after(after_exit);
             for d in &diagnostics {
-                render(d, false);
+                render(d, json);
             }
             ExitCode::from(rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8)
         }
