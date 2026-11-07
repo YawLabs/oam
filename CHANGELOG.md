@@ -14,6 +14,18 @@ gap between headings below is expected rather than a missing entry. Not every ta
 is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
 one, so `install.sh`, which resolves the latest Release, never handed them out.
 
+## [0.19.5] - TBD
+- Addressed Issue #472: `--max-old-space-size` was silently ignored
+
+### Added
+
+- **`--max-old-space-size=N` accepted on the command line and in `NODE_OPTIONS`.** Maps to
+  oam's `OAM_MAX_HEAP_MB` knob — same V8 heap cap, same OOM banner, same cgroup-aware
+  default. Both `--max-old-space-size=N` and `--max-old-space-size N` forms work, before or
+  after the subcommand (`oam run --max-old-space-size=512 app.cjs`). A value from argv wins
+  over any pre-existing `OAM_MAX_HEAP_MB` env var. The flag round-trips through
+  `process.execArgv` so child processes inherit it.
+
 ## [0.19.4] - 2026-11-04
 - Addressed Issue #471: the node compatibility flags
 
