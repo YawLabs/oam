@@ -314,6 +314,7 @@ const NODE_STYLE_FLAGS: &[&str] = &[
     "--tls-max-v1.2",
     "--tls-max-v1.3",
     "--max-http-header-size",
+    "--max-old-space-size",
     "--v8-pool-size",
     "--insecure-http-parser",
     "--trace-require-module",
@@ -369,7 +370,7 @@ after `run` (the `deno run --flag` shape):
   --disable-warning=CAT --redirect-warnings=P --expose-gc
   --expose-internals --experimental-vm-modules --allow-natives-syntax
   --js-float16array --zero-fill-buffers --title=T --v8-pool-size=N
-  --max-http-header-size=N --insecure-http-parser
+  --max-http-header-size=N --max-old-space-size=N --insecure-http-parser
   --trace-require-module=all|no-node-modules
   --dns-result-order=verbatim|ipv4first|ipv6first
   --tls-min-v1.0 .. --tls-min-v1.3 --tls-max-v1.2 --tls-max-v1.3
@@ -452,6 +453,7 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
                     | "--env-file-if-exists"
                     | "--input-type"
                     | "--max-http-header-size"
+                    | "--max-old-space-size"
                     | "--v8-pool-size"
                     | "--trace-require-module"
                     | "--dns-result-order"
@@ -523,6 +525,7 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
                     | "--env-file-if-exists"
                     | "--input-type"
                     | "--max-http-header-size"
+                    | "--max-old-space-size"
                     | "--v8-pool-size"
                     | "--trace-require-module"
                     | "--dns-result-order"
@@ -896,6 +899,25 @@ fn main() -> ExitCode {
                 flags.dns_result_order = Some(value);
                 flags.dns_result_order_spaced = spaced;
                 i += if spaced { 2 } else { 1 };
+            } else if let Some(v) = arg.strip_prefix("--max-old-space-size=") {
+                // Maps to `OAM_MAX_HEAP_MB` (oam's --max-old-space-size analogue).
+                // Empty is node's exit 9; here a bad token is ignored instead.
+                if !v.is_empty() {
+                    flags.max_old_space_mb = Some(v.to_string());
+                }
+                i += 1;
+            } else if arg == "--max-old-space-size" {
+                match raw.get(i + 1) {
+                    Some(v) => {
+                        flags.max_old_space_mb = Some(v.clone());
+                        flags.max_old_space_mb_spaced = true;
+                        i += 2;
+                    }
+                    None => {
+                        eprintln!("oam: --max-old-space-size requires an argument");
+                        return ExitCode::from(9);
+                    }
+                }
             } else if let Some(v) = arg.strip_prefix("--title=") {
                 flags.title = Some(v.to_string());
                 i += 1;
@@ -1023,6 +1045,16 @@ fn main() -> ExitCode {
         // Everything from here on runs with both sources: NODE_OPTIONS under
         // argv, argv kept aside for execArgv.
         let flags = env_flags.merged(flags);
+        // Apply `--max-old-space-size` to `OAM_MAX_HEAP_MB` so
+        // `resolve_heap_cap()` picks it up. Must happen here (before any
+        // early return below: eval, bare-script, dispatch) -- before the
+        // runtime starts. The flag value wins over any pre-existing env var.
+        if let Some(mb) = &flags.max_old_space_mb {
+            // SAFETY: `set_var` on a single env var before any thread starts
+            // is safe; we set it here and never touch the var again except
+            // through `std::env::var` which is synchronous and safe.
+            unsafe { std::env::set_var("OAM_MAX_HEAP_MB", mb) };
+        }
         // V8 flags must be set before V8::initialize, i.e. before any
         // JsRuntime is constructed.
         // The loader decides whether `internal/...` resolves, and it reads
@@ -2306,6 +2338,16 @@ fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
                 Some(v) => flags.dns_result_order = Some(v.clone()),
                 None => flags.dns_result_order_missing = Some("--dns-result-order"),
             }
+        } else if let Some(v) = tok.strip_prefix("--max-old-space-size=") {
+            // Maps to `OAM_MAX_HEAP_MB` (oam's --max-old-space-size analogue).
+            // Empty is node's exit 9; here a bad token is ignored instead.
+            if !v.is_empty() {
+                flags.max_old_space_mb = Some(v.to_string());
+            }
+        } else if tok == "--max-old-space-size"
+            && let Some(v) = it.next()
+        {
+            flags.max_old_space_mb = Some(v.clone());
         } else if tok == "--no-warnings" {
             flags.no_warnings = true;
         } else if tok == "--no-deprecation" {
@@ -3177,6 +3219,12 @@ struct NodeFlags {
     /// size.
     dns_result_order: Option<String>,
     dns_result_order_spaced: bool,
+    /// `--max-old-space-size=N`: maps to `OAM_MAX_HEAP_MB` (oam's
+    /// `--max-old-space-size` analogue). Kept raw so execArgv hands it back
+    /// unchanged and a fork child sizes its heap the same way. Spaced as for
+    /// the header size.
+    max_old_space_mb: Option<String>,
+    max_old_space_mb_spaced: bool,
     /// The spelling of a `--dns-result-order` given no value in
     /// NODE_OPTIONS, which node refuses at startup with exit 9.
     dns_result_order_missing: Option<&'static str>,
@@ -3234,6 +3282,11 @@ impl NodeFlags {
         } else {
             (env.v8_pool_size, env.v8_pool_size_spaced)
         };
+        let (max_old_space_mb, max_old_space_mb_spaced) = if argv.max_old_space_mb.is_some() {
+            (argv.max_old_space_mb.clone(), argv.max_old_space_mb_spaced)
+        } else {
+            (env.max_old_space_mb, env.max_old_space_mb_spaced)
+        };
         NodeFlags {
             pending_deprecation: env.pending_deprecation || argv.pending_deprecation,
             expose_gc: env.expose_gc || argv.expose_gc,
@@ -3272,6 +3325,8 @@ impl NodeFlags {
             dns_result_order_missing: env
                 .dns_result_order_missing
                 .or(argv.dns_result_order_missing),
+            max_old_space_mb,
+            max_old_space_mb_spaced,
             insecure_http_parser: env.insecure_http_parser || argv.insecure_http_parser,
             tls_min_v1_0: env.tls_min_v1_0 || argv.tls_min_v1_0,
             tls_min_v1_1: env.tls_min_v1_1 || argv.tls_min_v1_1,
@@ -3631,6 +3686,14 @@ impl NodeFlags {
                 out.push(v.clone());
             } else {
                 out.push(format!("--dns-result-order={v}"));
+            }
+        }
+        if let Some(v) = &self.max_old_space_mb {
+            if self.max_old_space_mb_spaced {
+                out.push("--max-old-space-size".into());
+                out.push(v.clone());
+            } else {
+                out.push(format!("--max-old-space-size={v}"));
             }
         }
         if self.insecure_http_parser {

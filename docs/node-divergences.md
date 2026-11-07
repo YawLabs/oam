@@ -366,7 +366,8 @@ still wins. Only these tokens are accepted:
 --pending-deprecation   --no-warnings   --no-deprecation   --expose-gc
 --trace-warnings   --trace-deprecation   --throw-deprecation
 --disable-warning[=]    --redirect-warnings[=]
---max-http-header-size[=]   --insecure-http-parser   --trace-require-module[=]
+--max-http-header-size[=]   --max-old-space-size[=]   --insecure-http-parser
+--trace-require-module[=]   --v8-pool-size[=]
 --tls-min-v1.0  --tls-min-v1.1  --tls-min-v1.2  --tls-min-v1.3  --tls-max-v1.2  --tls-max-v1.3
 ```
 
@@ -389,6 +390,20 @@ ok
 ```
 
 Consistent with Node, `NODE_OPTIONS`-sourced flags are excluded from `process.execArgv`.
+
+### 5a. `--max-old-space-size` maps to `OAM_MAX_HEAP_MB`
+
+Node's `--max-old-space-size` (both `=N` and spaced forms) is accepted on the command
+line and in `NODE_OPTIONS`. oam translates it into its own `OAM_MAX_HEAP_MB` knob — the
+same V8 heap cap, same OOM banner, same cgroup-aware default. A value from argv wins
+over any pre-existing `OAM_MAX_HEAP_MB` env var; a value from `NODE_OPTIONS` is applied
+the same way (it sets `OAM_MAX_HEAP_MB` before the runtime starts). The flag round-trips
+through `process.execArgv` so a child process inherits it.
+
+This closes a gap where Dockerfiles and k8s manifests that set
+`NODE_OPTIONS=--max-old-space-size=...` to fit the heap under a memory limit would
+silently have their cap ignored (oam kept its default instead). Now the flag is
+recognized, applied, and named in the OOM banner as `set by OAM_MAX_HEAP_MB`.
 
 ### 6. `child.pid` is one tick late for IPC children
 
