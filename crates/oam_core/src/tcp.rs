@@ -1375,16 +1375,30 @@ pub fn tcp_has_lingering(registry: &TcpRegistry) -> bool {
 /// not waited for beyond this.
 pub(crate) const PEER_EOF_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// The SO_LINGER of a delivering close ([`arm_delivering_close`]): the close
-/// returns when the peer's kernel has acknowledged everything, however long
-/// that takes, so the longest each platform holds. Windows stores seconds in
-/// a u16, and resets on expiry. XNU stores ticks (100 a second) in an i16,
-/// so 327 s is its ceiling; an expiry there, as on Linux, leaves the close
-/// to finish in the background.
-#[cfg(not(target_vendor = "apple"))]
+/// The SO_LINGER of a delivering close ([`arm_delivering_close`]).
+///
+/// Windows: the longest it holds. It stores seconds in a u16 and resets on
+/// expiry, so the close must outlast the delivery; on loopback it returns at
+/// once (step 2 of [`arm_delivering_close`]).
+///
+/// XNU stores ticks (100 a second) in an i16, so 327 s is its ceiling; an
+/// expiry there leaves the close to finish in the background.
+///
+/// Linux and the other platforms: one second. A lingering close there
+/// returns only once the peer has ACKed the FIN, which follows every byte
+/// sent -- and what does not fit the peer's receive window is sent only as
+/// the peer reads. A peer that reads nothing until this process is gone (a
+/// child_process IPC parent blocked on the child) then held the exit for the
+/// whole linger, 18 hours. An expired linger loses nothing there: the close
+/// goes ahead without a reset and the kernel keeps sending the rest as the
+/// peer reads, as it does for a socket a process exits without closing.
+/// Not zero: a zero linger is the reset of [`set_linger_zero`].
+#[cfg(windows)]
 const CLOSE_LINGER: std::time::Duration = std::time::Duration::from_secs(u16::MAX as u64);
 #[cfg(target_vendor = "apple")]
 const CLOSE_LINGER: std::time::Duration = std::time::Duration::from_secs(300);
+#[cfg(not(any(windows, target_vendor = "apple")))]
+const CLOSE_LINGER: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Prepare a connected socket whose FIN is out for a close that loses
 /// nothing of what this end wrote, made by a process about to exit. The
@@ -1397,16 +1411,18 @@ const CLOSE_LINGER: std::time::Duration = std::time::Duration::from_secs(300);
 ///    reads ECONNRESET and 0 bytes; with the 100 bytes read first, all
 ///    200 kB).
 /// 2. SO_LINGER, on a blocking socket: the close returns once the peer's
-///    kernel has acknowledged every byte and the FIN. From then on the data
-///    is the peer's to read whenever it likes, like bytes left in a pipe by
-///    a process that has exited. Until then the socket must not be left to
-///    the process's end: Linux still holds up to its send buffer of unsent
-///    data (1.3-1.5 MB measured, SIOCOUTQ after the FIN of a 3 MB write to
-///    a peer that was not reading), on a connection nothing would own.
-///    Windows' loopback takes everything at once (64 MB sent in 0.1 s to a
-///    peer that was not reading; the close returned at once, and all of it
-///    was read after the sender had exited), so there the close does not
-///    wait.
+///    kernel has acknowledged every byte and the FIN, or the linger
+///    ([`CLOSE_LINGER`]) runs out. From then on the data is the peer's to
+///    read whenever it likes, like bytes left in a pipe by a process that
+///    has exited. Windows' loopback takes everything at once (64 MB sent in
+///    0.1 s to a peer that was not reading; the close returned at once, and
+///    all of it was read after the sender had exited), so there the close
+///    does not wait. Linux still holds up to its send buffer of unsent data
+///    after the FIN (1.3-1.5 MB measured, SIOCOUTQ after the FIN of a 3 MB
+///    write to a peer that was not reading); what the peer's receive window
+///    has no room for cannot be acknowledged before the peer reads, so the
+///    close waits at most the linger, and the kernel goes on sending the
+///    rest after it, as the peer reads.
 pub(crate) fn arm_delivering_close(socket: &socket2::Socket) {
     use std::io::Read;
     if socket.set_nonblocking(true).is_ok() {
@@ -1440,7 +1456,8 @@ pub(crate) fn arm_delivering_close(socket: &socket2::Socket) {
 ///    [`PEER_EOF_GRACE`]. No request is taken from it any more;
 /// 3. the close, as [`arm_delivering_close`] prepares it: whatever arrived
 ///    is discarded, and the close returns once the peer's kernel holds
-///    everything this end wrote.
+///    everything this end wrote, or the linger runs out (where an expired
+///    linger leaves the kernel to send the rest).
 ///
 /// So the exit waits for what delivery needs, not for the peer to read: a
 /// peer that blocks its own event loop until this process is gone gets it
@@ -1858,6 +1875,41 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
 
+    /// The longest any one wait in these tests may take. Every op here
+    /// talks to a peer on loopback or to a task of the test's own, and ends
+    /// in milliseconds when the code is right; a wait still open after this
+    /// fails the test with what it was waiting for, instead of hanging the run.
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// `.within(what)`: the future, bounded by [`BOUND`].
+    trait Within: std::future::Future + Sized {
+        async fn within(self, what: &str) -> Self::Output {
+            match tokio::time::timeout(BOUND, self).await {
+                Ok(out) => out,
+                Err(_) => panic!("still waiting after {BOUND:?}: {what}"),
+            }
+        }
+    }
+    impl<F: std::future::Future> Within for F {}
+
+    /// [`tcp_settle_lingering`], bounded. A panic is not enough here: the
+    /// settle's close runs on the blocking pool, and the test runtime's drop
+    /// waits for the blocking pool -- a close stuck in a linger would hang
+    /// the run after the panic all the same. So an overrun ends the process,
+    /// with the reason on stderr.
+    async fn settle_within(registry: &TcpRegistry) {
+        if tokio::time::timeout(BOUND, tcp_settle_lingering(registry.clone()))
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "tcp_settle_lingering still running after {BOUND:?}: its close is \
+                 waiting on the peer; aborting rather than hanging the run"
+            );
+            std::process::abort();
+        }
+    }
+
     /// Accepts N connections; each echoes its first read, then waits for the
     /// client's FIN (so a second client read can park) before closing.
     async fn echo_server(listener: tokio::net::TcpListener, connections: usize) {
@@ -1901,22 +1953,28 @@ mod tests {
             let handle = info["handle"].as_u64().unwrap();
 
             assert!(matches!(
-                tcp_write(registry.clone(), handle, b"ping".to_vec()).await,
+                tcp_write(registry.clone(), handle, b"ping".to_vec())
+                    .within("the ping write")
+                    .await,
                 OpOutcome::Done
             ));
             assert!(matches!(
-                tcp_read(registry.clone(), handle, 64).await,
+                tcp_read(registry.clone(), handle, 64).within("the echo").await,
                 OpOutcome::Bytes(b) if b == b"ping"
             ));
             match i % 3 {
                 0 => {
                     // Our FIN, the server's close, EOF, then close.
                     assert!(matches!(
-                        tcp_shutdown(registry.clone(), handle).await,
+                        tcp_shutdown(registry.clone(), handle)
+                            .within("the shutdown")
+                            .await,
                         OpOutcome::Done
                     ));
                     assert!(matches!(
-                        tcp_read(registry.clone(), handle, 64).await,
+                        tcp_read(registry.clone(), handle, 64)
+                            .within("the server's EOF")
+                            .await,
                         OpOutcome::Done
                     ));
                     tcp_close(&registry, handle);
@@ -1929,13 +1987,18 @@ mod tests {
                     let parked = tokio::spawn(tcp_read(registry.clone(), handle, 64));
                     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                     tcp_close(&registry, handle);
-                    assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+                    assert!(matches!(
+                        parked.within("the parked read").await.unwrap(),
+                        OpOutcome::Done
+                    ));
                 }
                 _ => {
                     // Close first; a read that lands afterwards fails.
                     tcp_close(&registry, handle);
                     assert!(matches!(
-                        tcp_read(registry.clone(), handle, 64).await,
+                        tcp_read(registry.clone(), handle, 64)
+                            .within("a read after the close")
+                            .await,
                         OpOutcome::Failed(_)
                     ));
                 }
@@ -1987,16 +2050,22 @@ mod tests {
                     let parked = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
                     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                     tcp_server_close(&registry, server_id);
-                    assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+                    assert!(matches!(
+                        parked.within("the parked accept").await.unwrap(),
+                        OpOutcome::Done
+                    ));
                 }
                 _ => {
                     // An accept completes, the stream is closed, then the
                     // server.
                     let client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                        .within("the connect")
                         .await
                         .unwrap();
                     let OpOutcome::Json(accepted) =
-                        tcp_accept(registry.clone(), server_id, ids.clone()).await
+                        tcp_accept(registry.clone(), server_id, ids.clone())
+                            .within("the accept")
+                            .await
                     else {
                         panic!("accept failed");
                     };
@@ -2014,7 +2083,9 @@ mod tests {
             // An accept after the close must neither resurrect the server
             // nor register a cancel Notify for it.
             assert!(matches!(
-                tcp_accept(registry.clone(), server_id, ids.clone()).await,
+                tcp_accept(registry.clone(), server_id, ids.clone())
+                    .within("an accept after the close")
+                    .await,
                 OpOutcome::Done
             ));
         }
@@ -2057,17 +2128,24 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         // One accept at a time: a second answers Done, the first parks on.
         assert!(matches!(
-            tcp_accept(registry.clone(), server_id, ids.clone()).await,
+            tcp_accept(registry.clone(), server_id, ids.clone())
+                .within("a second accept")
+                .await,
             OpOutcome::Done
         ));
         tcp_server_close(&registry, server_id);
-        let refused = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+        let refused = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .within("the connect to the closed server")
+            .await;
         assert_eq!(
             refused.as_ref().err().map(std::io::Error::kind),
             Some(std::io::ErrorKind::ConnectionRefused),
             "connected to a closed server: {refused:?}"
         );
-        assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+        assert!(matches!(
+            parked.within("the parked accept").await.unwrap(),
+            OpOutcome::Done
+        ));
         assert_eq!(
             registry.lock().unwrap().bookkeeping(),
             (0, 0, 0, 0, 0),
@@ -2098,13 +2176,18 @@ mod tests {
         let parked = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         tcp_server_close(&registry, server_id);
-        let refused = tokio::net::UnixStream::connect(&path).await;
+        let refused = tokio::net::UnixStream::connect(&path)
+            .within("the dial to the closed server")
+            .await;
         assert_eq!(
             refused.as_ref().err().map(std::io::Error::kind),
             Some(std::io::ErrorKind::NotFound),
             "connected to a closed server: {refused:?}"
         );
-        assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+        assert!(matches!(
+            parked.within("the parked accept").await.unwrap(),
+            OpOutcome::Done
+        ));
         assert_eq!(
             registry.lock().unwrap().bookkeeping(),
             (0, 0, 0, 0, 0),
@@ -2142,7 +2225,10 @@ mod tests {
             Some(std::io::ErrorKind::NotFound),
             "connected to a closed server: {refused:?}"
         );
-        assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+        assert!(matches!(
+            parked.within("the parked accept").await.unwrap(),
+            OpOutcome::Done
+        ));
         // Closed with no accept parked: the same, at once.
         let server =
             json(pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await);
@@ -2182,7 +2268,7 @@ mod tests {
             .open(&path)
             .unwrap();
         // Answered, and not taken: what JS sees a tick later.
-        let accepted = json(accepting.await.unwrap());
+        let accepted = json(accepting.within("the accept").await.unwrap());
         assert!(accepted["handle"].as_u64().is_some(), "{accepted}");
         // The close is judged by what it leaves (the name free, below), not
         // by a wall-clock bound a loaded host can miss.
@@ -2226,8 +2312,12 @@ mod tests {
             let connecting =
                 pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone());
             async move {
-                let client = json(connecting.await)["handle"].as_u64().unwrap();
-                let server = json(accepting.await.unwrap())["handle"].as_u64().unwrap();
+                let client = json(connecting.within("the dial").await)["handle"]
+                    .as_u64()
+                    .unwrap();
+                let server = json(accepting.within("the accept").await.unwrap())["handle"]
+                    .as_u64()
+                    .unwrap();
                 (client, server)
             }
         };
@@ -2238,11 +2328,13 @@ mod tests {
         assert!(!tcp_accept_take(&registry, server_id, untaken));
 
         assert!(matches!(
-            tcp_write(registry.clone(), kept_client, b"ping".to_vec()).await,
+            tcp_write(registry.clone(), kept_client, b"ping".to_vec())
+                .within("the ping write")
+                .await,
             OpOutcome::Done
         ));
         assert!(matches!(
-            tcp_read(registry.clone(), kept, 64).await,
+            tcp_read(registry.clone(), kept, 64).within("the ping read").await,
             OpOutcome::Bytes(b) if b == b"ping"
         ));
         assert!(registry.lock().unwrap().untaken.is_empty());
@@ -2375,6 +2467,14 @@ mod tests {
             stream.shutdown(std::net::Shutdown::Write).unwrap();
         });
         let handle = connected(&registry, &ids, port).await;
+        // Joined only once finished: a join can not be bounded.
+        async {
+            while !peer.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        .within("the peer's write and FIN")
+        .await;
         peer.join().unwrap();
         // Until the peer's bytes and its FIN are all here.
         let mut eof = false;
@@ -2389,12 +2489,17 @@ mod tests {
         assert!(tcp_read_ahead(&registry, handle), "the EOF stays seen");
 
         // Answered with a reset: the peer's socket is closed.
-        let _ = tcp_write(registry.clone(), handle, b"late".to_vec()).await;
+        let _ = tcp_write(registry.clone(), handle, b"late".to_vec())
+            .within("the late write")
+            .await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let mut received = Vec::new();
         loop {
-            match tcp_read(registry.clone(), handle, 65536).await {
+            match tcp_read(registry.clone(), handle, 65536)
+                .within("a read of what the read-ahead kept")
+                .await
+            {
                 OpOutcome::Bytes(chunk) => received.extend_from_slice(&chunk),
                 OpOutcome::Done => break,
                 // A failed read (ECONNRESET): the reset discarded the rest.
@@ -2409,7 +2514,9 @@ mod tests {
         );
         assert!(
             matches!(
-                tcp_read(registry.clone(), handle, 65536).await,
+                tcp_read(registry.clone(), handle, 65536)
+                    .within("the repeated EOF")
+                    .await,
                 OpOutcome::Done
             ),
             "the EOF is repeated"
@@ -2434,6 +2541,7 @@ mod tests {
             port,
             crate::net_connect::DEFAULT_ATTEMPT_TIMEOUT,
         )
+        .within("the connect")
         .await
         else {
             panic!("connect failed");
@@ -2488,17 +2596,23 @@ mod tests {
         let (writes, issued) = write_until_queued(&registry, handle);
         let writes: Vec<_> = writes.into_iter().map(tokio::spawn).collect();
 
-        tcp_settle_lingering(registry.clone()).await;
+        settle_within(&registry).await;
 
         // Before anything else is awaited: the settle is what finished them.
         for write in &writes {
             assert!(write.is_finished(), "a write was still queued");
         }
         for write in writes {
-            assert!(matches!(write.await.unwrap(), OpOutcome::Done));
+            assert!(matches!(
+                write.within("a finished write").await.unwrap(),
+                OpOutcome::Done
+            ));
         }
         // The parked read was woken to hand its half over: it ends like an EOF.
-        assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+        assert!(matches!(
+            parked.within("the parked read").await.unwrap(),
+            OpOutcome::Done
+        ));
         assert!(!tcp_has_lingering(&registry));
         assert_eq!(
             registry.lock().unwrap().bookkeeping(),
@@ -2524,13 +2638,17 @@ mod tests {
         handle: u64,
     ) -> tokio::task::JoinHandle<OpOutcome> {
         let parked = tokio::spawn(tcp_read(registry.clone(), handle, 64));
-        for _ in 0..5000 {
-            if !registry.lock().unwrap().readers.contains_key(&handle) {
-                return parked;
-            }
+        // Bounded by time, not by a count of sleeps: a sleep can take far
+        // longer than asked on a loaded host, or far less.
+        let deadline = tokio::time::Instant::now() + BOUND;
+        while registry.lock().unwrap().readers.contains_key(&handle) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the read never parked"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        panic!("the read never parked");
+        parked
     }
 
     /// A peer that accepts, writes `greeting`, and reads nothing until it is
@@ -2570,16 +2688,13 @@ mod tests {
         let handle = connected(&registry, &ids, port).await;
         tcp_linger_at_exit(&registry, handle);
         let parked = parked_read(&registry, handle).await;
-        let written = tcp_write(registry.clone(), handle, vec![7u8; 64 * 1024]).await;
+        let written = tcp_write(registry.clone(), handle, vec![7u8; 64 * 1024])
+            .within("the 64 KiB write")
+            .await;
         assert!(matches!(written, OpOutcome::Done));
 
         let started = std::time::Instant::now();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            tcp_settle_lingering(registry.clone()),
-        )
-        .await
-        .expect("the settle waited for a peer that was not reading");
+        settle_within(&registry).await;
         assert!(
             started.elapsed() >= PEER_EOF_GRACE,
             "the peer was not given its grace: {:?}",
@@ -2587,7 +2702,10 @@ mod tests {
         );
 
         assert!(peer.try_recv().is_err(), "the peer has not read yet");
-        assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+        assert!(matches!(
+            parked.within("the parked read").await.unwrap(),
+            OpOutcome::Done
+        ));
         assert_eq!(
             registry.lock().unwrap().bookkeeping(),
             (0, 0, 0, 0, 0),
@@ -2608,6 +2726,17 @@ mod tests {
     /// close, not closed on top of: that close is a reset, which on Windows
     /// costs the peer everything it has not read yet (measured: ECONNRESET
     /// and 0 of 200 kB). No read is parked: JS was not reading.
+    ///
+    /// 200 kB is more than the peer's receive window while it reads nothing
+    /// (a Linux loopback socket starts at about 128 KiB of receive buffer and
+    /// grows it only as the application reads). On Linux the rest then waits
+    /// in this end's send buffer until the peer reads, and a lingering close
+    /// returns only once the peer has ACKed the FIN behind it -- so the close
+    /// must not linger past [`CLOSE_LINGER`], or the settle waits on a peer
+    /// that is waiting on the settle. Windows' loopback takes it all at once,
+    /// so there the close returns at once. On every OS the contract is the
+    /// same: the settle returns while the peer reads nothing, and the peer
+    /// then reads every byte, and an end.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn what_the_peer_sent_unread_does_not_turn_the_close_into_a_reset() {
         let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
@@ -2615,10 +2744,12 @@ mod tests {
         let (port, go, peer) = held_peer(&[9u8; 100]);
         let handle = connected(&registry, &ids, port).await;
         tcp_linger_at_exit(&registry, handle);
-        let written = tcp_write(registry.clone(), handle, vec![7u8; 200_000]).await;
+        let written = tcp_write(registry.clone(), handle, vec![7u8; 200_000])
+            .within("the 200 kB write")
+            .await;
         assert!(matches!(written, OpOutcome::Done));
 
-        tcp_settle_lingering(registry.clone()).await;
+        settle_within(&registry).await;
 
         assert_eq!(
             registry.lock().unwrap().bookkeeping(),
@@ -2648,19 +2779,26 @@ mod tests {
         tcp_linger_at_exit(&registry, handle);
         let parked = tokio::spawn(tcp_read(registry.clone(), handle, 64));
         // Until the read has its half out.
-        while registry.lock().unwrap().bookkeeping().2 == 0 {
-            tokio::task::yield_now().await;
+        async {
+            while registry.lock().unwrap().bookkeeping().2 == 0 {
+                tokio::task::yield_now().await;
+            }
         }
+        .within("the read taking its half out")
+        .await;
         tcp_close(&registry, handle);
 
-        tcp_settle_lingering(registry.clone()).await;
+        settle_within(&registry).await;
 
         assert_eq!(
             registry.lock().unwrap().bookkeeping(),
             (0, 0, 0, 0, 0),
             "(closed, cancel, in_flight, readers, writers)"
         );
-        assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+        assert!(matches!(
+            parked.within("the parked read").await.unwrap(),
+            OpOutcome::Done
+        ));
         let received = tokio::task::spawn_blocking(move || {
             peer.recv_timeout(std::time::Duration::from_secs(30))
         })
@@ -2693,11 +2831,14 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         for write in writes {
             assert!(matches!(
-                tokio::spawn(write).await.unwrap(),
+                tokio::spawn(write).within("a queued write").await.unwrap(),
                 OpOutcome::Done
             ));
         }
-        assert!(matches!(shutdown.await.unwrap(), OpOutcome::Done));
+        assert!(matches!(
+            shutdown.within("the shutdown").await.unwrap(),
+            OpOutcome::Done
+        ));
         // The handle is still open: the EOF below is the shutdown's FIN.
         let received = tokio::task::spawn_blocking(move || {
             peer.recv_timeout(std::time::Duration::from_secs(30))
@@ -2713,7 +2854,9 @@ mod tests {
 
         // A write issued after the shutdown has no half to write to.
         assert!(matches!(
-            tcp_write(registry.clone(), handle, b"late".to_vec()).await,
+            tcp_write(registry.clone(), handle, b"late".to_vec())
+                .within("a write after the shutdown")
+                .await,
             OpOutcome::Failed(_)
         ));
         assert_eq!(registry.lock().unwrap().queued_writes(), 0);
@@ -2753,8 +2896,11 @@ mod tests {
         .expect("the peer's read failed");
         assert_eq!(received, b"response".len());
 
-        assert!(matches!(write.await, OpOutcome::Done));
-        assert!(matches!(shutdown.await, OpOutcome::Done));
+        assert!(matches!(write.within("the write").await, OpOutcome::Done));
+        assert!(matches!(
+            shutdown.within("the shutdown").await,
+            OpOutcome::Done
+        ));
         tcp_close(&registry, handle);
         assert_eq!(
             registry.lock().unwrap().bookkeeping(),
@@ -2786,10 +2932,16 @@ mod tests {
         // it, it ends one way or the other. The ops behind it find the
         // handle gone.
         for write in writes {
-            let _ = write.await.unwrap();
+            let _ = write.within("a queued write").await.unwrap();
         }
-        assert!(matches!(behind.await.unwrap(), OpOutcome::Failed(_)));
-        assert!(matches!(shutdown.await.unwrap(), OpOutcome::Done));
+        assert!(matches!(
+            behind.within("the write behind").await.unwrap(),
+            OpOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            shutdown.within("the shutdown").await.unwrap(),
+            OpOutcome::Done
+        ));
         let _ = tokio::task::spawn_blocking(move || {
             peer.recv_timeout(std::time::Duration::from_secs(30))
         })
@@ -2941,7 +3093,9 @@ mod tests {
         assert_eq!(tcp_reset(&registry, handle, false), Ok(()));
         peer_saw_reset(peer).await;
         assert!(matches!(
-            tcp_write(registry.clone(), handle, b"late".to_vec()).await,
+            tcp_write(registry.clone(), handle, b"late".to_vec())
+                .within("a write after the reset")
+                .await,
             OpOutcome::Failed(_)
         ));
         assert_eq!(
@@ -3020,11 +3174,15 @@ mod tests {
         let handle = connected(&registry, &ids, port).await;
 
         assert!(matches!(
-            tcp_write(registry.clone(), handle, b"bye".to_vec()).await,
+            tcp_write(registry.clone(), handle, b"bye".to_vec())
+                .within("the write")
+                .await,
             OpOutcome::Done
         ));
         assert!(matches!(
-            tcp_shutdown(registry.clone(), handle).await,
+            tcp_shutdown(registry.clone(), handle)
+                .within("the shutdown")
+                .await,
             OpOutcome::Done
         ));
         assert_eq!(
@@ -3057,7 +3215,9 @@ mod tests {
         let handle = connected(&registry, &ids, port).await;
 
         assert!(matches!(
-            tcp_shutdown(registry.clone(), handle).await,
+            tcp_shutdown(registry.clone(), handle)
+                .within("the shutdown")
+                .await,
             OpOutcome::Done
         ));
         let parked = tokio::spawn(tcp_read(registry.clone(), handle, 64));
@@ -3092,6 +3252,7 @@ mod tests {
         let options = crate::net_connect::ConnectOptions::default();
         let reaches = async |port: u16, ip: &str| {
             crate::net_connect::connect(ip, port, &options)
+                .within("the probe connect")
                 .await
                 .is_ok()
         };
@@ -3195,9 +3356,12 @@ mod tests {
         }
 
         let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
-        let client =
-            json(pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone()).await);
-        let accepted = json(accepting.await.unwrap());
+        let client = json(
+            pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone())
+                .within("the dial")
+                .await,
+        );
+        let accepted = json(accepting.within("the accept").await.unwrap());
         assert_eq!(client.as_object().unwrap().len(), 1, "{client}");
         assert_eq!(accepted.as_object().unwrap().len(), 1, "{accepted}");
         let (c, s) = (
@@ -3206,31 +3370,40 @@ mod tests {
         );
 
         assert!(matches!(
-            tcp_write(registry.clone(), c, b"ping".to_vec()).await,
+            tcp_write(registry.clone(), c, b"ping".to_vec())
+                .within("the ping write")
+                .await,
             OpOutcome::Done
         ));
         assert!(matches!(
-            tcp_read(registry.clone(), s, 64).await,
+            tcp_read(registry.clone(), s, 64).within("the ping read").await,
             OpOutcome::Bytes(b) if b == b"ping"
         ));
         assert!(matches!(
-            tcp_write(registry.clone(), s, b"pong".to_vec()).await,
+            tcp_write(registry.clone(), s, b"pong".to_vec())
+                .within("the pong write")
+                .await,
             OpOutcome::Done
         ));
         assert!(matches!(
-            tcp_read(registry.clone(), c, 64).await,
+            tcp_read(registry.clone(), c, 64).within("the pong read").await,
             OpOutcome::Bytes(b) if b == b"pong"
         ));
         // The client goes: the server reads the end of the stream.
         tcp_close(&registry, c);
         assert!(matches!(
-            tcp_read(registry.clone(), s, 64).await,
+            tcp_read(registry.clone(), s, 64)
+                .within("the server's EOF")
+                .await,
             OpOutcome::Done
         ));
         tcp_close(&registry, s);
         tcp_server_close(&registry, server_id);
 
-        match pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone()).await {
+        match pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone())
+            .within("the dial to the closed server")
+            .await
+        {
             OpOutcome::NodeFailed {
                 code,
                 message,
@@ -3267,11 +3440,16 @@ mod tests {
             .as_u64()
             .unwrap();
         let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
-        let c = json(pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone()).await)
-            ["handle"]
+        let c = json(
+            pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone())
+                .within("the dial")
+                .await,
+        )["handle"]
             .as_u64()
             .unwrap();
-        let s = json(accepting.await.unwrap())["handle"].as_u64().unwrap();
+        let s = json(accepting.within("the accept").await.unwrap())["handle"]
+            .as_u64()
+            .unwrap();
 
         const LEN: usize = 1024 * 1024;
         let writing = tokio::spawn(tcp_write(registry.clone(), s, vec![7u8; LEN]));
@@ -3284,22 +3462,32 @@ mod tests {
 
         let mut read = 0;
         while read < LEN {
-            match tcp_read(registry.clone(), c, 65536).await {
+            match tcp_read(registry.clone(), c, 65536)
+                .within("a read of the 1 MiB")
+                .await
+            {
                 OpOutcome::Bytes(b) => read += b.len(),
                 _ => panic!("the client reads every byte before any end"),
             }
         }
-        assert!(matches!(writing.await.unwrap(), OpOutcome::Done));
+        assert!(matches!(
+            writing.within("the 1 MiB write").await.unwrap(),
+            OpOutcome::Done
+        ));
         let shut = tokio::time::timeout(std::time::Duration::from_secs(10), shutting).await;
         assert!(matches!(shut, Ok(Ok(OpOutcome::Done))));
         // Ended both ways: the side that shut down reads EOF at once.
         assert!(matches!(
-            tcp_read(registry.clone(), s, 64).await,
+            tcp_read(registry.clone(), s, 64)
+                .within("the server's EOF")
+                .await,
             OpOutcome::Done
         ));
         tcp_close(&registry, s);
         assert!(matches!(
-            tcp_read(registry.clone(), c, 64).await,
+            tcp_read(registry.clone(), c, 64)
+                .within("the client's EOF")
+                .await,
             OpOutcome::Done
         ));
         tcp_close(&registry, c);
@@ -3322,18 +3510,25 @@ mod tests {
             .as_u64()
             .unwrap();
         let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
-        let c = json(pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone()).await)
-            ["handle"]
+        let c = json(
+            pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone())
+                .within("the dial")
+                .await,
+        )["handle"]
             .as_u64()
             .unwrap();
-        let s = json(accepting.await.unwrap())["handle"].as_u64().unwrap();
+        let s = json(accepting.within("the accept").await.unwrap())["handle"]
+            .as_u64()
+            .unwrap();
 
         // Nothing written: the shutdown has nothing to wait for, and the
         // server's parked read ends.
         let parked = tokio::spawn(tcp_read(registry.clone(), s, 64));
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert!(matches!(
-            tcp_shutdown(registry.clone(), s).await,
+            tcp_shutdown(registry.clone(), s)
+                .within("the shutdown")
+                .await,
             OpOutcome::Done
         ));
         let ended = tokio::time::timeout(std::time::Duration::from_secs(5), parked).await;
@@ -3344,11 +3539,15 @@ mod tests {
         // closed while that shutdown still waits: the close is at once.
         let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
         let c2 = json(
-            pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone()).await,
+            pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone())
+                .within("the second dial")
+                .await,
         )["handle"]
             .as_u64()
             .unwrap();
-        let s2 = json(accepting.await.unwrap())["handle"].as_u64().unwrap();
+        let s2 = json(accepting.within("the second accept").await.unwrap())["handle"]
+            .as_u64()
+            .unwrap();
         // More than the pipe's buffer and the read the server's end keeps
         // in flight on its own can hold.
         let writing = tokio::spawn(tcp_write(registry.clone(), c2, vec![1u8; 1024 * 1024]));
@@ -3382,11 +3581,16 @@ mod tests {
             .as_u64()
             .unwrap();
         let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
-        let c =
-            json(pipe_connect(registry.clone(), ids.clone(), path.clone(), path).await)["handle"]
-                .as_u64()
-                .unwrap();
-        let s = json(accepting.await.unwrap())["handle"].as_u64().unwrap();
+        let c = json(
+            pipe_connect(registry.clone(), ids.clone(), path.clone(), path)
+                .within("the dial")
+                .await,
+        )["handle"]
+            .as_u64()
+            .unwrap();
+        let s = json(accepting.within("the accept").await.unwrap())["handle"]
+            .as_u64()
+            .unwrap();
         (server_id, c, s)
     }
 
@@ -3420,7 +3624,11 @@ mod tests {
             "four waiting, all four taken"
         );
         // An accept hands one out and puts a fresh instance in its place.
-        let accepted = json(tcp_accept(registry.clone(), server_id, ids.clone()).await);
+        let accepted = json(
+            tcp_accept(registry.clone(), server_id, ids.clone())
+                .within("the accept")
+                .await,
+        );
         let fifth = ClientOptions::new().open(&path);
         assert!(fifth.is_ok(), "the accepted instance is replaced");
         drop((clients, fifth));
@@ -3469,10 +3677,14 @@ mod tests {
             .collect();
         let mut clients = Vec::new();
         for dial in dials {
-            clients.push(json(dial.await.unwrap())["handle"].as_u64().unwrap());
+            clients.push(
+                json(dial.within("a dial").await.unwrap())["handle"]
+                    .as_u64()
+                    .unwrap(),
+            );
         }
         let took = started.elapsed();
-        let servers = accepting.await.unwrap();
+        let servers = accepting.within("the accepts").await.unwrap();
         assert!(
             took < std::time::Duration::from_secs(2),
             "{CLIENTS} clients took {took:?} to connect"
@@ -3517,7 +3729,10 @@ mod tests {
         );
         let mut read = 0;
         while read < LEN + 100 {
-            match tcp_read(registry.clone(), s, 65536).await {
+            match tcp_read(registry.clone(), s, 65536)
+                .within("a read of the 1 MiB")
+                .await
+            {
                 OpOutcome::Bytes(b) => read += b.len(),
                 _ => panic!("every byte arrives"),
             }
@@ -3556,7 +3771,10 @@ mod tests {
 
         // The client's pipe is closed for good: the server's write fails.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while let OpOutcome::Done = tcp_write(registry.clone(), s, b"x".to_vec()).await {
+        while let OpOutcome::Done = tcp_write(registry.clone(), s, b"x".to_vec())
+            .within("a write to the closed client")
+            .await
+        {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the client end stays open after its close"

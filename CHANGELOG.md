@@ -348,6 +348,10 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 **node:child_process and node:cluster**
 
+- **On Linux, a child exiting after an IPC message larger than the parent's TCP receive
+  window no longer waits for the parent to read it.** The exit's close of the channel waited
+  until the parent read what did not fit, which a parent waiting for the child to exit never
+  does; it now waits at most a second and the kernel delivers the rest.
 - **`spawnSync` / `execSync` with an `input` larger than the pipe buffer no longer deadlock
   against a child that writes while it reads** (`cat`, a compressor, `stdin.pipe(stdout)`).
 - **A `spawnSync` / `execSync` `timeout` returns at the deadline even when a grandchild
