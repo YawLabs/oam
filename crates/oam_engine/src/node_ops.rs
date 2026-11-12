@@ -12662,16 +12662,18 @@ mod ifaddrs {
             target_os = "netbsd",
             target_os = "dragonfly"
         )))]
-        // SAFETY: `sa_family` lies inside every family's struct, which the
-        // caller's contract makes readable; read unaligned, so `sa`'s
-        // alignment is not assumed.
-        let family = unsafe { std::ptr::addr_of!((*sa).sa_family).read_unaligned() };
-        let len = match i32::from(family) {
-            libc::AF_INET => std::mem::size_of::<libc::sockaddr_in>(),
-            libc::AF_INET6 => std::mem::size_of::<libc::sockaddr_in6>(),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            libc::AF_PACKET => std::mem::size_of::<libc::sockaddr_ll>(),
-            _ => std::mem::size_of::<libc::sockaddr>(),
+        let len = {
+            // SAFETY: `sa_family` lies inside every family's struct, which
+            // the caller's contract makes readable; read unaligned, so
+            // `sa`'s alignment is not assumed.
+            let family = unsafe { std::ptr::addr_of!((*sa).sa_family).read_unaligned() };
+            match i32::from(family) {
+                libc::AF_INET => std::mem::size_of::<libc::sockaddr_in>(),
+                libc::AF_INET6 => std::mem::size_of::<libc::sockaddr_in6>(),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                libc::AF_PACKET => std::mem::size_of::<libc::sockaddr_ll>(),
+                _ => std::mem::size_of::<libc::sockaddr>(),
+            }
         };
         // SAFETY: `len` bytes from `sa` are in bounds: the family's struct
         // size, or on the BSDs the sockaddr's own `sa_len` (the caller's
