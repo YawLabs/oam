@@ -70,7 +70,8 @@ pub fn clear_unsent() {
 /// (`tcp::tcp_settle_lingering`) -- the FIN; a read to the parent's EOF for
 /// at most `tcp::PEER_EOF_GRACE` (a parent that is reading closes the channel
 /// at the child's end-of-stream); and a close that returns once the parent's
-/// kernel holds every byte. The write blocks, as node's channel write does
+/// kernel holds every byte, or its bounded linger runs out
+/// (`tcp::arm_delivering_close`). The write blocks, as node's channel write does
 /// at exit, for as long as the queue does not fit what the kernel buffers;
 /// nothing waits for a parent that is not reading a message that does fit.
 /// With no parent listening there is nobody to send to, and nothing is.
