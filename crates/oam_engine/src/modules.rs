@@ -9,12 +9,16 @@
 //! The module map lives in an isolate slot because the resolve callback
 //! must be a zero-capture function (rusty_v8 maps it to a C callback).
 //!
-//! Module identity: map keys are lexically-normalized absolute paths
-//! ('.'/'..' collapsed — std::path::absolute keeps '..' on POSIX, which
-//! would both double-instantiate modules and make '..'-spelled import
-//! cycles recurse forever). Keys stay case-SENSITIVE on purpose: on
-//! case-insensitive filesystems './A.ts' and './a.ts' become two module
-//! instances, which matches Node's URL-keyed ESM behavior exactly.
+//! Module identity: map keys are canonical paths (`module_key`):
+//! `std::fs::canonicalize` of the absolute path, so symlinks, Windows 8.3
+//! short names and drive/case aliases of one file all share a key -- the same
+//! resolution the loader applies to imported paths. On a case-insensitive
+//! filesystem './A.ts' and './a.ts' are therefore ONE module instance where
+//! the canonical form folds them (Windows reports the on-disk spelling).
+//! Only a path that cannot be canonicalized (a missing file) falls back to
+//! the lexically-normalized form ('.'/'..' collapsed — std::path::absolute
+//! keeps '..' on POSIX, which would both double-instantiate modules and make
+//! '..'-spelled import cycles recurse forever).
 
 use oam_diagnostics::{Diagnostic, Origin, Severity};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -53,12 +57,15 @@ pub trait ModuleHost: Sync {
 ///
 /// SAFETY contract -- enforced by EVERY entry point that runs JS on the
 /// isolate:
-///  - `execute_module` parks `Some(host_ptr)` and clears to `None` on return.
-///  - `reset_run_slots` clears to `None` -- this is the inheritance path for
-///    `execute_cjs` and `execute_worker` (both call `reset_run_slots` first).
-///  - `tick`, `repl_eval`, `execute_script`, and `run_registered_tests` clear
-///    to `None` at their head -- they accept JS that may call `import()` but
-///    have no host of their own.
+///  - `execute_module` and the CommonJS entry path (`run_cjs_entry`, behind
+///    `execute_cjs`) park `Some(host_ptr)` and clear to `None` on return, on
+///    every return path: each is a wrapper that clears after its body.
+///  - `reset_run_slots` clears to `None` -- every `execute_*` entry calls it
+///    first, so a run never starts with an earlier run's pointer.
+///  - `tick`, `repl_eval`, `execute_script`, `run_registered_tests`,
+///    `process_exit_code` and the 'exit' emit clear to `None` at their head
+///    -- they run JS that may call `import()` or `require()` of an ES module
+///    but have no host of their own.
 ///
 /// If a new JS-running entry point is added, it MUST clear this slot before
 /// running any JS (microtask checkpoints included), or an import() op will
@@ -191,12 +198,6 @@ pub(crate) struct RejectionLedger {
     unhandled: Vec<(v8::Global<v8::Promise>, v8::Global<v8::Value>)>,
 }
 
-/// Uncaught exceptions V8 reports outside any TryCatch — microtask callbacks
-/// are the reachable case: perform_microtask_checkpoint SWALLOWS their
-/// exceptions (documented), and without a message listener V8 just printed
-/// them to stdout while we exited 0 (review finding). The listener records
-/// the VALUE here so a process 'uncaughtException' listener gets the real
-/// Error; without a listener the event loop fails the run, like Node.
 /// The ES module entry's evaluation promise while the event loop runs it: a
 /// tick point stops at the microtask checkpoint that rejects it. node
 /// reports an entry's throw from inside the drain that resumed it (a
@@ -257,6 +258,12 @@ fn park_entry_evaluation(
     scope.set_slot(EntryEvaluation(parked));
 }
 
+/// Uncaught exceptions V8 reports outside any TryCatch — microtask callbacks
+/// are the reachable case: perform_microtask_checkpoint SWALLOWS their
+/// exceptions (documented), and without a message listener V8 just printed
+/// them to stdout while we exited 0 (review finding). The listener records
+/// the VALUE here so a process 'uncaughtException' listener gets the real
+/// Error; without a listener the event loop fails the run, like Node.
 #[derive(Default)]
 pub(crate) struct UncaughtLedger {
     entries: Vec<UncaughtEntry>,
@@ -666,12 +673,6 @@ pub(crate) fn flush_handled_rejections(
     None
 }
 
-/// Route an uncaught exception through the JS canonical dispatcher
-/// (`__oamDispatchUncaught`: uncaughtExceptionMonitor -> capture callback ->
-/// 'uncaughtException' listeners, all with Node's origin second argument).
-/// Returns true when JS consumed the error and the run survives. Falls back
-/// to a bare 'uncaughtException' emit when the dispatcher global is
-/// unavailable (early boot, stripped globals).
 /// Outcome of routing an exception through the JS uncaught ladder.
 pub(crate) enum Uncaught {
     /// A listener consumed it; the run survives.
@@ -688,6 +689,12 @@ pub(crate) enum Uncaught {
     },
 }
 
+/// Route an uncaught exception through the JS canonical dispatcher
+/// (`__oamDispatchUncaught`: uncaughtExceptionMonitor -> capture callback ->
+/// 'uncaughtException' listeners, all with Node's origin second argument).
+/// [`Uncaught::Handled`] when JS consumed the error and the run survives.
+/// Falls back to a bare 'uncaughtException' emit when the dispatcher global
+/// is unavailable (early boot, stripped globals).
 pub(crate) fn dispatch_uncaught(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     exception: v8::Local<v8::Value>,
@@ -1272,6 +1279,17 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
     path
 }
 
+/// Whether `path` names a virtual module -- a `node:` builtin or an `oam:`
+/// runtime module -- rather than a file. The one spelling of that test.
+pub(crate) fn is_virtual_module(path: &Path) -> bool {
+    path.to_str().is_some_and(is_virtual_specifier)
+}
+
+/// [`is_virtual_module`] for a path already in hand as text.
+fn is_virtual_specifier(text: &str) -> bool {
+    text.starts_with("node:") || text.starts_with("oam:")
+}
+
 /// The canonical identity of a module file: one key regardless of how the path
 /// was spelled. `std::fs::canonicalize` resolves symlinks, Windows 8.3 short
 /// names (`RUNNER~1`), and drive/case aliases — the SAME resolution the loader
@@ -1291,10 +1309,7 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
 /// failing its read -- not `app.js`, which `std::path::absolute`
 /// (GetFullPathNameW) would make of it.
 pub(crate) fn module_key(path: &Path) -> std::io::Result<PathBuf> {
-    if path
-        .to_str()
-        .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"))
-    {
+    if is_virtual_module(path) {
         return Ok(path.to_path_buf());
     }
     #[cfg(windows)]
@@ -1334,8 +1349,6 @@ fn test_diag(code: &str, message: impl Into<String>) -> Vec<Diagnostic> {
 }
 
 impl JsRuntime {
-    /// Reset all per-run isolate slots. Shared by the ESM and CJS entry
-    /// paths.
     /// Clear the dynamic-import host slot. Called by every JS-running entry
     /// point that has no host of its own (execute_script, repl_eval, tick,
     /// run_registered_tests). See the `ActiveHost` SAFETY note for why.
@@ -1349,9 +1362,10 @@ impl JsRuntime {
     /// `reset_run_slots`, which clears the slot.
     ///
     /// SAFETY: `host` outlives the whole `execute_*` call, and the ops only
-    /// read the slot while JS runs inside it; the slot is reset to None by
-    /// reset_run_slots / tick() / repl_eval() so no later turn can read a
-    /// stale pointer.
+    /// read the slot while JS runs inside it; the caller clears the slot
+    /// when that call returns (`clear_active_host`), and reset_run_slots /
+    /// tick() / repl_eval() clear it again at their head, so no later turn
+    /// can read a stale pointer.
     pub(crate) fn park_active_host(&mut self, host: &dyn ModuleHost) {
         // SAFETY: a lifetime-only transmute of a fat pointer -- only the erased
         // lifetime changes, the (data, vtable) halves keep identical layout, so
@@ -1363,6 +1377,8 @@ impl JsRuntime {
         self.isolate.set_slot(ActiveHost(Some(host_ptr)));
     }
 
+    /// Reset all per-run isolate slots. Shared by the ESM and CJS entry
+    /// paths.
     pub(crate) fn reset_run_slots(&mut self) -> Result<(), Vec<Diagnostic>> {
         // Clear any host pointer parked by a prior execute_module on this same
         // JsRuntime. execute_cjs and execute_worker both call reset_run_slots
@@ -1395,6 +1411,20 @@ impl JsRuntime {
 
     /// Load, instantiate, and evaluate the ES module graph rooted at `entry`.
     pub fn execute_module(
+        &mut self,
+        entry: &Path,
+        host: &dyn ModuleHost,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let result = self.execute_module_parked(entry, host);
+        // `host` is only borrowed for this call: the pointer the run parked
+        // must not outlive it, on any return path (see `ActiveHost`).
+        self.clear_active_host();
+        result
+    }
+
+    /// The body of [`Self::execute_module`], which parks `host` for the
+    /// import() ops; the wrapper clears the slot once this returns.
+    fn execute_module_parked(
         &mut self,
         entry: &Path,
         host: &dyn ModuleHost,
@@ -2010,16 +2040,10 @@ impl JsRuntime {
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
         loop {
-            // In replay mode, advance the virtual clock so all pending timers
-            // are immediately due -- no real sleep is needed.
-            let is_replay = tc
-                .get_slot::<crate::replay::ReplayState>()
-                .is_some_and(|s| s.is_replay());
-            let now = if is_replay {
-                std::time::Instant::now() + std::time::Duration::from_secs(86400)
-            } else {
-                std::time::Instant::now()
-            };
+            // The real clock, always: replay mode is set on the run path
+            // only, and a tick's budget is real time (a clock shifted for
+            // replay would be past the deadline before anything ran).
+            let now = std::time::Instant::now();
             if now >= deadline {
                 return Ok(());
             }
@@ -2039,6 +2063,10 @@ impl JsRuntime {
                         return Err(failure);
                     }
                 }
+                // Also after a handled throw, where pump_event_loop leaves
+                // the batch for its check phase: a tick has no later phase
+                // to drain it in, and the REPL's next line must not find
+                // the last one's ticks still queued.
                 if let Some(failure) = run_ticks_and_microtasks(tc) {
                     return Err(failure);
                 }
@@ -2051,21 +2079,7 @@ impl JsRuntime {
                 .get_slot_mut::<oam_core::CoreRuntime>()
                 .and_then(|core| core.try_recv())
             {
-                let completion =
-                    if let Some(state) = tc.get_slot_mut::<crate::replay::ReplayState>() {
-                        crate::replay::intercept_completion(state, completion)
-                    } else {
-                        completion
-                    };
-                match crate::ops::settle_completion(tc, completion) {
-                    crate::ops::Settled::Fatal(failure) => return Err(failure),
-                    crate::ops::Settled::ThrewHandled => {}
-                    crate::ops::Settled::Ran => {
-                        if let Some(failure) = run_ticks_and_microtasks(tc) {
-                            return Err(failure);
-                        }
-                    }
-                }
+                settle_received(tc, completion)?;
                 progressed = true;
             }
             if let Some(failure) = drain_uncaught(tc) {
@@ -2083,34 +2097,13 @@ impl JsRuntime {
                 Some(timer) if timer < deadline => timer,
                 _ => deadline,
             };
-            // In replay mode, skip the sleep -- timers appear due via the
-            // advanced virtual clock above; no real wall-clock wait needed.
-            let replay_active = tc
-                .get_slot::<crate::replay::ReplayState>()
-                .is_some_and(|s| s.is_replay());
-            let completion = if !replay_active {
-                tc.get_slot_mut::<oam_core::CoreRuntime>()
-                    .and_then(|core| core.recv_deadline(Some(wait_until)))
-            } else {
-                tc.get_slot_mut::<oam_core::CoreRuntime>()
-                    .and_then(|core| core.try_recv())
-            };
+            let completion = tc
+                .get_slot_mut::<oam_core::CoreRuntime>()
+                .and_then(|core| core.recv_deadline(Some(wait_until)));
             if let Some(completion) = completion {
-                let completion =
-                    if let Some(state) = tc.get_slot_mut::<crate::replay::ReplayState>() {
-                        crate::replay::intercept_completion(state, completion)
-                    } else {
-                        completion
-                    };
-                match crate::ops::settle_completion(tc, completion) {
-                    crate::ops::Settled::Fatal(failure) => return Err(failure),
-                    crate::ops::Settled::ThrewHandled => {}
-                    crate::ops::Settled::Ran => {
-                        if let Some(failure) = run_ticks_and_microtasks(tc) {
-                            return Err(failure);
-                        }
-                    }
-                }
+                // Its uncaught throws are delivered here: the loop may
+                // return at the deadline check before the drain above.
+                settle_received(tc, completion)?;
             } else if next_timer.is_none_or(|t| t >= deadline) {
                 return Ok(());
             }
@@ -2341,17 +2334,6 @@ impl JsRuntime {
     }
 }
 
-/// The blocking event loop, shared by ESM and CJS entry paths. Each turn
-/// services at most ONE due timer (so a clear issued by one callback
-/// cancels same-instant siblings) AND THEN one ready op completion — never
-/// timer-only: a continuously-due interval must not starve IO settlement
-/// (review blocker; Node's phase model services poll after timers no
-/// matter how busy timers are). Microtask drain after each, so dependent
-/// code runs at the earliest correct moment. When idle, block on the op
-/// channel with the next timer deadline as timeout (one blocking point, no
-/// busy-wait). Exit when nothing remains; the process stays alive for
-/// pending timers/ops after the entry settles — Node semantics. A rejected
-/// entry promise breaks early (the caller reports it).
 /// Node's processTicksAndRejections, host-owned (docs/design/
 /// nexttick-engine.md): drain the JS nextTick queue, run a microtask
 /// checkpoint, and loop while the checkpoint scheduled more ticks. This
@@ -2558,6 +2540,50 @@ fn drain_deferred_ticks(
     Ok(())
 }
 
+/// How far replay mode shifts the loop's clock ahead of the real one, so a
+/// pending timer is due at once and no real sleep is needed.
+const REPLAY_CLOCK_SHIFT: std::time::Duration = std::time::Duration::from_secs(86400);
+
+/// Settle one op completion the event loop received: swap in the recorded
+/// outcome in replay mode, run the callback, then the tick + microtask drain
+/// (not after a handled throw: node leaves that batch queued for its next
+/// tick point) and deliver anything the drain left on the UncaughtLedger.
+/// The one settle sequence for [`pump_event_loop`] and `JsRuntime::tick`.
+fn settle_received(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    completion: oam_core::OpCompletion,
+) -> Result<(), Vec<Diagnostic>> {
+    let completion = if let Some(state) = tc.get_slot_mut::<crate::replay::ReplayState>() {
+        crate::replay::intercept_completion(state, completion)
+    } else {
+        completion
+    };
+    match crate::ops::settle_completion(tc, completion) {
+        crate::ops::Settled::Fatal(failure) => return Err(failure),
+        crate::ops::Settled::ThrewHandled => {}
+        crate::ops::Settled::Ran => {
+            if let Some(failure) = run_ticks_and_microtasks(tc) {
+                return Err(failure);
+            }
+        }
+    }
+    if let Some(failure) = drain_uncaught(tc) {
+        return Err(failure);
+    }
+    Ok(())
+}
+
+/// The blocking event loop, shared by ESM and CJS entry paths. Each turn
+/// services at most ONE due timer (so a clear issued by one callback
+/// cancels same-instant siblings) AND THEN one ready op completion — never
+/// timer-only: a continuously-due interval must not starve IO settlement
+/// (review blocker; Node's phase model services poll after timers no
+/// matter how busy timers are). Microtask drain after each, so dependent
+/// code runs at the earliest correct moment. When idle, block on the op
+/// channel with the next timer deadline as timeout (one blocking point, no
+/// busy-wait). Exit when nothing remains; the process stays alive for
+/// pending timers/ops after the entry settles — Node semantics. A rejected
+/// entry promise breaks early (the caller reports it).
 pub(crate) fn pump_event_loop(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     entry_promise: Option<v8::Local<'_, v8::Promise>>,
@@ -2626,7 +2652,7 @@ pub(crate) fn pump_event_loop(
             .get_slot::<crate::replay::ReplayState>()
             .is_some_and(|s| s.is_replay());
         let now = if is_replay {
-            std::time::Instant::now() + std::time::Duration::from_secs(86400)
+            std::time::Instant::now() + REPLAY_CLOCK_SHIFT
         } else {
             std::time::Instant::now()
         };
@@ -2762,23 +2788,7 @@ pub(crate) fn pump_event_loop(
             .get_slot_mut::<oam_core::CoreRuntime>()
             .and_then(|core| core.try_recv())
         {
-            let completion = if let Some(state) = tc.get_slot_mut::<crate::replay::ReplayState>() {
-                crate::replay::intercept_completion(state, completion)
-            } else {
-                completion
-            };
-            match crate::ops::settle_completion(tc, completion) {
-                crate::ops::Settled::Fatal(failure) => return Err(failure),
-                crate::ops::Settled::ThrewHandled => {}
-                crate::ops::Settled::Ran => {
-                    if let Some(failure) = run_ticks_and_microtasks(tc) {
-                        return Err(failure);
-                    }
-                }
-            }
-            if let Some(failure) = drain_uncaught(tc) {
-                return Err(failure);
-            }
+            settle_received(tc, completion)?;
             last_ran = LastRan::Other;
             progressed = true;
         }
@@ -2839,24 +2849,7 @@ pub(crate) fn pump_event_loop(
                 .get_slot_mut::<oam_core::CoreRuntime>()
                 .and_then(|core| core.recv_deadline(Some(std::time::Instant::now() + DRAIN_SLICE)));
             if let Some(completion) = completion {
-                let completion =
-                    if let Some(state) = tc.get_slot_mut::<crate::replay::ReplayState>() {
-                        crate::replay::intercept_completion(state, completion)
-                    } else {
-                        completion
-                    };
-                match crate::ops::settle_completion(tc, completion) {
-                    crate::ops::Settled::Fatal(failure) => return Err(failure),
-                    crate::ops::Settled::ThrewHandled => {}
-                    crate::ops::Settled::Ran => {
-                        if let Some(failure) = run_ticks_and_microtasks(tc) {
-                            return Err(failure);
-                        }
-                    }
-                }
-                if let Some(failure) = drain_uncaught(tc) {
-                    return Err(failure);
-                }
+                settle_received(tc, completion)?;
             }
             continue;
         }
@@ -2895,36 +2888,22 @@ pub(crate) fn pump_event_loop(
         match (next_deadline, has_inflight) {
             (None, false) => break,
             (deadline, true) => {
-                // In replay mode, skip the blocking wait.
-                let replay_active = tc
-                    .get_slot::<crate::replay::ReplayState>()
-                    .is_some_and(|s| s.is_replay());
-                let completion = if replay_active {
-                    tc.get_slot_mut::<oam_core::CoreRuntime>()
-                        .and_then(|core| core.try_recv())
+                // Replay mode blocks here too: a replayed outcome is swapped
+                // in when the real completion arrives, so the op is still
+                // awaited -- polling instead spun this loop at full CPU
+                // until it landed. A timer still pending at this point is
+                // one the shifted clock did not make due, so its real
+                // deadline is brought forward by the same shift.
+                let deadline = if is_replay {
+                    deadline.map(|at| at.checked_sub(REPLAY_CLOCK_SHIFT).unwrap_or(at))
                 } else {
-                    tc.get_slot_mut::<oam_core::CoreRuntime>()
-                        .and_then(|core| core.recv_deadline(deadline))
+                    deadline
                 };
+                let completion = tc
+                    .get_slot_mut::<oam_core::CoreRuntime>()
+                    .and_then(|core| core.recv_deadline(deadline));
                 if let Some(completion) = completion {
-                    let completion =
-                        if let Some(state) = tc.get_slot_mut::<crate::replay::ReplayState>() {
-                            crate::replay::intercept_completion(state, completion)
-                        } else {
-                            completion
-                        };
-                    match crate::ops::settle_completion(tc, completion) {
-                        crate::ops::Settled::Fatal(failure) => return Err(failure),
-                        crate::ops::Settled::ThrewHandled => {}
-                        crate::ops::Settled::Ran => {
-                            if let Some(failure) = run_ticks_and_microtasks(tc) {
-                                return Err(failure);
-                            }
-                        }
-                    }
-                    if let Some(failure) = drain_uncaught(tc) {
-                        return Err(failure);
-                    }
+                    settle_received(tc, completion)?;
                     // A settled completion is loop progress: re-arm the
                     // once-per-drain 'beforeExit' guard (work scheduled from
                     // a beforeExit handler settles HERE, not via try_recv).
@@ -2939,12 +2918,16 @@ pub(crate) fn pump_event_loop(
                 // of being deferred until the next timer. recv_deadline doubles
                 // as the idle sleep AND the signal wakeup: it returns early
                 // with the completion, or None when the deadline is reached.
-                // In replay mode, skip the wait -- timers appear due via the
-                // advanced virtual clock above.
-                let replay_active = tc
-                    .get_slot::<crate::replay::ReplayState>()
-                    .is_some_and(|s| s.is_replay());
-                if !replay_active {
+                // In replay mode the shifted clock above has already run
+                // every timer it made due, so one still pending here waits
+                // for the shifted clock to reach it: its real deadline less
+                // the shift (skipping the wait spun the loop until then).
+                let deadline = if is_replay {
+                    deadline.checked_sub(REPLAY_CLOCK_SHIFT).unwrap_or(deadline)
+                } else {
+                    deadline
+                };
+                {
                     // When the inspector is attached, cap each wait at
                     // POLL_INTERVAL so CDP messages aren't deferred until the
                     // timer fires (the same interleave the old sleep used).
@@ -2965,25 +2948,7 @@ pub(crate) fn pump_event_loop(
                             .get_slot_mut::<oam_core::CoreRuntime>()
                             .and_then(|core| core.recv_deadline(Some(chunk_deadline)));
                         if let Some(completion) = completion {
-                            let completion = if let Some(state) =
-                                tc.get_slot_mut::<crate::replay::ReplayState>()
-                            {
-                                crate::replay::intercept_completion(state, completion)
-                            } else {
-                                completion
-                            };
-                            match crate::ops::settle_completion(tc, completion) {
-                                crate::ops::Settled::Fatal(failure) => return Err(failure),
-                                crate::ops::Settled::ThrewHandled => {}
-                                crate::ops::Settled::Ran => {
-                                    if let Some(failure) = run_ticks_and_microtasks(tc) {
-                                        return Err(failure);
-                                    }
-                                }
-                            }
-                            if let Some(failure) = drain_uncaught(tc) {
-                                return Err(failure);
-                            }
+                            settle_received(tc, completion)?;
                             // A signal listener may have scheduled work or called
                             // process.exit; re-evaluate the outer loop condition.
                             // Its callback was loop progress: re-arm the
@@ -3272,10 +3237,7 @@ impl<'scope, 'env> GraphPrefetcher<'scope, 'env> {
     /// conditions: virtual builtins, JSON modules and CJS interop all need
     /// the isolate and load inline.
     fn eligible(path: &Path) -> bool {
-        if path
-            .to_str()
-            .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"))
-        {
+        if is_virtual_module(path) {
             return false;
         }
         if path.extension().and_then(|e| e.to_str()) == Some("json") {
@@ -3766,38 +3728,20 @@ fn resolve_imports(
         // only supported attribute is type, and the only supported
         // type is json. Spec-required behavior is to IGNORE unknown
         // keys; an unsupported type VALUE is an error.
-        let attributes = request.get_import_attributes();
-        let mut typed_json = false;
-        let mut index = 0;
-        while index + 1 < attributes.length() {
-            let key = attributes
-                .get(tc, index)
-                .and_then(|d| v8::Local::<v8::Value>::try_from(d).ok())
-                .and_then(|v| v.to_string(tc))
-                .map(|s| s.to_rust_string_lossy(tc))
-                .unwrap_or_default();
-            let value = attributes
-                .get(tc, index + 1)
-                .and_then(|d| v8::Local::<v8::Value>::try_from(d).ok())
-                .and_then(|v| v.to_string(tc))
-                .map(|s| s.to_rust_string_lossy(tc))
-                .unwrap_or_default();
-            if key == "type" {
-                if value == "json" {
-                    typed_json = true;
-                } else {
-                    return Err(rt_diag(
-                        "OAM-MOD0003",
-                        format!(
-                            "{}: import of '{specifier}' declares type \"{value}\" — \
-                             the only supported import-attribute type is \"json\"",
-                            path.display()
-                        ),
-                    ));
-                }
+        let typed_json = match import_type(tc, request.get_import_attributes(), 3) {
+            None => false,
+            Some(value) if value == "json" => true,
+            Some(value) => {
+                return Err(rt_diag(
+                    "OAM-MOD0003",
+                    format!(
+                        "{}: import of '{specifier}' declares type \"{value}\" — \
+                         the only supported import-attribute type is \"json\"",
+                        path.display()
+                    ),
+                ));
             }
-            index += 3;
-        }
+        };
 
         let resolved = host.resolve(&specifier, path).inspect_err(|_| {
             tc.set_slot(UnresolvedDuringLoad(Some((
@@ -3816,21 +3760,14 @@ fn resolve_imports(
                 ),
             ));
         }
-        // Virtual builtin paths must not go through filesystem
-        // normalization (absolute() would anchor "node:fs" at cwd).
-        let resolved = if resolved
-            .to_str()
-            .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"))
-        {
-            resolved
-        } else {
-            module_key(&resolved).map_err(|e| {
-                rt_diag(
-                    "OAM-RT0002",
-                    format!("bad resolved path {}: {e}", resolved.display()),
-                )
-            })?
-        };
+        // module_key returns a virtual builtin path (`node:fs`) as it is,
+        // and keys everything else as a file.
+        let resolved = module_key(&resolved).map_err(|e| {
+            rt_diag(
+                "OAM-RT0002",
+                format!("bad resolved path {}: {e}", resolved.display()),
+            )
+        })?;
         tc.get_slot_mut::<ModuleMap>()
             .expect("module map installed")
             .edges
@@ -3861,13 +3798,37 @@ fn resolve_imports(
 /// placeholder `require.cache` entry the require() made and build a facade
 /// around its empty exports.
 fn runs_as_commonjs(scope: &mut v8::PinScope<'_, '_>, path: &Path) -> bool {
-    let virtual_module = path
-        .to_str()
-        .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"));
-    !virtual_module
+    !is_virtual_module(path)
         && path.extension().and_then(|e| e.to_str()) != Some("json")
         && oam_loader::module_kind(path) == oam_loader::ModuleKind::Cjs
         && !crate::cjs::is_requiring_esm(scope, path)
+}
+
+/// The ES module source for `path`: the load the pool parked for it, with
+/// the worker's bytecode-cache probe left in `probe`, or `host.load` inline
+/// when the path was never handed to the pool. Taking the parked load waits
+/// for its worker, so the host is never asked for one path twice at once.
+fn prefetched_or_load(
+    prefetch: Option<&mut GraphPrefetcher<'_, '_>>,
+    host: &dyn ModuleHost,
+    path: &Path,
+    probe: &mut Option<(
+        Option<crate::code_cache::CacheKey>,
+        Option<crate::code_cache::Loaded>,
+    )>,
+) -> Result<String, Vec<Diagnostic>> {
+    match prefetch.and_then(|prefetch| prefetch.take(path)) {
+        // A parked Err surfaces HERE — when the path is popped, not
+        // when the worker hit it — so error content and ordering are
+        // byte-identical to the inline call below.
+        Some(Prefetched::Loaded { code, key, cached }) => {
+            *probe = Some((key, cached));
+            Ok(code)
+        }
+        Some(Prefetched::Failed(diags)) => Err(diags),
+        Some(Prefetched::Panicked(payload)) => std::panic::resume_unwind(payload),
+        None => host.load(path),
+    }
 }
 
 /// Compile the module at `path` (not yet in the module map) and register it:
@@ -3968,7 +3929,10 @@ fn compile_module(
             crate::cjs::CjsLoad::Esm => {
                 let wkey = module_key(path).unwrap_or_else(|_| path.to_path_buf());
                 crate::cjs::warn_typeless_package_json(tc, &wkey);
-                host.load(path)?
+                // The pool front-runs a typeless project file on the guess
+                // that it is an ES module (GraphPrefetcher::eligible): this
+                // is where that guess wins, so its load is taken here.
+                prefetched_or_load(prefetch.as_deref_mut(), host, path, &mut prefetched)?
             }
             crate::cjs::CjsLoad::Threw => {
                 let caught = tc.exception().map(|value| v8::Global::new(tc, value));
@@ -3986,18 +3950,7 @@ fn compile_module(
             }
         }
     } else {
-        match prefetch.as_mut().and_then(|prefetch| prefetch.take(path)) {
-            // A parked Err surfaces HERE — when the path is popped, not
-            // when the worker hit it — so error content and ordering are
-            // byte-identical to the inline call below.
-            Some(Prefetched::Loaded { code, key, cached }) => {
-                prefetched = Some((key, cached));
-                code
-            }
-            Some(Prefetched::Failed(diags)) => return Err(diags),
-            Some(Prefetched::Panicked(payload)) => std::panic::resume_unwind(payload),
-            None => host.load(path)?,
-        }
+        prefetched_or_load(prefetch, host, path, &mut prefetched)?
     };
     let file = path.to_string_lossy().into_owned();
 
@@ -4197,8 +4150,10 @@ fn resolve_module_callback<'s>(
 struct DynamicImportHook(v8::Global<v8::Function>);
 
 /// A distinct number per module map, so js/esm_loader.js drops its job
-/// cache when a run starts a new map.
-static MODULE_MAP_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// cache when a run starts a new map. Counted from 1: 0 is what
+/// `ops.generation()` answers when the isolate has no map, and must never
+/// be a map's own number.
+static MODULE_MAP_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 fn next_module_map_generation() -> u32 {
     MODULE_MAP_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -4310,25 +4265,18 @@ fn op_dyn_resolve(
         }
         Some(Ok(path)) => path,
     };
-    // Virtual builtin paths bypass filesystem normalization (module_key /
-    // absolute() would anchor "node:fs" at cwd); everything else is keyed.
-    let key = if resolved
-        .to_str()
-        .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"))
-    {
-        resolved
-    } else {
-        match module_key(&resolved) {
-            Ok(key) => key,
-            Err(e) => {
-                return throw_dyn_error(
-                    scope,
-                    &format!(
-                        "oam: dynamic import('{spec}'): bad resolved path {}: {e}",
-                        resolved.display()
-                    ),
-                );
-            }
+    // module_key returns a virtual builtin path (`node:fs`) as it is, and
+    // keys everything else as a file.
+    let key = match module_key(&resolved) {
+        Ok(key) => key,
+        Err(e) => {
+            return throw_dyn_error(
+                scope,
+                &format!(
+                    "oam: dynamic import('{spec}'): bad resolved path {}: {e}",
+                    resolved.display()
+                ),
+            );
         }
     };
     let text =
@@ -4707,7 +4655,10 @@ pub(crate) fn require_esm(
     parent: &str,
 ) -> Option<v8::Global<v8::Value>> {
     if scope.get_slot::<ModuleMap>().is_none() {
-        scope.set_slot(ModuleMap::default());
+        scope.set_slot(ModuleMap {
+            generation: next_module_map_generation(),
+            ..ModuleMap::default()
+        });
     }
     // The running entry's host, or -- on a path that parks none (the REPL,
     // a timer after the entry returned) -- a fresh one from the embedder's
@@ -4869,16 +4820,7 @@ fn module_not_found(
             .unwrap_or_else(|| PathBuf::from(&specifier));
         // Lexically: the file does not exist, so there is nothing to
         // canonicalize against.
-        let mut file = PathBuf::new();
-        for component in joined.components() {
-            match component {
-                std::path::Component::CurDir => {}
-                std::path::Component::ParentDir => {
-                    file.pop();
-                }
-                other => file.push(other),
-            }
-        }
+        let file = normalize_lexically(&joined);
         let url = path_to_file_url(&file);
         return RequireFailure::Node {
             code: "ERR_MODULE_NOT_FOUND",
@@ -5431,7 +5373,7 @@ pub(crate) unsafe extern "C" fn import_meta_callback(
     };
 
     let path_text = path.to_string_lossy().into_owned();
-    let is_builtin = path_text.starts_with("node:") || path_text.starts_with("oam:");
+    let is_builtin = is_virtual_specifier(&path_text);
     let url = if is_builtin {
         path_text.clone()
     } else {

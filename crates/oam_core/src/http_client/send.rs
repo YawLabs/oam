@@ -128,8 +128,9 @@ pub struct FetchRequest {
     pub connect_timeout_ms: Option<f64>,
     /// True for `fetch()`: undici's bad-port block on the initial URL.
     /// `http.request`, `undici.request` and the http2 compat client leave it
-    /// false -- node's http.request has no such check. Redirect hops are
-    /// checked either way (redirect::next).
+    /// false -- node's http.request has no such check, nor undici's
+    /// request(). A fetch's redirect hops are checked too (redirect::next);
+    /// `undici.request`'s are not, as its first request is not.
     #[serde(default)]
     pub fetch_semantics: bool,
     /// True for `undici.request` (and implied by `fetch_semantics`): the
@@ -139,9 +140,18 @@ pub struct FetchRequest {
     #[serde(default)]
     pub dispatch_semantics: bool,
     /// `fetch`'s `redirect` option; `http.request` always sends `manual`
-    /// (node's http client never follows a redirect). Absent: follow.
+    /// (node's http client never follows a redirect), and so does
+    /// `undici.request` without a `maxRedirections`. Absent: follow.
     #[serde(default)]
     pub redirect: RedirectMode,
+    /// `undici.request`'s `maxRedirections` (the request's, else its
+    /// dispatcher's), when it is over 0: undici's RedirectHandler follows
+    /// that many redirects and hands the next 3xx back as the response
+    /// (measured on node v22.22.2 + undici 6.28.1; without one it follows
+    /// none, and JS sends `redirect: "manual"`). Not a fetch's, whose limit
+    /// is [`redirect::MAX_REDIRECTS`].
+    #[serde(default)]
+    pub max_redirections: Option<u32>,
     /// False delivers the body as received and keeps the encoding headers:
     /// what `http.request` sends, node's http client decoding nothing (#148).
     #[serde(default = "yes")]
@@ -162,10 +172,11 @@ pub struct FetchRequest {
     /// what node's fetch and `http.request` use by default.
     #[serde(default)]
     pub max_header_size: Option<u64>,
-    /// For an https URL, the TLS version range: node's live
-    /// `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION` as `node:tls`
-    /// resolves them (bootstrap.js tlsDefaultVersions), "" or absent for a
-    /// side with no bound of its own. Node's undici connects through
+    /// The TLS version range of every https handshake the request makes
+    /// (sent for an http URL too: a redirect may take it to an https one):
+    /// node's live `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION` as
+    /// `node:tls` resolves them (bootstrap.js tlsDefaultVersions), "" or
+    /// absent for a side with no bound of its own. Node's undici connects through
     /// tls.connect, which reads them for every connection.
     #[serde(default)]
     pub tls_min_version: Option<String>,
@@ -431,6 +442,8 @@ struct LoopState {
     source: BodySource,
     hops: u32,
     redirect: RedirectMode,
+    /// [`FetchRequest::max_redirections`].
+    max_redirections: Option<u32>,
     decode: bool,
     /// [`FetchRequest::decode_zstd`].
     decode_zstd: bool,
@@ -641,6 +654,7 @@ pub async fn fetch(
         source,
         hops: 0,
         redirect: req.redirect,
+        max_redirections: req.max_redirections,
         decode: req.decode,
         decode_zstd: req.decode_zstd,
         net_check,
@@ -782,17 +796,22 @@ pub async fn fetch_supply(
 /// The engine checks each address the hook answers as `address:port` with
 /// it, so a port-scoped grant that admitted the hop admits its answer too.
 /// Read from the parked state, never from JS.
-pub fn fetch_parked_port(token: u64, continuations: &FetchContinuations) -> Option<u16> {
+///
+/// The outer `None` is "nothing parked here waits for addresses":
+/// [`fetch_continue`] fails such a token and dials nothing. `Some(None)` is
+/// a hop that IS parked but whose target has neither a port nor a scheme
+/// with a default one. The two are kept apart because `fetch_continue` would
+/// resume the second with whatever addresses it is given: a caller that
+/// checks the answer must refuse it, not skip its check as for the first.
+pub fn fetch_parked_port(token: u64, continuations: &FetchContinuations) -> Option<Option<u16>> {
     let map = lock(continuations);
     let pending = map.get(&token)?;
-    (pending.wants == Wants::Addresses)
-        .then(|| match &pending.state.pin {
-            // pinned_url takes the pin's scheme and port, so the hop's
-            // target port is the pin's.
-            Some(pin) => pin.port_or_known_default(),
-            None => pending.state.current.port_or_known_default(),
-        })
-        .flatten()
+    (pending.wants == Wants::Addresses).then(|| match &pending.state.pin {
+        // pinned_url takes the pin's scheme and port, so the hop's
+        // target port is the pin's.
+        Some(pin) => pin.port_or_known_default(),
+        None => pending.state.current.port_or_known_default(),
+    })
 }
 
 /// `fetchAbandon`: drop the fetch parked under `token`. True if it was there.
@@ -809,7 +828,7 @@ async fn run(
     ids: &AtomicU64,
     continuations: &FetchContinuations,
 ) -> OpOutcome {
-    let response = loop {
+    let response = 'hops: loop {
         // The net grant, before this hop parks for its lookup hook or dials.
         // Every hop: the first (which the engine's synchronous gate also
         // checked, on its own parse of the URL JS sent) and each redirect
@@ -1004,6 +1023,15 @@ async fn run(
                         && e.is_h2_retryable() =>
                 {
                     state.resends.h2 += 1;
+                    // A supplied route uses each connection once, and the
+                    // one this send went out on is spent: the resend parks
+                    // for a connection of its own, as every hop does at the
+                    // top of the loop, rather than reach the connector with
+                    // none supplied. The count is in the state, so it
+                    // survives the park.
+                    if state.route.connection_needed(&uri).is_some() {
+                        continue 'hops;
+                    }
                 }
                 // A pooled connection the server had already closed: no part
                 // of a response arrived, so the request may go out again
@@ -1086,6 +1114,16 @@ async fn run(
         let location = redirect::location(response.headers());
         // undici.request: undici's dispatcher, and not a fetch.
         let undici_request = state.undici_head && !state.fetch_rules;
+        // undici's RedirectHandler follows `maxRedirections` redirects and
+        // hands back whatever answers the request after them, a 3xx
+        // included: no failure, and no limit of fetch's (measured on node
+        // v22.22.2 + undici 6.28.1: 26 requests under `maxRedirections: 25`,
+        // the last `302` the response). JS sends no count only with
+        // `redirect: "manual"`; fetch's limit bounds a request without one.
+        if undici_request && state.hops >= state.max_redirections.unwrap_or(redirect::MAX_REDIRECTS)
+        {
+            break response;
+        }
         let redirect_body = match (state.source.replayable(), state.fetch_rules) {
             (true, false) if undici_request => redirect::RedirectBody::UndiciReplayable,
             (true, _) => redirect::RedirectBody::Replayable,
@@ -1134,7 +1172,28 @@ async fn run(
                 // and no more.
                 let released = response.extensions().get::<Released>().cloned();
                 drop(response);
-                if let Some(released) = released {
+                // A streamed body never goes on to the next hop (a 303 drops
+                // it, undici.request's iterable is sent spent), and it may
+                // still be going out: the 3xx can answer a request whose
+                // body JS has not ended. hyper keeps the connection busy
+                // until that body ends, so the wait below would last as
+                // long as the stream -- for good, for one that never ends.
+                // The body is stopped unfinished here, which closes its
+                // connection, as undici resets the socket when a response
+                // completes while the request is still being written. One
+                // JS has already ended is left alone, and its connection
+                // goes back to the pool.
+                //
+                // A body whose stop could not be queued (its channel is
+                // full: JS is ahead of the socket) keeps its connection
+                // busy until the peer reads what is queued, which nothing
+                // bounds; that connection is not waited for. It closes or
+                // parks on its own, and the next hop takes another.
+                let stuck = match &mut state.source {
+                    BodySource::Stream(slot) => slot.abandon(),
+                    BodySource::Empty | BodySource::Full(_) => false,
+                };
+                if let Some(released) = released.filter(|_| !stuck) {
                     match &state.cancel {
                         Some(cancel) => tokio::select! {
                             biased;
@@ -1306,7 +1365,7 @@ fn pinned_url(url: &url::Url, pin: &url::Url) -> url::Url {
 /// `redirect::resolve_location` keeps its UTF-8-lossy decode on purpose:
 /// undici really does read `Location` as
 /// `Buffer.from(location, 'binary').toString('utf8')`.
-fn latin1(bytes: &[u8]) -> String {
+pub(super) fn latin1(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| char::from(b)).collect()
 }
 

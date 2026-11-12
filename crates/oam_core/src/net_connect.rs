@@ -181,9 +181,8 @@ pub(crate) async fn getaddrinfo(
 /// rather than the address echoed back. Returns (hostname, service); the
 /// service is the port's name, or the number when it has none.
 ///
-/// The zone is mapped to a scope id as libuv's uv_ip6_addr maps it: the
-/// CRT's atoi on Windows, the interface index elsewhere (sysfs on Linux, the
-/// system resolver on macOS and the BSDs, as [`zone_scope_id`] does).
+/// The zone is mapped to a scope id as libuv's uv_ip6_addr maps it, by
+/// [`zone_scope_id`].
 pub(crate) async fn getnameinfo(address: &str, port: u16) -> std::io::Result<(String, String)> {
     let addr = match address.split_once('%') {
         None => SocketAddr::new(
@@ -196,22 +195,7 @@ pub(crate) async fn getnameinfo(address: &str, port: u16) -> std::io::Result<(St
             let ip: std::net::Ipv6Addr = ip
                 .parse()
                 .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-            let scope = if cfg!(windows) {
-                c_atoi(zone) as u32
-            } else if cfg!(target_os = "linux") {
-                sysfs_ifindex(zone).unwrap_or(0)
-            } else {
-                match getaddrinfo(address, 0, None, 0).await {
-                    Ok(resolved) => resolved
-                        .iter()
-                        .find_map(|addr| match addr {
-                            SocketAddr::V6(v6) => Some(v6.scope_id()),
-                            SocketAddr::V4(_) => None,
-                        })
-                        .unwrap_or(0),
-                    Err(_) => 0,
-                }
-            };
+            let scope = zone_scope_id(&SystemDialer, ip, zone).await;
             SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, scope))
         }
     };
@@ -274,7 +258,9 @@ pub struct LocalBind {
     /// As the caller spelled it; node's bind error names it that way. An
     /// address of the other family than the target's -- or one that is not
     /// an address at all -- fails that attempt with `bind EINVAL`, as
-    /// libuv's `uv_ip4_addr` / `uv_ip6_addr` refuse it.
+    /// libuv's `uv_ip4_addr` / `uv_ip6_addr` refuse it. An IPv6 address may
+    /// carry a zone id (`fe80::1%eth0`), which `uv_ip6_addr` reads into the
+    /// bound address's scope id ([`zone_scope_id`]).
     pub address: Option<String>,
     pub port: u16,
 }
@@ -1227,7 +1213,7 @@ async fn dial(
     // node's localAddress / localPort: bound before the connect, and a bind
     // that fails is the attempt's error, named for the bind.
     if let Some(bind) = local {
-        bind_local(&socket, dialled, bind)?;
+        bind_local(&socket, dialled, bind).await?;
     }
 
     #[cfg(windows)]
@@ -1310,10 +1296,11 @@ async fn dial(
 /// the address must be of the target's family (`uv_ip4_addr` /
 /// `uv_ip6_addr` refuse the other: EINVAL); none means the family's
 /// unspecified address; on unix SO_REUSEADDR first (`uv__tcp_bind`); an
-/// IPv6 socket stays dual-stack, as libuv leaves it (IPV6_V6ONLY off). The
-/// failure names the address as the caller spelled it (or node's `0.0.0.0` /
-/// `::`) and the port.
-fn bind_local(
+/// IPv6 socket stays dual-stack, as libuv leaves it (IPV6_V6ONLY off). An
+/// IPv6 address's zone id becomes the bound address's scope id, as it does
+/// for a dialled one ([`zone_scope_id`]). The failure names the address as
+/// the caller spelled it (or node's `0.0.0.0` / `::`) and the port.
+async fn bind_local(
     socket: &socket2::Socket,
     dialled: SocketAddr,
     bind: &LocalBind,
@@ -1330,21 +1317,29 @@ fn bind_local(
         local: None,
         bind: Some((named.clone(), bind.port)),
     };
-    let ip = match &bind.address {
-        None if dialled.is_ipv4() => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-        None => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-        Some(text) => match text.parse::<IpAddr>() {
-            Ok(ip) if ip.is_ipv4() == dialled.is_ipv4() => ip,
+    let local = match &bind.address {
+        None if dialled.is_ipv4() => {
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), bind.port)
+        }
+        None => SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), bind.port),
+        Some(text) => match text.parse::<PinAddr>() {
+            Ok(PinAddr { ip, zone }) if ip.is_ipv4() == dialled.is_ipv4() => match (ip, zone) {
+                (IpAddr::V6(v6), Some(zone)) => {
+                    let scope = zone_scope_id(&SystemDialer, v6, &zone).await;
+                    SocketAddr::V6(std::net::SocketAddrV6::new(v6, bind.port, 0, scope))
+                }
+                (ip, _) => SocketAddr::new(ip, bind.port),
+            },
             _ => return Err(failure(einval())),
         },
     };
-    if ip.is_ipv6() {
+    if local.is_ipv6() {
         let _ = socket.set_only_v6(false);
     }
     #[cfg(unix)]
     socket.set_reuse_address(true).map_err(failure)?;
     socket
-        .bind(&socket2::SockAddr::from(SocketAddr::new(ip, bind.port)))
+        .bind(&socket2::SockAddr::from(local))
         .map_err(failure)
 }
 
@@ -2528,6 +2523,27 @@ mod tests {
         assert_eq!(error.errno, Some(-4071));
         #[cfg(unix)]
         assert_eq!(error.errno, Some(-libc::EINVAL));
+    }
+
+    #[tokio::test]
+    async fn a_local_address_may_carry_an_ipv6_zone() {
+        // A host with no IPv6 loopback has nothing to dial here.
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        // Zone `0` is scope id 0 on every platform (atoi on Windows, no
+        // interface of that name elsewhere), so the bind is plain `::1`: what
+        // is checked is that the zone is read rather than refused as EINVAL.
+        let opts = ConnectOptions {
+            local: Some(LocalBind {
+                address: Some("::1%0".to_string()),
+                port: 0,
+            }),
+            ..ConnectOptions::default()
+        };
+        let connected = connect("::1", port, &opts).await.unwrap();
+        assert!(connected.stream.local_addr().unwrap().is_ipv6());
     }
 
     #[tokio::test]

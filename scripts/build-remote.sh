@@ -17,8 +17,10 @@
 #                     (ci.yml parity: continue-on-error). Run ONCE per synced
 #                     tree; the sub-steps below never re-prep.
 #     gate         -- cargo fmt --check + clippy -D warnings   (ci.yml parity)
-#     test         -- cargo build --workspace + cargo test --workspace
-#                     (15-min ceiling where `timeout` exists) + debug smoke
+#     test         -- cargo build --workspace + cargo test --workspace, serial
+#                     (30-min ceiling where `timeout` exists;
+#                     OAM_REMOTE_TEST_TIMEOUT=<secs> on this host changes it
+#                     -- the orchestrators do not forward it) + debug smoke
 #     surface-gaps -- node scripts/gen-surface-gaps.mjs (records THIS host's
 #                     section of the builtin export-parity ratchet; pinned
 #                     node)
@@ -37,6 +39,8 @@
 #                     Deliberately NOT `rm -rf target/debug` -- see run_gc.
 #     mac-release  -- one-shot mac release leg (tailnet SSH has no idle-drop,
 #                     so no sub-step splitting needed): prep + gate + test +
+#                     conformance (the node-differential gate runs on darwin
+#                     too, not only on the linux leg) +
 #                     build (arm64 native) + x64 build via the
 #                     x86_64-apple-darwin HOST toolchain under Rosetta 2.
 #                     OAM_SKIP_MAC_X64=1 drops the x64 leg. Each mac binary
@@ -288,16 +292,25 @@ run_test() {
   # hard limit, and if neither takes, the tests report why they skipped.
   ulimit -n 4096 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
   note "descriptor limit for tests: $(ulimit -n)"
-  # ci.yml bounded a hung test at 15 min (deadlocked/lingering test class).
+  # A ceiling on the WHOLE test run, there for the deadlocked/lingering test
+  # class. ci.yml's was 15 min, set for a parallel run; this run is serial
+  # (below), and build-platforms-mac-linux.sh's header records the test
+  # dispatch at ~700s on the Lima leg -- too close to 900 for a loaded host,
+  # where crossing it fails the leg with exit 124 and no hung test to find.
+  # Hence 30 min, and a knob for a host that needs another figure.
+  local test_ceiling="${OAM_REMOTE_TEST_TIMEOUT:-1800}"
+  case "$test_ceiling" in
+    '' | *[!0-9]*) die "OAM_REMOTE_TEST_TIMEOUT must be a whole number of seconds (got '$test_ceiling')" ;;
+  esac
   command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1 \
-    || warn "no timeout/gtimeout on this host -- a deadlocked test hangs instead of dying at 15 min (mac: brew install coreutils)"
+    || warn "no timeout/gtimeout on this host -- a deadlocked test hangs instead of dying at ${test_ceiling}s (mac: brew install coreutils)"
   # --test-threads=1 on every release leg (mac-release calls run_test):
   # parallel tests sharing process-global state race on freed-then-reused
   # registry keys (see CONTRIBUTING.md, "Tests touching process-global
   # state"), and that killed a release at 08:19Z on 2026-10-21. libtest beats
   # the RUST_TEST_THREADS env .cargo/config.toml pins for everyone else, so
   # the daily CI loop stays parallel where the interference is meant to show.
-  with_timeout 900 cargo test --workspace -- --test-threads=1
+  with_timeout "$test_ceiling" cargo test --workspace -- --test-threads=1
   smoke "target/debug/oam"
 }
 

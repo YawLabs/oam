@@ -116,7 +116,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::daemon::{cache_root, fnv1a64, project_key, resolve_extends, strip_jsonc};
+use crate::daemon::{
+    cache_root, extends_is_path, fnv1a64, project_key, resolve_extends, strip_jsonc,
+};
 
 /// TypeScript 5.5's template for the ROOT config's directory (module docs).
 const CONFIG_DIR_TEMPLATE: &str = "${configDir}";
@@ -151,11 +153,11 @@ fn decls_dir() -> PathBuf {
     cache_root().join("ts-decls")
 }
 
-/// The declarations directory as a string, for recognizing a diagnostic that
-/// landed inside oam's own generated file. `None` when the cache dir cannot be
-/// resolved, which just means the hint is skipped.
-pub(crate) fn declarations_dir_for_hint() -> Option<String> {
-    Some(dts_dir().to_string_lossy().into_owned())
+/// The declarations directory, for recognizing a diagnostic that landed
+/// inside oam's own generated file. Lexically normalized, as a diagnostic's
+/// span is, so the caller can compare the two as paths.
+pub(crate) fn declarations_dir_for_hint() -> PathBuf {
+    crate::normalize_path(&dts_dir())
 }
 
 /// The declarations file's own directory.
@@ -243,6 +245,12 @@ fn write_if_changed(path: &Path, contents: &str) -> std::io::Result<bool> {
     }
 }
 
+/// The declarations file's name for `contents`: the content hash is the
+/// part that moves on an upgrade (see [`declarations_file`]).
+fn declarations_file_name(contents: &str) -> String {
+    format!("oam-{:016x}.d.ts", fnv1a64(contents.as_bytes()))
+}
+
 /// The declarations as a file on disk, materialized on first use.
 ///
 /// The name carries a content hash so an oam upgrade lands on a NEW path:
@@ -250,10 +258,7 @@ fn write_if_changed(path: &Path, contents: &str) -> std::io::Result<bool> {
 /// new entry and the cached diagnostics of the previous oam cannot survive
 /// an upgrade that changed what the declarations say.
 pub(crate) fn declarations_file() -> Option<PathBuf> {
-    let path = dts_dir().join(format!(
-        "oam-{:016x}.d.ts",
-        fnv1a64(DECLARATIONS.as_bytes())
-    ));
+    let path = dts_dir().join(declarations_file_name(DECLARATIONS));
     if write_if_changed(&path, DECLARATIONS).ok()? {
         // A fresh hash means an oam upgrade (or a local edit): drop the
         // previous release's file so the cache does not accumulate one per
@@ -492,7 +497,8 @@ fn paths_map(
 /// wins, which is why the walk visits the leaf first and array entries
 /// right to left.
 ///
-/// None = a config in the chain could not be read or parsed. The caller then
+/// None = a config in the chain could not be read or parsed, or names a
+/// package base this module's lookup cannot find (`visit`). The caller then
 /// runs the check with no declarations rather than guessing at a file set,
 /// because guessing wrong drops the user's own sources out of the program.
 fn read_chain(tsconfig: &Path) -> Option<ChainFacts> {
@@ -601,11 +607,27 @@ fn visit(
         _ => Vec::new(),
     };
     for spec in extends {
-        // A bare-package `extends` that does not resolve is tsgo's error to
-        // report; skipping it here only means the wrapper learns nothing
-        // from it, which is the same as it declaring no keys.
-        if let Some(path) = resolve_extends(dir, spec) {
-            visit(&path, root, facts, seen)?;
+        match resolve_extends(dir, spec) {
+            Some(path) => visit(&path, root, facts, seen)?,
+            // A FILE that is not there is tsgo's error to report (TS6053):
+            // nothing is inherited from it, so the wrapper learning nothing
+            // from it is exact.
+            None if extends_is_path(spec) => {}
+            // A PACKAGE this probe did not find is another matter: the
+            // probe knows only `node_modules/<spec>` as a file or directory,
+            // while TypeScript also follows the package's own `exports` and
+            // `tsconfig` fields (and Plug'n'Play). Such a base may declare
+            // `files`/`include`/`exclude`, and reading it as "declares
+            // none" would have the wrapper restate the default glob over
+            // the base's own file set -- a different program from
+            // `tsc -p`. Unknown keys mean no wrapper (module docs).
+            None => {
+                crate::debug(format_args!(
+                    "{} extends the package {spec:?}, which oam's own lookup did not find; checking without oam's declarations",
+                    config.display()
+                ));
+                return None;
+            }
         }
     }
     Some(())
@@ -810,7 +832,52 @@ pub(crate) fn project_config(tsconfig: &Path) -> Option<PathBuf> {
         return None;
     }
     let path = projects_dir().join(&name);
-    write_if_changed(&path, &contents).ok().map(|_| path)
+    if write_if_changed(&path, &contents).ok()? {
+        // A wrapper was just written here, so this is the moment the
+        // directory grew: collect the ones whose project is gone.
+        prune_orphaned_wrappers(&path);
+    }
+    Some(path)
+}
+
+/// Drop the cache-dir wrappers whose project no longer exists.
+///
+/// A wrapper in a project's own `node_modules/.oam` goes when the project
+/// does; one under oam's cache has nothing to take it along, so the
+/// directory grew by a file per project path ever checked from there. Each
+/// wrapper names its project in `extends` (an absolute path, `wrapper_json`),
+/// and one whose tsconfig is positively gone can never be used again: the
+/// next check of a project at that path writes a fresh one. A tsconfig that
+/// merely cannot be examined (`try_exists` errs: a directory on the way that
+/// may not be searched) keeps its wrapper; one on a volume that is not
+/// mounted right now reads as absent, and its wrapper is simply rewritten by
+/// that project's next check. An `extends` that is not an absolute path is
+/// not something `wrapper_json` was handed by a check (it would be tested
+/// against this process's cwd), so such a file is left alone. Only oam's own
+/// `project-<key>.json` shape is touched, and never `keep`.
+fn prune_orphaned_wrappers(keep: &Path) {
+    let Some(dir) = keep.parent() else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path == keep || !name.starts_with("project-") || !name.ends_with(".json") {
+            continue;
+        }
+        let project = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|json| json.get("extends")?.as_str().map(PathBuf::from));
+        if let Some(project) = project
+            && project.is_absolute()
+            && matches!(project.try_exists(), Ok(false))
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -857,9 +924,38 @@ mod tests {
     fn materialized_declarations_round_trip_and_key_on_content() {
         let first = declarations_file().expect("cache dir is writable in test env");
         assert_eq!(std::fs::read_to_string(&first).unwrap(), DECLARATIONS);
-        // Same content, same path: the second call is a no-op, not a rewrite.
         let second = declarations_file().expect("second call");
         assert_eq!(first, second);
+        // The name is a function of the content: the compiled-in text names
+        // the file just written, and any other text names a different one.
+        assert_eq!(
+            first.file_name().and_then(|name| name.to_str()),
+            Some(declarations_file_name(DECLARATIONS).as_str())
+        );
+        assert_eq!(
+            declarations_file_name("a"),
+            format!("oam-{:016x}.d.ts", fnv1a64(b"a"))
+        );
+        assert_ne!(declarations_file_name("a"), declarations_file_name("b"));
+    }
+
+    #[test]
+    fn write_if_changed_reports_whether_it_wrote() {
+        let path = scratch("decls-write").join("sub").join("file.json");
+        // First write creates the file (and its directory).
+        assert!(write_if_changed(&path, "one").unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one");
+        // Same bytes: a no-op, not a rewrite.
+        assert!(!write_if_changed(&path, "one").unwrap());
+        // Different bytes: replaced, with no temp file left beside it.
+        assert!(write_if_changed(&path, "two").unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
+        let left: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(left, [std::ffi::OsString::from("file.json")]);
     }
 
     #[test]
@@ -1684,5 +1780,71 @@ mod tests {
             project_config(&tsconfig).as_deref(),
             Some(wrapper.as_path())
         );
+    }
+
+    #[test]
+    fn chain_gives_up_on_a_package_base_it_cannot_find() {
+        // TypeScript may still resolve such a base (package.json `exports`
+        // / `tsconfig`), and it may declare the file set: no facts, so no
+        // wrapper restating a default glob over it.
+        let dir = scratch("decls-pkg-base");
+        let tsconfig = dir.join("tsconfig.json");
+        std::fs::write(&tsconfig, r#"{ "extends": "@oam-absent/tsconfig" }"#).unwrap();
+        assert!(read_chain(&tsconfig).is_none());
+        assert!(project_config(&tsconfig).is_none());
+        // One of several is enough.
+        std::fs::write(dir.join("base.json"), r#"{ "include": ["src"] }"#).unwrap();
+        std::fs::write(
+            &tsconfig,
+            r#"{ "extends": ["./base.json", "@oam-absent/tsconfig"] }"#,
+        )
+        .unwrap();
+        assert!(read_chain(&tsconfig).is_none());
+        // A missing FILE base is tsgo's own error and inherits nothing, so
+        // the chain still reads; and a package the lookup does find is read.
+        std::fs::write(&tsconfig, r#"{ "extends": "./absent.json" }"#).unwrap();
+        assert!(read_chain(&tsconfig).is_some());
+        let package = dir
+            .join("node_modules")
+            .join("@oam-present")
+            .join("tsconfig");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("tsconfig.json"), r#"{ "files": [] }"#).unwrap();
+        std::fs::write(&tsconfig, r#"{ "extends": "@oam-present/tsconfig" }"#).unwrap();
+        let facts = read_chain(&tsconfig).expect("found under node_modules");
+        assert_eq!(facts.files, Some(Vec::new()));
+    }
+
+    #[test]
+    fn orphaned_cache_dir_wrappers_are_pruned_and_live_ones_kept() {
+        let dir = scratch("decls-prune");
+        let wrappers = dir.join("projects");
+        std::fs::create_dir_all(&wrappers).unwrap();
+        let live_project = dir.join("live").join("tsconfig.json");
+        std::fs::create_dir_all(live_project.parent().unwrap()).unwrap();
+        std::fs::write(&live_project, "{}").unwrap();
+        let gone_project = dir.join("gone").join("tsconfig.json");
+        let wrapper_for = |project: &Path| {
+            serde_json::json!({ "extends": json_path(project), "files": [] }).to_string()
+        };
+        let keep = wrappers.join("project-0000000000000001.json");
+        let live = wrappers.join("project-0000000000000002.json");
+        let gone = wrappers.join("project-0000000000000003.json");
+        // `keep` is never examined, whatever it names.
+        std::fs::write(&keep, wrapper_for(&gone_project)).unwrap();
+        std::fs::write(&live, wrapper_for(&live_project)).unwrap();
+        std::fs::write(&gone, wrapper_for(&gone_project)).unwrap();
+        // Not oam's shape, or not readable as a wrapper: left alone.
+        let stranger = wrappers.join("notes.json");
+        std::fs::write(&stranger, wrapper_for(&gone_project)).unwrap();
+        let unparsed = wrappers.join("project-0000000000000004.json");
+        std::fs::write(&unparsed, "not json").unwrap();
+
+        prune_orphaned_wrappers(&keep);
+        assert!(keep.exists());
+        assert!(live.exists());
+        assert!(!gone.exists(), "its project's tsconfig is gone");
+        assert!(stranger.exists());
+        assert!(unparsed.exists());
     }
 }

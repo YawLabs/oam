@@ -813,13 +813,8 @@ async fn h1_idle_connection_is_reused_and_unread_body_closes_it() {
                     }
                     // Promise far more than is sent: the client cannot have
                     // read the body to its end when it drops the response.
-                    conn.send(
-                        b"HTTP/1.1 200 OK
-content-length: 1000000
-
-partial",
-                    )
-                    .await;
+                    conn.send(b"HTTP/1.1 200 OK\r\ncontent-length: 1000000\r\n\r\npartial")
+                        .await;
                     let closed = conn.closed_within(Duration::from_secs(10)).await;
                     let _ = closed_tx.send(closed);
                     return;

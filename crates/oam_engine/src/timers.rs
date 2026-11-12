@@ -1,15 +1,15 @@
-//! Timers and the M1 blocking event loop.
+//! Timers: the queue the event loop's timer, pending and check phases run.
 //!
 //! setTimeout / setInterval / clearTimeout / clearInterval / queueMicrotask,
-//! serviced by a min-heap timer queue in an isolate slot (the JS bindings
-//! must be zero-capture functions). `execute_module` drives the loop:
-//! pop one due timer, call it under the TryCatch, drain microtasks, repeat;
-//! sleep until the next deadline when idle; exit when no timers remain.
+//! plus immediates and pending callbacks, kept in a `TimerQueue` in an
+//! isolate slot (a min-heap of timers and a FIFO for each of the other two;
+//! the JS bindings must be zero-capture functions).
+//! The loop itself is `modules::pump_event_loop`, which also settles op
+//! completions: each turn it asks this queue what is due, calls one entry
+//! under its TryCatch, and runs the tick point after it.
 //!
-//! One-timer-at-a-time (no batching) so a clearTimeout() issued by one
+//! One-entry-at-a-time (no batching) so a clearTimeout() issued by one
 //! callback reliably cancels a not-yet-fired timer due in the same instant.
-//! The tokio-backed loop with IO lands next in oam_core; this slice makes
-//! TLA-on-timers and the standard timing globals real.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};

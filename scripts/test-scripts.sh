@@ -9,15 +9,22 @@
 # at once (mawk interval expressions, a dot-requiring family regex, and a
 # `cd ""` no-op), none of which any gate could have caught.
 #
-# Everything here runs the REAL scripts against real directories. No mocks: the
+# Everything here runs the REAL scripts, or functions sliced out of them
+# verbatim, against real directories. The code under test is never mocked: the
 # bugs that actually bit were external behaviour (mawk`s regex dialect, a cloud
 # CLI`s output buffering) differing from what the code assumed, which is precisely
-# what a mock would have encoded wrong.
+# what a mock would have encoded wrong. What IS stubbed is the far side those
+# scripts would otherwise reach -- ssh, scp, limactl, nerdctl, gh, curl,
+# codesign, security, cargo and rustc, as programs on a fixture PATH, plus a
+# few coreutils shims (find, stat, mv, mkdir, touch) that reproduce another
+# platform's dialect or a failure on demand. No fixture may reach the build
+# Mac, GitHub or the network.
 #
 # Cost matters, because this is a gate on every push and process spawn on the
-# Windows dev box runs ~1s. So: ONE temp root for the whole suite, ONE repo
-# skeleton shared by every fixture, and assertions grouped so a single
-# gc-target.sh run can answer several questions.
+# Windows dev box runs ~1s. So: ONE temp root for the whole suite, removed on
+# exit, with every group's fixture a directory under it; the gc-target.sh cases
+# share ONE repo skeleton, and assertions are grouped so a single script run
+# can answer several questions.
 #
 # Usage:
 #   ./scripts/test-scripts.sh            # run all, non-zero exit on any failure
@@ -45,8 +52,15 @@ cd "$REPO_DIR" || { echo "cannot cd to $REPO_DIR" >&2; exit 1; }
 # that needs a knob sets it on its own call. The host knobs are here for a
 # second reason: no fixture may ever reach the real build Mac.
 #
+# The second block is the knobs that move a verdict a case here asserts against
+# its default: the disk and tarball thresholds (resolved when host-helpers.sh
+# and src-sync.sh are sourced into this shell), the downgrade / pin-mismatch /
+# missing-tap escape hatches, and OAM_CI_FRESH, whose "unset" case must really
+# be unset under the documented `OAM_CI_FRESH=1 ./scripts/ci-local.sh`.
+#
 # A guard in the "mac-signing.sh" group fails when a release script starts
-# reading a signing, skip or mac-host knob that this list does not carry.
+# reading a signing, skip, mac-host, threshold or escape-hatch knob that this
+# list does not carry.
 OPERATOR_KNOBS="OAM_SIGN_REQUIRED OAM_RELEASE_SIGNING_KEY
   OAM_SKIP_MAC_SIGN OAM_SKIP_MAC_X64 OAM_SKIP_MAC OAM_SIGNING_DIR
   OAM_MAC_HOST OAM_MAC_USER OAM_MAC_KEY
@@ -55,18 +69,47 @@ OPERATOR_KNOBS="OAM_SIGN_REQUIRED OAM_RELEASE_SIGNING_KEY
   OAM_DRY_RUN OAM_NO_AUTO_BUMP OAM_NO_AUTO_ATTRIBUTION
   OAM_INSECURE_SKIP_SIGNATURE OAM_SKIP_PATH_SHADOW
   OAM_KEEP_VM OAM_LINUX_FAST OAM_LINUX_GLIBC_MAX OAM_LIMA_INSTANCE
-  OAM_LIMA_CPUS OAM_LIMA_MEMORY_GIB OAM_LIMA_DISK_GIB OAM_LINUX_RETRY_DELAY"
+  OAM_LIMA_CPUS OAM_LIMA_MEMORY_GIB OAM_LIMA_DISK_GIB OAM_LINUX_RETRY_DELAY
+  OAM_DISK_RECLAIM_GB OAM_DISK_MIN_GB OAM_SRC_TARBALL_MAX_MB
+  OAM_ALLOW_DOWNGRADE OAM_ALLOW_NODE_MISMATCH OAM_ALLOW_RUST_MISMATCH
+  OAM_TAPS_OPTIONAL OAM_CI_FRESH OAM_SKIP_ATTRIBUTION"
+# The three of those that a lib sourced into THIS shell gives a default
+# (host-helpers.sh, src-sync.sh). After the scrub they are set again, to the
+# lib's own default and unexported, so the "still set here" half of the guard
+# leaves them out; the scrub is what makes that default the one the cases see.
+OPERATOR_KNOBS_LIB_DEFAULTED="OAM_DISK_RECLAIM_GB OAM_DISK_MIN_GB OAM_SRC_TARBALL_MAX_MB"
 scrub_operator_knobs(){
   local k
   for k in $OPERATOR_KNOBS; do unset "$k"; done
 }
 scrub_operator_knobs
 
+# Git's own location overrides, cleared for the same reason. The fixtures below
+# `git init`, `git config`, add and commit in temp directories and rely on
+# git's cwd / `-C` discovery to stay there; an inherited GIT_DIR, GIT_WORK_TREE
+# or GIT_INDEX_FILE overrides that discovery and points every one of those
+# writes at the caller's repository. git exports these to hooks, and
+# ci-local.sh (this suite's caller) is documented as a pre-push hook. The
+# list is what `git rev-parse --local-env-vars` printed (git 2.56, 2026-11-10)
+# less its GIT_CONFIG* names, which relocate nothing, plus GIT_NAMESPACE.
+for k in GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+         GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE \
+         GIT_PREFIX GIT_IMPLICIT_WORK_TREE GIT_GRAFT_FILE GIT_SHALLOW_FILE \
+         GIT_NO_REPLACE_OBJECTS GIT_REPLACE_REF_BASE; do
+  unset "$k"
+done
+unset k
+
 # One temp root, removed on exit. Every fixture used to call mktemp and nothing
 # ever cleaned up: a single run leaked 14 directories, and once this became a
 # pre-push gate that grew without bound (149 had piled up on the dev box before
 # anyone looked). Same shape as ci-local.sh`s CLEANUP_PATHS + EXIT trap.
-SUITE_TMP="$(mktemp -d -t oamtest-XXXXXX)"
+#
+# Checked, like the cd above: this script runs without `set -e`, and an empty
+# SUITE_TMP would root every fixture at `/` (ROOT=/repo, and reset_tree's
+# `rm -rf "$ROOT/target"` with it).
+SUITE_TMP="$(mktemp -d -t oamtest-XXXXXX)" || { echo "mktemp -d failed -- cannot create the suite's temp root" >&2; exit 1; }
+[ -n "$SUITE_TMP" ] && [ -d "$SUITE_TMP" ] || { echo "mktemp -d returned no usable directory ('$SUITE_TMP')" >&2; exit 1; }
 # One EXIT trap: the temp root goes, and a console code page an install.ps1
 # case switched (in_ps_cp, below) is put back when the suite dies mid-case --
 # chcp is per console and sticks, and the console is the operator's.
@@ -93,6 +136,17 @@ eq(){ [ "$1" = "$2" ] && pass || fail "expected '$2', got '$1'"; }
 # failed" with no indication of which predicate in the chain gave way, on a
 # suite whose entire purpose is catching silent ones.
 ck(){ if "$@"; then pass; else fail "assertion failed: $*"; fi; }
+
+# One hasher for the fixtures. Stock macOS before 14 ships perl's shasum and
+# no coreutils, and a group that called sha256sum or sha1sum bare got an empty
+# digest there and failed for a reason that had nothing to do with the code
+# under test. Output is the coreutils shape either way ("<hex>  <name>").
+# The command strings exist for the stubs written to disk, which cannot call a
+# function of this shell.
+if command -v sha256sum >/dev/null 2>&1; then SUITE_SHA256="sha256sum"; else SUITE_SHA256="shasum -a 256"; fi
+if command -v sha1sum >/dev/null 2>&1; then SUITE_SHA1="sha1sum"; else SUITE_SHA1="shasum -a 1"; fi
+suite_sha256(){ $SUITE_SHA256 "$@"; }
+suite_sha1(){ $SUITE_SHA1 "$@"; }
 
 # ONE repo skeleton. gc-target.sh resolves its root from its own location, so a
 # fixture needs scripts/ beside target/ -- but it does not need a PRIVATE copy,
@@ -326,11 +380,17 @@ BSDLIST="$SUITE_TMP/shim-bsdlist"
 mkdir -p "$BSDLIST"
 REAL_FIND="$(command -v find)"
 REAL_STAT="$(command -v stat)"
-{
-  echo '#!/bin/sh'
-  echo 'for a in "$@"; do [ "$a" = "-printf" ] && exit 1; done'
-  printf 'exec "%s" "$@"\n' "$REAL_FIND"
-} > "$BSDLIST/find"
+# find_without_printf <dir> -- plant a `find` that refuses -printf (BSD find's
+# answer) and is the real one otherwise. One writer for both shim dirs that
+# need it; the caller makes the dir's contents executable.
+find_without_printf(){
+  {
+    echo '#!/bin/sh'
+    echo 'for a in "$@"; do [ "$a" = "-printf" ] && exit 1; done'
+    printf 'exec "%s" "$@"\n' "$REAL_FIND"
+  } > "$1/find"
+}
+find_without_printf "$BSDLIST"
 if ! stat -f '%m' . >/dev/null 2>&1; then
   # GNU stat: map the three BSD conversions gc-target.sh uses (%m mtime, %b
   # 512-byte blocks, %N name) and its %t tab onto --printf.
@@ -361,7 +421,9 @@ fi
 # Comments are stripped first: the prose above the awk block necessarily quotes
 # the very pattern it warns against.
 it "the awk program uses no interval expressions"
-INTERVALS="$(sed 's/#.*//' scripts/gc-target.sh | grep -nE '\{[0-9]+\}' || true)"
+# All three interval forms -- {N}, {N,} and {N,M} -- since mawk 1.3.4
+# implements none of them.
+INTERVALS="$(sed 's/#.*//' scripts/gc-target.sh | grep -nE '\{[0-9]+(,[0-9]*)?\}' || true)"
 if [ -n "$INTERVALS" ]; then
   fail "interval expression in live code -- mawk matches nothing for it: $INTERVALS"
 else pass; fi
@@ -543,11 +605,7 @@ NOPRINTF="$SUITE_TMP/shim-noprintf"
 mkdir -p "$NOPRINTF"
 REAL_FIND="$(command -v find)"
 REAL_STAT="$(command -v stat)"
-{
-  echo '#!/bin/sh'
-  echo 'for a in "$@"; do [ "$a" = "-printf" ] && exit 1; done'
-  printf 'exec %s "$@"\n' "$REAL_FIND"
-} > "$NOPRINTF/find"
+find_without_printf "$NOPRINTF"
 {
   echo '#!/bin/sh'
   echo '[ "$1" = "-f" ] && exit 1'
@@ -615,11 +673,6 @@ if ! disk_needs_reclaim "" && ! disk_below_floor "" \
    && ! disk_needs_reclaim "N/A" && ! disk_below_floor "N/A"; then pass
 else fail "empty/non-numeric readings must be inert"; fi
 
-# Both thresholds are documented env knobs that decide whether a release
-# prunes, proceeds, or aborts, and every assertion above runs against the
-# hardcoded 20/10 defaults. They are resolved at SOURCE time, so an override
-# only takes effect in a fresh shell -- assigning after the fact would silently
-# test nothing, which is why these go through `bash -c`.
 # #210: the old linux leg's probe could answer nothing with exit 0 (df's
 # failure hidden behind a trailing `tr`), and the check then skipped itself in
 # silence.
@@ -650,6 +703,11 @@ elif ! grep -qF 'disk_free_reading "$rc" "$out"' <<<"$ML_DF_LEG" || ! grep -q 'd
   fail "an unreadable build disk no longer warns through disk_free_reading"
 else pass; fi
 
+# Both thresholds are documented env knobs that decide whether a release
+# prunes, proceeds, or aborts, and every threshold assertion at the top of this
+# group runs against the hardcoded 20/10 defaults. They are resolved at SOURCE
+# time, so an override only takes effect in a fresh shell -- assigning after
+# the fact would silently test nothing, which is why these go through `bash -c`.
 it "OAM_DISK_RECLAIM_GB moves the reclaim threshold"
 eq "$(OAM_DISK_RECLAIM_GB=50 bash -c '. scripts/lib/host-helpers.sh; disk_needs_reclaim 40 && echo reclaim || echo skip')" \
    "reclaim"
@@ -1246,7 +1304,7 @@ case "\$1" in
       fetch)
         base="\${6##*/}"
         if [ -f "$ML/sum-override" ]; then echo "sha256=\$(cat "$ML/sum-override")"
-        else echo "sha256=\$(sha256sum "$ML/files/\$base" | cut -d' ' -f1)"; fi
+        else echo "sha256=\$($SUITE_SHA256 "$ML/files/\$base" | cut -d' ' -f1)"; fi
         echo "path=.oam-linux-leg/out/\$base"; exit 0 ;;
     esac ;;
 esac
@@ -1461,11 +1519,11 @@ ml_reset
 # file is put back by hand if the case breaks it, so a regression here fails
 # the case without dirtying the tree.
 ML_SG="conformance/surface-gaps.json"
-ML_SG_BEFORE="$(sha256sum "$ML_SG" | cut -d' ' -f1)"
+ML_SG_BEFORE="$(suite_sha256 "$ML_SG" | cut -d' ' -f1)"
 cp "$ML_SG" "$ML/sg-backup"
 printf '%064d\n' 0 > "$ML/sum-override"
 ml -- --mode=surface-gaps
-ML_SG_AFTER="$(sha256sum "$ML_SG" | cut -d' ' -f1)"
+ML_SG_AFTER="$(suite_sha256 "$ML_SG" | cut -d' ' -f1)"
 [ "$ML_SG_AFTER" = "$ML_SG_BEFORE" ] || cp "$ML/sg-backup" "$ML_SG"
 it "surface-gaps: a pulled ratchet whose hash is not the container's never lands on the tracked file"
 if [ "$ML_RC" != "0" ] && [ "$ML_SG_AFTER" = "$ML_SG_BEFORE" ] && grep -qF 'refusing a file that changed on the way' <<<"$ML_ERR"; then pass
@@ -2549,10 +2607,48 @@ group "src-sync.sh -- what the sync actually ships"
 # =============================================================================
 # Runs against the REAL repo, because the property under test is a fact about
 # THIS working tree, and a synthetic fixture would just re-encode the assumption
-# that broke. Cheap: one `git ls-files`, no tarball.
+# that broke. Cheap: one `git ls-files`, no tarball of the real tree.
+#
+# The listing is src-sync.sh's own src_file_list -- the function
+# write_src_tarball and src_largest_paths pipe from -- and not a copy of its
+# git command typed here, which would stay green while the tarball changed.
 SRC_LIST="$SUITE_TMP/src-list.txt"
-src_file_names(){ ( cd "$REPO_DIR" && git ls-files -z --cached --others --exclude-standard | tr '\0' '\n' ); }
+src_file_names(){ ( cd "$REPO_DIR" && src_file_list | tr '\0' '\n' ); }
 src_file_names > "$SRC_LIST" 2>/dev/null
+
+it "the tarball and the size diagnosis both pipe from src_file_list, and nothing re-types the listing"
+SRC_LIB="$(sed 's/#.*//' scripts/lib/src-sync.sh)"
+SRC_BAD=""
+[ "$(grep -c 'git ls-files' <<<"$SRC_LIB")" = "1" ] || SRC_BAD="$SRC_BAD ls-files-spelled-$(grep -c 'git ls-files' <<<"$SRC_LIB")-times"
+[ "$(grep -c '^[[:space:]]*src_file_list \\$' <<<"$SRC_LIB")" = "2" ] || SRC_BAD="$SRC_BAD callers=$(grep -c '^[[:space:]]*src_file_list \\$' <<<"$SRC_LIB")"
+if [ -z "$SRC_BAD" ]; then pass; else fail "$SRC_BAD"; fi
+
+# write_src_tarball itself, on a five-file fixture (one small tar, not the real
+# tree): the listing above says what git names, this says what tar then packs.
+# The nested repository is the 2026-08-31 shape in miniature -- git lists an
+# untracked nested checkout as one directory entry, and only --no-recursion
+# keeps tar from descending into it.
+it "write_src_tarball packs tracked and untracked files, no ignored one, no nested checkout's contents, and survives a deleted tracked file"
+SRC_TB="$SUITE_TMP/src-tarball"
+mkdir -p "$SRC_TB/repo/sub/target" "$SRC_TB/repo/ignored-dir" "$SRC_TB/repo/nested"
+( cd "$SRC_TB/repo" && git init -q . && git config user.email t@t && git config user.name t \
+  && printf 'ignored-dir/\n*.log\n' > .gitignore \
+  && echo tracked > tracked.txt && echo gone > deleted.txt && echo nested > sub/target/kept.txt \
+  && git add .gitignore tracked.txt deleted.txt sub >/dev/null 2>&1 \
+  && git -c commit.gpgsign=false commit -qm fixture >/dev/null 2>&1 \
+  && rm deleted.txt && echo untracked > untracked.txt && echo no > build.log && echo no > ignored-dir/out.bin \
+  && git init -q nested && echo no > nested/inner.bin ) >/dev/null 2>&1
+SRC_FIX_RC=$?
+if ! tar --version 2>/dev/null | grep -q 'GNU tar'; then
+  skip "tar here is not GNU tar -- write_src_tarball's flags are GNU's and it only ever runs on the packing host, so the tarball's contents went unchecked on this one"
+elif [ "$SRC_FIX_RC" != "0" ]; then
+  fail "could not build the fixture repository (rc=$SRC_FIX_RC)"
+else
+  write_src_tarball "$SRC_TB/repo" "$SRC_TB/out.tgz" 2>"$SRC_TB/err"; SRC_RC=$?
+  SRC_GOT="$(tar tzf "$SRC_TB/out.tgz" 2>/dev/null | LC_ALL=C sort | tr '\n' ' ')"
+  if [ "$SRC_RC" = "0" ] && [ "$SRC_GOT" = ".gitignore nested/ sub/target/kept.txt tracked.txt untracked.txt " ]; then pass
+  else fail "rc=$SRC_RC packed=[$SRC_GOT] stderr: $(cat "$SRC_TB/err")"; fi
+fi
 
 it "the file list is non-empty (git answered at all)"
 if [ -s "$SRC_LIST" ]; then pass; else fail "git ls-files produced nothing -- every assertion below would vacuously pass"; fi
@@ -2597,7 +2693,7 @@ if [ -z "$MISSING" ]; then pass; else fail "absent from the sync list:$MISSING";
 group "ci-local.sh -- miri gate verdicts"
 # =============================================================================
 # The gate's own decision logic, which until now was the one part of ci-local.sh
-# nothing exercised -- this suite's header said as much. Step 12 decides from
+# nothing exercised. Step 12 decides from
 # (exit status, output text), and every way that decision can rot makes the gate
 # QUIETER: libtest exits 0 on a run that executed nothing, and a held_* case
 # that dies for an unrelated reason still exits non-zero.
@@ -2614,11 +2710,11 @@ group "ci-local.sh -- miri gate verdicts"
 # their SUM, so a fixture with only one line would not exercise that.
 MIRI_PASS_OUT="$(cat <<'FIXTURE'
    Compiling oam_aliasing_model v0.12.1
-running 9 tests
+running 15 tests
 test tests::two_shared_scopes_coexist ... ok
 test tests::ref_entry_rejects_a_deleted_handle ... ok
 
-test result: ok. 6 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 41.20s
+test result: ok. 11 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 41.20s
 
 running 0 tests
 
@@ -2674,7 +2770,7 @@ FIXTURE
 )"
 
 it "the executed-model count sums every libtest summary in a run"
-eq "$(miri_executed_count "$MIRI_PASS_OUT")" "6"
+eq "$(miri_executed_count "$MIRI_PASS_OUT")" "11"
 
 it "a run with no libtest summary at all reports no count"
 miri_executed_count "$MIRI_NOSUMMARY_OUT" >/dev/null 2>&1 \
@@ -2738,6 +2834,50 @@ group "ci-local.sh -- gate wiring"
 # Source-level assertions, in the same spirit as the interval-expression guard
 # on gc-target.sh: these catch a gate step that stopped covering what its own
 # comments claim, on hosts that cannot run the step at all.
+
+# A mistyped flag used to be dropped and the full gate ran. The argument loop
+# is lifted out of the script and run on its own, NOT by invoking ci-local.sh:
+# this suite is ci-local.sh's step 13, so a loop that stopped refusing would
+# otherwise start a whole nested gate from inside the test (and that gate's
+# step 13 another). Run alone, a loop that lets the argument through just
+# prints REACHED. `bash -c <text> <name> <args>` sets $0 to <name>, which is
+# what the loop's pre-push allowance reads.
+CIL_LOOP="$(awk '/^for arg in "\$@"; do$/ { on = 1 } on { print } on && /^done$/ { exit }' scripts/ci-local.sh)"
+CIL_LOOP="$CIL_LOOP
+echo REACHED"
+# cil_args <name for \$0> <args...> -- sets CIL_RC, CIL_OUT (stdout), CIL_ERR.
+cil_args(){
+  local name="$1"; shift
+  CIL_RC=0
+  CIL_OUT="$(bash -c "$CIL_LOOP" "$name" "$@" 2>/dev/null)" || CIL_RC=$?
+  CIL_ERR="$(bash -c "$CIL_LOOP" "$name" "$@" 2>&1 >/dev/null)" || true
+}
+
+it "ci-local.sh's argument loop was found, and passes the flags it documents"
+cil_args scripts/ci-local.sh --no-tests --fast
+case "$CIL_LOOP" in
+  *'--no-tests) SKIP_TESTS=1'*)
+    if [ "$CIL_RC" = "0" ] && [ "$CIL_OUT" = "REACHED" ]; then pass
+    else fail "rc=$CIL_RC out=$CIL_OUT err=$CIL_ERR"; fi ;;
+  *) fail "the argument loop was not extracted from scripts/ci-local.sh" ;;
+esac
+
+it "ci-local.sh refuses an unknown flag before running anything"
+cil_args scripts/ci-local.sh --no-test
+if [ "$CIL_RC" = "2" ] && [ -z "$CIL_OUT" ] && grep -qF 'unknown argument: --no-test' <<<"$CIL_ERR"; then pass
+else fail "rc=$CIL_RC out=$CIL_OUT err=$CIL_ERR"; fi
+
+it "ci-local.sh refuses a stray positional argument when not installed as pre-push"
+cil_args scripts/ci-local.sh origin
+if [ "$CIL_RC" = "2" ] && [ -z "$CIL_OUT" ] && grep -qF 'unknown argument: origin' <<<"$CIL_ERR"; then pass
+else fail "rc=$CIL_RC out=$CIL_OUT err=$CIL_ERR"; fi
+
+it "ci-local.sh installed as pre-push accepts git's two positional arguments, but not a bad flag"
+cil_args .git/hooks/pre-push origin ssh://example.invalid/repo.git
+CIL_HOOK="$CIL_RC:$CIL_OUT"
+cil_args .git/hooks/pre-push --fats
+if [ "$CIL_HOOK" = "0:REACHED" ] && [ "$CIL_RC" = "2" ] && [ -z "$CIL_OUT" ]; then pass
+else fail "hook positional=$CIL_HOOK bad flag rc=$CIL_RC out=$CIL_OUT"; fi
 
 MODEL_SRC="crates/oam_aliasing_model/src/lib.rs"
 
@@ -2843,19 +2983,23 @@ else fail "the matrix's npm install is no longer sealed (missing:$MX_SEAL_MISSIN
 # crash (127 under Git Bash) must stop the release. Every status above 1 used
 # to be a warn, and a warn carries on to publish. And 1 is "a sidecar failed"
 # only with the report the gate writes once it has a verdict: taskkill /F and
-# an uncaught error end it with 1 and no report (1-noreport).
+# an uncaught error end it with 1 and no report (1-noreport). The same holds
+# for the "could not complete" statuses: with a report they are a warn that
+# names each unanswered row, and with none (2-noreport, 3-noreport: the matrix
+# stopped before its first probe) no sidecar was exercised, which stops the
+# release rather than warning once and publishing.
 it "release-local.sh stops the release when the sidecar matrix is interrupted, killed or crashed"
 MX_BLOCK="$(awk '/^  matrix_status=\$\?$/ { f = 1 } f { print } f && /^  esac$/ { exit }' scripts/release-local.sh)"
 MX_STUBS='ok(){ echo ok; }; warn(){ echo warn; }; fail(){ case "$1" in *"a sidecar failed"*) echo fail-verdict ;; *) echo fail ;; esac; exit 1; }'
 MX_REPORT="$SUITE_TMP/mcp-sidecar-matrix.json"
 MX_GOT=""
-for st in 0 1 1-noreport 2 3 127 129 130 137 143; do
+for st in 0 1 1-noreport 2 2-noreport 3 3-noreport 127 129 130 137 143; do
   MX_CODE="${st%-noreport}"
   rm -f "$MX_REPORT"
   [ "$st" = "$MX_CODE" ] && printf '{\n  "exitCode": %s,\n  "sidecars": []\n}\n' "$MX_CODE" > "$MX_REPORT"
   MX_GOT="$MX_GOT $st:$(bash -c "$MX_STUBS; matrix_report='$MX_REPORT'; (exit $MX_CODE); $MX_BLOCK" 2>/dev/null | head -1)"
 done
-if [ "$MX_GOT" = " 0:ok 1:fail-verdict 1-noreport:fail 2:warn 3:warn 127:fail 129:fail 130:fail 137:fail 143:fail" ]; then pass
+if [ "$MX_GOT" = " 0:ok 1:fail-verdict 1-noreport:fail 2:warn 2-noreport:fail 3:warn 3-noreport:fail 127:fail 129:fail 130:fail 137:fail 143:fail" ]; then pass
 else fail "release-local.sh's matrix step read the statuses as:$MX_GOT"; fi
 
 # #220: an INCOMPLETE matrix is a warning, and the rows it could not answer
@@ -2988,18 +3132,23 @@ if [ -z "$NDF_MISSING" ]; then pass; else fail "the napi-off gate no longer cove
 
 # ci-local.sh is a pre-push hook: a syntax error in it fails every push with a
 # bash parse error rather than a gate verdict, and nothing else here parses it.
-it "ci-local.sh and the libs it sources parse"
-PARSE_BAD=""
-for s in scripts/ci-local.sh scripts/bump-taps.sh scripts/release-local.sh \
-         scripts/lib/miri-gate.sh scripts/lib/build-locks.sh \
-         scripts/lib/crt-linkage.sh scripts/lib/host-helpers.sh \
-         scripts/lib/linux-vm-helpers.sh \
-         scripts/lib/tap-verify.sh scripts/lib/attribution.sh \
-         scripts/lib/ci-ledger.sh scripts/lib/rust-pin.sh \
-         scripts/lib/signing.sh scripts/release-upload-local-arm64.sh; do
+#
+# The list is the directory, not a hand-kept one: the hand-kept list left out
+# node-compat-measure.sh and bench-platforms.sh, which this suite only ever
+# greps, so a syntax error in either would have surfaced as a dead measure or
+# bench run on the build Mac. A new script is parsed the day it is added.
+it "every script under scripts/ and scripts/lib/ parses"
+PARSE_BAD=""; PARSE_N=0
+for s in scripts/*.sh scripts/lib/*.sh; do
+  [ -f "$s" ] || continue
+  PARSE_N=$((PARSE_N + 1))
   bash -n "$s" 2>/dev/null || PARSE_BAD="$PARSE_BAD $s"
 done
-if [ -z "$PARSE_BAD" ]; then pass; else fail "syntax errors in:$PARSE_BAD"; fi
+# The floor is the count the old list named (14): a glob that matched nothing
+# must not read as "nothing failed to parse".
+if [ "$PARSE_N" -lt 14 ]; then fail "only $PARSE_N scripts found to parse -- the glob is not seeing scripts/"
+elif [ -z "$PARSE_BAD" ]; then pass
+else fail "syntax errors in:$PARSE_BAD"; fi
 
 # --- the npm launcher channel -------------------------------------------------
 # npm/ ships the `oamjs` launcher and its five per-platform binary packages, and
@@ -3319,7 +3468,9 @@ LG_CASE="$(awk 'index($0, "case \"${OAM_CI_FRESH:-}\" in") == 1 { f = 1 } f { pr
 LG_STUBS='ok(){ echo "ok"; }; ko(){ echo "ko"; exit 1; }; ci_ledger_clear(){ echo "clear $1"; }; CI_LEDGER_DIR=L'
 LG_GOT=""
 for v in unset 0 1 yes; do
-  if [ "$v" = "unset" ]; then LG_OUT="$(bash -c "$LG_STUBS; $LG_CASE" 2>/dev/null | tr '\n' ' ')"
+  # `env -u`, so "unset" is a fact about this call and not about the caller:
+  # this suite runs under the documented `OAM_CI_FRESH=1 ./scripts/ci-local.sh`.
+  if [ "$v" = "unset" ]; then LG_OUT="$(env -u OAM_CI_FRESH bash -c "$LG_STUBS; $LG_CASE" 2>/dev/null | tr '\n' ' ')"
   else LG_OUT="$(OAM_CI_FRESH="$v" bash -c "$LG_STUBS; $LG_CASE" 2>/dev/null | tr '\n' ' ')"; fi
   LG_GOT="$LG_GOT$v:[${LG_OUT% }] "
 done
@@ -3443,7 +3594,7 @@ if [ -z "$LG_BAD" ]; then pass; else fail "mark not after the step's last ko:$LG
 # Step 14's key carries the nightly toolchain, so the toolchain is probed
 # before the ledger is asked, and the ask and the mark name the same inputs.
 it "step 14 checks for nightly+miri before asking the ledger, and asks and marks under the nightly's version"
-LG_L_RUSTUP="$(lg_line "rustup toolchain list 2>/dev/null | grep -q '^nightly'")"
+LG_L_RUSTUP="$(lg_line 'toolchains="$(rustup toolchain list 2>/dev/null || true)"')"
 LG_L_ASK14="$(lg_line 'step_done_earlier 14-miri')"; LG_L_MARK14="$(lg_line 'step_passed 14-miri')"
 LG_IN14='"nightly=$nightly_v" "miri=$miri_v"'
 if [ -z "$LG_L_RUSTUP" ] || [ -z "$LG_L_ASK14" ] || [ "$LG_L_RUSTUP" -ge "$LG_L_ASK14" ]; then
@@ -3470,10 +3621,67 @@ it "release-local.sh runs the gate through the retry helper, still fails closed 
 # wraps it in run_with_attempts now, so the same two claims are asserted
 # (ci-local.sh is what runs; its failure still fails the release) plus the
 # wrapper that replaced the plain call.
-if grep -qxF '  run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "local CI gate" \' scripts/release-local.sh \
-   && grep -qxF '    bash "$SCRIPT_DIR/ci-local.sh" || fail "local CI gate failed -- fix before releasing"' scripts/release-local.sh \
+#
+# The retried command is gate_attempt, not ci-local.sh directly: an attempt
+# that died after its conformance or node-suite step rewrote the receipts
+# leaves a tree the ledger has no passes for, so each attempt first restores
+# them and the retry skips what already passed.
+RG_GATE="$(awk '$0 == "gate_attempt() {" { p = 1 } p { print } p && /^}$/ { exit }' scripts/release-local.sh)"
+if grep -qxF '  run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "local CI gate" gate_attempt \' scripts/release-local.sh \
+   && grep -qxF '    || fail "local CI gate failed -- fix before releasing"' scripts/release-local.sh \
+   && [ "$(grep -v '^[[:space:]]*#' <<<"$RG_GATE" | sed -n '2p')" = '  restore_gate_artifacts "local CI gate (before this attempt)"' ] \
+   && [ "$(grep -v '^[[:space:]]*#' <<<"$RG_GATE" | sed -n '3p')" = '  bash "$SCRIPT_DIR/ci-local.sh"' ] \
    && grep -q '^#.*target/ci-local/passed' scripts/release-local.sh; then pass
-else fail "release-local.sh's gate call changed, or its header no longer mentions the ledger"; fi
+else fail "release-local.sh's gate call changed, or its header no longer mentions the ledger: $RG_GATE"; fi
+
+# run_with_attempts, read out of release-local.sh: a count that yields no
+# iteration ('00' -- `seq 1 00` prints nothing) used to fall through with rc=0,
+# the command never run, which skipped the gate and read as a pass.
+RG_RWA="$(awk '/^run_with_attempts\(\) \{$/ { f = 1 } f { print } f && /^}$/ { f = 0 }' scripts/release-local.sh)"
+rg_rwa(){  # rg_rwa <attempts> -> "<times the command ran>:<exit status>"
+  bash -c "set -uo pipefail; warn(){ :; }; note(){ :; }; ok(){ :; }; $RG_RWA"'
+    n=0; probe(){ n=$((n + 1)); return "$PROBE_RC"; }
+    rc=0; run_with_attempts "$1" "probe" probe || rc=$?
+    echo "$n:$rc"' rg-rwa "$1" 2>/dev/null
+}
+it "release-local: run_with_attempts never returns 0 without running the command -- 00, 0 and a non-number are refused"
+RG_00="$(PROBE_RC=0 rg_rwa 00)"; RG_0="$(PROBE_RC=0 rg_rwa 0)"; RG_X="$(PROBE_RC=0 rg_rwa two)"
+if [ -n "$RG_RWA" ] && [ "$RG_00" = "0:2" ] && [ "$RG_0" = "0:2" ] && [ "$RG_X" = "0:2" ]; then pass
+else fail "00 -> $RG_00, 0 -> $RG_0, 'two' -> $RG_X (want 0:2 each)"; fi
+it "release-local: run_with_attempts reads a leading-zero count in base 10 and still returns the last attempt's status"
+RG_02="$(PROBE_RC=7 rg_rwa 02)"; RG_08="$(PROBE_RC=0 rg_rwa 08)"; RG_1="$(PROBE_RC=0 rg_rwa 1)"
+if [ "$RG_02" = "2:7" ] && [ "$RG_08" = "1:0" ] && [ "$RG_1" = "1:0" ]; then pass
+else fail "02 failing -> $RG_02 (want 2:7), 08 passing -> $RG_08 (want 1:0), 1 passing -> $RG_1 (want 1:0)"; fi
+it "release-local: the OAM_RELEASE_LEG_ATTEMPTS knob is normalised in base 10, so 00 is the default single attempt"
+RG_KNOB="$(awk '/^case "\$\{OAM_RELEASE_LEG_ATTEMPTS:-\}" in$/ { f = 1 } f { print } f && /^esac$/ { exit }' scripts/release-local.sh)"
+rg_knob(){ OAM_RELEASE_LEG_ATTEMPTS="$1" bash -c "set -uo pipefail; fail(){ echo refused; exit 1; }; $RG_KNOB"'
+  echo "$OAM_RELEASE_LEG_ATTEMPTS"' rg-knob 2>/dev/null; }
+if [ -n "$RG_KNOB" ] && [ "$(rg_knob 00)" = "1" ] && [ "$(rg_knob 0)" = "1" ] && [ "$(rg_knob '')" = "1" ] \
+   && [ "$(rg_knob 02)" = "2" ] && [ "$(rg_knob 3)" = "3" ] && [ "$(rg_knob 2x)" = "refused" ]; then pass
+else fail "00 -> $(rg_knob 00), 0 -> $(rg_knob 0), '' -> $(rg_knob ''), 02 -> $(rg_knob 02), 3 -> $(rg_knob 3), 2x -> $(rg_knob 2x)"; fi
+
+# release-local.sh runs under pipefail, where `printf ... | grep -q` fails WITH
+# a match once the text outgrows the pipe buffer (#95): the site check read the
+# fetched downloads page that way. It matches in the shell now.
+it "release-local.sh: no 'printf | grep -q' match under pipefail; the downloads page is matched in the shell"
+RG_PIPE="$(grep -v '^[[:space:]]*#' scripts/release-local.sh | grep -nE 'printf .*\|[[:space:]]*grep -q' || true)"
+if [ -z "$RG_PIPE" ] && grep -qxF 'elif [[ "$live_dl" != *"$TAG"* ]]; then' scripts/release-local.sh \
+   && grep -qxF '    case "$live_dl" in *"$h"*) ;; *) dl_missing=$((dl_missing + 1)) ;; esac' scripts/release-local.sh; then pass
+else fail "a piped grep -q is back, or the downloads check changed shape: $RG_PIPE"; fi
+
+# only_stamps_dirty reads the receipt list from CONFORMANCE_ARTIFACTS: a
+# second hardcoded copy of the paths would leave a receipt added to the array
+# unrestored after the gate, and the release dead at the next clean-tree check.
+it "release-local: only_stamps_dirty takes its paths from CONFORMANCE_ARTIFACTS, not a second copy"
+RG_OSD="$(awk '$0 == "only_stamps_dirty() {" { p = 1 } p { print } p && /^}$/ { exit }' scripts/release-local.sh)"
+rg_osd(){  # rg_osd <porcelain status> -> only_stamps_dirty's exit status
+  RG_STATUS="$1" bash -c "set -uo pipefail; git(){ printf '%s' \"\$RG_STATUS\"; }; CONFORMANCE_ARTIFACTS=(A.md sub/b.json); $RG_OSD"'
+    only_stamps_dirty; echo $?' rg-osd 2>/dev/null
+}
+if [ -n "$RG_OSD" ] && grep -qF '"${CONFORMANCE_ARTIFACTS[@]}"' <<<"$RG_OSD" && ! grep -qF 'CONFORMANCE.md' <<<"$RG_OSD" \
+   && [ "$(rg_osd '')" = "0" ] && [ "$(rg_osd ' M A.md'$'\n'' M sub/b.json')" = "0" ] \
+   && [ "$(rg_osd ' M A.md'$'\n'' M src/x.rs')" = "1" ] && [ "$(rg_osd ' M CONFORMANCE.md')" = "1" ]; then pass
+else fail "clean -> $(rg_osd ''), both receipts -> $(rg_osd ' M A.md'$'\n'' M sub/b.json'), receipt + other -> $(rg_osd ' M A.md'$'\n'' M src/x.rs'), path not in the array -> $(rg_osd ' M CONFORMANCE.md')"; fi
 
 # =============================================================================
 group "attribution -- drift decision, comparison and delta"
@@ -4649,8 +4857,13 @@ case "$SG_D1|$SG_D0" in fail:*"|skip:"*) pass ;; *) fail "default: $SG_D1 / expl
 # Because of that default, "unset OAM_SIGN_REQUIRED" is no way out: under
 # release-local.sh an unset knob is 1. Every refusal used to advise it.
 it "no operator advice says to unset OAM_SIGN_REQUIRED -- the way out is OAM_SIGN_REQUIRED=0"
-SG_UNSET="$(git -C "$REPO_DIR" grep -nE '(or|then|just) unset OAM_SIGN_REQUIRED|unset OAM_SIGN_REQUIRED (for|to)' -- . ':!scripts/test-scripts.sh' || true)"
-if [ -z "$SG_UNSET" ]; then pass; else fail "stale opt-out advice:"$'\n'"$SG_UNSET"; fi
+# git grep exits 1 for "no match" and above 1 when it could not search at all
+# (not a repository, no git): only the first is the answer this case wants.
+SG_UNSET_RC=0
+SG_UNSET="$(git -C "$REPO_DIR" grep -nE '(or|then|just) unset OAM_SIGN_REQUIRED|unset OAM_SIGN_REQUIRED (for|to)' -- . ':!scripts/test-scripts.sh' 2>&1)" || SG_UNSET_RC=$?
+if [ "$SG_UNSET_RC" -gt 1 ]; then fail "git grep could not search the tree (rc=$SG_UNSET_RC), so nothing was checked: $SG_UNSET"
+elif [ "$SG_UNSET_RC" = "1" ]; then pass   # by status: stderr is captured too, and a warning is not a match
+else fail "stale opt-out advice:"$'\n'"$SG_UNSET"; fi
 
 it "release-local.sh: the release-exists check is one function, and fails closed on anything but gh's exact 'release not found'"
 SG_H="$(awk '$0 == "assert_release_unpublished() {" { p = 1 } p { print } p && /^}$/ { exit }' scripts/release-local.sh)"
@@ -4658,8 +4871,10 @@ if grep -qF "grep -qxF 'release not found'" <<<"$SG_H" && grep -qF '[ "$rc" -ne 
    && [ "$(grep -v '^[[:space:]]*#' scripts/release-local.sh | grep -c 'gh release view "$TAG" --repo "$REPO" 2>&1')" = "1" ]; then pass
 else fail "assert_release_unpublished lost its fail-closed shape, or a second inline copy appeared:"$'\n'"$SG_H"; fi
 
-it "release-local.sh: SHA256SUMS, then write/sign/verify the manifest, then the dry-run exit and the upload"
-sg_order scripts/release-local.sh 'sha256sum oam-* > SHA256SUMS && cat SHA256SUMS' \
+it "release-local.sh: license staging, SHA256SUMS, then write/sign/verify the manifest, then the dry-run exit and the upload"
+sg_order scripts/release-local.sh 'step "Stage license + attribution alongside the binaries"' \
+  'cp "$REPO_DIR/$f" "$RELEASE_DIR/$f"' \
+  'sha256sum oam-* LICENSE NOTICE THIRD_PARTY_LICENSES.md > SHA256SUMS && cat SHA256SUMS' \
   'release_write_manifest "$RELEASE_DIR" "$TAG"' 'release_sign_manifest "$RELEASE_DIR"' \
   'release_verify_manifest "$RELEASE_DIR" "$TAG"' 'step "DRY RUN' 'gh release create "$TAG" "$RELEASE_DIR"/*' \
   'draft_assets="$(gh release view' 'gh release edit "$TAG" --repo "$REPO" --draft=false'
@@ -4726,8 +4941,11 @@ if [ "$(grep -c '^UPLOAD' <<<"$CDR_A")" = "3" ] && grep -qx 'RC 0' <<<"$CDR_A" &
    && grep -q '^FAIL gh release create failed and no draft of v9.9.9 could be found' <<<"$CDR_B" && ! grep -q 'UPLOAD' <<<"$CDR_B"; then pass
 else fail "A: $CDR_A"$'\n'"B: $CDR_B"; fi
 
-it "release-local.sh: SHA256SUMS still checksums oam-* only"
-ck grep -qF '( cd "$RELEASE_DIR" && ls -lh oam-* >&2 && sha256sum oam-* > SHA256SUMS && cat SHA256SUMS >&2 )' scripts/release-local.sh
+# The installers check each license file against SHA256SUMS, so the release
+# must list them -- by name, never a glob that could sweep in anything else
+# that lands in the release dir.
+it "release-local.sh: SHA256SUMS checksums oam-* and the three license files, by name"
+ck grep -qF '( cd "$RELEASE_DIR" && ls -lh oam-* >&2 && sha256sum oam-* LICENSE NOTICE THIRD_PARTY_LICENSES.md > SHA256SUMS && cat SHA256SUMS >&2 )' scripts/release-local.sh
 
 it "release-local.sh: the bootstrap skip warns, a fail: decision is fatal, and anything else is refused"
 SG_BLK="$(awk '/^sign_decision="\$\(release_signing_decision\)"$/ { f = 1 } f { print } f && /^esac$/ { exit }' scripts/release-local.sh)"
@@ -4814,7 +5032,7 @@ sg_order scripts/release-local.sh \
   'sign_win_asset "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"' \
   'smoke "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"' \
   'OAM_CONPTY_BIN="$(cygpath -w "$asset")"' \
-  'win_verify "$exe" || fail' 'sha256sum oam-* > SHA256SUMS && cat SHA256SUMS' \
+  'win_verify "$exe" || fail' 'sha256sum oam-* LICENSE NOTICE THIRD_PARTY_LICENSES.md > SHA256SUMS && cat SHA256SUMS' \
   'release_write_manifest "$RELEASE_DIR" "$TAG"'
 
 it "release-local.sh: sign_win_asset is a no-op unless preflight decided to sign, and signs before it verifies"
@@ -4903,7 +5121,7 @@ ws_guard(){ awk -v s="$2" '$0 == s { f = 1 } f { print } f && /^fi$/ { exit }' "
 it "each script has exactly one top-level WIN_SIGNING guard; release-local.sh's sits right before sha256sum"
 SG_N="$(grep -cxF 'if [ "$WIN_SIGNING" = "1" ]; then' scripts/release-upload-local-arm64.sh) $(grep -cxF 'if [ "$WIN_SIGNING" = "1" ]; then' scripts/release-local.sh)"
 SG_NEXT="$(awk '$0 == "if [ \"$WIN_SIGNING\" = \"1\" ]; then" { f = 1 } f && /^fi$/ { getline; print; exit }' scripts/release-local.sh)"
-if [ "$SG_N" = "1 1" ] && grep -qF 'sha256sum oam-* > SHA256SUMS' <<<"$SG_NEXT"; then pass
+if [ "$SG_N" = "1 1" ] && grep -qF 'sha256sum oam-* LICENSE NOTICE THIRD_PARTY_LICENSES.md > SHA256SUMS' <<<"$SG_NEXT"; then pass
 else fail "guard blocks (upload, local): $SG_N; line after release-local.sh's: $SG_NEXT"; fi
 ws_guard scripts/release-upload-local-arm64.sh 'if [ "$WIN_SIGNING" = "1" ]; then' >"$WS/upload-guard.sh"
 ws_guard scripts/release-local.sh 'if [ "$WIN_SIGNING" = "1" ]; then' >"$WS/local-guard.sh"
@@ -5118,7 +5336,7 @@ au_git(){ git -C "$AU/work" -c user.name=t -c user.email=t@example.invalid -c co
   sed 's#^REPO="YawLabs/oam"$#REPO="example-invalid/fixture"#' scripts/release-upload-local-arm64.sh \
     >"$AU/work/scripts/release-upload-local-arm64.sh"
   # signing.sh sources host-helpers.sh (kill_proc_tree).
-  cp scripts/lib/build-locks.sh scripts/lib/signing.sh scripts/lib/host-helpers.sh "$AU/work/scripts/lib/"
+  cp scripts/lib/build-locks.sh scripts/lib/signing.sh scripts/lib/host-helpers.sh scripts/lib/crt-linkage.sh "$AU/work/scripts/lib/"
   cp release-keys/allowed_signers release-keys/ranges release-keys/presigning-sums "$AU/work/release-keys/"
   printf 'target/\n' >"$AU/work/.gitignore"
   au_git add . && au_git commit -qm main
@@ -5144,12 +5362,28 @@ EOF
 cat >"$AU/bin/cargo" <<EOF
 #!/bin/sh
 t=""; prev=""; for a in "\$@"; do [ "\$prev" = "--target-dir" ] && t="\$a"; prev="\$a"; done
+case "\$1" in
+  test)
+    # The console e2e against the staged asset: logs where it ran, on which
+    # commit, and the binary it was pointed at.
+    printf '%s|%s|%s\n' "\$(pwd)" "\$(git rev-parse HEAD)" "\${OAM_CONPTY_BIN:-}" >>"$AU/cargo-test.log"
+    exit 0 ;;
+esac
 printf '%s|%s|%s\n' "\$(pwd)" "\$(git rev-parse HEAD)" "\$t" >>"$AU/cargo.log"
-mkdir -p "\$t/release" && printf 'fixture arm64 binary\n' >"\$t/release/oam.exe"
+mkdir -p "\$t/release" || exit 1
+# The "binary" is a script the staged-asset gates can run and scan. $AU/bin-mode
+# picks one that exits non-zero, or one that carries a redistributable CRT
+# DLL's name (which is all the linkage gate looks for).
+case "\$(cat "$AU/bin-mode" 2>/dev/null)" in
+  crash) printf '#!/bin/sh\nexit 3\n' >"\$t/release/oam.exe" ;;
+  crt)   printf '#!/bin/sh\n# fixture: names VCRUNTIME140.dll on purpose\necho "ci smoke 42"\n' >"\$t/release/oam.exe" ;;
+  *)     printf '#!/bin/sh\necho "ci smoke 42"\n' >"\$t/release/oam.exe" ;;
+esac
+chmod +x "\$t/release/oam.exe"
 EOF
 chmod +x "$AU/bin/gh" "$AU/bin/cargo"
 au_run(){ # <tag> -- run main's copy from the fixture's main checkout
-  rm -f "$AU/gh.log" "$AU/cargo.log"
+  rm -f "$AU/gh.log" "$AU/cargo.log" "$AU/cargo-test.log"
   AU_RC=0
   AU_OUT="$(cd "$AU/work" && env -u GITHUB_TOKEN GH_TOKEN=invalid-fixture-token PATH="$AU/bin:$PATH" \
     bash scripts/release-upload-local-arm64.sh "$1" 2>&1)" || AU_RC=$?
@@ -5177,7 +5411,41 @@ if [ "$AU_OK" = "1" ]; then
   if [ "$AU_RC" = "0" ] && [ "${AU_HEAD:-}" = "$AU_OLD" ] && [ "${AU_CWD:-}" != "$AU/work" ] && [ ! -e "${AU_CWD:-/nonexistent}" ] \
      && [ "${AU_TD:-}" = "$AU/work/target" ] && [ "$AU_WTS" = "1" ] && grep -q 'release upload v0.5.0' "$AU/gh.log"; then pass
   else fail "rc=$AU_RC cargo ran in '${AU_CWD:-}' on '${AU_HEAD:-}' (tag $AU_OLD) into '${AU_TD:-}'; worktrees=$AU_WTS: $AU_OUT"; fi
+
+  # The patch path holds the staged asset to release-local.sh's Windows gates
+  # before it is checksummed or uploaded: it runs (smoke), it imports no
+  # redistributable CRT, and the tag's console e2e passes against it.
+  it "arm64 upload: the staged asset is smoked, CRT-checked and run through the tag's console e2e before the upload"
+  IFS='|' read -r AU_TCWD AU_THEAD AU_TBIN <"$AU/cargo-test.log" 2>/dev/null || true
+  if [ "$AU_RC" = "0" ] && [ "${AU_THEAD:-}" = "$AU_OLD" ] && [ "${AU_TCWD:-}" = "${AU_CWD:-unset}" ] \
+     && [ "$(wc -l <"$AU/cargo-test.log" 2>/dev/null | tr -d ' ')" = "1" ] \
+     && case "${AU_TBIN:-}" in *oam-aarch64-pc-windows-msvc.exe) true ;; *) false ;; esac \
+     && grep -qF 'smoke, static CRT and console raw-mode e2e' <<<"$AU_OUT"; then pass
+  else fail "rc=$AU_RC console e2e ran in '${AU_TCWD:-}' on '${AU_THEAD:-}' against '${AU_TBIN:-}': $AU_OUT"; fi
+
+  it "arm64 upload: a staged asset that does not run is refused -- no console e2e, no upload"
+  printf 'crash\n' >"$AU/bin-mode"
+  au_run v0.5.0
+  if [ "$AU_RC" != "0" ] && grep -qF 'smoke run failed' <<<"$AU_OUT" && [ -s "$AU/cargo.log" ] \
+     && [ ! -e "$AU/cargo-test.log" ] && ! grep -q 'release upload' "$AU/gh.log" 2>/dev/null \
+     && [ "$(au_git worktree list --porcelain 2>/dev/null | grep -c '^worktree ')" = "1" ]; then pass
+  else fail "rc=$AU_RC gh=$(tr '\n' ';' <"$AU/gh.log" 2>/dev/null): $AU_OUT"; fi
+
+  it "arm64 upload: a staged asset that names a redistributable CRT DLL is refused -- no upload"
+  printf 'crt\n' >"$AU/bin-mode"
+  au_run v0.5.0
+  if [ "$AU_RC" != "0" ] && grep -qF 'CRT-linkage gate failed for the staged' <<<"$AU_OUT" && [ -s "$AU/cargo.log" ] \
+     && ! grep -q 'release upload' "$AU/gh.log" 2>/dev/null; then pass
+  else fail "rc=$AU_RC gh=$(tr '\n' ';' <"$AU/gh.log" 2>/dev/null): $AU_OUT"; fi
+  rm -f "$AU/bin-mode"
 fi
+
+it "arm64 upload: build < sign < smoke < CRT gate < console e2e < the checksum download and the ONE upload"
+sg_order scripts/release-upload-local-arm64.sh 'cargo build --release -p oam_cli' \
+  'win_verify "${tmp}/${ASSET}" ||' 'run "${smoke_dir}/smoke.js")"; then' \
+  'assert_static_crt_canary ||' 'assert_static_crt "${tmp}/${ASSET}" ||' \
+  'cargo test -p oam_cli --test conpty --target-dir "$REPO_ROOT/target" -- --test-threads=1) \' \
+  '--pattern SHA256SUMS --pattern RELEASE-MANIFEST --pattern RELEASE-MANIFEST.sig' 'gh release upload "$TAG"'
 
 # =============================================================================
 group "install.sh -- the verify chain, run against a local release fixture"
@@ -5208,7 +5476,7 @@ else skip "no ssh-keygen with -Y or no curl here -- every installer fixture case
 
 if [ "$IN_SSH" = "1" ]; then
   in_url(){ if command -v cygpath >/dev/null 2>&1; then printf 'file:///%s' "$(cygpath -m "$1")"; else printf 'file://%s' "$1"; fi; }
-  in_sha(){ if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | awk '{ print $1 }'; }
+  in_sha(){ suite_sha256 "$1" | awk '{ print $1 }'; }
   IN_LINUX=oam-x86_64-unknown-linux-gnu
   # The Windows assets: any small real executable, so install.ps1's closing
   # `oam --version` smoke has something it can start.
@@ -5224,15 +5492,22 @@ if [ "$IN_SSH" = "1" ]; then
 
   # in_rel <name> <manifest tag|-> <signing key|-> -- a release directory: the
   # three binaries, license files, SHA256SUMS written the way release-local.sh
-  # writes it ("<hash> *<asset>"), and optionally the manifest and its .sig.
+  # writes it ("<hash> *<asset>", the binaries then the license files), and
+  # optionally the manifest and its .sig. IN_REL_BIN_ONLY=1 (set on the call)
+  # lists the binaries only, as every release cut before the license files
+  # were checksummed does.
   in_rel(){
     local d="$IN/rel/$1" f
     mkdir -p "$d"
     printf '#!/bin/sh\necho "oam fixture %s"\n' "$1" >"$d/$IN_LINUX"
     cp "$IN_WIN_EXE" "$d/oam-x86_64-pc-windows-msvc.exe"
     cp "$IN_WIN_EXE" "$d/oam-aarch64-pc-windows-msvc.exe"
-    ( cd "$d" && for f in oam-*; do printf '%s *%s\n' "$(in_sha "$f")" "$f"; done >SHA256SUMS )
-    for f in LICENSE NOTICE THIRD_PARTY_LICENSES.md; do printf 'fixture %s\n' "$f" >"$d/$f"; done
+    for f in LICENSE NOTICE THIRD_PARTY_LICENSES.md; do printf 'fixture %s %s\n' "$f" "$1" >"$d/$f"; done
+    if [ "${IN_REL_BIN_ONLY:-0}" = "1" ]; then
+      ( cd "$d" && for f in oam-*; do printf '%s *%s\n' "$(in_sha "$f")" "$f"; done >SHA256SUMS )
+    else
+      ( cd "$d" && for f in oam-* LICENSE NOTICE THIRD_PARTY_LICENSES.md; do printf '%s *%s\n' "$(in_sha "$f")" "$f"; done >SHA256SUMS )
+    fi
     if [ "$2" != "-" ]; then { printf 'oam-release-manifest v1\ntag %s\n' "$2"; cat "$d/SHA256SUMS"; } >"$d/RELEASE-MANIFEST"; fi
     if [ "$3" != "-" ]; then ssh-keygen -Y sign -f "$IN/$3" -n oam-release "$d/RELEASE-MANIFEST" </dev/null >/dev/null 2>&1; fi
   }
@@ -5252,7 +5527,15 @@ if [ "$IN_SSH" = "1" ]; then
   printf 'evil\n' >>"$IN/rel/tampered/$IN_LINUX"
   printf 'evil\n' >>"$IN/rel/tampered/oam-x86_64-pc-windows-msvc.exe"
   printf 'evil\n' >>"$IN/rel/tampered/oam-aarch64-pc-windows-msvc.exe"
-  in_rel pre      -       -    # v0.17.1: pinned, and the pin matches
+  in_rel licbad   v0.18.0 k1   # manifest fine, NOTICE changed after signing
+  printf 'changed\n' >>"$IN/rel/licbad/NOTICE"
+  IN_REL_BIN_ONLY=1 in_rel licold v0.18.0 k1   # signed, but its SUMS lists no license file
+  in_rel licdup   v0.18.0 -    # NOTICE listed twice (signed below, after the edit)
+  IN_DUP="$(grep ' \*NOTICE$' "$IN/rel/licdup/SHA256SUMS")"
+  printf '%s\n' "$IN_DUP" >>"$IN/rel/licdup/SHA256SUMS"
+  { printf 'oam-release-manifest v1\ntag v0.18.0\n'; cat "$IN/rel/licdup/SHA256SUMS"; } >"$IN/rel/licdup/RELEASE-MANIFEST"
+  ssh-keygen -Y sign -f "$IN/k1" -n oam-release "$IN/rel/licdup/RELEASE-MANIFEST" </dev/null >/dev/null 2>&1
+  IN_REL_BIN_ONLY=1 in_rel pre -  -    # v0.17.1: pinned, and the pin matches
   in_rel prebad   -       -    # v0.16.4: pinned, and the pin does not match
   { printf '# fixture pins\n'
     printf 'v0.17.1 %s\n' "$(in_sha "$IN/rel/pre/SHA256SUMS")"
@@ -5265,7 +5548,10 @@ if [ "$IN_SSH" = "1" ]; then
   # real script persists its install dir in the registry, and a test run must
   # never touch the operator's PATH. ENVIRON, not -v: awk -v would read
   # backslashes as escapes.
-  IN_PS_PATHSET="[Environment]::SetEnvironmentVariable('Path', \$newPath, 'User')"
+  # The one call site of Set-UserPath (the registry write and its
+  # WM_SETTINGCHANGE broadcast both live in that function, which the copy
+  # then never calls).
+  IN_PS_PATHSET="Set-UserPath \$newPath"
   L="    $IN_PS_PATHSET" awk '$0 == ENVIRON["L"] { print "    # (fixture copy: the user PATH is left alone)"; next } { print }' \
     install/install.ps1 >"$IN/install.ps1"
   IN_SWAP_BAD=""
@@ -5304,10 +5590,11 @@ if [ "$IN_SSH" = "1" ]; then
 
   # in_sh <release> <tag> <PATH> [VAR=value...] -- run the copy into a fresh
   # $IN/dest; IN_RC and IN_OUT get the result. The operator's own token and
-  # knobs never reach it.
+  # knobs never reach it. IN_KEEP_DEST=1 (set on the call) runs over whatever
+  # the install dir already holds, for the re-install cases.
   in_sh(){
     local rel="$1" tag="$2" path="$3"; shift 3
-    rm -rf "$IN/dest"
+    [ "${IN_KEEP_DEST:-0}" = "1" ] || rm -rf "$IN/dest"
     IN_RC=0
     IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API \
       HOME="$IN" PATH="$path" OAM_INSTALL_BASE="$(in_url "$IN/rel/$rel")" OAM_VERSION="$tag" \
@@ -5336,6 +5623,40 @@ if [ "$IN_SSH" = "1" ]; then
   grep -qF 'oam fixture good' <<<"$IN_OUT" && pass || fail "$IN_OUT"
   it "good: license files land beside the binary"
   ck cmp -s "$IN/dest/licenses/NOTICE" "$IN/rel/good/NOTICE"
+
+  # The license files are checked against the verified SHA256SUMS like the
+  # binary, and before it is put in place.
+  in_lic_all(){ # <release> -- all three license files in dest/licenses are that release's
+    local f
+    for f in LICENSE NOTICE THIRD_PARTY_LICENSES.md; do cmp -s "$IN/dest/licenses/$f" "$IN/rel/$1/$f" || return 1; done
+  }
+  it "license files: each listed one matches SHA256SUMS, is reported checked, and installs"
+  in_sh good v0.18.0 "$IN_PATH_KG"
+  if in_lic_all good && grep -qF 'checksum ok: LICENSE NOTICE THIRD_PARTY_LICENSES.md' <<<"$IN_OUT" \
+     && ! grep -qF 'do not list' <<<"$IN_OUT"; then in_installed good 'license and attribution files in'
+  else fail "rc=$IN_RC, license files not all installed and checked: $IN_OUT"; fi
+  it "license files: one whose bytes differ from SHA256SUMS refuses the whole install, nothing changed"
+  in_sh licbad v0.18.0 "$IN_PATH_KG"
+  in_refused 'checksum mismatch for NOTICE'
+  it "license files: a mismatch on a re-install leaves the previous binary and license files untouched"
+  in_sh good v0.18.0 "$IN_PATH_KG"
+  IN_KEEP_DEST=1 in_sh licbad v0.18.0 "$IN_PATH_KG"
+  if [ "$IN_RC" != "0" ] && grep -qF 'checksum mismatch for NOTICE' <<<"$IN_OUT" \
+     && cmp -s "$IN/dest/oam" "$IN/rel/good/$IN_LINUX" && in_lic_all good; then pass
+  else fail "rc=$IN_RC, wanted a refusal with rel/good's files still in place: $IN_OUT"; fi
+  it "license files: listed twice in SHA256SUMS refuses the install"
+  in_sh licdup v0.18.0 "$IN_PATH_KG"
+  in_refused 'list NOTICE 2 times, not once'
+  it "license files: a release whose SHA256SUMS does not list them installs the binary, skips them, and warns"
+  in_sh licold v0.18.0 "$IN_PATH_KG"
+  if [ ! -e "$IN/dest/licenses" ] && grep -qF 'do not list: LICENSE NOTICE THIRD_PARTY_LICENSES.md -- not installed' <<<"$IN_OUT"; then
+    in_installed licold 'signature ok: v0.18.0, signed by oam-release-k1'
+  else fail "rc=$IN_RC, wanted no licenses/ and the warning: $(ls -A "$IN/dest/licenses" 2>&1) $IN_OUT"; fi
+  it "license files: over an earlier install, unlisted ones remove the old copies (they describe another binary)"
+  in_sh good v0.18.0 "$IN_PATH_KG"
+  IN_KEEP_DEST=1 in_sh licold v0.18.0 "$IN_PATH_KG"
+  if [ ! -e "$IN/dest/licenses" ]; then in_installed licold 'do not list: LICENSE NOTICE THIRD_PARTY_LICENSES.md'
+  else fail "rc=$IN_RC, licenses/ still holds: $(ls -A "$IN/dest/licenses" 2>&1): $IN_OUT"; fi
 
   # The PATH-shadow guard (see the block in install.sh): it fires only when
   # the install dir is ALREADY a PATH entry -- the guidance PREPENDS the dir
@@ -5472,9 +5793,7 @@ if [ "$IN_SSH" = "1" ]; then
   in_sh good v0.18.0 "$IN_PATH_KG"
   printf 'old\n' >"$IN/dest/oam"
   rm -f "$IN/mv.log"
-  IN_RC=0
-  IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN HOME="$IN" PATH="$IN_MVLOG:$IN_PATH_KG" OAM_INSTALL_BASE="$(in_url "$IN/rel/good")" \
-    OAM_VERSION=v0.18.0 OAM_INSTALL_DIR="$IN/dest" "$IN_SH" "$IN/install.sh" 2>&1)" || IN_RC=$?
+  IN_KEEP_DEST=1 in_sh good v0.18.0 "$IN_MVLOG:$IN_PATH_KG"
   IN_MVSRC="$(D="$IN/dest/oam" awk -F'|' '$(NF-1) == ENVIRON["D"] { print $(NF-2) }' "$IN/mv.log" 2>/dev/null)"
   case "$IN_MVSRC" in
     "$IN/dest/.oam."*) in_installed good 'installed oam v0.18.0' ;;
@@ -5631,9 +5950,10 @@ if [ -n "$IN_PS64" ]; then
   # in_ps <powershell> <script> <release> <tag> [VAR=value...] -- run it into a
   # fresh $IN/pdest. PowerShell wraps long error lines at the console width,
   # mid-word, so the output is joined back up before any needle is looked for.
+  # IN_KEEP_DEST=1 (set on the call) keeps an install dir planted beforehand.
   in_ps(){
     local ps="$1" script="$2" rel="$3" tag="$4"; shift 4
-    rm -rf "$IN/pdest"
+    [ "${IN_KEEP_DEST:-0}" = "1" ] || rm -rf "$IN/pdest"
     IN_RC=0
     in_ps_cp "${IN_PS_CP:-65001}"
     IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API \
@@ -5698,6 +6018,27 @@ if [ -n "$IN_PS64" ]; then
   it "ps1 tampered asset"
   in_ps "$IN_PS64" "$IN/install.ps1" tampered v0.18.0
   in_ps_refused 'checksum mismatch for oam-'
+  in_ps_lic_all(){ # <release>
+    local f
+    for f in LICENSE NOTICE THIRD_PARTY_LICENSES.md; do cmp -s "$IN/pdest/licenses/$f" "$IN/rel/$1/$f" || return 1; done
+  }
+  it "ps1 license files: each listed one matches SHA256SUMS and installs"
+  in_ps "$IN_PS64" "$IN/install.ps1" good v0.18.0
+  if in_ps_lic_all good && grep -qF 'checksum ok: LICENSE NOTICE THIRD_PARTY_LICENSES.md' <<<"$IN_OUT"; then
+    in_ps_installed 'license and attribution files in'
+  else fail "rc=$IN_RC, license files not all installed and checked: $IN_OUT"; fi
+  it "ps1 license files: one whose bytes differ from SHA256SUMS refuses the whole install"
+  in_ps "$IN_PS64" "$IN/install.ps1" licbad v0.18.0
+  if [ ! -e "$IN/pdest/licenses" ]; then in_ps_refused 'checksum mismatch for NOTICE'
+  else fail "rc=$IN_RC, licenses/ was written: $IN_OUT"; fi
+  it "ps1 license files: listed twice refuses the install"
+  in_ps "$IN_PS64" "$IN/install.ps1" licdup v0.18.0
+  in_ps_refused 'list NOTICE 2 times, not once'
+  it "ps1 license files: unlisted ones are skipped with a warning, the binary installs, old copies go"
+  in_ps "$IN_PS64" "$IN/install.ps1" good v0.18.0
+  IN_KEEP_DEST=1 in_ps "$IN_PS64" "$IN/install.ps1" licold v0.18.0
+  if [ ! -e "$IN/pdest/licenses" ]; then in_ps_installed 'do not list: LICENSE NOTICE THIRD_PARTY_LICENSES.md -- not installed'
+  else fail "rc=$IN_RC, licenses/ still holds: $(ls -A "$IN/pdest/licenses" 2>&1): $IN_OUT"; fi
   it "ps1 pre-cutoff: pin matches"
   in_ps "$IN_PS64" "$IN/install.ps1" pre v0.17.1
   in_ps_installed 'v0.17.1 matches its pinned digest'
@@ -5740,47 +6081,25 @@ if [ -n "$IN_PS64" ]; then
   it "ps1: refuses when an earlier PATH entry resolves an oam.exe"
   IN_SHADOW="$IN/shadow-bin"; mkdir -p "$IN_SHADOW"
   printf '@echo off\r\necho fake oam.exe\r\n' >"$IN_SHADOW/oam.exe"
-  rm -rf "$IN/pdest"
-  IN_RC=0
-  in_ps_cp 65001
-  IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API \
-    PATH="$IN_SHADOW:$IN_WINPATH" OAM_INSTALL_BASE="$(in_url "$IN/rel/good")" OAM_VERSION=v0.18.0 \
-    OAM_INSTALL_DIR="$(cygpath -w "$IN/pdest")" \
-    "$IN_PS64" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$IN/install.ps1")" 2>&1 | tr -d '\r\n')" || IN_RC=$?
-  in_ps_cp "$IN_CP_ORIG"
-  if [ "$IN_RC" != "0" ] && grep -qF 'another oam would win on PATH' <<<"$IN_OUT" && [ ! -e "$IN/pdest/oam.exe" ]; then pass
-  else fail "rc=$IN_RC, wanted a PATH-shadow refusal and no oam.exe: $IN_OUT"; fi
+  # Through in_ps, with PATH as one of its VAR=value overrides (a later
+  # assignment wins in env): the helper's own env scrub and code-page handling
+  # reach these cases, where a hand-typed copy of its invocation would not
+  # follow a change to either.
+  in_ps "$IN_PS64" "$IN/install.ps1" good v0.18.0 "PATH=$IN_SHADOW:$IN_WINPATH"
+  in_ps_refused 'another oam would win on PATH'
   it "ps1: OAM_SKIP_PATH_SHADOW=0 does not unlock (only a literal 1 does)"
-  rm -rf "$IN/pdest"
-  IN_RC=0
-  in_ps_cp 65001
-  IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API \
-    PATH="$IN_SHADOW:$IN_WINPATH" OAM_INSTALL_BASE="$(in_url "$IN/rel/good")" OAM_VERSION=v0.18.0 \
-    OAM_INSTALL_DIR="$(cygpath -w "$IN/pdest")" OAM_SKIP_PATH_SHADOW=0 \
-    "$IN_PS64" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$IN/install.ps1")" 2>&1 | tr -d '\r\n')" || IN_RC=$?
-  in_ps_cp "$IN_CP_ORIG"
+  in_ps "$IN_PS64" "$IN/install.ps1" good v0.18.0 "PATH=$IN_SHADOW:$IN_WINPATH" OAM_SKIP_PATH_SHADOW=0
   in_ps_refused 'another oam would win on PATH'
   it "ps1: OAM_SKIP_PATH_SHADOW=1 installs anyway, loudly"
-  rm -rf "$IN/pdest"
-  IN_RC=0
-  in_ps_cp 65001
-  IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API \
-    PATH="$IN_SHADOW:$IN_WINPATH" OAM_INSTALL_BASE="$(in_url "$IN/rel/good")" OAM_VERSION=v0.18.0 \
-    OAM_INSTALL_DIR="$(cygpath -w "$IN/pdest")" OAM_SKIP_PATH_SHADOW=1 \
-    "$IN_PS64" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$IN/install.ps1")" 2>&1 | tr -d '\r\n')" || IN_RC=$?
-  in_ps_cp "$IN_CP_ORIG"
+  in_ps "$IN_PS64" "$IN/install.ps1" good v0.18.0 "PATH=$IN_SHADOW:$IN_WINPATH" OAM_SKIP_PATH_SHADOW=1
   in_ps_installed 'another oam would win on PATH'
   rm -f "$IN_SHADOW/oam.exe"
+  # IN_KEEP_DEST: the install dir is planted BEFORE the run, and in_ps would
+  # otherwise start by removing it.
   it "ps1: upgrading over its own install stands down (Get-Command resolves the install dir)"
   rm -rf "$IN/pdest"; mkdir -p "$IN/pdest"
   printf '@echo off\r\necho old oam.exe\r\n' >"$IN/pdest/oam.exe"
-  IN_RC=0
-  in_ps_cp 65001
-  IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API \
-    PATH="$IN/pdest:$IN_WINPATH" OAM_INSTALL_BASE="$(in_url "$IN/rel/good")" OAM_VERSION=v0.18.0 \
-    OAM_INSTALL_DIR="$(cygpath -w "$IN/pdest")" \
-    "$IN_PS64" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$IN/install.ps1")" 2>&1 | tr -d '\r\n')" || IN_RC=$?
-  in_ps_cp "$IN_CP_ORIG"
+  IN_KEEP_DEST=1 in_ps "$IN_PS64" "$IN/install.ps1" good v0.18.0 "PATH=$IN/pdest:$IN_WINPATH"
   in_ps_installed 'signature ok: v0.18.0, signed by oam-release-k1'
 
   it "ps1 latest: the tag comes from the /releases/latest redirect (the local stand-in above)"
@@ -5828,8 +6147,8 @@ MS_ENTS="$REPO_DIR/scripts/macos/oam.entitlements.plist"
 # gate compares the extracted leaf's SHA-1 with the pin.
 printf 'leaf certificate A' > "$MS/leaf-a"
 printf 'leaf certificate B' > "$MS/leaf-b"
-MS_PIN_A="$(sha1sum "$MS/leaf-a" | cut -c1-40)"
-MS_PIN_B="$(sha1sum "$MS/leaf-b" | cut -c1-40)"
+MS_PIN_A="$(suite_sha1 "$MS/leaf-a" | cut -c1-40)"
+MS_PIN_B="$(suite_sha1 "$MS/leaf-b" | cut -c1-40)"
 : > "$MS/kc/oam-codesign.keychain-db"
 printf 'kcpw' > "$MS/kc/pw"
 echo "probe source" > "$MS/true-src"
@@ -5961,18 +6280,22 @@ MS_GOT="$(
 eq "$MS_GOT" "leaked=skip"$'\n'"bootstrap=adhoc"$'\n'"pin=identity:$MS_PIN_A"
 ms_reset
 
-it "every signing, skip and mac-host knob a release script reads is scrubbed at the suite's top"
+it "every signing, skip, mac-host, threshold and escape-hatch knob a release script reads is scrubbed at the suite's top"
 MS_MISS=""
 for f in scripts/release-local.sh scripts/release-upload-local-arm64.sh scripts/build-platforms-tailnet.sh \
          scripts/build-platforms-mac-linux.sh scripts/mac-linux-vm.sh scripts/build-remote.sh scripts/provision-mac-signing.sh scripts/lib/signing.sh scripts/lib/mac-signing.sh \
-         install/install.sh; do
+         install/install.sh scripts/lib/host-helpers.sh scripts/lib/src-sync.sh \
+         scripts/bump-taps.sh scripts/ci-local.sh; do
   for k in $(sed 's/#.*//' "$f" | grep -oE '[$][{]?OAM_[A-Z0-9_]+' | tr -d '${' | sort -u); do
-    case "$k" in *SIGN*|*SKIP*|OAM_MAC_*) ;; *) continue ;; esac
+    case "$k" in *SIGN*|*SKIP*|OAM_MAC_*|OAM_DISK_*|OAM_ALLOW_*|*_MAX_MB|OAM_TAPS_OPTIONAL|OAM_CI_FRESH) ;; *) continue ;; esac
     case " $(echo $OPERATOR_KNOBS) " in *" $k "*) ;; *) MS_MISS="$MS_MISS $f:$k" ;; esac
   done
 done
 MS_SET=""
-for k in $OPERATOR_KNOBS; do [ -z "${!k+x}" ] || MS_SET="$MS_SET $k"; done
+for k in $OPERATOR_KNOBS; do
+  case " $OPERATOR_KNOBS_LIB_DEFAULTED " in *" $k "*) continue ;; esac
+  [ -z "${!k+x}" ] || MS_SET="$MS_SET $k"
+done
 if [ -z "$MS_MISS$MS_SET" ]; then pass
 else fail "not in OPERATOR_KNOBS:${MS_MISS:- none}; still set here:${MS_SET:- none}"; fi
 
@@ -6228,7 +6551,7 @@ fi
 MS_HB="$MS/handback"; mkdir -p "$MS_HB/art"
 printf 'arm64 bytes' > "$MS_HB/art/oam-aarch64-apple-darwin"
 printf 'x64 bytes' > "$MS_HB/art/oam-x86_64-apple-darwin"
-( cd "$MS_HB/art" && sha256sum oam-aarch64-apple-darwin oam-x86_64-apple-darwin ) > "$MS_HB/good.txt"
+( cd "$MS_HB/art" && suite_sha256 oam-aarch64-apple-darwin oam-x86_64-apple-darwin ) > "$MS_HB/good.txt"
 ms_hb(){ ms mac_handback_check "$@"; }
 ms_hb "$MS_HB/good.txt" "$MS_HB/art" oam-aarch64-apple-darwin oam-x86_64-apple-darwin
 it "hand-back: pulled binaries that match the Air's hashes pass"
@@ -6435,6 +6758,24 @@ else fail "rc=$MS_RC out='$MS_OUT' calls='$MS_CALLS' stderr: $MS_ERR"; fi
 ms_tn "" OAM_SKIP_MAC_SIGN=maybe
 it "preflight: a signing knob that is not 0 or 1 fails before touching the Air"
 if [ "$MS_RC" != "0" ] && [ -z "$MS_CALLS" ] && grep -qF "OAM_SKIP_MAC_SIGN must be 0 or 1, not 'maybe'" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC calls='$MS_CALLS' stderr: $MS_ERR"; fi
+
+# OAM_REMOTE_DIR reaches the Air's shell too, in the `cd <dir> && find . ...
+# -exec rm -rf` the sync runs: anything but one plain directory name is
+# refused before the first ssh, and a plain name goes on to the host probe.
+MS_RD_BAD=""
+for ms_rd in '~' '.' '..' 'a b' 'sub/dir' '/abs' '-x' 'a;b' '$HOME'; do
+  ms_tn "" OAM_REMOTE_DIR="$ms_rd"
+  if [ "$MS_RC" = "0" ] || [ -n "$MS_CALLS" ] || ! grep -qF "OAM_REMOTE_DIR must be one plain directory name" <<<"$MS_ERR"; then
+    MS_RD_BAD="$MS_RD_BAD [$ms_rd rc=$MS_RC calls='$MS_CALLS']"
+  fi
+done
+it "preflight: an OAM_REMOTE_DIR that is not one plain directory name fails before touching the Air"
+if [ -z "$MS_RD_BAD" ]; then pass; else fail "accepted or reached the Air:$MS_RD_BAD"; fi
+
+ms_tn "" OAM_REMOTE_DIR=oam-build.v2_x
+it "preflight: a plain OAM_REMOTE_DIR name is accepted"
+if [ "$MS_RC" = "0" ] && [ "$MS_CALLS" = "probe " ]; then pass
 else fail "rc=$MS_RC calls='$MS_CALLS' stderr: $MS_ERR"; fi
 
 # OAM_SKIP_MAC_X64 is checked by nothing else before it reaches the Air's
@@ -6884,6 +7225,20 @@ else
     *) fail "unexpected commit contents: $TOUCHED" ;;
   esac
 
+  it "another session's unpushed commit is not pushed along with ours"
+  # `git push origin HEAD` publishes every commit ahead of origin. A commit to
+  # Casks/yaw.rb that another session had not pushed went live on the tap with
+  # the oam bump, and the repair path called it "an earlier push failed".
+  taps_fixture
+  echo "not ready" >> "$taps_dir/homebrew-yaw/Casks/yaw.rb"
+  git -C "$taps_dir/homebrew-yaw" -c user.email=t@t -c user.name=t commit -qm "cask wip" -- Casks/yaw.rb
+  OUT="$(run_taps v0.14.0)"
+  if printf '%s' "$OUT" | grep -q "unpushed commit(s) touching files other than Formula/oam.rb" \
+     && ! printf '%s' "$(served homebrew-yaw Casks/yaw.rb)" | grep -q "not ready" \
+     && printf '%s' "$(served homebrew-yaw Formula/oam.rb)" | grep -q 'version "0.13.2"' \
+     && git -C "$taps_dir/homebrew-yaw" diff --quiet -- Formula/oam.rb; then pass
+  else fail "a foreign unpushed commit was not refused, or the tap moved: $OUT"; fi
+
   it "a tap on a local-only branch is refused, and gains no branch"
   # `rev-list --count HEAD..origin/<branch>` fell back to 0 when the upstream
   # did not exist, so `push origin HEAD` CREATED that branch on the tap instead
@@ -6929,9 +7284,7 @@ else
   # every case -- not the repos the two refusal cases before it left behind.
   taps_fixture
   run_taps v0.14.0 >/dev/null
-  OUT="$(OAM_ALLOW_DOWNGRADE=1 PATH="$TAPS_BIN:$PATH" \
-        OAM_HOMEBREW_DIR="$taps_dir/homebrew-yaw" OAM_SCOOP_DIR="$taps_dir/scoop-yaw" \
-        bash "$REPO_DIR/scripts/bump-taps.sh" v0.13.2 2>&1)"
+  OUT="$(OAM_ALLOW_DOWNGRADE=1 run_taps v0.13.2)"
   TAPS_SERVED="$(served homebrew-yaw Formula/oam.rb)"
   if printf '%s' "$TAPS_SERVED" | grep -q 'version "0.13.2"'; then pass
   else fail "an explicitly authorized downgrade did not land (origin serves: $(printf '%s' "$TAPS_SERVED" | grep -m1 'version' || echo "nothing -- git: ${SERVED_ERR:-no error}")): $OUT"; fi
@@ -7242,12 +7595,27 @@ done
 if [ -z "$NP_BAD" ]; then pass; else fail "not provisioning the pinned Node:$NP_BAD"; fi
 
 it "no dispatch checks for a bare node on PATH instead of the pin"
-NP_HITS="$(grep -n 'command -v node >/dev/null 2>&1 ||' scripts/build-remote.sh || true)"
-if [ -z "$NP_HITS" ]; then pass; else fail "bare node checks remain: $NP_HITS"; fi
+# Any spelling of "stop unless a node is on PATH": a lookup followed by
+# `|| die/fail/exit/return` whatever its redirects, or a negated lookup. A
+# lookup that only reports what it found (`$(command -v node || echo ...)`,
+# `if command -v node; then note ...`) is not one. The pattern is first shown
+# to match the spelling this case was written against, so it cannot go blind.
+NP_REQ='(command -v|type|which|hash)[[:space:]]+node([[:space:]]+[0-9&>/a-z]+)*[[:space:]]*\|\|[[:space:]]*\{?[[:space:]]*(die|fail|exit|return)|![[:space:]]*(command -v|type|which|hash)[[:space:]]+node([^-_[:alnum:]]|$)'
+NP_HITS="$(sed 's/#.*//' scripts/build-remote.sh | grep -nE "$NP_REQ" || true)"
+if ! grep -qE "$NP_REQ" <<<'  command -v node >/dev/null 2>&1 || die "node not found"' \
+   || ! grep -qE "$NP_REQ" <<<'  if ! command -v node >/dev/null; then'; then
+  fail "the bare-node pattern no longer matches its own examples"
+elif [ -z "$NP_HITS" ]; then pass
+else fail "bare node checks remain: $NP_HITS"; fi
 
 it "the node-suite dispatch does not require node (its oracle is the exit code)"
-if ! grep -q 'node' <<<"$(np_body run_node_suite | grep -v 'node-suite')"; then pass
-else fail "run_node_suite mentions node: $(np_body run_node_suite)"; fi
+# The body must be THERE before its silence about node means anything: a
+# renamed or reshaped function extracts as nothing, and nothing mentions node.
+NP_NS_BODY="$(np_body run_node_suite)"
+if [ -z "$NP_NS_BODY" ]; then fail "run_node_suite's body was not found in build-remote.sh -- nothing was checked"
+elif ! grep -q 'xtask -- node-suite' <<<"$NP_NS_BODY"; then fail "run_node_suite no longer runs the node-suite: $NP_NS_BODY"
+elif ! grep -q 'node' <<<"$(grep -v 'node-suite' <<<"$NP_NS_BODY")"; then pass
+else fail "run_node_suite mentions node: $NP_NS_BODY"; fi
 
 it "ci-local.sh checks the pinned Node before step 1, and only when conformance runs"
 NP_PRE="$(grep -n 'node_oracle_preflight$' scripts/ci-local.sh | tail -1 | cut -d: -f1)"
@@ -7328,14 +7696,8 @@ else
 fi
 
 # =============================================================================
-echo
-# A skip is carried into the summary rather than swallowed: "all N passed" on a
-# run that quietly skipped the mawk leg is the same overclaim the suite exists
-# to prevent. Skips do not fail the run -- a missing optional tool is not a
-# regression -- but they are never invisible.
-SKIP_NOTE=""
-[ "$SKIP" -gt 0 ] && SKIP_NOTE=", ${SKIP} skipped"
-# --- check-control-bytes.sh ---------------------------------------------------
+group "check-control-bytes.sh -- the control-byte scan"
+# =============================================================================
 # The gate ci-local runs FIRST, and the one whose failure mode is a false CLEAN
 # -- so it needs a suite more than most. Its predecessor used `git grep -I`,
 # which skips files git calls binary; a file containing a NUL IS binary to git,
@@ -7399,6 +7761,20 @@ else
   ccb_add prose.ts
   it "a bare MENTION of the marker does not disable the scan"
   eq "$(ccb)" "1"
+
+  # The full phrase, `: allow` suffix included, but inside a longer line. Only
+  # a line that is the marker and nothing else is a declaration.
+  ccb_reset
+  ccb_node 'require("fs").writeFileSync(process.argv[1], "// add a line reading control-byte-ok: allow to waive" + String.fromCharCode(10) + "const m = " + String.fromCharCode(34) + "control-byte-ok: allow" + String.fromCharCode(34) + ";" + String.fromCharCode(10) + "let a = " + String.fromCharCode(34,0,34) + ";")' quoted.ts
+  ccb_add quoted.ts
+  it "the full marker phrase quoted mid-line does not disable the scan"
+  eq "$(ccb)" "1"
+
+  ccb_reset
+  ccb_node 'require("fs").writeFileSync(process.argv[1], "let a = " + String.fromCharCode(34,0,34) + ";" + String.fromCharCode(13,10) + "  # control-byte-ok: allow" + String.fromCharCode(13,10))' crlf.sh
+  ccb_add crlf.sh
+  it "honours an indented declaration on a CRLF line, after the byte"
+  eq "$(ccb)" "0"
 
   ccb_reset
   ccb_node 'require("fs").writeFileSync(process.argv[1], "content")' gone.txt
@@ -7478,11 +7854,28 @@ eq "$(rp_verdict 1.99.0 1.98.0 1) / $(rp_verdict 1.99.0 "" 1) / $(rp_verdict 1.9
    "mismatch-allowed 0 / absent-allowed 0 / mismatch 1"
 
 it "every consumer sources the lib (a pin asserted nowhere is a pin ignored)"
-RP_WIRED="ok"
-grep -q 'source=lib/rust-pin.sh' scripts/ci-local.sh || RP_WIRED="ci-local.sh does not source it"
-grep -q 'source=lib/rust-pin.sh' scripts/build-remote.sh || RP_WIRED="$RP_WIRED build-remote.sh does not source it"
-grep -q 'source=lib/rust-pin.sh' scripts/release-local.sh || RP_WIRED="$RP_WIRED release-local.sh does not source it"
-eq "$RP_WIRED" "ok"
+# The `.` line itself, anchored, and a call of the verdict in live code. The
+# `# shellcheck source=lib/rust-pin.sh` directive above each one is a comment:
+# matching it (as this case once did) stays green with the real line deleted.
+RP_WIRED=""
+for f in scripts/ci-local.sh scripts/build-remote.sh scripts/release-local.sh; do
+  RP_LIVE="$(sed 's/^[[:space:]]*#.*//' "$f")"
+  grep -qE '^[[:space:]]*\.[[:space:]]+("\$SCRIPT_DIR/|scripts/)lib/rust-pin\.sh"?[[:space:]]*$' <<<"$RP_LIVE" \
+    || RP_WIRED="$RP_WIRED ${f##*/}-does-not-source-it"
+  grep -qE '\$\(rust_pin_verdict ' <<<"$RP_LIVE" \
+    || RP_WIRED="$RP_WIRED ${f##*/}-never-asks-for-the-verdict"
+done
+eq "${RP_WIRED:- ok}" " ok"
+
+# =============================================================================
+echo
+# A skip is carried into the summary rather than swallowed: "all N passed" on a
+# run that quietly skipped the mawk leg is the same overclaim the suite exists
+# to prevent. Skips do not fail the run -- a missing optional tool is not a
+# regression -- but they are never invisible. Computed HERE, after the last
+# group: taken any earlier it leaves out every skip below that point.
+SKIP_NOTE=""
+[ "$SKIP" -gt 0 ] && SKIP_NOTE=", ${SKIP} skipped"
 
 if [ "$FAIL" -gt 0 ]; then
   echo -e "${RED}$FAIL failed${NC}, $PASS passed${SKIP_NOTE}"

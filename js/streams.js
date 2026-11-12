@@ -1226,6 +1226,14 @@
     function finalize(rejected, error) {
       writerRelease(writer);
       readableReaderGenericRelease(source, reader);
+      // The pipe's own read may still be pending (an abort or a destination
+      // error with preventCancel leaves the source readable). It goes with
+      // the reader, as in releaseLock(): left queued, the next enqueue would
+      // hand its chunk to the released writer instead of the source's queue.
+      if (source._waiters.length > 0) {
+        const releasing = readerReleasingError();
+        while (source._waiters.length > 0) source._waiters.shift().reject(releasing);
+      }
       removeAbortListener?.();
       if (rejected) promise.reject(error);
       else promise.resolve();
@@ -1452,12 +1460,40 @@
     [Symbol.asyncIterator](options = {}) {
       const reader = this.getReader();
       const preventCancel = options.preventCancel === true;
+      // The iterator gives the lock back once it is finished -- the stream
+      // is done, a read rejected, or return() ran -- as node's does; after
+      // that next() answers done without touching the stream.
+      let finished = false;
       return {
-        next: () => reader.read(),
+        next: () => {
+          if (finished) return Promise.resolve({ value: undefined, done: true });
+          return reader.read().then(
+            (result) => {
+              if (result.done && !finished) {
+                finished = true;
+                reader.releaseLock();
+              }
+              return result;
+            },
+            (error) => {
+              if (!finished) {
+                finished = true;
+                reader.releaseLock();
+              }
+              throw error;
+            },
+          );
+        },
         return: async (value) => {
-          // Early loop exit cancels the stream (WHATWG default).
-          if (!preventCancel) await reader.cancel();
-          reader.releaseLock();
+          if (finished) return { value, done: true };
+          finished = true;
+          // Early loop exit cancels the stream (WHATWG default), with the
+          // value return() was given as the reason.
+          try {
+            if (!preventCancel) await reader.cancel(value);
+          } finally {
+            reader.releaseLock();
+          }
           return { value, done: true };
         },
         [Symbol.asyncIterator]() {
@@ -1474,12 +1510,25 @@
     // default stream's branches share each chunk.
     tee() {
       if (this._isBytes) return byteStreamTee(this);
+      const source = this;
       const reader = this.getReader();
       const queues = [new Queue(), new Queue()];
+      // The standard's ReadableStreamDefaultTee cancel steps: a cancelled
+      // branch takes no more chunks, and once both are cancelled the source
+      // is cancelled with the two reasons. Each branch's cancel() settles
+      // with that one cancel (or when the source ends first).
+      const canceled = [false, false];
+      const reasons = [undefined, undefined];
+      const cancelDeferred = deferred();
+      const controllers = [undefined, undefined];
       let pulling = null;
       const makeBranch = (index) =>
         new ReadableStream({
+          start(controller) {
+            controllers[index] = controller;
+          },
           async pull(controller) {
+            if (canceled[index]) return;
             if (queues[index].length > 0) {
               const item = queues[index].shift();
               if (item.done) controller.close();
@@ -1488,20 +1537,44 @@
             }
             pulling ??= reader.read().then((result) => {
               pulling = null;
-              for (const q of queues) {
-                q.push(result.done ? { done: true } : { done: false, value: result.value });
+              for (let i = 0; i < 2; i++) {
+                if (canceled[i]) continue;
+                queues[i].push(result.done ? { done: true } : { done: false, value: result.value });
               }
+              if (result.done && (!canceled[0] || !canceled[1])) cancelDeferred.resolve();
             }).catch((err) => {
               pulling = null;
+              if (!canceled[0] || !canceled[1]) cancelDeferred.resolve();
               throw err;
             });
             await pulling;
+            // Cancelled while the read was pending: nothing was queued for it.
+            if (canceled[index]) return;
             const item = queues[index].shift();
+            if (item === undefined) return;
             if (item.done) controller.close();
             else controller.enqueue(item.value);
           },
+          cancel(reason) {
+            canceled[index] = true;
+            reasons[index] = reason;
+            queues[index] = new Queue();
+            if (canceled[1 - index]) {
+              cancelDeferred.resolve(readableCancel(source, [reasons[0], reasons[1]]));
+            }
+            return cancelDeferred.promise;
+          },
         });
-      return [makeBranch(0), makeBranch(1)];
+      const branches = [makeBranch(0), makeBranch(1)];
+      // The standard's last tee step, as node runs it: a source that errors
+      // errors both branches at once -- whether or not a read is pending --
+      // and a branch cancel still waiting on the other branch settles.
+      then(reader.closed, undefined, (error) => {
+        controllers[0].error(error);
+        controllers[1].error(error);
+        if (!canceled[0] || !canceled[1]) cancelDeferred.resolve();
+      });
+      return branches;
     }
 
     // node's argument checks, in node's order; a failed check is a
@@ -2416,10 +2489,33 @@
   class TextEncoderStream {
     constructor() {
       const encoder = new TextEncoder();
+      // A chunk ending in a high surrogate holds it back for the next
+      // chunk, which may open with its low half (the Encoding standard's
+      // pending high surrogate, as node carries it); an unpaired one is
+      // U+FFFD, at the next chunk through encode() or at the end in flush.
+      let pendingHighSurrogate = "";
       const transform = new TransformStream({
         transform(chunk, controller) {
-          const bytes = encoder.encode(String(chunk));
+          let text = String(chunk);
+          if (pendingHighSurrogate !== "") {
+            text = pendingHighSurrogate + text;
+            pendingHighSurrogate = "";
+          }
+          if (text.length > 0) {
+            const last = text.charCodeAt(text.length - 1);
+            if (last >= 0xd800 && last <= 0xdbff) {
+              pendingHighSurrogate = text.slice(-1);
+              text = text.slice(0, -1);
+            }
+          }
+          const bytes = encoder.encode(text);
           if (bytes.length > 0) controller.enqueue(bytes);
+        },
+        flush(controller) {
+          if (pendingHighSurrogate !== "") {
+            pendingHighSurrogate = "";
+            controller.enqueue(new Uint8Array([0xef, 0xbf, 0xbd]));
+          }
         },
       });
       this.readable = transform.readable;

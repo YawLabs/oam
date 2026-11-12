@@ -1,14 +1,24 @@
 # cargo-about config -- drives THIRD_PARTY_LICENSES.md generation.
 #
-#   cargo about generate about.hbs > THIRD_PARTY_LICENSES.md
+#   cargo about generate about.hbs -o THIRD_PARTY_LICENSES.md
+#
+# Use `-o`, as scripts/ci-local.sh's drift gate does, not a shell `>` redirect:
+# the gate compares bytes, and a redirect is at the mercy of the shell's output
+# encoding.
 #
 # oam ships statically-linked binaries, so every crate below is REDISTRIBUTED
 # and its notice must travel with the release assets. Regenerate whenever the
 # dependency graph changes.
 
-# Only the targets we actually ship (see the asset-naming contract in
-# install/install.sh). Keeping this list tight avoids pulling attribution for
+# Only the targets a release binary is built for (see the asset-naming contract
+# in install/install.sh). Keeping this list tight avoids pulling attribution for
 # crates that never reach a released binary.
+#
+# One entry is ahead of the releases: `aarch64-unknown-linux-gnu` builds from
+# this tree but has no published asset yet (install.sh refuses the target by
+# name). It is listed so the attribution is already complete the day that
+# binary ships; until then THIRD_PARTY_LICENSES.md may name a crate that only
+# that target links. Over-attribution is the harmless direction.
 targets = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",

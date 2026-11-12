@@ -2,9 +2,10 @@
 //! client, `http_client`, is built on).
 //!
 //! Flow: `http_serve` binds a tokio listener and spawns an accept loop;
-//! each hyper request collects its body (wave-1: BUFFERED, capped — most
-//! API payloads are small; streaming request bodies land later), parks a
-//! oneshot responder, and pushes metadata onto the server's queue. JS
+//! each hyper request either collects its body (buffered, capped) or, on a
+//! server that streams request bodies, pumps it to JS in chunks behind the
+//! request (`RequestBody`); it parks a oneshot responder, and pushes
+//! metadata onto the server's queue. JS
 //! long-polls `http_accept` — the pending accept op is what keeps the
 //! event loop alive while listening, exactly Node's semantics. Responses
 //! come back either as one full buffer or as a CHANNEL BODY the JS side
@@ -296,12 +297,6 @@ fn interface_id(scope: u32) -> String {
     scope.to_string()
 }
 
-/// An inbound request body as the JS side will consume it.
-///
-/// Slice 1 of docs/design/streaming-bodies.md: every request is still
-/// `Full`, so behavior is unchanged. The variant exists so the streaming
-/// path has a seam to land on -- `Stream` will carry a chunk receiver and
-/// the handler will be dispatched on headers rather than on last byte.
 /// A queued request-body chunk that carries its own reservation against
 /// GLOBAL_BODY_BUDGET and refunds it when dropped.
 ///
@@ -340,6 +335,10 @@ impl Drop for BudgetedChunk {
 /// node's error for it when node has one (see [`request_body_failure`]).
 pub type BodyChunk = Result<BudgetedChunk, crate::OpOutcome>;
 
+/// An inbound request body as the JS side consumes it: collected whole
+/// before the handler is dispatched (`Full`), or, for a server that streams
+/// its request bodies, a chunk receiver behind a handler dispatched on the
+/// headers (`Stream`). See docs/design/streaming-bodies.md.
 pub enum RequestBody {
     /// Collected up front, subject to MAX_REQUEST_BODY + GLOBAL_BODY_BUDGET.
     Full(Vec<u8>),
@@ -379,13 +378,25 @@ pub enum ResponseBody {
     Unsized(Vec<u8>, Option<hyper::HeaderMap>),
     /// Frame channel plus a drop-signal: the oneshot sender rides inside
     /// ChannelBody, so dropping the body (finished OR connection lost)
-    /// resolves the paired stream_watch receiver.
-    Stream(mpsc::Receiver<Frame<Bytes>>, oneshot::Sender<()>),
+    /// resolves the paired stream_watch receiver. The flag says how a
+    /// channel that ended did: set, it was cut off stalled, not finished.
+    Stream(
+        mpsc::Receiver<Frame<Bytes>>,
+        oneshot::Sender<()>,
+        StreamStalled,
+    ),
     /// JS destroyed the request without responding (req.destroy()): the
     /// connection is torn down instead of synthesizing a response, so the
     /// client observes a connection error (Node's socket-destroy semantics).
     Abort,
 }
+
+/// Whether a streaming response was cut off stalled
+/// ([`HttpState::stall_stream`]): shared by the stream's entry, which sets
+/// it, and the response, which carries it to the connection as an extension
+/// (`watched_response` takes it from there).
+#[derive(Clone, Default)]
+pub struct StreamStalled(Arc<std::sync::atomic::AtomicBool>);
 
 pub struct ResponseSpec {
     pub head: ResponseHead,
@@ -526,8 +537,10 @@ pub struct HttpState {
     /// at that end. Kept only while the body's entry is: whatever removes the
     /// body removes these (lock order: `bodies`, then this).
     trailers: Mutex<HashMap<u64, Vec<(String, String)>>>,
-    /// response-stream id -> chunk sender (JS pushes, hyper drains).
-    streams: Mutex<HashMap<u64, mpsc::Sender<Frame<Bytes>>>>,
+    /// response-stream id -> chunk sender (JS pushes, hyper drains), and the
+    /// flag its body reads when the sender is gone: set, the stream was cut
+    /// off stalled ([`HttpState::stall_stream`]) rather than finished.
+    streams: Mutex<HashMap<u64, StreamEntry>>,
     /// response-stream id -> resolves when hyper drops the response body
     /// (normal completion OR connection loss). httpStreamClosed takes the
     /// receiver; JS tells the two cases apart via its own finished flag.
@@ -536,6 +549,9 @@ pub struct HttpState {
     /// when a body is buffered, refunded when the request finishes.
     body_bytes: AtomicUsize,
 }
+
+/// One live response stream: its chunk sender and its stalled flag.
+type StreamEntry = (mpsc::Sender<Frame<Bytes>>, StreamStalled);
 
 impl HttpState {
     fn next_id(&self) -> u64 {
@@ -661,8 +677,9 @@ impl HttpState {
         }
     }
 
-    /// JS has run the connection's `'secureConnection'` listeners: it may be
-    /// served now (unless one of them destroyed it, which `close_reason`
+    /// JS has run the listeners for what the connection was announced as
+    /// (`'connection'`, and then an https connection's
+    /// `'secureConnection'`): it may be served now (unless one of them destroyed it, which `close_reason`
     /// reports to the waiting connection task).
     pub fn resume_conn(&self, conn_id: u64) {
         if let Some(watch) = self.conn(conn_id) {
@@ -692,8 +709,8 @@ impl HttpState {
 
     /// Sync (isolate-thread) helpers consumed by the engine natives.
     /// Take the fully-collected body. Returns None for a request whose body
-    /// is being streamed (no such request yet -- see slice 2), so callers
-    /// keep working unchanged when that variant lands.
+    /// is being streamed (it is put back): the caller reads that one through
+    /// the chunk ops ([`HttpState::take_body_stream`]).
     pub fn take_request_body(&self, id: u64) -> Option<Vec<u8>> {
         let taken = self
             .bodies
@@ -805,7 +822,7 @@ impl HttpState {
         let responder = self
             .pending
             .lock()
-            .expect("http pending lock")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&id)?;
         let (tx, rx) = mpsc::channel::<Frame<Bytes>>(16);
         // node's OutgoingMessage#_send joins the head to the first chunk
@@ -819,18 +836,19 @@ impl HttpState {
         }
         let (closed_tx, closed_rx) = oneshot::channel::<()>();
         let stream_id = self.next_id();
+        let stalled = StreamStalled::default();
         self.streams
             .lock()
-            .expect("http streams lock")
-            .insert(stream_id, tx);
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(stream_id, (tx, stalled.clone()));
         self.stream_watch
             .lock()
-            .expect("http stream_watch lock")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(stream_id, closed_rx);
         let ok = responder
             .send(ResponseSpec {
                 head,
-                body: ResponseBody::Stream(rx, closed_tx),
+                body: ResponseBody::Stream(rx, closed_tx, stalled),
             })
             .is_ok();
         if ok {
@@ -864,22 +882,40 @@ impl HttpState {
     pub fn stream_sender(&self, stream_id: u64) -> Option<mpsc::Sender<Frame<Bytes>>> {
         self.streams
             .lock()
-            .expect("http streams lock")
+            .unwrap_or_else(|e| e.into_inner())
             .get(&stream_id)
-            .cloned()
+            .map(|(sender, _)| sender.clone())
+    }
+
+    /// End a streaming response that stalled (a chunk could not be queued
+    /// within `STREAM_PUSH_TIMEOUT`) without finishing it: the body is
+    /// marked before its sender goes, so that what the client has not been
+    /// sent is not passed off as the whole response. An HTTP/1 connection
+    /// is closed when its body gets there (`ResponseDone`) instead of being
+    /// sent the terminating chunk.
+    pub fn stall_stream(&self, stream_id: u64) {
+        if let Some((_, stalled)) = self
+            .streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&stream_id)
+        {
+            stalled.0.store(true, Ordering::Release);
+        }
+        self.end_stream(stream_id);
     }
 
     /// Dropping the sender ends the hyper body (clean EOF / final chunk).
     pub fn end_stream(&self, stream_id: u64) {
         self.streams
             .lock()
-            .expect("http streams lock")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&stream_id);
-        // Reap the watch entry if no httpStreamClosed op ever took it (the
-        // oam.serve path and pre-watcher callers never do).
+        // Reap the watch entry if no httpStreamClosed op ever took it (not
+        // every caller watches).
         self.stream_watch
             .lock()
-            .expect("http stream_watch lock")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&stream_id);
     }
 
@@ -892,7 +928,7 @@ impl HttpState {
     /// entry when the queue ends.
     pub fn close_server(&self, server_id: u64) {
         let listener_gone = {
-            let mut servers = self.servers.lock().expect("http servers lock");
+            let mut servers = self.servers.lock().unwrap_or_else(|e| e.into_inner());
             let Some(entry) = servers.get_mut(&server_id) else {
                 return;
             };
@@ -1012,11 +1048,16 @@ fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
             trailers,
         }
         .boxed(),
-        ResponseBody::Stream(rx, closed_tx) => ChannelBody {
-            rx,
-            _closed_tx: closed_tx,
+        ResponseBody::Stream(rx, closed_tx, stalled) => {
+            // For the connection, which is what can refuse to finish a
+            // response that was cut off (`watched_response`).
+            builder = builder.extension(stalled);
+            ChannelBody {
+                rx,
+                _closed_tx: closed_tx,
+            }
+            .boxed()
         }
-        .boxed(),
         // Intercepted in handle_request (returns Err(RequestAborted) before
         // building a response); never reaches the spec-to-response path.
         ResponseBody::Abort => http_body_util::Empty::new().boxed(),
@@ -1193,6 +1234,10 @@ impl Drop for MessageDone {
 struct ResponseDone {
     inner: BoxedBody,
     watch: Arc<ConnWatch>,
+    /// An HTTP/1 streaming response's flag: set when the stream was cut off
+    /// stalled (`HttpState::stall_stream`), which must not reach the client
+    /// as the body's end.
+    cut_off: Option<StreamStalled>,
 }
 
 impl hyper::body::Body for ResponseDone {
@@ -1203,7 +1248,23 @@ impl hyper::body::Body for ResponseDone {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
-        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        if let std::task::Poll::Ready(None) = &polled
+            && self
+                .cut_off
+                .as_ref()
+                .is_some_and(|stalled| stalled.0.load(Ordering::Acquire))
+        {
+            // The channel ended because the stream stalled, not because the
+            // response was finished. Ending the body here would have hyper
+            // write the terminating chunk: a well-formed response missing
+            // its tail. The body has no error to give (its error type is
+            // uninhabited), so it never ends and the connection is closed
+            // under it -- the client reads a response cut short.
+            self.watch.close(CloseReason::Destroy);
+            return std::task::Poll::Pending;
+        }
+        polled
     }
 
     fn is_end_stream(&self) -> bool {
@@ -1226,17 +1287,23 @@ impl Drop for ResponseDone {
 fn watched_response(
     response: hyper::Response<BoxedBody>,
     watch: Option<&Arc<ConnWatch>>,
+    // The exchange is HTTP/1: a streaming response cut off stalled closes
+    // the connection instead of ending. (An HTTP/2 stream's would take the
+    // whole session with it; it ends as before.)
+    http1: bool,
 ) -> hyper::Response<BoxedBody> {
     let Some(watch) = watch else {
         return response;
     };
     watch.response_started();
-    let (parts, body) = response.into_parts();
+    let (mut parts, body) = response.into_parts();
+    let cut_off = parts.extensions.remove::<StreamStalled>().filter(|_| http1);
     hyper::Response::from_parts(
         parts,
         ResponseDone {
             inner: body,
             watch: Arc::clone(watch),
+            cut_off,
         }
         .boxed(),
     )
@@ -1304,14 +1371,6 @@ async fn check_connections(
     }
 }
 
-/// Serve one HTTP/1 connection with hyper, held to node's timeouts: runs
-/// until the connection ends, closing it early when `watch` is closed
-/// (a request timeout answers 408 first), gracefully on server shutdown or
-/// `socket.end()`.
-///
-/// When a request takes the connection (`takeover`), what hyper was writing
-/// is written out first, and the stream comes back with the bytes hyper had
-/// read past that request's head.
 /// What JS said about a connection it was told about.
 #[derive(Clone, Copy)]
 struct Announcement {
@@ -1355,6 +1414,14 @@ async fn announce_connection(
     }
 }
 
+/// Serve one HTTP/1 connection with hyper, held to node's timeouts: runs
+/// until the connection ends, closing it early when `watch` is closed
+/// (a request timeout answers 408 first), gracefully on server shutdown or
+/// `socket.end()`.
+///
+/// When a request takes the connection (`takeover`), what hyper was writing
+/// is written out first, and the stream comes back with the bytes hyper had
+/// read past that request's head.
 #[allow(clippy::too_many_arguments)]
 async fn serve_http1<S, Svc>(
     stream: S,
@@ -1925,9 +1992,8 @@ struct RequestGuard {
     dispatched: bool,
     /// Where to report an exchange that ends before JS answered it (the
     /// connection was closed under it), for a server whose JS keeps the
-    /// request / response pair.
-    /// Where to report an exchange that ends before JS answered it, and
-    /// the connection's watch, which knows whether the peer reset it.
+    /// request / response pair, and the connection's watch, which knows
+    /// whether the peer reset it.
     closed_to: Option<(mpsc::Sender<ServerEvent>, Arc<ConnWatch>)>,
 }
 
@@ -1937,7 +2003,7 @@ impl Drop for RequestGuard {
             .state
             .pending
             .lock()
-            .expect("http pending lock")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&self.id)
             .is_some();
         // After the request event in the queue; a send that waits for room
@@ -1955,7 +2021,7 @@ impl Drop for RequestGuard {
                 let _ = queue.send(ServerEvent::Closed { request_id, reset }).await;
             });
         }
-        let mut bodies = self.state.bodies.lock().expect("http bodies lock");
+        let mut bodies = self.state.bodies.lock().unwrap_or_else(|e| e.into_inner());
         match bodies.get(&self.id) {
             // Streamed bodies on a DISPATCHED request outlive this guard:
             // handle_request returns the moment JS sends response headers --
@@ -2176,14 +2242,73 @@ async fn pump_request_body(
 enum CollectError {
     /// Over `MAX_REQUEST_BODY` (the drain has run).
     TooLarge,
+    /// Keeping it would take the retained bytes over the global budget (the
+    /// drain has run).
+    Busy,
     /// The parser refused the body: answer with this status.
     Refused(u16),
     /// The body was cut short (the client went away): no answer.
     Gone,
 }
 
+/// The bytes [`collect_body`] has charged against the global budget for the
+/// body it is buffering. Refunded on drop -- a body refused part way, or a
+/// collection cancelled with its connection -- unless [`Self::keep`] hands
+/// the charge on to the request (whose `RequestGuard` refunds it).
+struct CollectReservation<'a> {
+    state: &'a HttpState,
+    bytes: usize,
+}
+
+impl CollectReservation<'_> {
+    /// Charge `len` more bytes; false (and nothing charged) when that would
+    /// cross the budget.
+    fn charge(&mut self, len: usize) -> bool {
+        let prev = self.state.body_bytes.fetch_add(len, Ordering::AcqRel);
+        if prev + len > global_body_budget() {
+            self.state.body_bytes.fetch_sub(len, Ordering::AcqRel);
+            return false;
+        }
+        self.bytes += len;
+        true
+    }
+
+    /// Refund everything charged so far.
+    fn refund(&mut self) {
+        self.state
+            .body_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+        self.bytes = 0;
+    }
+
+    /// The charge stays: the caller owns its refund from here.
+    fn keep(mut self) {
+        self.bytes = 0;
+    }
+}
+
+impl Drop for CollectReservation<'_> {
+    fn drop(&mut self) {
+        self.refund();
+    }
+}
+
 /// Collect up to `MAX_REQUEST_BODY` bytes from `body`, then drain up to
 /// `DRAIN_BUDGET` more (discarding them) before returning.
+///
+/// A body that `declared_oversize` (its Content-Length is over the cap) is
+/// never buffered: its outcome is known from the head, so it goes straight
+/// to the drain. A buffered body is charged against the global budget as it
+/// arrives, chunk by chunk, and on `Ok` that charge (the body's length) is
+/// the caller's to refund.
+///
+/// The drain's bound is on the bytes READ off the connection, whatever
+/// became of them: `MAX_REQUEST_BODY + DRAIN_BUDGET` in all, the same for a
+/// body refused at its first byte (declared oversize, or the global budget
+/// full) as for one refused where it crossed the cap. Bounding only the
+/// discarded bytes would leave a body refused early -- one that is 10 MB
+/// over the cap, say -- with most of itself unread when the 413 is sent,
+/// and that close is the reset the drain is there to prevent.
 ///
 /// The drain step is what makes 413 reliable on Windows.  Without it,
 /// closing a TcpStream with unread kernel recv-buffer data sends a TCP RST
@@ -2197,18 +2322,24 @@ enum CollectError {
 /// `Gone`.
 async fn collect_body(
     mut body: hyper::body::Incoming,
+    declared_oversize: bool,
+    state: &HttpState,
 ) -> Result<(bytes::Bytes, Option<hyper::HeaderMap>), CollectError> {
     use bytes::BufMut;
     let mut buf = bytes::BytesMut::new();
-    let mut over_cap = false;
-    let mut drained: usize = 0;
+    // Why nothing of the body is kept any more, once there is a reason: the
+    // rest is drained and this is the answer.
+    let mut refusal = declared_oversize.then_some(CollectError::TooLarge);
+    let mut reservation = CollectReservation { state, bytes: 0 };
+    // Body bytes read so far, kept or discarded (the drain's bound).
+    let mut read: usize = 0;
     let mut trailers = None;
 
     loop {
         let frame = match body.frame().await {
             Some(Ok(f)) => f,
             None => break,
-            Some(Err(_)) if over_cap => break,
+            Some(Err(_)) if refusal.is_some() => break,
             Some(Err(e)) => {
                 return Err(match refused_body_status(&e) {
                     Some(status) => CollectError::Refused(status),
@@ -2225,26 +2356,37 @@ async fn collect_body(
                 continue;
             }
         };
-        if over_cap {
-            // Drain phase: discard bytes up to DRAIN_BUDGET to let the
-            // kernel recv-buffer clear so close() can use FIN, not RST.
-            drained += chunk.len();
-            if drained >= DRAIN_BUDGET {
-                break;
+        let len = chunk.len();
+        read = read.saturating_add(len);
+        if refusal.is_none() {
+            if buf.len() + len > MAX_REQUEST_BODY {
+                refusal = Some(CollectError::TooLarge);
+            } else if !reservation.charge(len) {
+                refusal = Some(CollectError::Busy);
+            } else {
+                buf.put(chunk);
+                continue;
             }
-        } else {
-            buf.put(chunk);
-            if buf.len() > MAX_REQUEST_BODY {
-                over_cap = true;
-                buf.clear(); // release buffered memory immediately
-            }
+            // Refused from this chunk on: what was buffered goes now, the
+            // allocation with it (`clear` would keep the capacity through
+            // the drain), and so does its charge.
+            buf = bytes::BytesMut::new();
+            reservation.refund();
+        }
+        // Drain phase: the chunk is discarded, to let the kernel recv-buffer
+        // clear so close() can use FIN, not RST -- up to DRAIN_BUDGET past
+        // the cap, counted from the body's first byte.
+        if read >= MAX_REQUEST_BODY + DRAIN_BUDGET {
+            break;
         }
     }
 
-    if over_cap {
-        Err(CollectError::TooLarge)
-    } else {
-        Ok((buf.freeze(), trailers))
+    match refusal {
+        Some(refusal) => Err(refusal),
+        None => {
+            reservation.keep();
+            Ok((buf.freeze(), trailers))
+        }
     }
 }
 
@@ -2304,6 +2446,7 @@ async fn handle_request(
     );
     let conn_id = watch.as_ref().map(|w| w.id);
     let notify_closed = watch.as_ref().filter(|w| w.js_driven()).map(Arc::clone);
+    let http1 = req.version() != hyper::Version::HTTP_2;
     let response = dispatch_request(
         state,
         queue,
@@ -2319,7 +2462,7 @@ async fn handle_request(
         upgrades,
     )
     .await?;
-    Ok(watched_response(response, watch.as_ref()))
+    Ok(watched_response(response, watch.as_ref(), http1))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2371,15 +2514,21 @@ async fn dispatch_request(
                             .iter()
                             .map(|(name, value)| (name.as_str(), value.as_bytes())),
                     );
-                if (connect || upgrade)
-                    && let Ok(head) = crate::http_head::parse_request_head(raw.as_bytes(), policy)
-                    && route.take(Takeover { id, head })
-                {
-                    // The connection loop takes the socket; this exchange
-                    // is never answered, and its future is dropped with
-                    // hyper's side of the connection.
-                    drop(message_done);
-                    return std::future::pending().await;
+                if connect || upgrade {
+                    // A head this parse refuses is answered as a refused
+                    // head, never passed on to the 'request' handler as if
+                    // it had not asked to leave HTTP.
+                    let head = match crate::http_head::parse_request_head(raw.as_bytes(), policy) {
+                        Ok(head) => head,
+                        Err(error) => return Ok(refused_head_response(error)),
+                    };
+                    if route.take(Takeover { id, head }) {
+                        // The connection loop takes the socket; this exchange
+                        // is never answered, and its future is dropped with
+                        // hyper's side of the connection.
+                        drop(message_done);
+                        return std::future::pending().await;
+                    }
                 }
             }
         }
@@ -2430,9 +2579,10 @@ async fn dispatch_request(
     let ((collected, trailers), body_stream) = if stream_request_body && !declared_oversize {
         ((bytes::Bytes::new(), None), Some((body, message_done)))
     } else {
-        let collected = match collect_body(body).await {
+        let collected = match collect_body(body, declared_oversize, &state).await {
             Ok(collected) => collected,
             Err(CollectError::TooLarge) => return Ok(status_body(413, b"request body too large")),
+            Err(CollectError::Busy) => return Ok(status_body(503, b"server is busy")),
             Err(CollectError::Refused(status)) => {
                 return Ok(hyper::Response::builder()
                     .status(status)
@@ -2445,15 +2595,14 @@ async fn dispatch_request(
         drop(message_done);
         (collected, None)
     };
-    // Reserve the retained bytes; refund (RequestGuard) on completion. A
-    // streamed body reserves nothing here -- it is charged per outstanding
-    // chunk instead, so a prompt consumer is not billed for the whole upload.
+    // The retained bytes, which collect_body charged against the global
+    // budget as they arrived (a body over it was answered 503 above); the
+    // refund is RequestGuard's, on completion. A streamed body reserved
+    // nothing -- it is charged per outstanding chunk instead, so a prompt
+    // consumer is not billed for the whole upload. Nothing between the
+    // collection and the guard below may return or await: the charge would
+    // be left without an owner.
     let body_len = collected.len();
-    let prev = state.body_bytes.fetch_add(body_len, Ordering::AcqRel);
-    if prev + body_len > global_body_budget() {
-        state.body_bytes.fetch_sub(body_len, Ordering::AcqRel);
-        return Ok(status_body(503, b"server is busy"));
-    }
     let mut headers = header_pairs(&parts.headers);
     // node's `server.maxHeadersCount`: the handler is given only the first so
     // many header fields, the rest dropped (the request is still served). It
@@ -2493,7 +2642,7 @@ async fn dispatch_request(
     state
         .pending
         .lock()
-        .expect("http pending lock")
+        .unwrap_or_else(|e| e.into_inner())
         .insert(id, tx);
     if let Some((body, message_done)) = body_stream {
         // Bounded: an unconsumed body applies backpressure to hyper rather
@@ -2503,7 +2652,7 @@ async fn dispatch_request(
         state
             .bodies
             .lock()
-            .expect("http bodies lock")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(id, RequestBody::Stream(chunk_rx));
         // Counted from here, so the connection's close waits for it
         // (ConnWatch::pumps_settled).
@@ -2523,7 +2672,7 @@ async fn dispatch_request(
         state
             .bodies
             .lock()
-            .expect("http bodies lock")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(id, RequestBody::Full(collected.to_vec()));
         if let Some(trailers) = &trailers {
             state.store_trailers(id, trailers);
@@ -2735,6 +2884,10 @@ async fn serve_secure_conn(
     // application that filters clients there has decided
     // before the handshake starts.
     let watch = ConnWatch::new(conn_state.next_id(), server_id, Arc::clone(&conn_timeouts));
+    // Not the http side's until the handshake is done and the listeners have
+    // run (`served_from_now`): until then headersTimeout / requestTimeout
+    // pass it over, and handshakeTimeout is what bounds it.
+    watch.not_yet_served();
     let registration = conn_state.register_conn(Arc::clone(&watch));
     let conn_id = watch.id;
     let announcement = announce_connection(
@@ -2759,9 +2912,22 @@ async fn serve_secure_conn(
         // runs to its end, as node's does: the server
         // had accepted the connection. handshakeTimeout
         // bounds it.
-        let handshake = crate::tls::server::accept_stream(stream, &context, &options).await;
+        //
+        // The plain socket 'connection' handed out is JS's all the while:
+        // destroying it (socket.destroy(), closeAllConnections()) ends the
+        // handshake with it, and node reports that as a 'tlsClientError'
+        // ECONNRESET "socket hang up" (measured, v22.22.2). The stream goes
+        // with the handshake's future, so a resetAndDestroy() closes it as a
+        // destroy does here.
+        let handshake = tokio::select! {
+            handshake = crate::tls::server::accept_stream(stream, &context, &options) => {
+                Some(handshake)
+            }
+            _ = watch.closed(CloseReason::Destroy) => None,
+        };
         match handshake {
-            Ok((tls_stream, info)) => {
+            None => Some((Some("ECONNRESET".to_string()), "socket hang up".to_string())),
+            Some(Ok((tls_stream, info))) => {
                 // node's onServerSocketSecure: a
                 // certificate that did not verify, under
                 // rejectUnauthorized, and the socket is
@@ -2792,7 +2958,7 @@ async fn serve_secure_conn(
                     None
                 }
             }
-            Err(failed) => Some(failure_parts(failed)),
+            Some(Err(failed)) => Some(failure_parts(failed)),
         }
     };
     // The connection is gone: it no longer counts
@@ -3077,7 +3243,7 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
     let queue = state
         .servers
         .lock()
-        .expect("http servers lock")
+        .unwrap_or_else(|e| e.into_inner())
         .get_mut(&server_id)
         .and_then(|entry| entry.queue.take());
     let Some(mut queue) = queue else {
@@ -3095,7 +3261,7 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
     // which is what lets 'close' and close(cb) wait for them as node's do.
     let next = queue.recv().await;
     {
-        let mut servers = state.servers.lock().expect("http servers lock");
+        let mut servers = state.servers.lock().unwrap_or_else(|e| e.into_inner());
         if next.is_none() {
             // Every sender has gone: nothing can reach this server again.
             servers.remove(&server_id);
@@ -3294,109 +3460,35 @@ pub async fn http2_serve(
                         let watch =
                             ConnWatch::new(conn_state.next_id(), server_id, conn_timeouts.clone());
                         let registration = conn_state.register_conn(Arc::clone(&watch));
-                        // Peek the first bytes to detect HTTP/2 prior-knowledge.
-                        // The preface is 24 bytes; TCP segmentation may deliver
-                        // fewer on the first peek. Retry a few times with a
-                        // short wait before falling back to HTTP/1.1. A client
-                        // that sends nothing is closed at headersTimeout.
-                        let mut peek_buf = [0u8; 24];
-                        let mut is_h2 = false;
-                        for _ in 0..3u8 {
-                            let peeked = tokio::select! {
-                                peeked = stream.peek(&mut peek_buf) => peeked,
-                                _ = conn_shutdown.changed() => return,
-                                // Nothing was said: close without an answer
-                                // (the client may speak HTTP/2).
-                                _ = watch.closed(CloseReason::End) => return,
-                            };
-                            match peeked {
-                                Ok(n) if n >= H2_PREFACE.len() => {
-                                    is_h2 = peek_buf[..H2_PREFACE.len()] == *H2_PREFACE;
-                                    break;
-                                }
-                                Ok(n) if n > 0 && n < H2_PREFACE.len() => {
-                                    // Partial read: if the first few bytes match
-                                    // the preface prefix, wait for more data.
-                                    if peek_buf[..n] == H2_PREFACE[..n] {
-                                        tokio::time::sleep(Duration::from_millis(5)).await;
-                                        continue;
-                                    }
-                                    // Definitely not h2.
-                                    break;
-                                }
-                                _ => break,
-                            }
-                        }
-
-                        if is_h2 {
-                            // HTTP/2: no timeouts, as in node.
-                            drop(registration);
-                            let io = hyper_util::rt::TokioIo::new(stream);
-                            let service = hyper::service::service_fn(move |req| {
-                                handle_request(
-                                    conn_state.clone(),
-                                    conn_queue.clone(),
-                                    req,
-                                    // Streamed, as the secure server's are:
-                                    // node's 'stream' comes with the headers,
-                                    // and the body (and its trailers) can
-                                    // still arrive after the response.
-                                    true,
-                                    conn_addrs,
-                                    None,
-                                    policy,
-                                    None,
-                                    Upgrades::Serve,
-                                )
-                            });
-                            let conn = hyper::server::conn::http2::Builder::new(
-                                hyper_util::rt::TokioExecutor::new(),
-                            )
-                            .serve_connection(io, service);
-                            let mut conn = std::pin::pin!(conn);
-                            let mut shutting_down = false;
-                            loop {
-                                tokio::select! {
-                                    result = conn.as_mut() => {
-                                        let _ = result;
-                                        break;
-                                    }
-                                    _ = conn_shutdown.changed(), if !shutting_down => {
-                                        shutting_down = true;
-                                        conn.as_mut().graceful_shutdown();
-                                    }
-                                }
-                            }
-                        } else {
-                            let _registration = registration;
-                            let service_queue = conn_queue.clone();
-                            let service_watch = Arc::clone(&watch);
-                            let service = hyper::service::service_fn(move |req| {
-                                handle_request(
-                                    conn_state.clone(),
-                                    service_queue.clone(),
-                                    req,
-                                    false, // http2: buffered until a later slice
-                                    conn_addrs,
-                                    None,
-                                    policy,
-                                    Some(Arc::clone(&service_watch)),
-                                    Upgrades::CloseConnect,
-                                )
-                            });
-                            serve_http1(
-                                stream,
-                                watch,
-                                policy,
-                                service,
-                                conn_queue,
-                                false,
-                                conn_addrs,
-                                conn_shutdown,
-                                None,
-                            )
-                            .await;
-                        }
+                        // Peek the first bytes to detect HTTP/2 prior-knowledge
+                        // (nothing is consumed). The preface is 24 bytes and
+                        // may arrive in pieces: the verdict waits for all of
+                        // it, however far apart they are. A client that
+                        // sends nothing, or stops part way, is closed at
+                        // headersTimeout.
+                        let verdict = tokio::select! {
+                            verdict = peek_h2_preface(&stream) => verdict,
+                            _ = conn_shutdown.changed() => None,
+                            _ = watch.closed(CloseReason::End) => None,
+                        };
+                        // Nothing was said: close without an answer (the
+                        // client may speak HTTP/2).
+                        let Some(is_h2) = verdict else {
+                            return;
+                        };
+                        serve_h2c_conn(
+                            stream,
+                            is_h2,
+                            watch,
+                            registration,
+                            server_id,
+                            conn_state,
+                            conn_queue,
+                            conn_addrs,
+                            policy,
+                            conn_shutdown,
+                        )
+                        .await;
                     });
                 }
             }
@@ -3479,76 +3571,190 @@ impl crate::http_conn::AbortiveClose for PrefixedIo {
     }
 }
 
-/// Detect the h2c preface on a connection, as [`http2_serve`]'s peek loop
-/// does: read the head bytes (up to 24), compare, and hand back what was
-/// read to serve to the parser. A TCP stream peeks (no prefix, nothing
-/// consumed); a PEEKLESS pipe reads, and its bytes come back as the prefix
-/// [`PrefixedIo`] serves to the parser. Retries the short reads a first
-/// segment can leave, bounded, as the TCP loop does; None when the
-/// connection ended (a close or a client gone) before a verdict.
-async fn read_h2_preface(
-    stream: &mut crate::tcp::PlainStream,
-) -> std::io::Result<Option<(bool, Bytes)>> {
-    let mut peek_buf = [0u8; 24];
-    // A PIPE read consumes what it read and cannot put it back, so its
-    // retries read on at `got` and the decision is made on the whole head
-    // -- a preface split across pipe reads accumulates instead of losing
-    // its first chunk to the retry. A TCP peek re-reads the untouched head
-    // every time, so `got` stays 0 there.
-    let mut got = 0usize;
+/// Detect the h2c preface on a TCP connection by PEEKING: nothing is
+/// consumed, so the parser reads the stream from its first byte. `true`
+/// for the 24-byte preface, `false` for anything else (HTTP/1.1's to
+/// answer), None when the connection failed before a verdict.
+///
+/// A head that is so far a prefix of the preface waits for the rest, for as
+/// long as it takes: the function has no bound of its own, and its caller
+/// races it against the connection's watch (headersTimeout closes a client
+/// that stops part way) and the server's shutdown. A peek returns at once
+/// while any byte is buffered, so the wait for more is a short sleep.
+async fn peek_h2_preface(tcp: &tokio::net::TcpStream) -> Option<bool> {
+    let mut head = [0u8; 24];
     loop {
-        let peeked = match stream {
-            crate::tcp::PlainStream::Tcp(tcp) => tcp.peek(&mut peek_buf).await,
-            crate::tcp::PlainStream::Pipe(_) => {
-                tokio::io::AsyncReadExt::read(stream, &mut peek_buf[got..]).await
+        match tcp.peek(&mut head).await {
+            Ok(n) if n >= H2_PREFACE.len() => {
+                return Some(head[..H2_PREFACE.len()] == *H2_PREFACE);
             }
-        };
-        match peeked {
-            Ok(n) if got + n >= H2_PREFACE.len() => {
-                let is_h2 = peek_buf[..H2_PREFACE.len()] == *H2_PREFACE;
-                // Only a pipe's read consumed bytes; a TCP peek leaves them.
-                let prefix = if matches!(stream, crate::tcp::PlainStream::Pipe(_)) {
-                    Bytes::copy_from_slice(&peek_buf[..got + n])
-                } else {
-                    Bytes::new()
-                };
-                return Ok(Some((is_h2, prefix)));
-            }
-            Ok(0) => {
-                let prefix = if matches!(stream, crate::tcp::PlainStream::Pipe(_)) && got > 0 {
-                    Bytes::copy_from_slice(&peek_buf[..got])
-                } else {
-                    Bytes::new()
-                };
-                return Ok(Some((false, prefix)));
-            }
-            // A partial head: a preface prefix waits for more, as the TCP
-            // loop does; anything else is HTTP/1.1.
+            // The client closed having said nothing.
+            Ok(0) => return Some(false),
             Ok(n) => {
-                let total = got + n;
-                if peek_buf[..total] == H2_PREFACE[..total] {
-                    if matches!(stream, crate::tcp::PlainStream::Pipe(_)) {
-                        got = total;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                    continue;
+                if head[..n] != H2_PREFACE[..n] {
+                    return Some(false);
                 }
-                let prefix = if matches!(stream, crate::tcp::PlainStream::Pipe(_)) {
-                    Bytes::copy_from_slice(&peek_buf[..total])
-                } else {
-                    Bytes::new()
-                };
-                return Ok(Some((false, prefix)));
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::Interrupted =>
             {
                 tokio::time::sleep(Duration::from_millis(5)).await;
-                continue;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Detect the h2c preface on a connection, by the rules of
+/// [`peek_h2_preface`]: the verdict, and what was consumed reaching it. A
+/// TCP stream is peeked (no prefix, nothing consumed); a PEEKLESS pipe is
+/// read, and its bytes come back as the prefix [`PrefixedIo`] serves to the
+/// parser. Like the peek it waits for the whole preface with no bound of
+/// its own (its caller's race with the watch and the shutdown is the
+/// bound); None when the connection failed before a verdict.
+async fn read_h2_preface(
+    stream: &mut crate::tcp::PlainStream,
+) -> std::io::Result<Option<(bool, Bytes)>> {
+    if let crate::tcp::PlainStream::Tcp(tcp) = &*stream {
+        return Ok(peek_h2_preface(tcp)
+            .await
+            .map(|is_h2| (is_h2, Bytes::new())));
+    }
+    let mut head = [0u8; 24];
+    // A PIPE read consumes what it read and cannot put it back, so each
+    // read goes on at `got` and the decision is made on the whole head -- a
+    // preface split across pipe reads accumulates instead of losing its
+    // first chunk to the next read.
+    let mut got = 0usize;
+    loop {
+        match tokio::io::AsyncReadExt::read(&mut *stream, &mut head[got..]).await {
+            // The client closed: whatever it said is HTTP/1.1's to answer.
+            Ok(0) => return Ok(Some((false, Bytes::copy_from_slice(&head[..got])))),
+            Ok(n) => {
+                got += n;
+                // Anything but a prefix of the preface is HTTP/1.1; a
+                // prefix waits for the rest (the next read).
+                if head[..got] != H2_PREFACE[..got] {
+                    return Ok(Some((false, Bytes::copy_from_slice(&head[..got]))));
+                }
+                if got == H2_PREFACE.len() {
+                    return Ok(Some((true, Bytes::copy_from_slice(&head[..got]))));
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
             Err(_) => return Ok(None),
         }
+    }
+}
+
+/// One connection of an h2c server ([`http2_serve`], [`http2_pipe_serve`])
+/// once its first bytes have said what it speaks: HTTP/2 (`is_h2`) served
+/// as one session until it or the server ends, anything else as HTTP/1.1
+/// under the http server's timeouts (`watch`, registered as
+/// `registration`). The one implementation both listeners share.
+#[allow(clippy::too_many_arguments)]
+async fn serve_h2c_conn<S>(
+    io: S,
+    is_h2: bool,
+    watch: Arc<ConnWatch>,
+    registration: ConnRegistration,
+    server_id: u64,
+    state: Arc<HttpState>,
+    queue: mpsc::Sender<ServerEvent>,
+    conn_addrs: ConnAddrs,
+    policy: HeadPolicy,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) where
+    S: tokio::io::AsyncRead
+        + tokio::io::AsyncWrite
+        + crate::http_conn::AbortiveClose
+        + Unpin
+        + Send
+        + 'static,
+{
+    if is_h2 {
+        // HTTP/2: no timeouts, as in node. The watch the connection waited
+        // for its first bytes under (the http server's) is let go, and the
+        // session gets one of its own on which nothing fires -- JS-driven
+        // only so that an exchange that ends without its response (a stream
+        // the client reset) is reported, as the secure server's sessions
+        // report it (`secure::http2_serve_tls`). It is not registered:
+        // nothing addresses an h2c session by id.
+        drop(registration);
+        drop(watch);
+        let session_watch = ConnWatch::new(
+            state.next_id(),
+            server_id,
+            ServerTimeouts::new(TimeoutSettings {
+                headers_ms: 0,
+                request_ms: 0,
+                keep_alive_ms: 0,
+                socket_ms: 0,
+                js_driven: true,
+                ..TimeoutSettings::default()
+            }),
+        );
+        let io = hyper_util::rt::TokioIo::new(io);
+        let service = hyper::service::service_fn(move |req| {
+            handle_request(
+                state.clone(),
+                queue.clone(),
+                req,
+                // Streamed, as the secure server's are: node's 'stream'
+                // comes with the headers, and the body (and its trailers)
+                // can still arrive after the response.
+                true,
+                conn_addrs,
+                None,
+                policy,
+                Some(Arc::clone(&session_watch)),
+                Upgrades::Serve,
+            )
+        });
+        let conn = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+            .serve_connection(io, service);
+        let mut conn = std::pin::pin!(conn);
+        let mut shutting_down = false;
+        loop {
+            tokio::select! {
+                result = conn.as_mut() => {
+                    let _ = result;
+                    break;
+                }
+                _ = shutdown.changed(), if !shutting_down => {
+                    shutting_down = true;
+                    conn.as_mut().graceful_shutdown();
+                }
+            }
+        }
+    } else {
+        let _registration = registration;
+        let service_queue = queue.clone();
+        let service_watch = Arc::clone(&watch);
+        let service = hyper::service::service_fn(move |req| {
+            handle_request(
+                state.clone(),
+                service_queue.clone(),
+                req,
+                false, // the HTTP/1 side of an http2 server: bodies buffered
+                conn_addrs,
+                None,
+                policy,
+                Some(Arc::clone(&service_watch)),
+                Upgrades::CloseConnect,
+            )
+        });
+        serve_http1(
+            io, watch, policy, service, queue, false, conn_addrs, shutdown, None,
+        )
+        .await;
     }
 }
 
@@ -3654,76 +3860,19 @@ pub async fn http2_pipe_serve(
                         let Some((is_h2, prefix)) = verdict else {
                             return;
                         };
-                        let io = PrefixedIo { stream, prefix };
-                        if is_h2 {
-                            // HTTP/2: no timeouts, as in node.
-                            drop(registration);
-                            let io = hyper_util::rt::TokioIo::new(io);
-                            let service = hyper::service::service_fn(move |req| {
-                                handle_request(
-                                    conn_state.clone(),
-                                    conn_queue.clone(),
-                                    req,
-                                    // Streamed, as the secure server's are:
-                                    // node's 'stream' comes with the headers,
-                                    // and the body (and its trailers) can
-                                    // still arrive after the response.
-                                    true,
-                                    conn_addrs,
-                                    None,
-                                    policy,
-                                    None,
-                                    Upgrades::Serve,
-                                )
-                            });
-                            let conn = hyper::server::conn::http2::Builder::new(
-                                hyper_util::rt::TokioExecutor::new(),
-                            )
-                            .serve_connection(io, service);
-                            let mut conn = std::pin::pin!(conn);
-                            let mut shutting_down = false;
-                            loop {
-                                tokio::select! {
-                                    result = conn.as_mut() => {
-                                        let _ = result;
-                                        break;
-                                    }
-                                    _ = conn_shutdown.changed(), if !shutting_down => {
-                                        shutting_down = true;
-                                        conn.as_mut().graceful_shutdown();
-                                    }
-                                }
-                            }
-                        } else {
-                            let _registration = registration;
-                            let service_queue = conn_queue.clone();
-                            let service_watch = Arc::clone(&watch);
-                            let service = hyper::service::service_fn(move |req| {
-                                handle_request(
-                                    conn_state.clone(),
-                                    service_queue.clone(),
-                                    req,
-                                    false, // http2: buffered until a later slice
-                                    conn_addrs,
-                                    None,
-                                    policy,
-                                    Some(Arc::clone(&service_watch)),
-                                    Upgrades::CloseConnect,
-                                )
-                            });
-                            serve_http1(
-                                io,
-                                watch,
-                                policy,
-                                service,
-                                conn_queue,
-                                false,
-                                conn_addrs,
-                                conn_shutdown,
-                                None,
-                            )
-                            .await;
-                        }
+                        serve_h2c_conn(
+                            PrefixedIo { stream, prefix },
+                            is_h2,
+                            watch,
+                            registration,
+                            server_id,
+                            conn_state,
+                            conn_queue,
+                            conn_addrs,
+                            policy,
+                            conn_shutdown,
+                        )
+                        .await;
                     });
                 }
             }
@@ -3737,11 +3886,6 @@ pub async fn http2_pipe_serve(
     super::OpOutcome::Json(serde_json::json!({ "serverId": server_id }).to_string())
 }
 
-/// Backpressured chunk push for streaming responses. A bounded timeout is
-/// the half-open backstop: when a client stops reading (or vanishes
-/// without a reset the OS has noticed yet), hyper stops draining the body,
-/// the channel fills, and `send` would park forever — wedging the JS pump.
-/// The timeout ends the stream so the pump always makes progress.
 /// Resolves when hyper drops the response body for `stream_id` -- normal
 /// completion after end_stream, OR the client tearing the connection down
 /// mid-stream. JS distinguishes the cases by whether it already finished
@@ -3763,6 +3907,11 @@ pub async fn http_stream_closed(state: Arc<HttpState>, stream_id: u64) -> super:
     super::OpOutcome::Done
 }
 
+/// Backpressured chunk push for streaming responses. A bounded timeout is
+/// the half-open backstop: when a client stops reading (or vanishes
+/// without a reset the OS has noticed yet), hyper stops draining the body,
+/// the channel fills, and `send` would park forever — wedging the JS pump.
+/// The timeout ends the stream so the pump always makes progress.
 pub async fn http_body_push(
     state: Arc<HttpState>,
     stream_id: u64,
@@ -3786,7 +3935,7 @@ pub async fn http_body_trailers(
 }
 
 /// One frame onto a streaming response's channel, with the backpressure
-/// and the timeout described above.
+/// and the timeout [`http_body_push`] describes.
 async fn push_frame(
     state: Arc<HttpState>,
     stream_id: u64,
@@ -3803,9 +3952,11 @@ async fn push_frame(
             super::OpOutcome::Failed("client disconnected".to_string())
         }
         Err(_elapsed) => {
-            // Stalled: consumer not reading. Drop the stream; the lingering
-            // socket is reaped by the OS / graceful close.
-            state.end_stream(stream_id);
+            // Stalled: consumer not reading. Drop the stream, marked as cut
+            // off: an HTTP/1 client that reads on later finds the
+            // connection closed under an unfinished response, not a
+            // terminating chunk after a body missing its tail.
+            state.stall_stream(stream_id);
             super::OpOutcome::Failed("stream stalled: client is not reading".to_string())
         }
     }
@@ -3992,6 +4143,59 @@ mod budget_tests {
         );
     }
 
+    /// The buffered path's charge, made as the body arrives: refunded when
+    /// the collection is dropped (refused, or cancelled with its
+    /// connection), left standing when it is handed on to the request.
+    #[test]
+    fn a_collection_refunds_unless_its_charge_is_kept() {
+        let state = state();
+        {
+            let mut reservation = CollectReservation {
+                state: &state,
+                bytes: 0,
+            };
+            assert!(reservation.charge(1024));
+            assert!(reservation.charge(1));
+            assert_eq!(state.body_bytes.load(Ordering::Acquire), 1025);
+        }
+        assert_eq!(
+            state.body_bytes.load(Ordering::Acquire),
+            0,
+            "a collection that is dropped refunds what it charged"
+        );
+        let mut reservation = CollectReservation {
+            state: &state,
+            bytes: 0,
+        };
+        assert!(reservation.charge(7));
+        reservation.keep();
+        assert_eq!(
+            state.body_bytes.load(Ordering::Acquire),
+            7,
+            "a kept charge is the request's to refund"
+        );
+        state.body_bytes.fetch_sub(7, Ordering::AcqRel);
+    }
+
+    /// A chunk that would cross the budget is not charged, and what was
+    /// charged before it still is.
+    #[test]
+    fn a_collection_is_refused_at_the_ceiling() {
+        let state = state();
+        let mut reservation = CollectReservation {
+            state: &state,
+            bytes: 0,
+        };
+        assert!(reservation.charge(global_body_budget()));
+        assert!(!reservation.charge(1));
+        assert_eq!(
+            state.body_bytes.load(Ordering::Acquire),
+            global_body_budget()
+        );
+        reservation.refund();
+        assert_eq!(state.body_bytes.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn budget_rejects_only_past_the_ceiling() {
         let state = state();
@@ -4018,6 +4222,50 @@ mod budget_tests {
 mod takeover_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A streaming response whose stream was cut off stalled
+    /// (`HttpState::stall_stream`) is not passed off as a whole one: over
+    /// HTTP/1 its body never ends and its connection is closed instead; a
+    /// stream that simply ended still ends, and so does an HTTP/2 one.
+    #[tokio::test]
+    async fn a_stalled_stream_closes_its_connection_instead_of_ending() {
+        let timeouts = ServerTimeouts::new(TimeoutSettings::default());
+        // A streaming response whose channel has already ended.
+        let respond = |stalled: &StreamStalled| {
+            let (tx, rx) = mpsc::channel::<Frame<Bytes>>(1);
+            let (closed_tx, _closed_rx) = oneshot::channel::<()>();
+            drop(tx);
+            spec_to_response(ResponseSpec {
+                head: ResponseHead::plain(200, Vec::new()),
+                body: ResponseBody::Stream(rx, closed_tx, stalled.clone()),
+            })
+        };
+        // Finished: the body ends, and the connection is left alone.
+        let watch = ConnWatch::new(1, 1, Arc::clone(&timeouts));
+        let mut body =
+            watched_response(respond(&StreamStalled::default()), Some(&watch), true).into_body();
+        assert!(body.frame().await.is_none());
+        assert_eq!(watch.close_reason(), None);
+        // Cut off stalled, over HTTP/1: the body does not end (no
+        // terminating chunk is written) and the connection is closed.
+        let stalled = StreamStalled::default();
+        stalled.0.store(true, Ordering::Release);
+        let watch = ConnWatch::new(2, 1, Arc::clone(&timeouts));
+        let mut body = watched_response(respond(&stalled), Some(&watch), true).into_body();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), body.frame())
+                .await
+                .is_err(),
+            "a response cut off stalled is not ended as if it were whole"
+        );
+        assert_eq!(watch.close_reason(), Some(CloseReason::Destroy));
+        // Over HTTP/2 the stream ends as before: closing the connection
+        // would take the session's other streams with it.
+        let watch = ConnWatch::new(3, 1, timeouts);
+        let mut body = watched_response(respond(&stalled), Some(&watch), false).into_body();
+        assert!(body.frame().await.is_none());
+        assert_eq!(watch.close_reason(), None);
+    }
 
     /// A connection taken by a request (an upgrade) that arrives while hyper
     /// is still writing an earlier response: the stream comes back once that
@@ -4080,8 +4328,18 @@ mod takeover_tests {
             .write_all(b"POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(watch.unflushed(), "hyper holds most of the response");
+        // Waited for, not slept for: the connection's task has to parse the
+        // request and back the response up into the pipe first, and how
+        // long that takes is the host's to say. Once hyper holds bytes it
+        // cannot flush them until the client reads, so the state is stable.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !watch.unflushed() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "hyper holds most of the response"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         client
             .write_all(b"helloGET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: x\r\n\r\nafter")
             .await

@@ -86,8 +86,23 @@ const OID: u8 = 0x06;
 const CONTEXT_0: u8 = 0xa0;
 const CONTEXT_0_PRIMITIVE: u8 = 0x80;
 
+/// How deep constructed elements may nest before the reader gives up:
+/// OpenSSL's own bound (ASN1_MAX_CONSTRUCTED_NEST in crypto/asn1/tasn_dec.c),
+/// so nothing it reads is refused here. The reader recurses per level, and
+/// without a bound the depth is the input's to choose.
+const MAX_NESTING: usize = 30;
+
 /// Read one element off the front of `input`: it and what follows it.
 fn read_tlv(input: &[u8]) -> Option<(Tlv<'_>, &[u8])> {
+    read_tlv_at(input, 0)
+}
+
+/// [`read_tlv`] at `depth` indefinite-length elements down; None past
+/// [`MAX_NESTING`].
+fn read_tlv_at(input: &[u8], depth: usize) -> Option<(Tlv<'_>, &[u8])> {
+    if depth > MAX_NESTING {
+        return None;
+    }
     let (&tag, rest) = input.split_first()?;
     // High tag numbers (0x1f) do not occur in these structures.
     if tag & 0x1f == 0x1f {
@@ -111,7 +126,7 @@ fn read_tlv(input: &[u8]) -> Option<(Tlv<'_>, &[u8])> {
                     &cursor[2..],
                 ));
             }
-            let (_, next) = read_tlv(cursor)?;
+            let (_, next) = read_tlv_at(cursor, depth + 1)?;
             cursor = next;
         }
     }
@@ -167,12 +182,21 @@ fn expect<'a>(tlv: Option<&Tlv<'a>>, tag: u8) -> Option<Tlv<'a>> {
 /// An OCTET STRING's bytes (implicitly tagged ones included), a BER
 /// constructed string's segments joined.
 fn octets(tlv: &Tlv<'_>) -> Option<Vec<u8>> {
+    octets_at(tlv, 0)
+}
+
+/// [`octets`] at `depth` constructed strings down; None past
+/// [`MAX_NESTING`].
+fn octets_at(tlv: &Tlv<'_>, depth: usize) -> Option<Vec<u8>> {
     if tlv.tag & 0x20 == 0 {
         return Some(tlv.content.to_vec());
     }
+    if depth > MAX_NESTING {
+        return None;
+    }
     let mut out = Vec::new();
     for part in children(tlv)? {
-        out.extend(octets(&part)?);
+        out.extend(octets_at(&part, depth + 1)?);
     }
     Some(out)
 }
@@ -1052,6 +1076,52 @@ mod tests {
             Some(vec![0xaa, 0xbb])
         );
         assert!(parse(&[0x30, 0x05, 0x02]).is_none());
+    }
+
+    /// Nesting is bounded: an element nested past `MAX_NESTING` is refused
+    /// as malformed, whatever its length -- by the reader for
+    /// indefinite-length elements, by `octets` for constructed strings --
+    /// and one at the bound still reads.
+    #[test]
+    fn ber_nesting_is_bounded() {
+        // `levels` indefinite-length SEQUENCEs, one inside the other.
+        let nested = |levels: usize| {
+            let mut input: Vec<u8> = Vec::new();
+            for _ in 0..levels {
+                input.extend_from_slice(&[0x30, 0x80]);
+            }
+            for _ in 0..levels {
+                input.extend_from_slice(&[0x00, 0x00]);
+            }
+            input
+        };
+        assert!(parse(&nested(MAX_NESTING + 1)).is_some());
+        assert!(parse(&nested(MAX_NESTING + 2)).is_none());
+        // Far past any stack's depth, were each level a frame.
+        assert!(parse(&nested(200_000)).is_none());
+        // Unterminated, as a truncated bundle is.
+        assert!(parse(&[0x30u8, 0x80].repeat(200_000)).is_none());
+        assert!(load_pkcs12(&nested(200_000), "").is_err());
+
+        // Definite-length constructed OCTET STRINGs, one inside the other,
+        // around one primitive segment.
+        let strings = |levels: usize| {
+            let mut input: Vec<u8> = vec![0x04, 0x01, 0xaa];
+            for _ in 0..levels {
+                let len = u32::try_from(input.len()).unwrap().to_be_bytes();
+                let mut outer = vec![0x24, 0x84];
+                outer.extend_from_slice(&len);
+                outer.extend_from_slice(&input);
+                input = outer;
+            }
+            input
+        };
+        assert_eq!(
+            octets(&parse(&strings(MAX_NESTING + 1)).unwrap()),
+            Some(vec![0xaa])
+        );
+        assert_eq!(octets(&parse(&strings(MAX_NESTING + 2)).unwrap()), None);
+        assert_eq!(octets(&parse(&strings(20_000)).unwrap()), None);
     }
 
     // RFC 7292's KDF against a vector computed with OpenSSL's

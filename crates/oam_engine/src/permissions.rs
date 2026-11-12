@@ -779,6 +779,23 @@ impl Default for Permissions {
 }
 
 impl Permissions {
+    /// Nothing granted, with the model on. What an isolate with no
+    /// permission slot is held to: every runtime sets the slot as it is
+    /// built, so a missing one is a construction path that forgot to, and
+    /// that must refuse rather than run all-granted.
+    pub fn denied() -> Self {
+        Self {
+            read: PermValue::None,
+            write: PermValue::None,
+            net: PermValue::None,
+            env: PermValue::None,
+            ffi: PermValue::None,
+            child: PermValue::None,
+            worker: PermValue::None,
+            enabled: true,
+        }
+    }
+
     /// Build from an optional `RuntimeOptions::permissions` field.
     /// `None` -> default (all-granted).
     pub fn from_opts(opts: Option<PermissionsOptions>) -> Self {
@@ -1186,9 +1203,9 @@ pub fn lookup_answer_resource(answer: &str) -> String {
     }
 }
 
-/// Caller-facing descriptor for `JsRuntime::with_permissions`.
-/// Each field is `None` (default: granted) | `Some(true)` (granted) |
-/// `Some(false)` (denied) | list of strings (whitelist).
+/// Caller-facing descriptor for `JsRuntime::new_with_permissions`.
+/// Each field is a [`BoolOrList`]: `Bool(true)` (granted, the default) |
+/// `Bool(false)` (denied) | `List` of strings (the grants).
 #[derive(Debug, Default, Clone)]
 pub struct PermissionsOptions {
     pub read: BoolOrList,

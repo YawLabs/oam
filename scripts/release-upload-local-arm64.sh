@@ -45,6 +45,8 @@ cd "$SCRIPT_DIR/.."
 . "$SCRIPT_DIR/lib/build-locks.sh"
 # shellcheck source=lib/signing.sh
 . "$SCRIPT_DIR/lib/signing.sh"
+# shellcheck source=lib/crt-linkage.sh
+. "$SCRIPT_DIR/lib/crt-linkage.sh"
 
 # ONE EXIT trap: the scratch dirs (the published asset's signature check, the
 # staging dir created after the build) and the private signing agent (started
@@ -53,9 +55,11 @@ tmp=""
 trust_dir=""
 wt=""
 prior_dir=""
+smoke_dir=""
 cleanup() {
   release_agent_stop
   if [ -n "$tmp" ]; then rm -rf "$tmp"; fi
+  if [ -n "$smoke_dir" ]; then rm -rf "$smoke_dir"; fi
   if [ -n "$prior_dir" ]; then rm -rf "$prior_dir"; fi
   if [ -n "$trust_dir" ]; then rm -rf "$trust_dir"; fi
   if [ -n "$wt" ]; then
@@ -212,7 +216,7 @@ guard_signed_asset() {
     echo "  [warn] ${TAG}'s published ${ASSET} is Authenticode-signed (${state}); OAM_SKIP_WIN_SIGN=1 replaces it with an UNSIGNED build" >&2
     return 0
   fi
-  echo "error: ${TAG}'s published ${ASSET} is Authenticode-signed (or could not be read: ${state}), and this run would replace it with an UNSIGNED build -- set OAM_WIN_SIGN_METADATA and OAM_WIN_SIGN_PUBLISHER (release-keys/README.md), or OAM_SKIP_WIN_SIGN=1 to downgrade it deliberately; $1" >&2
+  echo "error: ${TAG}'s published ${ASSET} is Authenticode-signed (or could not be read: ${state}), and this run would replace it with an UNSIGNED build -- set OAM_WIN_SIGN_METADATA and OAM_WIN_SIGN_PUBLISHER, or OAM_SKIP_WIN_SIGN=1 to downgrade it deliberately; $1" >&2
   exit 1
 }
 WIN_SIGNING=0
@@ -265,6 +269,52 @@ if [ "$WIN_SIGNING" = "1" ]; then
   win_verify "${tmp}/${ASSET}" || { echo "error: ${ASSET} does not verify after signing -- nothing was uploaded" >&2; exit 1; }
 fi
 
+# The same gates release-local.sh holds every Windows asset to, on the staged
+# (and, when signing, signed) copy -- the bytes about to be uploaded. This
+# path used to go from the build straight to the checksum and the upload, so
+# a tag whose build crashes at startup, or links the dynamic CRT, would have
+# been published under a freshly re-signed manifest. Every release this
+# script may patch (anything not pinned in release-keys/presigning-sums)
+# carries the crt-static config and the console e2e in its tree.
+#
+# 1. It runs: release-local.sh's smoke assertion, with the same 5-minute
+#    ceiling and the same cap on a type-check daemon's idle time (a daemon
+#    left running would hold the staged file open).
+smoke_dir="$(mktemp -d)"
+echo "console.log('ci smoke', 6 * 7)" > "${smoke_dir}/smoke.js"
+# `timeout` is on the release box (Git Bash ships coreutils); without it the
+# run is simply unbounded rather than refused.
+smoke_cmd=("${tmp}/${ASSET}")
+if command -v timeout >/dev/null 2>&1; then smoke_cmd=(timeout 300 "${tmp}/${ASSET}"); fi
+if ! smoke_out="$(OAM_DAEMON_IDLE_MS=1500 "${smoke_cmd[@]}" run "${smoke_dir}/smoke.js")"; then
+  echo "error: smoke run failed (crash or 5-min hang) for the staged ${ASSET} -- nothing was uploaded" >&2
+  exit 1
+fi
+rm -rf "$smoke_dir"
+smoke_dir=""
+[ "$smoke_out" = "ci smoke 42" ] \
+  || { echo "error: smoke output unexpected from the staged ${ASSET}: '${smoke_out}' -- nothing was uploaded" >&2; exit 1; }
+# 2. It needs no VC++ redistributable: green on this box proves nothing (the
+#    redist is installed here), so the import names are inspected. The canary
+#    first, so a checker that stopped rejecting is not read as a clean binary.
+assert_static_crt_canary || { echo "error: CRT-linkage self-check failed -- see above; nothing was uploaded" >&2; exit 1; }
+assert_static_crt "${tmp}/${ASSET}" || { echo "error: CRT-linkage gate failed for the staged ${ASSET} -- nothing was uploaded" >&2; exit 1; }
+# 3. The console raw-mode e2e (crates/oam_cli/tests/conpty.rs), the tag's own
+#    copy, pointed at the staged asset through OAM_CONPTY_BIN -- a native
+#    Windows path (cygpath), since the harness checks it with a Rust
+#    is_file(), which knows nothing of MSYS's /tmp. The test build links the
+#    debug oam beside the test binary, so that path is freed first, as
+#    release-local.sh does; only debug-tree processes are killed.
+oam_kill_under "$REPO_ROOT/target/debug"
+oam_reap_parked target/debug
+oam_reap_parked target/debug/deps
+conpty_bin="${tmp}/${ASSET}"
+if command -v cygpath >/dev/null 2>&1; then conpty_bin="$(cygpath -w "$conpty_bin")"; fi
+(cd "$wt" && OAM_CONPTY_BIN="$conpty_bin" \
+  cargo test -p oam_cli --test conpty --target-dir "$REPO_ROOT/target" -- --test-threads=1) \
+  || { echo "error: console raw-mode e2e failed against the staged ${ASSET} -- see above; nothing was uploaded" >&2; exit 1; }
+echo "  [ok] staged ${ASSET}: smoke, static CRT and console raw-mode e2e" >&2
+
 # Re-read SHA256SUMS -- and the manifest pair, when there is one -- from the
 # release at this step boundary, never cached. All three patterns in one call,
 # whatever the up-front probe said, so a manifest that appeared or vanished
@@ -316,7 +366,8 @@ if [ "$entries" -ne 1 ]; then
 fi
 
 # 2. The recorded hash actually matches the binary about to be uploaded.
-#    --ignore-missing: the manifest covers all six targets, only ours is here.
+#    --ignore-missing: the manifest covers every asset the release ships
+#    (five binaries plus the license files), only ours is here.
 (cd "$tmp" && sha256sum -c --ignore-missing SHA256SUMS >/dev/null) \
   || { echo "error: SHA256SUMS does not verify against ${ASSET} -- refusing to upload" >&2; exit 1; }
 echo "  [ok] manifest self-check: 1 entry for ${ASSET}, hash verifies"

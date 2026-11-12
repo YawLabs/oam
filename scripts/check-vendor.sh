@@ -53,6 +53,9 @@ done
 
 fail() { echo "check-vendor: $*" >&2; exit 1; }
 cannot() { echo "check-vendor: cannot run: $*" >&2; exit 2; }
+# A literal newline, for matching a line start inside a captured string.
+NL='
+'
 
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -129,7 +132,9 @@ for dir in "${dirs[@]}"; do
   (cd "$WORK/$crate/a" && GIT_CEILING_DIRECTORIES="$WORK" git -c core.autocrlf=false -c core.eol=lf apply --whitespace=nowarn "$patch_file") \
     || fail "$dir/OAM-PATCH.diff does not apply to the published $crate"
   if ! drift="$(cd "$WORK/$crate" && diff -r a b)"; then
-    printf '%s\n' "$drift" | head -40 >&2
+    # `|| true`: head closing the pipe early must not end the script (set -e,
+    # pipefail) before the fail line below names the cause.
+    printf '%s\n' "$drift" | head -40 >&2 || true
     fail "$dir differs from the published $crate plus OAM-PATCH.diff (above) -- an edit under vendor/ must land in OAM-PATCH.diff too ('scripts/check-vendor.sh --regen', then review)"
   fi
   echo "check-vendor: $dir = crates.io $crate (sha256 ${want:0:12}...) + OAM-PATCH.diff"
@@ -161,10 +166,16 @@ EOF
       out="$(cargo check --offline --quiet --manifest-path "$(native_path "$probe/Cargo.toml")" \
         --target-dir target/vendor-check 2>&1)" \
         || { printf '%s\n' "$out" >&2; fail "$crate does not compile with features [$features] (above)"; }
-      if printf '%s\n' "$out" | grep -q '^warning'; then
-        printf '%s\n' "$out" >&2
-        fail "$crate warns with features [$features] (above)"
-      fi
+      # Matched in the shell, not piped into `grep -q`: under pipefail, grep
+      # exiting on its first match can leave printf writing into a closed
+      # pipe, and the non-zero pipeline would then read as "no warnings" --
+      # only when the output is large, which is when it matters.
+      case "$out" in
+        warning* | *"$NL"warning*)
+          printf '%s\n' "$out" >&2
+          fail "$crate warns with features [$features] (above)"
+          ;;
+      esac
       echo "check-vendor: $crate builds warning-free with [$features]"
     done < "$dir/OAM-PATCH.features"
   fi

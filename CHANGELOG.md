@@ -9,17 +9,1071 @@ Entries are derived from the commit history between release tags. Pure internal
 churn — formatting passes, lockfile syncs, benchmark receipt refreshes — is
 omitted. oam is pre-1.0: breaking changes can land in a minor release.
 
-Version numbering is not contiguous: **0.9.3 and 0.9.5 were never tagged**, so a
+Version numbering is not contiguous: **0.9.3, 0.9.5 and 0.16.0 were never
+tagged** (0.15.3 is followed by 0.16.1), and **0.17.2 was prepared but never
+tagged** -- its entries ship in 0.18.0, under "Prepared as 0.17.2". So a
 gap between headings below is expected rather than a missing entry. Not every tag
 is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
 one, so `install.sh`, which resolves the latest Release, never handed them out.
 
-## [0.19.5] - TBD
-- Addressed Issue #472: `--max-old-space-size` was silently ignored
+## [Unreleased]
+
+### Changed
+
+**node:child_process**
+
+- **`maxBuffer` defaults to 1 MiB, as in node.** It was 50 MB for `exec`, `execFile`,
+  `spawnSync`, `execSync` and `execFileSync`. An explicit `0` is honoured and an invalid value
+  throws `ERR_OUT_OF_RANGE`. A program that relied on the larger default must now pass
+  `maxBuffer`.
+- **`execSync` / `execFileSync` forward the child's captured stderr to the parent's stderr when
+  no `stdio` option is given, as node does.** It was captured and dropped.
+- **`child.kill()` returns `false` and leaves `killed` alone once the child has exited or never
+  started.** `child.kill(0)` is the liveness probe; it threw `ERR_UNKNOWN_SIGNAL`.
+
+**node:crypto**
+
+- **ECDSA signatures from `crypto.sign`, `createSign` and `createVerify` are DER by default, as
+  node's are.** They were raw `r||s`. `dsaEncoding: 'ieee-p1363'` asks for the raw form, and the
+  curve comes from the key rather than the digest name. A signature stored from an earlier oam
+  verifies only with `dsaEncoding: 'ieee-p1363'`. WebCrypto `subtle` is unchanged.
+- **`crypto.generateKeyPair[Sync]('rsa' | 'ec')` without an encoding option returns
+  `KeyObject`s, as node does.** It returned PEM strings.
+- **`crypto.hash()` returns a hex string by default, as node does.** It returned the raw digest;
+  `'buffer'` asks for that. A non-string encoding is `ERR_INVALID_ARG_TYPE`, an unknown one
+  `ERR_INVALID_ARG_VALUE`.
+- **`Verify#verify` decodes a string signature given without an encoding as utf8, as node
+  does.** It assumed base64.
+- **`crypto.randomInt` throws `ERR_OUT_OF_RANGE` for a range wider than 2^48 - 1.** It never
+  returned. Its other argument errors carry node's codes, and `generatePrime` /
+  `generatePrimeSync` check `size` as node does (`ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE`)
+  instead of turning a negative or >= 2^31 size into a huge bit count.
+- **Streaming AES-GCM authenticates with the `ghash` crate.** `Cipher` / `Decipher` `update()`
+  computed the tag with a field multiply written in this repo; it is now the RustCrypto
+  implementation the one-shot `aes-gcm` path already uses (0.5.1, already in the build, so no
+  package is added), which takes the carry-less-multiply instruction on x86-64 where the CPU
+  has it. Output and tags are unchanged.
+- **RSA encryption, decryption, RSA-PSS and RSA key generation use `rsa` 0.10** (was 0.9).
+- **`crypto.privateDecrypt` with `RSA_PKCS1_PADDING` no longer throws for a block that does not
+  decode.** Like node, it returns a buffer, the same one for the same key and block, with the
+  bytes node returns.
+- **RSA encrypt / decrypt errors are `Error`s with node's `code` and message
+  (`ERR_OSSL_RSA_...`).** A wrong-length or out-of-range input, an undecodable OAEP block and a
+  malformed `publicDecrypt` block threw `TypeError`s with oam's own text.
+- **`privateEncrypt` / `publicDecrypt` given `RSA_PKCS1_OAEP_PADDING` throw
+  `ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE`, as node does.** They ignored the option. A
+  padding value that is not `RSA_PKCS1_PADDING`, `RSA_NO_PADDING` or `RSA_PKCS1_OAEP_PADDING` is
+  refused; it was read as OAEP.
+- **A `DiffieHellman` object matches node's.** Private keys of node's length, `getPublicKey` /
+  `getPrivateKey` without leading zero bytes, `computeSecret` checking the peer key with node's
+  errors (`ERR_CRYPTO_INVALID_KEYLEN`, `ERR_CRYPTO_INVALID_KEYTYPE`), node's constructor errors,
+  `verifyError` reporting the `DH_CHECK_*` flags, `generateKeys()` keeping a private key that
+  was set, and `createDiffieHellman(primeLength)` taking 512 to 10000 bits and honouring its
+  generator.
+
+**node:fs, node:os, process**
+
+- **File descriptors are the lowest free number from 3 up and are reused after close, as in
+  node.** `fs.openSync`, `fs.open`, `fsPromises.open` and the fs streams took their number from
+  the id counter sockets, request bodies and child processes share, which only counts up: a
+  program's first file was fd 64 and no number was ever issued twice. Files now have their own
+  table. Three opens are three consecutive numbers, closing the middle one makes it the next
+  open's, and a descriptor a parent handed down (`stdio: [..., 'pipe', 'pipe']`) keeps its
+  number until it is closed, so with 3 and 4 inherited the first file is 5. As in node, a
+  number held after its `close` may by then name another file; a second `closeSync` with no
+  open in between is still `EBADF`.
+- **`fs.exists` validates its callback (`ERR_INVALID_ARG_TYPE`) and answers on a later tick.**
+  It called back synchronously. `util.promisify(fs.exists)` resolves with the boolean.
+- **System errors with errno `ENODATA`, `ESOCKTNOSUPPORT`, `ENONET`, `EREMOTEIO`, `EUNATCH`
+  (and `EFTYPE` on macOS) carry that code.** They were reported as `EIO`.
+- **A refused `process.setuid` / `setgid` / `seteuid` / `setegid` / `setgroups` / `initgroups`
+  throws node's ErrnoException shape.** Numeric `errno`, `code`, `syscall`, and the message
+  `EPERM, Operation not permitted`; a failure outside a short list of codes (`EAGAIN`, `EMFILE`,
+  `EFAULT`, ...) reports its real errno name, for `process.execve` too, where it was `EIO`.
+- **`os.machine()` reports arm64 as node does per platform.** `'aarch64'` on Linux, `'arm64'` on
+  macOS and `'unknown'` on Windows; it was `'aarch64'` everywhere.
+
+**node:dns, node:net, node:dgram**
+
+- **A DNS query name that does not parse (`'a..b.example.'`) fails `EBADNAME`, as in node.** It
+  was `ESERVFAIL`.
+- **`dns.lookup()` / `dns.resolve*()` with a name holding a NUL byte or longer than 253
+  characters, and `dns.resolve*('')`, fail through the callback or promise with a code.** They
+  threw a `TypeError` synchronously.
+- **`dgram`: `send()` and `bind()` on a closed socket throw `ERR_SOCKET_DGRAM_NOT_RUNNING`, and a
+  second `bind()` throws `ERR_SOCKET_ALREADY_BOUND`.** The native UDP bind refuses an
+  out-of-range or non-integer port with a `RangeError` instead of binding a different port.
+- **`net.isIPv6` / `net.isIP` refuse three malformed forms they accepted.** An address with `::`
+  may spell out at most seven groups, and only its last group may be a dotted quad:
+  `1:2:3:4:5:6:7:8::`, `1:2:3:4:5:6:7::8` and `1.2.3.4::1` are no longer addresses.
+
+**Buffer, events and web APIs**
+
+- **An `EventTarget` listener that throws no longer stops the dispatch or throws out of
+  `dispatchEvent()` / `AbortController.abort()`.** The remaining listeners run and the error is
+  reported as an uncaught exception on a later tick, as in node.
+- **`EventEmitter` refuses a non-function listener with `ERR_INVALID_ARG_TYPE`.** An async
+  `prependOnceListener` handler's rejection now reaches the `captureRejections` handler.
+- **`TextDecoder.decode()` throws `ERR_INVALID_ARG_TYPE` for an argument that is not a
+  BufferSource.** A number was decoded as that many NUL bytes.
+- **`atob` / `btoa` failures are a `DOMException` named `InvalidCharacterError` (code 5).**
+  `atob` no longer accepts non-ASCII whitespace.
+- **`Buffer#swap16/32/64` and `Buffer#fill` raise node's coded errors.** `ERR_INVALID_BUFFER_SIZE`
+  and `ERR_OUT_OF_RANGE`; `fill` names `"end"` when `end` is the bad value and refuses a
+  non-integer `offset` / `end`, as node does.
+- **`assert.match` / `assert.doesNotMatch` fail on a non-string input.** It was coerced. The
+  generated message names the regexp and the input, with `generatedMessage` true, as in node.
+
+**node:v8, node:vm, node:repl and builtin modules**
+
+- **`v8.serialize` / `v8.deserialize` round-trip the structured-clone value.** `Map`, `Set`,
+  `Date`, `RegExp`, `BigInt`, typed arrays, `Buffer`, cycles and shared references survive, and
+  an uncloneable value throws; the format was lossy JSON. A `Serializer` given several
+  `writeValue` calls reads back value by value. The bytes are still oam's own, not V8's wire
+  format, and they are not the bytes an earlier oam wrote.
+- **`v8.startupSnapshot.addSerializeCallback` / `addDeserializeCallback` /
+  `setDeserializeMainFunction` throw `ERR_NOT_BUILDING_SNAPSHOT` outside a snapshot build, as
+  node's do.** `v8.cachedDataVersionTag()` is derived from the V8 version and the target
+  instead of being a constant 0.
+- **`repl.start()` throws `ERR_METHOD_NOT_IMPLEMENTED`.** It returned a fake session that had
+  already ended.
+- **`node:internal/errors` no longer resolves without `--expose-internals`.** node answers
+  `ERR_UNKNOWN_BUILTIN_MODULE`; under the flag both `internal/...` and `node:internal/...`
+  resolve, as in node.
+- **`vm.SourceTextModule#link` rejects where it resolved wrongly.** It throws
+  `ERR_VM_MODULE_DIFFERENT_CONTEXT` when the linker returns a module from another context, and
+  rejects with `ERR_VM_MODULE_LINK_FAILURE` instead of resolving with the module still unlinked
+  when a dependency's links are not recorded yet.
+
+**undici**
+
+- **`undici.request()`: a response header carried more than once (`set-cookie` above all) is an
+  array of its values, as undici's is.** It was one comma-joined string.
+- **`Dispatcher#compose()` and applying an `interceptors.*()` interceptor throw a self-naming
+  `NotSupportedError`.** They were a bare `TypeError` and a silent pass-through.
+
+**oam CLI**
+
+- **`oam run --replay <file>` with a trace that is missing or malformed fails with an error and
+  does not run the program.** It printed one line and ran the program live.
+- **`oam test <path>` fails and names any explicitly given path that does not exist.** The path
+  was skipped.
+- **`--max-old-space-size` is validated when read.** A value that is not a whole number (`512m`,
+  `abc`, or a subcommand swallowed by the spaced form) exits 9 naming the flag, as node does.
+  `--max-old-space-size=0` (node's "use the default") or another unusable value no longer
+  overwrites a valid `OAM_MAX_HEAP_MB`.
+- **`oam self-update` refuses to replace a binary inside `node_modules`.** That binary belongs
+  to an npm install of `oamjs`; the refusal points at `npm install -g oamjs@latest`.
+  `OAM_INSTALL_DIR` still names a target outright.
+- **`oam compile --minify` prints a notice that the flag is reserved and not implemented.** It
+  silently did nothing.
+- **`oam mcp`: `oam_run` keeps at most 1 MiB of each of stdout and stderr.** A longer stream ends
+  in a truncation marker and sets `stdoutTruncated` / `stderrTruncated`. A script's own
+  JSON-shaped stderr output (`console.error(42)`, a logged object) is no longer reported as
+  diagnostics; such lines stay in `stderrRaw`.
+
+**oam install**
+
+- **`oam install` updates and prunes like `npm ci`.** A package whose installed version differs
+  from the lockfile's is extracted again (and its lifecycle scripts become eligible again), and
+  package directories in `node_modules` that the lockfile does not name are removed.
+- **`oam install` honours the lockfile's `os` / `cpu` / `optional` fields.** An optional package
+  for another platform is skipped, a required one is an `OAM-PKG0004` error (npm's
+  `EBADPLATFORM`), and an optional package that fails to download is a warning.
+- **Workspace and link lockfile entries (`link: true`) are no longer fetched as URLs.** One
+  `OAM-PKG0004` warning lists the ones not linked, and a `resolved` value that is not an http(s)
+  URL is refused up front instead of being retried four times.
+
+**oam:test, oam:ai and oam:mcp**
+
+- **`expect(fn).toThrow(errorObject)` compares the message, as Jest does.** It passed for any
+  thrown error. An expected value of another type is an error.
+- **`toHaveBeenCalled`, `toHaveBeenCalledTimes`, `toHaveBeenCalledWith` and
+  `toHaveBeenLastCalledWith` throw when the value is not a mock or spy.** The `.not` forms could
+  pass silently.
+- **`toMatchObject` compares `Date`, `RegExp`, `Map`, `Set`, `Error` and binary values by
+  equality and requires equal array length.** It matched them vacuously.
+- **Fake timers move the whole `Date` clock.** `new Date()` and `Date()` follow it as well as
+  `Date.now()`; `performance.now()` stays real and is documented as such. `mock.timers.tick()`
+  throws on a timer that re-arms itself at 0 ms instead of spinning forever.
+- **`oam:ai`: a provider's mid-stream error frame makes `streamChat` throw.** The stream ended
+  silently. The `anthropic()` preset's default model is `claude-sonnet-5-5`; the old default id
+  named no model.
+- **`oam:mcp`: an HTTP request body larger than 16 MiB is answered with 413.**
 
 ### Added
 
-- **`--max-old-space-size=N` accepted on the command line and in `NODE_OPTIONS`.** Maps to
+**node: modules**
+
+- **`crypto.Hash` and `crypto.Hmac` are Transform streams.** `src.pipe(createHash('sha256'))`
+  and `pipeline(src, hash, cb)` work, `createHash` / `createHmac` take stream options, and a
+  finalized hash throws `ERR_CRYPTO_HASH_FINALIZED`.
+- **RSA-PSS `saltLength` honours `RSA_PSS_SALTLEN_DIGEST` / `MAX_SIGN` / `AUTO` and node's
+  defaults** (the maximum salt when signing, auto-detection when verifying), and
+  `crypto.constants` gains the three `RSA_PSS_SALTLEN_*` values. A `saltLength` the key cannot
+  encode throws.
+- **`crypto.createPrivateKey` / `createPublicKey` accept key material as a `Buffer`,
+  `TypedArray`, `DataView` or `ArrayBuffer`.** `createPublicKey` derives the public key from
+  private material (RSA, PKCS#8 EC) and unwraps `{ key: KeyObject }`; an unusable argument is
+  `ERR_INVALID_ARG_TYPE` / `ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE` instead of a key built from the
+  text `'undefined'`. `publicEncrypt` / `privateDecrypt` / `privateEncrypt` / `publicDecrypt`
+  and the `sign` / `verify` option bags accept a `KeyObject` key.
+- **`crypto.pbkdf2` accepts `sha224` and `crypto.hkdf` accepts `sha224` and `md5`**, the digest
+  list the error message already advertised, and `crypto.scrypt` / `scryptSync` accept any
+  `keylen` (everything outside 10..=64 threw `scrypt: invalid parameters`; 0 returns an empty
+  `Buffer`, as in node).
+- **`zlib.constants` gains node's `BROTLI_PARAM_*`, `BROTLI_MODE_*`, `BROTLI_DECODER_*` and the
+  missing `Z_*` and mode names.** `params: { [zlib.constants.BROTLI_PARAM_QUALITY]: n }` threw
+  `ERR_BROTLI_INVALID_PARAM`.
+- **http2 client: `session.setTimeout()` and `stream.setTimeout()` arm an idle timer and emit
+  `'timeout'`.** They were no-ops.
+- **`console.Console` instances have node's full method set** (`dir`, `trace`, `assert`,
+  `group`, `time`, `count`, ...) on `Console.prototype`, and a subclass can override `log()` and
+  call `super.log()`.
+- **`perf_hooks.createHistogram` and `monitorEventLoopDelay` record**, with node's `Histogram`
+  surface; `readline.emitKeypressEvents` emits `'keypress'`; `vm.measureMemory` reports the
+  isolate's used heap; `vm.Script#createCachedData` returns a `Buffer` (an empty one: no code
+  cache is produced).
+- **`diagnostics_channel`: `runStores` and `bindStore` work, and `unbindStore` exists.**
+  `runStores` passes `thisArg` and the arguments, returns the result, publishes, and enters the
+  stores bound with `bindStore`. Tracing channels trace when any of the five channels is
+  active, a throwing subscriber is rethrown as an uncaught exception instead of swallowed, and
+  `publish()` returns `undefined`, as node's does.
+- **`querystring.parse` / `stringify` accept `null` for `sep`, `eq` and `options`, and honour
+  `options.decodeURIComponent` / `options.encodeURIComponent`.**
+- **`process.resourceUsage()` reports real `userCPUTime` / `systemCPUTime` and a `maxRSS`, and
+  `process.availableMemory()` reports the system's free memory.** They were constant zeros.
+- **`fs.watchFile` honours `persistent: false`, and its `ref()` / `unref()` move the poller.** A
+  non-persistent or unref'd watcher no longer holds the process open.
+- **`node:test`: `t.before` / `t.after` / `t.beforeEach` / `t.afterEach` belong to the running
+  test.** `t.before` runs at once, `t.after` after that test, the each-hooks around its
+  subtests, and subtests run the enclosing suites' each-hooks.
+
+**node:crypto**
+
+- **`crypto.constants.RSA_NO_PADDING` in `publicEncrypt`, `privateDecrypt`, `privateEncrypt` and
+  `publicDecrypt`.**
+- **`oaepLabel` for `publicEncrypt` / `privateDecrypt`**, and `sha224` and the `RSA-SHA*`
+  spellings for `oaepHash`.
+- **RSA public keys from 4097 to 16384 bits can be used to encrypt and to verify RSA-PSS
+  signatures.** The limit was 4096 bits.
+- **`crypto.createDiffieHellmanGroup` and `crypto.DiffieHellmanGroup`, and the `modp15` to
+  `modp18` groups for `getDiffieHellman`.**
+- **`crypto.constants.DH_CHECK_P_NOT_PRIME`, `DH_CHECK_P_NOT_SAFE_PRIME`,
+  `DH_UNABLE_TO_CHECK_GENERATOR` and `DH_NOT_SUITABLE_GENERATOR`.**
+
+**Web APIs and undici**
+
+- **A `fetch()` response is `instanceof Response` and has `clone()`.** The body stream is teed.
+- **`addEventListener(type, fn, { signal })` honours the signal.** An aborted one registers
+  nothing, an abort removes the listener, and a value that is not an `AbortSignal` throws
+  `ERR_INVALID_ARG_TYPE`.
+- **WebSocket delivers a `Blob` for binary messages under the default `binaryType` `'blob'`,
+  and `send(blob)` sends the Blob's bytes in call order.**
+- **`undici.BalancedPool` balances.** Requests rotate over the upstreams, `addUpstream()` /
+  `removeUpstream()` / `upstreams` exist, and an empty pool rejects with
+  `BalancedPoolMissingUpstreamError`.
+
+**oam CLI, install and module resolution**
+
+- **The transpile cache evicts itself, and `oam cache clean` deletes it.** At most once a day a
+  storing run sweeps orphaned temp files older than 10 minutes and entries not written in 30
+  days; `oam cache clean` removes it along with the bytecode cache, and `--json` gains
+  `removed_transpile`. The bytecode cache sweep also ages out entries in superseded per-build
+  directories under a `NODE_COMPILE_CACHE` / `enableCompileCache(dir)` directory.
+- **`oam mcp` answers JSON-RPC batches** (an array of messages, as MCP 2025-03-26 allows),
+  honours `notifications/cancelled` for a running or queued request, and answers `ping` while a
+  tool call is running. A message that is not a JSON object is answered with -32600 instead of
+  silence.
+- **`oam_explain` explains `OAM-RT-OOM`**, the heap-cap banner. It answered "unknown code".
+- **A package.json `imports` entry may map a `#name` to another package** (`"#dep": "dep"`,
+  `"#w/*": "dep/*"`) or to a bare builtin name, as in node. It failed with `OAM-MOD0002`
+  'invalid target'.
+- **`oam install --json` reports skipped tarball symlinks, per-shim bin failures and a malformed
+  trust file as diagnostics** (`OAM-PKG0004` / `OAM-PKG0005` / `OAM-PKG0007` warnings) instead of
+  prose on stderr.
+
+**N-API**
+
+- **`napi_get_new_target` returns `new.target` for a construct call** (null for a plain call),
+  and getter / setter descriptors in `napi_define_class` / `napi_define_properties` define
+  accessors instead of being skipped.
+- **Finalizers run.** `napi_wrap` no longer pins the wrapped object, looks wraps up in constant
+  time and returns a usable weak reference; the finalizers of `napi_wrap`, `napi_add_finalizer`
+  and `napi_create_external` run after their object is collected; a reference with a count of
+  zero is weak, as in node.
+- **`napi_create_error`, `napi_create_type_error` and `napi_create_range_error` set `code` on
+  the error when one is given**, and answer `napi_string_expected` for a code that is not a
+  string.
+- **`napi_add_env_cleanup_hook` and `napi_remove_env_cleanup_hook` work.** They answered
+  `napi_ok` and did nothing. Hooks now run when the runtime that loaded the addon ends -- the
+  main thread's at a normal exit, a worker's when it stops -- in reverse order of registration
+  and before the addon's remaining finalizers, as in node. They do not run on `process.exit()`,
+  as in node. Registering the same function and argument twice is refused with
+  `napi_invalid_arg` (node aborts the process).
+
+### Fixed
+
+**node:fs and node:path**
+
+- **`fs.copyFile` onto the file itself succeeds and leaves the file intact, as node does.** The
+  same path, a hard link or a link to it truncated the file on Linux and macOS and failed
+  `EBUSY` on Windows.
+- **`fs.access` on Linux and macOS calls access(2) with the requested `R_OK` / `W_OK` / `X_OK`
+  bits.** `X_OK` and `R_OK` are really checked, `W_OK` honours ownership and privilege, and a
+  refusal reads `EACCES: permission denied`.
+- **`fs.rm` of a Windows directory symlink or junction removes the link.** The target is left
+  untouched; it failed `EPERM`.
+- **`fs.utimes` / `futimes` / `lutimes` no longer fail `EINVAL` on Linux and macOS for a time
+  whose sub-second part rounds up to a whole second** (0.9999999999).
+- **`fs.watch` on Linux survives a deleted or renamed directory.** Closing a watcher whose
+  directory was deleted no longer silences an unrelated watcher started afterwards, and such a
+  watcher keeps the event loop open until `close()`, as in node, whether or not other watchers
+  exist. Under `recursive`, a directory renamed inside the watched tree reports its entries
+  under the new name, and one moved out of the tree is no longer watched.
+- **`fs.glob` / `globSync` / `promises.glob`: an absolute pattern with a wildcard before its
+  last segment matches.** `/proj/**/*.js` and `C:/proj/*/index.ts` silently returned `[]`.
+- **`path.matchesGlob` and `fs.glob`'s string-array `exclude` let `**` match zero directories**
+  (`**/*.js` matches `foo.js`) and accept a brace group that spans path segments
+  (`{src/a,lib}/*.ts`), which also works in an `fs.glob` pattern. Array excludes match on
+  Windows, and `path.win32.matchesGlob` treats a backslash as a separator in both the path and
+  the pattern (`a\b.js` matches `a/*.js`).
+- **`fs.glob`'s oam-only options hold their bounds.** `follow: true` ends in `ELOOP` at a link
+  back to an ancestor directory instead of walking the tree again until the OS refuses the
+  path; `maxResults` refuses a value that floors to zero (0.5) up front, and the cap stops the
+  walk itself rather than being checked after the whole tree was collected.
+- **`fs.constants` and `fs.promises.constants` are the same object, as in node.**
+- **A pending callback `fs.write` / `fs.writev` is counted in
+  `process.getActiveResourcesInfo()`** (`FSReqCallback`) until its callback runs.
+
+**node:child_process and node:cluster**
+
+- **`spawnSync` / `execSync` with an `input` larger than the pipe buffer no longer deadlock
+  against a child that writes while it reads** (`cat`, a compressor, `stdin.pipe(stdout)`).
+- **A `spawnSync` / `execSync` `timeout` returns at the deadline even when a grandchild
+  (`cmd /c`, `sh -c`) still holds the output pipe.** A child that had already exited reports
+  its own status with `ETIMEDOUT`, as node does.
+- **`spawnSync` / `execSync` end the child and report `ENOBUFS` as soon as its output crosses
+  `maxBuffer`.** They buffered without bound until it exited.
+- **A child ended by a signal reports that signal.** `spawnSync` on POSIX answers
+  `signal: 'SIGSEGV'` with a null status instead of `{ status: null, signal: null }`, and
+  `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGTRAP`, `SIGALRM` and the other named signals are named in
+  `signalCode` / `spawnSync().signal` instead of `'SIG<n>'`.
+- **Every `child.kill()` is delivered, with the signal asked for.** Only the first was sent, so
+  `SIGTERM` to a child that traps it followed by `SIGKILL` never sent the `SIGKILL` (cluster
+  workers too). A signal outside the common ten (`SIGWINCH`, `SIGPIPE`, by name or number) was
+  sent as `SIGTERM`; names and numbers are now checked against one table
+  (`os.constants.signals`), so every POSIX signal node accepts by name is accepted.
+- **On Windows, `kill()` on a child that has already exited no longer replaces its real exit
+  code with `{ code: null, signal }`.**
+- **Output a child wrote just before exiting is no longer lost when the exit is collected before
+  the last read** (`spawn` / `exec` / `fork` stdout and stderr). IPC messages a child sends just
+  before exiting are delivered too: the channel is read to the child's end, and a channel
+  socket error emits `'disconnect'`.
+- **A forked child's exit no longer waits for its parent to read the IPC channel.** The child
+  stays only until its messages are in the parent's kernel, so a parent that blocks its event
+  loop until the child is gone gets it gone, as under node; the messages are delivered when
+  the parent next reads. The parent emits `'exit'` once the channel has been read to the
+  child's end, so `'disconnect'` still comes before `'exit'` and `'close'`.
+  `docs/node-divergences.md` records what remains different.
+- **A parent that sends to a child that has already exited still gets the child's last
+  messages.** With its event loop busy while the child sent and exited, a parent that then
+  `send()`s before reading lost them on Windows: the write drew a reset, which discards what
+  has not been read. The parent now takes what has arrived off the channel before each write,
+  and a send after the child's end-of-stream fails with `EPIPE` (to its callback, or as the
+  child's `'error'`), as in node.
+- **A child's `'exit'` no longer waits for an IPC channel another process holds.** A launcher
+  that passed the channel on to a process it started and exited held the parent's `'exit'`
+  (and `'close'`) until that process closed the channel. `'exit'` now comes at most a second
+  after the exit is collected; `'close'` still waits for `'disconnect'`, as in node.
+- **On Windows, `process.kill(pid, 0)` throws `ESRCH` for a child that has exited**, also
+  before its `'exit'` has been emitted, and a signal sent to it is `ESRCH` rather than
+  `EPERM`, as libuv answers both.
+- **`shell: true` is honoured together with `argv0` or extra `stdio` entries** (`spawn` and, on
+  Windows, `spawnSync`). The command was run as a program name and failed `ENOENT`.
+- **A `shell` option given as a string runs that shell** (`spawn`, `spawnSync`, `exec`,
+  `execFile` and the sync forms) instead of the platform default.
+- **On Windows, `spawn(cmd, args, { argv0, stdio: [..., 'ipc'] })` no longer fails with 'unknown
+  child handle'**, and `spawnSync` with `argv0` closes the child's stdin (after `input`, or at
+  once without one), so a child reading stdin to EOF no longer hangs.
+- **`execSync` / `execFileSync` errors carry what node's do.** A spawn error has the `spawnSync`
+  result fields (`status`, `output`, `stdout`, `stderr`), `execFileSync`'s 'Command failed'
+  message names the arguments, and `spawnargs` reports the caller's arguments, not the
+  self-spawn rewrite.
+- **The self-spawn rewrite no longer applies to a different binary that merely shares oam's
+  file name.** A path is compared resolved, links followed.
+- **`fork()` and `spawn(stdio 'ipc')` share one IPC channel implementation.** Queued `send`
+  callbacks are settled when a fork fails to start, and `disconnect()` flushes pending sends
+  and emits `'disconnect'` once. In a fork child, a `'message'` listener added with
+  `addListener` / `prependListener` / `prependOnceListener` starts the channel, and a failed
+  channel connect closes the channel instead of ending the child with an uncaught error.
+- **A child's last IPC messages survive its exit.** The child now closes its channel in order
+  before any exit -- every `process.send()` written out and read by the parent -- where a large
+  message sent just before `process.exit()` could be lost under load (on Windows the open
+  socket was reset). A `process.send()` followed at once by `process.exit()` is delivered even
+  when the channel was not connected yet. The parent sees `'disconnect'` before `'exit'`, and
+  also for a child that never used its channel. A child that only sends, with no `'message'`
+  or `'disconnect'` listener, no longer stays alive on its channel, and a `'disconnect'`
+  listener alone opens the channel.
+- **Destroying a parent-writable extra stdio stream closes the pipe, and a failed wait is
+  reported as `'error'` then `'close'` on the child** instead of an unhandled rejection. On
+  POSIX, a failed extra-fd spawn whose command contains a backslash or a control character
+  keeps its error code.
+- **An overlapping read of a child's stdout / stderr parks until the pipe is released instead of
+  spinning a runtime worker.**
+- **A cluster worker's own children and worker threads no longer report `cluster.isWorker`.**
+  The worker's `OAM_CLUSTER_WORKER` id is read once at startup and removed from its
+  environment, as node deletes `NODE_UNIQUE_ID`.
+- **On Windows, a cluster fork no longer starts a hidden conhost per worker.** Workers are
+  spawned with the same creation flags as every other child, without an unconditional
+  `CREATE_NO_WINDOW` beside inherited stdio.
+
+**node:net, node:dgram and node:dns**
+
+- **A socket destroyed with more than 64 KiB of inbound data pending no longer leaves the TLS,
+  http2 or fetch stream over it waiting for bytes forever.**
+- **`net.Socket.setEncoding` uses one `StringDecoder` per socket.** A multi-byte character split
+  across reads is decoded whole, `hex` / `base64` / `utf16le` / `latin1` work, and an unknown
+  encoding throws `ERR_UNKNOWN_ENCODING`. The fork IPC channel is covered too.
+- **`net.Socket.connect()` on a socket that was destroyed and has closed reconnects it.** The
+  stream is un-destroyed, as node does; it hung with no event. A `connect()` that throws on its
+  arguments no longer leaves the socket pinned in the active-handle list.
+- **A write callback or `'drain'` / `'finish'` listener that throws is an uncaught exception and
+  no longer wedges every later `write` and `end()` on the socket.**
+- **`socket.setTimeout(msecs)` over 2^31-1 is truncated to 2147483647 with a
+  `TimeoutOverflowWarning`, as node does** (net and tls). It fired `'timeout'` after 1 ms.
+- **`net.connect`: a `localAddress` with an IPv6 zone id (`fe80::1%eth0`) is bound with that
+  scope.** It failed with `bind EINVAL`.
+- **A udp6 socket binds `::` and sends to `::1` by default.** It used the IPv4 wildcard and
+  loopback.
+- **`dgram`: closing a socket ends every receive in flight on it.** `close()` during a bind
+  closes the native socket the bind registers, and sends made before an implicit bind settles
+  share one bind.
+- **`dns.setServers()` / `dns.promises.setServers()` in a worker no longer change the main
+  thread's (or another worker's) default nameservers, as in node.**
+- **`resolveTxt` / `resolveCaa` report bytes >= 0x80 one character per byte, as node does.** They
+  were decoded as lossy UTF-8. A NAPTR answer whose flags, service or regexp hold bytes outside
+  printable ASCII fails `EBADRESP`, as in node.
+
+**node:http, node:https and fetch**
+
+- **A non-101 answer to an upgrade request is an ordinary response.** Its body is framed by
+  `Content-Length` or chunked encoding and ends there, instead of running to connection close
+  with the raw chunk framing in it. The request's head and body now leave in one write, as
+  node's do, so such an answer no longer strands the next request on the connection.
+- **`http.request` over an agent's socket no longer drops a `#` and everything after it from the
+  request target.** It is sent as `%23` (node sends it raw; recorded in
+  docs/node-divergences.md).
+- **`res.headers['set-cookie']` is an array on the http client's default request path too**, and
+  a response header named like an `Object.prototype` member reads as its own value.
+- **http server: repeated request headers combine by node's rules.** `cookie` is joined with
+  `'; '` and single-value fields keep the first.
+- **http server: a pipelined request read while a long response is in flight no longer trips
+  `headersTimeout` / `requestTimeout` and closes the connection mid-response.** Its clock starts
+  when that response ends.
+- **http server: an upgrade or CONNECT request with more than 100 header fields reaches the
+  `'upgrade'` / `'connect'` listener** instead of falling through to `'request'`, and its header
+  values are decoded one code point per byte (latin1), as an ordinary request's are, instead of
+  as lossy UTF-8.
+- **https server: `headersTimeout` / `requestTimeout` no longer run during the TLS handshake.**
+  Destroying the `'connection'` socket mid-handshake ends the handshake at once, reported as
+  `'tlsClientError'` `ECONNRESET`, as node does.
+- **A streaming response cut off by the 60 s stall backstop closes its HTTP/1 connection**
+  instead of being terminated as if complete.
+- **`http.ClientRequest.setNoDelay` / `setSocketKeepAlive` made before the request has a socket
+  are deferred to it**, as node's `_deferToConnect` does. They were dropped.
+- **The http client and socket internals no longer run on a program's replaced `setImmediate` /
+  `setTimeout`.** Fake timers do not hold a request's dispatch, its `'close'`, or a socket
+  timeout.
+- **`http.STATUS_CODES` includes 509 'Bandwidth Limit Exceeded'.**
+- **`node:_http_common` `HTTPParser` follows llhttp in three more places.** A non-101 response
+  carrying `Upgrade` + `Connection: upgrade` is parsed as an ordinary message; a response whose
+  body the caller skips (a HEAD's) and that has no framing keeps the connection, so the next
+  response parses instead of failing `HPE_CLOSED_CONNECTION`; and a header value still arriving
+  counts against `maxHeaderSize`, so an unterminated one fails with `HPE_HEADER_OVERFLOW`.
+- **A connection released just as `agent.destroy()` ran can no longer be parked in the pool it
+  had emptied.**
+- **A fetch through a supplied connect function behaves like one over oam's own connections.**
+  A used connection closes once its response has drained instead of staying open until the
+  fetch's final response, and a resend after an HTTP/2 `GOAWAY` / `REFUSED_STREAM` asks the
+  function for a new connection instead of failing with `error sending request`.
+- **A 303 that answers a streamed request before its body has ended is followed at once.** The
+  fetch waited for the stream to end, forever for one that never does.
+- **A failed build of the platform TLS configuration is no longer cached for the life of the
+  process.** A system store unreadable at the first https request failed every later one; the
+  next request now builds again.
+- **`fetchBodyCancel` on a body that is already drained or gone no longer leaves a permanent
+  entry in the cancel set.**
+- **`url.urlToHttpOptions` no longer copies a URL's internal state (`_href`, `_c`, `_params`)
+  into the options.** User-added properties still carry over.
+
+**node:http2**
+
+- **A cleartext server waits for the whole 24-byte client preface however it is segmented.** It
+  fell back to HTTP/1.1 after about 10 ms.
+- **On a cleartext server, a stream the client resets before the handler answers is reported**
+  (the stream emits `'aborted'` / `'close'`), as on the secure server.
+- **`allowHTTP1`: `closeIdleConnections()` / `close()` no longer treat a connection with a
+  request in flight as idle.** The open-request count is tracked per request.
+- **`stream.close(code)` validates the code the same way on client and server streams**: uint32
+  range, and `ERR_INVALID_ARG_TYPE` for a non-number.
+- **A client session's `ping()` sends a PING frame and calls back at the server's ACK.** The
+  callback gets `(null, duration, payload)`: the round trip in milliseconds and a Buffer of the
+  eight bytes the ACK echoed. It sent nothing and answered at once with a duration of `0`, so a
+  keep-alive built on it never noticed a dead connection. The arguments are checked as node
+  checks them (`ERR_INVALID_ARG_TYPE`, `ERR_HTTP2_PING_LENGTH`), a destroyed session throws
+  `ERR_HTTP2_INVALID_SESSION`, and a ping made while connecting, after `close()`, past
+  `maxOutstandingPings` or still waiting at `destroy()` is called back with
+  `ERR_HTTP2_PING_CANCEL`.
+
+**node:tls**
+
+- **`tls.setDefaultCACertificates()` is honoured by servers too.** A `requestCert` server with
+  no `ca` verifies client certificates against the replaced store, and chain completion and
+  `getPeerCertificate(true)` issuers are built from it. Only client connections followed it.
+- **A client `ca` with one PEM section that will not decode no longer fails the whole
+  connection.** What parses is used and the rest ignored, as the server side already read the
+  option.
+- **Destroying a socket whose `write` (or `end`) is parked behind a peer that stopped reading
+  ends that write at once.** It held the connection and the pending op until the peer drained
+  or closed.
+- **Upgrading a socket whose write half is shut down or busy no longer drops its read half
+  before reporting the failure.**
+- **`socket.alpnProtocol` on a client reports a negotiated name with bytes above 0x7f as it was
+  offered** instead of U+FFFD, and a client's `ALPNProtocols` refuses non-string names, as
+  node does.
+- **A malformed `pfx` is refused as malformed** ("not enough data").
+- **A client that sends part of a record header and stalls costs a server a few timer wakeups a
+  second until the handshake timeout**, not about 500.
+
+**node:crypto**
+
+- **`Cipher` and `Decipher` `update()` return their output as node does.** Every update
+  yields the bytes available at that point (complete blocks for CBC and ECB, everything for
+  CTR and GCM) and `final()` the rest, with at most one block held back. It returned an empty
+  Buffer and kept the whole message until `final()`. Output encodings split across updates
+  decode correctly, and a second `setAAD` appends. `aes-128-ecb` and `aes-256-ecb` are new.
+- **`subtle.sign` / `verify` with RSASSA-PKCS1-v1_5 take the digest from the key**, so the bare
+  algorithm name works. It failed with 'unsupported RSA verify algorithm'.
+- **`crypto.subtle` AES names what it does not implement.** A 192-bit key and a non-default
+  AES-GCM `tagLength` are `NotSupportedError` on encrypt and decrypt alike, an invalid
+  `tagLength` is `OperationError`, and `deriveBits` accepts an algorithm name in any case.
+- **`X509Certificate` accepts PEM with a leading newline, a BOM or a text preamble before the
+  BEGIN marker.**
+- **`util.types.isKeyObject` recognizes crypto `KeyObject`s.** It always answered `false`.
+- **`crypto.publicEncrypt` / `privateDecrypt` with `RSA_NO_PADDING` no longer use OAEP.**
+- **`oaepLabel` is honoured.** It was ignored, so a ciphertext made with a label did not decrypt
+  and one made by oam with a label decrypted without it.
+- **`getDiffieHellman('modp1')` returns the right prime.** It returned a wrong one.
+
+**node:zlib**
+
+- **A stream destroyed while its native stream was still being created, and a brotli one-shot
+  whose write failed, no longer leave a native stream slot open.**
+
+**node:os and process**
+
+- **`process.kill` and `os.constants.signals` use the host's signal numbers** (libc's per target
+  on unix, node's eleven on Windows). `process.kill(pid, 'SIGUSR1')` sent `SIGBUS` on macOS, and
+  signals above 15 (`SIGCONT`, `SIGSTOP`, `SIGWINCH`, ...) were refused.
+- **`process.kill(pid, 0)` reports `ESRCH` for a pid that names no process.** Every failure was
+  `EPERM`, so a liveness probe read a dead pid as alive. A child spawned with `argv0` or extra
+  stdio can be signalled by pid, and a number that is no signal is refused with `EINVAL` before
+  the pid is looked at, as kill(2) orders it.
+- **`os.networkInterfaces()` reports the host's real interfaces**, with their hardware
+  addresses, addresses and prefix lengths, instead of a fixed loopback plus one made-up `eth0` /
+  `Ethernet` entry.
+- **`os.userInfo()` returns the real uid, gid, shell and home directory on Linux and macOS** (it
+  answered Windows' -1 / -1 / null everywhere), and `os.version()` returns the kernel version
+  string there instead of the release.
+- **`os.release()` and `os.version()` no longer spawn `uname` on every call on Linux and
+  macOS.** The values are read once per process, and `os.release()` no longer needs `uname` on
+  `PATH`.
+- **On Linux, `process.memoryUsage().rss` uses the kernel's page size** instead of assuming 4096
+  bytes. It was under-reported on 16K- and 64K-page arm64 kernels.
+- **An environment entry or a command-line argument that is not valid Unicode no longer ends the
+  process.** It is decoded lossily into `process.env` / `process.argv`, as node exposes it.
+- **`Object.defineProperty(process.env, ...)` stores through the same path as assignment.** The
+  name is case-folded on Windows (no duplicate `path` beside `Path`), an empty name stores
+  nothing, and `TZ` re-reads the time zone.
+- **`process.execArgv` lists `--zero-fill-buffers`, `--allow-natives-syntax`,
+  `--js-float16array`, `--expose-internals`, `--title=`, `--input-type=` and
+  `--env-file[-if-exists]=`**, so a `fork()` child inherits them. `oam test` and the REPL set
+  `process.execArgv` too.
+- **Passwd and group lookups behind `process.setuid` / `setgid` / `initgroups` are serialized**,
+  so concurrent lookups from worker threads cannot read each other's libc record.
+- **On Windows, signal watchers are tracked per isolate.** A worker adding or dropping its own
+  `SIGINT` listener no longer takes Ctrl-C handling away from the main thread's listener.
+- **On Windows, a `process.on('SIGHUP')` listener gets the system's close grace period when the
+  console window is closed.** The control handler no longer returns at once, as in libuv; logoff
+  and shutdown events no longer raise `SIGHUP`, matching node.
+- **Crash reports no longer land in the working directory when `LOCALAPPDATA` / `HOME` are unset
+  or `OAM_CACHE_DIR` is empty.** They fall back to the system temp directory, like oam's other
+  caches.
+
+**Workers, modules, node:vm and the inspector**
+
+- **`new Worker()` throws `ERR_WORKER_INIT_FAILED`, as node does, and `oam.fork()` throws an
+  error when the OS refuses a new thread.** Both crashed the process.
+- **`worker.terminate()` resolves with the exit code (1) once `'exit'` is emitted.** `'exit'`
+  fires exactly once on every path, and `worker.stdout` / `worker.stderr` end.
+- **`worker_threads.SHARE_ENV` is the registered symbol
+  `Symbol.for('nodejs.worker_threads.SHARE_ENV')`, as in node.**
+- **`oam.fork()` behaves the same whether a pre-warmed isolate or a cold start serves it.** The
+  forked script's process `'exit'` listeners run, `'online'` is reported, the entry is resolved
+  as a worker's is, the startup option check runs, and a fatal failure reaches the parent as
+  the thrown value.
+- **A worker thread's module resolver, and its caches, are freed when the worker exits.**
+- **`require()` of a package without an `exports` map keeps walking up `node_modules` when the
+  nearest copy lacks the file**, and loads a plain `node_modules/name.js` file, as node does.
+- **An `exports` / `imports` condition whose nested target matches nothing falls through to the
+  next condition, as in node.** `{"node": {"import": ...}, "default": ...}` under `require()`
+  loads `default`; an explicit `null` still blocks.
+- **A module written after a failed `import()` of it is found by the next import.** The
+  resolver's negative probe cache made the first miss permanent for the process.
+- **`require.cache` entries for JSON modules report `loaded: true` and carry `path` / `paths`,
+  as in node.**
+- **`module.isBuiltin('node:test')` is true, `'constants'` is in `module.builtinModules`, and
+  `isBuiltin` no longer `String()`-coerces a non-string.**
+- **A typeless `.js` file that node's syntax detection runs as an ES module is no longer read
+  and prepared twice during a graph load.**
+- **Two threads storing in the transpile cache in the same clock tick can no longer publish one
+  module's output under another's key.** The temp file name carries a per-process counter.
+- **Inspector: discovery (`/json`) stays answered and a second debugger gets a 503 while a
+  session is attached.** Both queued behind the attached client.
+- **A debugger that disconnects no longer leaves the session armed.** Breakpoints and
+  `debugger;` statements stop pausing the program once the client is gone, and the next client
+  starts from a clean session.
+
+**Timers, events, streams and other globals**
+
+- **`event.target` / `currentTarget` are set inside `onabort` and the WebSocket `onopen` /
+  `onmessage` / `onerror` / `onclose` handlers.** They were null.
+- **`new Event(type, null)` and `new CustomEvent(type, null)` no longer throw.** A null init is
+  accepted like `undefined`, as in node.
+- **`AbortSignal.any()` no longer leaves a strong listener per call on each source.** Sources
+  hold the result weakly, and the listeners are removed when it aborts or is collected.
+- **`structuredClone` (and `postMessage`) of an `Error` keeps its built-in class, message, stack
+  and cause.** A `DOMException` clones as a `DOMException`, and any other class instance clones
+  to a plain object, as in node.
+- **`ReadableStream` ends its reads cleanly.** A `pipeTo()` that ended while its read was
+  pending (an abort, or a destination error with `preventCancel`) made the next
+  `controller.enqueue()` throw and lose the chunk; an async iterator kept the stream locked
+  after iteration finished or a read rejected; and cancelling both branches of a default
+  `tee()` never cancelled the source, while a cancelled branch kept queueing chunks.
+- **`TextEncoderStream` encodes a surrogate pair split across two chunks as one character.** It
+  wrote two U+FFFD.
+- **`TextDecoder` strips a UTF-8 BOM that is split across `stream: true` chunks or follows an
+  empty first chunk.**
+- **`globalThis.performance` is `perf_hooks.performance`, one object.** Marks made on the global
+  reach `PerformanceObserver` and `perf_hooks`, and are `PerformanceEntry` instances.
+- **`performance.measure` follows node's option rules.** `{ end, duration }` derives the start,
+  an end mark is honoured without a string start, a missing mark is a `SyntaxError`
+  `DOMException`, and node's option-combination errors are thrown.
+- **`navigator.hardwareConcurrency` reports `os.availableParallelism()`** instead of a constant
+  1.
+- **`Timeout._repeat` is the interval period (null for a timeout) and `_idleTimeout` the coerced
+  duration, as in node.** A new `_repeat` set from an interval's callback re-arms it at that
+  period.
+- **`clearTimeout` / `clearInterval` with a timer's id as a string** (a handle used as an object
+  key) **clears the handle and drops it from the active-resource list.**
+- **WebSocket client: a close the server starts gets its Close reply**, so the server sees a
+  clean closing handshake instead of 1006.
+- **`WebSocket.close()` while CONNECTING is no longer lost.** The socket never opens or fires
+  `'open'`; it fails the connection as node does (`'error'`: "Connection was closed before it
+  was established.").
+- **WebSocket client: `wss://` verifies the server with the same trust as `fetch`** (the
+  platform verifier plus `NODE_EXTRA_CA_CERTS`) instead of the bundled Mozilla roots alone.
+
+**Buffer, util, assert and the smaller modules**
+
+- **Every `ERR_INVALID_ARG_TYPE` 'Received ...' tail comes from one renderer that matches
+  node.** Long strings keep their closing quote, symbols and bigints are shown whole, and an
+  anonymous function reads `function `.
+- **`Buffer#indexOf` with a fractional `byteOffset` finds string and `Buffer` needles.** The
+  offset truncates, as in node.
+- **`assert.deepStrictEqual` / `deepEqual` / `partialDeepStrictEqual` and
+  `util.isDeepStrictEqual` no longer report unequal `Set`s or `Map`s as equal** when a member
+  pair that compared unequal is retried against the same candidate. Deep equality of `Set`s and
+  `Map`s with primitive members or keys is linear instead of quadratic.
+- **`assert.throws` / `assert.rejects` use the caller's message when a validation function
+  returns non-true or when the caught error is itself an `AssertionError`, as in node.**
+- **`util.format` / `util.formatWithOptions` keep their own inspect options when an
+  `inspect.custom` hook calls `util.format` mid-string.**
+- **`punycode.toASCII` / `toUnicode` keep an email local part, treat U+3002 / U+FF0E / U+FF61 as
+  label separators, and throw punycode.js's `RangeError`s**, with its messages, for a label that
+  does not decode.
+
+**undici**
+
+- **`undici.request()`: stopping an iterable or `ReadableStream` request body returns its
+  iterator at once**, so a stream body parked in a read is cancelled and unlocked.
+- **`undici.stream()`: a response body that fails destroys the factory's writable with the
+  error** instead of leaving it open.
+
+**oam serve, oam.serve and the CLI**
+
+- **`oam.serve` accepts a plain-object or pair-list `headers` on a returned response.** A
+  response that cannot be sent is answered with a 500 instead of leaving the request open
+  behind an unhandled rejection.
+- **`oam.serve` cancels a streamed response body's source when the client disconnects** (or a
+  push fails), so the stream's `cancel()` runs.
+- **`oam.serve` builds a parseable `request.url` for an IPv6 hostname** (bracketed) and uses the
+  request's `Host` header as the authority, falling back to the bound address.
+- **`oam serve --workers N`: `--port 0` binds an OS-chosen port** instead of 3000. A stopped
+  worker leaves the rotation and its in-flight requests get a 502 (the pool exits 1 when no
+  worker is left), and handler paths containing a quote or, on unix, a backslash work.
+- **A compiled binary or `oam serve --workers` that ends through `process.exit()` no longer
+  leaves its `oam-embed-*` / `oam-serve-*` temp directory behind.**
+- **`oam run --env-file run app.ts` no longer loses the `run` subcommand.** A flag value equal
+  to the subcommand's name was removed with it.
+- **`--env-file` / `--env-file-if-exists`: a file that exists but does not load (a directory, an
+  unreadable file) is reported with the error's own message** instead of `not found`.
+- **`oam run --record` writes its trace when the program ends through `process.exit()`** or any
+  other hard exit; it wrote nothing. A trace that cannot be fully written (a full disk) is
+  reported on stderr instead of being silently truncated.
+- **Replay mode no longer spins the event loop at full CPU while a real op is still in flight**,
+  or a timer lies beyond the shifted clock; it blocks on the op channel.
+- **`--max-old-space-size`: the `OAM-RT-OOM` banner names where the cap was set, and a value
+  node refuses is refused in node's words (#472).** The banner says `set by
+  --max-old-space-size`, `set by NODE_OPTIONS --max-old-space-size` or `set by OAM_MAX_HEAP_MB`;
+  it said `OAM_MAX_HEAP_MB` for all three. An unusable value (`abc`, `1.5`) or a missing one
+  exits 9 with node's `illegal value for flag` lines, from argv or `NODE_OPTIONS` (which
+  ignored it), instead of a clap `unexpected argument` (exit 2); a negative one prints V8's
+  out-of-bounds lines and runs on. The flag no longer exports `OAM_MAX_HEAP_MB`, so a spawned
+  child process does not see the variable, and a child of `oam --max-old-space-size=N` does
+  not take the parent's cap; a cap from `NODE_OPTIONS` still reaches children through
+  `NODE_OPTIONS`, as in node.
+- **`oam --help`: the permission example under the node compatibility flags is a command that
+  runs.**
+- **REPL: an apostrophe in a comment or a regex no longer traps the prompt in continuation
+  mode.** `.exit` works mid-input and `.break` drops a multi-line input. An uncaught throw from
+  an op completion settled during the idle wait is delivered on that tick instead of a later
+  one.
+
+**oam check and the type-check daemon**
+
+- **An empty or relative `OAM_CACHE_DIR` / `XDG_CACHE_HOME` / `HOME` / `LOCALAPPDATA` no longer
+  puts the type-check cache in the working directory** (daemon state, build-info, oam's
+  declarations). A relative `OAM_CACHE_DIR` is made absolute at start-up.
+- **`oam check` no longer overrides the file set of a tsconfig whose package `extends` oam's own
+  lookup cannot find** (one resolved through package.json `exports`, say). Such a project is
+  checked against its own tsconfig, without oam's declarations.
+- **A daemon that stops answering mid-check falls back to one-shot at once.** It spawned a
+  second daemon, waited a second full timeout and recorded a false 'did not come up' spawn
+  failure.
+- **One unreadable subdirectory no longer makes a project permanently uncacheable in the
+  daemon**, and a tree too large to fingerprint no longer pays an extra `tsgo` listing run on
+  every check.
+- **On Unix, stopping or retiring a wedged daemon also ends its in-flight `tsgo`**, and
+  cancelling a check kills the whole `tsgo` process tree rather than only direct children. The
+  daemon runs in its own process group, so Ctrl+C in the terminal that happened to start it no
+  longer kills it.
+- **Wrapper configs under `<cache dir>/ts-decls/projects` are pruned once their project's
+  tsconfig is gone.**
+
+**oam install**
+
+- **A tarball whose root directory is not named `package/` extracts correctly.** The first path
+  component is stripped whatever it is called, as npm does.
+- **On Windows, lifecycle scripts run through `cmd /d /s /c` with the script passed verbatim**,
+  so a script containing double quotes is no longer mangled.
+- **`oam install --precompile` no longer follows directory symlinks inside a package**, so a
+  package that links back into its own tree cannot stall the install.
+
+**oam:mcp, oam:ai and the test runner**
+
+- **`oam:mcp`: `serve({ port: 0 })` binds an OS-chosen port** instead of falling back to `$PORT`
+  / 3000.
+- **`oam:mcp`: a tool, prompt or resource handler that returns `undefined` yields a valid empty
+  result** instead of a text block with no `text` field.
+- **`oam:mcp`: an SSE client that disconnects after sending a message no longer leaves a
+  30-minute idle timer holding its response**, and a late reply is no longer written to an
+  ended stream.
+- **`oam:mcp`: HTTP request bodies are decoded as one UTF-8 stream.** A character split across
+  chunks was corrupted.
+- **`oam:ai`: `parseSSEStream` accepts CRLF and lone-CR line endings.** A CRLF stream yielded
+  nothing until the end, with `'\r'` left in every value.
+- **`oam:ai`: leaving `parseSSEStream` / `streamChat` early (a `break`, or `streamChat`'s
+  `[DONE]`) cancels the response body.**
+- **`oam:ai`: `runToolLoop` replies to OpenAI-shaped tool calls with `role: "tool"` messages and
+  sends all Anthropic `tool_result`s of a turn in one user message.**
+- **`oam test`: `afterEach` hooks run even when a `beforeEach` hook throws.** `beforeAll` /
+  `afterAll` no longer run for skipped or fully filtered suites, and a throwing `beforeAll`
+  fails only that suite's tests (reported as 'beforeAll failed: ...') while sibling suites
+  still run.
+- **`oam test`: `test.todo` entries obey `--filter`, and `describe.only` nested in
+  `describe.skip` stays skipped.** Failure stacks keep the error header and the user frames
+  whose text mentions `node:`, `oam:` or `test_runner`.
+
+**N-API**
+
+- **On Windows, `napi_fatal_error` is exported from oam.exe**, so an addon importing it loads.
+  It was implemented but missing from the export list.
+- **An addon's library destructor can no longer be handed a freed `napi_env`.** At a normal
+  exit oam freed every addon's env and then unloaded the libraries, so a C++ static destructor
+  (or `DllMain` on detach, or a `Drop` in a Rust static) that called N-API with the env it had
+  saved read freed memory. Addon libraries loaded on the main thread are now never unloaded, as
+  in node, and a worker's are unloaded only after its cleanup hooks and finalizers have run; an
+  env stays allocated for as long as the library that was given it is mapped, and a call made
+  with it that late is answered `napi_invalid_arg`. An addon that a cleanup hook or a teardown
+  finalizer tries to load (through JS it calls) is refused, since its own hooks and finalizers
+  could no longer run before its library was unloaded; and a `napi_ref` minted before an env's
+  release stays invalid afterwards instead of resolving to a reference minted after it.
+- **An exception thrown by JS inside a napi call is the env's pending exception.**
+  `napi_is_exception_pending` / `napi_get_and_clear_last_exception` see and clear it, and
+  `napi_set_property` / `napi_set_named_property` / `napi_set_element` report a throwing setter
+  instead of `napi_ok`.
+- **`napi_create_external_buffer` and `napi_create_external_arraybuffer` alias the addon's
+  memory instead of copying it.** The supplied finalizer runs after the `ArrayBuffer` is
+  collected; a null pointer with length 0 is an empty buffer and one with a length is
+  `napi_invalid_arg`.
+- **`napi_call_function` and `napi_new_instance` answer `napi_invalid_arg` for a null `argv`
+  with a non-zero count or a null argument.**
+- **`napi_create_typedarray` and `napi_create_dataview` validate offset alignment and length
+  against the `ArrayBuffer`**, leaving a `RangeError` with node's
+  `ERR_NAPI_INVALID_TYPEDARRAY_ALIGNMENT` / `_LENGTH` / `ERR_NAPI_INVALID_DATAVIEW_ARGS` code
+  pending.
+- **`napi_create_int64` always returns a Number, as in node.** It returned a BigInt beyond
+  +/-(2^53-1).
+- **`napi_get_value_string_utf8` truncates at a character boundary** instead of splitting a
+  UTF-8 sequence.
+- **An addon function's callback record is released after the function is collected.** Every
+  function made by `napi_create_function`, `napi_define_class` or a method / getter / setter
+  descriptor kept its record until the runtime exited, so an addon that creates functions in a
+  loop grew without bound. The record now goes at the addon's next native entry after the
+  collection, as a wrap's finalizer does.
+
+**npm launcher and installers**
+
+- **npm launcher: a glibc Linux host that also has the musl loader installed** (the Debian /
+  Ubuntu `musl` package) **is no longer refused as a musl host.**
+- **install: a failed license download no longer reports the previous install's license files
+  as this release's**, and a release that ships none removes the stale ones.
+- **install.ps1: an upgrade no longer fails when `oam.exe.old` is still held by a running
+  oam.** The old binary moves aside to a unique name, and earlier move-asides are swept
+  best-effort.
+- **install.ps1: appending the install directory to the user `PATH` no longer expands `%VAR%`
+  references in existing entries.** `HKCU\Environment` is read and written unexpanded, keeping
+  `REG_EXPAND_SZ`.
+- **The installers' failure messages no longer suggest the repo is private**, and `GH_TOKEN` is
+  documented as an optional fallback.
+- **npm packaging scripts.** `npm/stage.mjs` refuses a POSIX package on Windows before any file
+  is copied and gains a `--root <dir>` destination; `npm/sync-packages.mjs --check` no longer
+  exits 0 without checking when it is invoked through a junction or symlinked path, and a
+  valueless `--root` is refused.
+
+**Release and CI scripts**
+
+- **release-local.sh's changelog gate refuses a version heading without a `YYYY-MM-DD` date.**
+  0.19.5 was tagged as '- TBD'.
+- **release-local.sh stops the release when the sidecar matrix ends with no report** (stage lock
+  held, fixture not clearable, release binary not runnable) instead of warning once and
+  publishing.
+- **release-local.sh: `OAM_RELEASE_LEG_ATTEMPTS=00` no longer skips the local gate silently**,
+  and a local-gate retry restores the receipts the failed attempt rewrote, so it reuses the
+  step ledger instead of running every step again.
+- **Checks that piped into `grep -q` under `pipefail` match in the shell instead.** The
+  post-publish downloads-page check could read a large correct page as stale, `check-vendor.sh
+  --build` could report a heavily-warning feature set as warning-free, and ci-local.sh step 14
+  could skip the miri gate.
+- **release-upload-local-arm64.sh smokes the staged win-arm64 asset**, checks it for static CRT
+  linkage and runs the console raw-mode e2e before it is checksummed and uploaded.
+- **build-platforms-tailnet.sh holds a lock on the Mac from before the sync until exit.** A
+  second run on the same directory stops `BUSY` instead of replacing the tree under a running
+  build. build-remote.sh's serial `cargo test --workspace` ceiling on the release legs is 30
+  minutes instead of 15 (`OAM_REMOTE_TEST_TIMEOUT=<secs>` overrides it).
+- **bump-taps.sh refuses to run when the shared tap checkout is ahead of origin by commits
+  touching files other than its own manifest.**
+- **ci-local.sh rejects an unknown argument (exit 2)** instead of silently running the full
+  gate; check-control-bytes.sh's `control-byte-ok: allow` waiver must be a whole line; and
+  gc-target.sh reports only what it actually deleted.
+- **The MCP sidecar matrix fails loudly.** Unknown flags and unknown or empty `--only` names exit
+  2, a truncated or BOM-prefixed root package.json is a SKIP row instead of a crash with no
+  report, a tool missing from oam's `tools/list` is put to the node control before it is blamed on
+  upstream, an inherited launcher `*_RUNTIME` switch is scrubbed from both arms by name, the
+  stage lock is no longer taken over while another run is still writing its pid, and leftover
+  children of a sidecar that exits on its own are cleaned up on Windows.
+
+**Benchmarks and the conformance harness**
+
+- **bench/results.json records each runtime's binary file name** instead of its absolute local
+  path.
+- **`xtask bench` fails early and cleans up.** An unknown `--case` name fails before the build,
+  the temp directory is removed on every exit, the mcp-* cases apply the per-sample timeout to
+  every response and kill the server on every exit path, `ts-cold-start` pins
+  `OAM_TRANSPILE_CACHE` on every oam row, and `PATH` lookup on Windows tries `.exe` / `.cmd` /
+  `.bat` before the bare name.
+- **The wedge demo converges and cleans up again.** `agent-loop.mjs` takes the type diagnostic
+  from the `oam_check` MCP tool, all three entry points stop their daemon and remove the temp
+  copy on exit, and the acts assert their output instead of a wall-clock comparison.
+- **A timed-out conformance, node-suite or bench case whose descendant still holds its stdout or
+  stderr no longer hangs the harness.** The readers are abandoned after a 2 s grace and the
+  output captured so far is reported.
+- **node-suite runs are stricter about their own inputs.** A stale `deliberate` or `partialSkip`
+  manifest entry, an unreadable manifest, an unknown `ratchet` key or a non-integer limit is an
+  error; a test that cannot be started ends the run before the receipts are written; a pass
+  that needed a retry is named with its attempt count (`retriedPasses`); and the colour
+  environment variables are removed from each test's environment, so the pass count no longer
+  depends on the launching terminal.
+- **Conformance gates report more.** Builtin export parity reports `global:` shapes as globals
+  and counts module exports and global properties separately, surface-gap names that neither
+  node nor oam exports are reported, and a `declare module "oam:x"` block the oam-modules runner
+  does not probe fails the oam-module-types gate.
+
+**Docs**
+
+- **NOTICE attributes the libuv code ported into `os.cpus()` / `os.loadavg()`, and carries the
+  BSD-3-Clause texts for the V8-bundled partition_alloc, rust, googletest, jinja2 and
+  markupsafe.** That section was an empty heading.
+- **docs/cli-reference documents `OAM_GRAPH_PREFETCH` and `OAM_SKIP_PATH_SHADOW`, lists
+  `--max-old-space-size` with the node flags**, and no longer presents the build-time
+  `OAM_DEP_VERSIONS` / `OAM_GIT_SHA` as runtime variables.
+- **docs/node-divergences records three more limits.** `process.kill` delivers a real signal
+  only to this process and its own children; Worker messages and `workerData` travel as JSON,
+  not a structured clone; and the heap cap (the flag, `OAM_MAX_HEAP_MB`, or the
+  container-derived default) is per isolate, so a program with busy workers under a container
+  limit should set a per-isolate cap that fits.
+- **why-oam and the blog post list all four of the ten benchmark rows Bun wins**
+  (http-keepalive-latency included), and why-oam no longer says oam is not a test runner or an
+  installer; the claim is limited to bundling and full package management.
+- **The oamjs README documents that signal forwarding is POSIX-only**, and that on Windows the
+  launcher must be stopped by closing stdin, not by killing its PID. BENCHMARKS.md labels the
+  mcp-idle-rss row (MB) instead of leaving it under 'All times in milliseconds'.
+- Tests and docs were corrected throughout: assertions that could not fail were pinned to
+  values, unbounded test waits were bounded, the shared self-signed test certificate was
+  reissued (valid 2025-2125), duplicate conformance case numbers were renumbered, the build-time
+  permission audit covers worker creation, and comments and reference docs that no longer
+  matched the code were corrected.
+
+### Security
+
+**oam CLI**
+
+- **When the working directory is not writable, `oam -e` / `--eval` writes its entry file into
+  a new directory of its own under the system temp directory** (owner-only on unix). A
+  compiled executable's embedded source and `oam serve --workers`' generated files get the
+  same kind of directory.
+
+**fetch and undici**
+
+- **`undici.request()` follows redirects only when `maxRedirections` asks it to, as undici
+  does.** The value comes from the request or, without one, its dispatcher; with neither, the
+  first 3xx is the response.
+- **`undici.request()` redirects follow undici's own redirect rules rather than `fetch`'s.** A
+  300 with a `Location` is followed, a `Location` with userinfo is followed without it, and
+  fetch's 20-redirect count and bad-port list do not apply.
+- **A request's `minVersion` / `maxVersion` TLS bounds are its own and hold across a redirect
+  from http to https.**
+- **A fetch resumed after a custom `lookup` re-checks every answered address against the net
+  permission**, also for a redirect hop with no port to name.
+- **oam's internal fetch hooks are no longer reachable from user code** (no
+  `__oamFetchInternal` global).
+
+**node:http**
+
+- **http server: a request body whose `Content-Length` is over the size cap is answered with
+  413 without being buffered, and the client reads the 413 rather than a reset.** A buffered
+  body counts against the server-wide body budget as it arrives; one that would take the
+  budget over is answered with 503.
+
+**The inspector**
+
+- **Inspector: a WebSocket upgrade must be made at the target's own `/<id>` path, and a request
+  whose `Host` header is neither an IP address nor `localhost` is answered with 400, as in
+  node.**
+
+**node:tls and node:crypto**
+
+- **tls: a self-signed certificate given through `ca`, `NODE_EXTRA_CA_CERTS`,
+  `tls.setDefaultCACertificates()` or a `pfx` anchors a chain only when its key usage and
+  extended key usage let OpenSSL take it as a CA for that purpose, as in node.** A chain that
+  ends at one that does not fails with node's error code.
+- **Classic Diffie-Hellman (`createDiffieHellman`, `getDiffieHellman`) computes its key
+  agreement and public keys in fixed-width Montgomery arithmetic over the group's
+  private-value width, and draws private values the way OpenSSL does** (the RFC 7919 length
+  for a known group).
+- **node:crypto: `Hash`, `Hmac`, `Cipher` and `Decipher` objects that are never finalized
+  release their native state when collected.**
+- **node:crypto: an AES-GCM `Cipher` / `Decipher` releases its native state at `final()`.**
+- **node:crypto: a malformed public key is refused with an error.** Every DER length in it is
+  checked against the input before it is used.
+- **`crypto.subtle`: a `CryptoKey`'s material is released when the key is collected.**
+
+**node:zlib, node:net, node:child_process and util**
+
+- **node:zlib: a sync write checks its output offset and length against the view it was
+  given**, and throws a `RangeError` for a span outside it before any input is consumed.
+- **`net.BlockList#check` applies `addRange` and `addSubnet` rules.**
+- **child_process: the `fork()` / `stdio: 'ipc'` channel accepts only the child it was created
+  for.** The child presents a per-child token when it connects; any other connection is
+  closed.
+- **`util.parseArgs` follows node's defaults and returns null-prototype `values`.** It is a
+  port of node's implementation, with node's errors; under the default `strict: true`,
+  `allowPositionals` now defaults to `false`, so a positional argument throws unless it is
+  allowed.
+
+**N-API**
+
+- **N-API: `napi_fatal_error`, `napi_create_function` and `napi_define_class` honour their
+  length arguments.** A string given with an explicit length is read to that length and need
+  not be NUL-terminated. As in node, `napi_create_string_utf8` / `_latin1` / `_utf16` and
+  `napi_define_class` answer `napi_invalid_arg` for a length past `INT_MAX` before reading the
+  text; the string constructors accept a null text with length 0 (making `""`);
+  `napi_define_class` refuses a null name or constructor, `napi_create_function` a null
+  callback, and both definers a property count with no descriptor array (`napi_define_properties`
+  before it looks at its target). Descriptor methods are named as in node: a `napi_define_class`
+  prototype method after its string key, every other descriptor function unnamed.
+
+**Permissions**
+
+- **Permission checks refuse when an isolate has no permission state.**
+- **`oam:permissions` `query()` reads Deno's `host`, `variable` and `command` descriptor keys**
+  for `net`, `env` and `child`.
+
+**oam:mcp**
+
+- **`oam:mcp`: each HTTP client has its own session id and initialisation state** -- one per
+  SSE connection, and one per `Mcp-Session-Id` on the streamable-HTTP endpoint.
+
+**oam install and trust**
+
+- **`oam install` refuses a lockfile entry whose key is not a package path inside the
+  project's `node_modules`.**
+- **`oam trust` decisions apply to a package by its own name.** A package's install scripts
+  run only when its manifest's `name`, and a registry `resolved` URL, agree with the name the
+  lockfile gives it; otherwise an `OAM-PKG0007` warning says so.
+- **`oam install` checks an `integrity` value that lists several hashes against its strongest
+  algorithm, and warns when a lockfile entry has no `integrity` value.**
+- **`oam install` refuses a tarball entry that resolves outside its package directory**,
+  including one reached through a symlink an earlier entry created.
+- **`oam install` links only top-level packages' bins into `node_modules/.bin`, and checks bin
+  names and targets.** A bin name is one file name inside `.bin` and its target stays inside
+  its package; an unusable entry is an `OAM-PKG0005` warning.
+- **An empty or relative `XDG_CONFIG_HOME`, `HOME` or `USERPROFILE` is treated as unset when
+  locating the global trust file.**
+
+**oam check and the type-check daemon**
+
+- **Type-check daemon: a request is bounded in size and time, the state file that holds the
+  daemon's token is created readable by its owner only, and on unix a state directory another
+  account can write to is not read from.**
+
+**Installers and release scripts**
+
+- **The installers and `oam self-update` verify the license files they install against the
+  release's SHA256SUMS.** A release whose SHA256SUMS does not list them (0.19.5 and earlier)
+  installs without them, with a note saying where to read them. `oam self-update` also refuses
+  a release whose SHA256SUMS lists its binary more than once, as the installers do.
+- **build-platforms-tailnet.sh refuses an `OAM_REMOTE_DIR` that is not one plain directory
+  name.**
+
+## [0.19.5] - 2026-11-08
+
+### Added
+
+- **`--max-old-space-size=N` accepted on the command line and in `NODE_OPTIONS` (#472).** The
+  flag was silently ignored. It now maps to
   oam's `OAM_MAX_HEAP_MB` knob — same V8 heap cap, same OOM banner, same cgroup-aware
   default. Both `--max-old-space-size=N` and `--max-old-space-size N` forms work, before or
   after the subcommand (`oam run --max-old-space-size=512 app.cjs`). A value from argv wins
@@ -27,17 +1081,26 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `process.execArgv` so child processes inherit it.
 
 ## [0.19.4] - 2026-11-04
-- Addressed Issue #471: the node compatibility flags
 
 ### Fixed
 
+- **The node compatibility flags are accepted after the subcommand (#471).**
+  `oam run --throw-deprecation app.ts` died on clap's "tip: to pass '--throw-deprecation' as a
+  value, use '-- --throw-deprecation'", and neither reading of that tip worked; only
+  `oam --throw-deprecation run app.ts` did. The node-style runtime flags written between a
+  subcommand and the file are now read exactly as the ones before the subcommand are, for every
+  subcommand (`oam serve --env-file=.env app.ts` too), a spaced value moving with its flag, and
+  `process.execArgv` lists them either way. `--` after the subcommand still starts the script's
+  arguments, an unknown flag still gets clap's own error, and a flag after the file is not
+  a runtime option. `oam --help` now ends with a "Node compatibility flags" block naming the set and
+  both positions.
 - **`--json` written before the subcommand (or before a bare script or `-e`) is honored
   everywhere.** The #471 pre-parse reads the flag as transparent and skips over it, but the
   argv it then handed clap started at the scan position, so `oam --json cache info` and
   `oam --json run x` ran as if the flag had never been given (human-format output, pretty
   errors). The skipped tokens are now carried through to clap, and the paths the pre-parse
   dispatches itself -- a bare script and `--eval` -- render JSONL too.
-    
+
 ## [0.19.3] - 2026-11-03
 
 ### Added
@@ -224,7 +1287,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   Whether a frame end stops the body is judged against the room node's 16 KiB output buffer has
   left after earlier reads, as node keeps it from one write to the next, not a fresh 16 KiB.
 
-## [0.19.1] - 2026-10-13
+## [0.19.1] - 2026-10-21
 
 ### Changed
 
@@ -269,8 +1332,6 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   own API state, as in node. The cache stays on by default, unlike node's; see
   `docs/node-divergences.md`. Conformance cases 438-439.
 
-### Added
-
 - **`--trace-uncaught`, and the hint that names it.** oam refused the flag, and a fatal
   report of a thrown primitive (`throw 42`, `throw null`) ended at the value, without node's
   `(Use \`node --trace-uncaught ...\` to show where the exception was thrown)`. The flag is
@@ -285,8 +1346,6 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   above those two still has no oam counterpart; see docs/node-divergences.md #54.
   Conformance case 573.
 
-### Added
-
 - **`require()` of an ES module, with node 22's semantics.** Every such `require()` threw
   `ERR_REQUIRE_ESM` while `process.features.require_module` said `true`. The graph now loads and
   evaluates synchronously inside the `require()`, sharing one module map with `import()` and
@@ -299,6 +1358,35 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `require()`. `--trace-require-module` gives node's once-per-process warning, silent by default.
   `require.cache` is now node's `Module._cache`, shared and live, ES modules included. A CommonJS
   dependency still runs before the ES modules ahead of it; see docs/node-divergences.md.
+
+- **Native `fs.watch` and `fs.promises.watch`.** Watchers sit on the OS's change notifications
+  (ReadDirectoryChangesW and FSEvents through the `notify` crate; on Linux one inotify instance per
+  run shared by every watcher) as node's do through libuv: `rename` and `change` events naming the
+  entry relative to the watched directory, `recursive: true` on every platform, every `encoding`
+  including `'buffer'`, `signal`, and `ref()` / `unref()` / `persistent: false` deciding whether a
+  watcher keeps the process alive. `fs.promises.watch` is node's async generator, with `maxQueue`
+  and `overflow`. Each event is its own callback, as in node: `process.nextTick` and the microtasks
+  drain after every listener call, and a listener's throw is an uncaught exception. `fs.watch`
+  polled the path's mtime every 100 ms: no `rename`, nothing from inside a directory, and a watcher
+  that kept the process alive however it was unref'd. Conformance cases 421 and 422; what still
+  differs is in docs/node-divergences.md.
+
+- **`node:zlib` zstd, as Node v22.22.2 has it.** `zstdCompress`, `zstdCompressSync`,
+  `zstdDecompress`, `zstdDecompressSync`, `createZstdCompress`, `createZstdDecompress`, the
+  `ZstdCompress` / `ZstdDecompress` classes and the `ZSTD_*` constants, over libzstd 1.5.7
+  -- the library Node links, through the `zstd-safe` binding -- so the compressed bytes,
+  every `ZSTD_c_*` / `ZSTD_d_*` parameter and the `ZSTD_error_*` errors are Node's. The
+  streams run Node's own `ZlibBase` loop, so its quirks match too: a one-shot decompress
+  returns the first frame only, a frame cut short decodes without error, and `flush()`,
+  `reset()` and `close()` work. `process.versions.zstd` reports the linked libzstd.
+  Conformance cases 435-437.
+- **`--trace-warnings` and `--trace-deprecation`, and node's hint that names them.** Both flags
+  are accepted on the command line, in `NODE_OPTIONS` and in a `Worker`'s own `execArgv`, set
+  `process.traceProcessWarnings` /
+  `process.traceDeprecation`, and make the default warning printer write the warning's stack (for
+  every warning, or for deprecations only) in place of its one-line text. Without them, the first
+  warning printed carries node's one-time hint, `(Use \`oam --trace-warnings ...\` to show where
+  the warning was created)`, naming the flag for its kind (#364).
 
 ### Fixed
 
@@ -348,8 +1436,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `FD_CLOEXEC` on the inherited fds 3 and up (never on 0-2, which `stdio: 'inherit'` children
   receive in place). oam's own reads and writes of an inherited fd, and a child explicitly given one
   (`stdio: [..., 4]`), are unaffected. Descriptors at 64 and above are not covered
-  ([node-divergences #19](docs/node-divergences.md)). The fix is tested on Windows; the unix half
-  has not yet been built or run on unix, and its test stays ignored until it has.
+  ([node-divergences #19](docs/node-divergences.md)).
 - **`fs.opendir`, `fs.opendirSync` and `fs.promises.opendir` honour `recursive`, as node's do
   (#286).** The `Dir` took one listing with one parent for all of it and ignored every option, so
   `{ recursive: true }` listed the top level only. It now walks as node v22.22.2's does. Handing out
@@ -429,7 +1516,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   node evaluates an ES module inside a microtask drain, so the promise jobs its top level queues,
   and the code after a top-level await they settle, run before any tick. oam ran the ticks first.
   Now the main module's and a worker's match node; CommonJS and timer callbacks were already right.
-  A `.js` or `.ts` file with no package.json "type", which oam runs as an ES module, gets the order
+  A `.js` or `.ts` file with no package.json "type" gets the order
   node gives it, decided by node's own test of the syntax: an ES module's if the file has an import
   or export (`export {}` too), a top-level await, `import.meta`, or a top-level declaration of
   `require`, `module`, `exports`, `__filename` or `__dirname`; CommonJS's if it has none. And no
@@ -992,18 +2079,6 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   callback that throws there is offered its throw once more, origin `unhandledRejection`
   (its exit 7 stands only if it throws again), where oam ended the run at the first. What
   still differs is docs/node-divergences.md #52 and #54. Conformance case 574.
-
-### Performance
-
-- **`stat` and `readdir` results no longer make a JSON round trip.** `stat`, `lstat` and `fstat`
-  (sync, callback, promise, `FileHandle`) and `readdir` / `opendir` listings came back as JSON the
-  native serialized and V8 parsed back on every call. A stat is now a `StatRecord` -- node's fourteen
-  `Stats` values as doubles plus the kind, the ids flag and the Windows reparse tag, integers exact --
-  which a sync stat writes into one reused `Float64Array` (as node's binding fills `statValues`, so no
-  allocation per call) and an async stat resolves as a `Float64Array` over a buffer of its own; the JS
-  side builds `Stats` / `BigIntStats` from it. A listing is two arrays, names and internalized kind
-  names, so a plain `readdir` returns the names array as it is. The win is largest for `readdir` on a
-  wide directory and for the sync stat forms, which now allocate nothing per call.
 - **File streams open, read, write and close through `options.fs`, or the live `fs.*`, as node's
   do.** `fs.createReadStream` and `fs.createWriteStream` opened, read, wrote and closed natively, so
   neither an `options.fs` nor a function assigned over `fs.open`, `fs.read`, `fs.write`,
@@ -1028,55 +2103,19 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `fs.promises.cp` making a missing destination parent, and the async forms' `ENOTDIR` from
   `mkdir`, are now guarded by a conformance case. (#360)
 
-### Added
+### Performance
 
-- **Native `fs.watch` and `fs.promises.watch`.** Watchers sit on the OS's change notifications
-  (ReadDirectoryChangesW and FSEvents through the `notify` crate; on Linux one inotify instance per
-  run shared by every watcher) as node's do through libuv: `rename` and `change` events naming the
-  entry relative to the watched directory, `recursive: true` on every platform, every `encoding`
-  including `'buffer'`, `signal`, and `ref()` / `unref()` / `persistent: false` deciding whether a
-  watcher keeps the process alive. `fs.promises.watch` is node's async generator, with `maxQueue`
-  and `overflow`. Each event is its own callback, as in node: `process.nextTick` and the microtasks
-  drain after every listener call, and a listener's throw is an uncaught exception. `fs.watch`
-  polled the path's mtime every 100 ms: no `rename`, nothing from inside a directory, and a watcher
-  that kept the process alive however it was unref'd. Conformance cases 421 and 422; what still
-  differs is in docs/node-divergences.md.
-
-### Added
-
-- **`node:zlib` zstd, as Node v22.22.2 has it.** `zstdCompress`, `zstdCompressSync`,
-  `zstdDecompress`, `zstdDecompressSync`, `createZstdCompress`, `createZstdDecompress`, the
-  `ZstdCompress` / `ZstdDecompress` classes and the `ZSTD_*` constants, over libzstd 1.5.7
-  -- the library Node links, through the `zstd-safe` binding -- so the compressed bytes,
-  every `ZSTD_c_*` / `ZSTD_d_*` parameter and the `ZSTD_error_*` errors are Node's. The
-  streams run Node's own `ZlibBase` loop, so its quirks match too: a one-shot decompress
-  returns the first frame only, a frame cut short decodes without error, and `flush()`,
-  `reset()` and `close()` work. `process.versions.zstd` reports the linked libzstd.
-  Conformance cases 435-437.
-- **`--trace-warnings` and `--trace-deprecation`, and node's hint that names them.** Both flags
-  are accepted on the command line, in `NODE_OPTIONS` and in a `Worker`'s own `execArgv`, set
-  `process.traceProcessWarnings` /
-  `process.traceDeprecation`, and make the default warning printer write the warning's stack (for
-  every warning, or for deprecations only) in place of its one-line text. Without them, the first
-  warning printed carries node's one-time hint, `(Use \`oam --trace-warnings ...\` to show where
-  the warning was created)`, naming the flag for its kind (#364).
+- **`stat` and `readdir` results no longer make a JSON round trip.** `stat`, `lstat` and `fstat`
+  (sync, callback, promise, `FileHandle`) and `readdir` / `opendir` listings came back as JSON the
+  native serialized and V8 parsed back on every call. A stat is now a `StatRecord` -- node's fourteen
+  `Stats` values as doubles plus the kind, the ids flag and the Windows reparse tag, integers exact --
+  which a sync stat writes into one reused `Float64Array` (as node's binding fills `statValues`, so no
+  allocation per call) and an async stat resolves as a `Float64Array` over a buffer of its own; the JS
+  side builds `Stats` / `BigIntStats` from it. A listing is two arrays, names and internalized kind
+  names, so a plain `readdir` returns the names array as it is. The win is largest for `readdir` on a
+  wide directory and for the sync stat forms, which now allocate nothing per call.
 
 ## [0.19.0] - 2026-10-11
-
-### Fixed
-
-- **A nextTick batch interrupted by a handled throw waits for the pending timer, as Node's
-  does.** The stranded-tick backstop drained a deferred batch at the first idle check --
-  BEFORE the loop waited for an already-scheduled timer, so `process.nextTick(() => { throw })
-  ; process.nextTick(...) ; setTimeout(...)` with an `uncaughtException` handler printed the
-  batch's remainder ahead of the timer. The order was a race against the timer's deadline:
-  it came out Node's way only when the 1 ms deadline happened to pass first, which is why
-  the two `next_tick_*` e2e tests flaked on the mac and Windows release legs (release builds
-  reproduced the wrong order ~6/7 locally, debug ~1/6). The backstop now runs only when no
-  ref'd timer and no inflight op holds the loop open -- the condition
-  `docs/design/nexttick-engine.md` already described -- so the batch drains at the next tick
-  point (the timer's scope close), matching Node's probe-verified order on every delay and
-  in the no-timer and unref-only cases.
 
 ### Added
 
@@ -1102,6 +2141,18 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **A nextTick batch interrupted by a handled throw waits for the pending timer, as Node's
+  does.** The stranded-tick backstop drained a deferred batch at the first idle check --
+  BEFORE the loop waited for an already-scheduled timer, so `process.nextTick(() => { throw })
+  ; process.nextTick(...) ; setTimeout(...)` with an `uncaughtException` handler printed the
+  batch's remainder ahead of the timer. The order was a race against the timer's deadline:
+  it came out Node's way only when the 1 ms deadline happened to pass first, which is why
+  the two `next_tick_*` e2e tests flaked on the mac and Windows release legs (release builds
+  reproduced the wrong order ~6/7 locally, debug ~1/6). The backstop now runs only when no
+  ref'd timer and no inflight op holds the loop open -- the condition
+  `docs/design/nexttick-engine.md` already described -- so the batch drains at the next tick
+  point (the timer's scope close), matching Node's probe-verified order on every delay and
+  in the no-timer and unref-only cases.
 - **A pipe's TCP bind error keeps its real port, and a split HTTP/2 preface survives the
   pipe's consuming reads (#314).** Review follow-ups to `listen(path)`: the http/https/h2c
   pipe error handlers stamped `port: -1` on every bind failure (node reports `-1` only for
@@ -5371,7 +6422,11 @@ releases.
 - The `fork` prewarm pool warms lazily, on first `fork()`.
 - `io_uring` read chunks grow from 64 KiB to 4 MiB, fixing large-file reads.
 
-[Unreleased]: https://github.com/YawLabs/oam/compare/v0.19.1...HEAD
+[Unreleased]: https://github.com/YawLabs/oam/compare/v0.19.5...HEAD
+[0.19.5]: https://github.com/YawLabs/oam/compare/v0.19.4...v0.19.5
+[0.19.4]: https://github.com/YawLabs/oam/compare/v0.19.3...v0.19.4
+[0.19.3]: https://github.com/YawLabs/oam/compare/v0.19.2...v0.19.3
+[0.19.2]: https://github.com/YawLabs/oam/compare/v0.19.1...v0.19.2
 [0.19.1]: https://github.com/YawLabs/oam/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/YawLabs/oam/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/YawLabs/oam/compare/v0.18.0...v0.18.1

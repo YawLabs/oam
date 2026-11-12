@@ -20,7 +20,8 @@
 #                                     container under Rosetta for Linux in
 #                                     a Lima VM (build-platforms-mac-linux.sh;
 #                                     glibc floor 2.34 gated)
-#   SHA256SUMS
+#   SHA256SUMS                                 (the binaries and the three
+#                                               license files below)
 #   RELEASE-MANIFEST, RELEASE-MANIFEST.sig     (tag-bound signed manifest over
 #                                               SHA256SUMS -- see "Signing")
 #   LICENSE, NOTICE, THIRD_PARTY_LICENSES.md   (attribution travels with the
@@ -162,7 +163,7 @@
 #                           the release key's PRIVATE half (passphrase-protected
 #                           ed25519, "<path>.pub" beside it). Never committed.
 #                           Required as soon as release-keys/allowed_signers
-#                           holds a key; see release-keys/README.md
+#                           holds a key
 #   OAM_SIGN_REQUIRED=0|1   default 1: missing signing setup is fatal in
 #                           preflight. 0 turns that back into a warning, and
 #                           exists only for a box without the Windows setup.
@@ -245,13 +246,13 @@
 # The second layer is the release: RELEASE-MANIFEST binds the tag to the
 # SHA256SUMS bytes, and
 # RELEASE-MANIFEST.sig is an ssh ed25519 signature over it (scripts/lib/
-# signing.sh has the why; release-keys/README.md the runbook). Placement:
+# signing.sh has the why; release-keys/README.md the keys). Placement:
 #   - preflight, after its cheap checks and before the second dirty-tree
 #     check, the bump and the tag: start a private ssh-agent, add the key (the
 #     run's one passphrase prompt), and prove a throwaway signature verifies
 #     against the committed keys and that the key's range covers $TAG -- never
 #     tag what we cannot sign;
-#   - right after `sha256sum oam-* > SHA256SUMS`: write, sign and verify the
+#   - right after `sha256sum oam-* LICENSE ... > SHA256SUMS`: write, sign and verify the
 #     manifest from disk, then stop the agent. Nothing may change a byte of
 #     SHA256SUMS after that;
 #   - before the draft goes live: every staged file, the manifest pair
@@ -324,6 +325,18 @@ origin_tag_object() {
 run_with_attempts() {
   local attempts="$1" ctx="$2" rc=0 attempt
   shift 2
+  # A count that yields no iteration (0, or '00': `seq 1 00` prints nothing)
+  # must not read as a pass -- the loop would fall through with rc=0 and cmd
+  # never run. The knob is normalised where it is read; this holds the helper
+  # itself to "returns 0 only when cmd ran and exited 0".
+  case "$attempts" in
+    '' | *[!0-9]*) warn "$ctx: invalid attempt count '$attempts' -- nothing was run"; return 2 ;;
+  esac
+  attempts=$((10#$attempts))
+  if [ "$attempts" -lt 1 ]; then
+    warn "$ctx: attempt count is 0 -- nothing was run"
+    return 2
+  fi
   for attempt in $(seq 1 "$attempts"); do
     if [ "$attempts" -gt 1 ]; then
       if [ "$attempt" -gt 1 ]; then
@@ -359,9 +372,10 @@ linux_leg_attempt() {
   fi
 }
 
-# note() prints to STDOUT on purpose: the leg drivers capture their caller's
-# stdout to read back the artifact dir as the LAST line, and only artifacts' own
-# final echo may live there. Everything this script narrates goes to stderr.
+# note() prints to STDERR on purpose, like ok/warn/step: the leg calls capture
+# run_with_attempts' stdout to read back the artifact dir as the LAST line
+# (MAC_ART, LINUX_ART), and note is called inside it, so only the leg's own
+# final echo may live on stdout. Everything this script narrates goes to stderr.
 note(){ echo -e "${YEL}  [note]${NC} $*" >&2; }
 
 SKIP_LOCAL_GATE="${OAM_SKIP_LOCAL_GATE:-0}"
@@ -388,8 +402,15 @@ export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"
 # process-global state"). OAM_TEST_THREADS is exported, not just read: the
 # local gate spawns ci-local.sh, whose step 6 re-reads it from the environment.
 case "${OAM_RELEASE_LEG_ATTEMPTS:-}" in
-  '' | 0) OAM_RELEASE_LEG_ATTEMPTS=1 ;;
+  '') OAM_RELEASE_LEG_ATTEMPTS=1 ;;
   *[!0-9]*) fail "invalid OAM_RELEASE_LEG_ATTEMPTS='$OAM_RELEASE_LEG_ATTEMPTS' (want a whole number of attempts, 1 or more)" ;;
+  *)
+    # Base 10 explicitly: '00' is zero and '02' is two, not a string that
+    # slips past a literal-0 test (and '08' is not a bad octal). Zero, however
+    # it is spelled, means the default single attempt.
+    OAM_RELEASE_LEG_ATTEMPTS=$((10#$OAM_RELEASE_LEG_ATTEMPTS))
+    [ "$OAM_RELEASE_LEG_ATTEMPTS" -ge 1 ] || OAM_RELEASE_LEG_ATTEMPTS=1
+    ;;
 esac
 if [ "$OAM_RELEASE_LEG_ATTEMPTS" -gt 1 ]; then
   export OAM_TEST_THREADS="${OAM_TEST_THREADS:-1}"
@@ -456,19 +477,21 @@ sign_win_asset() {
 # at this commit, and restoring keeps the tree the remote legs tar
 # byte-identical to the tag.
 CONFORMANCE_ARTIFACTS=(CONFORMANCE.md CONFORMANCE-NODE.md conformance/scorecard.json conformance/node-suite-scorecard.json)
-# only_stamps_dirty -- 0 when every dirty path (if any) is one of the four
-# gate-regenerated conformance artifacts. Here-string, not a pipe, so the
-# early `return 1` leaves the FUNCTION rather than a subshell.
+# only_stamps_dirty -- 0 when every dirty path (if any) is one of the
+# gate-regenerated conformance artifacts in CONFORMANCE_ARTIFACTS (read from
+# the array, so a receipt added there is covered here too). Here-string, not a
+# pipe, so the early `return 1` leaves the FUNCTION rather than a subshell.
 only_stamps_dirty() {
-  local dirty line path
+  local dirty line path artifact known
   dirty="$(git status --porcelain)"
   [ -n "$dirty" ] || return 0
   while IFS= read -r line; do
     path="${line:3}"
-    case "$path" in
-      CONFORMANCE.md | CONFORMANCE-NODE.md | conformance/scorecard.json | conformance/node-suite-scorecard.json) ;;
-      *) return 1 ;;
-    esac
+    known=0
+    for artifact in "${CONFORMANCE_ARTIFACTS[@]}"; do
+      if [ "$path" = "$artifact" ]; then known=1; break; fi
+    done
+    [ "$known" = "1" ] || return 1
   done <<<"$dirty"
   return 0
 }
@@ -482,6 +505,19 @@ restore_gate_artifacts() {  # restore_gate_artifacts <context>
     git checkout HEAD -- "${CONFORMANCE_ARTIFACTS[@]}"
   fi
   return 0
+}
+
+# gate_attempt -- one local-gate attempt, for run_with_attempts. A failed
+# attempt whose conformance or node-suite step rewrote the receipts leaves
+# them dirty, and the step ledger keys on the working tree: started on that
+# tree, the next attempt would find none of the earlier passes and run every
+# step again. Restoring first brings back the tree those passes were recorded
+# against (the rewriting step's own pass was withheld, so it runs again and
+# rewrites them again). A no-op on the first attempt: preflight proved the
+# tree clean.
+gate_attempt() {
+  restore_gate_artifacts "local CI gate (before this attempt)"
+  bash "$SCRIPT_DIR/ci-local.sh"
 }
 
 # assert_tree_clean <context> -- fail, naming every dirty path, unless the
@@ -524,7 +560,7 @@ assert_release_unpublished() {
   err="$(gh release view "$TAG" --repo "$REPO" 2>&1 >/dev/null)" || rc=$?
   if [ "$rc" -eq 0 ]; then
     fail "$1: release $TAG already exists on $REPO (possibly a draft left by an interrupted run) -- inspect/delete it: gh release view $TAG --repo $REPO"
-  elif [ "$rc" -ne 1 ] || ! printf '%s\n' "$err" | grep -qxF 'release not found'; then
+  elif [ "$rc" -ne 1 ] || ! grep -qxF 'release not found' <<<"$err"; then
     printf '%s\n' "${err:-<no output>}" | sed 's/^/        gh: /' >&2
     fail "$1: could not tell whether release $TAG exists on $REPO (gh exited $rc, output above) -- moving the tag is safe only while it is unpublished, so this stops rather than guess. Check the network and 'gh auth status', then re-run"
   fi
@@ -749,6 +785,20 @@ if [ -f CHANGELOG.md ]; then
     ' CHANGELOG.md | tr -d '[:space:]')"
     [ -n "$version_body" ] \
       || fail "CHANGELOG.md's '## [${TAG#v}]' section has no entries -- RELIABILITY.md requires a public behavior-change log for every release. Add them, or say plainly that this release changes nothing observable. (Bare '### Added'-style subheadings with nothing under them do not count.)"
+    # And the heading has to be DATED. A hand-written `## [x.y.z] - TBD` is a
+    # heading with entries, so it passed both checks above and the placeholder
+    # went out as the release's notes (0.19.5 was tagged that way). The form
+    # is the one scripts/changelog-release.sh writes: `## [x.y.z] - YYYY-MM-DD`.
+    # Spelled with repeated classes, not {4}: not every awk takes intervals.
+    awk -v head="$version_head" '
+      index($0, head) == 1 {
+        rest = substr($0, length(head) + 1)
+        dated = (rest ~ /^ - [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][[:space:]]*$/)
+        exit
+      }
+      END { exit !dated }
+    ' CHANGELOG.md \
+      || fail "CHANGELOG.md's '## [${TAG#v}]' heading carries no release date -- it must read '## [${TAG#v}] - YYYY-MM-DD' (a placeholder such as TBD would be published as written). Set the date and commit, then re-run."
   else
     # No heading at all reads as an empty body above; say which it is, or the
     # author is sent to fill in a section the file does not have.
@@ -810,7 +860,7 @@ RELEASE_SIGNING=0
 sign_decision="$(release_signing_decision)"
 case "$sign_decision" in
   sign)
-    release_agent_start || fail "could not load the release signing key -- see above (OAM_RELEASE_SIGNING_KEY; release-keys/README.md)"
+    release_agent_start || fail "could not load the release signing key -- see above (OAM_RELEASE_SIGNING_KEY)"
     release_signing_preflight "$TAG" || fail "release signing preflight failed -- see above; nothing has been bumped or tagged"
     RELEASE_SIGNING=1
     ;;
@@ -1152,9 +1202,11 @@ else
   # different trees, exactly what the ledger's re-keying exists to prevent.
   # Rerunning the script from the top re-reads the tree and skips every step
   # already recorded against it, so attempt 2 is cheap when attempt 1 died
-  # late. Serial tests apply from OAM_RELEASE_LEG_ATTEMPTS > 1 (see the knob).
-  run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "local CI gate" \
-    bash "$SCRIPT_DIR/ci-local.sh" || fail "local CI gate failed -- fix before releasing"
+  # late -- which holds only on the tree those passes were recorded against,
+  # so gate_attempt first restores receipts a failed attempt rewrote. Serial
+  # tests apply from OAM_RELEASE_LEG_ATTEMPTS > 1 (see the knob).
+  run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "local CI gate" gate_attempt \
+    || fail "local CI gate failed -- fix before releasing"
   # If the gate's conformance or node-suite results differ from the committed
   # receipts, xtask has just rewritten those files, stamped with the commit and
   # version the gate measured. If the results are unchanged it wrote nothing:
@@ -1305,9 +1357,25 @@ else
 fi
 
 # --- assemble + publish ----------------------------------------------------------
+# A released binary is a BINARY REDISTRIBUTION of V8 (BSD-3), ICU (Unicode),
+# the Node streams port (MIT) and ~380 Rust crates -- every one of which
+# requires its notice travel with the distribution. Apache-2.0 section 4(a)
+# says the same about oam's own license. Shipping bare binaries met none of
+# that, while NOTICE itself asserted the obligation applies to "every released
+# oam binary". These three files are small next to a 57MB binary and are the
+# difference between the claim and the fact. Staged BEFORE the checksums, so
+# SHA256SUMS -- and the signed manifest that wraps it -- list them too: the
+# installers copy them beside the binary and check each one against it.
+step "Stage license + attribution alongside the binaries"
+for f in LICENSE NOTICE THIRD_PARTY_LICENSES.md; do
+  [ -f "$REPO_DIR/$f" ] || fail "$f missing from the repo -- it must ship with the release"
+  cp "$REPO_DIR/$f" "$RELEASE_DIR/$f"
+done
+ok "LICENSE, NOTICE and THIRD_PARTY_LICENSES.md staged"
+
 step "Assemble release assets + SHA256SUMS"
-# Checksums cover the BINARIES only -- the license files are staged after this
-# so they do not appear in a manifest install.sh verifies per-asset.
+# Checksums cover the binaries and the three license files, by name -- never a
+# glob over the directory, so nothing else that lands there rides in.
 #
 # Every staged .exe is verified once more first, from disk: the checksums and
 # the manifest below vouch for these exact bytes, so they must be the signed
@@ -1319,12 +1387,12 @@ if [ "$WIN_SIGNING" = "1" ]; then
     win_verify "$exe" || fail "$(basename "$exe") no longer verifies before checksumming -- see above; nothing has been published"
   done
 fi
-( cd "$RELEASE_DIR" && ls -lh oam-* >&2 && sha256sum oam-* > SHA256SUMS && cat SHA256SUMS >&2 )
+( cd "$RELEASE_DIR" && ls -lh oam-* >&2 && sha256sum oam-* LICENSE NOTICE THIRD_PARTY_LICENSES.md > SHA256SUMS && cat SHA256SUMS >&2 )
 
 # The signed manifest wraps the SHA256SUMS just written -- from disk, so it is
 # the exact bytes that upload -- and binds it to $TAG. Right here, not later:
 # every byte change to SHA256SUMS after this point breaks the signature, and
-# the steps below (license staging, the matrix, the upload) only ADD files.
+# the steps below (the matrix, the upload) only ADD files.
 # RELEASE-MANIFEST{,.sig} are not oam-* names, so they are in neither the
 # checksum glob above nor any binary glob downstream (refresh-downloads.sh
 # included); `gh release create "$RELEASE_DIR"/*` uploads them with the rest.
@@ -1349,20 +1417,6 @@ else
   warn "no RELEASE-MANIFEST for $TAG (bootstrap: no release key committed) -- this release is checksummed but not signed"
 fi
 
-# A released binary is a BINARY REDISTRIBUTION of V8 (BSD-3), ICU (Unicode),
-# the Node streams port (MIT) and ~380 Rust crates -- every one of which
-# requires its notice travel with the distribution. Apache-2.0 section 4(a)
-# says the same about oam's own license. Shipping bare binaries met none of
-# that, while NOTICE itself asserted the obligation applies to "every released
-# oam binary". These three files are small next to a 57MB binary and are the
-# difference between the claim and the fact.
-step "Stage license + attribution alongside the binaries"
-for f in LICENSE NOTICE THIRD_PARTY_LICENSES.md; do
-  [ -f "$REPO_DIR/$f" ] || fail "$f missing from the repo -- it must ship with the release"
-  cp "$REPO_DIR/$f" "$RELEASE_DIR/$f"
-done
-ok "LICENSE, NOTICE and THIRD_PARTY_LICENSES.md staged"
-
 if [ "${OAM_DRY_RUN:-0}" = "1" ]; then
   # release.yml's workflow_dispatch dry-run: build + checksum, publish nothing.
   step "DRY RUN -- skipping gh release create"
@@ -1373,8 +1427,10 @@ fi
 # --- sidecar regression matrix --------------------------------------------------
 # Yaw MCP ships `defaultRuntime: "oam"`, so a release that breaks a sidecar
 # breaks the broker for real users. Gating here is the difference between
-# catching it and shipping it. Network- and npm-dependent, so a failure to RUN
-# the matrix warns; a sidecar that actually fails is fatal.
+# catching it and shipping it. Network- and npm-dependent, so a run that could
+# not ANSWER for some sidecars warns, naming each; a sidecar that actually
+# fails is fatal, and so is a matrix that ended with no report at all -- it
+# exercised nothing.
 #
 # BEFORE the release is cut, deliberately. This ran after `gh release edit
 # --draft=false`, so its "do NOT ship" branch fired on a build that install.sh
@@ -1442,6 +1498,16 @@ else
       fi
       ;;
     *)
+      # No report is no verdict on ANY sidecar: the matrix stopped before its
+      # first probe (the stage lock held by another run, a fixture directory it
+      # could not clear, the release binary itself not runnable -- its exit 2).
+      # The warn below lists the rows a run could not answer, and for a run
+      # with no rows it listed nothing: one line, then a published build on
+      # which no sidecar had been started. None of those causes is the network
+      # or npm, and each is the operator's to clear and re-run.
+      if [ ! -s "$matrix_report" ]; then
+        fail "sidecar matrix did not run (status $matrix_status and no report: no sidecar was exercised on this build -- see above) -- stopping; nothing has been published"
+      fi
       warn "sidecar matrix could not complete (status $matrix_status) -- result is INCOMPLETE, not clean"
       # Each row on a line of its own: a hosting regression in any of these
       # would NOT have stopped this release. This stays a warning -- whether
@@ -1667,24 +1733,24 @@ fi
 # one -- but a fatal there must not abort a release that has already published,
 # so the outcome is reported here rather than propagated.
 step "Bump the Homebrew formula + Scoop manifest"
-if [ "${OAM_DRY_RUN:-0}" = "1" ]; then
-  ok "DRY RUN -- taps not bumped"
-else
-  # Exit 3 is bump-taps.sh's "skipped, nothing done" (no tap checkout on this
-  # box). It exits 0 under OAM_TAPS_OPTIONAL so it cannot abort a release, but
-  # printing "taps are current" for it contradicted the `taps NOT bumped`
-  # warning two lines above in the same log -- and the green line is the one an
-  # operator skimming a long release keeps.
-  taps_rc=0
-  OAM_TAPS_OPTIONAL=1 "$SCRIPT_DIR/bump-taps.sh" "$TAG" || taps_rc=$?
-  case "$taps_rc" in
-    0) ok "package-manager taps are current for $TAG" ;;
-    3) warn "taps SKIPPED -- brew/scoop still serve the PREVIOUS release."
-       warn "run ./scripts/bump-taps.sh $TAG on a box with the tap checkouts" ;;
-    *) warn "tap bump FAILED -- brew/scoop still serve the previous release."
-       warn "repair with: ./scripts/bump-taps.sh $TAG" ;;
-  esac
-fi
+# No OAM_DRY_RUN branch here or in the site step above: a dry run exits right
+# after staging, before anything is published, so it never reaches them.
+#
+# Exit 3 is bump-taps.sh's "skipped, nothing done" (no tap checkout on this
+# box) under OAM_TAPS_OPTIONAL. It is caught here so it cannot abort a
+# release, and kept apart from 0 because
+# printing "taps are current" for it contradicted the `taps NOT bumped`
+# warning two lines above in the same log -- and the green line is the one an
+# operator skimming a long release keeps.
+taps_rc=0
+OAM_TAPS_OPTIONAL=1 "$SCRIPT_DIR/bump-taps.sh" "$TAG" || taps_rc=$?
+case "$taps_rc" in
+  0) ok "package-manager taps are current for $TAG" ;;
+  3) warn "taps SKIPPED -- brew/scoop still serve the PREVIOUS release."
+     warn "run ./scripts/bump-taps.sh $TAG on a box with the tap checkouts" ;;
+  *) warn "tap bump FAILED -- brew/scoop still serve the previous release."
+     warn "repair with: ./scripts/bump-taps.sh $TAG" ;;
+esac
 
 # What the gate did to these depends on its results. Where a result differs
 # from the committed receipt, xtask rewrote that receipt together with its twin
@@ -1744,13 +1810,19 @@ done
 live_dl="$(curl -fsSL --max-time 30 "https://oamjs.org/downloads/" 2>/dev/null || true)"
 if [ -z "$live_dl" ]; then
   warn "https://oamjs.org/downloads/ did not fetch -- cannot verify the published checksums"
-elif ! printf '%s' "$live_dl" | grep -q "$TAG"; then
+# Matched in the shell ([[ ]] here, `case` below), never `printf ... | grep -q`:
+# under pipefail grep -q exits at the first match, the writer can die of
+# SIGPIPE on a page larger than the pipe buffer, and the pipeline then fails
+# WITH a match -- a correct page would read as stale (the #95 shape; see
+# lib/tap-verify.sh). The quoted pattern is literal, so the dots in the tag
+# match only dots.
+elif [[ "$live_dl" != *"$TAG"* ]]; then
   warn "https://oamjs.org/downloads/ does not mention $TAG -- it still advertises the previous release"
 else
   dl_missing=0
   while read -r h _; do
     [ -n "$h" ] || continue
-    printf '%s' "$live_dl" | grep -q "$h" || dl_missing=$((dl_missing + 1))
+    case "$live_dl" in *"$h"*) ;; *) dl_missing=$((dl_missing + 1)) ;; esac
   done < "$RELEASE_DIR/SHA256SUMS"
   if [ "$dl_missing" -eq 0 ]; then
     ok "https://oamjs.org/downloads/ serves $TAG with matching checksums"

@@ -182,6 +182,13 @@ impl NodeDeflate {
             if input.is_empty() && produced < buf.len() {
                 break;
             }
+            // No progress with input left: the stream has already ended
+            // (a finished stream takes no more input), so another call
+            // would do the same. The input is dropped, as zlib's
+            // Z_STREAM_ERROR leaves it unconsumed.
+            if consumed == 0 && produced == 0 {
+                break;
+            }
         }
         self.scratch = buf;
         out
@@ -612,6 +619,20 @@ mod tests {
                 }
             }
             assert_eq!(inflate(wrap, dictionary, &out), data, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn input_after_the_stream_ended_returns_instead_of_looping() {
+        // A finished stream takes no more input: a second call hands back
+        // nothing (the trailer went out with the first) and returns.
+        for format in [Format::Deflate, Format::DeflateRaw, Format::Gzip] {
+            let mut enc = NodeDeflate::new(format, 6, None);
+            let whole = enc.finish_vec(b"abc");
+            assert!(!whole.is_empty(), "{format:?}");
+            assert!(enc.finish_vec(b"more").is_empty(), "{format:?}");
+            assert!(enc.deflate_vec(b"more", 0).is_empty(), "{format:?}");
+            assert!(enc.deflate_vec(&[], 2).is_empty(), "{format:?}");
         }
     }
 }

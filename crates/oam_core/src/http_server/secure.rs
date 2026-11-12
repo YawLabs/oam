@@ -44,7 +44,7 @@ pub fn http2_serve_tls(
     policy: HeadPolicy,
     // The http server's timeouts, for an HTTP/1 connection.
     http1_timeouts: TimeoutSettings,
-) -> std::io::Result<SecureSession> {
+) -> SecureSession {
     let addrs = stream
         .get_ref()
         .0
@@ -142,10 +142,10 @@ pub fn http2_serve_tls(
             shutdown_rx,
         ));
     }
-    Ok(SecureSession {
+    SecureSession {
         session_id,
         conn_id,
-    })
+    }
 }
 
 /// One HTTP/2 session: hyper's server connection until it ends, gracefully

@@ -37,24 +37,7 @@
 # Generation is an explicit operator action, NEVER something a release does on
 # its own (a release only ever runs `--check`). The certificate's SHA-1 is
 # pinned in scripts/mac-signing-identity.sha1 and the release refuses to sign
-# with anything else. Back up ~/.oam-signing/oam-codesign.p12 and
-# oam-codesign.p12-password off this host; `--import` restores them onto a
-# replacement host.
-#
-# Keychain password custody: the password sits in a 0600 file next to the
-# keychain, read on this host by the release. The signing plan's preferred
-# alternative is to `read -s` it once per release on the release box and send
-# it over ssh stdin, so it is never at rest here. For a self-signed identity
-# that buys nothing at Gatekeeper the file is accepted; revisit when the
-# Developer ID moves in.
-#
-# The same passwords also pass through argv: `security create-keychain -p`,
-# `unlock-keychain -p`, `set-key-partition-list -k` and `import -P` take them
-# as arguments, so each is visible in the process list to other local users
-# for the moment that command runs. security(1) documents no stdin or file form
-# for these non-interactively, so this is accepted alongside the at-rest file
-# above; a build Mac whose other local accounts are not trusted should not
-# hold the identity at all.
+# with anything else.
 #
 # bash 3.2 compatible (the build Mac's /bin/bash). The whole script is
 # functions plus one `main "$@"` line, because the release box's preflight runs

@@ -32,40 +32,17 @@
 
 #![cfg(windows)]
 
+// The sleeper script (the detached grandchild here), the cleanup guard, the
+// watchdog and the `stdio: 'inherit'` regression are shared with
+// stdio_inheritance_fds.rs.
+mod common;
+
 use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::atomic::Ordering;
 
-/// How long the grandchild may take to raise its alive flag. PARENT gives up
-/// at the same bound.
-const STARTUP_BOUND: Duration = Duration::from_secs(180);
-
-/// How long after its alive flag appears the grandchild is released.
-const RELEASE_AFTER: Duration = Duration::from_secs(60);
-
-/// The detached grandchild: reports its pid, raises its alive flag, and runs
-/// until released (stop.flag) or 90 s pass. It lowers the flag before it
-/// exits, so the flag is down before its handles close.
-const SLEEPER: &str = r#"
-const fs = require("fs");
-const path = require("path");
-const dir = process.env.OAM_STDIO_TEST_DIR;
-const alive = path.join(dir, "alive.flag");
-const stop = path.join(dir, "stop.flag");
-fs.writeFileSync(path.join(dir, "sleeper.pid"), String(process.pid));
-fs.writeFileSync(alive, "");
-const end = Date.now() + 90000;
-const t = setInterval(() => {
-  if (Date.now() > end || fs.existsSync(stop)) {
-    clearInterval(t);
-    fs.rmSync(alive, { force: true });
-  }
-}, 200);
-"#;
+use common::{Cleanup, SLEEPER, STARTUP_BOUND, oam, watchdog};
 
 /// Starts the sleeper detached with every stdio slot ignored, waits for its
 /// alive flag, writes `done` to the stream named by argv[2], and exits.
@@ -99,36 +76,6 @@ const poll = setInterval(() => {
 }, 20);
 "#;
 
-/// One child per spawn path, each with `stdio: 'inherit'` on fds 0-2, each
-/// writing a marker to stdout and one to stderr; every spawn must succeed and
-/// exit 0. The extra `'pipe'` slot sends the second through child_win's raw
-/// CreateProcessW, whose inherit arm once passed oam's std handle itself and
-/// failed with EINVAL once the handle was made non-inheritable.
-const INHERIT_PARENT: &str = r#"
-const cp = require("child_process");
-const exe = process.execPath;
-const code = (m) => `console.log(${JSON.stringify(m)}); console.error(${JSON.stringify(m + "-err")});`;
-const run = (m, stdio) =>
-  new Promise((resolve, reject) => {
-    const c = cp.spawn(exe, ["-e", code(m)], { stdio });
-    c.on("error", reject);
-    c.on("exit", (status) =>
-      status === 0 ? resolve() : reject(new Error(`${m} exited ${status}`)),
-    );
-  });
-(async () => {
-  await run("marker-tokio", "inherit");
-  await run("marker-extra-slot", ["inherit", "inherit", "inherit", "pipe"]);
-  const r = cp.spawnSync(exe, ["-e", code("marker-sync")], { stdio: "inherit" });
-  if (r.error) throw r.error;
-  if (r.status !== 0) throw new Error(`marker-sync exited ${r.status}`);
-  console.log("all-spawned");
-})().catch((e) => {
-  console.error("FAILED", e);
-  process.exit(2);
-});
-"#;
-
 /// A detached child with piped stdio: its output still reaches the parent.
 const DETACHED_PIPE_PARENT: &str = r#"
 const cp = require("child_process");
@@ -147,116 +94,7 @@ c.on("close", (status) => console.log(`got:${out.trim()} status:${status}`));
 "#;
 
 fn unique_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "oam-stdio-inherit-{tag}-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn oam(dir: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_oam"));
-    command
-        .current_dir(dir)
-        .env("OAM_STDIO_TEST_DIR", dir)
-        .env("OAM_CACHE_DIR", dir.join("cache"));
-    command
-}
-
-/// True when `pid` is a live `oam.exe`, from one `tasklist` call: guards the
-/// cleanup `taskkill` against a recycled pid.
-fn is_live_oam(pid: u32) -> bool {
-    let out = Command::new("tasklist")
-        .args([
-            "/FO",
-            "CSV",
-            "/NH",
-            "/FI",
-            &format!("PID eq {pid}"),
-            "/FI",
-            "IMAGENAME eq oam.exe",
-        ])
-        .output();
-    out.map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
-        .unwrap_or(false)
-}
-
-/// Releases the sleeper, gives it a moment to go on its own, then kills it if
-/// it is still an `oam.exe`, and removes the directory: a RED run, or any
-/// failure, leaves nothing behind.
-struct Cleanup {
-    dir: PathBuf,
-}
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::write(self.dir.join("stop.flag"), "");
-        for _ in 0..50 {
-            if !self.dir.join("alive.flag").exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let pid = std::fs::read_to_string(self.dir.join("sleeper.pid"))
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok());
-        if let Some(pid) = pid
-            && is_live_oam(pid)
-        {
-            let _ = Command::new("taskkill")
-                .args(["/F", "/PID", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-        // The sleeper's handle on its cwd can outlive taskkill briefly.
-        for _ in 0..20 {
-            if std::fs::remove_dir_all(&self.dir).is_ok() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-}
-
-/// Releases the grandchild (writes stop.flag) `RELEASE_AFTER` its alive flag
-/// appears, unless told to stand down first: a RED run (EOF held until the
-/// grandchild exits) then fails on the oracle instead of hanging for the
-/// grandchild's full lifetime. The countdown starts at the flag, not at the
-/// spawn, so startup time is never part of it. If the flag has not appeared
-/// within `STARTUP_BOUND` the watchdog sets the returned "never started" flag
-/// and writes stop.flag (so a late grandchild goes at once).
-fn watchdog(dir: &Path) -> (mpsc::Sender<()>, Arc<AtomicBool>) {
-    let (tx, rx) = mpsc::channel::<()>();
-    let alive = dir.join("alive.flag");
-    let stop = dir.join("stop.flag");
-    let never_started = Arc::new(AtomicBool::new(false));
-    let never_started_w = Arc::clone(&never_started);
-    std::thread::spawn(move || {
-        let deadline = Instant::now() + STARTUP_BOUND;
-        while !alive.exists() {
-            if Instant::now() >= deadline {
-                never_started_w.store(true, Ordering::SeqCst);
-                let _ = std::fs::write(&stop, "");
-                return;
-            }
-            if !matches!(
-                rx.recv_timeout(Duration::from_millis(50)),
-                Err(mpsc::RecvTimeoutError::Timeout)
-            ) {
-                return;
-            }
-        }
-        if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(RELEASE_AFTER) {
-            let _ = std::fs::write(stop, "");
-        }
-    });
-    (tx, never_started)
+    common::unique_dir("oam-stdio-inherit", tag)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -372,35 +210,7 @@ fn detached_child_does_not_hold_oam_stderr() {
 fn inherit_children_still_write_to_oam_stdout() {
     let dir = unique_dir("inherit");
     let _cleanup = Cleanup { dir: dir.clone() };
-    std::fs::write(dir.join("parent.cjs"), INHERIT_PARENT).unwrap();
-
-    let out = oam(&dir)
-        .args(["run", "--no-check", "parent.cjs"])
-        .stdin(Stdio::piped())
-        .output()
-        .expect("oam binary runs");
-    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
-    let stderr = String::from_utf8_lossy(&out.stderr).replace("\r\n", "\n");
-    assert!(
-        out.status.success(),
-        "oam run failed ({})\nstdout: {stdout}\nstderr: {stderr}",
-        out.status
-    );
-    for marker in ["marker-tokio", "marker-extra-slot", "marker-sync"] {
-        assert!(
-            stdout.lines().any(|l| l == marker),
-            "{marker} missing from oam's stdout\nstdout: {stdout}\nstderr: {stderr}"
-        );
-        let err_marker = format!("{marker}-err");
-        assert!(
-            stderr.lines().any(|l| l == err_marker),
-            "{err_marker} missing from oam's stderr\nstdout: {stdout}\nstderr: {stderr}"
-        );
-    }
-    assert!(
-        stdout.lines().any(|l| l == "all-spawned"),
-        "stdout: {stdout}\nstderr: {stderr}"
-    );
+    common::assert_inherit_children_reach_oam_stdio(&dir);
 }
 
 /// A detached child with `stdio: 'pipe'` still delivers its output to oam.

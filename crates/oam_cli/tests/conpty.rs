@@ -349,41 +349,7 @@ impl ConPty {
     /// The output with the escapes a terminal would consume stripped, so
     /// assertions read like what a person sees.
     fn text(&self) -> String {
-        let raw = self.raw_output();
-        let mut out = String::with_capacity(raw.len());
-        let mut chars = raw.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c != '\u{1b}' {
-                if c != '\r' {
-                    out.push(c);
-                }
-                continue;
-            }
-            match chars.next() {
-                // CSI: parameters, then one final byte.
-                Some('[') => {
-                    for p in chars.by_ref() {
-                        if p.is_ascii_alphabetic() || p == '@' || p == '`' {
-                            break;
-                        }
-                    }
-                }
-                // OSC: runs to BEL or ST.
-                Some(']') => {
-                    while let Some(p) = chars.next() {
-                        if p == '\u{7}' {
-                            break;
-                        }
-                        if p == '\u{1b}' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        out
+        strip_escapes(&self.raw_output())
     }
 
     /// Assert that `second` landed on screen immediately after `first`, the
@@ -497,6 +463,77 @@ impl Drop for ConPty {
     }
 }
 
+/// One escape sequence, as [`read_escape`] delimits it.
+enum Escape {
+    /// CSI: the parameter and intermediate bytes, then the final byte.
+    Csi(String, char),
+    /// A CSI the output ended inside of, with what was read of it.
+    CsiCut(String),
+    /// OSC, run to its BEL or ST (or to the end of the output).
+    Osc,
+    /// A charset designation (`ESC ( B` and the like), both bytes taken.
+    Charset,
+    /// Any other escape: the one byte after ESC, None at the end of the
+    /// output.
+    Other(Option<char>),
+}
+
+/// Reads one escape sequence off `chars`, the ESC itself already taken. The
+/// one place that decides where a sequence ends, so [`strip_escapes`] (what
+/// `wait_for` matches against) and [`Screen::feed`] (what cursor assertions
+/// replay) can never disagree about which bytes are text.
+fn read_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Escape {
+    match chars.next() {
+        // CSI: parameters and intermediates, then one final byte in @..~.
+        Some('[') => {
+            let mut body = String::new();
+            loop {
+                match chars.next() {
+                    Some(f @ '\u{40}'..='\u{7e}') => return Escape::Csi(body, f),
+                    Some(p) => body.push(p),
+                    None => return Escape::CsiCut(body),
+                }
+            }
+        }
+        // OSC: runs to BEL or ST.
+        Some(']') => {
+            while let Some(p) = chars.next() {
+                if p == '\u{7}' {
+                    break;
+                }
+                if p == '\u{1b}' && chars.peek() == Some(&'\\') {
+                    chars.next();
+                    break;
+                }
+            }
+            Escape::Osc
+        }
+        // Charset designation: one more byte.
+        Some('(' | ')' | '*' | '+') => {
+            chars.next();
+            Escape::Charset
+        }
+        other => Escape::Other(other),
+    }
+}
+
+/// `raw` with the escapes a terminal would consume (and carriage returns)
+/// stripped: the text behind [`ConPty::text`], pulled out so it is testable
+/// without a console. Unlike [`Screen::feed`] it accepts any sequence, and one
+/// the output ends inside of: it is polled while the child is still writing.
+fn strip_escapes(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            let _ = read_escape(&mut chars);
+        } else if c != '\r' {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// A minimal VT screen: enough of the escape set ConPTY emits to replay its
 /// output onto a grid and say where the next write lands.
 ///
@@ -569,49 +606,27 @@ impl Screen {
     }
 
     fn feed(&mut self, output: &str) {
-        let mut chars = output.chars();
+        let mut chars = output.chars().peekable();
         while let Some(c) = chars.next() {
             match c {
-                '\u{1b}' => match chars.next() {
-                    Some('[') => {
-                        let mut body = String::new();
-                        let final_byte = loop {
-                            match chars.next() {
-                                Some(f @ '\u{40}'..='\u{7e}') => break f,
-                                Some(p) => body.push(p),
-                                None => panic!("the output ends inside CSI {body:?}"),
-                            }
-                        };
-                        self.csi(&body, final_byte);
-                    }
-                    // OSC (the window title): runs to BEL or ST, paints nothing.
-                    Some(']') => loop {
-                        match chars.next() {
-                            Some('\u{7}') | None => break,
-                            Some('\u{1b}') => {
-                                chars.next();
-                                break;
-                            }
-                            Some(_) => {}
-                        }
-                    },
-                    Some('7') => self.saved = (self.row, self.col),
-                    Some('8') => {
+                '\u{1b}' => match read_escape(&mut chars) {
+                    Escape::Csi(body, final_byte) => self.csi(&body, final_byte),
+                    Escape::CsiCut(body) => panic!("the output ends inside CSI {body:?}"),
+                    // The window title and charset designations paint nothing.
+                    Escape::Osc | Escape::Charset => {}
+                    Escape::Other(Some('7')) => self.saved = (self.row, self.col),
+                    Escape::Other(Some('8')) => {
                         (self.row, self.col) = self.saved;
                         self.wrap_pending = false;
                     }
-                    Some('D') => self.line_feed(),
-                    Some('E') => {
+                    Escape::Other(Some('D')) => self.line_feed(),
+                    Escape::Other(Some('E')) => {
                         self.col = 0;
                         self.line_feed();
                     }
-                    Some('M') => self.reverse_index(),
-                    // Charset designation: one more byte, nothing painted.
-                    Some('(' | ')' | '*' | '+') => {
-                        chars.next();
-                    }
-                    Some('=' | '>') => {}
-                    other => panic!("Screen does not model ESC {other:?}"),
+                    Escape::Other(Some('M')) => self.reverse_index(),
+                    Escape::Other(Some('=' | '>')) => {}
+                    Escape::Other(other) => panic!("Screen does not model ESC {other:?}"),
                 },
                 '\r' => {
                     self.col = 0;
@@ -870,6 +885,27 @@ fn screen_defers_the_wrap_from_the_last_column() {
     let screen = Screen::replay(&format!("{full}\rY"));
     assert!(screen.line(0).starts_with("Yx"), "{:?}", screen.line(0));
     assert_eq!(screen.next_write(), (0, 1));
+}
+
+#[test]
+fn stripped_text_and_the_screen_end_an_escape_at_the_same_byte() {
+    // A CSI ends on any final byte in @..~ (here `~` and a letter), a charset
+    // designation takes two bytes after ESC, an OSC runs to BEL or to ST, and
+    // any other escape is one byte.
+    assert_eq!(
+        strip_escapes(
+            "a\u{1b}[3~b\u{1b}[1;31mc\u{1b}(Bd\u{1b}]0;title\u{7}e\u{1b}]0;t\u{1b}\\f\u{1b}=g\r\n"
+        ),
+        "abcdefg\n"
+    );
+    // A sequence the output stops inside of swallows nothing that came before.
+    assert_eq!(strip_escapes("done\u{1b}[12"), "done");
+    assert_eq!(strip_escapes("done\u{1b}"), "done");
+
+    // The screen reads the same sequences as the same amount of non-text.
+    let raw = "a\u{1b}[1;31mb\u{1b}(Bc\u{1b}]0;title\u{7}d\u{1b}]0;t\u{1b}\\e\u{1b}=f";
+    assert_eq!(Screen::replay(raw).line(0), strip_escapes(raw));
+    assert_eq!(strip_escapes(raw), "abcdef");
 }
 
 #[test]
@@ -1235,18 +1271,29 @@ for (const [name, flag] of [
   fs.closeSync(fd);
   rows.push(`${name.slice(4)} ${flag}: ${row} ${atty}/${tty.isatty(fd)}`);
 }
-console.log('[fstat ' + rows.join('; ') + ']');
+// One row per line, each far short of the console's 120 columns: the match
+// below must not depend on how the pseudoconsole renders a wrapped line.
+for (const row of rows) console.log('[fstat ' + row + ']');
+console.log('[fstat rows ' + rows.length + ']');
 "#,
     );
     let pty = ConPty::spawn(&script);
-    pty.wait_for(
-        "[fstat CON w: EISDIR fstat false/false; CON r: chr 20000 true/false; \
-         CONOUT$ w: EISDIR fstat false/false; CONOUT$ a: EISDIR fstat false/false; \
-         CONOUT$ r+: chr 20000 true/false; CONOUT$ r: chr 20000 true/false; \
-         CONIN$ r: chr 20000 true/false; CONIN$ r+: chr 20000 true/false; \
-         CONIN$ w: EISDIR fstat false/false; \
-         NUL w: chr 20666 false/false; NUL r: chr 20666 false/false]",
-    );
+    for row in [
+        "CON w: EISDIR fstat false/false",
+        "CON r: chr 20000 true/false",
+        "CONOUT$ w: EISDIR fstat false/false",
+        "CONOUT$ a: EISDIR fstat false/false",
+        "CONOUT$ r+: chr 20000 true/false",
+        "CONOUT$ r: chr 20000 true/false",
+        "CONIN$ r: chr 20000 true/false",
+        "CONIN$ r+: chr 20000 true/false",
+        "CONIN$ w: EISDIR fstat false/false",
+        "NUL w: chr 20666 false/false",
+        "NUL r: chr 20666 false/false",
+    ] {
+        pty.wait_for(&format!("[fstat {row}]"));
+    }
+    pty.wait_for("[fstat rows 11]");
     assert_eq!(pty.wait_exit(), 0);
 }
 

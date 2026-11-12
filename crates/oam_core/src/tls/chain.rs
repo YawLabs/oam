@@ -34,6 +34,7 @@
 //! that differ only there do not chain here.
 
 use rustls::pki_types::CertificateDer;
+use std::borrow::Cow;
 use std::sync::OnceLock;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::ParsedExtension;
@@ -196,15 +197,29 @@ pub(crate) fn store_issuers(
     completed
 }
 
-/// The store a context without a `ca` option builds chains from:
-/// NODE_EXTRA_CA_CERTS, then the bundled roots.
-pub(crate) fn default_store() -> &'static [CertificateDer<'static>] {
+/// The store a context without a `ca` option builds chains from, as the
+/// process starts with it: NODE_EXTRA_CA_CERTS, then the bundled roots.
+/// What [`default_store`] is until `tls.setDefaultCACertificates` replaces
+/// it.
+pub(crate) fn initial_default_store() -> &'static [CertificateDer<'static>] {
     static STORE: OnceLock<Vec<CertificateDer<'static>>> = OnceLock::new();
     STORE.get_or_init(|| {
         let mut store = super::extra_ca_certs().certs.clone();
         store.extend(super::roots::bundled().iter().cloned());
         store
     })
+}
+
+/// The store a context without a `ca` option builds chains from, now: the
+/// certificates `tls.setDefaultCACertificates` put in its place (#199), or
+/// [`initial_default_store`]. Read at each use, so it follows a later
+/// replacement -- the store the verifier of the same context trusts
+/// (`build_client_config`, the server's `ClientCertJudge`).
+pub(crate) fn default_store() -> Cow<'static, [CertificateDer<'static>]> {
+    match super::default_ca_override() {
+        Some(certs) => Cow::Owned(certs),
+        None => Cow::Borrowed(initial_default_store()),
+    }
 }
 
 /// Unix time now, for the issuers' validity.

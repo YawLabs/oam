@@ -4,19 +4,24 @@
 //
 // Every signature here is made by a REAL ssh-keygen (-Y sign) with throwaway
 // keys that exist only for the length of this script: the private halves are
-// never written outside a temp dir, and none of them is a release key. The
+// never written outside a temp dir, which is removed when the script exits
+// however it exits, and none of them is a release key. The
 // mutated vectors are byte edits of a real signature, and the one vector
 // ssh-keygen cannot make without a hardware token (sk-ssh-ed25519) is built
 // here by hand -- and then checked by ssh-keygen -Y verify like every other
 // vector. The script fails unless ssh-keygen's verdict on each vector is the
 // one recorded below, so a committed fixture always means what its name says.
+// The fixtures are built in the temp dir and copied here only once every
+// verdict has matched: a failed run leaves the committed files as they were.
 //
 // Regenerating replaces every key, so all files move together; commit them
-// as one change. The Rust tests (src/self_update.rs) read the result.
+// as one change. The Rust tests read the result: the unit tests in
+// src/self_update.rs and tests/release_trust.rs, which takes t1's fingerprint
+// from allowed_signers (printed at the end of a run, for reference).
 
 import { execFileSync } from "node:child_process";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,7 +30,13 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const KEYGEN = process.argv[2] || "ssh-keygen";
 const NS = "oam-release";
 const work = mkdtempSync(join(tmpdir(), "oam-su-fixtures-"));
-const cases = join(HERE, "cases");
+// The private keys live in `work`. 'exit' fires on a normal end, on
+// process.exit and on an uncaught throw (ssh-keygen missing, a sign call
+// failing), so none of those leaves them behind.
+process.on("exit", () => rmSync(work, { recursive: true, force: true }));
+// Everything bound for this directory is staged here first.
+const STAGE = join(work, "stage");
+const cases = join(STAGE, "cases");
 mkdirSync(cases, { recursive: true });
 
 const keygen = (args, opts = {}) =>
@@ -85,7 +96,7 @@ function parseSig(blob) {
   const reserved = r.str();
   const hashAlg = r.str();
   const signature = r.str();
-  return { magic, version, pubkey, namespace, reserved, hashAlg, signature, end: r.off };
+  return { magic, version, pubkey, namespace, reserved, hashAlg, signature };
 }
 const buildSig = (f) =>
   Buffer.concat([
@@ -120,18 +131,18 @@ const allowed = ["t1", "t2", "tsk"]
   .map((id) => `oam-release-${id} namespaces="${NS}" ${keys[id]}`)
   .join("\n");
 writeFileSync(
-  join(HERE, "allowed_signers"),
+  join(STAGE, "allowed_signers"),
   `# TEST trust root for src/self_update.rs -- throwaway keys, made by generate.mjs.\n${allowed}\n`,
 );
 writeFileSync(
-  join(HERE, "ranges"),
+  join(STAGE, "ranges"),
   "# TEST ranges for src/self_update.rs. t2 is staged: no line.\nt1 v0.18.0 -\ntsk v0.18.0 -\n",
 );
-writeFileSync(join(HERE, "untrusted.pub"), `${keys.t3}\n`);
+writeFileSync(join(STAGE, "untrusted.pub"), `${keys.t3}\n`);
 
 // --- manifests -----------------------------------------------------------------
 const payload = Buffer.from("oam self-update fixture binary: not a real oam\n");
-writeFileSync(join(HERE, "payload.bin"), payload);
+writeFileSync(join(STAGE, "payload.bin"), payload);
 const h = createHash("sha256").update(payload).digest("hex");
 const TRIPLES = [
   "aarch64-apple-darwin",
@@ -142,11 +153,11 @@ const TRIPLES = [
   "x86_64-unknown-linux-gnu",
 ];
 const sums = TRIPLES.map((t) => `${h} *oam-${t}\n`).join("");
-writeFileSync(join(HERE, "SHA256SUMS"), sums);
+writeFileSync(join(STAGE, "SHA256SUMS"), sums);
 const manifest = (tag, header = "oam-release-manifest v1", eol = "\n") =>
   Buffer.from(`${header}${eol}tag ${tag}${eol}${sums}`);
 const M18 = manifest("v0.18.0");
-writeFileSync(join(HERE, "manifest-v0.18.0"), M18);
+writeFileSync(join(STAGE, "manifest-v0.18.0"), M18);
 
 function signWith(id, msg, extra = []) {
   const f = join(work, `msg-${Math.random().toString(16).slice(2)}`);
@@ -244,7 +255,7 @@ for (const v of vectors) {
   let ok = true;
   try {
     keygen(
-      ["-Y", "verify", "-f", join(HERE, "allowed_signers"), "-I", `oam-release-${principal}`, "-n", NS, "-s", sigPath],
+      ["-Y", "verify", "-f", join(STAGE, "allowed_signers"), "-I", `oam-release-${principal}`, "-n", NS, "-s", sigPath],
       { input: msg },
     );
   } catch {
@@ -254,8 +265,13 @@ for (const v of vectors) {
   if (ok !== expect) bad++;
   console.log(`${mark} ${name}: ssh-keygen ${ok ? "accepts" : "rejects"} (expected ${expect ? "accept" : "reject"})`);
 }
-rmSync(work, { recursive: true, force: true });
 if (bad) {
-  console.error(`${bad} vector(s) did not get the expected ssh-keygen verdict`);
+  console.error(
+    `${bad} vector(s) did not get the expected ssh-keygen verdict; the committed fixtures were left as they were`,
+  );
   process.exit(1);
 }
+// Every verdict matched: the staged fixtures replace the committed ones.
+cpSync(STAGE, HERE, { recursive: true });
+const t1Fp = createHash("sha256").update(pubBlob(keys.t1)).digest("base64").replace(/=+$/, "");
+console.log(`fixtures written to ${HERE}; t1 is SHA256:${t1Fp}`);

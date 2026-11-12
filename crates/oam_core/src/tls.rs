@@ -81,6 +81,13 @@ pub struct TlsState {
     /// drains, and the process hangs at exit. `tls_close` fires the Notify so
     /// the parked read drops its half and the socket closes.
     cancel: HashMap<u64, Arc<tokio::sync::Notify>>,
+    /// The same for the write half: a `tls_write` the peer is not draining,
+    /// or a `tls_shutdown` behind one, parks for as long as the peer likes
+    /// while holding the other half of the BiLock. `tls_close` fires this so
+    /// the parked op drops its half, as tcp.rs's write does on its close
+    /// wake. One writer op is out per handle at a time (the half is taken
+    /// from `writers`), so one Notify and `notify_one` serve it.
+    write_cancel: HashMap<u64, Arc<tokio::sync::Notify>>,
     /// Server secure contexts by id (server.rs), one per `tls.createServer`.
     contexts: HashMap<u64, Arc<server::ServerContext>>,
     /// Client secure contexts by id (`ClientContext`), one per
@@ -112,6 +119,22 @@ impl TlsState {
         Some(writer)
     }
 
+    /// [`Self::take_writer`] with the handle's write-cancel Notify, minted
+    /// only when there is a half to park on (one made for a closed handle
+    /// would outlive it; #139).
+    fn take_writer_cancellable(
+        &mut self,
+        handle: u64,
+    ) -> Option<(TlsWriter, Arc<tokio::sync::Notify>)> {
+        let writer = self.take_writer(handle)?;
+        let notify = self
+            .write_cancel
+            .entry(handle)
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone();
+        Some((writer, notify))
+    }
+
     /// One checked-out half is back (reinserted or dropped). The last one
     /// back after a `tls_close` clears the closed marker, so nothing about
     /// the handle outlives its final await.
@@ -131,7 +154,7 @@ impl TlsState {
     pub(crate) fn bookkeeping(&self) -> (usize, usize, usize, usize, usize) {
         (
             self.closed.len(),
-            self.cancel.len(),
+            self.cancel.len() + self.write_cancel.len(),
             self.in_flight.len(),
             self.readers.len(),
             self.writers.len(),
@@ -366,10 +389,10 @@ pub fn extra_ca_certs() -> &'static ExtraCaCerts {
 static DEFAULT_CA_OVERRIDE: Mutex<Option<Vec<CertificateDer<'static>>>> = Mutex::new(None);
 
 /// Replace the process default trust store with `pems` (each parsed as PEM,
-/// duplicates dropped). `Err` -- the store left as it was -- when the array
-/// has entries but none parse (Node's `ERR_CRYPTO_OPERATION_FAILED`); an
-/// empty array is accepted and trusts nothing. `Some` is the count kept;
-/// `None` is Node's `ERR_CRYPTO_OPERATION_FAILED`. #199.
+/// duplicates dropped). `Some` is the count kept; an empty array is accepted
+/// and trusts nothing. `None` -- the store left as it was -- when the array
+/// has entries but none parse, which the caller throws as Node's
+/// `ERR_CRYPTO_OPERATION_FAILED`. #199.
 pub fn set_default_ca_certificates(pems: &[String]) -> Option<usize> {
     let mut certs: Vec<CertificateDer<'static>> = Vec::new();
     for pem in pems {
@@ -677,8 +700,9 @@ fn named_refusal(reason: &CertificateError) -> Option<VerifyFailure> {
         CertificateError::BadSignature => {
             VerifyFailure::named("CERT_SIGNATURE_FAILURE", "certificate signature failure")
         }
+        // OpenSSL 3's text (1.1 said "unsupported"; measured on v22.22.2).
         CertificateError::InvalidPurpose | CertificateError::InvalidPurposeContext { .. } => {
-            VerifyFailure::named("INVALID_PURPOSE", "unsupported certificate purpose")
+            VerifyFailure::named("INVALID_PURPOSE", "unsuitable certificate purpose")
         }
         CertificateError::UnhandledCriticalExtension => VerifyFailure::named(
             "UNHANDLED_CRITICAL_EXTENSION",
@@ -727,6 +751,10 @@ struct NodeCertVerifier {
     /// (`SELF_SIGNED_CERT_IN_CHAIN`, not `UNABLE_TO_VERIFY_LEAF_SIGNATURE`),
     /// so they inform the error code and nothing else.
     untrusted_known: Vec<CertificateDer<'static>>,
+    /// The user's self-signed certificates OpenSSL does not take as a CA
+    /// for a server chain (`anchor_refusal`): no anchors here either, and a
+    /// chain that ends at one is refused under the name kept with it.
+    refused_anchors: Vec<RefusedAnchor>,
     /// rejectUnauthorized:false -- verify and record, never fail the
     /// handshake. What fills `socket.authorized` / `authorizationError`.
     advisory: bool,
@@ -845,7 +873,11 @@ impl NodeCertVerifier {
             .chain(self.trusted_non_anchors.iter().cloned())
             .chain(self.untrusted_known.iter().cloned())
             .collect();
-        let classify = || classify_unknown_issuer(end_entity, &known, &self.trusted_non_anchors);
+        let classify = || {
+            refused_anchor_failure(end_entity, &known, &self.refused_anchors).unwrap_or_else(|| {
+                classify_unknown_issuer(end_entity, &known, &self.trusted_non_anchors)
+            })
+        };
         let error = match &self.inner {
             Some(inner) => {
                 match inner.verify_server_cert(end_entity, &known, server_name, &[], now) {
@@ -960,6 +992,9 @@ impl ExtraCaVerifier {
                 trusted_leaves: self_signed,
                 trusted_non_anchors: non_anchors,
                 untrusted_known: Vec::new(),
+                // A chain that ends at a bundle certificate that is no
+                // anchor is `NotAnchored` (`judge`): not this verifier's.
+                refused_anchors: Vec::new(),
                 advisory: false,
                 check_name: true,
                 outcome: Arc::new(Mutex::new(None)),
@@ -987,7 +1022,7 @@ impl ExtraCaVerifier {
         if !serves_tls(end_entity.as_ref()) {
             return ExtraCaVerdict::Refused(VerifyFailure::named(
                 "INVALID_PURPOSE",
-                "unsupported certificate purpose",
+                "unsuitable certificate purpose",
             ));
         }
         match self
@@ -1082,28 +1117,139 @@ fn eku_allows_tls_server(eku: &x509_parser::extensions::ExtendedKeyUsage<'_>) ->
 /// refused (measured on v22.22.2: OpenSSL's "key usage does not include
 /// certificate signing").
 fn can_anchor(der: &[u8]) -> bool {
+    anchor_refusal(der, ChainPurpose::Server).is_none()
+}
+
+/// Which peer a chain is verified for: a client verifies a TLS server's
+/// chain, a server (`requestCert`) a TLS client's. It decides which
+/// extended key usage a trust anchor has to allow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChainPurpose {
+    Server,
+    Client,
+}
+
+/// Why OpenSSL does not take the self-signed `der` as the trust anchor of a
+/// chain verified for `purpose` ([`can_anchor`]'s rules), as Node names it;
+/// None when it does. webpki reads none of an anchor's extensions, so
+/// without this a chain under such a certificate would verify. Measured on
+/// v22.22.2, a leaf signed by a self-signed `ca` certificate, both ways
+/// round (a client verifying its server, a server its client):
+///
+/// - a key usage without keyCertSign -- with CA:TRUE, with CA:FALSE, with no
+///   basicConstraints, with or without an extended key usage -- is code
+///   `UNSPECIFIED`, "key usage does not include certificate signing" (Node
+///   has no name for X509_V_ERR_KEYUSAGE_NO_CERTSIGN);
+/// - CA:FALSE with no key usage, no basicConstraints and no key usage, and
+///   an extended key usage that does not allow the purpose (clientAuth only
+///   under a server chain, serverAuth only under a client chain) are
+///   `INVALID_PURPOSE`, "unsuitable certificate purpose".
+///
+/// An extension that will not parse is refused under the second name, which
+/// errs toward refusing.
+pub(crate) fn anchor_refusal(der: &[u8], purpose: ChainPurpose) -> Option<VerifyFailure> {
+    let unsuitable = || VerifyFailure::named("INVALID_PURPOSE", "unsuitable certificate purpose");
     let Ok((_, cert)) = parse_x509_certificate(der) else {
-        return false;
+        return Some(unsuitable());
     };
     let Ok(key_usage) = cert.key_usage() else {
-        return false;
+        return Some(unsuitable());
     };
     if key_usage
         .as_ref()
         .is_some_and(|ku| !ku.value.key_cert_sign())
     {
-        return false;
+        return Some(VerifyFailure::named(
+            "UNSPECIFIED",
+            "key usage does not include certificate signing",
+        ));
     }
     match cert.extended_key_usage() {
-        Ok(Some(eku)) if !eku_allows_tls_server(eku.value) => return false,
-        Ok(_) => {}
-        Err(_) => return false,
+        Ok(Some(eku)) => {
+            let allowed = match purpose {
+                ChainPurpose::Server => eku_allows_tls_server(eku.value),
+                ChainPurpose::Client => eku.value.client_auth,
+            };
+            if !allowed {
+                return Some(unsuitable());
+            }
+        }
+        Ok(None) => {}
+        Err(_) => return Some(unsuitable()),
     }
-    match cert.basic_constraints() {
+    let is_ca = match cert.basic_constraints() {
         Ok(Some(constraints)) => constraints.value.ca,
         Ok(None) => cert.version().0 == 0 || key_usage.is_some(),
         Err(_) => false,
+    };
+    if is_ca { None } else { Some(unsuitable()) }
+}
+
+/// One of the user's self-signed certificates that is not taken as a trust
+/// anchor, with Node's name for a chain that ends at it.
+pub(crate) type RefusedAnchor = (CertificateDer<'static>, VerifyFailure);
+
+/// Offer one of the user's certificates (`ca`, a replaced default store,
+/// NODE_EXTRA_CA_CERTS, a pfx's CAs) to `root_store` as an anchor for
+/// chains verified for `purpose`. Only a self-signed one anchors a chain
+/// (see `NodeCertVerifier::trusted_non_anchors`), and only one OpenSSL takes
+/// as a CA for that purpose ([`anchor_refusal`]): the others are kept in
+/// `refused`, so a chain that ends at one is named as Node names it.
+pub(crate) fn add_user_anchor(
+    root_store: &mut rustls::RootCertStore,
+    refused: &mut Vec<RefusedAnchor>,
+    cert: &CertificateDer<'static>,
+    purpose: ChainPurpose,
+) {
+    if !is_self_signed(cert.as_ref()) {
+        return;
     }
+    match anchor_refusal(cert.as_ref(), purpose) {
+        // One webpki will not take is still trusted by name, through
+        // `trusted_leaves`.
+        None => {
+            let _ = root_store.add(cert.clone());
+        }
+        Some(failure) => refused.push((cert.clone(), failure)),
+    }
+}
+
+/// Node's name for a chain that builds to one of the user's certificates
+/// that is no trust anchor (`refused`): the chain is followed by name from
+/// `end_entity` through `pool`, as [`classify_unknown_issuer`] follows it,
+/// and its top's issuer looked up among them. None when it ends elsewhere.
+pub(crate) fn refused_anchor_failure(
+    end_entity: &CertificateDer<'_>,
+    pool: &[CertificateDer<'_>],
+    refused: &[RefusedAnchor],
+) -> Option<VerifyFailure> {
+    if refused.is_empty() {
+        return None;
+    }
+    let parsed: Vec<X509Certificate<'_>> = pool
+        .iter()
+        .filter_map(|der| {
+            parse_x509_certificate(der.as_ref())
+                .ok()
+                .map(|(_, cert)| cert)
+        })
+        .collect();
+    let (_, leaf) = parse_x509_certificate(end_entity.as_ref()).ok()?;
+    let mut top: &X509Certificate<'_> = &leaf;
+    let mut depth = 1usize;
+    while top.subject().as_raw() != top.issuer().as_raw() && depth <= parsed.len() {
+        let issuer = top.issuer().as_raw();
+        let Some(next) = parsed.iter().find(|c| c.subject().as_raw() == issuer) else {
+            break;
+        };
+        top = next;
+        depth += 1;
+    }
+    let issuer = top.issuer().as_raw();
+    refused.iter().find_map(|(der, failure)| {
+        let (_, anchor) = parse_x509_certificate(der.as_ref()).ok()?;
+        (anchor.subject().as_raw() == issuer).then(|| failure.clone())
+    })
 }
 
 /// Whether a certificate is its own issuer (subject == issuer, byte for
@@ -1504,16 +1650,23 @@ fn build_client_config(
     let mut root_store = rustls::RootCertStore::empty();
     let extras = extra_ca_certs();
 
-    // The user's certificates: only a self-signed one anchors a chain (see
-    // `trusted_non_anchors`); every one is trusted by name as a leaf.
+    // The user's certificates: only a self-signed one that OpenSSL takes as
+    // a CA anchors a chain (see `trusted_non_anchors`, `add_user_anchor`);
+    // every one is trusted by name as a leaf.
+    let mut refused_anchors: Vec<RefusedAnchor> = Vec::new();
     let (mut trusted_leaves, untrusted_known) = if let Some(ca) = ca_pem {
-        let certs = rustls_pemfile::certs(&mut BufReader::new(ca.as_bytes()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("ca cert parse: {e}"))?;
-        for cert in certs.iter().filter(|c| is_self_signed(c.as_ref())) {
-            root_store
-                .add(cert.clone())
-                .map_err(|e| format!("ca cert add: {e}"))?;
+        // What parses, the rest ignored, as the server side and the peer
+        // certificate payload read the same option (`ca_certificates`): one
+        // section that will not decode, or a certificate webpki will not
+        // take as an anchor, does not fail the connection.
+        let certs = server::ca_certificates(&[ca.to_string()]);
+        for cert in &certs {
+            add_user_anchor(
+                &mut root_store,
+                &mut refused_anchors,
+                cert,
+                ChainPurpose::Server,
+            );
         }
         (certs, extras.certs.clone())
     } else if let Some(override_certs) = default_ca_override() {
@@ -1522,25 +1675,36 @@ fn build_client_config(
         // override trusting nothing -- in place of the bundled roots and
         // NODE_EXTRA_CA_CERTS. A self-signed one anchors a chain; every one
         // is trusted by name as a leaf, as the `ca` option's are.
-        for cert in override_certs.iter().filter(|c| is_self_signed(c.as_ref())) {
-            let _ = root_store.add(cert.clone());
+        for cert in &override_certs {
+            add_user_anchor(
+                &mut root_store,
+                &mut refused_anchors,
+                cert,
+                ChainPurpose::Server,
+            );
         }
         (override_certs, Vec::new())
     } else {
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        for cert in extras.certs.iter().filter(|c| is_self_signed(c.as_ref())) {
-            // One that will not serve as an anchor is still trusted by
-            // name, through `trusted_leaves`.
-            let _ = root_store.add(cert.clone());
+        for cert in &extras.certs {
+            add_user_anchor(
+                &mut root_store,
+                &mut refused_anchors,
+                cert,
+                ChainPurpose::Server,
+            );
         }
         (extras.certs.clone(), Vec::new())
     };
     // A pfx's CA certificates join the store, as the `ca` option's do (Node's
     // LoadPKCS12 adds them to the context's certificate store).
     for cert in identity.map(|c| c.pfx_cas.as_slice()).unwrap_or_default() {
-        if is_self_signed(cert.as_ref()) {
-            let _ = root_store.add(cert.clone());
-        }
+        add_user_anchor(
+            &mut root_store,
+            &mut refused_anchors,
+            cert,
+            ChainPurpose::Server,
+        );
         trusted_leaves.push(cert.clone());
     }
     let trusted_non_anchors: Vec<CertificateDer<'static>> = trusted_leaves
@@ -1572,6 +1736,7 @@ fn build_client_config(
         trusted_leaves,
         trusted_non_anchors,
         untrusted_known,
+        refused_anchors,
         advisory: !reject_unauthorized,
         check_name,
         outcome: outcome.clone(),
@@ -1786,9 +1951,13 @@ pub(crate) fn peer_cert_payload(
 ) -> (Vec<String>, Vec<String>) {
     let peer = peer_certificates_b64(Some(chain)).unwrap_or_default();
     let ca = ca_pem.map(|pem| server::ca_certificates(&[pem.to_string()]));
+    let default_store;
     let mut store: Vec<&CertificateDer<'static>> = match &ca {
         Some(ca) => ca.iter().collect(),
-        None => chain::default_store().iter().collect(),
+        None => {
+            default_store = chain::default_store();
+            default_store.iter().collect()
+        }
     };
     if let Some(identity) = identity {
         store.extend(identity.pfx_cas.iter());
@@ -2095,7 +2264,10 @@ where
     let peer_certificates = peer_certificates_b64(client_conn.peer_certificates());
     let alpn = client_conn
         .alpn_protocol()
-        .map(|p| String::from_utf8_lossy(p).into_owned())
+        // One byte per code point, as `parse_alpn_protocols` took the names
+        // and as the server side reports its own: a name with a byte above
+        // 0x7f comes back equal to the one offered.
+        .map(|p| p.iter().map(|&b| char::from(b)).collect::<String>())
         .unwrap_or_default();
 
     // Node: `authorizationError` is the verify error's code (its message
@@ -2287,9 +2459,9 @@ pub async fn tls_write(registry: TlsRegistry, handle: u64, data: Vec<u8>) -> OpO
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
         // The held final flight goes ahead of this data (flight.rs).
         guard.release_flight(handle);
-        guard.take_writer(handle)
+        guard.take_writer_cancellable(handle)
     };
-    let Some(writer) = writer else {
+    let Some((writer, notify)) = writer else {
         return OpOutcome::Failed(format!("tls: write handle {handle} is gone"));
     };
     let _in_flight = InFlight {
@@ -2298,25 +2470,46 @@ pub async fn tls_write(registry: TlsRegistry, handle: u64, data: Vec<u8>) -> OpO
     };
 
     match writer {
-        TlsWriter::Client(w) => write_half(&registry, handle, w, &data, TlsWriter::Client).await,
-        TlsWriter::Server(w) => write_half(&registry, handle, w, &data, TlsWriter::Server).await,
-        TlsWriter::Wrapped(w) => write_half(&registry, handle, w, &data, TlsWriter::Wrapped).await,
+        TlsWriter::Client(w) => {
+            write_half(&registry, handle, w, &notify, &data, TlsWriter::Client).await
+        }
+        TlsWriter::Server(w) => {
+            write_half(&registry, handle, w, &notify, &data, TlsWriter::Server).await
+        }
+        TlsWriter::Wrapped(w) => {
+            write_half(&registry, handle, w, &notify, &data, TlsWriter::Wrapped).await
+        }
     }
 }
 
 /// One write on a checked-out half, reinserted (as `back` rebuilds it) once
-/// every byte went.
+/// every byte went, dropped on an error or when tls_close fires the cancel.
+/// A write the peer is not draining parks here for as long as the peer
+/// likes; a close must not wait for it (tcp.rs's write selects against its
+/// close wake the same way). What it has not handed the stream yet is
+/// dropped, as libuv cancels a write still pending when its handle closes.
 async fn write_half<S>(
     registry: &TlsRegistry,
     handle: u64,
     mut w: WriteHalf<S>,
+    notify: &tokio::sync::Notify,
     data: &[u8],
     back: fn(WriteHalf<S>) -> TlsWriter,
 ) -> OpOutcome
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
-    match w.write_all(data).await {
+    let wrote = tokio::select! {
+        biased;
+        wrote = w.write_all(data) => wrote,
+        // tls_close fired: drop the write half so the BiLock releases and
+        // the socket closes; do NOT reinsert.
+        _ = notify.notified() => {
+            drop(w);
+            return OpOutcome::Failed(format!("tls: write handle {handle} is gone"));
+        }
+    };
+    match wrote {
         Ok(()) => {
             reinsert_writer(registry, handle, back(w));
             OpOutcome::Done
@@ -2325,14 +2518,28 @@ where
     }
 }
 
+/// One close_notify + FIN on a checked-out half, which is dropped either
+/// way; tls_close's cancel ends a shutdown parked behind a peer that is not
+/// draining.
+async fn shutdown_half<S>(mut w: WriteHalf<S>, notify: &tokio::sync::Notify)
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    tokio::select! {
+        biased;
+        _ = w.shutdown() => {}
+        _ = notify.notified() => {}
+    }
+}
+
 pub async fn tls_shutdown(registry: TlsRegistry, handle: u64) -> OpOutcome {
     let writer = {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
         // The held final flight goes ahead of the close_notify (flight.rs).
         guard.release_flight(handle);
-        guard.take_writer(handle)
+        guard.take_writer_cancellable(handle)
     };
-    let Some(writer) = writer else {
+    let Some((writer, notify)) = writer else {
         return OpOutcome::Done;
     };
     let _in_flight = InFlight {
@@ -2340,15 +2547,9 @@ pub async fn tls_shutdown(registry: TlsRegistry, handle: u64) -> OpOutcome {
         handle,
     };
     match writer {
-        TlsWriter::Client(mut w) => {
-            let _ = w.shutdown().await;
-        }
-        TlsWriter::Server(mut w) => {
-            let _ = w.shutdown().await;
-        }
-        TlsWriter::Wrapped(mut w) => {
-            let _ = w.shutdown().await;
-        }
+        TlsWriter::Client(w) => shutdown_half(w, &notify).await,
+        TlsWriter::Server(w) => shutdown_half(w, &notify).await,
+        TlsWriter::Wrapped(w) => shutdown_half(w, &notify).await,
     }
     OpOutcome::Done
 }
@@ -2370,6 +2571,12 @@ pub fn tls_close(registry: &TlsRegistry, handle: u64) {
     if let Some(notify) = guard.cancel.remove(&handle) {
         notify.notify_one();
     }
+    // And any parked tls_write / tls_shutdown, which holds the other half.
+    // The Notify is dropped from the map either way, so a permit stored for
+    // an op that already finished goes with it.
+    if let Some(notify) = guard.write_cancel.remove(&handle) {
+        notify.notify_one();
+    }
 }
 
 #[cfg(test)]
@@ -2379,25 +2586,27 @@ mod tests {
 
     /// The e2e suite's self-signed CA:TRUE localhost certificate (no
     /// subjectAltName at all, CN=localhost only) -- the shape rustls alone
-    /// refuses as a leaf, and the one Node matches by CN.
+    /// refuses as a leaf, and the one Node matches by CN. Valid 2025-2125,
+    /// as the other fixtures are: the tests that connect with it run on
+    /// the real clock.
     const CERT: &str = "-----BEGIN CERTIFICATE-----\n\
-MIIDCTCCAfGgAwIBAgIUJscRiMbEzxV45KtAxD+Lly4dJrQwDQYJKoZIhvcNAQEL\n\
-BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDYxNTEyMzAwN1oXDTI3MDYx\n\
-NTEyMzAwN1owFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF\n\
-AAOCAQ8AMIIBCgKCAQEAoQ5a/fh4J3VW0MPpngEpN+yRUdJtlmY6aBhV/984yEIm\n\
-ng9/MGoK0ZRdB8YYGqx4awK1z82ECwtmmdVO/77WA4q6N0CJRzmAF6BN9RgzoyKV\n\
-2w1ltowPFyB6SrVqcW1MHqA/9NX/gw/ckvcjcuazYeI857joWulUmR/iWIpSNuBJ\n\
-c6odEIkfXG9W6/GyZwlutQXnKaa8eClLqCm+hDnkPBHx+doGWxezFVeOfFAdQM8w\n\
-NXT7mj4QN3fiHFDQHI6UkSnVttu7lAAEHY978gjnVyixAPX2dY9mB/Ed4R5eSOpJ\n\
-eTR7bXH6+QmUcDJSaDblM5vB3fb3zhitEGLo/APdQQIDAQABo1MwUTAdBgNVHQ4E\n\
-FgQUPffw9cdyC1LQ2PLrzN7IZjkpKmMwHwYDVR0jBBgwFoAUPffw9cdyC1LQ2PLr\n\
-zN7IZjkpKmMwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAWtdW\n\
-V/jSdVB5cN4GOwYXTHhh3dkYDtAPvFPCXbYacelaQe8mlRWv2BBHAhOZdmoJ3ai/\n\
-kNRw0D6pKqjcF4p17of9S07ZFCRaQGBAsDEd9jNY156AlEXu4Z8yp/kXE3fvznib\n\
-WHrQjdlDcmC2H/Ao+S7f4BkmbvsabyDbUoo+0Drk4MDvqga2azrFDdljqXQxzrEH\n\
-/mEwoi9pfukgFnFnhDE+WEqNsZQF9Yxa5QEX6d5tgbOcxS2NpKDug4xSgkpAQ0l6\n\
-XKpI59mdGTahOy9zGuNfTqVTHvrFoSXudnNHUjkfHK7Mh/VrNz9ZGpwDt5fGFD4x\n\
-E13+0jp6In545LYu+A==\n\
+MIIDCzCCAfOgAwIBAgIUJscRiMbEzxV45KtAxD+Lly4dJrQwDQYJKoZIhvcNAQEL\n\
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI1MDEwMTAwMDAwMFoYDzIxMjUw\n\
+MTAxMDAwMDAwWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEB\n\
+AQUAA4IBDwAwggEKAoIBAQChDlr9+HgndVbQw+meASk37JFR0m2WZjpoGFX/3zjI\n\
+QiaeD38wagrRlF0HxhgarHhrArXPzYQLC2aZ1U7/vtYDiro3QIlHOYAXoE31GDOj\n\
+IpXbDWW2jA8XIHpKtWpxbUweoD/01f+DD9yS9yNy5rNh4jznuOha6VSZH+JYilI2\n\
+4Elzqh0QiR9cb1br8bJnCW61Becpprx4KUuoKb6EOeQ8EfH52gZbF7MVV458UB1A\n\
+zzA1dPuaPhA3d+IcUNAcjpSRKdW227uUAAQdj3vyCOdXKLEA9fZ1j2YH8R3hHl5I\n\
+6kl5NHttcfr5CZRwMlJoNuUzm8Hd9vfOGK0QYuj8A91BAgMBAAGjUzBRMB0GA1Ud\n\
+DgQWBBQ99/D1x3ILUtDY8uvM3shmOSkqYzAfBgNVHSMEGDAWgBQ99/D1x3ILUtDY\n\
+8uvM3shmOSkqYzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAH\n\
+jdkIGOWczuu/hZMJ3QZcynx2Uxm7qK3cox56uFpnO7RPkv4jBu9SAOl7WVWwOlYb\n\
+MlL7Iamv+A+NdghDucbEiDyw9798hVQggIe1cjMjkdpeXD1vBp2XWzVcFUCkQFjP\n\
+kWeSUzzcsaC/rFV5xASqP2RQK+aGAPeUfhgin1lCtuC0zfhfsQVTSD5HrPkTKYMj\n\
+7GKUJqmLqTPreCVblP9BCm9S4Og5mvNx1SFwBUIHIcuosk9daaf7JZQynYv1yJRp\n\
+E3ybo/8zVvpZ3durGRT9NLilVC289CbYbRWAkh2zmHNA5nZsgxU9/JSLAjgtmLEt\n\
+laiOwbm2oOPQ9QfligDD\n\
 -----END CERTIFICATE-----";
 
     const KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
@@ -2712,7 +2921,8 @@ v9rosiSQqKE13Nl/HtOJB/w=\n\
             }
             other => panic!("{other:?}"),
         }
-        let later = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_900_000_000));
+        // Past the fixture's notAfter (2125-01-01, 4_891_363_200).
+        let later = UnixTime::since_unix_epoch(std::time::Duration::from_secs(5_000_000_000));
         match verifier.judge(&cert, &[], &localhost, later) {
             ExtraCaVerdict::Refused(failure) => {
                 assert_eq!(failure.code, Some("CERT_HAS_EXPIRED"));
@@ -2786,7 +2996,7 @@ v9rosiSQqKE13Nl/HtOJB/w=\n\
         ) {
             ExtraCaVerdict::Refused(failure) => {
                 assert_eq!(failure.code, Some("INVALID_PURPOSE"));
-                assert_eq!(failure.message, "unsupported certificate purpose");
+                assert_eq!(failure.message, "unsuitable certificate purpose");
             }
             other => panic!("{other:?}"),
         }
@@ -2829,6 +3039,78 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
         // Trusted by name all the same, as any self-signed bundle
         // certificate is: the verifier exists, and anchors nothing.
         assert!(ExtraCaVerifier::new(&[pem_der(CLIENT_AUTH_ROOT)]).is_some());
+    }
+
+    /// The `ca` option's certificates anchor a chain on the same rules: a
+    /// self-signed one OpenSSL does not take as a CA for the purpose stays
+    /// out of the root store, and a chain that ends at it carries node's
+    /// name for the refusal. The purpose decides which extended key usage
+    /// passes.
+    #[test]
+    fn a_ca_certificate_that_is_no_ca_anchors_nothing_and_names_the_refusal() {
+        let refusal = |pem: &str, purpose| {
+            anchor_refusal(pem_der(pem).as_ref(), purpose).map(|f| (f.code, f.message))
+        };
+        assert_eq!(refusal(PLAIN_ROOT, ChainPurpose::Server), None);
+        assert_eq!(refusal(PLAIN_ROOT, ChainPurpose::Client), None);
+        assert_eq!(
+            refusal(CLIENT_AUTH_ROOT, ChainPurpose::Server),
+            Some((
+                Some("INVALID_PURPOSE"),
+                "unsuitable certificate purpose".to_string()
+            ))
+        );
+        assert_eq!(refusal(CLIENT_AUTH_ROOT, ChainPurpose::Client), None);
+        let no_cert_sign = Some((
+            Some("UNSPECIFIED"),
+            "key usage does not include certificate signing".to_string(),
+        ));
+        assert_eq!(refusal(DEV_CERT, ChainPurpose::Server), no_cert_sign);
+
+        let mut root_store = rustls::RootCertStore::empty();
+        let mut refused = Vec::new();
+        for pem in [PLAIN_ROOT, DEV_CERT, MINTED_BY_DEV_CERT] {
+            add_user_anchor(
+                &mut root_store,
+                &mut refused,
+                &pem_der(pem),
+                ChainPurpose::Server,
+            );
+        }
+        assert_eq!(root_store.len(), 1, "the plain root alone anchors");
+        assert_eq!(
+            refused.len(),
+            1,
+            "the one that is not self-signed is neither"
+        );
+        assert_eq!(refused[0].0, pem_der(DEV_CERT));
+        // A leaf its key signed is refused under its name; a chain that
+        // ends elsewhere is left to `classify_unknown_issuer`.
+        assert_eq!(
+            refused_anchor_failure(&pem_der(MINTED_BY_DEV_CERT), &[], &refused)
+                .map(|f| (f.code, f.message)),
+            no_cert_sign
+        );
+        assert_eq!(refused_anchor_failure(&pem_der(CERT), &[], &refused), None);
+    }
+
+    /// A `ca` with a section that will not decode is read as the server
+    /// side reads it: what parses is kept, the rest ignored, and the
+    /// connection is not failed for it.
+    #[test]
+    fn a_ca_with_an_undecodable_section_still_builds_a_client() {
+        let ca = format!(
+            "-----BEGIN CERTIFICATE-----\n!!!! not base64 !!!!\n-----END CERTIFICATE-----\n{CERT}"
+        );
+        assert_eq!(server::ca_certificates(std::slice::from_ref(&ca)).len(), 1);
+        let versions = protocol_versions(None, None).unwrap();
+        assert!(
+            build_client_config(Some(&ca), None, true, true, &versions, Arc::default()).is_ok()
+        );
+        let garbage = "not a certificate at all";
+        assert!(
+            build_client_config(Some(garbage), None, true, true, &versions, Arc::default()).is_ok()
+        );
     }
 
     #[test]
@@ -3307,7 +3589,14 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
         .await
         .expect("the refusal does not hang");
         match outcome {
-            OpOutcome::NodeFailed { code, .. } => assert!(!code.is_empty()),
+            // The verifier's own verdict, as over a connection oam opened
+            // (`untrusted_self_signed_certificate_is_depth_zero_self_signed`)
+            // -- not whatever the transport reported once the handshake
+            // was abandoned.
+            OpOutcome::NodeFailed { code, message, .. } => {
+                assert_eq!(code, "DEPTH_ZERO_SELF_SIGNED_CERT");
+                assert_eq!(message, "self-signed certificate");
+            }
             other => panic!("expected node's refusal, got {other:?}"),
         }
         assert_eq!(registry.lock().unwrap().bookkeeping(), (0, 0, 0, 0, 0));
@@ -3506,6 +3795,134 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
             (0, 0, 0, 0, 0),
             "(closed, cancel, in_flight, readers, writers)"
         );
+    }
+
+    /// A write the peer is not draining holds the write half for as long
+    /// as the peer likes -- and with it the split stream, so the socket
+    /// stays open and the op pending. `tls_close` ends it, as it ends a
+    /// parked read: the write fails as on a handle that is gone, and
+    /// nothing of the handle is left behind.
+    #[tokio::test]
+    async fn a_close_ends_a_write_the_peer_is_not_draining() {
+        let registry: TlsRegistry = Arc::new(Mutex::new(TlsState::default()));
+        let ids = Arc::new(AtomicU64::new(1));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Finishes the handshake, then holds the connection without
+        // reading a byte until the test lets it go.
+        let (let_go, held) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let acceptor = tokio_rustls::TlsAcceptor::from(test_server_config());
+            let (tcp, _) = listener.accept().await.unwrap();
+            let stream = acceptor.accept(tcp).await;
+            let _ = held.await;
+            drop(stream);
+        });
+
+        let OpOutcome::Json(payload) = tls_connect(
+            registry.clone(),
+            ids.clone(),
+            "127.0.0.1".into(),
+            port,
+            Some("localhost".into()),
+            Some(CERT.into()),
+            true,
+            None,
+            true,
+            None,
+            None,
+            crate::net_connect::DEFAULT_ATTEMPT_TIMEOUT,
+        )
+        .await
+        else {
+            panic!("connect failed");
+        };
+        let info: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let handle = info["handle"].as_u64().unwrap();
+
+        // Far more than the socket buffers of both ends hold.
+        let parked = tokio::spawn(tls_write(
+            registry.clone(),
+            handle,
+            vec![0u8; 64 * 1024 * 1024],
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !parked.is_finished(),
+            "the write waits on a peer that reads nothing"
+        );
+        tls_close(&registry, handle);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), parked)
+            .await
+            .expect("the close ends the parked write")
+            .unwrap();
+        assert!(matches!(outcome, OpOutcome::Failed(_)), "{outcome:?}");
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+        // A write or a shutdown that lands after the close parks on nothing.
+        assert!(matches!(
+            tls_write(registry.clone(), handle, b"late".to_vec()).await,
+            OpOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            tls_shutdown(registry.clone(), handle).await,
+            OpOutcome::Done
+        ));
+        assert_eq!(registry.lock().unwrap().bookkeeping(), (0, 0, 0, 0, 0));
+
+        let _ = let_go.send(());
+        server.await.unwrap();
+    }
+
+    /// The negotiated ALPN name is reported one byte per code point, the
+    /// way `parse_alpn_protocols` took the names offered: one with bytes
+    /// above 0x7f (a Buffer entry) comes back equal to what was offered.
+    #[tokio::test]
+    async fn a_negotiated_alpn_name_comes_back_byte_for_byte() {
+        let registry: TlsRegistry = Arc::new(Mutex::new(TlsState::default()));
+        let ids = Arc::new(AtomicU64::new(1));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let offered = parse_alpn_protocols("[\"x\u{e9}\u{ff}\"]").unwrap();
+        assert_eq!(offered, vec![vec![b'x', 0xe9, 0xff]]);
+        let mut config = rustls::ServerConfig::clone(&test_server_config());
+        config.alpn_protocols = offered.clone();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            if let Ok(mut stream) = acceptor.accept(tcp).await {
+                let mut buf = [0u8; 16];
+                let _ = stream.read(&mut buf).await;
+            }
+        });
+
+        let OpOutcome::Json(payload) = tls_connect_pinned(
+            registry.clone(),
+            ids.clone(),
+            "127.0.0.1".into(),
+            port,
+            Some("localhost".into()),
+            Some(CERT.into()),
+            true,
+            None,
+            true,
+            None,
+            None,
+            crate::net_connect::DEFAULT_ATTEMPT_TIMEOUT,
+            None,
+            None,
+            offered,
+        )
+        .await
+        else {
+            panic!("connect failed");
+        };
+        let info: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(info["alpnProtocol"], "x\u{e9}\u{ff}", "{payload}");
+        tls_close(&registry, info["handle"].as_u64().unwrap());
     }
 
     /// The verifier's verdict drives `authorized` / `authorizationError`

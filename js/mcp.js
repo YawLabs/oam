@@ -21,8 +21,35 @@
 (function oamMcpModule(registry) {
   registry.factories["oam:mcp"] = () => {
     const PROTOCOL_VERSION = "2025-11-25";
+    // Revisions this server can speak, newest first. Same list as the
+    // `oam mcp` host in crates/oam_mcp. `initialize` answers the client's
+    // revision when it is one of these and the newest otherwise, which is the
+    // negotiation the spec describes.
+    const SUPPORTED_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
     const JSONRPC = "2.0";
-    const SESSION_TIMEOUT_MS = 30 * 60 * 1000; // idle SSE session reaper
+    const SESSION_TIMEOUT_MS = 30 * 60 * 1000; // idle session reaper (SSE and /mcp)
+    // Streamable-HTTP sessions are created by any `initialize`, so the table
+    // is bounded: the oldest entry goes when it is full.
+    const MAX_HTTP_SESSIONS = 1024;
+    // Largest request body the HTTP transports buffer before answering 413.
+    const MAX_BODY_BYTES = 16 * 1024 * 1024;
+
+    /** Per-client protocol state. One per stdio process, one per SSE
+     *  connection, one per Mcp-Session-Id on the streamable-HTTP endpoint --
+     *  never one per server, or the first client to initialise would
+     *  initialise everybody. */
+    function newClientState() {
+      return { initialized: false, protocolVersion: null, lastSeen: Date.now() };
+    }
+
+    /** JSON text for a handler result. `JSON.stringify` returns undefined (not
+     *  a string) for undefined, a function or a symbol, and a `text` field
+     *  holding undefined vanishes on serialisation, leaving a block that no
+     *  schema accepts. */
+    function jsonText(value) {
+      const s = JSON.stringify(value);
+      return typeof s === "string" ? s : "";
+    }
 
     class McpServer {
       #name;
@@ -31,8 +58,6 @@
       #resources = new Map();
       #resourceTemplates = new Map();
       #prompts = new Map();
-      #initialized = false;
-      #sessionId = null;
       #onClose = null;
 
       constructor(options) {
@@ -118,8 +143,11 @@
           return this.#serveStdio();
         }
         if (transport === "http") {
+          // `??`, not `||`: port 0 is a real request (the OS picks a free
+          // port, reported back on the resolved value), not "unset".
+          const envPort = parseInt(process.env.PORT, 10);
           return this.#serveHttp(
-            opts.port || parseInt(process.env.PORT, 10) || 3000,
+            opts.port ?? (Number.isInteger(envPort) && envPort >= 0 ? envPort : 3000),
             opts.host || "127.0.0.1",
             opts.allowedOrigins,
           );
@@ -135,19 +163,19 @@
         return caps;
       }
 
-      async #handleMessage(message) {
+      async #handleMessage(message, client) {
         if (Array.isArray(message)) {
           const responses = [];
           for (const msg of message) {
-            const r = await this.#handleSingle(msg);
+            const r = await this.#handleSingle(msg, client);
             if (r) responses.push(r);
           }
           return responses.length ? responses : null;
         }
-        return this.#handleSingle(message);
+        return this.#handleSingle(message, client);
       }
 
-      async #handleSingle(message) {
+      async #handleSingle(message, client) {
         // A JSON-RPC message must be an object. `JSON.parse` happily returns
         // null, a number or a string for a well-formed body, and reading `.id`
         // off null throws -- which on the HTTP transports lands in an
@@ -184,13 +212,13 @@
 
         if (isNotification) return null;
 
-        if (method !== "initialize" && !this.#initialized) {
+        if (method !== "initialize" && !client.initialized) {
           return { jsonrpc: JSONRPC, id, error: { code: -32002, message: "server not initialized" } };
         }
 
         let result;
         try {
-          result = await this.#dispatch(method, params);
+          result = await this.#dispatch(method, params, client);
         } catch (err) {
           return { jsonrpc: JSONRPC, id, error: { code: -32603, message: String(err.message || err) } };
         }
@@ -202,13 +230,17 @@
         return { jsonrpc: JSONRPC, id, result };
       }
 
-      async #dispatch(method, params) {
+      async #dispatch(method, params, client) {
         switch (method) {
           case "initialize": {
-            this.#initialized = true;
-            this.#sessionId = crypto.randomUUID();
+            const requested = params.protocolVersion;
+            client.protocolVersion =
+              typeof requested === "string" && SUPPORTED_VERSIONS.includes(requested)
+                ? requested
+                : PROTOCOL_VERSION;
+            client.initialized = true;
             return {
-              protocolVersion: PROTOCOL_VERSION,
+              protocolVersion: client.protocolVersion,
               capabilities: this.#buildCapabilities(),
               serverInfo: { name: this.#name, version: this.#version },
             };
@@ -266,7 +298,10 @@
           if (typeof result === "string") {
             return { content: [{ type: "text", text: result }] };
           }
-          return { content: [{ type: "text", text: JSON.stringify(result) }] };
+          // A side-effect-only handler returns nothing: an empty content
+          // array is the valid "no output" result.
+          if (result === undefined) return { content: [] };
+          return { content: [{ type: "text", text: jsonText(result) }] };
         } catch (err) {
           return {
             content: [{ type: "text", text: String(err.message || err) }],
@@ -328,7 +363,8 @@
         if (Array.isArray(result)) {
           return { messages: result };
         }
-        return { messages: [{ role: "user", content: { type: "text", text: JSON.stringify(result) } }] };
+        if (result === undefined) return { messages: [] };
+        return { messages: [{ role: "user", content: { type: "text", text: jsonText(result) } }] };
       }
 
       // ---- stdio transport ----
@@ -338,6 +374,10 @@
         const stdout = process.stdout;
         let buffer = "";
         let chain = Promise.resolve();
+        const client = newClientState();
+        // One decoder for the whole stream, so a multi-byte character split
+        // across two chunks is reassembled rather than replaced.
+        const decoder = new TextDecoder();
 
         const processLine = async (line) => {
           line = line.trim();
@@ -352,7 +392,7 @@
             return;
           }
 
-          const response = await this.#handleMessage(message);
+          const response = await this.#handleMessage(message, client);
           if (response) {
             stdout.write(JSON.stringify(response) + "\n");
           }
@@ -360,7 +400,7 @@
 
         return new Promise((resolve) => {
           const onData = (chunk) => {
-            buffer += (typeof chunk === "string") ? chunk : new TextDecoder().decode(chunk);
+            buffer += (typeof chunk === "string") ? chunk : decoder.decode(chunk, { stream: true });
             const lines = buffer.split("\n");
             buffer = lines.pop();
             for (const line of lines) {
@@ -417,6 +457,8 @@
       async #serveHttp(port, host, allowedOrigins) {
         const { createServer } = __oamNode.get("http");
         const sessions = new Map();
+        // Streamable-HTTP client state, keyed by Mcp-Session-Id.
+        const httpSessions = new Map();
         const allowed = normalizeOrigins(allowedOrigins);
 
         const server = createServer(async (req, res) => {
@@ -464,7 +506,22 @@
               return await this.#handleSseMessage(req, res, sessions, url);
             }
             if (req.method === "POST" && url.pathname === "/mcp") {
-              return await this.#handleStreamableHttp(req, res);
+              return await this.#handleStreamableHttp(req, res, httpSessions);
+            }
+            if (req.method === "DELETE" && url.pathname === "/mcp") {
+              // The client ending its session, per the streamable-HTTP spec.
+              const sid = req.headers["mcp-session-id"];
+              if (typeof sid !== "string" || sid === "") {
+                res.writeHead(400);
+                res.end("Mcp-Session-Id header required");
+              } else if (httpSessions.delete(sid)) {
+                res.writeHead(204);
+                res.end();
+              } else {
+                res.writeHead(404);
+                res.end("session not found");
+              }
+              return;
             }
             if (req.method === "GET" && url.pathname === "/health") {
               res.writeHead(200, { "Content-Type": "application/json" });
@@ -483,7 +540,18 @@
               process.stderr.write(`oam:mcp request failed: ${String((err && err.message) || err)}\n`);
             } catch {}
             try {
-              if (!res.headersSent) {
+              if (!res.headersSent && err && err.code === "OAM_MCP_BODY_TOO_LARGE") {
+                // The rest of the upload is discarded by readBody, and the
+                // connection is not reused.
+                res.writeHead(413, { "Content-Type": "application/json", Connection: "close" });
+                res.end(
+                  JSON.stringify({
+                    jsonrpc: JSONRPC,
+                    id: null,
+                    error: { code: -32600, message: "request body too large" },
+                  }),
+                );
+              } else if (!res.headersSent) {
                 res.writeHead(500, { "Content-Type": "application/json" });
                 res.end(
                   JSON.stringify({
@@ -519,15 +587,23 @@
         const endpoint = `/message?sessionId=${sessionId}`;
         res.write(`event: endpoint\ndata: ${endpoint}\n\n`);
 
-        const timer = setTimeout(() => {
+        const session = { res, alive: true, timer: null, client: newClientState() };
+        session.timer = setTimeout(() => {
+          session.alive = false;
           sessions.delete(sessionId);
           try { res.end(); } catch {}
         }, SESSION_TIMEOUT_MS);
 
-        sessions.set(sessionId, { res, alive: true, timer });
+        sessions.set(sessionId, session);
 
         req.on("close", () => {
-          clearTimeout(timer);
+          // session.timer, not the timer armed above: every message re-arms
+          // it, so the one captured at connect time is long gone by now.
+          // `alive` goes false so a reply still in flight is dropped rather
+          // than written to an ended response.
+          session.alive = false;
+          clearTimeout(session.timer);
+          session.timer = null;
           sessions.delete(sessionId);
         });
       }
@@ -558,21 +634,25 @@
         res.writeHead(202);
         res.end("accepted");
 
-        if (session.timer) {
+        // Re-arm only while the stream is open: the body read above awaits,
+        // and the client may have disconnected in the meantime -- arming a
+        // timer then would hold the ended response for the full timeout.
+        if (session.alive && session.timer) {
           clearTimeout(session.timer);
           session.timer = setTimeout(() => {
+            session.alive = false;
             sessions.delete(sessionId);
             try { session.res.end(); } catch {}
           }, SESSION_TIMEOUT_MS);
         }
 
-        const response = await this.#handleMessage(message);
+        const response = await this.#handleMessage(message, session.client);
         if (response && session.alive) {
           session.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
         }
       }
 
-      async #handleStreamableHttp(req, res) {
+      async #handleStreamableHttp(req, res, httpSessions) {
         const body = await readBody(req);
         let message;
         try {
@@ -583,14 +663,58 @@
           return;
         }
 
-        const response = await this.#handleMessage(message);
+        // Protocol state belongs to the session the request names. A request
+        // with no Mcp-Session-Id gets a fresh, uninitialised state: it can
+        // `initialize` (which mints a session and returns its id in the
+        // response header) and nothing else. An id this server did not issue,
+        // or one that has expired, is 404 -- the spec's signal to the client
+        // to start a new session.
+        const headerId = req.headers["mcp-session-id"];
+        let sessionId = null;
+        let client;
+        if (typeof headerId === "string" && headerId !== "") {
+          client = httpSessions.get(headerId);
+          if (client && Date.now() - client.lastSeen > SESSION_TIMEOUT_MS) {
+            httpSessions.delete(headerId);
+            client = undefined;
+          }
+          if (!client) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ jsonrpc: JSONRPC, id: null, error: { code: -32001, message: "session not found" } }));
+            return;
+          }
+          sessionId = headerId;
+          client.lastSeen = Date.now();
+        } else {
+          client = newClientState();
+        }
+
+        const response = await this.#handleMessage(message, client);
+
+        if (sessionId === null && client.initialized) {
+          const now = Date.now();
+          for (const [id, s] of httpSessions) {
+            if (now - s.lastSeen > SESSION_TIMEOUT_MS) httpSessions.delete(id);
+          }
+          while (httpSessions.size >= MAX_HTTP_SESSIONS) {
+            httpSessions.delete(httpSessions.keys().next().value);
+          }
+          sessionId = crypto.randomUUID();
+          client.lastSeen = now;
+          httpSessions.set(sessionId, client);
+        }
+
         const headers = { "Content-Type": "application/json" };
-        if (this.#sessionId) headers["Mcp-Session-Id"] = this.#sessionId;
+        if (sessionId !== null) headers["Mcp-Session-Id"] = sessionId;
         if (response) {
           res.writeHead(200, headers);
           res.end(JSON.stringify(response));
         } else {
-          res.writeHead(202);
+          if (sessionId !== null) {
+            res.writeHead(202, { "Mcp-Session-Id": sessionId });
+          } else {
+            res.writeHead(202);
+          }
           res.end();
         }
       }
@@ -613,6 +737,12 @@
       return out;
     }
 
+    // stdio whenever stdin is not a terminal -- which is how an MCP client
+    // spawns a server (stdin is a pipe). The same test is true of a service
+    // or container started with stdin closed or redirected: that process
+    // serves stdio, reads EOF and returns. A server meant to listen there
+    // must say so with serve({ transport: "http" }); the environment is not
+    // consulted, since a stdio server routinely inherits an unrelated PORT.
     function detectTransport() {
       try {
         if (process.stdin && !process.stdin.isTTY) return "stdio";
@@ -622,9 +752,31 @@
 
     function readBody(req) {
       return new Promise((resolve, reject) => {
+        // One streaming decoder for the whole body: a UTF-8 sequence that
+        // straddles a chunk boundary is carried over, not turned into two
+        // replacement characters. Bounded, because the body is buffered whole.
+        const decoder = new TextDecoder();
         const chunks = [];
-        req.on("data", (c) => chunks.push(typeof c === "string" ? c : new TextDecoder().decode(c)));
-        req.on("end", () => resolve(chunks.join("")));
+        let size = 0;
+        let overflowed = false;
+        req.on("data", (c) => {
+          if (overflowed) return; // keep draining, keep nothing
+          size += c.length;
+          if (size > MAX_BODY_BYTES) {
+            overflowed = true;
+            chunks.length = 0;
+            const err = new Error(`request body exceeds ${MAX_BODY_BYTES} bytes`);
+            err.code = "OAM_MCP_BODY_TOO_LARGE";
+            reject(err);
+            return;
+          }
+          chunks.push(typeof c === "string" ? c : decoder.decode(c, { stream: true }));
+        });
+        req.on("end", () => {
+          if (overflowed) return;
+          chunks.push(decoder.decode());
+          resolve(chunks.join(""));
+        });
         req.on("error", reject);
       });
     }
@@ -640,7 +792,9 @@
         return { contents: [{ uri, mimeType, blob: btoa(binary.join("")) }] };
       }
       if (result && result.contents) return result;
-      return { contents: [{ uri, mimeType, text: JSON.stringify(result) }] };
+      // jsonText: an undefined result reads as an empty resource, never as a
+      // contents entry with neither `text` nor `blob`.
+      return { contents: [{ uri, mimeType, text: jsonText(result) }] };
     }
 
     function matchUriTemplate(template, uri) {

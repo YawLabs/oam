@@ -51,6 +51,19 @@ impl ReadHalf {
             _ => None,
         }
     }
+
+    /// The socket underneath, for a read that must not wait
+    /// ([`tcp_read_ahead`]). None for a Windows named pipe or a bridged
+    /// duplex, which have no such read.
+    fn socket(&self) -> Option<socket2::SockRef<'_>> {
+        match self {
+            ReadHalf::Tcp(reader) => Some(socket2::SockRef::from(reader.as_ref())),
+            #[cfg(unix)]
+            ReadHalf::Unix(reader) => Some(socket2::SockRef::from(reader.as_ref())),
+            #[cfg(windows)]
+            _ => None,
+        }
+    }
 }
 
 /// One stream's write half: a TCP connection's, or a pipe's.
@@ -399,11 +412,15 @@ pub struct TcpState {
     shut_down: HashSet<u64>,
     /// Halves currently out of the maps for an await, per stream handle.
     in_flight: HashMap<u64, u32>,
-    /// An accept's wake-up, per server id, for as long as the accept is in
-    /// flight (one at a time per server); per stream handle, the
-    /// wake-up of the reads and writes parked on it, which [`tcp_close`]
-    /// and [`tcp_reset`] send (created by the first read or queued write).
+    /// Per stream handle, the wake-up of the reads and writes parked on it,
+    /// which [`tcp_close`] and [`tcp_reset`] send (created by the first read
+    /// or queued write).
     cancel: HashMap<u64, std::sync::Arc<tokio::sync::Notify>>,
+    /// Per server id, an accept's wake-up, for as long as the accept is in
+    /// flight (one at a time per server), which [`tcp_server_close`] sends.
+    /// A map of its own: nothing here relies on server ids and stream
+    /// handles being drawn from one counter.
+    accepting: HashMap<u64, std::sync::Arc<tokio::sync::Notify>>,
     /// The back of each stream handle's write queue: the latest `tcp_write_start`
     /// or `tcp_shutdown_start` issued for it and still pending (see [`WriteTurn`]).
     /// The last turn out removes the entry.
@@ -415,7 +432,44 @@ pub struct TcpState {
     /// would only have reset them, and a Windows pipe server's connection
     /// held the pipe's name until then.
     untaken: HashMap<u64, HashSet<u64>>,
+    /// Stream handles the process may not exit on top of
+    /// ([`tcp_linger_at_exit`]): each is closed in order first
+    /// ([`tcp_settle_lingering`]).
+    linger: HashSet<u64>,
+    /// Signalled each time the last half out for an await is back (see
+    /// [`TcpState::release`]): what [`tcp_settle_lingering`] waits on.
+    released: std::sync::Arc<tokio::sync::Notify>,
+    /// Per stream handle, what [`tcp_read_ahead`] took off the socket ahead
+    /// of the reads JS makes. The next [`tcp_read`]s hand it out, in order,
+    /// before the socket is read again. Leaves with the stream.
+    read_ahead: HashMap<u64, ReadAhead>,
 }
+
+/// Bytes (and the EOF) [`tcp_read_ahead`] read off a socket before JS asked
+/// for them.
+#[derive(Default)]
+struct ReadAhead {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+    bytes: usize,
+    eof: bool,
+}
+
+impl ReadAhead {
+    /// The next at most `len` bytes, in the order they were read.
+    fn take(&mut self, len: usize) -> Option<Vec<u8>> {
+        let mut chunk = self.chunks.pop_front()?;
+        if chunk.len() > len {
+            let rest = chunk.split_off(len);
+            self.chunks.push_front(rest);
+        }
+        self.bytes -= chunk.len();
+        Some(chunk)
+    }
+}
+
+/// The most [`tcp_read_ahead`] holds for one stream. Past it the read-ahead
+/// stops; what is left stays in the kernel for the stream's own reads.
+const READ_AHEAD_MAX: usize = 64 * 1024 * 1024;
 
 impl TcpState {
     pub fn register_stream(&mut self, handle: u64, reader: OwnedReadHalf, writer: OwnedWriteHalf) {
@@ -428,11 +482,16 @@ impl TcpState {
     /// reunion. The caller reunites or bridges them; both present means
     /// nothing is in flight, so there is no await to guard and no marker to
     /// leave. The stream leaves the registry: so does its parked ops'
-    /// wake-up.
+    /// wake-up. With either half missing (shut down, or out for an await)
+    /// nothing is taken: the stream stays as it was, for its owner to close.
     pub(crate) fn take_raw_halves(&mut self, handle: u64) -> Option<(ReadHalf, WriteHalf)> {
+        if !self.readers.contains_key(&handle) || !self.writers.contains_key(&handle) {
+            return None;
+        }
         let reader = self.readers.remove(&handle)?;
         let writer = self.writers.remove(&handle)?;
         self.cancel.remove(&handle);
+        self.read_ahead.remove(&handle);
         Some((reader, writer))
     }
 
@@ -476,6 +535,7 @@ impl TcpState {
                 self.in_flight.remove(&handle);
                 self.closed.remove(&handle);
                 self.reset.remove(&handle);
+                self.released.notify_waiters();
             }
         }
     }
@@ -487,7 +547,7 @@ impl TcpState {
     pub(crate) fn bookkeeping(&self) -> (usize, usize, usize, usize, usize) {
         (
             self.closed.len() + self.reset.len() + self.shut_down.len(),
-            self.cancel.len(),
+            self.cancel.len() + self.accepting.len(),
             self.in_flight.len(),
             self.readers.len(),
             self.writers.len(),
@@ -932,6 +992,16 @@ pub async fn tcp_read(registry: TcpRegistry, handle: u64, len: usize) -> OpOutco
     let wake;
     let (mut reader, woken) = {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        // What a read-ahead already took off the socket comes before
+        // anything the socket still holds.
+        if let Some(ahead) = guard.read_ahead.get_mut(&handle) {
+            if let Some(chunk) = ahead.take(len.max(1)) {
+                return OpOutcome::Bytes(chunk);
+            }
+            if ahead.eof {
+                return OpOutcome::Done;
+            }
+        }
         let Some(reader) = guard.take_reader(handle) else {
             return OpOutcome::Failed(format!("tcp: read handle {handle} is gone"));
         };
@@ -1202,6 +1272,7 @@ pub fn tcp_close(registry: &TcpRegistry, handle: u64) {
     guard.readers.remove(&handle);
     guard.writers.remove(&handle);
     guard.shut_down.remove(&handle);
+    guard.read_ahead.remove(&handle);
     // The ops parked on the handle hold their own reference to it.
     let wake = guard.cancel.remove(&handle);
     if guard.in_flight.get(&handle).is_some_and(|n| *n > 0) {
@@ -1211,6 +1282,254 @@ pub fn tcp_close(registry: &TcpRegistry, handle: u64) {
     if let Some(wake) = wake {
         wake.notify_waiters();
     }
+}
+
+/// Take off stream `handle`'s socket whatever has already arrived, without
+/// waiting for more, and keep it for the stream's next reads ([`tcp_read`]
+/// hands it out first, in order). Returns whether the peer's EOF has been
+/// read -- now or by an earlier read-ahead.
+///
+/// For a write that may draw a reset: the `child_process` IPC channel's
+/// parent end, writing to a child that may already be gone (node carries
+/// the channel on a pipe, where what the child wrote is the parent's to
+/// read however the child went). A child's exit closes its end of the
+/// connection; the parent's next write to it is answered with a reset, and
+/// on Windows the reset discards everything the parent has not read yet --
+/// a child's last message, when the parent's event loop was busy while the
+/// child sent it and exited. Read off the socket first, it is not the
+/// kernel's to discard.
+///
+/// Only while no read is out for an await: the stream's own reads must stay
+/// the only reader of the socket, or two reads could each take a part and
+/// hand them over out of order. A read that got data has put the half back
+/// before it reports, so after a stretch with the event loop busy the half
+/// is here; one still out is reading the socket as data arrives.
+pub fn tcp_read_ahead(registry: &TcpRegistry, handle: u64) -> bool {
+    use std::io::Read;
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let state = &mut *guard;
+    let Some(socket) = state.readers.get(&handle).and_then(ReadHalf::socket) else {
+        return state.read_ahead.get(&handle).is_some_and(|ahead| ahead.eof);
+    };
+    let ahead = state.read_ahead.entry(handle).or_default();
+    let mut inbound: &socket2::Socket = &socket;
+    while !ahead.eof && ahead.bytes < READ_AHEAD_MAX {
+        let mut chunk = vec![0u8; 64 * 1024];
+        match inbound.read(&mut chunk) {
+            Ok(0) => ahead.eof = true,
+            Ok(n) => {
+                chunk.truncate(n);
+                ahead.bytes += n;
+                ahead.chunks.push_back(chunk);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            // Nothing more yet (the socket is non-blocking), or an error,
+            // which the stream's next read reports.
+            Err(_) => break,
+        }
+    }
+    let eof = ahead.eof;
+    if !eof && ahead.chunks.is_empty() {
+        state.read_ahead.remove(&handle);
+    }
+    eof
+}
+
+/// Mark stream `handle` as one the process may not exit on top of: before
+/// any exit, [`tcp_settle_lingering`] closes it in order. Returns whether it
+/// is the registry's first such stream since the last settle (the caller
+/// arms its exit hook then).
+///
+/// For the `child_process` IPC channel, which node carries on a pipe: what a
+/// child wrote to a pipe before exiting is the parent's to read however the
+/// child went. A TCP connection gives no such promise -- a socket still open
+/// when its process ends is reset on Windows, and the reset discards what
+/// the peer has not read yet, and what was written but not yet sent.
+pub fn tcp_linger_at_exit(registry: &TcpRegistry, handle: u64) -> bool {
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let first = guard.linger.is_empty();
+    guard.linger.insert(handle);
+    first
+}
+
+/// Whether [`tcp_settle_lingering`] has anything to do.
+pub fn tcp_has_lingering(registry: &TcpRegistry) -> bool {
+    !registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .linger
+        .is_empty()
+}
+
+/// How long an exiting process gives the peer of a marked stream to read to
+/// the end and close, after the FIN ([`tcp_settle_lingering`], step 2).
+///
+/// Nothing of this end's needs the wait: a close made behind the FIN, with
+/// nothing unread here, delivers every byte whenever the peer comes to read
+/// (step 3). It is for the peer's sake -- one whose event loop is running
+/// reads to the end within it, and closes, and then nothing it wrote can
+/// arrive after this end is gone. What arrives after is answered with a
+/// reset, and on Windows a reset discards what the peer has not read yet
+/// (measured: 10 bytes sent, FIN, close, exit; the peer then writes, then
+/// reads: WSAECONNABORTED, 0 bytes). A peer that is not reading at all is
+/// not waited for beyond this.
+pub(crate) const PEER_EOF_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The SO_LINGER of a delivering close ([`arm_delivering_close`]): the close
+/// returns when the peer's kernel has acknowledged everything, however long
+/// that takes, so the longest each platform holds. Windows stores seconds in
+/// a u16, and resets on expiry. XNU stores ticks (100 a second) in an i16,
+/// so 327 s is its ceiling; an expiry there, as on Linux, leaves the close
+/// to finish in the background.
+#[cfg(not(target_vendor = "apple"))]
+const CLOSE_LINGER: std::time::Duration = std::time::Duration::from_secs(u16::MAX as u64);
+#[cfg(target_vendor = "apple")]
+const CLOSE_LINGER: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Prepare a connected socket whose FIN is out for a close that loses
+/// nothing of what this end wrote, made by a process about to exit. The
+/// caller then closes it (drops its owner), on a thread that may block.
+///
+/// 1. What has already arrived is read and discarded, without waiting for
+///    more: a close on top of unread data is a reset, and the reset discards
+///    what this end sent that the peer has not been handed yet (measured on
+///    Windows: 100 bytes unread here, 200 kB sent, FIN, close -- the peer
+///    reads ECONNRESET and 0 bytes; with the 100 bytes read first, all
+///    200 kB).
+/// 2. SO_LINGER, on a blocking socket: the close returns once the peer's
+///    kernel has acknowledged every byte and the FIN. From then on the data
+///    is the peer's to read whenever it likes, like bytes left in a pipe by
+///    a process that has exited. Until then the socket must not be left to
+///    the process's end: Linux still holds up to its send buffer of unsent
+///    data (1.3-1.5 MB measured, SIOCOUTQ after the FIN of a 3 MB write to
+///    a peer that was not reading), on a connection nothing would own.
+///    Windows' loopback takes everything at once (64 MB sent in 0.1 s to a
+///    peer that was not reading; the close returned at once, and all of it
+///    was read after the sender had exited), so there the close does not
+///    wait.
+pub(crate) fn arm_delivering_close(socket: &socket2::Socket) {
+    use std::io::Read;
+    if socket.set_nonblocking(true).is_ok() {
+        let mut sink = [0u8; 16 * 1024];
+        let mut inbound = socket;
+        loop {
+            match inbound.read(&mut sink) {
+                Ok(n) if n > 0 => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                // The peer's EOF, or nothing more here yet, or an error.
+                _ => break,
+            }
+        }
+    }
+    // A lingering close of a non-blocking socket does not wait (Windows
+    // refuses it outright, and leaves the socket open).
+    if socket.set_nonblocking(false).is_ok() {
+        let _ = socket.set_linger(Some(CLOSE_LINGER));
+    }
+}
+
+/// Close every stream marked by [`tcp_linger_at_exit`] in order, for a
+/// process about to exit. Per stream:
+///
+/// 1. the FIN, behind every write issued for the handle (the handle's write
+///    queue, as [`tcp_shutdown_start`] takes it) -- so every write made
+///    before the exit is handed to the socket first. This waits for the peer
+///    exactly as a blocking write to a full pipe does: only for as long as
+///    the message does not fit what the kernel will buffer;
+/// 2. the read side, read (and discarded) to the peer's EOF -- for at most
+///    [`PEER_EOF_GRACE`]. No request is taken from it any more;
+/// 3. the close, as [`arm_delivering_close`] prepares it: whatever arrived
+///    is discarded, and the close returns once the peer's kernel holds
+///    everything this end wrote.
+///
+/// So the exit waits for what delivery needs, not for the peer to read: a
+/// peer that blocks its own event loop until this process is gone gets it
+/// gone. A stream JS has already closed is only waited for (a half out for
+/// an await drops on the IO runtime, and the socket is not closed until it
+/// has).
+pub async fn tcp_settle_lingering(registry: TcpRegistry) {
+    let (handles, released) = {
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let handles: Vec<u64> = std::mem::take(&mut guard.linger).into_iter().collect();
+        (handles, guard.released.clone())
+    };
+    for handle in handles {
+        linger_close(&registry, &released, handle).await;
+    }
+}
+
+/// One stream's close (see [`tcp_settle_lingering`]).
+async fn linger_close(registry: &TcpRegistry, released: &tokio::sync::Notify, handle: u64) {
+    let closed_already = registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .closed
+        .contains(&handle);
+    if !closed_already && let Started::Pending(rest) = tcp_shutdown_start(registry.clone(), handle)
+    {
+        rest.await;
+    }
+    // The read half: in the map, or out with a parked read, which is woken
+    // (it puts the half back and ends like an EOF nobody is left to see).
+    let reader = loop {
+        // Created before the state is read: a half that comes back after
+        // the check still wakes this.
+        let back = released.notified();
+        {
+            let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+            if !guard.closed.contains(&handle)
+                && let Some(reader) = guard.readers.remove(&handle)
+            {
+                // The write half went with the FIN; were one still here, the
+                // socket would outlive the close below.
+                guard.writers.remove(&handle);
+                guard.shut_down.remove(&handle);
+                guard.cancel.remove(&handle);
+                guard.read_ahead.remove(&handle);
+                break Some(reader);
+            }
+            if !guard.in_flight.contains_key(&handle) {
+                // Closed, with every half dropped: nothing left to wait for.
+                break None;
+            }
+            if let Some(wake) = guard.cancel.get(&handle) {
+                wake.notify_waiters();
+            }
+        }
+        back.await;
+    };
+    let Some(mut reader) = reader else {
+        return;
+    };
+    let give_up = tokio::time::Instant::now() + PEER_EOF_GRACE;
+    let mut sink = vec![0u8; 16 * 1024];
+    while matches!(
+        tokio::time::timeout_at(give_up, reader.read(&mut sink)).await,
+        Ok(Ok(n)) if n > 0
+    ) {}
+    if let Some(stream) = reader.tcp() {
+        arm_delivering_close(&socket2::SockRef::from(stream));
+    }
+    // The close, which may block: not on a thread the IO runtime polls with.
+    // Err is the runtime shutting down, which drops the half all the same.
+    let _ = tokio::task::spawn_blocking(move || drop(reader)).await;
+}
+
+/// [`tcp_settle_lingering`] for a caller that is not async -- an exit path:
+/// runs it on the IO runtime and blocks until it is done. Returns at once
+/// with nothing marked, or with the runtime already shut down.
+pub fn settle_lingering_blocking(runtime: &tokio::runtime::Handle, registry: &TcpRegistry) {
+    if !tcp_has_lingering(registry) {
+        return;
+    }
+    let (done, settled) = std::sync::mpsc::channel::<()>();
+    let registry = registry.clone();
+    runtime.spawn(async move {
+        tcp_settle_lingering(registry).await;
+        drop(done);
+    });
+    // Err is the sender dropped: settled, or the task dropped unrun.
+    let _ = settled.recv();
 }
 
 /// Why [`tcp_reset`] could not reset a stream: node's errno code for it.
@@ -1250,6 +1569,7 @@ pub fn tcp_reset(
     }
     let state = &mut *guard;
     state.shut_down.remove(&handle);
+    state.read_ahead.remove(&handle);
     let reader = state.readers.remove(&handle);
     let writer = state.writers.remove(&handle);
     // A pipe has no reset (node refuses one in JS, ERR_INVALID_HANDLE_TYPE):
@@ -1303,7 +1623,7 @@ pub async fn tcp_listen(
     let server_id = ids.fetch_add(1, Ordering::Relaxed);
     registry
         .lock()
-        .expect("tcp registry lock")
+        .unwrap_or_else(|e| e.into_inner())
         .listeners
         .insert(server_id, Listener::Tcp(listener));
 
@@ -1412,11 +1732,11 @@ impl Drop for AcceptInFlight<'_> {
     fn drop(&mut self) {
         let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         if guard
-            .cancel
+            .accepting
             .get(&self.server_id)
             .is_some_and(|n| std::sync::Arc::ptr_eq(n, &self.notify))
         {
-            guard.cancel.remove(&self.server_id);
+            guard.accepting.remove(&self.server_id);
         }
     }
 }
@@ -1438,11 +1758,11 @@ pub async fn tcp_accept(
         // BEFORE the cancel Notify is created: an accept that lands after
         // `tcp_server_close` removed the server's Notify would otherwise
         // insert a fresh one that nothing ever removes (#139).
-        if !guard.listeners.contains_key(&server_id) || guard.cancel.contains_key(&server_id) {
+        if !guard.listeners.contains_key(&server_id) || guard.accepting.contains_key(&server_id) {
             return OpOutcome::Done;
         }
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        guard.cancel.insert(server_id, notify.clone());
+        guard.accepting.insert(server_id, notify.clone());
         notify
     };
     let in_flight = AcceptInFlight {
@@ -1514,7 +1834,7 @@ fn close_untaken(reader: ReadHalf, writer: WriteHalf) {
 pub fn tcp_server_close(registry: &TcpRegistry, server_id: u64) {
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     let listener = guard.listeners.remove(&server_id);
-    if let Some(notify) = guard.cancel.remove(&server_id) {
+    if let Some(notify) = guard.accepting.remove(&server_id) {
         notify.notify_one();
     }
     let untaken: Vec<(ReadHalf, WriteHalf)> = guard
@@ -1811,11 +2131,11 @@ mod tests {
         let server_id = server["serverId"].as_u64().unwrap();
         let parked = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        let closing = std::time::Instant::now();
         tcp_server_close(&registry, server_id);
-        // Not by running out its bound: the reactor answers in microseconds.
-        let took = closing.elapsed();
-        assert!(took < std::time::Duration::from_millis(250), "{took:?}");
+        // Not by running out its bound: an instance the close gave up
+        // waiting for is still open, and the dial below would connect to it.
+        // (No wall-clock bound on the close itself: how long the reactor
+        // takes to answer is the host's scheduling, not the code's.)
         let refused = tokio::net::windows::named_pipe::ClientOptions::new().open(&path);
         assert_eq!(
             refused.as_ref().err().map(std::io::Error::kind),
@@ -1864,10 +2184,9 @@ mod tests {
         // Answered, and not taken: what JS sees a tick later.
         let accepted = json(accepting.await.unwrap());
         assert!(accepted["handle"].as_u64().is_some(), "{accepted}");
-        let closing = std::time::Instant::now();
+        // The close is judged by what it leaves (the name free, below), not
+        // by a wall-clock bound a loaded host can miss.
         tcp_server_close(&registry, server_id);
-        let took = closing.elapsed();
-        assert!(took < std::time::Duration::from_millis(250), "{took:?}");
         let refused = tokio::net::windows::named_pipe::ClientOptions::new().open(&path);
         assert_eq!(
             refused.as_ref().err().map(std::io::Error::kind),
@@ -2035,6 +2354,78 @@ mod tests {
         (port, rx)
     }
 
+    /// What a peer sent and then closed on is not lost to the reset this
+    /// end's next write draws, once a read-ahead has taken it off the
+    /// socket: the reads hand it out, whole and in order, then the EOF.
+    /// Without the read-ahead, on Windows, the reset discards it (the reads
+    /// fail ECONNRESET having delivered nothing) -- the child_process IPC
+    /// parent's lost last message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_ahead_keeps_what_arrived_from_the_reset_a_write_draws() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sent: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        let to_send = sent.clone();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            std::io::Write::write_all(&mut stream, &to_send).unwrap();
+            // The FIN, then the close: the peer is gone.
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+        let handle = connected(&registry, &ids, port).await;
+        peer.join().unwrap();
+        // Until the peer's bytes and its FIN are all here.
+        let mut eof = false;
+        for _ in 0..200 {
+            if tcp_read_ahead(&registry, handle) {
+                eof = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(eof, "the read-ahead never saw the peer's EOF");
+        assert!(tcp_read_ahead(&registry, handle), "the EOF stays seen");
+
+        // Answered with a reset: the peer's socket is closed.
+        let _ = tcp_write(registry.clone(), handle, b"late".to_vec()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut received = Vec::new();
+        loop {
+            match tcp_read(registry.clone(), handle, 65536).await {
+                OpOutcome::Bytes(chunk) => received.extend_from_slice(&chunk),
+                OpOutcome::Done => break,
+                // A failed read (ECONNRESET): the reset discarded the rest.
+                _ => panic!("a read failed after {} bytes", received.len()),
+            }
+        }
+        assert!(
+            received == sent,
+            "{} of {} bytes, in order",
+            received.len(),
+            sent.len()
+        );
+        assert!(
+            matches!(
+                tcp_read(registry.clone(), handle, 65536).await,
+                OpOutcome::Done
+            ),
+            "the EOF is repeated"
+        );
+        tcp_close(&registry, handle);
+        assert!(
+            registry.lock().unwrap().read_ahead.is_empty(),
+            "the close drops it"
+        );
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+    }
+
     async fn connected(registry: &TcpRegistry, ids: &std::sync::Arc<AtomicU64>, port: u16) -> u64 {
         let OpOutcome::Json(payload) = tcp_connect(
             registry.clone(),
@@ -2075,6 +2466,212 @@ mod tests {
         }
         let issued = writes.len() * CHUNK;
         (writes, issued)
+    }
+
+    /// The close an exiting process owes a marked stream (the child_process
+    /// IPC channel): with a read parked on the handle and writes still
+    /// queued behind a peer that is not reading yet, the settle returns only
+    /// once every write has been handed to the socket -- the peer then reads
+    /// every byte -- and the socket is closed, nothing of it left in the
+    /// registry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lingering_stream_is_written_out_before_the_settle_returns() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let (port, peer) = reading_peer(std::time::Duration::from_millis(200));
+        let handle = connected(&registry, &ids, port).await;
+        assert!(tcp_linger_at_exit(&registry, handle), "the first marked");
+        assert!(tcp_has_lingering(&registry));
+
+        // A flowing socket's read is always parked.
+        let parked = parked_read(&registry, handle).await;
+        let (writes, issued) = write_until_queued(&registry, handle);
+        let writes: Vec<_> = writes.into_iter().map(tokio::spawn).collect();
+
+        tcp_settle_lingering(registry.clone()).await;
+
+        // Before anything else is awaited: the settle is what finished them.
+        for write in &writes {
+            assert!(write.is_finished(), "a write was still queued");
+        }
+        for write in writes {
+            assert!(matches!(write.await.unwrap(), OpOutcome::Done));
+        }
+        // The parked read was woken to hand its half over: it ends like an EOF.
+        assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+        assert!(!tcp_has_lingering(&registry));
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+        let received = tokio::task::spawn_blocking(move || {
+            peer.recv_timeout(std::time::Duration::from_secs(60))
+        })
+        .await
+        .unwrap()
+        .expect("the peer saw no EOF")
+        .expect("the peer's read failed: the close was a reset");
+        assert_eq!(received, issued, "every byte written before the exit");
+    }
+
+    /// A read of `handle`, spawned and parked: its half is out of the
+    /// registry when this returns. A read only spawned may not have been
+    /// polled yet, and a settle that runs first takes the half itself -- the
+    /// read then finds the handle gone instead of ending like an EOF.
+    async fn parked_read(
+        registry: &TcpRegistry,
+        handle: u64,
+    ) -> tokio::task::JoinHandle<OpOutcome> {
+        let parked = tokio::spawn(tcp_read(registry.clone(), handle, 64));
+        for _ in 0..5000 {
+            if !registry.lock().unwrap().readers.contains_key(&handle) {
+                return parked;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("the read never parked");
+    }
+
+    /// A peer that accepts, writes `greeting`, and reads nothing until it is
+    /// told to (the returned sender): then it reads to the end and reports
+    /// how many bytes arrived, or the error that ended the read.
+    fn held_peer(
+        greeting: &'static [u8],
+    ) -> (
+        u16,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<std::io::Result<usize>>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (go, told) = std::sync::mpsc::channel::<()>();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            std::io::Write::write_all(&mut stream, greeting).unwrap();
+            let _ = told.recv();
+            let mut all = Vec::new();
+            let result = std::io::Read::read_to_end(&mut stream, &mut all).map(|_| all.len());
+            let _ = tx.send(result);
+        });
+        (port, go, rx)
+    }
+
+    /// The settle is bounded by what delivery needs, not by the peer's
+    /// reading: against a peer that reads nothing, a message the kernel
+    /// takes is settled and closed after the grace -- and is the peer's to
+    /// read afterwards, whole, like bytes a process left in a pipe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_settle_does_not_wait_for_a_peer_that_is_not_reading() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let (port, go, peer) = held_peer(b"");
+        let handle = connected(&registry, &ids, port).await;
+        tcp_linger_at_exit(&registry, handle);
+        let parked = parked_read(&registry, handle).await;
+        let written = tcp_write(registry.clone(), handle, vec![7u8; 64 * 1024]).await;
+        assert!(matches!(written, OpOutcome::Done));
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tcp_settle_lingering(registry.clone()),
+        )
+        .await
+        .expect("the settle waited for a peer that was not reading");
+        assert!(
+            started.elapsed() >= PEER_EOF_GRACE,
+            "the peer was not given its grace: {:?}",
+            started.elapsed()
+        );
+
+        assert!(peer.try_recv().is_err(), "the peer has not read yet");
+        assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+        go.send(()).unwrap();
+        let received = tokio::task::spawn_blocking(move || {
+            peer.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .unwrap()
+        .expect("the peer saw no EOF")
+        .expect("the peer's read failed: the close was a reset");
+        assert_eq!(received, 64 * 1024);
+    }
+
+    /// What the peer sent that nobody here read is discarded before the
+    /// close, not closed on top of: that close is a reset, which on Windows
+    /// costs the peer everything it has not read yet (measured: ECONNRESET
+    /// and 0 of 200 kB). No read is parked: JS was not reading.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn what_the_peer_sent_unread_does_not_turn_the_close_into_a_reset() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let (port, go, peer) = held_peer(&[9u8; 100]);
+        let handle = connected(&registry, &ids, port).await;
+        tcp_linger_at_exit(&registry, handle);
+        let written = tcp_write(registry.clone(), handle, vec![7u8; 200_000]).await;
+        assert!(matches!(written, OpOutcome::Done));
+
+        tcp_settle_lingering(registry.clone()).await;
+
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+        go.send(()).unwrap();
+        let received = tokio::task::spawn_blocking(move || {
+            peer.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .unwrap()
+        .expect("the peer saw no EOF")
+        .expect("the peer's read failed: the close was a reset");
+        assert_eq!(received, 200_000);
+    }
+
+    /// A marked stream JS closed itself is not closed again, only waited
+    /// for: the half a parked read holds drops on the runtime, and the
+    /// socket is not closed until it has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_settle_waits_out_the_close_of_a_lingering_stream_already_closed() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let (port, peer) = reading_peer(std::time::Duration::ZERO);
+        let handle = connected(&registry, &ids, port).await;
+        tcp_linger_at_exit(&registry, handle);
+        let parked = tokio::spawn(tcp_read(registry.clone(), handle, 64));
+        // Until the read has its half out.
+        while registry.lock().unwrap().bookkeeping().2 == 0 {
+            tokio::task::yield_now().await;
+        }
+        tcp_close(&registry, handle);
+
+        tcp_settle_lingering(registry.clone()).await;
+
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+        assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+        let received = tokio::task::spawn_blocking(move || {
+            peer.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .unwrap()
+        .expect("the peer saw no EOF: the socket was not closed")
+        .expect("the peer's read failed");
+        assert_eq!(received, 0);
+        // With nothing marked, the blocking form returns without a runtime
+        // to wait on.
+        settle_lingering_blocking(&tokio::runtime::Handle::current(), &registry);
     }
 
     /// #156: a shutdown issued while a write is still in flight sends the
@@ -2216,7 +2813,7 @@ mod tests {
     async fn a_close_wakes_the_parked_read_and_the_stuck_write() {
         let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
         let ids = std::sync::Arc::new(AtomicU64::new(1));
-        let (port, peer) = reading_peer(std::time::Duration::from_secs(3));
+        let (port, peer) = reading_peer(std::time::Duration::from_secs(6));
         let handle = connected(&registry, &ids, port).await;
 
         let parked = tokio::spawn(tcp_read(registry.clone(), handle, 64));
@@ -2224,14 +2821,12 @@ mod tests {
         let writes: Vec<_> = writes.into_iter().map(tokio::spawn).collect();
         let behind = tokio::spawn(tcp_write(registry.clone(), handle, b"behind".to_vec()));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(
-            registry.lock().unwrap().in_flight.get(&handle).copied(),
-            Some(2),
-            "the read and a write are both out for an await"
-        );
+        both_halves_out(&registry, handle).await;
 
         tcp_close(&registry, handle);
-        let prompt = std::time::Duration::from_secs(1);
+        // Well inside the peer's 6 s before it reads, with room for a
+        // loaded host: each op must end by the wake-up, not by the peer.
+        let prompt = std::time::Duration::from_secs(3);
         let read = tokio::time::timeout(prompt, parked)
             .await
             .expect("the parked read was not woken by the close")
@@ -2267,6 +2862,56 @@ mod tests {
         .expect("the peer's read never ended");
         assert!(seen.is_ok(), "the peer saw a reset, not an end: {seen:?}");
         assert_eq!(registry.lock().unwrap().queued_writes(), 0);
+    }
+
+    /// Wait until the read and a write of `handle` are both out for an
+    /// await. The spawned ops get there on the scheduler's time, so the state
+    /// is polled for, with a bound on a hang, not assumed after a sleep.
+    async fn both_halves_out(registry: &TcpRegistry, handle: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let out = registry.lock().unwrap().in_flight.get(&handle).copied();
+            if out == Some(2) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the read and a write are both out for an await: {out:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// With a half missing, `take_raw_halves` takes nothing: the half that
+    /// is there stays registered, and so does the stream's wake-up.
+    #[tokio::test]
+    async fn taking_raw_halves_of_a_stream_missing_one_leaves_the_other() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(echo_server(listener, 1));
+        let handle = connected(&registry, &ids, port).await;
+
+        // The write half out, as a queued write or a shutdown leaves it.
+        let writer = registry.lock().unwrap().take_writer(handle).unwrap();
+        let out = InFlight {
+            registry: registry.clone(),
+            handle,
+        };
+        assert!(registry.lock().unwrap().take_raw_halves(handle).is_none());
+        let bookkeeping = registry.lock().unwrap().bookkeeping();
+        assert_eq!(bookkeeping.3, 1, "the read half is still registered");
+
+        // Back in, both are there to take.
+        assert!(reinsert_writer(&registry, handle, writer));
+        drop(out);
+        assert!(registry.lock().unwrap().take_raw_halves(handle).is_some());
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
     }
 
     /// What `reading_peer` saw: the connection reset (node's `read
@@ -2317,7 +2962,7 @@ mod tests {
     async fn a_reset_wakes_the_parked_read_and_the_stuck_write() {
         let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
         let ids = std::sync::Arc::new(AtomicU64::new(1));
-        let (port, peer) = reading_peer(std::time::Duration::from_secs(3));
+        let (port, peer) = reading_peer(std::time::Duration::from_secs(6));
         let handle = connected(&registry, &ids, port).await;
 
         let parked = tokio::spawn(tcp_read(registry.clone(), handle, 64));
@@ -2326,14 +2971,12 @@ mod tests {
         let behind = tokio::spawn(tcp_write(registry.clone(), handle, b"behind".to_vec()));
         let shutdown = tokio::spawn(tcp_shutdown(registry.clone(), handle));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(
-            registry.lock().unwrap().in_flight.get(&handle).copied(),
-            Some(2),
-            "the read and a write are both out for an await"
-        );
+        both_halves_out(&registry, handle).await;
 
         assert_eq!(tcp_reset(&registry, handle, false), Ok(()));
-        let prompt = std::time::Duration::from_secs(1);
+        // Well inside the peer's 6 s before it reads, with room for a
+        // loaded host: each op must end by the wake-up, not by the peer.
+        let prompt = std::time::Duration::from_secs(3);
         let read = tokio::time::timeout(prompt, parked)
             .await
             .expect("the parked read was not woken by the reset")

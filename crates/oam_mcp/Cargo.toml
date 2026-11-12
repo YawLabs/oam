@@ -1,6 +1,6 @@
 [package]
 name = "oam_mcp"
-description = "MCP server: oam's introspection (check, run, explain, project info) exposed to coding agents. stdio transport; Streamable HTTP arrives with oam_http."
+description = "MCP server: oam's introspection (check, run, explain, project info) exposed to coding agents. stdio transport; Streamable HTTP is not built yet."
 version.workspace = true
 publish.workspace = true
 edition.workspace = true

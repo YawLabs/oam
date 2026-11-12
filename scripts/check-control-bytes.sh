@@ -36,8 +36,9 @@
 # git repo, node absent). The caller must not report a 2 as clean -- a scanner
 # that could not run is the false-clean shape this whole gate exists to guard.
 #
-# Escape hatch: a line reading `control-byte-ok: allow` (in a comment, anywhere
-# in the file) skips that file, for the rare case where the byte is the point.
+# Escape hatch: a line reading `control-byte-ok: allow` and nothing else (bar
+# indentation and a comment leader such as `#` or `//`; anywhere in the file)
+# skips that file, for the rare case where the byte is the point.
 # Deliberately in-band rather than a path list, so the justification lives
 # beside the bytes it excuses -- and deliberately a DECLARATION rather than a
 # bare mention, so that a file merely discussing the marker (this script, a
@@ -50,7 +51,7 @@ case "${1:-}" in
   "") ;;
   --staged) MODE="staged" ;;
   -h | --help)
-    sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   *)
@@ -99,11 +100,14 @@ const BINARY = new Set([
   ".mp4", ".webm", ".mov", ".mp3", ".wav", ".ogg",
 ]);
 
-// A DECLARATION, not a mention. Anchored to its own line and requiring the
-// `: allow` suffix, so a file that merely talks about the marker keeps being
-// scanned. Matched against a latin1 decode so a NUL in the buffer cannot
-// terminate the search early.
-const ALLOW_MARKER = /(^|[\r\n])[^\r\n]{0,80}control-byte-ok:\s*allow/i;
+// A DECLARATION, not a mention. The marker must be the WHOLE line: optional
+// indentation, an optional comment leader, the marker with its `: allow`
+// suffix, an optional comment closer, and nothing else. A line that quotes the
+// full phrase inside prose or a string (this script does, and so does its test
+// suite) therefore keeps the file scanned. Matched against a latin1 decode so
+// a NUL in the buffer cannot terminate the search early.
+const ALLOW_MARKER =
+  /(^|[\r\n])[ \t]*(?:#+|\/\/+|\/\*+|\*+|;+|--|<!--|%+)?[ \t]*control-byte-ok:[ \t]*allow[ \t]*(?:\*\/|-->)?[ \t]*(?=[\r\n]|$)/i;
 
 const listArgs = staged
   ? ["diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"]
@@ -175,7 +179,7 @@ These are invisible in a terminal, make \`git diff\` report the file as binary
 so fmt, clippy and the tests all pass with them present.
 
 Build such a byte from a numeric code point rather than typing an escape, or
-add a line reading "control-byte-ok: allow" if it is deliberate.`);
+add a comment line reading only "control-byte-ok: allow" if it is deliberate.`);
 }
 
 if (unreadable.length > 0) {

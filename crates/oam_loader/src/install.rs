@@ -2,9 +2,17 @@
 //!
 //! Reads npm's `package-lock.json` v3, downloads tarballs from the resolved
 //! URLs, verifies SRI integrity hashes, extracts into `node_modules`, and
-//! creates `.bin` shims. Equivalent to `npm ci` for oam projects.
+//! creates `.bin` shims. The `npm ci` counterpart for oam projects: it makes
+//! `node_modules` match the lockfile -- a package whose installed version
+//! differs from the lockfile's is re-extracted, a package the lockfile no
+//! longer names is removed, and an optional entry for another platform
+//! (`os` / `cpu`) is skipped.
+//!
+//! Not `npm ci` yet: workspace `link` entries are not created (skipped with
+//! a warning), `libc` is not filtered on, nested packages get no
+//! `node_modules/.bin` of their own, and stale `.bin` shims are not removed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -24,15 +32,137 @@ struct Lockfile {
 }
 
 /// A single entry in the `packages` map.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub(crate) struct LockfileEntry {
-    #[allow(dead_code)]
+    /// The package's real name. npm writes it only when it differs from the
+    /// directory name in the key (an alias: `"x": "npm:other@1"`).
+    name: Option<String>,
     version: Option<String>,
     resolved: Option<String>,
     integrity: Option<String>,
     /// The `bin` field inside the lockfile entry (npm v3 mirrors it from
     /// the package's own package.json).
     bin: Option<serde_json::Value>,
+    /// A workspace / `file:` directory link: `resolved` is then a path
+    /// relative to the project, not a URL.
+    #[serde(default)]
+    link: bool,
+    /// Reachable only through optional dependencies: skipped on a platform
+    /// it does not support, and its failure does not fail the install.
+    #[serde(default)]
+    optional: bool,
+    /// `process.platform` values the package supports (`!x` excludes one).
+    os: Option<serde_json::Value>,
+    /// `process.arch` values the package supports (`!x` excludes one).
+    cpu: Option<serde_json::Value>,
+}
+
+/// This build's `process.platform`.
+fn node_platform() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "win32",
+        "macos" => "darwin",
+        "solaris" | "illumos" => "sunos",
+        other => other,
+    }
+}
+
+/// This build's `process.arch`.
+fn node_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "x86" => "ia32",
+        "aarch64" => "arm64",
+        "powerpc64" => "ppc64",
+        "loongarch64" => "loong64",
+        other => other,
+    }
+}
+
+/// npm's `os` / `cpu` list check (npm-install-checks `checkList`): `value`
+/// must match none of the `!negated` entries and, when the list has plain
+/// entries, at least one of them. A missing list, an empty one and `["any"]`
+/// allow everything.
+fn platform_list_allows(list: Option<&serde_json::Value>, value: &str) -> bool {
+    use serde_json::Value;
+    let entries: Vec<&str> = match list {
+        Some(Value::String(s)) => vec![s.as_str()],
+        Some(Value::Array(items)) => items.iter().filter_map(|v| v.as_str()).collect(),
+        _ => return true,
+    };
+    if entries.len() == 1 && entries[0] == "any" {
+        return true;
+    }
+    let mut negated = 0usize;
+    let mut matched = false;
+    for entry in &entries {
+        if let Some(excluded) = entry.strip_prefix('!') {
+            negated += 1;
+            if excluded == value {
+                return false;
+            }
+        } else if *entry == value {
+            matched = true;
+        }
+    }
+    matched || negated == entries.len()
+}
+
+/// Whether a lockfile entry's `os` and `cpu` lists admit this build.
+fn entry_matches_platform(entry: &LockfileEntry) -> bool {
+    platform_list_allows(entry.os.as_ref(), node_platform())
+        && platform_list_allows(entry.cpu.as_ref(), node_arch())
+}
+
+/// The package directory name a lockfile key installs under, or `None` when
+/// the key is not one `oam install` may write to.
+///
+/// A key is a `/`-separated path relative to the project that ends in
+/// `node_modules/<name>` or `node_modules/@scope/<name>` (optionally nested,
+/// optionally under a workspace directory). Every segment must be an ordinary
+/// name: no empty, `.` or `..` segment, no backslash, drive colon or NUL --
+/// so `project_dir.join(key)` cannot leave the project -- and the package
+/// name itself may not start with a dot (`.bin`, `.oam`).
+fn lockfile_key_package(key: &str) -> Option<&str> {
+    if key.contains(['\\', ':', '\0']) {
+        return None;
+    }
+    let segments: Vec<&str> = key.split('/').collect();
+    if segments.iter().any(|s| matches!(*s, "" | "." | "..")) {
+        return None;
+    }
+    let anchor = segments.iter().rposition(|s| *s == "node_modules")?;
+    let name_len = match &segments[anchor + 1..] {
+        [name] if !name.starts_with(['.', '@']) => name.len(),
+        [scope, name] if scope.starts_with('@') && scope.len() > 1 && !name.starts_with('.') => {
+            scope.len() + 1 + name.len()
+        }
+        _ => return None,
+    };
+    Some(&key[key.len() - name_len..])
+}
+
+/// Whether the package installed at `manifest_path` is a different version
+/// from the one the lockfile names. Anything unknown -- no lockfile version,
+/// an unreadable manifest, a manifest without a version -- counts as "same":
+/// the package is left alone rather than re-downloaded on a guess.
+fn installed_version_differs(manifest_path: &Path, want: Option<&str>) -> bool {
+    let Some(want) = want else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(manifest_path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    // The lockfile holds the cleaned version; a manifest may still say
+    // "v1.2.3" or "=1.2.3".
+    let clean = |v: &str| v.trim().trim_start_matches(['v', '=']).to_string();
+    match json.get("version").and_then(|v| v.as_str()) {
+        Some(have) => clean(have) != clean(want),
+        None => false,
+    }
 }
 
 /// Summary returned on a clean install (every package installed).
@@ -127,7 +257,11 @@ pub enum InstallOutcome {
 ///
 /// * `Ok(Complete(_))` — no diagnostics.
 /// * `Ok(Partial { errors, .. })` — `OAM-PKG0004` (per-package fetch /
-///   extract failure) and `OAM-PKG0005` (bin shim warning).
+///   extract failure; as a `Severity::Warning` it is a package-level note
+///   that does not fail the install: an optional package that could not be
+///   installed, a download with no integrity hash to check, tarball symlinks
+///   that were not created, workspace links oam does not create) and
+///   `OAM-PKG0005` (bin shim warning).
 /// * `Err(_)` — `OAM-PKG0001` (lockfile read or parse),
 ///   `OAM-PKG0002` (unsupported version), `OAM-PKG0003` (runtime or HTTP
 ///   client init), `OAM-PKG0006` (non-frozen mode rejected).
@@ -142,11 +276,12 @@ pub fn install(
             "only --frozen-lockfile mode is supported in this release",
         )]);
     }
-    // Install mutates the project layout (writes node_modules/, may rewrite
-    // tsconfig.json via extends). A same-process `oam run` after `oam install`
-    // must not see the stale "not found" / stale parsed paths. Drop the
-    // current thread's default resolver caches so the next resolve re-stats
-    // the filesystem and re-reads tsconfig.
+    // Install mutates the project layout (it writes node_modules/, and a
+    // package it extracts can carry a tsconfig that a project `extends`). A
+    // same-process `oam run` after `oam install` must not see the stale
+    // "not found" / stale parsed paths. Drop the current thread's default
+    // resolver caches so the next resolve re-stats the filesystem and
+    // re-reads tsconfig.
     crate::resolver::default_clear_caches();
     let started = Instant::now();
 
@@ -217,23 +352,81 @@ pub fn install(
         .join(".oam")
         .join("precompile");
 
-    for (key, entry) in &to_install {
-        let Some(resolved) = &entry.resolved else {
-            // Entries without a resolved URL are link/file deps or the root;
-            // skip silently.
+    // Plan: the lockfile entries this run installs, as (key, directory name,
+    // entry). Everything else is decided here, once, so the install loop, the
+    // bin pass and the precompile pass all walk the same list.
+    let mut plan: Vec<(&str, &str, &LockfileEntry)> = Vec::new();
+    let mut unlinked: Vec<&str> = Vec::new();
+    for &(key, entry) in &to_install {
+        if entry.link {
+            // A workspace / `file:` directory link: `resolved` is a project
+            // path, never something to download. oam does not create the
+            // link; say so unless something (npm) already put it there.
+            if lockfile_key_package(key).is_some()
+                && std::fs::symlink_metadata(project_dir.join(key)).is_err()
+            {
+                unlinked.push(key);
+            }
+            continue;
+        }
+        if entry.resolved.is_none() {
+            // No tarball of its own: the root, a workspace's source
+            // directory, or a dependency bundled inside its parent's tarball.
+            continue;
+        }
+        // The key is e.g. "node_modules/foo", "node_modules/@scope/bar" or,
+        // nested, "node_modules/react/node_modules/scheduler"; the package's
+        // directory name is what follows the LAST "node_modules/". A key of
+        // any other shape is never joined to project_dir.
+        let Some(pkg_name) = lockfile_key_package(key) else {
+            errors.push(diag(
+                "OAM-PKG0004",
+                format!(
+                    "failed to install {key}: the lockfile key is not a node_modules/<name> path inside the project"
+                ),
+            ));
             continue;
         };
+        if !entry_matches_platform(entry) {
+            // npm skips an optional package built for another platform and
+            // refuses a required one (EBADPLATFORM).
+            if !entry.optional {
+                errors.push(diag(
+                    "OAM-PKG0004",
+                    format!(
+                        "failed to install {key}: the package does not support this platform ({} {}) and is not optional",
+                        node_platform(),
+                        node_arch()
+                    ),
+                ));
+            }
+            continue;
+        }
+        plan.push((key, pkg_name, entry));
+    }
+    if !unlinked.is_empty() {
+        errors.push(Diagnostic::new(
+            "OAM-PKG0004",
+            Severity::Warning,
+            Origin::Install,
+            format!(
+                "{} workspace/link package(s) not linked into node_modules (oam install does not create links yet; `npm install` does): {}",
+                unlinked.len(),
+                unlinked.join(", ")
+            ),
+        ));
+    }
 
-        // The key is e.g. "node_modules/foo" or "node_modules/@scope/bar".
-        // The extraction target is project_dir joined with the key.
+    for &(key, pkg_name, entry) in &plan {
+        let Some(resolved) = entry.resolved.as_deref() else {
+            continue;
+        };
+        // The extraction target is project_dir joined with the (validated) key.
         let dest = project_dir.join(key);
-        // Extract the npm package name from the lockfile key.
-        // Keys can be deeply nested ("node_modules/react/node_modules/scheduler"),
-        // so take the portion after the LAST "node_modules/" segment.
-        let pkg_name = key
-            .rfind("node_modules/")
-            .map(|pos| &key[pos + "node_modules/".len()..])
-            .unwrap_or(key);
+        // The name lifecycle-script trust is checked against: the lockfile's
+        // `name` when the package is installed under an alias, else the
+        // directory name.
+        let declared_name = entry.name.as_deref().unwrap_or(pkg_name);
 
         // Skip already-installed packages (idempotency for partial installs).
         // WARM path: the package was extracted by a prior install run. npm runs
@@ -243,27 +436,104 @@ pub fn install(
         // a prior run extracted the package but died before the script pass
         // (so the scripts genuinely never ran). The marker is written only
         // after a successful run, below.
-        if dest.join("package.json").is_file() {
+        //
+        // "Installed" means the version the lockfile names: a package left
+        // over from before a lockfile bump is STALE and is re-extracted.
+        let manifest_path = dest.join("package.json");
+        let present = manifest_path.is_file();
+        let stale = present && installed_version_differs(&manifest_path, entry.version.as_deref());
+        if present && !stale {
             installed += 1;
             if !script_marker_path(&scripts_ran_dir, pkg_name).is_file()
-                && let Some(ps) =
-                    check_lifecycle_scripts(&dest, pkg_name, &scripts_ran_dir, &trust, &mut errors)
+                && let Some(ps) = check_lifecycle_scripts(
+                    &dest,
+                    pkg_name,
+                    declared_name,
+                    Some(resolved),
+                    &scripts_ran_dir,
+                    &trust,
+                    &mut errors,
+                )
             {
                 pending_scripts.push(ps);
             }
             continue;
         }
 
-        match fetch_and_extract(&rt, &client, resolved, entry.integrity.as_deref(), &dest) {
+        // Only http(s) tarballs are fetched. Anything else (`file:`, `git+`,
+        // a bare path) is refused here rather than handed to the HTTP client
+        // and retried.
+        if !(resolved.starts_with("https://") || resolved.starts_with("http://")) {
+            errors.push(diag(
+                "OAM-PKG0004",
+                format!(
+                    "failed to install {key}: unsupported `resolved` value '{resolved}' (only http(s) tarball URLs are installed)"
+                ),
+            ));
+            continue;
+        }
+
+        let mut notes: Vec<String> = Vec::new();
+        match fetch_and_extract(
+            &rt,
+            &client,
+            resolved,
+            entry.integrity.as_deref(),
+            &dest,
+            stale,
+            &mut notes,
+        ) {
             Ok(()) => {
                 installed += 1;
+                if entry.integrity.is_none() {
+                    errors.push(Diagnostic::new(
+                        "OAM-PKG0004",
+                        Severity::Warning,
+                        Origin::Install,
+                        format!(
+                            "{key}: the lockfile entry has no integrity hash, so the download from {resolved} was not verified"
+                        ),
+                    ));
+                }
+                if !notes.is_empty() {
+                    errors.push(Diagnostic::new(
+                        "OAM-PKG0004",
+                        Severity::Warning,
+                        Origin::Install,
+                        format!(
+                            "{key}: {} symlink(s) in the tarball were not created: {}",
+                            notes.len(),
+                            summarize_notes(&notes)
+                        ),
+                    ));
+                }
+                if stale {
+                    // A new version replaced the old one: its scripts have
+                    // not run, whatever the old version's stamp says.
+                    let _ = std::fs::remove_file(script_marker_path(&scripts_ran_dir, pkg_name));
+                }
                 // FRESH path: the package was just extracted this call, so its
                 // scripts have never run -- enqueue them unconditionally.
-                if let Some(ps) =
-                    check_lifecycle_scripts(&dest, pkg_name, &scripts_ran_dir, &trust, &mut errors)
-                {
+                if let Some(ps) = check_lifecycle_scripts(
+                    &dest,
+                    pkg_name,
+                    declared_name,
+                    Some(resolved),
+                    &scripts_ran_dir,
+                    &trust,
+                    &mut errors,
+                ) {
                     pending_scripts.push(ps);
                 }
+            }
+            Err(e) if entry.optional => {
+                // npm carries on without an optional dependency that fails.
+                errors.push(Diagnostic::new(
+                    "OAM-PKG0004",
+                    Severity::Warning,
+                    Origin::Install,
+                    format!("optional package {key} was not installed: {e}"),
+                ));
             }
             Err(e) => {
                 errors.push(diag("OAM-PKG0004", format!("failed to install {key}: {e}")));
@@ -271,11 +541,18 @@ pub fn install(
         }
     }
 
+    // Prune: a package directory the lockfile does not name is left over
+    // from an earlier dependency set, and resolution would still find it.
+    let known_keys: HashSet<&str> = to_install.iter().map(|(key, _)| *key).collect();
+    prune_unlisted(&node_modules, "node_modules", &known_keys);
+
     // Bin linking pass (runs even if some packages failed — link what we can).
     // Bin failures are non-fatal: a missing .bin shim doesn't invalidate the
     // install of the package itself, so the diagnostic lands on the Partial
     // path instead of poisoning an otherwise-clean install with Err.
-    link_bins(&node_modules, &to_install, &mut errors);
+    let linkable: Vec<(&str, &LockfileEntry)> =
+        plan.iter().map(|&(key, _, entry)| (key, entry)).collect();
+    link_bins(&node_modules, &linkable, &mut errors);
 
     // A4: now that the tree and .bin shims are in place, run the lifecycle
     // scripts collected from trusted packages.
@@ -288,11 +565,10 @@ pub fn install(
     // per-file freshness header (transpile fingerprint + source hash) keeps
     // the warm cost to one read + one hash + one open per source file.
     if precompile {
-        for (key, entry) in &to_install {
-            if entry.resolved.is_none() {
-                // Link/file deps, as in the install loop above.
-                continue;
-            }
+        // `plan`, not the raw lockfile: link entries, entries for another
+        // platform and keys that are not package paths are out, as in the
+        // install loop above.
+        for &(key, _, _) in &plan {
             let dest = project_dir.join(key);
             if !dest.join("package.json").is_file() {
                 // Failed to install this run -- already diagnosed above.
@@ -301,8 +577,9 @@ pub fn install(
             // Cache key = the lockfile key relative to the project's
             // node_modules ("react/node_modules/scheduler" for a nested
             // package), so nested packages get distinct cache slots and the
-            // run-time reader -- anchored on the OUTERMOST node_modules
-            // ancestor -- derives the same path.
+            // run-time reader -- anchored on the innermost node_modules
+            // ancestor holding a `.oam/precompile` directory, i.e. this
+            // project's -- derives the same path.
             let cache_key = key.strip_prefix("node_modules/").unwrap_or(key);
             let (_, precompile_errors) =
                 crate::precompile::precompile_package(&dest, cache_key, &cache_root);
@@ -361,6 +638,92 @@ fn push_precompile_warning(
             failures.len()
         ),
     ));
+}
+
+/// The first few per-entry notes of one package, joined for a single
+/// diagnostic line.
+fn summarize_notes(notes: &[String]) -> String {
+    const SHOWN: usize = 3;
+    let mut detail = notes
+        .iter()
+        .take(SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("; ");
+    if notes.len() > SHOWN {
+        detail.push_str(&format!(" (+{} more)", notes.len() - SHOWN));
+    }
+    detail
+}
+
+/// Remove the packages in `dir` (a node_modules directory whose lockfile key
+/// is `dir_key`) that the lockfile does not name, then do the same inside
+/// every package it does name.
+///
+/// Only package-shaped entries go: a directory holding a `package.json`, or a
+/// link. Dot-entries (`.bin`, `.oam`, tool caches) and anything else that is
+/// not a package are left alone. Best-effort: a removal that fails is left
+/// for the next install.
+fn prune_unlisted(dir: &Path, dir_key: &str, known: &HashSet<&str>) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for item in read.flatten() {
+        let Ok(name) = item.file_name().into_string() else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = item.path();
+        if !name.starts_with('@') {
+            prune_candidate(&path, &format!("{dir_key}/{name}"), known);
+            continue;
+        }
+        // A scope directory: its children are the packages. A scope that is
+        // itself a link is not walked.
+        let is_real_dir = std::fs::symlink_metadata(&path)
+            .map(|m| m.is_dir() && !m.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_real_dir {
+            continue;
+        }
+        let Ok(scoped) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for sub in scoped.flatten() {
+            let Ok(sub_name) = sub.file_name().into_string() else {
+                continue;
+            };
+            if sub_name.starts_with('.') {
+                continue;
+            }
+            let sub_key = format!("{dir_key}/{name}/{sub_name}");
+            prune_candidate(&sub.path(), &sub_key, known);
+        }
+    }
+}
+
+/// One entry of a node_modules directory for [`prune_unlisted`]: keep and
+/// descend when the lockfile names `key`, remove when it is an unlisted
+/// package. A link is removed as a link -- its target is never touched.
+fn prune_candidate(path: &Path, key: &str, known: &HashSet<&str>) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    let is_link = meta.file_type().is_symlink();
+    if known.contains(key) {
+        if !is_link && meta.is_dir() {
+            let nested_key = format!("{key}/node_modules");
+            prune_unlisted(&path.join("node_modules"), &nested_key, known);
+        }
+        return;
+    }
+    if is_link {
+        let _ = std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path));
+    } else if meta.is_dir() && path.join("package.json").is_file() {
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
 
 /// Acquire the cross-process install lock (A5). Returns the held lock file
@@ -431,6 +794,8 @@ fn fetch_and_extract(
     url: &str,
     integrity: Option<&str>,
     dest: &Path,
+    replace: bool,
+    notes: &mut Vec<String>,
 ) -> Result<(), String> {
     // Retry up to 3 times: registry CDNs see transient 5xx and TLS resets on
     // CI runners; npm itself defaults to 5. One retry (the original) gave up
@@ -438,11 +803,13 @@ fn fetch_and_extract(
     // resilience over zero retries.
     let data = download_with_retry(rt, client, url, 3)?;
 
+    // An entry without an integrity hash is extracted unverified; the caller
+    // reports that as a warning.
     if let Some(sri) = integrity {
         verify_integrity(&data, sri)?;
     }
 
-    extract_tarball(&data, dest)
+    extract_tarball_with(&data, dest, replace, notes)
 }
 
 fn download_with_retry(
@@ -481,39 +848,82 @@ fn download_with_retry(
 
 // ── SRI integrity verification ──────────────────────────────────────────
 
+/// Check `data` against an SRI string: one or more whitespace-separated
+/// `<algo>-<base64>[?options]` hashes. As npm (ssri) does, only the strongest
+/// algorithm present is checked, and any one hash of that algorithm matching
+/// passes; hashes of an algorithm oam does not know are ignored when a known
+/// one is present.
 pub(crate) fn verify_integrity(data: &[u8], integrity: &str) -> Result<(), String> {
-    let (algo, hash_b64) = integrity
-        .split_once('-')
-        .ok_or_else(|| format!("invalid SRI format: {integrity}"))?;
-    match algo {
+    // Strongest first.
+    const KNOWN: [&str; 4] = ["sha512", "sha384", "sha256", "sha1"];
+
+    let mut hashes: Vec<(&str, &str)> = Vec::new();
+    for token in integrity.split_whitespace() {
+        let (algo, rest) = token
+            .split_once('-')
+            .ok_or_else(|| format!("invalid SRI format: {integrity}"))?;
+        let hash_b64 = rest.split('?').next().unwrap_or(rest);
+        hashes.push((algo, hash_b64));
+    }
+    let Some((first_algo, _)) = hashes.first() else {
+        return Err(format!("invalid SRI format: {integrity}"));
+    };
+    let Some(algo) = KNOWN
+        .iter()
+        .find(|known| hashes.iter().any(|(a, _)| a == *known))
+    else {
+        return Err(format!("unsupported hash algorithm: {first_algo}"));
+    };
+
+    let computed: Vec<u8> = match *algo {
         "sha512" => {
             use sha2::{Digest, Sha512};
-            let computed = Sha512::digest(data);
-            let expected =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, hash_b64)
-                    .map_err(|e| format!("invalid base64 in integrity: {e}"))?;
-            if computed.as_slice() != expected.as_slice() {
-                return Err("sha512 integrity mismatch".into());
-            }
+            Sha512::digest(data).to_vec()
         }
-        "sha1" => {
+        "sha384" => {
+            use sha2::{Digest, Sha384};
+            Sha384::digest(data).to_vec()
+        }
+        "sha256" => {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(data).to_vec()
+        }
+        _ => {
             use sha1::Digest;
-            let computed = sha1::Sha1::digest(data);
-            let expected =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, hash_b64)
-                    .map_err(|e| format!("invalid base64 in integrity: {e}"))?;
-            if computed.as_slice() != expected.as_slice() {
-                return Err("sha1 integrity mismatch".into());
-            }
+            sha1::Sha1::digest(data).to_vec()
         }
-        other => return Err(format!("unsupported hash algorithm: {other}")),
+    };
+
+    let mut undecodable: Option<String> = None;
+    for (_, hash_b64) in hashes.iter().filter(|(a, _)| a == algo) {
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, hash_b64) {
+            Ok(expected) if expected == computed => return Ok(()),
+            Ok(_) => {}
+            Err(e) => undecodable = Some(format!("invalid base64 in integrity: {e}")),
+        }
     }
-    Ok(())
+    Err(undecodable.unwrap_or_else(|| format!("{algo} integrity mismatch")))
 }
 
 // ── Tarball extraction ──────────────────────────────────────────────────
 
+#[cfg(test)]
 fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), String> {
+    extract_tarball_with(data, dest, false, &mut Vec::new())
+}
+
+/// Extract a package tarball to `dest`.
+///
+/// `replace` is for a `dest` that holds a STALE install (another version):
+/// the complete package already there is then replaced instead of being
+/// taken for a peer's finished copy. `notes` collects one line per tarball
+/// entry that was deliberately not created (see `create_symlink_entry`).
+fn extract_tarball_with(
+    data: &[u8],
+    dest: &Path,
+    replace: bool,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
     // Atomic extract: extract into a sibling tempdir first, then rename to
     // `dest`. If anything fails mid-extract (ENOSPC, tar truncation, path
     // traversal, etc.) we remove the tempdir and `dest` stays untouched, so
@@ -547,7 +957,7 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), String> {
     std::fs::create_dir_all(&tmp)
         .map_err(|e| format!("create extract tempdir {}: {e}", tmp.display()))?;
 
-    let result = extract_into(data, &tmp);
+    let result = extract_into(data, &tmp, notes);
     match result {
         Ok(()) => {
             // A peer that FULLY installed dest (package.json present) between
@@ -556,8 +966,10 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), String> {
             // so functionally equivalent. We key on package.json presence,
             // NOT bare existence: dest may exist as a stale/partial dir from
             // a prior crashed extract (dir created, package.json never
-            // written), which must be replaced, not accepted.
-            if dest.join("package.json").is_file() {
+            // written), which must be replaced, not accepted. Under `replace`
+            // the complete package at dest is the stale version this extract
+            // is here to replace, so it is never accepted either.
+            if !replace && dest.join("package.json").is_file() {
                 let _ = std::fs::remove_dir_all(&tmp);
                 return Ok(());
             }
@@ -574,7 +986,7 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), String> {
                     // clear) or a transient FS error. If dest now has a
                     // package.json, accept the peer's copy; else surface it.
                     let _ = std::fs::remove_dir_all(&tmp);
-                    if dest.join("package.json").is_file() {
+                    if !replace && dest.join("package.json").is_file() {
                         Ok(())
                     } else {
                         Err(format!(
@@ -596,7 +1008,24 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), String> {
     }
 }
 
-fn extract_into(data: &[u8], dest: &Path) -> Result<(), String> {
+/// Whether any existing component of `rel`, walked from `dest`, is a symlink.
+/// A write to `dest/rel` would then land wherever the link points, which the
+/// lexical checks on `rel` say nothing about.
+fn crosses_symlink(dest: &Path, rel: &Path) -> bool {
+    let mut cur = dest.to_path_buf();
+    for comp in rel.components() {
+        cur.push(comp);
+        let is_link = std::fs::symlink_metadata(&cur)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_link {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_into(data: &[u8], dest: &Path, notes: &mut Vec<String>) -> Result<(), String> {
     let gz = flate2::read::GzDecoder::new(data);
     let mut archive = tar::Archive::new(gz);
 
@@ -605,27 +1034,50 @@ fn extract_into(data: &[u8], dest: &Path) -> Result<(), String> {
     // with a normal file). Cleaning both sides puts the comparison on a
     // canonical basis.
     let dest_clean = path_clean(dest);
+    // `dest` starts empty, so the only symlinks under it are the ones this
+    // tarball's own entries created; until one exists there is nothing for
+    // a later entry to be written through.
+    let mut symlinks_created = false;
 
     for entry in archive.entries().map_err(|e| format!("tar entries: {e}"))? {
         let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
         let path = entry.path().map_err(|e| format!("tar entry path: {e}"))?;
 
-        // npm tarballs wrap everything under a `package/` prefix.
-        let rel = path.strip_prefix("package").unwrap_or(&path).to_path_buf();
+        // An entry path is a chain of ordinary names. `..`, a root or a
+        // drive prefix is refused outright rather than normalized: a path
+        // that needs normalizing is not one `npm pack` writes.
+        let mut parts: Vec<&std::ffi::OsStr> = Vec::new();
+        let mut ordinary = true;
+        for comp in path.components() {
+            match comp {
+                std::path::Component::Normal(name) => parts.push(name),
+                std::path::Component::CurDir => {}
+                _ => ordinary = false,
+            }
+        }
+        if !ordinary {
+            return Err(format!(
+                "tarball path traversal: {} escapes {}",
+                path.display(),
+                dest.display()
+            ));
+        }
 
-        if rel.as_os_str().is_empty() {
+        // npm tarballs wrap everything under one root directory -- `package/`
+        // by convention, but npm strips the first component whatever it is
+        // called, and so does this. The root itself, and a stray entry beside
+        // it, have nothing left and are skipped.
+        if parts.len() < 2 {
             continue;
         }
+        let rel: PathBuf = parts[1..].iter().collect();
 
         let target = dest.join(&rel);
         let target_clean = path_clean(&target);
 
-        // Security: reject paths that escape the destination. The previous
-        // `target.starts_with(dest)` check was purely lexical and missed
-        // `..` segments inside a relative entry -- e.g. an entry
-        // `package/../../escape.txt` produced `dest/../../escape.txt`, which
-        // lexically starts with `dest` but resolves outside it. Cleaning
-        // the target collapses `..` so the prefix check actually works.
+        // Lexical containment, kept as a backstop for what the component
+        // check cannot see (on Windows a name like `C:x` re-parses as a
+        // drive-relative path once joined).
         if !target_clean.starts_with(&dest_clean) {
             return Err(format!(
                 "tarball path traversal: {} escapes {}",
@@ -634,13 +1086,31 @@ fn extract_into(data: &[u8], dest: &Path) -> Result<(), String> {
             ));
         }
 
+        // Real containment: nothing is created THROUGH a symlink. For a file
+        // or directory that covers the final component too (writing to an
+        // existing link follows it); a symlink entry replaces whatever link
+        // is at its own path, so only its parents are checked.
+        let kind = entry.header().entry_type();
+        if symlinks_created {
+            let through = if kind == tar::EntryType::Symlink {
+                rel.parent()
+            } else {
+                Some(rel.as_path())
+            };
+            if through.is_some_and(|p| crosses_symlink(dest, p)) {
+                return Err(format!(
+                    "tarball path traversal: {} is reached through a symlink",
+                    rel.display()
+                ));
+            }
+        }
+
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("create dir {}: {e}", parent.display()))?;
         }
 
         // Handle directories and files.
-        let kind = entry.header().entry_type();
         if kind.is_dir() {
             std::fs::create_dir_all(&target)
                 .map_err(|e| format!("create dir {}: {e}", target.display()))?;
@@ -666,7 +1136,10 @@ fn extract_into(data: &[u8], dest: &Path) -> Result<(), String> {
                 Ok(Some(name)) => name.into_owned(),
                 _ => continue, // unreadable / empty link target: skip
             };
-            create_symlink_entry(&link_name, &target, &dest_clean, &rel)?;
+            match create_symlink_entry(&link_name, &target, &dest_clean, &rel)? {
+                None => symlinks_created = true,
+                Some(note) => notes.push(note),
+            }
         }
         // Other entry types (hardlinks, char/block devices, FIFOs) are not
         // produced by `npm pack` and are skipped.
@@ -681,32 +1154,51 @@ fn extract_into(data: &[u8], dest: &Path) -> Result<(), String> {
 /// directory and must stay within `dest_clean`: a within-package link (the
 /// common case) is created; one that escapes the package -- whether a malicious
 /// `../../etc/passwd` or an unsupported cross-package/workspace link -- is
-/// skipped with a warning rather than created or aborted.
+/// skipped with a note rather than created or aborted.
 ///
-/// Unix creates the symlink. On non-Unix it is skipped with a warning: Windows
+/// The containment check is lexical, so the stored target must be one a
+/// lexical check can speak for: any `..` comes first (`../lib/x`, never
+/// `a/../x`), and it is not absolute. The leading `..` then only climb the
+/// link's own parents, which `extract_into` has verified are real
+/// directories; a `..` AFTER a name could climb out of whatever link that
+/// name turns out to be.
+///
+/// Unix creates the symlink. On non-Unix it is skipped with a note: Windows
 /// symlinks need a privilege normal accounts lack and require knowing file-vs-
 /// dir up front, and npm itself shims bins separately rather than relying on
-/// tarball symlinks there. Either way the warning means the omission is not
-/// silent (the prior MVP dropped symlinks with no trace).
+/// tarball symlinks there.
+///
+/// Returns `Ok(None)` when the link was created and `Ok(Some(note))` when it
+/// was skipped. The note goes to the caller's diagnostics -- nothing here
+/// prints (see `warnings.rs`: the loader never writes to stderr itself).
 fn create_symlink_entry(
     link_name: &Path,
     target: &Path,
     dest_clean: &Path,
     rel: &Path,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
+    let mut seen_name = false;
+    let mut plain = true;
+    for comp in link_name.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => plain &= !seen_name,
+            std::path::Component::Normal(_) => seen_name = true,
+            _ => plain = false,
+        }
+    }
     let link_parent = target.parent().unwrap_or(target);
     let resolved = path_clean(&link_parent.join(link_name));
-    if !resolved.starts_with(dest_clean) {
-        eprintln!(
-            "oam install: warning: skipping symlink {} -> {} (target outside package)",
+    if !plain || !resolved.starts_with(dest_clean) {
+        return Ok(Some(format!(
+            "{} -> {} (target outside the package)",
             rel.display(),
             link_name.display()
-        );
-        return Ok(());
+        )));
     }
 
     #[cfg(unix)]
-    {
+    let skipped: Option<String> = {
         // Replace any stale entry so a re-extract is idempotent.
         let _ = std::fs::remove_file(target);
         std::os::unix::fs::symlink(link_name, target).map_err(|e| {
@@ -716,16 +1208,15 @@ fn create_symlink_entry(
                 link_name.display()
             )
         })?;
-    }
+        None
+    };
     #[cfg(not(unix))]
-    {
-        eprintln!(
-            "oam install: warning: skipping symlink {} -> {} (symlinks need a privilege on this platform)",
-            rel.display(),
-            link_name.display()
-        );
-    }
-    Ok(())
+    let skipped: Option<String> = Some(format!(
+        "{} -> {} (symlinks need a privilege on this platform)",
+        rel.display(),
+        link_name.display()
+    ));
+    Ok(skipped)
 }
 
 // ── Bin linking ─────────────────────────────────────────────────────────
@@ -735,8 +1226,14 @@ fn create_symlink_entry(
 ///
 /// `errors` is appended to (never returned as `Err`) so the caller can
 /// classify once. The create-dir and canonicalize-failure paths surface
-/// `OAM-PKG0005` warnings; per-shim failures are non-diagnostic (logged to
-/// stderr) because a missing shim is recoverable on the next install.
+/// `OAM-PKG0005` warnings, and so does each shim that could not be written
+/// or whose `bin` entry is not usable -- as diagnostics, never as prose on
+/// stderr, so `oam install --json` stays JSONL.
+///
+/// Only TOP-LEVEL packages (`node_modules/<name>`) are linked here, as npm
+/// does: a nested copy (`node_modules/a/node_modules/semver`) must not
+/// replace the command of the top-level package of the same name. (npm gives
+/// nested packages a `.bin` beside them; oam does not create those yet.)
 pub(crate) fn link_bins(
     node_modules: &Path,
     packages: &[(&str, &LockfileEntry)],
@@ -748,6 +1245,11 @@ pub(crate) fn link_bins(
     let mut bins: Vec<(String, std::path::PathBuf)> = Vec::new();
 
     for (key, entry) in packages {
+        // Top-level only: the key is exactly node_modules/<directory name>.
+        let dir_name = lockfile_key_package(key);
+        if dir_name.is_none() || key.strip_prefix("node_modules/") != dir_name {
+            continue;
+        }
         let pkg_dir = node_modules.parent().unwrap_or(node_modules).join(key);
 
         let bin_field = if let Some(ref bin) = entry.bin {
@@ -767,21 +1269,37 @@ pub(crate) fn link_bins(
             bin
         };
 
-        // Package name for the default bin name (last segment of key).
-        let pkg_name = key.rsplit('/').next().unwrap_or(key);
+        // The default bin name for a string `bin`: the package's own name
+        // without its scope (the lockfile `name` under an alias, else the
+        // last segment of the key).
+        let pkg_name: &str = entry.name.as_deref().unwrap_or(*key);
 
+        let mut declared: Vec<(&str, &str)> = Vec::new();
         match &bin_field {
-            serde_json::Value::String(s) => {
-                bins.push((pkg_name.to_string(), pkg_dir.join(s)));
-            }
+            serde_json::Value::String(s) => declared.push((pkg_name, s.as_str())),
             serde_json::Value::Object(map) => {
                 for (name, path) in map {
                     if let Some(s) = path.as_str() {
-                        bins.push((name.clone(), pkg_dir.join(s)));
+                        declared.push((name.as_str(), s));
                     }
                 }
             }
             _ => {}
+        }
+        for (name, target) in declared {
+            // A command name is one file name inside .bin and its target one
+            // file inside the package, whatever the manifest spells.
+            match (safe_bin_name(name), safe_bin_target(&pkg_dir, target)) {
+                (Some(name), Some(target)) => bins.push((name.to_string(), target)),
+                _ => errors.push(Diagnostic::new(
+                    "OAM-PKG0005",
+                    Severity::Warning,
+                    Origin::Install,
+                    format!(
+                        "{key}: bin entry '{name}' -> '{target}' is not usable; no shim created"
+                    ),
+                )),
+            }
         }
     }
 
@@ -826,11 +1344,52 @@ pub(crate) fn link_bins(
     };
 
     for (name, target) in &bins {
-        if let Err(e) = create_bin_shim(&bin_dir, &bin_dir_canonical, name, target, node_modules) {
+        if let Err(e) = create_bin_shim(&bin_dir, &bin_dir_canonical, name, target) {
             // Non-fatal: warn and continue.
-            eprintln!("oam install: warning: bin shim for {name}: {e}");
+            errors.push(Diagnostic::new(
+                "OAM-PKG0005",
+                Severity::Warning,
+                Origin::Install,
+                format!("bin shim for {name}: {e}"),
+            ));
         }
     }
+}
+
+/// The file name a `bin` key links as: its last path segment, as npm
+/// normalizes it (`../../x` and `@scope/x` both name the command `x`). `None`
+/// when nothing usable is left.
+fn safe_bin_name(name: &str) -> Option<&str> {
+    let base = name.rsplit(['/', '\\', ':']).next().unwrap_or(name);
+    if matches!(base, "" | "." | "..") {
+        None
+    } else {
+        Some(base)
+    }
+}
+
+/// A `bin` target as a file inside `pkg_dir`. The value is read as a path
+/// relative to the package root: `.` segments drop, `..` climbs no higher
+/// than the root (npm's normalization), and a segment carrying a drive colon
+/// is refused. `None` when the target names no file.
+fn safe_bin_target(pkg_dir: &Path, target: &str) -> Option<PathBuf> {
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in target.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s if s.contains(':') => return None,
+            s => parts.push(s),
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut out = pkg_dir.to_path_buf();
+    out.extend(parts);
+    Some(out)
 }
 
 fn create_bin_shim(
@@ -838,14 +1397,15 @@ fn create_bin_shim(
     bin_dir_canonical: &Path,
     name: &str,
     target: &Path,
-    _node_modules: &Path,
 ) -> Result<(), String> {
     // Compute relative path from .bin to the target.
     let rel = pathdiff(target, bin_dir_canonical);
 
     #[cfg(windows)]
     {
-        // Windows: create a .cmd shim.
+        // Windows: create a .cmd shim. It starts the script with `node`
+        // from PATH (documented in docs/node-divergences.md section 11);
+        // which interpreter a shim should name is an open product choice.
         let cmd_path = bin_dir.join(format!("{name}.cmd"));
         let rel_str = rel.to_string_lossy().replace('/', "\\");
         let content = format!(
@@ -948,9 +1508,20 @@ fn script_marker_path(scripts_ran_dir: &Path, pkg_name: &str) -> PathBuf {
 /// warning and returns `None` -- scripts run only after explicit
 /// `oam trust add <pkg>`. No scripts, or unreadable package.json, returns
 /// `None` quietly.
+///
+/// Trust names a PACKAGE, not a directory. `pkg_name` is the directory the
+/// package is installed under (it keys the run-once marker); `declared_name`
+/// is the package the lockfile says is there -- its `name` under an alias,
+/// else the directory name -- and is what the trust list is asked about.
+/// Scripts are only ever enqueued when the identities agree: the extracted
+/// manifest's own `name` is `declared_name`, and a registry `resolved` URL
+/// carries that same name. Otherwise an `OAM-PKG0007` warning says so and the
+/// scripts are skipped whatever the trust list holds.
 fn check_lifecycle_scripts(
     dest: &Path,
     pkg_name: &str,
+    declared_name: &str,
+    resolved: Option<&str>,
     scripts_ran_dir: &Path,
     trust: &crate::trust::TrustConfig,
     errors: &mut Vec<Diagnostic>,
@@ -975,19 +1546,39 @@ fn check_lifecycle_scripts(
         return None;
     }
 
-    if !trust.is_trusted(pkg_name) {
-        let version = json.get("version").and_then(|v| v.as_str()).unwrap_or("?");
-        let script_list = present
-            .iter()
-            .map(|(p, _)| *p)
-            .collect::<Vec<_>>()
-            .join(", ");
+    let version = json.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+    let script_list = present
+        .iter()
+        .map(|(p, _)| *p)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let manifest_name = json.get("name").and_then(|v| v.as_str());
+    let url_agrees = match resolved {
+        Some(url) => resolved_url_names(url, declared_name),
+        None => true,
+    };
+    if manifest_name != Some(declared_name) || !url_agrees {
         errors.push(Diagnostic::new(
             "OAM-PKG0007",
             Severity::Warning,
             Origin::Install,
             format!(
-                "{pkg_name}@{version} has lifecycle script(s) ({script_list}) -- skipped; run 'oam trust add {pkg_name}' to allow"
+                "{declared_name}@{version} has lifecycle script(s) ({script_list}) -- skipped: the package in {} names itself '{}' and does not match the name and registry path the lockfile gives it, so no trust entry applies",
+                dest.display(),
+                manifest_name.unwrap_or("?")
+            ),
+        ));
+        return None;
+    }
+
+    if !trust.is_trusted(declared_name) {
+        errors.push(Diagnostic::new(
+            "OAM-PKG0007",
+            Severity::Warning,
+            Origin::Install,
+            format!(
+                "{declared_name}@{version} has lifecycle script(s) ({script_list}) -- skipped; run 'oam trust add {declared_name}' to allow"
             ),
         ));
         return None;
@@ -995,10 +1586,23 @@ fn check_lifecycle_scripts(
 
     Some(PendingScripts {
         pkg_dir: dest.to_path_buf(),
-        pkg_name: pkg_name.to_string(),
+        pkg_name: declared_name.to_string(),
         scripts: present,
         marker_path: script_marker_path(scripts_ran_dir, pkg_name),
     })
+}
+
+/// Whether a `resolved` URL is consistent with the package being `name`. A
+/// registry tarball URL is `<registry>/<name>/-/<file>.tgz` (the scope
+/// separator sometimes percent-encoded), so when the `/-/` marker is present
+/// the path before it must end in `/<name>`. A URL without the marker (a
+/// plain tarball host) carries no name to compare and is accepted.
+fn resolved_url_names(url: &str, name: &str) -> bool {
+    let Some((before, _)) = url.split_once("/-/") else {
+        return true;
+    };
+    let before = before.to_ascii_lowercase().replace("%2f", "/");
+    before.ends_with(&format!("/{}", name.to_ascii_lowercase()))
 }
 
 /// Run the lifecycle scripts collected from trusted packages, after the full
@@ -1068,8 +1672,9 @@ fn scripts_globally_ignored() -> bool {
     )
 }
 
-/// Run a single lifecycle script via the platform shell (`sh -c` / `cmd /C`),
-/// with `node_modules/.bin` prepended to PATH and `npm_lifecycle_event` set.
+/// Run a single lifecycle script via the platform shell (`sh -c` /
+/// `cmd /d /s /c`), with `node_modules/.bin` prepended to PATH and
+/// `npm_lifecycle_event` set.
 fn run_one_script(cmd: &str, phase: &str, pkg_dir: &Path, bin_dir: &Path) -> Result<(), String> {
     // Prepend node_modules/.bin to PATH so scripts can call installed bins.
     let mut paths: Vec<PathBuf> = vec![bin_dir.to_path_buf()];
@@ -1078,14 +1683,26 @@ fn run_one_script(cmd: &str, phase: &str, pkg_dir: &Path, bin_dir: &Path) -> Res
     }
     let new_path = std::env::join_paths(paths).map_err(|e| format!("PATH join: {e}"))?;
 
+    // Windows: the script goes to cmd.exe VERBATIM, wrapped in one pair of
+    // quotes that `/s` strips -- what npm and node's `shell: true` do. A
+    // plain `.arg(cmd)` would apply the C-runtime quoting rules (an inner `"`
+    // becomes `\"`), which cmd.exe does not undo, so a script such as
+    // `node -e "require('./x')"` reached its program mangled.
     #[cfg(windows)]
-    let (sh, flag) = ("cmd", "/C");
+    let (sh, mut command) = {
+        use std::os::windows::process::CommandExt;
+        let mut command = std::process::Command::new("cmd");
+        command.raw_arg("/d /s /c").raw_arg(format!("\"{cmd}\""));
+        ("cmd", command)
+    };
     #[cfg(not(windows))]
-    let (sh, flag) = ("sh", "-c");
+    let (sh, mut command) = {
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(cmd);
+        ("sh", command)
+    };
 
-    let status = std::process::Command::new(sh)
-        .arg(flag)
-        .arg(cmd)
+    let status = command
         .current_dir(pkg_dir)
         .env("PATH", new_path)
         .env("npm_lifecycle_event", phase)
@@ -1436,11 +2053,10 @@ mod tests {
     // NOTE on coverage: this test exercises the ABSOLUTE-path case, where
     // `Path::join` replaces the base so the prefix check fails outright.
     // The `..` case is covered separately by
-    // `extract_tarball_rejects_dotdot_path_traversal` — `extract_into` runs
-    // `path_clean` (which collapses `..`) on BOTH sides before comparing,
-    // so a `..` entry cannot escape. An earlier revision of this comment
-    // described that as an open gap; it was fixed, and the stale wording
-    // read as a live path-traversal vulnerability.
+    // `extract_tarball_rejects_dotdot_path_traversal` (`extract_into` refuses
+    // any entry path with a `..`, root or prefix component), and an entry
+    // reached through a symlink the tarball itself created by
+    // `extract_tarball_refuses_an_entry_reached_through_a_symlink`.
     #[test]
     fn extract_tarball_rejects_path_traversal() {
         use flate2::Compression;
@@ -1703,7 +2319,8 @@ mod tests {
         let empty = crate::trust::TrustConfig::default();
         let mut errors = Vec::new();
         assert!(
-            check_lifecycle_scripts(&pkg, "p", &scripts_ran_dir, &empty, &mut errors).is_none()
+            check_lifecycle_scripts(&pkg, "p", "p", None, &scripts_ran_dir, &empty, &mut errors)
+                .is_none()
         );
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].code, "OAM-PKG0007");
@@ -1712,8 +2329,16 @@ mod tests {
         let mut trusted = crate::trust::TrustConfig::default();
         trusted.add("p");
         let mut errors2 = Vec::new();
-        let pending = check_lifecycle_scripts(&pkg, "p", &scripts_ran_dir, &trusted, &mut errors2)
-            .expect("trusted pkg with scripts yields pending");
+        let pending = check_lifecycle_scripts(
+            &pkg,
+            "p",
+            "p",
+            None,
+            &scripts_ran_dir,
+            &trusted,
+            &mut errors2,
+        )
+        .expect("trusted pkg with scripts yields pending");
         assert!(errors2.is_empty(), "trusted: no warning; got {errors2:?}");
         assert_eq!(
             pending.scripts.len(),
@@ -1859,6 +2484,7 @@ mod tests {
                 "tsc": "./bin/tsc",
                 "tsserver": "./bin/tsserver"
             })),
+            ..Default::default()
         };
         let packages: Vec<(&str, &LockfileEntry)> = vec![(
             "node_modules/typescript",
@@ -1926,6 +2552,7 @@ mod tests {
             resolved: Some("https://example.invalid/legacy-pkg-1.0.0.tgz".into()),
             integrity: None,
             bin: Some(serde_json::json!(["cmd1", "cmd2"])),
+            ..Default::default()
         };
         let packages: Vec<(&str, &LockfileEntry)> = vec![("node_modules/legacy-pkg", &entry)];
 
@@ -1965,6 +2592,612 @@ mod tests {
             "message should mention frozen-lockfile; got: {}",
             errors[0].message
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A fresh, empty directory under the system temp dir.
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "oam-install-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A gzipped tarball of regular files, paths taken as written.
+    fn tarball_of(files: &[(&str, &str)]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, content) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_path(path).unwrap();
+            header.set_cksum();
+            builder.append(&header, content.as_bytes()).unwrap();
+        }
+        let tar_data = builder.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar_data).unwrap();
+        gz.finish().unwrap()
+    }
+
+    // A lockfile key is only ever a package path inside the project.
+    #[test]
+    fn lockfile_key_package_accepts_only_package_paths() {
+        assert_eq!(lockfile_key_package("node_modules/foo"), Some("foo"));
+        assert_eq!(
+            lockfile_key_package("node_modules/@scope/bar"),
+            Some("@scope/bar")
+        );
+        assert_eq!(
+            lockfile_key_package("node_modules/react/node_modules/scheduler"),
+            Some("scheduler")
+        );
+        assert_eq!(
+            lockfile_key_package("packages/app/node_modules/@scope/bar"),
+            Some("@scope/bar")
+        );
+        for refused in [
+            "",
+            "foo",
+            "packages/app",
+            "../node_modules/foo",
+            "node_modules/../../foo",
+            "node_modules/foo/../../../bar",
+            "/node_modules/foo",
+            "node_modules//foo",
+            "node_modules/foo/",
+            "node_modules/.bin",
+            "node_modules/@scope",
+            "node_modules/@/foo",
+            "node_modules/@scope/.hidden",
+            "node_modules/foo/bar",
+            "node_modules\\foo",
+            "C:/node_modules/foo",
+            // The last "node_modules" segment anchors; nothing follows it.
+            "node_modules/node_modules",
+        ] {
+            assert_eq!(lockfile_key_package(refused), None, "{refused:?}");
+        }
+    }
+
+    // npm-install-checks' list rule, for the `os` and `cpu` fields.
+    #[test]
+    fn platform_list_allows_follows_npm() {
+        use serde_json::json;
+
+        assert!(platform_list_allows(None, "linux"));
+        assert!(platform_list_allows(Some(&json!([])), "linux"));
+        assert!(platform_list_allows(Some(&json!(["any"])), "linux"));
+        assert!(platform_list_allows(Some(&json!("linux")), "linux"));
+        assert!(platform_list_allows(
+            Some(&json!(["darwin", "linux"])),
+            "linux"
+        ));
+        assert!(!platform_list_allows(Some(&json!(["darwin"])), "linux"));
+        assert!(platform_list_allows(Some(&json!(["!win32"])), "linux"));
+        assert!(!platform_list_allows(Some(&json!(["!win32"])), "win32"));
+        assert!(!platform_list_allows(
+            Some(&json!(["linux", "!linux"])),
+            "linux"
+        ));
+    }
+
+    // Link entries, entries for another platform and non-URL `resolved`
+    // values are settled from the lockfile alone: nothing is fetched (the
+    // hosts below do not resolve; a fetch attempt would add a "was not
+    // installed" diagnostic to the two this test expects).
+    #[test]
+    fn install_settles_link_platform_and_non_url_entries_without_fetching() {
+        let tmp = fresh_dir("no-fetch");
+        let lockfile = r#"{
+            "name": "ws-root",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "ws-root", "version": "1.0.0", "workspaces": ["packages/*"]},
+                "node_modules/ws-pkg": {"resolved": "packages/ws-pkg", "link": true},
+                "packages/ws-pkg": {"name": "ws-pkg", "version": "1.0.0"},
+                "node_modules/other-platform": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.example.invalid/other-platform/-/other-platform-1.0.0.tgz",
+                    "optional": true,
+                    "os": ["no-such-os"]
+                },
+                "node_modules/other-cpu": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.example.invalid/other-cpu/-/other-cpu-1.0.0.tgz",
+                    "optional": true,
+                    "cpu": ["no-such-cpu"]
+                },
+                "node_modules/from-file": {
+                    "version": "1.0.0",
+                    "resolved": "file:vendor/from-file-1.0.0.tgz"
+                }
+            }
+        }"#;
+        std::fs::write(tmp.join("package-lock.json"), lockfile).unwrap();
+
+        let (installed, errors) = match install(&tmp, true, false) {
+            Ok(InstallOutcome::Partial {
+                installed, errors, ..
+            }) => (installed, errors),
+            other => panic!("expected a Partial outcome; got {other:?}"),
+        };
+        assert_eq!(installed, 0);
+
+        let warnings: Vec<&Diagnostic> = errors
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .collect();
+        let hard: Vec<&Diagnostic> = errors
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert_eq!(warnings.len(), 1, "{errors:?}");
+        assert!(
+            warnings[0].message.contains("node_modules/ws-pkg")
+                && warnings[0].message.contains("not linked"),
+            "{}",
+            warnings[0].message
+        );
+        assert_eq!(hard.len(), 1, "{errors:?}");
+        assert_eq!(hard[0].code, "OAM-PKG0004");
+        assert!(
+            hard[0].message.contains("node_modules/from-file")
+                && hard[0].message.contains("unsupported `resolved`"),
+            "{}",
+            hard[0].message
+        );
+        assert!(!tmp.join("node_modules/other-platform").exists());
+        assert!(!tmp.join("node_modules/other-cpu").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // A key that is not a package path is refused before anything is joined
+    // to the project directory, and the directory it points at is untouched.
+    #[test]
+    fn install_refuses_a_key_outside_node_modules() {
+        let tmp = fresh_dir("bad-key");
+        let project = tmp.join("project");
+        let sibling = tmp.join("sibling");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("keep.txt"), "keep").unwrap();
+        let lockfile = r#"{
+            "name": "bad-key",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "bad-key", "version": "1.0.0"},
+                "../sibling": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.example.invalid/sibling/-/sibling-1.0.0.tgz"
+                }
+            }
+        }"#;
+        std::fs::write(project.join("package-lock.json"), lockfile).unwrap();
+
+        let (installed, errors) = match install(&project, true, false) {
+            Ok(InstallOutcome::Partial {
+                installed, errors, ..
+            }) => (installed, errors),
+            other => panic!("expected a Partial outcome; got {other:?}"),
+        };
+        assert_eq!(installed, 0);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].code, "OAM-PKG0004");
+        assert!(
+            errors[0].message.contains("lockfile key"),
+            "{}",
+            errors[0].message
+        );
+        assert!(sibling.join("keep.txt").is_file());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // "Installed" means the lockfile's version, not merely a package.json.
+    #[test]
+    fn installed_version_differs_compares_manifest_to_lockfile() {
+        let tmp = fresh_dir("version");
+        let manifest = tmp.join("package.json");
+        std::fs::write(&manifest, r#"{"name":"p","version":"1.0.0"}"#).unwrap();
+        assert!(!installed_version_differs(&manifest, Some("1.0.0")));
+        assert!(installed_version_differs(&manifest, Some("1.1.0")));
+        assert!(!installed_version_differs(&manifest, None));
+
+        std::fs::write(&manifest, r#"{"name":"p","version":"v1.0.0"}"#).unwrap();
+        assert!(!installed_version_differs(&manifest, Some("1.0.0")));
+
+        // Unknown is "same": no version, unparseable, missing.
+        std::fs::write(&manifest, r#"{"name":"p"}"#).unwrap();
+        assert!(!installed_version_differs(&manifest, Some("1.0.0")));
+        std::fs::write(&manifest, "not json").unwrap();
+        assert!(!installed_version_differs(&manifest, Some("1.0.0")));
+        assert!(!installed_version_differs(
+            &tmp.join("absent.json"),
+            Some("1.0.0")
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // A stale install is replaced by the extract; without `replace` a
+    // complete package at dest is a peer's copy and wins.
+    #[test]
+    fn extract_replaces_a_stale_package_only_when_asked() {
+        let tmp = fresh_dir("replace");
+        let dest = tmp.join("node_modules").join("p");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(
+            dest.join("package.json"),
+            r#"{"name":"p","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(dest.join("old.txt"), "old").unwrap();
+        let new = tarball_of(&[("package/package.json", r#"{"name":"p","version":"1.1.0"}"#)]);
+
+        extract_tarball_with(&new, &dest, false, &mut Vec::new()).unwrap();
+        assert!(dest.join("old.txt").is_file(), "a peer's copy is kept");
+
+        extract_tarball_with(&new, &dest, true, &mut Vec::new()).unwrap();
+        assert!(!dest.join("old.txt").exists(), "the stale tree is gone");
+        let manifest = std::fs::read_to_string(dest.join("package.json")).unwrap();
+        assert!(manifest.contains("1.1.0"), "{manifest}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // The prune pass removes unlisted PACKAGES (top-level, scoped, nested)
+    // and nothing else.
+    #[test]
+    fn prune_unlisted_removes_only_packages_the_lockfile_does_not_name() {
+        let tmp = fresh_dir("prune");
+        let nm = tmp.join("node_modules");
+        let package = |rel: &str| {
+            let dir = nm.join(rel);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("package.json"),
+                r#"{"name":"x","version":"1.0.0"}"#,
+            )
+            .unwrap();
+        };
+        package("keep");
+        package("keep/node_modules/stale-nested");
+        package("keep/node_modules/kept-nested");
+        package("gone");
+        package("@s/kept");
+        package("@s/dropped");
+        std::fs::create_dir_all(nm.join(".bin")).unwrap();
+        std::fs::write(nm.join(".bin").join("tool"), "x").unwrap();
+        std::fs::create_dir_all(nm.join(".oam").join("precompile")).unwrap();
+        std::fs::create_dir_all(nm.join("not-a-package")).unwrap();
+        std::fs::write(nm.join("not-a-package").join("notes.txt"), "x").unwrap();
+
+        let known: HashSet<&str> = [
+            "node_modules/keep",
+            "node_modules/keep/node_modules/kept-nested",
+            "node_modules/@s/kept",
+        ]
+        .into_iter()
+        .collect();
+        prune_unlisted(&nm, "node_modules", &known);
+
+        assert!(nm.join("keep/package.json").is_file());
+        assert!(
+            nm.join("keep/node_modules/kept-nested/package.json")
+                .is_file()
+        );
+        assert!(!nm.join("keep/node_modules/stale-nested").exists());
+        assert!(!nm.join("gone").exists());
+        assert!(nm.join("@s/kept/package.json").is_file());
+        assert!(!nm.join("@s/dropped").exists());
+        assert!(nm.join(".bin").join("tool").is_file());
+        assert!(nm.join(".oam").join("precompile").is_dir());
+        assert!(nm.join("not-a-package").join("notes.txt").is_file());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // A multi-hash SRI string verifies against its strongest algorithm.
+    #[test]
+    fn verify_integrity_multiple_hashes() {
+        let data = b"hello";
+        let b64 = |bytes: &[u8]| {
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+        };
+        let sha512 = {
+            use sha2::{Digest, Sha512};
+            b64(Sha512::digest(data).as_slice())
+        };
+        let sha256 = {
+            use sha2::{Digest, Sha256};
+            b64(Sha256::digest(data).as_slice())
+        };
+        let sha1 = {
+            use sha1::Digest;
+            b64(sha1::Sha1::digest(data).as_slice())
+        };
+        let wrong512 = {
+            use sha2::{Digest, Sha512};
+            b64(Sha512::digest(b"world").as_slice())
+        };
+
+        // Both present: fine, in either order, with an options suffix.
+        assert!(verify_integrity(data, &format!("sha512-{sha512} sha1-{sha1}")).is_ok());
+        assert!(verify_integrity(data, &format!("sha1-{sha1} sha512-{sha512}?opt")).is_ok());
+        assert!(verify_integrity(data, &format!("sha256-{sha256}")).is_ok());
+        // Two hashes of the strongest algorithm: either may match.
+        assert!(verify_integrity(data, &format!("sha512-{wrong512} sha512-{sha512}")).is_ok());
+        // The strongest algorithm decides: a matching sha1 does not rescue a
+        // sha512 that does not match.
+        let err = verify_integrity(data, &format!("sha512-{wrong512} sha1-{sha1}")).unwrap_err();
+        assert!(err.contains("sha512 integrity mismatch"), "{err}");
+        // An unknown algorithm beside a known one is ignored.
+        assert!(verify_integrity(data, &format!("md5-abc sha1-{sha1}")).is_ok());
+        assert!(verify_integrity(data, "").is_err());
+    }
+
+    // npm strips the tarball's first path component whatever it is called.
+    #[test]
+    fn extract_tarball_strips_any_root_directory() {
+        let gz = tarball_of(&[
+            ("pkg-root/package.json", r#"{"name":"t","version":"1.0.0"}"#),
+            ("pkg-root/lib/index.js", "module.exports = 1;\n"),
+            ("stray-file-beside-the-root", "ignored"),
+        ]);
+        let tmp = fresh_dir("any-root");
+        extract_tarball(&gz, &tmp).unwrap();
+        assert!(tmp.join("package.json").is_file());
+        assert!(tmp.join("lib").join("index.js").is_file());
+        assert!(!tmp.join("pkg-root").exists());
+        assert!(!tmp.join("stray-file-beside-the-root").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Containment is real, not only lexical: an entry whose path runs
+    // through a symlink an earlier entry created is refused, and a link
+    // whose target climbs after a name is not created at all.
+    #[cfg(unix)]
+    #[test]
+    fn extract_tarball_refuses_an_entry_reached_through_a_symlink() {
+        use std::io::Write;
+
+        let build = |link_target: &str, file_path: &str| {
+            let mut builder = tar::Builder::new(Vec::new());
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            link.set_path("package/a/up").unwrap();
+            link.set_link_name(link_target).unwrap();
+            link.set_cksum();
+            builder.append(&link, std::io::empty()).unwrap();
+
+            let content = b"x";
+            let mut file = tar::Header::new_gnu();
+            file.set_size(content.len() as u64);
+            file.set_entry_type(tar::EntryType::Regular);
+            file.set_path(file_path).unwrap();
+            file.set_cksum();
+            builder.append(&file, &content[..]).unwrap();
+
+            let tar_data = builder.into_inner().unwrap();
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            gz.write_all(&tar_data).unwrap();
+            gz.finish().unwrap()
+        };
+
+        // `a/up -> ..` stays inside the package and is created; a file
+        // addressed through it is refused.
+        let tmp = fresh_dir("through-link");
+        let dest = tmp.join("pkg");
+        std::fs::create_dir_all(&dest).unwrap();
+        let err = extract_tarball(&build("..", "package/a/up/through.txt"), &dest).unwrap_err();
+        assert!(err.contains("through a symlink"), "{err}");
+        assert!(!dest.join("through.txt").exists());
+        assert!(!tmp.join("through.txt").exists());
+
+        // A target with `..` after a name is skipped with a note, so the
+        // file after it is an ordinary write into a real directory.
+        let dest2 = tmp.join("pkg2");
+        std::fs::create_dir_all(&dest2).unwrap();
+        let mut notes = Vec::new();
+        extract_tarball_with(
+            &build("b/../..", "package/plain.txt"),
+            &dest2,
+            false,
+            &mut notes,
+        )
+        .unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(std::fs::symlink_metadata(dest2.join("a").join("up")).is_err());
+        assert!(dest2.join("plain.txt").is_file());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Only top-level packages link into the root .bin, a bin name is one
+    // file name inside it, and a bin target stays inside its package.
+    #[test]
+    fn link_bins_top_level_only_and_contained() {
+        let tmp = fresh_dir("linkbins-contained");
+        let nm = tmp.join("node_modules");
+        let file = |rel: &str| {
+            let path = nm.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        };
+        file("semver/bin/top.js");
+        file("zeta/node_modules/semver/bin/nested.js");
+        file("odd/run.js");
+        file("odd/inside.js");
+
+        let top = LockfileEntry {
+            bin: Some(serde_json::json!({"semver": "bin/top.js"})),
+            ..Default::default()
+        };
+        let nested = LockfileEntry {
+            bin: Some(serde_json::json!({"semver": "bin/nested.js"})),
+            ..Default::default()
+        };
+        let odd = LockfileEntry {
+            bin: Some(serde_json::json!({
+                "../../escape": "run.js",
+                "climb": "../../inside.js",
+                "..": "run.js"
+            })),
+            ..Default::default()
+        };
+        let packages: Vec<(&str, &LockfileEntry)> = vec![
+            ("node_modules/odd", &odd),
+            ("node_modules/semver", &top),
+            ("node_modules/zeta/node_modules/semver", &nested),
+        ];
+        let mut errors: Vec<Diagnostic> = Vec::new();
+        link_bins(&nm, &packages, &mut errors);
+
+        // The one unusable entry ("..") is a warning, not prose on stderr.
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].code, "OAM-PKG0005");
+        assert!(errors[0].severity == Severity::Warning);
+
+        let bin_dir = nm.join(".bin");
+        // What a shim points at, as text.
+        let shim = |name: &str| -> String {
+            #[cfg(windows)]
+            let text = std::fs::read_to_string(bin_dir.join(format!("{name}.cmd"))).unwrap();
+            #[cfg(not(windows))]
+            let text = std::fs::read_link(bin_dir.join(name))
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            text
+        };
+        assert!(shim("semver").contains("top.js"), "{}", shim("semver"));
+        assert!(!shim("semver").contains("nested.js"));
+        assert!(shim("escape").contains("run.js"));
+        assert!(shim("climb").contains("inside.js"));
+        // Nothing was written above .bin.
+        assert!(!tmp.join("escape").exists());
+        assert!(!tmp.join("escape.cmd").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Trust names a package: scripts run only when the directory's lockfile
+    // name, the manifest's own name and a registry URL's path all agree.
+    #[test]
+    fn check_lifecycle_scripts_requires_matching_identity() {
+        let tmp = fresh_dir("identity");
+        let pkg = tmp.join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"other","version":"1.0.0","scripts":{"postinstall":"echo hi"}}"#,
+        )
+        .unwrap();
+        let scripts_ran_dir = tmp.join("node_modules").join(".oam").join("scripts-ran");
+        let mut trust = crate::trust::TrustConfig::default();
+        trust.add("p");
+        trust.add("other");
+
+        // Installed as "p" with no lockfile name: the manifest disagrees.
+        let mut errors = Vec::new();
+        assert!(
+            check_lifecycle_scripts(&pkg, "p", "p", None, &scripts_ran_dir, &trust, &mut errors)
+                .is_none()
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].code, "OAM-PKG0007");
+        assert!(errors[0].message.contains("names itself 'other'"));
+
+        // Lockfile name agrees with the manifest, the registry path does not.
+        let mut errors = Vec::new();
+        assert!(
+            check_lifecycle_scripts(
+                &pkg,
+                "p",
+                "other",
+                Some("https://registry.example.invalid/p/-/p-1.0.0.tgz"),
+                &scripts_ran_dir,
+                &trust,
+                &mut errors,
+            )
+            .is_none()
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
+
+        // All three agree: the scripts are enqueued under the real name, and
+        // the run-once marker stays keyed on the directory.
+        let mut errors = Vec::new();
+        let pending = check_lifecycle_scripts(
+            &pkg,
+            "p",
+            "other",
+            Some("https://registry.example.invalid/other/-/other-1.0.0.tgz"),
+            &scripts_ran_dir,
+            &trust,
+            &mut errors,
+        )
+        .expect("consistent identity and trusted");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(pending.pkg_name, "other");
+        assert_eq!(
+            pending.marker_path,
+            script_marker_path(&scripts_ran_dir, "p")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolved_url_names_reads_the_registry_path() {
+        let base = "https://registry.example.invalid";
+        assert!(resolved_url_names(
+            &format!("{base}/foo/-/foo-1.0.0.tgz"),
+            "foo"
+        ));
+        assert!(resolved_url_names(
+            &format!("{base}/@s/foo/-/foo-1.0.0.tgz"),
+            "@s/foo"
+        ));
+        assert!(resolved_url_names(
+            &format!("{base}/@s%2Ffoo/-/foo-1.0.0.tgz"),
+            "@s/foo"
+        ));
+        assert!(!resolved_url_names(
+            &format!("{base}/bar/-/bar-1.0.0.tgz"),
+            "foo"
+        ));
+        assert!(!resolved_url_names(
+            &format!("{base}/xfoo/-/xfoo-1.0.0.tgz"),
+            "foo"
+        ));
+        // No registry marker: nothing to compare.
+        assert!(resolved_url_names(
+            &format!("{base}/tarballs/anything.tgz"),
+            "foo"
+        ));
+    }
+
+    // A script's own double quotes reach the shell as written, on both
+    // platforms (cmd.exe gets the line verbatim, not C-runtime-escaped).
+    #[test]
+    fn run_one_script_passes_double_quotes_through() {
+        let tmp = fresh_dir("script-quotes");
+        run_one_script(
+            "echo \"a b\" > marker.txt",
+            "postinstall",
+            &tmp,
+            &tmp.join("node_modules").join(".bin"),
+        )
+        .unwrap();
+        let got = std::fs::read_to_string(tmp.join("marker.txt")).unwrap();
+        assert!(got.contains("a b"), "{got:?}");
+        assert!(!got.contains('\\'), "{got:?}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

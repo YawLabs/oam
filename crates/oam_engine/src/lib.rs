@@ -5,9 +5,10 @@
 //! Everything above this crate speaks oam types, so the 4-week V8 bump stays
 //! a one-crate affair.
 //!
-//! M0 scope: platform init, isolate + context lifecycle, script execution,
-//! a minimal console binding, and exception -> error formatting. Snapshots,
-//! code cache, ops, and the event loop land in M1.
+//! Scope: platform init, isolate + context lifecycle (each context restored
+//! from the build-time startup snapshot), script and module execution, the
+//! native ops and the event-loop pump that settles them, the bytecode cache,
+//! worker isolates, the inspector, and exception -> diagnostic formatting.
 //!
 //! rusty_v8 v150 uses the pinned-scope API: scopes are created via the
 //! `v8::scope!` / `v8::scope_with_context!` / `v8::tc_scope!` macros, which
@@ -58,14 +59,14 @@ pub use replay::ReplayMode;
 
 static V8_INIT: Once = Once::new();
 
-/// Build-time startup snapshot: js/bootstrap.js pre-parsed, pre-evaluated,
 /// Index of the runtime context inside the startup snapshot. Must match
 /// `RUNTIME_CONTEXT_INDEX` in build.rs.
 pub(crate) const RUNTIME_CONTEXT_INDEX: usize = 0;
 
-/// compiled code retained. Every Context::new materializes a fresh context
-/// from this template; natives are installed after restore (the blob holds
-/// pure JS only — see build.rs).
+/// Build-time startup snapshot: js/bootstrap.js pre-parsed, pre-evaluated,
+/// compiled code retained. Every runtime materializes its context from this
+/// blob (`Context::from_snapshot` at [`RUNTIME_CONTEXT_INDEX`]); natives are
+/// installed after restore (the blob holds pure JS only — see build.rs).
 static OAM_SNAPSHOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oam_snapshot.bin"));
 
 /// Initialize the V8 platform exactly once per process.
@@ -145,6 +146,34 @@ static V8_POOL_SIZE_FLAG: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
 /// once, when V8 is initialized, and a later call has no effect.
 pub fn set_v8_pool_size(value: &str) {
     let _ = V8_POOL_SIZE_FLAG.set(parse_pool_size(value));
+}
+
+/// Where a `--max-old-space-size` cap came from, so the OOM banner can say.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MaxOldSpaceSource {
+    /// The command line.
+    Argv,
+    /// The `NODE_OPTIONS` environment variable.
+    NodeOptions,
+}
+
+/// `--max-old-space-size=N` from argv or NODE_OPTIONS, in megabytes, recorded
+/// by the embedder before the first isolate. Wins over `OAM_MAX_HEAP_MB`.
+///
+/// Held here rather than written into `OAM_MAX_HEAP_MB`: an exported variable
+/// would reach `process.env` and every child process's environment, so a
+/// child oam would take the parent's flag as its own cap and the banner would
+/// credit a variable nobody set. node hands an argv flag on only through
+/// `execArgv` (a `fork()`), and so does oam; a flag from NODE_OPTIONS reaches
+/// a child through NODE_OPTIONS itself, in both.
+static MAX_OLD_SPACE_FLAG: std::sync::OnceLock<(usize, MaxOldSpaceSource)> =
+    std::sync::OnceLock::new();
+
+/// Records `--max-old-space-size`'s cap (megabytes, positive) and where it
+/// was given. Must run before the first `JsRuntime`; only the first call
+/// counts.
+pub fn set_max_old_space_size(mb: usize, source: MaxOldSpaceSource) {
+    let _ = MAX_OLD_SPACE_FLAG.set((mb, source));
 }
 
 /// node parses `--v8-pool-size` as a C integer: leading digits (with an
@@ -272,10 +301,9 @@ pub(crate) struct ProcessArgv(pub Vec<String>);
 /// and trip V8's "Ineffective mark-compacts near heap limit" path, which has
 /// no graceful exit and aborts the process (see crash.rs::v8_oom_handler).
 /// Capping at startup converts that into the deterministic `near_heap_limit_oom`
-/// exit instead. 4 GiB matches the upper bound of the user-visible
-/// `OAM_MAX_HEAP_MB` knob: raising it past 4 GiB gives back roughly nothing
-/// on a 64-bit host (V8 compresses pointers below that threshold) and is
-/// almost always the user misreading "MB" as "GiB".
+/// exit instead. `OAM_MAX_HEAP_MB` itself has no upper bound -- any positive
+/// number is taken as given (see `resolve_heap_cap`) -- so a larger heap is
+/// one variable away for a program that needs it.
 const DEFAULT_HEAP_MB: usize = 4096;
 
 /// Provenance of the active heap cap, surfaced in the OOM banner. The cap is
@@ -284,10 +312,14 @@ const DEFAULT_HEAP_MB: usize = 4096;
 /// re-reading at OOM time would lie if the user `export`ed the var between
 /// startup and the OOM, because the cap itself was already baked into V8's
 /// resource constraints.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum HeapCapSource {
     /// User set `OAM_MAX_HEAP_MB` to a positive number.
     User,
+    /// `--max-old-space-size` on the command line.
+    Argv,
+    /// `--max-old-space-size` in `NODE_OPTIONS`.
+    NodeOptions,
     /// Built-in 4 GiB default (env var unset, empty, or holding something
     /// that is not a positive number -- "0" included -- which is warned about
     /// and ignored).
@@ -333,6 +365,16 @@ struct HeapCap {
 /// runtime cannot boot" end. It is a heuristic, not a measurement, and it is
 /// stated here rather than buried as a literal so the next person can argue
 /// with it on the right grounds.
+///
+/// The share is PER ISOLATE, and so not a bound on the process: the cap is
+/// resolved for every isolate (`JsRuntime::new_inner`: the main thread, each
+/// Worker, each `oam.fork()` isolate, each pre-warmed one) and each gets the
+/// whole of it. The headroom argument above holds for a program with one busy
+/// isolate. One whose workers fill their heaps too can hold N x 75% of the
+/// limit and be killed by the kernel with no banner; it has to set
+/// `OAM_MAX_HEAP_MB` to a per-isolate figure that fits (the user-facing note
+/// is docs/node-divergences.md section 5a). Sharing one budget across
+/// isolates is not implemented.
 const CGROUP_HEAP_FRACTION: u64 = 75;
 
 /// Floor for a cgroup-derived cap, in MiB. Below this the runtime cannot
@@ -482,8 +524,28 @@ fn parse_heap_cap_request(raw: Option<&str>) -> HeapCapRequest {
 /// with no `OAM-RT-OOM` banner. `0` used to select exactly that: the reader
 /// who set it meaning "unlimited" got about a third of the default heap and
 /// lost the one message that says which knob to turn.
+///
+/// A `--max-old-space-size` the embedder recorded (`set_max_old_space_size`)
+/// comes first, as node's flag does; the variable is then not read at all.
 fn resolve_heap_cap() -> HeapCap {
-    let raw = std::env::var("OAM_MAX_HEAP_MB").ok();
+    resolve_heap_cap_from(
+        MAX_OLD_SPACE_FLAG.get().copied(),
+        std::env::var("OAM_MAX_HEAP_MB").ok(),
+    )
+}
+
+/// [`resolve_heap_cap`] on given inputs: the recorded flag and the raw
+/// `OAM_MAX_HEAP_MB`.
+fn resolve_heap_cap_from(flag: Option<(usize, MaxOldSpaceSource)>, raw: Option<String>) -> HeapCap {
+    if let Some((mb, from)) = flag {
+        return HeapCap {
+            mb,
+            source: match from {
+                MaxOldSpaceSource::Argv => HeapCapSource::Argv,
+                MaxOldSpaceSource::NodeOptions => HeapCapSource::NodeOptions,
+            },
+        };
+    }
     let fallback = || {
         // Nothing usable asked for. Prefer what the CONTAINER says over the
         // built-in default: a 512Mi pod running a heap that believes it
@@ -538,6 +600,23 @@ fn warn_invalid_heap_cap(raw: &str, used_mb: usize) {
     );
 }
 
+/// The OOM banner's words for where the cap came from.
+fn heap_cap_source_label(source: HeapCapSource) -> &'static str {
+    match source {
+        HeapCapSource::User => "set by OAM_MAX_HEAP_MB",
+        HeapCapSource::Argv => "set by --max-old-space-size",
+        HeapCapSource::NodeOptions => "set by NODE_OPTIONS --max-old-space-size",
+        HeapCapSource::Default => "default 4 GiB",
+        // Names the mechanism AND the override, because this is the one source
+        // the operator did not choose: someone meeting this banner for the
+        // first time is looking at a pod that just died and needs to know both
+        // where the number came from and how to move it.
+        HeapCapSource::Cgroup => {
+            "derived from the container memory limit; set OAM_MAX_HEAP_MB to override"
+        }
+    }
+}
+
 /// V8 `NearHeapLimitCallback`: fires when the heap approaches the
 /// `OAM_MAX_HEAP_MB` cap. Prints a clean, ODIF-shaped fatal error and exits
 /// deterministically instead of letting V8 raise `FatalProcessOutOfMemory`
@@ -571,17 +650,7 @@ unsafe extern "C" fn near_heap_limit_oom(
     // if the user mutated it after startup. The callback only fires on the
     // same thread that registered it (V8 invariant), so the thread-local is
     // the right scope.
-    let source = HEAP_CAP_SOURCE.with(|s| match s.get() {
-        HeapCapSource::User => "set by OAM_MAX_HEAP_MB",
-        HeapCapSource::Default => "default 4 GiB",
-        // Names the mechanism AND the override, because this is the one source
-        // the operator did not choose: someone meeting this banner for the
-        // first time is looking at a pod that just died and needs to know both
-        // where the number came from and how to move it.
-        HeapCapSource::Cgroup => {
-            "derived from the container memory limit; set OAM_MAX_HEAP_MB to override"
-        }
-    });
+    let source = heap_cap_source_label(HEAP_CAP_SOURCE.with(|s| s.get()));
     let banner = format!(
         "error[OAM-RT-OOM]: JavaScript heap out of memory -- reached the {mb} MB cap ({source})\n"
     );
@@ -643,6 +712,9 @@ impl JsRuntime {
         // `oam serve` workers, and fork-prewarm threads -- inherits the cap;
         // a runaway MCP sidecar can't grow the heap unbounded. The default
         // (4 GiB) is set by `resolve_heap_cap`, which always yields a cap.
+        // Each isolate gets the WHOLE cap: it bounds one heap, not the sum
+        // of them (see `CGROUP_HEAP_FRACTION` for what that means under a
+        // container limit).
         let heap_cap = resolve_heap_cap();
         // Publish the cap's provenance to the OOM callback before registering
         // it. V8 invokes the callback on the same thread that owns the
@@ -669,6 +741,21 @@ impl JsRuntime {
         // drain process.nextTick -- so already-queued promise jobs would run
         // ahead of ticks. The engine owns every checkpoint via
         // modules::run_ticks_and_microtasks (Node's tick-point loop).
+        //
+        // SOUNDNESS, not only ordering: napi.rs depends on this policy.
+        // napi_create_function, napi_wrap, napi_add_finalizer and the
+        // ref_entry_mut callers hold a `&mut NapiEnv` across V8 API calls
+        // (Function::New, Object::GetPrivate, handle creation) on the
+        // grounds that those run no JavaScript. In v8 150.0.0 none of
+        // them arms V8's call-completed hook, but that is a V8 internal;
+        // this policy is the half of the argument the runtime owns. Under
+        // the auto policy a hook-arming call (CallDepthScope<true> ->
+        // FireCallCompletedCallback) runs a microtask checkpoint when it
+        // leaves API call depth zero, and a promise reaction could
+        // re-enter the addon under that borrow. The same goes for installing a call-completed callback or
+        // a custom microtask queue that performs checkpoints. Do not change
+        // any of these without reworking those borrows; napi::load_addon
+        // debug-asserts the policy.
         isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
         // Preempt V8's FatalProcessOutOfMemory with a clean, deterministic
         // exit + ODIF banner (see near_heap_limit_oom). Unconditional: there
@@ -696,7 +783,10 @@ impl JsRuntime {
         isolate.set_slot(ops::PendingOps::default());
         isolate.set_slot(crypto_ops::CryptoState::default());
         #[cfg(feature = "napi")]
-        isolate.set_slot(napi::AddonRegistry::new());
+        // A top-level runtime never unloads its addon libraries, as node's
+        // main thread never does; a worker's or a fork's gives them back
+        // when it ends (napi::AddonRegistry).
+        isolate.set_slot(napi::AddonRegistry::new(!with_fork_pool));
         isolate.set_slot(replay::ReplayState::default());
         // Fork pool: up to 2 pre-warmed isolates for oam.fork() cold-start
         // speedup. The pool lives in an isolate slot so the zero-capture
@@ -801,8 +891,13 @@ impl JsRuntime {
     /// Activate record or replay mode. Call before executing the entry (after
     /// `new()` but before `execute_module` / `execute_cjs`). In off mode this
     /// is a no-op: the default `ReplayState` slot is already `Off`.
-    pub fn set_replay_mode(&mut self, mode: replay::ReplayMode) {
-        self.isolate.set_slot(replay::ReplayState::from_mode(mode));
+    ///
+    /// `Err` when a replay trace cannot be read or parsed; the runtime is
+    /// then left in off mode and the caller must not run the program, which
+    /// would otherwise run live.
+    pub fn set_replay_mode(&mut self, mode: replay::ReplayMode) -> std::result::Result<(), String> {
+        self.isolate.set_slot(replay::ReplayState::from_mode(mode)?);
+        Ok(())
     }
 
     /// Suppress 'beforeExit' emission for this runtime. The `oam test` path
@@ -875,6 +970,9 @@ impl JsRuntime {
     /// Read `process.exitCode` after a completed run -- Node honors it at
     /// natural exit, and CI consuming exit codes depends on that.
     pub fn process_exit_code(&mut self) -> Option<i32> {
+        // Reading `exitCode` can run program code (an accessor, a `valueOf`),
+        // and no host is borrowed here for it to load modules through.
+        self.clear_active_host();
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         let context = scope.get_current_context();
         let global = context.global(scope);
@@ -929,6 +1027,10 @@ impl JsRuntime {
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
         crate::modules::emit_exit_event(tc, after != AfterScript::Nothing);
+        // A process.send() an 'exit' listener made on a channel not yet
+        // connected: nothing runs after this to connect it, so it is sent
+        // now (process.exit() gets there through its exit hook).
+        oam_core::fork_ipc::send_unsent();
     }
 
     /// A worker's 'exit' emit, as before the main thread's took node's
@@ -960,9 +1062,6 @@ impl JsRuntime {
         }
     }
 
-    /// Compile and run `source` as a classic script. Returns the stringified
-    /// completion value. Exceptions come back as `Err` with script:line info.
-    /// A tick point follows, as after any JS the host runs.
     /// Apply `--trace-uncaught` once the flags snippet that defines it
     /// (`__oamTraceUncaught`) has run on this isolate: V8 captures the
     /// stack of every uncaught throw from then on, and the fatal report
@@ -1000,6 +1099,9 @@ impl JsRuntime {
         Err(crate::modules::startup_report(tc, "<startup>"))
     }
 
+    /// Compile and run `source` as a classic script. Returns the stringified
+    /// completion value. Exceptions come back as `Err` with script:line info.
+    /// A tick point follows, as after any JS the host runs.
     pub fn execute_script(&mut self, name: &str, source: &str) -> Result<String> {
         self.execute_script_draining(name, source, AfterScript::TicksAndMicrotasks)
     }
@@ -1181,6 +1283,19 @@ impl Drop for JsRuntime {
             let context = scope.get_current_context();
             inspector.teardown(context);
         }
+        // Addon envs release their weak handles, and run the finalizers they
+        // still owe, while the isolate is alive: by the time the registry
+        // slot drops, rusty_v8 has marked the isolate disposed and a weak
+        // handle can no longer be released (napi::teardown). The finalizers
+        // get a scope with the context entered, as a native entry would give
+        // them; a runtime that never loaded an addon skips all of it.
+        #[cfg(feature = "napi")]
+        {
+            if napi::has_envs(&self.isolate) {
+                v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
+                napi::teardown(scope);
+            }
+        }
         // Destroy the V8 tasks still queued while the isolate is alive and
         // this is its thread; posts from here on are refused.
         self.platform_tasks.close();
@@ -1271,7 +1386,7 @@ fn install_runtime_globals(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<
 mod tests {
     use super::*;
     #[cfg(feature = "napi")]
-    use napi::{NAPI_ENV_DROP_COUNT, NAPI_REF_PUSH_COUNT};
+    use napi::{NAPI_ENV_DROP_COUNT, NAPI_ENV_KEPT_COUNT, NAPI_REF_PUSH_COUNT};
     use std::sync::Mutex;
 
     // Env-var tests share a process-wide environment. Serialize them so
@@ -1392,8 +1507,31 @@ mod tests {
                      declares it will act on, got {mb} MB",
                 );
             }
-            HeapCapSource::User => panic!("env var is unset; source cannot be User"),
+            other => panic!("nothing was set; source cannot be {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_max_old_space_size_flag_wins_and_is_credited_to_where_it_was_given() {
+        // The flag is taken over any variable, a bad one included (it is not
+        // read), and the banner names the flag's own source.
+        for (from, label) in [
+            (MaxOldSpaceSource::Argv, "set by --max-old-space-size"),
+            (
+                MaxOldSpaceSource::NodeOptions,
+                "set by NODE_OPTIONS --max-old-space-size",
+            ),
+        ] {
+            for raw in [None, Some("64"), Some("abc")] {
+                let cap = resolve_heap_cap_from(Some((96, from)), raw.map(String::from));
+                assert_eq!(cap.mb, 96, "{from:?} over OAM_MAX_HEAP_MB={raw:?}");
+                assert_eq!(heap_cap_source_label(cap.source), label, "{raw:?}");
+            }
+        }
+        // No flag: the variable, credited to itself.
+        let cap = resolve_heap_cap_from(None, Some("64".into()));
+        assert_eq!(cap.mb, 64);
+        assert_eq!(heap_cap_source_label(cap.source), "set by OAM_MAX_HEAP_MB");
     }
 
     #[test]
@@ -1649,10 +1787,29 @@ mod tests {
             "liboam_napi_test_addon.so"
         };
         let crate_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let built = crate_root.join("../../target/debug").join(addon_file);
+        // Beside this test binary's profile dir, wherever cargo put it: a
+        // literal `target/debug` is wrong under CARGO_TARGET_DIR, `--target`
+        // and `--release`, where it either finds nothing or finds an addon some
+        // other build left behind. A unit-test binary has no CARGO_BIN_EXE_*
+        // (that is what the e2e twin uses), but cargo always places it at
+        // `<target dir>/[<triple>/]<profile>/deps/<name>-<hash>`, and a cdylib
+        // at `<target dir>/[<triple>/]<profile>/`, so the addon is two levels
+        // up from the running executable. The literal path is only the
+        // fallback for a test binary run from somewhere else.
+        let built = std::env::current_exe()
+            .ok()
+            .and_then(|exe| {
+                let deps = exe.parent()?;
+                if deps.file_name()? != "deps" {
+                    return None;
+                }
+                Some(deps.parent()?.join(addon_file))
+            })
+            .unwrap_or_else(|| crate_root.join("../../target/debug").join(addon_file));
         assert!(
             built.is_file(),
-            "test addon not built at {} -- run `cargo build -p oam_napi_test_addon` first",
+            "test addon not built at {} -- run `cargo build -p oam_napi_test_addon` with the \
+             same profile, target and target dir as this test run first",
             built.display()
         );
         let Ok(built_at) = std::fs::metadata(&built).and_then(|m| m.modified()) else {
@@ -1755,41 +1912,173 @@ mod tests {
         });
     }
 
-    /// Verify that NapiEnv (and its owned FnData) is dropped exactly once per
-    /// JsRuntime drop when the runtime loaded an N-API addon.
+    /// A private copy of the built test addon, so that the image one test
+    /// maps is not the image another test keeps mapped: whether an unload
+    /// really unmaps the library is exactly what these tests are about, and
+    /// the tests of one binary share a process.
     ///
-    /// Without the fix (Box::leak), drop_count would stay at 0 because nothing
-    /// ever drops the leaked allocation.  With the AddonRegistry fix, each
-    /// runtime drop decrements its slot, and the slot drops all envs.
+    /// The copy sits beside the built addon under a fixed name, so a later
+    /// run replaces it instead of leaving one more behind (the top-level
+    /// test's copy stays loaded until the process ends and cannot be
+    /// removed by the test itself).
     ///
-    /// NOTE: the test addon DLL must already be built (`cargo build
-    /// -p oam_napi_test_addon`) before running this test.  A `--workspace` run
-    /// builds every member first, so that satisfies it automatically; a scoped
-    /// `cargo test -p oam_engine` does NOT, which is what `built_test_addon`
-    /// below reports on.
+    /// NOTE: the test addon must already be built (`cargo build
+    /// -p oam_napi_test_addon`). A `--workspace` run builds every member
+    /// first; a scoped `cargo test -p oam_engine` does NOT, which is what
+    /// `built_test_addon` reports on.
+    #[cfg(feature = "napi")]
+    fn private_test_addon(name: &str) -> std::path::PathBuf {
+        let built = built_test_addon();
+        let copy = built.with_file_name(format!("oam-napi-lifecycle-{name}.node"));
+        std::fs::copy(&built, &copy).expect("copy the built test addon");
+        copy
+    }
+
+    /// (envs freed, envs kept as tombstones) by registries dropped on this
+    /// thread since the counters were last reset.
+    #[cfg(feature = "napi")]
+    fn env_counts() -> (usize, usize) {
+        (
+            NAPI_ENV_DROP_COUNT.with(|c| c.get()),
+            NAPI_ENV_KEPT_COUNT.with(|c| c.get()),
+        )
+    }
+
+    #[cfg(feature = "napi")]
+    fn reset_env_counts() {
+        NAPI_ENV_DROP_COUNT.with(|c| c.set(0));
+        NAPI_ENV_KEPT_COUNT.with(|c| c.set(0));
+    }
+
+    #[cfg(feature = "napi")]
+    fn worker_runtime() -> JsRuntime {
+        JsRuntime::new_worker_runtime_with(std::sync::Arc::new(
+            permissions::Permissions::from_opts(None),
+        ))
+    }
+
+    /// A worker's runtime gives its addon library back when it drops, and
+    /// frees the addon's env only once that library is no longer mapped.
+    ///
+    /// Every env is accounted for on every platform: freed, or kept as a
+    /// tombstone. Which of the two depends on whether the platform unmaps
+    /// the image -- Windows and Linux with glibc do (measured: all freed);
+    /// a platform that keeps the library mapped (musl; macOS, for a library
+    /// with thread-local variables) keeps the tombstones instead, and that
+    /// is the correct outcome there.
     #[cfg(feature = "napi")]
     #[test]
-    fn napienv_lifecycle_drops_with_runtime() {
-        let addon_path = built_test_addon();
-
-        // Reset the drop counter on this thread (tests may run on the same
-        // thread as other napi tests).
-        NAPI_ENV_DROP_COUNT.with(|c| c.set(0));
+    fn a_worker_runtime_frees_an_addon_env_once_its_library_is_unmapped() {
+        let addon_path = private_test_addon("worker");
+        reset_env_counts();
 
         const ITERATIONS: usize = 100;
         for _ in 0..ITERATIONS {
-            let mut rt = JsRuntime::new();
+            let mut rt = worker_runtime();
             let loaded = rt.load_test_addon(&addon_path);
             assert!(loaded, "test addon must load without exception");
-            // rt drops here -- AddonRegistry slot drops, which drops
-            // the Box<NapiEnv>, which increments NAPI_ENV_DROP_COUNT.
+            // rt drops here: teardown, then the registry unloads the library
+            // and frees the env if the image is gone.
         }
 
-        let drops = NAPI_ENV_DROP_COUNT.with(|c| c.get());
+        let (freed, kept) = env_counts();
         assert_eq!(
-            drops, ITERATIONS,
-            "expected {ITERATIONS} NapiEnv drops (one per runtime), got {drops}; \
-             the AddonRegistry fix is not working correctly"
+            freed + kept,
+            ITERATIONS,
+            "every env is either freed or kept: freed {freed}, kept {kept}"
+        );
+        if cfg!(any(windows, all(target_os = "linux", target_env = "gnu"))) {
+            assert_eq!(
+                freed, ITERATIONS,
+                "closing the last handle unmaps the addon here, so every env is freed"
+            );
+        }
+    }
+
+    /// A top-level runtime never unloads an addon library and never frees
+    /// the env it handed that library, however many runtimes come and go:
+    /// the library's code can run until the process ends, and may present
+    /// the env again.
+    ///
+    /// The worker that loads the same file afterwards shows the other half
+    /// on every platform: its unload cannot unmap an image something else
+    /// still holds, so its env is kept as well.
+    #[cfg(feature = "napi")]
+    #[test]
+    fn a_top_level_runtime_keeps_its_addon_library_and_env() {
+        let addon_path = private_test_addon("top-level");
+        reset_env_counts();
+
+        {
+            let mut rt = JsRuntime::new();
+            assert!(rt.load_test_addon(&addon_path), "test addon must load");
+        }
+        assert_eq!(
+            env_counts(),
+            (0, 1),
+            "a top-level runtime's env is kept, not freed"
+        );
+
+        {
+            let mut rt = worker_runtime();
+            assert!(rt.load_test_addon(&addon_path), "test addon must load");
+        }
+        assert_eq!(
+            env_counts(),
+            (0, 2),
+            "the library is still mapped (the top-level runtime never unloaded it), so the worker's env is kept too"
+        );
+    }
+
+    /// The statuses of `napi_add_env_cleanup_hook` /
+    /// `napi_remove_env_cleanup_hook`. That registered hooks RUN, in reverse
+    /// order and before the addon's finalizers and its unload, is the e2e
+    /// suite's `napi_teardown_*` tests: only a real addon has a library to
+    /// unload.
+    #[cfg(feature = "napi")]
+    #[test]
+    fn cleanup_hook_registration_statuses() {
+        extern "C" fn noop(_arg: *mut std::ffi::c_void) {}
+        let hook: unsafe extern "C" fn(*mut std::ffi::c_void) = noop;
+        let first = std::ptr::without_provenance_mut::<std::ffi::c_void>(1);
+        let second = std::ptr::without_provenance_mut::<std::ffi::c_void>(2);
+
+        let mut rt = JsRuntime::new();
+        let statuses = rt.with_napi_env(|env, _value| {
+            // SAFETY: `env` is the live env `with_napi_env` hands the closure;
+            // `hook` is a real function that ignores its argument, and it is
+            // never called -- this env is not in a registry, so no teardown
+            // runs its hooks.
+            unsafe {
+                [
+                    napi::napi_add_env_cleanup_hook(env, Some(hook), first),
+                    napi::napi_add_env_cleanup_hook(env, Some(hook), second),
+                    // The same pair again: refused.
+                    napi::napi_add_env_cleanup_hook(env, Some(hook), first),
+                    napi::napi_add_env_cleanup_hook(env, None, first),
+                    napi::napi_remove_env_cleanup_hook(env, Some(hook), first),
+                    // Removed, so the pair can be registered again.
+                    napi::napi_add_env_cleanup_hook(env, Some(hook), first),
+                    // A pair that is not registered is left alone.
+                    napi::napi_remove_env_cleanup_hook(env, Some(hook), std::ptr::null_mut()),
+                    napi::napi_remove_env_cleanup_hook(env, None, first),
+                    napi::napi_add_env_cleanup_hook(std::ptr::null_mut(), Some(hook), first),
+                ]
+            }
+        });
+        assert_eq!(
+            statuses,
+            [
+                napi::NAPI_OK,
+                napi::NAPI_OK,
+                napi::NAPI_INVALID_ARG,
+                napi::NAPI_INVALID_ARG,
+                napi::NAPI_OK,
+                napi::NAPI_OK,
+                napi::NAPI_OK,
+                napi::NAPI_INVALID_ARG,
+                napi::NAPI_INVALID_ARG,
+            ]
         );
     }
 
@@ -1885,8 +2174,10 @@ mod tests {
 
     // zlibHandleWriteSync's out_len is an int32 (a negative value sign-extends
     // to ~usize::MAX) feeding `vec![0u8; out_len]` -- pre-fix that aborted the
-    // process before the handle was used. The allocation is now clamped to the
-    // output buffer's capacity, so the call proceeds normally.
+    // process before the handle was used. A span (offset + length) that does
+    // not lie inside the output view is now refused with a RangeError before
+    // any input is consumed -- node's binding refuses the same span (a fatal
+    // IsWithinBounds CHECK in node_zlib.cc), so it is not clamped.
 
     #[test]
     fn zlib_write_sync_rejects_negative_out_len() {
@@ -1901,15 +2192,38 @@ mod tests {
                 const out = new Uint8Array(64);
                 // outLen arg (-1) casts int32 -> usize::MAX; pre-fix the output
                 // vec allocation aborted the process before the handle was used.
+                let refused;
+                try {
+                    __oam.node.zlibHandleWriteSync(
+                        h, 4, new Uint8Array([1, 2, 3, 4, 5]), out, 0, -1,
+                    );
+                    refused = "no-throw";
+                } catch (e) {
+                    refused = e instanceof RangeError ? "RangeError" : ("other:" + e);
+                }
+                // A span one byte past the view is refused the same way.
+                let past;
+                try {
+                    __oam.node.zlibHandleWriteSync(
+                        h, 4, new Uint8Array([1, 2, 3, 4, 5]), out, 1, 64,
+                    );
+                    past = "no-throw";
+                } catch (e) {
+                    past = e instanceof RangeError ? "RangeError" : ("other:" + e);
+                }
+                // The refusals consumed nothing: the same handle still runs a
+                // valid write and returns [availOut, availIn].
                 const r = __oam.node.zlibHandleWriteSync(
-                    h, 4, new Uint8Array([1, 2, 3, 4, 5]), out, 0, -1,
+                    h, 4, new Uint8Array([1, 2, 3, 4, 5]), out, 0, 64,
                 );
-                Array.isArray(r) ? ("ok:" + r.length) : ("bad:" + typeof r)
+                refused + ":" + past + ":" +
+                    (Array.isArray(r) ? ("ok:" + r.length) : ("bad:" + typeof r))
                 "#,
             )
             .unwrap();
-        // ok:2 -> the call returned [availOut, availIn] instead of aborting.
-        assert_eq!(result, "ok:2", "got: {result}");
+        // Both out-of-bounds spans throw a RangeError instead of aborting (or
+        // being silently clamped); ok:2 -> the handle is still usable.
+        assert_eq!(result, "RangeError:RangeError:ok:2", "got: {result}");
     }
 
     // ---- read denied
@@ -1918,7 +2232,7 @@ mod tests {
     // going through require('fs'), which needs a module system.
 
     #[test]
-    fn permission_read_denied_throws_err_permission_denied() {
+    fn permission_read_denied_throws_err_access_denied() {
         let opts = permissions::PermissionsOptions {
             read: permissions::BoolOrList::Bool(false),
             ..Default::default()
@@ -1978,7 +2292,7 @@ mod tests {
     // ---- write denied
 
     #[test]
-    fn permission_write_denied_throws_err_permission_denied() {
+    fn permission_write_denied_throws_err_access_denied() {
         let opts = permissions::PermissionsOptions {
             write: permissions::BoolOrList::Bool(false),
             ..Default::default()
@@ -2041,7 +2355,7 @@ mod tests {
     // execute_script returning Err, OR as the exception value in a try/catch.
 
     #[test]
-    fn permission_net_denied_fetch_throws_err_permission_denied() {
+    fn permission_net_denied_fetch_throws_err_access_denied() {
         let opts = permissions::PermissionsOptions {
             net: permissions::BoolOrList::Bool(false),
             ..Default::default()
@@ -2068,31 +2382,34 @@ mod tests {
     // ---- net allowed
 
     #[test]
-    fn permission_net_allowed_for_listed_host_does_not_throw() {
+    fn permission_net_listed_host_passes_the_synchronous_gate() {
+        // The op really is spawned once the gate passes, so the target is a
+        // listener this test owns on loopback: nothing leaves the machine and
+        // no name is resolved. It is never accepted from; the fetch is not
+        // awaited.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback binds");
+        let port = listener.local_addr().expect("bound address").port();
         let opts = permissions::PermissionsOptions {
-            net: permissions::BoolOrList::List(vec!["example.com".to_string()]),
+            net: permissions::BoolOrList::List(vec!["127.0.0.1".to_string()]),
             ..Default::default()
         };
         let mut rt = JsRuntime::new_with_permissions(Some(opts));
         // fetch spawns an async op via CoreRuntime; init it since
         // execute_script doesn't call reset_run_slots.
         rt.ensure_core_runtime();
-        // The op IS spawned (it returns a pending promise); the permission gate
-        // passes, so no exception is thrown synchronously.  We do NOT await
-        // (no real HTTP connection in unit tests); just verify no throw.
-        let result = rt
-            .execute_script(
-                "perm_net_allow.js",
-                r#"
-                try {
-                    const p = __oam.fetch(JSON.stringify({url: 'http://example.com/'}));
+        // What is checked: the permission gate passes, so the call returns
+        // its pending promise instead of throwing synchronously.
+        let script = format!(
+            r#"
+                try {{
+                    const p = __oam.fetch(JSON.stringify({{url: 'http://127.0.0.1:{port}/'}}));
                     typeof p        // "object" (Promise)
-                } catch (e) {
+                }} catch (e) {{
                     'err:' + e.code
-                }
-                "#,
-            )
-            .unwrap();
+                }}
+                "#
+        );
+        let result = rt.execute_script("perm_net_allow.js", &script).unwrap();
         // Drop inflight ops: the future spawned in the test will be cancelled
         // when the runtime drops (shutdown_background).
         assert_eq!(result, "object", "got: {result}");
@@ -2144,6 +2461,8 @@ mod tests {
             read: permissions::BoolOrList::Bool(false),
             net: permissions::BoolOrList::Bool(false),
             write: permissions::BoolOrList::Bool(true),
+            // A list, so a scoped query and the unscoped one can disagree.
+            env: permissions::BoolOrList::List(vec!["OAM_QUERY_LISTED".to_string()]),
             ..Default::default()
         };
         let mut rt = JsRuntime::new_with_permissions(Some(opts));
@@ -2156,6 +2475,14 @@ mod tests {
             if (readStatus.state  !== 'denied')  throw new Error('read should be denied: '  + readStatus.state);
             if (writeStatus.state !== 'granted') throw new Error('write should be granted: ' + writeStatus.state);
             if (netStatus.state   !== 'denied')  throw new Error('net should be denied: '   + netStatus.state);
+            // Deno's per-permission scope key is a scoped query, answered by
+            // the allow-list rather than by the unscoped state.
+            const listed   = await permissions.query({ name: 'env', variable: 'OAM_QUERY_LISTED' });
+            const unlisted = await permissions.query({ name: 'env', variable: 'OAM_QUERY_UNLISTED' });
+            const viaPath  = await permissions.query({ name: 'env', path: 'OAM_QUERY_UNLISTED' });
+            if (listed.state   !== 'granted') throw new Error('listed variable should be granted: '  + listed.state);
+            if (unlisted.state !== 'denied')  throw new Error('unlisted variable should be denied: ' + unlisted.state);
+            if (viaPath.state  !== 'denied')  throw new Error('path-keyed scope should be denied: '  + viaPath.state);
             globalThis.__perm_ok = true;
         "#
         .to_string();

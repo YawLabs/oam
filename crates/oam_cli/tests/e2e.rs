@@ -13,12 +13,101 @@ fn write_temp(name: &str, content: &str) -> PathBuf {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        sweep_stale_run_dirs(&std::env::temp_dir());
         std::env::temp_dir().join(format!("oam-e2e-{}-{nanos}", std::process::id()))
     });
     let path = dir.join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, content).unwrap();
     path
+}
+
+/// How old an `oam-e2e-*` directory must be before a later suite run removes
+/// it. A day is far beyond any run (the gate's ceiling is 900s) and beyond the
+/// daemons a run leaves behind (`OAM_DAEMON_IDLE_MS` = 45s), so a concurrent
+/// run in another checkout never loses a directory it is still using.
+const STALE_RUN_DIR_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Remove the `oam-e2e-*` directories earlier suite runs left in `temp`.
+///
+/// The run dir cannot be removed by the run that made it: tests share it for
+/// the life of the process (there is no suite teardown hook) and a daemon a
+/// test started can hold it open after the process exits. So each run sweeps
+/// what its predecessors left instead -- the per-run tree holds one copy of
+/// the addon cdylib per napi test plus a cache dir, which otherwise
+/// accumulates without bound. Best effort throughout: an entry that cannot be
+/// read or removed is left for the next run.
+fn sweep_stale_run_dirs(temp: &std::path::Path) {
+    sweep_run_dirs_stale_at(temp, std::time::SystemTime::now());
+}
+
+/// [`sweep_stale_run_dirs`] with the clock as a parameter, so its test can
+/// age a directory on every platform without rewriting a directory's mtime.
+fn sweep_run_dirs_stale_at(temp: &std::path::Path, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(temp) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("oam-e2e-") {
+            continue;
+        }
+        let path = entry.path();
+        // symlink_metadata: a link named like a run dir is never followed.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|at| now.duration_since(at).ok())
+            .is_some_and(|age| age >= STALE_RUN_DIR_AGE);
+        if stale {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+// The sweep removes a run dir a day old, and nothing else: not a fresh one
+// (another checkout's suite may be using it), not a file, not another prefix.
+#[test]
+fn stale_run_dir_sweep_removes_only_old_oam_e2e_directories() {
+    let temp = write_temp("sweep-fixture/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let run_a = temp.join("oam-e2e-1-1");
+    let run_b = temp.join("oam-e2e-2-2");
+    let other = temp.join("not-oam-e2e-3-3");
+    for dir in [&run_a, &run_b, &other] {
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested/file"), "x").unwrap();
+    }
+    let file = temp.join("oam-e2e-a-file");
+    std::fs::write(&file, "x").unwrap();
+    let now = std::time::SystemTime::now();
+
+    // Read against the present, everything was made a moment ago: a run dir
+    // this fresh may belong to a suite that is still using it.
+    sweep_run_dirs_stale_at(&temp, now);
+    assert!(run_a.is_dir(), "a fresh run dir must be left alone");
+    assert!(run_b.is_dir(), "a fresh run dir must be left alone");
+    assert!(other.is_dir(), "another prefix must be left alone");
+    assert!(file.is_file(), "a file must be left alone");
+
+    // Read two stale ages later, the same entries are all old. The clock is
+    // moved rather than the mtimes: a directory's mtime cannot be rewritten
+    // through `File` on every platform.
+    sweep_run_dirs_stale_at(&temp, now + STALE_RUN_DIR_AGE * 2);
+    assert!(!run_a.exists(), "an old run dir must be removed");
+    assert!(!run_b.exists(), "an old run dir must be removed");
+    assert!(
+        other.is_dir(),
+        "another prefix must be left alone, old or not"
+    );
+    assert!(file.is_file(), "a file must be left alone, old or not");
 }
 
 /// How long any single `oam` the suite launches may take before the test that
@@ -34,6 +123,11 @@ fn write_temp(name: &str, content: &str) -> PathBuf {
 /// The ceiling is deliberately far above any honest invocation (the slowest
 /// legitimately waits on a cold tsgo, `OAM_CHECK_WAIT_MS` = 60s) and far below
 /// the gate's, so it always attributes before the gate gives up.
+///
+/// The bound is [`bounded_output`]'s (and [`bounded_output_with_stdin`]'s), so
+/// it covers a launch only when the launch goes through one of them: a raw
+/// `Command::output()` / `wait_with_output()` is still unbounded. New tests
+/// build on [`oam_command`] and one of those two.
 const OAM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Read a child pipe into a buffer the caller can look at at any time --
@@ -52,6 +146,10 @@ fn drain_pipe(mut pipe: impl std::io::Read + Send + 'static) -> PipeSink {
         let mut chunk = [0u8; 8192];
         loop {
             match pipe.read(&mut chunk) {
+                // An interrupted read is not EOF: ending here would drop the
+                // read end, hand the child EPIPE and the test a truncated
+                // stream. `Read::read` does not retry it for us.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Ok(0) | Err(_) => break,
                 Ok(n) => bytes
                     .lock()
@@ -81,15 +179,52 @@ impl PipeSink {
 /// `Command::output()` with [`OAM_DEADLINE`]: the same `Output` on a normal
 /// run, a panic naming the command and its partial output on one that hangs.
 fn bounded_output(cmd: &mut std::process::Command) -> Output {
+    bounded_output_fed(cmd, None)
+}
+
+/// [`bounded_output`] for a child that reads a script from stdin (the REPL):
+/// `input` is written to its stdin, which is then closed.
+fn bounded_output_with_stdin(cmd: &mut std::process::Command, input: &[u8]) -> Output {
+    bounded_output_fed(cmd, Some(input.to_vec()))
+}
+
+/// [`bounded_output`] for a child whose stdin the test has already chosen on
+/// `cmd` (a file, say): stdin is left exactly as configured.
+fn bounded_output_keeping_stdin(cmd: &mut std::process::Command) -> Output {
+    bounded_output_spawned(cmd, None)
+}
+
+fn bounded_output_fed(cmd: &mut std::process::Command, input: Option<Vec<u8>>) -> Output {
+    cmd.stdin(if input.is_some() {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::null()
+    });
+    bounded_output_spawned(cmd, input)
+}
+
+/// The shared body: spawn `cmd` with its stdin as configured, feed `input` to
+/// it when there is some (stdin must then be piped), and wait under
+/// [`OAM_DEADLINE`].
+fn bounded_output_spawned(cmd: &mut std::process::Command, input: Option<Vec<u8>>) -> Output {
     let described = format!("{cmd:?}");
     let mut child = cmd
-        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("oam binary runs");
     let stdout = drain_pipe(child.stdout.take().expect("piped stdout"));
     let stderr = drain_pipe(child.stderr.take().expect("piped stderr"));
+    if let Some(input) = input {
+        // Fed from its own thread: a child that stops reading stdin must not
+        // block the deadline loop below on a full pipe. Dropping the handle
+        // when the write ends is the EOF the child is waiting for.
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&input);
+        });
+    }
     let started = std::time::Instant::now();
     let status = loop {
         match child.try_wait().expect("child status readable") {
@@ -132,35 +267,57 @@ fn oam(args: &[&str]) -> Output {
 /// test that needs stdout to be something other than a pipe this process
 /// reads to the end (a record-preserving pipe, a file, a reader it drops).
 fn oam_command(args: &[&str]) -> std::process::Command {
-    // Isolated cache world: any daemon/build-info these invocations create
-    // lives under the run dir and self-reaps quickly.
-    let cache = write_temp("oam-cache/.keep", "")
-        .parent()
-        .unwrap()
-        .to_path_buf();
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
-    cmd.args(args)
+    cmd.args(args).suite_env();
+    cmd
+}
+
+/// What a test's own `Command` chain needs to behave like [`oam`]: the suite's
+/// environment and the [`OAM_DEADLINE`] bound. For a launch [`oam_command`]
+/// cannot build -- a binary `oam compile` produced, or an `oam` whose test
+/// sets more on the command first. A later `.env(..)` on the chain still wins,
+/// so a test that owns its cache dir sets it after `suite_env()`.
+trait SuiteCommand {
+    /// The environment every `oam` the suite launches gets.
+    fn suite_env(&mut self) -> &mut Self;
+    /// `output()` under [`OAM_DEADLINE`]; see [`bounded_output`].
+    fn output_within_deadline(&mut self) -> Output;
+}
+
+impl SuiteCommand for std::process::Command {
+    fn output_within_deadline(&mut self) -> Output {
+        bounded_output(self)
+    }
+
+    fn suite_env(&mut self) -> &mut Self {
+        // Isolated cache world: any daemon/build-info these invocations create
+        // lives under the run dir and self-reaps quickly.
+        let cache = write_temp("oam-cache/.keep", "")
+            .parent()
+            .unwrap()
+            .to_path_buf();
         // The e2e suite exercises oam's N-API alpha (napi_* tests load real
         // .node addons), which is OFF by default in production -- opt in here.
-        .env("OAM_ENABLE_NATIVE_ADDONS", "1")
-        .env("OAM_CACHE_DIR", cache)
-        .without_ambient_compile_cache()
-        .env("OAM_DAEMON_IDLE_MS", "45000")
-        // Warn-mode `oam run` waits this long for the checker after the
-        // program exits (default 10s). Under the full-parallel suite a cold
-        // tsgo regularly missed 10s, which used to force skips (8d7b515)
-        // that hid real assertions; 60s keeps them live on loaded boxes.
-        .env("OAM_CHECK_WAIT_MS", "60000")
-        // Colour policy is the test's to set, never the terminal's: oam
-        // honours these exactly as Node does (FORCE_COLOR wins over a piped
-        // stdout), so a terminal that exports FORCE_COLOR=3 -- this dev box's
-        // does -- turned structured_clone_and_util_style_text's "piped
-        // output carries no escapes" assertion red for no reason of oam's.
-        // A test that wants one sets it in its own script or Command.
-        .env_remove("FORCE_COLOR")
-        .env_remove("NO_COLOR")
-        .env_remove("NODE_DISABLE_COLORS");
-    cmd
+        self.env("OAM_ENABLE_NATIVE_ADDONS", "1")
+            .env("OAM_CACHE_DIR", cache)
+            .without_ambient_compile_cache()
+            .env("OAM_DAEMON_IDLE_MS", "45000")
+            // Warn-mode `oam run` waits this long for the checker after the
+            // program exits (default 10s). Under the full-parallel suite a cold
+            // tsgo regularly missed 10s, which used to force skips (8d7b515)
+            // that hid real assertions; 60s keeps them live on loaded boxes.
+            .env("OAM_CHECK_WAIT_MS", "60000")
+            // Colour policy is the test's to set, never the terminal's: oam
+            // honours these exactly as Node does (FORCE_COLOR wins over a piped
+            // stdout), so a terminal that exports FORCE_COLOR=3 -- this dev
+            // box's does -- turned structured_clone_and_util_style_text's
+            // "piped output carries no escapes" assertion red for no reason of
+            // oam's. A test that wants one sets it in its own script or
+            // Command.
+            .env_remove("FORCE_COLOR")
+            .env_remove("NO_COLOR")
+            .env_remove("NODE_DISABLE_COLORS")
+    }
 }
 
 // bug: `oam -e` writes its source to a REAL file in the CWD (node's eval
@@ -177,12 +334,11 @@ fn eval_artifact_is_removed_even_when_the_script_calls_process_exit() {
         .to_path_buf();
     // CWD is the whole point: the artifact lands where the process was started.
     let run = |args: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-            .args(args)
-            .current_dir(&dir)
-            .env("OAM_CACHE_DIR", &dir)
-            .output()
-            .expect("oam binary runs")
+        bounded_output(
+            oam_command(args)
+                .current_dir(&dir)
+                .env("OAM_CACHE_DIR", &dir),
+        )
     };
     let leftovers = || -> Vec<String> {
         std::fs::read_dir(&dir)
@@ -212,6 +368,10 @@ fn eval_artifact_is_removed_even_when_the_script_calls_process_exit() {
     assert_eq!(out.status.code(), Some(3));
     assert!(leftovers().is_empty(), "esm eval left {:?}", leftovers());
 }
+
+/// How long [`spawn_echo_server`]'s `/hold` route keeps its response open
+/// when the client does not close first.
+const ECHO_HOLD: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Minimal local HTTP/1.1 echo server so fetch tests never touch the
 /// network (CI determinism). Echoes {method, path, echo: body} as JSON.
@@ -270,6 +430,24 @@ fn spawn_echo_server() -> std::net::SocketAddr {
                         let _ = stream.flush();
                     }
                     return;
+                }
+                if path == "/hold" {
+                    // A stream that does not end on its own: one token, then
+                    // the response stays open until the CLIENT closes (or
+                    // ECHO_HOLD passes). A client that stops reading without
+                    // cancelling the body is left waiting on it.
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: tok1\n\n",
+                    );
+                    let _ = stream.flush();
+                    let _ = stream.set_read_timeout(Some(ECHO_HOLD));
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(n) if n > 0 => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            _ => return,
+                        }
+                    }
                 }
                 let x_probe = head
                     .lines()
@@ -358,11 +536,10 @@ fn transpile_cache_persists_across_runs_and_rejects_corruption() {
     .expect("write app");
     let cache = dir.join("cache");
     let run = || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-            .args(["run", dir.join("app.ts").to_str().unwrap(), "--no-check"])
-            .env("OAM_CACHE_DIR", &cache)
-            .output()
-            .expect("oam binary runs")
+        bounded_output(
+            oam_command(&["run", dir.join("app.ts").to_str().unwrap(), "--no-check"])
+                .env("OAM_CACHE_DIR", &cache),
+        )
     };
 
     let cold = run();
@@ -379,7 +556,12 @@ fn transpile_cache_persists_across_runs_and_rejects_corruption() {
                 let path = entry.path();
                 if path.is_dir() {
                     artifacts(&path, out);
-                } else {
+                } else if path.extension().is_some_and(|ext| ext == "js") {
+                    // Entries only (`<aa>/<hash>.js`). The directory also
+                    // holds the cache's housekeeping files -- the empty
+                    // `.sweep` stamp its background sweep writes, and a
+                    // store's `.tmp-*` sibling -- which are not artifacts
+                    // and carry no header to tamper behind.
                     out.push(path);
                 }
             }
@@ -400,21 +582,43 @@ fn transpile_cache_persists_across_runs_and_rejects_corruption() {
     );
     assert_eq!(String::from_utf8_lossy(&warm.stdout).trim(), "sum 42");
 
-    // Corrupt every artifact in place: a stale self-hash must be a miss.
-    for artifact in &cached {
-        std::fs::write(
-            artifact,
-            "// oam-transpile v1 deadbeef\nthrow new Error('corrupt artifact executed');\n",
+    // Corrupt every artifact in place, behind a header the reader ACCEPTS
+    // (`// oam-transpile v2 <sha256-of-body> <js-byte-len>`): an entry whose
+    // body no longer matches its recorded digest must be a miss. A header of
+    // another version is rejected on its prefix alone and would leave the
+    // digest comparison unexercised. The tampered body is the original with
+    // a throw in front, so the recorded js length still lands inside it and
+    // only the digest stands between the entry and execution.
+    const TAMPER: &str = "throw new Error('corrupt artifact executed');\n";
+    let tamper = |forge: &dyn Fn(&str, &str) -> String| {
+        for artifact in &cached {
+            let text = std::fs::read_to_string(artifact).expect("artifact is text");
+            let (header, body) = text.split_once('\n').expect("artifact has a header line");
+            assert!(
+                header.starts_with("// oam-transpile v2 "),
+                "the artifact header this test tampers behind changed: {header}"
+            );
+            std::fs::write(artifact, forge(header, body)).expect("corrupt");
+        }
+        let after = run();
+        assert!(
+            after.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&after.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&after.stdout).trim(), "sum 42");
+    };
+    // The artifact's own header, a different body.
+    tamper(&|header: &str, body: &str| format!("{header}\n{TAMPER}{body}"));
+    // (That run re-stored good entries over the bad ones.) A well-formed
+    // header whose digest is simply not the body's.
+    tamper(&|header: &str, body: &str| {
+        let js_len = header.rsplit(' ').next().unwrap_or_default();
+        format!(
+            "// oam-transpile v2 {} {js_len}\n{TAMPER}{body}",
+            "0".repeat(64)
         )
-        .expect("corrupt");
-    }
-    let after = run();
-    assert!(
-        after.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&after.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&after.stdout).trim(), "sum 42");
+    });
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -446,11 +650,10 @@ fn transpiled_ts_uncaught_stack_cites_source_line_cold_and_warm() {
     std::fs::write(dir.join("boom.ts"), STACK_FIDELITY_TS).expect("write boom.ts");
     let cache = dir.join("cache");
     let run = || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-            .args(["run", dir.join("boom.ts").to_str().unwrap(), "--no-check"])
-            .env("OAM_CACHE_DIR", &cache)
-            .output()
-            .expect("oam binary runs")
+        bounded_output(
+            oam_command(&["run", dir.join("boom.ts").to_str().unwrap(), "--no-check"])
+                .env("OAM_CACHE_DIR", &cache),
+        )
     };
     for phase in ["cold", "warm (served from the transpile cache)"] {
         let out = run();
@@ -476,9 +679,23 @@ fn transpiled_ts_uncaught_stack_cites_source_line_cold_and_warm() {
         // The warm phase only proves cache fidelity if an artifact was
         // actually stored; a silent store failure would make it a second
         // cold run.
+        let mut stored = 0usize;
+        let mut dirs = vec![cache.join("transpile")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "js") {
+                    // An entry, not the cache's `.sweep` stamp or a
+                    // store's `.tmp-*` sibling.
+                    stored += 1;
+                }
+            }
+        }
         assert!(
-            cache.join("transpile").is_dir(),
-            "{phase}: transpile cache dir must exist after a run"
+            stored >= 1,
+            "{phase}: the transpile cache must hold an artifact after a run"
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -975,6 +1192,30 @@ fn cjs_require_cache_is_a_singleton_and_cycles_see_partials() {
     // a=1, b=2 proves one shared module instance; the cycle peer observed
     // partial exports (started set, done not yet) exactly like Node.
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1 2 true true");
+}
+
+/// A JSON module's `require.cache` entry is a finished module, as node's is:
+/// `loaded` true once it parsed, with the `path` and `paths` every module
+/// object carries (it used to stay `loaded: false` with neither).
+#[test]
+fn cjs_json_module_cache_entry_is_loaded() {
+    write_temp("json_cache_entry/data.json", "{\"n\": 1}\n");
+    let script = write_temp(
+        "json_cache_entry/main.cjs",
+        "const data = require('./data.json');\n\
+         const m = require.cache[require.resolve('./data.json')];\n\
+         console.log(data.n, m.loaded, m.path === __dirname, Array.isArray(m.paths), m.exports === data);\n",
+    );
+    let out = oam(&["run", script.to_str().unwrap(), "--no-check"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "1 true true true true"
+    );
 }
 
 #[test]
@@ -1497,17 +1738,16 @@ fn legacy_streams_env_var_is_silently_ignored() {
          const alias = process.getBuiltinModule('_stream_readable');\n\
          console.log('alias', alias === R);",
     );
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(["run", script.to_str().unwrap(), "--no-check"])
-        .env("OAM_LEGACY_STREAMS", "1")
-        .env(
-            "OAM_CACHE_DIR",
-            write_temp("legacy-switch-gone-cache/.keep", "")
-                .parent()
-                .unwrap(),
-        )
-        .output()
-        .expect("oam binary runs");
+    let out = bounded_output(
+        oam_command(&["run", script.to_str().unwrap(), "--no-check"])
+            .env("OAM_LEGACY_STREAMS", "1")
+            .env(
+                "OAM_CACHE_DIR",
+                write_temp("legacy-switch-gone-cache/.keep", "")
+                    .parent()
+                    .unwrap(),
+            ),
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr: {stderr}");
@@ -2033,18 +2273,10 @@ fn builtin_named_packages_and_tsconfig_never_shadow_builtins() {
 
 #[test]
 fn repl_evaluates_typed_lines_with_live_event_loop() {
-    use std::io::Write;
     let cache = write_temp("replcache/.keep", "")
         .parent()
         .unwrap()
         .to_path_buf();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .env("OAM_CACHE_DIR", cache)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("repl spawns");
     let script = "1+2\n\
                   const x: number = 40\n\
                   x + 2\n\
@@ -2058,13 +2290,10 @@ fn repl_evaluates_typed_lines_with_live_event_loop() {
                   await new Promise<string>((r) => setTimeout(() => r('timer-live'), 80))\n\
                   nope.boom\n\
                   .exit\n";
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("repl exits");
+    let out = bounded_output_with_stdin(
+        oam_command(&[]).env("OAM_CACHE_DIR", cache),
+        script.as_bytes(),
+    );
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     let cleaned: Vec<String> = stdout
@@ -2101,7 +2330,9 @@ fn repl_evaluates_typed_lines_with_live_event_loop() {
             // line, so the pinned entries are indent-free.
             "Timeout {",
             "_kind: 'Timeout',",
-            "_repeat: false,",
+            // null for a one-shot timeout, as node v22.22.2 has it (the
+            // period for an interval); it was `false` before.
+            "_repeat: null,",
             "_delay: 40,",
             "_args: [],",
             "_origCallback: [Function (anonymous)],",
@@ -2129,18 +2360,10 @@ fn repl_top_level_await_declarations_persist() {
     // processTopLevelAwait behavior). And a line merely CONTAINING the
     // substring 'await' (`let awaiting = 1`) must NOT be wrapped -- the old
     // substring heuristic wrapped it and lost the binding.
-    use std::io::Write;
     let cache = write_temp("replcache-tla/.keep", "")
         .parent()
         .unwrap()
         .to_path_buf();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .env("OAM_CACHE_DIR", cache)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("repl spawns");
     let script = "let awaiting = 1\n\
                   awaiting\n\
                   const x = await Promise.resolve(41)\n\
@@ -2148,13 +2371,10 @@ fn repl_top_level_await_declarations_persist() {
                   const { a, b } = await Promise.resolve({ a: 2, b: 40 })\n\
                   a + b\n\
                   .exit\n";
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("repl exits");
+    let out = bounded_output_with_stdin(
+        oam_command(&[]).env("OAM_CACHE_DIR", cache),
+        script.as_bytes(),
+    );
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     let cleaned: Vec<String> = stdout
@@ -2243,32 +2463,34 @@ fn napi_addon_loads_and_calls_native_functions() {
 
 #[cfg(feature = "napi")]
 #[test]
-fn napi_create_int64_boundary_routes_to_number_or_bigint() {
-    // Node-parity: napi_create_int64 must return a JS Number for values
-    // in the range [-(2^53-1), 2^53-1] and a BigInt at/beyond ±2^53.
+fn napi_create_int64_is_a_number_at_every_magnitude() {
+    // napi_create_int64 always returns a JS Number, as in Node: past
+    // +/-(2^53-1) the value is rounded to the nearest double rather than
+    // promoted. BigInt is a different entry point (napi_create_bigint_int64).
     //
     // makeInt64(hi, lo) reconstructs an i64 from two i32s:
     //   value = (hi as i64) << 32 | (lo as u32 as i64)
     //
-    // Boundary values:
-    //   2^53     hi= 2097152 lo= 0  -> BigInt  (just above MAX_SAFE)
-    //   2^53-1   hi= 2097151 lo=-1  -> Number  (= MAX_SAFE_INTEGER)
-    //   -(2^53)  hi=-2097152 lo= 0  -> BigInt  (just below -MAX_SAFE)
-    //   -(2^53-1)hi=-2097152 lo= 1  -> Number  (= -MAX_SAFE_INTEGER)
+    //   2^53      hi= 2097152    lo= 0  -> 9007199254740992 (exact)
+    //   2^53-1    hi= 2097151    lo=-1  -> MAX_SAFE_INTEGER
+    //   -(2^53)   hi=-2097152    lo= 0  -> -9007199254740992 (exact)
+    //   -(2^53-1) hi=-2097152    lo= 1  -> -MAX_SAFE_INTEGER
+    //   2^63-1    hi= 2147483647 lo=-1  -> rounds to 2^63
     napi_addon_dir("napi_int64");
 
     write_temp(
         "napi_int64/main.cjs",
         "const native = require('./native.node');\n\
-         // 2^53 = BigInt boundary (exclusive on the Number side)\n\
          const pos_boundary  = native.makeInt64( 2097152,  0); // 2^53\n\
          const pos_safe      = native.makeInt64( 2097151, -1); // 2^53-1\n\
          const neg_boundary  = native.makeInt64(-2097152,  0); // -(2^53)\n\
          const neg_safe      = native.makeInt64(-2097152,  1); // -(2^53-1)\n\
-         console.log(typeof pos_boundary);  // bigint\n\
-         console.log(typeof pos_safe);      // number\n\
-         console.log(typeof neg_boundary);  // bigint\n\
-         console.log(typeof neg_safe);      // number",
+         const max           = native.makeInt64( 2147483647, -1); // 2^63-1\n\
+         console.log(typeof pos_boundary, pos_boundary === 2 ** 53);\n\
+         console.log(typeof pos_safe, pos_safe === Number.MAX_SAFE_INTEGER);\n\
+         console.log(typeof neg_boundary, neg_boundary === -(2 ** 53));\n\
+         console.log(typeof neg_safe, neg_safe === -Number.MAX_SAFE_INTEGER);\n\
+         console.log(typeof max, max === 2 ** 63);",
     );
     let main = write_temp("napi_int64/.anchor", "")
         .parent()
@@ -2282,18 +2504,118 @@ fn napi_create_int64_boundary_routes_to_number_or_bigint() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
-    assert_eq!(lines[0], "bigint", "2^53 must be BigInt (above MAX_SAFE)");
-    assert_eq!(
-        lines[1], "number",
-        "2^53-1 must be Number (= MAX_SAFE_INTEGER)"
+    assert_eq!(lines.len(), 5, "stdout: {stdout}");
+    assert_eq!(lines[0], "number true", "2^53 is a Number");
+    assert_eq!(lines[1], "number true", "2^53-1 is MAX_SAFE_INTEGER");
+    assert_eq!(lines[2], "number true", "-(2^53) is a Number");
+    assert_eq!(lines[3], "number true", "-(2^53-1) is -MAX_SAFE_INTEGER");
+    assert_eq!(lines[4], "number true", "2^63-1 rounds to the Number 2^63");
+}
+
+#[cfg(feature = "napi")]
+#[test]
+fn napi_function_and_class_names_honour_the_given_length() {
+    // napi_create_function and napi_define_class take a name plus a byte
+    // length; only NAPI_AUTO_LENGTH means "read to the NUL". The addon's
+    // buffers carry text past each length (see `sized_names`), and node v22
+    // prints the same lines for the same addon.
+    let dir = napi_addon_dir("napi_sized_names");
+    write_temp(
+        "napi_sized_names/main.cjs",
+        "const n = require('./native.node').sizedNames();\n\
+         console.log(JSON.stringify([n.fn.name, n.embedded.name, n.invalid.name, \
+           n.empty.name, n.auto.name, n.cls.name]));\n\
+         console.log(n.fnOverlong, n.clsOverlong, n.nullNameOverlong);",
     );
-    assert_eq!(
-        lines[2], "bigint",
-        "-(2^53) must be BigInt (below -MAX_SAFE)"
+    let out = oam(&["run", dir.join("main.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "stdout: {stdout}");
     assert_eq!(
-        lines[3], "number",
-        "-(2^53-1) must be Number (= -MAX_SAFE_INTEGER)"
+        lines[0],
+        // JSON.stringify escapes the NUL; U+FFFD it prints as is.
+        "[\"sizedFn\",\"ab\\u0000cd\",\"x\u{FFFD}y\",\"\",\"autoName\",\"SizedClass\"]"
+    );
+    // napi_invalid_arg for a length past i32::MAX, from both entry points;
+    // napi_ok when the name is null, since the length is then never read.
+    assert_eq!(lines[1], "1 1 0");
+}
+
+#[cfg(feature = "napi")]
+#[test]
+fn napi_string_constructors_and_define_class_check_their_text_like_node() {
+    // The addon's `stringRules` (see its doc comment) calls each string
+    // constructor and napi_define_class at the edges of their text
+    // arguments; the expected line is what node v22 prints for the same
+    // addon. A null text is accepted with length 0 (making ""), refused with
+    // any other length; a length past i32::MAX is refused before the text is
+    // read; napi_define_class refuses a null name whatever the length, and
+    // both definers refuse a property count with no descriptor array
+    // (napi_define_properties before it looks at its target, so even on a
+    // number or undefined, with no exception left pending);
+    // napi_define_class and napi_create_function refuse a null callback.
+    let dir = napi_addon_dir("napi_string_rules");
+    write_temp(
+        "napi_string_rules/main.cjs",
+        "console.log(JSON.stringify(require('./native.node').stringRules()));",
+    );
+    let out = oam(&["run", dir.join("main.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let per_encoding = "{\"nullZero\":0,\"nullZeroValue\":\"\",\"nullTwo\":1,\"nullAuto\":1,\
+                        \"overlong\":1,\"nullOut\":1,\"two\":0,\"twoValue\":\"ab\"}";
+    assert_eq!(
+        stdout.trim(),
+        format!(
+            "{{\"utf8\":{per_encoding},\"latin1\":{per_encoding},\"utf16\":{per_encoding},\
+             \"cls\":{{\"nullAuto\":1,\"nullZero\":1,\"nullProps\":1,\
+             \"definePropertiesNullProps\":1,\"nullCtor\":1,\"createFunctionNullCb\":1,\
+             \"numberNullProps\":1,\"undefinedNullProps\":1}}}}"
+        )
+    );
+}
+
+#[cfg(feature = "napi")]
+#[test]
+fn napi_descriptor_function_names_match_node() {
+    // Functions made from property descriptors (the addon's
+    // `descriptorNames`): node names a napi_define_class prototype method
+    // after its string key, and leaves every other one unnamed -- methods
+    // from napi_define_properties, static methods, symbol-keyed methods, and
+    // all getters and setters. The expected lines are node v22's output for
+    // the same addon.
+    let dir = napi_addon_dir("napi_descriptor_names");
+    write_temp(
+        "napi_descriptor_names/main.cjs",
+        "const d = require('./native.node').descriptorNames();\n\
+         const gd = Object.getOwnPropertyDescriptor;\n\
+         const names = (o) => [o.method.name, o.valueNamed.name, o[d.symMethod].name, \
+           gd(o, 'acc').get.name, gd(o, 'acc').set.name, gd(o, d.symAcc).get.name];\n\
+         console.log(JSON.stringify(names(d.obj)));\n\
+         console.log(JSON.stringify([d.cls.name, d.cls.sm.name, ...names(d.cls.prototype)]));",
+    );
+    let out = oam(&["run", dir.join("main.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "stdout: {stdout}");
+    assert_eq!(lines[0], "[\"\",\"\",\"\",\"\",\"\",\"\"]");
+    assert_eq!(
+        lines[1],
+        "[\"Named\",\"\",\"method\",\"valueNamed\",\"\",\"\",\"\",\"\"]"
     );
 }
 
@@ -2318,10 +2640,18 @@ fn built_test_addon() -> std::path::PathBuf {
         "liboam_napi_test_addon.so"
     };
     let crate_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let built = crate_root.join("../../target/debug").join(artifact);
+    // Beside the `oam` under test, wherever cargo put it: a literal
+    // `target/debug` is wrong under CARGO_TARGET_DIR, `--target` and
+    // `--release`, where it either finds nothing or finds an addon some other
+    // build left behind.
+    let built = std::path::Path::new(env!("CARGO_BIN_EXE_oam"))
+        .parent()
+        .expect("the oam binary has a parent directory")
+        .join(artifact);
     if !built.is_file() {
         panic!(
-            "test addon not built at {} -- run `cargo build -p oam_napi_test_addon` first",
+            "test addon not built at {} -- run `cargo build -p oam_napi_test_addon` with the \
+             same profile, target and target dir as this test run first",
             built.display()
         );
     }
@@ -2363,7 +2693,7 @@ fn built_test_addon() -> std::path::PathBuf {
         && source_at > built_at
     {
         panic!(
-            "test addon at {} is STALE -- {} is newer.\n`cargo test -p oam_cli` does not rebuild a sibling cdylib crate; run `cargo build -p oam_napi_test_addon` (or `cargo test --workspace`) first.",
+            "test addon at {} is STALE -- {} is newer.\n`cargo test -p oam_cli` does not rebuild a sibling cdylib crate; run `cargo build -p oam_napi_test_addon` (or `cargo test --workspace`) with the same profile, target and target dir first.",
             built.display(),
             path.display()
         );
@@ -2456,13 +2786,12 @@ fn oam_without_addon_optin(args: &[&str]) -> Output {
         .parent()
         .unwrap()
         .to_path_buf();
-    std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(args)
-        .env_remove("OAM_ENABLE_NATIVE_ADDONS")
-        .env("OAM_CACHE_DIR", cache)
-        .env("OAM_DAEMON_IDLE_MS", "45000")
-        .output()
-        .expect("oam binary runs")
+    // `oam_command` sets the opt-in; the removal after it is what wins.
+    bounded_output(
+        oam_command(args)
+            .env_remove("OAM_ENABLE_NATIVE_ADDONS")
+            .env("OAM_CACHE_DIR", cache),
+    )
 }
 
 #[cfg(feature = "napi")]
@@ -2551,6 +2880,232 @@ fn addon_sandbox_verdict_is_reported_ahead_of_the_env_opt_in() {
         !out.contains("OAM-NATIVE0001"),
         "the env-var opt-in must not answer ahead of the sandbox -- its message tells the caller to set a variable that would not help: {out}"
     );
+}
+
+/// Run `script` as `<subdir>/main.cjs` beside a copy of the test addon, with
+/// the addon's teardown probe armed, and return the run's output and the
+/// lines of the probe's log.
+///
+/// The probe (oam_napi_test_addon, `teardown_arm`) registers cleanup hooks
+/// 1, 2 and 3 and removes 2, logs `finalize` from the finalizer of each
+/// `wrapCounter()` object, and registers a library destructor that calls
+/// N-API with the env it saved and logs the status it got back,
+/// `unload:status=N`. The script appends its own lines to the same file,
+/// named by `OAM_NAPI_TEARDOWN_LOG`.
+#[cfg(feature = "napi")]
+fn napi_teardown_run(subdir: &str, script: &str) -> (Output, Vec<String>) {
+    let dir = napi_addon_dir(subdir);
+    let log = write_temp(&format!("{subdir}/teardown.log"), "");
+    write_temp(&format!("{subdir}/main.cjs"), script);
+    let main = dir.join("main.cjs");
+    let out = bounded_output(
+        oam_command(&["run", main.to_str().unwrap()]).env("OAM_NAPI_TEARDOWN_LOG", &log),
+    );
+    let lines = std::fs::read_to_string(&log)
+        .expect("read the teardown log")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    (out, lines)
+}
+
+/// The run ended normally: exit code 0, not a crash, not a signal.
+#[cfg(feature = "napi")]
+#[track_caller]
+fn assert_clean_exit(out: &Output, lines: &[String]) {
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "want a clean exit 0. log: {lines:?} stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(feature = "napi")]
+#[test]
+fn napi_teardown_runs_cleanup_hooks_then_finalizers_and_refuses_a_late_addon_call() {
+    // A normal exit drops the runtime: the addon's cleanup hooks run in
+    // reverse order of registration (3, then 1; 2 was removed), then the
+    // finalizer of the wrap that is still alive -- node's order, measured on
+    // v22.22.2 with this addon. The library is NOT unloaded then: its
+    // destructor runs as the process exits, and its N-API call with the env
+    // it saved is answered napi_invalid_arg (1). The env it presents has to
+    // be valid memory that late; node frees it at environment teardown, and
+    // the same addon segfaults node v22.22.2 at this point.
+    let (out, lines) = napi_teardown_run(
+        "napi_teardown_main",
+        "const native = require('./native.node');\n\
+         globalThis.keep = native.wrapCounter();\n\
+         require('node:fs').appendFileSync(process.env.OAM_NAPI_TEARDOWN_LOG, 'js:end\\n');\n",
+    );
+    assert_clean_exit(&out, &lines);
+    assert_eq!(
+        lines,
+        ["js:end", "hook:3", "hook:1", "finalize", "unload:status=1"]
+    );
+}
+
+#[cfg(feature = "napi")]
+#[test]
+fn napi_teardown_is_skipped_by_process_exit_and_the_late_addon_call_is_refused() {
+    // process.exit() drops no runtime: no cleanup hook and no finalizer runs
+    // (node v22.22.2 runs none either), nothing is unloaded and no env is
+    // freed. The library destructor still runs as the process exits, and is
+    // refused rather than let into an isolate that is being abandoned.
+    let (out, lines) = napi_teardown_run(
+        "napi_teardown_exit",
+        "const native = require('./native.node');\n\
+         globalThis.keep = native.wrapCounter();\n\
+         require('node:fs').appendFileSync(process.env.OAM_NAPI_TEARDOWN_LOG, 'js:end\\n');\n\
+         process.exit(0);\n",
+    );
+    assert_clean_exit(&out, &lines);
+    assert_eq!(lines, ["js:end", "unload:status=1"]);
+}
+
+/// A script whose worker loads the addon and wraps a counter, and whose
+/// main thread logs the worker's exit. `MAIN_LOADS` is replaced by whether
+/// the main thread loads the addon too, before it starts the worker.
+#[cfg(feature = "napi")]
+const NAPI_TEARDOWN_WORKER_SCRIPT: &str = "\
+const { Worker, isMainThread } = require('node:worker_threads');
+const fs = require('node:fs');
+const log = process.env.OAM_NAPI_TEARDOWN_LOG;
+if (isMainThread) {
+  if (MAIN_LOADS) require('./native.node');
+  new Worker(__filename).on('exit', (code) => {
+    fs.appendFileSync(log, `main:worker-exit ${code}\\n`);
+  });
+} else {
+  globalThis.keep = require('./native.node').wrapCounter();
+  fs.appendFileSync(log, 'worker:end\\n');
+}
+";
+
+#[cfg(feature = "napi")]
+#[test]
+fn napi_teardown_of_a_worker_unloads_its_addon_after_hooks_and_finalizers() {
+    // The worker is the only thread that loaded the addon. When it ends, its
+    // runtime runs the hooks and the finalizer and then gives the library
+    // back, as node does for a worker's addons; the destructor that unload
+    // runs presents the worker's env, which must still be allocated at that
+    // moment (node v22.22.2 has freed it, and segfaults here).
+    let (out, lines) = napi_teardown_run(
+        "napi_teardown_worker",
+        &NAPI_TEARDOWN_WORKER_SCRIPT.replace("MAIN_LOADS", "false"),
+    );
+    assert_clean_exit(&out, &lines);
+    assert_eq!(
+        lines[..4],
+        ["worker:end", "hook:3", "hook:1", "finalize"],
+        "the worker's hooks then its finalizer: {lines:?}"
+    );
+    // WHEN the destructor runs is the platform's call. Where closing the
+    // last handle unmaps the library (measured: Windows, and Linux with
+    // glibc 2.39) it runs inside the worker's teardown, before the main
+    // thread hears of the exit; a platform that keeps the image mapped (musl
+    // never unloads; macOS keeps a library with thread-local variables)
+    // runs it as the process exits. Either way it runs once, after the
+    // finalizer, and is answered with a status.
+    let mut rest: Vec<&str> = lines[4..].iter().map(String::as_str).collect();
+    if cfg!(any(windows, all(target_os = "linux", target_env = "gnu"))) {
+        assert_eq!(rest, ["unload:status=1", "main:worker-exit 0"]);
+    }
+    rest.sort_unstable();
+    assert_eq!(rest, ["main:worker-exit 0", "unload:status=1"]);
+}
+
+#[cfg(feature = "napi")]
+#[test]
+fn napi_teardown_of_a_worker_keeps_the_env_of_an_addon_the_main_thread_still_holds() {
+    // Main thread and worker load the same file, so they share one image
+    // and its statics: the env the destructor will present is the worker's,
+    // the last one registered. The worker's unload unmaps nothing (the main
+    // thread holds the library), so the destructor does not run then -- and
+    // the worker's env must outlive the worker, because the destructor
+    // presents it when the process exits, after the main thread's own hooks.
+    let (out, lines) = napi_teardown_run(
+        "napi_teardown_shared",
+        &NAPI_TEARDOWN_WORKER_SCRIPT.replace("MAIN_LOADS", "true"),
+    );
+    assert_clean_exit(&out, &lines);
+    assert_eq!(
+        lines,
+        [
+            "worker:end",
+            "hook:3",
+            "hook:1",
+            "finalize",
+            "main:worker-exit 0",
+            "hook:3",
+            "hook:1",
+            "unload:status=1"
+        ]
+    );
+}
+
+#[cfg(feature = "napi")]
+#[test]
+fn napi_teardown_refuses_an_addon_that_a_cleanup_hook_loads() {
+    // A worker's cleanup hook runs JS (OAM_NAPI_TEARDOWN_CALL: hook 3 calls
+    // globalThis.__oamTeardownCall), and that JS requires a second addon.
+    // Teardown had already taken its list of envs, so a second addon loaded
+    // then would never get its own hooks or finalizers run, and the worker
+    // would unload its library with them still owed. The load is refused
+    // instead, and the first addon's teardown goes on in order.
+    let dir = napi_addon_dir("napi_teardown_late_load");
+    std::fs::copy(dir.join("native.node"), dir.join("second.node")).expect("copy the addon");
+    let script = "\
+const { Worker, isMainThread } = require('node:worker_threads');
+const fs = require('node:fs');
+const log = process.env.OAM_NAPI_TEARDOWN_LOG;
+if (isMainThread) {
+  new Worker(__filename).on('exit', (code) => {
+    fs.appendFileSync(log, `main:worker-exit ${code}\\n`);
+  });
+} else {
+  globalThis.keep = require('./native.node').wrapCounter();
+  globalThis.__oamTeardownCall = () => {
+    try {
+      require('./second.node');
+      fs.appendFileSync(log, 'second:loaded\\n');
+    } catch (e) {
+      fs.appendFileSync(log, `second:refused ${/shutting down/.test(e.message)}\\n`);
+    }
+  };
+  fs.appendFileSync(log, 'worker:end\\n');
+}
+";
+    let log = write_temp("napi_teardown_late_load/teardown.log", "");
+    write_temp("napi_teardown_late_load/main.cjs", script);
+    let main = dir.join("main.cjs");
+    let out = bounded_output(
+        oam_command(&["run", main.to_str().unwrap()])
+            .env("OAM_NAPI_TEARDOWN_LOG", &log)
+            .env("OAM_NAPI_TEARDOWN_CALL", "1"),
+    );
+    let lines: Vec<String> = std::fs::read_to_string(&log)
+        .expect("read the teardown log")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_clean_exit(&out, &lines);
+    assert_eq!(
+        lines[..6],
+        [
+            "worker:end",
+            "hook:3",
+            "second:refused true",
+            "call:status=0",
+            "hook:1",
+            "finalize"
+        ],
+        "{lines:?}"
+    );
+    let mut rest: Vec<&str> = lines[6..].iter().map(String::as_str).collect();
+    rest.sort_unstable();
+    assert_eq!(rest, ["main:worker-exit 0", "unload:status=1"], "{lines:?}");
 }
 
 // The two feature-off contracts. `napi_addon_dir` needs a BUILT addon, so
@@ -3692,7 +4247,7 @@ fn oam_serve_streams_sse_incrementally() {
 }
 
 #[test]
-fn http_close_is_graceful_and_body_budget_rejects_floods() {
+fn http_close_is_graceful_and_backpressure_bounds_unread_floods() {
     let stdout = run_ok(
         "http_harden.mjs",
         "import http from 'node:http';\n\
@@ -3741,12 +4296,16 @@ fn http_close_is_graceful_and_body_budget_rejects_floods() {
          const chunk = 'x'.repeat(64 * 1024);\n\
          const PROMISED = 8 * 1024 * 1024;\n\
          const deadline = Date.now() + 3000;\n\
+         // Counted, not assumed: the RSS bound below says nothing unless the\n\
+         // clients really connected and started their uploads.\n\
+         let connected = 0;\n\
          const floods = Array.from({ length: 120 }, () => new Promise((resolve) => {\n\
            const s = net.connect(port2, '127.0.0.1');\n\
            s.on('error', () => resolve());\n\
            s.on('close', () => resolve());\n\
            s.on('data', () => {});\n\
            s.on('connect', () => {\n\
+             connected++;\n\
              s.write(`POST /up HTTP/1.1\\r\\nHost: x\\r\\nContent-Length: ${PROMISED}\\r\\n\\r\\n`);\n\
              let sent = 0;\n\
              const pump = () => {\n\
@@ -3764,14 +4323,15 @@ fn http_close_is_graceful_and_body_budget_rejects_floods() {
          // must keep that off our heap: measure AFTER a gc-eligible tick.\n\
          await new Promise((r) => setTimeout(r, 100));\n\
          const rss = process.memoryUsage().rss;\n\
-         console.log(floods.length === 120, rss < 500 * 1024 * 1024, `rss=${Math.round(rss / 1048576)}MB`);\n\
+         console.log(connected === 120, rss < 500 * 1024 * 1024, `connected=${connected} rss=${Math.round(rss / 1048576)}MB`);\n\
          server2.close();",
     );
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines[0], "slow-done");
     assert!(
         lines[1].starts_with("true true "),
-        "a 960MB unread-upload flood must be bounded by backpressure, not buffered: {stdout}"
+        "all 120 clients must connect, and their 960MB unread-upload flood must be bounded \
+         by backpressure, not buffered: {stdout}"
     );
 }
 
@@ -3815,17 +4375,16 @@ fn http_body_budget_sheds_when_the_ceiling_is_reached() {
          console.log('recovered', after.status === 200, await after.text());\n\
          server.close();",
     );
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(["run", script.to_str().unwrap(), "--no-check"])
-        .env("OAM_MAX_BODY_BYTES", (2 * 1024 * 1024).to_string())
-        .env(
-            "OAM_CACHE_DIR",
-            write_temp("http-budget-ceiling-cache/.keep", "")
-                .parent()
-                .unwrap(),
-        )
-        .output()
-        .expect("oam binary runs");
+    let out = bounded_output(
+        oam_command(&["run", script.to_str().unwrap(), "--no-check"])
+            .env("OAM_MAX_BODY_BYTES", (2 * 1024 * 1024).to_string())
+            .env(
+                "OAM_CACHE_DIR",
+                write_temp("http-budget-ceiling-cache/.keep", "")
+                    .parent()
+                    .unwrap(),
+            ),
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr: {stderr}");
@@ -4049,6 +4608,283 @@ fn small_builtins_wave_smoke() {
     assert_eq!(lines[2], "a=x%20y&b=1&b=2 x y \"\"");
     assert_eq!(lines[3], "waited");
     assert_eq!(lines[4], "\"sunk 9\\n\"");
+}
+
+/// Shapes node v22.22.2 has and oam lacked or had differently (each expected
+/// line is node's own output for the same script): the BROTLI_PARAM_* and
+/// remaining Z_* names in `zlib.constants`, so the usual computed-key
+/// `params` object is accepted; `close()` on a fresh stream's `_handle`;
+/// `querystring` with a null `sep` / `eq` / options and its two option
+/// hooks; `http.STATUS_CODES[509]`; the whole method set on
+/// `Console.prototype`, bound per instance with a subclass override
+/// honoured; and `_http_common`'s HTTPParser reading a non-101 response
+/// that announces `Upgrade` as an ordinary message.
+#[test]
+fn zlib_constants_querystring_console_and_parser_shapes_match_node() {
+    let stdout = run_ok(
+        "node_shapes_parity.mjs",
+        r#"
+import zlib from 'node:zlib';
+import qs from 'node:querystring';
+import http from 'node:http';
+import { Console } from 'node:console';
+import { Writable } from 'node:stream';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const { HTTPParser } = require('_http_common');
+
+const c = zlib.constants;
+console.log('brotli_params=' + [c.BROTLI_PARAM_MODE, c.BROTLI_PARAM_QUALITY, c.BROTLI_PARAM_LGWIN, c.BROTLI_PARAM_SIZE_HINT, c.BROTLI_MODE_TEXT, c.BROTLI_DECODER_PARAM_LARGE_WINDOW].join(','));
+console.log('z_names=' + [c.Z_BLOCK, c.Z_FILTERED, c.Z_HUFFMAN_ONLY, c.Z_RLE, c.Z_FIXED, c.Z_BUF_ERROR, c.UNZIP, c.BROTLI_DECODE, c.BROTLI_ENCODE].join(','));
+const input = Buffer.from('brotli params '.repeat(50));
+const packed = await new Promise((resolve, reject) => {
+  const enc = zlib.createBrotliCompress({ params: { [c.BROTLI_PARAM_QUALITY]: 5, [c.BROTLI_PARAM_MODE]: c.BROTLI_MODE_TEXT } });
+  const bufs = [];
+  enc.on('data', (d) => bufs.push(d)).on('end', () => resolve(Buffer.concat(bufs))).on('error', reject);
+  enc.end(input);
+});
+const unpacked = await new Promise((resolve, reject) => zlib.brotliDecompress(packed, (e, b) => (e ? reject(e) : resolve(b))));
+console.log('brotli_params_roundtrip=' + unpacked.equals(input));
+const gz = new zlib.Gzip();
+gz._handle.close();
+console.log('fresh_handle_close=ok');
+
+console.log('qs_null=' + JSON.stringify(qs.parse('a=1&b=2&c=3', null, null, { maxKeys: 2 })));
+console.log('qs_null_opts=' + JSON.stringify(qs.parse('a=1&b=2', null, null, null)));
+console.log('qs_decode=' + JSON.stringify(qs.parse('a=%31', null, null, { decodeURIComponent: (s) => s + '!' })));
+console.log('qs_stringify_null=' + qs.stringify({ a: 1, b: [2, 3] }, null, null, { encodeURIComponent: (s) => '<' + s + '>' }));
+console.log('qs_custom=' + JSON.stringify(qs.parse('a:1;b:2', ';', ':')) + ' ' + qs.stringify({ a: 1, b: 2 }, ';', ':'));
+
+console.log('sc_509=' + http.STATUS_CODES[509]);
+
+let captured = '';
+const sink = new Writable({ write(chunk, _e, cb) { captured += chunk; cb(); } });
+const con = new Console(sink, sink);
+con.group('g');
+con.dir({ a: 1 });
+con.count();
+con.count('x');
+con.count();
+con.groupEnd();
+con.assert(1 === 2, 'no %s', 'way');
+con.assert(true, 'unseen');
+con.dirxml('xml', 1);
+con.countReset();
+con.count();
+const { log } = con;
+log('detached %d', 3);
+con.clear();
+class Tagged extends Console {
+  log(...args) { super.log('[tag]', ...args); }
+}
+const tagged = new Tagged(sink);
+tagged.log('sub');
+tagged.info('plain');
+await new Promise((r) => setTimeout(r, 5));
+console.log('console=' + JSON.stringify(captured));
+console.log('console_methods=' + ['log', 'info', 'debug', 'warn', 'error', 'dir', 'dirxml', 'table', 'trace', 'assert', 'clear', 'count', 'countReset', 'group', 'groupCollapsed', 'groupEnd', 'time', 'timeEnd', 'timeLog'].every((k) => typeof con[k] === 'function' && typeof Console.prototype[k] === 'function'));
+let traced = '';
+const tsink = new Writable({ write(chunk, _e, cb) { traced += chunk; cb(); } });
+new Console(tsink).trace('here %d', 1);
+await new Promise((r) => setTimeout(r, 5));
+console.log('trace_head=' + JSON.stringify(traced.split('\n')[0]) + ' has_frames=' + /\n\s+at /.test(traced));
+
+function parse(text) {
+  const out = [];
+  const p = new HTTPParser();
+  p.initialize(HTTPParser.RESPONSE, {});
+  p[HTTPParser.kOnHeadersComplete] = (major, minor, headers, method, url, status, reason, upgrade) => { out.push('head ' + status + ' upgrade=' + upgrade); };
+  p[HTTPParser.kOnBody] = (b) => { out.push('body ' + b.toString('latin1')); };
+  p[HTTPParser.kOnMessageComplete] = () => { out.push('done'); };
+  const r = p.execute(Buffer.from(text, 'latin1'));
+  out.push('ret ' + (r instanceof Error ? r.code : r));
+  return out.join(' | ');
+}
+const announce = 'HTTP/1.1 200 OK\r\nUpgrade: h2,h2c\r\nConnection: Upgrade\r\nContent-Length: 2\r\n\r\nhi';
+console.log('parser_200=' + parse(announce + announce));
+console.log('parser_101=' + parse('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\nxx'));
+"#,
+    );
+    let expected = [
+        "brotli_params=0,1,2,5,1,1",
+        "z_names=5,1,2,3,4,-5,7,8,9",
+        "brotli_params_roundtrip=true",
+        "fresh_handle_close=ok",
+        r#"qs_null={"a":"1","b":"2"}"#,
+        r#"qs_null_opts={"a":"1","b":"2"}"#,
+        r#"qs_decode={"a!":"%31!"}"#,
+        "qs_stringify_null=<a>=<1>&<b>=<2>&<b>=<3>",
+        r#"qs_custom={"a":"1","b":"2"} a:1;b:2"#,
+        "sc_509=Bandwidth Limit Exceeded",
+        r#"console="g\n  { a: 1 }\n  default: 1\n  x: 1\n  default: 2\nAssertion failed: no way\nxml 1\ndefault: 1\ndetached 3\n[tag] sub\nplain\n""#,
+        "console_methods=true",
+        r#"trace_head="Trace: here 1" has_frames=true"#,
+        "parser_200=head 200 upgrade=false | body hi | done | head 200 upgrade=false | body hi | done | ret 156",
+        "parser_101=head 101 upgrade=true | done | ret 77",
+    ];
+    let lines: Vec<&str> = stdout.lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).copied().unwrap_or("MISSING"),
+            *exp,
+            "line {i} mismatch.\nfull stdout: {stdout}"
+        );
+    }
+}
+
+/// A repeated header field is combined by node's rules on both sides (each
+/// expected line is node v22.22.2's output for the same script): a response
+/// read by the default client path keeps `set-cookie` as an array, and a
+/// server request joins `cookie` with `; `, keeps the first of a
+/// single-value field, joins the rest with `, ` -- a field that shares a
+/// name with an Object.prototype member being a field like any other.
+#[test]
+fn http_repeated_header_fields_combine_as_node_does() {
+    let stdout = run_ok(
+        "http_repeated_fields.mjs",
+        r#"
+import http from 'node:http';
+import net from 'node:net';
+
+const server = http.createServer((req, res) => {
+  res.setHeader('Set-Cookie', ['a=1', 'b=2']);
+  res.setHeader('Constructor', 'made');
+  res.end(JSON.stringify({
+    cookie: req.headers.cookie,
+    multi: req.headers['x-multi'],
+    type: req.headers['content-type'],
+    ctor: req.headers.constructor,
+  }));
+});
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const port = server.address().port;
+
+// The default client path: the stock agent, no TLS policy.
+const viaClient = await new Promise((resolve, reject) => {
+  http.get(`http://127.0.0.1:${port}/`, (res) => {
+    res.resume();
+    res.on('end', () => resolve(res.headers));
+  }).on('error', reject);
+});
+console.log('set_cookie=' + JSON.stringify(viaClient['set-cookie']));
+console.log('res_constructor=' + JSON.stringify(viaClient.constructor));
+
+// A request with repeated fields, written by hand.
+const reply = await new Promise((resolve, reject) => {
+  const socket = net.connect(port, '127.0.0.1', () => {
+    socket.write(
+      'GET / HTTP/1.1\r\n' +
+      'Host: 127.0.0.1\r\n' +
+      'Cookie: a=1\r\n' +
+      'Cookie: b=2\r\n' +
+      'X-Multi: p\r\n' +
+      'X-Multi: q\r\n' +
+      'Content-Type: text/one\r\n' +
+      'Content-Type: text/two\r\n' +
+      'Constructor: sent\r\n' +
+      'Connection: close\r\n\r\n',
+    );
+  });
+  let text = '';
+  socket.setEncoding('latin1');
+  socket.on('data', (d) => { text += d; });
+  socket.on('end', () => resolve(text));
+  socket.on('error', reject);
+});
+console.log('req_headers=' + reply.slice(reply.indexOf('{'), reply.lastIndexOf('}') + 1));
+server.close();
+server.closeAllConnections();
+"#,
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], r#"set_cookie=["a=1","b=2"]"#, "{stdout}");
+    assert_eq!(lines[1], r#"res_constructor="made""#, "{stdout}");
+    assert_eq!(
+        lines[2],
+        r#"req_headers={"cookie":"a=1; b=2","multi":"p, q","type":"text/one","ctor":"sent"}"#,
+        "{stdout}"
+    );
+}
+
+/// An upgrade request the server declines gets an ordinary response whose
+/// body is framed by its own head -- Content-Length, chunked (framing
+/// removed, trailers reported) or none -- and ends there, on a connection
+/// the server keeps open (each expected line is node v22.22.2's output for
+/// the same script). The body used to run to the end of the connection,
+/// chunk-size lines included.
+#[test]
+fn http_client_declined_upgrade_response_body_is_framed() {
+    let stdout = run_ok(
+        "http_declined_upgrade_framing.mjs",
+        r#"
+import http from 'node:http';
+import net from 'node:net';
+
+// A server that declines every upgrade and keeps the connection open.
+const replies = {
+  '/length': 'HTTP/1.1 426 Upgrade Required\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nnope!',
+  '/chunked': 'HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\nTrailer: X-T\r\n\r\n' +
+    '5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\nX-T: 1\r\n\r\n',
+  '/empty': 'HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n',
+};
+const open = new Set();
+const server = net.createServer((socket) => {
+  open.add(socket);
+  socket.on('close', () => open.delete(socket));
+  socket.on('error', () => {});
+  let head = '';
+  socket.on('data', (d) => {
+    head += d.toString('latin1');
+    if (!head.includes('\r\n\r\n')) return;
+    const path = head.split(' ')[1];
+    head = '';
+    socket.write(replies[path]);
+  });
+});
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const port = server.address().port;
+
+function declined(path) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1', port, path,
+      headers: { Connection: 'Upgrade', Upgrade: 'websocket' },
+    });
+    req.on('upgrade', () => reject(new Error('upgraded')));
+    req.on('error', reject);
+    req.on('response', (res) => {
+      let body = '';
+      res.setEncoding('latin1');
+      res.on('data', (d) => { body += d; });
+      res.on('end', () => resolve(res.statusCode + ' ' + JSON.stringify(body) + ' complete=' + res.complete +
+        ' trailers=' + JSON.stringify(res.trailers)));
+      res.on('error', reject);
+    });
+    req.end();
+  });
+}
+const guard = setTimeout(() => { console.log('timed out waiting for a framed body'); process.exit(1); }, 5000);
+console.log('length=' + await declined('/length'));
+console.log('chunked=' + await declined('/chunked'));
+console.log('empty=' + await declined('/empty'));
+clearTimeout(guard);
+for (const socket of open) socket.destroy();
+server.close();
+"#,
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[0], r#"length=426 "nope!" complete=true trailers={}"#,
+        "{stdout}"
+    );
+    assert_eq!(
+        lines[1], r#"chunked=401 "hello world" complete=true trailers={"x-t":"1"}"#,
+        "{stdout}"
+    );
+    assert_eq!(
+        lines[2], r#"empty=204 "" complete=true trailers={}"#,
+        "{stdout}"
+    );
 }
 
 /// The `dictionary` option, used by oam's deflaters and inflaters as node's
@@ -4380,9 +5216,19 @@ fn crypto_key_derivation_pbkdf2_scrypt_hkdf() {
          console.log(okm instanceof ArrayBuffer, okm.byteLength);\n\
          // HKDF empty salt.\n\
          const okm2 = hkdfSync('sha256', 'ikm', '', '', 16);\n\
-         console.log(okm2.byteLength);",
+         console.log(okm2.byteLength);\n\
+         // scrypt's keylen is free: below 10 and above 64 (bytes are node 22's).\n\
+         const small = scryptSync('password', 'salt', 8, { N: 1024, r: 8, p: 1 });\n\
+         const large = scryptSync('password', 'salt', 128, { N: 1024, r: 8, p: 1 });\n\
+         console.log(small.toString('hex'), large.length, scryptSync('password', 'salt', 0).length);\n\
+         // Every digest getHashes() lists works in the KDFs (bytes are node 22's).\n\
+         console.log(pbkdf2Sync('password', 'salt', 2, 20, 'sha224').toString('hex'));\n\
+         console.log(Buffer.from(hkdfSync('md5', 'key', 'salt', 'info', 16)).toString('hex'));",
     );
     let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[6], "16dbc8906763c7f0 128 0");
+    assert_eq!(lines[7], "93200ffa96c5776d38fa10abdf8f5bfc0054b971");
+    assert_eq!(lines[8], "edd053d0030729baf813c1e0f0e9941d");
     assert_eq!(lines[0], "4b007901b765489abead49d926f721d065a429c1");
     assert_eq!(lines[1], "32");
     assert_eq!(lines[2], "64 true");
@@ -4400,36 +5246,30 @@ fn crypto_ciphers_aes_cbc_ctr_gcm() {
          const key = randomBytes(32);\n\
          const iv = randomBytes(16);\n\
          const enc = createCipheriv('aes-256-cbc', key, iv);\n\
-         enc.update('hello world');\n\
-         const ct = enc.final();\n\
+         const ct = Buffer.concat([enc.update('hello world'), enc.final()]);\n\
          const dec = createDecipheriv('aes-256-cbc', key, iv);\n\
-         dec.update(ct);\n\
-         const pt = dec.final();\n\
+         const pt = Buffer.concat([dec.update(ct), dec.final()]);\n\
          console.log(pt.toString());\n\
          // AES-128-CTR round-trip (symmetric: same op for enc/dec).\n\
          const key128 = randomBytes(16);\n\
          const ivCtr = randomBytes(16);\n\
          const encCtr = createCipheriv('aes-128-ctr', key128, ivCtr);\n\
-         encCtr.update('symmetric stream');\n\
-         const ctCtr = encCtr.final();\n\
+         const ctCtr = Buffer.concat([encCtr.update('symmetric stream'), encCtr.final()]);\n\
          const decCtr = createDecipheriv('aes-128-ctr', key128, ivCtr);\n\
-         decCtr.update(ctCtr);\n\
-         console.log(decCtr.final().toString());\n\
+         console.log(Buffer.concat([decCtr.update(ctCtr), decCtr.final()]).toString());\n\
          // AES-256-GCM round-trip with AAD + auth tag.\n\
          const gcmKey = randomBytes(32);\n\
          const gcmIv = randomBytes(12);\n\
          const aad = Buffer.from('additional data');\n\
          const gcmEnc = createCipheriv('aes-256-gcm', gcmKey, gcmIv);\n\
          gcmEnc.setAAD(aad);\n\
-         gcmEnc.update('authenticated!');\n\
-         const gcmCt = gcmEnc.final();\n\
+         const gcmCt = Buffer.concat([gcmEnc.update('authenticated!'), gcmEnc.final()]);\n\
          const tag = gcmEnc.getAuthTag();\n\
          console.log(tag.length);\n\
          const gcmDec = createDecipheriv('aes-256-gcm', gcmKey, gcmIv);\n\
          gcmDec.setAAD(aad);\n\
          gcmDec.setAuthTag(tag);\n\
-         gcmDec.update(gcmCt);\n\
-         console.log(gcmDec.final().toString());\n\
+         console.log(Buffer.concat([gcmDec.update(gcmCt), gcmDec.final()]).toString());\n\
          // GCM tampered tag fails.\n\
          const badTag = Buffer.from(tag);\n\
          badTag[0] ^= 0xff;\n\
@@ -4448,12 +5288,10 @@ fn crypto_ciphers_aes_cbc_ctr_gcm() {
          const npIv = randomBytes(16);\n\
          const npEnc = createCipheriv('aes-128-cbc', npKey, npIv);\n\
          npEnc.setAutoPadding(false);\n\
-         npEnc.update(Buffer.alloc(16, 0x42));\n\
-         const npCt = npEnc.final();\n\
+         const npCt = Buffer.concat([npEnc.update(Buffer.alloc(16, 0x42)), npEnc.final()]);\n\
          const npDec = createDecipheriv('aes-128-cbc', npKey, npIv);\n\
          npDec.setAutoPadding(false);\n\
-         npDec.update(npCt);\n\
-         console.log(npDec.final()[0] === 0x42);",
+         console.log(Buffer.concat([npDec.update(npCt), npDec.final()])[0] === 0x42);",
     );
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines[0], "hello world");
@@ -4461,8 +5299,173 @@ fn crypto_ciphers_aes_cbc_ctr_gcm() {
     assert_eq!(lines[2], "16");
     assert_eq!(lines[3], "authenticated!");
     assert_eq!(lines[4], "true");
-    assert_eq!(lines[5], "true true 6");
+    assert_eq!(lines[5], "true true 8");
     assert_eq!(lines[6], "true");
+}
+
+/// `Cipher#update` / `Decipher#update` return what node's return at that
+/// point, not an empty Buffer with everything deferred to `final()`: every
+/// byte for the stream modes (CTR, GCM), whole blocks for CBC and ECB, with
+/// a padded decrypt keeping the last whole block back until `final()`.
+///
+/// The script is deterministic (fixed key, IV and plaintext) and prints, per
+/// mode and chunking, the length each call returned and the concatenated
+/// bytes; the expected text is node v22.22.2's output for the same script,
+/// byte for byte. Chunk sizes 5 / 16 / 17 / 31 straddle block boundaries;
+/// the block-aligned plan is the one that shows the held-back block.
+/// `chacha20-poly1305` is not in the set: oam does not ship it.
+#[test]
+fn crypto_cipher_update_streams_like_node() {
+    let stdout = run_ok(
+        "crypto_cipher_streaming.mjs",
+        r#"import { createCipheriv, createDecipheriv } from 'node:crypto';
+const key32 = Buffer.from(Array.from({ length: 32 }, (_, i) => (i * 11 + 1) & 0xff));
+const key16 = key32.subarray(0, 16);
+const iv16 = Buffer.from(Array.from({ length: 16 }, (_, i) => (i * 5 + 9) & 0xff));
+const iv12 = iv16.subarray(0, 12);
+const aad = Buffer.from('header-data');
+const msg = (n) => Buffer.from(Array.from({ length: n }, (_, i) => (i * 7 + 3) & 0xff));
+const split = (buf, sizes) => {
+  const out = []; let at = 0, k = 0;
+  while (at < buf.length) { const n = Math.min(sizes[k++ % sizes.length], buf.length - at); out.push(buf.subarray(at, at + n)); at += n; }
+  return out;
+};
+const modes = [
+  ['aes-256-cbc', key32, iv16],
+  ['aes-128-cbc', key16, iv16],
+  ['aes-128-ecb', key16, null],
+  ['aes-256-ecb', key32, null],
+  ['aes-256-ctr', key32, iv16],
+  ['aes-128-ctr', key16, iv16],
+  ['aes-256-gcm', key32, iv12],
+  ['aes-128-gcm', key16, iv12],
+];
+const plans = [
+  ['straddle', 100, [5, 16, 17, 31]],
+  ['aligned', 64, [16, 16, 32]],
+  ['tiny', 7, [3]],
+];
+for (const [alg, key, iv] of modes) {
+  const aead = alg.endsWith('-gcm');
+  for (const [label, n, sizes] of plans) {
+    const plain = msg(n);
+    const enc = createCipheriv(alg, key, iv);
+    if (aead) enc.setAAD(aad);
+    const encParts = split(plain, sizes).map((c) => enc.update(c));
+    encParts.push(enc.final());
+    const ct = Buffer.concat(encParts);
+    const tag = aead ? enc.getAuthTag() : null;
+    console.log(`${alg} ${label} enc ${encParts.map((p) => p.length).join(',')} ${ct.toString('hex')}${tag ? ' tag=' + tag.toString('hex') : ''}`);
+    const dec = createDecipheriv(alg, key, iv);
+    if (aead) { dec.setAAD(aad); dec.setAuthTag(tag); }
+    const decParts = split(ct, sizes).map((c) => dec.update(c));
+    decParts.push(dec.final());
+    const pt = Buffer.concat(decParts);
+    console.log(`${alg} ${label} dec ${decParts.map((p) => p.length).join(',')} ${pt.equals(plain)}`);
+  }
+}
+// setAutoPadding(false): whole blocks out of update(), nothing held back.
+for (const alg of ['aes-256-cbc', 'aes-128-ecb']) {
+  const key = alg.includes('256') ? key32 : key16;
+  const iv = alg.endsWith('ecb') ? null : iv16;
+  const plain = msg(48);
+  const enc = createCipheriv(alg, key, iv).setAutoPadding(false);
+  const e = split(plain, [5, 16, 17, 10]).map((c) => enc.update(c)); e.push(enc.final());
+  const ct = Buffer.concat(e);
+  console.log(`${alg} nopad enc ${e.map((p) => p.length).join(',')} ${ct.toString('hex')}`);
+  const dec = createDecipheriv(alg, key, iv).setAutoPadding(false);
+  const d = split(ct, [16, 16, 16]).map((c) => dec.update(c)); d.push(dec.final());
+  console.log(`${alg} nopad dec ${d.map((p) => p.length).join(',')} ${Buffer.concat(d).equals(plain)}`);
+}
+// Output encodings carry over a chunk boundary.
+{
+  const enc = createCipheriv('aes-256-ctr', key32, iv16);
+  const parts = [enc.update(msg(5), undefined, 'base64'), enc.update(msg(5), undefined, 'base64'), enc.final('base64')];
+  console.log('ctr base64 ' + JSON.stringify(parts));
+  const enc2 = createCipheriv('aes-256-cbc', key32, iv16);
+  const parts2 = [enc2.update('héllo wörld, ünïcode!', 'utf8', 'hex'), enc2.final('hex')];
+  console.log('cbc hex ' + JSON.stringify(parts2));
+  const dec2 = createDecipheriv('aes-256-cbc', key32, iv16);
+  const parts3 = [dec2.update(parts2[0], 'hex', 'utf8'), dec2.update(parts2[1], 'hex', 'utf8'), dec2.final('utf8')];
+  console.log('cbc utf8 ' + JSON.stringify(parts3));
+}
+// A CTR keystream consumer that never calls final().
+{
+  const enc = createCipheriv('aes-128-ctr', key16, iv16);
+  console.log('ctr keystream ' + enc.update(Buffer.alloc(20)).toString('hex') + ' ' + enc.update(Buffer.alloc(3)).toString('hex'));
+}
+// GCM releases plaintext before the tag is checked; a bad tag fails at final().
+{
+  const enc = createCipheriv('aes-256-gcm', key32, iv12);
+  const ct = Buffer.concat([enc.update(msg(40)), enc.final()]);
+  const dec = createDecipheriv('aes-256-gcm', key32, iv12);
+  dec.setAuthTag(Buffer.alloc(16, 1));
+  const early = dec.update(ct);
+  let failed = false;
+  try { dec.final(); } catch { failed = true; }
+  console.log(`gcm badtag early=${early.equals(msg(40))} failed=${failed}`);
+}
+"#,
+    );
+    let expected = r#"aes-256-cbc straddle enc 0,16,16,32,0,16,16,16 d6325f7684f7813b7281802742d7728d340848fcb21531f2f73cd2e0b320b9178236be532c4319677fd1bc4660fbd897665bde169a3b0fcaa6946329bb20a7317a96c225c4854d82180879d1a74e8d5975c984424ce28fac60339154e3608adcbcce219b9e860d9acc2052f6ddb6cc16
+aes-256-cbc straddle dec 0,16,16,32,0,16,16,0,4 true
+aes-256-cbc aligned enc 16,16,32,16 d6325f7684f7813b7281802742d7728d340848fcb21531f2f73cd2e0b320b9178236be532c4319677fd1bc4660fbd897665bde169a3b0fcaa6946329bb20a7314d233b4d9d884cbd942f6cb7ade1a0e8
+aes-256-cbc aligned dec 0,16,32,16,0 true
+aes-256-cbc tiny enc 0,0,0,16 6912bfb028486c3ef9acc116c54f2c98
+aes-256-cbc tiny dec 0,0,0,0,0,0,7 true
+aes-128-cbc straddle enc 0,16,16,32,0,16,16,16 05c8fa65708ab9bcfb6c5fed806c390fd49494f2f0b8fc036673ccab7a479dbea4cd4efbe951dff35ee57a55dfb1ebf38483e5fea8d42c2e16e55f579a4f4230cbbdf6ba26e1cb12de0b9b169fcb48387c0946917daf5c407ed96bb2b494f19dddff69f64ce7f5a2610ca82faaeb2fe7
+aes-128-cbc straddle dec 0,16,16,32,0,16,16,0,4 true
+aes-128-cbc aligned enc 16,16,32,16 05c8fa65708ab9bcfb6c5fed806c390fd49494f2f0b8fc036673ccab7a479dbea4cd4efbe951dff35ee57a55dfb1ebf38483e5fea8d42c2e16e55f579a4f4230fadf50c3f855699750ae71a409a21959
+aes-128-cbc aligned dec 0,16,32,16,0 true
+aes-128-cbc tiny enc 0,0,0,16 7e83687e9db7f1d5a38a288368f0dab0
+aes-128-cbc tiny dec 0,0,0,0,0,0,7 true
+aes-128-ecb straddle enc 0,16,16,32,0,16,16,16 1a629d4e6cb025bc51b1ed86e41c359188a116bbc8f1cea10698863996c5a38f86f1e6db2171af3df3359f2bdb3ade25fa37f974e33544b99025cdd0bae879799bead868ae41a4108a52415f751b920d15a94da23c34b594e2d2e25bf3710e4a6b7624b542a9bd0080b79ab997e29f14
+aes-128-ecb straddle dec 0,16,16,32,0,16,16,0,4 true
+aes-128-ecb aligned enc 16,16,32,16 1a629d4e6cb025bc51b1ed86e41c359188a116bbc8f1cea10698863996c5a38f86f1e6db2171af3df3359f2bdb3ade25fa37f974e33544b99025cdd0bae879794bca25fae1557354eb5544ca551b9d48
+aes-128-ecb aligned dec 0,16,32,16,0 true
+aes-128-ecb tiny enc 0,0,0,16 52ee1c18b07ebc57de4492a1ad69ef82
+aes-128-ecb tiny dec 0,0,0,0,0,0,7 true
+aes-256-ecb straddle enc 0,16,16,32,0,16,16,16 2f47066d99200239ba7eb446e6a87cc2cca6dcb76fdc0c0c6d86ed71ae333a2e31cdd207e960990d7686ef2ce0a50ddfdb1a484887a93462a8c3454ac6ab69eadc50230a1dd7de8ce82dd4ed23b63f67bd188be01e4bd5c13a1da440683c8552521e238230938751b2ed0f4a48d19955
+aes-256-ecb straddle dec 0,16,16,32,0,16,16,0,4 true
+aes-256-ecb aligned enc 16,16,32,16 2f47066d99200239ba7eb446e6a87cc2cca6dcb76fdc0c0c6d86ed71ae333a2e31cdd207e960990d7686ef2ce0a50ddfdb1a484887a93462a8c3454ac6ab69ea1b5f7b435d81a1ed4da9f7ae92f304e5
+aes-256-ecb aligned dec 0,16,32,16,0 true
+aes-256-ecb tiny enc 0,0,0,16 be7e020e72b279c9f9dfe9e03b48fa30
+aes-256-ecb tiny dec 0,0,0,0,0,0,7 true
+aes-256-ctr straddle enc 5,16,17,31,5,16,10,0 753df4dc9ad9b0961b4fb44e8ea45f5d34d0a55c4d08f6dc7b473944baa5ffd61e4333195afb6c3a2d15d0364c0494929967fcb25afe78c9d9c9e6b7c8bc767d67275ec113fd4679770d9d6f4c8c682e3e4ed8fb6c236b5fc6a8261e14d9c7801123da31
+aes-256-ctr straddle dec 5,16,17,31,5,16,10,0 true
+aes-256-ctr aligned enc 16,16,32,0 753df4dc9ad9b0961b4fb44e8ea45f5d34d0a55c4d08f6dc7b473944baa5ffd61e4333195afb6c3a2d15d0364c0494929967fcb25afe78c9d9c9e6b7c8bc767d
+aes-256-ctr aligned dec 16,16,32,0 true
+aes-256-ctr tiny enc 3,3,1,0 753df4dc9ad9b0
+aes-256-ctr tiny dec 3,3,1,0 true
+aes-128-ctr straddle enc 5,16,17,31,5,16,10,0 b72edb0f2b34d118a282980e9295e109720930fa3652411fcf78ceacba8f5f56cc6fa55556acac2fd733086e9dbef5d52d312a7a75885b1472c952090e4f03aec2d670e542366239ff702275494960507c651560557e6cf62b611e4f3c549dc8d954d758
+aes-128-ctr straddle dec 5,16,17,31,5,16,10,0 true
+aes-128-ctr aligned enc 16,16,32,0 b72edb0f2b34d118a282980e9295e109720930fa3652411fcf78ceacba8f5f56cc6fa55556acac2fd733086e9dbef5d52d312a7a75885b1472c952090e4f03ae
+aes-128-ctr aligned dec 16,16,32,0 true
+aes-128-ctr tiny enc 3,3,1,0 b72edb0f2b34d1
+aes-128-ctr tiny dec 3,3,1,0 true
+aes-256-gcm straddle enc 5,16,17,31,5,16,10,0 ea780288b474f6fa9485acc2b36fd8b8a52bd487a830936404a488bdd64b3c5fab10bdda196eefd333f28a00a23c058ccbbd959992af652b69ab8de925e627e526ba6763b906af3b9c425db2551bfce635d8c52a8fdb4098bcc431808904bf738cb81f02 tag=26fd89da258e40f58e89d088e845f07d
+aes-256-gcm straddle dec 5,16,17,31,5,16,10,0 true
+aes-256-gcm aligned enc 16,16,32,0 ea780288b474f6fa9485acc2b36fd8b8a52bd487a830936404a488bdd64b3c5fab10bdda196eefd333f28a00a23c058ccbbd959992af652b69ab8de925e627e5 tag=f4a3a15a5ac7a5b6d46fbfb7b1105c5e
+aes-256-gcm aligned dec 16,16,32,0 true
+aes-256-gcm tiny enc 3,3,1,0 ea780288b474f6 tag=ebc8bd1acc4c7b02776b33bf8ca4b0e7
+aes-256-gcm tiny dec 3,3,1,0 true
+aes-128-gcm straddle enc 5,16,17,31,5,16,10,0 87ad7b4023e58160d9f49ea4a7e936252102af4aecf825c120091fa3e80a6d79021484adb7870311467158cf39b39dcb70d8d130427d03d9260e7794ec2f6d8f1379b109c561a0e71fd9ab3003d78371a131a65fd29469d55facd46b1f13cec245fa0b53 tag=bd7ca732e38c15d957996f2d4a13539e
+aes-128-gcm straddle dec 5,16,17,31,5,16,10,0 true
+aes-128-gcm aligned enc 16,16,32,0 87ad7b4023e58160d9f49ea4a7e936252102af4aecf825c120091fa3e80a6d79021484adb7870311467158cf39b39dcb70d8d130427d03d9260e7794ec2f6d8f tag=f15c287ee70639c140d9a17979490598
+aes-128-gcm aligned dec 16,16,32,0 true
+aes-128-gcm tiny enc 3,3,1,0 87ad7b4023e581 tag=b91d4416478e964a0b1d95d7db1ba7e2
+aes-128-gcm tiny dec 3,3,1,0 true
+aes-256-cbc nopad enc 0,16,16,16,0 d6325f7684f7813b7281802742d7728d340848fcb21531f2f73cd2e0b320b9178236be532c4319677fd1bc4660fbd897
+aes-256-cbc nopad dec 16,16,16,0 true
+aes-128-ecb nopad enc 0,16,16,16,0 1a629d4e6cb025bc51b1ed86e41c359188a116bbc8f1cea10698863996c5a38f86f1e6db2171af3df3359f2bdb3ade25
+aes-128-ecb nopad dec 16,16,16,0 true
+ctr base64 ["dT30","3Jr8l7M4","Eg=="]
+cbc hex ["9c189b9dcf963b9c5205f82cd71a8905","a138c0637a18b868b97dec5c19e971ea"]
+cbc utf8 ["","héllo wörld, ","ünïcode!"]
+ctr keystream b424ca173412fc2c99c0d15ec5cb84650173b172 b9c4dc
+gcm badtag early=true failed=true
+"#;
+    assert_eq!(stdout, expected.trim_end());
 }
 
 // -------------------------------------------------------------------- URL
@@ -4534,20 +5537,17 @@ fn url_search_params_full_surface() {
     assert_eq!(lines[5], "yes null");
 }
 
-// Several assertions here are Windows-shaped (drive letters in file://
-// URLs, \\?\... device paths). On POSIX `file:///foo/bar` is a VALID
-// path so the throw assertions don't hold. TODO: split into a portable
-// half (URLSearchParams, port setters, opaque paths) and a Windows-only
-// file:// half so Unix CI retains coverage of the portable cases.
-#[cfg_attr(not(windows), ignore = "Windows file:// URL shapes only")]
+// The portable half of the parity-fleet regressions (URLSearchParams, the
+// search/port/hostname/pathname setters, urlToHttpOptions): nothing here
+// depends on the host's path shapes, so it runs on every platform. The
+// file:// half below is Windows-shaped and runs only there.
 #[test]
 fn url_parity_fleet_regressions() {
     // Every case here is a confirmed divergence from the adversarial
     // oam-vs-node parity fleet, now pinned to node's behavior.
     let stdout = run_ok(
         "url_parity.mjs",
-        "import { fileURLToPath, pathToFileURL, urlToHttpOptions } from 'node:url';\n\
-         import path from 'node:path';\n\
+        "import { urlToHttpOptions } from 'node:url';\n\
          // BLOCKER: astral chars through string init.\n\
          const sp = new URLSearchParams('e=\\u{1F984}');\n\
          console.log(sp.toString(), sp.get('e') === '\\u{1F984}');\n\
@@ -4573,16 +5573,6 @@ fn url_parity_fleet_regressions() {
          const du = new URL('data:text/plain,abc');\n\
          du.pathname = 'xyz';\n\
          console.log(du.href);\n\
-         // Encoded separators must throw, not smuggle.\n\
-         let smuggle = '';\n\
-         try { fileURLToPath('file:///C:/foo%2Fbar'); } catch (e) { smuggle = e.code; }\n\
-         let driveless = '';\n\
-         try { fileURLToPath('file:///foo/bar'); } catch (e) { driveless = e.code; }\n\
-         console.log(smuggle, driveless);\n\
-         // Relative pathToFileURL resolves against cwd; device paths clean.\n\
-         const rel = pathToFileURL('foo/bar.txt').href;\n\
-         console.log(rel === pathToFileURL(path.resolve('foo/bar.txt')).href, rel.includes('/C:/') || rel.includes(':/'));\n\
-         console.log(pathToFileURL('\\\\\\\\?\\\\C:\\\\foo').href);\n\
          // urlToHttpOptions: node shape.\n\
          const o = urlToHttpOptions(new URL('http://us%65r:p%40ss@[::1]:8080/x/y?q=1#h'));\n\
          console.log(o.hostname, typeof o.port, o.port, o.auth, o.pathname);\n\
@@ -4597,21 +5587,46 @@ fn url_parity_fleet_regressions() {
     assert_eq!(lines[4], "http://example.com:8080/");
     assert_eq!(lines[5], "http://a.com:7/");
     assert_eq!(lines[6], "data:text/plain,abc");
-    assert_eq!(
-        lines[7],
-        "ERR_INVALID_FILE_URL_PATH ERR_INVALID_FILE_URL_PATH"
-    );
-    assert_eq!(lines[8], "true true");
-    assert_eq!(lines[9], "file:///C:/foo");
-    assert_eq!(lines[10], "::1 number 8080 user:p@ss /x/y");
-    assert_eq!(lines[11], "false false");
+    assert_eq!(lines[7], "::1 number 8080 user:p@ss /x/y");
+    assert_eq!(lines[8], "false false");
 }
 
-// Windows-shaped fixture (drive letters, backslashes, UNC). The cross-
-// platform fileURLToPath/pathToFileURL behavior is covered by the parity
-// fleet test above; this one pins the Windows-specific round trips
-// directly. TODO: extract a portable companion test for the non-drive,
-// non-UNC POSIX path round trips.
+// The Windows-shaped half of the parity-fleet regressions (drive letters in
+// file:// URLs, \\?\... device paths). On POSIX `file:///foo/bar` is a VALID
+// path, so the throw assertions do not hold there.
+#[cfg_attr(not(windows), ignore = "Windows file:// URL shapes only")]
+#[test]
+fn url_parity_fleet_file_url_regressions() {
+    let stdout = run_ok(
+        "url_parity_file.mjs",
+        "import { fileURLToPath, pathToFileURL } from 'node:url';\n\
+         import path from 'node:path';\n\
+         // Encoded separators must throw, not smuggle.\n\
+         let smuggle = '';\n\
+         try { fileURLToPath('file:///C:/foo%2Fbar'); } catch (e) { smuggle = e.code; }\n\
+         let driveless = '';\n\
+         try { fileURLToPath('file:///foo/bar'); } catch (e) { driveless = e.code; }\n\
+         console.log(smuggle, driveless);\n\
+         // Relative pathToFileURL resolves against cwd; device paths clean.\n\
+         const rel = pathToFileURL('foo/bar.txt').href;\n\
+         console.log(rel === pathToFileURL(path.resolve('foo/bar.txt')).href, rel.includes('/C:/') || rel.includes(':/'));\n\
+         console.log(pathToFileURL('\\\\\\\\?\\\\C:\\\\foo').href);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[0],
+        "ERR_INVALID_FILE_URL_PATH ERR_INVALID_FILE_URL_PATH"
+    );
+    assert_eq!(lines[1], "true true");
+    assert_eq!(lines[2], "file:///C:/foo");
+}
+
+// Windows-shaped fixture (drive letters, backslashes, UNC): this pins the
+// Windows-specific fileURLToPath/pathToFileURL round trips directly, as
+// url_parity_fleet_file_url_regressions above pins the Windows-specific
+// refusals. Both are ignored off Windows, so POSIX path round trips have no
+// e2e coverage in this file. TODO: add a portable companion test for the
+// non-drive, non-UNC POSIX path round trips.
 #[cfg_attr(not(windows), ignore = "Windows path/URL shapes only")]
 #[test]
 fn node_url_file_conversions_round_trip() {
@@ -4900,12 +5915,22 @@ fn fetch_text_json_still_work_and_cancel_does_not_hang() {
              console.log(doubled);\n\
              // Early-exit from iteration cancels the body; the run must\n\
              // exit promptly instead of waiting out the server's stream.\n\
-             const slow = await fetch('http://{addr}/stream');\n\
+             // /hold never ends its stream on its own, so a body that was\n\
+             // not cancelled keeps the run alive for the whole hold.\n\
+             const slow = await fetch('http://{addr}/hold');\n\
              for await (const _chunk of slow.body) break;\n\
              console.log('cancelled-clean');"
         ),
     );
-    let out = oam(&["run", main.to_str().unwrap()]);
+    let started = std::time::Instant::now();
+    // --no-check: the elapsed time below must be the script's, not a checker's.
+    let out = oam(&["run", main.to_str().unwrap(), "--no-check"]);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < ECHO_HOLD / 2,
+        "the run took {elapsed:?}: it waited on a stream it had stopped reading (the \
+         server holds it open for {ECHO_HOLD:?}) instead of cancelling the body"
+    );
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -5321,10 +6346,11 @@ fn dynamic_import_from_test_body_rejects_via_cleared_host_slot() {
         stdout.contains("not wired up on this entry path"),
         "expected the test body to log the new rejection message: stdout=<<{stdout}>>"
     );
+    // The runner's own summary line (`N file(s): P passed, F failed, ...`),
+    // and nothing looser: the test's title is printed for a failing test too.
     assert!(
-        stderr.contains("1 passed")
-            || stderr.contains("ok") && stderr.contains("cleared host slot"),
-        "expected the test runner to record 1 passed: stderr=<<{stderr}>>"
+        stderr.contains("1 passed, 0 failed"),
+        "expected the test runner's summary to record 1 passed, 0 failed: stderr=<<{stderr}>>"
     );
 }
 
@@ -6682,6 +7708,138 @@ server.close();
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// `undici.request` follows redirects by undici's RedirectHandler and by
+/// nothing of fetch's: none without `maxRedirections` (the request's, else
+/// its dispatcher's; `null` and 0 are none), that many with it and then the
+/// next 3xx as the response -- past fetch's 20 too -- a value that is not a
+/// whole number from 0 up refused before any request, a Location with
+/// userinfo followed without it, and a `300` followed like the rest. oam
+/// followed every redirect whatever `maxRedirections` said, failed the 21st
+/// with fetch's `redirect count exceeded` and a userinfo Location with
+/// fetch's credentials rule, and returned a `300`. The expected output is
+/// node v22.22.2 + undici 6.28.1's, line for line.
+#[test]
+fn undici_request_follows_only_under_max_redirections() {
+    let script = write_temp(
+        "undici_request_max_redirections/main.mjs",
+        r##"import http from 'node:http';
+import { Agent, Pool, request } from 'undici';
+
+const hits = [];
+const server = http.createServer((q, s) => {
+  q.resume();
+  hits.push(`${q.method} ${q.url}`);
+  const port = server.address().port;
+  const loop = q.url.match(/^\/loop(\d*)$/);
+  if (loop) { s.writeHead(302, { location: `/loop${Number(loop[1] || 0) + 1}` }); s.end(); }
+  else if (q.url === '/userinfo') { s.writeHead(302, { location: `http://u:p@127.0.0.1:${port}/ok` }); s.end(); }
+  else if (q.url === '/m300') { s.writeHead(300, { location: '/ok' }); s.end(); }
+  else s.end(`ok auth=${q.headers.authorization ?? '-'}`);
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+const show = async (label, path, opts) => {
+  hits.length = 0;
+  try {
+    const r = await request(base + path, opts);
+    const text = await r.body.text();
+    console.log(label, '->', r.statusCode, JSON.stringify(text), '|', hits.length, hits.at(-1));
+  } catch (e) {
+    console.log(label, '-> threw', e.name, e.code, e.message, '|', hits.length);
+  }
+};
+await show('no maxRedirections', '/loop', {});
+await show('maxRedirections 0', '/loop', { maxRedirections: 0 });
+await show('maxRedirections null', '/loop', { maxRedirections: null });
+await show('maxRedirections 2', '/loop', { maxRedirections: 2 });
+await show('maxRedirections 22', '/loop', { maxRedirections: 22 });
+await show('agent 2', '/loop', { dispatcher: new Agent({ maxRedirections: 2 }) });
+await show('agent 2, request 0', '/loop', { dispatcher: new Agent({ maxRedirections: 2 }), maxRedirections: 0 });
+await show('agent 2, request 1', '/loop', { dispatcher: new Agent({ maxRedirections: 2 }), maxRedirections: 1 });
+await show('agent 2, request null', '/loop', { dispatcher: new Agent({ maxRedirections: 2 }), maxRedirections: null });
+await show('pool 2', '/loop', { dispatcher: new Pool(base, { maxRedirections: 2 }) });
+for (const bad of [1.5, -1, '2']) await show(`maxRedirections ${JSON.stringify(bad)}`, '/loop', { maxRedirections: bad });
+await show('userinfo', '/userinfo', { maxRedirections: 2 });
+await show('300 GET', '/m300', { maxRedirections: 2 });
+await show('300 POST', '/m300', { maxRedirections: 2, method: 'POST', body: 'abc' });
+await show('300, no maxRedirections', '/m300', {});
+process.exit(0);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "\
+no maxRedirections -> 302 \"\" | 1 GET /loop
+maxRedirections 0 -> 302 \"\" | 1 GET /loop
+maxRedirections null -> 302 \"\" | 1 GET /loop
+maxRedirections 2 -> 302 \"\" | 3 GET /loop2
+maxRedirections 22 -> 302 \"\" | 23 GET /loop22
+agent 2 -> 302 \"\" | 3 GET /loop2
+agent 2, request 0 -> 302 \"\" | 1 GET /loop
+agent 2, request 1 -> 302 \"\" | 2 GET /loop1
+agent 2, request null -> 302 \"\" | 1 GET /loop
+pool 2 -> 302 \"\" | 3 GET /loop2
+maxRedirections 1.5 -> threw InvalidArgumentError UND_ERR_INVALID_ARG maxRedirections must be a positive number | 0
+maxRedirections -1 -> threw InvalidArgumentError UND_ERR_INVALID_ARG maxRedirections must be a positive number | 0
+maxRedirections \"2\" -> threw InvalidArgumentError UND_ERR_INVALID_ARG maxRedirections must be a positive number | 0
+userinfo -> 200 \"ok auth=-\" | 2 GET /ok
+300 GET -> 200 \"ok auth=-\" | 2 GET /ok
+300 POST -> 200 \"ok auth=-\" | 2 POST /ok
+300, no maxRedirections -> 300 \"\" | 1 GET /m300";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// A redirect that goes on without a streamed request body does not wait
+/// for that body to end. The origin here answers `303` as soon as it has
+/// the request head and keeps the connection open, and the body is a stream
+/// that sends one chunk and never ends: Node follows with the GET at once
+/// (undici resets the socket of a request still being written when its
+/// response completes). oam waited for the connection to come back to the
+/// pool, which it does only once the body has ended -- so the fetch hung
+/// for as long as the stream stayed open. The expected output is node
+/// v22.22.2's.
+#[test]
+fn a_redirect_that_drops_a_streamed_body_does_not_wait_for_its_end() {
+    let script = write_temp(
+        "redirect_drops_open_stream/main.mjs",
+        r##"import net from 'node:net';
+const seen = [];
+// A raw origin: it answers each request head as it arrives and keeps the
+// connection open, reading (and ignoring) whatever body follows.
+const server = net.createServer((sock) => {
+  let head = '';
+  let answered = false;
+  sock.on('error', () => {});
+  sock.on('data', (d) => {
+    if (answered) return;
+    head += d.toString('latin1');
+    if (head.indexOf('\r\n\r\n') < 0) return;
+    answered = true;
+    const line = head.slice(0, head.indexOf('\r\n'));
+    seen.push(line.replace(' HTTP/1.1', ''));
+    if (line.startsWith('POST /start')) sock.write('HTTP/1.1 303 See Other\r\nlocation: /done\r\ncontent-length: 0\r\n\r\n');
+    else sock.write('HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\nlanded');
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+const timer = setTimeout(() => { console.log('still waiting after 20 s |', seen.join('; ')); process.exit(1); }, 20000);
+// A body that is never ended: one chunk, then nothing.
+const body = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('first')); } });
+const r = await fetch(`${base}/start`, { method: 'POST', body, duplex: 'half' });
+console.log(r.status, r.redirected, await r.text(), '|', seen.join('; '));
+clearTimeout(timer);
+process.exit(0);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "200 true landed | POST /start; GET /done"
+    );
+}
+
 /// undici's headers and body timeouts (review 3, findings 10 and 11): they
 /// run on undici's FastTimer, so a 200 ms `headersTimeout` lets an 800 ms
 /// answer through and a 100 ms `bodyTimeout` lapses after about 1 s; and
@@ -6827,6 +7985,99 @@ destroyed body: close
 /text ResponseStatusCodeError UND_ERR_RESPONSE_STATUS_CODE Response status code 500: Broken 500 500 "oops" text/plain
 /none ResponseStatusCodeError UND_ERR_RESPONSE_STATUS_CODE Response status code 403: Forbidden 403 403 undefined undefined
 without throwOnError 404 {"a":1}"#;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// Four corners of the undici shim that used to answer quietly wrong:
+/// `request()` files a response header carried more than once as an array
+/// (undici's parseHeaders; two `set-cookie` lines were one joined string
+/// that cannot be split again), `stream()` destroys the factory's writable
+/// when the response body fails (it was left open), a `BalancedPool` takes
+/// its upstreams in turn and has `addUpstream` / `removeUpstream` (every
+/// request went to the first), and an `interceptors.*()` interceptor and
+/// `compose()` refuse by name (the interceptors were pass-throughs and
+/// `compose` was not a function).
+#[test]
+fn undici_repeated_headers_stream_failure_balanced_pool_and_interceptors() {
+    let script = write_temp(
+        "undici_repeated_headers_balanced_pool/main.mjs",
+        r##"import http from 'node:http';
+import { Writable } from 'node:stream';
+import { request, stream, Agent, BalancedPool, interceptors, errors } from 'undici';
+
+const serve = async (name) => {
+  const server = http.createServer((q, s) => {
+    if (q.url === '/cookies') {
+      s.setHeader('set-cookie', ['a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT', 'b=2']);
+      s.setHeader('x-one', '1');
+      s.end('ok');
+      return;
+    }
+    if (q.url === '/cut') {
+      s.writeHead(200, { 'content-length': '10' });
+      s.write('abc');
+      setTimeout(() => s.destroy(), 20);
+      return;
+    }
+    s.end(name);
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  return `http://127.0.0.1:${server.address().port}`;
+};
+const a = await serve('A');
+const b = await serve('B');
+
+const cookies = await request(a + '/cookies');
+await cookies.body.dump();
+console.log('cookies', JSON.stringify(cookies.headers['set-cookie']), cookies.headers['x-one']);
+
+const sink = new Writable({ write(chunk, enc, cb) { cb(); } });
+let rejected = false;
+try {
+  await stream(a + '/cut', { method: 'GET' }, () => sink);
+} catch {
+  rejected = true;
+}
+console.log('stream cut: rejected', rejected, 'destroyed', sink.destroyed);
+
+const pool = new BalancedPool([a]);
+console.log('upstreams', pool.addUpstream(b) === pool, pool.addUpstream(b).upstreams.length, pool.upstreams[0] === a);
+const turn = async () => (await pool.request({ path: '/', method: 'GET' })).body.text();
+console.log('rotation', await turn(), await turn(), await turn(), await turn());
+console.log('after remove', pool.removeUpstream(a) === pool, await turn(), await turn());
+try {
+  await new BalancedPool().request({ path: '/', method: 'GET' });
+  console.log('empty: resolved');
+} catch (e) {
+  console.log('empty', e instanceof errors.BalancedPoolMissingUpstreamError, e.code);
+}
+
+const interceptor = interceptors.redirect({ maxRedirections: 1 });
+try {
+  interceptor(() => {});
+  console.log('interceptor: applied');
+} catch (e) {
+  console.log('interceptor', typeof interceptor, e instanceof errors.NotSupportedError, e.code);
+}
+try {
+  new Agent().compose(interceptor);
+  console.log('compose: returned');
+} catch (e) {
+  console.log('compose', e instanceof errors.NotSupportedError, e.code);
+}
+process.exit(0);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = r#"cookies ["a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT","b=2"] 1
+stream cut: rejected true destroyed true
+upstreams true 2 true
+rotation A B A B
+after remove true B B
+empty true UND_ERR_BPL_MISSING_UPSTREAM
+interceptor function true UND_ERR_NOT_SUPPORTED
+compose true UND_ERR_NOT_SUPPORTED"#;
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
@@ -7364,6 +8615,27 @@ fn spawn_recording_proxy(
     (port, heads)
 }
 
+/// Every variable the host might export that changes where a request goes or
+/// which roots it trusts: the proxy variables in both cases, the CGI guard
+/// that disables them, and the node switches that turn environment proxying
+/// on or add trust roots. One list for both helpers below, so a test whose
+/// premise is "the environment's proxy must not apply" cannot inherit one
+/// through a name only the other helper knew about.
+const AMBIENT_PROXY_ENV: [&str; 12] = [
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "REQUEST_METHOD",
+    "NODE_EXTRA_CA_CERTS",
+    "NODE_USE_ENV_PROXY",
+    "NODE_OPTIONS",
+];
+
 /// `oam run --no-check <script>` with every proxy variable the host might
 /// export removed, then `vars` set. Windows compares variable names without
 /// case, so the removals come first or they would undo the sets.
@@ -7372,23 +8644,9 @@ fn oam_run_with_proxy_env(script: &std::path::Path, vars: &[(&str, &str)]) -> Ou
         .parent()
         .unwrap()
         .to_path_buf();
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
-    cmd.args(["run", "--no-check", script.to_str().unwrap()])
-        .env("OAM_CACHE_DIR", cache);
-    for name in [
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-        "NO_PROXY",
-        "no_proxy",
-        "REQUEST_METHOD",
-        "NODE_EXTRA_CA_CERTS",
-        "NODE_USE_ENV_PROXY",
-        "NODE_OPTIONS",
-    ] {
+    let mut cmd = oam_command(&["run", "--no-check", script.to_str().unwrap()]);
+    cmd.env("OAM_CACHE_DIR", cache);
+    for name in AMBIENT_PROXY_ENV {
         cmd.env_remove(name);
     }
     for (k, v) in vars {
@@ -9644,6 +10902,9 @@ fn fetch_connect_lookup_parks_a_streamed_body_until_answered() {
         "fetch_lookup_stream/main.mjs",
         r#"import http from 'node:http';
 import { Agent } from 'undici';
+// The `__oamBodyStream` knob is read only by the runtime's own fetch
+// entries; this one is reachable only under --expose-internals.
+import { fetch as internalFetch } from 'internal/oam/fetch';
 const natives = globalThis.__oam.node;
 const encode = (s) => new TextEncoder().encode(s);
 let received = null;
@@ -9675,7 +10936,7 @@ const watchdog = setTimeout(() => { console.log('HANG'); process.exit(1); }, 200
     answer();
   } } });
   try {
-    await fetch(`http://stream.test:${port}/`, { method: 'POST', dispatcher: agent, __oamBodyStream: handle });
+    await internalFetch(`http://stream.test:${port}/`, { method: 'POST', dispatcher: agent, __oamBodyStream: handle });
     console.log('refused: resolved?!');
   } catch (e) {
     console.log('refused', e.message, e.cause.message, 'settled while parked', atAnswer);
@@ -9691,7 +10952,7 @@ const watchdog = setTimeout(() => { console.log('HANG'); process.exit(1); }, 200
   let calls = 0;
   const controller = new AbortController();
   const agent = new Agent({ connect: { lookup: () => { calls++; setTimeout(() => controller.abort(), 0); } } });
-  const p = fetch(`http://stream.test:${port}/`, { method: 'POST', dispatcher: agent, __oamBodyStream: handle, signal: controller.signal });
+  const p = internalFetch(`http://stream.test:${port}/`, { method: 'POST', dispatcher: agent, __oamBodyStream: handle, signal: controller.signal });
   for (let i = 0; i < 10; i++) writes.push(natives.fetchBodyChannelWrite(handle, encode('x')));
   try { await p; console.log('aborted: resolved?!'); } catch (e) { console.log('aborted', e.name, 'calls', calls); }
   await Promise.all(writes);
@@ -9708,7 +10969,7 @@ const watchdog = setTimeout(() => { console.log('HANG'); process.exit(1); }, 200
   const asked = new Promise((r) => (hooked = r));
   const agent = new Agent({ connect: { lookup: () => { calls++; hooked(); } } });
   const controller = new AbortController();
-  const p = fetch(`http://stream.test:${port}/`, { method: 'POST', dispatcher: agent, __oamBodyStream: handle, signal: controller.signal });
+  const p = internalFetch(`http://stream.test:${port}/`, { method: 'POST', dispatcher: agent, __oamBodyStream: handle, signal: controller.signal });
   for (let i = 0; i < 10; i++) writes.push(natives.fetchBodyChannelWrite(handle, encode('x')));
   controller.abort();
   let outcome = 'resolved?!';
@@ -9725,7 +10986,7 @@ const watchdog = setTimeout(() => { console.log('HANG'); process.exit(1); }, 200
     for (let i = 0; i < 12; i++) await natives.fetchBodyChannelWrite(handle, encode('chunk' + i + ';'));
     natives.fetchBodyChannelEnd(handle);
   })();
-  const res = await fetch(`http://stream.test:${port}/`, { method: 'POST', dispatcher: agent, __oamBodyStream: handle });
+  const res = await internalFetch(`http://stream.test:${port}/`, { method: 'POST', dispatcher: agent, __oamBodyStream: handle });
   await writer;
   const expected = Array.from({ length: 12 }, (_, i) => 'chunk' + i + ';').join('');
   console.log('answered', res.status, await res.text(), received === expected);
@@ -9734,7 +10995,11 @@ clearTimeout(watchdog);
 server.close();
 "#,
     );
-    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    // OAM_EXPOSE_INTERNALS=1 is what --expose-internals sets.
+    let out = bounded_output(
+        oam_command(&["run", "--no-check", script.to_str().unwrap()])
+            .env("OAM_EXPOSE_INTERNALS", "1"),
+    );
     let (stdout, _) = run_script_ok(&script, out);
     // The channel holds 8 chunks (CoreRuntime::new_outbound_body), so 4 of
     // the 12 writes were blocked on the parked fetch.
@@ -9744,6 +11009,145 @@ server.close();
          aborted: writes settled, server saw null\n\
          aborted before parking AbortError calls 1 writes settled, server saw null\n\
          answered 200 got 86 true";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// The runtime's own fetch entries -- the ones that read an init's `__oam*`
+/// knobs -- are not reachable from a program: no `__oamFetchInternal`
+/// global (node has none either), `internal/oam/fetch` refused by the
+/// resolver and by the builtin registry without --expose-internals, and by
+/// the registry in a Worker whose `env` option claims the flag. oam's own
+/// callers still send through them: http.get (whose init asks for the raw
+/// exchange -- `content-encoding` intact, the body not decoded) and
+/// undici.request.
+#[test]
+fn fetch_internal_init_marker_is_out_of_a_programs_reach() {
+    write_temp(
+        "fetch_internal_marker/worker.cjs",
+        "const { parentPort } = require('node:worker_threads');\n\
+         let out;\n\
+         try { globalThis.__oamNode.get('internal/oam/fetch'); out = 'loaded?!'; } \
+         catch (e) { out = 'refused ' + e.message; }\n\
+         parentPort.postMessage(out + ' ' + typeof globalThis.__oamFetchInternal);\n",
+    );
+    let script = write_temp(
+        "fetch_internal_marker/main.mjs",
+        r#"import http from 'node:http';
+import { createRequire } from 'node:module';
+import { Worker } from 'node:worker_threads';
+import { request } from 'undici';
+const require = createRequire(import.meta.url);
+console.log('global', typeof globalThis.__oamFetchInternal, Object.getOwnPropertyNames(globalThis).includes('__oamFetchInternal'));
+try { require('internal/oam/fetch'); console.log('require: loaded?!'); } catch (e) { console.log('require refused', e.code); }
+try { await import('node:internal/oam/fetch'); console.log('import: loaded?!'); } catch { console.log('import refused'); }
+try { globalThis.__oamNode.get('internal/oam/fetch'); console.log('registry: loaded?!'); } catch (e) { console.log('registry refused', e.message); }
+const inWorker = await new Promise((resolve, reject) => {
+  const w = new Worker(new URL('./worker.cjs', import.meta.url), { env: { ...process.env, OAM_EXPOSE_INTERNALS: '1' } });
+  w.once('message', resolve);
+  w.once('error', reject);
+});
+console.log('worker registry', inWorker);
+const gz = (await import('node:zlib')).gzipSync('hello');
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'content-encoding': 'gzip', 'content-length': gz.length });
+  res.end(gz);
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const { port } = server.address();
+const raw = await new Promise((resolve, reject) => {
+  http.get({ host: '127.0.0.1', port, path: '/' }, (res) => {
+    const chunks = [];
+    res.on('data', (c) => chunks.push(c));
+    res.on('end', () => resolve(res.headers['content-encoding'] + ' ' + Buffer.concat(chunks).equals(gz)));
+  }).on('error', reject);
+});
+console.log('http.get', raw);
+const u = await request(`http://127.0.0.1:${port}/`);
+console.log('undici.request', u.statusCode, Buffer.from(await u.body.arrayBuffer()).equals(gz));
+server.close();
+"#,
+    );
+    let out = bounded_output(
+        oam_command(&["run", "--no-check", script.to_str().unwrap()])
+            .env_remove("OAM_EXPOSE_INTERNALS")
+            .env_remove("NODE_OPTIONS"),
+    );
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "global undefined false\n\
+         require refused MODULE_NOT_FOUND\n\
+         import refused\n\
+         registry refused Cannot find module 'internal/oam/fetch'\n\
+         worker registry refused Cannot find module 'internal/oam/fetch' undefined\n\
+         http.get gzip true\n\
+         undici.request 200 true";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// fetch's `__oam*` knobs are read only from the init a runtime entry was
+/// handed, never through Object.prototype: a program that defines them there
+/// sees no lookup -- from globalThis.fetch, undici.fetch, http.get or
+/// undici.request (a buffered body and a streamed one) -- and so can neither
+/// set a knob for a request nor be shown an internal init as `this`. node
+/// v22.22.2 prints the same lines.
+#[test]
+fn fetch_knobs_are_not_read_through_object_prototype() {
+    let script = write_temp(
+        "fetch_knobs_prototype/main.mjs",
+        r#"import http from 'node:http';
+import { Readable } from 'node:stream';
+import { request, fetch as undiciFetch } from 'undici';
+const knobs = ['__oamFetchSemantics', '__oamDispatchSemantics', '__oamManualRedirect', '__oamRawExchange',
+  '__oamMaxRedirections', '__oamMaxHeaderSize', '__oamSentSignal', '__oamDeferHead', '__oamOfferNoAlpn',
+  '__oamHeadersTimeout', '__oamBodyTimeout', '__oamBodyStream', '__oamChunked', '__oamIterableBody',
+  '__oamCanceller'];
+const looked = new Set();
+const symbols = new Set();
+for (const name of knobs) {
+  Object.defineProperty(Object.prototype, name, {
+    configurable: true,
+    get() {
+      looked.add(name);
+      for (const s of Object.getOwnPropertySymbols(this)) symbols.add(String(s));
+      return undefined;
+    },
+  });
+}
+const server = http.createServer((req, res) => {
+  let n = 0;
+  req.on('data', (c) => { n += c.length; });
+  req.on('end', () => res.end(`${req.method} ${n}`));
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+console.log('fetch', await (await fetch(url, { method: 'POST', body: 'abc' })).text());
+console.log('undici.fetch', await (await undiciFetch(url)).text());
+console.log('http.get', await new Promise((resolve, reject) => {
+  http.get(url, (res) => {
+    let t = '';
+    res.setEncoding('utf8');
+    res.on('data', (c) => { t += c; });
+    res.on('end', () => resolve(t));
+  }).on('error', reject);
+}));
+const plain = await request(url, { method: 'POST', body: 'abcd' });
+console.log('undici.request', await plain.body.text());
+const streamed = await request(url, { method: 'POST', body: Readable.from(['ab', 'cde']) });
+console.log('undici.request streamed', await streamed.body.text());
+server.close();
+for (const name of knobs) delete Object.prototype[name];
+console.log('looked up', JSON.stringify([...looked]));
+console.log('symbols', JSON.stringify([...symbols]));
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "fetch POST 3\n\
+         undici.fetch GET 0\n\
+         http.get GET 0\n\
+         undici.request POST 4\n\
+         undici.request streamed POST 5\n\
+         looked up []\n\
+         symbols []";
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
@@ -11891,19 +13295,9 @@ fn oam_without_proxy_env(args: &[&str]) -> Output {
         .parent()
         .unwrap()
         .to_path_buf();
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
-    cmd.args(args).env("OAM_CACHE_DIR", cache);
-    for name in [
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-        "NO_PROXY",
-        "no_proxy",
-        "REQUEST_METHOD",
-    ] {
+    let mut cmd = oam_command(args);
+    cmd.env("OAM_CACHE_DIR", cache);
+    for name in AMBIENT_PROXY_ENV {
         cmd.env_remove(name);
     }
     bounded_output(&mut cmd)
@@ -11975,9 +13369,11 @@ const viaHttp = (c) =>
     req.on('error', (e) => resolve(fail(e)));
     req.end();
   });
+// undici.request follows a redirect only under `maxRedirections`, as undici's
+// does; one hop is what each case here takes.
 const viaUndici = async (c) => {
   try {
-    const r = await request(url('undici', c));
+    const r = await request(url('undici', c), { maxRedirections: 1 });
     return `${r.statusCode} ${await r.body.text()}`;
   } catch (e) {
     return fail(e);
@@ -12197,9 +13593,10 @@ const viaHttp = (url) =>
       res.on('end', () => resolve(`${res.statusCode}`));
     }).on('error', (e) => resolve(fail(e)));
   });
+// `maxRedirections`: undici.request follows no redirect without it.
 const viaUndici = async (url) => {
   try {
-    const r = await request(url);
+    const r = await request(url, { maxRedirections: 1 });
     return `${r.statusCode} ${await r.body.text()}`;
   } catch (e) {
     return fail(e);
@@ -13440,17 +14837,19 @@ process.exit(0);
     // millisecond. Measured 2026-10-18 on the x86_64 Linux builder, the e2e workload with
     // 20 concurrent copies (the load a full `cargo test` puts on the box): 0-1 hop of 1,000
     // read twice per run over 240 runs, every fetch answered and every POST read once. The
-    // gate-off floor is 7-59 of 1,000, so <= 3 (as the plain-TCP sibling tolerates) still
-    // catches the regression this test exists for.
+    // gate-off floor is 7-59 of 1,000, so <= 3 still catches the regression this test
+    // exists for. (The plain-TCP sibling holds `/redir` to exactly once, `redir_max == 1`;
+    // the 3 it tolerates is on its `/final` hops, the count the 12 below bounds here.)
     assert!(
         redir_doubles <= 3,
-        "{redir_doubles}/1000 GET + 302 hops over TLS arrived twice (tolerance 3, as over \
-         plain TCP and as docs/node-divergences.md entry 38 records for a same-process TLS \
-         server):\n{stdout}"
+        "{redir_doubles}/1000 `/redir` requests (the GET that draws the 302) arrived twice \
+         over TLS (tolerance 3; over plain TCP none may, and docs/node-divergences.md entry \
+         38 records the resend for a same-process TLS server):\n{stdout}"
     );
     assert!(
         final_doubles <= 12,
-        "{final_doubles}/1000 GET + 302 hops over TLS arrived twice (tolerance 12 -- the \
+        "{final_doubles}/1000 `/final` hops (the GET that follows the 302) arrived twice \
+         over TLS (tolerance 12 -- the \
          pool::reuse_h1 freshness wait is a heuristic, and over TLS the close is a \
          close_notify rustls must decode before the sender closes; measured 0-8 under the \
          load a full e2e run puts on the box):\n{stdout}"
@@ -13988,6 +15387,223 @@ fn oam_test_mocks_spies_and_fake_timers() {
     );
 }
 
+/// Matcher strictness: toMatchObject compares Date/Map/RegExp values and
+/// array length instead of matching vacuously, toThrow(errorObject) compares
+/// the message, and the mock matchers refuse a value that is not a mock in
+/// both polarities. Every test here passes only if the matcher under test
+/// REJECTS the mismatch.
+#[test]
+fn oam_test_matchers_reject_mismatches_they_used_to_accept() {
+    write_temp(
+        "runner_matchers_strict/strict.test.ts",
+        "import { test, expect, mock } from 'oam:test';\n\
+         const rejects = (fn: () => void) => {\n\
+           try { fn(); } catch { return true; }\n\
+           return false;\n\
+         };\n\
+         test('toMatchObject', () => {\n\
+           expect(rejects(() => expect({ d: new Date(0) }).toMatchObject({ d: new Date(5) }))).toBe(true);\n\
+           expect(rejects(() => expect({ m: new Map([[1, 2]]) }).toMatchObject({ m: new Map() }))).toBe(true);\n\
+           expect(rejects(() => expect({ r: /a/ }).toMatchObject({ r: /b/ }))).toBe(true);\n\
+           expect(rejects(() => expect([1, 2, 3]).toMatchObject([1]))).toBe(true);\n\
+           expect({ d: new Date(5), extra: 1 }).toMatchObject({ d: new Date(5) });\n\
+           expect({ a: [{ b: 1, c: 2 }] }).toMatchObject({ a: [{ b: 1 }] });\n\
+         });\n\
+         test('toThrow with an error object', () => {\n\
+           const boom = () => { throw new Error('A'); };\n\
+           expect(rejects(() => expect(boom).toThrow(new Error('B')))).toBe(true);\n\
+           expect(boom).toThrow(new Error('A'));\n\
+           expect(boom).not.toThrow(new Error('B'));\n\
+         });\n\
+         test('mock matchers on a non-mock', () => {\n\
+           const plain = () => {};\n\
+           expect(rejects(() => expect(plain).not.toHaveBeenCalled())).toBe(true);\n\
+           expect(rejects(() => expect(plain).toHaveBeenCalledTimes(0))).toBe(true);\n\
+           expect(rejects(() => expect(plain).not.toHaveBeenCalledWith(1))).toBe(true);\n\
+           expect(rejects(() => expect(plain).not.toHaveBeenLastCalledWith(1))).toBe(true);\n\
+           expect(mock.fn()).not.toHaveBeenCalled();\n\
+         });",
+    );
+    let dir = write_temp("runner_matchers_strict/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = oam(&["test", dir.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("3 passed"), "stderr: {stderr}");
+}
+
+/// Fake timers move the whole Date clock, not Date.now alone, and tick()
+/// reports a timer that re-arms itself at 0 ms instead of spinning.
+#[test]
+fn oam_test_fake_timers_cover_new_date_and_guard_a_runaway_tick() {
+    write_temp(
+        "runner_fake_date/clock.test.ts",
+        "import { test, expect, mock } from 'oam:test';\n\
+         test('new Date() reads the fake clock', () => {\n\
+           const RealDate = Date;\n\
+           const before = new Date(7);\n\
+           mock.timers.enable({ now: 1000 });\n\
+           expect(new Date().getTime()).toBe(1000);\n\
+           expect(Date.now()).toBe(1000);\n\
+           expect(new Date(5).getTime()).toBe(5);\n\
+           expect(new Date()).toBeInstanceOf(RealDate);\n\
+           expect(before).toBeInstanceOf(Date);\n\
+           mock.timers.setSystemTime(0);\n\
+           expect(new Date().getTime()).toBe(0);\n\
+           expect(new Date()).toStrictEqual(new RealDate(0));\n\
+           mock.timers.restore();\n\
+           expect(Date).toBe(RealDate);\n\
+           expect(new Date().getTime()).toBeGreaterThan(1e12);\n\
+         });\n\
+         test('tick reports a zero-delay self-rearming timer', () => {\n\
+           mock.timers.enable({ now: 0 });\n\
+           const loop = () => { setTimeout(loop, 0); };\n\
+           loop();\n\
+           expect(() => mock.timers.tick(1)).toThrow('runaway');\n\
+           mock.timers.restore();\n\
+           mock.timers.enable({ now: 0 });\n\
+           let fired = 0;\n\
+           setInterval(() => { fired++; }, 1);\n\
+           mock.timers.tick(150000);\n\
+           expect(fired).toBe(150000);\n\
+         });",
+    );
+    let dir = write_temp("runner_fake_date/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = oam(&["test", dir.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("2 passed"), "stderr: {stderr}");
+}
+
+/// Suite hooks follow the tests they serve: a skipped or fully filtered suite
+/// runs no beforeAll/afterAll, a throwing beforeAll fails that suite's tests
+/// while sibling suites still run, a throwing beforeEach still gets the
+/// afterEach pass, a todo is subject to the filter, and a describe.only
+/// nested in a describe.skip stays skipped.
+#[test]
+fn oam_test_hooks_are_scoped_to_the_tests_that_run() {
+    write_temp(
+        "runner_hook_scope/scope.test.ts",
+        "import { test, describe, beforeAll, afterAll, beforeEach, afterEach } from 'oam:test';\n\
+         describe.skip('skipped', () => {\n\
+           beforeAll(() => { console.log('SKIPPED_SETUP'); });\n\
+           afterAll(() => { console.log('SKIPPED_TEARDOWN'); });\n\
+           test('s', () => {});\n\
+         });\n\
+         describe('bad', () => {\n\
+           beforeAll(() => { throw new Error('setup-boom'); });\n\
+           test('b1', () => { console.log('B1_BODY'); });\n\
+           describe('nested', () => {\n\
+             beforeAll(() => { console.log('NESTED_SETUP'); });\n\
+             test('b2', () => {});\n\
+           });\n\
+         });\n\
+         describe('falsy', () => {\n\
+           beforeAll(() => { throw 0; });\n\
+           test('f1', () => { console.log('F1_BODY'); });\n\
+         });\n\
+         describe('each', () => {\n\
+           beforeEach(() => { console.log('EACH_OPEN'); });\n\
+           afterEach(() => { console.log('EACH_CLOSE'); });\n\
+           describe('inner', () => {\n\
+             beforeEach(() => { throw new Error('each-boom'); });\n\
+             test('e1', () => { console.log('E1_BODY'); });\n\
+           });\n\
+         });\n\
+         describe('good', () => {\n\
+           beforeAll(() => { console.log('GOOD_SETUP'); });\n\
+           afterAll(() => { console.log('GOOD_TEARDOWN'); });\n\
+           test('g', () => {});\n\
+           test.todo('later');\n\
+         });",
+    );
+    let dir = write_temp("runner_hook_scope/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = oam(&["test", dir.to_str().unwrap()]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "output: {combined}");
+    for absent in [
+        "SKIPPED_SETUP",
+        "SKIPPED_TEARDOWN",
+        "B1_BODY",
+        "NESTED_SETUP",
+        "F1_BODY",
+        "E1_BODY",
+    ] {
+        assert!(
+            !combined.contains(absent),
+            "{absent} ran; output: {combined}"
+        );
+    }
+    for present in [
+        "FAIL bad > b1",
+        "FAIL bad > nested > b2",
+        "beforeAll failed: setup-boom",
+        "EACH_OPEN",
+        "EACH_CLOSE",
+        "FAIL each > inner > e1",
+        "GOOD_SETUP",
+        "GOOD_TEARDOWN",
+        "ok   good > g",
+        "todo good > later",
+        "FAIL falsy > f1",
+        "beforeAll failed: beforeAll threw 0",
+        "1 passed, 4 failed, 1 skipped, 1 todo",
+    ] {
+        assert!(
+            combined.contains(present),
+            "missing {present}; output: {combined}"
+        );
+    }
+
+    // Under a filter only the matching suite's hooks run, and a todo that
+    // does not match is not reported.
+    let out = oam(&["test", dir.to_str().unwrap(), "-t", "good > g"]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "output: {combined}");
+    assert!(combined.contains("GOOD_SETUP"), "output: {combined}");
+    assert!(!combined.contains("EACH_OPEN"), "output: {combined}");
+    assert!(!combined.contains("later"), "output: {combined}");
+    assert!(!combined.contains("setup-boom"), "output: {combined}");
+
+    // describe.only inside describe.skip does not escape the skip.
+    write_temp(
+        "runner_only_in_skip/nested.test.ts",
+        "import { test, describe } from 'oam:test';\n\
+         describe.skip('outer', () => {\n\
+           describe.only('inner', () => {\n\
+             test('x', () => { throw new Error('ran-inside-skip'); });\n\
+           });\n\
+         });",
+    );
+    let dir = write_temp("runner_only_in_skip/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = oam(&["test", dir.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("ran-inside-skip"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("skip outer > inner > x"),
+        "stderr: {stderr}"
+    );
+}
+
 #[test]
 fn oam_test_timeout_and_no_files_are_clear_failures() {
     write_temp(
@@ -14012,6 +15628,35 @@ fn oam_test_timeout_and_no_files_are_clear_failures() {
     assert!(!out.status.success());
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("no test files found"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A path named on the `oam test` command line must exist: a mistyped one
+/// beside a real one fails the run and is named, instead of being skipped
+/// while the real file's pass makes the exit code 0.
+#[test]
+fn oam_test_refuses_an_explicit_path_that_does_not_exist() {
+    let real = write_temp(
+        "runner_missing_path/real.test.ts",
+        "import { test } from 'oam:test';\ntest('passes', () => {});",
+    );
+    let missing = real.with_file_name("typo.test.ts");
+    let out = oam(&["test", missing.to_str().unwrap(), real.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a missing explicit path must fail the run; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no such file or directory") && stderr.contains("typo.test.ts"),
+        "the missing path must be named; stderr: {stderr}"
+    );
+    // The real file alone still passes.
+    let out = oam(&["test", real.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -14063,6 +15708,22 @@ fn jsx_without_a_runtime_is_a_clear_diagnostic_not_a_crash() {
 console.log(a);
 ",
     );
+    // Resolution walks every ancestor's node_modules, so a `react` installed
+    // above the temp dir (on Windows it sits under the user profile, so
+    // ~/node_modules counts) makes this run succeed for a reason outside oam.
+    if let Some(found) = file
+        .parent()
+        .unwrap()
+        .ancestors()
+        .map(|d| d.join("node_modules").join("react"))
+        .find(|p| p.exists())
+    {
+        eprintln!(
+            "skipping: {} is resolvable from the temp dir",
+            found.display()
+        );
+        return;
+    }
     let out = oam(&["run", file.to_str().unwrap(), "--json"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -14214,11 +15875,10 @@ fn require_of_commonjs_jsx_transpiles_via_interop() {
     )
     .expect("write entry");
 
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(["run", dir.join("main.cjs").to_str().unwrap()])
-        .env("OAM_CACHE_DIR", dir.join("cache"))
-        .output()
-        .expect("oam binary runs");
+    let out = bounded_output(
+        oam_command(&["run", dir.join("main.cjs").to_str().unwrap()])
+            .env("OAM_CACHE_DIR", dir.join("cache")),
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
@@ -14416,6 +16076,27 @@ fn dot_and_backslash_specifiers_are_invalid_not_bare() {
         String::from_utf8_lossy(&out.stderr).contains("OAM-MOD0004"),
         "'.' should be invalid-specifier, not bare"
     );
+
+    // A backslash is never a path separator in a specifier: `.\name` is
+    // invalid even with the file it would name on Windows sitting right
+    // there, and a backslash inside a bare-looking name is not looked up as
+    // a package either. (The JS literal `'.\\x'` is the specifier `.\x`.)
+    write_temp("backslash_target.ts", "export const t = 1;");
+    for (name, source) in [
+        (
+            "backslash_relative_main.ts",
+            "import '.\\\\backslash_target';",
+        ),
+        ("backslash_bare_main.ts", "import 'pkg\\\\sub';"),
+    ] {
+        let main = write_temp(name, source);
+        let out = oam(&["run", main.to_str().unwrap(), "--json"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && stderr.contains("OAM-MOD0004"),
+            "{source} should be invalid-specifier, not resolved and not bare; stderr: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -14776,11 +16457,11 @@ fn uncaught_microtask_exception_fails_the_run() {
 #[test]
 fn check_missing_tsgo_is_ts0000_via_env() {
     let file = write_temp("env_check.ts", "export const n: number = 1;");
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(["check", file.to_str().unwrap(), "--json", "--no-daemon"])
-        .env("OAM_TSGO", "/definitely/not/a/tsgo")
-        .output()
-        .unwrap();
+    // oam_command supplies the isolated OAM_CACHE_DIR this used to run without.
+    let out = bounded_output(
+        oam_command(&["check", file.to_str().unwrap(), "--json", "--no-daemon"])
+            .env("OAM_TSGO", "/definitely/not/a/tsgo"),
+    );
     assert!(!out.status.success());
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("OAM-TS0000"),
@@ -14804,13 +16485,13 @@ fn run_warn_reports_type_errors_without_blocking() {
         eprintln!("skipping: tsgo not installed");
         return;
     }
-    if stderr.contains("OAM-TS0005") {
-        // Warn mode's post-exit wait deadline hit before the (cold) checker
-        // finished -- a load artifact of the full-parallel suite, not a
-        // warn-mode defect; the ODIF marker proves warn mode reported it.
-        eprintln!("skipping: checker did not finish before the wait deadline");
-        return;
-    }
+    // No OAM-TS0005 skip any more (see run_clean_typescript_adds_no_noise):
+    // oam() gives the checker 60s after the program exits, so a missed
+    // deadline here is warn mode not delivering its report, and it fails.
+    assert!(
+        !stderr.contains("OAM-TS0005"),
+        "the checker missed the 60s post-exit wait: {stderr}"
+    );
     assert!(out.status.success(), "warn mode must not change exit code");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran anyway");
     assert!(
@@ -14947,6 +16628,77 @@ fn tsconfig_paths_resolve_in_run_and_check_agrees() {
     );
 }
 
+/// [`oam_command`] for a test that owns its cache world: a type-check
+/// daemon's state files, build-info and spawn-failure marker all live under
+/// `cache`, so nothing another test does can show up in them. Everything
+/// else is `oam_command`'s -- including OAM_DAEMON_IDLE_MS, the guard that
+/// has a daemon reap itself in 45s if its spawn or teardown ever breaks
+/// instead of wedging the suite. Run it with [`bounded_output`].
+fn oam_command_in_cache(cache: &std::path::Path, args: &[&str]) -> std::process::Command {
+    let mut cmd = oam_command(args);
+    cmd.env("OAM_CACHE_DIR", cache);
+    cmd
+}
+
+/// `oam daemon status <proj>`, parsed. `run` is the test's own invocation
+/// (its cache dir, its tsgo).
+fn daemon_status(run: &dyn Fn(&[&str]) -> Output, proj: &std::path::Path) -> serde_json::Value {
+    let out = run(&["daemon", "status", proj.to_str().unwrap()]);
+    serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap_or_else(|e| {
+        panic!(
+            "daemon status is JSON ({e}); stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+/// After a first `oam check <proj>` that passed: the daemon SERVES checks,
+/// and an unchanged re-check is answered from its cache.
+///
+/// Not "wins a 5s spawn race on the first one". `check` has a
+/// never-worse-than-one-shot contract: if the daemon is not ready within
+/// SPAWN_WAIT (5s, a production timeout tuned for how long a user should
+/// wait before falling back, not a test knob), the check runs one-shot and
+/// succeeds with checks_served still 0. On a loaded box -- a release build
+/// running underneath, which is the normal state of this one -- losing that
+/// race is expected behaviour, so demanding it of the FIRST check made a
+/// correct runtime look broken (measured: 1 pass in 3). So a second check
+/// may be the one the daemon serves. The property is unchanged and still
+/// load-bearing: the daemon comes up and serves checks; one that never
+/// serves any still fails.
+///
+/// The cache hit matters to a caller that goes on to edit the tree: a CACHED
+/// verdict is what the edit has to invalidate, and a daemon that never
+/// caches (a fill whose listing failed) would pass that assertion trivially.
+fn assert_daemon_serves_then_caches(run: &dyn Fn(&[&str]) -> Output, proj: &std::path::Path) {
+    let check = || run(&["check", proj.to_str().unwrap(), "--json"]);
+    if daemon_status(run, proj)["checks_served"]
+        .as_u64()
+        .unwrap_or(0)
+        == 0
+    {
+        let _ = check();
+    }
+    let status = daemon_status(run, proj);
+    assert_eq!(status["running"], true, "daemon should be up: {status}");
+    assert!(
+        status["checks_served"].as_u64().unwrap_or(0) >= 1,
+        "the daemon came up but served no check across two attempts: {status}"
+    );
+    let again = check();
+    assert!(
+        again.status.success(),
+        "unchanged re-check: {}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    let status = daemon_status(run, proj);
+    assert!(
+        status["cache_hits"].as_u64().unwrap_or(0) >= 1,
+        "the unchanged re-check must be served from the cache: {status}"
+    );
+}
+
 #[test]
 fn check_daemon_lifecycle_and_cache() {
     // Fully isolated daemon world: state files, build-info, and the daemon
@@ -14963,16 +16715,8 @@ fn check_daemon_lifecycle_and_cache() {
         .parent()
         .unwrap()
         .to_path_buf();
-    let oam_d = |args: &[&str]| -> Output {
-        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-            .args(args)
-            .env("OAM_CACHE_DIR", &cache)
-            // Regression guard: if daemon spawn/teardown ever breaks again,
-            // the daemon reaps itself in 45s instead of wedging the suite.
-            .env("OAM_DAEMON_IDLE_MS", "45000")
-            .output()
-            .expect("oam runs")
-    };
+    let oam_d =
+        |args: &[&str]| -> Output { bounded_output(&mut oam_command_in_cache(&cache, args)) };
 
     let first = oam_d(&["check", proj.to_str().unwrap()]);
     if !tsgo_available(&first) {
@@ -14985,49 +16729,9 @@ fn check_daemon_lifecycle_and_cache() {
         String::from_utf8_lossy(&first.stderr)
     );
 
-    // The daemon SERVES checks -- not "wins a 5s spawn race on the first one".
-    //
-    // `check` has a never-worse-than-one-shot contract: if the daemon is not
-    // ready within SPAWN_WAIT (5s, a production timeout tuned for how long a
-    // user should wait before falling back, not a test knob), the check runs
-    // one-shot and succeeds with checks_served still 0. On a loaded box -- a
-    // release build running underneath, which is the normal state of this one
-    // -- losing that race is expected behaviour, so demanding it on the FIRST
-    // check made a correct runtime look broken. Measured here: 1 pass in 3 with
-    // this change absent, and it fails the same way on main.
-    //
-    // So allow a second check to be the one the daemon serves. The property
-    // under test is unchanged and still load-bearing: the daemon comes up, and
-    // it serves checks. A daemon that never serves one still fails.
-    let mut parsed: serde_json::Value = serde_json::from_str(
-        String::from_utf8_lossy(&oam_d(&["daemon", "status", proj.to_str().unwrap()]).stdout)
-            .trim(),
-    )
-    .unwrap();
-    if parsed["checks_served"].as_u64().unwrap_or(0) == 0 {
-        let _ = oam_d(&["check", proj.to_str().unwrap()]);
-        parsed = serde_json::from_str(
-            String::from_utf8_lossy(&oam_d(&["daemon", "status", proj.to_str().unwrap()]).stdout)
-                .trim(),
-        )
-        .unwrap();
-    }
-    assert_eq!(parsed["running"], true, "daemon should be up: {parsed}");
-    assert!(
-        parsed["checks_served"].as_u64().unwrap() >= 1,
-        "the daemon came up but served no check across two attempts: {parsed}"
-    );
-
-    // Unchanged tree: second check must be served from the daemon cache.
-    let second = oam_d(&["check", proj.to_str().unwrap()]);
-    assert!(second.status.success());
-    let status = oam_d(&["daemon", "status", proj.to_str().unwrap()]);
-    let parsed: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).unwrap();
-    assert!(
-        parsed["cache_hits"].as_u64().unwrap() >= 1,
-        "repeat check should cache-hit: {parsed}"
-    );
+    // The daemon comes up and serves a check (the first may lose the spawn
+    // race), and on an unchanged tree the next one is a cache hit.
+    assert_daemon_serves_then_caches(&oam_d, &proj);
 
     // Edited tree: diagnostics stay correct (a NEW error must surface).
     write_temp("daemonproj/ok.ts", "export const n: number = 'broken';");
@@ -15082,14 +16786,8 @@ fn check_daemon_cache_invalidates_on_checkjs_and_nested_target_edits() {
         .parent()
         .unwrap()
         .to_path_buf();
-    let oam_d = |args: &[&str]| -> Output {
-        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-            .args(args)
-            .env("OAM_CACHE_DIR", &cache)
-            .env("OAM_DAEMON_IDLE_MS", "45000")
-            .output()
-            .expect("oam runs")
-    };
+    let oam_d =
+        |args: &[&str]| -> Output { bounded_output(&mut oam_command_in_cache(&cache, args)) };
 
     let first = oam_d(&["check", proj.to_str().unwrap()]);
     if !tsgo_available(&first) {
@@ -15144,8 +16842,6 @@ fn check_daemon_cache_invalidates_on_checkjs_and_nested_target_edits() {
     let _ = oam_d(&["daemon", "stop", proj.to_str().unwrap()]);
 }
 
-/// Write a fake tsgo script; returns the path to point OAM_TSGO at.
-/// `body_unix`/`body_windows` are the full script bodies.
 /// `path` spelled as the OS reports it for a cwd. A relative path is checked
 /// against process.cwd(), which getcwd(3) answers through real components:
 /// on macOS the temp dir is `/var/folders/...` and a cwd entered through it
@@ -15163,6 +16859,8 @@ fn cwd_spelling(path: &std::path::Path) -> PathBuf {
     }
 }
 
+/// Write a fake tsgo script; returns the path to point OAM_TSGO at.
+/// `body_unix`/`body_windows` are the full script bodies.
 fn write_fake_tsgo(name: &str, body_windows: &str, body_unix: &str) -> PathBuf {
     if cfg!(windows) {
         write_temp(&format!("{name}/tsgo.cmd"), body_windows)
@@ -15201,13 +16899,7 @@ fn check_rejects_an_impostor_tsgo_and_daemon_status_reports_why() {
         .unwrap()
         .to_path_buf();
     let run = |args: &[&str]| -> Output {
-        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-            .args(args)
-            .env("OAM_CACHE_DIR", &cache)
-            .env("OAM_DAEMON_IDLE_MS", "45000")
-            .env("OAM_TSGO", &fake)
-            .output()
-            .expect("oam runs")
+        bounded_output(oam_command_in_cache(&cache, args).env("OAM_TSGO", &fake))
     };
 
     let one_shot = run(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
@@ -15293,26 +16985,23 @@ fn daemon_status_gives_a_reason_with_every_spawn_failure() {
         .unwrap()
         .to_path_buf();
     let command = |args: &[&str]| {
-        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
+        let mut command = oam_command_in_cache(&cache, args);
         command
-            .args(args)
-            .env("OAM_CACHE_DIR", &cache)
-            .env("OAM_DAEMON_IDLE_MS", "45000")
             .env("OAM_TSGO_TIMEOUT_MS", "60000")
             .env("OAM_TSGO", &fake);
         command
     };
 
+    // Killed below, once status has been read: never waited on unbounded.
     let mut check = command(&["check", proj.to_str().unwrap()])
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("oam check starts");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let parsed: serde_json::Value = loop {
-        let status = command(&["daemon", "status", proj.to_str().unwrap()])
-            .output()
-            .expect("oam daemon status runs");
+        let status = bounded_output(&mut command(&["daemon", "status", proj.to_str().unwrap()]));
         let parsed: serde_json::Value =
             serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).unwrap();
         if parsed["spawn_failed_ms_ago"].is_u64() || std::time::Instant::now() >= deadline {
@@ -15374,13 +17063,10 @@ fn daemon_spawns_tsgo_without_a_console_window() {
         .parent()
         .unwrap()
         .to_path_buf();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(["check", proj.to_str().unwrap(), "--json"])
-        .env("OAM_CACHE_DIR", &cache)
-        .env("OAM_DAEMON_IDLE_MS", "45000")
-        .env("OAM_TSGO", &fake)
-        .output()
-        .expect("oam check runs");
+    let out = bounded_output(
+        oam_command_in_cache(&cache, &["check", proj.to_str().unwrap(), "--json"])
+            .env("OAM_TSGO", &fake),
+    );
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -15420,14 +17106,16 @@ fn check_tsgo_timeout_surfaces_as_a_diagnostic_not_a_hang() {
         .unwrap()
         .to_path_buf();
     let started = std::time::Instant::now();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(["check", file.to_str().unwrap(), "--json", "--no-daemon"])
-        // Isolate the version-probe disk cache along with everything else.
-        .env("OAM_CACHE_DIR", &cache)
+    let out = bounded_output(
+        // Its own cache: isolates the version-probe disk cache along with
+        // everything else.
+        oam_command_in_cache(
+            &cache,
+            &["check", file.to_str().unwrap(), "--json", "--no-daemon"],
+        )
         .env("OAM_TSGO", &fake)
-        .env("OAM_TSGO_TIMEOUT_MS", "1500")
-        .output()
-        .expect("oam runs");
+        .env("OAM_TSGO_TIMEOUT_MS", "1500"),
+    );
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -15739,14 +17427,7 @@ fn check_resolves_types_entries_from_the_projects_node_modules() {
     .parent()
     .unwrap()
     .to_path_buf();
-    let run = |args: &[&str]| -> Output {
-        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-            .args(args)
-            .env("OAM_CACHE_DIR", &cache)
-            .env("OAM_DAEMON_IDLE_MS", "45000")
-            .output()
-            .expect("oam runs")
-    };
+    let run = |args: &[&str]| -> Output { bounded_output(&mut oam_command_in_cache(&cache, args)) };
 
     let root_before = dir_entries(&proj);
     let one_shot = run(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
@@ -15796,42 +17477,9 @@ fn check_resolves_types_entries_from_the_projects_node_modules() {
         "stderr: {}",
         String::from_utf8_lossy(&via_daemon.stderr)
     );
-    // As in check_daemon_lifecycle_and_cache: the first check may lose the
-    // spawn race and run one-shot, so let the daemon serve one before the
-    // edit -- the invalidation below has to be the daemon's to get right.
-    let status = || -> serde_json::Value {
-        serde_json::from_str(
-            String::from_utf8_lossy(&run(&["daemon", "status", proj.to_str().unwrap()]).stdout)
-                .trim(),
-        )
-        .unwrap()
-    };
-    if status()["checks_served"].as_u64().unwrap_or(0) == 0 {
-        assert!(
-            run(&["check", proj.to_str().unwrap(), "--json"])
-                .status
-                .success()
-        );
-    }
-    assert!(
-        status()["checks_served"].as_u64().unwrap_or(0) >= 1,
-        "the daemon served no check across two attempts: {}",
-        status()
-    );
-    // A CACHED verdict is what the edit below has to invalidate: an
-    // unchanged re-check must be a hit first, or a daemon that never caches
-    // this shape (a fill whose listing failed) would pass the edit
-    // assertion trivially.
-    assert!(
-        run(&["check", proj.to_str().unwrap(), "--json"])
-            .status
-            .success()
-    );
-    assert!(
-        status()["cache_hits"].as_u64().unwrap_or(0) >= 1,
-        "the unchanged re-check must be served from the cache: {}",
-        status()
-    );
+    // The daemon serves a check and holds a CACHED verdict before the edit:
+    // the invalidation below has to be the daemon's to get right.
+    assert_daemon_serves_then_caches(&run, &proj);
     std::fs::write(
         &stub,
         "declare module \"node:fs\" { export function readFileSync(path: string, encoding: string): number; }\n",
@@ -15924,13 +17572,7 @@ process.exit(0);
         "#!/bin/sh\nexec node \"$(dirname \"$0\")/fake-tsgo.js\" \"$@\"\n",
     );
     let run = |args: &[&str]| -> Output {
-        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-            .args(args)
-            .env("OAM_CACHE_DIR", &cache)
-            .env("OAM_DAEMON_IDLE_MS", "45000")
-            .env("OAM_TSGO", &fake)
-            .output()
-            .expect("oam runs")
+        bounded_output(oam_command_in_cache(&cache, args).env("OAM_TSGO", &fake))
     };
 
     // One-shot: the wrapper run fails on a config-level problem, the bare
@@ -15962,38 +17604,10 @@ process.exit(0);
         "stderr: {}",
         String::from_utf8_lossy(&via_daemon.stderr)
     );
-    let status = || -> serde_json::Value {
-        serde_json::from_str(
-            String::from_utf8_lossy(&run(&["daemon", "status", proj.to_str().unwrap()]).stdout)
-                .trim(),
-        )
-        .unwrap()
-    };
-    if status()["checks_served"].as_u64().unwrap_or(0) == 0 {
-        assert!(
-            run(&["check", proj.to_str().unwrap(), "--json"])
-                .status
-                .success()
-        );
-    }
-    assert!(
-        status()["checks_served"].as_u64().unwrap_or(0) >= 1,
-        "the daemon served no check across two attempts: {}",
-        status()
-    );
     // The union has to produce a fingerprint the daemon CACHES against --
     // a fill whose listing errs caches nothing and would pass the edit
     // assertion below by re-running tsgo every time.
-    assert!(
-        run(&["check", proj.to_str().unwrap(), "--json"])
-            .status
-            .success()
-    );
-    assert!(
-        status()["cache_hits"].as_u64().unwrap_or(0) >= 1,
-        "the unchanged re-check must be served from the cache: {}",
-        status()
-    );
+    assert_daemon_serves_then_caches(&run, &proj);
     std::fs::write(&stub, "// BROKEN\n").unwrap();
     let after_edit = run(&["check", proj.to_str().unwrap(), "--json"]);
     let stderr = String::from_utf8_lossy(&after_edit.stderr);
@@ -16042,13 +17656,7 @@ fn check_inherits_a_list_of_type_packages_untouched() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr: {stderr}");
     assert!(!stderr.contains("OAM-TS"), "stderr: {stderr}");
-    let dir = proj.join("node_modules").join(".oam").join("ts-decls");
-    let wrapper = dir_entries(&dir)
-        .into_iter()
-        .find(|name| name.starts_with("project-") && name.ends_with(".json"))
-        .expect("wrapper written in-tree");
-    let json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(dir.join(wrapper)).unwrap()).unwrap();
+    let json = in_tree_wrapper(&proj);
     assert!(
         json.get("compilerOptions").is_none(),
         "nothing restated for a list of package names: {json}"
@@ -16137,16 +17745,42 @@ fn slashed(path: &std::path::Path) -> String {
 /// Diagnostics of a direct `tsgo -p tsconfig.json` run in `project` -- the
 /// oracle a check through oam's wrapper has to match -- as (code, file
 /// basename, line); a span-less one carries an empty name and line 0.
-/// Resolved the way oam resolves it when nothing overrides: `OAM_TSGO`, else
-/// the PATH name (the npm shim is `tsgo.cmd` on Windows).
-fn direct_tsgo_diagnostics(project: &std::path::Path) -> Vec<(String, String, u64)> {
-    let program = std::env::var("OAM_TSGO")
-        .unwrap_or_else(|_| if cfg!(windows) { "tsgo.cmd" } else { "tsgo" }.to_string());
-    let out = std::process::Command::new(program)
-        .args(["-p", "tsconfig.json", "--pretty", "false", "--noEmit"])
-        .current_dir(project)
-        .output()
-        .expect("tsgo spawns directly: oam just ran it");
+/// Resolved in oam's own candidate order (`tsgo_candidates`, oam_ts): an
+/// explicit `OAM_TSGO` alone; else the nearest `node_modules/.bin` shim
+/// walking up from the project, then the PATH names (`tsgo.cmd` and
+/// `tsgo.exe` on Windows) -- so the oracle is the tsgo oam just ran, not
+/// another version that happens to be on PATH. None when no candidate
+/// spawns from here: there is then no oracle to compare against.
+fn direct_tsgo_diagnostics(project: &std::path::Path) -> Option<Vec<(String, String, u64)>> {
+    let names: &[&str] = if cfg!(windows) {
+        &["tsgo.cmd", "tsgo.exe"]
+    } else {
+        &["tsgo"]
+    };
+    let candidates: Vec<PathBuf> = match std::env::var_os("OAM_TSGO") {
+        Some(explicit) => vec![PathBuf::from(explicit)],
+        None => {
+            let local = project.ancestors().find_map(|dir| {
+                let bin = dir.join("node_modules").join(".bin");
+                names
+                    .iter()
+                    .map(|name| bin.join(name))
+                    .find(|shim| shim.is_file())
+            });
+            local
+                .into_iter()
+                .chain(names.iter().map(|name| PathBuf::from(*name)))
+                .collect()
+        }
+    };
+    let out = candidates.iter().find_map(|program| {
+        std::process::Command::new(program)
+            .args(["-p", "tsconfig.json", "--pretty", "false", "--noEmit"])
+            .current_dir(project)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+    })?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut diagnostics = Vec::new();
     for line in stdout.lines() {
@@ -16173,7 +17807,7 @@ fn direct_tsgo_diagnostics(project: &std::path::Path) -> Vec<(String, String, u6
         diagnostics.push((format!("TS{code}"), file, line_no));
     }
     diagnostics.sort();
-    diagnostics
+    Some(diagnostics)
 }
 
 /// oam's ODIF JSONL, in the same shape.
@@ -16210,7 +17844,10 @@ fn assert_matches_direct_tsgo(
     stderr: &str,
     oam_import: Option<(&str, u64)>,
 ) {
-    let mut direct = direct_tsgo_diagnostics(project);
+    let Some(mut direct) = direct_tsgo_diagnostics(project) else {
+        eprintln!("skipping the direct-tsgo comparison: no tsgo candidate spawns from the test");
+        return;
+    };
     if let Some((file, line)) = oam_import {
         let missing = ("TS2307".to_string(), file.to_string(), line);
         let at = direct
@@ -16607,18 +18244,70 @@ fn check_reports_a_removed_base_url_like_tsgo() {
     );
 }
 
-#[test]
-fn mcp_serves_the_agent_loop_over_stdio() {
-    use std::io::{BufRead, BufReader, Write};
+/// One `oam mcp` session over stdio: `requests` go in one per line, stdin is
+/// closed (EOF ends the server loop cleanly), and every response line comes
+/// back with how long the server took to answer, close its stdout and exit.
+///
+/// Bounded by `within`. Reading stdout to EOF used to be the wait, so a
+/// server that never answered blocked its test for good, and an "answered in
+/// time" assertion placed after that read could only ever see a run that had
+/// finished. At the bound the server is killed and the panic carries what it
+/// had written. Built on [`oam_command`], so the `oam run` an `oam_run` call
+/// starts works in the suite's cache dir like every other invocation here.
+fn mcp_stdio_session(
+    requests: &[serde_json::Value],
+    within: std::time::Duration,
+) -> (Vec<serde_json::Value>, std::time::Duration) {
+    use std::io::Write;
 
-    let broken = write_temp("mcp_broken.ts", "import './does_not_exist';");
-
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .arg("mcp")
+    let mut child = oam_command(&["mcp"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("oam mcp spawns");
+    let stdout = drain_pipe(child.stdout.take().expect("piped stdout"));
+    {
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        for request in requests {
+            writeln!(stdin, "{request}").unwrap();
+        }
+        // Dropped here: the EOF the server loop ends on.
+    }
+    let started = std::time::Instant::now();
+    let status = loop {
+        let exited = child.try_wait().expect("child status readable");
+        if exited.is_some() && stdout.at_eof() {
+            break exited;
+        }
+        if started.elapsed() >= within {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let elapsed = started.elapsed();
+    let written = String::from_utf8_lossy(&stdout.taken()).into_owned();
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "`oam mcp` did not answer, close stdout and exit within {}s and was killed\nstdout so far: {written}",
+            within.as_secs()
+        );
+    };
+    assert!(
+        status.success(),
+        "clean exit on stdin EOF ({status}); stdout: {written}"
+    );
+    let responses: Vec<serde_json::Value> = written
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each response is JSON"))
+        .collect();
+    (responses, elapsed)
+}
+
+#[test]
+fn mcp_serves_the_agent_loop_over_stdio() {
+    let broken = write_temp("mcp_broken.ts", "import './does_not_exist';");
 
     let requests = [
         serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -16634,20 +18323,7 @@ fn mcp_serves_the_agent_loop_over_stdio() {
         serde_json::json!({"jsonrpc": "2.0", "id": 5, "method": "initialize",
             "params": {"protocolVersion": "2026-07-28", "clientInfo": {"name": "e2e"}}}),
     ];
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        for request in &requests {
-            writeln!(stdin, "{request}").unwrap();
-        }
-    }
-    drop(child.stdin.take()); // EOF ends the server loop cleanly.
-
-    let stdout = BufReader::new(child.stdout.take().unwrap());
-    let responses: Vec<serde_json::Value> = stdout
-        .lines()
-        .map(|l| serde_json::from_str(&l.unwrap()).expect("each response is JSON"))
-        .collect();
-    assert!(child.wait().unwrap().success(), "clean exit on stdin EOF");
+    let (responses, _) = mcp_stdio_session(&requests, OAM_DEADLINE);
 
     // 5 requests with ids -> 5 responses, in order; the notification none.
     assert_eq!(responses.len(), 5);
@@ -16676,35 +18352,18 @@ fn mcp_serves_the_agent_loop_over_stdio() {
 
 #[test]
 fn mcp_run_kills_hung_scripts_at_deadline() {
-    use std::io::{BufRead, BufReader, Write};
-
     // Legitimate Node keep-alive semantics: this script never exits.
     let hang = write_temp("mcp_hang.ts", "setInterval(() => {}, 1000);");
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .arg("mcp")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("oam mcp spawns");
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        let call = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "oam_run", "arguments": {"file": hang.to_str().unwrap(), "timeoutMs": 1500}}});
-        writeln!(stdin, "{call}").unwrap();
-    }
-    drop(child.stdin.take());
-
-    let started = std::time::Instant::now();
-    let stdout = BufReader::new(child.stdout.take().unwrap());
-    let responses: Vec<serde_json::Value> = stdout
-        .lines()
-        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
-        .collect();
-    assert!(child.wait().unwrap().success());
+    let call = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "oam_run", "arguments": {"file": hang.to_str().unwrap(), "timeoutMs": 1500}}});
+    // A deadline that never fires ends at the session's own bound (the
+    // server is killed and the test fails there); one that fires late fails
+    // the assertion below.
+    let (responses, elapsed) = mcp_stdio_session(&[call], std::time::Duration::from_secs(60));
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(20),
-        "deadline must fire, not hang"
+        elapsed < std::time::Duration::from_secs(20),
+        "deadline must fire, not hang ({elapsed:?})"
     );
 
     let payload: serde_json::Value = serde_json::from_str(
@@ -16737,8 +18396,6 @@ impl Drop for ReleaseOnDrop {
 /// runs until released, so the test proves something held the pipe.
 #[test]
 fn mcp_run_answers_at_the_deadline_while_a_grandchild_holds_stdout() {
-    use std::io::{BufRead, BufReader, Write};
-
     let stop = write_temp("mcp_grandchild/stop.flag", "");
     std::fs::remove_file(&stop).unwrap();
     let _release = ReleaseOnDrop(stop.clone());
@@ -16770,31 +18427,14 @@ fn mcp_run_answers_at_the_deadline_while_a_grandchild_holds_stdout() {
         ),
     );
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .arg("mcp")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("oam mcp spawns");
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        // Long enough for a loaded box to start the script and its child.
-        let call = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "oam_run", "arguments": {"file": parent.to_str().unwrap(), "timeoutMs": 8000}}});
-        writeln!(stdin, "{call}").unwrap();
-    }
-    drop(child.stdin.take());
-
-    let started = std::time::Instant::now();
-    let stdout = BufReader::new(child.stdout.take().unwrap());
-    let responses: Vec<serde_json::Value> = stdout
-        .lines()
-        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
-        .collect();
-    let elapsed = started.elapsed();
+    // Long enough for a loaded box to start the script and its child.
+    let call = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "oam_run", "arguments": {"file": parent.to_str().unwrap(), "timeoutMs": 8000}}});
+    // The session's bound is below the grandchild's own 90s, so an answer
+    // that waits for the grandchild fails here rather than passing late.
+    let (responses, elapsed) = mcp_stdio_session(&[call], std::time::Duration::from_secs(75));
     // Still holding the pipe when the answer came: the case under test.
     let held = alive.exists();
-    assert!(child.wait().unwrap().success());
     assert!(
         elapsed < std::time::Duration::from_secs(45),
         "the answer waited for the grandchild holding stdout ({elapsed:?})"
@@ -16819,35 +18459,23 @@ fn mcp_run_answers_at_the_deadline_while_a_grandchild_holds_stdout() {
 /// a check writes the file OAM_FAKE_TSGO_MARK names, then runs until the
 /// file OAM_FAKE_TSGO_STOP names exists (two minutes at most).
 fn stand_in_tsgo(dir: &str) -> PathBuf {
-    if cfg!(windows) {
-        write_temp(
-            &format!("{dir}/tsgo.cmd"),
-            "@echo off\r\n\
-             if \"%~1\"==\"--version\" (echo Version 7.0.0-dev& exit /b 0)\r\n\
-             type nul > \"%OAM_FAKE_TSGO_MARK%\"\r\n\
-             for /l %%i in (1,1,120) do (\r\n\
-             \x20 if exist \"%OAM_FAKE_TSGO_STOP%\" exit /b 0\r\n\
-             \x20 ping -n 2 127.0.0.1 >nul\r\n\
-             )\r\n\
-             exit /b 0\r\n",
-        )
-    } else {
-        let path = write_temp(
-            &format!("{dir}/tsgo"),
-            "#!/bin/sh\n\
-             if [ \"$1\" = \"--version\" ]; then echo 'Version 7.0.0-dev'; exit 0; fi\n\
-             : > \"$OAM_FAKE_TSGO_MARK\"\n\
-             i=0\n\
-             while [ $i -lt 120 ] && [ ! -e \"$OAM_FAKE_TSGO_STOP\" ]; do sleep 1; i=$((i+1)); done\n\
-             exit 0\n",
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        path
-    }
+    write_fake_tsgo(
+        dir,
+        "@echo off\r\n\
+         if \"%~1\"==\"--version\" (echo Version 7.0.0-dev& exit /b 0)\r\n\
+         type nul > \"%OAM_FAKE_TSGO_MARK%\"\r\n\
+         for /l %%i in (1,1,120) do (\r\n\
+         \x20 if exist \"%OAM_FAKE_TSGO_STOP%\" exit /b 0\r\n\
+         \x20 ping -n 2 127.0.0.1 >nul\r\n\
+         )\r\n\
+         exit /b 0\r\n",
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then echo 'Version 7.0.0-dev'; exit 0; fi\n\
+         : > \"$OAM_FAKE_TSGO_MARK\"\n\
+         i=0\n\
+         while [ $i -lt 120 ] && [ ! -e \"$OAM_FAKE_TSGO_STOP\" ]; do sleep 1; i=$((i+1)); done\n\
+         exit 0\n",
+    )
 }
 
 /// No tsconfig.json at or above `dir`: a check of a file there is one-shot,
@@ -16978,30 +18606,11 @@ fn a_spawn_with_extra_stdio_works_once_the_type_check_has_started() {
 
 #[test]
 fn mcp_run_treats_dash_prefixed_file_as_path() {
-    use std::io::{BufRead, BufReader, Write};
-
     // Pre-fix, file '--help' hit clap's flag parsing and returned a
     // success-shaped payload with clap's help text.
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .arg("mcp")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("oam mcp spawns");
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        let call = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "oam_run", "arguments": {"file": "--help"}}});
-        writeln!(stdin, "{call}").unwrap();
-    }
-    drop(child.stdin.take());
-
-    let stdout = BufReader::new(child.stdout.take().unwrap());
-    let responses: Vec<serde_json::Value> = stdout
-        .lines()
-        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
-        .collect();
-    assert!(child.wait().unwrap().success());
+    let call = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "oam_run", "arguments": {"file": "--help"}}});
+    let (responses, _) = mcp_stdio_session(&[call], OAM_DEADLINE);
 
     let payload: serde_json::Value = serde_json::from_str(
         responses[0]["result"]["content"][0]["text"]
@@ -17032,6 +18641,122 @@ fn dotted_basename_resolves_appended_extension() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "dotted");
 }
 
+/// The inspector target's WebSocket URL, read from the discovery endpoint as
+/// a debugger reads it: the upgrade is accepted only at the target's own
+/// `/<uuid>` path. `None` until the inspector is listening.
+async fn inspector_ws_url(port: u16) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .ok()?;
+    let request =
+        format!("GET /json/list HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.ok()?;
+    let response = String::from_utf8_lossy(&response);
+    let (_, rest) = response.split_once("\"webSocketDebuggerUrl\":\"")?;
+    Some(rest.split_once('"')?.0.to_string())
+}
+
+/// An `oam run --inspect[-brk]=127.0.0.1:0` child and its output.
+///
+/// Port 0 has oam bind a port the OS picks, and the test reads it from the
+/// banner. Picking one here first (bind, read the number, release) left a gap
+/// in which any of the suite's other listeners could take it: the child then
+/// failed to bind, or the client reached some other test's server.
+///
+/// The child is killed when this is dropped, so a test that panics while a
+/// `--inspect-brk` child is still waiting for a debugger does not leave it
+/// running (std's `Child` is not killed on drop).
+struct InspectedChild {
+    child: std::process::Child,
+    stdout: PipeSink,
+    stderr: PipeSink,
+}
+
+impl InspectedChild {
+    fn spawn(cmd: &mut std::process::Command) -> Self {
+        let mut child = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("oam binary spawns");
+        let stdout = drain_pipe(child.stdout.take().expect("piped stdout"));
+        let stderr = drain_pipe(child.stderr.take().expect("piped stderr"));
+        Self {
+            child,
+            stdout,
+            stderr,
+        }
+    }
+
+    /// The port in the `Debugger listening on ws://host:port/<uuid>` banner,
+    /// which is printed once the listener is bound.
+    fn port(&mut self) -> u16 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let stderr = String::from_utf8_lossy(&self.stderr.taken()).into_owned();
+            let port = stderr
+                .split_inclusive('\n')
+                .filter(|line| line.ends_with('\n'))
+                .find_map(|line| line.trim().strip_prefix("Debugger listening on ws://"))
+                .and_then(|rest| rest.split('/').next())
+                .and_then(|authority| authority.rsplit(':').next())
+                .and_then(|port| port.parse::<u16>().ok());
+            if let Some(port) = port {
+                return port;
+            }
+            let exited = self.child.try_wait().expect("child status readable");
+            if exited.is_some() || std::time::Instant::now() >= deadline {
+                panic!("no inspector banner (child exit status: {exited:?}); stderr: {stderr}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// The child's exit and whole output, or a panic (the child killed) if it
+    /// has not exited `within` that long.
+    fn finish(&mut self, within: std::time::Duration) -> Output {
+        let started = std::time::Instant::now();
+        let status = loop {
+            let exited = self.child.try_wait().expect("child status readable");
+            if exited.is_some() && self.stdout.at_eof() && self.stderr.at_eof() {
+                break exited;
+            }
+            if started.elapsed() >= within {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let (stdout, stderr) = (self.stdout.taken(), self.stderr.taken());
+        let Some(status) = status else {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            panic!(
+                "the inspected `oam` did not exit within {}s and was killed\nstdout so far: {}\nstderr so far: {}",
+                within.as_secs(),
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr),
+            );
+        };
+        Output {
+            status,
+            stdout,
+            stderr,
+        }
+    }
+}
+
+impl Drop for InspectedChild {
+    fn drop(&mut self) {
+        // No-ops once `finish` has reaped the child.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// End-to-end V8 Inspector: spawn `oam run --inspect-brk`, attach a real
 /// CDP-over-WebSocket client, drive the enable/run handshake, ride the
 /// break-on-start and `debugger;` pauses by resuming each, and confirm the
@@ -17040,15 +18765,8 @@ fn dotted_basename_resolves_appended_extension() {
 #[tokio::test]
 async fn inspector_attaches_pauses_on_debugger_and_resumes() {
     use futures_util::{SinkExt, StreamExt};
-    use std::process::Stdio;
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::Message;
-
-    // Grab a free port, then release it so the child can bind it.
-    let port = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    };
 
     let file = write_temp(
         "inspector/brk.mjs",
@@ -17059,25 +18777,24 @@ async fn inspector_attaches_pauses_on_debugger_and_resumes() {
         .unwrap()
         .to_path_buf();
 
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args([
-            "run",
-            &format!("--inspect-brk=127.0.0.1:{port}"),
-            file.to_str().unwrap(),
-        ])
-        .env("OAM_CACHE_DIR", cache)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("oam binary spawns");
+    // Declared before the drive: if the drive panics, dropping this kills
+    // the child, which would otherwise wait for a debugger indefinitely.
+    let mut child = InspectedChild::spawn(
+        oam_command(&["run", "--inspect-brk=127.0.0.1:0", file.to_str().unwrap()])
+            .env("OAM_CACHE_DIR", cache),
+    );
+    let port = child.port();
 
     // The whole drive is time-boxed so a regression can never hang CI.
     let drive = tokio::time::timeout(Duration::from_secs(25), async {
-        // The path is ignored by the server (it routes on the Upgrade
-        // header, not the URL), so a fixed path is fine.
-        let url = format!("ws://127.0.0.1:{port}/oam");
+        // The upgrade is accepted only at the target's own path, so the URL
+        // comes from discovery, as a debugger's does.
         let mut ws = None;
         for _ in 0..50 {
+            let Some(url) = inspector_ws_url(port).await else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
             match tokio_tungstenite::connect_async(&url).await {
                 Ok((stream, _)) => {
                     ws = Some(stream);
@@ -17122,7 +18839,9 @@ async fn inspector_attaches_pauses_on_debugger_and_resumes() {
 
     let paused = drive.await.expect("inspector drive did not time out");
 
-    let output = child.wait_with_output().expect("child exits");
+    // Bounded as well: the drive also ends when a recv times out, and the
+    // program can still be paused then. It is killed and reported here.
+    let output = child.finish(Duration::from_secs(30));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -17144,6 +18863,112 @@ async fn inspector_attaches_pauses_on_debugger_and_resumes() {
     );
 }
 
+/// A debugger that enabled the Debugger domain and then left must not leave
+/// the session armed: the program's next `debugger;` statement runs through,
+/// as it does with no debugger attached. The one V8 session outlives its
+/// client, so it used to stay enabled, and the statement paused the program
+/// in a loop waiting for a client that was gone.
+///
+/// The program reaches `debugger;` only once the driver has closed its
+/// socket and written the sentinel, with turns of the event loop in between
+/// for the runtime to see the disconnect.
+#[tokio::test]
+async fn inspector_disconnect_disarms_the_debugger() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let file = write_temp(
+        "inspector/disarm.mjs",
+        "import { existsSync } from 'node:fs';\n\
+         console.log('start');\n\
+         const done = process.env.OAM_TEST_DONE;\n\
+         for (let i = 0; i < 150 && !existsSync(done); i++) {\n\
+         await new Promise(r => setTimeout(r, 100));\n\
+         }\n\
+         await new Promise(r => setTimeout(r, 300));\n\
+         debugger;\n\
+         console.log('end');",
+    );
+    let done = file.parent().unwrap().join("disarm.done");
+    let _ = std::fs::remove_file(&done);
+    let cache = write_temp("oam-cache-disarm/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    let mut child = InspectedChild::spawn(
+        oam_command(&["run", "--inspect=127.0.0.1:0", file.to_str().unwrap()])
+            .env("OAM_CACHE_DIR", cache)
+            .env("OAM_TEST_DONE", &done),
+    );
+    let port = child.port();
+
+    let drive = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut ws = None;
+        for _ in 0..50 {
+            let Some(url) = inspector_ws_url(port).await else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            match tokio_tungstenite::connect_async(&url).await {
+                Ok((stream, _)) => {
+                    ws = Some(stream);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let mut ws = ws.expect("inspector accepts a WebSocket connection");
+
+        ws.send(Message::Text(
+            r#"{"id":7,"method":"Debugger.enable"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        // The domain is enabled once its response is back. V8 sends a
+        // `Debugger.scriptParsed` event for every script already loaded
+        // BEFORE that response (dozens: the runtime's own modules), so the
+        // wait is bounded by time, never by a count of messages.
+        let mut enabled = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if text.contains("\"id\":7") {
+                        enabled = true;
+                        break;
+                    }
+                }
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => break,
+                Ok(Some(Ok(_))) => {}
+                Err(_) => continue,
+            }
+        }
+        assert!(enabled, "no response to Debugger.enable");
+
+        let _ = ws.close(None).await;
+        drop(ws);
+    });
+    drive.await.expect("inspector drive did not time out");
+
+    // Released only now: the program goes on to its `debugger;` statement
+    // with no client attached.
+    std::fs::write(&done, "").unwrap();
+
+    let output = child.finish(Duration::from_secs(30));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "program should run to completion; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("start") && stdout.contains("end"),
+        "program output incomplete: {stdout:?}"
+    );
+}
+
 /// End-to-end reconnect: spawn `oam run --inspect`, attach a first WebSocket
 /// client, drive the enable/run handshake, send `Debugger.enable`, then close
 /// the WebSocket gracefully.  Re-connect a second WebSocket to the same
@@ -17157,15 +18982,8 @@ async fn inspector_attaches_pauses_on_debugger_and_resumes() {
 #[tokio::test]
 async fn inspector_reconnects_after_client_disconnect() {
     use futures_util::{SinkExt, StreamExt};
-    use std::process::Stdio;
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::Message;
-
-    // Grab a free port, then release it so the child can bind it.
-    let port = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    };
 
     // The program has to outlive both sessions, and it waits for the DRIVER to
     // say so rather than for a fixed sleep.  A fixed sleep is a hard deadline:
@@ -17193,18 +19011,12 @@ async fn inspector_reconnects_after_client_disconnect() {
         .unwrap()
         .to_path_buf();
 
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args([
-            "run",
-            &format!("--inspect=127.0.0.1:{port}"),
-            file.to_str().unwrap(),
-        ])
-        .env("OAM_CACHE_DIR", cache)
-        .env("OAM_TEST_DONE", &done)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("oam binary spawns");
+    let mut child = InspectedChild::spawn(
+        oam_command(&["run", "--inspect=127.0.0.1:0", file.to_str().unwrap()])
+            .env("OAM_CACHE_DIR", cache)
+            .env("OAM_TEST_DONE", &done),
+    );
+    let port = child.port();
 
     // Hang guard only, never the assertion.  It has to EXCEED the sum of the
     // inner retry budgets (5 s connect + 10 s drain, twice over) or a genuine
@@ -17212,12 +19024,19 @@ async fn inspector_reconnects_after_client_disconnect() {
     // assertion that knows what went wrong.  Still far below ci-local.sh's
     // 900 s cargo-test ceiling.
     let drive = tokio::time::timeout(Duration::from_secs(30), async {
-        let url = format!("ws://127.0.0.1:{port}/oam");
+        // The target's URL, from discovery (the upgrade is accepted only at
+        // the target's own path); the second client reuses it.
+        let mut url = String::new();
 
         // --- First client ---
         let mut ws1 = None;
         // Up to 5 s for the process to start and bind.
         for _ in 0..50 {
+            let Some(found) = inspector_ws_url(port).await else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            url = found;
             match tokio_tungstenite::connect_async(&url).await {
                 Ok((stream, _)) => {
                     ws1 = Some(stream);
@@ -17322,11 +19141,13 @@ async fn inspector_reconnects_after_client_disconnect() {
     let drive_result = drive.await;
     // Written however the drive ended, and BEFORE the expect: a drive that
     // failed must not leave the child polling out its whole ceiling, because
-    // the wait_with_output below would block for exactly that long.
+    // the wait below would last exactly that long.
     let _ = std::fs::write(&done, b"");
     let second_session_ok = drive_result.expect("reconnect drive did not time out");
 
-    let output = child.wait_with_output().expect("child exits");
+    // Above the program's own 15 s orphan guard, so only a child that fails
+    // to exit ends here.
+    let output = child.finish(Duration::from_secs(60));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -17661,6 +19482,87 @@ fn readable_stream_tee_survives_underlying_error() {
     );
 }
 
+#[test]
+fn web_streams_release_and_cancel_follow_node() {
+    // Four contracts, each line checked against node v22:
+    // - a pipe that ends while its read is pending gives that read up, so
+    //   the next enqueue lands in the source's queue;
+    // - the async iterator gives the lock back when the stream is done or
+    //   a read rejects;
+    // - cancelling both tee() branches cancels the source with both reasons;
+    // - TextEncoderStream joins a surrogate pair split across chunks, and
+    //   an unpaired trailing high surrogate is U+FFFD at the end.
+    let stdout = run_ok(
+        "web_streams_release_cancel.mjs",
+        "{\n\
+           let ctl;\n\
+           const rs = new ReadableStream({ start(c) { ctl = c; } });\n\
+           const got = [];\n\
+           const ws = new WritableStream({ write(c) { got.push(c); } });\n\
+           const ac = new AbortController();\n\
+           const piped = rs.pipeTo(ws, { signal: ac.signal, preventCancel: true, preventAbort: true });\n\
+           await new Promise((r) => setTimeout(r, 5));\n\
+           ac.abort();\n\
+           const outcome = await piped.then(() => 'resolved', (e) => e.name);\n\
+           let threw = 'no-throw';\n\
+           try { ctl.enqueue('x'); } catch (e) { threw = e.name; }\n\
+           const r = await rs.getReader().read();\n\
+           console.log('pipe', outcome, threw, r.value, got.length);\n\
+         }\n\
+         {\n\
+           const rs = ReadableStream.from(['a', 'b']);\n\
+           const seen = [];\n\
+           for await (const c of rs) seen.push(c);\n\
+           console.log('iter', seen.join(''), rs.locked);\n\
+           const bad = new ReadableStream({ start(c) { c.error(new Error('boom')); } });\n\
+           let msg = '';\n\
+           try { for await (const c of bad) seen.push(c); } catch (e) { msg = e.message; }\n\
+           console.log('iter-err', msg, bad.locked);\n\
+         }\n\
+         {\n\
+           let cancelled;\n\
+           const rs = new ReadableStream({ start(c) { c.enqueue('a'); }, cancel(r) { cancelled = r; } });\n\
+           const [a, b] = rs.tee();\n\
+           await Promise.all([a.cancel('r1'), b.cancel('r2')]);\n\
+           console.log('tee', JSON.stringify(cancelled));\n\
+         }\n\
+         {\n\
+           let ctl;\n\
+           const rs = new ReadableStream({ start(c) { ctl = c; } });\n\
+           const [a, b] = rs.tee();\n\
+           let settled = 'pending';\n\
+           a.cancel('x').then(() => { settled = 'resolved'; }, () => { settled = 'rejected'; });\n\
+           ctl.enqueue(1);\n\
+           await new Promise((r) => setTimeout(r, 5));\n\
+           ctl.error(new Error('src'));\n\
+           await new Promise((r) => setTimeout(r, 5));\n\
+           const r = await b.getReader().read().then(() => 'read', (e) => e.message);\n\
+           console.log('tee-err', settled, r);\n\
+         }\n\
+         {\n\
+           const tes = new TextEncoderStream();\n\
+           const w = tes.writable.getWriter();\n\
+           w.write('\\uD83D'); w.write('\\uDE00'); w.write('z\\uD83D'); w.close();\n\
+           const out = [];\n\
+           for await (const c of tes.readable) out.push(...c);\n\
+           console.log('enc', out.map((b) => b.toString(16)).join(' '));\n\
+         }",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "pipe AbortError no-throw x 0",
+            "iter ab false",
+            "iter-err boom false",
+            "tee [\"r1\",\"r2\"]",
+            "tee-err resolved src",
+            "enc f0 9f 98 80 7a ef bf bd",
+        ],
+        "stdout: {stdout}"
+    );
+}
+
 // ------------------------------------------------ node:url POSIX round trip
 
 /// POSIX-only fileURLToPath/pathToFileURL assertions that run on ALL
@@ -17744,10 +19646,12 @@ fn node_url_file_conversions_posix() {
     }
 }
 
-// ----------------------------------------- http 413 strict (all platforms)
+// ------------------------------- http 413 strict (Windows and Linux; ignored on macOS)
 
 /// Strict variant of `http_per_request_body_over_cap_returns_413_not_503`
-/// that asserts stdout == "413" exactly on every platform.
+/// that asserts stdout == "413" exactly -- on Windows and Linux. It is still
+/// ignored on macOS (see the attribute below), where only the loose test
+/// runs, and that one accepts any `ERR:*` as well as 413.
 ///
 /// The original test was cfg_attr-ignored on Windows because a 200 MB POST
 /// could race: the server rejects after reading 100 MB, drops the connection
@@ -17761,11 +19665,15 @@ fn node_url_file_conversions_posix() {
 ///   2. The test body is 110 MB (10 MB over cap) -- within the 16 MB drain
 ///      budget -- so the drain always completes and the FIN path wins.
 ///
-/// This replaces both the cfg_attr AND the 200 MB body.
+/// This replaces both the Windows cfg_attr AND the 200 MB body.
+///
+/// The macOS ignore dates from a hosted x86_64-apple-darwin runner the repo
+/// no longer uses; it has not been re-measured on the current mac release
+/// leg. Until it is, a 413 that regresses to a reset is not caught on macOS.
 #[test]
 #[cfg_attr(
     target_os = "macos",
-    ignore = "flakes on x86_64-apple-darwin GH runner; loose test covers macOS"
+    ignore = "flaked on a hosted x86_64-apple-darwin runner (since retired); not re-measured on the mac release leg -- only the loose test runs on macOS"
 )]
 fn http_per_request_body_over_cap_413_strict() {
     let stdout = run_ok(
@@ -17911,15 +19819,191 @@ w.on('message', (msg) => {{
     assert!(tid > 0, "worker threadId > 0");
 }
 
-// ------------------------------------------ url: portable parity cases
+/// `worker.terminate()` as node v22.22.2 reports it: the promise resolves
+/// with the exit code (1) once `'exit'` has been emitted, `'exit'` carries
+/// that code and fires once, `worker.stdout` ends, and a `terminate()` after
+/// the exit resolves `undefined`. It used to resolve 0 at once, emit `'exit'`
+/// with 0 and never end the streams.
+#[test]
+fn worker_terminate_reports_exit_once_and_ends_streams() {
+    let worker_script = write_temp(
+        "terminate_worker.cjs",
+        r#"const { parentPort } = require('worker_threads');
+parentPort.on('message', () => {});
+"#,
+    );
 
-/// Portable (all-platform) subset of `url_parity_fleet_regressions`.
-/// The parent test is cfg_attr-ignored on non-Windows because several of
-/// its assertions use Windows file:// shapes (drive letters, device paths).
-/// The cases extracted here are purely WHATWG-URL behavior with no
-/// file:// path assumptions: URLSearchParams astral chars, live-iteration
-/// delete, empty-query search, port setter, hostname setter no-op on ':',
-/// opaque-path setter, and urlToHttpOptions shape.
+    let worker_path = worker_script.to_string_lossy().replace('\\', "/");
+    let source = format!(
+        r#"const {{ Worker }} = require('worker_threads');
+const w = new Worker('{worker_path}', {{ stdout: true }});
+let exits = 0;
+w.stdout.on('end', () => console.log('stdout end'));
+w.stdout.resume();
+w.on('exit', (code) => {{ exits++; console.log('exit ' + code); }});
+w.on('online', async () => {{
+  const first = w.terminate();
+  const second = w.terminate();
+  console.log('terminate ' + (await first) + ' ' + (await second));
+  console.log('after exit ' + (await w.terminate()));
+  setTimeout(() => console.log('exits ' + exits), 50);
+}});
+"#,
+    );
+    let stdout = run_ok("worker_terminate_main.cjs", &source);
+    let mut lines: Vec<&str> = stdout.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(
+        lines,
+        [
+            "after exit undefined",
+            "exit 1",
+            "exits 1",
+            "stdout end",
+            "terminate 1 1",
+        ],
+        "stdout: {stdout}"
+    );
+}
+
+/// EventTarget / AbortSignal / structuredClone behaviours that are node's
+/// (every expected line below is what node v22.22.2 prints for this script):
+/// a null event init is accepted, `addEventListener`'s `signal` option
+/// removes the listener on abort and refuses a non-signal, a listener that
+/// throws neither stops the dispatch nor unwinds `abort()` (it is reported
+/// as an uncaught exception afterwards, as an async listener's rejection
+/// is), `onabort` sees the event's target,
+/// `AbortSignal.any` follows its sources, and a cloned Error keeps its
+/// class, message, stack and cause while a class instance clones plain.
+#[test]
+fn event_target_listener_semantics_match_node() {
+    let source = r#"
+process.on('uncaughtException', (e) => { console.log('uncaught', e.message); });
+console.log('null init', new Event('x', null).bubbles, new CustomEvent('y', null).detail);
+const ac = new AbortController();
+const et = new EventTarget();
+let calls = 0;
+et.addEventListener('x', () => calls++, { signal: ac.signal });
+et.dispatchEvent(new Event('x'));
+ac.abort();
+et.dispatchEvent(new Event('x'));
+et.addEventListener('x', () => (calls += 10), { signal: ac.signal });
+et.dispatchEvent(new Event('x'));
+console.log('signal option', calls);
+try { et.addEventListener('x', () => {}, { signal: 5 }); } catch (e) { console.log(e.code); }
+const c = new AbortController();
+c.signal.addEventListener('abort', () => { throw new Error('L1'); });
+c.signal.addEventListener('abort', () => console.log('L2 ran'));
+c.abort();
+console.log('abort returned');
+const h = new AbortController();
+h.signal.onabort = (e) => console.log('onabort target', e.target === h.signal, e.currentTarget === h.signal);
+h.abort();
+const a = new AbortController();
+const b = new AbortController();
+const any = AbortSignal.any([a.signal, b.signal]);
+any.addEventListener('abort', () => console.log('any aborted', any.reason));
+b.abort('why');
+a.abort('late');
+console.log('any reason', any.reason, AbortSignal.any([a.signal]).aborted);
+const e = new RangeError('boom', { cause: { a: 1 } });
+e.code = 'X';
+const k = structuredClone(e);
+console.log('clone', k instanceof RangeError, k.message, typeof k.stack, JSON.stringify(k.cause), k.code, Object.getOwnPropertyNames(k).sort().join());
+class A { constructor() { this.x = 1; } }
+const plain = structuredClone(new A());
+console.log('instance', Object.getPrototypeOf(plain) === Object.prototype, plain.x);
+console.log('inherits', structuredClone(Object.create(Error.prototype)) instanceof Error);
+process.on('unhandledRejection', (e) => { console.log('unhandled', e.message); });
+const t = new EventTarget();
+t.addEventListener('z', async () => { throw new Error('L3'); });
+t.dispatchEvent(new Event('z'));
+"#;
+    let stdout = run_ok("event_target_listener_semantics.mjs", source);
+    let expected = "null init false null\n\
+                    signal option 1\n\
+                    ERR_INVALID_ARG_TYPE\n\
+                    L2 ran\n\
+                    abort returned\n\
+                    onabort target true true\n\
+                    any aborted why\n\
+                    any reason why true\n\
+                    clone true boom string {\"a\":1} undefined cause,message,stack\n\
+                    instance true 1\n\
+                    inherits false\n\
+                    uncaught L1\n\
+                    uncaught L3";
+    // run_ok trims the output.
+    assert_eq!(stdout.replace("\r\n", "\n"), expected);
+}
+
+/// A binary message arrives as a Blob under the default `binaryType`, a
+/// Blob passed to `send()` goes out as its bytes ahead of the message sent
+/// after it, and an `on*` handler sees the socket as the event's target.
+#[test]
+fn websocket_blob_messages_and_handler_target() {
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            let stream = tokio::net::TcpStream::from_std(stream).unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            use futures_util::{SinkExt, StreamExt};
+            use tokio_tungstenite::tungstenite::Message;
+            while let Some(Ok(msg)) = ws.next().await {
+                match msg {
+                    Message::Text(text) => {
+                        ws.send(Message::Text(text)).await.ok();
+                    }
+                    Message::Binary(data) => {
+                        ws.send(Message::Binary(data)).await.ok();
+                    }
+                    Message::Close(frame) => {
+                        ws.send(Message::Close(frame)).await.ok();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    });
+
+    let source = format!(
+        r#"
+const ws = new WebSocket("ws://127.0.0.1:{port}");
+const seen = [];
+ws.onopen = (ev) => {{
+  console.log("open target", ev.target === ws, ev.currentTarget === ws);
+  ws.send(new Blob(["bl", "ob"]));
+  ws.send("after");
+}};
+ws.onmessage = async (ev) => {{
+  seen.push(ev.data);
+  if (seen.length < 2) return;
+  console.log("first", seen[0] instanceof Blob, await seen[0].text());
+  console.log("second", seen[1]);
+  ws.close();
+}};
+ws.onclose = (ev) => console.log("closed", ev.code, ev.target === ws);
+"#,
+        port = addr.port(),
+    );
+    let stdout = run_ok("websocket_blob.mjs", &source);
+    // run_ok trims the output.
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        "open target true true\nfirst true blob\nsecond after\nclosed 1000 true"
+    );
+}
+
 #[test]
 fn websocket_echo_round_trip() {
     use std::net::TcpListener;
@@ -17987,6 +20071,15 @@ ws.addEventListener("close", (ev) => {{
     );
 }
 
+// ------------------------------------------ url: portable parity cases
+
+/// Portable (all-platform) subset of `url_parity_fleet_regressions`.
+/// The parent test is cfg_attr-ignored on non-Windows because several of
+/// its assertions use Windows file:// shapes (drive letters, device paths).
+/// The cases extracted here are purely WHATWG-URL behavior with no
+/// file:// path assumptions: URLSearchParams astral chars, live-iteration
+/// delete, empty-query search, port setter, hostname setter no-op on ':',
+/// opaque-path setter, and urlToHttpOptions shape.
 #[test]
 fn url_parity_portable() {
     let stdout = run_ok(
@@ -18128,6 +20221,149 @@ console.log('defaultExtractDelta=' + typeof defaultExtractDelta);
     assert_eq!(lines[7], "defaultExtractDelta=function");
 }
 
+/// oam:ai's stream and tool-loop contracts that the `/stream` test above does
+/// not reach: every SSE line terminator (CRLF, lone CR, LF -- including a CRLF
+/// split across two chunks), the source being cancelled when the consumer
+/// stops early, a provider's mid-stream error frame surfacing as a throw
+/// rather than a short stream, and `runToolLoop` answering a tool call in the
+/// shape of the conversation it came from.
+#[test]
+fn oam_ai_sse_line_endings_cancel_error_frames_and_tool_result_shapes() {
+    let file = write_temp(
+        "ai_sse_contracts.mjs",
+        r#"import http from 'node:http';
+import { parseSSEStream, streamChat, runToolLoop } from 'oam:ai';
+
+const enc = new TextEncoder();
+function streamOf(parts, onCancel) {
+  let i = 0;
+  return new ReadableStream({
+    pull(c) {
+      if (i < parts.length) c.enqueue(enc.encode(parts[i++]));
+      else c.close();
+    },
+    cancel() { if (onCancel) onCancel(); },
+  });
+}
+async function collect(parts) {
+  const out = [];
+  for await (const ev of parseSSEStream(streamOf(parts))) out.push(ev);
+  return out;
+}
+
+// 1. CRLF line endings, with one CRLF split across two chunks.
+const crlf = await collect(['event: tick\r\ndata: a\r', '\n\r\ndata: b\r\ndata: c\r\n\r\n']);
+console.log('CRLF=' + JSON.stringify(crlf.map((e) => [e.event, e.data])));
+// 2. Lone-CR line endings, the last CR being the final byte of the stream.
+const cr = await collect(['data: x\r\rdata: y\r\r']);
+console.log('CR=' + JSON.stringify(cr.map((e) => e.data)));
+// 3. LF is unchanged.
+const lf = await collect(['data: p\n\ndata: q\n\n']);
+console.log('LF=' + JSON.stringify(lf.map((e) => e.data)));
+
+// 4. Leaving the loop early cancels the source; reading to the end does not.
+let cancelled = 0;
+for await (const ev of parseSSEStream(streamOf(['data: 1\n\n', 'data: 2\n\n', 'data: 3\n\n'], () => { cancelled += 1; }))) {
+  if (ev.data === '1') break;
+}
+console.log('CANCEL_ON_BREAK=' + cancelled);
+let cancelledFull = 0;
+for await (const ev of parseSSEStream(streamOf(['data: 1\n\n'], () => { cancelledFull += 1; }))) void ev;
+console.log('CANCEL_ON_END=' + cancelledFull);
+
+// 5. streamChat: [DONE] ends the stream, and a provider error frame throws.
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'content-type': 'text/event-stream' });
+  if (req.url === '/done') {
+    res.end('data: {"choices":[{"delta":{"content":"hi"}}]}\r\n\r\ndata: [DONE]\r\n\r\n');
+    return;
+  }
+  if (req.url === '/bare') {
+    res.end('data: {"error":{"message":"quota"}}\n\n');
+    return;
+  }
+  res.end(
+    'data: {"type":"content_block_delta","delta":{"text":"par"}}\n\n' +
+      'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"busy"}}\n\n',
+  );
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = 'http://127.0.0.1:' + server.address().port;
+async function drain(path) {
+  const got = [];
+  try {
+    for await (const d of streamChat({ url: base + path, body: {} })) got.push(d);
+    return got.join('') + '|ok';
+  } catch (err) {
+    return got.join('') + '|' + err.message;
+  }
+}
+console.log('DONE=' + (await drain('/done')));
+console.log('ERR=' + (await drain('/err')));
+console.log('BARE=' + (await drain('/bare')));
+server.close();
+
+// 6. runToolLoop answers each provider in its own shape.
+async function loop(first) {
+  let sent = null;
+  let turn = 0;
+  await runToolLoop({
+    chat: async (messages) => {
+      turn += 1;
+      if (turn === 1) return first;
+      sent = messages.slice(1);
+      return first.choices
+        ? { choices: [{ message: { role: 'assistant', content: 'done' } }] }
+        : { content: [{ type: 'text', text: 'done' }] };
+    },
+    messages: [{ role: 'user', content: 'go' }],
+    onToolCall: async ({ name, input }) => (name === 'a' ? 'ra' : { n: input.n ?? null }),
+  });
+  return sent;
+}
+const oai = await loop({
+  choices: [{ message: { role: 'assistant', content: null, tool_calls: [
+    { id: 'c1', type: 'function', function: { name: 'a', arguments: '' } },
+    { id: 'c2', type: 'function', function: { name: 'b', arguments: '{"n":2}' } },
+  ] } }],
+});
+console.log('OPENAI=' + JSON.stringify(oai.map((m) => [m.role, m.tool_call_id ?? null, typeof m.content === 'string' ? m.content : 'blocks'])));
+const anth = await loop({
+  content: [
+    { type: 'tool_use', id: 't1', name: 'a', input: {} },
+    { type: 'tool_use', id: 't2', name: 'b', input: { n: 3 } },
+  ],
+});
+console.log('ANTHROPIC=' + JSON.stringify(anth.map((m) => [m.role, Array.isArray(m.content) ? m.content.map((b) => b.type + ':' + (b.tool_use_id ?? b.id) + ':' + (b.content ?? '')) : m.content])));
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let ctx = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        out.status.success(),
+        "oam:ai contracts script failed. {ctx}"
+    );
+    for expected in [
+        r#"CRLF=[["tick","a"],["message","b\nc"]]"#,
+        r#"CR=["x","y"]"#,
+        r#"LF=["p","q"]"#,
+        "CANCEL_ON_BREAK=1",
+        "CANCEL_ON_END=0",
+        "DONE=hi|ok",
+        "ERR=par|streamChat: stream error -- busy",
+        "BARE=|streamChat: stream error -- quota",
+        r#"OPENAI=[["assistant",null,"blocks"],["tool","c1","ra"],["tool","c2","{\"n\":2}"]]"#,
+        r#"ANTHROPIC=[["assistant",["tool_use:t1:","tool_use:t2:"]],["user",["tool_result:t1:ra","tool_result:t2:{\"n\":3}"]]]"#,
+    ] {
+        assert!(
+            stdout.lines().any(|l| l == expected),
+            "missing line `{expected}`. {ctx}"
+        );
+    }
+}
+
 #[test]
 fn oam_mcp_module_stdio_transport() {
     // oam:mcp virtual module: McpServer with stdio transport processes
@@ -18181,23 +20417,10 @@ server.serve({ transport: 'stdio' });
         .parent()
         .unwrap()
         .to_path_buf();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(["run", file.to_str().unwrap()])
-        .env("OAM_CACHE_DIR", &cache)
-        .env("OAM_DAEMON_IDLE_MS", "45000")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                let _ = stdin.write_all(stdin_data.as_bytes());
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("oam binary runs");
+    let out = bounded_output_with_stdin(
+        oam_command(&["run", file.to_str().unwrap()]).env("OAM_CACHE_DIR", &cache),
+        stdin_data.as_bytes(),
+    );
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -18300,10 +20523,55 @@ console.log('HOST=' + process.env.HOST);
     assert_eq!(lines[1], "HOST=0.0.0.0");
 }
 
+/// The port in the worker pool's listening line
+/// (`oam serve: 127.0.0.1:<port> (N workers)`), or `None` when the line has
+/// not arrived by `limit` or stdout closed without it. Polls a drained pipe,
+/// so a server that starts and prints nothing costs `limit`, not the whole
+/// suite's ceiling the way a blocking `lines()` read did.
+fn pool_listening_port(stdout: &PipeSink, limit: std::time::Duration) -> Option<u16> {
+    let started = std::time::Instant::now();
+    loop {
+        // Read the flag first: bytes that land before EOF are then seen.
+        let eof = stdout.at_eof();
+        let text = String::from_utf8_lossy(&stdout.taken()).into_owned();
+        for line in text.lines() {
+            // "workers)" closes the line, so a half-read port is never parsed.
+            if !line.contains("workers)") {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("oam serve: 127.0.0.1:") {
+                return rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|p| p.parse::<u16>().ok());
+            }
+        }
+        if eof || started.elapsed() >= limit {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// One `Connection: close` request against a loopback server, with socket
+/// timeouts so a server that accepts and never answers fails the read here.
+fn pool_http_exchange(port: u16, request: &[u8]) -> String {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+        .expect("connect to the port the listening line names");
+    let limit = Some(std::time::Duration::from_secs(30));
+    stream.set_read_timeout(limit).unwrap();
+    stream.set_write_timeout(limit).unwrap();
+    stream.write_all(request).unwrap();
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("the server answers and closes within the socket timeout");
+    response
+}
+
 #[test]
 fn oam_serve_worker_pool_dispatches_requests() {
-    use std::io::{BufRead, Read, Write};
-
     // Handler that echoes method + url + a marker proving it ran in a worker.
     // Uses CJS module.exports so the worker shim can require() it.
     let handler = write_temp(
@@ -18322,8 +20590,9 @@ module.exports = function handler(req, res) {
 "#,
     );
 
-    // Pick a port unlikely to collide. Start oam serve with 2 workers.
-    let port = 19876u16;
+    // Start oam serve with 2 workers on a port the OS picks (`--port 0`): a
+    // fixed port collides with a second suite run on the same box. The
+    // listening line names the bound port.
     let cache = write_temp("pool-cache/.keep", "")
         .parent()
         .unwrap()
@@ -18333,7 +20602,7 @@ module.exports = function handler(req, res) {
             "serve",
             handler.to_str().unwrap(),
             "--port",
-            &port.to_string(),
+            "0",
             "--host",
             "127.0.0.1",
             "--workers",
@@ -18346,55 +20615,46 @@ module.exports = function handler(req, res) {
         .spawn()
         .expect("oam serve spawns");
 
-    // Wait for "listening" on stdout (the dispatcher prints it).
-    let stdout = child.stdout.take().unwrap();
-    let reader = std::io::BufReader::new(stdout);
-    let mut listening = false;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    for line in reader.lines() {
-        if std::time::Instant::now() > deadline {
-            break;
-        }
-        let line = line.unwrap_or_default();
-        if line.contains("workers)") {
-            listening = true;
-            break;
-        }
-    }
-    assert!(
-        listening,
-        "server did not print listening line within timeout"
-    );
+    // Wait (bounded) for the listening line the dispatcher prints on stdout.
+    // Both pipes are drained so a chatty server never blocks on a full one.
+    let stdout = drain_pipe(child.stdout.take().unwrap());
+    let stderr = drain_pipe(child.stderr.take().unwrap());
+    let Some(port) = pool_listening_port(&stdout, std::time::Duration::from_secs(30)) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "server did not print its listening line within the timeout\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&stdout.taken()),
+            String::from_utf8_lossy(&stderr.taken())
+        );
+    };
 
-    // Make two HTTP requests to verify dispatch works.
-    let client = std::net::TcpStream::connect(format!("127.0.0.1:{port}"));
-    assert!(client.is_ok(), "could not connect to server");
-
-    // Request 1: GET /hello
-    let mut stream = client.unwrap();
-    stream
-        .write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .unwrap();
-    let mut response1 = String::new();
-    stream.read_to_string(&mut response1).unwrap();
-    drop(stream);
-
-    // Request 2: POST /data with body
-    let mut stream2 = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    // Make two HTTP requests to verify dispatch works. A failed exchange
+    // must not leave the server running, so the kill comes before the unwrap.
     let post_body = r#"{"key":"value"}"#;
     let req2 = format!(
         "POST /data HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
         post_body.len(),
         post_body
     );
-    stream2.write_all(req2.as_bytes()).unwrap();
-    let mut response2 = String::new();
-    stream2.read_to_string(&mut response2).unwrap();
-    drop(stream2);
+    let exchanged = std::panic::catch_unwind(|| {
+        // Request 1: GET /hello
+        let response1 = pool_http_exchange(
+            port,
+            b"GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        // Request 2: POST /data with body
+        let response2 = pool_http_exchange(port, req2.as_bytes());
+        (response1, response2)
+    });
 
     // Kill the server.
     let _ = child.kill();
     let _ = child.wait();
+    let (response1, response2) = match exchanged {
+        Ok(responses) => responses,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
 
     // Verify response 1: GET /hello
     assert!(
@@ -18428,6 +20688,73 @@ module.exports = function handler(req, res) {
     assert!(body2["worker"].as_u64().unwrap() > 0, "worker threadId > 0");
 }
 
+/// `oam serve --workers N --port 0` binds a port the OS picks, as the
+/// single-isolate path does, not the 3000 default: 0 is a port request, not
+/// a missing one. The pool answers on the port its listening line names.
+#[test]
+fn oam_serve_worker_pool_port_zero_binds_an_os_chosen_port() {
+    let handler = write_temp(
+        "pool_port_zero/handler.cjs",
+        "module.exports = function handler(req, res) {\n\
+           res.writeHead(200, { 'content-type': 'text/plain' });\n\
+           res.end('pool-ok');\n\
+         };\n",
+    );
+    let cache = write_temp("pool-port-zero-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args([
+            "serve",
+            handler.to_str().unwrap(),
+            "--port",
+            "0",
+            "--host",
+            "127.0.0.1",
+            "--workers",
+            "2",
+        ])
+        .env("OAM_CACHE_DIR", &cache)
+        .env("OAM_DAEMON_IDLE_MS", "45000")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("oam serve spawns");
+
+    // "oam serve: 127.0.0.1:<port> (2 workers)", waited for with a deadline
+    // that can fire (a blocking line read could not).
+    let stdout = drain_pipe(child.stdout.take().unwrap());
+    let _stderr = drain_pipe(child.stderr.take().unwrap());
+    let port = pool_listening_port(&stdout, std::time::Duration::from_secs(30));
+    let response = port.map(|port| {
+        std::panic::catch_unwind(|| {
+            pool_http_exchange(
+                port,
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+        })
+    });
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let port = port.expect("the pool printed its listening line with a port");
+    assert_ne!(port, 0, "the listening line names the bound port");
+    assert_ne!(
+        port, 3000,
+        "--port 0 must not fall back to the default port"
+    );
+    let response = match response.unwrap() {
+        Ok(response) => response,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    assert!(
+        response.contains("200 OK") && response.contains("pool-ok"),
+        "response: {response}"
+    );
+}
+
 // --------------------------------------------------------- child_process
 
 #[test]
@@ -18445,8 +20772,9 @@ console.log("execSync:", out.toString().trim());
 const r = spawnSync("echo", ["spawn", "sync"], { shell: true });
 console.log("spawnSync:", Buffer.from(r.stdout).toString().trim(), "status:", r.status);
 
-// spawnSync without shell (direct executable)
-const r2 = spawnSync("node", ["-e", "console.log('node-direct')"]);
+// spawnSync without shell (direct executable). The child is this runtime
+// (process.execPath), so the test needs no `node` on PATH.
+const r2 = spawnSync(process.execPath, ["-e", "console.log('node-direct')"]);
 console.log("direct:", Buffer.from(r2.stdout).toString().trim(), "status:", r2.status);
 
 // execSync throws on non-zero exit
@@ -18458,7 +20786,7 @@ try {
 }
 
 // spawnSync with input
-const r3 = spawnSync("node", ["-e", "process.stdin.resume(); process.stdin.on('data', d => { process.stdout.write(d); process.stdin.pause(); });"], { input: "piped-in" });
+const r3 = spawnSync(process.execPath, ["-e", "process.stdin.resume(); process.stdin.on('data', d => { process.stdout.write(d); process.stdin.pause(); });"], { input: "piped-in" });
 console.log("input:", Buffer.from(r3.stdout).toString().trim());
 "#,
     );
@@ -18523,7 +20851,7 @@ fn child_process_close_waits_for_stdout_eof() {
         "cp_close_order.mjs",
         r#"
 import { spawn } from "child_process";
-const cp = spawn("node", ["-e", "process.stdout.write('payload-data')"], { shell: false });
+const cp = spawn(process.execPath, ["-e", "process.stdout.write('payload-data')"], { shell: false });
 let captured = "";
 let endBeforeClose = false;
 cp.on("spawn", () => {
@@ -18551,9 +20879,10 @@ fn child_process_spawn_stdin_piped() {
         "cp_stdin.mjs",
         r#"
 import { spawn } from "child_process";
-// Use node (portable) rather than cmd /c findstr (Windows-only -> ENOENT on
-// Unix). `node -e stdin.pipe(stdout)` echoes stdin like findstr ".*" did.
-const cp = spawn("node", ["-e", "process.stdin.pipe(process.stdout)"], { shell: false });
+// Use this runtime (portable, and always present) rather than cmd /c findstr
+// (Windows-only -> ENOENT on Unix) or a `node` that may not be installed.
+// `-e stdin.pipe(stdout)` echoes stdin like findstr ".*" did.
+const cp = spawn(process.execPath, ["-e", "process.stdin.pipe(process.stdout)"], { shell: false });
 const chunks = [];
 cp.stdout.on("data", (chunk) => chunks.push(chunk));
 cp.on("spawn", () => {
@@ -18580,7 +20909,14 @@ fn child_process_kill_terminates_child() {
         "cp_kill.mjs",
         r#"
 import { spawn } from "child_process";
-const cp = spawn("node", ["-e", "setTimeout(() => {}, 60000);"]);
+import { writeFileSync } from "fs";
+import { fileURLToPath } from "url";
+// The child is this runtime, so no `node` on PATH is needed. It runs a file
+// rather than `-e`: a killed `-e` child cannot remove the eval source it
+// wrote into the working directory.
+const childFile = fileURLToPath(new URL("./cp_kill_child.cjs", import.meta.url));
+writeFileSync(childFile, "setTimeout(() => {}, 60000);\n");
+const cp = spawn(process.execPath, [childFile]);
 cp.on("spawn", () => {
   console.log("kill-pid-type:", typeof cp.pid);
   setTimeout(() => {
@@ -18611,9 +20947,10 @@ fn child_process_spawn_echo() {
         "cp_echo.mjs",
         r#"
 import { spawn } from "child_process";
-// Use node (portable) rather than cmd /c echo (Windows-only -> ENOENT on
-// Unix). Tests spawn + stdout capture + exit code, not cmd specifically.
-const cp = spawn("node", ["-e", "process.stdout.write('hello')"], { shell: false });
+// Use this runtime (portable, and always present) rather than cmd /c echo
+// (Windows-only -> ENOENT on Unix) or a `node` that may not be installed.
+// Tests spawn + stdout capture + exit code, not cmd specifically.
+const cp = spawn(process.execPath, ["-e", "process.stdout.write('hello')"], { shell: false });
 const chunks = [];
 cp.on("spawn", () => {
   cp.stdout.on("data", (chunk) => chunks.push(chunk));
@@ -18846,8 +21183,6 @@ try {
 
 #[test]
 fn process_stdin_is_readable_stream() {
-    use std::io::Write;
-
     let f = write_temp(
         "stdin_read.mjs",
         r#"
@@ -18865,21 +21200,10 @@ console.log('isTTY:', process.stdin.isTTY);
         .parent()
         .unwrap()
         .to_path_buf();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(["run", f.to_str().unwrap()])
-        .env("OAM_CACHE_DIR", &cache)
-        .env("OAM_DAEMON_IDLE_MS", "45000")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn oam");
-
-    let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(b"hello world\ngoodbye world\n").unwrap();
-    drop(stdin);
-
-    let output = child.wait_with_output().unwrap();
+    let output = bounded_output_with_stdin(
+        oam_command(&["run", f.to_str().unwrap()]).env("OAM_CACHE_DIR", &cache),
+        b"hello world\ngoodbye world\n",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -18939,10 +21263,8 @@ b.close();
         .parent()
         .unwrap()
         .to_path_buf();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(["run", f.to_str().unwrap(), "--no-check"])
+    let mut child = oam_command(&["run", f.to_str().unwrap(), "--no-check"])
         .env("OAM_CACHE_DIR", &cache)
-        .env("OAM_DAEMON_IDLE_MS", "45000")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -18987,7 +21309,24 @@ b.close();
     }
     drop(stdin);
 
-    let status = child.wait().expect("oam exits");
+    // Bounded: a runtime that answered every prompt and then failed to exit
+    // costs this test, not the whole suite's ceiling.
+    let exit_deadline = Instant::now() + OAM_DEADLINE;
+    let status = loop {
+        match child.try_wait().expect("child status readable") {
+            Some(status) => break status,
+            None if Instant::now() >= exit_deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "oam did not exit within {}s of stdin closing and was killed; stdout so far: {}",
+                    OAM_DEADLINE.as_secs(),
+                    String::from_utf8_lossy(&seen.lock().unwrap())
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
     pump.join().unwrap();
     let stdout = String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
     let mut stderr = String::new();
@@ -19991,10 +22330,51 @@ fn os_and_process_native_values() {
          console.log('endianness:', os.endianness() === 'LE');\n\
          console.log('EOL:', os.EOL === '\\r\\n' || os.EOL === '\\n');",
     );
+    assert_true_lines(
+        &stdout,
+        &[
+            "release:",
+            "totalmem:",
+            "freemem:",
+            "cpu_count:",
+            "cpu_model:",
+            "cpu_speed:",
+            "cpu_times_integers:",
+            "cpu_times_nonzero:",
+            "cpu_times_advance:",
+            "loopback:",
+            "rss:",
+            "heapUsed:",
+            "heapTotal:",
+            "rss_fn:",
+            "v8_heap:",
+            "ppid:",
+            "platform:",
+            "arch:",
+            "homedir:",
+            "tmpdir:",
+            "hostname:",
+            "endianness:",
+            "EOL:",
+        ],
+    );
+}
+
+/// Every line of `stdout` is a `label: true` check that passed, AND every
+/// label in `required` was printed. The loop alone is vacuous on missing
+/// lines: a check printed from a callback that never fires, or a run that
+/// prints nothing at all, used to pass it.
+fn assert_true_lines(stdout: &str, required: &[&str]) {
     for line in stdout.lines() {
         assert!(
             line.ends_with("true"),
             "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+    for label in required {
+        assert!(
+            stdout.lines().any(|line| line.starts_with(label)),
+            "check `{label}` never printed\nfull output: {stdout}"
         );
     }
 }
@@ -20084,12 +22464,23 @@ fn fs_mkdtemp_symlink_readlink_link_chmod_truncate() {
          fs.rmSync(dir2, { recursive: true, force: true });\n\
          console.log('done:', true);",
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    assert_true_lines(
+        &stdout,
+        &[
+            "mkdtempSync:",
+            "mkdtemp:",
+            "symlinkSync:",
+            "readlinkSync:",
+            "symlink_async:",
+            "linkSync:",
+            "link_async:",
+            "truncateSync:",
+            "truncate_async:",
+            "chmodSync:",
+            "chmod_async:",
+            "done:",
+        ],
+    );
 }
 
 #[test]
@@ -20148,12 +22539,22 @@ fn http_request_and_get_client() {
             port = addr.port(),
         ),
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    assert_true_lines(
+        &stdout,
+        &[
+            "get_status:",
+            "get_method:",
+            "get_path:",
+            "post_status:",
+            "post_method:",
+            "post_echo:",
+            "setHeader:",
+            "removeHeader:",
+            // Printed from the 'error' listener: required, so a destroy that
+            // emits nothing is a failure and not a silent pass.
+            "destroy_hang_up:",
+        ],
+    );
     assert!(
         stdout.contains("destroy_hang_up: true"),
         "no 'socket hang up' from the destroyed request: {stdout}"
@@ -20196,12 +22597,9 @@ fn http_full_duplex_pipeline_echoes_while_request_streams() {
          console.log('echoed_all:', got === 'c1c2c3c4c5');\n\
          server.close();",
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    // `srv_pipeline_ok` prints from the server's pipeline callback: its
+    // absence is the failure, so it is required, not merely checked if seen.
+    assert_true_lines(&stdout, &["srv_pipeline_ok:", "echoed_all:"]);
 }
 
 #[test]
@@ -20253,12 +22651,7 @@ fn http_chunked_write_before_end_is_never_dropped() {
          console.log('count_15:', seen.length === 15);\n\
          server.close();",
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    assert_true_lines(&stdout, &["every_body_whole:", "count_15:"]);
 }
 
 #[test]
@@ -20296,12 +22689,9 @@ fn http_get_with_piped_body_dispatches_and_settles() {
          console.log('cli_settled_premature:', !!err && err.code === 'ERR_STREAM_PREMATURE_CLOSE');\n\
          server.close();",
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    // The server-side claim prints from the pipeline callback, so it must be
+    // required: a callback that never fires leaves no line to fail on.
+    assert_true_lines(&stdout, &["srv_pipeline_ok:", "cli_settled_premature:"]);
 }
 
 #[test]
@@ -20347,12 +22737,7 @@ fn http_body_keeps_streaming_after_early_response() {
          await srvDone;\n\
          server.close();",
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    assert_true_lines(&stdout, &["srv_got_all:", "cli_status:"]);
 }
 
 #[test]
@@ -20433,12 +22818,16 @@ fn http_streamed_body_backpressure_bounds_memory() {
          console.log('response_done:', done);\n\
          server.close();",
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    assert_true_lines(
+        &stdout,
+        &[
+            "echo_total:",
+            "writes_stalled:",
+            "rss_flat:",
+            "all_bytes_arrived:",
+            "response_done:",
+        ],
+    );
 }
 
 #[test]
@@ -20550,12 +22939,19 @@ fn process_versions_honest_keys() {
          }\n\
          console.log('node_first:', Object.keys(v)[0] === 'node');",
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    // The script is synchronous, so its last line proves it ran to the end;
+    // one label per loop proves the loops ran.
+    assert_true_lines(
+        &stdout,
+        &[
+            "zstd_is_libzstd:",
+            "has_icu:",
+            "has_unicode:",
+            "absent_uv:",
+            "absent_tz:",
+            "node_first:",
+        ],
+    );
 }
 
 // node:zlib's zstd loop calls the handle once per output window (16 KiB by
@@ -20679,7 +23075,8 @@ full output: {stdout}"
 #[test]
 fn process_versions_ada_is_the_vendored_cpp_version() {
     // The ada-url CRATE version and the ada C++ version it vendors are
-    // DIFFERENT numbers (3.4.5 vs 3.4.4 at the time of writing), and both are
+    // DIFFERENT numbers (3.4.5 vs 3.4.4 at the time of writing; they may
+    // coincide after a bump, which the last assertion allows for), and both are
     // shaped like a version -- so the regex check in
     // process_versions_honest_keys passes either way. Publishing the crate
     // number under a key node owns would be a quiet lie about which parser is
@@ -20753,11 +23150,16 @@ fn process_versions_ada_is_the_vendored_cpp_version() {
          {}, not the ada-url crate version ({crate_version})",
         header.display()
     );
-    assert_ne!(
-        published, crate_version,
-        "process.versions.ada is the ada-url CRATE version -- it must be the \
-         vendored C++ ADA_VERSION instead"
-    );
+    // Only meaningful while the two numbers differ: a future ada-url whose
+    // crate version equals its vendored ADA_VERSION is a correct build, and
+    // the assert_eq above already pins the answer to the vendored header.
+    if vendored != crate_version {
+        assert_ne!(
+            published, crate_version,
+            "process.versions.ada is the ada-url CRATE version -- it must be the \
+             vendored C++ ADA_VERSION instead"
+        );
+    }
 }
 
 #[test]
@@ -20795,12 +23197,21 @@ fn process_identity_properties_are_read_only() {
          try { process.platform = 'bogus'; } catch (e) { /* strict-mode TypeError */ }\n\
          console.log('assign_is_inert:', process.platform === before);",
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    assert_true_lines(
+        &stdout,
+        &[
+            "ro_version:",
+            "ro_pid:",
+            "features_non_configurable:",
+            "features_ro:",
+            "versions_members_ro:",
+            "versions_members_configurable:",
+            "release_members_ro:",
+            "versions_extensible:",
+            "versions_not_frozen:",
+            "assign_is_inert:",
+        ],
+    );
 }
 
 #[test]
@@ -20836,12 +23247,22 @@ fn system_error_name_round_trips_the_errno_oam_stamps() {
          console.log('unmapped_falls_back:',\n\
            util.getSystemErrorName(-999999) === 'Unknown system error -999999');",
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    assert_true_lines(
+        &stdout,
+        &[
+            "is_enoent:",
+            "errno_negative:",
+            "round_trips:",
+            "message_real:",
+            "map_realistic_size:",
+            "map_agrees_with_name:",
+            "map_has_the_stamped_errno:",
+            "eof_fixed:",
+            "unknown_fixed:",
+            "no_invented_eacces:",
+            "unmapped_falls_back:",
+        ],
+    );
 }
 
 #[test]
@@ -20885,12 +23306,10 @@ fn http_client_socket_event_and_headers() {
              console.log('response_ok:', result.length > 0);",
         ),
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    assert_true_lines(
+        &stdout,
+        &["headersSent_after:", "socket_fired:", "response_ok:"],
+    );
 }
 
 #[test]
@@ -20928,12 +23347,20 @@ fn submodule_imports_resolve() {
          // path/posix has join\n\
          console.log('path_posix:', pp.join('a', 'b') === 'a/b');",
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    assert_true_lines(
+        &stdout,
+        &[
+            "isDate:",
+            "isRegExp:",
+            "isArrayBuffer:",
+            "dns_promises:",
+            "readline_promises:",
+            "fs_promises:",
+            "stream_promises:",
+            "timers_promises:",
+            "path_posix:",
+        ],
+    );
 }
 
 #[test]
@@ -20974,12 +23401,10 @@ fn fs_promises_open_file_handle() {
          fs.rmSync(dir, { recursive: true, force: true });\n\
          console.log('done:', true);",
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    assert_true_lines(
+        &stdout,
+        &["readFile:", "stat:", "size:", "write_bytes:", "done:"],
+    );
 }
 
 // ----------------------------------------------------------------- crypto sign/verify
@@ -21074,7 +23499,26 @@ console.log('keyobj_roundtrip:', v3);
 const sig4 = crypto.createSign('RSA-SHA256').update('encode test').sign(privKey, 'base64');
 console.log('b64_sig:', typeof sig4 === 'string');
 const v4 = crypto.createVerify('RSA-SHA256').update('encode test').verify(pubKey, sig4, 'base64');
-console.log('b64_verify:', v4);"#,
+console.log('b64_verify:', v4);
+// A string signature with no encoding is utf8 (node), not base64.
+console.log('b64_no_encoding:', crypto.createVerify('RSA-SHA256').update('encode test').verify(pubKey, sig4) === false);
+
+// Key material as bytes, and a public key derived from a private one.
+const codeOf = (fn) => {{ try {{ fn(); return 'none'; }} catch (e) {{ return e.code; }} }};
+const privBytes = fs.readFileSync('{0}');
+console.log('priv_from_buffer:', crypto.createPrivateKey(privBytes).type === 'private');
+console.log('priv_from_arraybuffer:', crypto.createPrivateKey(new Uint8Array(privBytes).buffer).type === 'private');
+const sig5 = crypto.createSign('RSA-SHA256').update('bytes key').sign(crypto.createPrivateKey(privBytes));
+console.log('priv_from_buffer_signs:', crypto.createVerify('RSA-SHA256').update('bytes key').verify(pubKey, sig5));
+const derived = crypto.createPublicKey(privKey);
+console.log('pub_from_private_pem:', derived.type === 'public' && !String(derived.export({{ type: 'spki', format: 'pem' }})).includes('PRIVATE'));
+console.log('pub_from_private_pem_verifies:', crypto.createVerify('RSA-SHA256').update('bytes key').verify(derived, sig5));
+console.log('pub_from_private_bytes:', crypto.createVerify('RSA-SHA256').update('bytes key').verify(crypto.createPublicKey(privBytes), sig5));
+console.log('pub_from_wrapped_keyobject:', crypto.createPublicKey({{ key: privObj }}).type === 'public');
+console.log('pub_from_public_keyobject:', codeOf(() => crypto.createPublicKey(pubObj)) === 'ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE');
+console.log('priv_bad_type:', codeOf(() => crypto.createPrivateKey(123)) === 'ERR_INVALID_ARG_TYPE');
+console.log('priv_bad_key_type:', codeOf(() => crypto.createPrivateKey({{ key: 5 }})) === 'ERR_INVALID_ARG_TYPE');
+console.log('priv_from_keyobject:', codeOf(() => crypto.createPrivateKey(privObj)) === 'ERR_INVALID_ARG_TYPE');"#,
         priv_path.display().to_string().replace('\\', "/"),
         pub_path.display().to_string().replace('\\', "/"),
     );
@@ -21086,12 +23530,36 @@ console.log('b64_verify:', v4);"#,
     if !out.status.success() {
         panic!("crypto sign/verify failed:\nstdout: {stdout}\nstderr: {stderr}");
     }
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}\nstderr: {stderr}"
-        );
-    }
+    assert_true_lines(
+        &stdout,
+        &[
+            "sig_type:",
+            "sig_len:",
+            "verify_ok:",
+            "verify_tampered:",
+            "oneshot_sig:",
+            "oneshot_verify:",
+            "priv_type:",
+            "priv_asym:",
+            "pub_type:",
+            "pub_asym:",
+            "keyobj_roundtrip:",
+            "b64_sig:",
+            "b64_verify:",
+            "b64_no_encoding:",
+            "priv_from_buffer:",
+            "priv_from_arraybuffer:",
+            "priv_from_buffer_signs:",
+            "pub_from_private_pem:",
+            "pub_from_private_pem_verifies:",
+            "pub_from_private_bytes:",
+            "pub_from_wrapped_keyobject:",
+            "pub_from_public_keyobject:",
+            "priv_bad_type:",
+            "priv_bad_key_type:",
+            "priv_from_keyobject:",
+        ],
+    );
 }
 
 // ------------------------------------------------------------ process.cpuUsage / process.kill
@@ -21101,6 +23569,9 @@ fn process_cpu_usage_and_kill() {
     let path = write_temp(
         "process_cpu_kill.mjs",
         "import process from 'node:process';\n\
+         import { spawn } from 'node:child_process';\n\
+         import { writeFileSync } from 'node:fs';\n\
+         import { fileURLToPath } from 'node:url';\n\
          \n\
          // cpuUsage returns {user, system} in microseconds\n\
          const usage = process.cpuUsage();\n\
@@ -21118,26 +23589,382 @@ fn process_cpu_usage_and_kill() {
          // process.kill(pid, 0) checks if process exists (our own pid)\n\
          console.log('kill_self_check:', process.kill(process.pid, 0) === true);\n\
          \n\
-         // signal name support\n\
-         console.log('kill_sig_name:', process.kill(process.pid, 'SIGTERM') !== undefined || true);\n\
+         // An unknown signal name is refused before anything is signalled.\n\
+         let unknown;\n\
+         try { process.kill(process.pid, 'SIGNOPE'); } catch (e) { unknown = e; }\n\
+         console.log('kill_unknown_signal:', unknown instanceof TypeError && unknown.code === 'ERR_UNKNOWN_SIGNAL');\n\
+         \n\
+         // Signal-name support, aimed at a child so this process lives to\n\
+         // report it (a self-SIGTERM ends the script, and on Windows it is\n\
+         // TerminateProcess). node: a unix child dies of the signal; a\n\
+         // Windows child is terminated with exit code 1 and no signal.\n\
+         // The child runs a file, not `-e`: a killed `-e` child cannot\n\
+         // remove the eval source it wrote into the working directory.\n\
+         const childFile = fileURLToPath(new URL('./process_cpu_kill_child.cjs', import.meta.url));\n\
+         writeFileSync(childFile, 'setTimeout(() => {}, 60000);');\n\
+         const child = spawn(process.execPath, [childFile], { stdio: 'ignore' });\n\
+         await new Promise((r) => child.once('spawn', r));\n\
+         const exited = new Promise((r) => child.once('exit', (code, signal) => r({ code, signal })));\n\
+         console.log('kill_sig_name:', process.kill(child.pid, 'SIGTERM') === true);\n\
+         const how = await exited;\n\
+         console.log('kill_child_died:', process.platform === 'win32'\n\
+           ? how.code === 1 && how.signal === null\n\
+           : how.code === null && how.signal === 'SIGTERM');\n\
          console.log('done:', true);",
     );
     let out = oam(&["run", path.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // On Windows, process.kill sends TerminateProcess which kills the process
-    // immediately, so we can only test the existence check (signal 0) and
-    // cpuUsage. The SIGTERM test will kill the process, so we test it carefully.
-    // Just verify cpuUsage lines and signal-0 check.
-    let lines: Vec<&str> = stdout.lines().collect();
-    for line in &lines {
-        if line.starts_with("cpu_") || line.starts_with("kill_self_check:") {
-            assert!(
-                line.ends_with("true"),
-                "assertion failed: {line}\nfull output: {stdout}\nstderr: {stderr}"
-            );
-        }
-    }
+    assert!(
+        out.status.success(),
+        "exit {}\nstdout: {stdout}\nstderr: {stderr}",
+        out.status
+    );
+    assert_true_lines(
+        &stdout,
+        &[
+            "cpu_user:",
+            "cpu_system:",
+            "cpu_diff_user:",
+            "cpu_diff_system:",
+            "kill_self_check:",
+            "kill_unknown_signal:",
+            "kill_sig_name:",
+            "kill_child_died:",
+            "done:",
+        ],
+    );
+}
+
+/// `process.kill` reports the OS's own answer and sends the HOST's signal
+/// number. A pid that names no process is ESRCH (it used to be EPERM for
+/// every failure, so a liveness probe read a dead pid as alive), by probe and
+/// by signal alike; `os.constants.signals` is the host's table (SIGUSR1 is 10
+/// on Linux and 30 on macOS, and Windows has no SIGUSR1 at all); and on POSIX
+/// a child sent SIGUSR2 by name dies of SIGUSR2, which with one transcribed
+/// Linux table was a different signal on macOS.
+#[test]
+fn process_kill_reports_esrch_and_sends_the_hosts_signal() {
+    let path = write_temp(
+        "process_kill_host_signals.mjs",
+        r#"import process from 'node:process';
+import os from 'node:os';
+import { spawn } from 'node:child_process';
+
+// No process has this pid on any supported host.
+const NO_SUCH_PID = 2147483647;
+let probe;
+try { process.kill(NO_SUCH_PID, 0); } catch (e) { probe = e; }
+console.log('dead_probe_esrch:', !!probe && probe.code === 'ESRCH' && probe.syscall === 'kill'
+  && probe.message === 'kill ESRCH' && typeof probe.errno === 'number' && probe.errno < 0);
+let signalled;
+try { process.kill(NO_SUCH_PID, 'SIGTERM'); } catch (e) { signalled = e; }
+console.log('dead_signal_esrch:', !!signalled && signalled.code === 'ESRCH');
+
+const sigs = os.constants.signals;
+console.log('signals_common:', sigs.SIGINT === 2 && sigs.SIGKILL === 9 && sigs.SIGTERM === 15);
+const hostTable = process.platform === 'win32'
+  ? sigs.SIGABRT === 22 && sigs.SIGBREAK === 21 && sigs.SIGUSR1 === undefined
+  : process.platform === 'darwin'
+    ? sigs.SIGUSR1 === 30 && sigs.SIGUSR2 === 31 && sigs.SIGBUS === 10
+    : process.platform === 'linux'
+      ? sigs.SIGUSR1 === 10 && sigs.SIGUSR2 === 12 && sigs.SIGBUS === 7 && sigs.SIGINFO === undefined
+      : true;
+console.log('signals_host_table:', hostTable);
+
+if (process.platform === 'win32') {
+  // Windows has no SIGUSR2: the name is refused before anything is signalled.
+  let unknown;
+  try { process.kill(process.pid, 'SIGUSR2'); } catch (e) { unknown = e; }
+  console.log('usr2_by_name:', !!unknown && unknown.code === 'ERR_UNKNOWN_SIGNAL');
+} else {
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+  await new Promise((r) => child.once('spawn', r));
+  const exited = new Promise((r) => child.once('exit', (code, signal) => r({ code, signal })));
+  process.kill(child.pid, 'SIGUSR2');
+  const how = await exited;
+  console.log('usr2_by_name:', how.code === null && how.signal === 'SIGUSR2');
+}
+console.log('done:', true);
+"#,
+    );
+    let out = oam(&["run", path.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "exit {}\nstdout: {stdout}\nstderr: {stderr}",
+        out.status
+    );
+    assert_true_lines(
+        &stdout,
+        &[
+            "dead_probe_esrch:",
+            "dead_signal_esrch:",
+            "signals_common:",
+            "signals_host_table:",
+            "usr2_by_name:",
+            "done:",
+        ],
+    );
+}
+
+/// A name the dns ops cannot resolve is an asynchronous, coded failure, as in
+/// node: it reaches the callback. A name with a NUL byte or an over-long one
+/// used to throw a plain TypeError out of `dns.lookup()` / `dns.resolve4()`
+/// before any callback existed. The NUL names are answered without a resolver
+/// (ENOTFOUND, as node reports them); the over-long ones get whatever code
+/// the resolver gives a name it cannot encode, so only its presence is pinned.
+#[test]
+fn dns_unresolvable_names_fail_through_the_callback() {
+    let path = write_temp(
+        "dns_async_refusals.mjs",
+        r#"import dns from 'node:dns';
+
+const viaCallback = (start) => new Promise((resolve) => {
+  let threw = null;
+  try {
+    start((err) => resolve({ threw: null, err }));
+  } catch (e) {
+    threw = e;
+    resolve({ threw, err: null });
+  }
+});
+
+const nulLookup = await viaCallback((cb) => dns.lookup('a\0b', cb));
+console.log('lookup_nul_async:', nulLookup.threw === null && !!nulLookup.err
+  && nulLookup.err.code === 'ENOTFOUND' && nulLookup.err.syscall === 'getaddrinfo');
+
+const nulQuery = await viaCallback((cb) => dns.resolve4('a\0b', cb));
+console.log('resolve_nul_async:', nulQuery.threw === null && !!nulQuery.err
+  && nulQuery.err.code === 'ENOTFOUND' && nulQuery.err.syscall === 'queryA');
+
+const longQuery = await viaCallback((cb) => dns.resolve4('a'.repeat(300), cb));
+console.log('resolve_long_async:', longQuery.threw === null && !!longQuery.err
+  && typeof longQuery.err.code === 'string');
+
+const longLookup = await viaCallback((cb) => dns.lookup('a'.repeat(300), cb));
+console.log('lookup_long_async:', longLookup.threw === null && !!longLookup.err
+  && typeof longLookup.err.code === 'string');
+console.log('done:', true);
+"#,
+    );
+    let out = oam(&["run", path.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "exit {}\nstdout: {stdout}\nstderr: {stderr}",
+        out.status
+    );
+    assert_true_lines(
+        &stdout,
+        &[
+            "lookup_nul_async:",
+            "resolve_nul_async:",
+            "resolve_long_async:",
+            "lookup_long_async:",
+            "done:",
+        ],
+    );
+}
+
+// ------------------------------------------------------------ execSync / kill() result contract
+
+/// node's `execSync` / `execFileSync` forward a captured stderr when the
+/// caller gave no `stdio`, name the file and its arguments in the failure
+/// message, and assign the whole spawnSync result onto a spawn error; and
+/// `child.kill()` reports whether a signal went out (false after the exit
+/// and for a child that never started, `kill(0)` as the liveness probe, a
+/// signal by number). Each expectation was read off node v22.22.2.
+#[test]
+fn exec_sync_stderr_and_child_kill_results_match_node() {
+    let path = write_temp(
+        "exec_sync_kill_results.mjs",
+        r#"import { execFileSync, spawn } from 'node:child_process';
+import os from 'node:os';
+const exe = process.execPath;
+
+execFileSync(exe, ['-e', "process.stderr.write('fwd-marker-shown\\n')"]);
+execFileSync(exe, ['-e', "process.stderr.write('fwd-marker-piped\\n')"], { stdio: 'pipe' });
+
+let failed;
+try { execFileSync(exe, ['-e', 'process.exit(3)'], { stdio: 'pipe' }); } catch (e) { failed = e; }
+console.log('exec_file_message:', failed.message === `Command failed: ${exe} -e process.exit(3)`);
+console.log('exec_file_status:', failed.status === 3);
+
+let missing;
+try { execFileSync('oam-e2e-no-such-binary', ['a'], { stdio: 'pipe' }); } catch (e) { missing = e; }
+console.log('spawn_error_code:', missing.code === 'ENOENT');
+console.log('spawn_error_result:', 'status' in missing && Array.isArray(missing.output) && missing.error === missing);
+console.log('spawn_error_args:', JSON.stringify(missing.spawnargs) === '["a"]');
+
+const child = spawn(exe, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+await new Promise((r) => child.once('spawn', r));
+console.log('kill_probe_live:', child.kill(0) === true);
+let unknown;
+try { child.kill('SIGNOPE'); } catch (e) { unknown = e; }
+console.log('kill_unknown:', unknown !== undefined && unknown.code === 'ERR_UNKNOWN_SIGNAL');
+const exited = new Promise((r) => child.once('exit', r));
+console.log('kill_by_number:', child.kill(os.constants.signals.SIGTERM) === true);
+await exited;
+console.log('kill_after_exit:', child.kill() === false && child.kill(0) === false);
+
+const never = spawn('oam-e2e-no-such-binary', [], { stdio: 'ignore' });
+await new Promise((r) => never.once('error', r));
+console.log('kill_failed_spawn:', never.kill() === false && never.killed === false);
+console.log('done:', true);
+"#,
+    );
+    let out = oam(&["run", path.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "exit {}\nstdout: {stdout}\nstderr: {stderr}",
+        out.status
+    );
+    assert_true_lines(
+        &stdout,
+        &[
+            "exec_file_message:",
+            "exec_file_status:",
+            "spawn_error_code:",
+            "spawn_error_result:",
+            "spawn_error_args:",
+            "kill_probe_live:",
+            "kill_unknown:",
+            "kill_by_number:",
+            "kill_after_exit:",
+            "kill_failed_spawn:",
+            "done:",
+        ],
+    );
+    assert!(
+        stderr.contains("fwd-marker-shown"),
+        "a captured stderr is forwarded when no stdio was given\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("fwd-marker-piped"),
+        "an explicit stdio keeps the child's stderr with the caller\nstderr: {stderr}"
+    );
+}
+
+// ------------------------------------------------------------ diagnostics_channel stores / honest stubs
+
+/// `diagnostics_channel`: `runStores` passes the receiver and arguments,
+/// returns the function's result, publishes, and enters bound stores; a
+/// tracing channel with only an `end` subscriber is still traced; a throwing
+/// subscriber does not stop the others and surfaces as an uncaught exception.
+/// Then the surfaces that used to answer with constants: `perf_hooks`
+/// histograms record, `v8.startupSnapshot` refuses outside a build as node's
+/// does, `vm.measureMemory` reports a measured figure, `repl.start()` says it
+/// is not implemented, and `readline.emitKeypressEvents` emits `'keypress'`.
+/// The histogram and keypress values are node v22.22.2's for the same input.
+#[test]
+fn diagnostics_channel_stores_and_measured_surfaces() {
+    let path = write_temp(
+        "dc_stores_measured_surfaces.mjs",
+        r#"import dc from 'node:diagnostics_channel';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHistogram, monitorEventLoopDelay } from 'node:perf_hooks';
+import v8 from 'node:v8';
+import vm from 'node:vm';
+import readline from 'node:readline';
+import repl from 'node:repl';
+import { PassThrough } from 'node:stream';
+
+const ch = dc.channel('e2e:plain');
+const seen = [];
+ch.subscribe((m) => seen.push(m));
+const receiver = { k: 1 };
+const got = ch.runStores({ id: 7 }, function (a, b) { return [this === receiver, a + b]; }, receiver, 40, 2);
+console.log('run_stores_result:', got[0] === true && got[1] === 42);
+console.log('run_stores_published:', seen.length === 1 && seen[0].id === 7);
+const als = new AsyncLocalStorage();
+ch.bindStore(als, (m) => m.id);
+console.log('run_stores_store:', ch.runStores({ id: 9 }, () => als.getStore()) === 9);
+console.log('run_stores_idle:', dc.channel('e2e:idle').runStores({}, () => 5) === 5);
+
+const tc = dc.tracingChannel('e2e:trace');
+const ends = [];
+tc.subscribe({ end: (m) => ends.push(m) });
+console.log('trace_end_only:', tc.traceSync(() => 'r', { tag: 1 }) === 'r' && ends.length === 1 && ends[0].result === 'r');
+
+const uncaught = new Promise((r) => process.once('uncaughtException', r));
+const loud = dc.channel('e2e:loud');
+let second = false;
+loud.subscribe(() => { throw new Error('subscriber failed'); });
+loud.subscribe(() => { second = true; });
+loud.publish({});
+console.log('publish_continues:', second === true);
+console.log('publish_rethrows:', (await uncaught).message === 'subscriber failed');
+
+const h = createHistogram();
+for (const v of [1, 2, 3, 4, 100, 1000, 5]) h.record(v);
+console.log('histogram:', h.count === 7 && h.min === 1 && h.max === 1000 && h.percentile(50) === 4 && h.percentiles.get(75) === 100);
+const eld = monitorEventLoopDelay({ resolution: 10 });
+console.log('eld_enable:', eld.enable() === true && eld.enable() === false);
+await new Promise((r) => setTimeout(r, 150));
+console.log('eld_disable:', eld.disable() === true && eld.disable() === false);
+console.log('eld_recorded:', eld.count > 0 && eld.min > 0 && eld.max >= eld.min);
+
+const snap = [];
+for (const name of ['addSerializeCallback', 'addDeserializeCallback', 'setDeserializeMainFunction']) {
+  try { v8.startupSnapshot[name](() => {}); snap.push('returned'); } catch (e) { snap.push(e.code); }
+}
+console.log('snapshot_refused:', snap.every((c) => c === 'ERR_NOT_BUILDING_SNAPSHOT') && !v8.startupSnapshot.isBuildingSnapshot());
+console.log('version_tag:', Number.isInteger(v8.cachedDataVersionTag()));
+
+const mem = await vm.measureMemory();
+console.log('measure_memory:', mem.total.jsMemoryEstimate > 0 && mem.total.jsMemoryRange[1] === mem.total.jsMemoryEstimate);
+console.log('cached_data:', Buffer.isBuffer(new vm.Script('1 + 1').createCachedData()));
+
+let replError;
+try { repl.start(); } catch (e) { replError = e; }
+console.log('repl_start:', replError !== undefined && replError.code === 'ERR_METHOD_NOT_IMPLEMENTED');
+
+const input = new PassThrough();
+readline.emitKeypressEvents(input);
+const keys = [];
+input.on('keypress', (str, key) => keys.push([str, key.name, key.ctrl]));
+input.write('a\x1b[A\x03');
+await new Promise((r) => setTimeout(r, 50));
+console.log('keypress:', JSON.stringify(keys) === JSON.stringify([['a', 'a', false], [undefined, 'up', false], ['\x03', 'c', true]]));
+console.log('done:', true);
+"#,
+    );
+    let out = oam(&["run", path.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "exit {}\nstdout: {stdout}\nstderr: {stderr}",
+        out.status
+    );
+    assert_true_lines(
+        &stdout,
+        &[
+            "run_stores_result:",
+            "run_stores_published:",
+            "run_stores_store:",
+            "run_stores_idle:",
+            "trace_end_only:",
+            "publish_continues:",
+            "publish_rethrows:",
+            "histogram:",
+            "eld_enable:",
+            "eld_disable:",
+            "eld_recorded:",
+            "snapshot_refused:",
+            "version_tag:",
+            "measure_memory:",
+            "cached_data:",
+            "repl_start:",
+            "keypress:",
+            "done:",
+        ],
+    );
 }
 
 // ------------------------------------------------------------ fs.opendir + fs.cp
@@ -21211,12 +24038,24 @@ fn fs_opendir_and_cp() {
     if !out.status.success() {
         panic!("fs opendir/cp failed:\nstdout: {stdout}\nstderr: {stderr}");
     }
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}\nstderr: {stderr}"
-        );
-    }
+    assert_true_lines(
+        &stdout,
+        &[
+            "opendir_path:",
+            "sub_isDir:",
+            "opendir_count:",
+            "has_a:",
+            "has_b:",
+            "has_sub:",
+            "async_opendir_count:",
+            "cp_a:",
+            "cp_b:",
+            "cp_nested:",
+            "async_cp:",
+            "single_cp:",
+            "done:",
+        ],
+    );
 }
 
 #[test]
@@ -21628,9 +24467,13 @@ import crypto from 'node:crypto';
 const h1 = crypto.hash('sha256', 'hello', 'hex');
 console.log('sha256_hello=' + h1);
 
+// no encoding: node defaults to 'hex'
+const h0 = crypto.hash('sha256', 'hello');
+console.log('default_is_hex=' + (h0 === h1));
+
 // binary (buffer) output
-const h2 = crypto.hash('sha256', 'hello');
-console.log('is_buffer=' + (h2 instanceof Uint8Array));
+const h2 = crypto.hash('sha256', 'hello', 'buffer');
+console.log('is_buffer=' + Buffer.isBuffer(h2));
 console.log('buf_len=' + h2.length);
 
 // matches createHash
@@ -21660,6 +24503,7 @@ console.log('base64_len=' + h6.length);
     );
     let expected = [
         "sha256_hello=2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "default_is_hex=true",
         "is_buffer=true",
         "buf_len=32",
         "matches_createHash=true",
@@ -21674,9 +24518,11 @@ console.log('base64_len=' + h6.length);
             "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
         );
     }
-    assert!(
-        stdout.contains("base64_len="),
-        "missing base64 line.\nstdout: {stdout}\nstderr: {stderr}"
+    // 32 digest bytes are 44 base64 characters.
+    assert_eq!(
+        lines.get(expected.len()).copied(),
+        Some("base64_len=44"),
+        "base64 digest length.\nstdout: {stdout}\nstderr: {stderr}"
     );
 }
 
@@ -21917,8 +24763,12 @@ console.log('map_enoent=' + map.get(enoentErrno)[0]);
             "OAM_CACHE_DIR",
             write_temp("oam-cache2/.keep", "").parent().unwrap(),
         )
-        .output()
-        .unwrap();
+        // The values asserted below are the FILE's: a shell that exports one
+        // of these names must not decide the test either way.
+        .env_remove("FOO")
+        .env_remove("BAZ")
+        .env_remove("NUM")
+        .output_within_deadline();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -22622,6 +25472,170 @@ console.log('captureRejection=' + typeof events.captureRejectionSymbol);
     }
 }
 
+// Web/Buffer/events argument handling measured against node v22.22.2: the
+// expected lines below are that node's output for this same script.
+#[test]
+fn text_decoder_buffer_atob_event_emitter_argument_contracts() {
+    let file = write_temp(
+        "arg_contracts_nc1.mjs",
+        r#"
+import os from 'node:os';
+import { EventEmitter } from 'node:events';
+import { Buffer } from 'node:buffer';
+
+const shape = (fn) => {
+  try { return 'ok:' + JSON.stringify(fn()); }
+  catch (e) { return e.name + ':' + e.code; }
+};
+const full = (fn) => {
+  try { return 'ok:' + JSON.stringify(fn()); }
+  catch (e) { return e.name + ':' + e.code + ':' + e.message; }
+};
+
+// -- TextDecoder.decode takes a BufferSource only --
+console.log('decode_number=' + full(() => new TextDecoder().decode(5)));
+console.log('decode_string=' + shape(() => new TextDecoder().decode('abc')));
+console.log('decode_null=' + shape(() => new TextDecoder().decode(null)));
+console.log('decode_arraybuffer=' + shape(() => new TextDecoder().decode(new Uint8Array([65, 66]).buffer)));
+console.log('decode_dataview=' + shape(() => new TextDecoder().decode(new DataView(new Uint8Array([67]).buffer))));
+console.log('decode_undefined=' + shape(() => new TextDecoder().decode()));
+
+// -- a BOM split across stream chunks is still stripped --
+{
+  const d = new TextDecoder();
+  const s = d.decode(new Uint8Array([0xef]), { stream: true }) +
+    d.decode(new Uint8Array([0xbb, 0xbf, 0x41]));
+  console.log('bom_split=' + JSON.stringify(s));
+  const d2 = new TextDecoder();
+  const s2 = d2.decode(new Uint8Array(0), { stream: true }) +
+    d2.decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x41]));
+  console.log('bom_after_empty=' + JSON.stringify(s2));
+  const d3 = new TextDecoder();
+  const s3 = d3.decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x41]), { stream: true }) +
+    d3.decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x42]), { stream: true });
+  console.log('bom_only_at_head=' + (s3.length === 3 && s3.charCodeAt(1) === 0xfeff));
+}
+
+// -- the "Received" tail of ERR_INVALID_ARG_TYPE --
+const tail = (v) => {
+  try { Buffer.alloc(1).readUInt8(v); return 'no throw'; }
+  catch (e) { return e.message.slice(e.message.indexOf('Received')); }
+};
+console.log('tail_long_string=' + tail('a'.repeat(30)));
+console.log('tail_anonymous_fn=' + JSON.stringify(tail(() => {})));
+console.log('tail_symbol=' + tail(Symbol('x'.repeat(30))));
+console.log('tail_bigint=' + tail(123456789012345678901234567890123n));
+console.log('tail_null_proto=' + tail(Object.create(null)));
+console.log('tail_quote=' + tail("it's"));
+
+// -- Buffer#indexOf truncates a fractional byteOffset --
+const abc = Buffer.from('abcdef');
+console.log('indexOf_frac=' + [abc.indexOf('c', 1.5), abc.indexOf('c', 2.5), abc.indexOf('c', -4.5),
+  abc.indexOf(Buffer.from('c'), 1.9), abc.indexOf('c', 3.5)].join(','));
+
+// -- Buffer#swap* and Buffer#fill raise node's coded errors --
+console.log('swap16=' + full(() => Buffer.alloc(3).swap16()));
+console.log('swap64=' + full(() => Buffer.alloc(3).swap64()));
+console.log('fill_offset=' + full(() => Buffer.alloc(3).fill(1, -1)));
+console.log('fill_end=' + full(() => Buffer.alloc(3).fill(1, 0, 9)));
+console.log('fill_end_fraction=' + full(() => Buffer.alloc(3).fill(1, 0, 2.5)));
+console.log('fill_past_end=' + full(() => Array.from(Buffer.alloc(3).fill(1, 5))));
+console.log('fill_ok=' + full(() => Array.from(Buffer.alloc(3).fill(7, 1, 2))));
+
+// -- atob / btoa --
+const dom = (fn) => {
+  try { return 'ok:' + JSON.stringify(fn()); }
+  catch (e) { return e.name + ':' + e.code + ':' + (e instanceof DOMException); }
+};
+console.log('atob_invalid=' + dom(() => atob('*')));
+console.log('atob_nbsp=' + dom(() => atob('QUJD' + String.fromCharCode(0xa0) + ' ')));
+console.log('atob_bom=' + dom(() => atob('QUJD' + String.fromCharCode(0xfeff))));
+console.log('atob_vt=' + dom(() => atob('QUJD\v')));
+console.log('atob_ascii_ws=' + dom(() => atob(' QU\tJD\n\f\r')));
+console.log('btoa_wide=' + dom(() => btoa(String.fromCharCode(0x100))));
+
+// -- EventEmitter listener validation, and the once wrappers --
+const ee = new EventEmitter();
+for (const m of ['on', 'once', 'prependListener', 'prependOnceListener']) {
+  console.log(m + '=' + full(() => ee[m]('x', 5)));
+}
+console.log('on_long_string=' + full(() => ee.on('x', 'a'.repeat(30))));
+{
+  const cap = new EventEmitter({ captureRejections: true });
+  const seen = [];
+  cap.on('error', (e) => seen.push(e.message));
+  cap.prependOnceListener('a', async () => { throw new Error('from prependOnce'); });
+  cap.once('b', async () => { throw new Error('from once'); });
+  cap.emit('a');
+  cap.emit('b');
+  await new Promise((r) => setTimeout(r, 20));
+  console.log('captured=' + seen.join('|'));
+}
+
+// -- os.machine: "aarch64" is Linux's spelling only --
+console.log('machine_spelling=' + (os.machine() !== 'aarch64' || process.platform === 'linux'));
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "argument contracts failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "decode_number=TypeError:ERR_INVALID_ARG_TYPE:The \"list\" argument must be an instance of SharedArrayBuffer, ArrayBuffer or ArrayBufferView.",
+        "decode_string=TypeError:ERR_INVALID_ARG_TYPE",
+        "decode_null=TypeError:ERR_INVALID_ARG_TYPE",
+        "decode_arraybuffer=ok:\"AB\"",
+        "decode_dataview=ok:\"C\"",
+        "decode_undefined=ok:\"\"",
+        "bom_split=\"A\"",
+        "bom_after_empty=\"A\"",
+        "bom_only_at_head=true",
+        "tail_long_string=Received type string ('aaaaaaaaaaaaaaaaaaaaaaaaa...')",
+        "tail_anonymous_fn=\"Received function \"",
+        "tail_symbol=Received type symbol (Symbol(xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx))",
+        "tail_bigint=Received type bigint (123456789012345678901234567890123n)",
+        "tail_null_proto=Received [Object: null prototype] {}",
+        "tail_quote=Received type string (\"it's\")",
+        "indexOf_frac=2,2,2,2,-1",
+        "swap16=RangeError:ERR_INVALID_BUFFER_SIZE:Buffer size must be a multiple of 16-bits",
+        "swap64=RangeError:ERR_INVALID_BUFFER_SIZE:Buffer size must be a multiple of 64-bits",
+        "fill_offset=RangeError:ERR_OUT_OF_RANGE:The value of \"offset\" is out of range. It must be >= 0 && <= 9007199254740991. Received -1",
+        "fill_end=RangeError:ERR_OUT_OF_RANGE:The value of \"end\" is out of range. It must be >= 0 && <= 3. Received 9",
+        "fill_end_fraction=RangeError:ERR_OUT_OF_RANGE:The value of \"end\" is out of range. It must be an integer. Received 2.5",
+        "fill_past_end=ok:[0,0,0]",
+        "fill_ok=ok:[0,7,0]",
+        "atob_invalid=InvalidCharacterError:5:true",
+        "atob_nbsp=InvalidCharacterError:5:true",
+        "atob_bom=InvalidCharacterError:5:true",
+        "atob_vt=InvalidCharacterError:5:true",
+        "atob_ascii_ws=ok:\"ABC\"",
+        "btoa_wide=InvalidCharacterError:5:true",
+        "on=TypeError:ERR_INVALID_ARG_TYPE:The \"listener\" argument must be of type function. Received type number (5)",
+        "once=TypeError:ERR_INVALID_ARG_TYPE:The \"listener\" argument must be of type function. Received type number (5)",
+        "prependListener=TypeError:ERR_INVALID_ARG_TYPE:The \"listener\" argument must be of type function. Received type number (5)",
+        "prependOnceListener=TypeError:ERR_INVALID_ARG_TYPE:The \"listener\" argument must be of type function. Received type number (5)",
+        "on_long_string=TypeError:ERR_INVALID_ARG_TYPE:The \"listener\" argument must be of type function. Received type string ('aaaaaaaaaaaaaaaaaaaaaaaaa...')",
+        "captured=from prependOnce|from once",
+        "machine_spelling=true",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines.len(),
+        expected.len(),
+        "line count mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+    );
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn assert_iferror_events_getmax_util_tousvstring_process_extras() {
     let file = write_temp(
@@ -22662,8 +25676,14 @@ console.log('toUSV_type=' + typeof util.toUSVString);
 // -- process.debugPort, connected, constrainedMemory, availableMemory --
 console.log('debugPort=' + process.debugPort);
 console.log('connected=' + process.connected);
-console.log('constrainedMemory=' + process.constrainedMemory());
-console.log('availableMemory=' + process.availableMemory());
+// Shape, not value: node reports real byte counts here (constrainedMemory
+// is 0 only on an unconstrained host), so pinning oam's placeholder 0 would
+// turn an honest implementation red.
+const byteCount = (n) => Number.isInteger(n) && n >= 0;
+console.log('constrainedMemory=' + byteCount(process.constrainedMemory()));
+// availableMemory is the system's free memory: a running host has some, and
+// a constant 0 reads to a caller as "no memory".
+console.log('availableMemory=' + (byteCount(process.availableMemory()) && process.availableMemory() > 0));
 
 // -- crypto.getFips, secureHeapUsed --
 console.log('getFips=' + crypto.getFips());
@@ -22705,8 +25725,8 @@ console.log('sb_len=' + sb.length);
         "toUSV_type=function",
         "debugPort=9229",
         "connected=false",
-        "constrainedMemory=0",
-        "availableMemory=0",
+        "constrainedMemory=true",
+        "availableMemory=true",
         "getFips=0",
         "secureHeap_total=0",
         "secureHeap_used=0",
@@ -23060,7 +26080,8 @@ console.log('FileReadStream=' + typeof fs.FileReadStream);
 // -- events.EventEmitterAsyncResource --
 console.log('EEAR=' + typeof events.EventEmitterAsyncResource);
 const ear = new events.EventEmitterAsyncResource({ name: 'test' });
-console.log('ear_asyncId=' + ear.asyncId);
+// Shape, not value: node hands out a real (positive) async id here.
+console.log('ear_asyncId=' + (Number.isInteger(ear.asyncId) && ear.asyncId >= 0));
 ear.on('test', () => {});
 console.log('ear_listeners=' + ear.listenerCount('test'));
 "#,
@@ -23091,7 +26112,7 @@ console.log('ear_listeners=' + ear.listenerCount('test'));
         "WriteStream=function",
         "FileReadStream=function",
         "EEAR=function",
-        "ear_asyncId=0",
+        "ear_asyncId=true",
         "ear_listeners=1",
     ];
     let lines: Vec<&str> = stdout.trim().lines().collect();
@@ -23181,6 +26202,12 @@ if (win) {
     verdict = process.getuid() === 0 ? 'ok' : 'BAD:setuid-silently-did-nothing';
   } catch (e) {
     verdict = e.code === 'EPERM' ? 'ok' : 'BAD:setuid-threw-' + e.code;
+    // node's ErrnoException: errno is the host's positive number for the
+    // code (EPERM is 1 on linux and macOS), never the name, beside code and
+    // syscall.
+    if (verdict === 'ok' && e.errno !== 1) verdict = 'BAD:setuid-errno-' + String(e.errno);
+    if (verdict === 'ok' && e.syscall !== 'setuid') verdict = 'BAD:setuid-syscall-' + e.syscall;
+    if (verdict === 'ok' && e.message !== 'EPERM, Operation not permitted') verdict = 'BAD:setuid-message-' + e.message;
   }
   console.log('posix_identity_calls=' + (
     verdict === 'ok' && typeof process.getuid() === 'number' && Array.isArray(process.getgroups())
@@ -23288,13 +26315,24 @@ console.log('poel_getEntries=' + Array.isArray(poel.getEntries()));
 console.log('PerformanceNodeTiming=' + typeof PerformanceNodeTiming);
 console.log('nodeTiming_name=' + nodeTiming.name);
 console.log('nodeTiming_type=' + nodeTiming.entryType);
-console.log('nodeTiming_idleTime=' + nodeTiming.idleTime);
+// Shape, not value, for the three below: node reports real measurements
+// (idle ms, CPU microseconds, peak RSS), so pinning oam's placeholder 0s
+// would turn an honest implementation red.
+const nonNegative = (n) => typeof n === 'number' && n >= 0;
+console.log('nodeTiming_idleTime=' + nonNegative(nodeTiming.idleTime));
 
 // -- process.resourceUsage --
 const ru = process.resourceUsage();
 console.log('ru_type=' + typeof ru);
-console.log('ru_userCPU=' + ru.userCPUTime);
-console.log('ru_maxRSS=' + ru.maxRSS);
+console.log('ru_userCPU=' + nonNegative(ru.userCPUTime));
+// maxRSS is kilobytes of resident memory: a running process has some, and it
+// sits within a factor of two of memoryUsage.rss() read right beside it.
+const rssKb = process.memoryUsage.rss() / 1024;
+console.log('ru_maxRSS=' + (nonNegative(ru.maxRSS) && ru.maxRSS > 0 && ru.maxRSS < rssKb * 2 + 1024));
+// The CPU times are process.cpuUsage()'s clock: never ahead of a later read.
+const cpuAfter = process.cpuUsage();
+console.log('ru_cpuClock=' + (ru.userCPUTime <= cpuAfter.user && ru.systemCPUTime <= cpuAfter.system));
+console.log('ru_keys=' + Object.keys(ru).length);
 "#,
     );
     let out = oam(&["run", file.to_str().unwrap()]);
@@ -23331,10 +26369,12 @@ console.log('ru_maxRSS=' + ru.maxRSS);
         "PerformanceNodeTiming=function",
         "nodeTiming_name=node",
         "nodeTiming_type=node",
-        "nodeTiming_idleTime=0",
+        "nodeTiming_idleTime=true",
         "ru_type=object",
-        "ru_userCPU=0",
-        "ru_maxRSS=0",
+        "ru_userCPU=true",
+        "ru_maxRSS=true",
+        "ru_cpuClock=true",
+        "ru_keys=16",
     ];
     let lines: Vec<&str> = stdout.trim().lines().collect();
     for (i, exp) in expected.iter().enumerate() {
@@ -23401,7 +26441,12 @@ console.log('isWeakRef=' + util.types.isWeakRef(new WeakRef({})));
 console.log('isGeneratorObject=' + util.types.isGeneratorObject((function*(){})()));
 "#,
     );
-    let out = oam(&["run", file.to_str().unwrap()]);
+    // `internal/...` is a builtin only under --expose-internals, as in node;
+    // OAM_EXPOSE_INTERNALS=1 is what the flag sets for the loader.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", file.to_str().unwrap()])
+        .env("OAM_EXPOSE_INTERNALS", "1")
+        .output_within_deadline();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -23446,6 +26491,31 @@ console.log('isGeneratorObject=' + util.types.isGeneratorObject((function*(){})(
     }
 }
 
+/// Without --expose-internals `node:internal/errors` is not a builtin: node
+/// answers ERR_UNKNOWN_BUILTIN_MODULE, oam its unknown-builtin diagnostic.
+#[test]
+fn node_internal_specifier_is_refused_without_expose_internals() {
+    let file = write_temp(
+        "internal_errors_unflagged.mjs",
+        "import { codes } from 'node:internal/errors';\nconsole.log(typeof codes);\n",
+    );
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", file.to_str().unwrap()])
+        .env_remove("OAM_EXPOSE_INTERNALS")
+        .env_remove("NODE_OPTIONS")
+        .output_within_deadline();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "node:internal/errors must not resolve unflagged:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("OAM-MOD0006") && stderr.contains("node:internal/errors"),
+        "expected the unknown-builtin diagnostic; stderr: {stderr}"
+    );
+}
+
 #[test]
 fn crypto_rsa_public_encrypt_private_decrypt() {
     let file = write_temp(
@@ -23457,8 +26527,13 @@ import crypto from 'node:crypto';
 const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
   modulusLength: 2048,
 });
-console.log('keygen_ok=' + (publicKey.startsWith('-----BEGIN PUBLIC KEY-----')));
-console.log('privkey_ok=' + (privateKey.startsWith('-----BEGIN PRIVATE KEY-----')));
+// With no encoding options node returns KeyObjects, not PEM strings; the
+// rest of this test hands them to publicEncrypt / privateDecrypt as node
+// code does.
+console.log('keygen_ok=' + (publicKey.type === 'public' && publicKey.asymmetricKeyType === 'rsa'
+  && publicKey.export({ type: 'spki', format: 'pem' }).startsWith('-----BEGIN PUBLIC KEY-----')));
+console.log('privkey_ok=' + (privateKey.type === 'private' && privateKey.asymmetricKeyType === 'rsa'
+  && privateKey.export({ type: 'pkcs8', format: 'pem' }).startsWith('-----BEGIN PRIVATE KEY-----')));
 
 // Test 1: OAEP (default padding) round-trip
 const plaintext = Buffer.from('Hello RSA-OAEP!');
@@ -23484,7 +26559,7 @@ const dec3 = crypto.privateDecrypt(
 );
 console.log('pkcs1_roundtrip=' + (dec3.toString() === 'PKCS1 test'));
 
-// Test 4: Encrypt with private key PEM also accepted (extracts public key)
+// Test 4: Encrypt with the private key also accepted (extracts public key)
 const enc4 = crypto.publicEncrypt(privateKey, Buffer.from('privkey-as-pubkey'));
 const dec4 = crypto.privateDecrypt(privateKey, enc4);
 console.log('privkey_as_pubkey=' + (dec4.toString() === 'privkey-as-pubkey'));
@@ -23522,6 +26597,1163 @@ console.log('RSA_PKCS1_OAEP_PADDING=' + crypto.constants.RSA_PKCS1_OAEP_PADDING)
         );
     }
 }
+
+// A fixed 2048-bit key (made by node v22.22.2) and ciphertexts and signatures
+// node made with it. Every expected line is what node prints for this script:
+// the deterministic operations (privateEncrypt, PKCS#1 v1.5 signatures, key
+// encodings, JWK) byte for byte, and for the randomised ones (OAEP, PKCS#1
+// v1.5 encryption, PSS) node's output is the input oam has to read back.
+#[test]
+fn crypto_rsa_fixed_key_interop_with_node() {
+    let file = write_temp(
+        "rsa_fixed_key_interop.cjs",
+        r#"
+const crypto = require('node:crypto');
+const C = crypto.constants;
+const msg = Buffer.from('oam rsa interop message');
+const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
+const show = (v) => Buffer.isBuffer(v) ? (v.length <= 40 ? 'hex:' + v.toString('hex') : 'sha256:' + sha(v)) : typeof v === 'string' ? v : JSON.stringify(v);
+function t(name, fn) {
+  let r;
+  try { r = show(fn()); } catch (e) { r = 'throws ' + (e.code || e.name) + ': ' + e.message; }
+  console.log(name + '=' + r);
+}
+const der = (pem) => Buffer.from(pem.split('\n').filter((l) => !l.startsWith('-----')).join(''), 'base64');
+const hex = (s) => Buffer.from(s, 'hex');
+
+const PRIV = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDq0PY64yGXmo1t\nTNBMW21m5n8lCyrIXCDgNFKxZShofTyjpCghCt8DfM/mKLcTCBhVnmnyXEq6wKK4\nYPc1xhQkvfj8ZYtcsxS8Fhygwd7BQoFEMHp8ciuCHFwYyLVVpjDEWrYM2zNz6jrS\nKOifqEQHMjTgcj2a606xM4yzv4f9PAIEUQT8OIRaAPf1Tf6Egvbw0EZUBD6GLlgg\npFljQFB8+Z1fxKXhikus1R9oT/gZnxnrqikqb0udLT4Qx8TgGXSEEIOkFWM5+YDj\nAOzxZOgdY7hOSlXnPSujHLsOeIRg9PhLhFjUTQ6v6JNQRKPSTvsc66v65VFJ4eLq\nuA27AJarAgMBAAECggEASwZ7/eGvTHydnmQSE6uMn3ma+y9/umexO2GMYFClYglN\ntC1RgwkxqzAYTv4ITITkHYsRZ9X0LIo7E3Ur11sT+Y9XO/GH3xT61YOtHvICpbYF\njk98+0ERRK+h/2s1gQmqADrJev8Yh/s5UweuF8EQB0qT2Xi21UZErNp/JLlYDmEe\nyL1bMVE4FWYXdHnIqYo+D9/h2tUYVBjz53XebrIGnUMkR0mF6xN2NkhumtyuJXEy\nlB+zhkYF1qiCNPCbGPGyuqUJA1VPfuRriEmO+J0NEV0aDLNy/Khv+yuTejFcJCpt\nypwYZ0Gqe3hV+7bQULIvNvW4neBGtkAeSSFI7I0FmQKBgQD2CBupoydDDBzJXH5Y\n28V2Mf8vg2eqcfnqlKKQnK/DyOT56flLgF74J+8CoAlKmM2rctCRowpWDUT2S66B\nnMP23jZL4eRl6L+gZYOmFkuwH+KJcs4c2BvwTI2d5HtKNdpenf5P+A+OKTKoPwgB\nT6/FFiFqHr58TSPA74eTNy4Q8wKBgQD0VIZwQHIoPXnn44aKt0Jp0I0B7LaIGGtS\nP3ulLgNNZr/8vspRRSyCNMH2YLiPXYfQcePfNV2PsgZn94gvoMDE6dL1vcxi53yv\nZsdtuCBq3MfMuu8w6MwMK4k+aJSjbmrxJvgLkfMva1VZF4X59eXlHwc+hWrz1qfW\nt36saPaRaQKBgHcNq10mHxyZouBpipYzGtU8ElEKlEJtTtMNw7CYsZDbCLpKVyEK\n6GnK4SRzDqvzTyrUr0qaC6liWGmaa8I6erVeCAYmNCCARSI3nUHkbhG3DCcYz9Yz\nWSmp0amC44ogjx/T8jj+P4C6PNIfVh9UUSjcsaSpZeG+bjuxbPh27iqzAoGBAIdg\nLf0UOCxDo7/wOSOy1oF6pCZk2d4eaZhwxDmJfRrty4Jm1AKjqT2brbytapVE5XOB\nJxkNoIF1ykbgx/xbvXNdex3dw9kpGdS1xdntI0kSe0HccZtP4X78wFZr66+CBo8H\nYHhIrc2gUvHCLuGIdZC12HWzxsbEMMqvcOhmX/fBAoGAGB6Gh1Rd6dggDcZu4AuJ\n4DR64giVmmLYK1a8dS5e+M4+emTl7kVC9SLhLrIRLX9FsTj4wKZI96wImJc88lOO\n5gg9dAJ/aTqkENxf0f5Jb896aafoJopxYVsae6/qQIKbDv7xDyQkqK5ne8W7y7rT\nveypYU+3vLV5dytdMGn1owc=\n-----END PRIVATE KEY-----\n";
+const PRIV1 = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA6tD2OuMhl5qNbUzQTFttZuZ/JQsqyFwg4DRSsWUoaH08o6Qo\nIQrfA3zP5ii3EwgYVZ5p8lxKusCiuGD3NcYUJL34/GWLXLMUvBYcoMHewUKBRDB6\nfHIrghxcGMi1VaYwxFq2DNszc+o60ijon6hEBzI04HI9mutOsTOMs7+H/TwCBFEE\n/DiEWgD39U3+hIL28NBGVAQ+hi5YIKRZY0BQfPmdX8Sl4YpLrNUfaE/4GZ8Z66op\nKm9LnS0+EMfE4Bl0hBCDpBVjOfmA4wDs8WToHWO4TkpV5z0roxy7DniEYPT4S4RY\n1E0Or+iTUESj0k77HOur+uVRSeHi6rgNuwCWqwIDAQABAoIBAEsGe/3hr0x8nZ5k\nEhOrjJ95mvsvf7pnsTthjGBQpWIJTbQtUYMJMaswGE7+CEyE5B2LEWfV9CyKOxN1\nK9dbE/mPVzvxh98U+tWDrR7yAqW2BY5PfPtBEUSvof9rNYEJqgA6yXr/GIf7OVMH\nrhfBEAdKk9l4ttVGRKzafyS5WA5hHsi9WzFROBVmF3R5yKmKPg/f4drVGFQY8+d1\n3m6yBp1DJEdJhesTdjZIbprcriVxMpQfs4ZGBdaogjTwmxjxsrqlCQNVT37ka4hJ\njvidDRFdGgyzcvyob/srk3oxXCQqbcqcGGdBqnt4Vfu20FCyLzb1uJ3gRrZAHkkh\nSOyNBZkCgYEA9ggbqaMnQwwcyVx+WNvFdjH/L4NnqnH56pSikJyvw8jk+en5S4Be\n+CfvAqAJSpjNq3LQkaMKVg1E9kuugZzD9t42S+HkZei/oGWDphZLsB/iiXLOHNgb\n8EyNneR7SjXaXp3+T/gPjikyqD8IAU+vxRYhah6+fE0jwO+HkzcuEPMCgYEA9FSG\ncEByKD155+OGirdCadCNAey2iBhrUj97pS4DTWa//L7KUUUsgjTB9mC4j12H0HHj\n3zVdj7IGZ/eIL6DAxOnS9b3MYud8r2bHbbggatzHzLrvMOjMDCuJPmiUo25q8Sb4\nC5HzL2tVWReF+fXl5R8HPoVq89an1rd+rGj2kWkCgYB3DatdJh8cmaLgaYqWMxrV\nPBJRCpRCbU7TDcOwmLGQ2wi6SlchCuhpyuEkcw6r808q1K9KmgupYlhpmmvCOnq1\nXggGJjQggEUiN51B5G4RtwwnGM/WM1kpqdGpguOKII8f0/I4/j+AujzSH1YfVFEo\n3LGkqWXhvm47sWz4du4qswKBgQCHYC39FDgsQ6O/8DkjstaBeqQmZNneHmmYcMQ5\niX0a7cuCZtQCo6k9m628rWqVROVzgScZDaCBdcpG4Mf8W71zXXsd3cPZKRnUtcXZ\n7SNJEntB3HGbT+F+/MBWa+uvggaPB2B4SK3NoFLxwi7hiHWQtdh1s8bGxDDKr3Do\nZl/3wQKBgBgehodUXenYIA3GbuALieA0euIIlZpi2CtWvHUuXvjOPnpk5e5FQvUi\n4S6yES1/RbE4+MCmSPesCJiXPPJTjuYIPXQCf2k6pBDcX9H+SW/Pemmn6CaKcWFb\nGnuv6kCCmw7+8Q8kJKiuZ3vFu8u6073sqWFPt7y1eXcrXTBp9aMH\n-----END RSA PRIVATE KEY-----\n";
+const PUB = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6tD2OuMhl5qNbUzQTFtt\nZuZ/JQsqyFwg4DRSsWUoaH08o6QoIQrfA3zP5ii3EwgYVZ5p8lxKusCiuGD3NcYU\nJL34/GWLXLMUvBYcoMHewUKBRDB6fHIrghxcGMi1VaYwxFq2DNszc+o60ijon6hE\nBzI04HI9mutOsTOMs7+H/TwCBFEE/DiEWgD39U3+hIL28NBGVAQ+hi5YIKRZY0BQ\nfPmdX8Sl4YpLrNUfaE/4GZ8Z66opKm9LnS0+EMfE4Bl0hBCDpBVjOfmA4wDs8WTo\nHWO4TkpV5z0roxy7DniEYPT4S4RY1E0Or+iTUESj0k77HOur+uVRSeHi6rgNuwCW\nqwIDAQAB\n-----END PUBLIC KEY-----\n";
+const PUB1 = "-----BEGIN RSA PUBLIC KEY-----\nMIIBCgKCAQEA6tD2OuMhl5qNbUzQTFttZuZ/JQsqyFwg4DRSsWUoaH08o6QoIQrf\nA3zP5ii3EwgYVZ5p8lxKusCiuGD3NcYUJL34/GWLXLMUvBYcoMHewUKBRDB6fHIr\nghxcGMi1VaYwxFq2DNszc+o60ijon6hEBzI04HI9mutOsTOMs7+H/TwCBFEE/DiE\nWgD39U3+hIL28NBGVAQ+hi5YIKRZY0BQfPmdX8Sl4YpLrNUfaE/4GZ8Z66opKm9L\nnS0+EMfE4Bl0hBCDpBVjOfmA4wDs8WToHWO4TkpV5z0roxy7DniEYPT4S4RY1E0O\nr+iTUESj0k77HOur+uVRSeHi6rgNuwCWqwIDAQAB\n-----END RSA PUBLIC KEY-----\n";
+// Made by node with the key above; the padding in each is random.
+const V = {"oaep_sha1":"758cc2f35bd8a14c65d3075a82912061613c9c4d7eb576e10fcf803d2474c9766d10343c5c6d8739c0943a36af0e7d65d6ac2c9aeaed9d4efcf338513de28a81c913629736870050f181c9ea2cb80ed60b2f36c7541d590a994c9e83f174004a0fb0c0e97b8afb9cf93c183027228436c9fead9ae68867c6e988bc3c75803a508563c4c65783bb82d36e4ed952d6efe061dccd71e7224da71e6c1685be802c4805bed4717ee3af58b055a9c12683fc52f5801ea43228c0f9e4ae8d9c5fa948677823d1a52f69b4a9a7077337fb4a8ef19dfd8d1af916e24a5545707497cbca0777b8ed9ee05648463429d1102f537ecf3c28d15092354f88fd0980aa61b6e92d","oaep_sha1_label":"468508a3af8d00d39d37b642355251c032a2fbf0b9b05f613413aa48f9accb66e68595837791f032e80fa5f7947585d3ff013338e8641bb95c10a45ad3e426906e62225c8710eb3b5a358184fa7f975cc6e7fa7cec84765c36cdcb2cdb3b766c58b72f90f15598d8ea962a0a7dae8cdcaf17ee2deec5e44e7193e8e5a85df09f963ef82f97aa7e797a3d5b196e8ace9395a650f3a13c68d3add0d9c80a7ea378901c72e5d37358431daf274da4a52e4ce070b0394702a8fa78c230e5acfe32c90b557257aa4ad1be3bdb431d4c533de5424379f3616ad4d3e0faa33156eecc78665962c266957ed07f1a5201a1a1dd18b8a42fc3bb1e45c885d950891890b934","pss_sha1_digest":"0c540c2bd6409d44da4713e760df3a370ccaa97225f8bba25c89d3983920808c6d1a5b4eb68859a6e94ff370446d4581561db6f22dea36a3a899b115299e5b490eaed84b87aaeb2163c182483fd7efdcdfbb7e3e9aa984bd6b6b257d2589ba57927e2742854bb6d06fe958bc870ec19dff7b81b5e121557d87d467e8fbf54cbaa0a237acd49836fc055041d5d36f4b0e3ed32107e8097c3f5810786c83040c4eb5e7e4947fa3e10582170f450e0c1409d2ea1b173c91e9914cd31f778d8adfe43790c90f8a0dac1a500e81164da46f322eaafba786b09450a720d09cf770a45250d57487f81b56d595f2c0831d06bbee7ecec3a825e1486c7ac90c90bafd8694","pss_sha1_max":"831e8852e4ff7a8cd363b1d6d4a264dc07a57fd800bbe8d024ca2e154929ccd82cc7654973e982507149bb89793b6c18843ad62f067f3c214cc03ee2631287d852b0d04f8fc185112f8020568a3b13ac14bc2d05da2fdb93669f846ddaa8f52579780ea99dfa23b1a8721bb4c8efef4eca092efb17963e9cf471d5b4d9d94d7960a30a8533e7e67940ece52dc3ec37cdb4c302fe0fe8f0e2c7073fa07da9830b4676ce6dcd0dec888fbab0648112a9d5783d27f802056b6a593f0871240bff2bfd5b93a6240ab943b743d37073aeb448e7e188f3941e1e8ae7ef240208b27cb2a94d66cb7c1bdc6434d89587f18e4121d3fcf21a5a88b6841bace85b7767ffdb","pss_sha1_0":"84f65fc79666fec4fd2394e222b151cbe5e294d2e0fbd73ac0b0b85564e963fdbbe1592f43f82f78cfa5afad94a31bab378b7dd3c8867b8da9727b67ed7db49d274f32bb3a995c1891307b8815e39a93fa2d67268cf40653d06951cc336349d9946f41ad23b75248dff08bdec0c8002024d807a6a857056578ee6228553948307186c6eef379a17832e7de1a03ff0f22844128826ad7b03bbe43d95b4451c58f67d080ad8aca25ee102a5ce9f21fc7bb0b2d95e807592300a473b974aa4792c4a5d2144af9b57da1b0a2700faf17fc4d355c7be599d47aed415eba0f9e1632d1a46cb58a3e2446fee3104d0df59af4f840881b321015367c492bb08e70bb36cd","pss_sha1_7":"b944c0012d98933bf90e740346b78704de2697918bbbaf1cc403b9d479a344cf7bf378d7293bfd3b9a453e50d7546e1ec74a29e1e8810647c7f632d044aa71d0b1cb1d1a76ebf1fef8bd69fd08e82f98b205c03dbc5b96d95b7e5d8a443a24a515e6eb05d56fad75be4defe970f9098d1fc4d93bf94580864161d640e599f81ade76b6600a42e986ab869df560a6e4800df0f5d69baa17c9c89b18d81a5149ab3bc559fa70adde0f45a1a89ac21404468708079b2fcb1636e7249f4ea55b119e107f1a885bfd0065488dab8f24ca9ab412f6a3b3abc6f195e16fb8b8de12a699217a73aca6ad7f5ebd6b069eba38e156decea382f3e344452e70e0a54f7716b6","oaep_sha256":"c708b9deca9c39824bf0d200710c6b3d590947c30b8270914cefc9ea0df53634eaf6a02e9e4bce7bf4c24be9f1b7914a5adef56628d2fc9196681928014593df8de4e95487109a8010143496b63a16bae91789216a97bd6996c7796c1bb3d9f969e61525c7df33f5fa45286553d4f3a4428b93961e9df6dfbb7d3e9e836f8a7e997942a10537fd8b56724317f22158db04d27513acf0d271a26b712bf61a834456300064448b07a574f90fc9ec7b2768966d1cbfc3c4d2dd2f587ce8c0c464c76a4be03126163bbbf58b4249f7690c1f1e5fe4a8036594f5d117d93b109067a0151e82dafdfcf583b4173f46c0d014425b6fb9ec7cb160f85173165f32ef444e","oaep_sha256_label":"7f8a5f1965fcbd405e3e1ceacf41477636d8ad268cb8abf91402004454dbc79c7ec1e21c7cf54a9ce5031363dee3ad52e0e0a44f9a20292b8aceac7da3b039ce5206bb062139d82bf47b1d9de985ad20648f70e20f9ac00de3174ffbe74c77dabdea91f358b7775a6fd374ce94015fa97ba36bb4a94c9a1c5fb3132c76498b18ae5074cae15bcc0e4eea17a5b94d845794461e0df86c2d82f0b43f2e7f7ee0d8ac8c79dd0aaacb5f1923b8d401c2031f38e63f9fa22e24d3dbc4e60d083673ad24d0ce2241e248dde14a9cc31d79417e91f454a831b29469e78892c0239768a6a0e79e3cf5eb44912330ad83dba15f61d8893ca1b0fee8e8a1c5cf0f83a57bb9","pss_sha256_digest":"678d02f555d2fc9346430ccb8d22a19d105aefa4a6f9f1099be2475755c304353cb8e8d804e1b3b6c92c7bd934d8e323cc7ea8bcb6c4d73b3778eee1e59e239ea9971f3efcbe26de42ad11cef3a4ef6cc927892102ea067fd6f0c71340105318ad530ea275aff366c1bf18d0af2767c790f715769acf028fb87dff93b8c4efd901b27dd72605fd3bb4efdf082453e1cb27ec8b00684c9bafb22348683d604db2e1525e6976daaa19228632d93745f055e8c77a23f378dcb8966753f8fee0e4bb6a2ac15153a5f41186bd1be7d658bad6dea6c66b2ca5ca7b6a239653e3d156d8e471d594f9975e909ad25e6eb082b4439c534f28a4eaf22210a6c188fbae1ac0","pss_sha256_max":"7925ba44066dad366f1d7bfa3debdef605576728a34b4bc764cea6fed45dfa085fe2fa3f062e1c194ad886a9e5dfff5d002c2bb0a9f3385ee1e6c61126725c11be688d1b3aab8647cbfe6bfd5432aa3179357ad0d1b5f2527d5f92cf4b80029b6ebcf1de9f2bccab946496dcd89632bb5a58561adaf5098fccdb81772f72eedf6d6161f2cb0b5491feb88a36c8c1d5757b8fd297223334b4ee5af8c885033408d388981fa5f7bf4aba928ab1b9c947f1a312c2818dc4fda846d8e30e15448f8bca997764127e8bdb2cd69ff037ea3f93bacf8399a69d3353214f8edec0b26fcbdaf9b4b1b07722080eec587aae07178ff86d81891e601c7f672c65635eb2794b","pss_sha256_0":"90cca575b9f6c96a264dcf14b36ad77462635dd895653238e56b75f44bb978e81f437a9eec8b030ec94a31f39a184f20ac01f43cb1ea195f6e1789f305b5442267b2db05181f348bf96cba4515a9b9263429095255ae30e14e1b6e40c1df837064b66e8929002bd6152c19b152ff992d0ca4879c209de161f9eddffc0a462bd0e715ac139a8ef47a15e0fe647299e283f8358015cae2284f0ab53226aa412071e3456e72983c96cdd51cdf99c3e134391f1de331b4cc445c4fbbef97867537755e928e995984729134c15c5578880d86717ed79722c5101dde2ebb556b07824c64d66387423fbb92acbc9c478e4fa62b2074775c9da579d6bbbf8552b36d39c4","pss_sha256_7":"de71dc6df4964849bbf531ce99605cbc6ce44d75f1ee873605b360fd938aab580f16d2a2bcdc093f6e47153c85128736a55f08cfed95be67505758a7453bf0453830f847b5215ebddbf2da564987c44a444a27ef7cb119b321f1f23058ab97fd3ff969b6c613d60ecc3151c581c3bf9722b56045100e496a9fd4d957c9ed94b163284cf7cb65cdfe11df8361983a9ff4cadb9aa693517499dcb17211a0d9c265a7b831d646036e306137d520dd980f42ad1423efb065a7298289ba1d8b29c2187e5d940dd679061df69d4e17f6401cf26e3fc77c36656f2d6894a5b29ccbe88fc7da16a463ae1a4442fbc977619c7196afd247b848c4d6d7d26cb4bf8993c47e","oaep_sha384":"65cf1eae1b398746c13f3e57e232570dcf0252a32f165e1aba268a952b54751cd0aa0152aea7b4e9bbaece9a4f58d2030dff02a10a2a14b75bf695b3191e82d119b5ee2e2c79ddd9ec550d65c011b879d8749dedc63b6b12b8570d2f3ed8d26be81d5f5bce1033e54dd1e4ecd7cbccda0e1173c18c33852e98e9fc4b4d5e2432f6fb7be60334f8e58822fb0a0274f787da800272c7507918667a79d3b3585b28a3b16711feae3486b358b00633d45020053d462addad9f8e9abb8a360992b23633315ab27f68bf9dcacd012bf65603708709b4f997ca88c6e676de666084278a40ea06a9140f605bbcd087a5842454a40fe4a44ccaece66ccb3785ecb1558c25","oaep_sha384_label":"bcb23ab9846dcf73e1255755f1b7ff37f44c92a82fa1397c45140381be49538c968cc10ed58e98d2079ff741f463a07cab5e4bfa508e78b7a7ca8ea8440600ea2df909132a09cbc9be93be8689bd787d1e3bf4b43eda81ac95dc8aae05771fe404494c80d358168bc7ec8cb962383542c3f9f4cefc6abbc70de282acf3f5e94516d43946fa47cd916a520df5c7eaeae32dcf197019c0fd6825ea241151f958e0b8a8bb06ee2ad21f7d802d328ec656e33c67eb05fc7082fbe34bb37547b134102b79b68b132e75fa92e3174fb6603f979d76228cda32d2dfdf4e837e24e07b53b6e0890580a2dcf2838b2de35713d9a40320e5233ddb8ff6b8eeed31ed70127e","pss_sha384_digest":"7a505739d768516585dd3bfd4c65b9581e808ced94f61d4955461a0e18e24aa2b0cd277632e39a8dfd65f7eefae8822ba16f8d2d5d28c756112f4c2ca473e74f493dfcc48d24a7986a14ccf8839d435eb58dfa6dbf345b73fc0be004f4410d67492ac7c8cf38a9297e5e0f70c286a33a29a888f325590301374efe6f0d60182633f0216bce75758f45c15fe6ceda09cf7e05a513f25a47ba5fdd80a9325c807daee7938b5f692187b440b1b67d1dd27c88fd2f2e1873b59353add45722b827122c78817f0dafbe34b9785e348d4313d39971e9b431e22ea72bac286ccace24ccd3df95dbcb0dd27a9e217f3821208ef62539011e39956817ae72f04a8d7c3373","pss_sha384_max":"e6d997d41e7f76dcf87dc8023991fcb4db76ddd7e28448bb413b6b616fe0db7784f410e1474c5ea8b3e54eaa97da6c981f4e54ccf9ae40354390150a3c90394341bb6760dc959f6285f4974b529fbf808204d2b66bc936228f4495782c76381835aeafd114a0278919b7bf4fb8b4f336ef2e53fff77f79292e72a5784139615694c06c2d7dad14b1cac5f2cc05ee0ff3f1a454b891c14fe51c73aff0bed898762bf24a9699667184ae5ca84d46c7be7dd2e7a491d9357c772005a59a8a7dddb4f11a204cddc81ec3f46106dce5b7f0a1c4fe769281ceb05eeda60b8c970ae9522251b216ec7e841bb6456661a038dc25a8d887164871626aa28ce4690a3ebf5a","pss_sha384_0":"3119346a257d19fc1d12aae12e0358e637c6390c00f2b7b95d682738297799e2480c32336be157ea72d34f52deedf1fec7fd9db285d6a208fc824c92b32c9734cc87e57cbb3ee861bb00dec2ea959917a2433c88a3070d7db72cbf84366b561246001a79509d90218f139bc9794e044f35effc2cf66c1f8f625b848f5f4990a40e191099acedc438406867a0e273f7b0f998023d503cdf6815d47ae10b0a86287346323d7089fa6f5aa016ef9a599956879d5c2d93addd394c10709abc69c56808f469e93f0cda460a8b5535148161baa2f7c571a15a16a1bc5fe5d9f8ba764005d38a383bef42e3eb26e24d800c5a51bc0d46c761558474a9bf49eb637d7ea7","pss_sha384_7":"5b0902a1c568633967d399788a87856c36bb3a4e02c56e6de2d3cca9db4992349b110fc77d57d4d2dbb3188ff1d8e1e7e0b2a460502ffb23b54b5386edfbf9ebcf0b0d0c006826800d850ffc7cf70b0d705a6bfb98b3c19c9cb07fa610cf09976aa18d0a2d0b11be3b4e3cda82f78593062cd14337f79a97f202805dbf03ee8911ea10c5835d13961b9053481c5c4381e0be7a7babc70a40b48e4ab05e8d9f131ddf57f429dd6f779137b4f6696de3c522266093371945144bda310679e287d60fabf6ddd6edb77f363d75ae2110e943faecd437cd21f465bbc5aeffcefe1431dd5960c5e588d578c38f71eea25a07009dfbc4df5d0714ea15970b49f77ca673","oaep_sha512":"b07670c8f3b6f96f4f410b1e3b8cacdbee7f93fc07447d87ed3259b4f056f617a40778b2ecc93905c70f08bcf6ba97171a5421b62cd352229ebafa985ee5333c06bc9d7bd903d2818b93919fa9ceecb57149c252b1e609634722d5fd40d0de1ef0ba3d90abd430af726a67aebbd17fb0a3d36282f34594c52663fffa50dd067796ad85b8d16d1483899c9cc42f299509cb25ca4a885e6e972b6a700a721fc040a7a73a9c8771d2a0afd84945b3fbd24e24e67e88684d704037b5290e609d77a9a2382dea732d43a6ecca914fd7123d1a7fd2afd513863cf72a699e87d3b08f7b159237c056f51848d91354b31b82f055058922cadc9658d87535015970f0ecc8","oaep_sha512_label":"59ff43dfc4dbe26f15f52215ead2bddeac76923836c4dc771a6456b745a41d102e13484bcf618059e2861f6fd1214be5c9d42547667a6a4b4d97b22011b95776ba503e0e896339f98edd11844cb5fea8a1493c280826ca794489a7a4fc585deb39400d068ceb6285c4b608fca728f8e35e1df9d6745db41d4e0c07b31d9b69d41ad0ae5b12d866ecf41eed3a5a6b7f4843506b87867571631f56ee0befbfd7084e5a5f020e8de3c95fd1318f948f5e228545fdfca569cb06a419ffe12f11e5d4454b4c288b1c6df3ec699b9bc1caabb60c66e570ba376aa953f444bbb4b11c0eff93025b443c07d2408bf8a709df86105d18f65b0307d7c7bc530b78c580aebb","pss_sha512_digest":"8c07d1106e0f8fc3b81aa579490b837e255db0a550311c783b9e1e6e62c7fcd02c7090cddedb6e2b713bedf3b1e7c2f97c6cdbe2dee2927400524c12cb71951c3621a98f25cdb4ffd71cc01f2fe12784275584fac58489e1e2b20f30cdf5b15acfe1467e0016e7bf9c91f590b9fa9f8eac491355e0da938b5c3d7dc23151e30708569e3c16b5cd56e1f02f83280acb43923e50d03068adc92cef884b2f5cd7ce60a3609da7aba94a8c29a5ed702352818ca72ee933ef9210bb1d9952848de15fa15bdbb0559fe4998c328a6fb5dca385acd9bb1cf78ec917ba8310077c54d52560c276543a8d3af8a78b845fc336e9f43b5709a2764c64cca124e999bcc790da","pss_sha512_max":"abf5bfcbe8caf4e304aef058ea62a81331bfc4a777b1ba406716413baa204e95bdc6681ccc926df56836a4266004807d9f2d802c2ec1ca2d0d62395f53e239a4ec8b500882587c19b7f85771b20c05c336f89afe89ad7e20e511dc9ae96103e0dc9afaf33760d6a09e5a64c1f23f627663cfb6ba543cae09a711a5b0531ff076286c2644dc3547c4d84aadd5d348086dc8a5127e58ee380ea46b69fadb1680c399aa41098732ce9f52a9357fd29e388b87ca8f2122abe65918dcf3cf33784b080bc0d27ed727f06233801f4d6a3fc53fdc90815ce18aedef495f6dca7a360f4ee3b9309b21ec3d6b1d14d65460e583b05e1e66bb863e2183b8167d32eb9a1348","pss_sha512_0":"3113783f6093ff0ac4cab154fe882280182b35e08f1b8b946e20b8cc33540ce0242e3f196242736bcb3489346d0fa5044136c4774d652b0b2e27433ec1ff49eaefd7b09ca738195addda48609823f2d833c16400186cf9df24c103cf18d417aef16da3aada2549f00484478f4004131d3fec1e8955674fb2f557ac96d999beaa5db7d50882041587a5dc84e53325530b230ec0356d7e668225faf6246ceed461116abdb01a515f421b54de92ada300db9d42fb84ae145dcf886c17fd92558ec97794606191bf3502931673ea75acf6311db9878308d75ff779735bd831a671dc9b4d055122aa73057472ae737269956802ab8c5f2f20cef64c7f8964d1caa6d8","pss_sha512_7":"4a57af4b6f6e975708f2ec1d77f97f44f762a648cc8d2fd26e4bc403cba494407a48b98c3aae74d3558288e3982ab1c6944a53696f7242c408399f516a2cbb6160e8bbd3867cfcb598a6cfad1af7a73e2281ef7d8a5eac3cb38805ffce02aabdc0e467145850df73c148ed2e1541127a52deb5c48907a28a84db0712f3d320cb3e84ae1aad8c4651e2b94ffb8b2841e8937f5a2403e81c8a8e28edbffbee0e49df76628cafa9ae3e4ffa0c606b24847cf64ac86fd85bc2e6688f924e11440787b15200f4c50229fa8d5b8bfdff8cae048334c5d519b62975448c5f9479b2293518d7551cbb491cceae8adfbdadc636888c8c3faa7b5bd85f2a2481cefbf8dcd5","pkcs1_ct":"026b5535d8c19e721052b3a342951c60d0a380e129ce19016459cfb89f946c62b8c1565169363df6711e7a30cc47aa2df8e9f85a66eac6f12656b5a452275964e7203e8e6b7f910e9b58bde5340dc7066aaf7b06c093348534f60961c390c32f30539a07dd54303c0e1b4a017a279cca31f9b43c239e850a9417a6314754d19f98325103d157b07b304b83916c088a17841469bb79d4b608e825417fbe1147bb24b55eb6234f7d55f1852f857c3918c2dc126c5c967fa8b06bbb4922ed103f0e7a6df00d5c74eb39a38cb29b75c930348cc980844606829db45175bbd082eeeca59d2eae6936538cf11738720cc32feec54be467d9351b6510fa036a2cc4803d","pkcs1_ct_empty":"1893089d89b6cc8d157c3cf337826620e585cbd41997f3f01f5b065aef704cbdc0cc79ba13a5d0e34814410f83a8815e67dc4db3c73d45b47a0046403bebaa832e5dea6566cb56a9bda045fce99958bd9b1ad5e75ef987369ae39566eee6819456ed95012134dd665f1f67cf197a612f67df1bb3471540bdd936430a8b143ac52b42aabd9b998ad241311f1d772a5136cb95e702b2a3b53d4dba462b16446acac46d3bec84f50e2d03ad7b8ee8176683efab4d98e5d14f5ab5d56c6a353a6ad4c5ef466003411770497d14ca978c3cd06fcc987b7d655824c94098fa0bd1a87682b4d0b1faebd61d72b5e231f73eb915419bc9c9d6fb895212ac86d13d92a6b5"};
+
+// Deterministic: the same bytes as node.
+t('privateEncrypt', () => crypto.privateEncrypt(PRIV, Buffer.from('pe')));
+t('privateEncrypt.pkcs1key', () => crypto.privateEncrypt(PRIV1, Buffer.from('pe')));
+t('publicDecrypt', () => crypto.publicDecrypt(PUB, crypto.privateEncrypt(PRIV, Buffer.from('pe'))));
+t('publicDecrypt.withPrivateKey', () => crypto.publicDecrypt(PRIV, crypto.privateEncrypt(PRIV, Buffer.from('pe'))));
+for (const h of ['sha256', 'sha384', 'sha512']) {
+  t('sign.pkcs1.' + h, () => crypto.sign(h, msg, PRIV));
+  t('verify.pkcs1.' + h, () => [crypto.verify(h, msg, PUB, crypto.sign(h, msg, PRIV)), crypto.verify(h, Buffer.from('x'), PUB, crypto.sign(h, msg, PRIV))]);
+}
+
+// node encrypted, oam decrypts.
+for (const h of ['sha1', 'sha256', 'sha384', 'sha512']) {
+  t('oaep.' + h + '.fromNode', () => crypto.privateDecrypt({ key: PRIV, oaepHash: h }, hex(V['oaep_' + h])));
+  t('oaep.' + h + '.label.fromNode', () => crypto.privateDecrypt({ key: PRIV1, oaepHash: h, oaepLabel: Buffer.from('oam-label') }, hex(V['oaep_' + h + '_label'])));
+  t('oaep.' + h + '.label.other', () => crypto.privateDecrypt({ key: PRIV, oaepHash: h, oaepLabel: Buffer.from('other') }, hex(V['oaep_' + h + '_label'])));
+  t('oaep.' + h + '.label.absent', () => crypto.privateDecrypt({ key: PRIV, oaepHash: h }, hex(V['oaep_' + h + '_label'])));
+  t('oaep.' + h + '.roundtrip', () => crypto.privateDecrypt({ key: PRIV, oaepHash: h, oaepLabel: 'L' }, crypto.publicEncrypt({ key: PUB, oaepHash: h, oaepLabel: Buffer.from('L') }, Buffer.from('rt'))));
+}
+t('oaep.hash.spellings', () => crypto.privateDecrypt({ key: PRIV, oaepHash: 'SHA256' }, crypto.publicEncrypt({ key: PUB1, oaepHash: 'RSA-SHA256' }, Buffer.from('rt'))));
+t('oaep.sha224.roundtrip', () => crypto.privateDecrypt({ key: PRIV, oaepHash: 'sha224' }, crypto.publicEncrypt({ key: PUB, oaepHash: 'sha224' }, Buffer.from('rt'))));
+t('oaep.label.type', () => crypto.publicEncrypt({ key: PUB, oaepLabel: 5 }, Buffer.from('rt')));
+t('oaep.undecodable', () => crypto.privateDecrypt(PRIV, Buffer.alloc(256, 1)));
+t('oaep.messageTooLong', () => crypto.publicEncrypt(PUB, Buffer.alloc(215)));
+t('oaep.messageMax', () => crypto.publicEncrypt(PUB, Buffer.alloc(214)).length);
+t('pkcs1.fromNode', () => crypto.privateDecrypt({ key: PRIV, padding: C.RSA_PKCS1_PADDING }, hex(V.pkcs1_ct)));
+t('pkcs1.fromNode.empty', () => crypto.privateDecrypt({ key: PRIV1, padding: C.RSA_PKCS1_PADDING }, hex(V.pkcs1_ct_empty)).length);
+t('pkcs1.roundtrip', () => crypto.privateDecrypt({ key: PRIV, padding: C.RSA_PKCS1_PADDING }, crypto.publicEncrypt({ key: PUB, padding: C.RSA_PKCS1_PADDING }, Buffer.from('rt'))));
+t('pkcs1.messageTooLong', () => crypto.publicEncrypt({ key: PUB, padding: C.RSA_PKCS1_PADDING }, Buffer.alloc(246)));
+t('pkcs1.messageMax', () => crypto.publicEncrypt({ key: PUB, padding: C.RSA_PKCS1_PADDING }, Buffer.alloc(245)).length);
+t('privateEncrypt.messageTooLong', () => crypto.privateEncrypt(PRIV, Buffer.alloc(246)));
+
+// node signed, oam verifies: [default salt (auto), digest-length salt, salt 7, another message].
+const pss = (extra) => Object.assign({ key: PUB, padding: C.RSA_PKCS1_PSS_PADDING }, extra);
+for (const h of ['sha1', 'sha256', 'sha384', 'sha512']) {
+  for (const s of ['digest', 'max', '0', '7']) {
+    const sig = hex(V['pss_' + h + '_' + s]);
+    t('pss.' + h + '.' + s + '.fromNode', () => [
+      crypto.verify(h, msg, pss({}), sig),
+      crypto.verify(h, msg, pss({ saltLength: C.RSA_PSS_SALTLEN_DIGEST }), sig),
+      crypto.verify(h, msg, pss({ saltLength: 7 }), sig),
+      crypto.verify(h, Buffer.from('x'), pss({}), sig),
+    ]);
+  }
+  t('pss.' + h + '.roundtrip', () => [C.RSA_PSS_SALTLEN_DIGEST, C.RSA_PSS_SALTLEN_MAX_SIGN, 0, 7].map((sl) => {
+    const sig = crypto.sign(h, msg, { key: PRIV, padding: C.RSA_PKCS1_PSS_PADDING, saltLength: sl });
+    return sig.length === 256 && crypto.verify(h, msg, pss({ saltLength: sl }), sig) && crypto.verify(h, msg, pss({ saltLength: C.RSA_PSS_SALTLEN_AUTO }), sig);
+  }));
+}
+t('pss.wrongLength', () => [crypto.verify('sha256', msg, pss({}), Buffer.alloc(255, 1)), crypto.verify('sha256', msg, pss({}), Buffer.alloc(257, 1)), crypto.verify('sha256', msg, pss({}), Buffer.alloc(0))]);
+
+// Key encodings and JWK.
+const jwk = crypto.createPrivateKey(PRIV).export({ format: 'jwk' });
+t('priv.pkcs8pem', () => crypto.createPrivateKey(PRIV).export({ type: 'pkcs8', format: 'der' }));
+t('priv.pkcs1pem', () => crypto.sign('sha256', msg, crypto.createPrivateKey(PRIV1)));
+t('priv.pkcs8der', () => crypto.createPrivateKey({ key: der(PRIV), format: 'der', type: 'pkcs8' }).export({ type: 'pkcs8', format: 'der' }));
+t('priv.pkcs1der', () => crypto.sign('sha256', msg, crypto.createPrivateKey({ key: der(PRIV1), format: 'der', type: 'pkcs1' })));
+t('pub.spkipem', () => crypto.createPublicKey(PUB).export({ type: 'spki', format: 'der' }));
+t('pub.pkcs1pem', () => { const k = crypto.createPublicKey(PUB1); return [k.export({ format: 'jwk' }).n === jwk.n, crypto.verify('sha256', msg, k, crypto.sign('sha256', msg, PRIV))]; });
+t('pub.spkider', () => crypto.createPublicKey({ key: der(PUB), format: 'der', type: 'spki' }).export({ type: 'spki', format: 'der' }));
+t('pub.pkcs1der', () => { const k = crypto.createPublicKey({ key: der(PUB1), format: 'der', type: 'pkcs1' }); return [k.export({ format: 'jwk' }).n === jwk.n, crypto.verify('sha256', msg, k, crypto.sign('sha256', msg, PRIV))]; });
+t('pub.fromPrivate', () => crypto.createPublicKey(PRIV).export({ type: 'spki', format: 'der' }));
+t('pub.fromPrivate.pkcs1', () => crypto.createPublicKey(PRIV1).export({ type: 'spki', format: 'der' }));
+t('jwk.private.fields', () => Object.keys(jwk).sort().map((k) => k + ':' + jwk[k].length).join(' '));
+for (const k of ['n', 'e', 'd', 'p', 'q', 'dp', 'dq', 'qi']) t('jwk.private.' + k, () => jwk[k].length <= 8 ? jwk[k] : 'sha256:' + sha(Buffer.from(jwk[k])));
+t('jwk.public', () => { const j = crypto.createPublicKey(PUB).export({ format: 'jwk' }); return [j.kty, j.e, j.n === jwk.n, Object.keys(j).sort().join(',')]; });
+t('jwk.import.private', () => crypto.createPrivateKey({ key: jwk, format: 'jwk' }).export({ type: 'pkcs8', format: 'der' }));
+t('jwk.import.public', () => crypto.createPublicKey({ key: { kty: 'RSA', n: jwk.n, e: jwk.e }, format: 'jwk' }).export({ type: 'spki', format: 'der' }));
+t('jwk.import.sign', () => crypto.sign('sha256', msg, crypto.createPrivateKey({ key: jwk, format: 'jwk' })));
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "rsa_fixed_key_interop.cjs failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        r#"privateEncrypt=sha256:89e05761391e6f136ec3b3d5540d56adb0830f650e67a8c35b448b1b80a1ebc6"#,
+        r#"privateEncrypt.pkcs1key=sha256:89e05761391e6f136ec3b3d5540d56adb0830f650e67a8c35b448b1b80a1ebc6"#,
+        r#"publicDecrypt=hex:7065"#,
+        r#"publicDecrypt.withPrivateKey=hex:7065"#,
+        r#"sign.pkcs1.sha256=sha256:ad202abcfb8b3a16435f5f0343cd032d3b49df22d05f281176da2df960fc90f4"#,
+        r#"verify.pkcs1.sha256=[true,false]"#,
+        r#"sign.pkcs1.sha384=sha256:b3fe098fe9cad59cfbf9b43b74dbb4fb21fd858d63cb647896bc7c2b75636bd0"#,
+        r#"verify.pkcs1.sha384=[true,false]"#,
+        r#"sign.pkcs1.sha512=sha256:80d9c08552c9762c93d52191817bf4022d3cfcad42165a71498943cf80d1ac6a"#,
+        r#"verify.pkcs1.sha512=[true,false]"#,
+        r#"oaep.sha1.fromNode=hex:6f616570"#,
+        r#"oaep.sha1.label.fromNode=hex:6f616570"#,
+        r#"oaep.sha1.label.other=throws ERR_OSSL_RSA_OAEP_DECODING_ERROR: error:02000079:rsa routines::oaep decoding error"#,
+        r#"oaep.sha1.label.absent=throws ERR_OSSL_RSA_OAEP_DECODING_ERROR: error:02000079:rsa routines::oaep decoding error"#,
+        r#"oaep.sha1.roundtrip=hex:7274"#,
+        r#"oaep.sha256.fromNode=hex:6f616570"#,
+        r#"oaep.sha256.label.fromNode=hex:6f616570"#,
+        r#"oaep.sha256.label.other=throws ERR_OSSL_RSA_OAEP_DECODING_ERROR: error:02000079:rsa routines::oaep decoding error"#,
+        r#"oaep.sha256.label.absent=throws ERR_OSSL_RSA_OAEP_DECODING_ERROR: error:02000079:rsa routines::oaep decoding error"#,
+        r#"oaep.sha256.roundtrip=hex:7274"#,
+        r#"oaep.sha384.fromNode=hex:6f616570"#,
+        r#"oaep.sha384.label.fromNode=hex:6f616570"#,
+        r#"oaep.sha384.label.other=throws ERR_OSSL_RSA_OAEP_DECODING_ERROR: error:02000079:rsa routines::oaep decoding error"#,
+        r#"oaep.sha384.label.absent=throws ERR_OSSL_RSA_OAEP_DECODING_ERROR: error:02000079:rsa routines::oaep decoding error"#,
+        r#"oaep.sha384.roundtrip=hex:7274"#,
+        r#"oaep.sha512.fromNode=hex:6f616570"#,
+        r#"oaep.sha512.label.fromNode=hex:6f616570"#,
+        r#"oaep.sha512.label.other=throws ERR_OSSL_RSA_OAEP_DECODING_ERROR: error:02000079:rsa routines::oaep decoding error"#,
+        r#"oaep.sha512.label.absent=throws ERR_OSSL_RSA_OAEP_DECODING_ERROR: error:02000079:rsa routines::oaep decoding error"#,
+        r#"oaep.sha512.roundtrip=hex:7274"#,
+        r#"oaep.hash.spellings=hex:7274"#,
+        r#"oaep.sha224.roundtrip=hex:7274"#,
+        r#"oaep.label.type=throws ERR_INVALID_ARG_TYPE: The "key.oaepLabel" property must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received type number (5)"#,
+        r#"oaep.undecodable=throws ERR_OSSL_RSA_OAEP_DECODING_ERROR: error:02000079:rsa routines::oaep decoding error"#,
+        r#"oaep.messageTooLong=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE: error:0200006E:rsa routines::data too large for key size"#,
+        r#"oaep.messageMax=256"#,
+        r#"pkcs1.fromNode=hex:706b6373312076312e35"#,
+        r#"pkcs1.fromNode.empty=0"#,
+        r#"pkcs1.roundtrip=hex:7274"#,
+        r#"pkcs1.messageTooLong=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE: error:0200006E:rsa routines::data too large for key size"#,
+        r#"pkcs1.messageMax=256"#,
+        r#"privateEncrypt.messageTooLong=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE: error:0200006E:rsa routines::data too large for key size"#,
+        r#"pss.sha1.digest.fromNode=[true,true,false,false]"#,
+        r#"pss.sha1.max.fromNode=[true,false,false,false]"#,
+        r#"pss.sha1.0.fromNode=[true,false,false,false]"#,
+        r#"pss.sha1.7.fromNode=[true,false,true,false]"#,
+        r#"pss.sha1.roundtrip=[true,true,true,true]"#,
+        r#"pss.sha256.digest.fromNode=[true,true,false,false]"#,
+        r#"pss.sha256.max.fromNode=[true,false,false,false]"#,
+        r#"pss.sha256.0.fromNode=[true,false,false,false]"#,
+        r#"pss.sha256.7.fromNode=[true,false,true,false]"#,
+        r#"pss.sha256.roundtrip=[true,true,true,true]"#,
+        r#"pss.sha384.digest.fromNode=[true,true,false,false]"#,
+        r#"pss.sha384.max.fromNode=[true,false,false,false]"#,
+        r#"pss.sha384.0.fromNode=[true,false,false,false]"#,
+        r#"pss.sha384.7.fromNode=[true,false,true,false]"#,
+        r#"pss.sha384.roundtrip=[true,true,true,true]"#,
+        r#"pss.sha512.digest.fromNode=[true,true,false,false]"#,
+        r#"pss.sha512.max.fromNode=[true,false,false,false]"#,
+        r#"pss.sha512.0.fromNode=[true,false,false,false]"#,
+        r#"pss.sha512.7.fromNode=[true,false,true,false]"#,
+        r#"pss.sha512.roundtrip=[true,true,true,true]"#,
+        r#"pss.wrongLength=[false,false,false]"#,
+        r#"priv.pkcs8pem=sha256:0018f445b4fc1d1e270ce8561e503e229cf8bcc0ee16fccd9c6fe869a205fdca"#,
+        r#"priv.pkcs1pem=sha256:ad202abcfb8b3a16435f5f0343cd032d3b49df22d05f281176da2df960fc90f4"#,
+        r#"priv.pkcs8der=sha256:0018f445b4fc1d1e270ce8561e503e229cf8bcc0ee16fccd9c6fe869a205fdca"#,
+        r#"priv.pkcs1der=sha256:ad202abcfb8b3a16435f5f0343cd032d3b49df22d05f281176da2df960fc90f4"#,
+        r#"pub.spkipem=sha256:bc517b5dbe09a184eca158afea5f12edd284226dae7d1b9e90d6b4fd2cadf4e2"#,
+        r#"pub.pkcs1pem=[true,true]"#,
+        r#"pub.spkider=sha256:bc517b5dbe09a184eca158afea5f12edd284226dae7d1b9e90d6b4fd2cadf4e2"#,
+        r#"pub.pkcs1der=[true,true]"#,
+        r#"pub.fromPrivate=sha256:bc517b5dbe09a184eca158afea5f12edd284226dae7d1b9e90d6b4fd2cadf4e2"#,
+        r#"pub.fromPrivate.pkcs1=sha256:bc517b5dbe09a184eca158afea5f12edd284226dae7d1b9e90d6b4fd2cadf4e2"#,
+        r#"jwk.private.fields=d:342 dp:171 dq:171 e:4 kty:3 n:342 p:171 q:171 qi:171"#,
+        r#"jwk.private.n=sha256:0668885e8bf87bf747d098e6f40c842d4c23127750d6fd69f314f467cec3b9c7"#,
+        r#"jwk.private.e=AQAB"#,
+        r#"jwk.private.d=sha256:3757f7d9b3ca5c584c80fbff3c713ca5f85a6b50fc228437544801f05b69e7e7"#,
+        r#"jwk.private.p=sha256:e30edb97f7d2d8542a9f147acb2746930852b10a2b5851f549d09eefde8352e5"#,
+        r#"jwk.private.q=sha256:0a99ded799091d0b23989cef3279fff05731e447bc77c37ce1ee030ab2f2c7b4"#,
+        r#"jwk.private.dp=sha256:57e5c1721629ee812966d42b2b7fceb7c6b718219ff103cf4b39eee32368708e"#,
+        r#"jwk.private.dq=sha256:df653393ff0390f8699c0d6bda28444227bde2d2b7ee47e7109829b75693b662"#,
+        r#"jwk.private.qi=sha256:bd76dd1200a5455db2ab8fb86d79a62c92060336d5df68fa53cd8cd3bbe3629d"#,
+        r#"jwk.public=["RSA","AQAB",true,"e,kty,n"]"#,
+        r#"jwk.import.private=sha256:0018f445b4fc1d1e270ce8561e503e229cf8bcc0ee16fccd9c6fe869a205fdca"#,
+        r#"jwk.import.public=sha256:bc517b5dbe09a184eca158afea5f12edd284226dae7d1b9e90d6b4fd2cadf4e2"#,
+        r#"jwk.import.sign=sha256:ad202abcfb8b3a16435f5f0343cd032d3b49df22d05f281176da2df960fc90f4"#,
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), expected.len(), "line count; stdout:\n{stdout}");
+    for (got, want) in lines.iter().zip(expected.iter()) {
+        assert_eq!(got, want, "stdout:\n{stdout}");
+    }
+}
+
+// privateDecrypt with RSA_PKCS1_PADDING on a block that does not decode: node
+// returns a buffer, the same one for the same key and block, and so does oam,
+// with the same bytes. Expected lines are node v22.22.2's for fixed keys and
+// fixed blocks; the script is run twice to show a second process agrees.
+#[test]
+fn crypto_rsa_private_decrypt_pkcs1_undecodable_block_matches_node() {
+    let file = write_temp(
+        "rsa_pkcs1_undecodable.cjs",
+        r#"
+const crypto = require('node:crypto');
+const C = crypto.constants;
+const msg = Buffer.from('oam rsa interop message');
+const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
+const show = (v) => Buffer.isBuffer(v) ? (v.length <= 40 ? 'hex:' + v.toString('hex') : 'sha256:' + sha(v)) : typeof v === 'string' ? v : JSON.stringify(v);
+function t(name, fn) {
+  let r;
+  try { r = show(fn()); } catch (e) { r = 'throws ' + (e.code || e.name) + ': ' + e.message; }
+  console.log(name + '=' + r);
+}
+const der = (pem) => Buffer.from(pem.split('\n').filter((l) => !l.startsWith('-----')).join(''), 'base64');
+const hex = (s) => Buffer.from(s, 'hex');
+
+{
+  const PRIV = "-----BEGIN PRIVATE KEY-----\nMIICdgIBADANBgkqhkiG9w0BAQEFAASCAmAwggJcAgEAAoGBAJ7h+HNnCM++xncJ\nyfFIsHZzRBhPpfkgeCTSorJnKTxnBtg+rxgLFb0QxJmbT3i6bejG0bVQohIMiCNQ\nZE7K5QM9KESIJ+zES7WHFmEptsre6aaOF1wNzNWXYPaNnQ9ZZEqSF4NKl1WTYNmL\nS2bJxdqCaSWwzaM3aDvS9P+1fKyvAgMBAAECgYAxZ70VTZXM29rlCzMzh1HwE1m6\nYZIPzMvvT1xuM2v8L2FOfvd9d3z0BLHNviDRPs+Mkb6GLiOnjyQKLyZx5d+eS8VI\nXzj9OCInO/G5ZmlynVBkP3PVYCqVpUNBuRPmmUlPfLExpRU4yoLyCw4/V/Wc4uoF\nsTH9RdvYX6ttgGsbcQJBAM0aI8QHxBQa1nLHv1Yy1j6/AVbyZLAvdMv+1MvCggi6\n5PIVN6oha/CSsia3xMlrsJ+oKaOrJV+LTR2M1TjHP6cCQQDGT5Lvcn852kb6XgQl\nnBY07NVhQEP7JGI9ssRnufhqekeqLPOaCwmCTFtZXibNwNJimRSIJTYt34rcGabQ\nkIu5AkA+cObSl0qqlEEVUJp/s5pmH+BYiBL/UHNOZ5aBMgZEgiGRUcRQlzw1UXPL\nNcdDSvXKpXeHzGLkY5RmmqmPT5mhAkBjqMO3z7t+MGKxGaRN3kYOrOKC8A/52wv/\n46HuWrgrkm4HaHW3eUp7D7Jsk/M+PWO9Jx75WHIE1a1r9PwvHiUJAkEAnlKQrcNS\nkxXXypzx+QgV9ajVqHftNB3MH0hca7WzjFLw7vd+QgGQpsSzz0xEl6sEbcDATfCp\n2XlK/AUTXVY3lA==\n-----END PRIVATE KEY-----\n";
+  const PRIV1 = "-----BEGIN RSA PRIVATE KEY-----\nMIICXAIBAAKBgQCe4fhzZwjPvsZ3CcnxSLB2c0QYT6X5IHgk0qKyZyk8ZwbYPq8Y\nCxW9EMSZm094um3oxtG1UKISDIgjUGROyuUDPShEiCfsxEu1hxZhKbbK3ummjhdc\nDczVl2D2jZ0PWWRKkheDSpdVk2DZi0tmycXagmklsM2jN2g70vT/tXysrwIDAQAB\nAoGAMWe9FU2VzNva5QszM4dR8BNZumGSD8zL709cbjNr/C9hTn73fXd89ASxzb4g\n0T7PjJG+hi4jp48kCi8mceXfnkvFSF84/TgiJzvxuWZpcp1QZD9z1WAqlaVDQbkT\n5plJT3yxMaUVOMqC8gsOP1f1nOLqBbEx/UXb2F+rbYBrG3ECQQDNGiPEB8QUGtZy\nx79WMtY+vwFW8mSwL3TL/tTLwoIIuuTyFTeqIWvwkrImt8TJa7CfqCmjqyVfi00d\njNU4xz+nAkEAxk+S73J/OdpG+l4EJZwWNOzVYUBD+yRiPbLEZ7n4anpHqizzmgsJ\ngkxbWV4mzcDSYpkUiCU2Ld+K3Bmm0JCLuQJAPnDm0pdKqpRBFVCaf7OaZh/gWIgS\n/1BzTmeWgTIGRIIhkVHEUJc8NVFzyzXHQ0r1yqV3h8xi5GOUZpqpj0+ZoQJAY6jD\nt8+7fjBisRmkTd5GDqzigvAP+dsL/+Oh7lq4K5JuB2h1t3lKew+ybJPzPj1jvSce\n+VhyBNWta/T8Lx4lCQJBAJ5SkK3DUpMV18qc8fkIFfWo1ah37TQdzB9IXGu1s4xS\n8O73fkIBkKbEs89MRJerBG3AwE3wqdl5SvwFE11WN5Q=\n-----END RSA PRIVATE KEY-----\n";
+  const k = 128;
+  const opts = (key) => ({ key, padding: C.RSA_PKCS1_PADDING });
+  for (let i = 0; i < 6; i++) {
+    const ct = Buffer.alloc(k);
+    for (let j = 0; j < k; j++) ct[j] = (j * 37 + i * 101 + 11) & 0xff;
+    ct[0] &= 0x3f;
+    t('rsa1024.block' + i, () => {
+      const a = crypto.privateDecrypt(opts(PRIV), ct);
+      // The same key in its other encoding, and a second call: the same bytes.
+      const again = crypto.privateDecrypt(opts(PRIV), ct).equals(a) && crypto.privateDecrypt(opts(PRIV1), ct).equals(a);
+      return [again, a.length, show(a)];
+    });
+  }
+  t('rsa1024.zeroBlock', () => crypto.privateDecrypt(opts(PRIV), Buffer.alloc(k)));
+  // A block shorter than the modulus is the same integer without its leading zero bytes.
+  t('rsa1024.shortBlock', () => crypto.privateDecrypt(opts(PRIV), Buffer.alloc(k - 1, 1)));
+  t('rsa1024.shortBlock.padded', () => { const ct = Buffer.alloc(k, 1); ct[0] = 0; return crypto.privateDecrypt(opts(PRIV), ct).equals(crypto.privateDecrypt(opts(PRIV), Buffer.alloc(k - 1, 1))); });
+  t('rsa1024.oneByte', () => crypto.privateDecrypt(opts(PRIV), Buffer.from([7])));
+  // Not a block for this key at all: these are refused.
+  t('rsa1024.empty', () => crypto.privateDecrypt(opts(PRIV), Buffer.alloc(0)));
+  t('rsa1024.tooLong', () => crypto.privateDecrypt(opts(PRIV), Buffer.alloc(k + 1, 1)));
+  t('rsa1024.notBelowModulus', () => crypto.privateDecrypt(opts(PRIV), Buffer.alloc(k, 0xff)));
+  // A well-formed ciphertext still decrypts.
+  t('rsa1024.wellFormed', () => crypto.privateDecrypt(opts(PRIV), hex("891a391e9b7ec6f2b7cca495b3b9cb53f4de2e5deb5226fdd859acca3a4d30d9f6bf9f075ab53072200a4dce573cc1193cb8685113d53382b48e6ce36b404dfacdbf5db026de6528ca04e8c8db4a511401c014b5e9b78d2f03471edb0dd02d4ffc9102732167d059ecf71d48f911067d879321c6ac51f5590d7a8f1b8de359a7")).toString());
+}
+
+{
+  const PRIV = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDq0PY64yGXmo1t\nTNBMW21m5n8lCyrIXCDgNFKxZShofTyjpCghCt8DfM/mKLcTCBhVnmnyXEq6wKK4\nYPc1xhQkvfj8ZYtcsxS8Fhygwd7BQoFEMHp8ciuCHFwYyLVVpjDEWrYM2zNz6jrS\nKOifqEQHMjTgcj2a606xM4yzv4f9PAIEUQT8OIRaAPf1Tf6Egvbw0EZUBD6GLlgg\npFljQFB8+Z1fxKXhikus1R9oT/gZnxnrqikqb0udLT4Qx8TgGXSEEIOkFWM5+YDj\nAOzxZOgdY7hOSlXnPSujHLsOeIRg9PhLhFjUTQ6v6JNQRKPSTvsc66v65VFJ4eLq\nuA27AJarAgMBAAECggEASwZ7/eGvTHydnmQSE6uMn3ma+y9/umexO2GMYFClYglN\ntC1RgwkxqzAYTv4ITITkHYsRZ9X0LIo7E3Ur11sT+Y9XO/GH3xT61YOtHvICpbYF\njk98+0ERRK+h/2s1gQmqADrJev8Yh/s5UweuF8EQB0qT2Xi21UZErNp/JLlYDmEe\nyL1bMVE4FWYXdHnIqYo+D9/h2tUYVBjz53XebrIGnUMkR0mF6xN2NkhumtyuJXEy\nlB+zhkYF1qiCNPCbGPGyuqUJA1VPfuRriEmO+J0NEV0aDLNy/Khv+yuTejFcJCpt\nypwYZ0Gqe3hV+7bQULIvNvW4neBGtkAeSSFI7I0FmQKBgQD2CBupoydDDBzJXH5Y\n28V2Mf8vg2eqcfnqlKKQnK/DyOT56flLgF74J+8CoAlKmM2rctCRowpWDUT2S66B\nnMP23jZL4eRl6L+gZYOmFkuwH+KJcs4c2BvwTI2d5HtKNdpenf5P+A+OKTKoPwgB\nT6/FFiFqHr58TSPA74eTNy4Q8wKBgQD0VIZwQHIoPXnn44aKt0Jp0I0B7LaIGGtS\nP3ulLgNNZr/8vspRRSyCNMH2YLiPXYfQcePfNV2PsgZn94gvoMDE6dL1vcxi53yv\nZsdtuCBq3MfMuu8w6MwMK4k+aJSjbmrxJvgLkfMva1VZF4X59eXlHwc+hWrz1qfW\nt36saPaRaQKBgHcNq10mHxyZouBpipYzGtU8ElEKlEJtTtMNw7CYsZDbCLpKVyEK\n6GnK4SRzDqvzTyrUr0qaC6liWGmaa8I6erVeCAYmNCCARSI3nUHkbhG3DCcYz9Yz\nWSmp0amC44ogjx/T8jj+P4C6PNIfVh9UUSjcsaSpZeG+bjuxbPh27iqzAoGBAIdg\nLf0UOCxDo7/wOSOy1oF6pCZk2d4eaZhwxDmJfRrty4Jm1AKjqT2brbytapVE5XOB\nJxkNoIF1ykbgx/xbvXNdex3dw9kpGdS1xdntI0kSe0HccZtP4X78wFZr66+CBo8H\nYHhIrc2gUvHCLuGIdZC12HWzxsbEMMqvcOhmX/fBAoGAGB6Gh1Rd6dggDcZu4AuJ\n4DR64giVmmLYK1a8dS5e+M4+emTl7kVC9SLhLrIRLX9FsTj4wKZI96wImJc88lOO\n5gg9dAJ/aTqkENxf0f5Jb896aafoJopxYVsae6/qQIKbDv7xDyQkqK5ne8W7y7rT\nveypYU+3vLV5dytdMGn1owc=\n-----END PRIVATE KEY-----\n";
+  const PRIV1 = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA6tD2OuMhl5qNbUzQTFttZuZ/JQsqyFwg4DRSsWUoaH08o6Qo\nIQrfA3zP5ii3EwgYVZ5p8lxKusCiuGD3NcYUJL34/GWLXLMUvBYcoMHewUKBRDB6\nfHIrghxcGMi1VaYwxFq2DNszc+o60ijon6hEBzI04HI9mutOsTOMs7+H/TwCBFEE\n/DiEWgD39U3+hIL28NBGVAQ+hi5YIKRZY0BQfPmdX8Sl4YpLrNUfaE/4GZ8Z66op\nKm9LnS0+EMfE4Bl0hBCDpBVjOfmA4wDs8WToHWO4TkpV5z0roxy7DniEYPT4S4RY\n1E0Or+iTUESj0k77HOur+uVRSeHi6rgNuwCWqwIDAQABAoIBAEsGe/3hr0x8nZ5k\nEhOrjJ95mvsvf7pnsTthjGBQpWIJTbQtUYMJMaswGE7+CEyE5B2LEWfV9CyKOxN1\nK9dbE/mPVzvxh98U+tWDrR7yAqW2BY5PfPtBEUSvof9rNYEJqgA6yXr/GIf7OVMH\nrhfBEAdKk9l4ttVGRKzafyS5WA5hHsi9WzFROBVmF3R5yKmKPg/f4drVGFQY8+d1\n3m6yBp1DJEdJhesTdjZIbprcriVxMpQfs4ZGBdaogjTwmxjxsrqlCQNVT37ka4hJ\njvidDRFdGgyzcvyob/srk3oxXCQqbcqcGGdBqnt4Vfu20FCyLzb1uJ3gRrZAHkkh\nSOyNBZkCgYEA9ggbqaMnQwwcyVx+WNvFdjH/L4NnqnH56pSikJyvw8jk+en5S4Be\n+CfvAqAJSpjNq3LQkaMKVg1E9kuugZzD9t42S+HkZei/oGWDphZLsB/iiXLOHNgb\n8EyNneR7SjXaXp3+T/gPjikyqD8IAU+vxRYhah6+fE0jwO+HkzcuEPMCgYEA9FSG\ncEByKD155+OGirdCadCNAey2iBhrUj97pS4DTWa//L7KUUUsgjTB9mC4j12H0HHj\n3zVdj7IGZ/eIL6DAxOnS9b3MYud8r2bHbbggatzHzLrvMOjMDCuJPmiUo25q8Sb4\nC5HzL2tVWReF+fXl5R8HPoVq89an1rd+rGj2kWkCgYB3DatdJh8cmaLgaYqWMxrV\nPBJRCpRCbU7TDcOwmLGQ2wi6SlchCuhpyuEkcw6r808q1K9KmgupYlhpmmvCOnq1\nXggGJjQggEUiN51B5G4RtwwnGM/WM1kpqdGpguOKII8f0/I4/j+AujzSH1YfVFEo\n3LGkqWXhvm47sWz4du4qswKBgQCHYC39FDgsQ6O/8DkjstaBeqQmZNneHmmYcMQ5\niX0a7cuCZtQCo6k9m628rWqVROVzgScZDaCBdcpG4Mf8W71zXXsd3cPZKRnUtcXZ\n7SNJEntB3HGbT+F+/MBWa+uvggaPB2B4SK3NoFLxwi7hiHWQtdh1s8bGxDDKr3Do\nZl/3wQKBgBgehodUXenYIA3GbuALieA0euIIlZpi2CtWvHUuXvjOPnpk5e5FQvUi\n4S6yES1/RbE4+MCmSPesCJiXPPJTjuYIPXQCf2k6pBDcX9H+SW/Pemmn6CaKcWFb\nGnuv6kCCmw7+8Q8kJKiuZ3vFu8u6073sqWFPt7y1eXcrXTBp9aMH\n-----END RSA PRIVATE KEY-----\n";
+  const k = 256;
+  const opts = (key) => ({ key, padding: C.RSA_PKCS1_PADDING });
+  for (let i = 0; i < 6; i++) {
+    const ct = Buffer.alloc(k);
+    for (let j = 0; j < k; j++) ct[j] = (j * 37 + i * 101 + 11) & 0xff;
+    ct[0] &= 0x3f;
+    t('rsa2048.block' + i, () => {
+      const a = crypto.privateDecrypt(opts(PRIV), ct);
+      // The same key in its other encoding, and a second call: the same bytes.
+      const again = crypto.privateDecrypt(opts(PRIV), ct).equals(a) && crypto.privateDecrypt(opts(PRIV1), ct).equals(a);
+      return [again, a.length, show(a)];
+    });
+  }
+  t('rsa2048.zeroBlock', () => crypto.privateDecrypt(opts(PRIV), Buffer.alloc(k)));
+  // A block shorter than the modulus is the same integer without its leading zero bytes.
+  t('rsa2048.shortBlock', () => crypto.privateDecrypt(opts(PRIV), Buffer.alloc(k - 1, 1)));
+  t('rsa2048.shortBlock.padded', () => { const ct = Buffer.alloc(k, 1); ct[0] = 0; return crypto.privateDecrypt(opts(PRIV), ct).equals(crypto.privateDecrypt(opts(PRIV), Buffer.alloc(k - 1, 1))); });
+  t('rsa2048.oneByte', () => crypto.privateDecrypt(opts(PRIV), Buffer.from([7])));
+  // Not a block for this key at all: these are refused.
+  t('rsa2048.empty', () => crypto.privateDecrypt(opts(PRIV), Buffer.alloc(0)));
+  t('rsa2048.tooLong', () => crypto.privateDecrypt(opts(PRIV), Buffer.alloc(k + 1, 1)));
+  t('rsa2048.notBelowModulus', () => crypto.privateDecrypt(opts(PRIV), Buffer.alloc(k, 0xff)));
+  // A well-formed ciphertext still decrypts.
+  t('rsa2048.wellFormed', () => crypto.privateDecrypt(opts(PRIV), hex("026b5535d8c19e721052b3a342951c60d0a380e129ce19016459cfb89f946c62b8c1565169363df6711e7a30cc47aa2df8e9f85a66eac6f12656b5a452275964e7203e8e6b7f910e9b58bde5340dc7066aaf7b06c093348534f60961c390c32f30539a07dd54303c0e1b4a017a279cca31f9b43c239e850a9417a6314754d19f98325103d157b07b304b83916c088a17841469bb79d4b608e825417fbe1147bb24b55eb6234f7d55f1852f857c3918c2dc126c5c967fa8b06bbb4922ed103f0e7a6df00d5c74eb39a38cb29b75c930348cc980844606829db45175bbd082eeeca59d2eae6936538cf11738720cc32feec54be467d9351b6510fa036a2cc4803d")).toString());
+}
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "rsa_pkcs1_undecodable.cjs failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        r#"rsa1024.block0=[true,73,"sha256:cbc56e73293eebd3a8a917020a2c2095ae4dc572283f397f47e40056c6840326"]"#,
+        r#"rsa1024.block1=[true,66,"sha256:df6841b67ef4e8793de088c2c7df7d322c21d44566c0e397f40a0e10209af916"]"#,
+        r#"rsa1024.block2=[true,83,"sha256:8245585a6f0b1d8e4d08ad2d8660e8a9319c819403e3d4a44d05000f567c342e"]"#,
+        r#"rsa1024.block3=[true,55,"sha256:1d0023d255c3f2281ed00ae769f6672a3f46cbc45277d02e2d70fd24e39a96bd"]"#,
+        r#"rsa1024.block4=[true,25,"hex:497be2aeacb8197bc48664c8bae03275e72a77bbeae6d3984c"]"#,
+        r#"rsa1024.block5=[true,21,"hex:a59702db673ac623754977edc494a1a28cb5127e37"]"#,
+        r#"rsa1024.zeroBlock=sha256:c2b6f00375fe02dd6aaa4eb5e4f3be10a935cf26330e98c704c3f6fd5698e2c3"#,
+        r#"rsa1024.shortBlock=sha256:36e578f6e507eb1ce86a6dfb231576ade05cd0a13accb0aa5ef80baed7da9abf"#,
+        r#"rsa1024.shortBlock.padded=true"#,
+        r#"rsa1024.oneByte=sha256:0aa5890bedcddf79f20bf13cd85b8c6f144f962e0ca99c2372df48bb298e8f1f"#,
+        r#"rsa1024.empty=throws ERR_OSSL_RSA_DATA_TOO_SMALL: error:0200006F:rsa routines::data too small"#,
+        r#"rsa1024.tooLong=throws ERR_OSSL_RSA_DATA_GREATER_THAN_MOD_LEN: error:0200006C:rsa routines::data greater than mod len"#,
+        r#"rsa1024.notBelowModulus=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_MODULUS: error:02000084:rsa routines::data too large for modulus"#,
+        r#"rsa1024.wellFormed=pkcs1 v1.5"#,
+        r#"rsa2048.block0=[true,199,"sha256:7922954fa428e77bf802a99580d5d59e5a19855a1e5465c9f9b67824ef982eba"]"#,
+        r#"rsa2048.block1=[true,25,"hex:a953f4b5d85f706c23c07da05da22f67acd5f212d9d125bb69"]"#,
+        r#"rsa2048.block2=[true,99,"sha256:8df328765269a6303cd2a441fd2f3b525cb8a108f20130e6e3ef748d1e1d3ac9"]"#,
+        r#"rsa2048.block3=[true,175,"sha256:5bc4c28d71a5ecb3f23a10e3d35a80760a875f2a838598f561965f2cc846b908"]"#,
+        r#"rsa2048.block4=[true,145,"sha256:551d4c7f84a6cd6915b460556dae42c569896233bf9b74192d66094ba37849fb"]"#,
+        r#"rsa2048.block5=[true,157,"sha256:66e025723a32280c12acd1338f94cdcd5b5058d797ecdb0cc6d5d965de8851bc"]"#,
+        r#"rsa2048.zeroBlock=sha256:d80c58ced91bb5fe688ba450515b48bed85b65ffe65de8f7f233666433a76903"#,
+        r#"rsa2048.shortBlock=sha256:2c400bca1016c04e5511f3d8ca92623a4448280680ee1d8885a32eb446063d05"#,
+        r#"rsa2048.shortBlock.padded=true"#,
+        r#"rsa2048.oneByte=sha256:daca14ab7ea109be111dda689b086472d4db952a919e6a83d127c0a8feb63078"#,
+        r#"rsa2048.empty=throws ERR_OSSL_RSA_DATA_TOO_SMALL: error:0200006F:rsa routines::data too small"#,
+        r#"rsa2048.tooLong=throws ERR_OSSL_RSA_DATA_GREATER_THAN_MOD_LEN: error:0200006C:rsa routines::data greater than mod len"#,
+        r#"rsa2048.notBelowModulus=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_MODULUS: error:02000084:rsa routines::data too large for modulus"#,
+        r#"rsa2048.wellFormed=pkcs1 v1.5"#,
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), expected.len(), "line count; stdout:\n{stdout}");
+    for (got, want) in lines.iter().zip(expected.iter()) {
+        assert_eq!(got, want, "stdout:\n{stdout}");
+    }
+    // A second process: the same bytes again.
+    let again = oam(&["run", file.to_str().unwrap()]);
+    assert_eq!(String::from_utf8_lossy(&again.stdout), stdout);
+}
+
+// What each RSA operation does by modulus size, against node v22.22.2: fixed
+// 256-, 512-, 1024- and 2048-bit keys (node made them; the 256-bit one came
+// in through a JWK, since node will not generate below 512 bits), public keys
+// of 16384 and 16392 bits, and generateKeyPairSync from 511 to 1025 bits.
+// Expected lines are node's except where a `// node:` comment says
+// what node prints instead; docs/node-divergences.md lists those.
+#[test]
+fn crypto_rsa_key_sizes_follow_node() {
+    let file = write_temp(
+        "rsa_key_sizes.cjs",
+        r#"
+const crypto = require('node:crypto');
+const C = crypto.constants;
+const msg = Buffer.from('oam rsa interop message');
+const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
+const show = (v) => Buffer.isBuffer(v) ? (v.length <= 40 ? 'hex:' + v.toString('hex') : 'sha256:' + sha(v)) : typeof v === 'string' ? v : JSON.stringify(v);
+function t(name, fn) {
+  let r;
+  try { r = show(fn()); } catch (e) { r = 'throws ' + (e.code || e.name) + ': ' + e.message; }
+  console.log(name + '=' + r);
+}
+const der = (pem) => Buffer.from(pem.split('\n').filter((l) => !l.startsWith('-----')).join(''), 'base64');
+const hex = (s) => Buffer.from(s, 'hex');
+
+{
+  const PRIV = "-----BEGIN PRIVATE KEY-----\nMIHEAgEAMA0GCSqGSIb3DQEBAQUABIGvMIGsAgEAAiEAwPAXIJrh6HP4RjrMNl9n\nBDHFVWIAbVjhJL+4LWDvBDUCAwEAAQIhALnxacihnGEEC13b4t3wGf2zUeKpDj69\n97WpV14DnbuhAhEA5I+gqs0ZzVb9yzA3w9KIPQIRANgZp32QuDAFqShqRuIXs1kC\nEBdxa+dY9iaLn6hxn6akN3kCEQDLb1s92f+LNckJQwN31NgBAhEAjwza9EeIhqN/\nChMCZNXCNw==\n-----END PRIVATE KEY-----\n";
+  const PUB = "-----BEGIN PUBLIC KEY-----\nMDwwDQYJKoZIhvcNAQEBBQADKwAwKAIhAMDwFyCa4ehz+EY6zDZfZwQxxVViAG1Y\n4SS/uC1g7wQ1AgMBAAE=\n-----END PUBLIC KEY-----\n";
+  const k = 32;
+  const p = 'rsa256.';
+  t(p + 'import', () => [crypto.createPrivateKey(PRIV).asymmetricKeyType, crypto.createPublicKey(PUB).asymmetricKeyType, show(crypto.createPublicKey(PRIV).export({ type: 'spki', format: 'der' }))]);
+  t(p + 'jwk', () => { const j = crypto.createPrivateKey(PRIV).export({ format: 'jwk' }); return [Buffer.from(j.n, 'base64url').length, sha(Buffer.from(j.d + j.p + j.q + j.dp + j.dq + j.qi))]; });
+  t(p + 'privateEncrypt', () => crypto.privateEncrypt(PRIV, Buffer.from('pe')));
+  t(p + 'publicDecrypt', () => crypto.publicDecrypt(PUB, crypto.privateEncrypt(PRIV, Buffer.from('pe'))));
+  t(p + 'pkcs1.roundtrip', () => crypto.privateDecrypt({ key: PRIV, padding: C.RSA_PKCS1_PADDING }, crypto.publicEncrypt({ key: PUB, padding: C.RSA_PKCS1_PADDING }, Buffer.from('rt'))));
+  t(p + 'pkcs1.fromNode', () => crypto.privateDecrypt({ key: PRIV, padding: C.RSA_PKCS1_PADDING }, hex("ba4dcdc814116afb731dc7f5887820311de2326d779d446e04c6a4f8efa66ec0")));
+  t(p + 'pkcs1.undecodable', () => crypto.privateDecrypt({ key: PRIV, padding: C.RSA_PKCS1_PADDING }, Buffer.alloc(k, 1).fill(0, 0, 1)));
+  t(p + 'oaep.sha1.roundtrip', () => crypto.privateDecrypt(PRIV, crypto.publicEncrypt(PUB, Buffer.from('rt'))));
+  t(p + 'oaep.sha1.fromNode', () => crypto.privateDecrypt(PRIV, hex("")));
+  t(p + 'oaep.sha256.roundtrip', () => crypto.privateDecrypt({ key: PRIV, oaepHash: 'sha256' }, crypto.publicEncrypt({ key: PUB, oaepHash: 'sha256' }, Buffer.from('rt'))));
+  t(p + 'nopad', () => { const b = Buffer.alloc(k, 3); b[0] = 0; const c = crypto.publicEncrypt({ key: PUB, padding: C.RSA_NO_PADDING }, b); return [show(c), crypto.privateDecrypt({ key: PRIV, padding: C.RSA_NO_PADDING }, c).equals(b)]; });
+  t(p + 'pss.sha1.fromNode', () => crypto.verify('sha1', msg, { key: PUB, padding: C.RSA_PKCS1_PSS_PADDING }, hex("1013654975990253e747cb31d5ed84f29b04fc13e78541bca5edaff73d99a90a")));
+  t(p + 'pss.sha1.roundtrip', () => crypto.verify('sha1', msg, { key: PUB, padding: C.RSA_PKCS1_PSS_PADDING }, crypto.sign('sha1', msg, { key: PRIV, padding: C.RSA_PKCS1_PSS_PADDING })));
+  t(p + 'pss.sha512.roundtrip', () => crypto.verify('sha512', msg, { key: PUB, padding: C.RSA_PKCS1_PSS_PADDING }, crypto.sign('sha512', msg, { key: PRIV, padding: C.RSA_PKCS1_PSS_PADDING })));
+  t(p + 'sign.pkcs1.sha256', () => crypto.sign('sha256', msg, PRIV));
+}
+
+{
+  const PRIV = "-----BEGIN PRIVATE KEY-----\nMIIBVgIBADANBgkqhkiG9w0BAQEFAASCAUAwggE8AgEAAkEA2bf7YFbzENG9E0Wl\nINTswCgvJql2GPvPoHuE2lB0GqfRTOT7nI18c8swaNexA1VdUk5lPMHnLAcPZ48l\nmwxjWQIDAQABAkEAyBhXZ8uByUt6QmQXx3zpuhE0hIvqhjuoLw5Wo26dxoAT31dl\n2zZr/Gp1G+A27zXIC0U6LUe1d7Y8wc2m1CcqIQIhAOy+JngeF3HVbhrt3IoUzxr2\njETZIEQA/NG6U+nvI5wrAiEA622uNGUCcEWozLCC6NjG98myqqFNgU4DHZQpadaf\nyIsCIGgl0sie/FNgwFpqb83zD5VeByE2n8Iq6Q3euZG9WV4XAiEAsId0aVsYIgFJ\nmfn8nwX041W8/46lpABP+7zd9Lt24hMCIQCFj8U6mtGrR1lMFOLkg4nheHQTNDN6\ndwb3jCF9p7LJig==\n-----END PRIVATE KEY-----\n";
+  const PUB = "-----BEGIN PUBLIC KEY-----\nMFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBANm3+2BW8xDRvRNFpSDU7MAoLyapdhj7\nz6B7hNpQdBqn0Uzk+5yNfHPLMGjXsQNVXVJOZTzB5ywHD2ePJZsMY1kCAwEAAQ==\n-----END PUBLIC KEY-----\n";
+  const k = 64;
+  const p = 'rsa512.';
+  t(p + 'import', () => [crypto.createPrivateKey(PRIV).asymmetricKeyType, crypto.createPublicKey(PUB).asymmetricKeyType, show(crypto.createPublicKey(PRIV).export({ type: 'spki', format: 'der' }))]);
+  t(p + 'jwk', () => { const j = crypto.createPrivateKey(PRIV).export({ format: 'jwk' }); return [Buffer.from(j.n, 'base64url').length, sha(Buffer.from(j.d + j.p + j.q + j.dp + j.dq + j.qi))]; });
+  t(p + 'privateEncrypt', () => crypto.privateEncrypt(PRIV, Buffer.from('pe')));
+  t(p + 'publicDecrypt', () => crypto.publicDecrypt(PUB, crypto.privateEncrypt(PRIV, Buffer.from('pe'))));
+  t(p + 'pkcs1.roundtrip', () => crypto.privateDecrypt({ key: PRIV, padding: C.RSA_PKCS1_PADDING }, crypto.publicEncrypt({ key: PUB, padding: C.RSA_PKCS1_PADDING }, Buffer.from('rt'))));
+  t(p + 'pkcs1.fromNode', () => crypto.privateDecrypt({ key: PRIV, padding: C.RSA_PKCS1_PADDING }, hex("c28cd7bf877a4258973000201ae5332603b5107ca2193176b0cb0c3b3827737a362c590120a7344c893a4c058f779d5ecfee310b4d38714b4e3c2acf20b83c16")));
+  t(p + 'pkcs1.undecodable', () => crypto.privateDecrypt({ key: PRIV, padding: C.RSA_PKCS1_PADDING }, Buffer.alloc(k, 1).fill(0, 0, 1)));
+  t(p + 'oaep.sha1.roundtrip', () => crypto.privateDecrypt(PRIV, crypto.publicEncrypt(PUB, Buffer.from('rt'))));
+  t(p + 'oaep.sha1.fromNode', () => crypto.privateDecrypt(PRIV, hex("2941abcb85bfcb4092a2869b8e995ee6f06becd7854cdeeb4f11c66662a7fb540e0345a3ddac7e2ffc9bd55cb75e70c9d663c9d3eed6be414558a20bfb2c045a")));
+  t(p + 'oaep.sha256.roundtrip', () => crypto.privateDecrypt({ key: PRIV, oaepHash: 'sha256' }, crypto.publicEncrypt({ key: PUB, oaepHash: 'sha256' }, Buffer.from('rt'))));
+  t(p + 'nopad', () => { const b = Buffer.alloc(k, 3); b[0] = 0; const c = crypto.publicEncrypt({ key: PUB, padding: C.RSA_NO_PADDING }, b); return [show(c), crypto.privateDecrypt({ key: PRIV, padding: C.RSA_NO_PADDING }, c).equals(b)]; });
+  t(p + 'pss.sha1.fromNode', () => crypto.verify('sha1', msg, { key: PUB, padding: C.RSA_PKCS1_PSS_PADDING }, hex("c6f73c8252f92d9a7344423f115027b7fbd89d7641ef57096d14a2e8ae2749d7836802bcdc39c15650b88c53bb1c99423295e1d068b00eddda6abf1999db7499")));
+  t(p + 'pss.sha1.roundtrip', () => crypto.verify('sha1', msg, { key: PUB, padding: C.RSA_PKCS1_PSS_PADDING }, crypto.sign('sha1', msg, { key: PRIV, padding: C.RSA_PKCS1_PSS_PADDING })));
+  t(p + 'pss.sha512.roundtrip', () => crypto.verify('sha512', msg, { key: PUB, padding: C.RSA_PKCS1_PSS_PADDING }, crypto.sign('sha512', msg, { key: PRIV, padding: C.RSA_PKCS1_PSS_PADDING })));
+  t(p + 'sign.pkcs1.sha256', () => crypto.sign('sha256', msg, PRIV));
+}
+
+{
+  const PRIV = "-----BEGIN PRIVATE KEY-----\nMIICdgIBADANBgkqhkiG9w0BAQEFAASCAmAwggJcAgEAAoGBAJ7h+HNnCM++xncJ\nyfFIsHZzRBhPpfkgeCTSorJnKTxnBtg+rxgLFb0QxJmbT3i6bejG0bVQohIMiCNQ\nZE7K5QM9KESIJ+zES7WHFmEptsre6aaOF1wNzNWXYPaNnQ9ZZEqSF4NKl1WTYNmL\nS2bJxdqCaSWwzaM3aDvS9P+1fKyvAgMBAAECgYAxZ70VTZXM29rlCzMzh1HwE1m6\nYZIPzMvvT1xuM2v8L2FOfvd9d3z0BLHNviDRPs+Mkb6GLiOnjyQKLyZx5d+eS8VI\nXzj9OCInO/G5ZmlynVBkP3PVYCqVpUNBuRPmmUlPfLExpRU4yoLyCw4/V/Wc4uoF\nsTH9RdvYX6ttgGsbcQJBAM0aI8QHxBQa1nLHv1Yy1j6/AVbyZLAvdMv+1MvCggi6\n5PIVN6oha/CSsia3xMlrsJ+oKaOrJV+LTR2M1TjHP6cCQQDGT5Lvcn852kb6XgQl\nnBY07NVhQEP7JGI9ssRnufhqekeqLPOaCwmCTFtZXibNwNJimRSIJTYt34rcGabQ\nkIu5AkA+cObSl0qqlEEVUJp/s5pmH+BYiBL/UHNOZ5aBMgZEgiGRUcRQlzw1UXPL\nNcdDSvXKpXeHzGLkY5RmmqmPT5mhAkBjqMO3z7t+MGKxGaRN3kYOrOKC8A/52wv/\n46HuWrgrkm4HaHW3eUp7D7Jsk/M+PWO9Jx75WHIE1a1r9PwvHiUJAkEAnlKQrcNS\nkxXXypzx+QgV9ajVqHftNB3MH0hca7WzjFLw7vd+QgGQpsSzz0xEl6sEbcDATfCp\n2XlK/AUTXVY3lA==\n-----END PRIVATE KEY-----\n";
+  const PUB = "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCe4fhzZwjPvsZ3CcnxSLB2c0QY\nT6X5IHgk0qKyZyk8ZwbYPq8YCxW9EMSZm094um3oxtG1UKISDIgjUGROyuUDPShE\niCfsxEu1hxZhKbbK3ummjhdcDczVl2D2jZ0PWWRKkheDSpdVk2DZi0tmycXagmkl\nsM2jN2g70vT/tXysrwIDAQAB\n-----END PUBLIC KEY-----\n";
+  const k = 128;
+  const p = 'rsa1024.';
+  t(p + 'import', () => [crypto.createPrivateKey(PRIV).asymmetricKeyType, crypto.createPublicKey(PUB).asymmetricKeyType, show(crypto.createPublicKey(PRIV).export({ type: 'spki', format: 'der' }))]);
+  t(p + 'jwk', () => { const j = crypto.createPrivateKey(PRIV).export({ format: 'jwk' }); return [Buffer.from(j.n, 'base64url').length, sha(Buffer.from(j.d + j.p + j.q + j.dp + j.dq + j.qi))]; });
+  t(p + 'privateEncrypt', () => crypto.privateEncrypt(PRIV, Buffer.from('pe')));
+  t(p + 'publicDecrypt', () => crypto.publicDecrypt(PUB, crypto.privateEncrypt(PRIV, Buffer.from('pe'))));
+  t(p + 'pkcs1.roundtrip', () => crypto.privateDecrypt({ key: PRIV, padding: C.RSA_PKCS1_PADDING }, crypto.publicEncrypt({ key: PUB, padding: C.RSA_PKCS1_PADDING }, Buffer.from('rt'))));
+  t(p + 'pkcs1.fromNode', () => crypto.privateDecrypt({ key: PRIV, padding: C.RSA_PKCS1_PADDING }, hex("891a391e9b7ec6f2b7cca495b3b9cb53f4de2e5deb5226fdd859acca3a4d30d9f6bf9f075ab53072200a4dce573cc1193cb8685113d53382b48e6ce36b404dfacdbf5db026de6528ca04e8c8db4a511401c014b5e9b78d2f03471edb0dd02d4ffc9102732167d059ecf71d48f911067d879321c6ac51f5590d7a8f1b8de359a7")));
+  t(p + 'pkcs1.undecodable', () => crypto.privateDecrypt({ key: PRIV, padding: C.RSA_PKCS1_PADDING }, Buffer.alloc(k, 1).fill(0, 0, 1)));
+  t(p + 'oaep.sha1.roundtrip', () => crypto.privateDecrypt(PRIV, crypto.publicEncrypt(PUB, Buffer.from('rt'))));
+  t(p + 'oaep.sha1.fromNode', () => crypto.privateDecrypt(PRIV, hex("8443881028ee2ccc924bf93c3aeb9645a3f66cbfe072906516ad5412cf3b94b42a911a8562a57d8d1c0d1c45672f23c83883b72a16a1c44204191c03047a53447403eb660ca49994a471b94013f296ea166862c9ce22dcec543c7633c8effbdbc28cdda311a4616c2742a35b743117ecaaab8dd747d2dec81e2f15795ec757b9")));
+  t(p + 'oaep.sha256.roundtrip', () => crypto.privateDecrypt({ key: PRIV, oaepHash: 'sha256' }, crypto.publicEncrypt({ key: PUB, oaepHash: 'sha256' }, Buffer.from('rt'))));
+  t(p + 'nopad', () => { const b = Buffer.alloc(k, 3); b[0] = 0; const c = crypto.publicEncrypt({ key: PUB, padding: C.RSA_NO_PADDING }, b); return [show(c), crypto.privateDecrypt({ key: PRIV, padding: C.RSA_NO_PADDING }, c).equals(b)]; });
+  t(p + 'pss.sha1.fromNode', () => crypto.verify('sha1', msg, { key: PUB, padding: C.RSA_PKCS1_PSS_PADDING }, hex("53a8c1914b6bc9f20bb05b264365ad3d0d245d249ade96fcff758f4d11c3b8d996af9ae32bddb94b80159bfca83f0a6a6e7922767703c4745aceca9f2be01b6473e93f53b040bfd6eb4160bb0306def77aa5396c83577c34e110ed0310eb35f529364164e076e0398df3f502a7d64ea778593c4b3506f1c6d2f99e8ff2681256")));
+  t(p + 'pss.sha1.roundtrip', () => crypto.verify('sha1', msg, { key: PUB, padding: C.RSA_PKCS1_PSS_PADDING }, crypto.sign('sha1', msg, { key: PRIV, padding: C.RSA_PKCS1_PSS_PADDING })));
+  t(p + 'pss.sha512.roundtrip', () => crypto.verify('sha512', msg, { key: PUB, padding: C.RSA_PKCS1_PSS_PADDING }, crypto.sign('sha512', msg, { key: PRIV, padding: C.RSA_PKCS1_PSS_PADDING })));
+  t(p + 'sign.pkcs1.sha256', () => crypto.sign('sha256', msg, PRIV));
+}
+
+{
+  const PRIV = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDq0PY64yGXmo1t\nTNBMW21m5n8lCyrIXCDgNFKxZShofTyjpCghCt8DfM/mKLcTCBhVnmnyXEq6wKK4\nYPc1xhQkvfj8ZYtcsxS8Fhygwd7BQoFEMHp8ciuCHFwYyLVVpjDEWrYM2zNz6jrS\nKOifqEQHMjTgcj2a606xM4yzv4f9PAIEUQT8OIRaAPf1Tf6Egvbw0EZUBD6GLlgg\npFljQFB8+Z1fxKXhikus1R9oT/gZnxnrqikqb0udLT4Qx8TgGXSEEIOkFWM5+YDj\nAOzxZOgdY7hOSlXnPSujHLsOeIRg9PhLhFjUTQ6v6JNQRKPSTvsc66v65VFJ4eLq\nuA27AJarAgMBAAECggEASwZ7/eGvTHydnmQSE6uMn3ma+y9/umexO2GMYFClYglN\ntC1RgwkxqzAYTv4ITITkHYsRZ9X0LIo7E3Ur11sT+Y9XO/GH3xT61YOtHvICpbYF\njk98+0ERRK+h/2s1gQmqADrJev8Yh/s5UweuF8EQB0qT2Xi21UZErNp/JLlYDmEe\nyL1bMVE4FWYXdHnIqYo+D9/h2tUYVBjz53XebrIGnUMkR0mF6xN2NkhumtyuJXEy\nlB+zhkYF1qiCNPCbGPGyuqUJA1VPfuRriEmO+J0NEV0aDLNy/Khv+yuTejFcJCpt\nypwYZ0Gqe3hV+7bQULIvNvW4neBGtkAeSSFI7I0FmQKBgQD2CBupoydDDBzJXH5Y\n28V2Mf8vg2eqcfnqlKKQnK/DyOT56flLgF74J+8CoAlKmM2rctCRowpWDUT2S66B\nnMP23jZL4eRl6L+gZYOmFkuwH+KJcs4c2BvwTI2d5HtKNdpenf5P+A+OKTKoPwgB\nT6/FFiFqHr58TSPA74eTNy4Q8wKBgQD0VIZwQHIoPXnn44aKt0Jp0I0B7LaIGGtS\nP3ulLgNNZr/8vspRRSyCNMH2YLiPXYfQcePfNV2PsgZn94gvoMDE6dL1vcxi53yv\nZsdtuCBq3MfMuu8w6MwMK4k+aJSjbmrxJvgLkfMva1VZF4X59eXlHwc+hWrz1qfW\nt36saPaRaQKBgHcNq10mHxyZouBpipYzGtU8ElEKlEJtTtMNw7CYsZDbCLpKVyEK\n6GnK4SRzDqvzTyrUr0qaC6liWGmaa8I6erVeCAYmNCCARSI3nUHkbhG3DCcYz9Yz\nWSmp0amC44ogjx/T8jj+P4C6PNIfVh9UUSjcsaSpZeG+bjuxbPh27iqzAoGBAIdg\nLf0UOCxDo7/wOSOy1oF6pCZk2d4eaZhwxDmJfRrty4Jm1AKjqT2brbytapVE5XOB\nJxkNoIF1ykbgx/xbvXNdex3dw9kpGdS1xdntI0kSe0HccZtP4X78wFZr66+CBo8H\nYHhIrc2gUvHCLuGIdZC12HWzxsbEMMqvcOhmX/fBAoGAGB6Gh1Rd6dggDcZu4AuJ\n4DR64giVmmLYK1a8dS5e+M4+emTl7kVC9SLhLrIRLX9FsTj4wKZI96wImJc88lOO\n5gg9dAJ/aTqkENxf0f5Jb896aafoJopxYVsae6/qQIKbDv7xDyQkqK5ne8W7y7rT\nveypYU+3vLV5dytdMGn1owc=\n-----END PRIVATE KEY-----\n";
+  const PUB = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6tD2OuMhl5qNbUzQTFtt\nZuZ/JQsqyFwg4DRSsWUoaH08o6QoIQrfA3zP5ii3EwgYVZ5p8lxKusCiuGD3NcYU\nJL34/GWLXLMUvBYcoMHewUKBRDB6fHIrghxcGMi1VaYwxFq2DNszc+o60ijon6hE\nBzI04HI9mutOsTOMs7+H/TwCBFEE/DiEWgD39U3+hIL28NBGVAQ+hi5YIKRZY0BQ\nfPmdX8Sl4YpLrNUfaE/4GZ8Z66opKm9LnS0+EMfE4Bl0hBCDpBVjOfmA4wDs8WTo\nHWO4TkpV5z0roxy7DniEYPT4S4RY1E0Or+iTUESj0k77HOur+uVRSeHi6rgNuwCW\nqwIDAQAB\n-----END PUBLIC KEY-----\n";
+  const k = 256;
+  const p = 'rsa2048.';
+  t(p + 'import', () => [crypto.createPrivateKey(PRIV).asymmetricKeyType, crypto.createPublicKey(PUB).asymmetricKeyType, show(crypto.createPublicKey(PRIV).export({ type: 'spki', format: 'der' }))]);
+  t(p + 'jwk', () => { const j = crypto.createPrivateKey(PRIV).export({ format: 'jwk' }); return [Buffer.from(j.n, 'base64url').length, sha(Buffer.from(j.d + j.p + j.q + j.dp + j.dq + j.qi))]; });
+  t(p + 'privateEncrypt', () => crypto.privateEncrypt(PRIV, Buffer.from('pe')));
+  t(p + 'publicDecrypt', () => crypto.publicDecrypt(PUB, crypto.privateEncrypt(PRIV, Buffer.from('pe'))));
+  t(p + 'pkcs1.roundtrip', () => crypto.privateDecrypt({ key: PRIV, padding: C.RSA_PKCS1_PADDING }, crypto.publicEncrypt({ key: PUB, padding: C.RSA_PKCS1_PADDING }, Buffer.from('rt'))));
+  t(p + 'pkcs1.fromNode', () => crypto.privateDecrypt({ key: PRIV, padding: C.RSA_PKCS1_PADDING }, hex("026b5535d8c19e721052b3a342951c60d0a380e129ce19016459cfb89f946c62b8c1565169363df6711e7a30cc47aa2df8e9f85a66eac6f12656b5a452275964e7203e8e6b7f910e9b58bde5340dc7066aaf7b06c093348534f60961c390c32f30539a07dd54303c0e1b4a017a279cca31f9b43c239e850a9417a6314754d19f98325103d157b07b304b83916c088a17841469bb79d4b608e825417fbe1147bb24b55eb6234f7d55f1852f857c3918c2dc126c5c967fa8b06bbb4922ed103f0e7a6df00d5c74eb39a38cb29b75c930348cc980844606829db45175bbd082eeeca59d2eae6936538cf11738720cc32feec54be467d9351b6510fa036a2cc4803d")));
+  t(p + 'pkcs1.undecodable', () => crypto.privateDecrypt({ key: PRIV, padding: C.RSA_PKCS1_PADDING }, Buffer.alloc(k, 1).fill(0, 0, 1)));
+  t(p + 'oaep.sha1.roundtrip', () => crypto.privateDecrypt(PRIV, crypto.publicEncrypt(PUB, Buffer.from('rt'))));
+  t(p + 'oaep.sha1.fromNode', () => crypto.privateDecrypt(PRIV, hex("758cc2f35bd8a14c65d3075a82912061613c9c4d7eb576e10fcf803d2474c9766d10343c5c6d8739c0943a36af0e7d65d6ac2c9aeaed9d4efcf338513de28a81c913629736870050f181c9ea2cb80ed60b2f36c7541d590a994c9e83f174004a0fb0c0e97b8afb9cf93c183027228436c9fead9ae68867c6e988bc3c75803a508563c4c65783bb82d36e4ed952d6efe061dccd71e7224da71e6c1685be802c4805bed4717ee3af58b055a9c12683fc52f5801ea43228c0f9e4ae8d9c5fa948677823d1a52f69b4a9a7077337fb4a8ef19dfd8d1af916e24a5545707497cbca0777b8ed9ee05648463429d1102f537ecf3c28d15092354f88fd0980aa61b6e92d")));
+  t(p + 'oaep.sha256.roundtrip', () => crypto.privateDecrypt({ key: PRIV, oaepHash: 'sha256' }, crypto.publicEncrypt({ key: PUB, oaepHash: 'sha256' }, Buffer.from('rt'))));
+  t(p + 'nopad', () => { const b = Buffer.alloc(k, 3); b[0] = 0; const c = crypto.publicEncrypt({ key: PUB, padding: C.RSA_NO_PADDING }, b); return [show(c), crypto.privateDecrypt({ key: PRIV, padding: C.RSA_NO_PADDING }, c).equals(b)]; });
+  t(p + 'pss.sha1.fromNode', () => crypto.verify('sha1', msg, { key: PUB, padding: C.RSA_PKCS1_PSS_PADDING }, hex("831e8852e4ff7a8cd363b1d6d4a264dc07a57fd800bbe8d024ca2e154929ccd82cc7654973e982507149bb89793b6c18843ad62f067f3c214cc03ee2631287d852b0d04f8fc185112f8020568a3b13ac14bc2d05da2fdb93669f846ddaa8f52579780ea99dfa23b1a8721bb4c8efef4eca092efb17963e9cf471d5b4d9d94d7960a30a8533e7e67940ece52dc3ec37cdb4c302fe0fe8f0e2c7073fa07da9830b4676ce6dcd0dec888fbab0648112a9d5783d27f802056b6a593f0871240bff2bfd5b93a6240ab943b743d37073aeb448e7e188f3941e1e8ae7ef240208b27cb2a94d66cb7c1bdc6434d89587f18e4121d3fcf21a5a88b6841bace85b7767ffdb")));
+  t(p + 'pss.sha1.roundtrip', () => crypto.verify('sha1', msg, { key: PUB, padding: C.RSA_PKCS1_PSS_PADDING }, crypto.sign('sha1', msg, { key: PRIV, padding: C.RSA_PKCS1_PSS_PADDING })));
+  t(p + 'pss.sha512.roundtrip', () => crypto.verify('sha512', msg, { key: PUB, padding: C.RSA_PKCS1_PSS_PADDING }, crypto.sign('sha512', msg, { key: PRIV, padding: C.RSA_PKCS1_PSS_PADDING })));
+  t(p + 'sign.pkcs1.sha256', () => crypto.sign('sha256', msg, PRIV));
+}
+
+{
+  const PUB = "-----BEGIN PUBLIC KEY-----\nMIIIIjANBgkqhkiG9w0BAQEFAAOCCA8AMIIICgKCCAEAusYWFq5Yggi0+qBmneD/\nji4Oo/UjzQwXvmnd7MXzZHUmVfQ1zY4/vkkw4A5l8oslJoBB/d6j5reayVOiGBTo\nD8lMVZYBxNELlayy4OIXzQcd9kvhLHPzlYM0mVmcnLSZJ8G67DBxFeNEzHqK/fJM\nky8O5LtCYvBBuS5EFlqOwBYJvdgLk7O69sk9Xc9mEDaf5NCFulwdUJni5qJiIDtt\nX8HiVvCx+DVFQFXbtuzZmKCI5NevCv+RXBgPNgOkKOLbiea+Mq5emTc+/pkx58cR\npzRGhFRcR+tjC1jJWXwnAJbk1wqFCM7Fz89rGYtflL/XAksBNUVy7mGk81r8BgMC\n2mkLcHjVNp8DAmTDENtF5x7V20r149uBW/Tvw6sRoP+nQTH2DRbAw/LHQ7iqmZnu\nrrrpSooCzteAjSHQB95w1+P5Z2wEc62bMsm03shWawLiOcklk57AawyaGUrhjEa6\nGeaXIX5qKtAtm6ECn4RTwWdEVUENCfAkpCTYY7UY0U86dj6apkay2J46gvWJkuA4\n9TgJvXhgIdG+XgRIZ5P036DTtTkTLsINWlc1fB9Zrvc4+SM4GSS4SkcDQgOzKSUY\nxXh93UXzbWtXgXSfcfX4Et96iNxgo1qm9t98sDO4Il+8Sj/PCfxAi8pbyEae73wo\nC+uFYbqpomnoQywUsmD23/XTIaa4qvEtXyAnFJiZVP17JJs6U+KN3kImQTkcOmiw\nD5F/9AtMliYu6zwsJPuhbENRsjCnvSkMHCnS0rmZ8TeQ/3fKuAyAdHtWvis8YCuA\niuGUHBSrvy0l7NmQe5OJAsLpFmzE1wso5GYtGXvGKm7CNFfPcQNgMgqupAzM6sMl\nca/uZzjWiSpXf8rnEr+khZwWn8aPSd7oOM7WTaBJSXU/IaluF7D3osTz462nmYW3\nJXLu6OVM8JgNEMlDlFXoXQKqM9e176rb8f+jT/zTkO2mAbY9pBZT5SjlH5iBJs5f\n3hBghqEC8yI+PRpIJwh4G/qlXKGkWm22X0WhtOY2d2zWteZDkO3qJIr6Cq1vKPXD\n/6o3GJm97q46FMFZD4/SG/V0M3SmWg41XO8Qp20InbOx3BP/Swk+Muy3+9DRFbHH\nvQmnUZwzAX6F3H0dEgZ6+l2WEDihcFFl5VsyDE6n5sATrwSFsXQ2Fb9keiEHTznd\ncDyr12h/y0cHMNvGrJMSxyBEMhvSx2bG8umfE22R7aix4jr9hMQNUC6oELvN0Tpv\nqI9WlcEMGRKjDxHrxF24/u5g0BcXAOcGAFx5bdDKJBjy9sLR2l1AvjUU4T3JeEjW\nD9iQ28aN30G8OXbaANhQ4XCXkR6aoz4f+hfROiEoN72OKz8uocIhfSqRYd+hyRpi\nbOwIeGZnT+s3uPXJy6IdqWRfvZ0WjkeVxgAAztGxqdDhVAzEahbv7Um2ztMulz3o\nHFYRkbh0QS91ozf0OKuxDq0F+fP7A68251/c31kOxuVI7KoS5Fv+V+D/oTBzdx+p\nM2PWITFx5jhKRVMx0TnuNkQN+84e2DMCAmGSP5LcLMwymHC9n0QiP7jXWxHS+ZSm\nWPj5lwJPHakExEyc00B5lu83SRtX687kpz/bBx9tNFo7RmivDoh6MZMubWL8I676\nA3wpKzRnADXKsrsWG+RpuFDAvf6TUBMbYKaIbroeSmpLBq9JZ5VUIQI23c6rgZUS\nPl1goh4gPz5Skqcsxe7BXBwTj7TBpq22hctl0v1c69vvFZK9beIl/pxX5SNdNYYo\npCQoGBYbwIT6ofS0MhwOhET+XpUtzeALf3ECesuooELLIOYoqDFlPRbyEKS5aWZY\nHb4O+d4c59jUbmK1kzEUFIP1g2NqiIg+eLpe6iQGdaO/aHHx4aYdxMH77uacXDVa\nU3pyz7Ldd0RtSE1jyOcE6QNF/Zi6RuBvf6k5zebDAXE24kKGv4iSow1L4ApSzoKc\nyFE9yJ4A03mwjj79OgmaIUNpd1kwVqpC37Ch5BF+SNpj2UB7lb3Ts612jWYPmnPB\ncSb1+sdo/X16GaRh0Ov2SXY0e40VqGFjPIHROG4KuNSzc6tn7Y4rY7DmPy2zi3tL\nO6o14KNUW0kIHlvTmzV5iEPJE5Emp9NCZ/rhDFLPSXW26VC0S3sqCuLheTG+o/ro\nRSLkh+GfK583B9JeCilJEPRfXaZCNk/9KDdb4yVnvrD13XmkFt5a/1QrGjlzMKX8\ne5/yZMRQOEmBN2iEMCLrVNuNaeEJIKOSbuM5kmclhMEhWGL+uI2oqp7frkHFB+zu\nRS5LDU3XpMeVfRHjy0MUIFlNrdheSF5OmEhPRQSbDJ36EOnckrsSCdabRBvqi/TM\nEp1YUYb8SLUz0vIrJYDTmzHlx5Z/vV8Ola3BYwU1hI0KiECmWmGcHtHynljFEbgX\nvw4kPlIRTKE8VP6Fy8rPqd4cH2AYVouLb5j+oP2aUvKY6d8suWQ//Zioh2xHaUHy\nyzcOJPQ9XSGimTTo6ocUOtl4LrnJa+d+o59TTaOwYCxMeVixfnp6VtHH+Ann89Np\nibAq3NeTVEqtlGBmheOJ/dauU4nGMTalOPxV296CjFlo/fiVFLIMqCCTcdsPrjQ4\nTftEF1VT7ZVsEc3AuQy+o6miZiDp+HkAynCFQH+BmwRmBQkP/kfLE3Qkg3E/xDUQ\njLoPLt6aJXqRKgxNMAoCAmrmwD5UBoP0KcQq+XBwD/TcmnWtAZTl5JCK0UGRK0Om\neXbn2fVp3R3ORLD28PzaT1kCAwEAAQ==\n-----END PUBLIC KEY-----\n";
+  const k = 2048;
+  const p = 'rsa16384.public.';
+  t(p + 'import', () => crypto.createPublicKey(PUB).asymmetricKeyType);
+  t(p + 'nopad', () => { const b = Buffer.alloc(k, 3); b[0] = 0; return crypto.publicEncrypt({ key: PUB, padding: C.RSA_NO_PADDING }, b); });
+  t(p + 'pkcs1', () => crypto.publicEncrypt({ key: PUB, padding: C.RSA_PKCS1_PADDING }, Buffer.from('rt')).length);
+  t(p + 'oaep', () => crypto.publicEncrypt(PUB, Buffer.from('rt')).length);
+  t(p + 'publicDecrypt', () => crypto.publicDecrypt(PUB, Buffer.alloc(k, 1).fill(0, 0, 1)));
+  t(p + 'pss.verify', () => crypto.verify('sha256', msg, { key: PUB, padding: C.RSA_PKCS1_PSS_PADDING }, Buffer.alloc(k, 1)));
+}
+
+{
+  const PUB = "-----BEGIN PUBLIC KEY-----\nMIIIIzANBgkqhkiG9w0BAQEFAAOCCBAAMIIICwKCCAIAkzsVKe9gSBhAo3fXCpVk\nPNpBPLo4/HhfzsuwFfaaN/6WJDYB3WEtUjLQrkbyJOp7YSNfYaDSdfLp/XUOCCj5\nmNoCKu/kCJfByL/zjLWwHnxgjUi+IW1OaeNari0d9rR+ui/W9Pr6IwpDsRfDaAs5\n65hAQh/+RuWpc4zNRwo6uUVJoj1eOVGmqiDnXMsVDYHoQnPBlTr/HtaCs2YY0fss\na9M/6+O/Yf19DJcGKi05t7fzqyLpaYXAutHgiYQJCi/tgCdy3dHdKjqYruMcr9e4\nPT2Ksxal+9AzJSocZD4lPxfXxVjr8EEcGVYjJjbQj7TCCtOsMp9ZhfIJ2bXLEf3i\nRJDAnsQKu9AfunixMenVI/IkFtTHHc2EQpro1vwh4ob0EwCp9KhlVJQjXkv8zm+x\nkPmWk6uyyubGckmxQnic3rzD+DP3PQ9oOE15y4NjDmInVYcc4zGcrsnsOrwV9Gke\nQu6KH2bWmxPOGAABAeLWy5piNCyMqihVnAuWCrjSgugldUfAyrwMfAOmMP8Y4NAt\nthXlrr5fsnWs5hhM7qu00hFP3fu/nxcA+10f9+csSi09rAJAv2EQF6IunYwqA7A1\neyQ3VHQTSbP+12YAOr1/a/5sC9jvjQSStF9O1KXe7tywEZLEcUWr13y/F2ZjVJ2x\nJrwzKFOKcnfB31E1mf/VywL5oGKnwF675Ub3PZ9J2wmB9ZWXVR0GyehGynypHR/L\naU3swN2ckBSk6hvWVCtXBLSoS5rWwbq0SD53j4hEDqQF2CjNpiPRi4juN4nLft2h\neOxrq3GYlFmNHQCiEEch/FlKefOaZt6epqbUC98tphBEWJIX9NhdQz8i62GpU8RY\nGe5FcoiRwNVc1uv1oPoJ0G8s+6Lzo206FNif4ymYjk/2ZyydenkjDUehw+LevH5w\n6II+fjAsEbWgs+YO095B1BHIc9OoTln6zwRJiFR1LIKnwp52WU86Zi19/iTHuexy\nSsuBuABoYRUlTN7u2ECtQ6joE+llXippF1W42nHqtLqicrwIeO6wGjYN2IzmdeDf\nJAuxzKKnm8DMayqj3p2W98t/kWkqqqxEvcAc7kVsFNuMQg9/9+dtD2zDtmhFp+5h\nSCaQIomH8PCV1G83u5rXkS2ubszlkI6uAblHVGod/srFEP0mQFb3OhvKb2HXg5Cj\n0vuHodhJrTam7eKnGMoKSts8O6oY0IKYYX5wky5yFfhq4PgZUL717uSJp3mo++RP\nD/eH0LPY75zrEAOdduk24axEi8UPLs1T3tbgu1ql8akK0f3T/TyOumdfXL1IMdjN\nFN1EID7z5p61GOncwaRtoYt43kXpdT++W31lwUorDOk4TLNXCkjmP45C5NoeT1JM\nDw4pEuowPxKTc/xWIbB/xUdJ4azDzG8NQisI43aEnXZt74F4liH1vVNlZwAVdS6n\n1zELqwEyCgfOn9O41RKd95Pvp8ja7sXE5U7W/h9dG4ffjzrnMPTDFaItDWGH/bgE\n6cVwiN9F0ATB31aIf5Wdxa2fW8YGms6oaGepTf7Xm1U32CHlh1DLqGyUca/tFtxI\nFrp0h+zJvr9vJeyFxKVqtEDR4Pik5gIi9CgAQDnJc256zuJrZcel2OSR+NR3u6nW\nljZfpip/fxSKrAXlSlF064KBpgX54xKX6QpBw4bdzZbiEYa69k+Q40Z6GxJES+GM\nSWasMsbKJI9xrs3V6X377O0y/lTAQeMzHhZAzT8mY3rURtwfmdV3PTcCP7ahkWnK\n9u12GYn8qyEkX3L18BzRiKuKwygBk6AYPeJIN/ubtfbptA85THlx6lFXET34KWgA\nLZBbL5UGaDMj3eu/H328KDtfPLKTcjmybC1aPMiemIGHrZxCl7uawVjCYydb/WGX\nAIJY6wIOtTVHfedpCmHvz3drOvtBfSForD+kAtTCIVF6euo6HT5nFmCGQlT2IW+G\n/EEzVA3qP6WjfgTIpwN5tatKZ8GO3rHcj34CB22yVwWPXdFeO4rmTwFcqHXRcP0f\nkmAgyBEu87a99An0B2xx161IdacnNsc3bhGlxtuyFUFgVX/09K8vDA+kHpK+Tp7k\nxQnLnMuT1QlmRbwiLb46EzH54hG6zuApYXNle031sEhZNEhZQFSxTyEzIq+ddhsa\nIVoikUG3GJcpNV+xVam+ord0D1F/fwuz+t0W7V98hi2qLeKS9ZXztgAMbF8PCC0q\ntHMUBQf3Lg7uFhCYN731WiERHxSCmu21XTfvBflSh9SPh6HS/CAH1V31a7u7o1PV\nUu789VgGzkxDhNxOA3e63cRUTYM9O4HL9Wb6OXogKvctk4X1xPn2yKJRv2qO2R1O\nQV3N/JaZ19GtYS0qyxMyb16nvEnxvOFCNJ3FbdfCxSNG472EOPduhcHwSANxC5yT\nsbHaOBAVwVa5fKhpM+Hk5jA88pgDiGH/tL3c+MqW/5cxRN/bIijx1AfxeIGd5ZG4\nMz9MO4c4f+78/vABOPbbSUULbEDaMGXv9fRV3LT8SP0hDox6DmcWJpq9IGrxL6y4\nB1oc0TB6C4ndN5RrSNRSga8H39QqO6NXQmkrmaVdvH6DS7Vn/IzditiJLB7yhxFX\n8+pMyUhXTnjMUQkj2oE1p78jjyJlyckoOE6CQjvFqEr/s1GRV7uZHW/9FcD/5HXc\nZtDLEEEoBvK0F6G8GYiV0FlTa2Z6qnsMtl9ei8512O0MOwEgmL9ymbWeyGWrx65I\nzjO/DtnK15iy4G20gHHFrNW/AgMBAAE=\n-----END PUBLIC KEY-----\n";
+  const k = 2049;
+  const p = 'rsa16392.public.';
+  t(p + 'import', () => crypto.createPublicKey(PUB).asymmetricKeyType);
+  t(p + 'nopad', () => { const b = Buffer.alloc(k, 3); b[0] = 0; return crypto.publicEncrypt({ key: PUB, padding: C.RSA_NO_PADDING }, b); });
+  t(p + 'pkcs1', () => crypto.publicEncrypt({ key: PUB, padding: C.RSA_PKCS1_PADDING }, Buffer.from('rt')).length);
+  t(p + 'oaep', () => crypto.publicEncrypt(PUB, Buffer.from('rt')).length);
+  t(p + 'publicDecrypt', () => crypto.publicDecrypt(PUB, Buffer.alloc(k, 1).fill(0, 0, 1)));
+  t(p + 'pss.verify', () => crypto.verify('sha256', msg, { key: PUB, padding: C.RSA_PKCS1_PSS_PADDING }, Buffer.alloc(k, 1)));
+}
+
+for (const bits of [511, 512, 768, 1023, 1024, 1025]) {
+  t('generate.' + bits, () => {
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: bits });
+    const n = Buffer.from(publicKey.export({ format: 'jwk' }).n, 'base64url');
+    const sig = crypto.sign('sha1', msg, { key: privateKey, padding: C.RSA_PKCS1_PSS_PADDING });
+    // [modulus bytes, top bit set, e, a PKCS#1 v1.5 round trip, a PSS round trip]
+    return [n.length, (n[0] >> ((bits + 7) % 8)) === 1, publicKey.export({ format: 'jwk' }).e,
+      crypto.privateDecrypt({ key: privateKey, padding: C.RSA_PKCS1_PADDING }, crypto.publicEncrypt({ key: publicKey, padding: C.RSA_PKCS1_PADDING }, Buffer.from('g'))).toString(),
+      crypto.verify('sha1', msg, { key: publicKey, padding: C.RSA_PKCS1_PSS_PADDING }, sig)];
+  });
+}
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "rsa_key_sizes.cjs failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        r#"rsa256.import=["rsa","rsa","sha256:86020e22057516c4a6a89f582653c83224391feaa109d5b769cfcfc3680cf97d"]"#,
+        r#"rsa256.jwk=[32,"2758a304310c0cd458178f3bde51e4e193946d1c487c40ae8699875cf99d871d"]"#,
+        r#"rsa256.privateEncrypt=hex:b1ae1f14fe813809304946c7a6acb924167f5cf0464d93405ca751b46cbeb002"#,
+        r#"rsa256.publicDecrypt=hex:7065"#,
+        r#"rsa256.pkcs1.roundtrip=hex:7274"#,
+        r#"rsa256.pkcs1.fromNode=hex:706b6373312076312e35"#,
+        r#"rsa256.pkcs1.undecodable=hex:8aa482efa0480384ea"#,
+        r#"rsa256.oaep.sha1.roundtrip=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE: error:0200006E:rsa routines::data too large for key size"#,
+        r#"rsa256.oaep.sha1.fromNode=throws ERR_OSSL_RSA_DATA_TOO_SMALL: error:0200006F:rsa routines::data too small"#,
+        r#"rsa256.oaep.sha256.roundtrip=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE: error:0200006E:rsa routines::data too large for key size"#,
+        r#"rsa256.nopad=["hex:81449f20c70309a58ba0a260651ae3aae223135e753f779b3499e054123e632b",true]"#,
+        r#"rsa256.pss.sha1.fromNode=true"#,
+        r#"rsa256.pss.sha1.roundtrip=true"#,
+        // node: rsa256.pss.sha512.roundtrip=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE: error:0200006E:rsa routines::data too large for key size
+        r#"rsa256.pss.sha512.roundtrip=throws TypeError: RSA-PSS sign: key is too small for this digest"#,
+        // node: rsa256.sign.pkcs1.sha256=throws ERR_OSSL_RSA_DIGEST_TOO_BIG_FOR_RSA_KEY: error:02000070:rsa routines::digest too big for rsa key
+        r#"rsa256.sign.pkcs1.sha256=throws TypeError: RSA key parse: TooSmall"#,
+        r#"rsa512.import=["rsa","rsa","sha256:521d8c0d859592de62d07d2e1b4d61f994b0f056a3293b46a86a29069dbe2d26"]"#,
+        r#"rsa512.jwk=[64,"abe16ae3dc650f1caafd060ab4d81d615de86eedec63b15903337a0b881a3412"]"#,
+        r#"rsa512.privateEncrypt=sha256:a210fc229b86fd0b02ac2d3e41b4537bc04fe299e1558bea89a69ebae3024a0c"#,
+        r#"rsa512.publicDecrypt=hex:7065"#,
+        r#"rsa512.pkcs1.roundtrip=hex:7274"#,
+        r#"rsa512.pkcs1.fromNode=hex:706b6373312076312e35"#,
+        r#"rsa512.pkcs1.undecodable=hex:16aceba2e7"#,
+        r#"rsa512.oaep.sha1.roundtrip=hex:7274"#,
+        r#"rsa512.oaep.sha1.fromNode=hex:6f616570"#,
+        r#"rsa512.oaep.sha256.roundtrip=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE: error:0200006E:rsa routines::data too large for key size"#,
+        r#"rsa512.nopad=["sha256:0a4dccd27d7789bde91cda320c9ce55b312fca50da698653d5ea5777953b5833",true]"#,
+        r#"rsa512.pss.sha1.fromNode=true"#,
+        r#"rsa512.pss.sha1.roundtrip=true"#,
+        // node: rsa512.pss.sha512.roundtrip=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE: error:0200006E:rsa routines::data too large for key size
+        r#"rsa512.pss.sha512.roundtrip=throws TypeError: RSA-PSS sign: key is too small for this digest"#,
+        // node: rsa512.sign.pkcs1.sha256=sha256:4cab0dfd33ab88b0aba0fbf4e6b1310adc6e932b524666adc0a9c92b19c5fced
+        r#"rsa512.sign.pkcs1.sha256=throws TypeError: RSA key parse: TooSmall"#,
+        r#"rsa1024.import=["rsa","rsa","sha256:cd097bd7f10593284f15174b59b39e86864ad48bee6ab76c9bbd03b67bc0371c"]"#,
+        r#"rsa1024.jwk=[128,"ce4293c8cc5dacac2f8ce5d1941b0343ffa1e8e3cfb43f526d91c2466c569104"]"#,
+        r#"rsa1024.privateEncrypt=sha256:ea5627d06df5f1f5a9940c210c43e9891673f0aac73a40b4660d1441e8bf51ed"#,
+        r#"rsa1024.publicDecrypt=hex:7065"#,
+        r#"rsa1024.pkcs1.roundtrip=hex:7274"#,
+        r#"rsa1024.pkcs1.fromNode=hex:706b6373312076312e35"#,
+        r#"rsa1024.pkcs1.undecodable=sha256:36e578f6e507eb1ce86a6dfb231576ade05cd0a13accb0aa5ef80baed7da9abf"#,
+        r#"rsa1024.oaep.sha1.roundtrip=hex:7274"#,
+        r#"rsa1024.oaep.sha1.fromNode=hex:6f616570"#,
+        r#"rsa1024.oaep.sha256.roundtrip=hex:7274"#,
+        r#"rsa1024.nopad=["sha256:4be8057f59a65d3e5363082cc9e348662d0a372713b65c09349dfca638e63490",true]"#,
+        r#"rsa1024.pss.sha1.fromNode=true"#,
+        r#"rsa1024.pss.sha1.roundtrip=true"#,
+        r#"rsa1024.pss.sha512.roundtrip=true"#,
+        // node: rsa1024.sign.pkcs1.sha256=sha256:9739982ce887aaa5735a0166a41e6bd4da51818e458d8d7107a0317be6f10dcf
+        r#"rsa1024.sign.pkcs1.sha256=throws TypeError: RSA key parse: TooSmall"#,
+        r#"rsa2048.import=["rsa","rsa","sha256:bc517b5dbe09a184eca158afea5f12edd284226dae7d1b9e90d6b4fd2cadf4e2"]"#,
+        r#"rsa2048.jwk=[256,"6383b6cf8c7faa45f568fb48ec010ab3b027c39f650778901117529636a8ac6c"]"#,
+        r#"rsa2048.privateEncrypt=sha256:89e05761391e6f136ec3b3d5540d56adb0830f650e67a8c35b448b1b80a1ebc6"#,
+        r#"rsa2048.publicDecrypt=hex:7065"#,
+        r#"rsa2048.pkcs1.roundtrip=hex:7274"#,
+        r#"rsa2048.pkcs1.fromNode=hex:706b6373312076312e35"#,
+        r#"rsa2048.pkcs1.undecodable=sha256:2c400bca1016c04e5511f3d8ca92623a4448280680ee1d8885a32eb446063d05"#,
+        r#"rsa2048.oaep.sha1.roundtrip=hex:7274"#,
+        r#"rsa2048.oaep.sha1.fromNode=hex:6f616570"#,
+        r#"rsa2048.oaep.sha256.roundtrip=hex:7274"#,
+        r#"rsa2048.nopad=["sha256:85f1089f2bfebcb5a0171aa033f50e94bc196d00f5cf88d52a38779937d4ad7b",true]"#,
+        r#"rsa2048.pss.sha1.fromNode=true"#,
+        r#"rsa2048.pss.sha1.roundtrip=true"#,
+        r#"rsa2048.pss.sha512.roundtrip=true"#,
+        r#"rsa2048.sign.pkcs1.sha256=sha256:ad202abcfb8b3a16435f5f0343cd032d3b49df22d05f281176da2df960fc90f4"#,
+        r#"rsa16384.public.import=rsa"#,
+        r#"rsa16384.public.nopad=sha256:560607049f6e54be312b5b2207346125e41e80b953c3cb6482883539a801aa22"#,
+        r#"rsa16384.public.pkcs1=2048"#,
+        r#"rsa16384.public.oaep=2048"#,
+        r#"rsa16384.public.publicDecrypt=throws ERR_OSSL_RSA_INVALID_PADDING: error:0200008A:rsa routines::invalid padding"#,
+        r#"rsa16384.public.pss.verify=false"#,
+        r#"rsa16392.public.import=rsa"#,
+        r#"rsa16392.public.nopad=throws ERR_OSSL_RSA_MODULUS_TOO_LARGE: error:02000069:rsa routines::modulus too large"#,
+        r#"rsa16392.public.pkcs1=throws ERR_OSSL_RSA_MODULUS_TOO_LARGE: error:02000069:rsa routines::modulus too large"#,
+        r#"rsa16392.public.oaep=throws ERR_OSSL_RSA_MODULUS_TOO_LARGE: error:02000069:rsa routines::modulus too large"#,
+        r#"rsa16392.public.publicDecrypt=throws ERR_OSSL_RSA_MODULUS_TOO_LARGE: error:02000069:rsa routines::modulus too large"#,
+        r#"rsa16392.public.pss.verify=false"#,
+        // node: generate.511=throws Error: error:1C8000AB:Provider routines::key size too small
+        r#"generate.511=throws TypeError: generateKeyPairSync: modulusLength must be between 512 and 16384"#,
+        r#"generate.512=[64,true,"AQAB","g",true]"#,
+        r#"generate.768=[96,true,"AQAB","g",true]"#,
+        r#"generate.1023=[128,true,"AQAB","g",true]"#,
+        r#"generate.1024=[128,true,"AQAB","g",true]"#,
+        r#"generate.1025=[129,true,"AQAB","g",true]"#,
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), expected.len(), "line count; stdout:\n{stdout}");
+    for (got, want) in lines.iter().zip(expected.iter()) {
+        assert_eq!(got, want, "stdout:\n{stdout}");
+    }
+}
+
+// RSA_NO_PADDING in all four directions, the padding values each direction
+// takes, and the refusals publicDecrypt gives for a malformed block. Fixed
+// 512- and 2048-bit keys; every expected line is node v22.22.2's.
+#[test]
+fn crypto_rsa_no_padding_and_padding_argument_match_node() {
+    let file = write_temp(
+        "rsa_no_padding.cjs",
+        r#"
+const crypto = require('node:crypto');
+const C = crypto.constants;
+const msg = Buffer.from('oam rsa interop message');
+const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
+const show = (v) => Buffer.isBuffer(v) ? (v.length <= 40 ? 'hex:' + v.toString('hex') : 'sha256:' + sha(v)) : typeof v === 'string' ? v : JSON.stringify(v);
+function t(name, fn) {
+  let r;
+  try { r = show(fn()); } catch (e) { r = 'throws ' + (e.code || e.name) + ': ' + e.message; }
+  console.log(name + '=' + r);
+}
+const der = (pem) => Buffer.from(pem.split('\n').filter((l) => !l.startsWith('-----')).join(''), 'base64');
+const hex = (s) => Buffer.from(s, 'hex');
+
+{
+  const PRIV = "-----BEGIN PRIVATE KEY-----\nMIIBVgIBADANBgkqhkiG9w0BAQEFAASCAUAwggE8AgEAAkEA2bf7YFbzENG9E0Wl\nINTswCgvJql2GPvPoHuE2lB0GqfRTOT7nI18c8swaNexA1VdUk5lPMHnLAcPZ48l\nmwxjWQIDAQABAkEAyBhXZ8uByUt6QmQXx3zpuhE0hIvqhjuoLw5Wo26dxoAT31dl\n2zZr/Gp1G+A27zXIC0U6LUe1d7Y8wc2m1CcqIQIhAOy+JngeF3HVbhrt3IoUzxr2\njETZIEQA/NG6U+nvI5wrAiEA622uNGUCcEWozLCC6NjG98myqqFNgU4DHZQpadaf\nyIsCIGgl0sie/FNgwFpqb83zD5VeByE2n8Iq6Q3euZG9WV4XAiEAsId0aVsYIgFJ\nmfn8nwX041W8/46lpABP+7zd9Lt24hMCIQCFj8U6mtGrR1lMFOLkg4nheHQTNDN6\ndwb3jCF9p7LJig==\n-----END PRIVATE KEY-----\n";
+  const PUB = "-----BEGIN PUBLIC KEY-----\nMFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBANm3+2BW8xDRvRNFpSDU7MAoLyapdhj7\nz6B7hNpQdBqn0Uzk+5yNfHPLMGjXsQNVXVJOZTzB5ywHD2ePJZsMY1kCAwEAAQ==\n-----END PUBLIC KEY-----\n";
+  const k = 64;
+  const p = 'rsa512.';
+  const none = (key) => ({ key, padding: C.RSA_NO_PADDING });
+  const blk = Buffer.alloc(k);
+  for (let j = 0; j < k; j++) blk[j] = (j * 13 + 5) & 0xff;
+  blk[0] = 0; blk[1] = 1;
+  t(p + 'publicEncrypt', () => crypto.publicEncrypt(none(PUB), blk));
+  t(p + 'publicEncrypt.withPrivateKey', () => crypto.publicEncrypt(none(PRIV), blk));
+  t(p + 'privateDecrypt', () => crypto.privateDecrypt(none(PRIV), crypto.publicEncrypt(none(PUB), blk)).equals(blk));
+  t(p + 'privateEncrypt', () => crypto.privateEncrypt(none(PRIV), blk));
+  t(p + 'publicDecrypt', () => crypto.publicDecrypt(none(PUB), crypto.privateEncrypt(none(PRIV), blk)).equals(blk));
+  t(p + 'publicDecrypt.withPrivateKey', () => crypto.publicDecrypt(none(PRIV), crypto.privateEncrypt(none(PRIV), blk)).equals(blk));
+  // The block a padded operation works on, seen without the padding step.
+  t(p + 'publicDecrypt.ofPkcs1', () => { const em = crypto.publicDecrypt(none(PUB), crypto.privateEncrypt(PRIV, Buffer.from('pe'))); return [em.length, em.subarray(0, 4).toString('hex'), em.subarray(-3).toString('hex')]; });
+  t(p + 'privateDecrypt.ofPkcs1', () => { const em = crypto.privateDecrypt(none(PRIV), hex("c28cd7bf877a4258973000201ae5332603b5107ca2193176b0cb0c3b3827737a362c590120a7344c893a4c058f779d5ecfee310b4d38714b4e3c2acf20b83c16")); return [em.length, em[0], em[1], em.subarray(-10).toString()]; });
+  t(p + 'publicEncrypt.zero', () => crypto.publicEncrypt(none(PUB), Buffer.alloc(k)).equals(Buffer.alloc(k)));
+  t(p + 'privateEncrypt.zero', () => crypto.privateEncrypt(none(PRIV), Buffer.alloc(k)).equals(Buffer.alloc(k)));
+  // Encrypting takes exactly the modulus length, below the modulus.
+  t(p + 'publicEncrypt.short', () => crypto.publicEncrypt(none(PUB), blk.subarray(1)));
+  t(p + 'publicEncrypt.long', () => crypto.publicEncrypt(none(PUB), Buffer.concat([Buffer.alloc(1), blk])));
+  t(p + 'publicEncrypt.notBelowModulus', () => crypto.publicEncrypt(none(PUB), Buffer.alloc(k, 0xff)));
+  t(p + 'privateEncrypt.short', () => crypto.privateEncrypt(none(PRIV), blk.subarray(1)));
+  t(p + 'privateEncrypt.long', () => crypto.privateEncrypt(none(PRIV), Buffer.concat([Buffer.alloc(1), blk])));
+  t(p + 'privateEncrypt.notBelowModulus', () => crypto.privateEncrypt(none(PRIV), Buffer.alloc(k, 0xff)));
+  // Decrypting also takes a shorter block: the same integer without its leading zero bytes.
+  t(p + 'privateDecrypt.short', () => crypto.privateDecrypt(none(PRIV), blk.subarray(1)).equals(crypto.privateDecrypt(none(PRIV), blk)));
+  t(p + 'privateDecrypt.long', () => crypto.privateDecrypt(none(PRIV), Buffer.alloc(k + 1, 1)));
+  t(p + 'privateDecrypt.notBelowModulus', () => crypto.privateDecrypt(none(PRIV), Buffer.alloc(k, 0xff)));
+  t(p + 'privateDecrypt.empty', () => crypto.privateDecrypt(none(PRIV), Buffer.alloc(0)));
+  t(p + 'publicDecrypt.short', () => crypto.publicDecrypt(none(PUB), blk.subarray(1)).equals(crypto.publicDecrypt(none(PUB), blk)));
+  t(p + 'publicDecrypt.long', () => crypto.publicDecrypt(none(PUB), Buffer.alloc(k + 1, 1)));
+  t(p + 'publicDecrypt.notBelowModulus', () => crypto.publicDecrypt(none(PUB), Buffer.alloc(k, 0xff)));
+  t(p + 'publicDecrypt.empty', () => crypto.publicDecrypt(none(PUB), Buffer.alloc(0)).equals(Buffer.alloc(k)));
+  // The padding argument: which values each direction takes.
+  t(p + 'padding.default.encrypt', () => crypto.privateDecrypt({ key: PRIV, padding: C.RSA_PKCS1_OAEP_PADDING }, crypto.publicEncrypt({ key: PUB }, Buffer.from('d'))).toString());
+  t(p + 'padding.zero.encrypt', () => crypto.privateDecrypt(PRIV, crypto.publicEncrypt({ key: PUB, padding: 0 }, Buffer.from('d'))).toString());
+  t(p + 'padding.default.sign', () => crypto.publicDecrypt({ key: PUB, padding: C.RSA_PKCS1_PADDING }, crypto.privateEncrypt({ key: PRIV }, Buffer.from('d'))).toString());
+  t(p + 'padding.unknown.publicEncrypt', () => crypto.publicEncrypt({ key: PUB, padding: 99 }, Buffer.from('d')));
+  t(p + 'padding.unknown.privateDecrypt', () => crypto.privateDecrypt({ key: PRIV, padding: 2 }, Buffer.alloc(k, 1)));
+  t(p + 'padding.oaep.privateEncrypt', () => crypto.privateEncrypt({ key: PRIV, padding: C.RSA_PKCS1_OAEP_PADDING }, Buffer.from('d')));
+  t(p + 'padding.oaep.publicDecrypt', () => crypto.publicDecrypt({ key: PUB, padding: C.RSA_PKCS1_OAEP_PADDING }, crypto.privateEncrypt(PRIV, Buffer.from('d'))));
+  t(p + 'padding.unknown.privateEncrypt', () => crypto.privateEncrypt({ key: PRIV, padding: 99 }, Buffer.from('d')));
+  // publicDecrypt names what is wrong with a block that is not PKCS#1 v1.5 type 1.
+  const raw = (em) => crypto.publicDecrypt(PUB, crypto.privateEncrypt(none(PRIV), em));
+  t(p + 'type1.notZeroFirst', () => crypto.publicDecrypt(PUB, Buffer.alloc(k, 1)));
+  t(p + 'type1.blockType', () => raw(Buffer.concat([Buffer.from([0, 2]), Buffer.alloc(k - 5, 0xff), Buffer.from([0, 0x61, 0x62])])));
+  t(p + 'type1.header', () => raw(Buffer.concat([Buffer.from([0, 1]), Buffer.alloc(20, 0xff), Buffer.from([5]), Buffer.alloc(k - 23, 0x61)])));
+  t(p + 'type1.noSeparator', () => raw(Buffer.concat([Buffer.from([0, 1]), Buffer.alloc(k - 2, 0xff)])));
+  t(p + 'type1.shortPadding', () => raw(Buffer.concat([Buffer.from([0, 1]), Buffer.alloc(7, 0xff), Buffer.from([0]), Buffer.alloc(k - 10, 0x61)])));
+  t(p + 'type1.eightPadBytes', () => raw(Buffer.concat([Buffer.from([0, 1]), Buffer.alloc(8, 0xff), Buffer.from([0]), Buffer.alloc(k - 11, 0x61)])).length);
+  t(p + 'type1.noData', () => crypto.publicDecrypt(PUB, crypto.privateEncrypt(PRIV, Buffer.alloc(0))));
+}
+
+{
+  const PRIV = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDq0PY64yGXmo1t\nTNBMW21m5n8lCyrIXCDgNFKxZShofTyjpCghCt8DfM/mKLcTCBhVnmnyXEq6wKK4\nYPc1xhQkvfj8ZYtcsxS8Fhygwd7BQoFEMHp8ciuCHFwYyLVVpjDEWrYM2zNz6jrS\nKOifqEQHMjTgcj2a606xM4yzv4f9PAIEUQT8OIRaAPf1Tf6Egvbw0EZUBD6GLlgg\npFljQFB8+Z1fxKXhikus1R9oT/gZnxnrqikqb0udLT4Qx8TgGXSEEIOkFWM5+YDj\nAOzxZOgdY7hOSlXnPSujHLsOeIRg9PhLhFjUTQ6v6JNQRKPSTvsc66v65VFJ4eLq\nuA27AJarAgMBAAECggEASwZ7/eGvTHydnmQSE6uMn3ma+y9/umexO2GMYFClYglN\ntC1RgwkxqzAYTv4ITITkHYsRZ9X0LIo7E3Ur11sT+Y9XO/GH3xT61YOtHvICpbYF\njk98+0ERRK+h/2s1gQmqADrJev8Yh/s5UweuF8EQB0qT2Xi21UZErNp/JLlYDmEe\nyL1bMVE4FWYXdHnIqYo+D9/h2tUYVBjz53XebrIGnUMkR0mF6xN2NkhumtyuJXEy\nlB+zhkYF1qiCNPCbGPGyuqUJA1VPfuRriEmO+J0NEV0aDLNy/Khv+yuTejFcJCpt\nypwYZ0Gqe3hV+7bQULIvNvW4neBGtkAeSSFI7I0FmQKBgQD2CBupoydDDBzJXH5Y\n28V2Mf8vg2eqcfnqlKKQnK/DyOT56flLgF74J+8CoAlKmM2rctCRowpWDUT2S66B\nnMP23jZL4eRl6L+gZYOmFkuwH+KJcs4c2BvwTI2d5HtKNdpenf5P+A+OKTKoPwgB\nT6/FFiFqHr58TSPA74eTNy4Q8wKBgQD0VIZwQHIoPXnn44aKt0Jp0I0B7LaIGGtS\nP3ulLgNNZr/8vspRRSyCNMH2YLiPXYfQcePfNV2PsgZn94gvoMDE6dL1vcxi53yv\nZsdtuCBq3MfMuu8w6MwMK4k+aJSjbmrxJvgLkfMva1VZF4X59eXlHwc+hWrz1qfW\nt36saPaRaQKBgHcNq10mHxyZouBpipYzGtU8ElEKlEJtTtMNw7CYsZDbCLpKVyEK\n6GnK4SRzDqvzTyrUr0qaC6liWGmaa8I6erVeCAYmNCCARSI3nUHkbhG3DCcYz9Yz\nWSmp0amC44ogjx/T8jj+P4C6PNIfVh9UUSjcsaSpZeG+bjuxbPh27iqzAoGBAIdg\nLf0UOCxDo7/wOSOy1oF6pCZk2d4eaZhwxDmJfRrty4Jm1AKjqT2brbytapVE5XOB\nJxkNoIF1ykbgx/xbvXNdex3dw9kpGdS1xdntI0kSe0HccZtP4X78wFZr66+CBo8H\nYHhIrc2gUvHCLuGIdZC12HWzxsbEMMqvcOhmX/fBAoGAGB6Gh1Rd6dggDcZu4AuJ\n4DR64giVmmLYK1a8dS5e+M4+emTl7kVC9SLhLrIRLX9FsTj4wKZI96wImJc88lOO\n5gg9dAJ/aTqkENxf0f5Jb896aafoJopxYVsae6/qQIKbDv7xDyQkqK5ne8W7y7rT\nveypYU+3vLV5dytdMGn1owc=\n-----END PRIVATE KEY-----\n";
+  const PUB = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6tD2OuMhl5qNbUzQTFtt\nZuZ/JQsqyFwg4DRSsWUoaH08o6QoIQrfA3zP5ii3EwgYVZ5p8lxKusCiuGD3NcYU\nJL34/GWLXLMUvBYcoMHewUKBRDB6fHIrghxcGMi1VaYwxFq2DNszc+o60ijon6hE\nBzI04HI9mutOsTOMs7+H/TwCBFEE/DiEWgD39U3+hIL28NBGVAQ+hi5YIKRZY0BQ\nfPmdX8Sl4YpLrNUfaE/4GZ8Z66opKm9LnS0+EMfE4Bl0hBCDpBVjOfmA4wDs8WTo\nHWO4TkpV5z0roxy7DniEYPT4S4RY1E0Or+iTUESj0k77HOur+uVRSeHi6rgNuwCW\nqwIDAQAB\n-----END PUBLIC KEY-----\n";
+  const k = 256;
+  const p = 'rsa2048.';
+  const none = (key) => ({ key, padding: C.RSA_NO_PADDING });
+  const blk = Buffer.alloc(k);
+  for (let j = 0; j < k; j++) blk[j] = (j * 13 + 5) & 0xff;
+  blk[0] = 0; blk[1] = 1;
+  t(p + 'publicEncrypt', () => crypto.publicEncrypt(none(PUB), blk));
+  t(p + 'publicEncrypt.withPrivateKey', () => crypto.publicEncrypt(none(PRIV), blk));
+  t(p + 'privateDecrypt', () => crypto.privateDecrypt(none(PRIV), crypto.publicEncrypt(none(PUB), blk)).equals(blk));
+  t(p + 'privateEncrypt', () => crypto.privateEncrypt(none(PRIV), blk));
+  t(p + 'publicDecrypt', () => crypto.publicDecrypt(none(PUB), crypto.privateEncrypt(none(PRIV), blk)).equals(blk));
+  t(p + 'publicDecrypt.withPrivateKey', () => crypto.publicDecrypt(none(PRIV), crypto.privateEncrypt(none(PRIV), blk)).equals(blk));
+  // The block a padded operation works on, seen without the padding step.
+  t(p + 'publicDecrypt.ofPkcs1', () => { const em = crypto.publicDecrypt(none(PUB), crypto.privateEncrypt(PRIV, Buffer.from('pe'))); return [em.length, em.subarray(0, 4).toString('hex'), em.subarray(-3).toString('hex')]; });
+  t(p + 'privateDecrypt.ofPkcs1', () => { const em = crypto.privateDecrypt(none(PRIV), hex("026b5535d8c19e721052b3a342951c60d0a380e129ce19016459cfb89f946c62b8c1565169363df6711e7a30cc47aa2df8e9f85a66eac6f12656b5a452275964e7203e8e6b7f910e9b58bde5340dc7066aaf7b06c093348534f60961c390c32f30539a07dd54303c0e1b4a017a279cca31f9b43c239e850a9417a6314754d19f98325103d157b07b304b83916c088a17841469bb79d4b608e825417fbe1147bb24b55eb6234f7d55f1852f857c3918c2dc126c5c967fa8b06bbb4922ed103f0e7a6df00d5c74eb39a38cb29b75c930348cc980844606829db45175bbd082eeeca59d2eae6936538cf11738720cc32feec54be467d9351b6510fa036a2cc4803d")); return [em.length, em[0], em[1], em.subarray(-10).toString()]; });
+  t(p + 'publicEncrypt.zero', () => crypto.publicEncrypt(none(PUB), Buffer.alloc(k)).equals(Buffer.alloc(k)));
+  t(p + 'privateEncrypt.zero', () => crypto.privateEncrypt(none(PRIV), Buffer.alloc(k)).equals(Buffer.alloc(k)));
+  // Encrypting takes exactly the modulus length, below the modulus.
+  t(p + 'publicEncrypt.short', () => crypto.publicEncrypt(none(PUB), blk.subarray(1)));
+  t(p + 'publicEncrypt.long', () => crypto.publicEncrypt(none(PUB), Buffer.concat([Buffer.alloc(1), blk])));
+  t(p + 'publicEncrypt.notBelowModulus', () => crypto.publicEncrypt(none(PUB), Buffer.alloc(k, 0xff)));
+  t(p + 'privateEncrypt.short', () => crypto.privateEncrypt(none(PRIV), blk.subarray(1)));
+  t(p + 'privateEncrypt.long', () => crypto.privateEncrypt(none(PRIV), Buffer.concat([Buffer.alloc(1), blk])));
+  t(p + 'privateEncrypt.notBelowModulus', () => crypto.privateEncrypt(none(PRIV), Buffer.alloc(k, 0xff)));
+  // Decrypting also takes a shorter block: the same integer without its leading zero bytes.
+  t(p + 'privateDecrypt.short', () => crypto.privateDecrypt(none(PRIV), blk.subarray(1)).equals(crypto.privateDecrypt(none(PRIV), blk)));
+  t(p + 'privateDecrypt.long', () => crypto.privateDecrypt(none(PRIV), Buffer.alloc(k + 1, 1)));
+  t(p + 'privateDecrypt.notBelowModulus', () => crypto.privateDecrypt(none(PRIV), Buffer.alloc(k, 0xff)));
+  t(p + 'privateDecrypt.empty', () => crypto.privateDecrypt(none(PRIV), Buffer.alloc(0)));
+  t(p + 'publicDecrypt.short', () => crypto.publicDecrypt(none(PUB), blk.subarray(1)).equals(crypto.publicDecrypt(none(PUB), blk)));
+  t(p + 'publicDecrypt.long', () => crypto.publicDecrypt(none(PUB), Buffer.alloc(k + 1, 1)));
+  t(p + 'publicDecrypt.notBelowModulus', () => crypto.publicDecrypt(none(PUB), Buffer.alloc(k, 0xff)));
+  t(p + 'publicDecrypt.empty', () => crypto.publicDecrypt(none(PUB), Buffer.alloc(0)).equals(Buffer.alloc(k)));
+  // The padding argument: which values each direction takes.
+  t(p + 'padding.default.encrypt', () => crypto.privateDecrypt({ key: PRIV, padding: C.RSA_PKCS1_OAEP_PADDING }, crypto.publicEncrypt({ key: PUB }, Buffer.from('d'))).toString());
+  t(p + 'padding.zero.encrypt', () => crypto.privateDecrypt(PRIV, crypto.publicEncrypt({ key: PUB, padding: 0 }, Buffer.from('d'))).toString());
+  t(p + 'padding.default.sign', () => crypto.publicDecrypt({ key: PUB, padding: C.RSA_PKCS1_PADDING }, crypto.privateEncrypt({ key: PRIV }, Buffer.from('d'))).toString());
+  t(p + 'padding.unknown.publicEncrypt', () => crypto.publicEncrypt({ key: PUB, padding: 99 }, Buffer.from('d')));
+  t(p + 'padding.unknown.privateDecrypt', () => crypto.privateDecrypt({ key: PRIV, padding: 2 }, Buffer.alloc(k, 1)));
+  t(p + 'padding.oaep.privateEncrypt', () => crypto.privateEncrypt({ key: PRIV, padding: C.RSA_PKCS1_OAEP_PADDING }, Buffer.from('d')));
+  t(p + 'padding.oaep.publicDecrypt', () => crypto.publicDecrypt({ key: PUB, padding: C.RSA_PKCS1_OAEP_PADDING }, crypto.privateEncrypt(PRIV, Buffer.from('d'))));
+  t(p + 'padding.unknown.privateEncrypt', () => crypto.privateEncrypt({ key: PRIV, padding: 99 }, Buffer.from('d')));
+  // publicDecrypt names what is wrong with a block that is not PKCS#1 v1.5 type 1.
+  const raw = (em) => crypto.publicDecrypt(PUB, crypto.privateEncrypt(none(PRIV), em));
+  t(p + 'type1.notZeroFirst', () => crypto.publicDecrypt(PUB, Buffer.alloc(k, 1)));
+  t(p + 'type1.blockType', () => raw(Buffer.concat([Buffer.from([0, 2]), Buffer.alloc(k - 5, 0xff), Buffer.from([0, 0x61, 0x62])])));
+  t(p + 'type1.header', () => raw(Buffer.concat([Buffer.from([0, 1]), Buffer.alloc(20, 0xff), Buffer.from([5]), Buffer.alloc(k - 23, 0x61)])));
+  t(p + 'type1.noSeparator', () => raw(Buffer.concat([Buffer.from([0, 1]), Buffer.alloc(k - 2, 0xff)])));
+  t(p + 'type1.shortPadding', () => raw(Buffer.concat([Buffer.from([0, 1]), Buffer.alloc(7, 0xff), Buffer.from([0]), Buffer.alloc(k - 10, 0x61)])));
+  t(p + 'type1.eightPadBytes', () => raw(Buffer.concat([Buffer.from([0, 1]), Buffer.alloc(8, 0xff), Buffer.from([0]), Buffer.alloc(k - 11, 0x61)])).length);
+  t(p + 'type1.noData', () => crypto.publicDecrypt(PUB, crypto.privateEncrypt(PRIV, Buffer.alloc(0))));
+}
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "rsa_no_padding.cjs failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        r#"rsa512.publicEncrypt=sha256:8eade4eb97ac8aa36b3c657e58a9e3d92ba757de819b2b3f8a488b365bc26bba"#,
+        r#"rsa512.publicEncrypt.withPrivateKey=sha256:8eade4eb97ac8aa36b3c657e58a9e3d92ba757de819b2b3f8a488b365bc26bba"#,
+        r#"rsa512.privateDecrypt=true"#,
+        r#"rsa512.privateEncrypt=sha256:4b4efdd5ae7d24abf6f641e0996ec75eb406be96bf5f62cb00235c92f5f2282c"#,
+        r#"rsa512.publicDecrypt=true"#,
+        r#"rsa512.publicDecrypt.withPrivateKey=true"#,
+        r#"rsa512.publicDecrypt.ofPkcs1=[64,"0001ffff","007065"]"#,
+        r#"rsa512.privateDecrypt.ofPkcs1=[64,0,2,"pkcs1 v1.5"]"#,
+        r#"rsa512.publicEncrypt.zero=true"#,
+        r#"rsa512.privateEncrypt.zero=true"#,
+        r#"rsa512.publicEncrypt.short=throws ERR_OSSL_RSA_DATA_TOO_SMALL_FOR_KEY_SIZE: error:0200007A:rsa routines::data too small for key size"#,
+        r#"rsa512.publicEncrypt.long=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE: error:0200006E:rsa routines::data too large for key size"#,
+        r#"rsa512.publicEncrypt.notBelowModulus=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_MODULUS: error:02000084:rsa routines::data too large for modulus"#,
+        r#"rsa512.privateEncrypt.short=throws ERR_OSSL_RSA_DATA_TOO_SMALL_FOR_KEY_SIZE: error:0200007A:rsa routines::data too small for key size"#,
+        r#"rsa512.privateEncrypt.long=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE: error:0200006E:rsa routines::data too large for key size"#,
+        r#"rsa512.privateEncrypt.notBelowModulus=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_MODULUS: error:02000084:rsa routines::data too large for modulus"#,
+        r#"rsa512.privateDecrypt.short=true"#,
+        r#"rsa512.privateDecrypt.long=throws ERR_OSSL_RSA_DATA_GREATER_THAN_MOD_LEN: error:0200006C:rsa routines::data greater than mod len"#,
+        r#"rsa512.privateDecrypt.notBelowModulus=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_MODULUS: error:02000084:rsa routines::data too large for modulus"#,
+        r#"rsa512.privateDecrypt.empty=throws ERR_OSSL_RSA_DATA_TOO_SMALL: error:0200006F:rsa routines::data too small"#,
+        r#"rsa512.publicDecrypt.short=true"#,
+        r#"rsa512.publicDecrypt.long=throws ERR_OSSL_RSA_DATA_GREATER_THAN_MOD_LEN: error:0200006C:rsa routines::data greater than mod len"#,
+        r#"rsa512.publicDecrypt.notBelowModulus=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_MODULUS: error:02000084:rsa routines::data too large for modulus"#,
+        r#"rsa512.publicDecrypt.empty=true"#,
+        r#"rsa512.padding.default.encrypt=d"#,
+        r#"rsa512.padding.zero.encrypt=d"#,
+        r#"rsa512.padding.default.sign=d"#,
+        r#"rsa512.padding.unknown.publicEncrypt=throws ERR_OSSL_RSA_UNKNOWN_PADDING_TYPE: error:02000076:rsa routines::unknown padding type"#,
+        r#"rsa512.padding.unknown.privateDecrypt=throws ERR_OSSL_RSA_UNKNOWN_PADDING_TYPE: error:02000076:rsa routines::unknown padding type"#,
+        r#"rsa512.padding.oaep.privateEncrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"rsa512.padding.oaep.publicDecrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"rsa512.padding.unknown.privateEncrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"rsa512.type1.notZeroFirst=throws ERR_OSSL_RSA_INVALID_PADDING: error:0200008A:rsa routines::invalid padding"#,
+        r#"rsa512.type1.blockType=throws ERR_OSSL_RSA_BLOCK_TYPE_IS_NOT_01: error:0200006A:rsa routines::block type is not 01"#,
+        r#"rsa512.type1.header=throws ERR_OSSL_RSA_BAD_FIXED_HEADER_DECRYPT: error:02000066:rsa routines::bad fixed header decrypt"#,
+        r#"rsa512.type1.noSeparator=throws ERR_OSSL_RSA_NULL_BEFORE_BLOCK_MISSING: error:02000071:rsa routines::null before block missing"#,
+        r#"rsa512.type1.shortPadding=throws ERR_OSSL_RSA_BAD_PAD_BYTE_COUNT: error:02000067:rsa routines::bad pad byte count"#,
+        r#"rsa512.type1.eightPadBytes=53"#,
+        r#"rsa512.type1.noData=throws ERR_OSSL_RSA_LIB: error:1C880004:Provider routines::RSA lib"#,
+        r#"rsa2048.publicEncrypt=sha256:320dabb20f31c1f1b0143063cad98545c02e679aa98902e62bccd80b9aaeb602"#,
+        r#"rsa2048.publicEncrypt.withPrivateKey=sha256:320dabb20f31c1f1b0143063cad98545c02e679aa98902e62bccd80b9aaeb602"#,
+        r#"rsa2048.privateDecrypt=true"#,
+        r#"rsa2048.privateEncrypt=sha256:2238604ec0da715b23e8b48849532ad9a10f36acc1f35779e6eb064257fb49a0"#,
+        r#"rsa2048.publicDecrypt=true"#,
+        r#"rsa2048.publicDecrypt.withPrivateKey=true"#,
+        r#"rsa2048.publicDecrypt.ofPkcs1=[256,"0001ffff","007065"]"#,
+        r#"rsa2048.privateDecrypt.ofPkcs1=[256,0,2,"pkcs1 v1.5"]"#,
+        r#"rsa2048.publicEncrypt.zero=true"#,
+        r#"rsa2048.privateEncrypt.zero=true"#,
+        r#"rsa2048.publicEncrypt.short=throws ERR_OSSL_RSA_DATA_TOO_SMALL_FOR_KEY_SIZE: error:0200007A:rsa routines::data too small for key size"#,
+        r#"rsa2048.publicEncrypt.long=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE: error:0200006E:rsa routines::data too large for key size"#,
+        r#"rsa2048.publicEncrypt.notBelowModulus=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_MODULUS: error:02000084:rsa routines::data too large for modulus"#,
+        r#"rsa2048.privateEncrypt.short=throws ERR_OSSL_RSA_DATA_TOO_SMALL_FOR_KEY_SIZE: error:0200007A:rsa routines::data too small for key size"#,
+        r#"rsa2048.privateEncrypt.long=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE: error:0200006E:rsa routines::data too large for key size"#,
+        r#"rsa2048.privateEncrypt.notBelowModulus=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_MODULUS: error:02000084:rsa routines::data too large for modulus"#,
+        r#"rsa2048.privateDecrypt.short=true"#,
+        r#"rsa2048.privateDecrypt.long=throws ERR_OSSL_RSA_DATA_GREATER_THAN_MOD_LEN: error:0200006C:rsa routines::data greater than mod len"#,
+        r#"rsa2048.privateDecrypt.notBelowModulus=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_MODULUS: error:02000084:rsa routines::data too large for modulus"#,
+        r#"rsa2048.privateDecrypt.empty=throws ERR_OSSL_RSA_DATA_TOO_SMALL: error:0200006F:rsa routines::data too small"#,
+        r#"rsa2048.publicDecrypt.short=true"#,
+        r#"rsa2048.publicDecrypt.long=throws ERR_OSSL_RSA_DATA_GREATER_THAN_MOD_LEN: error:0200006C:rsa routines::data greater than mod len"#,
+        r#"rsa2048.publicDecrypt.notBelowModulus=throws ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_MODULUS: error:02000084:rsa routines::data too large for modulus"#,
+        r#"rsa2048.publicDecrypt.empty=true"#,
+        r#"rsa2048.padding.default.encrypt=d"#,
+        r#"rsa2048.padding.zero.encrypt=d"#,
+        r#"rsa2048.padding.default.sign=d"#,
+        r#"rsa2048.padding.unknown.publicEncrypt=throws ERR_OSSL_RSA_UNKNOWN_PADDING_TYPE: error:02000076:rsa routines::unknown padding type"#,
+        r#"rsa2048.padding.unknown.privateDecrypt=throws ERR_OSSL_RSA_UNKNOWN_PADDING_TYPE: error:02000076:rsa routines::unknown padding type"#,
+        r#"rsa2048.padding.oaep.privateEncrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"rsa2048.padding.oaep.publicDecrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"rsa2048.padding.unknown.privateEncrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"rsa2048.type1.notZeroFirst=throws ERR_OSSL_RSA_INVALID_PADDING: error:0200008A:rsa routines::invalid padding"#,
+        r#"rsa2048.type1.blockType=throws ERR_OSSL_RSA_BLOCK_TYPE_IS_NOT_01: error:0200006A:rsa routines::block type is not 01"#,
+        r#"rsa2048.type1.header=throws ERR_OSSL_RSA_BAD_FIXED_HEADER_DECRYPT: error:02000066:rsa routines::bad fixed header decrypt"#,
+        r#"rsa2048.type1.noSeparator=throws ERR_OSSL_RSA_NULL_BEFORE_BLOCK_MISSING: error:02000071:rsa routines::null before block missing"#,
+        r#"rsa2048.type1.shortPadding=throws ERR_OSSL_RSA_BAD_PAD_BYTE_COUNT: error:02000067:rsa routines::bad pad byte count"#,
+        r#"rsa2048.type1.eightPadBytes=245"#,
+        r#"rsa2048.type1.noData=throws ERR_OSSL_RSA_LIB: error:1C880004:Provider routines::RSA lib"#,
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), expected.len(), "line count; stdout:\n{stdout}");
+    for (got, want) in lines.iter().zip(expected.iter()) {
+        assert_eq!(got, want, "stdout:\n{stdout}");
+    }
+}
+
+// Private keys of less usual shapes (factors of unequal length, a private
+// exponent that is not below the modulus), an OAEP block whose leading octet
+// is not zero, and the data and `padding` arguments of the four
+// encrypt/decrypt functions: every type Node takes for each. Fixed keys made
+// with Node. Expected lines are node v22.22.2's except where a `// node:`
+// comment says otherwise.
+#[test]
+fn crypto_rsa_key_shapes_and_argument_types_match_node() {
+    let file = write_temp(
+        "rsa_key_shapes.cjs",
+        r#"
+const crypto = require('node:crypto');
+const C = crypto.constants;
+const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
+const show = (v) => Buffer.isBuffer(v) ? (v.length <= 40 ? 'hex:' + v.toString('hex') : 'sha256:' + sha(v)) : typeof v === 'string' ? v : JSON.stringify(v);
+function t(name, fn) {
+  let r;
+  try { r = show(fn()); } catch (e) { r = 'throws ' + (e.code || e.name) + ': ' + e.message; }
+  console.log(name + '=' + r);
+}
+const hex = (s) => Buffer.from(s, 'hex');
+const big = (s) => BigInt('0x' + Buffer.from(s, 'base64url').toString('hex'));
+const bits = (s) => big(s).toString(2).length;
+const PSS = C.RSA_PKCS1_PSS_PADDING;
+const msg = Buffer.from('fixture message');
+
+// 'plain' is an ordinary 1024-bit key. The others are two-prime keys of
+// less usual shapes: 'near' has factors of 511 and 513 bits, 'wide' of 1088
+// and 960 bits, and 'larged' has a private exponent that is not below its
+// modulus.
+const KEYS = {"plain":{"pkcs8":"-----BEGIN PRIVATE KEY-----\nMIICdgIBADANBgkqhkiG9w0BAQEFAASCAmAwggJcAgEAAoGBANR38YO+bCMg6+3Z\ntZj5ld2HCIodmSPGw8ZyJPJQ4ZPDAkZX1BzS4/S3fFLSRB8J9elRltVrD65YCD9k\nMa33qZI6sQbOMMK2jtiBlMc56a5Vpq+IGQkibMbZ1zktkNjyrK8jUzmh8qkrp01F\n7MHJJBxrs5Pm8NmGw4uhpRbhHT+jAgMBAAECgYBzVGAeuSCNuPMX+tMeJGx7AS9b\neVGFIAFpGNCBT/ICeRolAMu8kaT3UxoDAuvDRW7cpVMQqbqrUlG3xzVIT2UVY9tV\nLLXM2LBu1geUs1CJpXO8jjE2TkLK4awxxLNOeNKebVPjGJ9qUVHJoTEpGqPowh+J\nHPFLbnHHTCVwNbVxoQJBAOxmZ7GPEjUVe3vbZR6/p+OkfQh0IdHRqpghLEIie6Ck\n7xiVc7Ye7V4GaIO0zoKglxO9t32u5pv+Ld6L3QbSWpsCQQDmFZeOMjGWwF16xo/A\ntmrctHLgfkGLotwXZ1sqWPgCrSeRXebC5BsE2hUrCKAhlvDTqX/r2j98uzisT1Mw\nkFuZAkAqSF6/qYFuMTt2+dTqXQlgdClQ+8SYzNGgiD5sTdKi9x003nZl2r5GFQtY\nk1xkjOi4xTQurLvepuX5ajbMY4+FAkAWAy7Svd6cq57F5kVOjKVApErxS2L99wDT\nhGHmdUiVCPfmInO3ZZdoKW0pBtQ7InO77FV+vQyh5E+RvK0a0lTRAkEAq6gqAAb8\n8nByWgIi45EoORhlrhQ5IQp3lBoTva/w+gDRSRPL3v8bkXHTYCmnoprwrSYQs+ln\ncNiPMrXT0HX29w==\n-----END PRIVATE KEY-----\n","pkcs1":"-----BEGIN RSA PRIVATE KEY-----\nMIICXAIBAAKBgQDUd/GDvmwjIOvt2bWY+ZXdhwiKHZkjxsPGciTyUOGTwwJGV9Qc\n0uP0t3xS0kQfCfXpUZbVaw+uWAg/ZDGt96mSOrEGzjDCto7YgZTHOemuVaaviBkJ\nImzG2dc5LZDY8qyvI1M5ofKpK6dNRezBySQca7OT5vDZhsOLoaUW4R0/owIDAQAB\nAoGAc1RgHrkgjbjzF/rTHiRsewEvW3lRhSABaRjQgU/yAnkaJQDLvJGk91MaAwLr\nw0Vu3KVTEKm6q1JRt8c1SE9lFWPbVSy1zNiwbtYHlLNQiaVzvI4xNk5CyuGsMcSz\nTnjSnm1T4xifalFRyaExKRqj6MIfiRzxS25xx0wlcDW1caECQQDsZmexjxI1FXt7\n22Uev6fjpH0IdCHR0aqYISxCInugpO8YlXO2Hu1eBmiDtM6CoJcTvbd9ruab/i3e\ni90G0lqbAkEA5hWXjjIxlsBdesaPwLZq3LRy4H5Bi6LcF2dbKlj4Aq0nkV3mwuQb\nBNoVKwigIZbw06l/69o/fLs4rE9TMJBbmQJAKkhev6mBbjE7dvnU6l0JYHQpUPvE\nmMzRoIg+bE3SovcdNN52Zdq+RhULWJNcZIzouMU0Lqy73qbl+Wo2zGOPhQJAFgMu\n0r3enKuexeZFToylQKRK8Uti/fcA04Rh5nVIlQj35iJzt2WXaCltKQbUOyJzu+xV\nfr0MoeRPkbytGtJU0QJBAKuoKgAG/PJwcloCIuORKDkYZa4UOSEKd5QaE72v8PoA\n0UkTy97/G5Fx02App6Ka8K0mELPpZ3DYjzK109B19vc=\n-----END RSA PRIVATE KEY-----\n","spki":"-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDUd/GDvmwjIOvt2bWY+ZXdhwiK\nHZkjxsPGciTyUOGTwwJGV9Qc0uP0t3xS0kQfCfXpUZbVaw+uWAg/ZDGt96mSOrEG\nzjDCto7YgZTHOemuVaaviBkJImzG2dc5LZDY8qyvI1M5ofKpK6dNRezBySQca7OT\n5vDZhsOLoaUW4R0/owIDAQAB\n-----END PUBLIC KEY-----\n","jwk":{"kty":"RSA","n":"1Hfxg75sIyDr7dm1mPmV3YcIih2ZI8bDxnIk8lDhk8MCRlfUHNLj9Ld8UtJEHwn16VGW1WsPrlgIP2QxrfepkjqxBs4wwraO2IGUxznprlWmr4gZCSJsxtnXOS2Q2PKsryNTOaHyqSunTUXswckkHGuzk-bw2YbDi6GlFuEdP6M","e":"AQAB","d":"c1RgHrkgjbjzF_rTHiRsewEvW3lRhSABaRjQgU_yAnkaJQDLvJGk91MaAwLrw0Vu3KVTEKm6q1JRt8c1SE9lFWPbVSy1zNiwbtYHlLNQiaVzvI4xNk5CyuGsMcSzTnjSnm1T4xifalFRyaExKRqj6MIfiRzxS25xx0wlcDW1caE","p":"7GZnsY8SNRV7e9tlHr-n46R9CHQh0dGqmCEsQiJ7oKTvGJVzth7tXgZog7TOgqCXE723fa7mm_4t3ovdBtJamw","q":"5hWXjjIxlsBdesaPwLZq3LRy4H5Bi6LcF2dbKlj4Aq0nkV3mwuQbBNoVKwigIZbw06l_69o_fLs4rE9TMJBbmQ","dp":"Kkhev6mBbjE7dvnU6l0JYHQpUPvEmMzRoIg-bE3SovcdNN52Zdq-RhULWJNcZIzouMU0Lqy73qbl-Wo2zGOPhQ","dq":"FgMu0r3enKuexeZFToylQKRK8Uti_fcA04Rh5nVIlQj35iJzt2WXaCltKQbUOyJzu-xVfr0MoeRPkbytGtJU0Q","qi":"q6gqAAb88nByWgIi45EoORhlrhQ5IQp3lBoTva_w-gDRSRPL3v8bkXHTYCmnoprwrSYQs-lncNiPMrXT0HX29w"},"oaep":"570e8e2b0dcd14964241f74b853acc293042157240958d90449c258df8608ad8831b3fa1afe63b3ce9426867d9637cb50187e928739135969e6e1b855e0c3f08ef7e0aa3def9112d159e8c1669440df539f9eeeeaa82b8b3c6c444eaca89cac8ef76af0fc97f0e8d0d3d390cc718402cfa2df3c172a4e69555e6ce4b951ce671","pe":"a081be22d6bd18d0d74cebac23e2fde650d5e87650b32e3020824a7e5bbe3e5929508e0ee2c1be89ab3660b2b6d7c83d4256079338c6d39913e5b69977126d4f538db7ce8b8e24ab6181cc047abb2136d3fa8e2c0cb3b92555ee6b443121c52344ea59975b3e0d453d77c251ae097263c49c800d1061813f4a29f4c401dcba18"},"near":{"pkcs8":"-----BEGIN PRIVATE KEY-----\nMIICdAIBADANBgkqhkiG9w0BAQEFAASCAl4wggJaAgEAAoGBALIziAkoPj9hdxaL\nG3+xw2vzk4iveR0TwVaHs1+g0uLL35MFpJ4RPKYyk0kqgCkHHbzPI2TEIcbCQRVk\nVLYaBpiHPL0IMysgSVgDJeyLZEenLdUMwkcp/XnQHoeTD8983sIfoY9Q5SHRwyUq\nXsDZqd4a5K6RVYsxE9JO/EH0v16DAgMBAAECgYAPJy71/ww4AyzcvQx5Zx95J60P\nzkK2vxjNfQblkVKNbYz/6VbDstnc6hJjLNrZYkexkqLtrSM6zbGPb54nyVPDvLmb\nUf9VbaY8l39r3kiBqKfz2PsO8GHH5tvzXCZV52FUcsWcmEIY8aAL0L9P22p5Rign\n1ZbX/i7d7U5aBpNBXQJAYy4/cAzGNa3F9toLWRzpO3+jGOrjoLOmuzyUUInkmgLJ\nfCPoy6DN6/C3dhUxvnC9TwQ+HcZujUihPHhX6EPgnQJBAcv2yPMNcD2fs5BPvKTd\n9/8Olh0kpq8NzWL3m3BSNIVpkpuKew/3GxQeknK4tuSK8uBQdwwld875MVMe5/4b\nQZ8CQBHM0RHZGRG1OFxPUc4ShEFrbOgh7+x9kaT1AGFb/i0t5t9iynsRRyPbNfH5\nZ84YCcHOrx9E575vlJB3wL8sv3kCQG4gIQ6oWgY3FVvo62ahyn2jtWc23j2tVU5r\nsCidVfvXQgXBiyNQa4hOpYuYFBn19p6kRUyAMAY6/YdEMBFT30sCQF13AE8gFE+r\nTty6GoeW2XUbVrDhqABM8aWniZg7l/SfRiMmZpHHZhpVyprgXt1JWhgoaahCCDxn\nQHWTEs8iRNo=\n-----END PRIVATE KEY-----\n","pkcs1":"-----BEGIN RSA PRIVATE KEY-----\nMIICWgIBAAKBgQCyM4gJKD4/YXcWixt/scNr85OIr3kdE8FWh7NfoNLiy9+TBaSe\nETymMpNJKoApBx28zyNkxCHGwkEVZFS2GgaYhzy9CDMrIElYAyXsi2RHpy3VDMJH\nKf150B6Hkw/PfN7CH6GPUOUh0cMlKl7A2aneGuSukVWLMRPSTvxB9L9egwIDAQAB\nAoGADycu9f8MOAMs3L0MeWcfeSetD85Ctr8YzX0G5ZFSjW2M/+lWw7LZ3OoSYyza\n2WJHsZKi7a0jOs2xj2+eJ8lTw7y5m1H/VW2mPJd/a95Igain89j7DvBhx+bb81wm\nVedhVHLFnJhCGPGgC9C/T9tqeUYoJ9WW1/4u3e1OWgaTQV0CQGMuP3AMxjWtxfba\nC1kc6Tt/oxjq46Czprs8lFCJ5JoCyXwj6Mugzevwt3YVMb5wvU8EPh3Gbo1IoTx4\nV+hD4J0CQQHL9sjzDXA9n7OQT7yk3ff/DpYdJKavDc1i95twUjSFaZKbinsP9xsU\nHpJyuLbkivLgUHcMJXfO+TFTHuf+G0GfAkARzNER2RkRtThcT1HOEoRBa2zoIe/s\nfZGk9QBhW/4tLebfYsp7EUcj2zXx+WfOGAnBzq8fROe+b5SQd8C/LL95AkBuICEO\nqFoGNxVb6Otmocp9o7VnNt49rVVOa7AonVX710IFwYsjUGuITqWLmBQZ9faepEVM\ngDAGOv2HRDARU99LAkBddwBPIBRPq07cuhqHltl1G1aw4agATPGlp4mYO5f0n0Yj\nJmaRx2YaVcqa4F7dSVoYKGmoQgg8Z0B1kxLPIkTa\n-----END RSA PRIVATE KEY-----\n","spki":"-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCyM4gJKD4/YXcWixt/scNr85OI\nr3kdE8FWh7NfoNLiy9+TBaSeETymMpNJKoApBx28zyNkxCHGwkEVZFS2GgaYhzy9\nCDMrIElYAyXsi2RHpy3VDMJHKf150B6Hkw/PfN7CH6GPUOUh0cMlKl7A2aneGuSu\nkVWLMRPSTvxB9L9egwIDAQAB\n-----END PUBLIC KEY-----\n","jwk":{"kty":"RSA","n":"sjOICSg-P2F3Fosbf7HDa_OTiK95HRPBVoezX6DS4svfkwWknhE8pjKTSSqAKQcdvM8jZMQhxsJBFWRUthoGmIc8vQgzKyBJWAMl7ItkR6ct1QzCRyn9edAeh5MPz3zewh-hj1DlIdHDJSpewNmp3hrkrpFVizET0k78QfS_XoM","e":"AQAB","d":"Dycu9f8MOAMs3L0MeWcfeSetD85Ctr8YzX0G5ZFSjW2M_-lWw7LZ3OoSYyza2WJHsZKi7a0jOs2xj2-eJ8lTw7y5m1H_VW2mPJd_a95Igain89j7DvBhx-bb81wmVedhVHLFnJhCGPGgC9C_T9tqeUYoJ9WW1_4u3e1OWgaTQV0","p":"Yy4_cAzGNa3F9toLWRzpO3-jGOrjoLOmuzyUUInkmgLJfCPoy6DN6_C3dhUxvnC9TwQ-HcZujUihPHhX6EPgnQ","q":"Acv2yPMNcD2fs5BPvKTd9_8Olh0kpq8NzWL3m3BSNIVpkpuKew_3GxQeknK4tuSK8uBQdwwld875MVMe5_4bQZ8","dp":"EczREdkZEbU4XE9RzhKEQWts6CHv7H2RpPUAYVv-LS3m32LKexFHI9s18flnzhgJwc6vH0Tnvm-UkHfAvyy_eQ","dq":"biAhDqhaBjcVW-jrZqHKfaO1ZzbePa1VTmuwKJ1V-9dCBcGLI1BriE6li5gUGfX2nqRFTIAwBjr9h0QwEVPfSw","qi":"XXcATyAUT6tO3Loah5bZdRtWsOGoAEzxpaeJmDuX9J9GIyZmkcdmGlXKmuBe3UlaGChpqEIIPGdAdZMSzyJE2g"},"oaep":"2f17655ab3b0c554a5152f3f2c1977f5ca9d306ed0edeaf32de6fb85b16a58887c95cecb85f356bd975f075ba05252a3cde675ec871d2a2f2ce1047c86cd8323177c99ed73fe121bb2a2d70e4501b4d9e6b0335d9a2aea589a3b571d6402898673119cfb57e28c551b8dd53ab63a062696dbf16a16580b5f853896adcd2875b2","pe":"777afc15d5011fdf702936872dc96ea2ed66609ff6d2b7b50a0475f3896d8ba114a35d4680bfc1a73adb43cda99f1ce0511a06ce7a08df9fb0afe360683551e17b6a38aac4ff3f7789d0a5c15c70722a9c4b7501476fa96bdd9fbf02fbbda2d16b2339043b43be08164f54e2197345f3684b7238726fa91da595575e28f215d3"},"wide":{"pkcs8":"-----BEGIN PRIVATE KEY-----\nMIIExAIBADANBgkqhkiG9w0BAQEFAASCBK4wggSqAgEAAoIBAQCbnCtmlznaDlZi\nlIzze0l1E6/TS9dK9CJQCIk0jFbis0X9gN5+U6in+wKNgq8ogKfia0Xt89CRQz8T\ntS6Bx8UDOo9tJU6pCn2RDHBoJhtcTFnFFvapbLw2Yax/NJZ3C7XJcf3BouJIQEhU\n044XbP5vXMydnYI3OUvUs9kJtlGHtZ0gNsqdmG027cWE47Q7zdGqDHyQrNzUy7Wc\n3I7558lrMgzGKm9SC9wcYp4Zm1yj36jF3FA0tIpDP0PDCIuDa3WFyVeLJSTo0ZGE\ntxPVTb0zEK84ngvb/I/XMcITI2XbzKbthzLee5P65wIQubdO7XlEUcE9NXtESkst\nvtdzXl5zAgMBAAECggEAQNZacx2x2jy9G8g/zrfhDKpOSaFBLJb6sRRNbxrGnSEL\nmawXiNV84blCAAqixyKMUVhXQ+WiUtSNNL36idLeMRE2b8jqtJ6NYWGoeIzgO54I\njYma709CQPqDsGEODL5RWYVosUUYOfim6slXXEVq4qXtEANwHWh+8DJv/BUEo5/8\n6qSduOT1qx66VCP7RPLkPhVNgqifMeKbYQrtB8XVeOXUCUYEXC5Mk6x6IpP0lsYG\nOHtVeL4sOoAswizmCRsuRhHDbYMV1u0m1jcfdom7qoi1s3hJH+OzJDGQ3i6clSp9\nP3ZlSR8VPVRHBsiB2fp1VasKKLfe8wN0ECwGvNAB+QKBiQDHRjAk/jn5cI2kWRmh\nuS1bwZi7zw6EMWSJg6CJhyURDxDE7kzi+3DKTuDBp0+6iY28fKsM3Ocb6Dehe33a\n3S6EEQu7GFGklAcJIAeNTlWLCFeDZYW0TKyXnR6CgqSZciJzVuWVVVAjF6mGHE+g\nz7H1OiJFqrdbGOpSsQgdE50UwCusmIGUBWh/AnkAx+gFnIOCSQG6h96bO1Zy0vjw\ngj/aDamJR1MQJVv22G0WRHM2nILWLOz9LTafvmSxiUsf1pMLWfkq0+EQuYUDlyEh\nUMCA3EtuoGc1AXBQfgFa2TEmJTU2vgX7ga4smKbQ3v+VNq/ntw18IP3wf4t9rOmc\nngjqX/ANAoGJAI60yAOmADSPExBwMnfrmf0M3mkY9gdbK+mC1vPGUZgu1s6A7ZTb\nhkGLTU/Blso6ecNS8FgM1oDYwwYk3tNe9FHltyXsW4Nl8sfpJR9fysj/V1Sk3qRp\nCGynO1MxZdjxsJQy1cUkzHflGSUOn0PFmWbJlAOaJybY5+4CE5JnGmXi3SQELz+m\nw9cCeApqrbgtJiHVxDmGQQKDi7IwpJ+04hDqL6wWyPWZaDB45rskYckgDDcFFmA/\nw20xZArqbjtJKENE95VY2f1A0CIU6N6DWXOhPp9/IUT07EzUlz5QEFPKBRM7zpJA\nWDSQJLwqB0V1PxbLzhcOBHUw+JiFB9M4VbYwFQKBiQCpl+WuLQXCn3jOJf5a10Y+\n9K9LGIo/fNSA0CaUB/WGE+wiJYZIUPBd/DB6FFA8ny9sjpdPLfgJ+YSAQlStSbtl\nEdaOQyuc+qXYEgR/8b+l7CZdjaW+Yy/G3wwGdfT4DoArH0QaBWl50PIucZ0rQZTb\n9RcmVkZ/mXcsAOOLJa/sQZqAxfsxC6x/\n-----END PRIVATE KEY-----\n","pkcs1":"-----BEGIN RSA PRIVATE KEY-----\nMIIEqgIBAAKCAQEAm5wrZpc52g5WYpSM83tJdROv00vXSvQiUAiJNIxW4rNF/YDe\nflOop/sCjYKvKICn4mtF7fPQkUM/E7UugcfFAzqPbSVOqQp9kQxwaCYbXExZxRb2\nqWy8NmGsfzSWdwu1yXH9waLiSEBIVNOOF2z+b1zMnZ2CNzlL1LPZCbZRh7WdIDbK\nnZhtNu3FhOO0O83Rqgx8kKzc1Mu1nNyO+efJazIMxipvUgvcHGKeGZtco9+oxdxQ\nNLSKQz9DwwiLg2t1hclXiyUk6NGRhLcT1U29MxCvOJ4L2/yP1zHCEyNl28ym7Ycy\n3nuT+ucCELm3Tu15RFHBPTV7REpLLb7Xc15ecwIDAQABAoIBAEDWWnMdsdo8vRvI\nP8634QyqTkmhQSyW+rEUTW8axp0hC5msF4jVfOG5QgAKoscijFFYV0PlolLUjTS9\n+onS3jERNm/I6rSejWFhqHiM4DueCI2Jmu9PQkD6g7BhDgy+UVmFaLFFGDn4purJ\nV1xFauKl7RADcB1ofvAyb/wVBKOf/Oqknbjk9aseulQj+0Ty5D4VTYKonzHim2EK\n7QfF1Xjl1AlGBFwuTJOseiKT9JbGBjh7VXi+LDqALMIs5gkbLkYRw22DFdbtJtY3\nH3aJu6qItbN4SR/jsyQxkN4unJUqfT92ZUkfFT1URwbIgdn6dVWrCii33vMDdBAs\nBrzQAfkCgYkAx0YwJP45+XCNpFkZobktW8GYu88OhDFkiYOgiYclEQ8QxO5M4vtw\nyk7gwadPuomNvHyrDNznG+g3oXt92t0uhBELuxhRpJQHCSAHjU5ViwhXg2WFtEys\nl50egoKkmXIic1bllVVQIxephhxPoM+x9ToiRaq3WxjqUrEIHROdFMArrJiBlAVo\nfwJ5AMfoBZyDgkkBuofemztWctL48II/2g2piUdTECVb9thtFkRzNpyC1izs/S02\nn75ksYlLH9aTC1n5KtPhELmFA5chIVDAgNxLbqBnNQFwUH4BWtkxJiU1Nr4F+4Gu\nLJim0N7/lTav57cNfCD98H+LfazpnJ4I6l/wDQKBiQCOtMgDpgA0jxMQcDJ365n9\nDN5pGPYHWyvpgtbzxlGYLtbOgO2U24ZBi01PwZbKOnnDUvBYDNaA2MMGJN7TXvRR\n5bcl7FuDZfLH6SUfX8rI/1dUpN6kaQhspztTMWXY8bCUMtXFJMx35RklDp9DxZlm\nyZQDmicm2OfuAhOSZxpl4t0kBC8/psPXAngKaq24LSYh1cQ5hkECg4uyMKSftOIQ\n6i+sFsj1mWgweOa7JGHJIAw3BRZgP8NtMWQK6m47SShDRPeVWNn9QNAiFOjeg1lz\noT6ffyFE9OxM1Jc+UBBTygUTO86SQFg0kCS8KgdFdT8Wy84XDgR1MPiYhQfTOFW2\nMBUCgYkAqZflri0Fwp94ziX+WtdGPvSvSxiKP3zUgNAmlAf1hhPsIiWGSFDwXfww\nehRQPJ8vbI6XTy34CfmEgEJUrUm7ZRHWjkMrnPql2BIEf/G/pewmXY2lvmMvxt8M\nBnX0+A6AKx9EGgVpedDyLnGdK0GU2/UXJlZGf5l3LADjiyWv7EGagMX7MQusfw==\n-----END RSA PRIVATE KEY-----\n","spki":"-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAm5wrZpc52g5WYpSM83tJ\ndROv00vXSvQiUAiJNIxW4rNF/YDeflOop/sCjYKvKICn4mtF7fPQkUM/E7UugcfF\nAzqPbSVOqQp9kQxwaCYbXExZxRb2qWy8NmGsfzSWdwu1yXH9waLiSEBIVNOOF2z+\nb1zMnZ2CNzlL1LPZCbZRh7WdIDbKnZhtNu3FhOO0O83Rqgx8kKzc1Mu1nNyO+efJ\nazIMxipvUgvcHGKeGZtco9+oxdxQNLSKQz9DwwiLg2t1hclXiyUk6NGRhLcT1U29\nMxCvOJ4L2/yP1zHCEyNl28ym7Ycy3nuT+ucCELm3Tu15RFHBPTV7REpLLb7Xc15e\ncwIDAQAB\n-----END PUBLIC KEY-----\n","jwk":{"kty":"RSA","n":"m5wrZpc52g5WYpSM83tJdROv00vXSvQiUAiJNIxW4rNF_YDeflOop_sCjYKvKICn4mtF7fPQkUM_E7UugcfFAzqPbSVOqQp9kQxwaCYbXExZxRb2qWy8NmGsfzSWdwu1yXH9waLiSEBIVNOOF2z-b1zMnZ2CNzlL1LPZCbZRh7WdIDbKnZhtNu3FhOO0O83Rqgx8kKzc1Mu1nNyO-efJazIMxipvUgvcHGKeGZtco9-oxdxQNLSKQz9DwwiLg2t1hclXiyUk6NGRhLcT1U29MxCvOJ4L2_yP1zHCEyNl28ym7Ycy3nuT-ucCELm3Tu15RFHBPTV7REpLLb7Xc15ecw","e":"AQAB","d":"QNZacx2x2jy9G8g_zrfhDKpOSaFBLJb6sRRNbxrGnSELmawXiNV84blCAAqixyKMUVhXQ-WiUtSNNL36idLeMRE2b8jqtJ6NYWGoeIzgO54IjYma709CQPqDsGEODL5RWYVosUUYOfim6slXXEVq4qXtEANwHWh-8DJv_BUEo5_86qSduOT1qx66VCP7RPLkPhVNgqifMeKbYQrtB8XVeOXUCUYEXC5Mk6x6IpP0lsYGOHtVeL4sOoAswizmCRsuRhHDbYMV1u0m1jcfdom7qoi1s3hJH-OzJDGQ3i6clSp9P3ZlSR8VPVRHBsiB2fp1VasKKLfe8wN0ECwGvNAB-Q","p":"x0YwJP45-XCNpFkZobktW8GYu88OhDFkiYOgiYclEQ8QxO5M4vtwyk7gwadPuomNvHyrDNznG-g3oXt92t0uhBELuxhRpJQHCSAHjU5ViwhXg2WFtEysl50egoKkmXIic1bllVVQIxephhxPoM-x9ToiRaq3WxjqUrEIHROdFMArrJiBlAVofw","q":"x-gFnIOCSQG6h96bO1Zy0vjwgj_aDamJR1MQJVv22G0WRHM2nILWLOz9LTafvmSxiUsf1pMLWfkq0-EQuYUDlyEhUMCA3EtuoGc1AXBQfgFa2TEmJTU2vgX7ga4smKbQ3v-VNq_ntw18IP3wf4t9rOmcngjqX_AN","dp":"jrTIA6YANI8TEHAyd-uZ_QzeaRj2B1sr6YLW88ZRmC7WzoDtlNuGQYtNT8GWyjp5w1LwWAzWgNjDBiTe0170UeW3Jexbg2Xyx-klH1_KyP9XVKTepGkIbKc7UzFl2PGwlDLVxSTMd-UZJQ6fQ8WZZsmUA5onJtjn7gITkmcaZeLdJAQvP6bD1w","dq":"CmqtuC0mIdXEOYZBAoOLsjCkn7TiEOovrBbI9ZloMHjmuyRhySAMNwUWYD_DbTFkCupuO0koQ0T3lVjZ_UDQIhTo3oNZc6E-n38hRPTsTNSXPlAQU8oFEzvOkkBYNJAkvCoHRXU_FsvOFw4EdTD4mIUH0zhVtjAV","qi":"qZflri0Fwp94ziX-WtdGPvSvSxiKP3zUgNAmlAf1hhPsIiWGSFDwXfwwehRQPJ8vbI6XTy34CfmEgEJUrUm7ZRHWjkMrnPql2BIEf_G_pewmXY2lvmMvxt8MBnX0-A6AKx9EGgVpedDyLnGdK0GU2_UXJlZGf5l3LADjiyWv7EGagMX7MQusfw"},"oaep":"3983dbc89109e60a8dde4fb8e8cc9aba43b0614bc9708db453565ce37e28c38f62398baefdcf7110740d199059ecb62c8478e77826f3a7ddeb991f1ffcfbf58de46e9a9e8bb1c578ec72a26b6c56fc93028777c8120d97cc1fdb5f497124076f905af9a852edd61bb1f8f2ad04b0176ee11ab63f47eb2a81954b8871e9761b94d2ba1716741c50a19502d8ed4f4326ae01800869fedf0cbc93fa6a5f468b3eff35a8ad9aa13654f03707065e05a719ca735a8cadcc576830752631530d03a4d484507614d861f10449032ef48362322dc93742674105dea15e926d61713df831ad0cfe500bdc878fc824426ab8c9fc6f86d4956af17924984a94082c84489e45","pe":"2c04ec06cbd1247414b52044e89806ccab734d58845b7e6bb73f9aabc4c9e8633eaed884a8ef747f89236ccf0c873d3b4a1010dcd54909d1f2b9af664671e92a73289fbda54a105f7cb4c6d6d1b4b498a9d57f46ed592e3ab1d511088d807f6dd1d2b66f932b0e8631f54f913da1bc1d2ddf3449bf46b633dfdee729a0c10ff280e2a84dfe60b09f717349e350529021b48ae967fc3cd3fe2541005574d76451e0f1902559562b90b058577d2d629e3bd9f020c06101942e0c4f814f196aa283d2c87f2104f6d5228923812c6b21b027f75950019e2fed2cc506d7ebf6d265b6415a7cc6fe5e141473f23993b9ca490864503dd49ac4a0e70a401cf9fb8e6dd2"},"larged":{"pkcs8":"-----BEGIN PRIVATE KEY-----\nMIICeAIBADANBgkqhkiG9w0BAQEFAASCAmIwggJeAgEAAoGBAOm7LJlkslcLVU3y\nJ5Lu1FLbibLSsQlK0W2EBxsecoYfDKVDs09eXwXDoeG1vC44NCKwFpPX6f1KXkcK\nYR9Z6B0+IySQcvw54Sp6MpHMziW/ex1ZC4ahIPODYWT+1vg6NudesrsZgjt9pGJ8\nvO1DK8jCIsbasPJYjZtLzhUs2eQbAgMBAAECgYEA6uUmW2M9BMEbhkIfF34KnUvq\n/y2FJAQwm0nNW3DX+1v86vdOb+ryyST+33fB0UqHPE+6x4EVmA8pSF3LZkZD88Vk\ns5u8YF5eg0yYYEaUyVj1DGYJR8mx5u2tyQmzyY2ZJUH3I1V5xJ6SCozBrYM4viWK\n95xH2IqQj9c+cIvjLVkCQQD0eOy88kE+wn2K6L4uRbfroPPjKls0s0K5SdTUrUOf\n7M11ftTsZVyByQ8HJklDWnNOXb3HBMMPR+fyi5z+TGCFAkEA9MCXETKzxO4Ehsxd\naO0HshWKd74ukEoa25zQkM0uvR/3awQOIiScqApw51KjIvv/Hqm320nU+kX9pWfs\nykGkHwJAE/MaPoD2Wgy8+ezsOBJwY8YKoOr/7lkChORFfeV1s0M7sO7cqT3MQrsJ\ngufY6qoi5q43oln9IO4ZO22xLf9FkQJBALHD7/UdzlQKTF9br7y17BD8dEXkbA2A\nxWEc1J9XZ8sVnK6tk1ZZIS8r5jUdYD/Yp8OtoUw0o+vjSgcJJIMCiiECQQCD8FBg\nY6C+mnGPb4ANdeRAkltZ08hCcaqyn8xrf7Umo/cb7wMZREbIGLqwc6tA4IMEN1oj\n7wYE87Hp+DbS8+2c\n-----END PRIVATE KEY-----\n","pkcs1":"-----BEGIN RSA PRIVATE KEY-----\nMIICXgIBAAKBgQDpuyyZZLJXC1VN8ieS7tRS24my0rEJStFthAcbHnKGHwylQ7NP\nXl8Fw6HhtbwuODQisBaT1+n9Sl5HCmEfWegdPiMkkHL8OeEqejKRzM4lv3sdWQuG\noSDzg2Fk/tb4OjbnXrK7GYI7faRifLztQyvIwiLG2rDyWI2bS84VLNnkGwIDAQAB\nAoGBAOrlJltjPQTBG4ZCHxd+Cp1L6v8thSQEMJtJzVtw1/tb/Or3Tm/q8skk/t93\nwdFKhzxPuseBFZgPKUhdy2ZGQ/PFZLObvGBeXoNMmGBGlMlY9QxmCUfJsebtrckJ\ns8mNmSVB9yNVecSekgqMwa2DOL4livecR9iKkI/XPnCL4y1ZAkEA9HjsvPJBPsJ9\niui+LkW366Dz4ypbNLNCuUnU1K1Dn+zNdX7U7GVcgckPByZJQ1pzTl29xwTDD0fn\n8ouc/kxghQJBAPTAlxEys8TuBIbMXWjtB7IVine+LpBKGtuc0JDNLr0f92sEDiIk\nnKgKcOdSoyL7/x6pt9tJ1PpF/aVn7MpBpB8CQBPzGj6A9loMvPns7DgScGPGCqDq\n/+5ZAoTkRX3ldbNDO7Du3Kk9zEK7CYLn2OqqIuauN6JZ/SDuGTttsS3/RZECQQCx\nw+/1Hc5UCkxfW6+8tewQ/HRF5GwNgMVhHNSfV2fLFZyurZNWWSEvK+Y1HWA/2KfD\nraFMNKPr40oHCSSDAoohAkEAg/BQYGOgvppxj2+ADXXkQJJbWdPIQnGqsp/Ma3+1\nJqP3G+8DGURGyBi6sHOrQOCDBDdaI+8GBPOx6fg20vPtnA==\n-----END RSA PRIVATE KEY-----\n","spki":"-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDpuyyZZLJXC1VN8ieS7tRS24my\n0rEJStFthAcbHnKGHwylQ7NPXl8Fw6HhtbwuODQisBaT1+n9Sl5HCmEfWegdPiMk\nkHL8OeEqejKRzM4lv3sdWQuGoSDzg2Fk/tb4OjbnXrK7GYI7faRifLztQyvIwiLG\n2rDyWI2bS84VLNnkGwIDAQAB\n-----END PUBLIC KEY-----\n","jwk":{"kty":"RSA","n":"6bssmWSyVwtVTfInku7UUtuJstKxCUrRbYQHGx5yhh8MpUOzT15fBcOh4bW8Ljg0IrAWk9fp_UpeRwphH1noHT4jJJBy_DnhKnoykczOJb97HVkLhqEg84NhZP7W-Do2516yuxmCO32kYny87UMryMIixtqw8liNm0vOFSzZ5Bs","e":"AQAB","d":"6uUmW2M9BMEbhkIfF34KnUvq_y2FJAQwm0nNW3DX-1v86vdOb-ryyST-33fB0UqHPE-6x4EVmA8pSF3LZkZD88Vks5u8YF5eg0yYYEaUyVj1DGYJR8mx5u2tyQmzyY2ZJUH3I1V5xJ6SCozBrYM4viWK95xH2IqQj9c-cIvjLVk","p":"9HjsvPJBPsJ9iui-LkW366Dz4ypbNLNCuUnU1K1Dn-zNdX7U7GVcgckPByZJQ1pzTl29xwTDD0fn8ouc_kxghQ","q":"9MCXETKzxO4EhsxdaO0HshWKd74ukEoa25zQkM0uvR_3awQOIiScqApw51KjIvv_Hqm320nU-kX9pWfsykGkHw","dp":"E_MaPoD2Wgy8-ezsOBJwY8YKoOr_7lkChORFfeV1s0M7sO7cqT3MQrsJgufY6qoi5q43oln9IO4ZO22xLf9FkQ","dq":"scPv9R3OVApMX1uvvLXsEPx0ReRsDYDFYRzUn1dnyxWcrq2TVlkhLyvmNR1gP9inw62hTDSj6-NKBwkkgwKKIQ","qi":"g_BQYGOgvppxj2-ADXXkQJJbWdPIQnGqsp_Ma3-1JqP3G-8DGURGyBi6sHOrQOCDBDdaI-8GBPOx6fg20vPtnA"},"oaep":"b6c4fb861a037fb0cb22e7f015fd9e75b72b6e344445a178351edff5b72ff3335dfe8052b24bb9b1ac168f497518bba760865413b5a52e8f7ed0deddb04014cf46a5a3f068f128d3a1731b8de1cab820bbd75fef1b566ed75c115041b54042dfef4fd893fcce2e276757642945016a43e53f7ef8cb0b2ef78f4aa818340c9818","pe":"5d227d03a0e3eba4434028b363aa3137f1d5344f565e691b268dcb28e52cee414000d834a0da6824fedc88ea5d10a95a2bf0bfe071f9f4c5bd7e5b65c15624670175c208130b3af93f368bfa34bb1121d469bc4785685af985d76b69f2f05ea7e13364aef8249960a33fd5bcc95bdc4adedd3b0e0ac91666a320afd901d1e32a"}};
+for (const name of ['plain', 'near', 'wide']) {
+  const k = KEYS[name];
+  const p = name + '.';
+  t(p + 'shape', () => [bits(k.jwk.n), bits(k.jwk.p), bits(k.jwk.q), big(k.jwk.d) >= big(k.jwk.n)]);
+  t(p + 'privateDecrypt.pkcs8', () => crypto.privateDecrypt(k.pkcs8, hex(k.oaep)).toString());
+  t(p + 'privateDecrypt.pkcs1', () => crypto.privateDecrypt(k.pkcs1, hex(k.oaep)).toString());
+  t(p + 'privateDecrypt.pkcs1Padding', () => crypto.privateDecrypt({ key: k.pkcs8, padding: C.RSA_PKCS1_PADDING }, crypto.publicEncrypt({ key: k.spki, padding: C.RSA_PKCS1_PADDING }, msg)).toString());
+  t(p + 'privateDecrypt.noPadding', () => crypto.privateDecrypt({ key: k.pkcs8, padding: C.RSA_NO_PADDING }, hex(k.pe)));
+  t(p + 'privateEncrypt', () => crypto.privateEncrypt(k.pkcs8, msg).equals(hex(k.pe)));
+  t(p + 'privateEncrypt.noPadding', () => crypto.privateEncrypt({ key: k.pkcs1, padding: C.RSA_NO_PADDING }, crypto.publicEncrypt({ key: k.spki, padding: C.RSA_NO_PADDING }, Buffer.concat([Buffer.alloc(hex(k.pe).length - msg.length), msg]))).subarray(-msg.length).toString());
+  t(p + 'publicDecrypt', () => crypto.publicDecrypt(k.spki, hex(k.pe)).toString());
+  t(p + 'publicDecrypt.withPrivateKey', () => crypto.publicDecrypt(k.pkcs8, hex(k.pe)).toString());
+  t(p + 'publicEncrypt.withPrivateKey', () => crypto.privateDecrypt(k.pkcs1, crypto.publicEncrypt(k.pkcs1, msg)).toString());
+  t(p + 'pss.sign', () => crypto.verify('sha256', msg, { key: k.spki, padding: PSS }, crypto.sign('sha256', msg, { key: k.pkcs8, padding: PSS })));
+  t(p + 'pss.verify.withPrivateKey', () => crypto.verify('sha256', msg, { key: k.pkcs8, padding: PSS }, crypto.sign('sha256', msg, { key: k.pkcs8, padding: PSS })));
+  t(p + 'pss.createSign', () => crypto.createVerify('sha256').update(msg).verify({ key: k.spki, padding: PSS }, crypto.createSign('sha256').update(msg).sign({ key: k.pkcs1, padding: PSS, saltLength: 20 })));
+  t(p + 'createPublicKey', () => crypto.createPublicKey(k.pkcs8).export({ type: 'spki', format: 'pem' }) === k.spki);
+  t(p + 'createPublicKey.pkcs1', () => crypto.createPublicKey(k.pkcs1).export({ type: 'spki', format: 'pem' }) === k.spki);
+  t(p + 'jwk.export', () => JSON.stringify(crypto.createPrivateKey(k.pkcs8).export({ format: 'jwk' })) === JSON.stringify(k.jwk));
+  t(p + 'jwk.export.pkcs1', () => JSON.stringify(crypto.createPrivateKey(k.pkcs1).export({ format: 'jwk' })) === JSON.stringify(k.jwk));
+  t(p + 'jwk.import', () => crypto.privateDecrypt(crypto.createPrivateKey({ key: k.jwk, format: 'jwk' }), hex(k.oaep)).toString());
+  t(p + 'jwk.import.export', () => JSON.stringify(crypto.createPrivateKey({ key: k.jwk, format: 'jwk' }).export({ format: 'jwk' })) === JSON.stringify(k.jwk));
+}
+
+// The key whose private exponent is not below its modulus: its public half
+// is used as any other key's, its private half is not read.
+{
+  const k = KEYS.larged;
+  const p = 'larged.';
+  t(p + 'shape', () => [bits(k.jwk.n), bits(k.jwk.p), bits(k.jwk.q), big(k.jwk.d) >= big(k.jwk.n)]);
+  t(p + 'publicDecrypt.withPrivateKey', () => crypto.publicDecrypt(k.pkcs8, hex(k.pe)).toString());
+  t(p + 'publicEncrypt.withPrivateKey', () => crypto.publicEncrypt(k.pkcs1, msg).length);
+  t(p + 'pss.verify.withPrivateKey', () => crypto.verify('sha256', msg, { key: k.pkcs8, padding: PSS }, Buffer.alloc(128, 1)));
+  t(p + 'privateDecrypt', () => crypto.privateDecrypt(k.pkcs8, hex(k.oaep)).toString());
+  t(p + 'privateEncrypt', () => crypto.privateEncrypt(k.pkcs1, msg).equals(hex(k.pe)));
+  t(p + 'pss.sign', () => crypto.sign('sha256', msg, { key: k.pkcs8, padding: PSS }).length);
+  t(p + 'createPublicKey', () => crypto.createPublicKey(k.pkcs8).export({ type: 'spki', format: 'pem' }) === k.spki);
+  t(p + 'jwk.export', () => JSON.stringify(crypto.createPrivateKey(k.pkcs8).export({ format: 'jwk' })) === JSON.stringify(k.jwk));
+}
+
+// An OAEP block (sha1, empty label) for 'hello' under the 'plain' key, built
+// here so its leading octet can be chosen; the rest is a valid encoding.
+{
+  const k = KEYS.plain;
+  const size = 128, h = 20;
+  const mgf1 = (seed, len) => { let out = Buffer.alloc(0); for (let i = 0; out.length < len; i++) { const c = Buffer.alloc(4); c.writeUInt32BE(i); out = Buffer.concat([out, crypto.createHash('sha1').update(seed).update(c).digest()]); } return out.subarray(0, len); };
+  const xor = (a, b) => Buffer.from(a.map((v, i) => v ^ b[i]));
+  const block = (first) => {
+    const m = Buffer.from('hello');
+    const db = Buffer.concat([crypto.createHash('sha1').update('').digest(), Buffer.alloc(size - m.length - 2 * h - 2), Buffer.from([1]), m]);
+    const seed = Buffer.alloc(h, 0x5a);
+    const maskedDb = xor(db, mgf1(seed, db.length));
+    const maskedSeed = xor(seed, mgf1(maskedDb, h));
+    return crypto.publicEncrypt({ key: k.spki, padding: C.RSA_NO_PADDING }, Buffer.concat([Buffer.from([first]), maskedSeed, maskedDb]));
+  };
+  t('oaep.leadingOctet.0', () => crypto.privateDecrypt({ key: k.pkcs8, padding: C.RSA_PKCS1_OAEP_PADDING }, block(0)).toString());
+  t('oaep.leadingOctet.1', () => crypto.privateDecrypt({ key: k.pkcs8, padding: C.RSA_PKCS1_OAEP_PADDING }, block(1)).toString());
+}
+
+// The data argument: the bytes of a string, an ArrayBuffer or any view.
+{
+  const k = KEYS.plain;
+  const rt = (data, opts) => crypto.privateDecrypt(k.pkcs8, crypto.publicEncrypt(Object.assign({ key: k.spki }, opts), data)).toString('hex');
+  const bytes = Uint8Array.of(9, 1, 2, 3, 4, 5, 6, 7, 8, 9);
+  t('data.buffer', () => rt(Buffer.from([1, 2, 3])));
+  t('data.string', () => rt('h\u00e9llo'));
+  t('data.uint8array.offset', () => rt(bytes.subarray(1, 4)));
+  t('data.uint16array', () => rt(new Uint16Array([0x0201, 0x0403])));
+  t('data.float64array', () => rt(new Float64Array([1.5])));
+  t('data.dataview', () => rt(new DataView(bytes.buffer, 2, 3)));
+  t('data.arraybuffer', () => rt(bytes.buffer));
+  t('data.empty', () => rt(Buffer.alloc(0)));
+  for (const [label, value] of [['undefined', undefined], ['null', null], ['number', 5], ['boolean', true], ['object', {}], ['array', [1, 2]]]) {
+    t('data.' + label + '.publicEncrypt', () => crypto.publicEncrypt(k.spki, value));
+    t('data.' + label + '.privateDecrypt', () => crypto.privateDecrypt(k.pkcs8, value));
+    t('data.' + label + '.privateEncrypt', () => crypto.privateEncrypt(k.pkcs8, value));
+    t('data.' + label + '.publicDecrypt', () => crypto.publicDecrypt(k.spki, value));
+  }
+  const viaPe = (data) => crypto.publicDecrypt(k.spki, crypto.privateEncrypt(k.pkcs8, data)).toString('hex');
+  t('data.uint16array.privateEncrypt', () => viaPe(new Uint16Array([0x0201, 0x0403])));
+  t('data.dataview.privateEncrypt', () => viaPe(new DataView(bytes.buffer, 2, 3)));
+  const ct = crypto.publicEncrypt(k.spki, Buffer.from('view'));
+  const wide = new Uint8Array(ct.length + 16);
+  wide.set(ct, 8);
+  t('data.dataview.privateDecrypt', () => crypto.privateDecrypt(k.pkcs8, new DataView(wide.buffer, 8, ct.length)).toString());
+  t('data.arraybuffer.privateDecrypt', () => crypto.privateDecrypt(k.pkcs8, wide.buffer.slice(8, 8 + ct.length)).toString());
+  const sig = crypto.privateEncrypt(k.pkcs8, Buffer.from('view'));
+  wide.fill(0); wide.set(sig, 8);
+  t('data.dataview.publicDecrypt', () => crypto.publicDecrypt(k.spki, new DataView(wide.buffer, 8, sig.length)).toString());
+}
+
+// The padding option: a falsy value is the direction's default; anything
+// else is read as a 32-bit unsigned integer.
+{
+  const k = KEYS.plain;
+  const which = (padding) => {
+    const ct = crypto.publicEncrypt({ key: k.spki, padding }, Buffer.from('pad'));
+    for (const [name, p] of [['oaep', C.RSA_PKCS1_OAEP_PADDING], ['pkcs1', C.RSA_PKCS1_PADDING]]) {
+      try { if (crypto.privateDecrypt({ key: k.pkcs8, padding: p }, ct).toString() === 'pad') return name; } catch {}
+    }
+    return 'neither';
+  };
+  const whichSign = (padding) => crypto.publicDecrypt(k.spki, crypto.privateEncrypt({ key: k.pkcs8, padding }, Buffer.from('pad'))).toString();
+  const values = [['undefined', undefined], ['null', null], ['false', false], ['emptyString', ''], ['NaN', NaN], ['zero', 0],
+    ['object', {}], ['array', []], ['arrayOfFour', [4]], ['string', 'oaep'], ['numericString', '4'], ['numericStringOne', '1'], ['true', true],
+    ['fraction', 4.7], ['negative', -1], ['wrapsToOne', 2 ** 32 + 1], ['infinity', Infinity], ['bigint', 4n], ['symbol', Symbol('s')]];
+  for (const [label, value] of values) {
+    t('padding.' + label + '.publicEncrypt', () => which(value));
+    t('padding.' + label + '.privateDecrypt', () => { const out = crypto.privateDecrypt({ key: k.pkcs8, padding: value }, hex(k.oaep)); return out.toString() === 'fixture message' ? 'fixture message' : out; });
+    t('padding.' + label + '.privateEncrypt', () => whichSign(value));
+    t('padding.' + label + '.publicDecrypt', () => crypto.publicDecrypt({ key: k.spki, padding: value }, hex(k.pe)).toString());
+  }
+}
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "rsa_key_shapes.cjs failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        r#"plain.shape=[1024,512,512,false]"#,
+        r#"plain.privateDecrypt.pkcs8=fixture message"#,
+        r#"plain.privateDecrypt.pkcs1=fixture message"#,
+        r#"plain.privateDecrypt.pkcs1Padding=fixture message"#,
+        r#"plain.privateDecrypt.noPadding=sha256:0c8985d73d99eb6ca43e2058f26caf720a1d287934dca02aad40c67feee26c49"#,
+        r#"plain.privateEncrypt=true"#,
+        r#"plain.privateEncrypt.noPadding=fixture message"#,
+        r#"plain.publicDecrypt=fixture message"#,
+        r#"plain.publicDecrypt.withPrivateKey=fixture message"#,
+        r#"plain.publicEncrypt.withPrivateKey=fixture message"#,
+        r#"plain.pss.sign=true"#,
+        r#"plain.pss.verify.withPrivateKey=true"#,
+        r#"plain.pss.createSign=true"#,
+        r#"plain.createPublicKey=true"#,
+        r#"plain.createPublicKey.pkcs1=true"#,
+        r#"plain.jwk.export=true"#,
+        r#"plain.jwk.export.pkcs1=true"#,
+        r#"plain.jwk.import=fixture message"#,
+        r#"plain.jwk.import.export=true"#,
+        r#"near.shape=[1024,511,513,false]"#,
+        r#"near.privateDecrypt.pkcs8=fixture message"#,
+        r#"near.privateDecrypt.pkcs1=fixture message"#,
+        r#"near.privateDecrypt.pkcs1Padding=fixture message"#,
+        r#"near.privateDecrypt.noPadding=sha256:9e9f98e979ee4fbc4d4cec35f0adb507593e119373bdb2f96c2f140b45846456"#,
+        r#"near.privateEncrypt=true"#,
+        r#"near.privateEncrypt.noPadding=fixture message"#,
+        r#"near.publicDecrypt=fixture message"#,
+        r#"near.publicDecrypt.withPrivateKey=fixture message"#,
+        r#"near.publicEncrypt.withPrivateKey=fixture message"#,
+        r#"near.pss.sign=true"#,
+        r#"near.pss.verify.withPrivateKey=true"#,
+        r#"near.pss.createSign=true"#,
+        r#"near.createPublicKey=true"#,
+        r#"near.createPublicKey.pkcs1=true"#,
+        r#"near.jwk.export=true"#,
+        r#"near.jwk.export.pkcs1=true"#,
+        r#"near.jwk.import=fixture message"#,
+        r#"near.jwk.import.export=true"#,
+        r#"wide.shape=[2048,1088,960,false]"#,
+        r#"wide.privateDecrypt.pkcs8=fixture message"#,
+        r#"wide.privateDecrypt.pkcs1=fixture message"#,
+        r#"wide.privateDecrypt.pkcs1Padding=fixture message"#,
+        r#"wide.privateDecrypt.noPadding=sha256:a3b6d4f53cc77f1987c8e2046b885c3b2c85bb353463aade8d12a56600974d53"#,
+        r#"wide.privateEncrypt=true"#,
+        r#"wide.privateEncrypt.noPadding=fixture message"#,
+        r#"wide.publicDecrypt=fixture message"#,
+        r#"wide.publicDecrypt.withPrivateKey=fixture message"#,
+        r#"wide.publicEncrypt.withPrivateKey=fixture message"#,
+        r#"wide.pss.sign=true"#,
+        r#"wide.pss.verify.withPrivateKey=true"#,
+        r#"wide.pss.createSign=true"#,
+        r#"wide.createPublicKey=true"#,
+        r#"wide.createPublicKey.pkcs1=true"#,
+        r#"wide.jwk.export=true"#,
+        r#"wide.jwk.export.pkcs1=true"#,
+        r#"wide.jwk.import=fixture message"#,
+        r#"wide.jwk.import.export=true"#,
+        r#"larged.shape=[1024,512,512,true]"#,
+        r#"larged.publicDecrypt.withPrivateKey=fixture message"#,
+        r#"larged.publicEncrypt.withPrivateKey=128"#,
+        r#"larged.pss.verify.withPrivateKey=false"#,
+        // node: larged.privateDecrypt=fixture message
+        r#"larged.privateDecrypt=throws TypeError: RSA private key parse: invalid exponent"#,
+        // node: larged.privateEncrypt=true
+        r#"larged.privateEncrypt=throws TypeError: RSA private key parse: invalid exponent"#,
+        // node: larged.pss.sign=128
+        r#"larged.pss.sign=throws TypeError: RSA private key parse: invalid exponent"#,
+        // node: larged.createPublicKey=true
+        r#"larged.createPublicKey=throws TypeError: RSA private key parse: invalid exponent"#,
+        // node: larged.jwk.export=true
+        r#"larged.jwk.export=throws TypeError: RSA private key parse: invalid exponent"#,
+        r#"oaep.leadingOctet.0=hello"#,
+        // node: oaep.leadingOctet.1=throws ERR_OSSL_RSA_OAEP_DECODING_ERROR: error:02000079:rsa routines::oaep decoding error
+        r#"oaep.leadingOctet.1=hello"#,
+        r#"data.buffer=010203"#,
+        r#"data.string=68c3a96c6c6f"#,
+        r#"data.uint8array.offset=010203"#,
+        r#"data.uint16array=01020304"#,
+        r#"data.float64array=000000000000f83f"#,
+        r#"data.dataview=020304"#,
+        r#"data.arraybuffer=09010203040506070809"#,
+        r#"data.empty="#,
+        r#"data.undefined.publicEncrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received undefined"#,
+        r#"data.undefined.privateDecrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received undefined"#,
+        r#"data.undefined.privateEncrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received undefined"#,
+        r#"data.undefined.publicDecrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received undefined"#,
+        r#"data.null.publicEncrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received null"#,
+        r#"data.null.privateDecrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received null"#,
+        r#"data.null.privateEncrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received null"#,
+        r#"data.null.publicDecrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received null"#,
+        r#"data.number.publicEncrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received type number (5)"#,
+        r#"data.number.privateDecrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received type number (5)"#,
+        r#"data.number.privateEncrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received type number (5)"#,
+        r#"data.number.publicDecrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received type number (5)"#,
+        r#"data.boolean.publicEncrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received type boolean (true)"#,
+        r#"data.boolean.privateDecrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received type boolean (true)"#,
+        r#"data.boolean.privateEncrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received type boolean (true)"#,
+        r#"data.boolean.publicDecrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received type boolean (true)"#,
+        r#"data.object.publicEncrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received an instance of Object"#,
+        r#"data.object.privateDecrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received an instance of Object"#,
+        r#"data.object.privateEncrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received an instance of Object"#,
+        r#"data.object.publicDecrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received an instance of Object"#,
+        r#"data.array.publicEncrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received an instance of Array"#,
+        r#"data.array.privateDecrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received an instance of Array"#,
+        r#"data.array.privateEncrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received an instance of Array"#,
+        r#"data.array.publicDecrypt=throws ERR_INVALID_ARG_TYPE: The "buffer" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received an instance of Array"#,
+        r#"data.uint16array.privateEncrypt=01020304"#,
+        r#"data.dataview.privateEncrypt=020304"#,
+        r#"data.dataview.privateDecrypt=view"#,
+        r#"data.arraybuffer.privateDecrypt=view"#,
+        r#"data.dataview.publicDecrypt=view"#,
+        r#"padding.undefined.publicEncrypt=oaep"#,
+        r#"padding.undefined.privateDecrypt=fixture message"#,
+        r#"padding.undefined.privateEncrypt=pad"#,
+        r#"padding.undefined.publicDecrypt=fixture message"#,
+        r#"padding.null.publicEncrypt=oaep"#,
+        r#"padding.null.privateDecrypt=fixture message"#,
+        r#"padding.null.privateEncrypt=pad"#,
+        r#"padding.null.publicDecrypt=fixture message"#,
+        r#"padding.false.publicEncrypt=oaep"#,
+        r#"padding.false.privateDecrypt=fixture message"#,
+        r#"padding.false.privateEncrypt=pad"#,
+        r#"padding.false.publicDecrypt=fixture message"#,
+        r#"padding.emptyString.publicEncrypt=oaep"#,
+        r#"padding.emptyString.privateDecrypt=fixture message"#,
+        r#"padding.emptyString.privateEncrypt=pad"#,
+        r#"padding.emptyString.publicDecrypt=fixture message"#,
+        r#"padding.NaN.publicEncrypt=oaep"#,
+        r#"padding.NaN.privateDecrypt=fixture message"#,
+        r#"padding.NaN.privateEncrypt=pad"#,
+        r#"padding.NaN.publicDecrypt=fixture message"#,
+        r#"padding.zero.publicEncrypt=oaep"#,
+        r#"padding.zero.privateDecrypt=fixture message"#,
+        r#"padding.zero.privateEncrypt=pad"#,
+        r#"padding.zero.publicDecrypt=fixture message"#,
+        r#"padding.object.publicEncrypt=throws ERR_OSSL_RSA_UNKNOWN_PADDING_TYPE: error:02000076:rsa routines::unknown padding type"#,
+        r#"padding.object.privateDecrypt=throws ERR_OSSL_RSA_UNKNOWN_PADDING_TYPE: error:02000076:rsa routines::unknown padding type"#,
+        r#"padding.object.privateEncrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"padding.object.publicDecrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"padding.array.publicEncrypt=throws ERR_OSSL_RSA_UNKNOWN_PADDING_TYPE: error:02000076:rsa routines::unknown padding type"#,
+        r#"padding.array.privateDecrypt=throws ERR_OSSL_RSA_UNKNOWN_PADDING_TYPE: error:02000076:rsa routines::unknown padding type"#,
+        r#"padding.array.privateEncrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"padding.array.publicDecrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"padding.arrayOfFour.publicEncrypt=oaep"#,
+        r#"padding.arrayOfFour.privateDecrypt=fixture message"#,
+        r#"padding.arrayOfFour.privateEncrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"padding.arrayOfFour.publicDecrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"padding.string.publicEncrypt=throws ERR_OSSL_RSA_UNKNOWN_PADDING_TYPE: error:02000076:rsa routines::unknown padding type"#,
+        r#"padding.string.privateDecrypt=throws ERR_OSSL_RSA_UNKNOWN_PADDING_TYPE: error:02000076:rsa routines::unknown padding type"#,
+        r#"padding.string.privateEncrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"padding.string.publicDecrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"padding.numericString.publicEncrypt=oaep"#,
+        r#"padding.numericString.privateDecrypt=fixture message"#,
+        r#"padding.numericString.privateEncrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"padding.numericString.publicDecrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"padding.numericStringOne.publicEncrypt=pkcs1"#,
+        r#"padding.numericStringOne.privateDecrypt=hex:bdc7f99817193d9b1a5986506147d01f6c65474fe0b39119211c1782580b"#,
+        r#"padding.numericStringOne.privateEncrypt=pad"#,
+        r#"padding.numericStringOne.publicDecrypt=fixture message"#,
+        r#"padding.true.publicEncrypt=pkcs1"#,
+        r#"padding.true.privateDecrypt=hex:bdc7f99817193d9b1a5986506147d01f6c65474fe0b39119211c1782580b"#,
+        r#"padding.true.privateEncrypt=pad"#,
+        r#"padding.true.publicDecrypt=fixture message"#,
+        r#"padding.fraction.publicEncrypt=oaep"#,
+        r#"padding.fraction.privateDecrypt=fixture message"#,
+        r#"padding.fraction.privateEncrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"padding.fraction.publicDecrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"padding.negative.publicEncrypt=throws ERR_OSSL_RSA_UNKNOWN_PADDING_TYPE: error:02000076:rsa routines::unknown padding type"#,
+        r#"padding.negative.privateDecrypt=throws ERR_OSSL_RSA_UNKNOWN_PADDING_TYPE: error:02000076:rsa routines::unknown padding type"#,
+        r#"padding.negative.privateEncrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"padding.negative.publicDecrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"padding.wrapsToOne.publicEncrypt=pkcs1"#,
+        r#"padding.wrapsToOne.privateDecrypt=hex:bdc7f99817193d9b1a5986506147d01f6c65474fe0b39119211c1782580b"#,
+        r#"padding.wrapsToOne.privateEncrypt=pad"#,
+        r#"padding.wrapsToOne.publicDecrypt=fixture message"#,
+        r#"padding.infinity.publicEncrypt=throws ERR_OSSL_RSA_UNKNOWN_PADDING_TYPE: error:02000076:rsa routines::unknown padding type"#,
+        r#"padding.infinity.privateDecrypt=throws ERR_OSSL_RSA_UNKNOWN_PADDING_TYPE: error:02000076:rsa routines::unknown padding type"#,
+        r#"padding.infinity.privateEncrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"padding.infinity.publicDecrypt=throws ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE: error:1C8000A5:Provider routines::illegal or unsupported padding mode"#,
+        r#"padding.bigint.publicEncrypt=throws TypeError: Cannot convert a BigInt value to a number"#,
+        r#"padding.bigint.privateDecrypt=throws TypeError: Cannot convert a BigInt value to a number"#,
+        r#"padding.bigint.privateEncrypt=throws TypeError: Cannot convert a BigInt value to a number"#,
+        r#"padding.bigint.publicDecrypt=throws TypeError: Cannot convert a BigInt value to a number"#,
+        r#"padding.symbol.publicEncrypt=throws TypeError: Cannot convert a Symbol value to a number"#,
+        r#"padding.symbol.privateDecrypt=throws TypeError: Cannot convert a Symbol value to a number"#,
+        r#"padding.symbol.privateEncrypt=throws TypeError: Cannot convert a Symbol value to a number"#,
+        r#"padding.symbol.publicDecrypt=throws TypeError: Cannot convert a Symbol value to a number"#,
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), expected.len(), "line count; stdout:\n{stdout}");
+    for (got, want) in lines.iter().zip(expected.iter()) {
+        assert_eq!(got, want, "stdout:\n{stdout}");
+    }
+}
+// ── end of the node-measured RSA vectors ──
 
 #[test]
 fn crypto_ecdh_key_agreement() {
@@ -23635,15 +27867,30 @@ import crypto from "crypto";
 const { publicKey: pub256, privateKey: priv256 } = crypto.generateKeyPairSync("ec", {
   namedCurve: "P-256",
 });
-console.log("pub256_type=" + typeof pub256);
-console.log("pub256_pem=" + pub256.startsWith("-----BEGIN PUBLIC KEY-----"));
-console.log("priv256_pem=" + priv256.startsWith("-----BEGIN PRIVATE KEY-----"));
+// With no encoding options node returns KeyObjects, not PEM strings.
+const spki = { type: "spki", format: "pem" };
+const pkcs8 = { type: "pkcs8", format: "pem" };
+console.log("pub256_type=" + typeof pub256 + ":" + pub256.type + ":" + pub256.asymmetricKeyType);
+console.log("pub256_pem=" + pub256.export(spki).startsWith("-----BEGIN PUBLIC KEY-----"));
+console.log("priv256_pem=" + (priv256.type === "private" && priv256.export(pkcs8).startsWith("-----BEGIN PRIVATE KEY-----")));
 
 // Sign/verify round-trip proves keys are valid ECDSA pairs
 const sign = crypto.createSign("SHA256");
 sign.update("hello from oam");
 const sig = sign.sign(priv256);
-console.log("sig256_len=" + sig.length);
+// node's default dsaEncoding is DER: SEQUENCE { INTEGER r, INTEGER s }.
+console.log("sig256_der=" + (sig[0] === 0x30 && sig.length === sig[1] + 2));
+// 'ieee-p1363' is the fixed-width r||s, and each verifies as itself only.
+const p1363 = crypto.sign("sha256", Buffer.from("hello from oam"), { key: priv256, dsaEncoding: "ieee-p1363" });
+console.log("sig256_p1363_len=" + p1363.length);
+console.log("verify256_p1363=" + crypto.verify("sha256", Buffer.from("hello from oam"), { key: pub256, dsaEncoding: "ieee-p1363" }, p1363));
+console.log("verify256_p1363_as_der=" + crypto.verify("sha256", Buffer.from("hello from oam"), pub256, p1363));
+try {
+  crypto.sign("sha256", Buffer.from("x"), { key: priv256, dsaEncoding: "DER" });
+  console.log("dsa_encoding_bad=accepted");
+} catch (e) {
+  console.log("dsa_encoding_bad=" + e.code);
+}
 
 const verify = crypto.createVerify("SHA256");
 verify.update("hello from oam");
@@ -23653,15 +27900,15 @@ console.log("verify256=" + verify.verify(pub256, sig));
 const { publicKey: pub384, privateKey: priv384 } = crypto.generateKeyPairSync("ec", {
   namedCurve: "P-384",
 });
-console.log("pub384_pem=" + pub384.startsWith("-----BEGIN PUBLIC KEY-----"));
-console.log("priv384_pem=" + priv384.startsWith("-----BEGIN PRIVATE KEY-----"));
-console.log("pub384_longer=" + (pub384.length > pub256.length));
+console.log("pub384_pem=" + pub384.export(spki).startsWith("-----BEGIN PUBLIC KEY-----"));
+console.log("priv384_pem=" + priv384.export(pkcs8).startsWith("-----BEGIN PRIVATE KEY-----"));
+console.log("pub384_longer=" + (pub384.export(spki).length > pub256.export(spki).length));
 
 // Sign/verify P-384
 const sign384 = crypto.createSign("SHA384");
 sign384.update("hello from oam");
 const sig384 = sign384.sign(priv384);
-console.log("sig384_len=" + sig384.length);
+console.log("sig384_der=" + (sig384[0] === 0x30 && sig384.length === sig384[1] + 2));
 
 const verify384 = crypto.createVerify("SHA384");
 verify384.update("hello from oam");
@@ -23671,7 +27918,7 @@ console.log("verify384=" + verify384.verify(pub384, sig384));
 const { publicKey: pubAlias } = crypto.generateKeyPairSync("ec", {
   namedCurve: "prime256v1",
 });
-console.log("alias_works=" + pubAlias.startsWith("-----BEGIN PUBLIC KEY-----"));
+console.log("alias_works=" + pubAlias.export(spki).startsWith("-----BEGIN PUBLIC KEY-----"));
 
 // DER output format
 const { publicKey: pubDer } = crypto.generateKeyPairSync("ec", {
@@ -23689,15 +27936,19 @@ console.log("der_is_buffer=" + Buffer.isBuffer(pubDer));
         "EC keygen failed:\nstdout: {stdout}\nstderr: {stderr}"
     );
     let expected = [
-        "pub256_type=string",
+        "pub256_type=object:public:ec",
         "pub256_pem=true",
         "priv256_pem=true",
-        "sig256_len=64",
+        "sig256_der=true",
+        "sig256_p1363_len=64",
+        "verify256_p1363=true",
+        "verify256_p1363_as_der=false",
+        "dsa_encoding_bad=ERR_INVALID_ARG_VALUE",
         "verify256=true",
         "pub384_pem=true",
         "priv384_pem=true",
         "pub384_longer=true",
-        "sig384_len=96",
+        "sig384_der=true",
         "verify384=true",
         "alias_works=true",
         "der_is_buffer=true",
@@ -23799,6 +28050,269 @@ console.log("verify_error=" + alice.verifyError);
             "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
         );
     }
+}
+
+// Classic Diffie-Hellman against node v22.22.2: the expected lines are node's
+// output for the same script. Fixed private keys give byte-exact public keys
+// and shared secrets for every named group and for a 512-bit safe prime with
+// generators 2 and 5; then the encodings' lengths and leading zero bytes, the
+// peer checks, the constructor contract, verifyError, and the widths of
+// generated private values.
+#[test]
+fn crypto_dh_node_vectors_and_contract() {
+    let file = write_temp(
+        "crypto_dh_node_vectors.mjs",
+        r##"import crypto from "node:crypto";
+const PA = Buffer.from("dda1c2f6e6d302291a445defc55fbf75acd344565f302ca129e491c3e75cd5a8714ab2c1faf2df3473bba813eb04f32ac64c39ba890d37a2970e75c4fc83581f", "hex");
+const PB = Buffer.from("c1b5c3d899bfe0823b965fc1518b67a7ff5fdd2fb3e2324a718e61015dc045d9d50169ffa45b399c33389a7213db210f562d1861dd472959070fb283dcd49a63", "hex");
+const R1024P = Buffer.from("b10b8f96a080e01dde92de5eae5d54ec52c99fbcfb06a3c69a6a9dca52d23b616073e28675a23d189838ef1e2ee652c013ecb4aea906112324975c3cd49b83bfaccbdd7d90c4bd7098488e9c219a73724effd6fae5644738faa31a4ff55bccc0a151af5f0dc8b4bd45bf37df365c1a65e68cfda76d4da708df1fb2bc2e4a4371", "hex");
+const R1024G = Buffer.from("a4d1cbd5c3fd34126765a442efb99905f8104dd258ac507fd6406cff14266d31266fea1e5c41564b777e690f5504f213160217b4b01b886a5e91547f9e2749f4d7fbd7d3b9a92ee1909d0d2263f80a76a6a24c087a091f531dbf0a0169b6a28ad662a4d18e73afa32d779d5918d08bc8858f4dcef97c2a24855e6eeb22b3b2e5", "hex");
+const FF2048 = Buffer.from("ffffffffffffffffadf85458a2bb4a9aafdc5620273d3cf1d8b9c583ce2d3695a9e13641146433fbcc939dce249b3ef97d2fe363630c75d8f681b202aec4617ad3df1ed5d5fd65612433f51f5f066ed0856365553ded1af3b557135e7f57c935984f0c70e0e68b77e2a689daf3efe8721df158a136ade73530acca4f483a797abc0ab182b324fb61d108a94bb2c8e3fbb96adab760d7f4681d4f42a3de394df4ae56ede76372bb190b07a7c8ee0a6d709e02fce1cdf7e2ecc03404cd28342f619172fe9ce98583ff8e4f1232eef28183c3fe3b1b4c6fad733bb5fcbc2ec22005c58ef1837d1683b2c6f34a26c1b2effa886b423861285c97ffffffffffffffff", "hex");
+const H = (b) => crypto.createHash("sha256").update(b).digest("hex").slice(0, 16);
+const E = (e) => e.constructor.name + "|" + e.code + "|" + e.message;
+const T = (f) => { try { return f(); } catch (e) { return "THROW " + E(e); } };
+const out = (...a) => console.log(a.join(" "));
+const big = (b) => BigInt("0x" + (Buffer.from(b).toString("hex") || "0"));
+const buf = (n) => { let h = n.toString(16); if (h.length % 2) h = "0" + h; return Buffer.from(h, "hex"); };
+const bits = (b) => { let i = 0; while (i < b.length && b[i] === 0) i++; if (i === b.length) return 0; return (b.length - i - 1) * 8 + (32 - Math.clz32(b[i])); };
+const X = crypto.createHash("sha256").update("oam-dh-a").digest();
+const Y = crypto.createHash("sha256").update("oam-dh-b").digest();
+const NAMED = ["modp1", "modp2", "modp5", "modp14", "modp15", "modp16", "modp17", "modp18"];
+
+out("constants", ["DH_CHECK_P_NOT_PRIME", "DH_CHECK_P_NOT_SAFE_PRIME", "DH_UNABLE_TO_CHECK_GENERATOR", "DH_NOT_SUITABLE_GENERATOR"].map((k) => crypto.constants[k]).join(","));
+out("exports", typeof crypto.DiffieHellmanGroup, typeof crypto.createDiffieHellmanGroup, crypto.getDiffieHellman === crypto.createDiffieHellmanGroup);
+for (const g of NAMED) {
+  const d = crypto.getDiffieHellman(g);
+  out("group", g, d.getPrime().length, H(d.getPrime()), d.getGenerator("hex"), "verr", d.verifyError, Object.keys(d).join("/"),
+    Object.getOwnPropertyNames(Object.getPrototypeOf(d)).join("/"), typeof d.setPrivateKey, d instanceof crypto.DiffieHellmanGroup);
+}
+out("group-name", T(() => crypto.getDiffieHellman("MODP14").getPrime().length), T(() => crypto.getDiffieHellman("modp3")), T(() => crypto.getDiffieHellman(14)));
+out("verr-desc", JSON.stringify(Object.getOwnPropertyDescriptor(crypto.getDiffieHellman("modp2"), "verifyError")));
+
+// Fixed private keys: public keys and shared secrets for every named group,
+// a 512-bit safe prime with generators 2 and 5, and one with bit 2 clear.
+const VG = NAMED.map((g) => [g, crypto.getDiffieHellman(g).getPrime(), 2]);
+VG.push(["PA", PA, 2], ["PA", PA, 5], ["PB", PB, 2]);
+for (const [name, p, g] of VG) {
+  const a = crypto.createDiffieHellman(p, g);
+  const ret = a.setPrivateKey(X) === a;
+  const pa = a.generateKeys();
+  const b = crypto.createDiffieHellman(p, g); b.setPrivateKey(Y); const pb = b.generateKeys();
+  const s1 = a.computeSecret(pb), s2 = b.computeSecret(pa);
+  out("vec", name, "g" + g, ret, pa.length, H(pa), a.getPrivateKey().length, s1.length, H(s1), s1.equals(s2));
+  if (p.length <= 64) out("vec-hex", name, "g" + g, pa.toString("hex"), s1.toString("hex"));
+}
+// Keys wider than the group, and private values with leading zero bytes.
+for (const len of [64, 104, 200]) {
+  const k = Buffer.alloc(len); for (let i = 0; i < len; i++) k[i] = (i * 151 + 7) & 0xff; k[0] |= 0x80;
+  const a = crypto.createDiffieHellman(PA, 2); a.setPrivateKey(k);
+  const b = crypto.createDiffieHellman(PA, 2); b.setPrivateKey(Y);
+  out("wide", len, H(a.generateKeys()), H(a.computeSecret(b.generateKeys())));
+}
+for (const k of [Buffer.from([0, 0, 0, 5]), Buffer.from([1]), Buffer.from([0]), Buffer.alloc(0)]) {
+  const a = crypto.createDiffieHellman(PA, 2); a.setPrivateKey(k);
+  out("privk", k.toString("hex") || "-", T(() => a.getPrivateKey("hex")), T(() => a.generateKeys("hex")),
+    T(() => { const s = a.computeSecret(Buffer.from([5])); return s.length + ":" + H(s); }));
+}
+// Encodings keep node's lengths: a public key with a leading zero byte comes
+// back one byte short; a shared secret keeps its leading zero byte.
+{
+  const a = crypto.createDiffieHellman(PA, 2); a.setPrivateKey(Buffer.from("0e7be5aa", "hex"));
+  const pub = a.generateKeys();
+  out("short-pub", pub.length, a.getPublicKey().length, a.getPublicKey("hex"));
+  const b = crypto.createDiffieHellman(PA, 2); b.setPrivateKey(X); b.generateKeys();
+  const peer = crypto.createDiffieHellman(PA, 2); peer.setPrivateKey(Buffer.from("7346a9", "hex"));
+  const s = b.computeSecret(peer.generateKeys());
+  out("zero-led-secret", s.length, s.toString("hex"));
+}
+// Peer validation.
+for (const [name, p, g] of [["modp14", crypto.getDiffieHellman("modp14").getPrime(), 2], ["modp1", crypto.getDiffieHellman("modp1").getPrime(), 2],
+  ["PA", PA, 2], ["PA5", PA, 5], ["rfc5114-1024", R1024P, R1024G], ["ffdhe2048", FF2048, 2]]) {
+  const a = crypto.createDiffieHellman(p, g); a.setPrivateKey(X); a.generateKeys();
+  const P = big(p);
+  const peers = { zero: Buffer.from([0]), one: Buffer.from([1]), two: Buffer.from([2]), "p-2": buf(P - 2n), "p-1": buf(P - 1n), p: buf(P), "p+1": buf(P + 1n), empty: Buffer.alloc(0), "00002": Buffer.from([0, 0, 2]), g: Buffer.from(a.getGenerator()) };
+  out("peer", name, Object.keys(peers).map((k) => k + "=" + T(() => { const s = a.computeSecret(peers[k]); return s.length + ":" + H(s); })).join(" "));
+}
+// Constructor contract.
+const ctors = {
+  even: () => crypto.createDiffieHellman(buf(big(PA) + 1n), 2),
+  "odd-composite": () => crypto.createDiffieHellman(buf(big(PA) + 2n), 2),
+  prime0: () => crypto.createDiffieHellman(Buffer.from([0]), 2),
+  prime1: () => crypto.createDiffieHellman(Buffer.from([1]), 2),
+  prime2: () => crypto.createDiffieHellman(Buffer.from([2]), 2),
+  prime23: () => crypto.createDiffieHellman(Buffer.from([23]), 2),
+  gen0: () => crypto.createDiffieHellman(PA, 0),
+  gen1: () => crypto.createDiffieHellman(PA, 1),
+  gen1buf: () => crypto.createDiffieHellman(PA, Buffer.from([1])),
+  "gen-p-1": () => crypto.createDiffieHellman(PA, buf(big(PA) - 1n)),
+  "gen-p": () => crypto.createDiffieHellman(PA, PA),
+  "gen-p+1": () => crypto.createDiffieHellman(PA, buf(big(PA) + 1n)),
+  "gen-float": () => crypto.createDiffieHellman(PA, 2.5),
+  "gen-obj": () => crypto.createDiffieHellman(PA, {}),
+  "gen-str": () => crypto.createDiffieHellman(PA, "hex", "05", "hex"),
+  "prime-hex-gen5": () => crypto.createDiffieHellman(PA.toString("hex"), "hex", 5),
+  "prime-obj": () => crypto.createDiffieHellman({}),
+  "len512-gen1": () => crypto.createDiffieHellman(512, 1),
+  "len512-genbuf": () => crypto.createDiffieHellman(512, Buffer.from([5])),
+  len0: () => crypto.createDiffieHellman(0),
+  len256: () => crypto.createDiffieHellman(256),
+  len10001: () => crypto.createDiffieHellman(10001),
+  "no-new": () => crypto.DiffieHellman(PA, 2),
+  "large-modulus": () => crypto.createDiffieHellman(buf((1n << 10008n) - 1n), 2),
+};
+for (const k in ctors) {
+  let d;
+  try { d = ctors[k](); } catch (e) { out("ctor", k, "THROW", E(e)); continue; }
+  out("ctor", k, "verr", d.verifyError, T(() => d.getPrime().length), T(() => d.getGenerator("hex").length),
+    "gk", T(() => { d.setPrivateKey(X); return H(d.generateKeys()); }),
+    "cs", T(() => { const s = d.computeSecret(Buffer.from([3])); return s.length + ":" + H(s); }));
+}
+for (const [k, p, g] of [["modp14-g5", crypto.getDiffieHellman("modp14").getPrime(), 5], ["ffdhe2048", FF2048, 2], ["rfc5114-1024", R1024P, R1024G], ["rfc5114-1024-g2", R1024P, 2], ["nonsafe-composite", buf(big(PA) * 3n), 2]]) {
+  out("verr", k, crypto.createDiffieHellman(p, g).verifyError);
+}
+// State and encodings.
+{
+  const d = crypto.createDiffieHellman(PA, 2);
+  out("state", T(() => d.getPublicKey()), T(() => d.getPrivateKey()), T(() => d.computeSecret(Buffer.from([3])).length));
+  d.setPublicKey(Buffer.from([0, 7]));
+  out("state-setpub", d.getPublicKey("hex"), d.generateKeys().length === d.getPublicKey().length);
+  d.setPrivateKey(X.toString("base64"), "base64");
+  out("enc", d.getPrivateKey("hex") === X.toString("hex"), d.generateKeys("hex").length, d.generateKeys("base64").length, d.getPrime("base64").slice(0, 12), d.getGenerator("latin1").charCodeAt(0));
+  const e = crypto.createDiffieHellman(PA, 2); e.setPrivateKey(Y); const pe = e.generateKeys();
+  out("enc-cs", H(d.computeSecret(pe.toString("hex"), "hex", "buffer")), d.computeSecret(pe.toString("latin1"), "latin1", "hex").length, H(d.computeSecret(new Uint8Array(pe).buffer)));
+  out("enc-errors", T(() => d.computeSecret(5)), T(() => d.setPrivateKey()));
+  out("enc-utf8", T(() => { d.setPrivateKey("abcd"); return d.getPrivateKey("hex"); }));
+  const f = crypto.createDiffieHellman(PA, 2); f.generateKeys(); const k1 = f.getPrivateKey("hex"); f.generateKeys();
+  out("keeps-private", k1 === f.getPrivateKey("hex"));
+}
+// Generated private values: node's widths for named groups (at most the
+// group's length) and for other groups (exactly bits(p) - 2, bit 0 clear for
+// g = 2 when p has bit 2 clear), in their minimal encoding.
+for (const [name, mk, rule] of [
+  ["modp1", () => crypto.getDiffieHellman("modp1"), "exact"], ["modp5", () => crypto.getDiffieHellman("modp5"), 200],
+  ["modp14", () => crypto.getDiffieHellman("modp14"), 225], ["modp18", () => crypto.getDiffieHellman("modp18"), 400],
+  ["ffdhe2048", () => crypto.createDiffieHellman(FF2048, 2), 225], ["rfc5114-1024", () => crypto.createDiffieHellman(R1024P, R1024G), 160],
+  ["PA-g5", () => crypto.createDiffieHellman(PA, 5), "exact"], ["PB-g2", () => crypto.createDiffieHellman(PB, 2), "exact"],
+]) {
+  const seen = new Set(); let ok = true, even = 0;
+  for (let i = 0; i < 6; i++) {
+    const d = mk(); d.generateKeys(); const k = d.getPrivateKey(); const b = bits(k);
+    if (k[0] === 0) ok = false;
+    if (rule === "exact") seen.add(b); else if (b > rule || b < rule - 64) ok = false;
+    if ((k[k.length - 1] & 1) === 0) even++;
+  }
+  out("gen", name, rule === "exact" ? [...seen].join(",") : "<=" + rule, ok, name === "PB-g2" ? even : "-");
+}
+{
+  const d = crypto.createDiffieHellman(512, 5); d.generateKeys();
+  out("gen-len", d.getPrime().length, d.getGenerator("hex"), bits(d.getPrivateKey()));
+}
+"##,
+    );
+    let expected = r##"constants 1,2,4,8
+exports function function true
+group modp1 96 b52ba6a3026520a6 02 verr 0 verifyError constructor/generateKeys/computeSecret/getPrime/getGenerator/getPublicKey/getPrivateKey undefined true
+group modp2 128 3f35a3f5f6c4376a 02 verr 0 verifyError constructor/generateKeys/computeSecret/getPrime/getGenerator/getPublicKey/getPrivateKey undefined true
+group modp5 192 64fcc83ec403930b 02 verr 0 verifyError constructor/generateKeys/computeSecret/getPrime/getGenerator/getPublicKey/getPrivateKey undefined true
+group modp14 256 d66436f79bbd6b2e 02 verr 0 verifyError constructor/generateKeys/computeSecret/getPrime/getGenerator/getPublicKey/getPrivateKey undefined true
+group modp15 384 48cf8b092fbce435 02 verr 0 verifyError constructor/generateKeys/computeSecret/getPrime/getGenerator/getPublicKey/getPrivateKey undefined true
+group modp16 512 4ee95187682bcb23 02 verr 0 verifyError constructor/generateKeys/computeSecret/getPrime/getGenerator/getPublicKey/getPrivateKey undefined true
+group modp17 768 d1bfe6d0925ce7e4 02 verr 0 verifyError constructor/generateKeys/computeSecret/getPrime/getGenerator/getPublicKey/getPrivateKey undefined true
+group modp18 1024 39ab4feab950a312 02 verr 0 verifyError constructor/generateKeys/computeSecret/getPrime/getGenerator/getPublicKey/getPrivateKey undefined true
+group-name 256 THROW Error|ERR_CRYPTO_UNKNOWN_DH_GROUP|Unknown DH group THROW TypeError|ERR_INVALID_ARG_TYPE|Group name must be a string
+verr-desc {"value":0,"writable":false,"enumerable":true,"configurable":false}
+vec modp1 g2 true 96 9d633f20a95ff7a7 32 96 755cc220865d98e3 true
+vec modp2 g2 true 128 24ad7e13a0d1e21f 32 128 a02acd52b8ae1bf6 true
+vec modp5 g2 true 192 b3a2e13985509a1f 32 192 7aaa7844b4b62e87 true
+vec modp14 g2 true 256 5ade78458a770970 32 256 35b35fd2e4479ba5 true
+vec modp15 g2 true 384 8cab00666feb70b2 32 384 fdd55779f456fc45 true
+vec modp16 g2 true 512 827387c3d6579e89 32 512 f98ae94199aae285 true
+vec modp17 g2 true 768 3438fa9fd157ff51 32 768 1eb0083c949a73f6 true
+vec modp18 g2 true 1024 27fd6ce29fe7911a 32 1024 e2248b38d8694b36 true
+vec PA g2 true 64 fefae0dc738291c7 32 64 00340b664b2f963e true
+vec-hex PA g2 45c53208225eb0ab342b44a0daf53245295a3b1e41889273a868f41dfdfd74cbd9daef977272ec19d4ea3d0083821dfa9a4524f7b39db369ba0745eb1639252c 41a7277195292a1c96264d75ab24d330c12f5e1c918d920d0442b15d5c084384186766f259e31d91e818040ce7f4243a3820840ef9b525f09a8fbf27d76b379f
+vec PA g5 true 64 929d1ab1bd616790 32 64 56bead58cf5a7783 true
+vec-hex PA g5 2fa82a687844b3c4c481511ab109dd2640ffacc8e2b6fe7586ccce666fbd252ae4a3997d64f9ead0344cdcfec9956533b558627ba50f5014e0b3aa887995b852 336cbae496fc74ad4e52e0569fe14f5df21569bc42bf86436c8c9b3b72a85a1c4ba6a6bde12d46e797e5b40c16e9db01f179d55bbd7a29a0d945d2b4b674b641
+vec PB g2 true 64 b5178286146b8c03 32 64 065b17e4f366d085 true
+vec-hex PB g2 1c266481d9228789087f4c377ab8cfe08da0cedb90cb6e63f044b7f844a3e40542586709cd9bc1266698c36bf6d7ac118335a9c32806320c3a9eb646f1f904dc 23e023e7c21c5229fe646ccb7da57e8418d13ac318effcb0fcfb1ba1285e5765d4fe6768242899e8bc49b91eae08c0da0a1fe5c4c020b3dcefa00e282643f039
+wide 64 57cd36593e2f170b 93d3d1481c2e1a97
+wide 104 63766a69d7dfffb9 ee9aea4fdb669958
+wide 200 2e6ebd1fc7e92213 b337333d5b244f6c
+privk 00000005 05 20 64:1c89f582101aae24
+privk 01 01 02 64:c6481e22c5ff4164
+privk 00 THROW Error|ERR_CRYPTO_INVALID_STATE|No private key - did you forget to generate one? 01 0:e3b0c44298fc1c14
+privk - THROW Error|ERR_CRYPTO_INVALID_STATE|No private key - did you forget to generate one? 01 0:e3b0c44298fc1c14
+short-pub 63 63 9a7a1f5343b746fd4aaf93f327a2c34b01d186b85cf294e27c42181ce2b384040c2e192c36086e4bf2702b03ea7b167664fdf1a1ed363188f2033a77998984
+zero-led-secret 64 00322e8630277b29d8f0491662f80396fd6c26dce88287ff48a50efc71dc9f68ed704d5128cee0500eb228db5dfc55f41749cb5c0af6b11435557615b9459736
+peer modp14 zero=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small one=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small two=256:5ade78458a770970 p-2=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error p-1=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error p=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error p+1=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error empty=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small 00002=256:5ade78458a770970 g=256:5ade78458a770970
+peer modp1 zero=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small one=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small two=96:9d633f20a95ff7a7 p-2=96:64b97abe0ba1672d p-1=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error p=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error p+1=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error empty=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small 00002=96:9d633f20a95ff7a7 g=96:9d633f20a95ff7a7
+peer PA zero=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small one=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small two=64:fefae0dc738291c7 p-2=64:7420b4d0a82dca2f p-1=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error p=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error p+1=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error empty=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small 00002=64:fefae0dc738291c7 g=64:fefae0dc738291c7
+peer PA5 zero=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small one=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small two=64:fefae0dc738291c7 p-2=64:7420b4d0a82dca2f p-1=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error p=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error p+1=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error empty=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small 00002=64:fefae0dc738291c7 g=64:929d1ab1bd616790
+peer rfc5114-1024 zero=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small one=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small two=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error p-2=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error p-1=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error p=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error p+1=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error empty=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small 00002=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error g=128:8ec0a8329e3c2461
+peer ffdhe2048 zero=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small one=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small two=256:cb31abbc727d0150 p-2=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error p-1=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error p=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error p+1=THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error empty=THROW RangeError|ERR_CRYPTO_INVALID_KEYLEN|Supplied key is too small 00002=256:cb31abbc727d0150 g=256:cb31abbc727d0150
+ctor even verr 1 64 2 gk THROW Error|ERR_CRYPTO_OPERATION_FAILED|Key generation failed cs 0:e3b0c44298fc1c14
+ctor odd-composite verr 1 64 2 gk 495e5d86dae57525 cs 64:b9e8bb45222947af
+ctor prime0 verr 137 THROW Error|ERR_CRYPTO_INVALID_STATE|p is null 2 gk THROW Error|ERR_CRYPTO_OPERATION_FAILED|Key generation failed cs THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error
+ctor prime1 verr 137 1 2 gk THROW Error|ERR_CRYPTO_OPERATION_FAILED|Key generation failed cs THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error
+ctor prime2 verr 139 1 2 gk THROW Error|ERR_CRYPTO_OPERATION_FAILED|Key generation failed cs THROW RangeError|ERR_CRYPTO_INVALID_KEYTYPE|Unspecified validation error
+ctor prime23 verr 128 1 2 gk THROW Error|ERR_CRYPTO_OPERATION_FAILED|Key generation failed cs 1:6e340b9cffb37a98
+ctor gen0 verr 0 64 2 gk fefae0dc738291c7 cs 64:cc51c2d9011c5bc7
+ctor gen1 THROW Error|ERR_OSSL_DH_BAD_GENERATOR|error:02800065:Diffie-Hellman routines::bad generator
+ctor gen1buf THROW Error|ERR_OSSL_DH_BAD_GENERATOR|error:02800065:Diffie-Hellman routines::bad generator
+ctor gen-p-1 verr 8 64 128 gk 6803a1d222179aad cs 64:cc51c2d9011c5bc7
+ctor gen-p verr 8 64 128 gk THROW Error|ERR_CRYPTO_OPERATION_FAILED|Key generation failed cs 64:cc51c2d9011c5bc7
+ctor gen-p+1 verr 8 64 128 gk 4bf5122f344554c5 cs 64:cc51c2d9011c5bc7
+ctor gen-float THROW RangeError|ERR_OUT_OF_RANGE|The value of "generator" is out of range. It must be an integer. Received 2.5
+ctor gen-obj THROW TypeError|ERR_INVALID_ARG_TYPE|The "generator" argument must be one of type number or string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received an instance of Object
+ctor gen-str verr 0 64 2 gk 929d1ab1bd616790 cs 64:cc51c2d9011c5bc7
+ctor prime-hex-gen5 verr 0 64 2 gk 929d1ab1bd616790 cs 64:cc51c2d9011c5bc7
+ctor prime-obj THROW TypeError|ERR_INVALID_ARG_TYPE|The "sizeOrKey" argument must be one of type number or string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received an instance of Object
+ctor len512-gen1 THROW Error|ERR_OSSL_DH_BAD_GENERATOR|error:02800065:Diffie-Hellman routines::bad generator
+ctor len512-genbuf THROW TypeError|ERR_INVALID_ARG_TYPE|Second argument must be an int32
+ctor len0 THROW Error|ERR_OSSL_DH_MODULUS_TOO_SMALL|error:0280007E:Diffie-Hellman routines::modulus too small
+ctor len256 THROW TypeError|ERR_INVALID_ARG_VALUE|Invalid DH parameters
+ctor len10001 THROW TypeError|ERR_INVALID_ARG_VALUE|Invalid DH parameters
+ctor no-new verr 0 64 2 gk fefae0dc738291c7 cs 64:cc51c2d9011c5bc7
+ctor large-modulus verr 257 1251 2 gk THROW Error|ERR_CRYPTO_OPERATION_FAILED|Key generation failed cs 0:e3b0c44298fc1c14
+verr modp14-g5 0
+verr ffdhe2048 0
+verr rfc5114-1024 0
+verr rfc5114-1024-g2 2
+verr nonsafe-composite 1
+state THROW Error|ERR_CRYPTO_INVALID_STATE|No public key - did you forget to generate one? THROW Error|ERR_CRYPTO_INVALID_STATE|No private key - did you forget to generate one? 0
+state-setpub 07 true
+enc true 128 88 3aHC9ubTAika 2
+enc-cs 00340b664b2f963e 128 00340b664b2f963e
+enc-errors THROW TypeError|ERR_INVALID_ARG_TYPE|The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received type number (5) THROW TypeError|ERR_INVALID_ARG_TYPE|The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received undefined
+enc-utf8 61626364
+keeps-private true
+gen modp1 766 true -
+gen modp5 <=200 true -
+gen modp14 <=225 true -
+gen modp18 <=400 true -
+gen ffdhe2048 <=225 true -
+gen rfc5114-1024 <=160 true -
+gen PA-g5 510 true -
+gen PB-g2 510 true 6
+gen-len 64 05 125
+"##;
+    let out = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "DH vectors failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let got: Vec<&str> = stdout.lines().collect();
+    let want: Vec<&str> = expected.lines().collect();
+    for (i, exp) in want.iter().enumerate() {
+        assert_eq!(
+            got.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} differs from node.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+    assert_eq!(got.len(), want.len(), "line count.\nfull stdout: {stdout}");
 }
 
 // ─── X.509 Certificate ──────────────────────────────────────────────
@@ -24011,11 +28525,19 @@ const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", {
 });
 
 // Sign with PEM key, verify with JWK-imported key
+const rsaData = new TextEncoder().encode("jwk test data");
 const signer = crypto.createSign("SHA256");
-signer.update("jwk test data");
+signer.update(rsaData);
 const rsaSig = signer.sign(privateKey);
 console.log("rsa_sig_len=" + rsaSig.length);
-console.log("all_ok=true");
+const rsaJwk = crypto.createPublicKey(publicKey).export({ format: "jwk" });
+const rsaKey = await subtle.importKey(
+  "jwk", rsaJwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, true, ["verify"]);
+console.log("rsa_key_type=" + rsaKey.type);
+// The digest is the key's: the verify algorithm is the bare name.
+console.log("rsa_jwk_verify=" + await subtle.verify("RSASSA-PKCS1-v1_5", rsaKey, rsaSig, rsaData));
+console.log("rsa_jwk_verify_other=" + await subtle.verify(
+  "RSASSA-PKCS1-v1_5", rsaKey, rsaSig, new TextEncoder().encode("other data")));
 "#,
     );
     let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
@@ -24028,7 +28550,13 @@ console.log("all_ok=true");
     assert!(stdout.contains("hmac_key_type=secret"), "stdout: {stdout}");
     assert!(stdout.contains("hmac_sig_len=32"), "stdout: {stdout}");
     assert!(stdout.contains("hmac_verify=true"), "stdout: {stdout}");
-    assert!(stdout.contains("all_ok=true"), "stdout: {stdout}");
+    assert!(stdout.contains("rsa_sig_len=256"), "stdout: {stdout}");
+    assert!(stdout.contains("rsa_key_type=public"), "stdout: {stdout}");
+    assert!(stdout.contains("rsa_jwk_verify=true"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("rsa_jwk_verify_other=false"),
+        "stdout: {stdout}"
+    );
 }
 
 // ── Wave 8: createKeyObject from JWK ────────────────────────────────
@@ -24044,16 +28572,23 @@ import crypto from "node:crypto";
 const secretJwk = { kty: "oct", k: "dGVzdGtleQ" };  // base64url("testkey")
 const secretKey = crypto.createSecretKey(secretJwk);
 console.log("secret_type=" + secretKey.type);
+console.log("secret_key_ok=" + (secretKey.export().toString() === "testkey"));
 
-// Test createPublicKey from JWK
+// Test createPublicKey from JWK: the JWK-built key verifies what the PEM
+// private key signed, and exports the same JWK it was built from.
 const { publicKey: pubPem, privateKey: privPem } = crypto.generateKeyPairSync("rsa", {
   modulusLength: 2048,
   publicKeyEncoding: { type: "spki", format: "pem" },
   privateKeyEncoding: { type: "pkcs8", format: "pem" },
 });
-
-console.log("secret_key_ok=true");
-console.log("all_ok=true");
+const pubJwk = crypto.createPublicKey(pubPem).export({ format: "jwk" });
+const pubFromJwk = crypto.createPublicKey({ format: "jwk", key: pubJwk });
+console.log("pub_jwk_type=" + pubFromJwk.type + ":" + pubFromJwk.asymmetricKeyType);
+const jwkSig = crypto.createSign("SHA256").update("keyobject jwk").sign(privPem);
+console.log("pub_jwk_verify=" + crypto.createVerify("SHA256").update("keyobject jwk").verify(pubFromJwk, jwkSig));
+console.log("pub_jwk_rejects_other=" + (crypto.createVerify("SHA256").update("other").verify(pubFromJwk, jwkSig) === false));
+const backOut = pubFromJwk.export({ format: "jwk" });
+console.log("pub_jwk_round_trip=" + (backOut.kty === "RSA" && backOut.n === pubJwk.n && backOut.e === pubJwk.e));
 "#,
     );
     let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
@@ -24064,7 +28599,20 @@ console.log("all_ok=true");
         "test failed.\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(stdout.contains("secret_type=secret"), "stdout: {stdout}");
-    assert!(stdout.contains("all_ok=true"), "stdout: {stdout}");
+    assert!(stdout.contains("secret_key_ok=true"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("pub_jwk_type=public:rsa"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("pub_jwk_verify=true"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("pub_jwk_rejects_other=true"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("pub_jwk_round_trip=true"),
+        "stdout: {stdout}"
+    );
 }
 
 // ── Wave 8: createDiffieHellman(primeLength) ────────────────────────
@@ -24099,10 +28647,17 @@ const secret1 = dh.computeSecret(dh2.getPublicKey());
 const secret2 = dh2.computeSecret(dh.getPublicKey());
 console.log("secrets_match=" + (secret1.toString("hex") === secret2.toString("hex")));
 
-// Also test DiffieHellman constructor with number
-const dh3 = new crypto.DiffieHellman(256);
+// The DiffieHellman constructor takes a prime length too; like node's it
+// refuses one below 512 bits.
+const dh3 = new crypto.DiffieHellman(512);
 dh3.generateKeys();
-console.log("constructor_ok=true");
+console.log("constructor_ok=" + (dh3.getPrime().length === 64));
+try {
+  new crypto.DiffieHellman(256);
+  console.log("short_length=accepted");
+} catch (e) {
+  console.log("short_length=" + e.code + ":" + e.message);
+}
 "#,
     );
     let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
@@ -24118,6 +28673,10 @@ console.log("constructor_ok=true");
     assert!(stdout.contains("has_private=true"), "stdout: {stdout}");
     assert!(stdout.contains("secrets_match=true"), "stdout: {stdout}");
     assert!(stdout.contains("constructor_ok=true"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("short_length=ERR_INVALID_ARG_VALUE:Invalid DH parameters"),
+        "stdout: {stdout}"
+    );
 }
 
 // ── Wave 8: generatePrime / checkPrimeSync ──────────────────────────
@@ -24209,13 +28768,14 @@ console.log("pub_type=" + pubKeyObj.type);
 
 // Verify the extracted public key works for encryption
 const msg = Buffer.from("round trip test");
-const encrypted = crypto.publicEncrypt(pubKeyObj.export(), msg);
+const spki = { type: "spki", format: "pem" };
+const encrypted = crypto.publicEncrypt(pubKeyObj.export(spki), msg);
 const decrypted = crypto.privateDecrypt(privPem, encrypted);
 console.log("round_trip=" + decrypted.toString());
 
 // Verify it matches the original public key
 const origPubObj = crypto.createPublicKey(pubPem);
-console.log("pem_match=" + (pubKeyObj.export() === origPubObj.export()));
+console.log("pem_match=" + (pubKeyObj.export(spki) === origPubObj.export(spki)));
 "#,
     );
     let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
@@ -24232,6 +28792,152 @@ console.log("pem_match=" + (pubKeyObj.export() === origPubObj.export()));
         "stdout: {stdout}"
     );
     assert!(stdout.contains("pem_match=true"), "stdout: {stdout}");
+}
+
+// ── Hash/Hmac as streams, randomInt range, subtle AES checks ─────────
+// Node-side expectations probed on v22.22.2 (the subtle AES-192 and
+// tagLength refusals are oam's own, recorded in docs/node-divergences.md).
+
+#[test]
+fn crypto_hash_streams_random_int_range_and_subtle_checks() {
+    let file = write_temp(
+        "crypto_hash_streams_random_int.mjs",
+        r#"
+import crypto from "node:crypto";
+import url from "node:url";
+import path from "node:path";
+import { Readable, Transform, pipeline } from "node:stream";
+
+const codeOf = (fn) => { try { fn(); return "none"; } catch (e) { return e.code; } };
+const nameOf = async (promise) => { try { await promise; return "none"; } catch (e) { return e.name; } };
+
+// Hash and Hmac are Transform streams whose stream state is built lazily.
+const direct = crypto.createHash("sha256").update("abc").digest("hex");
+const piped = crypto.createHash("sha256");
+console.log("hash_is_transform=" + (piped instanceof Transform));
+console.log("hash_own_keys=" + Object.keys(piped).join(","));
+await new Promise((resolve, reject) =>
+  pipeline(Readable.from([Buffer.from("a"), "bc"]), piped, (err) => (err ? reject(err) : resolve())));
+console.log("hash_pipeline=" + (piped.read().toString("hex") === direct));
+
+const encoded = crypto.createHash("sha256", { encoding: "hex" });
+const chunks = [];
+const ended = new Promise((resolve) => encoded.on("end", resolve));
+encoded.on("data", (chunk) => chunks.push(chunk));
+encoded.write("ab");
+encoded.end("c");
+await ended;
+console.log("hash_stream_encoding=" + (typeof chunks[0] === "string" && chunks.join("") === direct));
+
+const hmacDirect = crypto.createHmac("sha256", "k").update("abc").digest("hex");
+const hmacStream = crypto.createHmac("sha256", "k");
+const hmacChunks = [];
+const hmacEnded = new Promise((resolve) => hmacStream.on("end", resolve));
+hmacStream.on("data", (chunk) => hmacChunks.push(chunk));
+hmacStream.end("abc");
+await hmacEnded;
+console.log("hmac_stream=" + (Buffer.concat(hmacChunks).toString("hex") === hmacDirect));
+
+console.log("hash_digest_twice=" + codeOf(() => { const h = crypto.createHash("md5"); h.digest(); h.digest(); }));
+console.log("hash_update_after_digest=" + codeOf(() => { const h = crypto.createHash("md5"); h.digest(); h.update("a"); }));
+console.log("hash_copy_after_digest=" + codeOf(() => { const h = crypto.createHash("md5"); h.digest(); h.copy(); }));
+const spent = crypto.createHmac("sha256", "k");
+spent.digest();
+console.log("hmac_digest_twice=" + JSON.stringify(spent.digest("hex")) + "/" + spent.digest().length);
+console.log("hmac_update_after_digest=" + codeOf(() => spent.update("a")));
+
+// randomInt: a range wider than 48 bits is refused, never sampled.
+console.log("random_int_wide_max=" + codeOf(() => crypto.randomInt(2 ** 48 + 1)));
+console.log("random_int_wide_range=" + codeOf(() => crypto.randomInt(0, 2 ** 48)));
+try { crypto.randomInt(0, 2 ** 48); } catch (e) { console.log("random_int_message=" + e.message); }
+console.log("random_int_widest=" + typeof crypto.randomInt(0, 2 ** 48 - 1));
+console.log("random_int_empty=" + codeOf(() => crypto.randomInt(5, 5)));
+console.log("random_int_fraction=" + codeOf(() => crypto.randomInt(1.5)));
+
+// url.urlToHttpOptions carries a URL's components and user-added
+// properties, and nothing of the URL's own bookkeeping.
+const target = new URL("http://u:p@[::1]:8080/a/b?x=1#h");
+target.searchParams;
+target.extra = 1;
+const options = url.urlToHttpOptions(target);
+console.log("url_options_keys=" + Object.keys(options).join(","));
+console.log("url_options_values=" + [options.hostname, options.port, options.auth, options.path, options.extra].join("|"));
+
+// path.win32.matchesGlob treats `\` as a separator on both sides.
+console.log("glob_win32=" + [
+  path.win32.matchesGlob("a\\b.js", "a/*.js"),
+  path.win32.matchesGlob("a\\b.js", "a\\*.js"),
+  path.win32.matchesGlob("a\\b.js", "a/b.js"),
+  path.win32.matchesGlob("a*b", "a\\*b"),
+].join(","));
+console.log("glob_posix=" + [
+  path.posix.matchesGlob("a\\b.js", "a/*.js"),
+  path.posix.matchesGlob("a/b.js", "a/*.js"),
+  path.posix.matchesGlob("a/b.js", "a\\*.js"),
+  path.posix.matchesGlob("a\\b.js", "a\\*.js"),
+  path.posix.matchesGlob("a*b", "a\\*b"),
+].join(","));
+
+// subtle: algorithm names are case-insensitive in deriveBits too.
+const base = await crypto.subtle.importKey("raw", new Uint8Array(8), "PBKDF2", false, ["deriveBits"]);
+const bits = await crypto.subtle.deriveBits(
+  { name: "pbkdf2", salt: new Uint8Array(8), iterations: 1, hash: "SHA-256" }, base, 256);
+console.log("derive_bits_lowercase=" + bits.byteLength);
+
+// subtle AES: a key length or tag length oam does not implement is named,
+// on encrypt and decrypt alike.
+const iv = new Uint8Array(12);
+const aes192 = await crypto.subtle.importKey("raw", new Uint8Array(24), "AES-GCM", false, ["encrypt"]);
+console.log("aes192=" + await nameOf(crypto.subtle.encrypt({ name: "AES-GCM", iv }, aes192, new Uint8Array(4))));
+const aes256 = await crypto.subtle.importKey("raw", new Uint8Array(32), "AES-GCM", false, ["encrypt", "decrypt"]);
+console.log("gcm_tag_96_encrypt=" + await nameOf(crypto.subtle.encrypt({ name: "AES-GCM", iv, tagLength: 96 }, aes256, new Uint8Array(4))));
+console.log("gcm_tag_96_decrypt=" + await nameOf(crypto.subtle.decrypt({ name: "AES-GCM", iv, tagLength: 96 }, aes256, new Uint8Array(32))));
+console.log("gcm_tag_100=" + await nameOf(crypto.subtle.encrypt({ name: "AES-GCM", iv, tagLength: 100 }, aes256, new Uint8Array(4))));
+const sealed = await crypto.subtle.encrypt({ name: "AES-GCM", iv, tagLength: 128 }, aes256, new Uint8Array([1, 2, 3, 4]));
+const opened = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, aes256, sealed);
+console.log("gcm_round_trip=" + sealed.byteLength + "/" + Array.from(new Uint8Array(opened)).join(""));
+"#,
+    );
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in [
+        "hash_is_transform=true",
+        "hash_own_keys=_options",
+        "hash_pipeline=true",
+        "hash_stream_encoding=true",
+        "hmac_stream=true",
+        "hash_digest_twice=ERR_CRYPTO_HASH_FINALIZED",
+        "hash_update_after_digest=ERR_CRYPTO_HASH_FINALIZED",
+        "hash_copy_after_digest=ERR_CRYPTO_HASH_FINALIZED",
+        "hmac_digest_twice=\"\"/0",
+        "hmac_update_after_digest=ERR_CRYPTO_HASH_FINALIZED",
+        "random_int_wide_max=ERR_OUT_OF_RANGE",
+        "random_int_wide_range=ERR_OUT_OF_RANGE",
+        "random_int_message=The value of \"max - min\" is out of range. It must be <= 281474976710655. Received 281_474_976_710_656",
+        "random_int_widest=number",
+        "random_int_empty=ERR_OUT_OF_RANGE",
+        "random_int_fraction=ERR_INVALID_ARG_TYPE",
+        "url_options_keys=extra,protocol,hostname,hash,search,pathname,path,href,port,auth",
+        "url_options_values=::1|8080|u:p|/a/b?x=1|1",
+        "glob_win32=true,true,true,false",
+        "glob_posix=false,true,true,false,false",
+        "derive_bits_lowercase=32",
+        "aes192=NotSupportedError",
+        "gcm_tag_96_encrypt=NotSupportedError",
+        "gcm_tag_96_decrypt=NotSupportedError",
+        "gcm_tag_100=OperationError",
+        "gcm_round_trip=20/1234",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?}\nstdout: {stdout}"
+        );
+    }
 }
 
 // ── generateKeyPairSync JWK output format ───────────────────────────
@@ -24271,11 +28977,11 @@ const pubKeyObj = crypto.createPublicKey({ format: "jwk", key: publicKey });
 
 const signer = crypto.createSign("SHA256");
 signer.update("jwk round trip");
-const sig = signer.sign(privKeyObj.export());
+const sig = signer.sign(privKeyObj.export({ type: "pkcs8", format: "pem" }));
 
 const verifier = crypto.createVerify("SHA256");
 verifier.update("jwk round trip");
-const valid = verifier.verify(pubKeyObj.export(), sig);
+const valid = verifier.verify(pubKeyObj.export({ type: "spki", format: "pem" }), sig);
 console.log("jwk_round_trip_verify=" + valid);
 
 // n values should match between public and private
@@ -24308,24 +29014,28 @@ console.log("e_match=" + (publicKey.e === privateKey.e));
 
 // ─── TLS / HTTPS ────────────────────────────────────────────────────
 
+// Self-signed, CA:TRUE, CN=localhost with no subjectAltName; valid
+// 2025-2125 so the suite does not stop on a date (it used to end
+// 2027-06-15). The same certificate is `CERT` in oam_core's tls.rs tests
+// and the self-signed pair of the conformance cases.
 const TLS_TEST_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
-MIIDCTCCAfGgAwIBAgIUJscRiMbEzxV45KtAxD+Lly4dJrQwDQYJKoZIhvcNAQEL\n\
-BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDYxNTEyMzAwN1oXDTI3MDYx\n\
-NTEyMzAwN1owFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF\n\
-AAOCAQ8AMIIBCgKCAQEAoQ5a/fh4J3VW0MPpngEpN+yRUdJtlmY6aBhV/984yEIm\n\
-ng9/MGoK0ZRdB8YYGqx4awK1z82ECwtmmdVO/77WA4q6N0CJRzmAF6BN9RgzoyKV\n\
-2w1ltowPFyB6SrVqcW1MHqA/9NX/gw/ckvcjcuazYeI857joWulUmR/iWIpSNuBJ\n\
-c6odEIkfXG9W6/GyZwlutQXnKaa8eClLqCm+hDnkPBHx+doGWxezFVeOfFAdQM8w\n\
-NXT7mj4QN3fiHFDQHI6UkSnVttu7lAAEHY978gjnVyixAPX2dY9mB/Ed4R5eSOpJ\n\
-eTR7bXH6+QmUcDJSaDblM5vB3fb3zhitEGLo/APdQQIDAQABo1MwUTAdBgNVHQ4E\n\
-FgQUPffw9cdyC1LQ2PLrzN7IZjkpKmMwHwYDVR0jBBgwFoAUPffw9cdyC1LQ2PLr\n\
-zN7IZjkpKmMwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAWtdW\n\
-V/jSdVB5cN4GOwYXTHhh3dkYDtAPvFPCXbYacelaQe8mlRWv2BBHAhOZdmoJ3ai/\n\
-kNRw0D6pKqjcF4p17of9S07ZFCRaQGBAsDEd9jNY156AlEXu4Z8yp/kXE3fvznib\n\
-WHrQjdlDcmC2H/Ao+S7f4BkmbvsabyDbUoo+0Drk4MDvqga2azrFDdljqXQxzrEH\n\
-/mEwoi9pfukgFnFnhDE+WEqNsZQF9Yxa5QEX6d5tgbOcxS2NpKDug4xSgkpAQ0l6\n\
-XKpI59mdGTahOy9zGuNfTqVTHvrFoSXudnNHUjkfHK7Mh/VrNz9ZGpwDt5fGFD4x\n\
-E13+0jp6In545LYu+A==\n\
+MIIDCzCCAfOgAwIBAgIUJscRiMbEzxV45KtAxD+Lly4dJrQwDQYJKoZIhvcNAQEL\n\
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI1MDEwMTAwMDAwMFoYDzIxMjUw\n\
+MTAxMDAwMDAwWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEB\n\
+AQUAA4IBDwAwggEKAoIBAQChDlr9+HgndVbQw+meASk37JFR0m2WZjpoGFX/3zjI\n\
+QiaeD38wagrRlF0HxhgarHhrArXPzYQLC2aZ1U7/vtYDiro3QIlHOYAXoE31GDOj\n\
+IpXbDWW2jA8XIHpKtWpxbUweoD/01f+DD9yS9yNy5rNh4jznuOha6VSZH+JYilI2\n\
+4Elzqh0QiR9cb1br8bJnCW61Becpprx4KUuoKb6EOeQ8EfH52gZbF7MVV458UB1A\n\
+zzA1dPuaPhA3d+IcUNAcjpSRKdW227uUAAQdj3vyCOdXKLEA9fZ1j2YH8R3hHl5I\n\
+6kl5NHttcfr5CZRwMlJoNuUzm8Hd9vfOGK0QYuj8A91BAgMBAAGjUzBRMB0GA1Ud\n\
+DgQWBBQ99/D1x3ILUtDY8uvM3shmOSkqYzAfBgNVHSMEGDAWgBQ99/D1x3ILUtDY\n\
+8uvM3shmOSkqYzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAH\n\
+jdkIGOWczuu/hZMJ3QZcynx2Uxm7qK3cox56uFpnO7RPkv4jBu9SAOl7WVWwOlYb\n\
+MlL7Iamv+A+NdghDucbEiDyw9798hVQggIe1cjMjkdpeXD1vBp2XWzVcFUCkQFjP\n\
+kWeSUzzcsaC/rFV5xASqP2RQK+aGAPeUfhgin1lCtuC0zfhfsQVTSD5HrPkTKYMj\n\
+7GKUJqmLqTPreCVblP9BCm9S4Og5mvNx1SFwBUIHIcuosk9daaf7JZQynYv1yJRp\n\
+E3ybo/8zVvpZ3durGRT9NLilVC289CbYbRWAkh2zmHNA5nZsgxU9/JSLAjgtmLEt\n\
+laiOwbm2oOPQ9QfligDD\n\
 -----END CERTIFICATE-----";
 
 const TLS_TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
@@ -24644,7 +29354,9 @@ console.log('listening=' + port);
 const sock = tls.connect({{ port, host: '127.0.0.1', rejectUnauthorized: false }});
 await new Promise((resolve) => sock.on('secureConnect', resolve));
 console.log('encrypted=' + sock.encrypted);
-console.log('authorized=' + (typeof sock.authorized === 'boolean'));
+// node: a self-signed peer accepted only through rejectUnauthorized:false
+// is connected but not authorized.
+console.log('authorized=' + sock.authorized);
 
 sock.write('GET /test-path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n');
 
@@ -24671,7 +29383,7 @@ server.close();
         "test failed.\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(stdout.contains("encrypted=true"), "stdout: {stdout}");
-    assert!(stdout.contains("authorized="), "stdout: {stdout}");
+    assert!(stdout.contains("authorized=false"), "stdout: {stdout}");
     assert!(stdout.contains("has_200=true"), "stdout: {stdout}");
     assert!(stdout.contains("has_body=true"), "stdout: {stdout}");
 }
@@ -24899,7 +29611,7 @@ process.exit(0);
 /// shared client used to print about dropping it has nothing left to say.
 /// All measured on Node v22.22.2.
 #[test]
-fn https_min_max_version_threads_pins_and_warns_once_on_the_shared_client() {
+fn https_min_max_version_threads_pins_and_warns_about_none() {
     let src = format!(
         r#"
 import tls from 'node:tls';
@@ -24965,9 +29677,10 @@ console.log('rejectFalseDefault=' + await viaRequest({{ rejectUnauthorized: fals
 console.log('verifyingMax1.2=' + await viaRequest({{ ca: cert, servername: 'localhost', maxVersion: 'TLSv1.2' }}));
 await new Promise((r) => echo.close(r));
 
-// No pin is dropped any more, so nothing warns about one.
+// No pin is dropped any more, so nothing warns about one: no process warning
+// of any wording may name a pin option.
 let warnings = 0;
-process.on('warning', (w) => {{ if (String(w.message).includes('minVersion, maxVersion and secureProtocol are not applied')) warnings++; }});
+process.on('warning', (w) => {{ if (/minVersion|maxVersion|secureProtocol/.test(String(w && w.message))) warnings++; }});
 function verifying(opts) {{
   const r = https.request({{ host: '127.0.0.1', port: 1, path: '/', ...opts }}, () => {{}});
   r.on('error', () => {{}});
@@ -24976,13 +29689,12 @@ function verifying(opts) {{
 verifying({{ minVersion: 'TLSv1.2' }});
 verifying({{ maxVersion: 'TLSv1.3' }});
 verifying({{ secureProtocol: 'TLS_method' }});
-await new Promise((r) => setTimeout(r, 50));
-console.log('quietPins=' + warnings);
 verifying({{ maxVersion: 'TLSv1.2' }});
 verifying({{ minVersion: 'TLSv1.3' }});
 verifying({{ secureProtocol: 'TLSv1_2_method' }});
+// Warnings are delivered on a later tick; one macrotask is past all of them.
 await new Promise((r) => setTimeout(r, 50));
-console.log('loudPins=' + warnings);
+console.log('pinWarnings=' + warnings);
 process.exit(0);
 "#,
         cert = TLS_TEST_CERT,
@@ -25037,14 +29749,12 @@ process.exit(0);
         stdout.contains("verifyingMax1.2=proto=TLSv1.2"),
         "stdout: {stdout}"
     );
-    assert!(stdout.contains("quietPins=0"), "stdout: {stdout}");
-    assert!(stdout.contains("loudPins=0"), "stdout: {stdout}");
-    assert_eq!(
-        stderr
-            .matches("minVersion, maxVersion and secureProtocol are not applied")
-            .count(),
-        0,
-        "no pin is dropped, so nothing warns.\nstderr: {stderr}"
+    assert!(stdout.contains("pinWarnings=0"), "stdout: {stdout}");
+    assert!(
+        !["minVersion", "maxVersion", "secureProtocol"]
+            .iter()
+            .any(|option| stderr.contains(option)),
+        "no pin is dropped, so nothing on stderr names one.\nstderr: {stderr}"
     );
 }
 
@@ -25947,13 +30657,16 @@ const session = http2.connect('https://localhost:' + port, {{ ca: root }});
 session.on('connect', () => console.log('connect'));
 const stream = session.request({{ ':path': '/' }});
 stream.on('error', (e) => console.log('stream error ' + e.code));
-stream.on('close', () => console.log('stream close'));
-setTimeout(() => {{
-  console.log('survived destroyed=' + session.destroyed);
-  try {{ session.destroy(); }} catch {{}}
-  server.close();
-  process.exit(0);
-}}, 900);
+// Event-driven, not a fixed sleep: the stream's 'close' and then the session
+// reaching destroyed, both bounded by the 20 s TIMEOUT above. The short settle
+// after them is where a late session 'error' would still crash the process.
+await new Promise((r) => stream.on('close', () => {{ console.log('stream close'); r(); }}));
+while (!session.destroyed) await new Promise((r) => setTimeout(r, 10));
+await new Promise((r) => setTimeout(r, 100));
+console.log('survived destroyed=' + session.destroyed);
+try {{ session.destroy(); }} catch {{}}
+server.close();
+process.exit(0);
 "#,
         root = FETCH_TEST_CA,
         cert = FETCH_TEST_LEAF,
@@ -26788,11 +31501,16 @@ fn spawn_failure_stdin_does_not_hang() {
     let src = r#"
 import { spawn } from 'child_process';
 const cp = spawn('definitely-not-a-real-binary-xyzqq', [], { shell: false });
-cp.on('error', () => { console.log('cp_error=true'); });
-cp.stdin.on('error', () => { console.log('stdin_settled=true'); });
+// Both events are awaited, not slept for: a starved box only takes longer.
+const cpError = new Promise((r) => cp.on('error', () => { console.log('cp_error=true'); r(); }));
+const stdinSettled = new Promise((r) => cp.stdin.on('error', () => { console.log('stdin_settled=true'); r(); }));
 cp.stdin.write('hello');
 cp.stdin.end();
-setTimeout(() => { console.log('done'); process.exit(0); }, 1500);
+const bound = setTimeout(() => { console.log('settled=NEVER'); process.exit(3); }, 20000);
+await Promise.all([cpError, stdinSettled]);
+clearTimeout(bound);
+console.log('done');
+process.exit(0);
 "#;
     let f = write_temp("spawn_fail_stdin.mjs", src);
     let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
@@ -26813,8 +31531,9 @@ setTimeout(() => { console.log('done'); process.exit(0); }, 1500);
 fn spawn_stdin_before_spawn_resolves() {
     let src = r#"
 import { spawn } from 'child_process';
-// Portable echo-stdin (cmd /c findstr is Windows-only -> ENOENT on Unix).
-const cp = spawn('node', ['-e', 'process.stdin.pipe(process.stdout)'], { shell: false });
+// Portable echo-stdin (cmd /c findstr is Windows-only -> ENOENT on Unix). The
+// child is oam itself, so the test holds on a machine with no node on PATH.
+const cp = spawn(process.execPath, ['-e', 'process.stdin.pipe(process.stdout)'], { shell: false });
 const chunks = [];
 cp.stdout.on('data', (c) => chunks.push(c));
 cp.stdin.write('deferred-stdin\r\n');
@@ -27056,12 +31775,15 @@ fn tls_server_missing_cert_emits_client_error() {
 import tls from 'node:tls';
 const server = tls.createServer();
 let clientErr = false;
-server.on('tlsClientError', () => { clientErr = true; });
+const clientErrored = new Promise((r) => server.on('tlsClientError', () => { clientErr = true; r(); }));
 await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 const port = server.address().port;
 const c = tls.connect({ host: '127.0.0.1', port, rejectUnauthorized: false });
 c.on('error', () => {});
-await new Promise((r) => setTimeout(r, 800));
+// Await the event (bounded) instead of sleeping a fixed time for it.
+let bound;
+await Promise.race([clientErrored, new Promise((r) => { bound = setTimeout(r, 20000); })]);
+clearTimeout(bound);
 console.log('client_error_fired=' + clientErr);
 console.log('still_listening=' + server.listening);
 server.close();
@@ -27101,14 +31823,21 @@ const server = tls.createServer({ cert, key }, (socket) => {
 });
 await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 const port = server.address().port;
+// The first of the three events is the verdict; it is awaited (bounded), not
+// slept for, so a starved box only takes longer.
 let result = 'none';
+let settled;
+const firstEvent = new Promise((r) => { settled = r; });
+const settle = (value) => { if (result === 'none') { result = value; settled(); } };
 const req = https.get(`https://127.0.0.1:${port}/`, { rejectUnauthorized: false }, (res) => {
   res.on('data', () => {});
-  res.on('end', () => { if (result === 'none') result = 'end'; });
-  res.on('aborted', () => { if (result === 'none') result = 'aborted'; });
+  res.on('end', () => settle('end'));
+  res.on('aborted', () => settle('aborted'));
 });
-req.on('error', (e) => { if (result === 'none') result = 'error:' + (e && e.code); });
-await new Promise((r) => setTimeout(r, 800));
+req.on('error', (e) => settle('error:' + (e && e.code)));
+let bound;
+await Promise.race([firstEvent, new Promise((r) => { bound = setTimeout(r, 20000); })]);
+clearTimeout(bound);
 console.log('result=' + result);
 server.close();
 "#
@@ -27169,7 +31898,14 @@ fn https_client_malformed_chunk_size_errors() {
 fn child_process_kill_reports_signal() {
     let src = r#"
 import { spawn } from 'child_process';
-const cp = spawn('node', ['-e', 'setTimeout(() => {}, 60000);']);
+import { writeFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+// The child is oam itself, so the test holds with no node on PATH. It runs a
+// file rather than `-e`: a killed `-e` child cannot remove the eval source it
+// wrote into the working directory.
+const childFile = fileURLToPath(new URL('./cp_kill_signal_child.cjs', import.meta.url));
+writeFileSync(childFile, 'setTimeout(() => {}, 60000);\n');
+const cp = spawn(process.execPath, [childFile]);
 cp.on('spawn', () => { setTimeout(() => cp.kill('SIGTERM'), 200); });
 cp.on('exit', (code, signal) => { console.log('exit_signal=' + signal); process.exit(0); });
 setTimeout(() => { console.log('timeout'); process.exit(1); }, 5000);
@@ -27203,10 +31939,15 @@ await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 const port = server.address().port;
 const c = tls.connect({ host: '127.0.0.1', port, rejectUnauthorized: false });
 let got = '';
-const sink = new Writable({ write(chunk, enc, cb) { got += chunk.toString(); cb(); } });
+let echoed;
+const whole = new Promise((r) => { echoed = r; });
+const sink = new Writable({ write(chunk, enc, cb) { got += chunk.toString(); if (got.includes('echo:piped-hello')) echoed(); cb(); } });
 c.pipe(sink);
 c.on('secureConnect', () => c.write('piped-hello'));
-await new Promise((r) => setTimeout(r, 700));
+// Await the echo (bounded) instead of sleeping a fixed time for it.
+let bound;
+await Promise.race([whole, new Promise((r) => { bound = setTimeout(r, 20000); })]);
+clearTimeout(bound);
 console.log('piped=' + got);
 c.end();
 server.close();
@@ -27270,9 +32011,17 @@ let ended = false;
 let errored = false;
 c.on('data', () => {});
 c.on('secureConnect', () => c.write('x'));
-c.on('end', () => { ended = true; });
+// 'close' is the last event either way, so it is what is awaited (bounded)
+// instead of a fixed sleep: an 'error' that follows 'end' is still seen. The
+// 1 s after 'end' only covers a socket that never reports 'close'.
+let finished;
+const done = new Promise((r) => { finished = r; });
+c.on('end', () => { ended = true; setTimeout(finished, 1000); });
 c.on('error', () => { errored = true; });
-await new Promise((r) => setTimeout(r, 700));
+c.on('close', () => setTimeout(finished, 50));
+let bound;
+await Promise.race([done, new Promise((r) => { bound = setTimeout(r, 20000); })]);
+clearTimeout(bound);
 console.log('ended=' + ended);
 console.log('errored=' + errored);
 server.close();
@@ -27290,6 +32039,9 @@ process.exit(0);
         out.status
     );
     assert!(stdout.contains("ended=true"), "{stdout}");
+    // The 'error' listener is there so a regression reports as this line
+    // instead of an unhandled-'error' exit; it must never have fired.
+    assert!(stdout.contains("errored=false"), "{stdout}\n{stderr}");
 }
 
 // Regression: an explicit socket.destroy() on a TLS socket whose read is
@@ -27345,38 +32097,17 @@ fn oam_bounded(
     args: &[&str],
     deadline: std::time::Duration,
 ) -> (Option<std::process::ExitStatus>, String, String) {
-    use std::io::Read;
     use std::process::Stdio;
-    let cache = write_temp("oam-cache/.keep", "")
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(args)
-        .env("OAM_ENABLE_NATIVE_ADDONS", "1")
-        .env("OAM_CACHE_DIR", cache)
-        .env("OAM_DAEMON_IDLE_MS", "45000")
-        .env("OAM_CHECK_WAIT_MS", "60000")
-        .env_remove("FORCE_COLOR")
-        .env_remove("NO_COLOR")
-        .env_remove("NODE_DISABLE_COLORS")
+    // The same environment every other test's oam gets (`oam_command`), so
+    // the two cannot drift apart.
+    let mut child = oam_command(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("oam binary runs");
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let out = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stdout.read_to_string(&mut s);
-        s
-    });
-    let err = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stderr.read_to_string(&mut s);
-        s
-    });
+    let stdout = drain_pipe(child.stdout.take().expect("piped stdout"));
+    let stderr = drain_pipe(child.stderr.take().expect("piped stderr"));
     let end = std::time::Instant::now() + deadline;
     let status = loop {
         match child.try_wait().expect("try_wait") {
@@ -27389,7 +32120,19 @@ fn oam_bounded(
             None => std::thread::sleep(std::time::Duration::from_millis(20)),
         }
     };
-    (status, out.join().unwrap(), err.join().unwrap())
+    // Bounded like `bounded_output`'s drain: something the child spawned may
+    // have inherited a pipe and still hold it after the child is gone.
+    let drained = std::time::Instant::now();
+    while (!stdout.at_eof() || !stderr.at_eof())
+        && drained.elapsed() < std::time::Duration::from_secs(30)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    (
+        status,
+        String::from_utf8_lossy(&stdout.taken()).into_owned(),
+        String::from_utf8_lossy(&stderr.taken()).into_owned(),
+    )
 }
 
 /// The `exit=0 after=<ms>` line a liveness script prints from 'exit': how
@@ -27801,19 +32544,84 @@ server.listen(0, '127.0.0.1', async () => {
 
 // ======================================= dns.resolve + dns.reverse
 
+/// Script prelude for the `dns.resolve*` / `dns.reverse` tests below: a
+/// nameserver on loopback that `dns.setServers` points both APIs at, so no
+/// query leaves the machine (an offline or DNS-filtered box used to fail these
+/// tests on names it could not look up). It answers with one record of the
+/// type asked -- A, PTR, MX or TXT -- and NXDOMAIN for any other type. The
+/// wire format is the one conformance case 592's fake server uses; the script
+/// closes `responder` when it is done.
+const DNS_LOOPBACK_SERVER: &str = r#"
+import dgram from 'node:dgram';
+import dns from 'node:dns';
+const dnsName = (name) => {
+  const parts = [];
+  for (const label of name.split('.').filter(Boolean)) parts.push(label.length, ...Buffer.from(label));
+  parts.push(0);
+  return Buffer.from(parts);
+};
+const DNS_RDATA = {
+  1: () => Buffer.from([192, 0, 2, 7]),
+  12: () => dnsName('dns.oamt.test'),
+  15: () => Buffer.concat([Buffer.from([0, 10]), dnsName('mx.oamt.test')]),
+  16: () => Buffer.from([2, 104, 105]),
+};
+let dnsAsked = 0;
+const responder = dgram.createSocket('udp4');
+responder.on('message', (msg, rinfo) => {
+  dnsAsked++;
+  let off = 12;
+  const labels = [];
+  while (msg[off]) {
+    labels.push(msg.subarray(off + 1, off + 1 + msg[off]).toString());
+    off += msg[off] + 1;
+  }
+  off += 1;
+  const qtype = msg.readUInt16BE(off);
+  const make = DNS_RDATA[qtype];
+  const answers = [];
+  if (make) {
+    const data = make();
+    const fixed = Buffer.alloc(10);
+    fixed.writeUInt16BE(qtype, 0);
+    fixed.writeUInt16BE(1, 2);
+    fixed.writeUInt32BE(60, 4);
+    fixed.writeUInt16BE(data.length, 8);
+    answers.push(Buffer.concat([dnsName(labels.join('.')), fixed, data]));
+  }
+  const header = Buffer.from(msg.subarray(0, 12));
+  header[2] = 0x84 | (msg[2] & 1);
+  header[3] = 0x80 | (make ? 0 : 3);
+  header.writeUInt16BE(1, 4);
+  header.writeUInt16BE(answers.length, 6);
+  header.writeUInt16BE(0, 8);
+  header.writeUInt16BE(0, 10);
+  responder.send(Buffer.concat([header, msg.subarray(12, off + 4), ...answers]), rinfo.port, rinfo.address);
+});
+await new Promise((r) => responder.bind(0, '127.0.0.1', r));
+dns.setServers([`127.0.0.1:${responder.address().port}`]);
+"#;
+
+/// [`run_ok`] on `body` behind the [`DNS_LOOPBACK_SERVER`] prelude.
+fn run_ok_with_loopback_dns(name: &str, body: &str) -> String {
+    run_ok(name, &[DNS_LOOPBACK_SERVER, body].concat())
+}
+
 #[test]
 fn dns_resolve_a_record() {
-    let stdout = run_ok(
+    let stdout = run_ok_with_loopback_dns(
         "dns_resolve_a.mjs",
         r#"
-import dns from 'node:dns';
-dns.resolve('google.com', 'A', (err, addrs) => {
+dns.resolve('name.oamt.test', 'A', (err, addrs) => {
+  responder.close();
   if (err) { console.log('ERR:' + err.code); process.exit(1); }
   console.log('count=' + addrs.length);
   console.log('is_ipv4=' + /^\d+\.\d+\.\d+\.\d+$/.test(addrs[0]));
+  console.log('served_locally=' + (dnsAsked >= 1 && addrs[0] === '192.0.2.7'));
 });
 "#,
     );
+    assert!(stdout.contains("served_locally=true"), "stdout: {stdout}");
     assert!(stdout.contains("count="), "stdout: {stdout}");
     let count: usize = stdout
         .lines()
@@ -27829,11 +32637,11 @@ dns.resolve('google.com', 'A', (err, addrs) => {
 
 #[test]
 fn dns_resolve_mx_record() {
-    let stdout = run_ok(
+    let stdout = run_ok_with_loopback_dns(
         "dns_resolve_mx.mjs",
         r#"
-import dns from 'node:dns';
-dns.resolveMx('google.com', (err, records) => {
+dns.resolveMx('name.oamt.test', (err, records) => {
+  responder.close();
   if (err) { console.log('ERR:' + err.code); process.exit(1); }
   console.log('count=' + records.length);
   const r = records[0];
@@ -27849,11 +32657,11 @@ dns.resolveMx('google.com', (err, records) => {
 
 #[test]
 fn dns_resolve_txt_record() {
-    let stdout = run_ok(
+    let stdout = run_ok_with_loopback_dns(
         "dns_resolve_txt.mjs",
         r#"
-import dns from 'node:dns';
-dns.resolveTxt('google.com', (err, records) => {
+dns.resolveTxt('name.oamt.test', (err, records) => {
+  responder.close();
   if (err) { console.log('ERR:' + err.code); process.exit(1); }
   console.log('count=' + records.length);
   console.log('is_array_of_arrays=' + (Array.isArray(records) && Array.isArray(records[0])));
@@ -27869,11 +32677,11 @@ dns.resolveTxt('google.com', (err, records) => {
 
 #[test]
 fn dns_reverse_lookup() {
-    let stdout = run_ok(
+    let stdout = run_ok_with_loopback_dns(
         "dns_reverse.mjs",
         r#"
-import dns from 'node:dns';
-dns.reverse('8.8.8.8', (err, hostnames) => {
+dns.reverse('192.0.2.7', (err, hostnames) => {
+  responder.close();
   if (err) { console.log('ERR:' + err.code); process.exit(1); }
   console.log('count=' + hostnames.length);
   console.log('has_dns=' + hostnames.some(h => h.includes('dns')));
@@ -27886,15 +32694,15 @@ dns.reverse('8.8.8.8', (err, hostnames) => {
 
 #[test]
 fn dns_promises_resolve() {
-    let stdout = run_ok(
+    let stdout = run_ok_with_loopback_dns(
         "dns_promises_resolve.mjs",
         r#"
-import dns from 'node:dns';
-const addrs = await dns.promises.resolve('google.com', 'A');
+const addrs = await dns.promises.resolve('name.oamt.test', 'A');
 console.log('count=' + addrs.length);
 console.log('is_ipv4=' + /^\d+\.\d+\.\d+\.\d+$/.test(addrs[0]));
-const hostnames = await dns.promises.reverse('8.8.8.8');
+const hostnames = await dns.promises.reverse('192.0.2.7');
 console.log('rev_count=' + hostnames.length);
+responder.close();
 "#,
     );
     assert!(stdout.contains("count="), "stdout: {stdout}");
@@ -27941,6 +32749,436 @@ child.send({{ data: 'hello-from-parent' }});
     );
     assert!(stdout.contains("from=child"), "stdout: {stdout}");
     assert!(stdout.contains("exit=0"), "stdout: {stdout}");
+}
+
+/// What a child hands its IPC channel before it goes is delivered, however
+/// it goes, and the parent sees 'disconnect' then 'exit' (node v22.22.2,
+/// every mode below). oam's channel is a loopback connection the child makes
+/// on first use, so each of these lost something:
+///
+/// - `send-exit`: `process.send()` then `process.exit()` in the same turn --
+///   the connection was not up yet and the queue went with the process;
+/// - `reply-exit`: the same on a connected channel -- the socket was left to
+///   the process's end, which on Windows is a reset that discards what the
+///   parent has not read yet (conformance case 644 under load);
+/// - `natural`: a child that only sends never exited -- the channel's parked
+///   read held its loop -- and node's does: the channel is ref'd only while
+///   'message' or 'disconnect' is listened for;
+/// - `idle`: a child that never touches the channel closes it by exiting,
+///   and the parent emitted no 'disconnect' for it.
+#[test]
+fn fork_ipc_delivers_what_a_child_sent_before_it_exits() {
+    let child_path = write_temp(
+        "fork_ipc_exit_child.cjs",
+        r#"
+const mode = process.argv[2];
+const big = 'x'.repeat(3000000);
+if (mode === 'send-exit') { process.send({ a: 1 }); process.send({ big }); process.exit(0); }
+if (mode === 'reply-exit') {
+  process.on('message', () => { process.send({ a: 1 }); process.send({ big }); process.exit(0); });
+}
+if (mode === 'natural') { process.send({ a: 1 }); process.send({ big }); }
+if (mode === 'throw') { process.send({ a: 1 }); process.send({ big }); throw new Error('boom'); }
+"#,
+    );
+    let child_str = child_path.to_str().unwrap().replace('\\', "/");
+    let parent_src = r#"
+const { fork } = require('node:child_process');
+(async () => {
+  for (const mode of ['send-exit', 'reply-exit', 'natural', 'throw', 'idle']) {
+    const cp = fork('CHILD', [mode], { silent: true });
+    let messages = 0, bytes = 0;
+    const order = [];
+    cp.on('message', (m) => { messages++; if (m.big) bytes += m.big.length; });
+    if (mode === 'reply-exit') cp.send({ go: 1 });
+    await new Promise((done) => {
+      cp.on('disconnect', () => order.push('disconnect'));
+      cp.on('exit', (code) => order.push('exit:' + code));
+      cp.on('close', () => { order.push('close'); done(); });
+    });
+    console.log(mode, messages, bytes, order.join(','), cp.connected);
+  }
+})();
+"#
+    .replace("CHILD", &child_str);
+    let stdout = run_ok("fork_ipc_exit_parent.cjs", &parent_src);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            "send-exit 2 3000000 disconnect,exit:0,close false",
+            "reply-exit 2 3000000 disconnect,exit:0,close false",
+            "natural 2 3000000 disconnect,exit:0,close false",
+            "throw 2 3000000 disconnect,exit:1,close false",
+            "idle 0 0 disconnect,exit:0,close false",
+        ],
+        "stdout: {stdout}"
+    );
+}
+
+/// A child's exit does not wait for its parent to read the channel: with the
+/// parent's event loop blocked for 2 s (nothing of the channel read, the
+/// exit not collected), a child that sent a small message and exited is
+/// GONE by the end of the block -- asked of the OS, not of the runtime --
+/// and the message is delivered afterwards, ahead of 'exit' and 'close'. So
+/// under node v22.22.2, whose child leaves its message in the pipe; this
+/// test's stdout is node's, byte for byte (measured on Windows).
+///
+/// oam's child used to close its loopback channel by reading to the parent's
+/// EOF, whatever the message's size, so it stayed until the parent read: a
+/// parent waiting for the child's death without reading waited for good.
+/// The exit now waits only for the message to be in the parent's kernel.
+///
+/// - `up`: the channel is established (the child said so over it) and the
+///   child exits from its send's callback;
+/// - `cold`: the child's first use of the channel is the message, so the
+///   parent has not even accepted the connection when it blocks;
+/// - `cold-exit`: the same with `process.exit()` right behind the send --
+///   the message goes out on the exit path's own blocking connection.
+///
+/// The 3 MB rows pin delivery only. node's child stays until the parent
+/// reads, there (the message does not fit its pipe); whether oam's does is
+/// the platform's loopback buffering (Windows takes all of it at once and
+/// the child goes; Linux holds part of it back and the child stays).
+#[test]
+fn fork_ipc_child_exit_does_not_wait_for_a_parent_that_is_not_reading() {
+    let child_path = write_temp(
+        "fork_ipc_blocked_parent_child.cjs",
+        r#"
+const fs = require('node:fs');
+const [mode, size, base] = process.argv.slice(2);
+// Sends when the parent says it is about to block, and says when it has.
+const send = () => {
+  const t = setInterval(() => {
+    if (!fs.existsSync(base + '.go')) return;
+    clearInterval(t);
+    const message = { pad: 'x'.repeat(Number(size)) };
+    if (mode === 'cold-exit') {
+      process.send(message);
+      fs.writeFileSync(base + '.sent', '1');
+      process.exit(0);
+    }
+    process.send(message, () => process.exit(0));
+    fs.writeFileSync(base + '.sent', '1');
+  }, 5);
+};
+if (mode === 'up') { process.on('message', () => {}); process.send({ ready: 1 }, send); }
+else { fs.writeFileSync(base + '.ready', '1'); send(); }
+"#,
+    );
+    let child_str = child_path.to_str().unwrap().replace('\\', "/");
+    let parent_src = r#"
+const { fork, execFileSync } = require('node:child_process');
+const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+// Whether process `pid` has ended, asked of the OS, synchronously. A zombie
+// has: its exit is only not collected yet.
+function gone(pid) {
+  if (process.platform === 'win32') {
+    const listed = execFileSync('tasklist', ['/NH', '/FI', `PID eq ${pid}`]).toString();
+    return !listed.includes(String(pid));
+  }
+  if (process.platform === 'linux') {
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      return stat.slice(stat.lastIndexOf(')') + 2)[0] === 'Z';
+    } catch (_) { return true; }
+  }
+  try {
+    return execFileSync('ps', ['-o', 'stat=', '-p', String(pid)]).toString().trim().startsWith('Z');
+  } catch (_) { return true; }
+}
+let n = 0;
+const run = (mode, size) => new Promise((done) => {
+  const base = path.join(os.tmpdir(), `oam-e2e-ipc-block-${process.pid}-${n++}`);
+  const cp = fork('CHILD', [mode, String(size), base], { silent: true });
+  let messages = 0, bytes = 0, wasGone = null, exit = null, blocked = false;
+  // From the go-ahead to the end of the block the loop does not run.
+  const block = () => {
+    fs.writeFileSync(base + '.go', '1');
+    const t0 = Date.now();
+    while (!fs.existsSync(base + '.sent') && Date.now() - t0 < 30000) sleep(5);
+    sleep(2000);
+    wasGone = gone(cp.pid);
+    blocked = true;
+  };
+  cp.on('message', (m) => {
+    if (m.ready) return block();
+    messages++; bytes += m.pad.length;
+  });
+  if (mode !== 'up') {
+    const poll = setInterval(() => {
+      if (!fs.existsSync(base + '.ready')) return;
+      clearInterval(poll);
+      block();
+    }, 5);
+  }
+  cp.on('exit', (code) => { exit = code; });
+  cp.on('close', () => {
+    for (const s of ['.ready', '.go', '.sent']) fs.rmSync(base + s, { force: true });
+    done(`${mode} ${size} blocked=${blocked} exit=${exit} messages=${messages} bytes=${bytes}`
+      + (size < 65536 ? ` gone=${wasGone}` : ''));
+  });
+});
+(async () => {
+  for (const [mode, size] of [['up', 10], ['cold', 10], ['cold-exit', 10], ['up', 3000000], ['cold', 3000000]]) {
+    console.log(await run(mode, size));
+  }
+})();
+"#
+    .replace("CHILD", &child_str);
+    let stdout = run_ok("fork_ipc_blocked_parent.cjs", &parent_src);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            "up 10 blocked=true exit=0 messages=1 bytes=10 gone=true",
+            "cold 10 blocked=true exit=0 messages=1 bytes=10 gone=true",
+            "cold-exit 10 blocked=true exit=0 messages=1 bytes=10 gone=true",
+            "up 3000000 blocked=true exit=0 messages=1 bytes=3000000",
+            "cold 3000000 blocked=true exit=0 messages=1 bytes=3000000",
+        ],
+        "stdout: {stdout}"
+    );
+}
+
+/// A parent whose loop was busy while its child sent a last message and
+/// exited, and which then send()s before reading, still gets the message;
+/// the send fails with node's ErrnoException(EPIPE, 'write') -- to its
+/// callback, or as the child's 'error' without one.
+///
+/// The child is gone by then (its exit does not wait for a parent that is
+/// not reading), so the parent's write is answered with a reset, and on
+/// Windows a reset discards what the parent has not read yet: every size
+/// below was lost there. The parent now takes what has arrived off the
+/// socket before each write (oam_core::tcp::tcp_read_ahead).
+///
+/// The 10-byte rows are node v22.22.2's output, byte for byte (measured on
+/// Windows). For the large rows node's child is still alive when the parent
+/// sends (its message does not fit the pipe), so its send succeeds; those
+/// rows pin delivery only.
+#[test]
+fn fork_ipc_a_send_to_an_exited_child_fails_and_its_last_message_is_delivered() {
+    let child_path = write_temp(
+        "fork_ipc_late_send_child.cjs",
+        r#"
+const fs = require('node:fs');
+const [size, base] = process.argv.slice(2);
+process.on('message', () => {});
+process.send({ ready: 1 });
+const t = setInterval(() => {
+  if (!fs.existsSync(base + '.go')) return;
+  clearInterval(t);
+  process.send({ pad: 'x'.repeat(Number(size)) }, () => process.exit(0));
+  fs.writeFileSync(base + '.sent', '1');
+}, 5);
+"#,
+    );
+    let child_str = child_path.to_str().unwrap().replace('\\', "/");
+    let parent_src = r#"
+const { fork } = require('node:child_process');
+const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+const { getSystemErrorName } = require('node:util');
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const shape = (e) => e === null ? 'null'
+  : [e.message, e.code, e.syscall, getSystemErrorName(e.errno), Object.keys(e).join('+')].join(' ');
+let n = 0;
+const run = (size, withCallback) => new Promise((done) => {
+  const base = path.join(os.tmpdir(), `oam-e2e-ipc-late-${process.pid}-${n++}`);
+  const cp = fork('CHILD', [String(size), base], { silent: true });
+  let messages = 0, bytes = 0, sent = 'none';
+  cp.on('error', (e) => { sent = 'error: ' + shape(e); });
+  cp.on('message', (m) => {
+    if (!m.ready) { messages++; bytes += m.pad.length; return; }
+    // From here to the send, the loop does not run: nothing is read.
+    fs.writeFileSync(base + '.go', '1');
+    const t0 = Date.now();
+    while (!fs.existsSync(base + '.sent') && Date.now() - t0 < 30000) sleep(5);
+    sleep(2000);
+    if (withCallback) cp.send({ late: 1 }, (e) => { sent = 'callback: ' + shape(e); });
+    else cp.send({ late: 1 });
+  });
+  cp.on('close', (code) => {
+    for (const s of ['.go', '.sent']) fs.rmSync(base + s, { force: true });
+    done(`${size} ${withCallback ? 'cb' : 'nocb'} exit=${code} messages=${messages} bytes=${bytes}`
+      + (size < 65536 ? ` ${sent}` : ''));
+  });
+});
+(async () => {
+  for (const size of [10, 200000, 3000000]) {
+    for (const withCallback of [true, false]) console.log(await run(size, withCallback));
+  }
+})();
+"#
+    .replace("CHILD", &child_str);
+    let stdout = run_ok("fork_ipc_late_send_parent.cjs", &parent_src);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            "10 cb exit=0 messages=1 bytes=10 callback: write EPIPE EPIPE write EPIPE errno+code+syscall",
+            "10 nocb exit=0 messages=1 bytes=10 error: write EPIPE EPIPE write EPIPE errno+code+syscall",
+            "200000 cb exit=0 messages=1 bytes=200000",
+            "200000 nocb exit=0 messages=1 bytes=200000",
+            "3000000 cb exit=0 messages=1 bytes=3000000",
+            "3000000 nocb exit=0 messages=1 bytes=3000000",
+        ],
+        "stdout: {stdout}"
+    );
+}
+
+/// The channel of a child spawned with an 'ipc' slot may be made by another
+/// process: a launcher that hands the channel's variable on to a process it
+/// starts, and exits. The child's 'exit' then does not wait for that
+/// process to close the channel -- it comes at most a second after the exit
+/// is collected, as node's comes when the direct child exits -- and 'close'
+/// still follows 'disconnect'.
+///
+/// Here the grandchild says hello over the channel and then blocks its loop
+/// for 6 s, so the channel stays open that long. The 'exit' used to wait for
+/// it.
+#[test]
+fn spawn_ipc_exit_does_not_wait_for_a_channel_another_process_holds() {
+    let grandchild = write_temp(
+        "spawn_ipc_held_grandchild.cjs",
+        r#"
+const fs = require('node:fs');
+process.on('message', () => {});
+process.send({ hello: 1 }, () => {
+  fs.writeFileSync(process.argv[2], '1');
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 6000);
+});
+"#,
+    );
+    // Starts the grandchild without waiting for it, waits until it has said
+    // hello (the marker file), and exits.
+    let launcher = if cfg!(windows) {
+        write_temp(
+            "spawn_ipc_held_launcher.cmd",
+            "@echo off\r\n\
+             start \"\" /b \"%~1\" run --no-check \"%~2\" -- \"%~3\"\r\n\
+             :wait\r\n\
+             if exist \"%~3\" exit /b 0\r\n\
+             ping -n 1 127.0.0.1 >nul\r\n\
+             goto wait\r\n",
+        )
+    } else {
+        write_temp(
+            "spawn_ipc_held_launcher.sh",
+            "\"$1\" run --no-check \"$2\" -- \"$3\" &\n\
+             while [ ! -f \"$3\" ]; do sleep 0.05; done\n",
+        )
+    };
+    let marker = std::env::temp_dir().join(format!("oam-e2e-ipc-held-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let fwd = |p: &std::path::Path| p.to_str().unwrap().replace('\\', "/");
+    let parent_src = r#"
+const { spawn } = require('node:child_process');
+const [shell, launcher, grandchild, marker] = ['SHELL', 'LAUNCHER', 'GRANDCHILD', 'MARKER'];
+const args = process.platform === 'win32'
+  ? ['/d', '/c', launcher, process.execPath, grandchild, marker]
+  : [launcher, process.execPath, grandchild, marker];
+const cp = spawn(shell, args, { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+const events = [];
+let hello = 0, exitAt = 0;
+cp.on('message', (m) => { if (m.hello) { hello = Date.now(); events.push('message'); } });
+cp.on('exit', (code) => { exitAt = Date.now(); events.push('exit:' + code); });
+cp.on('disconnect', () => events.push('disconnect'));
+cp.on('close', () => {
+  events.push('close');
+  const waited = exitAt - hello;
+  console.log(events.join(','), hello > 0 && waited < 4000 ? 'prompt' : `held ${waited} ms`);
+});
+"#
+    .replace("SHELL", if cfg!(windows) { "cmd.exe" } else { "sh" })
+    .replace("LAUNCHER", &fwd(&launcher))
+    .replace("GRANDCHILD", &fwd(&grandchild))
+    .replace("MARKER", &fwd(&marker));
+    let stdout = run_ok("spawn_ipc_held_parent.cjs", &parent_src);
+    let _ = std::fs::remove_file(&marker);
+    assert_eq!(
+        stdout.trim_end(),
+        "message,exit:0,disconnect,close prompt",
+        "stdout: {stdout}"
+    );
+}
+
+/// `process.kill(pid, 0)` asks whether a process is still alive, and a child
+/// that has exited is not, though its exit has not been collected yet (the
+/// loop was blocked): ESRCH, as libuv's uv_kill answers it. A real signal to
+/// it is ESRCH too. On Windows the runtime's own handle to the child keeps
+/// the exited process's pid valid, and OpenProcess succeeded on it.
+/// (Windows only: on POSIX the child is a zombie until reaped, and kill(2)
+/// succeeds on a zombie -- under node as well.)
+#[cfg(windows)]
+#[test]
+fn process_kill_probe_of_an_exited_child_is_esrch() {
+    let stdout = run_ok(
+        "process_kill_exited_child.cjs",
+        r#"
+const { spawn } = require('node:child_process');
+const cp = spawn(process.execPath, ['-e', '0'], { stdio: 'ignore' });
+cp.on('spawn', () => {
+  // Long enough for the child to have exited; the exit is not collected.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);
+  const r = [];
+  for (const sig of [0, 'SIGTERM']) {
+    try { process.kill(cp.pid, sig); r.push(sig + ':alive'); }
+    catch (e) { r.push(`${sig}:${e.code}:${e.syscall}`); }
+  }
+  console.log(r.join(' '));
+});
+cp.on('exit', (code) => console.log('exit', code));
+"#,
+    );
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        ["0:ESRCH:kill SIGTERM:ESRCH:kill", "exit 0"],
+        "stdout: {stdout}"
+    );
+}
+
+/// A forked child receives messages whichever EventEmitter method added its
+/// `'message'` listener. Only `process.on` (and `once`, through it) started
+/// the channel, so a child using `addListener` or a prepend form never heard
+/// the parent.
+#[test]
+fn fork_ipc_message_listener_added_by_any_method() {
+    let parent_template = r#"
+import { fork } from 'node:child_process';
+const child = fork('CHILD');
+child.on('message', (msg) => console.log('METHOD echo=' + msg.echo));
+child.on('exit', (code) => console.log('METHOD exit=' + code));
+child.send({ data: 'ping' });
+"#;
+    for method in [
+        "addListener",
+        "prependListener",
+        "prependOnceListener",
+        "once",
+    ] {
+        let child_path = write_temp(
+            &format!("fork_child_{method}.mjs"),
+            &format!(
+                r#"
+process.{method}('message', (msg) => {{
+  process.send({{ echo: msg.data }});
+  process.disconnect();
+}});
+"#
+            ),
+        );
+        let child_str = child_path.to_str().unwrap().replace('\\', "/");
+        let parent_src = parent_template
+            .replace("CHILD", &child_str)
+            .replace("METHOD", method);
+        let stdout = run_ok(&format!("fork_parent_{method}.mjs"), &parent_src);
+        assert!(
+            stdout.contains(&format!("{method} echo=ping")),
+            "{method}: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("{method} exit=0")),
+            "{method}: {stdout}"
+        );
+    }
 }
 
 #[test]
@@ -28388,16 +33626,327 @@ fn vm_script_filename_option() {
         "vm_script_filename.cjs",
         r#"
         const vm = require('vm');
-        const s = new vm.Script('1+1', { filename: 'test.js', lineOffset: 5 });
-        console.log('fname=' + s._filename);
-        console.log('line=' + s._lineOffset);
-        const s2 = new vm.Script('2+2', 'legacy.js');
-        console.log('legacy=' + s2._filename);
+        // Observed the way a program observes them -- through where a thrown
+        // error says it came from -- not through fields of oam's Script that
+        // node's does not have. The throw is on source line 2, so with
+        // lineOffset 5 the frame is line 7 (node v22.22.2: test.js:7 and
+        // legacy.js:1).
+        const where = (name, run) => {
+          try { run(); return 'NOTHROW'; }
+          catch (e) { const m = new RegExp(name + ':(\\d+)').exec(String(e.stack)); return m ? m[0] : 'ABSENT'; }
+        };
+        const s = new vm.Script("\nthrow new Error('boom')", { filename: 'test.js', lineOffset: 5 });
+        console.log('frame=' + where('test\\.js', () => s.runInThisContext()));
+        const s2 = new vm.Script("throw new Error('boom')", 'legacy.js');
+        console.log('legacy=' + where('legacy\\.js', () => s2.runInThisContext()));
     "#,
     );
-    assert!(stdout.contains("fname=test.js"), "{stdout}");
-    assert!(stdout.contains("line=5"), "{stdout}");
-    assert!(stdout.contains("legacy=legacy.js"), "{stdout}");
+    assert!(stdout.contains("frame=test.js:7"), "{stdout}");
+    assert!(stdout.contains("legacy=legacy.js:1"), "{stdout}");
+}
+
+/// `net.isIPv6` counts the groups around a `::` and takes a dotted quad only
+/// as the last group; `net.BlockList` evaluates its range and subnet rules
+/// (and compares across families as node does); `socket.setTimeout` past
+/// 2^31-1 is truncated with a warning instead of firing after 1 ms. Every
+/// line is node v22.22.2's for the same script.
+#[test]
+fn net_is_ipv6_block_list_and_timeout_truncation_match_node() {
+    let stdout = run_ok(
+        "net_ipv6_blocklist_timeout.cjs",
+        r#"
+const net = require('net');
+for (const a of ['1:2:3:4:5:6:7:8::', '1:2:3:4:5:6:7::8', '1.2.3.4::1', '1:2:3:4:5:6::1.2.3.4',
+  '1:2:3:4:5:6:7::', '1:2:3:4:5::1.2.3.4', '::', '::1', '1::', '::ffff:1.2.3.4', '1:2:3:4:5:6:7:8', 'fe80::1%eth0']) {
+  console.log('v6 ' + a + ' ' + net.isIPv6(a));
+}
+const bl = new net.BlockList();
+bl.addSubnet('10.0.0.0', 8);
+bl.addRange('192.168.1.5', '192.168.1.9');
+bl.addAddress('1.2.3.4');
+bl.addSubnet('fe80::', 10, 'ipv6');
+console.log('subnet ' + bl.check('10.1.2.3') + ' ' + bl.check('11.0.0.1'));
+console.log('range ' + bl.check('192.168.1.5') + ' ' + bl.check('192.168.1.9') + ' ' + bl.check('192.168.1.10'));
+console.log('address ' + bl.check('1.2.3.4') + ' ' + bl.check('1.2.3.5'));
+console.log('v6 subnet ' + bl.check('fe80::1', 'ipv6') + ' ' + bl.check('fec0::1', 'ipv6') + ' ' + bl.check('fe80::1'));
+console.log('mapped ' + bl.check('::ffff:10.1.2.3', 'ipv6') + ' ' + bl.check('::ffff:a01:203', 'ipv6'));
+console.log('family case ' + bl.check('10.1.2.3', 'IPv4'));
+console.log('socket address ' + bl.check(new net.SocketAddress({ address: '10.9.9.9' })));
+console.log('not an address ' + bl.check('example'));
+console.log('rules ' + JSON.stringify(bl.rules));
+const code = (fn) => { try { fn(); return 'no throw'; } catch (e) { return e.code; } };
+console.log('bad prefix ' + code(() => bl.addSubnet('10.0.0.0', 40)));
+console.log('reversed range ' + code(() => bl.addRange('10.0.0.9', '10.0.0.1')));
+console.log('bad address ' + code(() => bl.addAddress('example')));
+console.log('bad type ' + code(() => bl.check(5)));
+const warnings = [];
+process.on('warning', (w) => warnings.push(w.name));
+const s = new net.Socket();
+let timedOut = false;
+s.on('timeout', () => { timedOut = true; });
+s.setTimeout(2 ** 31);
+console.log('timeout property ' + s.timeout);
+setTimeout(() => {
+  console.log('timed out ' + timedOut + ' warnings ' + warnings.join(','));
+  s.destroy();
+}, 100);
+"#,
+    );
+    let expected = r#"v6 1:2:3:4:5:6:7:8:: false
+v6 1:2:3:4:5:6:7::8 false
+v6 1.2.3.4::1 false
+v6 1:2:3:4:5:6::1.2.3.4 false
+v6 1:2:3:4:5:6:7:: true
+v6 1:2:3:4:5::1.2.3.4 true
+v6 :: true
+v6 ::1 true
+v6 1:: true
+v6 ::ffff:1.2.3.4 true
+v6 1:2:3:4:5:6:7:8 true
+v6 fe80::1%eth0 true
+subnet true false
+range true true false
+address true false
+v6 subnet true false false
+mapped true true
+family case true
+socket address true
+not an address false
+rules ["Subnet: IPv6 fe80::/10","Address: IPv4 1.2.3.4","Range: IPv4 192.168.1.5-192.168.1.9","Subnet: IPv4 10.0.0.0/8"]
+bad prefix ERR_OUT_OF_RANGE
+reversed range ERR_INVALID_ARG_VALUE
+bad address ERR_INVALID_ADDRESS
+bad type ERR_INVALID_ARG_TYPE
+timeout property 2147483648
+timed out false warnings TimeoutOverflowWarning"#;
+    assert_eq!(stdout.replace("\r\n", "\n"), expected);
+}
+
+/// punycode's `toASCII` / `toUnicode` leave an address's local part alone,
+/// split labels on the IDNA separators, and throw punycode.js's errors for a
+/// label that does not decode. node v22.22.2's lines.
+#[test]
+fn punycode_maps_domains_and_throws_like_punycode_js() {
+    let stdout = run_ok(
+        "punycode_map_domain.cjs",
+        r#"
+process.noDeprecation = true;
+const p = require('punycode');
+const msg = (fn) => { try { return String(fn()); } catch (e) { return e.name + ': ' + e.message; } };
+console.log(p.toASCII('user@mañana.com'));
+console.log(p.toASCII('mañana。com'));
+console.log(p.toASCII('mañana．com｡org'));
+console.log(p.toUnicode('user@xn--maana-pta.com') === 'user@mañana.com');
+console.log(p.toUnicode('XN--maana-pta.com'));
+console.log(msg(() => p.toUnicode('xn--é.com')));
+console.log(msg(() => p.decode('99999999999')));
+console.log(msg(() => p.decode('é-a')));
+console.log(msg(() => p.decode('a-é')));
+"#,
+    );
+    let expected = "user@xn--maana-pta.com\n\
+xn--maana-pta.com\n\
+xn--maana-pta.com.org\n\
+true\n\
+XN--maana-pta.com\n\
+RangeError: Invalid input\n\
+RangeError: Overflow: input needs wider integers to process\n\
+RangeError: Illegal input >= 0x80 (not a basic code point)\n\
+RangeError: Invalid input";
+    assert_eq!(stdout.replace("\r\n", "\n"), expected);
+}
+
+/// `performance.measure` derives the start from `end - duration`, reads an
+/// end mark whatever the start is, and refuses a missing mark with a
+/// SyntaxError DOMException. node v22.22.2's lines.
+#[test]
+fn perf_hooks_measure_start_end_duration_match_node() {
+    let stdout = run_ok(
+        "perf_measure_start_end_duration.cjs",
+        r#"
+const { performance } = require('perf_hooks');
+const show = (m) => m.startTime + ' ' + m.duration;
+const err = (fn) => { try { fn(); return 'no throw'; } catch (e) { return e.name + ' ' + e.message; } };
+console.log('end+duration ' + show(performance.measure('m1', { end: 100, duration: 30 })));
+console.log('start+duration ' + show(performance.measure('m2', { start: 10, duration: 5 })));
+performance.mark('e', { startTime: 50 });
+console.log('end mark only ' + show(performance.measure('m3', undefined, 'e')));
+console.log('start+end ' + show(performance.measure('m4', { start: 10, end: 'e' })));
+console.log('missing start ' + err(() => performance.measure('x', 'nope')));
+console.log('missing end ' + err(() => performance.measure('x', undefined, 'nope')));
+console.log('missing option ' + err(() => performance.measure('x', { start: 'nope' })));
+console.log('all three ' + err(() => performance.measure('x', { start: 1, end: 2, duration: 3 })));
+console.log('options and endMark ' + err(() => performance.measure('x', { start: 1 }, 'e')));
+"#,
+    );
+    let expected = r#"end+duration 70 30
+start+duration 10 5
+end mark only 0 50
+start+end 10 40
+missing start SyntaxError The "nope" performance mark has not been set
+missing end SyntaxError The "nope" performance mark has not been set
+missing option SyntaxError The "nope" performance mark has not been set
+all three TypeError Must not have options.start, options.end, and options.duration specified
+options and endMark TypeError endMark must not be specified"#;
+    assert_eq!(stdout.replace("\r\n", "\n"), expected);
+}
+
+/// `_http_common`'s HTTPParser: a response the caller says has no body (a
+/// HEAD's) and no framing keeps the connection, so the next one parses; and
+/// a header value still arriving counts against the head limit. node
+/// v22.22.2's lines.
+#[test]
+fn http_parser_skipped_body_keeps_alive_and_value_overflow() {
+    let stdout = run_ok(
+        "http_parser_skip_body_value_overflow.cjs",
+        r#"
+const { HTTPParser } = require('_http_common');
+const show = (r) => (r instanceof Error ? r.code : r);
+{
+  const p = new HTTPParser();
+  p.initialize(HTTPParser.RESPONSE, {});
+  let heads = 0, done = 0;
+  p[HTTPParser.kOnHeadersComplete] = () => { heads++; return 1; };
+  p[HTTPParser.kOnMessageComplete] = () => { done++; };
+  const one = Buffer.from('HTTP/1.1 200 OK\r\n\r\n');
+  console.log('first ' + show(p.execute(one)) + ' second ' + show(p.execute(one)) + ' heads ' + heads + ' done ' + done);
+}
+{
+  const p = new HTTPParser();
+  p.initialize(HTTPParser.RESPONSE, {}, 1024);
+  p[HTTPParser.kOnHeadersComplete] = () => 0;
+  let r = p.execute(Buffer.from('HTTP/1.1 200 OK\r\nX: '));
+  let fed = 0;
+  const filler = Buffer.alloc(400, 0x61);
+  while (!(r instanceof Error) && fed < 8000) { r = p.execute(filler); fed += filler.length; }
+  console.log('overflow ' + show(r) + ' after ' + fed);
+}
+"#,
+    );
+    let expected = "first 19 second 19 heads 2 done 2\noverflow HPE_HEADER_OVERFLOW after 1200";
+    assert_eq!(stdout.replace("\r\n", "\n"), expected);
+}
+
+/// A `net.Socket`'s `setEncoding` decodes through one StringDecoder (a
+/// character split across two reads arrives whole, `hex` works, what is left
+/// at the end is flushed, an unknown encoding is refused); `connect()` from
+/// the socket's own 'close' listener reconnects it; a write callback that
+/// throws is an uncaught exception and the writes and end() after it still
+/// complete; a `connect()` that refuses its arguments leaves `connecting`
+/// true. Each line is node v22.22.2's (the uncaught exception's position
+/// among the callbacks is not compared).
+#[test]
+fn net_socket_set_encoding_reconnect_and_throwing_write_callback() {
+    let stdout = run_ok(
+        "net_set_encoding_reconnect.cjs",
+        r#"
+const net = require('net');
+const euro = Buffer.from('€');
+const server = net.createServer((conn) => {
+  conn.on('error', () => {});
+  conn.once('data', (d) => {
+    const mode = String(d);
+    if (mode === 'split') {
+      conn.write(euro.subarray(0, 1));
+      setTimeout(() => conn.end(euro.subarray(1)), 100);
+    } else if (mode === 'hex') {
+      conn.end(Buffer.from([0xde, 0xad]));
+    } else if (mode === 'cut') {
+      conn.end(euro.subarray(0, 2));
+    } else {
+      conn.end('pong');
+    }
+  });
+});
+const escaped = (s) => JSON.stringify(s).replace(/[^\x20-\x7e]/g, (c) => 'U+' + c.charCodeAt(0).toString(16));
+function exchange(port, mode, encoding) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    const c = net.connect(port, '127.0.0.1', () => c.write(mode));
+    c.setEncoding(encoding);
+    c.on('data', (d) => chunks.push(d));
+    c.on('close', () => resolve(chunks));
+  });
+}
+server.listen(0, '127.0.0.1', async () => {
+  const port = server.address().port;
+  const split = await exchange(port, 'split', 'utf8');
+  console.log('split ' + escaped(split.join('')) + ' strings ' + split.every((d) => typeof d === 'string'));
+  console.log('hex ' + escaped((await exchange(port, 'hex', 'hex')).join('')));
+  console.log('cut ' + escaped((await exchange(port, 'cut', 'utf8')).join('')));
+  try {
+    new net.Socket().setEncoding('nope');
+    console.log('unknown encoding accepted');
+  } catch (e) {
+    console.log('unknown encoding ' + e.code);
+  }
+
+  await new Promise((resolve) => {
+    const s = new net.Socket();
+    let connects = 0;
+    let data = '';
+    s.on('connect', () => {
+      connects++;
+      console.log('connect ' + connects + ' destroyed ' + s.destroyed + ' writable ' + s.writable);
+      s.write('ping');
+    });
+    s.on('data', (d) => { data += d; });
+    s.on('close', () => {
+      console.log('close ' + connects + ' destroyed ' + s.destroyed + ' data ' + data);
+      data = '';
+      if (connects < 2) {
+        s.connect(port, '127.0.0.1');
+        console.log('reconnecting destroyed ' + s.destroyed + ' connecting ' + s.connecting);
+      } else {
+        resolve();
+      }
+    });
+    s.connect(port, '127.0.0.1');
+  });
+
+  await new Promise((resolve) => {
+    process.once('uncaughtException', (e) => console.log('uncaught ' + e.message));
+    const s = net.connect(port, '127.0.0.1', () => {
+      s.write('a', () => { throw new Error('callback threw'); });
+      s.write('b', () => console.log('second write callback'));
+      s.end(() => console.log('end callback'));
+    });
+    s.on('finish', () => console.log('finish'));
+    s.on('data', () => {});
+    s.on('close', resolve);
+  });
+
+  const bad = new net.Socket();
+  try {
+    bad.connect({ port: 70000 });
+  } catch (e) {
+    console.log('bad port ' + e.code + ' connecting ' + bad.connecting);
+  }
+  bad.destroy();
+  server.close();
+});
+"#,
+    );
+    let stdout = stdout.replace("\r\n", "\n");
+    let ordered = r#"split "U+20ac" strings true
+hex "dead"
+cut "U+fffd"
+unknown encoding ERR_UNKNOWN_ENCODING
+connect 1 destroyed false writable true
+close 1 destroyed true data pong
+reconnecting destroyed false connecting true
+connect 2 destroyed false writable true
+close 2 destroyed true data pong
+"#;
+    assert!(stdout.starts_with(ordered), "{stdout}");
+    for line in [
+        "uncaught callback threw",
+        "second write callback",
+        "end callback\nfinish",
+        "bad port ERR_SOCKET_BAD_PORT connecting true",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?}: {stdout}");
+    }
 }
 
 #[test]
@@ -28415,6 +33964,78 @@ fn vm_context_preserves_existing_tag() {
     );
     assert!(stdout.contains("tag=[object Custom]"), "{stdout}");
     assert!(stdout.contains("same=true"), "{stdout}");
+}
+
+/// `SourceTextModule#link` records the whole graph and then instantiates
+/// its root once, so an import cycle links, and a link that cannot complete
+/// rejects instead of resolving with the module still unlinked. The expected
+/// lines are node v22's for the same script.
+#[test]
+fn vm_source_text_module_link_graph() {
+    let main = write_temp(
+        "vm_module_link_graph.mjs",
+        r#"
+        import vm from 'node:vm';
+        const show = (e) => `${e.code} | ${e.message}`;
+        {
+            const a = new vm.SourceTextModule('import { y } from "b"; export const x = y + 1;', { identifier: 'a' });
+            const b = new vm.SourceTextModule('import { x } from "a"; export const y = 2; export const readX = () => x;', { identifier: 'b' });
+            const graph = { a, b };
+            await a.link((specifier) => graph[specifier]);
+            console.log('cycle', a.status, b.status);
+            await a.evaluate();
+            console.log('cycle', a.status, b.status, a.namespace.x, b.namespace.readX());
+        }
+        {
+            const a = new vm.SourceTextModule('import "b";', { identifier: 'a' });
+            const b = new vm.SourceTextModule('export default 1;', {
+                identifier: 'b',
+                context: vm.createContext({}),
+            });
+            await a.link(() => b).then(() => console.log('context ok'), (e) => console.log('context', show(e)));
+        }
+        {
+            const d = new vm.SourceTextModule('import "e"; export const d = 1;', { identifier: 'd' });
+            const e = new vm.SourceTextModule('export const e = 1;', { identifier: 'e' });
+            const x = new vm.SourceTextModule('import "d";', { identifier: 'x' });
+            const y = new vm.SourceTextModule('import "d";', { identifier: 'y' });
+            let release;
+            const gate = new Promise((resolve) => { release = resolve; });
+            const linker = async (specifier) => {
+                if (specifier === 'e') {
+                    await gate;
+                    return e;
+                }
+                return d;
+            };
+            const first = x.link(linker);
+            await y.link(linker).then(() => console.log('shared ok'), (err) => console.log('shared', show(err)));
+            release();
+            await first;
+            console.log('shared', x.status, y.status, d.status, e.status);
+        }
+    "#,
+    );
+    let script = main.to_str().unwrap();
+    let out = oam(&["--experimental-vm-modules", "run", script, "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stderr: {}\nstdout: {stdout}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        [
+            "cycle linked linked",
+            "cycle evaluated evaluated 3 3",
+            "context ERR_VM_MODULE_DIFFERENT_CONTEXT | Linked modules must use the same context",
+            "shared ERR_VM_MODULE_LINK_FAILURE | request for 'e' is from a module not been linked",
+            "shared linked unlinked linked linked",
+        ],
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -28502,8 +34123,8 @@ fn punycode_encode_decode() {
         "pure ASCII decode: {stdout}"
     );
     assert!(
-        stdout.contains("encEmoji="),
-        "emoji encode produced output: {stdout}"
+        stdout.lines().any(|line| line.trim() == "encEmoji=xj8h"),
+        "emoji encode (U+1F37A is xj8h): {stdout}"
     );
     assert!(
         stdout.contains("emojiRt=true"),
@@ -28575,6 +34196,131 @@ fn perf_hooks_mark_measure_entries() {
     assert!(stdout.contains("byname_start=1"), "{stdout}");
     assert!(stdout.contains("byname_type=1"), "{stdout}");
     assert!(stdout.contains("entry_class=true"), "{stdout}");
+}
+
+/// The global `performance` is `perf_hooks.performance`, as in node: a mark
+/// made on the global is a `PerformanceEntry` that `perf_hooks.performance`
+/// lists and a `PerformanceObserver` hears, and the global stays assignable.
+/// They used to be two implementations with separate entry lists.
+#[test]
+fn global_performance_is_perf_hooks_performance() {
+    let stdout = run_ok(
+        "perf_global_identity.cjs",
+        r#"
+        const seen = [];
+        const globalMark = performance.mark('from-global');
+        const { performance: hooked, PerformanceObserver, PerformanceEntry } = require('perf_hooks');
+        console.log('same=' + (performance === hooked));
+        console.log('entry=' + (globalMark instanceof PerformanceEntry));
+        console.log('listed=' + hooked.getEntriesByName('from-global').length);
+        new PerformanceObserver((list) => {
+          for (const e of list.getEntries()) seen.push(e.name);
+        }).observe({ entryTypes: ['mark'] });
+        globalThis.performance.mark('observed');
+        setTimeout(() => console.log('seen=' + seen.join(',')), 20);
+        console.log('now='+ (typeof performance.now() === 'number' && performance.timeOrigin > 0));
+        globalThis.performance = { replaced: true };
+        console.log('assignable=' + (performance.replaced === true));
+        globalThis.performance = hooked;
+    "#,
+    );
+    assert!(stdout.contains("same=true"), "{stdout}");
+    assert!(stdout.contains("entry=true"), "{stdout}");
+    assert!(stdout.contains("listed=1"), "{stdout}");
+    assert!(stdout.contains("seen=observed"), "{stdout}");
+    assert!(stdout.contains("now=true"), "{stdout}");
+    assert!(stdout.contains("assignable=true"), "{stdout}");
+}
+
+/// A client's `ALPNProtocols` array goes through the same conversion as a
+/// server's, which is node's: the names are strings (every expected line is
+/// what node v22.22.2 prints for this script). The client used to have its
+/// own conversion, which accepted a Buffer name.
+#[test]
+fn tls_connect_alpn_names_are_validated_as_node_validates_them() {
+    let stdout = run_ok(
+        "tls_connect_alpn_names.cjs",
+        r#"
+const tls = require('tls');
+for (const [label, alpn] of [['number', [5]], ['buffer', [Buffer.from('h2')]], ['long', ['x'.repeat(256)]]]) {
+  try {
+    const s = tls.connect({ host: '127.0.0.1', port: 9, ALPNProtocols: alpn });
+    s.on('error', () => {});
+    s.destroy();
+    console.log(label + ': no throw');
+  } catch (e) {
+    console.log(label + ': ' + e.name + ' ' + e.code + ' ' + e.message);
+  }
+}
+"#,
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "number: TypeError ERR_INVALID_ARG_TYPE The \"string\" argument must be of type string or an instance of Buffer or ArrayBuffer. Received type number (5)",
+            "buffer: TypeError ERR_INVALID_ARG_TYPE argument must be a string",
+            "long: RangeError ERR_OUT_OF_RANGE The byte length of the protocol at index 0 exceeds the maximum length. It must be <= 255. Received 256",
+        ],
+        "stdout: {stdout}"
+    );
+}
+
+/// `navigator.hardwareConcurrency` is `os.availableParallelism()`, as node's
+/// is (it was a constant 1).
+#[test]
+fn navigator_hardware_concurrency_is_available_parallelism() {
+    let stdout = run_ok(
+        "navigator_hardware_concurrency.cjs",
+        "console.log('same=' + (navigator.hardwareConcurrency === require('os').availableParallelism()));\n",
+    );
+    assert!(stdout.contains("same=true"), "{stdout}");
+}
+
+/// A Timeout's legacy fields and a primitive id, as node v22.22.2 has them
+/// (every expected line is what node prints for this script): `_repeat` is
+/// the period for an interval and null for a timeout, `_idleTimeout` the
+/// coerced duration, a new `_repeat` set from an interval's callback is the
+/// next period, and `clearTimeout` of the id as a string (a handle used as an
+/// object key) clears the handle.
+#[test]
+fn timeout_repeat_is_a_duration_and_string_ids_clear() {
+    let stdout = run_ok(
+        "timer_repeat_and_string_id.cjs",
+        r#"
+const a = setInterval(() => {}, 50); console.log('interval', a._repeat, a._idleTimeout); clearInterval(a);
+const b = setTimeout(() => {}, '30'); console.log('timeout', b._repeat, b._idleTimeout); clearTimeout(b);
+const c = setInterval(() => {}); console.log('default', c._repeat, c._idleTimeout); clearInterval(c);
+const keyed = {};
+const h = setTimeout(() => console.log('string id fired'), 200);
+keyed[h] = 1;
+for (const k in keyed) clearTimeout(k);
+console.log('cleared', h._destroyed, process.getActiveResourcesInfo().filter((x) => x === 'Timeout').length);
+let n = 0;
+let last = Date.now();
+const i = setInterval(() => {
+  const now = Date.now();
+  n++;
+  console.log('fire', n, n === 2 && now - last >= 150 ? 'long' : '-', i._repeat, i._idleTimeout);
+  last = now;
+  if (n === 1) i._repeat = 200;
+  if (n === 2) clearInterval(i);
+}, 20);
+"#,
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "interval 50 50",
+            "timeout null 30",
+            "default 1 1",
+            "cleared true 0",
+            "fire 1 - 20 20",
+            "fire 2 long 200 200",
+        ],
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -28779,8 +34525,9 @@ fn worker_threads_share_env_symbol() {
         console.log('type=' + typeof wt.SHARE_ENV);
         console.log('is_symbol=' + (typeof wt.SHARE_ENV === 'symbol'));
         console.log('desc=' + wt.SHARE_ENV.description);
-        // SHARE_ENV should not equal any other symbol
-        console.log('unique=' + (wt.SHARE_ENV !== Symbol('nodejs.worker_threads.SHARE_ENV')));
+        // node: the registered symbol, Symbol.for(...). (Comparing against a
+        // fresh Symbol() -- the old check -- is unequal for any value.)
+        console.log('registered=' + (wt.SHARE_ENV === Symbol.for('nodejs.worker_threads.SHARE_ENV')));
     "#,
     );
     assert!(stdout.contains("type=symbol"), "{stdout}");
@@ -28789,7 +34536,7 @@ fn worker_threads_share_env_symbol() {
         stdout.contains("desc=nodejs.worker_threads.SHARE_ENV"),
         "{stdout}"
     );
-    assert!(stdout.contains("unique=true"), "{stdout}");
+    assert!(stdout.contains("registered=true"), "{stdout}");
 }
 
 #[test]
@@ -28972,7 +34719,8 @@ fn perf_hooks_measure_throws_on_missing_mark() {
         "missing opts.start mark: {stdout}"
     );
     assert!(
-        stdout.contains("err=Failed to execute"),
+        // node v22's exact text (a DOMException SyntaxError, code 12).
+        stdout.contains("err=The \"nonexistent\" performance mark has not been set"),
         "error message: {stdout}"
     );
 }
@@ -29197,7 +34945,11 @@ fn readline_clearline_invalid_dir() {
     "#,
     );
     // This documents current behavior -- undefined writes ESC[2K (whole line)
-    assert!(stdout.contains("valid_len="), "valid clearLine: {stdout}");
+    // ESC [ 2 K: four characters.
+    assert!(
+        stdout.lines().any(|line| line.trim() == "valid_len=4"),
+        "valid clearLine: {stdout}"
+    );
     assert!(
         stdout.contains("undef_wrote=true"),
         "undefined dir writes: {stdout}"
@@ -29245,8 +34997,7 @@ fn install_missing_lockfile_fails() {
         .args(["install"])
         .current_dir(dir)
         .env("OAM_CACHE_DIR", dir.join("oam-cache"))
-        .output()
-        .expect("oam binary runs");
+        .output_within_deadline();
     assert!(
         !out.status.success(),
         "should fail without lockfile; stdout: {} stderr: {}",
@@ -29282,8 +35033,7 @@ fn install_parses_empty_lockfile_v3() {
         .args(["install"])
         .current_dir(dir)
         .env("OAM_CACHE_DIR", dir.join("oam-cache"))
-        .output()
-        .expect("oam binary runs");
+        .output_within_deadline();
     assert!(
         out.status.success(),
         "should succeed with empty lockfile; stdout: {} stderr: {}",
@@ -29342,8 +35092,8 @@ fn compile_produces_standalone_binary_that_runs() {
     // Run the compiled binary -- it should execute the embedded JS
     // without any arguments.
     let run_out = std::process::Command::new(&output)
-        .output()
-        .expect("compiled binary runs");
+        .suite_env()
+        .output_within_deadline();
     let _ = std::fs::remove_file(&output);
     let stdout = String::from_utf8_lossy(&run_out.stdout);
     assert!(
@@ -29392,8 +35142,8 @@ fn compiled_binary_runs_its_embedded_script_as_the_main_module() {
         String::from_utf8_lossy(&compile_out.stderr)
     );
     let run_out = std::process::Command::new(&output)
-        .output()
-        .expect("compiled binary runs");
+        .suite_env()
+        .output_within_deadline();
     let _ = std::fs::remove_file(&output);
     let stdout = String::from_utf8_lossy(&run_out.stdout);
     assert!(
@@ -29442,8 +35192,8 @@ fn compiled_binary_runs_exit_listeners_before_the_fatal_report() {
         String::from_utf8_lossy(&compile_out.stderr)
     );
     let run_out = std::process::Command::new(&output)
-        .output()
-        .expect("compiled binary runs");
+        .suite_env()
+        .output_within_deadline();
     let _ = std::fs::remove_file(&output);
     let stderr = String::from_utf8_lossy(&run_out.stderr);
     assert_eq!(run_out.status.code(), Some(1), "stderr={stderr}");
@@ -29560,8 +35310,8 @@ fn compile_binary_passes_script_args() {
     assert!(compile_out.status.success());
     let run_out = std::process::Command::new(&output)
         .args(["--", "foo", "bar"])
-        .output()
-        .expect("compiled binary runs");
+        .suite_env()
+        .output_within_deadline();
     let _ = std::fs::remove_file(&output);
     let stdout = String::from_utf8_lossy(&run_out.stdout);
     assert!(
@@ -29637,8 +35387,7 @@ fn compile_embeds_bytecode_consumed_without_disk_cache() {
     let run_out = std::process::Command::new(&output)
         .env("OAM_CACHE_DIR", &run_cache)
         .without_ambient_compile_cache()
-        .output()
-        .expect("compiled binary runs");
+        .output_within_deadline();
     let _ = std::fs::remove_file(&output);
 
     let stdout = String::from_utf8_lossy(&run_out.stdout);
@@ -29780,8 +35529,8 @@ fn compile_foreign_carrier_embeds_js_only() {
         "the JS-only notice must explain why: {stderr}"
     );
     let run_out = std::process::Command::new(&output)
-        .output()
-        .expect("compiled binary runs");
+        .suite_env()
+        .output_within_deadline();
     let _ = std::fs::remove_file(&carrier);
     let _ = std::fs::remove_file(&output);
     assert!(
@@ -29886,8 +35635,7 @@ fn process_exit_still_prints_queued_loader_warnings() {
         ])
         .current_dir(&dir)
         .env("OAM_CACHE_DIR", &dir)
-        .output()
-        .expect("oam binary runs");
+        .output_within_deadline();
     assert_eq!(
         out.status.code(),
         Some(42),
@@ -29932,8 +35680,8 @@ fn compile_binary_argv1_is_filename() {
         String::from_utf8_lossy(&compile_out.stderr)
     );
     let run_out = std::process::Command::new(&output)
-        .output()
-        .expect("compiled binary runs");
+        .suite_env()
+        .output_within_deadline();
     let _ = std::fs::remove_file(&output);
     let stdout = String::from_utf8_lossy(&run_out.stdout);
     assert!(
@@ -29966,15 +35714,9 @@ fn record_then_replay_is_deterministic() {
     .unwrap();
     let recfile = dir.join("trace.jsonl");
 
-    let run = |args: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-            .args(args)
-            .output()
-            .expect("oam runs")
-    };
-
+    // Both runs go through `oam`: the suite's isolated cache and the deadline.
     // Record: values are live; the trace is flushed on clean exit.
-    let rec = run(&[
+    let rec = oam(&[
         "run",
         "--record",
         recfile.to_str().unwrap(),
@@ -29994,7 +35736,7 @@ fn record_then_replay_is_deterministic() {
 
     // Replay: Math.random / Date.now / performance.now return the recorded
     // values, so stdout matches the recorded run exactly.
-    let rep = run(&[
+    let rep = oam(&[
         "run",
         "--replay",
         recfile.to_str().unwrap(),
@@ -30010,6 +35752,96 @@ fn record_then_replay_is_deterministic() {
         recorded, replayed,
         "replay output must reproduce the recorded run exactly"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A program that leaves through process.exit() drops nothing on the way out;
+// its trace is written from the exit path and replays like any other.
+#[test]
+fn record_writes_the_trace_when_the_script_calls_process_exit() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("oam-rec-exit-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("exits.mjs");
+    std::fs::write(
+        &script,
+        "console.log('r=' + Math.random());\n\
+         console.log('d=' + Date.now());\n\
+         process.exit(0);\n",
+    )
+    .unwrap();
+    let recfile = dir.join("trace.jsonl");
+
+    let rec = oam(&[
+        "run",
+        "--record",
+        recfile.to_str().unwrap(),
+        script.to_str().unwrap(),
+    ]);
+    assert!(
+        rec.status.success(),
+        "record run failed: {}",
+        String::from_utf8_lossy(&rec.stderr)
+    );
+    assert!(
+        recfile.is_file(),
+        "a run ending in process.exit() must still write the trace"
+    );
+    let rep = oam(&[
+        "run",
+        "--replay",
+        recfile.to_str().unwrap(),
+        script.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&rec.stdout),
+        String::from_utf8_lossy(&rep.stdout),
+        "replay output must reproduce the recorded run exactly"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --replay with a trace that is missing or not a trace does not run the
+// program: it would run live, which is what a replay is asked not to do.
+#[test]
+fn replay_with_an_unusable_trace_does_not_run_the_program() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("oam-rep-bad-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("ran.mjs");
+    std::fs::write(&script, "console.log('program-ran');\n").unwrap();
+    let malformed = dir.join("malformed.jsonl");
+    std::fs::write(&malformed, "not a trace\n").unwrap();
+
+    for trace in [dir.join("no-such-trace.jsonl"), malformed] {
+        let out = oam(&[
+            "run",
+            "--replay",
+            trace.to_str().unwrap(),
+            script.to_str().unwrap(),
+        ]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "an unusable trace must fail the run ({}): {stdout}{stderr}",
+            trace.display()
+        );
+        assert!(
+            !stdout.contains("program-ran"),
+            "the program must not run live ({}): {stdout}",
+            trace.display()
+        );
+        assert!(stderr.contains("replay:"), "{stderr}");
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -30059,11 +35891,11 @@ const pubKey2 = crypto.createPublicKey({ format: "jwk", key: pubJwk });
 
 const signer = crypto.createSign("SHA256");
 signer.update("ec jwk round trip");
-const sig = signer.sign(privKey2.export());
+const sig = signer.sign(privKey2.export({ type: "pkcs8", format: "pem" }));
 
 const verifier = crypto.createVerify("SHA256");
 verifier.update("ec jwk round trip");
-const valid = verifier.verify(pubKey2.export(), sig);
+const valid = verifier.verify(pubKey2.export({ type: "spki", format: "pem" }), sig);
 console.log("ec_jwk_round_trip=" + valid);
 "#,
     );
@@ -30344,12 +36176,10 @@ fn http2_module_shape_and_server_listens() {
          session.close();\n\
          server.close();",
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    assert_true_lines(
+        &stdout,
+        &["server_created:", "server_listening:", "client_connected:"],
+    );
 }
 
 #[test]
@@ -30363,12 +36193,16 @@ fn cluster_basic_api() {
          console.log('has_workers:', typeof cluster.workers === 'object');\n\
          console.log('sched_rr:', cluster.SCHED_RR === 2);",
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    assert_true_lines(
+        &stdout,
+        &[
+            "is_primary:",
+            "is_worker:",
+            "has_fork:",
+            "has_workers:",
+            "sched_rr:",
+        ],
+    );
 }
 
 #[test]
@@ -30395,6 +36229,10 @@ fn cluster_is_primary_and_fork() {
     assert!(
         stdout.contains("worker_exited: true"),
         "worker should exit: {stdout}"
+    );
+    assert!(
+        stdout.contains("exit_code_zero: true"),
+        "the worker's process.exit(0) is the code 'exit' reports: {stdout}"
     );
 }
 
@@ -30424,6 +36262,32 @@ fn cluster_worker_exit_event() {
     );
 }
 
+/// A cluster worker knows its id, but the variable that carried it is gone
+/// from its environment once it has started (node deletes NODE_UNIQUE_ID in
+/// worker bootstrap): a child the worker spawns with its default environment
+/// is a primary of its own, not a worker of this one.
+#[test]
+fn cluster_worker_id_is_not_inherited_by_the_workers_children() {
+    let stdout = run_ok(
+        "cluster_worker_env.mjs",
+        "import cluster from 'node:cluster';\n\
+         import { spawnSync } from 'node:child_process';\n\
+         if (cluster.isPrimary) {\n\
+           const worker = cluster.fork();\n\
+           worker.on('exit', () => process.exit(0));\n\
+         } else {\n\
+           console.log('worker_id:', cluster.worker.id);\n\
+           console.log('worker_env:', process.env.OAM_CLUSTER_WORKER);\n\
+           const child = spawnSync(process.execPath, ['-e', \"console.log('child:', process.env.OAM_CLUSTER_WORKER, require('node:cluster').isWorker)\"], { encoding: 'utf8' });\n\
+           console.log(child.stdout.trim());\n\
+           process.exit(0);\n\
+         }",
+    );
+    assert!(stdout.contains("worker_id: 1"), "{stdout}");
+    assert!(stdout.contains("worker_env: undefined"), "{stdout}");
+    assert!(stdout.contains("child: undefined false"), "{stdout}");
+}
+
 #[test]
 fn tls_create_server_basics() {
     let stdout = run_ok(
@@ -30443,12 +36307,15 @@ fn tls_create_server_basics() {
          console.log('has_address:', server.address() !== null);\n\
          server.close();",
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    assert_true_lines(
+        &stdout,
+        &[
+            "server_class:",
+            "server_created:",
+            "server_listening:",
+            "has_address:",
+        ],
+    );
 }
 
 #[test]
@@ -30938,6 +36805,121 @@ server.close();
 process.exit(0);"#,
     );
     assert_eq!(stdout, "status: 200\nbody: hello from h2 server");
+}
+
+/// A client session's `ping()` sends a PING frame and calls back at the
+/// server's ACK with (null, duration, payload): a finite, non-negative
+/// number of milliseconds and a Buffer of its own holding the eight bytes
+/// the ACK echoed -- the caller's, or the session's own when it gave none
+/// -- over h2c and over TLS, against oam's own server. The argument checks
+/// are node's (v22.22.2; conformance case 645 pins them byte for byte), a
+/// ping made while connecting, after close(), past maxOutstandingPings or
+/// still waiting at destroy() is cancelled with ERR_HTTP2_PING_CANCEL, and
+/// the ACK raises no 'ping' event. It used to send nothing and answer at
+/// once with a duration of 0 and the caller's own buffer.
+#[test]
+fn http2_client_session_ping_is_answered_by_the_servers_ack() {
+    let src = r#"import http2 from 'node:http2';
+setTimeout(() => { console.log('TIMEOUT'); process.exit(1); }, 20000);
+const code = (fn) => { try { return String(fn()); } catch (e) { return e.name + ' ' + e.code; } };
+const noop = () => {};
+const handler = (stream) => { stream.respond({ ':status': 200 }); stream.end('ok'); };
+const servers = {
+  h2c: [http2.createServer(), (port) => http2.connect('http://127.0.0.1:' + port)],
+  tls: [http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__` }),
+        (port) => http2.connect('https://localhost:' + port, { ca: `__CA__` })],
+};
+for (const [name, [server, connect]] of Object.entries(servers)) {
+  server.on('stream', handler);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const client = connect(server.address().port);
+  let pingEvents = 0;
+  client.on('ping', () => pingEvents++);
+  const connecting = new Promise((r) => client.ping((...args) => r(args.length + ' ' + args[0].code)));
+  console.log(name, 'connecting:', await connecting);
+  if (client.connecting) await new Promise((r) => client.once('connect', r));
+  console.log(name, 'encrypted', client.encrypted, client.alpnProtocol);
+  const ping = (...payload) => new Promise((resolve) => {
+    let sync = true;
+    const returned = client.ping(...payload, (...args) => {
+      const [err, duration, echoed] = args;
+      resolve([returned, sync ? 'sync' : 'async', args.length, String(err), typeof duration,
+        Number.isFinite(duration) && duration >= 0 && duration < 20000,
+        Buffer.isBuffer(echoed), echoed !== payload[0], echoed.length,
+        payload.length ? echoed.toString('hex') : '-'].join(' '));
+    });
+    sync = false;
+  });
+  console.log(name, 'payload:', await ping(Buffer.from('abcdefgh')));
+  console.log(name, 'none:', await ping());
+  console.log(name, 'view:', await ping(new DataView(Uint8Array.of(0, 9, 8, 7, 6, 5, 4, 3, 2, 0).buffer, 1, 8)));
+  const order = [];
+  await Promise.all([1, 2, 3, 4].map((n) => new Promise((r) => {
+    client.ping(Buffer.alloc(8, n), (err, ms, echoed) => { order.push(echoed[0]); r(); });
+  })));
+  console.log(name, 'order:', order.join(''));
+  console.log(name, 'checks:', [
+    code(() => client.ping()),
+    code(() => client.ping(Buffer.alloc(8))),
+    code(() => client.ping('12345678', noop)),
+    code(() => client.ping(new ArrayBuffer(8), noop)),
+    code(() => client.ping(Buffer.alloc(7), noop)),
+    code(() => client.ping(new Uint16Array(8), noop)),
+    code(() => client.ping(Buffer.alloc(9))),
+  ].join(', '));
+  const over = [];
+  const waits = [];
+  for (let n = 0; n < 11; n++) {
+    waits.push(new Promise((r) => over.push(client.ping((err) => { over.push(err ? err.code : 'ack'); r(); }))));
+  }
+  const before = over.join(' ');
+  await Promise.all(waits);
+  console.log(name, 'limit:', before, '|', over.slice(12).join(' '));
+  const req = client.request({ ':path': '/' });
+  req.resume();
+  await new Promise((r) => req.on('close', r));
+  console.log(name, "'ping' events", pingEvents);
+  const cancelled = new Promise((r) => client.ping((...args) => r(args.length + ' ' + args[0].code)));
+  client.destroy();
+  console.log(name, 'destroyed while waiting:', await cancelled);
+  console.log(name, 'destroyed:', code(() => client.ping(noop)), '/', code(() => client.ping('x')));
+  server.close();
+}
+process.exit(0);
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY)
+    .replace("__CA__", TLS_TEST_CA_CERT);
+    let stdout = run_ok("h2_client_ping.mjs", &src);
+    let expected = |name: &str, encrypted: &str| {
+        [
+            "connecting: 1 ERR_HTTP2_PING_CANCEL",
+            encrypted,
+            "payload: true async 3 null number true true true 8 6162636465666768",
+            "none: true async 3 null number true true true 8 -",
+            "view: true async 3 null number true true true 8 0908070605040302",
+            "order: 1234",
+            "checks: TypeError ERR_INVALID_ARG_TYPE, TypeError ERR_INVALID_ARG_TYPE, \
+             TypeError ERR_INVALID_ARG_TYPE, TypeError ERR_INVALID_ARG_TYPE, \
+             RangeError ERR_HTTP2_PING_LENGTH, RangeError ERR_HTTP2_PING_LENGTH, \
+             RangeError ERR_HTTP2_PING_LENGTH",
+            "limit: true true true true true true true true true true ERR_HTTP2_PING_CANCEL false \
+             | ack ack ack ack ack ack ack ack ack ack",
+            "'ping' events 0",
+            "destroyed while waiting: 1 ERR_HTTP2_PING_CANCEL",
+            "destroyed: Error ERR_HTTP2_INVALID_SESSION / Error ERR_HTTP2_INVALID_SESSION",
+        ]
+        .map(|line| format!("{name} {line}"))
+        .join("\n")
+    };
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        format!(
+            "{}\n{}",
+            expected("h2c", "encrypted false h2c"),
+            expected("tls", "encrypted true h2")
+        )
+    );
 }
 
 #[test]
@@ -31664,8 +37646,6 @@ for (const message of thrown) console.log('uncaught ' + message);
 
 #[test]
 fn oam_mcp_module_batch_array() {
-    use std::io::{BufRead, BufReader, Write};
-
     let script = write_temp(
         "mcp_module_batch.ts",
         r#"import { McpServer } from 'oam:mcp';
@@ -31679,38 +37659,30 @@ await s.serve();
 "#,
     );
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .arg("run")
-        .arg(&script)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("oam run spawns");
-
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        writeln!(
-            stdin,
-            "{}",
-            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"e2e"}}})
-        )
-        .unwrap();
-        // Batch array: two tool calls with a notification interleaved.
-        let batch = serde_json::json!([
-            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"double","arguments":{"n":5}}},
-            {"jsonrpc":"2.0","method":"notifications/initialized"},
-            {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"double","arguments":{"n":21}}}
-        ]);
-        writeln!(stdin, "{batch}").unwrap();
-    }
-    drop(child.stdin.take());
-
-    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let initialize = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"e2e"}}});
+    // Batch array: two tool calls with a notification interleaved.
+    let batch = serde_json::json!([
+        {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"double","arguments":{"n":5}}},
+        {"jsonrpc":"2.0","method":"notifications/initialized"},
+        {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"double","arguments":{"n":21}}}
+    ]);
+    // Both lines, then EOF -- under the deadline and the suite's isolated
+    // cache, so a serve() that never returns fails this test by name.
+    let out = bounded_output_with_stdin(
+        &mut oam_command(&["run", script.to_str().unwrap()]),
+        format!("{initialize}\n{batch}\n").as_bytes(),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "exit {}\nstdout: {stdout}\nstderr: {stderr}",
+        out.status
+    );
     let responses: Vec<serde_json::Value> = stdout
         .lines()
-        .map(|l| serde_json::from_str(&l.unwrap()).expect("each line is JSON"))
+        .map(|l| serde_json::from_str(l).expect("each line is JSON"))
         .collect();
-    assert!(child.wait().unwrap().success());
 
     // initialize response + one batch-array response on a single line.
     assert_eq!(responses.len(), 2);
@@ -31754,8 +37726,8 @@ fn install_lifecycle_script_warns_pkg0007() {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
         .args(["install"])
         .current_dir(dir)
-        .output()
-        .expect("oam binary runs");
+        .env("OAM_CACHE_DIR", dir.join("oam-cache"))
+        .output_within_deadline();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("OAM-PKG0007"),
@@ -31806,8 +37778,8 @@ fn install_lifecycle_script_suppressed_by_trust() {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
         .args(["install"])
         .current_dir(dir)
-        .output()
-        .expect("oam binary runs");
+        .env("OAM_CACHE_DIR", dir.join("oam-cache"))
+        .output_within_deadline();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !stderr.contains("OAM-PKG0007"),
@@ -31834,8 +37806,8 @@ fn trust_add_remove_list_round_trip() {
     let out = std::process::Command::new(oam)
         .args(["trust", "add", "esbuild"])
         .current_dir(dir)
-        .output()
-        .expect("oam trust add runs");
+        .suite_env()
+        .output_within_deadline();
     assert!(
         out.status.success(),
         "oam trust add should succeed; stderr: {}",
@@ -31858,8 +37830,8 @@ fn trust_add_remove_list_round_trip() {
     let out = std::process::Command::new(oam)
         .args(["trust", "list"])
         .current_dir(dir)
-        .output()
-        .expect("oam trust list runs");
+        .suite_env()
+        .output_within_deadline();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("esbuild"),
@@ -31870,8 +37842,8 @@ fn trust_add_remove_list_round_trip() {
     let out = std::process::Command::new(oam)
         .args(["trust", "remove", "esbuild"])
         .current_dir(dir)
-        .output()
-        .expect("oam trust remove runs");
+        .suite_env()
+        .output_within_deadline();
     assert!(
         out.status.success(),
         "oam trust remove should succeed; stderr: {}",
@@ -31986,8 +37958,7 @@ fn install_precompile_creates_cache() {
         .args(["install", "--precompile"])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
-        .output()
-        .expect("oam binary runs");
+        .output_within_deadline();
 
     assert!(
         out.status.success(),
@@ -32107,8 +38078,7 @@ fn install_fails_loudly_when_a_tarball_arrives_content_encoded() {
         .args(["install"])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
-        .output()
-        .expect("oam binary runs");
+        .output_within_deadline();
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -32201,8 +38171,7 @@ fn install_precompile_populates_warm_tree() {
         .args(["install"])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
-        .output()
-        .expect("oam binary runs");
+        .output_within_deadline();
     assert!(
         out.status.success(),
         "plain install should succeed; stderr: {}",
@@ -32226,8 +38195,7 @@ fn install_precompile_populates_warm_tree() {
         .args(["install", "--precompile"])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
-        .output()
-        .expect("oam binary runs");
+        .output_within_deadline();
     assert!(
         out.status.success(),
         "warm install --precompile should succeed; stderr: {}",
@@ -32310,8 +38278,7 @@ console.log(pkg.value);"#,
         .args(["run", entry.to_str().unwrap()])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
-        .output()
-        .expect("oam binary runs");
+        .output_within_deadline();
 
     assert!(
         out.status.success(),
@@ -32394,8 +38361,7 @@ fn install_precompile_esm_ts_cache_used_on_run() {
         .args(["run", entry.to_str().unwrap()])
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
-        .output()
-        .expect("oam binary runs");
+        .output_within_deadline();
 
     assert!(
         out.status.success(),
@@ -32435,18 +38401,9 @@ impl WithoutAmbientCompileCache for std::process::Command {
 
 /// Recursively count `.v8c` bytecode-cache blobs under `dir`.
 fn count_v8c(dir: &std::path::Path) -> usize {
-    let mut n = 0;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                n += count_v8c(&p);
-            } else if p.extension().and_then(|x| x.to_str()) == Some("v8c") {
-                n += 1;
-            }
-        }
-    }
-    n
+    let mut found = Vec::new();
+    collect_v8c(dir, &mut found);
+    found.len()
 }
 
 // B3c: a required CJS module produces a V8 bytecode blob on first run and the
@@ -32480,8 +38437,7 @@ fn cjs_bytecode_cache_produced_and_reused() {
             .current_dir(&project_dir)
             .env("OAM_CACHE_DIR", &cache)
             .without_ambient_compile_cache()
-            .output()
-            .expect("oam binary runs")
+            .output_within_deadline()
     };
 
     // Run 1: produces the bytecode cache.
@@ -32556,8 +38512,7 @@ fn esm_bytecode_cache_produced_and_reused() {
             .current_dir(&project_dir)
             .env("OAM_CACHE_DIR", &cache)
             .without_ambient_compile_cache()
-            .output()
-            .expect("oam binary runs")
+            .output_within_deadline()
     };
 
     // Run 1: compiles both ESM modules and produces bytecode blobs.
@@ -32643,8 +38598,7 @@ fn code_cache_opt_out_disables_produce() {
         .env("OAM_CACHE_DIR", &cache)
         .without_ambient_compile_cache()
         .env("OAM_CODE_CACHE", "0")
-        .output()
-        .expect("oam binary runs");
+        .output_within_deadline();
 
     assert!(
         out.status.success(),
@@ -32708,11 +38662,19 @@ fn run_compile_cache(
         cmd.arg("--");
         cmd.args(args);
     }
-    cmd.current_dir(cwd).without_ambient_compile_cache();
+    // The suite's isolated cache unless `envs` names another: a run that set
+    // none used to store its blobs in the developer's own cache.
+    let suite_cache = write_temp("oam-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    cmd.current_dir(cwd)
+        .without_ambient_compile_cache()
+        .env("OAM_CACHE_DIR", suite_cache);
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    cmd.output().expect("oam binary runs")
+    bounded_output(&mut cmd)
 }
 
 /// Every `.v8c` blob under `dir` with its mtime: equal snapshots before and
@@ -33029,8 +38991,7 @@ fn compile_cache_env_vars_move_and_disable_it() {
         .env("OAM_CACHE_DIR", &off_cache)
         .env("NODE_COMPILE_CACHE", &off_ncc)
         .env("NODE_DISABLE_COMPILE_CACHE", "0")
-        .output()
-        .expect("oam binary runs");
+        .output_within_deadline();
     assert!(
         off.status.success(),
         "{}",
@@ -33123,8 +39084,7 @@ fn compile_cache_enable_mid_graph_load_holds_for_prefetched_modules() {
             .without_ambient_compile_cache()
             .env("OAM_CACHE_DIR", &oam_cache)
             .env("OAM_GRAPH_PREFETCH", prefetch)
-            .output()
-            .expect("oam binary runs");
+            .output_within_deadline();
         assert!(
             out.status.success(),
             "{}",
@@ -33167,8 +39127,7 @@ fn compile_cache_cli_reports_the_node_compile_cache_dir() {
             .without_ambient_compile_cache()
             .env("OAM_CACHE_DIR", &oam_cache)
             .env("NODE_COMPILE_CACHE", &ncc)
-            .output()
-            .expect("oam binary runs")
+            .output_within_deadline()
     };
 
     let cold = cache_cmd(&["cache", "info"]);
@@ -33263,21 +39222,19 @@ fn compile_cache_concurrent_processes_share_one_dir() {
 
     let children: Vec<_> = (0..6)
         .map(|_| {
-            std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-                .arg("run")
+            let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
+            cmd.arg("run")
                 .arg(&entry)
                 .current_dir(&project)
-                .env_remove("OAM_CODE_CACHE")
-                .env_remove("NODE_DISABLE_COMPILE_CACHE")
-                .env("NODE_COMPILE_CACHE", &ncc)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .expect("oam binary spawns")
+                .suite_env()
+                .env("NODE_COMPILE_CACHE", &ncc);
+            // One thread per process, so all six run at once and each is
+            // still under the deadline.
+            std::thread::spawn(move || bounded_output(&mut cmd))
         })
         .collect();
     for child in children {
-        let out = child.wait_with_output().unwrap();
+        let out = child.join().expect("a bounded run reports its own hang");
         assert!(
             out.status.success(),
             "{}",
@@ -33403,8 +39360,7 @@ fn code_cache_corrupt_blob_falls_back_and_refreshes() {
             .current_dir(&project_dir)
             .env("OAM_CACHE_DIR", &cache)
             .without_ambient_compile_cache()
-            .output()
-            .expect("oam binary runs")
+            .output_within_deadline()
     };
 
     // Run 1 produces the blobs.
@@ -33504,8 +39460,7 @@ fn esm_code_cache_produced_after_evaluation_and_consumed() {
             .current_dir(&project_dir)
             .env("OAM_CACHE_DIR", &cache)
             .without_ambient_compile_cache()
-            .output()
-            .expect("oam binary runs")
+            .output_within_deadline()
     };
 
     let out1 = run();
@@ -33588,8 +39543,7 @@ fn esm_code_cache_produced_when_evaluation_throws() {
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", &cache)
         .without_ambient_compile_cache()
-        .output()
-        .expect("oam binary runs");
+        .output_within_deadline();
     assert!(!out.status.success(), "a throwing module must fail the run");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("eval-throws"),
@@ -33628,8 +39582,7 @@ fn cache_subcommand_info_and_clean() {
         .current_dir(&project_dir)
         .env("OAM_CACHE_DIR", &cache)
         .without_ambient_compile_cache()
-        .output()
-        .expect("oam binary runs");
+        .output_within_deadline();
     assert!(
         run_out.status.success(),
         "warm-up run failed: {}",
@@ -33641,13 +39594,38 @@ fn cache_subcommand_info_and_clean() {
         "warm-up run must store a blob"
     );
 
+    // A TypeScript run also fills the transpile cache beside the bytecode
+    // one; `cache clean` covers both.
+    let ts_entry = project_dir.join("typed.ts");
+    std::fs::write(
+        &ts_entry,
+        "const n: number = 2;\nconsole.log('ts-warm=' + n);\n",
+    )
+    .unwrap();
+    let ts_out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", ts_entry.to_str().unwrap()])
+        .current_dir(&project_dir)
+        .env("OAM_CACHE_DIR", &cache)
+        .env_remove("OAM_TRANSPILE_CACHE")
+        .without_ambient_compile_cache()
+        .output_within_deadline();
+    assert!(
+        ts_out.status.success(),
+        "TypeScript warm-up run failed: {}",
+        String::from_utf8_lossy(&ts_out.stderr)
+    );
+    let transpile_dir = cache.join("transpile");
+    assert!(
+        transpile_dir.is_dir(),
+        "a TypeScript run must fill the transpile cache"
+    );
+
     let cache_cmd = |args: &[&str]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
             .args(args)
             .env("OAM_CACHE_DIR", &cache)
             .without_ambient_compile_cache()
-            .output()
-            .expect("oam binary runs")
+            .output_within_deadline()
     };
 
     let info = cache_cmd(&["cache", "info"]);
@@ -33678,6 +39656,15 @@ fn cache_subcommand_info_and_clean() {
         String::from_utf8_lossy(&clean.stderr)
     );
     assert!(!bytecode_dir.exists(), "clean must remove the bytecode dir");
+    assert!(
+        !transpile_dir.exists(),
+        "clean must remove the transpile dir too"
+    );
+    assert!(
+        String::from_utf8_lossy(&clean.stderr).contains(&transpile_dir.display().to_string()),
+        "clean must name the transpile dir it removed: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
 
     let again = cache_cmd(&["cache", "clean"]);
     assert!(again.status.success(), "clean of a missing dir is success");
@@ -33772,6 +39759,87 @@ fn node_test_exit_code_reflects_pass_fail() {
     let f = oam(&["run", fail.to_str().unwrap(), "--no-check"]);
     assert_eq!(p.status.code(), Some(0), "a passing node:test must exit 0");
     assert_eq!(f.status.code(), Some(1), "a failing node:test must exit 1");
+}
+
+/// A test context's hooks belong to that test, in node's order (the expected
+/// list is what node v22.22.2 records for this file): `t.before()` runs at
+/// once, `t.beforeEach()` / `t.afterEach()` run around every subtest below
+/// the test and nowhere else, `t.after()` runs when its own test finishes
+/// (after the afterEach hooks that apply to it), and a `t.after()` that throws
+/// fails that test. They used to register on the file's root suite.
+#[test]
+fn node_test_context_hooks_belong_to_their_test() {
+    let path = write_temp(
+        "nt_context_hooks.cjs",
+        r#"const { test, afterEach, after } = require('node:test');
+const out = [];
+const L = (s) => out.push(s);
+afterEach((t) => L('file afterEach ' + t.name));
+after(() => { L('file after'); console.log('HOOKS ' + out.join('|')); });
+test('one', async (t) => {
+  t.before((c) => L('one.before ' + (c && c.name)));
+  t.after((c) => L('one.after ' + (c && c.name)));
+  t.beforeEach((c) => L('one.beforeEach ' + c.name));
+  t.afterEach((c) => L('one.afterEach ' + c.name));
+  L('one body');
+  await t.test('sub1', async (s) => {
+    s.after(() => L('sub1.after'));
+    L('sub1 body');
+    await s.test('deep', () => L('deep body'));
+  });
+  await t.test('sub2', () => L('sub2 body'));
+  L('one body end');
+});
+test('two', (t) => { t.after(() => { throw new Error('boom'); }); L('two body'); });
+test('three', (t) => { t.before(() => L('three.before')); L('three body'); });
+"#,
+    );
+    let out = oam(&["run", path.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let hooks = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("HOOKS "))
+        .unwrap_or_else(|| panic!("no HOOKS line in: {stdout}"));
+    let expected = [
+        "one.before one",
+        "one body",
+        "one.beforeEach sub1",
+        "sub1 body",
+        "one.beforeEach deep",
+        "deep body",
+        "one.afterEach deep",
+        "file afterEach deep",
+        "one.afterEach sub1",
+        "file afterEach sub1",
+        "sub1.after",
+        "one.beforeEach sub2",
+        "sub2 body",
+        "one.afterEach sub2",
+        "file afterEach sub2",
+        "one body end",
+        "file afterEach one",
+        "one.after one",
+        "two body",
+        "file afterEach two",
+        "three.before",
+        "three body",
+        "file afterEach three",
+        "file after",
+    ];
+    assert_eq!(hooks.split('|').collect::<Vec<_>>(), expected);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("not ok") && line.ends_with("- two")),
+        "a throwing t.after() fails its test: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("ok") && line.ends_with("- three")),
+        "the hooks of one test do not reach the next: {stdout}"
+    );
+    assert_eq!(out.status.code(), Some(1), "stdout: {stdout}");
 }
 
 #[test]
@@ -33920,9 +39988,16 @@ fn client_disconnect_mid_upload_does_not_kill_the_server() {
         "import http from 'node:http';\n\
          import net from 'node:net';\n\
          // Deliberately NO 'error' listener on req -- that is the regression.\n\
+         let entered = false, aborted = false, caught = false;\n\
+         // Polled with a 5 s bound rather than slept for a fixed window: a\n\
+         // loaded machine delivers the request, and then the reset, late.\n\
+         const until = async (cond) => {\n\
+           for (let i = 0; i < 250 && !cond(); i++) await new Promise((r) => setTimeout(r, 20));\n\
+         };\n\
          const server = http.createServer(async (req, res) => {\n\
-           req.on('aborted', () => console.log('aborted'));\n\
-           try { for await (const c of req) { void c; } } catch { console.log('caught'); }\n\
+           entered = true;\n\
+           req.on('aborted', () => { aborted = true; console.log('aborted'); });\n\
+           try { for await (const c of req) { void c; } } catch { caught = true; console.log('caught'); }\n\
            try { res.end('ok'); } catch { /* socket already gone */ }\n\
          });\n\
          await new Promise((r) => server.listen(0, r));\n\
@@ -33933,9 +40008,13 @@ fn client_disconnect_mid_upload_does_not_kill_the_server() {
          // Node's parser (and now oam's) refuses with 400.\n\
          sock.write(`POST /u HTTP/1.1\\r\\nHost: x\\r\\nContent-Length: ${10 * 1024 * 1024}\\r\\n\\r\\n`);\n\
          sock.write('x'.repeat(1024));\n\
+         await until(() => entered);\n\
          await new Promise((r) => setTimeout(r, 150));\n\
          sock.destroy();\n\
-         await new Promise((r) => setTimeout(r, 600));\n\
+         await until(() => aborted && caught);\n\
+         // One more turn, so a fatal error that follows the reset would land\n\
+         // before 'alive' is printed.\n\
+         await new Promise((r) => setTimeout(r, 100));\n\
          console.log('alive');\n\
          server.close();",
     );
@@ -34075,7 +40154,6 @@ fn net_end_after_connect_on_a_destroyed_socket_calls_back() {
 /// response), so a slow box cannot fail this and a lost FIN cannot pass.
 #[test]
 fn net_server_write_then_end_delivers_the_fin_to_a_node_client() {
-    use std::io::BufRead;
     if !node_available() {
         eprintln!("skipping: node not installed (the client runs on it)");
         return;
@@ -34129,21 +40207,19 @@ fn net_server_write_then_end_delivers_the_fin_to_a_node_client() {
          }\n\
          for (const [r, n] of tally) console.log(n + ' x ' + r);\n",
     );
-    let mut serving = oam_command(&["run", server.to_str().unwrap()])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .expect("oam binary runs");
-    let mut port = String::new();
-    std::io::BufReader::new(serving.stdout.take().unwrap())
-        .read_line(&mut port)
-        .expect("the server prints its port");
+    let mut serving = KillOnDrop(
+        oam_command(&["run", server.to_str().unwrap()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("oam binary runs"),
+    );
+    let port = first_stdout_line(&mut serving, "the server prints its port");
     let out = bounded_output(
         std::process::Command::new("node").args([client.to_str().unwrap(), port.trim()]),
     );
-    let _ = serving.kill();
-    let _ = serving.wait();
+    drop(serving);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
@@ -34227,6 +40303,143 @@ fn heap_cap_env_always_caps_and_warns_on_an_unusable_value() {
         "OAM_MAX_HEAP_MB=8192 must raise the cap, got {large} bytes"
     );
     assert!(!stderr.contains("warning"), "8192 is valid: {stderr}");
+}
+
+/// `--max-old-space-size` is read where the flag can still be named. A value
+/// that is not a whole number is refused with exit 9 naming the flag (node
+/// v22.22.2 exits 9 on `=abc` and `=512m`), never exported and reported as
+/// an `OAM_MAX_HEAP_MB` the user did not set; `=0` is node's "use the
+/// default" and leaves a valid `OAM_MAX_HEAP_MB` in force; a usable value
+/// wins over the variable.
+#[test]
+fn max_old_space_size_flag_is_validated_and_never_clobbers_a_valid_env_cap() {
+    let script = write_temp(
+        "heap_cap_flag.mjs",
+        "import v8 from 'node:v8';\n\
+         console.log(v8.getHeapStatistics().heap_size_limit);",
+    );
+    let path = script.to_string_lossy().to_string();
+
+    for bad in ["--max-old-space-size=abc", "--max-old-space-size=512m"] {
+        let out = oam_with_env(&[bad, &path], &[("OAM_MAX_HEAP_MB", "")]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(9), "{bad}: stderr: {stderr}");
+        assert!(
+            stderr.contains(bad) && !stderr.contains("OAM_MAX_HEAP_MB"),
+            "{bad}: the flag is what gets named: {stderr}"
+        );
+        assert!(out.stdout.is_empty(), "{bad}: the script must not run");
+    }
+    // The spaced form does not swallow a subcommand or a script as its value.
+    let out = oam_with_env(
+        &["--max-old-space-size", "run", &path],
+        &[("OAM_MAX_HEAP_MB", "")],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(9),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let limit_of = |args: &[&str], env_mb: &str| -> (u64, String) {
+        let out = oam_with_env(args, &[("OAM_MAX_HEAP_MB", env_mb)]);
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            out.status.success(),
+            "{args:?}: exit {}; stderr: {stderr}",
+            out.status
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let limit = stdout
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("{args:?}: stdout {stdout:?}: {e}"));
+        (limit, stderr)
+    };
+    // `=0` asks for nothing: the variable's 64 MB cap stands, unwarned.
+    let (kept, stderr) = limit_of(&["--max-old-space-size=0", &path], "64");
+    assert!(
+        kept < 128 * 1024 * 1024,
+        "--max-old-space-size=0 must leave OAM_MAX_HEAP_MB=64 in force, got {kept} bytes"
+    );
+    assert!(
+        !stderr.contains("warning"),
+        "nothing to warn about: {stderr}"
+    );
+    // A usable flag value wins over the variable.
+    let (raised, stderr) = limit_of(&["--max-old-space-size=8192", &path], "64");
+    assert!(
+        raised >= 8192 * 1024 * 1024,
+        "--max-old-space-size=8192 must win over OAM_MAX_HEAP_MB=64, got {raised} bytes"
+    );
+    assert!(!stderr.contains("warning"), "8192 is valid: {stderr}");
+}
+
+/// The shapes the 0.19.5 changelog entry promises for `--max-old-space-size`:
+/// both spellings (`=N` and a spaced `N`), before or after the subcommand,
+/// each capping the heap and each handed back through `process.execArgv` as
+/// it was written; and `NODE_OPTIONS`, which caps the heap too but, as in
+/// node, is never listed in execArgv.
+#[test]
+fn max_old_space_size_caps_in_every_accepted_position_and_round_trips_exec_argv() {
+    let script = write_temp(
+        "heap_cap_flag_shapes.mjs",
+        "import v8 from 'node:v8';\n\
+         console.log(v8.getHeapStatistics().heap_size_limit);\n\
+         console.log(JSON.stringify(process.execArgv));",
+    );
+    let path = script.to_string_lossy().to_string();
+    let run = |args: &[&str], vars: &[(&str, &str)]| -> (u64, String) {
+        let out = oam_with_env(args, vars);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{args:?}: exit {}; stderr: {stderr}",
+            out.status
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let mut lines = stdout.lines();
+        let limit = lines
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("{args:?}: stdout {stdout:?}: {e}"));
+        let exec_argv = lines.next().unwrap_or_default().trim().to_string();
+        (limit, exec_argv)
+    };
+    let unset = [("OAM_MAX_HEAP_MB", "")];
+
+    let eq = r#"["--max-old-space-size=64"]"#;
+    let spaced = r#"["--max-old-space-size","64"]"#;
+    let shapes: [(&[&str], &str); 4] = [
+        (&["--max-old-space-size=64", &path], eq),
+        (&["--max-old-space-size", "64", &path], spaced),
+        (&["run", "--max-old-space-size=64", &path], eq),
+        (&["run", "--max-old-space-size", "64", &path], spaced),
+    ];
+    for (args, want_exec_argv) in shapes {
+        let (limit, exec_argv) = run(args, &unset);
+        assert!(
+            limit < 128 * 1024 * 1024,
+            "{args:?} must cap near 64 MB, got {limit} bytes"
+        );
+        assert_eq!(exec_argv, want_exec_argv, "{args:?}");
+    }
+
+    let (limit, exec_argv) = run(
+        &["run", &path],
+        &[
+            ("OAM_MAX_HEAP_MB", ""),
+            ("NODE_OPTIONS", "--max-old-space-size=64"),
+        ],
+    );
+    assert!(
+        limit < 128 * 1024 * 1024,
+        "NODE_OPTIONS=--max-old-space-size=64 must cap near 64 MB, got {limit} bytes"
+    );
+    assert_eq!(exec_argv, "[]", "NODE_OPTIONS is not part of execArgv");
 }
 
 /// `OAM_V8_POOL_SIZE`'s warning contract (oam_engine::init_platform_with_flags):
@@ -34371,14 +40584,12 @@ fn node_flag_after_run_installs_like_before_the_subcommand() {
         ],
         "throwDeprecation: true",
     );
-    // A flag after the FILE is a script arg, untouched by the lift.
+    // A flag after the FILE is not lifted, and it is not a script arg either:
+    // `--throw-deprecation` reaches the script as argv only when preceded by
+    // `--` (the next case). Without the separator it is refused with a usage
+    // error (exit 2) -- exactly that, never a silent no-op script arg.
     let out = oam(&["run", &path, "--throw-deprecation"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // `--throw-deprecation` after the file is handed to the script as argv
-    // only when preceded by `--`; without it, clap answers it. Accept either
-    // clap refusal (exit 2) or the node parser taking it (there is no file
-    // positional left, so refusal is expected); the point is it is NOT a
-    // silent no-op script arg.
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -34573,8 +40784,9 @@ fn node_flag_lift_refusals_stay_refusals() {
     let script = write_temp("node_flag_refusals.mjs", "console.log('ran');");
     let path = script.to_string_lossy().to_string();
 
-    // A trailing spaced-value flag has no value: the pre-parse refuses it
-    // (exit 9), it never lifts, and the process NEVER falls into the REPL.
+    // A trailing spaced-value flag after `run` has no value. It never lifts,
+    // so it stays where it was typed and `run` is left without its <FILE>:
+    // a usage error (exit 2), and the process NEVER falls into the REPL.
     let out = oam(&["run", "--env-file"]);
     assert_eq!(
         out.status.code(),
@@ -34705,18 +40917,301 @@ fn heap_cap_reached_is_the_oom_banner() {
     );
 }
 
+/// The banner names where the cap was set: the flag on the command line (in
+/// either spelling, before or after `run`), the flag in NODE_OPTIONS, or the
+/// variable -- not the variable for all three (#472). Each run sets the
+/// variable to a larger cap too, so the flag must also be what decided it.
+#[test]
+fn heap_cap_oom_banner_names_where_the_cap_was_set() {
+    let script = write_temp(
+        "heap_cap_oom_source.mjs",
+        "const keep = [];\n\
+         for (;;) keep.push(new Array(1e5).fill(keep.length));",
+    );
+    let path = script.to_string_lossy().to_string();
+    let argv = "(set by --max-old-space-size)";
+    // (argv, environment, the banner's source)
+    type Case<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)], &'a str);
+    let cases: [Case; 4] = [
+        (
+            &["--max-old-space-size=64", &path],
+            &[("OAM_MAX_HEAP_MB", "96")],
+            argv,
+        ),
+        (
+            &["run", "--max-old-space-size", "64", &path],
+            &[("OAM_MAX_HEAP_MB", "96")],
+            argv,
+        ),
+        (
+            &["run", &path],
+            &[
+                ("OAM_MAX_HEAP_MB", "96"),
+                ("NODE_OPTIONS", "--max-old-space-size=64"),
+            ],
+            "(set by NODE_OPTIONS --max-old-space-size)",
+        ),
+        (
+            &["run", &path],
+            &[("OAM_MAX_HEAP_MB", "64")],
+            "(set by OAM_MAX_HEAP_MB)",
+        ),
+    ];
+    for (args, vars, source) in cases {
+        let out = oam_with_env(args, vars);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(134), "{args:?} {vars:?}: {stderr}");
+        let want = format!("reached the 64 MB cap {source}");
+        assert!(
+            stderr.contains("error[OAM-RT-OOM]: JavaScript heap out of memory")
+                && stderr.contains(&want),
+            "{args:?} {vars:?}: the banner must say {want:?}: {stderr}"
+        );
+    }
+}
+
+/// `--max-old-space-size` reaches the engine without passing through the
+/// environment: the program's own `process.env` has no `OAM_MAX_HEAP_MB`, and
+/// a child it spawns gets the default cap with nothing to credit, as a
+/// `node` child of `node --max-old-space-size=64` does (node hands an argv
+/// flag on only through execArgv, to a fork). Exporting the variable used to
+/// give the child the parent's cap and a banner naming a variable nobody set.
+/// A cap from NODE_OPTIONS does reach the child, through NODE_OPTIONS itself.
+#[test]
+fn max_old_space_size_is_not_inherited_by_a_spawned_child_through_the_env() {
+    let script = write_temp(
+        "heap_cap_child.js",
+        "const { execFileSync } = require('node:child_process');\n\
+         const v8 = require('node:v8');\n\
+         const code = 'console.log(JSON.stringify([process.env.OAM_MAX_HEAP_MB ?? null, ' +\n\
+           'require(\"node:v8\").getHeapStatistics().heap_size_limit]))';\n\
+         const child = execFileSync(process.execPath, ['-e', code], { encoding: 'utf8' });\n\
+         console.log(JSON.stringify({\n\
+           env: process.env.OAM_MAX_HEAP_MB ?? null,\n\
+           limit: v8.getHeapStatistics().heap_size_limit,\n\
+           child: JSON.parse(child),\n\
+         }));",
+    );
+    let path = script.to_string_lossy().to_string();
+    let out = oam_with_env(&["--max-old-space-size=64", &path], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stderr}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let seen: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("stdout {stdout:?}: {e}"));
+    assert_eq!(seen["env"], serde_json::Value::Null, "{seen}");
+    assert!(
+        seen["limit"].as_u64().unwrap() < 128 * 1024 * 1024,
+        "the parent is capped: {seen}"
+    );
+    assert_eq!(seen["child"][0], serde_json::Value::Null, "{seen}");
+    assert!(
+        seen["child"][1].as_u64().unwrap() > 128 * 1024 * 1024,
+        "the child must not run under the parent's 64 MB cap: {seen}"
+    );
+
+    // A cap from NODE_OPTIONS is another matter: the child inherits
+    // NODE_OPTIONS and with it the cap, as a node child does (node v22.22.2:
+    // heap_size_limit 112 MB under NODE_OPTIONS=--max-old-space-size=64).
+    let out = oam_with_env(
+        &["run", &path],
+        &[("NODE_OPTIONS", "--max-old-space-size=64")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stderr}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let seen: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("stdout {stdout:?}: {e}"));
+    assert_eq!(seen["env"], serde_json::Value::Null, "{seen}");
+    assert_eq!(seen["child"][0], serde_json::Value::Null, "{seen}");
+    assert!(
+        seen["child"][1].as_u64().unwrap() < 128 * 1024 * 1024,
+        "a NODE_OPTIONS cap reaches the child through NODE_OPTIONS: {seen}"
+    );
+}
+
+/// A `--max-old-space-size` node cannot use is answered in node's words and
+/// with its exit code, from argv and NODE_OPTIONS alike, never as a warning
+/// about `OAM_MAX_HEAP_MB` or clap's "unexpected argument" (#472). Expected
+/// output measured on node v22.22.2 (which then lists five of its own V8
+/// flags as bad options too; that tail is not reproduced).
+#[test]
+fn max_old_space_size_bad_values_answer_in_nodes_words_and_exit_code() {
+    let script = write_temp("heap_cap_bad_value.mjs", "console.log('ran');");
+    let path = script.to_string_lossy().to_string();
+    let illegal = |flag: &str| {
+        vec![
+            format!("Error: illegal value for flag {flag} of type size_t"),
+            "Try --help for options".to_string(),
+            format!(": bad option: {flag}"),
+        ]
+    };
+    let out_of_bounds = |flag: &str| {
+        vec![
+            format!(
+                "Error: Value for flag {flag} of type size_t is out of bounds \
+                 [0-18446744073709551615]"
+            ),
+            "Try --help for options".to_string(),
+        ]
+    };
+    let bare = "--max-old-space-size";
+    // (argv, NODE_OPTIONS, exit, stderr lines; the third line of a refusal
+    // follows the executable's path, so it is matched as a suffix).
+    let cases: Vec<(Vec<&str>, &str, i32, Vec<String>)> = vec![
+        (
+            vec!["--max-old-space-size=abc", &path],
+            "",
+            9,
+            illegal("--max-old-space-size=abc"),
+        ),
+        (
+            vec!["--max-old-space-size=1.5", &path],
+            "",
+            9,
+            illegal("--max-old-space-size=1.5"),
+        ),
+        (
+            vec!["run", "--max-old-space-size=abc", &path],
+            "",
+            9,
+            illegal("--max-old-space-size=abc"),
+        ),
+        (
+            vec!["--max-old-space-size=-5", &path],
+            "",
+            0,
+            out_of_bounds("--max-old-space-size=-5"),
+        ),
+        (
+            vec!["--max-old-space-size", "-5", &path],
+            "",
+            0,
+            out_of_bounds(bare),
+        ),
+        // V8 takes no size from 2^63 up (i64::MAX itself still runs).
+        (
+            vec!["--max-old-space-size=9223372036854775808", &path],
+            "",
+            0,
+            out_of_bounds("--max-old-space-size=9223372036854775808"),
+        ),
+        (vec!["--max-old-space-size=0", &path], "", 0, vec![]),
+        // No value at all: before a subcommand, after `run`, after `-e`.
+        (vec!["--max-old-space-size"], "", 9, illegal(bare)),
+        (vec!["run", "--max-old-space-size"], "", 9, illegal(bare)),
+        (
+            vec!["-e", "1", "--max-old-space-size"],
+            "",
+            9,
+            illegal(bare),
+        ),
+        (
+            vec!["run", &path],
+            "--max-old-space-size=abc",
+            9,
+            illegal("--max-old-space-size=abc"),
+        ),
+        (
+            vec!["run", &path],
+            "--max-old-space-size=1.5",
+            9,
+            illegal("--max-old-space-size=1.5"),
+        ),
+        (vec!["run", &path], "--max-old-space-size", 9, illegal(bare)),
+        (
+            vec!["run", &path],
+            "--max-old-space-size --no-warnings",
+            9,
+            illegal(bare),
+        ),
+        (
+            vec!["run", &path],
+            "--max-old-space-size=-5",
+            0,
+            out_of_bounds("--max-old-space-size=-5"),
+        ),
+        (vec!["run", &path], "--max-old-space-size=0", 0, vec![]),
+    ];
+    for (args, node_options, code, want) in cases {
+        let mut vars = vec![("OAM_MAX_HEAP_MB", "")];
+        if !node_options.is_empty() {
+            vars.push(("NODE_OPTIONS", node_options));
+        }
+        let out = oam_with_env(&args, &vars);
+        let stderr = String::from_utf8_lossy(&out.stderr).replace("\r\n", "\n");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let ctx = format!("{args:?} NODE_OPTIONS={node_options:?}");
+        assert_eq!(out.status.code(), Some(code), "{ctx}: {stderr}");
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert_eq!(lines.len(), want.len(), "{ctx}: {stderr}");
+        for (got, want) in lines.iter().zip(&want) {
+            if want.starts_with(": bad option") {
+                assert!(got.ends_with(want.as_str()), "{ctx}: {got:?} vs {want:?}");
+            } else {
+                assert_eq!(got, want, "{ctx}");
+            }
+        }
+        // A refusal runs nothing; a run goes on with the program.
+        let ran = stdout.contains("ran");
+        assert_eq!(
+            ran,
+            code == 0 && args.contains(&path.as_str()),
+            "{ctx}: {stdout:?}"
+        );
+    }
+    // The spaced form with a dash-led token behind it in NODE_OPTIONS that is
+    // not one of node's NODE_OPTIONS options: node reads the token as an
+    // option of its own, not allowed there -- a negative number or not.
+    for tok in ["-5", "-abc", "--bogus"] {
+        let node_options = format!("--max-old-space-size {tok}");
+        let out = oam_with_env(
+            &["run", &path],
+            &[("OAM_MAX_HEAP_MB", ""), ("NODE_OPTIONS", &node_options)],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(9), "{tok}: {stderr}");
+        assert!(
+            stderr
+                .trim_end()
+                .ends_with(&format!(": {tok} is not allowed in NODE_OPTIONS"))
+                && stderr.trim_end().lines().count() == 1,
+            "{tok}: {stderr}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------- permissions
 
-/// Run the compiled binary with an explicit environment, bypassing the shared
-/// `oam()` helper so the child's env is controlled per-test rather than
-/// inherited. `--permission` gates are only observable against a known var.
+/// Run `oam` with `vars` set on top of the inherited environment, bypassing
+/// the shared `oam()` helper and what it adds (the native-addon opt-in among
+/// it). The environment is NOT cleared -- a child needs the platform's own
+/// variables to start -- so the ones the callers' assertions turn on are
+/// removed first and a shell that exports one cannot decide a test: the
+/// runtime's sizing and option variables, the colour switches and the
+/// compile-cache switches. `vars` is applied after, so a test still sets any
+/// of them itself. `--permission` gates are only observable against a known
+/// var, which is why each caller names its own.
 fn oam_with_env(args: &[&str], vars: &[(&str, &str)]) -> Output {
     let cache = write_temp("oam-perm-cache/.keep", "")
         .parent()
         .unwrap()
         .to_path_buf();
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
-    cmd.args(args).env("OAM_CACHE_DIR", cache);
+    cmd.args(args)
+        .env("OAM_CACHE_DIR", cache)
+        .without_ambient_compile_cache();
+    for ambient in [
+        "OAM_V8_POOL_SIZE",
+        "OAM_MAX_HEAP_MB",
+        "NODE_OPTIONS",
+        "NODE_EXTRA_CA_CERTS",
+        "FORCE_COLOR",
+        "NO_COLOR",
+        "NODE_DISABLE_COLORS",
+    ] {
+        cmd.env_remove(ambient);
+    }
     for (k, v) in vars {
         cmd.env(k, v);
     }
@@ -35310,7 +41805,12 @@ fn unwatch_file_stops_all_and_tolerates_unknown_paths() {
          let lateHits = 0;\n\
          fs.watchFile(late, { interval: 20 }, () => { lateHits++; });\n\
          setTimeout(() => fs.writeFileSync(late, 'now i exist'), 60);\n\
-         setTimeout(() => {\n\
+         // Up to 5 s for the create to be seen, as the sibling test above\n\
+         // waits: a loaded machine runs the 20 ms poller late.\n\
+         const started = Date.now();\n\
+         const check = setInterval(() => {\n\
+           if (lateHits === 0 && Date.now() - started < 5000) return;\n\
+           clearInterval(check);\n\
            console.log('late_create_seen:', lateHits > 0);\n\
            let a = 0, b = 0;\n\
            const file = join(dir, 'two.txt');\n\
@@ -35324,7 +41824,7 @@ fn unwatch_file_stops_all_and_tolerates_unknown_paths() {
              fs.unwatchFile(late);\n\
              fs.rmSync(dir, { recursive: true, force: true });\n\
            }, 160);\n\
-         }, 400);",
+         }, 20);",
     );
     let out = oam(&["run", script.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -35858,7 +42358,11 @@ fn child_process_and_workers_cannot_escape_the_sandbox() {
         "escape_worker_body.mjs",
         &format!(
             "import fs from 'node:fs';\n\
-             try {{ fs.writeFileSync('{marker_js}', 'x'); }} catch {{}}"
+             import {{ parentPort }} from 'node:worker_threads';\n\
+             let result;\n\
+             try {{ fs.writeFileSync('{marker_js}', 'x'); result = 'WROTE'; }}\n\
+             catch (e) {{ result = String(e && e.code); }}\n\
+             parentPort.postMessage(result);"
         ),
     );
     let script = write_temp(
@@ -35866,32 +42370,65 @@ fn child_process_and_workers_cannot_escape_the_sandbox() {
         &format!(
             "import {{ Worker }} from 'node:worker_threads';\n\
              const w = new Worker('{}');\n\
+             w.on('message', (m) => console.log('write=' + m));\n\
+             w.on('error', (e) => console.log('workerErr=' + (e && (e.code || e.message))));\n\
              w.on('exit', () => console.log('worker=DONE'));",
             body.to_string_lossy().replace('\\', "/")
         ),
     );
-    let out = oam(&["--permission", "--allow-worker", script.to_str().unwrap()]);
+    // The read grant lets the worker load its body, so what is left
+    // ungranted is the write alone: the worker has to RUN and report the
+    // refusal, or a worker that never started would pass as "no marker".
+    let out = oam(&[
+        "--permission",
+        "--allow-worker",
+        "--allow-fs-read=*",
+        script.to_str().unwrap(),
+    ]);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stdout.contains("write=ERR_ACCESS_DENIED") && stdout.contains("worker=DONE"),
+        "the worker must run and have its write refused (status {:?}):\n{stdout}{stderr}",
+        out.status
+    );
     assert!(
         !marker.exists(),
         "a worker wrote through the sandbox -- it did not inherit the parent's \
-         permissions:\n{stdout}{}",
-        String::from_utf8_lossy(&out.stderr)
+         permissions:\n{stdout}{stderr}"
     );
+
+    // Control: with the write granted the same worker does land the marker,
+    // so its absence above is the inherited denial.
+    let out = oam(&[
+        "--permission",
+        "--allow-worker",
+        "--allow-fs-read=*",
+        "--allow-fs-write=*",
+        script.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stdout.contains("write=WROTE") && marker.exists(),
+        "a worker granted the write must land the marker (status {:?}):\n{stdout}{stderr}",
+        out.status
+    );
+    let _ = std::fs::remove_file(&marker);
 }
 
 /// `cluster.fork()` must respect the `child` permission gate.
 ///
 /// `cluster.fork()` hands `process.argv[1]` verbatim to
-/// `natives.clusterFork(scriptPath, ...)` (node_compat.js:20819/20826), and
+/// `natives.clusterFork(scriptPath, ...)` (js/node_compat.js, `Cluster.fork`), and
 /// `op_cluster_fork` re-execs this runtime with that path as the worker's
-/// argv (`crates/oam_core/src/cluster.rs`). So a script that is NOT covered
-/// by `--allow-child` calling `cluster.fork()` re-execs ITSELF as a worker --
-/// the same escape hatch `spawn("sh")` is. It used to run ungated while
-/// `spawn` was denied. The worker branch writes a marker file; if the marker
-/// exists, the fork ran and the sandbox was bypassed.
+/// argv (`crates/oam_core/src/cluster.rs`). So a script run without
+/// `--allow-child-process` that calls `cluster.fork()` would re-exec ITSELF
+/// as a worker -- a process start like any `spawn`, and held to the same
+/// gate. The worker branch writes a marker file: it must be absent without
+/// the grant and present with it (the control run).
 ///
-/// `setupPrimary({ exec })` is a no-op here (node_compat.js:20871), so there
+/// `setupPrimary({ exec })` is a no-op here (js/node_compat.js), so there
 /// is no redirect trick -- the gated path is the primary's own script. The
 /// marker-file write uses only `fs`, no cmd/sh, so this is portable.
 #[test]
@@ -35906,9 +42443,10 @@ fn cluster_fork_cannot_escape_the_child_sandbox() {
 
     // The worker is this same script re-exec'd with OAM_CLUSTER_WORKER set, so
     // gate the marker write on the worker branch (cluster.isWorker). The
-    // primary branch forks, then stays alive long enough for a (wrongly)
-    // spawned worker to run -- otherwise the primary could exit before the
-    // marker had a chance to land and read as a vacuous pass.
+    // primary branch forks, then waits for the worker's 'exit' (bounded by a
+    // timer) -- otherwise the primary could exit before the marker had a
+    // chance to land and read as a vacuous pass. A refused fork() throws
+    // synchronously and is printed as `fork=<code>`.
     let script = write_temp(
         "cluster_escape.mjs",
         &format!(
@@ -35916,11 +42454,14 @@ fn cluster_fork_cannot_escape_the_child_sandbox() {
              import fs from 'node:fs';\n\
              if (cluster.isWorker) {{\n\
              \x20 try {{ fs.writeFileSync('{marker_js}', 'x'); }} catch {{}}\n\
+             \x20 process.exit(0);\n\
              }} else {{\n\
              \x20 try {{\n\
              \x20   const w = cluster.fork();\n\
              \x20   w.on('error', (e) => console.log('forkErr=' + (e && e.code)));\n\
-             \x20   setTimeout(() => {{ try {{ w.kill(); }} catch {{}}; console.log('primary=DONE'); }}, 3000);\n\
+             \x20   const done = () => {{ console.log('primary=DONE'); process.exit(0); }};\n\
+             \x20   w.on('exit', done);\n\
+             \x20   setTimeout(() => {{ try {{ w.kill(); }} catch {{}}; done(); }}, 20000);\n\
              \x20 }} catch (e) {{\n\
              \x20   console.log('fork=' + (e && e.code));\n\
              \x20 }}\n\
@@ -35928,22 +42469,54 @@ fn cluster_fork_cannot_escape_the_child_sandbox() {
         ),
     );
 
-    // --allow-child points at a DIFFERENT (existing) path, so the worker
-    // script being fork'd (the primary itself) is outside the allow list.
-    let other = write_temp("cluster_allowed_child.js", "// not the worker script\n");
-    let out = oam(&[
+    // Everything the worker needs to land the marker is granted (fs, env), so
+    // the two runs differ in `--allow-child-process` alone and the marker's
+    // absence in the first can only be the fork gate.
+    let base = [
         "--permission",
-        "--allow-child",
-        other.to_str().unwrap(),
-        script.to_str().unwrap(),
-    ]);
+        "--allow-fs-read=*",
+        "--allow-fs-write=*",
+        "--allow-env",
+    ];
+
+    // 1. Without the child grant: fork() is refused and nothing is written.
+    let mut args = base.to_vec();
+    args.push(script.to_str().unwrap());
+    let out = oam(&args);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stdout.contains("fork=ERR_ACCESS_DENIED"),
+        "cluster.fork() must be refused without --allow-child-process \
+         (status {:?}):\n{stdout}{stderr}",
+        out.status
+    );
     assert!(
         !marker.exists(),
-        "a cluster worker wrote through the sandbox -- cluster.fork() bypassed \
-         the child permission gate:\n{stdout}{}",
-        String::from_utf8_lossy(&out.stderr)
+        "a cluster worker wrote the marker -- cluster.fork() was not held to \
+         the child permission gate:\n{stdout}{stderr}"
     );
+
+    // 2. Control, with the child grant: the same script's worker does write
+    //    the marker, so run 1's missing marker is the gate and not a worker
+    //    that could never have written it.
+    let mut args = base.to_vec();
+    args.push("--allow-child-process");
+    args.push(script.to_str().unwrap());
+    let out = oam(&args);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stdout.contains("primary=DONE") && !stdout.contains("fork="),
+        "cluster.fork() must run with --allow-child-process (status {:?}):\n{stdout}{stderr}",
+        out.status
+    );
+    assert!(
+        marker.exists(),
+        "the granted worker never wrote the marker, so the denied run above \
+         proves nothing:\n{stdout}{stderr}"
+    );
+    let _ = std::fs::remove_file(&marker);
 }
 
 // ------------------------- --permission at the other CLI entry points
@@ -36026,30 +42599,21 @@ fn permission_is_enforced_by_the_test_runner() {
 /// that is the day this entry point starts being able to touch the disk.
 #[test]
 fn permission_is_enforced_in_the_repl() {
-    use std::io::Write;
-
     let cache = write_temp("perm-repl-cache/.keep", "")
         .parent()
         .unwrap()
         .to_path_buf();
 
     let feed = |args: &[&str]| -> String {
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-            .args(args)
-            .env("OAM_CACHE_DIR", &cache)
-            .env("PERM_REPL_SECRET", "leaked")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("oam repl spawns");
-        child
-            .stdin
-            .take()
-            .expect("stdin piped")
-            .write_all(b"console.log('ENV:' + process.env.PERM_REPL_SECRET)\n.exit\n")
-            .expect("feed the repl");
-        let out = child.wait_with_output().expect("repl exits");
+        // Bounded: a REPL that never sees its `.exit` fails this test, not
+        // the whole suite's ceiling.
+        let out = bounded_output_with_stdin(
+            std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+                .args(args)
+                .env("OAM_CACHE_DIR", &cache)
+                .env("PERM_REPL_SECRET", "leaked"),
+            b"console.log('ENV:' + process.env.PERM_REPL_SECRET)\n.exit\n",
+        );
         format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
@@ -36668,6 +43232,243 @@ fn fs_promises_wrapper_preserves_glob_callbacks_and_paths() {
     );
 }
 
+/// An absolute glob pattern walks every segment after its literal prefix: a
+/// wildcard in a middle segment is a wildcard, not a directory name. The walk
+/// used to start at the pattern's last segment, so `<abs>/**/*.js` and
+/// `<abs>/*/index.js` listed a directory literally named `**` / `*` and
+/// answered `[]`.
+#[test]
+fn fs_glob_absolute_pattern_matches_wildcards_in_middle_segments() {
+    let stdout = run_ok(
+        "fs_glob_absolute_middle.mjs",
+        "import fs from 'node:fs';\n\
+         import os from 'node:os';\n\
+         import path from 'node:path';\n\
+         \n\
+         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-globabs-'));\n\
+         fs.mkdirSync(path.join(dir, 'a', 'b'), { recursive: true });\n\
+         fs.mkdirSync(path.join(dir, 'c'));\n\
+         fs.writeFileSync(path.join(dir, 'top.js'), '');\n\
+         fs.writeFileSync(path.join(dir, 'a', 'index.js'), '');\n\
+         fs.writeFileSync(path.join(dir, 'a', 'b', 'deep.js'), '');\n\
+         fs.writeFileSync(path.join(dir, 'c', 'index.js'), '');\n\
+         const names = (list) => list.map((p) => path.relative(dir, p).split(path.sep).join('/')).sort().join(',');\n\
+         const star = fs.globSync(path.join(dir, '*', 'index.js'));\n\
+         console.log('star:', names(star));\n\
+         console.log('starAbsolute:', star.every((p) => path.isAbsolute(p)));\n\
+         console.log('globstar:', names(fs.globSync(path.join(dir, '**', '*.js'))));\n\
+         console.log('twoMagic:', names(fs.globSync(path.join(dir, '?', '*', '*.js'))));\n\
+         console.log('lastOnly:', names(fs.globSync(path.join(dir, '*.js'))));\n",
+    );
+    assert!(
+        stdout.contains("star: a/index.js,c/index.js\n"),
+        "a `*` middle segment of an absolute pattern must match directories: {stdout}"
+    );
+    assert!(
+        stdout.contains("starAbsolute: true"),
+        "an absolute pattern yields absolute paths: {stdout}"
+    );
+    assert!(
+        stdout.contains("globstar: a/b/deep.js,a/index.js,c/index.js,top.js\n"),
+        "a `**` middle segment of an absolute pattern must walk the tree: {stdout}"
+    );
+    assert!(
+        stdout.contains("twoMagic: a/b/deep.js\n"),
+        "every segment after the literal prefix is walked: {stdout}"
+    );
+    assert!(
+        // The last line: `run_ok` trims the trailing newline, so anchor on
+        // the end of the output instead of on a `\n`.
+        stdout.ends_with("\nlastOnly: top.js"),
+        "a pattern whose only wildcard is its last segment is unchanged: {stdout}"
+    );
+}
+
+/// `maxResults` and `follow` are oam's own fs.glob options (node ignores
+/// both), so no differential case can hold them. The cap: a value that
+/// floors to zero is refused up front rather than accepted and then failing
+/// on the first match, a fraction above one floors, and exactly `maxResults`
+/// matches is within it. `follow: true`: a link back to an ancestor
+/// directory ends in ELOOP -- the check compared path strings, which differ
+/// on every trip round the cycle, so it never fired.
+#[test]
+fn fs_glob_max_results_bounds_and_follow_cycle() {
+    let stdout = run_ok(
+        "fs_glob_cap_follow.mjs",
+        "import fs from 'node:fs';\n\
+         import os from 'node:os';\n\
+         import path from 'node:path';\n\
+         \n\
+         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-globcap-'));\n\
+         fs.mkdirSync(path.join(dir, 'a', 'b'), { recursive: true });\n\
+         for (const f of ['one.js', 'a/two.js', 'a/b/three.js']) fs.writeFileSync(path.join(dir, f), '');\n\
+         const attempt = (label, options) => {\n\
+           try {\n\
+             console.log(label + ': ' + fs.globSync('**/*.js', { cwd: dir, ...options }).length);\n\
+           } catch (e) {\n\
+             console.log(label + ': ' + e.code + ' ' + (e.message.includes('\"options.maxResults\"') ? 'option' : 'results'));\n\
+           }\n\
+         };\n\
+         attempt('half', { maxResults: 0.5 });\n\
+         attempt('zero', { maxResults: 0 });\n\
+         attempt('exact', { maxResults: 3 });\n\
+         attempt('floored', { maxResults: 3.9 });\n\
+         attempt('under', { maxResults: 2 });\n\
+         attempt('unbounded', { maxResults: Infinity });\n\
+         if (process.platform !== 'win32') {\n\
+           fs.symlinkSync(dir, path.join(dir, 'a', 'back'));\n\
+           attempt('cycle', { follow: true });\n\
+           attempt('unfollowed', {});\n\
+         }\n\
+         fs.rmSync(dir, { recursive: true, force: true });\n",
+    );
+    // `run_ok` trims, so the last line printed has no newline of its own;
+    // put one back so every expectation below can name a whole line.
+    let stdout = format!("{stdout}\n");
+    for line in [
+        "half: ERR_OUT_OF_RANGE option\n",
+        "zero: ERR_OUT_OF_RANGE option\n",
+        "exact: 3\n",
+        "floored: 3\n",
+        "under: ERR_OUT_OF_RANGE results\n",
+        "unbounded: 3\n",
+    ] {
+        assert!(stdout.contains(line), "expected {line:?} in: {stdout}");
+    }
+    if cfg!(unix) {
+        assert!(
+            stdout.contains("cycle: ELOOP results\n"),
+            "a link back to an ancestor must end the followed walk: {stdout}"
+        );
+        assert!(
+            stdout.contains("unfollowed: 3\n"),
+            "an unfollowed link is not descended: {stdout}"
+        );
+    }
+}
+
+/// Node contracts of the callback fs module and of process.env / node:module
+/// that each had a quiet gap:
+///
+/// 1. `fs.exists` validates its callback and answers on a later tick, never
+///    inside the call; `util.promisify(fs.exists)` resolves with the boolean.
+/// 2. `fs.constants` and `fs.promises.constants` are one object.
+/// 3. A pending callback `fs.write` is an active request until its callback.
+/// 4. `fs.watchFile(.., { persistent: false })` and `.unref()` do not hold
+///    the event loop open (the exit-3 timer below is unref'd, so it only
+///    fires when something else keeps the loop alive).
+/// 5. `Object.defineProperty(process.env, ...)` stores through the same path
+///    as assignment: nothing for an empty name, and one key per variable on
+///    a case-insensitive host.
+/// 6. `module.isBuiltin` agrees with what can be loaded.
+#[test]
+fn fs_exists_constants_watchfile_env_define_and_is_builtin_contracts() {
+    let stdout = run_ok(
+        "fs_env_module_contracts.mjs",
+        "import fs from 'node:fs';\n\
+         import fsp from 'node:fs/promises';\n\
+         import os from 'node:os';\n\
+         import path from 'node:path';\n\
+         import util from 'node:util';\n\
+         import { isBuiltin, builtinModules } from 'node:module';\n\
+         \n\
+         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-contracts-'));\n\
+         const file = path.join(dir, 'f.txt');\n\
+         fs.writeFileSync(file, 'x');\n\
+         \n\
+         let order = [];\n\
+         const answers = await new Promise((resolve) => {\n\
+         \x20 const got = [];\n\
+         \x20 fs.exists(file, (yes) => { order.push('cb'); got.push(yes);\n\
+         \x20   fs.exists(path.join(dir, 'missing'), (no) => { got.push(no); resolve(got); }); });\n\
+         \x20 order.push('returned');\n\
+         });\n\
+         console.log('existsOrder:', order.join(','));\n\
+         console.log('existsAnswers:', answers.join(','));\n\
+         let code = 'no throw';\n\
+         try { fs.exists(file); } catch (e) { code = e.code; }\n\
+         console.log('existsNoCallback:', code);\n\
+         console.log('existsPromisified:', await util.promisify(fs.exists)(file));\n\
+         \n\
+         console.log('constantsShared:', fs.constants === fsp.constants && fs.constants.R_OK === 4);\n\
+         \n\
+         const fd = fs.openSync(file, 'a');\n\
+         const pending = new Promise((resolve) => fs.write(fd, 'y', () => resolve()));\n\
+         console.log('writeCounted:', process.getActiveResourcesInfo().includes('FSReqCallback'));\n\
+         await pending;\n\
+         console.log('writeReleased:', !process.getActiveResourcesInfo().includes('FSReqCallback'));\n\
+         fs.closeSync(fd);\n\
+         \n\
+         process.env.OAM_DEFINE_CASE = 'first';\n\
+         Object.defineProperty(process.env, 'oam_define_case', {\n\
+         \x20 value: 'second', configurable: true, writable: true, enumerable: true });\n\
+         const spellings = Object.keys(process.env).filter((k) => k.toLowerCase() === 'oam_define_case');\n\
+         console.log('defineKeys:', spellings.length === (process.platform === 'win32' ? 1 : 2));\n\
+         console.log('defineRead:', process.env.oam_define_case);\n\
+         Object.defineProperty(process.env, '', {\n\
+         \x20 value: 'x', configurable: true, writable: true, enumerable: true });\n\
+         console.log('defineEmpty:', Object.keys(process.env).includes(''));\n\
+         console.log('envMiss:', process.env.OAM_NEVER_SET_ANYWHERE, 'OAM_NEVER_SET_ANYWHERE' in process.env);\n\
+         delete process.env.OAM_DEFINE_CASE;\n\
+         console.log('envDeleted:', process.env.oam_define_case === (process.platform === 'win32' ? undefined : 'second'));\n\
+         \n\
+         console.log('isBuiltin:', isBuiltin('node:test'), isBuiltin('test'), isBuiltin('constants'),\n\
+         \x20 isBuiltin('node:constants'), isBuiltin('node:fs'), isBuiltin('fs'), isBuiltin(['fs']),\n\
+         \x20 isBuiltin('node:nope'), builtinModules.includes('constants'), builtinModules.includes('test'));\n\
+         \n\
+         setTimeout(() => { console.log('loopHeld'); process.exit(3); }, 3000).unref();\n\
+         fs.watchFile(file, { persistent: false, interval: 50 }, () => {});\n\
+         fs.watchFile(path.join(dir, 'other'), { interval: 50 }, () => {}).unref();\n\
+         console.log('end');\n",
+    );
+    assert!(
+        stdout.contains("existsOrder: returned,cb\n"),
+        "fs.exists must answer after the call returns: {stdout}"
+    );
+    assert!(
+        stdout.contains("existsAnswers: true,false\n"),
+        "fs.exists answers true / false: {stdout}"
+    );
+    assert!(
+        stdout.contains("existsNoCallback: ERR_INVALID_ARG_TYPE\n"),
+        "fs.exists validates its callback: {stdout}"
+    );
+    assert!(
+        stdout.contains("existsPromisified: true\n"),
+        "util.promisify(fs.exists) resolves with the boolean: {stdout}"
+    );
+    assert!(
+        stdout.contains("constantsShared: true\n"),
+        "fs.constants and fs.promises.constants are one object: {stdout}"
+    );
+    assert!(
+        stdout.contains("writeCounted: true\n") && stdout.contains("writeReleased: true\n"),
+        "a pending fs.write is an active request until its callback: {stdout}"
+    );
+    assert!(
+        stdout.contains("defineKeys: true\n") && stdout.contains("defineRead: second\n"),
+        "defineProperty on process.env stores through the assignment path: {stdout}"
+    );
+    assert!(
+        stdout.contains("defineEmpty: false\n"),
+        "an empty name stores nothing: {stdout}"
+    );
+    assert!(
+        stdout.contains("envMiss: undefined false\n") && stdout.contains("envDeleted: true\n"),
+        "a miss and a delete resolve through the case fold: {stdout}"
+    );
+    assert!(
+        stdout.contains("isBuiltin: true false true true true true false false true false\n"),
+        "module.isBuiltin / builtinModules agree with what loads: {stdout}"
+    );
+    // `run_ok` trims its result, so the final line carries no newline: `end`
+    // must be the last line, with nothing (no `loopHeld`) printed after it.
+    assert!(
+        stdout.ends_with("\nend") && !stdout.contains("loopHeld"),
+        "a non-persistent or unref'd watchFile must not hold the loop open: {stdout}"
+    );
+}
+
 /// The HTTP MCP transport binds 127.0.0.1, and `detectTransport()` picks it
 /// whenever stdin is a TTY -- so an ordinary interactive `oam run server.js`
 /// is listening on localhost by default. "Only local" is not a boundary
@@ -36778,6 +43579,137 @@ oam.exit(0);
         stdout.contains("ALIVE_AFTER_NULL true"),
         "server died on a null body. {ctx}"
     );
+}
+
+/// oam:mcp over streamable HTTP keeps protocol state per client, not per
+/// server:
+///
+/// - `port: 0` binds an OS-chosen port (it used to read as "unset" and fall
+///   back to 3000);
+/// - `initialize` answers the revision the client asked for when the server
+///   speaks it, and mints an `Mcp-Session-Id` for that client alone;
+/// - a second client that has not initialised is still refused, an id the
+///   server never issued is 404, and DELETE ends a session;
+/// - a handler that returns nothing yields an empty `content` array, not a
+///   text block with no `text`;
+/// - a request body whose multi-byte character is split across two writes
+///   arrives intact.
+#[test]
+fn mcp_http_state_is_per_session_and_bodies_decode_across_chunks() {
+    let file = write_temp(
+        "mcp_http_sessions.mjs",
+        r#"
+import http from 'node:http';
+import { McpServer } from 'oam:mcp';
+
+const server = new McpServer({ name: 'sessions', version: '1.0.0' });
+server.tool('noop', { handler: async () => {} });
+server.tool('echo', { handler: async ({ text }) => text });
+
+const { port } = await server.serve({ transport: 'http', port: 0 });
+console.log('PORT_IS_NOT_THE_DEFAULT', String(port !== 3000 && port > 0));
+
+const base = `http://127.0.0.1:${port}/mcp`;
+const init = (version) => ({
+  jsonrpc: '2.0',
+  id: 1,
+  method: 'initialize',
+  params: { protocolVersion: version, capabilities: {}, clientInfo: { name: 't', version: '1' } },
+});
+const call = (name, args) => ({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name, arguments: args } });
+
+async function post(body, sid) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (sid) headers['Mcp-Session-Id'] = sid;
+  const res = await fetch(base, { method: 'POST', headers, body: JSON.stringify(body) });
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+  return { status: res.status, sid: res.headers.get('mcp-session-id'), json };
+}
+
+// Client A initialises with an older revision the server speaks.
+const a = await post(init('2025-06-18'));
+console.log('A_VERSION', a.json.result.protocolVersion);
+console.log('A_HAS_SID', String(typeof a.sid === 'string' && a.sid.length > 0));
+
+// An unknown revision is answered with the server's newest.
+const b = await post(init('1999-01-01'));
+console.log('B_VERSION', b.json.result.protocolVersion);
+console.log('SIDS_DIFFER', String(a.sid !== b.sid));
+
+// A client that never initialised does not ride on A's initialisation.
+const stranger = await post(call('noop', {}));
+console.log('STRANGER_CODE', stranger.json.error && stranger.json.error.code);
+
+// An id this server never issued.
+const bogus = await post(call('noop', {}), 'not-a-session');
+console.log('BOGUS_STATUS', bogus.status);
+
+// A side-effect-only tool: valid, empty content.
+const noop = await post(call('noop', {}), a.sid);
+console.log('NOOP_RESULT', JSON.stringify(noop.json.result));
+
+// A body split in the middle of a two-byte character.
+const word = 'café';
+const bytes = Buffer.from(JSON.stringify(call('echo', { text: word })), 'utf8');
+const cut = bytes.indexOf(0xc3) + 1;
+const split = await new Promise((resolve, reject) => {
+  const req = http.request(
+    {
+      host: '127.0.0.1',
+      port,
+      path: '/mcp',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': bytes.length,
+        'Mcp-Session-Id': a.sid,
+      },
+    },
+    (res) => {
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => { text += c; });
+      res.on('end', () => resolve(JSON.parse(text)));
+    },
+  );
+  req.on('error', reject);
+  req.write(bytes.subarray(0, cut));
+  setTimeout(() => req.end(bytes.subarray(cut)), 100);
+});
+console.log('SPLIT_INTACT', String(cut > 0 && split.result.content[0].text === word));
+
+// DELETE ends A's session; its id is then unknown.
+const del = await fetch(base, { method: 'DELETE', headers: { 'Mcp-Session-Id': a.sid } });
+console.log('DELETE_STATUS', del.status);
+const gone = await post(call('noop', {}), a.sid);
+console.log('GONE_STATUS', gone.status);
+
+oam.exit(0);
+"#,
+    );
+
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let ctx = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    for expected in [
+        "PORT_IS_NOT_THE_DEFAULT true",
+        "A_VERSION 2025-06-18",
+        "A_HAS_SID true",
+        "B_VERSION 2025-11-25",
+        "SIDS_DIFFER true",
+        "STRANGER_CODE -32002",
+        "BOGUS_STATUS 404",
+        "NOOP_RESULT {\"content\":[]}",
+        "SPLIT_INTACT true",
+        "DELETE_STATUS 204",
+        "GONE_STATUS 404",
+    ] {
+        assert!(stdout.contains(expected), "missing `{expected}`. {ctx}");
+    }
 }
 
 /// `runToolLoop` is the one oam:ai export that shipped with no behavioural
@@ -36980,13 +43912,13 @@ clearTimeout(watchdog);
         // {} after a TLS 1.3 handshake: OpenSSL keeps no peer temporary key.
         "ephemeral={}",
         r#"keys=["subject","issuer","ca","modulus","bits","exponent","pubkey","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","serialNumber","raw"]"#,
-        r#"scalars={"subject":{"CN":"localhost"},"issuer":{"CN":"localhost"},"ca":true,"bits":2048,"exponent":"0x10001","modulus":"A10E5AFDF878/512","pubkey":"294:30820122","valid_from":"Jun 15 12:30:07 2026 GMT","valid_to":"Jun 15 12:30:07 2027 GMT","fingerprint":"F3:9E:27:5B:08:05:32:D6:FA:BD:2E:DD:B6:41:6B:69:01:B6:DF:11","fingerprint256":"02:92:43:F0:41:85:E0:BE:02:14:8A:4B:51:9B:6C:D4:64:16:34:4A:6F:8C:64:5D:8A:8F:AF:AD:6E:FE:F0:31","fingerprint512":191,"serialNumber":"26C71188C6C4CF1578E4AB40C43F8B972E1D26B4","raw":781}"#,
+        r#"scalars={"subject":{"CN":"localhost"},"issuer":{"CN":"localhost"},"ca":true,"bits":2048,"exponent":"0x10001","modulus":"A10E5AFDF878/512","pubkey":"294:30820122","valid_from":"Jan  1 00:00:00 2025 GMT","valid_to":"Jan  1 00:00:00 2125 GMT","fingerprint":"0B:59:98:54:D8:C3:60:96:F8:12:C2:FB:4B:A0:58:01:CB:44:F3:9F","fingerprint256":"A6:D0:48:A1:FD:97:E2:40:74:60:FD:7D:88:B3:59:96:3F:1A:EB:D0:60:48:2E:3E:AA:1C:08:CE:C8:8B:EF:D7","fingerprint512":191,"serialNumber":"26C71188C6C4CF1578E4AB40C43F8B972E1D26B4","raw":783}"#,
         // A plain object with null-prototype names, a fresh one per call, no
         // issuerCertificate unless detailed.
         "shape=[true,true,true,false,true]",
         // detailed: one more key, and a self-signed certificate points at itself.
         "detailed=[1,true]",
-        r#"x509={"ctor":"X509Certificate","subject":"CN=localhost","serialNumber":"26C71188C6C4CF1578E4AB40C43F8B972E1D26B4","validFrom":"Jun 15 12:30:07 2026 GMT","sameFingerprint":true,"sameRaw":true,"fresh":true,"san":"undefined","keyUsage":"undefined"}"#,
+        r#"x509={"ctor":"X509Certificate","subject":"CN=localhost","serialNumber":"26C71188C6C4CF1578E4AB40C43F8B972E1D26B4","validFrom":"Jan  1 00:00:00 2025 GMT","sameFingerprint":true,"sameRaw":true,"fresh":true,"san":"undefined","keyUsage":"undefined"}"#,
         // The accepted socket: no key info (null), no peer certificate ({}).
         r#"server={"protocol":"TLSv1.3","cipher":"[object Object]","ephemeral":null,"peer":{},"detailed":{},"x509":"undefined"}"#,
         // The handle is gone: null everywhere, undefined for the X509Certificate.
@@ -37103,7 +44035,7 @@ clearTimeout(watchdog);
 }
 
 // crypto.X509Certificate's fields that came with the legacy object (#138):
-// validFrom/validTo in OpenSSL's "Jun 15 12:30:07 2026 GMT" (they used to
+// validFrom/validTo in OpenSSL's "Jan  1 00:00:00 2025 GMT" (they used to
 // carry "+00:00"), fingerprint512, infoAccess (newline-joined lines),
 // keyUsage as the EXTENDED key usage OIDs, subjectAltName undefined without
 // the extension, a full toLegacyObject(), and BN_bn2hex's serial with a
@@ -37141,7 +44073,7 @@ show('low', [low.serialNumber, low.toLegacyObject().serialNumber]);
         "test failed.\nstdout: {stdout}\nstderr: {stderr}"
     );
     for expected in [
-        r#"rsa={"validFrom":"Jun 15 12:30:07 2026 GMT","validTo":"Jun 15 12:30:07 2027 GMT","san":"undefined","infoAccess":"undefined","keyUsage":"undefined","fp512":64,"ca":true}"#,
+        r#"rsa={"validFrom":"Jan  1 00:00:00 2025 GMT","validTo":"Jan  1 00:00:00 2125 GMT","san":"undefined","infoAccess":"undefined","keyUsage":"undefined","fp512":64,"ca":true}"#,
         r#"rsa.legacy={"keys":["subject","issuer","ca","modulus","bits","exponent","pubkey","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","serialNumber","raw"],"subject":{"CN":"localhost"},"subjectProto":true,"bits":2048,"exponent":"0x10001","modulus":512,"pubkey":294,"raw":true,"fresh":true}"#,
         r#"ec={"infoAccess":"OCSP - URI:http://ocsp.example.test/\nCA Issuers - URI:http://ca.example.test/ca.crt","keyUsage":["1.3.6.1.5.5.7.3.1","1.3.6.1.5.5.7.3.2"],"san":"DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1, email:oam@example.test, URI:https://example.test/x","ca":false}"#,
         r#"ec.legacy={"keys":["subject","issuer","subjectaltname","infoAccess","ca","bits","pubkey","asn1Curve","nistCurve","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw"],"infoAccess":{"OCSP - URI":["http://ocsp.example.test/"],"CA Issuers - URI":["http://ca.example.test/ca.crt"]}}"#,
@@ -37218,6 +44150,52 @@ tcp.close();
     );
 }
 
+/// A child that serves until killed, killed and reaped when the test leaves
+/// scope -- by a failed assert or a [`bounded_output`] panic as much as by
+/// the end of the test. std does not kill a `Child` on drop, and a server
+/// left running keeps the `oam` binary open (on Windows, locked against the
+/// next build).
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The first line a serving child prints on its (piped) stdout, without the
+/// line ending. Bounded: a server that never prints, or exits first, is a
+/// panic naming `what` rather than a test blocked in `read_line` for good.
+fn first_stdout_line(serving: &mut KillOnDrop, what: &str) -> String {
+    let sink = drain_pipe(serving.0.stdout.take().expect("piped stdout"));
+    let bound = std::time::Duration::from_secs(60);
+    let started = std::time::Instant::now();
+    loop {
+        // EOF is read before the bytes: a line that lands between the two
+        // reads is then still seen, not reported as a close without one.
+        let at_eof = sink.at_eof();
+        let bytes = sink.taken();
+        if let Some(end) = bytes.iter().position(|b| *b == b'\n') {
+            return String::from_utf8_lossy(&bytes[..end])
+                .trim_end_matches('\r')
+                .to_string();
+        }
+        assert!(
+            !at_eof,
+            "{what}: stdout closed before a first line; got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(
+            started.elapsed() < bound,
+            "{what}: no first line on stdout within {}s; got {:?}",
+            bound.as_secs(),
+            String::from_utf8_lossy(&bytes)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// A pipe path for one e2e test: a Windows named pipe, a Unix domain socket
 /// in the temp dir elsewhere (short enough for `sun_path`).
 fn e2e_pipe_path(tag: &str) -> String {
@@ -37267,7 +44245,6 @@ fn socket_dir(tag: &str) -> PathBuf {
 /// listening and serves until killed; the client checks the echo and exits.
 #[test]
 fn net_pipe_server_and_client_interoperate_with_node() {
-    use std::io::BufRead;
     if !node_available() {
         eprintln!("skipping: node not installed (the other end runs on it)");
         return;
@@ -37298,22 +44275,21 @@ fn net_pipe_server_and_client_interoperate_with_node() {
     );
     for (server_on_oam, tag) in [(true, "oam-serves"), (false, "node-serves")] {
         let path = e2e_pipe_path(tag);
-        let mut serving = if server_on_oam {
-            oam_command(&["--", server.to_str().unwrap(), &path])
-        } else {
-            let mut cmd = std::process::Command::new("node");
-            cmd.args([server.to_str().unwrap(), &path]);
-            cmd
-        }
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .expect("the server runs");
-        let mut listening = String::new();
-        std::io::BufReader::new(serving.stdout.take().unwrap())
-            .read_line(&mut listening)
-            .expect("the server prints its address");
+        let mut serving = KillOnDrop(
+            if server_on_oam {
+                oam_command(&["--", server.to_str().unwrap(), &path])
+            } else {
+                let mut cmd = std::process::Command::new("node");
+                cmd.args([server.to_str().unwrap(), &path]);
+                cmd
+            }
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("the server runs"),
+        );
+        let listening = first_stdout_line(&mut serving, "the server prints its address");
         assert_eq!(listening.trim(), path, "{tag}: address() is the path");
         let out = if server_on_oam {
             bounded_output(
@@ -37322,8 +44298,7 @@ fn net_pipe_server_and_client_interoperate_with_node() {
         } else {
             bounded_output(&mut oam_command(&["--", client.to_str().unwrap(), &path]))
         };
-        let _ = serving.kill();
-        let _ = serving.wait();
+        drop(serving);
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success(),
@@ -37389,7 +44364,16 @@ fn a_pipe_is_a_net_resource_granted_by_its_exact_path() {
     let first = if cfg!(windows) {
         r"\\.".to_string()
     } else {
-        "/tmp".to_string()
+        // The path's own first component, not a fixed `/tmp`: the socket is
+        // under `temp_dir()`, which is `/var/folders/..` on macOS and
+        // whatever TMPDIR says elsewhere.
+        format!(
+            "/{}",
+            path.trim_start_matches('/')
+                .split('/')
+                .next()
+                .unwrap_or_default()
+        )
     };
     for grant in [
         "--allow-net=127.0.0.1".to_string(),
@@ -37681,16 +44665,30 @@ fn a_pipe_path_with_a_nul_byte_is_einval_as_on_node() {
         }
     }
     expected.push_str("done\n");
-    if node_available() {
-        let node = std::process::Command::new("node")
-            .args([script.to_str().unwrap(), &dir_s, &secret_s])
-            .output()
-            .expect("node runs");
-        assert_eq!(
-            String::from_utf8_lossy(&node.stdout).replace("\r\n", "\n"),
-            expected,
-            "node's own answer"
-        );
+    // The expected block is node 22's (measured on v22.22.2). Whatever
+    // `node` is on PATH is cross-checked only when it is that major: another
+    // major's error keys or wording differing is not an oam defect.
+    let node_version = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+    match node_version.as_deref() {
+        Some(version) if version.starts_with("v22.") => {
+            let node = bounded_output(std::process::Command::new("node").args([
+                script.to_str().unwrap(),
+                &dir_s,
+                &secret_s,
+            ]));
+            assert_eq!(
+                String::from_utf8_lossy(&node.stdout).replace("\r\n", "\n"),
+                expected,
+                "node's own answer ({version})"
+            );
+        }
+        Some(version) => eprintln!("note: node cross-check skipped, PATH has {version}, not v22"),
+        None => eprintln!("note: node cross-check skipped, node not installed"),
     }
     assert_eq!(run(&[], false), expected);
     // Under --permission, whatever the grants: the same EINVAL, before any
@@ -38269,6 +45267,11 @@ fn drain_records(
                         break;
                     }
                 }
+                // An interrupted read is not the end of the stream and not an
+                // idle one either: std does not retry it, and leaving the
+                // loop here drops the reading end while the child still
+                // writes (a datagram peer then fails its next write).
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => break,
             }
         }
@@ -38662,6 +45665,41 @@ process.stdout.write(Buffer.from([0xff, 0x00, 0x41]));
     let bytes = sink.records().concat();
     let expected = [0xe2, 0x82, 0xac, 0x0a, 0xff, 0x00, 0x41];
     assert!(bytes == expected, "{}", first_difference(&bytes, &expected));
+}
+
+/// An environment entry and a script argument that are not valid UTF-8 do
+/// not stop the run: process.env still enumerates (the entry is there, its
+/// undecodable byte shown as U+FFFD) and process.argv is readable. Both used
+/// to end the process, std's `env::vars()` / `env::args()` panicking on the
+/// first entry that does not decode. unix only: a Windows `Command` cannot
+/// be handed a lone surrogate without the wide-string API.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_env_entry_and_argument_do_not_stop_the_run() {
+    use std::os::unix::ffi::OsStrExt;
+    let script = write_temp(
+        "non_utf8_env_and_arg.mjs",
+        r"
+const v = process.env.OAM_E2E_NOT_UTF8;
+console.log('env:', typeof v, v === 'a�b');
+console.log('keys:', Object.keys(process.env).includes('OAM_E2E_NOT_UTF8'));
+console.log('argv:', process.argv.length, process.argv[2] === 'x�y');
+",
+    );
+    let mut cmd = oam_command(&["run", script.to_str().unwrap(), "--"]);
+    cmd.arg(std::ffi::OsStr::from_bytes(b"x\xffy"));
+    cmd.env("OAM_E2E_NOT_UTF8", std::ffi::OsStr::from_bytes(b"a\xffb"));
+    let out = bounded_output(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        "env: string true\nkeys: true\nargv: 3 true\n"
+    );
 }
 
 /// A stdout that takes no writes: a file opened read-only, as `oam run x.mjs
@@ -39180,16 +46218,9 @@ catch (e) {{ console.log('mailslot: ' + [e.code, e.errno, e.syscall, 'winError' 
     );
 }
 
-/// The engine's own async path, end to end and on every OS (#450): an
-/// `OpOutcome::NodeFailed` with the Win32 code, handed to the live engine by
-/// record/replay. The trace of a failing `fs.promises.stat` is rewritten into
-/// the `UNKNOWN` a Win32 code libuv does not name would produce -- with
-/// `win_error` and, as a pre-#450 recording, without -- and replayed, so the
-/// NodeFailed arm, `SysFields`, `sys_error`'s record and the JS factory all
-/// run on the real rejection, which fs/promises then re-frames on the same
-/// object. No deterministic async UNKNOWN exists from JS alone; this is the
-/// one way to drive the path with a chosen outcome.
-/// The same through node:dns (#450, review of #451): a resolver failure whose
+/// The engine's async path through node:dns (#450, review of #451; the fs
+/// counterpart is `an_async_rejection_keeps_the_win32_code_through_replay`):
+/// a resolver failure whose
 /// WSA code libuv's getaddrinfo translation does not name is an UNKNOWN with
 /// the code kept on the native rejection, and the dns module rebuilds every
 /// rejection into node's DNSException shape (`_shapeDnsError`), which must
@@ -39198,8 +46229,8 @@ catch (e) {{ console.log('mailslot: ' + [e.code, e.errno, e.syscall, 'winError' 
 /// native path and the reshape both run; every OS.
 #[test]
 fn a_dns_rejection_keeps_the_win32_code_through_the_reshape() {
-    let script = write_temp(
-        "replay_dns_win_error.mjs",
+    let (recorded, outputs) = replay_with_edited_outcomes(
+        "replay_dns_win_error",
         r"
 import dns from 'node:dns';
 try { await dns.promises.lookup('no-such-host.invalid'); console.log('lookup resolved'); }
@@ -39210,75 +46241,28 @@ catch (e) {
     JSON.stringify(Object.keys(e)), JSON.stringify(Object.getOwnPropertyNames(e)), JSON.stringify(e)].join(' | '));
 }
 ",
+        // The lookup's one failed op: whatever the host's resolver said
+        // (ENOTFOUND or EAI_AGAIN), make it the UNKNOWN an unlisted WSA code
+        // produces. The UNKNOWN in the expected lines is what proves the
+        // rewrite took (see `replay_with_outcomes`).
+        |o| o.get("NodeFailed").is_some(),
+        |recorded| {
+            let mut outcome = recorded.clone();
+            outcome["NodeFailed"]["code"] = "UNKNOWN".into();
+            outcome["NodeFailed"]["errno"] = (-4094).into();
+            outcome["NodeFailed"]["message"] = "getaddrinfo UNKNOWN no-such-host.invalid".into();
+            let mut with_code = outcome.clone();
+            with_code["NodeFailed"]["win_error"] = 10041.into();
+            vec![("with", with_code), ("without", outcome)]
+        },
     );
-    let trace = write_temp("replay_dns_win_error.jsonl", "");
-    let run = |args: &[&str]| {
-        let out = oam(args);
-        assert!(
-            out.status.success(),
-            "exit {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
-    let recorded = run(&[
-        "run",
-        "--record",
-        trace.to_str().unwrap(),
-        script.to_str().unwrap(),
-        "--no-check",
-    ]);
     assert!(recorded.contains(" | getaddrinfo | "), "{recorded}");
-    // The lookup's one Op event: whatever the host's resolver said (ENOTFOUND
-    // or EAI_AGAIN), make it the UNKNOWN an unlisted WSA code produces.
-    let ops: Vec<serde_json::Value> = std::fs::read_to_string(&trace)
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    let failed: Vec<usize> = (0..ops.len())
-        .filter(|&i| {
-            ops[i]["type"] == "Op"
-                && ops[i]["outcome_json"]
-                    .as_str()
-                    .is_some_and(|o| o.contains("NodeFailed"))
-        })
-        .collect();
-    assert_eq!(failed.len(), 1, "one failed op in the trace: {ops:?}");
-    let mut outcome: serde_json::Value =
-        serde_json::from_str(ops[failed[0]]["outcome_json"].as_str().unwrap()).unwrap();
-    outcome["NodeFailed"]["code"] = "UNKNOWN".into();
-    outcome["NodeFailed"]["errno"] = (-4094).into();
-    outcome["NodeFailed"]["message"] = "getaddrinfo UNKNOWN no-such-host.invalid".into();
-    let replay = |tag: &str, outcome: &serde_json::Value| {
-        let mut events = ops.clone();
-        events[failed[0]]["outcome_json"] = serde_json::to_string(outcome).unwrap().into();
-        let body: String = events
-            .iter()
-            .map(|e| format!("{}\n", serde_json::to_string(e).unwrap()))
-            .collect();
-        let edited = write_temp(&format!("replay_dns_win_error.{tag}.jsonl"), &body);
-        // The replayer falls back to the live op if an edited outcome fails to
-        // parse, so the UNKNOWN in the expected lines is what proves the
-        // rewrite took.
-        run(&[
-            "run",
-            "--replay",
-            edited.to_str().unwrap(),
-            script.to_str().unwrap(),
-            "--no-check",
-        ])
-    };
-    let mut with_code = outcome.clone();
-    with_code["NodeFailed"]["win_error"] = 10041.into();
     assert_eq!(
-        replay("with", &with_code),
-        r#"UNKNOWN | -4094 | getaddrinfo | getaddrinfo UNKNOWN no-such-host.invalid | 10041 | w-c | ["errno","code","syscall","hostname"] | ["stack","message","errno","code","syscall","hostname","winError"] | {"errno":-4094,"code":"UNKNOWN","syscall":"getaddrinfo","hostname":"no-such-host.invalid"}"#
-    );
-    assert_eq!(
-        replay("without", &outcome),
-        r#"UNKNOWN | -4094 | getaddrinfo | getaddrinfo UNKNOWN no-such-host.invalid | undefined | absent | ["errno","code","syscall","hostname"] | ["stack","message","errno","code","syscall","hostname"] | {"errno":-4094,"code":"UNKNOWN","syscall":"getaddrinfo","hostname":"no-such-host.invalid"}"#
+        outputs,
+        [
+            r#"UNKNOWN | -4094 | getaddrinfo | getaddrinfo UNKNOWN no-such-host.invalid | 10041 | w-c | ["errno","code","syscall","hostname"] | ["stack","message","errno","code","syscall","hostname","winError"] | {"errno":-4094,"code":"UNKNOWN","syscall":"getaddrinfo","hostname":"no-such-host.invalid"}"#,
+            r#"UNKNOWN | -4094 | getaddrinfo | getaddrinfo UNKNOWN no-such-host.invalid | undefined | absent | ["errno","code","syscall","hostname"] | ["stack","message","errno","code","syscall","hostname"] | {"errno":-4094,"code":"UNKNOWN","syscall":"getaddrinfo","hostname":"no-such-host.invalid"}"#,
+        ]
     );
 }
 
@@ -39295,6 +46279,20 @@ fn replay_with_outcomes(
     select: impl Fn(&serde_json::Value) -> bool,
     outcomes: &[(&str, serde_json::Value)],
 ) -> Vec<String> {
+    replay_with_edited_outcomes(tag, source, select, |_| outcomes.to_vec()).1
+}
+
+/// [`replay_with_outcomes`] for outcomes derived from the recorded one:
+/// `edit` is handed the picked op's recorded outcome and returns the
+/// `(tag, outcome)` pairs to replay, so a test can change a few fields and
+/// keep the rest as the host recorded them. Returns the recording run's
+/// trimmed stdout as well, then each replay's.
+fn replay_with_edited_outcomes<'a>(
+    tag: &str,
+    source: &str,
+    select: impl Fn(&serde_json::Value) -> bool,
+    edit: impl FnOnce(&serde_json::Value) -> Vec<(&'a str, serde_json::Value)>,
+) -> (String, Vec<String>) {
     let script = write_temp(&format!("{tag}.mjs"), source);
     let trace = write_temp(&format!("{tag}.jsonl"), "");
     let run = |args: &[&str]| {
@@ -39307,7 +46305,7 @@ fn replay_with_outcomes(
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
-    run(&[
+    let recorded = run(&[
         "run",
         "--record",
         trace.to_str().unwrap(),
@@ -39329,7 +46327,9 @@ fn replay_with_outcomes(
         })
         .collect();
     assert_eq!(picked.len(), 1, "exactly one op matches: {events:?}");
-    outcomes
+    let recorded_outcome: serde_json::Value =
+        serde_json::from_str(events[picked[0]]["outcome_json"].as_str().unwrap()).unwrap();
+    let replays: Vec<String> = edit(&recorded_outcome)
         .iter()
         .map(|(name, outcome)| {
             let mut edited = events.clone();
@@ -39347,7 +46347,8 @@ fn replay_with_outcomes(
                 "--no-check",
             ])
         })
-        .collect()
+        .collect();
+    (recorded, replays)
 }
 
 /// A pipe server's listen failure that carries a Win32 code: node's
@@ -39573,10 +46574,19 @@ fn every_fatal_unknown_report_names_its_win32_code() {
     }
 }
 
+/// The engine's own async path, end to end and on every OS (#450): an
+/// `OpOutcome::NodeFailed` with the Win32 code, handed to the live engine by
+/// record/replay. The trace of a failing `fs.promises.stat` is rewritten into
+/// the `UNKNOWN` a Win32 code libuv does not name would produce -- with
+/// `win_error` and, as a pre-#450 recording, without -- and replayed, so the
+/// NodeFailed arm, `SysFields`, `sys_error`'s record and the JS factory all
+/// run on the real rejection, which fs/promises then re-frames on the same
+/// object. No deterministic async UNKNOWN exists from JS alone; this is the
+/// one way to drive the path with a chosen outcome.
 #[test]
 fn an_async_rejection_keeps_the_win32_code_through_replay() {
-    let script = write_temp(
-        "replay_win_error.mjs",
+    let (recorded, outputs) = replay_with_edited_outcomes(
+        "replay_win_error",
         r"
 import fsp from 'node:fs/promises';
 try { await fsp.stat('missing-for-450'); console.log('stat resolved'); }
@@ -39587,63 +46597,33 @@ catch (e) {
     JSON.stringify(Object.getOwnPropertyNames(e)), String(e.stack).includes('\n    at ')].join(' | '));
 }
 ",
+        // The one failed op is the stat's NodeFailed; make it the UNKNOWN
+        // that a Win32 code libuv has no row for produces.
+        |o| o.get("NodeFailed").is_some(),
+        |recorded| {
+            let mut outcome = recorded.clone();
+            let path = outcome["NodeFailed"]["path"].as_str().unwrap().to_string();
+            outcome["NodeFailed"]["code"] = "UNKNOWN".into();
+            outcome["NodeFailed"]["errno"] = (-4094).into();
+            outcome["NodeFailed"]["message"] =
+                format!("UNKNOWN: unknown error, stat '{path}'").into();
+            let mut with_code = outcome.clone();
+            with_code["NodeFailed"]["win_error"] = 536.into();
+            // "without" is a recording from before the field: the same
+            // error, nothing kept.
+            vec![("with", with_code), ("without", outcome)]
+        },
     );
-    let trace = write_temp("replay_win_error.jsonl", "");
-    let run = |args: &[&str]| {
-        let out = oam(args);
-        assert!(
-            out.status.success(),
-            "exit {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
-    let recorded = run(&[
-        "run",
-        "--record",
-        trace.to_str().unwrap(),
-        script.to_str().unwrap(),
-        "--no-check",
-    ]);
     assert!(
         recorded.starts_with("ENOENT | ") && recorded.contains(" | undefined | absent | "),
         "{recorded}"
     );
-    // The one Op event is the stat's NodeFailed; make it the UNKNOWN that a
-    // Win32 code libuv has no row for produces.
-    let line = std::fs::read_to_string(&trace).unwrap();
-    let mut event: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-    let mut outcome: serde_json::Value =
-        serde_json::from_str(event["outcome_json"].as_str().unwrap()).unwrap();
-    let path = outcome["NodeFailed"]["path"].as_str().unwrap().to_string();
-    outcome["NodeFailed"]["code"] = "UNKNOWN".into();
-    outcome["NodeFailed"]["errno"] = (-4094).into();
-    outcome["NodeFailed"]["message"] = format!("UNKNOWN: unknown error, stat '{path}'").into();
-    let mut with_code = outcome.clone();
-    with_code["NodeFailed"]["win_error"] = 536.into();
-    let mut replay = |tag: &str, outcome: &serde_json::Value| {
-        event["outcome_json"] = serde_json::to_string(outcome).unwrap().into();
-        let edited = write_temp(
-            &format!("replay_win_error.{tag}.jsonl"),
-            &format!("{}\n", serde_json::to_string(&event).unwrap()),
-        );
-        run(&[
-            "run",
-            "--replay",
-            edited.to_str().unwrap(),
-            script.to_str().unwrap(),
-            "--no-check",
-        ])
-    };
     assert_eq!(
-        replay("with", &with_code),
-        r#"UNKNOWN | -4094 | 536 | w-c | ["errno","code","syscall","path"] | ["stack","message","errno","code","syscall","path","winError"] | true"#
-    );
-    // A recording from before the field: the same error, nothing kept.
-    assert_eq!(
-        replay("without", &outcome),
-        r#"UNKNOWN | -4094 | undefined | absent | ["errno","code","syscall","path"] | ["stack","message","errno","code","syscall","path"] | true"#
+        outputs,
+        [
+            r#"UNKNOWN | -4094 | 536 | w-c | ["errno","code","syscall","path"] | ["stack","message","errno","code","syscall","path","winError"] | true"#,
+            r#"UNKNOWN | -4094 | undefined | absent | ["errno","code","syscall","path"] | ["stack","message","errno","code","syscall","path"] | true"#,
+        ]
     );
 }
 
@@ -39770,10 +46750,9 @@ fn a_negative_descriptor_never_reaches_stdin() {
         .write(true)
         .open(&stdin_path)
         .expect("open stdin file");
-    let out = oam_command(&[&script.to_string_lossy()])
-        .stdin(std::process::Stdio::from(stdin))
-        .output()
-        .expect("oam runs");
+    let out = bounded_output_keeping_stdin(
+        oam_command(&[&script.to_string_lossy()]).stdin(std::process::Stdio::from(stdin)),
+    );
     let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
     assert_eq!(
         stdout,
@@ -39996,6 +46975,47 @@ fn worker_and_fork_entry_gates_test_the_namespaced_path() {
         stdout,
         "worker w.js. MODULE_NOT_FOUND\nworker w.js. exit 1\nfork w.js. not found\n\
          worker x.js. exit 0\nfork x.js. passed\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// A fork served by a pre-warmed isolate and one that cold-starts run the same
+// routine, so a forked script's process 'exit' listeners run either way.
+// Three forks in a row: the pool holds two isolates, so the third cold-starts.
+// Only the cold one used to emit 'exit'.
+#[test]
+fn fork_runs_process_exit_listeners_whether_or_not_a_slot_was_free() {
+    let child = write_temp(
+        "fork_exit_listeners/child.cjs",
+        "const fs = require('fs');\n\
+         const path = require('path');\n\
+         const name = 'exit-' + Math.random().toString(36).slice(2);\n\
+         process.on('exit', () => fs.writeFileSync(path.join(__dirname, name), ''));\n",
+    );
+    let script = write_temp(
+        "fork_exit_listeners/main.cjs",
+        "const fs = require('fs');\n\
+         const child = process.argv[2];\n\
+         const dir = require('path').dirname(child);\n\
+         const markers = () => fs.readdirSync(dir).filter((f) => f.startsWith('exit-'));\n\
+         for (const f of markers()) fs.unlinkSync(require('path').join(dir, f));\n\
+         for (let i = 0; i < 3; i++) globalThis.__oam.forkSpawn(child, null);\n\
+         const started = Date.now();\n\
+         (function poll() {\n\
+           const seen = markers().length;\n\
+           if (seen === 3 || Date.now() - started > 15000) {\n\
+             console.log('exit listeners ran: ' + seen);\n\
+             process.exit(0);\n\
+           }\n\
+           setTimeout(poll, 25);\n\
+         })();\n",
+    );
+    let out = oam(&[script.to_str().unwrap(), child.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(
+        stdout,
+        "exit listeners ran: 3\n",
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -40251,20 +47271,24 @@ fn a_write_grant_alone_reads_nothing() {
         "promises.readFile",
         "promises.open",
     ];
+    // Whole lines, not substrings: `readFile r: ...` is the tail of the
+    // `promises.readFile r: ...` line, and each row is its own check.
+    let lines: Vec<&str> = stdout.lines().map(str::trim_end).collect();
     for flag in ["r", "r+", "a+", "w+", "2"] {
         for row in rows {
+            let want = format!("{row} {flag}: ERR_ACCESS_DENIED FileSystemRead");
             assert!(
-                stdout.contains(&format!("{row} {flag}: ERR_ACCESS_DENIED FileSystemRead")),
+                lines.contains(&want.as_str()),
                 "{row} {flag} needs the read grant: {stdout}"
             );
         }
     }
     assert!(
-        stdout.contains("stream r+: ERR_ACCESS_DENIED FileSystemRead"),
+        lines.contains(&"stream r+: ERR_ACCESS_DENIED FileSystemRead"),
         "{stdout}"
     );
     // A write-only open needs only the write grant.
-    assert!(stdout.contains("openSync a: got a descriptor"), "{stdout}");
+    assert!(lines.contains(&"openSync a: got a descriptor"), "{stdout}");
     assert_eq!(std::fs::read_to_string(&secret).unwrap(), "secret");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -40467,10 +47491,299 @@ fn os_uptime_is_the_system_uptime_not_the_process_uptime() {
          console.log('system_not_process:', up > process.uptime() + 1);\n\
          console.log('monotone:', os.uptime() >= up);",
     );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+    assert_true_lines(&stdout, &["number:", "system_not_process:", "monotone:"]);
+}
+
+/// A `#name` subpath import whose package.json `imports` target is a
+/// builtin (`"#fs": "fs"`): `import` loads the builtin, while `require()` and
+/// `require.resolve()` throw node's TypeError `ERR_INVALID_URL_SCHEME`
+/// ("The URL must be of scheme file") -- node's CJS loader gets a `node:` URL
+/// from the resolver and cannot turn it into a path, whatever condition
+/// picked the target. A package or file target is unaffected. The expected
+/// lines are node v22.22.2's output for the same project.
+#[test]
+fn subpath_import_of_a_builtin_loads_for_import_and_throws_for_require() {
+    write_temp(
+        "subpath_builtin/package.json",
+        r##"{ "name": "subpath-builtin", "imports": {
+  "#fs": "fs", "#path": "path", "#cond": { "require": "fs", "import": "fs" },
+  "#dep": "dep", "#local": "./local.cjs" } }"##,
+    );
+    write_temp("subpath_builtin/local.cjs", "module.exports = 'local';\n");
+    write_temp(
+        "subpath_builtin/node_modules/dep/package.json",
+        r#"{"name":"dep","main":"index.js"}"#,
+    );
+    write_temp(
+        "subpath_builtin/node_modules/dep/index.js",
+        "module.exports = 'dep';\n",
+    );
+    let main = write_temp(
+        "subpath_builtin/main.cjs",
+        r##"const ids = ['#fs', '#path', '#cond', '#dep', '#local'];
+const shape = (m) => (typeof m === 'string' ? m : typeof m.readFileSync + '/' + typeof m.join);
+const thrown = (e) => ['THROW', e.name, e.code, JSON.stringify(e.message)].join(' ');
+for (const id of ids) {
+  try { console.log('require', id, 'ok', shape(require(id))); }
+  catch (e) { console.log('require', id, thrown(e)); }
+  try { const r = require.resolve(id); console.log('resolve', id, 'ok', require('path').basename(r)); }
+  catch (e) { console.log('resolve', id, thrown(e)); }
+}
+(async () => {
+  for (const id of ids) {
+    const m = await import(id);
+    console.log('import', id, 'ok', shape(typeof m.default === 'string' ? m.default : m));
+  }
+})();
+"##,
+    );
+    let out = oam(&["run", main.to_str().unwrap(), "--no-check"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let expected = r#"require #fs THROW TypeError ERR_INVALID_URL_SCHEME "The URL must be of scheme file"
+resolve #fs THROW TypeError ERR_INVALID_URL_SCHEME "The URL must be of scheme file"
+require #path THROW TypeError ERR_INVALID_URL_SCHEME "The URL must be of scheme file"
+resolve #path THROW TypeError ERR_INVALID_URL_SCHEME "The URL must be of scheme file"
+require #cond THROW TypeError ERR_INVALID_URL_SCHEME "The URL must be of scheme file"
+resolve #cond THROW TypeError ERR_INVALID_URL_SCHEME "The URL must be of scheme file"
+require #dep ok dep
+resolve #dep ok index.js
+require #local ok local
+resolve #local ok local.cjs
+import #fs ok function/undefined
+import #path ok undefined/function
+import #cond ok function/undefined
+import #dep ok dep
+import #local ok local
+"#;
+    assert_eq!(stdout.replace("\r\n", "\n"), expected);
+}
+
+/// File descriptors come from their own table, which hands out the lowest
+/// free number from 3 up and takes it back on close, as node's programs see
+/// (maintainer decision; measured on node v22.22.2, whose output for this
+/// script on Windows is the text below, byte for byte). They used to come
+/// from the id counter sockets, bodies and children share, which only counts
+/// up: the first open was 64 and no number was ever reissued.
+///
+/// The second half is what a separate table has to keep true: a descriptor
+/// may now equal a live socket's or child's id, so a hundred files are held
+/// open -- every number from 3 past the shared counter's start is a
+/// descriptor -- while a server, four sockets and a child come and go. Each
+/// kind goes on working when the other is closed, a number closed twice is
+/// EBADF, and the sockets cost the table no numbers.
+#[test]
+fn file_descriptors_are_the_lowest_free_number_and_are_reused() {
+    let script = write_temp(
+        "fd_table_contract.mjs",
+        r##"import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-fd-table-'));
+const p = (n) => path.join(dir, n);
+for (const n of ['a', 'b', 'c', 'd']) fs.writeFileSync(p(n), n.repeat(4));
+const code = (f) => { try { f(); return 'ok'; } catch (e) { return e.code + ' ' + e.syscall; } };
+const cb = (run) => new Promise((res) => run((er, v) => res(er ? er.code + ' ' + er.syscall : v)));
+const text = (fd) => { const b = Buffer.alloc(4); return fs.readSync(fd, b, 0, 4, 0) + ' ' + b; };
+
+// Three opens: consecutive small numbers.
+const a = fs.openSync(p('a'), 'r'), b = fs.openSync(p('b'), 'r'), c = fs.openSync(p('c'), 'r');
+console.log('first', process.platform === 'win32' ? a : 'small ' + (a >= 3 && a < 64));
+console.log('consecutive', b - a, c - b);
+// The middle one closed is the number the next open returns, sync or async.
+fs.closeSync(b);
+const d = fs.openSync(p('d'), 'r');
+console.log('reuse sync', d === b, text(d));
+console.log('close', code(() => fs.closeSync(d)), '| again', code(() => fs.closeSync(d)));
+// Every fs op on the closed number is EBADF.
+console.log('fstatSync', code(() => fs.fstatSync(d)));
+console.log('readSync', code(() => fs.readSync(d, Buffer.alloc(1), 0, 1, 0)));
+console.log('writeSync', code(() => fs.writeSync(d, 'x')));
+console.log('fsyncSync', code(() => fs.fsyncSync(d)));
+console.log('ftruncateSync', code(() => fs.ftruncateSync(d, 0)));
+console.log('fstat', await cb((done) => fs.fstat(d, done)));
+console.log('read', await cb((done) => fs.read(d, Buffer.alloc(1), 0, 1, 0, done)));
+console.log('write', await cb((done) => fs.write(d, 'x', done)));
+console.log('close cb', await cb((done) => fs.close(d, done)));
+const e = await cb((done) => fs.open(p('d'), 'r', done));
+console.log('reuse async', e === b, text(e));
+// A FileHandle takes the next number, gives it back, and the next takes it.
+const fh = await fsp.open(p('b'), 'r');
+console.log('filehandle', fh.fd === c + 1, (await fh.read(Buffer.alloc(4), 0, 4, 0)).buffer.toString());
+await fh.close();
+console.log('filehandle closed', fh.fd);
+const fh2 = await fsp.open(p('c'), 'r');
+console.log('filehandle reuse', fh2.fd === c + 1, (await fh2.read(Buffer.alloc(4), 0, 4, 0)).buffer.toString());
+await fh2.close();
+// A stream's descriptor comes from the same table and goes back to it.
+const rs = fs.createReadStream(p('a'));
+const rsFd = await new Promise((res) => rs.on('open', res));
+console.log('stream fd', rsFd === c + 1);
+await new Promise((res) => rs.on('close', res).resume());
+const after = fs.openSync(p('a'), 'r');
+console.log('stream fd reused', after === c + 1);
+fs.closeSync(after);
+fs.closeSync(e);
+
+// Descriptors stay what they are while sockets, a server and a child come
+// and go -- with enough files open that every small number is a descriptor.
+const many = [];
+for (let i = 0; i < 100; i++) many.push(fs.openSync(p('abcd'[i % 4]), 'r'));
+// How many numbers the hundred span depends on which inherited descriptors
+// the table steps around (a test runner hands down its own), so the span is
+// bounded rather than pinned: at most the 61 inherited slots wider.
+console.log('dense', many[99] - many[0] < 100 + 61, new Set(many).size, many.every((fd) => (fd | 0) === fd));
+const all = () => many.every((fd, i) => fd === null || text(fd) === '4 ' + 'abcd'[i % 4].repeat(4));
+const server = net.createServer((s) => s.on('data', (chunk) => s.write(String(chunk).toUpperCase())));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const socks = [];
+for (let i = 0; i < 4; i++) {
+  const s = net.connect(server.address().port, '127.0.0.1');
+  await new Promise((r) => s.on('connect', r));
+  socks.push(s);
+}
+const echo = (s, word) => new Promise((res) => { s.once('data', (chunk) => res(String(chunk))); s.write(word); });
+console.log('files with sockets open', all(), text(a), text(c));
+// Close every other descriptor while the sockets are live: the sockets go on.
+const closed = many.filter((fd, i) => i % 2 === 0);
+for (let i = 0; i < 100; i += 2) { fs.closeSync(many[i]); many[i] = null; }
+console.log('sockets after closes', (await Promise.all(socks.map((s, i) => echo(s, 'ping' + i)))).join(' '));
+// Close the sockets and the server: the descriptors go on.
+await Promise.all(socks.map((s) => new Promise((r) => s.on('close', r).destroy())));
+await new Promise((r) => server.close(r));
+console.log('files after sockets closed', all(), text(a), fs.fstatSync(c).size);
+// Sockets opened and closed took none of the table's numbers.
+const again = [];
+for (let i = 0; i < 50; i++) again.push(fs.openSync(p('a'), 'r'));
+console.log('lowest free first', again.every((fd, i) => fd === closed[i]));
+const child = spawn(process.execPath, ['-e', 'console.log("child")']);
+let out = '';
+child.stdout.on('data', (chunk) => { out += chunk; });
+const exit = await new Promise((r) => child.on('close', r));
+console.log('child', exit, out.trim(), '| files', all(), text(a));
+for (const fd of again) fs.closeSync(fd);
+for (const fd of many) if (fd !== null) fs.closeSync(fd);
+console.log('closed twice', code(() => fs.closeSync(many[1])), code(() => fs.closeSync(again[0])));
+fs.closeSync(a); fs.closeSync(c);
+console.log('all closed', code(() => fs.fstatSync(a)), code(() => fs.fstatSync(c)));
+const last = fs.openSync(p('a'), 'r');
+console.log('back to the first', last === a);
+fs.closeSync(last);
+fs.rmSync(dir, { recursive: true });
+"##,
+    );
+    let out = bounded_output(&mut oam_command(&[&script.to_string_lossy()]));
+    let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    // The first number is exact where it was measured; elsewhere the test
+    // runner may have handed the process descriptors of its own, which the
+    // table passes over, so the script prints only that it is small.
+    let first = if cfg!(windows) {
+        "first 3"
+    } else {
+        "first small true"
+    };
+    let expected = format!(
+        "{first}\n{}",
+        r##"consecutive 1 1
+reuse sync true 4 dddd
+close ok | again EBADF close
+fstatSync EBADF fstat
+readSync EBADF read
+writeSync EBADF write
+fsyncSync EBADF fsync
+ftruncateSync EBADF ftruncate
+fstat EBADF fstat
+read EBADF read
+write EBADF write
+close cb EBADF close
+reuse async true 4 dddd
+filehandle true bbbb
+filehandle closed -1
+filehandle reuse true cccc
+stream fd true
+stream fd reused true
+dense true 100 true
+files with sockets open true 4 aaaa 4 cccc
+sockets after closes PING0 PING1 PING2 PING3
+files after sockets closed true 4 aaaa 4
+lowest free first true
+child 0 child | files true 4 aaaa
+closed twice EBADF close EBADF close
+all closed EBADF fstat EBADF fstat
+back to the first true
+"##
+    );
+    assert_eq!(
+        stdout,
+        expected,
+        "exit {}; stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The table and the descriptors a parent hands down share one numbering, as
+/// a kernel's table does: with 3 and 4 inherited the child's first files are
+/// 5 and 6, closing 4 closes the parent's pipe (it reads what was written and
+/// then EOF) and makes 4 the next number issued, and a second close of 4 is
+/// EBADF rather than a close of the file that has since taken a number.
+/// node v22.22.2 prints these same lines as the child on Windows, under a
+/// node parent and an oam one alike. Windows only because that is where it
+/// was measured: on unix node's own numbers start wherever its event loop's
+/// descriptors end.
+#[cfg(windows)]
+#[test]
+fn own_descriptors_are_numbered_around_inherited_ones() {
+    write_temp(
+        "fd_table_inherited_child.cjs",
+        r##"const fs = require('fs');
+const f = __filename;
+const code = (g) => { try { return String(g()); } catch (e) { return e.code + ' ' + e.syscall; } };
+const a = fs.openSync(f, 'r');
+const b = fs.openSync(f, 'r');
+const out = ['own ' + a + ' ' + b];
+out.push('write4 ' + code(() => fs.writeSync(4, 'to-parent')));
+out.push('close4 ' + code(() => fs.closeSync(4)) + ' again ' + code(() => fs.closeSync(4)));
+const c = fs.openSync(f, 'r');
+const d = fs.openSync(f, 'r');
+out.push('after ' + c + ' ' + d);
+out.push('close own ' + code(() => fs.closeSync(a)) + ' reopen ' + fs.openSync(f, 'r'));
+out.push('fstat3 ' + code(() => typeof fs.fstatSync(3).size));
+console.log(out.join('\n'));
+"##,
+    );
+    let parent = write_temp(
+        "fd_table_inherited_parent.cjs",
+        r##"const { spawn } = require('child_process');
+const exe = process.argv[2];
+const c = spawn(exe, [__dirname + '/fd_table_inherited_child.cjs'], { stdio: ['ignore', 'pipe', 'inherit', 'pipe', 'pipe'] });
+let out = '', four = '';
+c.stdout.on('data', (d) => (out += d));
+c.stdio[4].on('data', (d) => (four += d));
+c.on('close', (code) => console.log(out.trim() + '\nfd4: ' + four + ' exit ' + code));
+"##,
+    );
+    let exe = env!("CARGO_BIN_EXE_oam");
+    let out = bounded_output(&mut oam_command(&[&parent.to_string_lossy(), exe]));
+    let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(
+        stdout,
+        "own 5 6\n\
+         write4 9\n\
+         close4 undefined again EBADF close\n\
+         after 4 7\n\
+         close own undefined reopen 5\n\
+         fstat3 number\n\
+         fd4: to-parent exit 0\n",
+        "exit {}; stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

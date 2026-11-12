@@ -115,32 +115,60 @@ fn self_update(dir: &Path, base: &str, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
-/// The t1 public key's fingerprint, as `ssh-keygen -lf` prints it.
-const T1_FP: &str = "SHA256:HGTWpLiMBRFgpurFRx8SMBmCf5kXKrDVpMv+0IhBWhE";
+/// The fixtures' t1 public key's fingerprint, as `ssh-keygen -lf` prints it:
+/// `SHA256:` then the unpadded base64 of the SHA-256 of the key blob. Read
+/// from the fixtures' allowed_signers rather than written here, because
+/// generate.mjs makes new keys on every run.
+fn t1_fingerprint() -> String {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let signers = String::from_utf8(fixture("allowed_signers")).unwrap();
+    let line = signers
+        .lines()
+        .find(|line| line.starts_with("oam-release-t1 "))
+        .expect("allowed_signers lists oam-release-t1");
+    // `<principal> <options> <key type> <base64 key blob>`.
+    let blob = line
+        .split_whitespace()
+        .nth(3)
+        .expect("the t1 line carries a key blob");
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(blob)
+        .expect("the t1 key blob is base64");
+    let digest = sha2::Sha256::digest(blob);
+    format!(
+        "SHA256:{}",
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest.as_slice())
+    )
+}
+
 /// release-keys/README.md's k1.
 const K1_FP: &str = "SHA256:zB7Aq4Ky/U90VJ4sAEp0e2A65KfQpiyQXJI4FuT2oss";
 
 #[test]
 fn a_release_signed_by_a_non_release_key_is_refused_and_nothing_changes() {
-    let base = serve(vec![
-        ("/RELEASE-MANIFEST".into(), fixture("manifest-v0.18.0")),
+    let mut routes = vec![
+        ("/RELEASE-MANIFEST".to_string(), fixture("manifest-v0.18.0")),
         ("/RELEASE-MANIFEST.sig".into(), fixture("cases/valid.sig")),
         ("/SHA256SUMS".into(), fixture("SHA256SUMS")),
-        (
-            "/oam-x86_64-pc-windows-msvc.exe".into(),
-            fixture("payload.bin"),
-        ),
-        (
-            "/oam-aarch64-pc-windows-msvc.exe".into(),
-            fixture("payload.bin"),
-        ),
-        (
-            "/oam-x86_64-unknown-linux-gnu".into(),
-            fixture("payload.bin"),
-        ),
-        ("/oam-aarch64-apple-darwin".into(), fixture("payload.bin")),
-        ("/oam-x86_64-apple-darwin".into(), fixture("payload.bin")),
-    ]);
+    ];
+    // A passing run never asks for these: the manifest is refused before any
+    // asset is fetched. They are served, for every triple the fixture
+    // SHA256SUMS lists, so that a verify which wrongly passed would go on to
+    // install the payload (outside --dry-run) and fail `assert_untouched` on
+    // any host, instead of stopping at a 404 that looks like a refusal.
+    for asset in [
+        "oam-aarch64-apple-darwin",
+        "oam-aarch64-pc-windows-msvc.exe",
+        "oam-aarch64-unknown-linux-gnu",
+        "oam-x86_64-apple-darwin",
+        "oam-x86_64-pc-windows-msvc.exe",
+        "oam-x86_64-unknown-linux-gnu",
+    ] {
+        routes.push((format!("/{asset}"), fixture("payload.bin")));
+    }
+    let base = serve(routes);
+    let t1_fp = t1_fingerprint();
     for args in [
         &["--version", "v0.18.0"][..],
         &["--version", "v0.18.0", "--dry-run"],
@@ -151,8 +179,8 @@ fn a_release_signed_by_a_non_release_key_is_refused_and_nothing_changes() {
         assert!(!out.status.success(), "{args:?}: must fail\n{stderr}");
         assert!(stderr.contains("not a release key"), "{args:?}: {stderr}");
         assert!(
-            stderr.contains(T1_FP),
-            "{args:?}: names the signing key\n{stderr}"
+            stderr.contains(&t1_fp),
+            "{args:?}: names the signing key ({t1_fp})\n{stderr}"
         );
         assert!(
             stderr.contains(K1_FP),

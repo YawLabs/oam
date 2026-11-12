@@ -24,6 +24,16 @@ pub struct ChildProcess {
     /// Set while a read holds the stderr pipe out of the registry, so a
     /// concurrent second read sees the stream as busy rather than at EOF.
     pub stderr_busy: bool,
+    /// Woken each time a read lets go of the stdout pipe (or finds it gone),
+    /// so a second read waiting on `stdout_busy` parks instead of spinning.
+    pub stdout_released: Arc<Notify>,
+    /// As `stdout_released`, for stderr.
+    pub stderr_released: Arc<Notify>,
+    /// True once `child_wait` has collected the exit. The entry outlives the
+    /// exit while a read pipe (or a read in flight) remains, so the readers
+    /// can drain what the child wrote just before it exited; `pid` no longer
+    /// names this child from then on and must not be signalled.
+    pub exited: bool,
     pub pid: u32,
     /// Wakes the parked `child_wait` future, which owns the `Child` and is the
     /// only place that can signal it. Lets kill survive `child` being taken.
@@ -44,6 +54,9 @@ impl ChildProcess {
             stderr,
             stdout_busy: false,
             stderr_busy: false,
+            stdout_released: Arc::new(Notify::new()),
+            stderr_released: Arc::new(Notify::new()),
+            exited: false,
             pid,
             kill: Arc::new(Notify::new()),
             kill_signal: None,
@@ -153,38 +166,7 @@ pub fn spawn_child(
     argv0: Option<String>,
 ) -> Result<(tokio::process::Child, u32), String> {
     let (prog, final_args) = if shell {
-        #[cfg(windows)]
-        {
-            // cmd.exe parses its own quoting; Rust's default arg escaping
-            // (MSVCRT rules) mangles a command that embeds quotes, so the
-            // canonical `exec('"C:\path with spaces\app.exe" arg')` fails.
-            // Node passes `/d /s /c "<command>"` with verbatim arguments --
-            // /d skips AutoRun, /s + the wrapping quotes make cmd strip
-            // exactly the outer pair. The raw_arg application is below.
-            let mut full = command;
-            for a in &args {
-                full.push(' ');
-                full.push_str(a);
-            }
-            (
-                "cmd.exe".to_string(),
-                vec![
-                    "/d".to_string(),
-                    "/s".to_string(),
-                    "/c".to_string(),
-                    format!("\"{full}\""),
-                ],
-            )
-        }
-        #[cfg(not(windows))]
-        {
-            let mut full = command;
-            for a in &args {
-                full.push(' ');
-                full.push_str(a);
-            }
-            ("/bin/sh".to_string(), vec!["-c".to_string(), full])
-        }
+        shell_command(&command, &args)
     } else {
         (command, args)
     };
@@ -262,6 +244,44 @@ pub fn spawn_child(
     }
     let pid = child.id().unwrap_or(0);
     Ok((child, pid))
+}
+
+/// The program and arguments a `shell: true` spawn runs: the platform shell
+/// with `command` and `args` joined by spaces as its one command string. One
+/// builder for the async and the sync spawn, so the two cannot drift.
+///
+/// Windows: cmd.exe parses its own quoting; Rust's default arg escaping
+/// (MSVCRT rules) mangles a command that embeds quotes, so the canonical
+/// `exec('"C:\path with spaces\app.exe" arg')` fails. Node passes
+/// `/d /s /c "<command>"` with verbatim arguments -- /d skips AutoRun, /s +
+/// the wrapping quotes make cmd strip exactly the outer pair. The callers
+/// apply the arguments with `raw_arg`.
+///
+/// `pub` for the raw-create spawns (extra-fd stdio, argv0), which the engine
+/// rewrites with it before `child_extra::spawn_extra`: on Windows those must
+/// then take the verbatim form (`spawn_extra_verbatim`), for the same reason.
+pub fn shell_command(command: &str, args: &[String]) -> (String, Vec<String>) {
+    let mut full = command.to_string();
+    for a in args {
+        full.push(' ');
+        full.push_str(a);
+    }
+    #[cfg(windows)]
+    {
+        (
+            "cmd.exe".to_string(),
+            vec![
+                "/d".to_string(),
+                "/s".to_string(),
+                "/c".to_string(),
+                format!("\"{full}\""),
+            ],
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        ("/bin/sh".to_string(), vec!["-c".to_string(), full])
+    }
 }
 
 /// The JSON body a failed async spawn hands the JS layer: the node code, the
@@ -695,33 +715,7 @@ pub fn spawn_sync(
     argv0: Option<String>,
 ) -> SpawnSyncResult {
     let (prog, final_args) = if shell {
-        #[cfg(windows)]
-        {
-            // Same cmd.exe verbatim-quoting contract as spawn_child above.
-            let mut full = command.to_string();
-            for a in args {
-                full.push(' ');
-                full.push_str(a);
-            }
-            (
-                "cmd.exe".to_string(),
-                vec![
-                    "/d".to_string(),
-                    "/s".to_string(),
-                    "/c".to_string(),
-                    format!("\"{full}\""),
-                ],
-            )
-        }
-        #[cfg(not(windows))]
-        {
-            let mut full = command.to_string();
-            for a in args {
-                full.push(' ');
-                full.push_str(a);
-            }
-            ("/bin/sh".to_string(), vec!["-c".to_string(), full])
-        }
+        shell_command(command, args)
     } else {
         (command.to_string(), args.to_vec())
     };
@@ -764,7 +758,7 @@ pub fn spawn_sync(
     // would be a divergence that only looks like correctness.
     //
     // A pipe-shaped slot stays a real PIPE even with no input to write: the
-    // `drop(child.stdin.take())` below closes the write end immediately, so the
+    // `drop(stdin)` below closes the write end immediately, so the
     // child still sees EOF -- but over a pipe, as node gives it. Substituting
     // the null device here would have been observably different, not merely
     // "EOF by another route": the child's fd 0 becomes a character device, so
@@ -847,137 +841,164 @@ pub fn spawn_sync(
 
     let pid = child.id();
 
-    if let Some(input) = input
-        && let Some(mut stdin) = child.stdin.take()
-    {
-        use std::io::Write;
-        let _ = stdin.write_all(input);
+    // `input` goes down stdin on its OWN thread, alongside the drains below.
+    // Writing it here first deadlocked against any child that answers while it
+    // reads (cat, a compressor, `process.stdin.pipe(process.stdout)`): the
+    // child fills its stdout pipe, stops reading stdin, and both sides block
+    // once the input outgrows the pipe buffers -- before the timeout was even
+    // armed. The thread is not joined: it ends when the write completes or
+    // the read end goes away with the child.
+    match (input, child.stdin.take()) {
+        (Some(data), Some(mut stdin)) if !data.is_empty() => {
+            let data = data.to_vec();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let _ = stdin.write_all(&data);
+                // `stdin` drops here: the child reads EOF after the input.
+            });
+        }
+        // No input, or an empty one: the write end closes now, so the child
+        // reads EOF at once -- over a pipe, as node gives it.
+        (_, stdin) => drop(stdin),
     }
-    drop(child.stdin.take());
 
-    let output = if timeout_ms > 0 {
-        // The child stays REACHABLE here rather than being moved into a worker
-        // that owns it. `wait_with_output()` consumes the Child, so the old
-        // shape had nothing left to kill when the deadline passed: spawnSync
-        // returned ETIMEDOUT while the child ran on holding its port, its lock
-        // and -- now that `stdio: 'inherit'` is honored -- the parent's console.
-        // The worker was also left parked on a wait that might never return.
-        //
-        // Pipes are drained on their own threads so a child that fills one
-        // cannot deadlock against our wait, which is the reason
-        // `wait_with_output` exists in the first place.
-        use std::io::Read;
-        let mut out_pipe = child.stdout.take();
-        let mut err_pipe = child.stderr.take();
-        let out_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(p) = out_pipe.as_mut() {
-                let _ = p.read_to_end(&mut buf);
-            }
-            buf
-        });
-        let err_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(p) = err_pipe.as_mut() {
-                let _ = p.read_to_end(&mut buf);
-            }
-            buf
-        });
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-        let mut timed_out = false;
-        let mut wait_err = None;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        let _ = child.kill();
-                        // Reap it, so the timeout path leaves no zombie.
-                        let _ = child.wait();
-                        timed_out = true;
-                        break None;
+    // Each piped stream is drained on its own thread, so a child that fills
+    // one cannot block against this wait, and each drain stops at `max_buffer`
+    // (`drain_capped`) so an endless writer is ended rather than buffered
+    // without bound. The child stays REACHABLE here -- never moved into a
+    // worker -- so a deadline or an overflow can still end it.
+    let (events, pipe_events) = std::sync::mpsc::channel();
+    let stdout_sink = drain_capped(pipe_chunks(child.stdout.take()), max_buffer, events.clone());
+    let stderr_sink = drain_capped(pipe_chunks(child.stderr.take()), max_buffer, events);
+    let deadline = (timeout_ms > 0)
+        .then(|| std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
+    let mut open_pipes = 2usize;
+    // The synthetic failure that ended the wait before a plain exit, if any.
+    let mut cut_short: Option<&'static str> = None;
+    let mut waited: Option<std::io::Result<std::process::ExitStatus>> = None;
+    // As node's sync spawn: first every piped stream to its end (a grandchild
+    // holding a write end keeps it open), then the exit itself.
+    // The read end of a stream that overflowed, kept open until the child has
+    // been ended below (`SyncPipeHold`).
+    let mut overflowed_pipe = None;
+    match await_sync_pipes(&pipe_events, &mut open_pipes, deadline) {
+        PipesEnded::Overflow(hold) => {
+            cut_short = Some("ENOBUFS");
+            overflowed_pipe = Some(hold);
+        }
+        PipesEnded::TimedOut => cut_short = Some("ETIMEDOUT"),
+        PipesEnded::AllEof => match deadline {
+            None => waited = Some(child.wait()),
+            Some(deadline) => {
+                let mut nap = std::time::Duration::from_millis(1);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            waited = Some(Ok(status));
+                            break;
+                        }
+                        Ok(None) if std::time::Instant::now() >= deadline => {
+                            cut_short = Some("ETIMEDOUT");
+                            break;
+                        }
+                        Ok(None) => {
+                            std::thread::sleep(nap);
+                            nap = (nap * 2).min(std::time::Duration::from_millis(5));
+                        }
+                        Err(e) => {
+                            waited = Some(Err(e));
+                            break;
+                        }
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
-                Err(e) => {
-                    wait_err = Some(e);
-                    break None;
-                }
+            }
+        },
+    }
+
+    if let Some(code) = cut_short {
+        // A deadline or an overflow ends the child, as node does, and the
+        // result is its error plus whatever was read so far. A child that had
+        // already exited by itself (a grandchild kept the pipes open, or it
+        // finished just as the limit was crossed) reports its own exit: it was
+        // never signalled.
+        let own_exit = match child.try_wait() {
+            Ok(Some(status)) => Some(status),
+            _ => {
+                let _ = child.kill();
+                // Reap it, so this path leaves no zombie.
+                let _ = child.wait();
+                None
             }
         };
-        // The pipes close when the child dies, so these joins cannot outlive it.
-        let mut stdout = out_thread.join().unwrap_or_default();
-        let mut stderr = err_thread.join().unwrap_or_default();
-
-        if timed_out {
-            // node hands back whatever the child managed to emit before the
-            // deadline, not an empty pair.
-            stdout.truncate(max_buffer);
-            stderr.truncate(max_buffer);
-            return SpawnSyncResult {
-                stdout,
-                stderr,
-                status: None,
-                signal: Some("SIGTERM".to_string()),
-                pid,
-                error: Some(SpawnSyncError {
-                    code: "ETIMEDOUT".to_string(),
-                    errno: synthetic_spawn_errno("ETIMEDOUT"),
-                    message: format!("spawnSync timed out after {timeout_ms}ms"),
-                    win_error: None,
-                }),
-            };
-        }
-        match (status, wait_err) {
-            (Some(status), _) => Ok(std::process::Output {
-                status,
-                stdout,
-                stderr,
+        // Only now does an overflowed stream's read end close.
+        drop(overflowed_pipe);
+        // The pipes close with the child unless something else holds a write
+        // end. That is not waited for past a short grace: node closes its own
+        // ends at this point, and joining the drains here kept spawnSync
+        // blocked for as long as a grandchild (`cmd /c`, `sh -c`) lived.
+        let _ = await_sync_pipes(
+            &pipe_events,
+            &mut open_pipes,
+            Some(std::time::Instant::now() + SYNC_KILL_PIPE_GRACE),
+        );
+        let (status, signal) = match own_exit {
+            Some(status) => exit_report(&status, false, None),
+            None => (None, Some("SIGTERM".to_string())),
+        };
+        let mut stdout = take_sink(&stdout_sink);
+        let mut stderr = take_sink(&stderr_sink);
+        // The retained length is read-granularity dependent under node too,
+        // so it is deliberately not part of the contract.
+        stdout.truncate(max_buffer);
+        stderr.truncate(max_buffer);
+        let message = if code == "ETIMEDOUT" {
+            format!("spawnSync timed out after {timeout_ms}ms")
+        } else {
+            format!("spawnSync {command} {code}")
+        };
+        return SpawnSyncResult {
+            stdout,
+            stderr,
+            status,
+            signal,
+            pid,
+            error: Some(SpawnSyncError {
+                code: code.to_string(),
+                errno: synthetic_spawn_errno(code),
+                message,
+                win_error: None,
             }),
-            (None, Some(e)) => Err(e),
-            (None, None) => Err(std::io::Error::other("spawnSync: child never exited")),
-        }
-    } else {
-        child.wait_with_output()
-    };
+        };
+    }
 
+    let output = match waited {
+        Some(Ok(status)) => Ok(std::process::Output {
+            status,
+            stdout: take_sink(&stdout_sink),
+            stderr: take_sink(&stderr_sink),
+        }),
+        Some(Err(e)) => Err(e),
+        None => Err(std::io::Error::other("spawnSync: child never exited")),
+    };
     match output {
         Ok(output) => {
-            let mut stdout = output.stdout;
-            let mut stderr = output.stderr;
-            // Blowing maxBuffer is an ERROR, not a quiet trim. Truncating and
-            // reporting status 0 handed callers a short result that looked
-            // complete -- a half JSON document that parses as valid, a log tail
-            // that reads as the whole log -- while every node-shaped caller
-            // (`if (result.error) throw`, or execSync's throw) saw nothing to
-            // branch on. node terminates the child and reports ENOBUFS with a
-            // null status; the output it kept is read-granularity dependent, so
-            // the retained length is deliberately not part of the contract.
-            let overflowed = stdout.len() > max_buffer || stderr.len() > max_buffer;
-            stdout.truncate(max_buffer);
-            stderr.truncate(max_buffer);
-            if overflowed {
-                return SpawnSyncResult {
-                    stdout,
-                    stderr,
-                    status: None,
-                    signal: Some("SIGTERM".to_string()),
-                    pid,
-                    error: Some(SpawnSyncError {
-                        code: "ENOBUFS".to_string(),
-                        errno: synthetic_spawn_errno("ENOBUFS"),
-                        message: format!("spawnSync {command} ENOBUFS"),
-                        win_error: None,
-                    }),
-                };
-            }
-            let status = output.status.code();
+            // Blowing maxBuffer is an ERROR, not a quiet trim: it never gets
+            // here. A drain that crosses the limit reports it while the child
+            // still runs (`cut_short` above), because truncating and reporting
+            // status 0 handed callers a short result that looked complete -- a
+            // half JSON document that parses as valid, a log tail that reads
+            // as the whole log.
+            //
+            // A child a signal ended reports the signal's name and a null
+            // status, as node does; `signal: None` here hid every crash
+            // (SIGSEGV, an out-of-memory SIGKILL) behind `{status: null,
+            // signal: null}`.
+            let (status, signal) = exit_report(&output.status, false, None);
             SpawnSyncResult {
-                stdout,
-                stderr,
+                stdout: output.stdout,
+                stderr: output.stderr,
                 status,
-                signal: None,
+                signal,
                 pid,
                 error: None,
             }
@@ -1020,132 +1041,307 @@ pub struct SpawnSyncError {
     pub win_error: Option<u32>,
 }
 
-pub async fn child_read_stdout(children: ChildRegistry, handle: u64) -> OpOutcome {
-    // Check-and-set atomically under one lock. A concurrent second read sees
-    // busy=true and WAITS for the in-flight read to release the pipe rather
-    // than failing, so the pump's 'close' path cannot stall on a rejected
-    // read promise. A None pipe with busy=false is a real EOF (stream closed
-    // / never piped). The guard is dropped before the yield, so no lock is
-    // held across the await; the loop always terminates because the in-flight
-    // read clears busy on every exit path (bounded by data/EOF/child death).
-    let stdout = loop {
-        let taken = {
-            let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-            match guard.get_mut(&handle) {
-                Some(cp) if cp.stdout_busy => None,
-                Some(cp) => match cp.stdout.take() {
-                    Some(pipe) => {
-                        cp.stdout_busy = true;
-                        Some(Some(pipe))
-                    }
-                    None => Some(None),
-                },
-                None => Some(None),
-            }
-        };
-        match taken {
-            Some(pipe) => break pipe,
-            None => tokio::task::yield_now().await,
-        }
+/// What one sync-spawn drain thread reports, once, when it stops.
+pub(crate) enum SyncPipeEvent {
+    /// The stream ended (or there was no pipe to drain).
+    Eof,
+    /// The stream produced more than `max_buffer`; the drain stopped reading.
+    /// The stream itself rides along, still open (see `SyncPipeHold`).
+    Overflow(SyncPipeHold),
+}
+
+/// The read end of a stream whose drain stopped at `max_buffer`, kept open
+/// until the caller lets go of it. The caller holds it until it has ended the
+/// child: a read end that closed with the drain reached a child that was
+/// still writing first (SIGPIPE on POSIX), so the child could be gone of that
+/// before it was ended, and the result then reported that signal where node,
+/// which ends the child and only then closes its pipes, reports the kill.
+pub(crate) struct SyncPipeHold {
+    _stream: Box<dyn std::any::Any + Send>,
+}
+
+/// How a wait on the sync-spawn drains ended.
+pub(crate) enum PipesEnded {
+    /// Every stream reached its end.
+    AllEof,
+    /// A stream crossed `max_buffer`; its read end is handed over still open.
+    Overflow(SyncPipeHold),
+    /// The deadline passed with a stream still open.
+    TimedOut,
+}
+
+/// How long a sync spawn that just ended its child waits for the child's
+/// pipes to close before it returns what was read. They close at once unless
+/// another process inherited a write end, and that one is not waited for.
+pub(crate) const SYNC_KILL_PIPE_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Drain one of a sync spawn's streams on its own thread, into the returned
+/// buffer. `next` is one blocking read: the next bytes, or `None` at the end
+/// of the stream. With no pipe (`None`: an inherited or ignored slot) the end
+/// is reported at once.
+///
+/// The drain stops, and says so, as soon as the buffer holds more than
+/// `max_buffer`: the caller ends the child then, as node does, where reading
+/// to EOF first let an endless writer grow the buffer without bound. The
+/// buffer is shared rather than returned by a join so the caller can take what
+/// was read without waiting for a stream something else still holds open.
+pub(crate) fn drain_capped<F>(
+    next: Option<F>,
+    max_buffer: usize,
+    events: std::sync::mpsc::Sender<SyncPipeEvent>,
+) -> Arc<Mutex<Vec<u8>>>
+where
+    F: FnMut() -> Option<Vec<u8>> + Send + 'static,
+{
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let Some(mut next) = next else {
+        let _ = events.send(SyncPipeEvent::Eof);
+        return sink;
     };
-    match stdout {
-        Some(mut stdout) => {
-            use tokio::io::AsyncReadExt;
-            let mut buf = vec![0u8; 65536];
-            match stdout.read(&mut buf).await {
-                Ok(0) => {
-                    // Real EOF: the pipe is dropped, not re-inserted. Clear busy.
-                    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(cp) = guard.get_mut(&handle) {
-                        cp.stdout_busy = false;
+    let out = Arc::clone(&sink);
+    std::thread::spawn(move || {
+        while let Some(chunk) = next() {
+            let mut buf = out.lock().unwrap_or_else(|e| e.into_inner());
+            buf.extend_from_slice(&chunk);
+            if buf.len() > max_buffer {
+                drop(buf);
+                // The reader (and the read end it owns) goes to the caller
+                // rather than closing here; with nobody listening the send
+                // fails and it closes after all.
+                let _ = events.send(SyncPipeEvent::Overflow(SyncPipeHold {
+                    _stream: Box::new(next),
+                }));
+                return;
+            }
+        }
+        let _ = events.send(SyncPipeEvent::Eof);
+    });
+    sink
+}
+
+/// `drain_capped`'s reader over a std pipe: one blocking read of up to 64 KiB
+/// a call, `None` at EOF or on a read error.
+fn pipe_chunks<R>(pipe: Option<R>) -> Option<impl FnMut() -> Option<Vec<u8>> + Send + 'static>
+where
+    R: std::io::Read + Send + 'static,
+{
+    pipe.map(|mut pipe| {
+        move || {
+            let mut chunk = vec![0u8; 65536];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => return None,
+                    Ok(n) => {
+                        chunk.truncate(n);
+                        return Some(chunk);
                     }
-                    OpOutcome::Done
-                }
-                Ok(n) => {
-                    buf.truncate(n);
-                    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(cp) = guard.get_mut(&handle) {
-                        cp.stdout = Some(stdout);
-                        cp.stdout_busy = false;
-                    }
-                    OpOutcome::Bytes(buf)
-                }
-                Err(e) => {
-                    // Read error: the pipe is dropped, not re-inserted. Clear busy.
-                    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(cp) = guard.get_mut(&handle) {
-                        cp.stdout_busy = false;
-                    }
-                    OpOutcome::Failed(format!("read stdout: {e}"))
+                    // A signal arrived before anything was read: not an end.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return None,
                 }
             }
         }
-        None => OpOutcome::Done,
+    })
+}
+
+/// Wait for the drains still running (`open` of them) to report, until
+/// `deadline` when there is one. `open` is left at the number still running.
+pub(crate) fn await_sync_pipes(
+    events: &std::sync::mpsc::Receiver<SyncPipeEvent>,
+    open: &mut usize,
+    deadline: Option<std::time::Instant>,
+) -> PipesEnded {
+    use std::sync::mpsc::RecvTimeoutError;
+    while *open > 0 {
+        let event = match deadline {
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                match events.recv_timeout(left) {
+                    Ok(event) => event,
+                    Err(RecvTimeoutError::Timeout) => return PipesEnded::TimedOut,
+                    // Every drain is gone without a word (one panicked):
+                    // nothing is left to wait for.
+                    Err(RecvTimeoutError::Disconnected) => {
+                        *open = 0;
+                        break;
+                    }
+                }
+            }
+            None => match events.recv() {
+                Ok(event) => event,
+                Err(_) => {
+                    *open = 0;
+                    break;
+                }
+            },
+        };
+        *open -= 1;
+        if let SyncPipeEvent::Overflow(hold) = event {
+            return PipesEnded::Overflow(hold);
+        }
     }
+    PipesEnded::AllEof
+}
+
+/// What a drain has read so far, taken out of its shared buffer.
+pub(crate) fn take_sink(sink: &Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
+    std::mem::take(&mut *sink.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+pub async fn child_read_stdout(children: ChildRegistry, handle: u64) -> OpOutcome {
+    read_child_pipe(children, handle, "stdout", stdout_slot).await
 }
 
 pub async fn child_read_stderr(children: ChildRegistry, handle: u64) -> OpOutcome {
+    read_child_pipe(children, handle, "stderr", stderr_slot).await
+}
+
+/// One of a child's two read streams inside its registry entry: the pipe, its
+/// busy flag, and the notifier a finished read wakes the next one with.
+struct ReadSlot<'a, P> {
+    pipe: &'a mut Option<P>,
+    busy: &'a mut bool,
+    released: &'a Arc<Notify>,
+}
+
+fn stdout_slot(cp: &mut ChildProcess) -> ReadSlot<'_, tokio::process::ChildStdout> {
+    ReadSlot {
+        pipe: &mut cp.stdout,
+        busy: &mut cp.stdout_busy,
+        released: &cp.stdout_released,
+    }
+}
+
+fn stderr_slot(cp: &mut ChildProcess) -> ReadSlot<'_, tokio::process::ChildStderr> {
+    ReadSlot {
+        pipe: &mut cp.stderr,
+        busy: &mut cp.stderr_busy,
+        released: &cp.stderr_released,
+    }
+}
+
+/// Drop an exited child's entry once neither read stream is left: both pipes
+/// gone and no read in flight. `child_wait` keeps the entry past the exit for
+/// exactly as long as a reader can still drain what the child wrote.
+fn retire_if_drained(children: &mut HashMap<u64, ChildProcess>, handle: u64) {
+    let drained = children.get(&handle).is_some_and(|cp| {
+        cp.exited
+            && cp.stdout.is_none()
+            && cp.stderr.is_none()
+            && !cp.stdout_busy
+            && !cp.stderr_busy
+    });
+    if drained {
+        children.remove(&handle);
+    }
+}
+
+/// One read of a child's stdout or stderr (`slot` picks which); the shared
+/// body of `child_read_stdout` and `child_read_stderr`.
+async fn read_child_pipe<P>(
+    children: ChildRegistry,
+    handle: u64,
+    label: &str,
+    slot: fn(&mut ChildProcess) -> ReadSlot<'_, P>,
+) -> OpOutcome
+where
+    P: tokio::io::AsyncRead + Unpin,
+{
     // Check-and-set atomically under one lock. A concurrent second read sees
     // busy=true and WAITS for the in-flight read to release the pipe rather
     // than failing, so the pump's 'close' path cannot stall on a rejected
     // read promise. A None pipe with busy=false is a real EOF (stream closed
-    // / never piped). The guard is dropped before the yield, so no lock is
-    // held across the await; the loop always terminates because the in-flight
-    // read clears busy on every exit path (bounded by data/EOF/child death).
-    let stderr = loop {
+    // / never piped). The guard is dropped before the wait, so no lock is
+    // held across the await.
+    //
+    // The wait is parked on the stream's notifier, which every read wakes as
+    // it lets go of the pipe. (It used to spin on `yield_now`, which kept a
+    // runtime worker busy for as long as the first read sat on a quiet
+    // child.) `notify_one` stores a permit when nobody is parked yet, so a
+    // release between this check and the await is not lost; a stale permit
+    // costs one extra pass of the loop.
+    //
+    // `parked_on` is the notifier this read last waited on. A read that was
+    // woken and then finds the stream over -- or the whole entry gone, where
+    // the slot's own notifier can no longer be reached -- passes the wake-up
+    // on through it, so a third read parked behind it is not left waiting on
+    // a notifier nobody will signal again.
+    let mut parked_on: Option<Arc<Notify>> = None;
+    let (mut pipe, released) = loop {
         let taken = {
             let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
             match guard.get_mut(&handle) {
-                Some(cp) if cp.stderr_busy => None,
-                Some(cp) => match cp.stderr.take() {
-                    Some(pipe) => {
-                        cp.stderr_busy = true;
-                        Some(Some(pipe))
+                Some(cp) => {
+                    let slot = slot(cp);
+                    if *slot.busy {
+                        Err(Arc::clone(slot.released))
+                    } else {
+                        match slot.pipe.take() {
+                            Some(pipe) => {
+                                *slot.busy = true;
+                                Ok(Some((pipe, Arc::clone(slot.released))))
+                            }
+                            None => {
+                                // Pass the wake-up on: another read may be
+                                // parked behind the one that reached the end.
+                                slot.released.notify_one();
+                                Ok(None)
+                            }
+                        }
                     }
-                    None => Some(None),
-                },
-                None => Some(None),
+                }
+                None => Ok(None),
             }
         };
         match taken {
-            Some(pipe) => break pipe,
-            None => tokio::task::yield_now().await,
-        }
-    };
-    match stderr {
-        Some(mut stderr) => {
-            use tokio::io::AsyncReadExt;
-            let mut buf = vec![0u8; 65536];
-            match stderr.read(&mut buf).await {
-                Ok(0) => {
-                    // Real EOF: the pipe is dropped, not re-inserted. Clear busy.
-                    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(cp) = guard.get_mut(&handle) {
-                        cp.stderr_busy = false;
-                    }
-                    OpOutcome::Done
+            Ok(Some(taken)) => break taken,
+            Ok(None) => {
+                if let Some(released) = parked_on {
+                    released.notify_one();
                 }
-                Ok(n) => {
-                    buf.truncate(n);
-                    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(cp) = guard.get_mut(&handle) {
-                        cp.stderr = Some(stderr);
-                        cp.stderr_busy = false;
-                    }
-                    OpOutcome::Bytes(buf)
-                }
-                Err(e) => {
-                    // Read error: the pipe is dropped, not re-inserted. Clear busy.
-                    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(cp) = guard.get_mut(&handle) {
-                        cp.stderr_busy = false;
-                    }
-                    OpOutcome::Failed(format!("read stderr: {e}"))
-                }
+                return OpOutcome::Done;
+            }
+            Err(released) => {
+                released.notified().await;
+                parked_on = Some(released);
             }
         }
-        None => OpOutcome::Done,
-    }
+    };
+
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; 65536];
+    let read = pipe.read(&mut buf).await;
+    let outcome = {
+        let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
+        let outcome = match read {
+            Ok(n) if n > 0 => {
+                buf.truncate(n);
+                if let Some(cp) = guard.get_mut(&handle) {
+                    let slot = slot(cp);
+                    *slot.pipe = Some(pipe);
+                    *slot.busy = false;
+                }
+                OpOutcome::Bytes(buf)
+            }
+            // EOF or a read error: the pipe is dropped, not re-inserted.
+            ended => {
+                if let Some(cp) = guard.get_mut(&handle) {
+                    *slot(cp).busy = false;
+                }
+                drop(pipe);
+                match ended {
+                    Err(e) => OpOutcome::Failed(format!("read {label}: {e}")),
+                    Ok(_) => OpOutcome::Done,
+                }
+            }
+        };
+        // The stream may have been the last thing an exited child's entry
+        // was kept for.
+        retire_if_drained(&mut guard, handle);
+        outcome
+    };
+    released.notify_one();
+    outcome
 }
 
 pub fn child_close_stdin(children: &ChildRegistry, handle: u64) {
@@ -1166,7 +1362,12 @@ pub async fn child_write_stdin(children: ChildRegistry, handle: u64, data: Vec<u
             match stdin.write_all(&data).await {
                 Ok(()) => {
                     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(cp) = guard.get_mut(&handle) {
+                    // Not back into the entry of a child that has exited:
+                    // nothing reads it, and the entry is only kept for its
+                    // read streams from then on.
+                    if let Some(cp) = guard.get_mut(&handle)
+                        && !cp.exited
+                    {
                         cp.stdin = Some(stdin);
                     }
                     OpOutcome::Done
@@ -1184,6 +1385,11 @@ pub async fn child_write_stdin(children: ChildRegistry, handle: u64, data: Vec<u
 pub fn child_kill(children: &ChildRegistry, handle: u64, signal: Option<String>) {
     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(cp) = guard.get_mut(&handle) {
+        // An entry kept past the exit for its read streams has nobody to
+        // signal any more.
+        if cp.exited {
+            return;
+        }
         cp.kill_signal = signal;
         // notify_one stores a permit if the wait future has not parked yet, so
         // a kill issued before child_wait starts still lands.
@@ -1206,28 +1412,52 @@ pub async fn child_wait(children: ChildRegistry, handle: u64) -> OpOutcome {
         return OpOutcome::Failed("unknown child handle".to_string());
     };
 
-    let killed;
-    let status = tokio::select! {
-        s = child.wait() => { killed = false; s }
-        _ = kill.notified() => {
-            killed = true;
-            // Read the signal child_kill recorded (stored under the lock BEFORE
-            // notify_one, so it is visible here) and deliver it for real.
-            let requested = {
-                let guard = children.lock().unwrap_or_else(|e| e.into_inner());
-                guard.get(&handle).and_then(|cp| cp.kill_signal.clone())
-            };
-            deliver_kill(&mut child, pid, requested.as_deref());
-            child.wait().await
+    // A LOOP, so every kill is delivered, not only the first. Awaiting the
+    // exit with nothing left listening on the notifier after one kill meant a
+    // later one only stored a permit: SIGTERM to a child that traps it and
+    // then SIGKILL never sent the SIGKILL (likewise SIGSTOP then SIGCONT, or
+    // a repeated SIGUSR1). `Child::wait` is cancel safe, so dropping it for
+    // a kill and awaiting it again loses nothing.
+    let mut killed = false;
+    let status = loop {
+        tokio::select! {
+            s = child.wait() => break s,
+            _ = kill.notified() => {
+                // Read the signal child_kill recorded (stored under the lock
+                // BEFORE notify_one, so it is visible here) and deliver it for
+                // real. A kill that found the child already gone delivered
+                // nothing and must not colour the exit report.
+                let requested = {
+                    let guard = children.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.get(&handle).and_then(|cp| cp.kill_signal.clone())
+                };
+                if deliver_kill(&mut child, pid, requested.as_deref()) {
+                    killed = true;
+                }
+            }
         }
     };
 
-    // Drop the registry entry now that the wait is done, capturing the requested
-    // kill signal (used by the Windows exit report).
+    // The exit is collected: capture the requested kill signal (used by the
+    // Windows exit report), close stdin (nothing reads it now), and mark the
+    // entry. The entry itself STAYS while a read pipe, or a read in flight,
+    // remains: the JS side starts this wait alongside its read pumps, and
+    // dropping the entry here threw away whatever the child wrote between the
+    // parent's last read and its exit -- the next read found no entry and
+    // reported EOF with the tail still in the pipe (the raw registries' #456 /
+    // #419, here). Each reader drops the entry with the last stream
+    // (`retire_if_drained`); with nothing piped it goes now.
     let requested_signal = {
         let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-        let sig = guard.get(&handle).and_then(|cp| cp.kill_signal.clone());
-        guard.remove(&handle);
+        let sig = match guard.get_mut(&handle) {
+            Some(cp) => {
+                cp.exited = true;
+                drop(cp.stdin.take());
+                cp.kill_signal.clone()
+            }
+            None => None,
+        };
+        retire_if_drained(&mut guard, handle);
         sig
     };
 
@@ -1248,28 +1478,45 @@ pub async fn child_wait(children: ChildRegistry, handle: u64) -> OpOutcome {
 /// regardless of which signal (or sender) caused it. On Windows there are no
 /// POSIX signals, so `start_kill()` (TerminateProcess) is the only mechanism;
 /// the requested signal name is surfaced by `exit_report` instead.
+///
+/// Returns whether a kill was actually issued: false for a child that had
+/// already exited, or (Unix) for a signal name this platform does not have.
 #[cfg(unix)]
-fn deliver_kill(child: &mut tokio::process::Child, pid: u32, signal: Option<&str>) {
+fn deliver_kill(child: &mut tokio::process::Child, pid: u32, signal: Option<&str>) -> bool {
     // Only signal while the child is still alive. If it already exited and the
     // SIGCHLD driver reaped it, the kernel can recycle the pid immediately, so
     // a kill then could hit an unrelated process. On a try_wait error we fall
     // through and signal anyway (conservative).
     if let Ok(Some(_)) = child.try_wait() {
-        return;
+        return false;
     }
-    // Unknown signal names fall back to SIGTERM, pending JS-side validation.
-    let signum = signal
-        .map(crate::child_unix::signal_number)
-        .unwrap_or(Some(libc::SIGTERM))
-        .unwrap_or(libc::SIGTERM);
+    // No signal named is SIGTERM, node's default. A name this platform does
+    // not have is NOT: it used to become SIGTERM too, so `kill(SIGWINCH)` --
+    // which a number reaches without the JS name check -- ended the child.
+    let signum = match signal {
+        None => libc::SIGTERM,
+        Some(name) => match crate::child_unix::signal_number(name) {
+            Some(signum) => signum,
+            None => return false,
+        },
+    };
     crate::child_unix::deliver_signal(pid, signum);
+    true
 }
 
 #[cfg(windows)]
-fn deliver_kill(child: &mut tokio::process::Child, _pid: u32, _signal: Option<&str>) {
+fn deliver_kill(child: &mut tokio::process::Child, _pid: u32, _signal: Option<&str>) -> bool {
+    // A child that has already exited is not killed, and must not be reported
+    // as killed: `exit_report` turns a delivered kill into `{code: null,
+    // signal}`, which hid the real exit code of a child that finished just
+    // before the kill was looked at (`child_win::raw_kill` checks the same
+    // way). On a try_wait error we fall through and terminate anyway.
+    if let Ok(Some(_)) = child.try_wait() {
+        return false;
+    }
     // TerminateProcess -- the only kill Windows offers. exit_report maps the
     // requested signal name onto the exit event.
-    let _ = child.start_kill();
+    child.start_kill().is_ok()
 }
 
 /// Build the Node-shaped `(code, signal)` exit report from the child's ACTUAL

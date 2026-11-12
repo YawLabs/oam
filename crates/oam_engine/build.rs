@@ -183,8 +183,9 @@ fn zstd_version(lock: &str) -> (String, String) {
 }
 
 /// The unpacked source directory of a pinned crate inside the cargo registry,
-/// e.g. `v8-15.0.245.2` or `ada-url-3.4.5`. Shared by the two build-time
-/// version probes that must read a vendored C header rather than the lockfile.
+/// e.g. `v8-15.0.245.2` or `ada-url-3.4.5`. Shared by the build-time version
+/// probes (v8's ICU, ada-url, zstd-sys) that must read a vendored C header
+/// rather than the lockfile.
 ///
 /// On a miss the `Err` carries the `registry/src` root that was searched, so
 /// every caller's panic can name the directory it actually looked in instead

@@ -47,6 +47,7 @@ use tokio::io::{
 use tokio::sync::watch;
 
 use super::body::{FetchBodies, FetchBody, StreamSlot};
+use super::send::latin1;
 use super::transport::{channel_body, empty_body, full_body};
 use super::{BoxError, ReqBody};
 use crate::{OpOutcome, OutboundBodies};
@@ -309,10 +310,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// A JS string that holds bytes one per code point (the latin1 convention
 /// node writes a request head in). Anything past U+00FF cannot be sent.
-fn latin1_bytes(text: &str, what: &str) -> Result<Vec<u8>, String> {
-    text.chars()
-        .map(|c| u8::try_from(u32::from(c)).map_err(|_| format!("invalid character in {what}")))
-        .collect()
+pub(super) fn latin1_bytes(text: &str, what: &str) -> Result<Vec<u8>, String> {
+    crate::http_head::latin1_bytes(text).ok_or_else(|| format!("invalid character in {what}"))
 }
 
 /// True for a target in absolute form (`http://host/p`), which a request to
@@ -338,13 +337,16 @@ fn is_absolute_form(target: &[u8]) -> bool {
 /// parsed as a whole URI; origin form (`/p?q`), `*` and `?q` become the
 /// URI's path-and-query; an authority-form target (`host:port`) is held as
 /// the authority. `http::Uri` refuses a few bytes node allows, so a target
-/// it will not hold is percent-encoded byte by byte where it has to be.
+/// it will not hold is percent-encoded byte by byte where it has to be. A
+/// `#` is one of them: `http::Uri` holds no fragment and would drop it and
+/// everything after it, so it goes out as `%23` and the rest stays.
 ///
 /// An opaque target `http::Uri` cannot spell at all -- `abc?d=1`, which is
 /// neither an authority (no query allowed) nor a path (no leading `/`) --
 /// is sent in origin form, `/abc?d=1`, rather than failing the request:
-/// node sends it as written and every server answers 400. (Recorded in
-/// docs/node-divergences.md.)
+/// node sends it as written and every server answers 400. A bare query,
+/// `?q`, gains the `/` the same way (`/?q`): the URI's path is never empty
+/// when written. (All recorded in docs/node-divergences.md.)
 ///
 /// This only ever names the target on a connection that is already open to
 /// the host the request dialled, so it cannot move where the request goes.
@@ -353,12 +355,28 @@ fn target_uri(target: &str) -> Result<http::Uri, String> {
     if let Ok(uri) = hold_target(Bytes::from(bytes.clone())) {
         return Ok(uri);
     }
+    // A `#` may be all that stands in the way: try the target with only
+    // that encoded, so the bytes around it that can be held as written
+    // still are, as they would be without it.
+    if bytes.contains(&b'#') {
+        let mut hashed = Vec::with_capacity(bytes.len() + 2);
+        for &byte in &bytes {
+            if byte == b'#' {
+                hashed.extend_from_slice(b"%23");
+            } else {
+                hashed.push(byte);
+            }
+        }
+        if let Ok(uri) = hold_target(Bytes::from(hashed)) {
+            return Ok(uri);
+        }
+    }
     let mut encoded = String::with_capacity(target.len() * 3);
     for byte in bytes {
         let plain = byte.is_ascii_graphic()
             && !matches!(
                 byte,
-                b'"' | b'<' | b'>' | b'\\' | b'^' | b'`' | b'{' | b'|' | b'}'
+                b'"' | b'#' | b'<' | b'>' | b'\\' | b'^' | b'`' | b'{' | b'|' | b'}'
             );
         if plain {
             encoded.push(char::from(byte));
@@ -376,12 +394,18 @@ fn target_uri(target: &str) -> Result<http::Uri, String> {
 /// One attempt at [`target_uri`]'s spelling, for the bytes as given.
 fn hold_target(bytes: Bytes) -> Result<http::Uri, String> {
     let held = |e: http::Error| e.to_string();
+    // `http::Uri` parses a `#` as the start of a fragment and keeps nothing
+    // from there on, in every form: the target would go out cut short.
+    if bytes.contains(&b'#') {
+        return Err("a '#' cannot be held as written".to_string());
+    }
     // Absolute form: a whole URI, which is how hyper writes it back.
     if is_absolute_form(&bytes) {
         return http::Uri::from_maybe_shared(bytes).map_err(|e| held(e.into()));
     }
     // Origin form, `*` and a bare query: the URI's path-and-query, written
-    // back as it is.
+    // back as it is -- but for the bare query, which is written after the
+    // `/` of the path it does not have.
     if bytes
         .first()
         .is_some_and(|&b| b == b'/' || b == b'*' || b == b'?')
@@ -404,8 +428,9 @@ fn hold_target(bytes: Bytes) -> Result<http::Uri, String> {
 }
 
 /// True when `target_uri` gives hyper the target back byte for byte (see
-/// its doc comment): everything but an absolute form with no path, which
-/// gains the `/` every proxy expects.
+/// its doc comment): everything but a byte it has to percent-encode and the
+/// spellings that gain a `/` -- an absolute form with no path, an opaque
+/// target with a query, a bare query.
 #[cfg(test)]
 fn target_round_trips(target: &str) -> bool {
     target_uri(target).is_ok_and(|uri| *uri.to_string() == *target)
@@ -528,11 +553,6 @@ pub(crate) fn head_parse_error(error: &hyper::Error, undici: bool) -> Option<OpO
         format!("Parse Error: {reason}")
     };
     Some(OpOutcome::node_failed(code, message))
-}
-
-/// A header value as JS sees it: latin1, one code point per byte.
-fn latin1(bytes: &[u8]) -> String {
-    bytes.iter().map(|&b| char::from(b)).collect()
 }
 
 /// `httpBridgeResponse`: run the exchange and resolve at the response head
@@ -715,7 +735,9 @@ pub fn progress(bridges: &Bridges, id: u64) -> Option<Progress> {
 
 /// `httpBridgeIn`: hand hyper bytes the socket read. Resolves once the pipe
 /// took them all, which is the socket's read backpressure. Bytes for a
-/// closed bridge are dropped.
+/// closed bridge are dropped, whether it was closed before the write or
+/// while the write was parked; on a bridge still open, a write hyper no
+/// longer takes (it is done with the connection) fails.
 pub async fn input(bridges: Bridges, id: u64, bytes: Vec<u8>) -> OpOutcome {
     let half = lock(&bridges)
         .get_mut(&id)
@@ -724,7 +746,14 @@ pub async fn input(bridges: Bridges, id: u64, bytes: Vec<u8>) -> OpOutcome {
         return OpOutcome::Done;
     };
     let wrote = half.write_all(&bytes).await;
-    if let Some(bridge) = lock(&bridges).get_mut(&id) {
+    {
+        let mut guard = lock(&bridges);
+        let Some(bridge) = guard.get_mut(&id) else {
+            // Closed while the write was parked: [`close`] dropped hyper's
+            // end of the pipe, which is what failed the write. The same
+            // event as a close before it, and the same answer.
+            return OpOutcome::Done;
+        };
         bridge.input = Some(half);
     }
     match wrote {
@@ -751,7 +780,9 @@ pub fn close(bridges: &Bridges, id: u64) -> bool {
     removed.is_some()
 }
 
-/// How many bridges are open.
+/// How many bridges are open. Test support: the integration tests assert
+/// that an exchange leaves none behind; nothing in the runtime reads it.
+#[doc(hidden)]
 pub fn open(bridges: &Bridges) -> usize {
     lock(bridges).len()
 }
@@ -804,6 +835,33 @@ mod tests {
             "http://example.com/"
         );
         assert_eq!(target_uri("abc?d=1").unwrap().to_string(), "/abc?d=1");
+    }
+
+    /// A bare query is written after the `/` of the path it does not have
+    /// (also recorded in docs/node-divergences.md).
+    #[test]
+    fn target_uri_gives_a_bare_query_a_path() {
+        assert_eq!(target_uri("?q=1").unwrap().to_string(), "/?q=1");
+        assert!(!target_round_trips("?q=1"));
+    }
+
+    /// `http::Uri` holds no fragment: a `#` is percent-encoded, in every
+    /// form, so that nothing after it is lost.
+    #[test]
+    fn target_uri_keeps_what_follows_a_hash() {
+        assert_eq!(target_uri("/p#frag").unwrap().to_string(), "/p%23frag");
+        assert_eq!(
+            target_uri("/p?q=1#frag&r=2").unwrap().to_string(),
+            "/p?q=1%23frag&r=2"
+        );
+        assert_eq!(
+            target_uri("http://example.com/p#frag").unwrap().to_string(),
+            "http://example.com/p%23frag"
+        );
+        // Only the `#` changes: a byte beside it that is held as written
+        // without it is held as written with it.
+        assert_eq!(target_uri("/a|b").unwrap().to_string(), "/a|b");
+        assert_eq!(target_uri("/a|b#c").unwrap().to_string(), "/a|b%23c");
     }
 
     /// Past U+00FF there is no byte to send (node writes latin1).

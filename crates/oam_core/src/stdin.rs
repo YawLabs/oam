@@ -276,10 +276,18 @@ impl ReadGate {
     /// pending.
     #[cfg_attr(not(windows), allow(dead_code))]
     fn arm_cancel(&self, cursor: impl FnOnce() -> Option<SavedCursor>) -> Option<u64> {
+        // The settle lock first, the mark under it. A read that returns just
+        // as it is marked settles through `settle_discard`, which takes this
+        // lock: so it waits for the cursor and generation below, and the
+        // generation handed back is always the one that settle bumps. Marking
+        // before locking let that settle run in between -- the generation
+        // returned was then already bumped, nothing was left to bump it
+        // again, and the caller's wait ran the whole SETTLE_TIMEOUT (with a
+        // stale saved cursor left behind for the next read).
+        let mut settle = self.settle.lock().unwrap_or_else(|e| e.into_inner());
         if !self.mark_discard() {
             return None;
         }
-        let mut settle = self.settle.lock().unwrap_or_else(|e| e.into_inner());
         settle.saved_cursor = cursor();
         Some(settle.generation)
     }

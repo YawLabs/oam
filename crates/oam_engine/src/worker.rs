@@ -10,25 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 impl super::JsRuntime {
-    /// Execute a worker thread entry as the kind oam's loader gives its file
-    /// (oam.fork()'s in-process pool; a `new Worker` thread finds its entry
-    /// with [`Self::worker_entry`] first). Called on the WORKER thread, not
-    /// the parent.
-    pub(crate) fn execute_worker(
-        &mut self,
-        entry: &Path,
-        ctx: WorkerContext,
-    ) -> Result<(), Vec<Diagnostic>> {
-        // An ESM entry has to go through the module graph. load_cjs compiles
-        // it as a classic script, so `new Worker('x.mjs')` threw on its first
-        // import statement -- the ESM guard lives in the require() callback,
-        // which an entry never passes through. Decided as the CLI routes a
-        // program's entry: on the file's real path, a typeless .js by its
-        // syntax.
-        let kind = self.entry_module_kind(entry);
-        self.execute_worker_as(entry, kind, ctx)
-    }
-
     /// The file a `new Worker(filename)` thread runs, and as which kind, by
     /// the rules node's worker applies to its entry (#287): it runs it as
     /// the main module of the thread (`Module.runMain`), so `filename` is
@@ -497,8 +478,7 @@ where
         .spawn(f)
 }
 
-/// Spawn a worker thread. Returns (worker_id, thread_id). The caller
-/// must store the returned handles in the parent's WorkerRegistry.
+/// What a worker thread is started with, beyond its entry and channels.
 pub(crate) struct WorkerOptions {
     pub pipe_stdout: bool,
     pub pipe_stderr: bool,
@@ -514,6 +494,11 @@ pub(crate) struct WorkerOptions {
     pub creator_flags: Option<crate::WorkerFlagsOptions>,
 }
 
+/// Spawn a worker thread and return its join handle, which the caller stores
+/// with the worker's channels in the parent's registry. `Err` when the OS
+/// refuses the thread (its thread or address-space limit): the callers are
+/// V8 callbacks, where the failure has to become a thrown error and a panic
+/// would end the process.
 pub(crate) fn spawn_worker(
     script_path: PathBuf,
     worker_data: Option<String>,
@@ -522,7 +507,7 @@ pub(crate) fn spawn_worker(
     worker_tx: mpsc::Sender<WorkerEvent>,
     options: WorkerOptions,
     permissions: std::sync::Arc<crate::permissions::Permissions>,
-) -> std::thread::JoinHandle<()> {
+) -> std::io::Result<std::thread::JoinHandle<()>> {
     spawn_isolate_thread(format!("oam-worker-{worker_id}"), move || {
         let exit_code = run_worker(
             &script_path,
@@ -535,7 +520,6 @@ pub(crate) fn spawn_worker(
         );
         let _ = worker_tx.send(WorkerEvent::Exit(exit_code));
     })
-    .expect("worker thread spawns")
 }
 
 fn run_worker(
@@ -572,6 +556,70 @@ fn run_worker(
     // all-granted, which made `new Worker(...)` a one-line escape from
     // --permission.
     let mut rt = super::JsRuntime::new_worker_thread_runtime(permissions, env);
+    run_worker_on(
+        &mut rt,
+        script_path,
+        worker_data,
+        thread_id,
+        from_parent,
+        to_parent,
+        WorkerStart {
+            pipe_stdout,
+            pipe_stderr,
+            exec_argv,
+            flags_js,
+        },
+    )
+}
+
+/// What [`run_worker_on`] needs of a worker's options once its isolate
+/// exists: `env` went into the isolate, and the flags were decided from it.
+pub(crate) struct WorkerStart {
+    pub pipe_stdout: bool,
+    pub pipe_stderr: bool,
+    pub exec_argv: Vec<String>,
+    /// The flags prelude and resolved options, `None` when no builder is
+    /// registered (an embedder without the CLI).
+    pub flags_js: Option<(String, crate::WorkerFlagsOptions)>,
+}
+
+impl WorkerStart {
+    /// An `oam.fork()` isolate's start: the process environment, its
+    /// creator's flags, no `execArgv`, the process's own stdio. The cold
+    /// spawn's `WorkerOptions` (fork.rs `cold_spawn`) resolve to the same.
+    pub(crate) fn for_fork() -> Self {
+        let flags_js = crate::worker_flags_builder()
+            .map(|build| build(None, true, &[], &|name: &str| std::env::var(name).ok()));
+        Self {
+            pipe_stdout: false,
+            pipe_stderr: false,
+            exec_argv: Vec::new(),
+            flags_js,
+        }
+    }
+}
+
+/// Run a worker's entry on an isolate that already exists and return the
+/// thread's exit code. Everything a worker does after its isolate is built
+/// happens here, so a `new Worker` thread, a cold `oam.fork()` and a fork
+/// served by a pre-warmed isolate (fork.rs) behave alike: flags, the startup
+/// check, 'online', the entry's resolution, the fatal path and the worker's
+/// own process 'exit'. The caller sends `WorkerEvent::Exit`.
+pub(crate) fn run_worker_on(
+    rt: &mut super::JsRuntime,
+    script_path: &Path,
+    worker_data: Option<String>,
+    thread_id: u64,
+    from_parent: mpsc::Receiver<Vec<u8>>,
+    to_parent: mpsc::Sender<WorkerEvent>,
+    start: WorkerStart,
+) -> i32 {
+    let WorkerStart {
+        pipe_stdout,
+        pipe_stderr,
+        exec_argv,
+        flags_js,
+    } = start;
     rt.set_process_argv(vec![
         "oam".to_string(),
         script_path.to_string_lossy().into_owned(),

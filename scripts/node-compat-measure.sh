@@ -14,7 +14,8 @@
 #                         in its memory together)
 #
 # The per-PR RATCHET gate (the only gating part of node-compat.yml) lives in
-# scripts/ci-local.sh step 7 -- this script is purely measurement.
+# scripts/ci-local.sh step 9 (node-suite; step 8 is the conformance gate) --
+# this script is purely measurement.
 #
 # Output: a stage dir with per-platform scorecards + a pass-rate summary
 # table on stderr. LAST stdout line = the stage dir.
@@ -26,6 +27,12 @@
 #   OAM_SKIP_LOCAL=1 ...                             # drop the local leg
 # Remote host config: same env as the two platform scripts (OAM_MAC_HOST,
 # OAM_MAC_USER, OAM_MAC_KEY, OAM_LIMA_INSTANCE, OAM_KEEP_VM).
+#
+# NOTE: the local leg runs the two xtask suites in this working tree, and they
+# rewrite the committed receipts (CONFORMANCE.md, CONFORMANCE-NODE.md and the
+# two scorecards under conformance/) when results changed; review the diff
+# before committing. A suite that failed without writing its receipts stages
+# nothing: the committed ones are not this run's numbers.
 # =============================================================================
 
 set -euo pipefail
@@ -53,12 +60,37 @@ else
   LOCAL_OK=1
   cargo build -p oam_cli >&2 || LOCAL_OK=0
   if [ "$LOCAL_OK" = "1" ]; then
-    cargo run -p xtask -- conformance >&2 || warn "local conformance diverged (measurement continues)"
-    cargo run -p xtask -- node-suite  >&2 || warn "local node-suite ratchet violated (measurement continues)"
     mkdir -p "$STAGE_DIR/local"
-    cp conformance/scorecard.json conformance/node-suite-scorecard.json \
-       CONFORMANCE.md CONFORMANCE-NODE.md "$STAGE_DIR/local/" 2>/dev/null \
-      || warn "some local scorecards missing"
+    # A suite's receipts are staged only when THIS run produced them. Both
+    # suites gate after writing (a divergence or a ratchet violation exits
+    # non-zero with the receipts current), so a failure alone does not say
+    # which: a run refused before measuring (a non-pinned node, an xtask that
+    # does not compile) leaves the committed receipts in place, and copying
+    # those would report them as this run's local numbers -- the "green leg
+    # measuring nothing" case the summary below rejects for the remote legs,
+    # which it cannot detect here because the host field matches. The tell is
+    # the line each suite prints once its receipts are settled ("wrote ... +
+    # <scorecard> (results changed)" or "... + <scorecard> unchanged"); if
+    # that wording moves, a failed run stages nothing, which is the safe side.
+    # $1 = xtask subcommand, $2 = scorecard path as the suite prints it,
+    # $3 = its markdown twin, $4 = what a non-zero exit means when it measured.
+    stage_local_suite() {
+      local log="$STAGE_DIR/local/$1.log" rc=0
+      # pipefail: the pipeline's status is cargo's (tee does not fail).
+      cargo run -p xtask -- "$1" 2>&1 | tee "$log" >&2 || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        if grep -qF -e "+ $2 (results changed)" -e "+ $2 unchanged" "$log"; then
+          warn "local $1: $4 (measurement continues)"
+        else
+          warn "local $1 failed before it measured anything (exit $rc; log: $log) -- its receipts in the tree are the COMMITTED ones, not this run's, so they are not staged"
+          return 0
+        fi
+      fi
+      cp "$2" "$3" "$STAGE_DIR/local/" 2>/dev/null \
+        || warn "local $1: receipts missing ($2, $3)"
+    }
+    stage_local_suite conformance conformance/scorecard.json CONFORMANCE.md "diverged"
+    stage_local_suite node-suite conformance/node-suite-scorecard.json CONFORMANCE-NODE.md "ratchet violated"
     ok "local leg done"
   else
     warn "local build failed -- local leg dropped"
@@ -87,8 +119,10 @@ else
   step "Mac leg (tailnet, --mode=measure)"
   if MAC_ART=$(bash "$SCRIPT_DIR/build-platforms-tailnet.sh" --mode=measure); then
     MAC_ART="${MAC_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line
-    cp -r "$MAC_ART/mac-arm64" "$STAGE_DIR/"
-    ok "mac leg done"
+    # `&& ok || warn`: under set -e a bare cp would end the sweep here, with
+    # no summary and no stage-dir line, when the leg handed back no such dir.
+    cp -r "$MAC_ART/mac-arm64" "$STAGE_DIR/" && ok "mac leg done" \
+      || warn "mac leg exited 0 but handed back no mac-arm64 dir under '${MAC_ART}' (measurement continues without it)"
   else
     warn "mac leg failed (measurement continues without it)"
   fi
@@ -100,8 +134,8 @@ else
   step "Linux leg (Lima VM on the build Mac, --mode=measure)"
   if LINUX_ART=$(bash "$SCRIPT_DIR/build-platforms-mac-linux.sh" --mode=measure); then
     LINUX_ART="${LINUX_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line
-    cp -r "$LINUX_ART/linux-x64" "$STAGE_DIR/"
-    ok "linux leg done"
+    cp -r "$LINUX_ART/linux-x64" "$STAGE_DIR/" && ok "linux leg done" \
+      || warn "linux leg exited 0 but handed back no linux-x64 dir under '${LINUX_ART}' (measurement continues without it)"
   else
     warn "linux leg failed (measurement continues without it)"
   fi

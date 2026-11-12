@@ -29,7 +29,9 @@ pub type TsconfigEntry = Option<crate::tsconfig::TsconfigInfo>;
 #[derive(Default)]
 pub struct Resolver {
     /// Paths confirmed NOT to exist on a recent resolve. Speeds up repeated
-    /// misses for the same specifier across the same resolver scope.
+    /// misses for the same specifier across the same resolver scope. Only a
+    /// shortcut past candidates that lose to a later one: before a resolve
+    /// fails, every cached miss it relied on is stat'd again.
     negative_probes: Mutex<HashSet<PathBuf>>,
     /// `tsconfig.json` path -> parsed paths config. None = file existed but
     /// had no paths (so we don't re-stat it).
@@ -41,6 +43,17 @@ pub struct Resolver {
     /// `clear_caches` cannot be silently undone by an in-flight walk's
     /// back-fill (see `nearest_tsconfig_from_dir`).
     tsconfig_dirs: Mutex<TsconfigDirCache>,
+}
+
+/// What `Resolver::probe_file` learned about one candidate path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileProbe {
+    /// Stat'd just now: a file.
+    File,
+    /// Stat'd just now: not a file (and now recorded in the negative cache).
+    Missing,
+    /// Not stat'd: the negative cache says it was missing earlier.
+    CachedMissing,
 }
 
 /// The tsconfig discovery cache plus the generation stamp guarding its
@@ -150,32 +163,48 @@ impl Resolver {
         crate::npm::resolve_require_with(self, specifier, referrer)
     }
 
-    /// Check whether `path` resolves to a file, consulting the negative
-    /// cache first. Insert into the negative set on miss; remove on hit (a
-    /// file may have been created since the last check).
-    pub(crate) fn is_file_cached(&self, path: &Path) -> bool {
+    /// Whether `path` is a file, consulting the negative cache first: a path
+    /// recorded as missing answers `CachedMissing` WITHOUT touching the
+    /// filesystem, so that answer can be stale (the file may have been
+    /// created since). A caller about to report a failure must confirm such
+    /// candidates with `restat_file` first -- `probe_candidates` does.
+    pub(crate) fn probe_file(&self, path: &Path) -> FileProbe {
         {
             let neg = self
                 .negative_probes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if neg.contains(path) {
-                return false;
+                return FileProbe::CachedMissing;
             }
         }
         if crate::pathutil::is_file(path) {
-            self.negative_probes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(path);
-            true
+            FileProbe::File
         } else {
             self.negative_probes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(path.to_path_buf());
-            false
+            FileProbe::Missing
         }
+    }
+
+    /// Stat `path` regardless of the negative cache, and bring the cache up
+    /// to date with the answer. The slow path behind a `CachedMissing`: a
+    /// resolve never FAILS on a cached miss alone, so a module written after
+    /// a failed `import()` is found by the next one, as in node.
+    pub(crate) fn restat_file(&self, path: &Path) -> bool {
+        let is_file = crate::pathutil::is_file(path);
+        let mut neg = self
+            .negative_probes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if is_file {
+            neg.remove(path);
+        } else {
+            neg.insert(path.to_path_buf());
+        }
+        is_file
     }
 
     /// Resolve an import specifier as written in the module at `referrer`.
@@ -383,24 +412,24 @@ fn url_specifier_input(specifier: &str) -> std::borrow::Cow<'_, str> {
 // worker threads won't see one thread's `clear_caches()` wipe another's
 // work-in-progress -- each thread's default is isolated.
 //
-// The thread-local stores a `Box<Resolver>` that is leaked on first use,
-// giving a `&'static Resolver` (the box lives for the thread's lifetime, the
-// thread lives for the process's lifetime). That's the same shape the old
-// process-globals had (also `OnceLock`-lived forever).
+// The thread-local OWNS its `Resolver` (behind an `Rc`, so a caller can hold
+// it across a resolve without borrowing the thread-local slot). It is dropped
+// with the thread: a worker thread resolves imports through this default too,
+// and worker threads come and go, so a leaked per-thread resolver -- with its
+// negative-probe and tsconfig maps -- would be lost memory on every worker
+// exit.
 
 thread_local! {
-    static DEFAULT: &'static Resolver = {
-        let boxed: &'static Resolver = Box::leak(Box::new(Resolver::new()));
-        boxed
-    };
+    static DEFAULT: std::rc::Rc<Resolver> = std::rc::Rc::new(Resolver::new());
 }
 
-/// Borrow the current thread's default `Resolver`. Free functions call this
+/// The current thread's default `Resolver` (a cheap handle to it; the
+/// resolver itself lives until the thread exits). Free functions call this
 /// to preserve backward-compatible behavior. Long-lived consumers (CLI
 /// tools, daemons) should construct their own `Resolver` and pass it
 /// explicitly via the `*_with` variants.
-pub fn default_resolver() -> &'static Resolver {
-    DEFAULT.with(|r| *r)
+pub fn default_resolver() -> std::rc::Rc<Resolver> {
+    DEFAULT.with(std::rc::Rc::clone)
 }
 
 /// Drop every cache entry on the current thread's default `Resolver`.
@@ -445,6 +474,51 @@ mod tests {
             url_specifier_input("./esm.mjs"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    /// The negative probe cache is a shortcut, never the reason a resolve
+    /// fails: a module written after a failed `import()` is found by the next
+    /// one (node stats every time), with no `clear_caches` in between.
+    #[test]
+    fn a_file_created_after_a_failed_resolve_is_found_by_the_next_one() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "oam-resolver-negcache-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("entry.mjs");
+        std::fs::write(&entry, "").unwrap();
+        let resolver = Resolver::new();
+
+        for specifier in ["./gen.mjs", "./late"] {
+            let err = resolver
+                .resolve_import(specifier, &entry)
+                .expect_err("nothing there yet");
+            assert_eq!(err.code, "OAM-MOD0001", "{specifier}: {err:?}");
+        }
+        let gen_path = dir.join("gen.mjs");
+        assert_eq!(resolver.probe_file(&gen_path), FileProbe::CachedMissing);
+
+        std::fs::write(&gen_path, "export default 1;\n").unwrap();
+        std::fs::write(dir.join("late.js"), "export default 2;\n").unwrap();
+        let found = resolver
+            .resolve_import("./gen.mjs", &entry)
+            .expect("the file written after the failed resolve is found");
+        assert!(found.ends_with("gen.mjs"), "got {found:?}");
+        // An extensionless specifier: the candidate that now exists is found
+        // among several cached misses.
+        let late = resolver
+            .resolve_import("./late", &entry)
+            .expect("late.js is found");
+        assert!(late.ends_with("late.js"), "got {late:?}");
+        // And the cache caught up with the filesystem.
+        assert_eq!(resolver.probe_file(&gen_path), FileProbe::File);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

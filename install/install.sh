@@ -21,7 +21,7 @@
 #                       that is not pinned is refused.
 #
 # A signature that is present but does not verify always fails; so does a
-# v0.18.0+ release with no manifest. release-keys/README.md is the runbook.
+# v0.18.0+ release with no manifest. release-keys/README.md describes the keys.
 #
 # Env overrides:
 #   OAM_VERSION       install a specific tag (e.g. v0.18.0); default: latest
@@ -35,10 +35,12 @@
 #                     ssh-keygen, WITHOUT checking its signature. Only a
 #                     missing tool is skipped: with ssh-keygen present the
 #                     signature is always checked, and a bad one always fails.
-#   GH_TOKEN          GitHub token for private-repo installs (GITHUB_TOKEN is
-#                     also accepted). Needed on headless hosts -- CI, Docker, a
-#                     fresh VM -- that have a token but no gh CLI. While the
-#                     repo is private, unauthenticated asset URLs return 404.
+#   GH_TOKEN          Optional GitHub token (GITHUB_TOKEN is also accepted).
+#                     The repo and its releases are public, so a normal
+#                     install needs none. It is only a fallback, tried when
+#                     the unauthenticated download fails -- e.g. a GitHub
+#                     Enterprise mirror (OAM_GH_API) that requires auth, on a
+#                     headless host that has a token but no gh CLI.
 #   OAM_GH_API        GitHub API base; default https://api.github.com
 #                     (set this for GitHub Enterprise)
 set -eu
@@ -106,7 +108,7 @@ embedded_allowed_signers() {
 # Every oam release from the first signed one on carries RELEASE-MANIFEST and
 # RELEASE-MANIFEST.sig; this file names the keys allowed to have made that
 # signature. Read by scripts/lib/signing.sh (release_verify_manifest), and the
-# source of the key set the installers and `oam self-update` will embed.
+# source of the key set the installers and `oam self-update` embed.
 #
 # One line per key:
 #
@@ -119,7 +121,7 @@ embedded_allowed_signers() {
 #   - ssh-ed25519 (or sk-ssh-ed25519@openssh.com for a hardware key)
 #
 # k1 is the current release key (signs from v0.18.0, see ./ranges); k2 is the
-# staged next key, held offline, with no range yet. Because key lines exist,
+# staged next key, with no range yet. Because key lines exist,
 # every release must sign; there is no knob that skips it.
 #
 #   k1  SHA256:zB7Aq4Ky/U90VJ4sAEp0e2A65KfQpiyQXJI4FuT2oss
@@ -134,7 +136,7 @@ OAM_EMBED_ALLOWED_SIGNERS
 embedded_ranges() {
   cat <<'OAM_EMBED_RANGES'
 # Which tags each release key may sign. Read by scripts/lib/signing.sh
-# (release_tag_in_range); the installers and `oam self-update` will embed it.
+# (release_tag_in_range); the installers and `oam self-update` embed it.
 #
 # At most one line per key in ./allowed_signers:
 #
@@ -264,7 +266,8 @@ else
   die "need sha256sum or shasum to verify the download"
 fi
 
-# Map uname -> Rust target triple (must match release.yml asset names).
+# Map uname -> Rust target triple (must match the asset names
+# scripts/release-local.sh publishes; install/README.md lists them).
 os="$(uname -s)"
 arch="$(uname -m)"
 case "$os" in
@@ -305,8 +308,9 @@ tag_from_redirect() {
     *) return 1 ;;
   esac
 }
-# Private repo: /releases/latest 404s unauthenticated, so ask the API with the
-# token, then the gh CLI. Strip whitespace first, as token_dl explains.
+# Fallbacks for when the redirect above gives no tag (a host that requires
+# auth, a proxy that eats the redirect): ask the API with the token, then the
+# gh CLI. Strip whitespace first, as token_dl explains.
 tag_from_api() {
   [ -n "$TOKEN" ] || return 1
   api_get "${GH_API}/repos/${OWNER_REPO}/releases/latest" | tr -d ' \n\r' \
@@ -325,7 +329,7 @@ else
   tag="$(tag_from_redirect || true)"
   [ -n "$tag" ] || tag="$(tag_from_api 2>/dev/null || true)"
   [ -n "$tag" ] || tag="$(tag_from_gh || true)"
-  [ -n "$tag" ] || die "could not resolve the latest release tag (private repo? set GH_TOKEN or install the gh CLI; or set OAM_VERSION)"
+  [ -n "$tag" ] || die "could not resolve the latest release tag (network or proxy? set OAM_VERSION to name the tag; if your host requires GitHub auth, set GH_TOKEN or install the gh CLI)"
 fi
 is_plain_tag "$tag" || die "'$tag' is not a release tag -- oam tags look like ${FIRST_MANIFEST_SIG_TAG}"
 
@@ -336,7 +340,7 @@ else
 fi
 
 # Token fallback: works on headless hosts with no gh CLI (CI, Docker, a fresh
-# VM). A private-repo asset is NOT reachable via its browser_download_url even
+# VM). An asset that requires auth is NOT reachable via its browser_download_url even
 # with a token -- GitHub only serves the bytes from the assets endpoint with
 # Accept: application/octet-stream -- so resolve the numeric asset id first.
 rel_json=""
@@ -360,9 +364,9 @@ token_dl() {
     "application/octet-stream"
 }
 
-# Authenticated fallback: while the repo is private, unauthenticated release
-# URLs 404. If the direct download fails and the gh CLI is available (internal
-# machines), fetch the same assets through the caller's GitHub auth.
+# Authenticated fallback. The releases are public, so this is not the normal
+# path: if the direct download fails and the gh CLI is available, fetch the
+# same assets through the caller's GitHub auth.
 gh_dl() {
   command -v gh >/dev/null 2>&1 || return 1
   gh release download "$tag" --repo "$OWNER_REPO" --pattern "$1" \
@@ -370,7 +374,9 @@ gh_dl() {
 }
 
 # Direct first (public releases + a mirror), then token, then gh CLI. All three
-# fetch the same tag, and everything fetched is verified the same way.
+# fetch the same tag, and the manifest, the checksums, the binary and the
+# license and attribution texts are verified the same way whichever of them
+# served the bytes.
 fetch_asset() {
   dl "${base}/$1" "$2" && return 0
   if [ -n "$TOKEN" ]; then
@@ -378,19 +384,24 @@ fetch_asset() {
     token_dl "$1" "$2" && return 0
   fi
   if command -v gh >/dev/null 2>&1; then
-    say "retrying $1 via gh CLI (private repo needs auth)"
+    say "retrying $1 via gh CLI"
     gh_dl "$1" "$2" && return 0
   fi
   return 1
 }
 
-# hash_from_sums <file> -- the sha256 <file> lists for $asset, when it lists it
-# exactly once. Field 2 is matched exactly, with sha256sum's binary-mode "*"
-# stripped: the release writes "<hash> *<asset>". Two entries are refused
-# rather than resolved: the first of a duplicate pair has been the stale one.
+# hash_from_sums <file> [name] -- the sha256 <file> lists for [name] (default
+# $asset), when it lists it exactly once. Field 2 is matched exactly, with
+# sha256sum's binary-mode "*" stripped: the release writes "<hash> *<asset>".
+# Two entries are refused rather than resolved: the first of a duplicate pair
+# has been the stale one.
 hash_from_sums() {
-  awk -v a="$asset" '{ f = $2; sub(/^\*/, "", f); if (f == a) { n++; h = $1 } }
+  awk -v a="${2:-$asset}" '{ f = $2; sub(/^\*/, "", f); if (f == a) { n++; h = $1 } }
     END { if (n != 1) exit 1; print tolower(h) }' "$1"
+}
+# sums_count <file> <name> -- how many entries <file> has for <name>.
+sums_count() {
+  awk -v a="$2" '{ f = $2; sub(/^\*/, "", f); if (f == a) n++ } END { print n + 0 }' "$1"
 }
 
 # find_ssh_keygen -- KEYGEN set to an ssh-keygen that understands -Y verify
@@ -500,7 +511,7 @@ else
   say "SHA256SUMS ok: $tag matches its pinned digest (released before signing)"
   sums="$tmp/SHA256SUMS"
 fi
-expected="$(hash_from_sums "$sums")" || die "the verified checksums for $tag list ${asset} $(awk -v a="$asset" '{ f = $2; sub(/^\*/, "", f); if (f == a) n++ } END { print n + 0 }' "$sums") times, not once"
+expected="$(hash_from_sums "$sums")" || die "the verified checksums for $tag list ${asset} $(sums_count "$sums" "$asset") times, not once"
 
 # --- macOS code-signature hook (INACTIVE) ---------------------------------------
 # Developer ID signing is not live yet (signing plan 4.2 / rollout step 6). The
@@ -530,38 +541,68 @@ macos_signature_check() {
 mkdir -p "$INSTALL_DIR"
 bin_tmp="$(mktemp "$INSTALL_DIR/.oam.XXXXXX")" || die "could not create a temp file in $INSTALL_DIR"
 say "downloading ${asset} ${tag} from ${base}"
-fetch_asset "${asset}" "$bin_tmp" || die "download failed: ${asset} (private repo? set GH_TOKEN or install the gh CLI)"
+fetch_asset "${asset}" "$bin_tmp" || die "download failed: ${asset} (network or proxy? does ${tag} carry this asset? if your host requires GitHub auth, set GH_TOKEN or install the gh CLI)"
 actual="$(sha256_of "$bin_tmp")"
 [ "$expected" = "$actual" ] || die "checksum mismatch for ${asset} (expected ${expected}, got ${actual})"
 say "checksum ok"
 macos_signature_check "$bin_tmp"
+
+# The binary is a binary redistribution of V8, ICU, the Node streams port and
+# ~380 Rust crates, whose licenses require their notices travel with it. They
+# go beside the binary so the copy on THIS machine carries its attribution,
+# not just the repo it came from. Each one is checked against the same
+# verified checksums as the binary, and BEFORE the binary is put in place: a
+# file whose bytes differ from what the release lists stops the install with
+# nothing changed. Otherwise best-effort:
+#   - a release whose checksums do not list a file (every release cut before
+#     the license files were checksummed; before v0.8.1 there were none at
+#     all) does not get that file installed -- unchecked text is not put
+#     beside the binary -- and a warning says where to read it instead;
+#   - a listed file that cannot be fetched is not worth failing an otherwise
+#     good install over, and is reported rather than swallowed.
+lic_ok=""; lic_unlisted=""; lic_failed=""
+for f in LICENSE NOTICE THIRD_PARTY_LICENSES.md; do
+  _n="$(sums_count "$sums" "$f")"
+  case "$_n" in
+    0) lic_unlisted="${lic_unlisted:+$lic_unlisted }$f"; continue ;;
+    1) ;;
+    *) die "the verified checksums for $tag list $f $_n times, not once" ;;
+  esac
+  rm -f "${tmp}/lic.$f"
+  if ! fetch_asset "$f" "${tmp}/lic.$f" 2>/dev/null; then
+    lic_failed="${lic_failed:+$lic_failed }$f"; continue
+  fi
+  _want="$(hash_from_sums "$sums" "$f")"
+  _got="$(sha256_of "${tmp}/lic.$f")"
+  [ "$_want" = "$_got" ] || die "checksum mismatch for $f (expected ${_want}, got ${_got}) -- refusing to install $tag; nothing was changed"
+  lic_ok="${lic_ok:+$lic_ok }$f"
+done
+[ -z "$lic_ok" ] || say "checksum ok: $lic_ok"
+
 chmod 755 "$bin_tmp"
 mv -f "$bin_tmp" "${INSTALL_DIR}/oam"
 bin_tmp=""
 say "installed oam ${tag} to ${INSTALL_DIR}/oam"
 
-# The binary is a binary redistribution of V8, ICU, the Node streams port and
-# ~380 Rust crates, whose licenses require their notices travel with it. Put
-# them beside the binary so the copy on THIS machine carries its attribution,
-# not just the repo it came from. Best-effort: a missing notice is not worth
-# failing an otherwise good install over, and it is reported rather than
-# swallowed.
-got_licenses=0
+# Whatever the install this one replaced left in licenses/ describes a
+# different binary: those three names go first, then the checked files go in,
+# and the directory goes when nothing is left in it.
 mkdir -p "${INSTALL_DIR}/licenses"
 for f in LICENSE NOTICE THIRD_PARTY_LICENSES.md; do
-  if fetch_asset "$f" "${tmp}/$f" 2>/dev/null; then
-    mv -f "${tmp}/$f" "${INSTALL_DIR}/licenses/$f"
-    got_licenses=1
-  fi
+  rm -f "${INSTALL_DIR}/licenses/$f"
 done
-if [ "$got_licenses" = "1" ]; then
+for f in $lic_ok; do
+  mv -f "${tmp}/lic.$f" "${INSTALL_DIR}/licenses/$f"
+done
+rmdir "${INSTALL_DIR}/licenses" 2>/dev/null || true
+if [ -n "$lic_ok" ]; then
   say "license and attribution files in ${INSTALL_DIR}/licenses"
-else
-  # Releases before v0.8.1 shipped no license assets. Leaving an empty
-  # directory behind would imply they were installed, so remove it and say
-  # plainly where to read them instead.
-  rmdir "${INSTALL_DIR}/licenses" 2>/dev/null || true
-  say "note: this release ships no license assets; see https://github.com/${OWNER_REPO}"
+fi
+if [ -n "$lic_unlisted" ]; then
+  warn "the verified checksums for $tag do not list: ${lic_unlisted} -- not installed (only checked license files are copied); read them at https://github.com/${OWNER_REPO}/tree/${tag}"
+fi
+if [ -n "$lic_failed" ]; then
+  warn "could not fetch ${lic_failed} for $tag; see https://github.com/${OWNER_REPO}/tree/${tag}"
 fi
 
 # PATH guidance: only nudge if the install dir isn't already on PATH.

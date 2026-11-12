@@ -144,7 +144,13 @@ for tree in "${TREES[@]}"; do
       warn "would delete $tree/incremental (${inc_gb}GB)"
     else
       rm -rf "$tree/incremental" 2>/dev/null || true
-      ok "deleted $tree/incremental (${inc_gb}GB)"
+      # Report what happened, not what was asked for: the rm above cannot
+      # fail the script, so only the directory's absence says it worked.
+      if [ -e "$tree/incremental" ]; then
+        warn "$tree/incremental could not be fully deleted (was ${inc_gb}GB, $(oam_dir_gb "$tree/incremental")GB left) -- something still holds files in it"
+      else
+        ok "deleted $tree/incremental (${inc_gb}GB)"
+      fi
     fi
   fi
 
@@ -160,13 +166,23 @@ for tree in "${TREES[@]}"; do
   # safe (only the tab and the newline separate, and cargo names outputs
   # <crate>-<hash>[.ext], which carry neither), while macOS's BSD awk takes
   # RS='\0' as an empty string and loses every record after the first.
+  # Counted AFTER the rm, and only when the path is really gone: gc_rm cannot
+  # fail, so counting beforehand reported an image a live process still holds
+  # as reclaimed. A dry run counts the plan, which is what it reports.
   stale_count=0
   stale_kb=0
+  held_count=0
+  held_kb=0
   while IFS= read -r line; do
     kb="${line%% *}"; path="${line#* }"
-    stale_count=$((stale_count + 1))
-    stale_kb=$((stale_kb + kb))
     gc_rm "$path"
+    if [ "$DRY_RUN" = "1" ] || [ ! -e "$path" ]; then
+      stale_count=$((stale_count + 1))
+      stale_kb=$((stale_kb + kb))
+    else
+      held_count=$((held_count + 1))
+      held_kb=$((held_kb + kb))
+    fi
   done < <(
     list_files "$tree/deps" |
       sort -rn |
@@ -252,6 +268,9 @@ for tree in "${TREES[@]}"; do
     else
       ok "pruned $stale_count superseded artifacts from $tree/deps ($((stale_kb / 1024))MB)"
     fi
+  fi
+  if [ "$held_count" -gt 0 ]; then
+    warn "$held_count superseded artifacts in $tree/deps could not be deleted ($((held_kb / 1024))MB left in place) -- likely still in use; a later run reclaims them"
   fi
 
   oam_reap_parked "$tree"

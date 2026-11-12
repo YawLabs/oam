@@ -1,6 +1,6 @@
 # Streams Port: Node v22 internal/streams into oam
 
-Status: design, pre-implementation
+Status: implemented. All five slices landed; slice 5 (2026-07-26) deleted the hand-rolled streams and the `OAM_LEGACY_STREAMS` kill switch -- see section 11. Sections 1-10 are the design as written before implementation and are kept as the record of it; line numbers in them refer to the tree of that time.
 Owner: oam runtime
 Driver: MCP-server stdio/pipe/backpressure fidelity + hono/fastify request/response streams. Priority order: Readable/Writable state machines, pipeline()/finished() > operators/webstream interop > exotic surfaces.
 

@@ -481,10 +481,18 @@ fn printable(b: &[u8]) -> String {
 }
 
 /// The digest SHA256SUMS lists for `asset`: "<hex> *<name>" (sha256sum's
-/// binary marker) or "<hex>  <name>", first match wins -- install.sh's awk.
+/// binary marker) or "<hex>  <name>". The name must be listed exactly once:
+/// two entries are refused rather than resolved, as install.sh's
+/// `hash_from_sums` and install.ps1's `Get-HashFromSums` do.
 fn sum_for(sums: &[u8], asset: &str) -> Result<[u8; 32], String> {
     let text =
         std::str::from_utf8(sums).map_err(|_| "the signed SHA256SUMS is not text".to_string())?;
+    let n = sum_count(sums, asset);
+    if n > 1 {
+        return Err(format!(
+            "the verified checksums list {asset} {n} times, not once -- refusing it"
+        ));
+    }
     for line in text.lines() {
         let mut f = line.split_whitespace();
         let (Some(digest), Some(name)) = (f.next(), f.next()) else {
@@ -502,6 +510,23 @@ fn sum_for(sums: &[u8], asset: &str) -> Result<[u8; 32], String> {
     Err(format!(
         "the release lists no {asset} -- no build of it for this platform"
     ))
+}
+
+/// How many SHA256SUMS lines name `asset` (`sum_for`'s matching).
+fn sum_count(sums: &[u8], asset: &str) -> usize {
+    std::str::from_utf8(sums)
+        .map(|text| {
+            text.lines()
+                .filter(|line| {
+                    let mut f = line.split_whitespace();
+                    matches!(
+                        (f.next(), f.next()),
+                        (Some(_), Some(name)) if name.strip_prefix('*').unwrap_or(name) == asset
+                    )
+                })
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// This build's release asset name (install.sh / install.ps1 must agree; see
@@ -760,6 +785,15 @@ pub(crate) fn run(
         }
     }
 
+    // Refused here, naming the tag as check_licenses does, before the dry-run
+    // report and before anything is downloaded or written.
+    let n = sum_count(sums, &req.asset);
+    if n > 1 {
+        return Err(format!(
+            "the verified checksums for {tag} list {} {n} times, not once -- refusing it; nothing was changed",
+            req.asset
+        ));
+    }
     let expected = sum_for(sums, &req.asset)?;
     let url = format!("{base}/{}", req.asset);
     if req.dry_run {
@@ -806,8 +840,11 @@ pub(crate) fn run(
         .map_err(|e| format!("setting permissions on {}: {e}", staged.path.display()))?;
     drop(file);
 
+    // Checked before the binary is put in place: a notice whose bytes differ
+    // from what the release lists stops the update with nothing changed.
+    let licenses = check_licenses(http, &base, sums, tag)?;
     let reported = replace(&req.target, &staged.path, smoke)?;
-    refresh_licenses(http, &base, dir);
+    install_licenses(&licenses, dir, tag);
     println!(
         "oam self-update: installed {tag} to {} ({reported})",
         req.target.display()
@@ -817,15 +854,80 @@ pub(crate) fn run(
 
 /// The notices install.sh / install.ps1 put in `<install dir>/licenses`: the
 /// binary redistributes V8, ICU and ~400 crates, and their notices travel with
-/// it, so a new binary brings its own. Best-effort, as in the installers: a
-/// release before v0.8.1 ships none, and a missing notice is reported, not
-/// worth undoing a good update over. They are outside SHA256SUMS (it covers
-/// binaries), so they are unverified text -- written, never executed.
-fn refresh_licenses(http: &Http, base: &str, dir: &Path) {
+/// it, so a new binary brings its own.
+const LICENSE_FILES: [&str; 3] = ["LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.md"];
+
+/// The license files of one release, fetched and checked against its verified
+/// SHA256SUMS.
+#[derive(Debug, Default)]
+struct CheckedLicenses {
+    /// Listed once, fetched, and matching the listed digest.
+    ok: Vec<(&'static str, Vec<u8>)>,
+    /// Not listed (every release cut before the license files were checksummed;
+    /// before v0.8.1 there were none at all): not installed.
+    unlisted: Vec<&'static str>,
+    /// Listed, but the fetch failed: reported, not worth failing an update over.
+    failed: Vec<&'static str>,
+}
+
+/// Fetches each license file the verified `sums` list and checks its digest,
+/// as install.sh / install.ps1 do. A digest mismatch, or a name listed more
+/// than once, is an error: the caller has changed nothing yet.
+fn check_licenses(
+    http: &Http,
+    base: &str,
+    sums: &[u8],
+    tag: Tag,
+) -> Result<CheckedLicenses, String> {
+    let mut out = CheckedLicenses::default();
+    for name in LICENSE_FILES {
+        match sum_count(sums, name) {
+            0 => {
+                out.unlisted.push(name);
+                continue;
+            }
+            1 => {}
+            n => {
+                return Err(format!(
+                    "the verified checksums for {tag} list {name} {n} times, not once"
+                ));
+            }
+        }
+        let want = sum_for(sums, name)?;
+        let Ok(Fetched::Body(body)) = http.get(&format!("{base}/{name}"), LICENSE_CAP) else {
+            out.failed.push(name);
+            continue;
+        };
+        let got: [u8; 32] = Sha256::digest(&body).into();
+        if got != want {
+            return Err(format!(
+                "checksum mismatch for {name} (expected sha256 {}, got {}) -- refusing to install {tag}; nothing was changed",
+                hex(&want),
+                hex(&got)
+            ));
+        }
+        out.ok.push((name, body));
+    }
+    Ok(out)
+}
+
+/// Puts the checked license files in `<dir>/licenses`. Whatever an earlier
+/// install left there describes a different binary, so each of the three
+/// names is replaced by its checked copy or removed, and the directory goes
+/// when nothing is left in it. Best-effort: a write failure is reported, not
+/// worth undoing a good update over.
+fn install_licenses(checked: &CheckedLicenses, dir: &Path, tag: Tag) {
     let licenses = dir.join("licenses");
     let mut got = false;
-    for name in ["LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.md"] {
-        let Ok(Fetched::Body(body)) = http.get(&format!("{base}/{name}"), LICENSE_CAP) else {
+    for name in LICENSE_FILES {
+        let Some((_, body)) = checked.ok.iter().find(|(n, _)| *n == name) else {
+            match std::fs::remove_file(licenses.join(name)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => println!(
+                    "oam self-update: note: could not remove the earlier {name} from {}: {e}",
+                    licenses.display()
+                ),
+                _ => {}
+            }
             continue;
         };
         let tmp = licenses.join(format!(".{name}.update-{}", std::process::id()));
@@ -839,7 +941,7 @@ fn refresh_licenses(http: &Http, base: &str, dir: &Path) {
                     .create_new(true)
                     .open(&tmp)
             })
-            .and_then(|mut f| f.write_all(&body))
+            .and_then(|mut f| f.write_all(body))
             .and_then(|()| std::fs::rename(&tmp, licenses.join(name)));
         match written {
             Ok(()) => got = true,
@@ -852,14 +954,24 @@ fn refresh_licenses(http: &Http, base: &str, dir: &Path) {
             }
         }
     }
+    // Only succeeds on an empty directory.
+    let _ = std::fs::remove_dir(&licenses);
     if got {
         println!(
             "oam self-update: license and attribution files in {}",
             licenses.display()
         );
-    } else {
+    }
+    if !checked.unlisted.is_empty() {
         println!(
-            "oam self-update: note: this release ships no license assets; see https://github.com/YawLabs/oam"
+            "oam self-update: note: the verified checksums for {tag} do not list: {} -- not installed (only checked license files are copied); read them at https://github.com/YawLabs/oam/tree/{tag}",
+            checked.unlisted.join(" ")
+        );
+    }
+    if !checked.failed.is_empty() {
+        println!(
+            "oam self-update: note: could not fetch {} for {tag}; see https://github.com/YawLabs/oam/tree/{tag}",
+            checked.failed.join(" ")
         );
     }
 }
@@ -1068,6 +1180,9 @@ fn run_with_deadline(
 /// The binary to replace: `$OAM_INSTALL_DIR/oam[.exe]` when set (the
 /// installers' knob), else the running binary, through any symlink (a
 /// symlinked oam is updated where the link points, not replaced by a file).
+/// A running binary inside `node_modules` is refused: see
+/// [`npm_managed_message`]. `$OAM_INSTALL_DIR` names its target outright and
+/// is not second-guessed.
 fn target_path() -> Result<PathBuf, String> {
     if let Some(d) = std::env::var_os("OAM_INSTALL_DIR") {
         return Ok(PathBuf::from(d).join(if cfg!(windows) { "oam.exe" } else { "oam" }));
@@ -1077,11 +1192,37 @@ fn target_path() -> Result<PathBuf, String> {
     let is_link = std::fs::symlink_metadata(&exe)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false);
-    if is_link {
-        return std::fs::canonicalize(&exe)
-            .map_err(|e| format!("cannot resolve {}: {e}", exe.display()));
+    let target = if is_link {
+        std::fs::canonicalize(&exe).map_err(|e| format!("cannot resolve {}: {e}", exe.display()))?
+    } else {
+        exe
+    };
+    if in_node_modules(&target) {
+        return Err(npm_managed_message(&target));
     }
-    Ok(exe)
+    Ok(target)
+}
+
+/// Whether `path` lies inside a `node_modules` directory: a binary there
+/// belongs to a package manager (the `oamjs` npm package ships oam inside its
+/// platform package), which records the version and the file's integrity.
+fn in_node_modules(path: &Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str().eq_ignore_ascii_case("node_modules"))
+}
+
+/// Why a package-managed binary is not replaced in place: the package's
+/// recorded version and the lockfile's integrity would no longer describe the
+/// file, and the next clean install would put the old one back without a word.
+fn npm_managed_message(target: &Path) -> String {
+    format!(
+        "{} was installed by a package manager (it is inside node_modules), so it is not \
+         replaced in place: the package's version and lockfile would no longer match the \
+         binary, and the next install would revert it. Update the package instead \
+         (`npm install -g oamjs@latest`, or bump `oamjs` in the project that depends on it). \
+         To update a separate install, set OAM_INSTALL_DIR to its directory.",
+        target.display()
+    )
 }
 
 /// `oam self-update [--version <tag>] [--dry-run]`.
@@ -1194,6 +1335,30 @@ mod tests {
 
     fn t(s: &str) -> Tag {
         Tag::parse(s).unwrap()
+    }
+
+    /// A binary a package manager installed is recognised by where it is,
+    /// and the refusal says how to update it instead.
+    #[test]
+    fn a_binary_inside_node_modules_is_package_managed() {
+        for managed in [
+            "/usr/lib/node_modules/oamjs-linux-x64/bin/oam",
+            "project/node_modules/oamjs-darwin-arm64/bin/oam",
+            "/srv/app/Node_Modules/oamjs-linux-x64/bin/oam",
+        ] {
+            assert!(in_node_modules(Path::new(managed)), "{managed}");
+        }
+        for own in [
+            "/home/user/.oam/bin/oam",
+            "/opt/node_modules_backup/oam",
+            "/opt/my-node_modules/oam",
+            "oam",
+        ] {
+            assert!(!in_node_modules(Path::new(own)), "{own}");
+        }
+        let message = npm_managed_message(Path::new("/x/node_modules/oamjs-linux-x64/bin/oam"));
+        assert!(message.contains("npm install -g oamjs@latest"), "{message}");
+        assert!(message.contains("OAM_INSTALL_DIR"), "{message}");
     }
 
     /// The test trust root: t1 and tsk sign from v0.18.0, t2 is staged, and
@@ -1732,20 +1897,195 @@ mod tests {
         ));
         let base = serve(routes);
         let s = Scene::new("ok");
+        // An earlier install's notices describe a different binary.
+        std::fs::create_dir_all(s.dir.join("licenses")).unwrap();
+        std::fs::write(s.dir.join("licenses/LICENSE"), b"an earlier LICENSE\n").unwrap();
         assert_eq!(
             update(&s.request(&base, None, "v0.17.1")),
             Ok(Outcome::Updated(t("v0.18.0")))
         );
+        // The fixture's signed SHA256SUMS lists no license files, so the served
+        // LICENSE is unchecked and is not put beside the binary, and the
+        // earlier copy is gone with the directory it was the last file in.
+        assert_eq!(s.state(), (fixture("payload.bin"), vec![]));
+    }
+
+    /// A pre-signing v0.17.1 release whose SHA256SUMS is the fixture's plus a
+    /// line for each `(name, listed bytes)`, serving `served` beside it, and a
+    /// trust root pinning exactly that SHA256SUMS.
+    fn release_listing(listed: &[(&str, &[u8])], served: &[(&str, &[u8])]) -> (String, TrustRoot) {
+        let mut sums = fixture("SHA256SUMS");
+        for (name, bytes) in listed {
+            sums.extend_from_slice(format!("{} *{name}\n", hex(&Sha256::digest(bytes))).as_bytes());
+        }
+        let d = "/releases/download/v0.17.1";
+        let mut routes: Routes = vec![
+            (format!("{d}/SHA256SUMS"), 200, sums.clone()),
+            (
+                format!("{d}/{}", asset_name().unwrap_or("oam-none")),
+                200,
+                fixture("payload.bin"),
+            ),
+        ];
+        for (name, bytes) in served {
+            routes.push((format!("{d}/{name}"), 200, bytes.to_vec()));
+        }
+        let pinned = format!("v0.17.1 {}\n", hex(&Sha256::digest(&sums)));
+        let root = TrustRoot::parse(
+            &fixture_str("allowed_signers"),
+            &fixture_str("ranges"),
+            &pinned,
+        )
+        .unwrap();
+        (serve(routes), root)
+    }
+
+    fn update_with(base: &str, root: &TrustRoot, s: &Scene) -> Result<Outcome, String> {
+        run(
+            &s.request(base, Some("v0.17.1"), "v0.17.1"),
+            root,
+            &Http::new().unwrap(),
+            &smoke_ok,
+        )
+    }
+
+    const LIC: &[u8] = b"the release's LICENSE\n";
+    const NOTICE: &[u8] = b"the release's NOTICE\n";
+
+    #[test]
+    fn e2e_listed_license_files_are_checked_and_installed() {
+        // LICENSE and NOTICE are listed; THIRD_PARTY_LICENSES.md is served but
+        // not listed, so it is not installed and an earlier copy is removed.
+        let (base, root) = release_listing(
+            &[("LICENSE", LIC), ("NOTICE", NOTICE)],
+            &[
+                ("LICENSE", LIC),
+                ("NOTICE", NOTICE),
+                ("THIRD_PARTY_LICENSES.md", b"unlisted\n"),
+            ],
+        );
+        let s = Scene::new("lic-ok");
+        std::fs::create_dir_all(s.dir.join("licenses")).unwrap();
+        std::fs::write(s.dir.join("licenses/THIRD_PARTY_LICENSES.md"), b"earlier\n").unwrap();
+        assert_eq!(
+            update_with(&base, &root, &s),
+            Ok(Outcome::Updated(t("v0.17.1")))
+        );
         assert_eq!(s.state(), (fixture("payload.bin"), vec!["licenses".into()]));
-        // The notices travel with the binary, as the installers place them.
+        assert_eq!(std::fs::read(s.dir.join("licenses/LICENSE")).unwrap(), LIC);
         assert_eq!(
-            std::fs::read(s.dir.join("licenses/LICENSE")).unwrap(),
-            license
+            std::fs::read(s.dir.join("licenses/NOTICE")).unwrap(),
+            NOTICE
         );
+        let mut left: Vec<String> = std::fs::read_dir(s.dir.join("licenses"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["LICENSE", "NOTICE"]);
+    }
+
+    #[test]
+    fn e2e_license_file_differing_from_its_listed_digest_is_refused() {
+        let (base, root) = release_listing(
+            &[("LICENSE", LIC), ("NOTICE", NOTICE)],
+            &[("LICENSE", LIC), ("NOTICE", b"a different NOTICE\n")],
+        );
+        let s = Scene::new("lic-bad");
+        let e = update_with(&base, &root, &s).unwrap_err();
+        assert!(e.contains("checksum mismatch for NOTICE"), "{e}");
+        assert!(e.contains(&hex(&Sha256::digest(NOTICE))), "{e}");
+        assert!(e.contains("nothing was changed"), "{e}");
+        // Checked before the binary moves: the old one and no licenses/ remain.
+        s.assert_untouched();
+    }
+
+    #[test]
+    fn e2e_license_file_listed_twice_is_refused() {
+        let (base, root) = release_listing(
+            &[("LICENSE", LIC), ("LICENSE", b"another LICENSE\n")],
+            &[("LICENSE", LIC)],
+        );
+        let s = Scene::new("lic-dup");
+        let e = update_with(&base, &root, &s).unwrap_err();
+        assert!(e.contains("list LICENSE 2 times, not once"), "{e}");
+        s.assert_untouched();
+    }
+
+    #[test]
+    fn e2e_listed_license_file_that_cannot_be_fetched_is_skipped() {
+        let (base, root) =
+            release_listing(&[("LICENSE", LIC), ("NOTICE", NOTICE)], &[("LICENSE", LIC)]);
+        let s = Scene::new("lic-404");
         assert_eq!(
-            std::fs::read_dir(s.dir.join("licenses")).unwrap().count(),
-            1
+            update_with(&base, &root, &s),
+            Ok(Outcome::Updated(t("v0.17.1")))
         );
+        assert_eq!(std::fs::read(s.dir.join("licenses/LICENSE")).unwrap(), LIC);
+        assert!(!s.dir.join("licenses/NOTICE").exists());
+    }
+
+    #[test]
+    fn e2e_binary_listed_twice_is_refused() {
+        // The fixture already lists this platform's binary with the served
+        // payload's digest; a second entry (a different digest) follows it.
+        let asset = asset_name().unwrap_or("oam-none");
+        let (base, root) = release_listing(&[(asset, &b"another build\n"[..])], &[]);
+        let s = Scene::new("bin-dup");
+        let e = update_with(&base, &root, &s).unwrap_err();
+        assert!(
+            e.contains(&format!(
+                "the verified checksums for v0.17.1 list {asset} 2 times, not once"
+            )),
+            "{e}"
+        );
+        assert!(e.contains("nothing was changed"), "{e}");
+        s.assert_untouched();
+        // A dry run refuses it too, rather than reporting the first entry.
+        let mut req = s.request(&base, Some("v0.17.1"), "v0.17.1");
+        req.dry_run = true;
+        let e = run(&req, &root, &Http::new().unwrap(), &smoke_ok).unwrap_err();
+        assert!(
+            e.contains(&format!("list {asset} 2 times, not once")),
+            "{e}"
+        );
+        s.assert_untouched();
+    }
+
+    #[test]
+    fn sum_for_refuses_a_name_listed_more_than_once() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        // Same digest twice, differing digests, and the two line forms mixed:
+        // each is refused, never resolved to one of the entries.
+        for sums in [
+            format!("{a} *oam-x\n{a} *oam-x\n"),
+            format!("{a} *oam-x\n{b} *oam-x\n"),
+            format!("{a}  oam-x\n{b} *oam-x\n{a} *oam-y\n"),
+        ] {
+            let e = sum_for(sums.as_bytes(), "oam-x").unwrap_err();
+            assert!(e.contains("list oam-x 2 times, not once"), "{e}");
+        }
+        let three = format!("{a} *oam-x\n{a} *oam-x\n{a} *oam-x\n");
+        assert!(
+            sum_for(three.as_bytes(), "oam-x")
+                .unwrap_err()
+                .contains("3 times")
+        );
+        // A different name listed twice does not affect a name listed once.
+        let other = format!("{a} *oam-y\n{a} *oam-y\n{b} *oam-x\n");
+        assert_eq!(
+            sum_for(other.as_bytes(), "oam-x").unwrap(),
+            parse_sha256_hex(&b).unwrap()
+        );
+    }
+
+    #[test]
+    fn sum_count_matches_names_as_sum_for_does() {
+        let sums = b"aa *LICENSE\nbb  LICENSE\ncc *LICENSE.md\n\nbroken\n";
+        assert_eq!(sum_count(sums, "LICENSE"), 2);
+        assert_eq!(sum_count(sums, "LICENSE.md"), 1);
+        assert_eq!(sum_count(sums, "NOTICE"), 0);
     }
 
     #[test]

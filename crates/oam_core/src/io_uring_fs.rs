@@ -9,9 +9,14 @@
 //!
 //! Opt-in (`OAM_IO_URING=1`) + a runtime probe + a full fallback: if io_uring
 //! is unavailable (old kernel, seccomp) the probe fails and callers use the
-//! std path. Reads are processed sequentially for this first slice;
-//! cross-request concurrency is a follow-up (tokio-uring 0.5 exposes no
-//! top-level `spawn`).
+//! std path.
+//!
+//! Requests run concurrently: the worker spawns one task per request
+//! (`tokio_uring::spawn`) behind a 128-permit semaphore, so up to 128 reads
+//! and writes are in flight on the ring at once and the rest wait for a
+//! permit before they open a file or allocate. Each read holds its own
+//! growing output buffer plus one 64 KiB chunk buffer; each write holds the
+//! caller's data until the ring hands it back.
 
 use std::sync::OnceLock;
 
@@ -106,11 +111,13 @@ impl UringFs {
     /// in -- no clone on the happy path.
     ///
     /// On a worker-channel failure ("worker stopped" / "reply dropped") the
-    /// un-consumed `data` is handed back as `Err((err, data))` so the caller can
-    /// retry via the std path with no clone. A genuine io error from the worker
-    /// (the buffer is already consumed by then) is returned as `Err((err,
-    /// Vec::new()))` -- the empty `Vec` is the caller's "this is a real error,
-    /// surface it" signal, distinct from the populated `Vec` on a send failure.
+    /// un-consumed `data` is handed back as `Err((err, Some(data)))` so the
+    /// caller can retry via the std path with no clone. A genuine io error from
+    /// the worker (the buffer is already consumed by then) is returned as
+    /// `Err((err, None))` -- the caller's "this is a real error, surface it"
+    /// signal. It is an `Option` and not the buffer's emptiness because the
+    /// caller's own data may be empty (`writeFile(p, '')`), and that write
+    /// has to reach the std path as any other does.
     /// The error says which half failed, the create or the write, as node
     /// reports them apart (`crate::whole_file_error`); a channel failure is
     /// reported as the open's.
@@ -118,17 +125,17 @@ impl UringFs {
         &self,
         path: String,
         data: Vec<u8>,
-    ) -> Result<(), (crate::WholeFileError, Vec<u8>)> {
+    ) -> Result<(), (crate::WholeFileError, Option<Vec<u8>>)> {
         let (reply, rx) = oneshot::channel();
         // Send failure: the worker is gone and `data` rides back inside the
         // returned UringRequest::Write, so we can hand it to the caller for a
         // std retry without cloning.
         if let Err(send_err) = self.tx.send(UringRequest::Write { path, data, reply }) {
             let data = match send_err.0 {
-                UringRequest::Write { data, .. } => data,
-                // Unreachable: we only ever send a Write here. Recover an empty
-                // buffer rather than panic.
-                _ => Vec::new(),
+                UringRequest::Write { data, .. } => Some(data),
+                // Unreachable: we only ever send a Write here. Report nothing
+                // recovered rather than panic.
+                _ => None,
             };
             return Err((
                 crate::WholeFileError::Open(std::io::Error::other("io_uring worker stopped")),
@@ -138,15 +145,15 @@ impl UringFs {
         match rx.await {
             // Worker replied: the buffer was consumed by write_all, so a genuine
             // io error carries no recoverable data -- signal "real error" with
-            // an empty Vec.
-            Ok(res) => res.map_err(|e| (e, Vec::new())),
+            // `None`.
+            Ok(res) => res.map_err(|e| (e, None)),
             // Reply dropped: the worker died after we sent but before replying.
             // The buffer went with the dropped task, so we can't recover it;
-            // signal "real error" with an empty Vec. The caller surfaces this
+            // signal "real error" with `None`. The caller surfaces this
             // directly (it has no buffer of its own to retry std with).
             Err(_) => Err((
                 crate::WholeFileError::Open(std::io::Error::other("io_uring reply dropped")),
-                Vec::new(),
+                None,
             )),
         }
     }
@@ -222,13 +229,44 @@ async fn write_all(path: &str, data: Vec<u8>) -> Result<(), crate::WholeFileErro
 mod tests {
     use super::*;
 
-    // Real io_uring read on the CI Linux kernel: write a >64 KiB file (to
+    /// Start the lane for a test, or say LOUDLY that the test covered nothing.
+    ///
+    /// A host that blocks `io_uring_setup` (an old kernel, a container's
+    /// seccomp profile) fails the probe, and these tests then have nothing to
+    /// exercise. Returning quietly made that indistinguishable from a pass:
+    /// the lane could go green with zero coverage. So:
+    ///
+    /// - `OAM_REQUIRE_IO_URING=1` turns the failed probe into a test failure,
+    ///   for a host that is known to allow io_uring and must keep doing so;
+    /// - otherwise the skip is written straight to the process's stderr. Not
+    ///   `eprintln!`: libtest captures that for a passing test, which is how
+    ///   the old message was never seen.
+    fn start_or_skip(test: &str) -> Option<UringFs> {
+        if let Some(uring) = UringFs::try_start() {
+            return Some(uring);
+        }
+        let required = matches!(std::env::var("OAM_REQUIRE_IO_URING").as_deref(), Ok("1"));
+        assert!(
+            !required,
+            "{test}: OAM_REQUIRE_IO_URING=1 but the io_uring probe failed on this host \
+             (kernel < 5.1, or io_uring_setup is blocked) -- the io_uring lane has no coverage here"
+        );
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP {test}: io_uring probe failed on this host (kernel < 5.1, or io_uring_setup \
+             is blocked) -- the io_uring lane has NO coverage in this run; set \
+             OAM_REQUIRE_IO_URING=1 to make this a failure"
+        );
+        None
+    }
+
+    // Real io_uring read on a Linux kernel: write a >64 KiB file (to
     // exercise the multi-chunk loop), read it back through the worker thread,
-    // and assert the bytes. Skips gracefully if the runner has no io_uring.
+    // and assert the bytes. Without io_uring it skips, visibly (start_or_skip).
     #[test]
     fn uring_reads_file_contents() {
-        let Some(uring) = UringFs::try_start() else {
-            eprintln!("io_uring unavailable on this runner; skipping");
+        let Some(uring) = start_or_skip("uring_reads_file_contents") else {
             return;
         };
 
@@ -260,11 +298,10 @@ mod tests {
 
     // Slice 2: write a file via io_uring, then read it back via io_uring, and
     // assert the round-trip matches. Exercises the write path + the concurrent
-    // worker on a real kernel. Skips gracefully if io_uring is unavailable.
+    // worker on a real kernel. Without io_uring it skips, visibly (start_or_skip).
     #[test]
     fn uring_write_then_read_roundtrips() {
-        let Some(uring) = UringFs::try_start() else {
-            eprintln!("io_uring unavailable on this runner; skipping");
+        let Some(uring) = start_or_skip("uring_write_then_read_roundtrips") else {
             return;
         };
 

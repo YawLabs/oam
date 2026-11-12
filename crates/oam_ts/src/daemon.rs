@@ -168,13 +168,34 @@ pub(crate) struct CacheEnv {
 
 impl CacheEnv {
     fn from_process() -> Self {
-        let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
+        Self::from_lookup(
+            |name| std::env::var_os(name).map(PathBuf::from),
+            std::env::temp_dir(),
+        )
+    }
+
+    /// [`CacheEnv::from_process`] over an injected variable lookup, so the
+    /// two filters below are unit-tested without touching the process
+    /// environment.
+    ///
+    /// An EMPTY value counts as unset, and so does a RELATIVE platform
+    /// directory (the XDG base-directory spec says to ignore one): either
+    /// would resolve under the process cwd -- the user's project -- which is
+    /// the one place the cache must never land. The explicit `OAM_CACHE_DIR`
+    /// override is honoured when relative, but made absolute here, once:
+    /// tsgo runs from the project directory and the generated wrapper config
+    /// sits in its own, so a relative path to the declarations file or the
+    /// build-info would name a different file from each.
+    fn from_lookup(lookup: impl Fn(&str) -> Option<PathBuf>, temp_dir: PathBuf) -> Self {
+        let var = |name: &str| lookup(name).filter(|dir| !dir.as_os_str().is_empty());
+        let absolute_only = |name: &str| var(name).filter(|dir| dir.is_absolute());
+        let override_dir = var("OAM_CACHE_DIR");
         CacheEnv {
-            override_dir: var("OAM_CACHE_DIR"),
-            local_app_data: var("LOCALAPPDATA"),
-            xdg_cache_home: var("XDG_CACHE_HOME"),
-            home: var("HOME"),
-            temp_dir: std::env::temp_dir(),
+            override_dir: override_dir.map(|dir| std::path::absolute(&dir).unwrap_or(dir)),
+            local_app_data: absolute_only("LOCALAPPDATA"),
+            xdg_cache_home: absolute_only("XDG_CACHE_HOME"),
+            home: absolute_only("HOME"),
+            temp_dir,
         }
     }
 }
@@ -204,7 +225,32 @@ pub(crate) fn resolve_cache_root(env: &CacheEnv) -> PathBuf {
 }
 
 pub(crate) fn cache_root() -> PathBuf {
-    resolve_cache_root(&CacheEnv::from_process())
+    let env = CacheEnv::from_process();
+    // Unit tests never write into the developer's real cache: without an
+    // explicit OAM_CACHE_DIR they get a scratch root of their own. (They
+    // used to leave a wrapper per scratch project in `~/.cache/oam`, and
+    // could prune the installed oam's declarations file.)
+    #[cfg(test)]
+    {
+        if env.override_dir.is_none() {
+            return test_cache_root();
+        }
+    }
+    resolve_cache_root(&env)
+}
+
+/// One scratch cache root per test process.
+#[cfg(test)]
+fn test_cache_root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        std::env::temp_dir().join(format!(
+            "oam-ts-test-cache-{}-{}",
+            std::process::id(),
+            now_millis()
+        ))
+    })
+    .clone()
 }
 
 pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -417,7 +463,18 @@ fn fingerprint(root: &Path, tsconfig: &Path, listed: &[PathBuf]) -> Option<u64> 
 
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let read = std::fs::read_dir(&dir).ok()?;
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            // A directory the walk cannot list (another user's volume
+            // mounted into the project, a `chmod 000` dir) is one tsgo's
+            // own glob cannot list either, and any file tsgo still reaches
+            // inside it by name is in `listed`, stamped below. Recorded as
+            // "unlistable" rather than aborting the fingerprint -- which
+            // made the whole project uncacheable, every check paying a
+            // listing run for a cache that could never fill -- so that its
+            // becoming listable later changes the hash.
+            entries.insert(dir, None);
+            continue;
+        };
         for entry in read.flatten() {
             let path = entry.path();
             let name = entry.file_name();
@@ -541,7 +598,19 @@ fn tsconfig_chain(tsconfig: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// TypeScript's `extends` resolution, minus package.json `tsconfig` fields:
+/// An `extends` value that names a FILE (relative or rooted) rather than a
+/// package to look up under `node_modules`.
+pub(crate) fn extends_is_path(spec: &str) -> bool {
+    spec.starts_with("./")
+        || spec.starts_with("../")
+        || spec.starts_with('/')
+        || Path::new(spec).is_absolute()
+}
+
+/// TypeScript's `extends` resolution, minus what a package can say about
+/// itself -- package.json `tsconfig` fields, `exports` maps, Plug'n'Play --
+/// so for a PACKAGE spec None means "not found by this probe", not "does
+/// not exist" (`decls::visit` gives up on the wrapper for that reason):
 /// `./x` / `../x` / absolute -> that file (`.json` appended if needed, a dir
 /// means its tsconfig.json); anything else -> `node_modules/<spec>` walking
 /// up.
@@ -562,11 +631,7 @@ pub(crate) fn resolve_extends(dir: &Path, spec: &str) -> Option<PathBuf> {
         let with_json = PathBuf::from(with_json);
         with_json.is_file().then_some(with_json)
     }
-    let relative = spec.starts_with("./")
-        || spec.starts_with("../")
-        || spec.starts_with('/')
-        || Path::new(spec).is_absolute();
-    if relative {
+    if extends_is_path(spec) {
         return existing(dir.join(spec));
     }
     let mut probe = dir.to_path_buf();
@@ -668,8 +733,16 @@ pub struct DaemonStatus {
     pub spawn_failed_ms_ago: Option<u64>,
 }
 
+/// The recorded daemon for `tsconfig`'s project, read only from a state
+/// directory that is this user's own ([`trusted_state_dir`]): everything a
+/// client does next -- which port it asks, whose verdict it believes, which
+/// pid `stop` may kill -- comes out of this file.
 fn read_state(tsconfig: &Path) -> Option<StateFile> {
-    let raw = std::fs::read_to_string(state_path(tsconfig)).ok()?;
+    let state_file = state_path(tsconfig);
+    if !state_file.parent().is_some_and(trusted_state_dir) {
+        return None;
+    }
+    let raw = std::fs::read_to_string(state_file).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
@@ -706,6 +779,18 @@ pub fn check_via_daemon(target: &Path) -> Result<Vec<Diagnostic>, String> {
         return result;
     }
     let state_file = state_path(&tsconfig);
+    // A state directory that exists and is not this user's own: no daemon
+    // would start there (serve refuses), so do not spawn one to find out.
+    if let Some(dir) = state_file.parent()
+        && dir.exists()
+        && !trusted_state_dir(dir)
+    {
+        return Err(format!(
+            "{} is not owned by and writable only by the current user; \
+             not using a daemon (set OAM_CACHE_DIR)",
+            dir.display()
+        ));
+    }
     if let Some(age) = spawn_failure_age(&state_file) {
         if age < SPAWN_BACKOFF {
             return Err(format!(
@@ -776,13 +861,26 @@ fn try_existing(tsconfig: &Path) -> Option<Result<Vec<Diagnostic>, String>> {
     if !alive {
         return None;
     }
-    let response = request(
+    // From here the daemon is KNOWN to be up (it just answered the Ping), so
+    // a Check with no answer is "the daemon answered but could not check",
+    // not "no daemon": the read ran out the whole check budget, or the
+    // daemon went away mid-check (retired by a client whose tsgo lookup
+    // differs, stopped, killed). Reporting it as None made the caller spawn
+    // a sibling and wait a SECOND full budget on it -- past the bound
+    // check_timeout documents -- and, when that also ran out, record a
+    // "did not come up" spawn failure and its 5-minute backoff against a
+    // daemon that had come up fine.
+    let Some(response) = request(
         &state,
         &Request::Check {
             token: state.token.clone(),
         },
         check_timeout(),
-    )?;
+    ) else {
+        return Some(Err(
+            "the daemon stopped answering mid-check (timed out, or exited)".into(),
+        ));
+    };
     if response.ok {
         Some(Ok(response.diagnostics.unwrap_or_default()))
     } else {
@@ -916,7 +1014,9 @@ pub fn stop(target: &Path) -> bool {
 /// common stale-state-file case, not against a determined race.
 fn kill_daemon(pid: u32) -> bool {
     use std::process::Command;
-    if !daemon_process_alive(pid) {
+    // 0 and 1 never name a daemon, and negated below they would name this
+    // process's own group and every process respectively.
+    if pid <= 1 || !daemon_process_alive(pid) {
         return false;
     }
     let pid_str = pid.to_string();
@@ -926,10 +1026,26 @@ fn kill_daemon(pid: u32) -> bool {
         quiet(&mut command);
         command.status()
     } else {
+        // The daemon's process GROUP first (spawn_daemon makes it the
+        // leader of its own, and the tsgo it runs inherits the group), so
+        // an in-flight compiler does not outlive the daemon that would have
+        // bounded it -- the Unix counterpart of taskkill's /T. A negative
+        // pid names the group; `--` keeps it from being read as an option.
+        // This fails harmlessly (no such group) for a daemon that is not a
+        // group leader -- one started by an oam from before the daemon had
+        // a group -- and the plain kill below still ends that one.
+        let mut group = Command::new("kill");
+        group.args(["-KILL", "--", &format!("-{pid_str}")]);
+        quiet(&mut group);
+        let group_killed = group.status().is_ok_and(|s| s.success());
         let mut command = Command::new("kill");
         command.args(["-KILL", &pid_str]);
         quiet(&mut command);
-        command.status()
+        let single = command.status();
+        if group_killed {
+            return true;
+        }
+        single
     };
     status.is_ok_and(|s| s.success())
 }
@@ -1064,6 +1180,18 @@ fn spawn_daemon(tsconfig: &Path) -> Result<std::process::Child, String> {
         // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
         command.creation_flags(0x0000_0008 | 0x0000_0200);
     }
+    // Unix's half of the same detachment: a process group of its own. Left
+    // in the spawning client's group, the daemon took the terminal's Ctrl+C
+    // (SIGINT goes to the whole foreground group) along with the `oam check`
+    // that happened to start it, leaving a stale state file and a cold
+    // respawn. The group is also what kill_daemon signals: the daemon's
+    // tsgo children inherit it, so a wedged daemon and its in-flight
+    // compiler go together.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     command.spawn().map_err(|e| e.to_string())
 }
 
@@ -1091,6 +1219,9 @@ struct Cache {
     entry: Option<(u64, Vec<Diagnostic>)>,
     /// tsgo's program file list as of the last fill.
     listed: Vec<PathBuf>,
+    /// The last fill listed the program and could not fingerprint it (over
+    /// the entry cap): see `Shared::fill`.
+    too_big: bool,
 }
 
 impl Shared {
@@ -1115,13 +1246,30 @@ impl Shared {
 
     /// Cache miss: refresh tsgo's file list, fingerprint BEFORE the check
     /// (an edit during the run must miss next time), run it, store.
+    ///
+    /// A tree too big to fingerprint can never fill the cache, so the
+    /// listing run would be pure cost on every check -- two tsgo runs where
+    /// one-shot pays one. Once a fill has found that, later fills first
+    /// repeat the walk alone (no tsgo; the project walk is a subset of the
+    /// full fingerprint, so while IT is over the cap the full one is too)
+    /// and skip the listing until the tree fits again.
     fn fill(&self) -> Result<Vec<Diagnostic>, Diagnostic> {
-        let listed = crate::list_files(&self.tsconfig, &self.handle).ok();
+        let too_big = self.cache.lock().unwrap_or_else(|p| p.into_inner()).too_big;
+        let listed = if too_big && fingerprint(&self.root, &self.tsconfig, &[]).is_none() {
+            None
+        } else {
+            crate::list_files(&self.tsconfig, &self.handle).ok()
+        };
         let fp = listed
             .as_deref()
             .and_then(|listed| fingerprint(&self.root, &self.tsconfig, listed));
         let diagnostics = crate::check_cancellable(&self.tsconfig, &self.handle)?;
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        // Only a listing that succeeded says anything new about the size;
+        // a skipped one leaves the verdict that skipped it.
+        if listed.is_some() {
+            cache.too_big = fp.is_none();
+        }
         match (fp, listed) {
             (Some(fp), Some(listed)) => {
                 cache.entry = Some((fp, diagnostics.clone()));
@@ -1140,7 +1288,7 @@ impl Shared {
 pub fn serve(tsconfig: &Path) -> std::io::Result<()> {
     let tsconfig = std::path::absolute(tsconfig)?;
     let state_file = state_path(&tsconfig);
-    std::fs::create_dir_all(state_file.parent().expect("state dir"))?;
+    create_private_state_dir(state_file.parent().expect("state dir"))?;
     match serve_inner(&tsconfig, &state_file) {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -1182,12 +1330,7 @@ fn serve_inner(tsconfig: &Path, state_file: &Path) -> std::io::Result<()> {
         tsgo_path: tsgo_path.to_string_lossy().into_owned(),
         tsgo_version: tsgo_version.clone(),
     };
-    std::fs::write(state_file, serde_json::to_string(&state)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(state_file, std::fs::Permissions::from_mode(0o600));
-    }
+    write_state_file(state_file, &serde_json::to_string(&state)?)?;
     // We are up: whatever the previous attempt recorded is history.
     let _ = std::fs::remove_file(sidecar(state_file, "error"));
     let _ = std::fs::remove_file(sidecar(state_file, "spawn-failed"));
@@ -1233,6 +1376,117 @@ fn serve_inner(tsconfig: &Path, state_file: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Write the state file -- it holds the token -- readable by its owner only
+/// from the moment it exists. Unix: created 0600 (a plain write followed by
+/// a chmod left it at the umask's mode in between); a file left by an
+/// earlier daemon is removed first so the mode applies to a fresh one, and
+/// the chmod stays for the case where a sibling daemon re-created it in
+/// that gap. Windows: the cache dir is under the user's profile, whose ACL
+/// already limits it.
+fn write_state_file(state_file: &Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let _ = std::fs::remove_file(state_file);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(state_file)?;
+        file.write_all(contents.as_bytes())?;
+        let _ = std::fs::set_permissions(state_file, std::fs::Permissions::from_mode(0o600));
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(state_file, contents)
+    }
+}
+
+/// Is `dir` -- the directory the state files live in -- this user's own to
+/// trust? A state file names the port and token a client then believes a
+/// verdict from, and the pid `stop`/`retire` may kill, so it is read only
+/// from a directory no other account can write into. The usual roots (under
+/// the home directory) pass trivially; this matters for the `<temp>/oam`
+/// fallback of an environment with no home, which is shared.
+///
+/// Unix: a real directory (not a symlink), owned by the current user, not
+/// writable by group or other. Windows: `%LOCALAPPDATA%` and `%TEMP%` are
+/// per-user on every stock configuration; nothing to check.
+#[cfg(unix)]
+fn state_dir_is_private(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    meta.is_dir() && meta.mode() & 0o022 == 0 && current_uid(dir) == Some(meta.uid())
+}
+
+#[cfg(not(unix))]
+fn state_dir_is_private(_dir: &Path) -> bool {
+    true
+}
+
+/// The current effective uid, learned without libc (this crate has no FFI
+/// on Unix) from the ownership of a probe file this process creates in
+/// `dir`; read through the open handle, so it is the file just created
+/// whatever happens to the name. Cached once learned. None = the probe
+/// could not be created, which callers treat as "not ours".
+#[cfg(unix)]
+fn current_uid(dir: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    static UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if let Some(uid) = UID.get() {
+        return Some(*uid);
+    }
+    let probe = dir.join(format!(
+        ".uid-probe-{}-{}",
+        std::process::id(),
+        now_millis()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .ok()?;
+    let uid = file.metadata().ok().map(|meta| meta.uid());
+    drop(file);
+    let _ = std::fs::remove_file(&probe);
+    let uid = uid?;
+    Some(*UID.get_or_init(|| uid))
+}
+
+/// [`state_dir_is_private`], after first narrowing an existing directory to
+/// user-only on Unix: one created by an earlier oam under a permissive
+/// umask is ours to fix, and the chmod fails on a directory that is not
+/// ours, which the check then reports.
+fn trusted_state_dir(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    state_dir_is_private(dir)
+}
+
+/// Create the state directory, user-only on Unix, and confirm it is one to
+/// trust ([`trusted_state_dir`]). The daemon refuses to start otherwise.
+fn create_private_state_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    if trusted_state_dir(dir) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "{} is not a directory owned by and writable only by the current user; \
+             the type-check daemon keeps no state there (set OAM_CACHE_DIR)",
+            dir.display()
+        )))
+    }
 }
 
 /// Delete the state file only when it still records our pid.
@@ -1304,15 +1558,51 @@ fn check_worker(rx: Receiver<TcpStream>, shared: Arc<Shared>) {
     }
 }
 
+/// The largest request line the daemon reads. A request is one small JSON
+/// object (a command name and the 64-character token); anything longer is
+/// not one of ours.
+const MAX_REQUEST_BYTES: usize = 4096;
+
+/// One request line off `stream`, bounded in BOTH size and time. This runs
+/// on the accept thread before the token is checked, so neither bound may
+/// depend on the peer: the line is capped at [`MAX_REQUEST_BYTES`] (a
+/// `read_line` grew its buffer for as long as bytes without a newline kept
+/// coming), and [`REQUEST_IO_TIMEOUT`] covers the whole line, not each read
+/// (a per-read timeout restarts with every byte that arrives). None = the
+/// read failed or the time ran out; the connection is dropped unanswered,
+/// as a failed read always was. An over-long or newline-less line comes
+/// back as far as it was read and fails to parse as a request.
+fn read_request_line(stream: &TcpStream) -> Option<String> {
+    use std::io::Read;
+    let deadline = Instant::now() + REQUEST_IO_TIMEOUT;
+    let mut reader = stream;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !bytes.contains(&b'\n') && bytes.len() < MAX_REQUEST_BYTES {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())?;
+        stream.set_read_timeout(Some(remaining)).ok()?;
+        let read = reader.read(&mut chunk).ok()?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(bytes.len());
+    String::from_utf8(bytes[..end].to_vec()).ok()
+}
+
 /// Returns false when the daemon should exit (shutdown request).
 fn handle_connection(stream: TcpStream, shared: &Shared, worker: &Sender<TcpStream>) -> bool {
-    let _ = stream.set_read_timeout(Some(REQUEST_IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(REQUEST_IO_TIMEOUT));
     let _ = stream.set_nodelay(true);
-    let mut line = String::new();
-    if BufReader::new(&stream).read_line(&mut line).is_err() {
+    let Some(line) = read_request_line(&stream) else {
         return true;
-    }
+    };
 
     let Ok(request) = serde_json::from_str::<Request>(line.trim()) else {
         respond(&stream, &Response::failure("malformed request"));
@@ -1687,6 +1977,124 @@ mod tests {
             PathBuf::from("/home/u").join(".cache").join("oam")
         };
         assert_eq!(resolve_cache_root(&home_only), expected);
+    }
+
+    #[test]
+    fn cache_env_treats_empty_as_unset_and_never_keeps_a_relative_dir() {
+        // An absolute path in this platform's own spelling.
+        let abs = std::env::temp_dir().join("oam-cache-env");
+        assert!(abs.is_absolute());
+        let temp = std::env::temp_dir();
+
+        // Every variable set but empty: all unset, so the temp fallback.
+        let empty = CacheEnv::from_lookup(|_| Some(PathBuf::new()), temp.clone());
+        assert!(empty.override_dir.is_none());
+        assert!(empty.local_app_data.is_none());
+        assert!(empty.xdg_cache_home.is_none());
+        assert!(empty.home.is_none());
+        assert_eq!(resolve_cache_root(&empty), temp.join("oam"));
+
+        // A relative platform dir is ignored; a relative override is kept
+        // but made absolute, so nothing derived from it depends on which
+        // directory reads it.
+        let relative = CacheEnv::from_lookup(|_| Some(PathBuf::from("rel")), temp.clone());
+        assert!(relative.local_app_data.is_none());
+        assert!(relative.xdg_cache_home.is_none());
+        assert!(relative.home.is_none());
+        let root = resolve_cache_root(&relative);
+        assert!(root.is_absolute(), "{}", root.display());
+        assert!(root.ends_with("rel"), "{}", root.display());
+
+        // Absolute values pass through untouched.
+        let absolute = CacheEnv::from_lookup(|_| Some(abs.clone()), temp);
+        assert_eq!(absolute.override_dir.as_deref(), Some(abs.as_path()));
+        assert_eq!(absolute.home.as_deref(), Some(abs.as_path()));
+    }
+
+    #[test]
+    fn fingerprint_survives_a_directory_it_cannot_list() {
+        // One unlistable directory used to abort the whole fingerprint,
+        // which made the project permanently uncacheable. A root that does
+        // not exist fails read_dir the same way a forbidden one does.
+        let dir = scratch("fp-unlistable");
+        let tsconfig = dir.join("tsconfig.json");
+        std::fs::write(&tsconfig, "{}").unwrap();
+        let absent = dir.join("absent");
+        let unlistable = fingerprint(&absent, &tsconfig, &[]).expect("still fingerprints");
+        // ...and it becoming listable is a change.
+        std::fs::create_dir_all(&absent).unwrap();
+        let listable = fingerprint(&absent, &tsconfig, &[]).expect("fingerprints");
+        assert_ne!(unlistable, listable);
+    }
+
+    #[test]
+    fn extends_specs_split_into_paths_and_packages() {
+        assert!(extends_is_path("./base.json"));
+        assert!(extends_is_path("../base"));
+        assert!(extends_is_path("/abs/base.json"));
+        assert!(!extends_is_path("@acme/tsconfig/base.json"));
+        assert!(!extends_is_path("tsconfig-base"));
+    }
+
+    #[test]
+    fn a_request_line_is_bounded_in_size() {
+        // The pre-token read on the accept thread: a peer that sends bytes
+        // with no newline must not grow the buffer without limit.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let writer = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            // Ignore the result: the reader stops early and may close.
+            let _ = stream.write_all(&vec![b'x'; 64 * 1024]);
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let line = read_request_line(&stream).expect("a capped line, not a failure");
+        assert!(line.len() >= MAX_REQUEST_BYTES, "{}", line.len());
+        assert!(line.len() < MAX_REQUEST_BYTES + 1024, "{}", line.len());
+        drop(stream);
+        writer.join().unwrap();
+
+        // A well-formed line comes back without its newline.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let writer = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream.write_all(b"{\"cmd\":\"ping\"}\ntrailing").unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        assert_eq!(
+            read_request_line(&stream).as_deref(),
+            Some("{\"cmd\":\"ping\"}")
+        );
+        writer.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_state_file_is_user_only_from_creation_and_its_dir_is_checked() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("state-private").join("ts-daemons");
+        create_private_state_dir(&dir).expect("our own scratch dir is trusted");
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let state = dir.join("abc.json");
+        // Over a pre-existing, wider file too.
+        std::fs::write(&state, "old").unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_state_file(&state, "{}").unwrap();
+        assert_eq!(std::fs::read_to_string(&state).unwrap(), "{}");
+        assert_eq!(
+            std::fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // A symlink standing in for the directory is not trusted, whoever
+        // owns what it points at.
+        let link = dir.with_file_name("ts-daemons-link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(!trusted_state_dir(&link));
+        assert!(!trusted_state_dir(&dir.with_file_name("absent")));
     }
 
     #[test]

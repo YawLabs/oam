@@ -1,9 +1,11 @@
 //! The Promise <-> Future bridge.
 //!
-//! JS-side: `globalThis.oam` carries the built-in async surface (sleep,
-//! readTextFile for now — the namespace grows with the op table). Each call
-//! creates a V8 PromiseResolver, spawns the op future onto oam_core's tokio
-//! runtime, and parks the resolver in the PendingOps slot keyed by op id.
+//! JS-side: the natives object installed here (`__oam`: sleep, fetch,
+//! WebSocket, fork, record/replay, ...; the node: surface's natives are
+//! node_ops.rs) carries the built-in async surface. An async call creates a
+//! V8 PromiseResolver, spawns the op future onto oam_core's tokio runtime,
+//! and parks the resolver in the PendingOps slot keyed by op id (a callback
+//! op parks a function instead).
 //! Loop-side: `settle_completion` maps each OpCompletion back to its
 //! resolver on the isolate thread (Done -> undefined, Text -> string,
 //! Failed -> reject with Error).
@@ -354,12 +356,7 @@ fn op_read_text_file(
     // The path as an fs op takes it (`FsPath`: namespaced on Windows), so
     // the path the permission check judges is the path that is read.
     let path = oam_core::FsPath::new(path.to_rust_string_lossy(scope));
-    if let Err(denial) = scope
-        .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
-        .cloned()
-        .unwrap_or_default()
-        .check_read_path(&path)
-    {
+    if let Err(denial) = crate::node_ops::permissions_of(scope).check_read_path(&path) {
         crate::node_ops::throw_permission_denied(scope, &denial);
         return;
     }
@@ -393,10 +390,7 @@ fn op_fetch(
     // fetch anywhere (a host the grant never named, loopback, a metadata
     // address). Here it is asked about the initial URL synchronously, so a
     // refused URL throws before anything starts; `None` = every host granted.
-    let permissions = scope
-        .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
-        .cloned()
-        .unwrap_or_default();
+    let permissions = crate::node_ops::permissions_of(scope);
     let net_check = crate::permissions::fetch_net_check(&permissions);
     if let Some(check) = &net_check {
         let parsed = ada_url::Url::parse(&request.url, None).ok();
@@ -490,26 +484,34 @@ fn op_fetch_continue(
         return;
     };
     let answer = answer.to_rust_string_lossy(scope);
-    let permissions = scope
-        .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
-        .cloned()
-        .unwrap_or_default();
+    let permissions = crate::node_ops::permissions_of(scope);
     if !matches!(permissions.net, crate::permissions::PermValue::All) {
+        // The shape the op itself parses (`resume_with_answer`'s `Lookup`).
         #[derive(serde::Deserialize)]
         struct Answer {
-            #[serde(default)]
             ips: Vec<String>,
         }
         // The hop's port comes from the parked fetch, never from JS. A token
-        // that parks nothing has no port and dials nothing: the op fails it.
-        // A malformed answer is not this gate's business either: the op
-        // itself reports it, with its own message.
+        // that parks nothing (the outer `None`) has no port and dials
+        // nothing: the op fails it. A malformed answer is not this gate's
+        // business either: the op itself reports it, with its own message.
         let continuations = core_runtime!(scope).fetch_continuations();
-        let port = oam_core::ops::fetch_parked_port(token, &continuations);
-        if let (Some(port), Ok(parsed)) = (port, serde_json::from_str::<Answer>(&answer)) {
+        let parked = oam_core::ops::fetch_parked_port(token, &continuations);
+        if let (Some(port), Ok(parsed)) = (parked, serde_json::from_str::<Answer>(&answer)) {
             for ip in &parsed.ips {
                 let resource = crate::permissions::lookup_answer_resource(ip);
-                if let Err(denial) = permissions.check_net_target(&resource, port) {
+                // A hop that is parked but has no port to name (neither its
+                // own nor its scheme's default) cannot be matched against a
+                // grant, and the op would still resume it with these
+                // addresses: none is admitted for it.
+                let verdict = match port {
+                    Some(port) => permissions.check_net_target(&resource, port),
+                    None => Err(crate::permissions::PermissionDenial {
+                        permission: "Net",
+                        resource,
+                    }),
+                };
+                if let Err(denial) = verdict {
                     oam_core::ops::fetch_abandon(token, &continuations);
                     crate::node_ops::throw_permission_denied(scope, &denial);
                     return;
@@ -687,30 +689,20 @@ fn op_fetch_body_trailers(
 }
 
 /// Synchronous: drop the stored body (connection closes). Safe to call
-/// on an already-drained handle. A handle absent from the registry may have
-/// a read IN FLIGHT (remove-await-reinsert); tombstone it so the returning
-/// read drops the body instead of reviving it.
+/// on an already-drained handle, which leaves nothing behind. A handle absent
+/// from the registry because its read is IN FLIGHT (remove-await-reinsert)
+/// is tombstoned and its read woken, so the returning read drops the body
+/// instead of reviving it (`oam_core::ops::fetch_body_cancel`).
 fn op_fetch_body_cancel(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let removed = core_runtime!(scope)
-        .bodies()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&handle);
-    if removed.is_none() {
-        core_runtime!(scope)
-            .cancelled_bodies()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(handle);
-        // Wake the parked read so the cancel takes effect even when the peer
-        // has simply stopped sending (chunk() would never resolve).
-        core_runtime!(scope).body_cancel_signal().notify_waiters();
-    }
+    let bodies = core_runtime!(scope).bodies();
+    let cancelled = core_runtime!(scope).cancelled_bodies();
+    let cancel_signal = core_runtime!(scope).body_cancel_signal();
+    oam_core::ops::fetch_body_cancel(&bodies, &cancelled, &cancel_signal, handle);
 }
 
 fn op_ws_connect(
@@ -771,12 +763,7 @@ fn op_ws_connect(
             .as_ref()
             .map(crate::permissions::url_net_port)
             .unwrap_or_default();
-        if let Err(denial) = scope
-            .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
-            .cloned()
-            .unwrap_or_default()
-            .check_net_target(&host, port)
-        {
+        if let Err(denial) = crate::node_ops::permissions_of(scope).check_net_target(&host, port) {
             crate::node_ops::throw_permission_denied(scope, &denial);
             return;
         }
@@ -899,16 +886,16 @@ pub(crate) fn settle_completion(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     completion: OpCompletion,
 ) -> Settled {
-    // Inbound OS signal: no parked resolver (it was never a spawn_op). Emit the
-    // named event on `process` so JS listeners fire; a present listener also
-    // means the OS default was already suppressed at install time. If nothing
-    // listens, emit is a benign no-op (a signal watcher can outlive its last
-    // listener by a turn on the remove path).
     // A V8 foreground-task wake (platform.rs): it only had to interrupt the
     // loop's wait; the loop runs the queued tasks itself.
     if completion.id == oam_core::PLATFORM_TASK_OP_ID {
         return Settled::Ran;
     }
+    // Inbound OS signal: no parked resolver (it was never a spawn_op). Emit the
+    // named event on `process` so JS listeners fire; a present listener also
+    // means the OS default was already suppressed at install time. If nothing
+    // listens, emit is a benign no-op (a signal watcher can outlive its last
+    // listener by a turn on the remove path).
     if completion.id == oam_core::SIGNAL_OP_ID {
         if let OpOutcome::Signal(name) = completion.outcome {
             crate::modules::emit_process_event(tc, &name, &[]);
@@ -1469,16 +1456,14 @@ fn op_fork_spawn(
         .get_slot::<std::sync::Arc<crate::fork::ForkPool>>()
         .cloned();
 
-    match pool {
-        Some(pool) => {
-            pool.fork(
-                path,
-                worker_data,
-                worker_id,
-                worker_to_parent_tx,
-                parent_to_worker_rx,
-            );
-        }
+    let spawned = match pool {
+        Some(pool) => pool.fork(
+            path,
+            worker_data,
+            worker_id,
+            worker_to_parent_tx,
+            parent_to_worker_rx,
+        ),
         None => {
             // Slot not set (e.g. worker thread that didn't initialize a pool):
             // fall back to a cold spawn.
@@ -1498,8 +1483,19 @@ fn op_fork_spawn(
                     creator_flags: None,
                 },
                 permissions,
-            );
+            )
+            // Not joined: the registry holds a fork's channels only.
+            .map(drop)
         }
+    };
+    // The OS refused the thread: an error for the caller to catch, with
+    // nothing registered for a fork that never started.
+    if let Err(e) = spawned {
+        let text = format!("forkSpawn: could not start a thread: {e}");
+        let msg = v8::String::new(scope, &text).unwrap();
+        let exc = v8::Exception::error(scope, msg);
+        scope.throw_exception(exc);
+        return;
     }
 
     {

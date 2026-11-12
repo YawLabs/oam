@@ -41,6 +41,7 @@ OAM_MIRI_HELD_CASES=(
   held_two_exclusive_scopes_is_ub
   held_deref_deleted_handle_is_use_after_free
   held_derive_then_move_box_is_ub
+  held_collector_writing_through_the_env_is_ub
 )
 
 # How many CURRENT-design models the unfiltered run must actually execute. A
@@ -48,7 +49,7 @@ OAM_MIRI_HELD_CASES=(
 # FEWER has lost coverage (the failure this catches), and one that executes MORE
 # means models were added and the floor needs re-blessing here. Kept honest by a
 # test that counts the non-`#[ignore]`d `#[test]` functions in the crate.
-OAM_MIRI_CURRENT_MIN=6
+OAM_MIRI_CURRENT_MIN=11
 
 # miri_executed_count <output>
 # Sum of "N passed" across every libtest summary line in <output> (a cargo test

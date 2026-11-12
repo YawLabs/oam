@@ -1,7 +1,7 @@
 // A NUMBERED descriptor in an EXTRA stdio slot -- `stdio: [..., logFd]` at
 // index 3 or beyond.
 //
-// The 0/1/2 slots learned to resolve a descriptor (case 68); the extra-fd path
+// The 0/1/2 slots learned to resolve a descriptor (case 115); the extra-fd path
 // did not, and its fallback was actively wrong rather than merely absent. A
 // numeric entry collapsed to 'inherit', and the Windows backend's inherit arm
 // is `match fd { 0 => stdin, 1 => stdout, _ => stderr }` -- so EVERY slot above

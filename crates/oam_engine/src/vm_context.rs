@@ -586,10 +586,6 @@ pub(crate) fn op_vm_is_context<'s>(
     rv.set_bool(contextified);
 }
 
-/// Compiles and runs `code` in `context`, re-throwing into the caller.
-///
-/// The result and any exception cross the inner handle scope as globals: a
-/// `Local` minted inside would dangle the moment the scope closes.
 /// Everything `run` needs about the script itself, as opposed to where it runs.
 struct ScriptSpec<'a> {
     code: v8::Local<'a, v8::String>,
@@ -599,6 +595,10 @@ struct ScriptSpec<'a> {
     timeout_ms: u64,
 }
 
+/// Compiles and runs `code` in `context`, re-throwing into the caller.
+///
+/// The result and any exception cross the inner handle scope as globals: a
+/// `Local` minted inside would dangle the moment the scope closes.
 fn run(
     scope: &mut v8::PinScope<'_, '_>,
     context: v8::Local<'_, v8::Context>,
@@ -666,7 +666,8 @@ fn run(
     }
 }
 
-/// `op_vm_run_in_context(sandbox, code, filename, lineOffset, columnOffset)`
+/// `op_vm_run_in_context(sandbox, code, filename, lineOffset, columnOffset,
+/// timeoutMs)` -- a missing or zero `timeoutMs` runs unbounded.
 pub(crate) fn op_vm_run_in_context<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -721,7 +722,8 @@ pub(crate) fn op_vm_run_in_context<'s>(
     );
 }
 
-/// `op_vm_run_in_this_context(code, filename, lineOffset, columnOffset)`
+/// `op_vm_run_in_this_context(code, filename, lineOffset, columnOffset,
+/// timeoutMs)` -- a missing or zero `timeoutMs` runs unbounded.
 ///
 /// Compiles against the live global rather than wrapping the source in a
 /// function, so a top-level `var` really does create a global binding and stack

@@ -59,10 +59,12 @@ enum Command {
         #[arg(long)]
         release: bool,
     },
-    /// Bidirectional-ratchet gate for the `unsafe` surface (AI-POLICY.md gate
-    /// 5). Counts real unsafe constructs per crate (ceiling, may only drop) and
-    /// `// SAFETY:` comments (floor, may only rise) and diffs both against
-    /// conformance/unsafe-budget.json.
+    /// Ceiling-ratchet gate for the `unsafe` surface (AI-POLICY.md gate 5).
+    /// Counts real unsafe constructs per crate and diffs each count against
+    /// its ceiling in conformance/unsafe-budget.json: above the ceiling fails,
+    /// and so does below it until the baseline is regenerated, so the ceiling
+    /// only ever drops. Per-site `// SAFETY:` coverage is clippy's job, not
+    /// counted here.
     ///
     /// Pass --regen (alias --bless) to rewrite the baseline from the tree.
     UnsafeBudget {

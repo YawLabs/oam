@@ -34,7 +34,7 @@ Commit `acec008` | release | host windows-aarch64
 
 ## Results
 
-All times in milliseconds. Lower is better.
+Milliseconds, except where a row's label names another unit. Lower is better.
 
 | Case | oam | node | bun | vs node |
 |---|--:|--:|--:|--:|
@@ -46,7 +46,7 @@ All times in milliseconds. Lower is better.
 | json-parse | 74.50 | 115.99 | 91.15 | 0.64x |
 | crypto-hash | 223.89 | 292.29 | 38.99 | 0.77x |
 | mcp-cold-start | 35.00 | 250.87 | 483.19 | 0.14x |
-| mcp-idle-rss | 25.23 | 61.34 | 98.43 | 0.41x |
+| mcp-idle-rss (MB) | 25.23 | 61.34 | 98.43 | 0.41x |
 | mcp-first-call-latency | 0.34 | 2.40 | 5.04 | 0.14x |
 
 Re-measured by a filtered run (`--case`), so from a different tree than the `Commit` line above: http-keepalive-latency/oam at `031e7e8` (oam 0.17.1), http-keepalive-latency/node at `031e7e8` (v22.22.2), http-keepalive-latency/bun at `031e7e8` (1.3.14).

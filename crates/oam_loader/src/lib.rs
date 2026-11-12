@@ -20,9 +20,10 @@
 //!   (`take_warnings`) for configs oam cannot honor.
 //! - `oam install` (`install`), install-time pre-compilation (`precompile`),
 //!   and the lifecycle-script trust store (`trust`).
+//! - The content-addressed transpile cache (`transpile_cache`), keyed on
+//!   `transpile_fingerprint` plus the source bytes.
 //!
-//! Still ahead: content-addressed transform caches keyed on
-//! `transpile_fingerprint`, and bare-package tsconfig `extends`.
+//! Still ahead: bare-package tsconfig `extends`.
 
 // AI-POLICY gate 5: this crate carries no `unsafe`. `forbid` (not `deny`) so it
 // can never be silently reintroduced under an inner `#[allow(unsafe_code)]`.
@@ -69,7 +70,10 @@ pub fn is_builtin_specifier(specifier: &str) -> bool {
 /// (the CLI sets OAM_EXPOSE_INTERNALS for the loader). Node gates these the
 /// same way, and they stay out of `builtinModules` in both runtimes: they
 /// are a test/debug surface, never public API. Without the flag the
-/// specifier keeps failing exactly as before -- as a missing package.
+/// specifier keeps failing exactly as before -- as a missing package, or,
+/// spelled `node:internal/...`, as an unknown builtin (node's
+/// ERR_UNKNOWN_BUILTIN_MODULE). No internal name is exempt: none is listed
+/// among the resolver's supported builtins.
 pub fn is_exposed_internal(specifier: &str) -> bool {
     specifier.starts_with("internal/")
         && std::env::var("OAM_EXPOSE_INTERNALS").as_deref() == Ok("1")
@@ -212,7 +216,7 @@ fn apply_jsx_settings(settings: &tsconfig::JsxSettings, jsx: &mut JsxOptions) {
 /// transform cache keys on. Resolved through the thread's default
 /// `Resolver`; see `transpile_fingerprint_with`.
 pub fn transpile_fingerprint(path: &Path) -> String {
-    transpile_fingerprint_with(default_resolver(), path)
+    transpile_fingerprint_with(&default_resolver(), path)
 }
 
 /// `transpile_fingerprint` against an explicit `Resolver` (its tsconfig
@@ -270,7 +274,7 @@ pub fn transpile_fingerprint_with(resolver: &Resolver, path: &Path) -> String {
 /// (`transpile_typescript_rich`), which run the same transform.
 #[cfg(test)]
 pub fn transpile_typescript(path: &Path, source: &str) -> Result<String, TranspileError> {
-    transpile_typescript_with(default_resolver(), path, source)
+    transpile_typescript_with(&default_resolver(), path, source)
 }
 
 /// `transpile_typescript` against an explicit `Resolver`.
@@ -290,7 +294,7 @@ pub fn transpile_typescript_mapped(
     path: &Path,
     source: &str,
 ) -> Result<TranspileOutput, TranspileError> {
-    transpile_typescript_mapped_with(default_resolver(), path, source)
+    transpile_typescript_mapped_with(&default_resolver(), path, source)
 }
 
 /// `transpile_typescript_mapped` against an explicit `Resolver`.
@@ -331,7 +335,7 @@ pub fn transpile_typescript_rich(
     path: &Path,
     source: &str,
 ) -> Result<TranspileOutput, TranspileError> {
-    transpile_impl(default_resolver(), path, source, true, false)
+    transpile_impl(&default_resolver(), path, source, true, false)
 }
 
 fn transpile_impl(
@@ -657,13 +661,6 @@ pub fn module_links(source: &str) -> Option<ModuleLinks> {
     })
 }
 
-/// Check if a candidate path is a file, consulting the negative cache first.
-/// On miss from `is_file()`, insert into the negative set. On hit, remove
-/// from the negative set (in case a file was created since last check).
-fn is_file_cached(resolver: &Resolver, path: &Path) -> bool {
-    resolver.is_file_cached(path)
-}
-
 /// True for TypeScript / JS declaration files. These are types-only and
 /// must never be treated as runtime entry points -- loading one as JS is
 /// always wrong. Suffix-based so the match survives platform separators
@@ -730,10 +727,29 @@ pub(crate) fn probe_candidates(resolver: &Resolver, raw: &Path) -> (Option<PathB
     // engine would try to load the .d.ts as a JS module.
     candidates.retain(|p| !is_declaration_file(p));
 
-    let found = candidates
-        .iter()
-        .find(|c| is_file_cached(resolver, c))
-        .map(|c| std::path::absolute(c).unwrap_or_else(|_| c.clone()));
+    // First pass through the resolver's negative cache: a candidate recorded
+    // as missing is skipped without a stat. That record can be stale (the
+    // file may have been written since -- a module generated after a failed
+    // `import()`), so before answering "not found" every candidate skipped
+    // that way is stat'd for real.
+    let mut found: Option<&PathBuf> = None;
+    let mut cached_misses: Vec<&PathBuf> = Vec::new();
+    for candidate in &candidates {
+        match resolver.probe_file(candidate) {
+            crate::resolver::FileProbe::File => {
+                found = Some(candidate);
+                break;
+            }
+            crate::resolver::FileProbe::Missing => {}
+            crate::resolver::FileProbe::CachedMissing => cached_misses.push(candidate),
+        }
+    }
+    if found.is_none() {
+        found = cached_misses
+            .into_iter()
+            .find(|candidate| resolver.restat_file(candidate));
+    }
+    let found = found.map(|c| std::path::absolute(c).unwrap_or_else(|_| c.clone()));
     (found, candidates)
 }
 
@@ -1176,6 +1192,9 @@ mod tests {
         // project layout changes. Simulate `oam install` adding a file in
         // the same process as a subsequent `oam run` resolve.
         let dir = std::env::temp_dir().join(format!("oam-cache-clear-{}", std::process::id()));
+        // A failed earlier run leaves `missing.ts` behind; a recycled pid
+        // must not start with it already present.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("entry.ts"), "export {};\n").unwrap();
         let entry_ts = dir.join("entry.ts");
@@ -1190,17 +1209,30 @@ mod tests {
 
         // 2) The file appears (think: `oam install` wrote node_modules/foo).
         //    The negative cache still says "not found" -- this is the stale
-        //    state the cache can serve.
-        std::fs::write(dir.join("missing.ts"), "export const x = 1;\n").unwrap();
-        let stale = resolver.resolve_import("./missing", &entry_ts);
-        assert!(
-            stale.is_err(),
-            "without clear_caches the negative entry still wins: {stale:?}"
+        //    state `clear_caches` exists to drop. (A full resolve no longer
+        //    FAILS on that stale entry: `probe_candidates` re-stats every
+        //    cached miss before reporting "not found", as node stats every
+        //    time -- pinned by
+        //    `a_file_created_after_a_failed_resolve_is_found_by_the_next_one`
+        //    in resolver.rs. So the staleness is observed at the cache
+        //    itself, not through `resolve_import`.)
+        let added = dir.join("missing.ts");
+        std::fs::write(&added, "export const x = 1;\n").unwrap();
+        assert_eq!(
+            resolver.probe_file(&added),
+            crate::resolver::FileProbe::CachedMissing,
+            "without clear_caches the negative entry is still served"
         );
 
-        // 3) Drop the stale entries. The next resolve re-stats the
-        //    filesystem and finds the newly-written file.
+        // 3) Drop the stale entries. The next probe re-stats the
+        //    filesystem and finds the newly-written file, and so does a
+        //    full resolve.
         resolver.clear_caches();
+        assert_eq!(
+            resolver.probe_file(&added),
+            crate::resolver::FileProbe::File,
+            "after clear_caches the probe must hit the filesystem again"
+        );
         let fresh = resolver
             .resolve_import("./missing", &entry_ts)
             .expect("after clear_caches the file must resolve");

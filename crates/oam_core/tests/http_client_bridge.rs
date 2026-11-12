@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,7 +31,7 @@ impl Reg {
             bodies: Arc::new(Mutex::new(HashMap::new())),
             ids: Arc::new(AtomicU64::new(1)),
             outbound: Arc::new(Mutex::new(HashMap::new())),
-            cancelled: Arc::new(Mutex::new(HashSet::new())),
+            cancelled: CancelledBodies::default(),
             signal: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -664,6 +664,32 @@ async fn closing_ends_everything_parked() {
             bridge::out(reg.bridges.clone(), id).await,
             OpOutcome::Done
         ));
+    })
+    .await;
+}
+
+/// Bytes for a bridge closed while their write was parked are dropped, as
+/// they are for one closed before the write: the same event in either order.
+#[tokio::test(flavor = "multi_thread")]
+async fn input_parked_at_the_close_is_dropped() {
+    within(async {
+        let reg = Reg::new();
+        let id = reg.start(json!({ "method": "GET", "target": "/", "headers": [["host", "h"]] }));
+        // Nothing reads the pipe before the exchange starts, so a write of
+        // more than it buffers parks.
+        let parked = tokio::spawn(bridge::input(
+            reg.bridges.clone(),
+            id,
+            vec![b'x'; 256 * 1024],
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!parked.is_finished());
+        assert!(bridge::close(&reg.bridges, id));
+        let ended = parked.await.unwrap();
+        assert!(
+            matches!(ended, OpOutcome::Done),
+            "parked input ended {ended:?}"
+        );
     })
     .await;
 }

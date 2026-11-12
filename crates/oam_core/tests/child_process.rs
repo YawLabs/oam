@@ -4,9 +4,11 @@
 //! liveness guards that keep a kill-after-exit from masking the real exit
 //! code (or signaling a recycled pid).
 //!
-//! T3/T4/T5 are cfg(unix): they compile there and are skipped on Windows.
-//! Every spawn goes through the functions under test with a portable shell
-//! builtin (`cmd /c` / `sh -c`), never an external dependency like `node`.
+//! Most tests are per-platform: the cfg(unix) ones drive `child_unix`'s raw
+//! registry (and `child_kill`), the cfg(windows) ones the Windows raw
+//! backend. Every spawn goes through the functions under test, with what the
+//! platform itself ships -- `sh -c` on unix, `cmd /c` or `ping` on Windows --
+//! never an external dependency like `node`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -199,50 +201,71 @@ async fn concurrent_stdout_reads_serialize() {
         .expect("child must be reapable after EOF");
 }
 
-/// T3 (unix): a kill that lands after the child already exited must not
-/// overwrite the real exit report. Covers the try_wait guard in
-/// `deliver_kill` (child.rs): an already-exited child is not signaled, and
-/// `child_wait` reports `{code:0, signal:null}`.
+/// T3 (unix): a kill recorded for a child that has already exited must not
+/// overwrite the real exit report: `child_wait` reports
+/// `{code:0, signal:null}` whether its select resolves on the exit or on the
+/// kill.
+///
+/// The kill is recorded BEFORE `child_wait` is first polled, so its permit is
+/// waiting when the wait starts and the kill arm -- `deliver_kill` and its
+/// try_wait guard (child.rs) -- is reachable; a kill issued after a parked
+/// `child_wait` has resolved on the exit finds no registry entry and reaches
+/// nothing. Both arms are ready at that first poll and `select!` picks
+/// between them at random, so the scenario runs several times: every run must
+/// give the same report whichever arm it took. What the guard itself prevents
+/// (a signal sent to a pid that is no longer the child's) is not observable
+/// from here: an exited child nobody has waited for is a zombie, and the
+/// kernel discards a signal sent to one.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deliver_kill_does_not_signal_exited_child() {
-    // Exits immediately with code 0.
-    let (child, pid) = spawn_child(
-        "sh".to_string(),
-        vec!["-c".to_string(), "exit 0".to_string()],
-        None,
-        None,
-        false,
-        stdio_pipe_all(),
-        false,
-        false,
-        None,
-    )
-    .expect("spawn immediate-exit child");
-    let (reg, handle) = register(child, pid);
+async fn a_kill_recorded_after_the_exit_reports_the_real_exit() {
+    for round in 0..16 {
+        // Exits immediately with code 0.
+        let (child, pid) = spawn_child(
+            "sh".to_string(),
+            vec!["-c".to_string(), "exit 0".to_string()],
+            None,
+            None,
+            false,
+            stdio_pipe_all(),
+            false,
+            false,
+            None,
+        )
+        .expect("spawn immediate-exit child");
+        let (reg, handle) = register(child, pid);
 
-    // Park child_wait first: it takes the Child out of the registry entry and
-    // selects on wait vs the kill notifier. Give the child time to really
-    // exit and tokio's reaper a chance to observe it.
-    let reg_wait = reg.clone();
-    let waiter = tokio::spawn(async move { child_wait(reg_wait, handle).await });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // The child is the only holder of its stdout's write end, so EOF
+        // there is the observable that it is exiting: no sleep stands in for
+        // it. It writes nothing, so every outcome before Done is a failure.
+        let eof = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            child_read_stdout(reg.clone(), handle),
+        )
+        .await
+        .expect("an exiting child closes its stdout");
+        assert!(
+            matches!(eof, OpOutcome::Done),
+            "round {round}: expected EOF from a child that writes nothing, got {eof:?}"
+        );
 
-    // Kill after the exit: this wakes the parked waiter, whose deliver_kill
-    // must see try_wait == already-exited and NOT signal the (possibly
-    // recycled) pid.
-    child_kill(&reg, handle, Some("SIGTERM".to_string()));
-
-    let outcome = waiter.await.expect("child_wait task panicked");
-    let OpOutcome::Json(json) = outcome else {
-        panic!("expected Json exit report, got {outcome:?}");
-    };
-    let report: serde_json::Value = serde_json::from_str(&json).expect("exit report is json");
-    assert_eq!(
-        report,
-        serde_json::json!({ "code": 0, "signal": null }),
-        "kill-after-exit must still report the real exit code, not a signal"
-    );
+        // Record the kill first, then start the wait: the permit is there at
+        // the wait's first poll.
+        child_kill(&reg, handle, Some("SIGTERM".to_string()));
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(10), child_wait(reg, handle))
+                .await
+                .expect("an exited child is reaped at once");
+        let OpOutcome::Json(json) = outcome else {
+            panic!("round {round}: expected Json exit report, got {outcome:?}");
+        };
+        let report: serde_json::Value = serde_json::from_str(&json).expect("exit report is json");
+        assert_eq!(
+            report,
+            serde_json::json!({ "code": 0, "signal": null }),
+            "round {round}: a kill after the exit must still report the real exit, not a signal"
+        );
+    }
 }
 
 /// T4 (unix): a kill that lands after the child already exited must not
@@ -253,12 +276,14 @@ async fn deliver_kill_does_not_signal_exited_child() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_kill_after_exit_reports_real_exit() {
+    // stdout is a pipe only so the test can see the exit: the child is the
+    // one holder of its write end and writes nothing.
     let raw = spawn_extra(
         "sh",
         &["-c".to_string(), "exit 0".to_string()],
         None,
         None,
-        &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
+        &[StdioFd::Ignore, StdioFd::ChildWrite, StdioFd::Ignore],
         false,
         false,
         None::<&str>,
@@ -271,10 +296,14 @@ async fn raw_kill_after_exit_reports_real_exit() {
         .insert(id, raw);
 
     // Nobody has waited yet, so the child is unreaped and raw_kill WILL issue
-    // the kill(2). Give it time to exit first: the pid is then a zombie, the
-    // kernel discards the signal, and the report below must still be the real
-    // exit -- not a phantom signal death.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // the kill(2). Wait for the exit first -- EOF on its stdout, not a sleep
+    // that a loaded host outlasts: the kernel then discards the signal, and
+    // the report below must still be the real exit, not a phantom signal
+    // death.
+    assert!(
+        read_to_eof(&reg, id, 1).await.is_empty(),
+        "the child writes nothing before it exits"
+    );
     raw_kill(&reg, id, Some("SIGTERM".to_string()));
 
     let outcome = raw_wait(reg, id).await;
@@ -538,16 +567,18 @@ async fn raw_kill_before_wait_delivers_signal() {
 async fn raw_kill_trapped_signal_reports_clean_exit() {
     // `sleep 30 & wait` (not a foreground sleep): sh runs traps only between
     // foreground commands, while the `wait` builtin is interrupted by the
-    // signal immediately.
+    // signal immediately. The `printf` after the trap is the test's cue that
+    // the trap is installed; the sleeper's stdout goes to /dev/null so only
+    // sh holds the pipe.
     let raw = spawn_extra(
         "sh",
         &[
             "-c".to_string(),
-            "trap 'exit 0' USR1; sleep 30 & wait $!".to_string(),
+            "trap 'exit 0' USR1; printf ready; sleep 30 >/dev/null & wait $!".to_string(),
         ],
         None,
         None,
-        &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
+        &[StdioFd::Ignore, StdioFd::ChildWrite, StdioFd::Ignore],
         false,
         false,
         None::<&str>,
@@ -560,10 +591,19 @@ async fn raw_kill_trapped_signal_reports_clean_exit() {
         .insert(id, raw);
 
     let wait = tokio::spawn(raw_wait(reg.clone(), id));
-    // Give sh time to install the trap; a signal landing before that would
-    // kill it (USR1 default-terminates) and turn the assertion into a real
-    // failure rather than a flake -- 300ms is the margin T3 already uses.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // A signal landing before sh installed the trap would kill it (USR1
+    // default-terminates), so wait for the child's own word that it has: the
+    // first bytes of `ready`, written after the `trap` builtin ran.
+    let cue = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        raw_read(reg.clone(), id, 1),
+    )
+    .await
+    .expect("the child reports that its trap is installed");
+    assert!(
+        matches!(&cue, OpOutcome::Bytes(b) if b.as_slice().starts_with(b"r")),
+        "expected the child's ready cue, got {cue:?}"
+    );
     raw_kill(&reg, id, Some("SIGUSR1".to_string()));
 
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), wait)
@@ -746,4 +786,389 @@ async fn closing_the_last_read_end_after_the_reap_drops_the_entry() {
         reg.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "the entry goes with its last end"
     );
+}
+
+/// `spawn_sync` with every slot piped and nothing else set.
+fn run_sync(
+    command: &str,
+    args: &[&str],
+    input: Option<&[u8]>,
+    timeout_ms: u64,
+    max_buffer: usize,
+) -> oam_core::child::SpawnSyncResult {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    oam_core::child::spawn_sync(
+        command,
+        &args,
+        None,
+        None,
+        input,
+        false,
+        timeout_ms,
+        max_buffer,
+        stdio_pipe_all(),
+        false,
+        false,
+        None,
+    )
+}
+
+/// The error code on a sync result, if any.
+fn sync_error(result: &oam_core::child::SpawnSyncResult) -> Option<&str> {
+    result.error.as_ref().map(|e| e.code.as_str())
+}
+
+/// A sync child a signal ended reports the signal by name and a null status,
+/// as node does -- not `{status: null, signal: null}`.
+#[cfg(unix)]
+#[test]
+fn spawn_sync_reports_the_signal_that_ended_the_child() {
+    let result = run_sync("sh", &["-c", "kill -KILL $$"], None, 0, 1 << 20);
+    assert_eq!(sync_error(&result), None);
+    assert_eq!(result.status, None);
+    assert_eq!(result.signal.as_deref(), Some("SIGKILL"));
+}
+
+/// `input` larger than the pipe buffers reaches a child that writes while it
+/// reads. The input used to be written in full before anything drained the
+/// child's output, so both sides blocked for good.
+#[test]
+fn spawn_sync_feeds_input_to_a_child_that_answers_while_it_reads() {
+    let line = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd\r\n";
+    let input: Vec<u8> = line.iter().copied().cycle().take(1 << 20).collect();
+    #[cfg(unix)]
+    let (command, args): (&str, Vec<&str>) = ("cat", vec![]);
+    // findstr with a pattern every line matches is Windows' line echo.
+    #[cfg(windows)]
+    let (command, args): (&str, Vec<&str>) = ("findstr", vec!["^"]);
+    let result = run_sync(command, &args, Some(&input), 0, 16 << 20);
+    assert_eq!(sync_error(&result), None);
+    assert_eq!(result.status, Some(0));
+    #[cfg(unix)]
+    assert!(result.stdout == input, "cat returns its input unchanged");
+    #[cfg(windows)]
+    assert!(!result.stdout.is_empty(), "the echo came back");
+}
+
+/// A timeout ends the wait even when another process still holds the child's
+/// output pipe. The drains used to be joined after the kill, so the call
+/// returned only when that process exited too.
+#[test]
+fn spawn_sync_timeout_does_not_wait_for_a_grandchild_holding_the_pipe() {
+    #[cfg(unix)]
+    let (command, args) = ("sh", ["-c", "sleep 8; echo late"]);
+    // ping's stdout goes to NUL, but it inherits cmd's stderr pipe.
+    #[cfg(windows)]
+    let (command, args) = ("cmd", ["/c", "ping -n 8 127.0.0.1 >nul"]);
+    let started = std::time::Instant::now();
+    let result = run_sync(command, &args, None, 300, 1 << 20);
+    let took = started.elapsed();
+    assert_eq!(sync_error(&result), Some("ETIMEDOUT"));
+    assert_eq!(result.status, None);
+    assert_eq!(result.signal.as_deref(), Some("SIGTERM"));
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "the timeout must not wait out the grandchild (took {took:?})"
+    );
+}
+
+/// Output past `max_buffer` ends the child and reports ENOBUFS while it is
+/// still running. The limit used to be compared only after the child exited,
+/// so a child that never stops writing was never stopped. The timeout only
+/// bounds a regression; the limit is crossed at once.
+#[test]
+fn spawn_sync_ends_a_child_that_overflows_max_buffer() {
+    #[cfg(unix)]
+    let (command, args) = ("sh", ["-c", "while :; do echo yyyyyyyyyyyyyyyy; done"]);
+    #[cfg(windows)]
+    let (command, args) = ("ping", ["-t", "127.0.0.1"]);
+    let result = run_sync(command, &args, None, 60_000, 16);
+    assert_eq!(sync_error(&result), Some("ENOBUFS"));
+    assert_eq!(result.status, None);
+    assert_eq!(result.signal.as_deref(), Some("SIGTERM"));
+    assert!(result.stdout.len() <= 16, "the kept output is capped");
+}
+
+/// The Windows argv0 path of spawnSync closes the child's stdin: after the
+/// input when there is one, at once when there is none. It used to keep the
+/// write end open for the whole wait, so a child reading stdin to EOF never
+/// finished. The timeout only bounds a regression.
+#[cfg(windows)]
+#[test]
+fn spawn_sync_argv0_closes_stdin_after_the_input() {
+    let comspec =
+        std::env::var("ComSpec").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string());
+    let stdio = [StdioFd::ChildRead, StdioFd::ChildWrite, StdioFd::ChildWrite];
+    for input in [Some(&b"fed\r\n"[..]), None] {
+        let result = oam_core::child_extra::spawn_sync_argv0(
+            &comspec,
+            &["/c".to_string(), "more".to_string()],
+            None,
+            None,
+            input,
+            &stdio,
+            false,
+            false,
+            Some("renamed"),
+            20_000,
+            1 << 20,
+        );
+        assert_eq!(
+            sync_error(&result),
+            None,
+            "`more` reads stdin to EOF and exits (input: {})",
+            input.is_some()
+        );
+        if input.is_some() {
+            assert!(
+                String::from_utf8_lossy(&result.stdout).contains("fed"),
+                "the input reached the child"
+            );
+        }
+    }
+}
+
+/// `shell: true` together with an argv0 on Windows: the shell rewrite
+/// (`shell_command`) goes through the raw-create path with its command line
+/// taken verbatim, so cmd.exe reads the `"<command>"` token as written and
+/// runs a builtin. The argv0 path used to ignore `shell` and tried to create
+/// a process named after the command string.
+#[cfg(windows)]
+#[test]
+fn spawn_sync_argv0_runs_a_shell_command_verbatim() {
+    let (program, args) = oam_core::child::shell_command("echo", &["via shell".to_string()]);
+    let stdio = [StdioFd::Ignore, StdioFd::ChildWrite, StdioFd::ChildWrite];
+    let result = oam_core::child_extra::spawn_sync_argv0_with(
+        &program,
+        &args,
+        None,
+        None,
+        None,
+        &stdio,
+        false,
+        false,
+        Some("renamed"),
+        20_000,
+        1 << 20,
+        true,
+    );
+    assert_eq!(sync_error(&result), None);
+    assert_eq!(result.status, Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout).trim(),
+        "via shell",
+        "cmd.exe ran the builtin with the argument as written"
+    );
+}
+
+/// What a child wrote before it exited is still read after `child_wait` has
+/// collected the exit: the registry entry stays until both read streams have
+/// reached their end. `child_wait` used to drop it, so a read issued after
+/// the exit reported EOF with the output still in the pipe. This order (wait,
+/// then read) is the losing one every time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn output_written_before_the_exit_is_read_after_the_wait() {
+    #[cfg(unix)]
+    let (command, args) = ("sh", ["-c", "printf drained"]);
+    #[cfg(windows)]
+    let (command, args) = ("cmd", ["/c", "echo drained"]);
+    let (child, pid) = spawn_child(
+        command.to_string(),
+        args.iter().map(|a| a.to_string()).collect(),
+        None,
+        None,
+        false,
+        stdio_pipe_all(),
+        false,
+        false,
+        None,
+    )
+    .expect("spawn one-line writer");
+    let (reg, handle) = register(child, pid);
+
+    let exit = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        child_wait(reg.clone(), handle),
+    )
+    .await
+    .expect("the writer exits");
+    assert!(
+        matches!(exit, OpOutcome::Json(_)),
+        "exit report, got {exit:?}"
+    );
+    assert!(
+        !reg.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "the entry stays for its unread streams"
+    );
+
+    let mut got = Vec::new();
+    loop {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            child_read_stdout(reg.clone(), handle),
+        )
+        .await
+        .expect("the read reaches EOF: the child is gone")
+        {
+            OpOutcome::Bytes(b) => got.extend_from_slice(&b),
+            OpOutcome::Done => break,
+            other => panic!("unexpected read outcome {other:?}"),
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&got).contains("drained"),
+        "the output survives the exit, got {got:?}"
+    );
+    let stderr_end = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        oam_core::child::child_read_stderr(reg.clone(), handle),
+    )
+    .await
+    .expect("stderr reaches EOF: the child is gone");
+    assert!(
+        matches!(stderr_end, OpOutcome::Done),
+        "nothing was written to stderr, got {stderr_end:?}"
+    );
+    assert!(
+        reg.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "the entry goes with its last stream"
+    );
+}
+
+/// Spawn `sh -c <script>` through `spawn_child`, start its wait, and return
+/// once the child has printed its `ready` cue.
+#[cfg(unix)]
+async fn spawn_ready_sh(script: &str) -> (ChildRegistry, u64, tokio::task::JoinHandle<OpOutcome>) {
+    let (child, pid) = spawn_child(
+        "sh".to_string(),
+        vec!["-c".to_string(), script.to_string()],
+        None,
+        None,
+        false,
+        stdio_pipe_all(),
+        false,
+        false,
+        None,
+    )
+    .expect("spawn sh");
+    let (reg, handle) = register(child, pid);
+    // The wait first, as the JS side starts it: every kill below reaches a
+    // wait that is already parked.
+    let wait = tokio::spawn(child_wait(reg.clone(), handle));
+    let cue = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        child_read_stdout(reg.clone(), handle),
+    )
+    .await
+    .expect("the child prints its cue");
+    assert!(
+        matches!(&cue, OpOutcome::Bytes(b) if b.as_slice().starts_with(b"r")),
+        "expected the child's ready cue, got {cue:?}"
+    );
+    (reg, handle, wait)
+}
+
+/// The exit report a finished `child_wait` task carries.
+#[cfg(unix)]
+async fn exit_report_of(wait: tokio::task::JoinHandle<OpOutcome>) -> serde_json::Value {
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+        .await
+        .expect("the child exits")
+        .expect("wait task join");
+    let OpOutcome::Json(json) = outcome else {
+        panic!("expected Json exit report, got {outcome:?}");
+    };
+    serde_json::from_str(&json).expect("exit report is json")
+}
+
+/// Every kill is delivered, not only the first: a child that ignores SIGTERM
+/// is still ended by the SIGKILL that follows. `child_wait` used to listen for
+/// one kill and then only for the exit, so the second was never sent.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_kill_is_delivered_after_the_first_was_survived() {
+    // `read` blocks on the stdin pipe the registry holds open; no grandchild.
+    let (reg, handle, wait) = spawn_ready_sh("trap '' TERM; printf ready; read x").await;
+    child_kill(&reg, handle, Some("SIGTERM".to_string()));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!wait.is_finished(), "the child ignores SIGTERM");
+    child_kill(&reg, handle, Some("SIGKILL".to_string()));
+    assert_eq!(
+        exit_report_of(wait).await,
+        serde_json::json!({ "code": null, "signal": "SIGKILL" }),
+        "the second kill must reach the child"
+    );
+}
+
+/// A signal is delivered as itself: SIGWINCH, which a process ignores by
+/// default, leaves the child running. A name outside a ten-entry table used
+/// to be sent as SIGTERM, which ended it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_signal_ignored_by_default_does_not_end_the_child() {
+    let (reg, handle, wait) = spawn_ready_sh("printf ready; read x; exit 0").await;
+    child_kill(&reg, handle, Some("SIGWINCH".to_string()));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!wait.is_finished(), "SIGWINCH does not end a process");
+    // EOF on stdin lets the child finish by itself.
+    oam_core::child::child_close_stdin(&reg, handle);
+    assert_eq!(
+        exit_report_of(wait).await,
+        serde_json::json!({ "code": 0, "signal": null }),
+        "the child exits by itself, not by a signal"
+    );
+}
+
+/// Windows twin of the kill-after-exit test above: a kill recorded for a
+/// child that has already exited terminates nothing, so the report is the
+/// real exit code, not `{code: null, signal}`.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_recorded_after_the_exit_reports_the_real_exit_win() {
+    for round in 0..8 {
+        let (child, pid) = spawn_child(
+            "cmd".to_string(),
+            vec!["/c".to_string(), "exit 3".to_string()],
+            None,
+            None,
+            false,
+            stdio_pipe_all(),
+            false,
+            false,
+            None,
+        )
+        .expect("spawn immediate-exit child");
+        let (reg, handle) = register(child, pid);
+
+        // EOF on stdout says the child is exiting; its handles close a
+        // moment before the process object is signalled, hence the pause.
+        let eof = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            child_read_stdout(reg.clone(), handle),
+        )
+        .await
+        .expect("an exiting child closes its stdout");
+        assert!(
+            matches!(eof, OpOutcome::Done),
+            "round {round}: expected EOF from a child that writes nothing, got {eof:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // The kill first, then the wait: the permit is there at its first
+        // poll, so the kill arm is reachable.
+        oam_core::child::child_kill(&reg, handle, Some("SIGTERM".to_string()));
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(10), child_wait(reg, handle))
+                .await
+                .expect("an exited child is collected at once");
+        let OpOutcome::Json(json) = outcome else {
+            panic!("round {round}: expected Json exit report, got {outcome:?}");
+        };
+        let report: serde_json::Value = serde_json::from_str(&json).expect("exit report is json");
+        assert_eq!(
+            report,
+            serde_json::json!({ "code": 3, "signal": null }),
+            "round {round}: a kill after the exit must still report the real exit"
+        );
+    }
 }

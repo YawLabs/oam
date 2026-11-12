@@ -34,10 +34,13 @@ switch (mode) {
 
   case 'signal':
     // Report the signal that killed us by dying from it, after telling the test
-    // we are ready to be killed. Never exits on its own: the timer is what
-    // keeps the loop alive if the signal never arrives, so a broken forward
-    // shows up as a test timeout rather than a pass.
-    process.stdout.write('ready\n');
+    // we are ready to be killed -- and which pid to look for afterwards. The
+    // pid is the evidence: if the forward never lands, the launcher still dies
+    // of the signal by default disposition, so the launcher's own status proves
+    // nothing, and only "is this process gone?" tells the two apart. The timer
+    // keeps the loop alive meanwhile and bounds a stray fixture's lifetime; it
+    // is not what fails the test.
+    process.stdout.write(`ready ${process.pid}\n`);
     setTimeout(() => process.exit(0), 30_000);
     break;
 

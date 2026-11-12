@@ -10,9 +10,13 @@ oam is a JavaScript/TypeScript runtime built in Rust on V8, designed around thre
    TypeScript 7 (`tsgo`) daemon checks it on demand: `oam check`, `oam run --check=warn` to
    report type errors after the run, or `--check=block` to gate on them. Node strips without
    checking; Bun executes types-blind. oam closes the loop.
-2. **Reliability with receipts.** Public conformance dashboards (Node's own test suite,
-   WinterTC ECMA-429, WPT), soak farms, crash-rate telemetry, a behavior-change log on every
-   release, and an LTS commitment. Claims come with reproducible numbers or they don't ship.
+2. **Reliability with receipts.** In place today: committed conformance scorecards (a
+   subset of Node's own test suite, a Node differential suite, the WPT URL suites) that the
+   gate regenerates and ratchets, a behavior-change log in every release's changelog, and an
+   LTS commitment that takes effect at 1.0. Planned, not built: a hosted dashboard, a WinterTC
+   ECMA-429 harness, soak runs, fuzzing and opt-in crash-rate telemetry —
+   [RELIABILITY.md](RELIABILITY.md) marks each one. Claims come with reproducible numbers or
+   they don't ship.
 3. **Built for the AI era, owned by no model vendor.** Every diagnostic oam emits — parse,
    type, resolve, runtime, test, install — is ODIF: structured JSON with stable codes and
    source spans that agents consume directly (and humans see pretty-printed from the same
@@ -101,13 +105,23 @@ cargo test --workspace
 ## Architecture (short version)
 
 - `crates/oam_engine` — the only crate that touches V8 (rusty_v8). Isolates, snapshots, code cache.
-- `crates/oam_core` — event loop, op system, Promise<->Future bridge.
+- `crates/oam_core` — the engine-agnostic async substrate: tokio runtime, op system,
+  Promise<->Future bridge, and the native side of the node: APIs (net, http, tls, child
+  processes, the inspector transport). No V8 types.
+- `crates/oam_loader` — the module pipeline: TypeScript strip/transform (oxc), resolution.
+- `crates/oam_ts` — type checking through the tsgo sidecar, its output turned into ODIF.
+- `crates/oam_mcp` — the MCP server behind `oam mcp`.
 - `crates/oam_diagnostics` — ODIF, the diagnostic envelope everything else speaks.
 - `crates/oam_cli` — the `oam` binary.
+- `crates/oam_napi_test_addon`, `crates/oam_aliasing_model` — test-only: a real compiled
+  N-API addon for the e2e suite, and Miri-checkable models of the N-API pointer disciplines.
+  Neither ships.
+- `js/` — the runtime's own JavaScript (the node: and web API surface), compiled into the V8
+  startup snapshot.
 - `xtask` — repo automation (`conformance`, `node-suite`, `bench`, `unsafe-budget`).
 
-Wider layout (loader, web/node compat, http, test runner, package manager, sandbox, tsgo
-sidecar, inspector) lands per the roadmap; crates are created when their workstream starts.
+Further crates are split out when a workstream needs one; the test runner, package manager
+and permission model currently live in the crates above rather than in crates of their own.
 
 ## Governance
 
@@ -122,13 +136,13 @@ sidecar, inspector) lands per the roadmap; crates are created when their workstr
   `cargo about generate about.hbs -o THIRD_PARTY_LICENSES.md` and drift-gated by CI.
   [NOTICE](NOTICE) carries everything that tool cannot see: V8 itself, the 16 third-party
   trees bundled *inside* the prebuilt V8 static library (ICU, abseil, highway, libc++ and the
-  rest), the vendored Node.js sources, and the vendored web-platform-tests data. None of those
-  appear in the cargo graph — the `v8` crate declares itself MIT, which covers only its Rust
+  rest), the vendored Node.js sources, the code ported from libuv, and the vendored
+  web-platform-tests data. None of those appear in the cargo graph — the `v8` crate declares itself MIT, which covers only its Rust
   bindings — so that section is hand-maintained and must be revisited on a V8 bump.
 - [GOVERNANCE.md](GOVERNANCE.md) — the oam Covenant, foundation triggers, succession.
 - [AI-POLICY.md](AI-POLICY.md) — oam is heavily AI-developed, with identical review gates for
-  human and AI changes, enforced changeset limits, and published provenance. The mega-merge
-  failure mode is structurally impossible here, by policy and by CI.
+  human and AI changes, changeset limits held at review, and published provenance. The
+  mega-merge failure mode is ruled out here by policy and review.
 - [RELIABILITY.md](RELIABILITY.md) — the scorecard: what we measure, publish, and gate on.
 
 Domain: https://oamjs.org — the installer and update channel serve from there exclusively.
@@ -138,6 +152,7 @@ reference](https://oamjs.org/docs/errors) that every `--json` diagnostic points
 at, and the [ODIF envelope](https://oamjs.org/docs/odif). Everything else lives
 here, beside the code it describes.
 
-Distribution: the install script is canonical. An npm package is planned under
-**@yawlabs/oam** — that name is not published yet, so install via the script above (bare
-`oam` on npm belongs to an unrelated project).
+Distribution: the install script is canonical. An npm channel is prepared in
+[npm/](npm/README.md) under the name **oamjs** — a launcher package plus one binary package
+per shipped target, with no postinstall script — but nothing is published to npm yet, so
+install via the script above (bare `oam` on npm belongs to an unrelated project).

@@ -21,7 +21,15 @@ const CONCURRENCIES = [1, 8, 64];
 const TARGET_BYTES = 32 * 1024 * 1024; // ~work budget per cell -> adaptive iters
 const WARMUP = 3;
 
-const mode = process.env.OAM_IO_URING ? 'io_uring' : 'baseline';
+// The label mirrors the runtime's own switch (enabled() in
+// crates/oam_core/src/io_uring_fs.rs): the fast path is compiled on Linux only
+// and engages for exactly these four values, so OAM_IO_URING=0 or =false is a
+// baseline run and is labelled as one. What the label cannot see is the
+// runtime's start-up probe: when that fails oam falls back to the baseline
+// path silently, so `io_uring` here means "requested", and two modes with
+// matching numbers may be that fallback.
+const requested = ['1', 'true', 'on', 'yes'].includes(process.env.OAM_IO_URING ?? '');
+const mode = requested && process.platform === 'linux' ? 'io_uring' : 'baseline';
 
 function median(xs) {
   xs.sort((a, b) => a - b);

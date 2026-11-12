@@ -17,7 +17,7 @@
 // --root exists for the tests: drift has to be provable, and the only honest
 // way to prove it is to perturb a real tree and watch --check fail.
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -149,10 +149,35 @@ export async function sync(root, { check }) {
   return { version, drift };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Is this file the program, rather than an import of it (the tests import it)?
+//
+// Node realpath's the main entry before it becomes import.meta.url, while
+// process.argv[1] is only made absolute. Comparing the two directly is false
+// whenever the script is reached through a junction or a symlink -- and a false
+// here skipped the whole body: `--check` printed nothing and exited 0, which
+// both callers (ci-local.sh, release-local.sh) read as "manifests match". So
+// argv[1] is resolved the same way before the comparison. `realpathSync`, not
+// `.native`: it is the resolution node itself applies to the entry, so the two
+// spellings agree on drive-letter and component case.
+export function isMainModule(moduleUrl, argv1) {
+  if (!argv1) return false;
+  let entry = argv1;
+  try {
+    entry = realpathSync(argv1);
+  } catch {
+    // Unresolvable: compare the path as given rather than guess.
+  }
+  return moduleUrl === pathToFileURL(entry).href;
+}
+
+if (isMainModule(import.meta.url, process.argv[1])) {
   const check = process.argv.includes('--check');
   const rootFlag = process.argv.indexOf('--root');
   const root = rootFlag === -1 ? REPO_ROOT : process.argv[rootFlag + 1];
+  if (root === undefined || root.startsWith('--')) {
+    process.stderr.write('oam-npm-sync: error: --root needs a directory\n');
+    process.exit(1);
+  }
   const { version, drift } = await sync(root, { check });
   if (drift.length > 0) {
     for (const d of drift) process.stderr.write(`  ${d}\n`);

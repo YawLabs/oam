@@ -57,14 +57,18 @@ its own module ecosystem. Those are not goals here.
 
 ## vs Bun
 
-Every figure in this section comes from the committed run at commit `acec008`,
-release profile, host windows-aarch64. The full table is in
+Every figure in this section comes from the committed run at commit `acec008`
+(oam 0.9.0), release profile, host windows-aarch64. The benchmarks are a manual
+run that no gate or release script repeats, so these figures describe that
+version and not necessarily the current release. The full table is in
 [`BENCHMARKS.md`](../BENCHMARKS.md) and the raw samples are in
 [`bench/results.json`](../bench/results.json).
 
 Bun is faster than oam at several things and the benchmark table says so
-plainly — it wins `url-parse`, `http-throughput` and `crypto-hash` on the same
-hardware, the last of them by nearly 6x. If raw single-process throughput is
+plainly — it wins four of the ten rows on the same hardware: `url-parse`,
+`http-throughput`, `http-keepalive-latency` (0.07ms against oam's 0.25ms, where
+oam only ties Node; that row was re-measured at `031e7e8`, as the table notes)
+and `crypto-hash`, the last of them by nearly 6x. If raw single-process throughput is
 what you are optimising, benchmark Bun. (Node, not Bun, is the one to beat on
 `fs-read`, and it does — narrowly.)
 
@@ -81,8 +85,10 @@ once before timing, so oam absorbs that cost up front where node and bun pay it
 on every iteration. On a machine with such a scanner active, those three rows
 flatter oam. Measure on your own hardware before you rely on the margin.
 
-Bun is also a bundler, test runner, and package manager. oam is not trying to be
-those.
+Bun is also a bundler. oam is not trying to be one: `oam compile` embeds a file
+you bundled yourself. oam does ship a test runner (`oam test`) and a
+lockfile installer (`oam install`, the `npm ci` equivalent), but not a full
+package manager -- adding or upgrading a dependency is still npm's job.
 
 ## The MCP case specifically
 

@@ -16,68 +16,113 @@
       let data = "";
       let id = "";
 
+      // Feeds one complete line (terminator already removed). Returns the
+      // event a blank line dispatches, or null.
+      function feedLine(line) {
+        if (line === "") {
+          // Empty line = event boundary.
+          const out = data
+            ? {
+                event: event || "message",
+                data: data.endsWith("\n") ? data.slice(0, -1) : data,
+                id,
+              }
+            : null;
+          event = "";
+          data = "";
+          id = "";
+          return out;
+        }
+        if (line.startsWith(":")) return null; // comment
+
+        const colon = line.indexOf(":");
+        let field, value2;
+        if (colon === -1) {
+          field = line;
+          value2 = "";
+        } else {
+          field = line.slice(0, colon);
+          value2 = line.slice(colon + 1);
+          if (value2.startsWith(" ")) value2 = value2.slice(1);
+        }
+
+        switch (field) {
+          case "event":
+            event = value2;
+            break;
+          case "data":
+            data += value2 + "\n";
+            break;
+          case "id":
+            id = value2;
+            break;
+          // "retry" is intentionally ignored (no reconnection in this API).
+        }
+        return null;
+      }
+
       const reader = readableStream.getReader();
+      // True once the source reported done. Any other way out of this
+      // generator (the consumer broke out of its loop, a read threw) leaves
+      // the body unread, and it has to be cancelled, not just unlocked.
+      let finished = false;
       try {
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
 
-          const lines = buffer.split("\n");
-          // Last element is incomplete (no trailing newline yet) -- keep it.
-          buffer = lines.pop();
+          // The SSE grammar ends a line with CRLF, a lone LF, or a lone CR.
+          // A CR that is the last character read so far may be the first
+          // half of a CRLF the next chunk completes, so it stays in the
+          // buffer (with its line) until more bytes -- or the end -- arrive.
+          let ready = buffer;
+          let held = "";
+          if (ready.endsWith("\r")) {
+            held = "\r";
+            ready = ready.slice(0, -1);
+          }
+          const lines = ready.split(/\r\n|\r|\n/);
+          // Last element is incomplete (no terminator yet) -- keep it.
+          buffer = lines.pop() + held;
 
           for (const line of lines) {
-            if (line === "") {
-              // Empty line = event boundary.
-              if (data) {
-                yield {
-                  event: event || "message",
-                  data: data.endsWith("\n") ? data.slice(0, -1) : data,
-                  id,
-                };
-              }
-              event = "";
-              data = "";
-              id = "";
-              continue;
-            }
-            if (line.startsWith(":")) continue; // comment
-
-            const colon = line.indexOf(":");
-            let field, value2;
-            if (colon === -1) {
-              field = line;
-              value2 = "";
-            } else {
-              field = line.slice(0, colon);
-              value2 = line.slice(colon + 1);
-              if (value2.startsWith(" ")) value2 = value2.slice(1);
-            }
-
-            switch (field) {
-              case "event":
-                event = value2;
-                break;
-              case "data":
-                data += value2 + "\n";
-                break;
-              case "id":
-                id = value2;
-                break;
-              // "retry" is intentionally ignored (no reconnection in this API).
-            }
+            const out = feedLine(line);
+            if (out) yield out;
+          }
+        }
+        finished = true;
+        // A line whose CR terminator was the last byte of the stream is a
+        // complete line; an unterminated tail is not, and stays dropped.
+        if (buffer.endsWith("\r")) {
+          const tail = buffer.slice(0, -1);
+          buffer = "";
+          for (const line of tail.split(/\r\n|\r|\n/)) {
+            const out = feedLine(line);
+            if (out) yield out;
           }
         }
         // Flush trailing event if stream ended without a final empty line.
         if (data) {
-          yield {
+          const out = {
             event: event || "message",
             data: data.endsWith("\n") ? data.slice(0, -1) : data,
             id,
           };
+          data = "";
+          yield out;
         }
       } finally {
+        if (!finished) {
+          // Early exit: release the underlying response body rather than
+          // leave it open. A cancel that rejects (the stream already
+          // errored) must not replace the error on its way out.
+          try {
+            await reader.cancel();
+          } catch {
+            /* already errored or closed */
+          }
+        }
         reader.releaseLock();
       }
     }
@@ -106,11 +151,35 @@
       for await (const event of parseSSEStream(response.body)) {
         if (event.data === "[DONE]") return;
         let parsed;
+        let isJson = true;
         try {
           parsed = JSON.parse(event.data);
         } catch {
-          continue; // non-JSON SSE line (keepalive, etc.)
+          isJson = false;
         }
+        // A provider reports a mid-stream failure as a frame, not a status:
+        // Anthropic sends `event: error` with { type: "error", error }, and
+        // OpenAI-shaped servers send a bare { error }. Neither carries a
+        // delta, so skipping them would end the stream looking complete.
+        const errorBody =
+          isJson && parsed !== null && typeof parsed === "object" ? parsed.error : undefined;
+        if (
+          event.event === "error" ||
+          (isJson && parsed !== null && typeof parsed === "object" && parsed.type === "error") ||
+          (errorBody !== null &&
+            typeof errorBody === "object" &&
+            parsed.choices === undefined &&
+            parsed.delta === undefined)
+        ) {
+          const detail =
+            (errorBody && typeof errorBody === "object" && errorBody.message) ||
+            (typeof errorBody === "string" && errorBody) ||
+            event.data;
+          const err = new Error(`streamChat: stream error -- ${detail}`);
+          err.data = isJson ? parsed : event.data;
+          throw err;
+        }
+        if (!isJson) continue; // non-JSON SSE line (keepalive, etc.)
         const delta = extract(parsed, event);
         if (delta != null) yield delta;
       }
@@ -150,7 +219,7 @@
       return {
         chat(messages, options) {
           const {
-            model = "claude-sonnet-4-5-20250514",
+            model = "claude-sonnet-5-5",
             max_tokens = 4096,
             system,
             signal,
@@ -197,7 +266,7 @@
     //         },
     //         // options carries stream:false plus any tools the loop added.
     //         body: JSON.stringify({
-    //           model: 'claude-sonnet-4-5-20250514',
+    //           model: 'claude-sonnet-5-5',
     //           max_tokens: 4096,
     //           messages,
     //           ...options,
@@ -268,7 +337,8 @@
             toolCalls = choice.message.tool_calls.map((tc) => ({
               id: tc.id,
               name: tc.function.name,
-              input: JSON.parse(tc.function.arguments),
+              // A no-argument call may carry an empty arguments string.
+              input: tc.function.arguments ? JSON.parse(tc.function.arguments) : {},
             }));
           }
         }
@@ -278,21 +348,34 @@
         }
 
         // Execute tool calls and append results.
-        msgs.push(response.choices ? response.choices[0].message : { role: "assistant", content: response.content });
+        // The reply has to be in the shape of the conversation it answers:
+        // which branch above parsed the response decides it, not a second
+        // look at the response.
+        const openaiShape = !response?.content;
+        msgs.push(
+          openaiShape
+            ? response.choices[0].message
+            : { role: "assistant", content: response.content },
+        );
+        const anthropicResults = [];
         for (const call of toolCalls) {
           const result = await onToolCall(call);
-          // Anthropic shape
-          msgs.push({
-            role: "user",
-            content: [
-              {
-                type: "tool_result",
-                tool_use_id: call.id,
-                content: typeof result === "string" ? result : JSON.stringify(result),
-              },
-            ],
-          });
+          const content =
+            typeof result === "string" ? result : (JSON.stringify(result) ?? "");
+          if (openaiShape) {
+            // Chat Completions: one role:"tool" message per tool_calls entry.
+            msgs.push({ role: "tool", tool_call_id: call.id, content });
+          } else {
+            anthropicResults.push({
+              type: "tool_result",
+              tool_use_id: call.id,
+              content,
+            });
+          }
         }
+        // Messages API: every tool_result of one assistant turn goes back in
+        // a single user message.
+        if (!openaiShape) msgs.push({ role: "user", content: anthropicResults });
       }
       return {
         text: "",

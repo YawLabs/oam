@@ -18,7 +18,7 @@
 #                       pre-v0.18.0 tag that is not pinned is refused.
 #
 # A signature that is present but does not verify always fails; so does a
-# v0.18.0+ release with no manifest. release-keys/README.md is the runbook.
+# v0.18.0+ release with no manifest. release-keys/README.md describes the keys.
 #
 # Env overrides:
 #   OAM_VERSION       install a specific tag (e.g. v0.18.0); default: latest
@@ -37,10 +37,12 @@
 #                     still be the one that runs (a dev build, or another
 #                     product's bundled copy). Loud: this install does not
 #                     take effect until PATH is reordered.
-#   GH_TOKEN          GitHub token for private-repo installs (GITHUB_TOKEN is
-#                     also accepted). Needed on headless hosts -- CI, a fresh
-#                     VM -- that have a token but no gh CLI. While the repo is
-#                     private, unauthenticated asset URLs return 404.
+#   GH_TOKEN          Optional GitHub token (GITHUB_TOKEN is also accepted).
+#                     The repo and its releases are public, so a normal
+#                     install needs none. It is only a fallback, tried when
+#                     the unauthenticated download fails -- e.g. a GitHub
+#                     Enterprise mirror (OAM_GH_API) that requires auth, on a
+#                     headless host that has a token but no gh CLI.
 #   OAM_GH_API        GitHub API base; default https://api.github.com
 #
 # Windows PowerShell 5.1 compatible, ASCII only. Two 5.1 traps shape the code:
@@ -90,7 +92,7 @@ $embeddedAllowedSigners = @'
 # Every oam release from the first signed one on carries RELEASE-MANIFEST and
 # RELEASE-MANIFEST.sig; this file names the keys allowed to have made that
 # signature. Read by scripts/lib/signing.sh (release_verify_manifest), and the
-# source of the key set the installers and `oam self-update` will embed.
+# source of the key set the installers and `oam self-update` embed.
 #
 # One line per key:
 #
@@ -103,7 +105,7 @@ $embeddedAllowedSigners = @'
 #   - ssh-ed25519 (or sk-ssh-ed25519@openssh.com for a hardware key)
 #
 # k1 is the current release key (signs from v0.18.0, see ./ranges); k2 is the
-# staged next key, held offline, with no range yet. Because key lines exist,
+# staged next key, with no range yet. Because key lines exist,
 # every release must sign; there is no knob that skips it.
 #
 #   k1  SHA256:zB7Aq4Ky/U90VJ4sAEp0e2A65KfQpiyQXJI4FuT2oss
@@ -116,7 +118,7 @@ oam-release-k2 namespaces="oam-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDdF
 '@
 $embeddedRanges = @'
 # Which tags each release key may sign. Read by scripts/lib/signing.sh
-# (release_tag_in_range); the installers and `oam self-update` will embed it.
+# (release_tag_in_range); the installers and `oam self-update` embed it.
 #
 # At most one line per key in ./allowed_signers:
 #
@@ -187,7 +189,8 @@ function Test-TagLe([string]$a, [string]$b) {
   return ([version]$a.Substring(1)) -le ([version]$b.Substring(1))
 }
 
-# Map arch -> Rust target triple (must match release.yml asset names). A 32-bit
+# Map arch -> Rust target triple (must match the asset names
+# scripts/release-local.sh publishes; install/README.md lists them). A 32-bit
 # PowerShell on 64-bit Windows reports x86 here and the real arch in
 # PROCESSOR_ARCHITEW6432; there is no 32-bit oam, so the real one decides.
 $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
@@ -215,8 +218,8 @@ function Get-LatestTag {
     try { $loc = $resp.Headers['Location'] } finally { $resp.Close() }
     if ($loc -and $loc -match '/releases/tag/([^/?#]+)$') { return $Matches[1] }
   } catch { }
-  # Private repo: that redirect 404s unauthenticated. The API with the token,
-  # then the gh CLI.
+  # Fallbacks for when that redirect gives no tag (a host that requires auth,
+  # a proxy that eats the redirect): the API with the token, then the gh CLI.
   if ($token) {
     try {
       $rel = Invoke-RestMethod -Uri "$ghApi/repos/$ownerRepo/releases/latest" -UseBasicParsing -Headers @{
@@ -254,22 +257,30 @@ if ($env:OAM_VERSION) {
   Die "OAM_INSTALL_BASE needs OAM_VERSION too: the signature is checked against the tag you ask for, and a mirror cannot be asked which tag it serves (e.g. OAM_VERSION=$firstManifestSigTag)"
 } else {
   $tag = Get-LatestTag
-  if (-not $tag) { Die 'could not resolve the latest release tag (private repo? set GH_TOKEN or install the gh CLI; or set OAM_VERSION)' }
+  if (-not $tag) { Die 'could not resolve the latest release tag (network or proxy? set OAM_VERSION to name the tag; if your host requires GitHub auth, set GH_TOKEN or install the gh CLI)' }
 }
 if (-not (Test-PlainTag $tag)) { Die "'$tag' is not a release tag -- oam tags look like $firstManifestSigTag" }
 
 $base = if ($env:OAM_INSTALL_BASE) { $env:OAM_INSTALL_BASE } else { "https://github.com/$ownerRepo/releases/download/$tag" }
 
-# Authenticated fallback: while the repo is private, unauthenticated release
-# URLs 404. If the direct download fails and the gh CLI is available
-# (internal machines), fetch the same assets through the caller's GitHub auth.
+# Authenticated fallback. The releases are public, so this is not the normal
+# path: if the direct download fails and the gh CLI is available, fetch the
+# same assets through the caller's GitHub auth.
 function Get-ViaGh($pattern, $outFile) {
   if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { return $false }
-  try { gh release download $tag --repo $ownerRepo --pattern $pattern --output $outFile --clobber } catch { return $false }
+  # gh's exit status decides, not the file alone: a failed download leaves
+  # whatever was already at $outFile, and that would read as a success.
+  # Out-Null: anything gh prints on stdout would otherwise join this
+  # function's return value. $LASTEXITCODE is set first: StrictMode makes
+  # reading it a hard error when no native command has run yet (a gh that is
+  # a script or function never sets it).
+  $global:LASTEXITCODE = 0
+  try { gh release download $tag --repo $ownerRepo --pattern $pattern --output $outFile --clobber | Out-Null } catch { return $false }
+  if ($LASTEXITCODE -ne 0) { return $false }
   return (Test-Path $outFile)
 }
 
-# Token fallback: works on headless hosts with no gh CLI. A private-repo asset
+# Token fallback: works on headless hosts with no gh CLI. An asset that requires auth
 # is NOT reachable via its browser_download_url even with a token -- GitHub
 # only serves the bytes from the assets endpoint with an octet-stream Accept
 # -- so resolve the numeric asset id first.
@@ -291,7 +302,9 @@ function Get-ViaToken($assetName, $outFile) {
 }
 
 # Direct first (public releases + a mirror), then token, then gh CLI. All three
-# fetch the same tag, and everything fetched is verified the same way.
+# fetch the same tag, and the manifest, the checksums, the binary and the
+# license and attribution texts are verified the same way whichever of them
+# served the bytes.
 function Get-Asset($assetName, $outFile) {
   try { Invoke-WebRequest -Uri "$base/$assetName" -OutFile $outFile -UseBasicParsing; return $true } catch { }
   if ($token) {
@@ -299,7 +312,7 @@ function Get-Asset($assetName, $outFile) {
     if (Get-ViaToken $assetName $outFile) { return $true }
   }
   if (Get-Command gh -ErrorAction SilentlyContinue) {
-    Say "retrying $assetName via gh CLI (private repo needs auth)"
+    Say "retrying $assetName via gh CLI"
     return (Get-ViaGh $assetName $outFile)
   }
   return $false
@@ -378,18 +391,56 @@ $keygenFix = 'install the OpenSSH client (OpenSSH 8.1 or later), from an elevate
 # Comparing hashes: lower-case hex, from Get-FileHash.
 function Get-Sha256([string]$path) { (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLower() }
 
-# The sha256 a SHA256SUMS text lists for $asset, when it lists it exactly once.
-# Field 2 matched exactly, sha256sum's binary-mode "*" stripped. Two entries
-# are refused rather than resolved: the first of a duplicate pair has been the
-# stale one.
-function Get-HashFromSums([string]$text) {
+# Every sha256 a SHA256SUMS text lists for $name. Field 2 matched exactly,
+# sha256sum's binary-mode "*" stripped.
+function Get-SumsHits([string]$text, [string]$name) {
   $hits = @()
   foreach ($l in ($text -split "`n")) {
     $parts = $l -split '[ \t]+'
-    if ($parts.Count -ge 2 -and ($parts[1] -replace '^\*', '') -ceq $asset) { $hits += $parts[0].ToLower() }
+    if ($parts.Count -ge 2 -and ($parts[1] -replace '^\*', '') -ceq $name) { $hits += $parts[0].ToLower() }
   }
-  if ($hits.Count -ne 1) { Die "the verified checksums for $tag list $asset $($hits.Count) times, not once" }
+  return ,$hits
+}
+# The sha256 a SHA256SUMS text lists for $name (default $asset), when it lists
+# it exactly once. Two entries are refused rather than resolved: the first of a
+# duplicate pair has been the stale one.
+function Get-HashFromSums([string]$text, [string]$name = $asset) {
+  $hits = Get-SumsHits $text $name
+  if ($hits.Count -ne 1) { Die "the verified checksums for $tag list $name $($hits.Count) times, not once" }
   return $hits[0]
+}
+
+# The user PATH, exactly as HKCU\Environment stores it. Not
+# [Environment]::GetEnvironmentVariable('Path', 'User') and its Set twin: that
+# read returns the value with every %VAR% reference expanded, and that write
+# stores a plain string, so appending one directory through the pair would
+# permanently flatten an entry such as %USERPROFILE%\bin into today's
+# expansion. (That is .NET's documented behaviour, taken from its reference,
+# not measured on a box here.) Read unexpanded; written back with the kind
+# the value already had, REG_EXPAND_SZ for a new one.
+$userEnvKey = 'Environment'
+$noExpand = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+function Get-UserPathRaw {
+  $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($userEnvKey)
+  if (-not $k) { return '' }
+  try { return [string]$k.GetValue('Path', '', $noExpand) } finally { $k.Close() }
+}
+function Set-UserPath([string]$value) {
+  $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($userEnvKey)
+  try {
+    $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+    if ($null -ne $k.GetValue('Path', $null, $noExpand)) {
+      $had = $k.GetValueKind('Path')
+      if ($had -eq [Microsoft.Win32.RegistryValueKind]::String) { $kind = $had }
+    }
+    $k.SetValue('Path', $value, $kind)
+  } finally { $k.Close() }
+  # A raw registry write tells no running program the environment changed.
+  # SetEnvironmentVariable broadcasts WM_SETTINGCHANGE after every user-scope
+  # write, so clearing a variable that does not exist sends that one
+  # broadcast and changes nothing (again from the .NET reference, not
+  # measured here). Best-effort: without it only a new sign-in sees the PATH.
+  try { [Environment]::SetEnvironmentVariable('OAM_INSTALL_PATH_NOTIFY', $null, 'User') } catch { }
 }
 
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("oam-install-" + [System.Guid]::NewGuid().ToString('N'))
@@ -460,7 +511,7 @@ try {
       if ($f[2] -ne '-' -and -not (Test-TagLe $tag $f[2])) { Die "RELEASE-MANIFEST for $tag is signed by $principal, which was retired after $($f[2]); refusing it" }
       Say "signature ok: $tag, signed by $principal"
     }
-    $expected = Get-HashFromSums $mText.Substring($prefix.Length)
+    $sumsText = $mText.Substring($prefix.Length)
   } else {
     # Cut before signing existed: the pinned digest of its SHA256SUMS is the
     # proof, and ssh-keygen plays no part. Said anyway when it is missing, so
@@ -479,8 +530,9 @@ try {
     $got = Get-Sha256 $sumsPath
     if ($got -ne $pinned) { Die "SHA256SUMS for $tag hashes to $got, but ${tag}'s pinned digest is $pinned -- it is not the file that release published; refusing it" }
     Say "SHA256SUMS ok: $tag matches its pinned digest (released before signing)"
-    $expected = Get-HashFromSums ([System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($sumsPath)))
+    $sumsText = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($sumsPath))
   }
+  $expected = Get-HashFromSums $sumsText
 
   # --- Authenticode hook (INACTIVE) ---------------------------------------------
   # The release signs both .exe assets with Authenticode from v0.18.0 (signing
@@ -502,56 +554,116 @@ try {
 
   # --- Download, check, replace -------------------------------------------------
   Say "downloading $asset $tag from $base"
-  if (-not (Get-Asset $asset $binPath)) { Die "download failed: $asset (private repo? set GH_TOKEN or install the gh CLI)" }
+  if (-not (Get-Asset $asset $binPath)) { Die "download failed: $asset (network or proxy? does $tag carry this asset? if your host requires GitHub auth, set GH_TOKEN or install the gh CLI)" }
   $actual = Get-Sha256 $binPath
   if ($expected -ne $actual) { Die "checksum mismatch for $asset (expected $expected, got $actual)" }
   Say 'checksum ok'
   Test-OamAuthenticode $binPath
+
+  # The binary is a binary redistribution of V8, ICU, the Node streams port and
+  # ~380 Rust crates, whose licenses require their notices travel with it. They
+  # go beside the binary so the copy on THIS machine carries its attribution,
+  # not just the repo it came from. Each one is checked against the same
+  # verified checksums as the binary, and BEFORE the binary is put in place: a
+  # file whose bytes differ from what the release lists stops the install with
+  # nothing changed. Otherwise best-effort, as install.sh:
+  #   - a release whose checksums do not list a file (every release cut before
+  #     the license files were checksummed; before v0.8.1 there were none at
+  #     all) does not get that file installed -- unchecked text is not put
+  #     beside the binary -- and a warning says where to read it instead;
+  #   - a listed file that cannot be fetched is not worth failing an otherwise
+  #     good install over, and is reported, not swallowed.
+  # Get-Asset returns a bool (it never throws), so that is what is tested.
+  $licenseNames = @('LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.md')
+  $licOk = @(); $licUnlisted = @(); $licFailed = @()
+  foreach ($f in $licenseNames) {
+    $hits = Get-SumsHits $sumsText $f
+    if ($hits.Count -eq 0) { $licUnlisted += $f; continue }
+    if ($hits.Count -ne 1) { Die "the verified checksums for $tag list $f $($hits.Count) times, not once" }
+    $staged = Join-Path $tmp "lic.$f"
+    Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+    if (-not (Get-Asset $f $staged)) { $licFailed += $f; continue }
+    $got = Get-Sha256 $staged
+    if ($got -ne $hits[0]) { Die "checksum mismatch for $f (expected $($hits[0]), got $got) -- refusing to install $tag; nothing was changed" }
+    $licOk += $f
+  }
+  if ($licOk.Count -gt 0) { Say "checksum ok: $($licOk -join ' ')" }
 
   New-Item -ItemType Directory -Path $installDir -Force | Out-Null
   $dest = Join-Path $installDir 'oam.exe'
   # A running oam.exe can't be overwritten in place; move the old one aside.
   if (Test-Path $dest) {
     try { Move-Item -Path $dest -Destination "$dest.old" -Force }
-    catch { Remove-Item -Path "$dest.old" -Force -ErrorAction SilentlyContinue; Move-Item -Path $dest -Destination "$dest.old" -Force }
+    catch {
+      Remove-Item -Path "$dest.old" -Force -ErrorAction SilentlyContinue
+      if (Test-Path "$dest.old") {
+        # oam.exe.old is itself still in use: an oam started before the LAST
+        # upgrade (an `oam mcp` server, say) still runs from it, and Windows
+        # replaces or deletes no running image. Move aside to a name of this
+        # run's own instead -- the <target>.old-<pid>-<secs> shape
+        # `oam self-update` uses, so its sweep and the one below both
+        # recognize it.
+        $secs = [int64][Math]::Floor(([DateTime]::UtcNow - (New-Object DateTime 1970, 1, 1)).TotalSeconds)
+        Move-Item -Path $dest -Destination "$dest.old-$PID-$secs" -Force
+      } else {
+        Move-Item -Path $dest -Destination "$dest.old" -Force
+      }
+    }
   }
   Move-Item -Path $binPath -Destination $dest -Force
-  # The move-aside is removed best-effort: a running copy (an `oam mcp` server,
-  # a second session) keeps it until a later install or `oam self-update`, whose
-  # sweep clears it. Say so when it survives -- a stray oam.exe beside the
-  # install is exactly the residue that must not go unnoticed.
-  Remove-Item -Path "$dest.old" -Force -ErrorAction SilentlyContinue
-  if (Test-Path "$dest.old") { Warn "$dest.old could not be removed -- most likely the previous oam.exe is still running (an ACL refusal looks the same); it is not on PATH and a later install or 'oam self-update' will clear it" }
+  # The move-asides are removed best-effort -- this run's and any an earlier
+  # install or `oam self-update` left (oam.exe.old, oam.exe.old-<digits and
+  # dashes>): a running copy (an `oam mcp` server, a second session) keeps its
+  # file until a later install or `oam self-update`, whose sweep clears it. Say
+  # so when one survives -- a stray oam.exe beside the install is exactly the
+  # residue that must not go unnoticed.
+  $asideLeft = @()
+  $asides = @(Get-ChildItem -LiteralPath $installDir -Force -ErrorAction SilentlyContinue |
+    Where-Object { -not $_.PSIsContainer -and $_.Name -match '^oam\.exe\.old(-[0-9-]+)?\z' })
+  foreach ($aside in $asides) {
+    Remove-Item -LiteralPath $aside.FullName -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $aside.FullName) { $asideLeft += $aside.FullName }
+  }
+  if ($asideLeft.Count -gt 0) { Warn "$($asideLeft -join ', ') could not be removed -- most likely the previous oam.exe is still running (an ACL refusal looks the same); it is not on PATH and a later install or 'oam self-update' will clear it" }
   Say "installed oam $tag to $dest"
 
-  # The binary is a binary redistribution of V8, ICU, the Node streams port and
-  # ~380 Rust crates, whose licenses require their notices travel with it. Put
-  # them beside the binary so the copy on THIS machine carries its attribution,
-  # not just the repo it came from. Best-effort: a missing notice is not worth
-  # failing an otherwise good install over, and it is reported, not swallowed.
-  # Get-Asset returns a bool (it never throws), so that is what is tested.
+  # Whatever the install this one replaced left in licenses/ describes a
+  # different binary: those three names go first, then the checked files go
+  # in, and the directory goes when nothing is left in it.
   $licenseDir = Join-Path $installDir 'licenses'
-  New-Item -ItemType Directory -Path $licenseDir -Force | Out-Null
-  $gotLicenses = $false
-  foreach ($f in @('LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.md')) {
-    # Releases before v0.8.1 ship no license assets.
-    if (Get-Asset $f (Join-Path $licenseDir $f)) { $gotLicenses = $true }
+  foreach ($f in $licenseNames) {
+    Remove-Item -LiteralPath (Join-Path $licenseDir $f) -Force -ErrorAction SilentlyContinue
   }
-  if ($gotLicenses) {
-    Say "license and attribution files in $licenseDir"
-  } else {
-    # An empty directory would imply they were installed.
-    Remove-Item -Path $licenseDir -Force -ErrorAction SilentlyContinue
-    Say "note: this release ships no license assets; see https://github.com/$ownerRepo"
+  $gotLicenses = $false
+  foreach ($f in $licOk) {
+    try {
+      New-Item -ItemType Directory -Path $licenseDir -Force | Out-Null
+      Move-Item -LiteralPath (Join-Path $tmp "lic.$f") -Destination (Join-Path $licenseDir $f) -Force
+      $gotLicenses = $true
+    } catch { Warn "could not put $f in ${licenseDir}: $($_.Exception.Message)" }
+  }
+  if ((Test-Path -LiteralPath $licenseDir) -and -not @(Get-ChildItem -LiteralPath $licenseDir -Force -ErrorAction SilentlyContinue).Count) {
+    Remove-Item -LiteralPath $licenseDir -Force -ErrorAction SilentlyContinue
+  }
+  if ($gotLicenses) { Say "license and attribution files in $licenseDir" }
+  if ($licUnlisted.Count -gt 0) {
+    Warn "the verified checksums for $tag do not list: $($licUnlisted -join ' ') -- not installed (only checked license files are copied); read them at https://github.com/$ownerRepo/tree/$tag"
+  }
+  if ($licFailed.Count -gt 0) {
+    Warn "could not fetch $($licFailed -join ' ') for $tag; see https://github.com/$ownerRepo/tree/$tag"
   }
 
   # Add install dir to the USER PATH (persistent) if it isn't already there.
-  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  # Read and written as the registry stores it (Get-UserPathRaw above): an
+  # entry such as %USERPROFILE%\bin stays a reference instead of being
+  # rewritten as today's expansion. An entry counts as the install dir either
+  # as written or once expanded.
+  $userPath = Get-UserPathRaw
   if (-not $userPath) { $userPath = '' }
-  $onPath = $userPath.Split(';') | Where-Object { $_ -eq $installDir }
+  $onPath = $userPath.Split(';') | Where-Object { $_ -eq $installDir -or [Environment]::ExpandEnvironmentVariables($_) -eq $installDir }
   if (-not $onPath) {
     $newPath = if ($userPath.TrimEnd(';')) { "$($userPath.TrimEnd(';'));$installDir" } else { $installDir }
-    [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+    Set-UserPath $newPath
     $env:Path = "$env:Path;$installDir"
     Say "added $installDir to your user PATH (restart your terminal to pick it up)"
   }

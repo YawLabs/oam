@@ -4,6 +4,11 @@
 //
 //   node npm/stage.mjs <release-dir>
 //   node npm/stage.mjs <release-dir> --only oamjs-win32-arm64   (see below)
+//   node npm/stage.mjs <release-dir> --root D    stage into D/npm/<package>
+//
+// --root exists for the tests, as it does in sync-packages.mjs: staging writes
+// binaries and attribution files, and a test that did that in the checkout
+// would have to delete them again from a tree that may be staged for real.
 //
 // <release-dir> is scripts/release-local.sh's $RELEASE_DIR: the temp directory
 // holding oam-<triple>[.exe] for all five targets plus LICENSE, NOTICE and
@@ -44,10 +49,19 @@ const { SUPPORTED } = (await import(
 const args = process.argv.slice(2);
 const only = [];
 const positional = [];
+// Where the package directories live: <root>/npm/<package>. The checkout by
+// default; --root points it at a copy, which is what lets the tests stage
+// without writing into (or cleaning up inside) a tree that may itself be staged
+// for a publish.
+let root = REPO_ROOT;
 for (let i = 0; i < args.length; i += 1) {
   if (args[i] === '--only') {
     if (i + 1 >= args.length) diePreflight('--only needs a package name');
     only.push(args[i + 1]);
+    i += 1;
+  } else if (args[i] === '--root') {
+    if (i + 1 >= args.length) diePreflight('--root needs a directory');
+    root = args[i + 1];
     i += 1;
   } else if (args[i].startsWith('--')) {
     diePreflight(`unknown flag: ${args[i]}`);
@@ -70,7 +84,7 @@ function die(message) {
   process.exit(1);
 }
 
-if (!releaseDir) die('usage: node npm/stage.mjs <release-dir> [--only <package>]');
+if (!releaseDir) die('usage: node npm/stage.mjs <release-dir> [--only <package>] [--root <dir>]');
 // SUPPORTED is keyed by "<platform> <arch>"; --only names the PACKAGE, which is
 // the `pkg` field. Validating against the wrong set is why a correct package
 // name was rejected here a moment ago.
@@ -88,42 +102,55 @@ for (const f of ATTRIBUTION) {
   }
 }
 
-let staged = 0;
-for (const target of Object.values(SUPPORTED)) {
-  if (only.length > 0 && !only.includes(target.pkg)) continue;
+const selected = Object.values(SUPPORTED)
+  .filter((target) => only.length === 0 || only.includes(target.pkg));
 
+// npm packs the mode it finds on disk, and a binary that arrives 0644 is a
+// permission-denied on the user's first run.
+//
+// chmod cannot deliver that mode from Windows: libuv's uv_fs_chmod only
+// toggles FILE_ATTRIBUTE_READONLY, so the execute bit is a silent no-op and
+// the tarball ships 0644. Measured on this box -- staging the linux binary
+// and packing produced `-rw-r--r--  package/bin/oam`. The release box IS
+// Windows (scripts/release-local.sh runs there), so the default path would
+// have published three broken POSIX packages, and npm forbids re-publishing a
+// version: the only fix after the fact is a new release.
+//
+// So refuse rather than warn. The .exe targets are unaffected -- Windows has
+// no execute bit and the suffix is what makes them runnable -- which is why
+// this gate is per-target and not a blanket "do not stage on Windows".
+//
+// Decided HERE, before anything is copied. The check used to sit after the
+// copy inside the loop below, so the very binary it refused to stage was left
+// in npm/<package>/bin at mode 0644, beside whichever Windows packages the loop
+// had already staged -- a tree that looks half-ready and is not publishable.
+// A refusal now leaves the destination untouched.
+if (process.platform === 'win32' && process.env.OAM_NPM_ALLOW_UNEXECUTABLE !== '1') {
+  const refused = selected.filter((target) => !target.bin.endsWith('.exe')).map((t) => t.pkg);
+  if (refused.length > 0) {
+    die(`cannot stage ${refused.join(', ')} from Windows: chmod cannot set the execute bit here, `
+      + `so the packed binary would be mode 0644 and every user of that platform would get a `
+      + `permission denied. Nothing was staged. A release stages all five packages in one run on `
+      + `a POSIX host (the mac or linux release leg), where the mode can be set. `
+      + `(Set OAM_NPM_ALLOW_UNEXECUTABLE=1 to override, for a local pack you will not publish.)`);
+  }
+}
+
+let staged = 0;
+for (const target of selected) {
   const asset = `oam-${target.triple}${target.bin.endsWith('.exe') ? '.exe' : ''}`;
   const src = join(releaseDir, asset);
   if (!existsSync(src)) die(`${asset} missing from ${releaseDir}`);
 
-  const pkgDir = join(REPO_ROOT, 'npm', target.pkg);
+  const pkgDir = join(root, 'npm', target.pkg);
   if (!existsSync(pkgDir)) die(`${target.pkg} has no package dir -- run node npm/sync-packages.mjs`);
 
   mkdirSync(join(pkgDir, 'bin'), { recursive: true });
   const dest = join(pkgDir, 'bin', target.bin);
   copyFileSync(src, dest);
-  // npm packs the mode it finds on disk, and a binary that arrives 0644 is a
-  // permission-denied on the user's first run.
-  //
-  // chmod cannot deliver that mode from Windows: libuv's uv_fs_chmod only
-  // toggles FILE_ATTRIBUTE_READONLY, so the execute bit is a silent no-op and
-  // the tarball ships 0644. Measured on this box -- staging the linux binary
-  // and packing produced `-rw-r--r--  package/bin/oam`. The release box IS
-  // Windows (scripts/release-local.sh runs there), so the default path would
-  // have published three broken POSIX packages, and npm forbids re-publishing a
-  // version: the only fix after the fact is a new release.
-  //
-  // So refuse rather than warn. The .exe targets are unaffected -- Windows has
-  // no execute bit and the suffix is what makes them runnable -- which is why
-  // this gate is per-target and not a blanket "do not stage on Windows".
+  // The mode npm will pack. A no-op on Windows, which is what the refusal
+  // above the loop is about.
   chmodSync(dest, 0o755);
-  if (process.platform === 'win32' && !target.bin.endsWith('.exe')
-      && process.env.OAM_NPM_ALLOW_UNEXECUTABLE !== '1') {
-    die(`cannot stage ${target.pkg} from Windows: chmod cannot set the execute bit here, `
-      + `so the packed binary would be mode 0644 and every user of that platform would get a `
-      + `permission denied. Stage and publish the POSIX packages from the mac or linux release `
-      + `leg. (Set OAM_NPM_ALLOW_UNEXECUTABLE=1 to override, for a local pack you will not publish.)`);
-  }
   for (const f of ATTRIBUTION) copyFileSync(join(releaseDir, f), join(pkgDir, f));
 
   process.stdout.write(`staged ${asset} -> npm/${target.pkg}/bin/${target.bin} `
@@ -133,7 +160,7 @@ for (const target of Object.values(SUPPORTED)) {
 
 // The launcher ships no binary, but it is still a distribution of oam's own
 // Apache-2.0 code and npm shows the license file on the package page.
-copyFileSync(join(releaseDir, 'LICENSE'), join(REPO_ROOT, 'npm/oamjs/LICENSE'));
+copyFileSync(join(releaseDir, 'LICENSE'), join(root, 'npm', 'oamjs', 'LICENSE'));
 
 // Fail, do not warn. A release script runs under `set -e` and sees exit 0, and
 // a warning in a long release log is not a gate: the outcome is a published

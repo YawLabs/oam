@@ -388,14 +388,37 @@ fn is_content_length(v: &[u8]) -> bool {
 }
 
 /// Parse and check a request head: httparse's grammar -- which refuses
-/// obs-fold, control characters, bad tokens and more than `max_headers`
-/// fields, as hyper does -- then [`check_request_head`]. `Ok` carries the
-/// method, target and headers as received (names in their own case), which
-/// an upgrade or CONNECT request hands to JS from the head hyper parsed.
+/// obs-fold, control characters and bad tokens, as hyper does -- then
+/// [`check_request_head`]. `Ok` carries the method, target and headers as
+/// received (names in their own case, values one code point per byte, as
+/// node's parser decodes them), which an upgrade or CONNECT request hands to
+/// JS from the head hyper parsed.
+///
+/// The field ceiling is the one the server gives hyper
+/// ([`HeadPolicy::max_parsed_headers`]), so a head hyper accepted is never
+/// refused here for its field count: a small inline buffer first, as hyper
+/// starts with, and one sized to the policy only for a head that needs it.
 pub fn parse_request_head(head: &[u8], policy: HeadPolicy) -> Result<ParsedHead, HeadError> {
-    const MAX_HEADERS: usize = 100; // hyper's default
-    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
-    let mut req = httparse::Request::new(&mut headers);
+    const INLINE_HEADERS: usize = 100; // hyper's inline buffer
+    let mut inline = [httparse::EMPTY_HEADER; INLINE_HEADERS];
+    let parsed = match parse_head_into(head, &mut inline)? {
+        Some(parsed) => parsed,
+        None => {
+            let mut grown = vec![httparse::EMPTY_HEADER; policy.max_parsed_headers()];
+            parse_head_into(head, &mut grown)?.ok_or(HeadError::HeaderOverflow)?
+        }
+    };
+    check_request_head(head, policy)?;
+    Ok(parsed)
+}
+
+/// [`parse_request_head`]'s parse with room for `headers.len()` fields:
+/// `Ok(None)` when the head carries more than that.
+fn parse_head_into<'b>(
+    head: &'b [u8],
+    headers: &mut [httparse::Header<'b>],
+) -> Result<Option<ParsedHead>, HeadError> {
+    let mut req = httparse::Request::new(headers);
     match req.parse(head) {
         Ok(httparse::Status::Complete(len)) if len == head.len() => {}
         // The parser found the head's end before the CRLFCRLF the caller cut
@@ -407,25 +430,27 @@ pub fn parse_request_head(head: &[u8], policy: HeadPolicy) -> Result<ParsedHead,
         Ok(httparse::Status::Partial) => {
             return Err(HeadError::BadRequest("incomplete head"));
         }
-        Err(httparse::Error::TooManyHeaders) => return Err(HeadError::HeaderOverflow),
+        Err(httparse::Error::TooManyHeaders) => return Ok(None),
         Err(_) => return Err(HeadError::BadRequest("malformed head")),
     }
-    check_request_head(head, policy)?;
-    Ok(ParsedHead {
+    Ok(Some(ParsedHead {
         method: req.method.unwrap_or_default().to_string(),
         target: req.path.unwrap_or_default().to_string(),
         http10: req.version == Some(0),
         headers: req
             .headers
             .iter()
+            // One code point per byte (latin1), as an ordinary request's
+            // values are decoded (`header_pairs` in http_server.rs): UTF-8
+            // decoding would turn a lone 0xE9 into U+FFFD.
             .map(|h| {
                 (
                     h.name.to_string(),
-                    String::from_utf8_lossy(h.value).into_owned(),
+                    h.value.iter().map(|&b| char::from(b)).collect::<String>(),
                 )
             })
             .collect(),
-    })
+    }))
 }
 
 /// Whether a request head asks for an upgrade, by node's rule: an `Upgrade`
@@ -864,6 +889,51 @@ mod tests {
         assert_eq!(
             parse_request_head(big.as_bytes(), small),
             Err(HeadError::HeaderOverflow)
+        );
+    }
+
+    /// A head of more fields than the inline buffer holds is parsed whole:
+    /// the server lifts hyper's field ceiling to the policy's, so such a
+    /// head reaches this parse, and the count alone must not refuse it.
+    #[test]
+    fn a_head_of_many_fields_is_parsed_whole() {
+        let mut head = String::from("GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: x\r\n");
+        for i in 0..150 {
+            head.push_str(&format!("X-{i}: v\r\n"));
+        }
+        head.push_str("\r\n");
+        let parsed = parse_request_head(head.as_bytes(), STRICT).unwrap();
+        assert_eq!(parsed.headers.len(), 152);
+        assert_eq!(parsed.headers[0].0, "Connection");
+        assert_eq!(parsed.headers[151], ("X-149".to_string(), "v".to_string()));
+        // Exactly the inline buffer's worth, and one more.
+        for fields in [100usize, 101] {
+            let mut head = String::from("CONNECT x:1 HTTP/1.1\r\n");
+            for i in 0..fields {
+                head.push_str(&format!("X-{i}: v\r\n"));
+            }
+            head.push_str("\r\n");
+            let parsed = parse_request_head(head.as_bytes(), STRICT).unwrap();
+            assert_eq!(parsed.headers.len(), fields);
+        }
+    }
+
+    /// A header value is one code point per byte, as an ordinary request's
+    /// is: 0xE9 reads as U+00E9, never U+FFFD.
+    #[test]
+    fn an_upgrade_heads_values_are_latin1() {
+        let parsed = parse_request_head(
+            b"GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: x\r\nCookie: caf\xe9\r\nX-U: \xc3\xa9\r\n\r\n",
+            STRICT,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.headers[2],
+            ("Cookie".to_string(), "caf\u{e9}".to_string())
+        );
+        assert_eq!(
+            parsed.headers[3],
+            ("X-U".to_string(), "\u{c3}\u{a9}".to_string())
         );
     }
 

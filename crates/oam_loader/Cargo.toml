@@ -1,6 +1,6 @@
 [package]
 name = "oam_loader"
-description = "Module pipeline: TS strip/transform (oxc), and later the ESM graph, npm resolution, CJS interop, caches."
+description = "Module pipeline: TS strip/transform (oxc), ESM and CJS resolution, npm package resolution, tsconfig, the transpile caches, and `oam install`."
 version.workspace = true
 publish.workspace = true
 edition.workspace = true

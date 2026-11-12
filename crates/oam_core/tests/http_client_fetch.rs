@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,7 +47,7 @@ impl Reg {
             ids: Arc::new(AtomicU64::new(100)),
             outbound: Arc::new(Mutex::new(HashMap::new())),
             continuations: Arc::new(Mutex::new(HashMap::new())),
-            cancelled: Arc::new(Mutex::new(HashSet::new())),
+            cancelled: CancelledBodies::default(),
             signal: Arc::new(tokio::sync::Notify::new()),
             net_check: None,
         }
@@ -518,69 +518,105 @@ async fn the_payload_names_the_tls_session_over_h2() {
 /// where oam failed the whole fetch with `error sending request for url (...)`
 /// on most iterations.
 ///
-/// Deterministic here: connection 0 answers the first request (so it is
-/// pooled, healthy) and closes on the second without a byte of response.
+/// Every connection of the fixture answers its first request (so it is
+/// pooled, healthy) and closes on its second without a byte of response.
+///
+/// Two of the steps hold only inside the pool's `SETTLE` window (250 ms of
+/// wall clock, with nothing to inject): the close has to be met that soon
+/// after the connection was parked for the origin to be marked, and the POST
+/// has to follow the retry's connection that closely to be kept off it. A
+/// host that stalls past the window makes those steps mean something else
+/// (the POST reuses the parked connection and is lost), so each run measures
+/// both windows and one that overran is run again on a fresh server rather
+/// than read. The window's own rules are pinned without a clock in pool.rs
+/// (`an_origin_that_closed_early_is_not_handed_a_just_parked_connection`).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_on_a_closed_pooled_connection_is_sent_again() {
+    /// Under the pool's 250 ms `SETTLE`, with room for the clock readings
+    /// here not being the pool's own.
+    const INSIDE_SETTLE: Duration = Duration::from_millis(200);
+    const RUNS: usize = 5;
     within(async {
-        // Every connection answers its first request and FINs on its second
-        // without a byte of response.
-        let server = serve(|mut conn, _, seen| async move {
-            if let Some(request) = conn.request().await {
-                seen.lock().unwrap().push(request);
-                conn.send(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
-                    .await;
+        for run in 1..=RUNS {
+            // Every connection answers its first request and FINs on its
+            // second without a byte of response.
+            let server = serve(|mut conn, _, seen| async move {
+                if let Some(request) = conn.request().await {
+                    seen.lock().unwrap().push(request);
+                    conn.send(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                        .await;
+                }
+                if let Some(request) = conn.request().await {
+                    seen.lock().unwrap().push(request);
+                }
+            })
+            .await;
+            let transport = plain();
+            let reg = Reg::new();
+            let url = format!("http://127.0.0.1:{}/x", server.port);
+            // Warm the pool, then let the connection go back into it. The
+            // first window opens no earlier than this: the connection is
+            // parked after it.
+            let warmed = std::time::Instant::now();
+            let p = payload(reg.fetch(&transport, json!({ "url": &url })).await);
+            assert_eq!(reg.text(handle_of(&p)).await, "ok");
+            // Short: the close the next request meets has to be seen well
+            // inside `SETTLE` for the origin to be marked by it.
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            assert_eq!(server.accepts(), 1);
+
+            // The second window opens no earlier than this: the retry's
+            // connection is parked after it.
+            let retried = std::time::Instant::now();
+            let p = payload(reg.fetch(&transport, json!({ "url": &url })).await);
+            let met_the_close_in = warmed.elapsed();
+            assert_eq!(p["status"], 200);
+            assert_eq!(reg.text(handle_of(&p)).await, "ok");
+            assert_eq!(server.accepts(), 2, "the retry dialled afresh");
+            assert_eq!(
+                server.seen().len(),
+                3,
+                "the dead connection read the first try"
+            );
+
+            // The origin has now been seen to close a connection it had just
+            // answered on, so the one parked a moment ago is not trusted
+            // with the next request (#312): a POST that follows closely
+            // dials its own, and is answered where it would have been lost.
+            // No wait: it dials whether or not the retry's connection is
+            // parked yet.
+            let posted = reg
+                .fetch(&transport, json!({ "url": &url, "method": "POST" }))
+                .await;
+            let followed_in = retried.elapsed();
+            if met_the_close_in >= INSIDE_SETTLE || followed_in >= INSIDE_SETTLE {
+                // Not read: outside the window the origin may be unmarked,
+                // or the parked connection old enough to be handed out.
+                assert!(
+                    run < RUNS,
+                    "every run overran the pool's SETTLE window \
+                     ({met_the_close_in:?} to the close, {followed_in:?} to the POST)"
+                );
+                continue;
             }
-            if let Some(request) = conn.request().await {
-                seen.lock().unwrap().push(request);
-            }
-        })
-        .await;
-        let transport = plain();
-        let reg = Reg::new();
-        let url = format!("http://127.0.0.1:{}/x", server.port);
-        // Warm the pool, then let hyper-util put the connection back into it.
-        let p = payload(reg.fetch(&transport, json!({ "url": &url })).await);
-        assert_eq!(reg.text(handle_of(&p)).await, "ok");
-        // Short: the close the next request meets has to be seen well inside
-        // the pool's `SETTLE` (250 ms) for the origin to be marked by it.
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        assert_eq!(server.accepts(), 1);
+            let p = payload(posted);
+            assert_eq!(p["status"], 200);
+            assert_eq!(reg.text(handle_of(&p)).await, "ok");
+            assert_eq!(server.accepts(), 3, "the POST dialled its own connection");
 
-        let p = payload(reg.fetch(&transport, json!({ "url": &url })).await);
-        assert_eq!(p["status"], 200);
-        assert_eq!(reg.text(handle_of(&p)).await, "ok");
-        assert_eq!(server.accepts(), 2, "the retry dialled afresh");
-        assert_eq!(
-            server.seen().len(),
-            3,
-            "the dead connection read the first try"
-        );
-
-        // The origin has now been seen to close a connection it had just
-        // answered on, so the one parked a moment ago is not trusted with
-        // the next request (#312): a POST that follows closely dials its
-        // own, and is answered where it would have been lost. No wait: it
-        // dials whether or not the retry's connection is parked yet.
-        let p = payload(
-            reg.fetch(&transport, json!({ "url": &url, "method": "POST" }))
-                .await,
-        );
-        assert_eq!(p["status"], 200);
-        assert_eq!(reg.text(handle_of(&p)).await, "ok");
-        assert_eq!(server.accepts(), 3, "the POST dialled its own connection");
-
-        // A POST is NOT replayed: oam DID put the request on the wire and
-        // cannot know the server ignored it (RFC 9110 s9.2.2, idempotent
-        // methods only). On the connection the retry left, which has by now
-        // sat idle long enough to be reused.
-        let_a_parked_connection_settle().await;
-        let socket = closed_by_peer(
-            reg.fetch(&transport, json!({ "url": &url, "method": "POST" }))
-                .await,
-        );
-        assert_eq!(socket.remote_port, Some(server.port));
-        assert_eq!(server.accepts(), 3, "no fresh connection for a POST");
+            // A POST is NOT replayed: oam DID put the request on the wire
+            // and cannot know the server ignored it (RFC 9110 s9.2.2,
+            // idempotent methods only). On the connection the retry left,
+            // which has by now sat idle long enough to be reused.
+            let_a_parked_connection_settle().await;
+            let socket = closed_by_peer(
+                reg.fetch(&transport, json!({ "url": &url, "method": "POST" }))
+                    .await,
+            );
+            assert_eq!(socket.remote_port, Some(server.port));
+            assert_eq!(server.accepts(), 3, "no fresh connection for a POST");
+            return;
+        }
     })
     .await;
 }
@@ -830,25 +866,31 @@ async fn a_malformed_chunk_on_the_shared_transport_is_the_parsers_error() {
     .await;
 }
 
+/// The head of the HTTP/1 request `buf` starts with, once all of it has
+/// arrived: the head and a content-length body. `None` while more is to
+/// come. What the blocking and the async request readers below share.
+fn request_complete(buf: &[u8]) -> Option<String> {
+    let end = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+    let len = head
+        .lines()
+        .find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    (buf.len() >= end + 4 + len).then_some(head)
+}
+
 /// A blocking HTTP/1 request read: the head and a content-length body.
 fn read_request_blocking(stream: &mut std::net::TcpStream) -> Option<String> {
     use std::io::Read as _;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let head = String::from_utf8_lossy(&buf[..end]).into_owned();
-            let len = head
-                .lines()
-                .find_map(|l| {
-                    let (name, value) = l.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().ok())?
-                })
-                .unwrap_or(0);
-            if buf.len() >= end + 4 + len {
-                return Some(head);
-            }
+        if let Some(head) = request_complete(&buf) {
+            return Some(head);
         }
         match stream.read(&mut chunk) {
             Ok(0) | Err(_) => return None,
@@ -1014,19 +1056,8 @@ async fn read_request_async<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> 
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let head = String::from_utf8_lossy(&buf[..end]).into_owned();
-            let len = head
-                .lines()
-                .find_map(|l| {
-                    let (name, value) = l.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().ok())?
-                })
-                .unwrap_or(0);
-            if buf.len() >= end + 4 + len {
-                return Some(head);
-            }
+        if let Some(head) = request_complete(&buf) {
+            return Some(head);
         }
         match stream.read(&mut chunk).await {
             Ok(0) | Err(_) => return None,
@@ -2491,7 +2522,7 @@ async fn cancel_for_another_handle_loses_nothing() {
             });
             parked_read(&reg, handle).await;
             let other = handle + 1000;
-            reg.cancelled.lock().unwrap().insert(other);
+            reg.cancelled.lock().unwrap().tombstone(other);
             // Several wakes, so at least one lands while the read waits.
             for _ in 0..5 {
                 reg.signal.notify_waiters();
@@ -2505,7 +2536,7 @@ async fn cancel_for_another_handle_loses_nothing() {
                 "{encoding:?}: {outcome:?}"
             );
             assert!(reg.bodies.lock().unwrap().contains_key(&handle));
-            assert!(reg.cancelled.lock().unwrap().contains(&other));
+            assert!(reg.cancelled.lock().unwrap().is_tombstoned(other));
         }
     })
     .await;
@@ -2524,7 +2555,7 @@ async fn cancel_tombstone_mid_read_is_done_and_not_reinserted() {
             async move { reg.read(handle).await }
         });
         parked_read(&reg, handle).await;
-        reg.cancelled.lock().unwrap().insert(handle);
+        reg.cancelled.lock().unwrap().tombstone(handle);
         // `notify_waiters` wakes only a read already waiting: repeat it
         // until the read has seen one (the tombstone stays until then).
         for _ in 0..250 {
@@ -2536,6 +2567,34 @@ async fn cancel_tombstone_mid_read_is_done_and_not_reinserted() {
         }
         assert!(matches!(read.await.unwrap(), OpOutcome::Done));
         assert!(!reg.bodies.lock().unwrap().contains_key(&handle));
+        assert!(reg.cancelled.lock().unwrap().is_empty());
+    })
+    .await;
+}
+
+/// `fetchBodyCancel` on a read in flight ends it, and the read takes its
+/// tombstone with it; on a handle that is simply gone -- drained, or
+/// cancelled already -- it leaves nothing in the cancel state.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_leaves_no_tombstone_behind() {
+    within(async {
+        let (server, _go) = gated_server(b"never".to_vec(), None).await;
+        let reg = Reg::new();
+        let url = format!("http://127.0.0.1:{}/", server.port);
+        let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+        let handle = handle_of(&p);
+        let read = tokio::spawn({
+            let reg = reg.clone();
+            async move { reg.read(handle).await }
+        });
+        parked_read(&reg, handle).await;
+        body::cancel(&reg.bodies, &reg.cancelled, &reg.signal, handle);
+        assert!(matches!(read.await.unwrap(), OpOutcome::Done));
+        assert!(!reg.bodies.lock().unwrap().contains_key(&handle));
+        assert!(reg.cancelled.lock().unwrap().is_empty());
+        // No body and no read: nothing to mark.
+        body::cancel(&reg.bodies, &reg.cancelled, &reg.signal, handle);
+        body::cancel(&reg.bodies, &reg.cancelled, &reg.signal, handle + 1000);
         assert!(reg.cancelled.lock().unwrap().is_empty());
     })
     .await;
@@ -3559,10 +3618,7 @@ async fn the_sent_signal_fires_with_the_connection_and_never_without_one() {
 
         // Nothing listens: no connection, so no signal -- the wait ends when
         // the failed fetch drops its sender.
-        let closed = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        let closed = closed_port().await;
         let fetch = start(3, format!("http://127.0.0.1:{closed}/"));
         let waited = tokio::spawn(sent::wait(signals.clone(), 3));
         assert!(!matches!(fetch.await.unwrap(), OpOutcome::Json(_)));

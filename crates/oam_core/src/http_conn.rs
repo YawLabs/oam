@@ -328,11 +328,14 @@ pub struct ConnWatch {
     timer_changed: Notify,
     close: Mutex<Option<CloseReason>>,
     close_notify: Notify,
-    /// JS has run the connection's `'secureConnection'` listeners and the
-    /// connection may be served. Node attaches its HTTP parser to a TLS
-    /// connection only once those listeners have returned, so a listener
-    /// that destroys the socket stops the request reaching the handler;
-    /// this is where that verdict is handed back.
+    /// JS has run the listeners for what the connection was announced as
+    /// (`'connection'`, and then an https connection's
+    /// `'secureConnection'`) and the connection may go on. Node reads
+    /// nothing from a connection before its `'connection'` listeners have
+    /// returned, and attaches its HTTP parser to a TLS connection only once
+    /// the `'secureConnection'` ones have, so a listener that destroys the
+    /// socket stops the request reaching the handler; this is where that
+    /// verdict is handed back.
     resumed: AtomicBool,
     resume_notify: Notify,
     /// Woken when a request is dispatched or the one being received is all
@@ -450,6 +453,15 @@ impl ConnWatch {
         }
     }
 
+    /// The connection is not node's http side's yet: an https connection
+    /// from its accept, while its TLS handshake runs and its
+    /// `'secureConnection'` listeners decide. No request is being received
+    /// on it, so the headers / request check ([`ConnWatch::expire`]) passes
+    /// it over until [`ConnWatch::served_from_now`].
+    pub fn not_yet_served(&self) {
+        self.phase().active = false;
+    }
+
     /// node's http side has taken the connection over, and its timeouts
     /// start here. On an https connection that is the end of the handshake
     /// (where node attaches its parser, after `'secureConnection'`), not
@@ -460,14 +472,13 @@ impl ConnWatch {
     pub fn served_from_now(&self) {
         self.touch();
         let mut phase = self.phase();
+        // Receiving its first request from here (see `not_yet_served`).
+        phase.active = true;
         phase.message_start = Instant::now();
         phase.begun = false;
         phase.headers_complete = false;
     }
 
-    /// Bytes arrived. The first byte of a request starts its clock again
-    /// (node's `on_message_begin` resets the start the accept set), and the
-    /// first byte after a request was all in begins the next one.
     /// A read failed. A reset is kept (the first one) for the connection's
     /// close to report; hyper itself treats a reset between requests as the
     /// connection ending, and says nothing of it.
@@ -525,6 +536,9 @@ impl ConnWatch {
         }
     }
 
+    /// Bytes arrived. The first byte of a request starts its clock again
+    /// (node's `on_message_begin` resets the start the accept set), and the
+    /// first byte after a request was all in begins the next one.
     pub fn note_read(&self, n: usize) {
         if n == 0 {
             return;
@@ -670,6 +684,12 @@ impl ConnWatch {
         }
         phase.current_request = None;
         phase.response_started = false;
+        // A pipelined request whose first bytes were read while this
+        // response was in flight was not under the check until now (see
+        // `expire`); hyper starts on its head here, so its clock does too.
+        if phase.begun && !phase.headers_complete {
+            phase.message_start = Instant::now();
+        }
         let keep_alive = self.timeouts.keep_alive_ms();
         if keep_alive > 0 {
             phase.keep_alive_set = true;
@@ -774,6 +794,15 @@ impl ConnWatch {
     /// it is due, and then it is not checked again for this request. Like
     /// node's `ConnectionsList::Expired`, a headers timeout longer than the
     /// request timeout swaps with it.
+    ///
+    /// A request whose head is not in while a response is still in flight is
+    /// not checked. hyper reads the socket during a response, so a pipelined
+    /// request's first bytes are seen ([`ConnWatch::note_read`]), but it
+    /// does not parse that head until the response ends -- where node parses
+    /// it at once, and so never times it out. Checked from its first byte,
+    /// such a request would be due while it sat complete in hyper's buffer
+    /// behind a long response, and the connection would close under that
+    /// response. Its clock starts in [`ConnWatch::response_finished`].
     pub fn expire(&self, headers_ms: u64, request_ms: u64, now: Instant) -> bool {
         let (headers_ms, request_ms) = if request_ms > 0 && headers_ms > request_ms {
             (request_ms, headers_ms)
@@ -781,7 +810,7 @@ impl ConnWatch {
             (headers_ms, request_ms)
         };
         let mut phase = self.phase();
-        if !phase.active {
+        if !phase.active || (!phase.headers_complete && phase.in_flight > 0) {
             return false;
         }
         let elapsed = u64::try_from(
@@ -944,6 +973,22 @@ mod tests {
         ConnWatch::new(1, 1, ServerTimeouts::new(settings))
     }
 
+    /// A connection the http side has not taken yet (an https connection's
+    /// handshake) is never due, however long that takes; its clock starts
+    /// when it is served.
+    #[test]
+    fn a_connection_not_yet_served_is_not_checked() {
+        let w = watch(TimeoutSettings::default());
+        let accepted = w.phase().message_start;
+        w.not_yet_served();
+        assert!(!w.expire(1000, 2000, accepted + Duration::from_secs(3600)));
+        w.served_from_now();
+        let served = w.phase().message_start;
+        assert!(served >= accepted);
+        assert!(!w.expire(1000, 2000, served + Duration::from_millis(999)));
+        assert!(w.expire(1000, 2000, served + Duration::from_millis(1000)));
+    }
+
     /// A connection that sends nothing is due for headersTimeout from its
     /// accept; once its headers are in only requestTimeout applies, and a
     /// request whose body is in is never due.
@@ -980,6 +1025,7 @@ mod tests {
         w.message_complete(generation);
         assert!(!w.expire(1000, 2000, start + Duration::from_secs(60)));
         // The next request's first byte starts a new clock.
+        w.response_finished();
         w.note_read(1);
         let second = w.phase().message_start;
         assert!(second >= start);
@@ -993,6 +1039,36 @@ mod tests {
         let w = watch(TimeoutSettings::default());
         let start = w.phase().message_start;
         assert!(w.expire(2000, 1000, start + Duration::from_millis(1000)));
+    }
+
+    /// A pipelined request's bytes read while a response is in flight do not
+    /// put the connection under the check: hyper has not started on that
+    /// head, and node, which parses it at once, never times it out. The
+    /// request's clock starts when the response ends.
+    #[test]
+    fn a_pipelined_request_waits_for_the_response_before_its_clock_starts() {
+        let w = watch(TimeoutSettings::default());
+        w.note_read(10);
+        let generation = w.headers_complete(1);
+        w.message_complete(generation);
+        // The next request's bytes arrive under the response.
+        w.note_read(10);
+        let read_at = w.phase().message_start;
+        assert!(!w.expire(1000, 2000, read_at + Duration::from_secs(3600)));
+        assert!(w.phase().active, "and it is still to be checked");
+        std::thread::sleep(Duration::from_millis(20));
+        w.response_finished();
+        let start = w.phase().message_start;
+        assert!(start > read_at, "the clock starts with the response's end");
+        assert!(!w.expire(1000, 2000, start + Duration::from_millis(999)));
+        assert!(w.expire(1000, 2000, start + Duration::from_millis(1000)));
+        // A request whose head IS in stays under requestTimeout while its
+        // own response is in flight.
+        let w = watch(TimeoutSettings::default());
+        w.note_read(10);
+        let start = w.phase().message_start;
+        let _ = w.headers_complete(1);
+        assert!(w.expire(1000, 2000, start + Duration::from_millis(2000)));
     }
 
     /// The end of a body read late belongs to its own request: a request

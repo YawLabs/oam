@@ -111,6 +111,73 @@ fn undici_request_redirect_matrix() {
     }
 }
 
+/// `undici.request` follows by undici's RedirectHandler, which has none of
+/// fetch's own rules (measured on node v22.22.2 + undici 6.28.1): a Location
+/// on a port fetch blocks is dialled like any other, one with userinfo is
+/// followed without it, a `300` with a Location is followed too, and the
+/// count is `maxRedirections`, which the send loop applies before it asks
+/// -- so fetch's limit of 20 is not looked at here. A scheme that is not
+/// http(s) still stops it.
+#[test]
+fn undici_request_redirects_skip_the_checks_that_are_fetchs() {
+    let cur = url("http://a.test:8080/x");
+    let get = Method::GET;
+    for body in [RedirectBody::UndiciReplayable, RedirectBody::UndiciIterable] {
+        let next = |status: u16, location: &str, so_far: u32| {
+            redirect::next(status, &get, &cur, Some(&hv(location)), so_far, body)
+        };
+        let followed = |to: &str| Next::Follow {
+            url: url(to),
+            method: Method::GET,
+            drop_body: false,
+        };
+        assert_eq!(
+            next(302, "http://a.test:25/y", 0),
+            followed("http://a.test:25/y"),
+            "{body:?}"
+        );
+        assert_eq!(
+            next(302, "http://u:p@b.test/y?q=1", 0),
+            followed("http://b.test/y?q=1"),
+            "{body:?}"
+        );
+        assert_eq!(
+            next(302, "http://u@a.test:8080/y", 0),
+            followed("http://a.test:8080/y"),
+            "{body:?}"
+        );
+        assert_eq!(next(300, "/y", 0), followed("http://a.test:8080/y"));
+        assert_eq!(
+            next(302, "/y", MAX_REDIRECTS + 5),
+            followed("http://a.test:8080/y"),
+            "{body:?}"
+        );
+        assert_eq!(next(302, "ftp://a.test/y", 0), Next::Fail(BAD_SCHEME));
+        // A 300 without a Location, and a status that is no redirect.
+        assert_eq!(
+            redirect::next(300, &get, &cur, None, 0, body),
+            Next::Done,
+            "{body:?}"
+        );
+        assert_eq!(next(304, "/y", 0), Next::Done, "{body:?}");
+    }
+    // The same Locations on a fetch keep fetch's answers, and a fetch does
+    // not follow a 300.
+    assert_eq!(
+        follow(302, &get, cur.as_str(), "http://a.test:25/y", true),
+        Next::Fail(BAD_PORT)
+    );
+    assert_eq!(
+        follow(302, &get, cur.as_str(), "http://u:p@b.test/y", true),
+        Next::Fail(CREDENTIALS)
+    );
+    assert_eq!(follow(300, &get, cur.as_str(), "/y", true), Next::Done);
+    assert_eq!(
+        redirect::next(302, &get, &cur, Some(&hv("/y")), MAX_REDIRECTS, true),
+        Next::Fail(COUNT_EXCEEDED)
+    );
+}
+
 #[test]
 fn spot_checks_of_the_matrix() {
     // 301/302 rewrite POST only; PUT keeps its method (unlike reqwest, which
@@ -535,13 +602,17 @@ fn apply_same_origin_keeps_everything() {
         &url("http://a.test:80/y#f"),
         false,
     );
+    // Every header as it was, the caller's own `referer` among them: none
+    // is added, changed or dropped.
     assert_eq!(names(&h), names(&map(EVERYTHING)));
-    assert!(!h.contains_key("referer") || h["referer"] == "http://user-set.test/");
 }
 
 #[test]
 fn apply_drop_body_strips_request_body_headers_only() {
     let mut h = map(EVERYTHING);
+    // The framing oam sets for a streamed undici.request body goes with the
+    // body it framed.
+    h.append(http::header::TRANSFER_ENCODING, hv("chunked"));
     redirect::apply(
         &mut h,
         &url("http://a.test/x"),
@@ -554,6 +625,7 @@ fn apply_drop_body_strips_request_body_headers_only() {
         "content-encoding",
         "content-language",
         "content-location",
+        "transfer-encoding",
     ] {
         assert!(!h.contains_key(gone), "{gone}");
     }
@@ -707,6 +779,22 @@ fn a_fetch_cannot_follow_a_redirect_that_resends_its_streamed_body() {
             drop_body: true,
         }
     );
+    // A 303 answering a GET or a HEAD keeps the method and the body: a
+    // streamed one cannot go again, and a fetch's 3xx is never handed back.
+    for method in [Method::GET, Method::HEAD] {
+        assert_eq!(
+            redirect::next(
+                303,
+                &method,
+                &cur,
+                Some(&target),
+                0,
+                RedirectBody::StreamedFetch
+            ),
+            Next::Fail(STREAMED_BODY),
+            "303 {method}"
+        );
+    }
     assert_eq!(
         redirect::next(
             307,

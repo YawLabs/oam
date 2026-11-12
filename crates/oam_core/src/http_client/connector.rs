@@ -48,7 +48,6 @@ use super::BoxError;
 use super::prepare::host_for_connect;
 use super::tls_config::{self, Alpn, TlsConfigs, TlsRange};
 use crate::net_connect::{self, AttemptLog, ConnectOptions, Pin};
-use std::sync::atomic::AtomicU8;
 
 /// The byte stream under a connection: TCP, TLS over TCP, or TLS over a
 /// tunnel.
@@ -578,32 +577,20 @@ pub(crate) struct Shared {
     /// behind the transport's `Arc`.
     pub(crate) proxy: Option<Matcher>,
     pub(crate) user_agent: HeaderValue,
-    /// The TLS version range of the request being sent (`TlsRange::code`):
-    /// node's live `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION`, which
-    /// every send stores before its request goes out and the connector reads
-    /// at the handshake. Two concurrent requests
-    /// can only disagree while a default is being reassigned, a value that is
-    /// process-wide in node too; a pooled connection made under an earlier
-    /// value is reused, as node's undici reuses its own.
-    pub(crate) tls_range: AtomicU8,
 }
 
 impl Shared {
-    pub(crate) fn tls_range(&self) -> TlsRange {
-        TlsRange::from_code(self.tls_range.load(Ordering::Relaxed))
-    }
-
-    pub(crate) fn set_tls_range(&self, range: TlsRange) {
-        self.tls_range.store(range.code(), Ordering::Relaxed);
-    }
-
     /// The config offering `alpn` -- the request's offer for an origin
     /// handshake, [`Alpn::None`] for the handshake with an https proxy -- in
-    /// the range the request being sent asked for (`set_tls_range`).
-    async fn tls(&self, alpn: Alpn) -> Result<Arc<ClientConfig>, BoxError> {
+    /// `range`, the version range of the request the dial is made for
+    /// ([`DialParams::tls_range`]). The range travels with the dial, never
+    /// through this shared state: requests sharing a transport each handshake
+    /// in their own, whatever else is being sent at the time. A pooled
+    /// connection made under an earlier range is reused, as node's undici
+    /// reuses its own.
+    async fn tls(&self, alpn: Alpn, range: TlsRange) -> Result<Arc<ClientConfig>, BoxError> {
         let configs = match &self.tls {
             TlsSource::Platform => {
-                let range = self.tls_range();
                 if range == TlsRange::None {
                     return Err(Box::new(NoProtocolsAvailable));
                 }
@@ -771,6 +758,11 @@ pub(crate) struct DialParams {
     /// dns's result order as the request's caller read it, for a dial that
     /// resolves the host itself (`ConnectOptions::order`).
     pub(crate) dns_order: crate::dns::ResultOrder,
+    /// The TLS version range an https handshake of this dial runs in --
+    /// with the origin, and with an `https://` proxy on the way: node's live
+    /// `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION` as the request's
+    /// caller resolved them.
+    pub(crate) tls_range: TlsRange,
 }
 
 /// A lookup-hooked connector was asked to open a connection to a host NAME
@@ -1017,6 +1009,7 @@ impl OamConnector {
         let https = dst.scheme_str() == Some("https");
         let host = host_for_connect(&dst).ok_or("request url has no host")?;
         let port = dst.port_u16().unwrap_or(if https { 443 } else { 80 });
+        let tls_range = params.tls_range;
         let mut gate = None;
         let opts = match &self.via {
             Via::Supplied { conns } => return supplied(conns, &dst),
@@ -1024,14 +1017,7 @@ impl OamConnector {
                 if let Some(intercept) = self.shared.proxy.as_ref().and_then(|m| m.intercept(&dst))
                 {
                     return self
-                        .through_proxy(
-                            dst,
-                            &host,
-                            intercept,
-                            alpn,
-                            params.attempt_timeout,
-                            params.dns_order,
-                        )
+                        .through_proxy(dst, &host, intercept, alpn, &params)
                         .await;
                 }
                 ConnectOptions {
@@ -1082,7 +1068,7 @@ impl OamConnector {
         let Some(name) = name else {
             return Ok(OamConn::new(Box::new(tcp), false, false, info));
         };
-        let config = self.shared.tls(alpn).await?;
+        let config = self.shared.tls(alpn, tls_range).await?;
         let (tls, h2) = tls_handshake(config, name, tcp).await?;
         let info = info.with_tls(tls.get_ref().1);
         Ok(OamConn::new_tls(tls, h2, info))
@@ -1094,8 +1080,7 @@ impl OamConnector {
         host: &str,
         intercept: Intercept,
         alpn: Alpn,
-        attempt_timeout: Duration,
-        dns_order: crate::dns::ResultOrder,
+        params: &DialParams,
     ) -> Result<OamConn, BoxError> {
         if !matches!(intercept.uri().scheme_str(), Some("http" | "https")) {
             return Err(format!(
@@ -1106,8 +1091,9 @@ impl OamConnector {
         }
         let mut transport = ProxyTransport {
             shared: self.shared.clone(),
-            attempt_timeout,
-            dns_order,
+            attempt_timeout: params.attempt_timeout,
+            dns_order: params.dns_order,
+            tls_range: params.tls_range,
         };
         if dst.scheme_str() != Some("https") {
             let mut conn = transport.call(intercept.uri().clone()).await?;
@@ -1125,7 +1111,7 @@ impl OamConnector {
         let tunneled = tunnel.call(dst).await?;
         // The TCP endpoints are the proxy's; the TLS session is the origin's.
         let endpoints = tunneled.info.clone();
-        let config = self.shared.tls(alpn).await?;
+        let config = self.shared.tls(alpn, params.tls_range).await?;
         let (tls, h2) = tls_handshake(config, name, TokioIo::new(tunneled)).await?;
         let info = endpoints.with_tls(tls.get_ref().1);
         Ok(OamConn::new_tls(tls, h2, info))
@@ -1162,6 +1148,9 @@ pub(crate) struct ProxyTransport {
     /// dns's result order for the proxy's own lookup (node's ProxyAgent
     /// connects to the proxy through net).
     pub(crate) dns_order: crate::dns::ResultOrder,
+    /// The version range of the handshake with an `https://` proxy: the
+    /// request's own ([`DialParams::tls_range`]).
+    pub(crate) tls_range: TlsRange,
 }
 
 impl Service<Uri> for ProxyTransport {
@@ -1201,7 +1190,7 @@ impl Service<Uri> for ProxyTransport {
             // No ALPN towards the proxy: what goes through it is an
             // http/1.1 CONNECT or an absolute-form request, which h2 cannot
             // carry. (reqwest offered h2 here for an http destination.)
-            let config = this.shared.tls(Alpn::None).await?;
+            let config = this.shared.tls(Alpn::None, this.tls_range).await?;
             let (tls, _) = tls_handshake(config, name, tcp).await?;
             Ok(OamConn::new_tls(tls, false, info))
         })
@@ -1594,7 +1583,6 @@ mod tests {
             tls: TlsSource::Unavailable("test".to_string()),
             proxy,
             user_agent: HeaderValue::from_static("oam/test"),
-            tls_range: AtomicU8::new(TlsRange::Both.code()),
         })
     }
 
@@ -1741,10 +1729,46 @@ mod tests {
             shared: shared(Some(rules)),
             attempt_timeout: Duration::from_millis(250),
             dns_order: crate::dns::ResultOrder::Verbatim,
+            tls_range: TlsRange::Both,
         };
         let uri: Uri = format!("http://127.0.0.1:{port}/").parse().unwrap();
         let conn = transport.call(uri).await.unwrap();
         assert!(!conn.proxied && !conn.h2);
+        accept.await.unwrap().unwrap();
+    }
+
+    /// The version range of an https handshake is the dial's own
+    /// (`DialParams::tls_range`): a dial whose range holds no version is
+    /// refused at the handshake, whatever range the transport's other
+    /// requests carry -- nothing about it is read from the shared state.
+    #[tokio::test]
+    async fn the_handshake_runs_in_the_range_the_dial_carries() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+        let connector = OamConnector {
+            shared: Arc::new(Shared {
+                tls: TlsSource::Platform,
+                proxy: None,
+                user_agent: HeaderValue::from_static("oam/test"),
+            }),
+            via: Via::Pooled,
+        };
+        let uri: Uri = format!("https://127.0.0.1:{port}/").parse().unwrap();
+        let params = DialParams {
+            attempt_timeout: Duration::from_millis(250),
+            pin: None,
+            dns_order: crate::dns::ResultOrder::Verbatim,
+            tls_range: TlsRange::None,
+        };
+        let err = match connector.connect(uri, Alpn::Http1, params).await {
+            Ok(_) => panic!("handshook in a range with no version in it"),
+            Err(e) => e,
+        };
+        assert!(
+            err.downcast_ref::<NoProtocolsAvailable>().is_some(),
+            "{err}"
+        );
         accept.await.unwrap().unwrap();
     }
 
@@ -1773,12 +1797,14 @@ mod tests {
                 gate: None,
             }),
             dns_order: crate::dns::ResultOrder::Verbatim,
+            tls_range: TlsRange::Both,
         };
         for dial in [
             DialParams {
                 attempt_timeout: Duration::from_millis(250),
                 pin: None,
                 dns_order: crate::dns::ResultOrder::Verbatim,
+                tls_range: TlsRange::Both,
             },
             elsewhere("localhost:2"),
             elsewhere("other.test:1"),

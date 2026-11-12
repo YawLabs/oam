@@ -81,6 +81,9 @@ pub enum RedirectBody {
 
 impl From<bool> for RedirectBody {
     /// `true`: [`RedirectBody::Replayable`]; `false`: [`RedirectBody::Streamed`].
+    /// A shorthand for the tests (`tests/http_client_redirect.rs`), which
+    /// mostly ask about a fetch's replayable body; the send loop names the
+    /// variant.
     fn from(replayable: bool) -> RedirectBody {
         if replayable {
             RedirectBody::Replayable
@@ -122,9 +125,18 @@ pub enum Next {
     InvalidLocation { input: String },
 }
 
-/// True for the statuses undici follows (constants.js:8).
+/// True for the statuses undici's fetch follows (constants.js:8).
 pub fn is_redirect_status(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+/// True for the statuses followed under `rules`: fetch's five, and under
+/// undici's RedirectHandler a 300 too (redirect-handler.js
+/// `redirectableStatusCodes`; measured on node v22.22.2 + undici 6.28.1,
+/// where `undici.request` with `maxRedirections` follows a `300` with a
+/// Location, method and body kept).
+pub fn follows_status(status: u16, rules: Rules) -> bool {
+    is_redirect_status(status) || (rules == Rules::Undici && status == 300)
 }
 
 /// The Location value undici reads: `headersList.get('location', true)` joins
@@ -148,12 +160,27 @@ pub fn location(headers: &HeaderMap) -> Option<HeaderValue> {
 /// Decide the next step for a response with `status` to a request with
 /// `method` for `current`. `location` is [`location`]'s value;
 /// `redirects_so_far` counts the redirects already followed for this fetch;
-/// `body` says whether the request's body can be sent again (a bool: `true`
-/// for none or a buffered one).
+/// `body` is the request's body as a redirect sees it ([`RedirectBody`]):
+/// whether it can be sent again, and whose rules the request follows by --
+/// fetch's, or undici's RedirectHandler for `undici.request`.
 ///
-/// The checks run in undici's order: Location parse, scheme, count,
+/// A fetch's checks run in undici's order: Location parse, scheme, count,
 /// credentials, a fetch's streamed body, then the method/body rewrite, and
 /// last the bad-port check `mainFetch` runs on the new URL before it dials.
+///
+/// `undici.request` ([`RedirectBody::UndiciReplayable`] and
+/// [`RedirectBody::UndiciIterable`]) gets the Location parse, the scheme
+/// check and the RedirectHandler's rewrite, and none of fetch's own rules
+/// (measured on node v22.22.2 + undici 6.28.1):
+///
+/// - no count here: the RedirectHandler follows `maxRedirections` redirects
+///   and hands the next 3xx back as the response, which the caller does
+///   before it asks (`send.rs`), so `redirects_so_far` is not looked at;
+/// - a Location with userinfo is followed, without the userinfo: the next
+///   request goes to the Location's `origin` and path, and no
+///   `authorization` is made of it;
+/// - no bad-port block, on a hop as on the first request: the port is
+///   dialled like any other.
 pub fn next(
     status: u16,
     method: &http::Method,
@@ -163,7 +190,15 @@ pub fn next(
     body: impl Into<RedirectBody>,
 ) -> Next {
     let body = body.into();
-    if !is_redirect_status(status) {
+    let rules = if matches!(
+        body,
+        RedirectBody::UndiciReplayable | RedirectBody::UndiciIterable
+    ) {
+        Rules::Undici
+    } else {
+        Rules::Fetch
+    };
+    if !follows_status(status, rules) {
         return Next::Done;
     }
     let Some(location) = location else {
@@ -181,11 +216,23 @@ pub fn next(
     if !matches!(target.scheme(), "http" | "https") {
         return Next::Fail(BAD_SCHEME);
     }
-    if redirects_so_far >= MAX_REDIRECTS {
-        return Next::Fail(COUNT_EXCEEDED);
-    }
-    if !target.username().is_empty() || target.password().is_some() {
-        return Next::Fail(CREDENTIALS);
+    match rules {
+        Rules::Fetch => {
+            if redirects_so_far >= MAX_REDIRECTS {
+                return Next::Fail(COUNT_EXCEEDED);
+            }
+            if !target.username().is_empty() || target.password().is_some() {
+                return Next::Fail(CREDENTIALS);
+            }
+        }
+        // undici's RedirectHandler keeps the Location's `origin` and path,
+        // which leaves its userinfo behind; fetch's count and its "cors"
+        // credentials rule are not its own (see the doc above).
+        Rules::Undici => {
+            // Neither can fail: an http(s) URL has a host.
+            let _ = target.set_username("");
+            let _ = target.set_password(None);
+        }
     }
     // util.js responseLocationURL step 4: a Location without a fragment (or
     // with an empty one -- `URL.hash` is "" for both) takes the current URL's.
@@ -198,22 +245,20 @@ pub fn next(
     if body == RedirectBody::StreamedFetch && status != 303 {
         return Next::Fail(STREAMED_BODY);
     }
-    let rules = if matches!(
-        body,
-        RedirectBody::UndiciReplayable | RedirectBody::UndiciIterable
-    ) {
-        Rules::Undici
-    } else {
-        Rules::Fetch
-    };
     let rewrite = rewrites_to_get(status, method, rules);
+    // What is left of a fetch's streamed body here is a 303 answering a GET
+    // or a HEAD, which keeps its method and would send the body again. No
+    // fetch gets here -- a GET or HEAD request takes no body -- and a body
+    // already read cannot be sent twice, so it fails as the other statuses
+    // do, never as [`Next::ReturnResponse`] (which is not a fetch's).
     if !rewrite && body == RedirectBody::StreamedFetch {
-        return Next::ReturnResponse;
+        return Next::Fail(STREAMED_BODY);
     }
     // fetch/index.js:1351 hands the hop to `mainFetch`, whose first network
     // decision is the bad-port block (index.js:541-543): the fetch fails
-    // before the next request is sent.
-    if is_bad_port(&target) {
+    // before the next request is sent. A fetch's alone: `undici.request`
+    // has no such block on its first request (`send::fetch`) or on a hop.
+    if rules == Rules::Fetch && is_bad_port(&target) {
         return Next::Fail(BAD_PORT);
     }
     if rewrite {

@@ -219,6 +219,15 @@ pub struct RawChild {
     kill_signal: Option<String>,
 }
 
+impl RawChild {
+    /// Whether `pid` still names this child: false once `raw_wait` has
+    /// collected the exit and closed the process handle, after which the
+    /// system may give the pid to another process.
+    pub fn owns_pid(&self) -> bool {
+        self.process.is_some()
+    }
+}
+
 pub type RawChildRegistry = Arc<Mutex<HashMap<u64, RawChild>>>;
 
 /// `GetFileType`: what kind of object a handle names -- a pipe (or socket), a
@@ -347,8 +356,9 @@ fn open_nul() -> HANDLE {
     let name = to_wide("NUL");
     // SAFETY: `name` is a NUL-terminated UTF-16 buffer that outlives the call and
     // `&sa` points to the live SECURITY_ATTRIBUTES above; the remaining arguments
-    // are constants or null. The returned HANDLE (or INVALID_HANDLE_VALUE on
-    // failure) is checked by the caller.
+    // are constants or null. The returned HANDLE is INVALID_HANDLE_VALUE on
+    // failure, which the one caller (`spawn_extra`'s `Ignore` arm) checks
+    // before it uses or closes it.
     unsafe {
         CreateFileW(
             name.as_ptr(),
@@ -386,6 +396,62 @@ pub fn spawn_extra(
     windows_hide: bool,
     argv0: Option<&str>,
 ) -> Result<RawChild, String> {
+    spawn_extra_with(
+        command,
+        args,
+        cwd,
+        env,
+        stdio,
+        detached,
+        windows_hide,
+        argv0,
+        false,
+    )
+}
+
+/// `spawn_extra` with the command line taken as written: every token is
+/// joined by one space and nothing is quoted, node's
+/// `windowsVerbatimArguments`. This is the form a `shell: true` spawn needs
+/// (`child::shell_command`): cmd.exe parses its own quoting, and escaping the
+/// `"<command>"` token by the CRT's rules hands it a command it cannot read.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_extra_verbatim(
+    command: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    env: Option<&[(String, String)]>,
+    stdio: &[StdioFd],
+    detached: bool,
+    windows_hide: bool,
+    argv0: Option<&str>,
+) -> Result<RawChild, String> {
+    spawn_extra_with(
+        command,
+        args,
+        cwd,
+        env,
+        stdio,
+        detached,
+        windows_hide,
+        argv0,
+        true,
+    )
+}
+
+/// The one body behind `spawn_extra` and `spawn_extra_verbatim`;
+/// `verbatim_args` picks how the command line is assembled.
+#[allow(clippy::too_many_arguments)]
+fn spawn_extra_with(
+    command: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    env: Option<&[(String, String)]>,
+    stdio: &[StdioFd],
+    detached: bool,
+    windows_hide: bool,
+    argv0: Option<&str>,
+    verbatim_args: bool,
+) -> Result<RawChild, String> {
     // Same program search as the std-backed spawns (see child.rs).
     let resolved = match super::child::resolve_windows_program(command, cwd) {
         Ok(resolved) => resolved,
@@ -406,7 +472,16 @@ pub fn spawn_extra(
                 .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
                 .map(|(_, v)| v.as_str())
         });
-        match super::child::resolve_program_path(command, cwd, child_path) {
+        // No PATH in the child's environment (or no `env` at all, the child
+        // inheriting this process's): libuv's uv_spawn then searches this
+        // process's own PATH, so a bare `cmd.exe` is still found.
+        let own_path = if child_path.is_none() {
+            std::env::var("PATH").ok()
+        } else {
+            None
+        };
+        let search_path = child_path.or(own_path.as_deref());
+        match super::child::resolve_program_path(command, cwd, search_path) {
             Ok(path) => Some(path),
             Err(e) => return Err(super::child::spawn_failure_json(&e)),
         }
@@ -454,6 +529,14 @@ pub fn spawn_extra(
             match spec {
                 StdioFd::Ignore => {
                     let nul = open_nul();
+                    // The check `open_nul` leaves to its caller: a failed open
+                    // must not go into the child's fd table, nor be closed
+                    // later as though it were a handle of ours.
+                    if nul == INVALID_HANDLE_VALUE {
+                        let err = GetLastError();
+                        cleanup_fail(&child_close, &nul_handles);
+                        return Err(format!("CreateFileW(NUL) for fd{fd} failed: {err}"));
+                    }
                     nul_handles.push(nul);
                     child_handles.push(nul);
                 }
@@ -657,11 +740,21 @@ pub fn spawn_extra(
         // Command line. On Windows the first token of lpCommandLine IS argv0,
         // so we use argv0 (when given) as the first quoted token instead of the
         // program name node's CreateProcessW call would get from its first arg.
+        // Verbatim (a shell spawn): the tokens as written, as libuv joins
+        // them under UV_PROCESS_WINDOWS_VERBATIM_ARGUMENTS.
         let mut cmdline = String::new();
-        append_quoted(argv0.unwrap_or(command), &mut cmdline);
+        if verbatim_args {
+            cmdline.push_str(argv0.unwrap_or(command));
+        } else {
+            append_quoted(argv0.unwrap_or(command), &mut cmdline);
+        }
         for a in args {
             cmdline.push(' ');
-            append_quoted(a, &mut cmdline);
+            if verbatim_args {
+                cmdline.push_str(a);
+            } else {
+                append_quoted(a, &mut cmdline);
+            }
         }
         let mut cmd_w = to_wide(&cmdline);
 
@@ -767,11 +860,12 @@ pub fn spawn_extra(
 /// Synchronous drain + wait for a child `spawn_extra` created for the argv0
 /// path of `spawnSync`. std's blocking `Child` cannot set the raw command line
 /// an argv0 needs, so that path runs the same spawn the async path uses and
-/// waits here, mirroring `child::spawn_sync`'s contract: each piped stream is
-/// drained to EOF on its own thread (so a child that fills a pipe cannot
-/// deadlock against our wait), a non-zero `timeout_ms` kills and reaps the
-/// child and reports ETIMEDOUT, and output past `max_buffer` reports ENOBUFS
-/// with a null status.
+/// waits here, mirroring `child::spawn_sync`'s contract: `input` is written
+/// and each piped stream drained on its own thread (so a child that fills a
+/// pipe, or answers while it reads, cannot deadlock against our wait), stdin
+/// is closed after the input, a non-zero `timeout_ms` or output past
+/// `max_buffer` ends and reaps the child and reports ETIMEDOUT / ENOBUFS, and
+/// neither waits for a pipe another process still holds open.
 #[allow(clippy::too_many_arguments)]
 pub fn drain_sync(
     mut child: RawChild,
@@ -780,133 +874,189 @@ pub fn drain_sync(
     timeout_ms: u64,
     max_buffer: usize,
 ) -> super::child::SpawnSyncResult {
-    use super::child::{SpawnSyncError, SpawnSyncResult};
+    use super::child::{
+        PipesEnded, SYNC_KILL_PIPE_GRACE, SpawnSyncError, SpawnSyncResult, await_sync_pipes,
+        drain_capped, take_sink,
+    };
     const WAIT_TIMEOUT: u32 = 0x102;
 
     let pid = child.pid;
-    // Node's spawnSync only feeds `input` into a slot typed 'pipe': writing it
-    // to a slot the caller made 'ignore'/'inherit' would put bytes on a device
-    // node leaves alone, and the child would read them where node reads EOF.
-    // The dup is a plain blocking write under the registry lock -- the child
-    // is not running its read loop yet, and stdin's EOF closes the end.
-    if let Some(data) = input
-        && let Some(FdEnd::Write(slot)) = child.fds.get_mut(&0)
-        && let Some(h) = slot.take()
-    {
-        let long_lived = !data.is_empty();
-        let mut off = 0usize;
-        while off < data.len() {
-            let mut written: u32 = 0;
-            // SAFETY: `h` is the open write handle this call owns; the
-            // pointer/length are the head of the still-live `data` slice
-            // and `written` is a live out-param.
-            let ok = unsafe {
-                WriteFile(
-                    h.as_raw_handle(),
-                    data[off..].as_ptr(),
-                    (data.len() - off) as u32,
-                    &mut written,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 || written == 0 {
-                break;
+    let Some(h) = child.process.take().map(|SendHandle(h)| h) else {
+        return SpawnSyncResult {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            status: None,
+            signal: None,
+            pid,
+            error: Some(SpawnSyncError {
+                code: "UNKNOWN".to_string(),
+                errno: None,
+                message: "spawn child had no process handle".to_string(),
+                win_error: None,
+            }),
+        };
+    };
+
+    // stdin's write end ALWAYS leaves this function's hands, as
+    // `child::spawn_sync` always drops its `ChildStdin`: with no input it
+    // closes now, and with input it closes when the write below is done, as
+    // node shuts the pipe down after writing `input`. Left open -- it used to
+    // stay in `child.fds` for the whole wait -- a child that reads stdin to
+    // EOF never finished.
+    //
+    // Node's spawnSync only feeds `input` into a slot typed 'pipe': a slot the
+    // caller made 'ignore'/'inherit' has no write end here, so nothing is
+    // written to a device node leaves alone.
+    //
+    // The write runs on its OWN thread, alongside the drains below: writing
+    // it here first blocked forever against a child that answers while it
+    // reads, once the input outgrew the pipe buffers. The thread is not
+    // joined: it ends when the write completes or the read end goes away.
+    if let Some(FdEnd::Write(Some(stdin))) = child.fds.remove(&0) {
+        match input {
+            Some(data) if !data.is_empty() => {
+                let data = data.to_vec();
+                std::thread::spawn(move || {
+                    use std::io::Write;
+                    let mut pipe = std::fs::File::from(stdin);
+                    let _ = pipe.write_all(&data);
+                    // `pipe` drops here: the child reads EOF after the input.
+                });
             }
-            off += written as usize;
+            // Dropping the end closes the pipe: the child reads EOF.
+            _ => drop(stdin),
         }
-        if long_lived {
-            // The pipe is empty and the child drains what it needs as
-            // it reads; keep the write end open (node does not close
-            // stdin just because `input` was set).
-            *slot = Some(h);
-        }
-        // else: `h` dropped here closes the pipe -> the child sees EOF.
     }
 
-    // Take the read ends out so a thread can drain each to EOF; the child's
-    // death -- or every write end closing -- ends the read.
+    // Take the read ends out so a thread can drain each: to EOF (the child's
+    // death, or every write end closing), or until it holds more than
+    // `max_buffer` (`child::drain_capped`). Each end is shared with its drain
+    // so a read still blocked when the child has been ended can be cancelled.
     let take_read = |child: &mut RawChild, fd: u32| match child.fds.remove(&fd) {
         Some(FdEnd::Read(end)) => Some(end),
         _ => None,
     };
     let out_end = take_read(&mut child, 1);
     let err_end = take_read(&mut child, 2);
-    let drain = |end: Option<Arc<ReadEnd>>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(end) = end {
-                // A read returns at EOF (the child's write ends all closed).
-                while let Ok(Some(bytes)) = end.read_blocking() {
-                    buf.extend_from_slice(&bytes);
-                }
-            }
-            buf
-        })
+    let reader = |end: &Option<Arc<ReadEnd>>| {
+        end.clone()
+            .map(|end| move || end.read_blocking().ok().flatten())
     };
-    let out_thread = drain(out_end);
-    let err_thread = drain(err_end);
+    let (events, pipe_events) = std::sync::mpsc::channel();
+    let stdout_sink = drain_capped(reader(&out_end), max_buffer, events.clone());
+    let stderr_sink = drain_capped(reader(&err_end), max_buffer, events);
 
-    let mut hp = child.process.take().map(|SendHandle(h)| h);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(1));
-    let mut timed_out = false;
+    let wait_for = |ms: u32| -> u32 {
+        // SAFETY: `h` is the process handle this call took out of `child` and
+        // closes only at the end of this function, so it is open here;
+        // WaitForSingleObject only blocks on it and touches no memory of ours.
+        unsafe { WaitForSingleObject(h, ms) }
+    };
+    let exit_code_now = || -> i32 {
+        let mut code: u32 = 0;
+        // SAFETY: `h` is the same open process handle, of a process that has
+        // exited; `code` is a live out-param the call writes.
+        unsafe { GetExitCodeProcess(h, &mut code) };
+        code as i32
+    };
+
+    let deadline = (timeout_ms > 0)
+        .then(|| std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
+    let mut open_pipes = 2usize;
+    // The synthetic failure that ended the wait before a plain exit, if any.
+    let mut cut_short: Option<&'static str> = None;
     let mut wait_err: Option<String> = None;
     let mut exit_code: Option<i32> = None;
-    loop {
-        let Some(h) = hp else {
-            wait_err = Some("spawn child had no process handle".to_string());
-            break;
-        };
-        // SAFETY: h is the live process handle this call owns.
-        let state = unsafe { WaitForSingleObject(h, 0) };
-        if state == WAIT_OBJECT_0 {
-            let mut code: u32 = 0;
-            // SAFETY: h is the live (now-exited) process handle; `code` is a
-            // live out-param the call writes.
-            unsafe { GetExitCodeProcess(h, &mut code) };
-            exit_code = Some(code as i32);
-            break;
+    // As node's sync spawn: first every piped stream to its end (a grandchild
+    // holding a write end keeps it open), then the exit itself.
+    match await_sync_pipes(&pipe_events, &mut open_pipes, deadline) {
+        // The hold is let go at once: `out_end` / `err_end` keep the read end
+        // open here until the child has been ended.
+        PipesEnded::Overflow(_) => cut_short = Some("ENOBUFS"),
+        PipesEnded::TimedOut => cut_short = Some("ETIMEDOUT"),
+        PipesEnded::AllEof => {
+            let ms = match deadline {
+                None => INFINITE,
+                Some(deadline) => {
+                    let left = deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_millis();
+                    // Rounded up, and never INFINITE by accident.
+                    u32::try_from(left)
+                        .unwrap_or(u32::MAX)
+                        .saturating_add(1)
+                        .min(INFINITE - 1)
+                }
+            };
+            let state = wait_for(ms);
+            if state == WAIT_OBJECT_0 {
+                exit_code = Some(exit_code_now());
+            } else if state == WAIT_TIMEOUT {
+                cut_short = Some("ETIMEDOUT");
+            } else {
+                wait_err = Some(format!("WaitForSingleObject: {state}"));
+            }
         }
-        if state != WAIT_TIMEOUT {
-            wait_err = Some(format!("WaitForSingleObject: {state}"));
-            break;
-        }
-        if timeout_ms > 0 && std::time::Instant::now() >= deadline {
-            // SAFETY: h is the live process handle this call owns; TerminateProcess
-            // takes it by value and touches no memory of ours.
+    }
+
+    // A deadline or an overflow ends the child, as node does. One that had
+    // already exited by itself (a grandchild kept the pipes open, or it
+    // finished just as the limit was crossed) keeps its own exit code: it was
+    // never terminated.
+    let mut killed = false;
+    if cut_short.is_some() {
+        if wait_for(0) == WAIT_OBJECT_0 {
+            exit_code = Some(exit_code_now());
+        } else {
+            // SAFETY: `h` is the open process handle this call owns;
+            // TerminateProcess takes it by value and touches no memory of ours.
             unsafe { TerminateProcess(h, 1) };
-            // Reap it so the timeout path leaves no zombie.
-            // SAFETY: h is the same live process handle, now terminating;
-            // WaitForSingleObject only blocks on it and touches no memory.
-            unsafe { WaitForSingleObject(h, INFINITE) };
-            timed_out = true;
-            break;
+            // Reap it, so this path leaves no zombie.
+            wait_for(INFINITE);
+            killed = true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        // The pipes close with the child unless something else holds a write
+        // end. That is not waited for past a short grace: node closes its own
+        // ends at this point, and joining the drains here kept spawnSync
+        // blocked for as long as a grandchild lived. A drain still blocked
+        // after the grace is cancelled, so no thread outlives this call by
+        // more than its current read.
+        let _ = await_sync_pipes(
+            &pipe_events,
+            &mut open_pipes,
+            Some(std::time::Instant::now() + SYNC_KILL_PIPE_GRACE),
+        );
+        for end in [&out_end, &err_end].into_iter().flatten() {
+            end.close();
+        }
     }
-    if let Some(h) = hp.take() {
-        // SAFETY: the handle was taken out of `hp` above, so this call is its
-        // sole owner and closes it once.
-        unsafe { CloseHandle(h) };
-    }
+    // SAFETY: `h` was taken out of `child` at the top, so this function is its
+    // sole owner; nothing uses it after this, and it is closed once.
+    unsafe { CloseHandle(h) };
 
-    // The child is gone (or its write ends closed), so both joins end now.
-    let mut stdout = out_thread.join().unwrap_or_default();
-    let mut stderr = err_thread.join().unwrap_or_default();
+    let mut stdout = take_sink(&stdout_sink);
+    let mut stderr = take_sink(&stderr_sink);
 
-    if timed_out {
-        // node hands back whatever the child emitted before the deadline.
+    if let Some(code) = cut_short {
+        // node hands back whatever the child emitted before it was ended; the
+        // retained length is read-granularity dependent there too.
         stdout.truncate(max_buffer);
         stderr.truncate(max_buffer);
+        let message = if code == "ETIMEDOUT" {
+            format!("spawnSync timed out after {timeout_ms}ms")
+        } else {
+            format!("spawnSync {command} {code}")
+        };
         return SpawnSyncResult {
             stdout,
             stderr,
-            status: None,
-            signal: Some("SIGTERM".to_string()),
+            status: if killed { None } else { exit_code },
+            signal: killed.then(|| "SIGTERM".to_string()),
             pid,
             error: Some(SpawnSyncError {
-                code: "ETIMEDOUT".to_string(),
-                errno: super::child::synthetic_spawn_errno("ETIMEDOUT"),
-                message: format!("spawnSync timed out after {timeout_ms}ms"),
+                code: code.to_string(),
+                errno: super::child::synthetic_spawn_errno(code),
+                message,
                 win_error: None,
             }),
         };
@@ -927,25 +1077,8 @@ pub fn drain_sync(
             }),
         };
     }
-    // Blowing maxBuffer is ENOBUFS with a null status, as child::spawn_sync.
-    let overflowed = stdout.len() > max_buffer || stderr.len() > max_buffer;
-    stdout.truncate(max_buffer);
-    stderr.truncate(max_buffer);
-    if overflowed {
-        return SpawnSyncResult {
-            stdout,
-            stderr,
-            status: None,
-            signal: Some("SIGTERM".to_string()),
-            pid,
-            error: Some(SpawnSyncError {
-                code: "ENOBUFS".to_string(),
-                errno: super::child::synthetic_spawn_errno("ENOBUFS"),
-                message: format!("spawnSync {command} ENOBUFS"),
-                win_error: None,
-            }),
-        };
-    }
+    // Blowing maxBuffer never gets here: a drain that crosses the limit
+    // reports it while the child still runs (`cut_short` above).
     SpawnSyncResult {
         stdout,
         stderr,
@@ -974,8 +1107,42 @@ pub fn spawn_sync_argv0(
     timeout_ms: u64,
     max_buffer: usize,
 ) -> super::child::SpawnSyncResult {
+    spawn_sync_argv0_with(
+        command,
+        args,
+        cwd,
+        env,
+        input,
+        stdio,
+        detached,
+        windows_hide,
+        argv0,
+        timeout_ms,
+        max_buffer,
+        false,
+    )
+}
+
+/// `spawn_sync_argv0` with the choice of command-line form: `verbatim_args`
+/// is `spawn_extra_verbatim`'s, for a `shell: true` spawn whose command and
+/// arguments `child::shell_command` has already rewritten.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_sync_argv0_with(
+    command: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    env: Option<&[(String, String)]>,
+    input: Option<&[u8]>,
+    stdio: &[StdioFd],
+    detached: bool,
+    windows_hide: bool,
+    argv0: Option<&str>,
+    timeout_ms: u64,
+    max_buffer: usize,
+    verbatim_args: bool,
+) -> super::child::SpawnSyncResult {
     use super::child::{SpawnSyncError, SpawnSyncResult};
-    match spawn_extra(
+    match spawn_extra_with(
         command,
         args,
         cwd,
@@ -984,6 +1151,7 @@ pub fn spawn_sync_argv0(
         detached,
         windows_hide,
         argv0,
+        verbatim_args,
     ) {
         Ok(child) => drain_sync(child, command, input, timeout_ms, max_buffer),
         Err(msg) => {
@@ -1169,8 +1337,10 @@ pub fn raw_kill(reg: &RawChildRegistry, id: u64, signal: Option<String>) {
     }
 }
 
-/// Wait for exit; returns Node-shaped {code, signal}. Closes all remaining
-/// handles and drops the registry entry.
+/// Wait for exit; returns Node-shaped {code, signal}. Closes the process
+/// handle and the parent's WRITE ends; the read ends stay until their readers
+/// reach EOF (or the caller closes them), and the registry entry goes with the
+/// last one (`retire_read_end` / `raw_close_fd`), or here when none is left.
 pub async fn raw_wait(reg: RawChildRegistry, id: u64) -> OpOutcome {
     let process = {
         let guard = reg.lock().unwrap_or_else(|e| e.into_inner());

@@ -159,6 +159,75 @@ try {
 } catch (e) {
   show("matchesGlob bad arg", { code: e.code, name: e.name });
 }
+// --- matchesGlob: a globstar matches ZERO or more directories, only when
+// `**` is a whole segment, and a brace alternative may span segments.
+// posix.matchesGlob so the table reads the same on every host.
+for (const [candidate, pattern] of [
+  ["foo.js", "**/*.js"], ["a/b/foo.js", "**/*.js"], ["foo.ts", "**/*.js"],
+  ["a/b", "a/**/b"], ["a/x/y/b", "a/**/b"], ["ab", "a/**/b"], ["a/xb", "a/**/b"], ["xa/b", "a/**/b"],
+  ["a", "a/**"], ["a/", "a/**"], ["a/b/c", "a/**"], ["ab", "a/**"],
+  ["a/b", "**"], ["", "**"],
+  ["node_modules/x/y.js", "**/node_modules/**"], ["a/node_modules/x", "**/node_modules/**"],
+  ["node_modules", "**/node_modules/**"], ["xnode_modules/y", "**/node_modules/**"],
+  ["src/a/x.ts", "{src/a,lib}/*.ts"], ["lib/x.ts", "{src/a,lib}/*.ts"], ["src/x.ts", "{src/a,lib}/*.ts"],
+  ["a/b/c", "a/{b/c,d}"], ["a/d", "a/{b/c,d}"], ["a/b", "a/{b/c,d}"],
+  ["a/c/d", "a/**/c/**/d"], ["a/c/x/d", "a/**/c/**/d"], ["a/d", "a/**/c/**/d"],
+  ["axb", "a**b"], ["a/b", "a**b"], ["ax/yb", "a**b"], ["a/xb", "a/**b"], ["a/x/b", "a/**b"], ["a/b/x", "a/b**"],
+  ["b", "**/**/b"], ["x/y/b", "**/**/b"], ["lib/a/b/x.ts", "{src,lib}/**/*.ts"], ["bin/x.ts", "{src,lib}/**/*.ts"],
+]) {
+  show(`matchesGlob ${JSON.stringify(candidate)} ${pattern}`, path.posix.matchesGlob(candidate, pattern));
+}
+
+// --- exclude as a string array of path globs: a globstar in one matches
+// zero directories too, and a brace alternative may span segments.
+show("exclude arr a/**", fs.globSync("**/*.js", { cwd: root, exclude: ["a/**"] }).sort());
+show("exclude arr **/b/**", fs.globSync("**/*.js", { cwd: root, exclude: ["**/b/**"] }).sort());
+show("exclude arr a/b/*.js", fs.globSync("**/*.js", { cwd: root, exclude: ["a/b/*.js"] }).sort());
+show("exclude arr brace slash", fs.globSync("**/*.js", { cwd: root, exclude: ["{a/b,c}/*.js"] }).sort());
+show("exclude arr **/leaf.js", fs.globSync("**/*.js", { cwd: root, exclude: ["**/leaf.js"] }).sort());
+show("exclude arr **/*.js top", fs.globSync("*.js", { cwd: root, exclude: ["**/*.js"] }).sort());
+show("exclude arr two", fs.globSync("**/*.js", { cwd: root, exclude: ["**/deep.js", "c/**"] }).sort());
+// --- a brace group that spans path segments in the PATTERN
+show("{a/b,c}/*.js", fs.globSync("{a/b,c}/*.js", { cwd: root }).sort());
+show("{a/b,c,nope/x}/*.js", fs.globSync("{a/b,c,nope/x}/*.js", { cwd: root }).sort());
+show("a/{b/deep,b}.js", fs.globSync("a/{b/deep,b}.js", { cwd: root }).sort());
+
+// --- a globstar with MORE than one segment after it, a directory matched
+// by the segment after a globstar, and the prefix's own match under a
+// trailing globstar. (The tree grows here so the legs above keep theirs.)
+fs.mkdirSync(path.join(root, "c", "b"), { recursive: true });
+fs.writeFileSync(path.join(root, "c", "b", "n.js"), "");
+for (const pattern of [
+  "**/b/*.js", "**/b", "**/b/**", "a/**", "**/a/b/deep.js", "**/**/*.js", "**/*", "a/**/b/*.js", "*/b/**",
+]) {
+  show(`walk ${pattern}`, fs.globSync(pattern, { cwd: root }).sort());
+}
+show("walk **/b/*.js exclude a/**", fs.globSync("**/b/*.js", { cwd: root, exclude: ["a/**"] }).sort());
+show("walk a/** exclude a/b", fs.globSync("a/**", { cwd: root, exclude: ["a/b"] }).sort());
+
+// --- dot-leading names: a wildcard at the start of a segment does not match
+// one and a globstar does not cross one; a segment that spells the dot does.
+fs.mkdirSync(path.join(root, ".h", ".i"), { recursive: true });
+fs.mkdirSync(path.join(root, "a", ".w"), { recursive: true });
+fs.writeFileSync(path.join(root, ".dot.js"), "");
+fs.writeFileSync(path.join(root, ".h", "x.js"), "");
+fs.writeFileSync(path.join(root, ".h", ".i", "t.js"), "");
+fs.writeFileSync(path.join(root, "a", ".w", "s.js"), "");
+for (const pattern of [
+  "*", "**", "**/*.js", ".h/*", ".h/**", "**/.w/s.js", "**/s.js", ".*", "a/.w/**", "*/.*", "{.h,c}/*.js",
+]) {
+  show(`dot ${pattern}`, fs.globSync(pattern, { cwd: root }).sort());
+}
+show("dot exclude **/x.js", fs.globSync(".h/**", { cwd: root, exclude: ["**/x.js"] }).sort());
+show("dot exclude .h/*", fs.globSync(".h/**", { cwd: root, exclude: [".h/*"] }).sort());
+for (const [candidate, pattern] of [
+  [".a", "*"], ["a/.b", "a/*"], [".x/foo.js", "**/*.js"], ["a/.b/c", "a/**/c"], ["a/.b", "a/**"], [".git/x", "**"],
+  [".a", ".*"], ["a/.b", "a/.*"], ["a/.b/c", "**/.b/c"], [".a/b", ".a/**"], [".a", "{.a,b}"], [".a", "{*,b}"],
+  ["x.a", "x{*,y}"], [".a", "[.]a"], [".a", "?a"], [".a", "[!x]a"], ["a.b", "*"],
+  ["a", "***"], ["a/b", "***"], ["a/b/c", "a/***/c"], ["a/x/y/c", "a/***/c"],
+]) {
+  show(`matchesGlob dot ${JSON.stringify(candidate)} ${pattern}`, path.posix.matchesGlob(candidate, pattern));
+}
 
 // --- cleanup
 fs.rmSync(root, { recursive: true, force: true });

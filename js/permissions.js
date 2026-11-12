@@ -20,16 +20,29 @@
     }
 
     /**
-     * Normalise a PermissionDescriptor to {name, path?, host?}.
-     * "path" and "host" (url) are the two whitelist-matching keys the Rust
-     * side understands.
+     * Normalise a PermissionDescriptor to {name, target}, where target is
+     * the one string the Rust side matches against that permission's
+     * allow-list, or null for an unscoped query.
+     *
+     * oam's own keys are "path" and "url". Deno spells the scope per
+     * permission -- "host" for net, "variable" for env, "command" for a
+     * subprocess -- and those are read first for the permission they belong
+     * to. Dropping one would turn a scoped question into the unscoped one,
+     * which answers "granted" for any non-empty allow-list.
      */
     function normalise(desc) {
       assertDescriptor(desc);
+      const str = (v) => (typeof v === "string" ? v : undefined);
+      let scoped;
+      switch (desc.name) {
+        case "net":   scoped = str(desc.host);     break;
+        case "env":   scoped = str(desc.variable); break;
+        case "child": scoped = str(desc.command);  break;
+        default:      scoped = undefined;
+      }
       return {
         name: desc.name,
-        path: typeof desc.path === "string" ? desc.path : undefined,
-        url:  typeof desc.url  === "string" ? desc.url  : undefined,
+        target: scoped ?? str(desc.path) ?? str(desc.url) ?? null,
       };
     }
 
@@ -39,8 +52,8 @@
        * Compatible with Deno.permissions.query({name: "read", path: "/tmp"}).
        */
       query(desc) {
-        const { name, path, url } = normalise(desc);
-        const result = node.permissionsQuery(name, path ?? url ?? null);
+        const { name, target } = normalise(desc);
+        const result = node.permissionsQuery(name, target);
         // Return a PermissionStatus-shaped object (state + eventTarget stub).
         return Promise.resolve({
           state: result.state,

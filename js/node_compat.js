@@ -14,9 +14,10 @@
 // eval time. Nothing at top level may touch __oam, console, or timers.
 //
 // Wave-1 documented divergences (all carry a clear error or doc note):
-// - process.env is a copy taken at first access of the process module;
-//   writes mutate the JS object only.
-// - process.exit() exits immediately (no 'exit' event flush), like Bun.
+// - process.env is a string-coercing view over a copy of the environment
+//   taken at first property access; a write updates that copy (or, in a
+//   SHARE_ENV worker, the store shared with its creator), not the OS
+//   environment, so natives.env() readers keep seeing the startup values.
 // - process.nextTick is a FIFO queue drained BY THE HOST at every tick
 //   point (drain -> microtask checkpoint, looped until both empty -- Node's
 //   processTicksAndRejections; docs/design/nexttick-engine.md). Ticks run
@@ -27,7 +28,9 @@
 //   installs the vendored Node v22 port (docs/design/streams-port.md); the
 //   hand-rolled wave-1 streams were deleted in slice 5. fs/net/http streams
 //   in this file build on registry.get("stream") = the vendored classes.
-// - TextDecoder supports utf-8 only (fatal + ignoreBOM honored).
+// - TextDecoder implements utf-8 (fatal + ignoreBOM honored) and
+//   windows-1252, with every label the Encoding Standard maps onto them;
+//   any other label throws ERR_ENCODING_NOT_SUPPORTED.
 "use strict";
 (() => {
   // ---------------------------------------------------------------- utf-8
@@ -220,7 +223,19 @@
       else if (input instanceof Uint8Array) bytes = input;
       else if (ArrayBuffer.isView(input))
         bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
-      else bytes = new Uint8Array(input);
+      else if (isAnyArrayBuffer(input)) bytes = new Uint8Array(input);
+      else {
+        // node (v22.22.2) rejects anything that is not a BufferSource, with
+        // this exact text -- it names the argument "list" and has no
+        // "Received" tail. `new Uint8Array(input)` would instead read a
+        // number as a length and a string as an empty list.
+        const err = new TypeError(
+          'The "list" argument must be an instance of SharedArrayBuffer, ' +
+            "ArrayBuffer or ArrayBufferView.",
+        );
+        err.code = "ERR_INVALID_ARG_TYPE";
+        throw err;
+      }
 
       if (this.encoding === "windows-1252") {
         // Single-byte and total: every one of the 256 bytes maps to a code
@@ -268,7 +283,12 @@
 
       let i = 0;
       const atStart = this._atStart;
-      this._atStart = !stream; // a final (non-stream) decode resets the stream
+      // A final (non-stream) decode resets the stream. A stream:true call
+      // leaves the head only once it has DECODED bytes: an empty chunk, or a
+      // 1-2 byte chunk that is all an incomplete sequence held in _pending
+      // (a split BOM), has examined nothing yet, so the next call is still
+      // at the head and still strips the BOM.
+      this._atStart = !stream || (atStart && bytes.length === 0);
       if (
         atStart &&
         !this.ignoreBOM &&
@@ -686,12 +706,16 @@
   }
 
   /// Captured when node_compat.js is evaluated, so a script that replaces
-  /// Promise.prototype.then or Error.captureStackTrace cannot redirect how
-  /// fs/promises settles.
+  /// the Promise global, Promise.reject, Promise.prototype.then or
+  /// Error.captureStackTrace cannot redirect how fs/promises settles.
   const PromiseCtor = Promise;
   const promiseThen = Promise.prototype.then;
+  const promiseReject = Promise.reject;
   const captureStackTrace = Error.captureStackTrace;
-  const kIsNodeErrorMark = globalThis.__oamKIsNodeError;
+  // node's kIsNodeError brand (bootstrap.js mints it): the one binding for
+  // it in this file, read by asAlwaysRejecting and set by the coded-error
+  // builders below.
+  const kIsNodeErrorBrand = globalThis.__oamKIsNodeError;
 
   function asAlwaysRejecting(api) {
     const out = {};
@@ -725,7 +749,7 @@
           // builds and no binding hands back: fs.promises.rm's
           // ERR_FS_EISDIR keeps its no frames.
           if (err !== null && typeof err === "object" && typeof err.syscall === "string" &&
-              err[kIsNodeErrorMark] !== true) {
+              err[kIsNodeErrorBrand] !== true) {
             captureStackTrace(err);
           }
           throw err;
@@ -744,7 +768,7 @@
           try {
             ret = fn.apply(this, args);
           } catch (e) {
-            return Promise.reject(e);
+            return promiseReject.call(PromiseCtor, e);
           }
           return ret instanceof PromiseCtor ? promiseThen.call(ret, undefined, onRejected) : ret;
         },
@@ -765,16 +789,11 @@
     return err;
   }
 
-  /// node's "Received ..." tail on an ERR_INVALID_ARG_TYPE message.
+  /// node's "Received ..." tail on an ERR_INVALID_ARG_TYPE message, without
+  /// the " Received " lead. One implementation -- receivedSuffix -- renders
+  /// it for every caller.
   function describeArg(value) {
-    if (value === null) return "null";
-    if (value === undefined) return "undefined";
-    if (typeof value === "object") {
-      var name = value.constructor && value.constructor.name;
-      return `an instance of ${name || "Object"}`;
-    }
-    if (typeof value === "string") return `type string ('${value}')`;
-    return `type ${typeof value} (${String(value)})`;
+    return determineSpecificType(value);
   }
 
   // Node's coded-error shape (lib/internal/errors.js makeNodeErrorWithCode,
@@ -965,41 +984,13 @@
 
   var codes = {};
 
-  // Faithful port of Node's internal `lib/internal/errors.js`
-  // invalidArgTypeHelper -- renders the "Received ..." tail of an
-  // ERR_INVALID_ARG_TYPE message the way Node does (type + inspected value,
-  // class names, function names, negative zero, etc.). Many conformance tests
-  // assert on this exact text, so it must match byte-for-byte.
+  // The " Received ..." tail of an ERR_INVALID_ARG_TYPE message. Many
+  // conformance tests assert on this exact text, so it must match node
+  // byte-for-byte; receivedSuffix is the one implementation (this used to be
+  // a separate port that cut the already-quoted form of a long string, losing
+  // its closing quote, and cut symbols and bigints, which node shows whole).
   function invalidArgTypeHelper(input) {
-    if (input == null) {
-      return ` Received ${input}`;
-    }
-    // No name gate: anonymous functions render "Received function " (empty
-    // name, trailing space) -- probe-verified against real node v22.22.2,
-    // and test/common invalidArgTypeHelper does the same unconditionally.
-    if (typeof input === "function") {
-      return ` Received function ${input.name}`;
-    }
-    if (typeof input === "object") {
-      if (input.constructor && input.constructor.name) {
-        return ` Received an instance of ${input.constructor.name}`;
-      }
-      try {
-        return ` Received ${nodeInspect(input, { depth: -1 })}`;
-      } catch {
-        return ` Received an object`;
-      }
-    }
-    let inspected;
-    try {
-      inspected = nodeInspect(input, { colors: false });
-    } catch {
-      inspected = String(input);
-    }
-    if (inspected.length > 28) {
-      inspected = `${inspected.slice(0, 25)}...`;
-    }
-    return ` Received type ${typeof input} (${inspected})`;
+    return receivedSuffix(input);
   }
 
   // Build the "must be of type X" / "must be one of type X, Y, or Z" clause and
@@ -1112,37 +1103,17 @@
   codes.ERR_FS_WATCH_QUEUE_OVERFLOW = E("ERR_FS_WATCH_QUEUE_OVERFLOW", Error, function(max) {
     return `fs.watch() queued more than ${max} events`;
   });
-  codes.ERR_INVALID_CALLBACK = E("ERR_INVALID_CALLBACK", TypeError, function(name) {
-    return 'Callback must be a function. Received ' + String(name);
-  });
   codes.ERR_INVALID_THIS = E("ERR_INVALID_THIS", TypeError, function(expected) {
     return 'Value of "this" must be of type ' + expected;
   });
   // Node determineSpecificType: "undefined" / "an instance of Map" /
   // "function foo" / "type string ('x')".
+  // The same text as the ERR_INVALID_ARG_TYPE tail, minus its " Received "
+  // lead: receivedSuffix renders both. (No `require` is in scope in this
+  // file, so an earlier `require("util").inspect` here always threw and a
+  // null-prototype object read "an instance of Object".)
   function determineSpecificType(value) {
-    if (value === null || value === undefined) return String(value);
-    if (typeof value === "function" && value.name) return "function " + value.name;
-    if (typeof value === "object") {
-      if (value.constructor && value.constructor.name) return "an instance of " + value.constructor.name;
-      try {
-        return require("util").inspect(value, { depth: -1 });
-      } catch {
-        return "an instance of Object";
-      }
-    }
-    // `require` is not in scope here (this runs inside the errors factory),
-    // so the old `require("util").inspect` ALWAYS threw and fell back to
-    // String(value) -- a string then showed with no quotes where node writes
-    // `type string ('abc')`. nodeInspect resolves util off the registry, late.
-    let inspected;
-    try {
-      inspected = nodeInspect(value, { colors: false });
-    } catch {
-      inspected = String(value);
-    }
-    if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
-    return "type " + typeof value + " (" + inspected + ")";
+    return receivedSuffix(value).slice(10); // " Received ".length
   }
   codes.ERR_INCOMPATIBLE_OPTION_PAIR = E("ERR_INCOMPATIBLE_OPTION_PAIR", TypeError, function(a, b) {
     return 'Option "' + a + '" cannot be used in combination with option "' + b + '"';
@@ -1197,11 +1168,27 @@
   codes.ERR_SOCKET_BAD_TYPE = E("ERR_SOCKET_BAD_TYPE", TypeError, function() {
     return 'Bad socket type specified. Valid types are: udp4, udp6';
   });
+  codes.ERR_SOCKET_ALREADY_BOUND = E("ERR_SOCKET_ALREADY_BOUND", Error, 'Socket is already bound');
+  codes.ERR_SOCKET_DGRAM_NOT_RUNNING = E("ERR_SOCKET_DGRAM_NOT_RUNNING", Error, 'Not running');
   // node's text, which speaks of sending a handle (child_process) wherever
   // the error is raised -- resetAndDestroy() on a non-TCP socket included.
   codes.ERR_INVALID_HANDLE_TYPE = E("ERR_INVALID_HANDLE_TYPE", TypeError, 'This handle type cannot be sent');
   codes.ERR_UNKNOWN_SIGNAL = E("ERR_UNKNOWN_SIGNAL", TypeError, function(signal) {
     return 'Unknown signal: ' + signal;
+  });
+  // util.parseArgs (node's lib/internal/errors.js wording).
+  codes.ERR_PARSE_ARGS_INVALID_OPTION_VALUE = E("ERR_PARSE_ARGS_INVALID_OPTION_VALUE", TypeError, function(message) {
+    return message;
+  });
+  codes.ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL = E("ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL", TypeError, function(value) {
+    return "Unexpected argument '" + value + "'. This command does not take positional arguments";
+  });
+  codes.ERR_PARSE_ARGS_UNKNOWN_OPTION = E("ERR_PARSE_ARGS_UNKNOWN_OPTION", TypeError, function(option, allowPositionals) {
+    // node's text ends at the JSON-quoted option, with no closing quote.
+    const suggestDashDash = allowPositionals
+      ? ". To specify a positional argument starting with a '-', place it at the end of the command after '--', as in '-- " + JSON.stringify(option)
+      : "";
+    return "Unknown option '" + option + "'" + suggestDashDash;
   });
   codes.ERR_UNESCAPED_CHARACTERS = E("ERR_UNESCAPED_CHARACTERS", TypeError, function(name) {
     return name + ' contains unescaped characters';
@@ -1211,6 +1198,11 @@
   // lookupAndConnectMultiple throws it). `%s` formatting, as node's message.
   codes.ERR_INVALID_IP_ADDRESS = E("ERR_INVALID_IP_ADDRESS", TypeError, function(ip) {
     return registry.get("util").format("Invalid IP address: %s", ip);
+  });
+  // net.BlockList / net.SocketAddress: text that is not an address of the
+  // family named (node: E('ERR_INVALID_ADDRESS', 'Invalid socket address', Error)).
+  codes.ERR_INVALID_ADDRESS = E("ERR_INVALID_ADDRESS", Error, function() {
+    return "Invalid socket address";
   });
   // ---- RangeError family ----
   // node's message function also sets `host` and `port` on the error, which
@@ -1651,12 +1643,6 @@
   codes.ERR_UNKNOWN_CREDENTIAL = E("ERR_UNKNOWN_CREDENTIAL", Error, function(kind, value) {
     return kind + ' identifier does not exist: ' + value;
   });
-  codes.ERR_FS_CP_DIR_TO_NON_DIR = E("ERR_FS_CP_DIR_TO_NON_DIR", Error, function(msg) {
-    return msg;
-  });
-  codes.ERR_FS_CP_NON_DIR_TO_DIR = E("ERR_FS_CP_NON_DIR_TO_DIR", Error, function(msg) {
-    return msg;
-  });
   codes.ERR_FS_INVALID_SYMLINK_TYPE = E("ERR_FS_INVALID_SYMLINK_TYPE", Error, function(type) {
     return 'Symlink type must be one of "dir", "file", or "junction". Received "' + type + '"';
   });
@@ -1672,7 +1658,7 @@
   // and util.inspect shows the accessors' values. The header is
   // bootstrap.js's Error.prepareStackTrace's, which renders a kIsNodeError
   // error's from its name, code and message when the stack is first read.
-  const kIsNodeErrorBrand = globalThis.__oamKIsNodeError;
+  // (kIsNodeErrorBrand is declared once, next to asAlwaysRejecting.)
   const systemErrorMessages = {
     __proto__: null,
     ERR_FS_CP_DIR_TO_NON_DIR: "Cannot overwrite non-directory with directory",
@@ -1800,11 +1786,14 @@
   codes.ERR_ASSERTION = E("ERR_ASSERTION", Error, function(msg) {
     return msg || 'assertion error';
   });
+  codes.ERR_CRYPTO_HASH_FINALIZED = E("ERR_CRYPTO_HASH_FINALIZED", Error, function() {
+    return "Digest already called";
+  });
+  codes.ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE = E("ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", TypeError, function(actual, expected) {
+    return `Invalid key object type ${actual}, expected ${expected}.`;
+  });
   codes.ERR_CRYPTO_FIPS_FORCED = E("ERR_CRYPTO_FIPS_FORCED", Error, function() {
     return 'Cannot set FIPS mode, it was forced with --force-fips at startup.';
-  });
-  codes.ERR_WORKER_NOT_SUPPORTED = E("ERR_WORKER_NOT_SUPPORTED", Error, function() {
-    return 'Worker threads are not supported in this environment';
   });
   codes.ERR_WORKER_PATH = E("ERR_WORKER_PATH", TypeError, function(filename) {
     return "The worker script or module filename must be an absolute path or a " +
@@ -1816,8 +1805,10 @@
   codes.ERR_ENV_FILE_NOT_FOUND = E("ERR_ENV_FILE_NOT_FOUND", Error, function(path) {
     return 'Cannot find env file: ' + path;
   });
-  codes.ERR_INVALID_BUFFER_SIZE = E("ERR_INVALID_BUFFER_SIZE", RangeError, function() {
-    return 'Buffer size must be a multiple of 8';
+  // Buffer#swap16/32/64 on a length that is not a multiple of the width;
+  // `multiple` is "16-bits", "32-bits" or "64-bits", as node's message takes.
+  codes.ERR_INVALID_BUFFER_SIZE = E("ERR_INVALID_BUFFER_SIZE", RangeError, function(multiple) {
+    return 'Buffer size must be a multiple of ' + multiple;
   });
 
 
@@ -2127,7 +2118,10 @@
   // holds a single quote is JSON-quoted instead; a symbol or bigint is shown whole, -0 as -0, and
   // an object whose constructor has a `name` (even "") is "an instance of"
   // it. (oam used to cut the quoted form at 25, losing the closing quote, and
-  // to cut symbols and bigints.)
+  // to cut symbols and bigints.) An object with no such constructor is
+  // util.inspect'ed at depth -1, as node's: `[Object: null prototype] {}`
+  // for an empty one. This is the ONE renderer of that tail in this file:
+  // invalidArgTypeHelper, determineSpecificType and describeArg call it.
   function receivedSuffix(input) {
     if (input == null) return " Received " + input;
     switch (typeof input) {
@@ -2136,7 +2130,14 @@
       case "object": {
         const ctor = input.constructor;
         if (ctor && "name" in ctor) return " Received an instance of " + ctor.name;
-        return " Received [Object: null prototype] {}";
+        // nodeInspect's own fallback is String(value), which throws for an
+        // object with no toString; the literal is what node prints for the
+        // common case and stands in if util cannot be built yet.
+        try {
+          return " Received " + nodeInspect(input, { depth: -1 });
+        } catch {
+          return " Received [Object: null prototype] {}";
+        }
       }
       case "string":
         return " Received type string (" + quoteReceivedString(input) + ")";
@@ -2901,13 +2902,22 @@
         encoding = end;
         end = this.length;
       }
-      if (start < 0 || end < 0 || end > this.length) {
-        throw Object.assign(
-          new RangeError(
-            `The value of "offset" is out of range. It must be >= 0 and <= ${this.length}. Received ${start < 0 ? start : end}`,
-          ),
-          { code: "ERR_OUT_OF_RANGE" },
-        );
+      // node's validateOffset, offset first and then end, each under its own
+      // name (measured on v22.22.2): a non-integer number is "an integer",
+      // offset's range is 0..MAX_SAFE_INTEGER -- so an offset past the end is
+      // not an error, see below -- and end's is 0..length. Raised through
+      // codes.* so they carry node's coded-error shape.
+      if (typeof start === "number" && !Number.isInteger(start)) {
+        throw codes.ERR_OUT_OF_RANGE("offset", "an integer", start);
+      }
+      if (start < 0 || start > Number.MAX_SAFE_INTEGER) {
+        throw codes.ERR_OUT_OF_RANGE("offset", ">= 0 && <= 9007199254740991", start);
+      }
+      if (typeof end === "number" && !Number.isInteger(end)) {
+        throw codes.ERR_OUT_OF_RANGE("end", "an integer", end);
+      }
+      if (end < 0 || end > this.length) {
+        throw codes.ERR_OUT_OF_RANGE("end", `>= 0 && <= ${this.length}`, end);
       }
       // An `end` at or before `offset` is an EMPTY range, not an error: node
       // returns the buffer untouched (probe-verified on v22.22.2 --
@@ -2962,8 +2972,12 @@
         byteOffset = 0;
       }
       // Node coerces byteOffset numerically; NaN (and other non-numbers) -> 0.
+      // A fraction truncates toward zero (indexOf('c', 1.5) searches from 1,
+      // -4.5 from length - 4), as lastIndexOf's does: the search loop below
+      // indexes with it, and a non-integer index reads undefined.
       byteOffset = +byteOffset;
       if (Number.isNaN(byteOffset)) byteOffset = 0;
+      else byteOffset = Math.trunc(byteOffset);
       if (byteOffset < 0) byteOffset = Math.max(0, this.length + byteOffset);
       if (typeof needle === "number") {
         return Uint8Array.prototype.indexOf.call(this, needle & 0xff, byteOffset);
@@ -3426,10 +3440,7 @@
     function swapper(width) {
       return function () {
         if (this.length % width !== 0) {
-          throw Object.assign(
-            new RangeError(`Buffer size must be a multiple of ${width * 8}-bits`),
-            { code: "ERR_INVALID_BUFFER_SIZE" },
-          );
+          throw codes.ERR_INVALID_BUFFER_SIZE(`${width * 8}-bits`);
         }
         for (let i = 0; i < this.length; i += width) {
           for (let j = 0; j < width / 2; j++) {
@@ -3471,13 +3482,20 @@
     configurable: true,
   });
 
+  // atob/btoa failures are a DOMException named InvalidCharacterError
+  // (legacy code 5), which is what callers and node's tests check; the name
+  // has to be passed, since DOMException's default name is "Error".
+  function invalidCharacterError(message) {
+    return new (globalThis.DOMException ?? TypeError)(message, "InvalidCharacterError");
+  }
+
   function btoa(input) {
     const str = String(input);
     const bytes = new Uint8Array(str.length);
     for (let i = 0; i < str.length; i++) {
       const c = str.charCodeAt(i);
       if (c > 0xff) {
-        throw new (globalThis.DOMException ?? TypeError)(
+        throw invalidCharacterError(
           "btoa: the string contains characters outside of the Latin1 range",
         );
       }
@@ -3489,11 +3507,14 @@
   function atob(input) {
     let bytes;
     try {
-      bytes = Uint8Array.fromBase64(String(input).replace(/\s/g, ""), {
+      // Forgiving-base64 removes ASCII whitespace only (tab, LF, FF, CR,
+      // space). `\s` also matches U+00A0, U+FEFF and the other Unicode
+      // spaces, which are invalid characters here and must throw.
+      bytes = Uint8Array.fromBase64(String(input).replace(/[\t\n\f\r ]/g, ""), {
         lastChunkHandling: "loose",
       });
     } catch {
-      throw new (globalThis.DOMException ?? TypeError)(
+      throw invalidCharacterError(
         "atob: the string to be decoded is not correctly encoded",
       );
     }
@@ -3628,12 +3649,9 @@
     return globalThis.clearTimeout(id);
   };
 
-  if (typeof globalThis.structuredClone !== "function") {
-    globalThis.structuredClone = function structuredClone(value) {
-      if (value === undefined) return undefined;
-      return JSON.parse(JSON.stringify(value));
-    };
-  }
+  // structuredClone is bootstrap.js's (evaluated before this file, see
+  // crates/oam_engine/build.rs). No fallback is installed here: a JSON
+  // round-trip would silently drop Maps, Dates, typed arrays and cycles.
 
   // ------------------------------------------------------------- registry
   const registry = {
@@ -3709,6 +3727,14 @@
     configurable: false,
   });
 
+  // bootstrap.js's internal fetch entries, taken now -- while the snapshot
+  // is built -- because the global they arrive on is gone before a program
+  // runs (undici.js removes it). http.ClientRequest sends through these.
+  const oamFetchInternal = globalThis.__oamFetchInternal;
+  if (oamFetchInternal === undefined) {
+    throw new Error("oam internal: bootstrap.js's fetch entries are missing");
+  }
+
   // --------------------------------------------------------------- events
   registry.factories.events = () => {
     const errorMonitor = Symbol("events.errorMonitor");
@@ -3778,13 +3804,17 @@
     EventEmitter.prototype._add = function (type, listener, prepend, once) {
       eventsOf(this);
       if (typeof listener !== "function") {
-        throw new TypeError(`The "listener" argument must be a function`);
+        // node's checkListener: ERR_INVALID_ARG_TYPE with a Received tail.
+        throw codes.ERR_INVALID_ARG_TYPE("listener", "function", listener);
       }
       let entry = listener;
       if (once) {
+        // The listener's result is returned, as once()'s wrapper does:
+        // emit's captureRejections path reads it to route an async
+        // listener's rejection to the rejection handler.
         const wrapper = (...args) => {
           this.removeListener(type, wrapper);
-          listener.apply(this, args);
+          return listener.apply(this, args);
         };
         wrapper.listener = listener;
         entry = wrapper;
@@ -3833,8 +3863,11 @@
     };
     EventEmitter.prototype.once = function (type, listener) {
       if (typeof listener !== "function") {
-        throw new TypeError(`The "listener" argument must be a function`);
+        throw codes.ERR_INVALID_ARG_TYPE("listener", "function", listener);
       }
+      // Built here rather than in _add because node's once() registers
+      // through `this.on`, which a subclass may override; the wrapper itself
+      // is the same shape as _add's (prependOnceListener).
       const wrapper = (...args) => {
         this.removeListener(type, wrapper);
         return listener.apply(this, args);
@@ -4458,7 +4491,6 @@
     // NOT reserved.
     function isWindowsReservedName(str, index) {
       if (index !== 3 && index !== 4) return false;
-      let i = 0;
       const first = str.charCodeAt(0) | 0x20; // lowercase
       const second = str.charCodeAt(1) | 0x20;
       const third = str.charCodeAt(2) | 0x20;
@@ -4479,7 +4511,6 @@
       if (fourth >= 0x31 && fourth <= 0x39) return true;
       // superscript 1 (0xB9), 2 (0xB2), 3 (0xB3)
       if (fourth === 0xb9 || fourth === 0xb2 || fourth === 0xb3) return true;
-      void i;
       return false;
     }
 
@@ -4602,7 +4633,6 @@
                 envCwd.slice(0, 2).toLowerCase() === resolvedDevice.toLowerCase()
                   ? envCwd
                   : `${resolvedDevice}\\`;
-              if (path === undefined) path = `${resolvedDevice}\\`;
             }
 
             const len = path.length;
@@ -5254,7 +5284,7 @@
           return ret;
         },
 
-        matchesGlob: pathMatchesGlob,
+        matchesGlob: pathMatchesGlobWin32,
         sep: "\\",
         delimiter: ";",
       };
@@ -5564,7 +5594,7 @@
           return ret;
         },
 
-        matchesGlob: pathMatchesGlob,
+        matchesGlob: pathMatchesGlobPosix,
         sep: "/",
         delimiter: ":",
       };
@@ -5844,7 +5874,9 @@
             ? "Darwin"
             : "Linux",
       release: () => natives.osRelease(),
-      version: () => natives.osRelease(),
+      // uname's `version` field on unix (the kernel build string, as node);
+      // on Windows still the release string (node-divergences.md entry 15).
+      version: () => natives.osRelease(true),
       homedir: () => natives.homedir(),
       tmpdir: () => natives.tmpdir(),
       hostname: () => natives.hostname(),
@@ -5885,33 +5917,59 @@
         if (typeof result === "string") throw uvSystemError(result, "uv_os_setpriority");
       },
       networkInterfaces: () => JSON.parse(natives.networkInterfaces()),
+      // uname's machine field as libuv reports it, derived from the build's
+      // arch rather than read from the OS. arm64 has three spellings: Linux
+      // says "aarch64", Darwin "arm64", and on Windows libuv's uv_os_uname
+      // has no ARM64 case, so node answers "unknown" there (measured on
+      // v22.22.2 / libuv 1.51.0, win32 arm64).
       machine: () => {
         var a = natives.arch;
-        if (a === "arm64") return "aarch64";
+        if (a === "arm64") {
+          if (isWin) return "unknown";
+          return natives.platform === "darwin" ? "arm64" : "aarch64";
+        }
         if (a === "x64") return "x86_64";
         if (a === "ia32") return "i686";
         if (a === "arm") return "armv7l";
         return a;
       },
-      userInfo: () => ({
-        username: natives.username(),
-        homedir: natives.homedir(),
-        shell: null,
-        uid: -1,
-        gid: -1,
-      }),
+      // libuv's uv_os_get_passwd. Windows has no uid/gid/shell (node answers
+      // -1, -1, null there); on POSIX it is the passwd record of the
+      // EFFECTIVE uid -- its gid, shell and home directory, not $HOME -- and
+      // a uid with no record is ERR_SYSTEM_ERROR, as in node. The
+      // `{ encoding: 'buffer' }` option is not implemented: strings always.
+      userInfo: () => {
+        if (isWin) {
+          return {
+            uid: -1,
+            gid: -1,
+            username: natives.username(),
+            homedir: natives.homedir(),
+            shell: null,
+          };
+        }
+        const uid = natives.posixGetId(2);
+        const record = natives.posixLookupId(3, uid);
+        if (record === null || record === undefined) {
+          throw uvSystemError("ENOENT", "uv_os_get_passwd");
+        }
+        return {
+          uid,
+          gid: record.gid,
+          username: record.username,
+          homedir: record.homedir,
+          shell: record.shell,
+        };
+      },
       // node freezes every member of signals / errno / priority. constantBag
       // reached only errno when it landed, so `os.constants.signals.SIGINT = 999`
       // stuck where node makes it inert.
       constants: {
-        signals: constantBag({
-          SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5,
-          SIGABRT: 6, SIGBUS: 7, SIGFPE: 8, SIGKILL: 9, SIGUSR1: 10,
-          SIGSEGV: 11, SIGUSR2: 12, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15,
-          SIGCHLD: 17, SIGCONT: 18, SIGSTOP: 19, SIGTSTP: 20, SIGTTIN: 21,
-          SIGTTOU: 22, SIGURG: 23, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26,
-          SIGPROF: 27, SIGWINCH: 28, SIGIO: 29, SIGINFO: 29, SIGSYS: 31,
-        }),
+        // The host's own table, from oam_engine (os_signals_json): libc's
+        // numbers per target on unix, node's fixed eleven on Windows. One
+        // transcribed Linux table used to be published everywhere, which gave
+        // macOS Linux's numbers (SIGUSR1 10 where Darwin's is 30).
+        signals: constantBag(natives.osSignals()),
         // The host's POSIX errno, positive (node's shape). Only the `.errno`
         // group: the parse also carries libuv-only names, and node publishes
         // none of them here (conformance case 87 diffs this exact key set
@@ -7222,9 +7280,7 @@
     // 0 }` keeps every other option rather than blanking it. The object is
     // sealed, so an unrecognized key throws instead of silently doing nothing,
     // and a non-object (null, an array, a function) is an ERR_INVALID_ARG_TYPE.
-    // All three are Node parity. numericSeparator is stored and reported but not
-    // yet applied by the walker (Node's formatNumber/formatBigInt separator port
-    // is missing); that gap is per-call too, not specific to defaultOptions.
+    // All three are Node parity.
     const inspectDefaultOptions = Object.seal({
       showHidden: false,
       depth: 2,
@@ -7305,7 +7361,6 @@
       const string = String(v);
       return numericSeparator ? `${numSepStart(string)}n` : `${string}n`;
     }
-    let _fmtOpts = {};
 
     // Node tryStringify: %j narrows its catch to circular-structure
     // TypeErrors (matched by first message line against a probe) and
@@ -7382,12 +7437,15 @@
     }
 
     function format(f, ...args) {
-      _fmtOpts = inspect.defaultOptions;
       // util.format() with no arguments returns '' (Node parity).
       if (arguments.length === 0) return "";
-      return formatBody(f, args);
+      return formatBody(f, args, inspect.defaultOptions);
     }
-    function formatBody(f, args) {
+    // The inspect options are a PARAMETER, not shared state: an
+    // inspect.custom hook that itself calls util.format() runs in the middle
+    // of this replace(), and one binding for both calls gave the rest of the
+    // outer string the inner call's options.
+    function formatBody(f, args, _fmtOpts) {
       const fmtInspect = (x) => (typeof x === "string" ? x : inspect(x, _fmtOpts));
       if (typeof f !== "string") {
         return [f, ...args].map(fmtInspect).join(" ");
@@ -7890,7 +7948,20 @@
       if (prior && prior.has(b)) return true;
       if (prior) prior.add(b);
       else memo.set(a, new Set([b]));
+      // The memo is a guard against CYCLES only: it holds the pairs being
+      // compared right now and forgets each when its comparison ends, as
+      // node's innerDeepEqual does. A pair left behind after it compared
+      // unequal answered "equal" the next time a Set / Map matching loop
+      // retried it against the same candidate.
+      try {
+        return deepEqualMembers(a, b, strict, memo);
+      } finally {
+        memo.get(a)?.delete(b);
+      }
+    }
 
+    // The rest of deepEqualImpl, for a pair it has recorded in `memo`.
+    function deepEqualMembers(a, b, strict, memo) {
       if (Array.isArray(a)) {
         if (a.length !== b.length) return false;
         // Do NOT return here: fall through to the own-key comparison so extra
@@ -7900,36 +7971,72 @@
       }
       if (isRealMap(a)) {
         if (a.size !== b.size) return false;
-        const entries = [...b];
-        const used = new Array(entries.length).fill(false);
-        mapOuter: for (const [k, v] of a) {
-          for (let i = 0; i < entries.length; i++) {
-            if (used[i]) continue;
-            if (
-              deepEqualImpl(k, entries[i][0], strict, memo) &&
-              deepEqualImpl(v, entries[i][1], strict, memo)
-            ) {
-              used[i] = true;
-              continue mapOuter;
-            }
+        // Keys `b` holds itself pair through get() first, as node's mapEquiv
+        // does, so a Map of primitive keys compares in linear time; only what
+        // is left goes through the pairwise scan. A primitive key can equal
+        // no other key in strict mode, so a miss there is final; a loose
+        // miss, and an object key whose own entry differs, may still match a
+        // different entry. (Loose mode pairs only primitives this way.)
+        const rest = [];
+        const taken = new Set();
+        for (const entry of a) {
+          const k = entry[0];
+          const kPrim = k === null || typeof k !== "object";
+          if ((strict || kPrim) && b.has(k) && deepEqualImpl(entry[1], b.get(k), strict, memo)) {
+            taken.add(k);
+            continue;
           }
-          return false;
+          if (strict && kPrim) return false;
+          rest.push(entry);
+        }
+        if (rest.length > 0) {
+          const entries = [];
+          for (const entry of b) if (!taken.has(entry[0])) entries.push(entry);
+          const used = new Array(entries.length).fill(false);
+          mapOuter: for (const [k, v] of rest) {
+            for (let i = 0; i < entries.length; i++) {
+              if (used[i]) continue;
+              if (
+                deepEqualImpl(k, entries[i][0], strict, memo) &&
+                deepEqualImpl(v, entries[i][1], strict, memo)
+              ) {
+                used[i] = true;
+                continue mapOuter;
+              }
+            }
+            return false;
+          }
         }
         // fall through: own enumerable props on the Map object are compared too
       }
       if (isRealSet(a)) {
         if (a.size !== b.size) return false;
-        const items = [...b];
-        const used = new Array(items.length).fill(false);
-        setOuter: for (const v of a) {
-          for (let i = 0; i < items.length; i++) {
-            if (used[i]) continue;
-            if (deepEqualImpl(v, items[i], strict, memo)) {
-              used[i] = true;
-              continue setOuter;
+        // Members both Sets hold pair with themselves through has() (node's
+        // setEquiv), which makes Sets of primitives linear; the pairwise scan
+        // is for the rest. Strict mode: a primitive `b` lacks can equal
+        // nothing else. Loose mode pairs only primitives this way.
+        const pairs = (v, other) =>
+          (strict || v === null || typeof v !== "object") && other.has(v);
+        const rest = [];
+        for (const v of a) {
+          if (pairs(v, b)) continue;
+          if (strict && (v === null || typeof v !== "object")) return false;
+          rest.push(v);
+        }
+        if (rest.length > 0) {
+          const items = [];
+          for (const v of b) if (!pairs(v, a)) items.push(v);
+          const used = new Array(items.length).fill(false);
+          setOuter: for (const v of rest) {
+            for (let i = 0; i < items.length; i++) {
+              if (used[i]) continue;
+              if (deepEqualImpl(v, items[i], strict, memo)) {
+                used[i] = true;
+                continue setOuter;
+              }
             }
+            return false;
           }
-          return false;
         }
         // fall through: own enumerable props on the Set object are compared too
       }
@@ -7992,7 +8099,17 @@
       if (prior && prior.has(actual)) return true;
       if (prior) prior.add(actual);
       else memo.set(expected, new Set([actual]));
+      // A cycle guard only, forgotten when the comparison ends (see
+      // deepEqualImpl): a failed pair must not answer "equal" on a retry.
+      try {
+        return partialDeepEqualMembers(actual, expected, memo);
+      } finally {
+        memo.get(expected)?.delete(actual);
+      }
+    }
 
+    // The rest of partialDeepEqualImpl, for a pair it has recorded in `memo`.
+    function partialDeepEqualMembers(actual, expected, memo) {
       // Node's partial mode DROPS the prototype/constructor check but keeps the
       // internal type-tag check -- that tag is what rejects arguments-vs-object,
       // Error-vs-object, boxed-Symbol-vs-object and Uint8Array-vs-Int8Array.
@@ -8241,142 +8358,283 @@
       return true;
     }
 
-    function parseArgs(config) {
-      config = config || {};
-      var argv = config.args || globalThis.process.argv.slice(2);
-      var options = config.options || {};
-      var strict = config.strict !== false;
-      var allowPositionals = config.allowPositionals !== false;
-      var tokens = [];
-      var values = {};
-      var positionals = [];
-
-      for (var name in options) {
-        if (options[name].default !== undefined) {
-          values[name] = options[name].default;
+    // util.parseArgs: a port of node's lib/internal/util/parse_args (v22),
+    // diffed against node v22.22.2's own util.parseArgs over the config and
+    // argv shapes conformance case 611 keeps. Every lookup of a user-named
+    // option goes through an own-property check and `values` has a null
+    // prototype, so an argv word such as `--constructor` or `--__proto__`
+    // can neither read nor write through Object.prototype.
+    const paHasOwn = (obj, prop) => Object.prototype.hasOwnProperty.call(obj, prop);
+    const paGetOwn = (obj, prop) => (paHasOwn(obj, prop) ? obj[prop] : undefined);
+    const paOptionGetOwn = (options, longOption, prop) =>
+      paHasOwn(options, longOption) ? paGetOwn(options[longOption], prop) : undefined;
+    function paValidateObject(value, name) {
+      if (value === null || Array.isArray(value) || typeof value !== "object") {
+        throw new codes.ERR_INVALID_ARG_TYPE(name, "Object", value);
+      }
+    }
+    function paValidateBoolean(value, name) {
+      if (typeof value !== "boolean") throw new codes.ERR_INVALID_ARG_TYPE(name, "boolean", value);
+    }
+    function paValidateString(value, name) {
+      if (typeof value !== "string") throw new codes.ERR_INVALID_ARG_TYPE(name, "string", value);
+    }
+    function paValidateArray(value, name) {
+      if (!Array.isArray(value)) throw new codes.ERR_INVALID_ARG_TYPE(name, "Array", value);
+    }
+    function paValidateStringArray(value, name) {
+      paValidateArray(value, name);
+      for (let i = 0; i < value.length; i++) paValidateString(value[i], `${name}[${i}]`);
+    }
+    function paValidateBooleanArray(value, name) {
+      paValidateArray(value, name);
+      for (let i = 0; i < value.length; i++) paValidateBoolean(value[i], `${name}[${i}]`);
+    }
+    function paFindLongOptionForShort(shortOption, options) {
+      paValidateObject(options, "options");
+      const entry = Object.entries(options).find(
+        ({ 1: optionConfig }) => paGetOwn(optionConfig, "short") === shortOption,
+      );
+      return entry?.[0] ?? shortOption;
+    }
+    const paIsLoneShortOption = (arg) =>
+      arg.length === 2 && arg.charAt(0) === "-" && arg.charAt(1) !== "-";
+    const paIsLoneLongOption = (arg) =>
+      arg.length > 2 && arg.startsWith("--") && !arg.includes("=", 3);
+    const paIsLongOptionAndValue = (arg) =>
+      arg.length > 2 && arg.startsWith("--") && arg.includes("=", 3);
+    function paIsShortOptionGroup(arg, options) {
+      if (arg.length <= 2 || arg.charAt(0) !== "-" || arg.charAt(1) === "-") return false;
+      const longOption = paFindLongOptionForShort(arg.charAt(1), options);
+      return paOptionGetOwn(options, longOption, "type") !== "string";
+    }
+    function paIsShortOptionAndValue(arg, options) {
+      paValidateObject(options, "options");
+      if (arg.length <= 2 || arg.charAt(0) !== "-" || arg.charAt(1) === "-") return false;
+      const longOption = paFindLongOptionForShort(arg.charAt(1), options);
+      return paOptionGetOwn(options, longOption, "type") === "string";
+    }
+    // In strict mode a value that looks like an option (`--foo -x`) is
+    // refused unless it was given inline (`--foo=-x`).
+    function paCheckOptionLikeValue(token) {
+      const value = token.value;
+      if (!token.inlineValue && value != null && value.length > 1 && value.charAt(0) === "-") {
+        const example = token.rawName.startsWith("--")
+          ? `'${token.rawName}=-XYZ'`
+          : `'--${token.name}=-XYZ' or '${token.rawName}-XYZ'`;
+        throw new codes.ERR_PARSE_ARGS_INVALID_OPTION_VALUE(
+          `Option '${token.rawName}' argument is ambiguous.\n` +
+            `Did you forget to specify the option argument for '${token.rawName}'?\n` +
+            `To specify an option argument starting with a dash use ${example}.`,
+        );
+      }
+    }
+    function paCheckOptionUsage(config, token) {
+      let tokenName = token.name;
+      if (!paHasOwn(config.options, tokenName)) {
+        // A negated boolean option, when allowNegative is on.
+        if (config.allowNegative && tokenName.startsWith("no-")) {
+          tokenName = tokenName.slice(3);
+          if (
+            !paHasOwn(config.options, tokenName) ||
+            paOptionGetOwn(config.options, tokenName, "type") !== "boolean"
+          ) {
+            throw new codes.ERR_PARSE_ARGS_UNKNOWN_OPTION(token.rawName, config.allowPositionals);
+          }
+        } else {
+          throw new codes.ERR_PARSE_ARGS_UNKNOWN_OPTION(token.rawName, config.allowPositionals);
         }
       }
-
-      var i = 0;
-      while (i < argv.length) {
-        var arg = argv[i];
+      const short = paOptionGetOwn(config.options, tokenName, "short");
+      const shortAndLong = `${short ? `-${short}, ` : ""}--${tokenName}`;
+      const type = paOptionGetOwn(config.options, tokenName, "type");
+      if (type === "string" && typeof token.value !== "string") {
+        throw new codes.ERR_PARSE_ARGS_INVALID_OPTION_VALUE(
+          `Option '${shortAndLong} <value>' argument missing`,
+        );
+      }
+      if (type === "boolean" && token.value != null) {
+        throw new codes.ERR_PARSE_ARGS_INVALID_OPTION_VALUE(
+          `Option '${shortAndLong}' does not take an argument`,
+        );
+      }
+    }
+    function paStoreOption(token, options, values, allowNegative) {
+      let longOption = token.name;
+      let optionValue = token.value;
+      if (longOption === "__proto__") return;
+      if (allowNegative && longOption.startsWith("no-") && optionValue === undefined) {
+        // --no-foo: the token is renamed to the option it negates.
+        longOption = longOption.slice(3);
+        token.name = longOption;
+        optionValue = false;
+      }
+      // Stored by the value given, not the declared type, so the caller sees
+      // what the user wrote. A `multiple` option always collects an array.
+      const newValue = optionValue ?? true;
+      if (paOptionGetOwn(options, longOption, "multiple")) {
+        if (values[longOption]) values[longOption].push(newValue);
+        else values[longOption] = [newValue];
+      } else {
+        values[longOption] = newValue;
+      }
+    }
+    function paArgsToTokens(args, options) {
+      const tokens = [];
+      let index = -1;
+      let groupCount = 0;
+      const remainingArgs = Array.prototype.slice.call(args);
+      while (remainingArgs.length > 0) {
+        const arg = remainingArgs.shift();
+        const nextArg = remainingArgs[0];
+        if (groupCount > 0) groupCount--;
+        else index++;
 
         if (arg === "--") {
-          tokens.push({ kind: "option-terminator", index: i });
-          i++;
-          while (i < argv.length) {
-            positionals.push(argv[i]);
-            tokens.push({ kind: "positional", index: i, value: argv[i] });
-            i++;
+          // Everything after a bare '--' is positional.
+          tokens.push({ kind: "option-terminator", index });
+          for (const rest of remainingArgs) {
+            tokens.push({ kind: "positional", index: ++index, value: rest });
           }
           break;
         }
-
-        if (arg.startsWith("--")) {
-          var eqIdx = arg.indexOf("=");
-          var longName, longValue;
-          if (eqIdx !== -1) {
-            longName = arg.slice(2, eqIdx);
-            longValue = arg.slice(eqIdx + 1);
-          } else {
-            longName = arg.slice(2);
-            longValue = undefined;
+        if (paIsLoneShortOption(arg)) {
+          const shortOption = arg.charAt(1);
+          const longOption = paFindLongOptionForShort(shortOption, options);
+          let value;
+          let inlineValue;
+          if (paOptionGetOwn(options, longOption, "type") === "string" && nextArg != null) {
+            value = remainingArgs.shift();
+            inlineValue = false;
           }
-          var optDef = options[longName];
-          if (strict && !optDef) {
-            throw new TypeError("Unknown option '--" + longName + "'");
-          }
-          var optType = optDef ? optDef.type : "boolean";
-          if (optType === "string") {
-            if (longValue === undefined) {
-              i++;
-              if (i >= argv.length) {
-                throw new TypeError("Option '--" + longName + "' requires a value");
-              }
-              longValue = argv[i];
-            }
-            if (optDef && optDef.multiple) {
-              if (!Array.isArray(values[longName])) values[longName] = [];
-              values[longName].push(longValue);
-            } else {
-              values[longName] = longValue;
-            }
-          } else {
-            if (longValue !== undefined && strict) {
-              throw new TypeError("Option '--" + longName + "' does not take a value");
-            }
-            if (optDef && optDef.multiple) {
-              if (!Array.isArray(values[longName])) values[longName] = [];
-              values[longName].push(true);
-            } else {
-              values[longName] = true;
-            }
-          }
-          tokens.push({ kind: "option", name: longName, value: values[longName], index: i - (longValue !== undefined && eqIdx === -1 ? 1 : 0) });
-          i++;
+          tokens.push({ kind: "option", name: longOption, rawName: arg, index, value, inlineValue });
+          if (value != null) ++index;
           continue;
         }
-
-        if (arg.startsWith("-") && arg.length > 1 && arg[1] !== "-") {
-          var shortChars = arg.slice(1);
-          for (var ci = 0; ci < shortChars.length; ci++) {
-            var ch = shortChars[ci];
-            var shortName = null;
-            for (var oName in options) {
-              if (options[oName].short === ch) {
-                shortName = oName;
-                break;
-              }
-            }
-            if (strict && !shortName) {
-              throw new TypeError("Unknown option '-" + ch + "'");
-            }
-            if (!shortName) shortName = ch;
-            var sDef = options[shortName];
-            var sType = sDef ? sDef.type : "boolean";
-            if (sType === "string") {
-              var sVal;
-              if (ci + 1 < shortChars.length) {
-                sVal = shortChars.slice(ci + 1);
-                ci = shortChars.length;
-              } else {
-                i++;
-                if (i >= argv.length) {
-                  throw new TypeError("Option '-" + ch + "' requires a value");
-                }
-                sVal = argv[i];
-              }
-              if (sDef && sDef.multiple) {
-                if (!Array.isArray(values[shortName])) values[shortName] = [];
-                values[shortName].push(sVal);
-              } else {
-                values[shortName] = sVal;
-              }
-              tokens.push({ kind: "option", name: shortName, value: values[shortName], index: i });
+        if (paIsShortOptionGroup(arg, options)) {
+          // -fXzy expands to -f -X -z -y; a string option in the middle
+          // takes the rest of the word (-abfFILE -> -a -b -fFILE).
+          const expanded = [];
+          for (let at = 1; at < arg.length; at++) {
+            const shortOption = arg.charAt(at);
+            const longOption = paFindLongOptionForShort(shortOption, options);
+            if (paOptionGetOwn(options, longOption, "type") !== "string" || at === arg.length - 1) {
+              expanded.push(`-${shortOption}`);
             } else {
-              if (sDef && sDef.multiple) {
-                if (!Array.isArray(values[shortName])) values[shortName] = [];
-                values[shortName].push(true);
-              } else {
-                values[shortName] = true;
-              }
-              tokens.push({ kind: "option", name: shortName, value: true, index: i });
+              expanded.push(`-${arg.slice(at)}`);
+              break;
             }
           }
-          i++;
+          remainingArgs.unshift(...expanded);
+          groupCount = expanded.length;
           continue;
         }
-
-        if (!allowPositionals && strict) {
-          throw new TypeError("Unexpected argument '" + arg + "'");
+        if (paIsShortOptionAndValue(arg, options)) {
+          const shortOption = arg.charAt(1);
+          const longOption = paFindLongOptionForShort(shortOption, options);
+          tokens.push({
+            kind: "option", name: longOption, rawName: `-${shortOption}`,
+            index, value: arg.slice(2), inlineValue: true,
+          });
+          continue;
         }
-        positionals.push(arg);
-        tokens.push({ kind: "positional", index: i, value: arg });
-        i++;
+        if (paIsLoneLongOption(arg)) {
+          const longOption = arg.slice(2);
+          let value;
+          let inlineValue;
+          if (paOptionGetOwn(options, longOption, "type") === "string" && nextArg != null) {
+            value = remainingArgs.shift();
+            inlineValue = false;
+          }
+          tokens.push({ kind: "option", name: longOption, rawName: arg, index, value, inlineValue });
+          if (value != null) ++index;
+          continue;
+        }
+        if (paIsLongOptionAndValue(arg)) {
+          const equalIndex = arg.indexOf("=");
+          const longOption = arg.slice(2, equalIndex);
+          tokens.push({
+            kind: "option", name: longOption, rawName: `--${longOption}`,
+            index, value: arg.slice(equalIndex + 1), inlineValue: true,
+          });
+          continue;
+        }
+        tokens.push({ kind: "positional", index, value: arg });
+      }
+      return tokens;
+    }
+    function parseArgs(config = {}) {
+      const args = paGetOwn(config, "args") ?? globalThis.process.argv.slice(2);
+      const strict = paGetOwn(config, "strict") ?? true;
+      const allowPositionals = paGetOwn(config, "allowPositionals") ?? !strict;
+      const returnTokens = paGetOwn(config, "tokens") ?? false;
+      const allowNegative = paGetOwn(config, "allowNegative") ?? false;
+      const options = paGetOwn(config, "options") ?? { __proto__: null };
+      const parseConfig = { args, strict, options, allowPositionals, allowNegative };
+
+      paValidateArray(args, "args");
+      paValidateBoolean(strict, "strict");
+      paValidateBoolean(allowPositionals, "allowPositionals");
+      paValidateBoolean(returnTokens, "tokens");
+      paValidateBoolean(allowNegative, "allowNegative");
+      paValidateObject(options, "options");
+      for (const { 0: longOption, 1: optionConfig } of Object.entries(options)) {
+        paValidateObject(optionConfig, `options.${longOption}`);
+        const optionType = paGetOwn(optionConfig, "type");
+        if (optionType !== "string" && optionType !== "boolean") {
+          throw new codes.ERR_INVALID_ARG_TYPE(
+            `options.${longOption}.type`, "('string|boolean')", optionType,
+          );
+        }
+        if (paHasOwn(optionConfig, "short")) {
+          const shortOption = optionConfig.short;
+          paValidateString(shortOption, `options.${longOption}.short`);
+          if (shortOption.length !== 1) {
+            throw new codes.ERR_INVALID_ARG_VALUE(
+              `options.${longOption}.short`, shortOption, "must be a single character",
+            );
+          }
+        }
+        const multipleOption = paGetOwn(optionConfig, "multiple");
+        if (paHasOwn(optionConfig, "multiple")) {
+          paValidateBoolean(multipleOption, `options.${longOption}.multiple`);
+        }
+        const defaultValue = paGetOwn(optionConfig, "default");
+        if (defaultValue !== undefined) {
+          const validator =
+            optionType === "string"
+              ? (multipleOption ? paValidateStringArray : paValidateString)
+              : (multipleOption ? paValidateBooleanArray : paValidateBoolean);
+          validator(defaultValue, `options.${longOption}.default`);
+        }
       }
 
-      var result = { values: values, positionals: positionals };
-      if (config.tokens) result.tokens = tokens;
+      // Phase 1: tokens. Phase 2: values and positionals.
+      const tokens = paArgsToTokens(args, options);
+      const result = { values: { __proto__: null }, positionals: [] };
+      if (returnTokens) result.tokens = tokens;
+      for (const token of tokens) {
+        if (token.kind === "option") {
+          if (strict) {
+            paCheckOptionUsage(parseConfig, token);
+            paCheckOptionLikeValue(token);
+          }
+          paStoreOption(token, options, result.values, allowNegative);
+        } else if (token.kind === "positional") {
+          if (!allowPositionals) {
+            throw new codes.ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL(token.value);
+          }
+          result.positionals.push(token.value);
+        }
+      }
+      // Phase 3: defaults for the options argv did not set. The default is
+      // stored as given and never appended to.
+      for (const { 0: longOption, 1: optionConfig } of Object.entries(options)) {
+        const defaultValue = paGetOwn(optionConfig, "default");
+        if (defaultValue !== undefined && result.values[longOption] === undefined) {
+          if (longOption !== "__proto__") result.values[longOption] = defaultValue;
+        }
+      }
       return result;
     }
 
@@ -8431,9 +8689,8 @@
         if (opts === null || typeof opts !== "object") {
           throw new codes.ERR_INVALID_ARG_TYPE("inspectOptions", "object", opts);
         }
-        _fmtOpts = { ...inspect.defaultOptions, ...opts };
         if (args.length === 0) return "";
-        return formatBody(args[0], args.slice(1));
+        return formatBody(args[0], args.slice(1), { ...inspect.defaultOptions, ...opts });
       },
       inspect,
       getCallSites,
@@ -8900,7 +9157,13 @@
         isSymbolObject: (v) => natives.v8Is(v, "symbolObject"),
         isBigIntObject: (v) => natives.v8Is(v, "bigIntObject"),
         isCryptoKey: (v) => typeof CryptoKey !== "undefined" && v instanceof CryptoKey,
-        isKeyObject: () => false,
+        // A KeyObject can only have come from node:crypto, so when that
+        // module was never loaded the answer is false without loading it.
+        isKeyObject: (v) => {
+          if (!registry.cache.has("crypto")) return false;
+          const KeyObject = registry.cache.get("crypto").KeyObject;
+          return typeof KeyObject === "function" && v instanceof KeyObject;
+        },
         isBoxedPrimitive: (v) =>
           natives.v8Is(v, "numberObject") ||
           natives.v8Is(v, "stringObject") ||
@@ -9890,7 +10153,10 @@
         // "does not match the expected pattern". A throw inside propagates.
         const ret = expected(err);
         if (ret === true) return true;
-        if (soft) return false;
+        // As the RegExp and class branches: with a custom message the caller
+        // builds the error that carries it (node v22.22.2:
+        // throws(fn, () => false, 'custom') fails with 'custom').
+        if (soft || message !== undefined) return false;
         // Node names the function in the message and only appends the caught
         // error when the thrown value actually is one.
         const fnName = expected.name ? `"${expected.name}" ` : "";
@@ -10035,7 +10301,9 @@
       }
       if (!expected) return actual;
       if (!checkExpected(actual, expected, operator, stackStartFn, false, message)) {
-        if (actual instanceof AssertionError) throw actual;
+        // A caught AssertionError is reported like any other mismatched
+        // error: node's message for throws(() => assert.ok(false), TypeError,
+        // 'custom') is 'custom', not the inner assertion's.
         const err = new AssertionError({
           actual,
           expected,
@@ -10202,10 +10470,8 @@
       doesNotThrow: doesNotThrowImpl,
       rejects,
       doesNotReject,
-      match: (string, regexp, message) => {
-        if (!regexp.test(string)) {
-          innerFail(string, regexp, message ?? `The input did not match the regular expression`, "match");
-        }
+      match: function match(string, regexp, message) {
+        internalMatch(string, regexp, message, true, match);
       },
       ifError: (err) => {
         if (err !== null && err !== undefined) {
@@ -10253,10 +10519,8 @@
           throw newErr;
         }
       },
-      doesNotMatch: (string, regexp, message) => {
-        if (regexp.test(string)) {
-          innerFail(string, regexp, message ?? `The input was expected to not match`, "doesNotMatch");
-        }
+      doesNotMatch: function doesNotMatch(string, regexp, message) {
+        internalMatch(string, regexp, message, false, doesNotMatch);
       },
     });
     // assert.strict: equal family promoted to strict semantics.
@@ -10393,27 +10657,46 @@
         throw new AssertionError({ message, details: errors });
       }
     };
-    // ---- regexp validation for match / doesNotMatch ----
-    function validateRegExp(regexp, name) {
+    // ---- match / doesNotMatch: node's internalMatch (lib/assert.js) ----
+    // Probed on node v22.22.2: a non-RegExp `regexp` is ERR_INVALID_ARG_TYPE;
+    // a non-string input FAILS either assertion (it is never coerced, so
+    // match(123, /2/) does not pass); the generated text names the regexp
+    // and the input and sets generatedMessage; an Error passed as the
+    // message is thrown as is.
+    function internalMatch(string, regexp, message, wantMatch, fn) {
       if (!(regexp instanceof RegExp)) {
-        throw new codes.ERR_INVALID_ARG_TYPE(name, "RegExp", regexp);
+        throw new codes.ERR_INVALID_ARG_TYPE("regexp", "RegExp", regexp);
       }
+      if (typeof string === "string" && (RegExp.prototype.exec.call(regexp, string) !== null) === wantMatch) {
+        return;
+      }
+      if (message instanceof Error) throw message;
+      const generatedMessage = !message;
+      if (!message) {
+        message =
+          typeof string !== "string"
+            ? `The "string" argument must be of type string. Received type ${typeof string} (${util.inspect(string)})`
+            : (wantMatch
+                ? "The input did not match the regular expression "
+                : "The input was expected to not match the regular expression ") +
+              `${util.inspect(regexp)}. Input:\n\n${util.inspect(string)}\n`;
+      }
+      const err = new AssertionError({
+        actual: string,
+        expected: regexp,
+        message,
+        operator: wantMatch ? "match" : "doesNotMatch",
+        stackStartFn: fn,
+      });
+      err.generatedMessage = generatedMessage;
+      throw err;
     }
-    const origMatch = assert.match;
-    assert.match = (string, regexp, message) => {
-      validateRegExp(regexp, "regexp");
-      return origMatch(string, regexp, message);
-    };
-    const origDoesNotMatch = assert.doesNotMatch;
-    assert.doesNotMatch = (string, regexp, message) => {
-      validateRegExp(regexp, "regexp");
-      return origDoesNotMatch(string, regexp, message);
-    };
 
     // ---- partialDeepStrictEqual ----
-    // A structural "expected is a partial subset of actual" check. Full
-    // colored Myers-diff message output is out of scope; the function exists,
-    // validates arity, and throws an ERR_ASSERTION AssertionError on mismatch.
+    // A structural "expected is a partial subset of actual" check: validates
+    // arity and throws an ERR_ASSERTION AssertionError on mismatch, whose
+    // generated message is the diff AssertionError builds for this operator
+    // (createErrDiff), as for deepStrictEqual.
     function partialDeepStrictEqual(actual, expected, message) {
       if (arguments.length < 2) {
         throw new codes.ERR_MISSING_ARGS("actual", "expected");
@@ -11218,9 +11501,9 @@
   // an error beats the alternative: the walker's `out.push()` loop has no
   // yield points, so a 100k+ match glob against a deep tree can grow the V8
   // heap past 1 GiB and trip "Ineffective mark-compacts near heap limit",
-  // aborting the whole process (no graceful exit). The dedup pass below
-  // also early-aborts once the unique count clears the cap, bounding the
-  // worst-case heap cost to roughly:
+  // aborting the whole process (no graceful exit). The cap is enforced as
+  // the walker records each unique match (emitMatch), so the walk itself
+  // stops one match past it, bounding the worst-case heap cost to roughly:
   //   `out` array   ~ 24 MB / 1M entries (pointers)
   //   `emitted` Set ~ 80 MB / 1M entries (string hash + value)
   //   result strings ~ 300 MB / 1M entries @ ~300-byte avg paths
@@ -11232,13 +11515,20 @@
   // `Infinity` disables it.
   const DEFAULT_MAX_RESULTS = 1_000_000;
 
-  // Pattern -> { regex, hasMagic }. Splits on `/`, normalizes path separators
-  // internally. `*` is any-non-slash, `**` is any (incl. slash), `?` one-
-  // non-slash, `[abc]` / `[!abc]` char classes, `{a,b}` brace expansion (one
-  // level deep; backslash escapes `,` `}` `{`). `**` followed by a literal
-  // segment in the same pattern (e.g. `a/**/b`) lets the `**` match zero or
-  // more directories by absorbing the trailing `/` so the regex doesn't pin
-  // a literal slash at that point.
+  // Pattern -> { regex, hasMagic }. The pattern is `/`-separated and may be
+  // a single segment (the walker compiles one at a time) or a whole path
+  // (path.matchesGlob, array `exclude`, `include`). `*` is any-non-slash,
+  // `?` one-non-slash, `[abc]` / `[!abc]` char classes, `{a,b}` brace
+  // alternatives (each compiled recursively, so one may contain `/`;
+  // backslash escapes `,` `}` `{`). `**` as a whole segment is a globstar:
+  // before a `/` it matches zero or more directories and absorbs that slash
+  // (`a/**/b` matches `a/b`), and as the last segment it matches everything
+  // below. A path segment that starts with "." is matched only by a pattern
+  // segment that spells the dot out: a wildcard at the start of a segment
+  // refuses one and a globstar does not cross one. That is minimatch
+  // without `dot`, which is how node v22.22.2 runs path.matchesGlob,
+  // fs.glob and its array `exclude` alike (`*` does not yield `.a`, `**/s.js`
+  // does not find `v/.w/s.js`, `.h/*` and `**/.w/s.js` do find theirs).
   // Case sensitivity is PLATFORM-derived, never user-supplied: node v22
   // validates only cwd/exclude/withFileTypes and silently IGNORES a `nocase`
   // option, while its internal minimatch instances are hard-wired with
@@ -11257,30 +11547,59 @@
     return GLOB_FOLD_CASE;
   }
 
+  // globToRegex's `opts` for a brace alternative that starts in the middle
+  // of a path segment (`x{*,y}`), where a leading wildcard is not at a
+  // segment start. Recognized by identity, never by a key: the walker hands
+  // globToRegex the caller's own options object.
+  var GLOB_MID_SEGMENT = {};
+
   function globToRegex(pattern, opts) {
     var nocase = globFoldCase();
-    var segs = pattern.split("/");
     var re = "^";
     var hasMagic = false;
-    for (var si = 0; si < segs.length; si++) {
-      var seg = segs[si];
+    var midSeg = opts === GLOB_MID_SEGMENT;
+    {
+      // One pass over the WHOLE pattern. (It used to be split on "/" first,
+      // which left the globstar's slash-absorb below unreachable and cut a
+      // brace group such as `{src/a,lib}` in two.)
+      var seg = pattern;
       var segRe = "";
       var segMagic = false;
       for (var i = 0; i < seg.length; i++) {
         var c = seg[i];
+        var segStart = i === 0 ? !midSeg : seg[i - 1] === "/";
+        // What keeps a wildcard at a segment start off a dot-leading name.
+        var dotGuard = segStart ? "(?!\\.)" : "";
         if (c === "*") {
           if (seg[i + 1] === "*") {
             segMagic = true;
-            segRe += ".*";
+            // A globstar only when `**` is a whole path segment. Followed
+            // by "/" it matches zero or more directories and takes that
+            // slash with it (`**/*.js` matches `foo.js`, `a/**/b` matches
+            // `a/b`); as the last segment it matches the rest of the path;
+            // anywhere else (`a**b`) it is a plain `*`. Each shape checked
+            // against path.matchesGlob on node v22.22.2.
+            // Exactly two stars: a run of three or more is a plain `*`
+            // (`***` matches `a` and not `a/b` there).
+            var wholeSeg = segStart;
+            var starsFrom = i;
             while (i + 1 < seg.length && seg[i + 1] === "*") i++;
-            if (i + 1 < seg.length && seg[i + 1] === "/") i++;
+            if (i - starsFrom !== 1) wholeSeg = false;
+            if (wholeSeg && i + 1 === seg.length) {
+              segRe += "(?:(?!\\.)[^/]+(?:/|$))*";
+            } else if (wholeSeg && seg[i + 1] === "/") {
+              segRe += "(?:(?!\\.)[^/]+/)*";
+              i++;
+            } else {
+              segRe += dotGuard + "[^/]*";
+            }
           } else {
             segMagic = true;
-            segRe += "[^/]*";
+            segRe += dotGuard + "[^/]*";
           }
         } else if (c === "?") {
           segMagic = true;
-          segRe += "[^/]";
+          segRe += dotGuard + "[^/]";
         } else if (c === "[") {
           segMagic = true;
           var cls = "";
@@ -11292,11 +11611,13 @@
             cls += seg[i];
             i++;
           }
-          segRe += "[" + cls + "]";
+          // A class that lists the dot itself spells it out.
+          segRe += (cls[0] === "^" || cls.indexOf(".") === -1 ? dotGuard : "") + "[" + cls + "]";
         } else if (c === "{") {
           segMagic = true;
           var depth = 1;
           var body = "";
+          var altOpts = segStart ? undefined : GLOB_MID_SEGMENT;
           i++;
           while (i < seg.length && depth > 0) {
             if (seg[i] === "\\" && i + 1 < seg.length) { body += seg[i] + seg[i + 1]; i += 2; continue; }
@@ -11320,7 +11641,7 @@
           var inner = "(?:";
           for (var k = 0; k < alts.length; k++) {
             if (k > 0) inner += "|";
-            inner += globToRegex(alts[k], opts).source.slice(1, -1);
+            inner += globToRegex(alts[k], altOpts).source.slice(1, -1);
           }
           segRe += inner + ")";
         } else if (c === "\\") {
@@ -11334,7 +11655,6 @@
       }
       hasMagic = hasMagic || segMagic;
       re += segRe;
-      if (si < segs.length - 1) re += "/";
     }
     return { regex: new RegExp(re + "$", nocase ? "i" : ""), source: re + "$", hasMagic: hasMagic };
   }
@@ -11350,13 +11670,20 @@
   // `**` is the twist: it can match zero or more directories. The walker
   // therefore treats `**` as "consume the segment AND try to skip it (try the
   // empty match first); if a directory entry fits, also descend through it."
-  // The cycle check on `follow:true` records every ancestor inode we've
-  // recursed into; revisiting one would loop forever, so we throw ELOOP.
+  // The cycle check on `follow:true` (globEnterDir) records the identity of
+  // every ancestor directory we've recursed into; revisiting one would loop
+  // forever, so we throw ELOOP.
   function globWalk(opts, natives, cwd, segs, pos, base, visited, out, sep, absolutePattern) {
     var seg = segs[pos];
     var names, kinds;
     try {
-      [names, kinds] = natives.fsReaddirSync(base);
+      // An absolute pattern whose first walked segment sits directly under
+      // the filesystem root has the root as its base with the separator
+      // split off: "" for `/x`, a bare `C:` for `C:/x`. Put it back for the
+      // listing -- a bare `C:` would list the drive's current directory.
+      [names, kinds] = natives.fsReaddirSync(
+        base === "" || /^[A-Za-z]:$/.test(base) ? base + "/" : base,
+      );
     } catch (e) {
       // Missing directories (ENOENT), non-directory paths (ENOTDIR), and any
       // other readdir failure are silently treated as zero matches -- matches
@@ -11437,7 +11764,13 @@
       // emitting the directory itself would shadow the per-segment match in
       // action 1 (a/ would show up in **/*.js, which isn't what callers want).
       if (isGlobStar) {
+        // A globstar neither yields nor crosses a dot-leading name (`**`
+        // lists no `.git`, `**/s.js` does not find `v/.w/s.js`); the
+        // segment after it may still name one (`**/.w/s.js`), which is the
+        // zero-directory match below.
+        var dotName = name.charCodeAt(0) === 46;
         if (isLast) {
+          if (dotName) continue;
           // node v22 emits directories from a terminal `**` regardless of
           // nodir:true (verified empirically against v22.22.2). The
           // non-globstar terminal branch honors nodir because literal pattern
@@ -11454,14 +11787,18 @@
           // gate -- a separate recursive call to `globWalk` would re-enter
           // the non-globstar terminal branch and exclude by full relative
           // path, which would over-exclude `a/b.js` under a globstar.
-          // nodir is the cheaper probe and gates every directory entry before
-          // we pay for a regex match; check it first, then match the leaf.
-          if (opts.nodir === true && kind === "dir") continue;
+          // That holds only when the next segment is the pattern's LAST: a
+          // directory matches it as a file does (`**/test` yields every
+          // `test` directory), and nodir drops the directory from the
+          // results without stopping the descent below. With more pattern
+          // after it, the entry has to be a directory to walk on from --
+          // see the descent block.
           if (
-            kind !== "dir" &&
-            matchSegment(nextSeg, nextCompiled, nextIsMagic, name, false)
+            pos + 1 === segs.length - 1 &&
+            !(opts.nodir === true && kind === "dir") &&
+            matchSegment(nextSeg, nextCompiled, nextIsMagic, name, false) &&
+            !(Array.isArray(opts.exclude) && matchExclude(opts.exclude, rel))
           ) {
-            if (Array.isArray(opts.exclude) && matchExclude(opts.exclude, rel)) continue;
             emitMatch(opts, natives, base, rel, childPath, kind, out, sep, absolutePattern);
           }
         }
@@ -11474,13 +11811,24 @@
           if (excludeFn && excludeFn(rel)) continue;
           if (opts.follow === true && kind === "symlink") {
             try { natives.fsReaddirSync(childPath); } catch (e) { continue; }
-            if (visited.has(childPath)) {
-              throw makeSystemError("ELOOP", "glob", childPath);
-            }
-            visited.add(childPath);
           }
-          globWalk(opts, natives, cwd, segs, pos, childPath, visited, out, sep, absolutePattern);
-          if (opts.follow === true && kind === "symlink") visited.delete(childPath);
+          var starDirId = globEnterDir(opts, natives, childPath, visited);
+          // The zero-directory match with more pattern left: this directory
+          // stands where the next segment does, so the walk goes on inside
+          // it from the segment after that (`**/test/*.js` reaches
+          // `test/t.js`, `**/a/b/c.js` reaches `a/b/c.js`).
+          if (
+            !isLast &&
+            pos + 1 < segs.length - 1 &&
+            matchSegment(nextSeg, nextCompiled, nextIsMagic, name, false)
+          ) {
+            globEmitSelfForFinalStar(opts, natives, segs, pos + 2, base, rel, childPath, kind, out, sep, absolutePattern);
+            globWalk(opts, natives, cwd, segs, pos + 2, childPath, visited, out, sep, absolutePattern);
+          }
+          if (!dotName) {
+            globWalk(opts, natives, cwd, segs, pos, childPath, visited, out, sep, absolutePattern);
+          }
+          if (starDirId !== undefined) visited.delete(starDirId);
         }
       } else if (isLast) {
         if (opts.nodir === true && kind === "dir") continue;
@@ -11489,15 +11837,46 @@
       } else if (kind === "dir" || (opts.follow === true && kind === "symlink")) {
         if (opts.follow === true && kind === "symlink") {
           try { natives.fsReaddirSync(childPath); } catch (e) { continue; }
-          if (visited.has(childPath)) {
-            throw makeSystemError("ELOOP", "glob", childPath);
-          }
-          visited.add(childPath);
         }
+        var dirId = globEnterDir(opts, natives, childPath, visited);
+        globEmitSelfForFinalStar(opts, natives, segs, pos + 1, base, rel, childPath, kind, out, sep, absolutePattern);
         globWalk(opts, natives, cwd, segs, pos + 1, childPath, visited, out, sep, absolutePattern);
-        if (opts.follow === true && kind === "symlink") visited.delete(childPath);
+        if (dirId !== undefined) visited.delete(dirId);
       }
     }
+  }
+
+  // A `**` that ends the pattern matches zero directories too, so the
+  // directory the walk is about to enter AT that segment is itself a match:
+  // `sub/**` yields `sub` as well as what is below it, and `**/deep/**`
+  // yields each `deep` (node v22.22.2's fs.globSync, same tree). A no-op
+  // for any other segment. A terminal `**` reports directories whatever
+  // `nodir` says, as its own branch of the walker does.
+  function globEmitSelfForFinalStar(opts, natives, segs, nextPos, base, rel, childPath, kind, out, sep, absolutePattern) {
+    if (nextPos !== segs.length - 1 || segs[nextPos] !== "**") return;
+    if (opts.exclude && matchExclude(opts.exclude, rel)) return;
+    emitMatch(opts, natives, base, rel, childPath, kind, out, sep, absolutePattern);
+  }
+
+  // With follow:true, records the directory `dirPath` resolves to among the
+  // ancestors being walked and returns its identity, for the caller to
+  // remove once that subtree is done. A directory that is ALREADY one of
+  // them was reached again through a link, and descending would never end:
+  // ELOOP. The identity is the file's exact dev:ino (statFileId) -- a path
+  // cannot serve, since every trip round a link cycle has a longer one.
+  // undefined without follow, or where the identity cannot be read.
+  function globEnterDir(opts, natives, dirPath, visited) {
+    if (opts.follow !== true) return undefined;
+    var id;
+    try {
+      id = statFileId(natives.fsStatSync(dirPath, false, true, statSyncValues));
+    } catch (e) {
+      return undefined;
+    }
+    if (id === undefined) return undefined;
+    if (visited.has(id)) throw makeSystemError("ELOOP", "glob", dirPath);
+    visited.add(id);
+    return id;
   }
 
   // Literal segments fold case on case-insensitive platforms EXCEPT under a
@@ -11521,26 +11900,90 @@
   function matchExclude(exclude, relPath) {
     if (typeof exclude === "function") return exclude(relPath);
     if (Array.isArray(exclude)) {
+      // The patterns are `/`-separated globs; on win32 the walker's relative
+      // path is `\`-separated and node matches the two all the same (probed
+      // on v22.22.2: exclude ['sub/**'] drops sub\l.js), so both sides are
+      // brought to `/` there. Elsewhere a backslash is an ordinary character.
+      var win = globalThis.process && globalThis.process.platform === "win32";
+      var subject = win ? relPath.replace(/\\/g, "/") : relPath;
       for (var i = 0; i < exclude.length; i++) {
-        if (globToRegex(exclude[i], {}).regex.test(relPath)) return true;
+        var pat = win ? exclude[i].replace(/\\/g, "/") : exclude[i];
+        if (globToRegex(pat, {}).regex.test(subject)) return true;
       }
     }
     return false;
   }
 
+  // Records one match in `out`, once: the walker reaches the same entry more
+  // than once under `**` (the zero-directory match and each deeper descent),
+  // so `out.seen` holds what is already there. `out.cap` is the
+  // `maxResults` bound, enforced HERE so that a runaway pattern stops at
+  // cap + 1 unique matches instead of after the whole tree was collected.
   function emitMatch(opts, natives, parentPath, rel, childPath, kind, out, sep, absolutePattern) {
+    var leaf = opts.withFileTypes ? rel.split(sep).pop() : null;
+    // `absolute` is a no-op in node v22 unless the pattern itself is absolute:
+    // a relative pattern always yields relative paths even with absolute:true,
+    // an absolute pattern always yields absolute paths even without the flag.
+    var item = absolutePattern ? childPath : rel;
+    var key = opts.withFileTypes ? leaf + "|" + parentPath + "|" + kind : item;
+    if (out.seen !== undefined) {
+      if (out.seen.has(key)) return;
+      if (out.length >= out.cap) {
+        throw codes.ERR_OUT_OF_RANGE(
+          "results",
+          "<= " + out.cap + " (set options.maxResults higher or narrow the pattern)",
+          out.length + 1,
+        );
+      }
+      out.seen.add(key);
+    }
     if (opts.withFileTypes) {
       // Dirent's `name` is the leaf, `parentPath` is the containing directory.
       // The walker threads `parentPath` (the readdir base) through, not the
       // glob root -- otherwise entries inside a/b/ would all claim the same
       // parent as the cwd.
-      out.push(new Dirent(rel.split(sep).pop(), parentPath, kind));
+      out.push(new Dirent(leaf, parentPath, kind));
       return;
     }
-    // `absolute` is a no-op in node v22 unless the pattern itself is absolute:
-    // a relative pattern always yields relative paths even with absolute:true,
-    // an absolute pattern always yields absolute paths even without the flag.
-    out.push(absolutePattern ? childPath : rel);
+    out.push(item);
+  }
+
+  // Expands the first brace group whose body contains a `/` into one pattern
+  // per alternative, recursively, so that no remaining group spans a path
+  // segment. A group without a slash is left for globToRegex, and a pattern
+  // with no such group comes back alone. The caller has already turned `\`
+  // into `/`, so there are no escapes to honor here.
+  function globExpandSlashBraces(pattern) {
+    for (var open = pattern.indexOf("{"); open !== -1; open = pattern.indexOf("{", open + 1)) {
+      var depth = 1;
+      var close = -1;
+      var hasSlash = false;
+      var commas = [];
+      for (var i = open + 1; i < pattern.length; i++) {
+        var c = pattern[i];
+        if (c === "{") depth++;
+        else if (c === "}") {
+          depth--;
+          if (depth === 0) { close = i; break; }
+        } else if (c === "/") hasSlash = true;
+        else if (c === "," && depth === 1) commas.push(i);
+      }
+      // An unclosed brace is not a group: nothing here or after it expands.
+      if (close === -1) break;
+      if (!hasSlash) continue;
+      var head = pattern.slice(0, open);
+      var tail = pattern.slice(close + 1);
+      var result = [];
+      var from = open + 1;
+      commas.push(close);
+      for (var k = 0; k < commas.length; k++) {
+        var expanded = globExpandSlashBraces(head + pattern.slice(from, commas[k]) + tail);
+        for (var e = 0; e < expanded.length; e++) result.push(expanded[e]);
+        from = commas[k] + 1;
+      }
+      return result;
+    }
+    return [pattern];
   }
 
   // Public entry used by the three factories. Validates args; everything
@@ -11571,22 +12014,18 @@
     var maxResults;
     if (typeof opts.maxResults === "number") {
       if (Number.isFinite(opts.maxResults)) {
-        if (opts.maxResults > 0) {
+        // Floored first: 1.5 is a cap of 1. What floors to zero or below
+        // (0, a negative, 0.5) is rejected loudly, so the caller neither
+        // quietly gets 1M matches nor a cap of zero that fails on the
+        // first match.
+        if (Math.floor(opts.maxResults) > 0) {
           maxResults = Math.floor(opts.maxResults);
         } else {
-          // Finite but non-positive: zero or negative. Reject loudly so the
-          // caller doesn't quietly get 1M matches. Floats get floored first
-          // so 1.5 -> 1 (valid) lands in the cap branch, and 0.5 -> 0 hits
-          // here as "user asked for zero".
-          if (Math.floor(opts.maxResults) > 0) {
-            maxResults = Math.floor(opts.maxResults);
-          } else {
-            throw codes.ERR_OUT_OF_RANGE(
-              "options.maxResults",
-              "a positive integer or Infinity",
-              opts.maxResults,
-            );
-          }
+          throw codes.ERR_OUT_OF_RANGE(
+            "options.maxResults",
+            "a positive integer or Infinity",
+            opts.maxResults,
+          );
         }
       } else if (opts.maxResults === Infinity) {
         maxResults = Infinity;
@@ -11612,50 +12051,78 @@
         opts.maxResults,
       );
     }
-    var normalized = pattern.replace(/\\/g, "/");
-    if (normalized.startsWith("./")) normalized = normalized.slice(2);
-    var segs = normalized.split("/");
-    var cwd = opts.cwd ? String(opts.cwd) : ".";
-    var isAbsolute = normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized);
-    // For absolute patterns, the walker should start at the directory portion
-    // of the path (everything except the last segment). The pattern's
-    // trailing component is then matched against the listing in that dir.
-    // Relative patterns start at cwd.
-    var root, startSeg;
-    if (isAbsolute) {
-      // pattern[0] is "/" (POSIX) or the drive letter (Windows). Walk starts
-      // at the directory containing the final segment. The segments were
-      // normalized to '/', so rejoin with the platform's native separator --
-      // the original pattern uses '\\' on Windows and node emits '\\' in the
-      // result.
-      startSeg = segs.length - 1;
-      root = segs.slice(0, startSeg).join(pattern.indexOf("\\") !== -1 ? "\\" : "/");
-    } else {
-      startSeg = 0;
-      root = cwd;
-    }
-    // Path separator for joining the root with descendant names during
-    // traversal. For relative cwd, derive from the cwd itself (Windows cwd
-    // uses '\\', POSIX uses '/'). For absolute patterns the root above
-    // already carries the platform separator.
-    var sep = root.indexOf("\\") !== -1 ? "\\" : "/";
     var out = [];
-    var seen = new Set();
-    // `**` matches the cwd itself (`.` on a relative cwd) in addition to
-    // everything below it -- this is the documented node behavior and the
-    // shape most tooling (lint, prettier ignore globs) relies on. The `.`
-    // is emitted in string form even with nodir:true; for withFileTypes the
-    // walker handles the cwd-self via the normal descent path (the cwd's
-    // own children get emitted, not a synthetic "." Dirent).
-    if (segs.length === 1 && segs[0] === "**" && !opts.withFileTypes) {
-      out.push(isAbsolute ? root : ".");
+    // emitMatch's dedup set and result cap (see there).
+    out.seen = new Set();
+    out.cap = maxResults;
+    var isAbsolute = false;
+    // The walker takes the pattern one `/`-separated segment at a time, so a
+    // brace group that spans segments (`{src/a,lib}/*.ts`) is expanded into
+    // one pattern per alternative first and each is walked into the same
+    // `out`.
+    var patterns = globExpandSlashBraces(pattern.replace(/\\/g, "/"));
+    for (var pi = 0; pi < patterns.length; pi++) {
+      var normalized = patterns[pi];
+      if (normalized.startsWith("./")) normalized = normalized.slice(2);
+      // `**/**` is one globstar: a run of them matches what a single one does.
+      var segs = normalized.split("/").filter(function (s, at, all) {
+        return !(s === "**" && at > 0 && all[at - 1] === "**");
+      });
+      var cwd = opts.cwd ? String(opts.cwd) : ".";
+      isAbsolute = normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized);
+      // For absolute patterns, the walker starts at the longest magic-free
+      // directory prefix and walks every segment after it: `/proj/**/*.js`
+      // starts at `/proj` with `**` as its first segment. (Starting at
+      // "everything except the last segment" made a wildcard in any earlier
+      // segment a literal directory name, whose failed readdir read as zero
+      // matches.) The final segment is always left to match against a listing.
+      // Relative patterns start at cwd.
+      var root, startSeg;
+      if (isAbsolute) {
+        // pattern[0] is "/" (POSIX) or the drive letter (Windows). The segments
+        // were normalized to '/', so rejoin with the platform's native
+        // separator -- the original pattern uses '\\' on Windows and node emits
+        // '\\' in the result.
+        startSeg = segs.length - 1;
+        for (var mi = 1; mi < segs.length - 1; mi++) {
+          if (globToRegex(segs[mi], opts).hasMagic) { startSeg = mi; break; }
+        }
+        root = segs.slice(0, startSeg).join(pattern.indexOf("\\") !== -1 ? "\\" : "/");
+      } else {
+        startSeg = 0;
+        root = cwd;
+      }
+      // Path separator for joining the root with descendant names during
+      // traversal. For relative cwd, derive from the cwd itself (Windows cwd
+      // uses '\\', POSIX uses '/'). For absolute patterns the root above
+      // already carries the platform separator.
+      // A root with no separator left in it (`C:` for `C:\*\x`, "" for `/*`)
+      // cannot show the pattern's style, so an absolute pattern reads it off
+      // the pattern, exactly as the root's own join above does.
+      var sep = (isAbsolute ? pattern.indexOf("\\") !== -1 : root.indexOf("\\") !== -1) ? "\\" : "/";
+      // The ancestors of the directory being walked, by identity, for
+      // follow:true's cycle check; the root is the first of them.
+      var seen = new Set();
+      globEnterDir(opts, natives, root === "" || /^[A-Za-z]:$/.test(root) ? root + "/" : root, seen);
+      // `**` matches the cwd itself (`.` on a relative cwd) in addition to
+      // everything below it -- this is the documented node behavior and the
+      // shape most tooling (lint, prettier ignore globs) relies on. The `.`
+      // is emitted in string form even with nodir:true; for withFileTypes the
+      // walker handles the cwd-self via the normal descent path (the cwd's
+      // own children get emitted, not a synthetic "." Dirent).
+      if (segs.length === 1 && segs[0] === "**" && !opts.withFileTypes) {
+        out.push(isAbsolute ? root : ".");
+      }
+      globWalk(opts, natives, root, segs, startSeg, root, seen, out, sep, isAbsolute);
     }
-    globWalk(opts, natives, root, segs, startSeg, root, seen, out, sep, isAbsolute);
     out.sort();
     // The walker explores each match multiple times when `**` is involved
     // (zero-segment match + every-depth descent). Real Node deduplicates via
     // a realpath cache; a path-set is enough for our purposes and avoids
-    // the extra stat.
+    // the extra stat. emitMatch has already dropped those repeats and
+    // enforced the cap during the walk; this pass covers the one entry
+    // pushed without it (the `.` of a bare `**`) and keeps the cap check in
+    // one more place.
     var deduped = [];
     var emitted = new Set();
     var overCap = false;
@@ -11721,16 +12188,28 @@
     };
   }
 
-  // path.matchesGlob shares the regex compiler but treats its input as a
-  // single-name match (no slash splitting). path/posix and path/win32 both
-  // forward to it (the underlying match is separator-agnostic on this side;
-  // the path module picks the separator when splitting).
-  function pathMatchesGlob(p, pattern) {
+  // path.matchesGlob shares the regex compiler, which takes a `/`-separated
+  // pattern and matches a `/`-separated path. Node runs both flavours with
+  // minimatch's windowsPathsNoEscape, so a `\` in the PATTERN is a
+  // separator in either flavour, never an escape; a `\` in the PATH is a
+  // separator only for path.win32.matchesGlob (the `windows` flag). So
+  // win32 matches `a\b.js` against `a/*.js` and `a\*.js`, posix matches
+  // `a/b.js` (not `a\b.js`) against `a\*.js`, and neither matches `a*b`
+  // against `a\*b` (probed on v22.22.2).
+  function pathMatchesGlob(p, pattern, windows) {
     if (typeof p !== "string") throw codes.ERR_INVALID_ARG_TYPE("path", "string", p);
     if (typeof pattern !== "string") throw codes.ERR_INVALID_ARG_TYPE("pattern", "string", pattern);
+    pattern = pattern.replaceAll("\\", "/");
+    if (windows) p = p.replaceAll("\\", "/");
     var compiled = globToRegex(pattern, {});
     if (!compiled.hasMagic) return p === pattern;
     return compiled.regex.test(p);
+  }
+  function pathMatchesGlobPosix(p, pattern) {
+    return pathMatchesGlob(p, pattern, false);
+  }
+  function pathMatchesGlobWin32(p, pattern) {
+    return pathMatchesGlob(p, pattern, true);
   }
 
   function readOptions(options) {
@@ -15507,6 +15986,16 @@
           }
         }, function () {});
       }, interval);
+      // node's StatWatcher holds the loop open unless `persistent` is false
+      // (lib/fs.js watchFile defaults it to true; StatWatcher[kFSStatWatcherStart]
+      // unrefs the handle otherwise), and its ref() / unref() move the same
+      // handle. The poller is this interval, so that is what they move.
+      var setRefed = function (on) {
+        if (stopped || !poll) return;
+        if (on) { if (typeof poll.ref === "function") poll.ref(); }
+        else if (typeof poll.unref === "function") poll.unref();
+      };
+      if (opts.persistent === false) setRefed(false);
       var stop = function () {
         stopped = true;
         clearInterval(poll);
@@ -15520,8 +16009,8 @@
         // fsUnwatchFile(path, listener) stopped every sibling poller whenever
         // the listener was not unique to this watcher.
         close: function () { stopWatchEntries(filePath, function (entry) { return entry === self; }); },
-        ref: function () { return this; },
-        unref: function () { return this; },
+        ref: function () { setRefed(true); return this; },
+        unref: function () { setRefed(false); return this; },
       };
     }
 
@@ -15582,17 +16071,10 @@
       // node's does. The raw `promises` above, which throws a bad path
       // synchronously, stays internal to the callback forms.
       promises: registry.get("fs/promises"),
-      constants: {
-        F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
-        ...openFlagBits(natives),
-        S_IFMT: 61440, S_IFREG: 32768, S_IFDIR: 16384, S_IFLNK: 40960,
-        S_IFBLK: 24576, S_IFCHR: 8192, S_IFIFO: 4096, S_IFSOCK: 49152,
-        S_IRUSR: 256, S_IWUSR: 128, S_IXUSR: 64,
-        S_IRGRP: 32, S_IWGRP: 16, S_IXGRP: 8,
-        S_IROTH: 4, S_IWOTH: 2, S_IXOTH: 1,
-        COPYFILE_EXCL: 1, COPYFILE_FICLONE: 2, COPYFILE_FICLONE_FORCE: 4,
-        UV_FS_SYMLINK_DIR: 1, UV_FS_SYMLINK_JUNCTION: 2,
-      },
+      // The ONE constants object, built in the fs/promises factory: node's
+      // `fs.constants === fsPromises.constants`, and one literal cannot drift
+      // from a second copy of itself.
+      constants: promises.constants,
       // node re-exports the four access-mode constants at the TOP level of
       // node:fs as well as under fs.constants, and code destructures them
       // from the module (`const { R_OK } = require("fs")`) -- as named ESM
@@ -16008,10 +16490,17 @@
         cpCallbackified ??= registry.get("util").callbackify(cpAsync);
         cpCallbackified(from, to, opts, callback);
       },
-      exists: (path, cb) => {
-        // Deprecated single-arg callback shape, still in the wild. A path
-        // node cannot validate is simply false, as in existsSync.
-        cb(fs.existsSync(path));
+      // Deprecated single-arg callback shape, still in the wild. As node's
+      // (lib/fs.js): the callback is checked first ("cb"), the answer is an
+      // fs.access(F_OK) delivered on a later tick -- never inside the call --
+      // and only a path node cannot validate answers false at once.
+      exists: function exists(path, cb) {
+        validateCb(cb);
+        try {
+          fs.access(path, 0, function (err) { cb(err ? false : true); });
+        } catch {
+          return cb(false);
+        }
       },
 
       // fd-based callback ops (chokidar etc. do promisify(fs.open)). The
@@ -16066,8 +16555,11 @@
       //   fs.write(fd, buffer, options, cb)
       //   fs.write(fd, string[, position[, encoding]], cb)
       // fd 1/2 route to the stdout/stderr sinks (pino/sonic-boom's default
-      // async destination writes here); other fds use the sync native op
-      // dispatched on a microtask to preserve the async callback contract.
+      // async destination writes here); other fds use the sync native op.
+      // The write itself runs INSIDE the call, on the loop thread (the
+      // divergence docs/node-divergences.md records); only the callback is
+      // deferred, to the tick queue, and the request is counted as active
+      // (an FSReqCallback) until it is delivered, as node's is.
       // node's argument handling (lib/fs.js, v22.22.2), all of it thrown at
       // the call: the descriptor first (its JS getValidatedFd, validateFd),
       // then for a buffer the callback -- the last of position, length,
@@ -16112,10 +16604,12 @@
           // node's callback for a failed write is (err, 0, data), not (err):
           // its wrapper passes `written || 0` and the buffer or string
           // either way (measured on v22.22.2, fd 1 and a read-only fd).
-          process.nextTick(function () { cb(e, 0, data); });
+          var failedToken = fsReqStart();
+          process.nextTick(function () { fsReqEnd(failedToken); cb(e, 0, data); });
           return;
         }
-        process.nextTick(function () { cb(null, n, data); });
+        var token = fsReqStart();
+        process.nextTick(function () { fsReqEnd(token); cb(null, n, data); });
       },
       read: function read(fd, buffer, offsetOrOptions, length, position, cb) {
         // node's JS getValidatedFd, before any other argument (validateFd).
@@ -16247,6 +16741,15 @@
     const fchmodCb = fdCallbackOp((fd, mode) => natives.fsFchmod(fd, mode));
     const fchownCb = fdCallbackOp((fd, uid, gid) => natives.fsFchown(fd, uid, gid));
     const futimesCb = fdCallbackOp((fd, atime, mtime) => natives.fsFutimes(fd, atime, mtime));
+    // node's kCustomPromisifiedSymbol on fs.exists: its callback takes the
+    // answer where every other takes an error, so util.promisify(fs.exists)
+    // resolves with the boolean instead of rejecting with `true`.
+    Object.defineProperty(fs.exists, Symbol.for("nodejs.util.promisify.custom"), {
+      __proto__: null,
+      value: function exists(path) {
+        return new Promise((resolve) => fs.exists(path, resolve));
+      },
+    });
     fs.fsync = function fsync(fd, cb) { fsyncCb(cb, fd); };
     fs.fdatasync = function fdatasync(fd, cb) { fdatasyncCb(cb, fd); };
     // Their other arguments are node's validators, checked first: the length
@@ -16638,6 +17141,10 @@
     // runtime at startup. Node lazy-initializes stdio the same way.
     const { Buffer } = registry.get("buffer");
 
+    // process.resourceUsage().maxRSS: the largest resident set (kilobytes)
+    // any call has read; see resourceUsage below.
+    let resourceUsageMaxRssKb = 0;
+
     // ---- POSIX credential helpers (see the identity block far below) ----
     // Node validates every id argument before it reaches the syscall, and
     // the conformance suite asserts the exact message text, so these build
@@ -16675,9 +17182,27 @@
       return id;
     };
     /// An errno name from a credential syscall -> a Node-shaped Error.
+    /// node's ErrnoException (src/api/exceptions.cc), measured on v22 linux
+    /// for a refused setuid / setgroups: `errno` is the host's POSITIVE errno
+    /// number (1), `code` its name, and the message `EPERM, Operation not
+    /// permitted` -- the name and strerror's text. The two texts here are the
+    /// ones these calls fail with and read the same on glibc and macOS; a
+    /// code outside them keeps the syscall in the message rather than a
+    /// strerror text this table would have to guess.
+    const CREDENTIAL_STRERROR = {
+      __proto__: null,
+      EPERM: "Operation not permitted",
+      EINVAL: "Invalid argument",
+    };
     const credentialSyscallError = (errnoName, syscall) => {
-      const err = makeNodeError(errnoName, `${errnoName}, ${syscall}`);
-      err.errno = errnoName;
+      const text = CREDENTIAL_STRERROR[errnoName];
+      const err = new Error(`${errnoName}, ${text === undefined ? syscall : text}`);
+      // These APIs exist on POSIX hosts only, so the host table is there.
+      // Key order is node's: errno, code, syscall.
+      const hosted = posixErrno(natives);
+      const number = hosted.errno[errnoName] ?? hosted.uvOnly[errnoName];
+      if (number !== undefined) err.errno = number;
+      err.code = errnoName;
       err.syscall = syscall;
       return err;
     };
@@ -17029,10 +17554,29 @@
       }
       return envCache;
     };
+    // Case-folding lookups (envResolveKey, below): lowercased name -> the key
+    // as stored, for the one store object it was built from. A miss on the
+    // exact-case name used to list and lowercase EVERY key, on every get /
+    // has / set of a name that is not there -- `process.env.NODE_ENV` unset,
+    // read in a hot path. Built on the first folded miss, kept current by
+    // envWrite (every write to a store goes through it), and rebuilt when
+    // ensureEnv swaps the store for a newer shared snapshot.
+    let envFoldIndex = null;
+    let envFoldIndexStore = null;
     // Store `text` under `key` (undefined deletes it), in a shared store too.
     const envWrite = (store, key, text) => {
       if (text === undefined) delete store[key];
       else store[key] = text;
+      if (envFoldIndexStore === store) {
+        const lower = String(key).toLowerCase();
+        if (text === undefined) {
+          // Rebuild on the next miss rather than guess whether another
+          // spelling of the name is still stored.
+          if (envFoldIndex.get(lower) === key) envFoldIndexStore = null;
+        } else if (!envFoldIndex.has(lower)) {
+          envFoldIndex.set(lower, key);
+        }
+      }
       if (envShared === undefined) return;
       const before = envSharedVersion;
       const after = natives.envSharedSet(envShared, key, text);
@@ -17085,11 +17629,34 @@
     registry.processEnvFolds = envCaseFold;
     const envResolveKey = (store, prop) => {
       if (!envCaseFold() || prop in store) return prop;
-      const wanted = String(prop).toLowerCase();
-      for (const k of Object.keys(store)) {
-        if (k.toLowerCase() === wanted) return k;
+      if (envFoldIndexStore !== store) {
+        envFoldIndex = new Map();
+        for (const k of Object.keys(store)) {
+          const lower = k.toLowerCase();
+          // The first spelling in key order wins, as the scan this replaced.
+          if (!envFoldIndex.has(lower)) envFoldIndex.set(lower, k);
+        }
+        envFoldIndexStore = store;
       }
-      return prop;
+      const stored = envFoldIndex.get(String(prop).toLowerCase());
+      return stored === undefined ? prop : stored;
+    };
+    // The one write path of the `set` and `defineProperty` traps (node's
+    // EnvDefiner hands the value to its EnvSetter): an empty name stores
+    // nothing, a Windows-hidden name is ignored, the name is resolved through
+    // the case fold, and TZ re-reads the zone.
+    const envAssign = (prop, text) => {
+      // An empty name is not a valid environment variable: node accepts the
+      // assignment expression but stores nothing (probe: reads back
+      // undefined). Silently ignore rather than throw.
+      if (prop === "" || envHidden(prop)) return;
+      const store = ensureEnv();
+      const key = envResolveKey(store, prop);
+      envWrite(store, key, text);
+      // TZ is not just a string: Node re-reads the zone on assignment so
+      // subsequent Dates render in it. Without this the variable changed
+      // and every Date kept the zone the process started in.
+      if (key === "TZ") natives.setTimeZone(text);
     };
     // Windows hides a name that starts with '=' (`=C:` is drive C's cwd,
     // updated by every chdir): node's enumerator skips it, so it is not in
@@ -17119,9 +17686,7 @@
         if (typeof value === "symbol") {
           throw new TypeError("Cannot convert a Symbol value to a string");
         }
-        // An empty name is not a valid environment variable: node accepts the
-        // assignment expression but stores nothing (probe: reads back
-        // undefined). Silently ignore rather than throw.
+        // An empty name stores nothing (envAssign), and warns of nothing.
         if (prop === "") return true;
         // DEP0104, under --pending-deprecation only: anything other than a
         // string/number/boolean is String()-coerced on the way in, and the
@@ -17141,15 +17706,7 @@
             "DEP0104",
           );
         }
-        const text = String(value);
-        if (envHidden(prop)) return true;
-        const store = ensureEnv();
-        const key = envResolveKey(store, prop);
-        envWrite(store, key, text);
-        // TZ is not just a string: Node re-reads the zone on assignment so
-        // subsequent Dates render in it. Without this the variable changed
-        // and every Date kept the zone the process started in.
-        if (key === "TZ") natives.setTimeZone(String(value));
+        envAssign(prop, String(value));
         return true;
       },
       has(_, prop) {
@@ -17201,9 +17758,10 @@
         if (typeof prop === "symbol") {
           throw new TypeError("Cannot convert a Symbol value to a string");
         }
-        const text = String(desc.value);
-        if (envHidden(prop)) return true;
-        envWrite(ensureEnv(), prop, text);
+        // Through the set trap's own write path: defining `path` beside a
+        // stored `Path` used to add a second key the fold then never read,
+        // an empty name was stored, and TZ did not re-read the zone.
+        envAssign(prop, String(desc.value));
         return true;
       },
       ownKeys() { return Reflect.ownKeys(ensureEnv()); },
@@ -17626,7 +18184,13 @@
       debugPort: 9229,
       connected: false,
       constrainedMemory: () => 0,
-      availableMemory: () => 0,
+      // uv_get_available_memory: the system's free memory wherever no cgroup
+      // limit applies (libuv's own fallback is uv_get_free_memory, which is
+      // os.freemem()). A cgroup's remaining allowance is not read, so inside
+      // a memory-limited container this is the host's figure
+      // (docs/node-divergences.md). It was a constant 0, which a caller
+      // sizing a cache reads as "no memory".
+      availableMemory: () => natives.osFreeMem(),
       memoryUsage: Object.assign(
         () => {
           const h = natives.heapStatistics();
@@ -17883,19 +18447,26 @@
         if (pid != (pid | 0)) {
           throw new codes.ERR_INVALID_ARG_TYPE("pid", "number", pid);
         }
-        const SIGNALS = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGBUS: 7, SIGFPE: 8, SIGKILL: 9, SIGUSR1: 10, SIGSEGV: 11, SIGUSR2: 12, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15 };
+        // The HOST's signal numbers (os.constants.signals, from the native
+        // table), as node's process.kill reads them: a name this platform
+        // does not have is ERR_UNKNOWN_SIGNAL, and the number that reaches
+        // kill(2) is this platform's own (SIGUSR1 is 10 on Linux, 30 on
+        // macOS).
+        const SIGNALS = registry.get("os").constants.signals;
         let err;
         if (signal === (signal | 0)) {
           err = process._kill(pid, signal);
         } else {
           const name = signal || "SIGTERM";
-          const n = SIGNALS[name];
+          const n = Object.prototype.hasOwnProperty.call(SIGNALS, name) ? SIGNALS[name] : undefined;
           if (n === undefined) throw new codes.ERR_UNKNOWN_SIGNAL(name);
           err = process._kill(pid, n);
         }
         if (err) {
-          const NAME = { "-22": "EINVAL", "-1": "EPERM", "-3": "ESRCH" };
-          const nm = NAME[String(err)] || "UNKNOWN";
+          // node's ErrnoException(err, 'kill'): the code is the libuv name of
+          // the errno _kill returned.
+          const entry = uvErrnoTable(natives).get(err);
+          const nm = entry === undefined ? "UNKNOWN" : entry[0];
           const e = new Error("kill " + nm);
           e.code = nm;
           e.errno = err;
@@ -17908,9 +18479,14 @@
       // process.kill routes through this (monkeypatchable -- test-process-kill-pid
       // replaces it to intercept pid/sig without actually signalling).
       _kill: (pid, sig) => {
-        const VALID = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-        if (sig !== 0 && !VALID.includes(sig)) return -22; // EINVAL before touching the sandbox
-        try { natives.processKill(pid, sig); return 0; } catch { return -1; }
+        // The native answers 0 or the error's code name (ESRCH for a pid that
+        // names no process, EPERM for one this process may not signal,
+        // EINVAL for a number that is no signal here); the number handed
+        // back is this host's libuv errno for it.
+        const failed = natives.processKill(pid, sig);
+        if (!failed) return 0;
+        for (const [errno, entry] of uvErrnoTable(natives)) if (entry[0] === failed) return errno;
+        return UV_FALLBACK_ERRNO.EPERM;
       },
       // Lives in js/internal/process/per_thread.js so its stack frame names
       // the module node core names. Bound once here; see that file.
@@ -18066,13 +18642,25 @@
       hasUncaughtExceptionCaptureCallback() {
         return !!process._uncaughtCaptureCb;
       },
-      resourceUsage: () => ({
-        userCPUTime: 0, systemCPUTime: 0, maxRSS: 0,
-        sharedMemorySize: 0, unsharedDataSize: 0, unsharedStackSize: 0,
-        minorPageFault: 0, majorPageFault: 0, swappedOut: 0,
-        fsRead: 0, fsWrite: 0, ipcSent: 0, ipcReceived: 0,
-        signalsCount: 0, voluntaryContextSwitches: 0, involuntaryContextSwitches: 0,
-      }),
+      // uv_getrusage's sixteen fields, in node's order. Three are measured:
+      // the two CPU times are process.cpuUsage()'s (microseconds, as node's
+      // are), and maxRSS (kilobytes) is the largest resident set this call
+      // has read so far -- the CURRENT set at each call, not the kernel's
+      // peak, so it is a lower bound of node's figure. The other thirteen
+      // have no native behind them and read 0 (docs/node-divergences.md);
+      // all sixteen used to, which read as a process that had used nothing.
+      resourceUsage: () => {
+        const cpu = natives.processCpuUsage();
+        const rssKb = Math.floor(natives.processRss() / 1024);
+        if (rssKb > resourceUsageMaxRssKb) resourceUsageMaxRssKb = rssKb;
+        return {
+          userCPUTime: cpu.user, systemCPUTime: cpu.system, maxRSS: resourceUsageMaxRssKb,
+          sharedMemorySize: 0, unsharedDataSize: 0, unsharedStackSize: 0,
+          minorPageFault: 0, majorPageFault: 0, swappedOut: 0,
+          fsRead: 0, fsWrite: 0, ipcSent: 0, ipcReceived: 0,
+          signalsCount: 0, voluntaryContextSwitches: 0, involuntaryContextSwitches: 0,
+        };
+      },
       release: { name: "node", lts: "Jod" },
       config: Object.freeze({
         variables: Object.freeze({
@@ -18483,6 +19071,8 @@
       "child_process",
       "cluster",
       "console",
+      // require()able (registry.factories.constants) and in node's list.
+      "constants",
       "crypto",
       "dgram",
       "diagnostics_channel",
@@ -18648,9 +19238,18 @@
         return natives.makeRequire(base);
       },
       builtinModules,
+      // node's BuiltinModule.isBuiltin: a listed name, bare or under 'node:',
+      // or a prefix-only builtin ('node:test') under its prefix -- those are
+      // deliberately not in builtinModules (node v22 lists none of them) and
+      // are builtins all the same, as getBuiltinModule and import treat
+      // them. A non-string is not a builtin (no String() coercion).
       isBuiltin: (name) => {
-        const bare = String(name).replace(/^node:/, "");
-        return builtinModules.includes(bare);
+        if (typeof name !== "string") return false;
+        if (builtinModules.includes(name)) return true;
+        if (!name.startsWith("node:")) return false;
+        const bare = name.slice(5);
+        return builtinModules.includes(bare) ||
+          (PREFIX_ONLY_BUILTINS.has(bare) && !!registry.factories[bare]);
       },
       syncBuiltinESMExports: () => {},
       constants,
@@ -18674,7 +19273,9 @@
   // in installRuntimeGlobals.
   //
   // Wave-1 divergences (documented): executionAsyncId/triggerAsyncId
-  // return 0 (no async-ids machinery); createHook is a warn-once no-op â€”
+  // return 0 (no async-ids machinery); createHook is an init-only observer
+  // (a real registry of `init` callbacks, no warning; the other lifecycle
+  // callbacks never fire) â€”
   // the legacy diagnostics API is deprecated in Node and the packages that
   // matter feature-detect AsyncLocalStorage first.
   registry.factories.async_hooks = (natives) => {
@@ -18894,11 +19495,10 @@
   };
 
   // -------------------------------------------------------- string_decoder
-  // StringDecoder = boundary-safe Buffer -> string decoding. The utf8
-  // family rides TextDecoder's stream:true buffering (multi-byte chars
-  // split across chunks reassemble exactly); single-byte encodings decode
-  // per chunk. base64/hex per-chunk decoding can tear at chunk boundaries
-  // (punch-listed; rare in stream position).
+  // StringDecoder = boundary-safe Buffer -> string decoding, as the
+  // buffering port described below: utf8, utf16le/ucs2 and base64/base64url
+  // carry an incomplete sequence across write() calls; the single-byte
+  // encodings and hex decode per chunk (no chunk boundary can split them).
   registry.factories.string_decoder = () => {
     const Buffer = globalThis.Buffer;
 
@@ -19778,9 +20378,19 @@
         throw new codes.ERR_INVALID_ARG_TYPE("url", "object", url);
       }
       const { hostname, pathname, port, username, password, search } = url;
+      // node spreads the url to carry user-added properties over; its URL
+      // keeps state in private fields, so a URL itself contributes nothing.
+      // oam's URL keeps its state in ordinary own properties (`_href`, `_c`,
+      // `_params`), which are not options: leave them out for a real URL.
+      const extras = { ...url };
+      if (url instanceof globalThis.URL) {
+        delete extras._href;
+        delete extras._c;
+        delete extras._params;
+      }
       const options = {
         __proto__: null,
-        ...url, // preserve any user-added properties on the url object
+        ...extras,
         protocol: url.protocol,
         hostname:
           hostname && hostname[0] === "["
@@ -20681,6 +21291,72 @@
       return "rsa";
     }
 
+    // The PEM behind a key argument that node accepts as a PEM string, PEM
+    // bytes or a KeyObject -- bare, or as the `key` of an options bag.
+    function asymmetricKeyPem(value) {
+      if (typeof value === "string") return value;
+      if (value instanceof KeyObject) {
+        return value._pem || new TextDecoder().decode(value._material);
+      }
+      return new TextDecoder().decode(value);
+    }
+
+    // node's `dsaEncoding` for an ECDSA signature, read off the key argument
+    // of sign() / verify(): 'der' (the default) or 'ieee-p1363' (r||s).
+    // Anything else is ERR_INVALID_ARG_VALUE, whatever the key's type.
+    function dsaEncodingOf(key) {
+      if (typeof key !== "object" || key === null) return "der";
+      if (key instanceof KeyObject || key instanceof Uint8Array) return "der";
+      const value = key.dsaEncoding;
+      if (value === undefined || value === "der") return "der";
+      if (value === "ieee-p1363") return "ieee-p1363";
+      throw codes.ERR_INVALID_ARG_VALUE("options.dsaEncoding", value);
+    }
+
+    // node's getIntOption('saltLength', options): an int32, or
+    // ERR_INVALID_ARG_VALUE (a string, null and 1.5 all throw; probed on
+    // v22.22.2). Called only for a value that is not undefined.
+    function pssSaltLengthOf(value) {
+      if (value === value >> 0) return value;
+      throw codes.ERR_INVALID_ARG_VALUE("options.saltLength", value);
+    }
+
+    // The bytes of a key argument given as an ArrayBufferView or an
+    // ArrayBuffer (node takes both wherever it takes a key string);
+    // undefined for anything else.
+    function keyBytesOf(value) {
+      if (ArrayBuffer.isView(value)) {
+        return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+      }
+      if (value instanceof ArrayBuffer) return new Uint8Array(value);
+      return undefined;
+    }
+
+    // createPublicKey's PEM for a PEM it was handed: a public PEM is itself,
+    // and a PRIVATE one yields the public key derived from it (node's
+    // contract) -- never the private PEM filed under type 'public'. RSA and
+    // PKCS#8 EC (P-256 / P-384) derive; the natives have no derivation for
+    // the other key types, so those are refused here.
+    function publicPemFromPem(pem) {
+      if (!pem.includes("PRIVATE KEY-----")) return pem;
+      var kind = detectKeyType(pem);
+      if (kind === "rsa") return natives.cryptoExtractPublicPem(pem);
+      if (kind === "ec") {
+        var comps = natives.cryptoEcJwkExport(pem, true);
+        return natives.cryptoEcJwkImport(comps.crv, comps.x, comps.y);
+      }
+      throw new Error("createPublicKey: deriving the public key of a private " + kind + " key is not supported");
+    }
+
+    // createPublicKey's PEM for a KeyObject (bare or as `key.key`): only a
+    // private KeyObject is accepted, as in node.
+    function publicPemFromKeyObject(keyObject) {
+      if (keyObject.type !== "private") {
+        throw codes.ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE(keyObject.type, "private");
+      }
+      return publicPemFromPem(keyObject._pem);
+    }
+
     function createPrivateKey(input) {
       var pem;
       if (typeof input === "object" && input !== null && input.format === "jwk" && input.key) {
@@ -20698,23 +21374,33 @@
         }
       } else if (typeof input === "string") {
         pem = input;
-      } else if (input && typeof input === "object") {
-        if (input.key instanceof Uint8Array || BufferCtor.isBuffer(input.key)) {
+      } else if (keyBytesOf(input) !== undefined) {
+        // Bare PEM bytes: createPrivateKey(fs.readFileSync("key.pem")).
+        pem = new TextDecoder().decode(keyBytesOf(input));
+      } else if (input && typeof input === "object" && !(input instanceof KeyObject)) {
+        var privBytes = keyBytesOf(input.key);
+        if (privBytes !== undefined) {
           if (input.format === "der") {
             // DER bytes: wrap as PEM so the native layer (which parses PEM) and
             // detectKeyType see real ASN.1, not the bytes mis-decoded as UTF-8 text.
             var privLabel = input.type === "sec1" ? "EC PRIVATE KEY"
               : input.type === "pkcs1" ? "RSA PRIVATE KEY"
               : "PRIVATE KEY";
-            pem = derToPem(input.key, privLabel);
+            pem = derToPem(privBytes, privLabel);
           } else {
-            pem = new TextDecoder().decode(input.key);
+            pem = new TextDecoder().decode(privBytes);
           }
+        } else if (typeof input.key === "string") {
+          pem = input.key;
         } else {
-          pem = String(input.key);
+          // Anything else used to be stringified ("undefined",
+          // "[object Object]") and fail much later as a PEM parse error.
+          throw codes.ERR_INVALID_ARG_TYPE(
+            "key.key", ["string", "ArrayBuffer", "Buffer", "TypedArray", "DataView"], input.key);
         }
       } else {
-        throw new TypeError("createPrivateKey: input must be a string or object");
+        throw codes.ERR_INVALID_ARG_TYPE(
+          "key", ["string", "ArrayBuffer", "Buffer", "TypedArray", "DataView"], input);
       }
       var ko = new KeyObject("private", null);
       ko._pem = pem;
@@ -20754,22 +21440,36 @@
           throw new Error("createPublicKey: unsupported JWK kty: " + jwk.kty);
         }
       } else if (typeof input === "string") {
-        pem = input;
+        pem = publicPemFromPem(input);
+      } else if (keyBytesOf(input) !== undefined) {
+        // Bare PEM bytes: createPublicKey(fs.readFileSync("key.pem")).
+        pem = publicPemFromPem(new TextDecoder().decode(keyBytesOf(input)));
+      } else if (input instanceof KeyObject) {
+        pem = publicPemFromKeyObject(input);
       } else if (input && typeof input === "object") {
-        if (input instanceof KeyObject && input.type === "private") {
-          pem = natives.cryptoExtractPublicPem(input._pem);
-        } else if (input.key instanceof Uint8Array || BufferCtor.isBuffer(input.key)) {
+        var pubBytes = keyBytesOf(input.key);
+        if (input.key instanceof KeyObject) {
+          pem = publicPemFromKeyObject(input.key);
+        } else if (pubBytes !== undefined) {
           if (input.format === "der") {
             var pubLabel = input.type === "pkcs1" ? "RSA PUBLIC KEY" : "PUBLIC KEY";
-            pem = derToPem(input.key, pubLabel);
+            pem = derToPem(pubBytes, pubLabel);
           } else {
-            pem = new TextDecoder().decode(input.key);
+            pem = publicPemFromPem(new TextDecoder().decode(pubBytes));
           }
+        } else if (typeof input.key === "string") {
+          pem = publicPemFromPem(input.key);
         } else {
-          pem = String(input.key);
+          throw codes.ERR_INVALID_ARG_TYPE(
+            "key.key",
+            ["string", "ArrayBuffer", "Buffer", "TypedArray", "DataView", "KeyObject", "CryptoKey"],
+            input.key);
         }
       } else {
-        throw new TypeError("createPublicKey: input must be a string or object");
+        throw codes.ERR_INVALID_ARG_TYPE(
+          "key",
+          ["string", "ArrayBuffer", "Buffer", "TypedArray", "DataView", "KeyObject", "CryptoKey"],
+          input);
       }
       var ko = new KeyObject("public", null);
       ko._pem = pem;
@@ -20810,7 +21510,7 @@
           pem = key._pem || new TextDecoder().decode(key._material);
           keyType = key._keyType || "rsa";
         } else if (typeof key === "object" && key !== null && !(key instanceof Uint8Array)) {
-          pem = typeof key.key === "string" ? key.key : new TextDecoder().decode(key.key);
+          pem = asymmetricKeyPem(key.key);
           keyType = detectKeyType(pem);
         } else {
           pem = typeof key === "string" ? key : new TextDecoder().decode(key);
@@ -20822,18 +21522,20 @@
         var off = 0;
         for (var i = 0; i < this._data.length; i++) { merged.set(this._data[i], off); off += this._data[i].length; }
         var padding = 1;
-        var saltLength = 32;
+        // Node's sign default is RSA_PSS_SALTLEN_MAX_SIGN, not a fixed 32:
+        // undefined reaches the op, which resolves it (and -1 / -2).
+        var saltLength;
         if (key instanceof KeyObject) {
           // KeyObject does not carry padding; default PKCS1
         } else if (typeof key === "object" && key !== null && !(key instanceof Uint8Array)) {
           if (key.padding !== undefined) padding = key.padding;
-          if (key.saltLength !== undefined) saltLength = key.saltLength;
+          if (key.saltLength !== undefined) saltLength = pssSaltLengthOf(key.saltLength);
         }
         var sig;
         if (padding === 6 && keyType === "rsa") {
           sig = asBuffer(natives.cryptoSignPss(this._algorithm, merged, pem, saltLength));
         } else {
-          sig = asBuffer(natives.cryptoSign(this._algorithm == null ? "" : this._algorithm, merged, pem, keyType));
+          sig = asBuffer(natives.cryptoSign(this._algorithm == null ? "" : this._algorithm, merged, pem, keyType, dsaEncodingOf(key)));
         }
         return outputEncoding ? sig.toString(outputEncoding) : sig;
       }
@@ -20859,7 +21561,7 @@
           pem = key._pem || new TextDecoder().decode(key._material);
           keyType = key._keyType || "rsa";
         } else if (typeof key === "object" && key !== null && !(key instanceof Uint8Array)) {
-          pem = typeof key.key === "string" ? key.key : new TextDecoder().decode(key.key);
+          pem = asymmetricKeyPem(key.key);
           keyType = detectKeyType(pem);
         } else {
           pem = typeof key === "string" ? key : new TextDecoder().decode(key);
@@ -20871,20 +21573,23 @@
         var off = 0;
         for (var i = 0; i < this._data.length; i++) { merged.set(this._data[i], off); off += this._data[i].length; }
         var sigBuf = typeof signature === "string"
-          ? BufferCtor.from(signature, signatureEncoding || "base64")
+          // No encoding is node's Buffer.from default (utf8), not base64.
+          ? BufferCtor.from(signature, signatureEncoding == null ? undefined : signatureEncoding)
           : toBytes(signature);
         var padding = 1;
-        var saltLength = 32;
+        // Node's verify default is RSA_PSS_SALTLEN_AUTO (read the length
+        // off the signature); the op resolves undefined, -1 and -2.
+        var saltLength;
         if (key instanceof KeyObject) {
           // KeyObject does not carry padding; default PKCS1
         } else if (typeof key === "object" && key !== null && !(key instanceof Uint8Array)) {
           if (key.padding !== undefined) padding = key.padding;
-          if (key.saltLength !== undefined) saltLength = key.saltLength;
+          if (key.saltLength !== undefined) saltLength = pssSaltLengthOf(key.saltLength);
         }
         if (padding === 6 && keyType === "rsa") {
           return natives.cryptoVerifyPss(this._algorithm, merged, pem, sigBuf, saltLength);
         }
-        return natives.cryptoVerify(this._algorithm == null ? "" : this._algorithm, merged, pem, sigBuf, keyType);
+        return natives.cryptoVerify(this._algorithm == null ? "" : this._algorithm, merged, pem, sigBuf, keyType, dsaEncodingOf(key));
       }
       _transform(chunk, encoding, callback) {
         this.update(chunk, encoding);
@@ -20919,41 +21624,129 @@
     const asBuffer = (bytes) =>
       BufferCtor.from(bytes.buffer, bytes.byteOffset, bytes.length);
 
-    class Hash {
-      constructor(id) {
-        this._id = id;
+    // A native hasher or cipher instance is not memory V8 sees, so a Hash,
+    // Hmac, Cipher or Decipher dropped before digest() / final() would keep
+    // it (and, for an HMAC or a cipher, its key) for the life of the
+    // isolate. The registry releases the handle when its owner is collected;
+    // digest() / final() consume the handle natively and unregister. Handle
+    // ids are never reused, so a release of a consumed handle is a no-op.
+    let cryptoHandles = null;
+    const trackCryptoHandle = (owner, id) => {
+      if (typeof FinalizationRegistry !== "function") return;
+      (cryptoHandles ??= new FinalizationRegistry((held) => natives.cryptoHandleFree(held)))
+        .register(owner, id, owner);
+    };
+    const untrackCryptoHandle = (owner) => {
+      if (cryptoHandles) cryptoHandles.unregister(owner);
+    };
+
+    // node's LazyTransform (lib/internal/streams/lazy_transform.js): a
+    // Transform whose stream state is built on first use. Hash and Hmac are
+    // streams in node (`src.pipe(createHash("sha256"))`, `pipeline(src,
+    // hash, cb)`), but the common `createHash(a).update(d).digest()` never
+    // touches the stream side, so the constructor only keeps the options
+    // (the instance's one own key, `_options`, as in node) and the first read
+    // of `_readableState` / `_writableState` runs the Transform constructor.
+    function LazyTransform(options) {
+      this._options = options;
+    }
+    Object.setPrototypeOf(LazyTransform.prototype, stream.Transform.prototype);
+    Object.setPrototypeOf(LazyTransform, stream.Transform);
+    const lazyStreamState = (name) => ({
+      __proto__: null,
+      get() {
+        stream.Transform.call(this, this._options);
+        // Strings reach _transform undecoded, with their encoding.
+        this._writableState.decodeStrings = false;
+        return this[name];
+      },
+      set(value) {
+        Object.defineProperty(this, name, {
+          __proto__: null,
+          value,
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
+      },
+      configurable: true,
+      enumerable: true,
+    });
+    Object.defineProperties(LazyTransform.prototype, {
+      _readableState: lazyStreamState("_readableState"),
+      _writableState: lazyStreamState("_writableState"),
+    });
+
+    // The handle id and the finalized flag sit under a symbol, so the
+    // instance's own string keys stay node's (`_options` only).
+    const kHashState = Symbol("kHashState");
+    const hashStateOf = (hash) => {
+      const state = hash[kHashState];
+      if (state === undefined) throw codes.ERR_INVALID_THIS("Hash");
+      return state;
+    };
+
+    class Hash extends LazyTransform {
+      constructor(id, options) {
+        super(options);
+        this[kHashState] = { id, finalized: false };
+        trackCryptoHandle(this, id);
       }
       update(data, inputEncoding) {
-        natives.cryptoHashUpdate(this._id, toBytes(data, inputEncoding));
+        const state = hashStateOf(this);
+        if (state.finalized) throw codes.ERR_CRYPTO_HASH_FINALIZED();
+        natives.cryptoHashUpdate(state.id, toBytes(data, inputEncoding));
         return this;
       }
       digest(encoding) {
-        const bytes = asBuffer(natives.cryptoHashDigest(this._id));
-        return encoding ? bytes.toString(encoding) : bytes;
+        const state = hashStateOf(this);
+        if (state.finalized) throw codes.ERR_CRYPTO_HASH_FINALIZED();
+        state.finalized = true;
+        const bytes = asBuffer(natives.cryptoHashDigest(state.id));
+        untrackCryptoHandle(this);
+        return encoding && encoding !== "buffer" ? bytes.toString(encoding) : bytes;
       }
-      copy() {
-        return new Hash(natives.cryptoHashCopy(this._id));
+      copy(options) {
+        const state = hashStateOf(this);
+        if (state.finalized) throw codes.ERR_CRYPTO_HASH_FINALIZED();
+        return new Hash(natives.cryptoHashCopy(state.id), options);
+      }
+      _transform(chunk, encoding, callback) {
+        this.update(chunk, encoding);
+        callback();
+      }
+      _flush(callback) {
+        this.push(this.digest());
+        callback();
       }
     }
 
     class Hmac extends Hash {
+      digest(encoding) {
+        // node: a second Hmac digest() is an empty result, not a throw.
+        if (hashStateOf(this).finalized) {
+          const empty = BufferCtor.alloc(0);
+          return encoding && encoding !== "buffer" ? empty.toString(encoding) : empty;
+        }
+        return super.digest(encoding);
+      }
       copy() {
         throw new Error("Hmac.copy is not supported (Node parity)");
       }
     }
 
-    function createHash(algorithm) {
+    function createHash(algorithm, options) {
       if (typeof algorithm !== "string") {
         throw new codes.ERR_INVALID_ARG_TYPE("algorithm", "string", algorithm);
       }
-      return new Hash(natives.cryptoHashCreate(algorithm));
+      return new Hash(natives.cryptoHashCreate(algorithm), options);
     }
 
-    function createHmac(algorithm, key) {
+    function createHmac(algorithm, key, options) {
       if (typeof algorithm !== "string") {
         throw new codes.ERR_INVALID_ARG_TYPE("hmac", "string", algorithm);
       }
-      return new Hmac(natives.cryptoHmacCreate(algorithm, toBytes(key)));
+      return new Hmac(natives.cryptoHmacCreate(algorithm, toBytes(key)), options);
     }
 
     // node's crypto.Hash / crypto.Hmac: constructors that work with or
@@ -21007,16 +21800,36 @@
       return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
     }
 
+    // node's RAND_MAX for randomInt: the largest range it accepts.
+    const RANDOM_INT_MAX_RANGE = 0xffff_ffff_ffff;
     function randomInt(min, max, callback) {
-      if (max === undefined || typeof max === "function") {
+      const minNotSpecified = max === undefined || typeof max === "function";
+      if (minNotSpecified) {
         callback = max;
         max = min;
         min = 0;
       }
-      if (!Number.isSafeInteger(min) || !Number.isSafeInteger(max) || max <= min) {
-        throw new RangeError("randomInt: max must be greater than min (safe integers)");
+      // node's checks, in node's order (lib/internal/crypto/random.js).
+      if (callback !== undefined && typeof callback !== "function") {
+        throw codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
+      }
+      if (!Number.isSafeInteger(min)) {
+        throw codes.ERR_INVALID_ARG_TYPE("min", "a safe integer", min);
+      }
+      if (!Number.isSafeInteger(max)) {
+        throw codes.ERR_INVALID_ARG_TYPE("max", "a safe integer", max);
+      }
+      if (max <= min) {
+        throw codes.ERR_OUT_OF_RANGE("max", `greater than the value of "min" (${min})`, max);
       }
       const range = max - min;
+      // The draw below is 48 bits wide: a wider range cannot be sampled
+      // uniformly, and `floor(2**48 / range) * range` would be 0 -- a
+      // rejection bound nothing is ever under, so the loop never ended.
+      if (!(range <= RANDOM_INT_MAX_RANGE)) {
+        throw codes.ERR_OUT_OF_RANGE(
+          `max${minNotSpecified ? "" : " - min"}`, `<= ${RANDOM_INT_MAX_RANGE}`, range);
+      }
       // Rejection sampling over 48 bits â€” uniform, like Node.
       let value;
       do {
@@ -21046,8 +21859,12 @@
       return h.replace("-", "").toUpperCase();
     }
 
-    var _importedKeys = new Map();
-    var _keyIdCounter = 1;
+    // Key material (raw bytes or a PEM) per CryptoKey. Weak, keyed by a
+    // token object only the CryptoKey holds (`_id`): the material goes when
+    // the key does. A counter-keyed Map kept every imported, generated,
+    // derived or unwrapped key's material for the life of the isolate.
+    var _importedKeys = new WeakMap();
+    var newKeyToken = function() { return Object.freeze({ __proto__: null }); };
 
     function CryptoKey(algorithm, type, extractable, usages, _id) {
       this.algorithm = algorithm;
@@ -21055,6 +21872,47 @@
       this.extractable = extractable;
       this.usages = usages;
       this._id = _id;
+    }
+
+    // The native cipher a WebCrypto AES key selects. The natives implement
+    // AES-128 and AES-256 only, so a 192-bit key is refused by name rather
+    // than run as AES-256 and failed on its length.
+    // The whole message through a CBC / CTR native cipher: update() returns
+    // the output that is final so far, final() the rest (the padding block).
+    function subtleCipherRun(handle, data) {
+      var head = natives.cryptoCipherUpdate(handle, data);
+      var tail = natives.cryptoCipherFinal(handle);
+      if (tail.length === 0) return head;
+      var out = new Uint8Array(head.length + tail.length);
+      out.set(head, 0);
+      out.set(tail, head.length);
+      return out;
+    }
+
+    function subtleAesCipher(keyMat, mode) {
+      var bytes = keyMat ? keyMat.length : -1;
+      if (bytes === 16) return "aes-128-" + mode;
+      if (bytes === 32) return "aes-256-" + mode;
+      if (bytes === 24) {
+        throw new globalThis.DOMException("AES-192 is not supported", "NotSupportedError");
+      }
+      throw new globalThis.DOMException("Invalid key length", "OperationError");
+    }
+
+    // AES-GCM's tag length in bytes, for encrypt and decrypt alike. The
+    // natives produce and check a full 128-bit tag only: the other lengths
+    // WebCrypto defines are refused as unsupported, and anything else is the
+    // OperationError an invalid tagLength is.
+    function subtleGcmTagBytes(algorithm) {
+      var bits = algorithm.tagLength === undefined ? 128 : algorithm.tagLength;
+      if ([32, 64, 96, 104, 112, 120, 128].indexOf(bits) === -1) {
+        throw new globalThis.DOMException(bits + " is not a valid AES-GCM tag length", "OperationError");
+      }
+      if (bits !== 128) {
+        throw new globalThis.DOMException(
+          "AES-GCM tagLength " + bits + " is not supported (128 only)", "NotSupportedError");
+      }
+      return 16;
     }
 
     const subtle = {
@@ -21073,7 +21931,7 @@
         // with ERR_MISSING_OPTION; oam's message differs). Remove it only
         // with a real algorithm check in its place.
         var algoName = algoObj.name.toUpperCase();
-        var id = _keyIdCounter++;
+        var id = newKeyToken();
         var keyType;
         var pem;
 
@@ -21167,7 +22025,11 @@
         }
 
         if (algoName === "RSASSA-PKCS1-V1_5") {
-          var hashN = webcryptoHashName(algorithm);
+          // WebCrypto: the digest is the KEY's (fixed at import/generate),
+          // and the sign/verify algorithm is just the name -- so
+          // `sign("RSASSA-PKCS1-v1_5", key, data)` must work. Reading the
+          // hash off the call's algorithm made that the digest "name".
+          var hashN = webcryptoHashName(stored.algo && stored.algo.hash ? stored.algo : algorithm);
           var sigBytes2 = natives.cryptoSign(hashN, toBytes(data), stored.pem, "rsa");
           return sigBytes2.buffer.slice(sigBytes2.byteOffset, sigBytes2.byteOffset + sigBytes2.length);
         }
@@ -21209,7 +22071,8 @@
         }
 
         if (algoName === "RSASSA-PKCS1-V1_5") {
-          var hashN = webcryptoHashName(algorithm);
+          // The key's digest, as in sign() above.
+          var hashN = webcryptoHashName(stored.algo && stored.algo.hash ? stored.algo : algorithm);
           var sigBuf2 = signature instanceof ArrayBuffer ? new Uint8Array(signature) : new Uint8Array(signature.buffer, signature.byteOffset, signature.byteLength);
           return natives.cryptoVerify(hashN, toBytes(data), stored.pem, sigBuf2, "rsa");
         }
@@ -21234,8 +22097,8 @@
         var algoName = webcryptoAlgoName(algorithm).toUpperCase();
         if (algoName === "ED25519") {
           var pair = natives.cryptoGenerateKeyPair("ed25519");
-          var privId = _keyIdCounter++;
-          var pubId = _keyIdCounter++;
+          var privId = newKeyToken();
+          var pubId = newKeyToken();
           _importedKeys.set(privId, { format: "pkcs8", pem: pair.privateKey, algo: { name: "Ed25519" } });
           _importedKeys.set(pubId, { format: "spki", pem: pair.publicKey, algo: { name: "Ed25519" } });
           return {
@@ -21246,21 +22109,22 @@
         if (algoName === "HMAC") {
           var len = (algorithm.length || 256) / 8;
           var raw = natives.cryptoRandomFill(len);
-          var kid = _keyIdCounter++;
+          var kid = newKeyToken();
           _importedKeys.set(kid, { format: "raw", data: raw, algo: algorithm });
           return new CryptoKey(algorithm, "secret", extractable, keyUsages, kid);
         }
         if (algoName === "AES-GCM" || algoName === "AES-CBC" || algoName === "AES-CTR") {
           var aesLen = (algorithm.length || 256) / 8;
           var aesRaw = natives.cryptoRandomFill(aesLen);
-          var aesKid = _keyIdCounter++;
+          var aesKid = newKeyToken();
           _importedKeys.set(aesKid, { format: "raw", data: aesRaw, algo: algorithm });
           return new CryptoKey(algorithm, "secret", extractable, keyUsages, aesKid);
         }
         throw new Error("subtle.generateKey: unsupported algorithm " + algoName);
       },
       async deriveBits(algorithm, baseKey, length) {
-        var algoName = webcryptoAlgoName(typeof algorithm === "string" ? algorithm : algorithm.name);
+        // Algorithm names are case-insensitive, here as in every other method.
+        var algoName = webcryptoAlgoName(typeof algorithm === "string" ? algorithm : algorithm.name).toUpperCase();
         var stored = _importedKeys.get(baseKey._id);
         if (!stored) throw new Error("subtle.deriveBits: unknown key");
         var keyData = stored.data instanceof ArrayBuffer ? new Uint8Array(stored.data) : stored.data;
@@ -21293,7 +22157,7 @@
         throw new Error("subtle.deriveBits: unsupported algorithm " + algoName);
       },
       async deriveKey(algorithm, baseKey, derivedKeyType, extractable, keyUsages) {
-        var dkAlgoName = webcryptoAlgoName(typeof derivedKeyType === "string" ? derivedKeyType : derivedKeyType.name);
+        var dkAlgoName = webcryptoAlgoName(typeof derivedKeyType === "string" ? derivedKeyType : derivedKeyType.name).toUpperCase();
         var length = derivedKeyType.length;
         if (!length && dkAlgoName === "AES-CBC") length = 256;
         if (!length && dkAlgoName === "AES-GCM") length = 256;
@@ -21312,31 +22176,31 @@
         var plainArr = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
         if (algoName === "AES-GCM") {
           var iv = new Uint8Array(algorithm.iv);
-          var cn = keyMat.length === 16 ? "aes-128-gcm" : "aes-256-gcm";
-          var h = natives.cryptoCipherCreate(cn, keyMat, iv, true);
-          if (algorithm.additionalData) natives.cryptoCipherSetAad(h, new Uint8Array(algorithm.additionalData));
-          natives.cryptoCipherUpdate(h, plainArr);
-          var ct = natives.cryptoCipherFinalGcm(h);
-          var tag = natives.cryptoCipherGetAuthTag(h);
-          var out = new Uint8Array(ct.length + tag.length);
-          out.set(ct, 0);
-          out.set(tag, ct.length);
-          return out.buffer;
+          // Validated on encrypt as on decrypt: the appended tag is always
+          // the full 16 bytes, so any other tagLength is refused, not ignored.
+          subtleGcmTagBytes(algorithm);
+          subtleAesCipher(keyMat, "gcm");
+          // subtleAesCipher is called for its key-length refusals; the
+          // one-shot native returns ciphertext || tag, WebCrypto's layout.
+          var out = natives.cryptoGcmOneShot(
+            keyMat, iv,
+            algorithm.additionalData ? new Uint8Array(algorithm.additionalData) : new Uint8Array(0),
+            plainArr, true,
+          );
+          return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
         }
         if (algoName === "AES-CBC") {
           var iv2 = new Uint8Array(algorithm.iv);
-          var cn2 = keyMat.length === 16 ? "aes-128-cbc" : "aes-256-cbc";
+          var cn2 = subtleAesCipher(keyMat, "cbc");
           var h2 = natives.cryptoCipherCreate(cn2, keyMat, iv2, true);
-          natives.cryptoCipherUpdate(h2, plainArr);
-          var ct2 = natives.cryptoCipherFinal(h2);
+          var ct2 = subtleCipherRun(h2, plainArr);
           return ct2.buffer.slice(ct2.byteOffset, ct2.byteOffset + ct2.byteLength);
         }
         if (algoName === "AES-CTR") {
           var ctr = new Uint8Array(algorithm.counter);
-          var cn3 = keyMat.length === 16 ? "aes-128-ctr" : "aes-256-ctr";
+          var cn3 = subtleAesCipher(keyMat, "ctr");
           var h3 = natives.cryptoCipherCreate(cn3, keyMat, ctr, true);
-          natives.cryptoCipherUpdate(h3, plainArr);
-          var ct3 = natives.cryptoCipherFinal(h3);
+          var ct3 = subtleCipherRun(h3, plainArr);
           return ct3.buffer.slice(ct3.byteOffset, ct3.byteOffset + ct3.byteLength);
         }
         throw new Error("subtle.encrypt: unsupported algorithm " + algoName);
@@ -21349,31 +22213,32 @@
         var cipherArr = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
         if (algoName === "AES-GCM") {
           var iv = new Uint8Array(algorithm.iv);
-          var tagLen = (algorithm.tagLength || 128) / 8;
-          var cn = keyMat.length === 16 ? "aes-128-gcm" : "aes-256-gcm";
-          var ctPart = cipherArr.slice(0, cipherArr.length - tagLen);
-          var tagPart = cipherArr.slice(cipherArr.length - tagLen);
-          var h = natives.cryptoCipherCreate(cn, keyMat, iv, false);
-          if (algorithm.additionalData) natives.cryptoCipherSetAad(h, new Uint8Array(algorithm.additionalData));
-          natives.cryptoCipherSetAuthTag(h, tagPart);
-          natives.cryptoCipherUpdate(h, ctPart);
-          var pt = natives.cryptoCipherFinalGcm(h);
+          var tagLen = subtleGcmTagBytes(algorithm);
+          if (cipherArr.length < tagLen) {
+            throw new globalThis.DOMException("The provided data is too small", "OperationError");
+          }
+          subtleAesCipher(keyMat, "gcm");
+          // One shot, ciphertext || tag in: nothing is released unless the
+          // tag holds (tagLen is always the full 16 bytes here).
+          var pt = natives.cryptoGcmOneShot(
+            keyMat, iv,
+            algorithm.additionalData ? new Uint8Array(algorithm.additionalData) : new Uint8Array(0),
+            cipherArr, false,
+          );
           return pt.buffer.slice(pt.byteOffset, pt.byteOffset + pt.byteLength);
         }
         if (algoName === "AES-CBC") {
           var iv2 = new Uint8Array(algorithm.iv);
-          var cn2 = keyMat.length === 16 ? "aes-128-cbc" : "aes-256-cbc";
+          var cn2 = subtleAesCipher(keyMat, "cbc");
           var h2 = natives.cryptoCipherCreate(cn2, keyMat, iv2, false);
-          natives.cryptoCipherUpdate(h2, cipherArr);
-          var pt2 = natives.cryptoCipherFinal(h2);
+          var pt2 = subtleCipherRun(h2, cipherArr);
           return pt2.buffer.slice(pt2.byteOffset, pt2.byteOffset + pt2.byteLength);
         }
         if (algoName === "AES-CTR") {
           var ctr = new Uint8Array(algorithm.counter);
-          var cn3 = keyMat.length === 16 ? "aes-128-ctr" : "aes-256-ctr";
+          var cn3 = subtleAesCipher(keyMat, "ctr");
           var h3 = natives.cryptoCipherCreate(cn3, keyMat, ctr, false);
-          natives.cryptoCipherUpdate(h3, cipherArr);
-          var pt3 = natives.cryptoCipherFinal(h3);
+          var pt3 = subtleCipherRun(h3, cipherArr);
           return pt3.buffer.slice(pt3.byteOffset, pt3.byteOffset + pt3.byteLength);
         }
         throw new Error("subtle.decrypt: unsupported algorithm " + algoName);
@@ -21483,13 +22348,35 @@
       }
     }
 
-    // ---- wave 2: symmetric ciphers (AES-CBC / CTR / GCM) ----
+    // ---- wave 2: symmetric ciphers (AES-CBC / ECB / CTR / GCM) ----
+    //
+    // Incremental, as node's are: update() returns the output that is final
+    // at that point (every byte for CTR and GCM; whole blocks for CBC and
+    // ECB, a padded decrypt keeping the last one back) and final() the rest.
 
     const SUPPORTED_CIPHERS = [
       "aes-128-cbc", "aes-256-cbc",
+      "aes-128-ecb", "aes-256-ecb",
       "aes-128-ctr", "aes-256-ctr",
       "aes-128-gcm", "aes-256-gcm",
     ];
+
+    // node's getDecoder (lib/internal/crypto/cipher.js): an output encoding
+    // goes through one StringDecoder for the life of the cipher, so a
+    // character (or a base64 group) split across two update() calls comes
+    // out whole, and the encoding cannot change part-way.
+    function cipherOutput(owner, bytes, encoding, last) {
+      if (!encoding || encoding === "buffer") return bytes;
+      const { StringDecoder } = registry.get("string_decoder");
+      if (!owner._decoder) {
+        owner._decoder = new StringDecoder(encoding);
+      } else if (new StringDecoder(encoding).encoding !== owner._decoder.encoding) {
+        const err = new Error("Cannot change encoding");
+        err.code = "ERR_INTERNAL_ASSERTION";
+        throw err;
+      }
+      return last ? owner._decoder.end(bytes) : owner._decoder.write(bytes);
+    }
 
     class Cipher {
       constructor(handle, isGcm) {
@@ -21497,16 +22384,20 @@
         this._isGcm = isGcm;
         this._finalized = false;
         this._authTag = null;
+        trackCryptoHandle(this, handle);
       }
       update(data, inputEncoding, outputEncoding) {
         if (this._finalized) throw new Error("Attempting to use a finalized cipher");
-        natives.cryptoCipherUpdate(this._handle, toBytes(data, inputEncoding));
-        const empty = BufferCtor.alloc(0);
-        return outputEncoding ? empty.toString(outputEncoding) : empty;
+        const out = asBuffer(
+          natives.cryptoCipherUpdate(this._handle, toBytes(data, inputEncoding)),
+        );
+        return cipherOutput(this, out, outputEncoding, false);
       }
       final(outputEncoding) {
         if (this._finalized) throw new Error("Attempting to use a finalized cipher");
         this._finalized = true;
+        // The native final consumes the handle, whether or not it throws.
+        untrackCryptoHandle(this);
         let result;
         if (this._isGcm) {
           result = asBuffer(natives.cryptoCipherFinalGcm(this._handle));
@@ -21514,7 +22405,7 @@
         } else {
           result = asBuffer(natives.cryptoCipherFinal(this._handle));
         }
-        return outputEncoding ? result.toString(outputEncoding) : result;
+        return cipherOutput(this, result, outputEncoding, true);
       }
       setAutoPadding(autoPadding) {
         natives.cryptoCipherSetAutoPadding(
@@ -21539,23 +22430,27 @@
         this._handle = handle;
         this._isGcm = isGcm;
         this._finalized = false;
+        trackCryptoHandle(this, handle);
       }
       update(data, inputEncoding, outputEncoding) {
         if (this._finalized) throw new Error("Attempting to use a finalized decipher");
-        natives.cryptoCipherUpdate(this._handle, toBytes(data, inputEncoding));
-        const empty = BufferCtor.alloc(0);
-        return outputEncoding ? empty.toString(outputEncoding) : empty;
+        const out = asBuffer(
+          natives.cryptoCipherUpdate(this._handle, toBytes(data, inputEncoding)),
+        );
+        return cipherOutput(this, out, outputEncoding, false);
       }
       final(outputEncoding) {
         if (this._finalized) throw new Error("Attempting to use a finalized decipher");
         this._finalized = true;
+        // The native final consumes the handle, whether or not it throws.
+        untrackCryptoHandle(this);
         let result;
         if (this._isGcm) {
           result = asBuffer(natives.cryptoCipherFinalGcm(this._handle));
         } else {
           result = asBuffer(natives.cryptoCipherFinal(this._handle));
         }
-        return outputEncoding ? result.toString(outputEncoding) : result;
+        return cipherOutput(this, result, outputEncoding, true);
       }
       setAutoPadding(autoPadding) {
         natives.cryptoCipherSetAutoPadding(
@@ -21573,17 +22468,21 @@
       }
     }
 
+    // A cipher with no IV (ECB) takes null, as node's does; undefined is
+    // still the argument error toBytes raises.
+    const cipherIv = (iv) => (iv === null ? new Uint8Array(0) : toBytes(iv));
+
     function createCipheriv(algorithm, key, iv) {
       const alg = String(algorithm).toLowerCase();
       const isGcm = alg.endsWith("-gcm");
-      const handle = natives.cryptoCipherCreate(alg, toBytes(key), toBytes(iv), true);
+      const handle = natives.cryptoCipherCreate(alg, toBytes(key), cipherIv(iv), true);
       return new Cipher(handle, isGcm);
     }
 
     function createDecipheriv(algorithm, key, iv) {
       const alg = String(algorithm).toLowerCase();
       const isGcm = alg.endsWith("-gcm");
-      const handle = natives.cryptoCipherCreate(alg, toBytes(key), toBytes(iv), false);
+      const handle = natives.cryptoCipherCreate(alg, toBytes(key), cipherIv(iv), false);
       return new Decipher(handle, isGcm);
     }
 
@@ -21633,14 +22532,13 @@
           };
         }
       }
-      // Ed25519 with no encoding options -> KeyObjects (Node parity). The relay
-      // token flow calls generateKeyPairSync('ed25519').privateKey.export({...}),
-      // which requires KeyObjects, not PEM strings. Scoped to ed25519 so the
-      // established RSA/EC string returns (and their e2e tests) stay unchanged.
-      if (type === 'ed25519') {
-        if (!(options && options.publicKeyEncoding)) pubOut = createPublicKey(result.publicKey);
-        if (!(options && options.privateKeyEncoding)) privOut = createPrivateKey(result.privateKey);
-      }
+      // No encoding option for a half -> that half is a KeyObject (Node parity,
+      // every key type and each half on its own): callers go on to
+      // `.export({...})`, `.asymmetricKeyType`, or hand it to sign/encrypt.
+      // RSA and EC used to answer PEM strings here, so node code that called
+      // `.export()` on the result threw.
+      if (!(options && options.publicKeyEncoding)) pubOut = createPublicKey(result.publicKey);
+      if (!(options && options.privateKeyEncoding)) privOut = createPrivateKey(result.privateKey);
       return { publicKey: pubOut, privateKey: privOut };
     }
     function generateKeyPair(type, options, callback) {
@@ -21793,173 +22691,379 @@
       return asn1Seq([pkcs8Version, RSA_OID_BYTES, octetStr]);
     }
 
-    function publicEncrypt(keyOrOpts, buffer) {
-      var key, padding = 4, oaepHash = "sha1";
+    // The padding an RSA encrypt/decrypt call asks for, as the name the
+    // native op takes. RSA_PKCS1_PADDING is 1, RSA_NO_PADDING 3 and
+    // RSA_PKCS1_OAEP_PADDING 4. Node reads it in two steps, and so does
+    // this: a falsy `padding` (absent, null, 0, NaN, '', false) is the
+    // direction's default, and any other value is converted to a 32-bit
+    // unsigned integer ('4' and 4.7 are 4, true is 1, an object or a word
+    // is 0; a BigInt or a Symbol throws the conversion's TypeError). A
+    // number that is none of the three is "unknown", which the op refuses.
+    function rsaPaddingName(padding, defaultPadding) {
+      var value = padding ? (+padding >>> 0) : defaultPadding;
+      return value === 1 ? "pkcs1" : value === 3 ? "none" : value === 4 ? "oaep" : "unknown";
+    }
+
+    // The native RSA ops report the conditions Node names with OpenSSL's own
+    // text ("error:0200006E:rsa routines::data too large for key size").
+    // Give such an error Node's shape: an Error with `library`, `reason` and
+    // the `code` Node derives from them. Anything else passes through.
+    function rsaOpError(e) {
+      var m = e && typeof e.message === "string" && /^error:[0-9A-F]{8}:([^:]+)::(.+)$/.exec(e.message);
+      if (!m) return e;
+      var err = new Error(e.message);
+      err.library = m[1];
+      err.reason = m[2];
+      err.code = "ERR_OSSL_" + (m[1] === "rsa routines" ? "RSA_" : "") +
+        m[2].toUpperCase().replace(/[^A-Z0-9]+/g, "_");
+      return err;
+    }
+
+    // The arguments the four RSA encrypt/decrypt functions share: the key as
+    // PEM, and from an options object `padding`, `oaepHash` and `oaepLabel`.
+    function rsaCryptArgs(fnName, keyOrOpts, defaultPadding) {
+      var key, padding, oaepHash = "sha1", oaepLabel;
       if (typeof keyOrOpts === "string") {
         key = keyOrOpts;
+      } else if (keyOrOpts instanceof KeyObject) {
+        key = asymmetricKeyPem(keyOrOpts);
       } else if (ArrayBuffer.isView(keyOrOpts)) {
         key = new TextDecoder().decode(keyOrOpts);
       } else if (keyOrOpts && typeof keyOrOpts === "object") {
-        key = typeof keyOrOpts.key === "string" ? keyOrOpts.key : new TextDecoder().decode(keyOrOpts.key);
-        if (keyOrOpts.padding !== undefined) padding = keyOrOpts.padding;
+        key = asymmetricKeyPem(keyOrOpts.key);
+        padding = keyOrOpts.padding;
         if (keyOrOpts.oaepHash) oaepHash = keyOrOpts.oaepHash;
+        var label = keyOrOpts.oaepLabel;
+        if (label !== undefined && label !== null) {
+          if (typeof label === "string") {
+            oaepLabel = new Uint8Array(BufferCtor.from(label));
+          } else if (ArrayBuffer.isView(label)) {
+            oaepLabel = new Uint8Array(label.buffer, label.byteOffset, label.byteLength);
+          } else if (label instanceof ArrayBuffer) {
+            oaepLabel = new Uint8Array(label);
+          } else {
+            throw codes.ERR_INVALID_ARG_TYPE(
+              "key.oaepLabel", ["string", "ArrayBuffer", "Buffer", "TypedArray", "DataView"], label);
+          }
+        }
       } else {
-        throw new TypeError("publicEncrypt: key must be a string, Buffer, or object");
+        throw new TypeError(fnName + ": key must be a string, Buffer, or object");
       }
-      var paddingName = padding === 1 ? "pkcs1" : "oaep";
-      var data = typeof buffer === "string" ? BufferCtor.from(buffer) : buffer;
-      return BufferCtor.from(natives.cryptoPublicEncrypt(new Uint8Array(data), key, paddingName, oaepHash));
+      return {
+        key: key,
+        // Named after the data argument is checked, which is Node's order.
+        padding: padding,
+        defaultPadding: defaultPadding,
+        oaepHash: String(oaepHash),
+        // The label belongs to OAEP; the other paddings ignore it, as in Node.
+        oaepLabel: oaepLabel || new Uint8Array(0),
+      };
+    }
+
+    // The data argument: a string's UTF-8 bytes, or the bytes an
+    // ArrayBuffer or a view covers (a view of any element type, or a
+    // DataView, is its underlying bytes, not its elements).
+    function rsaCryptData(buffer) {
+      if (typeof buffer === "string") return new Uint8Array(BufferCtor.from(buffer));
+      if (ArrayBuffer.isView(buffer)) {
+        return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+      }
+      if (buffer instanceof ArrayBuffer ||
+          (typeof SharedArrayBuffer !== "undefined" && buffer instanceof SharedArrayBuffer)) {
+        return new Uint8Array(buffer);
+      }
+      throw codes.ERR_INVALID_ARG_TYPE(
+        "buffer", ["string", "ArrayBuffer", "Buffer", "TypedArray", "DataView"], buffer);
+    }
+
+    // Run one of the four native ops: the data, then the padding, then the
+    // call, with the op's error given Node's shape.
+    function rsaCrypt(op, a, buffer, withOaep) {
+      var data = rsaCryptData(buffer);
+      var padding = rsaPaddingName(a.padding, a.defaultPadding);
+      try {
+        return BufferCtor.from(withOaep
+          ? op(data, a.key, padding, a.oaepHash, a.oaepLabel)
+          : op(data, a.key, padding));
+      } catch (e) { throw rsaOpError(e); }
+    }
+
+    function publicEncrypt(keyOrOpts, buffer) {
+      return rsaCrypt(natives.cryptoPublicEncrypt, rsaCryptArgs("publicEncrypt", keyOrOpts, 4), buffer, true);
     }
 
     function privateDecrypt(keyOrOpts, buffer) {
-      var key, padding = 4, oaepHash = "sha1";
-      if (typeof keyOrOpts === "string") {
-        key = keyOrOpts;
-      } else if (ArrayBuffer.isView(keyOrOpts)) {
-        key = new TextDecoder().decode(keyOrOpts);
-      } else if (keyOrOpts && typeof keyOrOpts === "object") {
-        key = typeof keyOrOpts.key === "string" ? keyOrOpts.key : new TextDecoder().decode(keyOrOpts.key);
-        if (keyOrOpts.padding !== undefined) padding = keyOrOpts.padding;
-        if (keyOrOpts.oaepHash) oaepHash = keyOrOpts.oaepHash;
-      } else {
-        throw new TypeError("privateDecrypt: key must be a string, Buffer, or object");
-      }
-      var paddingName = padding === 1 ? "pkcs1" : "oaep";
-      var data = typeof buffer === "string" ? BufferCtor.from(buffer) : buffer;
-      return BufferCtor.from(natives.cryptoPrivateDecrypt(new Uint8Array(data), key, paddingName, oaepHash));
+      return rsaCrypt(natives.cryptoPrivateDecrypt, rsaCryptArgs("privateDecrypt", keyOrOpts, 4), buffer, true);
     }
 
     function privateEncrypt(keyOrOpts, buffer) {
-      var key;
-      if (typeof keyOrOpts === "string") {
-        key = keyOrOpts;
-      } else if (ArrayBuffer.isView(keyOrOpts)) {
-        key = new TextDecoder().decode(keyOrOpts);
-      } else if (keyOrOpts && typeof keyOrOpts === "object") {
-        key = typeof keyOrOpts.key === "string" ? keyOrOpts.key : new TextDecoder().decode(keyOrOpts.key);
-      } else {
-        throw new TypeError("privateEncrypt: key must be a string, Buffer, or object");
-      }
-      var data = typeof buffer === "string" ? BufferCtor.from(buffer) : buffer;
-      return BufferCtor.from(natives.cryptoPrivateEncrypt(new Uint8Array(data), key));
+      return rsaCrypt(natives.cryptoPrivateEncrypt, rsaCryptArgs("privateEncrypt", keyOrOpts, 1), buffer, false);
     }
 
     function publicDecrypt(keyOrOpts, buffer) {
-      var key;
-      if (typeof keyOrOpts === "string") {
-        key = keyOrOpts;
-      } else if (ArrayBuffer.isView(keyOrOpts)) {
-        key = new TextDecoder().decode(keyOrOpts);
-      } else if (keyOrOpts && typeof keyOrOpts === "object") {
-        key = typeof keyOrOpts.key === "string" ? keyOrOpts.key : new TextDecoder().decode(keyOrOpts.key);
-      } else {
-        throw new TypeError("publicDecrypt: key must be a string, Buffer, or object");
-      }
-      var data = typeof buffer === "string" ? BufferCtor.from(buffer) : buffer;
-      return BufferCtor.from(natives.cryptoPublicDecrypt(new Uint8Array(data), key));
+      return rsaCrypt(natives.cryptoPublicDecrypt, rsaCryptArgs("publicDecrypt", keyOrOpts, 1), buffer, false);
     }
 
 
     // ---- Diffie-Hellman (classic, non-EC) ----
+    // node's lib/internal/crypto/diffiehellman.js over src/crypto/crypto_dh.cc
+    // (v22.22.2): the argument handling, the errors and their shapes are
+    // node's; the arithmetic, which groups are named, the private-value length,
+    // the peer checks and verifyError are the cryptoDh* ops (OpenSSL's rules,
+    // crypto_ops.rs). State is p, g, the keys as last set or generated, and
+    // whether the group came from a prime length.
     var DH_GROUPS = {
-      modp1: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6BFFFFFFFFFFFFFFFF",
+      modp1: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF",
       modp2: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF",
       modp5: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA237327FFFFFFFFFFFFFFFF",
       modp14: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF",
+      modp15: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF",
+      modp16: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D788719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA993B4EA988D8FDDC186FFB7DC90A6C08F4DF435C934063199FFFFFFFFFFFFFFFF",
+      modp17: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D788719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA993B4EA988D8FDDC186FFB7DC90A6C08F4DF435C93402849236C3FAB4D27C7026C1D4DCB2602646DEC9751E763DBA37BDF8FF9406AD9E530EE5DB382F413001AEB06A53ED9027D831179727B0865A8918DA3EDBEBCF9B14ED44CE6CBACED4BB1BDB7F1447E6CC254B332051512BD7AF426FB8F401378CD2BF5983CA01C64B92ECF032EA15D1721D03F482D7CE6E74FEF6D55E702F46980C82B5A84031900B1C9E59E7C97FBEC7E8F323A97A7E36CC88BE0F1D45B7FF585AC54BD407B22B4154AACC8F6D7EBF48E1D814CC5ED20F8037E0A79715EEF29BE32806A1D58BB7C5DA76F550AA3D8A1FBFF0EB19CCB1A313D55CDA56C9EC2EF29632387FE8D76E3C0468043E8F663F4860EE12BF2D5B0B7474D6E694F91E6DCC4024FFFFFFFFFFFFFFFF",
+      modp18: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D788719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA993B4EA988D8FDDC186FFB7DC90A6C08F4DF435C93402849236C3FAB4D27C7026C1D4DCB2602646DEC9751E763DBA37BDF8FF9406AD9E530EE5DB382F413001AEB06A53ED9027D831179727B0865A8918DA3EDBEBCF9B14ED44CE6CBACED4BB1BDB7F1447E6CC254B332051512BD7AF426FB8F401378CD2BF5983CA01C64B92ECF032EA15D1721D03F482D7CE6E74FEF6D55E702F46980C82B5A84031900B1C9E59E7C97FBEC7E8F323A97A7E36CC88BE0F1D45B7FF585AC54BD407B22B4154AACC8F6D7EBF48E1D814CC5ED20F8037E0A79715EEF29BE32806A1D58BB7C5DA76F550AA3D8A1FBFF0EB19CCB1A313D55CDA56C9EC2EF29632387FE8D76E3C0468043E8F663F4860EE12BF2D5B0B7474D6E694F91E6DBE115974A3926F12FEE5E438777CB6A932DF8CD8BEC4D073B931BA3BC832B68D9DD300741FA7BF8AFC47ED2576F6936BA424663AAB639C5AE4F5683423B4742BF1C978238F16CBE39D652DE3FDB8BEFC848AD922222E04A4037C0713EB57A81A23F0C73473FC646CEA306B4BCBC8862F8385DDFA9D4B7FA2C087E879683303ED5BDD3A062B3CF5B3A278A66D2A13F83F44F82DDF310EE074AB6A364597E899A0255DC164F31CC50846851DF9AB48195DED7EA1B1D510BD7EE74D73FAF36BC31ECFA268359046F4EB879F924009438B481C6CD7889A002ED5EE382BC9190DA6FC026E479558E4475677E9AA9E3050E2765694DFC81F56E880B96E7160C980DD98EDD3DFFFFFFFFFFFFFFFFF",
+    };
+    var kDhHandle = Symbol("kHandle");
+    var DH_SOURCE_TYPES = ["number", "string", "ArrayBuffer", "Buffer", "TypedArray", "DataView"];
+    var DH_KEY_TYPES = ["string", "ArrayBuffer", "Buffer", "TypedArray", "DataView"];
+    // A named group's verifyError never changes; computed once per name.
+    var dhGroupVerifyError = Object.create(null);
+
+    // A copy of an ArrayBuffer or view's bytes, as the native side reads them.
+    function dhBytes(value) {
+      if (isAnyArrayBuffer(value)) return new Uint8Array(value.slice(0));
+      return new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+    }
+    // BN_bn2bin's encoding: no leading zero bytes.
+    function dhMinimal(bytes) {
+      var i = 0;
+      while (i < bytes.length && bytes[i] === 0) i++;
+      return bytes.subarray(i);
+    }
+    function dhWord(n) {
+      var out = [];
+      while (n > 0) {
+        out.unshift(n % 256);
+        n = Math.floor(n / 256);
+      }
+      return new Uint8Array(out);
+    }
+    function dhBelowTwo(bytes) {
+      var m = dhMinimal(bytes);
+      return m.length === 0 || (m.length === 1 && m[0] < 2);
+    }
+    // node's toBuf.
+    function dhToBuf(value, encoding) {
+      if (typeof value === "string") {
+        if (encoding === "buffer" || !encoding) encoding = "utf8";
+        return BufferCtor.from(value, encoding);
+      }
+      return value;
+    }
+    // node's getArrayBufferOrView(value, "key", encoding).
+    function dhKeyArg(value, encoding) {
+      if (isAnyArrayBuffer(value)) return value;
+      if (typeof value === "string") {
+        if (encoding === "buffer") encoding = "utf8";
+        return BufferCtor.from(value, encoding);
+      }
+      if (!ArrayBuffer.isView(value)) {
+        throw new codes.ERR_INVALID_ARG_TYPE("key", DH_KEY_TYPES, value);
+      }
+      return value;
+    }
+    function dhEncode(bytes, encoding) {
+      var buf = BufferCtor.from(bytes);
+      return encoding && encoding !== "buffer" ? buf.toString(encoding) : buf;
+    }
+    // An OpenSSL-raised error as node throws it: Error with library, reason,
+    // and the ERR_OSSL_ code node derives from them.
+    function dhOpenSslError(hex, reason) {
+      var err = new Error("error:" + hex + ":Diffie-Hellman routines::" + reason);
+      err.library = "Diffie-Hellman routines";
+      err.reason = reason;
+      err.code = "ERR_OSSL_DH_" + reason.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
+      return err;
+    }
+    function dhBadGenerator() {
+      return dhOpenSslError("02800065", "bad generator");
+    }
+    function dhDefineVerifyError(self, value) {
+      Object.defineProperty(self, "verifyError", {
+        __proto__: null,
+        enumerable: true,
+        value: value,
+        writable: false,
+      });
+    }
+    function dhCheck(handle) {
+      var flags = natives.cryptoDhCheck(handle.prime, handle.generator);
+      if (flags < 0) {
+        throw nativeCodedError(Error, "Checking DH parameters failed", "ERR_CRYPTO_OPERATION_FAILED");
+      }
+      return flags;
+    }
+
+    // crypto_dh.cc New(): a prime length (a fresh prime) or a prime, and a
+    // generator.
+    function dhNewHandle(sizeOrKey, generator) {
+      var handle = { prime: null, generator: null, publicKey: null, privateKey: null, generated: false };
+      if (typeof sizeOrKey === "number") {
+        if (sizeOrKey < 2) throw dhOpenSslError("0280007E", "modulus too small");
+        if (typeof generator !== "number") {
+          throw nativeCodedError(TypeError, "Second argument must be an int32", "ERR_INVALID_ARG_TYPE");
+        }
+        if (generator < 2) throw dhBadGenerator();
+        // OpenSSL's parameter generation takes 512 to 10000 bits.
+        if (sizeOrKey < 512 || sizeOrKey > 10000) {
+          throw nativeCodedError(TypeError, "Invalid DH parameters", "ERR_INVALID_ARG_VALUE");
+        }
+        handle.prime = new Uint8Array(natives.cryptoGeneratePrime(sizeOrKey));
+        handle.generator = dhWord(generator);
+        handle.generated = true;
+        return handle;
+      }
+      handle.prime = dhBytes(sizeOrKey);
+      if (typeof generator === "number") {
+        if (generator < 2) throw dhBadGenerator();
+        handle.generator = dhWord(generator);
+      } else {
+        handle.generator = dhBytes(generator);
+        if (dhBelowTwo(handle.generator)) throw dhBadGenerator();
+      }
+      return handle;
+    }
+
+    function DiffieHellman(sizeOrKey, keyEncoding, generator, genEncoding) {
+      if (!(this instanceof DiffieHellman)) {
+        return new DiffieHellman(sizeOrKey, keyEncoding, generator, genEncoding);
+      }
+      if (typeof sizeOrKey !== "number" && typeof sizeOrKey !== "string" &&
+          !ArrayBuffer.isView(sizeOrKey) && !isAnyArrayBuffer(sizeOrKey)) {
+        throw new codes.ERR_INVALID_ARG_TYPE("sizeOrKey", DH_SOURCE_TYPES, sizeOrKey);
+      }
+      if (typeof sizeOrKey === "number") validateInt32(sizeOrKey, "sizeOrKey");
+      if (keyEncoding && !BufferCtor.isEncoding(keyEncoding) && keyEncoding !== "buffer") {
+        genEncoding = generator;
+        generator = keyEncoding;
+        keyEncoding = false;
+      }
+      keyEncoding = keyEncoding || "buffer";
+      genEncoding = genEncoding || "buffer";
+      if (typeof sizeOrKey !== "number") sizeOrKey = dhToBuf(sizeOrKey, keyEncoding);
+      if (!generator) {
+        generator = 2;
+      } else if (typeof generator === "number") {
+        validateInt32(generator, "generator");
+      } else if (typeof generator === "string") {
+        generator = dhToBuf(generator, genEncoding);
+      } else if (!ArrayBuffer.isView(generator) && !isAnyArrayBuffer(generator)) {
+        throw new codes.ERR_INVALID_ARG_TYPE("generator", DH_SOURCE_TYPES, generator);
+      }
+      this[kDhHandle] = dhNewHandle(sizeOrKey, generator);
+      dhDefineVerifyError(this, dhCheck(this[kDhHandle]));
+    }
+
+    function DiffieHellmanGroup(name) {
+      if (!(this instanceof DiffieHellmanGroup)) return new DiffieHellmanGroup(name);
+      if (typeof name !== "string") {
+        throw nativeCodedError(TypeError, "Group name must be a string", "ERR_INVALID_ARG_TYPE");
+      }
+      var key = name.toLowerCase();
+      if (!Object.prototype.hasOwnProperty.call(DH_GROUPS, key)) {
+        throw nativeCodedError(Error, "Unknown DH group", "ERR_CRYPTO_UNKNOWN_DH_GROUP");
+      }
+      var handle = {
+        prime: new Uint8Array(BufferCtor.from(DH_GROUPS[key], "hex")),
+        generator: new Uint8Array([2]),
+        publicKey: null,
+        privateKey: null,
+        generated: false,
+      };
+      this[kDhHandle] = handle;
+      if (!(key in dhGroupVerifyError)) dhGroupVerifyError[key] = dhCheck(handle);
+      dhDefineVerifyError(this, dhGroupVerifyError[key]);
+    }
+
+    function dhGenerateKeys(encoding) {
+      var handle = this[kDhHandle];
+      var keys = natives.cryptoDhGenerateKeys(
+        handle.prime, handle.generator,
+        handle.privateKey === null ? undefined : handle.privateKey,
+        handle.generated
+      );
+      if (keys === null) {
+        throw nativeCodedError(Error, "Key generation failed", "ERR_CRYPTO_OPERATION_FAILED");
+      }
+      if (keys.privateKey) handle.privateKey = keys.privateKey;
+      handle.publicKey = keys.publicKey;
+      // A zero public value is kept, and reported as node reports it.
+      if (keys.publicKey.length === 0) {
+        throw nativeCodedError(Error, "Key generation failed", "ERR_CRYPTO_OPERATION_FAILED");
+      }
+      return dhEncode(keys.publicKey, encoding);
+    }
+
+    function dhComputeSecret(key, inEnc, outEnc) {
+      key = dhKeyArg(key, inEnc);
+      var handle = this[kDhHandle];
+      var secret = natives.cryptoDhComputeSecret(
+        handle.prime, handle.generator,
+        handle.privateKey === null ? undefined : handle.privateKey,
+        dhBytes(key), handle.generated
+      );
+      if (secret === 1) {
+        throw nativeCodedError(RangeError, "Supplied key is too small", "ERR_CRYPTO_INVALID_KEYLEN");
+      }
+      if (secret === 2) {
+        throw nativeCodedError(RangeError, "Unspecified validation error", "ERR_CRYPTO_INVALID_KEYTYPE");
+      }
+      return dhEncode(secret, outEnc);
+    }
+
+    function dhStateValue(bytes, message, encoding) {
+      var value = bytes === null ? null : dhMinimal(bytes);
+      if (value === null || value.length === 0) {
+        throw nativeCodedError(Error, message, "ERR_CRYPTO_INVALID_STATE");
+      }
+      return dhEncode(value, encoding);
+    }
+    function dhGetPrime(encoding) {
+      return dhStateValue(this[kDhHandle].prime, "p is null", encoding);
+    }
+    function dhGetGenerator(encoding) {
+      return dhStateValue(this[kDhHandle].generator, "g is null", encoding);
+    }
+    function dhGetPublicKey(encoding) {
+      return dhStateValue(this[kDhHandle].publicKey, "No public key - did you forget to generate one?", encoding);
+    }
+    function dhGetPrivateKey(encoding) {
+      return dhStateValue(this[kDhHandle].privateKey, "No private key - did you forget to generate one?", encoding);
+    }
+
+    DiffieHellmanGroup.prototype.generateKeys = DiffieHellman.prototype.generateKeys = dhGenerateKeys;
+    DiffieHellmanGroup.prototype.computeSecret = DiffieHellman.prototype.computeSecret = dhComputeSecret;
+    DiffieHellmanGroup.prototype.getPrime = DiffieHellman.prototype.getPrime = dhGetPrime;
+    DiffieHellmanGroup.prototype.getGenerator = DiffieHellman.prototype.getGenerator = dhGetGenerator;
+    DiffieHellmanGroup.prototype.getPublicKey = DiffieHellman.prototype.getPublicKey = dhGetPublicKey;
+    DiffieHellmanGroup.prototype.getPrivateKey = DiffieHellman.prototype.getPrivateKey = dhGetPrivateKey;
+    DiffieHellman.prototype.setPublicKey = function setPublicKey(key, encoding) {
+      key = dhKeyArg(key, encoding);
+      this[kDhHandle].publicKey = dhBytes(key);
+      return this;
+    };
+    DiffieHellman.prototype.setPrivateKey = function setPrivateKey(key, encoding) {
+      key = dhKeyArg(key, encoding);
+      this[kDhHandle].privateKey = dhBytes(key);
+      return this;
     };
 
-    class DiffieHellman {
-      constructor(prime, generator) {
-        if (typeof prime === "number") {
-          var primeBytes = BufferCtor.from(natives.cryptoGeneratePrime(prime));
-          prime = primeBytes;
-        }
-        this._prime = BufferCtor.isBuffer(prime) ? prime : BufferCtor.from(prime);
-        if (!generator) generator = BufferCtor.from([2]);
-        else if (typeof generator === "number") generator = BufferCtor.from([generator]);
-        else if (!BufferCtor.isBuffer(generator)) generator = BufferCtor.from(generator);
-        this._generator = generator;
-        this._publicKey = null;
-        this._privateKey = null;
-      }
-      generateKeys(encoding) {
-        var result = natives.cryptoDhGenerateKeys(
-          new Uint8Array(this._prime),
-          new Uint8Array(this._generator)
-        );
-        this._publicKey = BufferCtor.from(result.publicKey);
-        this._privateKey = BufferCtor.from(result.privateKey);
-        return this.getPublicKey(encoding);
-      }
-      computeSecret(otherPublicKey, inputEncoding, outputEncoding) {
-        if (!this._privateKey) throw new Error("DH: keys have not been generated");
-        var otherKey = typeof otherPublicKey === "string"
-          ? BufferCtor.from(otherPublicKey, inputEncoding || "hex")
-          : BufferCtor.from(otherPublicKey);
-        var secret = natives.cryptoDhComputeSecret(
-          new Uint8Array(this._prime),
-          new Uint8Array(this._privateKey),
-          new Uint8Array(otherKey)
-        );
-        var buf = BufferCtor.from(secret);
-        return outputEncoding ? buf.toString(outputEncoding) : buf;
-      }
-      getPrime(encoding) {
-        var buf = BufferCtor.from(this._prime);
-        return encoding ? buf.toString(encoding) : buf;
-      }
-      getGenerator(encoding) {
-        var buf = BufferCtor.from(this._generator);
-        return encoding ? buf.toString(encoding) : buf;
-      }
-      getPublicKey(encoding) {
-        if (!this._publicKey) throw new Error("DH: keys have not been generated");
-        var buf = BufferCtor.from(this._publicKey);
-        return encoding ? buf.toString(encoding) : buf;
-      }
-      getPrivateKey(encoding) {
-        if (!this._privateKey) throw new Error("DH: keys have not been generated");
-        var buf = BufferCtor.from(this._privateKey);
-        return encoding ? buf.toString(encoding) : buf;
-      }
-      setPublicKey(key, encoding) {
-        this._publicKey = typeof key === "string"
-          ? BufferCtor.from(key, encoding || "hex")
-          : BufferCtor.from(key);
-      }
-      setPrivateKey(key, encoding) {
-        this._privateKey = typeof key === "string"
-          ? BufferCtor.from(key, encoding || "hex")
-          : BufferCtor.from(key);
-      }
-      get verifyError() { return 0; }
+    function createDiffieHellman(sizeOrKey, keyEncoding, generator, genEncoding) {
+      return new DiffieHellman(sizeOrKey, keyEncoding, generator, genEncoding);
     }
 
-    function createDiffieHellman(primeOrLen, primeEncoding, generator, generatorEncoding) {
-      if (typeof primeOrLen === "number") {
-        var primeBytes = BufferCtor.from(natives.cryptoGeneratePrime(primeOrLen));
-        return new DiffieHellman(primeBytes, BufferCtor.from([2]));
-      }
-      var prime = typeof primeOrLen === "string"
-        ? BufferCtor.from(primeOrLen, primeEncoding || "hex")
-        : BufferCtor.from(primeOrLen);
-      var gen;
-      if (generator === undefined || generator === null) {
-        gen = BufferCtor.from([2]);
-      } else if (typeof generator === "number") {
-        gen = BufferCtor.from([generator]);
-      } else if (typeof generator === "string") {
-        gen = BufferCtor.from(generator, generatorEncoding || "hex");
-      } else {
-        gen = BufferCtor.from(generator);
-      }
-      return new DiffieHellman(prime, gen);
-    }
-
-    function getDiffieHellman(groupName) {
-      var hex = DH_GROUPS[groupName.toLowerCase()];
-      if (!hex) throw new Error("Unknown DH group: " + groupName);
-      return new DiffieHellman(BufferCtor.from(hex, "hex"), BufferCtor.from([2]));
+    // node exports this one function under both names.
+    function createDiffieHellmanGroup(name) {
+      return new DiffieHellmanGroup(name);
     }
 
 
@@ -22026,6 +23130,10 @@
     }
 
     function generatePrimeSync(size, options) {
+      // Node's validateInt32(size, 'size', 1): ERR_INVALID_ARG_TYPE for a
+      // non-number, ERR_OUT_OF_RANGE for a fraction or a value outside
+      // [1, 2**31 - 1] (probed on v22.22.2).
+      validateInt32(size, "size", 1);
       var bigint = options && options.bigint;
       var bytes = natives.cryptoGeneratePrime(size);
       if (bigint) {
@@ -22038,6 +23146,8 @@
 
     function generatePrime(size, options, callback) {
       if (typeof options === "function") { callback = options; options = {}; }
+      // A bad size throws synchronously in node, callback or not.
+      validateInt32(size, "size", 1);
       try {
         var result = generatePrimeSync(size, options);
         if (callback) queueMicrotask(function() { callback(null, result); });
@@ -22073,10 +23183,22 @@
     }
 
     return {
-      hash: (algorithm, data, outputEncoding) => {
+      // node: hash(algorithm, data, outputEncoding = 'hex'); 'buffer' asks
+      // for the raw digest as a Buffer.
+      hash: (algorithm, data, outputEncoding = "hex") => {
+        // node refuses a non-string encoding (ERR_INVALID_ARG_TYPE) and a
+        // name that is neither an encoding nor 'buffer', in any case
+        // (ERR_INVALID_ARG_VALUE).
+        if (typeof outputEncoding !== "string") {
+          throw new codes.ERR_INVALID_ARG_TYPE("outputEncoding", "string", outputEncoding);
+        }
+        var asRaw = outputEncoding.toLowerCase() === "buffer";
+        if (!asRaw && !globalThis.Buffer.isEncoding(outputEncoding)) {
+          throw new codes.ERR_INVALID_ARG_VALUE("outputEncoding", outputEncoding);
+        }
         var h = createHash(algorithm);
         h.update(data);
-        return outputEncoding ? h.digest(outputEncoding) : h.digest();
+        return asRaw ? h.digest() : h.digest(outputEncoding);
       },
       createHash,
       createHmac,
@@ -22139,8 +23261,10 @@
       privateDecrypt,
       publicDecrypt,
       createDiffieHellman,
-      getDiffieHellman,
+      createDiffieHellmanGroup,
+      getDiffieHellman: createDiffieHellmanGroup,
       DiffieHellman,
+      DiffieHellmanGroup,
       X509Certificate,
       generatePrime,
       generatePrimeSync,
@@ -22154,11 +23278,20 @@
       Verify,
       Certificate,
       constants: {
+        DH_CHECK_P_NOT_SAFE_PRIME: 2,
+        DH_CHECK_P_NOT_PRIME: 1,
+        DH_UNABLE_TO_CHECK_GENERATOR: 4,
+        DH_NOT_SUITABLE_GENERATOR: 8,
         RSA_PKCS1_PADDING: 1,
         RSA_NO_PADDING: 3,
         RSA_PKCS1_OAEP_PADDING: 4,
         RSA_PKCS1_PSS_PADDING: 6,
         RSA_PKCS1_SHA256_PADDING: 12,
+        // saltLength sentinels, resolved by the PSS ops (values probed on
+        // v22.22.2: MAX_SIGN and AUTO share -2).
+        RSA_PSS_SALTLEN_DIGEST: -1,
+        RSA_PSS_SALTLEN_MAX_SIGN: -2,
+        RSA_PSS_SALTLEN_AUTO: -2,
         POINT_CONVERSION_COMPRESSED: 2,
         POINT_CONVERSION_UNCOMPRESSED: 4,
         SSL_OP_ALL: 0x80000bff,
@@ -22188,9 +23321,9 @@
   // gzip/deflate/deflateRaw + unzip auto-detect. Sync forms run on the
   // isolate thread (the API contract); callback forms ride the async op
   // (CPU work on the blocking pool, Node's threadpool model). create*
-  // Transform classes BUFFER input and emit on flush â€” wave-1 divergence,
-  // documented: true incremental compression streams land later. brotli*
-  // is gated with a pointer.
+  // Transform classes compress and decompress incrementally, chunk by
+  // chunk, brotli included (streamingTransformClass). Only the brotli
+  // *Sync forms are gated with a pointer.
   registry.factories.zlib = (natives) => {
     const BufferCtor = globalThis.Buffer;
     const toBytes = (data) =>
@@ -22242,7 +23375,9 @@
         return [result[1], result[0]];
       }
       close() {
-        if (this._nativeHandle !== null) {
+        // `!= null`: a placeholder handle built without the constructor
+        // has no native slot at all (undefined), and must not reach the op.
+        if (this._nativeHandle != null) {
           natives.zlibStreamClose(this._nativeHandle);
           this._nativeHandle = null;
         }
@@ -22600,8 +23735,8 @@
     // internal block size (typically 32-128 kB) rather than the whole
     // input. _flush finalizes the stream and emits any trailer bytes.
     //
-    // Supported formats (incremental): gzip, deflate, deflateRaw, unzip.
-    // Brotli uses the legacy buffering path with a clear error gate.
+    // Supported formats (incremental): gzip, deflate, deflateRaw, unzip and
+    // brotli.
     //
     // The stream handle is created lazily on the first _transform call so
     // that streams that are only used for sync ops (e.g. pipe target with
@@ -22638,7 +23773,21 @@
           // Promise serializing back-to-back _transform calls so we
           // never have two concurrent zlibStreamWrite ops for the same handle.
           this._zlibQueue = Promise.resolve();
+          // A placeholder for code that reaches for `stream._handle`: it
+          // owns no native slot, so its close() is a no-op.
           this._handle = Object.create(ZlibHandle.prototype);
+          this._handle._nativeHandle = null;
+        }
+
+        // Keep the slot a create just returned, unless the stream was
+        // destroyed while the create was in flight: _destroy saw a null
+        // handle then, so the slot is closed here and the pending call fails.
+        _adoptStream(info) {
+          if (this.destroyed) {
+            natives.zlibStreamClose(info.handle);
+            throw new Error("zlib stream was destroyed");
+          }
+          this._zlibHandle = info.handle;
         }
 
         // Lazily allocate the Rust-side stream on first use.
@@ -22646,7 +23795,7 @@
           if (this._zlibHandle !== null) return Promise.resolve();
           return natives.zlibStreamCreate(
             format, this._zlibLevel, compress, this._zlibDictionary,
-          ).then((info) => { this._zlibHandle = info.handle; });
+          ).then((info) => this._adoptStream(info));
         }
 
         // node's Zlib.prototype.params (Brotli inherits it): validated, then
@@ -22732,7 +23881,7 @@
                 format, this._zlibLevel, compress, this._zlibDictionary,
               )
                 .then((info) => {
-                  this._zlibHandle = info.handle;
+                  this._adoptStream(info);
                   return natives.zlibStreamFlush(this._zlibHandle, this._zlibFinishFlush);
                 });
             }
@@ -22755,55 +23904,25 @@
       };
     }
 
-    // Wave-1 buffering fallback: kept for brotli (not yet incrementally
-    // backed) and any format that is not in the streaming set.
-    function bufferingTransformClass(format, compress) {
-      const { Transform } = registry.get("stream");
-      return class extends Transform {
-        constructor(options) {
-          const level = zlibSettings(format, compress, options).level;
-          super(transformOptions(options));
-          this._zlibChunks = [];
-          this._zlibLevel = level;
-        }
-        _transform(chunk, _encoding, cb) {
-          this._zlibChunks.push(toBytes(chunk));
-          cb();
-        }
-        _flush(cb) {
-          const total = this._zlibChunks.reduce((n, c) => n + c.length, 0);
-          const joined = new Uint8Array(total);
-          let offset = 0;
-          for (const c of this._zlibChunks) {
-            joined.set(c, offset);
-            offset += c.length;
-          }
-          natives.zlibAsync(joined, format, this._zlibLevel, compress).then(
-            (bytes) => cb(null, asBuffer(bytes)),
-            (err) => cb(err),
-          );
-        }
-      };
-    }
-
-    // Route: use incremental streaming for gzip/deflate/deflateRaw/unzip/brotli;
-    // fall back to the buffering path for any unrecognized future formats.
-    const STREAMING_FORMATS = new Set(["gzip", "deflate", "deflateRaw", "unzip", "brotli"]);
+    // Every format (gzip, deflate, deflateRaw, unzip, brotli) streams
+    // incrementally.
     function transformClass(format, compress) {
-      if (STREAMING_FORMATS.has(format)) {
-        return streamingTransformClass(format, compress);
-      }
-      return bufferingTransformClass(format, compress);
+      return streamingTransformClass(format, compress);
     }
 
     // One-shot brotli: create stream, write all data, flush -- returns Buffer.
-    // The streaming Transform class handles incremental paths automatically
-    // (brotli is in STREAMING_FORMATS above).
     const brotliOneShot = (data, compress) => {
       const bytes = toBytes(data);
       return natives.zlibStreamCreate("brotli", -1, compress).then((info) => {
         const handle = info.handle;
-        return natives.zlibStreamWrite(handle, bytes).then((chunk1) =>
+        // A failed write leaves the stream in the native registry (only a
+        // flush or a close removes it), so close it before passing the
+        // error on.
+        const written = natives.zlibStreamWrite(handle, bytes).then(undefined, (err) => {
+          natives.zlibStreamClose(handle);
+          throw err;
+        });
+        return written.then((chunk1) =>
           natives.zlibStreamFlush(handle).then((chunk2) => {
             const total = (chunk1 ? chunk1.length : 0) + (chunk2 ? chunk2.length : 0);
             if (total === 0) return asBuffer(new Uint8Array(0));
@@ -23626,6 +24745,59 @@
         BROTLI_DEFAULT_WINDOW: 22,
         BROTLI_MIN_WINDOW_BITS: 10,
         BROTLI_MAX_WINDOW_BITS: 24,
+        // The rest of node v22's zlib.constants (values as node lists
+        // them; ZLIB_VERNUM is left out, there being no zlib build here to
+        // report). Without the BROTLI_PARAM_* names the usual
+        // `params: { [constants.BROTLI_PARAM_QUALITY]: n }` builds the key
+        // "undefined", which the params check refuses.
+        Z_BLOCK: 5,
+        Z_NEED_DICT: 2,
+        Z_ERRNO: -1,
+        Z_STREAM_ERROR: -2,
+        Z_MEM_ERROR: -4,
+        Z_BUF_ERROR: -5,
+        Z_VERSION_ERROR: -6,
+        Z_FILTERED: 1,
+        Z_HUFFMAN_ONLY: 2,
+        Z_RLE: 3,
+        Z_FIXED: 4,
+        UNZIP: 7,
+        BROTLI_DECODE: 8,
+        BROTLI_ENCODE: 9,
+        Z_MIN_WINDOWBITS: 8,
+        Z_MAX_WINDOWBITS: 15,
+        Z_MIN_MEMLEVEL: 1,
+        Z_MAX_MEMLEVEL: 9,
+        Z_MIN_LEVEL: -1,
+        Z_MAX_LEVEL: 9,
+        Z_DEFAULT_LEVEL: -1,
+        BROTLI_OPERATION_EMIT_METADATA: 3,
+        BROTLI_PARAM_MODE: 0,
+        BROTLI_MODE_GENERIC: 0,
+        BROTLI_MODE_TEXT: 1,
+        BROTLI_MODE_FONT: 2,
+        BROTLI_DEFAULT_MODE: 0,
+        BROTLI_PARAM_QUALITY: 1,
+        BROTLI_PARAM_LGWIN: 2,
+        BROTLI_LARGE_MAX_WINDOW_BITS: 30,
+        BROTLI_PARAM_LGBLOCK: 3,
+        BROTLI_MIN_INPUT_BLOCK_BITS: 16,
+        BROTLI_MAX_INPUT_BLOCK_BITS: 24,
+        BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING: 4,
+        BROTLI_PARAM_SIZE_HINT: 5,
+        BROTLI_PARAM_LARGE_WINDOW: 6,
+        BROTLI_PARAM_NPOSTFIX: 7,
+        BROTLI_PARAM_NDIRECT: 8,
+        BROTLI_DECODER_RESULT_ERROR: 0,
+        BROTLI_DECODER_RESULT_SUCCESS: 1,
+        BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT: 2,
+        BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT: 3,
+        BROTLI_DECODER_PARAM_DISABLE_RING_BUFFER_REALLOCATION: 0,
+        BROTLI_DECODER_PARAM_LARGE_WINDOW: 1,
+        BROTLI_DECODER_NO_ERROR: 0,
+        BROTLI_DECODER_SUCCESS: 1,
+        BROTLI_DECODER_NEEDS_MORE_INPUT: 2,
+        BROTLI_DECODER_NEEDS_MORE_OUTPUT: 3,
         ...ZSTD_CONSTANTS,
       },
       ZstdCompress,
@@ -23742,9 +24914,27 @@
       return out;
     };
 
-    function parse(input, sep = "&", eq = "=", options = {}) {
+    function parse(input, sep, eq, options) {
       const out = Object.create(null);
       if (typeof input !== "string" || input.length === 0) return out;
+      // node: any falsy sep/eq (null in `parse(str, null, null, opts)`, not
+      // only undefined) means the default, and options may be null too.
+      sep = !sep ? "&" : String(sep);
+      eq = !eq ? "=" : String(eq);
+      if (options === null || options === undefined) options = {};
+      // node: options.decodeURIComponent replaces querystring.unescape for
+      // every key and value; if it throws, the built-in decoding is used.
+      let decode = unescape;
+      if (typeof options.decodeURIComponent === "function") {
+        const custom = options.decodeURIComponent;
+        decode = (text) => {
+          try {
+            return custom(text);
+          } catch {
+            return unescape(text);
+          }
+        };
+      }
       // Node honors maxKeys only when it is a NUMBER (Infinity/NaN included);
       // a non-number (e.g. the string 'Infinity') falls back to the 1000
       // default. A number > 0 caps; <=0 / NaN means unlimited.
@@ -23757,8 +24947,10 @@
         const idx = piece.indexOf(eq);
         const rawKey = idx === -1 ? piece : piece.slice(0, idx);
         const rawValue = idx === -1 ? "" : piece.slice(idx + eq.length);
-        const key = unescape(rawKey.replaceAll("+", " "));
-        const value = unescape(rawValue.replaceAll("+", " "));
+        // node decodes only a non-empty key or value (a custom
+        // decodeURIComponent is never called with "").
+        const key = rawKey.length > 0 ? decode(rawKey.replaceAll("+", " ")) : "";
+        const value = rawValue.length > 0 ? decode(rawValue.replaceAll("+", " ")) : "";
         if (key in out) {
           if (Array.isArray(out[key])) out[key].push(value);
           else out[key] = [out[key], value];
@@ -23769,16 +24961,23 @@
       return out;
     }
 
-    function stringify(obj, sep = "&", eq = "=", _options = {}) {
+    function stringify(obj, sep, eq, options) {
+      // node: `sep || '&'`, `eq || '='` (so null selects the default), and
+      // options.encodeURIComponent replaces querystring.escape.
+      sep = sep || "&";
+      eq = eq || "=";
+      const encode = options && typeof options.encodeURIComponent === "function"
+        ? options.encodeURIComponent
+        : escape;
       if (obj === null || typeof obj !== "object") return "";
       const parts = [];
       for (const key of Object.keys(obj)) {
-        const escapedKey = escape(key);
+        const escapedKey = encode(key);
         const value = obj[key];
         if (Array.isArray(value)) {
-          for (const item of value) parts.push(`${escapedKey}${eq}${escape(stringifyPrimitive(item))}`);
+          for (const item of value) parts.push(`${escapedKey}${eq}${encode(stringifyPrimitive(item))}`);
         } else {
-          parts.push(`${escapedKey}${eq}${escape(stringifyPrimitive(value))}`);
+          parts.push(`${escapedKey}${eq}${encode(stringifyPrimitive(value))}`);
         }
       }
       return parts.join(sep);
@@ -24137,6 +25336,7 @@
 
   registry.factories.console = () => {
     const util = registry.get("util");
+    const kConsoleState = Symbol("kConsoleState");
     class Console {
       constructor(stdout, stderr) {
         const options = stdout && stdout.write ? { stdout, stderr } : (stdout ?? {});
@@ -24150,28 +25350,172 @@
         // error handler as write()'s CALLBACK -- consumers (and node's own
         // samecb-singletick test) rely on that callback being invoked.
         const ignoreErr = () => {};
+        const state = {
+          // node's `inspectOptions`, which its table() and dir() inspect with.
+          inspectOptions: options.inspectOptions,
+          indent: "",
+          timers: new Map(),
+          counters: new Map(),
+          out: null,
+          err: null,
+        };
+        // One finished line of text to a stream, under the group indentation.
         const writeTo = (stream) => {
           let armed = false;
-          return (...args) => {
+          return (text) => {
             if (!armed) {
               armed = true;
               if (typeof stream.once === "function") stream.once("error", ignoreErr);
             }
-            stream.write(`${util.format(...args)}\n`, ignoreErr);
+            if (state.indent.length !== 0) {
+              if (text.includes("\n")) text = text.replace(/\n/g, `\n${state.indent}`);
+              text = state.indent + text;
+            }
+            stream.write(`${text}\n`, ignoreErr);
           };
         };
-        this.log = writeTo(this._out);
-        this.info = this.log;
-        this.debug = this.log;
-        this.warn = writeTo(this._err);
-        this.error = this.warn;
-        // node's `inspectOptions`, which its table() inspects cells with.
-        const inspectOptions = options.inspectOptions;
-        this.table = (data, properties) => {
-          const text = consoleTable(data, properties, inspectOptions);
-          this.log(text === null ? data : text);
-        };
+        state.out = writeTo(this._out);
+        state.err = writeTo(this._err);
+        this[kConsoleState] = state;
+        // As node does, bind every prototype method to the instance, read
+        // THROUGH the instance: a detached `const { log } = con` works, and
+        // a subclass's own log() is the one bound (its super.log() reaching
+        // Console.prototype's).
+        for (const key of Object.keys(Console.prototype)) {
+          const method = this[key];
+          if (typeof method !== "function") continue;
+          const bound = method.bind(this);
+          Object.defineProperty(bound, "name", { value: key, configurable: true });
+          this[key] = bound;
+        }
       }
+    }
+    // node's method set, as enumerable properties of Console.prototype
+    // (the constructor's binding loop walks its keys).
+    const elapsedText = (ms) => {
+      let hours = 0;
+      let minutes = 0;
+      let seconds = 0;
+      if (ms >= 1000) {
+        if (ms >= 60000) {
+          if (ms >= 3600000) {
+            hours = Math.floor(ms / 3600000);
+            ms = ms % 3600000;
+          }
+          minutes = Math.floor(ms / 60000);
+          ms = ms % 60000;
+        }
+        seconds = ms / 1000;
+      }
+      if (hours !== 0 || minutes !== 0) {
+        const parts = seconds.toFixed(3).split(".");
+        const pad = (v) => String(v).padStart(2, "0");
+        const res = hours !== 0 ? `${hours}:${pad(minutes)}` : minutes;
+        return `${res}:${pad(parts[0])}.${parts[1]} (${hours !== 0 ? "h:m" : ""}m:ss.mmm)`;
+      }
+      if (seconds !== 0) return `${seconds.toFixed(3)}s`;
+      return `${Number(ms.toFixed(3))}ms`;
+    };
+    const nowMs = () => globalThis.performance.now();
+    const consoleWarning = (message) => globalThis.process.emitWarning(message);
+    const consoleMethods = {
+      log(...args) {
+        this[kConsoleState].out(util.format(...args));
+      },
+      warn(...args) {
+        this[kConsoleState].err(util.format(...args));
+      },
+      dir(object, options) {
+        const state = this[kConsoleState];
+        state.out(util.inspect(object, { customInspect: false, ...state.inspectOptions, ...options }));
+      },
+      time(label = "default") {
+        label = `${label}`;
+        const state = this[kConsoleState];
+        if (state.timers.has(label)) {
+          consoleWarning(`Label '${label}' already exists for console.time()`);
+          return;
+        }
+        state.timers.set(label, nowMs());
+      },
+      timeEnd(label = "default") {
+        label = `${label}`;
+        const state = this[kConsoleState];
+        const start = state.timers.get(label);
+        if (start === undefined) {
+          consoleWarning(`No such label '${label}' for console.timeEnd()`);
+          return;
+        }
+        state.timers.delete(label);
+        this.log("%s: %s", label, elapsedText(nowMs() - start));
+      },
+      timeLog(label = "default", ...data) {
+        label = `${label}`;
+        const start = this[kConsoleState].timers.get(label);
+        if (start === undefined) {
+          consoleWarning(`No such label '${label}' for console.timeLog()`);
+          return;
+        }
+        this.log("%s: %s", label, elapsedText(nowMs() - start), ...data);
+      },
+      trace: function trace(...args) {
+        const err = { name: "Trace", message: util.format(...args) };
+        Error.captureStackTrace(err, trace);
+        this.error(err.stack);
+      },
+      assert(expression, ...args) {
+        if (!expression) {
+          args[0] = `Assertion failed${args.length === 0 ? "" : `: ${args[0]}`}`;
+          this.warn(...args);
+        }
+      },
+      // Clears a terminal only (cursor home, erase below), as node does.
+      clear() {
+        const out = this._out;
+        if (out.isTTY && globalThis.process.env.TERM !== "dumb") {
+          out.write("\x1b[1;1H\x1b[0J");
+        }
+      },
+      count(label = "default") {
+        label = `${label}`;
+        const counters = this[kConsoleState].counters;
+        const next = (counters.get(label) ?? 0) + 1;
+        counters.set(label, next);
+        this.log(`${label}: ${next}`);
+      },
+      countReset(label = "default") {
+        label = `${label}`;
+        const counters = this[kConsoleState].counters;
+        if (!counters.has(label)) {
+          consoleWarning(`Count for '${label}' does not exist`);
+          return;
+        }
+        counters.delete(label);
+      },
+      group(...data) {
+        if (data.length > 0) this.log(...data);
+        this[kConsoleState].indent += "  ";
+      },
+      groupEnd() {
+        const state = this[kConsoleState];
+        state.indent = state.indent.slice(0, Math.max(0, state.indent.length - 2));
+      },
+      table(tabularData, properties) {
+        const state = this[kConsoleState];
+        const text = consoleTable(tabularData, properties, state.inspectOptions);
+        if (text === null) this.log(tabularData);
+        else state.out(text);
+      },
+      dirxml(...data) {
+        this.log(...data);
+      },
+    };
+    consoleMethods.debug = consoleMethods.log;
+    consoleMethods.info = consoleMethods.log;
+    consoleMethods.error = consoleMethods.warn;
+    consoleMethods.groupCollapsed = consoleMethods.group;
+    for (const key of Object.keys(consoleMethods)) {
+      Console.prototype[key] = consoleMethods[key];
     }
     // node's `require("node:console")` IS globalThis.console (identity holds),
     // with Console hung off it as an own property. This used to be
@@ -24302,9 +25646,11 @@
         }
         this.headers = {};
         this.rawHeaders = [];
+        // node's rules for a repeated field (addHeaderLine): cookie joins
+        // with '; ', the single-value fields keep the first, the rest join
+        // with ', '.
         for (const [name, value] of meta.headers || []) {
-          const key = name.toLowerCase();
-          this.headers[key] = key in this.headers ? `${this.headers[key]}, ${value}` : value;
+          addHeaderLine(this.headers, name, value);
           this.rawHeaders.push(name, value);
         }
         // An EventEmitter, not a bare object: handlers register error/close
@@ -26604,6 +27950,10 @@
     // percent-decoded. Measured on node v22.22.2:
     // `http.request('http://onlyu@h/')` sends `Basic b25seXU6` ("onlyu:")
     // and `http://u:p%40w@h/` sends `Basic dTpwQHc=` ("u:p@w").
+    // Not the public url.urlToHttpOptions: this one feeds only
+    // normalizeClientArgs, so it carries just the fields the client reads,
+    // leaves `port` a string ("" = scheme default) and copies no extra
+    // properties off the URL.
     function urlToHttpOptions(url) {
       var hostname = url.hostname;
       if (hostname.charAt(0) === "[") hostname = hostname.slice(1, -1);
@@ -26729,7 +28079,7 @@
     //    TLSSocket, emitted at 'socket', that never connects itself: the
     //    transport's facts about the connection it used (the dialled peer, the
     //    local end, the TLS session) are filled into it before 'response'.
-    const oamFetchInternal = globalThis.__oamFetchInternal;
+    //    (`oamFetchInternal`, taken at the top of this file.)
 
     function connResetException(message) {
       const err = new Error(message);
@@ -26930,7 +28280,11 @@
         const value = pairs[i][1];
         raw.push(name, value);
         const key = name.toLowerCase();
-        const existing = headers[key];
+        // Own fields only: a field named `constructor` or `tostring` is
+        // not already present because Object.prototype has one.
+        const existing = Object.prototype.hasOwnProperty.call(headers, key)
+          ? headers[key]
+          : undefined;
         if (key === "set-cookie") {
           if (existing === undefined) headers[key] = [value];
           else existing.push(value);
@@ -27193,20 +28547,20 @@
       }
     }
 
-    // The fetch path's headers, as they have always been read: through the
-    // fetch Headers class (repeated names combined), in the order they
-    // arrived -- its stored list, not its iteration, which sorts by name.
+    // The fetch path's headers, in the order they arrived and under the
+    // same node rules as the agent path's (set-cookie an array, cookie
+    // joined with '; ', the single-value fields keeping their first):
+    // names lowercased and values stripped of surrounding HTTP whitespace,
+    // as the fetch Headers class this once went through left them.
     function fetchPathHeaders(pairs) {
-      const combined = new oamFetchInternal.Headers();
-      for (let i = 0; i < pairs.length; i++) combined.append(pairs[i][0], pairs[i][1]);
-      const headers = {};
-      const raw = [];
-      for (const [name, value] of combined._list) {
-        const key = name.toLowerCase();
-        headers[key] = key in headers ? headers[key] + ", " + value : value;
-        raw.push(name, value);
+      const normalized = [];
+      for (let i = 0; i < pairs.length; i++) {
+        normalized.push([
+          String(pairs[i][0]).toLowerCase(),
+          String(pairs[i][1]).replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, ""),
+        ]);
       }
-      return { headers, raw };
+      return agentPathHeaders(normalized);
     }
 
     function bodyRead(handle) {
@@ -28304,7 +29658,10 @@
           decide();
           return;
         }
-        globalThis.setImmediate(decide);
+        // The runtime's own immediate, not the patchable global: node's
+        // internals do not run on a program's fake timers (the rule net's
+        // closeCallback follows).
+        (registry._setImmediate ?? globalThis.setImmediate)(decide);
       }
 
       _runFetchDispatch() {
@@ -28431,6 +29788,11 @@
           headers = headers.map(function (pair) { return [pair[0], self._wireValue(pair[1])]; });
         }
         var fetchOpts = {
+          // The `__oam*` keys below are read because this goes to
+          // oamFetchInternal.fetch, one of the runtime's own entries. No
+          // prototype: a key not set here is absent, not looked up on
+          // Object.prototype.
+          __proto__: null,
           method: self.method,
           headers: headers,
           // node's http.request has no Fetch-spec bad-port block: port 1
@@ -28672,8 +30034,9 @@
 
       // node: the agent hands the request its socket (or its failure). The
       // socket gets a provisional 'error' / 'close' watch until 'socket' is
-      // emitted a tick later: oam's net.Socket reports a failure from
-      // destroy() synchronously, where node's does it on a later tick.
+      // emitted a tick later: net.Socket defers what destroy() reports, as
+      // node's does (#189), but a socket destroyed before this call has its
+      // 'error' / 'close' queued ahead of that tick, with no listener yet.
       onSocket(socket, err) {
         var self = this;
         this._awaitingSocket = false;
@@ -29112,7 +30475,6 @@
         this._bridge = id;
         this._holdSocketEof(socket);
         this._pumpBridge(socket, id);
-        var self = this;
         natives.httpBridgeResponse(id).then(function (raw) {
           if (self._aborted) {
             self._releaseSocketEof();
@@ -29368,8 +30730,13 @@
         // (_noteFirstSend), else one byte per code point.
         var headBytes = globalThis.Buffer.from(head + "\r\n", this._utf8Head === true ? "utf8" : "latin1");
         if (bodyData && bodyData.length > 0) {
-          socket.write(headBytes);
-          socket.write(bodyData, written);
+          // One write, as node's: end() corks the socket around the head and
+          // the body, so they leave in one writev. Written apart, the body
+          // could reach the peer after its answer to the head -- and, now
+          // that an answer framed by its own head completes the exchange
+          // without waiting for the connection to end, after the request
+          // had already finished.
+          socket.write(globalThis.Buffer.concat([headBytes, bodyData]), written);
         } else {
           socket.write(headBytes, written);
         }
@@ -29475,25 +30842,184 @@
             self._emitClose();
             return;
           }
-          // Not upgraded: an ordinary response, read to the end of the
-          // connection.
+          // Not upgraded: an ordinary response. Its body is framed by its
+          // own head, as a parser frames it: none for a HEAD, a 204 or a
+          // 304; chunked when Transfer-Encoding ends in `chunked` (the
+          // chunk framing removed, trailers collected); Content-Length
+          // bytes when that is given; else whatever arrives until the
+          // connection ends. A framed body that is complete ends the
+          // response at once, without waiting for the peer to close, and
+          // this hand-written exchange's socket is then closed rather than
+          // pooled.
           self.res = res;
           self._res = res;
-          self.emit("response", res);
-          if (remaining.length > 0) res.push(remaining);
-          socket.on("data", function (more) {
-            if (!res.push(more) && !socketPaused && typeof socket.pause === "function") {
-              socketPaused = true;
-              socket.pause();
-            }
-          });
-          socket.on("end", function () {
-            res.complete = true;
-            res.push(null);
+          var transferEncoding = parsed.headers["transfer-encoding"];
+          var contentLength = parsed.headers["content-length"];
+          var framing = "close";
+          var bodyLeft = 0;
+          if (self.method === "HEAD" || statusCode === 204 || statusCode === 304) {
+            framing = "none";
+          } else if (typeof transferEncoding === "string") {
+            if (/(?:^|,)\s*chunked\s*$/i.test(transferEncoding)) framing = "chunked";
+          } else if (typeof contentLength === "string" && /^\d+$/.test(contentLength)) {
+            framing = "length";
+            bodyLeft = Number(contentLength);
+          }
+          var bodySettled = false;
+          var onBodyData;
+          var onBodyEnd;
+          var onBodyClose;
+          var detachBody = function () {
+            socket.removeListener("data", onBodyData);
+            socket.removeListener("end", onBodyEnd);
+            socket.removeListener("close", onBodyClose);
+          };
+          var closeRequest = function () {
             self._responseDone = true;
             self.destroyed = true;
             self._emitClose();
-          });
+          };
+          // The body arrived whole. `byFraming`: its own framing ended it,
+          // the connection still open.
+          var completeBody = function (byFraming) {
+            if (bodySettled) return;
+            bodySettled = true;
+            detachBody();
+            res.complete = true;
+            res.push(null);
+            // The request is marked done before its socket goes, so the
+            // socket's close finds a finished exchange.
+            closeRequest();
+            if (byFraming && !socket.destroyed) socket.destroy();
+          };
+          // The connection went, or the framing broke, before the body's
+          // end: the response is aborted, as node's is.
+          var abortBody = function (err) {
+            if (bodySettled) return;
+            bodySettled = true;
+            detachBody();
+            res.destroy(err);
+            closeRequest();
+            if (!socket.destroyed) socket.destroy();
+          };
+          var deliverBody = function (bytes) {
+            if (bytes.length === 0) return;
+            if (!res.push(bytes) && !socketPaused && typeof socket.pause === "function") {
+              socketPaused = true;
+              socket.pause();
+            }
+          };
+          var chunkParseError = function (reason, code) {
+            var parseError = new Error("Parse Error: " + reason);
+            parseError.code = code;
+            return parseError;
+          };
+          // Chunked decoding: 0 a chunk-size line, 1 chunk data, 2 the CRLF
+          // after it, 3 the trailer section.
+          var chunkState = 0;
+          var chunkPending = null;
+          var lineEnd = function (bytes) {
+            for (var at = 0; at + 1 < bytes.length; at++) {
+              if (bytes[at] === 13 && bytes[at + 1] === 10) return at;
+            }
+            return -1;
+          };
+          var feedBody = function (bytes) {
+            if (bodySettled) return;
+            if (framing === "close") {
+              deliverBody(bytes);
+              return;
+            }
+            if (framing === "length") {
+              var part = bytes.length > bodyLeft ? bytes.slice(0, bodyLeft) : bytes;
+              bodyLeft -= part.length;
+              deliverBody(part);
+              if (bodyLeft === 0) completeBody(true);
+              return;
+            }
+            chunkPending = chunkPending === null || chunkPending.length === 0
+              ? bytes
+              : globalThis.Buffer.concat([chunkPending, bytes]);
+            for (;;) {
+              if (chunkState === 1) {
+                if (chunkPending.length === 0) return;
+                var n = Math.min(chunkPending.length, bodyLeft);
+                deliverBody(chunkPending.slice(0, n));
+                chunkPending = chunkPending.slice(n);
+                bodyLeft -= n;
+                if (bodyLeft > 0) return;
+                chunkState = 2;
+              } else if (chunkState === 2) {
+                if (chunkPending.length < 2) return;
+                if (chunkPending[0] !== 13 || chunkPending[1] !== 10) {
+                  abortBody(chunkParseError("Expected LF after chunk data", "HPE_STRICT"));
+                  return;
+                }
+                chunkPending = chunkPending.slice(2);
+                chunkState = 0;
+              } else {
+                var eol = lineEnd(chunkPending);
+                if (eol === -1) {
+                  // A line that never ends cannot grow this without bound.
+                  if (chunkPending.length > maxHeaderSize) {
+                    abortBody(chunkParseError("Header overflow", "HPE_HEADER_OVERFLOW"));
+                  }
+                  return;
+                }
+                var line = chunkPending.toString("latin1", 0, eol);
+                chunkPending = chunkPending.slice(eol + 2);
+                if (chunkState === 0) {
+                  // A chunk extension (`;name=value`) is not part of the size.
+                  var semi = line.indexOf(";");
+                  var sizeText = (semi === -1 ? line : line.slice(0, semi)).trim();
+                  if (sizeText.length > 13 || !/^[0-9a-fA-F]+$/.test(sizeText)) {
+                    abortBody(chunkParseError("Invalid character in chunk size", "HPE_INVALID_CHUNK_SIZE"));
+                    return;
+                  }
+                  bodyLeft = parseInt(sizeText, 16);
+                  chunkState = bodyLeft === 0 ? 3 : 1;
+                } else if (line.length === 0) {
+                  completeBody(true);
+                  return;
+                } else {
+                  var colon = line.indexOf(":");
+                  if (colon > 0) {
+                    var trailerName = line.slice(0, colon);
+                    var trailerValue = line.slice(colon + 1).trim();
+                    var trailerKey = trailerName.toLowerCase();
+                    res.rawTrailers.push(trailerName, trailerValue);
+                    res.trailers[trailerKey] =
+                      Object.prototype.hasOwnProperty.call(res.trailers, trailerKey)
+                        ? res.trailers[trailerKey] + ", " + trailerValue
+                        : trailerValue;
+                  }
+                }
+              }
+            }
+          };
+          onBodyData = function (more) {
+            feedBody(typeof more === "string" ? globalThis.Buffer.from(more, "latin1") : more);
+          };
+          // The peer's FIN ends a body that runs to the end of the
+          // connection; under any other framing the body is cut short.
+          onBodyEnd = function () {
+            if (framing === "close") completeBody(false);
+            else abortBody(connResetException("aborted"));
+          };
+          // A socket that closes with no 'end' (destroyed, or reset).
+          onBodyClose = function (hadError) {
+            if (framing === "close" && !hadError) completeBody(false);
+            else abortBody(connResetException("aborted"));
+          };
+          // A response nobody listens for is read to its end, as node dumps
+          // it, so its framing still ends the exchange.
+          if (!self.emit("response", res)) res.resume();
+          socket.on("data", onBodyData);
+          socket.on("end", onBodyEnd);
+          socket.on("close", onBodyClose);
+          if (framing === "none") completeBody(true);
+          else if (framing === "length" && bodyLeft === 0) completeBody(true);
+          else if (remaining.length > 0) feedBody(remaining);
         };
         var early = this._takeEarlyData();
         socket.on("data", onData);
@@ -29678,7 +31204,7 @@
           // (socketCloseListener): behind the response's own 'close', which
           // follows its 'end' by a tick.
           var socket = this.socket;
-          globalThis.setImmediate(function () {
+          (registry._setImmediate ?? globalThis.setImmediate)(function () {
             self._closeBridge();
             if (socket) {
               socket._httpMessage = null;
@@ -29778,7 +31304,7 @@
         if (this._fetchKeptAlive) return;
         this.destroyed = true;
         var self = this;
-        globalThis.setImmediate(function () { self._emitClose(); });
+        (registry._setImmediate ?? globalThis.setImmediate)(function () { self._emitClose(); });
       }
 
       // The fetch path's stand-in is done with: its idle timer stops, as a
@@ -29786,7 +31312,7 @@
       _stopFetchSocketTimer() {
         var socket = this._fetchSocket;
         if (this._agentPath || !socket || socket._timeoutId == null) return;
-        globalThis.clearTimeout(socket._timeoutId);
+        (registry._clearTimeout ?? globalThis.clearTimeout)(socket._timeoutId);
         socket._timeoutId = null;
       }
 
@@ -29903,7 +31429,7 @@
         // A dumped response's request closes from its 'end' if that comes
         // first, else when node's destroyed socket would have closed (its
         // socketCloseListener): a turn of the loop on.
-        if (dumped) globalThis.setImmediate(function () { self._emitClose(); });
+        if (dumped) (registry._setImmediate ?? globalThis.setImmediate)(function () { self._emitClose(); });
         else this._emitClose();
       }
       _emitClose() {
@@ -29942,11 +31468,30 @@
         else this.once("socket", apply);
         return this;
       }
+      // node's _deferToConnect: the call reaches the socket once the request
+      // has one (the 'socket' event), and once that socket has connected --
+      // not dropped because it was made before either.
+      _deferToSocket(method, args) {
+        var self = this;
+        var call = function () {
+          var socket = self.socket;
+          if (self._agentPath && socket && typeof socket[method] === "function") {
+            socket[method].apply(socket, args);
+          }
+        };
+        var onSocket = function () {
+          var socket = self.socket;
+          if (socket && socket.connecting) socket.once("connect", call);
+          else call();
+        };
+        if (this.socket) onSocket();
+        else this.once("socket", onSocket);
+      }
       setNoDelay(noDelay) {
-        if (this._agentPath && this.socket) this.socket.setNoDelay(noDelay);
+        this._deferToSocket("setNoDelay", [noDelay]);
       }
       setSocketKeepAlive(enable, initialDelay) {
-        if (this._agentPath && this.socket) this.socket.setKeepAlive(enable, initialDelay);
+        this._deferToSocket("setKeepAlive", [enable, initialDelay]);
       }
     }
 
@@ -30316,14 +31861,17 @@
         const keys = Object.keys(set);
         for (let v = 0; v < keys.length; v++) {
           // node indexes the live array here, which is safe only because its
-          // socket.destroy() leaves 'close' for a later tick. oam emits
-          // 'close' from inside destroy(), so the agent's own onClose
-          // listener splices the socket out of the very array being indexed
-          // and `n + 1` lands past whatever shifted down -- every second
-          // socket under a name survived agent.destroy(), still open, still
-          // pooled, and (having been unref'd by keepSocketAlive) invisible
-          // in anything that counts handles. A snapshot destroys each socket
-          // exactly once, which is what node's loop amounts to.
+          // socket.destroy() leaves 'close' for a later tick. oam's
+          // net.Socket does the same now (#189); when it emitted 'close'
+          // from inside destroy(), the agent's own onClose listener spliced
+          // the socket out of the very array being indexed and `n + 1`
+          // landed past whatever shifted down -- every second socket under
+          // a name survived agent.destroy(), still open, still pooled, and
+          // (having been unref'd by keepSocketAlive) invisible in anything
+          // that counts handles. The snapshot is kept: an agent may hold a
+          // socket of another kind (createConnection's), whose destroy()
+          // makes no such promise, and a snapshot destroys each exactly
+          // once, which is what node's loop amounts to.
           const setName = set[keys[v]];
           if (setName === undefined) continue;
           const sockets = setName.slice();
@@ -30465,15 +32013,7 @@
       if (msecs < 0 || !Number.isFinite(msecs)) {
         throw codes.ERR_OUT_OF_RANGE(name, "a non-negative finite number", msecs);
       }
-      if (msecs > 2147483647) {
-        process.emitWarning(
-          msecs + " does not fit into a 32-bit signed integer." +
-            "\nTimer duration was truncated to 2147483647.",
-          "TimeoutOverflowWarning",
-        );
-        return 2147483647;
-      }
-      return msecs;
+      return truncateTimerDuration(msecs);
     }
 
     var INVALID_HEADER_CHAR = /[^\t\x20-\x7e\x80-\xff]/;
@@ -30730,7 +32270,7 @@
         503: "Service Unavailable", 504: "Gateway Timeout",
         505: "HTTP Version Not Supported", 506: "Variant Also Negotiates",
         507: "Insufficient Storage", 508: "Loop Detected",
-        510: "Not Extended", 511: "Network Authentication Required",
+        509: "Bandwidth Limit Exceeded", 510: "Not Extended", 511: "Network Authentication Required",
       },
     };
     // node: an accessor over the agent requests default to, so assigning
@@ -31148,7 +32688,12 @@
     // The head is in. Returns the index to resume at, or an Error; sets the
     // body state.
     function headersComplete(parser, p, i) {
-      const upgrade = (p.upgradeHeader && p.connUpgrade) || (p.type === REQUEST && p.method === CONNECT);
+      // llhttp: on a response, `Upgrade` + `Connection: upgrade` mean an
+      // upgrade only with a 101; on any other status they announce support
+      // and the message is read as usual.
+      const upgrade = p.upgradeHeader && p.connUpgrade
+        ? (p.type === REQUEST || p.status === 101)
+        : (p.type === REQUEST && p.method === CONNECT);
       p.upgrade = upgrade;
       p.skipBody = false;
       p.keepAlive = shouldKeepAlive(p);
@@ -31208,7 +32753,11 @@
     // there: an upgrade (llhttp pauses for good) or a 101 without one (the
     // next execute() goes on with the next message).
     function endMessage(parser, p, i, stop) {
-      const keepAlive = p.keepAlive;
+      // llhttp works should_keep_alive out again as the message completes,
+      // with what on_headers_complete answered (F_SKIPBODY) counted: a
+      // response to a HEAD with no framing needs no EOF. The value the
+      // callback was handed stays the one computed before it ran.
+      const keepAlive = p.keepAlive = shouldKeepAlive(p);
       const upgrade = stop && p.upgrade;
       p.state = upgrade ? S_UPGRADED : keepAlive ? S_START : S_CLOSED;
       p.resumed = false;
@@ -31540,7 +33089,16 @@
             }
             if (j > i) p.value += buf.latin1Slice(i, j);
             i = j;
-            if (i >= len) continue;
+            if (i >= len) {
+              // A value still arriving counts against the head limit as it
+              // comes (node tracks every value span), not only once its
+              // line ends: the value's own track() below adds the trimmed
+              // length, so this is a check, not a second count.
+              if (p.nread + p.value.length >= p.max) {
+                return fail(parseError("HPE_HEADER_OVERFLOW", "Header overflow", i));
+              }
+              continue;
+            }
             const b = buf[i];
             if (b !== 0x0d && b !== 0x0a) {
               return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header value char", i));
@@ -31997,6 +33555,23 @@
   // on the next re-arm); otherwise the timer is (re)armed and the callback
   // rides on 'timeout' once. Every message and code probed on Node. The
   // socket's own reads and writes re-arm the timer through _resetTimeout.
+  // The tail of node's getTimerDuration (lib/internal/timers.js): a valid
+  // duration over TIMEOUT_MAX (2^31-1) is TRUNCATED to it, with a
+  // TimeoutOverflowWarning -- unlike the Timeout constructor, which sets
+  // such a delay to 1. One copy for http's request timeouts, a socket's
+  // setTimeout and timers.enroll.
+  function truncateTimerDuration(msecs) {
+    if (msecs > 2147483647) {
+      globalThis.process.emitWarning(
+        msecs + " does not fit into a 32-bit signed integer." +
+          "\nTimer duration was truncated to 2147483647.",
+        "TimeoutOverflowWarning",
+      );
+      return 2147483647;
+    }
+    return msecs;
+  }
+
   function socketSetTimeout(socket, msecs, callback) {
     if (socket.destroyed) return socket;
     socket.timeout = msecs;
@@ -32006,11 +33581,14 @@
     if (msecs < 0 || !Number.isFinite(msecs)) {
       throw new codes.ERR_OUT_OF_RANGE("msecs", "a non-negative finite number", msecs);
     }
+    // Truncated, not handed on as is: the Timeout constructor would turn a
+    // delay over 2^31-1 into 1 ms and time the socket out at once.
+    msecs = truncateTimerDuration(msecs);
     if (callback !== undefined && typeof callback !== "function") {
       throw new codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
     }
     if (socket._timeoutId !== null) {
-      globalThis.clearTimeout(socket._timeoutId);
+      (registry._clearTimeout ?? globalThis.clearTimeout)(socket._timeoutId);
       socket._timeoutId = null;
     }
     socket._timeoutMs = msecs;
@@ -32055,10 +33633,6 @@
     return bits;
   }
 
-  // node lib/dns.js lookup, right after the hints: `options.family` is
-  // 'IPv4' / 'IPv6' or one of 0, 4, 6 (validateOneOf), and the number form
-  // `dns.lookup(host, 6, cb)` is checked under the name 'family'. Returns
-  // the family to use. net.connect reaches it with its own `family`.
   // dns's default result order (dns.getDefaultResultOrder): "verbatim", or
   // --dns-result-order's value (the CLI checked it). One per thread, shared
   // by dns, dns.promises and net's own lookups, as node's is; a Worker starts
@@ -32092,6 +33666,10 @@
     configurable: true,
   });
 
+  // node lib/dns.js lookup, right after the hints: `options.family` is
+  // 'IPv4' / 'IPv6' or one of 0, 4, 6 (validateOneOf), and the number form
+  // `dns.lookup(host, 6, cb)` is checked under the name 'family'. Returns
+  // the family to use. net.connect reaches it with its own `family`.
   function validateDnsFamily(family, name) {
     if (family == null) return 0;
     if (family === "IPv4") return 4;
@@ -32130,7 +33708,19 @@
               /^[0-9A-Fa-f]{1,4}$/.test(group) ||
               (i === arr.length - 1 && isIPv4(group)),
           );
-      if (sections.length === 2) return check(sections[0]) && check(sections[1]);
+      if (sections.length === 2) {
+        // node's IPv6Reg with a `::`: it stands for at least one group, so
+        // the groups written out come to seven at most (a dotted-quad tail
+        // is two of them), and only the address's last group may be the
+        // dotted quad -- never the end of the half before the `::`.
+        const [head, tail] = sections;
+        const headGroups = head === "" ? [] : head.split(":");
+        const tailGroups = tail === "" ? [] : tail.split(":");
+        if (!headGroups.every((group) => /^[0-9A-Fa-f]{1,4}$/.test(group))) return false;
+        if (!check(tail)) return false;
+        const v4Tail = tailGroups.length > 0 && isIPv4(tailGroups[tailGroups.length - 1]);
+        return headGroups.length + tailGroups.length + (v4Tail ? 1 : 0) <= 7;
+      }
       const groups = text.split(":");
       const hasV4Tail = isIPv4(groups[groups.length - 1]);
       const expected = hasV4Tail ? 7 : 8;
@@ -32317,6 +33907,21 @@
       self._readableState.closeEmitted = self._writableState.closeEmitted = true;
       if (hadError === undefined) self.emit("close");
       else self.emit("close", hadError);
+    }
+    // A reaction on a socket's write chain (`_chain`) that runs the caller's
+    // code -- a write callback, a 'drain' or 'finish' listener, end()'s
+    // callbacks. What that code throws is the process's uncaught exception,
+    // raised from a tick as node raises it, never a rejection of the chain:
+    // a rejected `_chain` skips every later write's accounting and callback
+    // and the end() behind them.
+    function chainStep(step) {
+      return (value) => {
+        try {
+          step(value);
+        } catch (e) {
+          raiseFromListener(e);
+        }
+      };
     }
     // What a queued write or shutdown resolves with when the socket was
     // destroyed before it could run (see Socket.prototype._issue).
@@ -32589,6 +34194,9 @@
         super();
         this._handle = null;
         this._encoding = null;
+        // setEncoding()'s StringDecoder: one per socket, so a character
+        // split across two reads is put back together.
+        this._decoder = null;
         this._chain = Promise.resolve();
         this.connecting = false;
         this.destroyed = false;
@@ -32739,6 +34347,19 @@
         // node: `options.host || 'localhost'`, and the name is looked up like
         // any other (a `lookup` option sees 'localhost').
         const host = options.host || "localhost";
+        // node's connect() on a socket that was destroyed and has closed:
+        // the stream is un-destroyed and connects again (the reconnect a
+        // 'close' listener makes on the same socket).
+        if (this.destroyed && this._readableState.closeEmitted) {
+          // Writes still held behind the connect that never came: they fail
+          // now, before the state they wait in is reset (their own 'close'
+          // listener may be behind the one that is reconnecting).
+          if (this._heldWrites !== null) {
+            this.removeListener("close", this._failHeldWrites);
+            this._failHeldWrites();
+          }
+          this._undestroy();
+        }
         if (typeof cb === "function") this.once("connect", cb);
         this.connecting = true;
         // Whether the connect waits for a name lookup (resetAndDestroy).
@@ -32764,7 +34385,9 @@
         // settles without releasing anything, so a held end() would never
         // call back. Its ops start at once and fail as a closed socket's.
         if (this._heldOps === null && !this.destroyed) this._heldOps = [];
+        let dialed = false;
         const dial = (spec, local) => {
+          dialed = true;
           // lookupAndConnect has validated the port by the time it dials.
           const port = options.port | 0;
           let connecting;
@@ -32789,12 +34412,66 @@
         // node: `const pipe = !!path` -- a path names a Unix domain socket or
         // a Windows named pipe, whatever host and port also say
         // (http.request's `socketPath` arrives this way).
-        if (options.path) {
-          this._connectPipe(options.path);
-          return this;
+        try {
+          if (options.path) {
+            this._connectPipe(options.path);
+            return this;
+          }
+          lookupAndConnect(this, options, host, options.port, dial);
+        } catch (err) {
+          // The arguments were refused before anything was dialed (a bad
+          // port, a local address that is not one, the net grant, a lookup
+          // hook that threw): no connect is in flight, so nothing will ever
+          // take the socket back out of the active-handle list, a strong
+          // Map. `connecting` stays true and the callback stays on
+          // 'connect', as node leaves them (measured, v22.22.2); node's own
+          // unconnected handle goes with the socket when it is collected.
+          if (!dialed && this._handle === null) registry._activeHandles.delete(this);
+          throw err;
         }
-        lookupAndConnect(this, options, host, options.port, dial);
         return this;
+      }
+
+      // node's _undestroy (Duplex), with what net's connect() resets beside
+      // it: a socket that was destroyed and has closed is a fresh stream
+      // again, with no handle, no addresses and nothing written or read.
+      _undestroy() {
+        const rs = this._readableState;
+        const ws = this._writableState;
+        this.destroyed = false;
+        this.readable = true;
+        this.writable = true;
+        rs.endEmitted = rs.closed = rs.closeEmitted = rs.destroyed = rs.ended = false;
+        rs.errorEmitted = rs.reading = false;
+        rs.errored = null;
+        rs.length = 0;
+        ws.finished = ws.errorEmitted = ws.needDrain = ws.closed = ws.closeEmitted = false;
+        ws.destroyed = ws.ended = ws.ending = ws.finalCalled = ws.prefinished = false;
+        ws.errored = null;
+        ws.length = 0;
+        ws.pendingcb = 0;
+        this._handle = null;
+        this._chain = Promise.resolve();
+        this._everConnected = false;
+        this._heldOps = null;
+        this._heldWrites = null;
+        this._endCallbacks = null;
+        this._noHandleFailure = null;
+        this._finishPending = false;
+        this._readEofSeen = false;
+        this._readBuf = [];
+        this._readBufBytes = 0;
+        this._holdData = false;
+        this._eofPending = false;
+        this._readFull = false;
+        if (this._pipeHandle === true) this._pipeHandle = false;
+        if (this.resetAndClosing) this.resetAndClosing = false;
+        if (this._resetAtConnect === true) this._resetAtConnect = false;
+        this.bytesRead = 0;
+        this.bytesWritten = 0;
+        this.bufferSize = 0;
+        this.remoteAddress = this.remotePort = this.remoteFamily = undefined;
+        this.localAddress = this.localPort = this.localFamily = undefined;
       }
 
       // node's connect() to a pipe (lib/net.js: validateString(path), then
@@ -32970,7 +34647,7 @@
           this._writableState.length -= bytes.length;
           this.bufferSize = this._writableState.length;
         }
-        this._chain = this._chain.then(() => written).then((failure) => {
+        const afterWrite = (failure) => {
           if (!tookWhole) settle();
           if (failure === undefined) {
             if (cb) cb(null);
@@ -33001,7 +34678,8 @@
           if (this.destroyed && this._endCallbacks !== null && (cb || !tookWhole)) {
             this._failEndCallbacks(failure === kSocketClosed);
           }
-        });
+        };
+        this._chain = this._chain.then(() => written).then(chainStep(afterWrite));
         // Node: false once the queue is at or past the high-water mark (and
         // not empty). The write is still accepted -- false is advisory,
         // asking the producer to wait for 'drain'.
@@ -33308,7 +34986,7 @@
           if (op === undefined) doneInCall = true;
           return op;
         }, true);
-        this._chain = this._chain.then(() => shut).then((failure) => {
+        this._chain = this._chain.then(() => shut).then(chainStep((failure) => {
           // A failed shutdown is the socket's error (node's afterShutdown
           // destroys with it), not a rejection left on `_chain`.
           if (failure !== undefined && failure !== kSocketClosed) this.destroy(failure);
@@ -33340,7 +35018,7 @@
             this._finishPending = false;
             if (!this.destroyed && !this._writableState.errored) this._finish(callbacks);
           });
-        });
+        }));
         return this;
       }
 
@@ -33421,7 +35099,7 @@
           if (!rs.errored) rs.errored = err;
         }
         if (this._timeoutId !== null) {
-          globalThis.clearTimeout(this._timeoutId);
+          (registry._clearTimeout ?? globalThis.clearTimeout)(this._timeoutId);
           this._timeoutId = null;
         }
         // resetAndDestroy(): node's _destroy closes the handle with a reset
@@ -33563,8 +35241,10 @@
             this._readableState.length = this._readBufBytes;
             if (this._readBufBytes >= 65536) this._readFull = true;
             if (this._readableMode) this.emit("readable");
-          } else if (this._encoding) {
-            this.emit("data", new TextDecoder(this._encoding).decode(chunk));
+          } else if (this._decoder) {
+            // Nothing is emitted for a chunk that only began a character.
+            const text = this._decoder.write(buf);
+            if (text.length > 0) this.emit("data", text);
           } else {
             this.emit("data", buf);
           }
@@ -33575,6 +35255,12 @@
         this.readable = false;
         // state.readable stays untouched (side-existence marker; see destroy).
         this._readableState.ended = true;
+        // node's onEofChunk: what the decoder still holds (the start of a
+        // character the stream ended inside) is the last 'data'.
+        if (this._decoder) {
+          const rest = this._decoder.end();
+          if (rest.length > 0 && !this._readableMode) this.emit("data", rest);
+        }
         this._readableState.endEmitted = true;
         this.emit("end");
         if (!this.allowHalfOpen) {
@@ -33643,7 +35329,9 @@
         }
         this._readableState.length = this._readBufBytes;
         this._resumeReading();
-        const value = this._encoding ? new TextDecoder(this._encoding).decode(out) : out;
+        const value = this._decoder ? this._decoder.write(out) : out;
+        // Only the start of a character: nothing to hand over yet.
+        if (value.length === 0) return null;
         this.emit("data", value);
         return value;
       }
@@ -33731,7 +35419,8 @@
           this._readBuf = [];
           this._readBufBytes = 0;
           this._readableState.length = 0;
-          this.emit("data", this._encoding ? new TextDecoder(this._encoding).decode(all) : all);
+          const held = this._decoder ? this._decoder.write(all) : all;
+          if (held.length > 0) this.emit("data", held);
         }
         if (this._eofPending) {
           this._eofPending = false;
@@ -33802,12 +35491,22 @@
         this.destroy();
       }
 
-      setEncoding(encoding) { this._encoding = encoding; return this; }
+      // node's Readable.setEncoding: a StringDecoder held by the stream --
+      // any encoding Buffer knows (hex, base64, utf16le, latin1 ...), an
+      // unknown one refused here (ERR_UNKNOWN_ENCODING), and a multi-byte
+      // character that straddles two reads decoded whole. What is left of
+      // one at the end of the stream is flushed before 'end' (_onReadEof).
+      setEncoding(encoding) {
+        const { StringDecoder } = registry.get("string_decoder");
+        this._decoder = new StringDecoder(encoding);
+        this._encoding = this._decoder.encoding;
+        return this;
+      }
       setTimeout(msecs, callback) { return socketSetTimeout(this, msecs, callback); }
       _resetTimeout() {
-        if (this._timeoutId !== null) globalThis.clearTimeout(this._timeoutId);
+        if (this._timeoutId !== null) (registry._clearTimeout ?? globalThis.clearTimeout)(this._timeoutId);
         if (this._timeoutMs > 0 && !this.destroyed) {
-          this._timeoutId = globalThis.setTimeout(() => {
+          this._timeoutId = (registry._setTimeout ?? globalThis.setTimeout)(() => {
             this._timeoutId = null;
             this.emit("timeout");
           }, this._timeoutMs);
@@ -34230,27 +35929,131 @@
       }
     }
 
+    // net.BlockList, as node's (lib/internal/blocklist.js over
+    // SocketAddressBlockList): address, range and subnet rules, each
+    // evaluated by check(). An address is compared as a number; across
+    // families as node compares them -- an IPv4 address against an IPv6 rule
+    // as its IPv4-mapped form (::ffff:a.b.c.d), an IPv4-mapped IPv6 address
+    // against an IPv4 rule as the IPv4 address, and any other IPv6 address
+    // never matches an IPv4 rule.
+    //
+    // `address` under `family` ("ipv4" / "ipv6") as { v: 4 | 6, n: BigInt },
+    // or null for text that is not an address of that family.
+    function blockListParse(address, family) {
+      const text = String(address);
+      if (family === "ipv4") {
+        if (!isIPv4(text)) return null;
+        let n = 0n;
+        for (const part of text.split(".")) n = (n << 8n) | BigInt(Number(part));
+        return { v: 4, n };
+      }
+      if (!isIPv6(text)) return null;
+      const zone = text.indexOf("%");
+      const halves = (zone === -1 ? text : text.slice(0, zone)).split("::");
+      const groupsOf = (half) => {
+        const out = [];
+        if (half === "") return out;
+        for (const group of half.split(":")) {
+          if (group.includes(".")) {
+            const quad = group.split(".").map(Number);
+            out.push(quad[0] * 256 + quad[1], quad[2] * 256 + quad[3]);
+          } else {
+            out.push(parseInt(group, 16));
+          }
+        }
+        return out;
+      };
+      let groups = groupsOf(halves[0]);
+      if (halves.length === 2) {
+        const tail = groupsOf(halves[1]);
+        const gap = 8 - groups.length - tail.length;
+        if (gap < 0) return null;
+        groups = groups.concat(new Array(gap).fill(0), tail);
+      }
+      if (groups.length !== 8) return null;
+      let n = 0n;
+      for (const group of groups) n = (n << 16n) | BigInt(group);
+      return { v: 6, n };
+    }
+    // A parsed address as a number in family `v`'s space, or null when the
+    // two are not comparable.
+    function blockListIn(addr, v) {
+      if (addr.v === v) return addr.n;
+      if (v === 6) return 0xffff00000000n | addr.n;
+      return (addr.n >> 32n) === 0xffffn ? addr.n & 0xffffffffn : null;
+    }
+    // What an add* method was handed -- a SocketAddress, or a string under
+    // `family` -- as { v, n, source }; node's errors for anything else.
+    function blockListAddress(value, family, name) {
+      let source = value;
+      if (!(value instanceof SocketAddress)) {
+        if (typeof value !== "string") throw codes.ERR_INVALID_ARG_TYPE(name, "string", value);
+        if (typeof family !== "string") throw codes.ERR_INVALID_ARG_TYPE("family", "string", family);
+        const lowered = family.toLowerCase();
+        if (lowered !== "ipv4" && lowered !== "ipv6") {
+          throw codes.ERR_INVALID_ARG_VALUE("options.family", family);
+        }
+        source = new SocketAddress({ address: value, family: lowered });
+      }
+      const fam = String(source.family).toLowerCase();
+      const parsed = fam === "ipv4" || fam === "ipv6" ? blockListParse(source.address, fam) : null;
+      if (parsed === null) throw codes.ERR_INVALID_ADDRESS();
+      parsed.source = source;
+      return parsed;
+    }
+    const blockListLabel = (addr) => (addr.v === 4 ? "IPv4 " : "IPv6 ") + addr.source.address;
+
     class BlockList {
+      static isBlockList(value) { return value instanceof BlockList; }
       constructor() { this._rules = []; }
-      addAddress(address, family) {
-        this._rules.push({ type: "address", address: address, family: family || "ipv4" });
+      addAddress(address, family = "ipv4") {
+        const addr = blockListAddress(address, family, "address");
+        this._rules.unshift({ type: "address", v: addr.v, low: addr.n, high: addr.n,
+          text: "Address: " + blockListLabel(addr) });
       }
-      addRange(start, end, family) {
-        this._rules.push({ type: "range", start: start, end: end, family: family || "ipv4" });
+      addRange(start, end, family = "ipv4") {
+        const from = blockListAddress(start, family, "start");
+        const to = blockListAddress(end, family, "end");
+        // Both ends in one family's space; a range whose start is past its
+        // end (or whose ends cannot be compared) is refused, as node's is.
+        const high = blockListIn(to, from.v);
+        if (high === null || from.n > high) {
+          throw codes.ERR_INVALID_ARG_VALUE("start", from.source, "must come before end");
+        }
+        this._rules.unshift({ type: "range", v: from.v, low: from.n, high,
+          text: "Range: " + blockListLabel(from) + "-" + to.source.address });
       }
-      addSubnet(network, prefix, family) {
-        this._rules.push({ type: "subnet", network: network, prefix: prefix, family: family || "ipv4" });
+      addSubnet(network, prefix, family = "ipv4") {
+        const net = blockListAddress(network, family, "network");
+        const bits = net.v === 4 ? 32 : 128;
+        validateInt32(prefix, "prefix", 0, bits);
+        // The rule as the range the prefix covers.
+        const host = (1n << BigInt(bits - prefix)) - 1n;
+        const low = net.n & ~host;
+        this._rules.unshift({ type: "subnet", v: net.v, low, high: low | host,
+          text: "Subnet: " + blockListLabel(net) + "/" + prefix });
       }
-      check(address, family) {
-        var fam = (family || "ipv4").toLowerCase();
-        for (var ri = 0; ri < this._rules.length; ri++) {
-          var rule = this._rules[ri];
-          if (rule.family !== fam) continue;
-          if (rule.type === "address" && rule.address === address) return true;
+      check(address, family = "ipv4") {
+        let addr;
+        if (address instanceof SocketAddress) {
+          const fam = String(address.family).toLowerCase();
+          addr = fam === "ipv4" || fam === "ipv6" ? blockListParse(address.address, fam) : null;
+        } else {
+          if (typeof address !== "string") throw codes.ERR_INVALID_ARG_TYPE("address", "string", address);
+          if (typeof family !== "string") throw codes.ERR_INVALID_ARG_TYPE("family", "string", family);
+          const fam = family.toLowerCase();
+          addr = fam === "ipv4" || fam === "ipv6" ? blockListParse(address, fam) : null;
+        }
+        // node: text that is not an address of that family matches nothing.
+        if (addr === null) return false;
+        for (const rule of this._rules) {
+          const n = blockListIn(addr, rule.v);
+          if (n !== null && n >= rule.low && n <= rule.high) return true;
         }
         return false;
       }
-      get rules() { return this._rules.slice(); }
+      // node's list: one line per rule, the newest first.
+      get rules() { return this._rules.map((rule) => rule.text); }
     }
 
     // What http's agent path needs to tell a patched socket layer (an
@@ -34744,14 +36547,7 @@
       validateMsecs(msecs, "msecs");
       // TIMEOUT_MAX overflow on the enroll path: node v22 TRUNCATES to
       // 2147483647 (unlike the Timeout ctor's set-to-1) with its own text.
-      if (msecs > 2147483647) {
-        process.emitWarning(
-          msecs + " does not fit into a 32-bit signed integer." +
-            "\nTimer duration was truncated to 2147483647.",
-          "TimeoutOverflowWarning",
-        );
-        msecs = 2147483647;
-      }
+      msecs = truncateTimerDuration(msecs);
       if (item._idleNext) unenroll(item);
       item._idleTimeout = msecs;
       item._idleNext = null;
@@ -34913,6 +36709,8 @@
     const BASE = 36, TMIN = 1, TMAX = 26, SKEW = 38, DAMP = 700, BIAS_INIT = 72;
     const MAXINT = 2147483647;
     const DELIMITER = "\x2D";
+    // punycode.js's error texts.
+    const OVERFLOW = "Overflow: input needs wider integers to process";
 
     function adapt(delta, numPoints, firstTime) {
       delta = firstTime ? Math.floor(delta / DAMP) : delta >>> 1;
@@ -34944,7 +36742,7 @@
       const basic = input.lastIndexOf(DELIMITER);
       const start = basic < 0 ? 0 : basic;
       for (let j = 0; j < start; j++) {
-        if (input.charCodeAt(j) >= 128) throw new RangeError("Illegal input characters");
+        if (input.charCodeAt(j) >= 128) throw new RangeError("Illegal input >= 0x80 (not a basic code point)");
         output.push(input.charCodeAt(j));
       }
       let ic = basic > 0 ? basic + 1 : 0;
@@ -34954,17 +36752,18 @@
         for (let k = BASE; ; k += BASE) {
           if (ic >= input.length) throw new RangeError("Invalid input");
           const digit = basicToDigit(input.charCodeAt(ic++));
-          if (digit >= BASE || digit > Math.floor((MAXINT - i) / w)) throw new RangeError("Overflow");
+          if (digit >= BASE) throw new RangeError("Invalid input");
+          if (digit > Math.floor((MAXINT - i) / w)) throw new RangeError(OVERFLOW);
           i += digit * w;
           const t = k <= bias ? TMIN : k >= bias + TMAX ? TMAX : k - bias;
           if (digit < t) break;
           const baseMinusT = BASE - t;
-          if (w > Math.floor(MAXINT / baseMinusT)) throw new RangeError("Overflow");
+          if (w > Math.floor(MAXINT / baseMinusT)) throw new RangeError(OVERFLOW);
           w *= baseMinusT;
         }
         const out = output.length + 1;
         bias = adapt(i - oldi, out, oldi === 0);
-        if (Math.floor(i / out) > MAXINT - n) throw new RangeError("Overflow");
+        if (Math.floor(i / out) > MAXINT - n) throw new RangeError(OVERFLOW);
         n += Math.floor(i / out);
         i %= out;
         output.splice(i++, 0, n);
@@ -34984,13 +36783,13 @@
       let bias = BIAS_INIT;
       while (handled < cps.length) {
         const m = cps.filter((cp) => cp >= n).reduce((a, b) => Math.min(a, b), MAXINT);
-        if (m - n > Math.floor((MAXINT - delta) / (handled + 1))) throw new RangeError("Overflow");
+        if (m - n > Math.floor((MAXINT - delta) / (handled + 1))) throw new RangeError(OVERFLOW);
         delta += (m - n) * (handled + 1);
         n = m;
         for (const cp of cps) {
           if (cp < n) {
             delta++;
-            if (delta > MAXINT) throw new RangeError("Overflow");
+            if (delta > MAXINT) throw new RangeError(OVERFLOW);
           }
           if (cp === n) {
             let q = delta;
@@ -35012,20 +36811,33 @@
       return output.join("");
     }
 
-    function toASCII(domain) {
-      return domain.split(".").map((label) => {
-        if (/[^\x00-\x7F]/.test(label)) return "xn--" + encode(label);
-        return label;
-      }).join(".");
+    // punycode.js mapDomain: an email address's local part (up to the first
+    // '@') is left as is, and the three other IDNA2003 separators (U+3002,
+    // U+FF0E, U+FF61) are label separators like '.'.
+    function mapDomain(domain, callback) {
+      const parts = domain.split("@");
+      let result = "";
+      if (parts.length > 1) {
+        result = parts[0] + "@";
+        domain = parts[1];
+      }
+      domain = domain.replace(/[\x2E。．｡]/g, "\x2E");
+      return result + domain.split(".").map(callback).join(".");
     }
 
-    function toUnicode(domain) {
-      return domain.split(".").map((label) => {
-        if (label.startsWith("xn--")) {
-          try { return decode(label.slice(4)); } catch { return label; }
-        }
+    function toASCII(domain) {
+      return mapDomain(domain, (label) => {
+        if (/[^\x00-\x7F]/.test(label)) return "xn--" + encode(label);
         return label;
-      }).join(".");
+      });
+    }
+
+    // A label that does not decode throws, as punycode.js's does.
+    function toUnicode(domain) {
+      return mapDomain(domain, (label) => {
+        if (/^xn--/.test(label)) return decode(label.slice(4).toLowerCase());
+        return label;
+      });
     }
 
     return {
@@ -35048,9 +36860,10 @@
   };
 
   // ----------------------------------------------------------- perf_hooks
-  // Wrap globalThis.performance (installed post-restore). Factory defers the
-  // lookup to call time so requiring perf_hooks before installRuntimeGlobals
-  // still works (performance will be live when methods are invoked).
+  // `performance` here is the one object: globalThis.performance is a lazy
+  // getter for it (installRuntimeGlobals), as node's global is
+  // perf_hooks.performance. The native clock is looked up at call time, so
+  // requiring perf_hooks before installRuntimeGlobals still works.
   registry.factories.perf_hooks = () => {
     const _marks = [];
     const _measures = [];
@@ -35152,11 +36965,42 @@
       return null;
     }
 
+    // node's getMark: a timestamp as given, or the named mark's start time;
+    // a name with no mark is a SyntaxError DOMException (code 12).
+    function _markTime(nameOrTime) {
+      if (typeof nameOrTime === "number") return nameOrTime;
+      var name = String(nameOrTime);
+      var found = _findMark(name);
+      if (found === null) {
+        var message = 'The "' + name + '" performance mark has not been set';
+        if (typeof globalThis.DOMException === "function") {
+          throw new globalThis.DOMException(message, "SyntaxError");
+        }
+        throw new SyntaxError(message);
+      }
+      return found.startTime;
+    }
+    function _measureOptionsError(message) {
+      var err = new TypeError(message);
+      err.code = "ERR_PERFORMANCE_MEASURE_INVALID_OPTIONS";
+      return err;
+    }
+
     var _nodeTiming = new PerformanceNodeTiming();
 
     var perf = {
-      now: function() { return globalThis.performance.now(); },
-      get timeOrigin() { return globalThis.performance.timeOrigin; },
+      // The clock itself: this object IS globalThis.performance (the global
+      // is a lazy getter for it, installRuntimeGlobals), so the two cannot
+      // defer to the global as they did when it was a separate object. The
+      // methods below still call through globalThis.performance.now(), so a
+      // replaced global clock (record/replay, fake timers) is the one read.
+      now: function now() { return globalThis.__oam.node.nowMs(); },
+      get timeOrigin() {
+        if (registry._perfTimeOrigin === undefined) {
+          registry._perfTimeOrigin = Date.now() - globalThis.__oam.node.nowMs();
+        }
+        return registry._perfTimeOrigin;
+      },
 
       mark: function(name, options) {
         var startTime = (options && options.startTime !== undefined) ? options.startTime : globalThis.performance.now();
@@ -35168,50 +37012,40 @@
       },
 
       measure: function(name, startMarkOrOptions, endMark) {
-        var startTime = 0;
-        var endTime = globalThis.performance.now();
+        // node's calculateStartDuration (lib/internal/perf/usertiming.js):
+        // the end is endMark, else options.end, else start + duration, else
+        // now; the start is the start mark, else options.start, else
+        // end - duration, else 0. An options object counts only when it
+        // names a start or an end.
         var detail = null;
-        var duration;
-
-        if (typeof startMarkOrOptions === "string") {
-          var sm = _findMark(startMarkOrOptions);
-          if (!sm) throw new Error("Failed to execute 'measure': The mark '" + startMarkOrOptions + "' does not exist.");
-          startTime = sm.startTime;
-          if (typeof endMark === "string") {
-            var em = _findMark(endMark);
-            if (!em) throw new Error("Failed to execute 'measure': The mark '" + endMark + "' does not exist.");
-            endTime = em.startTime;
-          }
-          duration = endTime - startTime;
-        } else if (startMarkOrOptions && typeof startMarkOrOptions === "object") {
-          var opts = startMarkOrOptions;
-          detail = opts.detail !== undefined ? opts.detail : null;
-          if (opts.start !== undefined) {
-            if (typeof opts.start === "string") {
-              var smk = _findMark(opts.start);
-              if (!smk) throw new Error("Failed to execute 'measure': The mark '" + opts.start + "' does not exist.");
-              startTime = smk.startTime;
-            } else {
-              startTime = opts.start;
-            }
-          }
-          if (opts.end !== undefined) {
-            if (typeof opts.end === "string") {
-              var emk = _findMark(opts.end);
-              if (!emk) throw new Error("Failed to execute 'measure': The mark '" + opts.end + "' does not exist.");
-              endTime = emk.startTime;
-            } else {
-              endTime = opts.end;
-            }
-          }
-          if (opts.duration !== undefined) {
-            duration = opts.duration;
-          } else {
-            duration = endTime - startTime;
-          }
-        } else {
-          duration = endTime - startTime;
+        var optStart, optEnd, optDuration;
+        var optionsValid = false;
+        if (startMarkOrOptions !== null && typeof startMarkOrOptions === "object") {
+          optStart = startMarkOrOptions.start;
+          optEnd = startMarkOrOptions.end;
+          optDuration = startMarkOrOptions.duration;
+          if (startMarkOrOptions.detail !== undefined) detail = startMarkOrOptions.detail;
+          optionsValid = optStart !== undefined || optEnd !== undefined;
         }
+        if (optionsValid) {
+          if (endMark !== undefined) throw _measureOptionsError("endMark must not be specified");
+          if (optStart !== undefined && optEnd !== undefined && optDuration !== undefined) {
+            throw _measureOptionsError(
+              "Must not have options.start, options.end, and options.duration specified");
+          }
+        }
+        var endTime;
+        if (endMark !== undefined) endTime = _markTime(endMark);
+        else if (optionsValid && optEnd !== undefined) endTime = _markTime(optEnd);
+        else if (optionsValid && optStart !== undefined && optDuration !== undefined) {
+          endTime = _markTime(optStart) + _markTime(optDuration);
+        } else endTime = globalThis.performance.now();
+        var startTime;
+        if (typeof startMarkOrOptions === "string") startTime = _markTime(startMarkOrOptions);
+        else if (optionsValid && optStart !== undefined) startTime = _markTime(optStart);
+        else if (optionsValid && optDuration !== undefined) startTime = endTime - _markTime(optDuration);
+        else startTime = 0;
+        var duration = endTime - startTime;
 
         var entry = new PerformanceEntry(name, "measure", startTime, duration, detail);
         _measures.push(entry);
@@ -35287,26 +37121,211 @@
       PerformanceObserverEntryList,
       PerformanceNodeTiming,
       nodeTiming: _nodeTiming,
-      createHistogram: () => ({
-        record: () => {},
-        percentile: () => 0,
-        mean: 0,
-        max: 0,
-        min: 0,
-        count: 0,
-      }),
-      monitorEventLoopDelay: () => ({
-        enable() {},
-        disable() {},
-        reset() {},
-        mean: 0,
-        max: 0,
-        min: 0,
-        stddev: 0,
-        percentile: () => 0,
-        percentiles: new Map(),
-      }),
+      createHistogram,
+      monitorEventLoopDelay,
     };
+
+    // perf_hooks histograms: node's Histogram / RecordableHistogram /
+    // ELDHistogram surface over an exact value -> count table. node's are
+    // HdrHistograms at three significant figures, so for values past a few
+    // thousand its min/max/percentiles are bucket-rounded where these are the
+    // recorded values themselves (docs/node-divergences.md). These replaced
+    // objects whose record() dropped the value and whose statistics were
+    // all a constant 0.
+    function makeHistogramClasses() {
+      const kHistEmptyMin = 9223372036854776000;
+      class Histogram {
+        constructor(highest) {
+          this._counts = new Map();
+          this._sorted = null;
+          this._count = 0;
+          this._exceeds = 0;
+          this._sum = 0;
+          this._min = kHistEmptyMin;
+          this._max = 0;
+          this._highest = highest;
+          this._prev = 0;
+        }
+        _record(value) {
+          if (value > this._highest) { this._exceeds++; return; }
+          this._counts.set(value, (this._counts.get(value) || 0) + 1);
+          this._sorted = null;
+          this._count++;
+          this._sum += value;
+          if (value < this._min) this._min = value;
+          if (value > this._max) this._max = value;
+        }
+        // node's Histogram::RecordDelta: the nanoseconds since the previous
+        // call, recorded from the second call on.
+        _recordDelta() {
+          const now = Math.round(globalThis.performance.now() * 1e6);
+          if (this._prev > 0) {
+            const delta = now - this._prev;
+            if (delta > 0) this._record(delta);
+          }
+          this._prev = now;
+        }
+        _values() {
+          if (this._sorted === null) this._sorted = [...this._counts.keys()].sort((a, b) => a - b);
+          return this._sorted;
+        }
+        get count() { return this._count; }
+        get countBigInt() { return BigInt(this._count); }
+        get min() { return this._min; }
+        get minBigInt() { return BigInt(this._min); }
+        get max() { return this._max; }
+        get maxBigInt() { return BigInt(this._max); }
+        get mean() { return this._count === 0 ? NaN : this._sum / this._count; }
+        get exceeds() { return this._exceeds; }
+        get exceedsBigInt() { return BigInt(this._exceeds); }
+        get stddev() {
+          if (this._count === 0) return NaN;
+          const mean = this._sum / this._count;
+          let acc = 0;
+          for (const value of this._values()) acc += (value - mean) * (value - mean) * this._counts.get(value);
+          return Math.sqrt(acc / this._count);
+        }
+        percentile(percentile) {
+          if (typeof percentile !== "number") {
+            throw codes.ERR_INVALID_ARG_TYPE("percentile", "number", percentile);
+          }
+          if (Number.isNaN(percentile) || percentile <= 0 || percentile > 100) {
+            throw codes.ERR_OUT_OF_RANGE("percentile", "> 0 && <= 100", percentile);
+          }
+          // hdr_value_at_percentile: the value the rounded target count falls on.
+          const target = Math.max(Math.floor((percentile / 100) * this._count + 0.5), 1);
+          let seen = 0;
+          for (const value of this._values()) {
+            seen += this._counts.get(value);
+            if (seen >= target) return value;
+          }
+          return 0;
+        }
+        percentileBigInt(percentile) { return BigInt(this.percentile(percentile)); }
+        // HdrHistogram's percentile iterator at one tick per half distance: 0,
+        // 50, 75, 87.5, ... each mapped to the first value whose cumulative
+        // share reaches it, then 100 for the last value.
+        get percentiles() {
+          const out = new Map();
+          let target = 0;
+          let seen = 0;
+          let last = 0;
+          for (const value of this._values()) {
+            seen += this._counts.get(value);
+            last = value;
+            const share = (100 * seen) / this._count;
+            // The last value is reported once, on arrival; an earlier one for
+            // every step its share covers.
+            const isLast = seen === this._count;
+            while (target <= share && target < 100) {
+              out.set(target, value);
+              const half = Math.pow(2, Math.floor(Math.log2(100 / (100 - target))) + 1);
+              target += 100 / half;
+              if (isLast) break;
+            }
+          }
+          out.set(100, last);
+          return out;
+        }
+        get percentilesBigInt() {
+          const out = new Map();
+          for (const [key, value] of this.percentiles) out.set(key, BigInt(value));
+          return out;
+        }
+        reset() {
+          this._counts.clear();
+          this._sorted = null;
+          this._count = 0;
+          this._exceeds = 0;
+          this._sum = 0;
+          this._min = kHistEmptyMin;
+          this._max = 0;
+          this._prev = 0;
+        }
+        toJSON() {
+          return {
+            count: this.count,
+            min: this.min,
+            max: this.max,
+            mean: this.mean,
+            exceeds: this.exceeds,
+            stddev: this.stddev,
+            percentiles: Object.fromEntries(this.percentiles),
+          };
+        }
+      }
+      class RecordableHistogram extends Histogram {
+        record(val) {
+          if (typeof val === "bigint") val = Number(val);
+          else if (typeof val !== "number") {
+            throw codes.ERR_INVALID_ARG_TYPE("val", ["number", "bigint"], val);
+          }
+          if (!Number.isInteger(val) || val < 1 || val > Number.MAX_SAFE_INTEGER) {
+            throw codes.ERR_OUT_OF_RANGE("val", ">= 1 && <= " + Number.MAX_SAFE_INTEGER, val);
+          }
+          this._record(val);
+        }
+        recordDelta() { this._recordDelta(); }
+        add(other) {
+          if (!(other instanceof Histogram)) {
+            throw codes.ERR_INVALID_ARG_TYPE("other", "RecordableHistogram", other);
+          }
+          for (const [value, n] of other._counts) {
+            for (let i = 0; i < n; i++) this._record(value);
+          }
+          this._exceeds += other._exceeds;
+        }
+      }
+      // node's monitorEventLoopDelay: a timer at `resolution` ms, unref'd,
+      // that records the nanoseconds between its own firings -- so a loop
+      // that is never late reports about the resolution, not zero.
+      class ELDHistogram extends Histogram {
+        constructor(resolution) {
+          super(Number.MAX_SAFE_INTEGER);
+          this._resolution = resolution;
+          this._timer = null;
+        }
+        enable() {
+          if (this._timer !== null) return false;
+          this._timer = setInterval(() => this._recordDelta(), this._resolution);
+          if (this._timer && typeof this._timer.unref === "function") this._timer.unref();
+          return true;
+        }
+        disable() {
+          if (this._timer === null) return false;
+          clearInterval(this._timer);
+          this._timer = null;
+          return true;
+        }
+      }
+      return { RecordableHistogram, ELDHistogram };
+    }
+    // `var`, read as undefined until first use: this sits after the factory's
+    // `return`, where a `let` would never be initialized.
+    var histogramClasses;
+    function createHistogram(options) {
+      if (options !== undefined && (options === null || typeof options !== "object")) {
+        throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+      }
+      const highest =
+        options && options.highest !== undefined ? Number(options.highest) : Number.MAX_SAFE_INTEGER;
+      if (histogramClasses === undefined) histogramClasses = makeHistogramClasses();
+      return new histogramClasses.RecordableHistogram(highest);
+    }
+    function monitorEventLoopDelay(options) {
+      if (options !== undefined && (options === null || typeof options !== "object")) {
+        throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+      }
+      const resolution = options && options.resolution !== undefined ? options.resolution : 10;
+      if (typeof resolution !== "number") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.resolution", "number", resolution);
+      }
+      if (resolution <= 0 || !Number.isSafeInteger(resolution)) {
+        throw codes.ERR_OUT_OF_RANGE("resolution", ">= 1 && <= " + Number.MAX_SAFE_INTEGER, resolution);
+      }
+      if (histogramClasses === undefined) histogramClasses = makeHistogramClasses();
+      return new histogramClasses.ELDHistogram(resolution);
+    }
   };
 
   // ------------------------------------------------------- diagnostics_channel
@@ -35318,8 +37337,11 @@
       constructor(name) {
         this.name = name;
         this._subs = [];
+        // store -> transform, as bound by bindStore (node's ActiveChannel).
+        this._stores = new Map();
       }
-      get hasSubscribers() { return this._subs.length > 0; }
+      // node: a channel is active while it has a subscriber OR a bound store.
+      get hasSubscribers() { return this._subs.length > 0 || this._stores.size > 0; }
       subscribe(fn) { if (typeof fn === "function") this._subs.push(fn); }
       unsubscribe(fn) {
         const i = this._subs.indexOf(fn);
@@ -35328,11 +37350,46 @@
       }
       publish(message) {
         const subs = this._subs.slice();
-        for (const fn of subs) { try { fn(message, this.name); } catch {} }
-        return subs.length > 0;
+        for (const fn of subs) {
+          try {
+            fn(message, this.name);
+          } catch (err) {
+            // node: a throwing subscriber does not stop the others, and its
+            // error is not dropped -- it is raised as an uncaught exception
+            // on the next tick.
+            rethrowAsync(err);
+          }
+        }
+        // No return value, as node's publish().
       }
-      bindStore() {}
-      runStores(context, fn) { if (typeof fn === "function") fn(); }
+      bindStore(store, transform) { this._stores.set(store, transform); }
+      unbindStore(store) { return this._stores.delete(store); }
+      // node's runStores(data, fn, thisArg, ...args): enter every bound store
+      // with its transformed context, publish `data`, then call fn with the
+      // receiver and arguments given and RETURN its result.
+      runStores(data, fn, thisArg, ...args) {
+        let run = () => {
+          this.publish(data);
+          return Reflect.apply(fn, thisArg, args);
+        };
+        for (const [store, transform] of this._stores) {
+          const next = run;
+          run = () => {
+            let context;
+            try {
+              context = typeof transform === "function" ? transform(data) : data;
+            } catch (err) {
+              rethrowAsync(err);
+              return next();
+            }
+            return store.run(context, next);
+          };
+        }
+        return run();
+      }
+    }
+    function rethrowAsync(err) {
+      globalThis.process.nextTick(() => { throw err; });
     }
     function channel(name) {
       if (!_channels.has(name)) _channels.set(name, new Channel(String(name)));
@@ -35352,6 +37409,15 @@
       var asyncStartCh = channel(name + ":asyncStart");
       var asyncEndCh = channel(name + ":asyncEnd");
       var errorCh = channel(name + ":error");
+      // node gates the trace methods on ANY of the five channels being active,
+      // not on `start` alone: a tracer subscribed only to error/end/asyncEnd
+      // is still called.
+      var anyActive = () =>
+        startCh.hasSubscribers ||
+        endCh.hasSubscribers ||
+        asyncStartCh.hasSubscribers ||
+        asyncEndCh.hasSubscribers ||
+        errorCh.hasSubscribers;
       return {
         start: startCh,
         end: endCh,
@@ -35386,24 +37452,26 @@
         // Node, so the publish bookkeeping never runs when nobody listens.
         traceSync(fn, context, thisArg, ...args) {
           context = context || {};
-          if (!startCh.hasSubscribers) return Reflect.apply(fn, thisArg, args);
-          startCh.publish(context);
-          try {
-            const result = Reflect.apply(fn, thisArg, args);
-            context.result = result;
-            return result;
-          } catch (err) {
-            context.error = err;
-            errorCh.publish(context);
-            throw err;
-          } finally {
-            endCh.publish(context);
-          }
+          if (!anyActive()) return Reflect.apply(fn, thisArg, args);
+          // runStores publishes `start` after entering the bound stores.
+          return startCh.runStores(context, () => {
+            try {
+              const result = Reflect.apply(fn, thisArg, args);
+              context.result = result;
+              return result;
+            } catch (err) {
+              context.error = err;
+              errorCh.publish(context);
+              throw err;
+            } finally {
+              endCh.publish(context);
+            }
+          });
         },
         tracePromise(fn, context, thisArg, ...args) {
           context = context || {};
-          if (!startCh.hasSubscribers) return Reflect.apply(fn, thisArg, args);
-          startCh.publish(context);
+          if (!anyActive()) return Reflect.apply(fn, thisArg, args);
+          return startCh.runStores(context, () => {
           let promise;
           try {
             promise = Reflect.apply(fn, thisArg, args);
@@ -35429,10 +37497,11 @@
               throw err;
             },
           );
+          });
         },
         traceCallback(fn, position, context, thisArg, ...args) {
           context = context || {};
-          if (!startCh.hasSubscribers) return Reflect.apply(fn, thisArg, args);
+          if (!anyActive()) return Reflect.apply(fn, thisArg, args);
           if (position === undefined || position === -1) position = args.length - 1;
           const callback = args[position];
           if (typeof callback === "function") {
@@ -35443,24 +37512,28 @@
               } else {
                 context.result = arguments[1];
               }
-              asyncStartCh.publish(context);
-              try {
-                return Reflect.apply(callback, this, arguments);
-              } finally {
-                asyncEndCh.publish(context);
-              }
+              const self = this;
+              const cbArgs = arguments;
+              return asyncStartCh.runStores(context, () => {
+                try {
+                  return Reflect.apply(callback, self, cbArgs);
+                } finally {
+                  asyncEndCh.publish(context);
+                }
+              });
             };
           }
-          startCh.publish(context);
-          try {
-            return Reflect.apply(fn, thisArg, args);
-          } catch (err) {
-            context.error = err;
-            errorCh.publish(context);
-            throw err;
-          } finally {
-            endCh.publish(context);
-          }
+          return startCh.runStores(context, () => {
+            try {
+              return Reflect.apply(fn, thisArg, args);
+            } catch (err) {
+              context.error = err;
+              errorCh.publish(context);
+              throw err;
+            } finally {
+              endCh.publish(context);
+            }
+          });
         },
       };
     }
@@ -35468,8 +37541,10 @@
   };
 
   // -------------------------------------------------------------- readline
-  // Minimal stub: enough for `readline.createInterface` and the async-
-  // iterator line-reading pattern used by CLI utilities.
+  // readline: Interface / createInterface (line reading, question(), the
+  // async iterator), the cursor helpers and emitKeypressEvents. Not node's
+  // full line editor: see the `node:repl`, `node:readline` row in
+  // docs/node-divergences.md.
   // node's internal AbortError (the one class, bootstrap.js, #401)
   // carrying the signal's reason as `cause`. What readline's question()
   // rejects with on an aborted signal -- NOT a DOMException: `if (err.code
@@ -35799,7 +37874,194 @@
       else if (dy > 0) data += `\x1b[${dy}B`;
       return stream.write(data, callback);
     }
-    function emitKeypressEvents() {}
+    // readline.emitKeypressEvents(stream): once the stream has a 'keypress'
+    // listener, its 'data' is decoded and re-emitted as node's
+    // `'keypress', (str, key)` -- key is { sequence, name, ctrl, meta, shift }
+    // (plus `code` for an escape sequence), by the tables of node's
+    // internal/readline/utils.js emitKeys. This used to do nothing, so a
+    // prompt library that waits for 'keypress' never heard one. One
+    // difference is kept simple: a chunk is decoded on its own, so an escape
+    // sequence split across two reads is not rejoined, and an ESC that ends a
+    // chunk is reported as `escape` at once rather than after node's 500 ms.
+    const kKeypressDecoder = Symbol("oam.keypressDecoder");
+    const KEYPRESS_CSI_NAMES = {
+      /* xterm/gnome ESC [ letter (with modifier) */
+      "[P": "f1", "[Q": "f2", "[R": "f3", "[S": "f4",
+      /* xterm/gnome ESC O letter (without modifier) */
+      "OP": "f1", "OQ": "f2", "OR": "f3", "OS": "f4",
+      /* xterm/rxvt ESC [ number ~ */
+      "[11~": "f1", "[12~": "f2", "[13~": "f3", "[14~": "f4",
+      /* from Cygwin and used in libuv */
+      "[[A": "f1", "[[B": "f2", "[[C": "f3", "[[D": "f4", "[[E": "f5",
+      /* common */
+      "[15~": "f5", "[17~": "f6", "[18~": "f7", "[19~": "f8",
+      "[20~": "f9", "[21~": "f10", "[23~": "f11", "[24~": "f12",
+      /* xterm ESC [ letter */
+      "[A": "up", "[B": "down", "[C": "right", "[D": "left",
+      "[E": "clear", "[F": "end", "[H": "home",
+      /* xterm/gnome ESC O letter */
+      "OA": "up", "OB": "down", "OC": "right", "OD": "left",
+      "OE": "clear", "OF": "end", "OH": "home",
+      /* xterm/rxvt ESC [ number ~ */
+      "[1~": "home", "[2~": "insert", "[3~": "delete", "[4~": "end",
+      "[5~": "pageup", "[6~": "pagedown",
+      /* putty */
+      "[[5~": "pageup", "[[6~": "pagedown",
+      /* rxvt */
+      "[7~": "home", "[8~": "end",
+      /* misc. */
+      "[Z": "tab",
+      /* bracketed paste */
+      "[200~": "paste-start", "[201~": "paste-end",
+    };
+    const KEYPRESS_RXVT_SHIFT = {
+      "[a": "up", "[b": "down", "[c": "right", "[d": "left", "[e": "clear",
+      "[2$": "insert", "[3$": "delete", "[5$": "pageup", "[6$": "pagedown",
+      "[7$": "home", "[8$": "end",
+    };
+    const KEYPRESS_RXVT_CTRL = {
+      "Oa": "up", "Ob": "down", "Oc": "right", "Od": "left", "Oe": "clear",
+      "[2^": "insert", "[3^": "delete", "[5^": "pageup", "[6^": "pagedown",
+      "[7^": "home", "[8^": "end",
+    };
+    // One key from `s` at `i`: returns [str, key, nextIndex].
+    function decodeKeypress(s, i) {
+      const key = { sequence: null, name: undefined, ctrl: false, meta: false, shift: false };
+      const start = i;
+      let ch = s[i++];
+      let escaped = false;
+      if (ch === "\x1b") {
+        escaped = true;
+        if (i < s.length) {
+          ch = s[i++];
+          if (ch === "\x1b" && i < s.length) ch = s[i++];
+        } else {
+          ch = undefined;
+        }
+      }
+      if (escaped && (ch === "O" || ch === "[")) {
+        // ANSI escape sequence.
+        let code = ch;
+        let modifier = 0;
+        if (ch === "O") {
+          // ESC O letter, ESC O modifier letter
+          ch = s[i++];
+          if (ch >= "0" && ch <= "9") {
+            modifier = (ch.charCodeAt(0) - 48) - 1;
+            ch = s[i++];
+          }
+          code += ch === undefined ? "" : ch;
+        } else {
+          // ESC [ letter, ESC [ modifier letter, ESC [ [ modifier letter,
+          // ESC [ [ num char, ESC [ num ; modifier char
+          if (s[i] === "[") { code += "["; i++; }
+          const seqStart = i;
+          while (i < s.length && s[i] >= "0" && s[i] <= "9") i++;
+          if (s[i] === ";") {
+            i++;
+            while (i < s.length && s[i] >= "0" && s[i] <= "9") i++;
+          }
+          const cmdStart = i;
+          ch = s[i++];
+          const params = s.slice(seqStart, cmdStart);
+          const cmd = ch === undefined ? "" : ch;
+          let match;
+          if ((match = /^(\d\d?)(?:;(\d))?$/.exec(params)) && /[~^$]/.test(cmd)) {
+            code += match[1] + cmd;
+            modifier = (match[2] || 1) - 1;
+          } else if ((match = /^(?:\d;)?(\d)$/.exec(params)) && /[A-Za-z]/.test(cmd)) {
+            code += cmd;
+            modifier = (match[1] || 1) - 1;
+          } else {
+            code += params + cmd;
+          }
+        }
+        key.ctrl = !!(modifier & 4);
+        key.meta = !!(modifier & 10);
+        key.shift = !!(modifier & 1);
+        key.code = code;
+        if (KEYPRESS_CSI_NAMES[code] !== undefined) {
+          key.name = KEYPRESS_CSI_NAMES[code];
+          if (code === "[Z") key.shift = true;
+        } else if (KEYPRESS_RXVT_SHIFT[code] !== undefined) {
+          key.name = KEYPRESS_RXVT_SHIFT[code];
+          key.shift = true;
+        } else if (KEYPRESS_RXVT_CTRL[code] !== undefined) {
+          key.name = KEYPRESS_RXVT_CTRL[code];
+          key.ctrl = true;
+        } else {
+          key.name = "undefined";
+        }
+      } else if (ch === "\r") {
+        key.name = "return";
+        key.meta = escaped;
+      } else if (ch === "\n") {
+        key.name = "enter";
+        key.meta = escaped;
+      } else if (ch === "\t") {
+        key.name = "tab";
+        key.meta = escaped;
+      } else if (ch === "\b" || ch === "\x7f") {
+        key.name = "backspace";
+        key.meta = escaped;
+      } else if (ch === "\x1b" || ch === undefined) {
+        // A lone ESC, or ESC ESC.
+        key.name = "escape";
+        key.meta = escaped && ch !== undefined;
+      } else if (ch === " ") {
+        key.name = "space";
+        key.meta = escaped;
+      } else if (!escaped && ch <= "\x1a") {
+        // ctrl+letter
+        key.name = String.fromCharCode(ch.charCodeAt(0) + 97 - 1);
+        key.ctrl = true;
+      } else if (/^[0-9A-Za-z]$/.test(ch)) {
+        // Letter or number, with or without a leading ESC (meta).
+        key.name = ch.toLowerCase();
+        key.shift = /^[A-Z]$/.test(ch);
+        key.meta = escaped;
+      } else if (escaped) {
+        // ESC followed by anything else: meta + that character.
+        key.meta = true;
+      } else if (ch >= "\ud800" && ch <= "\udbff" && i < s.length) {
+        // An astral character is one keypress.
+        i++;
+      }
+      if (i > s.length) i = s.length;
+      key.sequence = s.slice(start, i);
+      // node hands the listener a string only for a plain character; an
+      // escaped key or an escape sequence arrives as undefined plus the key.
+      const str = escaped ? undefined : key.sequence;
+      return [str, key, i];
+    }
+    function emitKeypressEvents(stream, _iface) {
+      if (stream == null || stream[kKeypressDecoder]) return;
+      const { StringDecoder } = registry.get("string_decoder");
+      stream[kKeypressDecoder] = new StringDecoder("utf8");
+      const onData = (chunk) => {
+        if (stream.listenerCount("keypress") === 0) {
+          // Nobody is listening any more: stop decoding until someone is.
+          stream.removeListener("data", onData);
+          stream.on("newListener", onNewListener);
+          return;
+        }
+        const text = typeof chunk === "string" ? chunk : stream[kKeypressDecoder].write(chunk);
+        let i = 0;
+        while (i < text.length) {
+          const [str, key, next] = decodeKeypress(text, i);
+          i = next;
+          stream.emit("keypress", str, key);
+        }
+      };
+      const onNewListener = (event) => {
+        if (event === "keypress") {
+          stream.on("data", onData);
+          stream.removeListener("newListener", onNewListener);
+        }
+      };
+      if (stream.listenerCount("keypress") > 0) stream.on("data", onData);
+      else stream.on("newListener", onNewListener);
+    }
     return {
       Interface, createInterface,
       clearLine, clearScreenDown, cursorTo, moveCursor, emitKeypressEvents,
@@ -35871,10 +38133,10 @@
 
   // ----------------------------------------------------------------------- vm
   // vm module: Script.runInThisContext / runInNewContext / runInContext,
-  // createContext with WeakSet tracking, expression-first compilation.
-  // NOTE: this uses the with(this){...} pattern for sandboxing, which is
-  // NOT true V8 context isolation -- it shares the same global heap.
-  // Sufficient for template engines, config eval, and most bundler use.
+  // createContext, compileFunction, SourceTextModule. Each context is a real
+  // v8::Context in this isolate (see the note that opens the factory): its
+  // own global and intrinsics, one shared heap -- as node's vm, a separate
+  // scope and not a security boundary.
   registry.factories.vm = (natives) => {
     // Every entry point here runs on a real v8::Context (see
     // crates/oam_engine/src/vm_context.rs). The script therefore gets its own
@@ -35949,8 +38211,12 @@
       runInNewContext(sandbox, options) {
         return this.runInContext(createContext(sandbox), options);
       }
+      // No code cache is produced (a script is recompiled per run, see
+      // docs/node-divergences.md), so there is none to hand out: an empty
+      // Buffer, node's return type, which a consumer that feeds it back as
+      // `cachedData` treats as a rejected cache.
       createCachedData() {
-        return new Uint8Array(0);
+        return registry.get("buffer").Buffer.alloc(0);
       }
     }
 
@@ -35980,6 +38246,7 @@
         : null;
 
     const kModuleId = Symbol("oam.vmModuleId");
+    const kLinkGraph = Symbol("oam.vmModuleLinkGraph");
     let moduleSequence = 0;
 
     class SourceTextModule {
@@ -36035,6 +38302,16 @@
             "ERR_VM_MODULE_STATUS",
           );
         }
+        await this[kLinkGraph](linker);
+        // Once, for the root: V8 instantiates the whole graph under it, and
+        // every module the graph reaches has its links recorded by now. A
+        // dependency instantiated on its own, part-way through, would ask
+        // for the back-edge of a cycle before that edge was recorded.
+        natives.vmModuleInstantiate(this[kModuleId]);
+      }
+      /// Resolve this module's imports through `linker` and record them,
+      /// dependencies first. No instantiation: that is link()'s, for the root.
+      async [kLinkGraph](linker) {
         this._linkedOnce = true;
         const specifiers = this.dependencySpecifiers;
         const resolvedIds = [];
@@ -36046,16 +38323,21 @@
               "ERR_VM_MODULE_NOT_MODULE",
             );
           }
+          if (dependency.context !== this.context) {
+            throw applyNodeErrorShape(
+              new Error("Linked modules must use the same context"),
+              "ERR_VM_MODULE_DIFFERENT_CONTEXT",
+            );
+          }
           // Depth-first, and only once per module: a cycle would otherwise
           // recurse forever, and diamond imports would link a shared
           // dependency twice.
           if (dependency.status === "unlinked" && !dependency._linkedOnce) {
-            await dependency.link(linker);
+            await dependency[kLinkGraph](linker);
           }
           resolvedIds.push(dependency[kModuleId]);
         }
         natives.vmModuleLink(this[kModuleId], specifiers, resolvedIds);
-        natives.vmModuleInstantiate(this[kModuleId]);
       }
       async evaluate(options) {
         const timeout = timeoutOf(options);
@@ -36112,8 +38394,14 @@
       if (opts.filename) fn._filename = opts.filename;
       return fn;
     }
-    function measureMemory() {
-      return Promise.resolve({ total: { jsMemoryEstimate: 0 } });
+    // vm.measureMemory(): V8's per-context measurement is not wired up, so
+    // this reports what IS measured -- the isolate's used heap
+    // (v8.getHeapStatistics().used_heap_size) as the estimate, which every
+    // context's share lies at or below, hence the range from 0. It used to
+    // resolve a constant `jsMemoryEstimate: 0`.
+    function measureMemory(_options) {
+      const used = natives.heapStatistics().used_heap_size;
+      return Promise.resolve({ total: { jsMemoryEstimate: used, jsMemoryRange: [0, used] } });
     }
     function createScript(code, options) {
       return new Script(code, options);
@@ -36131,28 +38419,285 @@
   // the rest is a minimal surface -- feature-detect callers get safe
   // defaults and serialization uses JSON under a V8 wire header.
   registry.factories.v8 = (natives) => {
-    // V8 serialization wire format sentinel bytes: 0xff 0x0d (version 13).
+    // v8.serialize / v8.deserialize. NOT V8's wire format: the engine's
+    // ValueSerializer is not exposed to this layer, so the bytes are oam's
+    // own -- the two V8 header bytes (0xff 0x0d), then UTF-8 JSON describing
+    // the value graph -- and only oam reads them back
+    // (docs/node-divergences.md). What the graph encoding does give is the
+    // structured-clone RESULT node's gives: Map, Set, Date, RegExp, BigInt,
+    // undefined, NaN / -0, typed arrays, Buffers, ArrayBuffers, boxed
+    // primitives, errors, holes, cycles and shared references all
+    // round-trip, and what cannot be cloned (a function, a symbol) throws
+    // instead of vanishing. The plain JSON.stringify this replaced turned a
+    // Map into `{}`, a Date into a string and a typed array into an index
+    // object, silently.
+    const V8S_ENVELOPE = "oam-v8-serialize";
+    const V8S_VIEWS = [
+      "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
+      "Int32Array", "Uint32Array", "Float32Array", "Float64Array",
+      "BigInt64Array", "BigUint64Array", "DataView",
+    ];
+    function v8DataCloneError(value) {
+      let shown;
+      try { shown = String(value); } catch { shown = Object.prototype.toString.call(value); }
+      return new Error(`${shown} could not be cloned.`);
+    }
+    function v8EncodeGraph(root) {
+      const { Buffer } = registry.get("buffer");
+      const ids = new Map();
+      const table = [];
+      const enc = (value) => {
+        switch (typeof value) {
+          case "string":
+          case "boolean":
+            return value;
+          case "number":
+            if (Number.isNaN(value)) return ["n", "NaN"];
+            if (!Number.isFinite(value)) return ["n", value > 0 ? "Infinity" : "-Infinity"];
+            if (Object.is(value, -0)) return ["n", "-0"];
+            return value;
+          case "undefined":
+            return ["u"];
+          case "bigint":
+            return ["i", value.toString()];
+          case "object":
+            if (value === null) return null;
+            break;
+          default:
+            throw v8DataCloneError(value);
+        }
+        const known = ids.get(value);
+        if (known !== undefined) return ["r", known];
+        const id = table.length;
+        ids.set(value, id);
+        table.push(null);
+        table[id] = encObject(value);
+        return ["r", id];
+      };
+      const encObject = (value) => {
+        if (Array.isArray(value)) {
+          const items = new Array(value.length);
+          for (let i = 0; i < value.length; i++) items[i] = i in value ? enc(value[i]) : ["h"];
+          return ["a", items];
+        }
+        if (value instanceof Map) {
+          const pairs = [];
+          for (const [k, v] of value) pairs.push([enc(k), enc(v)]);
+          return ["M", pairs];
+        }
+        if (value instanceof Set) {
+          const items = [];
+          for (const v of value) items.push(enc(v));
+          return ["S", items];
+        }
+        if (value instanceof Date) {
+          const ms = value.getTime();
+          return ["D", Number.isNaN(ms) ? null : ms];
+        }
+        if (value instanceof RegExp) return ["R", value.source, value.flags];
+        if (value instanceof ArrayBuffer) return ["B", Buffer.from(value).toString("base64")];
+        if (ArrayBuffer.isView(value)) {
+          if (!(value.buffer instanceof ArrayBuffer)) throw v8DataCloneError(value);
+          const kind = Buffer.isBuffer(value)
+            ? "Buffer"
+            : V8S_VIEWS.find((name) => value instanceof globalThis[name]);
+          if (kind === undefined) throw v8DataCloneError(value);
+          if (kind === "Buffer") {
+            // node writes a Buffer's own bytes, not the pool slab behind it.
+            return ["F", Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("base64")];
+          }
+          const length = kind === "DataView" ? value.byteLength : value.length;
+          return ["V", kind, enc(value.buffer), value.byteOffset, length];
+        }
+        if (value instanceof Number) return ["P", "n", enc(value.valueOf())];
+        if (value instanceof String) return ["P", "s", value.valueOf()];
+        if (value instanceof Boolean) return ["P", "b", value.valueOf()];
+        if (typeof BigInt === "function" && value instanceof BigInt) return ["P", "i", value.valueOf().toString()];
+        if (value instanceof Error) {
+          const out = ["E", String(value.name), String(value.message)];
+          out.push(typeof value.stack === "string" ? value.stack : null);
+          out.push("cause" in value ? [enc(value.cause)] : null);
+          return out;
+        }
+        const tag = Object.prototype.toString.call(value);
+        if (tag === "[object Promise]" || tag === "[object WeakMap]" || tag === "[object WeakSet]" ||
+            tag === "[object WeakRef]" || tag === "[object SharedArrayBuffer]") {
+          throw v8DataCloneError(`#<${tag.slice(8, -1)}>`);
+        }
+        // Any other object goes as its own enumerable string-keyed
+        // properties: a class instance comes back a plain object, as in node.
+        const pairs = [];
+        for (const key of Object.keys(value)) pairs.push([key, enc(value[key])]);
+        return ["o", pairs];
+      };
+      const rootRef = enc(root);
+      return [V8S_ENVELOPE, 1, rootRef, table];
+    }
+    const V8S_ERROR_TYPES = {
+      EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError,
+    };
+    function v8DecodeGraph(envelope) {
+      const { Buffer } = registry.get("buffer");
+      const table = envelope[3];
+      const objects = new Array(table.length);
+      // Shells first, so a cycle or a shared reference finds its target.
+      for (let id = 0; id < table.length; id++) {
+        const node = table[id];
+        switch (node[0]) {
+          case "a": objects[id] = new Array(node[1].length); break;
+          case "o": objects[id] = {}; break;
+          case "M": objects[id] = new Map(); break;
+          case "S": objects[id] = new Set(); break;
+          case "D": objects[id] = new Date(node[1] === null ? NaN : node[1]); break;
+          case "R": objects[id] = new RegExp(node[1], node[2]); break;
+          case "B": {
+            const bytes = Buffer.from(node[1], "base64");
+            const buffer = new ArrayBuffer(bytes.length);
+            new Uint8Array(buffer).set(bytes);
+            objects[id] = buffer;
+            break;
+          }
+          case "F": objects[id] = Buffer.from(node[1], "base64"); break;
+          case "P":
+            if (node[1] === "s") objects[id] = new String(node[2]);
+            else if (node[1] === "b") objects[id] = new Boolean(node[2]);
+            else if (node[1] === "i") objects[id] = Object(BigInt(node[2]));
+            break;
+          case "E": {
+            // Own names only: an error named "constructor" or "toString" must
+            // not pick an inherited Object.prototype member as its class.
+            const Ctor = Object.prototype.hasOwnProperty.call(V8S_ERROR_TYPES, node[1])
+              ? V8S_ERROR_TYPES[node[1]]
+              : Error;
+            const err = new Ctor(node[2]);
+            if (node[3] !== null) {
+              Object.defineProperty(err, "stack", {
+                value: node[3], writable: true, enumerable: false, configurable: true,
+              });
+            }
+            objects[id] = err;
+            break;
+          }
+          case "V":
+            break;
+          default:
+            throw new Error("Unable to deserialize cloned data.");
+        }
+      }
+      const dec = (value) => {
+        if (value === null || typeof value !== "object") return value;
+        switch (value[0]) {
+          case "u": return undefined;
+          case "n": return value[1] === "-0" ? -0 : Number(value[1]);
+          case "i": return BigInt(value[1]);
+          case "r": return objects[value[1]];
+          default: throw new Error("Unable to deserialize cloned data.");
+        }
+      };
+      // Views next: each needs only its buffer, which is a shell already.
+      for (let id = 0; id < table.length; id++) {
+        const node = table[id];
+        if (node[0] === "V") {
+          if (!V8S_VIEWS.includes(node[1])) throw new Error("Unable to deserialize cloned data.");
+          objects[id] = new globalThis[node[1]](dec(node[2]), node[3], node[4]);
+        } else if (node[0] === "P" && node[1] === "n") {
+          objects[id] = new Number(dec(node[2]));
+        }
+      }
+      for (let id = 0; id < table.length; id++) {
+        const node = table[id];
+        const target = objects[id];
+        switch (node[0]) {
+          case "a":
+            for (let i = 0; i < node[1].length; i++) {
+              const item = node[1][i];
+              if (item !== null && typeof item === "object" && item[0] === "h") continue;
+              target[i] = dec(item);
+            }
+            break;
+          case "o":
+            for (const [key, v] of node[1]) {
+              Object.defineProperty(target, key, {
+                value: dec(v), writable: true, enumerable: true, configurable: true,
+              });
+            }
+            break;
+          case "M":
+            for (const [k, v] of node[1]) target.set(dec(k), dec(v));
+            break;
+          case "S":
+            for (const v of node[1]) target.add(dec(v));
+            break;
+          case "E":
+            if (node[4] !== null) {
+              Object.defineProperty(target, "cause", {
+                value: dec(node[4][0]), writable: true, enumerable: false, configurable: true,
+              });
+            }
+            break;
+          default:
+            break;
+        }
+      }
+      return dec(envelope[2]);
+    }
+    function v8EncodeText(value) {
+      return JSON.stringify(v8EncodeGraph(value));
+    }
+    function v8DecodeText(text) {
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        // Not oam's: real V8 wire bytes (node's v8.serialize output), or junk.
+        throw new Error(
+          "Unable to deserialize cloned data: the buffer was not written by oam's v8.serialize " +
+            "(V8's wire format is not supported)",
+        );
+      }
+      if (Array.isArray(parsed) && parsed.length === 4 && parsed[0] === V8S_ENVELOPE && parsed[1] === 1) {
+        return v8DecodeGraph(parsed);
+      }
+      // A buffer an earlier oam wrote: plain JSON under the same header.
+      return parsed;
+    }
+    function v8PayloadOf(buffer) {
+      let bytes;
+      if (buffer instanceof Uint8Array) bytes = buffer;
+      else if (ArrayBuffer.isView(buffer)) bytes = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+      else bytes = new Uint8Array(buffer);
+      const start = (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0x0d) ? 2 : 0;
+      return new TextDecoder().decode(bytes.subarray(start));
+    }
     function serialize(value) {
-      const json = JSON.stringify(value);
-      const enc = new TextEncoder().encode(json);
-      const out = new Uint8Array(2 + enc.length);
+      const { Buffer } = registry.get("buffer");
+      const enc = new TextEncoder().encode(v8EncodeText(value));
+      const out = Buffer.allocUnsafe(2 + enc.length);
       out[0] = 0xff; out[1] = 0x0d;
       out.set(enc, 2);
       return out;
     }
     function deserialize(buffer) {
-      const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
-      const start = (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0x0d) ? 2 : 0;
-      return JSON.parse(new TextDecoder().decode(bytes.subarray(start)));
+      // One value: the text up to the first value separator, if any.
+      const text = v8PayloadOf(buffer);
+      const end = text.indexOf("\n");
+      return v8DecodeText(end === -1 ? text : text.slice(0, end));
     }
+    // Serializer / Deserializer: the header, then one line of JSON per
+    // writeValue, so several values written to one buffer read back one by
+    // one (they used to be concatenated into text no reader could parse).
     class Serializer {
       constructor() { this._chunks = []; }
       writeHeader() { this._chunks.push(new Uint8Array([0xff, 0x0d])); }
-      writeValue(value) { this._chunks.push(new TextEncoder().encode(JSON.stringify(value))); }
+      writeValue(value) {
+        this._chunks.push(new TextEncoder().encode(v8EncodeText(value) + "\n"));
+        return true;
+      }
       releaseBuffer() {
+        const { Buffer } = registry.get("buffer");
         let total = 0;
         for (const c of this._chunks) total += c.length;
-        const out = new Uint8Array(total);
+        const out = Buffer.allocUnsafe(total);
         let off = 0;
         for (const c of this._chunks) { out.set(c, off); off += c.length; }
         this._chunks = [];
@@ -36161,12 +38706,18 @@
     }
     class Deserializer {
       constructor(buffer) {
-        const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
-        const start = (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0x0d) ? 2 : 0;
-        this._text = new TextDecoder().decode(bytes.subarray(start));
+        this._text = v8PayloadOf(buffer);
+        this._pos = 0;
       }
       readHeader() { return true; }
-      readValue() { return JSON.parse(this._text); }
+      readValue() {
+        if (this._pos >= this._text.length) throw new Error("Unable to deserialize cloned data.");
+        let end = this._text.indexOf("\n", this._pos);
+        if (end === -1) end = this._text.length;
+        const line = this._text.slice(this._pos, end);
+        this._pos = end + 1;
+        return v8DecodeText(line);
+      }
     }
     function getHeapStatistics() {
       return natives.heapStatistics();
@@ -36271,12 +38822,40 @@
       heapSnapshotOptions(options);
       return heapSnapshotStreamOf(natives.heapSnapshot());
     }
-    function cachedDataVersionTag() { return 0; }
+    // v8.cachedDataVersionTag(): node's is V8's own tag, derived from the V8
+    // version, flags and CPU features, and all a caller may do with it is
+    // compare it with a stored one. V8's is not exposed here, so this derives
+    // one (FNV-1a, 32-bit) from what would invalidate a cache the same way:
+    // the linked V8 version and the target. It used to be a constant 0, the
+    // same across every V8 upgrade.
+    function cachedDataVersionTag() {
+      const p = globalThis.process;
+      const text = `${p.versions.v8}|${p.arch}|${p.platform}`;
+      let hash = 0x811c9dc5;
+      for (let i = 0; i < text.length; i++) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193);
+      }
+      return hash >>> 0;
+    }
     function stopCoverage() {}
     function takeCoverage() {}
+    // v8.startupSnapshot. oam never builds a userland startup snapshot, so
+    // the process is never "building" one, and node's contract for that
+    // state is to THROW from the three registration calls
+    // (ERR_NOT_BUILDING_SNAPSHOT, lib/internal/v8/startup_snapshot.js). They
+    // used to return quietly, which told an application using node's
+    // snapshot pattern that its callbacks were registered.
+    function throwIfNotBuildingSnapshot() {
+      throw applyNodeErrorShape(
+        new Error("Operation cannot be invoked when not building startup snapshot"),
+        "ERR_NOT_BUILDING_SNAPSHOT",
+      );
+    }
     const startupSnapshot = {
-      addDeserializeCallback() {},
-      addSerializeCallback() {},
+      addDeserializeCallback(_callback, _data) { throwIfNotBuildingSnapshot(); },
+      addSerializeCallback(_callback, _data) { throwIfNotBuildingSnapshot(); },
+      setDeserializeMainFunction(_callback, _data) { throwIfNotBuildingSnapshot(); },
       isBuildingSnapshot() { return false; },
     };
     return {
@@ -36294,8 +38873,9 @@
   // -------------------------------------------------------------- https
   // HTTPS server (TLS-wrapped HTTP) and client. The server uses
   // httpsServe (Rust TLS termination) but shares the same accept/respond
-  // ops as plain HTTP. Client request/get delegate to fetch (which
-  // supports HTTPS natively via reqwest+rustls).
+  // ops as plain HTTP. Client request/get build http's own ClientRequest
+  // (registry._httpRequest) with the https agent, which sends over
+  // tls.connect.
   registry.factories.https = (natives) => {
     // Loaded first: the http factory is what sets registry._httpAgents.
     registry.get("http");
@@ -36758,10 +39338,12 @@
       clearBufferedCommand() {}
       setupHistory(file, cb) { if (typeof cb === "function") queueMicrotask(() => cb(null, this)); }
     }
+    // There is no in-process REPL behind this module (the interactive one is
+    // the `oam repl` command), so start() says so. It used to hand back a
+    // server that emitted 'exit' a microtask later -- which a caller reads as
+    // "a session ran and the user left it".
     function start(_options) {
-      const server = new REPLServer();
-      queueMicrotask(() => server.emit("exit"));
-      return server;
+      throw codes.ERR_METHOD_NOT_IMPLEMENTED("repl.start()");
     }
     return { start, REPLServer, builtinModules: registry.get("module").builtinModules };
   };
@@ -36986,6 +39568,30 @@
       }
     }
 
+    /** Whether `cmd` names this runtime's own binary, for the self-spawn
+     *  rewrite in normalizeArgs. A matching FILE NAME is not enough for a
+     *  path: with oam installed or linked under another name (`node`), a
+     *  different program of that name elsewhere (`/usr/bin/node`) would get
+     *  the `run <script> --no-check --` rewrite and fail on it. So a path is
+     *  compared resolved, links followed. A bare name is left to the OS's
+     *  PATH lookup and is still taken to be this binary, as before. */
+    function isOwnBinary(cmd, execPath, cwd) {
+      const base = (p) => p.replace(/\\/g, "/").split("/").pop();
+      if (base(cmd) !== base(execPath)) return false;
+      if (!/[\\/]/.test(cmd)) return true;
+      const win = natives.platform === "win32";
+      const path = registry.get("path");
+      const real = (p) => {
+        let out = p;
+        try { out = registry.get("fs").realpathSync(p); } catch { /* unresolvable: compare as given */ }
+        return win ? out.replace(/\//g, "\\").toLowerCase() : out;
+      };
+      // A relative command is resolved by the child after its chdir on
+      // POSIX, and against this process's directory on Windows.
+      const from = !win && typeof cwd === "string" && cwd !== "" ? cwd : ".";
+      return real(path.resolve(from, cmd)) === real(path.resolve(execPath));
+    }
+
     function normalizeArgs(command, args, options) {
       if (args != null && typeof args === "object" && !Array.isArray(args)) {
         options = args;
@@ -37012,10 +39618,7 @@
         // --no-check --` rewrite into it, breaking the child. String() also
         // keeps a non-string assignment from throwing on .replace below.
         const execPath = String(natives.execPath || (natives.argv() || [])[0] || "");
-        const sameBin =
-          execPath !== "" &&
-          (cmd === execPath ||
-          cmd.replace(/\\/g, "/").split("/").pop() === execPath.replace(/\\/g, "/").split("/").pop());
+        const sameBin = execPath !== "" && (cmd === execPath || isOwnBinary(cmd, execPath, opts.cwd));
         const first = argv[0];
         if (sameBin && !first.startsWith("-") && !OAM_SUBCOMMANDS.has(first)) {
           argv = ["run", first, "--no-check", "--", ...argv.slice(1)];
@@ -37064,6 +39667,52 @@
         return { file, args: ["-c", command] };
       }
       return { file: typeof opts.shell === "string" ? opts.shell : "/bin/sh", args: ["-c", command] };
+    }
+
+    /** What the native spawn ops are handed: `{ command, args, shell }`.
+     *  Their `shell` is a boolean that runs the platform shell (cmd.exe with
+     *  verbatim `/d /s /c "<command>"`, or /bin/sh -c). A shell NAMED by a
+     *  string is therefore spawned here as the program itself with node's
+     *  argv for it (`-c <command>`, normalizeSpawnArguments), the native
+     *  `shell` off -- otherwise `{ shell: '/bin/bash' }` or
+     *  `{ shell: 'powershell.exe' }` ran under /bin/sh or cmd.exe. The one
+     *  string that stays on the native shell path is a cmd.exe name on
+     *  Windows: its arguments must reach it verbatim, which only that path
+     *  does (it runs `cmd.exe` by name, not the given path to it). */
+    function shellSpawnPlan(norm) {
+      const shell = norm.options.shell;
+      if (typeof shell !== "string" || shell === "") {
+        return { command: norm.command, args: norm.args, shell: !!shell };
+      }
+      const target = spawnErrorTarget(norm);
+      if (target.args[0] === "/d") {
+        return { command: norm.command, args: norm.args, shell: true };
+      }
+      return { command: target.file, args: target.args, shell: false };
+    }
+
+    /** node's `maxBuffer` for exec / execFile (`sync` false) and the sync
+     *  spawns, as measured on v22.22.2. The default is 1 MiB, and node applies
+     *  it by spreading the caller's options over it, so it holds only when
+     *  the options have no own enumerable `maxBuffer` at all. A value that is
+     *  neither null nor undefined must be a non-negative number
+     *  (validateMaxBuffer: ERR_OUT_OF_RANGE). What a given value then means
+     *  differs by path, because the two compare differently:
+     *   - async: the running length is compared against the value as given,
+     *     so undefined never overflows (no limit) and null overflows at once
+     *     (a limit of 0, like 0 itself);
+     *   - sync: the native spawn reads a limit only from a number above 0,
+     *     so 0, null and undefined all mean no limit.
+     *  Returns the limit in bytes, Infinity for none. */
+    function resolveMaxBuffer(opts, sync) {
+      const given = Object.prototype.propertyIsEnumerable.call(opts, "maxBuffer");
+      const maxBuffer = given ? opts.maxBuffer : 1024 * 1024;
+      if (maxBuffer != null && !(typeof maxBuffer === "number" && maxBuffer >= 0)) {
+        throw codes.ERR_OUT_OF_RANGE("options.maxBuffer", "a positive number", maxBuffer);
+      }
+      if (sync) return maxBuffer > 0 ? maxBuffer : Infinity;
+      if (maxBuffer === undefined) return Infinity;
+      return maxBuffer === null ? 0 : maxBuffer;
     }
 
     function decodeOutput(buf, encoding) {
@@ -37220,7 +39869,7 @@
         // Exactly the child's environment, which replaces oam's own as node's
         // envPairs do: see childEnv.
         env: childEnv(opts.env, spawnArgv(norm)),
-        shell: !!opts.shell,
+        shell: shellSpawnPlan(norm).shell,
         // node's spawnSync honors `detached` too (spawn_sync.cc sets
         // UV_PROCESS_DETACHED), so a detached sync child is kept out of the
         // Windows kill-on-close job like an async one.
@@ -37230,7 +39879,7 @@
         // instead of paying for a hidden conhost.exe of its own.
         windowsHide: !!opts.windowsHide,
         timeout: opts.timeout || 0,
-        maxBuffer: opts.maxBuffer || 50 * 1024 * 1024,
+        maxBuffer: resolveMaxBuffer(opts, true),
         input: opts.input != null
           ? (typeof opts.input === "string" ? Buffer.from(opts.input, opts.encoding || "utf8") : opts.input)
           : undefined,
@@ -37238,7 +39887,8 @@
       };
       const modes = stdioModes(opts.stdio);
       nativeOpts.stdio = modes;
-      const result = natives.spawnSync(norm.command, norm.args, nativeOpts);
+      const plan = shellSpawnPlan(norm);
+      const result = natives.spawnSync(plan.command, plan.args, nativeOpts);
       const encoding = opts.encoding || "buffer";
       // node reports null -- not an empty buffer -- for a slot it never piped,
       // so `spawnSync(..., {stdio: 'inherit'}).stdout === null`.
@@ -37285,37 +39935,66 @@
       return Object.assign(err, result);
     }
 
+    /** node's execSync/execFileSync `inheritStderr`: with no `stdio` option the
+     *  child's stderr was captured, and node forwards it to the parent's
+     *  stderr whether or not the command succeeded -- a build script's
+     *  warnings are not dropped because it exited 0. */
+    function forwardSyncStderr(options, result) {
+      if ((!options || !options.stdio) && result.stderr && result.stderr.length > 0) {
+        globalThis.process.stderr.write(result.stderr);
+      }
+    }
+
+    /** The spawn-failure arm of node's checkExecSyncError (ETIMEDOUT, ENOBUFS,
+     *  ENOENT): the spawnSync error itself, with the whole result assigned
+     *  onto it so `err.stdout`/`stderr`/`status`/`output` are there too. */
+    function execSyncSpawnError(result) {
+      return Object.assign(result.error, result);
+    }
+
     function execSync(command, options) {
       const opts = Object.assign({ shell: true }, options);
       const result = spawnSync(command, [], opts);
-      if (result.error) throw result.error;
+      forwardSyncStderr(options, result);
+      if (result.error) throw execSyncSpawnError(result);
       if (result.status !== 0) throw execSyncError(result, command);
       return result.stdout;
     }
 
     function execFileSync(file, args, options) {
       const norm = normalizeArgs(file, args, options);
-      const result = spawnSync(norm.command, norm.args, norm.options);
-      if (result.error) throw result.error;
+      // The caller's OWN arguments go to spawnSync, which applies the
+      // self-spawn rewrite once. Handing it the already rewritten argv made
+      // its `userArgs` -- what a failed spawn reports as `spawnargs` -- the
+      // rewritten form.
+      const result = spawnSync(norm.command, norm.userArgs, norm.options);
+      forwardSyncStderr(norm.options, result);
+      if (result.error) throw execSyncSpawnError(result);
       // Same error shape as execSync -- including `output` -- since callers
-      // branch on it identically.
-      if (result.status !== 0) throw execSyncError(result, norm.command);
+      // branch on it identically. node's message names the file (argv0 when
+      // given) AND its arguments, space-joined.
+      if (result.status !== 0) {
+        throw execSyncError(
+          result,
+          [norm.options.argv0 || norm.command, ...norm.userArgs].join(" "),
+        );
+      }
       return result.stdout;
     }
 
     // Valid kill-signal names for child.kill(). Mirrors Node's
     // convertToValidSignal (lib/internal/util.js), which validates against the
-    // platform's libuv signal set: on win32 that set is the reduced list below
-    // (Node throws ERR_UNKNOWN_SIGNAL for SIGCONT/SIGSTOP/etc. there), on POSIX
-    // it is the set oam's native layer can actually deliver. Names are matched
-    // case-insensitively (Node uppercases before lookup). Unknown names must
-    // throw ERR_UNKNOWN_SIGNAL rather than fall back to SIGTERM.
-    const VALID_KILL_SIGNALS =
-      globalThis.__oam.node.platform === "win32"
-        ? new Set(["SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGABRT", "SIGFPE",
-                   "SIGKILL", "SIGSEGV", "SIGTERM", "SIGBREAK", "SIGWINCH"])
-        : new Set(["SIGHUP", "SIGINT", "SIGQUIT", "SIGABRT", "SIGKILL",
-                   "SIGUSR1", "SIGUSR2", "SIGTERM", "SIGCONT", "SIGSTOP"]);
+    // platform's signal set, `os.constants.signals`: on win32 that is the
+    // reduced eleven-name list (Node throws ERR_UNKNOWN_SIGNAL for
+    // SIGCONT/SIGSTOP/etc. there), on POSIX the full table, every name of
+    // which the native kill ops resolve (child_unix.rs signal_number is the
+    // same table). ONE source for the name path and the number path below:
+    // a second, narrower name list let a signal passed by NUMBER through to
+    // the native layer under a name the name path would have refused. Names
+    // are matched case-insensitively (Node uppercases before lookup). Unknown
+    // names must throw ERR_UNKNOWN_SIGNAL rather than fall back to SIGTERM.
+    const isKillSignalName = (name) =>
+      Object.prototype.hasOwnProperty.call(registry.get("os").constants.signals, name);
     // number -> name, built lazily from os.constants.signals -- the same
     // source node's getSignalsToNamesMapping reads. Kept as a map (not a
     // validity Set) because the native kill ops speak NAMES: forwarding the
@@ -37342,7 +40021,7 @@
         return name;
       }
       const name = String(signal).toUpperCase();
-      if (!VALID_KILL_SIGNALS.has(name)) throw new codes.ERR_UNKNOWN_SIGNAL(signal);
+      if (!isKillSignalName(name)) throw new codes.ERR_UNKNOWN_SIGNAL(signal);
       return name;
     }
 
@@ -37359,6 +40038,8 @@
         this.stderr = null;
         this._handle = null;
         this._exited = false;
+        // Set the moment a spawn is known to have failed (before 'error').
+        this._spawnFailed = false;
         this._extra = false;
         // A kill() issued before the native handle resolves parks here.
         this._pendingKill = null;
@@ -37367,7 +40048,21 @@
         // Validate BEFORE any handle/null branching so an unknown signal name
         // throws ERR_UNKNOWN_SIGNAL regardless of spawn state -- matching Node,
         // where convertToValidSignal runs first in ChildProcess.prototype.kill.
-        const sig = validateKillSignal(signal);
+        // Signal 0 is not a signal but node's liveness probe, and skips the
+        // name check there too (`sig === 0 ? sig : convertToValidSignal(sig)`).
+        const probe = signal === 0;
+        const sig = probe ? null : validateKillSignal(signal);
+        // node drops its handle when the child exits or never started, and
+        // kill() then returns false and leaves `killed` alone: nothing was
+        // signalled. Without this a kill after 'exit' reported true, and one
+        // on a child whose spawn failed parked below for good.
+        if (this._exited || this._spawnFailed) return false;
+        if (probe) {
+          // The child is running (or about to be, in the ipc bind window).
+          // node sets `killed` on any kill() its handle accepts, 0 included.
+          if (this._handle != null) this.killed = true;
+          return true;
+        }
         if (this._handle == null) {
           // node's spawn is synchronous, so this window does not exist there.
           // It does here for an ipc-bound child, whose channel must bind before
@@ -37477,6 +40172,10 @@
         // Exactly the child's environment, which replaces oam's own as node's
         // envPairs do: see childEnv.
         env: childEnv(opts.env, spawnArgv(norm)),
+        // The raw path honors `shell` as the plain one does: an argv0 or
+        // extra-fd spawn with `shell: true` runs through the platform shell,
+        // and one naming a shell runs that shell (shellSpawnPlan).
+        shell: shellSpawnPlan(norm).shell,
         detached: !!opts.detached,
         windowsHide: !!opts.windowsHide,
         argv0: opts.argv0 || undefined,
@@ -37494,7 +40193,8 @@
       }
       let info;
       try {
-        info = JSON.parse(natives.spawnExtra(norm.command, norm.args, nativeOpts, codes));
+        const plan = shellSpawnPlan(norm);
+        info = JSON.parse(natives.spawnExtra(plan.command, plan.args, nativeOpts, codes));
       } catch (err) {
         // Thrown, not emitted, for the codes node throws -- but only when this
         // runs inside spawn() itself. With an ipc slot it runs after the
@@ -37503,6 +40203,8 @@
         if (thrown) throw thrown;
         const target = spawnErrorTarget(norm);
         const e = spawnFailureError(err, target.file, target.args);
+        cp._spawnFailed = true;
+        cp._pendingKill = null;
         // An ipc channel bound for this child would otherwise keep listening
         // forever: 'exit' never fires for a child that never started.
         if (cp._ipcTeardown) cp._ipcTeardown();
@@ -37535,6 +40237,14 @@
             final(callback) {
               natives.spawnExtraCloseFd(cp._handle, fd);
               callback();
+            },
+            // destroy() without end() -- a pipeline error, or the caller
+            // giving up -- closes the pipe too, as the Readable below does:
+            // otherwise the child never sees EOF on this fd. After final()
+            // the end is already closed and this is a no-op.
+            destroy(err, callback) {
+              natives.spawnExtraCloseFd(cp._handle, fd);
+              callback(err);
             },
           });
           cp.stdio[fd] = w;
@@ -37597,9 +40307,26 @@
         cp._exited = true;
         cp.exitCode = result.code;
         cp.signalCode = result.signal;
-        cp.emit("exit", result.code, result.signal);
+        const emitExit = () => {
+          cp.emit("exit", result.code, result.signal);
+          // And after the ipc channel's 'disconnect', when there is one.
+          Promise.allSettled(cp._ipcClosed ? reads.concat(cp._ipcClosed) : reads).then(() => {
+            cp.emit("close", result.code, result.signal);
+          });
+        };
+        // With an ipc channel, once it has been read to the child's end
+        // (attachIpcChannel).
+        if (cp._ipcAfterExit) cp._ipcAfterExit(emitExit);
+        else emitExit();
+      }, (err) => {
+        // The wait itself failed, so the exit can no longer be observed.
+        // Reported on the child, then 'close', instead of an unhandled
+        // rejection and a child whose 'exit'/'close' never arrive.
+        cp._exited = true;
+        if (cp._ipcTeardown) cp._ipcTeardown();
+        cp.emit("error", err instanceof Error ? err : new Error(String(err)));
         Promise.allSettled(reads).then(() => {
-          cp.emit("close", result.code, result.signal);
+          cp.emit("close", null, null);
         });
       });
       };
@@ -37610,11 +40337,127 @@
       return cp;
     }
 
+    // The fork/spawn IPC channel's handshake. node's channel is a descriptor
+    // only the child inherits; oam's is a loopback listener, which is
+    // reachable by address. So the channel is bound to the child it was made
+    // for: the child is given a per-child random token in its environment,
+    // next to the port (`OAM_FORK_IPC_PORT=<port>:<token>`), and presents it
+    // as the first line. Only a connection that does becomes the channel; any
+    // other is closed and the listener keeps waiting for the child.
+    function newIpcToken() {
+      return registry.get("crypto").randomBytes(16).toString("hex");
+    }
+    function ipcTokenMatches(given, token) {
+      // Compared as bytes, and only at equal BYTE length: a line of the right
+      // character count holding a multi-byte character is a different byte
+      // length, which timingSafeEqual refuses by throwing -- inside a socket
+      // 'data' handler, where that would be an uncaught exception.
+      const a = Buffer.from(String(given), "utf8");
+      const b = Buffer.from(token, "utf8");
+      if (a.length !== b.length) return false;
+      return registry.get("crypto").timingSafeEqual(a, b);
+    }
+    /** Calls `onPeer(socket, rest)` once, for the first connection that
+     *  presents `token`; `rest` is whatever followed the token line in the
+     *  same read. The listener is closed at that point, not before. Returns a
+     *  function that drops the connections still waiting to present one. */
+    function acceptIpcPeer(ipcServer, token, onPeer) {
+      const waiting = new Set();
+      let graceTimer = null;
+      const endGrace = () => {
+        if (graceTimer !== null) {
+          clearTimeout(graceTimer);
+          graceTimer = null;
+        }
+      };
+      let accepted = false;
+      // Set by afterExit: called once, when the child is gone and it is
+      // settled that no connection of its will become the channel.
+      let noPeer = null;
+      const settleNoPeer = () => {
+        if (noPeer === null || accepted || waiting.size !== 0) return;
+        const report = noPeer;
+        noPeer = null;
+        report();
+      };
+      const dropWaiting = () => {
+        endGrace();
+        for (const s of waiting) {
+          try { s.destroy(); } catch (_) { /* already gone */ }
+        }
+        waiting.clear();
+        settleNoPeer();
+      };
+      // For the child's 'exit'. What the child wrote just before exiting --
+      // its token line and its last messages -- may still be unread on a
+      // connection already made, and dropping that connection at once would
+      // lose a `process.send(result)` followed by exit. So a connection that
+      // is still waiting gets a bounded time to present the token; one that
+      // reaches EOF first, or stays silent past it, is dropped. The timer is
+      // cleared as soon as nothing is waiting, so it never outlives them.
+      // `onNoPeer` is called if it ends with no channel made at all -- a
+      // child that never used its channel, or one whose connection never
+      // presented the token: at once with nothing waiting, else when the
+      // last waiting connection is dropped.
+      dropWaiting.afterExit = (onNoPeer) => {
+        if (accepted) { dropWaiting(); return; }
+        noPeer = onNoPeer;
+        if (waiting.size === 0) { dropWaiting(); return; }
+        if (graceTimer === null) graceTimer = setTimeout(dropWaiting, 1000);
+      };
+      ipcServer.on("connection", (socket) => {
+        if (accepted) { socket.destroy(); return; }
+        waiting.add(socket);
+        const drop = () => {
+          waiting.delete(socket);
+          try { socket.destroy(); } catch (_) { /* already gone */ }
+          if (waiting.size === 0) {
+            endGrace();
+            settleNoPeer();
+          }
+        };
+        let head = "";
+        socket.setEncoding("utf8");
+        const onData = (chunk) => {
+          head += chunk;
+          const nl = head.indexOf("\n");
+          if (nl === -1) {
+            // A token line is exactly token.length characters.
+            if (head.length > token.length) drop();
+            return;
+          }
+          if (accepted || !ipcTokenMatches(head.slice(0, nl), token)) { drop(); return; }
+          accepted = true;
+          socket.removeListener("data", onData);
+          socket.removeListener("error", drop);
+          socket.removeListener("close", drop);
+          socket.removeListener("end", drop);
+          waiting.delete(socket);
+          // One channel per child; stop accepting so the listener does not
+          // pin the parent's event loop open. (Already closed when the token
+          // arrives after the child's 'exit'.)
+          try { ipcServer.close(); } catch (_) { /* already closed */ }
+          dropWaiting();
+          onPeer(socket, head.slice(nl + 1));
+        };
+        socket.on("data", onData);
+        socket.on("error", drop);
+        socket.on("close", drop);
+        // EOF with no token line: nothing more can arrive on it.
+        socket.on("end", drop);
+      });
+      return dropWaiting;
+    }
+
     // The IPC half of fork(), reusable by spawn(stdio:[...,'ipc']). Binds a
     // loopback channel, hands the port to `launch` as an env override, and
     // wires send/disconnect/'message' onto `cp`. The bind is async, so a
     // child started this way resolves its pid one tick later than a plain
     // spawn -- the same property fork() already has.
+    // The longest a child's 'exit' waits for its channel to be over (see
+    // _ipcAfterExit): the child's own grace for this end to read to its EOF
+    // (oam_core::tcp::PEER_EOF_GRACE, 500 ms), and as much again.
+    const IPC_EXIT_HOLD_MS = 1000;
     function attachIpcChannel(cp, launch, ipcIndex) {
       let ipcSocket = null;
       const pendingSends = [];
@@ -37630,19 +40473,97 @@
           return false;
         }
         const line = JSON.stringify(message) + "\n";
-        if (ipcSocket) ipcSocket.write(line, "utf8", callback);
-        else pendingSends.push({ line, callback });
+        if (ipcSocket) {
+          if (peerHasClosed(ipcSocket)) failSendEpipe(callback);
+          else ipcSocket.write(line, "utf8", callback);
+        } else pendingSends.push({ line, callback });
         return true;
       };
 
+      // Before a write: take what the child has sent off the socket, and
+      // say whether its end of the channel is closed. node carries the
+      // channel on a pipe, where what the child wrote is the parent's to
+      // read however the child went. Here a write to a child that has exited
+      // is answered with a reset, and on Windows the reset discards what
+      // this end has not read yet -- the child's last message, when this
+      // process's loop was busy while the child sent it and exited. What the
+      // read-ahead took is the socket's next reads, in order
+      // (oam_core::tcp::tcp_read_ahead).
+      const peerHasClosed = (sock) =>
+        typeof sock._handle === "number" && natives.tcpReadAhead(sock._handle) === true;
+      // node's send() on a channel whose other end has gone: the write fails
+      // with ErrnoException(EPIPE, 'write'), to the callback when there is
+      // one, else as the child's 'error' -- and the messages the child sent
+      // before it went are still delivered.
+      const failSendEpipe = (callback) => {
+        let errno = -32;
+        for (const [number, entry] of uvErrnoTable(natives)) {
+          if (entry[0] === "EPIPE") { errno = number; break; }
+        }
+        const err = new Error("write EPIPE");
+        err.errno = errno;
+        err.code = "EPIPE";
+        err.syscall = "write";
+        if (typeof callback === "function") process.nextTick(callback, err);
+        else process.nextTick(() => cp.emit("error", err));
+      };
+
+      // 'disconnect' is emitted once per channel, whichever of disconnect(),
+      // the peer's EOF or a socket error gets there first.
+      let disconnectEmitted = false;
+      // The child's 'exit', held back until the channel is over (see
+      // _ipcAfterExit).
+      let exitAfterDisconnect = null;
+      let exitHoldTimer = null;
+      // 'close' follows 'disconnect', as node counts the channel among what
+      // 'close' waits for. Read by the 'exit' emitters.
+      let channelOver;
+      cp._ipcClosed = new Promise((resolve) => { channelOver = resolve; });
+      const releaseExit = () => {
+        if (exitHoldTimer !== null) {
+          clearTimeout(exitHoldTimer);
+          exitHoldTimer = null;
+        }
+        const emitExit = exitAfterDisconnect;
+        exitAfterDisconnect = null;
+        if (emitExit) emitExit();
+      };
+      const emitDisconnect = () => {
+        cp.connected = false;
+        if (disconnectEmitted) return;
+        disconnectEmitted = true;
+        channelOver();
+        try {
+          cp.emit("disconnect");
+        } finally {
+          releaseExit();
+        }
+      };
+      // Run `fn` once every write already handed to the socket has gone out,
+      // so a send() made just before the channel closes is still delivered.
+      const afterWrites = (sock, fn) => {
+        Promise.resolve(sock._chain).then(fn, fn);
+      };
+
       cp.disconnect = function disconnect() {
+        // On a channel already closed this is a no-op, and never a second
+        // 'disconnect'. node emits ERR_IPC_DISCONNECTED as an 'error' there;
+        // docs/node-divergences.md records the difference.
+        if (!cp.connected) return;
         cp.connected = false;
         if (ipcSocket) {
           const sock = ipcSocket;
           ipcSocket = null;
-          sock.destroy();
+          afterWrites(sock, () => {
+            try { sock.destroy(); } catch (_) { /* already gone */ }
+            emitDisconnect();
+          });
+        } else {
+          // No peer yet. The listener stays up until 'exit' so a child that
+          // connects later is answered -- it is sent what was queued and then
+          // closed (below) -- rather than refused.
+          emitDisconnect();
         }
-        cp.emit("disconnect");
       };
 
       const net = registry.get("net");
@@ -37658,17 +40579,37 @@
       const slot = ipcIndex ?? 3;
       if (Array.isArray(cp.stdio) && slot >= 3) cp.stdio[slot] = null;
 
-      ipcServer.on("connection", (socket) => {
+      const ipcToken = newIpcToken();
+      const dropWaitingPeers = acceptIpcPeer(ipcServer, ipcToken, (socket, rest) => {
+        const queued = pendingSends.splice(0, pendingSends.length);
+        // The child may be gone already, its messages unread behind the
+        // token: see peerHasClosed.
+        if (queued.length !== 0 && peerHasClosed(socket)) {
+          for (const p of queued) failSendEpipe(p.callback);
+        } else {
+          for (const p of queued) socket.write(p.line, "utf8", p.callback);
+        }
+        if (disconnectEmitted) {
+          // disconnect() ran before the child connected: what send() queued
+          // ahead of it has just gone out, and the channel closes behind it.
+          socket.on("error", () => {});
+          afterWrites(socket, () => {
+            try { socket.destroy(); } catch (_) { /* already gone */ }
+          });
+          return;
+        }
         ipcSocket = socket;
-        // One channel per child; stop accepting so the listener does not pin
-        // the parent's event loop open.
-        ipcServer.close();
-        for (const p of pendingSends) socket.write(p.line, "utf8", p.callback);
-        pendingSends.length = 0;
+        // After 'exit' the channel is no longer writable (`ipcSocket` is
+        // cleared) but it is still READ, to the child's EOF: see the 'exit'
+        // handler below.
+        const release = () => {
+          if (ipcSocket === socket) ipcSocket = null;
+          try { socket.destroy(); } catch (_) { /* already gone */ }
+          emitDisconnect();
+        };
 
         let buf = "";
-        socket.setEncoding("utf8");
-        socket.on("data", (chunk) => {
+        const onChunk = (chunk) => {
           buf += chunk;
           let nl;
           while ((nl = buf.indexOf("\n")) !== -1) {
@@ -37678,18 +40619,18 @@
               cp.emit("message", JSON.parse(line));
             } catch (_) { /* ignore malformed */ }
           }
-        });
-        socket.on("end", () => {
-          cp.connected = false;
-          cp.emit("disconnect");
-        });
-        socket.on("error", () => {
-          cp.connected = false;
-        });
+        };
+        socket.on("data", onChunk);
+        // The channel is over at the peer's EOF or at a socket error, and
+        // either one is a 'disconnect', as under node.
+        socket.on("end", release);
+        socket.on("error", release);
+        // Messages that arrived in the same read as the token line.
+        if (rest) onChunk(rest);
       });
 
       ipcServer.listen(0, "127.0.0.1", () => {
-        launch({ OAM_FORK_IPC_PORT: String(ipcServer.address().port) });
+        launch({ OAM_FORK_IPC_PORT: `${ipcServer.address().port}:${ipcToken}` });
       });
 
       // Never leave the listener or socket holding the loop open. Exposed on
@@ -37699,6 +40640,7 @@
       // would swallow node's throw-on-unhandled-'error'.
       cp._ipcTeardown = () => {
         try { ipcServer.close(); } catch (_) { /* already closed */ }
+        dropWaitingPeers();
         // Unconditional: on the FAILED-spawn path -- the case this was added
         // for -- no socket ever connected, so gating this on `ipcSocket` left
         // `connected` true. cp.send() then kept returning true and queueing
@@ -37709,22 +40651,72 @@
           ipcSocket = null;
           try { sock.destroy(); } catch (_) { /* already gone */ }
         }
-        // Settle anything queued before the channel died; node delivers EPIPE
-        // to a send callback on a closed channel rather than dropping it.
-        if (pendingSends.length > 0) {
-          const queued = pendingSends.splice(0, pendingSends.length);
-          for (const p of queued) {
-            if (p.callback) {
-              const err = new Error("channel closed");
-              err.code = "EPIPE";
-              p.callback(err);
-            }
+        failPendingSends();
+      };
+      // Settle anything queued before the channel died; node delivers EPIPE
+      // to a send callback on a closed channel rather than dropping it.
+      function failPendingSends() {
+        if (pendingSends.length === 0) return;
+        const queued = pendingSends.splice(0, pendingSends.length);
+        for (const p of queued) {
+          if (p.callback) {
+            const err = new Error("channel closed");
+            err.code = "EPIPE";
+            p.callback(err);
           }
         }
+      }
+      // The child is gone -- this is called with what emits its 'exit' (and
+      // then 'close') -- but what it sent just before exiting may still be
+      // unread: a child that does `process.send(result)` and exits. So the
+      // channel is not destroyed here -- a read that lands after destroy() is
+      // discarded -- only closed for writing; it is read to the child's EOF,
+      // as node reads its channel, and the socket's own 'end' / 'error'
+      // (above) release it and emit 'disconnect'.
+      //
+      // 'exit' waits for that 'disconnect', for at most IPC_EXIT_HOLD_MS.
+      // The child does not wait: its exit waits for its messages to be in
+      // this process's kernel, not for them to be read here
+      // (oam_core::tcp::tcp_settle_lingering), so the exit can be collected
+      // with the channel still unread -- always, when this process blocked
+      // its loop meanwhile. Emitted at once, 'exit' and 'close' would then
+      // come ahead of the child's last messages and of 'disconnect'; node's
+      // 'close' follows 'disconnect', and its 'exit' does whenever the
+      // parent's loop is running. When the channel is the child's own
+      // connection, its end closed with the child, so this end reads its
+      // EOF (or its reset) as soon as it reads, well inside the bound. The
+      // bound is for a channel that is NOT the child's own: one made by a
+      // process the child handed OAM_FORK_IPC_PORT to (a launcher that
+      // starts oam and exits). That process may keep it open for as long as
+      // it lives, and node emits 'exit' when the direct child exits whatever
+      // the channel is doing; only 'close' waits for 'disconnect' there, as
+      // it does here (cp._ipcClosed).
+      cp._ipcAfterExit = (emitExit) => {
+        try { ipcServer.close(); } catch (_) { /* already closed */ }
+        // Not dropped at once: see acceptIpcPeer's afterExit. A child that
+        // never opened its channel has closed it by exiting, and that is a
+        // 'disconnect' too, as under node (which emits it for a child that
+        // never touched process.send).
+        dropWaitingPeers.afterExit(emitDisconnect);
+        cp.connected = false;
+        failPendingSends();
+        if (ipcSocket) {
+          const sock = ipcSocket;
+          ipcSocket = null;
+          afterWrites(sock, () => {
+            // The FIN is a write too: to a child that is gone it draws the
+            // reset that discards what is unread (peerHasClosed).
+            peerHasClosed(sock);
+            try { sock.end(); } catch (_) { /* already gone */ }
+          });
+        }
+        if (disconnectEmitted) {
+          emitExit();
+        } else {
+          exitAfterDisconnect = emitExit;
+          exitHoldTimer = setTimeout(releaseExit, IPC_EXIT_HOLD_MS);
+        }
       };
-      cp.on("exit", () => {
-        cp._ipcTeardown();
-      });
     }
 
     // Resolve once a child's stdio Readable has actually FINISHED, for the
@@ -37812,17 +40804,22 @@
       // native registry than the raw child an argv0 spawn registers in, so a
       // plain-path argv0 child came back as "unknown child handle". Gated on
       // the same platforms the extra-fd branch trusts.
+      //
+      // With an 'ipc' slot too, POSIX stays on the plain path, whose native
+      // spawn carries argv0 itself (Command::arg0). Windows cannot: the plain
+      // native spawn has no way to set the command line's first token, so the
+      // argv0 + 'ipc' shape goes through the raw path as well, with the same
+      // channel wiring the extra-fd branch below uses.
       if (
         opts.argv0 &&
-        !wantsIpc &&
         (natives.platform === "win32" ||
-          natives.platform === "linux" ||
-          natives.platform === "darwin")
+          (!wantsIpc &&
+            (natives.platform === "linux" || natives.platform === "darwin")))
       ) {
         let arr = stdioSpec;
         if (typeof arr === "string") arr = [arr, arr, arr];
         if (!Array.isArray(arr)) arr = ["pipe", "pipe", "pipe"];
-        return spawnExtra(norm, arr, false, -1);
+        return spawnExtra(norm, arr, wantsIpc, ipcIndex);
       }
       // Extra-fd stdio (Chromium CDP pipe): an array with >3 entries routes to
       // the raw extra-fd spawn (CreateProcessW+lpReserved2 on Windows, Command+
@@ -37879,7 +40876,7 @@
         // Exactly the child's environment, which replaces oam's own as node's
         // envPairs do: see childEnv.
         env: childEnv(opts.env, spawnArgv(norm)),
-        shell: !!opts.shell,
+        shell: shellSpawnPlan(norm).shell,
         // Windows: a non-detached child joins the kill-on-close job and dies
         // with this process, as under node; a detached one is left out.
         detached: !!opts.detached,
@@ -37924,7 +40921,8 @@
       }
       let info;
       try {
-        info = JSON.parse(natives.spawnAsync(norm.command, norm.args, nativeOpts));
+        const plan = shellSpawnPlan(norm);
+        info = JSON.parse(natives.spawnAsync(plan.command, plan.args, nativeOpts));
       } catch (err) {
         // Thrown, not emitted, for the codes node throws -- but only when this
         // runs inside spawn() itself (see spawnExtra). fork() has the same
@@ -37932,6 +40930,8 @@
         const thrown = wantsIpc ? null : spawnThrownError(err);
         if (thrown) throw thrown;
         info = null;
+        cp._spawnFailed = true;
+        cp._pendingKill = null;
         queueMicrotask(() => handleSpawnFailure(err));
       }
       if (info) {
@@ -37953,14 +40953,28 @@
           cp._exited = true;
           cp.exitCode = result.code;
           cp.signalCode = result.signal;
-          cp.emit("exit", result.code, result.signal);
-          // Node fires 'close' only AFTER the stdio streams reach EOF, not
-          // merely when the process exits. Wait for both read loops so a
-          // 'data' listener attached in the 'spawn' handler still sees all
-          // output before 'close' -- otherwise stdout capture races the
-          // close emit and is intermittently empty.
+          const emitExit = () => {
+            cp.emit("exit", result.code, result.signal);
+            // Node fires 'close' only AFTER the stdio streams reach EOF, not
+            // merely when the process exits. Wait for both read loops so a
+            // 'data' listener attached in the 'spawn' handler still sees all
+            // output before 'close' -- otherwise stdout capture races the
+            // close emit and is intermittently empty.
+            Promise.allSettled(cp._ipcClosed ? pumps.concat(cp._ipcClosed) : pumps).then(() => {
+              cp.emit("close", result.code, result.signal);
+            });
+          };
+          // With an ipc channel, once it has been read to the child's end
+          // (attachIpcChannel).
+          if (cp._ipcAfterExit) cp._ipcAfterExit(emitExit);
+          else emitExit();
+        }, (err) => {
+          // A failed wait: see spawnExtra's.
+          cp._exited = true;
+          if (cp._ipcTeardown) cp._ipcTeardown();
+          cp.emit("error", err instanceof Error ? err : new Error(String(err)));
           Promise.allSettled(pumps).then(() => {
-            cp.emit("close", result.code, result.signal);
+            cp.emit("close", null, null);
           });
         });
         });
@@ -38025,6 +41039,8 @@
         options = {};
       }
       const opts = Object.assign({ shell: true }, options);
+      // Validated before anything is spawned, as node's execFile does.
+      resolveMaxBuffer(opts, false);
       // node's exec/execFile hand spawn an explicit option WHITELIST (cwd, env,
       // gid, shell, signal, uid, windowsHide, windowsVerbatimArguments) and drop
       // `stdio` on the floor -- exec owns the pipes, because collecting stdout
@@ -38055,7 +41071,7 @@
     function collectExec(cp, command, opts, callback) {
       const stdout = [];
       const stderr = [];
-      const maxBuffer = opts.maxBuffer || 50 * 1024 * 1024;
+      const maxBuffer = resolveMaxBuffer(opts, false);
       let stdoutLen = 0;
       let stderrLen = 0;
       let maxBufferError = null;
@@ -38064,8 +41080,8 @@
       let timedOut = false;
 
       // Running totals, NOT Buffer.concat(...).length per chunk: concatenating
-      // everything accumulated so far on every chunk is quadratic, and at the
-      // 50MB default that is gigabytes of copying for one noisy command. node
+      // everything accumulated so far on every chunk is quadratic, and under a
+      // large maxBuffer that is gigabytes of copying for one noisy command. node
       // keeps the same two counters.
       //
       // On overflow node delivers EXACTLY maxBuffer bytes: the chunk that
@@ -38194,8 +41210,12 @@
       // and shelling out re-splits arguments on whitespace (so a path or value
       // containing a space breaks) and EXECUTES shell metacharacters that
       // happen to appear inside an argument. `shell` stays honored if the
-      // caller explicitly asks for one, which node also supports.
-      const spawnOpts = Object.assign({}, opts, { shell: !!opts.shell });
+      // caller explicitly asks for one, which node also supports -- by name
+      // too: a string `shell` reaches spawn as the string (shellSpawnPlan).
+      resolveMaxBuffer(opts, false);
+      const spawnOpts = Object.assign({}, opts, {
+        shell: typeof opts.shell === "string" ? opts.shell : !!opts.shell,
+      });
       // Same whitelist as exec(): none of stdio, detached or argv0 reaches
       // spawn, and windowsHide arrives as a boolean.
       delete spawnOpts.stdio;
@@ -38316,55 +41336,19 @@
       cp.stdin = null;
       cp.stdio = [null, cp.stdout, cp.stderr, null];
 
-      let ipcSocket = null;
-      const pendingSends = [];
-
-      cp.send = function send(message, _sendHandle, _options, callback) {
-        if (typeof _sendHandle === "function") { callback = _sendHandle; }
-        else if (typeof _options === "function") { callback = _options; }
-        if (!cp.connected) {
-          const err = new Error("channel closed");
-          err.code = "ERR_IPC_CHANNEL_CLOSED";
-          if (callback) callback(err);
-          return false;
-        }
-        const line = JSON.stringify(message) + "\n";
-        if (ipcSocket) {
-          ipcSocket.write(line, "utf8", callback);
-        } else {
-          pendingSends.push({ line, callback });
-        }
-        return true;
-      };
-
-      cp.disconnect = function disconnect() {
-        cp.connected = false;
-        if (ipcSocket) {
-          var sock = ipcSocket;
-          ipcSocket = null;
-          sock._chain.then(function() {
-            sock.destroy();
-            cp.emit("disconnect");
-          });
-        } else {
-          cp.emit("disconnect");
-        }
-      };
+      // The channel itself -- send, disconnect, 'message', the listener and its
+      // teardown -- is attachIpcChannel's, the one spawn(stdio:[...,'ipc'])
+      // uses; fork only supplies the launch (at the end of this function).
 
       // Taken now, as node's fork() takes it, not when the channel is bound.
       const baseEnv = childEnv(
         opts.env,
         [execPath, ...execArgv, "run", String(modulePath), "--no-check", "--", ...args],
       );
-      const net = registry.get("net");
-      const ipcServer = net.createServer();
-
-      ipcServer.listen(0, "127.0.0.1", () => {
-        const ipcPort = ipcServer.address().port;
-
-        const forkEnv = Object.assign(Object.create(null), baseEnv, {
-          OAM_FORK_IPC_PORT: String(ipcPort),
-        });
+      // Runs once the channel's listener is bound; `ipcEnv` carries its port
+      // and per-child token (see acceptIpcPeer).
+      const launch = (ipcEnv) => {
+        const forkEnv = Object.assign(Object.create(null), baseEnv, ipcEnv);
 
         const spawnArgs = execArgv.concat(["run", String(modulePath), "--no-check", "--"]).concat(args);
         const nativeOpts = {
@@ -38378,45 +41362,16 @@
           windowsHide: !!opts.windowsHide,
         };
 
-        ipcServer.on("connection", (socket) => {
-          ipcSocket = socket;
-          ipcServer.close();
-
-          for (const p of pendingSends) {
-            socket.write(p.line, "utf8", p.callback);
-          }
-          pendingSends.length = 0;
-
-          let buf = "";
-          socket.setEncoding("utf8");
-          socket.on("data", (chunk) => {
-            buf += chunk;
-            let nl;
-            while ((nl = buf.indexOf("\n")) !== -1) {
-              const line = buf.slice(0, nl);
-              buf = buf.slice(nl + 1);
-              try {
-                const msg = JSON.parse(line);
-                cp.emit("message", msg);
-              } catch (_) { /* ignore malformed */ }
-            }
-          });
-          socket.on("end", () => {
-            cp.connected = false;
-            cp.emit("disconnect");
-          });
-          socket.on("error", () => {
-            cp.connected = false;
-          });
-        });
-
         // Synchronous spawn (node parity: fork() also yields a live pid
         // immediately). Everything after stays async.
         let info = null;
         try {
           info = JSON.parse(natives.spawnAsync(execPath, spawnArgs, nativeOpts));
         } catch (err) {
-          ipcServer.close();
+          // Closes the listener and settles every queued send callback.
+          cp._ipcTeardown();
+          cp._spawnFailed = true;
+          cp._pendingKill = null;
           // Same Node-shaped error as spawn()/spawnExtra(): this catch was
           // missed when the others were converted, so a failed fork still
           // surfaced the raw native JSON body with err.code undefined.
@@ -38487,23 +41442,29 @@
             cp._exited = true;
             cp.exitCode = result.code;
             cp.signalCode = result.signal;
-            ipcServer.close();
-            if (ipcSocket) {
-              var sock = ipcSocket;
-              ipcSocket = null;
-              sock._chain.then(function() { sock.end(); });
-            }
-            cp.connected = false;
-            cp.emit("exit", result.code, result.signal);
-            // 'close' waits for stdio EOF, not just process exit (Node parity;
-            // see spawn() above -- avoids the stdout-capture race on 'close').
+            // 'exit' once the channel has been read to the child's end
+            // (attachIpcChannel's _ipcAfterExit).
+            cp._ipcAfterExit(() => {
+              cp.emit("exit", result.code, result.signal);
+              // 'close' waits for stdio EOF, not just process exit (Node parity;
+              // see spawn() above -- avoids the stdout-capture race on 'close').
+              Promise.allSettled(cp._ipcClosed ? pumps.concat(cp._ipcClosed) : pumps).then(() => {
+                cp.emit("close", result.code, result.signal);
+              });
+            });
+          }, (err) => {
+            // A failed wait: see spawnExtra's.
+            cp._exited = true;
+            cp._ipcTeardown();
+            cp.emit("error", err instanceof Error ? err : new Error(String(err)));
             Promise.allSettled(pumps).then(() => {
-              cp.emit("close", result.code, result.signal);
+              cp.emit("close", null, null);
             });
           });
           });
         }
-      });
+      };
+      attachIpcChannel(cp, launch, 3);
 
       return cp;
     }
@@ -38524,7 +41485,10 @@
   registry.factories.cluster = (natives) => {
     const EventEmitter = registry.get("events");
 
-    const _isWorker = natives.clusterIsWorker();
+    // The worker id was taken out of the environment at startup
+    // (installRuntimeGlobals), so it is read from there, not process.env.
+    const _workerId = registry.clusterWorkerId;
+    const _isWorker = _workerId !== undefined;
 
     let _nextId = 1;
 
@@ -38577,7 +41541,7 @@
         this.schedulingPolicy = this.SCHED_NONE;
         if (_isWorker) {
           this.worker = new Worker(
-            parseInt(process.env.OAM_CLUSTER_WORKER, 10) || 0,
+            parseInt(_workerId, 10) || 0,
             -1,
             process.pid,
           );
@@ -38679,16 +41643,33 @@
       constructor(type, listener) {
         super();
         this._type = type || "udp4";
+        // The type picks the family of everything left unsaid: the wildcard
+        // bind() binds and the loopback send() targets.
+        this._ipv6 = this._type === "udp6";
         this._handle = null;
         this._bound = false;
+        // A bind is in flight: udpBind has been called and not yet settled.
+        this._binding = false;
+        // Sends (and a close) made while the bind is in flight; node's
+        // `state.queue`. Run in order once the socket is bound.
+        this._queue = [];
         this._closed = false;
         this._recvLoop = false;
-        this._address = { address: "0.0.0.0", family: "IPv4", port: 0 };
+        this._address = this._ipv6
+          ? { address: "::", family: "IPv6", port: 0 }
+          : { address: "0.0.0.0", family: "IPv4", port: 0 };
         if (typeof listener === "function") this.on("message", listener);
       }
 
       bind(...args) {
-        let port = 0, address = "0.0.0.0", cb;
+        // node: a closed socket is "not running", and a socket binds once --
+        // a second bind(), while the first is in flight or after it, throws.
+        // Without the in-flight half, two back-to-back auto-binding send()s
+        // each bound a native socket and the second replaced the first.
+        if (this._closed) throw new codes.ERR_SOCKET_DGRAM_NOT_RUNNING();
+        if (this._bound || this._binding) throw new codes.ERR_SOCKET_ALREADY_BOUND();
+        const wildcard = this._ipv6 ? "::" : "0.0.0.0";
+        let port = 0, address = wildcard, cb;
         if (typeof args[0] === "number") {
           port = args[0];
           if (typeof args[1] === "string") address = args[1];
@@ -38696,7 +41677,7 @@
         } else if (typeof args[0] === "object" && args[0] !== null) {
           const opts = args[0];
           port = opts.port || 0;
-          address = opts.address || "0.0.0.0";
+          address = opts.address || wildcard;
           if (typeof args[1] === "function") cb = args[1];
         } else if (typeof args[0] === "function") {
           cb = args[0];
@@ -38704,8 +41685,18 @@
 
         if (cb) this.once("listening", cb);
 
-        natives.udpBind(address, port).then((result) => {
-          if (this._closed) return;
+        // Marked in flight only once the op is under way: it refuses an
+        // ungranted address by throwing, which leaves the socket unbound.
+        const binding = natives.udpBind(address, port);
+        this._binding = true;
+        binding.then((result) => {
+          this._binding = false;
+          if (this._closed) {
+            // close() ran while the bind was in flight and had no handle to
+            // close; the socket this bind just registered is closed here.
+            natives.udpClose(result.handle);
+            return;
+          }
           this._handle = result.handle;
           this._bound = true;
           this._address = {
@@ -38715,7 +41706,19 @@
           };
           this.emit("listening");
           this._startRecv();
+          // What was queued behind the bind, in order. A queued send goes out
+          // a tick later (node's takes a lookup step first), so a close()
+          // queued behind it closes first and the send is dropped, as
+          // measured on node v22.22.2 for `s.send(...); s.close()`.
+          const queued = this._queue.splice(0, this._queue.length);
+          for (const run of queued) run();
         }).catch((err) => {
+          if (this._binding) {
+            // The bind itself failed: the socket is unbound again, and what
+            // waited on it is dropped, as node clears its queue then.
+            this._binding = false;
+            this._queue.length = 0;
+          }
           this.emit("error", err);
         });
 
@@ -38747,6 +41750,8 @@
         //   send(msg, offset, length, port, address, callback)
         //   send(msg, port, address, callback)
         let offset, length, port, address, cb;
+        // node's default destination: the loopback of the socket's family.
+        const loopback = this._ipv6 ? "::1" : "127.0.0.1";
 
         if (typeof args[0] === "number" && typeof args[1] === "number" &&
             typeof args[2] === "number") {
@@ -38754,12 +41759,12 @@
           offset = args[0];
           length = args[1];
           port = args[2];
-          address = typeof args[3] === "string" ? args[3] : "127.0.0.1";
+          address = typeof args[3] === "string" ? args[3] : loopback;
           cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : undefined;
         } else {
           // send(msg, port, address, callback)
           port = args[0];
-          address = typeof args[1] === "string" ? args[1] : "127.0.0.1";
+          address = typeof args[1] === "string" ? args[1] : loopback;
           cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : undefined;
           offset = 0;
           length = undefined;
@@ -38783,6 +41788,11 @@
         // (#163: 65536 was sent to 65535 and 1.5 to 1).
         port = validatePort(port, "Port", false);
 
+        // node's healthCheck: a closed socket is not running, and send()
+        // throws rather than auto-binding a socket nothing would ever close
+        // and leaving the callback unsettled.
+        if (this._closed) throw new codes.ERR_SOCKET_DGRAM_NOT_RUNNING();
+
         if (offset !== undefined && offset !== 0 || length !== undefined) {
           data = data.slice(offset || 0, length !== undefined ? (offset || 0) + length : undefined);
         }
@@ -38792,6 +41802,11 @@
           // (ERR_ACCESS_DENIED); run it inside the executor so that reaches
           // the callback or 'error' like any other send failure, instead of
           // escaping send() or the auto-bind's 'listening' listener.
+          //
+          // A send that waited behind the bind and finds the socket closed
+          // is dropped without a callback, as node drops it ("handle has
+          // been closed in the mean time").
+          if (this._closed || this._handle === null) return;
           new Promise((resolve) => {
             resolve(natives.udpSend(this._handle, data, String(address), port));
           }).then((result) => {
@@ -38802,16 +41817,34 @@
           });
         };
 
-        if (!this._bound) {
-          // Auto-bind like Node does when sending without bind
-          this.bind(0, () => doSend());
-        } else {
+        if (this._bound) {
           doSend();
+          return;
+        }
+        // Unbound: queue behind the ONE bind -- an explicit bind() still in
+        // flight, or the auto-bind node does on a first send. A second send
+        // made before that bind settles joins the queue instead of binding
+        // a socket of its own.
+        this._queue.push(() => process.nextTick(doSend));
+        if (!this._binding) {
+          try {
+            this.bind(0);
+          } catch (err) {
+            // The bind never started, so nothing will run the queue.
+            this._queue.length = 0;
+            throw err;
+          }
         }
       }
 
       close(cb) {
         if (this._closed) return this;
+        if (this._binding && this._queue.length > 0) {
+          // node: a close() behind queued sends waits its turn in the queue
+          // (the bind completes and 'listening' fires first).
+          this._queue.push(() => this.close(cb));
+          return this;
+        }
         this._closed = true;
         if (this._handle !== null) {
           natives.udpClose(this._handle);
@@ -38947,6 +41980,14 @@
     // promises API and the Resolver class all inherit the same shaped error --
     // dns.promises.lookup() used to hand back the bare op error because it
     // returned the native promise straight to the caller.
+    //
+    // `flags` are dns.lookup's hints: AI_ADDRCONFIG, AI_V4MAPPED and AI_ALL go
+    // to getaddrinfo with the family, as node's do, so the answer is the
+    // platform resolver's own -- glibc answers a name with both `::1` and
+    // `127.0.0.1` in /etc/hosts under V4MAPPED | ALL with the mapped
+    // address twice, and node reports both; emulating the flags over an
+    // unflagged lookup answered it once (case 228 on the linux leg), and
+    // ADDRCONFIG was dropped here up to 0.18.0 (#165).
     function _dnsLookup(hostname, family, all, flags = 0, order = "verbatim") {
       const host = String(hostname);
       // node answers an IP literal itself, as written (no resolver, no
@@ -39001,22 +42042,6 @@
     // shared with net's default for a connect); read when node:dns loads.
     const { ADDRCONFIG, V4MAPPED, ALL } = dnsHintFlags();
 
-    // node lib/dns.js lookup: a bad `options.hints` throws (validateDnsHints).
-    function lookupHints(opts) {
-      return validateDnsHints(opts.hints);
-    }
-
-    // dns.lookup with its hints: AI_ADDRCONFIG, AI_V4MAPPED and AI_ALL go to
-    // getaddrinfo with the family, as node's do, so the answer is the
-    // platform resolver's own -- glibc answers a name with both `::1` and
-    // `127.0.0.1` in /etc/hosts under V4MAPPED | ALL with the mapped
-    // address twice, and node reports both; emulating the flags over an
-    // unflagged lookup answered it once (case 228 on the linux leg), and
-    // ADDRCONFIG was dropped here up to 0.18.0 (#165).
-    function _dnsLookupHinted(hostname, family, all, hints, order) {
-      return _dnsLookup(hostname, family, all, hints, order);
-    }
-
     // node's internal/dns/utils emitInvalidHostnameWarning: DEP0118 for a
     // falsy hostname, once per process across dns.lookup and
     // dns.promises.lookup. It goes through process.emitWarning, so
@@ -39059,7 +42084,8 @@
       }
       checkCallback();
       const opts = options || {};
-      const hints = lookupHints(opts);
+      // node lib/dns.js lookup: a bad `options.hints` throws.
+      const hints = validateDnsHints(opts.hints);
       if (!namedFamilies && typeof opts.family === "string") {
         throw codes.ERR_INVALID_ARG_VALUE("options.family", opts.family, "must be one of: 0, 4, 6");
       }
@@ -39118,7 +42144,7 @@
         return {};
       }
 
-      _dnsLookupHinted(hostname, family, all, hints, order).then(
+      _dnsLookup(hostname, family, all, hints, order).then(
         (result) => {
           if (all) {
             callback(null, result);
@@ -39420,7 +42446,7 @@
           warnInvalidHostname(hostname);
           return Promise.resolve(all ? [] : { address: null, family: family === 6 ? 6 : 4 });
         }
-        return _dnsLookupHinted(hostname, family, all, hints, order);
+        return _dnsLookup(hostname, family, all, hints, order);
       },
       lookupService(address, port) {
         if (arguments.length !== 2) throw new codes.ERR_MISSING_ARGS("address", "port");
@@ -39692,6 +42718,21 @@
   // internal/errors -- some packages (readable-stream, undici) import this
   registry.factories["internal/errors"] = () => ({ codes, AbortError: globalThis.__oamAbortError });
 
+  // internal/oam/fetch (--expose-internals only) -- fetch through one of
+  // the runtime's own entries, so that oam's own tests can drive the
+  // `__oam*` knobs (a streamed request body, ...) that globalThis.fetch
+  // ignores. A program run without the flag cannot reach it: the resolver
+  // refuses the specifier, and this factory refuses a load through the
+  // registry too unless the process itself was started with the flag. Only
+  // the main thread's environment says that: a Worker's is whatever its
+  // `env` option gave it.
+  registry.factories["internal/oam/fetch"] = (natives) => {
+    if (!(natives.workerIsMainThread() && natives.env().OAM_EXPOSE_INTERNALS === "1")) {
+      throw new Error("Cannot find module 'internal/oam/fetch'");
+    }
+    return Object.freeze({ fetch: oamFetchInternal.internalFetch });
+  };
+
   // internal/assert/myers_diff (--expose-internals) -- the SAME port that
   // produces oam's real assert diffs, published under node's internal id.
   // Registering it here short-circuits the internal/* vendor path in
@@ -39842,27 +42883,69 @@
   // is finished writing (or the pump stopped); the owner ends the socket.
   // `stop()` detaches from the socket and closes the pipe, which the
   // consumer reads as the peer closing; the socket's 'close' stops it too.
+  // The two halves of every stream <-> tlsPipe pump (pipeSocket here, and
+  // the tls factory's pumpTlsPipe), which used to be written out twice.
+  //
+  // pipePumpIn: the 'data' and 'end' listeners that feed the stream's bytes
+  // into pipe `id`, in order. The stream is paused while a chunk is still
+  // going in and resumed after it, unless `live()` says the pump is over or
+  // the stream is destroyed. `end` is idempotent (one owner hears both 'end'
+  // and 'close' with it).
+  function pipePumpIn(stream, id, live) {
+    var natives = globalThis.__oam.node;
+    var tail = Promise.resolve();
+    var ended = false;
+    return {
+      data: function (chunk) {
+        var bytes = typeof chunk === "string" ? globalThis.Buffer.from(chunk, "latin1") : chunk;
+        if (typeof stream.pause === "function") stream.pause();
+        tail = tail
+          .then(function () { return natives.tlsPipeIn(id, bytes); })
+          .then(function () {
+            if (live() && !stream.destroyed && typeof stream.resume === "function") stream.resume();
+          }, function () {});
+      },
+      end: function () {
+        if (ended) return;
+        ended = true;
+        tail = tail
+          .then(function () { return natives.tlsPipeInEnd(id); })
+          .then(function () {}, function () {});
+      },
+    };
+  }
+  // pipePumpOut: writes what pipe `id` produces to the stream, taking the
+  // next bytes only once the stream accepted the last. It ends by calling
+  // `done(finished)` exactly once: `finished` true when the pipe's producer
+  // is done writing, false when the pump stopped first (`live()` false, a
+  // failed write, a failed read of the pipe).
+  function pipePumpOut(stream, id, live, done) {
+    var natives = globalThis.__oam.node;
+    var next = function () {
+      natives.tlsPipeOut(id).then(function (bytes) {
+        if (!live()) return done(false);
+        if (bytes === undefined) return done(true);
+        stream.write(
+          globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+          function (err) {
+            if (err) done(false);
+            else next();
+          },
+        );
+      }, function () { done(false); });
+    };
+    next();
+  }
+
   function pipeSocket(socket) {
     var natives = globalThis.__oam.node;
     var id = natives.tlsPipeOpen();
     var stopped = false;
-    var inTail = Promise.resolve();
     var resolveOut;
     var outDone = new Promise(function (resolve) { resolveOut = resolve; });
-    var onData = function (chunk) {
-      var bytes = typeof chunk === "string" ? globalThis.Buffer.from(chunk, "latin1") : chunk;
-      if (typeof socket.pause === "function") socket.pause();
-      inTail = inTail
-        .then(function () { return natives.tlsPipeIn(id, bytes); })
-        .then(function () {
-          if (!stopped && !socket.destroyed && typeof socket.resume === "function") socket.resume();
-        }, function () {});
-    };
-    var onEnd = function () {
-      inTail = inTail
-        .then(function () { return natives.tlsPipeInEnd(id); })
-        .then(function () {}, function () {});
-    };
+    var pumpIn = pipePumpIn(socket, id, function () { return !stopped; });
+    var onData = pumpIn.data;
+    var onEnd = pumpIn.end;
     var stop = function () {
       if (stopped) return;
       stopped = true;
@@ -39875,27 +42958,17 @@
     socket.on("data", onData);
     socket.on("end", onEnd);
     socket.on("close", stop);
-    var pumpOut = function () {
-      natives.tlsPipeOut(id).then(function (bytes) {
-        // A socket already ended for writing -- the peer's FIN ends it, its
-        // allowHalfOpen being off -- takes nothing more: what the session
-        // still has to say (an h2 GOAWAY in answer to the peer's) has no
-        // one to go to, and writing it would fail the socket, and with it
-        // the session, with ERR_STREAM_WRITE_AFTER_END.
-        if (bytes === undefined || stopped || socket.destroyed || socket.writableEnded) {
-          resolveOut();
-          return;
-        }
-        socket.write(
-          globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
-          function (err) {
-            if (err) resolveOut();
-            else pumpOut();
-          },
-        );
-      }, function () { resolveOut(); });
-    };
-    pumpOut();
+    // A socket already ended for writing -- the peer's FIN ends it, its
+    // allowHalfOpen being off -- takes nothing more: what the session
+    // still has to say (an h2 GOAWAY in answer to the peer's) has no
+    // one to go to, and writing it would fail the socket, and with it
+    // the session, with ERR_STREAM_WRITE_AFTER_END.
+    pipePumpOut(
+      socket,
+      id,
+      function () { return !stopped && !socket.destroyed && !socket.writableEnded; },
+      function () { resolveOut(); },
+    );
     return { id: id, outDone: outDone, stop: stop };
   }
   registry._pipeSocket = pipeSocket;
@@ -40809,7 +43882,11 @@
             code = NGHTTP2_NO_ERROR;
           }
           if (code === undefined) code = NGHTTP2_NO_ERROR;
-          if (typeof code !== "number" || !Number.isInteger(code) || code < 0 || code > 0xffffffff) {
+          // node's validateInteger(code, 'code', 0, kMaxInt): a non-number is
+          // a type error, anything else outside uint32 a range error.
+          if (typeof code !== "number") throw codes.ERR_INVALID_ARG_TYPE("code", "number", code);
+          if (!Number.isInteger(code)) throw codes.ERR_OUT_OF_RANGE("code", "an integer", code);
+          if (code < 0 || code > 0xffffffff) {
             throw codes.ERR_OUT_OF_RANGE("code", ">= 0 && <= 4294967295", code);
           }
           if (callback !== undefined) {
@@ -41476,8 +44553,11 @@
             req.res = res;
             res.req = req;
             conn.open++;
-            var done = false;
-            var answered = function() {
+            // Block-scoped: one `done` per request. As `var` the whole loop
+            // shared one, so a response's late 'close' could count down a
+            // LATER request and leave its connection looking idle.
+            let done = false;
+            const answered = function() {
               if (done) return;
               done = true;
               conn.open--;
@@ -41779,6 +44859,44 @@
         });
       });
     }
+    // setTimeout() of a client session or stream (node's setStreamTimeout):
+    // 'timeout' after `msecs` with no activity, 0 disarming it. The timer is
+    // unref'd, as node's is, and nothing but the event follows from it. What
+    // counts as activity is what this layer sees -- a request made, a response
+    // head, a body chunk read, a write handed over (noteClientActivity) -- not
+    // every frame on the connection, which hyper reads.
+    function setClientIdleTimeout(owner, msecs, callback) {
+      if (owner.destroyed) return owner;
+      if (typeof msecs !== "number") throw codes.ERR_INVALID_ARG_TYPE("msecs", "number", msecs);
+      if (!(msecs >= 0) || !Number.isFinite(msecs)) {
+        throw codes.ERR_OUT_OF_RANGE("msecs", "a non-negative finite number", msecs);
+      }
+      if (callback !== undefined && typeof callback !== "function") {
+        throw codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
+      }
+      owner._idleMs = msecs;
+      touchClientIdle(owner);
+      if (callback !== undefined) {
+        if (msecs === 0) owner.removeListener("timeout", callback);
+        else owner.once("timeout", callback);
+      }
+      return owner;
+    }
+    function touchClientIdle(owner) {
+      if (owner._idleTimer) globalThis.clearTimeout(owner._idleTimer);
+      owner._idleTimer = null;
+      if (!(owner._idleMs > 0) || owner.destroyed) return;
+      owner._idleTimer = globalThis.setTimeout(function () {
+        owner._idleTimer = null;
+        if (!owner.destroyed) owner.emit("timeout");
+      }, owner._idleMs);
+      if (owner._idleTimer && typeof owner._idleTimer.unref === "function") owner._idleTimer.unref();
+    }
+    // Activity on a stream is activity on its session too.
+    function noteClientActivity(stream) {
+      touchClientIdle(stream);
+      if (stream._session !== undefined) touchClientIdle(stream._session);
+    }
     class ClientHttp2Stream extends Duplex {
       constructor(session, prepared, options) {
         // autoDestroy: once the response has ended and the request body is
@@ -41838,7 +44956,7 @@
       get aborted() { return this._aborted; }
       get session() { return this._session; }
       get sentTrailers() { return this._sentTrailers; }
-      setTimeout() { return this; }
+      setTimeout(msecs, callback) { return setClientIdleTimeout(this, msecs, callback); }
       priority() {}
 
       // node's requestOnConnect: the session connected, send the request.
@@ -41851,6 +44969,7 @@
         }
         this._id = session._nextStreamId;
         session._nextStreamId += 2;
+        noteClientActivity(this);
         session._pendingStreams.delete(this);
         session._streams.set(this._id, this);
         var self = this;
@@ -41935,6 +45054,7 @@
         for (var i = 0; i < raw.headers.length; i++) rawHeaders.push(raw.headers[i][0], raw.headers[i][1]);
         var headers = toHeaderObject(rawHeaders);
         this._bodyHandle = raw.bodyHandle;
+        noteClientActivity(this);
         // nghttp2's flags: END_HEADERS, plus END_STREAM for a response with
         // no body.
         this.emit("response", headers, raw.endStream ? 5 : 4, rawHeaders);
@@ -41954,6 +45074,7 @@
           self._reading = false;
           // Destroyed, or closed (which let go of the body) meanwhile.
           if (self.destroyed || self._bodyHandle !== handle) return;
+          noteClientActivity(self);
           if (chunk === undefined) {
             self._bodyHandle = null;
             self._readEnded = true;
@@ -41984,11 +45105,16 @@
           return;
         }
         var stream = this._bodyStream;
+        var self = this;
+        noteClientActivity(this);
         var next = this._channelTail.then(function () {
           return natives.fetchBodyChannelWrite(stream, bytes);
         });
         this._channelTail = next.then(function () {}, function () {});
-        next.then(function () { callback(); }, function (err) { callback(err); });
+        next.then(function () {
+          noteClientActivity(self);
+          callback();
+        }, function (err) { callback(err); });
       }
 
       write(chunk, encoding, callback) {
@@ -42059,14 +45185,15 @@
 
       close(code, callback) {
         if (code === undefined) code = NGHTTP2_NO_ERROR;
-        if (typeof code !== "number" || !Number.isInteger(code) || code < 0 || code > 2147483647) {
-          var errors = registry.get("internal/errors").codes;
-          if (typeof code !== "number") throw new errors.ERR_INVALID_ARG_TYPE("code", "number", code);
-          throw new errors.ERR_OUT_OF_RANGE("code", ">= 0 && <= 2147483647", code);
+        // node's validateInteger(code, 'code', 0, kMaxInt), kMaxInt 2**32 - 1:
+        // the same check the server stream's close() makes.
+        if (typeof code !== "number") throw codes.ERR_INVALID_ARG_TYPE("code", "number", code);
+        if (!Number.isInteger(code)) throw codes.ERR_OUT_OF_RANGE("code", "an integer", code);
+        if (code < 0 || code > 0xffffffff) {
+          throw codes.ERR_OUT_OF_RANGE("code", ">= 0 && <= 4294967295", code);
         }
         if (callback !== undefined && typeof callback !== "function") {
-          var codes = registry.get("internal/errors").codes;
-          throw new codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
+          throw codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
         }
         if (this._closed) return;
         if (callback !== undefined) this.once("close", callback);
@@ -42333,6 +45460,15 @@
         this._closingOnOpen = false;
         this._goawaysDone = null;
         this._goawaysDoneResolve = function () {};
+        // The pings sent and not yet acknowledged (ping()), and node's
+        // maxOutstandingPings: how many there may be.
+        this._pings = new Set();
+        // Answers that came ahead of an earlier one's (ping()), by the
+        // order of their ACKs, and the next one due.
+        this._pongs = new Map();
+        this._pongsDue = 0;
+        this._maxPings = options && typeof options.maxOutstandingPings === "number"
+          ? options.maxOutstandingPings : 10;
         this._nextStreamId = 1;
         this._authority = undefined;
         this._protocol = undefined;
@@ -42631,6 +45767,9 @@
         if (state.destroyed) return;
         state.destroyed = true;
         state.destroyCode = code;
+        // The pings still waiting are cancelled, as node's are: on the
+        // check phase (its SetImmediate), ahead of the session's 'close'.
+        this._pings.forEach(function (ping) { setImmediate(ping.settle, null); });
         if (this._pendingStreams.size > 0 || this._streams.size > 0) {
           var cancel = streamCancelError(error);
           this._pendingStreams.forEach(function (stream) { stream.destroy(cancel); });
@@ -42696,10 +45835,74 @@
       unref() {
         if (this._socket && typeof this._socket.unref === "function") this._socket.unref();
       }
-      setTimeout() { return this; }
+      setTimeout(msecs, callback) { return setClientIdleTimeout(this, msecs, callback); }
+      // node's ping(): a PING frame carrying `payload` (eight bytes of the
+      // session's choosing when there is none; node sends the clock), and
+      // the callback at the peer's ACK with (null, duration in ms, the
+      // bytes the ACK echoed, a Buffer of its own). The checks are node's,
+      // in node's order: a destroyed session first, then the payload, its
+      // length, the callback. A ping that cannot be answered -- made while
+      // connecting or after close(), over maxOutstandingPings (that one
+      // returns false, its callback already called), or still waiting when
+      // the session is destroyed -- gets ERR_HTTP2_PING_CANCEL and nothing
+      // else. The ACK is the session's own business: no 'ping' event.
       ping(payload, callback) {
+        if (this._state.destroyed) throw h2Error("ERR_HTTP2_INVALID_SESSION", "The session has been destroyed");
         if (typeof payload === "function") { callback = payload; payload = undefined; }
-        if (callback) process.nextTick(function () { callback(null, 0, payload || globalThis.Buffer.alloc(8)); });
+        if (payload && !ArrayBuffer.isView(payload)) {
+          throw codes.ERR_INVALID_ARG_TYPE("payload", ["Buffer", "TypedArray", "DataView"], payload);
+        }
+        if (payload && payload.byteLength !== 8) {
+          throw h2Error("ERR_HTTP2_PING_LENGTH", "HTTP2 ping payload must be 8 bytes", RangeError);
+        }
+        if (typeof callback !== "function") throw codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
+        var cancel = function () { callback(h2Error("ERR_HTTP2_PING_CANCEL", "HTTP2 ping cancelled")); };
+        if (this.connecting || this._state.closed) {
+          process.nextTick(cancel);
+          return undefined;
+        }
+        if (this._pings.size >= this._maxPings) {
+          cancel();
+          return false;
+        }
+        // The bytes as they are now: the caller may reuse its buffer.
+        var bytes = new Uint8Array(8);
+        if (payload) bytes.set(new Uint8Array(payload.buffer, payload.byteOffset, 8));
+        else globalThis.crypto.getRandomValues(bytes);
+        var self = this;
+        var ping = {
+          settled: false,
+          // The op's answer, or null for a ping cancelled.
+          settle: function (pong) {
+            if (ping.settled) return;
+            ping.settled = true;
+            self._pings.delete(ping);
+            if (pong && pong.ack) callback(null, pong.duration, globalThis.Buffer.from(pong.payload));
+            else cancel();
+          },
+        };
+        this._pings.add(ping);
+        // 'connect' has come, and the h2 layer may still be opening.
+        var send = function (sid) { return natives.http2SessionPing(sid, bytes); };
+        var answer = this._sid !== null ? send(this._sid) : this._opening.then(send);
+        // On a tick of its own, so a callback that throws is an uncaught
+        // exception, as node's is, not a rejection of this chain. Each
+        // answer comes by its own op, in no order of their own: the
+        // callbacks go in the order the ACKs came in (`seq`), as node's do.
+        answer.then(
+          function (pong) {
+            if (!pong || !pong.ack) {
+              process.nextTick(ping.settle, null);
+              return;
+            }
+            self._pongs.set(pong.seq, function () { ping.settle(pong); });
+            for (var due; (due = self._pongs.get(self._pongsDue)) !== undefined; self._pongsDue++) {
+              self._pongs.delete(self._pongsDue);
+              process.nextTick(due);
+            }
+          },
+          function () { process.nextTick(ping.settle, null); },
+        );
         return true;
       }
     }
@@ -42832,7 +46035,6 @@
     function socketClosedError() {
       return codes.ERR_SOCKET_CLOSED();
     }
-    // A connect-syscall error in Node's shape (`connect EISCONN host:port -
     // A net.Socket with no connection yet and no connect in flight (node:
     // `!socket._handle`), which a TLSSocket over it waits on: it is
     // `connecting` until that socket's 'connect' (node's _init), and its
@@ -42848,6 +46050,7 @@
         wrap[registry._netNativeConnection] === undefined;
     }
 
+    // A connect-syscall error in Node's shape (`connect EISCONN host:port -
     // Local (addr:port)`, code / errno / syscall / address / port), for the
     // one code the TLS path raises itself.
     function connectSyscallError(code, host, port, socket) {
@@ -42871,16 +46074,15 @@
     // fresh socket), this class follows Node. The transport feeds the
     // address fields once it connects.
     //
-    // The `socket` constructor argument and the `socket` option are accepted
-    // for signature parity only. oam has no native op to wrap an existing
-    // plain socket in a CLIENT-side TLS session (tls_accept_wrap does the
-    // server side), so a TLSSocket opens its own connection through
-    // connect() and refuses a socket it was asked to wrap (connect()
-    // destroys it with an error, rather than quietly connecting somewhere
-    // else). And unlike Node, where a bare `new TLSSocket().connect()` only
-    // opens the transport and only tls.connect() starts the handshake,
-    // oam's connect() runs the handshake too: 'secureConnect' fires from
-    // both paths.
+    // The `socket` constructor argument and the `socket` option wrap a socket
+    // this one did not open (_wrapOver): TLS then runs over that socket
+    // through a pipe pumped to and from it (_connectTlsOver, pumpTlsPipe),
+    // and connect() starts the handshake there instead of opening a
+    // connection of its own. And unlike Node, where a bare
+    // `new TLSSocket().connect()` only opens the transport and only
+    // tls.connect() starts the handshake, oam's connect() runs the handshake
+    // too: 'secureConnect' fires from both paths.
+    //
     // The option a server's accept loop builds its sockets with: born with
     // the server's context, so no context of their own is built (or
     // validated) at construction.
@@ -43149,7 +46351,7 @@
           }
         }
         if (this._timeoutId !== null) {
-          globalThis.clearTimeout(this._timeoutId);
+          (registry._clearTimeout ?? globalThis.clearTimeout)(this._timeoutId);
           this._timeoutId = null;
         }
         this.connecting = false;
@@ -43298,9 +46500,9 @@
       // the socket still open (probed on Node: readyState stays "open" and
       // destroyed stays false; closing it is the listener's decision).
       _resetTimeout() {
-        if (this._timeoutId !== null) globalThis.clearTimeout(this._timeoutId);
+        if (this._timeoutId !== null) (registry._clearTimeout ?? globalThis.clearTimeout)(this._timeoutId);
         if (this._timeoutMs > 0 && !this.destroyed) {
-          this._timeoutId = globalThis.setTimeout(() => {
+          this._timeoutId = (registry._setTimeout ?? globalThis.setTimeout)(() => {
             this._timeoutId = null;
             this.emit("timeout");
           }, this._timeoutMs);
@@ -43416,41 +46618,21 @@
       return [options, typeof last === "function" ? last : undefined];
     }
 
-    // node's convertALPNProtocols for a client: `ALPNProtocols` as an array
-    // of names (strings, Buffers or typed arrays), or one buffer already in
-    // the wire format (each name prefixed with its length). Returns the
-    // names for the native, one byte per code point, as JSON; undefined for
-    // none. A name over 255 bytes throws, as node does at tls.connect().
+    // A client's `ALPNProtocols` as the names the native offers, one byte per
+    // code point, as JSON; undefined for none. The conversion and the wire
+    // parse are the server's (convertALPNProtocols, alpnWireNames, below):
+    // an array of string names, or one buffer already in the wire format
+    // (each name prefixed with its length). A name over 255 bytes, or one
+    // that is not a string, throws, as node does at tls.connect(). The
+    // client used to have its own copy of both, which took Buffer names and
+    // skipped a malformed wire entry where the server's stops at it.
     function alpnProtocolNames(protocols) {
-      var names = [];
-      if (Array.isArray(protocols)) {
-        for (var i = 0; i < protocols.length; i++) {
-          var bytes = globalThis.Buffer.from(protocols[i]);
-          if (bytes.length > 255) {
-            var tooLong = new RangeError(
-              "The byte length of the protocol at index " + i +
-              " exceeds the maximum length. It must be <= 255. Received " + bytes.length,
-            );
-            tooLong.code = "ERR_OUT_OF_RANGE";
-            throw tooLong;
-          }
-          if (bytes.length > 0) names.push(bytes.toString("latin1"));
-        }
-      } else if (ArrayBuffer.isView(protocols)) {
-        var wire = globalThis.Buffer.from(protocols.buffer, protocols.byteOffset, protocols.byteLength);
-        for (var at = 0; at < wire.length;) {
-          var len = wire[at];
-          if (len > 0 && at + 1 + len <= wire.length) {
-            names.push(wire.toString("latin1", at + 1, at + 1 + len));
-          }
-          at += 1 + len;
-        }
-      }
+      var converted = {};
+      convertALPNProtocols(protocols, converted);
+      var names = alpnWireNames(converted.ALPNProtocols);
       return names.length > 0 ? JSON.stringify(names) : undefined;
     }
 
-    // The connect flow tls.connect() and TLSSocket.prototype.connect() share.
-    // One native op does the TCP connect and the handshake, so 'connect',
     // Node validates and resolves the TLS protocol-version options when it
     // builds the SecureContext -- synchronously, at tls.connect() and
     // tls.createServer(). `minVersion` / `maxVersion` are one of 'TLSv1.3' /
@@ -43729,24 +46911,10 @@
     // socket's end now: a FIN from the peer no longer ends its write side
     // (allowHalfOpen), TLS decides.
     function pumpTlsPipe(socket, wrap, pipe) {
-      var inChain = Promise.resolve();
-      var ended = false;
-      var onData = function (chunk) {
-        var bytes = typeof chunk === "string" ? globalThis.Buffer.from(chunk, "latin1") : chunk;
-        if (typeof wrap.pause === "function") wrap.pause();
-        inChain = inChain
-          .then(function () { return natives.tlsPipeIn(pipe, bytes); })
-          .then(function () {
-            if (!wrap.destroyed && typeof wrap.resume === "function") wrap.resume();
-          }, function () {});
-      };
-      var onEnd = function () {
-        if (ended) return;
-        ended = true;
-        inChain = inChain
-          .then(function () { return natives.tlsPipeInEnd(pipe); })
-          .then(function () {}, function () {});
-      };
+      // The pump's two halves are pipeSocket's (pipePumpIn / pipePumpOut).
+      var pumpIn = pipePumpIn(wrap, pipe, function () { return true; });
+      var onData = pumpIn.data;
+      var onEnd = pumpIn.end;
       var onError = function (err) {
         if (!socket.destroyed) socket.destroy(err);
       };
@@ -43757,22 +46925,22 @@
       socket._wrapListeners = { data: onData, end: onEnd, error: onError, close: onEnd };
       if ("allowHalfOpen" in wrap) wrap.allowHalfOpen = true;
       if (typeof wrap.resume === "function") wrap.resume();
-      var pumpOut = function () {
-        natives.tlsPipeOut(pipe).then(function (bytes) {
-          if (wrap.destroyed) return;
-          if (bytes === undefined) {
-            if (typeof wrap.end === "function") wrap.end();
-            return;
-          }
-          wrap.write(
-            globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
-            function (err) { if (!err) pumpOut(); },
-          );
-        }, function () {});
-      };
-      pumpOut();
+      // TLS finished writing (close_notify sent): the wrapped socket's write
+      // side is ended. A pump that stopped first -- the socket destroyed, a
+      // write that failed (which the socket reports as 'error', above) --
+      // ends nothing.
+      pipePumpOut(
+        wrap,
+        pipe,
+        function () { return !wrap.destroyed; },
+        function (finished) {
+          if (finished && typeof wrap.end === "function") wrap.end();
+        },
+      );
     }
 
+    // The connect flow tls.connect() and TLSSocket.prototype.connect() share.
+    // One native op does the TCP connect and the handshake, so 'connect',
     // 'ready' and 'secureConnect' fire back to back -- Node's order, probed
     // -- and the transport's addresses land as they would on a net.Socket:
     // remoteAddress is the resolved IP, never the host name.
@@ -44278,8 +47446,8 @@
       }
       var socket = new TLSSocket(null, options);
       // Node arms the idle timer from the option when it opens the transport
-      // itself (never for a wrapped socket, which is refused here anyway).
-      if (options.timeout && !options.socket) socket.setTimeout(options.timeout);
+      // itself, never for a wrapped socket -- which returned above.
+      if (options.timeout) socket.setTimeout(options.timeout);
       // node's tls.connect calls the socket's own connect(): a caller that
       // wraps TLSSocket.prototype.connect sees every tls connection.
       if (socket.connect !== stockTlsSocketConnect) {
@@ -44461,19 +47629,34 @@
     // wire form -- each name's length byte, then its bytes -- and a name over
     // 255 bytes throws; a Uint8Array or other ArrayBufferView is taken as the
     // wire form already (copied); anything else leaves the option unset.
+    // The one conversion, for tls.connect() and tls.createServer() alike (the
+    // client's alpnProtocolNames goes through it), so the two cannot differ.
+    // An array's names are strings, as node's convertProtocols has them
+    // (measured on v22.22.2): each is measured first with Buffer.byteLength,
+    // which refuses a number or an object, and then written as a string, so
+    // a Buffer or typed-array NAME is refused too ("argument must be a
+    // string"). The server used to stringify whatever it was given, and the
+    // client to take bytes.
     function convertALPNProtocols(protocols, out) {
       var Buf = globalThis.Buffer;
       if (Array.isArray(protocols)) {
         var parts = [];
-        for (var i = 0; i < protocols.length; i++) {
-          var bytes = Buf.from(String(protocols[i]), "utf8");
-          if (bytes.length > 255) {
+        var i;
+        for (i = 0; i < protocols.length; i++) {
+          var length = Buf.byteLength(protocols[i]);
+          if (length > 255) {
             var tooLong = new RangeError(
               "The byte length of the protocol at index " + i +
-                " exceeds the maximum length. It must be <= 255. Received " + bytes.length,
+                " exceeds the maximum length. It must be <= 255. Received " + length,
             );
             throw applyNodeErrorShape(tooLong, "ERR_OUT_OF_RANGE");
           }
+        }
+        for (i = 0; i < protocols.length; i++) {
+          if (typeof protocols[i] !== "string") {
+            throw applyNodeErrorShape(new TypeError("argument must be a string"), "ERR_INVALID_ARG_TYPE");
+          }
+          var bytes = Buf.from(protocols[i], "utf8");
           parts.push(Buf.from([bytes.length]), bytes);
         }
         out.ALPNProtocols = Buf.concat(parts);
@@ -45659,15 +48842,20 @@
   registry.factories.worker_threads = () => {
     const EventEmitter = registry.get("events");
 
-    // SHARE_ENV sentinel -- when passed as opts.env, workers share the
-    // process environment (which they do by default in oam anyway).
-    const SHARE_ENV = Symbol("nodejs.worker_threads.SHARE_ENV");
+    // SHARE_ENV sentinel -- passed as opts.env, the worker shares this
+    // thread's environment store (both see each other's writes); without it
+    // a worker starts with a copy (workerEnvOption below).
+    // Node's is the REGISTERED symbol (Symbol.for), so code that never
+    // imported worker_threads can still name it; a private Symbol() with the
+    // same description was a different value.
+    const SHARE_ENV = Symbol.for("nodejs.worker_threads.SHARE_ENV");
 
     // Module-level environment data store shared across threads in-process.
     const _envData = new Map();
 
-    // WeakSet for markAsUntransferable -- marks objects so transfer attempts
-    // can check (actual enforcement is future; the mark is the contract).
+    // WeakSet for markAsUntransferable -- marks objects so a transfer attempt
+    // can check: a port's postMessage throws DataCloneError for a marked
+    // object in its transfer list.
     const _untransferableSet = untransferable;
 
     const natives = globalThis.__oam.node;
@@ -45845,6 +49033,11 @@
         // _recvLoop and terminate() mark it exited.
         this._started = false;
         this._exited = false;
+        // _finishExit / terminate() state: 'exit' emitted, terminate() called,
+        // and the terminate() promises waiting on the exit.
+        this._exitEmitted = false;
+        this._terminated = false;
+        this._terminateWaiters = [];
 
         // Expose performance reference (mirrors Node behavior)
         this.performance = globalThis.performance;
@@ -45869,13 +49062,34 @@
           });
         }
       }
+      // The one way a Worker ends, whichever path gets there first (the
+      // worker's own 'exit' event, terminate(), the channel going away, a
+      // failed receive): both output streams get their EOF, so an 'end'
+      // listener fires, 'exit' is emitted exactly once, and every pending
+      // terminate() promise resolves with the code, as node's does.
+      _finishExit(code) {
+        if (this._exitEmitted) return;
+        this._exitEmitted = true;
+        this._exited = true;
+        this.stdout.push(null);
+        this.stderr.push(null);
+        const waiters = this._terminateWaiters;
+        this._terminateWaiters = [];
+        this._emitFromLoop("exit", code);
+        for (const resolve of waiters) resolve(code);
+      }
       async _recvLoop() {
         while (true) {
           let raw;
-          try { raw = await natives.workerRecvMessage(this._workerId); } catch { this._exited = true; break; }
-          // undefined: the channel is gone -- terminate() removed it, or the
-          // worker thread dropped it. Either way the worker no longer runs.
-          if (raw === undefined) { this._exited = true; this._emitFromLoop("exit", 0); break; }
+          // A receive that fails leaves no channel to hear an 'exit' on: the
+          // worker is reported gone (it used to end with no 'exit' at all).
+          try { raw = await natives.workerRecvMessage(this._workerId); } catch { this._finishExit(1); break; }
+          // terminate() has reported the exit (or is about to): nothing the
+          // worker sent after it is delivered, as in node.
+          if (this._terminated) { this._finishExit(1); break; }
+          // undefined: the channel is gone -- the worker thread dropped it.
+          // The worker no longer runs.
+          if (raw === undefined) { this._finishExit(0); break; }
           if (raw instanceof Uint8Array) {
             const text = new TextDecoder().decode(raw);
             try {
@@ -45895,11 +49109,7 @@
               this[raw.type].push(Buffer.from(raw.data, "latin1"));
             }
             if (raw.type === "exit") {
-              this._exited = true;
-              // EOF both streams so a waiting 'end' listener fires.
-              this.stdout.push(null);
-              this.stderr.push(null);
-              this._emitFromLoop("exit", raw.code);
+              this._finishExit(raw.code);
               break;
             }
           }
@@ -45908,13 +49118,30 @@
       postMessage(data) {
         natives.workerPostMessage(this._workerId, JSON.stringify(data));
       }
-      terminate() {
-        // Marked here, not only when 'exit' arrives: the promise below
-        // resolves at once, and node's worker reports not-running as soon
-        // as terminate() has settled.
-        this._exited = true;
-        natives.workerTerminate(this._workerId);
-        return Promise.resolve(0);
+      terminate(callback) {
+        // node's terminate(): a worker that has already exited resolves
+        // undefined; otherwise the promise resolves with the exit code once
+        // 'exit' has been emitted, and a terminated worker's code is 1. It
+        // used to resolve 0 at once and leave 'exit' (code 0, streams never
+        // ended) to whatever the worker sent next. oam cannot stop the
+        // thread from here (no cross-thread interrupt, see getHeapSnapshot),
+        // so the exit is reported on the next tick rather than when the
+        // thread is gone: the worker's channel is closed, nothing it sends
+        // afterwards is delivered, and it ends once it next goes idle.
+        if (this._exitEmitted) return Promise.resolve();
+        if (typeof callback === "function") {
+          this.once("exit", (code) => callback(null, code));
+        }
+        const promise = new Promise((resolve) => { this._terminateWaiters.push(resolve); });
+        if (!this._terminated) {
+          this._terminated = true;
+          // Marked here, not only when 'exit' is emitted: node's worker
+          // reports not-running as soon as terminate() has been called.
+          this._exited = true;
+          natives.workerTerminate(this._workerId);
+          process.nextTick(() => this._finishExit(1));
+        }
+        return promise;
       }
       ref() { return this; }
       unref() { return this; }
@@ -46224,7 +49451,18 @@
       log("  ...");
     }
 
-    function makeContext(name) {
+    // A test's context. Its hooks are ITS OWN, as node's TestContext hooks
+    // are (measured on v22.22.2): t.before() runs at once, t.after() runs
+    // when this test's function has finished (after the afterEach hooks that
+    // apply to it), and t.beforeEach() / t.afterEach() run around every
+    // subtest below it. They used to be the module-level hook functions,
+    // which register on the suite being DEFINED -- the root, by the time a
+    // test runs -- so t.after() ran at the end of the file, t.beforeEach()
+    // attached to every later test in it, and t.before() never ran.
+    // `parent` is the context of the test this one is a subtest of (null
+    // for a test registered at file or suite level); `suite` is the suite
+    // whose beforeEach / afterEach hooks apply.
+    function makeContext(name, parent, suite) {
       const ctx = {
         name,
         assert,
@@ -46235,21 +49473,83 @@
         todo(msg) {
           ctx._todo = msg ?? true;
         },
-        before,
-        after,
-        beforeEach,
-        afterEach,
+        before(fn) {
+          // The test has already started, so node runs the hook now. A
+          // failure fails the test once its function has finished.
+          let pending;
+          try {
+            pending = fn(ctx);
+          } catch (e) {
+            ctx._hookError ??= e;
+            return;
+          }
+          if (pending && typeof pending.then === "function") {
+            ctx._pendingBefore.push(
+              Promise.resolve(pending).then(undefined, (e) => {
+                ctx._hookError ??= e;
+              }),
+            );
+          }
+        },
+        after(fn) {
+          ctx._hooks.after.push(fn);
+        },
+        beforeEach(fn) {
+          ctx._hooks.beforeEach.push(fn);
+        },
+        afterEach(fn) {
+          ctx._hooks.afterEach.push(fn);
+        },
         signal: undefined,
         runOnly() {},
         // Subtests run inline within the parent test, awaited.
         test(n, o, f) {
-          return runSubtest(norm(n, o, f));
+          return runSubtest(norm(n, o, f), ctx);
         },
       };
+      // Not enumerable: runner state, not part of the context a test sees.
+      const hidden = (value) => ({ value, writable: true, enumerable: false, configurable: true });
+      Object.defineProperties(ctx, {
+        _parent: hidden(parent || null),
+        _suite: hidden(suite || root),
+        _hooks: hidden({ after: [], beforeEach: [], afterEach: [] }),
+        _pendingBefore: hidden([]),
+        _hookError: hidden(undefined),
+      });
       return ctx;
     }
+    // The contexts above `ctx`, outermost first (`ctx` itself excluded).
+    function contextAncestors(ctx) {
+      const chain = [];
+      for (let c = ctx._parent; c; c = c._parent) chain.unshift(c);
+      return chain;
+    }
+    // The beforeEach hooks that apply to `ctx`'s test: its suites', outermost
+    // first, then those of the tests it is nested in. Each is handed `ctx`.
+    async function runBeforeEachHooks(ctx) {
+      for (const s of lineage(ctx._suite)) for (const h of s.beforeEach) await h(ctx);
+      for (const p of contextAncestors(ctx)) for (const h of p._hooks.beforeEach) await h(ctx);
+    }
+    // The afterEach hooks that apply, innermost first (the enclosing tests',
+    // then the suites'), and then the test's own t.after() hooks -- node's
+    // order. Every hook runs; `onError` gets each failure, a t.before()
+    // failure included.
+    async function runAfterHooks(ctx, onError) {
+      const run = async (h) => {
+        try {
+          await h(ctx);
+        } catch (e) {
+          onError(e);
+        }
+      };
+      for (const p of contextAncestors(ctx).reverse()) for (const h of p._hooks.afterEach) await run(h);
+      for (const s of lineage(ctx._suite).reverse()) for (const h of s.afterEach) await run(h);
+      await Promise.all(ctx._pendingBefore);
+      for (const h of ctx._hooks.after) await run(h);
+      if (ctx._hookError !== undefined) onError(ctx._hookError);
+    }
 
-    async function runSubtest(a) {
+    async function runSubtest(a, parent) {
       const id = ++counter;
       if (a.options.skip) {
         skipped++;
@@ -46260,20 +49560,34 @@
         log(`ok ${id} - ${a.name} # TODO`);
         return;
       }
-      const ctx = makeContext(a.name);
+      const ctx = makeContext(a.name, parent, parent ? parent._suite : root);
+      let err = null;
+      let threw = false;
+      const fail = (e) => {
+        if (!threw) err = e;
+        threw = true;
+      };
       try {
-        await a.fn?.(ctx);
-        if (ctx._skipped) {
-          skipped++;
-          log(`ok ${id} - ${a.name} # SKIP`);
-        } else {
-          passed++;
-          log(`ok ${id} - ${a.name}`);
+        await runBeforeEachHooks(ctx);
+        try {
+          await a.fn?.(ctx);
+        } catch (e) {
+          fail(e);
         }
+        await runAfterHooks(ctx, fail);
       } catch (e) {
+        fail(e);
+      }
+      if (threw) {
         failed++;
         log(`not ok ${id} - ${a.name}`);
-        diag(e);
+        diag(err);
+      } else if (ctx._skipped) {
+        skipped++;
+        log(`ok ${id} - ${a.name} # SKIP`);
+      } else {
+        passed++;
+        log(`ok ${id} - ${a.name}`);
       }
     }
 
@@ -46294,27 +49608,26 @@
         entry.resolve?.();
         return;
       }
-      const ctx = makeContext(entry.name);
+      const ctx = makeContext(entry.name, null, entry.suite);
       let err = null;
+      let threw = false;
+      const fail = (e) => {
+        if (!threw) err = e;
+        threw = true;
+      };
       try {
-        for (const s of lineage(entry.suite)) for (const h of s.beforeEach) await h(ctx);
+        await runBeforeEachHooks(ctx);
         try {
           await entry.fn?.(ctx);
         } catch (e) {
-          err = e;
+          fail(e);
         }
-        for (const s of lineage(entry.suite).reverse())
-          for (const h of s.afterEach) {
-            try {
-              await h(ctx);
-            } catch (e) {
-              err ??= e;
-            }
-          }
+        // The suites' afterEach hooks, then this test's own t.after() hooks.
+        await runAfterHooks(ctx, fail);
       } catch (e) {
-        err = e;
+        fail(e);
       }
-      if (err) {
+      if (threw) {
         failed++;
         log(`not ok ${id} - ${entry.name}`);
         diag(err);
@@ -46403,6 +49716,18 @@
     // this they throw "global is not defined" the moment that path runs.
     if (typeof globalThis.global === "undefined") globalThis.global = globalThis;
 
+    // Cluster worker side: the id cluster.fork() named this process by. Taken
+    // at startup and removed from the environment (natives.clusterIsWorker
+    // removes the real variable; the delete covers a process.env store that
+    // was already read), as node deletes NODE_UNIQUE_ID in worker bootstrap:
+    // a child this worker spawns with its default env, or a worker thread it
+    // starts, is not a worker of this primary. node:cluster reads the id
+    // from here.
+    registry.clusterWorkerId = natives.clusterIsWorker();
+    if (registry.clusterWorkerId !== undefined) {
+      delete globalThis.process.env.OAM_CLUSTER_WORKER;
+    }
+
     // Fork IPC child side: store port for lazy connect.
     // Cannot connect during installRuntimeGlobals because CoreRuntime
     // (tokio, TCP ops) is not installed until execute_module/reset_run_slots.
@@ -46425,22 +49750,63 @@
         _ipcConnecting = true;
         const _net = registry.get("net");
         _ipcSock = new _net.Socket();
+        _ipcUpdateRef();
         let _ipcBuf = "";
 
+        // `<port>:<token>`. The token is this child's proof to the parent
+        // that the connection is the child it started (child_process's
+        // acceptIpcPeer); it goes first, on a line of its own.
+        const _ipcSep = String(_ipcPort).indexOf(":");
+        const _ipcToken = _ipcSep === -1 ? "" : String(_ipcPort).slice(_ipcSep + 1);
+        // Listening BEFORE connect(): a connect that fails (the parent is
+        // already gone) emits 'error' on the socket, which with no listener
+        // ended the child with an uncaught ECONNREFUSED. The channel is
+        // closed instead, as node's child sees a parent that went away: every
+        // queued send() callback gets the error, and 'disconnect' is emitted.
+        _ipcSock.on("error", (err) => {
+          globalThis.process.connected = false;
+          if (_ipcReady || _ipcSock === null) return;
+          _ipcSock = null;
+          _ipcDisconnectPending = false;
+          const pending = _ipcPending.splice(0);
+          natives.forkIpcQueueClear();
+          for (const p of pending) {
+            if (typeof p.callback === "function") p.callback(err);
+          }
+          globalThis.process.emit("disconnect");
+        });
         _ipcSock.connect(parseInt(_ipcPort, 10), "127.0.0.1", () => {
           _ipcReady = true;
           _ipcSock.setEncoding("utf8");
+          // The channel is a pipe under node, and what a child wrote to a
+          // pipe is the parent's to read however the child then exits. A
+          // socket left open at exit promises nothing of the kind (Windows
+          // resets it, and the reset discards what the parent has not read
+          // yet -- a child's last message, sent just before process.exit()),
+          // so this one is closed in order before any exit: every write
+          // issued is sent, and the close waits until the parent's kernel
+          // holds it all -- not for the parent to read it
+          // (tcp_settle_lingering).
+          natives.tcpLingerAtExit(_ipcSock._handle);
+          if (_ipcToken) _ipcSock.write(_ipcToken + "\n", "utf8");
 
           for (const p of _ipcPending) {
             _ipcSock.write(p.line, "utf8", p.callback);
           }
           _ipcPending.length = 0;
+          // Written: no longer the exit path's to send (see send()).
+          natives.forkIpcQueueClear();
           if (_ipcDisconnectPending) {
             _ipcClose();
             return;
           }
 
-          _ipcSock.on("data", (chunk) => {
+          // Both only while the socket is still the channel: after
+          // disconnect() it goes on being read, to the parent's EOF (see
+          // _ipcClose), and what arrives then is nobody's.
+          const sock = _ipcSock;
+          sock.on("data", (chunk) => {
+            if (_ipcSock !== sock) return;
             _ipcBuf += chunk;
             let nl;
             while ((nl = _ipcBuf.indexOf("\n")) !== -1) {
@@ -46450,23 +49816,55 @@
                 const msg = JSON.parse(line);
                 globalThis.process.emit("message", msg);
               } catch (_) { /* ignore malformed */ }
+              if (_ipcSock !== sock) return;
             }
           });
-          _ipcSock.on("end", () => {
+          sock.on("end", () => {
+            if (_ipcSock !== sock) return;
             globalThis.process.connected = false;
             globalThis.process.emit("disconnect");
-          });
-          _ipcSock.on("error", () => {
-            globalThis.process.connected = false;
           });
         });
       }
 
-      const _origOn = globalThis.process.on.bind(globalThis.process);
-      globalThis.process.on = function on(event, listener) {
-        if (event === "message") _ipcEnsureConnect();
-        return _origOn(event, listener);
-      };
+      // node's channel keeps the process alive only while something
+      // listens on it (lib/internal/child_process.js setupChannel: the
+      // channel is ref'd by the first 'message' or 'disconnect' listener and
+      // unref'd with the last). A child that only sends -- its result, then
+      // nothing -- ends when its loop does; the socket's parked read used to
+      // hold it open for good. An unref'd socket still reads, and its writes
+      // still count (a send() is delivered before a natural exit).
+      function _ipcUpdateRef() {
+        if (_ipcSock === null) return;
+        const proc = globalThis.process;
+        if (proc.listenerCount("message") + proc.listenerCount("disconnect") > 0) _ipcSock.ref();
+        else _ipcSock.unref();
+      }
+
+      // A 'message' or 'disconnect' listener starts the channel, however it
+      // is added: on, addListener, once and the prepend forms all register
+      // through _add (the hook net.Server uses too). Only `process.on` used
+      // to be wrapped, so `process.addListener('message', fn)` never
+      // connected and never received a message.
+      const _ipcOrigAdd = globalThis.process._add;
+      Object.defineProperty(globalThis.process, "_add", {
+        value: function _add(type, listener, prepend, once) {
+          const result = _ipcOrigAdd.call(this, type, listener, prepend, once);
+          if (type === "message" || type === "disconnect") {
+            if (globalThis.process.connected) _ipcEnsureConnect();
+            _ipcUpdateRef();
+          }
+          return result;
+        },
+        writable: true,
+        configurable: true,
+        enumerable: false,
+      });
+      // The way out, as node's setupChannel listens for it ('removeListener'
+      // is emitted with the listener already gone).
+      _ipcOrigAdd.call(globalThis.process, "removeListener", function onRemoveListener(type) {
+        if (type === "message" || type === "disconnect") _ipcUpdateRef();
+      }, false, false);
 
       globalThis.process.send = function send(message, _sendHandle, _options, callback) {
         if (typeof _sendHandle === "function") { callback = _sendHandle; }
@@ -46483,19 +49881,34 @@
           _ipcSock.write(line, "utf8", callback);
         } else {
           _ipcPending.push({ line, callback });
+          // Queued behind the connect -- and handed to the natives as well:
+          // a process.exit() before the connection is up sends the queue
+          // itself, on a blocking connection, as node delivers a send() made
+          // right before process.exit() (oam_core::fork_ipc).
+          natives.forkIpcQueue(globalThis.Buffer.from(line, "utf8"));
         }
         return true;
       };
 
-      // Close the channel once every write handed to it has gone out.
+      // Close the channel once every write handed to it has gone out: the
+      // FIN behind them, 'disconnect' once it is sent. The socket is not
+      // destroyed -- a close with the parent's last messages still unread
+      // here is a reset, which discards what the parent has not read yet of
+      // this end's -- but read on, to the parent's EOF, which the parent
+      // sends once it has read everything (it closes the channel at the
+      // child's end-of-stream); the socket then closes itself. It no longer
+      // keeps the process alive (a closed channel does not, under node), and
+      // an exit before the parent's EOF closes it natively, without waiting
+      // for a parent that is not reading (tcpLingerAtExit).
       function _ipcClose() {
         var sock = _ipcSock;
         _ipcSock = null;
         _ipcReady = false;
-        sock._chain.then(function() {
-          sock.destroy();
-          globalThis.process.emit("disconnect");
-        });
+        sock.unref();
+        sock.resume();
+        sock.end();
+        var done = function() { globalThis.process.emit("disconnect"); };
+        sock._chain.then(done, done);
       }
 
       globalThis.process.disconnect = function disconnect() {
@@ -46512,116 +49925,30 @@
         }
       };
     }
-    var _perfEntries = [];
-    globalThis.performance = {
-      now: () => natives.nowMs(),
-      timeOrigin: Date.now() - natives.nowMs(),
-      mark: function mark(name, options) {
-        var entry = {
-          name: name,
-          entryType: "mark",
-          startTime: (options && options.startTime !== undefined) ? options.startTime : natives.nowMs(),
-          duration: 0,
-          detail: (options && options.detail) || null,
-        };
-        _perfEntries.push(entry);
-        return entry;
+    // globalThis.performance IS perf_hooks.performance, as in node: one
+    // object, so a mark made on the global reaches a PerformanceObserver and
+    // perf_hooks.performance.getEntriesByName(), and its entries are
+    // PerformanceEntry instances. It used to be a second implementation
+    // here, with its own entry list. The time origin is fixed now, at
+    // startup; the object is built on first use (as `crypto` below is), and
+    // the global stays assignable, as node's accessor is.
+    registry._perfTimeOrigin = Date.now() - natives.nowMs();
+    Object.defineProperty(globalThis, "performance", {
+      get() {
+        const value = registry.get("perf_hooks").performance;
+        Object.defineProperty(globalThis, "performance", {
+          value, writable: true, enumerable: true, configurable: true,
+        });
+        return value;
       },
-      measure: function measure(name, startOrOptions, endMark) {
-        var startTime = 0;
-        var endTime = natives.nowMs();
-        if (typeof startOrOptions === "string") {
-          for (var i = _perfEntries.length - 1; i >= 0; i--) {
-            if (_perfEntries[i].name === startOrOptions && _perfEntries[i].entryType === "mark") {
-              startTime = _perfEntries[i].startTime;
-              break;
-            }
-          }
-          if (typeof endMark === "string") {
-            for (var j = _perfEntries.length - 1; j >= 0; j--) {
-              if (_perfEntries[j].name === endMark && _perfEntries[j].entryType === "mark") {
-                endTime = _perfEntries[j].startTime;
-                break;
-              }
-            }
-          }
-        } else if (startOrOptions && typeof startOrOptions === "object") {
-          if (startOrOptions.start !== undefined) {
-            if (typeof startOrOptions.start === "string") {
-              for (var k = _perfEntries.length - 1; k >= 0; k--) {
-                if (_perfEntries[k].name === startOrOptions.start && _perfEntries[k].entryType === "mark") {
-                  startTime = _perfEntries[k].startTime;
-                  break;
-                }
-              }
-            } else {
-              startTime = startOrOptions.start;
-            }
-          }
-          if (startOrOptions.end !== undefined) {
-            if (typeof startOrOptions.end === "string") {
-              for (var m = _perfEntries.length - 1; m >= 0; m--) {
-                if (_perfEntries[m].name === startOrOptions.end && _perfEntries[m].entryType === "mark") {
-                  endTime = _perfEntries[m].startTime;
-                  break;
-                }
-              }
-            } else {
-              endTime = startOrOptions.end;
-            }
-          }
-          if (startOrOptions.duration !== undefined) {
-            endTime = startTime + startOrOptions.duration;
-          }
-        }
-        var entry = {
-          name: name,
-          entryType: "measure",
-          startTime: startTime,
-          duration: endTime - startTime,
-          detail: (startOrOptions && typeof startOrOptions === "object" && startOrOptions.detail) || null,
-        };
-        _perfEntries.push(entry);
-        return entry;
-      },
-      getEntries: function getEntries() { return _perfEntries.slice(); },
-      getEntriesByName: function getEntriesByName(name, type) {
-        return _perfEntries.filter(function(e) {
-          return e.name === name && (!type || e.entryType === type);
+      set(value) {
+        Object.defineProperty(globalThis, "performance", {
+          value, writable: true, enumerable: true, configurable: true,
         });
       },
-      getEntriesByType: function getEntriesByType(type) {
-        return _perfEntries.filter(function(e) { return e.entryType === type; });
-      },
-      clearMarks: function clearMarks(name) {
-        if (name === undefined) {
-          _perfEntries = _perfEntries.filter(function(e) { return e.entryType !== "mark"; });
-        } else {
-          _perfEntries = _perfEntries.filter(function(e) { return !(e.entryType === "mark" && e.name === name); });
-        }
-      },
-      clearMeasures: function clearMeasures(name) {
-        if (name === undefined) {
-          _perfEntries = _perfEntries.filter(function(e) { return e.entryType !== "measure"; });
-        } else {
-          _perfEntries = _perfEntries.filter(function(e) { return !(e.entryType === "measure" && e.name === name); });
-        }
-      },
-      // node's markResourceTiming, which the npm undici's fetch calls (on
-      // the global `performance`) for every response: perf_hooks' (one
-      // implementation; its entries are perf_hooks.performance's).
-      markResourceTiming: function markResourceTiming(timingInfo, requestedUrl, initiatorType, global,
-        cacheMode, bodyInfo, responseStatus) {
-        var perf = registry.get("perf_hooks").performance;
-        return perf.markResourceTiming.apply(perf, arguments);
-      },
-      clearResourceTimings: function clearResourceTimings() {
-        registry.get("perf_hooks").performance.clearResourceTimings();
-      },
-      toJSON: function toJSON() {
-        return { timeOrigin: this.timeOrigin };
-      },
-    };
+      enumerable: true,
+      configurable: true,
+    });
     // Lazy: registry.get('crypto') instantiates the ENTIRE crypto factory
     // (KeyObject, Hash, Hmac, createHash, ...) when only the webcrypto
     // sub-object {subtle, getRandomValues, randomUUID} is consumed at
@@ -46642,7 +49969,12 @@
     language: "en",
     languages: ["en"],
     onLine: true,
-    hardwareConcurrency: 1,
+    // node's navigator.hardwareConcurrency is os.availableParallelism()
+    // (measured equal on v22.22.2); a constant 1 made a pool sized from it
+    // single-threaded. A getter, so the os module is built only when read.
+    get hardwareConcurrency() {
+      return registry.get("os").availableParallelism();
+    },
   };
 
     // oam.serve: defined in bootstrap (snapshot), attached here because
@@ -46728,8 +50060,19 @@
           );
           delay = 1;
         }
+        // node's Timeout: `after *= 1`, and anything outside 1..TIMEOUT_MAX
+        // (NaN, 0, a negative) is 1. `_idleTimeout` is that duration, and
+        // `_repeat` is it again for an interval and null for a timeout --
+        // a duration, not a flag, which is how the fire path below reads it.
+        let after;
+        try {
+          after = Number(delay);
+        } catch {
+          after = NaN;
+        }
+        if (!(after >= 1 && after <= 2147483647)) after = 1;
         this._kind = kind;
-        this._repeat = repeat;
+        this._repeat = repeat ? after : null;
         this._delay = delay;
         this._args = args;
         this._origCallback = callback;
@@ -46744,7 +50087,7 @@
         this._domain = (typeof process !== "undefined" && process.domain) || null;
         this._ref = true;
         this._destroyed = false;
-        this._idleTimeout = repeat ? delay : delay;
+        this._idleTimeout = kind === "Immediate" ? delay : after;
         this._id = 0;
         this._schedule();
       }
@@ -46754,6 +50097,9 @@
         // mutating t._repeat converts a timeout into an interval and back.
         // Capture how this schedule was armed to detect the conversion.
         const scheduledAsRepeat = !!this._repeat;
+        // The period the native interval is armed with, as far as _repeat
+        // knows it: a different truthy _repeat after a fire re-arms it.
+        const scheduledRepeat = this._repeat;
         // Frame-bind a trampoline, not the ctor callback: Node invokes the
         // CURRENT _onTimeout on each fire (user code can swap it), while the
         // ALS frame is still captured at schedule time. Reflect.apply, not
@@ -46821,6 +50167,14 @@
                 nativeClearInterval(self._id);
                 activeTimers.delete(self._id);
                 self._destroyed = true;
+              } else if (self._repeat !== scheduledRepeat) {
+                // The callback gave the interval a new period: node re-inserts
+                // with _repeat as the duration after every fire, so the next
+                // one is that far off. The native interval is re-armed.
+                nativeClearInterval(self._id);
+                activeTimers.delete(self._id);
+                self._delay = self._idleTimeout = self._repeat;
+                self._schedule();
               }
             }
           }
@@ -46918,8 +50272,21 @@
           handle._destroyed = true;
           handle._idleTimeout = -1; // terminal: a later refresh() must no-op (Node parity)
           activeTimers.delete(handle._id);
-        } else {
-          activeTimers.delete(id);
+        } else if (typeof id === "number" || typeof id === "string") {
+          // A primitive id -- the number a Timeout coerces to, or that number
+          // as a string (the handle used as an object key): node looks the
+          // timer up by it (knownTimersById) and clears that handle. The
+          // map's keys are numbers, so a string never matched, and the
+          // handle stayed listed as active with _destroyed false.
+          const key = Number(id);
+          const mapped = activeTimers.get(key);
+          if (mapped !== undefined) {
+            mapped._destroyed = true;
+            mapped._idleTimeout = -1;
+            activeTimers.delete(key);
+            nativeClear(key);
+            return;
+          }
         }
         nativeClear(id);
       };

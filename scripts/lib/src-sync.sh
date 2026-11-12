@@ -50,8 +50,9 @@
 #
 # `set -o pipefail` is set INSIDE the subshell rather than relied upon from the
 # caller: without it a git that dies mid-list still yields a tar that exits 0,
-# and the leg would ship a silently truncated tree. The mac leg does not set
-# pipefail globally, so inheriting it is not a safe assumption.
+# and the leg would ship a silently truncated tree. Today's callers do run under
+# `set -euo pipefail`, but this is a sourced library: the guarantee belongs to
+# the function, not to whichever script happens to source it.
 #
 # --no-recursion is load-bearing: git already names every file individually, and
 # without it tar would descend into any directory it was handed and re-collect
@@ -61,12 +62,21 @@
 # the working tree, which `--cached` still lists. tar warns on stderr and exits
 # 0 rather than aborting a release over a file the local build does not have
 # either.
+#
+# src_file_list  -- the NUL-delimited list of what the sync ships, for the
+# repository the caller's cwd is in. ONE spelling, shared by the tarball, the
+# size diagnosis below and the suite's "what the sync actually ships" group, so
+# a change to the listing cannot leave any of the three describing another.
+src_file_list() {
+  git ls-files -z --cached --others --exclude-standard
+}
+
 write_src_tarball() {
   local repo="$1" out="$2"
   (
     set -o pipefail
     cd "$repo" || exit 1
-    git ls-files -z --cached --others --exclude-standard \
+    src_file_list \
       | tar czf "$out" --null --no-recursion --ignore-failed-read -T -
   )
 }
@@ -103,7 +113,7 @@ src_tarball_over_ceiling() {
 src_largest_paths() {
   (
     cd "$1" || exit 1
-    git ls-files -z --cached --others --exclude-standard \
+    src_file_list \
       | du --files0-from=- -b 2>/dev/null | sort -rn | head -n "${2:-10}"
   )
 }

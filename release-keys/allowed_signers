@@ -3,7 +3,7 @@
 # Every oam release from the first signed one on carries RELEASE-MANIFEST and
 # RELEASE-MANIFEST.sig; this file names the keys allowed to have made that
 # signature. Read by scripts/lib/signing.sh (release_verify_manifest), and the
-# source of the key set the installers and `oam self-update` will embed.
+# source of the key set the installers and `oam self-update` embed.
 #
 # One line per key:
 #
@@ -16,7 +16,7 @@
 #   - ssh-ed25519 (or sk-ssh-ed25519@openssh.com for a hardware key)
 #
 # k1 is the current release key (signs from v0.18.0, see ./ranges); k2 is the
-# staged next key, held offline, with no range yet. Because key lines exist,
+# staged next key, with no range yet. Because key lines exist,
 # every release must sign; there is no knob that skips it.
 #
 #   k1  SHA256:zB7Aq4Ky/U90VJ4sAEp0e2A65KfQpiyQXJI4FuT2oss

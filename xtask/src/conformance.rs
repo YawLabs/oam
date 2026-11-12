@@ -16,8 +16,10 @@
 //!    conformance/surface-gaps.json and may only shrink.
 //!
 //! Outputs: conformance/scorecard.json (machine) and CONFORMANCE.md
-//! (humans), both COMMITTED — the receipt is in the repo, and CI
-//! regenerates it on every push.
+//! (humans), both COMMITTED — the receipt is in the repo. There is no
+//! hosted CI: the gate runs from `scripts/ci-local.sh` and on each release
+//! leg (`scripts/build-remote.sh`), and rewrites the receipts only when the
+//! results changed (see `write_receipts`).
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -89,15 +91,20 @@ pub fn run(release: bool) -> Result<()> {
     let oam = ensure_oam_built(&repo, release)?;
     // Each case gets its own cache subdirectory (created in run_case, named
     // after the case), so a case can be re-run in isolation with its cache
-    // intact. Default root is per-pid and thrown away; set
-    // OAM_CONFORMANCE_CACHE_DIR to a fixed path to reuse the warmed V8
-    // bytecode cache across runs -- blobs are written temp-file + rename
+    // intact. Default root is per-pid and thrown away -- `_scratch` removes it
+    // when this function returns, on the error paths too (it used to be left
+    // behind: runners plus one bytecode subdirectory per case, every run on
+    // every leg). Set OAM_CONFORMANCE_CACHE_DIR to a fixed path to reuse the
+    // warmed V8 bytecode cache across runs; a root named that way is the
+    // caller's and is never removed. Blobs are written temp-file + rename
     // (code_cache.rs), so a reader never observes a torn file.
-    let cache_root = std::env::var("OAM_CONFORMANCE_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::temp_dir().join(format!("oam-conformance-{}", std::process::id()))
-        });
+    let (cache_root, _scratch) = match std::env::var("OAM_CONFORMANCE_CACHE_DIR") {
+        Ok(dir) => (PathBuf::from(dir), None),
+        Err(_) => {
+            let dir = std::env::temp_dir().join(format!("oam-conformance-{}", std::process::id()));
+            (dir.clone(), Some(ScratchDir(dir)))
+        }
+    };
     // The three runner suites (wpt-url, surface, oam-modules) share one
     // subdirectory -- they are single oam invocations, not one of N cases.
     let cache = cache_root.join("runners");
@@ -347,9 +354,10 @@ pub fn run(release: bool) -> Result<()> {
                     let detail =
                         first_difference(&normalize(&oam_out.stdout), &normalize(&node_out.stdout));
                     // Print the divergence to stdout, not just the scorecard JSON: the
-                    // scorecard is a CI artifact that isn't surfaced in the run log, so
-                    // a platform-specific FAIL (e.g. a case that only diverges on Linux)
-                    // was undiagnosable from `gh run view --log-failed`.
+                    // scorecard is a file on the box that ran the gate, and a release
+                    // leg's is on a remote host, so a platform-specific FAIL (e.g. a
+                    // case that only diverges on Linux) was undiagnosable from the
+                    // leg's log alone.
                     //
                     // The whole block goes out in ONE print: with several workers
                     // printing at once, separate println!s interleave and only the
@@ -414,7 +422,12 @@ The receipts were NOT rewritten; fix the harness and re-run."
                     "platform": node_platform(),
                     "noBaseline": exports.no_baseline,
                     "nodeTotal": exports.node_total,
+                    "nodeGlobalTotal": exports.node_global_total,
+                    "globalMissing": exports.global_missing,
                     "knownMissing": exports.known_missing,
+                    "unknownRatchet": exports.unknown_listed.iter()
+                        .map(|(m, k)| json!({ "module": m, "names": k }))
+                        .collect::<Vec<_>>(),
                     "newMissing": exports.new_missing.iter()
                         .map(|(m, k)| json!({ "module": m, "names": k }))
                         .collect::<Vec<_>>(),
@@ -440,6 +453,7 @@ The receipts were NOT rewritten; fix the harness and re-run."
                 "staleRatchet": module_types.stale.iter()
                     .map(|(m, k)| json!({ "module": m, "names": k }))
                     .collect::<Vec<_>>(),
+                "unprobedModules": module_types.unprobed.clone(),
                 "detail": live_modules["exportNames"].clone(),
             },
         },
@@ -473,6 +487,7 @@ The receipts were NOT rewritten; fix the harness and re-run."
         std::env::consts::OS,
         std::env::consts::ARCH
     ));
+    md.push_str(STAMP_NOTE);
     // Its own line, NOT folded into the Commit stamp above: write_receipts
     // ignores that line when deciding whether results changed, and a receipt
     // produced against the wrong Node must never compare equal to one
@@ -526,16 +541,29 @@ The receipts were NOT rewritten; fix the harness and re-run."
         ));
     } else {
         let implemented = exports.present();
+        // The headline total is two kinds of name, and it used to be
+        // published as if it were one: the runner folds the own-property
+        // names of the probed globals and their prototypes into the same map
+        // (`global:` keys), so `length` / `name` / `prototype` were being
+        // counted as "builtin export names". Say the split.
         md.push_str(&format!(
-            "**{implemented} / {} Node builtin export names present** ({} known-missing, tracked in \
-             [`conformance/surface-gaps.json`](conformance/surface-gaps.json)).\n\n",
-            exports.node_total, exports.known_missing
+            "**{implemented} / {} Node builtin surface names present** ({} known-missing, tracked \
+             in [`conformance/surface-gaps.json`](conformance/surface-gaps.json)): \
+             {} / {} export names of `node:` builtin modules, and {} / {} own-property names of \
+             the probed globals and their prototypes (the `global:` keys).\n\n",
+            exports.node_total,
+            exports.known_missing,
+            exports.modules_present(),
+            exports.module_total(),
+            exports.globals_present(),
+            exports.node_global_total
         ));
         md.push_str(
             "A builtin's ESM named exports are its module object's own enumerable keys, so a \
-             missing name is a link-time `SyntaxError` that kills the importing program outright \
-             — not a lazy failure at the call site. The ratchet gates on NEW gaps and forces the \
-             known list to shrink.\n",
+             missing export name is a link-time `SyntaxError` that kills the importing program \
+             outright — not a lazy failure at the call site. A missing property of a global is \
+             not a link error (it reads as `undefined`), but it is diffed and ratcheted the same \
+             way. The ratchet gates on NEW gaps and forces the known list to shrink.\n",
         );
     }
     md.push_str("\n### oam's own modules\n\n");
@@ -587,9 +615,14 @@ The receipts were NOT rewritten; fix the harness and re-run."
         println!("surface-exports: skipped (node absent)");
     } else {
         println!(
-            "surface-exports: {}/{} node export names present ({} known-missing, {} new, {} stale)",
+            "surface-exports: {}/{} node surface names present (module exports {}/{}, global \
+             properties {}/{}; {} known-missing, {} new, {} stale)",
             exports.present(),
             exports.node_total,
+            exports.modules_present(),
+            exports.module_total(),
+            exports.globals_present(),
+            exports.node_global_total,
             exports.known_missing,
             exports
                 .new_missing
@@ -628,8 +661,9 @@ The receipts were NOT rewritten; fix the harness and re-run."
 
     // Gate: the hand-curated node-differential cases are the deterministic
     // node-compat guard (byte-identical stdout+exit vs Node). Any divergence
-    // fails the run (non-zero exit) so the conformance CI job can be REQUIRED,
-    // not advisory. The scorecard receipts above are still written first.
+    // fails the run (non-zero exit), which is what makes the conformance step
+    // of scripts/ci-local.sh and of each release leg a gate rather than an
+    // advisory. The scorecard receipts above are still written first.
     //
     // A case BOTH runtimes cut short with their own watchdog, agreeing on
     // everything both printed and on the exit code, is the host's clock, not
@@ -701,36 +735,65 @@ The receipts were NOT rewritten; fix the harness and re-run."
         let mut problems = Vec::new();
         for (module, names) in &exports.new_missing {
             problems.push(format!(
-                "  node:{module} is missing {} export(s) not in surface-gaps.json: {}",
+                "  {} is missing {} {} not in surface-gaps.json: {}",
+                surface_label(module),
                 names.len(),
+                surface_noun(module),
                 names.join(", ")
             ));
         }
-        if !exports.new_absent_modules.is_empty() {
+        // absentModules holds both kinds of key; say which is which.
+        let (absent_globals, absent_modules): (Vec<&String>, Vec<&String>) = exports
+            .new_absent_modules
+            .iter()
+            .partition(|key| is_global_shape(key));
+        if !absent_modules.is_empty() {
             problems.push(format!(
                 "  modules absent from oam and not in surface-gaps.json: {}",
-                exports.new_absent_modules.join(", ")
+                join_names(&absent_modules)
+            ));
+        }
+        if !absent_globals.is_empty() {
+            problems.push(format!(
+                "  global shapes oam does not have at all, not in surface-gaps.json \
+                 absentModules: {}",
+                join_names(&absent_globals)
             ));
         }
         for (module, names) in &exports.stale {
             problems.push(format!(
-                "  node:{module} now HAS {} -- remove from surface-gaps.json (ratchet down)",
+                "  {} now HAS {} -- remove from surface-gaps.json (ratchet down)",
+                surface_label(module),
                 names.join(", ")
             ));
         }
         if !exports.stale_absent_modules.is_empty() {
             problems.push(format!(
-                "  modules now present -- remove from surface-gaps.json absentModules: {}",
+                "  now present -- remove from surface-gaps.json absentModules: {}",
                 exports.stale_absent_modules.join(", ")
             ));
         }
         if !problems.is_empty() {
             bail!(
-                "builtin export parity:\n{}\n\nEach missing name is a link-time SyntaxError for \
-                 any program that imports it. Implement it, or record it in \
+                "builtin export parity:\n{}\n\nA missing module export is a link-time \
+                 SyntaxError for any program that imports it; a missing property of a global \
+                 is `undefined` where Node has a value. Implement it, or record it in \
                  conformance/surface-gaps.json with a reason.",
                 problems.join("\n")
             );
+        }
+        // Advisory, after the gate: entries the diff cannot place.
+        if !exports.unknown_listed.is_empty() {
+            println!(
+                "\nWARNING: conformance/surface-gaps.json \"{}\" lists name(s) Node {node_version} \
+                 does not export here, and oam does not either. They are neither known gaps nor \
+                 stale ones, so nothing will ever remove them -- a typo, or a name a Node bump \
+                 dropped. Delete them (or regenerate with `node scripts/gen-surface-gaps.mjs`):",
+                node_platform()
+            );
+            for (module, names) in &exports.unknown_listed {
+                println!("         {}: {}", surface_label(module), names.join(", "));
+            }
         }
     }
 
@@ -756,6 +819,14 @@ The receipts were NOT rewritten; fix the harness and re-run."
             "  {module}: {} is recorded in conformance/oam-module-types.json but is now declared \
              (or no longer exported) -- remove the entry (ratchet down)",
             names.join(", ")
+        ));
+    }
+    for module in &module_types.unprobed {
+        problems.push(format!(
+            "  crates/oam_ts/types/oam.d.ts declares `{module}`, which \
+             conformance/runners/oam_modules.mjs did not report on, so its names were never \
+             compared -- add the specifier to the runner's MODULES list, or remove the \
+             declaration if no such module exists"
         ));
     }
     if !problems.is_empty() {
@@ -797,8 +868,22 @@ struct ExportParity {
     /// Names oam exports that Node does not. Advisory: an extra key cannot
     /// break an import, but it is still a fidelity divergence.
     extra: Vec<(String, Vec<String>)>,
-    /// Node's total public export names across every compared module.
+    /// Ratchet `missingExports` names that Node does not export on this host
+    /// and oam does not either -- so they are neither `known_missing` nor
+    /// `stale`, and would otherwise sit in the list forever (a typo, or a
+    /// name a Node bump dropped). Advisory: reported as a warning, because a
+    /// run against a non-pinned Node can produce them legitimately.
+    unknown_listed: Vec<(String, Vec<String>)>,
+    /// Node's total names across every compared key: module export names
+    /// PLUS the own-property names under the runner's `global:` keys.
     node_total: usize,
+    /// The part of `node_total` that is own-property names of globals and
+    /// their prototypes (`global:X`, `global:X.prototype`), not module
+    /// exports.
+    node_global_total: usize,
+    /// Names under `global:` keys that oam lacks, whichever bucket they
+    /// landed in (known, new, or a wholly absent shape).
+    global_missing: usize,
     /// Node export names belonging to modules oam does not register AT ALL.
     /// Counted separately because the per-name diff never sees them: an
     /// absent module is reported at module granularity and its keys are
@@ -820,6 +905,47 @@ impl ExportParity {
             + self.new_missing.iter().map(|(_, n)| n.len()).sum::<usize>()
             + self.absent_module_names;
         self.node_total.saturating_sub(missing)
+    }
+
+    /// Own-property names of the probed globals that oam has.
+    fn globals_present(&self) -> usize {
+        self.node_global_total.saturating_sub(self.global_missing)
+    }
+
+    /// Node's `node:` module export names (the total without the globals).
+    fn module_total(&self) -> usize {
+        self.node_total.saturating_sub(self.node_global_total)
+    }
+
+    /// `node:` module export names oam has.
+    fn modules_present(&self) -> usize {
+        self.present().saturating_sub(self.globals_present())
+    }
+}
+
+/// True for the surface runner's `global:X` / `global:X.prototype` keys, which
+/// carry a global object's own-property names rather than a module's exports.
+fn is_global_shape(key: &str) -> bool {
+    key.starts_with("global:")
+}
+
+/// A key of the runner's `exportNames` map as a reader should see it. The map
+/// holds both builtin modules and global shapes; printing every key as
+/// `node:<key>` named a module called `node:global:Buffer.prototype`.
+fn surface_label(key: &str) -> String {
+    match key.strip_prefix("global:") {
+        Some(global) => format!("global {global}"),
+        None => format!("node:{key}"),
+    }
+}
+
+/// What the names under a surface key are: exports of a module, or own
+/// properties of a global.
+fn surface_noun(key: &str) -> &'static str {
+    if is_global_shape(key) {
+        "own property name(s)"
+    } else {
+        "export(s)"
     }
 }
 
@@ -908,13 +1034,30 @@ fn compare_exports(ratchet: Option<&Value>, oam: &Value, node: Option<&Value>) -
         };
         let node_keys: Vec<&str> = node_keys.iter().filter_map(Value::as_str).collect();
         out.node_total += node_keys.len();
+        // A `global:` key is a global's own-property names, not a module's
+        // exports. Diffed and ratcheted the same way, counted apart so the
+        // published figure can say which is which.
+        let is_global = is_global_shape(module);
+        if is_global {
+            out.node_global_total += node_keys.len();
+        }
 
         let oam_entry = oam_map.get(module).unwrap_or(&Value::Bool(false));
         // Module absent in oam entirely: report at module granularity rather
         // than spraying every one of its export names into the diff.
-        if oam_entry.as_bool() == Some(false) || oam_entry.is_null() {
+        //
+        // Absent is `false` (the runner's require threw) or no entry at all.
+        // `null` is NOT absent: the runner writes it for a module that loads
+        // but whose exports are a primitive, and keeps it distinct on
+        // purpose. Such a module has no named exports, so it falls through
+        // with an empty key list and every Node name is diffed per name --
+        // which is what an importer of that name would hit.
+        if oam_entry.as_bool() == Some(false) {
             seen_absent.push(module.clone());
             out.absent_module_names += node_keys.len();
+            if is_global {
+                out.global_missing += node_keys.len();
+            }
             if !allowed_absent.contains(&module.as_str()) {
                 out.new_absent_modules.push(module.clone());
             }
@@ -934,6 +1077,9 @@ fn compare_exports(ratchet: Option<&Value>, oam: &Value, node: Option<&Value>) -
         for key in &node_keys {
             if oam_keys.contains(key) {
                 continue;
+            }
+            if is_global {
+                out.global_missing += 1;
             }
             if listed.contains(key) {
                 out.known_missing += 1;
@@ -955,6 +1101,18 @@ fn compare_exports(ratchet: Option<&Value>, oam: &Value, node: Option<&Value>) -
             out.stale.push((module.clone(), stale));
         }
 
+        // A listed name Node does not export here is covered by neither
+        // bucket above: it is not "known" (Node lacks it) and not "stale" (oam
+        // lacks it too). A typo, or a name a Node bump dropped.
+        let unknown: Vec<String> = listed
+            .iter()
+            .filter(|key| !node_keys.contains(key) && !oam_keys.contains(key))
+            .map(|key| (*key).to_string())
+            .collect();
+        if !unknown.is_empty() {
+            out.unknown_listed.push((module.clone(), unknown));
+        }
+
         let extra: Vec<String> = oam_keys
             .iter()
             .filter(|key| !node_keys.contains(key))
@@ -964,6 +1122,30 @@ fn compare_exports(ratchet: Option<&Value>, oam: &Value, node: Option<&Value>) -
             out.extra.push((module.clone(), extra));
         }
     }
+
+    // Listed under a module Node does not have here at all (or whose exports
+    // are not an object): the loop above never reaches that module, so every
+    // name listed for it is unaccounted for.
+    if let Some(listed_modules) = ratchet["missingExports"].as_object() {
+        for (module, names) in listed_modules {
+            if node_map.get(module).and_then(Value::as_array).is_some() {
+                continue;
+            }
+            let names: Vec<String> = names
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !names.is_empty() {
+                out.unknown_listed.push((module.clone(), names));
+            }
+        }
+    }
+    out.unknown_listed.sort();
 
     // Ratchet-down for modules too.
     out.stale_absent_modules = allowed_absent
@@ -1329,6 +1511,11 @@ struct DeclParity {
     /// Recorded-as-deliberate entries that are now declared, or that the
     /// module no longer exports. GATING, so the list can only shrink.
     stale: Vec<(String, Vec<String>)>,
+    /// Specifiers oam.d.ts declares that the runner did not report on, so
+    /// nothing compared them: a real module missing from
+    /// conformance/runners/oam_modules.mjs, or a declaration for a module
+    /// that does not exist. GATING.
+    unprobed: Vec<String>,
     /// Names deliberately left undeclared and still exported.
     allowed: usize,
     /// Export names compared across every module.
@@ -1415,6 +1602,18 @@ fn compare_declarations(
         }
     }
 
+    // The other blind side: the loop above walks only what the RUNNER
+    // reported, and the runner probes a hardcoded specifier list. A
+    // `declare module` block for a specifier outside that list was never
+    // compared in either direction -- whether the module is real (the runner
+    // is missing it) or not (the declarations promise a module nothing
+    // publishes).
+    out.unprobed = declared
+        .keys()
+        .filter(|module| !live_map.contains_key(module.as_str()))
+        .cloned()
+        .collect();
+
     out
 }
 
@@ -1451,6 +1650,17 @@ pub(crate) fn write_receipts(files: &[(PathBuf, String)]) -> Result<bool> {
     Ok(true)
 }
 
+/// Printed under a receipt's `Commit` stamp (CONFORMANCE.md and
+/// CONFORMANCE-NODE.md). [`write_receipts`] leaves a receipt alone when only
+/// the stamp would change, so the stamp names the tree whose run last CHANGED
+/// the results -- which can be releases behind HEAD, and can be a `+wip` tree
+/// nobody can check out. A reader otherwise takes it for the build the numbers
+/// describe.
+pub(crate) const STAMP_NOTE: &str = "The stamp above names the tree whose run last *changed* \
+     these results, not the latest tree they were checked on: a run with identical results \
+     leaves this file untouched, stamp included. A `+wip` suffix means that tree had \
+     uncommitted changes.\n\n";
+
 /// Drop the provenance lines -- the markdown header and the JSON twin's
 /// `commit` / `oamVersion`. Everything else, results included, stays
 /// significant.
@@ -1464,6 +1674,18 @@ fn strip_stamp(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A per-run scratch directory, removed (best effort) when this drops -- so
+/// every return from the owning function cleans up, an early `?` included.
+/// Only for directories the harness itself named under the temp dir; a
+/// caller-supplied cache root is never wrapped in one.
+pub(crate) struct ScratchDir(pub(crate) PathBuf);
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 pub(crate) fn repo_root() -> Result<PathBuf> {
@@ -1501,18 +1723,63 @@ pub(crate) fn ensure_oam_built(repo: &Path, release: bool) -> Result<PathBuf> {
     // target/debug/oam from July 22 and ran the whole node-suite against it
     // -- 140 phantom failures against today's corpus.
     println!("building oam ({profile})...");
-    let mut args = vec!["build", "-p", "oam_cli"];
+    // The JSON messages go to stdout and are read below; the human-readable
+    // progress and diagnostics still render on the inherited stderr.
+    let mut args = vec![
+        "build",
+        "-p",
+        "oam_cli",
+        "--message-format=json-render-diagnostics",
+    ];
     if release {
         args.push("--release");
     }
-    let status = Command::new("cargo")
+    let built = Command::new("cargo")
         .args(&args)
         .current_dir(repo)
-        .status()?;
-    if !status.success() {
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+        .context("running cargo build -p oam_cli")?;
+    if !built.status.success() {
         bail!("cargo build -p oam_cli failed");
     }
+    // Take the path from cargo itself where it reports one. CARGO_TARGET_DIR
+    // is only one of the things that move the artifact: CARGO_BUILD_TARGET, or
+    // a `build.target` / `build.target-dir` in a cargo config, put it under a
+    // directory the guess above does not name, and the guess then points at
+    // nothing -- or at a stale binary an earlier layout left behind.
+    let exe =
+        oam_executable_from_cargo_messages(&String::from_utf8_lossy(&built.stdout)).unwrap_or(exe);
+    // Every suite spawns this path once per test. If it is not there, each
+    // spawn fails the same way and the run would be scored as if the tests
+    // had failed, so stop here, before anything is measured or written.
+    if !exe.is_file() {
+        bail!(
+            "cargo build -p oam_cli succeeded but {} is not a file; \
+             the build wrote the binary somewhere this harness did not find",
+            exe.display()
+        );
+    }
     Ok(exe)
+}
+
+/// The `oam` executable a `cargo build --message-format=json*` run reported:
+/// the `executable` of the `compiler-artifact` message for the `oam` bin
+/// target. `None` when no such message is present.
+fn oam_executable_from_cargo_messages(stdout: &str) -> Option<PathBuf> {
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|msg| msg["reason"] == "compiler-artifact" && msg["target"]["name"] == "oam")
+        .filter(|msg| {
+            msg["target"]["kind"]
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|k| k == "bin"))
+        })
+        .filter_map(|msg| msg["executable"].as_str().map(PathBuf::from))
+        .next_back()
 }
 
 fn which_node() -> Option<String> {
@@ -1570,10 +1837,83 @@ pub(crate) struct Captured {
     pub(crate) timed_out: bool,
 }
 
+/// How long the output readers get to reach end-of-file once the child has
+/// been killed at its deadline. Normally they are there already; the wait
+/// only runs out when something else still holds the pipe.
+const READER_GRACE: Duration = Duration::from_secs(2);
+
+/// One output pipe being drained on its own thread into a shared buffer.
+///
+/// Shared, not returned from the thread, because the thread only returns at
+/// end-of-file and end-of-file needs EVERY holder of the pipe to close it. A
+/// process the child started with inherited stdio is such a holder and
+/// outlives `Child::kill`, which ends the direct child alone. Joining the
+/// reader unconditionally therefore parked the harness on exactly the hang
+/// the deadline exists to end.
+struct PipeReader {
+    bytes: std::sync::Arc<Mutex<Vec<u8>>>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl PipeReader {
+    fn spawn(mut pipe: impl std::io::Read + Send + 'static) -> Self {
+        let bytes = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&bytes);
+        let thread = std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => match sink.lock() {
+                        Ok(mut all) => all.extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        Self { bytes, thread }
+    }
+
+    /// Wait until `until` for end-of-file. `None` when the pipe is still
+    /// open then; the reader is left behind and ends with the last holder.
+    fn finish(self, until: Instant) -> Option<String> {
+        while !self.thread.is_finished() {
+            if Instant::now() >= until {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let _ = self.thread.join();
+        let bytes = self
+            .bytes
+            .lock()
+            .map(|mut all| std::mem::take(&mut *all))
+            .unwrap_or_default();
+        // What `read_to_string` gave: the whole text, or nothing at all when
+        // it is not UTF-8.
+        Some(String::from_utf8(bytes).unwrap_or_default())
+    }
+
+    /// What has arrived so far, for a pipe that never reached end-of-file.
+    fn so_far(bytes: &Mutex<Vec<u8>>) -> String {
+        bytes
+            .lock()
+            .map(|all| String::from_utf8_lossy(&all).into_owned())
+            .unwrap_or_default()
+    }
+}
+
 /// Spawn with piped output and a hard deadline (the oam_mcp try_wait
 /// pattern): a hung case must fail the suite, not the harness.
+///
+/// The deadline covers the output too. A child that leaves a process behind
+/// holding its stdout or stderr never delivers end-of-file, so once the
+/// deadline (plus `READER_GRACE` after a kill) has passed the run is reported
+/// as timed out with whatever had been written by then. Only the direct
+/// child is killed; a process it left behind is not.
 pub(crate) fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Captured> {
-    use std::io::Read;
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1581,18 +1921,8 @@ pub(crate) fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<C
         .spawn()
         .with_context(|| format!("spawning {cmd:?}"))?;
 
-    let mut stdout_pipe = child.stdout.take().context("stdout piped")?;
-    let mut stderr_pipe = child.stderr.take().context("stderr piped")?;
-    let stdout_thread = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stdout_pipe.read_to_string(&mut buf);
-        buf
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stderr_pipe.read_to_string(&mut buf);
-        buf
-    });
+    let stdout_reader = PipeReader::spawn(child.stdout.take().context("stdout piped")?);
+    let stderr_reader = PipeReader::spawn(child.stderr.take().context("stderr piped")?);
 
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
@@ -1608,9 +1938,32 @@ pub(crate) fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<C
         }
         std::thread::sleep(Duration::from_millis(50));
     };
+    // A child that exited by itself still has the rest of its deadline for
+    // its output to end; a killed one gets the grace period.
+    let until = if timed_out {
+        Instant::now() + READER_GRACE
+    } else {
+        deadline.max(Instant::now() + READER_GRACE)
+    };
+    let (stdout_bytes, stderr_bytes) = (
+        std::sync::Arc::clone(&stdout_reader.bytes),
+        std::sync::Arc::clone(&stderr_reader.bytes),
+    );
+    let stdout = stdout_reader.finish(until);
+    let stderr = stderr_reader.finish(until);
+    if stdout.is_none() || stderr.is_none() {
+        // A pipe outlived the deadline: the run did not finish in time,
+        // whatever the direct child's exit status said.
+        return Ok(Captured {
+            stdout: stdout.unwrap_or_else(|| PipeReader::so_far(&stdout_bytes)),
+            stderr: stderr.unwrap_or_else(|| PipeReader::so_far(&stderr_bytes)),
+            code: -2,
+            timed_out: true,
+        });
+    }
     Ok(Captured {
-        stdout: stdout_thread.join().unwrap_or_default(),
-        stderr: stderr_thread.join().unwrap_or_default(),
+        stdout: stdout.unwrap_or_default(),
+        stderr: stderr.unwrap_or_default(),
         code,
         timed_out,
     })
@@ -2004,6 +2357,54 @@ mod receipt_tests {
 mod tests {
     use super::*;
 
+    /// The longest watchdog delay a case source arms, in ms.
+    ///
+    /// The shape every case uses is `setTimeout(() => { ... }, N)` around a
+    /// WATCHDOG line, so the delay is the first `}, N)` after a mention. A
+    /// mention can be prose (a header comment naming the marker) with no
+    /// timer after it before the next one, so every mention is tried and the
+    /// largest delay found wins. `None` when no mention yields a literal.
+    fn watchdog_delay_ms(src: &str) -> Option<u64> {
+        src.split("WATCHDOG")
+            .skip(1)
+            .filter_map(|after| {
+                let (_, rest) = after.split_once("}, ")?;
+                rest.split(')')
+                    .next()?
+                    .trim()
+                    .replace('_', "")
+                    .parse::<u64>()
+                    .ok()
+            })
+            .max()
+    }
+
+    #[test]
+    fn the_watchdog_delay_parser_reads_the_shapes_cases_use() {
+        let armed = "setTimeout(() => {\n  console.log(\"WATCHDOG\");\n  process.exit(9);\n}, 60000).unref();";
+        assert_eq!(watchdog_delay_ms(armed), Some(60000));
+        assert_eq!(
+            watchdog_delay_ms(&armed.replace("60000", "60_000")),
+            Some(60000)
+        );
+        // A prose mention first: the armed one after it still counts.
+        assert_eq!(
+            watchdog_delay_ms(&format!("// prints `WATCHDOG` on a hang\n{armed}")),
+            Some(60000)
+        );
+        // Two watchdogs: the longer is the one the ceiling must clear.
+        assert_eq!(
+            watchdog_delay_ms(&format!("{armed}\n{}", armed.replace("60000", "120000"))),
+            Some(120000)
+        );
+        // A named delay cannot be read, and must not read as "no watchdog".
+        assert_eq!(
+            watchdog_delay_ms(&armed.replace("60000", "WATCHDOG_MS")),
+            None
+        );
+        assert_eq!(watchdog_delay_ms("console.log('no marker');"), None);
+    }
+
     /// Every case that arms its own watchdog must be able to fire it before
     /// `CASE_CEILING` kills it, or the harness records `TIMEOUT` and the case
     /// is scored on the clock instead of on what the two runtimes printed.
@@ -2017,30 +2418,36 @@ mod tests {
             .join("cases");
         let mut seen = 0usize;
         let mut worst: Option<(String, u64)> = None;
+        let mut unparsed: Vec<String> = Vec::new();
         for entry in std::fs::read_dir(&dir).expect("read cases").flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("mjs") {
                 continue;
             }
             let src = std::fs::read_to_string(&path).expect("read case");
-            // The shape every case uses: `setTimeout(() => { ...  }, N)`
-            // around a WATCHDOG line.
-            let Some(watchdog) = src.split("WATCHDOG").nth(1) else {
+            if !src.contains("WATCHDOG") {
                 continue;
-            };
-            let Some(ms) = watchdog
-                .split_once("}, ")
-                .and_then(|(_, rest)| rest.split(')').next())
-                .and_then(|n| n.trim().parse::<u64>().ok())
-            else {
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            // A case that mentions WATCHDOG and yields no delay is a case
+            // this test cannot vouch for, so it fails rather than dropping
+            // out: skipping it would let the next 150 s watchdog through.
+            let Some(ms) = watchdog_delay_ms(&src) else {
+                unparsed.push(name);
                 continue;
             };
             seen += 1;
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
             if worst.as_ref().is_none_or(|(_, w)| ms > *w) {
                 worst = Some((name, ms));
             }
         }
+        unparsed.sort();
+        assert!(
+            unparsed.is_empty(),
+            "these cases mention WATCHDOG but arm it in a shape this test cannot read \
+             (it wants a literal delay: `}}, 60000)` after the WATCHDOG line), so their \
+             margin under CASE_CEILING is unchecked: {unparsed:?}"
+        );
         assert!(seen > 0, "no case watchdogs found in {}", dir.display());
         let (name, ms) = worst.expect("a watchdog");
         assert!(
@@ -2048,6 +2455,92 @@ mod tests {
             "{name} arms a {ms} ms watchdog, but the harness gives up at \
              {} ms -- the case can never print its own verdict",
             CASE_CEILING.as_millis()
+        );
+    }
+
+    /// A command whose direct child starts another process on the same
+    /// stdout/stderr and then waits on it: the shell is the child the
+    /// harness kills, the sleeper keeps the pipes open afterwards.
+    fn shell_with_a_lingering_descendant() -> Command {
+        if cfg!(windows) {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "echo started& ping -n 20 127.0.0.1"]);
+            cmd
+        } else {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "echo started; sleep 20 & wait"]);
+            cmd
+        }
+    }
+
+    #[test]
+    fn a_timed_out_run_returns_even_when_a_descendant_holds_the_pipes() {
+        let started = Instant::now();
+        let out = run_with_timeout(
+            &mut shell_with_a_lingering_descendant(),
+            Duration::from_millis(1500),
+        )
+        .expect("the shell spawns");
+        let took = started.elapsed();
+        assert!(out.timed_out, "the run outlived its deadline");
+        assert_eq!(out.code, -2);
+        // The descendant holds the pipes for ~20 s. Returning well inside
+        // that is the property: deadline + READER_GRACE, with slack for a
+        // loaded host.
+        assert!(
+            took < Duration::from_secs(12),
+            "run_with_timeout took {took:?}; it waited on the pipes instead of the deadline"
+        );
+        // What was written before the deadline is still reported.
+        assert!(out.stdout.contains("started"), "stdout: {:?}", out.stdout);
+    }
+
+    #[test]
+    fn a_finished_run_keeps_its_whole_output_and_exit_code() {
+        let mut cmd = if cfg!(windows) {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "echo out& echo err 1>&2& exit /B 3"]);
+            cmd
+        } else {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "echo out; echo err 1>&2; exit 3"]);
+            cmd
+        };
+        let out = run_with_timeout(&mut cmd, Duration::from_secs(30)).expect("the shell spawns");
+        assert!(!out.timed_out);
+        assert_eq!(out.code, 3);
+        assert_eq!(normalize(&out.stdout), "out");
+        assert_eq!(normalize(&out.stderr), "err");
+    }
+
+    #[test]
+    fn the_built_binary_is_located_from_cargos_own_report() {
+        let messages = concat!(
+            r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"oam_core"},"executable":null}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","target":{"kind":["custom-build"],"name":"build-script-build"},"executable":null}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"oam"},"executable":"/t/x86_64-unknown-linux-gnu/debug/oam"}"#,
+            "\n",
+            "not json at all\n",
+            r#"{"reason":"build-finished","success":true}"#,
+            "\n",
+        );
+        assert_eq!(
+            oam_executable_from_cargo_messages(messages),
+            Some(PathBuf::from("/t/x86_64-unknown-linux-gnu/debug/oam"))
+        );
+        // Nothing reported: the caller falls back to its own guess.
+        assert_eq!(
+            oam_executable_from_cargo_messages(r#"{"reason":"build-finished","success":true}"#),
+            None
+        );
+        // A same-named target that is not the binary does not count.
+        assert_eq!(
+            oam_executable_from_cargo_messages(
+                r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"oam"},"executable":null}"#
+            ),
+            None
         );
     }
 
@@ -2228,6 +2721,46 @@ mod tests {
         // A clean run has nothing to say.
         let clean = vec![json!({ "case": "aaa.mjs", "status": "pass" })];
         assert_eq!(harness_problems(Vec::new(), &clean), None);
+    }
+
+    /// A case is referred to by its number alone ("case 378") in docs, code
+    /// comments and the changelog, so the numeric prefix must name exactly one
+    /// file. Two pairs once shared 68 and 69; this keeps a third from landing.
+    #[test]
+    fn no_two_cases_share_a_number() {
+        let dir = repo_root()
+            .expect("repo root")
+            .join("conformance")
+            .join("cases");
+        let mut by_number: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+        let mut unnumbered: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("read cases").flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("mjs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            match name
+                .split_once('-')
+                .and_then(|(prefix, _)| prefix.parse::<u64>().ok())
+            {
+                Some(number) => by_number.entry(number).or_default().push(name),
+                None => unnumbered.push(name),
+            }
+        }
+        assert!(!by_number.is_empty(), "no cases found in {}", dir.display());
+        assert!(
+            unnumbered.is_empty(),
+            "cases must be named NN-topic.mjs: {unnumbered:?}"
+        );
+        let shared: Vec<(u64, Vec<String>)> = by_number
+            .into_iter()
+            .filter(|(_, names)| names.len() > 1)
+            .collect();
+        assert!(
+            shared.is_empty(),
+            "a case number must name one file; renumber one of each: {shared:?}"
+        );
     }
 
     /// Case 384 cuts itself on purpose, so it is left out of the slow-host
@@ -2684,6 +3217,119 @@ mod tests {
         assert_eq!(out.extra, vec![("oamx".to_string(), vec!["b".to_string()])]);
     }
 
+    // -- a module that loads but exports a primitive (the runner's `null`) --
+
+    /// `null` is the runner's "loads, but module.exports is a primitive", kept
+    /// distinct from `false` (absent). It has no named exports, so every Node
+    /// name is missing per name -- not one absent module.
+    #[test]
+    fn a_primitive_export_is_a_present_module_with_no_names() {
+        let out = compare_exports(
+            Some(&ratchet(&[], &[])),
+            &json!({ "exportNames": { "punycode": null } }),
+            Some(&surface(&[("punycode", Some(&["decode", "encode"]))])),
+        );
+        assert!(out.new_absent_modules.is_empty());
+        assert_eq!(out.absent_module_names, 0);
+        assert_eq!(
+            out.new_missing,
+            vec![(
+                "punycode".to_string(),
+                vec!["decode".to_string(), "encode".to_string()]
+            )]
+        );
+        assert_eq!(out.present(), 0);
+    }
+
+    // -- ratchet entries nothing could ever remove --
+
+    /// A listed name Node does not export is not "known" and, with oam lacking
+    /// it too, not "stale" either. It has to be reported or it stays forever.
+    #[test]
+    fn a_listed_name_neither_runtime_exports_is_flagged() {
+        let out = compare_exports(
+            Some(&ratchet(
+                &[],
+                &[("fs", &["statfsSync", "statfsSnyc"]), ("gone", &["x"])],
+            )),
+            &surface(&[("fs", Some(&["statSync"]))]),
+            Some(&surface(&[("fs", Some(&["statSync", "statfsSync"]))])),
+        );
+        assert_eq!(out.known_missing, 1);
+        assert!(out.stale.is_empty());
+        assert!(out.new_missing.is_empty());
+        assert_eq!(
+            out.unknown_listed,
+            vec![
+                ("fs".to_string(), vec!["statfsSnyc".to_string()]),
+                ("gone".to_string(), vec!["x".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_clean_ratchet_has_no_unknown_names() {
+        let out = compare_exports(
+            Some(&ratchet(&[], &[("fs", &["statfsSync"])])),
+            &surface(&[("fs", Some(&["statSync"]))]),
+            Some(&surface(&[("fs", Some(&["statSync", "statfsSync"]))])),
+        );
+        assert!(out.unknown_listed.is_empty());
+    }
+
+    // -- global shapes share the map but are not module exports --
+
+    #[test]
+    fn global_shapes_are_counted_apart_from_module_exports() {
+        let out = compare_exports(
+            Some(&ratchet(
+                &["global:fetch.prototype"],
+                &[("global:Buffer", &["poolSize"])],
+            )),
+            &surface(&[
+                ("fs", Some(&["statSync"])),
+                ("global:Buffer", Some(&["alloc"])),
+                ("global:fetch.prototype", None),
+            ]),
+            Some(&surface(&[
+                ("fs", Some(&["statSync", "statfsSync"])),
+                ("global:Buffer", Some(&["alloc", "poolSize"])),
+                ("global:fetch.prototype", Some(&["constructor"])),
+            ])),
+        );
+        assert_eq!(out.node_total, 5);
+        assert_eq!(out.node_global_total, 3);
+        // poolSize (known) and the wholly absent prototype's one name.
+        assert_eq!(out.global_missing, 2);
+        assert_eq!(out.globals_present(), 1);
+        assert_eq!(out.module_total(), 2);
+        assert_eq!(out.modules_present(), 1);
+        assert_eq!(out.present(), 2);
+    }
+
+    #[test]
+    fn surface_keys_are_labelled_by_kind() {
+        assert_eq!(surface_label("fs"), "node:fs");
+        assert_eq!(
+            surface_label("global:Buffer.prototype"),
+            "global Buffer.prototype"
+        );
+        assert_eq!(surface_noun("fs"), "export(s)");
+        assert_eq!(surface_noun("global:Buffer"), "own property name(s)");
+    }
+
+    #[test]
+    fn scratch_dir_is_removed_on_drop() {
+        let dir = std::env::temp_dir().join(format!(
+            "oam-conformance-scratch-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join("runners")).unwrap();
+        std::fs::write(dir.join("runners").join("blob.v8c"), b"x").unwrap();
+        drop(ScratchDir(dir.clone()));
+        assert!(!dir.exists(), "{} survived its guard", dir.display());
+    }
+
     // ---------------------------------- oam's own module declarations ----
 
     /// The shipped declarations, read from the repo the same way the gate
@@ -2901,6 +3547,48 @@ interface OamGlobal { version: string; }
                 vec!["describe".to_string(), "test".to_string()]
             )]
         );
+    }
+
+    #[test]
+    fn a_declared_module_the_runner_did_not_report_is_a_gate_failure() {
+        let declared = BTreeMap::from([
+            ("oam:mcp".to_string(), vec!["McpServer".to_string()]),
+            ("oam:queue".to_string(), vec!["Queue".to_string()]),
+        ]);
+        let out = compare_declarations(
+            &undeclared(&[]),
+            &live(&[("oam:mcp", &["McpServer"])]),
+            &declared,
+        );
+        assert_eq!(out.unprobed, vec!["oam:queue".to_string()]);
+        assert!(out.missing.is_empty());
+        assert!(out.extra.is_empty());
+
+        // Reported by the runner: compared like any other, nothing unprobed.
+        let out = compare_declarations(
+            &undeclared(&[]),
+            &live(&[("oam:mcp", &["McpServer"]), ("oam:queue", &["Queue"])]),
+            &declared,
+        );
+        assert!(out.unprobed.is_empty());
+    }
+
+    /// The runner probes a hardcoded specifier list. Every specifier the
+    /// shipped declarations name must be on it, or that module's names are
+    /// compared by nothing -- checked here so it fails without a full run.
+    #[test]
+    fn the_runner_lists_every_declared_oam_module() {
+        let repo = repo_root().unwrap();
+        let runner =
+            std::fs::read_to_string(repo.join("conformance/runners/oam_modules.mjs")).unwrap();
+        let declared = declared_names(&shipped_declarations()).unwrap();
+        for module in declared.keys().filter(|m| m.as_str() != "oam") {
+            assert!(
+                runner.contains(&format!("\"{module}\"")),
+                "oam.d.ts declares `{module}` but conformance/runners/oam_modules.mjs does \
+                 not probe it"
+            );
+        }
     }
 
     #[test]

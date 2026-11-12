@@ -372,6 +372,13 @@ impl NodeInflate {
         matches!(self.at, At::Between | At::Done)
     }
 
+    /// True once nothing more will be decoded: a zlib or raw stream ended,
+    /// or a zero byte followed a gzip member (a gzip stream that merely
+    /// ended still reads a further member). Any further input is ignored.
+    pub(crate) fn is_over(&self) -> bool {
+        self.at == At::Done
+    }
+
     /// `Err(UNEXPECTED_EOF)` unless the stream is complete: the check node
     /// makes when the input ends under Z_FINISH (one-shot calls, `end()`).
     pub fn finish(&self) -> Result<(), ZlibError> {

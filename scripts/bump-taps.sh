@@ -49,9 +49,11 @@
 #                      the org-wide spellings the @yawlabs/*-mcp scripts read,
 #                      honored as a fallback so one export works everywhere.
 #                      The OAM_-prefixed names win when both are set.
-#   OAM_TAPS_OPTIONAL  1 = warn and exit 0 when a checkout is missing
+#   OAM_TAPS_OPTIONAL  1 = warn and exit 3 when a checkout is missing, instead
+#                      of failing with exit 1. 3 means "skipped, nothing
+#                      done", so a caller can tell it from 0 (taps current).
 #                      (release-local.sh sets this: a release is still valid
-#                      without a tap bump, and the verification says so loudly)
+#                      without a tap bump, and it reports the skip loudly)
 # =============================================================================
 
 set -euo pipefail
@@ -223,12 +225,32 @@ for a in "${BREW_ASSETS[@]}" "${SCOOP_ASSETS[@]}"; do
   ok "$a  $(printf '%.12s' "$h")..."
 done
 
+# --- helper: only our own commits may ride the push --------------------------
+# `git push origin HEAD` publishes EVERY commit ahead of origin, not just the
+# one this script makes, and these checkouts are shared: a commit another
+# session made and has not pushed (a Casks/yaw.rb bump that is not ready, say)
+# would go live on the tap as a side effect of an oam release. So a checkout
+# that is ahead of origin by anything other than commits confined to our own
+# file is refused, before anything is rewritten. Commits confined to our file
+# are this script's own earlier run whose push failed -- the repair path.
+refuse_foreign_ahead() {
+  local dir="$1" file="$2" label="$3" branch="$4" foreign
+  foreign="$(git -C "$dir" rev-list --count "origin/$branch..HEAD" -- . ":(exclude)$file")" \
+    || fail "could not inspect the unpushed commits in $dir"
+  if [ "$foreign" != "0" ]; then
+    fail "$label checkout has $foreign unpushed commit(s) touching files other than $file -- pushing would publish them too. Not this script's to push: push or move them yourself (git -C $dir log origin/$branch..HEAD), then re-run."
+  fi
+}
+
 # --- helper: pull, rewrite, commit, push -----------------------------------
 # Shared by both taps. The rewrite is done by the caller (different formats);
 # this owns the git half so the two paths cannot drift.
 publish_tap() {
   local dir="$1" file="$2" label="$3" branch unpushed
   branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD)" || return 1
+  # Asked again here, right before the pushes: sync_tap asked before the
+  # rewrite, and a shared checkout can have moved since.
+  refuse_foreign_ahead "$dir" "$file" "$label" "$branch"
   unpushed="$(git -C "$dir" rev-list --count "origin/$branch..HEAD" 2>/dev/null || echo 0)"
   # "Already current" means current AT ORIGIN, not merely in the worktree. A
   # previous run whose push failed leaves the commit local and the file clean,
@@ -301,6 +323,9 @@ sync_tap() {
   if ! git -C "$dir" rev-parse --verify --quiet "origin/$branch" >/dev/null; then
     fail "$label checkout is on '$branch', which has no origin/$branch -- pushing would create a new branch on the tap instead of updating the one users install from. Switch it to the tap's default branch, then re-run."
   fi
+  # Before the rebase as well as before the push: rebasing would rewrite
+  # another session's unpushed commits.
+  refuse_foreign_ahead "$dir" "$file" "$label" "$branch"
   behind="$(git -C "$dir" rev-list --count "HEAD..origin/$branch")"
   if [ "$behind" = "0" ]; then return 0; fi
 

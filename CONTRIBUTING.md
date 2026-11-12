@@ -1,13 +1,15 @@
 # Contributing
 
-Thanks for considering it. Until the first public release the codebase moves fast; issues and
-small PRs are welcome, large changes should start as a discussion.
+Thanks for considering it. oam is public and in beta, and before 1.0 the codebase still moves
+fast; issues and small PRs are welcome, large changes should start as a discussion.
 
 ## Ground rules
 
-- **DCO:** every commit is signed off (`git commit -s`), certifying the
+- **DCO:** sign off every commit you contribute (`git commit -s`), certifying the
   [Developer Certificate of Origin](https://developercertificate.org/). No CLA, ever
-  (see GOVERNANCE.md).
+  (see GOVERNANCE.md). The sign-off is checked at review, not by the gate --
+  `scripts/ci-local.sh` does not inspect commit trailers -- and much of the existing history,
+  recent maintainer commits among it, carries none.
 - **AI-assisted contributions are welcome** and held to the same gates as everything else —
   read AI-POLICY.md first. Practical implications: keep PRs under the changeset limits, never
   modify a test in the same PR as the implementation it gates, and label agent-authored

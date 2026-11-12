@@ -156,55 +156,49 @@ impl TlsRange {
         }
     }
 
-    /// A byte the connector's shared state carries the range as.
-    pub(crate) fn code(self) -> u8 {
+    /// The range's slot in [`PLATFORM`] (a range with nothing in it has
+    /// none, and is refused before the slot is looked up).
+    fn slot(self) -> usize {
         match self {
-            TlsRange::Both => 0,
+            TlsRange::Both | TlsRange::None => 0,
             TlsRange::Tls12 => 1,
             TlsRange::Tls13 => 2,
-            TlsRange::None => 3,
-        }
-    }
-
-    pub(crate) fn from_code(code: u8) -> TlsRange {
-        match code {
-            1 => TlsRange::Tls12,
-            2 => TlsRange::Tls13,
-            3 => TlsRange::None,
-            _ => TlsRange::Both,
         }
     }
 }
 
-/// One slot per range that can handshake, each built once per process.
-static PLATFORM: [OnceLock<Result<TlsConfigs, String>>; 3] =
-    [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+/// One slot per range that can handshake, each built once per process. A
+/// slot holds only a build that succeeded.
+static PLATFORM: [OnceLock<TlsConfigs>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
 
 /// The platform-verifier configs (plus NODE_EXTRA_CA_CERTS) for `range`,
 /// built once per process on first use. The build runs under
 /// `spawn_blocking` (it may read the system store from disk); later calls
 /// clone three `Arc`s. Two first requests racing may both build; the first
-/// result stored wins. `TlsRange::None` has no config: the connector refuses
-/// the handshake before asking.
+/// result stored wins. A build that FAILS is not stored: that request fails
+/// with the error, and the next https request builds again, so a system
+/// store that was unreadable for the first request (a CA bundle mounted
+/// after start) does not fail every later one. `TlsRange::None` has no
+/// config: the connector refuses the handshake before asking.
 pub async fn platform(range: TlsRange) -> Result<TlsConfigs, String> {
     let Some(versions) = range.versions() else {
         return Err(no_protocols());
     };
-    let slot = &PLATFORM[usize::from(range.code())];
+    let slot = &PLATFORM[range.slot()];
     if let Some(built) = slot.get() {
-        return built.clone();
+        return Ok(built.clone());
     }
     let built = match tokio::task::spawn_blocking(move || {
         build_platform(versions, &crate::tls::extra_ca_certs().certs)
     })
     .await
     {
-        Ok(built) => built,
+        Ok(built) => built?,
         // The build panicked or the runtime is shutting down: nothing to
         // cache, the next request tries again.
         Err(e) => return Err(e.to_string()),
     };
-    slot.get_or_init(|| built).clone()
+    Ok(slot.get_or_init(|| built).clone())
 }
 
 /// The configs [`platform`] would build had NODE_EXTRA_CA_CERTS named

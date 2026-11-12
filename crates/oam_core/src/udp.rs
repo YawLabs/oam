@@ -11,7 +11,11 @@ use std::sync::{Arc, atomic::Ordering};
 #[derive(Default)]
 pub struct UdpState {
     sockets: HashMap<u64, Arc<tokio::net::UdpSocket>>,
-    cancel: HashMap<u64, Arc<tokio::sync::Notify>>,
+    /// One close signal per socket with a receive in flight. A `watch`, not a
+    /// `Notify`: it is level-triggered and reaches every receiver, so a
+    /// close ends each receive on the socket, including one that has not
+    /// been polled yet. An entry exists only while its socket does.
+    cancel: HashMap<u64, tokio::sync::watch::Sender<bool>>,
 }
 
 pub type UdpRegistry = Arc<std::sync::Mutex<UdpState>>;
@@ -96,18 +100,21 @@ pub async fn udp_send(
 /// Returns Json {data (base64), rinfo: {address, port, family, size}}
 /// or Done if the socket was closed.
 pub async fn udp_recv(registry: UdpRegistry, handle: u64, len: usize) -> OpOutcome {
-    let (socket, notify) = {
+    let (socket, mut closed) = {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-        let socket = guard.sockets.get(&handle).cloned();
-        let notify = guard
+        // The socket first: a handle that is closed or unknown gets no close
+        // signal of its own, which nothing would ever remove.
+        let Some(socket) = guard.sockets.get(&handle).cloned() else {
+            return OpOutcome::Done;
+        };
+        // Subscribed under the lock udp_close sends under, so the close is
+        // always seen as a change.
+        let closed = guard
             .cancel
             .entry(handle)
-            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
-            .clone();
-        (socket, notify)
-    };
-    let Some(socket) = socket else {
-        return OpOutcome::Done;
+            .or_insert_with(|| tokio::sync::watch::channel(false).0)
+            .subscribe();
+        (socket, closed)
     };
 
     let mut buf = vec![0u8; len.clamp(1, 65536)];
@@ -135,17 +142,71 @@ pub async fn udp_recv(registry: UdpRegistry, handle: u64, len: usize) -> OpOutco
                 Err(e) => udp_fail(e, "recvmsg", &handle.to_string()),
             }
         }
-        _ = notify.notified() => {
+        // Resolves on the close (a change), and on the sender going away.
+        _ = closed.changed() => {
             OpOutcome::Done
         }
     }
 }
 
-/// socket.close(): close the UDP socket. Notifies any blocked recv.
+/// socket.close(): close the UDP socket. Ends every receive blocked on it,
+/// so none keeps the socket (and its port) alive.
 pub fn udp_close(registry: &UdpRegistry, handle: u64) {
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     guard.sockets.remove(&handle);
-    if let Some(notify) = guard.cancel.remove(&handle) {
-        notify.notify_one();
+    if let Some(closed) = guard.cancel.remove(&handle) {
+        let _ = closed.send(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Closing a socket ends EVERY receive in flight on it, and a receive on
+    /// a handle that is gone leaves nothing behind in the registry.
+    #[tokio::test]
+    async fn close_ends_every_receive_and_a_gone_handle_leaves_no_entry() {
+        let registry: UdpRegistry = Default::default();
+        let ids = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let bound = udp_bind(registry.clone(), ids, "127.0.0.1".into(), 0).await;
+        let OpOutcome::Json(json) = bound else {
+            panic!("bind must succeed");
+        };
+        let handle = serde_json::from_str::<serde_json::Value>(&json).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+
+        let first = tokio::spawn(udp_recv(registry.clone(), handle, 16));
+        let second = tokio::spawn(udp_recv(registry.clone(), handle, 16));
+        // Both receives are parked once each holds the socket.
+        loop {
+            let parked = registry
+                .lock()
+                .unwrap()
+                .sockets
+                .get(&handle)
+                .map(Arc::strong_count);
+            if parked == Some(3) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        udp_close(&registry, handle);
+        for recv in [first, second] {
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), recv)
+                .await
+                .expect("close must end the receive")
+                .unwrap();
+            assert!(matches!(outcome, OpOutcome::Done));
+        }
+
+        assert!(matches!(
+            udp_recv(registry.clone(), handle, 16).await,
+            OpOutcome::Done
+        ));
+        let guard = registry.lock().unwrap();
+        assert!(guard.sockets.is_empty());
+        assert!(guard.cancel.is_empty());
     }
 }

@@ -23,17 +23,36 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::mpsc::UnboundedSender;
 
-/// The run's inotify instance, while it has descriptors.
+/// What sits behind the run's lock.
+#[derive(Default)]
+struct State {
+    /// The run's inotify instance, while it has descriptors.
+    instance: Option<Instance>,
+    /// The watchers whose instance closed under them (their last descriptor
+    /// went with a deleted root). Each keeps its sender, so its parked read
+    /// stays pending until `close()`, as a libuv handle stays active after
+    /// its watch is gone; whether another watcher exists changes nothing.
+    idle: HashMap<u64, UnboundedSender<Note>>,
+}
+
+/// What the run's watchers share: the inotify instance, while it has
+/// descriptors, and the watchers it left behind.
 #[derive(Clone, Default)]
 pub(super) struct Shared {
-    slot: Arc<Mutex<Option<Instance>>>,
+    slot: Arc<Mutex<State>>,
+    /// The last watcher id handed out. It belongs to the run, not to an
+    /// instance: a `Handle` can outlive the instance it was made on (a
+    /// deleted root's watcher stays open until JS closes it), and its id
+    /// must never name a watcher of the instance that came after.
+    next: Arc<AtomicU64>,
 }
 
 impl Shared {
-    fn lock(&self) -> MutexGuard<'_, Option<Instance>> {
+    fn lock(&self) -> MutexGuard<'_, State> {
         self.slot.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -47,7 +66,9 @@ pub(super) struct Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        if let Some(instance) = self.shared.lock().as_mut() {
+        let mut state = self.shared.lock();
+        state.idle.remove(&self.id);
+        if let Some(instance) = state.instance.as_mut() {
             instance.detach(self.id);
         }
     }
@@ -58,7 +79,19 @@ struct Instance {
     /// By descriptor number: the descriptor and the watchers it serves.
     wds: HashMap<i32, Descriptor>,
     watchers: HashMap<u64, Watcher>,
-    next: u64,
+    /// Directories moved out of a recursive watcher's directory in the batch
+    /// of events being read, until their IN_MOVED_TO (the move stayed in the
+    /// tree) or the end of the batch (it did not) settles them.
+    moved: Vec<Moved>,
+}
+
+/// A directory a recursive watcher saw leave one of its directories.
+struct Moved {
+    /// Pairs the IN_MOVED_FROM with its IN_MOVED_TO.
+    cookie: u32,
+    watcher: u64,
+    /// The descriptors of the directory and of everything under it.
+    wds: Vec<i32>,
 }
 
 struct Descriptor {
@@ -103,28 +136,28 @@ pub(super) fn watch(
     recursive: bool,
     tx: UnboundedSender<Note>,
 ) -> Result<Handle, WatchStartError> {
-    let mut slot = shared.lock();
+    let mut state = shared.lock();
     // A new instance's reader starts only once the instance has a
     // descriptor: a reader blocked on an instance with none would never
     // wake.
-    let fresh = match slot.as_ref() {
+    let fresh = match state.instance.as_ref() {
         Some(_) => None,
         None => {
             let inotify = Inotify::init().map_err(WatchStartError::Io)?;
-            *slot = Some(Instance {
+            state.instance = Some(Instance {
                 watches: inotify.watches(),
                 wds: HashMap::new(),
                 watchers: HashMap::new(),
-                next: 0,
+                moved: Vec::new(),
             });
             Some(inotify)
         }
     };
-    let Some(instance) = slot.as_mut() else {
+    let Some(instance) = state.instance.as_mut() else {
         unreachable!("the slot was filled above");
     };
-    instance.next += 1;
-    let id = instance.next;
+    // Unique for the run, across instances (see `Shared::next`).
+    let id = shared.next.fetch_add(1, Ordering::Relaxed) + 1;
     instance.watchers.insert(
         id,
         Watcher {
@@ -139,7 +172,7 @@ pub(super) fn watch(
         if fresh.is_some() {
             // Nothing was added, so no reader: drop the instance, and with
             // it (and `fresh`) the descriptor.
-            *slot = None;
+            state.instance = None;
         }
         return Err(add_error(error));
     }
@@ -153,7 +186,7 @@ pub(super) fn watch(
             .spawn(move || read(reader, inotify));
         if let Err(error) = spawned {
             instance.detach(id);
-            *slot = None;
+            state.instance = None;
             return Err(WatchStartError::Io(error));
         }
     }
@@ -184,7 +217,18 @@ impl Instance {
             wd,
             users: Vec::new(),
         });
-        if descriptor.users.iter().any(|user| user.watcher == watcher) {
+        if let Some(user) = descriptor
+            .users
+            .iter_mut()
+            .find(|user| user.watcher == watcher)
+        {
+            // The same inode reached again: a directory renamed inside a
+            // recursive watcher's tree keeps its descriptor, and its entries
+            // are named by where it is now. (The root is never renamed: its
+            // prefix stays empty.)
+            if !user.prefix.as_os_str().is_empty() {
+                user.prefix = prefix;
+            }
             return Ok(());
         }
         descriptor.users.push(User { watcher, prefix });
@@ -220,17 +264,39 @@ impl Instance {
             return;
         };
         for number in w.wds {
-            let Some(descriptor) = self.wds.get_mut(&number) else {
-                continue;
-            };
-            descriptor.users.retain(|user| user.watcher != watcher);
-            if descriptor.users.is_empty()
-                && let Some(descriptor) = self.wds.remove(&number)
-            {
-                // Its IN_IGNORED wakes the reader. An error means the
-                // descriptor is already gone (its inode was deleted), and
-                // that IN_IGNORED is already queued.
-                let _ = self.watches.remove(descriptor.wd);
+            self.drop_user(watcher, number);
+        }
+    }
+
+    /// Take `watcher` off descriptor `number`; remove the descriptor if
+    /// nobody else uses it.
+    fn drop_user(&mut self, watcher: u64, number: i32) {
+        let Some(descriptor) = self.wds.get_mut(&number) else {
+            return;
+        };
+        descriptor.users.retain(|user| user.watcher != watcher);
+        if descriptor.users.is_empty()
+            && let Some(descriptor) = self.wds.remove(&number)
+        {
+            // Its IN_IGNORED wakes the reader. An error means the
+            // descriptor is already gone (its inode was deleted), and
+            // that IN_IGNORED is already queued.
+            let _ = self.watches.remove(descriptor.wd);
+        }
+    }
+
+    /// The end of a batch of events: a directory that left a recursive
+    /// watcher's tree without arriving anywhere else in it has moved out,
+    /// so the watcher stops watching it and everything under it. (A move
+    /// whose IN_MOVED_TO lands in the next batch is dropped here too, and
+    /// watched afresh when that event is read.)
+    fn settle_moves(&mut self) {
+        for moved in std::mem::take(&mut self.moved) {
+            if let Some(w) = self.watchers.get_mut(&moved.watcher) {
+                w.wds.retain(|n| !moved.wds.contains(n));
+            }
+            for number in moved.wds {
+                self.drop_user(moved.watcher, number);
             }
         }
     }
@@ -268,7 +334,11 @@ impl Instance {
         let new_dir = name.is_some()
             && mask.contains(EventMask::ISDIR)
             && mask.intersects(EventMask::CREATE | EventMask::MOVED_TO);
+        let left_dir = name.is_some()
+            && mask.contains(EventMask::ISDIR)
+            && mask.contains(EventMask::MOVED_FROM);
         let mut grow = Vec::new();
+        let mut left = Vec::new();
         for user in &descriptor.users {
             let Some(w) = self.watchers.get(&user.watcher) else {
                 continue;
@@ -287,6 +357,9 @@ impl Instance {
             };
             if new_dir && w.recursive {
                 grow.push((user.watcher, filename.clone()));
+            }
+            if left_dir && w.recursive {
+                left.push((user.watcher, filename.clone()));
             }
             let _ = w.tx.send(Note::Event(
                 WatchEvent {
@@ -307,6 +380,29 @@ impl Instance {
                 }
             }
         }
+        // A directory moved out of one of a recursive watcher's directories:
+        // note its descriptors (its own and those of everything under it),
+        // for the IN_MOVED_TO or the end of the batch to settle.
+        for (watcher, prefix) in left {
+            let wds: Vec<i32> = self
+                .wds
+                .iter()
+                .filter(|(_, descriptor)| {
+                    descriptor
+                        .users
+                        .iter()
+                        .any(|user| user.watcher == watcher && user.prefix.starts_with(&prefix))
+                })
+                .map(|(number, _)| *number)
+                .collect();
+            if !wds.is_empty() {
+                self.moved.push(Moved {
+                    cookie,
+                    watcher,
+                    wds,
+                });
+            }
+        }
         // A directory made (or moved) inside a recursive watcher's tree is
         // watched too, with what is already in it.
         for (watcher, prefix) in grow {
@@ -315,6 +411,15 @@ impl Instance {
             };
             let path = root.join(&prefix);
             if self.attach(watcher, &path, prefix.clone()).is_ok() {
+                if mask.contains(EventMask::MOVED_TO) {
+                    // It came from elsewhere in this watcher's tree: it
+                    // keeps its descriptors, which the attach above and the
+                    // walk below rename. (An attach that failed leaves the
+                    // move noted, so the end of the batch releases
+                    // descriptors nothing can name any more.)
+                    self.moved
+                        .retain(|moved| !(moved.cookie == cookie && moved.watcher == watcher));
+                }
                 self.attach_tree(watcher, &path, &prefix);
             }
         }
@@ -341,16 +446,16 @@ fn read(shared: Shared, mut inotify: Inotify) {
             Ok(events) => events,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => {
-                let mut slot = shared.lock();
-                if let Some(instance) = slot.as_mut() {
+                let mut state = shared.lock();
+                if let Some(instance) = state.instance.as_mut() {
                     instance.fail(&error);
                 }
-                *slot = None;
+                state.instance = None;
                 return;
             }
         };
-        let mut slot = shared.lock();
-        let Some(instance) = slot.as_mut() else {
+        let mut state = shared.lock();
+        let Some(instance) = state.instance.as_mut() else {
             return;
         };
         for event in events {
@@ -361,11 +466,17 @@ fn read(shared: Shared, mut inotify: Inotify) {
                 event.name,
             );
         }
+        instance.settle_moves();
         if instance.wds.is_empty() {
             // Nothing left to read: close the instance. A watch started
-            // after this makes a new one; until then the watchers left (a
-            // deleted root's) are idle, as libuv's are.
-            *slot = None;
+            // after this makes a new one. The watchers left (a deleted
+            // root's) are idle, as libuv's are: each keeps its sender, so
+            // its parked read stays pending until the watcher is closed.
+            if let Some(closed) = state.instance.take() {
+                for (id, w) in closed.watchers {
+                    state.idle.insert(id, w.tx);
+                }
+            }
             return;
         }
     }
@@ -384,28 +495,65 @@ mod tests {
         dir
     }
 
-    /// Every event that arrives within `wait`, as `type:name`.
-    fn drain(rx: &mut UnboundedReceiver<Note>, wait: Duration) -> Vec<String> {
-        let deadline = std::time::Instant::now() + wait;
+    /// How long the reader thread gets to deliver what a test waits for. A
+    /// bound on a hang, not a window the events must land in: the wait ends
+    /// as soon as they are there.
+    const ARRIVAL: Duration = Duration::from_secs(20);
+
+    /// The events of one change, as `type:name`: the first is waited for
+    /// (up to [`ARRIVAL`]), and the list ends once nothing more has come for
+    /// `quiet`, so a stray extra event still shows up in it.
+    fn drain(rx: &mut UnboundedReceiver<Note>, quiet: Duration) -> Vec<String> {
+        collect(rx, 1, quiet)
+    }
+
+    /// As [`drain`], for a change that reports `count` events: all of them
+    /// are waited for before the quiet period starts.
+    fn collect(rx: &mut UnboundedReceiver<Note>, count: usize, quiet: Duration) -> Vec<String> {
+        let deadline = std::time::Instant::now() + ARRIVAL;
+        let mut last = std::time::Instant::now();
         let mut out = Vec::new();
-        while std::time::Instant::now() < deadline {
+        loop {
             match rx.try_recv() {
-                Ok(Note::Event(e, _)) => out.push(format!(
-                    "{}:{}",
-                    if e.kind == WatchEventType::Rename {
-                        "rename"
+                Ok(Note::Event(e, _)) => {
+                    out.push(format!(
+                        "{}:{}",
+                        if e.kind == WatchEventType::Rename {
+                            "rename"
+                        } else {
+                            "change"
+                        },
+                        e.filename
+                            .map(|f| String::from_utf8_lossy(&f).into_owned())
+                            .unwrap_or_else(|| "null".into())
+                    ));
+                    last = std::time::Instant::now();
+                }
+                Ok(Note::Failed(e)) => {
+                    out.push(format!("error:{e}"));
+                    last = std::time::Instant::now();
+                }
+                Err(_) => {
+                    let now = std::time::Instant::now();
+                    let done = if out.len() >= count {
+                        now.duration_since(last) >= quiet
                     } else {
-                        "change"
-                    },
-                    e.filename
-                        .map(|f| String::from_utf8_lossy(&f).into_owned())
-                        .unwrap_or_else(|| "null".into())
-                )),
-                Ok(Note::Failed(e)) => out.push(format!("error:{e}")),
-                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                        now >= deadline
+                    };
+                    if done {
+                        return out;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
         }
-        out
+    }
+
+    /// Wait until the reader thread has finished the batch of events it is
+    /// on: it holds the lock from an event's delivery through whatever the
+    /// event made it do (watching a new directory, settling a move).
+    fn settled(shared: &Shared) {
+        drop(shared.lock());
     }
 
     fn start(shared: &Shared, path: &Path, recursive: bool) -> (Handle, UnboundedReceiver<Note>) {
@@ -416,7 +564,7 @@ mod tests {
     }
 
     fn instances(shared: &Shared) -> bool {
-        shared.lock().is_some()
+        shared.lock().instance.is_some()
     }
 
     #[test]
@@ -497,11 +645,43 @@ mod tests {
         let (_watch, mut rx) = start(&shared, &dir, false);
         std::fs::remove_dir(&dir).unwrap();
         assert_eq!(
-            drain(&mut rx, Duration::from_millis(300)),
+            collect(&mut rx, 2, Duration::from_millis(100)),
             ["rename:w", "rename:w"]
         );
         // No descriptor is left, so the reader has closed the instance.
         assert!(!instances(&shared));
+        // The watcher itself is still open: its queue is empty, not ended,
+        // so its parked read stays pending until close(), as node's handle
+        // stays active.
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn closing_a_watcher_of_an_ended_instance_leaves_the_next_instance_alone() {
+        // A deleted root ends the instance, but its handle stays open (JS
+        // has not closed it). Closing it later must not touch a watcher of
+        // the instance made since.
+        let root = temp("stale");
+        let gone = root.join("gone");
+        let kept = root.join("kept");
+        std::fs::create_dir(&gone).unwrap();
+        std::fs::create_dir(&kept).unwrap();
+        let shared = Shared::default();
+        let (stale, _stale_rx) = start(&shared, &gone, false);
+        std::fs::remove_dir(&gone).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while instances(&shared) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!instances(&shared), "the reader closed the instance");
+        let (_live, mut rx) = start(&shared, &kept, false);
+        drop(stale);
+        std::fs::write(kept.join("f"), b"").unwrap();
+        assert_eq!(drain(&mut rx, Duration::from_millis(300)), ["rename:f"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -527,20 +707,65 @@ mod tests {
         let (_watch, mut rx) = start(&shared, &root, true);
         std::fs::write(root.join("s1").join("s2").join("deep"), b"").unwrap();
         std::fs::create_dir(root.join("n")).unwrap();
-        // Give the reader a moment to watch `n` before writing into it.
-        let first = drain(&mut rx, Duration::from_millis(300));
+        let first = collect(&mut rx, 2, Duration::from_millis(100));
         assert!(
             first.contains(&"rename:s1/s2/deep".to_string()),
             "{first:?}"
         );
         assert!(first.contains(&"rename:n".to_string()), "{first:?}");
+        // The reader watches `n` in the batch that reported it.
+        settled(&shared);
         std::fs::write(root.join("n").join("inside"), b"").unwrap();
-        let second = drain(&mut rx, Duration::from_millis(300));
+        let second = drain(&mut rx, Duration::from_millis(100));
         assert!(
             second.contains(&"rename:n/inside".to_string()),
             "{second:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_directory_renamed_inside_a_recursive_tree_is_named_by_its_new_path() {
+        let root = temp("mv");
+        std::fs::create_dir_all(root.join("a").join("sub")).unwrap();
+        let shared = Shared::default();
+        let (_watch, mut rx) = start(&shared, &root, true);
+        std::fs::rename(root.join("a"), root.join("b")).unwrap();
+        // IN_MOVED_FROM and IN_MOVED_TO, both reported by the root.
+        let moved = collect(&mut rx, 2, Duration::from_millis(100));
+        assert_eq!(moved, ["rename:a", "rename:b"]);
+        settled(&shared);
+        std::fs::write(root.join("b").join("f"), b"").unwrap();
+        std::fs::write(root.join("b").join("sub").join("g"), b"").unwrap();
+        assert_eq!(
+            collect(&mut rx, 2, Duration::from_millis(100)),
+            ["rename:b/f", "rename:b/sub/g"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_directory_moved_out_of_a_recursive_tree_is_no_longer_watched() {
+        let base = temp("mvout");
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(root.join("a").join("sub")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let shared = Shared::default();
+        let (_watch, mut rx) = start(&shared, &root, true);
+        std::fs::rename(root.join("a"), outside.join("a")).unwrap();
+        assert_eq!(drain(&mut rx, Duration::from_millis(100)), ["rename:a"]);
+        settled(&shared);
+        // Nothing under the directory is this watcher's any more; the marker
+        // made after it shows the queue was read past those writes.
+        std::fs::write(outside.join("a").join("f"), b"").unwrap();
+        std::fs::write(outside.join("a").join("sub").join("g"), b"").unwrap();
+        std::fs::write(root.join("marker"), b"").unwrap();
+        assert_eq!(
+            drain(&mut rx, Duration::from_millis(100)),
+            ["rename:marker"]
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

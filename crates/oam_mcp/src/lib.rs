@@ -6,7 +6,8 @@
 //!
 //! v1 transport: stdio (newline-delimited JSON-RPC 2.0), the shape local
 //! agents (Claude Code, Cursor) consume dev tools in. The stateless
-//! Streamable HTTP transport (MCP 2026-07-28) lands with oam_http.
+//! Streamable HTTP transport (MCP 2026-07-28) is not built yet (the `oam_http`
+//! crate it was planned to arrive with was never created).
 //! Dispatch is a pure function (message in, response out) so the protocol
 //! logic unit-tests without processes or pipes.
 
@@ -23,8 +24,11 @@ use std::path::PathBuf;
 const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// Every revision `initialize` will agree to, newest first. The server
-/// itself is stateless and tools-only, so these revisions all describe the
-/// same wire behaviour here.
+/// itself is stateless and tools-only, so these revisions describe the same
+/// wire behaviour here but for one thing: 2025-03-26 has JSON-RPC batches (a
+/// line that is an array of messages), which the revisions on either side of
+/// it do not. Because the server keeps no record of the version it agreed
+/// to, a batch is answered whichever revision was negotiated.
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
@@ -44,42 +48,232 @@ fn negotiate(requested: Option<&str>) -> &'static str {
 /// JSON line each; notifications produce no response. Lines are read as
 /// bytes and lossy-decoded: one non-UTF-8 line from a buggy client gets the
 /// graceful -32700, not server death (BufRead::lines would Err and exit).
+///
+/// Messages are answered one at a time, in the order they arrive. Stdin is
+/// read on a thread of its own so that two messages are seen while a tool
+/// call is still running (an `oam_run` can take its whole budget): a
+/// `notifications/cancelled` naming the running request ends it, and a
+/// `ping` is answered at once instead of after it.
 pub fn serve_stdio() -> std::io::Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdin = stdin.lock();
+    let flight = std::sync::Arc::new(std::sync::Mutex::new(Flight::default()));
+    // Bounded: a client that writes faster than tool calls finish is held
+    // at the pipe rather than buffered without limit.
+    let (lines_tx, lines_rx) = std::sync::mpsc::sync_channel::<std::io::Result<String>>(1024);
+    let reader_flight = std::sync::Arc::clone(&flight);
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut stdin = stdin.lock();
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match stdin.read_until(b'\n', &mut buf) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(e) => {
+                    let _ = lines_tx.send(Err(e));
+                    return;
+                }
+            }
+            let line = String::from_utf8_lossy(&buf).trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+            let intercepted = {
+                let mut flight = reader_flight.lock().unwrap_or_else(|e| e.into_inner());
+                intercept(&line, &mut flight)
+            };
+            match intercepted {
+                Intercept::Forward => {
+                    // Counted before it is sent, so a `ping` read next sees
+                    // work ahead of it even before the loop has taken it up.
+                    reader_flight
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .queued += 1;
+                    if lines_tx.send(Ok(line)).is_err() {
+                        return;
+                    }
+                }
+                Intercept::Consumed => {}
+                Intercept::Answer(response) => {
+                    let _ = write_response(&response);
+                }
+            }
+        }
+    });
+
+    // Ends when the reader does: end of input, or a read error it passed on.
+    while let Ok(line) = lines_rx.recv() {
+        let line = line?;
+        let message: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => {
+                {
+                    let mut flight = flight.lock().unwrap_or_else(|e| e.into_inner());
+                    flight.queued = flight.queued.saturating_sub(1);
+                }
+                write_response(&parse_error())?;
+                continue;
+            }
+        };
+        let id = message.as_object().and_then(|m| m.get("id")).cloned();
+        {
+            let mut flight = flight.lock().unwrap_or_else(|e| e.into_inner());
+            // Taken up: no longer queued, and (below, under the same lock)
+            // either skipped or the message being served.
+            flight.queued = flight.queued.saturating_sub(1);
+            // Cancelled before it was reached: not run, and not answered
+            // (the sender of a cancellation expects no response).
+            if let Some(id) = &id
+                && let Some(at) = flight.pending.iter().position(|p| p == id)
+            {
+                flight.pending.remove(at);
+                continue;
+            }
+            flight.busy = true;
+            flight.serving = id;
+            flight.cancelled = false;
+        }
+        let cancelled = || flight.lock().unwrap_or_else(|e| e.into_inner()).cancelled;
+        let response = handle_value(&message, &cancelled);
+        let was_cancelled = {
+            let mut flight = flight.lock().unwrap_or_else(|e| e.into_inner());
+            flight.busy = false;
+            flight.serving = None;
+            std::mem::take(&mut flight.cancelled)
+        };
+        if !was_cancelled && let Some(response) = response {
+            write_response(&response)?;
+        }
+    }
+    Ok(())
+}
+
+/// One response line, written and flushed under the stdout lock: the reader
+/// thread answers a `ping` while the dispatch loop may be writing too.
+fn write_response(response: &Value) -> std::io::Result<()> {
     let mut stdout = std::io::stdout().lock();
-    let mut buf = Vec::new();
-    loop {
-        buf.clear();
-        if stdin.read_until(b'\n', &mut buf)? == 0 {
-            return Ok(());
+    writeln!(stdout, "{response}")?;
+    stdout.flush()
+}
+
+/// How many cancellations of requests not yet reached are remembered. One
+/// that names a request already answered is never matched, so the list is
+/// bounded and the oldest entry gives way.
+const MAX_PENDING_CANCELS: usize = 64;
+
+/// What the stdin reader and the dispatch loop share about the message
+/// being served.
+#[derive(Default)]
+struct Flight {
+    /// A message is being handled.
+    busy: bool,
+    /// Lines the reader has forwarded that the dispatch loop has not taken
+    /// up yet.
+    queued: usize,
+    /// Its id, when it is a single request (a batch has none of its own).
+    serving: Option<Value>,
+    /// A `notifications/cancelled` named `serving` while it ran.
+    cancelled: bool,
+    /// Ids cancelled before the loop reached them.
+    pending: Vec<Value>,
+}
+
+/// What the reader does with a line before the dispatch loop sees it.
+#[derive(Debug, PartialEq)]
+enum Intercept {
+    /// Nothing: the dispatch loop handles it, in its turn.
+    Forward,
+    /// Acted on here; there is nothing to answer.
+    Consumed,
+    /// Answered here, with this.
+    Answer(Value),
+}
+
+/// The two messages that cannot wait for the one being served: a
+/// cancellation (recorded for the dispatch loop, which ends the running
+/// call or skips a queued one) and a `ping` that arrives mid-call. Every
+/// other line is forwarded untouched, without being parsed here.
+fn intercept(line: &str, flight: &mut Flight) -> Intercept {
+    if !line.contains("notifications/cancelled") && !line.contains("\"ping\"") {
+        return Intercept::Forward;
+    }
+    let Ok(Value::Object(message)) = serde_json::from_str::<Value>(line) else {
+        return Intercept::Forward;
+    };
+    match message.get("method").and_then(Value::as_str) {
+        Some("notifications/cancelled") if !message.contains_key("id") => {
+            if let Some(id) = message.get("params").and_then(|p| p.get("requestId")) {
+                if flight.serving.as_ref() == Some(id) {
+                    flight.cancelled = true;
+                } else {
+                    if flight.pending.len() >= MAX_PENDING_CANCELS {
+                        flight.pending.remove(0);
+                    }
+                    flight.pending.push(id.clone());
+                }
+            }
+            Intercept::Consumed
         }
-        let line = String::from_utf8_lossy(&buf);
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(response) = handle_line(line) {
-            writeln!(stdout, "{response}")?;
-            stdout.flush()?;
-        }
+        Some("ping") if flight.busy || flight.queued > 0 => match message.get("id") {
+            Some(id) => Intercept::Answer(json!({ "jsonrpc": "2.0", "id": id, "result": {} })),
+            None => Intercept::Forward,
+        },
+        _ => Intercept::Forward,
     }
 }
 
-/// One message in, at most one response out (None for notifications).
+fn parse_error() -> Value {
+    error_response(Value::Null, -32700, "parse error: not valid JSON")
+}
+
+/// One line in, at most one response line out (None when nothing in it asks
+/// for an answer: a notification, or a batch of them).
 pub fn handle_line(line: &str) -> Option<String> {
     let message: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(_) => {
-            return Some(
-                error_response(Value::Null, -32700, "parse error: not valid JSON").to_string(),
-            );
-        }
+        Err(_) => return Some(parse_error().to_string()),
     };
-    handle_message(&message).map(|r| r.to_string())
+    handle_value(&message, &|| false).map(|r| r.to_string())
 }
 
-fn handle_message(message: &Value) -> Option<Value> {
+/// A parsed line: one message, or a JSON-RPC batch of them. A batch is
+/// answered with the array of its members' responses, in order, and with
+/// nothing when no member asked for one; an empty batch is itself an invalid
+/// request. `cancelled` is asked by a long tool call whether to stop.
+fn handle_value(message: &Value, cancelled: &dyn Fn() -> bool) -> Option<Value> {
+    match message {
+        Value::Array(batch) if batch.is_empty() => Some(error_response(
+            Value::Null,
+            -32600,
+            "invalid request: empty batch",
+        )),
+        Value::Array(batch) => {
+            let responses: Vec<Value> = batch
+                .iter()
+                .filter_map(|member| handle_message(member, cancelled))
+                .collect();
+            if responses.is_empty() {
+                None
+            } else {
+                Some(Value::Array(responses))
+            }
+        }
+        single => handle_message(single, cancelled),
+    }
+}
+
+fn handle_message(message: &Value, cancelled: &dyn Fn() -> bool) -> Option<Value> {
+    // Anything but an object is not a message at all. It has no id to stay
+    // silent about, so it is answered -- a client waiting on it would wait
+    // for ever otherwise.
+    if !message.is_object() {
+        return Some(error_response(
+            Value::Null,
+            -32600,
+            "invalid request: a message must be a JSON object",
+        ));
+    }
     let id = message.get("id").cloned();
     let method = message.get("method").and_then(Value::as_str).unwrap_or("");
     let params = message.get("params").cloned().unwrap_or(json!({}));
@@ -105,7 +299,7 @@ fn handle_message(message: &Value) -> Option<Value> {
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-            match call_tool(name, &arguments) {
+            match call_tool(name, &arguments, cancelled) {
                 Ok(result) => result,
                 Err(message) => {
                     return Some(error_response(id, -32602, &message));
@@ -148,7 +342,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "oam_run",
-            "description": "Run a JavaScript/TypeScript file with the oam runtime. Returns exit code, stdout, and ODIF diagnostics (parse/resolve/runtime errors) as structured data. Kills the script and reports timedOut=true if it exceeds the time budget (long-lived servers/intervals will always hit it).",
+            "description": "Run a JavaScript/TypeScript file with the oam runtime. Returns exit code, stdout, and ODIF diagnostics (parse/resolve/runtime errors) as structured data. Kills the script and reports timedOut=true if it exceeds the time budget (long-lived servers/intervals will always hit it). stdout and stderr are each kept up to 1 MiB; past that the rest is dropped and stdoutTruncated / stderrTruncated is true.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -177,7 +371,7 @@ fn tool_definitions() -> Value {
     ])
 }
 
-fn call_tool(name: &str, arguments: &Value) -> Result<Value, String> {
+fn call_tool(name: &str, arguments: &Value, cancelled: &dyn Fn() -> bool) -> Result<Value, String> {
     match name {
         "oam_check" => {
             let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
@@ -210,7 +404,7 @@ fn call_tool(name: &str, arguments: &Value) -> Result<Value, String> {
                 .and_then(Value::as_f64)
                 .unwrap_or(30_000.0)
                 .clamp(100.0, 600_000.0) as u64;
-            run_subprocess(file, timeout_ms)
+            run_subprocess(file, timeout_ms, cancelled)
         }
         "oam_project_info" => {
             let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
@@ -243,18 +437,58 @@ fn call_tool(name: &str, arguments: &Value) -> Result<Value, String> {
 /// for the output pipes to close before it answers with what arrived.
 const PIPE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How much of each of the script's output streams `oam_run` keeps. The
+/// answer is one JSON line held in memory on both ends, and a script stuck
+/// in a print loop writes without limit for its whole budget.
+const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+
+/// One output stream as captured: the first [`MAX_CAPTURE_BYTES`] of it, and
+/// how many bytes came after.
+#[derive(Default)]
+struct Captured {
+    bytes: Vec<u8>,
+    dropped: u64,
+}
+
+impl Captured {
+    fn push(&mut self, chunk: &[u8]) {
+        let room = MAX_CAPTURE_BYTES.saturating_sub(self.bytes.len());
+        let kept = chunk.len().min(room);
+        self.bytes.extend_from_slice(&chunk[..kept]);
+        self.dropped += (chunk.len() - kept) as u64;
+    }
+
+    /// The text, and whether any of the stream was dropped. A dropped tail
+    /// is said in the text too, on a line of its own, so a reader of the
+    /// output alone is not left thinking it saw all of it.
+    fn into_text(self) -> (String, bool) {
+        let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
+        let truncated = self.dropped > 0;
+        if truncated {
+            text.push_str(&format!(
+                "\n[oam_run: output truncated: the first {MAX_CAPTURE_BYTES} bytes are kept, \
+                 {} more were dropped]\n",
+                self.dropped
+            ));
+        }
+        (text, truncated)
+    }
+}
+
 /// Drain `pipe` on a thread into a buffer the caller can take at any time,
 /// sending on `closed` at end of file. The caller never has to wait for the
 /// end of file: a process the script started can hold the pipe open long
 /// after the script is gone. Once taken, the buffer is `None` and whatever
 /// such a process writes later is read and dropped -- read, so its writes do
 /// not block or fail on a full or closed pipe; dropped, so a long-lived
-/// server holds nothing for an answer already sent.
+/// server holds nothing for an answer already sent. Before that, the buffer
+/// keeps no more than [`MAX_CAPTURE_BYTES`]; the rest is read, counted and
+/// dropped the same way.
 fn drain_pipe<R: std::io::Read + Send + 'static>(
     mut pipe: R,
     closed: std::sync::mpsc::Sender<()>,
-) -> std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>> {
-    let buffer = std::sync::Arc::new(std::sync::Mutex::new(Some(Vec::new())));
+) -> std::sync::Arc<std::sync::Mutex<Option<Captured>>> {
+    let buffer = std::sync::Arc::new(std::sync::Mutex::new(Some(Captured::default())));
     let sink = std::sync::Arc::clone(&buffer);
     std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
@@ -263,7 +497,7 @@ fn drain_pipe<R: std::io::Read + Send + 'static>(
                 Ok(0) => break,
                 Ok(n) => {
                     if let Some(kept) = sink.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                        kept.extend_from_slice(&chunk[..n]);
+                        kept.push(&chunk[..n]);
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -275,17 +509,27 @@ fn drain_pipe<R: std::io::Read + Send + 'static>(
     buffer
 }
 
-/// Run `oam run <file> --json` with a kill-on-deadline budget. The `--`
-/// terminator keeps '-'-prefixed file strings out of clap's flag parsing
-/// (file '--help' used to return a success-shaped payload). Pipes are
-/// drained on threads so a chatty child can't deadlock the wait loop.
+/// Run `oam run --json <absolute file>` with a kill-on-deadline budget. The
+/// file is made absolute so that a '-'-prefixed name can never read as a flag
+/// (file '--help' used to return a success-shaped payload); a `--` terminator
+/// would not do it, because `oam run` forwards what follows one to the script
+/// as its arguments. Pipes are drained on threads so a chatty child can't
+/// deadlock the wait loop.
+///
+/// `cancelled` is polled with the child: when it turns true the script is
+/// killed and the call returns at once, with a payload nobody is waiting for
+/// (the caller of a cancelled request sends no response).
 ///
 /// The budget bounds the whole call, not just the script: the answer comes
 /// by the deadline plus [`PIPE_GRACE`] even when something other than the
 /// script still holds its stdout or stderr -- a child the script started
 /// with inherited stdio, say, which outlives a kill of the script. Waiting
 /// for those pipes to close held the answer until that process exited.
-fn run_subprocess(file: &str, timeout_ms: u64) -> Result<Value, String> {
+fn run_subprocess(
+    file: &str,
+    timeout_ms: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Value, String> {
     use std::time::{Duration, Instant};
 
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
@@ -325,6 +569,16 @@ fn run_subprocess(file: &str, timeout_ms: u64) -> Result<Value, String> {
                 timed_out = true;
                 break None;
             }
+            None if cancelled() => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // Let go of what was captured; the drainers read on and
+                // drop until the pipes close.
+                for buffer in [&stdout_buf, &stderr_buf] {
+                    *buffer.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
+                return Ok(tool_text(&json!({ "cancelled": true }).to_string(), true));
+            }
             None => std::thread::sleep(Duration::from_millis(15)),
         }
     };
@@ -340,24 +594,26 @@ fn run_subprocess(file: &str, timeout_ms: u64) -> Result<Value, String> {
             break;
         }
     }
-    let take = |buffer: &std::sync::Mutex<Option<Vec<u8>>>| {
+    let take = |buffer: &std::sync::Mutex<Option<Captured>>| {
         buffer
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .unwrap_or_default()
+            .into_text()
     };
-    let stdout = String::from_utf8_lossy(&take(&stdout_buf)).into_owned();
-    let stderr = String::from_utf8_lossy(&take(&stderr_buf)).into_owned();
+    let (stdout, stdout_truncated) = take(&stdout_buf);
+    let (stderr, stderr_truncated) = take(&stderr_buf);
     let mut diagnostics: Vec<Value> = Vec::new();
     let mut stderr_raw: Vec<&str> = Vec::new();
     for line in stderr.lines() {
-        match serde_json::from_str::<Value>(line) {
-            Ok(v) => diagnostics.push(v),
-            // Non-ODIF stderr (e.g. a panic) must not vanish: agents need
-            // SOMETHING to explain a non-zero exit with zero diagnostics.
-            Err(_) if !line.trim().is_empty() => stderr_raw.push(line),
-            Err(_) => {}
+        match odif_line(line) {
+            Some(diagnostic) => diagnostics.push(diagnostic),
+            // Non-ODIF stderr (e.g. a panic, or what the script itself
+            // wrote) must not vanish: agents need SOMETHING to explain a
+            // non-zero exit with zero diagnostics.
+            None if !line.trim().is_empty() => stderr_raw.push(line),
+            None => {}
         }
     }
     let payload = json!({
@@ -365,10 +621,22 @@ fn run_subprocess(file: &str, timeout_ms: u64) -> Result<Value, String> {
         "timedOut": timed_out,
         "timeoutMs": timeout_ms,
         "stdout": stdout,
+        "stdoutTruncated": stdout_truncated,
         "diagnostics": diagnostics,
         "stderrRaw": stderr_raw,
+        "stderrTruncated": stderr_truncated,
     });
     Ok(tool_text(&payload.to_string(), timed_out))
+}
+
+/// A stderr line of `oam run --json` that is an ODIF diagnostic, as the JSON
+/// it arrived as. The script's own stderr shares the stream, and whatever it
+/// writes there that happens to be JSON -- `console.error(42)`, a logged
+/// object -- is the script's output, not a diagnostic: only a line that reads
+/// as the whole envelope counts.
+fn odif_line(line: &str) -> Option<Value> {
+    serde_json::from_str::<oam_diagnostics::Diagnostic>(line).ok()?;
+    serde_json::from_str(line).ok()
 }
 
 fn tool_text(text: &str, is_error: bool) -> Value {
@@ -459,6 +727,15 @@ const KNOWN_CODES: &[(&str, &str)] = &[
         "OAM-RT0005",
         "Uncaught runtime exception, reported in Node's format: source frame, stack, then the error's own properties. The stack's first frame is the throw site.",
     ),
+    // Not zero-padded, and not an ODIF diagnostic: the engine writes it as a
+    // plain `error[OAM-RT-OOM]: ...` line from V8's near-heap-limit path,
+    // where no diagnostic can be built any more. It is a code a reader meets
+    // all the same, so it is explained; `explain_knows_the_banner_only_codes`
+    // holds the entry, since the scan of zero-padded literals cannot see it.
+    (
+        "OAM-RT-OOM",
+        "The JavaScript heap reached its cap and the process exited with code 134. Printed as a plain `error[OAM-RT-OOM]` line on stderr, not as an ODIF diagnostic (so it is not in a --json stream); the line names the cap in megabytes and where it came from. Raise it with OAM_MAX_HEAP_MB (megabytes) or --max-old-space-size, or find what holds the memory: by default the cap is 75% of the container memory limit when there is one, else 4096 MB.",
+    ),
     (
         "OAM-TS0000",
         "tsgo (the TypeScript 7 native compiler) is not installed or not on PATH. Install: npm i -g @typescript/native-preview, or set OAM_TSGO.",
@@ -505,11 +782,11 @@ const KNOWN_CODES: &[(&str, &str)] = &[
     ),
     (
         "OAM-PKG0004",
-        "One package failed to install: 'failed to install <key>: <cause>', where the cause is the download, the SRI integrity check, or extraction. The key is the package's lockfile path, so a dependency duplicated at two versions is unambiguous.",
+        "One package failed to install: 'failed to install <key>: <cause>', where the cause is the download, the SRI integrity check, or extraction. The key is the package's lockfile path, so a dependency duplicated at two versions is unambiguous. Also refused under this code, without a download: a lockfile key that is not a node_modules path inside the project, a `resolved` value that is not an http(s) URL, and a required package that does not support this platform. With severity warning it is a package-level note that does not fail the install: an optional package that could not be installed, a download the lockfile gave no integrity hash for, tarball symlinks that were not created, or workspace links oam does not create.",
     ),
     (
         "OAM-PKG0005",
-        "Warning: bin shims could not be created (the node_modules/.bin directory could not be made, or a package directory could not be canonicalized). The packages are installed, but the commands they provide are not on node_modules/.bin. Does not fail the install.",
+        "Warning: bin shims could not be created (the node_modules/.bin directory could not be made, a package directory could not be canonicalized, one shim could not be written, or a package's `bin` entry names nothing usable). The packages are installed, but the commands they provide are not on node_modules/.bin. Does not fail the install.",
     ),
     (
         "OAM-PKG0006",
@@ -517,7 +794,7 @@ const KNOWN_CODES: &[(&str, &str)] = &[
     ),
     (
         "OAM-PKG0007",
-        "Warning: a package's lifecycle scripts were skipped. The message names the package, its version and the scripts; skipping dependency code is the default, not a failure. Allow one package with `oam trust add <package>`. The same code covers the blanket skip when OAM_IGNORE_SCRIPTS is set.",
+        "Warning: a package's lifecycle scripts were skipped. The message names the package, its version and the scripts; skipping dependency code is the default, not a failure. Allow one package with `oam trust add <package>`. The same code covers the blanket skip when OAM_IGNORE_SCRIPTS is set, a package whose own name does not match the name and registry path the lockfile gives it (its scripts are skipped whatever the trust list holds), and a trust file that does not parse (it is treated as empty).",
     ),
     (
         "OAM-PKG0008",
@@ -665,6 +942,191 @@ mod tests {
         let response = handle_line("{not json").expect("response");
         let v: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(v["error"]["code"], -32700);
+    }
+
+    fn answer(line: &str) -> Value {
+        serde_json::from_str(&handle_line(line).expect("response")).unwrap()
+    }
+
+    #[test]
+    fn a_batch_is_answered_with_its_members_responses_in_order() {
+        let batch = json!([
+            { "jsonrpc": "2.0", "id": 1, "method": "ping" },
+            { "jsonrpc": "2.0", "method": "notifications/initialized" },
+            { "jsonrpc": "2.0", "id": "two", "method": "bogus/method" },
+            7,
+        ]);
+        let v = answer(&batch.to_string());
+        let responses = v.as_array().expect("a batch answers with an array");
+        // The notification has no response; the scalar member is answered.
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[0]["id"], 1);
+        assert!(responses[0]["result"].is_object());
+        assert_eq!(responses[1]["id"], "two");
+        assert_eq!(responses[1]["error"]["code"], -32601);
+        assert_eq!(responses[2]["id"], Value::Null);
+        assert_eq!(responses[2]["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn a_batch_of_notifications_gets_no_response_and_an_empty_one_is_invalid() {
+        let line = json!([
+            { "jsonrpc": "2.0", "method": "notifications/initialized" },
+            { "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 9 } },
+        ])
+        .to_string();
+        assert!(handle_line(&line).is_none());
+        let v = answer("[]");
+        assert_eq!(v["error"]["code"], -32600);
+        assert_eq!(v["id"], Value::Null);
+    }
+
+    #[test]
+    fn a_message_that_is_not_an_object_is_an_invalid_request() {
+        for line in ["42", "true", "null", "\"ping\""] {
+            let v = answer(line);
+            assert_eq!(v["error"]["code"], -32600, "{line}");
+            assert_eq!(v["id"], Value::Null, "{line}");
+        }
+    }
+
+    #[test]
+    fn the_reader_acts_on_a_cancellation_and_on_a_ping_during_a_call() {
+        let cancel = |id: Value| {
+            json!({ "jsonrpc": "2.0", "method": "notifications/cancelled",
+                    "params": { "requestId": id } })
+            .to_string()
+        };
+        let ping = json!({ "jsonrpc": "2.0", "id": 5, "method": "ping" }).to_string();
+        let mut flight = Flight::default();
+
+        // Idle: a ping waits its turn like anything else, and a cancellation
+        // is remembered for a request the loop has not reached.
+        assert_eq!(intercept(&ping, &mut flight), Intercept::Forward);
+        assert_eq!(
+            intercept(&cancel(json!(3)), &mut flight),
+            Intercept::Consumed
+        );
+        assert_eq!(flight.pending, vec![json!(3)]);
+        assert!(!flight.cancelled);
+
+        // A call is running: its cancellation is flagged, another id's is
+        // remembered, and a ping is answered at once.
+        flight.busy = true;
+        flight.serving = Some(json!("run-1"));
+        assert_eq!(
+            intercept(&cancel(json!("run-1")), &mut flight),
+            Intercept::Consumed
+        );
+        assert!(flight.cancelled);
+        assert_eq!(flight.pending, vec![json!(3)]);
+        match intercept(&ping, &mut flight) {
+            Intercept::Answer(v) => {
+                assert_eq!(v["id"], 5);
+                assert!(v["result"].is_object());
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // So is a ping read while an earlier message is still waiting for
+        // the loop: it must not queue up behind a call that has not started.
+        let mut waiting = Flight {
+            queued: 1,
+            ..Flight::default()
+        };
+        assert!(matches!(
+            intercept(&ping, &mut waiting),
+            Intercept::Answer(_)
+        ));
+
+        // Everything else goes to the dispatch loop, a tool call that only
+        // mentions one of the two names included.
+        let call = request(
+            "tools/call",
+            json!({ "name": "oam_explain", "arguments": { "code": "\"ping\"" } }),
+        );
+        assert_eq!(intercept(&call, &mut flight), Intercept::Forward);
+        assert_eq!(
+            intercept("{not json \"ping\"", &mut flight),
+            Intercept::Forward
+        );
+
+        // The remembered list is bounded, oldest out first.
+        for id in 0..(MAX_PENDING_CANCELS as u64 + 5) {
+            intercept(&cancel(json!(1000 + id)), &mut flight);
+        }
+        assert_eq!(flight.pending.len(), MAX_PENDING_CANCELS);
+        assert!(!flight.pending.contains(&json!(3)));
+    }
+
+    #[test]
+    fn captured_output_is_capped_and_says_so() {
+        let mut small = Captured::default();
+        small.push(b"hello\n");
+        assert_eq!(small.into_text(), ("hello\n".to_string(), false));
+
+        let mut big = Captured::default();
+        let chunk = [b'x'; 8192];
+        let chunks = MAX_CAPTURE_BYTES / chunk.len() + 3;
+        for _ in 0..chunks {
+            big.push(&chunk);
+        }
+        assert_eq!(big.bytes.len(), MAX_CAPTURE_BYTES);
+        let dropped = (chunks * chunk.len() - MAX_CAPTURE_BYTES) as u64;
+        assert_eq!(big.dropped, dropped);
+        let (text, truncated) = big.into_text();
+        assert!(truncated);
+        assert!(text.starts_with("xxxx"));
+        assert!(
+            text.ends_with(&format!("{dropped} more were dropped]\n")),
+            "{}",
+            &text[text.len() - 120..]
+        );
+    }
+
+    #[test]
+    fn only_an_odif_envelope_on_stderr_is_a_diagnostic() {
+        let real = oam_diagnostics::Diagnostic::new(
+            "OAM-MOD0001",
+            oam_diagnostics::Severity::Error,
+            oam_diagnostics::Origin::Resolve,
+            "no such file",
+        )
+        .to_jsonl();
+        let parsed = odif_line(&real).expect("an ODIF line");
+        assert_eq!(parsed["code"], "OAM-MOD0001");
+        assert_eq!(parsed["origin"], "resolve");
+        // What a script can write to stderr that is JSON all the same.
+        for line in [
+            "42",
+            "true",
+            "null",
+            "\"text\"",
+            "[1,2]",
+            "{}",
+            r#"{"level":"error","msg":"boom"}"#,
+            r#"{"code":"OAM-MOD0001","message":"looks like one"}"#,
+            "not json at all",
+            "",
+        ] {
+            assert!(odif_line(line).is_none(), "{line:?}");
+        }
+    }
+
+    /// The codes oam prints outside ODIF, which the scan of zero-padded
+    /// literals in `every_emitted_code_has_an_explanation` does not look
+    /// for. The engine source is read so the entry cannot outlive the code.
+    #[test]
+    fn explain_knows_the_banner_only_codes() {
+        let engine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("oam_engine/src/lib.rs");
+        let source = std::fs::read_to_string(&engine).unwrap();
+        assert!(source.contains("error[OAM-RT-OOM]"), "{engine:?}");
+        let text = explain_code("OAM-RT-OOM");
+        assert!(!text.contains("unknown code"), "{text}");
+        assert!(text.contains("OAM_MAX_HEAP_MB"), "{text}");
     }
 
     #[test]

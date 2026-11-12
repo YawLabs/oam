@@ -40,6 +40,7 @@ pub(crate) struct VmModules {
     /// (referrer id, specifier) -> resolved id, filled by `link()` before
     /// instantiation and read by the resolve callback.
     links: HashMap<(u32, String), u32>,
+    /// The last id handed out; 0 before the first (see `insert`).
     next_id: u32,
 }
 
@@ -50,8 +51,12 @@ impl VmModules {
         module: v8::Global<v8::Module>,
         context: Option<v8::Global<v8::Context>>,
     ) -> u32 {
+        // Ids count from 1 and never wrap onto 0: 0 is what `arg_u32` makes
+        // of a missing or non-numeric id, so it must address no module --
+        // such a call then gets "handle is no longer valid" (or, for a
+        // release, removes nothing) rather than acting on the first module.
+        self.next_id = self.next_id.wrapping_add(1).max(1);
         let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
         self.by_id.insert(id, ModuleEntry { module, context });
         self.ids_by_hash.entry(hash).or_default().push(id);
         id
@@ -90,6 +95,8 @@ fn with_modules<T: 'static>(
     }
 }
 
+/// A module id argument. A missing or non-numeric one reads as 0, which is
+/// no module's id (`VmModules::insert`).
 fn arg_u32(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments<'_>,
@@ -104,7 +111,9 @@ fn throw_unknown_module(scope: &mut v8::PinScope<'_, '_>) {
     scope.throw_exception(error);
 }
 
-/// `op_vm_module_compile(source, identifier) -> id`
+/// `op_vm_module_compile(source, identifier, context) -> id` -- `context` is
+/// the contextified object to compile in; anything else means the host
+/// context.
 pub(crate) fn op_vm_module_compile<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -261,40 +270,65 @@ fn resolve_vm_module<'s>(
     // Identity hashes collide, so narrow by hash and then compare identity --
     // resolving an import to the wrong module would be silent and very hard to
     // trace back.
-    let candidates: Vec<(u32, v8::Global<v8::Module>)> = {
-        let modules = scope.get_slot::<VmModules>()?;
-        let ids = modules
-            .ids_by_hash
-            .get(&referrer.get_identity_hash().get())?;
-        ids.iter()
-            .filter_map(|id| modules.by_id.get(id).map(|e| (*id, e.module.clone())))
-            .collect()
-    };
+    let referrer_hash = referrer.get_identity_hash().get();
+    let mut candidates: Vec<(u32, v8::Global<v8::Module>)> = Vec::new();
+    if let Some(modules) = scope.get_slot::<VmModules>()
+        && let Some(ids) = modules.ids_by_hash.get(&referrer_hash)
+    {
+        for id in ids {
+            if let Some(entry) = modules.by_id.get(id) {
+                candidates.push((*id, entry.module.clone()));
+            }
+        }
+    }
     let referrer_id = candidates.into_iter().find_map(|(id, global)| {
         let module = v8::Local::new(scope, &global);
         (module == referrer).then_some(id)
-    })?;
+    });
 
-    let target = {
+    let target = referrer_id.and_then(|referrer_id| {
         let modules = scope.get_slot::<VmModules>()?;
-        let target_id = modules.links.get(&(referrer_id, specifier))?;
-        modules.by_id.get(target_id)?.module.clone()
+        let target_id = modules.links.get(&(referrer_id, specifier.clone()))?;
+        Some(modules.by_id.get(target_id)?.module.clone())
+    });
+    let Some(target) = target else {
+        // Never a bare None: V8 takes None for "an exception is pending", and
+        // without one the instantiate op could not tell this from success.
+        // The referrer's links are not recorded -- its own link() is still
+        // awaiting its linker -- which node reports the same way.
+        let text = format!("request for '{specifier}' is from a module not been linked");
+        let message = v8::String::new(scope, &text).unwrap_or_else(|| v8::String::empty(scope));
+        let error = v8::Exception::error(scope, message);
+        if let Ok(object) = v8::Local::<v8::Object>::try_from(error)
+            && let (Some(key), Some(value)) = (
+                v8::String::new(scope, "code"),
+                v8::String::new(scope, "ERR_VM_MODULE_LINK_FAILURE"),
+            )
+        {
+            object.set(scope, key.into(), value.into());
+        }
+        scope.throw_exception(error);
+        return None;
     };
     Some(v8::Local::new(scope, &target))
 }
 
-/// `op_vm_module_instantiate(id)`
+/// `op_vm_module_instantiate(id)` -- instantiates the whole graph under
+/// `id`, so `link()` calls it for the root only, once every module the graph
+/// reaches has its links recorded.
 pub(crate) fn op_vm_module_instantiate<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let id = arg_u32(scope, &args, 0);
-    // Instantiation failure leaves an exception pending, which is the answer
-    // the caller wants; `Some(false)` without one should not look like success.
+    // Instantiation failure (None) leaves an exception pending, which is the
+    // answer the caller wants -- V8's own, or the one resolve_vm_module
+    // throws for a link nobody recorded; the closure's None carries it out.
+    // `Some(false)` without one should not look like success.
     let done = with_modules(scope, id, |scope, module| {
-        let linked = module.instantiate_module(scope, resolve_vm_module);
-        let flag = v8::Boolean::new(scope, linked.unwrap_or(true));
+        let linked = module.instantiate_module(scope, resolve_vm_module)?;
+        let flag = v8::Boolean::new(scope, linked);
         Some(v8::Global::new(scope, flag))
     });
     let outcome = done
@@ -313,7 +347,8 @@ pub(crate) fn op_vm_module_instantiate<'s>(
     }
 }
 
-/// `op_vm_module_evaluate(id) -> Promise`
+/// `op_vm_module_evaluate(id, timeoutMs) -> Promise` -- a missing or zero
+/// `timeoutMs` runs unbounded.
 pub(crate) fn op_vm_module_evaluate<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
