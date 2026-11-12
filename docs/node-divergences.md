@@ -1908,7 +1908,7 @@ What differs is what code that runs later than that finds:
   <path>: its runtime is shutting down`, because the new addon's own hooks and finalizers
   could no longer run before its library is unloaded.
 
-### 63. N-API functions: no own `arguments` / `caller`, and no receiver check on class methods
+### 63. N-API functions: no own `arguments` / `caller`, and a prototype-chain receiver check on class methods
 
 _(N-API is alpha and off by default -- see divergence 2. Measured against Node v22.22.2.)_
 A class from `napi_define_class` lists its prototype's keys as Node does (the instance
@@ -1923,10 +1923,17 @@ descriptors in order, then `constructor`) and its constructor's as Node does (`l
   oam's V8 defines both as accessors on `Function.prototype` instead, so reading
   `f.arguments` or `f.caller` still works through the prototype.
 - **Receiver check.** Node builds a class's prototype methods with a receiver signature, so
-  calling one on an object that is not an instance (`Cls.prototype.method.call({})`) throws
-  `TypeError: Illegal invocation` before the addon is called. oam calls the addon's
-  callback with that receiver; an addon that uses `napi_unwrap` on it gets
-  `napi_invalid_arg`.
+  calling one on a receiver that is not an instance (`Cls.prototype.method.call({})`, a
+  primitive, `undefined`, a detached call, an instance of another class, a Proxy of an
+  instance, `Cls.prototype` itself) throws `TypeError: Illegal invocation` before the addon
+  is called; a subclass instance (`class S extends Cls`) passes. Getters, setters and static
+  methods have no such check in either runtime. oam makes the same check in its own callback
+  trampoline, by walking the receiver's prototype chain for `Cls.prototype`, rather than V8's
+  signature (whose function template would keep the callback data for the isolate's life),
+  and throws the same error for every case above. Where the two tests part: an object given
+  the prototype by hand (`Object.create(Cls.prototype)`, `Object.setPrototypeOf({},
+  Cls.prototype)`) passes in oam and throws in Node, and an instance whose prototype was
+  later replaced (`Object.setPrototypeOf(instance, null)`) passes in Node and throws in oam.
 
 ---
 
