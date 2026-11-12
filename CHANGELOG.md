@@ -18,6 +18,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-11-12
+
 ### Fixed
 
 - **A heap cap under 16 MB is raised to 16 MB instead of crashing oam at startup** (#479).
@@ -6447,7 +6449,9 @@ releases.
 - The `fork` prewarm pool warms lazily, on first `fork()`.
 - `io_uring` read chunks grow from 64 KiB to 4 MiB, fixing large-file reads.
 
-[Unreleased]: https://github.com/YawLabs/oam/compare/v0.19.5...HEAD
+[Unreleased]: https://github.com/YawLabs/oam/compare/v0.20.1...HEAD
+[0.20.1]: https://github.com/YawLabs/oam/compare/v0.20.0...v0.20.1
+[0.20.0]: https://github.com/YawLabs/oam/compare/v0.19.5...v0.20.0
 [0.19.5]: https://github.com/YawLabs/oam/compare/v0.19.4...v0.19.5
 [0.19.4]: https://github.com/YawLabs/oam/compare/v0.19.3...v0.19.4
 [0.19.3]: https://github.com/YawLabs/oam/compare/v0.19.2...v0.19.3
