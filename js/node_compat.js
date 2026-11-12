@@ -5916,7 +5916,23 @@
         const result = natives.osSetPriority(pid, priority);
         if (typeof result === "string") throw uvSystemError(result, "uv_os_setpriority");
       },
-      networkInterfaces: () => JSON.parse(natives.networkInterfaces()),
+      // A failed getifaddrs answers its raw (positive) errno. node hands
+      // that same positive errno to libuv's name and message lookups, which
+      // know only negative codes, so its ERR_SYSTEM_ERROR reads "Unknown
+      // system error N" for code and message alike (src/node_os.cc).
+      networkInterfaces: function networkInterfaces() {
+        const result = natives.networkInterfaces();
+        if (typeof result === "number") {
+          const unknown = `Unknown system error ${result}`;
+          throw systemErrorWithCode("ERR_SYSTEM_ERROR", {
+            errno: result,
+            code: unknown,
+            message: unknown,
+            syscall: "uv_interface_addresses",
+          });
+        }
+        return JSON.parse(result);
+      },
       // uname's machine field as libuv reports it, derived from the build's
       // arch rather than read from the OS. arm64 has three spellings: Linux
       // says "aarch64", Darwin "arm64", and on Windows libuv's uv_os_uname

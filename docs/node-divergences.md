@@ -1599,30 +1599,34 @@ exit it has not collected yet (up to 0.19.5 the probe read such a process as ali
 signal to it was `EPERM`). `ChildProcess.kill()` on such a child still returns `true`
 where Node returns `false`: its answer comes before the signal is delivered, not from it.
 
-### `os.networkInterfaces()`: what still differs
+### `os.networkInterfaces()`: what still differs on Windows
 
-The interfaces, hardware addresses, addresses and prefix lengths are the ones the system
+The interfaces, hardware addresses, addresses and netmasks are the ones the system
 reports (up to 0.19.5 oam answered a fixed loopback entry named `lo` on every unix plus
-one made-up `eth0` / `Ethernet` entry with a zero MAC and a /24 mask). Read through the
-`sysinfo` crate rather than libuv's `uv_interface_addresses`, which leaves these
-differences:
+one made-up `eth0` / `Ethernet` entry with a zero MAC and a /24 mask).
+
+On Linux and macOS there is no difference: oam reads getifaddrs(3) as libuv's
+`uv_interface_addresses` does, so the interfaces, their order, each address's netmask,
+CIDR, hardware address, `internal` (the interface's loopback flag) and IPv6 `scopeid` are
+node's. It does not need `/sys`, so a container without sysfs gets the same answer node
+gives there. Conformance case 646 pins it against Node on all three platforms.
+
+On Windows the adapters are read through the `sysinfo` crate rather than libuv's
+`GetAdaptersAddresses` walk, which leaves these differences:
 
 - **Order.** Interfaces are sorted by name and each interface's addresses by family
-  (IPv4 first; IPv6 first on Windows, as Node lists them there) and then by address. Node
-  reports the system's order.
+  (IPv6 first, as Node lists them there) and then by address. Node reports the system's
+  order.
 - **`scopeid`.** Present and 0 for every IPv6 address except a link-local one
   (`fe80::/10`), which has no `scopeid` property: the zone index is not read, and 0 would
   be a wrong value rather than a missing one. Node reports the interface's index there.
 - **`internal`.** True for every address of an interface that holds a loopback address;
-  Node reads the interface's loopback flag.
+  Node reads the adapter's type.
 - **Which interfaces.** One the system reports as down, or with no address, is left out,
-  as in Node. On Windows only adapters with a hardware address are enumerated, so software
-  adapters (VPN and virtual-switch interfaces) Node lists are missing; the loopback
-  interface is added as `Loopback Pseudo-Interface 1` with `::1/128` and `127.0.0.1/8`,
-  each only if this host can bind it.
-
-_(Not measured against Node on Linux or macOS; the Windows differences are read from
-`sysinfo` 0.39's source and Node v22.22.2's output on one machine.)_
+  as in Node. Only adapters with a hardware address are enumerated, so software adapters
+  (VPN and virtual-switch interfaces) Node lists are missing; the loopback interface is
+  added as `Loopback Pseudo-Interface 1` with `::1/128` and `127.0.0.1/8`, each only if
+  this host can bind it. Case 646 pins that loopback entry against Node.
 
 ### 30. DNS channels: timing details, and what a `Resolver` instance lacks
 
