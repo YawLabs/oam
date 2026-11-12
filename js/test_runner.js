@@ -10,7 +10,9 @@
 // describe/test/it with .skip/.only/.todo, beforeAll/afterAll/beforeEach/
 // afterEach, Jest-shape expect (incl. .not / .resolves / .rejects),
 // mock.fn / mock.spyOn / mock.restoreAll / mock.clearAll, and
-// mock.timers (fake timers: enable/tick/runAll/setSystemTime/restore).
+// mock.timers (fake timers: enable/tick/runAll/setSystemTime/restore;
+// they cover the timer globals and Date -- Date.now(), new Date(), Date()
+// -- but not performance.now()).
 // Tests are promise/async only (no done-callback legacy shape).
 //
 // SNAPSHOT CONSTRAINT (same as the other js/ files): evaluated at BUILD
@@ -121,6 +123,18 @@
       const check = (pass, matcher, expectedText) => {
         if (pass === negated) fail(matcher, actual, expectedText, negated);
       };
+      // The mock matchers refuse a value that is not a mock or spy, in
+      // either polarity: read as "no calls", `.not.toHaveBeenCalled()` on a
+      // plain function could never fail.
+      const mockCalls = (matcher) => {
+        const calls = typeof actual === "function" ? actual.mock?.calls : undefined;
+        if (!Array.isArray(calls)) {
+          throw new ExpectationError(
+            `expect(${inspect(actual)})${negated ? ".not" : ""}.${matcher}: the value must be a mock or spy function`,
+          );
+        }
+        return calls;
+      };
       const matchers = {
         toBe: (expected) =>
           check(Object.is(actual, expected), "toBe", `(${inspect(expected)})`),
@@ -185,9 +199,26 @@
           check(pass, "toMatch", `(${inspect(pattern)})`);
         },
         toMatchObject: (expected) => {
+          // Jest's subset rule: a plain object compares only the expected
+          // keys; an array must also agree on length; a value whose state is
+          // not in enumerable keys (Date, RegExp, Map, Set, Error, binary
+          // data) compares by full equality -- walking its keys would find
+          // none and match anything.
+          const opaque = (v) =>
+            v instanceof Date ||
+            v instanceof RegExp ||
+            v instanceof Map ||
+            v instanceof Set ||
+            v instanceof Error ||
+            v instanceof ArrayBuffer ||
+            ArrayBuffer.isView(v);
           const subset = (exp, act) => {
             if (exp === null || typeof exp !== "object") return deepEqual(act, exp, false);
             if (act === null || typeof act !== "object") return false;
+            if (opaque(exp)) return deepEqual(act, exp, false);
+            if (Array.isArray(exp) && (!Array.isArray(act) || act.length !== exp.length)) {
+              return false;
+            }
             return Object.keys(exp).every((k) => subset(exp[k], act[k]));
           };
           check(subset(expected, actual), "toMatchObject", `(${inspect(expected)})`);
@@ -210,26 +241,33 @@
             if (typeof expected === "string") pass = message.includes(expected);
             else if (expected instanceof RegExp) pass = expected.test(message);
             else if (typeof expected === "function") pass = error instanceof expected;
+            else if (expected !== null && typeof expected === "object") {
+              // An error object (or any object carrying `message`) matches
+              // on an identical message, as in Jest.
+              pass = message === expected.message;
+            } else {
+              throw new ExpectationError(
+                "expect(...).toThrow: expected must be a string, a RegExp, a class or an error object",
+              );
+            }
           }
           check(pass, "toThrow", expected === undefined ? "()" : `(${inspect(expected)})`);
         },
         // Mock-aware matchers.
         toHaveBeenCalled: () =>
-          check(actual?.mock?.calls?.length > 0, "toHaveBeenCalled", "()"),
-        toHaveBeenCalledTimes: (n) =>
-          check(
-            actual?.mock?.calls?.length === n,
-            "toHaveBeenCalledTimes",
-            `(${n}) — got ${actual?.mock?.calls?.length}`,
-          ),
+          check(mockCalls("toHaveBeenCalled").length > 0, "toHaveBeenCalled", "()"),
+        toHaveBeenCalledTimes: (n) => {
+          const calls = mockCalls("toHaveBeenCalledTimes");
+          check(calls.length === n, "toHaveBeenCalledTimes", `(${n}) — got ${calls.length}`);
+        },
         toHaveBeenCalledWith: (...args) =>
           check(
-            (actual?.mock?.calls ?? []).some((call) => deepEqual(call, args, false)),
+            mockCalls("toHaveBeenCalledWith").some((call) => deepEqual(call, args, false)),
             "toHaveBeenCalledWith",
             `(${args.map(inspect).join(", ")})`,
           ),
         toHaveBeenLastCalledWith: (...args) => {
-          const calls = actual?.mock?.calls ?? [];
+          const calls = mockCalls("toHaveBeenLastCalledWith");
           check(
             calls.length > 0 && deepEqual(calls[calls.length - 1], args, false),
             "toHaveBeenLastCalledWith",
@@ -381,7 +419,8 @@
           clearInterval: globalThis.clearInterval,
           setImmediate: globalThis.setImmediate,
           clearImmediate: globalThis.clearImmediate,
-          dateNow: Date.now,
+          Date: globalThis.Date,
+          dateNow: globalThis.Date.now,
         };
         const schedule = (fn, ms, interval, args) => {
           const id = this._nextId++;
@@ -404,38 +443,51 @@
         globalThis.clearTimeout = cancel;
         globalThis.clearInterval = cancel;
         globalThis.clearImmediate = cancel;
-        Date.now = () => this._now;
-      }
-      _runDue(limit) {
-        let ran = 0;
-        for (;;) {
-          const due = this._queue
-            .filter((t) => t.due <= this._now)
-            .sort((a, b) => a.due - b.due || a.id - b.id)[0];
-          if (!due) break;
-          if (++ran > 100000) {
-            throw new Error("mock.timers: runaway timer loop (100000 callbacks)");
-          }
-          if (due.interval != null) {
-            due.due += due.interval;
-          } else {
-            this._queue = this._queue.filter((t) => t.id !== due.id);
-          }
-          due.fn(...due.args);
-          if (limit && ran >= limit) break;
-        }
-        return ran;
+        // The clock covers every way of reading "now" through Date: the
+        // real Date.now (for code that captured the constructor earlier)
+        // and a stand-in global whose zero-argument construction and
+        // call-as-function read the fake clock. The stand-in shares the
+        // real prototype and builds real Date objects, so instanceof and
+        // deep equality treat dates made before and after enable() alike.
+        // performance.now() is NOT faked.
+        const RealDate = this._saved.Date;
+        const clock = this;
+        const FakeDate = function Date(...args) {
+          if (new.target === undefined) return new RealDate(clock._now).toString();
+          return Reflect.construct(
+            RealDate,
+            args.length === 0 ? [clock._now] : args,
+            new.target === FakeDate ? RealDate : new.target,
+          );
+        };
+        FakeDate.prototype = RealDate.prototype;
+        FakeDate.now = () => this._now;
+        FakeDate.parse = RealDate.parse;
+        FakeDate.UTC = RealDate.UTC;
+        RealDate.now = FakeDate.now;
+        globalThis.Date = FakeDate;
       }
       tick(ms) {
         this._assertInstalled("tick");
         // Fire timers in due order, advancing the clock to each due time so
         // callbacks scheduling follow-ups land deterministically.
         const target = this._now + (Number(ms) || 0);
+        // Runaway guard: callbacks fired without the clock moving. A timer
+        // that re-arms itself at 0 ms is always due, and this loop is
+        // synchronous, so no per-test timeout could interrupt it. A long
+        // tick over a real interval advances the clock and never trips it.
+        let stalled = 0;
         for (;;) {
           const next = this._queue
             .filter((t) => t.due <= target)
             .sort((a, b) => a.due - b.due || a.id - b.id)[0];
           if (!next) break;
+          if (next.due > this._now) stalled = 0;
+          else if (++stalled > 100000) {
+            throw new Error(
+              "mock.timers.tick: runaway timer loop (100000 callbacks without the clock advancing)",
+            );
+          }
           this._now = Math.max(this._now, next.due);
           if (next.interval != null) next.due += next.interval;
           else this._queue = this._queue.filter((t) => t.id !== next.id);
@@ -476,7 +528,8 @@
         globalThis.clearInterval = this._saved.clearInterval;
         globalThis.setImmediate = this._saved.setImmediate;
         globalThis.clearImmediate = this._saved.clearImmediate;
-        Date.now = this._saved.dateNow;
+        globalThis.Date = this._saved.Date;
+        this._saved.Date.now = this._saved.dateNow;
         this._queue = [];
       }
       _assertInstalled(op) {
@@ -503,38 +556,79 @@
       await fn();
     }
 
-    async function runTest(entry, results, filter) {
+    // What happens to one registered test under this run's filter and the
+    // skip/only modes: "filtered" (not reported), "todo", "skip" or "run".
+    // The single source for both runTest and the does-this-suite-run check
+    // that gates beforeAll/afterAll.
+    function disposition(entry, filter) {
+      if (filter) {
+        const fullName = [...suitePath(entry.suite), entry.name].join(" > ");
+        if (!matchesFilter(fullName, filter)) return "filtered";
+      }
+      if (entry.mode === "todo") return "todo";
+      const inherited = inheritedMode(entry.suite);
+      if (
+        entry.mode === "skip" ||
+        inherited === "skip" ||
+        (hasOnly && entry.mode !== "only" && inherited !== "only")
+      ) {
+        return "skip";
+      }
+      return "run";
+    }
+
+    function suiteHasRunnable(suite, filter) {
+      return suite.children.some((child) =>
+        child.kind === "suite"
+          ? suiteHasRunnable(child.suite, filter)
+          : disposition(child, filter) === "run",
+      );
+    }
+
+    async function runTest(entry, results, filter, hookError) {
       const path = [...suitePath(entry.suite), entry.name];
       const fullName = path.join(" > ");
-      const skipByMode =
-        entry.mode === "skip" ||
-        inheritedMode(entry.suite) === "skip" ||
-        (hasOnly && entry.mode !== "only" && inheritedMode(entry.suite) !== "only");
-      if (entry.mode === "todo") {
-        results.push({ name: fullName, status: "todo", durationMs: 0, error: null });
+      const fate = disposition(entry, filter);
+      if (fate === "filtered") {
+        return; // filtered out entirely: not even reported (todo included)
+      }
+      if (fate === "todo" || fate === "skip") {
+        results.push({ name: fullName, status: fate, durationMs: 0, error: null });
         return;
       }
-      if (filter && !matchesFilter(fullName, filter)) {
-        return; // filtered out entirely: not even reported
-      }
-      if (skipByMode) {
-        results.push({ name: fullName, status: "skip", durationMs: 0, error: null });
+      if (hookError) {
+        // An enclosing suite's beforeAll threw: the test cannot run, and it
+        // is reported as failed with that error rather than left out.
+        results.push({
+          name: fullName,
+          status: "fail",
+          durationMs: 0,
+          error: {
+            message: `beforeAll failed: ${
+              hookError instanceof Error ? hookError.message : String(hookError)
+            }`,
+            stack: hookError instanceof Error ? trimStack(hookError.stack) : null,
+          },
+        });
         return;
       }
 
       const start = Date.now();
       let error = null;
       try {
-        for (const suite of lineage(entry.suite)) {
-          for (const hook of suite.beforeEach) await callHook(hook);
-        }
         try {
+          // A throwing beforeEach fails the test without running its body,
+          // but stays inside this try so the afterEach pass below still
+          // closes whatever the earlier beforeEach hooks opened.
+          for (const suite of lineage(entry.suite)) {
+            for (const hook of suite.beforeEach) await callHook(hook);
+          }
           await withTimeout(entry.fn(), entry.timeout, fullName);
         } catch (e) {
           error = e;
         }
         // afterEach ALWAYS runs (Jest semantics); its failure fails the
-        // test only if the body had not already failed.
+        // test only if the hooks and body before it had not already failed.
         for (const suite of lineage(entry.suite).reverse()) {
           for (const hook of suite.afterEach) {
             try {
@@ -572,12 +666,15 @@
       return chain;
     }
 
+    // A skip anywhere up the chain wins over an only nested inside it: a
+    // describe.only under a describe.skip stays skipped.
     function inheritedMode(suite) {
+      let mode = "normal";
       for (let s = suite; s; s = s.parent) {
         if (s.mode === "skip") return "skip";
-        if (s.mode === "only") return "only";
+        if (s.mode === "only") mode = "only";
       }
-      return "normal";
+      return mode;
     }
 
     function matchesFilter(fullName, filter) {
@@ -610,31 +707,49 @@
 
     function trimStack(stack) {
       if (!stack) return null;
-      // Drop runner-internal frames: the factory evaluates inside the
-      // snapshot with no resource name, so its frames read '<anonymous>';
-      // user test files always carry a real path.
+      // Drop runner-internal frames: the runner's own frames carry the
+      // location `oam:test_runner.js:L:C` (a native callback or an unnamed
+      // script reads '<anonymous>'), while user test files always carry a
+      // real path. Only FRAME lines are
+      // candidates, and only by their location (an `oam:`/`node:` builtin
+      // or a bare `<anonymous>`): the header line survives whatever its
+      // message says ("Cannot find module 'node:x'"), and so does a user
+      // frame whose function is `Object.<anonymous>` or whose path merely
+      // contains one of those words.
+      const internalFrame =
+        /^at (?:.* \()?(?:(?:oam|node):[^()]*|<anonymous>(?::\d+:\d+)?)\)?$/;
       return stack
         .split("\n")
-        .filter(
-          (line) =>
-            !line.includes("oam:") &&
-            !line.includes("node:") &&
-            !line.includes("test_runner") &&
-            !(line.trim().startsWith("at ") && line.includes("<anonymous>")),
-        )
+        .filter((line) => !internalFrame.test(line.trim()))
         .slice(0, 8)
         .join("\n");
     }
 
-    async function runSuite(suite, results, filter) {
+    // `inheritedError` is an enclosing suite's beforeAll failure. A suite's
+    // own hooks run only when at least one of its tests will actually run
+    // (so a skipped or fully filtered suite sets nothing up) and no
+    // enclosing beforeAll has failed. A beforeAll that throws fails the
+    // tests of THIS suite and its children; sibling suites carry on.
+    async function runSuite(suite, results, filter, inheritedError) {
+      const ownHooks = !inheritedError && suiteHasRunnable(suite, filter);
+      let hookError = inheritedError ?? null;
       try {
-        for (const hook of suite.beforeAll) await callHook(hook);
+        if (ownHooks) {
+          try {
+            for (const hook of suite.beforeAll) await callHook(hook);
+          } catch (e) {
+            // Normalised so ANY falsy thrown value (undefined, null, 0, "",
+            // false) still marks the failure: the checks downstream are
+            // truthiness tests.
+            hookError = e || new Error(`beforeAll threw ${String(e)}`);
+          }
+        }
         for (const child of suite.children) {
-          if (child.kind === "suite") await runSuite(child.suite, results, filter);
-          else await runTest(child, results, filter);
+          if (child.kind === "suite") await runSuite(child.suite, results, filter, hookError);
+          else await runTest(child, results, filter, hookError);
         }
       } finally {
-        for (const hook of suite.afterAll) {
+        for (const hook of ownHooks ? suite.afterAll : []) {
           try {
             await callHook(hook);
           } catch (e) {
@@ -655,9 +770,10 @@
     async function __run(filter) {
       const results = [];
       try {
-        await runSuite(rootSuite, results, filter || null);
+        await runSuite(rootSuite, results, filter || null, null);
       } catch (e) {
-        // A beforeAll/afterAll threw: surface as a file-level failure entry.
+        // Backstop: hook failures are scoped inside runSuite, so only an
+        // unexpected runner error reaches here; it is still reported.
         results.push({
           name: "(suite hooks)",
           status: "fail",

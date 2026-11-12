@@ -157,7 +157,14 @@ impl Drop for Cleanup {
                     .status();
             }
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
+        // A killed child's handle on its cwd (this directory) can outlive
+        // taskkill briefly, so one attempt can fail and leave the dir behind.
+        for _ in 0..20 {
+            if std::fs::remove_dir_all(&self.dir).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 }
 

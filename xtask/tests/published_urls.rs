@@ -14,7 +14,9 @@
 //! that assertion is the thing under review.
 //!
 //! Scope is what compiles into the binary and its snapshot: `crates/*/src`,
-//! `js/` outside `js/vendor`, and `xtask/src`. Test trees are out --
+//! `js/` outside `js/vendor/node-streams` (Node's own source, verbatim;
+//! `js/vendor/oam-shims` is oam's code and is scanned), `crates/*/types`
+//! (the `.d.ts` files a crate embeds and writes to disk), and `xtask/src`. Test trees are out --
 //! `crates/oam_cli/tests/e2e.rs` alone carries hundreds of example URLs
 //! that no user ever sees, and pulling them in would bury the signal.
 
@@ -47,13 +49,23 @@ fn every_printed_url_is_published() {
     let mut failures: Vec<String> = Vec::new();
 
     for file in scanned_files(&root) {
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
         let shown = file
             .strip_prefix(&root)
             .unwrap_or(&file)
             .display()
             .to_string()
             .replace('\\', "/");
+        // An unreadable (or non-UTF-8) file is a file this gate did not
+        // check. Defaulting it to empty text would report that as a pass.
+        let text = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(e) => {
+                failures.push(format!(
+                    "{shown}: could not be read as UTF-8 text ({e}), so its URLs were not checked."
+                ));
+                continue;
+            }
+        };
 
         for (lineno, line) in text.lines().enumerate() {
             let lineno = lineno + 1;
@@ -62,9 +74,11 @@ fn every_printed_url_is_published() {
             // included: `oam.sh/odif` lived in a module doc comment for its
             // whole life, and a URL in a comment is one copy-paste away from
             // being a URL in a `eprintln!`.
+            let mut retired_url_on_line = false;
             for url in urls_in(line) {
                 let host = host_of(&url);
                 if RETIRED_HOSTS.iter().any(|h| is_host(host, h)) {
+                    retired_url_on_line = true;
                     failures.push(format!(
                         "{shown}:{lineno}: {url} is on a retired domain. oamjs.org replaced oam.sh; \
                          oam.sh now redirects off the project entirely and cannot be allowlisted."
@@ -80,6 +94,17 @@ fn every_printed_url_is_published() {
                         ));
                     }
                 }
+            }
+
+            // A retired host needs no scheme to mislead: the reference that
+            // motivated this gate was written as a bare `oam.sh/odif`. The
+            // URL pass above already reported any spelled with a scheme.
+            if !retired_url_on_line && let Some(host) = bare_retired_host(line) {
+                failures.push(format!(
+                    "{shown}:{lineno}: mentions the retired domain {host}. oamjs.org replaced \
+                     oam.sh; oam.sh now redirects off the project entirely and cannot be \
+                     allowlisted."
+                ));
             }
 
             // Foreign hosts are checked with line comments stripped: in code
@@ -224,6 +249,10 @@ fn scanned_files(root: &Path) -> Vec<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(root.join("crates")) {
         for entry in entries.flatten() {
             collect(&entry.path().join("src"), "rs", &mut out);
+            // Declaration files a crate `include_str!`s from beside its src/
+            // (crates/oam_ts/types/oam.d.ts) ship inside the binary and are
+            // written to users' disks, so their JSDoc is printed text too.
+            collect(&entry.path().join("types"), "ts", &mut out);
         }
     }
     // Skip only the genuinely-upstream subtree. js/vendor/node-streams is Node's
@@ -332,11 +361,40 @@ fn host_of(url: &str) -> &str {
 
 /// `host` is `name`, or a subdomain of it. Substring matching would make
 /// `foam.sh` a match for `oam.sh`.
+///
+/// The suffix is compared as bytes: a host literal may be non-ASCII, and
+/// slicing the `str` at a byte offset inside a multi-byte character panics.
 fn is_host(host: &str, name: &str) -> bool {
+    let (host, name) = (host.as_bytes(), name.as_bytes());
     host.eq_ignore_ascii_case(name)
         || (host.len() > name.len()
             && host[host.len() - name.len()..].eq_ignore_ascii_case(name)
-            && host.as_bytes()[host.len() - name.len() - 1] == b'.')
+            && host[host.len() - name.len() - 1] == b'.')
+}
+
+/// The first retired host a line names as a whole word, scheme or not.
+///
+/// "Whole word" is what keeps `foam.sh`, `install-oam.sh` and `oam.shop`
+/// out: the match may be preceded by a `.` (a subdomain is still the retired
+/// domain) but not by another host-name character, and may not be followed
+/// by one.
+fn bare_retired_host(line: &str) -> Option<&'static str> {
+    let lower = line.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let is_name_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
+    for &name in RETIRED_HOSTS {
+        let mut from = 0;
+        while let Some(at) = lower[from..].find(name).map(|i| from + i) {
+            let end = at + name.len();
+            let before_ok = at == 0 || !is_name_byte(bytes[at - 1]);
+            let after_ok = end == bytes.len() || !is_name_byte(bytes[end]);
+            if before_ok && after_ok {
+                return Some(name);
+            }
+            from = end;
+        }
+    }
+    None
 }
 
 /// A fragment never reaches the server, so two URLs differing only in their
@@ -404,6 +462,43 @@ mod helper_tests {
         assert!(!is_host("oam.shop", "oam.sh"));
         assert!(is_host("oamjs.org", "oamjs.org"));
         assert!(!is_host("notoamjs.org", "oamjs.org"));
+    }
+
+    #[test]
+    fn a_non_ascii_host_is_compared_not_sliced() {
+        // Between them these put the suffix offset inside a two-byte
+        // character for each of the names compared.
+        for host in ["fa\u{df}.de", "\u{df}am.sh", "x\u{df}oamjs.org", "\u{df}"] {
+            assert!(!is_host(host, "oam.sh"), "{host}");
+            assert!(!is_host(host, "oamjs.org"), "{host}");
+            assert!(!is_host(host, "x"), "{host}");
+        }
+        assert!(is_host("\u{df}.oam.sh", "oam.sh"));
+    }
+
+    #[test]
+    fn a_retired_host_is_found_without_a_scheme() {
+        assert_eq!(bare_retired_host("//! spec: oam.sh/odif"), Some("oam.sh"));
+        assert_eq!(bare_retired_host("see WWW.OAM.SH."), Some("oam.sh"));
+        assert_eq!(bare_retired_host("redirects to 0am.sh now"), Some("0am.sh"));
+        assert_eq!(bare_retired_host("https://oam.sh/e/x"), Some("oam.sh"));
+        assert_eq!(bare_retired_host("scripts/install-oam.sh"), None);
+        assert_eq!(bare_retired_host("foam.sh and oam.shop"), None);
+        assert_eq!(bare_retired_host("my_oam.sh"), None);
+        assert_eq!(bare_retired_host("https://oamjs.org/docs/odif"), None);
+        // An earlier near-miss must not hide a later real one.
+        assert_eq!(bare_retired_host("foam.sh, then oam.sh"), Some("oam.sh"));
+    }
+
+    #[test]
+    fn the_shipped_declaration_file_is_in_scope() {
+        let files = scanned_files(&repo_root());
+        assert!(
+            files
+                .iter()
+                .any(|p| p.ends_with("crates/oam_ts/types/oam.d.ts")),
+            "crates/oam_ts/types/oam.d.ts is include_str!'d into the binary and must be scanned"
+        );
     }
 
     #[test]

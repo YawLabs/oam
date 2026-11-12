@@ -113,6 +113,16 @@ it "promoted, but the section is a bare Keep-a-Changelog skeleton: refused"
 mk "# Changelog" "" "## [Unreleased]" "" "## [0.16.5] - 2026-09-21" "" "### Fixed" "" "## [0.16.4] - 2026-09-20" "" "- old"
 gate_says "$FX" v0.16.5 "section has no entries"
 
+# 0.19.5 was tagged with `## [0.19.5] - TBD`: a heading with entries, which is
+# all the gate asked for.
+it "promoted with entries, but the heading's date is a placeholder (TBD): refused"
+mk "# Changelog" "" "## [Unreleased]" "" "## [0.16.5] - TBD" "" "### Fixed" "" "- **a fix.**" "" "## [0.16.4] - 2026-09-20" "" "- old"
+gate_says "$FX" v0.16.5 "heading carries no release date" "## [0.16.5] - YYYY-MM-DD"
+
+it "promoted with entries, but the heading has no date at all: refused"
+mk "# Changelog" "" "## [Unreleased]" "" "## [0.16.5]" "" "- **a fix.**" "" "## [0.16.4] - 2026-09-20" "" "- old"
+gate_says "$FX" v0.16.5 "heading carries no release date"
+
 it "promoted, with entries left under [Unreleased]: refused as leftover"
 mk "# Changelog" "" "## [Unreleased]" "" "- **late entry.**" "" "## [0.16.5] - 2026-09-21" "" "- a fix" "" "## [0.16.4] - 2026-09-20"
 gate_says "$FX" v0.16.5 "AND entries under [Unreleased]"

@@ -44,10 +44,17 @@ pub enum Severity {
 }
 
 /// How safe a repair is to apply without a human in the loop.
+///
+/// RESERVED, with [`Edit`] and [`Repair`]: the envelope holds a place for
+/// typed repair plans, but nothing in oam builds one yet, so every
+/// diagnostic oam emits has `repairs` empty (and leaves it out of the JSON),
+/// and there is no command that applies one. The shape is kept so a consumer
+/// that models the envelope does not have to change when an emitter lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FixSafety {
-    /// Mechanical, semantics-preserving. `oam fix --safe` applies these.
+    /// Mechanical, semantics-preserving: the only class a tool may apply
+    /// without asking.
     SafeAuto,
     /// Plausible but needs human review before applying.
     Review,
@@ -70,14 +77,14 @@ pub struct Span {
     pub end: Position,
 }
 
-/// A single proposed edit inside a repair plan.
+/// A single proposed edit inside a repair plan. Reserved: see [`FixSafety`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edit {
     pub span: Span,
     pub new_text: String,
 }
 
-/// A typed repair plan attached to a diagnostic.
+/// A typed repair plan attached to a diagnostic. Reserved: see [`FixSafety`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Repair {
     /// Stable repair id, e.g. "R-TS-ADD-EXTENSION".
@@ -104,15 +111,19 @@ pub struct Diagnostic {
     pub message: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spans: Vec<Span>,
-    /// Related locations (e.g. "declared here").
+    /// Related locations (e.g. "declared here"). Reserved: no emitter fills
+    /// it yet, so it is always empty and absent from the JSON.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<Span>,
-    /// Dedup / flake-correlation hash, stable across runs for "the same" problem.
+    /// Dedup / flake-correlation hash, stable across runs for "the same"
+    /// problem. Reserved: no emitter computes one yet, so it is always
+    /// `None` and absent from the JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
     /// The published page for this code, from [`docs_url`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docs: Option<String>,
+    /// Typed repair plans. Reserved: see [`FixSafety`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repairs: Vec<Repair>,
 }

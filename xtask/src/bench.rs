@@ -25,7 +25,9 @@
 //! Outputs: bench/results.json (machine) and BENCHMARKS.md (human),
 //! both COMMITTED -- the receipt is in the repo.
 
-use crate::conformance::{capture_version, ensure_oam_built, git_short_commit, repo_root};
+use crate::conformance::{
+    capture_version, ensure_oam_built, git_short_commit, repo_root, run_with_timeout,
+};
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -251,20 +253,32 @@ fn discover_runtimes(oam: PathBuf, oam_version: &str) -> Vec<Runtime> {
 /// trying the Windows executable suffixes where applicable.
 fn which(name: &str) -> Result<PathBuf> {
     let path_var = std::env::var_os("PATH").context("PATH is not set")?;
-    let exts: &[&str] = if cfg!(windows) {
-        &["", ".exe", ".cmd", ".bat"]
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path_var).collect();
+    which_in(name, &dirs, cfg!(windows)).with_context(|| format!("{name} not found on PATH"))
+}
+
+/// The lookup behind [`which`], with the directory list and the platform
+/// passed in so the suffix order is testable.
+///
+/// On Windows the executable suffixes are tried BEFORE the bare name. An
+/// npm-installed tool leaves both `bun` (an sh shim, for Git Bash) and
+/// `bun.cmd` in one directory; the bare name is a shell script `Command`
+/// cannot exec, so taking it first made that runtime fail every case.
+fn which_in(name: &str, dirs: &[PathBuf], windows: bool) -> Option<PathBuf> {
+    let exts: &[&str] = if windows {
+        &[".exe", ".cmd", ".bat", ""]
     } else {
         &[""]
     };
-    for dir in std::env::split_paths(&path_var) {
+    for dir in dirs {
         for ext in exts {
             let candidate = dir.join(format!("{name}{ext}"));
             if candidate.is_file() {
-                return Ok(candidate);
+                return Some(candidate);
             }
         }
     }
-    bail!("{name} not found on PATH");
+    None
 }
 
 // ------------------------------------------------------------ case runner
@@ -449,14 +463,112 @@ fn run_cold_start(rt: &Runtime, script: &Path) -> Result<CaseResult> {
     })
 }
 
+/// One MCP server process under measurement, driven over stdio.
+///
+/// Two things the mcp-* cases need on EVERY path, which is why they are a
+/// type rather than inline code:
+///
+/// * a deadline on each response. Stdout is read on its own thread and the
+///   lines arrive over a channel, so a server that starts but never answers
+///   fails the sample after `CASE_TIMEOUT` instead of hanging the bench on a
+///   blocking read;
+/// * the child is killed and reaped when this drops, so an error return (a
+///   timeout, a closed pipe, a failed write) cannot leave a server running.
+///
+/// Stdin stays open until drop: closing it is EOF, which a server may treat
+/// as "no more input" and exit on before writing its response.
+struct McpServer {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    /// Each non-empty stdout line, with the instant its read returned. The
+    /// clock stops on the reader thread, so a figure carries no harness
+    /// scheduling between the line landing and the main thread noticing.
+    lines: std::sync::mpsc::Receiver<(Instant, String)>,
+}
+
+impl McpServer {
+    fn spawn(mut cmd: Command) -> Result<Self> {
+        use std::io::BufRead;
+
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().context("spawn MCP server")?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let (tx, lines) = std::sync::mpsc::channel();
+        // Built before the pipes are checked, so the drop below reaps the
+        // child if either is missing.
+        let server = McpServer {
+            child,
+            stdin,
+            lines,
+        };
+        if server.stdin.is_none() {
+            bail!("mcp server stdin was not piped");
+        }
+        let stdout = stdout.context("mcp server stdout")?;
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    // EOF or a read error: dropping `tx` tells the receiver.
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let at = Instant::now();
+                        if !line.trim().is_empty() && tx.send((at, line.clone())).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(server)
+    }
+
+    /// Write one newline-terminated JSON-RPC message.
+    fn send(&mut self, msg: &str) -> Result<()> {
+        use std::io::Write;
+        let stdin = self.stdin.as_mut().context("mcp server stdin")?;
+        stdin.write_all(msg.as_bytes())?;
+        stdin.flush()?;
+        Ok(())
+    }
+
+    /// The instant the next non-empty stdout line was read, or an error
+    /// naming `what` when the server closes stdout first or stays silent past
+    /// `timeout`.
+    fn next_line(&self, what: &str, timeout: Duration) -> Result<Instant> {
+        use std::sync::mpsc::RecvTimeoutError;
+        match self.lines.recv_timeout(timeout) {
+            Ok((at, _line)) => Ok(at),
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("server closed stdout before {what}")
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                bail!("no {what} within {}s", timeout.as_secs())
+            }
+        }
+    }
+}
+
+impl Drop for McpServer {
+    fn drop(&mut self) {
+        // Close stdin first, then kill: the measurement is over either way.
+        self.stdin = None;
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// MCP cold-start: time from process spawn to the first JSON-RPC response.
 ///
 /// Spawns the server script, sends an MCP `initialize` request via stdin,
 /// and records wall-clock time until a JSON-RPC response line arrives on
 /// stdout. Kills the server after each measurement.
 fn run_mcp_cold_start(rt: &Runtime, server_script: &Path) -> Result<CaseResult> {
-    use std::io::{BufRead, Write};
-
     print!("  {}/mcp-cold-start: ", rt.name);
     let iters = COLD_START_ITERS;
     let mut samples = Vec::with_capacity(iters);
@@ -475,42 +587,20 @@ fn run_mcp_cold_start(rt: &Runtime, server_script: &Path) -> Result<CaseResult> 
         + "\n";
 
     for i in 0..iters {
-        let mut cmd = rt.build_cmd(server_script, &[]);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+        let cmd = rt.build_cmd(server_script, &[]);
 
         let start = Instant::now();
-        let mut child = cmd.spawn().context("spawn MCP server")?;
+        let mut server = McpServer::spawn(cmd)?;
 
-        // Write the initialize request. Keep stdin open (do NOT drop the handle
-        // yet): closing stdin sends EOF, which the server sees as "no more input"
-        // and may exit before writing its response.
-        let mut stdin = child.stdin.take().context("mcp server stdin")?;
-        stdin.write_all(init_msg.as_bytes())?;
-        stdin.flush()?;
+        // Write the initialize request; the first non-empty stdout line is its
+        // response. Stdin stays open until `server` drops (see McpServer).
+        server.send(&init_msg)?;
+        let answered = server
+            .next_line("the initialize response", CASE_TIMEOUT)
+            .with_context(|| format!("{}/mcp-cold-start iter {i}", rt.name))?;
+        let elapsed = answered.duration_since(start).as_secs_f64() * 1000.0;
 
-        // Read lines until we get a non-empty JSON line (the initialize response).
-        let stdout = child.stdout.take().context("mcp server stdout")?;
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut line = String::new();
-        let elapsed = loop {
-            line.clear();
-            let n = reader.read_line(&mut line)?;
-            if n == 0 {
-                bail!(
-                    "{}/mcp-cold-start iter {i}: server closed stdout before response",
-                    rt.name
-                );
-            }
-            if !line.trim().is_empty() {
-                break start.elapsed().as_secs_f64() * 1000.0;
-            }
-        };
-        drop(stdin); // close stdin AFTER reading the response
-
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(server); // close stdin, kill and reap AFTER reading the response
         samples.push(elapsed);
         print!(".");
 
@@ -536,6 +626,24 @@ fn run_mcp_cold_start(rt: &Runtime, server_script: &Path) -> Result<CaseResult> 
     })
 }
 
+/// The memory figure, in KB, from `tasklist /FO CSV /NH` output. The one
+/// parse `process_rss_bytes` uses on Windows, split out so the tests exercise
+/// the production code rather than a copy of it.
+///
+/// The memory field embeds a thousands separator, so splitting the line on
+/// ',' cuts THAT FIELD in half. The previous version did exactly that and
+/// rejoined the halves in reverse -- "22,220 K" parsed as 22022 -- so every
+/// RSS figure this ever reported on Windows was scrambled, plausibly enough
+/// to go unnoticed. Take the last QUOTED field instead, which is
+/// separator-agnostic.
+#[cfg(target_os = "windows")]
+fn parse_tasklist_rss_kb(text: &str) -> Option<u64> {
+    let line = text.lines().find(|l| l.contains('"'))?;
+    let field = line.rsplit('"').nth(1)?;
+    let digits: String = field.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 /// Read RSS of a running process in bytes. Best-effort; returns None on failure.
 fn process_rss_bytes(pid: u32) -> Option<u64> {
     #[cfg(target_os = "windows")]
@@ -547,16 +655,7 @@ fn process_rss_bytes(pid: u32) -> Option<u64> {
             .output()
             .ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
-        // The memory field embeds a thousands separator, so splitting the line
-        // on ',' cuts THAT FIELD in half. The previous version did exactly
-        // that and rejoined the halves in reverse -- "22,220 K" parsed as
-        // 22022 -- so every RSS figure this ever reported on Windows was
-        // scrambled, plausibly enough to go unnoticed. Take the last QUOTED
-        // field instead, which is separator-agnostic.
-        let line = text.lines().find(|l| l.contains('"'))?;
-        let field = line.rsplit('"').nth(1)?;
-        let digits: String = field.chars().filter(|c| c.is_ascii_digit()).collect();
-        let kb: u64 = digits.parse().ok()?;
+        let kb = parse_tasklist_rss_kb(&text)?;
         Some(kb * 1024)
     }
     #[cfg(target_os = "linux")]
@@ -587,8 +686,6 @@ fn process_rss_bytes(pid: u32) -> Option<u64> {
 /// Unit: MB (megabytes). The initialize round-trip ensures the runtime is
 /// fully loaded (module graph evaluated, event loop alive) before sampling.
 fn run_mcp_idle_rss(rt: &Runtime, server_script: &Path) -> Result<CaseResult> {
-    use std::io::{BufRead, Write};
-
     print!("  {}/mcp-idle-rss: ", rt.name);
     let iters = COLD_START_ITERS;
     let mut samples = Vec::with_capacity(iters);
@@ -602,30 +699,17 @@ fn run_mcp_idle_rss(rt: &Runtime, server_script: &Path) -> Result<CaseResult> {
     .to_string()
         + "\n";
 
-    for _i in 0..iters {
-        let mut cmd = rt.build_cmd(server_script, &[]);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = cmd.spawn().context("spawn MCP server")?;
-        let pid = child.id();
+    for i in 0..iters {
+        let mut server = McpServer::spawn(rt.build_cmd(server_script, &[]))?;
+        let pid = server.child.id();
 
-        let mut stdin = child.stdin.take().context("mcp server stdin")?;
-        stdin.write_all(init_msg.as_bytes())?;
-        stdin.flush()?;
-
-        let stdout = child.stdout.take().context("mcp server stdout")?;
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            if reader.read_line(&mut line)? == 0 {
-                break;
-            }
-            if !line.trim().is_empty() {
-                break;
-            }
-        }
+        // A server that never answers `initialize` is not "idle after
+        // initialize": fail the sample rather than publish the RSS of a
+        // process in some other state (or wait on it forever).
+        server.send(&init_msg)?;
+        server
+            .next_line("the initialize response", CASE_TIMEOUT)
+            .with_context(|| format!("{}/mcp-idle-rss iter {i}", rt.name))?;
 
         // Server is now idle (waiting for next request) -- sample RSS.
         if let Some(bytes) = process_rss_bytes(pid) {
@@ -633,9 +717,7 @@ fn run_mcp_idle_rss(rt: &Runtime, server_script: &Path) -> Result<CaseResult> {
             samples.push(mb);
         }
 
-        drop(stdin);
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(server);
         print!(".");
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -666,8 +748,6 @@ fn run_mcp_idle_rss(rt: &Runtime, server_script: &Path) -> Result<CaseResult> {
 /// time from send to response. The initialize is NOT included -- this is
 /// warm-path latency on an already-running server.
 fn run_mcp_first_call_latency(rt: &Runtime, server_script: &Path) -> Result<CaseResult> {
-    use std::io::{BufRead, Write};
-
     print!("  {}/mcp-first-call-latency: ", rt.name);
     let iters = COLD_START_ITERS;
     let mut samples = Vec::with_capacity(iters);
@@ -696,62 +776,28 @@ fn run_mcp_first_call_latency(rt: &Runtime, server_script: &Path) -> Result<Case
         + "\n";
 
     for i in 0..iters {
-        let mut cmd = rt.build_cmd(server_script, &[]);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = cmd.spawn().context("spawn MCP server")?;
-
-        let mut stdin = child.stdin.take().context("mcp server stdin")?;
-        stdin.write_all(init_msg.as_bytes())?;
-        stdin.flush()?;
-
-        let stdout = child.stdout.take().context("mcp server stdout")?;
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut line = String::new();
+        let iter_label = || format!("{}/mcp-first-call-latency iter {i}", rt.name);
+        let mut server = McpServer::spawn(rt.build_cmd(server_script, &[]))?;
 
         // Drain the initialize response.
-        loop {
-            line.clear();
-            if reader.read_line(&mut line)? == 0 {
-                bail!(
-                    "{}/mcp-first-call-latency iter {i}: closed before initialize response",
-                    rt.name
-                );
-            }
-            if !line.trim().is_empty() {
-                break;
-            }
-        }
+        server.send(&init_msg)?;
+        server
+            .next_line("the initialize response", CASE_TIMEOUT)
+            .with_context(iter_label)?;
 
         // Send the initialized notification (required by MCP spec before tools/call).
-        stdin.write_all(initialized_notif.as_bytes())?;
-        stdin.flush()?;
+        server.send(&initialized_notif)?;
 
         // Now measure: send tools/call, time to response.
         let call_start = Instant::now();
-        stdin.write_all(call_msg.as_bytes())?;
-        stdin.flush()?;
-
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line)?;
-            if n == 0 {
-                bail!(
-                    "{}/mcp-first-call-latency iter {i}: closed before tools/call response",
-                    rt.name
-                );
-            }
-            if !line.trim().is_empty() {
-                break;
-            }
-        }
-        let elapsed_ms = call_start.elapsed().as_secs_f64() * 1000.0;
+        server.send(&call_msg)?;
+        let answered = server
+            .next_line("the tools/call response", CASE_TIMEOUT)
+            .with_context(iter_label)?;
+        let elapsed_ms = answered.duration_since(call_start).as_secs_f64() * 1000.0;
         samples.push(elapsed_ms);
 
-        drop(stdin);
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(server);
         print!(".");
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -994,9 +1040,17 @@ fn write_ts_fixture(dir: &Path) -> Result<TsFixture> {
     Ok(TsFixture { entry })
 }
 
-/// The command for one row. Both cache variables are set explicitly rather
+/// The command for one row. Every cache variable is set explicitly rather
 /// than inherited: the row label promises a state, and nothing in the
 /// harness's own environment may be able to change it.
+///
+/// That includes `OAM_TRANSPILE_CACHE`, pinned ON for all three oam rows (its
+/// default). It used to be inherited, so a shell exporting
+/// `OAM_TRANSPILE_CACHE=0` made the `warm` row re-run oxc on every sample
+/// under a legend saying both caches are warm -- and the `.v8c` count cannot
+/// see that. The rows differ in the BYTECODE cache and in whether the cache
+/// directory is fresh; a fresh directory is what makes the transpile cache
+/// cold on `no-cache` and `cold`.
 fn ts_cmd(
     rt: &Runtime,
     state: TsState,
@@ -1020,9 +1074,15 @@ fn ts_cmd(
             "OAM_CODE_CACHE",
             if state == TsState::NoCache { "0" } else { "1" },
         );
+        cmd.env("OAM_TRANSPILE_CACHE", TS_TRANSPILE_CACHE);
     }
     cmd
 }
+
+/// What `ts_cmd` pins `OAM_TRANSPILE_CACHE` to on every oam row, and what the
+/// section records as `transpile_cache` so a reader (and `push_ts_markdown`)
+/// can tell a pinned measurement from one taken before the pin existed.
+const TS_TRANSPILE_CACHE: &str = "1";
 
 /// The line of a stderr dump worth quoting: the first one naming an error,
 /// else the first non-empty one. Node prints the offending source and a caret
@@ -1360,6 +1420,28 @@ fn run_ts_cold_start(runtimes: &[Runtime], fixture: &TsFixture, tmp: &Path) -> R
 
 pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
     let repo = repo_root()?;
+
+    // Resolved FIRST -- before the build, the staging copy and the temp dir --
+    // so a typo fails in under a second and leaves nothing behind. (It used
+    // to sit below all three while claiming this; `ensure_oam_built` always
+    // invokes cargo.)
+    let selected = select_cases(only)?;
+    let filtered = !only.is_empty();
+    let results_path = repo.join("bench").join("results.json");
+    // A filtered run merges into the committed file; refuse up front if there
+    // is nothing to merge into, rather than after the measurements.
+    let existing: Option<serde_json::Value> = if filtered {
+        let text = std::fs::read_to_string(&results_path).with_context(|| {
+            format!(
+                "--case merges into {}, which is missing -- run once without --case first",
+                results_path.display()
+            )
+        })?;
+        Some(serde_json::from_str(&text).context("parsing bench/results.json")?)
+    } else {
+        None
+    };
+
     let oam = ensure_oam_built(&repo, release)?;
     // Time a file nothing else is writing to, not a build artifact `cargo` may
     // replace mid-run. See stage_for_benchmark.
@@ -1396,25 +1478,8 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
 
     let tmp = std::env::temp_dir().join(format!("oam-bench-{}", std::process::id()));
     std::fs::create_dir_all(&tmp)?;
-
-    // Resolved before anything is measured so a typo fails in under a second,
-    // not after a build and a warm-up.
-    let selected = select_cases(only)?;
-    let filtered = !only.is_empty();
-    let results_path = repo.join("bench").join("results.json");
-    // A filtered run merges into the committed file; refuse up front if there
-    // is nothing to merge into, rather than after the measurements.
-    let existing: Option<serde_json::Value> = if filtered {
-        let text = std::fs::read_to_string(&results_path).with_context(|| {
-            format!(
-                "--case merges into {}, which is missing -- run once without --case first",
-                results_path.display()
-            )
-        })?;
-        Some(serde_json::from_str(&text).context("parsing bench/results.json")?)
-    } else {
-        None
-    };
+    // Removed on every exit from here on, an early `?` included.
+    let _tmp_guard = StagedBinary { dir: tmp.clone() };
 
     let scripts = write_scripts(&tmp, &repo)?;
     let ts_fixture = write_ts_fixture(&tmp.join("ts-fixture"))?;
@@ -1504,7 +1569,9 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
             match result {
                 Ok(r) => all_results.push(r),
                 Err(e) => {
-                    println!("  {}/{case_name}: FAILED -- {e}", rt.name);
+                    // `{e:#}`: the mcp-* errors carry the iteration as context
+                    // and the reason (timeout, closed pipe) as the cause.
+                    println!("  {}/{case_name}: FAILED -- {e:#}", rt.name);
                 }
             }
         }
@@ -1948,7 +2015,10 @@ fn print_table(results: &[CaseResult], runtimes: &[Runtime], case_names: &[&str]
                     .find(|r| r.name == *case_name && r.runtime == rt.name);
                 match result {
                     Some(r) => {
-                        print!(" {:>9.2}ms", r.median);
+                        // The row's own unit: mcp-idle-rss is MB, and a
+                        // literal "ms" here printed megabytes as a time.
+                        let cell = format!("{:.2}{}", r.median, r.unit);
+                        print!(" {cell:>11}");
                         medians.push(Some(r.median));
                     }
                     None => {
@@ -1993,11 +2063,20 @@ fn print_ts_table(ts: &TsSection) {
 
 // -------------------------------------------------------------- JSON output
 
+/// `exe` is the binary's file name only. The results file is committed to a
+/// public repo, and the full path is the measuring box's layout (a home
+/// directory, a per-run staging dir under temp) -- it identifies the box and
+/// tells a reader nothing the `name` and `version` beside it do not.
 fn runtime_json(rt: &Runtime) -> serde_json::Value {
+    let exe = rt
+        .exe
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| rt.name.clone());
     serde_json::json!({
         "name": rt.name,
         "version": rt.version,
-        "exe": rt.exe.to_string_lossy(),
+        "exe": exe,
     })
 }
 
@@ -2044,7 +2123,6 @@ fn build_json(
         "schema": "oam-bench/4",
         "timestamp": timestamp,
         "commit": commit,
-        "ci_run_id": std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
         "host": host,
         "hardware_class": std::env::var("BENCH_HARDWARE_CLASS").unwrap_or_else(|_| "unknown".to_string()),
         "profile": profile,
@@ -2079,6 +2157,7 @@ fn build_json(
             "modules": TS_MODULES,
             "iterations": COLD_START_ITERS,
             "node_flag": ts.node_flag,
+            "transpile_cache": TS_TRANSPILE_CACHE,
             "runtimes": participants,
             "rows": rows,
         });
@@ -2178,7 +2257,26 @@ fn build_markdown(doc: &serde_json::Value) -> String {
     md.push('\n');
 
     md.push_str("## Results\n\n");
-    md.push_str("All times in milliseconds. Lower is better.\n\n");
+    // Not "all times in milliseconds": mcp-idle-rss is megabytes, and it sat
+    // under that sentence unlabelled. Each row's own `unit` decides.
+    md.push_str(
+        "Milliseconds, except where a row's label names another unit. Lower is better.\n\n",
+    );
+    // `case` as the table prints it: the bare name for a millisecond row,
+    // `name (UNIT)` for any other unit recorded on one of the case's rows.
+    let case_label = |case: &str| {
+        let unit = results
+            .iter()
+            .copied()
+            .filter(|r| r["case"] == case)
+            .find_map(|r| r["unit"].as_str())
+            .unwrap_or("ms");
+        if unit == "ms" {
+            case.to_string()
+        } else {
+            format!("{case} ({unit})")
+        }
+    };
 
     if runtimes.len() == 1 {
         md.push_str("| Case | Median | Min | Max |\n");
@@ -2186,7 +2284,8 @@ fn build_markdown(doc: &serde_json::Value) -> String {
         for case_name in main_cases() {
             if let Some(r) = find(case_name, &runtimes[0].0) {
                 md.push_str(&format!(
-                    "| {case_name} | {:.2} | {:.2} | {:.2} |\n",
+                    "| {} | {:.2} | {:.2} | {:.2} |\n",
+                    case_label(case_name),
                     num(r, "p50"),
                     num(r, "min"),
                     num(r, "max")
@@ -2206,7 +2305,7 @@ fn build_markdown(doc: &serde_json::Value) -> String {
         md.push_str("--:|\n");
 
         for case_name in main_cases() {
-            md.push_str(&format!("| {case_name} |"));
+            md.push_str(&format!("| {} |", case_label(case_name)));
             let mut medians: Vec<Option<f64>> = Vec::new();
             for (name, _) in &runtimes {
                 match find(case_name, name) {
@@ -2350,10 +2449,22 @@ fn push_ts_markdown(md: &mut String, ts: &serde_json::Value) {
          run after the first. Its gap below no-cache is what consuming the cache saves. Both \
          caches are warm on this row: the V8 bytecode cache and, since the transpile cache \
          shipped, the oxc output for project files too (`OAM_TRANSPILE_CACHE`, on by default, \
-         content-addressed by source text plus transpile settings). The measurement above \
-         predates the transpile cache and so still describes a row that re-ran oxc every time; \
-         re-measure with `--case ts-cold-start` before quoting this row.\n",
+         content-addressed by source text plus transpile settings).",
     );
+    // The caveat is about ONE measurement, so it is keyed on that measurement
+    // and not printed unconditionally: a section this harness measured records
+    // the transpile-cache state it pinned (`ts_cmd`), and only a section
+    // without that record is the older one the caveat describes. Printed
+    // always, it told the reader to re-measure and then said the same thing
+    // about the fresh measurement.
+    if ts["transpile_cache"].is_null() {
+        md.push_str(
+            " The measurement above predates the transpile cache and so still describes a row \
+             that re-ran oxc every time; re-measure with `--case ts-cold-start` before quoting \
+             this row.",
+        );
+    }
+    md.push('\n');
     match node_flag {
         Some(flag) if has_node => {
             md.push_str(&format!(
@@ -2378,8 +2489,9 @@ fn push_ts_markdown(md: &mut String, ts: &serde_json::Value) {
 
 // -------------------------------------------------------- shared helpers
 
-// `repo_root`, `ensure_oam_built`, `capture_version` and `git_short_commit`
-// live in `conformance` and are imported at the top of this file rather than
+// `repo_root`, `ensure_oam_built`, `capture_version`, `git_short_commit` and
+// `run_with_timeout` (with its `Captured`) live in `conformance` and are
+// imported at the top of this file rather than
 // re-declared here. They used to be copy-pasted into both modules, and the
 // copies DIVERGED: on 2026-08-04 conformance's `ensure_oam_built` was fixed to
 // always invoke cargo (an existing-but-stale binary was silently measured for
@@ -2389,66 +2501,64 @@ fn push_ts_markdown(md: &mut String, ts: &serde_json::Value) {
 // code it did not come from, which is worse than a loud failure. One
 // definition means the next fix cannot land in only half the callers.
 
-/// ISO 8601 UTC timestamp via shell `date`, no chrono dependency.
+/// ISO 8601 UTC timestamp of now, from the system clock.
+///
+/// Computed here rather than by spawning `date`: Windows has no `date.exe`
+/// (it is a cmd builtin), so outside a shell with Git's tools on PATH the
+/// spawn failed and the results file got an empty timestamp, silently.
 fn chrono_utc_now() -> String {
-    Command::new("date")
-        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_default()
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    utc_timestamp(secs)
 }
 
-struct Captured {
-    stdout: String,
-    stderr: String,
-    code: i32,
-    timed_out: bool,
-}
-
-fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Captured> {
-    use std::io::Read;
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawning {cmd:?}"))?;
-
-    let mut stdout_pipe = child.stdout.take().context("stdout piped")?;
-    let mut stderr_pipe = child.stderr.take().context("stderr piped")?;
-    let stdout_thread = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stdout_pipe.read_to_string(&mut buf);
-        buf
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stderr_pipe.read_to_string(&mut buf);
-        buf
-    });
-
-    let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    let code = loop {
-        if let Some(status) = child.try_wait()? {
-            break status.code().unwrap_or(-1);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            timed_out = true;
-            break -2;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+/// `secs` since the Unix epoch as `YYYY-MM-DDTHH:MM:SSZ` (proleptic Gregorian,
+/// no leap seconds -- the same reading `date -u` gives).
+fn utc_timestamp(secs: u64) -> String {
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    // Days since 1970-01-01 to a civil date, counting in 400-year eras that
+    // start on 0000-03-01 so the leap day is the last day of a year.
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let day_of_era = z % 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153; // 0 = March
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
     };
-    Ok(Captured {
-        stdout: stdout_thread.join().unwrap_or_default(),
-        stderr: stderr_thread.join().unwrap_or_default(),
-        code,
-        timed_out,
-    })
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60
+    )
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::utc_timestamp;
+
+    #[test]
+    fn epoch_seconds_render_as_iso_8601_utc() {
+        assert_eq!(utc_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc_timestamp(86_399), "1970-01-01T23:59:59Z");
+        // A leap day in a century year that IS a leap year, and the day after.
+        assert_eq!(utc_timestamp(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(utc_timestamp(951_868_800), "2000-03-01T00:00:00Z");
+        assert_eq!(utc_timestamp(1_700_000_000), "2023-11-14T22:13:20Z");
+        // Year boundary.
+        assert_eq!(utc_timestamp(1_704_067_199), "2023-12-31T23:59:59Z");
+        assert_eq!(utc_timestamp(1_704_067_200), "2024-01-01T00:00:00Z");
+    }
 }
 
 /// Every document that quotes the benchmark table must name the run that
@@ -2536,15 +2646,9 @@ mod bench_doc_stamp {
 
 #[cfg(all(test, target_os = "windows"))]
 mod rss_parse_tests {
-    /// The parse under test, kept in lockstep with `process_rss_bytes`'s
-    /// Windows arm. Extracted so it can be exercised without spawning a
-    /// process (the real function needs a live PID).
-    fn parse_tasklist_rss_kb(text: &str) -> Option<u64> {
-        let line = text.lines().find(|l| l.contains('"'))?;
-        let field = line.rsplit('"').nth(1)?;
-        let digits: String = field.chars().filter(|c| c.is_ascii_digit()).collect();
-        digits.parse().ok()
-    }
+    // The production parse itself (`process_rss_bytes` calls it), not a copy:
+    // a regression there fails these tests.
+    use super::parse_tasklist_rss_kb;
 
     #[test]
     fn thousands_separator_does_not_scramble_the_value() {
@@ -2568,6 +2672,36 @@ mod rss_parse_tests {
         // the old parse got right -- hence it looked like it worked.
         let small = r#""tiny.exe","7","Console","1","840 K""#;
         assert_eq!(parse_tasklist_rss_kb(small), Some(840));
+    }
+
+    #[test]
+    fn runtime_json_records_the_file_name_not_the_local_path() {
+        let dir = std::env::temp_dir().join("oam-bench-stage-0");
+        let rt = super::Runtime {
+            name: "oam".to_string(),
+            exe: dir.join("oam-bin"),
+            version: "oam 0.0.0".to_string(),
+        };
+        let json = super::runtime_json(&rt);
+        assert_eq!(json["exe"], "oam-bin");
+        assert_eq!(json["name"], "oam");
+        assert_eq!(json["version"], "oam 0.0.0");
+    }
+
+    /// The committed results file must not carry a directory in any `exe`.
+    #[test]
+    fn committed_results_carry_no_local_paths() {
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../../bench/results.json")).expect("results parse");
+        for list in [&doc["runtimes"], &doc["ts_cold_start"]["runtimes"]] {
+            for rt in list.as_array().into_iter().flatten() {
+                let exe = rt["exe"].as_str().unwrap_or("");
+                assert!(
+                    !exe.contains('/') && !exe.contains('\\'),
+                    "bench/results.json records a path in `exe`: {exe}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2792,6 +2926,95 @@ mod filtered_runs {
         let md = build_markdown(&existing());
         assert!(!md.contains("Re-measured by a filtered run"));
         assert!(md.contains("| cold-start | 59.00 | 113.00 | 0.52x |"));
+    }
+
+    /// mcp-idle-rss is megabytes; the table must say so in the row rather
+    /// than sit under a blanket "milliseconds".
+    #[test]
+    fn markdown_labels_a_non_millisecond_row_with_its_unit() {
+        let mut doc = existing();
+        let mut rss = row("mcp-idle-rss", "oam", 25.0, None);
+        rss["unit"] = json!("MB");
+        doc["results"].as_array_mut().unwrap().push(rss);
+        let md = build_markdown(&doc);
+        assert!(md.contains("| mcp-idle-rss (MB) | 25.00 |"), "{md}");
+        assert!(md.contains("| cold-start | 59.00 |"), "{md}");
+        assert!(!md.contains("All times in milliseconds"), "{md}");
+    }
+
+    /// The "predates the transpile cache" caveat describes one measurement.
+    /// A section that records the pinned transpile-cache state is not it.
+    #[test]
+    fn ts_legend_caveat_follows_the_measurement_not_the_generator() {
+        let section = |pinned: bool| {
+            let mut ts = json!({
+                "commit": "c", "profile": "release", "host": "h",
+                "modules": TS_MODULES, "iterations": 20, "node_flag": null,
+                "runtimes": [], "rows": [],
+            });
+            if pinned {
+                ts["transpile_cache"] = json!(TS_TRANSPILE_CACHE);
+            }
+            let mut md = String::new();
+            push_ts_markdown(&mut md, &ts);
+            md
+        };
+        assert!(section(false).contains("predates the transpile cache"));
+        assert!(!section(true).contains("predates the transpile cache"));
+        assert!(section(true).contains("Both caches are warm on this row"));
+    }
+
+    /// A row label promises a cache state, so no cache variable may be left
+    /// to the caller's environment.
+    #[test]
+    fn ts_rows_pin_every_cache_variable() {
+        let rt = Runtime {
+            name: "oam".to_string(),
+            exe: PathBuf::from("oam"),
+            version: String::new(),
+        };
+        for state in TsState::OAM {
+            let cmd = ts_cmd(&rt, state, Path::new("main.ts"), Path::new("cache"), None);
+            let set: Vec<String> = cmd
+                .get_envs()
+                .filter(|(_, value)| value.is_some())
+                .map(|(key, _)| key.to_string_lossy().into_owned())
+                .collect();
+            for key in ["OAM_CACHE_DIR", "OAM_CODE_CACHE", "OAM_TRANSPILE_CACHE"] {
+                assert!(
+                    set.iter().any(|k| k == key),
+                    "the {} row inherits {key}",
+                    state.variant()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn results_header_has_a_timestamp_and_no_ci_run_field() {
+        let doc = build_json(&[], &[], None, "abc1234", "release");
+        assert!(doc["ci_run_id"].is_null());
+        let timestamp = doc["timestamp"].as_str().unwrap_or_default();
+        assert_eq!(timestamp.len(), "1970-01-01T00:00:00Z".len(), "{timestamp}");
+        assert!(timestamp.ends_with('Z'), "{timestamp}");
+    }
+
+    /// An npm-installed tool leaves a bare sh shim beside `tool.cmd`; on
+    /// Windows the lookup must return the one `Command` can exec.
+    #[test]
+    fn which_prefers_an_executable_suffix_over_a_bare_name_on_windows() {
+        let dir = std::env::temp_dir().join(format!("oam-bench-which-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tool"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.join("tool.cmd"), "@echo off\n").unwrap();
+        let dirs = [dir.clone()];
+        assert_eq!(which_in("tool", &dirs, true), Some(dir.join("tool.cmd")));
+        assert_eq!(which_in("tool", &dirs, false), Some(dir.join("tool")));
+        std::fs::write(dir.join("tool.exe"), "").unwrap();
+        assert_eq!(which_in("tool", &dirs, true), Some(dir.join("tool.exe")));
+        assert_eq!(which_in("absent", &dirs, true), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     trait Tap: Sized {

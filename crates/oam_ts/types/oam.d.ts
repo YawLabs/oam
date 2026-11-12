@@ -130,9 +130,13 @@ declare module "oam:mcp" {
   }
 
   export interface McpServeOptions {
-    /** Omitted: stdio when stdin is not a TTY, else http. */
+    /** Omitted: stdio when stdin is not a TTY, else http. A service or
+     *  container started with stdin closed or redirected therefore gets
+     *  stdio, which reads end-of-input and returns at once: pass
+     *  `transport: "http"` explicitly for a server meant to listen there. */
     transport?: "stdio" | "http";
-    /** http only. Defaults to $PORT, then 3000. */
+    /** http only. Defaults to $PORT, then 3000. `0` asks the OS for a free
+     *  port; read the one it picked from the value `serve()` resolves to. */
     port?: number;
     /** http only. Defaults to "127.0.0.1". */
     host?: string;
@@ -177,7 +181,9 @@ declare module "oam:mcp" {
     serve(options?: McpServeOptions): Promise<McpHttpServer | undefined>;
   }
 
-  /** The MCP protocol revision this server answers `initialize` with. */
+  /** The newest MCP protocol revision this server speaks. `initialize` is
+   *  answered with the client's requested revision when the server supports
+   *  it, and with this one otherwise. */
   const PROTOCOL_VERSION: string;
 
   /** Every `oam:` module also publishes its module object as the default
@@ -226,9 +232,18 @@ declare module "oam:test" {
     toHaveProperty(path: string, value?: unknown): void;
     /** A RegExp is tested; anything else is a substring match. */
     toMatch(pattern: string | RegExp): void;
+    /** Subset match on plain objects; arrays must also agree on length, and
+     *  Date/RegExp/Map/Set/Error/binary values compare by full equality. */
     toMatchObject(expected: object): void;
-    /** Requires the value under test to be a function; it is called here. */
-    toThrow(expected?: string | RegExp | (new (...args: any[]) => unknown)): void;
+    /** Requires the value under test to be a function; it is called here.
+     *  A string is a substring of the message, a RegExp is tested against
+     *  it, a class is an instanceof check, and an error object matches on
+     *  an identical message. */
+    toThrow(
+      expected?: string | RegExp | (new (...args: any[]) => unknown) | { message: string },
+    ): void;
+    /** The four mock matchers throw, in either polarity, when the value
+     *  under test is not a mock or spy function. */
     toHaveBeenCalled(): void;
     toHaveBeenCalledTimes(n: number): void;
     toHaveBeenCalledWith(...args: unknown[]): void;
@@ -259,7 +274,9 @@ declare module "oam:test" {
     toHaveProperty(path: string, value?: unknown): Promise<void>;
     toMatch(pattern: string | RegExp): Promise<void>;
     toMatchObject(expected: object): Promise<void>;
-    toThrow(expected?: string | RegExp | (new (...args: any[]) => unknown)): Promise<void>;
+    toThrow(
+      expected?: string | RegExp | (new (...args: any[]) => unknown) | { message: string },
+    ): Promise<void>;
     toHaveBeenCalled(): Promise<void>;
     toHaveBeenCalledTimes(n: number): Promise<void>;
     toHaveBeenCalledWith(...args: unknown[]): Promise<void>;
@@ -324,10 +341,14 @@ declare module "oam:test" {
   }
 
   export interface FakeTimers {
-    /** Replaces the global timer functions and Date.now until `restore()`. */
+    /** Replaces the global timer functions and the Date clock (`Date.now()`,
+     *  `new Date()` and `Date()` with no arguments) until `restore()`.
+     *  `performance.now()` is not faked. */
     enable(options?: { now?: number }): void;
     /** Advances the clock by `ms`, firing due callbacks in due order --
-     *  including ones scheduled by the callbacks it just fired. */
+     *  including ones scheduled by the callbacks it just fired. Throws if
+     *  100000 callbacks fire without the clock advancing (a timer that
+     *  re-arms itself at 0 ms). */
     tick(ms: number): void;
     /** Drains every pending timer. Intervals are dropped rather than
      *  rescheduled (Node test-runner parity), so this cannot spin forever. */
@@ -404,9 +425,10 @@ declare module "oam:ai" {
     id: string;
   }
 
-  /** Parse a byte stream of server-sent events. Comment lines are skipped,
-   *  multi-line `data:` fields are joined, and `retry:` is ignored (this API
-   *  never reconnects). */
+  /** Parse a byte stream of server-sent events. Lines may end in CRLF, LF or
+   *  CR. Comment lines are skipped, multi-line `data:` fields are joined, and
+   *  `retry:` is ignored (this API never reconnects). Leaving the iteration
+   *  before the stream ends cancels the stream. */
   function parseSSEStream(readableStream: ReadableStream<Uint8Array>): AsyncGenerator<SSEEvent>;
 
   export interface StreamChatOptions {
@@ -422,7 +444,9 @@ declare module "oam:ai" {
   }
 
   /** POST JSON, stream SSE back, yield content deltas. Throws on a non-2xx
-   *  response and stops at the `[DONE]` sentinel. */
+   *  response and on a provider error frame mid-stream (`event: error`,
+   *  `{ type: "error" }`, or a bare `{ error }`; the frame is on the thrown
+   *  error's `data`), and stops at the `[DONE]` sentinel. */
   function streamChat(options: StreamChatOptions): AsyncGenerator<string>;
 
   export interface ChatMessage {
@@ -465,7 +489,9 @@ declare module "oam:ai" {
     tools?: unknown[];
     messages: ChatMessage[];
     /** Runs one tool call and returns its result; a non-string is
-     *  JSON-stringified into the tool_result block. */
+     *  JSON-stringified. Results go back in the shape of the response that
+     *  asked: one `tool_result` user message per turn for Anthropic, one
+     *  `role: "tool"` message per call for OpenAI. */
     onToolCall: (call: ToolCall) => unknown | Promise<unknown>;
     onDelta?: (text: string) => void;
     /** Default 10. Hitting it returns `exhausted: true` rather than throwing. */
@@ -530,6 +556,15 @@ declare module "oam:permissions" {
      *  that host. A suffix like `api.github.com.attacker.net` is not granted
      *  by an `api.github.com` entry. */
     url?: string;
+    /** Deno's spelling of the scope for "net": matched like `url`, and read
+     *  before it when both are given. */
+    host?: string;
+    /** Deno's spelling of the scope for "env": matched against the
+     *  --allow-env name list, exactly. */
+    variable?: string;
+    /** Deno's spelling of the scope for a subprocess, read for "child":
+     *  matched against the --allow-child-process list as a path prefix. */
+    command?: string;
   }
 
   /** oam has no interactive prompt, so the state is decided by the flags the

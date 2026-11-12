@@ -17,9 +17,9 @@
 //      handle can still be null (case 65's window) -- must THROW, not park in
 //      the pending-kill slot.
 //
-// Deliberately NOT asserted: kill()'s return value on an already-dead child
-// (node returns false via ESRCH; oam returns true -- a known divergence, out
-// of scope here).
+// Not asserted here: kill()'s return value on an already-dead child (false in
+// node, and in oam since kill() checks the exit; the e2e test
+// exec_sync_stderr_and_child_kill_results_match_node covers it).
 import { spawn } from "node:child_process";
 
 const sleepy = () => spawn(process.execPath, ["-e", "setTimeout(()=>{}, 8000)"]);

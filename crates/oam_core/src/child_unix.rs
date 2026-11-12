@@ -84,6 +84,14 @@ pub struct RawChild {
     reaped: bool,
 }
 
+impl RawChild {
+    /// Whether `pid` still names this child: false once it has been reaped,
+    /// after which the kernel may give the pid to another process.
+    pub fn owns_pid(&self) -> bool {
+        !self.reaped
+    }
+}
+
 pub type RawChildRegistry = Arc<Mutex<HashMap<u64, RawChild>>>;
 
 /// Create an anonymous pipe with both ends `CLOEXEC`. Returns `(read, write)`.
@@ -124,40 +132,111 @@ fn relocate(fd: OwnedFd, base: RawFd) -> Result<OwnedFd, String> {
 /// Map a Node signal name to this platform's signal number (libc constants are
 /// platform-correct, unlike hardcoded numbers which diverge on macOS). Shared
 /// with the main `child.rs` kill path (`pub(crate)`).
+///
+/// The names are node's `os.constants.signals` for the platform; one this
+/// platform does not have (or a name that is no signal) is `None`, which the
+/// kill paths treat as "deliver nothing" -- never as SIGTERM.
 pub(crate) fn signal_number(name: &str) -> Option<i32> {
-    match name {
-        "SIGHUP" => Some(libc::SIGHUP),
-        "SIGINT" => Some(libc::SIGINT),
-        "SIGQUIT" => Some(libc::SIGQUIT),
-        "SIGABRT" => Some(libc::SIGABRT),
-        "SIGKILL" => Some(libc::SIGKILL),
-        "SIGUSR1" => Some(libc::SIGUSR1),
-        "SIGUSR2" => Some(libc::SIGUSR2),
-        "SIGTERM" => Some(libc::SIGTERM),
-        "SIGCONT" => Some(libc::SIGCONT),
-        "SIGSTOP" => Some(libc::SIGSTOP),
-        _ => None,
-    }
+    let num = match name {
+        "SIGHUP" => libc::SIGHUP,
+        "SIGINT" => libc::SIGINT,
+        "SIGQUIT" => libc::SIGQUIT,
+        "SIGILL" => libc::SIGILL,
+        "SIGTRAP" => libc::SIGTRAP,
+        // SIGIOT is SIGABRT under its older name.
+        "SIGABRT" | "SIGIOT" => libc::SIGABRT,
+        "SIGBUS" => libc::SIGBUS,
+        "SIGFPE" => libc::SIGFPE,
+        "SIGKILL" => libc::SIGKILL,
+        "SIGUSR1" => libc::SIGUSR1,
+        "SIGSEGV" => libc::SIGSEGV,
+        "SIGUSR2" => libc::SIGUSR2,
+        "SIGPIPE" => libc::SIGPIPE,
+        "SIGALRM" => libc::SIGALRM,
+        "SIGTERM" => libc::SIGTERM,
+        "SIGCHLD" => libc::SIGCHLD,
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        "SIGSTKFLT" => libc::SIGSTKFLT,
+        "SIGCONT" => libc::SIGCONT,
+        "SIGSTOP" => libc::SIGSTOP,
+        "SIGTSTP" => libc::SIGTSTP,
+        "SIGTTIN" => libc::SIGTTIN,
+        "SIGTTOU" => libc::SIGTTOU,
+        "SIGURG" => libc::SIGURG,
+        "SIGXCPU" => libc::SIGXCPU,
+        "SIGXFSZ" => libc::SIGXFSZ,
+        "SIGVTALRM" => libc::SIGVTALRM,
+        "SIGPROF" => libc::SIGPROF,
+        "SIGWINCH" => libc::SIGWINCH,
+        "SIGIO" => libc::SIGIO,
+        // Linux's SIGPOLL is SIGIO under its System V name.
+        #[cfg(target_os = "linux")]
+        "SIGPOLL" => libc::SIGIO,
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        "SIGPWR" => libc::SIGPWR,
+        #[cfg(target_os = "macos")]
+        "SIGINFO" => libc::SIGINFO,
+        "SIGSYS" => libc::SIGSYS,
+        _ => return None,
+    };
+    Some(num)
 }
 
-/// Reverse of `signal_number` for reporting a child that died of a signal we
-/// did not initiate. Falls back to `SIG<n>` for anything uncommon. Shared with
-/// the main `child.rs` kill path (`pub(crate)`).
+/// Every canonical name `signal_number` may know, aliases (SIGIOT, SIGPOLL)
+/// left out so a number reports under the name node gives it. `signal_name`
+/// searches this through `signal_number`, so the two directions are one
+/// table and cannot disagree; a name this platform lacks simply never matches.
+const SIGNAL_NAMES: &[&str] = &[
+    "SIGHUP",
+    "SIGINT",
+    "SIGQUIT",
+    "SIGILL",
+    "SIGTRAP",
+    "SIGABRT",
+    "SIGBUS",
+    "SIGFPE",
+    "SIGKILL",
+    "SIGUSR1",
+    "SIGSEGV",
+    "SIGUSR2",
+    "SIGPIPE",
+    "SIGALRM",
+    "SIGTERM",
+    "SIGCHLD",
+    "SIGSTKFLT",
+    "SIGCONT",
+    "SIGSTOP",
+    "SIGTSTP",
+    "SIGTTIN",
+    "SIGTTOU",
+    "SIGURG",
+    "SIGXCPU",
+    "SIGXFSZ",
+    "SIGVTALRM",
+    "SIGPROF",
+    "SIGWINCH",
+    "SIGIO",
+    "SIGPWR",
+    "SIGINFO",
+    "SIGSYS",
+];
+
+/// Reverse of `signal_number` for reporting a child that died of a signal:
+/// the name node reports (`SIGBUS`, `SIGILL`, ...). Falls back to `SIG<n>`
+/// only for a number with no name here (a real-time signal). Shared with the
+/// main `child.rs` exit reports (`pub(crate)`).
 pub(crate) fn signal_name(num: i32) -> String {
-    let name = match num {
-        x if x == libc::SIGHUP => "SIGHUP",
-        x if x == libc::SIGINT => "SIGINT",
-        x if x == libc::SIGQUIT => "SIGQUIT",
-        x if x == libc::SIGABRT => "SIGABRT",
-        x if x == libc::SIGKILL => "SIGKILL",
-        x if x == libc::SIGUSR1 => "SIGUSR1",
-        x if x == libc::SIGUSR2 => "SIGUSR2",
-        x if x == libc::SIGTERM => "SIGTERM",
-        x if x == libc::SIGSEGV => "SIGSEGV",
-        x if x == libc::SIGPIPE => "SIGPIPE",
-        _ => return format!("SIG{num}"),
-    };
-    name.to_string()
+    SIGNAL_NAMES
+        .iter()
+        .find(|name| signal_number(name) == Some(num))
+        .map(|name| (*name).to_string())
+        .unwrap_or_else(|| format!("SIG{num}"))
 }
 
 /// Spawn a child with an arbitrary stdio fd layout. Pipes are created per the
@@ -332,20 +411,18 @@ pub fn spawn_extra(
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let code = super::node_error_code(&e);
             // errno rides along: node emits it as the `code` argument of the
             // 'close' event for a child that never started, so the JS layer
             // cannot reproduce node's failure shape without it (same contract
-            // as the non-raw spawn path in child.rs).
-            let errno = super::node_errno(code, &e)
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "null".to_string());
-            let msg = format!(
-                "{{\"code\":\"{code}\",\"errno\":{errno},\"message\":\"spawn failed ({}) for {}\"}}",
-                e,
-                command.replace('"', "\\\"")
-            );
-            return Err(msg);
+            // as the non-raw spawn path in child.rs). Built as JSON by the
+            // shared builder, not formatted by hand: a command holding a
+            // backslash or a control character made a hand-escaped body
+            // unparsable, and the JS side then lost the code (the Windows
+            // backend routes through the same builder for the same reason).
+            return Err(super::child::spawn_failure_json_with(
+                &e,
+                &format!("spawn failed ({e}) for {command}"),
+            ));
         }
     };
     let pid = child.id();
@@ -563,12 +640,16 @@ pub fn raw_kill(reg: &RawChildRegistry, id: u64, signal: Option<String>) {
         if child.reaped {
             return;
         }
-        // Unknown signal names resolve to SIGTERM -- same as the None case.
-        let signum = signal
-            .as_deref()
-            .map(signal_number)
-            .unwrap_or(Some(libc::SIGTERM))
-            .unwrap_or(libc::SIGTERM);
+        // No signal named is SIGTERM, node's default. A name this platform
+        // does not have delivers NOTHING: resolving it to SIGTERM ended a
+        // child that was sent, say, SIGWINCH by number.
+        let signum = match signal.as_deref() {
+            None => libc::SIGTERM,
+            Some(name) => match signal_number(name) {
+                Some(signum) => signum,
+                None => return,
+            },
+        };
         // raw_wait derives the report from the real ExitStatus, so we do not
         // record the signal here -- a trapped/survived signal must not be
         // misreported as a death.
@@ -701,7 +782,7 @@ pub async fn raw_wait(reg: RawChildRegistry, id: u64) -> OpOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{retry_intr, signal_number};
+    use super::{SIGNAL_NAMES, retry_intr, signal_name, signal_number};
 
     /// EINTR is retried until the call settles, and any other outcome --
     /// success or a real error -- comes back on the first try. (raw_read's
@@ -732,13 +813,35 @@ mod tests {
     }
 
     /// Signal-name mapping covers the known names and rejects unknown/empty
-    /// ones (the `None` arm is the divergence fix: unknown no longer silently
-    /// becomes SIGTERM).
+    /// ones. The kill paths (`raw_kill`, `child::deliver_kill`) deliver
+    /// nothing for a `None`, so an unknown name is never SIGTERM.
     #[test]
     fn signal_number_maps_known_and_unknown() {
         assert_eq!(signal_number("SIGTERM"), Some(libc::SIGTERM));
         assert_eq!(signal_number("SIGKILL"), Some(libc::SIGKILL));
+        assert_eq!(signal_number("SIGWINCH"), Some(libc::SIGWINCH));
+        assert_eq!(signal_number("SIGPIPE"), Some(libc::SIGPIPE));
+        assert_eq!(signal_number("SIGIOT"), Some(libc::SIGABRT));
         assert_eq!(signal_number("SIGFOO"), None);
         assert_eq!(signal_number(""), None);
+    }
+
+    /// The two directions are one table: every name this platform has comes
+    /// back from its own number, and the crash signals report by name.
+    #[test]
+    fn signal_name_is_the_inverse_of_signal_number() {
+        for name in SIGNAL_NAMES {
+            if let Some(num) = signal_number(name) {
+                assert_eq!(signal_name(num), *name);
+            }
+        }
+        assert_eq!(signal_name(libc::SIGBUS), "SIGBUS");
+        assert_eq!(signal_name(libc::SIGILL), "SIGILL");
+        assert_eq!(signal_name(libc::SIGFPE), "SIGFPE");
+        assert_eq!(signal_name(libc::SIGSEGV), "SIGSEGV");
+        assert_eq!(signal_name(libc::SIGABRT), "SIGABRT");
+        assert_eq!(signal_name(libc::SIGCONT), "SIGCONT");
+        // A number with no name here keeps the numeric form.
+        assert_eq!(signal_name(0), "SIG0");
     }
 }

@@ -8,8 +8,9 @@
 //! `<pkg-key>` is the lockfile key relative to the project's
 //! `node_modules` (`react/node_modules/scheduler` for a nested package),
 //! so two nested packages with the same name get distinct slots and the
-//! run-time reader -- which anchors on the OUTERMOST `node_modules`
-//! ancestor -- derives the same path from the file location alone.
+//! run-time reader -- which anchors on the innermost `node_modules`
+//! ancestor that holds a `.oam/precompile` directory, i.e. the project's
+//! own -- derives the same path from the file location alone.
 //!
 //! At run time the CJS and ESM loaders check this cache before calling
 //! oxc, so the first `oam run` after `oam install --precompile` pays no
@@ -79,13 +80,30 @@ fn is_precompilable(path: &Path) -> bool {
 
 /// Recursively collect all precompilable source files under `dir`.
 /// Uses `std::fs::read_dir` recursively -- no walkdir dep required.
+///
+/// Directory symlinks (and Windows junctions) are never descended into: a
+/// package may link back into its own tree (`a -> .`), and following such
+/// links revisits the same files without end. Nothing is lost -- a module
+/// is loaded under its real path, so the artifact that matters is the one
+/// keyed on the real location, which the walk reaches directly.
 fn collect_transpile_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        // The entry's OWN type (not followed): a link to a directory is a
+        // symlink here, not a directory.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            // A link to a source FILE is still a source; a link to anything
+            // else is skipped.
+            if is_precompilable(&path) && path.is_file() {
+                out.push(path);
+            }
+        } else if file_type.is_dir() {
             // Skip common non-source directories. Nested node_modules are
             // separate lockfile entries and get their own pass.
             let name = entry.file_name();
@@ -146,7 +164,8 @@ fn ensure_gitignore(oam_dir: &Path) -> Result<(), std::io::Error> {
 /// the prefix and is rewritten.
 const HEADER_PREFIX: &str = "// oam-precompile v2 ";
 
-fn to_hex(bytes: &[u8; 32]) -> String {
+/// Lowercase hex of a SHA-256 digest (shared with `transpile_cache`).
+pub(crate) fn to_hex(bytes: &[u8; 32]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(64);
     for b in bytes {
@@ -246,10 +265,11 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    // rename() won't overwrite an existing file on Windows; remove the old
-    // entry first. A racing peer writing the same key is harmless -- both
-    // artifacts carry the same header and body.
-    let _ = std::fs::remove_file(path);
+    // std's rename replaces an existing destination on every platform
+    // (Windows included), so the old entry is never removed first: that
+    // would only open a window in which a reader finds no entry at all. A
+    // racing peer writing the same key is harmless -- both artifacts carry
+    // the same header and body.
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -374,7 +394,9 @@ pub fn precompile_package(
 /// precompiled).
 ///
 /// Cache layout: `<node_modules>/.oam/precompile/<rel>.js` where
-/// `<node_modules>` is the OUTERMOST such ancestor of `ts_path` and
+/// `<node_modules>` is the innermost such ancestor of `ts_path` that
+/// contains a `.oam/precompile` directory (the one the install wrote to;
+/// with none anywhere, the outermost, for a clean miss) and
 /// `<rel>` is `ts_path` relative to it -- so a nested package's file
 /// (`node_modules/react/node_modules/scheduler/index.ts`) maps to
 /// `react/node_modules/scheduler/index.ts.js`, exactly the slot the writer
@@ -703,12 +725,40 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A package that links back into its own tree must not send the source
+    /// walk round in circles: directory links are not descended into, and
+    /// each real file is collected exactly once.
+    #[cfg(unix)]
+    #[test]
+    fn source_walk_does_not_follow_directory_symlinks() {
+        let root = temp_dir("symlink-loop");
+        let pkg_dir = root.join("node_modules/mypkg");
+        fs::create_dir_all(pkg_dir.join("src")).unwrap();
+        fs::write(pkg_dir.join("src/index.ts"), "export const x = 1;\n").unwrap();
+        std::os::unix::fs::symlink(".", pkg_dir.join("a")).unwrap();
+        std::os::unix::fs::symlink(".", pkg_dir.join("b")).unwrap();
+        std::os::unix::fs::symlink("..", pkg_dir.join("src/up")).unwrap();
+        // A link to a source FILE is still collected (under the link's name).
+        std::os::unix::fs::symlink("src/index.ts", pkg_dir.join("alias.ts")).unwrap();
+
+        let mut sources = Vec::new();
+        collect_transpile_sources(&pkg_dir, &mut sources);
+        sources.sort();
+        assert_eq!(
+            sources,
+            vec![pkg_dir.join("alias.ts"), pkg_dir.join("src/index.ts")]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn nested_package_writer_and_reader_agree() {
         // Layout mirrors a lockfile key with two node_modules segments:
         // node_modules/react/node_modules/scheduler. The writer keys the
         // slot on the FULL key relative to the project node_modules; the
-        // reader anchors on the OUTERMOST node_modules ancestor -- both
+        // reader anchors on the innermost node_modules ancestor that holds
+        // a `.oam/precompile` directory (the project's, here) -- both
         // must land on the same file. A same-named top-level package keeps
         // its own distinct slot.
         let root = temp_dir("nested");

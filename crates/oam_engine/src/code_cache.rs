@@ -35,8 +35,9 @@
 //! user-writable cache dir priority over a compiled binary's embedded
 //! bytecode (see [`load`]). The cache is a pure
 //! optimization: every read/write failure is swallowed, and a miss just falls
-//! through to a normal compile. Housekeeping is opportunistic and off the
-//! load path: see [`maybe_sweep`].
+//! through to a normal compile. Housekeeping is opportunistic and its walk
+//! runs off the load path (a load pays only a once-per-root gate check): see
+//! [`maybe_sweep`].
 
 use oam_diagnostics::own_files::{self, Audience};
 use std::collections::HashMap;
@@ -193,7 +194,26 @@ struct CacheEnv {
 
 impl CacheEnv {
     fn from_process() -> Self {
-        let var = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+        let mut env = Self::from_lookup(|key| std::env::var(key).ok(), std::env::temp_dir());
+        // A relative `OAM_CACHE_DIR` is made absolute against the start-up
+        // working directory, like `NODE_COMPILE_CACHE` above: the root is
+        // resolved once and used for the life of the process, and a path
+        // left relative would follow every later `process.chdir()`.
+        // `oam_ts::daemon::CacheEnv` does the same, so the two agree.
+        env.cache_dir = env.cache_dir.map(|dir| {
+            std::path::absolute(&dir)
+                .ok()
+                .and_then(|abs| abs.into_os_string().into_string().ok())
+                .unwrap_or(dir)
+        });
+        env
+    }
+
+    /// [`CacheEnv::from_process`] over an injected variable lookup, so the
+    /// empty-counts-as-unset filter is unit-tested without touching the
+    /// process environment.
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>, temp_dir: PathBuf) -> Self {
+        let var = |key: &str| lookup(key).filter(|v| !v.is_empty());
         Self {
             node_compile_cache: var("NODE_COMPILE_CACHE")
                 .map(|dir| std::path::absolute(&dir).unwrap_or_else(|_| PathBuf::from(dir))),
@@ -201,7 +221,7 @@ impl CacheEnv {
             local_app_data: var("LOCALAPPDATA"),
             xdg_cache_home: var("XDG_CACHE_HOME"),
             home: var("HOME"),
-            temp_dir: std::env::temp_dir(),
+            temp_dir,
         }
     }
 }
@@ -367,7 +387,10 @@ fn version_dir_name() -> String {
         "aarch64" => "arm64",
         other => other,
     };
-    format!("oam-v{OAM_VERSION}-{arch}-{:08x}", version_tag())
+    format!(
+        "{BUILD_DIR_PREFIX}{OAM_VERSION}-{arch}-{:08x}",
+        version_tag()
+    )
 }
 
 /// What `module.getCompileCacheDir()` reports: the directory node's API
@@ -628,17 +651,28 @@ const TMP_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 /// A blob not written in this long is evicted. Blobs are never rewritten on a
 /// hit (touching on the hot path would cost a write per load), so a source in
 /// daily use is recompiled once a month; that trade keeps one-off `-e`
-/// strings, superseded V8 tags and edited files from accumulating forever.
+/// strings, superseded V8 tags and edited files from accumulating forever
+/// (under a user-named directory a superseded build is a sibling directory,
+/// which [`maybe_sweep`] visits too).
 const BLOB_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Opportunistic eviction. At most once per process, and only when the stamp
-/// says the last completed sweep is older than [`SWEEP_INTERVAL`], walk the
-/// cache root on a detached thread and delete orphaned temp files older than
-/// [`TMP_MAX_AGE`] and blobs older than [`BLOB_MAX_AGE`]. Detached and never
-/// joined, so no load ever waits on it; a process that exits mid-walk has
-/// already stamped, so the leftover work waits for the next interval rather
-/// than the next process. Concurrent
+/// Opportunistic eviction. At most once per process for each cache root, and
+/// only when the stamp says the last STARTED sweep is older than
+/// [`SWEEP_INTERVAL`], walk the cache root on a detached thread and delete
+/// orphaned temp files older than [`TMP_MAX_AGE`] and blobs older than
+/// [`BLOB_MAX_AGE`]. Detached and never joined, so no load ever waits on it;
+/// a process that exits mid-walk has already stamped, so the leftover work
+/// waits for the next interval rather than the next process. Concurrent
 /// processes may walk at once -- a file deleted twice is a swallowed error.
+///
+/// What a load pays for the gate is one uncontended lock and a set lookup;
+/// the path is copied only the first time a root is seen.
+///
+/// A root inside a directory the user named (`NODE_COMPILE_CACHE`,
+/// `enableCompileCache(dir)`) is a per-build subdirectory, and an oam upgrade
+/// or a V8 flag change starts a new one. When such a root is due, the other
+/// per-build directories beside it get the same age rules (see
+/// [`sibling_build_dirs`]); nothing else would ever visit them.
 fn maybe_sweep(root: &Path) {
     // One gate per root, not per process: an isolate's
     // `enableCompileCache(dir)` points its keys at a new root after the
@@ -650,7 +684,7 @@ fn maybe_sweep(root: &Path) {
     let first = SWEPT
         .get_or_init(Mutex::default)
         .lock()
-        .map(|mut swept| swept.insert(root.to_path_buf()))
+        .map(|mut swept| !swept.contains(root) && swept.insert(root.to_path_buf()))
         .unwrap_or(false);
     if !first {
         return;
@@ -662,8 +696,51 @@ fn maybe_sweep(root: &Path) {
             let now = SystemTime::now();
             if sweep_due(&root, now) {
                 sweep(&root, now);
+                // Each sibling keeps its own stamp, so a build that is still
+                // in use (two oam versions sharing one directory) is not
+                // walked more often than its own interval allows.
+                for sibling in sibling_build_dirs(&root) {
+                    if sweep_due(&sibling, now) {
+                        sweep(&sibling, now);
+                    }
+                }
             }
         });
+}
+
+/// Prefix of every per-build subdirectory name (see [`version_dir_name`]).
+const BUILD_DIR_PREFIX: &str = "oam-v";
+
+/// The other per-build directories beside `root`, when `root` is itself one
+/// (its name starts with [`BUILD_DIR_PREFIX`]): the directories earlier oam
+/// versions and other V8 flag sets left in the same user-named directory.
+/// Empty for the default root, whose last component is `bytecode` and which
+/// has no per-build level. Only directories carrying the prefix are returned,
+/// so nothing else a user keeps in that directory is ever walked. The
+/// directories themselves are left in place once emptied, like shard
+/// directories: another oam build may be storing into one.
+fn sibling_build_dirs(root: &Path) -> Vec<PathBuf> {
+    fn is_build_dir(name: &std::ffi::OsStr) -> bool {
+        name.to_string_lossy().starts_with(BUILD_DIR_PREFIX)
+    }
+    let (Some(own), Some(parent)) = (root.file_name(), root.parent()) else {
+        return Vec::new();
+    };
+    if !is_build_dir(own) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            name.as_os_str() != own && is_build_dir(&name)
+        })
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect()
 }
 
 /// Whether a sweep of `root` is due at `now`: the root exists (nothing to do
@@ -959,13 +1036,29 @@ mod tests {
 
     #[test]
     fn empty_env_values_count_as_unset() {
-        // `CacheEnv::from_process` filters empties; the pure function must
-        // therefore never see them, but a direct caller passing `Some("")`
-        // would get a CWD-relative `oam/`, which is the bug under test. Model
-        // the filter here so the contract is pinned at the boundary.
-        let filtered = |v: &str| Some(v.to_string()).filter(|s| !s.is_empty());
-        assert_eq!(filtered(""), None);
-        assert_eq!(filtered("x"), Some("x".to_string()));
+        // Every variable set but empty: the real filter (the one
+        // `CacheEnv::from_process` runs) must drop them all, or
+        // `LOCALAPPDATA=` would resolve to a CWD-relative `oam/`.
+        let temp = std::env::temp_dir();
+        let e = CacheEnv::from_lookup(|_| Some(String::new()), temp.clone());
+        assert!(e.node_compile_cache.is_none());
+        assert!(e.cache_dir.is_none());
+        assert!(e.local_app_data.is_none());
+        assert!(e.xdg_cache_home.is_none());
+        assert!(e.home.is_none());
+        for windows in [true, false] {
+            assert_eq!(
+                resolve_cache_root(&e, windows, "SUB"),
+                temp.join("oam").join("bytecode")
+            );
+        }
+        // A non-empty value is kept, and only for the key that carries it.
+        let e = CacheEnv::from_lookup(
+            |key| Some(if key == "OAM_CACHE_DIR" { "x" } else { "" }.to_string()),
+            temp,
+        );
+        assert_eq!(e.cache_dir.as_deref(), Some("x"));
+        assert!(e.home.is_none());
     }
 
     #[test]
@@ -1124,6 +1217,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A per-build root names the other per-build directories beside it and
+    /// nothing else; the default root (no per-build level) names none.
+    #[test]
+    fn sibling_build_dirs_lists_only_other_build_dirs() {
+        let parent = scratch("siblings");
+        let own = parent.join("oam-v9.9.9-x64-00000001");
+        let older = parent.join("oam-v9.9.8-x64-00000002");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&older).unwrap();
+        std::fs::create_dir_all(parent.join("v22.0.0-x64-abcdef")).unwrap();
+        std::fs::create_dir_all(parent.join("bytecode")).unwrap();
+        std::fs::write(parent.join("oam-v-a-file"), b"x").unwrap();
+
+        assert_eq!(sibling_build_dirs(&own), vec![older.clone()]);
+        assert!(
+            sibling_build_dirs(&parent.join("bytecode")).is_empty(),
+            "the default root has no per-build siblings"
+        );
+
+        // The age rules reach a sibling through the same `sweep`.
+        let now = SystemTime::now();
+        let shard = older.join("ab");
+        std::fs::create_dir_all(&shard).unwrap();
+        write_aged(
+            &shard.join("old.v8c"),
+            BLOB_MAX_AGE + Duration::from_secs(1),
+            now,
+        );
+        for sibling in sibling_build_dirs(&own) {
+            assert!(sweep_due(&sibling, now));
+            assert_eq!(sweep(&sibling, now).blobs, 1);
+        }
+        assert!(!shard.join("old.v8c").exists());
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
     /// The stamp must ADVANCE when a sweep rewrites an existing empty one.
     /// Rust std emulates create+truncate on Windows as OPEN_ALWAYS plus a
     /// manual truncate, so rewriting a 0-byte file with 0 bytes never bumps
@@ -1196,7 +1325,11 @@ mod tests {
             .unwrap()
             .as_nanos();
         let source = format!("seedfirst-{}-{nanos}", std::process::id());
-        let key = key_for(&source, Kind::Function, env_root_arc());
+        // A scratch root, never the environment's: this test stores a blob
+        // and a tombstone, and its loads gate a sweep of the key's root.
+        // Seeds match on content, so the seed below still finds this key.
+        let root = scratch("seedfirst");
+        let key = key_for(&source, Kind::Function, Arc::from(root.as_path()));
         seed(&source, Kind::Function, b"seed-bytes".to_vec());
         store(&key, b"disk-bytes");
         let got = load(&key).expect("seeded key loads");
@@ -1220,6 +1353,7 @@ mod tests {
         let _ = std::fs::remove_file(path_for_key(&key));
         let _ = std::fs::remove_file(tombstone_path(&key));
         assert!(load(&key).is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

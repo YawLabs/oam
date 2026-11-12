@@ -37,8 +37,17 @@
 //! graceful GOAWAY's clean end as an EOF, so a session told nothing of
 //! either: every stream closed with `NGHTTP2_CANCEL`, the one the server had
 //! answered included, and no `'goaway'` came.
+//!
+//! [`ping`] is node's `session.ping()`: a PING frame of the session's own,
+//! sent as the GOAWAY is, and answered when [`SessionIo`] reads the peer's
+//! ACK. hyper keeps h2's one user ping (`h2::PingPong`) to itself -- it
+//! takes it only for its keep-alive and window probes, which the session
+//! leaves off, and hands it to nobody -- and that one carries a payload of
+//! h2's choosing, one at a time; a frame of the session's own carries the
+//! caller's eight bytes, any number in flight. h2 reads the ACK too and
+//! ignores it, as it does any ACK of a PING it did not send.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -54,6 +63,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::ReqBody;
 use super::body::{FetchBodies, FetchBody, StreamSlot};
+use super::bridge::latin1_bytes;
+use super::send::latin1;
 use super::transport::{channel_body, empty_body, full_body};
 use crate::byte_pipe::Pipes;
 use crate::{OpOutcome, OutboundBodies};
@@ -75,6 +86,62 @@ pub struct H2Session {
     goaways: tokio::sync::watch::Receiver<Vec<GoAwayFrame>>,
     /// Frames of the session's own, to go out between hyper's.
     outbox: Arc<Outbox>,
+    /// The session's PINGs the peer has not acknowledged yet.
+    pings: Arc<Pings>,
+}
+
+/// The PINGs [`ping`] sent and the peer has yet to acknowledge, oldest
+/// first: [`SessionIo`] answers one as it reads its ACK, and cancels them
+/// all -- and every later one -- when hyper lets go of the connection.
+#[derive(Default)]
+struct Pings(Mutex<PingsState>);
+
+#[derive(Default)]
+struct PingsState {
+    /// Each dropped unanswered, its ping is cancelled.
+    waiting: VecDeque<tokio::sync::oneshot::Sender<Pong>>,
+    /// How many pings have been answered.
+    answered: u64,
+    /// The connection is gone: no ACK can come.
+    over: bool,
+}
+
+/// The answer to one ping.
+#[derive(Debug, PartialEq, Eq)]
+struct Pong {
+    /// The bytes the ACK echoed.
+    payload: [u8; 8],
+    /// How many of the session's pings were answered before this one. Each
+    /// answer reaches JS by its own op, in no order of their own: JS calls
+    /// back in this one, the order the ACKs came in.
+    seq: u64,
+}
+
+impl Pings {
+    /// The peer acknowledged a PING, echoing `payload`: answer the oldest
+    /// one waiting with it, whatever that one sent, as nghttp2 does (node
+    /// v22.22.2 hands a ping the bytes of an ACK that echoed others). An
+    /// ACK with no ping waiting is h2's to judge: it ignores it, where
+    /// node's session fails with a protocol error.
+    fn acked(&self, payload: [u8; 8]) {
+        let mut state = lock(&self.0);
+        if let Some(acked) = state.waiting.pop_front() {
+            let seq = state.answered;
+            // A ping nobody waits on any more (its op was dropped) is not
+            // an answer JS will hear of.
+            if acked.send(Pong { payload, seq }).is_ok() {
+                state.answered += 1;
+            }
+        }
+    }
+
+    /// The connection is gone: cancel every ping waiting, and refuse the
+    /// ones that follow.
+    fn end(&self) {
+        let mut state = lock(&self.0);
+        state.over = true;
+        state.waiting.clear();
+    }
 }
 
 /// Frames the session sends itself, hyper knowing nothing of them: what
@@ -118,8 +185,11 @@ const DATA: u8 = 0x0;
 const HEADERS: u8 = 0x1;
 const RST_STREAM: u8 = 0x3;
 const PUSH_PROMISE: u8 = 0x5;
+const PING: u8 = 0x6;
 const GOAWAY: u8 = 0x7;
 const CONTINUATION: u8 = 0x9;
+/// The ACK flag of PING.
+const ACK: u8 = 0x1;
 /// The END_STREAM flag of DATA and HEADERS.
 const END_STREAM: u8 = 0x1;
 /// The END_HEADERS flag of HEADERS, PUSH_PROMISE and CONTINUATION.
@@ -208,8 +278,26 @@ fn goaway_frame(code: u32) -> [u8; 17] {
     frame
 }
 
+/// A PING frame carrying `payload` (RFC 9113 6.7): what nghttp2 sends for
+/// node's `session.ping()`.
+fn ping_frame(payload: [u8; 8]) -> [u8; 17] {
+    let mut frame = [0u8; 17];
+    frame[2] = 8;
+    frame[3] = PING;
+    frame[9..17].copy_from_slice(&payload);
+    frame
+}
+
+/// What [`FrameScan`] reports of the peer's frames.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Scanned {
+    GoAway(GoAwayFrame),
+    /// The ACK of a PING, with the payload it echoes.
+    PingAck([u8; 8]),
+}
+
 /// Reads the frame headers of what the peer sends, and records each GOAWAY
-/// frame, without changing a byte: the bytes are hyper's to parse. The
+/// frame and each PING ACK, without changing a byte: the bytes are hyper's to parse. The
 /// stream starts with a frame (the server's preface is a SETTINGS frame, no
 /// magic), and every frame is a 9-byte header and the payload length it
 /// names, so following the lengths is all it takes.
@@ -220,8 +308,8 @@ struct FrameScan {
     have: usize,
     /// Payload bytes of the current frame still to come.
     left: usize,
-    /// The current frame's payload, when it is a GOAWAY.
-    goaway: Option<Vec<u8>>,
+    /// The current frame's payload, when it is a GOAWAY or a PING ACK.
+    kept: Option<Vec<u8>>,
     /// The streams whose response has begun and not yet ended: a later
     /// HEADERS frame on one is a final head after a 1xx, or its trailers.
     open_heads: std::collections::HashSet<u32>,
@@ -232,8 +320,9 @@ struct FrameScan {
 }
 
 impl FrameScan {
-    /// Feed the bytes read; `found` gets each complete GOAWAY frame.
-    fn feed(&mut self, mut bytes: &[u8], found: &mut impl FnMut(GoAwayFrame)) {
+    /// Feed the bytes read; `found` gets each complete GOAWAY frame and
+    /// PING ACK.
+    fn feed(&mut self, mut bytes: &[u8], found: &mut impl FnMut(Scanned)) {
         while !bytes.is_empty() {
             if self.have < self.head.len() {
                 let n = (self.head.len() - self.have).min(bytes.len());
@@ -244,7 +333,8 @@ impl FrameScan {
                     self.left = usize::from(self.head[0]) << 16
                         | usize::from(self.head[1]) << 8
                         | usize::from(self.head[2]);
-                    self.goaway = (self.head[3] == GOAWAY).then(Vec::new);
+                    let ping_ack = self.head[3] == PING && self.head[4] & ACK != 0;
+                    self.kept = (self.head[3] == GOAWAY || ping_ack).then(Vec::new);
                     self.track_heads();
                     if self.left == 0 {
                         self.frame_done(found);
@@ -253,7 +343,7 @@ impl FrameScan {
                 continue;
             }
             let n = self.left.min(bytes.len());
-            if let Some(payload) = &mut self.goaway {
+            if let Some(payload) = &mut self.kept {
                 payload.extend_from_slice(&bytes[..n]);
             }
             self.left -= n;
@@ -291,13 +381,22 @@ impl FrameScan {
         }
     }
 
-    fn frame_done(&mut self, found: &mut impl FnMut(GoAwayFrame)) {
+    fn frame_done(&mut self, found: &mut impl FnMut(Scanned)) {
         self.have = 0;
+        let Some(payload) = self.kept.take() else {
+            return;
+        };
+        // A PING of any other length is a FRAME_SIZE_ERROR, hyper's to
+        // report as the connection's end.
+        if self.head[3] == PING {
+            if let Ok(payload) = <[u8; 8]>::try_from(payload.as_slice()) {
+                found(Scanned::PingAck(payload));
+            }
+            return;
+        }
         // A GOAWAY shorter than its 8 fixed bytes is a FRAME_SIZE_ERROR,
         // which hyper reports as the connection's end.
-        if let Some(payload) = self.goaway.take()
-            && payload.len() >= 8
-        {
+        if payload.len() >= 8 {
             let word = |at: usize| {
                 u32::from_be_bytes([
                     payload[at],
@@ -306,13 +405,13 @@ impl FrameScan {
                     payload[at + 3],
                 ])
             };
-            found(GoAwayFrame {
+            found(Scanned::GoAway(GoAwayFrame {
                 last_stream_id: word(0) & 0x7fff_ffff,
                 code: word(4),
                 debug_data: payload[8..].to_vec(),
                 heads_before: self.heads,
                 ends_before: self.ends,
-            });
+            }));
         }
     }
 }
@@ -326,10 +425,19 @@ struct SessionIo<T> {
     goaways: tokio::sync::watch::Sender<Vec<GoAwayFrame>>,
     written: WriteScan,
     outbox: Arc<Outbox>,
+    pings: Arc<Pings>,
     /// Outbox bytes taken and not yet all written: they go out whole
     /// before anything more of hyper's.
     sending: Vec<u8>,
     sent: usize,
+}
+
+// hyper has let go of the connection -- it ended, or the session was
+// destroyed and its task aborted: no ACK can come.
+impl<T> Drop for SessionIo<T> {
+    fn drop(&mut self) {
+        self.pings.end();
+    }
 }
 
 impl<T: AsyncWrite + Unpin> SessionIo<T> {
@@ -340,8 +448,13 @@ impl<T: AsyncWrite + Unpin> SessionIo<T> {
             if !self.outbox.queued.load(Ordering::Acquire) || !self.written.at_boundary() {
                 return Poll::Ready(Ok(()));
             }
-            self.sending = std::mem::take(&mut *lock(&self.outbox.frames));
+            // The flag changes only under the frames' lock, here and in
+            // `send_goaway`: cleared outside it, a frame queued between the
+            // take and the clear would sit there unflagged, never written.
+            let mut frames = lock(&self.outbox.frames);
+            self.sending = std::mem::take(&mut *frames);
             self.outbox.queued.store(false, Ordering::Release);
+            drop(frames);
             self.sent = 0;
         }
         while self.sent < self.sending.len() {
@@ -370,9 +483,12 @@ impl<T: AsyncRead + Unpin> AsyncRead for SessionIo<T> {
         let polled = Pin::new(&mut this.io).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = polled {
             let goaways = &this.goaways;
-            this.scan.feed(&buf.filled()[before..], &mut |frame| {
-                goaways.send_modify(|frames| frames.push(frame));
-            });
+            let pings = &this.pings;
+            this.scan
+                .feed(&buf.filled()[before..], &mut |scanned| match scanned {
+                    Scanned::GoAway(frame) => goaways.send_modify(|frames| frames.push(frame)),
+                    Scanned::PingAck(payload) => pings.acked(payload),
+                });
         }
         polled
     }
@@ -391,9 +507,11 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for SessionIo<T> {
         Poll::Ready(Ok(n))
     }
 
-    // h2 writes every frame it holds before it flushes, so a request made
-    // before the session's GOAWAY was queued goes out ahead of it, as
-    // node's does; the outbox is written here once it has.
+    // The outbox goes out at the first frame boundary after it was queued:
+    // before hyper's next write (`poll_write`), so ahead of the frames h2
+    // still holds -- a request made in the same tick as the session's
+    // GOAWAY follows it, as node's does (nghttp2 sends the GOAWAY first)
+    // -- or here, when hyper has nothing more to write.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         this.outbox.task.register(cx.waker());
@@ -510,12 +628,14 @@ pub async fn open(
     };
     let (goaways_tx, goaways) = tokio::sync::watch::channel(Vec::new());
     let outbox = Arc::new(Outbox::default());
+    let pings = Arc::new(Pings::default());
     let io = SessionIo {
         io,
         scan: FrameScan::default(),
         goaways: goaways_tx,
         written: WriteScan::default(),
         outbox: outbox.clone(),
+        pings: pings.clone(),
         sending: Vec::new(),
         sent: 0,
     };
@@ -539,6 +659,7 @@ pub async fn open(
             ended: ended_rx,
             goaways,
             outbox,
+            pings,
         },
     );
     OpOutcome::Json(serde_json::json!({ "session": id }).to_string())
@@ -559,19 +680,6 @@ pub struct H2Request {
     pub body_stream: Option<u64>,
     #[serde(default)]
     pub body_base64: Option<String>,
-}
-
-/// A JS string that holds bytes one per code point. Anything past U+00FF
-/// cannot be sent.
-fn latin1_bytes(text: &str, what: &str) -> Result<Vec<u8>, String> {
-    text.chars()
-        .map(|c| u8::try_from(u32::from(c)).map_err(|_| format!("invalid character in {what}")))
-        .collect()
-}
-
-/// A header value as JS sees it: latin1, one code point per byte.
-fn latin1(bytes: &[u8]) -> String {
-    bytes.iter().map(|&b| char::from(b)).collect()
 }
 
 fn build_request(req: &H2Request, body: ReqBody) -> Result<http::Request<ReqBody>, String> {
@@ -615,7 +723,25 @@ const REFUSED_STREAM: u32 = 7;
 /// to the session, which reports the connection's end once, as node does,
 /// and takes its streams down with it.
 fn stream_error(error: &hyper::Error, after_goaway: bool) -> OpOutcome {
-    let closed = |code: u32, syscall: Option<&str>| OpOutcome::NodeFailed {
+    if let Some(h2) = find_h2(error) {
+        if h2.is_reset()
+            && let Some(reason) = h2.reason()
+        {
+            return stream_closed(u32::from(reason), None);
+        }
+        if h2.is_go_away() && h2.is_remote() {
+            return stream_closed(REFUSED_STREAM, Some("goaway"));
+        }
+    } else if after_goaway {
+        return stream_closed(REFUSED_STREAM, Some("goaway"));
+    }
+    OpOutcome::node_failed("ERR_HTTP2_SESSION_FAILED", error.to_string())
+}
+
+/// `ERR_HTTP2_STREAM_ERROR` for a stream closed with the h2 error `code`,
+/// which travels as `errno`; `syscall` is [`stream_error`]'s `"goaway"` mark.
+fn stream_closed(code: u32, syscall: Option<&str>) -> OpOutcome {
+    OpOutcome::NodeFailed {
         code: "ERR_HTTP2_STREAM_ERROR".to_string(),
         message: format!("Stream closed with error code {}", nghttp2_name(code)),
         syscall: syscall.map(str::to_string),
@@ -626,20 +752,7 @@ fn stream_error(error: &hyper::Error, after_goaway: bool) -> OpOutcome {
         port: None,
         dest: None,
         win_error: None,
-    };
-    if let Some(h2) = find_h2(error) {
-        if h2.is_reset()
-            && let Some(reason) = h2.reason()
-        {
-            return closed(u32::from(reason), None);
-        }
-        if h2.is_go_away() && h2.is_remote() {
-            return closed(REFUSED_STREAM, Some("goaway"));
-        }
-    } else if after_goaway {
-        return closed(REFUSED_STREAM, Some("goaway"));
     }
-    OpOutcome::node_failed("ERR_HTTP2_SESSION_FAILED", error.to_string())
 }
 
 /// `http2SessionRequest(session, requestJson)`: open one stream and resolve
@@ -714,21 +827,7 @@ pub async fn request(
     // past the GOAWAY's last stream id, where the peer ignores it and it
     // waits for the connection's end. As a stream above that id it closes
     // with `NGHTTP2_REFUSED_STREAM`, after the `'goaway'`.
-    let refused = || OpOutcome::NodeFailed {
-        code: "ERR_HTTP2_STREAM_ERROR".to_string(),
-        message: format!(
-            "Stream closed with error code {}",
-            nghttp2_name(REFUSED_STREAM)
-        ),
-        syscall: Some("goaway".to_string()),
-        path: None,
-        errno: i32::try_from(REFUSED_STREAM).ok(),
-        hostname: None,
-        address: None,
-        port: None,
-        dest: None,
-        win_error: None,
-    };
+    let refused = || stream_closed(REFUSED_STREAM, Some("goaway"));
     if after_goaway() {
         return fail(&mut slot, refused());
     }
@@ -824,20 +923,94 @@ pub async fn goaway(sessions: H2Sessions, id: u64, index: usize) -> OpOutcome {
     }
 }
 
-/// `http2SessionSendGoaway(session)`: send a GOAWAY (NO_ERROR) now, after
-/// every frame hyper holds, as nghttp2 sends node's `session.close()` one.
-/// hyper sends its own once the streams are done, as node's `destroy()`
-/// sends a second. False if the session is gone.
+/// `http2SessionSendGoaway(session)`: send a GOAWAY (NO_ERROR) now -- at the
+/// next frame boundary of what hyper writes, ahead of the frames h2 still
+/// holds -- as nghttp2 sends node's `session.close()` one, ahead of the
+/// requests made in the same tick. hyper sends its own once the streams are
+/// done, as node's `destroy()` sends a second. False if the session is gone.
 pub fn send_goaway(sessions: &H2Sessions, id: u64) -> bool {
     let sessions = lock(sessions);
     let Some(session) = sessions.get(&id) else {
         return false;
     };
     let outbox = &session.outbox;
-    lock(&outbox.frames).extend_from_slice(&goaway_frame(0));
+    // Flagged under the frames' lock, as `poll_outbox` clears it.
+    let mut frames = lock(&outbox.frames);
+    frames.extend_from_slice(&goaway_frame(0));
     outbox.queued.store(true, Ordering::Release);
+    drop(frames);
     outbox.task.wake();
     true
+}
+
+/// `http2SessionPing(session, payload)`: send a PING frame carrying
+/// `payload` -- at the next frame boundary of what hyper writes, as
+/// [`send_goaway`]'s frame goes -- and resolve when the peer acknowledges
+/// it, with `{"ack": true, "duration": ms, "payload": [..8 bytes], "seq"}`:
+/// the time from here to the ACK, in milliseconds, the bytes the ACK
+/// echoed, and how many of the session's pings were answered before it
+/// (JS calls back in that order). `{"ack": false}` when no ACK can come: the session is gone, or
+/// its connection ended (or the session was destroyed) first -- node's
+/// `ERR_HTTP2_PING_CANCEL`.
+///
+/// An ACK answers the oldest ping waiting, so pings are answered in the
+/// order sent, as nghttp2's are.
+///
+/// The frame is queued here, in the call, and the future only waits: the
+/// pings JS makes one after another go out in that order, whichever of
+/// their futures the runtime polls first.
+pub fn ping(
+    sessions: &H2Sessions,
+    id: u64,
+    payload: [u8; 8],
+) -> impl Future<Output = OpOutcome> + Send + 'static {
+    let started = std::time::Instant::now();
+    let acked = queue_ping(sessions, id, payload);
+    async move {
+        let pong = match acked {
+            Some(acked) => acked.await.ok(),
+            None => None,
+        };
+        let answer = match pong {
+            Some(pong) => serde_json::json!({
+                "ack": true,
+                "duration": started.elapsed().as_secs_f64() * 1000.0,
+                "payload": pong.payload,
+                "seq": pong.seq,
+            }),
+            None => serde_json::json!({ "ack": false }),
+        };
+        OpOutcome::Json(answer.to_string())
+    }
+}
+
+/// Queue a PING frame carrying `payload` on session `id`, and the wait for
+/// its ACK. `None` when no ACK can come: the session, or its connection, is
+/// gone.
+fn queue_ping(
+    sessions: &H2Sessions,
+    id: u64,
+    payload: [u8; 8],
+) -> Option<tokio::sync::oneshot::Receiver<Pong>> {
+    let sessions = lock(sessions);
+    let session = sessions.get(&id)?;
+    let outbox = &session.outbox;
+    // The frame and its place in the queue under one lock: two pings wait
+    // in the order their frames go out. Flagged under the frames' lock, as
+    // `poll_outbox` clears it.
+    let mut frames = lock(&outbox.frames);
+    let mut pings = lock(&session.pings.0);
+    if pings.over {
+        return None;
+    }
+    let (acked, wait) = tokio::sync::oneshot::channel();
+    pings.waiting.push_back(acked);
+    drop(pings);
+    frames.extend_from_slice(&ping_frame(payload));
+    outbox.queued.store(true, Ordering::Release);
+    drop(frames);
+    outbox.task.wake();
+    Some(wait)
 }
 
 /// `http2SessionClose(session)`: open no more streams; hyper ends the
@@ -857,7 +1030,10 @@ pub fn destroy(sessions: &H2Sessions, id: u64) -> bool {
     removed.is_some()
 }
 
-/// How many sessions are open.
+/// How many sessions are open. Test support: the integration tests assert
+/// that a destroyed session leaves none behind; nothing in the runtime reads
+/// it.
+#[doc(hidden)]
 pub fn open_count(sessions: &H2Sessions) -> usize {
     lock(sessions).len()
 }
@@ -883,12 +1059,96 @@ mod tests {
 
     /// What `FrameScan` finds in `bytes` fed `step` bytes at a time.
     fn scan(bytes: &[u8], step: usize) -> Vec<GoAwayFrame> {
+        scan_all(bytes, step)
+            .into_iter()
+            .filter_map(|scanned| match scanned {
+                Scanned::GoAway(frame) => Some(frame),
+                Scanned::PingAck(_) => None,
+            })
+            .collect()
+    }
+
+    /// Everything `FrameScan` reports of `bytes` fed `step` bytes at a time.
+    fn scan_all(bytes: &[u8], step: usize) -> Vec<Scanned> {
         let mut scan = FrameScan::default();
         let mut found = Vec::new();
         for piece in bytes.chunks(step) {
-            scan.feed(piece, &mut |frame| found.push(frame));
+            scan.feed(piece, &mut |scanned| found.push(scanned));
         }
         found
+    }
+
+    /// A PING ACK is reported with the payload it echoes, however the reads
+    /// split it, in its place among the GOAWAY frames; the peer's own PING
+    /// (no ACK flag) is hyper's to answer and not reported, and nor is an
+    /// ACK of the wrong length.
+    #[test]
+    fn the_scan_finds_each_ping_ack() {
+        let mut bytes = frame(0x4, 0, 0, &[]); // SETTINGS
+        bytes.extend(frame(PING, 0, 0, b"peerping")); // the peer's own
+        bytes.extend(frame(PING, ACK, 0, b"abcdefgh"));
+        bytes.extend(frame(DATA, 0, 1, &[PING; 40])); // a body is not frames
+        bytes.extend(goaway(0, 0, b""));
+        bytes.extend(frame(PING, ACK, 0, &[0; 7])); // FRAME_SIZE_ERROR
+        bytes.extend(frame(PING, ACK, 0, &[1, 2, 3, 4, 5, 6, 7, 8]));
+        let want = vec![
+            Scanned::PingAck(*b"abcdefgh"),
+            Scanned::GoAway(GoAwayFrame {
+                code: 0,
+                last_stream_id: 0,
+                debug_data: Vec::new(),
+                heads_before: 0,
+                ends_before: 0,
+            }),
+            Scanned::PingAck([1, 2, 3, 4, 5, 6, 7, 8]),
+        ];
+        for step in [1, 2, 7, 9, 10, 64, bytes.len()] {
+            assert_eq!(scan_all(&bytes, step), want, "fed {step} bytes at a time");
+        }
+        assert_eq!(
+            ping_frame(*b"abcdefgh").to_vec(),
+            frame(PING, 0, 0, b"abcdefgh"),
+            "the session's PING: no ACK flag, stream 0"
+        );
+    }
+
+    /// An ACK answers the oldest ping waiting, with the bytes the ACK
+    /// carried, whatever that ping sent (nghttp2's rule, and node's); one
+    /// that finds nothing waiting answers nothing; the connection's end
+    /// cancels the rest.
+    #[test]
+    fn an_ack_answers_the_oldest_ping_waiting() {
+        use tokio::sync::oneshot::error::TryRecvError;
+        let pings = Pings::default();
+        pings.acked(*b"nobodys.");
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            let (acked, wait) = tokio::sync::oneshot::channel();
+            lock(&pings.0).waiting.push_back(acked);
+            waits.push(wait);
+        }
+        pings.acked(*b"aaaaaaaa");
+        pings.acked(*b"bbbbbbbb");
+        let pong = |payload: &[u8; 8], seq| {
+            Ok(Pong {
+                payload: *payload,
+                seq,
+            })
+        };
+        assert_eq!(waits[0].try_recv(), pong(b"aaaaaaaa", 0));
+        assert_eq!(waits[1].try_recv(), pong(b"bbbbbbbb", 1));
+        assert_eq!(
+            waits[2].try_recv(),
+            Err(TryRecvError::Empty),
+            "the third still waits"
+        );
+        pings.end();
+        assert_eq!(
+            waits[2].try_recv(),
+            Err(TryRecvError::Closed),
+            "cancelled by the end"
+        );
+        assert!(lock(&pings.0).over);
     }
 
     /// The GOAWAY frames in a server's bytes, however the reads split them,

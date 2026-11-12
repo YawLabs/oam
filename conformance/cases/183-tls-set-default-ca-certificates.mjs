@@ -2,7 +2,8 @@
 // trust store (#199). The argument is validated as Node validates it, an
 // empty array is accepted and trusts nothing, duplicates are dropped, and a
 // connection made after it with no `ca` of its own verifies against the
-// override; getCACertificates('default') reads it back.
+// override, as a server made after it verifies its clients' certificates;
+// getCACertificates('default') reads it back.
 //
 // Counts are printed relative to the input, never the absolute bundled size
 // (Node's Mozilla store and oam's webpki-roots hold different numbers --
@@ -41,6 +42,25 @@ const KEY = `-----BEGIN PRIVATE KEY-----
 MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgQLidYpqFITu5wno8
 Fw5b5Ahrg5eTwH0UqA7RU57egNKhRANCAATIZSROMPcNXcmsamcAQ6VM5NzCkR0b
 j0ngz5dpnyIRlajsUptN/qPisRoVJ5BqZjfz4MS1vVN0KGg7vDRoCO1V
+-----END PRIVATE KEY-----
+`;
+// A client's certificate (extended key usage clientAuth) under the same CA.
+const CLIENT_CERT = `-----BEGIN CERTIFICATE-----
+MIIBoTCCAUigAwIBAgIUOy7BLDqzc+0IZz2NWG95hnXgrd8wCgYIKoZIzj0EAwIw
+GjEYMBYGA1UEAwwPb2FtIGgycyB0ZXN0IENBMCAXDTI1MDEwMTAwMDAwMFoYDzIx
+MjUwMTAxMDAwMDAwWjAVMRMwEQYDVQQDDApvYW0gY2xpZW50MFkwEwYHKoZIzj0C
+AQYIKoZIzj0DAQcDQgAEulhTChDco8oZzXpPqo3iqtybv/nUXKwS67GiGZ23ra4b
+5Ta8McX1MVv2p0WA1/JYyncszN9kbKwE1oeV0Q0lTKNvMG0wCQYDVR0TBAIwADAL
+BgNVHQ8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwIwHQYDVR0OBBYEFCk7s+uR
+ZEuahksP0Vn6QPqJ+TmIMB8GA1UdIwQYMBaAFDpSKOjuLSBTYw+71yVedRVNgy0H
+MAoGCCqGSM49BAMCA0cAMEQCIFOOnRBbxbAbIOcU15I7xnKlD5QXj7P2ZHQbxax0
+goFxAiBEgrUhNh9pzkHEQGCdqJNAtqjNUURu8GVWs9re4QYI7A==
+-----END CERTIFICATE-----
+`;
+const CLIENT_KEY = `-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgT9C7qt8YZkF23ize
+WR5qGRqTlTsUdSjwsf/UmBhdckihRANCAAS6WFMKENyjyhnNek+qjeKq3Ju/+dRc
+rBLrsaIZnbetrhvlNrwxxfUxW/anRYDX8ljKdyzM32RsrATWh5XRDSVM
 -----END PRIVATE KEY-----
 `;
 
@@ -82,6 +102,31 @@ await new Promise((resolve) => {
   s.on("close", resolve);
 });
 await new Promise((r) => server.close(r));
+
+// A server made after it with no `ca` of its own judges a client's
+// certificate against the override too: a client's certificate the
+// override's CA issued is authorized, where the stores the process started
+// with do not know its issuer at all; a server's certificate under the same
+// CA is refused for its purpose.
+const judging = tls.createServer(
+  { cert: CERT, key: KEY, requestCert: true, rejectUnauthorized: false },
+  (s) => {
+    console.log("server authorized=" + s.authorized + " error=" + s.authorizationError);
+    s.end();
+  },
+);
+await new Promise((r) => judging.listen(0, "127.0.0.1", r));
+for (const [cert, key] of [[CLIENT_CERT, CLIENT_KEY], [CERT, KEY]]) {
+  await new Promise((resolve) => {
+    const s = tls.connect({
+      port: judging.address().port, host: "127.0.0.1", servername: "localhost", cert, key,
+    });
+    s.on("error", (e) => console.log("judged error " + e.code));
+    s.on("close", resolve);
+    s.resume();
+  });
+}
+await new Promise((r) => judging.close(r));
 
 clearTimeout(watchdog);
 process.exit(0);

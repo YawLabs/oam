@@ -121,18 +121,54 @@ test('posix: SIGTERM to the launcher stops the child and the launcher dies of it
     env: { ...process.env, OAMJS_BINARY: process.execPath },
     stdio: ['ignore', 'pipe', 'inherit'],
   });
-  await new Promise((resolve) => child.stdout.once('data', resolve));
+  // The fixture announces its own pid ("ready <pid>\n"). That pid is the thing
+  // under test: the launcher's exit status alone cannot show a forward, because
+  // an unforwarded SIGTERM kills the launcher by default disposition with the
+  // very same status.
+  const fixturePid = await new Promise((resolve, reject) => {
+    let seen = '';
+    child.stdout.on('data', (c) => {
+      seen += c;
+      const m = /^ready (\d+)\n/.exec(seen);
+      if (m) resolve(Number(m[1]));
+    });
+    child.once('exit', () => reject(new Error(`the fixture never reported ready: ${seen}`)));
+  });
+  const alive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (e) {
+      // EPERM would mean "exists, not ours"; only ESRCH is "gone".
+      return e.code !== 'ESRCH';
+    }
+  };
+  assert.ok(alive(fixturePid), 'the fixture should be running before the signal');
+  t.after(() => {
+    // Whatever happened above, do not leave a fixture running for 30 s.
+    try { process.kill(fixturePid, 'SIGKILL'); } catch { /* already gone */ }
+  });
 
   // Directed at the launcher's PID only, which is what a supervisor does. A
   // process-group kill would reach the fixture directly and prove nothing.
+  //
+  // 'exit', not 'close': with a broken forward the orphaned fixture still holds
+  // the stdout pipe, so 'close' would simply arrive 30 s late and the status
+  // assertions would pass.
   child.kill('SIGTERM');
   const { code, signal } = await new Promise((resolve) => {
-    child.on('close', (c, s) => resolve({ code: c, signal: s }));
+    child.on('exit', (c, s) => resolve({ code: c, signal: s }));
   });
 
   assert.equal(signal, 'SIGTERM', 'the launcher did not die of the signal it was sent');
   assert.equal(code, null);
-  // The fixture would have run for 30s; if the forward had not landed it would
-  // still be running now, reparented to init.
-  await delay(50);
+
+  // The forward is what this asserts. The launcher re-raises only after it has
+  // seen the child exit, so the fixture is normally gone already; the short
+  // poll allows for the kernel finishing the teardown, and is far below the
+  // 30 s the fixture would live had the signal never reached it.
+  const deadline = Date.now() + 5_000;
+  while (alive(fixturePid) && Date.now() < deadline) await delay(25);
+  assert.equal(alive(fixturePid), false,
+    `the fixture (pid ${fixturePid}) outlived the launcher: SIGTERM was not forwarded`);
 });

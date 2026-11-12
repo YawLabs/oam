@@ -14,13 +14,17 @@
 //!
 //! JsRuntime is NOT Send (holds V8 isolate-thread locals), so pre-warmed
 //! isolates stay pinned to their creation thread. The pool communicates over
-//! `std::sync::mpsc::SyncSender` (bounded=1 so try_send succeeds immediately
-//! when the thread is waiting, preventing runaway buffering).
+//! `std::sync::mpsc::SyncSender` (bounded=1: a slot leaves the pool before
+//! its one request is sent, so the send never waits and nothing queues up).
+//!
+//! A fork served by a slot runs the routine a cold spawn runs once its
+//! isolate exists (`worker::run_worker_on`), so what a forked script observes
+//! does not depend on whether a slot was free.
 //!
 //! Drop: each thread loops on `recv()` which returns `Err` when the
 //! `SyncSender` is dropped along with the pool. The thread exits cleanly.
 
-use oam_core::worker::{WorkerContext, WorkerEvent};
+use oam_core::worker::WorkerEvent;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -83,42 +87,50 @@ impl ForkPool {
 
     /// Spawn one pre-warmed thread and push its sender into the pool.
     fn add_slot(pool: &Arc<Self>) {
-        // bounded=1: capacity for exactly one message. The pre-warmed thread
-        // calls recv() and blocks immediately, so try_send succeeds the moment
-        // we have a ForkRequest without any extra buffering.
+        // bounded=1: capacity for exactly one message, the one request this
+        // slot ever serves. It is buffered if the thread is still building
+        // its isolate and handed over directly once it waits in recv().
         let (tx, rx) = mpsc::sync_channel::<ForkRequest>(1);
         let pool_weak = Arc::downgrade(pool);
         let permissions = pool.permissions.clone();
-        super::worker::spawn_isolate_thread("oam-fork-prewarm".to_string(), move || {
-            // Pre-warm: pay the JsRuntime::new() cost before a request arrives.
-            // Use the worker constructor (NO fork pool) -- a prewarm
-            // isolate that installed its own pool would spawn more prewarm
-            // threads, recursing until the stack overflows.
-            super::init_platform();
-            let mut rt = super::JsRuntime::new_worker_runtime_with(permissions);
+        let spawned =
+            super::worker::spawn_isolate_thread("oam-fork-prewarm".to_string(), move || {
+                // Pre-warm: pay the JsRuntime::new() cost before a request arrives.
+                // Use the worker constructor (NO fork pool) -- a prewarm
+                // isolate that installed its own pool would spawn more prewarm
+                // threads, recursing until the stack overflows.
+                let mut rt = super::JsRuntime::new_worker_runtime_with(permissions);
 
-            // Block until a ForkRequest arrives or the pool drops (recv Err).
-            let req = match rx.recv() {
-                Ok(req) => req,
-                Err(_) => return, // pool dropped: exit cleanly
-            };
+                // Block until a ForkRequest arrives or the pool drops (recv Err).
+                let req = match rx.recv() {
+                    Ok(req) => req,
+                    Err(_) => return, // pool dropped: exit cleanly
+                };
 
-            // Run the worker script on this pre-warmed isolate.
-            run_fork_request(&mut rt, req);
+                // Run the worker script on this pre-warmed isolate.
+                run_fork_request(&mut rt, req);
 
-            // Refill: spawn a fresh slot so the pool stays at `capacity`.
-            // This thread's isolate has now run a script -- it may carry
-            // stale JS state, so a fresh slot gets a new isolate.
-            if let Some(pool) = pool_weak.upgrade() {
-                Self::add_slot(&pool);
-            }
-            // Thread exits; JsRuntime drops cleanly.
-        })
-        .expect("fork prewarm thread spawns");
+                // Refill: spawn a fresh slot so the pool stays at `capacity`.
+                // This thread's isolate has now run a script -- it may carry
+                // stale JS state, so a fresh slot gets a new isolate.
+                if let Some(pool) = pool_weak.upgrade() {
+                    Self::add_slot(&pool);
+                }
+                // Thread exits; JsRuntime drops cleanly.
+            });
+        // The OS refused the thread (its thread or address-space limit): no
+        // slot. This runs inside a V8 callback (the first fork) or on a
+        // finishing prewarm thread, where a panic would end the process; the
+        // pool is an optimization, and a fork that finds no slot cold-spawns
+        // (and reports its own spawn failure to the caller).
+        if spawned.is_err() {
+            return;
+        }
 
-        // Push the slot so the pool can dispatch to it. We push after
-        // spawning (not before) so the slot is only visible once the thread
-        // is running and has called recv().
+        // Push the slot so the pool can dispatch to it, after the spawn so a
+        // slot always has a thread behind it. That thread may still be inside
+        // `JsRuntime::new`: the channel holds one request, so a fork that
+        // takes the slot early is buffered and served when the isolate is up.
         if let Ok(mut guard) = pool.pool.lock() {
             guard.push(ForkSlot { tx });
         }
@@ -126,6 +138,7 @@ impl ForkPool {
 
     /// Hand off a fork request to a pre-warmed slot if available, or fall
     /// back to a cold spawn (same as the existing `spawn_worker` path).
+    /// `Err` only when that cold spawn's thread cannot be created.
     pub fn fork(
         self: &Arc<Self>,
         script: PathBuf,
@@ -133,7 +146,7 @@ impl ForkPool {
         worker_id: u64,
         event_tx: mpsc::Sender<WorkerEvent>,
         msg_rx: mpsc::Receiver<Vec<u8>>,
-    ) {
+    ) -> std::io::Result<()> {
         // First fork warms the pool; later forks find slots already spawned.
         Self::ensure_warm(self);
 
@@ -155,27 +168,20 @@ impl ForkPool {
                     event_tx: event_tx.clone(),
                     msg_rx,
                 };
-                match slot.tx.try_send(req) {
-                    Ok(()) => (),
-                    // Slot full (thread still alive but busy): cold spawn.
-                    Err(mpsc::TrySendError::Full(req)) => {
-                        cold_spawn(
-                            req.script,
-                            req.worker_data,
-                            req.worker_id,
-                            req.msg_rx,
-                            event_tx,
-                            self.permissions.clone(),
-                        );
-                    }
+                // The slot was taken out of the pool above and this is the
+                // only send its channel ever sees, so the one-request buffer
+                // is empty: the send cannot block, and fails only when the
+                // receiver is gone.
+                match slot.tx.send(req) {
+                    Ok(()) => Ok(()),
                     // Slot disconnected: the prewarm thread died (e.g. panicked
                     // before recv), so this slot's tx had no live receiver. We
                     // just removed that dead slot from the pool above, and the
                     // dead thread never reached the refill path -- so without a
                     // refill here the pool would shrink by one permanently. Spawn
                     // a fresh slot so the pool self-heals back to `capacity`.
-                    Err(mpsc::TrySendError::Disconnected(req)) => {
-                        cold_spawn(
+                    Err(mpsc::SendError(req)) => {
+                        let spawned = cold_spawn(
                             req.script,
                             req.worker_data,
                             req.worker_id,
@@ -184,6 +190,7 @@ impl ForkPool {
                             self.permissions.clone(),
                         );
                         Self::add_slot(self);
+                        spawned
                     }
                 }
             }
@@ -196,7 +203,7 @@ impl ForkPool {
                     msg_rx,
                     event_tx,
                     self.permissions.clone(),
-                );
+                )
             }
         }
     }
@@ -210,7 +217,7 @@ fn cold_spawn(
     msg_rx: mpsc::Receiver<Vec<u8>>,
     event_tx: mpsc::Sender<WorkerEvent>,
     permissions: Arc<crate::permissions::Permissions>,
-) {
+) -> std::io::Result<()> {
     crate::worker::spawn_worker(
         script,
         worker_data,
@@ -227,54 +234,28 @@ fn cold_spawn(
             creator_flags: None,
         },
         permissions,
-    );
+    )
+    // Not joined: the registry holds a fork's channels, not its thread.
+    .map(drop)
 }
 
 /// Execute a `ForkRequest` on an already-initialized `JsRuntime`.
-fn run_fork_request(rt: &mut super::JsRuntime, req: ForkRequest) -> i32 {
-    // Match the cold-fork path (worker::run_worker): set process.argv so a
-    // forked worker sees process.argv[1] == script path. Without this, argv is
-    // present on cold spawns but ABSENT on warm spawns -- non-deterministic by
-    // pool state. Per-request: the script path isn't known until the request.
-    rt.set_process_argv(vec![
-        "oam".to_string(),
-        req.script.to_string_lossy().into_owned(),
-    ]);
-
-    let ctx = WorkerContext {
-        inbox: std::sync::Arc::new(Mutex::new(Some(req.msg_rx))),
-        outbox: req.event_tx.clone(),
-        thread_id: req.worker_id,
-        worker_data: req.worker_data,
-        // A fork has its own process stdio; only worker_threads pipes.
-        pipe_stdout: false,
-        pipe_stderr: false,
-        exec_argv: Vec::new(),
-    };
-
-    // Inherit the parent's process-level flags (--no-warnings etc.); a
-    // fresh isolate would otherwise start with none of them.
-    if let Some(js) = crate::inherited_flags_js() {
-        let _ = rt.execute_script("<flags>", js);
-    }
-    rt.sync_trace_uncaught();
-    if let Err(diagnostics) = rt.execute_worker(&req.script, ctx) {
-        for d in &diagnostics {
-            eprintln!("fork worker {}: {}", req.worker_id, d.message);
-        }
-        let _ = req
-            .event_tx
-            .send(WorkerEvent::Error(oam_core::worker::WorkerError::message(
-                diagnostics
-                    .first()
-                    .map(|d| d.message.clone())
-                    .unwrap_or_else(|| "unknown fork worker error".to_string()),
-            )));
-        let _ = req.event_tx.send(WorkerEvent::Exit(1));
-        return 1;
-    }
-
-    let code = rt.process_exit_code().unwrap_or(0);
-    let _ = req.event_tx.send(WorkerEvent::Exit(code));
-    code
+///
+/// The same routine a cold spawn runs after building its isolate
+/// (`worker::run_worker_on`), so a fork behaves alike whether or not a slot
+/// was free: process.argv, the creator's flags and the startup check,
+/// 'online', the entry's resolution, the worker's own process 'exit'
+/// listeners, and a fatal failure handed to the parent as the thrown value.
+fn run_fork_request(rt: &mut super::JsRuntime, req: ForkRequest) {
+    let event_tx = req.event_tx;
+    let code = crate::worker::run_worker_on(
+        rt,
+        &req.script,
+        req.worker_data,
+        req.worker_id,
+        req.msg_rx,
+        event_tx.clone(),
+        crate::worker::WorkerStart::for_fork(),
+    );
+    let _ = event_tx.send(WorkerEvent::Exit(code));
 }

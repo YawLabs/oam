@@ -22,20 +22,36 @@ const { SUPPORTED, KNOWN_UNSUPPORTED } = require('./targets.js');
 // question that only matters when the exec is about to fail. An `existsSync`
 // on the dynamic loader answers it in microseconds for both of the common
 // cases, and getReport stays as the fallback for anything unrecognized.
-function detectGlibc() {
+//
+// ORDER MATTERS: the glibc loader is probed first, and the musl loader only
+// decides when no glibc loader is there. The musl loader's presence alone is
+// not a musl-host signal -- Debian and Ubuntu's `musl` package (a dependency
+// of musl-tools, common on a box that cross-compiles) installs
+// /lib/ld-musl-<arch>.so.1 on a glibc system, and reading that as "no glibc"
+// refused a host the gnu binary runs on. Both present is therefore answered
+// "glibc". The mirror case, a musl host carrying a glibc loader shim, gets the
+// exec attempt and the loader's own verdict, which is the less wrong of the two
+// mistakes: a refusal there cannot be worked around, a failed exec can.
+//
+// `opts` is the test seam (exists / arch / report); production passes nothing.
+function detectGlibc(opts = {}) {
+  const exists = opts.exists || fs.existsSync;
+  const arm = (opts.arch || process.arch) === 'arm64';
   try {
-    const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
-    if (fs.existsSync(`/lib/ld-musl-${arch}.so.1`)) return null;
-    for (const loader of ['/lib64/ld-linux-x86-64.so.2', '/lib/ld-linux-aarch64.so.1',
-      '/lib/x86_64-linux-gnu/libc.so.6', '/lib/aarch64-linux-gnu/libc.so.6']) {
-      if (fs.existsSync(loader)) return 'present';
+    const glibcLoaders = arm
+      ? ['/lib/ld-linux-aarch64.so.1', '/lib/aarch64-linux-gnu/libc.so.6']
+      : ['/lib64/ld-linux-x86-64.so.2', '/lib/x86_64-linux-gnu/libc.so.6'];
+    for (const loader of glibcLoaders) {
+      if (exists(loader)) return 'present';
     }
+    if (exists(`/lib/ld-musl-${arm ? 'aarch64' : 'x86_64'}.so.1`)) return null;
   } catch {
     // Fall through to the authoritative probe rather than guessing from an
     // fs error -- a sandbox that hides /lib is not a musl signal.
   }
   try {
-    return process.report.getReport().header.glibcVersionRuntime || null;
+    const report = opts.report ? opts.report() : process.report.getReport();
+    return report.header.glibcVersionRuntime || null;
   } catch {
     // Not a musl signal: an old Node, or one built without process.report.
     // Returning undefined means "unknown", and callers must not guess from it.

@@ -32,6 +32,10 @@ pub struct WsConnection {
 
 pub type WsRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, WsConnection>>>;
 
+/// How long the bridge waits for the Close reply to a peer-initiated close to
+/// reach the socket before it gives the connection up.
+const CLOSE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn bridge(
     ws: impl futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
     + futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
@@ -62,6 +66,14 @@ async fn bridge(
                         .map(|c| (c.code.into(), c.reason.to_string()))
                         .unwrap_or((1005, String::new()));
                     let _ = inbound_tx.send(WsFrame::Close { code, reason });
+                    // The peer started the closing handshake. tungstenite
+                    // only QUEUES the Close reply when it reads the peer's
+                    // frame and writes it on the next read or flush; leaving
+                    // here without one dropped the connection with no Close
+                    // frame, so the peer saw 1006 where it had asked for a
+                    // clean close. Bounded: a peer that stopped reading must
+                    // not keep this task (and the socket) alive.
+                    let _ = tokio::time::timeout(CLOSE_REPLY_TIMEOUT, sink.flush()).await;
                     break;
                 }
                 Some(Ok(_)) => {}
@@ -162,7 +174,28 @@ pub async fn ws_connect(
         Ok(connected) => connected.stream,
         Err(e) => return OpOutcome::Failed(format!("WebSocket connection failed: {e}")),
     };
-    let result = tokio_tungstenite::client_async_tls_with_config(request, stream, None, None).await;
+    // `wss:` verifies the server with the trust fetch and https.request use
+    // (the platform verifier plus NODE_EXTRA_CA_CERTS), offering `http/1.1`
+    // as undici's connector does. Left to itself tokio-tungstenite builds a
+    // config from the bundled Mozilla roots alone, so a server under a
+    // private CA that fetch reached was refused here.
+    let connector = if request.uri().scheme_str() == Some("wss") {
+        let range = crate::http_client::TlsRange::Both;
+        match crate::http_client::tls_config::platform(range).await {
+            Ok(configs) => Some(tokio_tungstenite::Connector::Rustls(
+                configs.offering(crate::http_client::Alpn::Http1).clone(),
+            )),
+            Err(e) => {
+                return OpOutcome::Failed(format!(
+                    "WebSocket connection failed: tls configuration error: {e}"
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let result =
+        tokio_tungstenite::client_async_tls_with_config(request, stream, None, connector).await;
     established(registry, ids, result)
 }
 
@@ -239,7 +272,7 @@ pub fn ws_send_sync(registry: &WsRegistry, handle: u64, message: Message) -> Res
 pub async fn ws_recv(registry: WsRegistry, handle: u64) -> OpOutcome {
     let rx = registry
         .lock()
-        .expect("ws registry lock")
+        .unwrap_or_else(|e| e.into_inner())
         .get_mut(&handle)
         .and_then(|conn| conn.inbound.take());
     let Some(mut rx) = rx else {
@@ -362,6 +395,55 @@ mod tests {
         assert!(accepted);
         assert_eq!(seen.as_deref(), Some("yes"));
         assert_eq!(registry.lock().unwrap().len(), 1);
+    }
+
+    /// A close the peer starts is answered: the peer reads oam's Close frame
+    /// (echoing its code) before the connection ends, so its closing
+    /// handshake is clean. The reply used to stay queued inside tungstenite
+    /// and the stream was dropped, which the peer reads as a reset.
+    #[tokio::test]
+    async fn a_peer_initiated_close_gets_its_close_reply() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        let registry: WsRegistry = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let ids = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let (near, far) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut ws = tokio_tungstenite::accept_async(far).await.unwrap();
+            ws.send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Normal,
+                reason: "done".into(),
+            })))
+            .await
+            .unwrap();
+            // The next thing read must be the client's Close reply.
+            ws.next().await
+        });
+        let outcome = ws_connect(
+            registry.clone(),
+            ids,
+            WsConnect {
+                url: "ws://no-such-host.invalid/chat".into(),
+                protocols: Vec::new(),
+                headers: Vec::new(),
+                supplied: Some(near),
+            },
+        )
+        .await;
+        assert!(
+            matches!(outcome, OpOutcome::Json(_)),
+            "the handshake must succeed"
+        );
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("the server must see the close complete")
+            .unwrap();
+        match reply {
+            Some(Ok(Message::Close(Some(frame)))) => {
+                assert_eq!(frame.code, CloseCode::Normal);
+            }
+            other => panic!("expected the client's Close reply, got {other:?}"),
+        }
     }
 
     /// #161: a refused loopback connect fails at once. Through tokio's own

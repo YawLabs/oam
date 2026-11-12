@@ -7,13 +7,15 @@
 //! The vendored tree (conformance/vendor/node/) carries a `package.json` with
 //! `{"type":"commonjs"}` so oam reads the bare `.js` files as CommonJS (oam
 //! defaults typeless `.js` outside node_modules to ESM, where `require` is
-//! undefined). An optional `manifest.json` marks per-test skips with reasons so
-//! the denominator is auditable. Emits conformance/node-suite-scorecard.json +
+//! undefined). Its `manifest.json` is required -- it carries the Node pin, the
+//! ratchet limits and the per-test skips with reasons, so the denominator is
+//! auditable -- and one that is missing, unparseable or carries a ratchet key
+//! this file does not know fails the run rather than disabling a limit. Emits conformance/node-suite-scorecard.json +
 //! CONFORMANCE-NODE.md (committed receipts), with per-module breakdown and BOTH
 //! pass/runnable and pass/total rates so the runnable filter can't hide
 //! exclusions.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -23,11 +25,13 @@ use std::time::Duration;
 use crate::conformance::{Captured, ensure_oam_built, repo_root, run_with_timeout};
 
 /// Modules vendored so far, longest-prefix-first so "string-decoder" wins over
-/// a generic "string" split. Drives the per-module breakdown.
+/// a generic "string" split. Drives the per-module breakdown, and through it
+/// the corpus description both receipts print (`corpus_modules`). A name
+/// belongs here only once its tests are vendored; the unit test
+/// `every_listed_module_has_vendored_tests` fails on one that matches no file.
 const MODULES: &[&str] = &[
     "string-decoder",
     "querystring",
-    "child-process",
     "buffer",
     "events",
     "assert",
@@ -89,6 +93,9 @@ pub(crate) fn run(release: bool) -> Result<()> {
     let oam = ensure_oam_built(&repo, release)?;
     let cache = std::env::temp_dir().join(format!("oam-node-suite-{}", std::process::id()));
     std::fs::create_dir_all(&cache)?;
+    // Per-pid and thrown away: removed when this function returns, on the
+    // error paths too. It used to be left behind after every run.
+    let _scratch = crate::conformance::ScratchDir(cache.clone());
 
     let vendor = repo.join("conformance/vendor/node");
     let parallel_dir = vendor.join("test/parallel");
@@ -100,6 +107,13 @@ pub(crate) fn run(release: bool) -> Result<()> {
     }
 
     let manifest = load_manifest(&vendor.join("manifest.json"))?;
+    let unenforced = unenforced_limits(&manifest);
+    if !unenforced.is_empty() {
+        println!(
+            "note: manifest.json sets no {} -- not enforced on this run",
+            unenforced.join(", ")
+        );
+    }
 
     let mut tests: Vec<PathBuf> = std::fs::read_dir(&parallel_dir)?
         .flatten()
@@ -142,6 +156,10 @@ pub(crate) fn run(release: bool) -> Result<()> {
     // partialSkip entry claims is there? An entry that no longer matches is
     // reported STALE below, the same as a deliberate entry that stopped failing.
     let mut partial_skip_marker_seen: BTreeSet<String> = BTreeSet::new();
+    // (name, attempts it took) for every test that failed at least once and
+    // then passed. Scored a pass like any other -- but a test that needs a
+    // second run is not the same fact as one that does not, so it is named.
+    let mut retried_passes: Vec<(String, usize)> = Vec::new();
     let (mut pass, mut fail) = (0usize, 0usize);
 
     for test in &tests {
@@ -173,9 +191,22 @@ pub(crate) fn run(release: bool) -> Result<()> {
                         FlagSupport::Supported(flags) => flags,
                         _ => Vec::new(),
                     };
-                    let result = run_test(&oam, test, &vendor, &cache, &flags, partial_skip);
+                    // `?`: a test that could not be STARTED says nothing about
+                    // oam. Scoring it would put a harness fault in the
+                    // denominator and then into both committed receipts, so
+                    // the run ends here, before anything is written.
+                    let result = run_test(&oam, test, &vendor, &cache, &flags, partial_skip)
+                        .with_context(|| {
+                            format!(
+                                "harness error: could not run {name}; nothing was scored \
+                                 and the receipts were left as they were"
+                            )
+                        })?;
                     if partial_skip && result.saw_skip_marker {
                         partial_skip_marker_seen.insert(key.clone());
+                    }
+                    if result.outcome == Outcome::Pass && result.attempts > 1 {
+                        retried_passes.push((name.clone(), result.attempts));
                     }
                     result.outcome
                 }
@@ -187,7 +218,12 @@ pub(crate) fn run(release: bool) -> Result<()> {
             Outcome::Pass => {
                 pass += 1;
                 slot[0] += 1;
-                println!("  PASS   {name}");
+                match retried_passes.last() {
+                    Some((retried, attempts)) if *retried == name => {
+                        println!("  PASS   {name}  (on attempt {attempts} of {MAX_ATTEMPTS})")
+                    }
+                    _ => println!("  PASS   {name}"),
+                }
             }
             Outcome::Skip(reason) => {
                 slot[2] += 1;
@@ -265,6 +301,7 @@ pub(crate) fn run(release: bool) -> Result<()> {
         skips: &skips,
         partial_skips: &partial_skip_entries,
         unrunnable: &unrunnables,
+        retried_passes: &retried_passes,
         total,
         pass,
         fail,
@@ -283,6 +320,17 @@ pub(crate) fn run(release: bool) -> Result<()> {
         skips.len(),
         unrunnables.len()
     );
+    if !retried_passes.is_empty() {
+        println!(
+            "  {} of the passes needed a retry: {}",
+            retried_passes.len(),
+            retried_passes
+                .iter()
+                .map(|(name, attempts)| format!("{name} ({attempts})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!(
         "{}",
         if rewrote {
@@ -319,23 +367,12 @@ pub(crate) fn run(release: bool) -> Result<()> {
     if !manifest.deliberate.is_empty() {
         println!(
             "deliberate divergences: {}/{} (ratchet ceiling) -- counted as failures, still in the denominator",
-            deliberate_failures.len(),
+            manifest.deliberate.len(),
             manifest
                 .max_deliberate
                 .map(|m| m.to_string())
                 .unwrap_or_else(|| "-".into())
         );
-    }
-    // A manifest entry that no longer fails is stale: the divergence was fixed
-    // (or the test moved) and the annotation now describes nothing. Say so
-    // rather than let it rot into a claim about a test that passes.
-    for name in manifest.deliberate.keys() {
-        let still_failing = deliberate_failures
-            .iter()
-            .any(|(n, _, _)| format!("parallel/{n}") == *name);
-        if !still_failing {
-            println!("  STALE  {name} is marked deliberate but did not fail -- drop the entry");
-        }
     }
     if !manifest.partial_skips.is_empty() {
         println!(
@@ -347,22 +384,24 @@ pub(crate) fn run(release: bool) -> Result<()> {
                 .unwrap_or_else(|| "-".into())
         );
     }
-    // Same staleness rule as `deliberate` above: an entry that no longer
-    // describes the test it names is a claim about nothing. A partialSkip
-    // overrides a marker, so an entry whose test prints no marker (it was
-    // fixed, it stopped feature-detecting, it never ran) is overriding nothing
-    // and should be dropped rather than left to rot.
-    for name in manifest.partial_skips.keys() {
-        if !partial_skip_marker_seen.contains(name) {
-            println!(
-                "  STALE  {name} is marked partialSkip but printed no TAP skip marker -- drop the entry"
-            );
-        }
+    // A manifest entry that no longer describes the test it names is a claim
+    // about nothing -- see `stale_manifest_entries`. Printed here, and failed
+    // below once the ratchet has had its say.
+    let failed_on_purpose: BTreeSet<String> = deliberate_failures
+        .iter()
+        .map(|(name, _, _)| format!("parallel/{name}"))
+        .collect();
+    let stale = stale_manifest_entries(&manifest, &failed_on_purpose, &partial_skip_marker_seen);
+    for line in &stale {
+        println!("  STALE  {line}");
     }
     if let Some(msg) = ratchet_violation(&Ratchet {
         skips: manifest_skips,
         known_issues: manifest.known_issues,
-        deliberate: deliberate_failures.len(),
+        // Manifest ENTRIES, the same thing `partial_skips` counts. Counting
+        // only the entries whose test failed let a stale one sit outside its
+        // own ceiling.
+        deliberate: manifest.deliberate.len(),
         partial_skips: manifest.partial_skips.len(),
         pass,
         max_skips: manifest.max_skips,
@@ -373,7 +412,49 @@ pub(crate) fn run(release: bool) -> Result<()> {
     }) {
         bail!("{msg}");
     }
+    // A stale entry fails the run, as a stale surface-gaps entry does. Left
+    // as a printed line it was a line nobody had to act on, and the entry
+    // went on holding a slot under its ceiling for a divergence that is gone.
+    if !stale.is_empty() {
+        bail!(
+            "stale manifest entries ({}): drop them from conformance/vendor/node/manifest.json \
+             and lower the matching ratchet ceiling.\n  {}",
+            stale.len(),
+            stale.join("\n  ")
+        );
+    }
     Ok(())
+}
+
+/// Manifest entries that no longer describe the test they name, one message
+/// each (empty when none).
+///
+/// * A `deliberate` entry whose test did not fail: the divergence was fixed
+///   (or the test moved, or it never ran), and the annotation now describes a
+///   test that passes.
+/// * A `partialSkip` entry whose test printed no TAP skip marker: the entry
+///   overrides a marker, so with none printed it overrides nothing.
+///
+/// `failed_on_purpose` and `marker_seen` hold manifest keys
+/// (`parallel/<file>`), as observed by the run.
+fn stale_manifest_entries(
+    manifest: &Manifest,
+    failed_on_purpose: &BTreeSet<String>,
+    marker_seen: &BTreeSet<String>,
+) -> Vec<String> {
+    let deliberate = manifest
+        .deliberate
+        .keys()
+        .filter(|key| !failed_on_purpose.contains(*key))
+        .map(|key| format!("{key} is marked deliberate but did not fail -- drop the entry"));
+    let partial = manifest
+        .partial_skips
+        .keys()
+        .filter(|key| !marker_seen.contains(*key))
+        .map(|key| {
+            format!("{key} is marked partialSkip but printed no TAP skip marker -- drop the entry")
+        });
+    deliberate.chain(partial).collect()
 }
 
 /// What one run measured, paired with the committed limits it must respect.
@@ -462,13 +543,45 @@ fn ratchet_violation(r: &Ratchet) -> Option<String> {
 /// printed a TAP skip marker. Read only for `partialSkip` manifest entries --
 /// an entry naming a test that no longer prints one describes nothing, and is
 /// reported STALE the same way a no-longer-failing `deliberate` entry is.
+///
+/// `attempts` is how many runs it took to get there (1 = the first run
+/// settled it). A pass with more than one is published by name: scored as a
+/// plain pass it was indistinguishable, in every receipt and in minPass, from
+/// a test that never fails.
 struct TestResult {
     outcome: Outcome,
     saw_skip_marker: bool,
+    attempts: usize,
 }
 
-/// Run one test, with a 3x flaky rerun: a Pass on any attempt wins; otherwise
-/// the last Fail/Skip stands.
+/// How many times one test may be run before its failure stands.
+const MAX_ATTEMPTS: usize = 3;
+
+/// Pause before re-trying a test that could not be started at all.
+const SPAWN_RETRY_PAUSE: Duration = Duration::from_millis(200);
+
+/// The colour-related variables removed from every test's environment.
+///
+/// oam reads all of them but CLICOLOR_FORCE (js/node_compat.js; that one is
+/// removed only to match the differential suite's scrub), so a suite launched from a
+/// terminal that exports one -- Yaw sets FORCE_COLOR=3 -- scored the
+/// util.inspect / console / styleText tests against that terminal rather than
+/// against oam. Unlike the differential suite this does NOT set NO_COLOR:
+/// there both sides only have to agree, while here node's tests assert
+/// against an environment where none of these is set
+/// (test-util-styletext.js expects styled output from a TTY with an empty
+/// override, which a NO_COLOR in the base environment turns off).
+const COLOUR_ENV: &[&str] = &[
+    "FORCE_COLOR",
+    "NO_COLOR",
+    "NODE_DISABLE_COLORS",
+    "CLICOLOR_FORCE",
+    "COLORTERM",
+];
+
+/// Run one test, re-running a failure up to `MAX_ATTEMPTS` times: a Pass on
+/// any attempt wins (and reports how many it took); otherwise the last Fail
+/// stands. See `score_with_retries` for what is and is not re-run.
 ///
 /// `partial_skip` comes from the manifest and means "this test's TAP skip
 /// marker does not describe how its run ended" -- see `classify_attempt`.
@@ -484,59 +597,87 @@ fn run_test(
     cache: &Path,
     flags: &[String],
     partial_skip: bool,
-) -> TestResult {
-    let mut last = TestResult {
-        outcome: Outcome::Fail("no attempt".to_string()),
-        saw_skip_marker: false,
-    };
-    for _ in 0..3 {
-        // Node-level flags go BEFORE the file, in the bare `oam <flags>
-        // <file>` form -- that is the shape oam's node-style parser reads,
-        // and it is what `node --no-warnings test.js` looks like.
-        let mut cmd = Command::new(oam);
-        for f in flags {
-            cmd.arg(f);
-        }
-        if flags.is_empty() {
-            cmd.arg("run").arg(test).arg("--no-check");
-        } else {
-            cmd.arg(test);
-        }
-        let out = match run_with_timeout(
-            cmd.env("OAM_CACHE_DIR", cache).current_dir(cwd),
-            // 60s was below the honest debug-build runtime of the slowest
-            // vendored tests (test-util-inspect-long-running takes ~90s here),
-            // which made their result depend on machine load rather than on
-            // correctness. Still bounded, so a genuine hang is still caught.
-            Duration::from_secs(150),
-        ) {
-            Ok(c) => c,
+) -> Result<TestResult> {
+    score_with_retries(
+        || {
+            // Node-level flags go BEFORE the file, in the bare `oam <flags>
+            // <file>` form -- that is the shape oam's node-style parser reads,
+            // and it is what `node --no-warnings test.js` looks like.
+            let mut cmd = Command::new(oam);
+            for f in flags {
+                cmd.arg(f);
+            }
+            if flags.is_empty() {
+                cmd.arg("run").arg(test).arg("--no-check");
+            } else {
+                cmd.arg(test);
+            }
+            for name in COLOUR_ENV {
+                cmd.env_remove(name);
+            }
+            run_with_timeout(
+                cmd.env("OAM_CACHE_DIR", cache).current_dir(cwd),
+                // 60s was below the honest debug-build runtime of the slowest
+                // vendored tests (test-util-inspect-long-running takes ~90s
+                // here), which made their result depend on machine load rather
+                // than on correctness. Still bounded, so a genuine hang is
+                // still caught.
+                Duration::from_secs(150),
+            )
+        },
+        partial_skip,
+    )
+}
+
+/// The retry policy, over a closure that performs one attempt, so the policy
+/// is unit-testable without spawning anything.
+///
+/// * A finished attempt that FAILED is re-run, up to `MAX_ATTEMPTS` in all.
+///   Everything else that finished is settled on the spot.
+/// * A TIMEOUT is settled too, as a failure. The deadline is already sized
+///   above the slowest honest test, so a run that reaches it is a hang, and
+///   re-running a hang costs the full deadline again each time for a verdict
+///   that then depends on machine load.
+/// * An attempt that could not be STARTED (`Err`: the binary is missing,
+///   locked, or busy being written) is no verdict at all. It uses up an
+///   attempt after a short pause, and if no attempt ever produced a verdict
+///   the error is returned so the caller can end the run instead of scoring
+///   a harness fault as a failing test.
+fn score_with_retries(
+    mut attempt: impl FnMut() -> Result<Captured>,
+    partial_skip: bool,
+) -> Result<TestResult> {
+    let mut last: Option<TestResult> = None;
+    let mut not_started: Option<anyhow::Error> = None;
+    for n in 1..=MAX_ATTEMPTS {
+        let out = match attempt() {
+            Ok(out) => out,
             Err(e) => {
-                return TestResult {
-                    outcome: Outcome::Fail(format!("harness error: {e}")),
-                    saw_skip_marker: false,
-                };
+                not_started = Some(e);
+                if n < MAX_ATTEMPTS {
+                    std::thread::sleep(SPAWN_RETRY_PAUSE);
+                }
+                continue;
             }
         };
-
         let saw_skip_marker = skip_marker_reason(&out.stdout).is_some();
-        // Only a Fail is worth re-running; everything else is settled.
-        match classify_attempt(&out, partial_skip) {
-            Outcome::Fail(detail) => {
-                last = TestResult {
-                    outcome: Outcome::Fail(detail),
-                    saw_skip_marker,
-                };
-            }
-            settled => {
-                return TestResult {
-                    outcome: settled,
-                    saw_skip_marker,
-                };
-            }
+        let outcome = classify_attempt(&out, partial_skip);
+        let rerun = matches!(outcome, Outcome::Fail(_)) && !out.timed_out;
+        let result = TestResult {
+            outcome,
+            saw_skip_marker,
+            attempts: n,
+        };
+        if !rerun {
+            return Ok(result);
         }
+        last = Some(result);
     }
-    last
+    match (last, not_started) {
+        (Some(result), _) => Ok(result),
+        (None, Some(e)) => Err(e),
+        (None, None) => bail!("no attempt was made"),
+    }
 }
 
 /// Score ONE finished attempt. Pure over the captured output, so the ordering
@@ -744,6 +885,18 @@ fn module_of(name: &str) -> String {
     "other".to_string()
 }
 
+/// The corpus as both receipts describe it: the modules that tests were
+/// actually filed under on this run, in the per-module table's order.
+/// `other` (a file matching no `MODULES` entry) is listed like any module, so
+/// a tranche vendored without updating `MODULES` shows up rather than hides.
+fn corpus_modules(by_module: &BTreeMap<String, [usize; 4]>) -> String {
+    by_module
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// manifest.json:
 /// {
 ///   "ratchet": { "maxSkips": N, "maxKnownIssues": M, "maxDeliberate": D,
@@ -802,6 +955,58 @@ struct Manifest {
     expected_total: Option<usize>,
 }
 
+/// Every key `load_manifest` reads out of `ratchet`. Anything else there is
+/// an error (a leading `_` marks a note, as `_doc` does at the top level).
+const RATCHET_KEYS: &[&str] = &[
+    "maxSkips",
+    "maxKnownIssues",
+    "maxDeliberate",
+    "maxPartialSkips",
+    "minPass",
+    "minPassByHost",
+    "expectedTotal",
+];
+
+/// A count from the manifest: `None` when the key is absent, an error when it
+/// is present but not a non-negative integer. `prefix` only names the key's
+/// home in the message.
+fn manifest_count(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    prefix: &str,
+) -> Result<Option<usize>> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(value) => match value.as_u64() {
+            Some(n) => Ok(Some(n as usize)),
+            None => {
+                bail!("manifest.json: {prefix}{key} must be a non-negative integer, found {value}")
+            }
+        },
+    }
+}
+
+/// The ratchet limits a manifest leaves unset, by key. An unset limit is not
+/// enforced, which is allowed -- but it is said, so a limit that went missing
+/// in an edit does not go missing quietly.
+fn unenforced_limits(m: &Manifest) -> Vec<&'static str> {
+    [
+        ("maxSkips", m.max_skips.is_none()),
+        ("maxKnownIssues", m.max_known_issues.is_none()),
+        ("maxDeliberate", m.max_deliberate.is_none()),
+        ("maxPartialSkips", m.max_partial_skips.is_none()),
+        (
+            "minPass",
+            m.min_pass.is_none() && m.min_pass_by_host.is_empty(),
+        ),
+        ("expectedTotal", m.expected_total.is_none()),
+    ]
+    .into_iter()
+    .filter(|(_, unset)| *unset)
+    .map(|(key, _)| key)
+    .collect()
+}
+
 fn load_manifest(path: &Path) -> Result<Manifest> {
     let mut m = Manifest {
         skips: BTreeMap::new(),
@@ -816,49 +1021,62 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
         min_pass_by_host: BTreeMap::new(),
         expected_total: None,
     };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Ok(m);
+    // Every failure below is an error, never an empty manifest. An empty one
+    // has no ceilings and no floor, so "could not read the limits" and "there
+    // are no limits" would be the same run -- and a ratchet key this parser
+    // does not know (`minpass`) or cannot read (`"429"`) would switch its
+    // limit off without a word.
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading the node-suite manifest {}", path.display()))?;
+    let v = serde_json::from_str::<Value>(&text)
+        .with_context(|| format!("parsing the node-suite manifest {}", path.display()))?;
+    let Some(top) = v.as_object() else {
+        bail!("manifest.json: the top level must be a JSON object");
     };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        return Ok(m);
+    let ratchet = match top.get("ratchet") {
+        None => None,
+        Some(r) => match r.as_object() {
+            Some(r) => Some(r),
+            None => bail!("manifest.json: \"ratchet\" must be a JSON object"),
+        },
     };
     // Top level, next to nodeVersion -- it describes the vendored CORPUS, not a
     // ratchet on oam's behavior. Accepted under "ratchet" too so a reader who
     // files it with the other numbers still gets the check rather than silence.
-    m.expected_total = v
-        .get("expectedTotal")
-        .or_else(|| v.get("ratchet").and_then(|r| r.get("expectedTotal")))
-        .and_then(|x| x.as_u64())
-        .map(|x| x as usize);
-    if let Some(r) = v.get("ratchet") {
-        m.max_skips = r
-            .get("maxSkips")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize);
-        m.max_known_issues = r
-            .get("maxKnownIssues")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize);
-        m.max_deliberate = r
-            .get("maxDeliberate")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize);
+    m.expected_total = match manifest_count(top, "expectedTotal", "")? {
+        Some(n) => Some(n),
+        None => match ratchet {
+            Some(r) => manifest_count(r, "expectedTotal", "ratchet.")?,
+            None => None,
+        },
+    };
+    if let Some(r) = ratchet {
+        if let Some(unknown) = r
+            .keys()
+            .find(|k| !k.starts_with('_') && !RATCHET_KEYS.contains(&k.as_str()))
+        {
+            bail!(
+                "manifest.json: unknown ratchet key \"{unknown}\". A limit under a name this \
+                 harness does not read is a limit that is not enforced; the keys are {}.",
+                RATCHET_KEYS.join(", ")
+            );
+        }
+        m.max_skips = manifest_count(r, "maxSkips", "ratchet.")?;
+        m.max_known_issues = manifest_count(r, "maxKnownIssues", "ratchet.")?;
+        m.max_deliberate = manifest_count(r, "maxDeliberate", "ratchet.")?;
         // Deliberately NOT maxSkips: that ceiling is 0 and means "no test may
         // leave the denominator by manifest fiat". A partialSkip does the
         // opposite -- it puts one back IN -- so folding the two into one number
         // would let a skip be traded for a partial skip with nothing to review.
-        m.max_partial_skips = r
-            .get("maxPartialSkips")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize);
-        m.min_pass = r
-            .get("minPass")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as usize);
-        if let Some(by_host) = r.get("minPassByHost").and_then(|x| x.as_object()) {
-            for (host, floor) in by_host {
-                if let Some(floor) = floor.as_u64() {
-                    m.min_pass_by_host.insert(host.clone(), floor as usize);
+        m.max_partial_skips = manifest_count(r, "maxPartialSkips", "ratchet.")?;
+        m.min_pass = manifest_count(r, "minPass", "ratchet.")?;
+        if let Some(by_host) = r.get("minPassByHost") {
+            let Some(by_host) = by_host.as_object() else {
+                bail!("manifest.json: ratchet.minPassByHost must be a JSON object");
+            };
+            for host in by_host.keys() {
+                if let Some(floor) = manifest_count(by_host, host, "ratchet.minPassByHost.")? {
+                    m.min_pass_by_host.insert(host.clone(), floor);
                 }
             }
         }
@@ -1158,6 +1376,10 @@ struct Scorecard<'a> {
     partial_skips: &'a [(String, String)],
     /// harness exclusions: (test, reason, why-class).
     unrunnable: &'a [(String, String, UnrunnableKind)],
+    /// passes that failed at least once first: (test, attempts it took).
+    /// Counted in `pass` like any other; named because a retried pass is the
+    /// only trace an intermittent failure leaves.
+    retried_passes: &'a [(String, usize)],
     /// every test file in the corpus, scored or not.
     total: usize,
     pass: usize,
@@ -1173,10 +1395,12 @@ fn write_scorecard(repo: &Path, oam: &Path, card: &Scorecard) -> Result<bool> {
         skips,
         partial_skips,
         unrunnable,
+        retried_passes,
         total,
         pass,
         fail,
     } = *card;
+    let corpus = corpus_modules(by_module);
     let oam_version = Command::new(oam)
         .arg("--version")
         .output()
@@ -1211,7 +1435,9 @@ fn write_scorecard(repo: &Path, oam: &Path, card: &Scorecard) -> Result<bool> {
         "oamVersion": oam_version,
         "nodeVersion": node_version,
         "host": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-        "corpus": "test/parallel: core modules (buffer, events, assert, util, querystring, string_decoder, url, path) + I/O-adjacent (stream, process, timers); fs/net/http vendored in later tranches",
+        // Derived from the files that ran, not written out by hand: a
+        // hand-kept list is wrong from the moment a tranche is vendored.
+        "corpus": format!("test/parallel: {corpus}"),
         "total": total,
         // pass + fail. Must stay the denominator `passOverRunnable` divides by.
         "runnable": scored,
@@ -1256,6 +1482,13 @@ fn write_scorecard(repo: &Path, oam: &Path, card: &Scorecard) -> Result<bool> {
                 "test": name, "firstDivergence": detail, "reason": reason,
             }))
             .collect::<Vec<_>>(),
+        // A SUBSET of `pass`: each failed at least once and passed on the
+        // attempt recorded (of at most MAX_ATTEMPTS). Empty on a run where
+        // every pass was a first-attempt pass.
+        "retriedPasses": retried_passes
+            .iter()
+            .map(|(name, attempts)| json!({ "test": name, "attempts": attempts }))
+            .collect::<Vec<_>>(),
     });
     // Held for the grouped write at the end -- see conformance::write_receipts.
     let scorecard_json = serde_json::to_string_pretty(&scorecard)?;
@@ -1269,6 +1502,11 @@ fn write_scorecard(repo: &Path, oam: &Path, card: &Scorecard) -> Result<bool> {
         std::env::consts::OS,
         std::env::consts::ARCH
     ));
+    // The stamp is NOT "the build these numbers were last checked on": the
+    // receipt is rewritten only when results change (conformance::
+    // write_receipts ignores the stamp), so it can trail HEAD by releases.
+    // Said in the file, where the reader of the stamp is.
+    md.push_str(crate::conformance::STAMP_NOTE);
     md.push_str("Oracle: a vendored Node core test passes when it runs to **exit 0** (Node tests self-assert via `require('../common')` + `assert`). `1..0 # Skipped` reclassifies a runtime skip, except for the `partialSkip` entries listed below; `// Flags:` and manifest entries are unrunnable-by-harness.\n\n");
     md.push_str(&format!(
         "**pass/runnable = {pass}/{scored} ({:.1}%)** &nbsp; pass/total = {pass}/{total} ({:.1}%)\n\n",
@@ -1296,7 +1534,20 @@ fn write_scorecard(repo: &Path, oam: &Path, card: &Scorecard) -> Result<bool> {
             pct(c[0], s)
         ));
     }
-    md.push_str("\nCorpus: core modules + the I/O-adjacent `stream` / `process` / `timers` tranche. The big socket/fixture-heavy modules (fs, net, http, child_process, tls) land in later tranches. pass/runnable drops as harder modules are added -- that is the honest denominator widening toward the >85% gate, not a regression; the pass COUNT is floored by ratchet.minPass.\n");
+    md.push_str(&format!("\nCorpus: Node's `test/parallel` files for {corpus}. A module not named here has no tests vendored yet. pass/runnable drops as harder modules are added -- that is the honest denominator widening, not a regression (this suite is a regression harness with a ratchet, not a release gate: the >85% gate is retired, see ROADMAP.md); the pass COUNT is floored by ratchet.minPass.\n"));
+    if !retried_passes.is_empty() {
+        md.push_str("\n## Passed only after a retry (counted as passes above)\n\n");
+        md.push_str(&format!(
+            "A failing test is re-run, up to {MAX_ATTEMPTS} attempts in all, and a pass on any \
+             attempt is scored a pass. Each of these failed at least once on this run before it \
+             passed, so its pass is not the same fact as the others'. A timeout is never re-run.\n\n"
+        ));
+        for (name, attempts) in retried_passes {
+            md.push_str(&format!(
+                "- `{name}` -- passed on attempt {attempts} of {MAX_ATTEMPTS}\n"
+            ));
+        }
+    }
     if !failures.is_empty() {
         md.push_str("\n## Failures (first divergence, triage backlog)\n\n");
         for (name, detail) in failures {
@@ -1668,9 +1919,9 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_skip_that_finishes_is_still_scored_a_skip_by_default() {
-        // Documents why the manifest opt-in exists, measured rather than
-        // assumed. On oam these two produce BYTE-IDENTICAL output --
+    fn a_manifest_partial_skip_is_scored_by_its_exit_code() {
+        // Why the manifest opt-in exists, measured rather than assumed. On
+        // oam these two produce BYTE-IDENTICAL output --
         // `1..0 # Skipped: missing crypto` on stdout, nothing else, exit 0:
         //
         //   test-stream-pipeline-http2.js  common.skip('missing crypto') at
@@ -1683,21 +1934,16 @@ mod tests {
         // -- common/index.js:54 -- and oam publishes the deps it really links.)
         // So NO output-only rule separates them, and scoring exit-0-with-marker
         // as a Pass in general would score the first test -- which asserted
-        // nothing -- as a pass. Skip stays the default for both.
-        let ran_on = attempt("1..0 # Skipped: missing crypto\n", 0, false);
-        let skipped_out = attempt("1..0 # Skipped: missing crypto\n", 0, false);
-        assert_eq!(
-            classify_attempt(&ran_on, false),
-            classify_attempt(&skipped_out, false)
-        );
-        assert!(matches!(classify_attempt(&ran_on, false), Outcome::Skip(_)));
-    }
-
-    #[test]
-    fn a_manifest_partial_skip_is_scored_by_its_exit_code() {
-        // The opt-in half of the pair above: the marker is not consulted, so
-        // the SAME bytes that scored Skip now score by how the process ended.
+        // nothing -- as a pass. Skip stays the default for both
+        // (marker_with_exit_zero_is_a_skip_carrying_its_reason pins that), and
+        // the only thing that tells them apart is the manifest flag: with it
+        // the marker is not consulted, so the SAME bytes score by how the
+        // process ended.
         let finished = attempt("1..0 # Skipped: missing crypto\n", 0, false);
+        assert_eq!(
+            classify_attempt(&finished, false),
+            Outcome::Skip("missing crypto".to_string())
+        );
         assert_eq!(classify_attempt(&finished, true), Outcome::Pass);
 
         // Overriding the marker must not override the exit code: a partialSkip
@@ -1790,6 +2036,256 @@ mod tests {
             Some("no reason given")
         );
         assert_eq!(skip_marker_reason("all good\n"), None);
+    }
+
+    // -- score_with_retries: what is re-run, and what a re-run leaves behind --
+
+    /// Feed `score_with_retries` a fixed sequence of attempts; returns its
+    /// result and how many attempts it actually made.
+    fn score(attempts: Vec<Result<Captured>>, partial_skip: bool) -> (Result<TestResult>, usize) {
+        let mut queue = attempts.into_iter();
+        let mut made = 0usize;
+        let result = score_with_retries(
+            || {
+                made += 1;
+                queue.next().expect("no more attempts were scripted")
+            },
+            partial_skip,
+        );
+        (result, made)
+    }
+
+    fn failing() -> Result<Captured> {
+        let mut out = attempt("", 1, false);
+        out.stderr = "AssertionError: 1 strictEqual 2".into();
+        Ok(out)
+    }
+
+    #[test]
+    fn a_first_attempt_pass_is_one_attempt() {
+        let (result, made) = score(vec![Ok(attempt("ok\n", 0, false))], false);
+        let result = result.expect("a verdict");
+        assert_eq!(result.outcome, Outcome::Pass);
+        assert_eq!((result.attempts, made), (1, 1));
+    }
+
+    #[test]
+    fn a_pass_after_a_failure_reports_the_attempt_it_took() {
+        let (result, made) = score(
+            vec![failing(), failing(), Ok(attempt("ok\n", 0, false))],
+            false,
+        );
+        let result = result.expect("a verdict");
+        assert_eq!(result.outcome, Outcome::Pass);
+        // The fact the receipts publish: this pass is not a first-run pass.
+        assert_eq!((result.attempts, made), (3, 3));
+    }
+
+    #[test]
+    fn a_failure_on_every_attempt_stands_after_the_last() {
+        let (result, made) = score(vec![failing(), failing(), failing()], false);
+        let result = result.expect("a verdict");
+        assert!(matches!(result.outcome, Outcome::Fail(_)));
+        assert_eq!((result.attempts, made), (MAX_ATTEMPTS, MAX_ATTEMPTS));
+    }
+
+    #[test]
+    fn a_timeout_is_not_run_again() {
+        // Only one attempt is scripted: asking for a second would panic.
+        let (result, made) = score(vec![Ok(attempt("", -2, true))], false);
+        let result = result.expect("a verdict");
+        assert_eq!(result.outcome, Outcome::Fail("[TIMEOUT]".to_string()));
+        assert_eq!((result.attempts, made), (1, 1));
+    }
+
+    #[test]
+    fn a_test_that_never_starts_is_an_error_not_a_failing_test() {
+        let (result, made) = score(
+            vec![
+                Err(anyhow::anyhow!("spawning oam: not found")),
+                Err(anyhow::anyhow!("spawning oam: not found")),
+                Err(anyhow::anyhow!("spawning oam: still not found")),
+            ],
+            false,
+        );
+        assert_eq!(made, MAX_ATTEMPTS);
+        match result {
+            Ok(result) => panic!(
+                "a test that never ran must not be scored, got {:?}",
+                result.outcome
+            ),
+            Err(e) => assert!(e.to_string().contains("still not found"), "{e}"),
+        }
+    }
+
+    #[test]
+    fn a_start_failure_followed_by_a_real_run_is_scored_on_the_run() {
+        let (result, made) = score(
+            vec![
+                Err(anyhow::anyhow!("spawning oam: text file busy")),
+                Ok(attempt("ok\n", 0, false)),
+            ],
+            false,
+        );
+        let result = result.expect("a verdict");
+        assert_eq!(result.outcome, Outcome::Pass);
+        assert_eq!((result.attempts, made), (2, 2));
+    }
+
+    // -- stale manifest entries fail the run, and both ceilings count entries --
+
+    #[test]
+    fn a_manifest_entry_that_describes_nothing_is_reported_stale() {
+        let mut manifest = manifest_naming(&[]);
+        for key in ["parallel/test-fails.js", "parallel/test-fixed.js"] {
+            manifest.deliberate.insert(key.into(), "why".into());
+        }
+        for key in ["parallel/test-marks.js", "parallel/test-silent.js"] {
+            manifest.partial_skips.insert(key.into(), "why".into());
+        }
+        let failed: BTreeSet<String> = ["parallel/test-fails.js".to_string()].into();
+        let marked: BTreeSet<String> = ["parallel/test-marks.js".to_string()].into();
+
+        let stale = stale_manifest_entries(&manifest, &failed, &marked);
+        assert_eq!(stale.len(), 2, "{stale:?}");
+        assert!(
+            stale[0].starts_with("parallel/test-fixed.js is marked deliberate"),
+            "{stale:?}"
+        );
+        assert!(
+            stale[1].starts_with("parallel/test-silent.js is marked partialSkip"),
+            "{stale:?}"
+        );
+
+        // Every entry still describing its test: nothing to report.
+        let failed: BTreeSet<String> = manifest.deliberate.keys().cloned().collect();
+        let marked: BTreeSet<String> = manifest.partial_skips.keys().cloned().collect();
+        assert!(stale_manifest_entries(&manifest, &failed, &marked).is_empty());
+    }
+
+    // -- the corpus description is derived, not written out --
+
+    #[test]
+    fn the_corpus_description_lists_the_modules_that_ran() {
+        let mut by_module: BTreeMap<String, [usize; 4]> = BTreeMap::new();
+        by_module.insert("stream".into(), [1, 0, 0, 0]);
+        by_module.insert("buffer".into(), [2, 1, 0, 0]);
+        by_module.insert("string_decoder".into(), [0, 0, 1, 0]);
+        assert_eq!(corpus_modules(&by_module), "buffer, stream, string_decoder");
+        // A file no MODULES entry claims is not hidden.
+        by_module.insert("other".into(), [0, 0, 0, 1]);
+        assert!(corpus_modules(&by_module).contains("other"));
+    }
+
+    #[test]
+    fn every_listed_module_has_vendored_tests() {
+        let dir = repo_root()
+            .expect("repo root")
+            .join("conformance/vendor/node/test/parallel");
+        let filed: BTreeSet<String> = std::fs::read_dir(&dir)
+            .expect("the vendored corpus is readable")
+            .flatten()
+            .map(|e| module_of(&e.file_name().to_string_lossy()))
+            .collect();
+        for module in MODULES {
+            assert!(
+                filed.contains(&module.replace('-', "_")),
+                "MODULES lists \"{module}\" but no vendored test is filed under it"
+            );
+        }
+    }
+
+    // -- the colour environment a test sees does not depend on the terminal --
+
+    #[test]
+    fn the_scrubbed_colour_variables_cover_what_oam_reads() {
+        for name in ["FORCE_COLOR", "NO_COLOR", "NODE_DISABLE_COLORS"] {
+            assert!(COLOUR_ENV.contains(&name), "{name} is not scrubbed");
+        }
+    }
+
+    // -- load_manifest: a manifest that cannot be read is not an empty one --
+
+    fn manifest_file(tag: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "oam-node-suite-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join("manifest.json");
+        std::fs::write(&path, body).expect("write");
+        path
+    }
+
+    fn load_error(tag: &str, body: &str) -> String {
+        let path = manifest_file(tag, body);
+        let msg = match load_manifest(&path) {
+            Ok(_) => panic!("`{body}` must not load"),
+            Err(e) => format!("{e:#}"),
+        };
+        let _ = std::fs::remove_dir_all(path.parent().expect("tmpdir"));
+        msg
+    }
+
+    #[test]
+    fn a_missing_or_unparseable_manifest_is_an_error() {
+        let missing = std::env::temp_dir().join(format!(
+            "oam-node-suite-no-such-manifest-{}.json",
+            std::process::id()
+        ));
+        assert!(load_manifest(&missing).is_err());
+        let msg = load_error("unparseable", "{ not json");
+        assert!(msg.contains("parsing the node-suite manifest"), "{msg}");
+        let msg = load_error("array", "[]");
+        assert!(msg.contains("must be a JSON object"), "{msg}");
+    }
+
+    #[test]
+    fn a_ratchet_key_the_harness_does_not_read_is_an_error() {
+        // One letter off, and the pass floor would simply not be there.
+        let msg = load_error("misspelled", r#"{"ratchet": {"minpass": 429}}"#);
+        assert!(msg.contains("unknown ratchet key \"minpass\""), "{msg}");
+        // Right name, unreadable value: same silence, same error.
+        let msg = load_error("mistyped", r#"{"ratchet": {"minPass": "429"}}"#);
+        assert!(msg.contains("ratchet.minPass must be"), "{msg}");
+        let msg = load_error(
+            "host-floor",
+            r#"{"ratchet": {"minPassByHost": {"linux-x86_64": -1}}}"#,
+        );
+        assert!(msg.contains("ratchet.minPassByHost.linux-x86_64"), "{msg}");
+        // A note is not a limit.
+        let path = manifest_file("note", r#"{"ratchet": {"_doc": "why", "minPass": 3}}"#);
+        assert_eq!(load_manifest(&path).expect("parse").min_pass, Some(3));
+        let _ = std::fs::remove_dir_all(path.parent().expect("tmpdir"));
+    }
+
+    #[test]
+    fn the_committed_manifest_loads_with_every_limit_set() {
+        let path = repo_root()
+            .expect("repo root")
+            .join("conformance/vendor/node/manifest.json");
+        let manifest = match load_manifest(&path) {
+            Ok(manifest) => manifest,
+            Err(e) => panic!("the committed manifest must load: {e:#}"),
+        };
+        assert_eq!(unenforced_limits(&manifest), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn an_unset_limit_is_named() {
+        let mut manifest = manifest_naming(&[]);
+        manifest.max_skips = Some(0);
+        manifest.min_pass_by_host.insert("linux-x86_64".into(), 1);
+        assert_eq!(
+            unenforced_limits(&manifest),
+            vec![
+                "maxKnownIssues",
+                "maxDeliberate",
+                "maxPartialSkips",
+                "expectedTotal"
+            ]
+        );
     }
 
     // -- corpus pin: the denominator is a committed number, not whatever is on disk --

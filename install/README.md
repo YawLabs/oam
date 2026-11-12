@@ -18,8 +18,16 @@ irm https://oamjs.org/install.ps1 | iex
 Both scripts: detect your OS/arch, resolve the release tag once, **verify the
 release** (see [Verification](#verification)), download the matching binary
 and check it against the verified checksums, install it to a per-user dir
-(`~/.oam/bin` or `%LOCALAPPDATA%\oam\bin`), and put it on PATH. No admin/sudo.
+(`~/.oam/bin` or `%LOCALAPPDATA%\oam\bin`). `install.ps1` then appends that
+dir to the user PATH; `install.sh` edits no shell profile and prints the
+`export PATH=...` line to add when the dir is not on PATH yet. No admin/sudo.
 Re-running upgrades in place.
+
+Both refuse to install where another `oam` earlier on PATH would still be the
+one that runs. `install.sh` checks this only when its install dir is already a
+PATH entry (the line it prints prepends the dir, so a dir not listed yet is not
+shadowed for good) and has no override; `install.ps1` appends, so it always
+checks, and `OAM_SKIP_PATH_SHADOW=1` installs anyway.
 
 ### Overrides (env vars)
 
@@ -29,6 +37,9 @@ Re-running upgrades in place.
 | `OAM_INSTALL_DIR` | install location | `~/.oam/bin` / `%LOCALAPPDATA%\oam\bin` |
 | `OAM_INSTALL_BASE` | asset base URL, for a mirror or CDN. Requires `OAM_VERSION`: the signature is checked against the tag you asked for, and a mirror cannot be asked which tag it serves | GitHub Releases |
 | `OAM_INSECURE_SKIP_SIGNATURE` | `1` installs a `v0.18.0`+ release on a host with no usable `ssh-keygen`, without checking its signature (loud). It skips only a missing tool: a bad signature or a missing manifest still fails | unset |
+| `OAM_SKIP_PATH_SHADOW` | `install.ps1` only: `1` installs even though another `oam` earlier on PATH would still be the one that runs (loud; the install takes effect once PATH is reordered) | unset |
+| `GH_TOKEN` | optional GitHub token (`GITHUB_TOKEN` is also accepted). The releases are public, so a normal install needs none; it is a fallback tried only when the unauthenticated download fails, e.g. a GitHub Enterprise mirror that requires auth | unset |
+| `OAM_GH_API` | GitHub API base used by the token fallback (set it for GitHub Enterprise) | `https://api.github.com` |
 
 ## Verification
 
@@ -49,6 +60,15 @@ verbatim) and `RELEASE-MANIFEST.sig`, an SSH signature over it (namespace
 
 A signature that is present but does not verify always fails, and so does a
 `v0.18.0`+ release with no manifest. There is no override for either.
+
+The `LICENSE`, `NOTICE` and `THIRD_PARTY_LICENSES.md` assets the installers
+copy into `licenses/` beside the binary are listed in the same `SHA256SUMS`
+(and so in the signed manifest) and are checked against it the same way,
+before the binary is put in place: a file whose sha256 differs stops the
+install with nothing changed. A release cut before the license files were
+checksummed does not list them; for those the installers install the binary,
+skip the license copy, and warn with a link to the files in the repository
+at that tag. A listed file that cannot be fetched is reported and skipped.
 
 Releases **before `v0.18.0`** were cut before signing existed. For those, the
 SHA-256 of the release's published `SHA256SUMS` must equal the value pinned in
@@ -134,7 +154,14 @@ oam-aarch64-unknown-linux-gnu        (not yet shipped -- needs an ARM Linux buil
 SHA256SUMS
 RELEASE-MANIFEST                     (v0.18.0 on)
 RELEASE-MANIFEST.sig                 (v0.18.0 on)
+LICENSE                              (v0.8.1 on; in SHA256SUMS after v0.19.5)
+NOTICE                               (v0.8.1 on; in SHA256SUMS after v0.19.5)
+THIRD_PARTY_LICENSES.md              (v0.8.1 on; in SHA256SUMS after v0.19.5)
 ```
+
+Releases up to v0.19.5 do not list the three license files in `SHA256SUMS`;
+the installers and `oam self-update` install a license file only when the
+verified checksums list it and its bytes match.
 
 `oam-x86_64-unknown-linux-gnu` is built on Debian 12 and needs glibc 2.34 or
 newer (Debian 12, Ubuntu 22.04, RHEL 9 and later). The release gates on that:
@@ -148,7 +175,7 @@ names. If you change a target triple, change it in `scripts/release-local.sh`
 ## Signing
 
 The release is signed (the manifest above, `scripts/lib/signing.sh`;
-`release-keys/README.md` is the runbook), and from `v0.18.0` so are the
+`release-keys/README.md` describes the keys), and from `v0.18.0` so are the
 binaries:
 
 - **Windows**: Authenticode through Azure Artifact Signing, publisher
@@ -179,12 +206,17 @@ the signed manifest, and renames it over the running oam (on Windows, the
 running exe moves aside to `oam.exe.old` first, as `install.ps1` does). A
 release before v0.18.0 has no signature; its `SHA256SUMS` must match the digest
 pinned in `release-keys/presigning-sums`. Without `--version` it never installs
-an older release than the running one. Any failure leaves the installed binary
-as it was. It updates oam where it currently lives, or `$OAM_INSTALL_DIR/oam`
+an older release than the running one. The license files in `licenses/` are
+handled as the installers handle them: each one the verified checksums list is
+checked before the binary is replaced, a mismatch stops the update, and an
+unlisted one is not installed (a note says where to read it). Any failure
+leaves the installed binary as it was. It updates oam where it currently lives, or `$OAM_INSTALL_DIR/oam`
 when that is set. `OAM_SELF_UPDATE_URL` (with `--version`) fetches the
 release's files from another base; they must still verify.
 
 ## Not yet wired
 
-- npm package `@yawlabs/oam` (a thin postinstall wrapper that fetches the
-  matching binary, esbuild-style).
+- The npm channel. The packages are prepared in `npm/` under the name `oamjs`
+  (a launcher plus one binary package per shipped target, selected through
+  `optionalDependencies`; no postinstall script), but nothing is published
+  yet. `npm/README.md` has the design.

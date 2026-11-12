@@ -4,9 +4,11 @@
 //! It scans EVERY workspace member -- the crates under `crates/` plus `xtask`
 //! itself -- and within each one every `.rs` file under `src/` and `tests/`,
 //! plus a top-level `build.rs`. `tests/` and `build.rs` are compiled Rust that
-//! CI builds and runs, and `xtask` is the gate's own tooling (no `[lints]`
-//! section, no `forbid(unsafe_code)`), so leaving any of the three out of the
-//! walk would make unsafe landing there invisible to every gate in the repo.
+//! CI builds and runs, and `xtask` is the gate's own tooling (it denies the
+//! clippy safety lints in its `[lints]` table but has no
+//! `forbid(unsafe_code)`), so leaving any of the three out of the walk would
+//! put unsafe landing there outside the ceiling: clippy would ask each site for
+//! a justification, and nothing would count it.
 //! `benches/` and `examples/` are NOT walked -- no crate in the tree has
 //! either; adding one means widening this walk again.
 //!
@@ -42,7 +44,11 @@
 //! `undocumented_unsafe_blocks = deny` (every unsafe block/impl carries a
 //! justification), `unnecessary_safety_comment = deny` (nothing that must NOT
 //! carry one does), and `missing_safety_doc = deny` (every public unsafe fn
-//! carries a `# Safety` section). Clippy checks each SITE, which counting lines
+//! carries a `# Safety` section). Each member's Cargo.toml `[lints.clippy]`
+//! table sets all three, `xtask`'s included; the `#![forbid(unsafe_code)]`
+//! crates (oam_diagnostics, oam_loader, oam_mcp) set only
+//! `unnecessary_safety_comment`, the one of the three that can still fire
+//! where no unsafe can exist. Clippy checks each SITE, which counting lines
 //! cannot do; a count can be ratcheted DOWNWARD over time, which clippy cannot
 //! do. This file keeps only the half clippy provably cannot: the per-crate
 //! `unsafe_count` CEILING.
@@ -258,8 +264,10 @@ fn measure_budget(repo: &Path) -> Result<Budget> {
         .filter(|p| p.is_dir())
         .collect();
     // `xtask` is a workspace member that does NOT live under `crates/`, and it
-    // is the gate's own tooling: no `[lints]` section, no `forbid(unsafe_code)`,
-    // so unsafe landing there is caught by nothing else. Its `name` derives from
+    // is the gate's own tooling: it has no `forbid(unsafe_code)`, and the clippy
+    // lints in its `[lints]` table ask a site for a justification without
+    // counting it, so unsafe landing there is held to a ceiling by nothing
+    // else. Its `name` derives from
     // `file_name()` -> "xtask" and it flows through the same loop; not being
     // under `crates/` there is no double-count. A missing `xtask/src` is skipped
     // by the `src.is_dir()` guard below rather than recorded as an empty crate.
@@ -1169,9 +1177,9 @@ mod tests {
 
     #[test]
     fn xtask_is_scanned_like_any_other_workspace_member() {
-        // xtask lives outside `crates/` and carries no [lints] section, so
-        // without this it is the one workspace member where unsafe is caught by
-        // nothing at all.
+        // xtask lives outside `crates/` and has no `forbid(unsafe_code)`, so
+        // without this it is the one workspace member whose unsafe no ceiling
+        // counts (its clippy lints only ask each site for a justification).
         let t = TempRepo::new("xtask");
         t.file("crates/oam_x/src/lib.rs", "pub fn f() {}\n");
         t.file("xtask/src/main.rs", "fn main() { unsafe { g(); } }\n");

@@ -26,8 +26,10 @@ pub mod cluster;
 /// option and `params()`.
 mod deflate;
 pub mod dns;
-/// `fs.watch` / `fs.promises.watch`: OS change notifications (inotify,
-/// ReadDirectoryChangesW, FSEvents) through the `notify` crate.
+pub mod fork_ipc;
+/// `fs.watch` / `fs.promises.watch`: OS change notifications -- inotify
+/// through the `inotify` crate on Linux, ReadDirectoryChangesW and FSEvents
+/// through the `notify` crate elsewhere.
 pub mod fs_watch;
 /// oam's own HTTP client transport for the `fetch` op (#143).
 pub mod http_client;
@@ -471,8 +473,11 @@ pub type BodyRegistry = http_client::body::FetchBodies;
 /// a handle whose read is IN FLIGHT (absent from the registry) records the
 /// handle here; the returning read sees it and drops the response instead of
 /// reinserting -- otherwise a cancelled body silently revives and holds its
-/// connection open for the rest of the run.
-pub type CancelledBodies = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u64>>>;
+/// connection open for the rest of the run. Only a read in flight gets a
+/// tombstone, and it takes it away when it returns
+/// (`http_client::body::CancelState`), so a cancel for a handle that is
+/// simply gone leaves nothing behind.
+pub type CancelledBodies = std::sync::Arc<std::sync::Mutex<http_client::body::CancelState>>;
 /// Outbound request-body channels: JS writes chunks, the fetch transport
 /// drains them. The receiver is taken by `fetch` when the request goes out;
 /// the sender stays here so later writes reach the in-flight request.
@@ -538,9 +543,107 @@ pub type BodyCancelSignal = std::sync::Arc<tokio::sync::Notify>;
 pub type OpenFile = std::sync::Arc<std::fs::File>;
 
 /// The descriptor table every fd-taking `fs` op resolves through.
-#[derive(Default)]
+///
+/// File descriptors are numbered HERE, not from the runtime's shared id
+/// counter (`CoreRuntime::body_ids`): an open takes the LOWEST FREE number at
+/// or above [`FIRST_OWN_FD`] and a close gives it back, as a POSIX descriptor
+/// table does and as node's programs see (`openSync` three times is three
+/// consecutive small numbers; close the middle one and the next open returns
+/// it). The numbers used to come from the shared counter, which only counts
+/// up: every open cost a number for the life of the process and nothing was
+/// ever reissued.
+///
+/// So a file fd is a number in its OWN space. It may equal a live socket's,
+/// body's or child's id -- those still come from the shared counter -- and
+/// that is harmless only because no lookup crosses kinds: an fs op resolves
+/// its number in this table and nowhere else, and no other registry is ever
+/// asked about an fd.
 pub struct FileState {
-    pub files: HashMap<u64, OpenFile>,
+    files: HashMap<u64, OpenFile>,
+    /// The keys of `files` that are dups of a descriptor the PARENT handed us
+    /// (`adopt_inherited_fd`), under the parent's number. Closing one closes
+    /// the parent's original too (see `close_descriptor`); closing one of our
+    /// own does not touch the OS descriptor of the same number, which on unix
+    /// is some unrelated descriptor of the process.
+    adopted: HashSet<u64>,
+    /// Numbers below `next_fd` that were issued and have since been closed,
+    /// lowest first.
+    free: std::collections::BTreeSet<u64>,
+    /// High-water mark: no number at or above it has been issued. Every
+    /// number in `FIRST_OWN_FD..next_fd` is open, in `free`, or was passed
+    /// over because the parent holds a descriptor there.
+    next_fd: u64,
+}
+
+impl Default for FileState {
+    fn default() -> Self {
+        Self {
+            files: HashMap::new(),
+            adopted: HashSet::new(),
+            free: std::collections::BTreeSet::new(),
+            next_fd: FIRST_OWN_FD,
+        }
+    }
+}
+
+impl FileState {
+    /// Register `file` under the lowest free descriptor number and return it.
+    ///
+    /// Never 0-2 (stdio), never a number the parent's descriptor still holds
+    /// (`inherited_eligible`: that one is the parent's to be adopted under,
+    /// until it is closed), never above int32 -- node's fd is an int32, and
+    /// `fd_arg` on the engine side refuses anything larger. A table that
+    /// full fails the open EMFILE, the errno a full descriptor table has.
+    pub fn insert(&mut self, file: std::fs::File) -> std::io::Result<u64> {
+        let fd = self.claim_lowest_free()?;
+        self.files.insert(fd, std::sync::Arc::new(file));
+        Ok(fd)
+    }
+
+    fn claim_lowest_free(&mut self) -> std::io::Result<u64> {
+        // Everything in `free` is below `next_fd`, and nothing at or above
+        // `next_fd` was ever issued, so the smallest entry is the lowest
+        // free number there is.
+        if let Some(fd) = self.free.pop_first() {
+            return Ok(fd);
+        }
+        loop {
+            let fd = self.next_fd;
+            if fd > MAX_FD {
+                // ERROR_TOO_MANY_OPEN_FILES / EMFILE.
+                let full = if cfg!(windows) { 4 } else { 24 };
+                return Err(std::io::Error::from_raw_os_error(full));
+            }
+            self.next_fd += 1;
+            // An adopted descriptor sits under the parent's number, and one
+            // not adopted yet still owns it.
+            if !self.files.contains_key(&fd) && !inherited_eligible(fd) {
+                return Ok(fd);
+            }
+        }
+    }
+
+    /// The open file behind `fd`, if this table holds one. No adoption: see
+    /// [`registered_file`] for the lookup the fs ops use.
+    pub fn get(&self, fd: u64) -> Option<&OpenFile> {
+        self.files.get(&fd)
+    }
+
+    /// Take `fd` out of the table and give its number back. The second half
+    /// of the pair is whether it was an adopted (inherited) descriptor.
+    ///
+    /// The number is returned to `free` only when an entry was really
+    /// removed, so closing a number twice frees it once: the second close
+    /// finds nothing (EBADF) and cannot hand the same number to two later
+    /// opens, nor free one that an open in between has already reissued.
+    fn remove(&mut self, fd: u64) -> Option<(OpenFile, bool)> {
+        let file = self.files.remove(&fd)?;
+        let adopted = self.adopted.remove(&fd);
+        if (FIRST_OWN_FD..self.next_fd).contains(&fd) {
+            self.free.insert(fd);
+        }
+        Some((file, adopted))
+    }
 }
 pub type FileRegistry = std::sync::Arc<std::sync::Mutex<FileState>>;
 
@@ -552,8 +655,7 @@ pub fn registered_file(registry: &FileRegistry, fd: u64) -> Option<OpenFile> {
         registry
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .files
-            .get(&fd)
+            .get(fd)
             .cloned()
     };
     // One lock on the hot path; adoption only on a miss.
@@ -568,7 +670,12 @@ pub fn registered_file(registry: &FileRegistry, fd: u64) -> Option<OpenFile> {
 
 /// Close `fd` as node's close does; false when it is not open (EBADF).
 ///
-/// An adopted descriptor (below OWN_FD_BASE) is a DUP of the parent's, so
+/// The number goes back to the table for the next open to take (see
+/// `FileState`). A second close of it is EBADF unless an open in between
+/// reissued it, in which case it closes THAT file -- the rule of every
+/// descriptor table, node's included.
+///
+/// An adopted descriptor (`FileState::adopted`) is a DUP of the parent's, so
 /// dropping ours closes only our copy: the original is closed too, or the
 /// peer of an inherited pipe never sees EOF -- which is precisely how a CDP
 /// child says "no more messages" on fd 4. The one exception is 0-2 on
@@ -582,13 +689,25 @@ pub fn close_descriptor(registry: &FileRegistry, fd: u64) -> bool {
     if cfg!(windows) && fd <= 2 {
         return guard.files.contains_key(&fd);
     }
-    let removed = guard.files.remove(&fd);
+    let removed = guard.remove(fd);
+    // An inherited number is retired while the registry is still locked,
+    // before the descriptor itself is closed: `adopt_inherited_fd` asks again
+    // under the same lock, so no op running on another thread can adopt the
+    // number between the close and the moment it is marked (when the kernel
+    // may already have given it to an unrelated open). Retired, it is an
+    // ordinary free number of the table from here on.
+    if matches!(removed, Some((_, true))) {
+        consume_inherited_fd(fd);
+    }
     drop(guard);
-    let Some(file) = removed else {
+    let Some((file, adopted)) = removed else {
         return false;
     };
     drop(file);
-    if fd < OWN_FD_BASE {
+    // Only for a descriptor the parent handed us. One of oam's own has no OS
+    // descriptor of its number: on unix OS fd `fd` is whatever the process
+    // happens to hold there, and closing it would close something unrelated.
+    if adopted {
         close_inherited_fd(fd);
         if let Some(closed) = STDIO_CLOSED.get(fd as usize) {
             closed.store(true, std::sync::atomic::Ordering::Release);
@@ -762,8 +881,10 @@ fn restore_position(file: &std::fs::File, saved: Option<u64>) {
 /// INVISIBLE to the other. Node has a single descriptor space, so
 /// `fs.readSync(fdFromAsyncOpen, ...)` works there and threw EBADF here; the
 /// reverse failed too. Both families always drew from the same id counter
-/// (`body_ids`), so the numbers never collided -- it was purely a failed
-/// lookup, which is why it failed loudly rather than reading the wrong file.
+/// (`body_ids`, at the time), so the numbers never collided -- it was purely a
+/// failed lookup, which is why it failed loudly rather than reading the wrong
+/// file. Descriptors are numbered by the table itself now (see `FileState`),
+/// one table for both families.
 ///
 /// Unifying costs nothing: `tokio::fs::File` IS a `std::fs::File` operated on
 /// `spawn_blocking`, so the async ops do that explicitly now and get one
@@ -771,24 +892,37 @@ fn restore_position(file: &std::fs::File, saved: Option<u64>) {
 /// -- see `fs_write_chunk`.
 pub type SyncFileRegistry = FileRegistry;
 
-/// First id the runtime hands out for its OWN descriptors.
+/// Lowest number the descriptor table hands out for a file oam opens itself:
+/// 0-2 are the process's stdio and are never reissued.
 ///
-/// oam's fds are synthetic -- registry keys, not OS descriptors -- and the
-/// counter used to start at 3. That is exactly where a parent's inherited
-/// descriptors live: a launcher that spawns us with
-/// `stdio: [...,'pipe','pipe']` hands us real OS fds 3 and 4, and oam's first
-/// `openSync` claimed key 3 and shadowed one of them. Starting above the
-/// inheritable window keeps the two spaces disjoint, so an unknown low fd is
-/// unambiguously "the parent gave me this" rather than "not open yet".
-///
-/// 0/1/2 are adopted the same way (see `inherited_eligible`), so the window
-/// is 0..OWN_FD_BASE.
-pub const OWN_FD_BASE: u64 = 64;
+/// oam's fds are synthetic -- table keys, not OS descriptors -- and 3 is
+/// exactly where a parent's inherited descriptors live: a launcher that
+/// spawns us with `stdio: [...,'pipe','pipe']` hands us real OS fds 3 and 4.
+/// An early version numbered its own files from 3 with no regard for that and
+/// its first `openSync` shadowed one of them; the next kept the two apart by
+/// starting its own numbers at 64, above the window, which also meant no
+/// program ever saw the small fds node gives it. The table now does what a
+/// kernel's does: a number the parent's descriptor holds (recorded at startup
+/// by `snapshot_inherited_fds`) is skipped until that descriptor is closed,
+/// so with 3 and 4 inherited the first open is 5 -- node's own answer -- and
+/// an fd the table does not hold is still unambiguous: it is the parent's if
+/// the snapshot says so, and EBADF otherwise.
+pub const FIRST_OWN_FD: u64 = 3;
 
-/// Largest fd oam will try to adopt from its parent. Above this a miss is a
-/// genuine EBADF. The CDP pipe convention uses 3 and 4; nothing real goes
-/// anywhere near the ceiling.
-pub const MAX_INHERITED_FD: u64 = OWN_FD_BASE - 1;
+/// Largest descriptor number: node's fd is an int32.
+pub const MAX_FD: u64 = i32::MAX as u64;
+
+/// Largest fd oam will try to adopt from its parent; 0/1/2 are adopted the
+/// same way (see `inherited_eligible`), so the window is 0..=63. Above it a
+/// miss is a genuine EBADF. The CDP pipe convention uses 3 and 4; nothing
+/// real goes anywhere near the ceiling.
+pub const MAX_INHERITED_FD: u64 = 63;
+
+/// Where the runtime's shared id counter (`CoreRuntime::body_ids`: sockets,
+/// servers, bodies, children -- everything but files) starts. Any start
+/// would do: those ids are keys of their own registries and are never
+/// looked up as descriptors, nor descriptors as them.
+pub const FIRST_HANDLE_ID: u64 = 64;
 
 #[cfg(windows)]
 mod crt_fd {
@@ -906,6 +1040,12 @@ fn dup_inherited(fd: u64) -> Option<std::fs::File> {
 /// (Windows) / kernel (unix) marks its own entry closed here, so nothing
 /// double-closes it at exit.
 pub fn close_inherited_fd(fd: u64) {
+    // Once the parent's original descriptor is closed its fd number is free
+    // for the kernel to reissue. The number is consumed BEFORE the close, so
+    // there is no moment at which it is closed and still adoptable -- see
+    // INHERITED_CONSUMED.
+    consume_inherited_fd(fd);
+
     #[cfg(unix)]
     if let Ok(raw) = i32::try_from(fd) {
         // SAFETY: closes the integer fd `raw`; no pointers are involved. The
@@ -928,11 +1068,6 @@ pub fn close_inherited_fd(fd: u64) {
     }
     #[cfg(not(any(unix, windows)))]
     let _ = fd;
-
-    // The parent's original descriptor is now closed and its fd number is free
-    // for the kernel to reissue. Consume the number so it can never be adopted
-    // again -- see INHERITED_CONSUMED.
-    consume_inherited_fd(fd);
 }
 
 /// The descriptors that were already open when the process started -- i.e. the
@@ -985,8 +1120,8 @@ fn inherited_eligible(fd: u64) -> bool {
 /// a single descriptor space: a file oam opens for ITSELF lands on OS fd 3, and
 /// a later `writeSync(3)` would then adopt oam's own descriptor. Reads and
 /// writes through it happen to match Node (Node's fd 3 is that same file), but
-/// `closeSync(3)` would not: it closes the descriptor the registry entry at 64
-/// still owns, leaving a dangling `File` whose fd the OS is free to hand to the
+/// `closeSync(3)` would not: it closes the descriptor a registry entry of
+/// oam's own still owns, leaving a dangling `File` whose fd the OS is free to hand to the
 /// next `open`. Aliasing two unrelated files is a corruption bug, not a parity
 /// one.
 ///
@@ -1195,13 +1330,22 @@ pub fn adopt_inherited_fd(registry: &SyncFileRegistry, fd: u64) -> bool {
         return false;
     }
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+    // Only ever the adopted dup: the table never issues one of its own under
+    // a number that is still eligible (`FileState::claim_lowest_free`).
     if guard.files.contains_key(&fd) {
         return true;
+    }
+    // Asked again now that the registry is locked: `close_descriptor` retires
+    // the number under this lock, so a close that ran while this call waited
+    // for it is seen here, before anything is duplicated.
+    if !inherited_eligible(fd) {
+        return false;
     }
     // Held across the dup so two ops racing on the same fd cannot both adopt.
     match dup_inherited(fd) {
         Some(file) => {
             guard.files.insert(fd, std::sync::Arc::new(file));
+            guard.adopted.insert(fd);
             true
         }
         None => false,
@@ -1217,7 +1361,16 @@ pub fn adopt_inherited_fd(registry: &SyncFileRegistry, fd: u64) -> bool {
 ///   NodeInflate decoders), truly incremental.
 /// - BrotliCompress/BrotliDecompress: pure-Rust brotli via the `brotli` crate.
 /// - HandleCompress/HandleDecompress: node's low-level zlib handle.
+/// - Stream: what the registry holds for a Transform's stream -- one of the
+///   four codecs above behind its own lock.
 pub enum ZlibStream {
+    /// A Transform's stream as registered (`ops::zlib_stream_create`): the
+    /// codec, shared and behind its own lock, as `Zstd` is. A write or a
+    /// `params()` holds the registry lock only to look the stream up and
+    /// this lock for the CPU work, so one stream's large chunk does not hold
+    /// up every other stream or the synchronous calls on the isolate thread.
+    /// `None` once a flush has taken the codec to finish it.
+    Stream(std::sync::Arc<std::sync::Mutex<Option<ZlibStream>>>),
     Compress(zlib::StreamCompressor),
     Decompress(zlib::StreamDecompressor),
     // Brotli state is large (~5 KB for the compressor); Box keeps the enum
@@ -1241,7 +1394,8 @@ pub type ZlibRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, ZlibStream>
 /// key [`CoreRuntime::spawn_handle_op`] files an op under. Tagged by kind
 /// even though every id below comes from the one `body_ids` counter: the tag
 /// costs nothing and keeps a stdin read from ever sharing a key with a
-/// socket.
+/// socket. No variant carries a file descriptor -- those are numbered by
+/// their own table (`FileState`) and may equal any id here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HandleKey {
     /// `process.stdin` (one read at a time; see [`crate::stdin::stdin_read`]).
@@ -1355,11 +1509,11 @@ pub struct CoreRuntime {
     fs_watches: fs_watch::FsWatchRegistry,
     #[cfg(any(windows, unix))]
     raw_children: child_extra::RawChildRegistry,
-    // Generic opaque-handle allocator (HTTP body ids, sync file fds, ...).
-    // Starts at 3 so file descriptors returned by openSync never collide with
-    // the reserved stdio fds 0 (stdin) / 1 (stdout) / 2 (stderr): the fs write
-    // shim routes fd 1/2 to the stdout/stderr sinks, which is only correct if a
-    // real file can never be handed those numbers (Node reserves them too).
+    // Generic opaque-handle allocator (HTTP body ids, sockets, servers,
+    // children, ...): counts up and never reissues. NOT file descriptors --
+    // the descriptor table numbers those itself, lowest free first (see
+    // `FileState`), so an fd may equal an id from here; each is only ever
+    // looked up in the registry of its own kind.
     next_body: std::sync::Arc<std::sync::atomic::AtomicU64>,
     outbound_bodies: OutboundBodies,
 }
@@ -1413,9 +1567,7 @@ impl CoreRuntime {
             op_handles: HashMap::new(),
             signals: HashMap::new(),
             bodies: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            cancelled_bodies: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashSet::new(),
-            )),
+            cancelled_bodies: CancelledBodies::default(),
             body_cancel_signal: std::sync::Arc::new(tokio::sync::Notify::new()),
             files: std::sync::Arc::new(std::sync::Mutex::new(FileState::default())),
             zlib_streams: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1430,8 +1582,7 @@ impl CoreRuntime {
             fs_watches: fs_watch::FsWatchRegistry::default(),
             #[cfg(any(windows, unix))]
             raw_children: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            // Starts above the inheritable-fd window, not at 3: see OWN_FD_BASE.
-            next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(OWN_FD_BASE)),
+            next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(FIRST_HANDLE_ID)),
             outbound_bodies: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
@@ -1531,8 +1682,10 @@ impl CoreRuntime {
         self.cancelled_bodies.clone()
     }
 
-    /// Allocator handle for new streaming bodies AND file handles (one id
-    /// space; the registries are separate).
+    /// Allocator handle for new streaming bodies, sockets, servers, children
+    /// and every other handle JS names by id -- one id space across separate
+    /// registries. File descriptors are NOT in it: `FileState` numbers those,
+    /// and reuses them.
     pub fn body_ids(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         self.next_body.clone()
     }
@@ -1573,6 +1726,21 @@ impl CoreRuntime {
         self.tcp.clone()
     }
 
+    /// Mark TCP stream `handle` as one the process may not exit on top of
+    /// (`tcp::tcp_linger_at_exit`): it is closed in order before any exit --
+    /// a hard one (`exit_process`, through the exit hook armed here) or the
+    /// end of the run (this runtime's drop).
+    pub fn linger_stream_at_exit(&self, handle: u64) {
+        let Some(runtime) = self.tokio.as_ref() else {
+            return;
+        };
+        if tcp::tcp_linger_at_exit(&self.tcp, handle) {
+            let runtime = runtime.handle().clone();
+            let registry = self.tcp.clone();
+            register_exit_hook(move || tcp::settle_lingering_blocking(&runtime, &registry));
+        }
+    }
+
     /// TLS socket registry (Arc clone; dies with the run).
     pub fn tls(&self) -> tls::TlsRegistry {
         self.tls.clone()
@@ -1598,7 +1766,6 @@ impl CoreRuntime {
         self.workers.clone()
     }
 
-    /// Child process registry (Arc clone; dies with the run).
     /// Enter the tokio runtime context for the duration of the returned
     /// guard. Required around any tokio type constructed on the V8 thread --
     /// notably `tokio::process::Command::spawn`, which registers the child
@@ -1608,6 +1775,7 @@ impl CoreRuntime {
         self.tokio.as_ref().map(|rt| rt.enter())
     }
 
+    /// Child process registry (Arc clone; dies with the run).
     pub fn children(&self) -> child::ChildRegistry {
         self.children.clone()
     }
@@ -1834,6 +2002,11 @@ impl Drop for CoreRuntime {
         // conn) turned exit into a 90-second hang. shutdown_background
         // drops everything without waiting.
         if let Some(runtime) = self.tokio.take() {
+            // Except the streams that must not be left to the process's end
+            // (the child_process IPC channel): those are closed in order
+            // first, which waits for their own peer's kernel to hold what
+            // was written, and briefly for the peer to close.
+            tcp::settle_lingering_blocking(runtime.handle(), &self.tcp);
             runtime.shutdown_background();
         }
     }
@@ -1933,6 +2106,53 @@ pub fn run_exit_cleanup() {
         } else {
             let _ = std::fs::remove_file(&path);
         }
+    }
+}
+
+/// Whether `address` lies inside an executable or shared library the
+/// process currently has mapped. The N-API registry asks this after
+/// unloading an addon: an unload that left the image in place (another
+/// handle is open, or the platform does not unmap it) means the addon's code
+/// can still run.
+///
+/// It errs toward `true`: a different image mapped at the same address
+/// since, or a platform with no way to ask, answers `true`.
+pub fn address_in_loaded_image(address: usize) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::LibraryLoader::{
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            GetModuleHandleExW,
+        };
+        let mut module = std::ptr::null_mut();
+        // SAFETY: with FROM_ADDRESS the second argument is an address to
+        // look up in the loader's module list, not a string: it is compared
+        // against the mapped ranges and never read through. UNCHANGED_REFCOUNT
+        // takes no reference on the module found, and `module` is a live
+        // local for the out-pointer.
+        let found = unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                address as *const u16,
+                &mut module,
+            )
+        };
+        found != 0
+    }
+    #[cfg(unix)]
+    {
+        let mut info = std::mem::MaybeUninit::<libc::Dl_info>::uninit();
+        // SAFETY: dladdr compares the address against the loaded objects'
+        // ranges and never reads through it; `info` is valid for the write,
+        // and is not read here.
+        let found = unsafe { libc::dladdr(address as *const libc::c_void, info.as_mut_ptr()) };
+        found != 0
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = address;
+        true
     }
 }
 
@@ -2281,6 +2501,20 @@ fn unix_errno_code(raw: i32) -> Option<&'static str> {
         libc::ETIMEDOUT => "ETIMEDOUT",
         libc::ETXTBSY => "ETXTBSY",
         libc::EXDEV => "EXDEV",
+        // The rest of libuv's names are not errnos on every unix, so each is
+        // listed only for the targets whose libc defines it.
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        libc::ENODATA => "ENODATA",
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        libc::ESOCKTNOSUPPORT => "ESOCKTNOSUPPORT",
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        libc::ENONET => "ENONET",
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        libc::EREMOTEIO => "EREMOTEIO",
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        libc::EUNATCH => "EUNATCH",
+        #[cfg(target_os = "macos")]
+        libc::EFTYPE => "EFTYPE",
         _ => return None,
     })
 }
@@ -2597,6 +2831,12 @@ pub struct FsError {
 /// and the read or write on it is what fails; `wx` and `ax` fail
 /// ERROR_FILE_EXISTS, the table's `EEXIST`; and an open of a root for writing
 /// is refused ERROR_ACCESS_DENIED, the table's `EPERM`, as node's is.
+///
+/// `path` is reserved: no rule here reads it (the ones that need the path
+/// looked at again live with the listing, above), and `whole_file_error` and
+/// `make_dir` only pass theirs through. It stays in the signature so the
+/// callers, which all have the OS path in hand, need no change when a rule
+/// does come to need it.
 pub fn fs_error_at(
     site: FsSite,
     syscall: &'static str,
@@ -2639,6 +2879,7 @@ pub fn fs_error_at(
             return at("EISDIR", syscall, true);
         }
     }
+    // `site` is read on Windows only; `path` is reserved (see the doc).
     let _ = (site, path);
     plain
 }
@@ -3082,20 +3323,19 @@ impl OpenFlags {
     /// - FILE_FLAG_BACKUP_SEMANTICS on every open, without which Windows
     ///   opens no directory;
     /// - a combination libuv has no case for (both access bits; both of
-    ///   sequential and random) is `EINVAL` before any call.
+    ///   sequential and random) is `EINVAL` before any call;
+    /// - the open's `mode` says one thing: FILE_ATTRIBUTE_READONLY for a
+    ///   creating open whose mode, less the umask, lacks the owner's write
+    ///   bit (#324).
     ///
-    /// Two things are not libuv's:
-    ///
-    /// - the open's `mode`: libuv adds FILE_ATTRIBUTE_READONLY for a creating
-    ///   open whose mode lacks the owner's write bit (#324);
-    /// - UV_FS_O_FILEMAP opens as libuv opens it -- a write-only open asks
-    ///   read access too, and a handle without standard information (a
-    ///   console, the pipe namespace) fails the open -- but no mapping is
-    ///   made: libuv does its reads and writes through one, emulating append
-    ///   and the access mode there, and opens an append-mode file read-write
-    ///   without the append swap; here it is an ordinary handle, which
-    ///   differs only together with O_APPEND or O_DIRECT
-    ///   (docs/node-divergences.md).
+    /// One thing is not libuv's: UV_FS_O_FILEMAP opens as libuv opens it -- a
+    /// write-only open asks read access too, and a handle without standard
+    /// information (a console, the pipe namespace) fails the open -- but no
+    /// mapping is made: libuv does its reads and writes through one,
+    /// emulating append and the access mode there, and opens an append-mode
+    /// file read-write without the append swap; here it is an ordinary
+    /// handle, which differs only together with O_APPEND or O_DIRECT
+    /// (docs/node-divergences.md).
     #[cfg(windows)]
     pub fn open_with_mode(
         self,
@@ -3628,6 +3868,10 @@ pub const COPYFILE_FICLONE_FORCE: u32 = 4;
 ///   the destination exists; the destination is then claimed with a
 ///   create-new open, so a destination made meanwhile is not overwritten,
 ///   and the claim is dropped again if the copy fails.
+/// - A copy onto the file itself -- the same path, a hard link to it or a
+///   link that leads to it -- succeeds and leaves the file as it was: libuv
+///   compares the two files' device and inode before it truncates anything
+///   (Unix), or after CopyFileW has refused with `EBUSY` (Windows).
 pub fn copy_file(from: &FsPath, to: &FsPath, mode: u32) -> std::io::Result<()> {
     #[cfg(windows)]
     if mode & COPYFILE_FICLONE_FORCE != 0 {
@@ -3638,7 +3882,20 @@ pub fn copy_file(from: &FsPath, to: &FsPath, mode: u32) -> std::io::Result<()> {
         ));
     }
     if mode & COPYFILE_EXCL == 0 {
-        return std::fs::copy(from, to).map(|_| ());
+        // std's copy truncates the destination as it opens it, so the
+        // same-file case has to be settled first off Windows.
+        #[cfg(unix)]
+        if copy_is_onto_itself(from, to) {
+            return Ok(());
+        }
+        return match std::fs::copy(from, to) {
+            Ok(_) => Ok(()),
+            // libuv's fs__copyfile: CopyFileW refuses a copy onto itself with
+            // a sharing violation, and an EBUSY is looked at again.
+            #[cfg(windows)]
+            Err(e) if node_error_code(&e) == "EBUSY" && copy_is_onto_itself(from, to) => Ok(()),
+            Err(e) => Err(e),
+        };
     }
     std::fs::metadata(from)?;
     std::fs::OpenOptions::new()
@@ -3648,6 +3905,34 @@ pub fn copy_file(from: &FsPath, to: &FsPath, mode: u32) -> std::io::Result<()> {
     std::fs::copy(from, to).map(|_| ()).inspect_err(|_| {
         let _ = std::fs::remove_file(to);
     })
+}
+
+/// Whether `from` and `to` name one file, as libuv's copyfile decides it:
+/// both stat (links followed) and the device and inode agree. A path that
+/// does not stat is not the same file as anything.
+#[cfg(unix)]
+fn copy_is_onto_itself(from: &FsPath, to: &FsPath) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(from), std::fs::metadata(to)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Whether `from` and `to` name one file, as libuv's fs__copyfile decides it
+/// after an `EBUSY`: both stat (links followed) and the volume serial number
+/// and file index agree.
+#[cfg(windows)]
+fn copy_is_onto_itself(from: &FsPath, to: &FsPath) -> bool {
+    // The record's exact integers: dev first, ino eighth (`StatRecord::new`).
+    let identity = |path: &FsPath| {
+        let record = ops::stat_path_record(path.os(), false).ok()?;
+        (record.numbers[ops::STAT_IDS_KNOWN] == 1.0).then_some((record.exact[0], record.exact[7]))
+    };
+    match (identity(from), identity(to)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// The link type a `symlink` call asked for, as node's JS hands it over:
@@ -4711,19 +4996,6 @@ mod fs_os_path_tests {
     }
 }
 
-/// Error code for an operation on an ALREADY-OPEN descriptor.
-///
-/// A descriptor was opened successfully, so there is no path left to be denied:
-/// the only way an fd read/write comes back "access denied" is that the handle
-/// is open in the wrong mode -- writing to an `r` fd, reading from a `w` one.
-/// libuv reports that as EBADF, and so does node:
-///
-///   writeSync(fdOpenedForRead, buf)
-///     node: EBADF: bad file descriptor, write
-///     oam:  EACCES: permission denied, write ''
-///
-/// Windows is what makes this show up: it returns ERROR_ACCESS_DENIED for a
-/// wrong-mode handle where POSIX returns EBADF directly.
 /// node's `stringToFlags` (lib/internal/fs/utils.js): the bits one of node's
 /// flag strings stands for. The JS layer makes the same translation before a
 /// flag reaches a native; this one serves the opens made on this side
@@ -4774,6 +5046,19 @@ pub fn write_all_checked(file: &std::fs::File, bytes: &[u8]) -> std::io::Result<
     file.write_all(bytes)
 }
 
+/// Error code for an operation on an ALREADY-OPEN descriptor.
+///
+/// A descriptor was opened successfully, so there is no path left to be denied:
+/// the only way an fd read/write comes back "access denied" is that the handle
+/// is open in the wrong mode -- writing to an `r` fd, reading from a `w` one.
+/// libuv reports that as EBADF, and so does node:
+///
+///   writeSync(fdOpenedForRead, buf)
+///     node: EBADF: bad file descriptor, write
+///     oam:  EACCES: permission denied, write ''
+///
+/// Windows is what makes this show up: it returns ERROR_ACCESS_DENIED for a
+/// wrong-mode handle where POSIX returns EBADF directly.
 ///
 /// POSIX needs its own arm even though it reports EBADF honestly, because
 /// `std::io::ErrorKind` has no BadFileDescriptor variant: raw errno 9 lands in
@@ -4794,27 +5079,29 @@ pub fn fd_error_code(error: &std::io::Error) -> &'static str {
     node_error_code(error)
 }
 
-/// fs.access semantics: existence always; W_OK (mode & 2) additionally
-/// requires the file not be read-only — Node throws EPERM on Windows for
-/// W_OK against a read-only file, and programs gate writes on exactly this
-/// call. X_OK is approximated as existence (wave 1).
 /// Node's `fs.access`. On failure returns (code, message, errno, and the Win32
 /// code behind an `UNKNOWN` -- `unknown_win32_error` -- or `None`).
+///
+/// On Unix it is access(2) with the caller's mode bits (F_OK, R_OK, W_OK,
+/// X_OK), as libuv's: the kernel answers for the real user, so ownership,
+/// group and a privileged caller all count, and every failure is the
+/// kernel's own errno.
 ///
 /// The errno rides along because both callers need it to build node's system-
 /// error shape and only this function still holds the `io::Error` it came
 /// from. Without it `fs.access`/`fs.promises.access` rejected with no `errno`
 /// at all (and the async form with no `syscall` or `path` either), where every
 /// sibling fs op carries all four. The Win32 code rides along for the same
-/// reason (#442); the sync caller keeps it, the async one does not yet.
+/// reason (#442); both callers keep it.
 ///
 /// The message names the path as `path.shown()` reports it, and so must the
 /// caller's `path` property.
 ///
 /// On Windows it is libuv's fs__access: the path's own attributes
 /// (GetFileAttributesW, which does not follow a link -- a dangling one is
-/// accessible), and W_OK refused only for a read-only FILE (directories
-/// cannot be read-only on Windows, libuv says).
+/// accessible), and W_OK refused `EPERM` only for a read-only FILE
+/// (directories cannot be read-only on Windows, libuv says); R_OK and X_OK
+/// ask nothing more than existence there, as in libuv.
 pub fn check_access(
     path: &FsPath,
     mode: i32,
@@ -4829,31 +5116,54 @@ pub fn check_access(
             unknown_win32_error(code, &e),
         )
     };
-    #[cfg(windows)]
-    let read_only = {
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
-        };
-        let attributes = win_fs::file_attributes(path.os()).map_err(failed)?;
-        attributes & FILE_ATTRIBUTE_READONLY != 0 && attributes & FILE_ATTRIBUTE_DIRECTORY == 0
-    };
-    #[cfg(not(windows))]
-    let read_only = std::fs::metadata(path)
-        .map_err(failed)?
-        .permissions()
-        .readonly();
-    if mode & 2 != 0 && read_only {
-        let code = if cfg!(windows) { "EPERM" } else { "EACCES" };
-        return Err((
-            code.to_string(),
-            format!("{code}: operation not permitted, access '{shown}'"),
-            // Synthesised (no io::Error behind it): the libuv numbers node
-            // reports for these two.
-            Some(if cfg!(windows) { -4048 } else { -13 }),
-            None,
-        ));
+    #[cfg(unix)]
+    {
+        use rustix::fs::Access;
+        // F_OK is no bit at all: an empty set asks for existence alone.
+        let mut wanted = Access::empty();
+        if mode & 4 != 0 {
+            wanted |= Access::READ_OK;
+        }
+        if mode & 2 != 0 {
+            wanted |= Access::WRITE_OK;
+        }
+        if mode & 1 != 0 {
+            wanted |= Access::EXEC_OK;
+        }
+        rustix::fs::access(path.os(), wanted).map_err(|e| failed(io_from_errno(e)))
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        #[cfg(windows)]
+        let read_only = {
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
+            };
+            let attributes = win_fs::file_attributes(path.os()).map_err(failed)?;
+            attributes & FILE_ATTRIBUTE_READONLY != 0 && attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        };
+        #[cfg(not(windows))]
+        let read_only = std::fs::metadata(path)
+            .map_err(failed)?
+            .permissions()
+            .readonly();
+        if mode & 2 != 0 && read_only {
+            // Synthesised (no io::Error behind it): the code, uv_strerror
+            // text and libuv number node reports -- EPERM on Windows.
+            let (code, text, errno) = if cfg!(windows) {
+                ("EPERM", "operation not permitted", -4048)
+            } else {
+                ("EACCES", "permission denied", -13)
+            };
+            return Err((
+                code.to_string(),
+                format!("{code}: {text}, access '{shown}'"),
+                Some(errno),
+                None,
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// node's `fs.chmod` of a path. On Windows it is libuv's (the CRT's
@@ -4893,7 +5203,10 @@ pub fn unlink_path(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
 }
 
-/// rm with Node semantics: file or directory, optional recursion.
+/// rm with Node semantics: file or directory, optional recursion. Anything
+/// that is not a directory itself -- a Windows directory symlink or junction
+/// included, whose `symlink_metadata` is a link -- is unlinked as libuv
+/// unlinks it (`unlink_path`): the link goes, what it leads to stays.
 pub fn remove_path(path: &str, recursive: bool) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
     if meta.is_dir() {
@@ -4903,7 +5216,7 @@ pub fn remove_path(path: &str, recursive: bool) -> std::io::Result<()> {
             std::fs::remove_dir(path)
         }
     } else {
-        std::fs::remove_file(path)
+        unlink_path(std::path::Path::new(path))
     }
 }
 
@@ -4916,8 +5229,9 @@ pub fn strip_unc_prefix(path: &std::path::Path) -> String {
     fs_shown_path(&path.to_string_lossy()).into_owned()
 }
 
-/// node:zlib backend (flate2 encoders, [`inflate::NodeInflate`] decoders,
-/// brotli). Sync fns serve the *Sync natives directly; the async ops below
+/// node:zlib backend (`deflate::NodeDeflate` encoders and
+/// [`inflate::NodeInflate`] decoders over miniz_oxide, with flate2 for the
+/// CRC-32 only; brotli). Sync fns serve the *Sync natives directly; the async ops below
 /// wrap them in spawn_blocking -- compression is CPU work and must not sit on
 /// the isolate thread for the callback forms.
 ///
@@ -5637,11 +5951,6 @@ pub mod ops {
         )
     }
 
-    /// `node_fail` for an operation on an already-open descriptor: no path, and
-    /// a wrong-mode denial reads as EBADF (see `fd_error_code`).
-    ///
-    /// These used to pass the HANDLE NUMBER as the path, so a failed stream
-    /// read reported `... read '64'` where node has no path at all.
     /// A failed fd operation other than a read or write (fstat, fsync,
     /// ftruncate, fchmod, fchown, futimes): node's code for the error as it is,
     /// and no path -- node's message ends at the syscall. These used to go
@@ -5658,6 +5967,11 @@ pub mod ops {
         )
     }
 
+    /// `node_fail` for an operation on an already-open descriptor: no path, and
+    /// a wrong-mode denial reads as EBADF (see `fd_error_code`).
+    ///
+    /// These used to pass the HANDLE NUMBER as the path, so a failed stream
+    /// read reported `... read '64'` where node has no path at all.
     fn node_fail_fd(error: std::io::Error, syscall: &str) -> OpOutcome {
         let code = super::fd_error_code(&error);
         OpOutcome::node_failed_io(
@@ -6676,8 +6990,8 @@ pub mod ops {
         // io_uring fast path (Linux, opt-in): non-append writes only (create +
         // truncate + write_all_at). `data` is moved in -- no clone on the happy
         // path. On a worker-channel failure write_file hands the un-consumed
-        // `data` back (a non-empty Vec) so we fall through to the std path with
-        // it; a genuine io error from the worker comes back with an empty Vec
+        // `data` back (`Some`, empty or not) so we fall through to the std path
+        // with it; a genuine io error from the worker comes back with `None`
         // and is surfaced directly (node_fail), matching the read path's
         // "io_uring is a pure optimization, never a correctness dependency"
         // contract. Append, the no-io_uring case and a `mode` other than the
@@ -6691,12 +7005,12 @@ pub mod ops {
                 match uring.write_file(path.os().to_string(), data).await {
                     Ok(()) => return OpOutcome::Done,
                     // Channel failure with the buffer recovered: retry via std.
-                    Err((_chan_err, recovered)) if !recovered.is_empty() => {
+                    Err((_chan_err, Some(recovered))) => {
                         return fs_write_file_std(path, recovered, append, mode).await;
                     }
-                    // Genuine io error (empty buffer), or an unrecoverable
-                    // channel failure where the data is gone: surface directly.
-                    Err((e, _)) => {
+                    // Genuine io error, or an unrecoverable channel failure
+                    // where the data is gone: surface directly.
+                    Err((e, None)) => {
                         return node_fail_whole_file(super::FsSite::WriteFile, e, &path);
                     }
                 }
@@ -7204,9 +7518,6 @@ pub mod ops {
         }
     }
 
-    /// `futimens(2)` / `SetFileTime`. Times arrive as milliseconds since the
-    /// unix epoch -- what the JS layer produces from a number, a Date or a
-    /// numeric string.
     /// Milliseconds since the epoch -> `timespec`.
     ///
     /// floor + remainder rather than a plain cast: for a negative time (before
@@ -7218,10 +7529,12 @@ pub mod ops {
     /// struct, so this has to be the type the call actually takes. `tv_sec` is
     /// `i64` on every target; `tv_nsec` is `i64` or `c_long` depending on the
     /// backend, hence the inferred cast.
+    ///
+    /// The sub-second part can round up to a whole second (999.9999999 ms);
+    /// it is carried into `tv_sec`, since a `tv_nsec` of 1e9 is `EINVAL`.
     #[cfg(unix)]
     fn to_timespec(ms: f64) -> rustix::fs::Timespec {
-        let secs = (ms / 1000.0).floor();
-        let nanos = ((ms - secs * 1000.0) * 1_000_000.0).round();
+        let (secs, nanos) = timespec_parts(ms);
         rustix::fs::Timespec {
             tv_sec: secs as _,
             tv_nsec: nanos as _,
@@ -7239,6 +7552,22 @@ pub mod ops {
         }
     }
 
+    /// The whole seconds and the nanoseconds (always 0..1e9) of a millisecond
+    /// time, as `to_timespec` lays them out.
+    #[cfg(unix)]
+    pub(crate) fn timespec_parts(ms: f64) -> (f64, f64) {
+        let secs = (ms / 1000.0).floor();
+        let nanos = ((ms - secs * 1000.0) * 1_000_000.0).round();
+        if nanos >= 1_000_000_000.0 {
+            (secs + 1.0, 0.0)
+        } else {
+            (secs, nanos)
+        }
+    }
+
+    /// `futimens(2)` / `SetFileTime`. Times arrive as milliseconds since the
+    /// unix epoch -- what the JS layer produces from a number, a Date or a
+    /// numeric string.
     fn futimes_file(file: &std::fs::File, atime_ms: f64, mtime_ms: f64) -> std::io::Result<()> {
         #[cfg(unix)]
         {
@@ -7622,10 +7951,11 @@ pub mod ops {
             ))
         };
         let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Some(stream)));
         streams
             .lock()
-            .expect("zlib stream registry lock")
-            .insert(handle, stream);
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(handle, super::ZlibStream::Stream(shared));
         OpOutcome::Json(serde_json::json!({ "handle": handle }).to_string())
     }
 
@@ -7639,8 +7969,28 @@ pub mod ops {
         chunk: Vec<u8>,
     ) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || {
-            let mut guard = streams.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(stream) = guard.get_mut(&handle) else {
+            // The registry lock is held for the lookup alone; the CPU work
+            // runs under the stream's own lock (`ZlibStream::Stream`).
+            let shared = match streams
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&handle)
+            {
+                Some(super::ZlibStream::Stream(shared)) => shared.clone(),
+                Some(_) => {
+                    return Err(Box::new(OpOutcome::Failed(
+                        "zlib handle: use its handle write, not zlibStreamWrite".into(),
+                    )));
+                }
+                None => {
+                    return Err(Box::new(OpOutcome::Failed(format!(
+                        "zlib stream: handle {handle} not found"
+                    ))));
+                }
+            };
+            let mut slot = shared.lock().unwrap_or_else(|e| e.into_inner());
+            // Flushed between the lookup and here: the stream is gone.
+            let Some(stream) = slot.as_mut() else {
                 return Err(Box::new(OpOutcome::Failed(format!(
                     "zlib stream: handle {handle} not found"
                 ))));
@@ -7661,7 +8011,8 @@ pub mod ops {
                     .map_err(|e| failed("brotli stream write", e)),
                 super::ZlibStream::HandleCompress(_)
                 | super::ZlibStream::HandleDecompress(_)
-                | super::ZlibStream::Zstd(_) => Err(Box::new(OpOutcome::Failed(
+                | super::ZlibStream::Zstd(_)
+                | super::ZlibStream::Stream(_) => Err(Box::new(OpOutcome::Failed(
                     "zlib handle: use its handle write, not zlibStreamWrite".into(),
                 ))),
             }
@@ -7688,8 +8039,17 @@ pub mod ops {
         let result = tokio::task::spawn_blocking(move || {
             let stream = streams
                 .lock()
-                .expect("zlib stream registry lock")
+                .unwrap_or_else(|e| e.into_inner())
                 .remove(&handle);
+            // The codec is taken out from behind the stream's own lock, which
+            // a write still in flight holds until it is done.
+            let stream = match stream {
+                Some(super::ZlibStream::Stream(shared)) => {
+                    let mut slot = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    slot.take()
+                }
+                other => other,
+            };
             let Some(stream) = stream else {
                 return Err(Box::new(OpOutcome::Failed(format!(
                     "zlib stream: handle {handle} not found"
@@ -7711,7 +8071,8 @@ pub mod ops {
                     .map_err(|e| Box::new(zlib_decode_failed("brotli stream flush", e))),
                 super::ZlibStream::HandleCompress(_)
                 | super::ZlibStream::HandleDecompress(_)
-                | super::ZlibStream::Zstd(_) => Err(Box::new(OpOutcome::Failed(
+                | super::ZlibStream::Zstd(_)
+                | super::ZlibStream::Stream(_) => Err(Box::new(OpOutcome::Failed(
                     "zlib handle: use close(), not zlibStreamFlush".into(),
                 ))),
             }
@@ -7735,8 +8096,19 @@ pub mod ops {
         level: Option<i32>,
     ) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || {
-            let mut guard = streams.lock().unwrap_or_else(|e| e.into_inner());
-            match guard.get_mut(&handle) {
+            // As a write: the registry lock for the lookup, the stream's own
+            // for the flush.
+            let shared = match streams
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&handle)
+            {
+                Some(super::ZlibStream::Stream(shared)) => shared.clone(),
+                Some(_) => return Ok(Vec::new()),
+                None => return Err(format!("zlib stream: handle {handle} not found")),
+            };
+            let mut slot = shared.lock().unwrap_or_else(|e| e.into_inner());
+            match slot.as_mut() {
                 Some(super::ZlibStream::Compress(enc)) => Ok(enc.params(level)),
                 Some(_) => Ok(Vec::new()),
                 None => Err(format!("zlib stream: handle {handle} not found")),
@@ -7772,12 +8144,17 @@ pub mod ops {
 
     /// zlibStreamClose: drop a stream without flushing. Synchronous --
     /// just removes the entry from the registry. Called by the JS side
-    /// when the Transform stream is destroyed before completion.
+    /// when the Transform stream is destroyed before completion. A write
+    /// still in flight holds its own reference to the stream, which is
+    /// freed when that write ends.
     pub fn zlib_stream_close(streams: &super::ZlibRegistry, handle: u64) {
-        streams
+        // Taken out under the lock, dropped after it: freeing a codec is not
+        // work to do with every other stream waiting.
+        let removed = streams
             .lock()
-            .expect("zlib stream registry lock")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&handle);
+        drop(removed);
     }
 
     /// zlibHandleCreate: allocate a low-level NodeDeflate or NodeInflate
@@ -7814,7 +8191,7 @@ pub mod ops {
         let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         streams
             .lock()
-            .expect("zlib registry lock")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(handle, stream);
         Ok(handle)
     }
@@ -7884,10 +8261,11 @@ pub mod ops {
     ) -> Result<u64, &'static str> {
         let engine = super::zstd::ZstdHandle::new(compress, pledged_src_size, dictionary, params)?;
         let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        streams.lock().expect("zlib registry lock").insert(
-            handle,
-            super::ZlibStream::Zstd(std::sync::Arc::new(std::sync::Mutex::new(engine))),
-        );
+        let engine = super::ZlibStream::Zstd(std::sync::Arc::new(std::sync::Mutex::new(engine)));
+        streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(handle, engine);
         Ok(handle)
     }
 
@@ -8024,7 +8402,6 @@ pub mod ops {
     /// about what a flag means. Resolves with Json {handle}.
     pub async fn fs_open(
         files: super::FileRegistry,
-        ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
         path: super::FsPath,
         flags: super::OpenFlags,
         mode: u32,
@@ -8041,13 +8418,14 @@ pub mod ops {
         };
         match opened {
             Ok(file) => {
-                let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                files
-                    .lock()
-                    .expect("file registry lock")
-                    .files
-                    .insert(handle, std::sync::Arc::new(file));
-                OpOutcome::Json(serde_json::json!({ "handle": handle }).to_string())
+                // The table's lowest free number, as the sync open takes.
+                let claimed = files.lock().unwrap_or_else(|e| e.into_inner()).insert(file);
+                match claimed {
+                    Ok(handle) => {
+                        OpOutcome::Json(serde_json::json!({ "handle": handle }).to_string())
+                    }
+                    Err(e) => node_fail_at(super::FsSite::Open(flags), e, "open", &path),
+                }
             }
             Err(e) => node_fail_at(super::FsSite::Open(flags), e, "open", &path),
         }
@@ -8071,7 +8449,23 @@ pub mod ops {
         len: usize,
         position: Option<i64>,
     ) -> OpOutcome {
-        let Some(file) = super::registered_file(&files, handle) else {
+        fs_read_chunk_of(super::registered_file(&files, handle), len, position).await
+    }
+
+    /// [`fs_read_chunk`] on a descriptor the caller has already resolved
+    /// (`None`: not open, EBADF).
+    ///
+    /// The engine resolves the number when JS makes the call, not when this
+    /// future first runs on a pool thread: descriptor numbers are reissued
+    /// (see `FileState`), so `fs.read(fd, ...)` followed in the same turn by
+    /// `closeSync(fd)` and an open that takes the number back must still read
+    /// the file `fd` named when the read was issued.
+    pub async fn fs_read_chunk_of(
+        file: Option<super::OpenFile>,
+        len: usize,
+        position: Option<i64>,
+    ) -> OpOutcome {
+        let Some(file) = file else {
             return node_fail_ebadf("read");
         };
         // Exactly `len`, unclamped -- same as the sync twin's `vec![0u8; length]`.
@@ -8116,7 +8510,19 @@ pub mod ops {
         bytes: Vec<u8>,
         position: Option<i64>,
     ) -> OpOutcome {
-        let Some(file) = super::registered_file(&files, handle) else {
+        fs_write_chunk_of(super::registered_file(&files, handle), bytes, position).await
+    }
+
+    /// [`fs_write_chunk`] on a descriptor the caller has already resolved
+    /// (`None`: not open, EBADF) -- resolved at the call for the reason
+    /// [`fs_read_chunk_of`] gives, and here the stake is a write landing in
+    /// the wrong file.
+    pub async fn fs_write_chunk_of(
+        file: Option<super::OpenFile>,
+        bytes: Vec<u8>,
+        position: Option<i64>,
+    ) -> OpOutcome {
+        let Some(file) = file else {
             return node_fail_ebadf("write");
         };
         // Node's contract is callback-after-syscall.
@@ -8147,6 +8553,7 @@ pub mod ops {
     /// ReadableStream lock guarantees a single reader per handle. A cancel
     /// that landed while the read was in flight drops the body instead of
     /// reinserting it.
+    pub use crate::http_client::body::cancel as fetch_body_cancel;
     pub use crate::http_client::body::read as fetch_body_read;
     pub use crate::http_client::body::take_trailers as fetch_body_trailers;
 
@@ -10102,14 +10509,184 @@ mod tests {
         assert!(ops::fstat_record(&stderr).is_ok());
         assert!(close_descriptor(&registry, 2));
         assert!(registered_file(&registry, 2).is_some());
-        assert!(registered_file(&registry, OWN_FD_BASE + 12345).is_none());
-        assert!(!close_descriptor(&registry, OWN_FD_BASE + 12345));
+        assert!(registered_file(&registry, 12345).is_none());
+        assert!(!close_descriptor(&registry, 12345));
     }
 
-    /// A descriptor with several ops in flight at once must serve all of them,
-    /// as node does. The chunk ops used to take the file out of the registry
-    /// for their IO await, so every op that started while another was in
-    /// flight found the slot empty and failed with EBADF.
+    /// A file of its own for each descriptor-table test.
+    fn table_test_file(tag: &str) -> std::fs::File {
+        let path = std::env::temp_dir().join(format!("oam-fd-table-{}-{tag}", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        file
+    }
+
+    /// The table numbers files as a POSIX descriptor table does: the lowest
+    /// free number from 3 up, given back on close. (Six descriptors at most,
+    /// so the numbers stay below the 9 that
+    /// `closed_inherited_fd_is_not_re_adopted` plants in the process-wide
+    /// snapshot.)
+    #[test]
+    fn the_table_issues_the_lowest_free_number_and_reuses_a_closed_one() {
+        let registry: FileRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(FileState::default()));
+        let open = |tag: &str| {
+            registry
+                .lock()
+                .unwrap()
+                .insert(table_test_file(tag))
+                .unwrap()
+        };
+        assert_eq!(
+            [open("a"), open("b"), open("c"), open("d")],
+            [3, 4, 5, 6],
+            "consecutive from FIRST_OWN_FD"
+        );
+
+        // The middle one closed is the next one issued; then the table grows.
+        assert!(close_descriptor(&registry, 4));
+        assert!(registered_file(&registry, 4).is_none());
+        assert_eq!(open("e"), 4);
+        assert_eq!(open("f"), 7);
+
+        // Several free: the lowest first, whatever order they were closed in.
+        assert!(close_descriptor(&registry, 6));
+        assert!(close_descriptor(&registry, 3));
+        assert!(close_descriptor(&registry, 5));
+        assert_eq!([open("g"), open("h"), open("i")], [3, 5, 6]);
+    }
+
+    /// Closing a number twice is EBADF the second time and frees it ONCE: two
+    /// later opens get two numbers. And a stale second close that lands after
+    /// the number was reissued closes that file and frees the number once
+    /// more -- it is never left free while a file is open under it.
+    #[test]
+    fn a_double_close_is_ebadf_and_frees_the_number_once() {
+        let registry: FileRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(FileState::default()));
+        let open = |tag: &str| {
+            registry
+                .lock()
+                .unwrap()
+                .insert(table_test_file(tag))
+                .unwrap()
+        };
+        let (a, b) = (open("j"), open("k"));
+        assert_eq!((a, b), (3, 4));
+        assert!(close_descriptor(&registry, a));
+        assert!(!close_descriptor(&registry, a), "already closed: EBADF");
+        assert!(!close_descriptor(&registry, a));
+        let (c, d) = (open("l"), open("m"));
+        assert_eq!((c, d), (3, 5), "freed once, so issued once");
+
+        // Never opened, and far above the table: EBADF, and the table does
+        // not come to believe the number is free.
+        assert!(!close_descriptor(&registry, 1000));
+        assert_eq!(open("n"), 6);
+        assert!(registered_file(&registry, 1000).is_none());
+
+        // 0-2 are never issued, even once closed (Windows keeps them open;
+        // on unix closing one here would take the test runner's stdio, so
+        // only the numbering is asserted).
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .free
+                .iter()
+                .all(|&fd| fd >= FIRST_OWN_FD)
+        );
+    }
+
+    /// Numbers stay within int32: a table grown to the ceiling fails the next
+    /// open EMFILE rather than issue a number node's fd type cannot hold.
+    #[test]
+    fn the_table_never_issues_a_number_above_int32() {
+        let mut state = FileState {
+            next_fd: MAX_FD,
+            ..FileState::default()
+        };
+        assert_eq!(state.insert(table_test_file("o")).unwrap(), MAX_FD);
+        let full = state.insert(table_test_file("p")).unwrap_err();
+        assert_eq!(node_error_code(&full), "EMFILE");
+        // A close makes room again.
+        assert!(state.remove(MAX_FD).is_some());
+        assert_eq!(state.insert(table_test_file("q")).unwrap(), MAX_FD);
+    }
+
+    /// The async open takes its number from the same table as the sync one,
+    /// and a read issued on a descriptor keeps the FILE it named: the engine
+    /// resolves at the call (`fs_read_chunk_of`), so closing the number and
+    /// reissuing it before the read runs does not redirect the read.
+    #[test]
+    fn an_issued_read_keeps_its_file_when_the_number_is_reissued() {
+        let dir = std::env::temp_dir().join(format!("oam-fd-reissue-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("one"), b"ONE").unwrap();
+        std::fs::write(dir.join("two"), b"TWO").unwrap();
+        let mut core = CoreRuntime::new().unwrap();
+        let files = core.files();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut open = |name: &str| {
+            core.spawn_op(ops::fs_open(
+                files.clone(),
+                FsPath::new(dir.join(name).to_string_lossy().into_owned()),
+                open_options_for("r"),
+                0o666,
+            ));
+            match core
+                .recv_deadline(Some(deadline))
+                .expect("open completes")
+                .outcome
+            {
+                OpOutcome::Json(json) => serde_json::from_str::<serde_json::Value>(&json).unwrap()
+                    ["handle"]
+                    .as_u64()
+                    .unwrap(),
+                _ => panic!("open of {name} failed"),
+            }
+        };
+        let one = open("one");
+        assert_eq!(one, FIRST_OWN_FD);
+        let issued = registered_file(&files, one);
+        assert!(close_descriptor(&files, one));
+        let two = open("two");
+        assert_eq!(two, one, "the closed number is reissued");
+        core.spawn_op(ops::fs_read_chunk_of(issued, 3, Some(0)));
+        let done = core.recv_deadline(Some(deadline)).expect("read completes");
+        assert!(matches!(&done.outcome, OpOutcome::Bytes(b) if b == b"ONE"));
+        core.spawn_op(ops::fs_read_chunk(files.clone(), two, 3, Some(0)));
+        let done = core.recv_deadline(Some(deadline)).expect("read completes");
+        assert!(matches!(&done.outcome, OpOutcome::Bytes(b) if b == b"TWO"));
+        assert!(close_descriptor(&files, two));
+        drop(core);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file fd and a socket / body / child id are numbers in different
+    /// spaces: the shared counter does not move when files open, and the
+    /// descriptor table does not move when ids are drawn.
+    #[test]
+    fn file_descriptors_do_not_come_from_the_shared_id_counter() {
+        let core = CoreRuntime::new().unwrap();
+        let ids = core.body_ids();
+        let before = ids.load(std::sync::atomic::Ordering::Relaxed);
+        let files = core.files();
+        let fd = files.lock().unwrap().insert(table_test_file("r")).unwrap();
+        assert_eq!(fd, FIRST_OWN_FD);
+        assert_eq!(ids.load(std::sync::atomic::Ordering::Relaxed), before);
+        let body = core.new_outbound_body();
+        assert_eq!(body, before);
+        let next = files.lock().unwrap().insert(table_test_file("s")).unwrap();
+        assert_eq!(next, FIRST_OWN_FD + 1);
+    }
+
     /// node's positions through libuv: -1 is the cursor everywhere; any other
     /// negative is the cursor on unix, and on Windows goes to the OS, which
     /// takes -2 as "at the cursor, which does not move" and refuses -5 with
@@ -10155,6 +10732,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A descriptor with several ops in flight at once must serve all of them,
+    /// as node does. The chunk ops used to take the file out of the registry
+    /// for their IO await, so every op that started while another was in
+    /// flight found the slot empty and failed with EBADF.
     #[test]
     fn concurrent_chunk_ops_on_one_descriptor_all_reach_it() {
         let dir = std::env::temp_dir().join(format!("oam-fd-shared-{}", std::process::id()));
@@ -10165,17 +10746,13 @@ mod tests {
         let mut core = CoreRuntime::new().unwrap();
         let files = core.files();
         let file = open_options_for("r+").open(&path).unwrap();
-        files
-            .lock()
-            .unwrap()
-            .files
-            .insert(OWN_FD_BASE, std::sync::Arc::new(file));
+        let fd = files.lock().unwrap().insert(file).unwrap();
 
         // A positional read leaves the cursor where it was: a cursor read
         // after it starts at 0. (Checked alone: on Windows, as in libuv, a
         // positional op saves and restores the cursor, so where CONCURRENT
         // ones leave it depends on their interleaving.)
-        let file = registered_file(&files, OWN_FD_BASE).expect("registered");
+        let file = registered_file(&files, fd).expect("registered");
         let mut two = [0u8; 2];
         assert_eq!(read_at(&file, &mut two, Some(10)).unwrap(), 2);
         assert_eq!(&two, b"KL");
@@ -10186,19 +10763,14 @@ mod tests {
 
         let mut reads = HashMap::new();
         for i in 0..8i64 {
-            let id = core.spawn_op(ops::fs_read_chunk(
-                files.clone(),
-                OWN_FD_BASE,
-                2,
-                Some(i * 2),
-            ));
+            let id = core.spawn_op(ops::fs_read_chunk(files.clone(), fd, 2, Some(i * 2)));
             reads.insert(id, i);
         }
         let mut writes = Vec::new();
         for i in 0..4i64 {
             writes.push(core.spawn_op(ops::fs_write_chunk(
                 files.clone(),
-                OWN_FD_BASE,
+                fd,
                 vec![b'0' + i as u8],
                 Some(20 + i),
             )));
@@ -10219,8 +10791,8 @@ mod tests {
         }
 
         // Closing drops the registry's reference; the next op is EBADF.
-        files.lock().unwrap().files.remove(&OWN_FD_BASE);
-        core.spawn_op(ops::fs_read_chunk(files.clone(), OWN_FD_BASE, 2, None));
+        assert!(close_descriptor(&files, fd));
+        core.spawn_op(ops::fs_read_chunk(files.clone(), fd, 2, None));
         let done = core.recv_deadline(Some(deadline)).expect("op completes");
         assert!(
             matches!(&done.outcome, OpOutcome::NodeFailed { code, .. } if code == "EBADF"),
@@ -10513,6 +11085,10 @@ mod unlink_path_tests {
         let made = std::os::windows::fs::symlink_dir(&target, &link);
         #[cfg(unix)]
         let made = std::os::unix::fs::symlink(&target, &link);
+        // Only Windows may refuse the link (no Developer Mode, no
+        // SeCreateSymbolicLinkPrivilege); anywhere else a refusal is a failure.
+        #[cfg(unix)]
+        made.as_ref().expect("a symlink needs no privilege here");
         if made.is_ok() {
             super::unlink_path(&link).unwrap();
             assert!(
@@ -10520,11 +11096,139 @@ mod unlink_path_tests {
                 "the link is gone"
             );
             assert!(target.is_dir(), "its target is not");
+        } else {
+            eprintln!(
+                "SKIPPED the directory-link half of \
+                 unlink_removes_a_directory_link_but_not_a_directory: this \
+                 account may not create a symlink ({made:?})"
+            );
         }
         assert!(
             super::unlink_path(&target).is_err(),
             "a directory is no file to unlink"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// rm of a directory link removes the link, recursive or not, and leaves
+    /// what it leads to -- contents included.
+    #[test]
+    fn remove_path_removes_a_directory_link_and_keeps_its_target() {
+        let dir = std::env::temp_dir().join(format!("oam-rm-link-{}", std::process::id()));
+        let target = dir.join("u");
+        let link = dir.join("l");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("kept"), b"kept").unwrap();
+        for recursive in [false, true] {
+            #[cfg(windows)]
+            let made = std::os::windows::fs::symlink_dir(&target, &link);
+            #[cfg(unix)]
+            let made = std::os::unix::fs::symlink(&target, &link);
+            #[cfg(unix)]
+            made.as_ref().expect("a symlink needs no privilege here");
+            if made.is_err() {
+                eprintln!(
+                    "SKIPPED remove_path_removes_a_directory_link_and_keeps_its_target: \
+                     this account may not create a symlink ({made:?})"
+                );
+                break;
+            }
+            super::remove_path(link.to_str().unwrap(), recursive).unwrap();
+            assert!(
+                std::fs::symlink_metadata(&link).is_err(),
+                "the link is gone (recursive: {recursive})"
+            );
+            assert_eq!(std::fs::read(target.join("kept")).unwrap(), b"kept");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// access(2) answers each mode bit: X_OK on a file with no execute bit
+    /// is `EACCES` (asked rather than W_OK, which a privileged caller is
+    /// granted whatever the mode), with uv_strerror's text.
+    #[cfg(unix)]
+    #[test]
+    fn check_access_asks_the_kernel_for_each_mode_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("oam-access-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let shown = file.to_str().unwrap().to_string();
+        let path = super::FsPath::new(shown.clone());
+        assert!(super::check_access(&path, 0).is_ok(), "F_OK");
+        assert!(super::check_access(&path, 4).is_ok(), "R_OK");
+        let (code, message, errno, win_error) = super::check_access(&path, 1).unwrap_err();
+        assert_eq!(code, "EACCES");
+        assert_eq!(
+            message,
+            format!("EACCES: permission denied, access '{shown}'")
+        );
+        assert_eq!(errno, Some(-libc::EACCES));
+        assert_eq!(win_error, None);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            super::check_access(&path, 1).is_ok(),
+            "X_OK once executable"
+        );
+        let missing = super::FsPath::new(format!("{shown}-missing"));
+        assert_eq!(super::check_access(&missing, 0).unwrap_err().0, "ENOENT");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A sub-second part that rounds up to a whole second is carried into
+    /// the seconds: the nanoseconds stay below 1e9, before 1970 too.
+    #[cfg(unix)]
+    #[test]
+    fn timespec_nanoseconds_never_reach_a_whole_second() {
+        use super::ops::timespec_parts;
+        assert_eq!(timespec_parts(0.0), (0.0, 0.0));
+        assert_eq!(timespec_parts(1500.0), (1.0, 500_000_000.0));
+        assert_eq!(timespec_parts(-500.0), (-1.0, 500_000_000.0));
+        // 0.9999999999 s, as `utimesSync(f, 0.9999999999, 0)` hands it over.
+        assert_eq!(timespec_parts(999.999_999_9), (1.0, 0.0));
+        assert_eq!(timespec_parts(-0.000_000_1), (0.0, 0.0));
+    }
+
+    /// An errno libuv names keeps its name, and so agrees with the `errno`
+    /// number reported beside it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn errnos_libuv_names_are_not_folded_into_eio() {
+        for (raw, code) in [
+            (libc::ENODATA, "ENODATA"),
+            (libc::ESOCKTNOSUPPORT, "ESOCKTNOSUPPORT"),
+            (libc::ENONET, "ENONET"),
+            (libc::EREMOTEIO, "EREMOTEIO"),
+            (libc::EUNATCH, "EUNATCH"),
+        ] {
+            let error = std::io::Error::from_raw_os_error(raw);
+            assert_eq!(super::node_error_code(&error), code);
+            assert_eq!(super::node_errno(code, &error), Some(-raw));
+        }
+    }
+
+    /// A copy onto the file itself -- by the same path or through a hard
+    /// link -- succeeds and leaves the bytes as they were, as libuv's does.
+    #[test]
+    fn copy_file_onto_itself_leaves_the_file_as_it_was() {
+        let dir = std::env::temp_dir().join(format!("oam-copy-self-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f");
+        let hard = dir.join("h");
+        std::fs::write(&file, b"contents").unwrap();
+        std::fs::hard_link(&file, &hard).unwrap();
+        let path = |p: &std::path::Path| super::FsPath::new(p.to_str().unwrap().to_string());
+        super::copy_file(&path(&file), &path(&file), 0).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"contents");
+        super::copy_file(&path(&file), &path(&hard), 0).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"contents");
+        assert_eq!(std::fs::read(&hard).unwrap(), b"contents");
+        // A different destination is still a copy.
+        let other = dir.join("o");
+        super::copy_file(&path(&file), &path(&other), 0).unwrap();
+        assert_eq!(std::fs::read(&other).unwrap(), b"contents");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

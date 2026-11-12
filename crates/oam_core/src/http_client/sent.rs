@@ -15,7 +15,7 @@
 //! sending half ([`take`]) and the request carries it, as a request
 //! extension, down to the pool, which fires it the moment a connection --
 //! reused or freshly dialled -- is checked out for the request
-//! ([`Dispatched::fire`]). hyper writes the head as soon as it is handed the
+//! ([`Dispatched::fire_on`]). hyper writes the head as soon as it is handed the
 //! request, so that is node's moment: a connected socket and the request
 //! queued on it. A pooled connection the server had already closed fires too,
 //! and the request then fails or is resent -- as node's request on a stale
@@ -113,9 +113,17 @@ impl Dispatched {
     /// The connection handed the request back unsent, and the pool is
     /// dialling another: until that one's [`fire_on`](Dispatched::fire_on), no
     /// connection has it. The checkout count stays -- node's request on a
-    /// stale keep-alive socket has already finished.
+    /// stale keep-alive socket has already finished. The connection's id
+    /// goes: it names the connection that gave the request back, which is
+    /// closing, and a [`wait`] that reads the state before the next checkout
+    /// must not hand JS that one to close or reset. (A wait that resolved at
+    /// the first checkout already holds the old id; this narrows the window,
+    /// it does not close it.)
     pub(crate) fn unsent(&self) {
-        self.0.send_modify(|state| state.on_connection = false);
+        self.0.send_modify(|state| {
+            state.on_connection = false;
+            state.connection = None;
+        });
     }
 
     /// The request's body is streamed and not all written yet (`true`), or
@@ -243,9 +251,16 @@ pub fn close(signals: &SentSignals, handle: u64) -> bool {
 mod tests {
     use super::*;
 
-    // Real time (the workspace's tokio has no test-util): a deadline is
-    // never early, and the upper bounds are loose.
+    // Real time (the workspace's tokio has no test-util). What each test
+    // pins is that a deadline is never early -- `elapsed >= LIMIT`, which no
+    // host load can break. `LATE` only says it came at all: a bound tight
+    // enough to mean more (it was three limits, 450 ms) failed a correct
+    // implementation whenever the scheduler stalled for 300 ms.
     const LIMIT: Duration = Duration::from_millis(150);
+    const LATE: Duration = Duration::from_secs(10);
+    // A wait that must end before a running deadline does: a third of the
+    // limit, so the host has two thirds of it (100 ms) to be slow in.
+    const SHORT: Duration = Duration::from_millis(50);
 
     #[tokio::test]
     async fn the_headers_deadline_waits_for_a_checkout() {
@@ -262,7 +277,7 @@ mod tests {
         let start = std::time::Instant::now();
         deadline.await;
         let elapsed = start.elapsed();
-        assert!(elapsed >= LIMIT && elapsed < LIMIT * 3, "{elapsed:?}");
+        assert!(elapsed >= LIMIT && elapsed < LATE, "{elapsed:?}");
     }
 
     #[tokio::test]
@@ -271,16 +286,12 @@ mod tests {
         let deadline = headers_deadline(dispatched.subscribe(), LIMIT);
         tokio::pin!(deadline);
         dispatched.fire();
-        assert!(
-            tokio::time::timeout(LIMIT * 2 / 3, &mut deadline)
-                .await
-                .is_err()
-        );
+        assert!(tokio::time::timeout(SHORT, &mut deadline).await.is_err());
         dispatched.fire();
         let start = std::time::Instant::now();
         deadline.await;
         let elapsed = start.elapsed();
-        assert!(elapsed >= LIMIT && elapsed < LIMIT * 3, "{elapsed:?}");
+        assert!(elapsed >= LIMIT && elapsed < LATE, "{elapsed:?}");
     }
 
     #[tokio::test]
@@ -290,11 +301,7 @@ mod tests {
         tokio::pin!(deadline);
         // A reused connection has it, then hands it back unsent.
         dispatched.fire();
-        assert!(
-            tokio::time::timeout(LIMIT * 2 / 3, &mut deadline)
-                .await
-                .is_err()
-        );
+        assert!(tokio::time::timeout(SHORT, &mut deadline).await.is_err());
         dispatched.unsent();
         // The re-dial takes longer than the limit: none of it counts.
         assert!(
@@ -306,7 +313,7 @@ mod tests {
         let start = std::time::Instant::now();
         deadline.await;
         let elapsed = start.elapsed();
-        assert!(elapsed >= LIMIT && elapsed < LIMIT * 3, "{elapsed:?}");
+        assert!(elapsed >= LIMIT && elapsed < LATE, "{elapsed:?}");
     }
 
     #[tokio::test]
@@ -327,7 +334,7 @@ mod tests {
         let start = std::time::Instant::now();
         deadline.await;
         let elapsed = start.elapsed();
-        assert!(elapsed >= LIMIT && elapsed < LIMIT * 3, "{elapsed:?}");
+        assert!(elapsed >= LIMIT && elapsed < LATE, "{elapsed:?}");
     }
 
     #[tokio::test]
@@ -342,6 +349,32 @@ mod tests {
             OpOutcome::Json(ref json) if json == "true"
         ));
         assert!(close(&signals, 7));
+    }
+
+    #[tokio::test]
+    async fn an_unsent_hand_back_forgets_the_connection_that_gave_the_request_back() {
+        let signals: SentSignals = Arc::default();
+        open(&signals, 8);
+        let dispatched = take(&signals, 8).expect("an open signal");
+        dispatched.fire_on(Some(41));
+        assert!(matches!(
+            wait(signals.clone(), 8).await,
+            OpOutcome::Json(ref json) if json == "41"
+        ));
+        // Handed back unsent: the request still counts as sent, on no
+        // connection a caller could name.
+        dispatched.unsent();
+        assert!(matches!(
+            wait(signals.clone(), 8).await,
+            OpOutcome::Json(ref json) if json == "true"
+        ));
+        // The re-dial's checkout names its own.
+        dispatched.fire_on(Some(42));
+        assert!(matches!(
+            wait(signals.clone(), 8).await,
+            OpOutcome::Json(ref json) if json == "42"
+        ));
+        assert!(close(&signals, 8));
     }
 
     #[tokio::test]

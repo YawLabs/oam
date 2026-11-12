@@ -1,7 +1,7 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "7d0c04db",
-  "oamVersion": "oam 0.19.3",
+  "commit": "6ffb6afa",
+  "oamVersion": "oam 0.19.5",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
   "suites": {
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 425,
-      "total": 426,
+      "pass": 431,
+      "total": 432,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -124,6 +124,14 @@
         },
         {
           "case": "114-fetch-request-rules.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "115-child-stdio-numbered-fd.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "116-child-extra-fd-eof.mjs",
           "status": "pass"
         },
         {
@@ -1568,6 +1576,10 @@
           "status": "pass"
         },
         {
+          "case": "611-util-assert-comparison-and-parse-args.mjs",
+          "status": "pass"
+        },
+        {
           "case": "62-child-ipc-fork-stdio.mjs",
           "status": "pass"
         },
@@ -1577,6 +1589,26 @@
         },
         {
           "case": "64-child-failure-path.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "641-child-maxbuffer-default.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "642-dgram-binds-once.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "643-child-shell-by-name.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "644-child-ipc-read-to-end.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "645-http2-client-ping.mjs",
           "status": "pass"
         },
         {
@@ -1596,15 +1628,7 @@
           "status": "pass"
         },
         {
-          "case": "68-child-stdio-numbered-fd.mjs",
-          "status": "pass"
-        },
-        {
           "case": "69-child-extra-fd-descriptor.mjs",
-          "status": "pass"
-        },
-        {
-          "case": "69-child-extra-fd-eof.mjs",
           "status": "pass"
         },
         {
@@ -1823,7 +1847,10 @@
         "platform": "win32",
         "noBaseline": false,
         "nodeTotal": 1874,
-        "knownMissing": 261,
+        "nodeGlobalTotal": 488,
+        "globalMissing": 60,
+        "knownMissing": 251,
+        "unknownRatchet": [],
         "newMissing": [],
         "staleRatchet": [],
         "absentModules": [],
@@ -1833,26 +1860,6 @@
             "module": "constants",
             "names": [
               "RSA_PKCS1_SHA256_PADDING",
-              "SIGALRM",
-              "SIGBUS",
-              "SIGCHLD",
-              "SIGCONT",
-              "SIGINFO",
-              "SIGIO",
-              "SIGPIPE",
-              "SIGPROF",
-              "SIGSTOP",
-              "SIGSYS",
-              "SIGTRAP",
-              "SIGTSTP",
-              "SIGTTIN",
-              "SIGTTOU",
-              "SIGURG",
-              "SIGUSR1",
-              "SIGUSR2",
-              "SIGVTALRM",
-              "SIGXCPU",
-              "SIGXFSZ",
               "S_IFBLK",
               "S_IFSOCK",
               "S_IRGRP",
@@ -1983,6 +1990,7 @@
               "clearMarks",
               "clearMeasures",
               "clearResourceTimings",
+              "eventLoopUtilization",
               "getEntries",
               "getEntriesByName",
               "getEntriesByType",
@@ -2025,7 +2033,9 @@
           {
             "module": "global:WebSocket.prototype",
             "names": [
+              "_enqueueSend",
               "_fireClose",
+              "_fireError",
               "_recvLoop"
             ]
           }
@@ -2038,6 +2048,7 @@
       "missing": [],
       "extra": [],
       "staleRatchet": [],
+      "unprobedModules": [],
       "detail": {
         "oam:mcp": [
           "McpServer",

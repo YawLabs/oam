@@ -11,7 +11,7 @@
 #                                            finding invalidates the build
 #                                            behind it)
 #   2. cargo fmt --all --check
-#   3. cargo clippy --workspace --all-targets -- -D warnings
+#   3. cargo clippy --workspace --all-targets --all-features -- -D warnings
 #   4. --no-default-features build + clippy + test  (GATING; the napi-off
 #                                            configuration, which nothing else
 #                                            here compiles -- see below)
@@ -93,6 +93,17 @@
 #                            refusing; xtask conformance honours it too). For an
 #                            ad-hoc run only -- the receipts then name the node
 #                            that really ran, which is not the parity target.
+#   OAM_ALLOW_RUST_MISMATCH=1  let the gate run on a `rustc` that is not the
+#                            version pinned in rust-toolchain.toml (warns
+#                            instead of refusing). Ad-hoc runs only: clippy
+#                            (step 3) then lints with a toolchain the other
+#                            legs do not gate on. It does not stand in for a
+#                            missing rustc.
+#   OAM_TEST_THREADS=1       append `-- --test-threads=1` to every cargo test
+#                            run here (steps 4 and 6). Release legs set it so
+#                            tests sharing process-global state cannot race;
+#                            the default stays parallel, which is the daily
+#                            run that surfaces that interference.
 #   OAM_SCRIPT_TESTS_RETRY=0 do not run step 13's script suite a second time
 #                            when the first run fails (default: one re-run, so
 #                            a case that flakes under load does not end a
@@ -150,6 +161,24 @@ for arg in "$@"; do
       # prefix stripped. Stops at the first non-comment line.
       awk 'NR==1{next} !/^#/{exit} {sub(/^# ?/, ""); print}' "$0"
       exit 0
+      ;;
+    -*)
+      # A mistyped flag must not fall through to the full gate (or to a gate
+      # other than the one asked for). Exit 2: nothing ran.
+      echo "ci-local.sh: unknown argument: $arg (want --no-tests, --fast, --help)" >&2
+      exit 2
+      ;;
+    *)
+      # git hands a pre-push hook two positional arguments (remote name and
+      # URL), and a hook that IS this script rather than the wrapper above
+      # receives them. Tolerated under that name only.
+      case "${0##*/}" in
+        pre-push) ;;
+        *)
+          echo "ci-local.sh: unknown argument: $arg (want --no-tests, --fast, --help)" >&2
+          exit 2
+          ;;
+      esac
       ;;
   esac
 done
@@ -437,7 +466,7 @@ say "1/14 Control bytes (raw C0 in tracked text)"
 # present -- and `git diff` reports the file as "Binary file ... matches" with
 # no hunks, so it is unreviewable rather than merely easy to miss. Five literal
 # NULs reached main in a sibling repo (YawLabs/mcp, b365955) exactly that way.
-# Relative, because line 76 already cd'd to the repo root. A "$REPO_ROOT/..."
+# Relative, because the cd near the top already moved to the repo root. A "$REPO_ROOT/..."
 # spelling would expand to "/scripts/..." here -- this script defines no such
 # variable, and `set -u` does not catch it inside a quoted expansion.
 # Exit code 2 is "the gate could not RUN" (no node on PATH), which is a
@@ -994,7 +1023,19 @@ say "14/14 Miri aliasing models (Stacked Borrows check on napi.rs's pointer disc
 # is checked BEFORE the ledger is asked: the key needs it. The two SKIPPED
 # paths are not recorded (nothing ran, and whether nightly+miri is installed
 # is not in the key -- install it and the step runs).
-if ! rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
+#
+# The list is captured and matched in the shell, not piped into `grep -q`:
+# under pipefail, grep exiting on its first match can fail rustup's remaining
+# writes, and that non-zero pipeline would read as "no nightly" and skip a
+# gating step.
+toolchains="$(rustup toolchain list 2>/dev/null || true)"
+case "
+$toolchains" in
+  *"
+nightly"*) have_nightly=1 ;;
+  *) have_nightly=0 ;;
+esac
+if [ "$have_nightly" = "0" ]; then
   warn "miri models SKIPPED -- no nightly toolchain (install: rustup toolchain install nightly --component miri)"
 elif ! miri_v="$(cargo +nightly miri --version 2>/dev/null)"; then
   warn "miri models SKIPPED -- nightly present but miri component missing (rustup component add miri --toolchain nightly)"

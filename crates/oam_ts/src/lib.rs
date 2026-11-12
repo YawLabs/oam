@@ -95,6 +95,12 @@ enum HandleState {
 /// makes any LATER spawn through the same handle refuse to start, so a
 /// caller that gives up on a check (warn-mode `oam run` exiting, the daemon
 /// shutting down) never leaves a type-check burning CPU behind it.
+///
+/// One run at a time: the clones exist so ANOTHER thread can cancel, not so
+/// several can check. The handle tracks a single child, and a run started
+/// through a clone while one is in flight fails to start (its tsgo is
+/// killed, the check reports that it could not run). Concurrent checks take
+/// one handle each.
 #[derive(Clone, Default)]
 pub struct TsgoHandle {
     state: Arc<Mutex<HandleState>>,
@@ -154,13 +160,22 @@ impl TsgoHandle {
         killed
     }
 
-    /// Record a spawned child; the handle now owns it. Err = already
-    /// cancelled: the child is handed back and the caller must kill and
-    /// reap what it just spawned.
-    fn register(&self, child: std::process::Child) -> Result<(), std::process::Child> {
+    /// Record a spawned child; the handle now owns it. Err = the handle
+    /// cannot take it -- already cancelled, or (`busy` true) another run
+    /// registered through a clone is still in flight: the child is handed
+    /// back and the caller must kill and reap what it just spawned.
+    ///
+    /// A handle tracks ONE child. Overwriting a Running entry would drop
+    /// that `Child` un-killed and un-reaped, the first run's `take_running`
+    /// would then reap the second run's process, and the second run would
+    /// read the empty state as a cancel -- so the second registration is
+    /// refused instead.
+    fn register(&self, child: std::process::Child) -> Result<(), (std::process::Child, bool)> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if matches!(*state, HandleState::Cancelled) {
-            return Err(child);
+        match *state {
+            HandleState::Cancelled => return Err((child, false)),
+            HandleState::Running(_) => return Err((child, true)),
+            HandleState::Idle => {}
         }
         *state = HandleState::Running(child);
         Ok(())
@@ -216,8 +231,9 @@ fn hide_console_window(_command: &mut Command) {}
 /// makes the real compiler a grandchild (cmd.exe -> node -> tsgo.exe on
 /// Windows; node -> tsgo on Unix when `process.execve` is unavailable), so
 /// killing only the direct child would leave the actual work running.
-/// Best-effort: a missing `taskkill`/`pkill` degrades to the old behaviour
-/// (the child finishes on its own). `no_console` is the caller's
+/// Best-effort: a missing `taskkill` degrades to the old behaviour (the
+/// child finishes on its own), a missing `pgrep` to killing the direct
+/// child alone. `no_console` is the caller's
 /// [`TsgoHandle::no_console`]: taskkill is a console process too, and from
 /// the daemon it would get a window of its own.
 fn kill_tree(pid: u32, no_console: bool) {
@@ -238,21 +254,56 @@ fn kill_tree(pid: u32, no_console: bool) {
     #[cfg(not(windows))]
     {
         let _ = no_console;
-        // Children first (they are still findable by parent pid), then the
-        // child itself.
-        let _ = Command::new("pkill")
-            .args(["-KILL", "-P", &pid])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // Every descendant, collected BEFORE anything is signalled (once a
+        // parent dies its children are re-parented and no longer findable
+        // through it), then the child itself. `pkill -P` reached the direct
+        // children only, so a three-level chain (an OAM_TSGO shell wrapper:
+        // sh -> node -> tsgo) left the compiler running.
+        let mut targets = descendant_pids(&pid);
+        targets.push(pid);
         let _ = Command::new("kill")
-            .args(["-KILL", &pid])
+            .arg("-KILL")
+            .args(&targets)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
     }
+}
+
+/// The pids of every descendant of `pid`, nearest generation first, walked
+/// with `pgrep -P` (procps on Linux, the base system on macOS -- the same
+/// package `pkill` comes from). Best-effort like the rest of `kill_tree`: a
+/// missing `pgrep` yields nothing and only the child itself is killed. The
+/// walk is capped so a runaway tree cannot hold a cancel up.
+#[cfg(not(windows))]
+fn descendant_pids(pid: &str) -> Vec<String> {
+    const CAP: usize = 1024;
+    let mut found: Vec<String> = Vec::new();
+    let mut frontier = vec![pid.to_string()];
+    while let Some(parent) = frontier.pop() {
+        let Ok(listing) = Command::new("pgrep")
+            .args(["-P", &parent])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            break;
+        };
+        for line in String::from_utf8_lossy(&listing.stdout).lines() {
+            let child = line.trim();
+            let is_pid = !child.is_empty() && child.bytes().all(|b| b.is_ascii_digit());
+            if !is_pid || found.iter().any(|seen| seen == child) {
+                continue;
+            }
+            if found.len() >= CAP {
+                return found;
+            }
+            found.push(child.to_string());
+            frontier.push(child.to_string());
+        }
+    }
+    found
 }
 
 enum RunFailure {
@@ -313,10 +364,17 @@ fn run_with_timeout(
     let mut child = command.spawn().map_err(RunFailure::Spawn)?;
     let out_pipe = drain(child.stdout.take());
     let err_pipe = drain(child.stderr.take());
-    if let Err(child) = handle.register(child) {
-        // Cancelled before we could register: kill what we just spawned.
+    if let Err((child, busy)) = handle.register(child) {
+        // Cancelled before we could register, or the handle already tracks
+        // another run: kill what we just spawned.
         kill_and_reap(child, handle.no_console);
-        return Err(RunFailure::Cancelled);
+        return Err(if busy {
+            RunFailure::Spawn(std::io::Error::other(
+                "this TsgoHandle already has a tsgo run in flight (one run at a time per handle)",
+            ))
+        } else {
+            RunFailure::Cancelled
+        });
     }
     // Pipe EOF signals the tree is done writing; a channel carries it so
     // this thread can bound the wait.
@@ -977,8 +1035,6 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
-/// Parse the classic tsc machine format. Lines that don't match the shape
-/// are continuation/elaboration lines and append to the previous diagnostic.
 /// Point a redeclaration collision at the half the user can actually fix.
 ///
 /// oam's declarations bring `declare const oam`, and a project created against
@@ -988,12 +1044,19 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
 /// that the user has never opened and must not edit. Naming the cause on that
 /// diagnostic costs nothing and turns a dead end into a one-line fix.
 fn annotate_declaration_collisions(diagnostics: &mut [Diagnostic]) {
-    let Some(dir) = crate::decls::declarations_dir_for_hint() else {
-        return;
-    };
+    // Compared as paths, component by component, both sides lexically
+    // normalized: a span is `normalize_path`ed where it is parsed, and so is
+    // the directory. A string prefix test also matched a sibling directory
+    // that merely shares the prefix, and missed whenever the cache root was
+    // spelled with `.`/`..` segments.
+    let dir = crate::decls::declarations_dir_for_hint();
     for d in diagnostics.iter_mut() {
         let collides = d.code == "OAM-TS2451" || d.code == "OAM-TS2300";
-        if collides && d.spans.iter().any(|sp| sp.file.starts_with(&dir)) {
+        if collides
+            && d.spans
+                .iter()
+                .any(|sp| Path::new(&sp.file).starts_with(&dir))
+        {
             d.message.push_str(concat!(
                 "
   This declaration is oam's own: it ships the `oam:` module types and",
@@ -1006,6 +1069,8 @@ fn annotate_declaration_collisions(diagnostics: &mut [Diagnostic]) {
     }
 }
 
+/// Parse the classic tsc machine format. Lines that don't match the shape
+/// are continuation/elaboration lines and append to the previous diagnostic.
 fn parse_tsc_output(output: &str, base: &Path) -> Vec<Diagnostic> {
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     for line in output.lines() {
@@ -1296,6 +1361,37 @@ mod tests {
             Err(RunFailure::TimedOut) => panic!("timed out"),
             Ok(_) => panic!("a cancelled handle must not run anything"),
         }
+    }
+
+    #[test]
+    fn a_handle_tracks_one_run_and_refuses_a_second_registration() {
+        // Two runs through clones of one handle: the second registration
+        // must hand its child back (busy) and leave the first in place,
+        // never overwrite it un-reaped.
+        let spawn = || {
+            Command::new(std::env::current_exe().unwrap())
+                .arg("--list")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn the test binary")
+        };
+        let handle = TsgoHandle::new();
+        let first = spawn();
+        let first_pid = first.id();
+        assert!(handle.register(first).is_ok());
+        match handle.clone().register(spawn()) {
+            Err((mut second, busy)) => {
+                assert!(busy, "refused as busy, not as cancelled");
+                let _ = second.kill();
+                let _ = second.wait();
+            }
+            Ok(()) => panic!("a second registration must be refused"),
+        }
+        let mut still_first = handle.take_running().expect("the first run is still held");
+        assert_eq!(still_first.id(), first_pid);
+        let _ = still_first.wait();
     }
 
     #[test]

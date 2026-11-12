@@ -117,12 +117,18 @@ const missingExports = {};
 let absentModuleNames = 0;
 for (const [name, nodeKeys] of Object.entries(node)) {
   if (!Array.isArray(nodeKeys)) continue;
-  const ours = oam[name];
-  if (ours === false || ours === null || ours === undefined) {
+  // Absent is `false` (the runner's require threw) or no entry at all. `null`
+  // is a module that LOADS but exports a primitive: it has no named exports,
+  // so every Node name is missing per name. Same rule as the gate
+  // (xtask conformance.rs compare_exports); the two must agree or a section
+  // written here fails the gate it was written for.
+  const entry = oam[name];
+  if (entry === false || entry === undefined) {
     absentModules.push(name);
     absentModuleNames += nodeKeys.length;
     continue;
   }
+  const ours = entry === null ? [] : entry;
   const missing = nodeKeys.filter((k) => !ours.includes(k));
   if (missing.length) missingExports[name] = missing;
 }
@@ -147,11 +153,16 @@ const previous = platforms[process.platform];
 if (previous && !allowRegression) {
   const had = (module) => new Set(previous.missingExports?.[module] ?? []);
   const regressions = [];
+  const absentBefore = new Set(previous.absentModules ?? []);
   for (const [module, names] of Object.entries(missingExports)) {
+    // A module that was wholly absent last time and is now registered but
+    // incomplete is strict progress: every name it still lacks was already
+    // recorded as missing, at module granularity. Only a module that was
+    // present before can have a NEWLY missing name.
+    if (absentBefore.has(module)) continue;
     const before = had(module);
     for (const name of names) if (!before.has(name)) regressions.push(`${module}.${name}`);
   }
-  const absentBefore = new Set(previous.absentModules ?? []);
   for (const module of absentModules) {
     if (!absentBefore.has(module)) regressions.push(`${module} (whole module)`);
   }

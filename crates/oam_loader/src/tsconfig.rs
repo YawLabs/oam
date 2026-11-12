@@ -259,7 +259,7 @@ pub(crate) fn load_for_with(resolver: &Resolver, referrer: &Path) -> Option<Path
 /// published files or retarget their JSX -- neither Node nor tsc applies it
 /// -- so anything under node_modules gets no tsconfig at all.
 pub(crate) fn info_for_with(resolver: &Resolver, referrer: &Path) -> Option<TsconfigInfo> {
-    if in_node_modules(referrer) {
+    if crate::npm::in_node_modules(referrer) {
         return None;
     }
     let tsconfig = find_tsconfig_with(resolver, referrer)?;
@@ -273,10 +273,6 @@ pub(crate) fn info_for_with(resolver: &Resolver, referrer: &Path) -> Option<Tsco
     let result = load_chain(&tsconfig, 0);
     cache.insert(tsconfig, result.clone());
     result
-}
-
-fn in_node_modules(path: &Path) -> bool {
-    path.components().any(|c| c.as_os_str() == "node_modules")
 }
 
 /// Nearest tsconfig.json at or above `referrer` (a file or a directory).
@@ -302,7 +298,7 @@ pub(crate) fn find_tsconfig_with(resolver: &Resolver, referrer: &Path) -> Option
 /// `Resolver`.
 #[cfg(test)]
 pub(crate) fn load_for(referrer: &Path) -> Option<PathsConfig> {
-    load_for_with(crate::resolver::default_resolver(), referrer)
+    load_for_with(&crate::resolver::default_resolver(), referrer)
 }
 
 /// Load a tsconfig and merge its `extends` chain (child wins per-option;
@@ -756,7 +752,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("entry.tsx"), "").unwrap();
         let entry = dir.join("entry.tsx");
-        let info = info_for_with(default_resolver(), &entry).expect("tsconfig loads");
+        let info = info_for_with(&default_resolver(), &entry).expect("tsconfig loads");
         let keys: Vec<&str> = info
             .paths
             .as_ref()
@@ -781,7 +777,7 @@ mod tests {
             Some("react"),
             "own declaration wins over both"
         );
-        let settings = jsx_settings_for(default_resolver(), &entry);
+        let settings = jsx_settings_for(&default_resolver(), &entry);
         assert_eq!(settings.mode, JsxMode::Classic);
         assert_eq!(settings.import_source.as_deref(), Some("solid-js"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1138,7 +1134,7 @@ mod tests {
         std::fs::write(dir.join("entry.tsx"), "").unwrap();
         let entry = dir.join("entry.tsx");
         assert_eq!(
-            jsx_settings_for(default_resolver(), &entry)
+            jsx_settings_for(&default_resolver(), &entry)
                 .import_source
                 .as_deref(),
             Some("preact")
@@ -1157,7 +1153,7 @@ mod tests {
         .unwrap();
         std::fs::write(over.join("e.tsx"), "").unwrap();
         assert_eq!(
-            jsx_settings_for(default_resolver(), &over.join("e.tsx"))
+            jsx_settings_for(&default_resolver(), &over.join("e.tsx"))
                 .import_source
                 .as_deref(),
             Some("solid-js")
@@ -1166,7 +1162,7 @@ mod tests {
         // No tsconfig at all -> the defaults, never a fabricated source.
         let bare = temp_dir("jsx-bare");
         std::fs::write(bare.join("e.tsx"), "").unwrap();
-        let settings = jsx_settings_for(default_resolver(), &bare.join("e.tsx"));
+        let settings = jsx_settings_for(&default_resolver(), &bare.join("e.tsx"));
         assert_eq!(settings.import_source, None);
         assert_eq!(settings.mode, JsxMode::Automatic);
 

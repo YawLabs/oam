@@ -85,6 +85,10 @@ aes = "0.8"
 cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 ctr = "0.9"
 aes-gcm = "0.10"
+# GHASH for the streaming AES-GCM path (Cipher/Decipher.update()), which the
+# one-shot aes-gcm crate cannot serve. Already compiled as aes-gcm's own
+# dependency; promoting it adds no package.
+ghash = "0.5.1"
 cipher = "0.4"
 # Triple-DES, for TLS server keys and PKCS#12 bundles protected with it
 # (tls/keys.rs): DES-EDE3-CBC legacy PEM keys, PBES2 des-ede3-cbc, PKCS#12's
@@ -105,20 +109,37 @@ base64 = "0.22"
 # ed25519 verifier: release keys are ssh-ed25519 (or sk-ssh-ed25519) by
 # release-keys/README.md, so no ecdsa/rsa/dsa/encrypted-key code is linked.
 ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519"] }
-# node:crypto wave 4: RSA encrypt/decrypt (publicEncrypt, privateDecrypt).
-# ring deliberately omits RSA encryption; the rsa crate (pure Rust) fills
-# the gap. rand_core provides OsRng for the encrypt padding randomness.
-rsa = "0.9"
+# node:crypto wave 4: RSA encrypt/decrypt (publicEncrypt, privateDecrypt),
+# RSA-PSS, key generation and key (de)serialisation. ring deliberately omits
+# RSA encryption; the rsa crate (pure Rust) fills the gap.
+#   pkcs1v15: RSA_PKCS1_PADDING encrypt/decrypt and privateEncrypt.
+#   hazmat:   the unpadded primitive (RSA_NO_PADDING, publicDecrypt, reading a
+#             PSS salt length) and generating a modulus below the crate's
+#             default 1024-bit floor, which node allows.
+rsa = { version = "0.10", features = ["pkcs1v15", "hazmat"] }
+# rsa 0.10 is on the digest-0.11 / rand_core-0.10 family, while the rest of
+# node:crypto here is still digest 0.10 (hmac, pbkdf2, hkdf, the cipher-0.4
+# crates). These two exist only for the RSA call sites: sha1 0.11 is the
+# OAEP/PSS SHA-1 (sha2 0.11 comes re-exported as rsa::sha2), and
+# crypto-common's getrandom feature is the system RNG rsa itself uses
+# (rand_core 0.10's TryCryptoRng). Both are already in rsa's own graph.
+sha1-rsa = { package = "sha1", version = "0.11", default-features = false }
+crypto-common = { version = "0.2", features = ["getrandom"] }
+# rand_core 0.6 OsRng: p256/p384 0.13 key generation and classic DH.
 rand_core = { version = "0.6", features = ["getrandom"] }
 # node:crypto wave 5: ECDH key agreement (createECDH).
 # ring's ECDH is one-shot (consumes the key); p256/p384 hold persistent
 # SecretKey objects that support Node's multi-computeSecret pattern.
 p256 = { version = "0.13", features = ["ecdh"] }
 p384 = { version = "0.13", features = ["ecdh"] }
-# node:crypto wave 6: classic Diffie-Hellman (createDiffieHellman,
-# getDiffieHellman).  Already in-tree transitively via rsa -> num-bigint-dig;
-# promoting to direct dep adds zero new compilation units.
+# node:crypto wave 6: generatePrime/checkPrime, and the public-value checks
+# of classic Diffie-Hellman (primality of a caller's modulus for verifyError).
 num-bigint-dig = { version = "0.8", features = ["prime"] }
+# Classic Diffie-Hellman exponentiation (createDiffieHellman,
+# getDiffieHellman, createDiffieHellmanGroup): heap-sized Montgomery form,
+# so any modulus width a caller supplies. Already in rsa's own graph; the
+# same feature set rsa asks for.
+crypto-bigint = { version = "0.7.11", default-features = false, features = ["alloc", "zeroize"] }
 # node:crypto wave 7: X.509 certificate inspection (X509Certificate class).
 # nom is already in-tree transitively; x509-parser adds only the ASN.1
 # layer (der-parser, asn1-rs, oid-registry) — no C deps.
@@ -209,9 +230,13 @@ rustls-native-certs = "0.8"
 # and reverse lookups. tokio-runtime for async; system-config reads
 # the OS resolver settings.
 hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
-# V8 Inspector (CDP) transport: WebSocket framing for the debugger socket.
-# default-features=false drops the TLS backends — the inspector is
-# plaintext localhost only.
+# WebSocket framing, for two consumers in oam_core: the V8 Inspector (CDP)
+# debugger socket (inspector.rs -- plaintext, localhost only) and the
+# WebSocket client (websocket.rs), which dials wss:// through
+# `client_async_tls_with_config`. The crate's TLS backends are all opt-in
+# features; `rustls-tls-webpki-roots` is the one selected (no native-tls). It
+# is what keeps wss:// working, and is also why tokio-rustls / webpki-roots
+# above were already compiled transitively -- do not drop it.
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 # N-API: dlopen for .node addons (and the test addon's host-symbol lookup).

@@ -13,8 +13,9 @@
 # one until the page is live; xtask/tests/published_urls.rs enforces the
 # file, not the web.
 #
-# Scope: crates/*/src, js/ (excluding js/vendor), xtask/src -- what compiles
-# into the binary and its V8 snapshot. install/install.sh and install.ps1
+# Scope: crates/*/src, crates/*/types (embedded .d.ts), js/ (excluding only js/vendor/node-streams, Node's own
+# source verbatim; js/vendor/oam-shims is oam's code and IS scanned), xtask/src
+# -- what compiles into the binary and its V8 snapshot. install/install.sh and install.ps1
 # build their URLs out of shell variables, so a textual scan cannot say what
 # they resolve to; scripts/release-local.sh fetches those live on every
 # release instead.

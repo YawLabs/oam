@@ -6,7 +6,7 @@
 
 mod common;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -39,7 +39,7 @@ impl Reg {
             bodies: Arc::new(Mutex::new(HashMap::new())),
             ids: Arc::new(AtomicU64::new(1)),
             outbound: Arc::new(Mutex::new(HashMap::new())),
-            cancelled: Arc::new(Mutex::new(HashSet::new())),
+            cancelled: CancelledBodies::default(),
             signal: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -572,13 +572,10 @@ async fn a_gone_pipe_or_session_fails_without_dialling_anything() {
 async fn destroying_a_session_ends_its_connection_and_the_pipe() {
     within(async {
         let reg = Reg::new();
-        let (port, _, _) = h2c_origin().await;
-        let socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        // A pipe nothing pumps: no peer is needed to destroy a session, and
+        // the test itself reads what the session wrote to the pipe (below).
         let pipe_id = pipe::open(&reg.pipes, &reg.ids);
-        // Pump only the inbound side here; the test reads what the session
-        // writes itself.
         let session = reg.open(pipe_id).await;
-        drop(socket);
         let waiting = tokio::spawn(h2_session::wait(reg.sessions.clone(), session));
         assert!(h2_session::destroy(&reg.sessions, session));
         assert_eq!(payload(waiting.await.unwrap()), json!({ "error": null }));
@@ -901,6 +898,75 @@ async fn the_session_sends_its_goaway_while_a_stream_is_open() {
         assert_eq!(reg.text(head["bodyHandle"].as_u64().unwrap()).await, "ok");
         assert!(h2_session::destroy(&reg.sessions, session));
         assert!(!h2_session::send_goaway(&reg.sessions, session), "gone");
+    })
+    .await;
+}
+
+/// `http2SessionPing` sends a PING frame carrying the caller's eight bytes
+/// and resolves at the peer's ACK with the bytes it echoed and the time it
+/// took: on a session with nothing else to write (the frame goes out
+/// though hyper is idle), several at once (each answered with its own
+/// payload), and with streams still served after them (h2 ignores the ACK
+/// of a PING it did not send).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ping_is_sent_and_answered_at_its_ack() {
+    within(async {
+        let reg = Reg::new();
+        let (port, _seen, _accepts) = h2c_origin().await;
+        let socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let session = reg.open(reg.pump(socket)).await;
+        let ping = |bytes: [u8; 8]| h2_session::ping(&reg.sessions, session, bytes);
+        let acked = |pong: Value, bytes: &[u8; 8]| {
+            assert_eq!(pong["ack"], true, "{pong}");
+            assert_eq!(pong["payload"], json!(bytes), "{pong}");
+            let duration = pong["duration"].as_f64().unwrap();
+            assert!(duration.is_finite() && duration >= 0.0, "{pong}");
+        };
+        acked(payload(ping(*b"abcdefgh").await), b"abcdefgh");
+        let (a, b, c) = tokio::join!(ping([1; 8]), ping([2; 8]), ping([1; 8]));
+        let (a, b, c) = (payload(a), payload(b), payload(c));
+        assert_eq!(
+            (&a["seq"], &b["seq"], &c["seq"]),
+            (&json!(1), &json!(2), &json!(3)),
+            "answered in the order sent, after the first"
+        );
+        acked(a, &[1; 8]);
+        acked(b, &[2; 8]);
+        acked(c, &[1; 8]);
+        let get = json!({ "method": "GET", "scheme": "http", "authority": "x", "path": "/after" });
+        let head = payload(reg.request(session, get).await);
+        assert_eq!(head["status"], 200);
+        assert_eq!(
+            reg.text(head["bodyHandle"].as_u64().unwrap()).await,
+            "path=/after"
+        );
+        acked(payload(ping([0xff; 8]).await), &[0xff; 8]);
+        assert!(h2_session::destroy(&reg.sessions, session));
+    })
+    .await;
+}
+
+/// A ping the peer never acknowledges is cancelled (`{"ack": false}`,
+/// node's ERR_HTTP2_PING_CANCEL) when the session is destroyed, and one on
+/// a session already gone is cancelled at once. This origin answers no
+/// PING.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ping_is_cancelled_when_its_session_goes() {
+    within(async {
+        let reg = Reg::new();
+        let (port, _goaway) = goaway_awaiting_origin().await;
+        let socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let session = reg.open(reg.pump(socket)).await;
+        let waiting = tokio::spawn(h2_session::ping(&reg.sessions, session, [7; 8]));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "no ACK has come");
+        assert!(h2_session::destroy(&reg.sessions, session));
+        assert_eq!(payload(waiting.await.unwrap()), json!({ "ack": false }));
+        assert_eq!(
+            payload(h2_session::ping(&reg.sessions, session, [7; 8]).await),
+            json!({ "ack": false }),
+            "gone"
+        );
     })
     .await;
 }

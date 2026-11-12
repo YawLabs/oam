@@ -13,6 +13,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+mod wire_bin;
+
 fn write_temp(name: &str, content: &str) -> PathBuf {
     use std::sync::OnceLock;
     static RUN_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -29,6 +31,35 @@ fn write_temp(name: &str, content: &str) -> PathBuf {
     path
 }
 
+/// `oam <flags> run <script> --no-check` on the binary under test (see
+/// `wire_bin::oam_under_test`), with the cache redirected into this run's temp
+/// directory -- never the developer's own -- and `NODE_OPTIONS` cleared.
+/// Every spawn in this file starts here.
+fn oam_run(flags: &[&str], script: &std::path::Path) -> Command {
+    let cache = write_temp("oam-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut cmd = Command::new(wire_bin::oam_under_test());
+    cmd.args(flags)
+        .args(["run", script.to_str().unwrap(), "--no-check"])
+        .env("OAM_CACHE_DIR", cache)
+        .env_remove("NODE_OPTIONS");
+    cmd
+}
+
+/// Run `script` to completion with `PORT` set and return its trimmed stdout,
+/// line endings normalised.
+fn run_with_port(flags: &[&str], script: &std::path::Path, port: u16) -> String {
+    let out = oam_run(flags, script)
+        .env("PORT", port.to_string())
+        .output()
+        .expect("oam runs");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .replace("\r\n", "\n")
+}
+
 /// A running `oam run` server script. The script prints `PORT <n>` once it
 /// listens and then one line per event it wants the test to see; the lines
 /// are forwarded to `lines`. Dropping it kills the process.
@@ -41,21 +72,8 @@ struct Server {
 impl Server {
     fn start(name: &str, source: &str, args: &[&str], env: &[(&str, &str)]) -> Server {
         let script = write_temp(name, source);
-        let cache = write_temp("oam-cache/.keep", "")
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        // OAM_WIRE_TEST_BIN runs the suite against another oam build -- how
-        // each test here was shown to fail on the release before its fix.
-        let bin = std::env::var("OAM_WIRE_TEST_BIN")
-            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_oam").to_string());
-        let mut cmd = Command::new(bin);
-        cmd.args(args)
-            .args(["run", script.to_str().unwrap(), "--no-check"])
-            .env("OAM_CACHE_DIR", cache)
-            .env_remove("NODE_OPTIONS")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+        let mut cmd = oam_run(args, &script);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -249,6 +267,13 @@ fn a_request_reports_the_clients_own_address() {
 /// and an upgrade socket said family `IPv4` for a `::1` client.
 #[test]
 fn an_ipv6_client_is_reported_as_ipv6() {
+    // A host or container with IPv6 loopback turned off cannot listen on
+    // `::1` at all; say so and skip, as the dual-stack test below does,
+    // rather than fail waiting for a port the script never prints.
+    if let Err(e) = std::net::TcpListener::bind("[::1]:0") {
+        eprintln!("skipped: this host cannot bind `::1` ({e})");
+        return;
+    }
     let server = Server::start("addr_v6.mjs", ADDR_SERVER, &[], &[("HOST", "::1")]);
     let target: SocketAddr = format!("[::1]:{}", server.port).parse().unwrap();
     for (path, head) in [
@@ -286,7 +311,6 @@ fn an_ipv4_client_of_a_dual_stack_listener_stays_v4_mapped() {
         eprintln!("skipped: this host's `::` listener is IPv6-only");
         return;
     }
-    let _ = server.next_line(Duration::from_millis(500)); // the probe connect
     let ex = exchange(
         target,
         None,
@@ -523,18 +547,7 @@ fn the_response_head_limit_follows_the_flag() {
          console.log('status', r.status, await r.text()); } \
          catch (e) { console.log('rejects', e.message, e.cause && e.cause.code); }",
     );
-    let run = |flags: &[&str]| {
-        let bin = std::env::var("OAM_WIRE_TEST_BIN")
-            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_oam").to_string());
-        let out = Command::new(bin)
-            .args(flags)
-            .args(["run", script.to_str().unwrap(), "--no-check"])
-            .env("PORT", port.to_string())
-            .env_remove("NODE_OPTIONS")
-            .output()
-            .expect("oam runs");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
+    let run = |flags: &[&str]| run_with_port(flags, &script, port);
     assert_eq!(
         run(&[]),
         "rejects fetch failed UND_ERR_HEADERS_OVERFLOW",
@@ -576,20 +589,7 @@ fn the_response_head_limit_follows_the_flag_on_both_http_request_paths() {
          console.log('own transport', await get(false));\n\
          console.log('agent socket', await get(new OwnSocket()));\n",
     );
-    let run = |flags: &[&str]| {
-        let bin = std::env::var("OAM_WIRE_TEST_BIN")
-            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_oam").to_string());
-        let out = Command::new(bin)
-            .args(flags)
-            .args(["run", script.to_str().unwrap(), "--no-check"])
-            .env("PORT", port.to_string())
-            .env_remove("NODE_OPTIONS")
-            .output()
-            .expect("oam runs");
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .replace("\r\n", "\n")
-    };
+    let run = |flags: &[&str]| run_with_port(flags, &script, port);
     assert_eq!(
         run(&[]),
         "own transport error HPE_HEADER_OVERFLOW Parse Error: Header overflow\n\
@@ -668,16 +668,62 @@ fn a_bare_lf_in_the_trailers_fails_the_request() {
 /// closed unanswered -- and before that, left open for good.)
 #[test]
 fn an_upgrade_nobody_listens_for_is_an_ordinary_request() {
+    use std::io::{Read, Write};
     let server = Server::start("noupgrade.mjs", BODY_SERVER, &[], &[]);
     let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
-    let ex = exchange(
-        target,
-        None,
-        b"GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
-        Duration::from_millis(800),
-    );
-    assert_eq!(ex.statuses(), ["HTTP/1.1 200 OK"], "{:?}", ex.response);
-    assert!(!ex.closed, "the connection stays open");
+    let mut stream = std::net::TcpStream::connect(target).unwrap();
+    stream
+        .write_all(
+            b"GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        )
+        .unwrap();
+    // Read until the whole answer is in -- its body is "ok", plain or as the
+    // last chunk -- however long a busy host takes over it, up to 10 s.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let started = std::time::Instant::now();
+    let mut response = Vec::new();
+    let mut buf = [0u8; 4096];
+    let complete = |r: &[u8]| {
+        r.windows(4).any(|w| w == b"\r\n\r\n")
+            && (r.ends_with(b"\r\n\r\nok") || r.ends_with(b"0\r\n\r\n"))
+    };
+    while !complete(&response) {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "no complete response: {:?}",
+            String::from_utf8_lossy(&response)
+        );
+        match stream.read(&mut buf) {
+            Ok(0) => panic!(
+                "the connection closed: {:?}",
+                String::from_utf8_lossy(&response)
+            ),
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => panic!("read failed: {e}"),
+        }
+    }
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response:?}");
+    // And then the connection stays open: the next read finds no end and no
+    // more bytes, only its own timeout.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    match stream.read(&mut buf) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) => {}
+        other => panic!("the connection stays open and silent, got {other:?}"),
+    }
     let seen = json(&server.next_line(Duration::from_secs(5)).expect("a line"));
     assert_eq!(seen["kind"], "end", "{seen}");
     assert_eq!(seen["url"], "/ws", "{seen}");
@@ -773,12 +819,16 @@ fn a_malformed_chunk_size_line_is_answered_like_node() {
         let seen = json(&server.next_line(Duration::from_secs(5)).expect("a line"));
         assert_eq!(seen["kind"], "body error", "{body:?}: {seen}");
     }
-    // A well-formed chunked body with an extension is still read.
+    // A well-formed chunked body with an extension is still read. The
+    // request asks for the connection to close, so the exchange ends when
+    // the answer is complete rather than at a deadline a busy host can miss.
+    let closing = head.replace("Host: x\r\n", "Host: x\r\nConnection: close\r\n");
+    assert_ne!(closing, head);
     let ex = exchange(
         target,
         None,
-        format!("{head}3;e=1\r\nabc\r\n0\r\n\r\n").as_bytes(),
-        Duration::from_millis(500),
+        format!("{closing}3;e=1\r\nabc\r\n0\r\n\r\n").as_bytes(),
+        Duration::from_secs(5),
     );
     assert_eq!(ex.statuses(), ["HTTP/1.1 200 OK"], "{:?}", ex.response);
     let seen = json(&server.next_line(Duration::from_secs(5)).expect("a line"));
@@ -954,7 +1004,20 @@ fn idle_keep_alive_connections_do_not_lock_the_server_out() {
     // The idle connections were closed without another byte.
     let mut first = &idle[0];
     let mut rest = Vec::new();
-    let _ = first.read_to_end(&mut rest);
+    // The read must END because the server closed the connection, not
+    // because the 5 s read timeout ran out: a connection the server never
+    // closed leaves `rest` just as empty.
+    let ended = first.read_to_end(&mut rest);
+    let timed_out = ended.as_ref().err().is_some_and(|e| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
+    });
+    assert!(
+        !timed_out,
+        "the idle connection must be closed, not left open: {ended:?}"
+    );
     assert!(rest.is_empty(), "{:?}", String::from_utf8_lossy(&rest));
 }
 

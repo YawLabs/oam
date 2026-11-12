@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import resolveModule from '../oamjs/lib/resolve.js';
 import targetsModule from '../oamjs/lib/targets.js';
 
-const { resolveBinary } = resolveModule;
+const { resolveBinary, detectGlibc } = resolveModule;
 const { SUPPORTED } = targetsModule;
 
 // Every platform path below is injected rather than probed, because four of the
@@ -57,6 +57,76 @@ test('a musl host is told it is a musl host', () => {
   assert.throws(
     () => resolveBinary(stub({ platform: 'linux', arch: 'x64', glibcVersionRuntime: null })),
     /no glibc \(musl/,
+  );
+});
+
+// detectGlibc itself, with the filesystem injected: every case above hands
+// resolveBinary a ready-made answer, so the probe that produces the answer on a
+// real Linux host was otherwise unexercised.
+const MUSL_X64 = '/lib/ld-musl-x86_64.so.1';
+const GLIBC_X64 = '/lib64/ld-linux-x86-64.so.2';
+const probe = (present, extra = {}) => detectGlibc({
+  arch: 'x64',
+  exists: (p) => present.includes(p),
+  report: () => { throw new Error('the report fallback must not run for this case'); },
+  ...extra,
+});
+
+test('a glibc host that also has the musl loader installed is a glibc host', () => {
+  // Debian/Ubuntu's `musl` package puts the musl loader on a glibc system. The
+  // gnu binary runs there, so the musl loader alone must not decide.
+  assert.equal(probe([MUSL_X64, GLIBC_X64]), 'present');
+  assert.equal(probe([MUSL_X64, '/lib/x86_64-linux-gnu/libc.so.6']), 'present');
+  // And resolveBinary, fed that answer, resolves instead of refusing.
+  assert.equal(
+    resolveBinary(stub({
+      platform: 'linux', arch: 'x64', glibcVersionRuntime: probe([MUSL_X64, GLIBC_X64]),
+    })),
+    '/resolved/oamjs-linux-x64/bin/oam',
+  );
+});
+
+test('the loader probe answers the two plain hosts without the report', () => {
+  assert.equal(probe([GLIBC_X64]), 'present');
+  assert.equal(probe([MUSL_X64]), null);
+  assert.equal(
+    detectGlibc({
+      arch: 'arm64',
+      exists: (p) => p === '/lib/ld-linux-aarch64.so.1',
+      report: () => { throw new Error('unused'); },
+    }),
+    'present',
+  );
+  assert.equal(
+    detectGlibc({
+      arch: 'arm64',
+      exists: (p) => p === '/lib/ld-musl-aarch64.so.1',
+      report: () => { throw new Error('unused'); },
+    }),
+    null,
+  );
+});
+
+test('an unrecognized layout falls back to the report, and an unusable report is "unknown"', () => {
+  const none = () => false;
+  assert.equal(
+    detectGlibc({ arch: 'x64', exists: none, report: () => ({ header: { glibcVersionRuntime: '2.39' } }) }),
+    '2.39',
+  );
+  assert.equal(detectGlibc({ arch: 'x64', exists: none, report: () => ({ header: {} }) }), null);
+  // undefined, not null: a probe that could not run is not a musl claim.
+  assert.equal(
+    detectGlibc({ arch: 'x64', exists: none, report: () => { throw new Error('no report'); } }),
+    undefined,
+  );
+  // An fs error is not a musl signal either; the report still decides.
+  assert.equal(
+    detectGlibc({
+      arch: 'x64',
+      exists: () => { throw new Error('EACCES'); },
+      report: () => ({ header: { glibcVersionRuntime: '2.39' } }),
+    }),
+    '2.39',
   );
 });
 

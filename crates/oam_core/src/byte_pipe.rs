@@ -105,8 +105,22 @@ pub async fn input(pipes: Pipes, id: u64, bytes: Vec<u8>) -> OpOutcome {
     // A near end that is gone takes nothing more: the bytes are dropped, as
     // for a closed pipe.
     let _ = half.write_all(&bytes).await;
-    if let Some(pipe) = lock(&pipes).get_mut(&id) {
-        pipe.input = Some(half);
+    // The lock is released before the await below (the guard is a temporary
+    // of this statement).
+    let orphaned = match lock(&pipes).get_mut(&id) {
+        Some(pipe) => {
+            pipe.input = Some(half);
+            None
+        }
+        None => Some(half),
+    };
+    if let Some(mut half) = orphaned {
+        // The pipe closed while this write was parked. [`close`] could not
+        // shut this half down (it was out of the map), and dropping it is
+        // not an EOF while an [`out`] read holds the other half: shut it
+        // down here, so the near end reads the end of the stream once it has
+        // drained what was buffered.
+        let _ = half.shutdown().await;
     }
     OpOutcome::Done
 }
@@ -241,6 +255,33 @@ mod tests {
         assert!(rest.is_empty());
         drop(near);
         assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+    }
+
+    #[tokio::test]
+    async fn closing_reaches_the_near_end_when_input_and_out_are_both_parked() {
+        let (pipes, ids) = pipes();
+        let id = open(&pipes, &ids);
+        let mut near = take_near(&pipes, id).unwrap();
+        // More than the pipe holds, so the write parks with its half out of
+        // the map; a parked out() read holds the other half.
+        let big = vec![7u8; PIPE + 1024];
+        let parked_in = tokio::spawn(input(pipes.clone(), id, big));
+        let parked_out = tokio::spawn(out(pipes.clone(), id));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!parked_in.is_finished(), "input waits for the near end");
+        assert!(close(&pipes, id));
+        let mut rest = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            near.read_to_end(&mut rest),
+        )
+        .await
+        .expect("the near end reads the close as EOF after the backlog")
+        .unwrap();
+        assert_eq!(rest.len(), PIPE + 1024);
+        assert!(matches!(parked_in.await.unwrap(), OpOutcome::Done));
+        drop(near);
+        assert!(matches!(parked_out.await.unwrap(), OpOutcome::Done));
     }
 
     #[tokio::test]

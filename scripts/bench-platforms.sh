@@ -94,8 +94,10 @@ else
   step "Mac leg (tailnet, --mode=bench)"
   if MAC_ART=$(bash "$SCRIPT_DIR/build-platforms-tailnet.sh" --mode=bench); then
     MAC_ART="${MAC_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line
-    cp -r "$MAC_ART/mac-arm64" "$STAGE_DIR/"
-    ok "mac leg done"
+    # `&& ok || warn`: under set -e a bare cp would end the sweep here, with
+    # no summary and no stage-dir line, when the leg handed back no such dir.
+    cp -r "$MAC_ART/mac-arm64" "$STAGE_DIR/" && ok "mac leg done" \
+      || warn "mac leg exited 0 but handed back no mac-arm64 dir under '${MAC_ART}' (sweep continues without it)"
   else
     warn "mac leg failed (sweep continues without it)"
   fi
@@ -107,8 +109,8 @@ else
   step "Linux leg (Lima VM on the build Mac, --mode=bench, incl. io_uring A/B)"
   if LINUX_ART=$(bash "$SCRIPT_DIR/build-platforms-mac-linux.sh" --mode=bench); then
     LINUX_ART="${LINUX_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line
-    cp -r "$LINUX_ART/linux-x64" "$STAGE_DIR/"
-    ok "linux leg done"
+    cp -r "$LINUX_ART/linux-x64" "$STAGE_DIR/" && ok "linux leg done" \
+      || warn "linux leg exited 0 but handed back no linux-x64 dir under '${LINUX_ART}' (sweep continues without it)"
   else
     warn "linux leg failed (sweep continues without it)"
   fi

@@ -10,7 +10,7 @@
 //
 // Surface: fetch, request, stream, Dispatcher/Agent/Pool/Client/BalancedPool,
 // ProxyAgent/EnvHttpProxyAgent, buildConnector, get/setGlobalDispatcher,
-// errors, interceptors (no-op), and the web globals undici re-exports
+// errors, interceptors (refused at use), and the web globals undici re-exports
 // (Headers/Response/Request/FormData/fetch/...).
 //
 // Supported transport control:
@@ -70,6 +70,17 @@
 //    transport beyond the connect hooks.
 
 (function oamUndiciModule(registry) {
+  // bootstrap.js's internal fetch entries, taken while the snapshot is built.
+  // This file evaluates last of the ones that need them
+  // (crates/oam_engine/build.rs), so it also removes the global they arrive
+  // on: node has no such name, and a program must not reach the entries
+  // that read a fetch init's `__oam*` knobs.
+  const fetchInternal = globalThis.__oamFetchInternal;
+  if (fetchInternal === undefined) {
+    throw new Error("oam internal: bootstrap.js's fetch entries are missing");
+  }
+  delete globalThis.__oamFetchInternal;
+
   // The global dispatcher lives on a locked global, not in this closure:
   // globalThis.fetch is native and cannot reach a module-scope binding, and it
   // needs the dispatcher to find a connect.lookup hook installed with
@@ -101,12 +112,15 @@
     // live globalThis.fetch: node's undici sends request() and its own
     // fetch() itself, so replacing globalThis.fetch (nock's fetch
     // interception, a test's wrapper) must not answer, block or see them.
-    const ownFetch = G.__oamFetchInternal.undiciFetch;
+    const ownFetch = fetchInternal.undiciFetch;
+    // undici.request's and a dispatcher's request(): not fetch in node, and
+    // the entry whose init's `__oam*` knobs are read (bootstrap.js oamFetch).
+    const ownRequest = fetchInternal.undiciRequest;
     const ZSTD_FETCH = Object.freeze({ zstd: true });
     // Where a mock connection leaves its reply's header lines for fetch,
     // which reports them in place of the ones that framed the wire
     // (bootstrap.js connectorReplyHeaders).
-    const kConnectorReply = G.__oamFetchInternal.connectorReply;
+    const kConnectorReply = fetchInternal.connectorReply;
 
     // ---- errors -----------------------------------------------------------
     // The classes globalThis.fetch raises (bootstrap.js undiciErrors, which
@@ -193,10 +207,16 @@
 
     // In the order the response carried them: the fetch Headers' stored list,
     // not its iteration, which sorts by name as the Fetch Standard says.
+    // A name the response carried more than once is an array of its values,
+    // as undici's parseHeaders files it (`set-cookie` above all: its values
+    // hold commas, so a joined string could not be split again).
     function headersToObject(headers) {
       const out = { __proto__: null };
       const add = (key, value) => {
-        out[key] = key in out ? out[key] + ", " + value : value;
+        const had = out[key];
+        if (had === undefined) out[key] = value;
+        else if (Array.isArray(had)) had.push(value);
+        else out[key] = [had, value];
       };
       if (headers && Array.isArray(headers._list)) {
         for (const [key, value] of headers._list) add(key, value);
@@ -208,7 +228,7 @@
 
     // ---- request() --------------------------------------------------------
     // undici.request(url, opts) -> { statusCode, headers, trailers, body,
-    // opaque, context }. Backed by oam's fetch (ownFetch).
+    // opaque, context }. Backed by oam's fetch (ownRequest).
     async function request(url, opts) {
       if (typeof url === "object" && url !== null && !(url instanceof G.URL)) {
         // request({ origin, path, method, ... }) form.
@@ -245,6 +265,21 @@
       checkDispatcherAllowH2(serving);
       const headersTimeout = phaseTimeout("headersTimeout", opts, dispatcherHeadersTimeout);
       const bodyTimeout = phaseTimeout("bodyTimeout", opts, dispatcherBodyTimeout);
+      // undici's RedirectHandler: `maxRedirections` redirects are followed
+      // and whatever answers after them is the response, a 3xx included;
+      // without one, none is followed and the first 3xx is the response.
+      // The request's own value wins (`null` and 0 are "none"), and when it
+      // has none the dispatcher's applies -- `new Agent({ maxRedirections })`,
+      // a Pool's, a Client's. Anything but a whole number from 0 up is
+      // refused before a request is made (measured on node v22.22.2 +
+      // undici 6.28.1).
+      let maxRedirections = opts.maxRedirections;
+      if (maxRedirections === undefined && carrier && carrier._options) {
+        maxRedirections = carrier._options.maxRedirections;
+      }
+      if (maxRedirections != null && (!Number.isInteger(maxRedirections) || maxRedirections < 0)) {
+        throw new errors.InvalidArgumentError("maxRedirections must be a positive number");
+      }
       // Both limits end the request the way an abort does, so the fetch runs
       // under a signal of the shim's own: aborting it with the timeout error
       // rejects a fetch still waiting for its head with that error, and after
@@ -265,10 +300,19 @@
       }
       const method = opts.method || "GET";
       const init = {
+        // The `__oam*` keys below are read because this (and the
+        // `{ ...init }` copies made further down) goes to ownRequest, one of
+        // the runtime's own entries. No prototype: a key not set here is
+        // absent, not looked up on Object.prototype.
+        __proto__: null,
         method,
         headers: opts.headers ? headerPairs(opts.headers) : undefined,
         signal: controller.signal,
-        redirect: opts.redirect || (opts.maxRedirections > 0 ? "follow" : undefined),
+        // How many redirects the transport follows, by the RedirectHandler's
+        // rules; 0 has it hand a 3xx back as the response (oamFetch reads
+        // this for a request that is not a fetch, whose `redirect` option
+        // it does not).
+        __oamMaxRedirections: maxRedirections > 0 ? maxRedirections : 0,
         // The dispatcher carries the connect.lookup hook. undici enforces it
         // for request() too, not just fetch(): agent.request() and
         // undici.request(url, {dispatcher}) both consult it (measured on node
@@ -529,7 +573,7 @@
       if (body == null) {
         bytes = null;
       } else if (isStream(body)) {
-        return sendStreamed(url, { ...init, headers }, body, true, declared, expectsPayload, controller);
+        return sendStreamed(url, { __proto__: null, ...init, headers }, body, true, declared, expectsPayload, controller);
       } else if (body instanceof Uint8Array || ArrayBuffer.isView(body)) {
         bytes = body.byteLength ? new Uint8Array(body.buffer, body.byteOffset, body.byteLength) : null;
       } else if (body instanceof ArrayBuffer) {
@@ -551,7 +595,7 @@
         const read = new Uint8Array(await encoded.arrayBuffer());
         bytes = read.byteLength ? read : null;
       } else if (isIterable(body)) {
-        return sendStreamed(url, { ...init, headers }, body, false, declared, expectsPayload, controller);
+        return sendStreamed(url, { __proto__: null, ...init, headers }, body, false, declared, expectsPayload, controller);
       } else if (isBlobLike(body)) {
         // undici sends a Blob with its size as content-length and its type
         // as content-type, unless the caller set one.
@@ -566,7 +610,7 @@
       if (length === 0 && !expectsPayload) length = null;
       if (!NO_CONTENT_LENGTH.has(method) && length > 0 && declared !== null && declared !== length) throw mismatch();
       if (length === 0) headers.push(["content-length", "0"]);
-      return ownFetch(url, { ...init, headers, body: bytes === null ? undefined : bytes });
+      return ownRequest(url, { __proto__: null, ...init, headers, body: bytes === null ? undefined : bytes });
     }
 
     // A Readable (`stream`) or an iterable body, written as undici's
@@ -640,7 +684,8 @@
           sentSignal = ops.fetchSentOpen();
           const headers = init.headers.slice();
           if (length !== null) headers.push(["content-length", String(length)]);
-          const sent = ownFetch(url, {
+          const sent = ownRequest(url, {
+            __proto__: null,
             ...init,
             headers,
             __oamBodyStream: channel,
@@ -805,19 +850,64 @@
     // undici's writeIterable reads it: `for await`, the next value taken once
     // the transport has the last. Stopping returns the iterator, which ends
     // a generator and cancels a ReadableStream.
+    //
+    // The iterator is driven by hand rather than by `for await`, so that a
+    // stop reaches one parked in its own await: `return()` is called then
+    // and there (a ReadableStream's cancels the read in flight; a generator
+    // runs its `finally` once the step it is in settles), not when the next
+    // chunk happens to arrive.
     function pumpIterable(iterable, write, finish) {
       let stopped = false;
-      (async () => {
-        for await (const chunk of iterable) {
-          if (stopped) return;
-          const pending = write(chunk);
-          if (pending !== null && (await pending.then(null, () => false)) === false) return finish(null, true);
-          if (stopped) return;
+      let iterator = null;
+      let returned = false;
+      // Return the iterator, once; what its return() does is its own affair.
+      const giveBack = () => {
+        if (returned || iterator === null) return;
+        returned = true;
+        try {
+          if (typeof iterator.return === "function") {
+            const result = iterator.return();
+            if (result && typeof result.then === "function") result.then(undefined, () => {});
+          }
+        } catch {
+          /* the iterator's own failure to stop */
         }
+      };
+      (async () => {
+        const open = iterable[Symbol.asyncIterator] ?? iterable[Symbol.iterator];
+        iterator = open.call(iterable);
+        if (stopped) return giveBack();
+        for (;;) {
+          let step;
+          try {
+            step = await iterator.next();
+          } catch (err) {
+            // An iterator that threw is over; it is not returned as well.
+            returned = true;
+            throw err;
+          }
+          if (stopped) return giveBack();
+          if (step.done) break;
+          // A sync iterable's values are awaited, as `for await` awaits them.
+          const chunk = await step.value;
+          if (stopped) return giveBack();
+          const pending = write(chunk);
+          if (pending !== null && (await pending.then(null, () => false)) === false) {
+            giveBack();
+            return finish(null, true);
+          }
+          if (stopped) return giveBack();
+        }
+        returned = true;
         finish(null, false);
-      })().catch((err) => finish(err, false));
+      })().catch((err) => {
+        // A chunk refused (write threw) leaves the iterator open: return it.
+        giveBack();
+        finish(err, false);
+      });
       return function stop() {
         stopped = true;
+        giveBack();
       };
     }
 
@@ -939,7 +1029,14 @@
       const { statusCode, headers, body, trailers, opaque } = await request(url, opts);
       const writable = factory({ statusCode, headers, opaque, trailers });
       await new Promise((resolve, reject) => {
-        body.on("error", reject);
+        // pipe() leaves its destination open when the source fails, so a
+        // body that errors (a body timeout, an abort, a dropped connection)
+        // destroys the factory's writable with that error, as undici's
+        // stream() does -- a file stream's descriptor is not left open.
+        body.on("error", (err) => {
+          reject(err);
+          if (typeof writable.destroy === "function" && !writable.destroyed) writable.destroy(err);
+        });
         writable.on("error", reject);
         writable.on("finish", resolve);
         writable.on("close", resolve);
@@ -1140,6 +1237,12 @@
       // most callers use. THIS dispatcher is the one the request rides, so
       // its connect.lookup hook applies; dropping it here used to un-pin
       // every agent.request() call.
+      // undici's compose() wraps dispatch() in interceptors, and oam does not
+      // run dispatch(): refused by name, like the rest of the dispatch-level
+      // API, rather than left a bare "compose is not a function".
+      compose() {
+        throw dispatchOnly("Dispatcher#compose()");
+      }
       request(opts, handler) {
         const p = request({ ...(opts || {}), dispatcher: this }, undefined);
         if (typeof handler === "function") {
@@ -1548,15 +1651,65 @@
       }
     }
     class Pool extends Client {}
+    // undici's BalancedPool: a set of upstream origins, each request sent to
+    // the next one in turn. undici's is a weighted round-robin whose weights
+    // fall on a connection error and recover on a response; here every
+    // upstream weighs the same and none is skipped for having failed. With
+    // no upstream a request fails with BalancedPoolMissingUpstreamError.
     class BalancedPool extends Dispatcher {
       constructor(upstreams = [], options) {
         super(options);
-        this.upstreams = Array.isArray(upstreams) ? upstreams : [upstreams];
+        this._oamUpstreams = [];
+        this._oamNextUpstream = 0;
+        for (const upstream of Array.isArray(upstreams) ? upstreams : [upstreams]) {
+          this.addUpstream(upstream);
+        }
+      }
+      // The upstreams' origins, as undici's getter lists them.
+      get upstreams() {
+        return this._oamUpstreams.slice();
+      }
+      // An upstream is filed by its origin, once.
+      addUpstream(upstream) {
+        const origin = upstreamOrigin(upstream);
+        if (!this._oamUpstreams.includes(origin)) this._oamUpstreams.push(origin);
+        return this;
+      }
+      removeUpstream(upstream) {
+        const origin = upstreamOrigin(upstream);
+        const at = this._oamUpstreams.indexOf(origin);
+        if (at !== -1) {
+          this._oamUpstreams.splice(at, 1);
+          if (at < this._oamNextUpstream) this._oamNextUpstream -= 1;
+        }
+        return this;
       }
       request(opts, handler) {
-        const origin = this.upstreams[0] || "";
+        const list = this._oamUpstreams;
+        if (list.length === 0) {
+          const err = new errors.BalancedPoolMissingUpstreamError();
+          if (typeof handler === "function") {
+            queueMicrotask(() => handler(err, null));
+            return undefined;
+          }
+          return Promise.reject(err);
+        }
+        if (this._oamNextUpstream >= list.length) this._oamNextUpstream = 0;
+        const origin = list[this._oamNextUpstream];
+        this._oamNextUpstream += 1;
         return super.request({ ...opts, origin }, handler);
       }
+    }
+    function upstreamOrigin(upstream) {
+      if (!(upstream instanceof G.URL) && (typeof upstream !== "string" || upstream === "")) {
+        throw new errors.InvalidArgumentError("Invalid URL: The URL argument must be a non-empty string.");
+      }
+      // A string that does not parse throws the URL constructor's TypeError.
+      const url = upstream instanceof G.URL ? upstream : new G.URL(upstream);
+      if (url.protocol !== "http:" && url.protocol !== "https:") {
+        throw new errors.InvalidArgumentError("Invalid URL protocol: the URL must start with `http:` or `https:`.");
+      }
+      return url.origin;
     }
 
     // The connection policy globalThis.fetch applies for a dispatcher (see
@@ -1712,15 +1865,24 @@
       return G.__oamForeignUndiciGlobal() ?? holder.current;
     }
 
-    // ---- interceptors (no-op pass-throughs) -------------------------------
-    const passThrough = () => (dispatch) => dispatch;
+    // ---- interceptors (refused at use) -------------------------------------
+    // Each factory links and can be called -- a module may build its
+    // interceptors as it loads -- but what it returns wraps dispatch(), which
+    // oam does not run: applying it refuses by name instead of passing the
+    // request through without the redirect / retry / dns / cache policy it
+    // was asked for. (compose() refuses too, and a dispatcher built with the
+    // `interceptors` option is refused per request: policyOf.)
+    const refusedInterceptor = (name) => () =>
+      function interceptor() {
+        throw dispatchOnly("interceptors." + name + "()");
+      };
     const interceptors = {
-      redirect: passThrough,
-      retry: passThrough,
-      dump: passThrough,
-      dns: passThrough,
-      cache: passThrough,
-      responseError: passThrough,
+      redirect: refusedInterceptor("redirect"),
+      retry: refusedInterceptor("retry"),
+      dump: refusedInterceptor("dump"),
+      dns: refusedInterceptor("dns"),
+      cache: refusedInterceptor("cache"),
+      responseError: refusedInterceptor("responseError"),
     };
 
     // ---- dispatch-level API: exported, refused at use ----------------------

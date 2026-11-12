@@ -8,14 +8,19 @@
 //! the ecosystem branches on codes, not messages.
 
 use crate::buffer_ops::{op_buffer_decode, op_buffer_utf8_length};
+/// (name, gid, shell, home) copied out of a passwd entry.
+#[cfg(unix)]
+type PasswdRecord = (Option<String>, u32, Option<String>, Option<String>);
+
 use crate::crypto_ops::{
     op_crypto_check_prime, op_crypto_cipher_create, op_crypto_cipher_final,
     op_crypto_cipher_final_gcm, op_crypto_cipher_get_auth_tag, op_crypto_cipher_set_aad,
     op_crypto_cipher_set_auth_tag, op_crypto_cipher_set_auto_padding, op_crypto_cipher_update,
-    op_crypto_dh_compute_secret, op_crypto_dh_generate_keys, op_crypto_ec_jwk_export,
-    op_crypto_ec_jwk_import, op_crypto_ecdh_compute_secret, op_crypto_ecdh_generate_keys,
-    op_crypto_ecdh_get_public_key, op_crypto_extract_public_pem, op_crypto_generate_keypair,
-    op_crypto_generate_prime, op_crypto_hash_copy, op_crypto_hash_create, op_crypto_hash_digest,
+    op_crypto_dh_check, op_crypto_dh_compute_secret, op_crypto_dh_generate_keys,
+    op_crypto_ec_jwk_export, op_crypto_ec_jwk_import, op_crypto_ecdh_compute_secret,
+    op_crypto_ecdh_generate_keys, op_crypto_ecdh_get_public_key, op_crypto_extract_public_pem,
+    op_crypto_gcm_one_shot, op_crypto_generate_keypair, op_crypto_generate_prime,
+    op_crypto_handle_free, op_crypto_hash_copy, op_crypto_hash_create, op_crypto_hash_digest,
     op_crypto_hash_update, op_crypto_hkdf_sync, op_crypto_hmac_create, op_crypto_pbkdf2_sync,
     op_crypto_private_decrypt, op_crypto_private_encrypt, op_crypto_public_decrypt,
     op_crypto_public_encrypt, op_crypto_random_fill, op_crypto_rsa_jwk_components,
@@ -139,6 +144,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("env", op_env),
         ("envHidden", op_env_hidden),
         ("forkIpcPort", op_fork_ipc_port),
+        ("forkIpcQueue", op_fork_ipc_queue),
+        ("forkIpcQueueClear", op_fork_ipc_queue_clear),
         ("envWorker", op_env_worker),
         ("envShareNew", op_env_share_new),
         ("envSharedVersion", op_env_shared_version),
@@ -156,10 +163,6 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // TTY raw-mode + window-size for interactive TUIs (process.stdin/stdout).
         ("ttySetRawMode", op_tty_set_raw_mode),
         ("ttyGetWinSize", op_tty_get_win_size),
-        // POSIX identity. Real syscalls -- a hardcoded uid of 0 would claim
-        // the process is root, which is both false and load-bearing (code
-        // branches on `getuid() === 0`). Absent on Windows, where Node does
-        // not define these at all.
         ("vmCompile", op_vm_compile),
         ("vmModuleCompile", op_vm_module_compile),
         ("vmModuleRequests", op_vm_module_requests),
@@ -177,6 +180,11 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("v8Is", op_v8_is),
         ("arrayBufferViewHasBuffer", op_array_buffer_view_has_buffer),
         ("getProxyDetails", op_get_proxy_details),
+        // POSIX identity. Real syscalls -- a hardcoded uid of 0 would claim
+        // the process is root, which is both false and load-bearing (code
+        // branches on `getuid() === 0`). On Windows the ops answer
+        // "unsupported" and the JS layer never installs the `process.*`
+        // functions, which Node does not define there at all.
         ("posixGetId", op_posix_get_id),
         ("posixSetId", op_posix_set_id),
         ("posixGetGroups", op_posix_get_groups),
@@ -187,7 +195,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("processExecve", op_process_execve),
         ("nowMs", op_now_ms),
         ("hrtimeNanos", op_hrtime_nanos),
-        ("uptimeMs", op_uptime_ms),
+        // The same clock under its second name (process.uptime, libuv's
+        // loop time): one function, so the two cannot drift apart.
+        ("uptimeMs", op_now_ms),
         ("homedir", op_homedir),
         ("tmpdir", op_tmpdir),
         ("hostname", op_hostname),
@@ -410,6 +420,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("http2SessionWait", op_http2_session_wait),
         ("http2SessionGoaway", op_http2_session_goaway),
         ("http2SessionSendGoaway", op_http2_session_send_goaway),
+        ("http2SessionPing", op_http2_session_ping),
         ("http2SessionClose", op_http2_session_close),
         ("http2SessionDestroy", op_http2_session_destroy),
         ("netCheck", op_net_check),
@@ -424,6 +435,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tcpAcceptTake", op_tcp_accept_take),
         ("tcpServerClose", op_tcp_server_close),
         ("tcpSetRef", op_tcp_set_ref),
+        ("tcpLingerAtExit", op_tcp_linger_at_exit),
+        ("tcpReadAhead", op_tcp_read_ahead),
         ("tcpServerSetRef", op_tcp_server_set_ref),
         // Pipes (node:net's `path`): named pipes / Unix domain sockets,
         // whose streams and servers then take the tcp* ops above.
@@ -440,6 +453,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("cryptoHashUpdate", op_crypto_hash_update),
         ("cryptoHashDigest", op_crypto_hash_digest),
         ("cryptoHashCopy", op_crypto_hash_copy),
+        // Releases a hash / HMAC / cipher handle dropped before its final.
+        ("cryptoHandleFree", op_crypto_handle_free),
         ("cryptoRandomFill", op_crypto_random_fill),
         ("cryptoTimingSafeEqual", op_crypto_timing_safe_equal),
         // node:crypto wave 2: key derivation + symmetric ciphers
@@ -450,6 +465,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("cryptoCipherUpdate", op_crypto_cipher_update),
         ("cryptoCipherFinal", op_crypto_cipher_final),
         ("cryptoCipherFinalGcm", op_crypto_cipher_final_gcm),
+        ("cryptoGcmOneShot", op_crypto_gcm_one_shot),
         ("cryptoCipherSetAad", op_crypto_cipher_set_aad),
         ("cryptoCipherGetAuthTag", op_crypto_cipher_get_auth_tag),
         ("cryptoCipherSetAuthTag", op_crypto_cipher_set_auth_tag),
@@ -479,6 +495,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("cryptoEcdhGetPublicKey", op_crypto_ecdh_get_public_key),
         ("cryptoDhGenerateKeys", op_crypto_dh_generate_keys),
         ("cryptoDhComputeSecret", op_crypto_dh_compute_secret),
+        ("cryptoDhCheck", op_crypto_dh_check),
         ("cryptoX509Parse", op_crypto_x509_parse),
         ("cryptoGeneratePrime", op_crypto_generate_prime),
         ("cryptoCheckPrime", op_crypto_check_prime),
@@ -579,6 +596,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // process.cpuUsage / process.kill
         ("processCpuUsage", op_process_cpu_usage),
         ("processKill", op_process_kill),
+        ("osSignals", op_os_signals),
         ("processUmask", op_process_umask),
     );
 
@@ -628,6 +646,57 @@ fn port_arg(
 /// infinity, nothing below 0 or above 65535.
 fn port_from_number(n: f64) -> Option<u16> {
     (n.fract() == 0.0 && (0.0..=65535.0).contains(&n)).then_some(n as u16)
+}
+
+/// The id no handle has: what [`handle_id_arg`] answers for an argument that
+/// names none. The shared id counter counts up from
+/// `oam_core::FIRST_HANDLE_ID` and cannot reach it. (File descriptors are not
+/// handle ids: they take [`fd_arg`] and resolve in the descriptor table only.)
+const NO_HANDLE: u64 = u64::MAX;
+
+/// A handle id, as argument `index` of an op that goes on to look the handle
+/// up: the id when the argument is a non-negative integer, else
+/// [`NO_HANDLE`], which every registry misses -- so a missing, NaN, negative
+/// or fractional argument is "no such handle", as the ops' sync twins treat
+/// it with their `id >= 0.0` guard. `unwrap_or(-1.0) as u64` saturated all of
+/// those to id 0 instead: a real id's spelling, harmless only for as long as
+/// no counter issues 0.
+fn handle_id_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+) -> u64 {
+    args.get(index)
+        .number_value(scope)
+        .and_then(handle_id_from_number)
+        .unwrap_or(NO_HANDLE)
+}
+
+/// The handle id a JS number names, when it names one: an integer from 0 up
+/// to the largest a JS number holds exactly (2^53 - 1).
+fn handle_id_from_number(n: f64) -> Option<u64> {
+    (n.fract() == 0.0 && (0.0..=9_007_199_254_740_991.0).contains(&n)).then_some(n as u64)
+}
+
+#[cfg(test)]
+mod handle_id_arg_tests {
+    use super::handle_id_from_number;
+
+    #[test]
+    fn only_a_non_negative_integer_names_a_handle() {
+        assert_eq!(handle_id_from_number(0.0), Some(0));
+        assert_eq!(handle_id_from_number(64.0), Some(64));
+        assert_eq!(
+            handle_id_from_number(9_007_199_254_740_991.0),
+            Some(9_007_199_254_740_991)
+        );
+        // Each of these used to come out as id 0.
+        assert_eq!(handle_id_from_number(-1.0), None);
+        assert_eq!(handle_id_from_number(f64::NAN), None);
+        assert_eq!(handle_id_from_number(1.5), None);
+        assert_eq!(handle_id_from_number(f64::INFINITY), None);
+        assert_eq!(handle_id_from_number(f64::NEG_INFINITY), None);
+    }
 }
 
 #[cfg(test)]
@@ -682,7 +751,6 @@ macro_rules! core_runtime_mut {
     };
 }
 
-/// Throw an Error with Node's `.code` / `.syscall` / `.path` properties.
 /// Node's `err.errno`. Single source of truth lives in oam_core so the
 /// child-spawn failure body can use the same table; see its doc comment.
 fn node_errno(code: &str, error: &std::io::Error) -> Option<i32> {
@@ -904,13 +972,11 @@ fn keep_win32_code<'s>(
     }
 }
 
-/// An optional non-negative POSITION argument: a number seeks (pread/pwrite),
-/// absent / null / negative means "from the current cursor". Shared by the four
-/// read/write natives so the coercion cannot drift between them.
 /// A read / write position argument as node's binding reads one (GetOffset):
-/// an integer number is the position -- negative ones included, which
-/// `oam_core::file_offset` resolves per platform -- anything else (null, a
-/// fraction, NaN) is the cursor.
+/// an integer number is the position (pread/pwrite) -- negative ones
+/// included, which `oam_core::file_offset` resolves per platform -- anything
+/// else (absent, null, a fraction, NaN) is the current cursor. Shared by the
+/// read/write natives so the coercion cannot drift between them.
 fn optional_position(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments<'_>,
@@ -1182,7 +1248,16 @@ fn op_env(
             env.pairs.clone()
         } else {
             let perms = get_permissions(scope);
-            std::env::vars()
+            // vars_os, decoded lossily: std::env::vars() PANICS on the first
+            // name or value that is not valid Unicode (a raw 0xFF byte on
+            // unix, a lone surrogate on Windows), and a panic inside a V8
+            // callback takes the process down. Node exposes such an entry
+            // lossily; here what does not decode becomes U+FFFD.
+            std::env::vars_os()
+                .map(|(name, value)| {
+                    let name = name.to_string_lossy().into_owned();
+                    (name, value.to_string_lossy().into_owned())
+                })
                 .filter(|(name, _)| !is_hidden_env_name(name) && perms.check_env(name).is_ok())
                 .collect()
         };
@@ -1241,10 +1316,12 @@ fn op_env_hidden(
     }
 }
 
-/// The variable child_process.fork() names its IPC channel's port in.
+/// The variable child_process.fork() names its IPC channel in: the port, and
+/// after a `:` the per-child token the child presents on connecting
+/// (`<port>:<token>`; the JS side splits it).
 const FORK_IPC_PORT_VAR: &str = "OAM_FORK_IPC_PORT";
 
-/// `__oam.node.forkIpcPort()`: the port of the IPC channel this process was
+/// `__oam.node.forkIpcPort()`: the value of the IPC channel this process was
 /// forked with, or `undefined`. It is taken out of the environment as it is
 /// read, as node's setupChildProcessIpcChannel deletes NODE_CHANNEL_FD: a
 /// forked child's process.env does not hold it, so neither do its own
@@ -1262,9 +1339,39 @@ fn op_fork_ipc_port(
         return;
     };
     set_process_env(FORK_IPC_PORT_VAR, None);
-    if let Some(port) = v8::String::new(scope, &port.to_string_lossy()) {
+    let port = port.to_string_lossy();
+    // Kept natively too: an exit with messages still queued behind the
+    // channel's connect sends them itself (oam_core::fork_ipc).
+    oam_core::fork_ipc::set_channel(&port);
+    if let Some(port) = v8::String::new(scope, &port) {
         rv.set(port.into());
     }
+}
+
+/// `__oam.node.forkIpcQueue(frame)`: a `process.send()` message queued
+/// behind the IPC channel's connect, as it will go on the wire. Held
+/// natively as well as in JS so that an exit before the connect is up still
+/// sends it (oam_core::fork_ipc); a no-op in a process with no channel.
+fn op_fork_ipc_queue(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(frame) = arg_bytes(scope, &args, 0) else {
+        throw_type_error(scope, "forkIpcQueue requires data");
+        return;
+    };
+    oam_core::fork_ipc::queue_unsent(&frame);
+}
+
+/// `__oam.node.forkIpcQueueClear()`: the queue [`op_fork_ipc_queue`] built
+/// is JS's again -- written to the connected channel, or failed with it.
+fn op_fork_ipc_queue_clear(
+    _scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    oam_core::fork_ipc::clear_unsent();
 }
 
 /// `__oam.node.envWorker()`: `null` on the main thread; on a worker thread
@@ -1495,10 +1602,18 @@ fn record_drive_cwd() {}
 /// chdir's `=X:`), each as node's own binding does.
 fn set_process_env(name: &str, value: Option<&std::ffi::OsStr>) {
     // SAFETY: edition 2024 marks env mutation unsafe because on POSIX it
-    // races other threads calling getenv. Every caller runs on the isolate
-    // thread inside an op, as node's own TZ and chdir updates do; on Windows
-    // the environment block is guarded by the process's own lock, which
-    // makes the mutation sound on any thread (std::env::set_var's docs).
+    // races other threads calling getenv. On Windows the environment block
+    // is guarded by the process's own lock, which makes the mutation sound
+    // on any thread (std::env::set_var's docs). On POSIX std's env lock
+    // serialises this against every Rust reader and writer (std::env::var,
+    // vars_os, another isolate's call here), but NOT against C code reading
+    // `environ` directly: a getaddrinfo or localtime/tzset running on a
+    // Worker's isolate thread or a runtime pool thread at the same moment.
+    // That residue is not excluded here; it is the exposure node itself has
+    // (its TZ setter and uv_os_setenv mutate the same block with libuv's
+    // threadpool running), accepted so that `process.env.TZ = ...` takes
+    // effect mid-run as it does there. The callers are the op bodies named
+    // in the doc above, each on an isolate thread.
     unsafe {
         match value {
             Some(value) => std::env::set_var(name, value),
@@ -1518,6 +1633,11 @@ fn op_exit(
     // wrappers whose body is running (this call among them), would be lost
     // here otherwise (see modules::flush_code_cache).
     crate::modules::flush_code_cache(scope);
+    // No runtime drops on this path, so no addon is unloaded and no addon
+    // env is freed; closing the envs keeps a destructor the C runtime runs
+    // on the way out from getting back into V8 (napi::close_for_exit).
+    #[cfg(feature = "napi")]
+    crate::napi::close_for_exit(scope);
     // Immediate exit, documented divergence (no 'exit' event flush).
     oam_core::exit_process(code);
 }
@@ -1738,8 +1858,9 @@ fn write_whole(mut sink: impl std::io::Write, mut bytes: &[u8]) -> std::io::Resu
 /// handle, so the writes skip std's `LineWriter` and still reach the same pipe,
 /// file or terminal. Made on first use; `None` when there is no stdout to
 /// duplicate, and from the moment the program closes descriptor 1
-/// (`forget_raw_stdout`). Taken under std's stdout lock by every writer, so
-/// the mutex is never contended.
+/// (`forget_raw_stdout`). Taken under std's stdout lock by every user, the
+/// closer included, so the mutex itself is never contended: whoever waits,
+/// waits on the stdout lock.
 static RAW_STDOUT: std::sync::Mutex<Option<Option<std::fs::File>>> = std::sync::Mutex::new(None);
 
 fn raw_stdout() -> std::sync::MutexGuard<'static, Option<Option<std::fs::File>>> {
@@ -1764,6 +1885,12 @@ fn raw_stdout() -> std::sync::MutexGuard<'static, Option<Option<std::fs::File>>>
 /// really closed: a pipe's reader sees EOF at `fs.closeSync(1)`, as under
 /// node, not when the process exits.
 fn forget_raw_stdout() {
+    // Under std's stdout lock like every writer (it is re-entrant, so a
+    // caller already holding it is fine): the one lock order, stdout then
+    // RAW_STDOUT. A close from another thread (a Worker's fs.closeSync(1))
+    // therefore waits for a write in flight to finish, write_whole's
+    // not-ready pauses included, and only then drops the duplicate.
+    let _stdout = std::io::stdout().lock();
     *RAW_STDOUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(None);
 }
 
@@ -2225,7 +2352,8 @@ fn tty_init_verdict(file: Option<&std::fs::File>) -> i32 {
 // process.stdin.setRawMode + stdout/stderr columns/rows. Windows uses inline
 // console FFI (matches os_release/mem_status style); Unix uses libc termios +
 // TIOCGWINSZ (cfg(unix) dep). Exactly one platform impl compiles per target;
-// both are exercised by the 4-platform CI (only Windows builds locally).
+// the unix one is first compiled by the release legs (macOS, Linux), the
+// Windows one by a local build.
 
 #[cfg(windows)]
 static WIN_STDIN_ORIG_MODE: std::sync::atomic::AtomicU32 =
@@ -3168,9 +3296,9 @@ mod raw_mode_tests {
     }
 }
 
-/// A descriptor oam's table holds. Its number is oam's (from OWN_FD_BASE up,
-/// or a dup of an inherited one), never the OS descriptor, so the ioctl goes
-/// to the file's own.
+/// A descriptor oam's table holds. Its number is the table's (the lowest
+/// free one when it was opened, or an inherited descriptor's), never the OS
+/// descriptor, so the ioctl goes to the file's own.
 #[cfg(unix)]
 fn file_win_size(file: &std::fs::File) -> Option<(i32, i32)> {
     use std::os::fd::AsRawFd;
@@ -3202,6 +3330,22 @@ fn op_tty_set_raw_mode(
 ) {
     let fd = args.get(0).int32_value(scope).unwrap_or(0);
     let enable = args.get(1).boolean_value(scope);
+    // Descriptor 0 only. The saved pre-raw state is ONE process-wide slot
+    // (UNIX_STDIN_ORIG_TERMIOS / WIN_STDIN_ORIG_MODE) with one restore hook,
+    // all of it stdin's: another descriptor would save its mode over stdin's
+    // and a later disable would write that to the wrong terminal (and on
+    // Windows win_std_handle answers any number above 1 with stderr). The JS
+    // layer already refuses fd != 0 with ENOTSUP; the same answer here, so
+    // the invariant does not rest on every caller remembering it. libuv's
+    // UV_ENOTSUP: -4049 on Windows, -ENOTSUP elsewhere.
+    if fd != 0 {
+        #[cfg(windows)]
+        let unsupported = -4049;
+        #[cfg(unix)]
+        let unsupported = -libc::ENOTSUP;
+        rv.set_int32(unsupported);
+        return;
+    }
     // 0 on success, else the negative libuv errno -- `uv_tty_set_mode`'s own
     // contract, so the JS side can emit node's ErrnoException shape rather
     // than swallowing a bare `false`.
@@ -3232,8 +3376,9 @@ fn op_tty_get_win_size(
 ) {
     let fd = args.get(0).int32_value(scope).unwrap_or(1);
     // Above 2 the number is a descriptor-table entry, not an OS descriptor:
-    // oam's own start at OWN_FD_BASE (64), so asking the OS about the bare
-    // number read the wrong terminal or none. node sizes the terminal the
+    // the table numbers oam's own files itself (3 is the first file the
+    // program opened, whatever the OS calls it), so asking the OS about the
+    // bare number read the wrong terminal or none. node sizes the terminal the
     // program opened, so the table's file is asked (#391); a number the
     // table does not hold has no size, as node's getWindowSize fails EBADF.
     let size = if fd > 2 {
@@ -3259,12 +3404,6 @@ fn op_tty_get_win_size(
     }
 }
 
-/// POSIX identity ops. Every one is a real syscall on unix and a no-op that
-/// reports "unsupported" on Windows, where the JS layer never installs the
-/// corresponding `process.*` function in the first place (Node does not
-/// define them there either).
-///
-/// `which`: 0=uid 1=gid 2=euid 3=egid.
 /// `op_v8_is(value, kind) -> boolean`
 ///
 /// V8's own answer to "what kind of value is this", for the `util.types`
@@ -3394,6 +3533,12 @@ fn op_get_proxy_details(
     rv.set(details.into());
 }
 
+/// POSIX identity ops. Every one is a real syscall on unix and a no-op that
+/// reports "unsupported" on Windows, where the JS layer never installs the
+/// corresponding `process.*` function in the first place (Node does not
+/// define them there either).
+///
+/// `which`: 0=uid 1=gid 2=euid 3=egid.
 fn op_posix_get_id(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3593,9 +3738,19 @@ fn op_posix_init_groups(
     }
 }
 
+/// Held across every getpwuid / getpwnam / getgrnam call and the copy out of
+/// its result. Those return a pointer into storage libc keeps ONE of per
+/// process, rewritten by the next call from any thread, and there is an
+/// isolate thread per Worker: without this a second lookup could rewrite the
+/// record while the first was still reading its name. These three are the
+/// only passwd/group lookups in the workspace.
+#[cfg(unix)]
+static CREDENTIAL_LOOKUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Credential lookup. `kind`: 0 = user NAME -> uid (getpwnam), 1 = group
 /// NAME -> gid (getgrnam), 2 = uid -> user NAME (getpwuid, the reverse
-/// direction initgroups(3) needs since it takes a name, not an id).
+/// direction initgroups(3) needs since it takes a name, not an id), 3 = uid
+/// -> the passwd record `{ username, gid, shell, homedir }` for os.userInfo().
 /// Returns null when there is no such entry, which JS turns into Node's
 /// ERR_UNKNOWN_CREDENTIAL.
 fn op_posix_lookup_id(
@@ -3607,30 +3762,69 @@ fn op_posix_lookup_id(
     #[cfg(unix)]
     {
         // uid -> name is the one direction whose input is numeric.
-        if kind == 2 {
+        if kind == 2 || kind == 3 {
             let uid = args.get(1).number_value(scope).unwrap_or(-1.0);
             if !(0.0..=f64::from(u32::MAX)).contains(&uid) || uid.fract() != 0.0 {
                 rv.set(v8::null(scope).into());
                 return;
             }
-            // getpwuid returns a pointer into static storage: copy the name
+            let _lookup = CREDENTIAL_LOOKUP.lock().unwrap_or_else(|e| e.into_inner());
+            // getpwuid returns a pointer into static storage: copy the fields
             // out immediately, never retain the pointer.
             // SAFETY: getpwuid returns either NULL (checked) or a pointer into
-            // libc static storage valid until the next getpw* call; the name is
-            // copied out immediately via CStr and the pointer is never retained
-            // past this block. `uid` was range-checked to fit uid_t above.
-            let name = unsafe {
+            // libc static storage valid until the next getpw* call, and no
+            // other thread can make that call while CREDENTIAL_LOOKUP is held
+            // (`_lookup`, above, outlives this block); the name, shell and
+            // home directory are NUL-terminated strings in that same storage
+            // (the two optional ones NULL-checked), copied out immediately
+            // via CStr, and no pointer is retained past this block. `uid`
+            // was range-checked to fit uid_t above.
+            let record: Option<PasswdRecord> = unsafe {
                 let pw = libc::getpwuid(uid as libc::uid_t);
                 if pw.is_null() {
                     None
                 } else {
-                    std::ffi::CStr::from_ptr((*pw).pw_name)
+                    let name = std::ffi::CStr::from_ptr((*pw).pw_name)
                         .to_str()
                         .ok()
-                        .map(str::to_string)
+                        .map(str::to_string);
+                    let shell = if (*pw).pw_shell.is_null() {
+                        None
+                    } else {
+                        std::ffi::CStr::from_ptr((*pw).pw_shell)
+                            .to_str()
+                            .ok()
+                            .map(str::to_string)
+                    };
+                    let dir = if (*pw).pw_dir.is_null() {
+                        None
+                    } else {
+                        std::ffi::CStr::from_ptr((*pw).pw_dir)
+                            .to_str()
+                            .ok()
+                            .map(str::to_string)
+                    };
+                    Some((name, (*pw).pw_gid, shell, dir))
                 }
             };
-            match name.and_then(|n| v8::String::new(scope, &n)) {
+            let Some((Some(name), gid, shell, dir)) = record else {
+                rv.set(v8::null(scope).into());
+                return;
+            };
+            if kind == 3 {
+                // The whole passwd record, for os.userInfo() (libuv's
+                // uv_os_get_passwd reads the same four fields).
+                let json = serde_json::json!({
+                    "username": name,
+                    "gid": gid,
+                    "shell": shell,
+                    "homedir": dir,
+                })
+                .to_string();
+                return_json(scope, &mut rv, &json);
+                return;
+            }
+            match v8::String::new(scope, &name) {
                 Some(s) => rv.set(s.into()),
                 None => rv.set(v8::null(scope).into()),
             }
@@ -3644,11 +3838,13 @@ fn op_posix_lookup_id(
             rv.set(v8::null(scope).into());
             return;
         };
+        let _lookup = CREDENTIAL_LOOKUP.lock().unwrap_or_else(|e| e.into_inner());
         // Same static-storage rule as above.
         // SAFETY: `cname` is a live CString read (not retained) by getpwnam /
         // getgrnam. Each returns NULL (checked) or a pointer into libc static
-        // storage; only the id field is read out before the block ends, so the
-        // pointer never outlives the call.
+        // storage that no other thread's lookup can rewrite while
+        // CREDENTIAL_LOOKUP is held; only the id field is read out before the
+        // block ends, so the pointer never outlives the call.
         let id: Option<u32> = unsafe {
             if kind == 0 {
                 let pw = libc::getpwnam(cname.as_ptr());
@@ -3791,30 +3987,35 @@ fn op_process_execve(
     }
 }
 
-/// The handful of errno values these ops can realistically produce, by name.
-/// Anything else is reported numerically rather than guessed at.
+/// The name of a raw errno these ops failed with, from the one table every
+/// other system error goes through (`oam_core::node_error_code`: the names
+/// libuv gives the numbers). A private short list here used to answer "EIO"
+/// for everything it left out -- a setuid refused EAGAIN (RLIMIT_NPROC), an
+/// execve refused EMFILE -- which named a failure that had not happened.
+/// Only a number libuv has no name for (0 included) still reads "EIO".
 #[cfg(unix)]
 fn errno_name(code: i32) -> &'static str {
-    match code {
-        libc::EPERM => "EPERM",
-        libc::EINVAL => "EINVAL",
-        libc::ESRCH => "ESRCH",
-        libc::ENOSYS => "ENOSYS",
-        // exec(2) failure modes -- ENOENT is the one users hit (bad path).
-        libc::ENOENT => "ENOENT",
-        libc::EACCES => "EACCES",
-        libc::ENOEXEC => "ENOEXEC",
-        libc::E2BIG => "E2BIG",
-        libc::ENOMEM => "ENOMEM",
-        libc::ELOOP => "ELOOP",
-        libc::ENAMETOOLONG => "ENAMETOOLONG",
-        libc::ENOTDIR => "ENOTDIR",
-        libc::EISDIR => "EISDIR",
-        libc::ETXTBSY => "ETXTBSY",
-        _ => "EIO",
+    oam_core::node_error_code(&std::io::Error::from_raw_os_error(code))
+}
+
+#[cfg(all(test, unix))]
+mod errno_name_tests {
+    use super::errno_name;
+
+    #[test]
+    fn an_errno_keeps_its_own_name() {
+        assert_eq!(errno_name(libc::EPERM), "EPERM");
+        assert_eq!(errno_name(libc::ENOENT), "ENOENT");
+        assert_eq!(errno_name(libc::ESRCH), "ESRCH");
+        // Not on the old short list: each came back as EIO.
+        assert_eq!(errno_name(libc::EAGAIN), "EAGAIN");
+        assert_eq!(errno_name(libc::EMFILE), "EMFILE");
+        assert_eq!(errno_name(libc::EFAULT), "EFAULT");
     }
 }
 
+/// `nowMs()` and `uptimeMs()`: milliseconds since the process's START
+/// anchor, bound under both names.
 fn op_now_ms(
     _scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
@@ -3832,15 +4033,6 @@ fn op_hrtime_nanos(
     let elapsed = START.get_or_init(Instant::now).elapsed();
     let nanos = v8::BigInt::new_from_u64(scope, elapsed.as_nanos() as u64);
     rv.set(nanos.into());
-}
-
-fn op_uptime_ms(
-    _scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let elapsed = START.get_or_init(Instant::now).elapsed();
-    rv.set_double(elapsed.as_secs_f64() * 1000.0);
 }
 
 fn op_homedir(
@@ -4190,7 +4382,7 @@ fn op_http_serve(
 }
 
 /// httpPipeServe(path, streamRequestBody, maxHeaderSize, insecureHTTPParser,
-/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs,
+/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs, jsDriven,
 /// maxHeadersCount) -> JSON `{ serverId }`: node's http.Server#listen(path)
 /// (#282), on a Windows named pipe or Unix domain socket. The pipe grant is
 /// checked here (as pipeListen's is); the same accept/respond/close ops
@@ -4245,9 +4437,6 @@ fn op_http_accept(
     );
 }
 
-/// Read the next chunk of a STREAMED request body. Resolves a Uint8Array,
-/// or Done at EOF. Remove-await-reinsert on the receiver, matching the
-/// accept queue.
 /// Open an outbound request-body channel. Returns the handle to put in the
 /// fetch request's `body_stream`. Slice 4 of docs/design/streaming-bodies.md.
 fn op_fetch_body_channel_new(
@@ -4410,7 +4599,7 @@ fn op_fetch_sent_wait(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let signals = core_runtime!(scope).sent_signals();
     crate::ops::spawn_op_unref(
         scope,
@@ -4754,8 +4943,8 @@ fn op_http2_pipe_serve(
 }
 
 /// http2ServeTls(tlsHandle, http1, maxHeaderSize, insecureHTTPParser,
-/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs) -> JSON
-/// `{ sessionId, connId }`: an accepted node:tls connection (at rest: JS has
+/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs, jsDriven)
+/// -> JSON `{ sessionId, connId }`: an accepted node:tls connection (at rest: JS has
 /// not read it) served natively from now on, as an HTTP/2 session or, with
 /// `http1`, as HTTP/1.1 (node's allowHTTP1). Its requests arrive on the
 /// session's own accept queue (`httpAccept(sessionId)`); `httpConnDestroy
@@ -4774,22 +4963,19 @@ fn op_http2_serve_tls(
         throw_type_error(scope, "http2ServeTls: the TLS connection is gone or in use");
         return;
     };
-    let served = {
+    // Nothing here can fail once the stream is in hand: the session is
+    // served from now on, and how it ends arrives on its queue.
+    let session = {
         let _runtime = core.enter();
         oam_core::http_server::http2_serve_tls(core.http(), stream, http1, policy, timeouts)
     };
-    match served {
-        Ok(session) => {
-            let json = serde_json::json!({
-                "sessionId": session.session_id,
-                "connId": session.conn_id,
-            })
-            .to_string();
-            if let Some(text) = v8::String::new(scope, &json) {
-                rv.set(text.into());
-            }
-        }
-        Err(e) => throw_type_error(scope, &format!("http2ServeTls: {e}")),
+    let json = serde_json::json!({
+        "sessionId": session.session_id,
+        "connId": session.conn_id,
+    })
+    .to_string();
+    if let Some(text) = v8::String::new(scope, &json) {
+        rv.set(text.into());
     }
 }
 
@@ -4852,7 +5038,7 @@ fn op_https_serve(
 
 /// httpsPipeServe(path, contextId, handshakeTimeout, requestCert,
 /// rejectUnauthorized, alpnJson, maxHeaderSize, insecureHTTPParser,
-/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs,
+/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs, jsDriven,
 /// maxHeadersCount) -> JSON `{ serverId }`: node's https.Server#listen(path)
 /// (#282), on a Windows named pipe or Unix domain socket -- the same TLS
 /// handshake and HTTP/1 serving as httpsServe, bound to a pipe. The pipe
@@ -5093,7 +5279,7 @@ fn op_http_bridge_response(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     let core = core_runtime!(scope);
     let bridges = core.http_bridges();
     let bodies = core.bodies();
@@ -5115,7 +5301,7 @@ fn op_http_bridge_out(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     let bridges = core_runtime!(scope).http_bridges();
     crate::ops::spawn_op_unref(
         scope,
@@ -5157,7 +5343,7 @@ fn op_http_bridge_in(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     let Some(bytes) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "httpBridgeIn requires bytes");
         return;
@@ -5176,7 +5362,7 @@ fn op_http_bridge_in_end(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     let bridges = core_runtime!(scope).http_bridges();
     crate::ops::spawn_op(
         scope,
@@ -5223,7 +5409,7 @@ fn op_http2_session_open(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let pipe_id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let pipe_id = handle_id_arg(scope, &args, 0);
     let core = core_runtime!(scope);
     let sessions = core.h2_sessions();
     let pipes = core.tls_pipes();
@@ -5243,7 +5429,7 @@ fn op_http2_session_request(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     let Some(request) = arg_string(scope, &args, 1) else {
         throw_type_error(scope, "http2SessionRequest requires a request");
         return;
@@ -5268,7 +5454,7 @@ fn op_http2_session_wait(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     let sessions = core_runtime!(scope).h2_sessions();
     crate::ops::spawn_op_unref(
         scope,
@@ -5285,7 +5471,7 @@ fn op_http2_session_goaway(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     let index = args.get(1).number_value(scope).unwrap_or(0.0).max(0.0) as usize;
     let sessions = core_runtime!(scope).h2_sessions();
     crate::ops::spawn_op_unref(
@@ -5309,6 +5495,32 @@ fn op_http2_session_send_goaway(
             id as u64,
         );
     rv.set_bool(sent);
+}
+
+/// `__oam.node.http2SessionPing(session, payload)`: send a PING frame
+/// carrying `payload` (an ArrayBufferView of eight bytes; JS has checked
+/// it) and resolve at the peer's ACK with `{ack: true, duration, payload}`,
+/// or with `{ack: false}` when the session goes first. The frame is queued
+/// before this returns, so pings go out in the order made. Unref'd, as
+/// `http2SessionWait` is: the socket keeps the process running, not a ping
+/// waiting on it.
+fn op_http2_session_ping(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = handle_id_arg(scope, &args, 0);
+    let payload = arg_bytes(scope, &args, 1).and_then(|bytes| <[u8; 8]>::try_from(bytes).ok());
+    let Some(payload) = payload else {
+        throw_type_error(scope, "http2SessionPing requires an 8-byte payload");
+        return;
+    };
+    let sessions = core_runtime!(scope).h2_sessions();
+    crate::ops::spawn_op_unref(
+        scope,
+        &mut rv,
+        oam_core::http_client::h2_session::ping(&sessions, id, payload),
+    );
 }
 
 /// `__oam.node.http2SessionClose(session)`: open no more streams; the
@@ -5672,6 +5884,35 @@ fn op_tcp_set_ref(
     core_runtime_mut!(scope).set_handle_ref(oam_core::HandleKey::Tcp(handle), referenced);
 }
 
+/// `__oam.node.tcpLingerAtExit(handle)`: the process may not exit on top of
+/// this stream -- before any exit it is closed in order, every write issued
+/// for it sent and in the peer's kernel (oam_core::tcp::tcp_settle_lingering).
+/// The child end of the child_process IPC channel asks for it.
+fn op_tcp_linger_at_exit(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    core_runtime!(scope).linger_stream_at_exit(handle);
+}
+
+/// `__oam.node.tcpReadAhead(handle)`: take what has already arrived on the
+/// stream off its socket, without waiting, for its next reads to hand out
+/// first; true once the peer's EOF has been read
+/// (oam_core::tcp::tcp_read_ahead). The parent end of the child_process IPC
+/// channel asks for it before each write, so a reset that write draws from
+/// an exited child cannot discard the child's last messages.
+fn op_tcp_read_ahead(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let tcp = core_runtime!(scope).tcp();
+    rv.set_bool(oam_core::tcp::tcp_read_ahead(&tcp, handle));
+}
+
 fn op_tcp_shutdown(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -5870,7 +6111,12 @@ fn op_udp_bind(
         throw_type_error(scope, "udpBind requires a host");
         return;
     };
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    // port_arg, not an `as u16` cast: the cast bound (and asked the net grant
+    // about) a different port than the one named -- 70000 became 65535, 1.5
+    // became 1, NaN became 0 (#163, the last socket op still doing it).
+    let Some(port) = port_arg(scope, &args, 1, "udpBind") else {
+        return;
+    };
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
@@ -6060,7 +6306,7 @@ fn op_tls_pipe_out(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     let pipes = core_runtime!(scope).tls_pipes();
     crate::ops::spawn_op_unref(scope, &mut rv, oam_core::byte_pipe::out(pipes, id));
 }
@@ -6071,7 +6317,7 @@ fn op_tls_pipe_in(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     let Some(bytes) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "tlsPipeIn requires bytes");
         return;
@@ -6086,7 +6332,7 @@ fn op_tls_pipe_in_end(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     let pipes = core_runtime!(scope).tls_pipes();
     crate::ops::spawn_op(scope, &mut rv, oam_core::byte_pipe::input_end(pipes, id));
 }
@@ -6770,14 +7016,28 @@ fn op_zlib_handle_write_sync(
     let input = arg_bytes(scope, &args, 2).unwrap_or_default();
     let out_off = args.get(4).int32_value(scope).unwrap_or(0) as usize;
     let out_len = args.get(5).int32_value(scope).unwrap_or(0) as usize;
-    // `out_len` is an unvalidated int32 (a negative value casts to ~usize::MAX);
-    // `vec![0u8; out_len]` would abort this non-unwindable callback. zlib can
-    // never produce more than the output buffer holds, so clamp to its capacity.
-    let out_len = out_len.min(
-        v8::Local::<v8::ArrayBufferView>::try_from(args.get(3))
-            .map(|v| v.byte_length())
-            .unwrap_or(0),
-    );
+    // `out_off` and `out_len` are unvalidated int32s (a negative value casts
+    // to ~usize::MAX), and the span they name has to lie inside the output
+    // VIEW -- its own byte length, not the ArrayBuffer under it, which for a
+    // pooled Buffer also holds other Buffers' bytes. node's binding checks
+    // exactly this before it runs the stream (IsWithinBounds(out_off,
+    // out_len, Buffer::Length(out_buf)), fatal there); refused here the same
+    // way, before any input is consumed, with a RangeError. It also bounds
+    // `vec![0u8; out_len]`, which would abort this non-unwindable callback on
+    // a huge length.
+    let view_len = v8::Local::<v8::ArrayBufferView>::try_from(args.get(3))
+        .map(|v| v.byte_length())
+        .unwrap_or(0);
+    if !matches!(out_off.checked_add(out_len), Some(end) if end <= view_len) {
+        let message = v8::String::new(
+            scope,
+            "zlib: output span out of bounds (offset + length exceeds buffer length)",
+        )
+        .unwrap();
+        let exception = v8::Exception::range_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    }
 
     let streams = core_runtime!(scope).zlib_streams();
 
@@ -6799,7 +7059,13 @@ fn op_zlib_handle_write_sync(
                         // casts to ~usize::MAX); fold the bounds adds through
                         // checked_add so a wrap can't slip an OOB write past the
                         // length check.
-                        if let Some(byte_offset) = view.byte_offset().checked_add(out_off)
+                        // And inside the VIEW first (`out_off + produced` within
+                        // its byte length): the store-wide check alone let a
+                        // write run past the view into whatever else shares
+                        // the ArrayBuffer.
+                        if let Some(view_end) = out_off.checked_add(produced)
+                            && view_end <= view.byte_length()
+                            && let Some(byte_offset) = view.byte_offset().checked_add(out_off)
                             && let Some(end) = byte_offset.checked_add(produced)
                             && end <= store.byte_length()
                         {
@@ -7928,16 +8194,13 @@ fn op_fs_fstat(
 // All exempt-by-capability in `permission_audit`: the fd can only have come
 // from an `open` that was checked, and there is no path here to re-check.
 
-/// Resolve an fd to its shared handle (see `oam_core::OpenFile`), adopting a
-/// descriptor the parent passed in. Throws EBADF and returns None when the fd
-/// is not open. The registry lock is held only for the lookup, never for the
-/// op's IO, so a slow descriptor stalls nothing else -- and nothing is taken
-/// out of the table, so concurrent ops on one descriptor all find it.
-///
-/// The registry comes in as a parameter rather than from `core_runtime!`: that
-/// macro expands to a bare `return;`, which only compiles inside a function
-/// returning `()`. The op callbacks do; this does not.
-/// A descriptor argument as the fd table keys it. node's binding takes an
+/// A descriptor argument as the fd table keys it -- and ONLY the fd table:
+/// descriptors are numbered there (`oam_core::FileState`, lowest free first)
+/// and not from the shared id counter, so the same number may be a live
+/// socket's, body's or child's id. Every op that takes one resolves it with
+/// `registered_file` / `close_descriptor` and nothing else, and no socket,
+/// body or child op takes one, so neither kind can be reached through the
+/// other's number. node's binding takes an
 /// int32 descriptor, and a negative, fractional or out-of-range number is no
 /// descriptor at all: it reaches the table as [`NO_FD`], which nothing holds or
 /// adopts, so the op fails EBADF. A saturating `as u64` cast turned -1 and
@@ -7953,6 +8216,15 @@ fn fd_arg(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> 
 /// The descriptor [`fd_arg`] gives a value that is not one.
 const NO_FD: u64 = u64::MAX;
 
+/// Resolve an fd to its shared handle (see `oam_core::OpenFile`), adopting a
+/// descriptor the parent passed in. Throws EBADF and returns None when the fd
+/// is not open. The registry lock is held only for the lookup, never for the
+/// op's IO, so a slow descriptor stalls nothing else -- and nothing is taken
+/// out of the table, so concurrent ops on one descriptor all find it.
+///
+/// The registry comes in as a parameter rather than from `core_runtime!`: that
+/// macro expands to a bare `return;`, which only compiles inside a function
+/// returning `()`. The op callbacks do; this does not.
 fn registered_fd(
     scope: &mut v8::PinScope<'_, '_>,
     files: &oam_core::SyncFileRegistry,
@@ -8799,13 +9071,11 @@ fn op_fs_open(
     let Some(path) = open_path_of(scope, path, flags) else {
         return;
     };
-    let core = core_runtime!(scope);
-    let files = core.files();
-    let ids = core.body_ids();
+    let files = core_runtime!(scope).files();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::fs_open(files, ids, path, flags, mode),
+        oam_core::ops::fs_open(files, path, flags, mode),
     );
 }
 
@@ -8820,10 +9090,13 @@ fn op_fs_read_chunk(
     // cursor", which is what the stream readers pass.
     let position = optional_position(scope, &args, 2);
     let files = core_runtime!(scope).files();
+    // Resolved here, at the call: the number may be closed and reissued to
+    // another file before the read runs (see `fs_read_chunk_of`).
+    let file = oam_core::registered_file(&files, handle);
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::fs_read_chunk(files, handle, len, position),
+        oam_core::ops::fs_read_chunk_of(file, len, position),
     );
 }
 
@@ -8841,10 +9114,12 @@ fn op_fs_write_chunk(
     // cursor, which is what the stream writers pass.
     let position = optional_position(scope, &args, 2);
     let files = core_runtime!(scope).files();
+    // Resolved at the call, as op_fs_read_chunk does.
+    let file = oam_core::registered_file(&files, handle);
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::fs_write_chunk(files, handle, bytes, position),
+        oam_core::ops::fs_write_chunk_of(file, bytes, position),
     );
 }
 
@@ -8907,17 +9182,20 @@ fn op_fs_open_sync(
     };
     match flags.open_with_mode(&path, mode) {
         Ok(file) => {
-            let core = core_runtime!(scope);
-            let id = core
-                .body_ids()
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            core.sync_files()
+            // The descriptor table's lowest free number (3 for a program's
+            // first file), not an id from the shared counter.
+            let claimed = core_runtime!(scope)
+                .sync_files()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .files
-                .insert(id, std::sync::Arc::new(file));
-            let val = v8::Number::new(scope, id as f64);
-            rv.set(val.into());
+                .insert(file);
+            match claimed {
+                Ok(fd) => {
+                    let val = v8::Number::new(scope, fd as f64);
+                    rv.set(val.into());
+                }
+                Err(e) => throw_fs_error(scope, oam_core::FsSite::Open(flags), "open", &path, &e),
+            }
         }
         Err(e) => throw_fs_error(scope, oam_core::FsSite::Open(flags), "open", &path, &e),
     }
@@ -8939,9 +9217,10 @@ fn op_fs_read_sync(
     let pos_seek = optional_position(scope, &args, 4);
 
     let files = core_runtime!(scope).sync_files();
-    // A low fd missing from the registry cannot be one oam allocated -- the
-    // counter starts above the inheritable window -- so it is the parent's to
-    // adopt (`registered_file` does). This is what lets oam BE the child of an
+    // An fd missing from the registry that the startup snapshot says the
+    // parent handed us is the parent's to adopt (`registered_file` does); the
+    // table never issues such a number for a file of oam's own while the
+    // parent's descriptor holds it. This is what lets oam BE the child of an
     // extra-fd spawn.
     let Some(file) = registered_fd(scope, &files, fd, "read") else {
         return;
@@ -9126,7 +9405,10 @@ fn get_permissions(
     scope
         .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
         .cloned()
-        .unwrap_or_default()
+        // Every runtime sets the slot as it is built (`JsRuntime::new_inner`).
+        // An isolate without one is held to nothing-granted, never to the
+        // all-granted `Permissions::default()`.
+        .unwrap_or_else(|| std::sync::Arc::new(crate::permissions::Permissions::denied()))
 }
 
 /// Which fs grant an op's path needs.
@@ -9383,7 +9665,7 @@ fn op_worker_new(
     let (worker_to_parent_tx, worker_to_parent_rx) =
         std::sync::mpsc::channel::<oam_core::worker::WorkerEvent>();
 
-    let thread = crate::worker::spawn_worker(
+    let thread = match crate::worker::spawn_worker(
         path,
         worker_data,
         worker_id,
@@ -9391,7 +9673,20 @@ fn op_worker_new(
         worker_to_parent_tx,
         worker_options,
         get_permissions(scope),
-    );
+    ) {
+        Ok(thread) => thread,
+        // The OS refused the thread. node's Worker::StartThread throws
+        // ERR_WORKER_INIT_FAILED with libuv's name for the error as the
+        // message (src/node_worker.cc); nothing was registered for it.
+        Err(e) => {
+            throw_coded_error(
+                scope,
+                oam_core::node_error_code(&e),
+                "ERR_WORKER_INIT_FAILED",
+            );
+            return;
+        }
+    };
 
     {
         let mut guard = workers.lock().unwrap_or_else(|e| e.into_inner());
@@ -9615,25 +9910,140 @@ fn opt_env_pairs(
     opts.and_then(|o| {
         let key = v8::String::new(scope, "env")?;
         let val = o.get(scope, key.into())?;
+        env_pairs_of(scope, val)
+    })
+}
+
+/// An environment object's own enumerable string-keyed properties as
+/// `(name, value)` pairs, each stringified; `None` for null, undefined or a
+/// value that is no object. The one reader behind the spawn ops' `env` option
+/// and `clusterFork`'s environment argument.
+fn env_pairs_of(
+    scope: &mut v8::PinScope<'_, '_>,
+    val: v8::Local<'_, v8::Value>,
+) -> Option<Vec<(String, String)>> {
+    if val.is_null_or_undefined() {
+        return None;
+    }
+    let env_obj = v8::Local::<v8::Object>::try_from(val).ok()?;
+    let names = env_obj.get_own_property_names(scope, Default::default())?;
+    let mut pairs = Vec::new();
+    for i in 0..names.length() {
+        if let Some(name) = names.get_index(scope, i)
+            && let Some(val) = env_obj.get(scope, name)
+            && let (Some(k), Some(v)) = (
+                name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+            )
+        {
+            pairs.push((k, v));
+        }
+    }
+    Some(pairs)
+}
+
+/// A spawn op's argument array (arg 1): each element stringified; anything
+/// that is not an array is no arguments. One reader for spawnSync, spawnAsync
+/// and spawnExtra.
+fn spawn_args_of(scope: &mut v8::PinScope<'_, '_>, val: v8::Local<'_, v8::Value>) -> Vec<String> {
+    let mut child_args: Vec<String> = Vec::new();
+    if let Ok(arr) = v8::Local::<v8::Array>::try_from(val) {
+        for i in 0..arr.length() {
+            if let Some(v) = arr.get_index(scope, i)
+                && let Some(s) = v.to_string(scope)
+            {
+                child_args.push(s.to_rust_string_lossy(scope));
+            }
+        }
+    }
+    child_args
+}
+
+/// A spawn op's options object (arg 2): `None` for null, undefined or a
+/// non-object.
+fn spawn_opts_of<'s>(val: v8::Local<'s, v8::Value>) -> Option<v8::Local<'s, v8::Object>> {
+    if val.is_null_or_undefined() {
+        None
+    } else {
+        v8::Local::<v8::Object>::try_from(val).ok()
+    }
+}
+
+/// The `cwd` spawn option, stringified; absent for null or undefined.
+fn opt_cwd(
+    scope: &mut v8::PinScope<'_, '_>,
+    opts: Option<v8::Local<'_, v8::Object>>,
+) -> Option<String> {
+    opts.and_then(|o| {
+        let key = v8::String::new(scope, "cwd")?;
+        let val = o.get(scope, key.into())?;
         if val.is_null_or_undefined() {
             return None;
         }
-        let env_obj = v8::Local::<v8::Object>::try_from(val).ok()?;
-        let names = env_obj.get_own_property_names(scope, Default::default())?;
-        let mut pairs = Vec::new();
-        for i in 0..names.length() {
-            if let Some(name) = names.get_index(scope, i)
-                && let Some(val) = env_obj.get(scope, name)
-                && let (Some(k), Some(v)) = (
-                    name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                    val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                )
-            {
-                pairs.push((k, v));
+        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
+    })
+}
+
+/// The `shell` spawn option: only `true` asks for the platform shell (the JS
+/// layer hands a boolean).
+fn opt_shell(scope: &mut v8::PinScope<'_, '_>, opts: Option<v8::Local<'_, v8::Object>>) -> bool {
+    opts.and_then(|o| {
+        let key = v8::String::new(scope, "shell")?;
+        o.get(scope, key.into())
+    })
+    .is_some_and(|v| v.is_true())
+}
+
+/// A dup of the registered descriptor `target`, for a numbered stdio slot
+/// (`stdio: ['ignore', logFd, logFd]`): a dup, so handing it to the child
+/// leaves the caller's fd usable and independently closable. The parent may
+/// have handed US this descriptor, so it is adopted first and a pass-through
+/// of an inherited fd resolves like any other.
+///
+/// `None` when the number names no open descriptor; both spawn paths then
+/// fall back to inheriting the parent's slot and say so on stderr, so the two
+/// cannot drift.
+fn dup_stdio_descriptor(files: &oam_core::SyncFileRegistry, target: u64) -> Option<std::fs::File> {
+    oam_core::adopt_inherited_fd(files, target);
+    let dup = files
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(target)
+        .and_then(|f| f.try_clone().ok());
+    if dup.is_none() {
+        eprintln!(
+            "oam: stdio fd {target} did not resolve to an open descriptor; child inherits parent stdio"
+        );
+    }
+    dup
+}
+
+/// One standard slot (`index` 0..=2) of a `StdioSpec` as the raw-create
+/// spawn's `StdioFd`. `ChildRead` is the end the CHILD reads (the parent
+/// writes): stdin. `ChildWrite` is the end the child writes and the parent
+/// reads: stdout / stderr. A numbered slot borrows the spec's file, which the
+/// caller keeps alive until the spawn has handed the child its copy.
+#[cfg(windows)]
+fn stdio_mode_to_fd(
+    index: usize,
+    mode: &oam_core::child::StdioMode,
+) -> oam_core::child_extra::StdioFd {
+    use oam_core::child_extra::StdioFd;
+    use std::os::windows::io::AsRawHandle;
+    match mode {
+        oam_core::child::StdioMode::Ignore => StdioFd::Ignore,
+        oam_core::child::StdioMode::Inherit => StdioFd::Inherit,
+        oam_core::child::StdioMode::Pipe => {
+            if index == 0 {
+                StdioFd::ChildRead
+            } else {
+                StdioFd::ChildWrite
             }
         }
-        Some(pairs)
-    })
+        oam_core::child::StdioMode::File(file) => {
+            StdioFd::Descriptor(file.as_raw_handle() as isize)
+        }
+    }
 }
 
 fn op_spawn_sync(
@@ -9652,39 +10062,10 @@ fn op_spawn_sync(
         return;
     }
 
-    let args_val = args.get(1);
-    let mut child_args: Vec<String> = Vec::new();
-    if let Ok(arr) = v8::Local::<v8::Array>::try_from(args_val) {
-        for i in 0..arr.length() {
-            if let Some(v) = arr.get_index(scope, i)
-                && let Some(s) = v.to_string(scope)
-            {
-                child_args.push(s.to_rust_string_lossy(scope));
-            }
-        }
-    }
-
-    let opts_val = args.get(2);
-    let opts = if opts_val.is_null_or_undefined() {
-        None
-    } else {
-        v8::Local::<v8::Object>::try_from(opts_val).ok()
-    };
-
-    let cwd = opts.and_then(|o| {
-        let key = v8::String::new(scope, "cwd")?;
-        let val = o.get(scope, key.into())?;
-        if val.is_null_or_undefined() {
-            return None;
-        }
-        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
-    });
-    let shell = opts
-        .and_then(|o| {
-            let key = v8::String::new(scope, "shell")?;
-            o.get(scope, key.into())
-        })
-        .is_some_and(|v| v.is_true());
+    let child_args = spawn_args_of(scope, args.get(1));
+    let opts = spawn_opts_of(args.get(2));
+    let cwd = opt_cwd(scope, opts);
+    let shell = opt_shell(scope, opts);
     let timeout_ms = opts
         .and_then(|o| {
             let key = v8::String::new(scope, "timeout")?;
@@ -9732,41 +10113,25 @@ fn op_spawn_sync(
     // `spawn_sync_argv0` exists only in child_win.rs, so this is Windows-only.
     #[cfg(windows)]
     if let Some(argv0) = argv0.as_deref() {
-        let [slot0, slot1, slot2] = stdio;
-        let to_fd = |i: usize, m: &oam_core::child::StdioMode| {
-            use oam_core::child_extra::StdioFd;
-            match m {
-                oam_core::child::StdioMode::Ignore => StdioFd::Ignore,
-                oam_core::child::StdioMode::Inherit => StdioFd::Inherit,
-                oam_core::child::StdioMode::Pipe => {
-                    // `ChildRead` == the CHILD reads this fd (parent writes):
-                    // stdin. `ChildWrite` == the child writes, the parent
-                    // reads: stdout/stderr. (spawn_extra / child_win.rs.)
-                    if i == 0 {
-                        StdioFd::ChildRead
-                    } else {
-                        StdioFd::ChildWrite
-                    }
-                }
-                oam_core::child::StdioMode::File(file) => {
-                    #[cfg(windows)]
-                    let raw = {
-                        use std::os::windows::io::AsRawHandle;
-                        file.as_raw_handle() as isize
-                    };
-                    #[cfg(unix)]
-                    let raw = {
-                        use std::os::fd::AsRawFd;
-                        file.as_raw_fd()
-                    };
-                    StdioFd::Descriptor(raw)
-                }
-            }
+        // `stdio` stays alive to the end of this block: a numbered slot's
+        // handle is borrowed from it until the child has its own copy.
+        let stdio_fds: Vec<oam_core::child_extra::StdioFd> = stdio
+            .iter()
+            .enumerate()
+            .map(|(index, mode)| stdio_mode_to_fd(index, mode))
+            .collect();
+        // `shell` is applied here, as child::spawn_sync applies it on the std
+        // path: the shell becomes the program, the command its one verbatim
+        // argument, and argv0 still names the command line's first token
+        // (node unshifts argv0 after the shell rewrite).
+        let (program, program_args) = if shell {
+            oam_core::child::shell_command(&command, &child_args)
+        } else {
+            (command, child_args)
         };
-        let stdio_fds = vec![to_fd(0, &slot0), to_fd(1, &slot1), to_fd(2, &slot2)];
-        let result = oam_core::child_extra::spawn_sync_argv0(
-            &command,
-            &child_args,
+        let result = oam_core::child_extra::spawn_sync_argv0_with(
+            &program,
+            &program_args,
             cwd.as_deref(),
             env_pairs.as_deref(),
             input.as_deref(),
@@ -9776,6 +10141,7 @@ fn op_spawn_sync(
             Some(argv0),
             timeout_ms,
             max_buffer,
+            shell,
         );
         rv.set(spawn_sync_result_to_js(scope, result).into());
         return;
@@ -9886,39 +10252,10 @@ fn op_spawn_async(
         return;
     }
 
-    let args_val = args.get(1);
-    let mut child_args: Vec<String> = Vec::new();
-    if let Ok(arr) = v8::Local::<v8::Array>::try_from(args_val) {
-        for i in 0..arr.length() {
-            if let Some(v) = arr.get_index(scope, i)
-                && let Some(s) = v.to_string(scope)
-            {
-                child_args.push(s.to_rust_string_lossy(scope));
-            }
-        }
-    }
-
-    let opts_val = args.get(2);
-    let opts = if opts_val.is_null_or_undefined() {
-        None
-    } else {
-        v8::Local::<v8::Object>::try_from(opts_val).ok()
-    };
-
-    let cwd = opts.and_then(|o| {
-        let key = v8::String::new(scope, "cwd")?;
-        let val = o.get(scope, key.into())?;
-        if val.is_null_or_undefined() {
-            return None;
-        }
-        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
-    });
-    let shell = opts
-        .and_then(|o| {
-            let key = v8::String::new(scope, "shell")?;
-            o.get(scope, key.into())
-        })
-        .is_some_and(|v| v.is_true());
+    let child_args = spawn_args_of(scope, args.get(1));
+    let opts = spawn_opts_of(args.get(2));
+    let cwd = opt_cwd(scope, opts);
+    let shell = opt_shell(scope, opts);
 
     let env_pairs = opt_env_pairs(scope, opts);
 
@@ -9927,6 +10264,12 @@ fn op_spawn_async(
     let windows_hide = opt_windows_hide(scope, opts);
 
     // Read argv0 from the options object (node's spawn/child_process API).
+    // Honored here on POSIX only (spawn_child: Command::arg0). On Windows an
+    // argv0 needs the raw-create path, whose child lives in the OTHER registry
+    // (raw_children) and is driven by the spawnExtra* ops; the JS layer routes
+    // every Windows argv0 spawn there (child_process spawn -> spawnExtra), so
+    // this op never creates a child its own spawnWait / spawnRead* / spawnKill
+    // could not find.
     let argv0 = opt_argv0(scope, opts);
 
     let children = core_runtime!(scope).children();
@@ -9937,79 +10280,6 @@ fn op_spawn_async(
     // immediately -- execa, tree-kill and pidusage all read it the instant
     // spawn() returns. The runtime-context guard is required: tokio's
     // Command::spawn registers the child with the signal-driver reactor.
-    //
-    // On Windows argv0 requires raw CreateProcessW (lpCommandLine), so when
-    // argv0 is provided we route through spawn_extra instead of spawn_child.
-    #[cfg(windows)]
-    let use_spawn_extra = argv0.is_some();
-    #[cfg(not(windows))]
-    let use_spawn_extra = false;
-
-    if use_spawn_extra {
-        // argv0 on Windows needs raw CreateProcessW — spawn_extra handles it.
-        // Convert [StdioMode; 3] → Vec<StdioFd>: slot 0=stdin, 1=stdout, 2=stderr.
-        let stdio_fds: Vec<oam_core::child_extra::StdioFd> = {
-            let mut out = Vec::with_capacity(3);
-            for (i, slot) in stdio.iter().enumerate() {
-                out.push(match slot {
-                    oam_core::child::StdioMode::Ignore => oam_core::child_extra::StdioFd::Ignore,
-                    oam_core::child::StdioMode::Inherit => oam_core::child_extra::StdioFd::Inherit,
-                    oam_core::child::StdioMode::Pipe => {
-                        if i == 0 {
-                            // stdin: the CHILD reads fd 0, the parent writes.
-                            oam_core::child_extra::StdioFd::ChildRead
-                        } else {
-                            // stdout/stderr: the child writes fd 1/2, the parent reads.
-                            oam_core::child_extra::StdioFd::ChildWrite
-                        }
-                    }
-                    oam_core::child::StdioMode::File(file) => {
-                        #[cfg(unix)]
-                        use std::os::fd::AsRawFd;
-                        #[cfg(windows)]
-                        use std::os::windows::io::AsRawHandle;
-                        #[cfg(windows)]
-                        let raw = file.as_raw_handle() as isize;
-                        #[cfg(unix)]
-                        let raw = file.as_raw_fd();
-                        oam_core::child_extra::StdioFd::Descriptor(raw)
-                    }
-                });
-            }
-            out
-        };
-        let reg = core_runtime!(scope).raw_children();
-        let ids = core_runtime!(scope).body_ids();
-        match oam_core::child_extra::spawn_extra(
-            &command,
-            &child_args,
-            cwd.as_deref(),
-            env_pairs.as_deref(),
-            &stdio_fds,
-            detached,
-            windows_hide,
-            argv0.as_deref(),
-        ) {
-            Ok(child) => {
-                let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let pid = child.pid;
-                reg.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(handle, child);
-                let json = serde_json::json!({ "handle": handle, "pid": pid });
-                if let Some(s) = v8::String::new(scope, &json.to_string()) {
-                    rv.set(s.into());
-                }
-            }
-            Err(msg) => {
-                let text = v8::String::new(scope, &msg).unwrap();
-                let err = v8::Exception::error(scope, text);
-                scope.throw_exception(err);
-            }
-        }
-        return;
-    }
-
     let spawned = {
         let core = core_runtime!(scope);
         let _guard = core.enter();
@@ -10098,26 +10368,9 @@ fn arg_stdio_spec(
             continue;
         };
         *slot = if code >= 3.0 {
-            let target = code as u64;
-            // The parent may have handed US this descriptor; adopt it first so
-            // a pass-through of an inherited fd resolves like any other.
-            oam_core::adopt_inherited_fd(files, target);
-            let dup = files
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .files
-                .get(&target)
-                // A dup, so handing it to the child leaves the caller's fd
-                // usable and independently closable.
-                .and_then(|f| f.try_clone().ok());
-            match dup {
+            match dup_stdio_descriptor(files, code as u64) {
                 Some(file) => oam_core::child::StdioMode::File(file),
-                None => {
-                    eprintln!(
-                        "oam: stdio fd {target} did not resolve to an open descriptor; child inherits parent stdio"
-                    );
-                    oam_core::child::StdioMode::Inherit
-                }
+                None => oam_core::child::StdioMode::Inherit,
             }
         } else {
             oam_core::child::StdioMode::from_code(code as u8)
@@ -10239,11 +10492,18 @@ fn op_spawn_wait(
     );
 }
 
-// -------------------------------------------------- extra-fd stdio (Windows)
+// ------------------------------------- extra-fd stdio (the raw-create spawn)
 // spawnExtra(command, args, opts, stdioCodes) -> {handle, pid} (synchronous,
 // like Node's spawn). stdioCodes is a number per fd: 0=ignore 1=inherit
 // 2=child-read(parent writes) 3=child-write(parent reads). Used for
-// CDP-over-pipe so a browser child gets numbered fds 3/4.
+// CDP-over-pipe so a browser child gets numbered fds 3/4, and for every
+// async spawn with an `argv0` the plain path cannot carry.
+//
+// Both shipped families have a backend behind `oam_core::child_extra`:
+// child_win.rs (CreateProcessW + the CRT fd table) and child_unix.rs
+// (Command + pre_exec dup2). The ops are `cfg(any(windows, unix))` because
+// that alias exists nowhere else; there are no stand-in ops for other
+// targets.
 
 #[cfg(any(windows, unix))]
 fn op_spawn_extra(
@@ -10261,32 +10521,10 @@ fn op_spawn_extra(
     if !check_child_perm(scope, &command) {
         return;
     }
-    let mut child_args: Vec<String> = Vec::new();
-    if let Ok(arr) = v8::Local::<v8::Array>::try_from(args.get(1)) {
-        for i in 0..arr.length() {
-            if let Some(v) = arr.get_index(scope, i)
-                && let Some(s) = v.to_string(scope)
-            {
-                child_args.push(s.to_rust_string_lossy(scope));
-            }
-        }
-    }
-    let opts = {
-        let v = args.get(2);
-        if v.is_null_or_undefined() {
-            None
-        } else {
-            v8::Local::<v8::Object>::try_from(v).ok()
-        }
-    };
-    let cwd = opts.and_then(|o| {
-        let key = v8::String::new(scope, "cwd")?;
-        let val = o.get(scope, key.into())?;
-        if val.is_null_or_undefined() {
-            return None;
-        }
-        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
-    });
+    let child_args = spawn_args_of(scope, args.get(1));
+    let opts = spawn_opts_of(args.get(2));
+    let cwd = opt_cwd(scope, opts);
+    let shell = opt_shell(scope, opts);
     let env_pairs = opt_env_pairs(scope, opts);
 
     // stdio codes (arg 3): one number per fd. 0-3 are dispositions; anything
@@ -10308,14 +10546,7 @@ fn op_spawn_extra(
                 .unwrap_or(0);
             if code >= DESCRIPTOR_CODE_BASE {
                 let target = u64::from(code - DESCRIPTOR_CODE_BASE);
-                oam_core::adopt_inherited_fd(&files, target);
-                let dup = files
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .files
-                    .get(&target)
-                    .and_then(|f| f.try_clone().ok());
-                match dup {
+                match dup_stdio_descriptor(&files, target) {
                     Some(file) => {
                         #[cfg(windows)]
                         let raw = {
@@ -10330,8 +10561,9 @@ fn op_spawn_extra(
                         held.push(file);
                         stdio.push(StdioFd::Descriptor(raw));
                     }
-                    // Unresolvable descriptor: same inherit fallback the 0/1/2
-                    // path takes, rather than silently giving the child NUL.
+                    // Unresolvable descriptor: the same inherit fallback (and
+                    // the same stderr note, from dup_stdio_descriptor) the
+                    // 0/1/2 path takes, rather than giving the child NUL.
                     None => stdio.push(StdioFd::Inherit),
                 }
                 continue;
@@ -10355,18 +10587,59 @@ fn op_spawn_extra(
     // Read argv0 from the options object (node's spawn/child_process API).
     let argv0 = opt_argv0(scope, opts);
 
+    // `shell`, as the std path applies it (child::spawn_child): the platform
+    // shell becomes the program and the command its one argument; argv0 still
+    // names the first token of the child's command line, as node unshifts it
+    // after the shell rewrite. This op used to ignore the option, so an argv0
+    // or extra-fd spawn with `shell: true` tried to run the command string as
+    // a program.
+    let (program, program_args) = if shell {
+        oam_core::child::shell_command(&command, &child_args)
+    } else {
+        (command, child_args)
+    };
+
     let reg = core_runtime!(scope).raw_children();
     let ids = core_runtime!(scope).body_ids();
-    match oam_core::child_extra::spawn_extra(
-        &command,
-        &child_args,
+    // Windows hands cmd.exe its command line verbatim (see
+    // child_win::spawn_extra_verbatim); POSIX passes argv as an array either
+    // way.
+    #[cfg(windows)]
+    let spawned = if shell {
+        oam_core::child_extra::spawn_extra_verbatim(
+            &program,
+            &program_args,
+            cwd.as_deref(),
+            env_pairs.as_deref(),
+            &stdio,
+            detached,
+            windows_hide,
+            argv0.as_deref(),
+        )
+    } else {
+        oam_core::child_extra::spawn_extra(
+            &program,
+            &program_args,
+            cwd.as_deref(),
+            env_pairs.as_deref(),
+            &stdio,
+            detached,
+            windows_hide,
+            argv0.as_deref(),
+        )
+    };
+    #[cfg(unix)]
+    let spawned = oam_core::child_extra::spawn_extra(
+        &program,
+        &program_args,
         cwd.as_deref(),
         env_pairs.as_deref(),
         &stdio,
         detached,
         windows_hide,
         argv0.as_deref(),
-    ) {
+    );
+    match spawned {
         Ok(child) => {
             let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let pid = child.pid;
@@ -10378,7 +10651,13 @@ fn op_spawn_extra(
                 rv.set(s.into());
             }
         }
-        Err(msg) => throw_type_error(scope, &msg),
+        Err(msg) => {
+            // The failure shape the plain spawn op throws (a JSON error body
+            // on an Error), so the JS layer parses one form from both.
+            let text = v8::String::new(scope, &msg).unwrap();
+            let err = v8::Exception::error(scope, text);
+            scope.throw_exception(err);
+        }
     }
 }
 
@@ -10468,58 +10747,6 @@ fn op_spawn_extra_kill(
     oam_core::child_extra::raw_kill(&reg, handle, signal);
 }
 
-// Non-Windows: extra-fd stdio is not implemented yet (Unix needs pre_exec
-// dup2). Stubs keep the op table symbol-complete across platforms.
-#[cfg(not(any(windows, unix)))]
-fn op_spawn_extra(
-    scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    throw_type_error(
-        scope,
-        "spawnExtra: extra-fd stdio is only implemented on Windows",
-    );
-}
-#[cfg(not(any(windows, unix)))]
-fn op_spawn_extra_read(
-    scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    throw_type_error(scope, "spawnExtraRead: Windows only");
-}
-#[cfg(not(any(windows, unix)))]
-fn op_spawn_extra_write(
-    scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    throw_type_error(scope, "spawnExtraWrite: Windows only");
-}
-#[cfg(not(any(windows, unix)))]
-fn op_spawn_extra_close_fd(
-    _scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
-) {
-}
-#[cfg(not(any(windows, unix)))]
-fn op_spawn_extra_wait(
-    scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    throw_type_error(scope, "spawnExtraWait: Windows only");
-}
-#[cfg(not(any(windows, unix)))]
-fn op_spawn_extra_kill(
-    _scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
-) {
-}
-
 // ================================================================ cluster
 
 fn op_cluster_fork(
@@ -10540,30 +10767,10 @@ fn op_cluster_fork(
         throw_type_error(scope, "clusterFork: worker id required");
         return;
     };
-    let env_pairs: Vec<(String, String)> = {
-        let val = args.get(2);
-        if val.is_null_or_undefined() {
-            Vec::new()
-        } else if let Ok(obj) = v8::Local::<v8::Object>::try_from(val) {
-            let mut pairs = Vec::new();
-            if let Some(names) = obj.get_own_property_names(scope, Default::default()) {
-                for i in 0..names.length() {
-                    if let Some(name) = names.get_index(scope, i)
-                        && let Some(val) = obj.get(scope, name)
-                        && let (Some(k), Some(v)) = (
-                            name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                            val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                        )
-                    {
-                        pairs.push((k, v));
-                    }
-                }
-            }
-            pairs
-        } else {
-            Vec::new()
-        }
-    };
+    // The worker's whole environment, as the JS layer built it (cluster_fork
+    // clears the inherited one); read by the same reader as the spawn ops'
+    // `env`. No object is an empty environment, as it always was here.
+    let env_pairs: Vec<(String, String)> = env_pairs_of(scope, args.get(2)).unwrap_or_default();
     let rt = core_runtime!(scope);
     let children = rt.children();
     let ids = rt.body_ids();
@@ -10610,20 +10817,40 @@ fn op_cluster_is_worker(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let val = v8::Boolean::new(scope, oam_core::cluster::cluster_is_worker());
-    rv.set(val.into());
+    // `__oam.node.clusterIsWorker()`: the cluster worker id this process was
+    // forked with, or `undefined` for a process that is no worker. Taken out
+    // of the environment as it is read, as node deletes NODE_UNIQUE_ID during
+    // worker bootstrap (and as op_fork_ipc_port does its own variable): the
+    // worker's children and worker threads must not read as workers of this
+    // primary. Called once per process, at startup (installRuntimeGlobals).
+    let Some(id) = oam_core::cluster::worker_id_from_env() else {
+        return;
+    };
+    set_process_env(oam_core::cluster::WORKER_ID_VAR, None);
+    if let Some(id) = v8::String::new(scope, &id) {
+        rv.set(id.into());
+    }
 }
 
 // ================================================================ dns
 
-fn validate_hostname(hostname: &str) -> Result<(), &'static str> {
-    if hostname.is_empty() || hostname.len() > 253 {
-        return Err("hostname must be between 1 and 253 characters");
+/// The one name the dns ops answer without asking a resolver: a name with a
+/// NUL byte in it. The C resolvers read a name only up to the NUL, so they
+/// would look up a name other than the one given; node reports ENOTFOUND for
+/// it (measured on node v22.22.2, Windows: `dns.lookup('a\0b', cb)` and
+/// `dns.resolve4('a\0b', cb)` both call back with code ENOTFOUND).
+///
+/// The failure is the op's REJECTION, not a throw: node delivers every
+/// resolution failure to the callback (or the promise), and a synchronous
+/// throw out of `dns.lookup()` / `dns.resolve*()` is one no caller catches.
+/// An empty or over-long name is no longer refused here at all -- the
+/// resolver answers those with its own code (`dns_lookup` / `dns_resolve`).
+fn nul_in_hostname(hostname: &str) -> Option<oam_core::OpOutcome> {
+    if !hostname.contains('\0') {
+        return None;
     }
-    if hostname.contains('\0') {
-        return Err("hostname must not contain null bytes");
-    }
-    Ok(())
+    let message = format!("ENOTFOUND {hostname}");
+    Some(oam_core::OpOutcome::node_failed("ENOTFOUND", message))
 }
 
 fn op_dns_lookup(
@@ -10632,8 +10859,8 @@ fn op_dns_lookup(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let hostname: String = args.get(0).to_rust_string_lossy(scope);
-    if let Err(msg) = validate_hostname(&hostname) {
-        throw_type_error(scope, msg);
+    if let Some(refused) = nul_in_hostname(&hostname) {
+        crate::ops::spawn_op(scope, &mut rv, async move { refused });
         return;
     }
 
@@ -10696,8 +10923,8 @@ fn op_dns_resolve(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let hostname: String = args.get(0).to_rust_string_lossy(scope);
-    if let Err(msg) = validate_hostname(&hostname) {
-        throw_type_error(scope, msg);
+    if let Some(refused) = nul_in_hostname(&hostname) {
+        crate::ops::spawn_op(scope, &mut rv, async move { refused });
         return;
     }
     let rrtype: String = args.get(1).to_rust_string_lossy(scope);
@@ -10895,12 +11122,19 @@ fn op_stdin_handle_type(
 
 // ============================================================== os extended
 
+/// `__oam.node.osRelease(version)`: uname's `release` field for `os.release()`,
+/// or, when `version` is true, its `version` field for `os.version()` (the
+/// kernel build string on unix; see `os_version` for Windows).
 fn op_os_release(
     scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
+    args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let release = os_release();
+    let release = if args.get(0).is_true() {
+        os_version()
+    } else {
+        os_release()
+    };
     let val = v8::String::new(scope, &release).unwrap();
     rv.set(val.into());
 }
@@ -10990,14 +11224,52 @@ fn os_release() -> String {
     )
 }
 
+/// The kernel release, uname(2)'s `release` field (what `uname -r` prints):
+/// read through sysinfo (uname on linux, the `kern.osrelease` sysctl on
+/// macOS), once per process -- it cannot change while the process runs. This
+/// used to spawn a `uname -r` child on every `os.release()` / `os.version()`
+/// call, and answered "" wherever no `uname` was on PATH.
 #[cfg(not(windows))]
 fn os_release() -> String {
-    use std::process::Command;
-    Command::new("uname")
-        .arg("-r")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+    static RELEASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RELEASE
+        .get_or_init(|| sysinfo::System::kernel_version().unwrap_or_default())
+        .clone()
+}
+
+/// Windows has no uname: `os.version()` stays the `os.release()` string there
+/// (node answers the product name; docs/node-divergences.md entry 15).
+#[cfg(windows)]
+fn os_version() -> String {
+    os_release()
+}
+
+/// uname's `version` field, which is what node's `os.version()` returns on
+/// unix (libuv's uv_os_uname).
+///
+/// Read once per process (it cannot change while the process runs). Linux
+/// publishes the field as /proc/sys/kernel/version, so no child is needed
+/// there; elsewhere it is one `uname -v`, and "" where that cannot run.
+#[cfg(not(windows))]
+fn os_version() -> String {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            #[cfg(target_os = "linux")]
+            {
+                if let Ok(text) = std::fs::read_to_string("/proc/sys/kernel/version")
+                    && !text.trim().is_empty()
+                {
+                    return text.trim().to_string();
+                }
+            }
+            std::process::Command::new("uname")
+                .arg("-v")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        })
+        .clone()
 }
 
 #[cfg(windows)]
@@ -11343,7 +11615,10 @@ fn process_rss() -> usize {
     fs::read_to_string("/proc/self/statm")
         .ok()
         .and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok())
-        .map(|pages| pages * 4096)
+        // statm counts pages of the RUNNING kernel's size: 4 KiB on x86-64,
+        // but 16 KiB or 64 KiB on some arm64 kernels, where a literal 4096
+        // under-reported the resident set 4x or 16x.
+        .map(|pages| pages.saturating_mul(rustix::param::page_size()))
         .unwrap_or(0)
 }
 
@@ -12162,62 +12437,132 @@ fn op_network_interfaces(
     rv.set(val.into());
 }
 
+/// `os.networkInterfaces()`: the host's interfaces as the system reports them
+/// (`sysinfo::Networks`: name, hardware address, and each address with its
+/// prefix length), in node's entry shape. Nothing here is assumed: this used
+/// to answer one fixed loopback entry named `lo` on every unix (macOS's is
+/// `lo0`) plus one invented `eth0` / `Ethernet` with a zero hardware address
+/// and a /24 mask around whatever local address a UDP socket picked.
+///
+/// What still differs from node is recorded in docs/node-divergences.md: the
+/// interfaces and each one's addresses are sorted rather than in the system's
+/// order, a link-local IPv6 address has no `scopeid` (the zone index is not
+/// read), and on Windows only the adapters sysinfo lists are reported (it
+/// leaves out software adapters), with the loopback interface added from the
+/// two loopback addresses this host can actually bind.
 fn network_interfaces() -> serde_json::Value {
-    use serde_json::{Map, Value, json};
-    use std::net::UdpSocket;
+    use serde_json::{Map, Value};
 
-    let mut result = Map::new();
-
-    let lo_name = if cfg!(windows) {
-        "Loopback Pseudo-Interface 1"
-    } else {
-        "lo"
-    };
-    result.insert(
-        lo_name.to_string(),
-        json!([
-            {
-                "address": "127.0.0.1",
-                "netmask": "255.0.0.0",
-                "family": "IPv4",
-                "mac": "00:00:00:00:00:00",
-                "internal": true,
-                "cidr": "127.0.0.1/8"
-            },
-            {
-                "address": "::1",
-                "netmask": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
-                "family": "IPv6",
-                "mac": "00:00:00:00:00:00",
-                "internal": true,
-                "cidr": "::1/128",
-                "scopeid": 0
-            }
-        ]),
-    );
-
-    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0")
-        && socket.connect("8.8.8.8:80").is_ok()
-        && let Ok(addr) = socket.local_addr()
-    {
-        let ip = addr.ip().to_string();
-        let iface_name = if cfg!(windows) { "Ethernet" } else { "eth0" };
-        result.insert(
-            iface_name.to_string(),
-            json!([
-                {
-                    "address": ip,
-                    "netmask": "255.255.255.0",
-                    "family": "IPv4",
-                    "mac": "00:00:00:00:00:00",
-                    "internal": false,
-                    "cidr": format!("{}/24", ip)
-                }
-            ]),
-        );
+    let mut interfaces: Vec<(String, Vec<Value>)> = Vec::new();
+    let networks = sysinfo::Networks::new_with_refreshed_list();
+    for (name, data) in &networks {
+        // node lists the addresses of interfaces that are up; one the system
+        // reports as down is left out, as is one with no address at all.
+        if matches!(
+            data.operational_state(),
+            sysinfo::InterfaceOperationalState::Down
+                | sysinfo::InterfaceOperationalState::NotPresent
+                | sysinfo::InterfaceOperationalState::LowerLayerDown
+        ) {
+            continue;
+        }
+        let mut nets: Vec<sysinfo::IpNetwork> = data.ip_networks().to_vec();
+        if nets.is_empty() {
+            continue;
+        }
+        // The family node lists first on this platform (IPv6 on Windows, IPv4
+        // elsewhere), then by address: sysinfo's own order is a hash set's.
+        nets.sort_by_key(|net| (net.addr.is_ipv4() == cfg!(windows), net.addr));
+        let internal = nets.iter().any(|net| net.addr.is_loopback());
+        let mac = data.mac_address().to_string();
+        let entries = nets
+            .iter()
+            .map(|net| interface_address(net.addr, net.prefix, &mac, internal))
+            .collect();
+        interfaces.push((name.clone(), entries));
     }
 
+    // Windows: sysinfo lists adapters with a hardware address only, which
+    // leaves the loopback interface out. Its name and two addresses are fixed
+    // by the system; each address is reported only if this host can bind it.
+    #[cfg(windows)]
+    {
+        const LOOPBACK: &str = "Loopback Pseudo-Interface 1";
+        const NO_MAC: &str = "00:00:00:00:00:00";
+        let mut entries = Vec::new();
+        if std::net::UdpSocket::bind("[::1]:0").is_ok() {
+            let addr = std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+            entries.push(interface_address(addr, 128, NO_MAC, true));
+        }
+        if std::net::UdpSocket::bind("127.0.0.1:0").is_ok() {
+            let addr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+            entries.push(interface_address(addr, 8, NO_MAC, true));
+        }
+        if !entries.is_empty() && !interfaces.iter().any(|(name, _)| name == LOOPBACK) {
+            interfaces.push((LOOPBACK.to_string(), entries));
+        }
+    }
+
+    interfaces.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut result = Map::new();
+    for (name, entries) in interfaces {
+        result.insert(name, Value::Array(entries));
+    }
     Value::Object(result)
+}
+
+/// One address of an interface as node's `os.networkInterfaces()` reports it,
+/// keys in node's order: the address, the netmask and CIDR its prefix length
+/// spells, the family, the interface's hardware address, and `internal`.
+/// An IPv6 address also carries `scopeid`, 0 for every scope but link-local;
+/// a link-local address (fe80::/10) gets no `scopeid` at all, because its
+/// zone index is not known here and 0 would be a wrong one.
+fn interface_address(
+    addr: std::net::IpAddr,
+    prefix: u8,
+    mac: &str,
+    internal: bool,
+) -> serde_json::Value {
+    use serde_json::json;
+    match addr {
+        std::net::IpAddr::V4(v4) => {
+            let bits = u32::from(prefix.min(32));
+            let mask = if bits == 0 {
+                0
+            } else {
+                u32::MAX << (32 - bits)
+            };
+            json!({
+                "address": v4.to_string(),
+                "netmask": std::net::Ipv4Addr::from(mask).to_string(),
+                "family": "IPv4",
+                "mac": mac,
+                "internal": internal,
+                "cidr": format!("{v4}/{bits}"),
+            })
+        }
+        std::net::IpAddr::V6(v6) => {
+            let bits = u32::from(prefix.min(128));
+            let mask = if bits == 0 {
+                0
+            } else {
+                u128::MAX << (128 - bits)
+            };
+            let mut entry = json!({
+                "address": v6.to_string(),
+                "netmask": std::net::Ipv6Addr::from(mask).to_string(),
+                "family": "IPv6",
+                "mac": mac,
+                "internal": internal,
+                "cidr": format!("{v6}/{bits}"),
+            });
+            let link_local = v6.segments()[0] & 0xffc0 == 0xfe80;
+            if !link_local {
+                entry["scopeid"] = json!(0);
+            }
+            entry
+        }
+    }
 }
 
 // ============================================================= parent PID
@@ -12485,7 +12830,7 @@ fn load_average() -> [f64; 3] {
 
 /// `os.uptime()`: seconds since the system booted, as libuv's `uv_uptime`
 /// reports them -- not this process's uptime, which is `process.uptime()`
-/// (`op_uptime_ms`) and was what this answered before.
+/// (`uptimeMs`, `op_now_ms`) and was what this answered before.
 fn op_os_uptime(
     _scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
@@ -12612,41 +12957,20 @@ fn cpu_usage_us() -> (u64, u64) {
 
 #[cfg(not(windows))]
 fn cpu_usage_us() -> (u64, u64) {
-    #[repr(C)]
-    struct timeval {
-        tv_sec: i64,
-        tv_usec: i64,
-    }
-    #[repr(C)]
-    struct rusage {
-        ru_utime: timeval,
-        ru_stime: timeval,
-        _pad: [u8; 112],
-    }
-    // ABI: the declaration matches getrusage(2)'s ABI (int who + rusage*
-    // out). The locally-defined `#[repr(C)]` `rusage` / `timeval` reproduce the
-    // leading ru_utime/ru_stime fields, and the 112-byte `_pad` must be large
-    // enough that the whole struct is >= the platform's `struct rusage` --
-    // getrusage writes the full struct, so an undersized layout here would be an
-    // OOB write. Verify the pad covers each Unix target's rusage size.
-    unsafe extern "C" {
-        fn getrusage(who: i32, usage: *mut rusage) -> i32;
-    }
-    let mut usage = rusage {
-        ru_utime: timeval {
-            tv_sec: 0,
-            tv_usec: 0,
-        },
-        ru_stime: timeval {
-            tv_sec: 0,
-            tv_usec: 0,
-        },
-        _pad: [0; 112],
+    // libc's own `rusage` and `getrusage`: the struct's size and its field
+    // widths are the target's (darwin's `tv_usec` is 32 bits wide, linux's
+    // 64), where a hand-declared copy only happened to be large enough and
+    // read darwin's microseconds together with the padding after them.
+    //
+    // SAFETY: `rusage` is plain integers, so the all-zero value is a valid
+    // one; `usage` is a live stack struct of exactly the type getrusage
+    // writes, passed by `&mut`. The result is ignored -- the fields stay zero
+    // on the failure RUSAGE_SELF does not have.
+    let usage = unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+        usage
     };
-    // SAFETY: `who = 0` is RUSAGE_SELF; `usage` is a live stack struct passed
-    // by `&mut`, valid for the out-write (see the layout note on the extern
-    // above). Result ignored -- fields stay zero on failure.
-    unsafe { getrusage(0, &mut usage) };
     let user = usage.ru_utime.tv_sec as u64 * 1_000_000 + usage.ru_utime.tv_usec as u64;
     let system = usage.ru_stime.tv_sec as u64 * 1_000_000 + usage.ru_stime.tv_usec as u64;
     (user, system)
@@ -12675,83 +12999,279 @@ fn op_process_umask(
 
 // ========================================================== process.kill
 
+/// processKill(pid, signal) -> 0, or the node code of the failure as a string
+/// (`"ESRCH"`, `"EPERM"`, `"EINVAL"`, `"ENOSYS"`); the JS `_kill` turns the
+/// name into the host's libuv errno. `signal` is the HOST's signal number
+/// (`os.constants.signals`, from `os_signals_json`), or 0 for the liveness
+/// probe.
+///
+/// Signal 0 is answered for any pid, as kill(2) answers it: ESRCH for a pid
+/// that names no process, EPERM for one this user may not signal. A real
+/// signal is delivered only to this process or to a child this runtime
+/// spawned (either registry); for any other pid the answer is ESRCH when the
+/// pid names nothing and EPERM when it does. That narrowing is deliberate and
+/// recorded in docs/node-divergences.md.
 fn op_process_kill(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let pid = args.get(0).number_value(scope).unwrap_or(0.0) as u32;
-    let signal = args.get(1).number_value(scope).unwrap_or(15.0) as i32;
+    let pid = args.get(0).number_value(scope).unwrap_or(0.0) as i32;
+    let signal = args.get(1).number_value(scope).unwrap_or(0.0) as i32;
 
-    // Only child processes of this runtime should be killable.
-    let children = core_runtime!(scope).children();
-    let is_own_child = children
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .values()
-        .any(|child| child.pid == pid);
-    let is_self = pid == std::process::id();
-    if !is_own_child && !is_self {
-        throw_type_error(
-            scope,
-            &format!("process.kill: permission denied for pid {pid} (not a child process)"),
-        );
-        return;
+    // A number that is no signal here is refused as such before anything
+    // about the pid is asked, as kill(2) and uv_kill order it.
+    let mut failed: Option<&'static str> = signal_refusal(signal);
+    let is_self = pid > 0 && pid as u32 == std::process::id();
+    if failed.is_none() && signal != 0 && !is_self {
+        let children = core_runtime!(scope).children();
+        let raw_children = core_runtime!(scope).raw_children();
+        let own_child = pid > 0
+            && children
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                // An entry kept past its child's exit (for its unread output)
+                // no longer owns the pid: the system may have reused it.
+                .any(|child| child.pid == pid as u32 && !child.exited);
+        // A child of the raw-create path (extra-fd stdio, argv0) lives in its
+        // own registry and is as much this runtime's child.
+        let own_raw_child = pid > 0
+            && raw_children
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .any(|child| child.pid == pid as u32 && child.owns_pid());
+        if !own_child && !own_raw_child {
+            // Not ours to signal. Which refusal it is comes from the probe:
+            // a pid that names no process is ESRCH, as it is under node.
+            failed = Some(match kill_process(pid, 0) {
+                Err("ESRCH") => "ESRCH",
+                _ => "EPERM",
+            });
+        }
     }
-
-    if let Err(msg) = kill_process(pid, signal) {
-        throw_type_error(scope, &msg);
+    if failed.is_none()
+        && let Err(code) = kill_process(pid, signal)
+    {
+        failed = Some(code);
+    }
+    match failed {
+        None => rv.set(v8::Integer::new(scope, 0).into()),
+        Some(code) => {
+            if let Some(text) = v8::String::new(scope, code) {
+                rv.set(text.into());
+            }
+        }
     }
 }
 
+/// What `process.kill` answers for a signal number this host cannot deliver,
+/// whatever the pid: libuv's uv_kill on Windows (outside 0..NSIG is EINVAL,
+/// anything but 0, SIGINT, SIGQUIT, SIGKILL and SIGTERM is ENOSYS), and
+/// kill(2)'s EINVAL for a number outside the platform's signal range.
+fn signal_refusal(signal: i32) -> Option<&'static str> {
+    #[cfg(windows)]
+    {
+        if !(0..23).contains(&signal) {
+            return Some("EINVAL");
+        }
+        if !matches!(signal, 0 | 2 | 3 | 9 | 15) {
+            return Some("ENOSYS");
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        // Linux numbers its real-time signals up to 64; the BSDs stop at 31.
+        let max = if cfg!(target_os = "linux") { 64 } else { 31 };
+        if (0..=max).contains(&signal) {
+            None
+        } else {
+            Some("EINVAL")
+        }
+    }
+}
+
+/// `__oam.node.osSignals()`: the host's `os.constants.signals` as an object,
+/// in node's key order (see `os_signals_json`).
+fn op_os_signals(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    return_json(scope, &mut rv, &os_signals_json());
+}
+
+/// The HOST platform's signal numbers as a JSON object, in the order node's
+/// `DefineSignalConstants` (src/node_constants.cc) defines them -- the single
+/// source behind `os.constants.signals`, the legacy `node:constants` spread of
+/// it, and the numbers `process.kill` hands to kill(2).
+///
+/// Sourced from `libc`, so the compiler resolves each constant for the target
+/// being built: SIGUSR1 is 10 on linux and 30 on darwin, SIGBUS 7 and 10, and
+/// one transcribed table sent the wrong signal on the other platform. The key
+/// set is node's per platform: `SIGSTKFLT`, `SIGPOLL` and `SIGPWR` are
+/// linux-only, `SIGINFO` is the BSDs', and `SIGIOT` / `SIGPOLL` are the older
+/// names of `SIGABRT` / `SIGIO` (same numbers). The linux set is the 33 names
+/// docs/node-divergences.md entry 14 records for node v22 there; the macOS
+/// set follows the same `#ifdef` list and has not been diffed against a node
+/// on a Mac.
+#[cfg(unix)]
+fn os_signals_json() -> String {
+    let mut table: Vec<(&'static str, i64)> = vec![
+        ("SIGHUP", libc::SIGHUP as i64),
+        ("SIGINT", libc::SIGINT as i64),
+        ("SIGQUIT", libc::SIGQUIT as i64),
+        ("SIGILL", libc::SIGILL as i64),
+        ("SIGTRAP", libc::SIGTRAP as i64),
+        ("SIGABRT", libc::SIGABRT as i64),
+        ("SIGIOT", libc::SIGABRT as i64),
+        ("SIGBUS", libc::SIGBUS as i64),
+        ("SIGFPE", libc::SIGFPE as i64),
+        ("SIGKILL", libc::SIGKILL as i64),
+        ("SIGUSR1", libc::SIGUSR1 as i64),
+        ("SIGSEGV", libc::SIGSEGV as i64),
+        ("SIGUSR2", libc::SIGUSR2 as i64),
+        ("SIGPIPE", libc::SIGPIPE as i64),
+        ("SIGALRM", libc::SIGALRM as i64),
+        ("SIGTERM", libc::SIGTERM as i64),
+        ("SIGCHLD", libc::SIGCHLD as i64),
+    ];
+    // The same target gate oam_core::child_unix::signal_number uses for the
+    // two constants libc defines per architecture.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    table.push(("SIGSTKFLT", libc::SIGSTKFLT as i64));
+    table.extend_from_slice(&[
+        ("SIGCONT", libc::SIGCONT as i64),
+        ("SIGSTOP", libc::SIGSTOP as i64),
+        ("SIGTSTP", libc::SIGTSTP as i64),
+        ("SIGTTIN", libc::SIGTTIN as i64),
+        ("SIGTTOU", libc::SIGTTOU as i64),
+        ("SIGURG", libc::SIGURG as i64),
+        ("SIGXCPU", libc::SIGXCPU as i64),
+        ("SIGXFSZ", libc::SIGXFSZ as i64),
+        ("SIGVTALRM", libc::SIGVTALRM as i64),
+        ("SIGPROF", libc::SIGPROF as i64),
+        ("SIGWINCH", libc::SIGWINCH as i64),
+        ("SIGIO", libc::SIGIO as i64),
+    ]);
+    #[cfg(target_os = "linux")]
+    table.push(("SIGPOLL", libc::SIGIO as i64));
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    table.push(("SIGPWR", libc::SIGPWR as i64));
+    #[cfg(target_os = "macos")]
+    table.push(("SIGINFO", libc::SIGINFO as i64));
+    table.push(("SIGSYS", libc::SIGSYS as i64));
+    errno_object(&table)
+}
+
+/// Windows: the eleven names node publishes there, with the CRT's numbers
+/// (`SIGABRT` is 22, not POSIX's 6) plus libuv's own `SIGHUP` / `SIGQUIT` /
+/// `SIGKILL` / `SIGWINCH`. Transcribed from `os.constants.signals` of node
+/// v22.22.2 on Windows; `libc` is not a dependency here, and the set is fixed.
 #[cfg(windows)]
-fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
+fn os_signals_json() -> String {
+    const SIGNALS: &[(&str, i64)] = &[
+        ("SIGHUP", 1),
+        ("SIGINT", 2),
+        ("SIGQUIT", 3),
+        ("SIGILL", 4),
+        ("SIGABRT", 22),
+        ("SIGFPE", 8),
+        ("SIGKILL", 9),
+        ("SIGSEGV", 11),
+        ("SIGTERM", 15),
+        ("SIGBREAK", 21),
+        ("SIGWINCH", 28),
+    ];
+    errno_object(SIGNALS)
+}
+
+/// The Windows half of `process.kill`, the failure as its node code --
+/// libuv's uv_kill (src/win/process.c), step for step.
+///
+/// The process is opened as libuv opens it (PROCESS_TERMINATE |
+/// PROCESS_QUERY_INFORMATION | SYNCHRONIZE), so a process this user may see
+/// but not signal is EPERM, as under node. And a process that has EXITED is
+/// ESRCH, though its pid still names it: a handle someone holds -- this
+/// runtime's own, for a child whose exit it has not collected yet -- keeps
+/// an exited process's object, and its pid, alive, and OpenProcess succeeds
+/// on it. libuv asks the handle: signalled means gone.
+#[cfg(windows)]
+fn kill_process(pid: i32, signal: i32) -> Result<(), &'static str> {
     // ABI: the signatures match the kernel32 ABI (OpenProcess,
-    // TerminateProcess, CloseHandle); none take pointer arguments, so each
-    // call's only obligation is handle validity, discharged at the call sites
-    // below.
+    // TerminateProcess, WaitForSingleObject, CloseHandle); none take pointer
+    // arguments, so each call's only obligation is handle validity,
+    // discharged at the call sites below.
     unsafe extern "system" {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
         fn TerminateProcess(handle: isize, exit_code: u32) -> i32;
+        fn WaitForSingleObject(handle: isize, milliseconds: u32) -> u32;
         fn CloseHandle(handle: isize) -> i32;
     }
-    if signal == 0 {
-        // SAFETY: OpenProcess takes only by-value integers (access mask 0x1000
-        // = PROCESS_QUERY_LIMITED_INFORMATION, no inherit, target pid); no
-        // memory is touched. The returned handle is null-checked before use and
-        // closed below.
-        let handle = unsafe { OpenProcess(0x1000, 0, pid) };
-        if handle == 0 {
-            return Err(format!("kill: no such process {pid}"));
-        }
-        // SAFETY: `handle` was returned non-null by OpenProcess just above and
-        // has not been closed; closing it once here releases it.
-        unsafe { CloseHandle(handle) };
+    // libuv's uv_kill (src/win/process.c): a number outside 0..NSIG is
+    // EINVAL; 0 probes; SIGINT, SIGQUIT, SIGKILL and SIGTERM terminate; every
+    // other signal is one Windows cannot deliver, ENOSYS.
+    const NSIG: i32 = 23;
+    if !(0..NSIG).contains(&signal) {
+        return Err("EINVAL");
+    }
+    if !matches!(signal, 0 | 2 | 3 | 9 | 15) {
+        return Err("ENOSYS");
+    }
+    // libuv reads pid 0 as this process.
+    if pid == 0 && signal == 0 {
         return Ok(());
     }
-    // SAFETY: OpenProcess takes only by-value integers (access 0x0001 =
-    // PROCESS_TERMINATE, no inherit, target pid); the returned handle is
-    // null-checked before use and closed below.
-    let handle = unsafe { OpenProcess(0x0001, 0, pid) };
+    // PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | SYNCHRONIZE.
+    const ACCESS: u32 = 0x0001 | 0x0400 | 0x0010_0000;
+    const WAIT_OBJECT_0: u32 = 0;
+    // SAFETY: OpenProcess takes only by-value integers (the access mask
+    // above, no inherit, the target pid); no memory is touched. The returned
+    // handle is null-checked before use and closed below.
+    let handle = unsafe { OpenProcess(ACCESS, 0, pid as u32) };
     if handle == 0 {
-        return Err(format!("kill: no such process {pid}"));
+        // ERROR_INVALID_PARAMETER (87) is libuv's ESRCH -- the pid names no
+        // process -- and a refusal (ERROR_ACCESS_DENIED) is EPERM. Read at
+        // once, before anything else can replace the thread's last error.
+        return Err(match std::io::Error::last_os_error().raw_os_error() {
+            Some(87) => "ESRCH",
+            _ => "EPERM",
+        });
     }
-    // SAFETY: `handle` is the non-null PROCESS_TERMINATE handle from OpenProcess
-    // above; TerminateProcess takes it plus a by-value exit code and touches no
-    // caller memory.
-    let ok = unsafe { TerminateProcess(handle, 1) };
-    // SAFETY: `handle` was returned non-null by OpenProcess above and not yet
-    // closed; closing it once here releases it regardless of the
-    // TerminateProcess result.
-    unsafe { CloseHandle(handle) };
-    if ok == 0 {
-        return Err(format!("kill: could not terminate process {pid}"));
+    // SAFETY: `handle` is the non-null handle OpenProcess returned above,
+    // not yet closed, and opened with SYNCHRONIZE (which the zero-timeout
+    // wait needs) and PROCESS_TERMINATE. Each call takes it plus by-value
+    // integers and touches no caller memory; it is closed exactly once, last.
+    unsafe {
+        let exited = |handle| WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
+        let outcome = if signal == 0 {
+            if exited(handle) { Err("ESRCH") } else { Ok(()) }
+        } else if TerminateProcess(handle, 1) != 0 {
+            Ok(())
+        } else if exited(handle) {
+            // TerminateProcess refuses a process that has already exited.
+            Err("ESRCH")
+        } else {
+            Err("EPERM")
+        };
+        CloseHandle(handle);
+        outcome
     }
-    Ok(())
 }
 
+/// kill(2), the failure as its node code: ESRCH for a pid that names no
+/// process, EINVAL for a number that is no signal on this platform, EPERM
+/// otherwise (the one other errno kill(2) documents).
 #[cfg(not(windows))]
-fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
+fn kill_process(pid: i32, signal: i32) -> Result<(), &'static str> {
     // ABI: the declaration matches kill(2)'s ABI (two by-value ints, int
     // return). No memory is referenced.
     unsafe extern "C" {
@@ -12760,10 +13280,13 @@ fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
     // SAFETY: kill takes two by-value integers and touches no caller memory; it
     // is unsafe only as an FFI call. Failure is surfaced via errno, read
     // immediately below.
-    let ret = unsafe { kill(pid as i32, signal) };
+    let ret = unsafe { kill(pid, signal) };
     if ret != 0 {
-        let errno = std::io::Error::last_os_error();
-        return Err(format!("kill({pid}, {signal}): {errno}"));
+        return Err(match std::io::Error::last_os_error().raw_os_error() {
+            Some(errno) if errno == libc::ESRCH => "ESRCH",
+            Some(errno) if errno == libc::EINVAL => "EINVAL",
+            _ => "EPERM",
+        });
     }
     Ok(())
 }
@@ -13194,44 +13717,89 @@ mod permission_audit {
                 "op_cluster_is_worker",
                 "reads an env flag set by the forked parent",
             ),
+            (
+                "op_fork_ipc_port",
+                "reads the channel port the forking parent put in the environment; opens nothing",
+            ),
+            (
+                "op_fork_ipc_queue",
+                "holds a message for the channel the forking parent opened; names no address",
+            ),
+            (
+                "op_fork_ipc_queue_clear",
+                "drops the messages held for the forking parent's channel",
+            ),
+            (
+                "op_tcp_linger_at_exit",
+                "marks a socket from a checked connect for an orderly close at exit",
+            ),
+            (
+                "op_worker_post_message",
+                "posts to a worker already permitted at workerNew / forkSpawn",
+            ),
+            (
+                "op_worker_recv_message",
+                "receives from a worker already permitted at workerNew / forkSpawn",
+            ),
+            (
+                "op_worker_terminate",
+                "stops a worker that was already permitted at workerNew / forkSpawn",
+            ),
+            ("op_worker_thread_id", "reads this isolate's own thread id"),
+            (
+                "op_worker_is_main_thread",
+                "reads whether this isolate is a worker thread; starts nothing",
+            ),
+            ("op_worker_get_data", "reads this worker's own workerData"),
         ];
 
-        let source = include_str!("node_ops.rs");
-        let mut offenders = Vec::new();
+        // The name of the top-level `fn` item a line opens, if it opens one:
+        // `fn name(`, with or without a visibility (`pub(crate) fn name<'s>(`).
+        // Only column 0 counts, so a nested or indented fn -- this test's own
+        // helpers included -- is part of the item around it.
+        fn top_level_fn_name(line: &str) -> Option<&str> {
+            let rest = ["pub(crate) ", "pub(super) ", "pub "]
+                .iter()
+                .find_map(|visibility| line.strip_prefix(*visibility))
+                .unwrap_or(line);
+            let rest = rest.strip_prefix("fn ")?;
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            let name = &rest[..end];
+            if name.is_empty() {
+                return None;
+            }
+            Some(name)
+        }
 
-        // Split on top-level `fn ` boundaries; each chunk is one op body.
-        let mut current: Option<&str> = None;
-        let mut body = String::new();
+        let mut offenders = Vec::new();
         let check = |name: Option<&str>, body: &str, offenders: &mut Vec<String>| {
             let Some(name) = name else { return };
             let sensitive = name.starts_with("op_fs_")
                 || name.starts_with("op_spawn_")
                 || name.starts_with("op_cluster_")
-                || name.starts_with("op_process_exec");
+                || name.starts_with("op_process_exec")
+                // The ops that start a child isolate, and everything named
+                // beside them.
+                || name.starts_with("op_worker_")
+                || name.starts_with("op_fork_");
             if !sensitive || EXEMPT.iter().any(|(n, _)| *n == name) {
                 return;
             }
-            // Only ops that actually PERFORM the operation need a gate. The
-            // `#[cfg(not(windows))]` twins are pure `throw_type_error("... only
-            // implemented on Windows")` stubs -- they touch nothing, so demanding
-            // a check of them would just be noise. Keyed on whether the body
-            // reaches an operation surface at all.
-            // The ONLY ops excused here are the `#[cfg(not(windows))]` twins:
-            // pure `throw_type_error("... only implemented on Windows")`
-            // stubs that touch nothing.
+            // No op is excused by its shape. There used to be an escape here
+            // for stand-in ops that only threw "... only implemented on
+            // Windows"; those are gone (both shipped families have the real
+            // spawnExtra ops), and an escape keyed on message text was one
+            // more way to skip an op that does reach an operation.
             //
-            // Deliberately a denylist of that one shape rather than an
-            // allowlist of operation surfaces (`std::fs`, `oam_core::`, ...).
-            // The allowlist version silently skipped `op_fs_exists_sync`,
-            // which reaches the filesystem through `std::path::Path::exists`,
-            // and `op_fs_open_sync` -- both were checked at the time, so the
-            // gate looked green while covering neither. An allowlist of API
-            // surfaces can never be complete; the stub shape is a closed set.
-            let is_unsupported_stub = body.contains("throw_type_error")
-                && (body.contains("only implemented on") || body.contains("Windows only"));
-            if is_unsupported_stub {
-                return;
-            }
+            // Deliberately a list of CHECK spellings rather than an allowlist
+            // of operation surfaces (`std::fs`, `oam_core::`, ...). The
+            // allowlist version silently skipped `op_fs_exists_sync`, which
+            // reaches the filesystem through `std::path::Path::exists`, and
+            // `op_fs_open_sync` -- both were checked at the time, so the gate
+            // looked green while covering neither. An allowlist of API
+            // surfaces can never be complete.
             let checked = body.contains("fs_path_arg(")
             || body.contains("fs_path_of(")
             // readdir's path: checked like `fs_path_of`'s (`fs_path_checked`).
@@ -13250,19 +13818,51 @@ mod permission_audit {
             }
         };
 
-        for line in source.lines() {
-            if let Some(rest) = line.strip_prefix("fn ")
-                && let Some(name) = rest.split('(').next()
-            {
-                check(current, &body, &mut offenders);
-                current = Some(name);
-                body.clear();
-                continue;
+        // One chunk per top-level fn: from its `fn` line to the `}` that closes
+        // it at column 0 (rustfmt's layout, which CI enforces). The body used
+        // to run on to the next line starting with `fn `, so a `pub(crate) fn`
+        // helper below an op -- and that helper's permission check -- counted
+        // as part of the op above it. ops.rs is audited too: forkSpawn, which
+        // starts a child isolate, lives there.
+        for source in [include_str!("node_ops.rs"), include_str!("ops.rs")] {
+            let mut current: Option<&str> = None;
+            let mut body = String::new();
+            for line in source.lines() {
+                if let Some(name) = top_level_fn_name(line) {
+                    check(current, &body, &mut offenders);
+                    current = Some(name);
+                    body.clear();
+                    body.push_str(line);
+                    body.push('\n');
+                    // An empty body is closed on its own line: `fn f() {}`.
+                    if line.trim_end().ends_with("{}") {
+                        check(current.take(), &body, &mut offenders);
+                        body.clear();
+                    }
+                    continue;
+                }
+                if current.is_some() {
+                    body.push_str(line);
+                    body.push('\n');
+                    if line == "}" {
+                        check(current.take(), &body, &mut offenders);
+                        body.clear();
+                    }
+                }
             }
-            body.push_str(line);
-            body.push('\n');
+            check(current, &body, &mut offenders);
         }
-        check(current, &body, &mut offenders);
+
+        // The parser itself: a visibility or a generic list must not hide an
+        // op from the audit, and an indented fn is not a top-level item.
+        assert_eq!(top_level_fn_name("fn op_fs_open("), Some("op_fs_open"));
+        assert_eq!(
+            top_level_fn_name("pub(crate) fn op_fs_stat<'s>("),
+            Some("op_fs_stat")
+        );
+        assert_eq!(top_level_fn_name("pub fn op_x() {}"), Some("op_x"));
+        assert_eq!(top_level_fn_name("    fn nested() {"), None);
+        assert_eq!(top_level_fn_name("// fn in_a_comment("), None);
 
         assert!(
             offenders.is_empty(),

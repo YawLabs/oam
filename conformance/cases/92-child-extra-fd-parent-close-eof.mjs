@@ -2,7 +2,7 @@
 // see EOF on the matching read end.
 //
 // Case 67 asserts the other direction (the child closes fd 4, the parent's
-// Readable emits 'end') and case 69-eof asserts the parent reading through a
+// Readable emits 'end') and case 116 asserts the parent reading through a
 // dead child's write end. Nothing asserted this one: `child.stdio[3].end()`
 // runs the Writable's `final`, which is the only caller of the native
 // close-fd op, and the fd it drops is the parent's copy of the pipe's write

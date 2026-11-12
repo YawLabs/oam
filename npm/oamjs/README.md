@@ -71,8 +71,23 @@ network at install time.
 | `OAMJS_BINARY` | Exec this path instead of resolving a per-platform package. For pointing the launcher at a locally built `target/release/oam`. |
 
 Everything else on the command line is oam's; the launcher forwards argv, stdin,
-stdout, stderr and exit status unchanged, and forwards signals to the runtime so
-that a supervisor stopping `oamjs` stops oam.
+stdout, stderr and exit status unchanged.
+
+### Stopping it
+
+On Linux and macOS the launcher forwards `SIGINT`, `SIGTERM`, `SIGHUP`,
+`SIGQUIT`, `SIGUSR1` and `SIGUSR2` to the runtime and then exits the way the
+runtime exited, so a supervisor that stops `oamjs` by signalling its PID stops
+oam. (`SIGKILL` cannot be caught by any process, so it stops the launcher only.)
+
+**On Windows, stop it by closing its stdin, not by killing its PID.** Windows
+has no signal to forward: killing a PID there is `TerminateProcess`, which ends
+the launcher immediately, runs none of its code and does not touch the
+`oam.exe` it started. The runtime keeps running with the caller's stdio handles
+open, so the caller may never see end-of-file, and each restart leaves another
+process behind. oam treats a closed stdin as a clean shutdown, which is what an
+MCP host should use. Ctrl+C and Ctrl+Break in a console reach oam directly and
+work as expected.
 
 ## License
 

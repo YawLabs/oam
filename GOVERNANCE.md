@@ -30,14 +30,13 @@ Trademark and governance transfer to a neutral foundation (OpenJS or independent
 
 ## Succession (bus-factor plan)
 
-If the founder is unable to continue: maintainers (or, before any exist, the most recent
-release's co-signers) gain admin on the GitHub org; DNS is escrowed with instructions, and
-release signing keys will be once code signing lands (see Releases); the Covenant binds
-successors. This file is the authoritative statement.
+If the founder is unable to continue: maintainers gain admin on the GitHub org; DNS is
+escrowed with instructions; the Covenant binds successors. This file is the authoritative statement.
 
 ## Releases
 
-Release cadence, semver policy, and the behavior-change log are specified in RELIABILITY.md.
+Semver policy and the behavior-change log are specified in RELIABILITY.md. No release cadence
+is specified yet; RELIABILITY.md defers the LTS-line cadence to before 1.0.
 From v0.18.0 every release carries a `RELEASE-MANIFEST` signed with the release key, which the
 installers and `oam self-update` verify. Windows binaries are Authenticode-signed; macOS
 binaries are signed with oam's own self-signed identity, with Apple Developer ID signing and

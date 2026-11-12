@@ -1,6 +1,13 @@
 # Claude Code's JS CLI on oam: compat and startup gaps
 
-Status: in progress, 2026-10-15. Written 2026-10-14 against oam 0.19.0 (`main` at 9c35417)
+Current status (2026-11-10): gaps 1, 2, 3 and 4b have merged to `main` -- gap 1 as
+PR #410 (conformance case 425), gap 3 as PR #409 (cases 421, 422), gap 2 as PRs #413
+and #423, gap 4b as PR #427 (cases 438, 439). Gap 4c (the app startup snapshot) is
+still a design only, in `docs/design/app-startup-snapshot.md`. Everything below is the
+2026-10-15 snapshot it says it is: "open", "no PR yet" and the branch names in "Where
+the work is" describe that day, not today.
+
+Status when written: in progress, 2026-10-15. Written 2026-10-14 against oam 0.19.0 (`main` at 9c35417)
 on windows-aarch64, then corrected on 2026-10-15 after a second review pass that read
 the in-flight branches, the repo's actual process, and the code each gap names.
 "Verified" means a command or code read confirmed it, "inferred" means it was not run.
@@ -737,7 +744,9 @@ first draft's sketch:
   (`v8.startupSnapshot.setDeserializeMainFunction`). So 4c cannot beat the native
   1.4 s for cli.js; it is for apps that opt in.
 - A PR 0 that makes the `v8.startupSnapshot` stubs honest (and adds the missing
-  `setDeserializeMainFunction`) is worth shipping regardless.
+  `setDeserializeMainFunction`) is worth shipping regardless. (Done in the runtime:
+  the three registration calls throw `ERR_NOT_BUILDING_SNAPSHOT`; its
+  node-differential case is not written yet.)
 
 Accept (unchanged): an app reaching first output faster from a snapshot than from a
 warm compile cache, with the design's rules tested.

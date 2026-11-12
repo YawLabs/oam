@@ -2,16 +2,17 @@
 
 oam is developed heavily with AI agents. That is a strength — and the industry has a fresh,
 named cautionary tale about doing it badly: a million-line, practically unreviewable
-AI-generated rewrite merged into a runtime millions depend on. This policy makes that failure
-mode structurally impossible here. Same tools, opposite discipline, receipts published.
+AI-generated rewrite merged into a runtime millions depend on. This policy is written to rule
+that failure mode out here. Same tools, opposite discipline, receipts published.
 
 ## The gates (identical for human and AI changes)
 
 1. **No fast path.** AI-authored changes pass exactly the review, test, and CI gates human
    changes do. There is no "the agent ran the tests" exemption.
-2. **Changeset limits, CI-enforced.** No PR exceeds ~400 lines of logic change (~1,500 for
-   mechanical/generated churn) without a documented decomposition reviewed first. Mega-merges
-   are rejected by tooling, not by willpower.
+2. **Changeset limits, held at review.** No PR exceeds ~400 lines of logic change (~1,500 for
+   mechanical/generated churn) without a documented decomposition reviewed first. This limit
+   is held by the reviewer and the PR template's checklist, not by tooling: no script in
+   this repository counts changed lines, so the limit is exactly as strong as the review.
 3. **Test-first ports.** Behavior specs — usually differential tests against real Node
    behavior — are reviewed and merged BEFORE the implementation. Implementation PRs may not
    modify the tests that gate them.

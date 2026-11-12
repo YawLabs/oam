@@ -11,7 +11,7 @@
 # Ported from Yaw Terminal's mac signing machinery -- the real-signature probe,
 # the locked-keychain remediation, the pinned-identity selection and the verify
 # gate -- but with oam's OWN identity and keychain (scripts/provision-mac-
-# signing.sh, ~/.oam-signing), never Yaw Terminal's.
+# signing.sh), never Yaw Terminal's.
 #
 # What is signed, and how (mac_sign_binary):
 #   codesign --force --sign <identity> [--keychain <kc>] --options runtime
@@ -217,13 +217,6 @@ mac_report_probe_failure(){
 # first and take long enough for a keychain to relock, which reads as
 # errSecInternalComponent. (The keychain is provisioned with no idle timeout;
 # this is the belt to that brace.)
-#
-# The password goes to `security unlock-keychain -p` as an argument, so for
-# the instant that command runs it is visible to other local users of the
-# build Mac in the process list. Accepted, with the at-rest custody the
-# provision script's header describes: security(1) offers no documented way
-# to take it on stdin or from a file for a non-interactive unlock, and the
-# identity it guards is self-signed. Revisit with the Developer ID.
 mac_unlock_keychain(){
   local kc="${1:-$MAC_SIGN_KEYCHAIN}"
   if [ -z "$kc" ] || [ ! -f "$kc" ]; then

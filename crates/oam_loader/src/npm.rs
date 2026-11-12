@@ -1,12 +1,17 @@
-//! Bare-specifier resolution against existing node_modules trees (M2: the
-//! installer lands in M3; until then oam runs alongside npm/pnpm installs).
+//! Bare-specifier resolution against existing node_modules trees: the ones
+//! `oam install` (`install.rs`) writes, and equally the ones npm or pnpm
+//! installed.
 //!
 //! Implements the Node ESM algorithm: walk node_modules upward from the
 //! referrer; inside a package honor the `exports` map (exclusive when
 //! present — exact subpaths, single-`*` wildcards with longest-prefix
 //! precedence, condition objects in declaration order with conditions
 //! ["node", "import", "default"], arrays as fallback chains, null as an
-//! explicit block) and otherwise the legacy main/index rules.
+//! explicit block) and otherwise the legacy main/index rules. An import
+//! stops at the first matching package directory. `require()` shares the
+//! walk and the exports algorithm, with node's CommonJS differences: for a
+//! package WITHOUT an exports map it tries every node_modules directory up
+//! the tree in turn (and takes a plain `node_modules/name.js` file).
 //!
 //! Documented divergence: for legacy IMPORT entry resolution we honor the
 //! bundler-standard "module" field before "main" — Node ignores it, but a
@@ -139,7 +144,13 @@ const PREFIX_ONLY_BUILTINS: [&str; 3] = ["sea", "sqlite", "test/reporters"];
 /// node:NAME paths the engine instantiates from the snapshot registry.
 /// Recognized names outside this list gate on OAM-MOD0006 with a precise
 /// pointer.
-const SUPPORTED_BUILTINS: [&str; 67] = [
+///
+/// No `internal/...` name belongs here: internals resolve only through
+/// `crate::is_exposed_internal` (--expose-internals), as in node, where
+/// `node:internal/errors` without the flag is ERR_UNKNOWN_BUILTIN_MODULE.
+/// The engine's own code reaches its internal modules through the snapshot
+/// registry, never through this resolver.
+const SUPPORTED_BUILTINS: [&str; 66] = [
     "assert",
     "assert/strict",
     "async_hooks",
@@ -161,7 +172,6 @@ const SUPPORTED_BUILTINS: [&str; 67] = [
     "http2",
     "https",
     "inspector",
-    "internal/errors",
     "module",
     "net",
     "os",
@@ -268,21 +278,16 @@ pub(crate) fn is_node_builtin(specifier: &str) -> bool {
     set.contains(name)
 }
 
-/// Walk up from `file` to the nearest directory containing a package.json.
-/// Returns (package_dir, parsed_manifest) on hit. The walk anchors subpath
-/// imports (#xxx) to the OWNING package, per Node's subpath-imports spec.
+/// The package that owns `file`: (package_dir, parsed_manifest) of its
+/// [`package_scope`] -- the nearest package.json above it, the walk stopping
+/// at a node_modules directory, as node's LOOKUP_PACKAGE_SCOPE does. Subpath
+/// imports (#xxx) are anchored to this package, per Node's subpath-imports
+/// spec.
 fn find_owning_package(file: &Path) -> Option<(PathBuf, Value)> {
-    let mut dir = file.parent()?.to_path_buf();
-    loop {
-        let manifest_path = dir.join("package.json");
-        if manifest_path.is_file() {
-            let manifest = cached_manifest(&manifest_path).unwrap_or(Value::Null);
-            return Some((dir, manifest));
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
+    let manifest_path = package_scope(file)?;
+    let dir = manifest_path.parent()?.to_path_buf();
+    let manifest = cached_manifest(&manifest_path).unwrap_or(Value::Null);
+    Some((dir, manifest))
 }
 
 /// Resolve a `#xxx` subpath-import specifier against the importing package's
@@ -343,6 +348,18 @@ fn resolve_subpath_import(
             ));
         }
         return Ok(path);
+    }
+    // A target that is itself a '#' name is a package name to node, never a
+    // second trip through `imports` (which could chase its own tail); no
+    // installable package has such a name.
+    if target.starts_with('#') {
+        return Err(diag(
+            "OAM-MOD0002",
+            format!(
+                "subpath import '{specifier}' -> '{target}': cannot find package '{target}' \
+                 (an imports target is a file or a package, not another '#' import)"
+            ),
+        ));
     }
     // Bare target: re-enter resolve_bare from the owning package's root. A
     // pseudo file under pkg_dir gives the node_modules walk the right anchor
@@ -407,9 +424,12 @@ pub(crate) fn resolve_bare(
     // `internal/...` under --expose-internals: a virtual path like any other
     // builtin, resolved from the snapshot's internal registry. Whether the
     // NAME actually exists is decided there, not here -- an unknown one
-    // throws from the registry with the same shape Node gives.
-    if crate::is_exposed_internal(specifier) {
-        return Ok(PathBuf::from(format!("node:{specifier}")));
+    // throws from the registry with the same shape Node gives. Under the
+    // flag node accepts the `node:`-prefixed spelling too
+    // (`require('node:internal/errors')`), so the prefix is optional here.
+    let unprefixed = specifier.strip_prefix("node:").unwrap_or(specifier);
+    if crate::is_exposed_internal(unprefixed) {
+        return Ok(PathBuf::from(format!("node:{unprefixed}")));
     }
 
     if specifier.starts_with("node:") || is_node_builtin(specifier) {
@@ -448,16 +468,48 @@ pub(crate) fn resolve_bare(
     })?;
 
     let mut searched = 0usize;
+    // require() only: what the NEAREST package directory without the file
+    // said, reported if no directory further up has it either.
+    let mut nearest_failure: Option<Diagnostic> = None;
     let mut dir = referrer.parent().map(Path::to_path_buf);
     while let Some(current) = dir {
         let package_dir = current.join("node_modules").join(&package);
         if crate::pathutil::is_dir(&package_dir) {
-            // Node stops at the first matching package directory: failures
-            // inside it are real errors, not reasons to keep walking.
-            return resolve_in_package(&package_dir, &package, &subpath, specifier, mode);
+            // An import stops at the first matching package directory, and so
+            // does a require() of a package with an `exports` map: failures
+            // inside it are real errors, not reasons to keep walking. A
+            // require() of a package WITHOUT one is node's LOAD_AS_FILE /
+            // LOAD_AS_DIRECTORY tried in each node_modules directory in turn,
+            // so a file missing from the nearest copy is looked for in the
+            // next one up.
+            let result = resolve_in_package(&package_dir, &package, &subpath, specifier, mode);
+            match (mode, result) {
+                (ResolveMode::Require, Err(failure))
+                    if failure.code == "OAM-MOD0002" && !has_exports_map(&package_dir) =>
+                {
+                    if nearest_failure.is_none() {
+                        nearest_failure = Some(failure);
+                    }
+                }
+                (_, result) => return result,
+            }
+        } else if let Some(found) = (mode == ResolveMode::Require
+            && subpath == "."
+            && crate::pathutil::is_dir(&current.join("node_modules")))
+        .then(|| probe_require(&package_dir))
+        .flatten()
+        {
+            // require('foo') also loads a plain file `node_modules/foo.js`
+            // (LOAD_AS_FILE); an import never does. Only a directory that
+            // HAS a node_modules is probed, so the walk up through the
+            // ones without does not pay a stat per candidate extension.
+            return Ok(found);
         }
         searched += 1;
         dir = current.parent().map(Path::to_path_buf);
+    }
+    if let Some(failure) = nearest_failure {
+        return Err(failure);
     }
     Err(diag(
         "OAM-MOD0002",
@@ -483,7 +535,7 @@ pub(crate) fn resolve_bare(
 /// default `Resolver`; long-lived consumers should own a `Resolver` so
 /// `clear_caches()` reaches the tsconfig state this reads.
 pub fn resolve_require(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagnostic> {
-    resolve_require_with(crate::resolver::default_resolver(), specifier, referrer)
+    resolve_require_with(&crate::resolver::default_resolver(), specifier, referrer)
 }
 
 /// `resolve_require` against an explicit `Resolver` (its tsconfig caches).
@@ -603,22 +655,17 @@ fn split_specifier(specifier: &str) -> Option<(String, String)> {
     Some((name, subpath))
 }
 
-/// True for paths ending in `.d.ts` / `.d.mts` / `.d.cts` / `.d.tsx` /
-/// `.d.jsx` (case-insensitive). Declaration files are types-only and must
-/// never be returned as a runtime entry, even if a package's `exports` /
-/// `main` / `module` field happens to point at one. Mirrors the check in
-/// `oam_loader::lib::is_declaration_file` for paths that come back from
-/// `resolve_in_package` rather than from the directory-probe path.
-fn is_declaration_target(p: &Path) -> bool {
-    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    let lc = name.to_ascii_lowercase();
-    lc.ends_with(".d.ts")
-        || lc.ends_with(".d.mts")
-        || lc.ends_with(".d.cts")
-        || lc.ends_with(".d.tsx")
-        || lc.ends_with(".d.jsx")
+/// A manifest's `exports` map, if it has one. node tests `exports != null`,
+/// so an explicit `"exports": null` is a package without a map (legacy
+/// main/index resolution), not one that exports nothing.
+fn exports_map(manifest: &Value) -> Option<&Value> {
+    manifest.get("exports").filter(|exports| !exports.is_null())
+}
+
+/// Whether the package at `package_dir` declares an `exports` map.
+fn has_exports_map(package_dir: &Path) -> bool {
+    cached_manifest(&package_dir.join("package.json"))
+        .is_some_and(|manifest| exports_map(&manifest).is_some())
 }
 
 fn resolve_in_package(
@@ -631,7 +678,7 @@ fn resolve_in_package(
     let manifest_path = package_dir.join("package.json");
     let manifest: Value = cached_manifest(&manifest_path).unwrap_or(Value::Null);
 
-    let resolved = if let Some(exports) = manifest.get("exports") {
+    let resolved = if let Some(exports) = exports_map(&manifest) {
         let target =
             exports_resolve(exports, subpath, mode.conditions()).map_err(
                 |reason| match reason {
@@ -713,8 +760,9 @@ fn resolve_in_package(
     // at a declaration file (rare but real -- some types-only packages or
     // misconfigured dual builds do this), loading it as a runtime module is
     // always wrong. Reject with MOD0001 plus a hint so the user knows why
-    // the bare-import didn't work.
-    if is_declaration_target(&resolved) {
+    // the bare-import didn't work. (Declaration files are types-only; the
+    // same check the directory-probe path applies to its candidates.)
+    if crate::is_declaration_file(&resolved) {
         return Err(diag(
             "OAM-MOD0001",
             format!(
@@ -857,7 +905,7 @@ pub fn node_declared_module_kind(path: &Path) -> Option<ModuleKind> {
 }
 
 /// Whether `path` lies under a node_modules directory.
-fn in_node_modules(path: &Path) -> bool {
+pub(crate) fn in_node_modules(path: &Path) -> bool {
     path.components().any(|c| c.as_os_str() == "node_modules")
 }
 
@@ -946,15 +994,27 @@ fn exports_resolve(
         }
         _ => None,
     };
+    // An `imports` lookup is always for a '#' specifier, an `exports` one for
+    // '.' or './x': the key shape tells the two fields apart, and only
+    // `imports` may name another package as a target.
+    let is_imports = subpath.starts_with('#');
+    // node asks PACKAGE_TARGET_RESOLVE and reads both of its empty answers --
+    // null (blocked) and undefined (no condition matched) -- as "not exported".
+    let finish = |outcome: Result<TargetOutcome, ExportsError>| -> Result<String, ExportsError> {
+        match outcome? {
+            TargetOutcome::Resolved(target) => Ok(target),
+            TargetOutcome::NoMatch | TargetOutcome::Blocked => Err(ExportsError::NotExported),
+        }
+    };
     let Some(map) = as_map else {
         if subpath == "." {
-            return resolve_target(exports, "", conditions);
+            return finish(resolve_target(exports, "", conditions, is_imports));
         }
         return Err(ExportsError::NotExported);
     };
 
     if let Some(value) = map.get(subpath) {
-        return resolve_target(value, "", conditions);
+        return finish(resolve_target(value, "", conditions, is_imports));
     }
 
     // Wildcards: one '*' per key; the longest static prefix wins.
@@ -973,21 +1033,64 @@ fn exports_resolve(
         }
     }
     match best {
-        Some((_, value, matched)) => resolve_target(value, &matched, conditions),
+        Some((_, value, matched)) => {
+            finish(resolve_target(value, &matched, conditions, is_imports))
+        }
         None => Err(ExportsError::NotExported),
     }
+}
+
+/// What node's PACKAGE_TARGET_RESOLVE answers when it does not throw.
+enum TargetOutcome {
+    /// A target string: `./x` inside the package or, for `imports` only, a
+    /// bare specifier to resolve as a package from the package root.
+    Resolved(String),
+    /// node's `undefined`: no condition of an object matched. An enclosing
+    /// conditions object goes on to its next key.
+    NoMatch,
+    /// node's `null`: the target is explicitly blocked. An enclosing
+    /// conditions object stops here; an enclosing array tries its next entry.
+    Blocked,
+}
+
+/// Whether node's `new URL(target)` would accept `target`: it starts with a
+/// URL scheme (`node:fs`, `https://x`, `C:/x`). node refuses such a string as
+/// an `imports` target (ERR_INVALID_PACKAGE_TARGET) rather than treat it as a
+/// package name.
+fn has_url_scheme(target: &str) -> bool {
+    let Some(colon) = target.find(':') else {
+        return false;
+    };
+    let mut scheme = target[..colon].chars();
+    let Some(first) = scheme.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && scheme.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 fn resolve_target(
     target: &Value,
     matched: &str,
     conditions: &[&str],
-) -> Result<String, ExportsError> {
+    is_imports: bool,
+) -> Result<TargetOutcome, ExportsError> {
     match target {
         Value::String(s) => {
             let substituted = s.replace('*', matched);
             if substituted.starts_with("./") {
-                Ok(substituted)
+                return Ok(TargetOutcome::Resolved(substituted));
+            }
+            // `imports` (never `exports`) may map to another package: any
+            // target that is not relative, absolute or URL-shaped is a bare
+            // specifier for the caller to resolve from the package root.
+            let bare = is_imports
+                && !s.is_empty()
+                && !s.starts_with("../")
+                && !s.starts_with('/')
+                && !has_url_scheme(s);
+            if bare {
+                Ok(TargetOutcome::Resolved(substituted))
             } else {
                 Err(ExportsError::InvalidTarget(substituted))
             }
@@ -995,20 +1098,39 @@ fn resolve_target(
         Value::Object(branches) => {
             for (condition, value) in branches {
                 if condition == "default" || conditions.contains(&condition.as_str()) {
-                    return resolve_target(value, matched, conditions);
+                    // A matching condition whose own target matched nothing
+                    // (a nested conditions object with no branch for us) does
+                    // not end the search: node continues with the next key.
+                    // An explicit null, or an invalid target, does end it.
+                    match resolve_target(value, matched, conditions, is_imports)? {
+                        TargetOutcome::NoMatch => continue,
+                        outcome => return Ok(outcome),
+                    }
                 }
             }
-            Err(ExportsError::NotExported)
+            Ok(TargetOutcome::NoMatch)
         }
         Value::Array(options) => {
+            // A fallback array skips entries that are invalid, blocked or
+            // unmatched, and answers with how the last invalid or blocked one
+            // failed (node keeps `lastException`); an empty array is blocked.
+            let mut last: Result<TargetOutcome, ExportsError> = Ok(if options.is_empty() {
+                TargetOutcome::Blocked
+            } else {
+                TargetOutcome::NoMatch
+            });
             for option in options {
-                if let Ok(resolved) = resolve_target(option, matched, conditions) {
-                    return Ok(resolved);
+                match resolve_target(option, matched, conditions, is_imports) {
+                    Ok(TargetOutcome::Resolved(resolved)) => {
+                        return Ok(TargetOutcome::Resolved(resolved));
+                    }
+                    Ok(TargetOutcome::NoMatch) => {}
+                    other => last = other,
                 }
             }
-            Err(ExportsError::NotExported)
+            last
         }
-        Value::Null => Err(ExportsError::NotExported),
+        Value::Null => Ok(TargetOutcome::Blocked),
         other => Err(ExportsError::InvalidTarget(other.to_string())),
     }
 }
@@ -1479,6 +1601,31 @@ mod tests {
         );
     }
 
+    // No internal module is a builtin without --expose-internals, whatever
+    // the spelling (node: ERR_UNKNOWN_BUILTIN_MODULE for the prefixed one).
+    #[test]
+    fn node_prefixed_internal_is_unknown_without_the_flag() {
+        if std::env::var("OAM_EXPOSE_INTERNALS").as_deref() == Ok("1") {
+            // The flag is process-wide; nothing to assert under it.
+            return;
+        }
+        // A directory of its own: this test removes it, and a parallel test
+        // sharing the name could lose its entry file mid-run.
+        let dir = std::env::temp_dir().join(format!("oam-npm-8b-internal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("entry.ts");
+        std::fs::write(&entry, "").unwrap();
+        let err = resolve_bare("node:internal/errors", &entry, ResolveMode::Import)
+            .expect_err("node:internal/errors is not a builtin without the flag");
+        assert_eq!(err.code, "OAM-MOD0006");
+        assert!(
+            err.message.contains("is not a known node: builtin module"),
+            "message was: {}",
+            err.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn sys_resolves_as_a_builtin() {
         // `sys` is node's deprecated (DEP0025) name for `util`, still a
@@ -1785,16 +1932,249 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A matching condition whose nested target matches nothing is not the
+    /// end of the search: node's PACKAGE_TARGET_RESOLVE goes on to the next
+    /// key (measured on node v22.22.2: the first map loads `./i.cjs` under
+    /// require() and `./n.mjs` under import). Only an explicit null stops it.
     #[test]
-    fn exports_array_falls_through_when_no_condition_matches() {
-        // Distinct from `exports_arrays_fall_back_and_bad_targets_error`
-        // (which uses a string in the array). Here the FIRST slot is a
-        // condition object whose condition ('browser') is not in the import
-        // conditions, so the array walks past it to the string fallback.
-        let exports = json!({ ".": [{ "browser": "./b.js" }, "./fallback.js"] });
+    fn exports_conditions_fall_through_a_nested_branch_that_matches_nothing() {
+        let nested = json!({ "node": { "import": "./n.mjs" }, "default": "./i.cjs" });
         assert_eq!(
-            exports_resolve(&exports, ".", IMPORT).ok().unwrap(),
-            "./fallback.js"
+            exports_resolve(&nested, ".", REQUIRE).ok().unwrap(),
+            "./i.cjs"
         );
+        assert_eq!(
+            exports_resolve(&nested, ".", IMPORT).ok().unwrap(),
+            "./n.mjs"
+        );
+        // A fallback array with no usable entry is "no match" too, so the
+        // enclosing conditions object continues to `default`.
+        let nested_array = json!({
+            ".": { "node": [{ "browser": "./b.js" }], "default": "./d.js" }
+        });
+        assert_eq!(
+            exports_resolve(&nested_array, ".", REQUIRE).ok().unwrap(),
+            "./d.js"
+        );
+        // An explicit null under a matching condition blocks the subpath:
+        // `default` is not consulted.
+        let blocked = json!({ "node": null, "default": "./i.cjs" });
+        assert!(matches!(
+            exports_resolve(&blocked, ".", REQUIRE),
+            Err(ExportsError::NotExported)
+        ));
+        // Nothing matches at any level: not exported.
+        let none = json!({ "node": { "import": "./n.mjs" } });
+        assert!(matches!(
+            exports_resolve(&none, ".", REQUIRE),
+            Err(ExportsError::NotExported)
+        ));
+        // A fallback array whose last failing entry is an invalid target
+        // reports that, as node does.
+        let invalid_last = json!({ "#arr": [{ "browser": "./b.js" }, "../bad.js"] });
+        assert!(matches!(
+            exports_resolve(&invalid_last, "#arr", IMPORT),
+            Err(ExportsError::InvalidTarget(_))
+        ));
+    }
+
+    /// `imports` -- unlike `exports` -- may map a '#' name to another package.
+    /// The target string comes back as written (with the wildcard filled in)
+    /// for the caller to resolve from the package root. Relative-upward,
+    /// absolute and URL-shaped targets stay invalid, as in node v22.22.2
+    /// (`"#x": "node:fs"` is ERR_INVALID_PACKAGE_TARGET there).
+    #[test]
+    fn imports_accept_bare_package_targets_and_exports_do_not() {
+        let imports = json!({
+            "#dep": "dep",
+            "#scoped": "@scope/dep/sub.js",
+            "#w/*": "dep/*",
+            "#cond": { "node": "dep-node", "default": "./shim.js" },
+            "#url": "node:fs",
+            "#up": "../x.js",
+            "#abs": "/x.js",
+            "#empty": "",
+        });
+        assert_eq!(
+            exports_resolve(&imports, "#dep", IMPORT).ok().unwrap(),
+            "dep"
+        );
+        assert_eq!(
+            exports_resolve(&imports, "#scoped", IMPORT).ok().unwrap(),
+            "@scope/dep/sub.js"
+        );
+        assert_eq!(
+            exports_resolve(&imports, "#w/s.js", REQUIRE).ok().unwrap(),
+            "dep/s.js"
+        );
+        assert_eq!(
+            exports_resolve(&imports, "#cond", IMPORT).ok().unwrap(),
+            "dep-node"
+        );
+        for invalid in ["#url", "#up", "#abs", "#empty"] {
+            assert!(
+                matches!(
+                    exports_resolve(&imports, invalid, IMPORT),
+                    Err(ExportsError::InvalidTarget(_))
+                ),
+                "{invalid}"
+            );
+        }
+        // The same string in `exports` is an invalid target.
+        let exports = json!({ ".": "dep" });
+        assert!(matches!(
+            exports_resolve(&exports, ".", IMPORT),
+            Err(ExportsError::InvalidTarget(_))
+        ));
+    }
+
+    #[test]
+    fn subpath_import_with_a_bare_target_resolves_through_node_modules() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-impbare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dep = dir.join("node_modules/dep");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::write(
+            dep.join("package.json"),
+            serde_json::to_string(&json!({ "name": "dep", "main": "index.js" })).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dep.join("index.js"), "module.exports = 'dep';").unwrap();
+        std::fs::write(dep.join("s.js"), "module.exports = 'sub';").unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            serde_json::to_string(&json!({
+                "name": "app",
+                "imports": {
+                    "#dep": "dep",
+                    "#w/*": "dep/*",
+                    "#fs": "fs",
+                    "#self": "#dep",
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let referrer = dir.join("src/entry.js");
+        std::fs::write(&referrer, "").unwrap();
+
+        for mode in [ResolveMode::Import, ResolveMode::Require] {
+            let main = resolve_bare("#dep", &referrer, mode).expect("#dep -> dep");
+            assert!(main.ends_with("node_modules/dep/index.js"), "got {main:?}");
+            let sub = resolve_bare("#w/s.js", &referrer, mode).expect("#w/s.js -> dep/s.js");
+            assert!(sub.ends_with("node_modules/dep/s.js"), "got {sub:?}");
+            // A bare builtin name is a package target like any other, and
+            // the resolver answers `node:fs` in both modes -- as node
+            // v22.22.2's does. What differs is the loader on top: `import`
+            // loads the builtin, while require() cannot turn the `node:`
+            // URL into a path and throws ERR_INVALID_URL_SCHEME. That
+            // refusal lives with require() (oam_engine's
+            // `resolve_require_or_throw`; e2e
+            // `subpath_import_of_a_builtin_loads_for_import_and_throws_for_require`),
+            // not here.
+            let builtin = resolve_bare("#fs", &referrer, mode).expect("#fs -> fs");
+            assert_eq!(builtin, PathBuf::from("node:fs"));
+            // A '#' target is a package name, never a second imports lookup.
+            let err = resolve_bare("#self", &referrer, mode).expect_err("#self");
+            assert_eq!(err.code, "OAM-MOD0002", "{err:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// require() of a package WITHOUT an `exports` map tries each
+    /// node_modules directory up the tree (node's LOAD_NODE_MODULES), so a
+    /// file missing from the nearest copy is found in an outer one, and a
+    /// plain `node_modules/name.js` file is a module. An import does neither,
+    /// and an `exports` map makes the nearest package final for both
+    /// (measured on node v22.22.2).
+    #[test]
+    fn require_walk_continues_past_a_package_without_the_file() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-reqwalk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let outer = dir.join("node_modules/foo");
+        let inner = dir.join("a/node_modules/foo");
+        std::fs::create_dir_all(outer.join("lib")).unwrap();
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(outer.join("lib/x.js"), "module.exports = 'outer';").unwrap();
+        std::fs::write(inner.join("package.json"), r#"{"name":"foo"}"#).unwrap();
+        std::fs::write(
+            dir.join("node_modules/plain.js"),
+            "module.exports = 'plain';",
+        )
+        .unwrap();
+        // A nearer copy WITH an exports map: nothing above it is consulted.
+        let sealed_outer = dir.join("node_modules/sealed");
+        let sealed_inner = dir.join("a/node_modules/sealed");
+        std::fs::create_dir_all(sealed_outer.join("lib")).unwrap();
+        std::fs::create_dir_all(&sealed_inner).unwrap();
+        std::fs::write(sealed_outer.join("lib/x.js"), "").unwrap();
+        std::fs::write(
+            sealed_inner.join("package.json"),
+            r#"{"name":"sealed","exports":{".":"./index.js"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        let referrer = dir.join("a/b/r.cjs");
+        std::fs::write(&referrer, "").unwrap();
+
+        let found = resolve_bare("foo/lib/x", &referrer, ResolveMode::Require)
+            .expect("the outer copy has lib/x.js");
+        assert!(
+            found.starts_with(dir.join("node_modules")) && found.ends_with("foo/lib/x.js"),
+            "got {found:?}"
+        );
+        let plain = resolve_bare("plain", &referrer, ResolveMode::Require)
+            .expect("node_modules/plain.js is a module to require()");
+        assert!(plain.ends_with("node_modules/plain.js"), "got {plain:?}");
+
+        // Neither copy has an entry point: the failure is the nearest one's.
+        let err = resolve_bare("foo", &referrer, ResolveMode::Require).expect_err("no entry");
+        assert_eq!(err.code, "OAM-MOD0002", "{err:?}");
+        assert!(
+            err.message.contains("has no resolvable entry"),
+            "{}",
+            err.message
+        );
+
+        // An import stops at the first package directory, and never takes a
+        // plain file for a package.
+        let err = resolve_bare("foo/lib/x.js", &referrer, ResolveMode::Import)
+            .expect_err("import does not walk past the nearest package");
+        assert_eq!(err.code, "OAM-MOD0002", "{err:?}");
+        let err = resolve_bare("plain", &referrer, ResolveMode::Import)
+            .expect_err("import takes no plain file");
+        assert_eq!(err.code, "OAM-MOD0002", "{err:?}");
+
+        // exports map: the nearest package answers, for require() too.
+        let err = resolve_bare("sealed/lib/x.js", &referrer, ResolveMode::Require)
+            .expect_err("the exports map does not allow the subpath");
+        assert_eq!(err.code, "OAM-MOD0007", "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `"exports": null` is a package without an exports map (node tests
+    /// `exports != null`): its main and its subpaths resolve the legacy way.
+    #[test]
+    fn a_null_exports_field_is_no_exports_map() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-expnull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("node_modules/en");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"en","exports":null,"main":"m.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("m.js"), "module.exports = 1;").unwrap();
+        let referrer = dir.join("entry.js");
+        std::fs::write(&referrer, "").unwrap();
+        for mode in [ResolveMode::Import, ResolveMode::Require] {
+            for specifier in ["en", "en/m.js"] {
+                let found = resolve_bare(specifier, &referrer, mode).expect(specifier);
+                assert!(found.ends_with("node_modules/en/m.js"), "got {found:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

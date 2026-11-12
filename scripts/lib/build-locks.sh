@@ -39,7 +39,7 @@
 #
 # Two tools, deliberately separate:
 #
-#   oam_park_*  -- make a path writable WITHOUT killing anything. Windows
+#   oam_park_file -- make a path writable WITHOUT killing anything. Windows
 #                  allows RENAMING a running image: holders keep their handle
 #                  to the renamed file and never notice. This is the default,
 #                  because target/release/oam.exe is what live typed-cli
@@ -71,21 +71,6 @@ oam_park_file() {
   rm -f "$parked" 2>/dev/null || true
   [ -e "$path" ] && return 1
   return 0
-}
-
-# oam_park_glob <glob>...
-# Parks every existing match. Unmatched globs and already-parked copies are
-# skipped. Returns 1 if any path could not be freed.
-oam_park_glob() {
-  local pattern hit rc=0
-  for pattern in "$@"; do
-    for hit in $pattern; do
-      [ -e "$hit" ] || continue
-      case "$hit" in *.inuse-*) continue ;; esac
-      oam_park_file "$hit" || rc=1
-    done
-  done
-  return "$rc"
 }
 
 # oam_reap_parked <dir>

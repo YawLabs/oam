@@ -32,12 +32,18 @@
 //!   by a SIGINT hung forever.)
 //!
 //! * Windows — `SetConsoleCtrlHandler`. The handler is a zero-capture
-//!   `extern "system"` fn, so state lives in a process-global. It maps
-//!   console control events to Node signal names, and returns TRUE (suppress
-//!   the OS default) only when that name currently has a watcher. CAVEAT:
-//!   CTRL_CLOSE / LOGOFF / SHUTDOWN give only ~5s before a forced kill even
-//!   when the handler returns TRUE, so SIGHUP-graceful shutdown is best-effort
-//!   on Windows. SIGTERM is accepted as a name but the OS never produces it.
+//!   `extern "system"` fn, so state lives in a process-global: the list of
+//!   watchers across every isolate, each with its own op channel. It maps
+//!   console control events to Node signal names as libuv does (Ctrl+C
+//!   SIGINT, Ctrl+Break SIGBREAK, console close SIGHUP), hands the delivery
+//!   to every watcher of the name, and returns TRUE (suppress the OS default)
+//!   only when one took it. CAVEAT: Windows ends the process the moment a
+//!   CTRL_CLOSE handler returns, so after dispatching SIGHUP the handler
+//!   thread does not return; the listener then has the system's close
+//!   timeout (~5s) before a forced kill, so SIGHUP-graceful shutdown is
+//!   best-effort on Windows. CTRL_LOGOFF / CTRL_SHUTDOWN are not signals (as
+//!   in libuv) and take the default. SIGTERM is accepted as a name but the
+//!   OS never produces it.
 
 use crate::{OpCompletion, OpOutcome, SIGNAL_OP_ID};
 use std::sync::mpsc::Sender;
@@ -126,10 +132,17 @@ fn default_terminates(signum: i32) -> bool {
     )
 }
 
-/// Map a Node signal name to a tokio `SignalKind`. Returns `None` for names
-/// that are not deliverable Unix signals (e.g. "SIGBREAK", which is
-/// Windows-only) — the JS listener is allowed but simply never fires, matching
-/// Node's behavior for such names on Unix.
+/// Map a Node signal name to a tokio `SignalKind`, for the nine signals oam
+/// watches. `None` for every other name: the JS listener is allowed but
+/// never fires, and the signal keeps its OS default. That matches Node only
+/// for a name that is no Unix signal ("SIGBREAK", which is Windows-only).
+/// For a real one outside the table -- SIGPIPE, SIGALRM, SIGCHLD, SIGTTIN,
+/// SIGXCPU, ... -- it is a gap: Node delivers every signal libuv can catch,
+/// so `process.on('SIGALRM', fn)` there runs `fn` where oam still takes the
+/// default action. The JS side's `SIGNAL_NAMES` is the same set, and
+/// docs/node-divergences.md records the gap. Widening it means deciding each
+/// added signal's unwatched default (`default_terminates`, and the stop
+/// handling in `die_by`), not only adding a row here.
 #[cfg(unix)]
 fn signal_kind(name: &str) -> Option<tokio::signal::unix::SignalKind> {
     use tokio::signal::unix::SignalKind;
@@ -314,24 +327,37 @@ pub fn stop_signal(map: &mut std::collections::HashMap<String, SignalHandle>, na
 // ========================================================== Windows backend
 
 #[cfg(windows)]
-use std::collections::HashSet;
+use std::sync::Mutex;
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(windows)]
-use std::sync::{Mutex, OnceLock};
 
+/// One live `SignalHandle`: a signal name some isolate is watching, and that
+/// isolate's op channel.
+#[cfg(windows)]
+struct Watcher {
+    id: u64,
+    name: String,
+    tx: Sender<OpCompletion>,
+}
+
+/// Every watcher in the process, across every isolate -- the Windows twin of
+/// the unix half's per-process watcher count. A delivery goes to each watcher
+/// of its name, and the OS default is suppressed while at least one of them
+/// took it. (This used to be ONE sender, overwritten by each `start_signal`,
+/// plus a set of names: a second isolate watching SIGINT took the deliveries
+/// away from the first, and its handle going took the name out of the set, so
+/// Ctrl-C then killed the process under the first isolate's listener.)
 #[cfg(windows)]
 struct SigState {
-    /// Sender for the current run's op channel. Refreshed on every
-    /// `start_signal` so the latest run wins after a per-run reset.
-    tx: Option<Sender<OpCompletion>>,
-    /// Node signal names that currently have a watcher. The ctrl handler only
-    /// suppresses the OS default (returns TRUE) for names in this set.
-    active: HashSet<String>,
+    watchers: Vec<Watcher>,
+    next_id: u64,
 }
 
 #[cfg(windows)]
-static SIGNAL_STATE: OnceLock<Mutex<SigState>> = OnceLock::new();
+static SIGNAL_STATE: Mutex<SigState> = Mutex::new(SigState {
+    watchers: Vec::new(),
+    next_id: 0,
+});
 #[cfg(windows)]
 static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
@@ -348,17 +374,50 @@ unsafe extern "system" {
 
 #[cfg(windows)]
 pub struct SignalHandle {
-    name: String,
+    /// This handle's entry in `SIGNAL_STATE.watchers`.
+    id: u64,
 }
 
 #[cfg(windows)]
 impl Drop for SignalHandle {
     fn drop(&mut self) {
-        if let Some(state) = SIGNAL_STATE.get() {
-            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-            guard.active.remove(&self.name);
-        }
+        let mut guard = SIGNAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        guard.watchers.retain(|watcher| watcher.id != self.id);
     }
+}
+
+/// Add a watcher of `name` delivering to `tx`. Its handle removes exactly
+/// this watcher when dropped, whatever else watches the same name.
+#[cfg(windows)]
+fn register(tx: &Sender<OpCompletion>, name: &str) -> SignalHandle {
+    let mut guard = SIGNAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let id = guard.next_id;
+    guard.next_id += 1;
+    guard.watchers.push(Watcher {
+        id,
+        name: name.to_string(),
+        tx: tx.clone(),
+    });
+    SignalHandle { id }
+}
+
+/// Hand one delivery of `name` to every watcher of it. True when at least
+/// one took it -- a watcher whose op channel is gone (its run is over) does
+/// not count, so a delivery nobody can act on gets the OS default.
+#[cfg(windows)]
+fn deliver(name: &str) -> bool {
+    let guard = SIGNAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut taken = false;
+    for watcher in guard.watchers.iter().filter(|w| w.name == name) {
+        taken |= watcher
+            .tx
+            .send(OpCompletion {
+                id: SIGNAL_OP_ID,
+                outcome: OpOutcome::Signal(name.to_string()),
+            })
+            .is_ok();
+    }
+    taken
 }
 
 #[cfg(windows)]
@@ -366,32 +425,37 @@ unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> i32 {
     const CTRL_C_EVENT: u32 = 0;
     const CTRL_BREAK_EVENT: u32 = 1;
     const CTRL_CLOSE_EVENT: u32 = 2;
-    const CTRL_LOGOFF_EVENT: u32 = 5;
-    const CTRL_SHUTDOWN_EVENT: u32 = 6;
     // TRUE suppresses the OS default; FALSE lets the next handler / default run.
     const TRUE: i32 = 1;
     const FALSE: i32 = 0;
+    // libuv's uv__signal_control_handler. CTRL_LOGOFF_EVENT and
+    // CTRL_SHUTDOWN_EVENT are not signals there (they reach services only,
+    // which have their own notification), so they take the default.
     let name = match ctrl_type {
         CTRL_C_EVENT => "SIGINT",
         CTRL_BREAK_EVENT => "SIGBREAK",
-        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => "SIGHUP",
+        CTRL_CLOSE_EVENT => "SIGHUP",
         _ => return FALSE,
     };
-    let Some(state) = SIGNAL_STATE.get() else {
+    // `deliver` has released the state lock by the time it returns, which
+    // the park below depends on: the isolate thread takes that lock to drop
+    // its handles on the way out.
+    if !deliver(name) {
         return FALSE;
-    };
-    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.active.contains(name) {
-        if let Some(tx) = &guard.tx {
-            let _ = tx.send(OpCompletion {
-                id: SIGNAL_OP_ID,
-                outcome: OpOutcome::Signal(name.to_string()),
-            });
-        }
-        TRUE
-    } else {
-        FALSE
     }
+    if ctrl_type == CTRL_CLOSE_EVENT {
+        // Windows terminates the process as soon as a CTRL_CLOSE handler
+        // returns, whatever it returns; while the handler has not returned,
+        // the process keeps running until the system's close timeout (about
+        // 5 s) ends it. So this thread -- one Windows creates for the
+        // handler -- stays here, as libuv's does (`Sleep(INFINITE)`), and the
+        // SIGHUP listener gets that time: it ends the process by exiting, or
+        // the timeout does.
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+    TRUE
 }
 
 #[cfg(windows)]
@@ -400,17 +464,7 @@ pub fn start_signal(
     tx: &Sender<OpCompletion>,
     name: &str,
 ) -> Option<SignalHandle> {
-    let state = SIGNAL_STATE.get_or_init(|| {
-        Mutex::new(SigState {
-            tx: None,
-            active: HashSet::new(),
-        })
-    });
-    {
-        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-        guard.tx = Some(tx.clone());
-        guard.active.insert(name.to_string());
-    }
+    let handle = register(tx, name);
     // Install the console ctrl handler exactly once (adding the same routine
     // twice would have it invoked twice per event).
     if !HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
@@ -421,24 +475,74 @@ pub fn start_signal(
             SetConsoleCtrlHandler(Some(ctrl_handler), 1);
         }
     }
-    Some(SignalHandle {
-        name: name.to_string(),
-    })
+    Some(handle)
 }
 
 #[cfg(windows)]
 impl SignalHandle {
-    /// No-op: Windows suppression is driven by the ctrl handler's `active`
-    /// set, which `Drop` maintains, so dropping the handle already restores
-    /// the OS default.
+    /// No-op: Windows suppression is driven by the ctrl handler's watcher
+    /// list, which `Drop` maintains, so dropping the handle already restores
+    /// the OS default once no other isolate watches the name.
     pub fn set_watched(&self, _on: bool) {}
 }
 
-/// Windows drops the handle, which removes the name from the ctrl handler's
-/// active set so the next event falls through to the OS default.
+/// Windows drops the handle, which removes this run's watcher: the next event
+/// falls through to the OS default unless another isolate still watches it.
 #[cfg(windows)]
 pub fn stop_signal(map: &mut std::collections::HashMap<String, SignalHandle>, name: &str) {
     map.remove(name);
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    fn took(rx: &std::sync::mpsc::Receiver<OpCompletion>, name: &str) -> bool {
+        match rx.try_recv() {
+            Ok(completion) => {
+                completion.id == SIGNAL_OP_ID
+                    && matches!(completion.outcome, OpOutcome::Signal(got) if got == name)
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Two isolates watching one name each get the delivery, and one of them
+    /// going leaves the other watching: the name stays suppressed until its
+    /// last watcher is gone. Names no console event maps to, so a real
+    /// Ctrl+C in the test run cannot interfere, and no handler is installed.
+    #[test]
+    fn watchers_are_per_isolate_and_counted() {
+        const NAME: &str = "TEST-SIGNAL-COUNTED";
+        let (main_tx, main_rx) = std::sync::mpsc::channel();
+        let (worker_tx, worker_rx) = std::sync::mpsc::channel();
+        assert!(!deliver(NAME), "nobody watches yet");
+
+        let main = register(&main_tx, NAME);
+        let worker = register(&worker_tx, NAME);
+        assert!(deliver(NAME));
+        assert!(took(&main_rx, NAME), "the first watcher keeps its delivery");
+        assert!(took(&worker_rx, NAME));
+
+        drop(worker);
+        assert!(deliver(NAME), "the remaining watcher still suppresses");
+        assert!(took(&main_rx, NAME));
+        assert!(!took(&worker_rx, NAME));
+
+        drop(main);
+        assert!(!deliver(NAME), "the last watcher is gone: OS default");
+    }
+
+    /// A watcher whose op channel is gone cannot act on a delivery, so it
+    /// does not suppress the default.
+    #[test]
+    fn a_watcher_with_no_receiver_does_not_suppress() {
+        const NAME: &str = "TEST-SIGNAL-NO-RECEIVER";
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _handle = register(&tx, NAME);
+        drop(rx);
+        assert!(!deliver(NAME));
+    }
 }
 
 // ================================================ fallback (no known backend)

@@ -1,6 +1,6 @@
-// oam bootstrap: the JS half of the runtime surface. Evaluated at context
-// creation today; compiled into the startup snapshot once that pipeline
-// lands (same source, faster boot).
+// oam bootstrap: the JS half of the runtime surface. Evaluated at build
+// time into the V8 startup snapshot (crates/oam_engine/build.rs); see the
+// SNAPSHOT CONSTRAINT below.
 //
 // fetch: plain-object Response/Headers shapes (real spec classes arrive with
 // oam_web + WPT) over a streamed body. Wire contract with crates/oam_core
@@ -127,6 +127,9 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         err.code = "ERR_INVALID_ARG_TYPE";
         throw err;
       }
+      // null is accepted like undefined (the guard above lets it through,
+      // as node does); the default parameter only covers undefined.
+      init ??= {};
       this.type = `${type}`;
       this.bubbles = init.bubbles === true;
       this.cancelable = init.cancelable === true;
@@ -239,7 +242,8 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       super(type, init);
       // `detail` is readonly per spec and defaults to null, not undefined.
       Object.defineProperty(this, "detail", {
-        value: init.detail === undefined ? null : init.detail,
+        // `init` may be null (accepted like undefined, as in Event).
+        value: init?.detail === undefined ? null : init.detail,
         writable: false,
         enumerable: true,
         configurable: true,
@@ -264,6 +268,9 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         if (!owner) return;
         const list = owner._listeners.get(type);
         if (list) owner._listeners.set(type, list.filter((e) => e !== entry));
+        // An AbortSignal.any composite pinned only by this (now dead)
+        // listener is released.
+        if (type === "abort") trackComposite(owner);
       })
     : null;
 
@@ -322,7 +329,40 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       return `${name} ${inspect({}, opts)}`;
     }
     addEventListener(type, listener, options) {
+      // options.signal (node's validateEventListenerOptions, then
+      // addEventListener in lib/internal/event_target.js): anything that is
+      // not an AbortSignal is ERR_INVALID_ARG_TYPE, an already-aborted one
+      // registers nothing, and otherwise the listener is removed when it
+      // aborts. The option was never read, so an aborted signal's listener
+      // went on being called.
+      const signal = options != null && typeof options !== "boolean" ? options.signal : undefined;
+      if (
+        signal !== undefined &&
+        (signal === null || typeof signal !== "object" || !("aborted" in signal))
+      ) {
+        throw new (globalThis.__oamNode.get("internal/errors").codes.ERR_INVALID_ARG_TYPE)(
+          "options.signal",
+          "AbortSignal",
+          signal,
+        );
+      }
       if (typeof listener !== "function" && typeof listener?.handleEvent !== "function") return;
+      // The owner of the signal's removal listener (see below); undefined
+      // when no signal was given.
+      let signalToken;
+      if (signal !== undefined) {
+        if (signal.aborted) return;
+        // Held weakly by the signal (kWeakHandler, as node registers it) and
+        // strongly by a token the registered entry carries, so the removal
+        // closure lives exactly as long as the registration: a long-lived
+        // signal keeps neither the target nor one closure per listener.
+        signalToken = {};
+        signal.addEventListener("abort", () => this.removeEventListener(type, listener), {
+          once: true,
+          [Symbol.for("oam.kWeakHandler")]: signalToken,
+          [Symbol.for("oam.kResistStopPropagation")]: true,
+        });
+      }
       // useCapture (boolean true) is a no-op in this non-DOM EventTarget; once only comes from options.once
       const once = options === true ? false : options?.once === true;
       // Node-internal resist flag (events.addAbortListener, vendored stream
@@ -386,6 +426,12 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
           globalThis.process.emitWarning(w);
         }
       }
+      if (signalToken !== undefined) {
+        // On the entry the listener is registered under, new or already
+        // there (a repeated add with a signal still removes on its abort).
+        const held = list.find((e) => listenerOf(e) === listener);
+        if (held) (held.signalTokens ??= []).push(signalToken);
+      }
     }
     removeEventListener(type, listener) {
       const list = this._listeners.get(type);
@@ -418,14 +464,21 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
           // an object listener is called with the LISTENER OBJECT, so
           // `handleEvent` can reach its own state. Both were getting the
           // target, which broke the object form's whole point.
-          if (typeof fn === "function") {
-            fn.call(this, event);
-          } else {
-            fn.handleEvent.call(fn, event);
+          // A listener that throws does not end the dispatch: the remaining
+          // listeners still run and the caller of dispatchEvent (an
+          // AbortController.abort(), say) does not see the exception. It is
+          // reported as an uncaught exception on a later tick, as node's
+          // EventTarget does.
+          try {
+            watchListenerResult(
+              typeof fn === "function" ? fn.call(this, event) : fn.handleEvent.call(fn, event),
+            );
+          } catch (err) {
+            reportListenerError(err);
           }
         }
       } finally {
-        // Restored even if a listener throws, so a later reader never sees
+        // Restored whatever happened above, so a later reader never sees
         // a stale mid-dispatch phase.
         event.eventPhase = 0; // NONE
         event.currentTarget = null;
@@ -438,10 +491,72 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   function listenerOf(entry) {
     return entry.ref ? entry.ref.deref() : entry.fn;
   }
+  // What a listener (or an on* handler) threw, rethrown on a later tick so
+  // it surfaces as an uncaught exception instead of unwinding the dispatch
+  // (node: `process.nextTick(() => { throw err; })`).
+  function reportListenerError(err) {
+    const rethrow = () => {
+      throw err;
+    };
+    const nextTick = globalThis.process?.nextTick;
+    if (typeof nextTick === "function") nextTick.call(globalThis.process, rethrow);
+    else globalThis.setTimeout(rethrow, 0);
+  }
+  // What a listener returned: a thenable (an async listener's promise) that
+  // rejects is reported the same way, as node's addCatch does (measured on
+  // v22.22.2: an async listener that throws reaches 'uncaughtException',
+  // not 'unhandledRejection'). Called inside the caller's try, so a throwing
+  // `then` getter is reported too.
+  function watchListenerResult(result) {
+    if (result === undefined || result === null) return;
+    const then = result.then;
+    if (typeof then === "function") then.call(result, undefined, reportListenerError);
+  }
+  // Calls an `on<type>` handler property the way a registered listener is
+  // called: with the event's target/currentTarget set (dispatchEvent, which
+  // runs afterwards, is otherwise the only place they are assigned, so a
+  // handler reading `event.target` saw null), and with a throw reported
+  // rather than propagated.
+  function callEventHandler(target, handler, event) {
+    if (typeof handler !== "function") return;
+    event.target = target;
+    event.currentTarget = target;
+    event.eventPhase = 2; // AT_TARGET
+    try {
+      watchListenerResult(handler.call(target, event));
+    } catch (err) {
+      reportListenerError(err);
+    } finally {
+      event.eventPhase = 0; // NONE
+      event.currentTarget = null;
+    }
+  }
   brand(EventTarget, "EventTarget");
   globalThis.EventTarget = EventTarget;
 
   // ------------------------------------------- AbortController / Signal
+  // AbortSignal.any bookkeeping. A composite is held only weakly by its
+  // sources, so one that still has an 'abort' listener or an onabort handler
+  // -- and may be referenced by nothing else -- is pinned here until it
+  // aborts or stops being listened to (node keeps such signals in a set of
+  // its own for the same reason). compositeCleanup takes a collected
+  // composite's listeners off its sources.
+  const liveComposites = new Set();
+  const compositeCleanup =
+    typeof FinalizationRegistry === "function"
+      ? new FinalizationRegistry(({ signal, listener }) => {
+          signal.removeEventListener("abort", listener);
+        })
+      : null;
+  function trackComposite(signal) {
+    if (signal._anySources === undefined) return;
+    const listening =
+      typeof signal.onabort === "function" ||
+      (signal._listeners.get("abort")?.length ?? 0) > 0;
+    if (listening) liveComposites.add(signal);
+    else liveComposites.delete(signal);
+  }
+
   class AbortSignal extends EventTarget {
     constructor() {
       super();
@@ -501,24 +616,79 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     }
     static any(signals) {
       const result = new AbortSignal();
-      for (const signal of signals) {
+      const list = Array.from(signals);
+      // Looked at before anything is registered: an already-aborted source
+      // settles the result at once, and must not leave listeners behind on
+      // the sources that came before it.
+      for (const signal of list) {
         if (signal.aborted) {
           result._fire(signal.reason);
           return result;
         }
-        signal.addEventListener("abort", () => result._fire(signal.reason), { once: true });
+      }
+      // Each source holds the result WEAKLY (the followSignal arrangement):
+      // a strong closure per call was never removed, so a long-lived source
+      // combined once per request kept every result, and grew its listener
+      // list, for as long as it lived. The listeners come off when the
+      // result aborts (_fire) or is collected (compositeCleanup); a result
+      // somebody is listening to is pinned by trackComposite meanwhile.
+      const ref = new WeakRef(result);
+      const sources = [];
+      for (const signal of new Set(list)) {
+        const listener = () => ref.deref()?._fire(signal.reason);
+        signal.addEventListener("abort", listener, {
+          once: true,
+          [Symbol.for("oam.kResistStopPropagation")]: true,
+        });
+        sources.push({ signal, listener });
+        compositeCleanup?.register(result, { signal, listener });
+      }
+      if (sources.length > 0) {
+        result._anySources = sources;
+        // `onabort` is an ordinary field on every other signal; here it is
+        // an accessor over the same value, so that setting a handler counts
+        // as listening.
+        let handler = result.onabort;
+        Object.defineProperty(result, "onabort", {
+          get() {
+            return handler;
+          },
+          set(value) {
+            handler = value;
+            trackComposite(result);
+          },
+          enumerable: true,
+          configurable: true,
+        });
       }
       return result;
     }
     throwIfAborted() {
       if (this.aborted) throw this.reason;
     }
+    // The listener-count hooks addEventListener / removeEventListener call:
+    // only a signal made by AbortSignal.any has anything to track.
+    [kNewListener](size, type) {
+      if (type === "abort") trackComposite(this);
+    }
+    [kRemoveListener](size, type) {
+      if (type === "abort") trackComposite(this);
+    }
     _fire(reason) {
       if (this.aborted) return;
       this.aborted = true;
       this.reason = defaultAbortReason(reason);
+      // A composite stops following its other sources once it has aborted.
+      const sources = this._anySources;
+      if (sources !== undefined) {
+        this._anySources = undefined;
+        liveComposites.delete(this);
+        for (const { signal, listener } of sources) signal.removeEventListener("abort", listener);
+      }
       const event = new Event("abort");
-      if (typeof this.onabort === "function") this.onabort.call(this, event);
+      // The handler sees the same target/currentTarget a listener does, and
+      // a throw from it does not keep the listeners from running.
+      callEventHandler(this, this.onabort, event);
       this.dispatchEvent(event);
     }
   }
@@ -1118,6 +1288,33 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // transferred) backing buffer via the memo, like the spec's serializer.
   // Other transferable kinds (MessagePort etc.) still throw DataCloneError
   // in this pure-JS wave. Circular references handled via a WeakMap memo.
+  // The constructors a cloned Error can come back as, by its `name`.
+  const CLONED_ERROR_CTORS = {
+    __proto__: null,
+    EvalError,
+    RangeError,
+    ReferenceError,
+    SyntaxError,
+    TypeError,
+    URIError,
+  };
+  // A cloned error keeps the source's stack text, not the clone site's.
+  function copyStack(from, to) {
+    try {
+      const stack = from.stack;
+      if (typeof stack === "string") {
+        Object.defineProperty(to, "stack", {
+          value: stack,
+          writable: true,
+          enumerable: false,
+          configurable: true,
+        });
+      }
+    } catch {
+      // a throwing `stack` getter, or a clone that will not take one: the
+      // clone keeps the stack it was made with
+    }
+  }
   if (typeof globalThis.structuredClone !== "function") {
     globalThis.structuredClone = function structuredClone(value, options) {
       const memo = new WeakMap();
@@ -1204,8 +1401,60 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
           for (let i = 0; i < v.length; i++) c[i] = cloneInner(v[i]);
           return c;
         }
-        // Plain object (or unknown class -- clone own enumerable props).
-        const c = Object.create(Object.getPrototypeOf(v));
+        // A DOMException clones as a DOMException with its name and message
+        // (and so its legacy code), as node's does.
+        if (typeof globalThis.DOMException === "function" && v instanceof globalThis.DOMException) {
+          const c = new globalThis.DOMException(v.message, v.name);
+          memo.set(v, c);
+          copyStack(v, c);
+          return c;
+        }
+        // An Error, as V8's serializer writes one: the built-in constructor
+        // its `name` says (plain Error for any other name, a subclass
+        // included), an own `message` and `cause` when the source has them,
+        // and the stack. Every other property -- `code`, `errno` -- is
+        // dropped. The generic branch below copied enumerable own keys
+        // only, so the clone had neither message nor stack.
+        // Told by the [[ErrorData]] slot where the engine can say
+        // (Error.isError), as the serializer tells it: an object that merely
+        // inherits from Error.prototype is not one, and clones plain below.
+        if (typeof Error.isError === "function" ? Error.isError(v) : v instanceof Error) {
+          let name;
+          try {
+            name = v.name;
+          } catch {
+            name = undefined;
+          }
+          const Ctor =
+            typeof name === "string" && Object.hasOwn(CLONED_ERROR_CTORS, name)
+              ? CLONED_ERROR_CTORS[name]
+              : Error;
+          const c = new Ctor();
+          memo.set(v, c);
+          const message = Object.getOwnPropertyDescriptor(v, "message");
+          if (message !== undefined && "value" in message) {
+            Object.defineProperty(c, "message", {
+              value: `${message.value}`,
+              writable: true,
+              enumerable: false,
+              configurable: true,
+            });
+          }
+          if (Object.hasOwn(v, "cause")) {
+            Object.defineProperty(c, "cause", {
+              value: cloneInner(v.cause),
+              writable: true,
+              enumerable: false,
+              configurable: true,
+            });
+          }
+          copyStack(v, c);
+          return c;
+        }
+        // A plain object, or an instance of any other class: its own
+        // enumerable properties on a PLAIN object. The prototype does not
+        // survive a structured clone.
+        const c = {};
         memo.set(v, c);
         for (const key of Object.keys(v)) c[key] = cloneInner(v[key]);
         return c;
@@ -2228,7 +2477,6 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // failed, or was cancelled.
   function makeResponse(raw, signal, fetchSemantics = true, onBodyOver) {
     const handle = raw.bodyHandle;
-    let consumed = false;
     let bodyStream = null;
     let streamController = null;
 
@@ -2341,9 +2589,17 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       return bodyStream;
     }
 
+    // One Response over the body: the one fetch resolves to (`stream` null
+    // until the body is first asked for, then the wire stream), or a clone()
+    // of it (`stream` a tee branch). Each has its own headers and its own
+    // read state; the abort handling above is the wire's, and reaches every
+    // branch through the tee.
+    function responseOver(stream) {
+    let consumed = false;
+    const ownBody = () => (stream ??= ensureBody());
     async function drainBytes() {
       // Read already, or held by a reader someone took from `.body`.
-      if (consumed || (bodyStream !== null && (bodyStream.locked || bodyStream._disturbed))) {
+      if (consumed || (stream !== null && (stream.locked || stream._disturbed))) {
         throw new TypeError("Body is unusable: Body has already been read");
       }
       // Consuming a body whose fetch was already aborted fails before it
@@ -2356,7 +2612,7 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       consumed = true;
       const chunks = [];
       let total = 0;
-      for await (const chunk of ensureBody()) {
+      for await (const chunk of ownBody()) {
         chunks.push(chunk);
         total += chunk.length;
       }
@@ -2382,12 +2638,24 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       redirected: raw.redirected === true,
       headers: makeHeaders(raw.headers),
       get body() {
-        return ensureBody();
+        return ownBody();
       },
       // Read from, not merely locked: a reader that has not read yet leaves
       // the body unused, as in node.
       get bodyUsed() {
-        return consumed || (bodyStream !== null && bodyStream._disturbed === true);
+        return consumed || (stream !== null && stream._disturbed === true);
+      },
+      // A second Response over the same body: the stream is teed, this
+      // response reads on from one branch and the clone from the other.
+      // Refused once the body has been read or is held by a reader, with
+      // the constructed Response's message.
+      clone() {
+        if (consumed || (stream !== null && (stream.locked || stream._disturbed === true))) {
+          throw new TypeError("Response.clone: Body has already been consumed.");
+        }
+        const [mine, theirs] = ownBody().tee();
+        stream = mine;
+        return responseOver(theirs);
       },
       arrayBuffer: async () => (await drainBytes()).buffer,
       bytes: () => drainBytes(),
@@ -2404,7 +2672,14 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     if (raw.trailers !== undefined && raw.trailers.length > 0) {
       Object.defineProperty(response, kConnectorReply, { value: { trailers: raw.trailers } });
     }
+    // `instanceof Response` holds, as it does in node. Every member above is
+    // an own property, so none of the constructed Response's prototype
+    // members (which read a body state this object does not have) is
+    // reached through it.
+    Object.setPrototypeOf(response, Response.prototype);
     return response;
+    }
+    return responseOver(null);
   }
 
   // Lone surrogates would survive JSON.stringify (escaped) but be rejected
@@ -3267,6 +3542,15 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     }
   }
 
+  // The `__oam*` knobs below are read only from an init handed to one of the
+  // runtime's own entries (oamFetch's `ownEntry` argument: http.request,
+  // the oam:undici shim's request(), the transport tests): they are not
+  // part of fetch's contract, and an init given to globalThis.fetch or
+  // undici.fetch must mean exactly what it means in node, where unknown keys
+  // are ignored. Which entry a call came through is not something the init
+  // carries, so nothing on the init -- and nothing a getter on
+  // Object.prototype is shown as `this` -- tells a program how to claim it.
+
   globalThis.fetch = async function fetch(input, init) {
     return oamFetch(input, init, false);
   };
@@ -3282,16 +3566,30 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // replacement of it (nock's fetch interception, a test's wrapper) neither
   // answers, blocks nor sees them there. `undici` is the shim's own options:
   // `{ zstd: true }` from undici.fetch (#443).
+  //
+  // `undiciRequest` is the shim's entry for undici.request and a
+  // dispatcher's request() -- not fetch in node -- and `internalFetch` the
+  // transport tests' (internal/oam/fetch, --expose-internals only): fetch,
+  // with its `__oam*` knobs read. These three entries are the only ones that
+  // read them.
+  //
+  // A hand-off, not a global: the global is configurable only so that it can
+  // go. node_compat.js and undici.js each take it into a binding of their
+  // own while the snapshot is built, and undici.js -- the last of them to
+  // evaluate (crates/oam_engine/build.rs) -- deletes it, so a program never
+  // finds it on globalThis (node has no such name).
   Object.defineProperty(globalThis, "__oamFetchInternal", {
     value: Object.freeze({
-      fetch: (input, init) => oamFetch(input, init, true),
-      undiciFetch: (input, init, undici) => oamFetch(input, init, false, undici),
+      fetch: (input, init) => oamFetch(input, init, true, undefined, true),
+      undiciFetch: (input, init, undici) => oamFetch(input, init, false, undici, false),
+      undiciRequest: (input, init) => oamFetch(input, init, false, undefined, true),
+      internalFetch: (input, init) => oamFetch(input, init, false, undefined, true),
       Headers,
       connectorReply: kConnectorReply,
     }),
     writable: false,
     enumerable: false,
-    configurable: false,
+    configurable: true,
   });
 
   // Ids for `__oam.fetch(request, id)` / `fetchCancel(id)`.
@@ -3449,10 +3747,14 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // headers in their stored order, the body (taken: a Request input reads as
   // used, unless `init` brought its own body), the request's signal and
   // redirect mode, and the dispatcher.
-  function fetchRequest(input, init) {
+  function fetchRequest(input, init, internal) {
     const request = new OamRequest(input, init);
     const state = requestStates.get(request);
+    // No prototype: oamFetch reads keys this does not set (`__oamBodyStream`
+    // and the rest), and those must come from here or nowhere -- never from
+    // Object.prototype.
     const flat = {
+      __proto__: null,
       method: state.method,
       headers: state.headers._list.map(([name, value]) => [name, value]),
       signal: state.signal,
@@ -3496,9 +3798,13 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       bodyStates.set(request, null);
     }
     // oam's own knobs (`__oamBodyStream` and the like, which tests and
-    // internal callers set) ride along untouched.
-    for (const key of Object.keys(init ?? {})) {
-      if (key.startsWith("__oam")) flat[key] = init[key];
+    // internal callers set) ride along untouched -- from an init handed to
+    // one of the runtime's own entries only (`internal`); anyone else's are
+    // unknown keys and dropped here, as every other unknown key is.
+    if (internal && init != null) {
+      for (const key of Object.keys(init)) {
+        if (key.startsWith("__oam")) flat[key] = init[key];
+      }
     }
     return { url: state.url, init: flat, collect };
   }
@@ -3621,13 +3927,19 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     }
   }
 
-  async function oamFetch(input, init, rawPayload, undici) {
+  async function oamFetch(input, init, rawPayload, undici, ownEntry) {
+    // An internal entry's init, copied onto no prototype before any key of
+    // it is read: a key it does not set is then absent, not looked up on
+    // Object.prototype (where a getter would be handed the init).
+    if (ownEntry === true && init != null) init = { __proto__: null, ...init };
     // Internal callers that are not fetch in node (http.request, the http2
     // client, undici.request) opt out of every Fetch-level rule below.
-    const fetchSemantics = init?.__oamFetchSemantics !== false;
+    // Only an internal entry's init can: for any other, the key is not read
+    // and every rule applies.
+    const fetchSemantics = ownEntry !== true || init == null || init.__oamFetchSemantics !== false;
     let collect = false;
-    if (fetchSemantics) ({ url: input, init, collect } = fetchRequest(input, init));
-    init = init || {};
+    if (fetchSemantics) ({ url: input, init, collect } = fetchRequest(input, init, ownEntry === true));
+    init = init || { __proto__: null };
     const signal = init.signal;
     // Already-aborted: reject before touching the network (spec).
     if (signal?.aborted) {
@@ -3718,18 +4030,26 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       // undici's response-head count and refusal (fetch, undici.request).
       dispatch_semantics: dispatchSemantics,
     };
-    // An https URL handshakes under node's live TLS defaults
-    // (tlsDefaultVersions). A default that is not a version fails a fetch as
-    // undici's tls.connect fails it -- `fetch failed` with that error as the
-    // cause; http.request's entry has already thrown it synchronously, and
-    // undici.request rejects with it as given.
-    if (/^https:/i.test(rawUrl)) {
+    // Every https handshake of the request runs under node's live TLS
+    // defaults (tlsDefaultVersions), so they are sent whatever scheme the
+    // URL has: an http URL may be redirected to an https one, and that hop
+    // handshakes in the same range. A default that is not a version fails
+    // an https fetch as undici's tls.connect fails it -- `fetch failed` with
+    // that error as the cause; http.request's entry has already thrown it
+    // synchronously, and undici.request rejects with it as given. An http
+    // URL makes no handshake of its own, so it is not failed here; the
+    // range it carries then holds no version, and an https hop it is
+    // redirected to is refused rather than made under other bounds.
+    {
       let versions;
       try {
         versions = tlsDefaultVersions();
       } catch (e) {
-        if (fetchSemantics) throw new TypeError("fetch failed", { cause: e });
-        throw e;
+        if (/^https:/i.test(rawUrl)) {
+          if (fetchSemantics) throw new TypeError("fetch failed", { cause: e });
+          throw e;
+        }
+        versions = { min: "TLSv1.3", max: "TLSv1.2" };
       }
       request.tls_min_version = versions.min;
       request.tls_max_version = versions.max;
@@ -3761,6 +4081,17 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       request.default_headers = false;
       if (!request.headers.some((h) => String(h[0]).toLowerCase() === "connection")) {
         headers.unshift(["connection", "keep-alive"]);
+      }
+      // ... and it follows a redirect only under `maxRedirections`, by its
+      // RedirectHandler's count, which the transport applies: that many are
+      // followed and the next 3xx is the response. Without one the first
+      // 3xx is the response, as for http.request above (measured on node
+      // v22.22.2 + undici 6.28.1).
+      const maxRedirections = init.__oamMaxRedirections;
+      if (typeof maxRedirections === "number" && maxRedirections >= 1) {
+        request.max_redirections = Math.min(Math.trunc(maxRedirections), 0xffffffff);
+      } else {
+        request.redirect = "manual";
       }
     }
     // undici.fetch decodes `zstd` too, as undici 7.11 and later do
@@ -4039,6 +4370,27 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
   // Response; a ReadableStream body streams to the client chunk-by-chunk
   // (the SSE/token path). Requests are dispatched CONCURRENTLY — the
   // accept loop never awaits a handler.
+  // `request.url` for a served request. An absolute-form target is the URL
+  // already. Otherwise the authority is the request's own Host header --
+  // the name the client asked for, where the bound address reads `0.0.0.0`
+  // for a server bound to every interface -- when it is one authority and
+  // nothing else, and the bound address (`host`, an IPv6 literal bracketed)
+  // when it is absent or is not.
+  function serverRequestUrl(uri, headers, host) {
+    if (/^https?:\/\//i.test(uri)) return uri;
+    const named = headers.get("host");
+    if (typeof named === "string" && /^[^\s/?#@\\]+$/.test(named)) {
+      const candidate = `http://${named}${uri}`;
+      try {
+        new globalThis.URL(candidate);
+        return candidate;
+      } catch {
+        // not an authority a URL can carry: the bound address below
+      }
+    }
+    return `http://${host}${uri}`;
+  }
+
   function makeServerRequest(meta, host) {
     let bodyBytes = null;
     let consumed = false;
@@ -4048,10 +4400,11 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       bodyBytes ??= globalThis.__oam.node.httpRequestBody(meta.requestId);
       return bodyBytes;
     };
+    const headers = makeHeaders(meta.headers);
     return {
       method: meta.method,
-      url: `http://${host}${meta.uri}`,
-      headers: makeHeaders(meta.headers),
+      url: serverRequestUrl(meta.uri, headers, host),
+      headers,
       get bodyUsed() {
         return consumed;
       },
@@ -4071,7 +4424,15 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       // order iteration gives a script.
       for (const [key, value] of response.headers._list) headerPairs.push([key, value]);
     } else if (response?.headers) {
-      response.headers.forEach((value, key) => headerPairs.push([key, value]));
+      const given = response.headers;
+      if (!Array.isArray(given) && typeof given.forEach === "function") {
+        // A Headers-like or a Map: forEach(value, name).
+        given.forEach((value, key) => headerPairs.push([key, value]));
+      } else {
+        // A plain object or a list of pairs -- any HeadersInit -- which has
+        // no such forEach to call.
+        for (const [key, value] of new Headers(given)._list) headerPairs.push([key, value]);
+      }
     }
     const headersJson = JSON.stringify(headerPairs);
     // A constructed Response whose body is known bytes is written whole,
@@ -4089,6 +4450,30 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       // Streaming response: chunks flush as the handler produces them.
       const streamId = node.httpRespondStream(requestId, status, headersJson);
       const reader = body.getReader();
+      let over = false;
+      // Never throws and never leaves a rejection behind, whatever kind of
+      // reader the handler's stream gave.
+      const cancelSource = (why) => {
+        try {
+          Promise.resolve(reader.cancel(why)).catch(() => {});
+        } catch {
+          // nothing more to tell it
+        }
+      };
+      // The client leaving ends the read loop even while the source is idle
+      // (a push is otherwise the only thing that notices): the watcher
+      // resolves when the transport lets go of the response body, and the
+      // source is cancelled, so whatever its start() set going is stopped
+      // by its cancel(). It resolves after a normal end too, which `over`
+      // makes a no-op. Unref'd by the runtime: it holds nothing open.
+      if (typeof streamId === "number" && typeof node.httpStreamClosed === "function") {
+        node.httpStreamClosed(streamId).then(
+          () => {
+            if (!over) cancelSource();
+          },
+          () => {},
+        );
+      }
       try {
         for (;;) {
           const { value, done } = await reader.read();
@@ -4097,9 +4482,12 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
             typeof value === "string" ? new TextEncoder().encode(value) : value;
           await node.httpBodyPush(streamId, bytes);
         }
-      } catch {
-        // Client gone or source errored: stop pushing.
+      } catch (err) {
+        // Client gone (the push failed) or the source errored: stop pushing,
+        // and tell the source -- a no-op for one that errored itself.
+        cancelSource(err);
       } finally {
+        over = true;
         node.httpBodyEnd(streamId);
       }
       return;
@@ -4121,7 +4509,12 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     const hostname = options.hostname ?? "127.0.0.1";
     const node = globalThis.__oam.node;
     const bound = await node.httpServe(hostname, options.port ?? 0);
-    const host = `${hostname}:${bound.port}`;
+    // An IPv6 literal goes in brackets, or `http://::1:PORT/` is not a URL.
+    const literal = String(hostname);
+    const host =
+      literal.includes(":") && !literal.startsWith("[")
+        ? `[${literal}]:${bound.port}`
+        : `${literal}:${bound.port}`;
 
     const handleOne = async (meta) => {
       let response;
@@ -4131,7 +4524,24 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         const message = e && e.message ? e.message : String(e);
         response = new Response(`oam: handler error: ${message}`, { status: 500 });
       }
-      await respondWith(meta.requestId, response);
+      try {
+        await respondWith(meta.requestId, response);
+      } catch (e) {
+        // What the handler returned could not be sent (headers that are not
+        // a HeadersInit, a status the transport refuses, ...): the request
+        // is still answered, with a 500, instead of being left open behind
+        // an unhandled rejection. If the head had already gone the exchange
+        // is no longer pending and there is nothing left to answer.
+        const message = e && e.message ? e.message : String(e);
+        try {
+          await respondWith(
+            meta.requestId,
+            new Response(`oam: response error: ${message}`, { status: 500 }),
+          );
+        } catch {
+          // already answered, or the client is gone
+        }
+      }
     };
 
     (async () => {
@@ -4299,6 +4709,11 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
       this._binaryType = "blob";
       this._handle = null;
       this._bufferedAmount = 0;
+      // close() called while still CONNECTING (see close()).
+      this._closedWhileConnecting = false;
+      // Messages waiting behind a Blob being read (see send()); null when
+      // there are none.
+      this._sendQueue = null;
       this.onopen = null;
       this.onmessage = null;
       this.onclose = null;
@@ -4325,28 +4740,51 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         : globalThis.__oam.wsConnect(JSON.stringify(wire));
       connecting.then(
         (result) => {
+          if (this._closedWhileConnecting) {
+            // close() was called before the handshake finished: the
+            // connection that turned up anyway is dropped unopened, and no
+            // 'open' is fired. What node reports from here is the connect
+            // failing (measured on v22.22.2: a second 'error', no 'close',
+            // readyState left at CLOSING).
+            try {
+              globalThis.__oam.wsDrop(result.handle);
+            } catch {
+              // already gone
+            }
+            this._fireError("Received network error or non-101 status code.");
+            return;
+          }
           this._handle = result.handle;
           this._protocol = result.protocol || "";
           this._extensions = result.extensions || "";
           this._readyState = OPEN;
           const ev = new Event("open");
-          if (typeof this.onopen === "function") this.onopen(ev);
+          callEventHandler(this, this.onopen, ev);
           this.dispatchEvent(ev);
           this._recvLoop();
         },
         () => {
-          this._readyState = CLOSED;
           // node (undici's failWebsocketConnection): an ErrorEvent whose
           // `message` is this fixed text and whose `error` is an Error
           // carrying it -- whatever failed, a refused connect or an answer
           // that is not a 101. It was a bare Event, with neither (#161).
           const message = "Received network error or non-101 status code.";
-          const ev = new ErrorEvent("error", { error: new Error(message), message });
-          if (typeof this.onerror === "function") this.onerror(ev);
-          this.dispatchEvent(ev);
+          if (this._closedWhileConnecting) {
+            // As above: the 'error' alone.
+            this._fireError(message);
+            return;
+          }
+          this._readyState = CLOSED;
+          this._fireError(message);
           this._fireClose(1006, "", false);
         },
       );
+    }
+
+    _fireError(message) {
+      const ev = new ErrorEvent("error", { error: new Error(message), message });
+      callEventHandler(this, this.onerror, ev);
+      this.dispatchEvent(ev);
     }
 
     get url() { return this._url; }
@@ -4372,6 +4810,26 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         );
       }
       if (this._readyState !== OPEN) return;
+      // Sent now, or behind a Blob still being read (below): the socket may
+      // have closed by the time its turn comes.
+      const transmit = (payload, binary) => {
+        if (this._readyState !== OPEN || this._handle === null) return;
+        try {
+          globalThis.__oam.wsSend(this._handle, payload, binary);
+        } catch {
+          // the connection went while this message waited its turn
+        }
+      };
+      // A Blob is sent as its bytes, as a binary message. Reading them is
+      // asynchronous, so this message and every one sent after it, until
+      // the queue drains, go out in the order send() was called.
+      if (typeof globalThis.Blob === "function" && data instanceof globalThis.Blob) {
+        const read = data.arrayBuffer().then((buffer) => new Uint8Array(buffer));
+        // Never left unhandled while it waits behind an earlier message.
+        read.catch(() => {});
+        this._enqueueSend(() => read.then((bytes) => transmit(bytes, true)));
+        return;
+      }
       let isBinary = false;
       if (typeof data !== "string") {
         isBinary = true;
@@ -4381,7 +4839,21 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
           data = new Uint8Array(data);
         }
       }
+      if (this._sendQueue !== null) {
+        this._enqueueSend(() => transmit(data, isBinary));
+        return;
+      }
       globalThis.__oam.wsSend(this._handle, data, isBinary);
+    }
+
+    // Runs `step` after everything already queued; the queue is dropped
+    // once it has drained, and send() is synchronous again.
+    _enqueueSend(step) {
+      const tail = (this._sendQueue ?? Promise.resolve()).then(step).catch(() => {});
+      this._sendQueue = tail;
+      tail.then(() => {
+        if (this._sendQueue === tail) this._sendQueue = null;
+      });
     }
 
     close(code, reason) {
@@ -4393,6 +4865,18 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
             "InvalidAccessError",
           );
         }
+      }
+      if (this._readyState === CONNECTING) {
+        // No connection yet to send a close frame on. The call used to be
+        // lost (wsClose of no handle is a no-op) and the socket went on to
+        // open and fire 'open'. node (undici, measured on v22.22.2) fails
+        // the connection instead: this 'error', fired here with readyState
+        // still CONNECTING, then CLOSING; the connect continuation in the
+        // constructor drops whatever connection arrives.
+        this._closedWhileConnecting = true;
+        this._fireError("Connection was closed before it was established.");
+        this._readyState = CLOSING;
+        return;
       }
       this._readyState = CLOSING;
       globalThis.__oam.wsClose(
@@ -4413,14 +4897,17 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
         if (frame === undefined) break;
 
         if (frame instanceof Uint8Array) {
+          // binaryType "blob" (the default) delivers a Blob, as node does;
+          // the raw Uint8Array it used to hand over has neither
+          // arrayBuffer() nor text().
           const data = this._binaryType === "arraybuffer"
-            ? frame.buffer : frame;
+            ? frame.buffer : new globalThis.Blob([frame]);
           const ev = new MessageEvent("message", { data });
-          if (typeof this.onmessage === "function") this.onmessage(ev);
+          callEventHandler(this, this.onmessage, ev);
           this.dispatchEvent(ev);
         } else if (frame.type === "text") {
           const ev = new MessageEvent("message", { data: frame.data });
-          if (typeof this.onmessage === "function") this.onmessage(ev);
+          callEventHandler(this, this.onmessage, ev);
           this.dispatchEvent(ev);
         } else if (frame.type === "close") {
           this._fireClose(frame.code, frame.reason, true);
@@ -4440,7 +4927,7 @@ Object.defineProperty(globalThis, "__oamV8BuiltInNames", {
     _fireClose(code, reason, wasClean) {
       this._readyState = CLOSED;
       const ev = new CloseEvent("close", { code, reason, wasClean });
-      if (typeof this.onclose === "function") this.onclose(ev);
+      callEventHandler(this, this.onclose, ev);
       this.dispatchEvent(ev);
     }
   }

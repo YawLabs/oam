@@ -85,7 +85,12 @@ pub struct WorkerHandle {
 pub struct WorkerState {
     pub handles: HashMap<u64, WorkerHandle>,
     pub receivers: HashMap<u64, mpsc::Receiver<WorkerEvent>>,
+    /// Workers terminated while a `parent_recv` had their receiver checked
+    /// out: that recv must not put it back. Each entry is removed when the
+    /// recv returns, so the set holds only terminations still in flight.
     pub closed: HashSet<u64>,
+    /// Workers whose receiver a `parent_recv` currently has checked out.
+    receiving: HashSet<u64>,
     next_id: u64,
 }
 
@@ -95,6 +100,7 @@ impl Default for WorkerState {
             handles: HashMap::new(),
             receivers: HashMap::new(),
             closed: HashSet::new(),
+            receiving: HashSet::new(),
             next_id: 1,
         }
     }
@@ -123,28 +129,38 @@ pub struct WorkerContext {
     pub exec_argv: Vec<String>,
 }
 
-fn reinsert_receiver(
+/// A `parent_recv` is over: its receiver goes back (when it still has one)
+/// unless the worker was terminated meanwhile, and the bookkeeping for the
+/// checkout -- the in-flight mark and any termination marker -- is dropped.
+/// True when the receiver was put back.
+fn finish_recv(
     registry: &WorkerRegistry,
     worker_id: u64,
-    rx: mpsc::Receiver<WorkerEvent>,
+    rx: Option<mpsc::Receiver<WorkerEvent>>,
 ) -> bool {
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.closed.contains(&worker_id) {
-        false
-    } else {
-        guard.receivers.insert(worker_id, rx);
-        true
+    guard.receiving.remove(&worker_id);
+    let terminated = guard.closed.remove(&worker_id);
+    match rx {
+        Some(rx) if !terminated => {
+            guard.receivers.insert(worker_id, rx);
+            true
+        }
+        _ => false,
     }
 }
 
 /// Receive the next event from a worker (parent side). Async:
 /// blocks on the channel via spawn_blocking, then returns the event.
 pub async fn parent_recv(registry: WorkerRegistry, worker_id: u64) -> OpOutcome {
-    let rx = registry
-        .lock()
-        .expect("worker registry lock")
-        .receivers
-        .remove(&worker_id);
+    let rx = {
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let rx = guard.receivers.remove(&worker_id);
+        if rx.is_some() {
+            guard.receiving.insert(worker_id);
+        }
+        rx
+    };
     let Some(rx) = rx else {
         return OpOutcome::Done;
     };
@@ -157,7 +173,7 @@ pub async fn parent_recv(registry: WorkerRegistry, worker_id: u64) -> OpOutcome 
 
     match result {
         Ok((rx, Ok(event))) => {
-            reinsert_receiver(&registry, worker_id, rx);
+            finish_recv(&registry, worker_id, Some(rx));
             match event {
                 WorkerEvent::Online => {
                     OpOutcome::Json(serde_json::json!({"type": "online"}).to_string())
@@ -190,8 +206,14 @@ pub async fn parent_recv(registry: WorkerRegistry, worker_id: u64) -> OpOutcome 
                 ),
             }
         }
-        Ok((_, Err(_))) => OpOutcome::Done,
-        Err(e) => OpOutcome::Failed(format!("worker recv task: {e}")),
+        Ok((_, Err(_))) => {
+            finish_recv(&registry, worker_id, None);
+            OpOutcome::Done
+        }
+        Err(e) => {
+            finish_recv(&registry, worker_id, None);
+            OpOutcome::Failed(format!("worker recv task: {e}"))
+        }
     }
 }
 
@@ -212,7 +234,12 @@ pub fn parent_terminate(registry: &WorkerRegistry, worker_id: u64) {
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     guard.handles.remove(&worker_id);
     guard.receivers.remove(&worker_id);
-    guard.closed.insert(worker_id);
+    // Only a recv in flight could put the receiver back, so only then is a
+    // marker needed; it is dropped when that recv returns. Marking every
+    // terminated worker kept one id per worker for the life of the runtime.
+    if guard.receiving.contains(&worker_id) {
+        guard.closed.insert(worker_id);
+    }
 }
 
 /// Receive a message from the parent (worker side). Async: blocks
@@ -251,6 +278,37 @@ pub fn worker_post(outbox: &mpsc::Sender<WorkerEvent>, data: Vec<u8>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Terminating a worker leaves a marker only while a recv has its
+    /// receiver checked out, and that recv clears it: the registry holds
+    /// nothing for a worker once it is gone.
+    #[tokio::test]
+    async fn a_terminated_worker_leaves_nothing_in_the_registry() {
+        let registry: WorkerRegistry = Default::default();
+
+        // No recv in flight: no marker at all.
+        let (_idle_tx, idle_rx) = mpsc::channel::<WorkerEvent>();
+        registry.lock().unwrap().receivers.insert(7, idle_rx);
+        parent_terminate(&registry, 7);
+        assert!(registry.lock().unwrap().closed.is_empty());
+
+        // A recv in flight: marked, the receiver is not put back, and the
+        // marker goes when the recv returns.
+        let (tx, rx) = mpsc::channel::<WorkerEvent>();
+        registry.lock().unwrap().receivers.insert(8, rx);
+        let recv = tokio::spawn(parent_recv(registry.clone(), 8));
+        while !registry.lock().unwrap().receiving.contains(&8) {
+            tokio::task::yield_now().await;
+        }
+        parent_terminate(&registry, 8);
+        assert!(registry.lock().unwrap().closed.contains(&8));
+        tx.send(WorkerEvent::Online).unwrap();
+        recv.await.unwrap();
+        let guard = registry.lock().unwrap();
+        assert!(guard.closed.is_empty());
+        assert!(guard.receiving.is_empty());
+        assert!(guard.receivers.is_empty());
+    }
 
     #[test]
     fn a_worker_error_reaches_the_parent_with_its_class_and_props_in_order() {

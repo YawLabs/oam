@@ -109,7 +109,7 @@ pub fn lookup(file: &str, line: u32, column: u32) -> Option<(u32, u32)> {
 
 /// Decode the `mappings` field out of a v3 source-map JSON string into the
 /// lookup table. Only the fields lookup needs; `None` on any malformed
-/// input (bad JSON, missing/непарseable mappings, VLQ garbage).
+/// input (bad JSON, missing/unparseable mappings, VLQ garbage).
 fn decode(map_json: &str) -> Option<DecodedMap> {
     let value: serde_json::Value = serde_json::from_str(map_json).ok()?;
     let mappings = value.get("mappings")?.as_str()?;

@@ -1,6 +1,11 @@
 # Design: application startup snapshots (`oam snapshot`, `oam run --snapshot`)
 
-Status: DRAFT FOR REVIEW 2026-10-15. No code. This is Gap 4c of
+Current status (2026-11-10): still a draft, and still no code -- there is no
+`oam snapshot` command and no `--snapshot` flag in the tree. The sibling gaps of
+`docs/design/claude-code-cli-compat.md` (1, 2, 3, 4b) have since merged; this one has
+not been reviewed or started.
+
+Status when written: DRAFT FOR REVIEW 2026-10-15. No code. This is Gap 4c of
 `docs/design/claude-code-cli-compat.md`, which says it "needs its own design review
 first". Nothing here should be implemented before that review, and nothing beyond
 PR 0 (section 15) should start before measurement shows that the time is spent where
@@ -563,9 +568,10 @@ prewarm isolates (`fork.rs:100`) and `oam serve` pool isolates all go through
 
 1. In a normal run, `isBuildingSnapshot() === false`. `addSerializeCallback`,
    `addDeserializeCallback` and `setDeserializeMainFunction` throw
-   `ERR_NOT_BUILDING_SNAPSHOT` (code and class). This is PR 0. Today oam's stubs
-   silently no-op and lack `setDeserializeMainFunction`
-   (`js/node_compat.js:33143-33147`): fake success, against house policy.
+   `ERR_NOT_BUILDING_SNAPSHOT` (code and class). This is PR 0. The runtime half
+   is in: `v8.startupSnapshot` in `js/node_compat.js` has all three and they
+   throw (they used to no-op silently, and `setDeserializeMainFunction` was
+   absent). The differential case is still to write.
 2. Build plus run of a CJS script: top-level state survives, serialize callbacks run
    once at build, and deserialize callbacks run before the main function, in
    registration order with their `data` argument.

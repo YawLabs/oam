@@ -1,8 +1,12 @@
 # Design: io_uring FS fast path
 
-Status: **accepted, incremental rollout in progress** (slice 1 = file reads).
+Status: **implemented (slices 1 and 2: whole-file reads and writes), opt-in,
+default off, and not being extended.** It measured as not a win (see
+"Measurement"), so the rollout stopped there; `OAM_IO_URING=1` engages it.
 Scope: Linux-only async file I/O via io_uring, opt-in, with a runtime probe and
-a full fallback to the existing path. Authored 2026-06-22.
+a full fallback to the existing path. Authored 2026-06-22; the "CI" this doc
+describes was GitHub Actions, which the project no longer uses -- see
+"Verification" for what covers the lane today.
 
 ## Motivation
 
@@ -150,30 +154,41 @@ read-chunk fix below did NOT change the large-file loss, which confirms the
 bottleneck is architectural, not chunk count.
 
 **Decision: io_uring stays OPT-IN (`OAM_IO_URING=1`), default OFF.** Default-on
-would regress large reads ~2x. The lane is kept (CI-verified, correct,
-fallback-safe) as a foundation for a future architecture that could actually win
+would regress large reads ~2x. The lane is kept (correct and fallback-safe as
+verified on the CI of the time; see "Verification" for today's coverage) as a foundation for a future architecture that could actually win
 -- inline io_uring on the executor thread (no dispatch hop) or batched
 submission -- not because the current dispatch-hop design wins. Revisit only
 with such a redesign.
 
-## Verification (Linux-only code, developed via CI)
+## Verification (Linux-only code)
 
 This code is `#[cfg(target_os = "linux")]` and cannot be built or run on the
 Windows/macOS dev boxes — the local build cfg's it out and exercises the
-fallback. It is verified on Linux **via CI**, which is a real Linux test
-environment, not a stand-in:
+fallback.
 
-- **Correctness:** the CI `ubuntu-latest` leg (kernel 6.x) compiles and runs the
-  `#[cfg(target_os = "linux")]` tests against a real kernel. A focused test reads
-  a file through the io_uring lane and asserts the bytes; the fallback path is
-  covered on every platform.
-- **Performance:** `bench.yml`'s ubuntu leg measures `fs-read` with the fast
-  path on vs off (directional, like the rest of that matrix — shared runners).
-- **Safety on restricted runners:** if a runner blocks `io_uring_setup`, the
-  probe fails and the fallback runs, so CI stays green either way.
+**How it was verified while it was built (historical).** On GitHub Actions: the
+`ubuntu-latest` leg (kernel 6.x) compiled and ran the Linux-only tests against
+a real kernel, and `bench.yml`'s `io-uring-ab` job produced the measurements
+above. Both are gone with GitHub Actions (see ROADMAP.md); the numbers in
+"Measurement" are from those runs and have not been re-taken since.
 
-Tradeoff accepted: iteration is CI-paced (push + ~7 min) rather than local, and
-CI perf is directional. Neither blocks development.
+**What covers it now.** The Linux release leg (`scripts/build-remote.sh`, an
+x86_64 Linux container) compiles the lane and runs its two unit tests in
+`crates/oam_core/src/io_uring_fs.rs`: a multi-chunk read, and a write-then-read
+round trip. The fallback path is covered on every platform. The A/B measurement
+survives as the `io-uring-ab` dispatch of `scripts/build-remote.sh`, which the
+Linux leg of the manual benchmark sweep (`scripts/bench-platforms.sh`) runs as
+an advisory step; no release gate runs it.
+
+**The coverage is conditional, and says so.** The tests need a host that allows
+`io_uring_setup`. Where the probe fails (an old kernel, a container whose
+seccomp profile blocks the syscall) there is nothing to exercise, and each test
+writes a `SKIP <test>: io_uring probe failed ...` line to stderr -- directly,
+so the test harness does not swallow it -- and passes. A green leg whose log
+carries those lines verified the fallback only, not the lane. Setting
+`OAM_REQUIRE_IO_URING=1` for the test run turns a failed probe into a failure;
+use it on a host known to allow io_uring. Whether the current release container
+allows it has not been established, so the leg does not set it.
 
 ## Risks
 

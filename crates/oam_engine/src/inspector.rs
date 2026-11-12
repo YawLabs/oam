@@ -33,8 +33,9 @@ pub(crate) struct Shared {
     /// the inspector. `from_client` (a public field) is the inbound channel.
     handle: InspectorHandle,
     /// Raw pointer to the boxed `V8InspectorSession`, set once after
-    /// `connect`. Null until then. Used to dispatch from `&self`-only
-    /// callbacks.
+    /// `connect`. Null until then, and again from `InspectorState::teardown`
+    /// on (this struct outlives the session in the isolate slot). Used to
+    /// dispatch from `&self`-only callbacks.
     session: Cell<*const v8::inspector::V8InspectorSession>,
     /// Nesting depth of active V8 pauses. A counter, not a bool, because V8
     /// re-enters `run_message_loop_on_pause` when a command dispatched WHILE
@@ -59,9 +60,32 @@ impl Shared {
         // but a program name or eval string can carry non-ASCII.
         let utf16: Vec<u16> = message.encode_utf16().collect();
         let view = v8::inspector::StringView::from(&utf16[..]);
-        // SAFETY: single-threaded; the session outlives every dispatch (it's
-        // boxed and owned by the runtime, dropped only on isolate teardown).
+        // SAFETY: single-threaded; the pointer is non-null only while the
+        // boxed session it names is alive: `attach` sets it once the session
+        // is boxed and `InspectorState::teardown` nulls it before the box
+        // drops.
         unsafe { (*session).dispatch_protocol_message(view) };
+    }
+
+    /// The client is gone: put the session back as a client finds it on its
+    /// first attach. There is ONE V8 session for the life of the runtime and
+    /// every client is bridged to it, so what a client enabled outlives the
+    /// client unless it is undone here -- with the Debugger domain left on,
+    /// the next breakpoint or `debugger;` statement pauses the program in
+    /// `run_pause_loop` with nobody to resume it, and the next client would
+    /// inherit breakpoints it never set. Disabling the Debugger domain
+    /// removes its breakpoints and, if V8 is paused, resumes it (V8 calls
+    /// `quit_message_loop_on_pause`); node gets the same by destroying its
+    /// per-client session. Call BEFORE the outbound sender is swapped: the
+    /// two responses then go to the departed client's channel and are
+    /// dropped, not delivered to a client that never asked.
+    fn reset_session(&self) {
+        for message in [
+            r#"{"id":0,"method":"Debugger.disable"}"#,
+            r#"{"id":0,"method":"Runtime.disable"}"#,
+        ] {
+            self.dispatch(message);
+        }
     }
 
     /// Forward one outbound CDP message (from the V8 channel) to the client.
@@ -80,15 +104,21 @@ impl Shared {
             match message {
                 FromClient::Message(text) => self.dispatch(&text),
                 FromClient::Reconnected(new_tx) => self.apply_reconnect(new_tx),
-                FromClient::Connected | FromClient::Disconnected => {}
+                FromClient::Disconnected => self.reset_session(),
+                FromClient::Connected => {}
             }
         }
     }
 
-    /// A new debugger client connected after the previous one left.  Swap the
-    /// outbound sender and clear per-session state so `wait_for_attach` and
-    /// the pause loop behave correctly for the fresh session.
+    /// The previous client's session has ended and the transport is ready
+    /// for the next one (it sends this as the session ends, right after
+    /// `Disconnected`, not when a new client arrives). Swap in the outbound
+    /// sender the next client will be bridged to and clear per-session state
+    /// so `wait_for_attach` and the pause loop behave correctly for it.
     fn apply_reconnect(&self, new_tx: OutboundSender) {
+        // Normally done on `Disconnected` already; repeated here (it is
+        // idempotent) for a session that ended without sending one.
+        self.reset_session();
         self.handle.swap_sender(new_tx);
         // `run_requested` is set by `Runtime.runIfWaitingForDebugger` which
         // the new client must re-send.  Clear it so --inspect-brk wait loops
@@ -111,12 +141,17 @@ impl Shared {
             match self.handle.from_client.recv() {
                 Ok(FromClient::Message(text)) => self.dispatch(&text),
                 Ok(FromClient::Connected) => {}
-                // Client vanished while paused — drop all pause levels so the
-                // process can make progress / exit rather than hang.
-                Ok(FromClient::Disconnected) | Err(_) => self.pause_depth.set(0),
-                // New client arrived after disconnect: swap sender and clear
-                // the pause so the engine is not stuck waiting for a resume
-                // that can never come from the now-disconnected prior client.
+                // Client vanished while paused — disarm the session (which
+                // resumes V8) and drop all pause levels so the process can
+                // make progress / exit rather than hang.
+                Ok(FromClient::Disconnected) | Err(_) => {
+                    self.reset_session();
+                    self.pause_depth.set(0);
+                }
+                // The transport is ready for the next client (sent as the
+                // prior session ends): swap sender and clear the pause so
+                // the engine is not stuck waiting for a resume that can
+                // never come from the now-disconnected prior client.
                 Ok(FromClient::Reconnected(new_tx)) => {
                     self.apply_reconnect(new_tx);
                     // pause_depth already zeroed by apply_reconnect.
@@ -140,7 +175,12 @@ impl Shared {
             match self.handle.from_client.recv() {
                 Ok(FromClient::Message(text)) => self.dispatch(&text),
                 Ok(FromClient::Connected) => {}
-                Ok(FromClient::Disconnected) | Err(_) => return false,
+                // The program now runs uninspected: nothing the departed
+                // client set may pause it.
+                Ok(FromClient::Disconnected) | Err(_) => {
+                    self.reset_session();
+                    return false;
+                }
                 // A reconnect while waiting: swap sender and keep waiting for
                 // the new client to send runIfWaitingForDebugger.
                 Ok(FromClient::Reconnected(new_tx)) => self.apply_reconnect(new_tx),
@@ -233,6 +273,10 @@ impl InspectorState {
     /// unregister the context, then drop — session deletes first, then the
     /// inspector, both with the isolate current.
     pub(crate) fn teardown(self, context: v8::Local<'_, v8::Context>) {
+        // The isolate slot keeps its `Rc<Shared>` until the isolate drops,
+        // after the session: nothing may reach the session through it from
+        // here on (`dispatch` and `arm_break` are no-ops on null).
+        self.shared.session.set(std::ptr::null());
         self.inspector.context_destroyed(context);
         // `self` drops here: session DELETE, then inspector DELETE.
     }
@@ -247,7 +291,7 @@ pub(crate) fn attach(
     addr: SocketAddr,
     break_on_start: bool,
 ) -> anyhow::Result<(InspectorState, String)> {
-    let uuid = random_uuid();
+    let uuid = random_uuid()?;
     let handle = oam_core::inspector::start(addr, uuid)?;
     let ws_url = handle.ws_url();
 
@@ -295,20 +339,21 @@ pub(crate) fn attach(
     ))
 }
 
-/// A v4-shaped random id for the debugger URL. DevTools only needs
-/// uniqueness, not RFC-4122 conformance.
-fn random_uuid() -> String {
+/// A v4-shaped random id for the debugger URL (RFC-4122 conformance is not
+/// needed). The transport accepts a session only at this id's path, so it
+/// has to come from the OS generator: without one the inspector does not
+/// start, rather than run under an id anyone could name.
+fn random_uuid() -> anyhow::Result<String> {
     let mut bytes = [0u8; 16];
-    // Best-effort OS randomness; a failure here only weakens uniqueness of a
-    // localhost debug URL, so fall back to a fixed pattern rather than error.
-    let _ = getrandom::fill(&mut bytes);
+    getrandom::fill(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("inspector: no random target id available: {e}"))?;
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!(
+    Ok(format!(
         "{}-{}-{}-{}-{}",
         &hex[0..8],
         &hex[8..12],
         &hex[12..16],
         &hex[16..20],
         &hex[20..32]
-    )
+    ))
 }

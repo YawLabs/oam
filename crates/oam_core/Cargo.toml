@@ -12,7 +12,9 @@ tokio = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# node:zlib compression backend.
+# The CRC-32 of the gzip paths (node:zlib's deflaters and inflaters, the
+# fetch body decoder), and the reference encoders the tests compare against.
+# The compression itself is miniz_oxide, below.
 flate2 = { workspace = true }
 # HTTP server, and since #143 the client half: the fetch transport is
 # hyper-util's pooled legacy client with oam's own connector, its env-proxy
@@ -207,3 +209,4 @@ security-framework = { workspace = true }
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
 unnecessary_safety_comment = "deny"
+missing_safety_doc = "deny"

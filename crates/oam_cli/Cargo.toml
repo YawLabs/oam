@@ -77,3 +77,4 @@ windows-sys = { version = "0.61", features = [
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
 unnecessary_safety_comment = "deny"
+missing_safety_doc = "deny"

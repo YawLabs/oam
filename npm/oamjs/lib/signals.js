@@ -50,7 +50,9 @@ function forwardSignals(child, opts = {}) {
     // object needs a native addon, which this package deliberately does not
     // have (no postinstall, no build step). Saying so is the honest option;
     // a host on Windows should stop the server by closing its stdin, which oam
-    // handles, rather than by PID. Recorded in npm/README.md too.
+    // handles, rather than by PID. Recorded in this package's README.md
+    // ("Stopping it"), which is the copy a user of the published package can
+    // read, and in the repo's npm/README.md.
     for (const sig of WINDOWS_HELD) listen(sig, () => {});
   } else {
     for (const sig of POSIX_FORWARDED) {

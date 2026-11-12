@@ -7,6 +7,10 @@
 //! off, oam_engine::napi is not compiled, no `napi_*` symbol exists, and this
 //! script emits nothing.
 
+// Kept in step with oam_engine/src/napi.rs by the unit test
+// `napi_export_list_matches_the_implemented_surface` in src/main.rs, which
+// reads both files: a symbol implemented there and missing here resolves on
+// Linux and macOS (everything is exported) and fails only on Windows.
 const NAPI_EXPORTS: &[&str] = &[
     // alpha wave
     "napi_get_undefined",
@@ -83,6 +87,7 @@ const NAPI_EXPORTS: &[&str] = &[
     "napi_throw_range_error",
     "napi_is_error",
     "napi_fatal_exception",
+    "napi_fatal_error",
     "napi_create_string_latin1",
     "napi_create_string_utf16",
     "napi_get_value_string_latin1",
@@ -218,7 +223,21 @@ fn main() {
                 }
             }
             std::fs::write(&def, text).expect("write napi.def");
-            println!("cargo:rustc-link-arg-bins=/DEF:{}", def.display());
+            // `/DEF:` is link.exe's spelling. The GNU toolchain takes a
+            // module-definition file as a plain input instead (the gcc driver
+            // hands a `.def` argument to ld, which reads its EXPORTS), the
+            // same msvc/gnu split the stack reserve above makes. Any other
+            // target env gets nothing rather than an option its linker may
+            // read as a file name.
+            match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+                Ok("msvc") => {
+                    println!("cargo:rustc-link-arg-bins=/DEF:{}", def.display());
+                }
+                Ok("gnu") => {
+                    println!("cargo:rustc-link-arg-bins={}", def.display());
+                }
+                _ => {}
+            }
         }
         "linux" => {
             println!("cargo:rustc-link-arg-bins=-Wl,--export-dynamic");

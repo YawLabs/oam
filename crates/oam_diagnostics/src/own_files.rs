@@ -161,6 +161,63 @@ fn create_dir_all_mode(dir: &Path, mode: u32) -> std::io::Result<()> {
     }
 }
 
+/// A NEW directory under `parent` for this process alone, named
+/// `<prefix><pid>-<16 hex digits>`, and its path.
+///
+/// Unlike [`create_dir_all`] it never settles for a directory that is
+/// already there: the create is exclusive, so what comes back was made by
+/// this call, is the owner's alone (0o700 on unix, whatever the mask), and
+/// holds nothing this process did not put in it. That is what lets a file
+/// written into it be read back and run as the one that was written. The
+/// name is not derivable from the pid, so a name taken beforehand does not
+/// stand in the way either; a collision is retried under another name.
+/// `parent` itself must exist.
+pub fn create_scratch_dir(parent: &Path, prefix: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::hash::{BuildHasher, Hasher};
+    let pid = std::process::id();
+    let mut taken = None;
+    for attempt in 0..16u32 {
+        // A `RandomState` is keyed from the system's randomness; hashing
+        // under a fresh one is the standard library's own source of a value
+        // another process cannot work out.
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(pid);
+        hasher.write_u32(attempt);
+        let dir = parent.join(format!("{prefix}{pid}-{:016x}", hasher.finish()));
+        match create_new_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => taken = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(taken.unwrap_or_else(|| std::io::Error::from(std::io::ErrorKind::AlreadyExists)))
+}
+
+/// `mkdir`, failing on anything already at `dir` (a link included: the last
+/// component is never followed), with the scratch mode on unix.
+fn create_new_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new().mode(0o700).create(dir)?;
+        // mkdir's mode is under the current mask; chmod is not. The bits
+        // above the permission bits are the directory's own and are kept,
+        // as in `create_dir_all_mode`.
+        if let Ok(meta) = std::fs::symlink_metadata(dir) {
+            let have = meta.permissions().mode() & 0o7777;
+            let want = (have & 0o7000) | 0o700;
+            if have != want {
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(want));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(dir)
+    }
+}
+
 /// `File::create` -- create, or truncate what is there -- with oam's mode
 /// for `audience`. A file already there that its owner cannot write (one a
 /// mask without the owner's bits left behind) is replaced.
@@ -253,6 +310,31 @@ mod tests {
         note_inherited_umask(0o027);
         note_inherited_umask(0);
         assert_eq!(inherited_umask(), Some(0o027));
+    }
+
+    /// Each call makes a directory of its own, and one already at a name is
+    /// an error rather than a directory to reuse.
+    #[test]
+    fn a_scratch_dir_is_always_a_new_one() {
+        let parent = std::env::temp_dir();
+        let one = create_scratch_dir(&parent, "oam-own-new-").unwrap();
+        let two = create_scratch_dir(&parent, "oam-own-new-").unwrap();
+        assert_ne!(one, two);
+        assert!(one.is_dir() && two.is_dir());
+        let name = one.file_name().unwrap().to_string_lossy().into_owned();
+        let prefix = format!("oam-own-new-{}-", std::process::id());
+        assert!(name.starts_with(&prefix), "{name}");
+        assert_eq!(std::fs::read_dir(&one).unwrap().count(), 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&one).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        let err = create_new_dir(&one).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        std::fs::remove_dir_all(&one).unwrap();
+        std::fs::remove_dir_all(&two).unwrap();
     }
 
     #[cfg(unix)]

@@ -8,7 +8,7 @@
 //! that takes, so a small compressed frame that inflates to megabytes never
 //! sits in memory whole.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -24,8 +24,9 @@ use crate::{BodyCancelSignal, CancelledBodies, OpOutcome, OutboundBodies};
 pub const OTHER_SIDE_CLOSED: &str = "other side closed";
 pub const SOCKET_CODE: &str = "UND_ERR_SOCKET";
 /// undici's `HTTPParserError` for a bad chunk-size line in a fetch body:
-/// llhttp's code, and its reason in undici's sentence.
-pub const BAD_CHUNK_SIZE_CODE: &str = "HPE_INVALID_CHUNK_SIZE";
+/// llhttp's code (`INVALID_CHUNK_SIZE`'s), and its reason in undici's
+/// sentence.
+pub const BAD_CHUNK_SIZE_CODE: &str = INVALID_CHUNK_SIZE.0;
 pub const BAD_CHUNK_SIZE: &str =
     "Response does not match the HTTP/1.1 protocol (Invalid character in chunk size)";
 /// undici's `ResponseContentLengthMismatchError`: a response the server
@@ -240,10 +241,7 @@ impl BodyReadError {
             },
             // llhttp's code and text for a bad chunk-size line, the one
             // framing error hyper leaves in the body.
-            BodyReadError::Framing if coded => OpOutcome::node_failed(
-                BAD_CHUNK_SIZE_CODE,
-                "Parse Error: Invalid character in chunk size",
-            ),
+            BodyReadError::Framing if coded => invalid_chunk_size(),
             BodyReadError::Framing => OpOutcome::node_failed(BAD_CHUNK_SIZE_CODE, BAD_CHUNK_SIZE),
             BodyReadError::Closed => OpOutcome::node_failed(SOCKET_CODE, OTHER_SIDE_CLOSED),
             BodyReadError::LengthMismatch => {
@@ -268,6 +266,9 @@ impl BodyReadError {
                 dest: None,
                 win_error: *win_error,
             },
+            // undici's bodyTimeout lapsed. The read does not put the body
+            // back, which closes its connection, as undici destroys the
+            // socket.
             BodyReadError::TimedOut => {
                 OpOutcome::node_failed("UND_ERR_BODY_TIMEOUT", "Body Timeout Error")
             }
@@ -444,15 +445,121 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The cancel state paired with [`FetchBodies`], for the
+/// remove-await-reinsert race: which handles have a read in flight (their
+/// body is out of the registry), and which of those were cancelled
+/// meanwhile -- a tombstone the returning read sees, so that it drops the
+/// body instead of reinserting it. A cancelled body would otherwise revive
+/// and hold its connection open for the rest of the run.
+///
+/// A tombstone is left only for a read in flight, and that read removes it
+/// when it returns, so the set does not grow: a cancel for a handle that is
+/// simply gone (drained, failed, cancelled before) leaves nothing behind.
+#[derive(Debug, Default)]
+pub struct CancelState {
+    /// How many reads of each handle are in flight. JS keeps one reader per
+    /// handle, so the count is 1; it is a count so that a second read
+    /// overlapping the first can never take the first's mark away early.
+    reading: HashMap<u64, usize>,
+    tombstones: HashSet<u64>,
+}
+
+impl CancelState {
+    /// Mark `handle` cancelled, whatever its read is doing.
+    pub fn tombstone(&mut self, handle: u64) {
+        self.tombstones.insert(handle);
+    }
+
+    /// True while `handle` carries a tombstone no read has taken.
+    pub fn is_tombstoned(&self, handle: u64) -> bool {
+        self.tombstones.contains(&handle)
+    }
+
+    /// True with no read in flight and no tombstone left.
+    pub fn is_empty(&self) -> bool {
+        self.reading.is_empty() && self.tombstones.is_empty()
+    }
+}
+
+/// One read's entry in [`CancelState`], from before it takes the body out of
+/// the registry until it returns (or is dropped): the mark that makes a
+/// cancel leave a tombstone, and the removal of both at the end.
+struct Reading {
+    cancelled: CancelledBodies,
+    handle: u64,
+}
+
+impl Reading {
+    fn begin(cancelled: CancelledBodies, handle: u64) -> Reading {
+        *lock(&cancelled).reading.entry(handle).or_insert(0) += 1;
+        Reading { cancelled, handle }
+    }
+
+    /// A cancel has landed on this read.
+    fn cancelled(&self) -> bool {
+        lock(&self.cancelled).tombstones.contains(&self.handle)
+    }
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        let mut state = lock(&self.cancelled);
+        // The last read of the handle takes the mark and any tombstone.
+        let last = match state.reading.get_mut(&self.handle) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            _ => true,
+        };
+        if last {
+            state.reading.remove(&self.handle);
+            state.tombstones.remove(&self.handle);
+        }
+    }
+}
+
+/// `fetchBodyCancel`: drop the body under `handle`, which closes its
+/// connection. A body that is out of the registry because its read is in
+/// flight gets a tombstone and a wake of `cancel_signal` instead, and that
+/// read drops it ([`read`]). A handle that is simply gone -- already drained,
+/// failed or cancelled -- is left alone.
+pub fn cancel(
+    bodies: &FetchBodies,
+    cancelled: &CancelledBodies,
+    cancel_signal: &BodyCancelSignal,
+    handle: u64,
+) {
+    let removed = lock(bodies).remove(&handle);
+    if removed.is_some() {
+        return;
+    }
+    let in_flight = {
+        let mut state = lock(cancelled);
+        let in_flight = state.reading.contains_key(&handle);
+        if in_flight {
+            state.tombstones.insert(handle);
+        }
+        in_flight
+    };
+    if in_flight {
+        // Wake the parked read, so the cancel takes effect even when the
+        // peer has simply stopped sending (the next chunk never comes).
+        cancel_signal.notify_waiters();
+    }
+}
+
 /// `fetchBodyRead`: one chunk of the body under `handle` (`Bytes`), `Done`
 /// at the end, a [`BodyReadError`]'s outcome on a failure.
 ///
-/// A cancel (`fetchBodyCancel`) that lands while the read is in flight --
-/// the body is out of the registry then -- leaves a tombstone in `cancelled`
-/// and fires `cancel_signal`; the read returns `Done` and drops the body
+/// A cancel ([`cancel`]) that lands while the read is in flight -- the body
+/// is out of the registry then -- leaves a tombstone in `cancelled` and
+/// fires `cancel_signal`; the read returns `Done` and drops the body
 /// (closing its connection) instead of reinserting it. The signal is
 /// broadcast, so a wake for another handle's cancel is checked against the
-/// tombstones and the read carries on with its state intact.
+/// tombstones and the read carries on with its state intact. The read marks
+/// itself in flight BEFORE it takes the body out of the registry, so a
+/// cancel that finds no body there always finds the mark.
 ///
 /// The wake cannot be lost. `Notify::notify_waiters` stores no permit: it
 /// wakes only the waiters already registered, so a cancel landing on the V8
@@ -470,13 +577,16 @@ pub async fn read(
     cancel_signal: BodyCancelSignal,
     handle: u64,
 ) -> OpOutcome {
+    // In flight from here until this returns: `reading` takes the mark, and
+    // any tombstone, away when it drops.
+    let reading = Reading::begin(cancelled, handle);
     let body = lock(&bodies).remove(&handle);
     let Some(mut body) = body else {
         return OpOutcome::Failed(format!("fetch: body handle {handle} is gone"));
     };
     let mut cancelled_wake = Box::pin(cancel_signal.notified());
     cancelled_wake.as_mut().enable();
-    if lock(&cancelled).remove(&handle) {
+    if reading.cancelled() {
         return OpOutcome::Done;
     }
     let result = loop {
@@ -485,29 +595,23 @@ pub async fn read(
             () = cancelled_wake.as_mut() => {
                 cancelled_wake.set(cancel_signal.notified());
                 cancelled_wake.as_mut().enable();
-                if lock(&cancelled).remove(&handle) {
+                if reading.cancelled() {
                     return OpOutcome::Done;
                 }
             }
         }
     };
-    if lock(&cancelled).remove(&handle) {
+    if reading.cancelled() {
         return OpOutcome::Done;
     }
     match result {
-        // undici's bodyTimeout lapsed: the body is dropped, which closes its
-        // connection, as undici destroys the socket.
-        Err(BodyReadError::TimedOut) => {
-            drop(body);
-            OpOutcome::node_failed("UND_ERR_BODY_TIMEOUT", "Body Timeout Error")
-        }
         Ok(Some(chunk)) => {
             lock(&bodies).insert(handle, body);
             // A cancel can land between the tombstone check above and the
             // insert (no tombstone yet, body not in the registry): without
             // this second look the cancelled body would revive and hold its
             // connection for the rest of the run.
-            if lock(&cancelled).remove(&handle) {
+            if reading.cancelled() {
                 let revived = lock(&bodies).remove(&handle);
                 drop(revived);
             }
@@ -522,11 +626,10 @@ pub async fn read(
         }
         // A kept-alive response's connection the peer closed mid-body:
         // undici's SocketError, with the connection's facts as they stand.
-        Err(BodyReadError::Closed) if body.conn.is_some() => match &body.conn {
-            Some(conn) => OpOutcome::socket_closed(conn.socket_facts()),
-            None => BodyReadError::Closed.to_outcome(body.coded),
+        Err(error) => match (&error, &body.conn) {
+            (BodyReadError::Closed, Some(conn)) => OpOutcome::socket_closed(conn.socket_facts()),
+            _ => error.to_outcome(body.coded),
         },
-        Err(error) => error.to_outcome(body.coded),
     }
 }
 
@@ -618,6 +721,34 @@ impl StreamSlot {
         self.state = SlotState::Dead;
         let removed = lock(&self.outbound).remove(&self.handle);
         drop(removed);
+    }
+
+    /// The request was answered and its body is not wanted any more (a
+    /// redirect that goes on without it), but may still be going out: stop
+    /// it. A body JS has already ended has no entry left and is untouched.
+    /// One still open gets an `Err` item, which ends it unfinished -- hyper
+    /// then closes the connection instead of framing what was written as a
+    /// whole body -- and its channel is forgotten, so later writes fail as
+    /// an unknown stream, as after [`StreamSlot::request_failed`]. A channel
+    /// with no room for the item (JS is ahead of the socket) is forgotten
+    /// all the same: the body then ends where its queue does.
+    ///
+    /// True for that last case alone: the stop could not be queued, so the
+    /// body's connection stays busy until the peer has read what is queued
+    /// -- which a peer that answered early may never do. The caller must
+    /// not wait for that connection.
+    pub(crate) fn abandon(&mut self) -> bool {
+        self.state = SlotState::Dead;
+        let removed = lock(&self.outbound).remove(&self.handle);
+        let mut stuck = false;
+        if let Some((Some(sender), _)) = &removed {
+            stuck = matches!(
+                sender.try_send(Err("request body abandoned".to_string())),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+            );
+        }
+        drop(removed);
+        stuck
     }
 }
 

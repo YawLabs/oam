@@ -39,24 +39,38 @@ const GIT_SHA: Option<&str> = option_env!("OAM_GIT_SHA");
 
 /// Cache/state root, mirroring `oam_ts::daemon::cache_root` (duplicated so the
 /// reporter stays self-contained and callable mid-crash with no cross-crate
-/// state): `OAM_CACHE_DIR` override, else the per-platform user cache dir.
+/// state): `OAM_CACHE_DIR` override, else the per-platform user cache dir,
+/// else `<temp>/oam` -- never the process cwd. An empty variable counts as
+/// unset, as it does in the copies this mirrors (`code_cache::CacheEnv`,
+/// `oam_loader::transpile_cache`): a scrubbed environment must not put crash
+/// files into whatever directory oam was run from.
 fn cache_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("OAM_CACHE_DIR") {
+    resolve_cache_root(
+        |key| std::env::var(key).ok(),
+        cfg!(windows),
+        std::env::temp_dir(),
+    )
+}
+
+/// Pure path logic behind [`cache_root`]. `windows` is a parameter rather
+/// than `cfg!` so both branches are unit-tested on every host.
+fn resolve_cache_root(
+    lookup: impl Fn(&str) -> Option<String>,
+    windows: bool,
+    temp_dir: PathBuf,
+) -> PathBuf {
+    let var = |key: &str| lookup(key).filter(|v| !v.is_empty());
+    if let Some(dir) = var("OAM_CACHE_DIR") {
         return PathBuf::from(dir);
     }
-    #[cfg(windows)]
-    {
-        PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into())).join("oam")
-    }
-    #[cfg(not(windows))]
-    {
-        let base = std::env::var("XDG_CACHE_HOME")
+    let platform = if windows {
+        var("LOCALAPPDATA").map(PathBuf::from)
+    } else {
+        var("XDG_CACHE_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".cache")
-            });
-        base.join("oam")
-    }
+            .or_else(|| var("HOME").map(|h| PathBuf::from(h).join(".cache")))
+    };
+    platform.unwrap_or(temp_dir).join("oam")
 }
 
 /// Milliseconds since the Unix epoch. `SystemTime` is permitted in runtime Rust
@@ -198,4 +212,59 @@ unsafe fn read_cstr(p: *const std::os::raw::c_char) -> String {
     // SAFETY: `p` is non-null here (checked above) and points to a V8-owned
     // nul-terminated C string, so `CStr::from_ptr`'s precondition holds.
     unsafe { std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_root_override_and_platform_dirs() {
+        let all = |key: &str| {
+            let value = match key {
+                "OAM_CACHE_DIR" => "/override",
+                "LOCALAPPDATA" => "C:/lad",
+                "XDG_CACHE_HOME" => "/xdg",
+                _ => "/home/u",
+            };
+            Some(value.to_string())
+        };
+        for windows in [true, false] {
+            assert_eq!(
+                resolve_cache_root(all, windows, PathBuf::from("/tmp-probe")),
+                PathBuf::from("/override")
+            );
+        }
+        let no_override = |key: &str| match key {
+            "OAM_CACHE_DIR" => None,
+            other => all(other),
+        };
+        assert_eq!(
+            resolve_cache_root(no_override, true, PathBuf::from("/tmp-probe")),
+            PathBuf::from("C:/lad").join("oam")
+        );
+        assert_eq!(
+            resolve_cache_root(no_override, false, PathBuf::from("/tmp-probe")),
+            PathBuf::from("/xdg").join("oam")
+        );
+        let home_only = |key: &str| (key == "HOME").then(|| "/home/u".to_string());
+        assert_eq!(
+            resolve_cache_root(home_only, false, PathBuf::from("/tmp-probe")),
+            PathBuf::from("/home/u").join(".cache").join("oam")
+        );
+    }
+
+    /// Unset and set-but-empty variables both land under the temp dir, never
+    /// in a cwd-relative path.
+    #[test]
+    fn cache_root_falls_back_to_temp_never_cwd() {
+        let temp = std::env::temp_dir();
+        for windows in [true, false] {
+            let unset = resolve_cache_root(|_| None, windows, temp.clone());
+            let empty = resolve_cache_root(|_| Some(String::new()), windows, temp.clone());
+            assert_eq!(unset, temp.join("oam"));
+            assert_eq!(empty, temp.join("oam"));
+            assert!(unset.is_absolute(), "{}", unset.display());
+        }
+    }
 }

@@ -19,17 +19,18 @@
 # question "is this the release I asked for?", not just "did we ever sign
 # this?". SHA256SUMS itself is untouched, so every existing consumer keeps
 # working; the manifest's name sits outside the `oam-*` globs that pick
-# binaries, and it is never listed IN SHA256SUMS (that file covers binaries).
+# binaries, and it is never listed IN SHA256SUMS (that file covers the binaries
+# and the LICENSE, NOTICE and THIRD_PARTY_LICENSES.md beside them).
 #
 # Trust is by TAG RANGE, not by time. release-keys/allowed_signers names the
 # keys (public material only), and release-keys/ranges says which tags each may
 # sign ("k1 v0.18.0 -": from v0.18.0 inclusive, open-ended). ssh-keygen's own
 # valid-before= option would be checked against the VERIFY time, so retiring a
 # key would break every pinned old tag it signed; a tag range retires a key
-# for new releases only. release-keys/README.md is the runbook.
+# for new releases only. release-keys/README.md describes the keys.
 #
-# Custody: the private half lives at $OAM_RELEASE_SIGNING_KEY, passphrase
-# protected. release_agent_start loads it into a PRIVATE ssh-agent -- its own
+# The agent: release_agent_start loads the key named by
+# $OAM_RELEASE_SIGNING_KEY into a PRIVATE ssh-agent -- its own
 # process, its own 0700 socket directory, a 6-hour key lifetime -- with one
 # passphrase prompt, and release_agent_stop kills it. SSH_AUTH_SOCK is NEVER
 # exported: every ssh-add / ssh-keygen call that needs the agent gets it as a
@@ -308,9 +309,9 @@ release_signing_decision() {
   if [ -n "$(release_key_lines)" ]; then
     printf 'sign\n'
   elif [ "$req" = "1" ]; then
-    printf 'fail:OAM_SIGN_REQUIRED=1 but release-keys/allowed_signers holds no key yet -- generate and commit one (release-keys/README.md), or set OAM_SIGN_REQUIRED=0 for a bootstrap release (release-local.sh defaults it to 1)\n'
+    printf 'fail:OAM_SIGN_REQUIRED=1 but release-keys/allowed_signers holds no key yet -- commit one (the release runbook, kept outside this repository), or set OAM_SIGN_REQUIRED=0 for a bootstrap release (release-local.sh defaults it to 1)\n'
   else
-    printf 'skip:release-keys/allowed_signers holds no key yet, so this release ships WITHOUT a signed RELEASE-MANIFEST (bootstrap; see release-keys/README.md). Once a key is committed this step is mandatory\n'
+    printf 'skip:release-keys/allowed_signers holds no key yet, so this release ships WITHOUT a signed RELEASE-MANIFEST (bootstrap). Once a key is committed this step is mandatory\n'
   fi
   return 0
 }
@@ -397,7 +398,7 @@ release_agent_start() {
   release_agent_stop
   local key="${OAM_RELEASE_SIGNING_KEY:-}" ktype kblob i rc base
   [ -n "$key" ] \
-    || { _rs_fail "OAM_RELEASE_SIGNING_KEY is not set -- point it at the release key's PRIVATE half (passphrase-protected ed25519, '<path>.pub' beside it); release-keys/README.md has the runbook"; return 1; }
+    || { _rs_fail "OAM_RELEASE_SIGNING_KEY is not set -- point it at the release key's PRIVATE half (passphrase-protected ed25519, '<path>.pub' beside it)"; return 1; }
   # A Windows-style path from the environment works for the MSYS tools once
   # translated; cygpath exists only where that translation is needed.
   if command -v cygpath >/dev/null 2>&1; then key="$(cygpath -u "$key")"; fi
@@ -550,10 +551,11 @@ release_write_manifest() {
   local dir="$1" tag="$2"
   _rs_plain_tag "$tag" || { _rs_fail "'$tag' is not a plain vX.Y.Z tag"; return 1; }
   [ -s "$dir/SHA256SUMS" ] || { _rs_fail "$dir/SHA256SUMS is missing or empty -- the manifest wraps it"; return 1; }
-  # SHA256SUMS covers binaries. A manifest listed inside it would be a hash of
-  # the thing that carries the hash -- and a sign the two got confused.
+  # SHA256SUMS covers the binaries and the license files. A manifest listed
+  # inside it would be a hash of the thing that carries the hash -- and a sign
+  # the two got confused.
   if grep -q 'RELEASE-MANIFEST' "$dir/SHA256SUMS"; then
-    _rs_fail "$dir/SHA256SUMS lists RELEASE-MANIFEST -- it must cover the oam-* binaries only"
+    _rs_fail "$dir/SHA256SUMS lists RELEASE-MANIFEST -- it must cover the oam-* binaries and license files only"
     return 1
   fi
   rm -f "$dir/RELEASE-MANIFEST.sig"
@@ -638,8 +640,7 @@ release_verify_manifest() {
 # The manifest above proves a release came from us; it does nothing for the
 # person who double-clicks oam.exe, or for Smart App Control, which judges the
 # binary alone. So each Windows asset also carries an Authenticode signature,
-# made by Azure Artifact Signing: the key lives in Microsoft's HSM and never
-# touches this box, the certificate is issued to the validated organization
+# made by Azure Artifact Signing: the certificate is issued to the validated organization
 # name and lives three days, and signtool reaches the service through a
 # client "dlib" plugin. Everything account-specific (endpoint, account name,
 # certificate profile) sits in a metadata.json OUTSIDE the repo, at
@@ -648,7 +649,7 @@ release_verify_manifest() {
 # itself is public (it is printed on every signed asset, and the docs state
 # it), but the script takes it from the environment so a renamed or
 # re-validated organization is a config change, not a code change.
-# release-keys/README.md ("Windows Authenticode") is the setup runbook.
+# The setup runbook is kept outside this repository.
 #
 # Three-day certificates make the RFC 3161 timestamp the signature's real
 # lifetime: an untimestamped signature dies with its certificate. So the TSA
@@ -1021,9 +1022,9 @@ win_sign_decision() {
   elif [ -n "$meta" ] || [ -n "$pub" ]; then
     printf 'fail:Windows signing is half configured -- set BOTH OAM_WIN_SIGN_METADATA (the metadata.json path) and OAM_WIN_SIGN_PUBLISHER (the validated publisher name), or neither\n'
   elif [ "$req" = "1" ]; then
-    printf 'fail:signing is required (OAM_SIGN_REQUIRED, default 1 under release-local.sh) but OAM_WIN_SIGN_METADATA is not set -- configure it (release-keys/README.md), set OAM_SKIP_WIN_SIGN=1, or OAM_SIGN_REQUIRED=0 to ship unsigned .exe assets deliberately\n'
+    printf 'fail:signing is required (OAM_SIGN_REQUIRED, default 1 under release-local.sh) but OAM_WIN_SIGN_METADATA is not set -- configure it, set OAM_SKIP_WIN_SIGN=1, or OAM_SIGN_REQUIRED=0 to ship unsigned .exe assets deliberately\n'
   else
-    printf 'skip:OAM_WIN_SIGN_METADATA is not set, so the Windows assets ship WITHOUT Authenticode signatures (bootstrap; see release-keys/README.md). OAM_SIGN_REQUIRED=1 makes this fatal\n'
+    printf 'skip:OAM_WIN_SIGN_METADATA is not set, so the Windows assets ship WITHOUT Authenticode signatures (bootstrap). OAM_SIGN_REQUIRED=1 makes this fatal\n'
   fi
   return 0
 }

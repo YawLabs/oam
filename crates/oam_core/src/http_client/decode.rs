@@ -27,10 +27,12 @@
 //!   `finishFlush: Z_SYNC_FLUSH` / `BROTLI_OPERATION_FLUSH`, so neither is an
 //!   error: an empty gzip 200 is "" and a truncated body yields what decoded.
 //!
-//! gzip member framing is done here by hand because flate2 1.1.9 on its pure
+//! gzip member framing is done by hand because flate2 1.1.9 on its pure
 //! Rust backend (miniz_oxide) has no gzip-wrapped `Decompress` (`new_gzip` is
 //! `cfg(any_zlib)`): header, raw inflate, CRC32 + ISIZE trailer, following
 //! zlib's inflate.c and node_zlib.cc for which bytes are an error and when.
+//! It is [`crate::inflate::NodeInflate`]'s, the one node:zlib's gunzip uses,
+//! so a conformance fix to the framing reaches both.
 //!
 //! Inflate itself is miniz_oxide's core decoder (the one under flate2) driven
 //! with the history held outside it ([`crate::inflate::Inflater`], shared
@@ -47,7 +49,6 @@ use crate::inflate::{self, InflateFailure};
 use crate::zstd::ZstdError;
 use brotli_decompressor::{BrotliDecompressStream, BrotliResult, BrotliState, StandardAlloc};
 use bytes::{Buf, Bytes};
-use flate2::Crc;
 use zstd_safe::{DCtx, InBuffer, OutBuffer};
 
 /// undici fetch/index.js:2140: more content-codings than this fails the fetch
@@ -194,6 +195,15 @@ impl DecodeError {
         }
     }
 
+    /// A failure of the shared gzip framing ([`inflate::NodeInflate`]): zlib's
+    /// code, its number and the message, as node reports them.
+    fn from_zlib(error: inflate::ZlibError) -> DecodeError {
+        DecodeError {
+            message: error.message,
+            node: Some((Cow::Borrowed(error.code), error.errno)),
+        }
+    }
+
     /// `name` is the decoder's error-code variant, whose names are the C
     /// enum's (`BROTLI_DECODER_ERROR_FORMAT_PADDING_1`), and `errno` its
     /// value; node's code is `ERR_` + the name without its `BROTLI_DECODER`
@@ -330,22 +340,23 @@ impl Decoder {
             }
             return Ok(Some(input.split_to(input.len().min(OUT_CAP))));
         };
-        if self.windows[last].is_empty() {
-            match self.pull(last, input) {
-                Ok(true) => {}
-                Ok(false) => {
-                    if self.overrun.is_some() {
-                        // `pull` stops at the overrun stage, so `input` may
-                        // still hold bytes nothing will read.
-                        input.clear();
-                        self.done = true;
-                    }
-                    return Ok(None);
+        // The last window is filled only by the `pull` below and emptied by
+        // the `take` after it, in the same call: it is empty on every entry.
+        debug_assert!(self.windows[last].is_empty());
+        match self.pull(last, input) {
+            Ok(true) => {}
+            Ok(false) => {
+                if self.overrun.is_some() {
+                    // `pull` stops at the overrun stage, so `input` may
+                    // still hold bytes nothing will read.
+                    input.clear();
+                    self.done = true;
                 }
-                Err(e) => {
-                    self.error = Some(e.clone());
-                    return Err(e);
-                }
+                return Ok(None);
+            }
+            Err(e) => {
+                self.error = Some(e.clone());
+                return Err(e);
             }
         }
         Ok(Some(self.windows[last].take()))
@@ -476,7 +487,7 @@ impl Stage {
     /// True once the stage was handed input past the end of its stream.
     fn overrun(&self) -> bool {
         match self {
-            Stage::Gzip(s) => s.at == Gz::Ignore,
+            Stage::Gzip(s) => s.overrun(),
             Stage::Deflate(s) => matches!(s, DeflateStage::Overrun),
             Stage::Brotli(s) => s.overrun,
             Stage::Zstd(s) => s.overrun,
@@ -508,12 +519,6 @@ impl Inflater {
         Inflater(inflate::Inflater::new(zlib))
     }
 
-    /// Start a new stream: zlib's `inflateReset` empties the window too
-    /// (`whave = 0`), so the next gzip member cannot copy from this one.
-    fn reset(&mut self) {
-        self.0.reset();
-    }
-
     /// One step: consume from `src`, write at most `dst.len().min(OUT_CAP)`
     /// bytes to `dst`. The bool is true once the stream (and for zlib its
     /// Adler-32) is complete.
@@ -535,241 +540,34 @@ impl Inflater {
 // gzip
 // ---------------------------------------------------------------------------
 
-const FTEXT_RESERVED: u8 = 0xe0;
-const FHCRC: u8 = 0x02;
-const FEXTRA: u8 = 0x04;
-const FNAME: u8 = 0x08;
-const FCOMMENT: u8 = 0x10;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Gz {
-    /// Magic byte 1 (checked together with byte 2, as zlib's NEEDBITS(16)
-    /// does: a lone byte at end of body is truncation, not an error).
-    Id1,
-    Id2,
-    /// CM, checked with FLG.
-    Cm,
-    Flg,
-    /// MTIME (4), XFL (1), OS (1): `n` bytes still to skip.
-    Fixed(u8),
-    XlenLo,
-    XlenHi,
-    Extra(u16),
-    Name,
-    Comment,
-    HcrcLo,
-    HcrcHi,
-    Body,
-    /// `n` of the 8 trailer bytes seen.
-    Trailer(u8),
-    /// A member ended. node_zlib.cc (GUNZIP): more input starting with a
-    /// non-zero byte is read as the next member (so junk is a header error);
-    /// a zero byte ends decoding and everything after it is dropped -- zero
-    /// padding is common. Measured: gzip+00+gzip decodes the first member
-    /// only; gzip+"JUNK" fails; gzip+1f at end of body does not.
-    Between,
-    Ignore,
-}
-
-struct GzipStage {
-    at: Gz,
-    inflate: Inflater,
-    /// CRC32 and size of the member's decoded bytes.
-    crc: Crc,
-    /// CRC32 of the header bytes, for FHCRC.
-    header_crc: Crc,
-    /// ID1 or CM, held for the check on the byte after it.
-    held: u8,
-    flags: u8,
-    xlen: u16,
-    trailer: [u8; 8],
-}
+/// A gzip body, framed by [`inflate::NodeInflate`]: the member framing
+/// node:zlib's gunzip decodes with, so the two cannot drift apart -- header,
+/// raw inflate, CRC32 + ISIZE trailer, following zlib's inflate.c for which
+/// bytes are an error and when, and node_zlib.cc (GUNZIP) for what follows a
+/// member: more input starting with a non-zero byte is read as the next
+/// member (so junk is a header error); a zero byte ends decoding and
+/// everything after it is dropped -- zero padding is common. Measured:
+/// gzip+00+gzip decodes the first member only; gzip+"JUNK" fails; gzip+1f at
+/// end of body does not.
+///
+/// It is stepped and never finished, so running out of input mid-stream is
+/// not an error here: truncation is not one (undici's `finishFlush`).
+struct GzipStage(inflate::NodeInflate);
 
 impl GzipStage {
     fn new() -> GzipStage {
-        GzipStage {
-            at: Gz::Id1,
-            inflate: Inflater::new(false),
-            crc: Crc::new(),
-            header_crc: Crc::new(),
-            held: 0,
-            flags: 0,
-            xlen: 0,
-            trailer: [0; 8],
-        }
+        GzipStage(inflate::NodeInflate::new(inflate::Wrap::Gzip))
     }
 
-    fn next_member(&mut self) {
-        self.at = Gz::Id1;
-        self.inflate.reset();
-        self.crc = Crc::new();
-        self.header_crc = Crc::new();
+    /// True once a zero byte followed a member: the rest is ignored.
+    fn overrun(&self) -> bool {
+        self.0.is_over()
     }
 
     fn run(&mut self, src: &[u8], dst: &mut [u8]) -> Result<Step, DecodeError> {
-        let mut consumed = 0;
-        loop {
-            match self.at {
-                Gz::Ignore => {
-                    return Ok(Step {
-                        consumed: src.len(),
-                        produced: 0,
-                    });
-                }
-                Gz::Body => {
-                    let (step, end) = self.inflate.step(&src[consumed..], dst)?;
-                    consumed += step.consumed;
-                    self.crc.update(&dst[..step.produced]);
-                    if end {
-                        self.at = Gz::Trailer(0);
-                    }
-                    if step.produced > 0 || !end {
-                        return Ok(Step {
-                            consumed,
-                            produced: step.produced,
-                        });
-                    }
-                }
-                Gz::Between => {
-                    let Some(&b) = src.get(consumed) else { break };
-                    if b == 0 {
-                        self.at = Gz::Ignore;
-                    } else {
-                        self.next_member();
-                    }
-                }
-                _ => {
-                    let Some(&b) = src.get(consumed) else { break };
-                    consumed += 1;
-                    self.byte(b)?;
-                }
-            }
-        }
-        Ok(Step {
-            consumed,
-            produced: 0,
-        })
-    }
-
-    /// One header or trailer byte.
-    fn byte(&mut self, b: u8) -> Result<(), DecodeError> {
-        if !matches!(self.at, Gz::HcrcLo | Gz::HcrcHi | Gz::Trailer(_)) {
-            self.header_crc.update(&[b]);
-        }
-        self.at = match self.at {
-            Gz::Id1 => {
-                self.held = b;
-                Gz::Id2
-            }
-            Gz::Id2 => {
-                if self.held != 0x1f || b != 0x8b {
-                    return Err(DecodeError::zlib("incorrect header check"));
-                }
-                Gz::Cm
-            }
-            Gz::Cm => {
-                self.held = b;
-                Gz::Flg
-            }
-            Gz::Flg => {
-                if self.held != 8 {
-                    return Err(DecodeError::zlib("unknown compression method"));
-                }
-                if b & FTEXT_RESERVED != 0 {
-                    return Err(DecodeError::zlib("unknown header flags set"));
-                }
-                self.flags = b;
-                Gz::Fixed(6)
-            }
-            Gz::Fixed(n) if n > 1 => Gz::Fixed(n - 1),
-            Gz::Fixed(_) if self.flags & FEXTRA != 0 => Gz::XlenLo,
-            Gz::Fixed(_) => self.after_extra(),
-            Gz::XlenLo => {
-                self.xlen = u16::from(b);
-                Gz::XlenHi
-            }
-            Gz::XlenHi => {
-                self.xlen |= u16::from(b) << 8;
-                match self.xlen {
-                    0 => self.after_extra(),
-                    n => Gz::Extra(n),
-                }
-            }
-            Gz::Extra(n) if n > 1 => Gz::Extra(n - 1),
-            Gz::Extra(_) => self.after_extra(),
-            Gz::Name if b != 0 => Gz::Name,
-            Gz::Name => self.after_name(),
-            Gz::Comment if b != 0 => Gz::Comment,
-            Gz::Comment => self.after_comment(),
-            Gz::HcrcLo => {
-                self.held = b;
-                Gz::HcrcHi
-            }
-            Gz::HcrcHi => {
-                let stored = u16::from_le_bytes([self.held, b]);
-                if u32::from(stored) != self.header_crc.sum() & 0xffff {
-                    return Err(DecodeError::zlib("header crc mismatch"));
-                }
-                Gz::Body
-            }
-            Gz::Trailer(n) => {
-                self.trailer[usize::from(n)] = b;
-                match n + 1 {
-                    // zlib checks CRC32 as soon as its 4 bytes are in, before
-                    // ISIZE has arrived (inflate.c CHECK then LENGTH).
-                    4 => {
-                        let stored = u32::from_le_bytes([
-                            self.trailer[0],
-                            self.trailer[1],
-                            self.trailer[2],
-                            self.trailer[3],
-                        ]);
-                        if stored != self.crc.sum() {
-                            return Err(DecodeError::zlib("incorrect data check"));
-                        }
-                        Gz::Trailer(4)
-                    }
-                    8 => {
-                        let stored = u32::from_le_bytes([
-                            self.trailer[4],
-                            self.trailer[5],
-                            self.trailer[6],
-                            self.trailer[7],
-                        ]);
-                        if stored != self.crc.amount() {
-                            return Err(DecodeError::zlib("incorrect length check"));
-                        }
-                        Gz::Between
-                    }
-                    n => Gz::Trailer(n),
-                }
-            }
-            Gz::Body | Gz::Between | Gz::Ignore => unreachable!("not a header byte state"),
-        };
-        Ok(())
-    }
-
-    fn after_extra(&self) -> Gz {
-        if self.flags & FNAME != 0 {
-            Gz::Name
-        } else {
-            self.after_name()
-        }
-    }
-
-    fn after_name(&self) -> Gz {
-        if self.flags & FCOMMENT != 0 {
-            Gz::Comment
-        } else {
-            self.after_comment()
-        }
-    }
-
-    fn after_comment(&self) -> Gz {
-        if self.flags & FHCRC != 0 {
-            Gz::HcrcLo
-        } else {
-            Gz::Body
+        match self.0.step(src, dst) {
+            Ok((consumed, produced)) => Ok(Step { consumed, produced }),
+            Err(error) => Err(DecodeError::from_zlib(error)),
         }
     }
 }
@@ -992,8 +790,14 @@ impl ZstdStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::{Compress, Compression, FlushCompress};
+    use flate2::{Compress, Compression, Crc, FlushCompress};
     use std::io::Write;
+
+    /// The gzip header's FLG bits (RFC 1952), for the members built by hand.
+    const FHCRC: u8 = 0x02;
+    const FEXTRA: u8 = 0x04;
+    const FNAME: u8 = 0x08;
+    const FCOMMENT: u8 = 0x10;
 
     // -- plan ---------------------------------------------------------------
 

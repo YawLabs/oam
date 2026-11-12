@@ -36,7 +36,6 @@ pub use super::connector::TlsSource;
 use super::connector::{HandshakeFailed, NoProtocolsAvailable};
 use super::redirect::Rules;
 use super::tls_config::{Alpn, TlsRange};
-use std::sync::atomic::AtomicU8;
 
 /// The proxy rules a transport applies to its pooled requests.
 pub enum ProxySource {
@@ -112,7 +111,6 @@ impl HttpTransport {
             tls: options.tls,
             proxy,
             user_agent: options.user_agent,
-            tls_range: AtomicU8::new(TlsRange::Both.code()),
         });
         let pool = Pool::pooled(OamConnector {
             shared: shared.clone(),
@@ -283,9 +281,6 @@ impl HttpTransport {
         request: http::Request<ReqBody>,
         follows: Option<Rules>,
     ) -> Result<http::Response<Incoming>, SendError> {
-        // Every route's connector handshakes through the shared state, so
-        // the request's version range goes there whichever pool sends it.
-        self.shared.set_tls_range(route.tls_range);
         let mut pin = None;
         let pool = match (&route.hooked, &route.supplied) {
             (Some(hooked), _) => {
@@ -310,23 +305,18 @@ impl HttpTransport {
         // connection carries every stream and no Connection header). A
         // response that itself says `close` is not re-parked either, inside
         // the pool.
-        let close_requested = request
-            .headers()
-            .get_all(http::header::CONNECTION)
-            .iter()
-            .any(|value| {
-                value.to_str().is_ok_and(|value| {
-                    value
-                        .split(',')
-                        .any(|token| token.trim().eq_ignore_ascii_case("close"))
-                })
-            });
+        let close_requested = super::pool::says_close(request.headers());
+        // The route's version range rides on the dial, so a hop that opens
+        // an https connection handshakes in this request's range whatever
+        // other requests the transport is sending (and whichever scheme the
+        // fetch started on).
         let dial = Dial {
             connect_timeout: route.connect_timeout,
             alpn: route.alpn,
             attempt_timeout: route.attempt_timeout,
             pin,
             dns_order: route.dns_order,
+            tls_range: route.tls_range,
         };
         pool.request(request, close_requested, dial, follows)
             .await

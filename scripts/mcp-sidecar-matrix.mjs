@@ -50,7 +50,11 @@
 // process tree under the sidecar before tearing it down, and a direct child
 // still running afterwards is a leak, adjudicated against the node control like
 // everything else. node's libuv puts every child in a kill-on-close job object
-// on Windows, so node never leaves one behind.
+// on Windows, so node never leaves one behind. A sidecar that exited by itself
+// before teardown is read too where the table can still say whose a process
+// was (Windows); elsewhere its orphans are re-parented at once, and the row
+// says the tree was not checked rather than that nothing was left. An
+// interrupted run ends the sidecar being probed, tree and all, before it dies.
 //
 // Runs on NODE, deliberately: it is testing oam, and a harness hosted on the
 // runtime under test turns "oam is broken" into "the harness is broken". The
@@ -72,8 +76,12 @@
 // Exit code is the gate: 0 when every selected sidecar answered its tool call
 // on oam; 1 when oam failed one; 3 when the matrix could not answer for one
 // (install failure, an install still damaged after a rebuild, broken
-// upstream, demoted fixture); 2 for bad usage, or when another run has held
-// the shared stage for longer than this one will wait. An interrupt (Ctrl-C,
+// upstream, demoted fixture); 2 for bad usage (an argument or an --only name
+// it does not know), or when the run could not start at all -- oam is not
+// runnable, another run has held the shared stage for longer than this one
+// will wait, or the fixture directory cannot be cleared. A 2 probed nothing
+// and writes no report, which is how release-local.sh tells it from a 3 and
+// stops the release on it. An interrupt (Ctrl-C,
 // Ctrl-Break, SIGTERM, SIGHUP) ends npm first; then the matrix dies of the
 // signal (on Windows, exits STATUS_CONTROL_C_EXIT), so a calling script sees
 // an interrupt -- which release-local.sh treats as fatal. The --json report is
@@ -534,9 +542,10 @@ const BROKER_META_TOOLS = [
 // SKIP naming the script (binFor): a PASS on a tree whose install differs from
 // what users get could hide an untested native path. Matched exactly on name,
 // event and script text -- not on version -- so a changed script needs a fresh
-// look. On 2026-09-30 this one script was the only one in the nine sidecars'
+// look. On 2026-09-30 puppeteer's was the only one in the then nine sidecars'
 // 221 installed packages, and it did nothing under PUPPETEER_SKIP_DOWNLOAD=1;
-// the trees installed with and without scripts were byte-identical.
+// the trees installed with and without scripts were byte-identical. Entries
+// added since carry their own reason in `why`.
 const REVIEWED_INSTALL_SCRIPTS = [
   {
     name: "puppeteer",
@@ -680,6 +689,9 @@ async function npmInstall(specs, { run = runBounded, wipe = wipeStageModules, ex
 // matrix (endRun).
 const inFlight = new Set();
 let ending = false;
+// The sidecars probe has running, for the same interrupt: endRun ends them
+// and everything under them before the matrix dies.
+const probing = new Set();
 
 /** Run a command to completion, or -- once `timeoutMs` passes -- kill it and
  *  every process still under it (killTree). Resolves to spawnSync's result
@@ -780,7 +792,9 @@ const INTERRUPTS = ["SIGINT", "SIGTERM", "SIGHUP", ...(process.platform === "win
  *  (npmInstall) -- renamed only: deleting it is the next run's startup sweep,
  *  so the exit does not wait on a delete of a whole tree, which takes
  *  seconds. Then the stage lock is released and the matrix dies of
- *  the interrupt (dieOf). With nothing in flight, or on a second interrupt, it
+ *  the interrupt (dieOf). A sidecar being probed at that moment is killed the
+ *  same way first, with everything under it, and nothing is renamed for it.
+ *  With nothing in flight, or on a second interrupt, it
  *  does that at once; a second interrupt during the rename's retries leaves
  *  what is there to the next run's damage check.
  *
@@ -800,8 +814,14 @@ async function endRun(
   } = {},
 ) {
   const running = [...inFlight];
+  const sidecars = [...probing];
   const again = ending;
   ending = true;
+  // A sidecar mid-probe goes first, tree and all: left to notice its stdin
+  // closing, it and whatever it started (a browser, holding its profile under
+  // the stage) outlived the matrix. Nothing of the install is moved aside for
+  // it -- a probe writes nothing into node_modules.
+  if (!again) for (const child of sidecars) await kill(child.pid);
   if (!again && running.length > 0) {
     for (const child of running) await kill(child.pid);
     note(`\n  ${signal}: ended the npm install in flight; moving what it half-wrote aside\n`);
@@ -922,7 +942,7 @@ function refusedReason(stderr) {
 async function installAll(pkgs, install = npmInstall, note = (line) => process.stderr.write(line)) {
   const batch = await install(pkgs.map((p) => `${p}@latest`));
   if (!batch) return new Map();
-  // One bad package must not take the other six down with it. Install each on
+  // One bad package must not take the others down with it. Install each on
   // its own to find out WHICH one npm rejected.
   note(`  batch install failed (${batch}); retrying one by one\n`);
   const failed = new Map();
@@ -1067,13 +1087,21 @@ const SWEEP_ATTEMPTS = 3;
 // how old a lock must be before it is taken over whatever its pid says -- a
 // pid can be reused by an unrelated process after a crash. The stale age has
 // to outlast the longest run there can be, or a live run's lock is taken over:
-// every install and every probe running out its time is about three and a half
-// hours -- up to 22 installs of 300s (a batch, one by one, the survivors
-// together, and all of it again after a rebuild), each timeout followed by a
-// tree kill, and two probes per sidecar of up to about five minutes each. The
-// self-test works it out from the constants and holds the stale age above it.
+// every install and every probe running out its time -- an install of 300s for
+// the batch, one per sidecar and one for the survivors together, all of it
+// again after a rebuild, each timeout followed by a tree kill, and two probes
+// per sidecar of up to about five minutes each. No figure is quoted here: it
+// grows with the table, and the self-test works it out from the table and the
+// constants and holds the stale age above it.
 const LOCK_WAIT_MS = 15 * 60_000;
 const LOCK_STALE_MS = 6 * 60 * 60_000;
+// How long a lock file may exist with no pid in it and still be a lock that is
+// being TAKEN: an exclusive create and the write of its content are two steps,
+// and a run that reads between them sees an empty file.
+const LOCK_UNWRITTEN_MS = 5_000;
+// How old a takeover marker (lockStage) must be before it is somebody's
+// leftover: holding one spans two reads and a delete.
+const LOCK_TAKEOVER_STALE_MS = 30_000;
 // Release the stage lock this run holds, if it still holds it; set by
 // lockStage once the lock is taken.
 let releaseLock = () => {};
@@ -1095,6 +1123,58 @@ function pidAlive(pid) {
   }
 }
 
+/** Whether a lock file with this content and age is one still being taken: no
+ *  pid in it yet, and too young to be a leftover. The age is taken either way
+ *  round, so an mtime ahead of the clock is not "young" for ever. */
+function lockUnwritten(held, ageMs) {
+  return !Number.isInteger(Number.parseInt(held, 10)) && Math.abs(ageMs) < LOCK_UNWRITTEN_MS;
+}
+
+/** Remove the stage lock just judged stale, if it is still the lock that was
+ *  judged (`held`, its content then). True when this call did the judging's
+ *  work -- the lock is gone or is somebody else's by now -- and false when
+ *  another waiter is taking over and this one should look again.
+ *
+ *  Read-compare-delete is three steps, and two waiters that judged the same
+ *  dead lock could interleave them: one deletes it and creates its own, the
+ *  other then deletes THAT. So the three steps run only under a marker file
+ *  created exclusively beside the lock: whoever holds the marker re-reads the
+ *  lock, and a lock created since has another pid in it and is left alone. A
+ *  marker whose holder died inside those steps is cleared once it is older
+ *  than they can take. A marker that cannot be created at all (the stage is
+ *  not writable that way) falls back to the bare compare-and-delete.
+ *  `io` is a seam for the self-test; production passes nothing. */
+function takeOverLock(lock, held, io = { writeFileSync, readFileSync, rmSync, statSync }) {
+  const marker = `${lock}.takeover`;
+  let marked = true;
+  try {
+    io.writeFileSync(marker, `${process.pid}\n`, { flag: "wx" });
+  } catch (e) {
+    if (e.code === "EEXIST") {
+      try {
+        if (Date.now() - io.statSync(marker).mtimeMs > LOCK_TAKEOVER_STALE_MS) io.rmSync(marker, { force: true });
+      } catch {
+        // Released between the create and the stat.
+      }
+      return false;
+    }
+    marked = false;
+  }
+  try {
+    if (io.readFileSync(lock, "utf8") === held) io.rmSync(lock, { force: true });
+  } catch {
+    // Gone already.
+  }
+  if (marked) {
+    try {
+      io.rmSync(marker, { force: true });
+    } catch {
+      // Left for the age check above to clear.
+    }
+  }
+  return true;
+}
+
 /** Hold the shared stage for the whole run: null once held, or why it could
  *  not be. Every run on the box shares one stage, and two at once had npm
  *  installing into one prefix concurrently -- a demonstrated way to leave the
@@ -1105,7 +1185,8 @@ function pidAlive(pid) {
  *  before an interrupt's death, which runs no exit handler on POSIX. A kill
  *  that runs no exit handler (taskkill, SIGKILL, a crash) leaves it behind, so
  *  a lock whose holder is gone, or that is older than any run, is taken over
- *  (lockVerdict); a live one is waited for, up to LOCK_WAIT_MS. */
+ *  (lockVerdict, takeOverLock); a live one is waited for, up to LOCK_WAIT_MS,
+ *  and one with no pid in it yet is a run mid-take (lockUnwritten). */
 async function lockStage(lock) {
   const mine = `${process.pid}\n`;
   const deadline = Date.now() + LOCK_WAIT_MS;
@@ -1133,13 +1214,24 @@ async function lockStage(lock) {
     } catch {
       continue; // released between the create and the read
     }
+    // A lock another run is this moment taking: created, pid not yet written.
+    // Read as "no holder" it would be judged stale and deleted from under
+    // the run that owns it.
+    if (lockUnwritten(held, ageMs)) {
+      await sleep(50);
+      continue;
+    }
     const holder = Number.parseInt(held, 10);
     if (lockVerdict({ holderAlive: pidAlive(holder), ageMs }) === "stale") {
-      // Only the lock just judged: another run may have taken it over since.
-      try {
-        if (readFileSync(lock, "utf8") === held) rmSync(lock, { force: true });
-      } catch {
-        // Gone already.
+      // Not taken over this turn (another waiter is at it): look again shortly
+      // rather than spin.
+      if (!takeOverLock(lock, held)) {
+        // Bounded like every other wait here: a marker that is never released
+        // and cannot be cleared must not hold this run for ever.
+        if (Date.now() > deadline) {
+          return `the stage lock ${lock} is stale, but its takeover marker (${lock}.takeover) has been held for over ${LOCK_WAIT_MS / 60_000} minutes -- remove it and re-run`;
+        }
+        await sleep(50);
       }
       continue;
     }
@@ -1261,8 +1353,18 @@ function nodePinFor(pin) {
  *  a real oam regression reads as upstream. Pure, and out of the run loop, so
  *  the self-test can hold that split. */
 function armEnv(host, s, call, ctx, nodePin, inherited) {
+  // The box's own copies of the launcher's switches decide nothing on either
+  // arm, whatever the row's envPrefixes happen to cover: the names come from
+  // the launcher's source (launcherRuntimeVars) because they get renamed, and
+  // a switch outside its row's prefixes, exported as `node` on the box, would
+  // otherwise hand the oam arm to node. Case-insensitively, as sidecarEnv.
+  const switches = new Set(Object.keys(nodePin).map((k) => k.toUpperCase()));
+  const unswitched =
+    switches.size === 0
+      ? inherited
+      : Object.fromEntries(Object.entries(inherited).filter(([k]) => !switches.has(k.toUpperCase())));
   return sidecarEnv(
-    inherited,
+    unswitched,
     s.envPrefixes ?? [],
     s.isolateHome ? homeEnv(ctx.profileDir) : {},
     s.env ?? {},
@@ -1434,6 +1536,40 @@ function classifyLeaks(verdict, oamLeft, nodeLeft) {
  *  assertion never run (fixed in 94d3792). */
 function uncalledVerdict(s, unmet) {
   return s.bootOnly ? { state: "boot", why: s.bootOnly } : { state: "demoted", why: unmet };
+}
+
+/** Adjudicate a tool missing from oam's tools/list against the node control.
+ *  `oam` is a probe that came back `stale` (it names the tool in `missing`);
+ *  `control` is the node arm's probe of the same row. The oam arm's list alone
+ *  cannot say whose the gap is: a sidecar that renamed a tool drops it on both
+ *  runtimes, and a tool that fails to register only under oam drops it on one.
+ *    - node lists it: the sidecar still has the tool, so the gap is oam's.
+ *    - node lacks it too: the matrix is asserting against a tool that is gone.
+ *    - node could not be asked (its probe failed, or `refused` says this box's
+ *      node is one the sidecar does not support): no evidence, and as with
+ *      classifyCall's probeFailed, nothing exonerates oam. */
+function staleVerdict(oam, control, refused = null) {
+  const because = refused ? ` (${refused})` : "";
+  if (!control.ok) {
+    return {
+      state: "fail",
+      why: `oam's tools/list has no ${oam.missing}; the node control could not probe (${control.why}${because}), so nothing exonerates oam`,
+    };
+  }
+  const nodeTools = control.tools ?? [];
+  if (nodeTools.includes(oam.missing)) {
+    return {
+      state: "fail",
+      why: `oam's tools/list has no ${oam.missing} (${oam.tools.length} tools served); the node control still advertises it (${nodeTools.length} tools served), so this is oam`,
+    };
+  }
+  if (refused) {
+    return {
+      state: "fail",
+      why: `oam's tools/list has no ${oam.missing}; the node control lacks it too, but ran outside the sidecar's supported node${because}, so nothing exonerates oam`,
+    };
+  }
+  return { state: "upstream", why: oam.call.why };
 }
 
 /** The node control's evidence about the call, as classifyCall reads it. A
@@ -1698,7 +1834,8 @@ function resolveInstalled(from, name, readManifest = readManifestAt) {
  *
  *  Every installed package is walked, optional ones included, since one that
  *  is there must be whole. A missing root is not this function's to report:
- *  resolveBin already says the package is not on disk. `readManifest` and
+ *  resolveBin already says the package is not on disk, or that its manifest
+ *  does not parse (it reads it the same way). `readManifest` and
  *  `exists` are injectable for the self-test. */
 function installProblems(root, readManifest = readManifestAt, exists = existsSync) {
   const top = readManifest(root);
@@ -1903,16 +2040,18 @@ function respReply(argv) {
 // uncalledVerdict, controlVerdict, binFor) so they can be held, and one case
 // pins the loop's calls to them at the source. So is the install the loop
 // runs over: settleInstall checks it whole, and rebuilds it once, before
-// anything is probed. Five cases spawn, all on node's own `-e`. Two run
-// stand-in sidecars, because what they hold is probe's to report: the depth
-// classifyBoot compares, and a control's stderr, including a refusal printed
-// by a detached child after its parent exited (that child exits by itself).
-// The third runs a stand-in install -- a node, and a child of its, under a
+// anything is probed. A handful of cases spawn, all on node's own `-e`. Three
+// run stand-in sidecars, because what they hold is probe's to report: an
+// initialize refused with an error, the depth classifyBoot compares, and a
+// control's stderr, including a refusal printed by a detached child after its
+// parent exited (that child exits by itself). On Windows a probe's teardown
+// also asks PowerShell for the process table, as a real run does.
+// Another runs a stand-in install -- a node, and a child of its, under a
 // shell -- and lets it time out, because the timeout must end both, not just
 // the shell; it waits out that 5s bound, which is most of the self-test's run
-// time. The fourth interrupts a stand-in install, which must die before the
+// time. Another interrupts a stand-in install, which must die before the
 // matrix does, and has a node die of the interrupt the way the matrix does.
-// The fifth hands npm's arguments to a node spawned the way npm is, which must
+// The last hands npm's arguments to a node spawned the way npm is, which must
 // get each quoted path whole. No network, npm or oam, and no disk beyond
 // reading this file. scripts/ci-local.sh runs all of it (step 13).
 
@@ -2230,21 +2369,34 @@ async function selfTest() {
     },
     {
       name: "an initialize ERROR is diagnosed at once, not waited out",
-      run() {
+      async run() {
         // The dispatcher used to match only `id === 1 && result`, so an error
         // reply fell through and the probe sat out the full 90s boot timeout
-        // before reporting the WRONG phase.
-        const line = JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          error: { code: -32602, message: "Unsupported protocol version: 2024-11-05" },
-        });
-        const msg = JSON.parse(line);
+        // before reporting the WRONG phase. Held by running probe itself
+        // against a stand-in that refuses initialize and then stays up: with
+        // the dispatcher's branch gone, this waits out the boot timeout and
+        // reports "no tools/list response".
+        const refuser = [
+          'let buf = "";',
+          'process.stdin.on("data", (d) => {',
+          "  buf += d;",
+          '  const lines = buf.split("\\n");',
+          "  buf = lines.pop();",
+          "  for (const line of lines) {",
+          "    if (!line.trim()) continue;",
+          "    const m = JSON.parse(line);",
+          '    if (m.method === "initialize") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, error: { code: -32602, message: "Unsupported protocol version: 2024-11-05" } }) + "\\n");',
+          "  }",
+          "});",
+        ].join("\n");
+        const started = Date.now();
+        const refused = await probe("node", "-e", { env: { ...process.env, NO_COLOR: "1" }, scriptArgs: [refuser], call: null, ctx: {} });
         assertDeep(
-          msg.id === 1 && Boolean(msg.error),
-          true,
-          "the shape the dispatcher must recognize before it can report it",
+          [refused.ok, refused.why, refused.depth],
+          [false, "initialize error: Unsupported protocol version: 2024-11-05", 0],
+          "an error reply to initialize is the verdict, in the server's own words",
         );
+        assertDeep(Date.now() - started < BOOT_TIMEOUT_MS, true, "and it is reported when it arrives, not after the boot timeout");
       },
     },
     {
@@ -2442,7 +2594,7 @@ async function selfTest() {
     {
       name: "a failure mid-call is not excused by a control that never booted",
       async run() {
-        // One of the five cases that spawn: the depth classifyBoot compares is probe's
+        // One of the cases that spawn: the depth classifyBoot compares is probe's
         // to report, so probe itself is run, against the stand-in above. The
         // call has a setup step, like puppeteer's navigate before evaluate:
         // depth has to count steps, or oam dying on the setup and node dying on
@@ -2501,6 +2653,24 @@ async function selfTest() {
           "FETCH_MCP_RUNTIME" in oamEnv,
           false,
           "the oam arm is never handed off to node, and the box's own setting is scrubbed",
+        );
+        // That scrub must not lean on the row's envPrefixes covering the
+        // switch (FETCH_MCP_ happens to): a launcher whose switch sits outside
+        // its row's prefixes, on a box that exports it, is scrubbed by name.
+        const bare = { envPrefixes: [] };
+        const elsewherePin = nodePinFor({ launcher: true, vars: ["ELSEWHERE_RUNTIME"] });
+        const exported = { PATH: "/bin", ELSEWHERE_RUNTIME: "node", elsewhere_runtime: "node" };
+        const bareOam = armEnv("oam", bare, null, ctx("oam"), elsewherePin, exported);
+        const bareNode = armEnv("node", bare, null, ctx("node"), elsewherePin, exported);
+        assertDeep(
+          [Object.keys(bareOam).filter((k) => /runtime/i.test(k)), bareOam.PATH],
+          [[], "/bin"],
+          "a switch no prefix covers is still scrubbed from the oam arm, in any case, and nothing else is",
+        );
+        assertDeep(
+          Object.entries(bareNode).filter(([k]) => /runtime/i.test(k)),
+          [["ELSEWHERE_RUNTIME", "node"]],
+          "and the node arm carries the pin alone, not the box's copies beside it",
         );
         for (const [k, v] of Object.entries(fetch.call.env(ctx("oam")))) {
           assertDeep([oamEnv[k], nodeEnv[k]], [v, v], `the call's ${k} reaches both arms, over the box's own value`);
@@ -2625,6 +2795,37 @@ async function selfTest() {
       },
     },
     {
+      name: "a tool missing from oam's tools/list is upstream only when the node control lacks it too",
+      run() {
+        const oam = {
+          ok: true,
+          tools: ["http_post"],
+          stale: true,
+          missing: "http_get",
+          call: { ok: false, why: "no longer advertises http_get (it serves 1 other tools) -- pick a new tool for the matrix" },
+        };
+        assertDeep(
+          staleVerdict(oam, { ok: true, tools: ["http_post"], stale: true, missing: "http_get" }),
+          { state: "upstream", why: oam.call.why },
+          "gone on both runtimes: the matrix needs a new tool, and the sentence says so",
+        );
+        const oams = staleVerdict(oam, { ok: true, tools: ["http_get", "http_post"], call: { ok: true, text: "t" } });
+        assertDeep(oams.state, "fail", "node still lists the tool, so the gap is oam's");
+        assertDeep(oams.why.includes("the node control still advertises it"), true, "and the row says what the control showed");
+        assertDeep(exitCodeFor([oams]), 1, "which fails the run instead of asking for a new tool");
+        assertDeep(
+          staleVerdict(oam, { ok: false, why: "exited early (code 1) awaiting tools/list", depth: 0 }).state,
+          "fail",
+          "a control that could not be asked exonerates nothing",
+        );
+        assertDeep(
+          staleVerdict(oam, { ok: true, tools: ["http_post"], stale: true, missing: "http_get" }, "engines.node >=24 excludes this box's node").state,
+          "fail",
+          "nor does one that ran on a node the sidecar does not support",
+        );
+      },
+    },
+    {
       name: "the fetch call holds a 200 to the fixture's own body",
       run() {
         const { expect } = SIDECARS.find((s) => s.name === "fetch").call;
@@ -2680,6 +2881,9 @@ async function selfTest() {
           ["const refused = nodeHostRefusal(bin.engines, process.versions.node, control.stderr);", 2],
           ["classifyBoot(oam, control, refused)", 1],
           ["const nodeVerdict = controlVerdict(control, refused);", 1],
+          // A tool oam's tools/list lacks is put to the control like any other
+          // verdict, not filed as upstream on the oam arm's word alone.
+          ["staleVerdict(oam, control, refused)", 1],
           ["classifyCall(oam.call, nodeVerdict,", 1],
           // Every row's bin, a damaged install's SKIP included, comes from binFor.
           ["const bin = binFor(s.pkg, installErrors, damaged, rebuilt, resolveBin);", 1],
@@ -2732,6 +2936,14 @@ async function selfTest() {
           ].filter((needle) => at < 0 || !resolveBinBody.includes(needle)),
           [],
           "resolveBin hands the loop the engines ranges and the install scripts of each sidecar's whole installed tree",
+        );
+        // And it reads the root manifest through the tolerant reader, so one
+        // that does not parse is a SKIP row: a bare JSON.parse there threw out
+        // of the run loop, ending the run with no report.
+        assertDeep(
+          [resolveBinBody.includes("const manifest = readManifestAt(dir);"), resolveBinBody.includes("JSON.parse(")],
+          [true, false],
+          "resolveBin reads the root package.json as installProblems does, and a manifest that does not parse is its row's error",
         );
         // npm runs through runBounded, whose timeout ends npm and every process
         // under it. A spawnSync back in its place would bring back the orphan:
@@ -3127,6 +3339,69 @@ async function selfTest() {
           ],
           ["stale", "wait", "stale"],
           "a dead or ancient lock is taken over; a live one is waited for",
+        );
+        // A lock exists before its pid is written. Read then, it has no
+        // holder, and must not be judged dead while it is that young.
+        assertDeep(
+          [
+            lockUnwritten("", 10),
+            lockUnwritten("", -10),
+            lockUnwritten("", LOCK_UNWRITTEN_MS + 1),
+            lockUnwritten("not a pid\n", 10),
+            lockUnwritten(`${process.pid}\n`, 10),
+          ],
+          [true, true, false, true, false],
+          "a lock with no pid in it yet is a run taking it, until it is too old to be",
+        );
+        // The takeover, over a recorded file table: only the lock that was
+        // judged is removed, and only by the one waiter holding the marker.
+        const lockPath = join("stage", ".matrix.lock");
+        const markerPath = `${lockPath}.takeover`;
+        const table = (entries, markerAgeMs = 0) => {
+          const files = new Map(entries);
+          const gone = () => Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+          return {
+            files,
+            io: {
+              writeFileSync(p, text, { flag }) {
+                if (flag === "wx" && files.has(p)) throw Object.assign(new Error("EEXIST"), { code: "EEXIST" });
+                files.set(p, text);
+              },
+              readFileSync(p) {
+                if (!files.has(p)) throw gone();
+                return files.get(p);
+              },
+              rmSync: (p) => files.delete(p),
+              statSync(p) {
+                if (!files.has(p)) throw gone();
+                return { mtimeMs: Date.now() - markerAgeMs };
+              },
+            },
+          };
+        };
+        const judged = table([[lockPath, "111\n"]]);
+        assertDeep(
+          [takeOverLock(lockPath, "111\n", judged.io), [...judged.files.keys()]],
+          [true, []],
+          "the lock that was judged stale is removed, and the marker with it",
+        );
+        const retaken = table([[lockPath, "222\n"]]);
+        assertDeep(
+          [takeOverLock(lockPath, "111\n", retaken.io), [...retaken.files]],
+          [true, [[lockPath, "222\n"]]],
+          "a lock another run created since the judgement is left alone",
+        );
+        const contended = table([[lockPath, "111\n"], [markerPath, "333\n"]]);
+        assertDeep(
+          [takeOverLock(lockPath, "111\n", contended.io), [...contended.files.keys()]],
+          [false, [lockPath, markerPath]],
+          "while another waiter holds the marker, this one removes nothing",
+        );
+        const leftover = table([[lockPath, "111\n"], [markerPath, "333\n"]], LOCK_TAKEOVER_STALE_MS + 1);
+        assertDeep(
+          [takeOverLock(lockPath, "111\n", leftover.io), [...leftover.files.keys()]],
+          [false, [lockPath]],
+          "a marker older than a takeover can last is cleared, for the next look to take",
         );
         // And "ancient" is older than any live run: every install and every
         // probe running out its time. installAll makes a batch install, one per
@@ -3538,6 +3813,7 @@ async function selfTest() {
         let started = 0;
         let steps1 = [];
         let idle = [];
+        let midProbe = [];
         // `ending` is the whole module's: every later case needs runBounded
         // back, so it is reset however this one ends.
         try {
@@ -3575,6 +3851,18 @@ async function selfTest() {
           ending = false;
           await endRun("SIGINT", seams);
           idle = steps.splice(0);
+          // A sidecar being probed when the interrupt lands is ended too,
+          // and nothing of the install is moved aside for it. The stand-in
+          // is a record, and so is its kill: there is no process behind it.
+          ending = false;
+          const sidecar = { pid: "sidecar-pid" };
+          probing.add(sidecar);
+          try {
+            await endRun("SIGINT", { ...seams, kill: async (p) => steps.push(`kill ${p}`) });
+          } finally {
+            probing.delete(sidecar);
+          }
+          midProbe = steps.splice(0);
         } finally {
           ending = false;
           for (const child of children) if (child.exitCode === null && child.signalCode === null) await killTree(child.pid);
@@ -3590,6 +3878,11 @@ async function selfTest() {
           "its half-written tree is moved aside only once it is dead, then the lock is released and the matrix dies -- and a second interrupt does that at once",
         );
         assertDeep(idle, ["release", "die SIGINT"], "an interrupt between installs releases the lock and dies at once, and moves nothing");
+        assertDeep(
+          midProbe,
+          ["kill sidecar-pid", "release", "die SIGINT"],
+          "an interrupt mid-probe ends the sidecar's tree before the matrix dies, and moves nothing aside",
+        );
         // And the death is an interrupt's, in a process of its own: dieOf must
         // end it the way a Ctrl-C does -- STATUS_CONTROL_C_EXIT on Windows,
         // the signal elsewhere -- never with an exit a calling shell could
@@ -3606,6 +3899,36 @@ async function selfTest() {
           [died.status, died.signal],
           process.platform === "win32" ? [0xc000013a, null] : [null, "SIGINT"],
           "the matrix dies of the interrupt, so a calling script stops too",
+        );
+      },
+    },
+    {
+      name: "a command line the matrix does not understand is refused, never run as something else",
+      run() {
+        const names = ["fetch", "memory"];
+        assertDeep(parseArgs([], names), { only: null, jsonPath: null, list: false, selfTest: false }, "no arguments: every sidecar, no report");
+        assertDeep(
+          parseArgs(["--only=fetch,memory", "--json=r.json"], names),
+          { only: ["fetch", "memory"], jsonPath: "r.json", list: false, selfTest: false },
+          "the documented forms are read as written",
+        );
+        assertDeep([parseArgs(["--list"], names).list, parseArgs(["--self-test"], names).selfTest], [true, true], "and so are the two that run nothing");
+        assertDeep(
+          [
+            ["--selftest"],
+            ["--json", "report.json"],
+            ["--only=fetch,memroy"],
+            ["--only="],
+            ["--json="],
+            ["fetch"],
+          ].map((args) => typeof parseArgs(args, names).error),
+          ["string", "string", "string", "string", "string", "string"],
+          "a mistyped flag, a flag given its value as a separate word, an unknown or absent sidecar name and a bare word are each an error",
+        );
+        assertDeep(
+          /memroy/.test(parseArgs(["--only=fetch,memroy"], names).error) && !/\bfetch\b/.test(parseArgs(["--only=fetch,memroy"], names).error),
+          true,
+          "and the error names the name that matched nothing, not the one that did",
         );
       },
     },
@@ -3686,7 +4009,13 @@ function resolveBin(pkg) {
   const dir = join(stage, "node_modules", ...pkg.split("/"));
   const manifestPath = join(dir, "package.json");
   if (!existsSync(manifestPath)) return { error: `not on disk after install: ${dir}` };
-  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  // Read as installProblems reads it (BOM dropped, null when it does not
+  // parse): a manifest an install left half-written is this row's SKIP, not an
+  // uncaught SyntaxError that ends the whole run with no report.
+  const manifest = readManifestAt(dir);
+  if (manifest === null || typeof manifest !== "object") {
+    return { error: `its package.json does not parse (a half-written install?): ${manifestPath}` };
+  }
   const bin = manifest.bin;
   const rel = typeof bin === "string" ? bin : bin && Object.values(bin)[0];
   if (!rel) return { error: "package.json declares no bin", version: manifest.version };
@@ -3844,7 +4173,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  *  never leaves one; oam, with no job object, always did. Deeper processes are
  *  still cleaned up, just not judged. */
 async function teardown(child) {
-  const tree = child.exitCode === null ? await descendants(child.pid) : [];
+  // A sidecar that already exited by itself -- it crashed mid-call, the
+  // likeliest shape of an oam regression -- is the one most likely to have
+  // left something behind, so "it is gone" is no reason to skip the read.
+  // Windows keeps a dead parent's pid on its children, so the table still
+  // shows them; the pid being live again means it was reused, and what is
+  // under it then is somebody else's. Elsewhere an orphan is re-parented the
+  // moment its parent dies and cannot be attributed, so the tree is unread
+  // (null: not checked), never "nothing left".
+  const gone = child.exitCode !== null || child.signalCode !== null;
+  let tree;
+  // No pid: the spawn itself failed, and nothing ran to leave anything.
+  if (!child.pid) tree = [];
+  else if (!gone) tree = await descendants(child.pid);
+  else if (process.platform === "win32") {
+    tree = await descendants(child.pid);
+    if (tree !== null && isAlive(child.pid)) tree = null;
+  } else tree = null;
   const exited = new Promise((r) => {
     if (child.exitCode !== null || child.signalCode !== null) r();
     else child.once("exit", r);
@@ -3890,7 +4235,11 @@ function probe(host, entry, { env, scriptArgs = [], oamFlags = [], cwd, call = n
   const cmd = host === "oam" ? oamBin : process.execPath;
   const argv = probeArgv(host, entry, scriptArgs, oamFlags);
   return new Promise((resolveP) => {
+    // Once the matrix is being ended nothing starts and nothing settles, as
+    // in runBounded: endRun has already listed what it will kill.
+    if (ending) return;
     const child = spawn(cmd, argv, { stdio: ["pipe", "pipe", "pipe"], env, cwd, windowsHide: true });
+    probing.add(child);
     // 'exit' can fire before the pipe's last stderr chunk is read, and a
     // sidecar that refuses to start prints why and exits at once -- the
     // refusal nodeHostRefusal reads. Resolving waits for stderr to close,
@@ -3919,7 +4268,10 @@ function probe(host, entry, { env, scriptArgs = [], oamFlags = [], cwd, call = n
       const reached = depth;
       teardown(child)
         .then((left) => Promise.race([stderrClosed, sleep(drainMs)]).then(() => left))
-        .then((left) => resolveP({ ...result, depth: reached, left, stderr }));
+        .then((left) => {
+          probing.delete(child);
+          resolveP({ ...result, depth: reached, left, stderr });
+        });
     };
     const wait = (what, ms) => {
       awaiting = what;
@@ -4003,6 +4355,9 @@ function probe(host, entry, { env, scriptArgs = [], oamFlags = [], cwd, call = n
               ok: true,
               tools,
               stale: true,
+              // Named on its own so staleVerdict can ask the control arm's
+              // tools/list about this exact tool.
+              missing,
               call: {
                 ok: false,
                 why: `no longer advertises ${missing} (it serves ${tools.length} other tools) -- pick a new tool for the matrix`,
@@ -4045,6 +4400,36 @@ function probe(host, entry, { env, scriptArgs = [], oamFlags = [], cwd, call = n
       },
     });
   });
+}
+
+/** The matrix's own command line, as `{ only, jsonPath, list, selfTest }` --
+ *  `only` the sidecar names asked for, or null for all of them -- or
+ *  `{ error }` naming what is wrong with it. Anything not understood is an
+ *  error, never dropped: a mistyped `--self-test` used to start a full
+ *  networked run with installs, `--json report.json` one that wrote no
+ *  report, and a mistyped name in `--only=` a run that quietly left that
+ *  sidecar out and could exit 0. `names` is every row's name. Pure, for the
+ *  self-test. */
+function parseArgs(args, names) {
+  const out = { only: null, jsonPath: null, list: false, selfTest: false };
+  for (const a of args) {
+    if (a === "--list") out.list = true;
+    else if (a === "--self-test") out.selfTest = true;
+    else if (a.startsWith("--only=")) {
+      const asked = a.slice("--only=".length).split(",").map((n) => n.trim()).filter(Boolean);
+      if (asked.length === 0) return { error: "--only= names no sidecar; try --list" };
+      const unknown = asked.filter((n) => !names.includes(n));
+      if (unknown.length > 0) return { error: `no sidecar is named ${unknown.join(", ")} (--only); try --list` };
+      out.only = [...(out.only ?? []), ...asked];
+    } else if (a.startsWith("--json=")) {
+      const path = a.slice("--json=".length);
+      if (!path) return { error: "--json= names no file" };
+      out.jsonPath = path;
+    } else {
+      return { error: `unknown argument: ${a}` };
+    }
+  }
+  return out;
 }
 
 /** One arm's argv after its executable. The oam arm is `run [...oamFlags]
@@ -4204,12 +4589,15 @@ function findBrowser() {
 // The run
 // =============================================================================
 
-const argv = process.argv.slice(2);
-const only = (argv.find((a) => a.startsWith("--only=")) ?? "").slice(7);
-const jsonPath = (argv.find((a) => a.startsWith("--json=")) ?? "").slice(7) || null;
-const selected = only ? SIDECARS.filter((s) => only.split(",").includes(s.name)) : SIDECARS;
+const cli = parseArgs(process.argv.slice(2), SIDECARS.map((s) => s.name));
+if (cli.error) {
+  console.error(`${cli.error}\nusage: node scripts/mcp-sidecar-matrix.mjs [--only=<name>[,<name>...]] [--json=<file>] [--list] [--self-test]`);
+  process.exit(2);
+}
+const jsonPath = cli.jsonPath;
+const selected = cli.only ? SIDECARS.filter((s) => cli.only.includes(s.name)) : SIDECARS;
 
-if (argv.includes("--list")) {
+if (cli.list) {
   for (const s of SIDECARS) {
     const what = s.call
       ? `calls ${[...(s.call.before ?? []).map((b) => b.tool), s.call.tool].join(" then ")}`
@@ -4220,11 +4608,7 @@ if (argv.includes("--list")) {
 }
 // Before anything that touches the disk, the network, or oam -- the self-test
 // exists precisely so it can run where none of those are available.
-if (argv.includes("--self-test")) process.exit(await selfTest());
-if (selected.length === 0) {
-  console.error(`no sidecar matches --only=${only}; try --list`);
-  process.exit(2);
-}
+if (cli.selfTest) process.exit(await selfTest());
 
 const oamBin = process.env.OAM_BIN ?? "oam";
 const version = spawnSync(oamBin, ["--version"], { encoding: "utf8" });
@@ -4366,14 +4750,6 @@ for (const s of selected) {
     });
     continue;
   }
-  // A tool the sidecar no longer advertises is answered by neither runtime, so
-  // there is nothing to adjudicate -- and running the control to confirm that
-  // would only spend a spawn to reach the same sentence.
-  if (oam.stale) {
-    record("upstream", oam.call.why, { tools: oam.tools.length, tool: call.tool });
-    continue;
-  }
-
   // The control arm. Run for EVERY invocation, not only failing ones: it is
   // what decides whose bug a red is, and a control taken only after a failure
   // is how "oam broke it" gets asserted first and checked second.
@@ -4387,6 +4763,15 @@ for (const s of selected) {
   // say). A missing control must never exonerate oam -- and neither must one
   // that ran on a node the sidecar does not support, and failed there.
   const refused = nodeHostRefusal(bin.engines, process.versions.node, control.stderr);
+  // A tool missing from oam's tools/list is adjudicated like every other
+  // verdict. The oam arm's list alone used to file it as upstream, on the
+  // unchecked claim that neither runtime answers the tool: a tool that fails
+  // to register only under oam then read as "pick a new tool for the matrix".
+  if (oam.stale) {
+    const v = classifyLeaks(staleVerdict(oam, control, refused), oam.left, control.left);
+    record(v.state, v.why, { note: v.note, tools: oam.tools.length, tool: call.tool });
+    continue;
+  }
   const nodeVerdict = controlVerdict(control, refused);
 
   const v = classifyLeaks(

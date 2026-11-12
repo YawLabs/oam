@@ -66,6 +66,18 @@ xtask = "run --package xtask --"
 # /NODEFAULTLIB only suppresses DEFAULT libraries, so naming libcmt.lib
 # explicitly restores it. Once ada-url moves that directive to a
 # `cargo:rustc-link-arg` (where it belongs), this flag can go.
+#
+# These flags only apply while the environment sets no rustflags of its own
+# -------------------------------------------------------------------------
+# Cargo takes rustflags from ONE source (the four are mutually exclusive, per
+# the cargo reference for `build.rustflags`), and `[target.<triple>] rustflags`
+# is below the environment in that order: if CARGO_ENCODED_RUSTFLAGS or
+# RUSTFLAGS is set -- even to the empty string -- both tables below are
+# ignored whole, the build links the dynamic CRT again, and the two-CRT hazard
+# above is back with nothing but an LNK4098 warning to say so. Never build oam
+# with `RUSTFLAGS=""` or any other env rustflags on Windows; a flag that has
+# to be added goes in these tables. (scripts/lib/ci-ledger.sh keys the gate's
+# ledger on these variables for the same reason.)
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=libcmt.lib"]
 

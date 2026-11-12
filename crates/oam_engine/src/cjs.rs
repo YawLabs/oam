@@ -69,8 +69,11 @@ pub(crate) struct CjsCache {
     /// program that deletes an entry gets a fresh load and one that plants an
     /// entry gets its `exports`, as in node. Created on first use.
     require_cache: Option<v8::Global<v8::Object>>,
-    /// Whether the --trace-require-module warning has been emitted (node
-    /// emits it once per process).
+    /// Whether the --trace-require-module warning has been emitted. Once per
+    /// run of one isolate, not once per process: node keeps the flag in its
+    /// CommonJS loader, which every thread has its own copy of, so a worker
+    /// that require()s an ES module warns again after the main thread did
+    /// (measured on v22.22.2).
     warned_require_module: bool,
 }
 
@@ -149,6 +152,38 @@ fn throw_syntax_error_with_code(scope: &mut v8::PinScope<'_, '_>, code: &str, me
         }
     }
     scope.throw_exception(exception);
+}
+
+/// `resolve_require` for `require()` and `require.resolve()`, throwing what
+/// node throws when it fails; `None` means an exception is pending.
+///
+/// One success is a failure here: a `#name` subpath import whose
+/// package.json `imports` target is a builtin (`"#fs": "fs"`). node's
+/// resolver answers with a `node:` URL, which `import` loads, but its CJS
+/// loader wants a file path and dies turning the URL into one -- a TypeError,
+/// `ERR_INVALID_URL_SCHEME`, "The URL must be of scheme file" (v22.22.2,
+/// `require` and `require.resolve` alike, under any condition).
+fn resolve_require_or_throw(
+    scope: &mut v8::PinScope<'_, '_>,
+    specifier: &str,
+    referrer: &Path,
+) -> Option<PathBuf> {
+    match oam_loader::resolve_require(specifier, referrer) {
+        Ok(path) => {
+            if specifier.starts_with('#') && crate::modules::is_virtual_module(&path) {
+                throw_node_error(scope, "ERR_INVALID_URL_SCHEME", &["file"]);
+                return None;
+            }
+            Some(path)
+        }
+        Err(failure) => {
+            // Node's MODULE_NOT_FOUND (a runtime Error, not ODIF) — the
+            // diagnostic message carries the precise reason, the code
+            // carries what optional-dependency try/catch blocks test.
+            throw_error_with_code(scope, "MODULE_NOT_FOUND", &failure.message);
+            None
+        }
+    }
 }
 
 /// CJS wrapper parameters, in order: node's `Module.wrapper` list exactly
@@ -553,15 +588,8 @@ fn require_callback(
             .unwrap_or_default(),
     );
 
-    let path = match oam_loader::resolve_require(&specifier, &referrer) {
-        Ok(path) => path,
-        Err(failure) => {
-            // Node's MODULE_NOT_FOUND (a runtime Error, not ODIF) — the
-            // diagnostic message carries the precise reason, the code
-            // carries what optional-dependency try/catch blocks test.
-            throw_error_with_code(scope, "MODULE_NOT_FOUND", &failure.message);
-            return;
-        }
+    let Some(path) = resolve_require_or_throw(scope, &specifier, &referrer) else {
+        return;
     };
     // Virtual modules (node:NAME stripped, oam:NAME full) come from the
     // snapshot registry; the registry object is the require() result —
@@ -822,8 +850,9 @@ fn cache_remove(scope: &mut v8::PinScope<'_, '_>, file: &str) {
 }
 
 /// node's `--trace-require-module` (off unless the flag is given): an
-/// ExperimentalWarning, once per process, naming the CommonJS module that
-/// loaded an ES module with require(). With `no-node-modules` a require from
+/// ExperimentalWarning, once per thread (the main thread and each worker
+/// warn once each, as node's do), naming the CommonJS module that loaded an
+/// ES module with require(). With `no-node-modules` a require from
 /// inside node_modules is not reported. The CLI publishes the flag's value as
 /// `__oamTraceRequireModule`.
 fn trace_require_module(scope: &mut v8::PinScope<'_, '_>, parent: &str, key: &Path) {
@@ -871,7 +900,11 @@ fn trace_require_module(scope: &mut v8::PinScope<'_, '_>, parent: &str, key: &Pa
     ) else {
         return;
     };
-    emit.call(scope, process.into(), &[message.into(), kind.into()]);
+    // A throw from a patched emitWarning is not the loader's to report (and
+    // must not be left pending for the require() that follows).
+    v8::tc_scope!(let tc, scope);
+    let _ = emit.call(tc, process.into(), &[message.into(), kind.into()]);
+    tc.reset();
 }
 
 /// Throw node's coded error `code`, built by node_compat.js's own factory
@@ -918,7 +951,11 @@ pub(crate) enum CjsLoad<'s> {
 /// callback position just return; the graph loader converts it via its
 /// TryCatch. Re-entrant: module bodies call require, which lands back here
 /// on the same stack. A file node decides by its syntax that turns out to be
-/// an ES module throws ERR_REQUIRE_ESM, as require() of one does.
+/// an ES module throws ERR_REQUIRE_ESM: this entry point only runs CommonJS.
+/// `require()` itself never gets that error for such a file -- its callback
+/// routes ES modules through `require_esm` and detection through
+/// [`load_cjs_or_detect`] -- so what is left is a caller that asked for a
+/// CommonJS run outright (a host's `execute_cjs`, a worker's CommonJS entry).
 pub(crate) fn load_cjs<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     path: &Path,
@@ -927,7 +964,7 @@ pub(crate) fn load_cjs<'s>(
         CjsLoad::Exports(exports) => Some(exports),
         CjsLoad::Threw => None,
         CjsLoad::Esm => {
-            throw_require_esm(scope, path, None);
+            throw_require_esm(scope, path);
             None
         }
     }
@@ -949,21 +986,46 @@ pub(crate) fn load_cjs_or_detect<'s>(scope: &mut v8::PinScope<'s, '_>, path: &Pa
     }
 }
 
-/// node's ERR_REQUIRE_ESM for `path`, required from `referrer` (or loaded as
-/// CommonJS by oam itself, with none).
-fn throw_require_esm(scope: &mut v8::PinScope<'_, '_>, path: &Path, referrer: Option<&Path>) {
-    let from = referrer
-        .map(|r| format!(" from {}", r.display()))
-        .unwrap_or_default();
+/// An error coded ERR_REQUIRE_ESM for `path`: [`load_cjs`] was asked to run
+/// as CommonJS a file whose syntax makes it an ES module. Not a `require()`
+/// refusal (see [`load_cjs`]), so the text names what happened instead of
+/// claiming require() of an ES module is unsupported.
+fn throw_require_esm(scope: &mut v8::PinScope<'_, '_>, path: &Path) {
     throw_error_with_code(
         scope,
         "ERR_REQUIRE_ESM",
         &format!(
-            "[ERR_REQUIRE_ESM] require() of ES module {}{from} is not supported — \
-             use import instead, or a .cjs/.cts module where require() is needed",
+            "[ERR_REQUIRE_ESM] cannot run {} as CommonJS: it has ES module syntax — \
+             load it as an ES module, or name it .cjs/.cts if it is meant to be CommonJS",
             path.display(),
         ),
     );
+}
+
+/// Set `module.path` (the directory of `key`) and `module.paths` (the
+/// node_modules directories a bare require searches from there) on a module
+/// object that runs no CommonJS body -- a JSON module, an addon. None: a
+/// string could not be allocated.
+fn set_module_dir_and_paths(
+    scope: &mut v8::PinScope<'_, '_>,
+    module: v8::Local<v8::Object>,
+    key: &Path,
+) -> Option<()> {
+    let dirname = key
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dirname_v8 = v8::String::new(scope, &dirname)?;
+    let path_key = v8::String::new(scope, "path")?;
+    module.set(scope, path_key.into(), dirname_v8.into());
+    let lookup: Vec<v8::Local<v8::Value>> = node_modules_lookup(key)
+        .iter()
+        .filter_map(|p| v8::String::new(scope, p).map(v8::Local::<v8::Value>::from))
+        .collect();
+    let paths = v8::Array::new_with_elements(scope, &lookup);
+    let paths_key = v8::String::new(scope, "paths")?;
+    module.set(scope, paths_key.into(), paths.into());
+    Some(())
 }
 
 /// The body of [`load_cjs_or_detect`]: None with `esm` set is an ES module
@@ -1063,9 +1125,20 @@ fn load_cjs_inner<'s>(
             }
             // node's `.node` loader hands dlopen `path.toNamespacedPath(filename)`.
             let exports_value = crate::napi::load_addon(scope, &oam_loader::fs_os_path(&key))?;
+            // The same members node's module object has for an addon:
+            // filename and id, exports, path and paths, loaded.
             let module = v8::Object::new(scope);
+            let filename_v8 = v8::String::new(scope, &file)?;
+            for prop in ["filename", "id"] {
+                let prop_key = v8::String::new(scope, prop)?;
+                module.set(scope, prop_key.into(), filename_v8.into());
+            }
             let exports_key = v8::String::new(scope, "exports")?;
             module.set(scope, exports_key.into(), exports_value);
+            set_module_dir_and_paths(scope, module, &key)?;
+            let loaded_key = v8::String::new(scope, "loaded")?;
+            let true_v8 = v8::Boolean::new(scope, true);
+            module.set(scope, loaded_key.into(), true_v8.into());
             let global = v8::Global::new(scope, module);
             scope
                 .get_slot_mut::<CjsCache>()
@@ -1079,12 +1152,12 @@ fn load_cjs_inner<'s>(
 
     // Sources the loader transpiles, reached via require(): .cts always;
     // .tsx/.jsx when the package.json walk routes them CommonJS
-    // ("type":"commonjs", or typeless inside node_modules). .ts/.mts cannot
-    // actually get here today -- module_kind() pins them ESM, so
-    // require_callback throws ERR_REQUIRE_ESM first (a documented
-    // divergence: docs/node-divergences.md sec. 24, "TypeScript module
-    // kind") -- but deriving the gate from is_transpiled_source keeps it
-    // correct if that policy ever changes. Cache order for a transpiled
+    // ("type":"commonjs", or typeless inside node_modules). .ts/.mts do
+    // not get here from require() today -- module_kind() pins them ESM, so
+    // require_callback loads them through require_esm instead (the pinning
+    // is a documented divergence: docs/node-divergences.md, "TypeScript
+    // module kind") -- but deriving the gate from is_transpiled_source keeps
+    // it correct if that policy ever changes. Cache order for a transpiled
     // source: install-time precompile cache (node_modules only, written by
     // `oam install --precompile`) -> content-addressed transpile cache ->
     // oxc inline, storing the fresh output for the next run.
@@ -1185,6 +1258,13 @@ fn load_cjs_inner<'s>(
         let parsed = v8::json::parse(scope, text)?; // None: SyntaxError pending
         let exports_key = v8::String::new(scope, "exports")?;
         module.set(scope, exports_key.into(), parsed);
+        // A JSON module is loaded once it has parsed, and carries the same
+        // `path`/`paths` every module does: node's
+        // `require.cache[file].loaded` is true for one (measured on
+        // v22.22.2).
+        set_module_dir_and_paths(scope, module, &key)?;
+        let true_v8 = v8::Boolean::new(scope, true);
+        module.set(scope, loaded_key.into(), true_v8.into());
         let global = v8::Global::new(scope, module);
         scope
             .get_slot_mut::<CjsCache>()
@@ -1555,21 +1635,16 @@ fn require_resolve_callback(
             .map(|s| s.to_rust_string_lossy(scope))
             .unwrap_or_default(),
     );
-    match oam_loader::resolve_require(&specifier, &referrer) {
-        Ok(path) => {
-            let is_virtual = path
-                .to_str()
-                .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"));
-            let text = if is_virtual {
-                specifier
-            } else {
-                path.to_string_lossy().into_owned()
-            };
-            if let Some(s) = v8::String::new(scope, &text) {
-                rv.set(s.into());
-            }
-        }
-        Err(failure) => throw_error_with_code(scope, "MODULE_NOT_FOUND", &failure.message),
+    let Some(path) = resolve_require_or_throw(scope, &specifier, &referrer) else {
+        return;
+    };
+    let text = if crate::modules::is_virtual_module(&path) {
+        specifier
+    } else {
+        path.to_string_lossy().into_owned()
+    };
+    if let Some(s) = v8::String::new(scope, &text) {
+        rv.set(s.into());
     }
 }
 
@@ -1789,6 +1864,22 @@ impl crate::JsRuntime {
     }
 
     fn run_cjs_entry(
+        &mut self,
+        entry: &Path,
+        host: &dyn crate::ModuleHost,
+        as_main: bool,
+    ) -> Result<(), Vec<oam_diagnostics::Diagnostic>> {
+        let result = self.run_cjs_entry_parked(entry, host, as_main);
+        // `host` is only borrowed for this call: the pointer the run parked
+        // must not outlive it, on any return path (see `ActiveHost` in
+        // modules.rs).
+        self.clear_active_host();
+        result
+    }
+
+    /// The body of [`Self::run_cjs_entry`], which parks `host` for the
+    /// import() ops; the wrapper clears the slot once this returns.
+    fn run_cjs_entry_parked(
         &mut self,
         entry: &Path,
         host: &dyn crate::ModuleHost,

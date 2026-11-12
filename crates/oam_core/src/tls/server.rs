@@ -31,9 +31,10 @@
 //!   (`first_record_refusal`): never an answer a cleartext client could read.
 
 use super::{
-    TlsReader, TlsRegistry, TlsWriter, VerifyFailure, cipher_names, classify_unknown_issuer,
-    extra_ca_certs, is_self_signed, peer_certificates_b64, protocol_name, protocol_versions,
-    refuse_no_protocols,
+    ChainPurpose, RefusedAnchor, TlsReader, TlsRegistry, TlsWriter, VerifyFailure, add_user_anchor,
+    cipher_names, classify_unknown_issuer, default_ca_override, extra_ca_certs, is_self_signed,
+    named_refusal, peer_certificates_b64, protocol_name, protocol_versions, refuse_no_protocols,
+    refused_anchor_failure, validity_refusal,
 };
 use crate::OpOutcome;
 use bytes::Bytes;
@@ -47,7 +48,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use x509_parser::parse_x509_certificate;
-use x509_parser::time::ASN1Time;
 
 // ------------------------------------------------------------------ context
 
@@ -249,8 +249,10 @@ pub struct ServerContext {
     /// No certificate / key pair to serve: Node creates the server and fails
     /// each handshake.
     has_identity: bool,
-    /// The context's certificate store: the `ca` option's certificates and a
-    /// pfx's, or None for Node's default store. What
+    /// The context's certificate store: the `ca` option's certificates (or,
+    /// without one, a default store `tls.setDefaultCACertificates` had
+    /// replaced when the context was built) and a pfx's, or None for the
+    /// process's initial default store. What
     /// `getPeerCertificate(true)` looks a client chain's last issuer up in.
     store: Option<Vec<CertificateDer<'static>>>,
 }
@@ -261,7 +263,7 @@ impl ServerContext {
     fn store(&self) -> Vec<&CertificateDer<'static>> {
         match &self.store {
             Some(store) => store.iter().collect(),
-            None => super::chain::default_store().iter().collect(),
+            None => super::chain::initial_default_store().iter().collect(),
         }
     }
 }
@@ -399,9 +401,13 @@ pub(crate) fn load_identities(
     // bundled roots and NODE_EXTRA_CA_CERTS without one), and a pfx's CAs.
     if chains.iter().any(|chain| chain.len() == 1) {
         let ca = spec.ca.as_deref().map(ca_certificates);
+        let default_store;
         let mut store: Vec<&CertificateDer<'static>> = match &ca {
             Some(ca) => ca.iter().collect(),
-            None => super::chain::default_store().iter().collect(),
+            None => {
+                default_store = super::chain::default_store();
+                default_store.iter().collect()
+            }
         };
         store.extend(pfx_cas.iter());
         let now = super::chain::unix_now();
@@ -450,8 +456,15 @@ pub fn build_server_context(spec: &ServerContextSpec) -> Result<ServerContext, C
         pfx_cas,
     } = load_identities(spec, &provider)?;
     let has_identity = !identities.is_empty();
-    let store = spec.ca.as_deref().map(|ca| {
-        let mut store = ca_certificates(ca);
+    // No `ca`: the default store -- the one `tls.setDefaultCACertificates`
+    // put in its place when it has (#199), held by the context from here on
+    // as its verifier (`ClientCertJudge::new`) holds it; else the process's
+    // initial one, which `ServerContext::store` reads where it lives.
+    let store = match spec.ca.as_deref() {
+        Some(ca) => Some(ca_certificates(ca)),
+        None => default_ca_override(),
+    }
+    .map(|mut store| {
         store.extend(pfx_cas.iter().cloned());
         store
     });
@@ -656,6 +669,10 @@ struct ClientCertJudge {
     inner: Option<Arc<dyn ClientCertVerifier>>,
     trusted_leaves: Vec<CertificateDer<'static>>,
     trusted_non_anchors: Vec<CertificateDer<'static>>,
+    /// The user's self-signed certificates OpenSSL does not take as a CA
+    /// for a client chain (`anchor_refusal`): no anchors, and a chain that
+    /// ends at one is refused under the name kept with it.
+    refused_anchors: Vec<RefusedAnchor>,
     hints: Vec<rustls::DistinguishedName>,
 }
 
@@ -665,6 +682,7 @@ impl ClientCertJudge {
     fn new(ca: Option<&[String]>, pfx_cas: &[CertificateDer<'static>]) -> Self {
         let mut root_store = rustls::RootCertStore::empty();
         let mut hints = Vec::new();
+        let mut refused_anchors: Vec<RefusedAnchor> = Vec::new();
         let mut trusted_leaves: Vec<CertificateDer<'static>> = match ca {
             Some(ca) => {
                 let certs = ca_certificates(ca);
@@ -674,20 +692,45 @@ impl ClientCertJudge {
                             parsed.subject().as_raw().to_vec(),
                         ));
                     }
-                    if is_self_signed(cert.as_ref()) {
-                        let _ = root_store.add(cert.clone());
-                    }
+                    add_user_anchor(
+                        &mut root_store,
+                        &mut refused_anchors,
+                        cert,
+                        ChainPurpose::Client,
+                    );
                 }
                 certs
             }
-            None => {
-                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                let extras = extra_ca_certs();
-                for cert in extras.certs.iter().filter(|c| is_self_signed(c.as_ref())) {
-                    let _ = root_store.add(cert.clone());
+            // `tls.setDefaultCACertificates` replaced the process store
+            // (#199): a server with no `ca` of its own trusts exactly those,
+            // as a client connection does (`build_client_config`), read when
+            // the context is built. No `ca` option, so no CA names are sent.
+            None => match default_ca_override() {
+                Some(override_certs) => {
+                    for cert in &override_certs {
+                        add_user_anchor(
+                            &mut root_store,
+                            &mut refused_anchors,
+                            cert,
+                            ChainPurpose::Client,
+                        );
+                    }
+                    override_certs
                 }
-                extras.certs.clone()
-            }
+                None => {
+                    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                    let extras = extra_ca_certs();
+                    for cert in &extras.certs {
+                        add_user_anchor(
+                            &mut root_store,
+                            &mut refused_anchors,
+                            cert,
+                            ChainPurpose::Client,
+                        );
+                    }
+                    extras.certs.clone()
+                }
+            },
         };
         for cert in pfx_cas {
             if let Ok((_, parsed)) = parse_x509_certificate(cert.as_ref()) {
@@ -695,9 +738,12 @@ impl ClientCertJudge {
                     parsed.subject().as_raw().to_vec(),
                 ));
             }
-            if is_self_signed(cert.as_ref()) {
-                let _ = root_store.add(cert.clone());
-            }
+            add_user_anchor(
+                &mut root_store,
+                &mut refused_anchors,
+                cert,
+                ChainPurpose::Client,
+            );
             trusted_leaves.push(cert.clone());
         }
         let trusted_non_anchors = trusted_leaves
@@ -722,6 +768,7 @@ impl ClientCertJudge {
             inner,
             trusted_leaves,
             trusted_non_anchors,
+            refused_anchors,
             hints,
         }
     }
@@ -729,6 +776,10 @@ impl ClientCertJudge {
     /// None when the client's certificate verifies; else Node's code for
     /// what is wrong with it. A client that sent none is
     /// `UNABLE_TO_GET_ISSUER_CERT` (Node's VerifyError default, measured).
+    /// The date check and the refusals rustls's reason names are the client
+    /// side's own (`validity_refusal`, `named_refusal`); only the fallback
+    /// differs -- a refusal with no Node name is `CERT_REJECTED` here, where
+    /// the client side leaves rustls's text.
     fn verdict(
         &self,
         chain: Option<&[CertificateDer<'_>]>,
@@ -741,22 +792,8 @@ impl ClientCertJudge {
             ));
         };
         // OpenSSL's date check runs last and so wins (as on the client side).
-        if let Ok((_, leaf)) = parse_x509_certificate(end_entity.as_ref())
-            && let Ok(at) = ASN1Time::from_timestamp(now.as_secs() as i64)
-        {
-            let validity = leaf.validity();
-            if at.timestamp() > validity.not_after.timestamp() {
-                return Some(VerifyFailure::named(
-                    "CERT_HAS_EXPIRED",
-                    "certificate has expired",
-                ));
-            }
-            if at.timestamp() < validity.not_before.timestamp() {
-                return Some(VerifyFailure::named(
-                    "CERT_NOT_YET_VALID",
-                    "certificate is not yet valid",
-                ));
-            }
+        if let Some((failure, _)) = validity_refusal(end_entity, now) {
+            return Some(failure);
         }
         if self
             .trusted_leaves
@@ -770,7 +807,11 @@ impl ClientCertJudge {
             .cloned()
             .chain(self.trusted_non_anchors.iter().cloned())
             .collect();
-        let classify = || classify_unknown_issuer(end_entity, &known, &self.trusted_non_anchors);
+        let classify = || {
+            refused_anchor_failure(end_entity, &known, &self.refused_anchors).unwrap_or_else(|| {
+                classify_unknown_issuer(end_entity, &known, &self.trusted_non_anchors)
+            })
+        };
         let Some(inner) = &self.inner else {
             return Some(classify());
         };
@@ -778,14 +819,9 @@ impl ClientCertJudge {
             Ok(_) => return None,
             Err(error) => error,
         };
+        let rejected = || VerifyFailure::named("CERT_REJECTED", "certificate rejected");
         Some(match &error {
             rustls::Error::InvalidCertificate(reason) => match reason {
-                CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
-                    VerifyFailure::named("CERT_HAS_EXPIRED", "certificate has expired")
-                }
-                CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
-                    VerifyFailure::named("CERT_NOT_YET_VALID", "certificate is not yet valid")
-                }
                 CertificateError::UnknownIssuer => classify(),
                 CertificateError::Other(other)
                     if other
@@ -795,23 +831,9 @@ impl ClientCertJudge {
                 {
                     classify()
                 }
-                CertificateError::Revoked => {
-                    VerifyFailure::named("CERT_REVOKED", "certificate revoked")
-                }
-                CertificateError::BadSignature => {
-                    VerifyFailure::named("CERT_SIGNATURE_FAILURE", "certificate signature failure")
-                }
-                CertificateError::InvalidPurpose
-                | CertificateError::InvalidPurposeContext { .. } => {
-                    VerifyFailure::named("INVALID_PURPOSE", "unsupported certificate purpose")
-                }
-                CertificateError::UnhandledCriticalExtension => VerifyFailure::named(
-                    "UNHANDLED_CRITICAL_EXTENSION",
-                    "unhandled critical extension",
-                ),
-                _ => VerifyFailure::named("CERT_REJECTED", "certificate rejected"),
+                reason => named_refusal(reason).unwrap_or_else(rejected),
             },
-            _ => VerifyFailure::named("CERT_REJECTED", "certificate rejected"),
+            _ => rejected(),
         })
     }
 }
@@ -951,6 +973,10 @@ async fn close_with_alert(mut stream: crate::tcp::PlainStream, alert: [u8; 7]) {
 /// record version, length 2, fatal (2), record_overflow (22).
 const RECORD_OVERFLOW_ALERT: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x16];
 
+/// The longest wait between two looks at a record header that has not all
+/// arrived (`read_record_header`).
+const PARTIAL_HEADER_BEAT_MAX: Duration = Duration::from_millis(128);
+
 /// What came before the handshake: at least the five bytes of a record
 /// header, fewer only at EOF. A TCP stream reads with peek, so the
 /// handshake still sees the bytes; a pipe has no peek, so its bytes are
@@ -959,6 +985,7 @@ async fn read_record_header(
     stream: &mut crate::tcp::PlainStream,
 ) -> std::io::Result<(Vec<u8>, Bytes)> {
     let mut buf = [0u8; 5];
+    let mut beat = Duration::from_millis(2);
     loop {
         match stream {
             crate::tcp::PlainStream::Tcp(tcp) => {
@@ -975,9 +1002,15 @@ async fn read_record_header(
             }
         }
         // A partial header: peek returns at once while those bytes are
-        // unread, so wait for the socket to have more (or a short beat when
-        // the readiness does not change) instead of spinning.
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        // unread, and so does the socket's readiness -- it stays set until a
+        // read finds nothing, which a peek over unread bytes never does --
+        // so there is nothing to await but time. Peek again after a beat,
+        // each one twice the last up to PARTIAL_HEADER_BEAT_MAX: a header
+        // split across segments is whole within a beat or two, and a client
+        // that sends a byte and stalls costs a few wakeups a second until
+        // the handshake timeout, not hundreds.
+        tokio::time::sleep(beat).await;
+        beat = (beat * 2).min(PARTIAL_HEADER_BEAT_MAX);
     }
 }
 
@@ -1477,6 +1510,7 @@ pub fn take_server_stream(
     match (reader, writer) {
         (TlsReader::Server(reader), TlsWriter::Server(writer)) => {
             guard.cancel.remove(&handle);
+            guard.write_cancel.remove(&handle);
             Some(reader.unsplit(writer))
         }
         (reader, writer) => {
@@ -1692,6 +1726,15 @@ asDZ6pyGf669FP4nlBCxQetAmb5ZvRlSGk6/Cus=\n\
         assert_eq!(
             code(default_store.verdict(Some(&der(CLIENT_CERT)), now)),
             Some("UNABLE_TO_VERIFY_LEAF_SIGNATURE")
+        );
+        // Both `ca` certificates anchor a client chain: a CA with
+        // keyCertSign, and a CA:TRUE one whose extended key usage is
+        // clientAuth -- the purpose asked of an anchor here, where the
+        // client side asks for a server's.
+        assert!(with_ca.refused_anchors.is_empty());
+        assert!(rogue_trusted.refused_anchors.is_empty());
+        assert!(
+            crate::tls::anchor_refusal(der(ROGUE_CERT)[0].as_ref(), ChainPurpose::Server).is_some()
         );
         // The hints are the ca subjects.
         assert_eq!(with_ca.hints.len(), 1);

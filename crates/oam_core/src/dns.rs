@@ -235,6 +235,9 @@ struct Channel {
     /// What `getServers()` reports, in node's string form and config order.
     display: Vec<String>,
     timing: CaresTiming,
+    /// Why a configured server is missing from `servers`: its resolver could
+    /// not be built (`build_channel_with`). The first failure's text.
+    setup_error: Option<String>,
 }
 
 /// The try budget and server timeout of a channel, as c-ares 1.34.6 runs them
@@ -489,6 +492,12 @@ fn build_channel(base: &Base, name_servers: Vec<NameServerConfig>) -> Channel {
 }
 
 /// `build_channel` with a channel's own timing and local addresses.
+///
+/// It runs inside V8 callbacks (a Resolver's constructor, setServers,
+/// setLocalAddress), where a panic aborts the process, so a server whose
+/// resolver cannot be built is left out instead: it stays in `display`
+/// (getServers() reports what was configured), and with no server left every
+/// query fails as on an empty channel, naming `setup_error`.
 fn build_channel_with(
     base: &Base,
     name_servers: Vec<NameServerConfig>,
@@ -498,6 +507,7 @@ fn build_channel_with(
     let mut seen: Vec<(IpAddr, u16)> = Vec::new();
     let mut servers = Vec::new();
     let mut display = Vec::new();
+    let mut setup_error: Option<String> = None;
     for mut ns in name_servers {
         let key = (ns.ip, server_port(&ns));
         if seen.contains(&key) {
@@ -547,14 +557,21 @@ fn build_channel_with(
         request.use_edns = pool_opts.edns0;
         request.edns_payload_len = pool_opts.edns_payload_len;
         request.case_randomization = pool_opts.case_randomization;
-        let tls = TlsConfig::new().expect("DNS pool TLS config");
+        let built = TlsConfig::new().and_then(|tls| Ok((tls, builder.build()?)));
+        let (tls, resolver) = match built {
+            Ok(parts) => parts,
+            Err(e) => {
+                setup_error.get_or_insert_with(|| e.to_string());
+                continue;
+            }
+        };
         let pool = NameServerPool::from_config(
             [pool_ns],
             Arc::new(PoolContext::new(pool_opts, tls)),
             CaresProvider::default(),
         );
         servers.push(Server {
-            resolver: builder.build().expect("build DNS resolver"),
+            resolver,
             pool: Arc::new(pool),
             request,
             failures: AtomicU32::new(0),
@@ -564,6 +581,7 @@ fn build_channel_with(
         servers,
         display,
         timing,
+        setup_error,
     }
 }
 
@@ -626,12 +644,30 @@ static NEXT_INSTANCE: AtomicU32 = AtomicU32::new(FIRST_INSTANCE);
 /// process-wide map kept every one of them (measured: 5000 Resolvers per
 /// worker left about 425 MB behind per worker). Ids come from one process-wide
 /// counter, so they never repeat across runtimes.
+///
+/// It also holds the runtime's two default channels (`DnsState`): node's
+/// default resolver belongs to the environment, so a worker's
+/// dns.setServers() reaches neither the main thread nor another worker
+/// (measured on node v22.22.2).
 #[derive(Clone, Default)]
-pub struct DnsInstances(Arc<Mutex<HashMap<u32, Instance>>>);
+pub struct DnsInstances(Arc<DnsState>);
+
+#[derive(Default)]
+struct DnsState {
+    instances: Mutex<HashMap<u32, Instance>>,
+    /// The callback and promises defaults when setServers replaced them;
+    /// `None` is "still the system channel".
+    callback_default: RwLock<Option<Arc<Channel>>>,
+    promises_default: RwLock<Option<Arc<Channel>>>,
+}
 
 impl DnsInstances {
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Instance>> {
+        self.0.instances.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn with<R>(&self, id: u32, f: impl FnOnce(&mut Instance) -> R) -> Option<R> {
-        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.map();
         map.get_mut(&id).map(f)
     }
 }
@@ -656,20 +692,16 @@ pub fn dns_resolver_new(
     ));
     let id = NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed);
     let (cancel, _) = tokio::sync::watch::channel(0);
-    instances
-        .0
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(
-            id,
-            Instance {
-                name_servers,
-                timing,
-                local,
-                channel,
-                cancel,
-            },
-        );
+    instances.map().insert(
+        id,
+        Instance {
+            name_servers,
+            timing,
+            local,
+            channel,
+            cancel,
+        },
+    );
     id
 }
 
@@ -677,11 +709,7 @@ pub fn dns_resolver_new(
 /// finishes; nothing can cancel it any more, as nothing can reach the
 /// instance.
 pub fn dns_resolver_free(instances: &DnsInstances, id: u32) {
-    instances
-        .0
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&id);
+    instances.map().remove(&id);
 }
 
 /// `resolver.cancel()`: every query the instance has pending fails with
@@ -752,17 +780,12 @@ fn cancelled(target: &str) -> OpOutcome {
     OpOutcome::node_failed("ECANCELLED", format!("ECANCELLED {target}"))
 }
 
-/// The callback and promises defaults when setServers replaced them; `None` is
-/// "still the system channel".
-static CALLBACK_DEFAULT: RwLock<Option<Arc<Channel>>> = RwLock::new(None);
-static PROMISES_DEFAULT: RwLock<Option<Arc<Channel>>> = RwLock::new(None);
-
 /// The channel a call through `api` goes to. A query holds its own `Arc`, so a
 /// setServers() during it changes the NEXT query, never one in flight.
 fn channel(instances: &DnsInstances, api: Api) -> Arc<Channel> {
     let slot = match api {
-        Api::Callback => &CALLBACK_DEFAULT,
-        Api::Promises => &PROMISES_DEFAULT,
+        Api::Callback => &instances.0.callback_default,
+        Api::Promises => &instances.0.promises_default,
         // An id with no instance (one already freed) falls back to the system
         // channel; the JS side never issues one.
         Api::Instance(id) => {
@@ -804,7 +827,7 @@ pub fn dns_set_servers(instances: &DnsInstances, api: Api, servers: &[(IpAddr, u
         .collect::<Vec<_>>();
     let slot = match api {
         Api::Callback => None,
-        Api::Promises => Some(&PROMISES_DEFAULT),
+        Api::Promises => Some(&instances.0.promises_default),
         Api::Instance(id) => {
             instances.with(id, |instance| {
                 instance.channel = Arc::new(build_channel_with(
@@ -824,8 +847,8 @@ pub fn dns_set_servers(instances: &DnsInstances, api: Api, servers: &[(IpAddr, u
     };
     match slot {
         None => {
-            set(&CALLBACK_DEFAULT);
-            set(&PROMISES_DEFAULT);
+            set(&instances.0.callback_default);
+            set(&instances.0.promises_default);
         }
         Some(slot) => set(slot),
     }
@@ -897,7 +920,6 @@ where
     Err(last)
 }
 
-/// One `RecordType` query of `name` over `channel`.
 /// A query's answer section, as the server sent it, and the question name
 /// its response carried (node's c-ares reads names from the response).
 #[derive(Debug)]
@@ -912,6 +934,11 @@ impl Answers {
     }
 }
 
+/// The text a `NetError::Msg` starts with when the name asked did not parse
+/// (`channel_lookup`); `query_error_code` reads it as EBADNAME.
+const INVALID_NAME: &str = "invalid name: ";
+
+/// One `RecordType` query of `name` over `channel`.
 async fn channel_lookup(
     channel: &Channel,
     name: &str,
@@ -922,7 +949,7 @@ async fn channel_lookup(
     // as a `Proto` error it would, demoting every server on the way.
     let name = match hickory_resolver::proto::rr::IntoName::into_name(name) {
         Ok(name) => name,
-        Err(e) => return Err(NetError::Msg(format!("invalid name: {e}"))),
+        Err(e) => return Err(NetError::Msg(format!("{INVALID_NAME}{e}"))),
     };
     // ONE query for the name as given, its answer section as served, as
     // c-ares's ares_query sends it for node's resolve* (not ares_search: no
@@ -1022,11 +1049,35 @@ fn empty_of_type(rtype: RecordType, hostname: &str, answers: &[Record]) -> Optio
 /// fails it with ARES_ENOSERVER, a status node's error table predates, so node
 /// v22.22.2 reports the code `UNKNOWN_ARES_ERROR` (measured: "queryA
 /// UNKNOWN_ARES_ERROR x.example").
-fn no_servers(query: &str) -> OpOutcome {
+///
+/// A channel whose servers could not be set up (`Channel::setup_error`) has
+/// none either, and fails the same way with the reason in the text.
+fn no_servers(query: &str, setup_error: Option<&str>) -> OpOutcome {
+    let why = match setup_error {
+        Some(error) => format!("nameserver setup failed: {error}"),
+        None => "no nameservers configured".to_string(),
+    };
     OpOutcome::node_failed(
         "UNKNOWN_ARES_ERROR",
-        format!("UNKNOWN_ARES_ERROR {query}: no nameservers configured"),
+        format!("UNKNOWN_ARES_ERROR {query}: {why}"),
     )
+}
+
+/// A DNS character-string as node builds it: one character per byte
+/// (cares_wrap's OneByteString), not UTF-8. Measured on node v22.22.2
+/// against a fake server: a TXT chunk and a CAA value of bytes 61 c3 a9 ff 62
+/// are the five characters U+0061 U+00C3 U+00A9 U+00FF U+0062.
+fn one_byte_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| char::from(b)).collect()
+}
+
+/// True when c-ares takes `bytes` as a NAPTR flags / service / regexp
+/// string: printable ASCII only. Measured on node v22.22.2 (c-ares 1.34.6)
+/// against a fake server, one record per answer: 0x20 and 0x7e come through
+/// in regexp; a 0x00, 0x01, 0x09, 0x7f or 0x80 there, and bytes c3 a9 ff in
+/// each of the three fields alone, are "queryNaptr EBADRESP".
+fn naptr_string_ok(bytes: &[u8]) -> bool {
+    bytes.iter().all(|b| (0x20..=0x7e).contains(b))
 }
 
 /// A DNS name as node reports it: without the root label's trailing dot.
@@ -1190,325 +1241,234 @@ pub fn dns_resolve(
 
 async fn resolve_on(ch: Arc<Channel>, hostname: String, rrtype: String) -> OpOutcome {
     if ch.servers.is_empty() {
-        return no_servers(&hostname);
+        return no_servers(&hostname, ch.setup_error.as_deref());
     }
+    let unsupported = || OpOutcome::Failed(format!("dns.resolve: unsupported rrtype '{rrtype}'"));
+    let rtype = match rrtype.as_str() {
+        "A" => RecordType::A,
+        "AAAA" => RecordType::AAAA,
+        "CNAME" => RecordType::CNAME,
+        "MX" => RecordType::MX,
+        "TXT" => RecordType::TXT,
+        "NS" => RecordType::NS,
+        "SRV" => RecordType::SRV,
+        "SOA" => RecordType::SOA,
+        "PTR" => RecordType::PTR,
+        "CAA" => RecordType::CAA,
+        "NAPTR" => RecordType::NAPTR,
+        "TLSA" => RecordType::TLSA,
+        _ => return unsupported(),
+    };
     // Every name is one query, as given (`channel_lookup`): node's resolve*
     // is c-ares's ares_query, which tries no search domain, whatever the
     // name's dots. (Up to 0.19.2 a name with dots was qualified here so
     // hickory would not walk the search list; a bare one was walked.)
-    match rrtype.as_str() {
-        "A" => match channel_lookup(&ch, &hostname, RecordType::A).await {
-            Ok(lookup) => {
-                if let Some(outcome) = no_record_of_type(RecordType::A, &hostname, &lookup) {
-                    return outcome;
-                }
-                let addrs: Vec<serde_json::Value> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|rec| match &rec.data {
-                        // With its TTL: the JS side keeps it for node's
-                        // { ttl: true } and otherwise drops it.
-                        RData::A(a) => Some(serde_json::json!({
-                            "address": a.0.to_string(),
-                            "ttl": rec.ttl,
-                        })),
-                        _ => None,
-                    })
-                    .collect();
-                OpOutcome::Json(serde_json::json!(addrs).to_string())
-            }
-            Err(e) => dns_err(&hostname, &e),
-        },
-        "AAAA" => match channel_lookup(&ch, &hostname, RecordType::AAAA).await {
-            Ok(lookup) => {
-                if let Some(outcome) = no_record_of_type(RecordType::AAAA, &hostname, &lookup) {
-                    return outcome;
-                }
-                let addrs: Vec<serde_json::Value> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|rec| match &rec.data {
-                        // With its TTL: the JS side keeps it for node's
-                        // { ttl: true } and otherwise drops it.
-                        RData::AAAA(a) => Some(serde_json::json!({
-                            "address": a.0.to_string(),
-                            "ttl": rec.ttl,
-                        })),
-                        _ => None,
-                    })
-                    .collect();
-                OpOutcome::Json(serde_json::json!(addrs).to_string())
-            }
-            Err(e) => dns_err(&hostname, &e),
-        },
-        "CNAME" => match channel_lookup(&ch, &hostname, RecordType::CNAME).await {
-            Ok(lookup) => {
-                if let Some(outcome) = no_record_of_type(RecordType::CNAME, &hostname, &lookup) {
-                    return outcome;
-                }
-                let names: Vec<serde_json::Value> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|rec| match &rec.data {
-                        RData::CNAME(c) => Some(serde_json::json!(host(&c.0))),
-                        _ => None,
-                    })
-                    .collect();
-                OpOutcome::Json(serde_json::json!(names).to_string())
-            }
-            Err(e) => dns_err(&hostname, &e),
-        },
-        "MX" => match channel_lookup(&ch, &hostname, RecordType::MX).await {
-            Ok(lookup) => {
-                if let Some(outcome) = no_record_of_type(RecordType::MX, &hostname, &lookup) {
-                    return outcome;
-                }
-                let records: Vec<serde_json::Value> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|rec| match &rec.data {
-                        // Key order is JS property-insertion order now that
-                        // serde_json preserves it: node (c-ares) inserts
-                        // exchange before priority, and the differential
-                        // compares JSON.stringify byte-for-byte.
-                        RData::MX(mx) => Some(serde_json::json!({
-                            "exchange": host(&mx.exchange),
-                            "priority": mx.preference,
-                        })),
-                        _ => None,
-                    })
-                    .collect();
-                OpOutcome::Json(serde_json::json!(records).to_string())
-            }
-            Err(e) => dns_err(&hostname, &e),
-        },
-        "TXT" => match channel_lookup(&ch, &hostname, RecordType::TXT).await {
-            Ok(lookup) => {
-                if let Some(outcome) = no_record_of_type(RecordType::TXT, &hostname, &lookup) {
-                    return outcome;
-                }
-                let records: Vec<serde_json::Value> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|rec| match &rec.data {
-                        RData::TXT(txt) => {
-                            let parts: Vec<String> = txt
-                                .txt_data
-                                .iter()
-                                .map(|b| String::from_utf8_lossy(b).into_owned())
-                                .collect();
-                            Some(serde_json::json!(parts))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                OpOutcome::Json(serde_json::json!(records).to_string())
-            }
-            Err(e) => dns_err(&hostname, &e),
-        },
-        "NS" => match channel_lookup(&ch, &hostname, RecordType::NS).await {
-            Ok(lookup) => {
-                if let Some(outcome) = no_record_of_type(RecordType::NS, &hostname, &lookup) {
-                    return outcome;
-                }
-                let names: Vec<serde_json::Value> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|rec| match &rec.data {
-                        RData::NS(ns) => Some(serde_json::json!(host(&ns.0))),
-                        _ => None,
-                    })
-                    .collect();
-                OpOutcome::Json(serde_json::json!(names).to_string())
-            }
-            Err(e) => dns_err(&hostname, &e),
-        },
-        "SRV" => match channel_lookup(&ch, &hostname, RecordType::SRV).await {
-            Ok(lookup) => {
-                if let Some(outcome) = no_record_of_type(RecordType::SRV, &hostname, &lookup) {
-                    return outcome;
-                }
-                let records: Vec<serde_json::Value> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|rec| match &rec.data {
-                        // node's insertion order (verified live v22.22.2:
-                        // _matrix._tcp.matrix.org): name, port, priority, weight.
-                        RData::SRV(srv) => Some(serde_json::json!({
-                            "name": host(&srv.target),
-                            "port": srv.port,
-                            "priority": srv.priority,
-                            "weight": srv.weight,
-                        })),
-                        _ => None,
-                    })
-                    .collect();
-                OpOutcome::Json(serde_json::json!(records).to_string())
-            }
-            Err(e) => dns_err(&hostname, &e),
-        },
-        "SOA" => match channel_lookup(&ch, &hostname, RecordType::SOA).await {
-            Ok(lookup) => {
-                if let Some(outcome) = no_record_of_type(RecordType::SOA, &hostname, &lookup) {
-                    return outcome;
-                }
-                if let Some(soa) = lookup.answers().iter().find_map(|rec| match &rec.data {
-                    RData::SOA(soa) => Some(soa),
-                    _ => None,
-                }) {
-                    OpOutcome::Json(
-                        serde_json::json!({
-                            "nsname": host(&soa.mname),
-                            "hostmaster": host(&soa.rname),
-                            "serial": soa.serial,
-                            "refresh": soa.refresh,
-                            "retry": soa.retry,
-                            "expire": soa.expire,
-                            "minttl": soa.minimum,
-                        })
-                        .to_string(),
-                    )
-                } else {
-                    OpOutcome::Json("null".to_string())
-                }
-            }
-            Err(e) => dns_err(&hostname, &e),
-        },
-        "PTR" => match channel_lookup(&ch, &hostname, RecordType::PTR).await {
-            Ok(lookup) => {
-                if let Some(outcome) = no_record_of_type(RecordType::PTR, &hostname, &lookup) {
-                    return outcome;
-                }
-                let names: Vec<serde_json::Value> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|rec| match &rec.data {
-                        RData::PTR(p) => Some(serde_json::json!(host(&p.0))),
-                        _ => None,
-                    })
-                    .collect();
-                OpOutcome::Json(serde_json::json!(names).to_string())
-            }
-            Err(e) => dns_err(&hostname, &e),
-        },
-        "CAA" => match channel_lookup(&ch, &hostname, RecordType::CAA).await {
-            Ok(lookup) => {
-                if let Some(outcome) = no_record_of_type(RecordType::CAA, &hostname, &lookup) {
-                    return outcome;
-                }
-                // node's shape is `{critical, <tag>: <value>}` -- the TAG is the
-                // KEY. This used to emit `{critical, issue: <tag>, value: <value>}`,
-                // which put the tag name where the value belongs, hardcoded the
-                // key as `issue` no matter the real tag, and added a `value` key
-                // node does not have. Measured against node v22.22.2:
-                // wikipedia.org returns an `iodef` record and two `issue`
-                // records, each keyed by its own tag.
-                //
-                // Built as text rather than through json!/Map because
-                // serde_json's default Map is a BTreeMap and would sort the keys
-                // -- node always puts `critical` first, and RFC 9495's
-                // `contactemail` / `contactphone` tags sort BEFORE it.
-                let objects: Vec<String> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|rec| match &rec.data {
-                        RData::CAA(caa) => {
-                            // The wire flags octet, which is what node reports --
-                            // not a 0/1 bool. RFC 6844 puts Issuer Critical in bit
-                            // 0 (0x80), so a critical record reads 128, matching
-                            // node's own documented example. hickory splits the
-                            // octet into the bool plus the remaining bits, so this
-                            // reassembles it rather than inventing a value.
-                            let flags =
-                                if caa.issuer_critical { 0x80u8 } else { 0 } | caa.reserved_flags;
-                            let tag = serde_json::json!(caa.tag.as_str());
-                            let value =
-                                serde_json::json!(String::from_utf8_lossy(&caa.value).into_owned());
-                            Some(format!("{{\"critical\":{flags},{tag}:{value}}}"))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                OpOutcome::Json(format!("[{}]", objects.join(",")))
-            }
-            Err(e) => dns_err(&hostname, &e),
-        },
-        "NAPTR" => match channel_lookup(&ch, &hostname, RecordType::NAPTR).await {
-            Ok(lookup) => {
-                if let Some(outcome) = no_record_of_type(RecordType::NAPTR, &hostname, &lookup) {
-                    return outcome;
-                }
-                let records: Vec<serde_json::Value> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|rec| match &rec.data {
-                        // node's insertion order (cares_wrap.cc ParseNaptrReply):
-                        // flags, service, regexp, replacement, order, preference.
-                        RData::NAPTR(naptr) => Some(serde_json::json!({
-                            "flags": String::from_utf8_lossy(&naptr.flags).into_owned(),
-                            "service": String::from_utf8_lossy(&naptr.services).into_owned(),
-                            "regexp": String::from_utf8_lossy(&naptr.regexp).into_owned(),
-                            "replacement": host(&naptr.replacement),
-                            "order": naptr.order,
-                            "preference": naptr.preference,
-                        })),
-                        _ => None,
-                    })
-                    .collect();
-                OpOutcome::Json(serde_json::json!(records).to_string())
-            }
-            Err(e) => dns_err(&hostname, &e),
-        },
-        "TLSA" => match channel_lookup(&ch, &hostname, RecordType::TLSA).await {
-            Ok(lookup) => {
-                if let Some(outcome) = no_record_of_type(RecordType::TLSA, &hostname, &lookup) {
-                    return outcome;
-                }
-                // One entry per answer record, null for a record of another
-                // type: node's array keeps the position, a hole where c-ares
-                // skipped a record (measured: [A, TLSA] answers a two-slot
-                // array with a hole first; [TLSA, A] one slot).
-                let records: Vec<Option<&hickory_resolver::proto::rr::rdata::TLSA>> = lookup
-                    .answers()
-                    .iter()
-                    .map(|rec| match &rec.data {
-                        RData::TLSA(tlsa) => Some(tlsa),
-                        _ => None,
-                    })
-                    .collect();
-                // c-ares refuses a TLSA record with no certificate data, and
-                // the whole answer with it (measured: "queryTlsa EBADRESP"
-                // even beside a well-formed record); hickory decodes it.
-                if records
-                    .iter()
-                    .flatten()
-                    .any(|tlsa| tlsa.cert_data.is_empty())
-                {
-                    return OpOutcome::node_failed(
-                        "EBADRESP",
-                        format!("EBADRESP {hostname}: TLSA record without certificate data"),
-                    );
-                }
-                // node's keys in its order (certUsage, selector, match,
-                // data); `data` is the bytes, made an ArrayBuffer in JS.
-                let records: Vec<serde_json::Value> = records
-                    .into_iter()
-                    .map(|tlsa| match tlsa {
-                        Some(tlsa) => serde_json::json!({
-                            "certUsage": u8::from(tlsa.cert_usage),
-                            "selector": u8::from(tlsa.selector),
-                            "match": u8::from(tlsa.matching),
-                            "data": tlsa.cert_data,
-                        }),
-                        None => serde_json::Value::Null,
-                    })
-                    .collect();
-                OpOutcome::Json(serde_json::json!(records).to_string())
-            }
-            Err(e) => dns_err(&hostname, &e),
-        },
-        other => OpOutcome::Failed(format!("dns.resolve: unsupported rrtype '{other}'")),
+    let lookup = match channel_lookup(&ch, &hostname, rtype).await {
+        Ok(lookup) => lookup,
+        Err(e) => return dns_err(&hostname, &e),
+    };
+    // Every type's rule for an answer with records but none of the type.
+    if let Some(outcome) = no_record_of_type(rtype, &hostname, &lookup) {
+        return outcome;
     }
+    match rtype {
+        // With its TTL: the JS side keeps it for node's { ttl: true } and
+        // otherwise drops it.
+        RecordType::A => json_list(&lookup, |rec| match &rec.data {
+            RData::A(a) => Some(serde_json::json!({
+                "address": a.0.to_string(),
+                "ttl": rec.ttl,
+            })),
+            _ => None,
+        }),
+        RecordType::AAAA => json_list(&lookup, |rec| match &rec.data {
+            RData::AAAA(a) => Some(serde_json::json!({
+                "address": a.0.to_string(),
+                "ttl": rec.ttl,
+            })),
+            _ => None,
+        }),
+        RecordType::CNAME => json_list(&lookup, |rec| match &rec.data {
+            RData::CNAME(c) => Some(serde_json::json!(host(&c.0))),
+            _ => None,
+        }),
+        RecordType::MX => json_list(&lookup, |rec| match &rec.data {
+            // Key order is JS property-insertion order now that
+            // serde_json preserves it: node (c-ares) inserts
+            // exchange before priority, and the differential
+            // compares JSON.stringify byte-for-byte.
+            RData::MX(mx) => Some(serde_json::json!({
+                "exchange": host(&mx.exchange),
+                "priority": mx.preference,
+            })),
+            _ => None,
+        }),
+        RecordType::TXT => json_list(&lookup, |rec| match &rec.data {
+            RData::TXT(txt) => {
+                let parts: Vec<String> = txt.txt_data.iter().map(|b| one_byte_string(b)).collect();
+                Some(serde_json::json!(parts))
+            }
+            _ => None,
+        }),
+        RecordType::NS => json_list(&lookup, |rec| match &rec.data {
+            RData::NS(ns) => Some(serde_json::json!(host(&ns.0))),
+            _ => None,
+        }),
+        RecordType::SRV => json_list(&lookup, |rec| match &rec.data {
+            // node's insertion order (verified live v22.22.2:
+            // _matrix._tcp.matrix.org): name, port, priority, weight.
+            RData::SRV(srv) => Some(serde_json::json!({
+                "name": host(&srv.target),
+                "port": srv.port,
+                "priority": srv.priority,
+                "weight": srv.weight,
+            })),
+            _ => None,
+        }),
+        RecordType::SOA => {
+            if let Some(soa) = lookup.answers().iter().find_map(|rec| match &rec.data {
+                RData::SOA(soa) => Some(soa),
+                _ => None,
+            }) {
+                OpOutcome::Json(
+                    serde_json::json!({
+                        "nsname": host(&soa.mname),
+                        "hostmaster": host(&soa.rname),
+                        "serial": soa.serial,
+                        "refresh": soa.refresh,
+                        "retry": soa.retry,
+                        "expire": soa.expire,
+                        "minttl": soa.minimum,
+                    })
+                    .to_string(),
+                )
+            } else {
+                OpOutcome::Json("null".to_string())
+            }
+        }
+        RecordType::PTR => json_list(&lookup, |rec| match &rec.data {
+            RData::PTR(p) => Some(serde_json::json!(host(&p.0))),
+            _ => None,
+        }),
+        RecordType::CAA => {
+            // node's shape is `{critical, <tag>: <value>}` -- the TAG is the
+            // KEY. This used to emit `{critical, issue: <tag>, value: <value>}`,
+            // which put the tag name where the value belongs, hardcoded the
+            // key as `issue` no matter the real tag, and added a `value` key
+            // node does not have. Measured against node v22.22.2:
+            // wikipedia.org returns an `iodef` record and two `issue`
+            // records, each keyed by its own tag.
+            //
+            // Built as text rather than through json!/Map because
+            // serde_json's default Map is a BTreeMap and would sort the keys
+            // -- node always puts `critical` first, and RFC 9495's
+            // `contactemail` / `contactphone` tags sort BEFORE it.
+            let objects: Vec<String> = lookup
+                .answers()
+                .iter()
+                .filter_map(|rec| match &rec.data {
+                    RData::CAA(caa) => {
+                        // The wire flags octet, which is what node reports --
+                        // not a 0/1 bool. RFC 6844 puts Issuer Critical in bit
+                        // 0 (0x80), so a critical record reads 128, matching
+                        // node's own documented example. hickory splits the
+                        // octet into the bool plus the remaining bits, so this
+                        // reassembles it rather than inventing a value.
+                        let flags =
+                            if caa.issuer_critical { 0x80u8 } else { 0 } | caa.reserved_flags;
+                        let tag = serde_json::json!(caa.tag.as_str());
+                        let value = serde_json::json!(one_byte_string(&caa.value));
+                        Some(format!("{{\"critical\":{flags},{tag}:{value}}}"))
+                    }
+                    _ => None,
+                })
+                .collect();
+            OpOutcome::Json(format!("[{}]", objects.join(",")))
+        }
+        RecordType::NAPTR => {
+            // c-ares refuses a NAPTR string that is not printable ASCII, and
+            // the answer with it (`naptr_string_ok`); hickory decodes it.
+            let refused = lookup.answers().iter().any(|rec| match &rec.data {
+                RData::NAPTR(naptr) => {
+                    !(naptr_string_ok(&naptr.flags)
+                        && naptr_string_ok(&naptr.services)
+                        && naptr_string_ok(&naptr.regexp))
+                }
+                _ => false,
+            });
+            if refused {
+                return OpOutcome::node_failed(
+                    "EBADRESP",
+                    format!("EBADRESP {hostname}: NAPTR string outside printable ASCII"),
+                );
+            }
+            json_list(&lookup, |rec| match &rec.data {
+                // node's insertion order (cares_wrap.cc ParseNaptrReply):
+                // flags, service, regexp, replacement, order, preference.
+                RData::NAPTR(naptr) => Some(serde_json::json!({
+                    "flags": one_byte_string(&naptr.flags),
+                    "service": one_byte_string(&naptr.services),
+                    "regexp": one_byte_string(&naptr.regexp),
+                    "replacement": host(&naptr.replacement),
+                    "order": naptr.order,
+                    "preference": naptr.preference,
+                })),
+                _ => None,
+            })
+        }
+        RecordType::TLSA => {
+            // One entry per answer record, null for a record of another
+            // type: node's array keeps the position, a hole where c-ares
+            // skipped a record (measured: [A, TLSA] answers a two-slot
+            // array with a hole first; [TLSA, A] one slot).
+            let records: Vec<Option<&hickory_resolver::proto::rr::rdata::TLSA>> = lookup
+                .answers()
+                .iter()
+                .map(|rec| match &rec.data {
+                    RData::TLSA(tlsa) => Some(tlsa),
+                    _ => None,
+                })
+                .collect();
+            // c-ares refuses a TLSA record with no certificate data, and
+            // the whole answer with it (measured: "queryTlsa EBADRESP"
+            // even beside a well-formed record); hickory decodes it.
+            if records
+                .iter()
+                .flatten()
+                .any(|tlsa| tlsa.cert_data.is_empty())
+            {
+                return OpOutcome::node_failed(
+                    "EBADRESP",
+                    format!("EBADRESP {hostname}: TLSA record without certificate data"),
+                );
+            }
+            // node's keys in its order (certUsage, selector, match,
+            // data); `data` is the bytes, made an ArrayBuffer in JS.
+            let records: Vec<serde_json::Value> = records
+                .into_iter()
+                .map(|tlsa| match tlsa {
+                    Some(tlsa) => serde_json::json!({
+                        "certUsage": u8::from(tlsa.cert_usage),
+                        "selector": u8::from(tlsa.selector),
+                        "match": u8::from(tlsa.matching),
+                        "data": tlsa.cert_data,
+                    }),
+                    None => serde_json::Value::Null,
+                })
+                .collect();
+            OpOutcome::Json(serde_json::json!(records).to_string())
+        }
+        // `rtype` is one of the twelve above.
+        _ => unsupported(),
+    }
+}
+
+/// A resolve*'s JSON array: one entry per answer record `entry` takes, in
+/// the order served. A record of another type (a CNAME before the A records
+/// it leads to) gives `None` and is left out.
+fn json_list(answers: &Answers, entry: impl Fn(&Record) -> Option<serde_json::Value>) -> OpOutcome {
+    let entries: Vec<serde_json::Value> = answers.answers().iter().filter_map(entry).collect();
+    OpOutcome::Json(serde_json::json!(entries).to_string())
 }
 
 /// dns.reverse(ip) -- PTR lookup for an IP address.
@@ -1616,6 +1576,13 @@ fn query_error_code(e: &NetError) -> &'static str {
             return "ECONNREFUSED";
         }
         NetError::Proto(_) => return "EBADRESP",
+        // A name that is not one (`channel_lookup`): c-ares's ARES_EBADNAME.
+        // Measured on node v22.22.2: "queryA EBADNAME a..b.example.", and
+        // the same for a leading dot, two trailing dots, a 64-byte label
+        // and a name past 255 bytes.
+        NetError::Msg(text) if text.starts_with(INVALID_NAME) => return "EBADNAME",
+        // Anything hickory reports that is none of the above. No c-ares
+        // status is known to match, so it reads as a failure to resolve.
         _ => return "ESERVFAIL",
     };
     match rcode {
@@ -1822,7 +1789,10 @@ mod tests {
     }
 
     fn test_channel(fakes: &[&Fake], tries: usize) -> Channel {
-        let base = test_base(tries);
+        test_channel_with(fakes, test_base(tries))
+    }
+
+    fn test_channel_with(fakes: &[&Fake], base: Base) -> Channel {
         let servers = fakes
             .iter()
             .map(|f| {
@@ -1946,14 +1916,21 @@ mod tests {
             delay_ms: 0,
         })
         .await;
-        let ch = test_channel(&[&bad, &live], 4);
+        // A server timeout far above the bound below, so that only a wait
+        // for the malformed server's timeout can cross it, not a busy host.
+        let slow = || {
+            let mut base = test_base(4);
+            base.timing.timeout = Duration::from_secs(20);
+            base
+        };
+        let ch = test_channel_with(&[&bad, &live], slow());
         let started = std::time::Instant::now();
         let lookup = channel_lookup(&ch, "m.example.", RecordType::A)
             .await
             .unwrap();
         assert_eq!(first_a(&lookup), "10.0.0.3");
         // At once, not after the server timeout.
-        assert!(started.elapsed() < Duration::from_millis(300));
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert_eq!(bad.asked.load(Ordering::SeqCst), 1);
         // Demoted: the next query goes straight to the live server.
         channel_lookup(&ch, "n.example.", RecordType::A)
@@ -1964,7 +1941,7 @@ mod tests {
 
         // Alone: every try, then EBADRESP (node: 4 sends, "queryA EBADRESP").
         let alone = fake(Reply::Truncated).await;
-        let ch = test_channel(&[&alone], 4);
+        let ch = test_channel_with(&[&alone], slow());
         let err = channel_lookup(&ch, "o.example.", RecordType::A)
             .await
             .unwrap_err();
@@ -2048,9 +2025,66 @@ mod tests {
         let err = channel_lookup(&ch, "a..b.example.", RecordType::A)
             .await
             .unwrap_err();
-        assert_eq!(query_error_code(&err), "ESERVFAIL");
+        // node v22.22.2, measured: "queryA EBADNAME a..b.example.".
+        assert_eq!(query_error_code(&err), "EBADNAME");
         assert_eq!(live.asked.load(Ordering::SeqCst), 0);
         assert_eq!(ch.servers[0].failures.load(Ordering::SeqCst), 0);
+        // Only the unparsed name is EBADNAME, not every message error.
+        assert_eq!(
+            query_error_code(&NetError::Msg("something else".to_string())),
+            "ESERVFAIL"
+        );
+    }
+
+    #[test]
+    fn character_strings_are_one_character_per_byte() {
+        // node v22.22.2, measured: bytes 61 c3 a9 ff 62 in a TXT chunk and
+        // a CAA value are five characters, not UTF-8.
+        assert_eq!(
+            one_byte_string(&[0x61, 0xc3, 0xa9, 0xff, 0x62]),
+            "a\u{c3}\u{a9}\u{ff}b"
+        );
+        assert_eq!(one_byte_string(b""), "");
+        // NAPTR's strings are printable ASCII or the answer is refused.
+        assert!(naptr_string_ok(b" ~!^.*$!sip:info@example!"));
+        assert!(naptr_string_ok(b""));
+        for byte in [0x00, 0x01, 0x09, 0x7f, 0x80, 0xff] {
+            assert!(!naptr_string_ok(&[b'a', byte]), "{byte:#x}");
+        }
+    }
+
+    #[tokio::test]
+    async fn each_runtime_has_its_own_default_servers() {
+        // node v22.22.2, measured: a worker's dns.setServers() and
+        // dns.promises.setServers() leave the main thread's lists as they
+        // were.
+        let main = DnsInstances::default();
+        let worker = DnsInstances::default();
+        let before = (
+            dns_get_servers(&main, Api::Callback),
+            dns_get_servers(&main, Api::Promises),
+        );
+        dns_set_servers(
+            &worker,
+            Api::Callback,
+            &[("127.0.0.1".parse().unwrap(), 5399)],
+        );
+        assert_eq!(dns_get_servers(&worker, Api::Callback), ["127.0.0.1:5399"]);
+        assert_eq!(dns_get_servers(&worker, Api::Promises), ["127.0.0.1:5399"]);
+        dns_set_servers(
+            &worker,
+            Api::Promises,
+            &[("127.0.0.1".parse().unwrap(), 5398)],
+        );
+        assert_eq!(dns_get_servers(&worker, Api::Callback), ["127.0.0.1:5399"]);
+        assert_eq!(dns_get_servers(&worker, Api::Promises), ["127.0.0.1:5398"]);
+        assert_eq!(
+            (
+                dns_get_servers(&main, Api::Callback),
+                dns_get_servers(&main, Api::Promises),
+            ),
+            before
+        );
     }
 
     #[test]
@@ -2108,7 +2142,7 @@ mod tests {
 
     #[tokio::test]
     async fn reverse_reports_nodata_as_enotfound_where_resolve_ptr_keeps_enodata() {
-        // Through the promises slot, which no other test touches.
+        // Through the promises default of this test's own registry.
         let reg = DnsInstances::default();
         let nodata = fake(Reply::Empty(0)).await;
         dns_set_servers(

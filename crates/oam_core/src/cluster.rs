@@ -27,16 +27,21 @@ pub async fn cluster_fork(
     for (k, v) in &env_pairs {
         cmd.env(k, v);
     }
-    cmd.env("OAM_CLUSTER_WORKER", &worker_id);
+    cmd.env(WORKER_ID_VAR, &worker_id);
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
     // Reap workers if the primary's runtime drops -- Node leaves orphans, but
     // here a leaked worker would outlive its only manager (and wedge tests).
     cmd.kill_on_drop(true);
 
+    // The flags every other child gets (libuv's table): not detached, no
+    // windowsHide, stdio inherited. A worker shares this process's console;
+    // CREATE_NO_WINDOW is added only when this process has none. Setting it
+    // unconditionally started a fresh hidden conhost for every worker while
+    // its stdio slots were inherited, the combination libuv rules out.
     #[cfg(windows)]
     {
-        cmd.creation_flags(0x0800_0000);
+        cmd.creation_flags(super::child::windows_creation_flags(false, false, true));
     }
 
     match cmd.spawn() {
@@ -71,8 +76,18 @@ pub fn cluster_worker_kill(children: &ChildRegistry, handle: u64, signal: Option
     super::child::child_kill(children, handle, signal);
 }
 
+/// The variable `cluster_fork` names a worker's id in (node's
+/// `NODE_UNIQUE_ID`).
+pub const WORKER_ID_VAR: &str = "OAM_CLUSTER_WORKER";
+
+/// The cluster worker id this process was forked with, if any. The engine
+/// reads it once at startup and takes the variable out of the environment
+/// (as node deletes `NODE_UNIQUE_ID` during worker bootstrap), so a worker's
+/// own children do not report themselves as workers of this primary.
+pub fn worker_id_from_env() -> Option<String> {
+    std::env::var(WORKER_ID_VAR).ok().filter(|v| !v.is_empty())
+}
+
 pub fn cluster_is_worker() -> bool {
-    std::env::var("OAM_CLUSTER_WORKER")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
+    worker_id_from_env().is_some()
 }

@@ -67,10 +67,12 @@ node npm/sync-packages.mjs           # rewrite the manifests
 node npm/sync-packages.mjs --check   # exit 1 on drift, write nothing
 ```
 
-`--check` is the detection. It also runs as a test (`npm/test/sync-packages.test.mjs`),
-so the npm test suite fails the moment `release-local.sh` bumps the
-workspace version without a re-sync. Wiring `--check` into `scripts/ci-local.sh`
-as its own step is the remaining piece -- see "Not wired yet" below.
+`--check` is the detection, and it is gated twice. `scripts/ci-local.sh` runs it
+as its own step (the "npm launcher packaging" step, together with the tests
+below), and it also runs as a test (`npm/test/sync-packages.test.mjs`).
+`scripts/release-local.sh` runs the sync itself during the version bump and then
+`--check` to confirm it converged, so the bump commit carries the regenerated
+manifests.
 
 ## Testing
 
@@ -105,15 +107,32 @@ npm install /tmp/rel/oamjs-win32-arm64-*.tgz /tmp/rel/oamjs-*.tgz
 ./node_modules/.bin/oamjs -pe "2+2"
 ```
 
-`--only` is for exactly this. A release must stage all five.
+`--only` is for exactly this. A release must stage all five. Staging a POSIX
+package (`--only oamjs-linux-x64`, say) from Windows is refused before anything
+is copied, for the reason given under "Publishing" below;
+`OAM_NPM_ALLOW_UNEXECUTABLE=1` overrides that for a pack you will not publish.
 
 ## Publishing (not wired -- what the release step would need)
 
-`scripts/release-local.sh` is deliberately not touched by this change. When it
-is wired, the step belongs immediately after "Stage license + attribution
-alongside the binaries", where `$RELEASE_DIR` holds all five binaries plus
-`LICENSE`, `NOTICE` and `THIRD_PARTY_LICENSES.md` -- which is exactly what
-`npm/stage.mjs` consumes:
+`scripts/release-local.sh` keeps the manifests in step with the version (see
+"Versioning") but does not stage or publish. The input the publish step needs
+is what that script already assembles after "Stage license + attribution
+alongside the binaries": a directory holding all five binaries plus `LICENSE`,
+`NOTICE` and `THIRD_PARTY_LICENSES.md`, which is exactly what `npm/stage.mjs`
+consumes.
+
+**The stage and the publish have to run on a POSIX host, not on the Windows box
+that runs `release-local.sh`.** npm packs the file mode it finds on disk, and
+`chmod` on Windows cannot set the execute bit, so a darwin or linux binary
+staged there packs as mode 0644 and fails with a permission denied on the
+user's first run. `npm/stage.mjs` therefore refuses a POSIX target on Windows,
+up front and without staging anything, and it also refuses to finish a partial
+stage -- so a full stage on Windows cannot succeed, by design. A POSIX host can
+stage all five: the `.exe` packages need no mode. How the assembled release
+directory reaches that host is the part of the wiring that is still open.
+
+On that host, with `$RELEASE_DIR` holding the five binaries and the three
+attribution files:
 
 ```sh
 node npm/sync-packages.mjs --check || fail "npm manifests are stale for $TAG"
@@ -149,12 +168,11 @@ Notes for whoever wires it:
 
 ## Not wired yet
 
-- `scripts/ci-local.sh` does not run `node npm/sync-packages.mjs --check` or the
-  npm tests. It should, as a cheap non-compiling step next to step 11.
-- `README.md` and `install/README.md` still describe the npm package as planned
-  under `@yawlabs/oam` and as "a thin postinstall wrapper". Both are wrong now:
-  the name is `oamjs` and there is no postinstall. A docs pass owns those files.
-- Nothing is published. The names are unregistered.
+- The publish itself: no script stages or publishes these packages (see
+  "Publishing" above for what the step needs and where it has to run).
+- Nothing is published. The names are unregistered, while `README.md` and
+  `install/README.md` now name `oamjs` in a public repo -- reserve the names
+  on the registry before anyone else can.
 
 ## Windows: stop the server by closing stdin, not by killing the PID
 

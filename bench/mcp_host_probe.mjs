@@ -4,9 +4,15 @@
 // dist entry under each runtime and speaks newline-delimited JSON-RPC 2.0 over
 // stdio (the StdioServerTransport the @yawlabs servers use).
 //
-// This is the dogfood gate for "wire Yaw's MCP sidecars to run on oam": if the
-// handshake succeeds under oam, the launcher can prefer `oam run` (with a node
-// fallback). If it fails, the captured stderr is the oam node:-surface gap.
+// HISTORICAL: this was the first dogfood probe for "wire Yaw's MCP sidecars to
+// run on oam". Nothing in scripts/ or xtask runs it; the gate for that job is
+// scripts/mcp-sidecar-matrix.mjs, which covers the same handshake with a
+// control arm. Kept as a one-server, by-hand probe: if the handshake fails
+// under oam, the captured stderr is the oam node:-surface gap.
+//
+// The init time is wall-clock from spawn and is indicative only. Each runtime
+// gets one discarded run first, so neither measured run pays for a cold file
+// cache on the server's files.
 //
 // Usage:
 //   node bench/mcp_host_probe.mjs <server-dist-index.js> [oam-binary]
@@ -32,11 +38,20 @@ function probe(label, cmd, args) {
     const finish = (ok, err) => {
       if (done) return;
       done = true;
+      clearTimeout(timer);
       try { child.kill(); } catch {}
       resolve({ label, ok, initMs, toolCount, err: err || null, stderr: errBuf.slice(0, 600) });
     };
     const timer = setTimeout(() => finish(false, 'timeout (8s)'), 8000);
-    child.on('error', (e) => { clearTimeout(timer); finish(false, `spawn failed: ${e.message}`); });
+    child.on('error', (e) => finish(false, `spawn failed: ${e.message}`));
+    // A server that dies before answering is a crash, not a timeout: report it
+    // now, with its exit status, instead of waiting out the timer. 'close'
+    // rather than 'exit' so the stderr captured for the report is complete.
+    child.on('close', (code, signal) => {
+      finish(false, `server exited before the handshake finished (${signal ?? `code ${code}`})`);
+    });
+    // The server may be gone by the time a request is written.
+    child.stdin.on('error', () => {});
     child.stderr.on('data', (c) => { errBuf += c.toString('utf8'); });
     child.stdout.on('data', (c) => {
       buf += c.toString('utf8');
@@ -48,12 +63,20 @@ function probe(label, cmd, args) {
         let msg;
         try { msg = JSON.parse(line); } catch { continue; }
         if (msg.id === 1 && initMs === null) {
+          // An error reply to initialize is a failed handshake, not an init.
+          if (msg.error || !msg.result) {
+            finish(false, `initialize failed: ${JSON.stringify(msg.error ?? msg).slice(0, 200)}`);
+            return;
+          }
           initMs = performance.now() - t0;
           child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
           child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }) + '\n');
         } else if (msg.id === 2) {
-          toolCount = (msg.result && msg.result.tools && msg.result.tools.length) || 0;
-          clearTimeout(timer);
+          if (msg.error || !msg.result) {
+            finish(false, `tools/list failed: ${JSON.stringify(msg.error ?? msg).slice(0, 200)}`);
+            return;
+          }
+          toolCount = (msg.result.tools && msg.result.tools.length) || 0;
           finish(true);
         }
       }
@@ -65,6 +88,9 @@ function probe(label, cmd, args) {
   });
 }
 
+// Discarded priming runs, one per runtime (see the header).
+await probe('node', process.execPath, [entry]);
+await probe('oam', oamBin, ['run', entry]);
 const node = await probe('node', process.execPath, [entry]);
 const oam = await probe('oam', oamBin, ['run', entry]);
 for (const r of [node, oam]) {

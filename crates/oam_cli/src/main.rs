@@ -188,7 +188,8 @@ enum Command {
         /// payload and builds its own bytecode cache lazily on first run.
         #[arg(long, value_name = "PATH")]
         carrier: Option<PathBuf>,
-        /// Reserved for future use (minify the embedded source).
+        /// Reserved for future use; accepted, prints a notice, changes nothing
+        /// (the source is embedded as written).
         #[arg(long)]
         minify: bool,
     },
@@ -224,8 +225,8 @@ enum Command {
 enum CacheAction {
     /// Print the bytecode cache directory, its entry count and total size.
     Info,
-    /// Delete the bytecode cache. Safe at any time: the next run recompiles
-    /// and repopulates it.
+    /// Delete the bytecode cache and the transpile cache beside it. Safe at
+    /// any time: the next run recompiles and repopulates them.
     Clean,
 }
 
@@ -356,7 +357,7 @@ after `run` (the `deno run --flag` shape):
 
   oam --throw-deprecation run app.ts
   oam run --throw-deprecation app.ts        # the same run
-  oam --permission --allow-net --allow-env=node -- node script.js
+  oam --permission --allow-net --allow-env=HOME script.js
   oam --env-file=.env serve app.ts
 
 `--` after `run` passes arguments to the script, as before. (--inspect and
@@ -453,7 +454,6 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
                     | "--env-file-if-exists"
                     | "--input-type"
                     | "--max-http-header-size"
-                    | "--max-old-space-size"
                     | "--v8-pool-size"
                     | "--trace-require-module"
                     | "--dns-result-order"
@@ -463,6 +463,11 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
                     | "--allow-fs-write"
             ) && argv.get(i + 1).is_some_and(|v| !v.starts_with('-'))
             {
+                consumed_as_value = true;
+            }
+            // `--max-old-space-size` takes the next token whatever it is, as
+            // the pre-parse does (a dash-led `-5` is a value node reads).
+            if arg == "--max-old-space-size" && i + 1 < argv.len() {
                 consumed_as_value = true;
             }
             i += 1;
@@ -493,6 +498,11 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
     // ahead of the subcommand, keeping their relative order; the first
     // token that is not one (the file, `--`, or an unknown flag) ends it.
     let mut lifted: Vec<String> = Vec::new();
+    // The argv POSITIONS of the lifted tokens. The reassembly below removes
+    // by position, never by value: a flag value may spell the subcommand
+    // (`oam run --env-file run app.ts`) or repeat an unlifted token, and a
+    // by-value filter would delete those too.
+    let mut lifted_at: Vec<usize> = Vec::new();
     let mut j = sub + 1;
     let mut value_pending = false;
     while j < argv.len() {
@@ -500,6 +510,7 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
         if value_pending {
             // The value of a flag just lifted; it moves with it.
             lifted.push(arg);
+            lifted_at.push(j);
             value_pending = false;
             j += 1;
             continue;
@@ -541,13 +552,20 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
             // then consume `run` as its value, sending a no-FILE clap
             // parse into the REPL. Leave such a flag in place and stop:
             // the run it belonged to cannot proceed anyway.
-            if takes_spaced_value && !argv.get(j + 1).is_some_and(|v| !v.starts_with('-')) {
+            //
+            // `--max-old-space-size` is the exception: like the pre-parse,
+            // it takes the next token whatever it is (`-5` is a value node
+            // reads), and with none it lifts alone, so the pre-parse refuses
+            // it in node's words instead of clap calling it unexpected.
+            if arg == "--max-old-space-size" {
+                value_pending = j + 1 < argv.len();
+            } else if takes_spaced_value && !argv.get(j + 1).is_some_and(|v| !v.starts_with('-')) {
                 break;
-            }
-            if takes_spaced_value {
+            } else if takes_spaced_value {
                 value_pending = true;
             }
             lifted.push(arg);
+            lifted_at.push(j);
             j += 1;
             continue;
         }
@@ -563,13 +581,24 @@ fn lift_node_flags_after_subcommand(mut argv: Vec<String>) -> Vec<String> {
     // j and the end moves.
     let mut head = argv[..sub].to_vec();
     head.extend(lifted.iter().cloned());
-    let lifted_set: std::collections::HashSet<&String> = lifted.iter().collect();
-    let mut tail: Vec<String> = argv[sub..j].to_vec();
-    tail.retain(|t| !lifted_set.contains(t));
+    let mut tail: Vec<String> = (sub..j)
+        .filter(|at| !lifted_at.contains(at))
+        .map(|at| argv[at].clone())
+        .collect();
     tail.extend_from_slice(&argv[j..]);
     argv = head;
     argv.extend(tail);
     argv
+}
+
+/// The process arguments as Strings, decoded lossily. `std::env::args()`
+/// PANICS on the first argument that is not valid Unicode (a raw 0xFF byte on
+/// unix, a lone surrogate on Windows), where node starts normally. What does
+/// not decode becomes U+FFFD.
+fn lossy_args() -> Vec<String> {
+    std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
 }
 
 fn main() -> ExitCode {
@@ -609,7 +638,7 @@ fn main() -> ExitCode {
         panic!("oam crash-reporter self-test");
     }
     if let Some((source, bytecode)) = extract_embedded() {
-        return run_embedded(&source, bytecode, std::env::args().collect());
+        return run_embedded(&source, bytecode, lossy_args());
     }
 
     // Node-style top-level flags, intercepted before clap (they are not
@@ -618,7 +647,7 @@ fn main() -> ExitCode {
     // shape). Suite children spawn process.execPath with these shapes --
     // the compat surface that unblocks spawnPromisified-shaped tests.
     {
-        let argv: Vec<String> = std::env::args().collect();
+        let argv: Vec<String> = lossy_args();
         // Node-style runtime flags given right after a subcommand (#471,
         // the `deno run --flag` shape) are lifted to the FRONT of argv, so
         // the same pre-parse that reads `oam --flag run x.ts` reads them
@@ -900,24 +929,34 @@ fn main() -> ExitCode {
                 flags.dns_result_order_spaced = spaced;
                 i += if spaced { 2 } else { 1 };
             } else if let Some(v) = arg.strip_prefix("--max-old-space-size=") {
-                // Maps to `OAM_MAX_HEAP_MB` (oam's --max-old-space-size analogue).
-                // Empty is node's exit 9; here a bad token is ignored instead.
-                if !v.is_empty() {
-                    flags.max_old_space_mb = Some(v.to_string());
+                // The value is read HERE so a bad one is refused naming the
+                // flag, node's exit 9 and words. An empty value or `0` is
+                // node's "use the default": accepted, and applied as no
+                // request at all (`resolve_max_old_space`).
+                if classify_max_old_space_size(v) == MaxOldSpace::Illegal {
+                    let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                    eprintln!("{}", max_old_space_illegal(exe, arg));
+                    return ExitCode::from(9);
                 }
+                flags.max_old_space_mb = Some(v.to_string());
+                flags.max_old_space_mb_spaced = false;
                 i += 1;
             } else if arg == "--max-old-space-size" {
-                match raw.get(i + 1) {
-                    Some(v) => {
-                        flags.max_old_space_mb = Some(v.clone());
-                        flags.max_old_space_mb_spaced = true;
-                        i += 2;
-                    }
-                    None => {
-                        eprintln!("oam: --max-old-space-size requires an argument");
-                        return ExitCode::from(9);
-                    }
-                }
+                // The next token is the value whatever it is, so one that is
+                // not a number -- a subcommand, a script path, another flag --
+                // is refused rather than swallowed, and so is no token at
+                // all. node names the bare flag either way (v22.22.2).
+                let value = raw
+                    .get(i + 1)
+                    .filter(|v| classify_max_old_space_size(v) != MaxOldSpace::Illegal);
+                let Some(v) = value else {
+                    let exe = argv.first().map(String::as_str).unwrap_or("oam");
+                    eprintln!("{}", max_old_space_illegal(exe, arg));
+                    return ExitCode::from(9);
+                };
+                flags.max_old_space_mb = Some(v.clone());
+                flags.max_old_space_mb_spaced = true;
+                i += 2;
             } else if let Some(v) = arg.strip_prefix("--title=") {
                 flags.title = Some(v.to_string());
                 i += 1;
@@ -1042,19 +1081,30 @@ fn main() -> ExitCode {
                 break;
             }
         }
+        // A `--max-old-space-size` node refuses in NODE_OPTIONS: its exit 9,
+        // before anything runs.
+        if let Some(refusal) = &env_flags.max_old_space_refused {
+            let exe = argv.first().map(String::as_str).unwrap_or("oam");
+            eprintln!("{}", refusal.message(exe));
+            return ExitCode::from(9);
+        }
+        // Hand `--max-old-space-size` to the engine with where it came from,
+        // for `resolve_heap_cap` and the OOM banner. Must happen here (before
+        // any early return below: eval, bare-script, dispatch) -- before the
+        // first isolate. A usable value wins over `OAM_MAX_HEAP_MB`; one that
+        // asks for nothing (`0`, empty) leaves the variable in force. Not
+        // written into the environment: that would reach process.env and
+        // every child process, which would then take the cap as its own.
+        let (max_old_space, warnings) = resolve_max_old_space(&env_flags, &flags);
+        for warning in warnings {
+            eprintln!("{warning}");
+        }
+        if let Some((mb, source)) = max_old_space {
+            oam_engine::set_max_old_space_size(mb, source);
+        }
         // Everything from here on runs with both sources: NODE_OPTIONS under
         // argv, argv kept aside for execArgv.
         let flags = env_flags.merged(flags);
-        // Apply `--max-old-space-size` to `OAM_MAX_HEAP_MB` so
-        // `resolve_heap_cap()` picks it up. Must happen here (before any
-        // early return below: eval, bare-script, dispatch) -- before the
-        // runtime starts. The flag value wins over any pre-existing env var.
-        if let Some(mb) = &flags.max_old_space_mb {
-            // SAFETY: `set_var` on a single env var before any thread starts
-            // is safe; we set it here and never touch the var again except
-            // through `std::env::var` which is synchronous and safe.
-            unsafe { std::env::set_var("OAM_MAX_HEAP_MB", mb) };
-        }
         // V8 flags must be set before V8::initialize, i.e. before any
         // JsRuntime is constructed.
         // The loader decides whether `internal/...` resolves, and it reads
@@ -1197,7 +1247,11 @@ fn main() -> ExitCode {
         }
     }
 
-    dispatch(Cli::parse_from(std::env::args()))
+    // Lossy like the pre-parse above, not args(): std::env::args() panics on
+    // an argument that is not valid Unicode. A script argument that does not
+    // decode reaches process.argv with U+FFFD in it; a script PATH that does
+    // not decode names no file and is reported as not found.
+    dispatch(Cli::parse_from(lossy_args()))
 }
 
 /// Node process-level flags parsed before the subcommand, stashed for the
@@ -1366,13 +1420,29 @@ fn dispatch(cli: Cli) -> ExitCode {
             frozen_lockfile,
             precompile,
         } => install_command(*frozen_lockfile, *precompile, cli.json),
-        Command::Trust { action } => trust_command(action),
+        Command::Trust { action } => {
+            let code = trust_command(action);
+            // A malformed trust file is a queued loader warning (the loader
+            // never prints); drain it here like every other command does.
+            report_loader_warnings(cli.json);
+            code
+        }
         Command::Compile {
             entry,
             output,
             carrier,
-            minify: _,
-        } => compile_command(entry, output, carrier.as_deref()),
+            minify,
+        } => {
+            // Accepted and inert, so say so: a build that asked for a
+            // minified payload should not finish looking as if it got one.
+            if *minify {
+                eprintln!(
+                    "oam compile: --minify is reserved and not implemented; \
+                     the source is embedded as written"
+                );
+            }
+            compile_command(entry, output, carrier.as_deref())
+        }
         Command::Cache { action } => cache_command(action, cli.json),
         Command::SelfUpdate { version, dry_run } => {
             self_update::command(version.as_deref(), *dry_run)
@@ -1434,8 +1504,6 @@ fn error_count(diagnostics: &[Diagnostic]) -> usize {
         .count()
 }
 
-/// `oam run` with the typed loop: strip-and-run starts immediately; the
-/// checker runs concurrently (warn), gates (block), or stays off.
 /// Resolve the `--inspect` / `--inspect-brk` flags into an optional
 /// (address, break-on-start) pair. `--inspect-brk` wins if both are given.
 /// The value is `PORT` or `HOST:PORT`; a bare port binds 127.0.0.1.
@@ -1459,6 +1527,8 @@ fn resolve_inspect(
     Ok(Some((addr, brk)))
 }
 
+/// `oam run` with the typed loop: strip-and-run starts immediately; the
+/// checker runs concurrently (warn), gates (block), or stays off.
 fn run_command(
     file: &Path,
     check: CheckMode,
@@ -1649,31 +1719,73 @@ fn check_path(path: &Path, json: bool, no_daemon: bool) -> ExitCode {
     }
 }
 
-/// Brace/paren/bracket balance ignoring string/template contents — the
-/// REPL's multi-line continuation heuristic.
+/// Brace/paren/bracket balance ignoring string/template and comment
+/// contents — the REPL's multi-line continuation heuristic.
+///
+/// It is a heuristic, not a lexer, and it errs toward "balanced": a wrong
+/// "balanced" hands the text to the parser, whose error is the user's to
+/// read, while a wrong "unbalanced" holds the prompt in continuation mode.
+/// So a `'` or `"` string ends at the end of its line unless the newline is
+/// escaped (JS has no other multi-line form for them; only a template
+/// spans lines), and `//` and `/* */` comments are skipped, which keeps an
+/// apostrophe in a comment or in a regex literal from opening a string that
+/// never closes.
 fn input_balanced(source: &str) -> bool {
     let mut depth: i64 = 0;
     let mut quote: Option<char> = None;
     let mut escaped = false;
-    for ch in source.chars() {
+    let mut block_comment = false;
+    // The previous code character, so the `/` of an escaped `\/` inside a
+    // regex literal is not read as the start of a comment.
+    let mut prev = '\0';
+    let mut chars = source.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if block_comment {
+            if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                block_comment = false;
+            }
+            continue;
+        }
         if let Some(q) = quote {
             if escaped {
                 escaped = false;
             } else if ch == '\\' {
                 escaped = true;
-            } else if ch == q {
+            } else if ch == q || (ch == '\n' && q != '`') {
                 quote = None;
             }
             continue;
         }
         match ch {
-            '\'' | '"' | '`' => quote = Some(ch),
+            '/' if prev != '\\' && chars.peek() == Some(&'/') => {
+                // Line comment: nothing up to the newline counts.
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+                prev = '\0';
+                continue;
+            }
+            '/' if prev != '\\' && chars.peek() == Some(&'*') => {
+                chars.next();
+                block_comment = true;
+                prev = '\0';
+                continue;
+            }
+            '\'' | '"' | '`' => {
+                quote = Some(ch);
+                prev = '\0';
+                continue;
+            }
             '{' | '(' | '[' => depth += 1,
             '}' | ')' | ']' => depth -= 1,
             _ => {}
         }
+        prev = ch;
     }
-    depth <= 0 && quote.is_none()
+    depth <= 0 && quote.is_none() && !block_comment
 }
 
 /// The typed REPL: every line runs through the oxc TypeScript strip, so
@@ -1700,6 +1812,7 @@ fn repl_command() -> ExitCode {
     // The process-level flags (--no-warnings and the rest), as a script run
     // gets them: the REPL used to start with none.
     flags.install(&mut rt);
+    flags.install_exec_argv(&mut rt);
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "oam".to_string());
@@ -1732,13 +1845,24 @@ fn repl_command() -> ExitCode {
         match rx.recv_timeout(std::time::Duration::from_millis(40)) {
             Ok(None) => break,
             Ok(Some(line)) => {
+                // `.exit` and `.break` are read in continuation mode too, as
+                // node's REPL reads them: they are the way out of a
+                // multi-line input that will never balance.
+                match line.trim() {
+                    ".exit" => break,
+                    ".break" => {
+                        buffer.clear();
+                        prompt(false);
+                        continue;
+                    }
+                    _ => {}
+                }
                 if buffer.is_empty() {
                     let trimmed = line.trim();
                     match trimmed {
-                        ".exit" => break,
                         ".help" => {
                             println!(
-                                ".exit  quit | .help  this | `_` holds the last value | top-level await works"
+                                ".exit  quit | .break  drop a multi-line input | .help  this | `_` holds the last value | top-level await works"
                             );
                             prompt(false);
                             continue;
@@ -1854,6 +1978,17 @@ fn discover_test_files(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// data. Exit 0 only when every discovered test passed.
 fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode {
     drain_loader_warnings_on_hard_exit(json);
+    // A path the user NAMED must exist. Discovery reads a root that is not a
+    // file as a directory and a directory it cannot read as empty, so a
+    // mistyped path beside a real one used to be dropped and the run could
+    // exit 0 having tested less than was asked for.
+    let missing: Vec<&PathBuf> = paths.iter().filter(|p| !p.exists()).collect();
+    if !missing.is_empty() {
+        for path in &missing {
+            eprintln!("oam test: no such file or directory: {}", path.display());
+        }
+        return ExitCode::FAILURE;
+    }
     let files = discover_test_files(paths);
     if files.is_empty() {
         eprintln!(
@@ -1896,6 +2031,9 @@ fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode
         if flags.apply_env_files(&mut rt).is_err() {
             return ExitCode::from(9);
         }
+        // As a script run has it: a test that forks or spawns from
+        // process.execArgv hands the child the flags this run was given.
+        flags.install_exec_argv(&mut rt);
 
         let evaluated = if rt.entry_module_kind(file) == oam_loader::ModuleKind::Cjs {
             rt.execute_cjs(file, &CliHost)
@@ -2238,7 +2376,6 @@ fn trust_command(action: &TrustAction) -> ExitCode {
     }
 }
 
-/// Walk upward from `start` looking for a directory that contains `target`.
 /// Split NODE_OPTIONS the way Node does: on whitespace, honoring single and
 /// double quotes (no escape processing inside quotes).
 fn split_node_options(raw: &str) -> Vec<String> {
@@ -2339,15 +2476,37 @@ fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
                 None => flags.dns_result_order_missing = Some("--dns-result-order"),
             }
         } else if let Some(v) = tok.strip_prefix("--max-old-space-size=") {
-            // Maps to `OAM_MAX_HEAP_MB` (oam's --max-old-space-size analogue).
-            // Empty is node's exit 9; here a bad token is ignored instead.
-            if !v.is_empty() {
+            // A value node cannot read is its exit 9 from NODE_OPTIONS too;
+            // kept as a refusal, reported before anything runs. An empty one
+            // is node's "use the default" and is kept as such.
+            if classify_max_old_space_size(v) == MaxOldSpace::Illegal {
+                flags.max_old_space_refused = Some(MaxOldSpaceRefusal::Illegal(tok.to_string()));
+            } else {
                 flags.max_old_space_mb = Some(v.to_string());
+                flags.max_old_space_mb_spaced = false;
             }
-        } else if tok == "--max-old-space-size"
-            && let Some(v) = it.next()
-        {
-            flags.max_old_space_mb = Some(v.clone());
+        } else if tok == "--max-old-space-size" {
+            // The spaced form, which node itself never reads from
+            // NODE_OPTIONS: a following whole number is taken as the size
+            // (oam's own extension, docs/node-divergences.md 5a), and the
+            // rest is refused as node refuses it. node reads a dash-led token
+            // behind it as its next option: one it allows in NODE_OPTIONS
+            // leaves the size without a value (illegal value), any other
+            // (`-5`, `-abc`, `--bogus`, `-e`) is not allowed there.
+            match it.next_if(|v| !v.starts_with('-')) {
+                Some(v) if classify_max_old_space_size(v) != MaxOldSpace::Illegal => {
+                    flags.max_old_space_mb = Some(v.clone());
+                    flags.max_old_space_mb_spaced = true;
+                }
+                next => {
+                    flags.max_old_space_refused = Some(match (next, it.peek()) {
+                        (None, Some(v)) if v.len() > 1 && !is_folded_node_option(v) => {
+                            MaxOldSpaceRefusal::NotAllowed(v.to_string())
+                        }
+                        _ => MaxOldSpaceRefusal::Illegal("--max-old-space-size".into()),
+                    });
+                }
+            }
         } else if tok == "--no-warnings" {
             flags.no_warnings = true;
         } else if tok == "--no-deprecation" {
@@ -2420,11 +2579,181 @@ fn apply_node_option_tokens(flags: &mut NodeFlags, tokens: &[String]) -> bool {
     before != *flags
 }
 
+/// The options [`apply_node_option_tokens`] reads that node v22.22.2 also
+/// allows in NODE_OPTIONS (`process.allowedNodeEnvironmentFlags`; oam's
+/// `--allow-net` and `--allow-env` are not among them). Keep in step with that
+/// fold when it learns an option.
+const FOLDED_NODE_OPTIONS: &[&str] = &[
+    "--pending-deprecation",
+    "--max-http-header-size",
+    "--v8-pool-size",
+    "--insecure-http-parser",
+    "--trace-require-module",
+    "--dns-result-order",
+    "--max-old-space-size",
+    "--no-warnings",
+    "--no-deprecation",
+    "--trace-warnings",
+    "--trace-deprecation",
+    "--throw-deprecation",
+    "--trace-uncaught",
+    "--expose-gc",
+    "--tls-min-v1.0",
+    "--tls-min-v1.1",
+    "--tls-min-v1.2",
+    "--tls-min-v1.3",
+    "--tls-max-v1.2",
+    "--tls-max-v1.3",
+    "--disable-warning",
+    "--permission",
+    "--allow-fs-read",
+    "--allow-fs-write",
+    "--allow-child-process",
+    "--allow-worker",
+    "--allow-addons",
+    "--redirect-warnings",
+];
+
+/// Whether a NODE_OPTIONS token is one of [`FOLDED_NODE_OPTIONS`], in either
+/// spelling (`--name` or `--name=value`). node allows many more options in
+/// NODE_OPTIONS than oam reads; one of those after a valueless spaced
+/// `--max-old-space-size` gets node's "not allowed" wording from oam where
+/// node prints "illegal value" (both exit 9; docs/node-divergences.md 5a).
+fn is_folded_node_option(tok: &str) -> bool {
+    let name = tok.split_once('=').map_or(tok, |(name, _)| name);
+    FOLDED_NODE_OPTIONS.contains(&name)
+}
+
+/// What a `--max-old-space-size` value asks for. It is read here, where the
+/// flag can still be named, and the cap handed to the engine with its source
+/// (`oam_engine::set_max_old_space_size`), never through `OAM_MAX_HEAP_MB`.
+#[derive(Debug, PartialEq, Eq)]
+enum MaxOldSpace {
+    /// A positive whole number of megabytes.
+    Cap(usize),
+    /// `0` or an empty value: node's "use the default" (v22.22.2 runs both
+    /// with its default heap limit, exit 0). No cap is requested.
+    UseDefault,
+    /// A whole number V8 will not take as a `size_t` (negative, or `2^63` and
+    /// up): V8 reports it out of bounds and node goes on without it (exit 0).
+    OutOfBounds,
+    /// Anything else (`abc`, `512m`, `1.5`, `0x10`): node's exit 9.
+    Illegal,
+}
+
+/// Classify a `--max-old-space-size` value (see [`MaxOldSpace`]).
+fn classify_max_old_space_size(value: &str) -> MaxOldSpace {
+    let value = value.trim();
+    if value.is_empty() {
+        return MaxOldSpace::UseDefault;
+    }
+    let all_digits = |d: &str| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit());
+    match value.parse::<usize>() {
+        Ok(0) => MaxOldSpace::UseDefault,
+        // node v22.22.2 runs 9223372036854775807 (i64::MAX) and reports
+        // 9223372036854775808 (2^63) and every value above it out of bounds,
+        // although the message names size_t's range.
+        Ok(mb) if mb > i64::MAX as usize => MaxOldSpace::OutOfBounds,
+        Ok(mb) => MaxOldSpace::Cap(mb),
+        Err(_) => {
+            let unsigned = value.strip_prefix('+').unwrap_or(value);
+            let negative = value.strip_prefix('-').is_some_and(all_digits);
+            if negative || all_digits(unsigned) {
+                MaxOldSpace::OutOfBounds
+            } else {
+                MaxOldSpace::Illegal
+            }
+        }
+    }
+}
+
+/// node's refusal of a `--max-old-space-size` value it cannot read, exit 9:
+/// V8's two lines, then node's own (v22.22.2; node goes on to list five
+/// internal V8 flags of its own as bad options too, which is not repeated).
+/// `flag` is the token as node names it: `--max-old-space-size=abc`, or the
+/// bare `--max-old-space-size` of the spaced form.
+fn max_old_space_illegal(exe: &str, flag: &str) -> String {
+    format!(
+        "Error: illegal value for flag {flag} of type size_t\n\
+         Try --help for options\n\
+         {exe}: bad option: {flag}"
+    )
+}
+
+/// V8's report of an out-of-bounds `--max-old-space-size`, after which node
+/// runs on without the value (exit 0).
+fn max_old_space_out_of_bounds(flag: &str) -> String {
+    format!(
+        "Error: Value for flag {flag} of type size_t is out of bounds [0-{}]\n\
+         Try --help for options",
+        usize::MAX
+    )
+}
+
+/// A `--max-old-space-size` in NODE_OPTIONS that node refuses at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MaxOldSpaceRefusal {
+    /// A value it cannot read, or none: [`max_old_space_illegal`] for the
+    /// token as node names it.
+    Illegal(String),
+    /// The spaced form given a dash-led value (`--max-old-space-size -5`):
+    /// node reads the value as an option of its own, not allowed there.
+    NotAllowed(String),
+}
+
+impl MaxOldSpaceRefusal {
+    fn message(&self, exe: &str) -> String {
+        match self {
+            Self::Illegal(flag) => max_old_space_illegal(exe, flag),
+            Self::NotAllowed(value) => format!("{exe}: {value} is not allowed in NODE_OPTIONS"),
+        }
+    }
+}
+
+/// The heap cap `--max-old-space-size` asks for, NODE_OPTIONS's then argv's
+/// in node's order: a usable value replaces the one before it, `0` or empty
+/// puts the default back, and an out-of-bounds one is reported (returned as
+/// the lines to print) and leaves what was there. `None` is no request:
+/// `OAM_MAX_HEAP_MB` and the defaults decide.
+fn resolve_max_old_space(
+    env: &NodeFlags,
+    argv: &NodeFlags,
+) -> (Option<(usize, oam_engine::MaxOldSpaceSource)>, Vec<String>) {
+    let mut cap = None;
+    let mut warnings = Vec::new();
+    for (flags, source) in [
+        (env, oam_engine::MaxOldSpaceSource::NodeOptions),
+        (argv, oam_engine::MaxOldSpaceSource::Argv),
+    ] {
+        let Some(value) = flags.max_old_space_mb.as_deref() else {
+            continue;
+        };
+        match classify_max_old_space_size(value) {
+            MaxOldSpace::Cap(mb) => cap = Some((mb, source)),
+            MaxOldSpace::UseDefault => cap = None,
+            MaxOldSpace::OutOfBounds => {
+                let flag = if flags.max_old_space_mb_spaced {
+                    "--max-old-space-size".to_string()
+                } else {
+                    format!("--max-old-space-size={value}")
+                };
+                warnings.push(max_old_space_out_of_bounds(&flag));
+            }
+            // Refused where it was parsed (argv exits 9, NODE_OPTIONS keeps
+            // a refusal), so it never arrives.
+            MaxOldSpace::Illegal => {}
+        }
+    }
+    (cap, warnings)
+}
+
 /// The values node's `--trace-require-module` takes.
 fn is_trace_require_module_value(value: &str) -> bool {
     matches!(value, "all" | "no-node-modules")
 }
 
+/// Walk upward from `start` looking for a directory that contains the FILE
+/// `target`.
 fn find_project_dir(start: &Path, target: &str) -> Option<PathBuf> {
     let mut dir = Some(start.to_path_buf());
     while let Some(current) = dir {
@@ -2570,31 +2899,45 @@ fn serve_with_workers(
     json: bool,
     inspect: Option<(std::net::SocketAddr, bool)>,
 ) -> ExitCode {
-    let handler_abs = std::path::absolute(handler)
-        .unwrap_or_else(|_| handler.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
-        .replace('\\', "/");
+    // `\` is a path separator only on Windows; elsewhere it is an ordinary
+    // file-name character and rewriting it would name a different file.
+    let forward_slashes = |path: String| {
+        if cfg!(windows) {
+            path.replace('\\', "/")
+        } else {
+            path
+        }
+    };
+    let handler_abs = forward_slashes(
+        std::path::absolute(handler)
+            .unwrap_or_else(|_| handler.to_path_buf())
+            .to_string_lossy()
+            .into_owned(),
+    );
 
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("oam-serve-{}-{nanos}", std::process::id()));
-    own_files::create_dir_all(&dir, Audience::Scratch).expect("temp dir");
+    // A directory this call creates, never one found already there: the
+    // dispatcher and worker shim written into it are what run.
+    let dir = own_files::create_scratch_dir(&std::env::temp_dir(), "oam-serve-").expect("temp dir");
+    // The removal below only runs if the dispatcher RETURNS; a server ended
+    // by process.exit() leaves from inside the op. Registered so the
+    // hard-exit path removes the directory too.
+    oam_engine::register_exit_cleanup(dir.clone());
 
     let worker_path = dir.join("_pool_worker.cjs");
     own_files::write(&worker_path, POOL_WORKER_CJS, Audience::Scratch).expect("write worker shim");
 
-    let worker_path_str = worker_path
-        .to_string_lossy()
-        .into_owned()
-        .replace('\\', "/");
+    let worker_path_str = forward_slashes(worker_path.to_string_lossy().into_owned());
 
+    // The two paths go in as JSON string literals, quotes included: a path
+    // is data, and one holding a `"`, a `\` or a newline must still be the
+    // same string on the JS side. `__OAM_HANDLER__` is substituted LAST so a
+    // handler path that happens to contain another placeholder's name is
+    // not rewritten by a later pass.
+    let js_string = |s: &str| serde_json::to_string(s).expect("a string serializes");
     let dispatcher_src = POOL_DISPATCHER_CJS
         .replace("__OAM_WORKERS__", &workers.to_string())
-        .replace("__OAM_HANDLER__", &handler_abs)
-        .replace("__OAM_WORKER_SCRIPT__", &worker_path_str);
+        .replace("__OAM_WORKER_SCRIPT__", &js_string(&worker_path_str))
+        .replace("__OAM_HANDLER__", &js_string(&handler_abs));
 
     let dispatcher_path = dir.join("_pool_dispatcher.cjs");
     own_files::write(&dispatcher_path, &dispatcher_src, Audience::Scratch)
@@ -2618,43 +2961,75 @@ const http = require("http");
 const { Worker } = require("worker_threads");
 
 const WORKER_COUNT = __OAM_WORKERS__;
-const HANDLER = "__OAM_HANDLER__";
-const WORKER_SCRIPT = "__OAM_WORKER_SCRIPT__";
+const HANDLER = __OAM_HANDLER__;
+const WORKER_SCRIPT = __OAM_WORKER_SCRIPT__;
 
+// The workers still able to take a request, and the requests each one has
+// not answered yet: id -> { res, worker }.
 const workers = [];
+const pending = new Map();
+let nextId = 1;
+let nextWorker = 0;
+
+function refuse(res, status, text) {
+  if (res.headersSent) {
+    res.end();
+    return;
+  }
+  res.writeHead(status, { "content-type": "text/plain" });
+  res.end(text);
+}
+
+// A worker that has stopped takes no more requests, and the ones it was
+// holding are answered rather than left open. Called from both "error" and
+// "exit"; the second call finds nothing to do.
+function retire(w) {
+  const at = workers.indexOf(w);
+  if (at === -1) return;
+  workers.splice(at, 1);
+  for (const [id, entry] of pending) {
+    if (entry.worker !== w) continue;
+    pending.delete(id);
+    refuse(entry.res, 502, "oam serve: the worker handling this request stopped\n");
+  }
+  if (workers.length === 0) {
+    console.error("oam serve: every worker has stopped");
+    process.exit(1);
+  }
+}
+
 for (let i = 0; i < WORKER_COUNT; i++) {
   const w = new Worker(WORKER_SCRIPT, {
     workerData: { handler: HANDLER, workerId: i },
   });
   w.on("error", (err) => {
-    console.error("worker " + i + " error:", err.message);
+    console.error("worker " + i + " error:", err && err.message);
+    retire(w);
+  });
+  w.on("exit", () => retire(w));
+  w.on("message", (msg) => {
+    const entry = pending.get(msg.id);
+    if (!entry) return;
+    pending.delete(msg.id);
+    entry.res.writeHead(msg.status, msg.headers || {});
+    entry.res.end(msg.body ? Buffer.from(msg.body, "base64") : undefined);
   });
   workers.push(w);
 }
 
-const pending = new Map();
-let nextId = 1;
-let nextWorker = 0;
-
-for (const w of workers) {
-  w.on("message", (msg) => {
-    const res = pending.get(msg.id);
-    if (!res) return;
-    pending.delete(msg.id);
-    res.writeHead(msg.status, msg.headers || {});
-    res.end(msg.body ? Buffer.from(msg.body, "base64") : undefined);
-  });
-}
-
 const server = http.createServer((req, res) => {
   const id = nextId++;
-  pending.set(id, res);
   const chunks = [];
   req.on("data", (chunk) => chunks.push(chunk));
   req.on("end", () => {
     const body = Buffer.concat(chunks);
-    const worker = workers[nextWorker % WORKER_COUNT];
+    if (workers.length === 0) {
+      refuse(res, 503, "oam serve: no worker is running\n");
+      return;
+    }
+    const worker = workers[nextWorker % workers.length];
     nextWorker++;
+    pending.set(id, { res: res, worker: worker });
     worker.postMessage({
       id: id,
       method: req.method,
@@ -2665,7 +3040,10 @@ const server = http.createServer((req, res) => {
   });
 });
 
-const port = parseInt(process.env.PORT) || 3000;
+// 0 is a real answer (`--port 0`: any free port), so only a PORT that is not
+// a number falls back to the default.
+const envPort = parseInt(process.env.PORT, 10);
+const port = Number.isNaN(envPort) ? 3000 : envPort;
 const host = process.env.HOST || "0.0.0.0";
 server.listen(port, host, () => {
   const addr = server.address();
@@ -2836,7 +3214,17 @@ fn run_file_with_flags(
     rt.set_process_argv(argv);
 
     if !matches!(replay_mode, oam_engine::ReplayMode::Off) {
-        rt.set_replay_mode(replay_mode);
+        // A trace that cannot be read or parsed ends the run here: carrying
+        // on would run the program live, with the real I/O and randomness
+        // --replay was asked to stand in for.
+        if let Err(message) = rt.set_replay_mode(replay_mode) {
+            return Err(err_exit(vec![Diagnostic::new(
+                "OAM-RT0002",
+                Severity::Error,
+                Origin::Runtime,
+                message,
+            )]));
+        }
         rt.apply_replay_patches();
     }
 
@@ -3115,16 +3503,6 @@ fn extract_embedded() -> Option<(String, Option<Vec<u8>>)> {
     None
 }
 
-/// Execute embedded JS source as a CJS script (the typical output of
-/// esbuild/rollup --format=cjs). Supports `--inspect` / `--inspect-brk`
-/// flags for debugging the compiled binary.
-/// `oam -e <code>` / `oam -p <code>`: evaluate a string as a CJS program,
-/// Node-shaped. The source runs from a file named `[eval]` inside the CWD
-/// so require() resolves relative paths and node_modules from the CWD the
-/// way node's eval does; -p prints the completion value via console.log.
-/// process.argv = [exe, ...extra] (node omits a script-path slot for eval).
-/// Falls back to a temp dir when the CWD is not writable (read-only mount,
-/// sandbox) -- require() resolution then roots at that temp dir.
 /// Node process-level flags accepted before any oam subcommand (also read
 /// from NODE_OPTIONS). They reach JS as non-enumerable globals -- node's own
 /// test/common leaked-globals check walks enumerable globals.
@@ -3219,12 +3597,15 @@ struct NodeFlags {
     /// size.
     dns_result_order: Option<String>,
     dns_result_order_spaced: bool,
-    /// `--max-old-space-size=N`: maps to `OAM_MAX_HEAP_MB` (oam's
-    /// `--max-old-space-size` analogue). Kept raw so execArgv hands it back
-    /// unchanged and a fork child sizes its heap the same way. Spaced as for
-    /// the header size.
+    /// `--max-old-space-size=N`: the V8 heap cap, in megabytes, ahead of
+    /// `OAM_MAX_HEAP_MB` (`resolve_max_old_space`). Kept raw so execArgv
+    /// hands it back unchanged and a fork child sizes its heap the same way.
+    /// Spaced as for the header size.
     max_old_space_mb: Option<String>,
     max_old_space_mb_spaced: bool,
+    /// A `--max-old-space-size` in NODE_OPTIONS that node refuses with exit 9
+    /// before anything runs (argv's is refused where it is parsed).
+    max_old_space_refused: Option<MaxOldSpaceRefusal>,
     /// The spelling of a `--dns-result-order` given no value in
     /// NODE_OPTIONS, which node refuses at startup with exit 9.
     dns_result_order_missing: Option<&'static str>,
@@ -3327,6 +3708,9 @@ impl NodeFlags {
                 .or(argv.dns_result_order_missing),
             max_old_space_mb,
             max_old_space_mb_spaced,
+            max_old_space_refused: env
+                .max_old_space_refused
+                .or(argv.max_old_space_refused.clone()),
             insecure_http_parser: env.insecure_http_parser || argv.insecure_http_parser,
             tls_min_v1_0: env.tls_min_v1_0 || argv.tls_min_v1_0,
             tls_min_v1_1: env.tls_min_v1_1 || argv.tls_min_v1_1,
@@ -3517,17 +3901,32 @@ impl NodeFlags {
     fn apply_env_files(&self, rt: &mut oam_engine::JsRuntime) -> Result<(), u8> {
         for (path, required) in &self.env_files {
             let literal = serde_json::to_string(path).unwrap_or_else(|_| "\"\"".into());
-            let script = format!("globalThis.process.loadEnvFile({literal});");
-            if let Err(e) = rt.execute_script("<env-file>", &script) {
-                if *required {
-                    let exe = std::env::current_exe()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_else(|_| "oam".to_string());
-                    let _ = e;
-                    eprintln!("{exe}: {path}: not found");
-                    return Err(9);
-                }
+            // The failure is caught in the script and handed back as
+            // [code, message], so a file that is there but cannot be loaded
+            // (a directory, one this user cannot read) is not reported as
+            // missing: node's `not found` wording is kept for ENOENT alone.
+            let script = format!(
+                "(function () {{ try {{ globalThis.process.loadEnvFile({literal}); return ''; }} \
+                 catch (e) {{ return JSON.stringify([String((e && e.code) || ''), \
+                 String((e && e.message) || e)]); }} }})()"
+            );
+            let failure = match rt.execute_script("<env-file>", &script) {
+                Ok(out) if out.is_empty() => continue,
+                Ok(out) => env_file_failure(&out),
+                Err(_) => (String::new(), "could not be loaded".to_string()),
+            };
+            let reason = env_file_failure_reason(&failure.0, &failure.1);
+            if *required {
+                let exe = std::env::current_exe()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "oam".to_string());
+                eprintln!("{exe}: {path}: {reason}");
+                return Err(9);
+            }
+            if failure.0 == "ENOENT" {
                 eprintln!("{path} not found. Continuing without it.");
+            } else {
+                eprintln!("{path}: {reason}. Continuing without it.");
             }
         }
         Ok(())
@@ -3583,6 +3982,18 @@ impl NodeFlags {
     /// The subset node reflects in process.execArgv: the flags argv gave,
     /// never NODE_OPTIONS's (a merged set answers for its `argv` half; one
     /// never merged answers for itself).
+    ///
+    /// Set as `process.execArgv` on a runtime that has just had the flags
+    /// installed. Left as the runtime's own empty array when argv gave none.
+    fn install_exec_argv(&self, rt: &mut oam_engine::JsRuntime) {
+        let exec_argv = self.exec_argv();
+        if !exec_argv.is_empty() {
+            let json = serde_json::to_string(&exec_argv).unwrap_or_else(|_| "[]".into());
+            let _ = rt.execute_script("<flags>", &format!("globalThis.process.execArgv = {json};"));
+        }
+    }
+
+    /// The flags node reflects in process.execArgv (see `install_exec_argv`).
     fn exec_argv(&self) -> Vec<String> {
         if let Some(argv) = &self.argv {
             return argv.exec_argv();
@@ -3596,6 +4007,37 @@ impl NodeFlags {
         }
         if self.experimental_vm_modules {
             out.push("--experimental-vm-modules".into());
+        }
+        // Every node option argv gave is listed, the process-wide ones and
+        // the ones that name a file included: fork re-spawns with
+        // [...execArgv, "run", file], and a child that is not handed
+        // `--zero-fill-buffers` allocates unzeroed buffers under a parent
+        // that asked for zeroed ones. The valued ones are handed back in
+        // the `=` spelling whichever way they were given.
+        if self.expose_internals {
+            out.push("--expose-internals".into());
+        }
+        if self.allow_natives_syntax {
+            out.push("--allow-natives-syntax".into());
+        }
+        if self.js_float16array {
+            out.push("--js-float16array".into());
+        }
+        if self.zero_fill_buffers {
+            out.push("--zero-fill-buffers".into());
+        }
+        if let Some(title) = &self.title {
+            out.push(format!("--title={title}"));
+        }
+        if let Some(kind) = &self.input_type {
+            out.push(format!("--input-type={kind}"));
+        }
+        for (path, required) in &self.env_files {
+            out.push(if *required {
+                format!("--env-file={path}")
+            } else {
+                format!("--env-file-if-exists={path}")
+            });
         }
         if self.permission {
             out.push("--permission".into());
@@ -3715,6 +4157,29 @@ impl NodeFlags {
     }
 }
 
+/// The `[code, message]` pair `apply_env_files` gets back from a failed
+/// `process.loadEnvFile`. Anything that is not that pair is kept whole as the
+/// message, with no code.
+fn env_file_failure(raw: &str) -> (String, String) {
+    match serde_json::from_str::<(String, String)>(raw) {
+        Ok(pair) => pair,
+        Err(_) => (String::new(), raw.to_string()),
+    }
+}
+
+/// What to say of an `--env-file` that did not load: node's `not found` for a
+/// file that is not there, and the error's own message for every other
+/// failure.
+fn env_file_failure_reason(code: &str, message: &str) -> String {
+    if code == "ENOENT" {
+        "not found".to_string()
+    } else if message.is_empty() {
+        "could not be loaded".to_string()
+    } else {
+        message.to_string()
+    }
+}
+
 /// Remove the eval source file (and its temp dir, when the CWD was not
 /// writable). Best-effort: a `process.exit()` inside the eval terminates the
 /// process before this runs, so the CWD file name carries the pid and a
@@ -3730,6 +4195,13 @@ fn cleanup_eval_artifacts(tmp_dir: Option<&Path>, tmp_file: &Path) {
     }
 }
 
+/// `oam -e <code>` / `oam -p <code>`: evaluate a string as a CJS program,
+/// Node-shaped. The source runs from a file named `[eval]` inside the CWD
+/// so require() resolves relative paths and node_modules from the CWD the
+/// way node's eval does; -p prints the completion value via console.log.
+/// process.argv = [exe, ...extra] (node omits a script-path slot for eval).
+/// Falls back to a temp dir when the CWD is not writable (read-only mount,
+/// sandbox) -- require() resolution then roots at that temp dir.
 fn run_eval(
     source: &str,
     print: bool,
@@ -3758,8 +4230,17 @@ fn run_eval(
         // the source written here is read back by this process.
         Some(p) if own_files::write(&p, "", Audience::Scratch).is_ok() => (None, p),
         _ => {
-            let dir = std::env::temp_dir().join(format!("oam-eval-{}", std::process::id()));
-            own_files::create_dir_all(&dir, Audience::Scratch).expect("create eval temp dir");
+            // A directory this call creates, never one found already there:
+            // the source written into it is read back and run, so it has to
+            // be this process's own, with nothing in it but what is written
+            // below.
+            let dir = match own_files::create_scratch_dir(&std::env::temp_dir(), "oam-eval-") {
+                Ok(dir) => dir,
+                Err(e) => {
+                    eprintln!("oam: could not create a directory for the eval source: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let file = dir.join(format!("__oam_eval.{ext}"));
             (Some(dir), file)
         }
@@ -3875,6 +4356,9 @@ fn run_eval(
     }
 }
 
+/// Execute embedded JS source as a CJS script (the typical output of
+/// esbuild/rollup --format=cjs). Supports `--inspect` / `--inspect-brk`
+/// flags for debugging the compiled binary.
 fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> ExitCode {
     // Parse --inspect / --inspect-brk from raw args (we bypass clap for
     // embedded binaries so the user's positional args pass through).
@@ -3975,13 +4459,14 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
 
     // Write the embedded source to a temp file so the CJS loader has a
     // real path for __filename / __dirname / require() resolution.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let tmp_dir = std::env::temp_dir().join(format!("oam-embed-{}-{nanos}", std::process::id()));
-    own_files::create_dir_all(&tmp_dir, Audience::Scratch)
+    // A directory this call creates, never one found already there: the
+    // source written into it is what runs.
+    let tmp_dir = own_files::create_scratch_dir(&std::env::temp_dir(), "oam-embed-")
         .expect("create temp dir for embedded source");
+    // The removal below only runs if the program RETURNS. One that calls
+    // process.exit() leaves from inside the op, so every such run left its
+    // whole source behind in temp; the hard-exit path removes it too.
+    oam_engine::register_exit_cleanup(tmp_dir.clone());
     let tmp_file = tmp_dir.join("__oam_embedded.js");
     own_files::write(&tmp_file, source, Audience::Scratch).expect("write embedded source to temp");
 
@@ -4263,9 +4748,10 @@ fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitC
     ExitCode::SUCCESS
 }
 
-/// `oam cache info|clean`: inspect or delete the V8 bytecode cache. The cache
-/// is a pure optimization, so `clean` is safe at any time -- the next run
-/// recompiles and repopulates it. `info` reports the directory this process
+/// `oam cache info|clean`: inspect or delete the V8 bytecode cache; `clean`
+/// also deletes the transpile cache beside it. Both are pure optimizations,
+/// so `clean` is safe at any time -- the next run
+/// recompiles and repopulates them. `info` reports the directory this process
 /// would use (`NODE_COMPILE_CACHE`'s per-build subdirectory wins, then
 /// `OAM_CACHE_DIR`, then the platform cache dir), the number
 /// of blobs and their total size; `--json` emits the same as one object.
@@ -4291,23 +4777,35 @@ fn cache_command(action: &CacheAction, json: bool) -> ExitCode {
         }
         CacheAction::Clean => {
             let path = oam_engine::code_cache_dir();
-            match oam_engine::code_cache_clean() {
-                Ok(()) => {
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({ "removed": path.to_string_lossy() })
-                        );
-                    } else {
-                        eprintln!("oam cache: removed {}", path.display());
-                    }
-                    ExitCode::SUCCESS
-                }
+            if let Err(e) = oam_engine::code_cache_clean() {
+                eprintln!("oam cache: could not remove {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+            // The transpile cache (`<cache dir>/transpile`) sits beside the
+            // bytecode one and is as disposable: clean covers both, or
+            // nothing but its own age sweep would ever empty it. `None`
+            // when this environment has no transpile cache directory.
+            let transpile = match oam_loader::transpile_cache::clean() {
+                Ok(removed) => removed,
                 Err(e) => {
-                    eprintln!("oam cache: could not remove {}: {e}", path.display());
-                    ExitCode::FAILURE
+                    let dir = oam_loader::transpile_cache::dir().unwrap_or_default();
+                    eprintln!("oam cache: could not remove {}: {e}", dir.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            if json {
+                let mut removed = serde_json::json!({ "removed": path.to_string_lossy() });
+                if let Some(dir) = &transpile {
+                    removed["removed_transpile"] = serde_json::json!(dir.to_string_lossy());
+                }
+                println!("{removed}");
+            } else {
+                eprintln!("oam cache: removed {}", path.display());
+                if let Some(dir) = &transpile {
+                    eprintln!("oam cache: removed {}", dir.display());
                 }
             }
+            ExitCode::SUCCESS
         }
     }
 }
@@ -4590,12 +5088,35 @@ mod tests {
 
     #[test]
     fn lift_carries_repeated_occurrences_individually() {
-        // Two occurrences of one flag are two grants (the reassembly
-        // dedups by whole token, so identical strings WOULD collapse --
-        // this pins that a repeated flag still arrives twice).
+        // Two occurrences of one flag are two grants: each is pushed to the
+        // lifted list as it is met and removed from the tail by position,
+        // so a repeated flag arrives twice.
         assert_eq!(
             joined(&["run", "--allow-fs-read=a", "--allow-fs-read=b", "app.ts"]),
             "oam --allow-fs-read=a --allow-fs-read=b run app.ts"
+        );
+        // Identical tokens too -- nothing collapses them by value -- in both
+        // the `=` and the spaced spelling.
+        assert_eq!(
+            joined(&["run", "--allow-fs-read=a", "--allow-fs-read=a", "app.ts"]),
+            "oam --allow-fs-read=a --allow-fs-read=a run app.ts"
+        );
+        assert_eq!(
+            joined(&[
+                "run",
+                "--disable-warning",
+                "W",
+                "--disable-warning",
+                "W",
+                "app.ts"
+            ]),
+            "oam --disable-warning W --disable-warning W run app.ts"
+        );
+        // A script arg that repeats a lifted token is past the option block
+        // and stays where it is.
+        assert_eq!(
+            joined(&["run", "--no-warnings", "app.ts", "--no-warnings"]),
+            "oam --no-warnings run app.ts --no-warnings"
         );
     }
 
@@ -4909,6 +5430,66 @@ mod tests {
     }
 
     #[test]
+    fn exec_argv_lists_the_process_wide_and_file_naming_flags() {
+        // fork re-spawns with [...execArgv, "run", file]: a flag missing
+        // here is a flag the child silently runs without.
+        let flags = super::NodeFlags {
+            expose_internals: true,
+            allow_natives_syntax: true,
+            js_float16array: true,
+            zero_fill_buffers: true,
+            title: Some("worker one".into()),
+            input_type: Some("module".into()),
+            env_files: vec![("a.env".into(), true), ("b.env".into(), false)],
+            ..Default::default()
+        };
+        assert_eq!(
+            flags.exec_argv(),
+            vec![
+                "--expose-internals",
+                "--allow-natives-syntax",
+                "--js-float16array",
+                "--zero-fill-buffers",
+                "--title=worker one",
+                "--input-type=module",
+                "--env-file=a.env",
+                "--env-file-if-exists=b.env",
+            ]
+        );
+        assert!(super::NodeFlags::default().exec_argv().is_empty());
+    }
+
+    #[test]
+    fn env_file_failures_are_not_all_reported_as_missing() {
+        // What the in-script catch hands back: [code, message].
+        let missing = super::env_file_failure(r#"["ENOENT","ENOENT: no such file, open 'x'"]"#);
+        assert_eq!(missing.0, "ENOENT");
+        assert_eq!(
+            super::env_file_failure_reason(&missing.0, &missing.1),
+            "not found"
+        );
+        // A file that is there but did not load keeps the error's message.
+        let dir = super::env_file_failure(r#"["EISDIR","EISDIR: illegal operation, read"]"#);
+        assert_eq!(
+            super::env_file_failure_reason(&dir.0, &dir.1),
+            "EISDIR: illegal operation, read"
+        );
+        // An error with no code (a TypeError), and output that is not the pair.
+        assert_eq!(
+            super::env_file_failure_reason("", "bad contents"),
+            "bad contents"
+        );
+        assert_eq!(
+            super::env_file_failure("not json"),
+            (String::new(), "not json".to_string())
+        );
+        assert_eq!(
+            super::env_file_failure_reason("", ""),
+            "could not be loaded"
+        );
+    }
+
+    #[test]
     fn tls_default_versions_follow_nodes_precedence() {
         let none = super::NodeFlags::default();
         assert_eq!(none.tls_default_versions(), (None, None));
@@ -5007,6 +5588,7 @@ mod tests {
             reflected,
             vec![
                 "--expose-gc",
+                "--env-file-if-exists=argv.env",
                 "--disable-warning=ArgvWarning",
                 "--max-http-header-size=2000",
                 "--tls-max-v1.3",
@@ -5121,6 +5703,227 @@ mod tests {
         let mut trailing = super::NodeFlags::default();
         assert!(!super::apply_node_options(&mut trailing, "--v8-pool-size"));
         assert_eq!(trailing.v8_pool_size, None);
+    }
+
+    #[test]
+    fn max_old_space_size_values_are_classified_as_node_reads_them() {
+        use super::MaxOldSpace::{Cap, Illegal, OutOfBounds, UseDefault};
+        use super::classify_max_old_space_size as classify;
+        // A positive whole number is a cap (node v22.22.2 reads `+5` as 5).
+        assert_eq!(classify("512"), Cap(512));
+        assert_eq!(classify(" 64"), Cap(64));
+        assert_eq!(classify("+5"), Cap(5));
+        // node v22.22.2: `=0` and an empty `=` both run on the default limit.
+        assert_eq!(classify("0"), UseDefault);
+        assert_eq!(classify(""), UseDefault);
+        // node reports a value outside size_t out of bounds and carries on:
+        // a negative, and anything from 2^63 up (i64::MAX itself still runs).
+        assert_eq!(classify("9223372036854775807"), Cap(9223372036854775807));
+        assert_eq!(classify("9223372036854775808"), OutOfBounds);
+        assert_eq!(classify("18446744073709551614"), OutOfBounds);
+        assert_eq!(classify("-5"), OutOfBounds);
+        assert_eq!(classify("18446744073709551615"), OutOfBounds);
+        assert_eq!(classify("99999999999999999999"), OutOfBounds);
+        // node's exit 9: not a whole number.
+        for bad in [
+            "abc",
+            "512m",
+            "4g",
+            "1.5",
+            "0x10",
+            "64abc",
+            "-",
+            "run",
+            "app.js",
+            "--no-warnings",
+        ] {
+            assert_eq!(classify(bad), Illegal, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn node_options_refuses_an_unusable_max_old_space_size_as_node_does() {
+        use super::MaxOldSpaceRefusal::{Illegal, NotAllowed};
+        let refused = |raw: &str| {
+            let mut flags = super::NodeFlags::default();
+            super::apply_node_options(&mut flags, raw);
+            assert_eq!(flags.max_old_space_mb, None, "{raw:?}");
+            flags.max_old_space_refused
+        };
+        // node v22.22.2 exits 9 on each, naming the token as it reads it.
+        assert_eq!(
+            refused("--max-old-space-size=4g"),
+            Some(Illegal("--max-old-space-size=4g".into()))
+        );
+        for raw in [
+            "--max-old-space-size",
+            "--max-old-space-size --no-warnings",
+            "--max-old-space-size --dns-result-order=ipv4first",
+            "--max-old-space-size -",
+            "--max-old-space-size abc",
+        ] {
+            assert_eq!(
+                refused(raw),
+                Some(Illegal("--max-old-space-size".into())),
+                "{raw:?}"
+            );
+        }
+        // Any other dash-led token is node's "not allowed in NODE_OPTIONS",
+        // whether a number or not (node v22.22.2, each exit 9).
+        for tok in ["-5", "-0", "-abc", "-5x", "--bogus", "-e", "--allow-net"] {
+            assert_eq!(
+                refused(&format!("--max-old-space-size {tok}")),
+                Some(NotAllowed(tok.into())),
+                "{tok:?}"
+            );
+        }
+        // The rendering: V8's two lines then node's, or node's one.
+        assert_eq!(
+            Illegal("--max-old-space-size=4g".into()).message("node"),
+            "Error: illegal value for flag --max-old-space-size=4g of type size_t\n\
+             Try --help for options\n\
+             node: bad option: --max-old-space-size=4g"
+        );
+        assert_eq!(
+            NotAllowed("-5".into()).message("node"),
+            "node: -5 is not allowed in NODE_OPTIONS"
+        );
+        // Both usable forms set it.
+        let mut eq = super::NodeFlags::default();
+        assert!(super::apply_node_options(
+            &mut eq,
+            "--max-old-space-size=256"
+        ));
+        assert_eq!(eq.max_old_space_mb.as_deref(), Some("256"));
+        let mut sp = super::NodeFlags::default();
+        assert!(super::apply_node_options(
+            &mut sp,
+            "--max-old-space-size 128"
+        ));
+        assert_eq!(sp.max_old_space_mb.as_deref(), Some("128"));
+    }
+
+    #[test]
+    fn max_old_space_resolves_node_options_then_argv_in_node_order() {
+        use oam_engine::MaxOldSpaceSource::{Argv, NodeOptions};
+        let with = |value: Option<&str>, spaced: bool| super::NodeFlags {
+            max_old_space_mb: value.map(String::from),
+            max_old_space_mb_spaced: spaced,
+            ..Default::default()
+        };
+        let resolve = |env: Option<&str>, argv: Option<&str>| {
+            super::resolve_max_old_space(&with(env, false), &with(argv, false))
+        };
+        assert_eq!(resolve(None, None), (None, vec![]));
+        assert_eq!(resolve(Some("64"), None).0, Some((64, NodeOptions)));
+        assert_eq!(resolve(None, Some("64")).0, Some((64, Argv)));
+        assert_eq!(resolve(Some("64"), Some("96")).0, Some((96, Argv)));
+        // node v22.22.2: argv's `=0` puts the default back over
+        // NODE_OPTIONS's value, and an out-of-bounds one is reported and
+        // leaves it (NODE_OPTIONS=--max-old-space-size=64 with argv `=-5`
+        // runs on the 64 MB cap).
+        assert_eq!(resolve(Some("64"), Some("0")).0, None);
+        let (cap, warnings) = resolve(Some("64"), Some("-5"));
+        assert_eq!(cap, Some((64, NodeOptions)));
+        assert_eq!(
+            warnings,
+            vec![
+                "Error: Value for flag --max-old-space-size=-5 of type size_t is out of bounds \
+                 [0-18446744073709551615]\nTry --help for options"
+                    .to_string()
+            ]
+        );
+        // The spaced form is named bare, as node names it.
+        let (_, warnings) =
+            super::resolve_max_old_space(&with(None, false), &with(Some("-5"), true));
+        assert!(
+            warnings[0].starts_with("Error: Value for flag --max-old-space-size of type"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn lift_removes_lifted_tokens_by_position_not_by_value() {
+        // The flag's value spells the subcommand: only the value moves, the
+        // subcommand stays, and the run option after it still reaches clap
+        // behind `run`.
+        assert_eq!(
+            joined(&["run", "--env-file", "run", "--check=block", "app.ts"]),
+            "oam --env-file run run --check=block app.ts"
+        );
+        assert_eq!(
+            joined(&["run", "--env-file", "run", "app.ts"]),
+            "oam --env-file run run app.ts"
+        );
+    }
+
+    #[test]
+    fn repl_continuation_ignores_comments_and_ends_plain_strings_at_the_line() {
+        use super::input_balanced as balanced;
+        // An apostrophe in a comment opens nothing.
+        assert!(balanced("// don't\n"));
+        assert!(balanced("let a = 1; /* it's */\n"));
+        assert!(balanced("x = 1 // say \"hi\n"));
+        // A bracket in a comment does not count either way.
+        assert!(balanced("// {\n"));
+        assert!(!balanced("function f() { // }\n"));
+        // An open block comment and an open template continue.
+        assert!(!balanced("/* not yet\n"));
+        assert!(balanced("/* not yet\n done */\n"));
+        assert!(!balanced("const t = `a\n"));
+        assert!(balanced("const t = `a\nb`\n"));
+        // A `'` or `"` string cannot span a line: an unterminated one goes
+        // to the parser instead of holding the prompt...
+        assert!(balanced("const s = 'abc\n"));
+        // ...unless the newline is escaped (a line continuation).
+        assert!(!balanced("const s = 'abc\\\n"));
+        // A regex holding a quote or an escaped slash is not a comment or a
+        // string that outlives its line.
+        assert!(balanced("const r = /'/;\n"));
+        assert!(!balanced("s.replace(/\\//g, () => {\n"));
+        // What it always did.
+        assert!(!balanced("if (x) {\n"));
+        assert!(balanced("if (x) {\n}\n"));
+        assert!(balanced("f('{')\n"));
+        assert!(balanced("'http://example.test/{'\n"));
+    }
+
+    #[test]
+    fn napi_export_list_matches_the_implemented_surface() {
+        // build.rs's NAPI_EXPORTS is the only source of the Windows .def;
+        // Linux and macOS export every symbol, so a function implemented in
+        // napi.rs and missing from the list fails only there, at addon load.
+        let implemented: std::collections::BTreeSet<String> =
+            include_str!("../../oam_engine/src/napi.rs")
+                .lines()
+                .filter(|line| line.trim_start().starts_with("pub "))
+                .filter_map(|line| line.split("extern \"C\" fn ").nth(1))
+                .map(|rest| {
+                    rest.chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect::<String>()
+                })
+                .filter(|name| name.starts_with("napi_"))
+                .collect();
+        let listed: std::collections::BTreeSet<String> = include_str!("../build.rs")
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("\"napi_"))
+            .filter_map(|rest| rest.strip_suffix("\","))
+            .map(|rest| format!("napi_{rest}"))
+            .collect();
+        assert!(
+            implemented.len() > 100,
+            "the scan of napi.rs found only {} functions; its pattern is stale",
+            implemented.len()
+        );
+        let unlisted: Vec<&String> = implemented.difference(&listed).collect();
+        let unimplemented: Vec<&String> = listed.difference(&implemented).collect();
+        assert!(
+            unlisted.is_empty() && unimplemented.is_empty(),
+            "NAPI_EXPORTS (crates/oam_cli/build.rs) and napi.rs disagree.\n\
+             implemented but not exported: {unlisted:?}\n\
+             exported but not implemented: {unimplemented:?}"
+        );
     }
 
     #[test]

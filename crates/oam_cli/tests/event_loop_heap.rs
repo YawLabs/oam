@@ -11,6 +11,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod wire_bin;
+
 fn write_temp(name: &str, content: &str) -> PathBuf {
     use std::sync::OnceLock;
     static RUN_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -36,9 +38,7 @@ fn run_measured(name: &str, source: &str) -> Vec<serde_json::Value> {
         .to_path_buf();
     // OAM_WIRE_TEST_BIN runs this against another oam build -- how these
     // tests were shown to fail before the fix.
-    let bin = std::env::var("OAM_WIRE_TEST_BIN")
-        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_oam").to_string());
-    let out = Command::new(bin)
+    let out = Command::new(wire_bin::oam_under_test())
         .args(["--expose-gc", "run", script.to_str().unwrap(), "--no-check"])
         .env("OAM_CACHE_DIR", cache)
         .env_remove("NODE_OPTIONS")

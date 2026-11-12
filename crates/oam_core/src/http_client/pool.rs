@@ -168,7 +168,7 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const MIN_REAP_TICK: Duration = Duration::from_millis(90);
 /// At most one retry after a reused connection hands a request back unsent; a
 /// fresh connection is never retried, so the loop settles in two.
-const MAX_ATTEMPTS: usize = 3;
+const MAX_ATTEMPTS: usize = 2;
 
 /// How one request may get a connection it has to open: the request's own
 /// connect parameters, which every request sharing a pool carries for
@@ -191,6 +191,10 @@ pub(crate) struct Dial {
     /// pooled connection is reused whatever order opened it, as undici's
     /// origin-keyed pool reuses it (measured on node v22.22.2).
     pub(crate) dns_order: crate::dns::ResultOrder,
+    /// The TLS version range of the https handshakes this request's dials
+    /// make ([`DialParams::tls_range`]). A pooled connection is reused
+    /// whatever range it was opened under, as node's undici reuses its own.
+    pub(crate) tls_range: super::tls_config::TlsRange,
 }
 
 /// A runtime's owned connection pool. Cloning shares the connections.
@@ -206,7 +210,8 @@ struct PoolInner {
     /// One multiplexed HTTP/2 sender per origin.
     h2: Mutex<HashMap<PoolKey, H2Entry>>,
     /// `Some(90s)` for a pooling client; `None` for the supplied route, which
-    /// never parks and never reuses (each supplied connection is used once).
+    /// never parks and never reuses (each supplied connection is used once):
+    /// `on_success` and `connect` keep nothing of it in `idle` or `h2`.
     idle_timeout: Option<Duration>,
     /// Bumped by [`Pool::destroy`]; a connection from an older generation is
     /// never re-parked.
@@ -275,6 +280,11 @@ impl Pool {
     /// Drop every pooled connection: `agent.destroy()`. Any in-flight request
     /// keeps its own sender and finishes, but on an older generation, so its
     /// connection is not re-parked.
+    ///
+    /// The generation is bumped BEFORE the idle list is cleared, and a park
+    /// compares it under the idle lock ([`PoolInner::park`]): a park that
+    /// takes the lock first is cleared here, one that takes it after sees
+    /// the new generation and drops its connection.
     pub(crate) fn destroy(&self) {
         self.inner.generation.fetch_add(1, Ordering::Relaxed);
         self.inner
@@ -334,6 +344,11 @@ impl Pool {
         let mut allow_reuse = dial.pin.is_none();
 
         for _ in 0..MAX_ATTEMPTS {
+            // The pool's generation as this attempt takes its connection: a
+            // `destroy` from here on -- while the request waits for its
+            // head as much as while its body drains -- keeps the connection
+            // out of the pool it emptied (`on_success`, `PoolInner::park`).
+            let generation = self.inner.generation.load(Ordering::Relaxed);
             let conn = match self.checkout(&key, allow_reuse, &mut dial).await {
                 Ok(conn) => conn,
                 Err(Checkout::NeedsLookup(needed)) => {
@@ -417,6 +432,7 @@ impl Pool {
                         proxied,
                         &mut response,
                         close_requested || retire,
+                        generation,
                     );
                     return Ok(response);
                 }
@@ -469,8 +485,9 @@ impl Pool {
             }
         }
 
-        // Unreachable: a fresh connection is never retried, so at most two
-        // attempts run. Surface a canceled error rather than panic.
+        // Unreachable: the one retry dials a fresh connection, which is never
+        // retried, so the second ([`MAX_ATTEMPTS`]) attempt always returns.
+        // Surface an error rather than panic.
         Err(Box::new(PoolFail {
             error: PoolError::connect(Box::<dyn std::error::Error + Send + Sync>::from(
                 "connection retries exhausted",
@@ -511,6 +528,7 @@ impl Pool {
             attempt_timeout: dial.attempt_timeout,
             pin,
             dns_order: dial.dns_order,
+            tls_range: dial.tls_range,
         };
         self.connect(key, uri, dial.connect_timeout, params)
             .await
@@ -693,19 +711,25 @@ impl Pool {
             tokio::spawn(async move {
                 let _ = connection.await;
             });
-            self.inner
-                .h2
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    key.clone(),
-                    H2Entry {
-                        sender: sender.clone(),
-                        stats: pool_stats,
-                        info: info.clone(),
-                        proxied,
-                    },
-                );
+            // A pool that does not pool (the supplied route's) keeps no
+            // entry: nothing would reuse it or reap it, and it would hold
+            // the connection open until the pool itself went. The request's
+            // own sender carries its stream.
+            if self.inner.idle_timeout.is_some() {
+                self.inner
+                    .h2
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        key.clone(),
+                        H2Entry {
+                            sender: sender.clone(),
+                            stats: pool_stats,
+                            info: info.clone(),
+                            proxied,
+                        },
+                    );
+            }
             Ok(Conn {
                 proto: Proto::H2(sender),
                 stats,
@@ -760,7 +784,14 @@ impl Pool {
     /// response drained) unless the request or response asked to close it; an
     /// h2 connection stays in its entry for the next stream. An h1 response
     /// carries a [`Released`] that settles once the connection is parked or
-    /// closed.
+    /// closed. A pool that does not pool (no idle timeout: the supplied
+    /// route's) parks nothing: its connection closes once the response has
+    /// drained, and an h2 one when its last stream is done.
+    ///
+    /// `gen_id` is the pool's generation from before the connection was
+    /// checked out for this request (`request`): a `destroy` at any point
+    /// since -- the wait for the head included -- keeps it from being parked.
+    #[allow(clippy::too_many_arguments)]
     fn on_success(
         &self,
         sender: Proto,
@@ -769,13 +800,15 @@ impl Pool {
         proxied: bool,
         response: &mut Response<Incoming>,
         close_requested: bool,
+        gen_id: u64,
     ) {
         let Proto::H1(mut sender, stats) = sender else {
-            return; // h2: the entry is already in the map
+            return; // h2: the entry is already in the map (of a pooling pool)
         };
-        let should_park = !close_requested && !says_close(response.headers());
+        let should_park = !close_requested
+            && !says_close(response.headers())
+            && self.inner.idle_timeout.is_some();
         let inner = Arc::downgrade(&self.inner);
-        let gen_id = self.inner.generation.load(Ordering::Relaxed);
         let (released, settles) = tokio::sync::watch::channel(());
         response.extensions_mut().insert(Released(settles));
         tokio::spawn(async move {
@@ -789,7 +822,9 @@ impl Pool {
                 return;
             }
             if !should_park {
-                return; // Connection: close -> the body drained, now close
+                // Connection: close, or a pool that does not pool -> the
+                // body drained, now close.
+                return;
             }
             if let Some(inner) = inner.upgrade()
                 && inner.generation.load(Ordering::Relaxed) == gen_id
@@ -802,7 +837,9 @@ impl Pool {
                     proxied,
                     parked_at: now,
                 };
-                if inner.park(key, entry, now) {
+                // The generation is looked at again under the idle lock: a
+                // destroy that landed since the look above is not undone.
+                if inner.park(key, entry, now, gen_id) {
                     inner.ensure_reaper();
                 }
             }
@@ -842,10 +879,19 @@ impl PoolInner {
     /// [`SETTLE`]). Parking every one of those connections would leave the
     /// origin with as many as were opened in that time, where it had one;
     /// so one settles and the rest are dropped here.
-    fn park(&self, key: PoolKey, entry: IdleH1, now: Instant) -> bool {
+    ///
+    /// `generation` is the pool's when the connection was checked out. It is
+    /// compared under the idle lock, which [`Pool::destroy`] takes to clear
+    /// the list after it has bumped the generation: a connection from before
+    /// a destroy is dropped here however the two interleave, where a check
+    /// made before the lock could pass and park it after the clear.
+    fn park(&self, key: PoolKey, entry: IdleH1, now: Instant, generation: u64) -> bool {
         // Read before the idle lock: the two are never held together.
         let marked = self.closes_early(&key, now);
         let mut map = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        if self.generation.load(Ordering::Relaxed) != generation {
+            return false;
+        }
         if marked
             && map
                 .get(&key)
@@ -1124,13 +1170,14 @@ fn domain_as_uri((scheme, authority, _): &PoolKey) -> Uri {
 /// the pooled connection, and the one resend covers it.
 fn retires_for_the_hop(response: &Response<Incoming>, method: &Method, rules: Rules) -> bool {
     let status = response.status().as_u16();
-    redirect::is_redirect_status(status)
+    redirect::follows_status(status, rules)
         && response.headers().contains_key(http::header::LOCATION)
         && !redirect::rewrites_to_get(status, method, rules)
 }
 
-/// Does the header map carry `Connection: close`?
-fn says_close(headers: &http::HeaderMap) -> bool {
+/// Does the header map carry `Connection: close`? Asked of a response by
+/// the pool and of a request by the transport (`send_following`).
+pub(super) fn says_close(headers: &http::HeaderMap) -> bool {
     headers
         .get_all(http::header::CONNECTION)
         .iter()
@@ -1220,8 +1267,15 @@ mod tests {
     /// The reaper closes an idle connection when its timeout is up, wherever
     /// its park fell between the reaper's passes. With a fixed tick of the
     /// timeout, a connection parked just after a tick lived to the tick
-    /// after next: here the second connection, parked 0.6 timeouts after
-    /// the first (whose park started the reaper), stayed idle 1.4 timeouts.
+    /// after next: a connection parked `x` timeouts after the first (whose
+    /// park started the reaper) stayed idle `2 - x` of them.
+    ///
+    /// The second connection is parked 0.2 timeouts after the first, so that
+    /// tick would close it 1.8 timeouts after its answer where the reaper
+    /// closes it at 1.0. The upper bound sits between the two with real time
+    /// to spare (700 ms): the close is measured across a sleep, a 2-worker
+    /// runtime and the origin's read loop, and a loaded host stretches all
+    /// three. Not being early is the other half, and no load can break it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_reaper_closes_an_idle_connection_at_its_timeout() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1265,9 +1319,6 @@ mod tests {
                     tls: super::super::TlsSource::Unavailable("not used".into()),
                     proxy: None,
                     user_agent: http::HeaderValue::from_static("oam-test"),
-                    tls_range: std::sync::atomic::AtomicU8::new(
-                        super::super::TlsRange::Both.code(),
-                    ),
                 }),
                 via: super::super::connector::Via::Pooled,
             },
@@ -1284,6 +1335,7 @@ mod tests {
                     attempt_timeout: Duration::from_millis(250),
                     pin: None,
                     dns_order: crate::dns::ResultOrder::Verbatim,
+                    tls_range: super::super::TlsRange::Both,
                 };
                 let response = pool.request(req, false, dial, None).await.ok().unwrap();
                 let released = response.extensions().get::<Released>().cloned().unwrap();
@@ -1294,7 +1346,7 @@ mod tests {
             }
         };
         get(first).await;
-        tokio::time::sleep(TIMEOUT * 6 / 10).await;
+        tokio::time::sleep(TIMEOUT * 2 / 10).await;
         get(second).await;
         for _ in 0..2 {
             let idle = tokio::time::timeout(TIMEOUT * 3, closed_rx.recv())
@@ -1303,7 +1355,7 @@ mod tests {
                 .unwrap();
             assert!(
                 idle >= TIMEOUT - Duration::from_millis(50)
-                    && idle < TIMEOUT + Duration::from_millis(350),
+                    && idle < TIMEOUT + Duration::from_millis(700),
                 "an idle connection closed {idle:?} after its answer; the timeout is {TIMEOUT:?}"
             );
         }
@@ -1392,9 +1444,6 @@ mod tests {
                     tls: super::super::TlsSource::Unavailable("not used".into()),
                     proxy: None,
                     user_agent: http::HeaderValue::from_static("oam-test"),
-                    tls_range: std::sync::atomic::AtomicU8::new(
-                        super::super::TlsRange::Both.code(),
-                    ),
                 }),
                 via: super::super::connector::Via::Pooled,
             },
@@ -1406,6 +1455,7 @@ mod tests {
             attempt_timeout: Duration::from_millis(250),
             pin: None,
             dns_order: crate::dns::ResultOrder::Verbatim,
+            tls_range: super::super::TlsRange::Both,
         };
         let uri: Uri = format!("http://127.0.0.1:{port}/").parse().unwrap();
         let get = || {
@@ -1566,9 +1616,6 @@ mod tests {
                     tls: super::super::TlsSource::Unavailable("not used".into()),
                     proxy: None,
                     user_agent: http::HeaderValue::from_static("oam-test"),
-                    tls_range: std::sync::atomic::AtomicU8::new(
-                        super::super::TlsRange::Both.code(),
-                    ),
                 }),
                 via: super::super::connector::Via::Pooled,
             },
@@ -1721,12 +1768,12 @@ mod tests {
         pool.inner.saw_an_early_close(&key);
         assert!(
             pool.inner
-                .park(key.clone(), idle_entry(live().await, now), now)
+                .park(key.clone(), idle_entry(live().await, now), now, 0)
         );
         assert!(
             !pool
                 .inner
-                .park(key.clone(), idle_entry(live().await, now), now)
+                .park(key.clone(), idle_entry(live().await, now), now, 0)
         );
         assert_eq!(idle_count(&pool, &key), 1);
 
@@ -1741,24 +1788,119 @@ mod tests {
             .parked_at = settled;
         assert!(
             pool.inner
-                .park(key.clone(), idle_entry(live().await, now), now)
+                .park(key.clone(), idle_entry(live().await, now), now, 0)
         );
         assert!(
             !pool
                 .inner
-                .park(key.clone(), idle_entry(live().await, now), now)
+                .park(key.clone(), idle_entry(live().await, now), now, 0)
         );
         assert_eq!(idle_count(&pool, &key), 2);
 
         assert!(
             pool.inner
-                .park(other.clone(), idle_entry(live().await, now), now)
+                .park(other.clone(), idle_entry(live().await, now), now, 0)
         );
         assert!(
             pool.inner
-                .park(other.clone(), idle_entry(live().await, now), now)
+                .park(other.clone(), idle_entry(live().await, now), now, 0)
         );
         assert_eq!(idle_count(&pool, &other), 2);
+    }
+
+    /// A connection checked out before [`Pool::destroy`] is not parked after
+    /// it: the park compares the generation under the idle lock the destroy
+    /// clears the list under, so no interleaving leaves the connection in a
+    /// pool that was emptied. One checked out since parks as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_from_before_a_destroy_is_not_parked() {
+        let pool = test_pool(Some(Duration::from_secs(90)));
+        let key = pool_key(&"http://gate.test/".parse().unwrap(), Alpn::default()).unwrap();
+        let before = pool.inner.generation.load(Ordering::Relaxed);
+        let (stale, _keep_stale) = h1_sender().await;
+        pool.destroy();
+        let now = Instant::now();
+        assert!(
+            !pool
+                .inner
+                .park(key.clone(), idle_entry(stale, now), now, before)
+        );
+        assert_eq!(idle_count(&pool, &key), 0);
+
+        let after = pool.inner.generation.load(Ordering::Relaxed);
+        assert_ne!(before, after);
+        let (fresh, _keep_fresh) = h1_sender().await;
+        assert!(
+            pool.inner
+                .park(key.clone(), idle_entry(fresh, now), now, after)
+        );
+        assert_eq!(idle_count(&pool, &key), 1);
+    }
+
+    /// A pool with no idle timeout (the supplied route's) keeps nothing of a
+    /// connection it used: the connection is closed once its response has
+    /// drained, with the pool still alive, and no entry is left behind that
+    /// nothing would reuse or reap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pool_that_does_not_pool_closes_a_connection_once_its_response_drains() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut head = Vec::new();
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0, "closed before the request");
+                head.extend_from_slice(&buf[..n]);
+            }
+            // Keep-alive, and nothing that asks for a close: only the pool
+            // decides what happens to the connection.
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            while stream.read(&mut buf).await.unwrap_or(0) > 0 {}
+            let _ = closed_tx.send(());
+        });
+        let pool = test_pool(None);
+        let uri: Uri = format!("http://127.0.0.1:{port}/").parse().unwrap();
+        let key = pool_key(&uri, Alpn::default()).unwrap();
+        let mut req = Request::new(super::super::transport::empty_body());
+        *req.uri_mut() = uri;
+        let dial = Dial {
+            connect_timeout: None,
+            alpn: Alpn::default(),
+            attempt_timeout: Duration::from_millis(250),
+            pin: None,
+            dns_order: crate::dns::ResultOrder::Verbatim,
+            tls_range: super::super::TlsRange::Both,
+        };
+        // Every await is bounded: a regression must fail, not hang the suite.
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            pool.request(req, false, dial, None),
+        )
+        .await
+        .expect("the request timed out")
+        .unwrap_or_else(|e| panic!("the request failed: {}", e.error));
+        let released = response.extensions().get::<Released>().cloned().unwrap();
+        http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), released.settled())
+            .await
+            .expect("the connection was never released");
+        assert_eq!(idle_count(&pool, &key), 0);
+        // The pool is still alive here: the close is its own doing, not the
+        // drop of the last sender with it.
+        tokio::time::timeout(Duration::from_secs(10), closed_rx)
+            .await
+            .expect("the connection was never closed")
+            .unwrap();
+        drop(pool);
     }
 
     /// A connection this side closed -- JS destroyed its socket -- is
