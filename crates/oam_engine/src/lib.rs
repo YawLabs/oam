@@ -372,9 +372,9 @@ struct HeapCap {
 /// whole of it. The headroom argument above holds for a program with one busy
 /// isolate. One whose workers fill their heaps too can hold N x 75% of the
 /// limit and be killed by the kernel with no banner; it has to set
-/// `OAM_MAX_HEAP_MB` to a per-isolate figure that fits (the user-facing note
-/// is docs/node-divergences.md section 5a). Sharing one budget across
-/// isolates is not implemented.
+/// `--max-old-space-size` or `OAM_MAX_HEAP_MB` to a per-isolate figure that
+/// fits (the user-facing note is docs/node-divergences.md section 5a). Sharing
+/// one budget across isolates is not implemented.
 const CGROUP_HEAP_FRACTION: u64 = 75;
 
 /// Floor for a cgroup-derived cap, in MiB. Below this the runtime cannot
@@ -610,9 +610,11 @@ fn heap_cap_source_label(source: HeapCapSource) -> &'static str {
         // Names the mechanism AND the override, because this is the one source
         // the operator did not choose: someone meeting this banner for the
         // first time is looking at a pod that just died and needs to know both
-        // where the number came from and how to move it.
+        // where the number came from and how to move it. Both knobs are named:
+        // the node flag (argv or NODE_OPTIONS) and the variable set the same cap.
         HeapCapSource::Cgroup => {
-            "derived from the container memory limit; set OAM_MAX_HEAP_MB to override"
+            "derived from the container memory limit; \
+             raise it with --max-old-space-size or OAM_MAX_HEAP_MB"
         }
     }
 }
@@ -1532,6 +1534,16 @@ mod tests {
         let cap = resolve_heap_cap_from(None, Some("64".into()));
         assert_eq!(cap.mb, 64);
         assert_eq!(heap_cap_source_label(cap.source), "set by OAM_MAX_HEAP_MB");
+    }
+
+    #[test]
+    fn the_cgroup_label_names_both_knobs() {
+        // A container-derived cap names both ways to raise it.
+        assert_eq!(
+            heap_cap_source_label(HeapCapSource::Cgroup),
+            "derived from the container memory limit; \
+             raise it with --max-old-space-size or OAM_MAX_HEAP_MB",
+        );
     }
 
     #[test]

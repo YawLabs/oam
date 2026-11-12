@@ -744,6 +744,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   child process does not see the variable, and a child of `oam --max-old-space-size=N` does
   not take the parent's cap; a cap from `NODE_OPTIONS` still reaches children through
   `NODE_OPTIONS`, as in node.
+- **The `OAM-RT-OOM` banner for a container-derived heap cap names both ways to raise it:**
+  `--max-old-space-size` (argv or `NODE_OPTIONS`) or `OAM_MAX_HEAP_MB`. It named only the
+  variable.
 - **`oam --help`: the permission example under the node compatibility flags is a command that
   runs.**
 - **REPL: an apostrophe in a comment or a regex no longer traps the prompt in continuation
@@ -843,6 +846,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   descriptor kept its record until the runtime exited, so an addon that creates functions in a
   loop grew without bound. The record now goes at the addon's next native entry after the
   collection, as a wrap's finalizer does.
+- **A `napi_define_class` prototype lists its own keys in node's order:** the instance
+  descriptors first and `constructor` last. It listed `constructor` first.
 
 **npm launcher and installers**
 

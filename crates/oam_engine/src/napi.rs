@@ -3372,6 +3372,33 @@ unsafe fn define_descriptor<'s>(
     }
 }
 
+/// Finish a `napi_define_class` prototype and make it the class's: add
+/// `constructor` (non-enumerable, writable, configurable) after the instance
+/// properties already on `proto`, as V8 does when it instantiates a
+/// prototype template, then set `ctor.prototype` to it. A descriptor that
+/// already made `constructor` non-configurable keeps it, as a failed
+/// property definition is skipped everywhere else in this file. `false` when
+/// the prototype could not be installed.
+fn install_class_prototype(
+    scope: &mut v8::PinScope<'_, '_>,
+    ctor: v8::Local<v8::Function>,
+    proto: v8::Local<v8::Object>,
+) -> bool {
+    let Some(constructor_key) = v8::String::new(scope, "constructor") else {
+        return false;
+    };
+    proto.define_own_property(
+        scope,
+        constructor_key.into(),
+        ctor.into(),
+        v8::PropertyAttribute::DONT_ENUM,
+    );
+    let Some(proto_key) = v8::String::new(scope, "prototype") else {
+        return false;
+    };
+    ctor.set(scope, proto_key.into(), proto.into()) == Some(true)
+}
+
 /// Create a native-backed JS class (constructor function + prototype methods).
 ///
 /// - Properties with `napi_static` go on the constructor itself.
@@ -3428,13 +3455,6 @@ pub unsafe extern "C" fn napi_define_class(
         return NAPI_GENERIC_FAILURE;
     };
 
-    // Get `constructor.prototype` for instance methods.
-    let proto_key = v8::String::new(scope, "prototype").unwrap();
-    let proto_val = ctor_fn.get(scope, proto_key.into());
-    let proto_obj = proto_val
-        .and_then(|v| v8::Local::<v8::Object>::try_from(v).ok())
-        .unwrap_or_else(|| v8::Object::new(scope));
-
     let props = if property_count > 0 {
         // SAFETY: `properties` is non-null (checked above) and points to at least `property_count` caller-owned elements; from_raw_parts reads them for the length the C caller declared.
         unsafe { std::slice::from_raw_parts(properties, property_count) }
@@ -3442,17 +3462,42 @@ pub unsafe extern "C" fn napi_define_class(
         &[]
     };
 
-    for prop in props {
-        // Node names a prototype method after its string key; a static one
-        // goes through napi_define_properties and stays unnamed.
-        let (target, naming): (v8::Local<v8::Object>, _) =
-            if prop.attributes & NAPI_ATTR_STATIC != 0 {
-                (ctor_fn.into(), MethodNaming::Unnamed)
-            } else {
-                (proto_obj, MethodNaming::StringKey)
-            };
+    // The prototype is built fresh, in node's order: node v22 sets the
+    // instance properties on the class's prototype template, and V8 adds
+    // `constructor` (non-enumerable) to the instantiated prototype after
+    // them, so `Object.getOwnPropertyNames(Cls.prototype)` lists the
+    // descriptors' string keys first and `constructor` last. The prototype
+    // V8 gave the function lists `constructor` first, so it is replaced
+    // rather than filled in.
+    //
+    // Static properties go on the constructor once the class is built, as
+    // node defines them (through napi_define_properties, so a static method
+    // stays unnamed): after `length`, `name` and `prototype`, in descriptor
+    // order. So the instance descriptors are defined first, then the
+    // prototype is finished and installed, then the static descriptors.
+    let proto_obj = v8::Object::new(scope);
+    let is_static = |prop: &NapiPropertyDescriptor| prop.attributes & NAPI_ATTR_STATIC != 0;
+    let ordered =
+        (props.iter().filter(|p| !is_static(p))).chain(props.iter().filter(|p| is_static(p)));
+    let mut installed = false;
+    for prop in ordered {
+        let (target, naming): (v8::Local<v8::Object>, _) = if is_static(prop) {
+            if !installed {
+                if !install_class_prototype(scope, ctor_fn, proto_obj) {
+                    return NAPI_GENERIC_FAILURE;
+                }
+                installed = true;
+            }
+            (ctor_fn.into(), MethodNaming::Unnamed)
+        } else {
+            // Node names a prototype method after its string key.
+            (proto_obj, MethodNaming::StringKey)
+        };
         // SAFETY: `env` is the caller's live env (env_scope_mut proved it) with no reference into it held here; `scope` is this entry point's one scope reference; `prop` is one of the caller's descriptors, whose name, value and callbacks are the addon's own per this entry point's contract.
         unsafe { define_descriptor(env, scope, target, prop, naming) };
+    }
+    if !installed && !install_class_prototype(scope, ctor_fn, proto_obj) {
+        return NAPI_GENERIC_FAILURE;
     }
 
     // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
