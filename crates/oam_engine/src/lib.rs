@@ -340,6 +340,9 @@ thread_local! {
     /// `Cell` because the OOM callback may run later on the same thread and
     /// observe a stale label if we replaced `static` with a non-`Copy` type.
     static HEAP_CAP_SOURCE: std::cell::Cell<HeapCapSource> = const { std::cell::Cell::new(HeapCapSource::Default) };
+    /// The cap the user asked for when it was below [`MIN_HEAP_MB`] and
+    /// raised to it, for the OOM banner. Set beside [`HEAP_CAP_SOURCE`].
+    static HEAP_CAP_RAISED_FROM: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// Resolved heap-cap configuration: the cap in MiB, and there always is one.
@@ -350,7 +353,31 @@ thread_local! {
 struct HeapCap {
     mb: usize,
     source: HeapCapSource,
+    /// The cap asked for, when it was below [`MIN_HEAP_MB`] and `mb` is that
+    /// minimum instead.
+    raised_from: Option<usize>,
 }
+
+/// The smallest heap cap oam runs with, in MiB. A smaller one asked for by
+/// `--max-old-space-size` or `OAM_MAX_HEAP_MB` is raised to it (#479).
+///
+/// The cap pins V8's old generation, and the startup snapshot deserializes
+/// into it before any user code runs. Below about 7 MB that fails inside V8
+/// ("Fatal JavaScript out of memory: GC during deserialization", exit 3, a
+/// native stack trace), where neither the near-heap-limit callback nor any
+/// other part of oam can step in. At 7 MB oam boots and reaches the cap at
+/// once (`OAM-RT-OOM`, exit 134); at 8 MB a one-line script runs, but a small
+/// program (an http server answering one fetch) reaches the cap. Measured on
+/// 0.20.0 (Windows ARM64): a booted oam holds 6.7 MB of live heap, 7.4 MB
+/// with the common builtins loaded, where node v22.22.2 holds 3.1 and 4.0.
+/// 16 MB is about twice the boot heap.
+///
+/// node does not refuse a small value either: `node --max-old-space-size=4`
+/// runs (its startup heap fits in 4 MB of old space, and its young generation
+/// adds about 48 MB; at 1 to 3 MB node dies of its own heap OOM). Raising the
+/// cap rather than refusing it keeps every value node starts with startable,
+/// and the OOM banner says when it happened.
+const MIN_HEAP_MB: usize = 16;
 
 /// Share of a container's memory limit the V8 heap may occupy.
 ///
@@ -510,9 +537,9 @@ fn parse_heap_cap_request(raw: Option<&str>) -> HeapCapRequest {
 /// Node parity: this is oam's `--max-old-space-size` analogue. Resolution:
 ///   * unset or empty -> the container-derived cap when there is one, else
 ///     [`DEFAULT_HEAP_MB`] (4 GiB on 64-bit).
-///   * `n > 0` -> n MB cap. A very small value is honored as-is; it trips
-///     the OOM callback during startup, printing the clean banner rather
-///     than aborting raw.
+///   * `n > 0` -> n MB cap, raised to [`MIN_HEAP_MB`] when smaller: a cap
+///     under about 7 MB does not reach the OOM callback at all, it aborts
+///     inside V8 while the startup snapshot deserializes.
 ///   * `0`, a negative or a non-numeric value -> the same cap as unset, plus
 ///     one warning on stderr naming the value.
 ///
@@ -527,6 +554,7 @@ fn parse_heap_cap_request(raw: Option<&str>) -> HeapCapRequest {
 ///
 /// A `--max-old-space-size` the embedder recorded (`set_max_old_space_size`)
 /// comes first, as node's flag does; the variable is then not read at all.
+/// The flag's value gets the same [`MIN_HEAP_MB`] floor.
 fn resolve_heap_cap() -> HeapCap {
     resolve_heap_cap_from(
         MAX_OLD_SPACE_FLAG.get().copied(),
@@ -537,6 +565,16 @@ fn resolve_heap_cap() -> HeapCap {
 /// [`resolve_heap_cap`] on given inputs: the recorded flag and the raw
 /// `OAM_MAX_HEAP_MB`.
 fn resolve_heap_cap_from(flag: Option<(usize, MaxOldSpaceSource)>, raw: Option<String>) -> HeapCap {
+    let mut cap = requested_heap_cap(flag, raw);
+    if cap.mb < MIN_HEAP_MB {
+        cap.raised_from = Some(cap.mb);
+        cap.mb = MIN_HEAP_MB;
+    }
+    cap
+}
+
+/// The cap [`resolve_heap_cap_from`] starts from, before [`MIN_HEAP_MB`].
+fn requested_heap_cap(flag: Option<(usize, MaxOldSpaceSource)>, raw: Option<String>) -> HeapCap {
     if let Some((mb, from)) = flag {
         return HeapCap {
             mb,
@@ -544,6 +582,7 @@ fn resolve_heap_cap_from(flag: Option<(usize, MaxOldSpaceSource)>, raw: Option<S
                 MaxOldSpaceSource::Argv => HeapCapSource::Argv,
                 MaxOldSpaceSource::NodeOptions => HeapCapSource::NodeOptions,
             },
+            raised_from: None,
         };
     }
     let fallback = || {
@@ -563,10 +602,12 @@ fn resolve_heap_cap_from(flag: Option<(usize, MaxOldSpaceSource)>, raw: Option<S
             Some(mb) => HeapCap {
                 mb,
                 source: HeapCapSource::Cgroup,
+                raised_from: None,
             },
             None => HeapCap {
                 mb: DEFAULT_HEAP_MB,
                 source: HeapCapSource::Default,
+                raised_from: None,
             },
         }
     };
@@ -575,6 +616,7 @@ fn resolve_heap_cap_from(flag: Option<(usize, MaxOldSpaceSource)>, raw: Option<S
         HeapCapRequest::Mb(mb) => HeapCap {
             mb,
             source: HeapCapSource::User,
+            raised_from: None,
         },
         HeapCapRequest::Invalid => {
             let cap = fallback();
@@ -653,9 +695,15 @@ unsafe extern "C" fn near_heap_limit_oom(
     // same thread that registered it (V8 invariant), so the thread-local is
     // the right scope.
     let source = heap_cap_source_label(HEAP_CAP_SOURCE.with(|s| s.get()));
-    let banner = format!(
-        "error[OAM-RT-OOM]: JavaScript heap out of memory -- reached the {mb} MB cap ({source})\n"
-    );
+    let banner = match HEAP_CAP_RAISED_FROM.with(|r| r.get()) {
+        Some(asked) => format!(
+            "error[OAM-RT-OOM]: JavaScript heap out of memory -- reached the {mb} MB cap \
+             ({source} to {asked} MB, raised to oam's {MIN_HEAP_MB} MB minimum)\n"
+        ),
+        None => format!(
+            "error[OAM-RT-OOM]: JavaScript heap out of memory -- reached the {mb} MB cap ({source})\n"
+        ),
+    };
     let stderr = std::io::stderr();
     let mut lock = stderr.lock();
     let _ = lock.write_all(banner.as_bytes());
@@ -723,6 +771,7 @@ impl JsRuntime {
         // isolate, so the thread-local is the right scope -- a worker thread
         // building its own isolate writes its own value here.
         HEAP_CAP_SOURCE.with(|s| s.set(heap_cap.source));
+        HEAP_CAP_RAISED_FROM.with(|r| r.set(heap_cap.raised_from));
         let mut params =
             v8::CreateParams::default().snapshot_blob(v8::StartupData::from(OAM_SNAPSHOT));
         // initial = 0 lets V8 grow from its small default; max is the hard
@@ -1510,6 +1559,41 @@ mod tests {
                 );
             }
             other => panic!("nothing was set; source cannot be {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cap_below_the_minimum_is_raised_to_it_and_remembers_what_was_asked() {
+        // #479: below about 7 MB V8 aborts while the snapshot deserializes.
+        // Every source a user can set is raised, and only below the minimum.
+        for from in [MaxOldSpaceSource::Argv, MaxOldSpaceSource::NodeOptions] {
+            for (asked, mb, raised_from) in [
+                (1, MIN_HEAP_MB, Some(1)),
+                (5, MIN_HEAP_MB, Some(5)),
+                (MIN_HEAP_MB - 1, MIN_HEAP_MB, Some(MIN_HEAP_MB - 1)),
+                (MIN_HEAP_MB, MIN_HEAP_MB, None),
+                (MIN_HEAP_MB + 1, MIN_HEAP_MB + 1, None),
+            ] {
+                let cap = resolve_heap_cap_from(Some((asked, from)), None);
+                assert_eq!(
+                    (cap.mb, cap.raised_from),
+                    (mb, raised_from),
+                    "--max-old-space-size={asked} from {from:?}"
+                );
+            }
+        }
+        for (raw, mb, raised_from) in [
+            ("5", MIN_HEAP_MB, Some(5)),
+            (" 05 ", MIN_HEAP_MB, Some(5)),
+            ("16", 16, None),
+            ("64", 64, None),
+        ] {
+            let cap = resolve_heap_cap_from(None, Some(raw.into()));
+            assert_eq!(
+                (cap.mb, cap.source, cap.raised_from),
+                (mb, HeapCapSource::User, raised_from),
+                "OAM_MAX_HEAP_MB={raw:?}"
+            );
         }
     }
 

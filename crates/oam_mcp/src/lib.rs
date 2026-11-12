@@ -734,7 +734,7 @@ const KNOWN_CODES: &[(&str, &str)] = &[
     // holds the entry, since the scan of zero-padded literals cannot see it.
     (
         "OAM-RT-OOM",
-        "The JavaScript heap reached its cap and the process exited with code 134. Printed as a plain `error[OAM-RT-OOM]` line on stderr, not as an ODIF diagnostic (so it is not in a --json stream); the line names the cap in megabytes and where it came from. Raise it with OAM_MAX_HEAP_MB (megabytes) or --max-old-space-size, or find what holds the memory: by default the cap is 75% of the container memory limit when there is one, else 4096 MB.",
+        "The JavaScript heap reached its cap and the process exited with code 134. Printed as a plain `error[OAM-RT-OOM]` line on stderr, not as an ODIF diagnostic (so it is not in a --json stream); the line names the cap in megabytes and where it came from (and, for a cap asked below 16 MB, that it was raised to oam's 16 MB minimum). Raise it with OAM_MAX_HEAP_MB (megabytes) or --max-old-space-size, or find what holds the memory: by default the cap is 75% of the container memory limit when there is one, else 4096 MB.",
     ),
     (
         "OAM-TS0000",

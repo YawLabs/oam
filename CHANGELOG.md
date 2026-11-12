@@ -16,6 +16,16 @@ gap between headings below is expected rather than a missing entry. Not every ta
 is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
 one, so `install.sh`, which resolves the latest Release, never handed them out.
 
+## [Unreleased]
+
+### Fixed
+
+- **A heap cap under 16 MB is raised to 16 MB instead of crashing oam at startup** (#479).
+  `--max-old-space-size`, `NODE_OPTIONS=--max-old-space-size` and `OAM_MAX_HEAP_MB` below
+  about 7 MB ended in a V8 fatal error (`GC during deserialization`, exit 3, a native stack
+  trace) before the entry script ran, and 7 MB in an immediate `OAM-RT-OOM`. Such a cap now
+  runs on the 16 MB minimum, and the OOM banner says it was raised and from what.
+
 ## [0.20.0] - 2026-11-11
 
 ### Changed

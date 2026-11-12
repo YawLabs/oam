@@ -40932,6 +40932,105 @@ fn heap_cap_reached_is_the_oom_banner() {
     );
 }
 
+/// A cap too small for oam to start with is raised to oam's 16 MB minimum,
+/// from every place a cap can be set, and the run goes on (#479). It was a
+/// V8 fatal error ("GC during deserialization", exit 3) under 7 MB and an
+/// instant `OAM-RT-OOM` at 7. node v22.22.2 starts from 4 MB up (1 to 3 end
+/// in its own heap OOM), so oam now starts wherever node does.
+#[test]
+fn a_heap_cap_below_the_minimum_is_raised_and_runs() {
+    let script = write_temp(
+        "heap_cap_floor.js",
+        "for (const m of ['http', 'crypto', 'stream', 'zlib', 'child_process']) require(m);\n\
+         console.log(require('v8').getHeapStatistics().heap_size_limit);",
+    );
+    let path = script.to_string_lossy().to_string();
+    let limit_of = |args: &[&str], vars: &[(&str, &str)], what: &str| -> u64 {
+        let mut env = vec![("OAM_MAX_HEAP_MB", ""), ("NODE_OPTIONS", "")];
+        env.extend_from_slice(vars);
+        let out = oam_with_env(args, &env);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stderr.is_empty(),
+            "{what}: exit {}; stderr: {stderr}",
+            out.status
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        stdout
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("{what}: stdout {stdout:?}: {e}"))
+    };
+
+    let minimum = limit_of(
+        &["--max-old-space-size=16", &path],
+        &[],
+        "--max-old-space-size=16",
+    );
+    assert!(
+        minimum < 64 * 1024 * 1024,
+        "16 is a real cap, got {minimum} bytes"
+    );
+    for value in ["1", "2", "5", "6", "7", "8", "15", "05", "+5"] {
+        let flag = format!("--max-old-space-size={value}");
+        for (args, vars, what) in [
+            (vec![flag.as_str(), &path], vec![], flag.clone()),
+            (
+                vec!["run", flag.as_str(), &path],
+                vec![],
+                format!("run {flag}"),
+            ),
+            (
+                vec!["run", &path],
+                vec![("NODE_OPTIONS", flag.as_str())],
+                format!("NODE_OPTIONS={flag}"),
+            ),
+            (
+                vec!["run", &path],
+                vec![("OAM_MAX_HEAP_MB", value)],
+                format!("OAM_MAX_HEAP_MB={value}"),
+            ),
+        ] {
+            assert_eq!(
+                limit_of(&args, &vars, &what),
+                minimum,
+                "{what} must run on the 16 MB minimum"
+            );
+        }
+    }
+
+    // The banner says the cap was raised, and from what.
+    let oom = write_temp(
+        "heap_cap_floor_oom.js",
+        "const keep = [];\n\
+         for (;;) keep.push(new Array(1e5).fill(keep.length));",
+    );
+    let oom = oom.to_string_lossy().to_string();
+    for (args, vars, source) in [
+        (
+            vec!["--max-old-space-size=5", oom.as_str()],
+            vec![("OAM_MAX_HEAP_MB", ""), ("NODE_OPTIONS", "")],
+            "set by --max-old-space-size",
+        ),
+        (
+            vec!["run", oom.as_str()],
+            vec![("OAM_MAX_HEAP_MB", "5"), ("NODE_OPTIONS", "")],
+            "set by OAM_MAX_HEAP_MB",
+        ),
+    ] {
+        let out = oam_with_env(&args, &vars);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(134), "{source}: {stderr}");
+        assert!(
+            stderr.contains("error[OAM-RT-OOM]: JavaScript heap out of memory")
+                && stderr.contains(&format!(
+                    "({source} to 5 MB, raised to oam's 16 MB minimum)"
+                )),
+            "the banner must say the cap was raised: {stderr}"
+        );
+    }
+}
+
 /// The banner names where the cap was set: the flag on the command line (in
 /// either spelling, before or after `run`), the flag in NODE_OPTIONS, or the
 /// variable -- not the variable for all three (#472). Each run sets the
