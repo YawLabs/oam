@@ -848,6 +848,10 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   collection, as a wrap's finalizer does.
 - **A `napi_define_class` prototype lists its own keys in node's order:** the instance
   descriptors first and `constructor` last. It listed `constructor` first.
+- **A `napi_define_class` prototype method called on a receiver that is not an instance of the
+  class throws `TypeError: Illegal invocation`, as in node,** without calling the addon. It
+  called the addon's callback with that receiver. Getters, setters and static methods are not
+  checked, as in node.
 
 **npm launcher and installers**
 

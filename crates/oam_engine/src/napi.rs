@@ -1175,15 +1175,89 @@ pub struct CbInfo {
     new_target: NapiValue,
 }
 
+/// Node's message when a `napi_define_class` prototype method is called on a
+/// receiver that is not an instance of the class (V8's signature check).
+const ILLEGAL_INVOCATION: &str = "Illegal invocation";
+
+/// The callback data of a trampoline function, as [`create_function`] built
+/// it: the `External` carrying the function's [`FnData`] record, and, for a
+/// `napi_define_class` prototype method, the class prototype its receiver
+/// must inherit from. A function without a receiver check has the `External`
+/// itself as its data; one with a check has a two-element array
+/// `[External, prototype]`, built with its elements in place (no setter can
+/// run) and never exposed to JS.
+fn trampoline_data<'s>(
+    scope: &v8::PinScope<'s, '_>,
+    data: v8::Local<'s, v8::Value>,
+) -> Option<(
+    v8::Local<'s, v8::External>,
+    Option<v8::Local<'s, v8::Object>>,
+)> {
+    if let Ok(external) = v8::Local::<v8::External>::try_from(data) {
+        return Some((external, None));
+    }
+    let pair = v8::Local::<v8::Array>::try_from(data).ok()?;
+    let external = v8::Local::<v8::External>::try_from(pair.get_index(scope, 0)?).ok()?;
+    let prototype = v8::Local::<v8::Object>::try_from(pair.get_index(scope, 1)?).ok()?;
+    Some((external, Some(prototype)))
+}
+
+/// Whether `receiver` passes a class prototype method's receiver check: an
+/// object whose prototype chain contains `prototype`. Node's check is V8's
+/// signature check, which asks whether the receiver was created by the
+/// class's constructor (or a subclass's); walking the prototype chain answers
+/// the same unless a prototype was set by hand: an object given the class
+/// prototype (`Object.create(Cls.prototype)`) passes here and not in node,
+/// and an instance whose prototype was replaced passes in node and not here
+/// (docs/node-divergences.md, entry 63). A proxy fails without its traps
+/// being consulted, as in node: the walk runs no JS.
+fn receiver_inherits(
+    scope: &v8::PinScope<'_, '_>,
+    receiver: v8::Local<v8::Value>,
+    prototype: v8::Local<v8::Object>,
+) -> bool {
+    let Ok(mut object) = v8::Local::<v8::Object>::try_from(receiver) else {
+        return false;
+    };
+    loop {
+        if object.is_proxy() {
+            return false;
+        }
+        let Some(next) = object.get_prototype(scope) else {
+            return false;
+        };
+        // `null` ends the chain.
+        let Ok(next) = v8::Local::<v8::Object>::try_from(next) else {
+            return false;
+        };
+        if next.strict_equals(prototype.into()) {
+            return true;
+        }
+        object = next;
+    }
+}
+
 /// The zero-capture trampoline behind every napi_create_function.
 fn napi_trampoline(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Ok(external) = v8::Local::<v8::External>::try_from(args.data()) else {
+    let Some((external, prototype)) = trampoline_data(scope, args.data()) else {
         return;
     };
+    // A class prototype method refuses a receiver that is not an instance
+    // of its class before anything else runs, as V8's signature check does
+    // in node: no finalizer, no callback.
+    if let Some(prototype) = prototype
+        && !receiver_inherits(scope, args.this().into(), prototype)
+    {
+        if let Some(message) = v8::String::new(scope, ILLEGAL_INVOCATION) {
+            let error = v8::Exception::type_error(scope, message);
+            scope.throw_exception(error);
+        }
+        return;
+    }
     // SAFETY: the External's payload is the `*mut FnData` stored when this function was built (`create_function`). The record is owned by `NapiEnv::fn_data` and leaves it only for an id V8 reported collected -- that is, after this External died -- or with the env; V8 has just handed this External over alive, so the record is live. The shared reference ends with this statement: the fields are copied out and the record is not read again, so nothing below (the finalizers, the addon callback, a nested entry) can observe it going away.
     let (cb, data, env) = unsafe {
         let fn_data = &*(external.value() as *const FnData);
@@ -2138,7 +2212,8 @@ pub unsafe extern "C" fn napi_create_function(
         return NAPI_INVALID_ARG;
     }
     // SAFETY: `env` is non-null and live (env_scope_mut found its scope) and no reference into it is held here; `scope` is its installed scope; `name` is null or the caller's string of `length` bytes (NUL-terminated when the length is NAPI_AUTO_LENGTH); `cb` and `data` are the addon's own.
-    let Some(function) = (unsafe { create_function(env, scope, name, length, cb, data) }) else {
+    let Some(function) = (unsafe { create_function(env, scope, name, length, cb, data, None) })
+    else {
         return NAPI_GENERIC_FAILURE;
     };
     // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
@@ -2156,6 +2231,17 @@ pub unsafe extern "C" fn napi_create_function(
 /// point that defines several functions still holds exactly one scope
 /// reference (`env_scope_mut`'s contract).
 ///
+/// `receiver` is the class prototype of a `napi_define_class` prototype
+/// method, `None` for every other function: the trampoline then refuses,
+/// with node's `TypeError: Illegal invocation`, a call whose receiver does
+/// not inherit from it ([`receiver_inherits`]). The prototype rides in the
+/// function's callback data next to the `External` ([`trampoline_data`]),
+/// so it is held from the JS heap, as the method is held by the prototype:
+/// nothing outside the heap keeps either alive, and the record is still
+/// released when the method is collected. (A V8 `Signature` would do the
+/// check in V8 itself, but needs a `FunctionTemplate`, whose callback data
+/// lives as long as the isolate.)
+///
 /// # Safety
 ///
 /// `env` must be a live `*mut NapiEnv` with no reference into it held by the
@@ -2172,17 +2258,20 @@ unsafe fn create_function<'s>(
     length: usize,
     cb: unsafe extern "C" fn(Env, *mut CbInfo) -> NapiValue,
     data: *mut c_void,
+    receiver: Option<v8::Local<'s, v8::Object>>,
 ) -> Option<v8::Local<'s, v8::Function>> {
     // The one borrow of the env this function takes. It stays live across
     // the V8 calls below (`External::new`, `Weak::with_finalizer` inside
-    // `track_weak_as`, and `Function::builder().build()`), so nothing may
-    // re-enter this env under it. Two things make that hold:
+    // `track_weak_as`, `Array::new_with_elements` for a prototype method,
+    // and `Function::builder().build()`), so nothing may re-enter this env
+    // under it. Two things make that hold:
     // * The collector never touches a `NapiEnv` (see `NapiEnv::collected`),
     //   so the allocations are harmless.
     // * The calls run no JavaScript. That rests on two things, and only
     //   the second is this runtime's to keep:
-    //   1. In v8 150.0.0 (src/api/api.cc, api-inl.h) `External::new` and
-    //      the weak-handle calls enter no call-depth scope, and `build` --
+    //   1. In v8 150.0.0 (src/api/api.cc, api-inl.h) `External::new`,
+    //      `Array::New` with elements and the weak-handle calls enter no
+    //      call-depth scope, and `build` --
     //      v8::Function::New, which instantiates through
     //      FunctionTemplate::GetFunction -- enters a
     //      PrepareForExecutionScope, i.e. `CallDepthScope<false>`: the kind
@@ -2227,8 +2316,14 @@ unsafe fn create_function<'s>(
         None,
         std::ptr::null_mut(),
     );
+    let callback_data: v8::Local<v8::Value> = match receiver {
+        None => external.into(),
+        Some(prototype) => {
+            v8::Array::new_with_elements(scope, &[external.into(), prototype.into()]).into()
+        }
+    };
     let Some(function) = v8::Function::builder(napi_trampoline)
-        .data(external.into())
+        .data(callback_data)
         .build(scope)
     else {
         // No Function was built, so nothing can ever call through the
@@ -3265,17 +3360,24 @@ fn napi_attrs_to_v8(attrs: u32) -> v8::PropertyAttribute {
     a
 }
 
-/// What `fn.name` a descriptor's `method` gets. Node v22 builds the
-/// prototype methods of `napi_define_class` from function templates set on
-/// the prototype template, which V8 names after a string key; every other
-/// descriptor function (`napi_define_properties`, static class members,
-/// symbol keys, getters and setters) is left unnamed.
+/// Where a descriptor is defined, which decides two things about its
+/// `method`. Node v22 builds the prototype methods of `napi_define_class`
+/// from function templates set on the prototype template, with a signature
+/// for the class: V8 names such a method after a string key, and refuses a
+/// receiver that is not an instance of the class (`TypeError: Illegal
+/// invocation`). Every other descriptor function (`napi_define_properties`,
+/// static class members, getters and setters, prototype ones included) is
+/// left unnamed and takes any receiver; a symbol-keyed prototype method is
+/// unnamed but still checks its receiver.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum MethodNaming {
-    /// The method is unnamed.
-    Unnamed,
-    /// The method is named after its key when the key is a string.
-    StringKey,
+enum DescriptorSite {
+    /// An object or a class constructor: the method is unnamed and takes
+    /// any receiver.
+    Plain,
+    /// A class prototype (the descriptor's target): the method is named
+    /// after its key when the key is a string, and its receiver must
+    /// inherit from the prototype.
+    ClassPrototype,
 }
 
 /// Define on `target` the property one `napi_property_descriptor` describes.
@@ -3294,8 +3396,10 @@ enum MethodNaming {
 /// is skipped.
 ///
 /// Every function built here is unnamed (`fn.name === ""`), as in Node,
-/// except a method under [`MethodNaming::StringKey`], which takes its
-/// string key as its name. Getters and setters are always unnamed.
+/// except a method under [`DescriptorSite::ClassPrototype`], which takes
+/// its string key as its name. Getters and setters are always unnamed. A
+/// method under [`DescriptorSite::ClassPrototype`] also checks its receiver
+/// (see [`create_function`]); no getter or setter does, as in node.
 ///
 /// # Safety
 ///
@@ -3308,9 +3412,9 @@ enum MethodNaming {
 unsafe fn define_descriptor<'s>(
     env: Env,
     scope: &mut v8::PinScope<'s, '_>,
-    target: v8::Local<v8::Object>,
+    target: v8::Local<'s, v8::Object>,
     prop: &NapiPropertyDescriptor,
-    naming: MethodNaming,
+    site: DescriptorSite,
 ) {
     let key: v8::Local<v8::Value> = if !prop.utf8name.is_null() {
         // SAFETY: `prop.utf8name` is the caller's NUL-terminated C string, null-checked before this read.
@@ -3333,19 +3437,32 @@ unsafe fn define_descriptor<'s>(
 
     // The trampoline function for one of the descriptor's callbacks, built
     // unnamed through the caller's scope: the one scope reference of this
-    // entry.
-    let function_for =
-        |scope: &mut v8::PinScope<'s, '_>, callback| -> Option<v8::Local<'s, v8::Function>> {
-            // SAFETY: `env` is the live env `scope` is installed on and no reference into it is held here (this function's contract); the name is null, so no text is read; the callback and `prop.data` are the addon's own.
-            unsafe { create_function(env, scope, std::ptr::null(), 0, callback, prop.data) }
-        };
+    // entry. `receiver` is the prototype a class prototype method's receiver
+    // must inherit from.
+    let function_for = |scope: &mut v8::PinScope<'s, '_>,
+                        callback,
+                        receiver|
+     -> Option<v8::Local<'s, v8::Function>> {
+        // SAFETY: `env` is the live env `scope` is installed on and no reference into it is held here (this function's contract); the name is null, so no text is read; the callback and `prop.data` are the addon's own.
+        unsafe {
+            create_function(
+                env,
+                scope,
+                std::ptr::null(),
+                0,
+                callback,
+                prop.data,
+                receiver,
+            )
+        }
+    };
 
     if prop.getter.is_some() || prop.setter.is_some() {
         let undefined: v8::Local<'s, v8::Value> = v8::undefined(scope).into();
         let mut halves = [undefined, undefined];
         for (half, callback) in halves.iter_mut().zip([prop.getter, prop.setter]) {
             if let Some(callback) = callback {
-                let Some(function) = function_for(scope, callback) else {
+                let Some(function) = function_for(scope, callback, None) else {
                     return;
                 };
                 *half = function.into();
@@ -3356,8 +3473,9 @@ unsafe fn define_descriptor<'s>(
         descriptor.set_configurable(prop.attributes & NAPI_ATTR_CONFIGURABLE != 0);
         target.define_property(scope, key, &descriptor);
     } else if let Some(method) = prop.method {
-        if let Some(function) = function_for(scope, method) {
-            if naming == MethodNaming::StringKey
+        let receiver = (site == DescriptorSite::ClassPrototype).then_some(target);
+        if let Some(function) = function_for(scope, method, receiver) {
+            if site == DescriptorSite::ClassPrototype
                 && let Ok(name) = v8::Local::<v8::String>::try_from(key)
             {
                 function.set_name(name);
@@ -3450,7 +3568,7 @@ pub unsafe extern "C" fn napi_define_class(
     // Create the constructor function via the shared trampoline.
     // SAFETY: `env` is non-null and live (env_scope_mut found its scope) and no reference into it is held here; `scope` is its installed scope; `utf8name` is non-null (checked above) and the caller's string of `length` bytes (NUL-terminated when the length is NAPI_AUTO_LENGTH); the constructor and `data` are the addon's own.
     let Some(ctor_fn) =
-        (unsafe { create_function(env, scope, utf8name, length, constructor, data) })
+        (unsafe { create_function(env, scope, utf8name, length, constructor, data, None) })
     else {
         return NAPI_GENERIC_FAILURE;
     };
@@ -3481,20 +3599,21 @@ pub unsafe extern "C" fn napi_define_class(
         (props.iter().filter(|p| !is_static(p))).chain(props.iter().filter(|p| is_static(p)));
     let mut installed = false;
     for prop in ordered {
-        let (target, naming): (v8::Local<v8::Object>, _) = if is_static(prop) {
+        let (target, site): (v8::Local<v8::Object>, _) = if is_static(prop) {
             if !installed {
                 if !install_class_prototype(scope, ctor_fn, proto_obj) {
                     return NAPI_GENERIC_FAILURE;
                 }
                 installed = true;
             }
-            (ctor_fn.into(), MethodNaming::Unnamed)
+            (ctor_fn.into(), DescriptorSite::Plain)
         } else {
-            // Node names a prototype method after its string key.
-            (proto_obj, MethodNaming::StringKey)
+            // Node names a prototype method after its string key and
+            // checks its receiver.
+            (proto_obj, DescriptorSite::ClassPrototype)
         };
         // SAFETY: `env` is the caller's live env (env_scope_mut proved it) with no reference into it held here; `scope` is this entry point's one scope reference; `prop` is one of the caller's descriptors, whose name, value and callbacks are the addon's own per this entry point's contract.
-        unsafe { define_descriptor(env, scope, target, prop, naming) };
+        unsafe { define_descriptor(env, scope, target, prop, site) };
     }
     if !installed && !install_class_prototype(scope, ctor_fn, proto_obj) {
         return NAPI_GENERIC_FAILURE;
@@ -5116,7 +5235,7 @@ pub unsafe extern "C" fn napi_define_properties(
     let descriptors = unsafe { std::slice::from_raw_parts(props, count) };
     for prop in descriptors {
         // SAFETY: `env` is the caller's live env (env_scope_mut proved it) with no reference into it held here; `scope` is this entry point's one scope reference; `prop` is one of the caller's descriptors, whose name, value and callbacks are the addon's own per this entry point's contract.
-        unsafe { define_descriptor(env, scope, target, prop, MethodNaming::Unnamed) };
+        unsafe { define_descriptor(env, scope, target, prop, DescriptorSite::Plain) };
     }
     NAPI_OK
 }
