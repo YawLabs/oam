@@ -585,8 +585,10 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   stdio can be signalled by pid, and a number that is no signal is refused with `EINVAL` before
   the pid is looked at, as kill(2) orders it.
 - **`os.networkInterfaces()` reports the host's real interfaces**, with their hardware
-  addresses, addresses and prefix lengths, instead of a fixed loopback plus one made-up `eth0` /
-  `Ethernet` entry.
+  addresses, addresses and netmasks, instead of a fixed loopback plus one made-up `eth0` /
+  `Ethernet` entry. On Linux and macOS it reads getifaddrs(3) as libuv does, so the result
+  matches node's, order and IPv6 `scopeid` included, and works in a container with no `/sys`.
+  A failed getifaddrs throws node's `ERR_SYSTEM_ERROR` naming `uv_interface_addresses`.
 - **`os.userInfo()` returns the real uid, gid, shell and home directory on Linux and macOS** (it
   answered Windows' -1 / -1 / null everywhere), and `os.version()` returns the kernel version
   string there instead of the release.

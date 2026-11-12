@@ -12432,25 +12432,295 @@ fn op_network_interfaces(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let json = serde_json::to_string(&network_interfaces()).unwrap_or_else(|_| "{}".into());
-    let val = v8::String::new(scope, &json).unwrap();
-    rv.set(val.into());
+    match network_interfaces() {
+        Ok(interfaces) => {
+            let json = serde_json::to_string(&interfaces).unwrap_or_else(|_| "{}".into());
+            let val = v8::String::new(scope, &json).unwrap();
+            rv.set(val.into());
+        }
+        // libuv's (negative) error number; the JS side throws node's
+        // ERR_SYSTEM_ERROR naming uv_interface_addresses, as node does.
+        Err(uv_errno) => rv.set(v8::Integer::new(scope, uv_errno).into()),
+    }
 }
 
-/// `os.networkInterfaces()`: the host's interfaces as the system reports them
-/// (`sysinfo::Networks`: name, hardware address, and each address with its
-/// prefix length), in node's entry shape. Nothing here is assumed: this used
-/// to answer one fixed loopback entry named `lo` on every unix (macOS's is
-/// `lo0`) plus one invented `eth0` / `Ethernet` with a zero hardware address
-/// and a /24 mask around whatever local address a UDP socket picked.
+/// `os.networkInterfaces()` on unix: libuv's `uv_interface_addresses`, read
+/// the way libuv reads it -- straight from getifaddrs(3), in the order the
+/// system lists the addresses.
+///
+/// - An address is reported when its interface is up AND running and the
+///   entry carries an IPv4 or IPv6 address (libuv's `uv__ifaddr_exclude`);
+///   the link-layer entries (`AF_PACKET` on Linux, `AF_LINK` on macOS) are
+///   not addresses but supply each interface's hardware address, matched by
+///   name, the last one winning as in libuv's second pass.
+/// - `internal` is the interface's `IFF_LOOPBACK` flag; `scopeid` is the
+///   IPv6 address's own `sin6_scope_id`; the CIDR suffix is node's
+///   `getCIDR` over the netmask.
+/// - The interface name is getifaddrs' own, so an IPv4 alias label such as
+///   `eth0:1` is its own key, as in node.
+///
+/// Never read through `/sys/class/net`: a container may have no sysfs at all
+/// (the linux release leg's rootless one has none), and getifaddrs answers
+/// from netlink there as everywhere. #474 first read this through
+/// `sysinfo::Networks`, which on Linux enumerates interfaces from that
+/// directory and so reported `{}` in such a container.
+#[cfg(unix)]
+fn network_interfaces() -> Result<serde_json::Value, i32> {
+    use serde_json::{Map, Value};
+    use std::collections::HashMap;
+
+    let entries = ifaddrs::read()?;
+    let up_and_running = |e: &ifaddrs::Entry| {
+        let want = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_uint;
+        e.flags & want == want
+    };
+
+    let mut macs: HashMap<&str, [u8; 6]> = HashMap::new();
+    for e in entries.iter().filter(|e| up_and_running(e)) {
+        if let ifaddrs::Addr::Link(mac) = e.addr {
+            macs.insert(&e.name, mac);
+        }
+    }
+
+    let mut result = Map::new();
+    for e in entries.iter().filter(|e| up_and_running(e)) {
+        let ifaddrs::Addr::Ip(addr, scope_id) = e.addr else {
+            continue;
+        };
+        let mac = macs.get(e.name.as_str()).copied().unwrap_or([0; 6]);
+        let mac = mac
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let internal = e.flags & libc::IFF_LOOPBACK as libc::c_uint != 0;
+        let scopeid = addr.is_ipv6().then_some(scope_id);
+        let entry = interface_address(addr, e.netmask, &mac, internal, scopeid);
+        match result
+            .entry(e.name.clone())
+            .or_insert_with(|| Value::Array(Vec::new()))
+        {
+            Value::Array(list) => list.push(entry),
+            _ => unreachable!("every interface entry is an array"),
+        }
+    }
+    Ok(Value::Object(result))
+}
+
+/// getifaddrs(3), read into owned values. Every pointer the list holds is
+/// dereferenced here and nowhere else; the list is freed before `read`
+/// returns.
+#[cfg(unix)]
+mod ifaddrs {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// One node of the list.
+    pub(super) struct Entry {
+        pub name: String,
+        pub flags: libc::c_uint,
+        pub addr: Addr,
+        /// The netmask's address bytes, read as the address's own family
+        /// (libuv copies the mask's sockaddr whatever its `sa_family` says,
+        /// and node formats it as the address's family). Zero when absent.
+        pub netmask: IpAddr,
+    }
+
+    pub(super) enum Addr {
+        /// An IPv4 or IPv6 address, with the IPv6 one's `sin6_scope_id`
+        /// (0 for IPv4).
+        Ip(IpAddr, u32),
+        /// A link-layer entry's hardware address: its first six bytes,
+        /// zero-filled when shorter (libuv's `phys_addr` is six bytes).
+        Link([u8; 6]),
+        /// No address, or a family that is neither.
+        Other,
+    }
+
+    /// The list getifaddrs returned; freed exactly once, on drop.
+    struct List(*mut libc::ifaddrs);
+
+    impl Drop for List {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is the non-null head getifaddrs returned and
+            // nothing else frees it; every reference into the list was
+            // turned into owned data before `read` drops this.
+            unsafe { libc::freeifaddrs(self.0) }
+        }
+    }
+
+    /// The system's interface addresses, or libuv's negative error number.
+    pub(super) fn read() -> Result<Vec<Entry>, i32> {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        // glibc builds the list over netlink; an EINTR there (a signal
+        // landing mid-recvmsg) is retried, as sysinfo and libc's callers do.
+        loop {
+            // SAFETY: `head` is a valid out-pointer for the list's head.
+            if unsafe { libc::getifaddrs(&mut head) } == 0 {
+                break;
+            }
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            if errno != libc::EINTR {
+                return Err(-errno);
+            }
+        }
+        if head.is_null() {
+            return Ok(Vec::new());
+        }
+        let list = List(head);
+        let mut out = Vec::new();
+        let mut cur: *const libc::ifaddrs = list.0;
+        while !cur.is_null() {
+            // SAFETY: `cur` is the head or an `ifa_next` of a node of the
+            // list getifaddrs returned, which stays allocated, unmutated,
+            // until `list` drops at the end of this function.
+            let node = unsafe { &*cur };
+            let name = if node.ifa_name.is_null() {
+                String::new()
+            } else {
+                // SAFETY: a non-null `ifa_name` is a NUL-terminated string
+                // inside the same live list.
+                unsafe { std::ffi::CStr::from_ptr(node.ifa_name) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            // SAFETY: each is null or points at a sockaddr inside the live
+            // list, its storage as long as its family's struct (`sa_len`
+            // long on the BSDs), which is `sockaddr_bytes`' contract.
+            let addr = unsafe { sockaddr_bytes(node.ifa_addr) };
+            // SAFETY: as above.
+            let mask = unsafe { sockaddr_bytes(node.ifa_netmask) };
+            let addr = decode(&addr);
+            let netmask = match addr {
+                Addr::Ip(IpAddr::V6(_), _) => IpAddr::V6(Ipv6Addr::from(ip6_bytes(&mask))),
+                _ => IpAddr::V4(Ipv4Addr::from(ip4_bytes(&mask))),
+            };
+            out.push(Entry {
+                name,
+                flags: node.ifa_flags,
+                addr,
+                netmask,
+            });
+            cur = node.ifa_next;
+        }
+        drop(list);
+        Ok(out)
+    }
+
+    /// A copy of the sockaddr at `sa` (empty for null), so every field is
+    /// then read by safe, bounds-checked byte parsing.
+    ///
+    /// # Safety
+    ///
+    /// `sa` is null, or points at a live sockaddr whose storage is at least
+    /// as long as the struct of the family it names -- on the BSDs at least
+    /// its `sa_len`, which is what gets copied there.
+    unsafe fn sockaddr_bytes(sa: *const libc::sockaddr) -> Vec<u8> {
+        if sa.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: `sa` is non-null and points at a sockaddr (the caller's
+        // contract); its header is in bounds for every family.
+        let header = unsafe { std::ptr::read_unaligned(sa) };
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
+        let len = usize::from(header.sa_len);
+        #[cfg(not(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        )))]
+        let len = match i32::from(header.sa_family) {
+            libc::AF_INET => std::mem::size_of::<libc::sockaddr_in>(),
+            libc::AF_INET6 => std::mem::size_of::<libc::sockaddr_in6>(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            libc::AF_PACKET => std::mem::size_of::<libc::sockaddr_ll>(),
+            _ => std::mem::size_of::<libc::sockaddr>(),
+        };
+        // SAFETY: `len` bytes from `sa` are in bounds: the family's struct
+        // size, or on the BSDs the sockaddr's own `sa_len` (the caller's
+        // contract); `u8` has no alignment requirement.
+        unsafe { std::slice::from_raw_parts(sa.cast::<u8>(), len) }.to_vec()
+    }
+
+    /// `N` bytes of `raw` from `at`, zero-filled past its end: a BSD netmask
+    /// may be shorter than its struct, its missing bytes zero.
+    fn field<const N: usize>(raw: &[u8], at: usize) -> [u8; N] {
+        let mut out = [0u8; N];
+        if let Some(rest) = raw.get(at..) {
+            let n = rest.len().min(N);
+            out[..n].copy_from_slice(&rest[..n]);
+        }
+        out
+    }
+
+    fn ip4_bytes(raw: &[u8]) -> [u8; 4] {
+        field(raw, std::mem::offset_of!(libc::sockaddr_in, sin_addr))
+    }
+
+    fn ip6_bytes(raw: &[u8]) -> [u8; 16] {
+        field(raw, std::mem::offset_of!(libc::sockaddr_in6, sin6_addr))
+    }
+
+    fn decode(raw: &[u8]) -> Addr {
+        if raw.is_empty() {
+            return Addr::Other;
+        }
+        let family_at = std::mem::offset_of!(libc::sockaddr, sa_family);
+        let family = i32::from(libc::sa_family_t::from_ne_bytes(field(raw, family_at)));
+        match family {
+            libc::AF_INET => Addr::Ip(IpAddr::V4(Ipv4Addr::from(ip4_bytes(raw))), 0),
+            libc::AF_INET6 => {
+                let scope_at = std::mem::offset_of!(libc::sockaddr_in6, sin6_scope_id);
+                let scope = u32::from_ne_bytes(field(raw, scope_at));
+                Addr::Ip(IpAddr::V6(Ipv6Addr::from(ip6_bytes(raw))), scope)
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            libc::AF_PACKET => {
+                let halen = field::<1>(raw, std::mem::offset_of!(libc::sockaddr_ll, sll_halen))[0];
+                let addr: [u8; 8] = field(raw, std::mem::offset_of!(libc::sockaddr_ll, sll_addr));
+                let mut mac = [0u8; 6];
+                let n = usize::from(halen).min(6);
+                mac[..n].copy_from_slice(&addr[..n]);
+                Addr::Link(mac)
+            }
+            #[cfg(target_vendor = "apple")]
+            libc::AF_LINK => {
+                let nlen = field::<1>(raw, std::mem::offset_of!(libc::sockaddr_dl, sdl_nlen))[0];
+                let alen = field::<1>(raw, std::mem::offset_of!(libc::sockaddr_dl, sdl_alen))[0];
+                // LLADDR: the hardware address follows the name in sdl_data.
+                let at = std::mem::offset_of!(libc::sockaddr_dl, sdl_data) + usize::from(nlen);
+                let bytes: [u8; 6] = field(raw, at);
+                let mut mac = [0u8; 6];
+                let n = usize::from(alen).min(6);
+                mac[..n].copy_from_slice(&bytes[..n]);
+                Addr::Link(mac)
+            }
+            _ => Addr::Other,
+        }
+    }
+}
+
+/// `os.networkInterfaces()` on Windows: the host's adapters as `sysinfo`
+/// reports them (name, hardware address, and each address with its prefix
+/// length), in node's entry shape.
 ///
 /// What still differs from node is recorded in docs/node-divergences.md: the
 /// interfaces and each one's addresses are sorted rather than in the system's
 /// order, a link-local IPv6 address has no `scopeid` (the zone index is not
-/// read), and on Windows only the adapters sysinfo lists are reported (it
-/// leaves out software adapters), with the loopback interface added from the
-/// two loopback addresses this host can actually bind.
-fn network_interfaces() -> serde_json::Value {
+/// read), and only the adapters sysinfo lists are reported (it leaves out
+/// software adapters), with the loopback interface added from the two
+/// loopback addresses this host can actually bind.
+#[cfg(windows)]
+fn network_interfaces() -> Result<serde_json::Value, i32> {
     use serde_json::{Map, Value};
 
     let mut interfaces: Vec<(String, Vec<Value>)> = Vec::new();
@@ -12470,37 +12740,34 @@ fn network_interfaces() -> serde_json::Value {
         if nets.is_empty() {
             continue;
         }
-        // The family node lists first on this platform (IPv6 on Windows, IPv4
-        // elsewhere), then by address: sysinfo's own order is a hash set's.
-        nets.sort_by_key(|net| (net.addr.is_ipv4() == cfg!(windows), net.addr));
+        // IPv6 first, as node lists them on Windows, then by address:
+        // sysinfo's own order is a hash set's.
+        nets.sort_by_key(|net| (net.addr.is_ipv4(), net.addr));
         let internal = nets.iter().any(|net| net.addr.is_loopback());
         let mac = data.mac_address().to_string();
         let entries = nets
             .iter()
-            .map(|net| interface_address(net.addr, net.prefix, &mac, internal))
+            .map(|net| prefixed_interface_address(net.addr, net.prefix, &mac, internal))
             .collect();
         interfaces.push((name.clone(), entries));
     }
 
-    // Windows: sysinfo lists adapters with a hardware address only, which
-    // leaves the loopback interface out. Its name and two addresses are fixed
-    // by the system; each address is reported only if this host can bind it.
-    #[cfg(windows)]
-    {
-        const LOOPBACK: &str = "Loopback Pseudo-Interface 1";
-        const NO_MAC: &str = "00:00:00:00:00:00";
-        let mut entries = Vec::new();
-        if std::net::UdpSocket::bind("[::1]:0").is_ok() {
-            let addr = std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
-            entries.push(interface_address(addr, 128, NO_MAC, true));
-        }
-        if std::net::UdpSocket::bind("127.0.0.1:0").is_ok() {
-            let addr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-            entries.push(interface_address(addr, 8, NO_MAC, true));
-        }
-        if !entries.is_empty() && !interfaces.iter().any(|(name, _)| name == LOOPBACK) {
-            interfaces.push((LOOPBACK.to_string(), entries));
-        }
+    // sysinfo lists adapters with a hardware address only, which leaves the
+    // loopback interface out. Its name and two addresses are fixed by the
+    // system; each address is reported only if this host can bind it.
+    const LOOPBACK: &str = "Loopback Pseudo-Interface 1";
+    const NO_MAC: &str = "00:00:00:00:00:00";
+    let mut entries = Vec::new();
+    if std::net::UdpSocket::bind("[::1]:0").is_ok() {
+        let addr = std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        entries.push(prefixed_interface_address(addr, 128, NO_MAC, true));
+    }
+    if std::net::UdpSocket::bind("127.0.0.1:0").is_ok() {
+        let addr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        entries.push(prefixed_interface_address(addr, 8, NO_MAC, true));
+    }
+    if !entries.is_empty() && !interfaces.iter().any(|(name, _)| name == LOOPBACK) {
+        interfaces.push((LOOPBACK.to_string(), entries));
     }
 
     interfaces.sort_by(|a, b| a.0.cmp(&b.0));
@@ -12508,61 +12775,90 @@ fn network_interfaces() -> serde_json::Value {
     for (name, entries) in interfaces {
         result.insert(name, Value::Array(entries));
     }
-    Value::Object(result)
+    Ok(Value::Object(result))
 }
 
-/// One address of an interface as node's `os.networkInterfaces()` reports it,
-/// keys in node's order: the address, the netmask and CIDR its prefix length
-/// spells, the family, the interface's hardware address, and `internal`.
-/// An IPv6 address also carries `scopeid`, 0 for every scope but link-local;
-/// a link-local address (fe80::/10) gets no `scopeid` at all, because its
-/// zone index is not known here and 0 would be a wrong one.
-fn interface_address(
+/// [`interface_address`] for an address known by its prefix length (what
+/// sysinfo reports), with Windows' `scopeid` rule: 0 for every IPv6 scope but
+/// link-local, and none at all for a link-local address (fe80::/10), whose
+/// zone index is not known here -- 0 would be a wrong one.
+#[cfg(windows)]
+fn prefixed_interface_address(
     addr: std::net::IpAddr,
     prefix: u8,
     mac: &str,
     internal: bool,
 ) -> serde_json::Value {
-    use serde_json::json;
-    match addr {
-        std::net::IpAddr::V4(v4) => {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let (netmask, scopeid) = match addr {
+        IpAddr::V4(_) => {
             let bits = u32::from(prefix.min(32));
-            let mask = if bits == 0 {
-                0
-            } else {
-                u32::MAX << (32 - bits)
-            };
-            json!({
-                "address": v4.to_string(),
-                "netmask": std::net::Ipv4Addr::from(mask).to_string(),
-                "family": "IPv4",
-                "mac": mac,
-                "internal": internal,
-                "cidr": format!("{v4}/{bits}"),
-            })
+            let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+            (IpAddr::V4(Ipv4Addr::from(mask)), None)
         }
-        std::net::IpAddr::V6(v6) => {
+        IpAddr::V6(v6) => {
             let bits = u32::from(prefix.min(128));
-            let mask = if bits == 0 {
-                0
-            } else {
-                u128::MAX << (128 - bits)
-            };
-            let mut entry = json!({
-                "address": v6.to_string(),
-                "netmask": std::net::Ipv6Addr::from(mask).to_string(),
-                "family": "IPv6",
-                "mac": mac,
-                "internal": internal,
-                "cidr": format!("{v6}/{bits}"),
-            });
+            let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
             let link_local = v6.segments()[0] & 0xffc0 == 0xfe80;
-            if !link_local {
-                entry["scopeid"] = json!(0);
+            (IpAddr::V6(Ipv6Addr::from(mask)), (!link_local).then_some(0))
+        }
+    };
+    interface_address(addr, netmask, mac, internal, scopeid)
+}
+
+/// One address of an interface as node's `os.networkInterfaces()` reports it,
+/// keys in node's order: the address, the netmask, the family, the
+/// interface's hardware address, `internal`, the CIDR, and (IPv6 only, when
+/// known) `scopeid`.
+fn interface_address(
+    addr: std::net::IpAddr,
+    netmask: std::net::IpAddr,
+    mac: &str,
+    internal: bool,
+    scopeid: Option<u32>,
+) -> serde_json::Value {
+    use serde_json::json;
+    let family = if addr.is_ipv4() { "IPv4" } else { "IPv6" };
+    let mut entry = json!({
+        "address": addr.to_string(),
+        "netmask": netmask.to_string(),
+        "family": family,
+        "mac": mac,
+        "internal": internal,
+        "cidr": netmask_ones(netmask).map(|ones| format!("{addr}/{ones}")),
+    });
+    if let (true, Some(scopeid)) = (addr.is_ipv6(), scopeid) {
+        entry["scopeid"] = json!(scopeid);
+    }
+    entry
+}
+
+/// node's `getCIDR` (lib/os.js) over a netmask's groups -- octets for IPv4,
+/// 16-bit groups for IPv6: the set bits of every group up to and including
+/// the first one that is not all ones, or `None` (node's `cidr: null`) when a
+/// later group is not zero.
+fn netmask_ones(netmask: std::net::IpAddr) -> Option<u32> {
+    let groups: Vec<(u32, u32)> = match netmask {
+        std::net::IpAddr::V4(v4) => v4.octets().iter().map(|&g| (u32::from(g), 0xff)).collect(),
+        std::net::IpAddr::V6(v6) => v6
+            .segments()
+            .iter()
+            .map(|&g| (u32::from(g), 0xffff))
+            .collect(),
+    };
+    let mut ones = 0;
+    let mut has_zeros = false;
+    for (group, full) in groups {
+        if has_zeros {
+            if group != 0 {
+                return None;
             }
-            entry
+        } else {
+            ones += group.count_ones();
+            has_zeros = group != full;
         }
     }
+    Some(ones)
 }
 
 // ============================================================= parent PID
