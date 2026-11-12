@@ -463,6 +463,21 @@ not read (`--inspect`, `--title=x`) draws that "not allowed" line where node pri
 `OAM_MAX_HEAP_MB` itself keeps its own rule: a value that is not a positive whole
 number draws one warning naming the variable and the default cap is kept.
 
+A cap under 16 MB is raised to 16 MB, from the flag (argv or `NODE_OPTIONS`) and
+`OAM_MAX_HEAP_MB` alike, and the run goes on. The cap bounds V8's old generation, and
+oam's startup snapshot needs about 7 MB of it before any code runs (a booted oam holds
+about 6.7 MB of live heap where node v22.22.2 holds about 3.1 MB). Below that, V8 used to
+abort with `Fatal JavaScript out of memory: GC during deserialization` (exit 3); 16 MB
+is about twice the boot heap. node takes the small value as given and starts from 4 MB
+up, because its startup heap fits (at 1 to 3 MB node dies of its own heap OOM). So for a
+cap under 16 MB `heap_size_limit` reports the same limit as `--max-old-space-size=16`, and
+an `OAM-RT-OOM` banner reads
+`(set by --max-old-space-size to 5 MB, raised to oam's 16 MB minimum)`.
+
+`heap_size_limit` also differs above the minimum. node adds about 48 MB of young
+generation to the cap (`--max-old-space-size=64` reports 112 MB); oam sizes its young
+generation from the cap, so the same flag reports about 70 MB.
+
 This closes a gap where Dockerfiles and k8s manifests that set
 `NODE_OPTIONS=--max-old-space-size=...` to fit the heap under a memory limit would
 silently have their cap ignored (oam kept its default instead).
