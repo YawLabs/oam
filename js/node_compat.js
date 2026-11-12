@@ -5916,13 +5916,20 @@
         const result = natives.osSetPriority(pid, priority);
         if (typeof result === "string") throw uvSystemError(result, "uv_os_setpriority");
       },
-      // A failed getifaddrs answers libuv's (negative) error number, which
-      // node turns into ERR_SYSTEM_ERROR naming uv_interface_addresses.
+      // A failed getifaddrs answers its raw (positive) errno. node hands
+      // that same positive errno to libuv's name and message lookups, which
+      // know only negative codes, so its ERR_SYSTEM_ERROR reads "Unknown
+      // system error N" for code and message alike (src/node_os.cc).
       networkInterfaces: function networkInterfaces() {
         const result = natives.networkInterfaces();
         if (typeof result === "number") {
-          const entry = uvErrnoTable(natives).get(result);
-          throw uvSystemError(entry === undefined ? "UNKNOWN" : entry[0], "uv_interface_addresses");
+          const unknown = `Unknown system error ${result}`;
+          throw systemErrorWithCode("ERR_SYSTEM_ERROR", {
+            errno: result,
+            code: unknown,
+            message: unknown,
+            syscall: "uv_interface_addresses",
+          });
         }
         return JSON.parse(result);
       },

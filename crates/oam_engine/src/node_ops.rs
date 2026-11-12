@@ -12438,8 +12438,8 @@ fn op_network_interfaces(
             let val = v8::String::new(scope, &json).unwrap();
             rv.set(val.into());
         }
-        // libuv's (negative) error number; the JS side throws node's
-        // ERR_SYSTEM_ERROR naming uv_interface_addresses, as node does.
+        // getifaddrs' raw errno; the JS side throws node's ERR_SYSTEM_ERROR
+        // naming uv_interface_addresses, as node does.
         Err(uv_errno) => rv.set(v8::Integer::new(scope, uv_errno).into()),
     }
 }
@@ -12467,7 +12467,6 @@ fn op_network_interfaces(
 #[cfg(unix)]
 fn network_interfaces() -> Result<serde_json::Value, i32> {
     use serde_json::{Map, Value};
-    use std::collections::HashMap;
 
     let entries = ifaddrs::read()?;
     let up_and_running = |e: &ifaddrs::Entry| {
@@ -12475,19 +12474,39 @@ fn network_interfaces() -> Result<serde_json::Value, i32> {
         e.flags & want == want
     };
 
-    let mut macs: HashMap<&str, [u8; 6]> = HashMap::new();
-    for e in entries.iter().filter(|e| up_and_running(e)) {
-        if let ifaddrs::Addr::Link(mac) = e.addr {
-            macs.insert(&e.name, mac);
+    // The link-layer entries in list order; for each address the LAST one
+    // that names its interface wins, as in libuv's second pass.
+    let links: Vec<(&str, [u8; 6])> = entries
+        .iter()
+        .filter(|e| up_and_running(e))
+        .filter_map(|e| match e.addr {
+            ifaddrs::Addr::Link(mac) => Some((e.name.as_str(), mac)),
+            _ => None,
+        })
+        .collect();
+    // libuv on Linux: an alias interface (`eth0:1`) shares the hardware
+    // address of the interface it labels (`eth0`). On macOS the names must
+    // match exactly (bsd-ifaddrs.c compares with strcmp).
+    let names_interface = |addr_name: &str, link_name: &str| {
+        if cfg!(any(target_os = "linux", target_os = "android")) {
+            addr_name
+                .strip_prefix(link_name)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+        } else {
+            addr_name == link_name
         }
-    }
+    };
 
     let mut result = Map::new();
     for e in entries.iter().filter(|e| up_and_running(e)) {
         let ifaddrs::Addr::Ip(addr, scope_id) = e.addr else {
             continue;
         };
-        let mac = macs.get(e.name.as_str()).copied().unwrap_or([0; 6]);
+        let mac = links
+            .iter()
+            .rev()
+            .find(|(name, _)| names_interface(&e.name, name))
+            .map_or([0; 6], |&(_, mac)| mac);
         let mac = mac
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -12548,11 +12567,13 @@ mod ifaddrs {
         }
     }
 
-    /// The system's interface addresses, or libuv's negative error number.
+    /// The system's interface addresses, or getifaddrs' (positive) errno.
     pub(super) fn read() -> Result<Vec<Entry>, i32> {
         let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
         // glibc builds the list over netlink; an EINTR there (a signal
-        // landing mid-recvmsg) is retried, as sysinfo and libc's callers do.
+        // landing mid-recvmsg) is retried, as sysinfo does. libuv does not
+        // retry and node then throws: the one place this knowingly differs,
+        // since the failure says nothing about the host's interfaces.
         loop {
             // SAFETY: `head` is a valid out-pointer for the list's head.
             if unsafe { libc::getifaddrs(&mut head) } == 0 {
@@ -12562,7 +12583,7 @@ mod ifaddrs {
                 .raw_os_error()
                 .unwrap_or(libc::EIO);
             if errno != libc::EINTR {
-                return Err(-errno);
+                return Err(errno);
             }
         }
         if head.is_null() {
@@ -12586,8 +12607,10 @@ mod ifaddrs {
                     .into_owned()
             };
             // SAFETY: each is null or points at a sockaddr inside the live
-            // list, its storage as long as its family's struct (`sa_len`
-            // long on the BSDs), which is `sockaddr_bytes`' contract.
+            // list: on Linux its storage is as long as its family's struct
+            // (glibc and musl allocate full, zeroed sockaddrs); on the BSDs
+            // `sa_len` bytes long, possibly shorter than the struct (a
+            // trimmed netmask). That is `sockaddr_bytes`' contract.
             let addr = unsafe { sockaddr_bytes(node.ifa_addr) };
             // SAFETY: as above.
             let mask = unsafe { sockaddr_bytes(node.ifa_netmask) };
@@ -12613,16 +12636,14 @@ mod ifaddrs {
     ///
     /// # Safety
     ///
-    /// `sa` is null, or points at a live sockaddr whose storage is at least
-    /// as long as the struct of the family it names -- on the BSDs at least
-    /// its `sa_len`, which is what gets copied there.
+    /// `sa` is null, or points at a live sockaddr. On the BSDs (where a
+    /// sockaddr carries `sa_len`) at least `sa_len` bytes from `sa` are
+    /// readable and initialized, and `sa_len` itself always is; elsewhere at
+    /// least as many bytes as the struct of the family it names.
     unsafe fn sockaddr_bytes(sa: *const libc::sockaddr) -> Vec<u8> {
         if sa.is_null() {
             return Vec::new();
         }
-        // SAFETY: `sa` is non-null and points at a sockaddr (the caller's
-        // contract); its header is in bounds for every family.
-        let header = unsafe { std::ptr::read_unaligned(sa) };
         #[cfg(any(
             target_vendor = "apple",
             target_os = "freebsd",
@@ -12630,7 +12651,10 @@ mod ifaddrs {
             target_os = "netbsd",
             target_os = "dragonfly"
         ))]
-        let len = usize::from(header.sa_len);
+        // SAFETY: `sa_len` is the first byte of every sockaddr there, valid
+        // even for a zero-length one (the caller's contract); a u8 read
+        // needs no alignment. Nothing past it is read before it is known.
+        let len = usize::from(unsafe { std::ptr::addr_of!((*sa).sa_len).read() });
         #[cfg(not(any(
             target_vendor = "apple",
             target_os = "freebsd",
@@ -12638,7 +12662,11 @@ mod ifaddrs {
             target_os = "netbsd",
             target_os = "dragonfly"
         )))]
-        let len = match i32::from(header.sa_family) {
+        // SAFETY: `sa_family` lies inside every family's struct, which the
+        // caller's contract makes readable; read unaligned, so `sa`'s
+        // alignment is not assumed.
+        let family = unsafe { std::ptr::addr_of!((*sa).sa_family).read_unaligned() };
+        let len = match i32::from(family) {
             libc::AF_INET => std::mem::size_of::<libc::sockaddr_in>(),
             libc::AF_INET6 => std::mem::size_of::<libc::sockaddr_in6>(),
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -12819,18 +12847,80 @@ fn interface_address(
 ) -> serde_json::Value {
     use serde_json::json;
     let family = if addr.is_ipv4() { "IPv4" } else { "IPv6" };
+    let address = uv_ip_name(addr);
     let mut entry = json!({
-        "address": addr.to_string(),
-        "netmask": netmask.to_string(),
+        "address": address,
+        "netmask": uv_ip_name(netmask),
         "family": family,
         "mac": mac,
         "internal": internal,
-        "cidr": netmask_ones(netmask).map(|ones| format!("{addr}/{ones}")),
+        "cidr": netmask_ones(netmask).map(|ones| format!("{address}/{ones}")),
     });
     if let (true, Some(scopeid)) = (addr.is_ipv6(), scopeid) {
         entry["scopeid"] = json!(scopeid);
     }
     entry
+}
+
+/// An address as node prints it: libuv's `uv_ip4_name` / `uv_ip6_name`. For
+/// IPv6 that is libuv's `inet_ntop6` (src/inet.c, BIND's), which differs from
+/// Rust's `Display` in one place: besides `::ffff:a.b.c.d` it prints an
+/// IPv4-compatible address (`::127.0.0.1`, as `ip link set sit0 up` adds on
+/// Linux) and `::0.0.0.2` in dotted form, where Rust prints `::7f00:1`.
+fn uv_ip_name(addr: std::net::IpAddr) -> String {
+    let v6 = match addr {
+        std::net::IpAddr::V4(v4) => return v4.to_string(),
+        std::net::IpAddr::V6(v6) => v6,
+    };
+    let words = v6.segments();
+    // The longest run of zero words, the first of equal ones, if 2+ long.
+    let mut best: Option<(usize, usize)> = None;
+    let mut cur: Option<(usize, usize)> = None;
+    for (i, &w) in words.iter().enumerate() {
+        if w == 0 {
+            cur = Some(cur.map_or((i, 1), |(base, len)| (base, len + 1)));
+        } else if let Some(run) = cur.take()
+            && best.is_none_or(|b| run.1 > b.1)
+        {
+            best = Some(run);
+        }
+    }
+    if let Some(run) = cur
+        && best.is_none_or(|b| run.1 > b.1)
+    {
+        best = Some(run);
+    }
+    let best = best.filter(|&(_, len)| len >= 2);
+
+    let mut out = String::new();
+    for (i, &w) in words.iter().enumerate() {
+        if let Some((base, len)) = best
+            && (base..base + len).contains(&i)
+        {
+            if i == base {
+                out.push(':');
+            }
+            continue;
+        }
+        if i != 0 {
+            out.push(':');
+        }
+        let embedded_v4 = i == 6
+            && best.is_some_and(|(base, len)| {
+                base == 0
+                    && (len == 6 || (len == 7 && words[7] != 1) || (len == 5 && words[5] == 0xffff))
+            });
+        if embedded_v4 {
+            let o = v6.octets();
+            out.push_str(&std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]).to_string());
+            return out;
+        }
+        out.push_str(&format!("{w:x}"));
+    }
+    if best.is_some_and(|(base, len)| base + len == words.len()) {
+        out.push(':');
+    }
+    out
 }
 
 /// node's `getCIDR` (lib/os.js) over a netmask's groups -- octets for IPv4,
@@ -12859,6 +12949,53 @@ fn netmask_ones(netmask: std::net::IpAddr) -> Option<u32> {
         }
     }
     Some(ones)
+}
+
+#[cfg(test)]
+mod network_interface_format_tests {
+    use super::{netmask_ones, uv_ip_name};
+
+    fn name(s: &str) -> String {
+        uv_ip_name(s.parse().unwrap())
+    }
+
+    #[test]
+    fn ipv6_names_follow_libuv_inet_ntop6() {
+        // Same as Rust's Display.
+        assert_eq!(name("::1"), "::1");
+        assert_eq!(name("::"), "::");
+        assert_eq!(name("::2"), "::2");
+        assert_eq!(
+            name("fe80::5055:55ff:fe9b:9f41"),
+            "fe80::5055:55ff:fe9b:9f41"
+        );
+        assert_eq!(name("ffff:ffff:ffff:ffff::"), "ffff:ffff:ffff:ffff::");
+        assert_eq!(name("1:0:0:2:0:0:0:3"), "1:0:0:2::3");
+        assert_eq!(name("1:0:0:2:0:0:3:4"), "1::2:0:0:3:4");
+        assert_eq!(name("1:0:2:3:4:5:6:7"), "1:0:2:3:4:5:6:7");
+        assert_eq!(name("::ffff:192.168.1.2"), "::ffff:192.168.1.2");
+        // Where libuv prints dotted IPv4 and Rust does not.
+        assert_eq!(name("::127.0.0.1"), "::127.0.0.1");
+        assert_eq!(name("::10.0.0.5"), "::10.0.0.5");
+        // Not embedded: a nonzero word before the IPv4 tail.
+        assert_eq!(name("::1:7f00:1"), "::1:7f00:1");
+        assert_eq!(name("127.0.0.1"), "127.0.0.1");
+    }
+
+    #[test]
+    fn cidr_ones_follow_node_get_cidr() {
+        let ones = |s: &str| netmask_ones(s.parse().unwrap());
+        assert_eq!(ones("255.0.0.0"), Some(8));
+        assert_eq!(ones("255.255.255.0"), Some(24));
+        assert_eq!(ones("0.0.0.0"), Some(0));
+        assert_eq!(ones("255.255.255.255"), Some(32));
+        assert_eq!(ones("ffff:ffff:ffff:ffff::"), Some(64));
+        assert_eq!(ones("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), Some(128));
+        // A partial group counts its set bits, as node's countBinaryOnes does.
+        assert_eq!(ones("255.253.0.0"), Some(15));
+        // A set bit after a group that is not all ones: node's null.
+        assert_eq!(ones("255.0.255.0"), None);
+    }
 }
 
 // ============================================================= parent PID
