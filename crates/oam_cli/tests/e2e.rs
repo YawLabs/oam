@@ -2601,7 +2601,11 @@ fn napi_descriptor_function_names_match_node() {
          const names = (o) => [o.method.name, o.valueNamed.name, o[d.symMethod].name, \
            gd(o, 'acc').get.name, gd(o, 'acc').set.name, gd(o, d.symAcc).get.name];\n\
          console.log(JSON.stringify(names(d.obj)));\n\
-         console.log(JSON.stringify([d.cls.name, d.cls.sm.name, ...names(d.cls.prototype)]));",
+         console.log(JSON.stringify([d.cls.name, d.cls.sm.name, ...names(d.cls.prototype)]));\n\
+         const c = gd(d.cls.prototype, 'constructor');\n\
+         console.log(JSON.stringify([Object.getOwnPropertyNames(d.cls.prototype), \
+           Object.getOwnPropertyNames(d.cls).filter((k) => k !== 'arguments' && k !== 'caller'), \
+           [c.value === d.cls, c.writable, c.enumerable, c.configurable]]));",
     );
     let out = oam(&["run", dir.join("main.cjs").to_str().unwrap()]);
     assert!(
@@ -2611,11 +2615,22 @@ fn napi_descriptor_function_names_match_node() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
-    assert_eq!(lines.len(), 2, "stdout: {stdout}");
+    assert_eq!(lines.len(), 3, "stdout: {stdout}");
     assert_eq!(lines[0], "[\"\",\"\",\"\",\"\",\"\",\"\"]");
     assert_eq!(
         lines[1],
         "[\"Named\",\"\",\"method\",\"valueNamed\",\"\",\"\",\"\",\"\"]"
+    );
+    // The class's own keys, as node v22 lists them: the prototype's
+    // descriptors in order and `constructor` after them (V8 adds it to an
+    // instantiated prototype template last), and the static member after
+    // `length`, `name` and `prototype`. Node's functions also own
+    // `arguments` and `caller`, which no function in oam's V8 build does
+    // (they live on Function.prototype), so the line leaves them out.
+    assert_eq!(
+        lines[2],
+        "[[\"method\",\"valueNamed\",\"acc\",\"constructor\"],\
+         [\"length\",\"name\",\"prototype\",\"sm\"],[true,true,false,true]]"
     );
 }
 
