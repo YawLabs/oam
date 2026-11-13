@@ -26,6 +26,20 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `target/<profile>/build/<pkg>/<hash>/`), and `scripts/gc-target.sh` now prunes that layout by
   what the last builds still depend on, removing the old layout's leftovers on its first run.
 
+### Fixed
+
+- **On Windows a GUI child spawned with `windowsHide: true` now opens hidden, as under node.**
+  libuv starts every child with `STARTF_USESHOWWINDOW` and `SW_HIDE` under `windowsHide` (else
+  `SW_SHOWDEFAULT`); oam did that only for spawns with extra stdio slots or an `argv0`, so a GUI
+  program run by `spawn`, `exec`, `execFile`, `fork`, `spawnSync`, `execSync`, `execFileSync` or
+  `cluster.fork` showed its first window anyway. Those paths now set libuv's show state through
+  Rust 1.100's `CommandExt::show_window` (divergence 53's `SW_HIDE` half, now closed).
+- **A `spawnSync` / `execSync` child on Windows joins the kill-on-close job before it runs.** It is
+  created suspended, placed in the job that ties a child's lifetime to oam's, and only then
+  resumed, as the extra-stdio spawn path already did; it used to be assigned just after it had
+  started, the order libuv uses. A child whose thread cannot be resumed is terminated and the
+  spawn fails rather than leaving it parked.
+
 ## [0.20.1] - 2026-11-12
 
 ### Fixed

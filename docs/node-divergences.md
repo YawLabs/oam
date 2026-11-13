@@ -986,11 +986,11 @@ What still differs (measured against node v22.22.2 on win32-arm64):
   the deprecation, where node's sets `process.noDeprecation` / drops the warning. The same flags
   given to the parent are inherited and applied.
 
-### 53. Windows child windows: no console popup from a console-less oam, no `SW_HIDE` on std spawns
+### 53. Windows child windows: no console popup from a console-less oam (`SW_HIDE` is FIXED)
 
 oam applies `windowsHide` as libuv's `uv_spawn` does: `CREATE_NO_WINDOW` only for
 `windowsHide: true` with no inherited or numbered stdio slot, so by default a console child
-shares oam's console (conformance case 450). Two places still differ.
+shares oam's console (conformance case 450). One place still differs.
 
 - **A process with no console.** When oam itself has no console (it was started detached,
   or by a GUI program), a console child needs a console of its own. node gives it one with
@@ -999,13 +999,18 @@ shares oam's console (conformance case 450). Two places still differ.
   no window. The child needs a new console either way, so this costs nothing; what differs
   is only whether a window appears (`windows_creation_flags`,
   `crates/oam_core/src/child.rs`).
-- **`SW_HIDE` for a GUI child.** libuv also starts every child with
-  `STARTF_USESHOWWINDOW` and `SW_HIDE` under `windowsHide` (else `SW_SHOWDEFAULT`), which
-  hides a GUI program's first window. oam does that only for a spawn with more than three
-  stdio slots, which it starts with its own `CreateProcessW` (`child_win.rs`). The others
-  go through Rust's `std::process::Command`, which has no stable way to set the show state,
-  so a GUI child spawned with `windowsHide: true` opens its window as usual. A console
-  child is not affected: `CREATE_NO_WINDOW` already keeps its console windowless.
+
+_Fixed: `SW_HIDE` for a GUI child._ libuv starts every child with `STARTF_USESHOWWINDOW`
+and `SW_HIDE` under `windowsHide` (else `SW_SHOWDEFAULT`), which hides a GUI program's first
+window. oam used to do that only for a spawn with more than three stdio slots or an
+`argv0`, which it starts with its own `CreateProcessW` (`child_win.rs`); the others went
+through Rust's `std::process::Command`, which had no stable way to set the show state, so a
+GUI child spawned with `windowsHide: true` opened its window as usual. Rust 1.100's
+`CommandExt::show_window` closed that: `spawn`, `exec`, `execFile`, `fork`, `spawnSync`,
+`execSync`, `execFileSync` and `cluster.fork` now set the same show state as libuv
+(`child_win::show_window_for`). As under node, Windows applies the show state to the
+program's first `ShowWindow` call, so a program that later shows its window explicitly
+still can.
 
 On POSIX `windowsHide` does nothing, as under node.
 

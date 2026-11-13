@@ -148,11 +148,11 @@ pub fn stdio_pipe_all() -> StdioSpec {
 /// the kill-on-close job (job_win.rs) every other child is placed in. It is
 /// not yet honored on POSIX, where node would also `setsid()` the child.
 ///
-/// `windows_hide` is node's `windowsHide`, which decides `CREATE_NO_WINDOW`
-/// as libuv does (see `windows_creation_flags`). std's `Command` has no
-/// stable way to set `wShowWindow`, so libuv's `SW_HIDE` for a GUI child is
-/// not applied here; docs/node-divergences.md records it. Ignored on POSIX,
-/// as under node.
+/// `windows_hide` is node's `windowsHide`, applied as libuv's `uv_spawn`
+/// applies it: it decides `CREATE_NO_WINDOW` (see `windows_creation_flags`),
+/// and every child starts under `STARTF_USESHOWWINDOW` with `SW_HIDE` for it,
+/// else `SW_SHOWDEFAULT` (`child_win::show_window_for`), so a GUI child's
+/// first window opens hidden. Ignored on POSIX, as under node.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_child(
     command: String,
@@ -221,7 +221,12 @@ pub fn spawn_child(
 
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         cmd.creation_flags(windows_creation_flags(detached, windows_hide, inherits));
+        // tokio's Command has no show_window of its own; it is std's, on the
+        // std Command tokio wraps.
+        cmd.as_std_mut()
+            .show_window(super::child_win::show_window_for(windows_hide));
         // argv0 on Windows requires direct CreateProcessW (lpCommandLine). The
         // tokio/std Command wrapper doesn't expose it; skip for spawn_child.
         let _ = argv0;
@@ -236,8 +241,9 @@ pub fn spawn_child(
     }
 
     let child = cmd.spawn().map_err(|e| spawn_failure_json(&e))?;
-    // Right after spawn, not suspended: tokio's Command cannot resume a
-    // suspended child. job_win.rs explains why that window is libuv's own.
+    // Right after spawn, not suspended: tokio's Child exposes no thread handle
+    // to resume a suspended child with. job_win.rs explains why that window is
+    // libuv's own.
     #[cfg(windows)]
     if !detached {
         super::job_win::adopt_tokio_child(&child);
@@ -699,6 +705,25 @@ fn stdio_inherits(stdio: &StdioSpec) -> bool {
         .any(|s| matches!(s, StdioMode::Inherit | StdioMode::File(_)))
 }
 
+/// The result of a `spawn_sync` whose child never ran: node's error shape for
+/// `e`, with `message` as its text, and no output, status or pid.
+fn spawn_sync_failure(e: &std::io::Error, message: String) -> SpawnSyncResult {
+    let code = super::node_error_code(e);
+    SpawnSyncResult {
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        status: None,
+        signal: None,
+        pid: 0,
+        error: Some(SpawnSyncError {
+            code: code.to_string(),
+            errno: super::node_errno(code, e),
+            message,
+            win_error: super::unknown_win32_error(code, e),
+        }),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_sync(
     command: &str,
@@ -777,8 +802,16 @@ pub fn spawn_sync(
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // windowsHide as spawn_child applies it (and with the same SW_HIDE gap).
-        cmd.creation_flags(windows_creation_flags(detached, windows_hide, inherits));
+        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+        // windowsHide as spawn_child applies it: CREATE_NO_WINDOW by libuv's
+        // table and libuv's show state for a GUI child's first window.
+        //
+        // A non-detached child starts SUSPENDED and is resumed only once it is
+        // in the kill-on-close job (below). A detached one is never assigned,
+        // so it starts running at once.
+        let suspended = if detached { 0 } else { CREATE_SUSPENDED };
+        cmd.creation_flags(windows_creation_flags(detached, windows_hide, inherits) | suspended);
+        cmd.show_window(super::child_win::show_window_for(windows_hide));
         // argv0 on Windows requires direct CreateProcessW (lpCommandLine). The
         // std Command wrapper doesn't expose it; skip for spawn_sync.
         let _ = argv0;
@@ -812,31 +845,33 @@ pub fn spawn_sync(
     let spawned = cmd.spawn();
     let mut child = match spawned {
         Ok(c) => c,
-        Err(e) => {
-            let code = super::node_error_code(&e);
-            return SpawnSyncResult {
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                status: None,
-                signal: None,
-                pid: 0,
-                error: Some(SpawnSyncError {
-                    code: code.to_string(),
-                    errno: super::node_errno(code, &e),
-                    message: e.to_string(),
-                    win_error: super::unknown_win32_error(code, &e),
-                }),
-            };
-        }
+        Err(e) => return spawn_sync_failure(&e, e.to_string()),
     };
 
     // Node's spawnSync goes through uv_spawn too, so a child it is blocked on
-    // still dies if this process is killed mid-wait. std's Command cannot
-    // resume a suspended child either; same post-spawn assignment as above.
+    // still dies if this process is killed mid-wait. The child was created
+    // suspended, so it joins the job before its first instruction -- ahead of
+    // libuv, which assigns a running child -- and only then runs. A child
+    // whose thread cannot be resumed has been terminated by adopt_suspended;
+    // it is reaped here and the spawn fails, as the raw path's does. If even
+    // the termination failed, the child is still parked and would never
+    // exit: waiting would hang spawnSync, so its handles are just dropped.
     #[cfg(windows)]
     if !detached {
         use std::os::windows::io::AsHandle;
-        super::job_win::adopt(child.as_handle());
+        use std::os::windows::process::ChildExt;
+        if let Err(failed) =
+            super::job_win::adopt_suspended(child.as_handle(), child.main_thread_handle())
+        {
+            if failed.terminated {
+                let _ = child.wait();
+            }
+            let message = format!(
+                "ResumeThread failed (GetLastError={}) for {command}",
+                failed.error.raw_os_error().unwrap_or(0)
+            );
+            return spawn_sync_failure(&failed.error, message);
+        }
     }
 
     let pid = child.id();
@@ -1558,5 +1593,274 @@ fn exit_report(
         )
     } else {
         (status.code(), None)
+    }
+}
+
+/// The window state and job membership a Windows child starts with, read by
+/// the child itself: this test binary re-runs itself as the child, with
+/// `PROBE_VAR` set, and only the probe test runs there.
+///
+/// The recursion guard is the ENVIRONMENT, never argv: every test in this
+/// module checks `PROBE_VAR` before anything else, and a process that has it
+/// set never spawns.
+///
+/// What the job assertions prove, and what they cannot: they fail when a
+/// spawn_sync child is not in oam's job (`job_flags` tells it from a job the
+/// test runner may already run in), and they fail if the suspended child
+/// were never resumed (spawnSync's 120 s timeout kills a parked child; the
+/// async probes carry the same bound). They do NOT prove the child joined BEFORE its
+/// first instruction: the probe runs only after the loader, the CRT and
+/// libtest, by which time a post-spawn assignment has long landed too
+/// (measured: 10 of 10 runs pass with the suspension removed). That ordering
+/// rests on CREATE_SUSPENDED and `job_win::adopt_suspended`.
+#[cfg(all(test, windows))]
+mod spawn_window_tests {
+    use super::{spawn_child, spawn_sync, stdio_pipe_all};
+    use windows_sys::Win32::System::JobObjects::{
+        IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW,
+    };
+
+    const PROBE_VAR: &str = "OAM_TEST_SPAWN_WINDOW_PROBE";
+    const PROBE_TEST: &str = "child::spawn_window_tests::probe_child_reports_its_startup_state";
+    const PROBE_LINE: &str = "OAM-SPAWN-PROBE ";
+    /// job_win.rs's limit flags: how the child tells oam's kill-on-close job
+    /// from a job the test runner itself may run in.
+    const OAM_JOB_FLAGS: u32 = JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+        | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+        | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    const SW_HIDE: u16 = 0;
+    const SW_SHOWDEFAULT: u16 = 10;
+
+    fn in_probe_child() -> bool {
+        std::env::var_os(PROBE_VAR).is_some()
+    }
+
+    #[derive(Debug)]
+    struct Probe {
+        use_show_window: bool,
+        show_window: u16,
+        /// Whether the child was in any job, and the limit flags of its
+        /// immediate job (0 when none), both read before anything else.
+        in_job: bool,
+        job_flags: u32,
+    }
+
+    impl Probe {
+        fn in_oam_job(&self) -> bool {
+            self.in_job && self.job_flags == OAM_JOB_FLAGS
+        }
+    }
+
+    /// The child side. A no-op in an ordinary run; in a probe child it prints
+    /// one `PROBE_LINE`. It never spawns.
+    #[test]
+    fn probe_child_reports_its_startup_state() {
+        if !in_probe_child() {
+            return;
+        }
+        let mut in_job = 0;
+        let mut job = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        let mut si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: GetCurrentProcess returns an always-valid pseudo-handle.
+        // IsProcessInJob writes one BOOL through a pointer to the live local
+        // `in_job`. QueryInformationJobObject on a null job queries this
+        // process's own immediate job and writes at most the length passed,
+        // size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(), into `job`, a
+        // live local of that type; a null return-length pointer is allowed.
+        // GetStartupInfoW fills `si`, a live STARTUPINFOW whose `cb` is set.
+        let job_flags = unsafe {
+            IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job);
+            let queried = QueryInformationJobObject(
+                std::ptr::null_mut(),
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_mut(&mut job).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            );
+            GetStartupInfoW(&mut si);
+            if queried == 0 {
+                0
+            } else {
+                job.BasicLimitInformation.LimitFlags
+            }
+        };
+        println!(
+            "{PROBE_LINE}use_show_window={} show_window={} in_job={} job_flags={job_flags}",
+            u8::from(si.dwFlags & STARTF_USESHOWWINDOW != 0),
+            si.wShowWindow,
+            u8::from(in_job != 0),
+        );
+    }
+
+    /// This test binary, told to run only the probe test.
+    fn probe_command() -> (String, Vec<String>) {
+        let exe = std::env::current_exe()
+            .expect("current_exe")
+            .to_string_lossy()
+            .into_owned();
+        let args = ["--exact", PROBE_TEST, "--nocapture", "--test-threads=1"]
+            .map(String::from)
+            .to_vec();
+        (exe, args)
+    }
+
+    /// This process's environment plus the recursion guard.
+    fn probe_env() -> Vec<(String, String)> {
+        let mut env: Vec<(String, String)> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .filter(|(k, _)| !k.eq_ignore_ascii_case(PROBE_VAR))
+            .collect();
+        env.push((PROBE_VAR.to_string(), "1".to_string()));
+        env
+    }
+
+    fn parse(stdout: &[u8]) -> Probe {
+        let text = String::from_utf8_lossy(stdout);
+        let line = text
+            .lines()
+            // libtest prints the test's name on the same line first.
+            .find_map(|l| l.find(PROBE_LINE).map(|at| &l[at + PROBE_LINE.len()..]))
+            .unwrap_or_else(|| panic!("no probe line in the child's stdout:\n{text}"));
+        let field = |name: &str| -> u32 {
+            line.split(' ')
+                .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("no {name} in {line:?}"))
+        };
+        Probe {
+            use_show_window: field("use_show_window") != 0,
+            show_window: u16::try_from(field("show_window")).expect("a u16"),
+            in_job: field("in_job") != 0,
+            job_flags: field("job_flags"),
+        }
+    }
+
+    fn probe_sync(windows_hide: bool, detached: bool) -> Probe {
+        let (exe, args) = probe_command();
+        let env = probe_env();
+        let result = spawn_sync(
+            &exe,
+            &args,
+            None,
+            Some(&env),
+            None,
+            false,
+            120_000,
+            1 << 20,
+            stdio_pipe_all(),
+            detached,
+            windows_hide,
+            None,
+        );
+        if let Some(e) = &result.error {
+            panic!("spawn_sync failed: {} {}", e.code, e.message);
+        }
+        assert_eq!(
+            result.status,
+            Some(0),
+            "probe child failed:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        parse(&result.stdout)
+    }
+
+    async fn probe_async(windows_hide: bool) -> Probe {
+        let (exe, args) = probe_command();
+        let (child, _pid) = spawn_child(
+            exe,
+            args,
+            None,
+            Some(probe_env()),
+            false,
+            stdio_pipe_all(),
+            false,
+            windows_hide,
+            None,
+        )
+        .expect("spawn_child");
+        // Bounded like the spawn_sync probes' 120 s timeout: a child that never
+        // exits (a spawn path that parks it) fails the test instead of hanging
+        // the whole lib test run. A child left running then is in the
+        // kill-on-close job spawn_child adopts it into, so it dies with the
+        // test process.
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            child.wait_with_output(),
+        )
+        .await
+        .expect("probe child did not exit within 120 s")
+        .expect("wait_with_output");
+        assert!(
+            output.status.success(),
+            "probe child failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        parse(&output.stdout)
+    }
+
+    #[test]
+    fn spawn_sync_starts_a_hidden_child_with_sw_hide_inside_the_job() {
+        if in_probe_child() {
+            return;
+        }
+        let probe = probe_sync(true, false);
+        assert!(probe.use_show_window, "{probe:?}");
+        assert_eq!(probe.show_window, SW_HIDE, "{probe:?}");
+        assert!(probe.in_oam_job(), "{probe:?}");
+    }
+
+    #[test]
+    fn spawn_sync_starts_a_shown_child_with_sw_showdefault_inside_the_job() {
+        if in_probe_child() {
+            return;
+        }
+        let probe = probe_sync(false, false);
+        assert!(probe.use_show_window, "{probe:?}");
+        assert_eq!(probe.show_window, SW_SHOWDEFAULT, "{probe:?}");
+        assert!(probe.in_oam_job(), "{probe:?}");
+    }
+
+    /// The control for the job assertions above: a detached child is never
+    /// assigned, so `in_oam_job` must be false for it. Were it true, the
+    /// assertions above would hold whatever spawn_sync did.
+    #[test]
+    fn spawn_sync_leaves_a_detached_child_out_of_the_job() {
+        if in_probe_child() {
+            return;
+        }
+        let probe = probe_sync(false, true);
+        assert!(probe.use_show_window, "{probe:?}");
+        assert_eq!(probe.show_window, SW_SHOWDEFAULT, "{probe:?}");
+        assert!(!probe.in_oam_job(), "{probe:?}");
+    }
+
+    #[tokio::test]
+    async fn spawn_child_starts_a_hidden_child_with_sw_hide() {
+        if in_probe_child() {
+            return;
+        }
+        let probe = probe_async(true).await;
+        assert!(probe.use_show_window, "{probe:?}");
+        assert_eq!(probe.show_window, SW_HIDE, "{probe:?}");
+    }
+
+    #[tokio::test]
+    async fn spawn_child_starts_a_shown_child_with_sw_showdefault() {
+        if in_probe_child() {
+            return;
+        }
+        let probe = probe_async(false).await;
+        assert!(probe.use_show_window, "{probe:?}");
+        assert_eq!(probe.show_window, SW_SHOWDEFAULT, "{probe:?}");
     }
 }

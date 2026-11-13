@@ -54,6 +54,19 @@ use super::OpOutcome;
 const SW_HIDE: u16 = 0;
 const SW_SHOWDEFAULT: u16 = 10;
 
+/// The `wShowWindow` libuv's `uv_spawn` starts every child with, always under
+/// `STARTF_USESHOWWINDOW`: `SW_HIDE` for node's `windowsHide`, else
+/// `SW_SHOWDEFAULT`. One source for this raw spawn and the `Command` spawns
+/// (`child::spawn_child`, `child::spawn_sync`, `cluster::cluster_fork`), which
+/// hand it to std's `CommandExt::show_window`.
+pub(crate) fn show_window_for(windows_hide: bool) -> u16 {
+    if windows_hide {
+        SW_HIDE
+    } else {
+        SW_SHOWDEFAULT
+    }
+}
+
 // MSVCRT fd-info flags packed into lpReserved2 (one byte per fd).
 const FOPEN: u8 = 0x01;
 const FPIPE: u8 = 0x08;
@@ -716,11 +729,7 @@ fn spawn_extra_with(
         // STARTF_USESHOWWINDOW always, as libuv sets it: SW_HIDE for
         // windowsHide, else SW_SHOWDEFAULT.
         si.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-        si.StartupInfo.wShowWindow = if windows_hide {
-            SW_HIDE
-        } else {
-            SW_SHOWDEFAULT
-        };
+        si.StartupInfo.wShowWindow = show_window_for(windows_hide);
         si.StartupInfo.hStdInput = child_handles
             .first()
             .copied()
