@@ -1529,6 +1529,60 @@ it "every park/reap call site passes the package whose [[bin]] is oam"
 PKG_BAD="$(park_pkg_sites "$REPO_DIR")"
 if [ -z "$PKG_BAD" ]; then pass; else fail "$PKG_BAD"; fi
 
+# The check's own diagnostics, each driven by a fixture repo that differs from
+# a clean one by the single change under test. The clean fixture has both call
+# shapes the real scripts use -- a bare reap with a quoted dir, and a park
+# inside $(...) -- one in scripts/, one in scripts/lib/, plus a build-locks.sh
+# defining the functions (skipped by the check, as the real one is) and a
+# second crate with no [[bin]] (so the bin is picked out, not just the first
+# package seen). Each case gets its own fresh directory and asserts the exact
+# line the check prints.
+PP_N=0
+pp_fixture(){
+  PP_N=$((PP_N + 1)); PP="$SUITE_TMP/park-pkg-$PP_N"
+  mkdir -p "$PP/crates/cli" "$PP/crates/core" "$PP/scripts/lib"
+  printf '[package]\nname = "oam_cli"\nversion = "0.1.0"\n\n[[bin]]\nname = "oam"\npath = "src/main.rs"\n' > "$PP/crates/cli/Cargo.toml"
+  printf '[package]\nname = "oam_core"\nversion = "0.1.0"\n\n[lib]\nname = "oam"\n' > "$PP/crates/core/Cargo.toml"
+  printf '#!/usr/bin/env bash\n# oam_reap_bin frees the stage; the comment names it with no argument.\noam_reap_bin "$dir" oam_cli\n' > "$PP/scripts/a.sh"
+  printf '#!/usr/bin/env bash\nheld="$(oam_park_bin target/release oam_cli oam.exe)" || exit 1\n' > "$PP/scripts/lib/b.sh"
+  printf 'oam_park_bin() { oam_bin_stages "$1" "$2" "$3"; }\n' > "$PP/scripts/lib/build-locks.sh"
+}
+it "park_pkg_sites: the clean fixture is clean (every case below differs from it by one change)"
+pp_fixture
+eq "$(park_pkg_sites "$PP")" ""
+
+it "park_pkg_sites: no crate with [[bin]] name = \"oam\" is said, not taken as a pass"
+pp_fixture
+printf '[package]\nname = "oam_cli"\nversion = "0.1.0"\n\n[[bin]]\nname = "oam-cli"\npath = "src/main.rs"\n' > "$PP/crates/cli/Cargo.toml"
+eq "$(park_pkg_sites "$PP")" 'expected one crate with [[bin]] name = "oam", found 0: '
+
+it "park_pkg_sites: two crates with [[bin]] name = \"oam\" are both named"
+pp_fixture
+mkdir -p "$PP/crates/cli2"
+printf '[package]\nname = "oam_cli2"\n\n[[bin]]\nname = "oam"\n' > "$PP/crates/cli2/Cargo.toml"
+eq "$(park_pkg_sites "$PP")" 'expected one crate with [[bin]] name = "oam", found 2: oam_cli oam_cli2'
+
+it "park_pkg_sites: a call site passing another package names the file, the call and both packages"
+pp_fixture
+printf '#!/usr/bin/env bash\noam_reap_bin "$dir" oam_core\n' > "$PP/scripts/a.sh"
+eq "$(park_pkg_sites "$PP")" "scripts/a.sh: 'oam_reap_bin \"\$dir\" oam_core' passes 'oam_core', the package is 'oam_cli'"
+
+it "park_pkg_sites: a quoted package argument is read as the package"
+pp_fixture
+printf '#!/usr/bin/env bash\nheld="$(oam_park_bin target/release "oam_cli" oam.exe)" || exit 1\n' > "$PP/scripts/lib/b.sh"
+eq "$(park_pkg_sites "$PP")" ""
+
+it "park_pkg_sites: no call site at all is said (only commented-out mentions left)"
+pp_fixture
+printf '#!/usr/bin/env bash\n# oam_reap_bin "$dir" oam_cli\n' > "$PP/scripts/a.sh"
+printf '#!/usr/bin/env bash\n# held="$(oam_park_bin target/release oam_cli oam.exe)"\n' > "$PP/scripts/lib/b.sh"
+eq "$(park_pkg_sites "$PP")" "no park/reap call site found under $PP/scripts"
+
+it "park_pkg_sites: a call continued on the next line is refused, not skipped"
+pp_fixture
+printf '#!/usr/bin/env bash\nheld="$(oam_park_bin \\\n  target/release oam_core oam.exe)" || exit 1\n' > "$PP/scripts/lib/b.sh"
+eq "$(park_pkg_sites "$PP")" 'scripts/lib/b.sh: call site the check cannot read: 2:held="$(oam_park_bin \'
+
 # =============================================================================
 group "build-remote.sh -- gc dispatch"
 # =============================================================================
@@ -8770,6 +8824,128 @@ for f in scripts/ci-local.sh scripts/build-remote.sh scripts/release-local.sh; d
     || RP_WIRED="$RP_WIRED ${f##*/}-never-asks-for-the-verdict"
 done
 eq "${RP_WIRED:- ok}" " ok"
+
+# =============================================================================
+group "workspace manifests -- every member denies unused dependencies"
+# =============================================================================
+# `-D warnings` after `--` reaches rustc and clippy, not cargo: cargo 1.100's
+# own `unused_dependencies` lint only prints unless the package's manifest
+# raises it, and that is per package (each member has its own [lints.clippy],
+# which `lints.workspace = true` cannot be combined with). A member that drops
+# the table -- or a new member that never had it -- loses the gate silently and
+# fails nowhere. The members come from the root Cargo.toml, never a list kept
+# here: a copy kept here is exactly what a new member would be missing from.
+#
+# ws_members <repo> -- the [workspace] members, one path per line.
+ws_members(){
+  awk '
+    /^[[:space:]]*\[/ { h = $0; sub(/#.*/, "", h); gsub(/[[:space:]]/, "", h); sect = h; inm = 0 }
+    sect == "[workspace]" && /^[[:space:]]*members[[:space:]]*=[[:space:]]*\[/ { inm = 1; sub(/^[^[]*\[/, "") }
+    inm {
+      l = $0; sub(/#.*/, "", l)
+      while (match(l, /"[^"]*"/)) { print substr(l, RSTART + 1, RLENGTH - 2); l = substr(l, RSTART + RLENGTH) }
+      if (l ~ /\]/) inm = 0
+    }
+  ' "$1/Cargo.toml"
+}
+# lint_deny_missing <repo> -- prints one line per member whose manifest does
+# not set [lints.cargo] unused_dependencies to deny (or forbid), or a line
+# saying why the check could not run. One awk over every manifest: it prints
+# the manifests that DO set it, and each member is looked up in that list.
+lint_deny_missing(){
+  local repo="$1" m members ok n=0 files=()
+  members="$(ws_members "$repo")"
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    [ -f "$repo/$m/Cargo.toml" ] && files+=("$repo/$m/Cargo.toml")
+  done <<<"$members"
+  ok=""
+  [ "${#files[@]}" -gt 0 ] && ok="$(awk '
+    FNR == 1 { sect = "" }
+    /^[[:space:]]*\[/ { h = $0; sub(/#.*/, "", h); gsub(/[[:space:]]/, "", h); sect = h; next }
+    sect == "[lints.cargo]" && /^[[:space:]]*unused_dependencies[[:space:]]*=/ {
+      v = $0; sub(/#.*/, "", v)
+      if (v ~ /=[[:space:]]*"(deny|forbid)"[[:space:]]*$/ || v ~ /level[[:space:]]*=[[:space:]]*"(deny|forbid)"/) print FILENAME
+    }
+  ' "${files[@]}")"
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    n=$((n + 1))
+    case "$m" in *'*'* | *'?'* | *'['*) echo "$m: a glob member the check cannot read"; continue ;; esac
+    if [ ! -f "$repo/$m/Cargo.toml" ]; then echo "$m: no Cargo.toml"; continue; fi
+    case $'\n'"$ok"$'\n' in
+      *$'\n'"$repo/$m/Cargo.toml"$'\n'*) ;;
+      *) echo "$m: no [lints.cargo] unused_dependencies = \"deny\"" ;;
+    esac
+  done <<<"$members"
+  [ "$n" -gt 0 ] || echo "no [workspace] members found in $repo/Cargo.toml"
+  return 0
+}
+
+it "every workspace member sets [lints.cargo] unused_dependencies = \"deny\""
+LD_BAD="$(lint_deny_missing "$REPO_DIR")"
+if [ -z "$LD_BAD" ]; then pass; else fail "$LD_BAD"; fi
+
+# The check against copies of the real manifests (root + every member's), each
+# changed in one way. The member broken is the LAST one listed, so a parser
+# that stopped after the first entry would miss it.
+LD_N=0
+ld_fixture(){
+  local m
+  LD_N=$((LD_N + 1)); LD="$SUITE_TMP/lint-deny-$LD_N"
+  mkdir -p "$LD"
+  cp "$REPO_DIR/Cargo.toml" "$LD/Cargo.toml"
+  while IFS= read -r m; do
+    mkdir -p "$LD/$m"; cp "$REPO_DIR/$m/Cargo.toml" "$LD/$m/Cargo.toml"
+  done < <(ws_members "$REPO_DIR")
+}
+LD_LAST="$(ws_members "$REPO_DIR" | tail -n 1)"
+LD_COUNT="$(ws_members "$REPO_DIR" | grep -c .)"
+
+it "lint_deny_missing: the real members list is read whole (more than one, the last included)"
+if [ "$LD_COUNT" -gt 1 ] && [ -n "$LD_LAST" ] && [ -f "$REPO_DIR/$LD_LAST/Cargo.toml" ]; then pass
+else fail "members=$LD_COUNT last='$LD_LAST'"; fi
+
+it "lint_deny_missing: a copy of the real manifests is clean"
+ld_fixture
+eq "$(lint_deny_missing "$LD")" ""
+
+it "lint_deny_missing: a member whose [lints.cargo] table is removed is named"
+ld_fixture
+awk '/^[[:space:]]*\[/ { drop = ($0 ~ /^\[lints\.cargo\]/) } !drop' "$REPO_DIR/$LD_LAST/Cargo.toml" > "$LD/$LD_LAST/Cargo.toml"
+if grep -q 'unused_dependencies[[:space:]]*=' "$LD/$LD_LAST/Cargo.toml"; then fail "the fixture still sets the lint"
+else eq "$(lint_deny_missing "$LD")" "$LD_LAST: no [lints.cargo] unused_dependencies = \"deny\""; fi
+
+it "lint_deny_missing: the lint left at warn is named"
+ld_fixture
+sed 's/^unused_dependencies = "deny"/unused_dependencies = "warn"/' "$REPO_DIR/$LD_LAST/Cargo.toml" > "$LD/$LD_LAST/Cargo.toml"
+eq "$(lint_deny_missing "$LD")" "$LD_LAST: no [lints.cargo] unused_dependencies = \"deny\""
+
+it "lint_deny_missing: the entry under another table (not [lints.cargo]) is named"
+ld_fixture
+sed 's/^\[lints\.cargo\]/[lints.rust]/' "$REPO_DIR/$LD_LAST/Cargo.toml" > "$LD/$LD_LAST/Cargo.toml"
+eq "$(lint_deny_missing "$LD")" "$LD_LAST: no [lints.cargo] unused_dependencies = \"deny\""
+
+it "lint_deny_missing: the table form { level = \"deny\" } counts"
+ld_fixture
+sed 's/^unused_dependencies = "deny"/unused_dependencies = { level = "deny", priority = 1 }/' "$REPO_DIR/$LD_LAST/Cargo.toml" > "$LD/$LD_LAST/Cargo.toml"
+eq "$(lint_deny_missing "$LD")" ""
+
+it "lint_deny_missing: a new member added without the table is named"
+ld_fixture
+mkdir -p "$LD/crates/oam_newmember"
+printf '[package]\nname = "oam_newmember"\nversion.workspace = true\n\n[lints.clippy]\nunnecessary_safety_comment = "deny"\n' > "$LD/crates/oam_newmember/Cargo.toml"
+# Appended at the END of the list, after the last existing entry.
+awk '/^members = \[/ { inm = 1 } inm && /^\]/ { print "    \"crates/oam_newmember\","; inm = 0 } { print }' "$REPO_DIR/Cargo.toml" > "$LD/Cargo.toml"
+eq "$(lint_deny_missing "$LD")" "crates/oam_newmember: no [lints.cargo] unused_dependencies = \"deny\""
+
+it "lint_deny_missing: a member with no manifest, and a manifest with no members, are said"
+ld_fixture
+awk '{ print } /^members = \[/ { print "    \"crates/oam_gone\"," }' "$REPO_DIR/Cargo.toml" > "$LD/Cargo.toml"
+LD_GONE="$(lint_deny_missing "$LD")"
+ld_fixture
+sed '/^members = \[/,/^\]/d' "$REPO_DIR/Cargo.toml" > "$LD/Cargo.toml"
+eq "$LD_GONE / $(lint_deny_missing "$LD")" "crates/oam_gone: no Cargo.toml / no [workspace] members found in $LD/Cargo.toml"
 
 # =============================================================================
 echo

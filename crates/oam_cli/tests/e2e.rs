@@ -47901,3 +47901,217 @@ c.on('close', (code) => console.log(out.trim() + '\nfd4: ' + four + ' exit ' + c
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ------------------------------------------------- cluster.fork(env) + worker lifetime
+
+/// `cluster.fork(env)` hands the worker `{...process.env, ...env}` (node's
+/// createWorkerProcess): a variable the primary set on its own process.env
+/// before forking is there, the fork's own object is there, and on a name
+/// both define the fork's value wins. The primary's process.env is left as
+/// it was.
+#[test]
+fn cluster_fork_env_is_merged_over_the_primarys_env() {
+    let stdout = run_ok(
+        "cluster_fork_env.mjs",
+        "import cluster from 'node:cluster';\n\
+         if (cluster.isPrimary) {\n\
+           process.env.OAM_PRIMARY_ONLY = 'set-before-fork';\n\
+           process.env.ROLE = 'primary';\n\
+           const worker = cluster.fork({ ROLE: 'x', OAM_FORK_ONLY: 'from-fork' });\n\
+           console.log('primary_role:', process.env.ROLE);\n\
+           console.log('primary_fork_only:', process.env.OAM_FORK_ONLY);\n\
+           worker.on('exit', (code) => { console.log('worker_exit:', code); process.exit(0); });\n\
+           setTimeout(() => { console.log('timeout'); process.exit(1); }, 60000);\n\
+         } else {\n\
+           console.log('worker_role:', process.env.ROLE);\n\
+           console.log('worker_fork_only:', process.env.OAM_FORK_ONLY);\n\
+           console.log('worker_primary_only:', process.env.OAM_PRIMARY_ONLY);\n\
+           process.exit(0);\n\
+         }",
+    );
+    for want in [
+        "worker_role: x",
+        "worker_fork_only: from-fork",
+        "worker_primary_only: set-before-fork",
+        "primary_role: primary",
+        "primary_fork_only: undefined",
+        "worker_exit: 0",
+    ] {
+        assert!(stdout.contains(want), "missing `{want}`:\n{stdout}");
+    }
+}
+
+/// A fork whose spawn fails emits 'error' carrying the op's
+/// "cluster fork: ..." message, marks the worker dead and drops it from
+/// cluster.workers -- and emits no 'exit' (there was never a process). The
+/// spawn is made to fail for real: the primary runs from a private copy of
+/// oam and takes that copy away from under itself before forking (unlinked on
+/// unix, where the running image survives it; renamed on Windows, which
+/// refuses to delete a running image but allows the rename), so the exe the
+/// runtime re-execs no longer exists at its path.
+#[test]
+fn cluster_fork_spawn_failure_emits_error_without_exit() {
+    let dir = write_temp("cluster_spawn_fail/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let exe = dir.join(format!("oam-copy{}", std::env::consts::EXE_SUFFIX));
+    let moved = dir.join(format!("oam-copy{}.moved", std::env::consts::EXE_SUFFIX));
+    let _ = std::fs::remove_file(&moved);
+    std::fs::copy(env!("CARGO_BIN_EXE_oam"), &exe).expect("stage a private oam copy");
+    let script = write_temp(
+        "cluster_spawn_fail/main.mjs",
+        "import cluster from 'node:cluster';\n\
+         import fs from 'node:fs';\n\
+         if (cluster.isWorker) {\n\
+           console.log('worker_ran: true');\n\
+           process.exit(0);\n\
+         }\n\
+         if (process.platform === 'win32') fs.renameSync(process.execPath, process.execPath + '.moved');\n\
+         else fs.unlinkSync(process.execPath);\n\
+         console.log('exe_gone:', !fs.existsSync(process.execPath));\n\
+         const w = cluster.fork();\n\
+         let exits = 0;\n\
+         w.on('exit', () => { exits++; });\n\
+         cluster.on('exit', () => { exits++; });\n\
+         w.on('error', (e) => {\n\
+           console.log('error_is_error:', e instanceof Error);\n\
+           console.log('error_message:', e.message);\n\
+           console.log('is_dead:', w.isDead());\n\
+           setTimeout(() => {\n\
+             console.log('in_workers:', Object.keys(cluster.workers).length);\n\
+             console.log('exits:', exits);\n\
+             process.exit(0);\n\
+           }, 500);\n\
+         });\n\
+         setTimeout(() => { console.log('timeout'); process.exit(1); }, 60000);",
+    );
+    let out = bounded_output(
+        std::process::Command::new(&exe)
+            .args(["run", script.to_str().unwrap(), "--no-check"])
+            .suite_env(),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let _ = std::fs::remove_file(&exe);
+    let _ = std::fs::remove_file(&moved);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
+    for want in [
+        "exe_gone: true",
+        "error_is_error: true",
+        "error_message: cluster fork: ",
+        "is_dead: true",
+        "in_workers: 0",
+        "exits: 0",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}`:\n{stdout}\n{stderr}"
+        );
+    }
+    assert!(!stdout.contains("worker_ran"), "{stdout}");
+}
+
+/// Whether `pid` names a live process -- one that exists and is not a zombie
+/// (`ps -o stat=`; no unsafe, no libc; works on Linux and macOS). `kill -0`
+/// alone would count a zombie: a worker the primary killed but exited before
+/// reaping is re-parented to pid 1, and in a container without a reaping
+/// init it stays a zombie forever -- dead, but `kill -0` says alive.
+#[cfg(unix)]
+fn cluster_pid_alive(pid: u32) -> bool {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    let stat = String::from_utf8_lossy(&out.stdout);
+    let stat = stat.trim();
+    out.status.success() && !stat.is_empty() && !stat.starts_with('Z')
+}
+
+/// On unix a worker must die with its primary, and only the primary's own
+/// teardown can see to that there (the job object is Windows-only). The
+/// primary forks a worker that only sleeps, waits for it to report its pid,
+/// then leaves by `how` without ever calling worker.kill(). A primary cannot
+/// end "naturally" with a live worker: the pending wait on the worker holds
+/// its event loop, as node's does.
+#[cfg(unix)]
+fn cluster_worker_dies_with_its_primary(how: &str) {
+    let dir = write_temp(&format!("cluster_orphan_{how}/.keep"), "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let pid_file = dir.join("worker.pid");
+    let _ = std::fs::remove_file(&pid_file);
+    let script = write_temp(
+        &format!("cluster_orphan_{how}/main.mjs"),
+        "import cluster from 'node:cluster';\n\
+         import fs from 'node:fs';\n\
+         const f = process.env.OAM_TEST_PID_FILE;\n\
+         if (cluster.isWorker) {\n\
+           fs.writeFileSync(f + '.tmp', String(process.pid));\n\
+           fs.renameSync(f + '.tmp', f);\n\
+           setInterval(() => {}, 1000000);\n\
+         } else {\n\
+           const w = cluster.fork();\n\
+           w.on('exit', () => { console.log('worker_exited_first'); process.exit(3); });\n\
+           const poll = setInterval(() => {\n\
+             if (!fs.existsSync(f)) return;\n\
+             clearInterval(poll);\n\
+             console.log('worker_pid:', fs.readFileSync(f, 'utf8'));\n\
+             if (process.env.OAM_TEST_HOW === 'exit') process.exit(0);\n\
+             throw new Error('primary dies of an uncaught exception');\n\
+           }, 20);\n\
+         }",
+    );
+    let out = bounded_output(
+        oam_command(&["run", script.to_str().unwrap(), "--no-check"])
+            .env("OAM_TEST_PID_FILE", &pid_file)
+            .env("OAM_TEST_HOW", how),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let pid: u32 = std::fs::read_to_string(&pid_file)
+        .unwrap_or_else(|e| panic!("no worker pid ({e}):\n{stdout}\n{stderr}"))
+        .trim()
+        .parse()
+        .expect("a numeric pid");
+    // Bounded: a worker still alive 10 s after its primary is gone is one
+    // nothing will ever reap.
+    let started = std::time::Instant::now();
+    while cluster_pid_alive(pid) && started.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let survived = cluster_pid_alive(pid);
+    if survived {
+        // Never leak it past the test, whatever the verdict.
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+    let expect_code = if how == "exit" { 0 } else { 1 };
+    assert_eq!(out.status.code(), Some(expect_code), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("worker_exited_first"), "{stdout}");
+    assert!(
+        !survived,
+        "worker {pid} outlived its primary ({how}) by 10 s:\n{stdout}\n{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cluster_worker_dies_when_its_primary_calls_process_exit() {
+    cluster_worker_dies_with_its_primary("exit");
+}
+
+#[cfg(unix)]
+#[test]
+fn cluster_worker_dies_when_its_primary_dies_of_an_uncaught_exception() {
+    cluster_worker_dies_with_its_primary("throw");
+}

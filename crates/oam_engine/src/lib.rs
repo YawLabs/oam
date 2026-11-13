@@ -2071,27 +2071,50 @@ mod tests {
         // so the profile dir recovered here holds no addon and the presence
         // check below fails.
         let exe = std::env::current_exe().expect("the test binary knows its own path");
-        let Some(profile_dir) = cargo_profile_dir(&exe) else {
-            panic!(
+        resolve_test_addon(&exe, addon_file, &crate_root).unwrap_or_else(|why| panic!("{why}"))
+    }
+
+    /// The decision behind `built_test_addon`, with its environment passed
+    /// in: the running test binary's path `exe`, the platform's addon file
+    /// name, and this crate's root (the addon crate is its sibling,
+    /// `<crate_root>/../oam_napi_test_addon`). `Ok` is the addon to load;
+    /// `Err` is the diagnostic `built_test_addon` panics with, one per way a
+    /// tree can be misbuilt:
+    ///
+    /// - `exe` sits in no layout `cargo_profile_dir` recognises;
+    /// - the profile dir holds no addon file;
+    /// - a `.rs` source of the addon crate (or its Cargo.toml) is strictly
+    ///   newer than the built addon.
+    ///
+    /// Split out so each arm is unit-tested against a laid-out temp dir: in
+    /// the suite proper they fire only on a misbuilt tree.
+    fn resolve_test_addon(
+        exe: &std::path::Path,
+        addon_file: &str,
+        crate_root: &std::path::Path,
+    ) -> std::result::Result<std::path::PathBuf, String> {
+        let Some(profile_dir) = cargo_profile_dir(exe) else {
+            return Err(format!(
                 "cannot find the cargo profile dir from the test binary at {} -- expected \
                  `<profile>/deps/<name>-<hash>` (cargo <= 1.99) or \
                  `<profile>/build/<pkg>/<hash>/out/<name>-<hash>` (cargo >= 1.100); run it \
                  through `cargo test`",
                 exe.display()
-            );
+            ));
         };
         let built = profile_dir.join(addon_file);
-        assert!(
-            built.is_file(),
-            "test addon not built at {} -- run `cargo build -p oam_napi_test_addon` with the \
-             same profile, target and target dir as this test run first (a separate cargo \
-             build-dir, `build.build-dir` / CARGO_BUILD_BUILD_DIR, is not supported: the \
-             cdylib is uplifted to the target-dir, not the build-dir)",
-            built.display()
-        );
+        if !built.is_file() {
+            return Err(format!(
+                "test addon not built at {} -- run `cargo build -p oam_napi_test_addon` with the \
+                 same profile, target and target dir as this test run first (a separate cargo \
+                 build-dir, `build.build-dir` / CARGO_BUILD_BUILD_DIR, is not supported: the \
+                 cdylib is uplifted to the target-dir, not the build-dir)",
+                built.display()
+            ));
+        }
         let Ok(built_at) = std::fs::metadata(&built).and_then(|m| m.modified()) else {
             // No mtime (exotic filesystem): the presence check above still stands.
-            return built;
+            return Ok(built);
         };
 
         let addon_root = crate_root.join("../oam_napi_test_addon");
@@ -2124,13 +2147,205 @@ mod tests {
         if let Some((path, source_at)) = newest
             && source_at > built_at
         {
-            panic!(
+            return Err(format!(
                 "test addon at {} is STALE -- {} is newer.\n`cargo test -p oam_engine` does not rebuild a sibling cdylib crate; run `cargo build -p oam_napi_test_addon` (or `cargo test --workspace`) first.",
                 built.display(),
                 path.display()
+            ));
+        }
+        Ok(built)
+    }
+
+    /// The addon file name the `resolve_test_addon` tests lay out. Any name
+    /// works: the resolver takes it as given.
+    const RESOLVE_ADDON: &str = "oam_napi_test_addon.dll";
+
+    /// A fixed, plausible mtime for fixture sources; addons are stamped
+    /// relative to it.
+    fn t0_plus(secs: u64) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + secs)
+    }
+
+    fn stamp(path: &std::path::Path, at: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+
+    /// A laid-out tree for `resolve_test_addon`: `<root>/crates/oam_engine`
+    /// (the crate root) beside `<root>/crates/oam_napi_test_addon` holding
+    /// Cargo.toml, src/lib.rs and a nested src/sub/m.rs, every source
+    /// stamped at `t0_plus(0)`. No profile dir is made: each test lays out
+    /// the one it needs. A leftover tree from an earlier run is removed
+    /// first. Returns (root, crate_root).
+    fn resolve_fixture(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "oam-resolve-test-addon-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let crate_root = root.join("crates").join("oam_engine");
+        let addon_crate = root.join("crates").join("oam_napi_test_addon");
+        std::fs::create_dir_all(&crate_root).unwrap();
+        std::fs::create_dir_all(addon_crate.join("src").join("sub")).unwrap();
+        for file in [
+            addon_crate.join("Cargo.toml"),
+            addon_crate.join("src").join("lib.rs"),
+            addon_crate.join("src").join("sub").join("m.rs"),
+        ] {
+            std::fs::write(&file, "").unwrap();
+            stamp(&file, t0_plus(0));
+        }
+        (root, crate_root)
+    }
+
+    /// Writes an empty addon at `<dir>/RESOLVE_ADDON` stamped `at` and
+    /// returns its path.
+    fn place_addon(dir: &std::path::Path, at: std::time::SystemTime) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let addon = dir.join(RESOLVE_ADDON);
+        std::fs::write(&addon, "").unwrap();
+        stamp(&addon, at);
+        addon
+    }
+
+    /// `<profile>/build/oam_engine/0123abcd/out/oam_engine-0123abcd.exe`:
+    /// the cargo >= 1.100 test-binary location.
+    fn new_layout_exe(profile: &std::path::Path) -> std::path::PathBuf {
+        profile
+            .join("build")
+            .join("oam_engine")
+            .join("0123abcd")
+            .join("out")
+            .join("oam_engine-0123abcd.exe")
+    }
+
+    #[test]
+    fn resolve_test_addon_rejects_an_unrecognised_layout() {
+        let (root, crate_root) = resolve_fixture("layout");
+        // An addon right beside the binary does not rescue a binary that
+        // sits in no cargo layout: the profile dir is never guessed.
+        let bin = root.join("target").join("debug").join("bin");
+        place_addon(&bin, t0_plus(10));
+        let exe = bin.join("oam_engine-0123abcd.exe");
+        let err = resolve_test_addon(&exe, RESOLVE_ADDON, &crate_root).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "cannot find the cargo profile dir from the test binary at {} -- expected \
+                 `<profile>/deps/<name>-<hash>` (cargo <= 1.99) or \
+                 `<profile>/build/<pkg>/<hash>/out/<name>-<hash>` (cargo >= 1.100); run it \
+                 through `cargo test`",
+                exe.display()
+            )
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_test_addon_reports_a_profile_dir_without_the_addon() {
+        let (root, crate_root) = resolve_fixture("missing");
+        let profile = root.join("target").join("debug");
+        let deps = profile.join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let addon = profile.join(RESOLVE_ADDON);
+        let expected = format!(
+            "test addon not built at {} -- run `cargo build -p oam_napi_test_addon` with the \
+             same profile, target and target dir as this test run first (a separate cargo \
+             build-dir, `build.build-dir` / CARGO_BUILD_BUILD_DIR, is not supported: the \
+             cdylib is uplifted to the target-dir, not the build-dir)",
+            addon.display()
+        );
+        for exe in [
+            deps.join("oam_engine-0123abcd.exe"),
+            new_layout_exe(&profile),
+        ] {
+            assert_eq!(
+                resolve_test_addon(&exe, RESOLVE_ADDON, &crate_root).unwrap_err(),
+                expected,
+                "{}",
+                exe.display()
             );
         }
-        built
+        let exe = deps.join("oam_engine-0123abcd.exe");
+        // Only the profile dir counts: an addon in deps/ (beside the binary)
+        // is not the uplifted one.
+        place_addon(&deps, t0_plus(10));
+        assert_eq!(
+            resolve_test_addon(&exe, RESOLVE_ADDON, &crate_root).unwrap_err(),
+            expected
+        );
+        // A directory under the addon's name is not a built addon.
+        std::fs::create_dir_all(&addon).unwrap();
+        assert_eq!(
+            resolve_test_addon(&exe, RESOLVE_ADDON, &crate_root).unwrap_err(),
+            expected
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_test_addon_reports_a_stale_addon_naming_the_newest_source() {
+        let (root, crate_root) = resolve_fixture("stale");
+        let profile = root.join("target").join("debug");
+        let exe = new_layout_exe(&profile);
+        let addon = place_addon(&profile, t0_plus(10));
+        let addon_crate = crate_root.join("../oam_napi_test_addon");
+        let stale = |source: &std::path::Path| {
+            format!(
+                "test addon at {} is STALE -- {} is newer.\n`cargo test -p oam_engine` does not rebuild a sibling cdylib crate; run `cargo build -p oam_napi_test_addon` (or `cargo test --workspace`) first.",
+                addon.display(),
+                source.display()
+            )
+        };
+
+        // A nested source is found by the directory walk.
+        let nested = addon_crate.join("src").join("sub").join("m.rs");
+        stamp(&nested, t0_plus(20));
+        assert_eq!(
+            resolve_test_addon(&exe, RESOLVE_ADDON, &crate_root).unwrap_err(),
+            stale(&nested)
+        );
+
+        // With several newer sources, the NEWEST is the one named.
+        let manifest = addon_crate.join("Cargo.toml");
+        stamp(&manifest, t0_plus(30));
+        assert_eq!(
+            resolve_test_addon(&exe, RESOLVE_ADDON, &crate_root).unwrap_err(),
+            stale(&manifest)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_test_addon_returns_a_fresh_addon_from_either_layout() {
+        let (root, crate_root) = resolve_fixture("fresh");
+        let profile = root.join("target").join("debug");
+        let addon = place_addon(&profile, t0_plus(10));
+        let addon_crate = crate_root.join("../oam_napi_test_addon");
+        // A newer file under src/ that is not a `.rs` source does not make
+        // it stale.
+        let notes = addon_crate.join("src").join("notes.md");
+        std::fs::write(&notes, "").unwrap();
+        stamp(&notes, t0_plus(99));
+        // A source stamped exactly at the addon's mtime is not newer.
+        stamp(&addon_crate.join("src").join("lib.rs"), t0_plus(10));
+
+        for exe in [
+            profile.join("deps").join("oam_engine-0123abcd.exe"),
+            new_layout_exe(&profile),
+        ] {
+            assert_eq!(
+                resolve_test_addon(&exe, RESOLVE_ADDON, &crate_root),
+                Ok(addon.clone()),
+                "{}",
+                exe.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A rejected `napi_create_reference` must create NOTHING.

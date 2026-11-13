@@ -28,6 +28,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **On Linux and macOS a `cluster` worker now dies when its primary calls `process.exit()`**, as
+  under node. node's worker exits when its IPC channel to the primary closes; oam's workers end
+  when the primary's runtime is torn down, and `process.exit()` skips that teardown, so a worker
+  outlived its primary indefinitely (measured: still running 10 s later). Workers not yet reaped
+  are now killed on every hard exit. Windows was unaffected: the kill-on-close job ends them.
 - **On Windows a GUI child spawned with `windowsHide: true` now opens hidden, as under node.**
   libuv starts every child with `STARTF_USESHOWWINDOW` and `SW_HIDE` under `windowsHide` (else
   `SW_SHOWDEFAULT`); oam did that only for spawns with extra stdio slots or an `argv0`, so a GUI
