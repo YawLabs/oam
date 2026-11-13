@@ -13,7 +13,7 @@
 # `gate` dispatch, an hour into the release, on a line that had never been touched by the release's commits.
 #
 # The fix has two halves:
-#   1. rust-toolchain.toml pins an EXACT version ("1.99.0"), never a floating
+#   1. rust-toolchain.toml pins an EXACT version ("1.100.0"), never a floating
 #      channel. rustup then resolves the same rustc on every host that reads
 #      the file -- which is every leg, because build-remote.sh runs
 #      `rustup toolchain install` in the repo root and cargo consults the
@@ -49,7 +49,7 @@
 # =============================================================================
 
 # rust_pin_read <repo-dir>
-# Echoes the EXACT version rust-toolchain.toml pins ("1.99.0"), and refuses
+# Echoes the EXACT version rust-toolchain.toml pins ("1.100.0"), and refuses
 # anything else loudly: a floating channel ("stable", "nightly") is the
 # per-host skew this gate exists to prevent, and a missing/blank channel
 # would leave every host on whatever its default happens to be.

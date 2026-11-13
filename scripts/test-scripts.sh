@@ -83,6 +83,9 @@ scrub_operator_knobs(){
   for k in $OPERATOR_KNOBS; do unset "$k"; done
 }
 scrub_operator_knobs
+# gc-target.sh's tree-list override, for probing a layout by hand: exported, it
+# would point every gc fixture below at trees they do not plant.
+unset OAM_GC_TREES
 
 # Git's own location overrides, cleared for the same reason. The fixtures below
 # `git init`, `git config`, add and commit in temp directories and rely on
@@ -624,6 +627,590 @@ if grep -q 'needs GNU find' <<<"$DEGRADE_OUT" \
 else
   fail "warned=$(grep -c 'needs GNU find' <<<"$DEGRADE_OUT") deps=$(count_in target/debug/deps)/2 incremental=$([ -e "$ROOT/target/debug/incremental" ] && echo present || echo reclaimed)"
 fi
+
+# =============================================================================
+group "gc-target.sh -- cargo 1.100 unit layout"
+# =============================================================================
+# cargo 1.100 (rust-lang/cargo#17354) dropped deps/ and .fingerprint/: every
+# unit is build/<pkg>/<hash>/ with out/ and fingerprint/<kind>.json. Every
+# deps/ case above passes against such a tree while it reclaims nothing but
+# incremental/, so the unit prune needs fixtures of its own. The json is the
+# shape cargo 1.100.0 wrote on a probe crate (2026-11-12), cut to the fields.
+
+# plant_unit <tree> <pkg> <hash> <gen|fresh> <kind> <profile> [out-file]...
+# <tree> is under target/ (debug, x64-host/release, ...). <gen> is plant's
+# generation (minutes on 2026-08-01, so hours old), or a whole touch -t stamp
+# (YYYYMMDDhhmm) for a unit days away from those; "fresh" leaves the mtimes
+# at now. <kind> "-" plants no json at all, "?" a json this script cannot
+# read. A run-* kind gets run/ beside out/ and the run's json shape (profile 0,
+# no features), as cargo lays it. Optional prefix variables: FEAT, the json's
+# activated features (cargo escapes them: '[\"fa\"]'; default []); DEPS, the
+# units this one was built from, by their <hash> dir names; CK, the json's
+# compile_kind (default 0, the host); RUSTC, its rustc hash (default 1); and
+# RAWDEPS, the deps array's contents verbatim, in place of DEPS.
+#
+# Every unit's own fingerprint hash -- what cargo writes into
+# fingerprint/<kind>, and what a dependent's json names -- is its dir name
+# REVERSED and with every hex digit complemented (0 <-> f), so a prune that
+# matched dir names instead of fingerprint files finds nothing, and every
+# dir name here (0000...) becomes a hash whose high bytes are ff: the decimal
+# a dependent's json carries is past 2^63, where an awk number has long since
+# rounded the low bytes away. A dependent's json names it the way cargo does:
+# the decimal u64 whose little-endian bytes are that hex (fp_dec, below). The
+# suite does that conversion with bash's 64-bit arithmetic, the script with
+# awk's digit string division -- two implementations, so neither can agree
+# with itself.
+FP_NOT=fedcba9876543210
+fp_hex(){ local s="$1" r="" i; for ((i = ${#s} - 1; i >= 0; i--)); do r="$r${FP_NOT:$((16#${s:i:1})):1}"; done; REPLY="$r"; }
+fp_dec(){ local s="$1" be="" i; for ((i = 14; i >= 0; i -= 2)); do be="$be${s:i:2}"; done; printf -v REPLY '%u' "$((16#$be))"; }
+plant_unit(){
+  local pkg="$2" hash="$3" u="$ROOT/target/$1/build/$2/$3" gen="$4" kind="$5" prof="$6"; shift 6
+  mkdir -p "$u/fingerprint" "$u/out"
+  local f d deps="" own
+  for f in "$@"; do echo artifact > "$u/out/$f"; done
+  for d in ${DEPS:-}; do
+    fp_hex "$d"; fp_dec "$REPLY"
+    deps="$deps${deps:+,}[1,\"d\",false,$REPLY]"
+  done
+  [ -n "${RAWDEPS:-}" ] && deps="$RAWDEPS"
+  local ck="${CK:-0}" rustc="${RUSTC:-1}" stamp
+  fp_hex "$hash"; own="$REPLY"
+  case "$kind" in
+    -) echo artifact > "$u/out/partial.o" ;;
+    '?') echo '{"rustc":1,"features":"[]"}' > "$u/fingerprint/lib-odd.json" ;;
+    run-*)
+      mkdir -p "$u/run"; echo 'cargo:rerun-if-changed=build.rs' > "$u/run/stdout"
+      printf '%s' "$own" > "$u/fingerprint/$kind"
+      printf '{"rustc":%s,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[%s],"local":[{"RerunIfChanged":{"output":"debug\\\\build\\\\%s/%s\\\\run\\\\stdout","paths":["build.rs"]}}],"rustflags":[],"config":0,"compile_kind":%s}' \
+        "$rustc" "$deps" "$pkg" "$hash" "$ck" > "$u/fingerprint/$kind.json" ;;
+    *)
+      printf '%s' "$own" > "$u/fingerprint/$kind"
+      printf '{"rustc":%s,"features":"%s","declared_features":"[\\"fa\\", \\"fb\\"]","target":1,"profile":%s,"path":1,"deps":[%s],"local":[{"CheckDepInfo":{"dep_info":"debug\\\\build\\\\%s/%s\\\\fingerprint\\\\dep-%s","fingerprint":"mtime"}}],"rustflags":[],"config":0,"compile_kind":%s}' \
+         "$rustc" "${FEAT:-[]}" "$prof" "$deps" "$pkg" "$hash" "$kind" "$ck" > "$u/fingerprint/$kind.json" ;;
+  esac
+  if [ "${#gen}" = 12 ]; then stamp="$gen"; else printf -v stamp '2026080112%02d' "$gen"; fi
+  [ "$gen" = "fresh" ] || find "$u" -type f -exec touch -t "$stamp" {} +
+}
+# plant_empty <tree> <pkg> <hash> <gen|fresh> -- a unit dir holding only an
+# empty out/, which cargo 1.100 leaves behind (seen on every probe).
+plant_empty(){
+  local u="$ROOT/target/$1/build/$2/$3"
+  mkdir -p "$u/out"
+  [ "$4" = "fresh" ] || touch -t "2026080112$(printf '%02d' "$4")" "$u/out" "$u"
+}
+# uplift <unit-out-file> <tree-file> -- what cargo does to a final artifact:
+# a hardlink. Sets LINK_FAILED when the filesystem would not.
+uplift(){
+  mkdir -p "$(dirname "$ROOT/$2")"
+  ln "$ROOT/$1" "$ROOT/$2" 2>/dev/null && [ "$ROOT/$1" -ef "$ROOT/$2" ] || LINK_FAILED=1
+}
+# Real pairs from the cargo 1.100.0 probe: the hex a unit wrote into
+# fingerprint/<kind> and the decimal its dependent's json carried for it.
+# Past 2^53, where an awk number would round.
+it "units: fp_dec reproduces cargo's own hex/decimal pairs"
+fp_dec 4f41513a19de9cf7; P1="$REPLY"; fp_dec ca08ce4603ae099c; P2="$REPLY"
+if [ "$P1" = 17842380023669014863 ] && [ "$P2" = 11243709273803196618 ]; then pass
+else fail "fp_dec gave $P1 and $P2"; fi
+
+BSB=build-script-build-script-build
+RBSB=run-build-script-build-script-build
+UB=target/debug/build
+XH=target/x64-host/release/build
+XT=target/x64-host/x86_64-pc-windows-msvc/release/build
+LINK_FAILED=0
+
+reset_tree
+# (a) A clippy run beside a build. Package a's lib (uplifted as liba.rlib)
+# was built from its build-script run, which ran a build-script compile, which
+# links p as a build-dependency (features fb). A LATER clippy run compiled the
+# build script again (same slot: the wrapper moves only the unit hash, and the
+# p it links is a newer unit of p's same slot), ran it, and checked the lib. Every unit of the build is older than its clippy
+# twin, and p's build-dep lib has a newer sibling in its own slot: newest-
+# per-slot alone keeps none of the build's chain. Reachability keeps it all.
+FEAT='[\"fb\"]' plant_unit debug p 00000000000b0001 0 lib-p 1 libp-00000000000b0001.rlib
+FEAT='[\"fb\"]' plant_unit debug p 00000000000b0002 3 lib-p 1 libp-00000000000b0002.rlib
+DEPS="00000000000b0001" plant_unit debug a 00000000000a0003 0 $BSB 6 build_script_build.exe
+DEPS="00000000000a0003" plant_unit debug a 00000000000a0002 0 $RBSB 0 gen.rs
+DEPS="00000000000a0002 00000000000d0001 00000000000d0002" plant_unit debug a 00000000000a0001 1 lib-a 1 liba-00000000000a0001.rlib
+uplift $UB/a/00000000000a0001/out/liba-00000000000a0001.rlib target/debug/liba.rlib
+DEPS="00000000000b0002" plant_unit debug a 00000000000a0013 4 $BSB 6 build_script_build.exe
+DEPS="00000000000a0013" plant_unit debug a 00000000000a0012 4 $RBSB 0 gen.rs
+DEPS="00000000000a0012" plant_unit debug a 00000000000a0011 4 lib-a 2 liba-00000000000a0011.rmeta
+# ... and a superseded generation of the lib, linked against the superseded
+# dup below, with ITS run (the newest run here, so a prune that let runs root
+# a slot would keep it) and build-script compile: nothing live names any of
+# them.
+DEPS="00000000000b0001" plant_unit debug a 00000000000a0023 0 $BSB 6 build_script_build.exe
+DEPS="00000000000a0023" plant_unit debug a 00000000000a0022 5 $RBSB 0 gen.rs
+DEPS="00000000000a0022 00000000000d0000 00000000000d0002" plant_unit debug a 00000000000a0021 0 lib-a 1 liba-00000000000a0021.rlib
+# (b) Two live versions of one crate, one slot: lib-a links both. A third,
+# superseded version is named by nothing live.
+plant_unit debug dup 00000000000d0001 0 lib-dup 1 libdup-00000000000d0001.rlib
+plant_unit debug dup 00000000000d0002 1 lib-dup 1 libdup-00000000000d0002.rlib
+plant_unit debug dup 00000000000d0000 0 lib-dup 1 libdup-00000000000d0000.rlib
+# (c) Switched back to an older version: z.exe is the OLDER bin unit, its run
+# and build-script compile older than the superseded version's. Plus an older
+# generation still that nothing uses.
+plant_unit debug z 00000000000e0003 0 $BSB 6 build_script_build.exe
+DEPS="00000000000e0003" plant_unit debug z 00000000000e0002 0 $RBSB 0 gen.rs
+DEPS="00000000000e0002" plant_unit debug z 00000000000e0001 0 bin-z 3 z.exe
+uplift $UB/z/00000000000e0001/out/z.exe target/debug/z.exe
+plant_unit debug z 00000000000e0013 5 $BSB 6 build_script_build.exe
+DEPS="00000000000e0013" plant_unit debug z 00000000000e0012 5 $RBSB 0 gen.rs
+DEPS="00000000000e0012" plant_unit debug z 00000000000e0011 5 bin-z 3 z.exe
+DEPS="00000000000e0012" plant_unit debug z 00000000000e0021 0 bin-z 3 z.exe
+# (d) A --target tree: the lib and its run are in the triple tree, the
+# build-script compile the run names is in the HOST tree of the same target dir
+# (target/x64-host), beside a newer sibling of its slot.
+plant_unit x64-host/release x 00000000000f0003 0 $BSB 6 build_script_build.exe
+plant_unit x64-host/release x 00000000000f0013 2 $BSB 6 build_script_build.exe
+DEPS="00000000000f0003" plant_unit x64-host/x86_64-pc-windows-msvc/release x 00000000000f0002 0 $RBSB 0 gen.rs
+DEPS="00000000000f0002" plant_unit x64-host/x86_64-pc-windows-msvc/release x 00000000000f0001 0 lib-x 1 libx-00000000000f0001.rlib
+uplift $XT/x/00000000000f0001/out/libx-00000000000f0001.rlib target/x64-host/x86_64-pc-windows-msvc/release/libx.rlib
+# (e) The hour's grace goes by the NEWEST file in a unit: g1 is a build-script
+# run nothing names yet (no slot root either: runs never are), its json hours
+# old, but the script is writing into its OUT_DIR right now. g3 is old
+# throughout and goes.
+plant_unit debug g 00000000000c0001 0 $RBSB 0 gen.rs
+echo writing > "$ROOT/$UB/g/00000000000c0001/out/libv8.a.partial"
+plant_unit debug g 00000000000c0003 0 $RBSB 0 gen.rs
+# (f) Uplift by inode, not by name: a lib's tree file is liba.rlib for
+# out/liba-<hash>.rlib (l1 below, z.exe above), and examples/ counts too.
+# Each is the OLDER unit of its slot.
+plant_unit debug l 00000000000c0011 0 lib-l 1 libl-00000000000c0011.rlib
+plant_unit debug l 00000000000c0012 1 lib-l 1 libl-00000000000c0012.rlib
+uplift $UB/l/00000000000c0011/out/libl-00000000000c0011.rlib target/debug/libl.rlib
+plant_unit debug a 00000000000c0021 0 example-ex 1 ex.exe
+plant_unit debug a 00000000000c0022 1 example-ex 1 ex.exe
+uplift $UB/a/00000000000c0021/out/ex.exe target/debug/examples/ex.exe
+# (g) Empty unit dirs: hours old goes, fresh stays. A unit with files but no
+# json, or a json this script cannot read, stays however old.
+plant_empty debug a 00000000000000e1 0
+plant_empty debug a 00000000000000e2 fresh
+plant_unit debug a 00000000000000d1 0 - 0
+plant_unit debug a 00000000000000d3 0 '?' 0
+# A parked copy in a surviving unit's out/ is reaped. Its mtime is the
+# unit's: a file written now would make a0011 the newest of lib-a's group by
+# months, and age lib-a's profile-1 slot out.
+echo parked > "$ROOT/$UB/a/00000000000a0011/out/a.exe.inuse-4242"
+touch -t 202608011204 "$ROOT/$UB/a/00000000000a0011/out/a.exe.inuse-4242"
+# The pre-1.100 layout beside it: all dead once units exist -- but a package
+# dir whose NAME looks like an old build-script dir and holds units is not.
+plant target/debug/deps 0 a-0123456789abcdef.exe liba-0123456789abcdef.rlib
+plant target/debug/.fingerprint/a-0123456789abcdef 0 lib-a
+plant target/debug/build/a-0123456789abcdef 0 build-script-build.exe
+plant_unit debug z-0123456789abcdef 00000000000000f1 0 lib-z 1
+# target/release has NO units: its deps/ must still get the family prune and
+# must NOT be removed as a migration leftover.
+plant target/release/deps 0 oam-aaaa000000000001
+plant target/release/deps 1 oam-aaaa000000000002
+DRY_OUT="$(gc_out --dry-run --keep 1 --keep-incremental)"
+UNIT_OUT="$(gc_out --keep 1 --keep-incremental)"
+
+# Seven superseded units: a's old lib, its run and build-script compile, the
+# third dup, z's oldest bin, the old run g3, and the stale empty dir.
+it "units: a real run prunes exactly the superseded units, and says so"
+if grep -q 'pruned 7 unreachable units under target ' <<<"$UNIT_OUT"; then
+  tree_survivors '!'$UB/a/00000000000a0021 '!'$UB/a/00000000000a0022 '!'$UB/a/00000000000a0023 \
+                 '!'$UB/dup/00000000000d0000 '!'$UB/z/00000000000e0021 '!'$UB/g/00000000000c0003 \
+                 '!'$UB/a/00000000000000e1
+else fail "output was: $UNIT_OUT"; fi
+
+it "units: --dry-run plans exactly what the real run then did"
+if grep -q 'would prune 7 unreachable units under target ' <<<"$DRY_OUT"; then pass
+else fail "dry run reported: $DRY_OUT"; fi
+
+if [ "$LINK_FAILED" = "1" ]; then
+  it "units: reachability from the tree's hardlinked artifacts"
+  skip "this filesystem would not hardlink a fixture file; every root but the slot one is a hardlink"
+else
+  it "units (a): a build's run, build-script compile and build-dep lib survive a newer clippy twin in their slots"
+  tree_survivors $UB/a/00000000000a0001 $UB/a/00000000000a0002 $UB/a/00000000000a0003 $UB/p/00000000000b0001 \
+                 $UB/a/00000000000a0011 $UB/a/00000000000a0012 $UB/a/00000000000a0013
+
+  it "units (b): two live versions of one crate in one slot both survive"
+  tree_survivors $UB/dup/00000000000d0001 $UB/dup/00000000000d0002
+
+  it "units (c): after a switch back, the older live unit and its whole chain survive"
+  tree_survivors $UB/z/00000000000e0001 $UB/z/00000000000e0002 $UB/z/00000000000e0003
+
+  it "units (d): a --target tree's run keeps the build-script compile it names in the host tree"
+  tree_survivors $XT/x/00000000000f0001 $XT/x/00000000000f0002 $XH/x/00000000000f0003
+
+  it "units (f): uplift is matched by inode -- liba.rlib for out/liba-<hash>.rlib, and examples/"
+  tree_survivors $UB/l/00000000000c0011 $UB/a/00000000000c0021
+fi
+
+it "units: the newest unit of each slot survives even when nothing names it"
+tree_survivors $UB/p/00000000000b0002 $UB/z/00000000000e0011 $UB/z/00000000000e0012 $UB/z/00000000000e0013 \
+               $XH/x/00000000000f0013 $UB/l/00000000000c0012 $UB/a/00000000000c0022
+
+it "units (e): an unreached unit with a file under an hour old survives, whatever its json's age"
+tree_survivors $UB/g/00000000000c0001
+
+it "units (g): an old empty unit dir goes, a fresh one stays; no json or an unreadable one stays"
+tree_survivors '!'$UB/a/00000000000000e1 $UB/a/00000000000000e2 $UB/a/00000000000000d1 $UB/a/00000000000000d3
+
+it "units: parked copies in a unit's out/ are reaped"
+tree_survivors '!'$UB/a/00000000000a0011/out/a.exe.inuse-4242 $UB/a/00000000000a0011/out/liba-00000000000a0011.rmeta
+
+it "migration: deps/, .fingerprint/ and build/<pkg>-<hash>/ go once the tree has units"
+tree_survivors '!target/debug/deps' '!target/debug/.fingerprint' '!'$UB/a-0123456789abcdef \
+               $UB/z-0123456789abcdef/00000000000000f1
+
+it "migration: a tree without units keeps deps/ and its family prune"
+tree_survivors target/release/deps/oam-aaaa000000000002 '!target/release/deps/oam-aaaa000000000001'
+
+it "migration says what it reclaimed"
+if grep -q 'removed 3 pre-1.100 layout dirs from target/debug' <<<"$UNIT_OUT"; then pass
+else fail "output was: $UNIT_OUT"; fi
+
+# deps/ is handed whole to the migration; a family prune over it as well
+# reported the same files twice in the plan.
+it "units: --dry-run reports a migrated deps/ once, not again as a family prune"
+if grep -q 'superseded artifacts from target/debug/deps' <<<"$DRY_OUT"; then
+  fail "the deps/ family prune ran on a migrated tree: $DRY_OUT"
+else pass; fi
+
+it "units: --keep 2 keeps two per slot"
+reset_tree
+plant_unit debug a 00000000000000a1 0 lib-a 1
+plant_unit debug a 00000000000000a2 1 lib-a 1
+plant_unit debug a 00000000000000a3 2 lib-a 1
+gc --keep 2
+tree_survivors $UB/a/00000000000000a2 $UB/a/00000000000000a3 '!'$UB/a/00000000000000a1
+
+# Slot keys, slot and uplift ageing, unlisted triple trees, and hashes past
+# 2^63 -- one fixture, one run, default TREES. Each pair below differs in
+# exactly the field under test; a slot key that dropped it would hold only
+# the newer unit.
+reset_tree; LINK_FAILED=0
+QR1=8036126e5ceaeb0b QR2=366f15cf9b137f53
+# (h) Dependency feature unification: h1 (`cargo build -p h`) links q with
+# fa, h2 (a workspace build) the q that unified fa and fb in. Same h, same
+# kind, profile, compile_kind, own features: only the slots of their deps
+# differ. t1/t2 differ only one level further down (their h's do), which a
+# single round of refinement does not see. v1/v2 are the other side: a
+# version bump of v's dependency, whose two units share one slot, so v2
+# supersedes v1, and v1 and its old dependency go.
+FEAT='[\"fa\"]' plant_unit debug q 0000000000010001 0 lib-q 1
+FEAT='[\"fa\",\"fb\"]' plant_unit debug q 0000000000010002 1 lib-q 1
+DEPS="0000000000010001" plant_unit debug h 0000000000010011 2 lib-h 1
+DEPS="0000000000010002" plant_unit debug h 0000000000010012 3 lib-h 1
+DEPS="0000000000010011" plant_unit debug t 0000000000010021 4 lib-t 1
+DEPS="0000000000010012" plant_unit debug t 0000000000010022 5 lib-t 1
+plant_unit debug vp 0000000000010031 0 lib-vp 1
+plant_unit debug vp 0000000000010032 1 lib-vp 1
+DEPS="0000000000010031" plant_unit debug v 0000000000010033 0 lib-v 1
+DEPS="0000000000010032" plant_unit debug v 0000000000010034 1 lib-v 1
+# (i) One lib at two feature sets; (j) at two compile kinds; (k) two packages
+# whose libs share a target name. Nothing names any of them.
+FEAT='[\"fa\"]' plant_unit debug f 0000000000020001 0 lib-f 1
+FEAT='[\"fb\"]' plant_unit debug f 0000000000020002 1 lib-f 1
+plant_unit debug k 0000000000020011 0 lib-k 1
+CK=1234567 plant_unit debug k 0000000000020012 1 lib-k 1
+plant_unit debug m1 0000000000020021 0 lib-m 1
+plant_unit debug m2 0000000000020022 1 lib-m 1
+# (l) A deps array in a shape this script does not know (a fifth field): the
+# unit is unreadable and stays, though a newer unit holds its slot.
+RAWDEPS='[1,"d",false,1,"x"]' plant_unit debug o 0000000000020031 0 lib-o 1
+plant_unit debug o 0000000000020032 1 lib-o 1
+# (m) A --target tree that TREES does not list: its run names the host
+# build-script compile in target/debug, beside a newer sibling there, and its
+# own superseded lib goes like any tree's.
+TT=target/aarch64-pc-windows-msvc/debug/build
+plant_unit debug w 0000000000030003 0 $BSB 6 build_script_build.exe
+plant_unit debug w 0000000000030013 2 $BSB 6 build_script_build.exe
+CK=99 DEPS="0000000000030003" plant_unit aarch64-pc-windows-msvc/debug w 0000000000030002 0 $RBSB 0 gen.rs
+CK=99 DEPS="0000000000030002" plant_unit aarch64-pc-windows-msvc/debug w 0000000000030001 1 lib-w 1
+CK=99 DEPS="0000000000030002" plant_unit aarch64-pc-windows-msvc/debug w 0000000000030000 0 lib-w 1
+# (n) Slot ageing: s's profile-1 slot was last built 17 days before its
+# profile-2 slot, so it roots nothing and its unit and OUT_DIR run go; s2's
+# trails by 4 days and stays.
+DEPS="0000000000040003" plant_unit debug s 0000000000040001 202607150000 lib-s 1
+plant_unit debug s 0000000000040003 202607150000 $RBSB 0 gen.rs
+plant_unit debug s 0000000000040002 0 lib-s 2
+plant_unit debug s2 0000000000040011 202607280000 lib-s2 1
+plant_unit debug s2 0000000000040012 0 lib-s2 2
+# (o) Uplifts and age/toolchain: rmb.exe was linked by another rustc than the
+# one most of the tree's uplifts were (a bin left behind by a toolchain bump),
+# so neither it nor its slot roots anything. ob.exe is 17 days older than
+# cur.exe in ANOTHER package -- a member untouched while another is rebuilt
+# with -p -- and is still its artifact's current build: kept. nx.exe is the
+# NEWEST uplift, linked by a third rustc (a one-off `cargo +nightly build -p
+# nx`), stamped into the future so it is the tree's newest unit beyond doubt:
+# it must not disown the majority's uplifts. It is the minority, so it roots
+# nothing, but it is inside the hour's grace and stays. No tree file is
+# touched.
+RUSTC=2 plant_unit debug rmb 0000000000050001 0 bin-rmb 3 rmb.exe
+uplift $UB/rmb/0000000000050001/out/rmb.exe target/debug/rmb.exe
+plant_unit debug ob 0000000000050011 202607150000 bin-ob 3 ob.exe
+uplift $UB/ob/0000000000050011/out/ob.exe target/debug/ob.exe
+plant_unit debug cur 0000000000050021 0 bin-cur 3 cur.exe
+uplift $UB/cur/0000000000050021/out/cur.exe target/debug/cur.exe
+RUSTC=3 plant_unit debug nx 0000000000050031 2 bin-nx 3 nx.exe
+uplift $UB/nx/0000000000050031/out/nx.exe target/debug/nx.exe
+find "$ROOT/$UB/nx/0000000000050031" -exec touch -t 209901010000 {} +
+# (p) Two units whose fingerprint files hold hashes cargo 1.100.0 really
+# wrote (4f41513a19de9cf7, ca08ce4603ae099c), named by a dependent in the
+# decimals it really wrote for them, beside a newer unit of their slot and an
+# older one nothing names.
+plant_unit debug r $QR1 0 lib-r 1
+plant_unit debug r $QR2 0 lib-r 1
+plant_unit debug r 0000000000060003 1 lib-r 1
+plant_unit debug r 0000000000060000 0 lib-r 1
+DEPS="$QR1 $QR2" plant_unit debug rt 0000000000060011 2 lib-rt 1
+KEYS_OUT="$(gc_out --keep 1)"
+
+it "units: the fixture's hashes include cargo's own, and every decimal is past 2^63"
+fp_hex $QR1; Q1="$REPLY"; fp_dec "$Q1"; P1="$REPLY"
+fp_hex $QR2; Q2="$REPLY"; fp_dec "$Q2"; P2="$REPLY"
+# Twenty decimal digits is at least 10^19, past 2^63.
+fp_hex 0000000000010001; fp_dec "$REPLY"
+if [ "$Q1" = 4f41513a19de9cf7 ] && [ "$P1" = 17842380023669014863 ] \
+   && [ "$Q2" = ca08ce4603ae099c ] && [ "$P2" = 11243709273803196618 ] \
+   && [ "${#REPLY}" = 20 ]; then pass
+else fail "planted $QR1 -> $Q1 = $P1, $QR2 -> $Q2 = $P2, 0000000000010001 -> $REPLY"; fi
+
+it "units (p): a dependent's decimal past 2^63 resolves to cargo's own hex"
+tree_survivors $UB/r/$QR1 $UB/r/$QR2 $UB/r/0000000000060003 $UB/rt/0000000000060011 '!'$UB/r/0000000000060000
+
+it "units (h): builds differing only in a dependency's unified features are two slots, to any depth"
+tree_survivors $UB/h/0000000000010011 $UB/h/0000000000010012 $UB/q/0000000000010001 $UB/q/0000000000010002 \
+               $UB/t/0000000000010021 $UB/t/0000000000010022
+
+it "units (h): a dependency's version bump stays one slot, and the superseded pair goes"
+tree_survivors $UB/v/0000000000010034 $UB/vp/0000000000010032 '!'$UB/v/0000000000010033 '!'$UB/vp/0000000000010031
+
+it "units (i,j,k): features, compile_kind and package each split a slot"
+tree_survivors $UB/f/0000000000020001 $UB/f/0000000000020002 $UB/k/0000000000020011 $UB/k/0000000000020012 \
+               $UB/m1/0000000000020021 $UB/m2/0000000000020022
+
+it "units (l): a deps array in an unknown shape leaves the unit alone"
+tree_survivors $UB/o/0000000000020031 $UB/o/0000000000020032
+
+it "units (m): an unlisted target/<triple>/debug is swept with target/, the host compile its run names kept"
+tree_survivors $UB/w/0000000000030003 $UB/w/0000000000030013 $TT/w/0000000000030002 $TT/w/0000000000030001 \
+               '!'$TT/w/0000000000030000
+
+it "units (n): a slot trailing its group by more than 7 days roots nothing; by 4 days it still does"
+tree_survivors '!'$UB/s/0000000000040001 '!'$UB/s/0000000000040003 $UB/s/0000000000040002 \
+               $UB/s2/0000000000040011 $UB/s2/0000000000040012
+
+if [ "$LINK_FAILED" = "1" ]; then
+  it "units (o): stale uplifts root nothing"
+  skip "this filesystem would not hardlink a fixture file"
+else
+  it "units (o): age never disowns an uplift; the newest unit's toolchain does not disown the majority's; the tree files stay"
+  tree_survivors '!'$UB/rmb/0000000000050001 $UB/ob/0000000000050011 $UB/cur/0000000000050021 \
+                 $UB/nx/0000000000050031 \
+                 target/debug/rmb.exe target/debug/ob.exe target/debug/cur.exe target/debug/nx.exe
+
+  it "units: the tally names the pruned units and the aged-out slots and uplifts"
+  if grep -q 'pruned 7 unreachable units under target ' <<<"$KEYS_OUT" \
+     && grep -q 'rooted nothing from 3 slots and 2 uplifted units under target ' <<<"$KEYS_OUT"; then pass
+  else fail "output was: $KEYS_OUT"; fi
+fi
+
+# target/<triple>/<profile> belongs to target/, as target/debug does: that is
+# the shape a plain `cargo build --target <triple>` leaves. OAM_GC_TREES can
+# name it; case (m) above shows it is swept without being named, too.
+it "units: OAM_GC_TREES replaces the tree list, and target/<triple>/debug resolves into target/debug"
+reset_tree
+plant_unit debug y 00000000000f0103 0 $BSB 6 build_script_build.exe
+plant_unit debug y 00000000000f0113 2 $BSB 6 build_script_build.exe
+DEPS="00000000000f0103" plant_unit aarch64-pc-windows-msvc/debug y 00000000000f0102 0 $RBSB 0 gen.rs
+DEPS="00000000000f0102" plant_unit aarch64-pc-windows-msvc/debug y 00000000000f0101 1 lib-y 1
+DEPS="00000000000f0102" plant_unit aarch64-pc-windows-msvc/debug y 00000000000f0100 0 lib-y 1
+( cd "$ROOT" && OAM_GC_TREES="target/debug target/aarch64-pc-windows-msvc/debug" bash scripts/gc-target.sh --keep 1 >/dev/null 2>&1 )
+tree_survivors $UB/y/00000000000f0103 target/aarch64-pc-windows-msvc/debug/build/y/00000000000f0102 \
+               '!target/aarch64-pc-windows-msvc/debug/build/y/00000000000f0100'
+
+it "units: --dry-run deletes no unit and no old-layout dir"
+reset_tree
+plant_unit debug a 00000000000000a1 0 lib-a 1
+plant_unit debug a 00000000000000a2 1 lib-a 1
+plant target/debug/deps 0 a-0123456789abcdef.exe
+gc --dry-run --keep 1
+tree_survivors $UB/a/00000000000000a1 $UB/a/00000000000000a2 target/debug/deps/a-0123456789abcdef.exe
+
+# The Air runs the BSD stat path; a unit prune that only works through GNU
+# find -printf would be the deps/ prune's macOS gap all over again. The inode
+# (uplift) and the empty-dir walk go through it too.
+it "units: the BSD stat lister drives the unit prune too, uplift and empty dirs included"
+reset_tree; LINK_FAILED=0
+plant_unit debug a 00000000000000a1 0 lib-a 1
+plant_unit debug a 00000000000000a2 1 lib-a 1
+plant_unit debug l 00000000000c0011 0 lib-l 1 libl-00000000000c0011.rlib
+plant_unit debug l 00000000000c0012 1 lib-l 1
+uplift $UB/l/00000000000c0011/out/libl-00000000000c0011.rlib target/debug/libl.rlib
+plant_empty debug a 00000000000000e1 0
+( cd "$ROOT" && PATH="$BSDLIST:$PATH" bash scripts/gc-target.sh --keep 1 >/dev/null 2>&1 )
+if [ "$LINK_FAILED" = "1" ]; then
+  tree_survivors $UB/a/00000000000000a2 '!'$UB/a/00000000000000a1 '!'$UB/a/00000000000000e1
+else
+  tree_survivors $UB/a/00000000000000a2 '!'$UB/a/00000000000000a1 '!'$UB/a/00000000000000e1 $UB/l/00000000000c0011
+fi
+
+it "units: with no lister, the unit prune is skipped loudly and the migration still runs"
+reset_tree
+plant_unit debug a 00000000000000a1 0 lib-a 1
+plant_unit debug a 00000000000000a2 1 lib-a 1
+plant target/debug/deps 0 a-0123456789abcdef.exe
+NOLIST_OUT="$( cd "$ROOT" && PATH="$NOPRINTF:$PATH" bash scripts/gc-target.sh --keep 1 2>&1 )"
+if grep -q 'unit prune skipped' <<<"$NOLIST_OUT"; then
+  tree_survivors $UB/a/00000000000000a1 $UB/a/00000000000000a2 '!target/debug/deps'
+else fail "no skip warning: $NOLIST_OUT"; fi
+
+# Same forced-awk loop as the deps/ prune's: the unit awk reads files with
+# getline, splits paths and long-divides the hashes, all places the dialects
+# have differed.
+it "units: selection is identical under every awk installed here"
+UNIT_AWK_BAD=0; UNIT_AWK_N=0
+for AWKBIN in mawk gawk original-awk busybox awk; do
+  SHIM="$SUITE_TMP/shim-$AWKBIN"
+  [ -x "$SHIM/awk" ] || continue
+  reset_tree
+  DEPS="00000000000000b2" plant_unit debug a 00000000000000a1 0 lib-a 1
+  DEPS="00000000000000b2" plant_unit debug a 00000000000000a2 1 lib-a 1
+  plant_unit debug a 00000000000000c1 0 lib-a 2
+  plant_unit debug b 00000000000000b1 0 lib-b 1
+  plant_unit debug b 00000000000000b2 1 lib-b 1
+  DEPS="00000000000000b1" plant_unit debug a 00000000000000a3 2 lib-a 1
+  ( cd "$ROOT" && PATH="$SHIM:$PATH" bash scripts/gc-target.sh --keep 1 >/dev/null 2>&1 )
+  UNIT_AWK_N=$((UNIT_AWK_N + 1))
+  if [ -e "$ROOT/$UB/a/00000000000000a1" ] || [ -e "$ROOT/$UB/a/00000000000000a2" ] \
+     || [ ! -e "$ROOT/$UB/a/00000000000000a3" ] || [ ! -e "$ROOT/$UB/a/00000000000000c1" ] \
+     || [ ! -e "$ROOT/$UB/b/00000000000000b1" ] || [ ! -e "$ROOT/$UB/b/00000000000000b2" ]; then
+    UNIT_AWK_BAD=1; fail "$AWKBIN selected wrongly: $(ls "$ROOT/$UB/a" "$ROOT/$UB/b" | tr '\n' ' ')"
+  fi
+done
+if [ "$UNIT_AWK_BAD" = "1" ]; then :
+elif [ "$UNIT_AWK_N" -gt 0 ]; then pass
+else fail "no awk shim from the deps/ case to test with"; fi
+
+# =============================================================================
+group "crt-linkage.sh -- which build script the gate scans, both cargo layouts"
+# =============================================================================
+# assert_static_crt_build_script must pick the build script cargo last linked
+# for ONE package, across the <= 1.99 shape (build/<pkg>-<hash>/
+# build-script-build.exe) and the 1.100 one (build/<pkg>/<hash>/out/
+# build_script_build.exe), and never a neighbour whose name merely starts with
+# the package's. A wrong pick is silent either way: it scans a clean stale
+# binary and passes, or a dynamic neighbour and fails for nothing.
+# assert_static_crt is a string scan for the redistributable CRT DLL names, so
+# a fixture "imports the dynamic CRT" by containing one.
+# shellcheck source=lib/crt-linkage.sh
+. scripts/lib/crt-linkage.sh
+CB="$SUITE_TMP/crt-bs/debug"
+crt_bin(){  # crt_bin <path> dynamic|clean <touch-stamp>
+  mkdir -p "$(dirname "$1")"
+  if [ "$2" = "dynamic" ]; then printf 'MZ\0\0imports VCRUNTIME140.dll\0' > "$1"
+  else printf 'MZ\0\0links the static CRT\0' > "$1"; fi
+  touch -t "$3" "$1"
+}
+if find . -maxdepth 0 -printf '' >/dev/null 2>&1; then
+  crt_bin "$CB/build/oam_engine-0123abcd/build-script-build.exe"        dynamic 202608011200
+  crt_bin "$CB/build/oam_engine/aaaa1111/out/build_script_build.exe"    clean   202608011300
+  # Decoys, both newer and both dynamic: an old-shape dir of another package
+  # whose name extends oam_engine-, and a new-shape package dir that extends
+  # oam_engine.
+  crt_bin "$CB/build/oam_engine-macros-ffff0000/build-script-build.exe" dynamic 202608011400
+  crt_bin "$CB/build/oam_engine_foo/bbbb2222/out/build_script_build.exe" dynamic 202608011400
+
+  it "crt build script: the newest 1.100 build script of the package is the one scanned, decoys ignored"
+  CRT_OUT="$(assert_static_crt_build_script "$CB" oam_engine 2>&1)" && CRT_RC=0 || CRT_RC=$?
+  if [ "$CRT_RC" = 0 ]; then pass; else fail "expected the clean 1.100 build script to pass: $CRT_OUT"; fi
+
+  it "crt build script: an old-shape build script newer than the 1.100 one is the one scanned"
+  touch -t 202608011330 "$CB/build/oam_engine-0123abcd/build-script-build.exe"
+  CRT_OUT="$(assert_static_crt_build_script "$CB" oam_engine 2>&1)" && CRT_RC=0 || CRT_RC=$?
+  if [ "$CRT_RC" != 0 ] && grep -qF 'oam_engine-0123abcd/build-script-build.exe' <<<"$CRT_OUT"; then pass
+  else fail "expected the dynamic old-shape build script to fail the gate: $CRT_OUT"; fi
+
+  it "crt build script: a package with no build script fails, naming both shapes looked for"
+  CRT_OUT="$(assert_static_crt_build_script "$CB" oam_nosuch 2>&1)" && CRT_RC=0 || CRT_RC=$?
+  if [ "$CRT_RC" != 0 ] && grep -qF 'no build script for oam_nosuch' <<<"$CRT_OUT"; then pass
+  else fail "expected a missing build script to fail: $CRT_OUT"; fi
+
+  it "crt build script: a name that is not a cargo package name is refused"
+  CRT_OUT="$(assert_static_crt_build_script "$CB" 'oam.*' 2>&1)" && CRT_RC=0 || CRT_RC=$?
+  if [ "$CRT_RC" != 0 ] && grep -qF 'not a cargo package name' <<<"$CRT_OUT"; then pass
+  else fail "expected 'oam.*' to be refused: $CRT_OUT"; fi
+else
+  it "crt build script: build-script selection across both cargo layouts"
+  skip "assert_static_crt_build_script needs GNU find -printf, which this host's find lacks"
+fi
+
+# =============================================================================
+group "build-locks.sh -- parking the link stage, both cargo layouts"
+# =============================================================================
+# cargo links oam.exe at a stage path and only then uplifts it; the LNK1104
+# deny window is on the stage. <= 1.99 staged at deps/oam.exe, 1.100 at
+# build/oam_cli/<hash>/out/oam.exe -- a park that only knows deps/ leaves the
+# real stage held and the link fails exactly as before the park existed.
+PK="$SUITE_TMP/park"
+mkdir -p "$PK/release/deps" "$PK/release/build/oam_cli/00000000000000b1/out" \
+         "$PK/release/build/oam_cli/00000000000000b2/out" \
+         "$PK/release/build/oam_cli/000000000000007f/out" \
+         "$PK/release/build/other/000000000000000f/out"
+for f in release/oam.exe release/deps/oam.exe \
+         release/build/oam_cli/00000000000000b1/out/oam.exe \
+         release/build/oam_cli/00000000000000b2/out/oam.exe \
+         release/build/oam_cli/000000000000007f/out/oam-000000000000007f.exe \
+         release/build/other/000000000000000f/out/oam.exe; do
+  echo image > "$PK/$f"
+done
+for d in release release/deps release/build/oam_cli/000000000000007f/out release/build/other/000000000000000f/out; do
+  echo parked > "$PK/$d/x.inuse-1-1"
+done
+PARK_STAGES="$( cd "$PK" && . "$REPO_DIR/scripts/lib/build-locks.sh" && oam_bin_stages release oam_cli oam.exe | sort | tr '\n' ' ' )"
+PARK_RC="$( cd "$PK" && . "$REPO_DIR/scripts/lib/build-locks.sh" && oam_reap_bin release oam_cli && oam_park_bin release oam_cli oam.exe >/dev/null; echo $? )"
+
+it "oam_bin_stages lists deps/ and every oam_cli unit's out/oam.exe, nothing else"
+eq "$PARK_STAGES" "release/build/oam_cli/00000000000000b1/out/oam.exe release/build/oam_cli/00000000000000b2/out/oam.exe release/deps/oam.exe "
+
+it "oam_park_bin frees the uplifted binary and every stage, and leaves other files"
+if [ "$PARK_RC" = "0" ]; then
+  bad=""
+  for f in release/oam.exe release/deps/oam.exe release/build/oam_cli/00000000000000b1/out/oam.exe release/build/oam_cli/00000000000000b2/out/oam.exe; do
+    [ -e "$PK/$f" ] && bad="$bad $f"
+  done
+  for f in release/build/oam_cli/000000000000007f/out/oam-000000000000007f.exe release/build/other/000000000000000f/out/oam.exe; do
+    [ -e "$PK/$f" ] || bad="$bad $f(missing)"
+  done
+  if [ -z "$bad" ]; then pass; else fail "wrong state:$bad"; fi
+else fail "oam_park_bin returned $PARK_RC on a tree nothing holds"; fi
+
+it "oam_reap_bin reaps the profile dir, deps/ and oam_cli's unit out/ dirs, not another package's"
+bad=""
+for d in release release/deps release/build/oam_cli/000000000000007f/out; do
+  [ -e "$PK/$d/x.inuse-1-1" ] && bad="$bad $d"
+done
+[ -e "$PK/release/build/other/000000000000000f/out/x.inuse-1-1" ] || bad="$bad other(reaped)"
+if [ -z "$bad" ]; then pass; else fail "wrong state:$bad"; fi
+
+# A stage that will not move must fail the park AND name itself: the callers
+# print it, and "oam.exe is locked" without the path sends the operator to the
+# wrong file. mv is shimmed to refuse exactly the 1.100 stage.
+it "oam_park_bin names a held 1.100 stage and returns 1"
+echo image > "$PK/release/build/oam_cli/00000000000000b2/out/oam.exe"
+PKSHIM="$SUITE_TMP/shim-park-mv"
+mkdir -p "$PKSHIM"
+{
+  echo '#!/bin/sh'
+  echo 'case "$1" in */out/oam.exe) exit 1 ;; esac'
+  printf 'exec "%s" "$@"\n' "$(command -v mv)"
+} > "$PKSHIM/mv"
+chmod +x "$PKSHIM/mv"
+PARK_HELD="$( cd "$PK" && PATH="$PKSHIM:$PATH" && . "$REPO_DIR/scripts/lib/build-locks.sh" && oam_park_bin release oam_cli oam.exe; echo "rc=$?" )"
+eq "${PARK_HELD//$'\n'/ }" "release/build/oam_cli/00000000000000b2/out/oam.exe rc=1"
+
+# Every park call site goes through the helpers. A literal deps/oam.exe park is
+# a site that was missed: it frees the old stage and leaves 1.100's held.
+it "no script parks deps/oam.exe directly any more"
+DIRECT="$(grep -nE '(oam_park_file|free_locked_binary|oam_reap_parked) +target/[^ ]*deps' scripts/*.sh || true)"
+if [ -z "$DIRECT" ]; then pass; else fail "direct deps/ park or reap left: $DIRECT"; fi
 
 # =============================================================================
 group "build-remote.sh -- gc dispatch"

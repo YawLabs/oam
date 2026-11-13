@@ -18,6 +18,14 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Changed
+
+- **Building oam from source needs Rust 1.100.0**, the version `rust-toolchain.toml` now pins
+  (was 1.99.0); rustup installs it on the first cargo command in the repo. Cargo 1.100 lays out
+  `target/` differently (no `target/<profile>/deps/`; each unit under
+  `target/<profile>/build/<pkg>/<hash>/`), and `scripts/gc-target.sh` now prunes that layout by
+  what the last builds still depend on, removing the old layout's leftovers on its first run.
+
 ## [0.20.1] - 2026-11-12
 
 ### Fixed

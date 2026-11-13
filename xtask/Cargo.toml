@@ -10,9 +10,14 @@ publish = false
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
+
 # bench mcp-idle-rss reads a child process's RSS by PID. Windows uses
 # tasklist, linux reads /proc; sysinfo backs the remaining unix targets
 # (macOS) where /proc is absent. Same crate the engine os natives use.
+# Target-scoped to match the #[cfg] on its only use (xtask/src/bench.rs):
+# declared unconditionally, cargo 1.100's warn-by-default
+# cargo::unused_dependencies fires on every Windows and linux build.
+[target.'cfg(not(any(target_os = "windows", target_os = "linux")))'.dependencies]
 sysinfo = { workspace = true }
 
 [lints.clippy]

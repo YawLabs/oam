@@ -5,5 +5,5 @@
 # Bump deliberately -- scripts/lib/rust-pin.sh (sourced by ci-local.sh,
 # build-remote.sh and release-local.sh) gates every release leg on this pin
 # resolving to the same rustc everywhere.
-channel = "1.99.0"
+channel = "1.100.0"
 components = ["rustfmt", "clippy", "rust-analyzer"]

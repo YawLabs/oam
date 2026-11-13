@@ -83,6 +83,56 @@ oam_reap_parked() {
   return 0
 }
 
+# Where cargo LINKS a binary before uplifting it, which is where the LNK1104
+# deny window lands. Two layouts, because a tree keeps whichever one built it:
+#
+#   cargo <= 1.99   <profile>/deps/<exe>, then copied/linked up to <profile>/<exe>
+#   cargo >= 1.100  <profile>/build/<pkg>/<unit-hash>/out/<exe>, hardlinked up
+#                   to <profile>/<exe> (rust-lang/cargo#17354: deps/ and
+#                   .fingerprint/ are gone; every unit gets its own dir)
+#
+# Under 1.100 a package has one unit dir per (target kind, profile, feature
+# set, ...), so a bin can sit in more than one -- a glob, not one path. Parking
+# a stage file costs a relink on the next build (its unit's fingerprint sees
+# the output missing), the same trade the deps/ park always made.
+
+# oam_bin_stages <profile-dir> <pkg> <exe>
+# Prints each EXISTING pre-uplift copy of <exe>, one per line, both layouts.
+# Not the uplifted <profile-dir>/<exe> itself. Always succeeds.
+oam_bin_stages() {
+  local dir="$1" pkg="$2" exe="$3" p
+  for p in "$dir/deps/$exe" "$dir/build/$pkg"/*/out/"$exe"; do
+    [ -e "$p" ] && printf '%s\n' "$p"
+  done
+  return 0
+}
+
+# oam_park_bin <profile-dir> <pkg> <exe>
+# Parks the uplifted <profile-dir>/<exe> and every pre-uplift stage of it. On
+# failure prints the first path still held and returns 1, so each caller can
+# die in its own dialect:  held="$(oam_park_bin ...)" || ko "$held ...".
+oam_park_bin() {
+  local dir="$1" pkg="$2" exe="$3" p
+  if ! oam_park_file "$dir/$exe"; then printf '%s\n' "$dir/$exe"; return 1; fi
+  while IFS= read -r p; do
+    if ! oam_park_file "$p"; then printf '%s\n' "$p"; return 1; fi
+  done < <(oam_bin_stages "$dir" "$pkg" "$exe")
+  return 0
+}
+
+# oam_reap_bin <profile-dir> <pkg>
+# oam_reap_parked over every dir oam_park_bin parks into: the profile dir, the
+# old deps/, and each of <pkg>'s 1.100 unit out/ dirs. Always succeeds.
+oam_reap_bin() {
+  local dir="$1" pkg="$2" d
+  oam_reap_parked "$dir"
+  oam_reap_parked "$dir/deps"
+  for d in "$dir/build/$pkg"/*/out; do
+    oam_reap_parked "$d"
+  done
+  return 0
+}
+
 # oam_kill_under <abs-dir>
 # Kills every process whose EXECUTABLE IMAGE lives under <abs-dir>. Matching is
 # on the image path, never the image name, so passing target/debug cannot reach
