@@ -637,6 +637,20 @@ free_locked_binary() {
   return 0
 }
 
+# free_locked_bin <profile-dir> -- free_locked_binary over oam.exe and every
+# pre-uplift stage of it (scripts/lib/build-locks.sh: oam_bin_stages), both
+# cargo layouts. The stage list is read before anything moves, and process
+# substitution keeps the loop in this shell, so fail() still exits the run.
+free_locked_bin() {
+  local dir="$1" p
+  oam_reap_bin "$dir" oam_cli
+  free_locked_binary "$dir/oam.exe"
+  while IFS= read -r p; do
+    free_locked_binary "$p"
+  done < <(oam_bin_stages "$dir" oam_cli oam.exe)
+  return 0
+}
+
 # land_on_main <commit-subject> <expected-version>
 # main carries a ruleset (verified signatures + PR-only). This account holds
 # bypass, so a direct push lands and GitHub just prints "Bypassed rule
@@ -1233,15 +1247,16 @@ step "Build oam-aarch64-pc-windows-msvc.exe (local, native)"
 # Live processes run this exact file -- typed-cli sessions, the resident
 # type-check daemon. Park it rather than killing them (see free_locked_binary).
 #
-# BOTH paths get freed, not just the promoted binary: cargo's link step writes
-# deps/oam.exe FIRST and only promotes it to release/oam.exe on success, so the
-# LNK1104 denial window is on the deps-stage file. The same deny window that
-# holds release/oam.exe (live typed-cli panes) can hold deps/oam.exe (an orphan
-# from a previous aborted build, or the file a parallel cargo invocation wrote
-# moments before the link started). Renaming frees both without touching any
-# process -- see scripts/lib/build-locks.sh.
-free_locked_binary target/release/oam.exe
-free_locked_binary target/release/deps/oam.exe
+# EVERY path gets freed, not just the promoted binary: cargo's link step writes
+# a stage file FIRST and only promotes it to release/oam.exe on success, so the
+# LNK1104 denial window is on the stage file. The same deny window that holds
+# release/oam.exe (live typed-cli panes) can hold the stage (an orphan from a
+# previous aborted build, or the file a parallel cargo invocation wrote moments
+# before the link started). The stage is deps/oam.exe on a tree cargo <= 1.99
+# built and build/oam_cli/<hash>/out/oam.exe since cargo 1.100 (cargo#17354);
+# oam_bin_stages lists both. Renaming frees them without touching any process
+# -- see scripts/lib/build-locks.sh.
+free_locked_bin target/release
 cargo build --release -p oam_cli
 cp target/release/oam.exe "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"
 sign_win_asset "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"
@@ -1255,13 +1270,12 @@ else
   # CARGO_TARGET_DIR isolation keeps the x64 toolchain's host artifacts from
   # churning the native toolchain's fingerprints in target/.
   rustup toolchain install "$pinned_rust-x86_64-pc-windows-msvc" --profile minimal --force-non-host
-  # Same LNK1104 story as the native leg: link writes deps/oam.exe before
-  # promoting it to release/oam.exe, so both paths must be free of a deny-delete
+  # Same LNK1104 story as the native leg: link writes the stage file before
+  # promoting it to release/oam.exe, so every path must be free of a deny-delete
   # holder. x64-host's trees are isolated from the native ones by CARGO_TARGET_DIR
   # -- nothing live ever runs out of this tree -- so a holder here is an orphan
   # of an earlier aborted x64 build, not a typed-cli session.
-  free_locked_binary target/x64-host/release/oam.exe
-  free_locked_binary target/x64-host/release/deps/oam.exe
+  free_locked_bin target/x64-host/release
   # No --target, deliberately: the +$pinned_rust-x86_64-pc-windows-msvc toolchain
   # already builds for x86_64-pc-windows-msvc, so naming it was redundant --
   # but not harmless. Passing --target splits cargo's unit graph into host and
@@ -1297,8 +1311,7 @@ step "Windows console raw-mode e2e against the release assets"
 conpty_assets=("$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe")
 [ "$SKIP_WIN_X64" = "1" ] || conpty_assets+=("$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe")
 oam_kill_under "$PWD/target/debug"
-oam_reap_parked target/debug
-oam_reap_parked target/debug/deps
+oam_reap_bin target/debug oam_cli
 for asset in "${conpty_assets[@]}"; do
   # A native Windows path: the harness checks the value with a Rust is_file(),
   # which knows nothing of MSYS's /tmp.

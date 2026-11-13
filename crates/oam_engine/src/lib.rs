@@ -1887,25 +1887,54 @@ mod tests {
         // literal `target/debug` is wrong under CARGO_TARGET_DIR, `--target`
         // and `--release`, where it either finds nothing or finds an addon some
         // other build left behind. A unit-test binary has no CARGO_BIN_EXE_*
-        // (that is what the e2e twin uses), but cargo always places it at
-        // `<target dir>/[<triple>/]<profile>/deps/<name>-<hash>`, and a cdylib
-        // at `<target dir>/[<triple>/]<profile>/`, so the addon is two levels
-        // up from the running executable. The literal path is only the
-        // fallback for a test binary run from somewhere else.
-        let built = std::env::current_exe()
-            .ok()
-            .and_then(|exe| {
-                let deps = exe.parent()?;
-                if deps.file_name()? != "deps" {
-                    return None;
-                }
-                Some(deps.parent()?.join(addon_file))
-            })
-            .unwrap_or_else(|| crate_root.join("../../target/debug").join(addon_file));
+        // (that is what the e2e twin uses), so the profile dir is recovered
+        // from the running executable's own path. A cdylib is uplifted to
+        // `<target dir>/[<triple>/]<profile>/` under every cargo, but where the
+        // test binary sits changed in cargo 1.100 (cargo#17354, the new
+        // intermediate build layout):
+        //   <= 1.99: `<profile>/deps/<name>-<hash>`
+        //   >= 1.100: `<profile>/build/<pkg>/<hash>/out/<name>-<hash>`
+        // Both are recognised because a target dir built by <= 1.99 keeps the
+        // old layout until it is removed. There is deliberately no literal
+        // `target/debug` fallback: when it was one, the 1.100 layout fell
+        // through to it silently and the lifecycle test loaded whatever addon
+        // the repo's default target dir happened to hold. An unrecognised
+        // layout fails below with the path it was looking at instead.
+        // A separate cargo build-dir (`build.build-dir` /
+        // CARGO_BUILD_BUILD_DIR) is not supported: the test binary then sits
+        // under the build-dir, but the cdylib is uplifted to the target-dir,
+        // so the profile dir recovered here holds no addon and the presence
+        // check below fails.
+        let exe = std::env::current_exe().expect("the test binary knows its own path");
+        let profile_dir = exe.parent().and_then(|dir| {
+            if dir.file_name()? == "deps" {
+                return dir.parent();
+            }
+            if dir.file_name()? != "out" {
+                return None;
+            }
+            let build = dir.parent()?.parent()?.parent()?;
+            if build.file_name()? != "build" {
+                return None;
+            }
+            build.parent()
+        });
+        let Some(profile_dir) = profile_dir else {
+            panic!(
+                "cannot find the cargo profile dir from the test binary at {} -- expected \
+                 `<profile>/deps/<name>-<hash>` (cargo <= 1.99) or \
+                 `<profile>/build/<pkg>/<hash>/out/<name>-<hash>` (cargo >= 1.100); run it \
+                 through `cargo test`",
+                exe.display()
+            );
+        };
+        let built = profile_dir.join(addon_file);
         assert!(
             built.is_file(),
             "test addon not built at {} -- run `cargo build -p oam_napi_test_addon` with the \
-             same profile, target and target dir as this test run first",
+             same profile, target and target dir as this test run first (a separate cargo \
+             build-dir, `build.build-dir` / CARGO_BUILD_BUILD_DIR, is not supported: the \
+             cdylib is uplifted to the target-dir, not the build-dir)",
             built.display()
         );
         let Ok(built_at) = std::fs::metadata(&built).and_then(|m| m.modified()) else {

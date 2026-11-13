@@ -237,33 +237,33 @@ ko()  { echo -e "${RED}  [fail]${NC} $*" >&2; exit 1; }
 # `target/release/oam.exe` typed-cli session is out of reach by construction.
 clear_debug_holders() {
   oam_kill_under "$PWD/target/debug"
-  oam_reap_parked target/debug
-  oam_reap_parked target/debug/deps
+  oam_reap_bin target/debug oam_cli
 }
 
 # Fallback for a holder the kill could not reach (elevated process, AV handle):
-# renaming works where deleting does not. Parking the deps-stage file is NOT
-# free, though: deleting deps/oam.exe dirties cargo's bin-unit fingerprint, so
+# renaming works where deleting does not. Parking the link-stage file is NOT
+# free, though: deleting it dirties cargo's bin-unit fingerprint, so
 # the next build relinks the binary even on an otherwise-fresh tree (measured
 # ~7.6s vs a 0.68s no-op in debug; the release scripts pay more). That cost is
 # accepted -- a locked binary fails the link outright, which is worse than a
 # relink.
 #
-# BOTH paths get parked: cargo's link writes deps/oam.exe FIRST and only
+# EVERY path gets parked: cargo's link writes the stage file FIRST and only
 # promotes it to debug/oam.exe on success, so the LNK1104 deny window lands
-# on the deps-stage file. An orphan test binary (a previous run's `cargo
-# test` left mapped) is the usual holder there -- same deny window, same
-# fix.
+# on the stage file. An orphan test binary (a previous run's `cargo test`
+# left mapped) is the usual holder there -- same deny window, same fix. The
+# stage is deps/oam.exe on a tree cargo <= 1.99 built and
+# build/oam_cli/<hash>/out/oam.exe since cargo 1.100 (cargo#17354);
+# oam_park_bin (scripts/lib/build-locks.sh) covers both.
 #
 # Called by every step that LINKS the oam binary, which is more than the plain
 # build: `cargo test -p oam_cli` builds the package's bin targets too, so the
 # feature-off step hits the same deny window.
 park_link_targets() {
   local hint="find the holder with: Get-CimInstance Win32_Process | Where-Object { \$_.ExecutablePath -like '*target*' } | Select-Object ProcessId,ExecutablePath"
-  oam_park_file target/debug/oam.exe \
-    || ko "target/debug/oam.exe is locked and could not be parked -- $hint"
-  oam_park_file target/debug/deps/oam.exe \
-    || ko "target/debug/deps/oam.exe is locked and could not be parked -- $hint"
+  local held
+  held="$(oam_park_bin target/debug oam_cli oam.exe)" \
+    || ko "$held is locked and could not be parked -- $hint"
 }
 
 # `cargo test` args, appended to every invocation: release legs set

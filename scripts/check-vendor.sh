@@ -146,7 +146,12 @@ for dir in "${dirs[@]}"; do
       case "$features" in ''|'#'*) continue ;; esac
       rm -rf "$probe"
       mkdir -p "$probe/src"
-      printf 'pub fn probe() {}\n' > "$probe/src/lib.rs"
+      # The re-export USES the dependency: an empty probe trips cargo 1.100's
+      # warn-by-default cargo::unused_dependencies on its own manifest, which
+      # the warning check below would then blame on the vendored crate.
+      # Allowing that lint instead would hide nothing today, but a use is the
+      # honest fix and keeps every warning class live.
+      printf 'pub use ::%s as vendored;\n' "${name//-/_}" > "$probe/src/lib.rs"
       cat > "$probe/Cargo.toml" <<EOF
 [package]
 name = "vendor-probe"

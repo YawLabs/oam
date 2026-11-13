@@ -235,18 +235,16 @@ guard_signed_asset "nothing was built or uploaded"
 # mid-launch is precisely what denies the link step this path. Renaming frees
 # it without touching a single process -- see scripts/lib/build-locks.sh.
 #
-# BOTH paths get parked: cargo's link writes deps/oam.exe FIRST and only promotes
-# it to release/oam.exe on success, so the LNK1104 deny window lands on the
-# deps-stage file. An orphan from an earlier aborted build is the usual holder
-# there; rename frees it the same way it frees the promoted binary.
-oam_reap_parked target/release
-oam_reap_parked target/release/deps
-if ! oam_park_file target/release/oam.exe; then
-  echo "error: target/release/oam.exe is locked and a rename could not free it" >&2
-  exit 1
-fi
-if ! oam_park_file target/release/deps/oam.exe; then
-  echo "error: target/release/deps/oam.exe is locked and a rename could not free it" >&2
+# EVERY path gets parked: cargo's link writes a stage file FIRST and only
+# promotes it to release/oam.exe on success, so the LNK1104 deny window lands
+# on the stage file. An orphan from an earlier aborted build is the usual holder
+# there; rename frees it the same way it frees the promoted binary. The stage
+# is deps/oam.exe on a tree cargo <= 1.99 built and
+# build/oam_cli/<hash>/out/oam.exe since cargo 1.100 (cargo#17354); oam_park_bin
+# covers both.
+oam_reap_bin target/release oam_cli
+if ! held="$(oam_park_bin target/release oam_cli oam.exe)"; then
+  echo "error: $held is locked and a rename could not free it" >&2
   exit 1
 fi
 # The tag's tree, checked out beside this one: its Cargo.lock,
@@ -306,8 +304,7 @@ assert_static_crt "${tmp}/${ASSET}" || { echo "error: CRT-linkage gate failed fo
 #    debug oam beside the test binary, so that path is freed first, as
 #    release-local.sh does; only debug-tree processes are killed.
 oam_kill_under "$REPO_ROOT/target/debug"
-oam_reap_parked target/debug
-oam_reap_parked target/debug/deps
+oam_reap_bin target/debug oam_cli
 conpty_bin="${tmp}/${ASSET}"
 if command -v cygpath >/dev/null 2>&1; then conpty_bin="$(cygpath -w "$conpty_bin")"; fi
 (cd "$wt" && OAM_CONPTY_BIN="$conpty_bin" \

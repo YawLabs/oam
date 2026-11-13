@@ -119,18 +119,61 @@ assert_static_crt_canary() {
 # shipped asset stays correct and this gate stays green while the build script
 # quietly goes back to linking two CRTs. Nothing else notices.
 #
-# Newest-by-mtime, deliberately: target/<profile>/build/ accumulates one dir per
-# historical fingerprint, and the stale ones legitimately hold dynamic-CRT
+# Where the executable lives depends on the cargo that built the tree. Cargo
+# 1.100 replaced the intermediate layout (cargo#17354): every unit now gets
+# target/<profile>/build/<package>/<hash>/, and the compiled build script is
+# out/build_script_build.exe in its compile unit's dir. Its run unit is a
+# SIBLING <hash>/ holding run/ (the script's captured stdout and stderr) and
+# out/ -- the OUT_DIR the script writes into, so no build-script executable.
+# Trees last built by cargo
+# <= 1.99 keep the old shape, target/<profile>/build/<package>-<hash>/
+# build-script-build.exe, until something deletes them -- and a box that just
+# moved to 1.100 has both side by side. Both are matched, so the gate keeps
+# working on a tree from either side of the toolchain bump.
+#
+# Newest-by-mtime across both shapes, deliberately: build/ accumulates one dir
+# per historical unit hash, and the stale ones legitimately hold dynamic-CRT
 # binaries from before this fix. The one cargo just linked is the newest, and a
-# dir cargo did not touch cannot become newer than it.
+# file cargo did not touch cannot become newer than it. That holds across the
+# layout change too: cargo 1.100 never writes into an old-shape
+# <package>-<hash>/ dir, so every old-shape exe is frozen at an mtime from
+# before the toolchain switch and cannot outrank a fresh 1.100 link. (In the new
+# shape the <hash> is unit metadata, not content, so a relink rewrites the SAME
+# out/build_script_build.exe in place -- verified with cargo 1.100.0 -- which
+# refreshes its mtime rather than adding a dir.)
+#
+# The package match is exact, not a prefix: the dir carries the PACKAGE name
+# verbatim, hyphens included, so a `*/oam_engine-*` glob would also take a
+# hypothetical `oam_engine-macros-<hash>/` (old shape). The old shape is pinned
+# to <package>-<hex hash>, the new one to the whole <package>/ component.
+#
+# Windows-only in practice -- the .exe names, and ci-local.sh calls it only when
+# target/debug/oam.exe exists -- so GNU find's -printf (Git Bash) is safe here;
+# macOS's BSD find has none, which is why gc-target.sh guards its own use.
 assert_static_crt_build_script() {
   local profile_dir="$1" crate="$2" newest
+  # The package name goes into an ERE below unescaped; cargo package names are
+  # [A-Za-z0-9_-] only, so refusing anything else keeps the match literal.
+  case "$crate" in
+    ''|*[!A-Za-z0-9_-]*)
+      echo "assert_static_crt_build_script: not a cargo package name: '$crate'" >&2
+      return 1 ;;
+  esac
   # find + %T@, not `ls -t`: same newest-first ordering without shellcheck
-  # SC2012, and it matches how gc-target.sh already walks these trees.
-  newest="$(find "$profile_dir/build" -maxdepth 2 -path "*/$crate-*" -name build-script-build.exe -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+  # SC2012, and it matches how gc-target.sh already walks these trees. Run from
+  # inside build/ so the anchored ERE never has to escape $profile_dir. maxdepth
+  # 4 reaches <package>/<hash>/out/<exe>; the old shape sits at depth 2.
+  # `|| true`: grep exits 1 on "no candidate", which must reach the explicit
+  # empty-result failure below rather than trip pipefail/errexit first.
+  newest="$(cd "$profile_dir/build" 2>/dev/null \
+    && find . -maxdepth 4 -type f \( -name build_script_build.exe -o -name build-script-build.exe \) -printf '%T@ %p\n' 2>/dev/null \
+    | grep -E "^[0-9.]+ \./($crate/[0-9a-f]+/out/build_script_build\.exe|$crate-[0-9a-f]+/build-script-build\.exe)\$" \
+    | sort -rn | head -1 | cut -d' ' -f2- || true)"
   if [ -z "$newest" ]; then
-    echo "assert_static_crt_build_script: no build script for $crate under $profile_dir" >&2
+    echo "assert_static_crt_build_script: no build script for $crate under $profile_dir/build" >&2
+    echo "  looked for $crate/<hash>/out/build_script_build.exe (cargo >= 1.100)" >&2
+    echo "  and $crate-<hash>/build-script-build.exe (cargo <= 1.99)" >&2
     return 1
   fi
-  assert_static_crt "$newest"
+  assert_static_crt "$profile_dir/build/${newest#./}"
 }
