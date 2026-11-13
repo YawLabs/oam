@@ -303,8 +303,32 @@ mod tests {
         );
     }
 
+    /// Whether spawning a program that does not exist fails at spawn() on
+    /// this host. False under Rosetta for Linux (the release's linux leg):
+    /// there glibc's posix_spawn, which std's Command uses, returns success
+    /// for a missing program and the child _exits 127 -- measured in the
+    /// release container on 2026-11-13. The e2e suite's probe of the same
+    /// name explains the consequence for cluster.fork.
+    fn exec_failure_reaches_spawn(missing: &std::path::Path) -> bool {
+        match std::process::Command::new(missing)
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Err(_) => true,
+            Ok(mut child) => {
+                let _ = child.wait();
+                false
+            }
+        }
+    }
+
     /// A spawn that fails is the op's failure, in the message the JS side
-    /// turns into the worker's 'error'.
+    /// turns into the worker's 'error'. Skipped where the host reports a
+    /// missing program as a child exiting 127 instead (see
+    /// exec_failure_reaches_spawn).
     #[tokio::test]
     async fn a_fork_whose_spawn_fails_is_a_failed_outcome() {
         let missing = std::env::temp_dir().join(format!(
@@ -313,6 +337,13 @@ mod tests {
             std::env::consts::EXE_SUFFIX
         ));
         assert!(!missing.exists(), "{} must not exist", missing.display());
+        if !exec_failure_reaches_spawn(&missing) {
+            eprintln!(
+                "skipping: this host reports a missing program as a child exiting 127, \
+                 not as a spawn error (x86_64 under Rosetta for Linux)"
+            );
+            return;
+        }
         let children: ChildRegistry = Default::default();
         let ids = Arc::new(AtomicU64::new(1));
         let outcome = cluster_fork_with(
