@@ -326,19 +326,29 @@ mod tests {
             .build()
             .unwrap();
         std::fs::write(dir.join("new.txt"), b"x").unwrap();
-        let outcome = rt.block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(10), next(&registry, id)).await
-        });
-        match outcome {
-            Ok(OpOutcome::Bytes(bytes)) => {
-                let needle = b"new.txt";
-                assert!(
-                    bytes.windows(needle.len()).any(|w| w == needle),
-                    "the event names the file: {bytes:?}"
-                );
+        // macOS FSEvents reports the watched directory's OWN creation (made
+        // just above) to its watcher, as `rename` + the directory's name --
+        // node delivers it too (conformance case 421, measured 2026-10-21).
+        // Skip exactly that event; anything else must name the file.
+        let mut own_creation = vec![0u8];
+        own_creation.extend_from_slice(dir.file_name().unwrap().as_encoded_bytes());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let outcome =
+                rt.block_on(async { tokio::time::timeout_at(deadline, next(&registry, id)).await });
+            match outcome {
+                Ok(OpOutcome::Bytes(bytes)) if bytes == own_creation => continue,
+                Ok(OpOutcome::Bytes(bytes)) => {
+                    let needle = b"new.txt";
+                    assert!(
+                        bytes.windows(needle.len()).any(|w| w == needle),
+                        "the event names the file: {bytes:?}"
+                    );
+                    break;
+                }
+                Ok(_) => panic!("expected an event"),
+                Err(_) => panic!("no event within 10 s"),
             }
-            Ok(_) => panic!("expected an event"),
-            Err(_) => panic!("no event within 10 s"),
         }
         // A read parked when close() runs settles empty.
         let parked = next(&registry, id);
