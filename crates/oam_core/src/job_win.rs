@@ -41,14 +41,18 @@
 //! missing lifetime link is worse than degrading to the pre-job behaviour.
 //!
 //! Ordering: libuv assigns a non-detached child AFTER a normal, already-running
-//! `CreateProcessW`. The raw spawn path (child_win.rs) does better and creates
-//! the child suspended, assigns, then resumes, so no instruction of the child
-//! runs outside the job. The `std`/`tokio` `Command` paths cannot resume a
-//! suspended child (neither exposes the primary thread handle), so they assign
-//! immediately after spawn, exactly as libuv does. The window that leaves is
-//! narrower than it looks: a process the child creates inside it would not
-//! have been a member anyway (SILENT_BREAKAWAY_OK), so the only loss is a
-//! parent killed in the microseconds between spawn and assignment.
+//! `CreateProcessW`. Two paths here do better and create the child suspended,
+//! assign, then resume, so no instruction of the child runs outside the job:
+//! the raw spawn path (child_win.rs) with its own `CreateProcessW`, and
+//! `child::spawn_sync` through std's `Command` with `CREATE_SUSPENDED` and
+//! [`adopt_suspended`] on the primary thread std's `ChildExt::main_thread_handle`
+//! exposes. tokio's `Child` (`child::spawn_child`, `cluster::cluster_fork`)
+//! still exposes no thread handle, so it cannot resume a suspended child, and
+//! those paths assign immediately after spawn, exactly as libuv does. The
+//! window that leaves is narrower than it looks: a process the child creates
+//! inside it would not have been a member anyway (SILENT_BREAKAWAY_OK), so the
+//! only loss is a parent killed in the microseconds between spawn and
+//! assignment.
 
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::sync::OnceLock;
@@ -59,7 +63,7 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, ResumeThread, TerminateProcess};
 
 /// `None` once creation failed: every later spawn then runs without the job
 /// rather than retrying a call that already failed on this process.
@@ -115,6 +119,47 @@ pub(crate) fn adopt(process: BorrowedHandle<'_>) {
     }
 }
 
+/// Why [`adopt_suspended`] failed: the resume's error, and whether the parked
+/// child was then terminated.
+#[derive(Debug)]
+pub(crate) struct ResumeFailed {
+    pub(crate) error: std::io::Error,
+    /// `false` only when `TerminateProcess` failed too. The child is then
+    /// still parked and will never exit, so the caller must NOT wait on it --
+    /// it drops the handles instead, as the raw spawn path (child_win.rs)
+    /// does with a child it could not resume.
+    pub(crate) terminated: bool,
+}
+
+/// [`adopt`] for a non-detached child created with `CREATE_SUSPENDED`, then
+/// resume its primary thread, so the child runs its first instruction already
+/// in the job.
+///
+/// The assignment stays best effort, as in [`adopt`]; the resume does not. A
+/// child whose thread cannot be resumed would sit parked forever, so it is
+/// terminated -- as the raw spawn path (child_win.rs) and libuv do -- and the
+/// resume's error is returned for the caller to fail the spawn with. The
+/// caller still owns `process`; it reaps it only when [`ResumeFailed`] says
+/// the termination took.
+pub(crate) fn adopt_suspended(
+    process: BorrowedHandle<'_>,
+    thread: BorrowedHandle<'_>,
+) -> Result<(), ResumeFailed> {
+    adopt(process);
+    // SAFETY: both handles are BorrowedHandles, so the thread and process
+    // handles they name stay open for this whole call; neither call reads or
+    // writes our memory. GetLastError is read immediately after the failed
+    // ResumeThread, before any other call can overwrite it.
+    unsafe {
+        if ResumeThread(thread.as_raw_handle()) == u32::MAX {
+            let error = std::io::Error::last_os_error();
+            let terminated = TerminateProcess(process.as_raw_handle(), 1) != 0;
+            return Err(ResumeFailed { error, terminated });
+        }
+    }
+    Ok(())
+}
+
 /// [`adopt`] for a tokio child, which exposes its process handle only raw.
 pub(crate) fn adopt_tokio_child(child: &tokio::process::Child) {
     if let Some(raw) = child.raw_handle() {
@@ -122,5 +167,38 @@ pub(crate) fn adopt_tokio_child(child: &tokio::process::Child) {
         // is borrowed for this whole call, so that handle cannot be closed --
         // and its value recycled -- before `adopt` returns.
         adopt(unsafe { BorrowedHandle::borrow_raw(raw) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::adopt_suspended;
+    use std::os::windows::io::AsHandle;
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+    /// The resume-failure branch, triggered deterministically: the PROCESS
+    /// handle passed where the thread handle belongs makes ResumeThread fail
+    /// with ERROR_INVALID_HANDLE. The parked child must be terminated (exit
+    /// code 1, from TerminateProcess) and reported so, so a caller can reap it
+    /// without hanging -- the branch spawn_sync takes when a resume fails.
+    #[test]
+    fn a_failed_resume_terminates_the_parked_child_and_says_so() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/d", "/c", "exit 0"])
+            .creation_flags(CREATE_SUSPENDED)
+            .spawn()
+            .expect("spawn a suspended cmd");
+        let failed = adopt_suspended(child.as_handle(), child.as_handle())
+            .expect_err("ResumeThread on a process handle must fail");
+        // ERROR_INVALID_HANDLE
+        assert_eq!(failed.error.raw_os_error(), Some(6), "{:?}", failed.error);
+        assert!(
+            failed.terminated,
+            "TerminateProcess on our own child failed"
+        );
+        let status = child.wait().expect("wait on the terminated child");
+        // exit 0 would mean the child ran after all; 1 is TerminateProcess's.
+        assert_eq!(status.code(), Some(1));
     }
 }

@@ -39,9 +39,14 @@ pub async fn cluster_fork(
     // CREATE_NO_WINDOW is added only when this process has none. Setting it
     // unconditionally started a fresh hidden conhost for every worker while
     // its stdio slots were inherited, the combination libuv rules out.
+    // And libuv's show state for a child without windowsHide (SW_SHOWDEFAULT
+    // under STARTF_USESHOWWINDOW), as spawn_child gives every other child.
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         cmd.creation_flags(super::child::windows_creation_flags(false, false, true));
+        cmd.as_std_mut()
+            .show_window(super::child_win::show_window_for(false));
     }
 
     match cmd.spawn() {
