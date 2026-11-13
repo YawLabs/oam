@@ -1861,6 +1861,171 @@ mod tests {
         );
     }
 
+    /// The cargo profile dir (`<target dir>/[<triple>/]<profile>`) holding a
+    /// test binary at `exe`, recognised from the two layouts cargo puts test
+    /// binaries in (see `built_test_addon`):
+    ///
+    /// - cargo 1.99 and earlier: `<profile>/deps/<exe>`
+    /// - cargo 1.100 and later: `<profile>/build/<pkg>/<hash>/out/<exe>`
+    ///
+    /// Anything else is `None`. Pure path arithmetic: nothing is read from
+    /// disk, and the directory names are matched exactly (case-sensitive).
+    fn cargo_profile_dir(exe: &std::path::Path) -> Option<&std::path::Path> {
+        let dir = exe.parent()?;
+        if dir.file_name()? == "deps" {
+            return dir.parent();
+        }
+        if dir.file_name()? != "out" {
+            return None;
+        }
+        let build = dir.parent()?.parent()?.parent()?;
+        if build.file_name()? != "build" {
+            return None;
+        }
+        build.parent()
+    }
+
+    #[test]
+    fn cargo_profile_dir_recognises_the_old_deps_layout() {
+        use std::path::Path;
+        let cases = [
+            ("/t/debug/deps/oam_engine-0123abcd", "/t/debug"),
+            ("/t/release/deps/oam_engine-0123abcd.exe", "/t/release"),
+            (
+                "/t/aarch64-pc-windows-msvc/debug/deps/oam_engine-0123abcd.exe",
+                "/t/aarch64-pc-windows-msvc/debug",
+            ),
+            // The profile name is not checked: a custom profile works too.
+            ("/t/ci-profile/deps/oam_engine-0123abcd", "/t/ci-profile"),
+        ];
+        for (exe, profile) in cases {
+            assert_eq!(
+                cargo_profile_dir(Path::new(exe)),
+                Some(Path::new(profile)),
+                "{exe}"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_profile_dir_recognises_the_new_build_out_layout() {
+        use std::path::Path;
+        let cases = [
+            (
+                "/t/debug/build/oam_engine/0123abcd/out/oam_engine-0123abcd",
+                "/t/debug",
+            ),
+            (
+                "/t/release/build/oam_engine/0123abcd/out/oam_engine-0123abcd.exe",
+                "/t/release",
+            ),
+            (
+                "/t/x86_64-unknown-linux-gnu/debug/build/oam_engine/0123abcd/out/oam_engine-0123abcd",
+                "/t/x86_64-unknown-linux-gnu/debug",
+            ),
+        ];
+        for (exe, profile) in cases {
+            assert_eq!(
+                cargo_profile_dir(Path::new(exe)),
+                Some(Path::new(profile)),
+                "{exe}"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_profile_dir_rejects_near_misses() {
+        use std::path::Path;
+        let misses = [
+            // `out/` straight under the profile, not under build/<pkg>/<hash>.
+            "/t/debug/out/oam_engine-0123abcd",
+            // `out/` one level short: build/<pkg>/out (no <hash>).
+            "/t/debug/build/oam_engine/out/oam_engine-0123abcd",
+            // `out/` one level too deep: build/<pkg>/<hash>/<extra>/out.
+            "/t/debug/build/oam_engine/0123abcd/extra/out/oam_engine-0123abcd",
+            // The three levels above `out/` end in something other than `build`.
+            "/t/debug/notbuild/oam_engine/0123abcd/out/oam_engine-0123abcd",
+            // A file NAMED deps / out is not a deps / out directory.
+            "/t/debug/deps",
+            "/t/debug/build/oam_engine/0123abcd/out",
+            // Exact, case-sensitive matches only.
+            "/t/debug/Deps/oam_engine-0123abcd",
+            "/t/debug/build/oam_engine/0123abcd/OUT/oam_engine-0123abcd",
+            "/t/debug/Build/oam_engine/0123abcd/out/oam_engine-0123abcd",
+            // A binary somewhere else entirely (e.g. `cargo install`ed, or copied out).
+            "/usr/local/bin/oam_engine-0123abcd",
+            // Too short to have a parent chain at all.
+            "/out/oam_engine-0123abcd",
+            "/build/out/oam_engine-0123abcd",
+            "oam_engine-0123abcd",
+            "/",
+            "",
+        ];
+        for exe in misses {
+            assert_eq!(cargo_profile_dir(Path::new(exe)), None, "{exe:?}");
+        }
+    }
+
+    /// The degenerate edges at the filesystem root, pinned as they behave
+    /// rather than as anyone would lay out a target dir: the arms take the
+    /// parent of `deps` / `build` as-is, so a `deps` or `build` at the root
+    /// yields the root (or the empty relative path) as the profile dir. The
+    /// addon presence check in `built_test_addon` is what then fails.
+    #[test]
+    fn cargo_profile_dir_at_the_root_yields_the_root() {
+        use std::path::Path;
+        assert_eq!(
+            cargo_profile_dir(Path::new("/deps/x")),
+            Some(Path::new("/"))
+        );
+        assert_eq!(cargo_profile_dir(Path::new("deps/x")), Some(Path::new("")));
+        assert_eq!(
+            cargo_profile_dir(Path::new("/build/p/h/out/x")),
+            Some(Path::new("/"))
+        );
+        assert_eq!(
+            cargo_profile_dir(Path::new("build/p/h/out/x")),
+            Some(Path::new(""))
+        );
+    }
+
+    /// Windows paths: `\` separators, a drive prefix, and the `/` that
+    /// Windows also accepts mixed in. `\` is not a separator elsewhere, so
+    /// this only runs on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn cargo_profile_dir_handles_windows_separators() {
+        use std::path::Path;
+        let cases = [
+            (
+                r"C:\t\debug\deps\oam_engine-0123abcd.exe",
+                Some(r"C:\t\debug"),
+            ),
+            (
+                r"C:\t\aarch64-pc-windows-msvc\release\build\oam_engine\0123abcd\out\oam_engine-0123abcd.exe",
+                Some(r"C:\t\aarch64-pc-windows-msvc\release"),
+            ),
+            (
+                r"C:\t\debug/build\oam_engine/0123abcd\out/oam_engine-0123abcd.exe",
+                Some(r"C:\t\debug"),
+            ),
+            (
+                r"\\?\C:\t\debug\deps\oam_engine-0123abcd.exe",
+                Some(r"\\?\C:\t\debug"),
+            ),
+            (r"C:\t\debug\out\oam_engine-0123abcd.exe", None),
+            (r"C:\deps\oam_engine-0123abcd.exe", Some(r"C:\")),
+            (r"C:\out\oam_engine-0123abcd.exe", None),
+        ];
+        for (exe, profile) in cases {
+            assert_eq!(
+                cargo_profile_dir(Path::new(exe)),
+                profile.map(Path::new),
+                "{exe}"
+            );
+        }
+    }
+
     /// Resolve the built test-addon cdylib, failing loudly if it is MISSING or
     /// STALE.
     ///
@@ -1906,20 +2071,7 @@ mod tests {
         // so the profile dir recovered here holds no addon and the presence
         // check below fails.
         let exe = std::env::current_exe().expect("the test binary knows its own path");
-        let profile_dir = exe.parent().and_then(|dir| {
-            if dir.file_name()? == "deps" {
-                return dir.parent();
-            }
-            if dir.file_name()? != "out" {
-                return None;
-            }
-            let build = dir.parent()?.parent()?.parent()?;
-            if build.file_name()? != "build" {
-                return None;
-            }
-            build.parent()
-        });
-        let Some(profile_dir) = profile_dir else {
+        let Some(profile_dir) = cargo_profile_dir(&exe) else {
             panic!(
                 "cannot find the cargo profile dir from the test binary at {} -- expected \
                  `<profile>/deps/<name>-<hash>` (cargo <= 1.99) or \

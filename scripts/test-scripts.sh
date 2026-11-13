@@ -1089,6 +1089,200 @@ if [ "$UNIT_AWK_BAD" = "1" ]; then :
 elif [ "$UNIT_AWK_N" -gt 0 ]; then pass
 else fail "no awk shim from the deps/ case to test with"; fi
 
+# fp_ref <dir-name> -- the decimal a dependent's json carries for that unit,
+# for a RAWDEPS entry written by hand.
+fp_ref(){ fp_hex "$1"; fp_dec "$REPLY"; }
+
+# Group keys, refinement keys and the hash conversion's padding -- one
+# fixture, one run, every case in packages of its own.
+reset_tree
+# (q) A slot's age is judged inside its TREE: target/release's gq lib (and
+# the build-script run it names) was last built 17 days before target/debug's
+# gq lib at another profile. Same package, kind and compile kind, one target
+# dir -- so a group key without the tree would age the release slot out.
+DEPS="0000000000070002" plant_unit release gq 0000000000070001 202607150000 lib-gq 1
+plant_unit release gq 0000000000070002 202607150000 $RBSB 0 gen.rs
+plant_unit debug gq 0000000000070011 0 lib-gq 2
+# (r) Refinement keys for a dependency the key cannot name by class. Each
+# pair is one slot, older first, and only the newer is a root:
+#   ri  names a hash no unit carries (its dependency was rebuilt in place)
+#   rq  names a unit whose json this script cannot read
+#   re  names a dependency with an empty name
+#   ra  names an empty-named and a named dependency, in opposite orders: an
+#       empty name must keep its place, or the names slide onto the wrong
+#       hashes and the two builds key apart
+fp_hex 0000000000080011; RQ_OWN="$REPLY"
+fp_ref 00000000000800ff; R_GONE="$REPLY"
+fp_ref 0000000000080001; R_IP="$REPLY"
+plant_unit debug ip 0000000000080001 0 lib-ip 1
+plant_unit debug rq 0000000000080011 0 '?' 0
+printf '%s' "$RQ_OWN" > "$ROOT/$UB/rq/0000000000080011/fingerprint/lib-odd"
+touch -t 202608011200 "$ROOT/$UB/rq/0000000000080011/fingerprint/lib-odd"
+DEPS="00000000000800ff" plant_unit debug ri 0000000000080021 0 lib-ri 1
+DEPS="00000000000800ff" plant_unit debug ri 0000000000080022 1 lib-ri 1
+DEPS="0000000000080011" plant_unit debug rqd 0000000000080031 0 lib-rqd 1
+DEPS="0000000000080011" plant_unit debug rqd 0000000000080032 1 lib-rqd 1
+RAWDEPS="[1,\"\",false,$R_GONE]" plant_unit debug re 0000000000080041 0 lib-re 1
+RAWDEPS="[1,\"\",false,$R_GONE]" plant_unit debug re 0000000000080042 1 lib-re 1
+RAWDEPS="[1,\"\",false,$R_GONE],[1,\"b\",false,$R_IP]" plant_unit debug ra 0000000000080051 0 lib-ra 1
+RAWDEPS="[1,\"b\",false,$R_IP],[1,\"\",false,$R_GONE]" plant_unit debug ra 0000000000080052 1 lib-ra 1
+# (s) A fingerprint hash whose high byte is 00 (a dir name starting ff, under
+# fp_hex's reverse-and-complement): the decimal is under 2^56, and its
+# little-endian hex still runs to 16 digits, the last two 00. The older unit
+# of lz's slot is the one lzd names.
+DEPS="ff00000000000001" plant_unit debug lzd 0000000000090001 2 lib-lzd 1
+plant_unit debug lz ff00000000000001 0 lib-lz 1
+plant_unit debug lz ff00000000000002 1 lib-lz 1
+REFINE_OUT="$(gc_out --keep 1)"
+
+it "units (q): a slot is aged against its own tree's group, not a sibling tree's"
+tree_survivors target/release/build/gq/0000000000070001 target/release/build/gq/0000000000070002 \
+               $UB/gq/0000000000070011
+
+it "units (r): an unresolvable, unreadable or empty-named dependency keys one slot: newest kept, superseded gone"
+tree_survivors $UB/ri/0000000000080022 '!'$UB/ri/0000000000080021 \
+               $UB/rqd/0000000000080032 '!'$UB/rqd/0000000000080031 $UB/rq/0000000000080011 \
+               $UB/re/0000000000080042 '!'$UB/re/0000000000080041 \
+               $UB/ra/0000000000080052 '!'$UB/ra/0000000000080051 $UB/ip/0000000000080001
+
+it "units (r): none of those dependents is counted unreadable, and the run says what it pruned"
+if grep -q 'cannot read' <<<"$REFINE_OUT"; then fail "a readable unit was counted odd: $REFINE_OUT"
+elif grep -q 'pruned 4 unreachable units under target ' <<<"$REFINE_OUT"; then pass
+else fail "output was: $REFINE_OUT"; fi
+
+it "units (s): a hash with a 00 high byte resolves -- lehex pads all eight bytes"
+fp_ref ff00000000000001
+if [ "$REPLY" -lt 72057594037927936 ]; then
+  tree_survivors $UB/lz/ff00000000000001 $UB/lz/ff00000000000002 $UB/lzd/0000000000090001
+else fail "fixture: ff00000000000001 -> $REPLY is not under 2^56"; fi
+
+# (t) The toolchain vote, per tree. target/debug's uplifts split 1:1 between
+# two rustcs: the one with the newer uplift (tv2) wins, so tv1's unit -- the
+# only one of its slot -- roots nothing and goes. target/release, in the same
+# target dir, has one uplift by the OTHER rustc, and keeps it: a vote over the
+# whole target dir would make rustc 1 the majority and take tv2 instead.
+reset_tree; LINK_FAILED=0
+RUSTC=1 plant_unit debug tv1 00000000000a1001 0 bin-tv1 3 tv1.exe
+uplift $UB/tv1/00000000000a1001/out/tv1.exe target/debug/tv1.exe
+RUSTC=2 plant_unit debug tv2 00000000000a1002 1 bin-tv2 3 tv2.exe
+uplift $UB/tv2/00000000000a1002/out/tv2.exe target/debug/tv2.exe
+RUSTC=1 plant_unit release tr1 00000000000a1011 2 bin-tr1 3 tr1.exe
+uplift target/release/build/tr1/00000000000a1011/out/tr1.exe target/release/tr1.exe
+VOTE_OUT="$(gc_out --keep 1)"
+if [ "$LINK_FAILED" = "1" ]; then
+  it "units (t): a 1:1 toolchain split goes to the newest uplift, and each tree votes alone"
+  skip "this filesystem would not hardlink a fixture file"
+else
+  it "units (t): a 1:1 toolchain split goes to the newest uplift's rustc; the older uplift's unit goes"
+  tree_survivors '!'$UB/tv1/00000000000a1001 $UB/tv2/00000000000a1002 target/debug/tv1.exe target/debug/tv2.exe
+
+  it "units (t): each tree of a target dir votes its own toolchain, and keeps its winner's units"
+  tree_survivors target/release/build/tr1/00000000000a1011 $UB/tv2/00000000000a1002 target/release/tr1.exe
+
+  it "units (t): the tally names one aged-out slot and one uplift by another toolchain"
+  if grep -q 'pruned 1 unreachable units under target ' <<<"$VOTE_OUT" \
+     && grep -q 'rooted nothing from 1 slots and 1 uplifted units under target ' <<<"$VOTE_OUT"; then pass
+  else fail "output was: $VOTE_OUT"; fi
+fi
+
+# (u) Deletes that do not happen. A held file survives rm -rf on Windows, and
+# both reclaim reports count only what is really gone. rm is shimmed to
+# refuse one superseded unit (2MB) and the old .fingerprint/ dir; the dry run
+# counts both as the plan, the real run leaves them, keeps them out of the
+# reclaimed counts and says how many it could not take.
+RMSHIM="$SUITE_TMP/shim-rm-held"
+mkdir -p "$RMSHIM"
+{
+  echo '#!/bin/sh'
+  echo 'for a in "$@"; do case "$a" in */build/hd/00000000000000a2|*/.fingerprint) exit 1 ;; esac; done'
+  printf 'exec "%s" "$@"\n' "$(command -v rm)"
+} > "$RMSHIM/rm"
+chmod +x "$RMSHIM/rm"
+reset_tree
+plant_unit debug hd 00000000000000a1 0 lib-hd 1
+plant_unit debug hd 00000000000000a2 1 lib-hd 1
+plant_unit debug hd 00000000000000a3 2 lib-hd 1
+head -c 2097152 /dev/zero > "$ROOT/$UB/hd/00000000000000a2/out/big.rlib"
+touch -t 202608011201 "$ROOT/$UB/hd/00000000000000a2/out/big.rlib"
+plant target/debug/deps 0 a-0123456789abcdef.exe
+plant target/debug/.fingerprint/a-0123456789abcdef 0 lib-a
+HELD_DRY="$( cd "$ROOT" && PATH="$RMSHIM:$PATH" bash scripts/gc-target.sh --dry-run --keep 1 2>&1 )"
+HELD_OUT="$( cd "$ROOT" && PATH="$RMSHIM:$PATH" bash scripts/gc-target.sh --keep 1 2>&1 )"
+
+it "held deletes: the unit and the old-layout dir rm could not take are still there"
+tree_survivors $UB/hd/00000000000000a2 target/debug/.fingerprint $UB/hd/00000000000000a3 \
+               '!'$UB/hd/00000000000000a1 '!target/debug/deps'
+
+it "held deletes: the reclaimed counts leave them out, and the warnings name them (units with their MB)"
+HELD_BAD=""
+for want in 'pruned 1 unreachable units under target (0MB)' \
+            '1 unreachable units under target could not be fully deleted (2MB left in place)' \
+            'removed 1 pre-1.100 layout dirs from target/debug' \
+            '1 pre-1.100 layout dirs in target/debug could not be fully deleted'; do
+  grep -qF "$want" <<<"$HELD_OUT" || HELD_BAD="$HELD_BAD [$want]"
+done
+if [ -z "$HELD_BAD" ]; then pass; else fail "missing:$HELD_BAD -- output was: $HELD_OUT"; fi
+
+it "held deletes: --dry-run still counts them in the plan"
+if grep -qF 'would prune 2 unreachable units under target (2MB)' <<<"$HELD_DRY" \
+   && grep -qF 'would remove 2 pre-1.100 layout dirs from target/debug' <<<"$HELD_DRY" \
+   && ! grep -q 'could not be fully deleted' <<<"$HELD_DRY"; then pass
+else fail "dry run reported: $HELD_DRY"; fi
+
+# (v) The unit walk's awk dying: no tally line comes back. That must read as
+# "nothing pruned there", loudly -- never as a clean prune -- and the rest of
+# the run (incremental/) still goes ahead. awk is shimmed to die for the unit
+# walk alone (the only awk handed the tree list); du's and the deps/ prune's
+# run as usual.
+NOTALLY="$SUITE_TMP/shim-awk-notally"
+mkdir -p "$NOTALLY"
+{
+  echo '#!/bin/sh'
+  echo 'for a in "$@"; do case "$a" in trees=*) exit 2 ;; esac; done'
+  printf 'exec "%s" "$@"\n' "$(command -v awk)"
+} > "$NOTALLY/awk"
+chmod +x "$NOTALLY/awk"
+reset_tree
+plant_unit debug a 00000000000000a1 0 lib-a 1
+plant_unit debug a 00000000000000a2 1 lib-a 1
+mkdir -p "$ROOT/target/debug/incremental"
+echo cache > "$ROOT/target/debug/incremental/dep-graph.bin"
+it "units: a unit walk that reports no tally warns, prunes nothing there, still reclaims incremental/, exits 0"
+NOTALLY_OUT="$( cd "$ROOT" && PATH="$NOTALLY:$PATH" bash scripts/gc-target.sh --keep 1 2>&1; echo "rc=$?" )"
+if grep -q 'the unit walk under target reported no tally -- nothing was pruned there' <<<"$NOTALLY_OUT" \
+   && grep -q '^rc=0$' <<<"$NOTALLY_OUT"; then
+  tree_survivors $UB/a/00000000000000a1 $UB/a/00000000000000a2 '!target/debug/incremental'
+else fail "output was: $NOTALLY_OUT"; fi
+
+# (w) The migration's count, planned and done: deps/, .fingerprint/ and two
+# old build-script dirs (one of them empty) -- four -- and never the package
+# dir whose name looks like one but holds units.
+reset_tree
+plant_unit debug a 00000000000000a1 0 lib-a 1
+plant target/debug/deps 0 a-0123456789abcdef.exe
+plant target/debug/.fingerprint/a-0123456789abcdef 0 lib-a
+plant target/debug/build/a-0123456789abcdef 0 build-script-build.exe
+mkdir -p "$ROOT/target/debug/build/b-fedcba9876543210"
+plant_unit debug z-0123456789abcdef 00000000000000f1 0 lib-z 1
+MIG_DRY="$(gc_out --dry-run --keep 1)"
+MIG_DRY_TREE=intact
+for f in target/debug/deps target/debug/.fingerprint $UB/a-0123456789abcdef \
+         $UB/b-fedcba9876543210 $UB/z-0123456789abcdef/00000000000000f1; do
+  [ -e "$ROOT/$f" ] || MIG_DRY_TREE="$MIG_DRY_TREE, $f missing"
+done
+MIG_OUT="$(gc_out --keep 1)"
+
+it "migration: --dry-run names the exact count it would remove, and removes none"
+if grep -q 'would remove 4 pre-1.100 layout dirs from target/debug ' <<<"$MIG_DRY" \
+   && [ "$MIG_DRY_TREE" = "intact" ]; then pass
+else fail "dry run: $MIG_DRY -- tree: $MIG_DRY_TREE"; fi
+
+it "migration: the real run removes that same count"
+if grep -q 'removed 4 pre-1.100 layout dirs from target/debug ' <<<"$MIG_OUT"; then
+  tree_survivors '!target/debug/deps' '!target/debug/.fingerprint' '!'$UB/a-0123456789abcdef \
+                 '!'$UB/b-fedcba9876543210 $UB/z-0123456789abcdef/00000000000000f1
+else fail "output was: $MIG_OUT"; fi
+
 # =============================================================================
 group "crt-linkage.sh -- which build script the gate scans, both cargo layouts"
 # =============================================================================
@@ -1211,6 +1405,129 @@ eq "${PARK_HELD//$'\n'/ }" "release/build/oam_cli/00000000000000b2/out/oam.exe r
 it "no script parks deps/oam.exe directly any more"
 DIRECT="$(grep -nE '(oam_park_file|free_locked_binary|oam_reap_parked) +target/[^ ]*deps' scripts/*.sh || true)"
 if [ -z "$DIRECT" ]; then pass; else fail "direct deps/ park or reap left: $DIRECT"; fi
+
+# A fresh clone, or a profile never built: every helper the release scripts
+# call under `set -euo pipefail` must be a silent no-op there, not the end of
+# the run. A missing dir and an empty one, each helper as a bare statement --
+# the shape errexit applies to.
+it "build-locks: on a missing or empty profile dir every helper returns 0, prints nothing and creates nothing"
+mkdir -p "$SUITE_TMP/park-fresh/empty"
+FRESH_OUT="$( cd "$SUITE_TMP/park-fresh" && bash -c '
+  set -euo pipefail
+  . "$1"
+  for d in absent empty; do
+    oam_bin_stages "$d" oam_cli oam.exe
+    oam_reap_bin "$d" oam_cli
+    oam_park_bin "$d" oam_cli oam.exe
+  done
+  echo done' _ "$REPO_DIR/scripts/lib/build-locks.sh" 2>&1; echo "rc=$?" )"
+FRESH_LEFT="$(cd "$SUITE_TMP/park-fresh" && find . | sort | tr '\n' ' ')"
+if [ "${FRESH_OUT//$'\n'/ }" = "done rc=0" ] && [ "$FRESH_LEFT" = ". ./empty " ]; then pass
+else fail "output: ${FRESH_OUT//$'\n'/ } -- tree: $FRESH_LEFT"; fi
+
+# The uplifted binary itself held (the usual case: a live typed-cli session
+# mid-launch). oam_park_bin must name it, return 1, and stop there -- parking
+# the stages after a failed uplift park would cost a relink for a build that
+# cannot link anyway. A real holder, not a shim: a native process with the
+# file open without FILE_SHARE_DELETE, which is what refuses a rename.
+it "oam_park_bin names a held <profile>/oam.exe, returns 1, and touches no stage"
+case "$(uname -s 2>/dev/null)" in MINGW* | MSYS* | CYGWIN*) PH_WIN=1 ;; *) PH_WIN=0 ;; esac
+if [ "$PH_WIN" = "1" ] && command -v powershell.exe >/dev/null 2>&1; then
+  PH="$SUITE_TMP/park-held"
+  mkdir -p "$PH/release/deps" "$PH/release/build/oam_cli/00000000000000c1/out"
+  for f in release/oam.exe release/deps/oam.exe release/build/oam_cli/00000000000000c1/out/oam.exe; do
+    echo image > "$PH/$f"
+  done
+  # The holder opens the file, says so, and holds it until told to stop (a
+  # minute at most, so a dead suite cannot leave it behind for long).
+  powershell.exe -NoProfile -NonInteractive -Command "\$ErrorActionPreference = 'Stop'; \$f = [System.IO.File]::Open('$(cygpath -w "$PH/release/oam.exe")', 'Open', 'Read', 'Read'); [System.IO.File]::WriteAllText('$(cygpath -w "$PH/held")', '1'); for (\$i = 0; \$i -lt 600 -and -not (Test-Path '$(cygpath -w "$PH/release-it")'); \$i++) { Start-Sleep -Milliseconds 100 }; \$f.Close()" >/dev/null 2>&1 &
+  PH_PID=$!
+  for _ in $(seq 1 300); do [ -e "$PH/held" ] && break; sleep 0.1; done
+  if [ -e "$PH/held" ]; then
+    PH_OUT="$( cd "$PH" && . "$REPO_DIR/scripts/lib/build-locks.sh" && oam_park_bin release oam_cli oam.exe; echo "rc=$?" )"
+    PH_LEFT="$(cd "$PH/release" && find . -type f | sort | tr '\n' ' ')"
+    echo > "$PH/release-it"; wait "$PH_PID" 2>/dev/null
+    if [ "${PH_OUT//$'\n'/ }" = "release/oam.exe rc=1" ] \
+       && [ "$PH_LEFT" = "./build/oam_cli/00000000000000c1/out/oam.exe ./deps/oam.exe ./oam.exe " ]; then pass
+    else fail "output: ${PH_OUT//$'\n'/ } -- files: $PH_LEFT"; fi
+  else
+    kill "$PH_PID" 2>/dev/null; wait "$PH_PID" 2>/dev/null
+    fail "the powershell holder never opened release/oam.exe"
+  fi
+else
+  skip "needs Windows: only there does an open handle refuse a rename"
+fi
+
+# release-local.sh's free_locked_bin: free_locked_binary dies through fail()
+# (exit) on a path it cannot free, and that must end the RELEASE rather than
+# let it go on to link against a held stage. This pins the abort itself, not
+# the loop's shape: at today's call sites a piped `oam_bin_stages ... | while`
+# would end the release too (set -e + pipefail fail the pipeline), so only the
+# outcome is asserted. The function is sliced out verbatim; the stub fails,
+# like fail(), on the 1.100 stage alone.
+it "release-local.sh free_locked_bin: a stage that cannot be freed ends the release itself"
+FLB_FN="$(sed -n '/^free_locked_bin() {/,/^}/p' scripts/release-local.sh)"
+FLB="$SUITE_TMP/flb"
+mkdir -p "$FLB/release/deps" "$FLB/release/build/oam_cli/00000000000000d1/out"
+for f in release/oam.exe release/deps/oam.exe release/build/oam_cli/00000000000000d1/out/oam.exe; do
+  echo image > "$FLB/$f"
+done
+FLB_OUT="$( cd "$FLB" && bash -c '
+  set -euo pipefail
+  . "$1"
+  eval "$2"
+  free_locked_binary(){
+    echo "free $1"
+    case "$1" in */out/oam.exe) echo "fail: could not free $1"; exit 1 ;; esac
+    return 0
+  }
+  free_locked_bin release
+  echo "the release carried on"' _ "$REPO_DIR/scripts/lib/build-locks.sh" "$FLB_FN" 2>&1; echo "rc=$?" )"
+FLB_WANT="free release/oam.exe free release/deps/oam.exe free release/build/oam_cli/00000000000000d1/out/oam.exe fail: could not free release/build/oam_cli/00000000000000d1/out/oam.exe rc=1"
+if [ -z "$FLB_FN" ]; then fail "free_locked_bin() not found in release-local.sh"
+else eq "${FLB_OUT//$'\n'/ }" "$FLB_WANT"; fi
+
+# Every park/reap call site passes a cargo PACKAGE name -- the glob is
+# build/<pkg>/*/out -- and the package whose [[bin]] is oam is the one that
+# links oam.exe. A typo, or a renamed package, parks and reaps nothing under
+# 1.100 and fails nowhere: the stage stays held and the link dies as before.
+# park_pkg_sites <repo-dir> -- prints each call site whose package argument is
+# not that package, or a line saying why the check could not run.
+park_pkg_sites(){
+  local repo="$1" want n
+  want="$(awk '
+    FNR == 1 { sect = ""; pkg = "" }
+    /^\[/ { sect = $0; next }
+    sect == "[package]" && /^name *=/ { v = $0; sub(/^name *= *"/, "", v); sub(/".*/, "", v); pkg = v }
+    sect == "[[bin]]" && /^name *= *"oam"/ { print pkg }
+  ' "$repo"/crates/*/Cargo.toml | sort -u)"
+  n="$(printf '%s' "$want" | grep -c .)"
+  if [ "$n" != 1 ]; then echo "expected one crate with [[bin]] name = \"oam\", found $n: ${want//$'\n'/ }"; return 0; fi
+  local f line pkg sites=0
+  for f in "$repo"/scripts/*.sh "$repo"/scripts/lib/*.sh; do
+    case "$f" in */lib/build-locks.sh | */test-scripts.sh) continue ;; esac
+    while IFS= read -r line; do
+      pkg="$(awk '{ print $3 }' <<<"$line")"; pkg="${pkg//\"/}"
+      sites=$((sites + 1))
+      [ "$pkg" = "$want" ] || echo "${f#"$repo"/}: '$line' passes '$pkg', the package is '$want'"
+    done < <(sed 's/#.*//' "$f" | grep -oE 'oam_(park_bin|reap_bin|bin_stages)[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:])]+')
+  done
+  [ "$sites" -gt 0 ] || echo "no park/reap call site found under $repo/scripts"
+  # A call whose package is not on its own line (`oam_park_bin \` with the
+  # arguments continued below) never matches the grep above and would slip
+  # past unchecked: refuse any line that names one of the functions as a call
+  # without the two arguments that grep reads.
+  for f in "$repo"/scripts/*.sh "$repo"/scripts/lib/*.sh; do
+    case "$f" in */lib/build-locks.sh | */test-scripts.sh) continue ;; esac
+    sed 's/#.*//' "$f" | grep -nE '(^|[^[:alnum:]_])oam_(park_bin|reap_bin|bin_stages)([[:space:]]|$)' \
+      | grep -vE 'oam_(park_bin|reap_bin|bin_stages)[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:])]+' \
+      | sed "s|^|${f#"$repo"/}: call site the check cannot read: |" || true
+  done
+  return 0
+}
+it "every park/reap call site passes the package whose [[bin]] is oam"
+PKG_BAD="$(park_pkg_sites "$REPO_DIR")"
+if [ -z "$PKG_BAD" ]; then pass; else fail "$PKG_BAD"; fi
 
 # =============================================================================
 group "build-remote.sh -- gc dispatch"

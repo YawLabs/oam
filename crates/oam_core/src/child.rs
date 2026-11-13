@@ -1808,6 +1808,87 @@ mod spawn_window_tests {
         parse(&output.stdout)
     }
 
+    /// The raw CreateProcessW path (`child_win::spawn_extra_with`), which
+    /// builds its own STARTUPINFOEXW instead of going through std's
+    /// `Command`: an argv0, or an extra stdio slot past fd 2, routes a spawn
+    /// there. Driven through `spawn_sync_argv0`, that path's blocking drain.
+    fn probe_raw(windows_hide: bool, argv0: Option<&str>, extra_fd: bool) -> Probe {
+        use crate::child_win::{StdioFd, spawn_sync_argv0};
+        let (exe, args) = probe_command();
+        let env = probe_env();
+        let mut stdio = vec![StdioFd::ChildRead, StdioFd::ChildWrite, StdioFd::ChildWrite];
+        if extra_fd {
+            stdio.push(StdioFd::ChildWrite);
+        }
+        let result = spawn_sync_argv0(
+            &exe,
+            &args,
+            None,
+            Some(&env),
+            None,
+            &stdio,
+            false,
+            windows_hide,
+            argv0,
+            120_000,
+            1 << 20,
+        );
+        if let Some(e) = &result.error {
+            panic!("spawn_sync_argv0 failed: {} {}", e.code, e.message);
+        }
+        assert_eq!(
+            result.status,
+            Some(0),
+            "probe child failed:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        parse(&result.stdout)
+    }
+
+    #[test]
+    fn spawn_extra_with_an_argv0_starts_a_hidden_child_with_sw_hide_inside_the_job() {
+        if in_probe_child() {
+            return;
+        }
+        let probe = probe_raw(true, Some("oam-probe-argv0"), false);
+        assert!(probe.use_show_window, "{probe:?}");
+        assert_eq!(probe.show_window, SW_HIDE, "{probe:?}");
+        assert!(probe.in_oam_job(), "{probe:?}");
+    }
+
+    #[test]
+    fn spawn_extra_with_an_argv0_starts_a_shown_child_with_sw_showdefault_inside_the_job() {
+        if in_probe_child() {
+            return;
+        }
+        let probe = probe_raw(false, Some("oam-probe-argv0"), false);
+        assert!(probe.use_show_window, "{probe:?}");
+        assert_eq!(probe.show_window, SW_SHOWDEFAULT, "{probe:?}");
+        assert!(probe.in_oam_job(), "{probe:?}");
+    }
+
+    #[test]
+    fn spawn_extra_with_an_extra_fd_starts_a_hidden_child_with_sw_hide() {
+        if in_probe_child() {
+            return;
+        }
+        let probe = probe_raw(true, None, true);
+        assert!(probe.use_show_window, "{probe:?}");
+        assert_eq!(probe.show_window, SW_HIDE, "{probe:?}");
+        assert!(probe.in_oam_job(), "{probe:?}");
+    }
+
+    #[test]
+    fn spawn_extra_with_an_extra_fd_starts_a_shown_child_with_sw_showdefault() {
+        if in_probe_child() {
+            return;
+        }
+        let probe = probe_raw(false, None, true);
+        assert!(probe.use_show_window, "{probe:?}");
+        assert_eq!(probe.show_window, SW_SHOWDEFAULT, "{probe:?}");
+        assert!(probe.in_oam_job(), "{probe:?}");
+    }
+
     #[test]
     fn spawn_sync_starts_a_hidden_child_with_sw_hide_inside_the_job() {
         if in_probe_child() {
@@ -1860,6 +1941,46 @@ mod spawn_window_tests {
             return;
         }
         let probe = probe_async(false).await;
+        assert!(probe.use_show_window, "{probe:?}");
+        assert_eq!(probe.show_window, SW_SHOWDEFAULT, "{probe:?}");
+    }
+
+    /// A cluster worker gets libuv's show state for a child without
+    /// windowsHide (SW_SHOWDEFAULT under STARTF_USESHOWWINDOW). Built by the
+    /// same `worker_command` cluster_fork uses, aimed at this test binary:
+    /// the probe's libtest arguments stand where `run` goes, and the probe's
+    /// test name where the script path goes. Only stdout/stderr are swapped
+    /// for pipes, to read the report back.
+    #[tokio::test]
+    async fn a_cluster_worker_starts_with_sw_showdefault() {
+        if in_probe_child() {
+            return;
+        }
+        let (exe, _) = probe_command();
+        let mut cmd = crate::cluster::worker_command(
+            &exe,
+            &["--exact", "--nocapture", "--test-threads=1"],
+            PROBE_TEST,
+            "1",
+            &probe_env(),
+        );
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let child = cmd.spawn().expect("spawn the worker command");
+        // Bounded as the other async probes are; kill_on_drop reaps it.
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            child.wait_with_output(),
+        )
+        .await
+        .expect("probe worker did not exit within 120 s")
+        .expect("wait_with_output");
+        assert!(
+            output.status.success(),
+            "probe worker failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let probe = parse(&output.stdout);
         assert!(probe.use_show_window, "{probe:?}");
         assert_eq!(probe.show_window, SW_SHOWDEFAULT, "{probe:?}");
     }

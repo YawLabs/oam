@@ -644,6 +644,15 @@ fn parse_tasklist_rss_kb(text: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// The `VmRSS` figure, in kB, from the text of `/proc/<pid>/status`. The one
+/// parse `process_rss_bytes` uses on Linux, split out (and compiled under
+/// `test` on every host) so the tests exercise the production code.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_status_vmrss_kb(status: &str) -> Option<u64> {
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
 /// Read RSS of a running process in bytes. Best-effort; returns None on failure.
 fn process_rss_bytes(pid: u32) -> Option<u64> {
     #[cfg(target_os = "windows")]
@@ -662,13 +671,8 @@ fn process_rss_bytes(pid: u32) -> Option<u64> {
     {
         // /proc/<pid>/status VmRSS line: "VmRSS:   12345 kB"
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-        for line in status.lines() {
-            if line.starts_with("VmRSS:") {
-                let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-                return Some(kb * 1024);
-            }
-        }
-        None
+        let kb = parse_proc_status_vmrss_kb(&status)?;
+        Some(kb * 1024)
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
@@ -2711,6 +2715,58 @@ mod rss_parse_tests {
         let gone = "INFO: No tasks are running which match the specified criteria.";
         assert_eq!(parse_tasklist_rss_kb(gone), None);
         assert_eq!(parse_tasklist_rss_kb(""), None);
+    }
+}
+
+/// `process_rss_bytes` against a live PID (this test process), so each OS leg
+/// runs its own arm end to end: tasklist on Windows, /proc VmRSS on Linux,
+/// sysinfo on macOS. Plus the Linux arm's pure parse, which compiles under
+/// `test` on every host.
+#[cfg(test)]
+mod rss_live_tests {
+    use super::{parse_proc_status_vmrss_kb, process_rss_bytes};
+
+    #[test]
+    fn own_pid_reports_a_byte_count_in_a_sane_range() {
+        let bytes = process_rss_bytes(std::process::id())
+            .expect("RSS of the running test process must be readable");
+        // A Rust test binary with std, serde_json and the test harness loaded
+        // holds several MiB resident on every OS. The tasklist and VmRSS arms
+        // both report kB; a dropped `* 1024` would land this in the kB range
+        // (a few thousand to tens of thousands), far under 2 MiB.
+        const MIB: u64 = 1024 * 1024;
+        assert!(
+            bytes >= 2 * MIB,
+            "RSS {bytes} bytes is implausibly small for a live process -- kB reported as bytes?"
+        );
+        // Ceiling: this process holds roughly 7-50 MiB resident, so a `* 1024`
+        // applied twice (or to a figure already in bytes) reads as at least
+        // 1 GiB -- measured: the double-scaled mutant reported ~7.4 GiB.
+        assert!(
+            bytes < 1024 * MIB,
+            "RSS {bytes} bytes is implausibly large for a test process -- unit scaled twice?"
+        );
+    }
+
+    #[test]
+    fn vmrss_parse_reads_the_kb_field() {
+        // Shape of a real /proc/<pid>/status excerpt: VmRSS is not the first
+        // Vm* line, and VmHWM (peak) precedes it with a larger value.
+        let status = "Name:\tcargo\nUmask:\t0022\nState:\tS (sleeping)\n\
+                      VmPeak:\t  123456 kB\nVmSize:\t  120000 kB\n\
+                      VmHWM:\t   30000 kB\nVmRSS:\t   12345 kB\nRssAnon:\t    8000 kB\n";
+        assert_eq!(parse_proc_status_vmrss_kb(status), Some(12345));
+    }
+
+    #[test]
+    fn vmrss_parse_without_the_line_yields_none() {
+        // Kernel threads (and zombies) carry no VmRSS line at all.
+        let kthread = "Name:\tkworker/0:1\nState:\tI (idle)\nThreads:\t1\n";
+        assert_eq!(parse_proc_status_vmrss_kb(kthread), None);
+        assert_eq!(parse_proc_status_vmrss_kb(""), None);
+        // A malformed value must not turn into a number.
+        assert_eq!(parse_proc_status_vmrss_kb("VmRSS:\n"), None);
+        assert_eq!(parse_proc_status_vmrss_kb("VmRSS:\t abc kB\n"), None);
     }
 }
 

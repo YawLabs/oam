@@ -15,3 +15,15 @@ serde_json = { workspace = true }
 # The crate is `#![forbid(unsafe_code)]`, so the coverage lints are moot --
 # but a stray `// Safety:` prose comment still trips this one, and did.
 unnecessary_safety_comment = "deny"
+
+[lints.cargo]
+# A dependency no target of this crate uses fails the gate on every leg.
+# `-D warnings` after `--` reaches rustc and clippy only; cargo's own lints
+# are not rustc lints, so warn-by-default `unused_dependencies` (cargo 1.100)
+# would otherwise only print. Per-package, not `[workspace.lints]`: every
+# member has its own `[lints.clippy]`, which `lints.workspace = true` cannot
+# be combined with. vendor/ crates are excluded from the workspace and keep
+# their upstream manifests. Measured limits on 1.100: dev-dependencies are
+# not checked, and a direct dependency that is also reachable through another
+# dependency is not reported.
+unused_dependencies = "deny"

@@ -16,38 +16,7 @@ pub async fn cluster_fork(
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "oam".to_string());
-
-    let mut cmd = tokio::process::Command::new(&exe);
-    cmd.arg("run");
-    cmd.arg(&script_path);
-    // node's cluster.fork hands the worker {...process.env, ...env}, and that
-    // is its whole environment: the JS layer builds it (childProcessEnv), so
-    // nothing of this process's own environment is added here.
-    cmd.env_clear();
-    for (k, v) in &env_pairs {
-        cmd.env(k, v);
-    }
-    cmd.env(WORKER_ID_VAR, &worker_id);
-    cmd.stdout(std::process::Stdio::inherit());
-    cmd.stderr(std::process::Stdio::inherit());
-    // Reap workers if the primary's runtime drops -- Node leaves orphans, but
-    // here a leaked worker would outlive its only manager (and wedge tests).
-    cmd.kill_on_drop(true);
-
-    // The flags every other child gets (libuv's table): not detached, no
-    // windowsHide, stdio inherited. A worker shares this process's console;
-    // CREATE_NO_WINDOW is added only when this process has none. Setting it
-    // unconditionally started a fresh hidden conhost for every worker while
-    // its stdio slots were inherited, the combination libuv rules out.
-    // And libuv's show state for a child without windowsHide (SW_SHOWDEFAULT
-    // under STARTF_USESHOWWINDOW), as spawn_child gives every other child.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(super::child::windows_creation_flags(false, false, true));
-        cmd.as_std_mut()
-            .show_window(super::child_win::show_window_for(false));
-    }
+    let mut cmd = worker_command(&exe, &["run"], &script_path, &worker_id, &env_pairs);
 
     match cmd.spawn() {
         Ok(child) => {
@@ -71,6 +40,53 @@ pub async fn cluster_fork(
         }
         Err(e) => OpOutcome::Failed(format!("cluster fork: {e}")),
     }
+}
+
+/// The worker's command: `<exe> <leading_args...> <script_path>` with the
+/// worker's whole environment, inherited stdout/stderr, kill-on-drop, and on
+/// Windows libuv's creation flags and show state. `cluster_fork` passes
+/// `["run"]`; split out so a test can aim the SAME construction at a probe
+/// binary (a unit test cannot run `<test binary> run <script>`: libtest would
+/// read `run` as a test-name filter).
+pub(crate) fn worker_command(
+    exe: &str,
+    leading_args: &[&str],
+    script_path: &str,
+    worker_id: &str,
+    env_pairs: &[(String, String)],
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.args(leading_args);
+    cmd.arg(script_path);
+    // node's cluster.fork hands the worker {...process.env, ...env}, and that
+    // is its whole environment: the JS layer builds it (childProcessEnv), so
+    // nothing of this process's own environment is added here.
+    cmd.env_clear();
+    for (k, v) in env_pairs {
+        cmd.env(k, v);
+    }
+    cmd.env(WORKER_ID_VAR, worker_id);
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
+    // Reap workers if the primary's runtime drops -- Node leaves orphans, but
+    // here a leaked worker would outlive its only manager (and wedge tests).
+    cmd.kill_on_drop(true);
+
+    // The flags every other child gets (libuv's table): not detached, no
+    // windowsHide, stdio inherited. A worker shares this process's console;
+    // CREATE_NO_WINDOW is added only when this process has none. Setting it
+    // unconditionally started a fresh hidden conhost for every worker while
+    // its stdio slots were inherited, the combination libuv rules out.
+    // And libuv's show state for a child without windowsHide (SW_SHOWDEFAULT
+    // under STARTF_USESHOWWINDOW), as spawn_child gives every other child.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(super::child::windows_creation_flags(false, false, true));
+        cmd.as_std_mut()
+            .show_window(super::child_win::show_window_for(false));
+    }
+    cmd
 }
 
 pub async fn cluster_worker_wait(children: ChildRegistry, handle: u64) -> OpOutcome {
