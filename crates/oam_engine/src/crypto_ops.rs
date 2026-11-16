@@ -1606,15 +1606,13 @@ fn crypto_sign_ec(
     key_pem: &str,
     der_encoding: bool,
 ) -> Result<Vec<u8>, String> {
-    let der = pem_to_der(key_pem)?;
     let label = pem_label(key_pem);
-    match label {
-        "PRIVATE KEY" => {}
-        "EC PRIVATE KEY" => {
-            return Err("SEC1 EC private key format not supported; use PKCS#8".into());
-        }
+    // A SEC1 key (`EC PRIVATE KEY`, what ssh2 makes of an OpenSSH ECDSA key)
+    // is re-encoded as PKCS#8, the one form ring reads.
+    let der = match label {
+        "PRIVATE KEY" | "EC PRIVATE KEY" => ec_private_pkcs8_der_from_pem(key_pem)?,
         _ => return Err(format!("unsupported EC PEM label: '{label}'")),
-    }
+    };
     let hash =
         EcHash::from_algo(algo).ok_or_else(|| format!("unsupported ECDSA algorithm: '{algo}'"))?;
     let p256_alg: &'static ring_sig::EcdsaSigningAlgorithm = if der_encoding {
@@ -1841,6 +1839,7 @@ pub(crate) fn op_crypto_generate_keypair(
     };
     let result = match key_type.as_str() {
         "ed25519" => crypto_generate_ed25519(),
+        "x25519" => crypto_generate_x25519(),
         "rsa" => {
             // No default: node requires modulusLength, and a missing one
             // (NaN, cast to 0) is refused by crypto_generate_rsa's range check.
@@ -1871,7 +1870,7 @@ pub(crate) fn op_crypto_generate_keypair(
         }
         _ => {
             let msg = format!(
-                "generateKeyPairSync: unsupported type '{}' (oam supports rsa, ec, ed25519)",
+                "generateKeyPairSync: unsupported type '{}' (oam supports rsa, ec, ed25519, x25519)",
                 key_type
             );
             crate::node_ops::throw_type_error(scope, &msg);
@@ -2790,6 +2789,449 @@ macro_rules! impl_ec_keygen {
 impl_ec_keygen!(p256, crypto_generate_ec_p256);
 impl_ec_keygen!(p384, crypto_generate_ec_p384);
 
+// ===================================================== OKP keys, SEC1, stateless DH
+// #489: X25519 key pairs, `crypto.diffieHellman({ privateKey, publicKey })`
+// over X25519 and P-256 / P-384 keys, the public half of an Ed25519 / X25519
+// private key, and SEC1 (`EC PRIVATE KEY`) private keys wherever a PKCS#8
+// EC key is read. Every structure below arrives from the caller (a PEM or
+// DER key, a peer's public key in an SSH key exchange), so each length and
+// tag is checked before use and a malformed key is an `Err`, never a panic.
+
+/// OID content octets (the bytes after `06 len`).
+const OID_X25519: &[u8] = &[0x2b, 0x65, 0x6e];
+const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
+const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+const OID_P256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+const OID_P384: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
+const OID_P521: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x23];
+
+/// The DER of an X25519 PKCS#8 v1 private key and SPKI public key, up to the
+/// 32 key bytes: the templates OpenSSL (and so node) writes.
+const X25519_PKCS8_PREFIX: &[u8] = &[
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x04, 0x22, 0x04, 0x20,
+];
+const X25519_SPKI_PREFIX: &[u8] = &[
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0x00,
+];
+
+/// OpenSSL's text for the two derivation failures node reports from
+/// `diffieHellman`; js/node_compat.js (`rsaOpError`) gives them node's
+/// `ERR_OSSL_*` code, `library` and `reason`.
+const DH_ERR_MISMATCHING_DOMAIN_PARAMETERS: &str =
+    "error:1C8000CB:Provider routines::mismatching domain parameters";
+const DH_ERR_FAILED_DURING_DERIVATION: &str =
+    "error:1C8000A4:Provider routines::failed during derivation";
+
+/// One DER element of the expected `tag`: `(body, rest)`.
+fn der_take<'a>(data: &'a [u8], tag: u8, what: &str) -> Result<(&'a [u8], &'a [u8]), String> {
+    match data.first() {
+        Some(&t) if t == tag => {}
+        _ => return Err(format!("ASN.1: expected {what}")),
+    }
+    let (rest, body) = parse_asn1_element(data)?;
+    Ok((body, rest))
+}
+
+/// The parts of a `PrivateKeyInfo` (PKCS#8 v1, or v2 / RFC 5958, whose
+/// trailing attributes and public key are not read).
+struct Pkcs8Parts<'a> {
+    algorithm: &'a [u8],
+    parameters: Option<&'a [u8]>,
+    private_key: &'a [u8],
+}
+
+fn parse_pkcs8(der: &[u8]) -> Result<Pkcs8Parts<'_>, String> {
+    let (body, _) = der_take(der, 0x30, "PrivateKeyInfo")?;
+    let (version, rest) = der_take(body, 0x02, "PKCS#8 version")?;
+    if version != [0] && version != [1] {
+        return Err("PKCS#8: unsupported version".into());
+    }
+    let (alg, rest) = der_take(rest, 0x30, "PKCS#8 algorithm")?;
+    let (algorithm, alg_rest) = der_take(alg, 0x06, "PKCS#8 algorithm OID")?;
+    let parameters = match alg_rest.first() {
+        Some(0x06) => Some(der_take(alg_rest, 0x06, "PKCS#8 parameters")?.0),
+        _ => None,
+    };
+    let (private_key, _) = der_take(rest, 0x04, "PKCS#8 private key")?;
+    Ok(Pkcs8Parts {
+        algorithm,
+        parameters,
+        private_key,
+    })
+}
+
+/// The parts of a `SubjectPublicKeyInfo`: algorithm OID, the parameters OID
+/// when there is one, and the key bits (whole bytes only).
+type SpkiParts<'a> = (&'a [u8], Option<&'a [u8]>, &'a [u8]);
+
+fn parse_spki(der: &[u8]) -> Result<SpkiParts<'_>, String> {
+    let (body, _) = der_take(der, 0x30, "SubjectPublicKeyInfo")?;
+    let (alg, rest) = der_take(body, 0x30, "SPKI algorithm")?;
+    let (algorithm, alg_rest) = der_take(alg, 0x06, "SPKI algorithm OID")?;
+    let parameters = match alg_rest.first() {
+        Some(0x06) => Some(der_take(alg_rest, 0x06, "SPKI parameters")?.0),
+        _ => None,
+    };
+    let (bits, _) = der_take(rest, 0x03, "SPKI public key")?;
+    match bits.split_first() {
+        Some((0, key)) => Ok((algorithm, parameters, key)),
+        _ => Err("SPKI: public key is not a whole number of bytes".into()),
+    }
+}
+
+/// An OKP (Ed25519 / X25519) key type, from its algorithm OID.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OkpKind {
+    Ed25519,
+    X25519,
+}
+
+impl OkpKind {
+    fn from_oid(oid: &[u8]) -> Option<Self> {
+        if oid == OID_ED25519 {
+            Some(OkpKind::Ed25519)
+        } else if oid == OID_X25519 {
+            Some(OkpKind::X25519)
+        } else {
+            None
+        }
+    }
+
+    /// The JWK `crv`.
+    fn jwk_crv(self) -> &'static str {
+        match self {
+            OkpKind::Ed25519 => "Ed25519",
+            OkpKind::X25519 => "X25519",
+        }
+    }
+}
+
+/// The 32-byte private key of a PKCS#8 Ed25519 / X25519 key: the
+/// `CurvePrivateKey` OCTET STRING inside the outer one (RFC 8410).
+fn okp_private_from_pkcs8(der: &[u8]) -> Result<(OkpKind, [u8; 32]), String> {
+    let parts = parse_pkcs8(der)?;
+    let kind = OkpKind::from_oid(parts.algorithm)
+        .ok_or_else(|| "not an Ed25519 or X25519 private key".to_string())?;
+    let (inner, _) = der_take(parts.private_key, 0x04, "CurvePrivateKey")?;
+    let key: [u8; 32] = inner
+        .try_into()
+        .map_err(|_| format!("{} private key is not 32 bytes", kind.jwk_crv()))?;
+    Ok((kind, key))
+}
+
+/// The 32-byte public key of an Ed25519 / X25519 SPKI.
+fn okp_public_from_spki(der: &[u8]) -> Result<(OkpKind, [u8; 32]), String> {
+    let (algorithm, _, key) = parse_spki(der)?;
+    let kind = OkpKind::from_oid(algorithm)
+        .ok_or_else(|| "not an Ed25519 or X25519 public key".to_string())?;
+    let key: [u8; 32] = key
+        .try_into()
+        .map_err(|_| format!("{} public key is not 32 bytes", kind.jwk_crv()))?;
+    Ok((kind, key))
+}
+
+/// The public key of an OKP private key. X25519 is the clamped scalar times
+/// the base point (RFC 7748); Ed25519 is ring's derivation from the seed.
+/// Both are constant-time in the private key.
+fn okp_public_from_private(kind: OkpKind, private: &[u8; 32]) -> Result<[u8; 32], String> {
+    match kind {
+        OkpKind::X25519 => Ok(
+            curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(*private).to_bytes(),
+        ),
+        OkpKind::Ed25519 => {
+            let pair = ring_sig::Ed25519KeyPair::from_seed_unchecked(private)
+                .map_err(|e| format!("Ed25519 key parse: {e}"))?;
+            pair.public_key()
+                .as_ref()
+                .try_into()
+                .map_err(|_| "Ed25519 public key is not 32 bytes".to_string())
+        }
+    }
+}
+
+/// X25519(k, u) (RFC 7748). An all-zero result -- a peer key of small order
+/// -- is refused, as OpenSSL refuses it ("failed during derivation"); the
+/// check folds every byte, so it takes the same time whatever the result.
+fn x25519_shared(private: &[u8; 32], peer: &[u8; 32]) -> Result<[u8; 32], String> {
+    let shared = curve25519_dalek::montgomery::MontgomeryPoint(*peer)
+        .mul_clamped(*private)
+        .to_bytes();
+    let folded = shared.iter().fold(0u8, |acc, &b| acc | b);
+    if folded == 0 {
+        return Err(DH_ERR_FAILED_DURING_DERIVATION.into());
+    }
+    Ok(shared)
+}
+
+/// The PEM pair of an X25519 private key: a PKCS#8 v1 private key and an
+/// SPKI public key, laid out as OpenSSL writes them.
+fn x25519_pem_pair(private: &[u8; 32]) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let public = okp_public_from_private(OkpKind::X25519, private)?;
+    let mut pkcs8 = X25519_PKCS8_PREFIX.to_vec();
+    pkcs8.extend_from_slice(private);
+    let priv_pem = der_to_pem(&pkcs8, "PRIVATE KEY");
+    pkcs8.zeroize();
+    let mut spki = X25519_SPKI_PREFIX.to_vec();
+    spki.extend_from_slice(&public);
+    Ok((
+        priv_pem.into_bytes(),
+        der_to_pem(&spki, "PUBLIC KEY").into_bytes(),
+    ))
+}
+
+/// A fresh X25519 key pair as PEM (`x25519_pem_pair`).
+fn crypto_generate_x25519() -> Result<(Vec<u8>, Vec<u8>), String> {
+    use rand_core::RngCore as _;
+    let mut private = [0u8; 32];
+    OsRng
+        .try_fill_bytes(&mut private)
+        .map_err(|e| format!("X25519 keygen: {e}"))?;
+    let pair = x25519_pem_pair(&private);
+    private.zeroize();
+    pair
+}
+
+/// The components of an OKP key for a JWK: `crv`, the public key `x`, and
+/// for a private key the private key `d`. A private key's `x` is derived.
+struct OkpComponents {
+    kind: OkpKind,
+    x: [u8; 32],
+    d: Option<[u8; 32]>,
+}
+
+fn okp_components(pem: &str, is_private: bool) -> Result<OkpComponents, String> {
+    let der = pem_to_der(pem)?;
+    if is_private {
+        let (kind, private) = okp_private_from_pkcs8(&der)?;
+        let x = okp_public_from_private(kind, &private)?;
+        Ok(OkpComponents {
+            kind,
+            x,
+            d: Some(private),
+        })
+    } else {
+        let (kind, x) = okp_public_from_spki(&der)?;
+        Ok(OkpComponents { kind, x, d: None })
+    }
+}
+
+/// The curve an EC OID names. P-521 is recognised only to say that oam has
+/// no arithmetic for it.
+fn ec_curve_from_oid(oid: &[u8]) -> Result<EcCurve, String> {
+    if oid == OID_P256 {
+        Ok(EcCurve::P256)
+    } else if oid == OID_P384 {
+        Ok(EcCurve::P384)
+    } else if oid == OID_P521 {
+        Err("unsupported EC curve P-521 (oam supports P-256 and P-384)".into())
+    } else {
+        Err("unsupported EC curve (oam supports P-256 and P-384)".into())
+    }
+}
+
+/// An EC private key: its curve and its scalar at exactly the curve's field
+/// width, big-endian. Not range-checked here: `SecretKey::from_slice` does
+/// that (zero, and a value not below the group order, are refused).
+struct EcPrivateScalar {
+    curve: EcCurve,
+    d: Vec<u8>,
+}
+
+impl Drop for EcPrivateScalar {
+    fn drop(&mut self) {
+        self.d.zeroize();
+    }
+}
+
+/// An `ECPrivateKey` (SEC1, RFC 5915). `outer_curve` is the curve a PKCS#8
+/// wrapper names; the structure's own `[0]` parameters name it otherwise,
+/// and when both are present they must agree. The private key OCTET STRING
+/// is read as an integer, as OpenSSL reads it: leading zero bytes (an
+/// OpenSSH key's mpint can carry one, and ssh2 copies it through) are
+/// dropped and a short value is left-padded. The optional `[1]` public key
+/// is not read: the public point is always derived from the scalar.
+fn parse_sec1(der: &[u8], outer_curve: Option<&[u8]>) -> Result<EcPrivateScalar, String> {
+    let (body, _) = der_take(der, 0x30, "ECPrivateKey")?;
+    let (version, rest) = der_take(body, 0x02, "ECPrivateKey version")?;
+    if version != [1] {
+        return Err("ECPrivateKey: unsupported version".into());
+    }
+    let (private, mut rest) = der_take(rest, 0x04, "ECPrivateKey private key")?;
+    let mut inner_curve = None;
+    while let Some(&tag) = rest.first() {
+        let (field, next) = der_take(rest, tag, "ECPrivateKey field")?;
+        if tag == 0xa0 {
+            inner_curve = Some(der_take(field, 0x06, "ECPrivateKey parameters")?.0);
+        }
+        rest = next;
+    }
+    let curve_oid = match (outer_curve, inner_curve) {
+        (Some(outer), Some(inner)) if outer != inner => {
+            return Err("EC private key names two different curves".into());
+        }
+        (Some(oid), _) | (None, Some(oid)) => oid,
+        (None, None) => return Err("EC private key does not name its curve".into()),
+    };
+    let curve = ec_curve_from_oid(curve_oid)?;
+    let width = match curve {
+        EcCurve::P256 => 32,
+        EcCurve::P384 => 48,
+    };
+    let first = private
+        .iter()
+        .position(|&b| b != 0)
+        .unwrap_or(private.len());
+    let digits = &private[first..];
+    if digits.len() > width {
+        return Err(format!("{} private key is too long", curve.name()));
+    }
+    let mut d = vec![0u8; width];
+    d[width - digits.len()..].copy_from_slice(digits);
+    Ok(EcPrivateScalar { curve, d })
+}
+
+/// The EC private key in a PEM: SEC1 (`EC PRIVATE KEY`) or PKCS#8
+/// (`PRIVATE KEY`, algorithm id-ecPublicKey).
+fn ec_private_from_pem(pem: &str) -> Result<EcPrivateScalar, String> {
+    let der = pem_to_der(pem)?;
+    match pem_label(pem) {
+        "EC PRIVATE KEY" => parse_sec1(&der, None),
+        "PRIVATE KEY" => {
+            let parts = parse_pkcs8(&der)?;
+            if parts.algorithm != OID_EC_PUBLIC_KEY {
+                return Err("not an EC private key".into());
+            }
+            parse_sec1(parts.private_key, parts.parameters)
+        }
+        label => Err(format!("unsupported EC PEM label: '{label}'")),
+    }
+}
+
+/// The PKCS#8 DER of an EC private key: what ring's ECDSA signer and the
+/// p256 / p384 PKCS#8 readers take. Re-encoded through the curve crate,
+/// which also range-checks the scalar.
+fn ec_private_to_pkcs8_der(key: &EcPrivateScalar) -> Result<Vec<u8>, String> {
+    use p256::pkcs8::EncodePrivateKey as _;
+    let doc = match key.curve {
+        EcCurve::P256 => p256::SecretKey::from_slice(&key.d)
+            .map_err(|e| format!("EC key parse: {e}"))?
+            .to_pkcs8_der(),
+        EcCurve::P384 => p384::SecretKey::from_slice(&key.d)
+            .map_err(|e| format!("EC key parse: {e}"))?
+            .to_pkcs8_der(),
+    }
+    .map_err(|e| format!("EC key encode: {e}"))?;
+    Ok(doc.as_bytes().to_vec())
+}
+
+/// A PEM EC private key's DER as PKCS#8: a SEC1 key is re-encoded, a PKCS#8
+/// one is its own DER.
+fn ec_private_pkcs8_der_from_pem(pem: &str) -> Result<Vec<u8>, String> {
+    match pem_label(pem) {
+        "EC PRIVATE KEY" => ec_private_to_pkcs8_der(&ec_private_from_pem(pem)?),
+        _ => pem_to_der(pem),
+    }
+}
+
+/// `crypto.diffieHellman({ privateKey, publicKey })` with both keys as PEM:
+/// a PKCS#8 / SEC1 private key and an SPKI public key. X25519 and P-256 /
+/// P-384 ECDH; the result is the raw shared secret (the x-coordinate for
+/// ECDH), as OpenSSL derives it. Keys of two different types or curves are
+/// OpenSSL's `mismatching domain parameters`.
+fn stateless_diffie_hellman(private_pem: &str, public_pem: &str) -> Result<Vec<u8>, String> {
+    let public_der = pem_to_der(public_pem)?;
+    let (algorithm, parameters, peer) = parse_spki(&public_der)?;
+    if pem_label(private_pem) == "PRIVATE KEY" {
+        let private_der = pem_to_der(private_pem)?;
+        let parts = parse_pkcs8(&private_der)?;
+        if let Some(kind) = OkpKind::from_oid(parts.algorithm) {
+            if kind != OkpKind::X25519 || algorithm != OID_X25519 {
+                return Err(DH_ERR_MISMATCHING_DOMAIN_PARAMETERS.into());
+            }
+            let peer: &[u8; 32] = peer
+                .try_into()
+                .map_err(|_| "X25519 public key is not 32 bytes".to_string())?;
+            let (_, mut private) = okp_private_from_pkcs8(&private_der)?;
+            let shared = x25519_shared(&private, peer);
+            private.zeroize();
+            return shared.map(|s| s.to_vec());
+        }
+    }
+    let private = ec_private_from_pem(private_pem)?;
+    if algorithm != OID_EC_PUBLIC_KEY {
+        return Err(DH_ERR_MISMATCHING_DOMAIN_PARAMETERS.into());
+    }
+    let peer_curve = ec_curve_from_oid(
+        parameters.ok_or_else(|| "EC public key does not name its curve".to_string())?,
+    )?;
+    if peer_curve != private.curve {
+        return Err(DH_ERR_MISMATCHING_DOMAIN_PARAMETERS.into());
+    }
+    match private.curve {
+        EcCurve::P256 => ecdh_compute_p256(&private.d, peer),
+        EcCurve::P384 => ecdh_compute_p384(&private.d, peer),
+    }
+}
+
+/// `cryptoDiffieHellman(privatePem, publicPem)` -> Uint8Array.
+pub(crate) fn op_crypto_diffie_hellman(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(private_pem) = crate::node_ops::arg_string(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "diffieHellman: private key required");
+        return;
+    };
+    let Some(public_pem) = crate::node_ops::arg_string(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "diffieHellman: public key required");
+        return;
+    };
+    match stateless_diffie_hellman(&private_pem, &public_pem) {
+        Ok(secret) => {
+            if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, secret) {
+                rv.set(value);
+            }
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
+
+/// `cryptoOkpComponents(pem, isPrivate)` -> `{ crv, x, d? }` for an Ed25519
+/// or X25519 key: a JWK's fields, and the public key of a private one.
+pub(crate) fn op_crypto_okp_components(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(pem) = crate::node_ops::arg_string(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "okpComponents: key required");
+        return;
+    };
+    let is_private = args.get(1).boolean_value(scope);
+    match okp_components(&pem, is_private) {
+        Ok(mut comps) => {
+            let obj = v8::Object::new(scope);
+            let crv_key = v8::String::new(scope, "crv").unwrap();
+            let crv = v8::String::new(scope, comps.kind.jwk_crv()).unwrap();
+            obj.set(scope, crv_key.into(), crv.into());
+            let x_key = v8::String::new(scope, "x").unwrap();
+            if let Some(x) = crate::node_ops::bytes_to_uint8array(scope, comps.x.to_vec()) {
+                obj.set(scope, x_key.into(), x);
+            }
+            if let Some(d) = comps.d.as_mut() {
+                let d_key = v8::String::new(scope, "d").unwrap();
+                if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, d.to_vec()) {
+                    obj.set(scope, d_key.into(), value);
+                }
+                d.zeroize();
+            }
+            rv.set(obj.into());
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
+
 // ===================================================== EC JWK import/export
 // Wave 9: import EC private/public keys from JWK components (crv, x, y, d)
 // and export EC keys to JWK components.
@@ -2885,6 +3327,12 @@ fn ec_pem_to_jwk_components(pem: &str, is_private: bool) -> Result<EcJwkComponen
     let label = pem_label(pem);
 
     if is_private {
+        // A SEC1 key is read as its PKCS#8 re-encoding.
+        let der = if label == "EC PRIVATE KEY" {
+            ec_private_pkcs8_der_from_pem(pem)?
+        } else {
+            der
+        };
         if let Ok(sk) = p256::SecretKey::from_pkcs8_der(&der) {
             use p256::elliptic_curve::sec1::ToEncodedPoint;
             let pk = sk.public_key();
@@ -6715,5 +7163,322 @@ mod streaming_ciphers {
             out.extend_from_slice(&part);
         }
         assert_eq!(out, whole);
+    }
+}
+
+#[cfg(test)]
+mod okp_sec1_and_stateless_dh {
+    use super::*;
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn arr(s: &str) -> [u8; 32] {
+        unhex(s).try_into().unwrap()
+    }
+
+    fn pem_pair(pair: (Vec<u8>, Vec<u8>)) -> (String, String) {
+        (
+            String::from_utf8(pair.0).unwrap(),
+            String::from_utf8(pair.1).unwrap(),
+        )
+    }
+
+    // RFC 7748 section 6.1.
+    const ALICE_PRIVATE: &str = "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a";
+    const ALICE_PUBLIC: &str = "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a";
+    const BOB_PRIVATE: &str = "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb";
+    const BOB_PUBLIC: &str = "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f";
+    const SHARED: &str = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742";
+
+    // The P-256 SEC1 key from #489, its public key as node derives it
+    // (v22.22.2), and node's ECDH secret with the P-256 key whose scalar is
+    // 32 bytes of 0x11.
+    const SEC1_P256: &str = "-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEILb6uVaI+/+Gmw4HrguzY9uYnowLyNAo4on5rzMT4hdLoAoGCCqGSM49
+AwEHoUQDQgAEfu3U8rG7HqTa6On7lSmP6VGi26vT4hYluLXLFEcQ98J+lEpRIMoY
+xVKuDE/XcYZBFaXG3LG2KYmGY36KMkHnxg==
+-----END EC PRIVATE KEY-----
+";
+    const SEC1_P256_D: &str = "b6fab95688fbff869b0e07ae0bb363db989e8c0bc8d028e289f9af3313e2174b";
+    const SEC1_P256_SPKI: &str = "3059301306072a8648ce3d020106082a8648ce3d030107034200047eedd4f2b1bb1ea4dae8e9fb95298fe951a2dbabd3e21625b8b5cb144710f7c27e944a5120ca18c552ae0c4fd771864115a5c6dcb1b6298986637e8a3241e7c6";
+    const PEER_P256_SPKI: &str = "3059301306072a8648ce3d020106082a8648ce3d030107034200040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794";
+    const SEC1_PEER_SECRET: &str =
+        "f5c06ab82aabc19778ffcf87286d93f0ebbf88c19a75fb90fd43781836b3c754";
+
+    // ssh2's eddsaSupported probe key (lib/protocol/constants.js), and its
+    // public key as node derives it.
+    const SSH2_ED25519: &str = "-----BEGIN PRIVATE KEY-----\r\nMC4CAQAwBQYDK2VwBCIEIHKj+sVa9WcD/q2DJUJaf43Kptc8xYuUQA4bOFj9vC8T\r\n-----END PRIVATE KEY-----";
+    const SSH2_ED25519_PUBLIC: &str =
+        "4aaba0778a81d992ba8347a2841c9daddd1bab51533410258cea5c9909e5ac29";
+
+    fn x25519_private_pem(raw: &str) -> String {
+        pem_pair(x25519_pem_pair(&arr(raw)).unwrap()).0
+    }
+
+    fn x25519_public_pem(raw: &str) -> String {
+        let mut der = X25519_SPKI_PREFIX.to_vec();
+        der.extend_from_slice(&unhex(raw));
+        der_to_pem(&der, "PUBLIC KEY")
+    }
+
+    #[test]
+    fn x25519_matches_rfc7748() {
+        assert_eq!(
+            okp_public_from_private(OkpKind::X25519, &arr(ALICE_PRIVATE)).unwrap(),
+            arr(ALICE_PUBLIC)
+        );
+        assert_eq!(
+            okp_public_from_private(OkpKind::X25519, &arr(BOB_PRIVATE)).unwrap(),
+            arr(BOB_PUBLIC)
+        );
+        let alice = x25519_private_pem(ALICE_PRIVATE);
+        let bob = x25519_private_pem(BOB_PRIVATE);
+        assert_eq!(
+            stateless_diffie_hellman(&alice, &x25519_public_pem(BOB_PUBLIC)).unwrap(),
+            unhex(SHARED)
+        );
+        assert_eq!(
+            stateless_diffie_hellman(&bob, &x25519_public_pem(ALICE_PUBLIC)).unwrap(),
+            unhex(SHARED)
+        );
+    }
+
+    #[test]
+    fn x25519_pem_layout_is_openssls() {
+        let (private, public) = pem_pair(x25519_pem_pair(&arr(ALICE_PRIVATE)).unwrap());
+        // node: createPrivateKey(...).export({ type: 'pkcs8', format: 'der' })
+        assert_eq!(
+            pem_to_der(&private).unwrap(),
+            unhex(&format!("302e020100300506032b656e04220420{ALICE_PRIVATE}"))
+        );
+        assert_eq!(
+            pem_to_der(&public).unwrap(),
+            unhex(&format!("302a300506032b656e032100{ALICE_PUBLIC}"))
+        );
+        let comps = okp_components(&private, true).unwrap();
+        assert_eq!(comps.kind, OkpKind::X25519);
+        assert_eq!(comps.x, arr(ALICE_PUBLIC));
+        assert_eq!(comps.d, Some(arr(ALICE_PRIVATE)));
+        let comps = okp_components(&public, false).unwrap();
+        assert_eq!(
+            (comps.kind, comps.x, comps.d),
+            (OkpKind::X25519, arr(ALICE_PUBLIC), None)
+        );
+    }
+
+    #[test]
+    fn generated_x25519_pairs_agree() {
+        let (a_priv, a_pub) = pem_pair(crypto_generate_x25519().unwrap());
+        let (b_priv, b_pub) = pem_pair(crypto_generate_x25519().unwrap());
+        assert_ne!(a_priv, b_priv);
+        let ab = stateless_diffie_hellman(&a_priv, &b_pub).unwrap();
+        let ba = stateless_diffie_hellman(&b_priv, &a_pub).unwrap();
+        assert_eq!(ab.len(), 32);
+        assert_eq!(ab, ba);
+    }
+
+    #[test]
+    fn small_order_x25519_peers_fail_like_openssl() {
+        let alice = x25519_private_pem(ALICE_PRIVATE);
+        let mut one = "01".to_string();
+        one.push_str(&"00".repeat(31));
+        for peer in ["00".repeat(32), one] {
+            assert_eq!(
+                stateless_diffie_hellman(&alice, &x25519_public_pem(&peer)).unwrap_err(),
+                DH_ERR_FAILED_DURING_DERIVATION
+            );
+        }
+    }
+
+    #[test]
+    fn mismatched_key_types_and_curves() {
+        let alice = x25519_private_pem(ALICE_PRIVATE);
+        let (p256_priv, p256_pub) = pem_pair(crypto_generate_ec_p256().unwrap());
+        let (_, p384_pub) = pem_pair(crypto_generate_ec_p384().unwrap());
+        let (ed_priv, ed_pub) = pem_pair(crypto_generate_ed25519().unwrap());
+        for (private, public) in [
+            (&alice, &p256_pub),
+            (&p256_priv, &x25519_public_pem(BOB_PUBLIC)),
+            (&p256_priv, &p384_pub),
+            (&ed_priv, &x25519_public_pem(BOB_PUBLIC)),
+            (&alice, &ed_pub),
+        ] {
+            assert_eq!(
+                stateless_diffie_hellman(private, public).unwrap_err(),
+                DH_ERR_MISMATCHING_DOMAIN_PARAMETERS
+            );
+        }
+    }
+
+    #[test]
+    fn ecdh_takes_sec1_and_pkcs8_private_keys() {
+        let peer = der_to_pem(&unhex(PEER_P256_SPKI), "PUBLIC KEY");
+        assert_eq!(
+            stateless_diffie_hellman(SEC1_P256, &peer).unwrap(),
+            unhex(SEC1_PEER_SECRET)
+        );
+        let pkcs8 = der_to_pem(
+            &ec_private_pkcs8_der_from_pem(SEC1_P256).unwrap(),
+            "PRIVATE KEY",
+        );
+        assert_eq!(
+            stateless_diffie_hellman(&pkcs8, &peer).unwrap(),
+            unhex(SEC1_PEER_SECRET)
+        );
+        let (a_priv, a_pub) = pem_pair(crypto_generate_ec_p384().unwrap());
+        let (b_priv, b_pub) = pem_pair(crypto_generate_ec_p384().unwrap());
+        let ab = stateless_diffie_hellman(&a_priv, &b_pub).unwrap();
+        assert_eq!(ab.len(), 48);
+        assert_eq!(ab, stateless_diffie_hellman(&b_priv, &a_pub).unwrap());
+    }
+
+    #[test]
+    fn sec1_keys_sign_and_derive_their_public_key() {
+        let msg = b"hello";
+        let comps = ec_pem_to_jwk_components(SEC1_P256, true).unwrap();
+        let public = ec_jwk_to_spki_pem(&comps.crv, &comps.x, &comps.y).unwrap();
+        assert_eq!(pem_to_der(&public).unwrap(), unhex(SEC1_P256_SPKI));
+        for der_encoding in [true, false] {
+            let sig = crypto_sign_ec("sha256", msg, SEC1_P256, der_encoding).unwrap();
+            assert!(crypto_verify_ec("sha256", msg, &public, &sig, der_encoding).unwrap());
+        }
+        let sec1_384 = der_to_pem(
+            &unhex(&format!(
+                "303e020101043000{}a00706052b81040022",
+                "11".repeat(47)
+            )),
+            "EC PRIVATE KEY",
+        );
+        let sig = crypto_sign_ec("sha384", msg, &sec1_384, true).unwrap();
+        let comps = ec_pem_to_jwk_components(&sec1_384, true).unwrap();
+        assert_eq!(comps.crv, "P-384");
+        let public = ec_jwk_to_spki_pem(&comps.crv, &comps.x, &comps.y).unwrap();
+        assert!(crypto_verify_ec("sha384", msg, &public, &sig, true).unwrap());
+    }
+
+    #[test]
+    fn sec1_scalar_is_read_as_an_integer() {
+        let curve = Some(OID_P256);
+        let plain = unhex(&format!("30250201010420{SEC1_P256_D}"));
+        // An OpenSSH mpint copied through by ssh2 carries a leading zero.
+        let padded = unhex(&format!("3026020101042100{SEC1_P256_D}"));
+        // A short scalar is left-padded.
+        let short = unhex("3006020101040107");
+        assert_eq!(parse_sec1(&plain, curve).unwrap().d, unhex(SEC1_P256_D));
+        assert_eq!(parse_sec1(&padded, curve).unwrap().d, unhex(SEC1_P256_D));
+        let mut seven = vec![0u8; 32];
+        seven[31] = 7;
+        assert_eq!(parse_sec1(&short, curve).unwrap().d, seven);
+        // Too wide even after leading zeros are dropped.
+        let wide = unhex(&format!("30260201010421ff{SEC1_P256_D}"));
+        assert!(parse_sec1(&wide, curve).is_err());
+        // Zero and the group order are out of range for the curve crate.
+        let zero = EcPrivateScalar {
+            curve: EcCurve::P256,
+            d: vec![0; 32],
+        };
+        assert!(ec_private_to_pkcs8_der(&zero).is_err());
+        let order = EcPrivateScalar {
+            curve: EcCurve::P256,
+            d: unhex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"),
+        };
+        assert!(ec_private_to_pkcs8_der(&order).is_err());
+    }
+
+    #[test]
+    fn sec1_curve_must_be_named_once_and_supported() {
+        let d = SEC1_P256_D;
+        let no_curve = unhex(&format!("30250201010420{d}"));
+        assert!(
+            parse_sec1(&no_curve, None)
+                .err()
+                .unwrap()
+                .contains("does not name its curve")
+        );
+        let p256_inner = unhex(&format!("30310201010420{d}a00a06082a8648ce3d030107"));
+        assert!(parse_sec1(&p256_inner, Some(OID_P384)).is_err());
+        assert!(parse_sec1(&p256_inner, Some(OID_P256)).is_ok());
+        let p521 = unhex(&format!("302e0201010420{d}a00706052b81040023"));
+        assert!(parse_sec1(&p521, None).err().unwrap().contains("P-521"));
+        let version_two = unhex(&format!("30310201020420{d}a00a06082a8648ce3d030107"));
+        assert!(parse_sec1(&version_two, None).is_err());
+        let pem = der_to_pem(&p521, "EC PRIVATE KEY");
+        assert!(crypto_sign_ec("sha512", b"m", &pem, true).is_err());
+    }
+
+    #[test]
+    fn ed25519_public_key_is_derived_from_the_private_key() {
+        let comps = okp_components(SSH2_ED25519, true).unwrap();
+        assert_eq!(comps.kind, OkpKind::Ed25519);
+        assert_eq!(comps.x, arr(SSH2_ED25519_PUBLIC));
+        // The derived key verifies what the private key signed (ssh2's probe).
+        let sig = crypto_sign_ed25519(b"a", SSH2_ED25519).unwrap();
+        let public = der_to_pem(&wrap_ed25519_spki(&comps.x), "PUBLIC KEY");
+        assert!(crypto_verify_ed25519(b"a", &public, &sig).unwrap());
+        // ring's v2 PKCS#8 (with the public key) reads the same way.
+        let (generated, generated_pub) = pem_pair(crypto_generate_ed25519().unwrap());
+        let derived = okp_components(&generated, true).unwrap().x;
+        assert_eq!(derived, okp_components(&generated_pub, false).unwrap().x);
+    }
+
+    #[test]
+    fn malformed_keys_are_errors_not_panics() {
+        let x_priv = pem_to_der(&x25519_private_pem(ALICE_PRIVATE)).unwrap();
+        let x_pub = pem_to_der(&x25519_public_pem(BOB_PUBLIC)).unwrap();
+        let sec1 = pem_to_der(SEC1_P256).unwrap();
+        let ec_pub = unhex(PEER_P256_SPKI);
+        // Every truncation, and every single-byte change, of each structure.
+        for der in [&x_priv, &x_pub, &sec1, &ec_pub] {
+            for len in 0..der.len() {
+                let cut = &der[..len];
+                let _ = okp_private_from_pkcs8(cut);
+                let _ = okp_public_from_spki(cut);
+                let _ = parse_sec1(cut, Some(OID_P256));
+                let _ = parse_spki(cut);
+            }
+            for i in 0..der.len() {
+                let mut bent = der.clone();
+                bent[i] ^= 0xff;
+                let _ = okp_private_from_pkcs8(&bent);
+                let _ = okp_public_from_spki(&bent);
+                let _ = parse_sec1(&bent, Some(OID_P256));
+                let private = der_to_pem(&bent, "PRIVATE KEY");
+                let public = der_to_pem(&bent, "PUBLIC KEY");
+                let _ = stateless_diffie_hellman(&private, &x25519_public_pem(BOB_PUBLIC));
+                let _ = stateless_diffie_hellman(&x25519_private_pem(ALICE_PRIVATE), &public);
+                let _ = stateless_diffie_hellman(&der_to_pem(&bent, "EC PRIVATE KEY"), &public);
+            }
+        }
+        // Wrong key lengths name the problem.
+        let short_pub = der_to_pem(
+            &unhex(&format!("3029300506032b656e032000{}", "09".repeat(31))),
+            "PUBLIC KEY",
+        );
+        assert!(
+            stateless_diffie_hellman(&x25519_private_pem(ALICE_PRIVATE), &short_pub)
+                .unwrap_err()
+                .contains("32 bytes")
+        );
+        let short_priv = der_to_pem(
+            &unhex(&format!(
+                "302d020100300506032b656e0421041f{}",
+                "09".repeat(31)
+            )),
+            "PRIVATE KEY",
+        );
+        assert!(okp_components(&short_priv, true).is_err());
+        // An invalid EC point and a non-key are refused.
+        let mut off_curve = unhex(PEER_P256_SPKI);
+        let last = off_curve.len() - 1;
+        off_curve[last] ^= 1;
+        assert!(
+            stateless_diffie_hellman(SEC1_P256, &der_to_pem(&off_curve, "PUBLIC KEY")).is_err()
+        );
+        assert!(stateless_diffie_hellman("not a key", "not a key").is_err());
     }
 }
