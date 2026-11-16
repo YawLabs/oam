@@ -80,9 +80,15 @@ struct SendHandle(HANDLE);
 // SAFETY: HANDLE is a raw `*mut c_void`, hence not auto-`Send`. The process
 // handle is only ever passed to WaitForSingleObject, GetExitCodeProcess and
 // TerminateProcess, which the kernel serializes on the object and which may be
-// called on one handle from several threads; it is closed once, by `raw_wait`,
-// after its wait has returned and after taking it out of the registry under
-// the lock `raw_kill` also takes, so no copy is used after the close.
+// called on one handle from several threads. It is closed once, by whichever
+// of two owners the child has, and only after that owner has taken it out of
+// the `RawChild`:
+// - a registered child's by `raw_wait`, after its wait has returned and after
+//   taking the handle out of the registry under the lock `raw_kill` also
+//   takes, so no copy is used after the close;
+// - a `spawnSync` argv0 child's by `drain_sync`, which is handed a `RawChild`
+//   that never enters a registry, takes the handle out first, and uses it on
+//   the calling thread alone until its one close.
 unsafe impl Send for SendHandle {}
 
 /// What to do with one child fd index.
@@ -225,7 +231,9 @@ impl ReadEnd {
 }
 
 pub struct RawChild {
-    /// `None` once `raw_wait` has collected the exit and closed it.
+    /// `None` once its owner has taken it out to close it: `raw_wait`, after
+    /// collecting a registered child's exit, or `drain_sync`, at its start,
+    /// for the `spawnSync` argv0 child it is handed.
     process: Option<SendHandle>,
     pub pid: u32,
     fds: HashMap<u32, FdEnd>,
@@ -874,7 +882,9 @@ fn spawn_extra_with(
 /// pipe, or answers while it reads, cannot deadlock against our wait), stdin
 /// is closed after the input, a non-zero `timeout_ms` or output past
 /// `max_buffer` ends and reaps the child and reports ETIMEDOUT / ENOBUFS, and
-/// neither waits for a pipe another process still holds open.
+/// neither waits for a pipe another process still holds open. A child ended
+/// that way reports `kill_signal` (node's `killSignal`) as libuv would have
+/// recorded it: see `child::sync_kill_signal_name`.
 #[allow(clippy::too_many_arguments)]
 pub fn drain_sync(
     mut child: RawChild,
@@ -882,6 +892,7 @@ pub fn drain_sync(
     input: Option<&[u8]>,
     timeout_ms: u64,
     max_buffer: usize,
+    kill_signal: Option<&str>,
 ) -> super::child::SpawnSyncResult {
     use super::child::{
         PipesEnded, SYNC_KILL_PIPE_GRACE, SpawnSyncError, SpawnSyncResult, await_sync_pipes,
@@ -1060,7 +1071,7 @@ pub fn drain_sync(
             stdout,
             stderr,
             status: if killed { None } else { exit_code },
-            signal: killed.then(|| "SIGTERM".to_string()),
+            signal: killed.then(|| super::child::sync_kill_signal_name(kill_signal)),
             pid,
             error: Some(SpawnSyncError {
                 code: code.to_string(),
@@ -1128,12 +1139,14 @@ pub fn spawn_sync_argv0(
         argv0,
         timeout_ms,
         max_buffer,
+        None,
         false,
     )
 }
 
-/// `spawn_sync_argv0` with the choice of command-line form: `verbatim_args`
-/// is `spawn_extra_verbatim`'s, for a `shell: true` spawn whose command and
+/// `spawn_sync_argv0` with node's `killSignal` (`kill_signal`, by name; `None`
+/// is SIGTERM) and the choice of command-line form: `verbatim_args` is
+/// `spawn_extra_verbatim`'s, for a `shell: true` spawn whose command and
 /// arguments `child::shell_command` has already rewritten.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_sync_argv0_with(
@@ -1148,6 +1161,7 @@ pub fn spawn_sync_argv0_with(
     argv0: Option<&str>,
     timeout_ms: u64,
     max_buffer: usize,
+    kill_signal: Option<&str>,
     verbatim_args: bool,
 ) -> super::child::SpawnSyncResult {
     use super::child::{SpawnSyncError, SpawnSyncResult};
@@ -1162,7 +1176,7 @@ pub fn spawn_sync_argv0_with(
         argv0,
         verbatim_args,
     ) {
-        Ok(child) => drain_sync(child, command, input, timeout_ms, max_buffer),
+        Ok(child) => drain_sync(child, command, input, timeout_ms, max_buffer, kill_signal),
         Err(msg) => {
             // `spawn_extra` returns `spawn_failure_json`: {code, errno, message}.
             let body: serde_json::Value =

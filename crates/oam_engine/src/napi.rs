@@ -35,6 +35,7 @@ pub const NAPI_OK: NapiStatus = 0;
 pub const NAPI_INVALID_ARG: NapiStatus = 1;
 pub const NAPI_OBJECT_EXPECTED: NapiStatus = 2;
 pub const NAPI_STRING_EXPECTED: NapiStatus = 3;
+pub const NAPI_NAME_EXPECTED: NapiStatus = 4;
 pub const NAPI_FUNCTION_EXPECTED: NapiStatus = 5;
 pub const NAPI_NUMBER_EXPECTED: NapiStatus = 6;
 pub const NAPI_BOOLEAN_EXPECTED: NapiStatus = 7;
@@ -535,6 +536,12 @@ impl Drop for NapiEnv {
 /// that asks for a JS value gets `napi_invalid_arg`; releasing native memory
 /// and `napi_delete_reference` work either way.
 ///
+/// An exception a finalizer leaves pending is dropped as soon as that
+/// finalizer returns, so the next one starts clean: left in place it would
+/// make every entry point that goes through [`catching`] refuse for the rest
+/// of the release. Node deals with a finalizer's exception per finalizer
+/// too, and drops it once the environment is going away.
+///
 /// # Safety
 ///
 /// `env` must be a live `*mut NapiEnv` of an isolate that has not been
@@ -570,7 +577,15 @@ unsafe fn release_env(env: Env) {
         // SAFETY: `finalize` is the `napi_finalize` the addon registered for
         // `native` / `hint`, called once (its entry was consumed above) with
         // the env it was registered on; the library is loaded per contract.
-        unsafe { finalize(env, native, hint) };
+        // The callback has returned when `pending` is taken, so no reference
+        // into the env is live then.
+        let leftover = unsafe {
+            finalize(env, native, hint);
+            (*env).pending.take()
+        };
+        // Dropped outside the block: it disposes a V8 handle, with the
+        // isolate alive per contract.
+        drop(leftover);
     }
     let refs = {
         // SAFETY: as above -- `env` is live, and no reference into it
@@ -615,8 +630,11 @@ pub(crate) fn has_envs(isolate: &v8::Isolate) -> bool {
 /// entry installs one: Node runs teardown with a handle scope and context
 /// entered, and a hook or a finalizer may rely on that (reading a
 /// reference's value on its way to releasing it, for one) through whichever
-/// env the addon saved. An exception a step leaves pending is dropped --
-/// there is no caller left to throw it to.
+/// env the addon saved. An exception a step leaves pending is dropped when
+/// that step returns -- there is no caller left to throw it to, and left in
+/// place it would make every later hook and finalizer of that env find its
+/// calls into JS refused ([`catching`] does not run on top of a pending
+/// exception).
 ///
 /// The envs are closed when this returns: tombstones, whose library the
 /// registry may then unload (see [`AddonRegistry`]).
@@ -654,27 +672,33 @@ pub(crate) fn teardown(scope: &mut v8::PinScope<'_, '_>) {
         let Some((_, is_hook, env)) = next else {
             break;
         };
-        if is_hook {
+        let leftover = if is_hook {
             // SAFETY: `env` is live; the hook is taken out of the env before
             // it is called, so the borrow has ended when addon code runs and
             // re-enters this ABI. `fun` is the function the addon registered
             // for `arg`, called once (it was just removed), and the registry
             // keeps the addon library loaded until it drops, after this.
+            // The hook has returned when `pending` is taken.
             unsafe {
                 if let Some(hook) = (*env).cleanup_hooks.pop() {
                     (hook.fun)(hook.arg);
                 }
+                (*env).pending.take()
             }
         } else {
             // SAFETY: `env` is live, the isolate is alive (the caller holds
             // its scope), no reference into the env is held across the call,
             // and the library its finalizers live in is still loaded, as
-            // above.
+            // above. The release has returned when `pending` is taken.
             unsafe {
                 (*env).released = true;
                 release_env(env);
+                (*env).pending.take()
             }
-        }
+        };
+        // What the step left pending goes no further (see above). Dropped
+        // outside any borrow of the env: it disposes a V8 handle.
+        drop(leftover);
     }
     for &env in &envs {
         // SAFETY: `env` is live and no addon code is running any more, so
@@ -868,6 +892,84 @@ unsafe fn catching_value(
         // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         Ok(value) => unsafe { out(result, value) },
         Err(status) => status,
+    }
+}
+
+/// The shared body of the entry points that ask an object a yes/no question
+/// V8 may have to run JS to answer -- a Proxy's `has`, `deleteProperty` or
+/// `getOwnPropertyDescriptor` trap: the `napi_has_*` and `napi_delete_*`
+/// families. `op` runs under [`catching`], so a trap that throws is
+/// `napi_pending_exception` with the exception in the env's slot, and
+/// nothing runs on top of an exception already pending -- what Node's
+/// `NAPI_PREAMBLE` gives every one of them. (They used to map V8's empty
+/// result to `false` and answer `napi_ok`, with the exception invisible to
+/// `napi_is_exception_pending` until the native frame returned.)
+///
+/// `result` receives the answer. Node requires it of the `has` family and
+/// lets a caller of the `delete` family pass none (`result_optional`).
+///
+/// The checks run in the order of Node's `napi_has_*` / `napi_delete_*`
+/// (js_native_api_v8.cc, v22.x, read for this), so a call wrong in two ways
+/// reports what Node reports:
+/// 1. `NAPI_PREAMBLE`: no native scope is `napi_invalid_arg`, an exception
+///    already pending is `napi_pending_exception` -- both from [`catching`],
+///    before anything else is looked at, a null key or name included.
+/// 2. `CHECK_ARG` of `result` (where required) and of the key handle
+///    (`key_given`; napi_has_property, napi_has_own_property,
+///    napi_delete_property): a null one is `napi_invalid_arg`. Node checks
+///    the two in a different order per entry point, with the same status.
+/// 3. `CHECK_TO_OBJECT`: a null `object` handle is `napi_invalid_arg` (its
+///    `CHECK_ARG`); otherwise `object` goes through ToObject, so a primitive
+///    is asked about as its wrapper (`'abc'` has index 0) and null or
+///    undefined is `napi_object_expected` -- with ToObject's TypeError left
+///    pending, as Node's TryCatch leaves it in `last_exception`.
+/// 4. `op`, which makes the checks Node makes after the object's -- the
+///    name of napi_has_named_property (`napi_invalid_arg`), the key of
+///    napi_has_own_property (`napi_name_expected`) -- and asks the question.
+///
+/// # Safety
+///
+/// As [`catching`]: `env` must be the live `napi_env` this engine handed the
+/// addon, or null, and the caller must hold no scope reference from
+/// [`env_scope`]. `object` must be null or a `napi_value` valid in the env's
+/// scope, and `result` null or valid for a write of one `bool`.
+unsafe fn object_query(
+    env: Env,
+    object: NapiValue,
+    key_given: bool,
+    result: *mut bool,
+    result_optional: bool,
+    op: impl FnOnce(
+        &v8::PinScope<'_, '_>,
+        v8::Local<'_, v8::Object>,
+    ) -> Option<Result<bool, NapiStatus>>,
+) -> NapiStatus {
+    // SAFETY: `object` is a napi_value handle from this env per this function's contract; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top), reading nothing through it, and returns None when null.
+    let object = unsafe { to_local(object) };
+    let argument_missing = !key_given || (result.is_null() && !result_optional);
+    // Set when ToObject refused `object`: its TypeError is then pending (in
+    // the env's slot, by `catching`) and the status is Node's
+    // napi_object_expected, not napi_pending_exception.
+    let not_an_object = std::cell::Cell::new(false);
+    // SAFETY: `env` and the scope rule are this function's own contract, passed straight through.
+    let outcome = unsafe {
+        catching(env, |scope| {
+            let (false, Some(object)) = (argument_missing, object) else {
+                return Some(Err(NAPI_INVALID_ARG));
+            };
+            let Some(target) = object.to_object(scope) else {
+                not_an_object.set(true);
+                return None;
+            };
+            op(scope, target)
+        })
+    };
+    match outcome {
+        Err(_) if not_an_object.get() => NAPI_OBJECT_EXPECTED,
+        Ok(Ok(_)) if result.is_null() => NAPI_OK,
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
+        Ok(Ok(answer)) => unsafe { out(result, answer) },
+        Ok(Err(status)) | Err(status) => status,
     }
 }
 
@@ -1211,6 +1313,13 @@ fn trampoline_data<'s>(
 /// and an instance whose prototype was replaced passes in node and not here
 /// (docs/node-divergences.md, entry 63). A proxy fails without its traps
 /// being consulted, as in node: the walk runs no JS.
+///
+/// Only a plain call is checked. V8 makes its signature check on the call
+/// branch alone (v8 150.0.0, src/builtins/builtins-api.cc,
+/// `HandleApiCallHelper`: the construct branch instantiates a fresh receiver
+/// and never reaches `IsCompatibleReceiver`), so in node
+/// `new Cls.prototype.method()` runs the callback, and the trampoline skips
+/// this check for a construct call to match.
 fn receiver_inherits(
     scope: &v8::PinScope<'_, '_>,
     receiver: v8::Local<v8::Value>,
@@ -1248,8 +1357,11 @@ fn napi_trampoline(
     };
     // A class prototype method refuses a receiver that is not an instance
     // of its class before anything else runs, as V8's signature check does
-    // in node: no finalizer, no callback.
+    // in node: no finalizer, no callback. A construct call has no receiver
+    // to refuse -- V8 makes a fresh one -- and is let through, as V8 lets
+    // it (see `receiver_inherits`).
     if let Some(prototype) = prototype
+        && !args.is_construct_call()
         && !receiver_inherits(scope, args.this().into(), prototype)
     {
         if let Some(message) = v8::String::new(scope, ILLEGAL_INVOCATION) {
@@ -1744,8 +1856,14 @@ pub unsafe extern "C" fn napi_get_value_int64(
     if !local.is_number() {
         return NAPI_NUMBER_EXPECTED;
     }
+    // NaN and both infinities read as 0, as in Node, which special-cases
+    // every non-finite value; a bare `as` cast would saturate the
+    // infinities to i64::MAX / i64::MIN. A finite value truncates toward
+    // zero and saturates at the ends of the i64 range.
+    let number = local.number_value(scope).unwrap_or(0.0);
+    let integer = if number.is_finite() { number as i64 } else { 0 };
     // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
-    unsafe { out(result, local.number_value(scope).unwrap_or(0.0) as i64) }
+    unsafe { out(result, integer) }
 }
 
 /// # Safety
@@ -2046,25 +2164,25 @@ pub unsafe extern "C" fn napi_has_named_property(
     name: *const c_char,
     result: *mut bool,
 ) -> NapiStatus {
-    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
-    let Some(scope) = (unsafe { env_scope(env) }) else {
-        return NAPI_INVALID_ARG;
+    let name = if name.is_null() {
+        None
+    } else {
+        // SAFETY: `name` is the caller's NUL-terminated C string, null-checked before this read.
+        Some(unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy())
     };
-    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
-    let Some(target) = (unsafe { as_object(object) }) else {
-        return NAPI_OBJECT_EXPECTED;
-    };
-    if name.is_null() {
-        return NAPI_INVALID_ARG;
+    // A null name is refused after the object is checked, as Node's
+    // CHECK_NEW_FROM_UTF8 follows its CHECK_TO_OBJECT; the key is built under
+    // the same TryCatch (see napi_set_named_property).
+    // SAFETY: `env` is the FFI caller's env pointer (object_query null-guards it and reports a missing native scope) and no scope reference is taken in this function; `object` is a napi_value handle from this env; `result` is the caller's out-parameter pointer, null-checked before the write.
+    unsafe {
+        object_query(env, object, true, result, false, |scope, target| {
+            let Some(name) = &name else {
+                return Some(Err(NAPI_INVALID_ARG));
+            };
+            let key = v8::String::new(scope, name)?;
+            target.has(scope, key.into()).map(Ok)
+        })
     }
-    // SAFETY: `name` is the caller's NUL-terminated C string, null-checked before this read.
-    let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
-    let Some(key) = v8::String::new(scope, &name) else {
-        return NAPI_GENERIC_FAILURE;
-    };
-    let has = target.has(scope, key.into()).unwrap_or(false);
-    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
-    unsafe { out(result, has) }
 }
 
 /// # Safety
@@ -4104,18 +4222,27 @@ pub unsafe extern "C" fn napi_create_buffer_copy(
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // Bytes to copy need somewhere to come from. (Node hands a null source
+    // straight to memcpy; it is refused here, as `external_arraybuffer`
+    // refuses one.)
+    if size > 0 && data.is_null() {
+        return NAPI_INVALID_ARG;
+    }
     let ab = v8::ArrayBuffer::new(scope, size);
-    let store = ab.get_backing_store();
-    if let Some(dst) = store.data() {
-        // SAFETY: `data` points to at least `size` caller-owned elements; from_raw_parts reads them for the length the C caller declared.
-        let src_bytes = unsafe { std::slice::from_raw_parts(data as *const u8, size) };
-        // SAFETY: `dst.as_ptr` points to at least `size` caller-owned writable elements; from_raw_parts_mut forms the out-slice written below.
-        let dst_bytes = unsafe { std::slice::from_raw_parts_mut(dst.as_ptr() as *mut u8, size) };
-        dst_bytes.copy_from_slice(src_bytes);
-        if !result_data.is_null() {
-            // SAFETY: `result_data` is a caller-provided out-parameter pointer, null-checked before this write.
-            unsafe { *result_data = dst.as_ptr() };
-        }
+    // Null for an empty buffer, whose backing store has no data.
+    let dst = ab
+        .get_backing_store()
+        .data()
+        .map_or(std::ptr::null_mut(), |p| p.as_ptr());
+    if size > 0 && !dst.is_null() {
+        // SAFETY: `data` is non-null (checked above) and valid for reads of `size` bytes per the C caller's declaration; `dst` is the non-null start of the `size`-byte backing store V8 just allocated for `ab`, which `ab` keeps alive; a fresh allocation cannot overlap the caller's memory.
+        unsafe { std::ptr::copy_nonoverlapping(data.cast::<u8>(), dst.cast::<u8>(), size) };
+    }
+    // Written whatever the size, as `napi_create_buffer` writes it: an empty
+    // copy must not leave the caller's variable unset.
+    if !result_data.is_null() {
+        // SAFETY: `result_data` is a caller-provided out-parameter pointer, null-checked before this write.
+        unsafe { *result_data = dst };
     }
     let Some(view) = v8::Uint8Array::new(scope, ab, 0, size) else {
         return NAPI_GENERIC_FAILURE;
@@ -4571,34 +4698,23 @@ pub unsafe extern "C" fn napi_is_error(
     value: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
+    // The scope itself is not used, only the proof that a native entry is
+    // on the stack: without one `value` cannot be a live handle.
     // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
-    let Some(scope) = (unsafe { env_scope(env) }) else {
+    if unsafe { env_scope(env) }.is_none() {
         return NAPI_INVALID_ARG;
-    };
+    }
     // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
-    // An Error is an object; check by seeing if it has a 'message' property
-    // and is an instance of Error via the global Error constructor.
-    let is_err = if let Ok(obj) = v8::Local::<v8::Object>::try_from(local) {
-        let ctx = scope.get_current_context();
-        let global = ctx.global(scope);
-        let error_key = v8::String::new(scope, "Error").unwrap();
-        if let Some(error_ctor) = global.get(scope, error_key.into()) {
-            if let Ok(ctor_obj) = v8::Local::<v8::Object>::try_from(error_ctor) {
-                obj.instance_of(scope, ctor_obj).unwrap_or(false)
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    // Node's test (`v8::Value::IsNativeError`): an object made by one of the
+    // Error constructors, of any realm. Not `instanceof globalThis.Error`,
+    // which user code can redirect, which an object merely given
+    // `Error.prototype` passes, and which an error from another realm
+    // fails. It runs no JS.
     // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
-    unsafe { out(result, is_err) }
+    unsafe { out(result, local.is_native_error()) }
 }
 
 /// # Safety
@@ -5051,21 +5167,20 @@ pub unsafe extern "C" fn napi_has_property(
     key: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
-    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
-    let Some(scope) = (unsafe { env_scope(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
-    let Some(target) = (unsafe { as_object(object) }) else {
-        return NAPI_OBJECT_EXPECTED;
-    };
     // SAFETY: `key` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
-    let Some(key_local) = (unsafe { to_local(key) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    let has = target.has(scope, key_local).unwrap_or(false);
-    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
-    unsafe { out(result, has) }
+    let key_local = unsafe { to_local(key) };
+    // A null key is refused by object_query, after the preamble.
+    // SAFETY: `env` is the FFI caller's env pointer (object_query null-guards it and reports a missing native scope) and no scope reference is taken in this function; `object` is a napi_value handle from this env; `result` is the caller's out-parameter pointer, null-checked before the write.
+    unsafe {
+        object_query(
+            env,
+            object,
+            key_local.is_some(),
+            result,
+            false,
+            |scope, target| target.has(scope, key_local?).map(Ok),
+        )
+    }
 }
 
 /// # Safety
@@ -5083,24 +5198,21 @@ pub unsafe extern "C" fn napi_delete_property(
     key: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
-    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
-    let Some(scope) = (unsafe { env_scope(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
-    let Some(target) = (unsafe { as_object(object) }) else {
-        return NAPI_OBJECT_EXPECTED;
-    };
     // SAFETY: `key` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
-    let Some(key_local) = (unsafe { to_local(key) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    let deleted = target.delete(scope, key_local).unwrap_or(false);
-    if !result.is_null() {
-        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
-        unsafe { *result = deleted };
+    let key_local = unsafe { to_local(key) };
+    // `result` is optional here, as in Node; a null key is refused by
+    // object_query, after the preamble.
+    // SAFETY: `env` is the FFI caller's env pointer (object_query null-guards it and reports a missing native scope) and no scope reference is taken in this function; `object` is a napi_value handle from this env; `result` is the caller's out-parameter pointer, null-checked before the write.
+    unsafe {
+        object_query(
+            env,
+            object,
+            key_local.is_some(),
+            result,
+            true,
+            |scope, target| target.delete(scope, key_local?).map(Ok),
+        )
     }
-    NAPI_OK
 }
 
 /// # Safety
@@ -5118,24 +5230,27 @@ pub unsafe extern "C" fn napi_has_own_property(
     key: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
-    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
-    let Some(scope) = (unsafe { env_scope(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
-    let Some(target) = (unsafe { as_object(object) }) else {
-        return NAPI_OBJECT_EXPECTED;
-    };
-    // SAFETY: `key` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
-    let Some(key_local) = (unsafe { to_local(key) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    let Ok(key_name) = v8::Local::<v8::Name>::try_from(key_local) else {
-        return NAPI_INVALID_ARG;
-    };
-    let has = target.has_own_property(scope, key_name).unwrap_or(false);
-    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
-    unsafe { out(result, has) }
+    // SAFETY: `key` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top), reading nothing through it, and returns None when null.
+    let key_local = unsafe { to_local(key) };
+    // A null key is refused by object_query, after the preamble; a key that
+    // is not a string or symbol is Node's napi_name_expected, judged after
+    // the object (and only then read: a native scope is established by now).
+    // SAFETY: `env` is the FFI caller's env pointer (object_query null-guards it and reports a missing native scope) and no scope reference is taken in this function; `object` is a napi_value handle from this env; `result` is the caller's out-parameter pointer, null-checked before the write.
+    unsafe {
+        object_query(
+            env,
+            object,
+            key_local.is_some(),
+            result,
+            false,
+            |scope, target| {
+                let Ok(key_name) = v8::Local::<v8::Name>::try_from(key_local?) else {
+                    return Some(Err(NAPI_NAME_EXPECTED));
+                };
+                target.has_own_property(scope, key_name).map(Ok)
+            },
+        )
+    }
 }
 
 /// # Safety
@@ -5153,17 +5268,12 @@ pub unsafe extern "C" fn napi_has_element(
     index: u32,
     result: *mut bool,
 ) -> NapiStatus {
-    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
-    let Some(scope) = (unsafe { env_scope(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
-    let Some(target) = (unsafe { as_object(object) }) else {
-        return NAPI_OBJECT_EXPECTED;
-    };
-    let has = target.has_index(scope, index).unwrap_or(false);
-    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
-    unsafe { out(result, has) }
+    // SAFETY: `env` is the FFI caller's env pointer (object_query null-guards it and reports a missing native scope) and no scope reference is taken in this function; `object` is a napi_value handle from this env; `result` is the caller's out-parameter pointer, null-checked before the write.
+    unsafe {
+        object_query(env, object, true, result, false, |scope, target| {
+            target.has_index(scope, index).map(Ok)
+        })
+    }
 }
 
 /// # Safety
@@ -5181,20 +5291,13 @@ pub unsafe extern "C" fn napi_delete_element(
     index: u32,
     result: *mut bool,
 ) -> NapiStatus {
-    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
-    let Some(scope) = (unsafe { env_scope(env) }) else {
-        return NAPI_INVALID_ARG;
-    };
-    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
-    let Some(target) = (unsafe { as_object(object) }) else {
-        return NAPI_OBJECT_EXPECTED;
-    };
-    let deleted = target.delete_index(scope, index).unwrap_or(false);
-    if !result.is_null() {
-        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
-        unsafe { *result = deleted };
+    // `result` is optional here, as in Node.
+    // SAFETY: `env` is the FFI caller's env pointer (object_query null-guards it and reports a missing native scope) and no scope reference is taken in this function; `object` is a napi_value handle from this env; `result` is the caller's out-parameter pointer, null-checked before the write.
+    unsafe {
+        object_query(env, object, true, result, true, |scope, target| {
+            target.delete_index(scope, index).map(Ok)
+        })
     }
-    NAPI_OK
 }
 
 /// # Safety
@@ -5262,8 +5365,17 @@ pub unsafe extern "C" fn napi_get_property_names(
     // `result` is the caller's out-parameter pointer, null-checked before the write.
     unsafe {
         catching_value(env, result, |scope| {
+            // Node's napi_get_property_names: enumerable string keys, the
+            // prototype chain included (the defaults), with integer indices
+            // as strings (napi_key_numbers_to_strings). V8's own default
+            // keeps them numbers, which an addon reading every key as a
+            // string would be refused on.
+            let args = v8::GetPropertyNamesArgs {
+                key_conversion: v8::KeyConversionMode::ConvertToString,
+                ..Default::default()
+            };
             target
-                .get_property_names(scope, v8::GetPropertyNamesArgs::default())
+                .get_property_names(scope, args)
                 .map(|names| from_local(names.into()))
         })
     }
@@ -7231,6 +7343,438 @@ mod tests {
             }
             assert!(is_pending(env));
             take_exception(env);
+        });
+    }
+
+    /// One of the six `has` / `delete` entry points, by number, asked about
+    /// `key` (the named and element ones about `k` and index 0). A null
+    /// `key` is a null name for the named one.
+    fn ask_has_or_delete(
+        env: Env,
+        which: usize,
+        object: NapiValue,
+        key: NapiValue,
+        answer: *mut bool,
+    ) -> NapiStatus {
+        let name = if key.is_null() {
+            std::ptr::null()
+        } else {
+            c"k".as_ptr()
+        };
+        // SAFETY: env and handles as in `eval`; the name is null or a
+        // NUL-terminated literal; `answer` is null or a live local of the
+        // caller's.
+        unsafe {
+            match which {
+                0 => napi_has_property(env, object, key, answer),
+                1 => napi_has_named_property(env, object, name, answer),
+                2 => napi_has_own_property(env, object, key, answer),
+                3 => napi_has_element(env, object, 0, answer),
+                4 => napi_delete_property(env, object, key, answer),
+                _ => napi_delete_element(env, object, 0, answer),
+            }
+        }
+    }
+
+    /// A Proxy trap that throws under one of the `has` / `delete` entry
+    /// points is that env's pending exception, as it is under the get / set
+    /// siblings. They used to answer napi_ok with `false`, the exception
+    /// invisible to napi_is_exception_pending.
+    #[test]
+    fn a_throwing_trap_is_pending_for_the_has_and_delete_family() {
+        let mut rt = JsRuntime::new();
+        rt.with_napi_env(|env, _value| {
+            // A handler that is itself a proxy: whichever trap V8 looks up,
+            // it finds a function throwing an Error named after the trap.
+            eval(
+                env,
+                c"globalThis.__trap = (t, trap) => () => { throw new Error(trap); }",
+            );
+            let trapped = eval(
+                env,
+                c"new Proxy({}, new Proxy({}, { get: globalThis.__trap }))",
+            );
+            let plain = eval(env, c"({ k: 1, 0: 'zero' })");
+            let key = eval(env, c"'k'");
+            // One entry point per number, each asked about `k` (or index 0).
+            let ask = |which: usize, object: NapiValue, answer: *mut bool| -> NapiStatus {
+                ask_has_or_delete(env, which, object, key, answer)
+            };
+            let traps = [
+                c"'has'",
+                c"'has'",
+                c"'getOwnPropertyDescriptor'",
+                c"'has'",
+                c"'deleteProperty'",
+                c"'deleteProperty'",
+            ];
+            for (which, trap) in traps.into_iter().enumerate() {
+                let mut answer = false;
+                assert_eq!(
+                    ask(which, trapped, &mut answer),
+                    NAPI_PENDING_EXCEPTION,
+                    "entry point {which}: a throwing trap is not napi_ok"
+                );
+                assert!(!answer, "entry point {which}: nothing is written");
+                assert!(is_pending(env), "entry point {which}: the throw is pending");
+
+                // On top of a pending exception nothing runs, trap or not.
+                assert_eq!(
+                    ask(which, plain, &mut answer),
+                    NAPI_PENDING_EXCEPTION,
+                    "entry point {which}: refused while an exception is pending"
+                );
+                assert!(!answer, "entry point {which}: nothing is written");
+
+                let caught = take_exception(env);
+                assert!(
+                    strict_eq(env, named(env, caught, c"message"), eval(env, trap)),
+                    "entry point {which}: the pending exception is the trap's own"
+                );
+
+                // Control: the plain object answers, and the answer is `true`
+                // for all six (the two deletes come last).
+                assert_eq!(ask(which, plain, &mut answer), NAPI_OK, "{which}");
+                assert!(answer, "entry point {which}: a plain object answers");
+            }
+
+            // The out-pointer is required of the `has` family and optional
+            // for the `delete` family, as in Node.
+            assert_eq!(ask(0, plain, std::ptr::null_mut()), NAPI_INVALID_ARG);
+            assert_eq!(ask(3, plain, std::ptr::null_mut()), NAPI_INVALID_ARG);
+            assert_eq!(ask(4, plain, std::ptr::null_mut()), NAPI_OK);
+            assert_eq!(ask(5, plain, std::ptr::null_mut()), NAPI_OK);
+        });
+    }
+
+    /// The `has` / `delete` family returns what Node's returns, checked in
+    /// Node's order (js_native_api_v8.cc and the CHECK_* macros of
+    /// js_native_api_v8.h, v22.x):
+    /// 1. an exception already pending (NAPI_PREAMBLE): napi_pending_exception,
+    ///    whatever else is wrong -- a null key or name included;
+    /// 2. a null required `result`, or a null key handle: napi_invalid_arg;
+    /// 3. the object (CHECK_TO_OBJECT): a null handle is napi_invalid_arg;
+    ///    null or undefined is napi_object_expected with ToObject's TypeError
+    ///    left pending; a primitive is asked about as its wrapper object;
+    /// 4. after the object, napi_has_named_property's null name
+    ///    (napi_invalid_arg) and napi_has_own_property's key that is not a
+    ///    string or symbol (napi_name_expected);
+    /// 5. the question itself.
+    ///
+    /// So a call wrong in several ways reports what Node reports, and no
+    /// trap runs for a call that is refused.
+    #[test]
+    fn the_has_and_delete_family_checks_in_nodes_order() {
+        let mut rt = JsRuntime::new();
+        rt.with_napi_env(|env, _value| {
+            // Every trap counts itself and then answers as no proxy would.
+            eval(
+                env,
+                c"globalThis.__asked = 0;
+                  globalThis.__counting = () => new Proxy({ k: 1, 0: 'zero' }, new Proxy({}, {
+                    get: (t, trap) => (...args) => { globalThis.__asked++; return Reflect[trap](...args); },
+                  }));",
+            );
+            let counted = eval(env, c"globalThis.__counting()");
+            let key = eval(env, c"'k'");
+            let not_a_name = eval(env, c"1");
+            let undefined = eval(env, c"undefined");
+            let primitive = eval(env, c"'abc'");
+            let asked = |n: &std::ffi::CStr| strict_eq(env, eval(env, c"globalThis.__asked"), eval(env, n));
+            let no_result: *mut bool = std::ptr::null_mut();
+            let no_object: NapiValue = std::ptr::null_mut();
+            let no_key: NapiValue = std::ptr::null_mut();
+            // ToObject's TypeError, pending after napi_object_expected.
+            let took_type_error = |which: usize| {
+                assert!(is_pending(env), "entry point {which}: ToObject's throw is pending");
+                let caught = take_exception(env);
+                assert!(
+                    strict_eq(env, named(env, caught, c"name"), eval(env, c"'TypeError'")),
+                    "entry point {which}: the pending exception is ToObject's TypeError"
+                );
+            };
+            let mut answer = false;
+
+            for which in 0..6 {
+                let requires_result = which < 4;
+                // has_property, has_own_property, delete_property.
+                let takes_key = matches!(which, 0 | 2 | 4);
+                let ask = |object: NapiValue, key: NapiValue, answer: *mut bool| {
+                    ask_has_or_delete(env, which, object, key, answer)
+                };
+
+                // 2 before 3: a missing required result wins over a
+                // non-object; where it is optional the object check is next.
+                let status = ask(undefined, key, no_result);
+                if requires_result {
+                    assert_eq!(status, NAPI_INVALID_ARG, "entry point {which}: no result");
+                } else {
+                    assert_eq!(status, NAPI_OBJECT_EXPECTED, "entry point {which}: undefined");
+                    took_type_error(which);
+                }
+                // A null object handle is CHECK_ARG's napi_invalid_arg.
+                assert_eq!(
+                    ask(no_object, key, &mut answer),
+                    NAPI_INVALID_ARG,
+                    "entry point {which}: a null object handle"
+                );
+                // Undefined does not convert: napi_object_expected, with the
+                // TypeError pending.
+                assert_eq!(
+                    ask(undefined, key, &mut answer),
+                    NAPI_OBJECT_EXPECTED,
+                    "entry point {which}: undefined"
+                );
+                took_type_error(which);
+
+                if takes_key {
+                    // 2 before 3: a null key is refused before the object
+                    // is looked at, and before any trap.
+                    assert_eq!(ask(undefined, no_key, &mut answer), NAPI_INVALID_ARG, "{which}");
+                    assert!(!is_pending(env), "entry point {which}: nothing converted");
+                    assert_eq!(ask(counted, no_key, &mut answer), NAPI_INVALID_ARG, "{which}");
+                } else if which == 1 {
+                    // 3 before 4: the null name is looked at after the object.
+                    assert_eq!(ask(undefined, no_key, &mut answer), NAPI_OBJECT_EXPECTED);
+                    took_type_error(which);
+                    assert_eq!(ask(no_object, no_key, &mut answer), NAPI_INVALID_ARG);
+                    assert_eq!(ask(counted, no_key, &mut answer), NAPI_INVALID_ARG);
+                }
+                if which == 2 {
+                    // 3 before 4: a key that is not a name is judged after
+                    // the object, and then it is napi_name_expected.
+                    assert_eq!(ask(undefined, not_a_name, &mut answer), NAPI_OBJECT_EXPECTED);
+                    took_type_error(which);
+                    assert_eq!(ask(no_object, not_a_name, &mut answer), NAPI_INVALID_ARG);
+                    assert_eq!(ask(counted, not_a_name, &mut answer), NAPI_NAME_EXPECTED);
+                    assert!(!is_pending(env));
+                }
+
+                // 2 before 5: refused for its missing result, the question
+                // is never put.
+                if requires_result {
+                    assert_eq!(ask(counted, key, no_result), NAPI_INVALID_ARG, "{which}");
+                }
+                assert!(asked(c"0"), "entry point {which}: a trap ran for a refused call");
+
+                // A primitive is its wrapper: 'abc' has index 0 (a
+                // non-configurable one, so it is not deleted) and no `k`,
+                // whose delete is then a success.
+                let want = [false, false, false, true, true, false][which];
+                answer = !want;
+                assert_eq!(ask(primitive, key, &mut answer), NAPI_OK, "entry point {which}: 'abc'");
+                assert_eq!(answer, want, "entry point {which}: 'abc' asked as its String wrapper");
+            }
+
+            // 1 before everything: with an exception pending, each wrong
+            // call is napi_pending_exception, and still no trap runs.
+            // Made pending by a trap that throws it (napi_throw would do,
+            // at the price of one more unsafe block in this file).
+            let boom = eval(env, c"globalThis.__boom = new Error('already pending')");
+            let throwing = eval(
+                env,
+                c"new Proxy({}, new Proxy({}, { get: () => () => { throw globalThis.__boom; } }))",
+            );
+            for which in 0..6 {
+                assert_eq!(
+                    ask_has_or_delete(env, which, throwing, key, &mut answer),
+                    NAPI_PENDING_EXCEPTION
+                );
+                assert!(is_pending(env));
+                answer = false;
+                for (object, key, result) in [
+                    (undefined, key, no_result),
+                    (undefined, key, &raw mut answer),
+                    (no_object, key, &raw mut answer),
+                    (counted, key, no_result),
+                    (counted, key, &raw mut answer),
+                    (counted, no_key, &raw mut answer),
+                    (no_object, no_key, no_result),
+                    (counted, not_a_name, &raw mut answer),
+                    (primitive, key, &raw mut answer),
+                ] {
+                    assert_eq!(
+                        ask_has_or_delete(env, which, object, key, result),
+                        NAPI_PENDING_EXCEPTION,
+                        "entry point {which}: an exception is pending"
+                    );
+                }
+                assert!(!answer, "entry point {which}: nothing is written");
+                assert!(
+                    strict_eq(env, take_exception(env), boom),
+                    "entry point {which}: the pending exception is left as it was"
+                );
+            }
+            assert!(asked(c"0"), "a trap ran on top of a pending exception");
+
+            // Control: asked properly, the proxy's trap does run.
+            assert_eq!(ask_has_or_delete(env, 0, counted, key, &mut answer), NAPI_OK);
+            assert!(answer);
+            assert!(asked(c"1"));
+        });
+    }
+
+    /// napi_get_property_names hands every key back as a string, integer
+    /// indices included, as Node does (napi_key_numbers_to_strings): an addon
+    /// reads each one with napi_get_value_string_*. V8's default left the
+    /// indices as numbers.
+    #[test]
+    fn property_names_are_strings_even_for_integer_indices() {
+        let mut rt = JsRuntime::new();
+        rt.with_napi_env(|env, _value| {
+            let object = eval(env, c"Object.assign([10, 20], { x: 1 })");
+            let mut names: NapiValue = std::ptr::null_mut();
+            let mut length = 0u32;
+            let mut keys: [NapiValue; 3] = [std::ptr::null_mut(); 3];
+            // SAFETY: env and `object` as in `eval`; `names`, `length` and
+            // the elements of `keys` are live locals backing the
+            // out-pointers; `names` is read only after napi_ok.
+            unsafe {
+                assert_eq!(napi_get_property_names(env, object, &mut names), NAPI_OK);
+                assert_eq!(napi_get_array_length(env, names, &mut length), NAPI_OK);
+                for (index, key) in keys.iter_mut().enumerate() {
+                    assert_eq!(napi_get_element(env, names, index as u32, key), NAPI_OK);
+                }
+            }
+            assert_eq!(length, 3, "two indices and `x`");
+            assert!(
+                strict_eq(env, keys[0], eval(env, c"'0'")),
+                "index 0 is the string '0', not the number 0"
+            );
+            assert!(strict_eq(env, keys[1], eval(env, c"'1'")));
+            assert!(strict_eq(env, keys[2], eval(env, c"'x'")));
+        });
+    }
+
+    /// Call a `(env, value, *mut T)` entry point; hand back its status and
+    /// what it wrote (`initial` when it wrote nothing).
+    fn read<T>(
+        env: Env,
+        value: NapiValue,
+        initial: T,
+        entry: unsafe extern "C" fn(Env, NapiValue, *mut T) -> NapiStatus,
+    ) -> (NapiStatus, T) {
+        let mut written = initial;
+        // SAFETY: env and `value` as in `eval`; `written` is a live local of
+        // the type `entry` writes through its out-pointer.
+        let status = unsafe { entry(env, value, &mut written) };
+        (status, written)
+    }
+
+    /// napi_is_error is Node's test -- made by an Error constructor
+    /// (`IsNativeError`) -- not `instanceof globalThis.Error`, which an
+    /// object merely given `Error.prototype` passes and which user code can
+    /// point elsewhere.
+    #[test]
+    fn is_error_asks_how_the_value_was_made() {
+        let mut rt = JsRuntime::new();
+        rt.with_napi_env(|env, _value| {
+            let is_error = |value: NapiValue| read::<bool>(env, value, false, napi_is_error);
+            assert_eq!(is_error(eval(env, c"new TypeError('t')")), (NAPI_OK, true));
+            assert_eq!(
+                is_error(eval(env, c"new (class Mine extends Error {})()")),
+                (NAPI_OK, true),
+                "a subclass instance is made by an Error constructor"
+            );
+            assert_eq!(
+                is_error(eval(env, c"Object.create(Error.prototype)")),
+                (NAPI_OK, false),
+                "an object given Error.prototype was not made by one"
+            );
+            assert_eq!(
+                is_error(eval(env, c"({ message: 'm', stack: 's' })")),
+                (NAPI_OK, false)
+            );
+            assert_eq!(is_error(eval(env, c"'text'")), (NAPI_OK, false));
+            // The answer does not go through the global, which a script can
+            // replace.
+            let kept = eval(env, c"new RangeError('r')");
+            eval(env, c"globalThis.Error = class {}");
+            assert_eq!(is_error(kept), (NAPI_OK, true));
+        });
+    }
+
+    /// napi_get_value_int64 reads NaN and both infinities as 0, as Node
+    /// does; the infinities used to come back as i64::MAX and i64::MIN.
+    #[test]
+    fn get_value_int64_reads_a_non_finite_number_as_zero() {
+        let mut rt = JsRuntime::new();
+        rt.with_napi_env(|env, _value| {
+            let int64 = |source: &std::ffi::CStr| {
+                read::<i64>(env, eval(env, source), -1, napi_get_value_int64)
+            };
+            assert_eq!(int64(c"Infinity"), (NAPI_OK, 0));
+            assert_eq!(int64(c"-Infinity"), (NAPI_OK, 0));
+            assert_eq!(int64(c"NaN"), (NAPI_OK, 0));
+            // Finite values are untouched by the special case: truncated
+            // toward zero, exact through 2^53.
+            assert_eq!(int64(c"-3.9"), (NAPI_OK, -3));
+            assert_eq!(int64(c"2 ** 53"), (NAPI_OK, 1 << 53));
+            assert_eq!(int64(c"'7'"), (NAPI_NUMBER_EXPECTED, -1));
+        });
+    }
+
+    /// napi_create_buffer_copy writes its data out-pointer whatever the
+    /// size -- an empty copy used to leave the caller's variable unset --
+    /// and refuses bytes to copy from a null source.
+    #[test]
+    fn buffer_copy_writes_its_data_pointer_at_every_size() {
+        let source = [7u8, 8, 9];
+        let mut rt = JsRuntime::new();
+        rt.with_napi_env(|env, _value| {
+            // What the addon's variable holds before the call: C leaves it
+            // uninitialized, so anything but a written value is a bug.
+            let unset = std::ptr::without_provenance_mut::<c_void>(1);
+            let mut buffer: NapiValue = std::ptr::null_mut();
+            let mut data = unset;
+            let mut empty_data = unset;
+            let mut copied = [0u8; 3];
+            // SAFETY: env as in `eval`; `source` is valid for the 3 bytes
+            // declared (and is not read for a size of 0); every out-pointer
+            // is a live local or the null the entry point allows. `data` is
+            // read back for 3 bytes only after napi_ok, when it points at
+            // the 3-byte store of the buffer just made, which `buffer` keeps
+            // alive. The null source with a size is the input under test and
+            // must be refused before it is read.
+            unsafe {
+                assert_eq!(
+                    napi_create_buffer_copy(env, 3, source.as_ptr().cast(), &mut data, &mut buffer),
+                    NAPI_OK
+                );
+                assert!(!data.is_null() && data != unset, "a copy has data");
+                std::ptr::copy_nonoverlapping(data.cast::<u8>(), copied.as_mut_ptr(), 3);
+
+                assert_eq!(
+                    napi_create_buffer_copy(
+                        env,
+                        0,
+                        source.as_ptr().cast(),
+                        &mut empty_data,
+                        &mut buffer
+                    ),
+                    NAPI_OK
+                );
+                assert_eq!(
+                    napi_create_buffer_copy(env, 3, std::ptr::null(), &mut data, &mut buffer),
+                    NAPI_INVALID_ARG
+                );
+                assert_eq!(
+                    napi_create_buffer_copy(
+                        env,
+                        0,
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                        &mut buffer
+                    ),
+                    NAPI_OK,
+                    "nothing to copy needs no source"
+                );
+            }
+            assert_eq!(copied, source, "the bytes were copied");
+            assert_ne!(
+                empty_data, unset,
+                "an empty copy still writes its data out-pointer"
+            );
         });
     }
 

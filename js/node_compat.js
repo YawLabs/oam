@@ -5865,6 +5865,61 @@
         syscall,
       });
     };
+    // Whether the env grant hides the variable `name` (always false without
+    // --permission): the gate's own matcher, through permissions.query().
+    const envDenied = (name) => natives.permissionsQuery("env", name).state !== "granted";
+    // libuv's uv_os_homedir. One variable decides -- USERPROFILE on Windows,
+    // HOME everywhere else -- and only when it is UNSET does the account
+    // database answer: the profile directory on Windows, the effective
+    // uid's passwd record on unix. A HOME that is set but empty is the
+    // answer ("") on unix; a USERPROFILE shorter than three bytes is ENOENT
+    // on Windows, as is an account with no record. Measured on node
+    // v22.22.2 (Windows) and v22.23.2 (Linux).
+    //
+    // The variable is read from process.env's store: that is where a
+    // program's own `process.env.HOME = dir` lands (node's setter writes the
+    // environment uv_os_homedir reads), and it is already held to the env
+    // grant. An object the program put in process.env's place is not read
+    // (node's uv_os_homedir never sees it; measured on v22: after
+    // `process.env = {}` os.homedir() is still HOME). A
+    // worker thread with its own process.env is the exception: that is a
+    // copy its creator chose, which node does not consult here. It reads
+    // the value its creator's environment had when the worker was made
+    // (workerEnvOption's `base`), where node reads the process environment
+    // as it is at the call.
+    //
+    // Under --permission a variable the env grant leaves out reads as unset
+    // here as everywhere else, so the account database answers (node, with
+    // no env permission, reads the variable; docs/node-divergences.md entry
+    // 4). See registry.osHomeEnv, beside process.env.
+    const homedir = () => {
+      const name = isWin ? "USERPROFILE" : "HOME";
+      let home = registry.osHomeEnv(name);
+      if (home !== undefined) {
+        // A string already (the store, or a worker's base, holds strings).
+        home = `${home}`;
+        if (isWin) {
+          // libuv counts the value's UTF-8 bytes.
+          let bytes = 0;
+          for (let i = 0; i < home.length && bytes < 3; i++) {
+            const unit = home.charCodeAt(i);
+            bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+          }
+          if (bytes < 3) throw uvSystemError("ENOENT", "uv_os_homedir");
+        }
+        return home;
+      }
+      if (isWin) {
+        const profile = natives.homedir();
+        if (profile === undefined) throw uvSystemError("ENOENT", "uv_os_homedir");
+        return profile;
+      }
+      const record = natives.posixLookupId(3, natives.posixGetId(2));
+      if (record == null || typeof record.homedir !== "string") {
+        throw uvSystemError("ENOENT", "uv_os_homedir");
+      }
+      return record.homedir;
+    };
     return {
       EOL: isWin ? "\r\n" : "\n",
       devNull: isWin ? "\\\\.\\nul" : "/dev/null",
@@ -5880,8 +5935,50 @@
       // uname's `version` field on unix (the kernel build string, as node);
       // on Windows still the release string (node-divergences.md entry 15).
       version: () => natives.osRelease(true),
-      homedir: () => natives.homedir(),
-      tmpdir: () => natives.tmpdir(),
+      homedir,
+      // node's lib/os.js (Windows) and its GetTempDir (elsewhere), both over
+      // process.env -- a worker's own included -- so `process.env.TMPDIR =
+      // dir` moves it. On Windows that is whatever object process.env now
+      // is, one the program put there too; elsewhere it is the thread's
+      // store, which such an object does not replace (registry.osTmpEnv).
+      // An empty variable counts as unset, the order differs
+      // by platform (TEMP before TMP on Windows), and exactly one trailing
+      // separator goes, never a root's: `/` and `C:\` stay whole. Measured
+      // on v22.22.2 (Windows) and v22.23.2 (Linux). Windows with none of
+      // the four variables answers "undefined\temp", as node does. This was
+      // the launch environment's answer by std's rules: deaf to process.env,
+      // TMPDIR alone on unix, TMP before TEMP on Windows, and every trailing
+      // separator stripped (`/` came back as "").
+      //
+      // Under --permission a variable the env grant leaves out reads as unset
+      // here as everywhere else (node, with no env permission, reads it;
+      // docs/node-divergences.md entry 4): "/tmp" off Windows. On Windows
+      // node's last resort is SystemRoot / windir, and with both unset the
+      // literal "undefined\temp". That stays the answer when the program
+      // unset them, as in node; when the grant is what hides them the answer
+      // is the Windows directory the OS reports (natives.windowsDirectory),
+      // not a path that names no directory.
+      tmpdir: () => {
+        const read = registry.osTmpEnv;
+        if (isWin) {
+          const root = () => {
+            const value = read("SystemRoot") || read("windir");
+            if (value || !(envDenied("SystemRoot") || envDenied("windir"))) return value;
+            return natives.windowsDirectory() ?? value;
+          };
+          const path = read("TEMP") || read("TMP") || root() + "\\temp";
+          if (
+            path.length > 1 &&
+            path[path.length - 1] === "\\" &&
+            path[path.length - 2] !== ":"
+          ) {
+            return path.slice(0, -1);
+          }
+          return path;
+        }
+        const path = read("TMPDIR") || read("TMP") || read("TEMP") || "/tmp";
+        return path.length > 1 && path.endsWith("/") ? path.slice(0, -1) : path;
+      },
       hostname: () => natives.hostname(),
       // oam targets x86/arm64 (both LE); hardcoded -- revisit for BE platforms
       endianness: () => "LE",
@@ -5953,17 +6050,29 @@
         return a;
       },
       // libuv's uv_os_get_passwd. Windows has no uid/gid/shell (node answers
-      // -1, -1, null there); on POSIX it is the passwd record of the
+      // -1, -1, null there), and its two strings come from the account, not
+      // from process.env: the profile directory, and the user name the
+      // process was started under. On POSIX it is the passwd record of the
       // EFFECTIVE uid -- its gid, shell and home directory, not $HOME -- and
       // a uid with no record is ERR_SYSTEM_ERROR, as in node. The
       // `{ encoding: 'buffer' }` option is not implemented: strings always.
+      //
+      // On Windows a profile directory that cannot be determined makes
+      // os.userInfo() throw: ERR_SYSTEM_ERROR, syscall uv_os_get_passwd, code
+      // ENOENT. Node throws the same error class and syscall there, but its
+      // code is libuv's translation of the Win32 error GetUserProfileDirectoryW
+      // (or OpenProcessToken / GetUserNameW) failed with (src/win/util.c,
+      // uv__getpwuid_r), which need not be ENOENT. natives.homedir() asks
+      // GetUserProfileDirectoryW on the process token, as libuv does.
       userInfo: () => {
         if (isWin) {
+          const profile = natives.homedir();
+          if (profile === undefined) throw uvSystemError("ENOENT", "uv_os_get_passwd");
           return {
             uid: -1,
             gid: -1,
             username: natives.username(),
-            homedir: natives.homedir(),
+            homedir: profile,
             shell: null,
           };
         }
@@ -17548,13 +17657,30 @@
     // when its version has moved, writes go through to it.
     let envCache = null;
     // natives.envWorker(): null on the main thread; on a worker thread
-    // `{ shared, base }` -- the shared store's id (SHARE_ENV) and the values
-    // of libuv's Windows additions its creator's environment had.
+    // `{ shared, fold, real, base }` -- the shared store's id (SHARE_ENV),
+    // whether names fold case, whether that store is the process's real
+    // environment (a chain of SHARE_ENV workers that starts at the main
+    // thread), and `base`, the values its creator's real environment had
+    // when the worker was made of libuv's Windows additions (USERPROFILE
+    // among them) and, off Windows, HOME: what the worker's os.homedir()
+    // reads (registry.osHomeEnv) when its store is not the real one.
     let envWorkerInfo;
     const workerEnvInfo = () => {
       if (envWorkerInfo === undefined) envWorkerInfo = natives.envWorker() ?? null;
       return envWorkerInfo;
     };
+    // Whether this thread's store is the process's real environment, the one
+    // libuv reads (getenv): the main thread's, or one shared with it through
+    // SHARE_ENV, directly or by a SHARE_ENV worker re-sharing it. A store a
+    // worker with its own `env` shares through SHARE_ENV is that worker's
+    // custom object, not the real environment (measured on v22.22.2 Windows
+    // and v22.23.2 Linux: main -> worker `env: {HOME: x}` -> SHARE_ENV worker
+    // reads the main thread's HOME, before and after it assigns its own).
+    const envIsReal = () => {
+      const info = workerEnvInfo();
+      return !info || (info.shared !== undefined && info.real === true);
+    };
+    registry.processEnvIsReal = envIsReal;
     let envShared;
     let envSharedVersion = -1;
     const ensureEnv = () => {
@@ -17582,6 +17708,29 @@
     // ensureEnv swaps the store for a newer shared snapshot.
     let envFoldIndex = null;
     let envFoldIndexStore = null;
+    // os.tmpdir()'s variables. node's Windows os.tmpdir() is lib/os.js over
+    // process.env, the object the program may have replaced (measured on
+    // v22.22.2: `process.env = { TEMP: dir }` moves it, `process.env = {}`
+    // gives 'undefined\temp'); everywhere else it is GetTempDir over the
+    // thread's own store, which a replaced process.env does not touch
+    // (measured on v22.23.2: `process.env = {}` leaves it on TMPDIR). A name
+    // the env grant hides is not in the store, and reads as unset.
+    registry.osTmpEnv = (name) => {
+      const own = globalThis.process.env;
+      return natives.platform !== "win32" || own === env ? env[name] : own[name];
+    };
+    // uv_os_homedir's variable, from the process environment: never a
+    // process.env the program replaced (measured on v22: after
+    // `process.env = {}` os.homedir() is still HOME). The main thread and a
+    // worker whose store is the real environment (envIsReal) read this
+    // thread's store, live; any other worker reads the real environment as
+    // its creator saw it when the worker was made (workerEnvOption's
+    // `base`). A name the env grant hides is in neither, and reads as unset.
+    registry.osHomeEnv = (name) => (envIsReal() ? env[name] : workerEnvInfo().base[name]);
+    // This thread's process.env store (the proxy), whatever object the
+    // program has put at globalThis.process.env: what a Worker made without
+    // an `env` option copies, as node's copies its creator's store.
+    registry.processEnvStore = () => env;
     // Store `text` under `key` (undefined deletes it), in a shared store too.
     const envWrite = (store, key, text) => {
       if (text === undefined) delete store[key];
@@ -17605,8 +17754,10 @@
     // SHARE_ENV (worker_threads): from now on this thread's process.env is a
     // store it shares with the new worker. Returns the store's id.
     registry.shareProcessEnv = () => {
+      // ensureEnv first: in a SHARE_ENV worker it is what picks up the store
+      // the worker already shares, which a new store must not replace.
+      const store = ensureEnv();
       if (envShared === undefined) {
-        const store = ensureEnv();
         envShared = natives.envShareNew(
           JSON.stringify(
             Object.keys(store).map((key) => [key.toWellFormed(), store[key].toWellFormed()]),
@@ -17618,12 +17769,15 @@
     };
     // Where libuv's Windows additions to a child's environment are read
     // from: node's libuv reads the process's real environment, which is the
-    // main thread's process.env. A worker has the values its creator had
-    // when it was made (docs/node-divergences.md).
-    registry.childEnvBase = () => {
-      const info = workerEnvInfo();
-      return info ? info.base : env;
-    };
+    // main thread's process.env. A worker whose store is that environment
+    // (envIsReal: SHARE_ENV from the main thread, directly or through other
+    // SHARE_ENV workers) reads it, live, as registry.osHomeEnv does -- its
+    // `base` is a snapshot from its own creation, which a write to the
+    // shared store since (HOME, say) has made stale. Any other worker,
+    // including a SHARE_ENV one whose shared store is a worker's own `env`
+    // object, has the values the real environment had when its creator
+    // made it (docs/node-divergences.md).
+    registry.childEnvBase = () => (envIsReal() ? env : workerEnvInfo().base);
     // process.env is a string-coercing view: assigning a non-string coerces
     // via String() (NOT delete -- `process.env.X = undefined` reads back as
     // the literal string 'undefined'); symbol keys are rejected the way Node
@@ -18604,7 +18758,14 @@
         setgid: (id) => posixSetId(1, id, "gid"),
         seteuid: (id) => posixSetId(2, id, "uid"),
         setegid: (id) => posixSetId(3, id, "gid"),
-        getgroups: () => natives.posixGetGroups() ?? [],
+        // The supplementary groups plus the effective gid (the native adds
+        // it when getgroups(2) left it out, as node does); a failed
+        // getgroups(2) throws its errno, as node's does.
+        getgroups: () => {
+          const groups = natives.posixGetGroups();
+          if (typeof groups === "string") throw credentialSyscallError(groups, "getgroups");
+          return groups ?? [];
+        },
         setgroups: (groups) => {
           if (!Array.isArray(groups)) {
             throw new codes.ERR_INVALID_ARG_TYPE("groups", "Array", groups);
@@ -39089,13 +39250,15 @@
     // What the native server accepts connections with: the secure context
     // and the options Node's tlsConnectionListener reads off the server.
     function tlsAcceptArgs(server) {
-      var alpn = server.ALPNProtocols;
-      var names = null;
-      if (Array.isArray(alpn)) names = alpn.map(String);
-      else if (ArrayBuffer.isView(alpn)) {
-        names = registry._tlsServer.alpnWireNames(
-          new Uint8Array(alpn.buffer, alpn.byteOffset, alpn.byteLength));
-      }
+      // Through the server's one conversion (serverAlpnNames): an array
+      // assigned to server.ALPNProtocols after createServer used to reach
+      // the native op as it was, and an empty name or one over 255 bytes
+      // was refused there in the op's words. A name over 255 bytes is
+      // node's ERR_OUT_OF_RANGE, thrown by the assignment itself (the
+      // property's setter, below), which keeps the value it had; node takes
+      // the assignment and throws the same error, uncaught, on the next
+      // connection.
+      var names = registry._tlsServer.serverAlpnNames(server.ALPNProtocols);
       return [
         server._contextId,
         Math.min(Math.floor(server._handshakeTimeout), 2147483647),
@@ -39155,6 +39318,9 @@
               return current;
             },
             set(next) {
+              // Refused before it is stored: a list the conversion throws
+              // on would otherwise throw again from every later sync.
+              if (name === "ALPNProtocols") registry._tlsServer.serverAlpnNames(next);
               current = next;
               syncTls(this);
             },
@@ -40044,6 +40210,21 @@
       return [STDIO_PIPE, STDIO_PIPE, STDIO_PIPE];
     }
 
+    /** node's sanitizeKillSignal for spawnSync's `killSignal`: a string or a
+     *  number goes through the same check child.kill() makes
+     *  (validateKillSignal: ERR_UNKNOWN_SIGNAL for one this platform lacks)
+     *  and comes back as the NAME the native layer takes; null/undefined is
+     *  the default; anything else is ERR_INVALID_ARG_TYPE. */
+    function sanitizeKillSignal(killSignal) {
+      if (typeof killSignal === "string" || typeof killSignal === "number") {
+        return validateKillSignal(killSignal);
+      }
+      if (killSignal != null) {
+        throw codes.ERR_INVALID_ARG_TYPE("options.killSignal", ["string", "number"], killSignal);
+      }
+      return undefined;
+    }
+
     function spawnSync(command, args, options) {
       const norm = normalizeArgs(command, args, options);
       const opts = norm.options;
@@ -40063,6 +40244,9 @@
         // instead of paying for a hidden conhost.exe of its own.
         windowsHide: !!opts.windowsHide,
         timeout: opts.timeout || 0,
+        // What ends a child that outlives `timeout` or overflows `maxBuffer`:
+        // a validated signal NAME, or undefined for the default (SIGTERM).
+        killSignal: sanitizeKillSignal(opts.killSignal),
         maxBuffer: resolveMaxBuffer(opts, true),
         input: opts.input != null
           ? (typeof opts.input === "string" ? Buffer.from(opts.input, opts.encoding || "utf8") : opts.input)
@@ -47867,6 +48051,40 @@
       return names;
     }
 
+    // The names a SERVER selects among, for the native side, from whatever
+    // its ALPNProtocols holds when a connection arrives. createServer has
+    // already converted the option to the wire form, but the property is
+    // read for each connection and a program may have assigned an array
+    // since, so the value is converted again here, as node converts it again
+    // in each server-side TLSSocket: a name over 255 bytes throws node's
+    // ERR_OUT_OF_RANGE. A zero-length entry is passed over, not the end of
+    // the list: measured on node v22.23.2, a server given ['', 'h2'] or the
+    // wire bytes 00 02 'h' '2' negotiates h2. (The client's list is another
+    // matter -- node aborts on an empty name there -- so alpnWireNames is
+    // left as it is.) Nothing empty or over-long reaches the native op,
+    // which refuses both.
+    //
+    // Not node's: a server whose list is nothing but empty names. Node
+    // refuses every ALPN client (no_application_protocol); here the list is
+    // empty and the handshake goes on without a protocol.
+    function serverAlpnNames(value) {
+      var names = [];
+      if (!value) return names;
+      var converted = {};
+      convertALPNProtocols(value, converted);
+      var wire = converted.ALPNProtocols;
+      if (!wire) return names;
+      for (var i = 0; i < wire.length;) {
+        var len = wire[i++];
+        if (i + len > wire.length) break;
+        if (len > 0) {
+          names.push(globalThis.Buffer.from(wire.subarray(i, i + len)).toString("latin1"));
+        }
+        i += len;
+      }
+      return names;
+    }
+
     // PEM text of a `cert` / `key` / `ca` entry: a string as given, bytes as
     // UTF-8 (PEM is ASCII).
     function pemText(value) {
@@ -48304,7 +48522,26 @@
         }
         var requestCert = this.requestCert;
         var rejectUnauthorized = this.rejectUnauthorized;
-        var alpn = this.ALPNProtocols ? JSON.stringify(alpnWireNames(this.ALPNProtocols)) : undefined;
+        var alpn;
+        try {
+          alpn = this.ALPNProtocols ? JSON.stringify(serverAlpnNames(this.ALPNProtocols)) : undefined;
+        } catch (e) {
+          // An array put on server.ALPNProtocols after createServer, with a
+          // name the conversion refuses: node's TLSSocket constructor throws
+          // it out of the connection listener, uncaught.
+          //
+          // The TLSSocket was built over no handle (the accepted one is
+          // taken, and the plain wrapper let go of it above), so its
+          // destroy() closes nothing: the connection is closed here, or
+          // with an 'uncaughtException' listener installed it would stay
+          // open and the client would wait on it for ever.
+          natives.tcpClose(accepted.handle);
+          socket.destroy();
+          process.nextTick(() => {
+            throw e;
+          });
+          return;
+        }
         var handshake;
         try {
           handshake = natives.tlsAcceptWrap(
@@ -48312,6 +48549,12 @@
             requestCert, rejectUnauthorized, alpn,
           );
         } catch (e) {
+          // A synchronous refusal (its options, or a secure context that is
+          // gone) comes before the op takes the stream out of the TCP table,
+          // so the handle is still ours to close; the TLSSocket's destroy()
+          // in the rejection below cannot (see above). An asynchronous
+          // failure is the op's: it took the stream and dropped it.
+          natives.tcpClose(accepted.handle);
           handshake = Promise.reject(e);
         }
         handshake.then(
@@ -48494,6 +48737,7 @@
     // with the context tls.Server built.
     registry._tlsServer = {
       alpnWireNames: alpnWireNames,
+      serverAlpnNames: serverAlpnNames,
       serverSocketView: serverSocketView,
       takenServerSocket: takenServerSocket,
     };
@@ -49051,14 +49295,27 @@
      *  its own enumerable string-keyed entries, each value stringified. A
      *  worker's own store is case-sensitive; a shared one folds case as its
      *  creator's does. `base` is what libuv's Windows additions to a child's
-     *  environment are read from (registry.childEnvBase). */
+     *  environment are read from (registry.childEnvBase), and on other
+     *  platforms the HOME the worker's os.homedir() reads. */
     function workerEnvOption(option) {
       // node keeps the pairs as UTF-8, so a lone surrogate becomes U+FFFD.
       let env;
       if (option === SHARE_ENV) {
-        env = { shared: registry.shareProcessEnv(), fold: registry.processEnvFolds() };
+        // `real`: whether the store shared is the process's real
+        // environment (this is the main thread, or a SHARE_ENV worker whose
+        // own store is), so the new worker reads it for os.homedir() and
+        // libuv's additions to a child rather than its `base`.
+        env = {
+          shared: registry.shareProcessEnv(),
+          fold: registry.processEnvFolds(),
+          real: registry.processEnvIsReal(),
+        };
       } else if (option == null) {
-        const own = globalThis.process.env;
+        // This thread's store, not whatever object the program has put at
+        // process.env: node's Worker copies its creator's store (measured
+        // on v22: after `process.env = {}` a worker still has TMPDIR, HOME
+        // and the rest).
+        const own = registry.processEnvStore();
         env = {
           pairs: Object.keys(own).map((key) => [key.toWellFormed(), own[key].toWellFormed()]),
           fold: false,
@@ -49085,6 +49342,12 @@
           const value = from[name];
           if (value !== undefined) env.base.push([name, value]);
         }
+      } else {
+        // The one variable the worker's os.homedir() reads (USERPROFILE is
+        // in the Windows set above): libuv takes it from the process
+        // environment, not from the worker's own process.env.
+        const home = from.HOME;
+        if (home !== undefined) env.base.push(["HOME", `${home}`.toWellFormed()]);
       }
       return env;
     }

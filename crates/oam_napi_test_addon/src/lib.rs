@@ -563,6 +563,9 @@ fn counter_increment(native: *mut c_void) -> bool {
 ///
 /// Releases the counter registered for the wrapped pointer. Safe to call with
 /// any pointer, any number of times: only a registered counter is dropped.
+/// With the teardown probe armed and `f` among the steps
+/// `OAM_NAPI_TEARDOWN_CALL` names, it then calls into JS (see
+/// [`teardown_call_js`]).
 ///
 /// No e2e script forces a collection, so the collected-object path is not
 /// exercised from this addon. The teardown path is: the e2e suite's
@@ -574,6 +577,7 @@ fn counter_increment(native: *mut c_void) -> bool {
 extern "C" fn counter_finalize(_env: NapiEnv, data: *mut c_void, _hint: *mut c_void) {
     counter_release(data);
     teardown_note("finalize");
+    teardown_call_js("f");
 }
 
 /// wrapCounter() -> obj
@@ -1838,42 +1842,54 @@ fn teardown_note(line: &str) {
 }
 
 /// The three cleanup hooks the probe registers; `arg` only names them.
-/// With `OAM_NAPI_TEARDOWN_CALL` set as well, hook 3 then calls
-/// `globalThis.__oamTeardownCall()` -- addon code that runs JS from a
-/// cleanup hook -- and logs `call:status=N`.
+/// A hook whose number is among the steps `OAM_NAPI_TEARDOWN_CALL` names
+/// then calls into JS (see [`teardown_call_js`]).
 extern "C" fn teardown_hook(arg: *mut c_void) {
     teardown_note(&format!("hook:{}", arg.addr()));
-    if arg.addr() == 3 && std::env::var_os("OAM_NAPI_TEARDOWN_CALL").is_some() {
-        let env = TEARDOWN_ENV.load(std::sync::atomic::Ordering::Relaxed);
-        let mut global: NapiValue = std::ptr::null_mut();
-        let mut function: NapiValue = std::ptr::null_mut();
-        let mut result: NapiValue = std::ptr::null_mut();
-        // SAFETY: `HOST` was resolved before any hook was registered. `env`
-        // is the env this image registered its hooks on, which the host runs
-        // them with, so it is the env of this call. The name is a static,
-        // NUL-terminated literal; `global`, `function` and `result` are live
-        // locals backing the out-pointers, and a `napi_value` the host wrote
-        // is passed back only within this call. No arguments are passed (a
-        // null argv with argc 0).
-        let status = unsafe {
-            let host = host();
-            let mut status = (host.get_global)(env, &mut global);
-            if status == 0 {
-                status = (host.get_named_property)(
-                    env,
-                    global,
-                    c"__oamTeardownCall".as_ptr(),
-                    &mut function,
-                );
-            }
-            if status == 0 {
-                status =
-                    (host.call_function)(env, global, function, 0, std::ptr::null(), &mut result);
-            }
-            status
-        };
-        teardown_note(&format!("call:status={status}"));
+    teardown_call_js(&arg.addr().to_string());
+}
+
+/// Call `globalThis.__oamTeardownCall()` -- addon code that runs JS from a
+/// teardown step -- and log `call:status=N`, the status of the last N-API
+/// call made (10, `napi_pending_exception`, when the function threw; the
+/// exception is left pending, as an addon that ignores the status leaves
+/// it). A no-op unless the probe is armed and `OAM_NAPI_TEARDOWN_CALL`
+/// contains `step`: `3` or `1` for that cleanup hook, `f` for every
+/// finalizer (`counter_finalize`).
+fn teardown_call_js(step: &str) {
+    if TEARDOWN_LOG.get().is_none()
+        || !std::env::var("OAM_NAPI_TEARDOWN_CALL").is_ok_and(|steps| steps.contains(step))
+    {
+        return;
     }
+    let env = TEARDOWN_ENV.load(std::sync::atomic::Ordering::Relaxed);
+    let mut global: NapiValue = std::ptr::null_mut();
+    let mut function: NapiValue = std::ptr::null_mut();
+    let mut result: NapiValue = std::ptr::null_mut();
+    // SAFETY: the probe is armed (checked above), which happens only after
+    // `HOST` was resolved. `env` is the env this image registered its hooks
+    // and wraps on, which the host runs its teardown steps with, so it is
+    // the env of this call. The name is a static, NUL-terminated literal;
+    // `global`, `function` and `result` are live locals backing the
+    // out-pointers, and a `napi_value` the host wrote is passed back only
+    // within this call. No arguments are passed (a null argv with argc 0).
+    let status = unsafe {
+        let host = host();
+        let mut status = (host.get_global)(env, &mut global);
+        if status == 0 {
+            status = (host.get_named_property)(
+                env,
+                global,
+                c"__oamTeardownCall".as_ptr(),
+                &mut function,
+            );
+        }
+        if status == 0 {
+            status = (host.call_function)(env, global, function, 0, std::ptr::null(), &mut result);
+        }
+        status
+    };
+    teardown_note(&format!("call:status={status}"));
 }
 
 /// The library destructor: runs when this image is unloaded, or at process

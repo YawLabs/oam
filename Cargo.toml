@@ -219,8 +219,10 @@ rustls-platform-verifier = "0.7"
 security-framework = "3"
 # TLS client/server: tokio-rustls wraps rustls for async IO; webpki-roots
 # bundles Mozilla's CA store for public HTTPS; rustls-pemfile parses PEM.
-# All three are already compiled transitively via tokio-tungstenite --
-# promoting to direct deps adds zero new compilation units.
+# The first two are already compiled transitively via tokio-tungstenite, so
+# promoting them to direct deps adds no package. rustls-pemfile is not: no
+# other package in Cargo.lock depends on it, so it is in the graph only
+# because oam_core asks for it.
 tokio-rustls = { version = "0.26", default-features = false }
 webpki-roots = "0.26"
 rustls-pemfile = "2"
@@ -247,10 +249,16 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 # N-API: dlopen for .node addons (and the test addon's host-symbol lookup).
 libloading = "0.8"
 clap = { version = "4", features = ["derive"] }
-# os/process native values on macOS + other non-linux unix: total/free mem,
-# CPU model/speed, process RSS, parent PID. Windows uses FFI/registry and
-# linux reads /proc directly; sysinfo backs the remaining unix targets, plus
-# os.loadavg() on every unix (a safe wrapper over /proc/loadavg / getloadavg).
+# os/process native values. Used on EVERY target, so do not target-scope it
+# (oam_engine/src/node_ops.rs):
+#   - all platforms: os.hostname();
+#   - Windows: os.networkInterfaces() (sysinfo::Networks);
+#   - every unix: the kernel release behind os.release() / os.version(), and
+#     os.loadavg() (a safe wrapper over /proc/loadavg / getloadavg);
+#   - linux: the os.uptime() fallback when /proc/uptime is unreadable;
+#   - macOS + other non-linux unix: total/free mem, CPU model/speed, process
+#     RSS, parent PID, uptime. For these Windows uses FFI/registry and linux
+#     reads /proc directly.
 sysinfo = "0.39"
 
 # TypeScript strip/transform pipeline (the wedge): pinned as a family —

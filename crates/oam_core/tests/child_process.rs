@@ -806,6 +806,7 @@ fn run_sync(
         false,
         timeout_ms,
         max_buffer,
+        None,
         stdio_pipe_all(),
         false,
         false,
@@ -889,6 +890,265 @@ fn spawn_sync_ends_a_child_that_overflows_max_buffer() {
     assert!(result.stdout.len() <= 16, "the kept output is capped");
 }
 
+/// `sh -c script` through `spawn_sync` with a `killSignal`, as
+/// `(error code, status, signal, stdout)`. The call runs on its own thread so
+/// that a child this crate fails to end fails the test instead of hanging the
+/// whole run.
+#[cfg(unix)]
+fn sync_sh_ended(
+    script: &'static str,
+    timeout_ms: u64,
+    max_buffer: usize,
+    kill_signal: Option<&'static str>,
+) -> (Option<String>, Option<i32>, Option<String>, Vec<u8>) {
+    let (done, result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = oam_core::child::spawn_sync(
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            None,
+            None,
+            None,
+            false,
+            timeout_ms,
+            max_buffer,
+            kill_signal,
+            stdio_pipe_all(),
+            false,
+            false,
+            None,
+        );
+        let _ = done.send((
+            result.error.map(|e| e.code),
+            result.status,
+            result.signal,
+            result.stdout,
+        ));
+    });
+    result
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap_or_else(|_| panic!("spawn_sync never returned for `{script}`"))
+}
+
+/// A child that survives the kill signal and keeps writing is not waited on
+/// for ever: the read ends close once the signal has been sent, as node's do,
+/// so the writer meets a closed pipe. Its output used to stay unread behind
+/// open read ends, and the child blocked in write(2) with `spawn_sync`
+/// blocked on the child.
+///
+/// Every expectation is node v22.23.2's for the same call (Linux, three runs,
+/// all alike). The shell ignores SIGTERM and so does the `yes` it runs (an
+/// ignored signal is inherited); `yes` dies of SIGPIPE and the shell goes on
+/// to its `exit 3`. In the loop the shell is the writer itself and SIGPIPE is
+/// what ends it.
+///
+/// Every case needs the trap in place before the signal arrives: a SIGTERM
+/// that beats it kills the shell outright (signal SIGTERM). The overflow case
+/// is ordered by construction -- nothing is written until the trap is set, so
+/// the limit cannot be crossed before it. The timeout cases cannot be ordered
+/// that way: the timer runs from the spawn, whatever the child is doing. Their
+/// timeout is therefore `SH_TRAP_MARGIN_MS`, far past the few milliseconds sh
+/// takes to reach its first command, rather than the 200 ms they used, which
+/// a loaded box could outrun. At that length the loops still write far less
+/// than the 64 MiB `max_buffer` (a few MB/s of `echo y`), so the timeout is
+/// what ends them.
+#[cfg(unix)]
+#[test]
+fn spawn_sync_closes_its_pipes_on_a_child_that_ignores_the_kill() {
+    let (error, status, signal, stdout) =
+        sync_sh_ended("trap \"\" TERM; yes; exit 3", 0, 1024, None);
+    assert_eq!(error.as_deref(), Some("ENOBUFS"));
+    assert_eq!((status, signal.as_deref()), (Some(3), None));
+    assert!(stdout.len() <= 1024, "the kept output is capped");
+
+    let (error, status, signal, _) = sync_sh_ended(
+        "trap \"\" TERM; while :; do echo y; done",
+        SH_TRAP_MARGIN_MS,
+        64 << 20,
+        None,
+    );
+    assert_eq!(error.as_deref(), Some("ETIMEDOUT"));
+    assert_eq!((status, signal.as_deref()), (None, Some("SIGPIPE")));
+
+    // A writer the shell waits on, on stderr: the subshell inherits the
+    // ignored SIGTERM, dies of SIGPIPE, and the shell goes on to its exit.
+    let (error, status, signal, _) = sync_sh_ended(
+        "trap \"\" TERM; (while :; do echo y; done) 1>&2; exit 3",
+        SH_TRAP_MARGIN_MS,
+        64 << 20,
+        None,
+    );
+    assert_eq!(error.as_deref(), Some("ETIMEDOUT"));
+    assert_eq!((status, signal.as_deref()), (Some(3), None));
+}
+
+/// The timeout `spawn_sync`'s trap tests give a shell whose first command
+/// installs a trap. The timer runs from the spawn, so nothing orders the trap
+/// before the signal; this margin makes a signal that beats it (and kills the
+/// shell outright, reporting SIGTERM) need a sh startup hundreds of times its
+/// usual few milliseconds. The cost is the margin's wall time per case.
+#[cfg(unix)]
+const SH_TRAP_MARGIN_MS: u64 = 2_000;
+
+/// What a trapping child reports, again as node v22.23.2 measures it. A
+/// handler that only exits reports its code. One that prints first writes
+/// into a pipe node has already closed: it dies of SIGPIPE, and nothing it
+/// printed is in the result. (The shell runs the trap when the foreground
+/// `sleep` returns, seconds after the timeout closed the pipes, so the
+/// print-or-close order is not a race.)
+///
+/// Both are timeout cases, so the trap is ordered before the signal only by
+/// the margin (`SH_TRAP_MARGIN_MS`); the sleep outlasts the margin by two
+/// seconds, as it outlasted the old 200 ms timeout by 800 ms.
+#[cfg(unix)]
+#[test]
+fn spawn_sync_reports_how_a_trapping_child_went() {
+    let (error, status, signal, _) = sync_sh_ended(
+        "trap \"exit 7\" TERM; while :; do sleep 0.05; done",
+        SH_TRAP_MARGIN_MS,
+        1 << 20,
+        None,
+    );
+    assert_eq!(error.as_deref(), Some("ETIMEDOUT"));
+    assert_eq!((status, signal.as_deref()), (Some(7), None));
+
+    let (error, status, signal, stdout) = sync_sh_ended(
+        "trap \"echo trapped; exit 7\" TERM; sleep 4",
+        SH_TRAP_MARGIN_MS,
+        1 << 20,
+        None,
+    );
+    assert_eq!(error.as_deref(), Some("ETIMEDOUT"));
+    assert_eq!((status, signal.as_deref()), (None, Some("SIGPIPE")));
+    assert!(stdout.is_empty(), "the handler's output is not read");
+}
+
+/// `killSignal` is what a `maxBuffer` overflow sends too, not only a timeout:
+/// a child with the default disposition dies of it, one that traps it exits
+/// by its own code (after `yes` has met the closed pipe). Node v22.23.2's
+/// results for the same calls.
+#[cfg(unix)]
+#[test]
+fn spawn_sync_overflow_sends_the_kill_signal_asked_for() {
+    let (error, status, signal, _) = sync_sh_ended("yes; exit 3", 0, 1024, Some("SIGUSR1"));
+    assert_eq!(error.as_deref(), Some("ENOBUFS"));
+    assert_eq!((status, signal.as_deref()), (None, Some("SIGUSR1")));
+
+    let (error, status, signal, _) = sync_sh_ended(
+        "trap \"exit 9\" USR1; yes; exit 3",
+        0,
+        1024,
+        Some("SIGUSR1"),
+    );
+    assert_eq!(error.as_deref(), Some("ENOBUFS"));
+    assert_eq!((status, signal.as_deref()), (Some(9), None));
+}
+
+/// Smoke test: what the child wrote before the timeout is in the result, as
+/// node's sync spawn has it (node reads as the bytes arrive), and the child is
+/// ended by the timeout (`exec`, so the signal reaches the sleeper itself).
+///
+/// This does NOT pin the fix for bytes that reach the pipe in the same drain
+/// wake-up as the cancel: the drain reads the marker milliseconds after it is
+/// written, a second before the cancel, so it passed on the code that dropped
+/// such bytes too. A child cannot be made to land bytes deterministically
+/// between the drain's last read and the cancel -- its writes race the drain
+/// thread, and a TERM handler's output races the read-end release (and node
+/// itself drops that output: `spawn_sync_reports_how_a_trapping_child_went`).
+/// The deterministic tests are the unit tests in `child.rs`
+/// (`sync_drain_cancel_tests`): `bytes_already_in_the_pipe_when_the_cancel_is_seen_are_kept`
+/// for the final pass, and `the_stop_waits_for_the_final_pass_before_the_sink_is_taken`
+/// for the wait before the result is taken.
+#[cfg(unix)]
+#[test]
+fn spawn_sync_timeout_result_keeps_earlier_output_smoke() {
+    let (error, status, signal, stdout) =
+        sync_sh_ended("printf marker; exec sleep 30", 1000, 1 << 20, None);
+    assert_eq!(error.as_deref(), Some("ETIMEDOUT"));
+    assert_eq!((status, signal.as_deref()), (None, Some("SIGTERM")));
+    assert!(
+        String::from_utf8_lossy(&stdout).contains("marker"),
+        "the marker written before the timeout is kept: {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+}
+
+/// A child that exited by itself while a grandchild still holds its stdout
+/// and stderr: the result reports the child's own exit, keeps what it wrote,
+/// and comes back without waiting for the grandchild (the drains are
+/// cancelled past the grace, and their final passes are waited for -- bounded
+/// -- before the result is taken). The grandchild outlives the call by far,
+/// so a return that waited on it would be seen. The 2 s timeout is only there
+/// to give the shell ample time to exit by itself first; the marker is read
+/// long before the cancel, so this covers the path, not the same-wake-up
+/// case (see the smoke test above).
+#[cfg(unix)]
+#[test]
+fn spawn_sync_returns_the_exit_of_a_child_whose_grandchild_holds_its_pipes() {
+    let started = std::time::Instant::now();
+    let (error, status, signal, stdout) =
+        sync_sh_ended("printf marker; sleep 20 & exit 0", 2000, 1 << 20, None);
+    let took = started.elapsed();
+    assert_eq!(error.as_deref(), Some("ETIMEDOUT"));
+    assert_eq!((status, signal.as_deref()), (Some(0), None));
+    assert!(
+        String::from_utf8_lossy(&stdout).contains("marker"),
+        "the child's output is kept: {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+    assert!(
+        took < std::time::Duration::from_secs(10),
+        "spawn_sync waited {took:?}, as if for the grandchild"
+    );
+}
+
+/// Ending the child closes its stdin too, as node's `Kill` closes all three
+/// pipes: the input not yet written is dropped and the child reads EOF after
+/// what was already in the pipe. The writer used to keep feeding a survivor
+/// for as long as it lived. The child ignores SIGTERM and reads nothing until
+/// well after it is ended, then counts its whole stdin into a file (its
+/// stdout is closed by then): far less than the input arrives.
+///
+/// The end comes from a `maxBuffer` overflow the child itself causes, AFTER
+/// its `trap '' TERM` has run, so the SIGTERM can never arrive before the
+/// trap is in place. (A timeout raced the shell's startup: under load sh died
+/// of the SIGTERM before it ran the trap, and that read as a stdin bug.) The
+/// overflow and the timeout end the child through the same path.
+#[cfg(unix)]
+#[test]
+fn spawn_sync_closes_stdin_when_it_ends_the_child() {
+    let count_file =
+        std::env::temp_dir().join(format!("oam-sync-stdin-count-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&count_file);
+    let path = count_file.to_string_lossy().into_owned();
+    let input = vec![b'x'; 4 << 20];
+    let result = run_sync(
+        "sh",
+        &[
+            "-c",
+            "trap '' TERM; head -c 4096 /dev/zero; sleep 1; wc -c > \"$1\"",
+            "sh",
+            path.as_str(),
+        ],
+        Some(&input),
+        0,
+        1024,
+    );
+    let counted = std::fs::read_to_string(&count_file);
+    let _ = std::fs::remove_file(&count_file);
+    assert_eq!(sync_error(&result), Some("ENOBUFS"));
+    assert_eq!((result.status, result.signal.as_deref()), (Some(0), None));
+    let counted: usize = counted
+        .expect("the child wrote its count")
+        .trim()
+        .parse()
+        .expect("a byte count");
+    assert!(
+        counted < input.len(),
+        "the child read all {counted} bytes: its stdin stayed open past the kill"
+    );
+}
+
 /// The Windows argv0 path of spawnSync closes the child's stdin: after the
 /// input when there is one, at once when there is none. It used to keep the
 /// write end open for the whole wait, so a child reading stdin to EOF never
@@ -950,6 +1210,7 @@ fn spawn_sync_argv0_runs_a_shell_command_verbatim() {
         Some("renamed"),
         20_000,
         1 << 20,
+        None,
         true,
     );
     assert_eq!(sync_error(&result), None);

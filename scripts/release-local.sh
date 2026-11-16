@@ -533,6 +533,34 @@ assert_tree_clean() {
   fail "$1: the working tree is dirty (paths above) -- the builds would ship them without their being in $TAG. Nothing has been built and no release exists yet; clean the tree and re-run (the tag has no release, so the re-run reconciles it)"
 }
 
+# assert_head_is_tag <context> -- fail unless HEAD is still the commit $TAG
+# points at. Both are re-read from git on every call, never taken from a
+# variable an earlier step filled.
+#
+# assert_tree_clean cannot see this: a commit or a branch switch made in this
+# checkout while the gate or a leg runs (another session shares it) leaves the
+# tree porcelain-clean. Every leg builds the working tree, so from then on the
+# assets would be built from a commit that is not $TAG and published as $TAG.
+# The tag reconciliation proves HEAD == $TAG once; the gate and the legs run
+# for over an hour after it, so this is called again around every build and
+# leg, before staging, and before the draft.
+assert_head_is_tag() {
+  local head_now tag_now
+  head_now="$(git rev-parse --verify --quiet HEAD 2>/dev/null)" \
+    || fail "$1: could not read HEAD"
+  tag_now="$(git rev-parse --verify --quiet "${TAG}^{commit}" 2>/dev/null)" \
+    || fail "$1: tag $TAG no longer resolves in this checkout -- it was at HEAD when this run reconciled it"
+  [ "$head_now" = "$tag_now" ] && return 0
+  fail "$1: HEAD is $head_now but $TAG points at $tag_now -- a commit or a checkout moved HEAD in this checkout mid-run, and every leg builds the working tree, so anything built since is not $TAG. No release exists yet. Re-run: with HEAD back at $tag_now it rebuilds $TAG, with the new HEAD on origin/main it re-points the unpublished tag there"
+}
+
+# on_main_branch -- true when HEAD is the local branch main: not detached, not
+# another branch that happens to sit at a commit on origin/main (which is all
+# the pre-tag ancestor check asks of a run that needs no bump).
+on_main_branch() {
+  [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)" = "main" ]
+}
+
 # assert_release_unpublished <context> -- fail unless $TAG has no release on
 # $REPO yet, draft or live.
 #
@@ -664,8 +692,17 @@ free_locked_bin() {
 # end to end and unattended -- branch, PR, `gh pr merge --admin` (the
 # documented override for a ruleset-gated merge) -- then realign local main to
 # whatever origin ended up with, because a squash merge mints a new SHA.
+#
+# Only from main. `git push origin main` pushes the local main REF, not HEAD:
+# from a detached HEAD or another branch the commit just made is not on that
+# ref, so the push would exit 0 ("Everything up-to-date") and the line below
+# would report a landing that never happened -- or push whatever else local
+# main carried. Every caller checks this before it commits; refusing here too
+# keeps the "landed on main" line true whoever calls.
 land_on_main() {
   local subject="$1" want_version="$2" branch_name merged_sha
+  on_main_branch \
+    || fail "cannot land '$subject': HEAD is not on main, so pushing main would not carry this commit -- it is local-only; land it by hand"
   if git push origin main; then
     ok "landed on main: $subject"
     return 0
@@ -999,7 +1036,7 @@ else
   # release over a regeneration the operator then has to do by hand, mid-run, on
   # top of a Cargo.toml this block has already rewritten. Regenerating and
   # carrying the result in the SAME commit is what keeps the tag internally
-  # consistent. The --check half still exists -- as ci-local.sh step 11, which
+  # consistent. The --check half still exists -- as ci-local.sh step 12, which
   # runs further down on the post-bump tree and covers the manual-bump path too.
   node npm/sync-packages.mjs >&2 \
     || fail "could not regenerate the npm manifests ('node npm/sync-packages.mjs') -- fix and re-run"
@@ -1241,6 +1278,11 @@ fi
 # are the sole dirty paths -- any other dirt it leaves in place and returns 0.
 # So check again before the first build starts.
 assert_tree_clean "after the local gate"
+# ... and that it is still the tag's tree: clean says nothing about WHICH
+# commit is checked out, and the gate ran for the better part of an hour in a
+# checkout other sessions share. Re-checked at every step boundary below, up
+# to the draft (see assert_head_is_tag).
+assert_head_is_tag "after the local gate"
 
 # --- local Windows legs ---------------------------------------------------------
 step "Build oam-aarch64-pc-windows-msvc.exe (local, native)"
@@ -1258,6 +1300,8 @@ step "Build oam-aarch64-pc-windows-msvc.exe (local, native)"
 # -- see scripts/lib/build-locks.sh.
 free_locked_bin target/release
 cargo build --release -p oam_cli
+# After the build as well as before it: cargo read the sources for minutes.
+assert_head_is_tag "after the native Windows build"
 cp target/release/oam.exe "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"
 sign_win_asset "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"
 smoke "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"
@@ -1288,6 +1332,7 @@ else
   # to target/x64-host/release (mirrored in scripts/gc-target.sh's TREES).
   CARGO_TARGET_DIR=target/x64-host \
     cargo +"$pinned_rust-x86_64-pc-windows-msvc" build --release -p oam_cli
+  assert_head_is_tag "after the win-x64 build"
   cp target/x64-host/release/oam.exe "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"
   sign_win_asset "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"
   smoke "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"   # runs under the OS's x64 emulation
@@ -1334,9 +1379,16 @@ else
   # instead of resuming a half-built leg. The [fail]/log-path message on
   # final failure is the driver's own -- it prints the log tail above it, per
   # attempt.
+  #
+  # The driver tars the working tree (lib/src-sync.sh) and checks neither HEAD
+  # nor the tag, so both sides of the leg are checked here: before, so a moved
+  # HEAD costs no leg; after, because a retry re-tars whatever is checked out
+  # by then.
+  assert_head_is_tag "before the mac leg"
   MAC_ART=$(run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "mac leg" \
     bash "$SCRIPT_DIR/build-platforms-tailnet.sh" --mode=release) \
     || fail "mac leg failed -- see its log output above"
+  assert_head_is_tag "after the mac leg"
   MAC_ART="${MAC_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line
   # The two exact asset names, never a glob: whatever else lands in the leg's
   # artifact dir must not ride into SHA256SUMS and onto the release.
@@ -1363,8 +1415,11 @@ else
   if [ "${OAM_KEEP_VM:-0}" = "1" ] && [ "$OAM_RELEASE_LEG_ATTEMPTS" -gt 1 ]; then
     note "OAM_KEEP_VM=1 applies to the last of the $OAM_RELEASE_LEG_ATTEMPTS linux attempts: an earlier one stops its VM and releases the Mac build lock, so a retry is not BUSY on it"
   fi
+  # Same two HEAD checks as the mac leg, for the same reason.
+  assert_head_is_tag "before the linux leg"
   LINUX_ART=$(run_with_attempts "$OAM_RELEASE_LEG_ATTEMPTS" "linux leg" linux_leg_attempt) \
     || fail "linux leg failed -- see its log output above"
+  assert_head_is_tag "after the linux leg"
   LINUX_ART="${LINUX_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line
   cp "$LINUX_ART/oam-x86_64-unknown-linux-gnu" "$RELEASE_DIR/"
 fi
@@ -1380,6 +1435,8 @@ fi
 # SHA256SUMS -- and the signed manifest that wraps it -- list them too: the
 # installers copy them beside the binary and check each one against it.
 step "Stage license + attribution alongside the binaries"
+# These three are copied from the working tree too.
+assert_head_is_tag "before staging the license files"
 for f in LICENSE NOTICE THIRD_PARTY_LICENSES.md; do
   [ -f "$REPO_DIR/$f" ] || fail "$f missing from the repo -- it must ship with the release"
   cp "$REPO_DIR/$f" "$RELEASE_DIR/$f"
@@ -1583,6 +1640,11 @@ step "Cut GitHub Release $TAG"
 # mid-upload failure is retried into the draft (complete_draft); one that
 # still fails leaves a DRAFT (delete it and re-run), never a live
 # half-release that install.sh / self-update could resolve.
+#
+# The last HEAD check, and the one every earlier one backs up: --verify-tag
+# below proves only that the tag exists on the remote, not that the assets
+# were built from it.
+assert_head_is_tag "before cutting the release"
 create_rc=0
 gh release create "$TAG" "$RELEASE_DIR"/* \
   --repo "$REPO" \
@@ -1655,6 +1717,40 @@ refresh_site_downloads() {
   return 0
 }
 
+# write_site_installers <repo> <tag> <public-dir> -- put <tag>'s
+# install/install.sh and install/install.ps1 into <public-dir>, both or
+# neither. Each is read into a temp file beside its target and renamed over it
+# only once BOTH reads succeeded: a redirect straight onto the target truncates
+# it before git show runs, so a failed read used to leave an empty installer
+# that the commit and the deploy below then published. Returns 1, with both
+# targets as they were and no temp file left behind (the deploy publishes
+# everything under public/), when either read or either rename fails; git's
+# own message is on stderr.
+write_site_installers() {
+  local repo="$1" tag="$2" dir="$3" f
+  local bak="$dir/install.sh.release-bak"
+  for f in install.sh install.ps1; do
+    if ! git -C "$repo" show "$tag:install/$f" > "$dir/$f.release-tmp"; then
+      rm -f "$dir/install.sh.release-tmp" "$dir/install.ps1.release-tmp"
+      return 1
+    fi
+  done
+  # A rename within one directory does not fail halfway, but if the second one
+  # fails the first is put back, so the pair is never half this release's.
+  rm -f "$bak"
+  if { [ -e "$dir/install.sh" ] && ! cp -p "$dir/install.sh" "$bak"; } \
+     || ! mv -f "$dir/install.sh.release-tmp" "$dir/install.sh"; then
+    rm -f "$dir/install.sh.release-tmp" "$dir/install.ps1.release-tmp" "$bak"
+    return 1
+  fi
+  if ! mv -f "$dir/install.ps1.release-tmp" "$dir/install.ps1"; then
+    if [ -e "$bak" ]; then mv -f "$bak" "$dir/install.sh"; else rm -f "$dir/install.sh"; fi
+    rm -f "$dir/install.ps1.release-tmp" "$bak"
+    return 1
+  fi
+  rm -f "$bak"
+}
+
 # --- publish the installers to oamjs.org -----------------------------------------
 # The installers at https://oamjs.org/install.{sh,ps1} are what users pipe into
 # sh / iex, and `oam self-update` in binaries before v0.18.0 does the same
@@ -1676,9 +1772,14 @@ else
   # stamps and the verification below. Under set -e an unguarded one ends the
   # whole run: a rejected site push would leave the taps unbumped, the stamps
   # unlanded and the live site unverified.
-  { cp "$REPO_DIR/install/install.sh" "$SITE_DIR/public/install.sh" \
-      && cp "$REPO_DIR/install/install.ps1" "$SITE_DIR/public/install.ps1"; } \
-    || warn "could not copy install/ into $SITE_DIR/public -- the site keeps its previous installers"
+  # Read from $TAG, not the working tree: the last HEAD check was before the
+  # draft, and a commit or checkout since then must not put installers on the
+  # site that are not the release's.
+  site_installers_ok=1
+  if ! write_site_installers "$REPO_DIR" "$TAG" "$SITE_DIR/public"; then
+    site_installers_ok=0
+    warn "could not read $TAG's install/ scripts into $SITE_DIR/public (reason above) -- the site's installers are left as they were"
+  fi
   # Reads the PUBLISHED release for its sizes and hashes, so this must run after
   # the "Cut GitHub Release" step above. Non-fatal for the same reason as the
   # rest of this step: the release is already out, and the verification below
@@ -1704,7 +1805,15 @@ else
   # Gated on ALL of public/, never the installers alone: they are byte-identical
   # across most releases, and checking only them is what once let a
   # two-releases-stale downloads page skip both the commit and the deploy.
-  if ! site_dirty="$(git -C "$SITE_DIR" status --porcelain --untracked-files=all -- public)"; then
+  #
+  # Without $TAG's installers nothing is committed or deployed, the regenerated
+  # pages included: the deploy publishes all of public/ as one unit, so it
+  # would put up a $TAG downloads page beside the previous release's
+  # installers, under a commit message that says they were synced from $TAG.
+  # The regenerated pages stay in the working tree for the finish by hand.
+  if [ "$site_installers_ok" != "1" ]; then
+    warn "site NOT committed or deployed (no $TAG installers to publish with the regenerated pages). Finish by hand in $SITE_DIR: copy install/install.{sh,ps1} at $TAG into public/, git add -A -- public, commit, push, then 'netlify deploy --prod --dir public'"
+  elif ! site_dirty="$(git -C "$SITE_DIR" status --porcelain --untracked-files=all -- public)"; then
     warn "could not read git status in $SITE_DIR -- site NOT committed or deployed"
   elif [ -z "$site_dirty" ]; then
     ok "nothing under $SITE_DIR/public differs from the site's HEAD -- nothing to commit, so no deploy (the verification below checks the live site)"
@@ -1793,6 +1902,18 @@ if git diff --quiet -- "${CONFORMANCE_ARTIFACTS[@]}"; then
   fi
 elif ! only_stamps_dirty; then
   warn "tree carries non-receipt changes -- leaving the rewritten conformance receipts uncommitted for you to review"
+elif ! on_main_branch; then
+  # A run that needed no bump and no attribution commit never had to be on
+  # main (the bump and the reconcile check it themselves; the pre-tag check
+  # asks only that HEAD is on origin/main). A commit made here would sit on a
+  # detached HEAD or another branch, and land_on_main pushes the main ref.
+  warn "HEAD is not on main -- leaving the rewritten conformance receipts uncommitted for you to review (a commit here would not be on main; switch to main and commit them there)"
+elif [ "$(git rev-parse --verify --quiet HEAD 2>/dev/null)" != "$(git rev-parse --verify --quiet "${TAG}^{commit}" 2>/dev/null)" ]; then
+  # Re-read, not remembered: HEAD was last checked before the draft. A commit
+  # made on main since then (another session shares this checkout) would be
+  # pushed along with the receipts by land_on_main. Warn, not fail: the
+  # release is already live.
+  warn "HEAD is no longer $TAG's commit -- leaving the rewritten conformance receipts uncommitted for you to review (landing them now would push whatever else was committed on main since the tag)"
 else
   git add "${CONFORMANCE_ARTIFACTS[@]}" || fail "could not stage the rewritten conformance receipts"
   git commit -q -m "chore(release): land the conformance receipts the $TAG gate rewrote" \
@@ -1806,12 +1927,16 @@ fi
 step "Verify oamjs.org serves this release"
 for f in install.sh install.ps1; do
   live="$(curl -fsSL --max-time 30 "https://oamjs.org/$f" 2>/dev/null || true)"
+  # The tag's copy is read on its own first: inside the comparison a failed
+  # read came back as "", and a correct live installer was reported as stale.
   if [ -z "$live" ]; then
     warn "https://oamjs.org/$f did not fetch -- the installers (and self-update in oam before v0.18.0) are BROKEN until it does"
-  elif [ "$live" = "$(cat "$REPO_DIR/install/$f")" ]; then
-    ok "https://oamjs.org/$f matches install/$f"
+  elif ! want_installer="$(git -C "$REPO_DIR" show "$TAG:install/$f" 2>/dev/null)"; then
+    warn "could not read install/$f at $TAG -- https://oamjs.org/$f was fetched but not checked against the release; compare it by hand"
+  elif [ "$live" = "$want_installer" ]; then
+    ok "https://oamjs.org/$f matches install/$f at $TAG"
   else
-    warn "https://oamjs.org/$f DIFFERS from install/$f -- the installers (and self-update in oam before v0.18.0) will run the stale copy"
+    warn "https://oamjs.org/$f DIFFERS from install/$f at $TAG -- the installers (and self-update in oam before v0.18.0) will run the stale copy"
   fi
 done
 

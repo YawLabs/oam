@@ -17,12 +17,13 @@
 //!   something has to reproduce the OS default for every delivery that no JS
 //!   listener is watching -- after `removeAllListeners('SIGINT')`, after the
 //!   run that installed the handler is gone (`oam test` builds a runtime per
-//!   file; a Worker or `oam.fork` isolate has its own), and for the SIGINT
-//!   and SIGTERM raw mode arms with no listener at all. That is
+//!   file; a Worker or `oam.fork` isolate has its own), and for the signals
+//!   armed with no listener at all: SIGINT and SIGTERM by raw mode, and the
+//!   deadly ones by a cluster primary (`serve_death_defaults`). That is
 //!   `serve_default_action`: ONE task per signal, on a runtime that is never
-//!   dropped, which drains the exit hooks and then dies by the signal
-//!   (restore `SIG_DFL`, re-raise), so the parent sees the right terminating
-//!   signal. "No JS listener" is decided per PROCESS, from a count of watched
+//!   dropped, which runs the process-state hooks (`die_by`) and then dies by
+//!   the signal (restore `SIG_DFL`, re-raise), so the parent sees the right
+//!   terminating signal. "No JS listener" is decided per PROCESS, from a count of watched
 //!   handles across every isolate: tokio broadcasts each delivery to every
 //!   receiver, so no one handle can decide alone. (It used to: each handle
 //!   re-raised once its own listeners were gone, which killed the process
@@ -215,8 +216,8 @@ pub fn start_signal(
 }
 
 /// Serve `signum`'s OS default for the rest of the process: a delivery that no
-/// JS listener anywhere in the process is watching drains the exit hooks and
-/// then dies by the signal. Idempotent, and it returns only once tokio has
+/// JS listener anywhere in the process is watching runs the process-state
+/// hooks and then dies by the signal (`die_by`). Idempotent, and it returns only once tokio has
 /// replaced `SIG_DFL`, so a caller that arms it can rely on the next delivery
 /// being served.
 ///
@@ -225,8 +226,12 @@ pub fn start_signal(
 /// Worker or `oam.fork` isolate one each -- while tokio's handler stayed
 /// installed with nobody receiving, so every later delivery was caught and
 /// discarded. Raw mode arms SIGINT and SIGTERM here with no listener at all,
-/// which is node's `SignalExit`: a terminal left raw is restored by the exit
-/// hooks on the way down.
+/// which is node's `SignalExit`: a terminal left raw is restored by the
+/// process-state hooks on the way down.
+///
+/// It replaces whatever disposition the signal had, an inherited `SIG_IGN`
+/// included: a caller arming a signal nobody asked to listen for checks
+/// `ignored` first (`serve_death_defaults`).
 #[cfg(unix)]
 pub fn serve_default_action(signum: i32) {
     static SERVED: std::sync::Mutex<std::collections::BTreeSet<i32>> =
@@ -267,15 +272,127 @@ pub fn serve_default_action(signum: i32) {
     });
 }
 
+/// The signals whose unwatched default is a death, of the nine oam watches:
+/// `default_terminates` without the stop.
+#[cfg(unix)]
+const DEATH_SIGNALS: [i32; 6] = [
+    libc::SIGHUP,
+    libc::SIGINT,
+    libc::SIGTERM,
+    libc::SIGQUIT,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+];
+
+/// Whether `signum` is ignored (`SIG_IGN`) right now -- as `nohup` leaves
+/// SIGHUP, and a non-interactive shell leaves SIGINT and SIGQUIT for a job
+/// it starts with `&`. False when the disposition cannot be read.
+#[cfg(unix)]
+fn ignored(signum: i32) -> bool {
+    // SAFETY: `sigaction` with a null new action changes nothing; it only
+    // writes the current disposition into `current`, a live zeroed stack
+    // struct (all-zero is a valid `libc::sigaction`), which is read only
+    // after the call reported success.
+    unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(signum, std::ptr::null(), &mut current) == 0
+            && current.sa_sigaction == libc::SIG_IGN
+    }
+}
+
+/// Route every deadly signal's default through `die_by`, for a process that
+/// owes something on a signal death with no JS listener and no raw mode to
+/// have armed it: a cluster primary, whose workers must die with it
+/// (`cluster::reap_on_exit`). Left at `SIG_DFL` the kernel ends the process
+/// with no code of ours run at all.
+///
+/// A signal that is ignored stays ignored. Arming it would install tokio's
+/// handler over the `SIG_IGN`, and the next delivery would then be served
+/// the DEFAULT -- death -- for a signal the process was started to survive
+/// (`nohup oam primary.js`, closing the terminal).
+///
+/// Covers `DEATH_SIGNALS` only. SIGKILL cannot be caught, and the signals
+/// outside oam's table (SIGPIPE, SIGALRM, SIGABRT, a fault, ...) keep the
+/// kernel default, so a primary ended by one of those still leaves its
+/// workers behind on unix.
+#[cfg(unix)]
+pub fn serve_death_defaults() {
+    for signum in DEATH_SIGNALS {
+        if !ignored(signum) {
+            serve_default_action(signum);
+        }
+    }
+}
+
+/// Set once `die_by` has begun a death, before it runs the hooks.
+#[cfg(unix)]
+static DYING_BY_SIGNAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process has begun to die of a signal: `die_by` is running the
+/// process-state hooks, or has run them and is about to re-raise. Work that
+/// counts on such a hook to undo it asks this once it has registered, and
+/// undoes itself when the answer is yes: the hooks were taken just after the
+/// flag went up, so a hook registered since may never run. A cluster worker
+/// forked on another thread is the case (`cluster`'s `track_unless`): nothing
+/// else would end it. With the fork gate (`fork_gate`) no fork can be in
+/// flight while the hooks run, so this is the second line: it decides only
+/// for a fork that took the gate after `die_by` let go of it, which happens
+/// only if the re-raise came back.
+#[cfg(unix)]
+pub(crate) fn dying_by_signal() -> bool {
+    DYING_BY_SIGNAL.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The fork gate: held by a cluster fork from before its `spawn()` until its
+/// worker is tracked (`cluster::cluster_fork_with`), and by `die_by` from
+/// before it raises `DYING_BY_SIGNAL` until after the re-raise. So when the
+/// hooks of a signal death run, every fork is either wholly before them --
+/// tracked, and so killed by `cluster`'s hook -- or wholly after: blocked at
+/// the gate, never spawned, while the process dies. Without it a fork that
+/// was still inside `spawn()` when the hooks ran tracked its worker only
+/// afterwards, and a fork between `spawn()` and the track was missed by both
+/// the hook and the flag.
+///
+/// Lock order, process-wide: this gate first, then `cluster`'s `LIVE`, then
+/// the process-state hook registry. A fork takes all three in that order
+/// (gate, then `track`: `LIVE`, and the registry under it); `die_by` takes the
+/// gate and then the registry (`drain` lets go of it before any hook runs),
+/// and the hook takes `LIVE`. Nothing takes the gate while holding either of
+/// the others, and a thread waiting at the gate holds neither. `die_by` runs
+/// on `serve_default_action`'s runtime thread, an ordinary thread, never in
+/// a signal handler, so blocking on a mutex there is in order; and a fork
+/// holding the gate never waits on that thread (`serve_death_defaults` only
+/// spawns onto its runtime).
+///
+/// NOT covered: a hard exit (`exit_process`) runs the same hooks without the
+/// gate, so a fork on another isolate's thread that races a `process.exit`
+/// can still leave its worker running.
+#[cfg(unix)]
+static FORK_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the fork gate (`FORK_GATE`). A poisoned gate is taken all the same:
+/// it guards no data, only an ordering.
+#[cfg(unix)]
+pub(crate) fn fork_gate() -> std::sync::MutexGuard<'static, ()> {
+    FORK_GATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The OS default for a signal whose default terminates or stops the process.
 ///
 /// A death first runs the process-state hooks: a signal death emits no JS
 /// 'exit', so the listeners that would normally put the terminal back into
 /// cooked mode never run, and a shell left raw by a killed TUI does not
-/// recover on its own. Those hooks only -- not the report-shaped exit hooks,
+/// recover on its own; and nothing else would end a cluster primary's
+/// workers. Those hooks only -- not the report-shaped exit hooks,
 /// which print, and not the artifact sweep: what a terminating signal should
 /// do about on-disk artifacts is a separate policy question this does not
 /// answer.
+///
+/// This is NOT signal-handler context, so the hooks need not be
+/// async-signal-safe (they take locks): the handler tokio installs only
+/// writes a byte to its wake-up pipe, and `die_by` runs later, on an
+/// ordinary thread -- a task of `serve_default_action`'s runtime, woken by
+/// that pipe.
 ///
 /// A STOP (SIGTSTP) is not a death, and gets neither: the process comes back
 /// on SIGCONT with its raw mode intact, as node's does (`SignalExit` covers
@@ -289,7 +406,17 @@ pub fn serve_default_action(signum: i32) {
 #[cfg(unix)]
 fn die_by(signum: i32) {
     let stops = signum == libc::SIGTSTP;
+    // A death holds the fork gate from here to the end, the re-raise
+    // included: no cluster fork can be mid-flight while the hooks run, and
+    // none starts before the process is gone (`FORK_GATE`). A stop runs no
+    // hooks and leaves forks alone. Were the re-raise to come back, the gate
+    // is let go at the return and the flag below answers for later forks.
+    let _fork_gate = (!stops).then(fork_gate);
     if !stops {
+        // Raised before the hooks are taken, never lowered: whatever would
+        // have registered a hook from here on has missed them
+        // (`dying_by_signal`).
+        DYING_BY_SIGNAL.store(true, std::sync::atomic::Ordering::SeqCst);
         crate::run_process_state_hooks();
     }
     // SAFETY: `sigaction` with a null new action only reads the current
@@ -542,6 +669,63 @@ mod windows_tests {
         let _handle = register(&tx, NAME);
         drop(rx);
         assert!(!deliver(NAME));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    /// Set on the re-exec'd run, which sh starts with SIGHUP ignored.
+    const IGNORED_ROLE_VAR: &str = "OAM_SIGNAL_TEST_STARTED_IGNORING_HUP";
+    const IGNORED_TEST: &str =
+        "signal::unix_tests::arming_the_death_defaults_leaves_an_ignored_signal_ignored";
+
+    /// A process started with a signal ignored (`nohup`, a shell's `&` job)
+    /// keeps ignoring it when the deadly signals are armed: only an unguarded
+    /// arm puts tokio's handler over the SIG_IGN, after which a delivery is
+    /// served the default and kills the process. Dispositions are
+    /// process-wide and cannot be put back from here, so the test re-execs
+    /// itself under `sh` with SIGHUP trapped to ignore (an ignored signal
+    /// stays ignored across exec) and checks in that process.
+    #[test]
+    fn arming_the_death_defaults_leaves_an_ignored_signal_ignored() {
+        if std::env::var_os(IGNORED_ROLE_VAR).is_none() {
+            let exe = std::env::current_exe().expect("the test binary's path");
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("trap '' HUP; exec \"$0\" \"$@\"")
+                .arg(exe)
+                .args(["--exact", IGNORED_TEST, "--nocapture", "--test-threads=1"])
+                .env(IGNORED_ROLE_VAR, "1")
+                .output()
+                .expect("re-exec the test binary under sh");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "re-exec'd test failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // It ran (a filter matching nothing also exits 0).
+            assert!(stdout.contains("1 passed"), "{stdout}");
+            return;
+        }
+        assert!(
+            ignored(libc::SIGHUP),
+            "the precondition: sh's trap left SIGHUP ignored across the exec"
+        );
+        serve_death_defaults();
+        assert!(
+            ignored(libc::SIGHUP),
+            "arming the death defaults installed a handler over SIG_IGN"
+        );
+        // What the guard prevents, and proof that `ignored` tells the two
+        // apart: an unguarded arm replaces the SIG_IGN.
+        serve_default_action(libc::SIGHUP);
+        assert!(
+            !ignored(libc::SIGHUP),
+            "an unguarded arm leaves tokio's handler installed, not SIG_IGN"
+        );
     }
 }
 

@@ -323,6 +323,11 @@ pub(crate) struct WorkerEnv {
     /// Whether names fold case (Windows, a store that leads back to the main
     /// thread's environment).
     pub fold: bool,
+    /// SHARE_ENV of a store whose chain of SHARE_ENV workers starts at the
+    /// main thread: the store is the process's real environment, which
+    /// libuv reads for os.homedir() and for its additions to a child's
+    /// environment. False for a store a worker with its own `env` shared.
+    pub real: bool,
     /// The values libuv's Windows additions to a child's environment are
     /// read from: the creator's, when the worker was made.
     pub base: Vec<(String, String)>,
@@ -358,6 +363,8 @@ impl WorkerEnv {
             pairs: pairs("pairs")?,
             shared,
             fold: value.get("fold").and_then(serde_json::Value::as_bool) == Some(true),
+            real: shared.is_some()
+                && value.get("real").and_then(serde_json::Value::as_bool) == Some(true),
             base: pairs("base")?,
         })
     }
@@ -828,13 +835,22 @@ mod env_tests {
         assert_eq!(env.pairs, pairs(&[("B", "2"), ("A", "1")]), "order kept");
         assert_eq!(env.shared, None);
         assert!(!env.fold);
+        assert!(!env.real);
         assert_eq!(env.base, pairs(&[("PATH", "p")]));
 
-        let shared = serde_json::json!({ "shared": 7, "fold": true, "base": [] });
+        let shared = serde_json::json!({ "shared": 7, "fold": true, "real": true, "base": [] });
         let env = WorkerEnv::from_json(&shared).expect("well-formed");
         assert_eq!(env.shared, Some(7));
         assert!(env.fold);
+        assert!(env.real);
         assert!(env.pairs.is_empty());
+
+        // `real` describes a shared store: an own store is never the real
+        // environment, whatever the JSON says.
+        let own = serde_json::json!({ "pairs": [], "real": true });
+        assert!(!WorkerEnv::from_json(&own).expect("well-formed").real);
+        let unrooted = serde_json::json!({ "shared": 8, "base": [] });
+        assert!(!WorkerEnv::from_json(&unrooted).expect("well-formed").real);
 
         for bad in [
             serde_json::json!({ "pairs": [["A"]] }),

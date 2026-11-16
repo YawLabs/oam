@@ -38,6 +38,132 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   an Ed25519 key's public half** (#489), as node does. Both threw for Ed25519, which made
   ssh2's load-time `eddsaSupported` probe fail on oam and switched off ed25519 key files and
   ed25519 host keys.
+- **`spawnSync`, `execSync` and `execFileSync` honour `killSignal`.** On Linux and macOS a child
+  that outlives `timeout` or overflows `maxBuffer` is sent that signal (default `SIGTERM`, which
+  it can now trap) instead of an unconditional `SIGKILL`, and `result.signal` / `result.status`
+  report how the child actually ended (0.20.2 reported `SIGTERM` whatever happened). As in node,
+  a child that ignores the signal holds the call until it exits by itself. When oam sends the
+  signal it also closes its ends of the child's stdout and stderr and stops feeding `input`, as
+  node closes its pipes, so a survivor that keeps writing ends on `SIGPIPE` instead of blocking
+  the call; output the child wrote before the signal is kept. The close trails the signal by a
+  thread wake-up, so a handler that prints at once may land that output where node's would meet
+  a closed pipe (docs/node-divergences.md, entry 65). On Windows the child is terminated and
+  `result.signal` names the requested signal when it is `SIGTERM`, `SIGKILL`, `SIGINT` or
+  `SIGQUIT`, and `SIGKILL` for any other valid `killSignal`, as node reports there; the thread
+  writing `input` is not stopped, so a grandchild that inherited stdin can go on receiving it
+  (entry 65). An invalid `killSignal` throws `ERR_UNKNOWN_SIGNAL` or `ERR_INVALID_ARG_TYPE`.
+- **`os.homedir()` follows libuv.** It reads `HOME` (`USERPROFILE` on Windows) from the thread's
+  `process.env`, so `process.env.HOME = dir` moves it and an object assigned to `process.env`
+  does not; 0.20.2 read `USERPROFILE`, then `HOME`, from the launch environment on every
+  platform, so a `USERPROFILE` exported into a unix process won over `HOME`. An unset variable
+  falls back to the account's home directory instead of `""`: the passwd record of the
+  effective uid, or on Windows the profile directory `GetUserProfileDirectoryW` reports for the
+  process token. On Windows a `USERPROFILE` shorter than three bytes throws `ERR_SYSTEM_ERROR`
+  (`uv_os_homedir`, `ENOENT`). In a worker with its
+  own `process.env`, `os.homedir()` reads its creator's environment as it was when the worker
+  was made, where node reads the live process environment (entry 4); a `SHARE_ENV` worker reads
+  the shared environment as it is.
+- **`os.userInfo()` on Windows**: `homedir` is the profile directory from the OS rather than
+  `USERPROFILE`, and a profile directory the OS cannot report throws `ERR_SYSTEM_ERROR`
+  (`uv_os_get_passwd`, `ENOENT`; node's code there is the translated Win32 error). `username`
+  is still the launch environment's `USERNAME` (no longer `USER` when that is missing), where
+  node asks the OS (entry 66).
+- **`os.tmpdir()` follows node.** On Linux and macOS it reads `TMPDIR`, `TMP`, `TEMP` in that
+  order from the thread's `process.env` store (not an object assigned to `process.env`), then
+  `/tmp`; on Windows `TEMP`, `TMP`, then
+  `SystemRoot` or `windir` + `\temp` (`undefined\temp` with all four unset, as in node) from
+  `process.env` as it currently is, including an object assigned to it. It skips an empty
+  variable and removes one trailing separator without reducing a root (`/`, `C:\`) to `""` or
+  `C:`. 0.20.2 answered from the launch environment by Rust's rules: `TMPDIR` alone on unix,
+  `TMP` before `TEMP` on Windows, every trailing separator stripped.
+- **`worker_threads`**: a Worker made without `env` copies its creator's environment, not an
+  object the program assigned to `process.env`, as node's does. A `SHARE_ENV` worker that makes
+  another `SHARE_ENV` worker shares its own store with it instead of starting a new one, and on
+  Windows the variables libuv adds to a child's environment are read from the shared store as
+  it is, not from a copy taken when the worker was made.
+- **`process.stderr.write()` of bytes that are not UTF-8 no longer fails on a Windows console**:
+  they are written as U+FFFD, as `process.stdout` and node write them. stdout and stderr each
+  complete their own character split across two writes.
+- **On Linux and macOS `process.getgroups()` always includes the effective gid**, as node's
+  does, and a failed `getgroups(2)` throws its errno instead of answering `[]`.
+- **On Windows a `setRawMode(true)` the console refused no longer leaves a saved console mode
+  behind** for a later `setRawMode(false)` to restore.
+- **`os.networkInterfaces()`: `cidr` is `null` for a netmask whose first partial group is not a
+  contiguous run of ones** (e.g. `255.253.0.0`, which counted 15), as in node.
+- **On Linux and macOS a `cluster` primary that dies of a `SIGHUP`, `SIGINT`, `SIGTERM`,
+  `SIGQUIT`, `SIGUSR1` or `SIGUSR2` it has no listener for takes its workers with it** and still
+  dies of that signal; before, the workers ran on. A worker forked while the primary is already
+  dying is killed too, and a signal the primary was started ignoring stays ignored. A primary
+  ended by `SIGKILL` or another signal (`SIGPIPE`, `SIGABRT`, a fault) still leaves its workers
+  behind.
+- **`child_process` IPC**: a child's exit-time wait for the parent's end-of-stream is bounded by
+  the 500 ms grace even while the parent keeps sending, and on Linux and macOS a connection
+  reset the parent meets while reading ahead of a send is reported to the channel as
+  `read ECONNRESET` instead of being turned into an end of stream.
+- **tls / https servers**: an empty name in `ALPNProtocols` is passed over instead of dropping
+  the names after it (`['', 'h2']` negotiates `h2`, as in node). An array assigned to
+  `server.ALPNProtocols` after creation goes through the same conversion as the option. On an
+  `https` server a name over 255 bytes throws `ERR_OUT_OF_RANGE` from the assignment, which
+  keeps the old value (node takes the assignment and throws on the next connection; entry 42);
+  a `tls` server takes it and throws on the next connection, as node's does. A list of nothing
+  but empty names offers no protocol, where node's server refuses ALPN clients (entry 42). A
+  connection whose TLS setup is refused before the handshake starts is closed instead of left
+  open.
+- **N-API**, each as in Node except where marked:
+  - `napi_get_property_names` returns integer-index keys as strings (they came back as numbers).
+  - `napi_get_value_int64` reads `NaN`, `Infinity` and `-Infinity` as 0 (the infinities came back
+    as `i64::MAX` / `i64::MIN`).
+  - `napi_create_buffer_copy` writes its data out-pointer for a zero-length copy, and (oam's own
+    check, not Node's: Node passes the pointer to `memcpy`; entry 64) returns `napi_invalid_arg`
+    for a null source with a non-zero size.
+  - `napi_has_property`, `napi_has_named_property`, `napi_has_own_property`, `napi_has_element`,
+    `napi_delete_property` and `napi_delete_element` report `napi_pending_exception` when a Proxy
+    trap throws and refuse to run while an exception is pending (they answered `napi_ok` with
+    `false`), check their arguments in Node's order, coerce a primitive receiver to an object,
+    and `napi_has_own_property` answers `napi_name_expected` for a key that is not a string or
+    symbol.
+  - `napi_is_error` uses Node's test (an object made by an Error constructor, of any realm)
+    instead of `instanceof globalThis.Error`.
+  - `new Cls.prototype.method()` on a `napi_define_class` prototype method runs the callback
+    instead of throwing `TypeError: Illegal invocation`.
+  - An exception a cleanup hook or teardown finalizer leaves pending is dropped when that step
+    returns, so later hooks and finalizers of the same addon can still call into JS.
+- **`oam mcp`**: cancelling an `oam_run` call ends it even after the script has exited while a
+  process it started still holds its stdout or stderr, and the `oam_explain` text for
+  `OAM-RT-OOM` states the default heap cap correctly (4096 MB, or on Linux 75% of the container
+  memory limit when that is at least 128 MB and under 4096 MB).
+
+### Changed
+
+- **Under `--permission` without an env grant, `os.tmpdir()` and `os.homedir()` no longer read
+  variables the grant hides.** 0.20.2 answered both from the launch environment whatever the
+  grant said. A hidden `TMPDIR`, `TMP`, `TEMP`, `HOME`, `USERPROFILE`, `SystemRoot` or `windir`
+  now reads as unset there as everywhere else, in every thread. `os.tmpdir()` is then the next
+  variable the grant allows, else `/tmp` (on Windows, with `SystemRoot` or `windir` hidden, the
+  Windows directory the OS reports + `\temp`), and `os.homedir()` is the account's home
+  directory. Grant the names (for example `--allow-env=TMPDIR,HOME`) to have them read. Node
+  has no env permission and reads the real values (docs/node-divergences.md, entry 4).
+- **Release and build tooling.** `scripts/release-local.sh` stops before anything is published if
+  HEAD stops being the tagged commit between the local gate and the draft release, takes the
+  site's installers from the tag (when it cannot read them it leaves the site's installers as
+  they were and commits and deploys nothing to the site), refuses to land a commit on main from
+  any other branch, and leaves the conformance receipts uncommitted (with a warning) when HEAD
+  is not on main or no longer the tag. The live-site check compares the installers with the
+  tag's copies and says so when it cannot read one. `scripts/release-upload-local-arm64.sh`
+  warns when its build has left the tag's binary in this checkout's `target/`.
+  `scripts/gc-target.sh --dry-run` no longer deletes parked `*.inuse-*` copies, a real run
+  reaps them only where oam parks them, and a build script rerun in place whose package then
+  failed to compile keeps its output (the newest run is kept for the unit that still names it).
+  `scripts/ci-local.sh` no longer exits silently on Linux and macOS when there is no leftover
+  debug process to clear.
+- **Benchmarks.** `BENCHMARKS.md` states which cases are sampled interleaved and which in
+  per-runtime blocks (it said every case was interleaved). The `mcp-*` cases accept only the
+  successful JSON-RPC response to the request they sent, pin and record the
+  `@modelcontextprotocol/sdk` baseline (1.29.0, reinstalled when another version is present),
+  and `mcp-idle-rss` refuses a runtime reachable only through a batch wrapper instead of
+  reporting `cmd.exe`'s memory. On Windows the harness prefers a runtime's `.exe` anywhere on
+  PATH to an earlier `.cmd` / `.bat` wrapper and says so. `BENCH_HARDWARE_CLASS` (free text
+  naming a class of machine) is recorded beside the host line.
 
 ## [0.20.2] - 2026-11-13
 
@@ -474,7 +600,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `addListener` / `prependListener` / `prependOnceListener` starts the channel, and a failed
   channel connect closes the channel instead of ending the child with an uncaught error.
 - **A child's last IPC messages survive its exit.** The child now closes its channel in order
-  before any exit -- every `process.send()` written out and read by the parent -- where a large
+  before any exit -- every `process.send()` written out to the parent's kernel -- where a large
   message sent just before `process.exit()` could be lost under load (on Windows the open
   socket was reset). A `process.send()` followed at once by `process.exit()` is delivered even
   when the channel was not connected yet. The parent sees `'disconnect'` before `'exit'`, and
@@ -1219,7 +1345,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   never held; they are now node's strings (`"ENOTFOUND"`, `"ETIMEOUT"`, ...).
 - **`os.hostname()` is the system's host name.** It read the `COMPUTERNAME` / `HOSTNAME`
   environment variables, so it answered `localhost` on macOS, where neither is set, and the
-  upper-case NetBIOS name on Windows (`WOODS` where node says `woods`).
+  upper-case NetBIOS name on Windows (`MYHOST` where node says `myhost`).
 - **`{ ttl: true }` on `resolve4()` / `resolve6()` reports each record's TTL as served.** It
   reported `ttl: 0` for every address.
 - **A DNS query's answer is the server's, as c-ares hands it to node.** oam's resolver chased
@@ -6499,7 +6625,8 @@ releases.
 - The `fork` prewarm pool warms lazily, on first `fork()`.
 - `io_uring` read chunks grow from 64 KiB to 4 MiB, fixing large-file reads.
 
-[Unreleased]: https://github.com/YawLabs/oam/compare/v0.20.1...HEAD
+[Unreleased]: https://github.com/YawLabs/oam/compare/v0.20.2...HEAD
+[0.20.2]: https://github.com/YawLabs/oam/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/YawLabs/oam/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/YawLabs/oam/compare/v0.19.5...v0.20.0
 [0.19.5]: https://github.com/YawLabs/oam/compare/v0.19.4...v0.19.5

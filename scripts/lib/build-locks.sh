@@ -153,7 +153,14 @@ oam_kill_under() {
       # Unix can unlink a running image, so the LOCK half of this file is moot
       # there -- but a detached daemon still leaks, and pkill -f matches the
       # argv[0] path the daemon was re-exec'd with.
-      command -v pkill >/dev/null 2>&1 && pkill -f "^$dir/" >/dev/null 2>&1
+      #
+      # `|| true` is load-bearing: pkill exits 1 when nothing matched, which is
+      # the normal state, and as the last command of this function's case arm
+      # that status would end a `set -e` caller (ci-local.sh calls this bare)
+      # before the `return 0` below is reached.
+      if command -v pkill >/dev/null 2>&1; then
+        pkill -f "^$dir/" >/dev/null 2>&1 || true
+      fi
       ;;
   esac
   return 0

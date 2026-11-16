@@ -24,6 +24,12 @@
 //!
 //! Outputs: bench/results.json (machine) and BENCHMARKS.md (human),
 //! both COMMITTED -- the receipt is in the repo.
+//!
+//! Environment: `BENCH_HARDWARE_CLASS` is optional free text naming the class
+//! of machine (a CPU model, "M-series laptop"), recorded as `hardware_class`
+//! in the JSON and printed on the BENCHMARKS.md stamp line. Unset, the field
+//! reads `unknown` and the stamp line omits it. Both files are public: name a
+//! class of hardware, never a host.
 
 use crate::conformance::{
     capture_version, ensure_oam_built, git_short_commit, repo_root, run_with_timeout,
@@ -52,8 +58,11 @@ use std::time::{Duration, Instant};
 // tighter comparison, not after.
 //
 // Load still matters more than n: do not measure on a busy machine. The
-// interleaving in `run_timed_case` protects the RATIOS from uniform drift, but
-// nothing protects the absolutes from a test suite running alongside.
+// interleaving in `run_timed_case_interleaved` and `run_ts_cold_start` protects
+// the RATIOS of the cases that go through them from uniform drift, but nothing
+// protects the absolutes from a test suite running alongside -- and the
+// `BLOCK_SAMPLED_CASES` are not interleaved at all, so not even their ratios
+// are protected.
 const COLD_START_ITERS: usize = 20;
 const TIMED_ITERS: usize = 15;
 const HTTP_ITERS: usize = 10;
@@ -82,6 +91,38 @@ const TS_CASE: &str = "ts-cold-start";
 /// The cases that share the main `case x runtime` table.
 fn main_cases() -> impl Iterator<Item = &'static str> {
     CASE_NAMES.iter().copied().filter(|c| *c != TS_CASE)
+}
+
+/// The cases sampled in per-runtime BLOCKS: every sample of one runtime is
+/// taken before the next runtime starts (`for rt in &runtimes` in `run`),
+/// because each drives the runtime through its own spawn-and-talk loop.
+/// Every other case is interleaved, one sample per runtime per round
+/// (`run_timed_case_interleaved`, `run_ts_cold_start`).
+///
+/// The published "Reproducing this" text is generated from this list, so the
+/// claim a reader sees about drift is the one the code keeps. It used to say
+/// every case was interleaved.
+const BLOCK_SAMPLED_CASES: [&str; 4] = [
+    "cold-start",
+    "mcp-cold-start",
+    "mcp-idle-rss",
+    "mcp-first-call-latency",
+];
+
+/// The one case whose figure is a memory reading rather than a time.
+const RSS_CASE: &str = "mcp-idle-rss";
+
+/// The version of `@modelcontextprotocol/sdk` the other runtimes' `mcp-*`
+/// rows are measured with. Pinned, and stamped on those rows as `mcp_sdk`:
+/// the install used to take whatever was current the day a box first ran
+/// `--compare` and keep it forever, so two boxes published different
+/// baselines under one label and neither output file said which.
+const MCP_SDK_VERSION: &str = "1.29.0";
+
+/// Whether a row was measured against the SDK server (every `mcp-*` case on
+/// a runtime other than oam, which serves its built-in `oam:mcp`).
+fn uses_sdk_server(case: &str, runtime: &str) -> bool {
+    case.starts_with("mcp-") && runtime != "oam"
 }
 
 /// Resolve `--case` filters against `CASE_NAMES`, preserving table order. An
@@ -254,7 +295,55 @@ fn discover_runtimes(oam: PathBuf, oam_version: &str) -> Vec<Runtime> {
 fn which(name: &str) -> Result<PathBuf> {
     let path_var = std::env::var_os("PATH").context("PATH is not set")?;
     let dirs: Vec<PathBuf> = std::env::split_paths(&path_var).collect();
-    which_in(name, &dirs, cfg!(windows)).with_context(|| format!("{name} not found on PATH"))
+    let found = which_in(name, &dirs, cfg!(windows))
+        .with_context(|| format!("{name} not found on PATH"))?;
+    // The one case where this lookup and the shell's disagree: say so, or the
+    // figures are for a different install than `name` runs at the prompt.
+    if let Some(wrapper) = shadowed_wrapper(name, &dirs, &found, cfg!(windows)) {
+        println!(
+            "  note: {name} resolves to {} though {} comes first on PATH (an image is preferred to a batch wrapper)",
+            found.display(),
+            wrapper.display()
+        );
+    }
+    Ok(found)
+}
+
+/// The `.cmd` / `.bat` wrapper for `name` that [`which_in`] passed over on
+/// its way to `found`: one in a directory EARLIER on PATH than the `.exe` it
+/// chose, which is the one a shell would have run. `None` when the choice is
+/// the first match anyway -- no wrapper before it, a wrapper beside it in the
+/// same directory (where the shell's PATHEXT order picks the `.exe` too), or
+/// off Windows.
+fn shadowed_wrapper(name: &str, dirs: &[PathBuf], found: &Path, windows: bool) -> Option<PathBuf> {
+    if !windows || is_batch_wrapper(found) {
+        return None;
+    }
+    let chosen_dir = found.parent()?;
+    for dir in dirs {
+        if dir == chosen_dir {
+            return None;
+        }
+        for ext in [".cmd", ".bat"] {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// `hardware_class` as the result file records it, from what
+/// `BENCH_HARDWARE_CLASS` holds: the text, trimmed, or "unknown" when the
+/// variable is unset, empty or only whitespace. `BENCH_HARDWARE_CLASS=` (set
+/// to nothing, the usual way of clearing a variable for one command) used to
+/// be recorded as "", which the stamp line then printed as a class.
+fn hardware_class(raw: Option<&str>) -> String {
+    match raw.map(str::trim) {
+        Some(text) if !text.is_empty() => text.to_string(),
+        _ => "unknown".to_string(),
+    }
 }
 
 /// The lookup behind [`which`], with the directory list and the platform
@@ -264,9 +353,26 @@ fn which(name: &str) -> Result<PathBuf> {
 /// npm-installed tool leaves both `bun` (an sh shim, for Git Bash) and
 /// `bun.cmd` in one directory; the bare name is a shell script `Command`
 /// cannot exec, so taking it first made that runtime fail every case.
+///
+/// A real image (`.exe`) ANYWHERE on PATH also beats a batch wrapper in an
+/// earlier directory. `Command` runs a `.cmd` through `cmd.exe`, so the child
+/// the harness holds is the wrapper, not the runtime: its PID is what
+/// `mcp-idle-rss` would read, and its start-up is inside every spawn-timed
+/// figure. A wrapper is still returned when it is all there is --
+/// [`is_batch_wrapper`] is how the callers notice. (A launcher that is itself
+/// an `.exe` and spawns the real runtime, as some version managers install,
+/// cannot be told apart here; the recorded `exe` and version are the check.)
 fn which_in(name: &str, dirs: &[PathBuf], windows: bool) -> Option<PathBuf> {
+    if windows {
+        for dir in dirs {
+            let candidate = dir.join(format!("{name}.exe"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
     let exts: &[&str] = if windows {
-        &[".exe", ".cmd", ".bat", ""]
+        &[".cmd", ".bat", ""]
     } else {
         &[""]
     };
@@ -279,6 +385,14 @@ fn which_in(name: &str, dirs: &[PathBuf], windows: bool) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Whether `exe` is a `.cmd` / `.bat`, which `Command` runs through `cmd.exe`
+/// rather than as the runtime itself. See [`which_in`].
+fn is_batch_wrapper(exe: &Path) -> bool {
+    exe.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
 }
 
 // ------------------------------------------------------------ case runner
@@ -537,20 +651,75 @@ impl McpServer {
         Ok(())
     }
 
-    /// The instant the next non-empty stdout line was read, or an error
-    /// naming `what` when the server closes stdout first or stays silent past
-    /// `timeout`.
-    fn next_line(&self, what: &str, timeout: Duration) -> Result<Instant> {
+    /// The instant the successful response to request `id` was read, or an
+    /// error naming `what` when the server answers with an error, closes
+    /// stdout first or does not answer within `timeout` (one deadline for the
+    /// whole wait, however many unrelated lines arrive before it).
+    ///
+    /// The line is checked, not just counted. This used to stop the clock on
+    /// ANY non-empty line, so an error reply (protocol version refused,
+    /// unknown tool), a server-initiated notification or a log line on stdout
+    /// was published as a successful round-trip.
+    fn next_response(&self, id: u64, what: &str, timeout: Duration) -> Result<Instant> {
         use std::sync::mpsc::RecvTimeoutError;
-        match self.lines.recv_timeout(timeout) {
-            Ok((at, _line)) => Ok(at),
-            Err(RecvTimeoutError::Disconnected) => {
-                bail!("server closed stdout before {what}")
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                bail!("no {what} within {}s", timeout.as_secs())
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok((at, line)) => match classify_rpc_line(&line, id) {
+                    RpcLine::Answer => return Ok(at),
+                    RpcLine::Unrelated => {}
+                    RpcLine::Failed(why) => bail!("{what} was {why}"),
+                },
+                Err(RecvTimeoutError::Disconnected) => {
+                    bail!("server closed stdout before {what}")
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    bail!("no {what} within {}s", timeout.as_secs())
+                }
             }
         }
+    }
+}
+
+/// What one stdout line is to a harness waiting on the response to one
+/// request.
+#[derive(Debug, PartialEq)]
+enum RpcLine {
+    /// The successful response to the request.
+    Answer,
+    /// Not the response: a notification, a request from the server, the
+    /// response to some other id, or a line that is not JSON at all. The wait
+    /// goes on.
+    Unrelated,
+    /// The response, and it reports a failure. Carries the reason.
+    Failed(String),
+}
+
+/// Classify one stdout line against the JSON-RPC request `id`.
+///
+/// A message carrying `method` is a request or notification FROM the server,
+/// whose ids are its own numbering and may collide with the harness's, so it
+/// is never the response. A tool result with `isError: true` is a failure:
+/// MCP reports a tool-level error inside a successful JSON-RPC `result`.
+fn classify_rpc_line(line: &str, id: u64) -> RpcLine {
+    let Ok(msg) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return RpcLine::Unrelated;
+    };
+    if msg.get("method").is_some() || msg.get("id").and_then(serde_json::Value::as_u64) != Some(id)
+    {
+        return RpcLine::Unrelated;
+    }
+    let quote = |v: &serde_json::Value| v.to_string().chars().take(200).collect::<String>();
+    if let Some(error) = msg.get("error").filter(|e| !e.is_null()) {
+        return RpcLine::Failed(format!("a JSON-RPC error: {}", quote(error)));
+    }
+    match msg.get("result") {
+        None => RpcLine::Failed("a reply with neither `result` nor `error`".to_string()),
+        Some(result) if result["isError"] == true => {
+            RpcLine::Failed(format!("a tool error: {}", quote(result)))
+        }
+        Some(_) => RpcLine::Answer,
     }
 }
 
@@ -592,11 +761,11 @@ fn run_mcp_cold_start(rt: &Runtime, server_script: &Path) -> Result<CaseResult> 
         let start = Instant::now();
         let mut server = McpServer::spawn(cmd)?;
 
-        // Write the initialize request; the first non-empty stdout line is its
-        // response. Stdin stays open until `server` drops (see McpServer).
+        // Write the initialize request and wait for the successful response
+        // to it. Stdin stays open until `server` drops (see McpServer).
         server.send(&init_msg)?;
         let answered = server
-            .next_line("the initialize response", CASE_TIMEOUT)
+            .next_response(1, "the initialize response", CASE_TIMEOUT)
             .with_context(|| format!("{}/mcp-cold-start iter {i}", rt.name))?;
         let elapsed = answered.duration_since(start).as_secs_f64() * 1000.0;
 
@@ -689,7 +858,23 @@ fn process_rss_bytes(pid: u32) -> Option<u64> {
 /// MCP idle RSS: spawn server, complete `initialize`, sample RSS, kill.
 /// Unit: MB (megabytes). The initialize round-trip ensures the runtime is
 /// fully loaded (module graph evaluated, event loop alive) before sampling.
+///
+/// The figure is the RSS of the process the harness spawned, so that process
+/// has to BE the runtime. Through a batch wrapper it is `cmd.exe`, a few MB
+/// that would be published as the runtime's memory with no error; such a
+/// runtime is refused here instead.
 fn run_mcp_idle_rss(rt: &Runtime, server_script: &Path) -> Result<CaseResult> {
+    if is_batch_wrapper(&rt.exe) {
+        bail!(
+            "{} resolves to a batch wrapper ({}), so the process the harness can measure \
+             is cmd.exe rather than the runtime; put the runtime's own executable on PATH",
+            rt.name,
+            rt.exe
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
+    }
     print!("  {}/mcp-idle-rss: ", rt.name);
     let iters = COLD_START_ITERS;
     let mut samples = Vec::with_capacity(iters);
@@ -712,7 +897,7 @@ fn run_mcp_idle_rss(rt: &Runtime, server_script: &Path) -> Result<CaseResult> {
         // process in some other state (or wait on it forever).
         server.send(&init_msg)?;
         server
-            .next_line("the initialize response", CASE_TIMEOUT)
+            .next_response(1, "the initialize response", CASE_TIMEOUT)
             .with_context(|| format!("{}/mcp-idle-rss iter {i}", rt.name))?;
 
         // Server is now idle (waiting for next request) -- sample RSS.
@@ -786,7 +971,7 @@ fn run_mcp_first_call_latency(rt: &Runtime, server_script: &Path) -> Result<Case
         // Drain the initialize response.
         server.send(&init_msg)?;
         server
-            .next_line("the initialize response", CASE_TIMEOUT)
+            .next_response(1, "the initialize response", CASE_TIMEOUT)
             .with_context(iter_label)?;
 
         // Send the initialized notification (required by MCP spec before tools/call).
@@ -796,7 +981,7 @@ fn run_mcp_first_call_latency(rt: &Runtime, server_script: &Path) -> Result<Case
         let call_start = Instant::now();
         server.send(&call_msg)?;
         let answered = server
-            .next_line("the tools/call response", CASE_TIMEOUT)
+            .next_response(2, "the tools/call response", CASE_TIMEOUT)
             .with_context(iter_label)?;
         let elapsed_ms = answered.duration_since(call_start).as_secs_f64() * 1000.0;
         samples.push(elapsed_ms);
@@ -1455,7 +1640,11 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
         Err(err) => {
             eprintln!(
                 "  warning: could not stage the oam binary out of target/ ({err}).\n  \
-                 Timings may include per-exec virus-scanner overhead that node/bun do not pay."
+                 It is being measured in place: a concurrent `cargo build` can replace it \
+                 mid-run, and freshly written bytes are cold where the installed runtimes \
+                 are warm.\n  \
+                 Do not build while this runs, and distrust oam's spawn-bound rows if \
+                 anything did."
             );
             (oam, None)
         }
@@ -1477,6 +1666,13 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
     println!("oam bench @ {commit} ({profile})\n");
     for rt in &runtimes {
         println!("  {} {}", rt.name, rt.version);
+        if is_batch_wrapper(&rt.exe) {
+            println!(
+                "    note: only a batch wrapper for {} is on PATH, so each spawn goes through \
+                 cmd.exe: its spawn-timed rows include that, and {RSS_CASE} is refused",
+                rt.name
+            );
+        }
     }
     println!();
 
@@ -1503,8 +1699,10 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
 
         // The script-driven timed cases sample every runtime round-robin, so
         // background load cannot bias one runtime's block relative to another's.
-        // The remaining cases (cold-start and the mcp-* trio) drive a runtime
-        // differently per runtime and keep the per-runtime path below.
+        // The remaining cases (`BLOCK_SAMPLED_CASES`: cold-start and the mcp-*
+        // trio) drive a runtime differently per runtime and keep the
+        // per-runtime path below, one whole block of samples per runtime. The
+        // generated BENCHMARKS.md text says so, from that same list.
         let timed: Option<(&Path, usize, Vec<String>)> = match *case_name {
             "url-parse" => Some((scripts.url_parse.as_path(), TIMED_ITERS, vec![])),
             "http-throughput" => Some((scripts.http_throughput.as_path(), HTTP_ITERS, vec![])),
@@ -1532,6 +1730,10 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
             continue;
         }
 
+        debug_assert!(
+            BLOCK_SAMPLED_CASES.contains(case_name),
+            "{case_name} takes the per-runtime path but is not in BLOCK_SAMPLED_CASES"
+        );
         for rt in &runtimes {
             let result = match *case_name {
                 "cold-start" => run_cold_start(rt, &scripts.cold_start),
@@ -1913,10 +2115,11 @@ server.serve({ transport: 'stdio' });
     })
 }
 
-/// Ensures @modelcontextprotocol/sdk is installed in `fixtures_dir` and
-/// returns the path to the server script. The fixtures dir is stable across
-/// runs (bench/sdk-fixtures/) so the install only happens once -- avoids
-/// Windows Defender scan churn polluting the benchmark measurements.
+/// Ensures @modelcontextprotocol/sdk is installed in `fixtures_dir` at
+/// `MCP_SDK_VERSION` and returns the path to the server script. The fixtures
+/// dir is stable across runs (bench/sdk-fixtures/) so the install only happens
+/// once per pin -- avoids Windows Defender scan churn polluting the benchmark
+/// measurements. A dir holding another version is reinstalled to the pin.
 fn build_sdk_mcp_server(fixtures: &Path) -> Option<PathBuf> {
     std::fs::create_dir_all(fixtures).ok()?;
 
@@ -1945,13 +2148,9 @@ await server.connect(transport);
     )
     .ok()?;
 
-    // Skip npm install if the SDK is already present.
-    let sdk_marker = fixtures
-        .join("node_modules")
-        .join("@modelcontextprotocol")
-        .join("sdk")
-        .join("package.json");
-    if sdk_marker.exists() {
+    // Skip npm install only when the PINNED version is what is installed. A
+    // bare "is anything there" check kept whatever a box first installed.
+    if installed_sdk_version(fixtures).as_deref() == Some(MCP_SDK_VERSION) {
         return Some(server);
     }
 
@@ -1964,10 +2163,11 @@ await server.connect(transport);
 
     let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
 
-    print!("  sdk-fixtures: npm install @modelcontextprotocol/sdk ... ");
+    let spec = format!("@modelcontextprotocol/sdk@{MCP_SDK_VERSION}");
+    print!("  sdk-fixtures: npm install {spec} ... ");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let status = Command::new(npm)
-        .args(["install", "--save-exact", "@modelcontextprotocol/sdk"])
+        .args(["install", "--save-exact", spec.as_str()])
         .current_dir(fixtures)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1977,9 +2177,27 @@ await server.connect(transport);
         println!("FAILED (skipping SDK leg)");
         return None;
     }
+    // The rows are stamped with the pin, so the pin has to be what runs.
+    if installed_sdk_version(fixtures).as_deref() != Some(MCP_SDK_VERSION) {
+        println!("FAILED: the installed SDK is not {MCP_SDK_VERSION} (skipping SDK leg)");
+        return None;
+    }
     println!("ok");
 
     Some(server)
+}
+
+/// The `version` in the installed SDK's own `package.json` under
+/// `fixtures`, or `None` when it is not installed (or unreadable).
+fn installed_sdk_version(fixtures: &Path) -> Option<String> {
+    let manifest = fixtures
+        .join("node_modules")
+        .join("@modelcontextprotocol")
+        .join("sdk")
+        .join("package.json");
+    let text = std::fs::read_to_string(manifest).ok()?;
+    let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some(doc["version"].as_str()?.to_string())
 }
 
 // ------------------------------------------------------------ table output
@@ -2117,7 +2335,15 @@ fn build_json(
     let rt_info: Vec<serde_json::Value> = runtimes.iter().map(runtime_json).collect();
     let cases: Vec<serde_json::Value> = results
         .iter()
-        .map(|r| case_row_json(r, Some(commit)))
+        .map(|r| {
+            let mut row = case_row_json(r, Some(commit));
+            // Per row, so it survives a `--case` merge beside the row's own
+            // commit, and a file whose rows predate the pin claims nothing.
+            if uses_sdk_server(&r.name, &r.runtime) {
+                row["mcp_sdk"] = serde_json::Value::String(MCP_SDK_VERSION.to_string());
+            }
+            row
+        })
         .collect();
 
     let timestamp = chrono_utc_now();
@@ -2128,7 +2354,9 @@ fn build_json(
         "timestamp": timestamp,
         "commit": commit,
         "host": host,
-        "hardware_class": std::env::var("BENCH_HARDWARE_CLASS").unwrap_or_else(|_| "unknown".to_string()),
+        // Opt-in free text (see the module doc); the stamp line prints it
+        // when it is set.
+        "hardware_class": hardware_class(std::env::var("BENCH_HARDWARE_CLASS").ok().as_deref()),
         "profile": profile,
         "warmup_iterations": 0,
         "runtimes": rt_info,
@@ -2170,6 +2398,71 @@ fn build_json(
 }
 
 // ---------------------------------------------------------- markdown output
+
+/// "`a`, `b` and `c`": case names as the generated prose lists them.
+fn code_list(names: &[&str]) -> String {
+    let quoted: Vec<String> = names.iter().map(|n| format!("`{n}`")).collect();
+    match quoted.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => quoted.concat(),
+    }
+}
+
+/// The two paragraphs of BENCHMARKS.md that say where each figure is taken
+/// and in what order the runs go. The case lists come from `CASE_NAMES` and
+/// `BLOCK_SAMPLED_CASES`, the lists `run` dispatches on, so the text cannot
+/// claim an ordering the code does not use. It used to say every case was
+/// interleaved and that only two were timed from outside.
+fn sampling_paragraphs() -> String {
+    let script_timed: Vec<&str> = main_cases()
+        .filter(|c| !BLOCK_SAMPLED_CASES.contains(c))
+        .collect();
+    let mut harness_timed: Vec<&str> = BLOCK_SAMPLED_CASES
+        .iter()
+        .copied()
+        .filter(|c| *c != RSS_CASE)
+        .collect();
+    harness_timed.push(TS_CASE);
+    let script_timed = code_list(&script_timed);
+    let harness_timed = code_list(&harness_timed);
+    let block_sampled = code_list(&BLOCK_SAMPLED_CASES);
+    [
+        "The script-timed cases (",
+        script_timed.as_str(),
+        ") time themselves inside the runtime under test and print the figure, so ",
+        "process start is not in it. ",
+        harness_timed.as_str(),
+        " are timed by the harness from outside, from process spawn or from the ",
+        "request it sends, and `",
+        RSS_CASE,
+        "` is a memory reading the harness takes from outside. A runtime that is not ",
+        "on PATH is skipped, never estimated. The profile and host are recorded in the ",
+        "line below, because a debug build against release Node is not a comparison; ",
+        "set `BENCH_HARDWARE_CLASS` (free text naming a class of machine, never a ",
+        "host) to have the hardware recorded beside them.\n\n",
+        "Every figure is a MEDIAN over repeated process runs, and the per-case sample ",
+        "count sits in the `iterations` field of ",
+        "[`bench/results.json`](bench/results.json) alongside min/max/p95/p99 and the ",
+        "raw samples -- read those before drawing a conclusion from a gap of a few ",
+        "percent. How the runs are ordered depends on the case. The script-timed cases ",
+        "and `",
+        TS_CASE,
+        "` are interleaved: one run of each runtime (for `",
+        TS_CASE,
+        "`, of each row) per round, so background load that drifts over the run lands ",
+        "on all of them rather than on whichever was measured last; their ratios ",
+        "survive it, the absolute numbers do not. ",
+        block_sampled.as_str(),
+        " are NOT interleaved: all of one runtime's samples are taken before the next ",
+        "runtime starts, so a load spike during one runtime's block moves that case's ",
+        "ratio too. Those include the spawn-bound cases, the ones most sensitive to ",
+        "load -- check them against the interleaved cases before believing a shift in ",
+        "one. Do not compare absolute figures across two runs on a machine that was ",
+        "doing different things each time -- compare the ratios of the interleaved ",
+        "cases, or re-measure both on a quiet box.\n\n",
+    ]
+    .concat()
+}
 
 /// Render BENCHMARKS.md from the results document. Takes the JSON rather than
 /// this run's structs so a `--case` merge and a full run render through one
@@ -2228,20 +2521,9 @@ fn build_markdown(doc: &serde_json::Value) -> String {
         "result when nothing is rebuilding concurrently. If you hand-roll a ",
         "`target/release/oam` invocation while a build is running, that is why yours will ",
         "disagree.\n\n",
-        "Each case is timed in-process by the harness rather than by a shell wrapper, ",
-        "except `cold-start` and `mcp-cold-start`, which are wall-clock from process ",
-        "spawn and can only be measured from outside. A runtime that is not on PATH is ",
-        "skipped, never estimated. The profile and host are recorded in the line below, ",
-        "because a debug build against release Node is not a comparison.\n\n",
-        "Every figure is a MEDIAN over repeated process runs, and the per-case sample ",
-        "count sits in the `iterations` field of [`bench/results.json`](bench/results.json) ",
-        "alongside min/max/p95/p99 and the raw samples -- read those before drawing a ",
-        "conclusion from a gap of a few percent. Runtimes are interleaved within a run, so ",
-        "background load that drifts over the run lands on all of them rather than on ",
-        "whichever was measured last; the ratios survive it, the absolute numbers do not. ",
-        "Do not compare absolute figures across two runs on a machine that was doing ",
-        "different things each time -- compare the ratios, or re-measure both on a quiet ",
-        "box.\n\n",
+    ));
+    md.push_str(&sampling_paragraphs());
+    md.push_str(concat!(
         "Where another runtime wins, the table says so -- see ",
         "[docs/why-oam.md](docs/why-oam.md) for the workloads oam is and is not aimed ",
         "at.\n\n",
@@ -2252,7 +2534,16 @@ fn build_markdown(doc: &serde_json::Value) -> String {
         "case gets re-measured after a change without re-stamping numbers that did not ",
         "move.\n\n",
     ));
-    md.push_str(&format!("Commit `{commit}` | {profile} | host {host}\n\n"));
+    // `hardware_class` is opt-in (BENCH_HARDWARE_CLASS); "unknown" is the
+    // unset value and says nothing worth a column.
+    let hardware = doc["hardware_class"]
+        .as_str()
+        .filter(|h| !h.is_empty() && *h != "unknown")
+        .map(|h| format!(" | {h}"))
+        .unwrap_or_default();
+    md.push_str(&format!(
+        "Commit `{commit}` | {profile} | host {host}{hardware}\n\n"
+    ));
 
     md.push_str("## Runtimes\n\n");
     for (name, version) in &runtimes {
@@ -2372,7 +2663,21 @@ fn build_markdown(doc: &serde_json::Value) -> String {
     md.push_str("- **fs-read** -- `fs.readFileSync` of a 4KB file, 1,000 iterations.\n");
     md.push_str("- **json-parse** -- `JSON.parse(JSON.stringify(obj))` round-trip on a 100-user payload, 1,000 iterations.\n");
     md.push_str("- **crypto-hash** -- `crypto.createHash('sha256').update(64KB).digest()`, 1,000 iterations.\n");
-    md.push_str("- **mcp-cold-start** -- wall-clock from process spawn to the first MCP `initialize` response via stdio. oam uses the built-in `oam:mcp` virtual module; other runtimes use `@modelcontextprotocol/sdk` (same noop tool, same transport).\n");
+    // The SDK version, from the rows that recorded one (`mcp_sdk`). Rows
+    // measured before the pin carry none, and the legend then claims none.
+    let mut sdk_versions: Vec<&str> = results
+        .iter()
+        .copied()
+        .filter_map(|r| r["mcp_sdk"].as_str())
+        .collect();
+    sdk_versions.sort_unstable();
+    sdk_versions.dedup();
+    let sdk_note = if sdk_versions.is_empty() {
+        String::new()
+    } else {
+        format!(", version {}", sdk_versions.join(" / "))
+    };
+    md.push_str(&format!("- **mcp-cold-start** -- wall-clock from process spawn to the first MCP `initialize` response via stdio. oam uses the built-in `oam:mcp` virtual module; other runtimes use `@modelcontextprotocol/sdk` (same noop tool, same transport{sdk_note}).\n"));
     md.push_str("- **mcp-idle-rss** -- resident set size (MB) after `initialize` completes and the server is idle, waiting for the next request. Measures runtime memory overhead of a hosted MCP server.\n");
     md.push_str("- **mcp-first-call-latency** -- wall-clock from sending `tools/call` to receiving the response, on an already-initialized server. Measures warm-path dispatch latency (no cold-start cost).\n");
     md.push_str(&format!(
@@ -2414,7 +2719,7 @@ fn push_ts_markdown(md: &mut String, ts: &serde_json::Value) {
          type`, a few inner functions each) that import each other in a chain plus a fan-out \
          from the entry. oam runs it as `oam run --no-check main.ts` in three cache states, one \
          row each; node runs it once, as installed, for reference. Median over {} runs per row, \
-         the rows sampled round-robin like every other case. Milliseconds, lower is better. \
+         the rows sampled round-robin, one run of each row per round. Milliseconds, lower is better. \
          Each label was checked rather than assumed: a no-cache run that leaves a `.v8c` blob, \
          a cold run that leaves none, or a row whose first line disagrees with another row's \
          fails the case instead of publishing. The stamp above is this section's own -- \
@@ -2679,6 +2984,25 @@ mod rss_parse_tests {
     }
 
     #[test]
+    fn a_dead_pid_yields_none_rather_than_a_bogus_number() {
+        // tasklist prints this to stdout when the filter matches nothing. It
+        // must not parse as a memory figure.
+        let gone = "INFO: No tasks are running which match the specified criteria.";
+        assert_eq!(parse_tasklist_rss_kb(gone), None);
+        assert_eq!(parse_tasklist_rss_kb(""), None);
+    }
+}
+
+/// Platform-independent checks on what the harness records and accepts.
+/// The first two sat in the Windows-only module above although neither
+/// touches tasklist, so a results file regenerated and gated on the mac or
+/// linux leg was never checked for local paths.
+#[cfg(test)]
+mod record_tests {
+    use super::{RpcLine, classify_rpc_line, installed_sdk_version, is_batch_wrapper};
+    use std::path::Path;
+
+    #[test]
     fn runtime_json_records_the_file_name_not_the_local_path() {
         let dir = std::env::temp_dir().join("oam-bench-stage-0");
         let rt = super::Runtime {
@@ -2708,13 +3032,97 @@ mod rss_parse_tests {
         }
     }
 
+    /// The clock must stop on the successful response to the request that
+    /// was sent, and on nothing else. Every non-`Answer` line here used to
+    /// count as one.
     #[test]
-    fn a_dead_pid_yields_none_rather_than_a_bogus_number() {
-        // tasklist prints this to stdout when the filter matches nothing. It
-        // must not parse as a memory figure.
-        let gone = "INFO: No tasks are running which match the specified criteria.";
-        assert_eq!(parse_tasklist_rss_kb(gone), None);
-        assert_eq!(parse_tasklist_rss_kb(""), None);
+    fn only_the_matching_successful_response_answers_a_request() {
+        let ok = r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}]}}"#;
+        assert_eq!(classify_rpc_line(ok, 2), RpcLine::Answer);
+        // The reader thread hands lines over with their newline.
+        assert_eq!(classify_rpc_line(&format!("{ok}\r\n"), 2), RpcLine::Answer);
+        // An empty result object is still a result (`initialize` aside, a
+        // server may answer `{}`).
+        let empty = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        assert_eq!(classify_rpc_line(empty, 1), RpcLine::Answer);
+
+        // Not the response: keep waiting.
+        for unrelated in [
+            // the response to a different request
+            ok,
+            // a notification
+            r#"{"jsonrpc":"2.0","method":"notifications/message","params":{}}"#,
+            // a request FROM the server whose id collides with ours
+            r#"{"jsonrpc":"2.0","id":1,"method":"roots/list"}"#,
+            // a log line on stdout
+            "server listening on stdio",
+            // a string id is not our numeric one
+            r#"{"jsonrpc":"2.0","id":"1","result":{}}"#,
+        ] {
+            assert_eq!(
+                classify_rpc_line(unrelated, 1),
+                RpcLine::Unrelated,
+                "{unrelated}"
+            );
+        }
+
+        // The response, reporting a failure: the sample fails.
+        let refused = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Unsupported protocol version"}}"#;
+        match classify_rpc_line(refused, 1) {
+            RpcLine::Failed(why) => {
+                assert!(why.contains("Unsupported protocol version"), "{why}");
+            }
+            other => panic!("an error reply classified as {other:?}"),
+        }
+        let tool_error = r#"{"jsonrpc":"2.0","id":2,"result":{"isError":true,"content":[{"type":"text","text":"Unknown tool: noop"}]}}"#;
+        match classify_rpc_line(tool_error, 2) {
+            RpcLine::Failed(why) => assert!(why.contains("Unknown tool"), "{why}"),
+            other => panic!("a tool error classified as {other:?}"),
+        }
+        let neither = r#"{"jsonrpc":"2.0","id":1}"#;
+        assert!(matches!(classify_rpc_line(neither, 1), RpcLine::Failed(_)));
+    }
+
+    /// `Command` runs these through cmd.exe, so the child is not the runtime.
+    #[test]
+    fn batch_wrappers_are_recognised_by_extension() {
+        assert!(is_batch_wrapper(Path::new("bun.cmd")));
+        assert!(is_batch_wrapper(
+            Path::new("dir").join("node.BAT").as_path()
+        ));
+        assert!(!is_batch_wrapper(Path::new("bun.exe")));
+        assert!(!is_batch_wrapper(Path::new("bun")));
+        // A dotted directory is not an extension of the file.
+        assert!(!is_batch_wrapper(
+            Path::new("tools.cmd").join("bun").as_path()
+        ));
+    }
+
+    /// The pin is compared against what is installed, not against "anything
+    /// is installed".
+    #[test]
+    fn installed_sdk_version_reads_the_sdk_manifest() {
+        let base = std::env::temp_dir().join(format!("oam-bench-sdk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(installed_sdk_version(&base), None);
+
+        let sdk = base
+            .join("node_modules")
+            .join("@modelcontextprotocol")
+            .join("sdk");
+        std::fs::create_dir_all(&sdk).unwrap();
+        std::fs::write(
+            sdk.join("package.json"),
+            r#"{"name":"@modelcontextprotocol/sdk","version":"9.8.7"}"#,
+        )
+        .unwrap();
+        assert_eq!(installed_sdk_version(&base).as_deref(), Some("9.8.7"));
+
+        // A manifest that does not parse is "not installed", so the harness
+        // reinstalls rather than trusting it.
+        std::fs::write(sdk.join("package.json"), "{").unwrap();
+        assert_eq!(installed_sdk_version(&base), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 
@@ -3071,6 +3479,194 @@ mod filtered_runs {
         assert_eq!(which_in("tool", &dirs, true), Some(dir.join("tool.exe")));
         assert_eq!(which_in("absent", &dirs, true), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `.cmd` earlier on PATH must not shadow the runtime's own image
+    /// later on it: through the wrapper the harness would hold cmd.exe.
+    #[test]
+    fn which_prefers_a_real_image_later_on_path_over_an_earlier_wrapper() {
+        let base = std::env::temp_dir().join(format!("oam-bench-which2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (shims, install) = (base.join("shims"), base.join("install"));
+        std::fs::create_dir_all(&shims).unwrap();
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::write(shims.join("tool.cmd"), "@echo off\n").unwrap();
+        let dirs = [shims.clone(), install.clone()];
+        // Only the wrapper exists: it is still found, and flagged.
+        let only_wrapper = which_in("tool", &dirs, true).unwrap();
+        assert_eq!(only_wrapper, shims.join("tool.cmd"));
+        assert!(is_batch_wrapper(&only_wrapper));
+        std::fs::write(install.join("tool.exe"), "").unwrap();
+        assert_eq!(
+            which_in("tool", &dirs, true),
+            Some(install.join("tool.exe"))
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The note about a passed-over wrapper names it only when it sits in an
+    /// EARLIER directory than the image that was chosen: that is the one
+    /// case where the lookup and a shell disagree.
+    #[test]
+    fn a_wrapper_earlier_on_path_than_the_chosen_image_is_reported() {
+        let base = std::env::temp_dir().join(format!("oam-bench-which3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (shims, install, late) = (base.join("shims"), base.join("install"), base.join("late"));
+        for dir in [&shims, &install, &late] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let dirs = [shims.clone(), install.clone(), late.clone()];
+        let found = |dirs: &[PathBuf]| which_in("tool", dirs, true).unwrap();
+
+        // Only a wrapper: it is what was chosen, nothing was passed over.
+        std::fs::write(shims.join("tool.bat"), "@echo off\n").unwrap();
+        assert_eq!(shadowed_wrapper("tool", &dirs, &found(&dirs), true), None);
+
+        // An image later on PATH: chosen, and the earlier wrapper is named.
+        std::fs::write(install.join("tool.exe"), "").unwrap();
+        assert_eq!(found(&dirs), install.join("tool.exe"));
+        assert_eq!(
+            shadowed_wrapper("tool", &dirs, &found(&dirs), true),
+            Some(shims.join("tool.bat"))
+        );
+        // `.cmd` is the one a shell tries first of the two.
+        std::fs::write(shims.join("tool.cmd"), "@echo off\n").unwrap();
+        assert_eq!(
+            shadowed_wrapper("tool", &dirs, &found(&dirs), true),
+            Some(shims.join("tool.cmd"))
+        );
+        // Not a Windows lookup: there is no suffix rule to disagree about.
+        assert_eq!(shadowed_wrapper("tool", &dirs, &found(&dirs), false), None);
+
+        // A wrapper beside the image, or after it, was not passed over.
+        std::fs::write(install.join("tool.cmd"), "@echo off\n").unwrap();
+        std::fs::write(late.join("tool.cmd"), "@echo off\n").unwrap();
+        let after = [install.clone(), late.clone(), shims.clone()];
+        assert_eq!(found(&after), install.join("tool.exe"));
+        assert_eq!(shadowed_wrapper("tool", &after, &found(&after), true), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An unset, empty or blank `BENCH_HARDWARE_CLASS` is "unknown"; anything
+    /// else is recorded without the whitespace around it.
+    #[test]
+    fn an_empty_hardware_class_is_unknown() {
+        assert_eq!(hardware_class(None), "unknown");
+        assert_eq!(hardware_class(Some("")), "unknown");
+        assert_eq!(hardware_class(Some(" \t ")), "unknown");
+        assert_eq!(
+            hardware_class(Some(" 8-core arm64 laptop\n")),
+            "8-core arm64 laptop"
+        );
+        assert_eq!(hardware_class(Some("unknown")), "unknown");
+    }
+
+    /// The published text about run ordering is generated from the lists the
+    /// dispatcher uses, names every case on exactly one side, and is what the
+    /// committed BENCHMARKS.md says.
+    #[test]
+    fn sampling_text_names_each_case_once_and_matches_the_committed_file() {
+        assert_eq!(code_list(&["a"]), "`a`");
+        assert_eq!(code_list(&["a", "b"]), "`a` and `b`");
+        assert_eq!(code_list(&["a", "b", "c"]), "`a`, `b` and `c`");
+
+        // The three groups partition the case list: the block-sampled four,
+        // the script-timed rest of the main table, and ts-cold-start.
+        for case in BLOCK_SAMPLED_CASES {
+            assert!(CASE_NAMES.contains(&case), "{case} is not a case");
+            assert_ne!(case, TS_CASE);
+        }
+        let script_timed: Vec<&str> = main_cases()
+            .filter(|c| !BLOCK_SAMPLED_CASES.contains(c))
+            .collect();
+        assert_eq!(
+            script_timed.len() + BLOCK_SAMPLED_CASES.len() + 1,
+            CASE_NAMES.len()
+        );
+
+        let text = sampling_paragraphs();
+        let blocked = format!("{} are NOT interleaved: ", code_list(&BLOCK_SAMPLED_CASES));
+        assert!(text.contains(&blocked), "{text}");
+        let timed = format!("The script-timed cases ({}) time", code_list(&script_timed));
+        assert!(text.contains(&timed), "{text}");
+        assert!(
+            text.contains("The script-timed cases and `ts-cold-start` are interleaved: "),
+            "{text}"
+        );
+        assert!(!text.contains("Runtimes are interleaved within a run"));
+
+        // Paragraph by paragraph, so a CRLF checkout of the .md still matches.
+        let committed = include_str!("../../BENCHMARKS.md");
+        for paragraph in text.trim_end().split("\n\n") {
+            assert!(
+                committed.contains(paragraph),
+                "BENCHMARKS.md does not carry the generated sampling text; regenerate it \
+                 (or hand-apply the wording) so the published claim matches the harness:\n\
+                 {paragraph}"
+            );
+        }
+        assert!(build_markdown(&existing()).contains(&text));
+        assert!(!committed.contains("round-robin like every other case"));
+    }
+
+    /// `hardware_class` reaches the stamp line when it was set, and the
+    /// unset value adds nothing.
+    #[test]
+    fn stamp_line_prints_a_recorded_hardware_class() {
+        let mut doc = existing();
+        assert!(build_markdown(&doc).contains("Commit `acec008` | release | host test-host\n"));
+        doc["hardware_class"] = json!("unknown");
+        assert!(build_markdown(&doc).contains("Commit `acec008` | release | host test-host\n"));
+        doc["hardware_class"] = json!("8-core arm64 laptop");
+        assert!(
+            build_markdown(&doc)
+                .contains("Commit `acec008` | release | host test-host | 8-core arm64 laptop\n")
+        );
+    }
+
+    /// The SDK rows say which SDK measured them, and the legend repeats it
+    /// only when a row does.
+    #[test]
+    fn sdk_rows_are_stamped_with_the_pinned_version() {
+        let result = |runtime: &str, case: &str| CaseResult {
+            runtime: runtime.to_string(),
+            name: case.to_string(),
+            median: 1.0,
+            min: 1.0,
+            max: 1.0,
+            p50: 1.0,
+            p95: 1.0,
+            p99: 1.0,
+            unit: "ms".to_string(),
+            iterations: 1,
+            warmup_iterations: 0,
+            samples: vec![1.0],
+        };
+        let results = [
+            result("oam", "mcp-cold-start"),
+            result("node", "mcp-cold-start"),
+            result("node", "cold-start"),
+        ];
+        let runtime = |name: &str| Runtime {
+            name: name.to_string(),
+            exe: PathBuf::from(name),
+            version: String::new(),
+        };
+        let runtimes = [runtime("oam"), runtime("node")];
+        let doc = build_json(&results, &runtimes, None, "abc1234", "release");
+        let rows = doc["results"].as_array().unwrap();
+        assert!(
+            rows[0]["mcp_sdk"].is_null(),
+            "oam serves oam:mcp, not the SDK"
+        );
+        assert_eq!(rows[1]["mcp_sdk"], MCP_SDK_VERSION);
+        assert!(rows[2]["mcp_sdk"].is_null(), "cold-start runs no SDK");
+
+        let legend = format!("same transport, version {MCP_SDK_VERSION})");
+        assert!(build_markdown(&doc).contains(&legend));
+        // Rows measured before the pin carry no version; the legend claims none.
+        let md = build_markdown(&existing());
+        assert!(md.contains("(same noop tool, same transport)."), "{md}");
     }
 
     trait Tap: Sized {

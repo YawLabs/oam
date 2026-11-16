@@ -40,7 +40,10 @@
 #                 leg used to buy after a toolchain bump. A tree with no 1.100
 #                 units still gets the deps/ family prune below.
 #   *.inuse-*     parked copies from scripts/lib/build-locks.sh whose holder
-#                 has since exited.
+#                 has since exited: at the top of a tree, in the old deps/,
+#                 and in the out/ of oam_cli's units -- the dirs oam_park_bin
+#                 parks into, and no other package's. --dry-run counts them
+#                 and deletes none.
 #
 # A file some process still has mapped simply fails to unlink and is left; that
 # is not an error here.
@@ -104,13 +107,25 @@
 #      what holds the units nothing uplifts: test harnesses, check and clippy
 #      units. Build-script RUN units are no root of their own (their json
 #      carries profile 0 and no features, so every run of a package would
-#      share one slot); they live through the compile units that name them.
+#      share one slot); they live through the compile units that name them
+#      -- and through root 3 when the unit that should name one no longer
+#      does.
 #      A slot roots nothing once its newest unit trails the newest unit of
 #      its GROUP -- same tree, package, kind and compile_kind, any profile
 #      hash, features or dependency variant -- by more than STALE_DAYS (7):
 #      a [profile] edit or a feature change opens a new slot, and the old
 #      one's newest unit (an old rusty_v8 OUT_DIR through its closure) would
 #      otherwise be pinned for good.
+#   3. The newest build-script RUN unit of a package, in a tree where a live
+#      unit of that package names a fingerprint hash no unit carries and no
+#      run unit of the package is otherwise live. That is what a build script
+#      rerun in place leaves when the package's own compile then fails or is
+#      interrupted: the run unit carries a new hash, the package's lib still
+#      names the old one, and with no slot of its own (2) the run -- the
+#      OUT_DIR: rusty_v8's static lib, oam_engine's snapshot -- would be
+#      unreached. Matched by tree and package, not by the dangling entry
+#      itself: the json names a dependency by target name and hash, and the
+#      hash is the one thing that no longer resolves.
 #
 # Everything reachable from a root through "deps", to a fixed point, is live:
 # a build's build-script compiles and runs (the OUT_DIRs -- rusty_v8's static
@@ -164,7 +179,11 @@
 #     window, and that run rebuilds what only it used.
 #   * a unit rebuilt IN PLACE gets a new fingerprint hash, so a dependent that
 #     was not rebuilt with it names a hash nothing carries; that dependent is
-#     dirty for cargo anyway and the dependency is still kept by its own slot.
+#     dirty for cargo anyway and the dependency is still kept by its own slot
+#     -- or, for a build-script run, which has none, by root 3. Root 3 cannot
+#     tell which dependency went missing, so a package whose live unit names
+#     any unresolved hash while none of its runs is live keeps its newest run
+#     (and that run's build-script compile) even when the run is a leftover.
 #   * nothing is pruned inside the hour's grace, so a run right after a build
 #     reclaims only what is older.
 # =============================================================================
@@ -224,9 +243,10 @@ if [ -n "${OAM_GC_TREES:-}" ]; then
   read -r -a TREES <<<"$OAM_GC_TREES"
 fi
 
-# How far a slot or an uplift may trail the newest of its kind before it stops
-# rooting anything (see "Units" in the header). Days, a named knob so the
-# header, the awk and the suite agree on one number.
+# How far a slot's newest unit may trail the newest unit of its group before
+# the slot stops rooting anything (see "Units" in the header). Slots only: age
+# never disowns an uplift. Days, a named knob so the header, the awk and the
+# suite agree on one number.
 STALE_DAYS=7
 
 # tree_root <tree> -- the CARGO_TARGET_DIR a tree belongs to: the tree less its
@@ -444,6 +464,23 @@ prune_root() {
           }
           return out
         }
+        # reach(<from>) -- mark everything the queued units q[from..nq] name
+        # through "deps" live, to a fixed point: a work queue, so one pass
+        # gets there. Every tree of the root resolves a hash -- a run in a
+        # --target tree names its build-script compile in the host tree.
+        function reach(from,   qi, u, m, j, nv, v, hs, vs) {
+          for (qi = from; qi <= nq; qi++) {
+            u = q[qi]
+            if (!(u in deps) || deps[u] == "") continue
+            m = split(deps[u], hs, " ")
+            for (j = 1; j <= m; j++) {
+              if (!(hs[j] in own)) continue
+              nv = split(own[hs[j]], vs, " ")
+              for (v = 1; v <= nv; v++)
+                if (!(vs[v] in live)) { live[vs[v]] = 1; q[++nq] = vs[v] }
+            }
+          }
+        }
         # An uplift target: which tree it is in, and its mtime (the inode`s,
         # so the unit file`s too).
         $1 == "t" {
@@ -459,7 +496,6 @@ prune_root() {
           n = split(rel, c, "/")
           if (n < 2 || c[1] == "" || c[2] !~ hex) next
           unit = pre c[1] "/" c[2]
-          utr[unit] = ti
           if ($1 == "d") {
             if (n != 2) next
             seen[unit] = 1; dmt[unit] = $2
@@ -521,6 +557,9 @@ prune_root() {
           # in (see the header).
           base[unit] = c[1] "|" kind "|" prof "|" ck "|" feat
           grp[unit] = ti "|" c[1] "|" kind "|" ck
+          # Tree and package: what root 3 matches a run unit to its package`s
+          # other units by.
+          upk[unit] = ti "|" c[1]
           # A build-script run is no root of its own (see the header).
           if (kind !~ /^run-/) slotted[unit] = 1
         }
@@ -625,20 +664,31 @@ prune_root() {
               if (!(best in live)) { live[best] = 1; q[++nq] = best; nslot++ }
             }
           }
-          # The closure: a work queue, so one pass reaches the fixed point.
-          # Every tree of the root resolves a hash -- a run in a --target tree
-          # names its build-script compile in the host tree.
-          for (qi = 1; qi <= nq; qi++) {
-            u = q[qi]
-            if (!(u in deps) || deps[u] == "") continue
-            m = split(deps[u], hs, " ")
-            for (j = 1; j <= m; j++) {
-              if (!(hs[j] in own)) continue
-              nv = split(own[hs[j]], vs, " ")
-              for (v = 1; v <= nv; v++)
-                if (!(vs[v] in live)) { live[vs[v]] = 1; q[++nq] = vs[v] }
-            }
+          # The closure of roots 1 and 2.
+          reach(1)
+          # Root 3: a package whose live compile unit names a hash no unit
+          # carries, in a tree where none of the package`s build-script runs
+          # is live, keeps its newest run (see the header). Decided on the
+          # finished closure and collected before anything is marked, so one
+          # run rooted here cannot change the verdict on another; then closed
+          # over in turn, which is what keeps that run`s build-script compile.
+          for (u in parsed) {
+            if (u in slotted) continue
+            k = upk[u]
+            if (u in live) runlive[k] = 1
+            if (!(k in rnew) || newest[u] + 0 > newest[rnew[k]] + 0) rnew[k] = u
           }
+          nwant = 0
+          for (u in live) {
+            if (!(u in slotted)) continue
+            k = upk[u]
+            if ((k in runlive) || !(k in rnew) || (k in wanted)) continue
+            for (j = 1; j <= nd[u]; j++)
+              if (dto[u, j] == "") { wanted[k] = 1; want[++nwant] = rnew[k]; break }
+          }
+          nrun = 0; rfrom = nq + 1
+          for (i = 1; i <= nwant; i++) { live[want[i]] = 1; q[++nq] = want[i]; nrun++ }
+          reach(rfrom)
           nlive = 0; nfresh = 0; nodd = 0
           for (u in seen) {
             if (u in live) { nlive++; continue }
@@ -648,14 +698,16 @@ prune_root() {
             if (!(u in nf)) { print "P 0 " u; continue }
             nodd++
           }
-          print "S " nup " " nslot " " nlive " " nfresh " " nodd " " nexp " " nstale
+          print "S " nup " " nslot " " nlive " " nfresh " " nodd " " nexp " " nstale " " nrun
         }
       '
   )
   # The awk's tally: uplift roots, slot roots, live units, unreached but
-  # inside the hour, unreadable, slots aged out, uplifts aged out.
-  local nup="" nslot="" nlive="" nfresh="" nodd="" nexp="" nstale=""
-  read -r nup nslot nlive nfresh nodd nexp nstale <<<"$stats" || true
+  # inside the hour, unreadable, slots aged out, uplifts linked by another
+  # toolchain, build-script runs kept for a dependent that names a hash
+  # nothing carries.
+  local nup="" nslot="" nlive="" nfresh="" nodd="" nexp="" nstale="" nrun=""
+  read -r nup nslot nlive nfresh nodd nexp nstale nrun <<<"$stats" || true
   if [ "$stale_count" -gt 0 ]; then
     if [ "$DRY_RUN" = "1" ]; then
       warn "would prune $stale_count unreachable units under $root ($((stale_kb / 1024))MB)"
@@ -663,10 +715,13 @@ prune_root() {
       ok "pruned $stale_count unreachable units under $root ($((stale_kb / 1024))MB)"
     fi
   fi
-  if [ -n "$nstale" ]; then
+  if [ -n "$nrun" ]; then
     ok "kept $nlive live units under $root ($nup uplifted, $nslot newest in their slot, the rest reached from those)"
     if [ "$nexp" -gt 0 ] || [ "$nstale" -gt 0 ]; then
       ok "rooted nothing from $nexp slots and $nstale uplifted units under $root left behind (slots over ${STALE_DAYS} days behind their group, uplifts by another toolchain)"
+    fi
+    if [ "$nrun" -gt 0 ]; then
+      ok "kept $nrun build-script runs under $root for a unit that names a hash nothing carries (a build script rerun in place; counted among the live units)"
     fi
     if [ "$nfresh" -gt 0 ]; then
       ok "kept $nfresh unreached units under $root that are under an hour old (a build may still be writing them)"
@@ -691,6 +746,18 @@ say "target/ is ${before_gb}GB before pruning (keep=$KEEP, dry-run=$DRY_RUN)"
 gc_rm() {
   if [ "$DRY_RUN" = "1" ]; then return 0; fi
   rm -f "$@" 2>/dev/null || true
+}
+
+# gc_reap <dir> -- oam_reap_parked that honours --dry-run: a dry run counts
+# the parked copies in <dir> for the closing report and deletes none.
+PARKED_PLANNED=0
+gc_reap() {
+  local f
+  if [ "$DRY_RUN" != "1" ]; then oam_reap_parked "$1"; return 0; fi
+  for f in "$1"/*.inuse-*; do
+    if [ -f "$f" ]; then PARKED_PLANNED=$((PARKED_PLANNED + 1)); fi
+  done
+  return 0
 }
 
 add_triple_trees
@@ -732,7 +799,7 @@ for tree in "${TREES[@]}"; do
   [ -d "$tree/deps" ] || continue
   if [ "$LISTER" = "none" ]; then
     warn "$tree/deps: per-family prune skipped -- needs GNU find -printf or BSD stat -f, and this host has neither; incremental/ was still reclaimed"
-    oam_reap_parked "$tree"; oam_reap_parked "$tree/deps"
+    gc_reap "$tree"; gc_reap "$tree/deps"
     continue
   fi
   # Newest-first globally, so the FIRST time awk sees a family it is that
@@ -848,8 +915,8 @@ for tree in "${TREES[@]}"; do
     warn "$held_count superseded artifacts in $tree/deps could not be deleted ($((held_kb / 1024))MB left in place) -- likely still in use; a later run reclaims them"
   fi
 
-  oam_reap_parked "$tree"
-  oam_reap_parked "$tree/deps"
+  gc_reap "$tree"
+  gc_reap "$tree/deps"
 done
 
 # The unit prune: one mark-and-sweep per target dir, over all of its trees.
@@ -871,17 +938,23 @@ for r in ${roots[@]+"${roots[@]}"}; do
   fi
 done
 for tree in ${UNIT_TREES[@]+"${UNIT_TREES[@]}"}; do
-  # Parked copies land in each unit's out/ (scripts/lib/build-locks.sh:
-  # oam_park_bin) as well as at the top of the tree.
+  # Parked copies land in the out/ of oam_cli's units (scripts/lib/
+  # build-locks.sh: oam_park_bin, which every caller hands oam_cli) as well as
+  # at the top of the tree. Only that package's: another crate's out/ is its
+  # own, and a file there that happens to match *.inuse-* is not this
+  # script's to remove.
   # shellcheck disable=SC2231  # $HEX16 is a glob and must stay unquoted
-  for d in "$tree"/build/*/$HEX16/out; do
-    oam_reap_parked "$d"
+  for d in "$tree"/build/oam_cli/$HEX16/out; do
+    gc_reap "$d"
   done
-  oam_reap_parked "$tree"
+  gc_reap "$tree"
 done
 
 after_gb="$(oam_dir_gb target)"
 if [ "$DRY_RUN" = "1" ]; then
+  if [ "$PARKED_PLANNED" -gt 0 ]; then
+    warn "would reap $PARKED_PLANNED parked copies (*.inuse-*) left by earlier runs"
+  fi
   say "dry run -- nothing deleted (target/ still ${after_gb}GB)"
 else
   say "target/ is ${after_gb}GB (was ${before_gb}GB)"

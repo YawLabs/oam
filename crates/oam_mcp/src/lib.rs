@@ -509,6 +509,38 @@ fn drain_pipe<R: std::io::Read + Send + 'static>(
     buffer
 }
 
+/// How often a running `oam_run` call looks for its script's exit and for a
+/// cancellation.
+const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(15);
+
+/// Wait for `pipes` drained pipes to report their end of file on `closed`
+/// (one message each, see [`drain_pipe`]), until `until` at the latest.
+/// Returns whether `cancelled` turned true first; it is asked at least every
+/// [`CANCEL_POLL`], so a cancellation is not held for as long as some process
+/// keeps a pipe open.
+fn wait_for_pipes(
+    closed: &std::sync::mpsc::Receiver<()>,
+    pipes: usize,
+    until: std::time::Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> bool {
+    let mut open = pipes;
+    while open > 0 {
+        if cancelled() {
+            return true;
+        }
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        match closed.recv_timeout(left.min(CANCEL_POLL)) {
+            Ok(()) => open -= 1,
+            // A poll interval went by with time still on the clock.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !left.is_zero() => {}
+            // Out of time, or no drainer is left to report.
+            Err(_) => break,
+        }
+    }
+    false
+}
+
 /// Run `oam run --json <absolute file>` with a kill-on-deadline budget. The
 /// file is made absolute so that a '-'-prefixed name can never read as a flag
 /// (file '--help' used to return a success-shaped payload); a `--` terminator
@@ -516,9 +548,11 @@ fn drain_pipe<R: std::io::Read + Send + 'static>(
 /// as its arguments. Pipes are drained on threads so a chatty child can't
 /// deadlock the wait loop.
 ///
-/// `cancelled` is polled with the child: when it turns true the script is
-/// killed and the call returns at once, with a payload nobody is waiting for
-/// (the caller of a cancelled request sends no response).
+/// `cancelled` is polled for the whole call, every [`CANCEL_POLL`]: while the
+/// script runs (it is then killed) and while its pipes are waited for after
+/// it has exited. When it turns true the call returns at once, with a payload
+/// nobody is waiting for (the caller of a cancelled request sends no
+/// response).
 ///
 /// The budget bounds the whole call, not just the script: the answer comes
 /// by the deadline plus [`PIPE_GRACE`] even when something other than the
@@ -558,6 +592,15 @@ fn run_subprocess(
     );
     let stderr_buf = drain_pipe(child.stderr.take().expect("piped stderr"), closed_tx);
 
+    // The answer to a cancelled call. It lets go of what was captured; the
+    // drainers read on and drop until the pipes close.
+    let cancelled_answer = || {
+        for buffer in [&stdout_buf, &stderr_buf] {
+            *buffer.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        tool_text(&json!({ "cancelled": true }).to_string(), true)
+    };
+
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut timed_out = false;
     let status = loop {
@@ -572,14 +615,9 @@ fn run_subprocess(
             None if cancelled() => {
                 let _ = child.kill();
                 let _ = child.wait();
-                // Let go of what was captured; the drainers read on and
-                // drop until the pipes close.
-                for buffer in [&stdout_buf, &stderr_buf] {
-                    *buffer.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                }
-                return Ok(tool_text(&json!({ "cancelled": true }).to_string(), true));
+                return Ok(cancelled_answer());
             }
-            None => std::thread::sleep(Duration::from_millis(15)),
+            None => std::thread::sleep(CANCEL_POLL),
         }
     };
 
@@ -587,12 +625,12 @@ fn run_subprocess(
     // until the budget plus PIPE_GRACE (the script finished early) or
     // PIPE_GRACE past the kill (the budget ran out), then answer with what
     // arrived; the drainer threads end whenever the pipe's last holder exits.
+    // A cancellation ends this wait as it ends the one above: the script is
+    // gone, but whatever holds its pipes can keep the call here for the rest
+    // of the budget.
     let wait_until = deadline.max(Instant::now()) + PIPE_GRACE;
-    for _ in 0..2 {
-        let left = wait_until.saturating_duration_since(Instant::now());
-        if closed_rx.recv_timeout(left).is_err() {
-            break;
-        }
+    if wait_for_pipes(&closed_rx, 2, wait_until, cancelled) {
+        return Ok(cancelled_answer());
     }
     let take = |buffer: &std::sync::Mutex<Option<Captured>>| {
         buffer
@@ -734,7 +772,7 @@ const KNOWN_CODES: &[(&str, &str)] = &[
     // holds the entry, since the scan of zero-padded literals cannot see it.
     (
         "OAM-RT-OOM",
-        "The JavaScript heap reached its cap and the process exited with code 134. Printed as a plain `error[OAM-RT-OOM]` line on stderr, not as an ODIF diagnostic (so it is not in a --json stream); the line names the cap in megabytes and where it came from (and, for a cap asked below 16 MB, that it was raised to oam's 16 MB minimum). Raise it with OAM_MAX_HEAP_MB (megabytes) or --max-old-space-size, or find what holds the memory: by default the cap is 75% of the container memory limit when there is one, else 4096 MB.",
+        "The JavaScript heap reached its cap and the process exited with code 134. Printed as a plain `error[OAM-RT-OOM]` line on stderr, not as an ODIF diagnostic (so it is not in a --json stream); the line names the cap in megabytes and where it came from (and, for a cap asked below 16 MB, that it was raised to oam's 16 MB minimum). Raise it with OAM_MAX_HEAP_MB (megabytes) or --max-old-space-size, or find what holds the memory: by default the cap is 4096 MB, or on Linux 75% of the container (cgroup) memory limit when that figure is at least 128 MB and under 4096 MB.",
     ),
     (
         "OAM-TS0000",
@@ -1127,6 +1165,56 @@ mod tests {
         let text = explain_code("OAM-RT-OOM");
         assert!(!text.contains("unknown code"), "{text}");
         assert!(text.contains("OAM_MAX_HEAP_MB"), "{text}");
+        // The default it states is the engine's: the fraction of a container
+        // limit, and the band outside which the limit is not used at all.
+        for (constant, said) in [
+            ("const CGROUP_HEAP_FRACTION: u64 = 75;", "75% of"),
+            (
+                "const CGROUP_HEAP_FLOOR_MB: usize = 128;",
+                "at least 128 MB",
+            ),
+            ("const DEFAULT_HEAP_MB: usize = 4096;", "under 4096 MB"),
+            (
+                "(CGROUP_HEAP_FLOOR_MB..DEFAULT_HEAP_MB).contains(&mb)",
+                "the cap is 4096 MB, or on Linux",
+            ),
+        ] {
+            assert!(source.contains(constant), "{engine:?} lost {constant:?}");
+            assert!(text.contains(said), "{said:?} is not in: {text}");
+        }
+    }
+
+    #[test]
+    fn a_cancellation_ends_the_wait_for_pipes_that_something_still_holds() {
+        use std::time::{Duration, Instant};
+        let far = Duration::from_secs(60);
+
+        // Both pipes closed: no wait, whatever the deadline.
+        let (ended, closed) = std::sync::mpsc::channel();
+        ended.send(()).unwrap();
+        ended.send(()).unwrap();
+        let started = Instant::now();
+        assert!(!wait_for_pipes(&closed, 2, started + far, &|| false));
+        assert!(started.elapsed() < far / 2);
+
+        // One closed, one held open (`ended` is its drainer's sender, still
+        // alive), no cancellation: the wait runs to its deadline.
+        ended.send(()).unwrap();
+        let started = Instant::now();
+        let short = Duration::from_millis(60);
+        assert!(!wait_for_pipes(&closed, 2, started + short, &|| false));
+        assert!(started.elapsed() >= short);
+
+        // Held open with the deadline far off: a cancellation ends the wait.
+        let asked = std::cell::Cell::new(0u32);
+        let cancelled = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 3
+        };
+        let started = Instant::now();
+        assert!(wait_for_pipes(&closed, 2, started + far, &cancelled));
+        assert!(started.elapsed() < far / 2, "{:?}", started.elapsed());
+        drop(ended);
     }
 
     #[test]
