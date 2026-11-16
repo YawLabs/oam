@@ -143,6 +143,12 @@ crypto-bigint = { version = "0.7.11", default-features = false, features = ["all
 # nom is already in-tree transitively; x509-parser adds only the ASN.1
 # layer (der-parser, asn1-rs, oid-registry) — no C deps.
 x509-parser = "0.16"
+# node:crypto x25519 keys and crypto.diffieHellman over them (#489): the
+# Montgomery-ladder scalar multiplication. Already in the graph at this version
+# (ssh-key -> ed25519-dalek -> curve25519-dalek); no default features, so the
+# crate builds exactly as ed25519-dalek already asks for it. ring has X25519
+# only for an ephemeral key it generates itself and cannot take a stored one.
+curve25519-dalek = { version = "4.1", default-features = false }
 # node:zlib: gzip/deflate via the same backend everything else in the
 # Rust ecosystem uses (already in-tree transitively through oxc).
 flate2 = "1"

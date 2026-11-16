@@ -1792,6 +1792,9 @@
   codes.ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE = E("ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", TypeError, function(actual, expected) {
     return `Invalid key object type ${actual}, expected ${expected}.`;
   });
+  codes.ERR_CRYPTO_INCOMPATIBLE_KEY = E("ERR_CRYPTO_INCOMPATIBLE_KEY", Error, function(name, msg) {
+    return `Incompatible ${name}: ${msg}`;
+  });
   codes.ERR_CRYPTO_FIPS_FORCED = E("ERR_CRYPTO_FIPS_FORCED", Error, function() {
     return 'Cannot set FIPS mode, it was forced with --force-fips at startup.';
   });
@@ -21301,6 +21304,7 @@
         for (var i = 0; i < der.length && i < 20; i++) hex += ("0" + der[i].toString(16)).slice(-2);
         if (hex.indexOf("06032b6570") !== -1) return "ed25519";
         if (hex.indexOf("06032b6571") !== -1) return "ed25519";
+        if (hex.indexOf("06032b656e") !== -1) return "x25519";
         if (hex.indexOf("2a8648ce3d") !== -1) return "ec";
         return "rsa";
       }
@@ -21361,7 +21365,108 @@
         var comps = natives.cryptoEcJwkExport(pem, true);
         return natives.cryptoEcJwkImport(comps.crv, comps.x, comps.y);
       }
+      if (kind === "x25519") checkX25519Pem(pem, true, false);
+      if (kind === "ed25519" || kind === "x25519") {
+        return okpSpkiPem(kind, natives.cryptoOkpComponents(pem, true).x);
+      }
       throw new Error("createPublicKey: deriving the public key of a private " + kind + " key is not supported");
+    }
+
+    // Ed25519 / X25519 (RFC 8410) keys from their 32 raw bytes, in the DER
+    // templates OpenSSL writes: an SPKI public key and a PKCS#8 v1 private
+    // key. The last OID byte is 0x70 for Ed25519 and 0x6e for X25519.
+    function okpOidByte(kind) {
+      return kind === "x25519" ? 0x6e : 0x70;
+    }
+    function okpSpkiPem(kind, raw) {
+      var der = new Uint8Array(44);
+      der.set([0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, okpOidByte(kind), 0x03, 0x21, 0x00]);
+      der.set(raw, 12);
+      return derToPem(der, "PUBLIC KEY");
+    }
+    function okpPkcs8Pem(kind, raw) {
+      var der = new Uint8Array(48);
+      der.set([0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, okpOidByte(kind), 0x04, 0x22, 0x04, 0x20]);
+      der.set(raw, 16);
+      return derToPem(der, "PRIVATE KEY");
+    }
+
+    // An OKP JWK ({ kty: 'OKP', crv: 'Ed25519' | 'X25519', x, d? }) as PEM:
+    // the private key from `d` when `wantPrivate`, else the public key from
+    // `x`. Validated in the order of node's getKeyObjectHandleFromJwk: crv a
+    // string naming an OKP curve (ERR_INVALID_ARG_TYPE / ERR_INVALID_ARG_VALUE
+    // on 'key.crv'), x a string -- for a private key too -- then d a string
+    // when private (ERR_INVALID_ARG_TYPE on 'key.x' / 'key.d'), and only a
+    // field of the wrong decoded length is ERR_CRYPTO_INVALID_JWK. Ed448 /
+    // X448 pass node's checks but have no natives here, so a well-formed one
+    // is refused with its own unsupported error.
+    function okpJwkToPem(jwk, wantPrivate) {
+      if (typeof jwk.crv !== "string") throw codes.ERR_INVALID_ARG_TYPE("key.crv", "string", jwk.crv);
+      if (["Ed25519", "Ed448", "X25519", "X448"].indexOf(jwk.crv) === -1) {
+        throw codes.ERR_INVALID_ARG_VALUE("key.crv", jwk.crv, "must be one of: 'Ed25519', 'Ed448', 'X25519', 'X448'");
+      }
+      if (typeof jwk.x !== "string") throw codes.ERR_INVALID_ARG_TYPE("key.x", "string", jwk.x);
+      if (wantPrivate && typeof jwk.d !== "string") throw codes.ERR_INVALID_ARG_TYPE("key.d", "string", jwk.d);
+      var raw = new Uint8Array(base64urlDecode(wantPrivate ? jwk.d : jwk.x));
+      var wantLength = jwk.crv === "Ed448" ? 57 : jwk.crv === "X448" ? 56 : 32;
+      if (raw.length !== wantLength) {
+        var err = new TypeError("Invalid JWK data");
+        err.code = "ERR_CRYPTO_INVALID_JWK";
+        throw err;
+      }
+      if (wantLength !== 32) throw new Error("JWK import is not supported for key type: " + jwk.crv);
+      var kind = jwk.crv === "Ed25519" ? "ed25519" : "x25519";
+      return wantPrivate ? okpPkcs8Pem(kind, raw) : okpSpkiPem(kind, raw);
+    }
+
+    // An Ed25519 / X25519 key as a JWK, as node exports one: crv, d (private
+    // keys only), x, kty -- in that key order.
+    function okpJwkExport(pem, isPrivate) {
+      var comps = natives.cryptoOkpComponents(pem, isPrivate);
+      var jwk = { crv: comps.crv };
+      if (isPrivate) jwk.d = base64urlEncode(comps.d);
+      jwk.x = base64urlEncode(comps.x);
+      jwk.kty = "OKP";
+      return jwk;
+    }
+
+    // asymmetricKeyType for a detectKeyType kind.
+    function asymmetricTypeOf(kind) {
+      return kind === "rsa" || kind === "ec" || kind === "x25519" ? kind : "ed25519";
+    }
+
+    // An X25519 PEM is labelled by its OID alone, so parse it at import, as
+    // node does, rather than let a malformed key surface later as a codeless
+    // TypeError from diffieHellman. node's errors: a bad PKCS#8 is OpenSSL's
+    // DECODER "unsupported"; a bad SPKI is a "decode error" from PEM and
+    // "Failed to read asymmetric key" from DER. (Other key types are still
+    // labelled without parsing; their natives report a bad key on use.)
+    function checkX25519Pem(pem, isPrivate, fromDer) {
+      try {
+        natives.cryptoOkpComponents(pem, isPrivate);
+        return;
+      } catch (_) {
+        // fall through to node's error
+      }
+      if (isPrivate) throw x25519ImportError("error:1E08010C:DECODER routines::unsupported", "DECODER routines", "unsupported", "ERR_OSSL_UNSUPPORTED");
+      if (fromDer) throw new Error("Failed to read asymmetric key");
+      throw x25519ImportError("error:03000072:digital envelope routines::decode error", "digital envelope routines", "decode error", "ERR_OSSL_EVP_DECODE_ERROR");
+    }
+    function x25519ImportError(message, library, reason, code) {
+      var err = new Error(message);
+      err.library = library;
+      err.reason = reason;
+      err.code = code;
+      return err;
+    }
+
+    // node's error for signing or verifying with a key-agreement (X25519) key.
+    function keyTypeOperationError() {
+      var err = new Error("error:03000096:digital envelope routines::operation not supported for this keytype");
+      err.library = "digital envelope routines";
+      err.reason = "operation not supported for this keytype";
+      err.code = "ERR_OSSL_EVP_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE";
+      return err;
     }
 
     // createPublicKey's PEM for a KeyObject (bare or as `key.key`): only a
@@ -21385,6 +21490,8 @@
           var yBytes = new Uint8Array(base64urlDecode(jwk.y));
           var dBytes = jwk.d ? new Uint8Array(base64urlDecode(jwk.d)) : undefined;
           pem = natives.cryptoEcJwkImport(crv, xBytes, yBytes, dBytes);
+        } else if (jwk.kty === "OKP") {
+          pem = okpJwkToPem(jwk, true);
         } else {
           throw new Error("createPrivateKey: unsupported JWK kty: " + jwk.kty);
         }
@@ -21421,7 +21528,8 @@
       var ko = new KeyObject("private", null);
       ko._pem = pem;
       ko._keyType = detectKeyType(pem);
-      ko.asymmetricKeyType = ko._keyType === "rsa" ? "rsa" : ko._keyType === "ec" ? "ec" : "ed25519";
+      if (ko._keyType === "x25519") checkX25519Pem(pem, true, false);
+      ko.asymmetricKeyType = asymmetricTypeOf(ko._keyType);
       ko.asymmetricKeySize = undefined;
       ko.export = function(options) {
         if (options && options.format === "jwk") {
@@ -21433,6 +21541,7 @@
             var rcomps = natives.cryptoRsaJwkComponents(pem, true);
             return { kty: "RSA", n: base64urlEncode(rcomps.n), e: base64urlEncode(rcomps.e), d: base64urlEncode(rcomps.d), p: base64urlEncode(rcomps.p), q: base64urlEncode(rcomps.q), dp: base64urlEncode(rcomps.dp), dq: base64urlEncode(rcomps.dq), qi: base64urlEncode(rcomps.qi) };
           }
+          if (ko._keyType === "ed25519" || ko._keyType === "x25519") return okpJwkExport(pem, true);
           throw new Error("JWK export not supported for key type: " + ko._keyType);
         }
         if (options && options.format === "der") return BufferCtor.from(pemToDer(pem));
@@ -21443,6 +21552,7 @@
 
     function createPublicKey(input) {
       var pem;
+      var pubFromDer = false;
       if (typeof input === "object" && input !== null && input.format === "jwk" && input.key) {
         var jwk = input.key;
         if (jwk.kty === "RSA") {
@@ -21452,6 +21562,8 @@
           var xBytes = new Uint8Array(base64urlDecode(jwk.x));
           var yBytes = new Uint8Array(base64urlDecode(jwk.y));
           pem = natives.cryptoEcJwkImport(crv, xBytes, yBytes);
+        } else if (jwk.kty === "OKP") {
+          pem = okpJwkToPem(jwk, false);
         } else {
           throw new Error("createPublicKey: unsupported JWK kty: " + jwk.kty);
         }
@@ -21470,6 +21582,7 @@
           if (input.format === "der") {
             var pubLabel = input.type === "pkcs1" ? "RSA PUBLIC KEY" : "PUBLIC KEY";
             pem = derToPem(pubBytes, pubLabel);
+            pubFromDer = true;
           } else {
             pem = publicPemFromPem(new TextDecoder().decode(pubBytes));
           }
@@ -21490,7 +21603,8 @@
       var ko = new KeyObject("public", null);
       ko._pem = pem;
       ko._keyType = detectKeyType(pem);
-      ko.asymmetricKeyType = ko._keyType === "rsa" ? "rsa" : ko._keyType === "ec" ? "ec" : "ed25519";
+      if (ko._keyType === "x25519") checkX25519Pem(pem, false, pubFromDer);
+      ko.asymmetricKeyType = asymmetricTypeOf(ko._keyType);
       ko.asymmetricKeySize = undefined;
       ko.export = function(options) {
         if (options && options.format === "jwk") {
@@ -21502,6 +21616,7 @@
             var rcomps = natives.cryptoRsaJwkComponents(pem, false);
             return { kty: "RSA", n: base64urlEncode(rcomps.n), e: base64urlEncode(rcomps.e) };
           }
+          if (ko._keyType === "ed25519" || ko._keyType === "x25519") return okpJwkExport(pem, false);
           throw new Error("JWK export not supported for key type: " + ko._keyType);
         }
         if (options && options.format === "der") return BufferCtor.from(pemToDer(pem));
@@ -21537,6 +21652,7 @@
         var merged = new Uint8Array(total);
         var off = 0;
         for (var i = 0; i < this._data.length; i++) { merged.set(this._data[i], off); off += this._data[i].length; }
+        if (keyType === "x25519") throw keyTypeOperationError();
         var padding = 1;
         // Node's sign default is RSA_PSS_SALTLEN_MAX_SIGN, not a fixed 32:
         // undefined reaches the op, which resolves it (and -1 / -2).
@@ -21588,6 +21704,15 @@
         var merged = new Uint8Array(total);
         var off = 0;
         for (var i = 0; i < this._data.length; i++) { merged.set(this._data[i], off); off += this._data[i].length; }
+        if (keyType === "x25519") throw keyTypeOperationError();
+        // Private Ed25519 / EC key material verifies with its public half, as
+        // in node (ssh2's ed25519 probe signs and verifies with one private
+        // PEM). RSA is left to the natives, which read a private key's public
+        // half themselves, including a key node reads but oam's public-key
+        // extraction refuses (a private exponent not below the modulus).
+        if ((keyType === "ed25519" || keyType === "ec") && pem.includes("PRIVATE KEY-----")) {
+          pem = publicPemFromPem(pem);
+        }
         var sigBuf = typeof signature === "string"
           // No encoding is node's Buffer.from default (utf8), not base64.
           ? BufferCtor.from(signature, signatureEncoding == null ? undefined : signatureEncoding)
@@ -22521,7 +22646,9 @@
         privOut = Buffer.from(lines.join(''), 'base64');
       }
       if (format === 'jwk') {
-        if (type === 'ec') {
+        if (type === 'ed25519' || type === 'x25519') {
+          pubOut = okpJwkExport(result.publicKey, false);
+        } else if (type === 'ec') {
           var pubEcComps = natives.cryptoEcJwkExport(result.publicKey, false);
           pubOut = { kty: 'EC', crv: pubEcComps.crv, x: base64urlEncode(pubEcComps.x), y: base64urlEncode(pubEcComps.y) };
         } else {
@@ -22530,7 +22657,9 @@
         }
       }
       if (privFormat === 'jwk') {
-        if (type === 'ec') {
+        if (type === 'ed25519' || type === 'x25519') {
+          privOut = okpJwkExport(result.privateKey, true);
+        } else if (type === 'ec') {
           var privEcComps = natives.cryptoEcJwkExport(result.privateKey, true);
           privOut = { kty: 'EC', crv: privEcComps.crv, x: base64urlEncode(privEcComps.x), y: base64urlEncode(privEcComps.y), d: base64urlEncode(privEcComps.d) };
         } else {
@@ -22557,6 +22686,44 @@
       if (!(options && options.privateKeyEncoding)) privOut = createPrivateKey(result.privateKey);
       return { publicKey: pubOut, privateKey: privOut };
     }
+    // crypto.diffieHellman({ privateKey, publicKey }) (node's
+    // lib/internal/crypto/diffiehellman.js): two KeyObjects of one type --
+    // 'ec' (P-256, P-384) or 'x25519' -- and the shared secret as a Buffer.
+    // A private KeyObject is accepted as the public key. The argument checks,
+    // their order and their errors are node's; a curve mismatch or a
+    // small-order X25519 peer is OpenSSL's error, raised by the native.
+    function diffieHellman(options) {
+      if (typeof options !== "object" || options === null || Array.isArray(options)) {
+        throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+      }
+      var privateKey = options.privateKey;
+      var publicKey = options.publicKey;
+      if (!(privateKey instanceof KeyObject)) {
+        throw codes.ERR_INVALID_ARG_VALUE("options.privateKey", privateKey);
+      }
+      if (!(publicKey instanceof KeyObject)) {
+        throw codes.ERR_INVALID_ARG_VALUE("options.publicKey", publicKey);
+      }
+      if (privateKey.type !== "private") {
+        throw codes.ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE(privateKey.type, "private");
+      }
+      if (publicKey.type !== "public" && publicKey.type !== "private") {
+        throw codes.ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE(publicKey.type, "private or public");
+      }
+      var privateType = privateKey.asymmetricKeyType;
+      var publicType = publicKey.asymmetricKeyType;
+      if (privateType !== publicType || (privateType !== "ec" && privateType !== "x25519")) {
+        throw codes.ERR_CRYPTO_INCOMPATIBLE_KEY(
+          "key types for Diffie-Hellman", privateType + " and " + publicType);
+      }
+      var publicPem = publicKey.type === "private" ? publicPemFromPem(publicKey._pem) : publicKey._pem;
+      try {
+        return BufferCtor.from(natives.cryptoDiffieHellman(privateKey._pem, publicPem));
+      } catch (e) {
+        throw rsaOpError(e);
+      }
+    }
+
     function generateKeyPair(type, options, callback) {
       if (typeof options === 'function') { callback = options; options = {}; }
       try {
@@ -23272,6 +23439,7 @@
       generateKeyPair,
       createECDH,
       ECDH,
+      diffieHellman,
       publicEncrypt,
       privateEncrypt,
       privateDecrypt,

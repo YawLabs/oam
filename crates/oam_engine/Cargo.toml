@@ -72,6 +72,8 @@ num-bigint-dig = { workspace = true }
 crypto-bigint = { workspace = true }
 # node:crypto wave 7: X.509 certificate inspection.
 x509-parser = { workspace = true }
+# node:crypto x25519 keys and crypto.diffieHellman (#489).
+curve25519-dalek = { workspace = true }
 # N-API addon loading (feature `napi` only).
 libloading = { workspace = true, optional = true }
 # os/process native values on macOS + other non-linux unix (mem/cpu/rss/ppid).

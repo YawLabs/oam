@@ -16,6 +16,29 @@ gap between headings below is expected rather than a missing entry. Not every ta
 is a published GitHub Release either — 0.9.2 through 0.10.1 were tagged without
 one, so `install.sh`, which resolves the latest Release, never handed them out.
 
+## [Unreleased]
+
+### Added
+
+- **`crypto.diffieHellman({ privateKey, publicKey })` and X25519 keys** (#489).
+  `diffieHellman` derives the shared secret of two `x25519` or two `ec` (P-256, P-384) key
+  objects, with node's argument errors and OpenSSL's for two curves or a small-order X25519
+  peer. `generateKeyPair('x25519')` / `generateKeyPairSync('x25519')` make X25519 pairs in
+  every encoding node offers (PEM, DER, JWK), and `createPrivateKey` / `createPublicKey` /
+  `KeyObject#export` read and write them, Ed25519 and X25519 JWKs included, with node's
+  per-field JWK errors and node's import errors for an X25519 key that does not parse. ssh2 now offers
+  `curve25519-sha256` key exchange on oam, as it does on node.
+
+### Fixed
+
+- **Signing with a SEC1 (`EC PRIVATE KEY`) private key works** (#489). `crypto.sign` and
+  `createSign` refused it (`SEC1 EC private key format not supported; use PKCS#8`), and SEC1
+  is the form ssh2 turns an ECDSA key file into, so ECDSA key-file auth failed. `createPublicKey` and JWK export of such a key work too.
+- **`crypto.verify` / `createVerify` take private key material, and `createPublicKey` derives
+  an Ed25519 key's public half** (#489), as node does. Both threw for Ed25519, which made
+  ssh2's load-time `eddsaSupported` probe fail on oam and switched off ed25519 key files and
+  ed25519 host keys.
+
 ## [0.20.2] - 2026-11-13
 
 ### Changed
