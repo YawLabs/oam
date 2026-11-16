@@ -28330,6 +28330,175 @@ gen-len 64 05 125
     assert_eq!(got.len(), want.len(), "line count.\nfull stdout: {stdout}");
 }
 
+// crypto.diffieHellman, X25519 keys, SEC1 signing and Ed25519 private keys
+// where a public key is expected (#489), against node v22.22.2: the expected
+// lines are node's output for this script. RFC 7748's X25519 vector, node's
+// argument errors in node's order, OpenSSL's errors for two curves and a
+// small-order peer, the #489 SEC1 key (and ssh2's leading-zero form of one),
+// and ssh2's own eddsaSupported probe key.
+#[test]
+fn crypto_diffie_hellman_x25519_sec1_ed25519_match_node() {
+    let file = write_temp(
+        "crypto_issue_489.mjs",
+        r##"import crypto from "node:crypto";
+const E = (e) => e.constructor.name + "|" + e.code + "|" + e.message;
+const T = (f) => { try { return f(); } catch (e) { return "THROW " + E(e); } };
+const out = (...a) => console.log(a.join(" "));
+const hex = (b) => Buffer.from(b).toString("hex");
+const der = (k, type) => hex(k.export({ type, format: "der" }));
+
+// RFC 7748 section 6.1 keys, as node imports them.
+const A = Buffer.from("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a", "hex");
+const BPUB = Buffer.from("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f", "hex");
+const aPriv = crypto.createPrivateKey({ key: Buffer.concat([Buffer.from("302e020100300506032b656e04220420", "hex"), A]), format: "der", type: "pkcs8" });
+const bPub = crypto.createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b656e032100", "hex"), BPUB]), format: "der", type: "spki" });
+out("exports", typeof crypto.diffieHellman, crypto.diffieHellman.length);
+out("x25519-types", aPriv.type, aPriv.asymmetricKeyType, bPub.type, bPub.asymmetricKeyType);
+out("rfc7748", hex(crypto.diffieHellman({ privateKey: aPriv, publicKey: bPub })));
+const aPub = crypto.createPublicKey(aPriv);
+out("derive", aPub.type, aPub.asymmetricKeyType, der(aPub, "spki"));
+out("pkcs8", der(aPriv, "pkcs8"));
+out("jwk-priv", JSON.stringify(aPriv.export({ format: "jwk" })));
+out("jwk-pub", JSON.stringify(aPub.export({ format: "jwk" })));
+out("jwk-import", der(crypto.createPrivateKey({ key: aPriv.export({ format: "jwk" }), format: "jwk" }), "pkcs8"),
+  der(crypto.createPublicKey({ key: aPub.export({ format: "jwk" }), format: "jwk" }), "spki"));
+out("jwk-bad", T(() => crypto.createPublicKey({ key: { kty: "OKP", crv: "X25519", x: "AAAA" }, format: "jwk" })));
+out("priv-as-pub", hex(crypto.diffieHellman({ privateKey: aPriv, publicKey: aPriv })));
+
+// Generated pairs and the encodings node offers.
+const g1 = crypto.generateKeyPairSync("x25519"), g2 = crypto.generateKeyPairSync("x25519");
+const s12 = crypto.diffieHellman({ privateKey: g1.privateKey, publicKey: g2.publicKey });
+const s21 = crypto.diffieHellman({ privateKey: g2.privateKey, publicKey: g1.publicKey });
+out("gen", g1.publicKey.asymmetricKeyType, g1.privateKey.asymmetricKeyType, s12.length, s12.equals(s21),
+  g1.publicKey.export({ type: "spki", format: "der" }).length, g1.privateKey.export({ type: "pkcs8", format: "der" }).length);
+const enc = crypto.generateKeyPairSync("x25519", { publicKeyEncoding: { type: "spki", format: "pem" }, privateKeyEncoding: { type: "pkcs8", format: "pem" } });
+out("gen-pem", enc.publicKey.split("\n")[0], enc.privateKey.split("\n")[0], crypto.createPrivateKey(enc.privateKey).asymmetricKeyType);
+const encDer = crypto.generateKeyPairSync("x25519", { publicKeyEncoding: { type: "spki", format: "der" }, privateKeyEncoding: { type: "pkcs8", format: "der" } });
+out("gen-der", encDer.publicKey.length, encDer.privateKey.length, hex(encDer.publicKey.subarray(0, 12)), hex(encDer.privateKey.subarray(0, 16)));
+const encJwk = crypto.generateKeyPairSync("x25519", { publicKeyEncoding: { format: "jwk" }, privateKeyEncoding: { format: "jwk" } });
+out("gen-jwk", Object.keys(encJwk.publicKey).join(","), Object.keys(encJwk.privateKey).join(","), encJwk.privateKey.crv);
+const edJwk = crypto.generateKeyPairSync("ed25519", { publicKeyEncoding: { format: "jwk" }, privateKeyEncoding: { format: "jwk" } });
+out("gen-ed-jwk", Object.keys(edJwk.publicKey).join(","), Object.keys(edJwk.privateKey).join(","), edJwk.privateKey.crv);
+crypto.generateKeyPair("x25519", (err, pub, priv) => out("gen-cb", err, pub.asymmetricKeyType, priv.asymmetricKeyType));
+
+// node's argument checks, in node's order.
+const ec1 = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
+const ec2 = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
+const ec3 = crypto.generateKeyPairSync("ec", { namedCurve: "P-384" });
+const ed = crypto.generateKeyPairSync("ed25519");
+out("err-none", T(() => crypto.diffieHellman()));
+out("err-null", T(() => crypto.diffieHellman(null)));
+out("err-pub", T(() => crypto.diffieHellman({ privateKey: aPriv, publicKey: "x" })));
+out("err-type", T(() => crypto.diffieHellman({ privateKey: bPub, publicKey: bPub })));
+out("err-secret", T(() => crypto.diffieHellman({ privateKey: aPriv, publicKey: crypto.createSecretKey(Buffer.alloc(8)) })));
+out("err-mixed", T(() => crypto.diffieHellman({ privateKey: aPriv, publicKey: ec1.publicKey })));
+out("err-ed", T(() => crypto.diffieHellman({ privateKey: ed.privateKey, publicKey: ed.publicKey })));
+const curves = T(() => crypto.diffieHellman({ privateKey: ec1.privateKey, publicKey: ec3.publicKey }));
+out("err-curves", curves);
+try { crypto.diffieHellman({ privateKey: ec1.privateKey, publicKey: ec3.publicKey }); } catch (e) { out("err-curves-fields", e.library, e.reason); }
+const zero = crypto.createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b656e032100", "hex"), Buffer.alloc(32)]), format: "der", type: "spki" });
+out("err-small-order", T(() => crypto.diffieHellman({ privateKey: aPriv, publicKey: zero })));
+out("err-x25519-sign", T(() => crypto.sign(null, Buffer.from("a"), aPriv)));
+const e12 = crypto.diffieHellman({ privateKey: ec1.privateKey, publicKey: ec2.publicKey });
+out("ec", e12.length, e12.equals(crypto.diffieHellman({ privateKey: ec2.privateKey, publicKey: ec1.publicKey })),
+  e12.equals(crypto.diffieHellman({ privateKey: ec1.privateKey, publicKey: ec2.privateKey })));
+const e33 = crypto.generateKeyPairSync("ec", { namedCurve: "P-384" });
+out("ec384", crypto.diffieHellman({ privateKey: ec3.privateKey, publicKey: e33.publicKey }).length);
+
+// SEC1 ("EC PRIVATE KEY") keys: the #489 key, and ssh2's shape of one (a
+// leading zero on the scalar).
+const sec1 = `-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEILb6uVaI+/+Gmw4HrguzY9uYnowLyNAo4on5rzMT4hdLoAoGCCqGSM49
+AwEHoUQDQgAEfu3U8rG7HqTa6On7lSmP6VGi26vT4hYluLXLFEcQ98J+lEpRIMoY
+xVKuDE/XcYZBFaXG3LG2KYmGY36KMkHnxg==
+-----END EC PRIVATE KEY-----
+`;
+const peer = crypto.createPrivateKey({ key: Buffer.from("303102010104201111111111111111111111111111111111111111111111111111111111111111a00a06082a8648ce3d030107", "hex"), format: "der", type: "sec1" });
+const sec1Pub = crypto.createPublicKey(sec1);
+out("sec1-pub", sec1Pub.asymmetricKeyType, der(sec1Pub, "spki"));
+const sj = crypto.createPrivateKey(sec1).export({ format: "jwk" });
+out("sec1-jwk", JSON.stringify(sj, Object.keys(sj).sort()));
+const sig = crypto.createSign("SHA256").update("hello").sign(sec1);
+out("sec1-sign", sig[0], crypto.createVerify("SHA256").update("hello").verify(sec1Pub, sig), crypto.verify("sha256", Buffer.from("hello"), sec1, sig));
+const p1363 = crypto.sign("sha256", Buffer.from("hello"), { key: sec1, dsaEncoding: "ieee-p1363" });
+out("sec1-p1363", p1363.length, crypto.verify("sha256", Buffer.from("hello"), { key: sec1Pub, dsaEncoding: "ieee-p1363" }, p1363));
+out("sec1-dh", hex(crypto.diffieHellman({ privateKey: crypto.createPrivateKey(sec1), publicKey: crypto.createPublicKey(peer) })));
+const lz = crypto.createPrivateKey({ key: Buffer.from("3032020101042100b6fab95688fbff869b0e07ae0bb363db989e8c0bc8d028e289f9af3313e2174ba00a06082a8648ce3d030107", "hex"), format: "der", type: "sec1" });
+out("sec1-lz", crypto.verify("sha256", Buffer.from("x"), sec1Pub, crypto.sign("sha256", Buffer.from("x"), lz)));
+
+// Ed25519 private key material where a public key is expected (ssh2's
+// eddsaSupported probe, with its own key).
+const edKey = "-----BEGIN PRIVATE KEY-----\r\nMC4CAQAwBQYDK2VwBCIEIHKj+sVa9WcD/q2DJUJaf43Kptc8xYuUQA4bOFj9vC8T\r\n-----END PRIVATE KEY-----";
+const edSig = crypto.sign(null, Buffer.from("a"), edKey);
+out("ed-probe", edSig.length, crypto.verify(null, Buffer.from("a"), edKey, edSig), crypto.verify(null, Buffer.from("b"), edKey, edSig));
+const edPriv = crypto.createPrivateKey(edKey);
+out("ed-ko", crypto.verify(null, Buffer.from("a"), edPriv, edSig), crypto.verify(null, Buffer.from("a"), { key: edKey }, edSig));
+const edPub = crypto.createPublicKey(edKey);
+out("ed-derive", edPub.type, edPub.asymmetricKeyType, der(edPub, "spki"), der(crypto.createPublicKey(edPriv), "spki"));
+out("ed-jwk", JSON.stringify(edPriv.export({ format: "jwk" })), JSON.stringify(edPub.export({ format: "jwk" })));
+out("ed-jwk-import", der(crypto.createPrivateKey({ key: edPriv.export({ format: "jwk" }), format: "jwk" }), "pkcs8"));
+"##,
+    );
+    let expected = r##"exports function 1
+x25519-types private x25519 public x25519
+rfc7748 4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742
+derive public x25519 302a300506032b656e0321008520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a
+pkcs8 302e020100300506032b656e0422042077076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a
+jwk-priv {"crv":"X25519","d":"dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo","x":"hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo","kty":"OKP"}
+jwk-pub {"crv":"X25519","x":"hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo","kty":"OKP"}
+jwk-import 302e020100300506032b656e0422042077076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a 302a300506032b656e0321008520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a
+jwk-bad THROW TypeError|ERR_CRYPTO_INVALID_JWK|Invalid JWK data
+priv-as-pub 6381401e6cdb0d7f21b69a3ca4659c06334519717557654b7b9f42a38e27d124
+gen x25519 x25519 32 true 44 48
+gen-pem -----BEGIN PUBLIC KEY----- -----BEGIN PRIVATE KEY----- x25519
+gen-der 44 48 302a300506032b656e032100 302e020100300506032b656e04220420
+gen-jwk crv,x,kty crv,d,x,kty X25519
+gen-ed-jwk crv,x,kty crv,d,x,kty Ed25519
+err-none THROW TypeError|ERR_INVALID_ARG_TYPE|The "options" argument must be of type object. Received undefined
+err-null THROW TypeError|ERR_INVALID_ARG_TYPE|The "options" argument must be of type object. Received null
+err-pub THROW TypeError|ERR_INVALID_ARG_VALUE|The property 'options.publicKey' is invalid. Received 'x'
+err-type THROW TypeError|ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE|Invalid key object type public, expected private.
+err-secret THROW TypeError|ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE|Invalid key object type secret, expected private or public.
+err-mixed THROW Error|ERR_CRYPTO_INCOMPATIBLE_KEY|Incompatible key types for Diffie-Hellman: x25519 and ec
+err-ed THROW Error|ERR_CRYPTO_INCOMPATIBLE_KEY|Incompatible key types for Diffie-Hellman: ed25519 and ed25519
+err-curves THROW Error|ERR_OSSL_MISMATCHING_DOMAIN_PARAMETERS|error:1C8000CB:Provider routines::mismatching domain parameters
+err-curves-fields Provider routines mismatching domain parameters
+err-small-order THROW Error|ERR_OSSL_FAILED_DURING_DERIVATION|error:1C8000A4:Provider routines::failed during derivation
+err-x25519-sign THROW Error|ERR_OSSL_EVP_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE|error:03000096:digital envelope routines::operation not supported for this keytype
+ec 32 true true
+ec384 48
+sec1-pub ec 3059301306072a8648ce3d020106082a8648ce3d030107034200047eedd4f2b1bb1ea4dae8e9fb95298fe951a2dbabd3e21625b8b5cb144710f7c27e944a5120ca18c552ae0c4fd771864115a5c6dcb1b6298986637e8a3241e7c6
+sec1-jwk {"crv":"P-256","d":"tvq5Voj7_4abDgeuC7Nj25iejAvI0CjiifmvMxPiF0s","kty":"EC","x":"fu3U8rG7HqTa6On7lSmP6VGi26vT4hYluLXLFEcQ98I","y":"fpRKUSDKGMVSrgxP13GGQRWlxtyxtimJhmN-ijJB58Y"}
+sec1-sign 48 true true
+sec1-p1363 64 true
+sec1-dh f5c06ab82aabc19778ffcf87286d93f0ebbf88c19a75fb90fd43781836b3c754
+sec1-lz true
+ed-probe 64 true false
+ed-ko true true
+ed-derive public ed25519 302a300506032b65700321004aaba0778a81d992ba8347a2841c9daddd1bab51533410258cea5c9909e5ac29 302a300506032b65700321004aaba0778a81d992ba8347a2841c9daddd1bab51533410258cea5c9909e5ac29
+ed-jwk {"crv":"Ed25519","d":"cqP6xVr1ZwP-rYMlQlp_jcqm1zzFi5RADhs4WP28LxM","x":"Squgd4qB2ZK6g0eihBydrd0bq1FTNBAljOpcmQnlrCk","kty":"OKP"} {"crv":"Ed25519","x":"Squgd4qB2ZK6g0eihBydrd0bq1FTNBAljOpcmQnlrCk","kty":"OKP"}
+ed-jwk-import 302e020100300506032b65700422042072a3fac55af56703fead8325425a7f8dcaa6d73cc58b94400e1b3858fdbc2f13
+gen-cb  x25519 x25519
+"##;
+    let out = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "#489 script failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let got: Vec<&str> = stdout.lines().collect();
+    let want: Vec<&str> = expected.lines().collect();
+    for (i, exp) in want.iter().enumerate() {
+        assert_eq!(
+            got.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} differs from node.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+    assert_eq!(got.len(), want.len(), "line count.\nfull stdout: {stdout}");
+}
+
 // ─── X.509 Certificate ──────────────────────────────────────────────
 
 #[test]
