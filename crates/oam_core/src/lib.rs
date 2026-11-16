@@ -2038,11 +2038,17 @@ pub fn register_exit_cleanup(path: std::path::PathBuf) {
 static EXIT_HOOKS: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Callbacks that put PROCESS state back -- the terminal's cooked mode -- on
-/// every way out, a signal death included. Kept apart from `EXIT_HOOKS`: a
-/// death by signal restores the terminal and nothing else, as node's
-/// `SignalExit` does, where the report-shaped hooks (a diagnostics drain to
-/// stderr) belong to the exits that print anyway.
+/// Callbacks that settle what the process leaves behind OUTSIDE itself, on
+/// every way out, a signal death included: the terminal goes back to cooked
+/// mode, and a cluster primary's workers are ended (`cluster::reap_on_exit`).
+/// Neither prints. Kept apart from `EXIT_HOOKS`: a death by signal does
+/// these and nothing else, as node's `SignalExit` restores the terminal and
+/// its workers go with their primary, where the report-shaped hooks (a
+/// diagnostics drain to stderr) belong to the exits that print anyway.
+///
+/// A hook here runs on an ordinary thread, never in a signal handler
+/// (`signal::die_by`), so it may lock and allocate. It must not print, and
+/// it must not wait on anything a dying process cannot count on.
 static PROCESS_STATE_HOOKS: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>> =
     std::sync::Mutex::new(Vec::new());
 
@@ -2052,8 +2058,11 @@ pub fn register_exit_hook(hook: impl FnOnce() + Send + 'static) {
     guard.push(Box::new(hook));
 }
 
-/// Register a callback that restores process state; it runs first on every
-/// hard exit and alone on a signal death (`run_process_state_hooks`).
+/// Register a callback for `PROCESS_STATE_HOOKS`; it runs first on every
+/// hard exit, and alone on a signal death that goes through
+/// `signal::die_by` (`run_process_state_hooks`) -- one for a signal oam has
+/// armed. A signal left at the kernel's default ends the process with no
+/// hook run at all.
 pub fn register_process_state_hook(hook: impl FnOnce() + Send + 'static) {
     let mut guard = PROCESS_STATE_HOOKS
         .lock()
@@ -2074,7 +2083,8 @@ fn drain(list: &std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>>) {
 }
 
 /// Run the process-state hooks only: what a death by signal owes the
-/// terminal, and nothing that prints. Idempotent -- the list is taken.
+/// terminal and a cluster primary's workers, and nothing that prints.
+/// Idempotent -- the list is taken.
 pub fn run_process_state_hooks() {
     drain(&PROCESS_STATE_HOOKS);
 }

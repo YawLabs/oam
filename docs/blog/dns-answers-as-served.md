@@ -7,7 +7,7 @@ directly, over UDP, and report what came back. Node runs the second half
 through c-ares, a DNS client library compiled into `node.exe`.
 
 oam, a JavaScript and TypeScript runtime built on Rust and V8, has no libuv
-and no c-ares. Its resolver is `hickory-client`. The work of making
+and no c-ares. Its resolver is `hickory-resolver`. The work of making
 `node:dns` answer like Node's landed across v0.19.2 and v0.19.3 (2026-11-03),
 and almost none of it was about parsing DNS. It was about the difference
 between a resolver that *knows* the answer and a resolver that *reports*
@@ -28,8 +28,8 @@ helpful:
   with no such name is `ENOTFOUND`.
 - **An answer holding only other record types is not a failure.** oam
   reported `ENODATA`. Node reports `[]` for TLSA, MX, TXT, SRV, CAA and
-  NAPTR; `ENODATA` for NS and PTR; `[]` or `ENODATA` for A / AAAA beside a
-  CNAME; and for a CNAME, the name asked.
+  NAPTR; `ENODATA` for NS and PTR; for A / AAAA, `[]` when a CNAME is among
+  the records and `ENODATA` when none is; and for a CNAME, the name asked.
 - **Nothing is cached.** oam kept an answer cache, so a repeated query --
   including an NXDOMAIN or a NODATA answer -- was served without asking the
   server again. Every query now goes out, as c-ares sends every query.
@@ -60,15 +60,15 @@ behaviour, the second one is the requirement.
 The same shape recurs across `node:dns`, and two entries in it are worth
 reading slowly because they look like regressions to file:
 
-**`reverse()` always reports `ENOTFOUND`.** Node's reverse goes through
+**A failed `reverse()` always reports `ENOTFOUND`.** Node's reverse goes through
 c-ares' `ares_gethostbyaddr`, which reports *every* failed reverse lookup
 that way. oam distinguished `ENODATA` (the name exists, has no PTR) from
 `ENOTFOUND`, which is the better error -- and `dns.resolvePtr()` still does,
 deliberately. The `reverse()` path reports what Node reports because that is
 what a caller branching on `err.code === 'ENOTFOUND'` was written against.
 
-**Two servers asked in parallel is the one where Node's behaviour is plainly
-worse.** oam took whichever answer arrived first, so an empty answer from a
+**Asking two servers in parallel is the one where oam's old behaviour was
+plainly worse.** oam took whichever answer arrived first, so an empty answer from a
 broken second server could beat the real answer from the first. c-ares walks
 the list, one server at a time, and moves on only when a server does not
 answer in time or sends something unparseable. oam now does the same: 2 s
@@ -139,8 +139,8 @@ All of it is written down in divergence 30 of
 <a href="https://github.com/YawLabs/oam/blob/main/docs/node-divergences.md"><code>docs/node-divergences.md</code></a>,
 which is the honest place for it. A runtime that claims Node's DNS while
 running a different client library will differ in the timing layer
-regardless; the question is whether the differences change an answer, and
-these do not.
+regardless; the question is whether the differences change an answer. The
+timing ones do not, and the SOA case is the one that does.
 
 The larger point is the one that runs through oam's conformance work
 generally: the reference is not the DNS specification, it is c-ares at the

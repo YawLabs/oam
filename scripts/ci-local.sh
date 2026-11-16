@@ -468,7 +468,8 @@ say "1/14 Control bytes (raw C0 in tracked text)"
 # NULs reached main in a sibling repo (YawLabs/mcp, b365955) exactly that way.
 # Relative, because the cd near the top already moved to the repo root. A "$REPO_ROOT/..."
 # spelling would expand to "/scripts/..." here -- this script defines no such
-# variable, and `set -u` does not catch it inside a quoted expansion.
+# variable and does not run under `set -u` (only -e and pipefail, above), so
+# the undefined name expands to empty without a word.
 # Exit code 2 is "the gate could not RUN" (no node on PATH), which is a
 # different fact from "the gate found something" and must not be reported as
 # the latter -- a scanner that cannot run is the false-clean shape this whole

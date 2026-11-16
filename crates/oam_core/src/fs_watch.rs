@@ -329,7 +329,14 @@ mod tests {
         // macOS FSEvents reports the watched directory's OWN creation (made
         // just above) to its watcher, as `rename` + the directory's name --
         // node delivers it too (conformance case 421, measured 2026-10-21).
-        // Skip exactly that event; anything else must name the file.
+        // Skip exactly that event, and there only; anything else must name
+        // the file. On inotify or ReadDirectoryChangesW an event naming the
+        // watched directory itself would be a backend defect, and fails the
+        // assertion below. How MANY such events FSEvents delivers before the
+        // file's has not been measured on macOS (this was written on a box
+        // without one), so every one of them is skipped rather than the
+        // first alone: holding it to one would be asserting a count nobody
+        // took. The deadline still bounds the loop.
         let mut own_creation = vec![0u8];
         own_creation.extend_from_slice(dir.file_name().unwrap().as_encoded_bytes());
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -337,7 +344,8 @@ mod tests {
             let outcome =
                 rt.block_on(async { tokio::time::timeout_at(deadline, next(&registry, id)).await });
             match outcome {
-                Ok(OpOutcome::Bytes(bytes)) if bytes == own_creation => continue,
+                Ok(OpOutcome::Bytes(bytes))
+                    if cfg!(target_os = "macos") && bytes == own_creation => {}
                 Ok(OpOutcome::Bytes(bytes)) => {
                     let needle = b"new.txt";
                     assert!(

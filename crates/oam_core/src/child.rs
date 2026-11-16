@@ -724,6 +724,11 @@ fn spawn_sync_failure(e: &std::io::Error, message: String) -> SpawnSyncResult {
     }
 }
 
+/// node's `spawnSync`: run `command` to its exit, with its piped output.
+///
+/// `kill_signal` is node's `killSignal`, by name: what ends a child that
+/// outlives `timeout_ms` or writes past `max_buffer` (`None` is SIGTERM, the
+/// default). See `end_sync_child` for what each platform does with it.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_sync(
     command: &str,
@@ -734,6 +739,7 @@ pub fn spawn_sync(
     shell: bool,
     timeout_ms: u64,
     max_buffer: usize,
+    kill_signal: Option<&str>,
     stdio: StdioSpec,
     detached: bool,
     windows_hide: bool,
@@ -882,14 +888,43 @@ pub fn spawn_sync(
     // child fills its stdout pipe, stops reading stdin, and both sides block
     // once the input outgrows the pipe buffers -- before the timeout was even
     // armed. The thread is not joined: it ends when the write completes or
-    // the read end goes away with the child.
+    // the read end goes away with the child -- and on unix also when the
+    // child is ended (`SyncDrainCancel`), as node's `Kill` closes stdin with
+    // the other two pipes.
+    //
+    // Unix: the cancel that lets this thread take the read ends back from the
+    // drains when it ends the child, and stops the stdin writer. Made before
+    // the writer starts, so the writer can watch it.
+    #[cfg(unix)]
+    let cancel = SyncDrainCancel::new();
     match (input, child.stdin.take()) {
-        (Some(data), Some(mut stdin)) if !data.is_empty() => {
+        (Some(data), Some(stdin)) if !data.is_empty() => {
             let data = data.to_vec();
+            #[cfg(unix)]
+            let watch = cancel.as_ref().map(SyncDrainCancel::watch);
             std::thread::spawn(move || {
-                use std::io::Write;
-                let _ = stdin.write_all(&data);
-                // `stdin` drops here: the child reads EOF after the input.
+                #[cfg(unix)]
+                feed_sync_stdin(stdin, &data, watch);
+                // Windows: nothing cancels this writer when the child is
+                // ended, unlike unix (`feed_sync_stdin`). Terminating the
+                // child closes its copy of the read end, so a writer blocked
+                // on it fails and stops -- but a grandchild that inherited
+                // stdin (`cmd /c`, a shell) keeps the read end open, keeps
+                // receiving the queued input after `spawnSync` returned, and
+                // this thread lives on until the input is all written or the
+                // grandchild exits (blocked for good on one that stops
+                // reading without exiting). Node's `Kill` closes stdin with
+                // the other two pipes. Recorded in docs/node-divergences.md,
+                // entry 65 ("`spawnSync` after `killSignal`"), its Windows
+                // paragraph.
+                #[cfg(not(unix))]
+                {
+                    use std::io::Write;
+                    let mut stdin = stdin;
+                    let _ = stdin.write_all(&data);
+                }
+                // `stdin` is dropped by now: the child reads EOF after the
+                // input.
             });
         }
         // No input, or an empty one: the write end closes now, so the child
@@ -903,8 +938,21 @@ pub fn spawn_sync(
     // without bound. The child stays REACHABLE here -- never moved into a
     // worker -- so a deadline or an overflow can still end it.
     let (events, pipe_events) = std::sync::mpsc::channel();
-    let stdout_sink = drain_capped(pipe_chunks(child.stdout.take()), max_buffer, events.clone());
-    let stderr_sink = drain_capped(pipe_chunks(child.stderr.take()), max_buffer, events);
+    // Unix: each drain watches the cancel made above (`SyncDrainCancel`).
+    #[cfg(unix)]
+    let (stdout_chunks, stderr_chunks) = {
+        let watch = |c: &Option<SyncDrainCancel>| c.as_ref().map(SyncDrainCancel::watch);
+        let stdout_chunks = pipe_chunks(child.stdout.take(), watch(&cancel));
+        let stderr_chunks = pipe_chunks(child.stderr.take(), watch(&cancel));
+        (stdout_chunks, stderr_chunks)
+    };
+    #[cfg(not(unix))]
+    let (stdout_chunks, stderr_chunks) = (
+        pipe_chunks(child.stdout.take()),
+        pipe_chunks(child.stderr.take()),
+    );
+    let stdout_sink = drain_capped(stdout_chunks, max_buffer, events.clone());
+    let stderr_sink = drain_capped(stderr_chunks, max_buffer, events);
     let deadline = (timeout_ms > 0)
         .then(|| std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
     let mut open_pipes = 2usize;
@@ -955,17 +1003,65 @@ pub fn spawn_sync(
         // result is its error plus whatever was read so far. A child that had
         // already exited by itself (a grandchild kept the pipes open, or it
         // finished just as the limit was crossed) reports its own exit: it was
-        // never signalled.
-        let own_exit = match child.try_wait() {
-            Ok(Some(status)) => Some(status),
-            _ => {
-                let _ = child.kill();
-                // Reap it, so this path leaves no zombie.
-                let _ = child.wait();
-                None
-            }
+        // never signalled. Any other is sent `kill_signal` and reaped, so this
+        // path leaves no zombie (`end_sync_child`).
+        //
+        // Between the signal and the reap every read end is let go of, as
+        // node's `SyncProcessRunner::Kill` closes its pipes when it kills. The
+        // wait is for as long as the child takes, and a child that survives
+        // the signal and keeps writing (it ignores SIGTERM, or its handler
+        // prints) would otherwise fill a pipe nobody reads and block in
+        // write(2) for good, with `spawnSync` blocked on it. With the read
+        // ends gone its next write fails (SIGPIPE/EPIPE) and it ends. Signal
+        // first, then close: the other order is the one `SyncPipeHold` exists
+        // to prevent.
+        let (status, signal) = match child.try_wait() {
+            Ok(Some(status)) => exit_report(&status, false, None),
+            _ => end_sync_child(
+                &mut child,
+                kill_signal,
+                &pipe_events,
+                &mut open_pipes,
+                |pipe_events, open_pipes| {
+                    // An overflowed stream's read end closes only now.
+                    drop(overflowed_pipe.take());
+                    // Known residual, macOS (and any unix without `pipe2`): std
+                    // opens the child's stdio pipes with pipe() and sets
+                    // close-on-exec in a second call. A child that ANOTHER thread
+                    // of this process forks between those two calls inherits our
+                    // read end of the child's stdout or stderr, and keeps it
+                    // until it execs or exits -- for good if it never execs. Our
+                    // close below is then not the last, the child gets no
+                    // EPIPE/SIGPIPE, and a child that ignores the kill signal and
+                    // keeps writing can still fill the pipe and block in
+                    // write(2), with the wait in `end_sync_child` blocked on it.
+                    // Linux opens the pipes with pipe2(O_CLOEXEC) and has no such
+                    // window. The cancel pipe itself has the same window for its
+                    // write end, which is why `fire` writes a byte as well as
+                    // closing it.
+                    //
+                    // Bounded by `SYNC_CANCEL_SETTLE`, as the stop below is: a
+                    // drain whose poll failed sits in a plain blocking read that
+                    // the cancel cannot reach, and on a stream a grandchild holds
+                    // open without writing an unbounded wait here held
+                    // `spawnSync` for as long as the grandchild lived. Such a
+                    // drain keeps its read end past the settle and goes on
+                    // reading. Once what it read crosses `max_buffer` it stops
+                    // reading and hands its read end over as a `SyncPipeHold`;
+                    // `end_sync_child` receives and drops every such hold while
+                    // it waits for the child (`wait_releasing_holds`), so the
+                    // read end closes and a survivor's next write fails rather
+                    // than blocking. (The forked-copy residual above is the
+                    // one way a survivor can still block.)
+                    #[cfg(unix)]
+                    if let Some(cancel) = &cancel {
+                        stop_sync_drains(cancel, pipe_events, open_pipes, SYNC_CANCEL_SETTLE);
+                    }
+                    #[cfg(not(unix))]
+                    let _ = (pipe_events, open_pipes);
+                },
+            ),
         };
-        // Only now does an overflowed stream's read end close.
         drop(overflowed_pipe);
         // The pipes close with the child unless something else holds a write
         // end. That is not waited for past a short grace: node closes its own
@@ -976,10 +1072,24 @@ pub fn spawn_sync(
             &mut open_pipes,
             Some(std::time::Instant::now() + SYNC_KILL_PIPE_GRACE),
         );
-        let (status, signal) = match own_exit {
-            Some(status) => exit_report(&status, false, None),
-            None => (None, Some("SIGTERM".to_string())),
-        };
+        // Past the grace the drains are told to stop, so a stream a
+        // grandchild still holds open does not keep a thread and a read end
+        // for as long as it lives. Their final passes are waited for, up to
+        // `SYNC_CANCEL_SETTLE`, before the sinks are taken: a child that
+        // exited by itself (the `try_wait` branch above, typically with a
+        // grandchild holding a pipe) was never cancelled until here, and what
+        // a final pass read after the take was lost. On the kill path the
+        // stop in `end_sync_child`'s release already fired the cancel, and
+        // with every drain gone by now this changes nothing. A drain still
+        // open is either merely late -- its final pass not done within that
+        // settle and the grace on a loaded box -- or stuck in the
+        // poll-failure fallback; one more bounded wait lets a late pass land
+        // in its sink before the take rather than after it, at the cost of
+        // one more settle for a stuck one.
+        #[cfg(unix)]
+        if let Some(cancel) = &cancel {
+            stop_sync_drains(cancel, &pipe_events, &mut open_pipes, SYNC_CANCEL_SETTLE);
+        }
         let mut stdout = take_sink(&stdout_sink);
         let mut stderr = take_sink(&stderr_sink);
         // The retained length is read-granularity dependent under node too,
@@ -1149,13 +1259,318 @@ where
                 return;
             }
         }
+        // The reader goes before the report: whoever hears `Eof` may count on
+        // the read end being closed already (`stop_sync_drains`).
+        drop(next);
         let _ = events.send(SyncPipeEvent::Eof);
     });
     sink
 }
 
+/// Unix: how `spawn_sync` takes its read ends back from the drain threads.
+///
+/// A drain owns its pipe and sits in a blocking wait on it, so the thread
+/// that ends the child cannot simply close the descriptor. Each drain instead
+/// polls its pipe together with the read end of this self-pipe; `fire` makes
+/// that readable, and every drain then reads what the pipe already holds --
+/// once, without blocking, and no more than it held when the cancel was seen
+/// -- and stops and drops its pipe. Node reads as the bytes arrive, so what
+/// a child wrote before it was ended is in node's result; a drain that saw
+/// the cancel and its data in the same wake-up used to drop that data.
+/// The stdin writer of a sync spawn watches the same end and stops writing
+/// (`feed_sync_stdin`), so all three pipes close with the kill, as node's do.
+///
+/// The close happens on the drain's thread, so it trails the signal by a
+/// thread wake-up where node, which reads on the thread that kills, closes
+/// in the very next call. A child that answers the signal by writing at once
+/// can therefore still land that write in the pipe here (and it may be read
+/// by the final pass) where under node it would already find the pipe
+/// closed.
+///
+/// `fire` does two things, each enough alone: it writes a byte, which is
+/// never consumed, so it reaches every watcher and stays in force; and it
+/// closes the write end, so every watcher's poll reports POLLHUP (which a
+/// watcher treats as the cancel too). The byte covers a close that is not
+/// seen: a close shows only once EVERY copy of the write end is gone, and a
+/// child forked by another thread in the window before close-on-exec is set
+/// (the platforms without `pipe2`) holds one. The close covers a byte write
+/// that failed. Only both failing at once -- a failed write AND an inherited
+/// copy of the write end -- leaves a watcher waiting. Dropping the cancel
+/// closes the write end too, so watchers left running when `spawn_sync`
+/// returns (a stdin writer feeding a grandchild) stop then.
+#[cfg(unix)]
+pub(crate) struct SyncDrainCancel {
+    seen: Arc<std::io::PipeReader>,
+    /// `None` once fired: the write end is closed.
+    fired: Mutex<Option<std::io::PipeWriter>>,
+}
+
+#[cfg(unix)]
+impl SyncDrainCancel {
+    /// `None` when the process cannot open another pipe: the drains then run
+    /// uncancellable, as they did before this existed.
+    pub(crate) fn new() -> Option<Self> {
+        let (seen, fired) = std::io::pipe().ok()?;
+        Some(Self {
+            seen: Arc::new(seen),
+            fired: Mutex::new(Some(fired)),
+        })
+    }
+
+    /// The end a drain polls next to its pipe.
+    pub(crate) fn watch(&self) -> Arc<std::io::PipeReader> {
+        Arc::clone(&self.seen)
+    }
+
+    /// Stop every drain watching: write the byte, then close the write end.
+    /// A second call changes nothing a watcher can see.
+    pub(crate) fn fire(&self) {
+        use std::io::Write;
+        let fired = self.fired.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(mut fired) = fired {
+            let _ = fired.write(&[1]);
+            // `fired` drops here: the write end closes.
+        }
+    }
+
+    /// Whether `fire` has run (the write end is closed). Only the tests ask:
+    /// `spawn_sync` stops the drains again whether or not it has.
+    #[cfg(test)]
+    pub(crate) fn has_fired(&self) -> bool {
+        self.fired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+    }
+}
+
+/// Unix: how long `stop_sync_drains` waits, at most, for the drains to finish
+/// their final passes. A drain that has seen the cancel never blocks, so this
+/// is normally microseconds; the bound only covers a drain that fell back to
+/// a plain blocking read after its poll failed (`pipe_chunks`) -- the cancel
+/// cannot reach a thread parked in read(2) -- on a stream a grandchild still
+/// holds open, which would otherwise hold `spawnSync` for as long as the
+/// grandchild lives.
+#[cfg(unix)]
+pub(crate) const SYNC_CANCEL_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Unix: fire `cancel` and wait, up to `settle`, for every drain still open
+/// to let go of its read end -- by dropping its reader (the drop comes before
+/// the `Eof` report) or by handing it over as a `SyncPipeHold` when its final
+/// pass crossed `max_buffer`, dropped here. When every drain reports within
+/// `settle`, what those passes read is in the sinks when this returns, so a
+/// `take_sink` after it keeps output the child wrote before it was ended. A
+/// pass still running at the deadline (a loaded box) lands in its sink
+/// whenever it finishes, after the return; `spawn_sync` awaits once more
+/// before it takes the sinks for that reason.
+///
+/// A drain that has seen the cancel is at most a bounded final pass of
+/// non-blocking reads from done, and the cancel reaches it by two separate
+/// means (`SyncDrainCancel`). The exception is a drain whose poll failed: it
+/// fell back to a plain blocking read (`pipe_chunks`) that nothing here can
+/// interrupt, and it ends only with its stream. `settle` bounds the wait for
+/// that one; past it the drain is left running with its read end, and `open`
+/// still counts it.
+#[cfg(unix)]
+pub(crate) fn stop_sync_drains(
+    cancel: &SyncDrainCancel,
+    events: &std::sync::mpsc::Receiver<SyncPipeEvent>,
+    open: &mut usize,
+    settle: std::time::Duration,
+) {
+    cancel.fire();
+    let deadline = std::time::Instant::now() + settle;
+    while let PipesEnded::Overflow(hold) = await_sync_pipes(events, open, Some(deadline)) {
+        drop(hold);
+    }
+}
+
 /// `drain_capped`'s reader over a std pipe: one blocking read of up to 64 KiB
 /// a call, `None` at EOF or on a read error.
+///
+/// Unix: with a `cancel` end to watch, the wait is a poll on both and a
+/// `cancel` that reports anything -- readable (the byte), POLLHUP (its write
+/// end closed), an error -- ends the stream as well (`SyncDrainCancel`). The
+/// cancel is looked at first, so a stream that always has bytes ready cannot
+/// outrun it. Once it is seen, what the pipe already holds is still read, in
+/// a final pass that never blocks and takes no more than the pipe held at
+/// that moment (`final_pass_chunk`), so output the child wrote before it was
+/// ended stays in the result; `drain_capped` still stops that pass at
+/// `max_buffer`. A poll that fails for any reason but EINTR falls through to
+/// the plain blocking read, as an unwatched drain does, rather than ending
+/// the stream: an end there was a short result with no error.
+#[cfg(unix)]
+pub(crate) fn pipe_chunks<R>(
+    pipe: Option<R>,
+    cancel: Option<Arc<std::io::PipeReader>>,
+) -> Option<impl FnMut() -> Option<Vec<u8>> + Send + 'static>
+where
+    R: std::io::Read + std::os::fd::AsFd + Send + 'static,
+{
+    use rustix::event::{PollFd, PollFlags};
+    pipe.map(|mut pipe| {
+        // Bytes left for the final pass, once the cancel has been seen.
+        let mut final_pass: Option<usize> = None;
+        move || {
+            let mut chunk = vec![0u8; 65536];
+            if let Some(left) = final_pass.as_mut() {
+                return final_pass_chunk(&mut pipe, &mut chunk, left);
+            }
+            loop {
+                if let Some(cancel) = &cancel {
+                    let cancelled = {
+                        let mut fds = [
+                            PollFd::new(&pipe, PollFlags::IN),
+                            PollFd::new(&**cancel, PollFlags::IN),
+                        ];
+                        match rustix::event::poll(&mut fds, None) {
+                            Ok(_) => !fds[1].revents().is_empty(),
+                            // A wait cut short by a signal, not an end.
+                            Err(rustix::io::Errno::INTR) => continue,
+                            // The wait itself failed: read as an unwatched
+                            // drain does. The cancel is looked at again on
+                            // the next call.
+                            Err(_) => false,
+                        }
+                    };
+                    if cancelled {
+                        // What the pipe holds now, and no more: a writer
+                        // that keeps writing cannot keep the pass going.
+                        // Unknown, one chunk's worth.
+                        let held = rustix::io::ioctl_fionread(&pipe)
+                            .ok()
+                            .and_then(|n| usize::try_from(n).ok())
+                            .unwrap_or(chunk.len());
+                        let left = final_pass.insert(held);
+                        return final_pass_chunk(&mut pipe, &mut chunk, left);
+                    }
+                }
+                match pipe.read(&mut chunk) {
+                    Ok(0) => return None,
+                    Ok(n) => {
+                        chunk.truncate(n);
+                        return Some(chunk);
+                    }
+                    // A signal arrived before anything was read: not an end.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return None,
+                }
+            }
+        }
+    })
+}
+
+/// Unix: one step of a cancelled drain's final pass (`pipe_chunks`): the next
+/// bytes the pipe already holds, at most `left` of them, or `None` once the
+/// pass is over -- `left` spent, nothing ready right now, EOF, or an error.
+/// Never blocks: a zero-timeout poll comes before each read, and the drain is
+/// the pipe's only reader, so a pipe the poll found readable still is.
+#[cfg(unix)]
+fn final_pass_chunk<R>(pipe: &mut R, chunk: &mut Vec<u8>, left: &mut usize) -> Option<Vec<u8>>
+where
+    R: std::io::Read + std::os::fd::AsFd,
+{
+    use rustix::event::{PollFd, PollFlags, Timespec};
+    loop {
+        if *left == 0 {
+            return None;
+        }
+        let ready = {
+            let mut fds = [PollFd::new(&*pipe, PollFlags::IN)];
+            match rustix::event::poll(&mut fds, Some(&Timespec::default())) {
+                Ok(_) => fds[0].revents().contains(PollFlags::IN),
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(_) => false,
+            }
+        };
+        if !ready {
+            return None;
+        }
+        let want = (*left).min(chunk.len());
+        match pipe.read(&mut chunk[..want]) {
+            Ok(0) => return None,
+            Ok(n) => {
+                *left -= n;
+                let mut out = std::mem::take(chunk);
+                out.truncate(n);
+                return Some(out);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Unix: feed a sync spawn's `input` to the child's stdin, then close it.
+///
+/// With a `cancel` end to watch (`SyncDrainCancel`), the write end is made
+/// non-blocking and each write waits in a poll on stdin (POLLOUT) together
+/// with the cancel, so the writer can never be parked in write(2) past the
+/// cancel: once the cancel reports anything it stops at once, and the write
+/// end and the unwritten input go with it -- node's `Kill` closes stdin with
+/// the other two pipes. Otherwise it writes everything, then closes: the child
+/// reads the whole input and then EOF, as before. A cancel that could not be
+/// made, a write end that cannot be made non-blocking, or a poll that fails
+/// for any reason but EINTR all fall back to the plain blocking write of
+/// what is left.
+#[cfg(unix)]
+fn feed_sync_stdin(
+    mut stdin: std::process::ChildStdin,
+    data: &[u8],
+    cancel: Option<Arc<std::io::PipeReader>>,
+) {
+    use rustix::event::{PollFd, PollFlags};
+    use std::io::Write;
+    let Some(cancel) = cancel else {
+        let _ = stdin.write_all(data);
+        return;
+    };
+    if rustix::io::ioctl_fionbio(&stdin, true).is_err() {
+        let _ = stdin.write_all(data);
+        return;
+    }
+    let mut rest = data;
+    while !rest.is_empty() {
+        let writable = {
+            let mut fds = [
+                PollFd::new(&stdin, PollFlags::OUT),
+                PollFd::new(&*cancel, PollFlags::IN),
+            ];
+            match rustix::event::poll(&mut fds, None) {
+                Ok(_) if !fds[1].revents().is_empty() => return,
+                Ok(_) => true,
+                // A wait cut short by a signal, not an end.
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(_) => false,
+            }
+        };
+        if !writable {
+            // The wait itself failed: write the rest as an unwatched writer
+            // does, blocking again.
+            let _ = rustix::io::ioctl_fionbio(&stdin, false);
+            let _ = stdin.write_all(rest);
+            return;
+        }
+        // Whatever the poll reported on stdin (POLLOUT, or POLLERR for a
+        // read end that is gone) the write tells which: progress, not yet,
+        // or the end.
+        match stdin.write(rest) {
+            Ok(0) => return,
+            Ok(n) => rest = &rest[n..],
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => return,
+        }
+    }
+    // `stdin` drops here: the child reads EOF after the input.
+}
+
+/// `drain_capped`'s reader over a std pipe: one blocking read of up to 64 KiB
+/// a call, `None` at EOF or on a read error.
+#[cfg(not(unix))]
 fn pipe_chunks<R>(pipe: Option<R>) -> Option<impl FnMut() -> Option<Vec<u8>> + Send + 'static>
 where
     R: std::io::Read + Send + 'static,
@@ -1554,6 +1969,140 @@ fn deliver_kill(child: &mut tokio::process::Child, _pid: u32, _signal: Option<&s
     child.start_kill().is_ok()
 }
 
+/// End a `spawn_sync` child that outlived its timeout or overflowed
+/// `maxBuffer`, reap it, and report how it went as `(status, signal)`.
+///
+/// Unix: the child is sent `kill_signal` (`None` is SIGTERM, node's default)
+/// with `kill(2)`, as node's sync spawn does, so it can trap the signal and
+/// shut down in order. The report is read off the reaped status: a child the
+/// signal ended reports that signal, one that caught it and exited reports
+/// its exit code. Like node, the wait is for as long as the child takes -- one
+/// that ignores the signal and stays quiet holds `spawnSync` until it exits
+/// by itself. A signal that could not be delivered (a name this platform
+/// lacks) falls back to SIGKILL, which is node's fallback too.
+///
+/// `release` runs between the signal and the wait: the caller closes its read
+/// ends of the child's pipes there, as node does when it kills, so a survivor
+/// that keeps writing meets a closed pipe rather than a full one. What that
+/// does to the report is node's too (v22.23.2 on Linux, three runs each, all
+/// alike): an `sh` that ignores SIGTERM around an endless `yes` reports its
+/// own exit code once `yes` has died of SIGPIPE, and a handler that prints
+/// before it exits dies of SIGPIPE on that print, which is then the `signal`.
+///
+/// The wait then takes the drains' reports (`events`, `open` of them still
+/// running) as they come, and drops the read end any drain hands over as a
+/// `SyncPipeHold` (`wait_releasing_holds`). A drain the release could not
+/// stop goes on reading, and once it crosses `max_buffer` its read end sits
+/// in such a hold; left unreceived in the channel it would keep the pipe
+/// open and full, and a survivor writing to it would block in write(2) with
+/// this wait blocked on that.
+///
+/// The pid is safe to signal: the caller saw the child still running, and
+/// only this function reaps it, so the pid cannot have been recycled.
+#[cfg(unix)]
+fn end_sync_child(
+    child: &mut std::process::Child,
+    kill_signal: Option<&str>,
+    events: &std::sync::mpsc::Receiver<SyncPipeEvent>,
+    open: &mut usize,
+    release: impl FnOnce(&std::sync::mpsc::Receiver<SyncPipeEvent>, &mut usize),
+) -> (Option<i32>, Option<String>) {
+    let signum = match kill_signal {
+        None => Some(libc::SIGTERM),
+        Some(name) => crate::child_unix::signal_number(name),
+    };
+    let delivered = signum
+        .and_then(rustix::process::Signal::from_named_raw)
+        .zip(
+            i32::try_from(child.id())
+                .ok()
+                .and_then(rustix::process::Pid::from_raw),
+        )
+        .is_some_and(|(sig, pid)| rustix::process::kill_process(pid, sig).is_ok());
+    if !delivered {
+        let _ = child.kill();
+    }
+    release(events, open);
+    match wait_releasing_holds(child, events, open) {
+        Ok(status) => exit_report(&status, false, None),
+        // Nothing to read the signal off: report the one that was asked for.
+        Err(_) => (None, Some(kill_signal.unwrap_or("SIGTERM").to_string())),
+    }
+}
+
+/// Unix: wait for an ended `spawn_sync` child while drains are still open
+/// (`open` of them, reporting on `events`), receiving their reports and
+/// dropping the read end in any `SyncPipeHold` at once (`end_sync_child`).
+/// With no drain open -- the usual case, the release having stopped them all
+/// -- this is a plain blocking `wait`. Otherwise it checks the child and
+/// waits on the channel in turns, 1 ms growing to 5 ms, which is the latency
+/// of the kill path only and only with a drain the release left running;
+/// once the last drain reports it blocks in `wait` as well.
+#[cfg(unix)]
+fn wait_releasing_holds(
+    child: &mut std::process::Child,
+    events: &std::sync::mpsc::Receiver<SyncPipeEvent>,
+    open: &mut usize,
+) -> std::io::Result<std::process::ExitStatus> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let mut nap = std::time::Duration::from_millis(1);
+    while *open > 0 {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        match events.recv_timeout(nap) {
+            Ok(event) => {
+                *open -= 1;
+                // A hold's read end closes here.
+                drop(event);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                nap = (nap * 2).min(std::time::Duration::from_millis(5));
+            }
+            // Every drain is gone without a word: none can hand a hold over.
+            Err(RecvTimeoutError::Disconnected) => *open = 0,
+        }
+    }
+    child.wait()
+}
+
+/// Windows has no signals to deliver: the child is terminated, and the result
+/// names the signal that was asked for, as libuv records it
+/// (`sync_kill_signal_name`). `release` runs once the child has been
+/// terminated, as on unix. A terminated child cannot outlive the kill, so the
+/// wait needs nothing from the drains (`events`, `open`): it is the plain
+/// `wait` it always was.
+#[cfg(windows)]
+fn end_sync_child(
+    child: &mut std::process::Child,
+    kill_signal: Option<&str>,
+    events: &std::sync::mpsc::Receiver<SyncPipeEvent>,
+    open: &mut usize,
+    release: impl FnOnce(&std::sync::mpsc::Receiver<SyncPipeEvent>, &mut usize),
+) -> (Option<i32>, Option<String>) {
+    let _ = child.kill();
+    release(events, open);
+    let _ = child.wait();
+    (None, Some(sync_kill_signal_name(kill_signal)))
+}
+
+/// The signal a Windows `spawnSync` reports for a child it terminated.
+///
+/// libuv's `uv_process_kill` terminates the process for SIGTERM, SIGKILL,
+/// SIGINT and SIGQUIT and records that signal as the exit signal; for any
+/// other it fails, and node's sync spawn then kills with SIGKILL instead. So
+/// the result names the requested signal when it is one of those four (`None`
+/// is the default, SIGTERM) and SIGKILL otherwise.
+#[cfg(windows)]
+pub(crate) fn sync_kill_signal_name(kill_signal: Option<&str>) -> String {
+    match kill_signal {
+        None => "SIGTERM",
+        Some(name @ ("SIGTERM" | "SIGKILL" | "SIGINT" | "SIGQUIT")) => name,
+        Some(_) => "SIGKILL",
+    }
+    .to_string()
+}
+
 /// Build the Node-shaped `(code, signal)` exit report from the child's ACTUAL
 /// exit status.
 ///
@@ -1757,6 +2306,7 @@ mod spawn_window_tests {
             false,
             120_000,
             1 << 20,
+            None,
             stdio_pipe_all(),
             detached,
             windows_hide,
@@ -1983,5 +2533,433 @@ mod spawn_window_tests {
         let probe = parse(&output.stdout);
         assert!(probe.use_show_window, "{probe:?}");
         assert_eq!(probe.show_window, SW_SHOWDEFAULT, "{probe:?}");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod sync_kill_signal_tests {
+    use super::sync_kill_signal_name;
+
+    /// The four signals libuv's `uv_process_kill` terminates for are reported
+    /// by their own name; every other request is reported as the SIGKILL node
+    /// falls back to; no `killSignal` at all is the default SIGTERM.
+    #[test]
+    fn a_terminated_child_reports_the_signal_libuv_records() {
+        assert_eq!(sync_kill_signal_name(None), "SIGTERM");
+        for name in ["SIGTERM", "SIGKILL", "SIGINT", "SIGQUIT"] {
+            assert_eq!(sync_kill_signal_name(Some(name)), name);
+        }
+        for name in ["SIGHUP", "SIGUSR1", "SIGBREAK", "SIGWINCH", "SIGPIPE"] {
+            assert_eq!(sync_kill_signal_name(Some(name)), "SIGKILL", "{name}");
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod sync_drain_cancel_tests {
+    use super::{
+        PipesEnded, SyncDrainCancel, SyncPipeEvent, SyncPipeHold, await_sync_pipes, drain_capped,
+        feed_sync_stdin, pipe_chunks, stop_sync_drains, take_sink, wait_releasing_holds,
+    };
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    /// Write to a pipe whose read end this process has just closed until the
+    /// write fails, and hand back the failure. Not at the first attempt
+    /// always: another test's child, forked while the pipe was open, holds a
+    /// copy of the read end from its fork until its exec (the pipe is
+    /// close-on-exec), and a write in that window still lands. Measured: one
+    /// run in two failed on the first write with the cluster tests spawning
+    /// beside this one.
+    fn write_fails(writer: &mut std::io::PipeWriter, why: &str) -> std::io::Error {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match writer.write_all(b"x") {
+                Err(e) => return e,
+                Ok(()) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(()) => panic!("a write still lands after 10 s: {why}"),
+            }
+        }
+    }
+
+    /// A drain parked on a quiet pipe stops when the cancel fires and has
+    /// closed its read end by the time the release returns: the writer's next
+    /// write fails with EPIPE. What it read before that is kept.
+    #[test]
+    fn a_fired_cancel_closes_the_read_end_of_a_quiet_pipe() {
+        let (reader, mut writer) = std::io::pipe().expect("a pipe");
+        let cancel = SyncDrainCancel::new().expect("a cancel pipe");
+        let (events, pipe_events) = std::sync::mpsc::channel();
+        let sink = drain_capped(
+            pipe_chunks(Some(reader), Some(cancel.watch())),
+            1 << 20,
+            events,
+        );
+        writer.write_all(b"before").expect("the read end is open");
+        // Until the cancel the drain is still there, and reads what arrives.
+        let mut open = 1usize;
+        assert!(matches!(
+            await_sync_pipes(
+                &pipe_events,
+                &mut open,
+                Some(Instant::now() + Duration::from_millis(200))
+            ),
+            PipesEnded::TimedOut
+        ));
+        assert_eq!(open, 1);
+
+        stop_sync_drains(&cancel, &pipe_events, &mut open, Duration::from_secs(30));
+        assert!(cancel.has_fired());
+        assert_eq!(open, 0);
+        let err = write_fails(&mut writer, "the read end is closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(take_sink(&sink), b"before");
+    }
+
+    /// A drain that already stopped at the limit handed its read end over;
+    /// the release closes that one too, whichever stream it was, and one
+    /// cancel reaches every drain watching it.
+    #[test]
+    fn the_release_closes_overflowed_and_draining_ends_alike() {
+        let (full_reader, mut full_writer) = std::io::pipe().expect("a pipe");
+        let (quiet_reader, mut quiet_writer) = std::io::pipe().expect("a pipe");
+        let cancel = SyncDrainCancel::new().expect("a cancel pipe");
+        let (events, pipe_events) = std::sync::mpsc::channel();
+        let _full = drain_capped(
+            pipe_chunks(Some(full_reader), Some(cancel.watch())),
+            4,
+            events.clone(),
+        );
+        let _quiet = drain_capped(
+            pipe_chunks(Some(quiet_reader), Some(cancel.watch())),
+            4,
+            events,
+        );
+        full_writer.write_all(b"past the limit").expect("open");
+        let mut open = 2usize;
+        let hold = match await_sync_pipes(&pipe_events, &mut open, None) {
+            PipesEnded::Overflow(hold) => hold,
+            _ => panic!("the full stream overflows first"),
+        };
+        // Held: the read end is still open, so a write still lands.
+        full_writer.write_all(b"x").expect("the hold keeps it open");
+        drop(hold);
+        let err = write_fails(&mut full_writer, "closed with the hold");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+
+        stop_sync_drains(&cancel, &pipe_events, &mut open, Duration::from_secs(30));
+        assert_eq!(open, 0);
+        let err = write_fails(&mut quiet_writer, "closed by the cancel");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// Bytes already in the pipe when the drain sees the cancel are still
+    /// read: here the cancel has fired before the drain's first poll, so the
+    /// poll reports the data and the cancel together -- the case that used to
+    /// drop the data. The final pass takes what the pipe held and stops
+    /// (the write end is still open, so it must not wait for EOF), and the
+    /// read end is closed after it.
+    #[test]
+    fn bytes_already_in_the_pipe_when_the_cancel_is_seen_are_kept() {
+        let (reader, mut writer) = std::io::pipe().expect("a pipe");
+        let cancel = SyncDrainCancel::new().expect("a cancel pipe");
+        writer
+            .write_all(b"written before the kill")
+            .expect("the read end is open");
+        cancel.fire();
+        let (events, pipe_events) = std::sync::mpsc::channel();
+        let sink = drain_capped(
+            pipe_chunks(Some(reader), Some(cancel.watch())),
+            1 << 20,
+            events,
+        );
+        let mut open = 1usize;
+        stop_sync_drains(&cancel, &pipe_events, &mut open, Duration::from_secs(30));
+        assert_eq!(open, 0);
+        assert_eq!(take_sink(&sink), b"written before the kill");
+        let err = write_fails(&mut writer, "the read end is closed after the pass");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// `stop_sync_drains` returns only once the final pass is in the sink:
+    /// the path where the child exited by itself fires the cancel and takes
+    /// the sinks straight after, and a take that did not wait for the pass
+    /// lost what it read. The drain is held back from its first read on
+    /// purpose, so its whole run (the cancel seen, the pass) comes after the
+    /// stop was called; a stop that only fired would find the sink empty. The
+    /// settle bound here is far past the hold-back, so load cannot fail it.
+    #[test]
+    fn the_stop_waits_for_the_final_pass_before_the_sink_is_taken() {
+        let (reader, mut writer) = std::io::pipe().expect("a pipe");
+        let cancel = SyncDrainCancel::new().expect("a cancel pipe");
+        writer
+            .write_all(b"in the pipe at the stop")
+            .expect("the read end is open");
+        let mut inner = pipe_chunks(Some(reader), Some(cancel.watch())).expect("a reader");
+        let mut held_back = true;
+        let slow = move || {
+            if std::mem::take(&mut held_back) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            inner()
+        };
+        let (events, pipe_events) = std::sync::mpsc::channel();
+        let sink = drain_capped(Some(slow), 1 << 20, events);
+        let mut open = 1usize;
+        stop_sync_drains(&cancel, &pipe_events, &mut open, Duration::from_secs(30));
+        assert_eq!(open, 0, "the drain did not report within the settle");
+        assert_eq!(take_sink(&sink), b"in the pipe at the stop");
+        let err = write_fails(&mut writer, "the read end is closed after the pass");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// A final pass that crosses `max_buffer` hands its read end over; the
+    /// stop drops it rather than returning with the pipe still held open.
+    #[test]
+    fn the_stop_drops_a_read_end_handed_over_in_the_final_pass() {
+        let (reader, mut writer) = std::io::pipe().expect("a pipe");
+        let cancel = SyncDrainCancel::new().expect("a cancel pipe");
+        writer.write_all(b"past the limit").expect("open");
+        cancel.fire();
+        let (events, pipe_events) = std::sync::mpsc::channel();
+        let sink = drain_capped(pipe_chunks(Some(reader), Some(cancel.watch())), 4, events);
+        let mut open = 1usize;
+        stop_sync_drains(&cancel, &pipe_events, &mut open, Duration::from_secs(30));
+        assert_eq!(open, 0);
+        assert_eq!(take_sink(&sink), b"past the limit");
+        let err = write_fails(&mut writer, "the handed-over read end is dropped");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// A drain the cancel cannot reach -- the plain blocking read a drain
+    /// falls back to after its poll failed, modelled here by a drain that
+    /// watches no cancel -- on a stream whose write end is held open and
+    /// quiet (a grandchild's) does not hold the stop past `settle`, and is
+    /// still counted open after it. The kill path of `spawn_sync` waits this
+    /// way too, where an unbounded wait held it until the writer went away.
+    /// The write end is closed at the end, so the drain thread ends with the
+    /// test.
+    #[test]
+    fn the_stop_is_bounded_for_a_drain_the_cancel_cannot_reach() {
+        let (reader, writer) = std::io::pipe().expect("a pipe");
+        let cancel = SyncDrainCancel::new().expect("a cancel pipe");
+        let (events, pipe_events) = std::sync::mpsc::channel();
+        let _sink = drain_capped(pipe_chunks(Some(reader), None), 1 << 20, events);
+        let mut open = 1usize;
+        let settle = Duration::from_millis(200);
+        let started = Instant::now();
+        stop_sync_drains(&cancel, &pipe_events, &mut open, settle);
+        let took = started.elapsed();
+        assert_eq!(open, 1, "the unreachable drain is still open");
+        assert!(took >= settle, "returned before the settle: {took:?}");
+        // Generous: the bound is the settle, and only scheduling adds to it.
+        assert!(
+            took < Duration::from_secs(20),
+            "the stop was not bounded: {took:?}"
+        );
+        drop(writer);
+        assert!(matches!(
+            await_sync_pipes(&pipe_events, &mut open, None),
+            PipesEnded::AllEof
+        ));
+        assert_eq!(open, 0);
+    }
+
+    /// The cancel's second mechanism alone: its write end closing, with no
+    /// byte written, stops a drain parked on a quiet pipe (POLLHUP on the
+    /// cancel end counts as the cancel). So a byte write that fails cannot
+    /// leave a drain waiting, and a release after it cannot hang.
+    #[test]
+    fn a_closed_cancel_end_stops_a_drain_without_the_byte() {
+        let (reader, mut writer) = std::io::pipe().expect("a pipe");
+        let cancel = SyncDrainCancel::new().expect("a cancel pipe");
+        let (events, pipe_events) = std::sync::mpsc::channel();
+        let _sink = drain_capped(
+            pipe_chunks(Some(reader), Some(cancel.watch())),
+            1 << 20,
+            events,
+        );
+        let mut open = 1usize;
+        assert!(matches!(
+            await_sync_pipes(
+                &pipe_events,
+                &mut open,
+                Some(Instant::now() + Duration::from_millis(200))
+            ),
+            PipesEnded::TimedOut
+        ));
+        // Dropping the cancel closes its write end and writes nothing.
+        drop(cancel);
+        assert!(
+            matches!(
+                await_sync_pipes(
+                    &pipe_events,
+                    &mut open,
+                    Some(Instant::now() + Duration::from_secs(10))
+                ),
+                PipesEnded::AllEof
+            ),
+            "the drain did not stop on the closed cancel end"
+        );
+        assert_eq!(open, 0);
+        let err = write_fails(&mut writer, "the read end is closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// The kill path's wait (`wait_releasing_holds`) drops a read end a
+    /// drain handed over as soon as the report arrives, while the child is
+    /// still running: a survivor writing to that pipe meets a closed pipe
+    /// instead of blocking in write(2) on a full one. Two drains are counted
+    /// open and only one reports, so the wait is still taking reports in
+    /// turns with the child's status when the child dies, and returns that
+    /// status with the other drain still counted open.
+    #[test]
+    fn the_kill_path_wait_drops_a_hold_while_the_child_runs() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep starts");
+        let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("a pid"))
+            .expect("a pid");
+        // A failed assertion before the explicit kill below must not leave
+        // the `sleep` running and the waiter parked: the guard kills the
+        // child on unwind (ESRCH once it is reaped is ignored).
+        struct KillOnDrop(rustix::process::Pid);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = rustix::process::kill_process(self.0, rustix::process::Signal::KILL);
+            }
+        }
+        let _guard = KillOnDrop(pid);
+        let (reader, mut writer) = std::io::pipe().expect("a pipe");
+        let (events, pipe_events) = std::sync::mpsc::channel();
+        events
+            .send(SyncPipeEvent::Overflow(SyncPipeHold {
+                _stream: Box::new(reader),
+            }))
+            .expect("the receiver is here");
+        let (done, waited) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let mut open = 2usize;
+            let status = wait_releasing_holds(&mut child, &pipe_events, &mut open);
+            let _ = done.send((status.map_err(|e| e.kind()), open));
+        });
+        // `events` stays alive to the end, so the channel never disconnects:
+        // the wait can only return on the child's status.
+
+        let err = write_fails(&mut writer, "the hold is dropped during the wait");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(
+            matches!(waited.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "the wait returned before the child was ended"
+        );
+
+        rustix::process::kill_process(pid, rustix::process::Signal::KILL)
+            .expect("the child is ours");
+        let (status, open) = waited
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the wait returns once the child is gone");
+        let status = status.expect("the child's status");
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+        assert_eq!(
+            open, 1,
+            "the drain that never reported is still counted open"
+        );
+        waiter.join().expect("the waiter");
+        drop(events);
+    }
+
+    /// Every drain gone without a report (the channel disconnected) leaves
+    /// nothing to hand a hold over: the wait stops taking reports, counts
+    /// none open, and blocks in a plain `wait` until the child exits.
+    ///
+    /// The child exits when its stdin closes, which the test does only after
+    /// the call has stayed blocked for 500 ms with the child running; a wait
+    /// that missed the disconnect would not be blocked but spinning, and the
+    /// call's first child check and channel read come long before that.
+    #[test]
+    fn the_kill_path_wait_falls_through_to_wait_when_every_drain_is_gone() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read line; exit 7"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh starts");
+        let stdin = child.stdin.take().expect("a stdin pipe");
+        let (events, pipe_events) = std::sync::mpsc::channel::<SyncPipeEvent>();
+        drop(events);
+        let (started, call_started) = std::sync::mpsc::channel();
+        let (done, waited) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let mut open = 1usize;
+            let _ = started.send(());
+            let status = wait_releasing_holds(&mut child, &pipe_events, &mut open);
+            let _ = done.send((status.map_err(|e| e.kind()), open));
+        });
+        call_started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the waiter starts");
+        assert!(
+            matches!(
+                waited.recv_timeout(Duration::from_millis(500)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the wait returned while the child was running"
+        );
+        drop(stdin);
+        let (status, open) = waited
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the wait returns once the child exits");
+        let status = status.expect("the child's status");
+        assert_eq!(status.code(), Some(7), "{status:?}");
+        assert_eq!(status.signal(), None);
+        assert_eq!(open, 0, "the disconnect counts every drain gone");
+        waiter.join().expect("the waiter");
+    }
+
+    /// A stdin writer parked on a full pipe the child never reads stops when
+    /// the cancel fires, closing the child's stdin: it does not sit in
+    /// write(2) holding the input until the child exits.
+    #[test]
+    fn a_fired_cancel_stops_a_stdin_writer_the_child_does_not_read() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        let stdin = child.stdin.take().expect("a stdin pipe");
+        let cancel = SyncDrainCancel::new().expect("a cancel pipe");
+        let watch = cancel.watch();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Far past any pipe buffer.
+            feed_sync_stdin(stdin, &vec![b'x'; 4 << 20], Some(watch));
+            let _ = done.send(());
+        });
+        let parked = finished.recv_timeout(Duration::from_millis(300)).is_err();
+        cancel.fire();
+        let stopped = finished.recv_timeout(Duration::from_secs(10)).is_ok();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            parked,
+            "the writer finished although nothing read the input"
+        );
+        assert!(stopped, "the writer did not stop on the cancel");
+    }
+
+    /// Without a cancel end the reader is the plain blocking one: it ends at
+    /// EOF and not before.
+    #[test]
+    fn an_unwatched_reader_runs_to_eof() {
+        let (reader, mut writer) = std::io::pipe().expect("a pipe");
+        let mut next = pipe_chunks(Some(reader), None).expect("a reader");
+        writer.write_all(b"abc").expect("open");
+        drop(writer);
+        assert_eq!(next().as_deref(), Some(&b"abc"[..]));
+        assert_eq!(next(), None);
     }
 }

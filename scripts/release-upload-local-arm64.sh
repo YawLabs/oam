@@ -229,6 +229,23 @@ case "$win_decision" in
 esac
 guard_signed_asset "nothing was built or uploaded"
 
+# warn_target_holds_tag -- say so when the build below has left ${TAG}'s
+# binary in this checkout's target/.
+#
+# The tag's tree is built into THIS checkout's target/ (a warm cache, and
+# deliberate -- see the build below), so afterwards target/release/oam.exe is
+# ${TAG}'s build, not this checkout's -- and that path is what live typed-cli
+# sessions execute (see the park below): every session started from it runs
+# ${TAG} until the next release build here. Nothing to say when this checkout
+# is at the tag. HEAD is read here, after the build, not at script start.
+warn_target_holds_tag() {
+  local head_now
+  head_now="$(git -C "$REPO_ROOT" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  [ "$head_now" != "$tag_sha" ] || return 0
+  echo "  [warn] target/release/oam.exe in this checkout is now ${TAG}'s build (${tag_sha}), not this checkout's (HEAD ${head_now:-unknown}) -- sessions started from it run ${TAG} until you rebuild: cargo build --release -p oam_cli" >&2
+  return 0
+}
+
 # Live typed-cli sessions run this exact file. `taskkill //F //IM oam.exe`
 # (what this used to do) killed the operator's other agent panes AND made the
 # failure MORE likely: every killed session restarts on --resume, and a process
@@ -257,6 +274,9 @@ git worktree add -q --detach "$wt" "$tag_sha" \
 [ "$(git -C "$wt" rev-parse HEAD)" = "$tag_sha" ] \
   || { echo "error: the worktree at $wt is not on ${TAG} ($tag_sha)" >&2; exit 1; }
 (cd "$wt" && cargo build --release -p oam_cli --target-dir "$REPO_ROOT/target")
+# Right after the build, not at the end: the binary is replaced from here on
+# whether or not the rest of this run gets as far as the upload.
+warn_target_holds_tag
 
 tmp="$(mktemp -d)"
 cp target/release/oam.exe "${tmp}/${ASSET}"

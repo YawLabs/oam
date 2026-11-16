@@ -480,13 +480,19 @@ case " $AWK_TESTED " in
   *) skip "mawk is not installed on this host, so the dialect that caused the original bug went untested; the source-level interval check above is the only mawk protection here" ;;
 esac
 
-it "--dry-run deletes nothing"
+# Parked copies included: the reap is a delete like any other, and a dry run
+# that took them while closing with "nothing deleted" was not one.
+it "--dry-run deletes nothing, parked copies included, and counts those"
 reset_tree
 plant target/debug/deps 0 oam-999999999999999a
 plant target/debug/deps 1 oam-999999999999999b
 plant target/debug/deps 2 oam-999999999999999c
-gc --dry-run --keep 1
-eq "$(count_in target/debug/deps)" "3"
+echo parked > "$ROOT/target/debug/deps/oam.exe.inuse-1-1"
+echo parked > "$ROOT/target/debug/oam.exe.inuse-1-1"
+DRY_OLD_OUT="$(gc_out --dry-run --keep 1)"
+if [ "$(count_in target/debug/deps) $(count_in target/debug)" = "4 2" ] \
+   && grep -q 'would reap 2 parked copies' <<<"$DRY_OLD_OUT"; then pass
+else fail "deps holds $(count_in target/debug/deps) of 4, target/debug $(count_in target/debug) of 2: $DRY_OLD_OUT"; fi
 
 # The builder`s exact condition: the tree arrives as a tarball of the files git
 # tracks, which never carries .git itself, and the caller`s cwd is $HOME. `git
@@ -688,8 +694,11 @@ plant_unit(){
       printf '{"rustc":%s,"features":"%s","declared_features":"[\\"fa\\", \\"fb\\"]","target":1,"profile":%s,"path":1,"deps":[%s],"local":[{"CheckDepInfo":{"dep_info":"debug\\\\build\\\\%s/%s\\\\fingerprint\\\\dep-%s","fingerprint":"mtime"}}],"rustflags":[],"config":0,"compile_kind":%s}' \
          "$rustc" "${FEAT:-[]}" "$prof" "$deps" "$pkg" "$hash" "$kind" "$ck" > "$u/fingerprint/$kind.json" ;;
   esac
+  # "fresh" first: it is no number, and formatting it as one made printf
+  # complain on stderr before the mtimes were (rightly) left alone.
+  if [ "$gen" = "fresh" ]; then return 0; fi
   if [ "${#gen}" = 12 ]; then stamp="$gen"; else printf -v stamp '2026080112%02d' "$gen"; fi
-  [ "$gen" = "fresh" ] || find "$u" -type f -exec touch -t "$stamp" {} +
+  find "$u" -type f -exec touch -t "$stamp" {} +
 }
 # plant_empty <tree> <pkg> <hash> <gen|fresh> -- a unit dir holding only an
 # empty out/, which cargo 1.100 leaves behind (seen on every probe).
@@ -789,14 +798,26 @@ plant_empty debug a 00000000000000e1 0
 plant_empty debug a 00000000000000e2 fresh
 plant_unit debug a 00000000000000d1 0 - 0
 plant_unit debug a 00000000000000d3 0 '?' 0
-# A parked copy in a surviving unit's out/ is reaped. Its mtime is the
+# Parked copies: one at the top of the tree and one in the out/ of an oam_cli
+# unit are reaped -- the dirs oam_park_bin parks into. One in another
+# package's out/ is that crate's own file and stays. Each mtime is its
 # unit's: a file written now would make a0011 the newest of lib-a's group by
 # months, and age lib-a's profile-1 slot out.
-echo parked > "$ROOT/$UB/a/00000000000a0011/out/a.exe.inuse-4242"
-touch -t 202608011204 "$ROOT/$UB/a/00000000000a0011/out/a.exe.inuse-4242"
+plant_unit debug oam_cli 00000000000c0031 4 bin-oam 3 oam.exe
+PARKED_CLI=$UB/oam_cli/00000000000c0031/out/oam.exe.inuse-4242
+PARKED_TOP=target/debug/oam.exe.inuse-4242
+PARKED_OTHER=$UB/a/00000000000a0011/out/a.exe.inuse-4242
+for f in $PARKED_CLI $PARKED_TOP $PARKED_OTHER; do
+  echo parked > "$ROOT/$f"
+  touch -t 202608011204 "$ROOT/$f"
+done
 # The pre-1.100 layout beside it: all dead once units exist -- but a package
 # dir whose NAME looks like an old build-script dir and holds units is not.
 plant target/debug/deps 0 a-0123456789abcdef.exe liba-0123456789abcdef.rlib
+# A second generation of one deps/ family: what a family prune over this
+# (migrated) deps/ would report as superseded, so the "reported once" case
+# below can fail.
+plant target/debug/deps 1 a-fedcba9876543210.exe
 plant target/debug/.fingerprint/a-0123456789abcdef 0 lib-a
 plant target/debug/build/a-0123456789abcdef 0 build-script-build.exe
 plant_unit debug z-0123456789abcdef 00000000000000f1 0 lib-z 1
@@ -805,25 +826,37 @@ plant_unit debug z-0123456789abcdef 00000000000000f1 0 lib-z 1
 plant target/release/deps 0 oam-aaaa000000000001
 plant target/release/deps 1 oam-aaaa000000000002
 DRY_OUT="$(gc_out --dry-run --keep 1 --keep-incremental)"
+# Read between the two runs: the real one reaps them.
+DRY_REAPED=""
+for f in $PARKED_CLI $PARKED_TOP $PARKED_OTHER; do
+  [ -e "$ROOT/$f" ] || DRY_REAPED="$DRY_REAPED $f"
+done
 UNIT_OUT="$(gc_out --keep 1 --keep-incremental)"
 
-# Seven superseded units: a's old lib, its run and build-script compile, the
-# third dup, z's oldest bin, the old run g3, and the stale empty dir.
-it "units: a real run prunes exactly the superseded units, and says so"
-if grep -q 'pruned 7 unreachable units under target ' <<<"$UNIT_OUT"; then
-  tree_survivors '!'$UB/a/00000000000a0021 '!'$UB/a/00000000000a0022 '!'$UB/a/00000000000a0023 \
-                 '!'$UB/dup/00000000000d0000 '!'$UB/z/00000000000e0021 '!'$UB/g/00000000000c0003 \
-                 '!'$UB/a/00000000000000e1
-else fail "output was: $UNIT_OUT"; fi
-
-it "units: --dry-run plans exactly what the real run then did"
-if grep -q 'would prune 7 unreachable units under target ' <<<"$DRY_OUT"; then pass
-else fail "dry run reported: $DRY_OUT"; fi
+it "units: --dry-run reaps no parked copy, and counts the two a real run takes"
+if [ -z "$DRY_REAPED" ] && grep -q 'would reap 2 parked copies' <<<"$DRY_OUT"; then pass
+else fail "reaped by the dry run:${DRY_REAPED:- none}; it reported: $DRY_OUT"; fi
 
 if [ "$LINK_FAILED" = "1" ]; then
-  it "units: reachability from the tree's hardlinked artifacts"
+  # The counts below too: without the uplift roots, z's switched-back chain
+  # and the older l and example units are unreached as well, so the run
+  # prunes more than seven and the count says nothing about the code.
+  it "units: reachability from the tree's hardlinked artifacts, and the pruned count that rests on it"
   skip "this filesystem would not hardlink a fixture file; every root but the slot one is a hardlink"
 else
+  # Seven superseded units: a's old lib, its run and build-script compile, the
+  # third dup, z's oldest bin, the old run g3, and the stale empty dir.
+  it "units: a real run prunes exactly the superseded units, and says so"
+  if grep -q 'pruned 7 unreachable units under target ' <<<"$UNIT_OUT"; then
+    tree_survivors '!'$UB/a/00000000000a0021 '!'$UB/a/00000000000a0022 '!'$UB/a/00000000000a0023 \
+                   '!'$UB/dup/00000000000d0000 '!'$UB/z/00000000000e0021 '!'$UB/g/00000000000c0003 \
+                   '!'$UB/a/00000000000000e1
+  else fail "output was: $UNIT_OUT"; fi
+
+  it "units: --dry-run plans exactly what the real run then did"
+  if grep -q 'would prune 7 unreachable units under target ' <<<"$DRY_OUT"; then pass
+  else fail "dry run reported: $DRY_OUT"; fi
+
   it "units (a): a build's run, build-script compile and build-dep lib survive a newer clippy twin in their slots"
   tree_survivors $UB/a/00000000000a0001 $UB/a/00000000000a0002 $UB/a/00000000000a0003 $UB/p/00000000000b0001 \
                  $UB/a/00000000000a0011 $UB/a/00000000000a0012 $UB/a/00000000000a0013
@@ -851,8 +884,9 @@ tree_survivors $UB/g/00000000000c0001
 it "units (g): an old empty unit dir goes, a fresh one stays; no json or an unreadable one stays"
 tree_survivors '!'$UB/a/00000000000000e1 $UB/a/00000000000000e2 $UB/a/00000000000000d1 $UB/a/00000000000000d3
 
-it "units: parked copies in a unit's out/ are reaped"
-tree_survivors '!'$UB/a/00000000000a0011/out/a.exe.inuse-4242 $UB/a/00000000000a0011/out/liba-00000000000a0011.rmeta
+it "units: parked copies at the top of the tree and in oam_cli's out/ are reaped, another package's out/ is left alone"
+tree_survivors '!'$PARKED_CLI '!'$PARKED_TOP $UB/oam_cli/00000000000c0031/out/oam.exe \
+               $PARKED_OTHER $UB/a/00000000000a0011/out/liba-00000000000a0011.rmeta
 
 it "migration: deps/, .fingerprint/ and build/<pkg>-<hash>/ go once the tree has units"
 tree_survivors '!target/debug/deps' '!target/debug/.fingerprint' '!'$UB/a-0123456789abcdef \
@@ -879,6 +913,37 @@ plant_unit debug a 00000000000000a2 1 lib-a 1
 plant_unit debug a 00000000000000a3 2 lib-a 1
 gc --keep 2
 tree_survivors $UB/a/00000000000000a2 $UB/a/00000000000000a3 '!'$UB/a/00000000000000a1
+
+# Root 3. A build script rerun in place carries a new fingerprint hash, and
+# when the package's own compile then fails or is interrupted its lib still
+# names the old one: a hash no unit carries. Runs have no slot, so nothing
+# reached rr's newest run -- the OUT_DIR -- or the build-script compile only
+# it names (its slot belongs to a newer clippy twin).
+#   rr  the lib names a missing hash and no run is live: the NEWEST run stays,
+#       with the compile it names; the older run still goes.
+#   rs  the lib names a missing hash too, but its run is live the ordinary
+#       way: the other, newer, unnamed run gets nothing from that and goes.
+#   rn  nothing names a missing hash: an unnamed run goes, as it always did.
+it "units: a build script rerun in place keeps its newest run and that run's compile, and no other run"
+reset_tree
+plant_unit debug rr 0000000000070003 0 $BSB 6 build_script_build.exe
+plant_unit debug rr 0000000000070013 3 $BSB 6 build_script_build.exe
+DEPS="0000000000070003" plant_unit debug rr 0000000000070002 2 $RBSB 0 gen.rs
+plant_unit debug rr 0000000000070022 0 $RBSB 0 gen.rs
+DEPS="00000000000700ff" plant_unit debug rr 0000000000070001 1 lib-rr 1
+plant_unit debug rs 0000000000071003 0 $BSB 6 build_script_build.exe
+DEPS="0000000000071003" plant_unit debug rs 0000000000071002 0 $RBSB 0 gen.rs
+plant_unit debug rs 0000000000071012 2 $RBSB 0 gen.rs
+DEPS="0000000000071002 00000000000710ff" plant_unit debug rs 0000000000071001 1 lib-rs 1
+plant_unit debug rn 0000000000072002 0 $RBSB 0 gen.rs
+plant_unit debug rn 0000000000072001 1 lib-rn 1
+RUN_OUT="$(gc_out --keep 1)"
+if grep -q 'kept 1 build-script runs under target ' <<<"$RUN_OUT"; then
+  tree_survivors $UB/rr/0000000000070001 $UB/rr/0000000000070002 $UB/rr/0000000000070003 \
+                 $UB/rr/0000000000070013 '!'$UB/rr/0000000000070022 \
+                 $UB/rs/0000000000071001 $UB/rs/0000000000071002 $UB/rs/0000000000071003 \
+                 '!'$UB/rs/0000000000071012 $UB/rn/0000000000072001 '!'$UB/rn/0000000000072002
+else fail "output was: $RUN_OUT"; fi
 
 # Slot keys, slot and uplift ageing, unlisted triple trees, and hashes past
 # 2^63 -- one fixture, one run, default TREES. Each pair below differs in
@@ -1022,9 +1087,16 @@ plant_unit debug y 00000000000f0113 2 $BSB 6 build_script_build.exe
 DEPS="00000000000f0103" plant_unit aarch64-pc-windows-msvc/debug y 00000000000f0102 0 $RBSB 0 gen.rs
 DEPS="00000000000f0102" plant_unit aarch64-pc-windows-msvc/debug y 00000000000f0101 1 lib-y 1
 DEPS="00000000000f0102" plant_unit aarch64-pc-windows-msvc/debug y 00000000000f0100 0 lib-y 1
+# "Replaces" is the half the trees above cannot show: both are swept under
+# the default list as well. target/release is in the default list, is no
+# triple tree (so nothing adds it back), and is left out here -- its
+# superseded artifact must still be there afterwards.
+plant target/release/deps 0 oam-aaaa000000000001
+plant target/release/deps 1 oam-aaaa000000000002
 ( cd "$ROOT" && OAM_GC_TREES="target/debug target/aarch64-pc-windows-msvc/debug" bash scripts/gc-target.sh --keep 1 >/dev/null 2>&1 )
 tree_survivors $UB/y/00000000000f0103 target/aarch64-pc-windows-msvc/debug/build/y/00000000000f0102 \
-               '!target/aarch64-pc-windows-msvc/debug/build/y/00000000000f0100'
+               '!target/aarch64-pc-windows-msvc/debug/build/y/00000000000f0100' \
+               target/release/deps/oam-aaaa000000000001 target/release/deps/oam-aaaa000000000002
 
 it "units: --dry-run deletes no unit and no old-layout dir"
 reset_tree
@@ -1324,8 +1396,10 @@ if find . -maxdepth 0 -printf '' >/dev/null 2>&1; then
 
   it "crt build script: a package with no build script fails, naming both shapes looked for"
   CRT_OUT="$(assert_static_crt_build_script "$CB" oam_nosuch 2>&1)" && CRT_RC=0 || CRT_RC=$?
-  if [ "$CRT_RC" != 0 ] && grep -qF 'no build script for oam_nosuch' <<<"$CRT_OUT"; then pass
-  else fail "expected a missing build script to fail: $CRT_OUT"; fi
+  if [ "$CRT_RC" != 0 ] && grep -qF 'no build script for oam_nosuch' <<<"$CRT_OUT" \
+     && grep -qF 'oam_nosuch/<hash>/out/build_script_build.exe' <<<"$CRT_OUT" \
+     && grep -qF 'oam_nosuch-<hash>/build-script-build.exe' <<<"$CRT_OUT"; then pass
+  else fail "expected a missing build script to fail, naming both shapes: $CRT_OUT"; fi
 
   it "crt build script: a name that is not a cargo package name is refused"
   CRT_OUT="$(assert_static_crt_build_script "$CB" 'oam.*' 2>&1)" && CRT_RC=0 || CRT_RC=$?
@@ -1424,6 +1498,26 @@ FRESH_OUT="$( cd "$SUITE_TMP/park-fresh" && bash -c '
 FRESH_LEFT="$(cd "$SUITE_TMP/park-fresh" && find . | sort | tr '\n' ' ')"
 if [ "${FRESH_OUT//$'\n'/ }" = "done rc=0" ] && [ "$FRESH_LEFT" = ". ./empty " ]; then pass
 else fail "output: ${FRESH_OUT//$'\n'/ } -- tree: $FRESH_LEFT"; fi
+
+# oam_kill_under's unix branch. pkill exits 1 when nothing matched -- the
+# normal state: no leftover daemon -- and as the last command of the branch
+# that status ended a `set -e` caller (ci-local.sh calls it bare, on every
+# run) right after the step banner, with no message. The Windows branch always
+# ended in `|| true`, so the dev box never saw it; uname is shimmed to take the
+# other branch here whatever the host, and pkill to find nothing.
+it "oam_kill_under: on a unix host, no process to kill is not a failure under set -e"
+KU="$SUITE_TMP/kill-under"
+mkdir -p "$KU/bin" "$KU/debug"
+printf '#!/bin/sh\necho Linux\n' > "$KU/bin/uname"
+printf '#!/bin/sh\necho "pkill $*" >> "%s"\nexit 1\n' "$KU/pkill.log" > "$KU/bin/pkill"
+chmod +x "$KU/bin/uname" "$KU/bin/pkill"
+KU_OUT="$( PATH="$KU/bin:$PATH" bash -c '
+  set -euo pipefail
+  . "$1"
+  oam_kill_under "$2"
+  echo carried-on' _ "$REPO_DIR/scripts/lib/build-locks.sh" "$KU/debug" 2>&1; echo "rc=$?" )"
+if [ "${KU_OUT//$'\n'/ }" = "carried-on rc=0" ] && grep -qxF "pkill -f ^$KU/debug/" "$KU/pkill.log" 2>/dev/null; then pass
+else fail "output: ${KU_OUT//$'\n'/ } -- pkill saw: $(cat "$KU/pkill.log" 2>/dev/null | tr '\n' ';')"; fi
 
 # The uplifted binary itself held (the usual case: a live typed-cli session
 # mid-launch). oam_park_bin must name it, return 1, and stop there -- parking
@@ -6370,6 +6464,14 @@ if [ "$AU_OK" = "1" ]; then
      && [ "${AU_TD:-}" = "$AU/work/target" ] && [ "$AU_WTS" = "1" ] && grep -q 'release upload v0.5.0' "$AU/gh.log"; then pass
   else fail "rc=$AU_RC cargo ran in '${AU_CWD:-}' on '${AU_HEAD:-}' (tag $AU_OLD) into '${AU_TD:-}'; worktrees=$AU_WTS: $AU_OUT"; fi
 
+  # The build goes into this checkout's target/, so target/release/oam.exe --
+  # the file live sessions run -- is the tag's build from then on. Said, right
+  # after the build; this fixture's HEAD is main, not the tag.
+  it "arm64 upload: a build of another commit than HEAD says target/release/oam.exe now holds the tag's build"
+  if grep -qF "target/release/oam.exe in this checkout is now v0.5.0's build ($AU_OLD)" <<<"$AU_OUT" \
+     && grep -A3 -F '(cd "$wt" && cargo build --release -p oam_cli --target-dir' scripts/release-upload-local-arm64.sh | grep -qx 'warn_target_holds_tag'; then pass
+  else fail "no notice in the run's output, or the call no longer follows the build: $AU_OUT"; fi
+
   # The patch path holds the staged asset to release-local.sh's Windows gates
   # before it is checksummed or uploaded: it runs (smoke), it imports no
   # redistributable CRT, and the tag's console e2e passes against it.
@@ -8630,6 +8732,7 @@ fi
 #
 # Parsed out of the JSON twin rather than the markdown, because that file is
 # the machine artifact the generator writes first.
+group "docs -- the conformance figures match the generated scorecard"
 it "the README and why-oam conformance figures match the generated scorecard"
 CONF_JSON="conformance/node-suite-scorecard.json"
 if [ ! -f "$CONF_JSON" ]; then
@@ -8929,7 +9032,10 @@ eq "$(lint_deny_missing "$LD")" "$LD_LAST: no [lints.cargo] unused_dependencies 
 it "lint_deny_missing: the table form { level = \"deny\" } counts"
 ld_fixture
 sed 's/^unused_dependencies = "deny"/unused_dependencies = { level = "deny", priority = 1 }/' "$REPO_DIR/$LD_LAST/Cargo.toml" > "$LD/$LD_LAST/Cargo.toml"
-eq "$(lint_deny_missing "$LD")" ""
+# An unchanged copy is clean too, so a sed that stopped matching would leave
+# the table form untested behind a pass.
+if ! grep -qF 'unused_dependencies = { level = "deny", priority = 1 }' "$LD/$LD_LAST/Cargo.toml"; then fail "the fixture was not rewritten to the table form"
+else eq "$(lint_deny_missing "$LD")" ""; fi
 
 it "lint_deny_missing: a new member added without the table is named"
 ld_fixture
@@ -8946,6 +9052,317 @@ LD_GONE="$(lint_deny_missing "$LD")"
 ld_fixture
 sed '/^members = \[/,/^\]/d' "$REPO_DIR/Cargo.toml" > "$LD/Cargo.toml"
 eq "$LD_GONE / $(lint_deny_missing "$LD")" "crates/oam_gone: no Cargo.toml / no [workspace] members found in $LD/Cargo.toml"
+
+# =============================================================================
+group "release-local.sh -- HEAD stays the tag from the gate to the draft; commits land only from main"
+# =============================================================================
+# The tag reconciliation proves HEAD == $TAG once. The gate and the legs then
+# run for over an hour in a checkout other sessions share, every leg builds
+# the working tree, and `git status --porcelain` is clean after a commit or a
+# branch switch -- so assets built from another commit would be signed and
+# published under the tag. The functions are sliced out verbatim and run in a
+# fixture checkout with a local bare origin, under the script's own shell
+# options; gh is a stub that fails, so land_on_main's PR fallback cannot
+# reach anything real.
+RH="$SUITE_TMP/rel-head"
+mkdir -p "$RH/work" "$RH/bin"
+printf '#!/bin/sh\nexit 1\n' > "$RH/bin/gh"; chmod +x "$RH/bin/gh"
+rh_git(){ git -C "$RH/work" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false -c tag.gpgsign=false "$@"; }
+{
+  git init -q --bare "$RH/origin.git"
+  rh_git init -q && rh_git checkout -q -b main
+  printf 'one\n' >"$RH/work/f.txt"
+  rh_git add f.txt && rh_git commit -qm one
+  rh_git remote add origin "$RH/origin.git"
+  rh_git push -q origin main
+  rh_git tag -a v9.9.9 -m v9.9.9
+} >/dev/null 2>&1
+RH_FNS="$(for f in assert_head_is_tag on_main_branch land_on_main; do sed -n "/^$f() {/,/^}/p" scripts/release-local.sh; done)"
+RH_TAG_SHA="$(rh_git rev-parse 'v9.9.9^{commit}' 2>/dev/null)"
+# rh_run <commands> -- run them after the sliced functions, with stand-ins for
+# the script's ok/warn/fail (fail exits, as the real one does).
+rh_run(){
+  ( cd "$RH/work" && TAG="${RH_TAG:-v9.9.9}" REPO=example-invalid/fixture PATH="$RH/bin:$PATH" bash -c '
+      set -euo pipefail
+      ok(){ echo "[ok] $*"; }
+      warn(){ echo "[warn] $*"; }
+      fail(){ echo "[fail] $*"; exit 1; }
+      eval "$1"
+      eval "$2"' _ "$RH_FNS" "$1" 2>&1; echo "rc=$?" )
+}
+
+it "release-local fixture: the three functions were found, HEAD is main at the tag, origin has it"
+if grep -q '^assert_head_is_tag() {' <<<"$RH_FNS" && grep -q '^on_main_branch() {' <<<"$RH_FNS" \
+   && grep -q '^land_on_main() {' <<<"$RH_FNS" && [ -n "$RH_TAG_SHA" ] \
+   && [ "$(rh_git rev-parse HEAD 2>/dev/null)" = "$RH_TAG_SHA" ] \
+   && [ "$(git -C "$RH/origin.git" rev-parse main 2>/dev/null)" = "$RH_TAG_SHA" ]; then pass; RH_OK=1
+else fail "fixture not as expected (tag at '${RH_TAG_SHA:-}') -- not running the cases"; RH_OK=0; fi
+
+if [ "$RH_OK" = "1" ]; then
+  it "assert_head_is_tag: silent while HEAD is the tag's commit; on_main_branch is true on main"
+  RH_OUT="$(rh_run 'assert_head_is_tag "after the gate"; on_main_branch; echo went-on')"
+  eq "${RH_OUT//$'\n'/ }" "went-on rc=0"
+
+  it "assert_head_is_tag: a tag that does not resolve fails, naming the step"
+  RH_OUT="$(RH_TAG=v0.0.0-nosuch rh_run 'assert_head_is_tag "after the gate"; echo went-on')"
+  if grep -qF '[fail] after the gate: tag v0.0.0-nosuch no longer resolves' <<<"$RH_OUT" \
+     && grep -qx 'rc=1' <<<"$RH_OUT" && ! grep -q 'went-on' <<<"$RH_OUT"; then pass
+  else fail "output: $RH_OUT"; fi
+
+  # The case itself: a commit lands in the checkout mid-run. The tree is
+  # clean, so nothing else in the script sees it.
+  printf 'two\n' >"$RH/work/f.txt"
+  rh_git commit -qam two >/dev/null 2>&1
+  RH_TWO="$(rh_git rev-parse HEAD 2>/dev/null)"
+  it "assert_head_is_tag: a commit made mid-run fails the run, naming both commits, on a clean tree"
+  RH_OUT="$(rh_run 'assert_head_is_tag "before the mac leg"; echo went-on')"
+  if [ -z "$(rh_git status --porcelain 2>/dev/null)" ] && [ "$RH_TWO" != "$RH_TAG_SHA" ] \
+     && grep -qF "[fail] before the mac leg: HEAD is $RH_TWO but v9.9.9 points at $RH_TAG_SHA" <<<"$RH_OUT" \
+     && grep -qx 'rc=1' <<<"$RH_OUT" && ! grep -q 'went-on' <<<"$RH_OUT"; then pass
+  else fail "HEAD $RH_TWO, tag $RH_TAG_SHA, output: $RH_OUT"; fi
+
+  it "land_on_main: from main, the commit reaches origin and is reported landed"
+  RH_OUT="$(rh_run 'land_on_main "the subject" 9.9.9; echo went-on')"
+  if grep -qF '[ok] landed on main: the subject' <<<"$RH_OUT" && grep -qx 'rc=0' <<<"$RH_OUT" \
+     && [ "$(git -C "$RH/origin.git" rev-parse main 2>/dev/null)" = "$RH_TWO" ]; then pass
+  else fail "origin main is $(git -C "$RH/origin.git" rev-parse main 2>/dev/null), wanted $RH_TWO: $RH_OUT"; fi
+
+  # A commit on a detached HEAD: `git push origin main` pushes the main ref,
+  # which does not carry it, exits 0 and used to be reported as a landing.
+  {
+    rh_git checkout -q --detach
+    printf 'three\n' >"$RH/work/f.txt"
+    rh_git commit -qam three
+  } >/dev/null 2>&1
+  RH_THREE="$(rh_git rev-parse HEAD 2>/dev/null)"
+  it "land_on_main: from a detached HEAD it refuses, and reports no landing that did not happen"
+  RH_OUT="$(rh_run 'if on_main_branch; then echo on-main; fi; land_on_main "the subject" 9.9.9; echo went-on')"
+  if [ "$RH_THREE" != "$RH_TWO" ] && grep -qF "[fail] cannot land 'the subject': HEAD is not on main" <<<"$RH_OUT" \
+     && grep -qx 'rc=1' <<<"$RH_OUT" && ! grep -q 'landed on main\|on-main\|went-on' <<<"$RH_OUT" \
+     && [ "$(git -C "$RH/origin.git" rev-parse main 2>/dev/null)" = "$RH_TWO" ]; then pass
+  else fail "HEAD $RH_THREE, origin main $(git -C "$RH/origin.git" rev-parse main 2>/dev/null): $RH_OUT"; fi
+
+  # release-upload-local-arm64.sh's notice, the quiet half: built from the
+  # commit this checkout is on, target/release/oam.exe is this checkout's own
+  # build and there is nothing to say. (The loud half runs in that script's
+  # own fixture above.)
+  it "arm64 upload: no leftover-binary notice when the tag is the commit this checkout is on"
+  RH_WARN_FN="$(sed -n '/^warn_target_holds_tag() {/,/^}/p' scripts/release-upload-local-arm64.sh)"
+  RH_OUT="$(cd "$RH/work" && REPO_ROOT="$RH/work" TAG=v9.9.9 tag_sha="$RH_THREE" bash -c '
+    set -euo pipefail
+    eval "$1"
+    warn_target_holds_tag
+    echo went-on' _ "$RH_WARN_FN" 2>&1; echo "rc=$?")"
+  if [ -z "$RH_WARN_FN" ]; then fail "warn_target_holds_tag() not found in release-upload-local-arm64.sh"
+  else eq "${RH_OUT//$'\n'/ }" "went-on rc=0"; fi
+fi
+
+# Where it is called is the other half: a correct check after the legs only
+# would let a moved HEAD cost two remote legs, and one before `gh release
+# create` only is the last line of defence with nothing in front of it. Each
+# build and each leg has the check on both sides, and the draft is cut only
+# after the last one.
+it "release-local.sh: HEAD is re-checked against the tag around every build and leg, and before the draft"
+sg_order scripts/release-local.sh 'git push -q origin "$TAG" || fail' \
+  'assert_tree_clean "after the local gate"' 'assert_head_is_tag "after the local gate"' \
+  'cargo build --release -p oam_cli' 'assert_head_is_tag "after the native Windows build"' \
+  'cp target/release/oam.exe "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"' \
+  'assert_head_is_tag "after the win-x64 build"' 'cp target/x64-host/release/oam.exe' \
+  'assert_head_is_tag "before the mac leg"' 'build-platforms-tailnet.sh" --mode=release' \
+  'assert_head_is_tag "after the mac leg"' 'cp "$MAC_ART/oam-aarch64-apple-darwin"' \
+  'assert_head_is_tag "before the linux leg"' 'LINUX_ART=$(run_with_attempts' \
+  'assert_head_is_tag "after the linux leg"' 'cp "$LINUX_ART/oam-x86_64-unknown-linux-gnu"' \
+  'assert_head_is_tag "before staging the license files"' \
+  'assert_head_is_tag "before cutting the release"' 'gh release create "$TAG"'
+
+# The receipts commit is the one release-flow commit a run can reach without
+# ever having been required to be on main (no bump, no attribution change).
+it "release-local.sh: the receipts are committed only from main, checked before anything is staged"
+sg_order scripts/release-local.sh 'step "Land the conformance receipts the gate rewrote"' \
+  'elif ! on_main_branch; then' 'git add "${CONFORMANCE_ARTIFACTS[@]}"' \
+  'land_on_main "chore(release): land the conformance receipts the $TAG gate rewrote"'
+
+# =============================================================================
+group "release-local.sh -- after the release: site installers from the tag, receipts only at the tag, live check against the tag"
+# =============================================================================
+# Three blocks that run after the release is live, each read out of
+# release-local.sh verbatim (from its step line to the end of its if/for) and
+# run under the script's own shell options and its real ok/warn/step, in
+# fixture checkouts with local bare origins. netlify and curl are stubs on the
+# fixture PATH; gh is a stub that fails, so land_on_main's PR fallback cannot
+# reach anything real.
+#
+# The release fixture: v9.9.8 holds only install/install.sh (so a git show of
+# its install.ps1 fails), v9.9.9 holds both, and the working tree's
+# install/install.sh is edited after the tag -- what the site must NOT get.
+PS="$SUITE_TMP/rel-post"
+mkdir -p "$PS/repo/install" "$PS/bin"
+ps_git(){ git -C "$1" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false -c tag.gpgsign=false -c core.autocrlf=false "${@:2}"; }
+printf '#!/bin/sh\nexit 1\n' > "$PS/bin/gh"
+printf '#!/bin/sh\necho "$*" >> "$PS_DEPLOYED"\n' > "$PS/bin/netlify"
+# curl prints $PS_LIVE/<last path segment of the URL>, or fails as -f would.
+printf '#!/bin/sh\nfor a; do u="$a"; done\nf="$PS_LIVE/${u##*/}"\n[ -f "$f" ] || exit 22\ncat "$f"\n' > "$PS/bin/curl"
+chmod +x "$PS/bin/gh" "$PS/bin/netlify" "$PS/bin/curl"
+{
+  ps_git "$PS/repo" init -q && ps_git "$PS/repo" checkout -q -b main
+  printf 'sh-at-v9.9.8\n' > "$PS/repo/install/install.sh"
+  ps_git "$PS/repo" add install && ps_git "$PS/repo" commit -qm one && ps_git "$PS/repo" tag -a v9.9.8 -m v9.9.8
+  printf 'sh-at-v9.9.9\n' > "$PS/repo/install/install.sh"; printf 'ps1-at-v9.9.9\n' > "$PS/repo/install/install.ps1"
+  ps_git "$PS/repo" add install && ps_git "$PS/repo" commit -qm two && ps_git "$PS/repo" tag -a v9.9.9 -m v9.9.9
+  printf 'sh-edited-after-the-tag\n' > "$PS/repo/install/install.sh"
+} >/dev/null 2>&1
+PS_LOG="$(grep -E '^(ok|warn|fail|step)\(\)' scripts/release-local.sh)"
+PS_SITE_FNS="$(awk '/^site_refresh_reason\(\) \{$/ || /^refresh_site_downloads\(\) \{$/ || /^write_site_installers\(\) \{$/ { f = 1 } f { print } f && /^}$/ { f = 0 }' scripts/release-local.sh)"
+PS_SITE_STEP="$(awk '/^step "Publish installers \+ downloads page to oamjs\.org"$/ { f = 1 } f { print } f && /^fi$/ { exit }' scripts/release-local.sh)"
+PS_VERIFY="$(awk '/^step "Verify oamjs\.org serves this release"$/ { f = 1 } f { print } f && /^done$/ { exit }' scripts/release-local.sh)"
+# ps_site <tag> -- a fresh site checkout (pushed to its own bare origin, its
+# installers the previous release's, a refresh-downloads.sh stub that writes
+# the downloads page), then the site step against it.
+ps_site(){
+  rm -rf "$PS/site" "$PS/site.git" "$PS/deployed"
+  mkdir -p "$PS/site/public" "$PS/site/scripts"
+  printf 'sh-previous\n' > "$PS/site/public/install.sh"; printf 'ps1-previous\n' > "$PS/site/public/install.ps1"
+  printf '#!/bin/sh\nmkdir -p "$(dirname "$0")/../public/downloads"\necho "page for $1" > "$(dirname "$0")/../public/downloads/index.html"\n' > "$PS/site/scripts/refresh-downloads.sh"
+  chmod +x "$PS/site/scripts/refresh-downloads.sh"
+  {
+    git init -q --bare "$PS/site.git"
+    ps_git "$PS/site" init -q && ps_git "$PS/site" checkout -q -b main
+    ps_git "$PS/site" config user.name t && ps_git "$PS/site" config user.email t@example.invalid
+    ps_git "$PS/site" config commit.gpgsign false && ps_git "$PS/site" config core.autocrlf false
+    ps_git "$PS/site" add -A && ps_git "$PS/site" commit -qm site
+    ps_git "$PS/site" remote add origin "$PS/site.git" && ps_git "$PS/site" push -q -u origin main
+  } >/dev/null 2>&1
+  PS_SITE_HEAD0="$(ps_git "$PS/site" rev-parse HEAD 2>/dev/null)"
+  PS_OUT="$(cd "$PS/repo" && GRN='' YEL='' RED='' CYA='' NC='' REPO_DIR="$PS/repo" TAG="$1" OAM_SITE_DIR="$PS/site" \
+    PS_DEPLOYED="$PS/deployed" PATH="$PS/bin:$PATH" bash -c "set -euo pipefail; $PS_LOG; $PS_SITE_FNS; $PS_SITE_STEP"'
+    echo "after rc=$?"' 2>&1)"
+}
+
+it "release-local post-release fixture: the three blocks were found, the tags hold what the cases assume"
+if [ -n "$PS_SITE_STEP" ] && [ -n "$PS_VERIFY" ] && [ "$(grep -c '() {$' <<<"$PS_SITE_FNS")" = "3" ] \
+   && grep -qF 'write_site_installers "$REPO_DIR" "$TAG" "$SITE_DIR/public"' <<<"$PS_SITE_STEP" \
+   && [ "$(ps_git "$PS/repo" show v9.9.9:install/install.sh 2>/dev/null)" = "sh-at-v9.9.9" ] \
+   && ! ps_git "$PS/repo" show v9.9.8:install/install.ps1 >/dev/null 2>&1; then pass; PS_OK=1
+else fail "fixture or slices not as expected -- not running the cases"; PS_OK=0; fi
+
+if [ "$PS_OK" = "1" ]; then
+  # (a) The working tree's installer was edited after the tag; the site gets
+  # the tag's bytes, commits them with the regenerated page, pushes, deploys.
+  it "site step: the tag's installers go on the site, not the working tree's, and are committed, pushed and deployed"
+  ps_site v9.9.9
+  PS_HEAD="$(ps_git "$PS/site" rev-parse HEAD 2>/dev/null)"
+  if [ "$(cat "$PS/site/public/install.sh")" != "sh-at-v9.9.9" ] || [ "$(cat "$PS/site/public/install.ps1")" != "ps1-at-v9.9.9" ]; then
+    fail "site installers: '$(cat "$PS/site/public/install.sh")' / '$(cat "$PS/site/public/install.ps1")':$(printf '\n%s' "$PS_OUT")"
+  elif [ "$PS_HEAD" = "$PS_SITE_HEAD0" ] || [ "$(git -C "$PS/site.git" rev-parse main 2>/dev/null)" != "$PS_HEAD" ]; then
+    fail "the sync was not committed and pushed:$(printf '\n%s' "$PS_OUT")"
+  elif [ "$(ps_git "$PS/site" show HEAD:public/install.sh 2>/dev/null)" != "sh-at-v9.9.9" ] \
+       || [ "$(ps_git "$PS/site" show HEAD:public/downloads/index.html 2>/dev/null)" != "page for v9.9.9" ]; then
+    fail "the commit does not carry the tag's installer and the page"
+  elif [ -n "$(ps_git "$PS/site" status --porcelain 2>/dev/null)" ] || ls "$PS/site/public" | grep -q 'release-'; then
+    fail "left behind: $(ps_git "$PS/site" status --porcelain 2>/dev/null) $(ls "$PS/site/public")"
+  elif ! grep -qx 'deploy --prod --dir public' "$PS/deployed" 2>/dev/null || ! grep -qx 'after rc=0' <<<"$PS_OUT"; then
+    fail "not deployed, or fatal:$(printf '\n%s' "$PS_OUT")"
+  else pass; fi
+
+  # (b) v9.9.8 has install.sh but no install.ps1: the first read succeeds and
+  # the second fails. The redirect onto the target used to truncate
+  # install.ps1 and the step then committed and deployed the empty file.
+  it "site step: a failed read of either installer leaves both untouched, commits nothing, deploys nothing, and is not fatal"
+  ps_site v9.9.8
+  if [ "$(cat "$PS/site/public/install.sh")" != "sh-previous" ] || [ "$(cat "$PS/site/public/install.ps1")" != "ps1-previous" ]; then
+    fail "site installers changed: '$(cat "$PS/site/public/install.sh")' / '$(cat "$PS/site/public/install.ps1")':$(printf '\n%s' "$PS_OUT")"
+  elif [ "$(ps_git "$PS/site" rev-parse HEAD 2>/dev/null)" != "$PS_SITE_HEAD0" ] || [ "$(git -C "$PS/site.git" rev-parse main 2>/dev/null)" != "$PS_SITE_HEAD0" ]; then
+    fail "the site was committed or pushed:$(printf '\n%s' "$PS_OUT")"
+  elif [ -e "$PS/deployed" ]; then fail "deployed: $(cat "$PS/deployed")"
+  elif ls "$PS/site/public" | grep -q 'release-'; then fail "a temp file was left in public/: $(ls "$PS/site/public")"
+  elif [ "$(cat "$PS/site/public/downloads/index.html" 2>/dev/null)" != "page for v9.9.8" ]; then
+    # The skip covers the installers' commit and deploy only: the downloads
+    # refresh still runs and its page stays in the tree for the hand finish.
+    fail "the downloads page was not regenerated when the installers could not be read:$(printf '\n%s' "$PS_OUT")"
+  elif ! grep -qF "[warn] could not read v9.9.8's install/ scripts into $PS/site/public (reason above) -- the site's installers are left as they were" <<<"$PS_OUT" \
+       || ! grep -qF '[warn] site NOT committed or deployed (no v9.9.8 installers to publish' <<<"$PS_OUT"; then
+    fail "the two warnings are missing:$(printf '\n%s' "$PS_OUT")"
+  elif ! grep -qx 'after rc=0' <<<"$PS_OUT"; then fail "fatal under set -euo pipefail:$(printf '\n%s' "$PS_OUT")"
+  else pass; fi
+
+  # (d) The live check. install.sh is served as the tag has it while the
+  # working tree differs; install.ps1 is served as something else.
+  ps_verify(){  # ps_verify <tag>
+    ( cd "$PS/repo" && GRN='' YEL='' RED='' CYA='' NC='' REPO_DIR="$PS/repo" TAG="$1" PS_LIVE="$PS/live" PATH="$PS/bin:$PATH" \
+        bash -c "set -euo pipefail; $PS_LOG; $PS_VERIFY"'
+        echo "after rc=$?"' 2>&1 )
+  }
+  rm -rf "$PS/live"; mkdir -p "$PS/live"
+  printf 'sh-at-v9.9.9\n' > "$PS/live/install.sh"; printf 'ps1-stale\n' > "$PS/live/install.ps1"
+  it "live check: compared with the tag's blob -- a served installer equal to the tag's matches though the working tree differs, another differs"
+  PS_OUT="$(ps_verify v9.9.9)"
+  if grep -qF '[ok] https://oamjs.org/install.sh matches install/install.sh at v9.9.9' <<<"$PS_OUT" \
+     && grep -qF '[warn] https://oamjs.org/install.ps1 DIFFERS from install/install.ps1 at v9.9.9' <<<"$PS_OUT" \
+     && grep -qx 'after rc=0' <<<"$PS_OUT"; then pass
+  else fail "output:$(printf '\n%s' "$PS_OUT")"; fi
+
+  it "live check: an installer the tag does not hold says it could not be read, never DIFFERS"
+  PS_OUT="$(ps_verify v9.9.8)"
+  if grep -qF '[warn] could not read install/install.ps1 at v9.9.8 -- https://oamjs.org/install.ps1 was fetched but not checked' <<<"$PS_OUT" \
+     && ! grep -qF 'install.ps1 DIFFERS' <<<"$PS_OUT" \
+     && grep -qF '[warn] https://oamjs.org/install.sh DIFFERS from install/install.sh at v9.9.8' <<<"$PS_OUT" \
+     && grep -qx 'after rc=0' <<<"$PS_OUT"; then pass
+  else fail "output:$(printf '\n%s' "$PS_OUT")"; fi
+fi
+
+# (c) The receipts. A checkout with one receipt, its origin at the tag and the
+# gate's rewrite waiting in the stash. When HEAD moved past the tag on main
+# (another session committed), landing would push that commit too: warn,
+# commit nothing, push nothing. At the tag, it lands.
+PS_LAND="$(awk '/^step "Land the conformance receipts the gate rewrote"$/ { f = 1 } f { print } f && /^fi$/ { exit }' scripts/release-local.sh)"
+PS_LAND_FNS="$(for f in only_stamps_dirty on_main_branch land_on_main; do sed -n "/^$f() {/,/^}/p" scripts/release-local.sh; done)"
+ps_receipts(){  # ps_receipts <dir> <advance: 0|1> -- build the checkout, run the block
+  local d="$1"
+  rm -rf "$d" "$d.git" "$d.stash"
+  mkdir -p "$d" "$d.stash"
+  {
+    git init -q --bare "$d.git"
+    ps_git "$d" init -q && ps_git "$d" checkout -q -b main
+    ps_git "$d" config user.name t && ps_git "$d" config user.email t@example.invalid
+    ps_git "$d" config commit.gpgsign false && ps_git "$d" config core.autocrlf false
+    printf 'receipt-old\n' > "$d/RECEIPT.md"; printf 'x\n' > "$d/other.txt"
+    ps_git "$d" add -A && ps_git "$d" commit -qm release
+    ps_git "$d" tag -a v9.9.9 -m v9.9.9
+    ps_git "$d" remote add origin "$d.git" && ps_git "$d" push -q origin main
+    if [ "$2" = "1" ]; then printf 'y\n' > "$d/other.txt"; ps_git "$d" commit -qam "another session"; fi
+  } >/dev/null 2>&1
+  printf 'receipt-new\n' > "$d.stash/RECEIPT.md"
+  PS_HEAD0="$(ps_git "$d" rev-parse HEAD 2>/dev/null)"
+  PS_TAGC="$(ps_git "$d" rev-parse 'v9.9.9^{commit}' 2>/dev/null)"
+  PS_OUT="$(cd "$d" && GRN='' YEL='' RED='' CYA='' NC='' TAG=v9.9.9 tag_version=9.9.9 REPO=example-invalid/fixture \
+    STAMP_STASH="$d.stash" SKIP_LOCAL_GATE=0 PATH="$PS/bin:$PATH" \
+    bash -c "set -euo pipefail; $PS_LOG; CONFORMANCE_ARTIFACTS=(RECEIPT.md); $PS_LAND_FNS; $PS_LAND"'
+    echo "after rc=$?"' 2>&1)"
+}
+
+it "receipts: HEAD advanced past the tag on main -- warned, nothing committed, nothing pushed, the rewrite left in the tree"
+ps_receipts "$PS/rc-moved" 1
+if [ -z "$PS_LAND" ] || [ "$(grep -c '() {$' <<<"$PS_LAND_FNS")" != "3" ]; then fail "the receipts block or its functions not found in release-local.sh"
+elif [ "$PS_HEAD0" = "$PS_TAGC" ]; then fail "fixture: HEAD did not advance past the tag"
+elif [ "$(ps_git "$PS/rc-moved" rev-parse HEAD 2>/dev/null)" != "$PS_HEAD0" ]; then fail "a commit was made:$(printf '\n%s' "$PS_OUT")"
+elif [ "$(git -C "$PS/rc-moved.git" rev-parse main 2>/dev/null)" != "$PS_TAGC" ]; then fail "origin main moved:$(printf '\n%s' "$PS_OUT")"
+elif [ "$(cat "$PS/rc-moved/RECEIPT.md")" != "receipt-new" ]; then fail "the rewrite is not in the tree"
+elif ! grep -qF "[warn] HEAD is no longer v9.9.9's commit -- leaving the rewritten conformance receipts uncommitted" <<<"$PS_OUT" \
+     || ! grep -qx 'after rc=0' <<<"$PS_OUT"; then fail "output:$(printf '\n%s' "$PS_OUT")"
+else pass; fi
+
+it "receipts: HEAD at the tag on main -- the rewrite is committed on top of the tag and lands on origin"
+ps_receipts "$PS/rc-tag" 0
+PS_NEW="$(ps_git "$PS/rc-tag" rev-parse HEAD 2>/dev/null)"
+if [ "$PS_HEAD0" != "$PS_TAGC" ]; then fail "fixture: HEAD is not the tag"
+elif [ "$PS_NEW" = "$PS_TAGC" ] || [ "$(ps_git "$PS/rc-tag" rev-parse HEAD^ 2>/dev/null)" != "$PS_TAGC" ]; then fail "no commit on top of the tag:$(printf '\n%s' "$PS_OUT")"
+elif [ "$(git -C "$PS/rc-tag.git" rev-parse main 2>/dev/null)" != "$PS_NEW" ]; then fail "origin main is not the receipts commit:$(printf '\n%s' "$PS_OUT")"
+elif [ "$(ps_git "$PS/rc-tag" show HEAD:RECEIPT.md 2>/dev/null)" != "receipt-new" ] \
+     || [ "$(ps_git "$PS/rc-tag" log -1 --format=%s 2>/dev/null)" != "chore(release): land the conformance receipts the v9.9.9 gate rewrote" ]; then
+  fail "the commit does not carry the rewrite under the expected subject"
+elif ! grep -qF '[ok] landed on main: chore(release): land the conformance receipts the v9.9.9 gate rewrote' <<<"$PS_OUT" \
+     || ! grep -qx 'after rc=0' <<<"$PS_OUT"; then fail "output:$(printf '\n%s' "$PS_OUT")"
+else pass; fi
 
 # =============================================================================
 echo

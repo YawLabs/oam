@@ -2634,6 +2634,97 @@ fn napi_descriptor_function_names_match_node() {
     );
 }
 
+#[cfg(feature = "napi")]
+#[test]
+fn napi_class_prototype_methods_check_their_receiver_like_node() {
+    // A napi_define_class prototype method (the addon's `descriptorNames`
+    // class, `Named`) refuses a receiver that is not an instance of its
+    // class with node's `TypeError: Illegal invocation`, before the addon is
+    // called; getters, setters and static methods take any receiver. Each
+    // line below is what node v22 answers for the same call, except the two
+    // marked as oam's own (docs/node-divergences.md, entry 63).
+    let dir = napi_addon_dir("napi_receiver_check");
+    write_temp(
+        "napi_receiver_check/main.cjs",
+        "const d = require('./native.node').descriptorNames();\n\
+         const Cls = d.cls;\n\
+         const m = Cls.prototype.method;\n\
+         const gd = Object.getOwnPropertyDescriptor;\n\
+         const attempt = (f) => {\n\
+           try { f(); return 'ok'; } catch (e) { return `${e.constructor.name}: ${e.message}`; }\n\
+         };\n\
+         class Sub extends Cls {}\n\
+         const inst = new Cls();\n\
+         const cases = {\n\
+           instance: () => inst.method(),\n\
+           subclass: () => new Sub().method(),\n\
+           valueNamed: () => inst.valueNamed(),\n\
+           symbolKeyed: () => inst[d.symMethod](),\n\
+           plainObject: () => m.call({}),\n\
+           primitive: () => m.call(1),\n\
+           undefinedThis: () => m.call(undefined),\n\
+           detached: () => (0, m)(),\n\
+           otherClass: () => m.call(new (class Other {})()),\n\
+           prototypeItself: () => m.call(Cls.prototype),\n\
+           proxyOfInstance: () => m.call(new Proxy(inst, {})),\n\
+           symbolKeyedOnPlain: () => Cls.prototype[d.symMethod].call({}),\n\
+           getter: () => gd(Cls.prototype, 'acc').get.call({}),\n\
+           setter: () => gd(Cls.prototype, 'acc').set.call({}, 1),\n\
+           staticMethod: () => Cls.sm.call({}),\n\
+           construct: () => {\n\
+             const made = new m();\n\
+             if (typeof made !== 'object' || made === null) throw new Error(typeof made);\n\
+           },\n\
+           handMadePrototype: () => m.call(Object.create(Cls.prototype)),\n\
+           prototypeReplaced: () => m.call(Object.setPrototypeOf(new Cls(), null)),\n\
+         };\n\
+         for (const [name, f] of Object.entries(cases)) console.log(name, attempt(f));\n",
+    );
+    let out = oam(&["run", dir.join("main.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    const ILLEGAL: &str = "TypeError: Illegal invocation";
+    let expected = [
+        // An instance, and an instance of a subclass, reach the addon --
+        // through a string key, a string-valued name or a symbol alike.
+        ("instance", "ok"),
+        ("subclass", "ok"),
+        ("valueNamed", "ok"),
+        ("symbolKeyed", "ok"),
+        // Anything else is refused.
+        ("plainObject", ILLEGAL),
+        ("primitive", ILLEGAL),
+        ("undefinedThis", ILLEGAL),
+        ("detached", ILLEGAL),
+        ("otherClass", ILLEGAL),
+        ("prototypeItself", ILLEGAL),
+        ("proxyOfInstance", ILLEGAL),
+        ("symbolKeyedOnPlain", ILLEGAL),
+        // No check on accessors or static methods.
+        ("getter", "ok"),
+        ("setter", "ok"),
+        ("staticMethod", "ok"),
+        // `new Cls.prototype.method()` is not a call on a receiver: V8 makes
+        // its signature check on plain calls only, so the callback runs and
+        // the fresh object comes back.
+        ("construct", "ok"),
+        // oam's own answers: it walks the prototype chain where V8's
+        // signature asks which constructor made the object, so the two part
+        // on a prototype set by hand (node: Illegal invocation, then ok).
+        ("handMadePrototype", "ok"),
+        ("prototypeReplaced", ILLEGAL),
+    ];
+    assert_eq!(lines.len(), expected.len(), "stdout: {stdout}");
+    for (line, (name, outcome)) in lines.iter().zip(expected) {
+        assert_eq!(*line, format!("{name} {outcome}"), "stdout: {stdout}");
+    }
+}
+
 // -------------------------------------------------------------- N-API beta
 
 /// Resolve the built test-addon cdylib, failing loudly if it is MISSING or
@@ -2675,10 +2766,11 @@ fn built_test_addon() -> std::path::PathBuf {
         return built;
     };
 
-    // Newest of the addon crate's own sources: Cargo.toml plus every .rs under
-    // src/. Walked rather than hardcoded so a second module cannot slip the net.
+    // Newest of the addon crate's own sources: Cargo.toml, build.rs and every
+    // .rs under src/. Walked rather than hardcoded so a second module cannot
+    // slip the net.
     let addon_root = crate_root.join("../oam_napi_test_addon");
-    let mut sources = vec![addon_root.join("Cargo.toml")];
+    let mut sources = vec![addon_root.join("Cargo.toml"), addon_root.join("build.rs")];
     let mut dirs = vec![addon_root.join("src")];
     while let Some(dir) = dirs.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -3063,7 +3155,7 @@ fn napi_teardown_of_a_worker_keeps_the_env_of_an_addon_the_main_thread_still_hol
 #[cfg(feature = "napi")]
 #[test]
 fn napi_teardown_refuses_an_addon_that_a_cleanup_hook_loads() {
-    // A worker's cleanup hook runs JS (OAM_NAPI_TEARDOWN_CALL: hook 3 calls
+    // A worker's cleanup hook runs JS (OAM_NAPI_TEARDOWN_CALL=3: hook 3 calls
     // globalThis.__oamTeardownCall), and that JS requires a second addon.
     // Teardown had already taken its list of envs, so a second addon loaded
     // then would never get its own hooks or finalizers run, and the worker
@@ -3098,7 +3190,7 @@ if (isMainThread) {
     let out = bounded_output(
         oam_command(&["run", main.to_str().unwrap()])
             .env("OAM_NAPI_TEARDOWN_LOG", &log)
-            .env("OAM_NAPI_TEARDOWN_CALL", "1"),
+            .env("OAM_NAPI_TEARDOWN_CALL", "3"),
     );
     let lines: Vec<String> = std::fs::read_to_string(&log)
         .expect("read the teardown log")
@@ -3119,6 +3211,77 @@ if (isMainThread) {
         "{lines:?}"
     );
     let mut rest: Vec<&str> = lines[6..].iter().map(String::as_str).collect();
+    rest.sort_unstable();
+    assert_eq!(rest, ["main:worker-exit 0", "unload:status=1"], "{lines:?}");
+}
+
+#[cfg(feature = "napi")]
+#[test]
+fn napi_teardown_drops_the_exception_a_step_leaves_pending_before_the_next_step() {
+    // Both cleanup hooks and both finalizers of a worker's addon call into
+    // JS (OAM_NAPI_TEARDOWN_CALL=31f), and the JS throws every time. Each
+    // step gets napi_pending_exception (10) for its own call and leaves the
+    // exception pending, as an addon that ignores statuses does. That must
+    // not reach the next step: with an exception still pending there, its
+    // calls into JS would be refused unrun -- no `js:call` line, though the
+    // status would read 10 just the same. So the proof is that the JS ran
+    // four times. There is nothing left to throw the exceptions to, and the
+    // worker still exits 0.
+    let dir = napi_addon_dir("napi_teardown_throwing_steps");
+    let script = "\
+const { Worker, isMainThread } = require('node:worker_threads');
+const fs = require('node:fs');
+const log = process.env.OAM_NAPI_TEARDOWN_LOG;
+if (isMainThread) {
+  new Worker(__filename).on('exit', (code) => {
+    fs.appendFileSync(log, `main:worker-exit ${code}\\n`);
+  });
+} else {
+  const native = require('./native.node');
+  globalThis.keep = [native.wrapCounter(), native.wrapCounter()];
+  let calls = 0;
+  globalThis.__oamTeardownCall = () => {
+    fs.appendFileSync(log, `js:call ${++calls}\\n`);
+    throw new Error('thrown at teardown');
+  };
+  fs.appendFileSync(log, 'worker:end\\n');
+}
+";
+    let log = write_temp("napi_teardown_throwing_steps/teardown.log", "");
+    write_temp("napi_teardown_throwing_steps/main.cjs", script);
+    let main = dir.join("main.cjs");
+    let out = bounded_output(
+        oam_command(&["run", main.to_str().unwrap()])
+            .env("OAM_NAPI_TEARDOWN_LOG", &log)
+            .env("OAM_NAPI_TEARDOWN_CALL", "31f"),
+    );
+    let lines: Vec<String> = std::fs::read_to_string(&log)
+        .expect("read the teardown log")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_clean_exit(&out, &lines);
+    assert!(lines.len() >= 13, "{lines:?}");
+    assert_eq!(
+        lines[..13],
+        [
+            "worker:end",
+            "hook:3",
+            "js:call 1",
+            "call:status=10",
+            "hook:1",
+            "js:call 2",
+            "call:status=10",
+            "finalize",
+            "js:call 3",
+            "call:status=10",
+            "finalize",
+            "js:call 4",
+            "call:status=10"
+        ],
+        "{lines:?}"
+    );
+    let mut rest: Vec<&str> = lines[13..].iter().map(String::as_str).collect();
     rest.sort_unstable();
     assert_eq!(rest, ["main:worker-exit 0", "unload:status=1"], "{lines:?}");
 }
@@ -12859,6 +13022,42 @@ server.close();
     );
 }
 
+/// The native under `tls.connect({ socket })` names its pipe by handle id,
+/// and an argument that names none -- absent, NaN, negative, fractional --
+/// is refused where the op reads it. Only a negative one was: a missing
+/// argument is NaN, which the `< 0` test let through, so the op went on to
+/// look up pipe 0 and (for 1.5) pipe 1.
+#[test]
+fn tls_connect_over_refuses_an_argument_that_names_no_pipe() {
+    let stdout = run_ok(
+        "tls_connect_over_no_pipe.cjs",
+        r#"
+const natives = globalThis.__oam.node;
+for (const pipe of [undefined, NaN, -1, 1.5, 'pipe']) {
+  let outcome;
+  try {
+    const pending = natives.tlsConnectOver(pipe, 'localhost');
+    // Not refused: whatever the handshake over the wrong pipe comes to is
+    // not this test's business, only that it was started.
+    if (pending && typeof pending.then === 'function') pending.then(() => {}, () => {});
+    outcome = 'started';
+  } catch (e) {
+    outcome = e.name + ': ' + e.message;
+  }
+  console.log(String(pipe) + ' -> ' + outcome);
+}
+"#,
+    );
+    let refused = "TypeError: tlsConnectOver requires a pipe";
+    assert_eq!(
+        stdout.replace('\r', ""),
+        format!(
+            "undefined -> {refused}\nNaN -> {refused}\n-1 -> {refused}\n1.5 -> {refused}\n\
+             pipe -> {refused}"
+        )
+    );
+}
+
 /// The real https-proxy-agent tunnels an https request as it does under node:
 /// a CONNECT to the proxy, then TLS to the target over the proxy's socket
 /// (`tls.connect({ socket })`), checked against the target's own certificate
@@ -19330,6 +19529,45 @@ fn process_stdout_write_invokes_callback() {
     );
 }
 
+/// Bytes that are not UTF-8 reach a stderr that is a pipe exactly as
+/// written, and the write reports no error. The other half of the same rule
+/// needs a real Windows console, which no test here has: there the bytes
+/// are decoded for WriteConsoleW with U+FFFD for what does not decode, as
+/// stdout's are (`console_utf16`'s unit tests), where std's console writer
+/// used to fail the write. This pins the half the console path must leave
+/// alone.
+#[test]
+fn process_stderr_passes_non_utf8_bytes_to_a_pipe_untouched() {
+    let main = write_temp(
+        "stderr_raw_bytes.cjs",
+        "process.stderr.on('error', (e) => console.log('error event ' + e.code));\n\
+         process.stderr.write(Buffer.from([0x61, 0xff, 0xfe, 0x62, 0xe2, 0x82]), (e) => {\n\
+           console.log('first ' + (e == null ? 'ok' : e.code));\n\
+           process.stderr.write(Buffer.from([0xac, 0x0a]), (e) => {\n\
+             console.log('second ' + (e == null ? 'ok' : e.code));\n\
+           });\n\
+         });\n",
+    );
+    let out = oam(&["run", main.to_str().unwrap(), "--no-check"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .replace('\r', ""),
+        "first ok\nsecond ok"
+    );
+    let written: &[u8] = b"a\xff\xfeb\xe2\x82\xac\n";
+    assert!(
+        out.stderr.windows(written.len()).any(|at| at == written),
+        "stderr: {:?}",
+        out.stderr
+    );
+}
+
 #[test]
 fn writable_write_after_end_without_error_listener_does_not_crash() {
     // Bug: Writable.write on an already-ended stream emitted 'error'
@@ -22375,6 +22613,597 @@ fn os_and_process_native_values() {
     );
 }
 
+/// os.homedir() is libuv's uv_os_homedir: one variable (USERPROFILE on
+/// Windows, HOME elsewhere), read from process.env so that a program's own
+/// assignment moves it, and the account database only when it is unset.
+/// Each expectation was measured on node v22.22.2 (Windows) / v22.23.2
+/// (Linux). oam read USERPROFILE, then HOME, on every platform, from the
+/// environment it was started with, and answered "" with neither set.
+#[test]
+fn os_homedir_reads_process_env_then_the_account_as_libuv_does() {
+    let main = write_temp(
+        "os_homedir_env.cjs",
+        r#"
+const os = require('os');
+const { Worker, isMainThread, parentPort } = require('worker_threads');
+if (!isMainThread) {
+  parentPort.postMessage(os.homedir());
+  return;
+}
+const win = process.platform === 'win32';
+const name = win ? 'USERPROFILE' : 'HOME';
+const check = (label, ok) => console.log(label + ': ' + (ok === true));
+const attempt = (fn) => {
+  try { return 'value ' + fn(); } catch (e) { return 'threw ' + e.code + ' ' + (e.info && e.info.code); }
+};
+
+// The platform's own variable and no other: a unix run is started with a
+// USERPROFILE as well (WSL exports one), which used to win.
+check('launch', os.homedir() === process.env[name]);
+
+const elsewhere = win ? 'C:\\somewhere\\else' : '/somewhere/else';
+process.env[name] = elsewhere;
+check('assigned', os.homedir() === elsewhere);
+
+// A worker with its own process.env still answers from the environment its
+// creator has, not from its own (empty) copy. The variable stays as it is
+// until the worker has answered: node's worker reads it at the call, oam's
+// as it was when the worker was made.
+new Worker(__filename, { env: {} }).once('message', (home) => {
+  check('worker', home === elsewhere);
+  theRest();
+});
+
+function theRest() {
+if (win) {
+  // libuv: a USERPROFILE of fewer than three bytes is ENOENT.
+  for (const short of ['', 'ab']) {
+    process.env.USERPROFILE = short;
+    check('short ' + short.length, attempt(() => os.homedir()) === 'threw ERR_SYSTEM_ERROR ENOENT');
+  }
+  process.env.USERPROFILE = 'abc';
+  check('three bytes', os.homedir() === 'abc');
+} else {
+  // Set but empty is still set.
+  process.env.HOME = '';
+  check('empty', os.homedir() === '');
+}
+
+// Unset: the account's own directory, which os.userInfo() reports too (or
+// the same refusal, for a uid with no passwd record) -- never the value the
+// process was started with.
+delete process.env[name];
+const unset = attempt(() => os.homedir());
+check('unset', unset === attempt(() => os.userInfo().homedir));
+check('unset is not the launch value', win || unset !== 'value ' + process.env.LAUNCH_HOME);
+}
+"#,
+    );
+    let launch_home = main.parent().unwrap().to_path_buf();
+    let mut cmd = oam_command(&["run", main.to_str().unwrap(), "--no-check"]);
+    if !cfg!(windows) {
+        cmd.env("HOME", &launch_home)
+            .env("LAUNCH_HOME", &launch_home)
+            .env("USERPROFILE", "/other/profile");
+    }
+    let out = cmd.output_within_deadline();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut required = vec![
+        "launch:",
+        "assigned:",
+        "worker:",
+        "unset:",
+        "unset is not the launch value:",
+    ];
+    if cfg!(windows) {
+        required.extend(["short 0:", "short 2:", "three bytes:"]);
+    } else {
+        required.push("empty:");
+    }
+    assert_true_lines(stdout.trim(), &required);
+}
+
+/// A worker made with its own `env` by a SHARE_ENV worker reads os.homedir()
+/// from the shared environment as it is when the inner worker is made, so a
+/// HOME (USERPROFILE on Windows) the SHARE_ENV worker assigned is the inner
+/// worker's answer, as in node (measured on v22.22.2 Windows and v22.23.2
+/// Linux: both `true`). oam handed the inner worker the SHARE_ENV worker's
+/// own creation-time snapshot instead, and it answered the launch value.
+#[test]
+fn os_homedir_of_a_worker_made_by_a_share_env_worker_reads_the_shared_env() {
+    let stdout = run_ok(
+        "os_homedir_share_env_nested.cjs",
+        r#"
+const os = require('os');
+const { Worker, isMainThread, parentPort, workerData, SHARE_ENV } = require('worker_threads');
+const name = process.platform === 'win32' ? 'USERPROFILE' : 'HOME';
+const elsewhere = process.platform === 'win32' ? 'C:\\shared\\home' : '/shared/home';
+if (isMainThread) {
+  new Worker(__filename, { env: SHARE_ENV, workerData: 'shared' }).once('message', (inner) => {
+    console.log('inner: ' + (inner === elsewhere ? 'true' : 'got ' + JSON.stringify(inner)));
+    console.log('main: ' + (os.homedir() === elsewhere));
+  });
+} else if (workerData === 'shared') {
+  process.env[name] = elsewhere;
+  new Worker(__filename, { env: {}, workerData: 'inner' }).once('message', (home) => {
+    parentPort.postMessage(home);
+  });
+} else {
+  parentPort.postMessage(os.homedir());
+}
+"#,
+    );
+    assert_true_lines(&stdout, &["inner:", "main:"]);
+}
+
+/// A SHARE_ENV worker made by a worker with its own `env` shares that
+/// worker's custom object, not the process's real environment: its
+/// os.homedir() and -- on Windows -- the USERPROFILE libuv adds to a child it
+/// spawns come from the real (main thread's) environment, before and after
+/// it assigns the variable in the store it shares. Measured on node v22.22.2
+/// (Windows) and v22.23.2 (Linux): every line `true`. oam read the shared
+/// store, the creator's own object, so `own` / `wrote` leaked into both. The
+/// main -> SHARE_ENV -> `env: {}` shape is checked for the child here too:
+/// there the shared store is the real environment, and the inner worker's
+/// child gets the USERPROFILE the SHARE_ENV worker assigned. So is a chain
+/// of SHARE_ENV workers from the main thread: the last one reads the store,
+/// live, after its own assignment.
+#[test]
+fn a_share_env_worker_of_a_worker_with_its_own_env_reads_the_real_env() {
+    let stdout = run_ok(
+        "share_env_of_own_env_worker.cjs",
+        r#"
+const os = require('os');
+const cp = require('child_process');
+const { Worker, isMainThread, parentPort, workerData, SHARE_ENV } = require('worker_threads');
+const win = process.platform === 'win32';
+const name = win ? 'USERPROFILE' : 'HOME';
+const at = (dir) => (win ? 'C:\\' + dir.replace(/\//g, '\\') : '/' + dir);
+const real = at('real/home');
+const shared = at('shared/home');
+// The USERPROFILE libuv adds to a child spawned with an env that lacks it
+// (null off Windows, where nothing is added).
+const childProfile = () => {
+  if (!win) return null;
+  const r = cp.spawnSync(
+    process.execPath,
+    ['-e', 'process.stdout.write(String(process.env.USERPROFILE))'],
+    { env: { SystemRoot: process.env.SystemRoot }, encoding: 'utf8' },
+  );
+  return r.stdout;
+};
+const report = () => ({ home: os.homedir(), child: childProfile() });
+const run = (env, data) =>
+  new Promise((resolve) => new Worker(__filename, { env, workerData: data }).once('message', resolve));
+if (isMainThread) {
+  process.env[name] = real;
+  const want = { home: real, child: win ? real : null };
+  const check = (label, got, expected = want) => {
+    const ok = JSON.stringify(got) === JSON.stringify(expected);
+    console.log(label + ': ' + (ok ? 'true' : 'got ' + JSON.stringify(got)));
+  };
+  (async () => {
+    for (const [label, env] of [['own', { [name]: at('w1/own') }], ['empty', {}]]) {
+      const r = await run(env, 'outer');
+      check(label + ' outer', r.outer);
+      check(label + ' inner before', r.inner.before);
+      check(label + ' inner after', r.inner.after);
+    }
+    const r = await run(SHARE_ENV, 'sharing');
+    check('shared inner', r, { home: shared, child: win ? shared : null });
+    const chained = at('chained/home');
+    const c = await run(SHARE_ENV, 'chain');
+    check('chained share', c, { home: chained, child: win ? chained : null });
+  })();
+} else if (workerData === 'chain') {
+  // A SHARE_ENV worker re-sharing the real environment: still the real one.
+  run(SHARE_ENV, 'chain end').then((r) => parentPort.postMessage(r));
+} else if (workerData === 'chain end') {
+  process.env[name] = at('chained/home');
+  parentPort.postMessage(report());
+} else if (workerData === 'outer') {
+  const outer = report();
+  run(SHARE_ENV, 'inner').then((inner) => parentPort.postMessage({ outer, inner }));
+} else if (workerData === 'inner') {
+  const before = report();
+  process.env[name] = at('w2/wrote');
+  parentPort.postMessage({ before, after: report() });
+} else if (workerData === 'sharing') {
+  process.env[name] = shared;
+  run({}, 'leaf').then((leaf) => parentPort.postMessage(leaf));
+} else {
+  parentPort.postMessage(report());
+}
+"#,
+    );
+    assert_true_lines(
+        &stdout,
+        &[
+            "own outer:",
+            "own inner before:",
+            "own inner after:",
+            "empty outer:",
+            "empty inner before:",
+            "empty inner after:",
+            "shared inner:",
+            "chained share:",
+        ],
+    );
+}
+
+/// os.tmpdir() is node's: over process.env (so `process.env.TMPDIR = dir`
+/// redirects it), TMPDIR / TMP / TEMP in that order off Windows and TEMP /
+/// TMP there, an empty variable skipped, and one trailing separator removed
+/// unless what is left would not be the same directory. Each expectation
+/// was measured on node v22.22.2 (Windows) / v22.23.2 (Linux). oam answered
+/// from the environment it was started with, by std's rules: TMPDIR only
+/// off Windows, TMP before TEMP on it, and a root stripped to "" or `C:`.
+#[test]
+fn os_tmpdir_follows_process_env_in_nodes_order() {
+    let stdout = run_ok(
+        "os_tmpdir_env.cjs",
+        r#"
+const os = require('os');
+const win = process.platform === 'win32';
+const tmpdir = (vars) => {
+  for (const name of ['TMPDIR', 'TMP', 'TEMP']) delete process.env[name];
+  Object.assign(process.env, vars);
+  return os.tmpdir();
+};
+const check = (label, vars, want) => {
+  const got = tmpdir(vars);
+  console.log(label + ': ' + (got === want ? 'true' : 'got ' + JSON.stringify(got)));
+};
+if (win) {
+  check('TEMP first', { TMPDIR: 'C:\\zzz', TMP: 'C:\\b', TEMP: 'C:\\a' }, 'C:\\a');
+  check('then TMP', { TMPDIR: 'C:\\zzz', TMP: 'C:\\b' }, 'C:\\b');
+  check('empty is unset', { TEMP: '', TMP: 'C:\\b' }, 'C:\\b');
+  check('none', {}, (process.env.SystemRoot || process.env.windir) + '\\temp');
+  check('root kept', { TEMP: 'C:\\' }, 'C:\\');
+  check('one separator off', { TEMP: 'C:\\a\\' }, 'C:\\a');
+  check('only one', { TEMP: 'C:\\a\\\\' }, 'C:\\a\\');
+} else {
+  check('TMPDIR first', { TMPDIR: '/a', TMP: '/b', TEMP: '/c' }, '/a');
+  check('then TMP', { TMP: '/b', TEMP: '/c' }, '/b');
+  check('then TEMP', { TEMP: '/c' }, '/c');
+  check('empty is unset', { TMPDIR: '', TMP: '/x' }, '/x');
+  check('none', {}, '/tmp');
+  check('root kept', { TMPDIR: '/' }, '/');
+  check('one separator off', { TMPDIR: '/a/' }, '/a');
+  check('only one', { TMPDIR: '/a//' }, '/a/');
+}
+"#,
+    );
+    let mut required = vec![
+        "then TMP:",
+        "empty is unset:",
+        "none:",
+        "root kept:",
+        "one separator off:",
+        "only one:",
+    ];
+    if cfg!(windows) {
+        required.push("TEMP first:");
+    } else {
+        required.extend(["TMPDIR first:", "then TEMP:"]);
+    }
+    assert_true_lines(&stdout, &required);
+}
+
+/// Under `--permission` without an env grant, a variable the grant hides
+/// reads as UNSET everywhere, os.tmpdir() and os.homedir() included, in the
+/// main thread and in every kind of worker: os.tmpdir() is `/tmp` off
+/// Windows and, on Windows, the Windows directory the OS reports + `\temp`
+/// (node's `SystemRoot` fallback, which the grant hides too); os.homedir() is
+/// the account's own directory (the passwd record of the effective uid, the
+/// Windows profile directory), never the launch value. With the grant, or
+/// without the permission model, both are the variables' values, as in node.
+///
+/// Deleting the variables answers the same unset fallbacks in every mode,
+/// with one Windows difference: deleted rather than hidden, `SystemRoot` and
+/// `windir` give node's literal `undefined\temp`. And unset, os.homedir() on
+/// Windows is the profile directory GetUserProfileDirectoryW reports, never
+/// the USERPROFILE oam was started with (std's lookup answered that).
+#[test]
+fn os_dirs_read_a_variable_the_env_grant_hides_as_unset() {
+    let script = write_temp(
+        "os_dirs_env_grant.cjs",
+        r#"
+const { Worker, SHARE_ENV, isMainThread, parentPort } = require('worker_threads');
+const os = require('os');
+const homeOf = () => { try { return os.homedir(); } catch (e) { return 'threw ' + e.code; } };
+const here = () => ({ tmpdir: os.tmpdir(), homedir: homeOf() });
+if (!isMainThread) {
+  parentPort.postMessage(here());
+} else {
+  const run = (env) => new Promise((resolve, reject) => {
+    const w = new Worker(__filename, { env });
+    w.on('message', resolve);
+    w.on('error', reject);
+  });
+  const lines = ['secret=' + (process.env.OS_DIRS_SECRET ?? 'unset')];
+  const put = (label, got) => lines.push(label + ' tmpdir=' + got.tmpdir, label + ' homedir=' + got.homedir);
+  (async () => {
+    put('main', here());
+    put('copy', await run(undefined));
+    put('shared', await run(SHARE_ENV));
+    put('spread', await run({ ...process.env }));
+    for (const name of ['TMPDIR', 'TMP', 'TEMP', 'SystemRoot', 'windir', 'HOME', 'USERPROFILE']) {
+      delete process.env[name];
+    }
+    put('deleted', here());
+    put('deleted copy', await run(undefined));
+    console.log(lines.join('\n'));
+  })();
+}
+"#,
+    );
+    let path = script.to_string_lossy().to_string();
+    let vars: &[(&str, &str)] = if cfg!(windows) {
+        &[
+            ("TEMP", "C:\\launch-a\\"),
+            ("TMP", "C:\\launch-b"),
+            ("USERPROFILE", "C:\\launch-home"),
+            ("OS_DIRS_SECRET", "s3cret"),
+        ]
+    } else {
+        &[
+            ("TMPDIR", "/launch-a/"),
+            ("TMP", "/launch-b"),
+            ("TEMP", "/launch-c"),
+            ("HOME", "/launch-home"),
+            ("OS_DIRS_SECRET", "s3cret"),
+        ]
+    };
+    let unset = OsDirsUnset::find();
+    for (flags, hidden) in OS_DIRS_MODES {
+        let (secret, tmpdir, homedir) = if hidden {
+            ("unset", unset.hidden_tmpdir(), unset.homedir.as_str())
+        } else if cfg!(windows) {
+            ("s3cret", "C:\\launch-a".to_string(), "C:\\launch-home")
+        } else {
+            ("s3cret", "/launch-a".to_string(), "/launch-home")
+        };
+        let mut expected = vec![format!("secret={secret}")];
+        for label in ["main", "copy", "shared", "spread"] {
+            expected.push(format!("{label} tmpdir={tmpdir}"));
+            expected.push(format!("{label} homedir={homedir}"));
+        }
+        let deleted_tmpdir = if hidden {
+            unset.hidden_tmpdir()
+        } else {
+            unset.deleted_tmpdir()
+        };
+        for label in ["deleted", "deleted copy"] {
+            expected.push(format!("{label} tmpdir={deleted_tmpdir}"));
+            expected.push(format!("{label} homedir={}", unset.homedir));
+        }
+        let out = oam_with_env(&os_dirs_args(flags, &path), vars);
+        assert_os_dirs_lines(&out, flags, &expected);
+    }
+}
+
+/// os.homedir() reads the thread's environment store, never an object the
+/// program put where process.env was (libuv's uv_os_homedir reads the
+/// process environment); os.tmpdir() reads that store off Windows (node's
+/// GetTempDir) and on Windows whatever object process.env now is (node's
+/// lib/os.js), so an own TEMP in it wins there and `process.env = {}` falls
+/// through to SystemRoot -- unset in that object, so `undefined\temp` as in
+/// node, or the OS's Windows directory where the env grant hides it. A
+/// Worker made with no `env` while process.env is replaced copies the store,
+/// not the object; one given an `env` object has that environment for
+/// os.tmpdir() and its creator's for os.homedir(). Measured on node v22.23.2
+/// (Linux) and v22.22.2 (Windows). Under a denied env grant the store holds
+/// none of the variables, so the same reads give the unset answers.
+#[test]
+fn os_dirs_read_the_thread_store_not_a_replaced_process_env() {
+    let script = write_temp(
+        "os_dirs_replaced_env.cjs",
+        r#"
+const { Worker, isMainThread, parentPort } = require('worker_threads');
+const os = require('os');
+const win = process.platform === 'win32';
+const homeOf = () => { try { return os.homedir(); } catch (e) { return 'threw ' + e.code; } };
+const here = () => ({ tmpdir: os.tmpdir(), homedir: homeOf() });
+if (!isMainThread) {
+  parentPort.postMessage(here());
+} else {
+  const run = (options) => new Promise((resolve, reject) => {
+    const w = new Worker(__filename, options);
+    w.on('message', resolve);
+    w.on('error', reject);
+  });
+  const lines = [];
+  const put = (label, got) => lines.push(label + ' tmpdir=' + got.tmpdir, label + ' homedir=' + got.homedir);
+  (async () => {
+    const saved = process.env;
+    process.env = win
+      ? { TEMP: 'C:\\own', USERPROFILE: 'C:\\own-home' }
+      : { TMPDIR: '/own', HOME: '/own-home' };
+    put('replaced', here());
+    put('worker made while replaced', await run({}));
+    process.env = {};
+    put('replaced empty', here());
+    process.env = saved;
+    put('restored', here());
+    put('worker env object', await run({ env: { OS_DIRS_UNRELATED: '1' } }));
+    console.log(lines.join('\n'));
+  })();
+}
+"#,
+    );
+    let path = script.to_string_lossy().to_string();
+    let vars: &[(&str, &str)] = if cfg!(windows) {
+        &[
+            ("TEMP", "C:\\launch-a"),
+            ("TMP", "C:\\launch-b"),
+            ("USERPROFILE", "C:\\launch-home"),
+        ]
+    } else {
+        &[
+            ("TMPDIR", "/launch-a"),
+            ("TMP", "/launch-b"),
+            ("TEMP", "/launch-c"),
+            ("HOME", "/launch-home"),
+        ]
+    };
+    let unset = OsDirsUnset::find();
+    for (flags, hidden) in OS_DIRS_MODES {
+        let (tmpdir, homedir) = if hidden {
+            (unset.hidden_tmpdir(), unset.homedir.clone())
+        } else if cfg!(windows) {
+            ("C:\\launch-a".to_string(), "C:\\launch-home".to_string())
+        } else {
+            ("/launch-a".to_string(), "/launch-home".to_string())
+        };
+        // What the os.tmpdir() of an environment without TEMP / TMP /
+        // SystemRoot answers: node's on a deleted SystemRoot, the OS's
+        // directory on a hidden one.
+        let bare_tmpdir = if hidden {
+            unset.hidden_tmpdir()
+        } else {
+            unset.deleted_tmpdir()
+        };
+        let (replaced_tmpdir, empty_tmpdir) = if cfg!(windows) {
+            ("C:\\own".to_string(), bare_tmpdir.clone())
+        } else {
+            (tmpdir.clone(), tmpdir.clone())
+        };
+        let mut expected = Vec::new();
+        for (label, tmp) in [
+            ("replaced", &replaced_tmpdir),
+            ("worker made while replaced", &tmpdir),
+            ("replaced empty", &empty_tmpdir),
+            ("restored", &tmpdir),
+            ("worker env object", &bare_tmpdir),
+        ] {
+            expected.push(format!("{label} tmpdir={tmp}"));
+            expected.push(format!("{label} homedir={homedir}"));
+        }
+        let out = oam_with_env(&os_dirs_args(flags, &path), vars);
+        assert_os_dirs_lines(&out, flags, &expected);
+    }
+}
+
+/// The three ways the os-dirs tests run a script, each with whether the env
+/// grant hides the variables: under `--permission` without an env grant,
+/// with one, and without the model. Workers need the worker grant and to
+/// read the script.
+const OS_DIRS_MODES: [(&[&str], bool); 3] = [
+    (
+        &["--permission", "--allow-worker", "--allow-fs-read=*"],
+        true,
+    ),
+    (
+        &[
+            "--permission",
+            "--allow-env",
+            "--allow-worker",
+            "--allow-fs-read=*",
+        ],
+        false,
+    ),
+    (&["run"], false),
+];
+
+/// The command line for one of `OS_DIRS_MODES`.
+fn os_dirs_args<'a>(flags: &[&'a str], path: &'a str) -> Vec<&'a str> {
+    let mut args: Vec<&str> = flags.to_vec();
+    if flags != ["run"] {
+        args.push("--");
+    }
+    args.push(path);
+    args
+}
+
+/// What os.tmpdir() and os.homedir() answer with their variables unset,
+/// found without oam.
+struct OsDirsUnset {
+    /// The account's own directory: the passwd record of this user (the
+    /// shell's `~name` expansion of `id -un`, the effective user), or on
+    /// Windows the profile directory, which the test process's own
+    /// USERPROFILE names.
+    homedir: String,
+    /// The Windows directory (the test process's SystemRoot); unused
+    /// elsewhere.
+    windows_dir: String,
+}
+
+impl OsDirsUnset {
+    fn find() -> Self {
+        if cfg!(windows) {
+            let var = |name: &str| {
+                std::env::var(name).unwrap_or_else(|_| panic!("the test runs with a {name}"))
+            };
+            return Self {
+                homedir: var("USERPROFILE"),
+                windows_dir: var("SystemRoot"),
+            };
+        }
+        let out = std::process::Command::new("sh")
+            .args(["-c", r#"eval "printf %s ~$(id -un)""#])
+            .output()
+            .expect("sh runs");
+        let homedir = String::from_utf8(out.stdout).expect("a UTF-8 home directory");
+        assert!(
+            homedir.starts_with('/'),
+            "this user has no passwd home directory: {homedir:?}"
+        );
+        Self {
+            homedir,
+            windows_dir: String::new(),
+        }
+    }
+
+    /// os.tmpdir() with TMPDIR / TMP / TEMP (TEMP / TMP on Windows) unset
+    /// and, on Windows, SystemRoot and windir hidden by the env grant.
+    fn hidden_tmpdir(&self) -> String {
+        if cfg!(windows) {
+            format!("{}\\temp", self.windows_dir)
+        } else {
+            "/tmp".to_string()
+        }
+    }
+
+    /// The same with every variable deleted (or never set): node's
+    /// `undefined\temp` on Windows.
+    fn deleted_tmpdir(&self) -> String {
+        if cfg!(windows) {
+            "undefined\\temp".to_string()
+        } else {
+            "/tmp".to_string()
+        }
+    }
+}
+
+/// A run of an os-dirs script succeeded and printed exactly `expected`, one
+/// line each, in order. Paths compare without case on Windows, where the
+/// OS's spelling of a directory (`C:\WINDOWS`) need not be the variable's.
+fn assert_os_dirs_lines(out: &Output, flags: &[&str], expected: &[String]) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{flags:?}: exit {}\nstdout: {stdout}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let fold = |line: &str| {
+        if cfg!(windows) {
+            line.to_lowercase()
+        } else {
+            line.to_string()
+        }
+    };
+    let got: Vec<String> = stdout.lines().map(fold).collect();
+    let want: Vec<String> = expected.iter().map(|line| fold(line.as_str())).collect();
+    assert_eq!(got, want, "{flags:?}\nfull output: {stdout}");
+}
+
 /// Every line of `stdout` is a `label: true` check that passed, AND every
 /// label in `required` was printed. The loop alone is vacuous on missing
 /// lines: a check printed from a callback that never fires, or a run that
@@ -23863,6 +24692,127 @@ console.log('done:', true);
         !stderr.contains("fwd-marker-piped"),
         "an explicit stdio keeps the child's stderr with the caller\nstderr: {stderr}"
     );
+}
+
+/// `spawnSync`'s `killSignal` is what ends a child that outlives `timeout`,
+/// and `result.signal` is how the child really went. The kill used to be an
+/// unconditional SIGKILL reported as 'SIGTERM' whatever was asked for: a
+/// child could not trap the default SIGTERM, and `killSignal` was never read.
+/// On POSIX the signal is delivered (a trapping child exits by its own code,
+/// with the timeout still the error); on Windows, where every kill is a
+/// termination, the result names the requested signal. A bad `killSignal`
+/// throws before anything is spawned, as node's argument check does. A
+/// `maxBuffer` overflow sends the same signal a timeout does.
+///
+/// When it sends the signal oam also closes its ends of the child's pipes,
+/// as node does, so a child that survives the signal cannot block for ever
+/// on output nobody reads (it used to, and `spawnSync` with it): a writer
+/// that ignores the signal meets a closed pipe, and so does a handler that
+/// prints before it exits. Every POSIX expectation below is node v22.23.2's
+/// result for the same call on Linux (three runs each, all alike).
+#[test]
+fn spawn_sync_timeout_delivers_and_reports_kill_signal() {
+    let path = write_temp(
+        "spawn_sync_kill_signal.mjs",
+        r#"import { spawnSync } from 'node:child_process';
+import os from 'node:os';
+const win = process.platform === 'win32';
+const [cmd, args] = win
+  ? [process.execPath, ['-e', 'setTimeout(() => {}, 60000)']]
+  : ['sleep', ['30']];
+const ended = (r, signal) =>
+  r.error !== undefined && r.error.code === 'ETIMEDOUT' && r.status === null && r.signal === signal;
+
+console.log('default_is_sigterm:', ended(spawnSync(cmd, args, { timeout: 300 }), 'SIGTERM'));
+console.log('by_name:', ended(spawnSync(cmd, args, { timeout: 300, killSignal: 'SIGKILL' }), 'SIGKILL'));
+console.log('by_lowercase_name:', ended(spawnSync(cmd, args, { timeout: 300, killSignal: 'sigkill' }), 'SIGKILL'));
+console.log('by_number:', ended(spawnSync(cmd, args, { timeout: 300, killSignal: os.constants.signals.SIGKILL }), 'SIGKILL'));
+
+let unknown;
+try { spawnSync(cmd, args, { timeout: 2000, killSignal: 'SIGNOPE' }); } catch (e) { unknown = e; }
+console.log('unknown_signal:', unknown !== undefined && unknown.code === 'ERR_UNKNOWN_SIGNAL');
+let badType;
+try { spawnSync(cmd, args, { timeout: 2000, killSignal: {} }); } catch (e) { badType = e; }
+console.log('bad_type:', badType !== undefined && badType.code === 'ERR_INVALID_ARG_TYPE');
+
+// An overflow is ended with killSignal too. The timeout only bounds a
+// regression; the limit is crossed by the first write.
+const writer = "setInterval(() => process.stdout.write('y'.repeat(65536)), 5)";
+const over = spawnSync(process.execPath, ['-e', writer], { maxBuffer: 1024, killSignal: 'SIGKILL', timeout: 60000 });
+console.log('max_buffer_kill_signal:',
+  over.error !== undefined && over.error.code === 'ENOBUFS' && over.status === null && over.signal === 'SIGKILL');
+
+if (!win) {
+  const sh = (script, options) => spawnSync('sh', ['-c', script], { encoding: 'utf8', ...options });
+  const went = (r, code, status, signal) =>
+    r.error !== undefined && r.error.code === code && r.status === status && r.signal === signal;
+  const show = (label, ok, r) =>
+    console.log(label + ':', ok || JSON.stringify([r.error && r.error.code, r.status, r.signal, r.stdout.length]));
+
+  // The trap runs between two short sleeps, so the shell is never waiting
+  // long on a foreground command when the signal arrives. A handler that
+  // only exits reports its own code.
+  const loop = 'trap "exit 7" TERM; while :; do sleep 0.05; done';
+  let r = sh(loop, { timeout: 300 });
+  show('sigterm_is_catchable', went(r, 'ETIMEDOUT', 7, null), r);
+  // One that prints first writes into a pipe that closed when the signal was
+  // sent, and dies of SIGPIPE; what it printed is not in the result. (The
+  // shell runs the trap when the foreground sleep returns, long after.)
+  r = sh('trap "echo trapped; exit 7" TERM; sleep 1', { timeout: 200 });
+  show('trap_output_meets_a_closed_pipe', went(r, 'ETIMEDOUT', null, 'SIGPIPE') && r.stdout === '', r);
+  r = sh(loop, { timeout: 500, killSignal: 'SIGKILL' });
+  show('sigkill_is_not', went(r, 'ETIMEDOUT', null, 'SIGKILL'), r);
+  console.log('other_signal:', ended(spawnSync(cmd, args, { timeout: 300, killSignal: 'SIGUSR1' }), 'SIGUSR1'));
+
+  // A child that ignores the signal and never stops writing. Under a
+  // timeout the shell is the writer, and SIGPIPE is what ends it; past
+  // maxBuffer it is `yes`, which inherits the ignored SIGTERM, dies of
+  // SIGPIPE, and leaves the shell to exit 3.
+  r = sh('trap "" TERM; while :; do echo y; done', { timeout: 200, maxBuffer: 64 * 1024 * 1024 });
+  show('ignored_kill_under_timeout', went(r, 'ETIMEDOUT', null, 'SIGPIPE'), r);
+  r = sh('trap "" TERM; yes; exit 3', { maxBuffer: 1024 });
+  show('ignored_kill_past_max_buffer', went(r, 'ENOBUFS', 3, null), r);
+  // killSignal past maxBuffer: delivered, and the report is the child's.
+  r = sh('yes; exit 3', { maxBuffer: 1024, killSignal: 'SIGUSR1' });
+  show('max_buffer_delivers_kill_signal', went(r, 'ENOBUFS', null, 'SIGUSR1'), r);
+  r = sh('trap "exit 9" USR1; yes; exit 3', { maxBuffer: 1024, killSignal: 'SIGUSR1' });
+  show('max_buffer_kill_signal_is_catchable', went(r, 'ENOBUFS', 9, null), r);
+}
+console.log('done:', true);
+"#,
+    );
+    let out = oam(&["run", path.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "exit {}\nstdout: {stdout}\nstderr: {stderr}",
+        out.status
+    );
+    let mut required = vec![
+        "default_is_sigterm:",
+        "by_name:",
+        "by_lowercase_name:",
+        "by_number:",
+        "unknown_signal:",
+        "bad_type:",
+        "max_buffer_kill_signal:",
+        "done:",
+    ];
+    // The POSIX half: `sh`, real signals and SIGPIPE. Not run on Windows.
+    if cfg!(unix) {
+        required.extend([
+            "sigterm_is_catchable:",
+            "trap_output_meets_a_closed_pipe:",
+            "sigkill_is_not:",
+            "other_signal:",
+            "ignored_kill_under_timeout:",
+            "ignored_kill_past_max_buffer:",
+            "max_buffer_delivers_kill_signal:",
+            "max_buffer_kill_signal_is_catchable:",
+        ]);
+    }
+    assert_true_lines(&stdout, &required);
 }
 
 // ------------------------------------------------------------ diagnostics_channel stores / honest stubs
@@ -26224,6 +27174,9 @@ if (win) {
     if (verdict === 'ok' && e.syscall !== 'setuid') verdict = 'BAD:setuid-syscall-' + e.syscall;
     if (verdict === 'ok' && e.message !== 'EPERM, Operation not permitted') verdict = 'BAD:setuid-message-' + e.message;
   }
+  // node's getgroups() always holds the effective gid: it appends it when
+  // getgroups(2) left it out (a process with no supplementary groups).
+  if (verdict === 'ok' && !process.getgroups().includes(process.getegid())) verdict = 'getgroups-without-egid';
   console.log('posix_identity_calls=' + (
     verdict === 'ok' && typeof process.getuid() === 'number' && Array.isArray(process.getgroups())
       ? 'ok' : 'BAD:' + verdict));
@@ -34527,6 +35480,161 @@ for (const [label, alpn] of [['number', [5]], ['buffer', [Buffer.from('h2')]], [
             "number: TypeError ERR_INVALID_ARG_TYPE The \"string\" argument must be of type string or an instance of Buffer or ArrayBuffer. Received type number (5)",
             "buffer: TypeError ERR_INVALID_ARG_TYPE argument must be a string",
             "long: RangeError ERR_OUT_OF_RANGE The byte length of the protocol at index 0 exceeds the maximum length. It must be <= 255. Received 256",
+        ],
+        "stdout: {stdout}"
+    );
+}
+
+/// A server's `ALPNProtocols` is checked where node checks it, and nothing
+/// the native handshake would refuse gets as far as an accepted connection.
+/// A name over 255 bytes throws node's ERR_OUT_OF_RANGE at createServer();
+/// an empty name is taken at createServer() and passed over when a protocol
+/// is selected, so the names after it still count (the wire parse used to
+/// stop at it, and the connection went on with no protocol at all); an array
+/// assigned to `server.ALPNProtocols` afterwards is converted as the option
+/// was. Every line up to `done` is what node v22.23.2 prints for the script.
+///
+/// The last line is oam's own: an over-long name in an array assigned to a
+/// listening https server throws node's error from the assignment. Node
+/// accepts the assignment and throws the same error, uncaught, when the next
+/// connection arrives. Before, the native op refused it in its own words.
+#[test]
+fn tls_server_alpn_names_are_validated_at_create_server() {
+    let script = r#"const tls = require('tls');
+const https = require('https');
+const cert = `__CERT__`;
+const key = `__KEY__`;
+const create = (label, mod, alpn) => {
+  try {
+    const server = mod.createServer({ cert, key, ALPNProtocols: alpn });
+    server.on('tlsClientError', () => {});
+    server.on('clientError', () => {});
+    return server;
+  } catch (e) {
+    console.log(label + ': ' + e.name + ' ' + e.code + ' ' + e.message);
+  }
+};
+// What a client offering h2 and http/1.1 ends up with.
+const negotiate = (label, server, afterListen) =>
+  new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      if (afterListen) afterListen(server);
+      const client = tls.connect({
+        host: '127.0.0.1', port: server.address().port, rejectUnauthorized: false,
+        ALPNProtocols: ['h2', 'http/1.1'],
+      });
+      const done = (what) => {
+        console.log(label + ': ' + what);
+        client.destroy();
+        server.close();
+        resolve();
+      };
+      client.on('secureConnect', () => done('alpn=' + client.alpnProtocol));
+      client.on('error', (e) => done('error ' + e.code));
+    });
+  });
+(async () => {
+  create('tls long', tls, ['x'.repeat(256)]);
+  create('https long', https, ['x'.repeat(256)]);
+  await negotiate('tls empty then h2', create('', tls, ['', 'h2']));
+  await negotiate('tls h2 then empty', create('', tls, ['h2', '']));
+  await negotiate('tls wire with an empty entry', create('', tls, Buffer.from([0, 2, 0x68, 0x32])));
+  await negotiate('https empty then http/1.1', create('', https, ['', 'http/1.1']));
+  await negotiate('https http/1.1 then empty', create('', https, ['http/1.1', '']));
+  await negotiate('tls array assigned later', create('', tls, ['http/1.1']), (s) => { s.ALPNProtocols = ['h2']; });
+  await negotiate('https array assigned later', create('', https, ['http/1.1']), (s) => { s.ALPNProtocols = ['h2']; });
+  console.log('done');
+  // oam's own (see the test's doc): refused at the assignment.
+  const late = create('', https, ['http/1.1']);
+  late.listen(0, '127.0.0.1', () => {
+    try {
+      late.ALPNProtocols = ['x'.repeat(256)];
+      console.log('https long assigned later: no throw');
+    } catch (e) {
+      console.log('https long assigned later: ' + e.name + ' ' + e.code + ' ' + e.message);
+    }
+    late.close();
+  });
+})();
+"#
+    .replace("__CERT__", TLS_TEST_CERT)
+    .replace("__KEY__", TLS_TEST_KEY);
+    let stdout = run_ok("tls_server_alpn_names.cjs", &script);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "tls long: RangeError ERR_OUT_OF_RANGE The byte length of the protocol at index 0 exceeds the maximum length. It must be <= 255. Received 256",
+            "https long: RangeError ERR_OUT_OF_RANGE The byte length of the protocol at index 0 exceeds the maximum length. It must be <= 255. Received 256",
+            "tls empty then h2: alpn=h2",
+            "tls h2 then empty: alpn=h2",
+            "tls wire with an empty entry: alpn=h2",
+            "https empty then http/1.1: alpn=http/1.1",
+            "https http/1.1 then empty: alpn=http/1.1",
+            "tls array assigned later: alpn=h2",
+            "https array assigned later: alpn=h2",
+            "done",
+            "https long assigned later: RangeError ERR_OUT_OF_RANGE The byte length of the protocol at index 0 exceeds the maximum length. It must be <= 255. Received 256",
+        ],
+        "stdout: {stdout}"
+    );
+}
+
+/// A tls.Server whose `ALPNProtocols`, assigned after createServer, holds a
+/// name the conversion refuses throws node's error, uncaught, when the next
+/// connection arrives. With an 'uncaughtException' listener the process goes
+/// on, and so must the server: the refused connection is closed -- its
+/// TLSSocket was built over no handle, so destroying it alone left the TCP
+/// connection open and the client waiting on it -- and the next one, once
+/// the names are fixed, is served.
+#[test]
+fn tls_server_refused_alpn_at_accept_closes_the_connection() {
+    let script = r#"const tls = require('tls');
+const cert = `__CERT__`;
+const key = `__KEY__`;
+const server = tls.createServer({ cert, key });
+server.on('tlsClientError', () => {});
+const uncaught = [];
+process.on('uncaughtException', (e) => uncaught.push(e.code));
+const attempt = (label) => new Promise((resolve) => {
+  const client = tls.connect({
+    host: '127.0.0.1', port: server.address().port, rejectUnauthorized: false,
+  });
+  let secure = false;
+  client.setTimeout(5000, () => {
+    console.log(label + ': still open after 5 s');
+    client.destroy();
+  });
+  client.on('secureConnect', () => {
+    secure = true;
+    client.end();
+  });
+  client.on('error', () => {});
+  client.on('close', () => {
+    if (!client.timedOut) console.log(label + ': ' + (secure ? 'secure' : 'closed before the handshake'));
+    resolve();
+  });
+  client.on('timeout', () => { client.timedOut = true; });
+});
+server.listen(0, '127.0.0.1', async () => {
+  server.ALPNProtocols = ['x'.repeat(256)];
+  await attempt('refused');
+  server.ALPNProtocols = null;
+  await attempt('next');
+  console.log('uncaught ' + uncaught.join(','));
+  server.close();
+});
+"#
+    .replace("__CERT__", TLS_TEST_CERT)
+    .replace("__KEY__", TLS_TEST_KEY);
+    let stdout = run_ok("tls_server_refused_alpn_at_accept.cjs", &script);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "refused: closed before the handshake",
+            "next: secure",
+            "uncaught ERR_OUT_OF_RANGE",
         ],
         "stdout: {stdout}"
     );
@@ -48312,15 +49420,19 @@ fn cluster_fork_spawn_failure_emits_error_without_exit() {
 /// alone would count a zombie: a worker the primary killed but exited before
 /// reaping is re-parented to pid 1, and in a container without a reaping
 /// init it stays a zombie forever -- dead, but `kill -0` says alive.
+///
+/// A `ps` that cannot be run is a panic, not "dead". One that runs and exits
+/// non-zero has to read as dead, since that is also how `ps -p` reports a pid
+/// that is gone; so a caller whose verdict is "dead" first checks that the
+/// probe sees a process known to be alive (its own), which a `ps` without
+/// `-o stat= -p` fails.
 #[cfg(unix)]
 fn cluster_pid_alive(pid: u32) -> bool {
-    let Ok(out) = std::process::Command::new("ps")
+    let out = std::process::Command::new("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
         .stderr(std::process::Stdio::null())
         .output()
-    else {
-        return false;
-    };
+        .unwrap_or_else(|e| panic!("cannot run `ps` to probe pid {pid}: {e}"));
     let stat = String::from_utf8_lossy(&out.stdout);
     let stat = stat.trim();
     out.status.success() && !stat.is_empty() && !stat.starts_with('Z')
@@ -48334,6 +49446,13 @@ fn cluster_pid_alive(pid: u32) -> bool {
 /// its event loop, as node's does.
 #[cfg(unix)]
 fn cluster_worker_dies_with_its_primary(how: &str) {
+    // The verdict below is "the probe says dead", so the probe has to be shown
+    // to see a live process first: with a `ps` that rejects these options
+    // every pid reads as dead and the test would pass having observed nothing.
+    assert!(
+        cluster_pid_alive(std::process::id()),
+        "`ps -o stat= -p <pid>` does not see this test process; the liveness probe is unusable here"
+    );
     let dir = write_temp(&format!("cluster_orphan_{how}/.keep"), "")
         .parent()
         .unwrap()

@@ -1438,14 +1438,13 @@ mod tests {
     use super::*;
     #[cfg(feature = "napi")]
     use napi::{NAPI_ENV_DROP_COUNT, NAPI_ENV_KEPT_COUNT, NAPI_REF_PUSH_COUNT};
-    use std::sync::Mutex;
 
-    // Env-var tests share a process-wide environment. Serialize them so
-    // a parallel `cargo test` thread reading OAM_MAX_HEAP_MB doesn't see
-    // a value another test just set. The lock is held for the duration of
-    // the EnvGuard scope so the SET -- ASSERT -- DROP sequence is atomic
-    // from any other test's perspective.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // The heap-cap tests below hand `resolve_heap_cap_from` the value
+    // OAM_MAX_HEAP_MB would hold instead of setting the variable. They used
+    // to set it behind a lock only they took, while every other test in this
+    // binary that builds a runtime reads it, unlocked, on its own thread
+    // (`JsRuntime::new` -> `resolve_heap_cap`): a value set for one test was
+    // the heap cap of whichever runtime test started in that window.
 
     #[test]
     fn v8_pool_defaults_to_node_four_capped_by_cores() {
@@ -1492,51 +1491,9 @@ mod tests {
         assert_eq!(parse_pool_size("99999999999999999999999"), 0);
     }
 
-    /// RAII guard for env-var mutations in tests. Sets `OAM_MAX_HEAP_MB` on
-    /// construction and restores the prior value (or unsets it) on drop --
-    /// including the panic-during-assertion case where a bare `remove_var`
-    /// after the assert would be skipped by the unwinder. The guard holds
-    /// `ENV_LOCK` for its lifetime so parallel tests can't observe a
-    /// half-applied mutation.
-    struct HeapCapEnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        prior: Option<String>,
-    }
-
-    impl HeapCapEnvGuard {
-        fn set(value: &str) -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prior = std::env::var("OAM_MAX_HEAP_MB").ok();
-            // SAFETY: serialized by `_lock` above; no other thread reads this
-            // env var until we drop.
-            unsafe { std::env::set_var("OAM_MAX_HEAP_MB", value) };
-            Self { _lock: lock, prior }
-        }
-        fn unset() -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prior = std::env::var("OAM_MAX_HEAP_MB").ok();
-            // SAFETY: serialized by `_lock` above.
-            unsafe { std::env::remove_var("OAM_MAX_HEAP_MB") };
-            Self { _lock: lock, prior }
-        }
-    }
-
-    impl Drop for HeapCapEnvGuard {
-        fn drop(&mut self) {
-            match self.prior.as_deref() {
-                // SAFETY: serialized by `self._lock` (still held here), so no
-                // other thread reads OAM_MAX_HEAP_MB concurrently.
-                Some(v) => unsafe { std::env::set_var("OAM_MAX_HEAP_MB", v) },
-                // SAFETY: as above -- `self._lock` is still held.
-                None => unsafe { std::env::remove_var("OAM_MAX_HEAP_MB") },
-            }
-        }
-    }
-
     #[test]
     fn heap_cap_defaults_to_4gib_when_unset() {
-        let _g = HeapCapEnvGuard::unset();
-        let cap = resolve_heap_cap();
+        let cap = resolve_heap_cap_from(None, None);
         // Written as a two-branch assertion on purpose. This test used to
         // demand 4 GiB unconditionally, which was correct only because nothing
         // consulted the container limit; run inside a memory-limited container
@@ -1748,16 +1705,14 @@ mod tests {
     /// container-derived one) and whether it is attributed to the user, for
     /// the rows that must equal it.
     fn unset_heap_cap() -> (usize, bool) {
-        let _g = HeapCapEnvGuard::unset();
-        let cap = resolve_heap_cap();
+        let cap = resolve_heap_cap_from(None, None);
         (cap.mb, matches!(cap.source, HeapCapSource::User))
     }
 
     #[test]
     fn heap_cap_zero_falls_back_to_default() {
         let unset = unset_heap_cap();
-        let _g = HeapCapEnvGuard::set("0");
-        let cap = resolve_heap_cap();
+        let cap = resolve_heap_cap_from(None, Some("0".into()));
         assert_eq!(
             (cap.mb, matches!(cap.source, HeapCapSource::User)),
             unset,
@@ -1770,8 +1725,7 @@ mod tests {
     #[test]
     fn heap_cap_empty_string_falls_back_to_default() {
         let unset = unset_heap_cap();
-        let _g = HeapCapEnvGuard::set("");
-        let cap = resolve_heap_cap();
+        let cap = resolve_heap_cap_from(None, Some(String::new()));
         assert_eq!(
             (cap.mb, matches!(cap.source, HeapCapSource::User)),
             unset,
@@ -1781,10 +1735,10 @@ mod tests {
 
     #[test]
     fn heap_cap_honors_explicit_value() {
-        let _g = HeapCapEnvGuard::set("256");
-        assert_eq!(resolve_heap_cap().mb, 256);
+        let cap = resolve_heap_cap_from(None, Some("256".into()));
+        assert_eq!(cap.mb, 256);
         assert!(
-            matches!(resolve_heap_cap().source, HeapCapSource::User),
+            matches!(cap.source, HeapCapSource::User),
             "explicit positive value -> User source so the OOM banner attributes \
              the cap to OAM_MAX_HEAP_MB truthfully",
         );
@@ -1794,8 +1748,7 @@ mod tests {
     fn heap_cap_garbage_value_falls_back_to_default() {
         let unset = unset_heap_cap();
         for raw in ["not-a-number", "-1", " 0"] {
-            let _g = HeapCapEnvGuard::set(raw);
-            let cap = resolve_heap_cap();
+            let cap = resolve_heap_cap_from(None, Some(raw.into()));
             assert_eq!(
                 (cap.mb, matches!(cap.source, HeapCapSource::User)),
                 unset,
@@ -2083,8 +2036,8 @@ mod tests {
     ///
     /// - `exe` sits in no layout `cargo_profile_dir` recognises;
     /// - the profile dir holds no addon file;
-    /// - a `.rs` source of the addon crate (or its Cargo.toml) is strictly
-    ///   newer than the built addon.
+    /// - a `.rs` source of the addon crate (its build.rs included) or its
+    ///   Cargo.toml is strictly newer than the built addon.
     ///
     /// Split out so each arm is unit-tested against a laid-out temp dir: in
     /// the suite proper they fire only on a misbuilt tree.
@@ -2117,8 +2070,10 @@ mod tests {
             return Ok(built);
         };
 
+        // build.rs sits at the crate root, outside the src/ walk; a crate
+        // without one is skipped below like any source with no mtime.
         let addon_root = crate_root.join("../oam_napi_test_addon");
-        let mut sources = vec![addon_root.join("Cargo.toml")];
+        let mut sources = vec![addon_root.join("Cargo.toml"), addon_root.join("build.rs")];
         let mut dirs = vec![addon_root.join("src")];
         while let Some(dir) = dirs.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -2316,6 +2271,15 @@ mod tests {
         assert_eq!(
             resolve_test_addon(&exe, RESOLVE_ADDON, &crate_root).unwrap_err(),
             stale(&manifest)
+        );
+
+        // The build script is a source too, though it sits outside src/.
+        let build_script = addon_crate.join("build.rs");
+        std::fs::write(&build_script, "").unwrap();
+        stamp(&build_script, t0_plus(40));
+        assert_eq!(
+            resolve_test_addon(&exe, RESOLVE_ADDON, &crate_root).unwrap_err(),
+            stale(&build_script)
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2577,9 +2541,12 @@ mod tests {
     // ---------------------------------------- permission gate integration tests
 
     /// Helper: build a temp file path that does not exist (for "denied" tests
-    /// we never need to read it; for "allowed" tests we create it first).
+    /// we never need to read it; for "allowed" tests we create it first). The
+    /// name carries this process's id, as `resolve_fixture`'s does: two test
+    /// runs sharing a temp dir (parallel worktrees) otherwise write, read and
+    /// remove each other's files.
     fn temp_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("oam-perm-test-{name}"))
+        std::env::temp_dir().join(format!("oam-perm-test-{}-{name}", std::process::id()))
     }
 
     /// Returns the JSON-escaped form of `path` (forward slashes on all

@@ -347,10 +347,41 @@ Differences from Node's model:
   A `worker_threads` Worker follows the same rule: without `env` it starts with a copy of
   its creator's `process.env` (so only granted variables), with an object `env` it has
   exactly that object's entries, passed as given, and with `SHARE_ENV` it shares its
-  creator's `process.env`. One difference without `--permission` too: in a worker, the
-  values libuv's additions to a Windows child are read from are the ones the main thread's
-  `process.env` had when the worker was made; Node reads the live environment at the
-  spawn, so a change the main thread makes later reaches that child in Node only.
+  creator's `process.env`. Two differences without `--permission` too, both for a worker
+  with its own `process.env` (made without `env`, or with an object): the values libuv's
+  additions to a Windows child are read from are the ones its creator's environment had
+  when the worker was made, and so is the `HOME` (`USERPROFILE` on Windows) its
+  `os.homedir()` reads -- not its own `process.env`, and not the environment as it is at
+  the call. Node reads the live environment at the spawn and at the call, so a change the
+  creator makes later reaches that child, and moves that `os.homedir()`, in Node only. A
+  `SHARE_ENV` worker whose shared store is the real environment -- shared by the main
+  thread, directly or through other `SHARE_ENV` workers -- reads that store, live, for
+  both, as Node does. A `SHARE_ENV` worker made by a worker with its own `process.env`
+  shares that worker's object, which is not the real environment: it reads both from the
+  values the real environment had when its creator was made (its creator's own snapshot),
+  never from the store it shares, so the same later-change difference applies to it.
+- **`os.tmpdir()` and `os.homedir()` read a variable the grant hides as unset.** Under an
+  `--allow-env` that leaves out any of `TMPDIR`, `TMP`, `TEMP`, `HOME`, `USERPROFILE`,
+  `SystemRoot` or `windir`, `os.tmpdir()` and `os.homedir()` read each name it leaves out as
+  unset, in every thread, and answer as Node does with that variable unset. `os.tmpdir()`
+  is the next variable the grant allows and the environment sets, in Node's order (`TMPDIR`,
+  `TMP`, `TEMP` on POSIX; `TEMP`, `TMP`, then `SystemRoot` or `windir` + `\temp` on
+  Windows). With `TMPDIR`, `TMP` and `TEMP` all hidden or unset it is `/tmp` on POSIX. On
+  Windows, with `TEMP`, `TMP`, `SystemRoot` and `windir` all hidden or unset and the grant
+  hiding `SystemRoot` or `windir`, it is the Windows directory the OS reports + `\temp`,
+  not the `undefined\temp` Node gives when those variables really are unset; when the grant
+  hides neither of those two (the program deleted them) oam gives `undefined\temp` too.
+  `os.homedir()` with `HOME` (`USERPROFILE` on Windows) hidden is the account's own
+  directory: the passwd record of the effective uid on POSIX, and on Windows the profile
+  directory `GetUserProfileDirectoryW` reports for the process token, as libuv's is with the
+  variable unset. `os.userInfo().homedir` is that same account directory with or without a
+  grant, as in Node. One Windows field does not follow the grant at all:
+  `os.userInfo().username` is the `USERNAME` oam was started with, whatever the grant hides
+  (entry 66). Node's permission model has no environment permission, so Node reads the real
+  values, and under such a grant the two runtimes can name different directories: a run
+  started with `TMPDIR=/scratch` gets `/scratch` from Node and `/tmp` from oam. Grant the
+  names (`--allow-env=TMPDIR,HOME`) to have oam read them. With a grant that covers them,
+  or without `--permission`, the two runtimes agree.
 - **`process.permission` is not implemented.** Node exposes `process.permission.has()`
   for runtime introspection; in oam it is `undefined` with or without the flag.
 
@@ -489,6 +520,14 @@ not the process: under a container limit, a program whose workers fill their hea
 well can exceed the limit in total and be ended by the kernel (exit 137, no OOM banner)
 before any one isolate reaches its cap. Such a program should set the cap to a
 per-isolate figure that fits its worker count.
+
+The container-derived default applies only when 75% of the limit is at least 128 MB and
+under 4096 MB, which is a limit from about 171 MiB to about 5.3 GiB. Above that band the
+built-in 4096 MB default is already the smaller figure. Below it the limit is not used and
+the default stays 4096 MB: oam does not derive a cap it might not be able to start under.
+A container with a limit that small therefore has to set `--max-old-space-size` or
+`OAM_MAX_HEAP_MB` itself; without one the kernel ends the process at the limit (exit 137)
+and no `OAM-RT-OOM` banner is printed.
 
 ### 6. `child.pid` is one tick late for IPC children
 
@@ -703,6 +742,40 @@ explicit-`stdio` path filters the `'ipc'` entry out wherever it sits, so
 `fork(mod, [], { stdio: ['pipe','ipc','pipe'] })` still renumbers silently: Node reports
 `child.stdout === null` and routes fd 1 to the channel, oam hands back a live stdout
 stream. Same bug, same fix, still open.
+
+### 65. `spawnSync` after `killSignal`: when the pipes close (Linux, macOS) and when `input` stops (Windows)
+
+_(source)_ When a `spawnSync` (or `execSync` / `execFileSync`) child outlives `timeout` or
+overflows `maxBuffer`, oam sends it `killSignal` and then lets go of its stdout and stderr
+read ends, as Node's `SyncProcessRunner::Kill` closes its pipes when it kills, so a child
+that survives the signal and keeps writing gets `EPIPE` / `SIGPIPE` instead of blocking
+the call. Two details differ:
+
+- **The close trails the signal by a thread wake-up.** Node reads the pipes on the thread
+  that sends the signal and closes them in the very next call. oam reads each pipe on its
+  own thread, blocked in a wait on it, so the thread that sends the signal cannot close
+  the descriptor itself: it wakes the reading threads, and each closes its own pipe once
+  it runs. A child that answers the signal by writing at once (a `SIGTERM` handler that
+  prints, say) can therefore land that write in the pipe, where under Node it would
+  already find the pipe closed. Which of the two a given run sees is down to scheduling.
+- **macOS: a child forked by another thread can keep a read end open.** macOS has no
+  `pipe2`, so the pipes are opened with `pipe()` and marked close-on-exec in a second
+  call. A child that another thread of the same process forks in that window inherits a
+  read end of the `spawnSync` child's stdout or stderr, and holds it until it execs or
+  exits. oam's close is then not the last one, so a `spawnSync` child that ignores
+  `killSignal` and keeps writing gets no `EPIPE` / `SIGPIPE` and can fill the pipe and
+  block in `write(2)`, with the call blocked on it. Linux opens the pipes with
+  `pipe2(O_CLOEXEC)` and has no such window.
+
+On Linux and macOS the same kill also stops feeding `input` and closes the child's stdin, as
+Node's `Kill` closes all three pipes. **Windows does not:** the thread writing `input` is not
+stopped when the child is terminated. Terminating the child closes its read end, so a write
+into it fails and the thread stops -- unless a grandchild inherited stdin (a `shell: true`
+command run through `cmd /c`, say). That grandchild then keeps receiving the rest of `input`
+after `spawnSync` has returned, and the writing thread stays alive until all of `input` is
+written or the grandchild exits; a grandchild that stops reading without exiting leaves it
+blocked for the life of the process. The `argv0` spawn path on Windows writes `input` the same
+way.
 
 ### 21. `fs.glob` honors option extensions that Node silently ignores
 
@@ -1592,6 +1665,18 @@ Windows, and on Linux and macOS the passwd record of the effective uid (up to 0.
 answered the Windows values on every host). The `{ encoding: 'buffer' }` option is not
 implemented; the fields are always strings.
 
+### 66. Windows: `os.userInfo().username` is the `USERNAME` oam was started with
+
+_(source)_ Node's `os.userInfo().username` on Windows is the account name `GetUserNameW`
+reports, which no environment variable moves. oam reads `USERNAME` from the environment
+the process was **launched** with -- never from `process.env`, so neither a program's own
+assignment or delete nor an `--allow-env` grant that hides it (entry 4) changes the answer.
+The two differ for a process launched with a `USERNAME` that is not its account's name,
+and for one launched without `USERNAME`, where oam answers `""`. The rest of the account
+answers match Node: `os.userInfo().homedir`, and `os.homedir()` with `USERPROFILE` unset in
+`process.env` (deleted by the program, or hidden by the grant), are both the profile
+directory `GetUserProfileDirectoryW` reports for the process token, as libuv asks it.
+
 ### `process.kill` signals only this process and its own children
 
 `process.kill(pid, 0)`, the liveness probe, is answered for any pid as in Node: `true` for
@@ -1958,6 +2043,16 @@ descriptors in order, then `constructor`) and its constructor's as Node does (`l
   the prototype by hand (`Object.create(Cls.prototype)`, `Object.setPrototypeOf({},
   Cls.prototype)`) passes in oam and throws in Node, and an instance whose prototype was
   later replaced (`Object.setPrototypeOf(instance, null)`) passes in Node and throws in oam.
+
+### 64. `napi_create_buffer_copy` refuses a null source with a non-zero size
+
+_(N-API is alpha and off by default -- see divergence 2. Written from the implementation.)_
+Node's `napi_create_buffer_copy` hands the `data` pointer straight to `memcpy`, so a null
+source with a non-zero `size` is undefined behavior there. oam answers
+`napi_invalid_arg` and creates nothing, as its `napi_create_external_arraybuffer` refuses a
+null pointer. A null source with a size of 0 is accepted, and the data out-pointer is
+written for it. Same reasoning as divergence 22: an addon bug becomes a
+status it can check rather than a fault.
 
 ---
 
@@ -3961,6 +4056,18 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   refused with Node's errors.
 - **`SNICallback` and `ALPNCallback` are validated but not called.** The server's own key
   and certificate serve every name, and with `ALPNCallback` no protocol is negotiated.
+- **An `ALPNProtocols` list of nothing but empty names offers no protocol.** _(source)_ An
+  empty name is passed over and the names after it are kept, as Node does (`['', 'h2']`
+  negotiates `h2`). A list with no other name (`['']`, or the wire bytes `00`) leaves oam's
+  server with no protocols, and the handshake goes on without one (`alpnProtocol ===
+  false`); Node's server refuses every client that offers ALPN with
+  `no_application_protocol`.
+- **An `https` server refuses an `ALPNProtocols` it cannot convert at the assignment.**
+  _(source)_ Assigning `server.ALPNProtocols` a list with a name over 255 bytes throws
+  `ERR_OUT_OF_RANGE` from the assignment itself (the server's accessor property, below), and
+  the property keeps the value it had. Node stores the assignment and throws the same error,
+  uncaught, when the next connection arrives. A `tls.createServer()` server behaves as
+  Node's: it stores the value, throws on the next connection, and closes that connection.
 - **A context's `ciphers`, `ecdhCurve`, `sigalgs`, `dhparam`, `crl`, `sessionIdContext`,
   `ticketKeys`, `sessionTimeout`, `privateKeyIdentifier` / `privateKeyEngine` and
   `clientCertEngine` are ignored** (and not validated): rustls has no knobs for them. `key`,

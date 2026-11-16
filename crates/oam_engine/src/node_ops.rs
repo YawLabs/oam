@@ -200,7 +200,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // loop time): one function, so the two cannot drift apart.
         ("uptimeMs", op_now_ms),
         ("homedir", op_homedir),
-        ("tmpdir", op_tmpdir),
+        ("windowsDirectory", op_windows_directory),
         ("hostname", op_hostname),
         ("username", op_username),
         ("makeRequire", op_make_require),
@@ -1379,18 +1379,22 @@ fn op_fork_ipc_queue_clear(
 }
 
 /// `__oam.node.envWorker()`: `null` on the main thread; on a worker thread
-/// `{ shared, fold, base }` from its [`crate::worker::WorkerEnv`] -- the
-/// SHARE_ENV store's id (absent for a worker with its own store), whether
-/// names fold case, and the values of libuv's Windows additions its creator
-/// had, as an object.
+/// `{ shared, fold, real, base }` from its [`crate::worker::WorkerEnv`] --
+/// the SHARE_ENV store's id (absent for a worker with its own store),
+/// whether names fold case, whether the shared store is the real (main
+/// thread's) environment, and `base`, as an object: the values its creator's
+/// environment had when the worker was made of libuv's Windows additions
+/// (USERPROFILE among them) and, off Windows, HOME -- what the worker reads
+/// for os.homedir() and for libuv's additions to a child it spawns, unless
+/// `real` (then it reads the shared store, live).
 fn op_env_worker(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some((shared, fold, base)) = scope
+    let Some((shared, fold, real, base)) = scope
         .get_slot::<crate::worker::WorkerEnv>()
-        .map(|env| (env.shared, env.fold, env.base.clone()))
+        .map(|env| (env.shared, env.fold, env.real, env.base.clone()))
     else {
         rv.set_null();
         return;
@@ -1403,6 +1407,9 @@ fn op_env_worker(
     }
     let key = v8::String::new(scope, "fold").unwrap();
     let value = v8::Boolean::new(scope, fold);
+    info.set(scope, key.into(), value.into());
+    let key = v8::String::new(scope, "real").unwrap();
+    let value = v8::Boolean::new(scope, real);
     info.set(scope, key.into(), value.into());
     let base_obj = v8::Object::new(scope);
     for (name, value) in base {
@@ -1424,7 +1431,7 @@ fn shared_env_id(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments<'_>,
 ) -> u64 {
-    args.get(0).number_value(scope).unwrap_or(0.0) as u64
+    handle_id_arg(scope, args, 0)
 }
 
 /// `__oam.node.envShareNew(json)`: a new SHARE_ENV store holding the
@@ -1810,7 +1817,7 @@ fn stdout_write_whole(bytes: &[u8]) -> std::io::Result<()> {
     let mut lock = stdout.lock();
     lock.flush()?;
     #[cfg(windows)]
-    if let Some(done) = win_console_write(bytes) {
+    if let Some(done) = win_console_write(ConsoleStream::Stdout, bytes) {
         return done;
     }
     let raw = raw_stdout();
@@ -1911,47 +1918,63 @@ fn close_fd(files: &oam_core::FileRegistry, fd: u64) -> bool {
 
 /// A Windows console gets UTF-16 through WriteConsoleW, as std and libuv give
 /// it: WriteFile would hand it bytes to read in the console's code page, which
-/// is not UTF-8 unless someone set it so. `None` when stdout is not a console
-/// -- a pipe, a file, or the pipe an msys/mintty "pty" is made of -- and the
-/// caller writes the bytes as they are.
+/// is not UTF-8 unless someone set it so. `None` when the stream is not a
+/// console -- a pipe, a file, or the pipe an msys/mintty "pty" is made of --
+/// and the caller writes the bytes as they are.
+///
+/// For stdout and for stderr, each with its own verdict and its own carried
+/// bytes. stderr used to go to std's `Stderr` as bytes, and std's console
+/// writer refuses a chunk that does not start with valid UTF-8
+/// (`InvalidData`): `process.stderr.write(Buffer.from([0xff]))`, or a
+/// child's code-page output piped to process.stderr, failed the write on a
+/// console where node prints U+FFFD and goes on.
+///
+/// The caller holds std's lock on `stream`, which is what serialises the
+/// carried bytes between threads.
 #[cfg(windows)]
-fn win_console_write(bytes: &[u8]) -> Option<std::io::Result<()>> {
-    use std::io::IsTerminal;
+fn win_console_write(stream: ConsoleStream, bytes: &[u8]) -> Option<std::io::Result<()>> {
+    use std::io::{IsTerminal, Write};
     use std::sync::atomic::{AtomicU8, Ordering};
-    // What stdout turned out to be; it does not change during a run.
+    // What the stream turned out to be; it does not change during a run.
     const UNKNOWN: u8 = 0;
     const CONSOLE: u8 = 1;
     const NOT_CONSOLE: u8 = 2;
-    static KIND: AtomicU8 = AtomicU8::new(UNKNOWN);
-    // An incomplete UTF-8 sequence a write ended on, completed by the next
-    // write (a Buffer can be cut mid-character). std and libuv keep the same.
-    static CARRY: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+    static KINDS: [AtomicU8; 2] = [AtomicU8::new(UNKNOWN), AtomicU8::new(UNKNOWN)];
+    static CARRIES: ConsoleCarries = ConsoleCarries::new();
+    let (kind_of, fd) = (&KINDS[stream.slot()], stream.fd());
 
-    let kind = KIND.load(Ordering::Relaxed);
+    let kind = kind_of.load(Ordering::Relaxed);
     if kind == NOT_CONSOLE {
         return None;
     }
-    let h = win_std_handle(1);
-    if kind == UNKNOWN && (h == 0 || h == -1 || !std::io::stdout().is_terminal()) {
-        KIND.store(NOT_CONSOLE, Ordering::Relaxed);
+    let h = win_std_handle(fd);
+    let is_terminal = || match stream {
+        ConsoleStream::Stdout => std::io::stdout().is_terminal(),
+        ConsoleStream::Stderr => std::io::stderr().is_terminal(),
+    };
+    if kind == UNKNOWN && (h == 0 || h == -1 || !is_terminal()) {
+        kind_of.store(NOT_CONSOLE, Ordering::Relaxed);
         return None;
     }
-    let mut carry = CARRY.lock().unwrap_or_else(|e| e.into_inner());
-    let mut pending = carry.clone();
-    pending.extend_from_slice(bytes);
-    let (wide, rest) = console_utf16(&pending);
+    let mut carry = CARRIES.of(stream);
+    let ConsolePending {
+        pending,
+        wide,
+        rest,
+    } = console_pending(&carry, bytes);
     if wide.is_empty() {
         // Nothing to hand the console yet -- the whole write is the start of
-        // one character. It is carried, and stdout's kind stays as it was:
-        // only a WriteConsoleW that took units can vouch for a console, and
-        // an msys/mintty "pty" (is_terminal says yes, WriteConsoleW refuses
-        // the pipe) must not be taken for one on a write that never asked.
+        // one character. It is carried, and the stream's kind stays as it
+        // was: only a WriteConsoleW that took units can vouch for a console,
+        // and an msys/mintty "pty" (is_terminal says yes, WriteConsoleW
+        // refuses the pipe) must not be taken for one on a write that never
+        // asked.
         *carry = rest;
         return Some(Ok(()));
     }
     match win_write_console(h, &wide) {
         Ok(()) => {
-            KIND.store(CONSOLE, Ordering::Relaxed);
+            kind_of.store(CONSOLE, Ordering::Relaxed);
             *carry = rest;
             Some(Ok(()))
         }
@@ -1961,21 +1984,108 @@ fn win_console_write(bytes: &[u8]) -> Option<std::io::Result<()>> {
         // whatever earlier partial character was being carried put back in
         // front of them.
         Err(_) if kind == UNKNOWN => {
-            KIND.store(NOT_CONSOLE, Ordering::Relaxed);
+            kind_of.store(NOT_CONSOLE, Ordering::Relaxed);
             *carry = Vec::new();
-            Some(match raw_stdout().as_ref().and_then(Option::as_ref) {
-                Some(file) => write_whole(file, &pending),
-                // std's stdout lock is reentrant, so taking it again under
-                // the caller's is fine.
-                None => {
-                    use std::io::Write;
-                    let stdout = std::io::stdout();
-                    let mut lock = stdout.lock();
+            // std's stdout and stderr locks are reentrant, so taking one
+            // again under the caller's is fine.
+            Some(match stream {
+                ConsoleStream::Stdout => match raw_stdout().as_ref().and_then(Option::as_ref) {
+                    Some(file) => write_whole(file, &pending),
+                    None => {
+                        let stdout = std::io::stdout();
+                        let mut lock = stdout.lock();
+                        write_whole(&mut lock, &pending).and_then(|()| lock.flush())
+                    }
+                },
+                ConsoleStream::Stderr => {
+                    let stderr = std::io::stderr();
+                    let mut lock = stderr.lock();
                     write_whole(&mut lock, &pending).and_then(|()| lock.flush())
                 }
             })
         }
         Err(e) => Some(Err(e)),
+    }
+}
+
+/// Which of the process's two output streams a console write is for.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsoleStream {
+    Stdout,
+    Stderr,
+}
+
+#[cfg(any(windows, test))]
+impl ConsoleStream {
+    /// Where this stream's state sits in a two-entry per-stream table.
+    const fn slot(self) -> usize {
+        match self {
+            ConsoleStream::Stdout => 0,
+            ConsoleStream::Stderr => 1,
+        }
+    }
+
+    /// The stream's file descriptor number, as `win_std_handle` takes it.
+    const fn fd(self) -> i32 {
+        match self {
+            ConsoleStream::Stdout => 1,
+            ConsoleStream::Stderr => 2,
+        }
+    }
+}
+
+/// The incomplete UTF-8 sequence each console stream's last write ended on,
+/// completed by that stream's next write (a Buffer can be cut
+/// mid-character). std and libuv keep the same. One entry a stream, never
+/// shared: the head of a character written to stdout is not finished by
+/// bytes written to stderr.
+#[cfg(any(windows, test))]
+struct ConsoleCarries([std::sync::Mutex<Vec<u8>>; 2]);
+
+#[cfg(any(windows, test))]
+impl ConsoleCarries {
+    const fn new() -> Self {
+        Self([
+            std::sync::Mutex::new(Vec::new()),
+            std::sync::Mutex::new(Vec::new()),
+        ])
+    }
+
+    /// `stream`'s carried bytes, held for the length of one write.
+    fn of(&self, stream: ConsoleStream) -> std::sync::MutexGuard<'_, Vec<u8>> {
+        self.0[stream.slot()]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// One console write, worked out but not yet written.
+#[cfg(any(windows, test))]
+struct ConsolePending {
+    /// The carried bytes followed by this write's: what goes out as bytes if
+    /// the stream turns out not to be a console after all.
+    pending: Vec<u8>,
+    /// `pending` as the UTF-16 the console is handed. Empty when the whole of
+    /// it is the start of one character.
+    wide: Vec<u16>,
+    /// The incomplete sequence `pending` ends on: the stream's next carry
+    /// once `wide` has been written.
+    rest: Vec<u8>,
+}
+
+/// Put a write after what its stream carried and decode the two together
+/// (`console_utf16`).
+#[cfg(any(windows, test))]
+fn console_pending(carry: &[u8], bytes: &[u8]) -> ConsolePending {
+    let mut pending = Vec::with_capacity(carry.len() + bytes.len());
+    pending.extend_from_slice(carry);
+    pending.extend_from_slice(bytes);
+    let (wide, rest) = console_utf16(&pending);
+    ConsolePending {
+        pending,
+        wide,
+        rest,
     }
 }
 
@@ -2044,7 +2154,8 @@ fn win_write_console(h: isize, wide: &[u16]) -> std::io::Result<()> {
         // inside it. `written` is a live stack u32 passed by `&mut` for the
         // out-write, read only after the return is checked. The reserved
         // argument is NULL, as the API requires. `h` is the process's stdout
-        // handle, already checked to be neither NULL nor INVALID_HANDLE_VALUE.
+        // or stderr handle, already checked to be neither NULL nor
+        // INVALID_HANDLE_VALUE.
         let ok =
             unsafe { WriteConsoleW(h, rest.as_ptr(), n as u32, &mut written, std::ptr::null()) };
         if ok == 0 {
@@ -2060,8 +2171,75 @@ fn win_write_console(h: isize, wide: &[u16]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod stdout_write_tests {
-    use super::{console_chunk_len, console_utf16, write_whole};
+    use super::{
+        ConsoleCarries, ConsoleStream, console_chunk_len, console_pending, console_utf16,
+        write_whole,
+    };
     use std::io::Write;
+
+    /// One console write against `carries`, as `win_console_write` does it
+    /// when the console takes the units: what the console was handed, with
+    /// the incomplete tail left as the stream's carry.
+    fn console_write(carries: &ConsoleCarries, stream: ConsoleStream, bytes: &[u8]) -> String {
+        let mut carry = carries.of(stream);
+        let step = console_pending(&carry, bytes);
+        *carry = step.rest;
+        String::from_utf16(&step.wide).expect("the console is handed valid UTF-16")
+    }
+
+    /// A character cut across two writes to one stream is carried and comes
+    /// out whole on the second, and the cut is that stream's alone: a write
+    /// to the other stream in between neither completes it nor is disturbed
+    /// by it. One carry for both printed U+FFFD twice here, or a character
+    /// made of one stream's head and the other's tail.
+    #[test]
+    fn each_console_stream_carries_its_own_split_character() {
+        let (out, err) = (ConsoleStream::Stdout, ConsoleStream::Stderr);
+        assert_ne!(out.slot(), err.slot());
+        assert_eq!((out.fd(), err.fd()), (1, 2));
+
+        // U+20AC is E2 82 AC, U+00E9 is C3 A9.
+        let carries = ConsoleCarries::new();
+        assert_eq!(console_write(&carries, out, b"a\xE2\x82"), "a");
+        assert_eq!(*carries.of(out), [0xE2, 0x82]);
+        assert!(carries.of(err).is_empty());
+
+        // stderr starts its own character while stdout's is still open.
+        assert_eq!(console_write(&carries, err, b"b\xC3"), "b");
+        assert_eq!(*carries.of(err), [0xC3]);
+        assert_eq!(*carries.of(out), [0xE2, 0x82]);
+
+        assert_eq!(console_write(&carries, out, b"\xACc"), "\u{20AC}c");
+        assert!(carries.of(out).is_empty());
+        assert_eq!(console_write(&carries, err, b"\xA9d"), "\u{E9}d");
+        assert!(carries.of(err).is_empty());
+    }
+
+    /// A write that is nothing but the head of a character hands the console
+    /// nothing and is carried whole, byte by byte if need be; `pending` is
+    /// the carry and the write together, for the stream that turns out not
+    /// to be a console.
+    #[test]
+    fn a_write_that_is_only_part_of_a_character_is_carried_whole() {
+        let carries = ConsoleCarries::new();
+        let err = ConsoleStream::Stderr;
+        // U+1F600 is F0 9F 98 80.
+        for byte in [0xF0u8, 0x9F, 0x98] {
+            assert_eq!(console_write(&carries, err, &[byte]), "");
+        }
+        assert_eq!(*carries.of(err), [0xF0, 0x9F, 0x98]);
+        let step = console_pending(&carries.of(err), &[0x80, b'!']);
+        assert_eq!(step.pending, [0xF0, 0x9F, 0x98, 0x80, b'!']);
+        assert_eq!(String::from_utf16(&step.wide).unwrap(), "\u{1F600}!");
+        assert!(step.rest.is_empty());
+
+        // A carried head the next write does not continue is U+FFFD, and the
+        // write itself is kept.
+        let carries = ConsoleCarries::new();
+        assert_eq!(console_write(&carries, err, &[0xE2]), "");
+        assert_eq!(console_write(&carries, err, b"x"), "\u{FFFD}x");
+        assert!(carries.of(err).is_empty());
+    }
 
     /// A sink that keeps every write it is handed, as its own entry.
     struct Calls(Vec<Vec<u8>>);
@@ -2236,10 +2414,11 @@ mod stdout_write_tests {
 
 /// `__oam.node.stderrWrite(chunk)`: `undefined`, or the error the write
 /// failed with (see [`stdio_write_failed`]). std's stderr is unbuffered, so
-/// nothing is held back between calls. One failure this path cannot see: on
-/// unix std's stderr reports a write to an fd not open for writing (EBADF)
-/// as done (`handle_ebadf`), where node v22.23.2 on Linux raises EBADF for a
-/// stderr opened read-only.
+/// nothing is held back between calls. A Windows console is written as
+/// stdout's is ([`win_console_write`]): UTF-16, a byte that is not UTF-8 as
+/// U+FFFD. One failure this path cannot see: on unix std's stderr reports a
+/// write to an fd not open for writing (EBADF) as done (`handle_ebadf`),
+/// where node v22.23.2 on Linux raises EBADF for a stderr opened read-only.
 fn op_stderr_write(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -2265,7 +2444,15 @@ fn op_stderr_write(
         }
         let stderr = std::io::stderr();
         let mut lock = stderr.lock();
-        if let Err(e) = write_whole(&mut lock, &bytes).and_then(|()| lock.flush()) {
+        #[cfg(windows)]
+        let console = win_console_write(ConsoleStream::Stderr, &bytes);
+        #[cfg(not(windows))]
+        let console: Option<std::io::Result<()>> = None;
+        let written = match console {
+            Some(done) => done,
+            None => write_whole(&mut lock, &bytes).and_then(|()| lock.flush()),
+        };
+        if let Err(e) = written {
             stdio_write_failed(scope, &mut rv, &e);
         }
     }
@@ -2515,6 +2702,47 @@ fn plan_console_switch(mode: u32, enable: bool, saved: Option<u32>) -> ConsoleSw
     ConsoleSwitch::Set { target, echo }
 }
 
+/// The saved-original slot after a `setRawMode(true)` that found the console
+/// in `mode`: `slot` is what it held (`u32::MAX` for nothing), `landed`
+/// whether the call left the console raw. The first enable to land saves the
+/// mode it found; a later one keeps that; and one whose SetConsoleMode failed
+/// saves nothing, as the unix twin saves its termios only "once the switch
+/// actually landed". The mode used to be saved before the switch was tried,
+/// so a refused enable (a console that rejects
+/// ENABLE_VIRTUAL_TERMINAL_INPUT) left a snapshot behind with raw mode never
+/// entered: a later setRawMode(false) then had a mode to "restore", and a
+/// later enable that did land kept the stale snapshot instead of the mode it
+/// found.
+#[cfg(any(windows, test))]
+fn saved_mode_after_enable(slot: u32, mode: u32, landed: bool) -> u32 {
+    if landed && slot == u32::MAX {
+        mode
+    } else {
+        slot
+    }
+}
+
+#[cfg(test)]
+mod saved_mode_tests {
+    use super::saved_mode_after_enable;
+
+    const NOTHING: u32 = u32::MAX;
+
+    #[test]
+    fn only_an_enable_that_landed_saves_the_mode_it_found() {
+        // The first enable to land saves the mode it found.
+        assert_eq!(saved_mode_after_enable(NOTHING, 0x1f7, true), 0x1f7);
+        // A refused one saves nothing, so the next to land saves the mode
+        // the console is in THEN, not the refused call's.
+        let after_refusal = saved_mode_after_enable(NOTHING, 0x1f7, false);
+        assert_eq!(after_refusal, NOTHING);
+        assert_eq!(saved_mode_after_enable(after_refusal, 0x0f7, true), 0x0f7);
+        // Raw already: the first snapshot stays, whatever this call found.
+        assert_eq!(saved_mode_after_enable(0x1f7, 0x2f0, true), 0x1f7);
+        assert_eq!(saved_mode_after_enable(0x1f7, 0x2f0, false), 0x1f7);
+    }
+}
+
 /// A console-mode switch in libuv's order: hold the stdin reader, cancel the
 /// read in flight while the mode it was issued under is still in force, flip,
 /// release. Generic over the steps so the order is unit-tested: it is what the
@@ -2603,20 +2831,31 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> i32 {
             return last_os_tty_errno();
         }
         let saved = if enable {
-            // Save the pre-raw mode once so setRawMode(false)/exit restores it.
-            let _ = WIN_STDIN_ORIG_MODE.compare_exchange(
-                u32::MAX,
-                mode,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
             None
         } else {
             let orig = WIN_STDIN_ORIG_MODE.swap(u32::MAX, Ordering::SeqCst);
             (orig != u32::MAX).then_some(orig)
         };
+        // The pre-raw mode, saved once so setRawMode(false)/exit restores it
+        // -- and only for an enable that left the console raw (see
+        // `saved_mode_after_enable`). WIN_CONSOLE_SWITCH is held, so the
+        // load and the store are one step.
+        let remember = |landed: bool| {
+            let slot = WIN_STDIN_ORIG_MODE.load(Ordering::SeqCst);
+            WIN_STDIN_ORIG_MODE.store(
+                saved_mode_after_enable(slot, mode, landed),
+                Ordering::SeqCst,
+            );
+        };
         let (target, echo) = match plan_console_switch(mode, enable, saved) {
-            ConsoleSwitch::Keep => return 0,
+            ConsoleSwitch::Keep => {
+                // An enable with nothing to change found the console in the
+                // raw mode already: that mode is what a disable goes back to.
+                if enable {
+                    remember(true);
+                }
+                return 0;
+            }
             ConsoleSwitch::Set { target, echo } => (target, echo),
         };
         // Cancel the stdin read in flight BEFORE the flip, in libuv's order
@@ -2644,7 +2883,13 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> i32 {
             if let Some(orig) = saved {
                 WIN_STDIN_ORIG_MODE.store(orig, Ordering::SeqCst);
             }
+            if enable {
+                remember(false);
+            }
             return errno;
+        }
+        if enable {
+            remember(true);
         }
     }
     // Why the cancel above exists: a stdin read that is ALREADY blocked keeps
@@ -3620,6 +3865,59 @@ fn op_posix_set_id(
     }
 }
 
+/// The supplementary group ids, as getgroups(2) reports them, or the errno
+/// it failed with.
+#[cfg(unix)]
+fn supplementary_groups() -> Result<Vec<libc::gid_t>, i32> {
+    let errno = || std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    // SAFETY: getgroups(0, NULL) is the documented "just return the count"
+    // form -- a null list pointer is explicitly allowed when the size is 0,
+    // so nothing is dereferenced. The return is checked for error below.
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return Err(errno());
+    }
+    let mut buf = vec![0 as libc::gid_t; count as usize];
+    // SAFETY: `buf` was allocated with exactly `count` gid_t elements, so
+    // the pointer is valid for `count` writes -- the size passed and the
+    // allocation agree. `count` is non-negative here (the error case
+    // returned above). getgroups writes at most `count` entries.
+    let got = unsafe { libc::getgroups(count, buf.as_mut_ptr()) };
+    if got < 0 {
+        return Err(errno());
+    }
+    buf.truncate(got as usize);
+    Ok(buf)
+}
+
+/// process.getgroups()'s list from the supplementary one: node appends the
+/// effective gid when getgroups(2) left it out (src/node_credentials.cc),
+/// because POSIX leaves it open whether that call reports it. A process
+/// started with no supplementary groups at all still belongs to one group.
+#[cfg(unix)]
+fn with_effective_gid(mut groups: Vec<libc::gid_t>, egid: libc::gid_t) -> Vec<libc::gid_t> {
+    if !groups.contains(&egid) {
+        groups.push(egid);
+    }
+    groups
+}
+
+#[cfg(all(test, unix))]
+mod get_groups_tests {
+    use super::with_effective_gid;
+
+    #[test]
+    fn the_effective_gid_is_in_the_list_once_and_last_when_it_was_missing() {
+        // A process with no supplementary groups used to answer [].
+        assert_eq!(with_effective_gid(Vec::new(), 5678), [5678]);
+        assert_eq!(with_effective_gid(vec![4, 24], 1000), [4, 24, 1000]);
+        assert_eq!(with_effective_gid(vec![4, 1000, 24], 1000), [4, 1000, 24]);
+    }
+}
+
+/// `__oam.node.posixGetGroups()`: process.getgroups()'s array, or the errno
+/// NAME getgroups(2) failed with, which JS throws as node does (a failure
+/// used to answer null, and JS made that an empty list). null off unix.
 fn op_posix_get_groups(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
@@ -3627,31 +3925,27 @@ fn op_posix_get_groups(
 ) {
     #[cfg(unix)]
     {
-        // SAFETY: getgroups(0, NULL) is the documented "just return the count"
-        // form -- a null list pointer is explicitly allowed when the size is 0,
-        // so nothing is dereferenced. The return is checked for error below.
-        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-        if count < 0 {
-            rv.set(v8::null(scope).into());
-            return;
+        // The group set can grow between the call that sizes the buffer and
+        // the one that fills it, which then fails EINVAL: sized again, once.
+        let groups = match supplementary_groups() {
+            Err(libc::EINVAL) => supplementary_groups(),
+            other => other,
+        };
+        match groups {
+            Ok(groups) => {
+                let groups = with_effective_gid(groups, rustix::process::getegid().as_raw());
+                let arr = v8::Array::new(scope, groups.len() as i32);
+                for (i, gid) in groups.iter().enumerate() {
+                    let n = v8::Number::new(scope, f64::from(*gid));
+                    arr.set_index(scope, i as u32, n.into());
+                }
+                rv.set(arr.into());
+            }
+            Err(errno) => {
+                let name = v8::String::new(scope, errno_name(errno)).expect("errno name is short");
+                rv.set(name.into());
+            }
         }
-        let mut buf = vec![0 as libc::gid_t; count as usize];
-        // SAFETY: `buf` was allocated with exactly `count` gid_t elements, so
-        // the pointer is valid for `count` writes -- the size passed and the
-        // allocation agree. `count` is non-negative here (the error case
-        // returned above). getgroups writes at most `count` entries.
-        let got = unsafe { libc::getgroups(count, buf.as_mut_ptr()) };
-        if got < 0 {
-            rv.set(v8::null(scope).into());
-            return;
-        }
-        buf.truncate(got as usize);
-        let arr = v8::Array::new(scope, got);
-        for (i, gid) in buf.iter().enumerate() {
-            let n = v8::Number::new(scope, f64::from(*gid));
-            arr.set_index(scope, i as u32, n.into());
-        }
-        rv.set(arr.into());
     }
     #[cfg(not(unix))]
     {
@@ -4039,30 +4333,174 @@ fn op_hrtime_nanos(
     rv.set(nanos.into());
 }
 
+/// `__oam.node.homedir()`: the current user's profile directory on
+/// Windows, `undefined` elsewhere and when Windows cannot say.
+///
+/// libuv's uv_os_homedir reads one variable -- HOME on unix, USERPROFILE on
+/// Windows -- and asks the account database only when it is unset. The JS
+/// layer (the os module's `homedir`) reads the variable from process.env's
+/// store, which is where a program's own `process.env.HOME = dir` lands and
+/// what the env grant has already filtered (a name the grant hides reads as
+/// unset), and on unix takes the passwd record through `posixLookupId`. This
+/// op is the Windows account answer, for os.homedir() with USERPROFILE unset
+/// and for os.userInfo().homedir: GetUserProfileDirectoryW on the process
+/// token, as libuv asks it (src/win/util.c, uv__getpwuid_r), never the
+/// environment.
+///
+/// This used to be std's `home_dir`, which answers with the USERPROFILE the
+/// process was started with before asking GetUserProfileDirectoryW: a
+/// USERPROFILE the program deleted from process.env, or one the env grant
+/// hides, still came back through it. Before that it was
+/// USERPROFILE-then-HOME on every platform, read from the launch environment
+/// only.
 fn op_homedir(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
-    if let Some(value) = v8::String::new(scope, &home) {
-        rv.set(value.into());
+    #[cfg(windows)]
+    {
+        if let Some(home) = win_dirs::user_profile_directory()
+            && let Some(value) = v8::String::new(scope, &home.to_string_lossy())
+        {
+            rv.set(value.into());
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = scope;
+        rv.set_undefined();
     }
 }
 
-fn op_tmpdir(
+/// `__oam.node.windowsDirectory()`: the system's Windows directory as the OS
+/// reports it (GetSystemWindowsDirectoryW, `C:\Windows`: the directory
+/// `SystemRoot` names, shared by every user even under Remote Desktop
+/// Services), `undefined` elsewhere and when Windows cannot say. Never read
+/// from the environment.
+///
+/// node's Windows os.tmpdir() falls back to `SystemRoot` (then `windir`) +
+/// `\temp`, and with both unset answers the literal `undefined\temp`. oam
+/// gives the same when the program unset them; this op is the answer only
+/// when the env grant hides them (the os module's `tmpdir`), where node,
+/// having no env permission, would read the real values.
+fn op_windows_directory(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let tmp = std::env::temp_dir();
-    // Node's tmpdir has no trailing separator.
-    let text = tmp.to_string_lossy();
-    let text = text.trim_end_matches(['/', '\\']);
-    if let Some(value) = v8::String::new(scope, text) {
-        rv.set(value.into());
+    #[cfg(windows)]
+    {
+        if let Some(dir) = win_dirs::windows_directory()
+            && let Some(value) = v8::String::new(scope, &dir.to_string_lossy())
+        {
+            rv.set(value.into());
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = scope;
+        rv.set_undefined();
+    }
+}
+
+/// The two directories Windows answers for an account and for the system,
+/// from the OS rather than the environment: what libuv's uv_os_homedir falls
+/// back to with USERPROFILE unset, and the Windows directory.
+#[cfg(windows)]
+mod win_dirs {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    /// TOKEN_READ (STANDARD_RIGHTS_READ | TOKEN_QUERY), the access libuv
+    /// opens the process token with before asking for the profile directory.
+    const TOKEN_READ: u32 = 0x0002_0008;
+
+    // ABI: kernel32's GetCurrentProcess (pseudo-handle out), CloseHandle and
+    // GetSystemWindowsDirectoryW (buffer + its length in u16 units in, the length
+    // written or needed out), advapi32's OpenProcessToken (process handle,
+    // access mask, HANDLE* out, BOOL out) and userenv's
+    // GetUserProfileDirectoryW (token, buffer, DWORD* length in u16 units
+    // in/out, BOOL out). HANDLE is pointer-sized: isize, as the other
+    // declarations in this file take it.
+    #[link(name = "advapi32")]
+    #[link(name = "userenv")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn CloseHandle(handle: isize) -> i32;
+        fn GetSystemWindowsDirectoryW(buffer: *mut u16, size: u32) -> u32;
+        fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
+        fn GetUserProfileDirectoryW(token: isize, dir: *mut u16, size: *mut u32) -> i32;
+    }
+
+    /// The Windows directory (`C:\Windows`), or None if Windows cannot say.
+    pub(super) fn windows_directory() -> Option<OsString> {
+        let mut buf = vec![0u16; 261];
+        loop {
+            let capacity = u32::try_from(buf.len()).ok()?;
+            // SAFETY: `buf` is a live, writable u16 buffer of exactly
+            // `capacity` units; the call writes at most that many (the
+            // terminator included) and reports the length it wrote, or the
+            // length it needs when that is larger.
+            let len = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), capacity) };
+            let len = usize::try_from(len).ok()?;
+            if len == 0 {
+                return None;
+            }
+            if len < buf.len() {
+                return Some(OsString::from_wide(&buf[..len]));
+            }
+            // Too small: `len` is the size needed, terminator included. A
+            // length that would not grow the buffer is not one to retry on.
+            if len == buf.len() {
+                return None;
+            }
+            buf.resize(len, 0);
+        }
+    }
+
+    /// The current user's profile directory as GetUserProfileDirectoryW
+    /// reports it for the process token, or None if it cannot be determined.
+    pub(super) fn user_profile_directory() -> Option<OsString> {
+        let mut token: isize = 0;
+        // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no
+        // closing; `&mut token` is a valid out-pointer for the HANDLE the
+        // call writes on success.
+        let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_READ, &mut token) };
+        if opened == 0 {
+            return None;
+        }
+        let profile = profile_directory_of(token);
+        // SAFETY: `token` is the handle OpenProcessToken opened above, owned
+        // here and closed exactly once.
+        unsafe { CloseHandle(token) };
+        profile
+    }
+
+    /// GetUserProfileDirectoryW for an open `token`, growing the buffer to
+    /// the length it asks for.
+    fn profile_directory_of(token: isize) -> Option<OsString> {
+        let mut buf = vec![0u16; 261];
+        loop {
+            let mut size = u32::try_from(buf.len()).ok()?;
+            // SAFETY: `token` is an open token handle with TOKEN_QUERY
+            // access; `buf` is a live, writable u16 buffer of `size` units
+            // and `&mut size` a valid in/out length. The call writes at most
+            // `size` units into `buf` (the path and its terminator), and on a
+            // buffer too small only the length it needs into `size`.
+            let ok = unsafe { GetUserProfileDirectoryW(token, buf.as_mut_ptr(), &mut size) };
+            let size = usize::try_from(size).ok()?;
+            if ok != 0 {
+                // Up to the terminator: whether a successful call updates
+                // `size` is not documented.
+                let end = buf.iter().position(|&unit| unit == 0).unwrap_or(buf.len());
+                return Some(OsString::from_wide(&buf[..end]));
+            }
+            if size <= buf.len() {
+                return None;
+            }
+            buf.resize(size, 0);
+        }
     }
 }
 
@@ -4074,8 +4512,8 @@ fn op_hostname(
     // The system's host name, as libuv's uv_os_gethostname answers node:
     // gethostname(2) on unix, the DNS host name on Windows (sysinfo asks
     // GetComputerNameExW). oam read COMPUTERNAME / HOSTNAME instead, which is
-    // the upper-case NetBIOS name on Windows ("WOODS" where node says
-    // "woods") and unset on macOS, where it answered "localhost". The
+    // the upper-case NetBIOS name on Windows ("MYHOST" where node says
+    // "myhost") and unset on macOS, where it answered "localhost". The
     // environment is only the fallback for a host that answers nothing.
     let host = sysinfo::System::host_name()
         .filter(|name| !name.is_empty())
@@ -4092,8 +4530,16 @@ fn op_username(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let user = std::env::var("USERNAME")
-        .or_else(|_| std::env::var("USER"))
+    // os.userInfo().username on Windows (unix reads the passwd record). node
+    // asks GetUserNameW, which no environment variable moves; the nearest
+    // thing here without that call is USERNAME as the process was started
+    // with it, so it is read from the launch environment, never from
+    // process.env, and no env grant hides it (docs/node-divergences.md
+    // entry 66). var_os, decoded lossily: `std::env::var` refuses a value
+    // that is not valid Unicode, and the answer was "" then.
+    let name = if cfg!(windows) { "USERNAME" } else { "USER" };
+    let user = std::env::var_os(name)
+        .map(|user| user.to_string_lossy().into_owned())
         .unwrap_or_default();
     if let Some(value) = v8::String::new(scope, &user) {
         rv.set(value.into());
@@ -4227,7 +4673,7 @@ fn op_http_server_timeouts(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let server_id = handle_id_arg(scope, &args, 0);
     let mut ms = [0u64; 4];
     for (offset, slot) in (1..).zip(ms.iter_mut()) {
         *slot = ms_arg(scope, args.get(offset)).unwrap_or(0);
@@ -4245,7 +4691,7 @@ fn op_http_server_max_connections(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let server_id = handle_id_arg(scope, &args, 0);
     let limit = args.get(1).number_value(scope).unwrap_or(f64::INFINITY);
     core_runtime!(scope)
         .http()
@@ -4260,7 +4706,7 @@ fn op_http_server_upgrades(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let server_id = handle_id_arg(scope, &args, 0);
     let listening = args.get(1).is_true();
     core_runtime!(scope)
         .http()
@@ -4274,7 +4720,7 @@ fn op_http_server_expire(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let server_id = handle_id_arg(scope, &args, 0);
     let headers_ms = ms_arg(scope, args.get(1)).unwrap_or(0);
     let request_ms = ms_arg(scope, args.get(2)).unwrap_or(0);
     let expired = core_runtime!(scope)
@@ -4290,7 +4736,7 @@ fn op_http_conn_set_timeout(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let conn_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let conn_id = handle_id_arg(scope, &args, 0);
     let ms = ms_arg(scope, args.get(1)).unwrap_or(0);
     core_runtime!(scope).http().set_conn_timeout(conn_id, ms);
 }
@@ -4303,7 +4749,7 @@ fn op_http_conn_destroy(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let conn_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let conn_id = handle_id_arg(scope, &args, 0);
     let graceful = args.get(1).is_true();
     core_runtime!(scope).http().destroy_conn(conn_id, graceful);
 }
@@ -4315,7 +4761,7 @@ fn op_http_conn_reset(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let conn_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let conn_id = handle_id_arg(scope, &args, 0);
     core_runtime!(scope).http().reset_conn(conn_id);
 }
 
@@ -4328,7 +4774,7 @@ fn op_http_conn_resume(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let conn_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let conn_id = handle_id_arg(scope, &args, 0);
     core_runtime!(scope).http().resume_conn(conn_id);
 }
 
@@ -4432,7 +4878,7 @@ fn op_http_accept(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let server_id = handle_id_arg(scope, &args, 0);
     let state = core_runtime!(scope).http();
     crate::ops::spawn_op(
         scope,
@@ -4460,7 +4906,7 @@ fn op_fetch_body_channel_write(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let Some(bytes) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "fetchBodyChannelWrite requires bytes");
         return;
@@ -4495,7 +4941,7 @@ fn op_fetch_body_channel_trailers(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let pairs = arg_string(scope, &args, 1)
         .map(|json| parse_headers_json(&json))
         .unwrap_or_default();
@@ -4527,7 +4973,7 @@ fn op_fetch_body_channel_end(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     core_runtime!(scope).end_outbound_body(handle);
 }
 
@@ -4538,7 +4984,7 @@ fn op_fetch_body_channel_cancel(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let entry = core_runtime!(scope)
         .outbound_bodies()
         .lock()
@@ -4573,12 +5019,9 @@ fn op_http_transport_drop_agent(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let id = handle_id_arg(scope, &args, 0);
     // Pool ids are positive integers; anything else names no pool.
-    let dropped = id >= 1.0
-        && id.fract() == 0.0
-        && id <= u64::MAX as f64
-        && core_runtime!(scope).http_client().drop_agent(id as u64);
+    let dropped = id >= 1 && id != NO_HANDLE && core_runtime!(scope).http_client().drop_agent(id);
     rv.set(v8::Boolean::new(scope, dropped).into());
 }
 
@@ -4620,9 +5063,9 @@ fn op_fetch_sent_close(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(-1.0);
-    let fired = handle >= 0.0
-        && oam_core::http_client::sent::close(&core_runtime!(scope).sent_signals(), handle as u64);
+    let handle = handle_id_arg(scope, &args, 0);
+    let fired = handle != NO_HANDLE
+        && oam_core::http_client::sent::close(&core_runtime!(scope).sent_signals(), handle);
     rv.set(v8::Boolean::new(scope, fired).into());
 }
 
@@ -4631,7 +5074,7 @@ fn op_http_request_body_read(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     let state = core_runtime!(scope).http();
     crate::ops::spawn_op(scope, &mut rv, async move {
         let mut rx = match state.take_body_stream(id) {
@@ -4695,7 +5138,7 @@ fn op_http_request_body_cancel(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     core_runtime!(scope).http().cancel_body_stream(id);
 }
 
@@ -4704,7 +5147,7 @@ fn op_http_request_body(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     let bytes = core_runtime!(scope)
         .http()
         .take_request_body(id)
@@ -4720,7 +5163,7 @@ fn op_http_respond(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     use oam_core::http_server::ResponseBody;
-    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     let body = arg_bytes(scope, &args, 3).unwrap_or_default();
     let head = response_head_args(scope, &args, 4, 6);
     // Arg 5 `true`: the body goes out as one of unknown length (chunked, or
@@ -4806,7 +5249,7 @@ fn op_http_respond_stream(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     let head = response_head_args(scope, &args, 3, 4);
     // node:http's first chunk, written with the head (respond_stream).
     let first = arg_bytes(scope, &args, 5);
@@ -4823,7 +5266,7 @@ fn op_http_body_push(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let stream_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let stream_id = handle_id_arg(scope, &args, 0);
     let Some(bytes) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "httpBodyPush requires data");
         return;
@@ -4843,7 +5286,7 @@ fn op_http_body_trailers(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let stream_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let stream_id = handle_id_arg(scope, &args, 0);
     let pairs = arg_string(scope, &args, 1)
         .map(|json| parse_headers_json(&json))
         .unwrap_or_default();
@@ -4860,7 +5303,7 @@ fn op_http_body_end(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let stream_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let stream_id = handle_id_arg(scope, &args, 0);
     core_runtime!(scope).http().end_stream(stream_id);
 }
 
@@ -4869,7 +5312,7 @@ fn op_http_stream_closed(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let stream_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let stream_id = handle_id_arg(scope, &args, 0);
     let state = core_runtime!(scope).http();
     // UNREF'd: this is a passive watcher for "the client went away", which
     // may never happen. hyper only notices a vanished peer when it next
@@ -4887,7 +5330,7 @@ fn op_http_abort(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     rv.set_bool(core_runtime!(scope).http().abort_request(id));
 }
 
@@ -4896,7 +5339,7 @@ fn op_http_close(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let server_id = handle_id_arg(scope, &args, 0);
     core_runtime!(scope).http().close_server(server_id);
 }
 
@@ -4958,7 +5401,7 @@ fn op_http2_serve_tls(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let http1 = args.get(1).is_true();
     let policy = head_policy_args(scope, &args, 2);
     let timeouts = timeout_args(scope, &args, 4);
@@ -4997,7 +5440,7 @@ fn op_https_serve(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let context_id = args.get(2).number_value(scope).unwrap_or(0.0) as u64;
+    let context_id = handle_id_arg(scope, &args, 2);
     // args 3..=6: handshakeTimeout, requestCert, rejectUnauthorized, ALPN.
     let Some(options) = accept_option_args(scope, &args, 3, "httpsServe") else {
         return;
@@ -5056,7 +5499,7 @@ fn op_https_pipe_serve(
     let Some((path, target)) = pipe_path_arg(scope, &args, "httpsPipeServe") else {
         return;
     };
-    let context_id = args.get(1).number_value(scope).unwrap_or(0.0) as u64;
+    let context_id = handle_id_arg(scope, &args, 1);
     // args 2..=5: handshakeTimeout, requestCert, rejectUnauthorized, ALPN.
     let Some(options) = accept_option_args(scope, &args, 2, "httpsPipeServe") else {
         return;
@@ -5105,8 +5548,8 @@ fn op_https_server_tls(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let context_id = args.get(1).number_value(scope).unwrap_or(0.0) as u64;
+    let server_id = handle_id_arg(scope, &args, 0);
+    let context_id = handle_id_arg(scope, &args, 1);
     let Some(options) = accept_option_args(scope, &args, 2, "httpsServerTls") else {
         return;
     };
@@ -5325,12 +5768,12 @@ fn op_http_bridge_progress(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
-    if id < 0.0 {
+    let id = handle_id_arg(scope, &args, 0);
+    if id == NO_HANDLE {
         return;
     }
     let bridges = core_runtime!(scope).http_bridges();
-    let Some(progress) = oam_core::http_client::bridge::progress(&bridges, id as u64) else {
+    let Some(progress) = oam_core::http_client::bridge::progress(&bridges, id) else {
         return;
     };
     let written = v8::Number::new(scope, progress.written as f64);
@@ -5382,9 +5825,9 @@ fn op_http_bridge_close(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
-    let closed = id >= 0.0
-        && oam_core::http_client::bridge::close(&core_runtime!(scope).http_bridges(), id as u64);
+    let id = handle_id_arg(scope, &args, 0);
+    let closed = id != NO_HANDLE
+        && oam_core::http_client::bridge::close(&core_runtime!(scope).http_bridges(), id);
     rv.set_bool(closed);
 }
 
@@ -5492,12 +5935,9 @@ fn op_http2_session_send_goaway(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
-    let sent = id >= 0.0
-        && oam_core::http_client::h2_session::send_goaway(
-            &core_runtime!(scope).h2_sessions(),
-            id as u64,
-        );
+    let id = handle_id_arg(scope, &args, 0);
+    let sent = id != NO_HANDLE
+        && oam_core::http_client::h2_session::send_goaway(&core_runtime!(scope).h2_sessions(), id);
     rv.set_bool(sent);
 }
 
@@ -5534,9 +5974,9 @@ fn op_http2_session_close(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
-    let closed = id >= 0.0
-        && oam_core::http_client::h2_session::close(&core_runtime!(scope).h2_sessions(), id as u64);
+    let id = handle_id_arg(scope, &args, 0);
+    let closed = id != NO_HANDLE
+        && oam_core::http_client::h2_session::close(&core_runtime!(scope).h2_sessions(), id);
     rv.set_bool(closed);
 }
 
@@ -5547,12 +5987,9 @@ fn op_http2_session_destroy(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
-    let destroyed = id >= 0.0
-        && oam_core::http_client::h2_session::destroy(
-            &core_runtime!(scope).h2_sessions(),
-            id as u64,
-        );
+    let id = handle_id_arg(scope, &args, 0);
+    let destroyed = id != NO_HANDLE
+        && oam_core::http_client::h2_session::destroy(&core_runtime!(scope).h2_sessions(), id);
     rv.set_bool(destroyed);
 }
 
@@ -5586,12 +6023,9 @@ fn op_net_resolve_drop(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let token = args.get(0).number_value(scope).unwrap_or(-1.0);
-    let dropped = token >= 0.0
-        && oam_core::net_connect::drop_answer(
-            &core_runtime!(scope).resolved_answers(),
-            token as u64,
-        );
+    let token = handle_id_arg(scope, &args, 0);
+    let dropped = token != NO_HANDLE
+        && oam_core::net_connect::drop_answer(&core_runtime!(scope).resolved_answers(), token);
     rv.set_bool(dropped);
 }
 
@@ -5784,7 +6218,7 @@ fn op_tcp_read(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
     let tcp = core_runtime!(scope).tcp();
     // Keyed by the socket: a parked read on an unref'd socket must not keep
@@ -5805,7 +6239,7 @@ fn op_tcp_write(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let Some(data) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "tcpWrite requires data");
         return;
@@ -5845,7 +6279,7 @@ fn op_tcp_close(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let tcp = core_runtime!(scope).tcp();
     oam_core::tcp::tcp_close(&tcp, handle);
     core_runtime_mut!(scope).forget_handle(oam_core::HandleKey::Tcp(handle));
@@ -5861,7 +6295,7 @@ fn op_tcp_reset(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let shutdown_finished = args.get(1).boolean_value(scope);
     let tcp = core_runtime!(scope).tcp();
     let refused = oam_core::tcp::tcp_reset(&tcp, handle, shutdown_finished).err();
@@ -5883,7 +6317,7 @@ fn op_tcp_set_ref(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let referenced = args.get(1).boolean_value(scope);
     core_runtime_mut!(scope).set_handle_ref(oam_core::HandleKey::Tcp(handle), referenced);
 }
@@ -5897,7 +6331,7 @@ fn op_tcp_linger_at_exit(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     core_runtime!(scope).linger_stream_at_exit(handle);
 }
 
@@ -5912,7 +6346,7 @@ fn op_tcp_read_ahead(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let tcp = core_runtime!(scope).tcp();
     rv.set_bool(oam_core::tcp::tcp_read_ahead(&tcp, handle));
 }
@@ -5922,7 +6356,7 @@ fn op_tcp_shutdown(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let tcp = core_runtime!(scope).tcp();
     spawn_tcp_started(
         scope,
@@ -6050,7 +6484,7 @@ fn op_tcp_accept(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let server_id = handle_id_arg(scope, &args, 0);
     let core = core_runtime!(scope);
     let tcp = core.tcp();
     let ids = core.body_ids();
@@ -6074,8 +6508,8 @@ fn op_tcp_accept_take(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let handle = args.get(1).number_value(scope).unwrap_or(0.0) as u64;
+    let server_id = handle_id_arg(scope, &args, 0);
+    let handle = handle_id_arg(scope, &args, 1);
     let tcp = core_runtime!(scope).tcp();
     rv.set_bool(oam_core::tcp::tcp_accept_take(&tcp, server_id, handle));
 }
@@ -6085,7 +6519,7 @@ fn op_tcp_server_close(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let server_id = handle_id_arg(scope, &args, 0);
     let tcp = core_runtime!(scope).tcp();
     oam_core::tcp::tcp_server_close(&tcp, server_id);
     core_runtime_mut!(scope).forget_handle(oam_core::HandleKey::TcpServer(server_id));
@@ -6099,7 +6533,7 @@ fn op_tcp_server_set_ref(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let server_id = handle_id_arg(scope, &args, 0);
     let referenced = args.get(1).boolean_value(scope);
     core_runtime_mut!(scope).set_handle_ref(oam_core::HandleKey::TcpServer(server_id), referenced);
 }
@@ -6140,7 +6574,7 @@ fn op_udp_send(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let Some(data) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "udpSend requires data");
         return;
@@ -6174,7 +6608,7 @@ fn op_udp_recv(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
     let udp = core_runtime!(scope).udp();
     crate::ops::spawn_op(scope, &mut rv, oam_core::udp::udp_recv(udp, handle, len));
@@ -6185,7 +6619,7 @@ fn op_udp_close(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let udp = core_runtime!(scope).udp();
     oam_core::udp::udp_close(&udp, handle);
 }
@@ -6347,9 +6781,9 @@ fn op_tls_pipe_close(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let id = handle_id_arg(scope, &args, 0);
     let closed =
-        id >= 0.0 && oam_core::byte_pipe::close(&core_runtime!(scope).tls_pipes(), id as u64);
+        id != NO_HANDLE && oam_core::byte_pipe::close(&core_runtime!(scope).tls_pipes(), id);
     rv.set_bool(closed);
 }
 
@@ -6363,8 +6797,10 @@ fn op_tls_connect_over(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let pipe = args.get(0).number_value(scope).unwrap_or(-1.0);
-    if pipe < 0.0 {
+    // A missing argument is NaN, not a coercion failure: `unwrap_or(-1.0)`
+    // with a `< 0.0` test let it through as pipe 0.
+    let pipe = handle_id_arg(scope, &args, 0);
+    if pipe == NO_HANDLE {
         throw_type_error(scope, "tlsConnectOver requires a pipe");
         return;
     }
@@ -6383,7 +6819,7 @@ fn op_tls_connect_over(
     // ALPNProtocols, as tlsConnect takes them (argument 12 there).
     let alpn = match arg_string(scope, &args, 8).filter(|s| !s.is_empty()) {
         None => Vec::new(),
-        Some(json) => match oam_core::tls::parse_alpn_protocols(&json) {
+        Some(json) => match alpn_list_arg(&json, "tlsConnectOver") {
             Ok(alpn) => alpn,
             Err(message) => {
                 throw_type_error(scope, &message);
@@ -6402,7 +6838,7 @@ fn op_tls_connect_over(
             tls,
             pipes,
             ids,
-            pipe as u64,
+            pipe,
             server_name,
             ca_pem,
             reject_unauthorized,
@@ -6429,9 +6865,9 @@ fn client_context_arg(
     if value.is_null_or_undefined() {
         return Some(None);
     }
-    let id = value.number_value(scope).unwrap_or(-1.0);
-    let found = match scope.get_slot::<oam_core::CoreRuntime>() {
-        Some(rt) if id >= 0.0 => oam_core::tls::client_context(&rt.tls(), id as u64),
+    let id = value.number_value(scope).and_then(handle_id_from_number);
+    let found = match (scope.get_slot::<oam_core::CoreRuntime>(), id) {
+        (Some(rt), Some(id)) => oam_core::tls::client_context(&rt.tls(), id),
         _ => None,
     };
     match found {
@@ -6448,7 +6884,7 @@ fn op_tls_read(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
     let tls = core_runtime!(scope).tls();
     // Keyed by the socket, as op_tcp_read is: an unref'd TLSSocket's parked
@@ -6466,7 +6902,7 @@ fn op_tls_write(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let Some(data) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "tlsWrite requires data");
         return;
@@ -6480,7 +6916,7 @@ fn op_tls_close(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let tls = core_runtime!(scope).tls();
     oam_core::tls::tls_close(&tls, handle);
     core_runtime_mut!(scope).forget_handle(oam_core::HandleKey::Tls(handle));
@@ -6493,7 +6929,7 @@ fn op_tls_set_ref(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let referenced = args.get(1).boolean_value(scope);
     core_runtime_mut!(scope).set_handle_ref(oam_core::HandleKey::Tls(handle), referenced);
 }
@@ -6503,16 +6939,60 @@ fn op_tls_shutdown(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let tls = core_runtime!(scope).tls();
     crate::ops::spawn_op(scope, &mut rv, oam_core::tls::tls_shutdown(tls, handle));
+}
+
+/// An ALPN list argument -- a JSON array of protocol names, one byte per code
+/// point -- as `op` carries it: `oam_core::tls::parse_alpn_protocols`, the one
+/// decoder for the client and the server ops alike, with a refusal named for
+/// the op that was called (the parser words its own for `tlsConnect`). The
+/// server ops used to decode the list themselves, and more loosely: a code
+/// point above 0xFF was cut down to its low byte, which is a different
+/// protocol name from the one the caller gave, and an empty or over-long name
+/// reached the TLS configuration unchecked.
+fn alpn_list_arg(json: &str, op: &str) -> Result<Vec<Vec<u8>>, String> {
+    oam_core::tls::parse_alpn_protocols(json).map_err(|message| {
+        match message.strip_prefix("tlsConnect: ") {
+            Some(rest) => format!("{op}: {rest}"),
+            None => message,
+        }
+    })
+}
+
+#[cfg(test)]
+mod alpn_list_arg_tests {
+    use super::alpn_list_arg;
+
+    #[test]
+    fn a_server_op_takes_the_list_as_the_client_ops_do_and_names_itself_in_a_refusal() {
+        assert_eq!(
+            alpn_list_arg("[\"h2\",\"http/1.1\",\"\u{ff}x\"]", "httpsServe"),
+            Ok(vec![b"h2".to_vec(), b"http/1.1".to_vec(), vec![0xff, b'x']])
+        );
+        // U+0168 used to be advertised as its low byte, 'h'.
+        for (list, why) in [
+            ("[\"\u{168}2\"]".to_string(), "must be bytes"),
+            ("[\"\"]".to_string(), "must be 1-255 bytes"),
+            (format!("[\"{}\"]", "a".repeat(256)), "must be 1-255 bytes"),
+            ("{}".to_string(), "malformed ALPNProtocols"),
+        ] {
+            let refused = alpn_list_arg(&list, "tlsAcceptWrap").expect_err(&list);
+            assert!(
+                refused.starts_with("tlsAcceptWrap: ") && refused.contains(why),
+                "{list}: {refused}"
+            );
+        }
+    }
 }
 
 /// What a TLS server reads off itself for each connection it accepts
 /// (Node's tlsConnectionListener), from four arguments starting at `first`:
 /// handshakeTimeout in ms (120 s by default, validated in JS), requestCert,
 /// rejectUnauthorized, and ALPNProtocols as a JSON list of names (one char
-/// per byte). None, with a TypeError thrown, for a malformed ALPN list.
+/// per byte). None, with a TypeError thrown, for an ALPN list
+/// [`alpn_list_arg`] refuses.
 fn accept_option_args(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments<'_>,
@@ -6529,13 +7009,10 @@ fn accept_option_args(
     let request_cert = args.get(first + 1).is_true();
     let reject_unauthorized = args.get(first + 2).is_true();
     let alpn = match arg_string(scope, args, first + 3) {
-        Some(json) => match serde_json::from_str::<Vec<String>>(&json) {
-            Ok(names) => names
-                .iter()
-                .map(|name| name.chars().map(|c| c as u32 as u8).collect())
-                .collect(),
-            Err(e) => {
-                throw_type_error(scope, &format!("{op}: malformed ALPN list: {e}"));
+        Some(json) => match alpn_list_arg(&json, op) {
+            Ok(names) => names,
+            Err(message) => {
+                throw_type_error(scope, &message);
                 return None;
             }
         },
@@ -6554,8 +7031,8 @@ fn op_tls_accept_wrap(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let tcp_handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let context_id = args.get(1).number_value(scope).unwrap_or(0.0) as u64;
+    let tcp_handle = handle_id_arg(scope, &args, 0);
+    let context_id = handle_id_arg(scope, &args, 1);
     // args 2..=5: handshakeTimeout, requestCert, rejectUnauthorized, ALPN.
     let Some(options) = accept_option_args(scope, &args, 2, "tlsAcceptWrap") else {
         return;
@@ -6609,7 +7086,7 @@ fn op_tls_server_context_free(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     oam_core::tls::server::free_context(&core_runtime!(scope).tls(), id);
 }
 
@@ -6647,7 +7124,7 @@ fn op_tls_client_context_free(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let id = handle_id_arg(scope, &args, 0);
     oam_core::tls::free_client_context(&core_runtime!(scope).tls(), id);
 }
 
@@ -6912,7 +7389,7 @@ fn op_zlib_stream_write(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let Some(chunk) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "zlibStreamWrite requires data");
         return;
@@ -6934,7 +7411,7 @@ fn op_zlib_stream_flush(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let finish_flush = arg_finish_flush(scope, &args, 1);
     let streams = core_runtime!(scope).zlib_streams();
     crate::ops::spawn_op(
@@ -6953,7 +7430,7 @@ fn op_zlib_stream_params(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let level = args.get(1);
     let level = if level.is_undefined() {
         None
@@ -6976,7 +7453,7 @@ fn op_zlib_stream_close(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let streams = core_runtime!(scope).zlib_streams();
     oam_core::ops::zlib_stream_close(&streams, handle);
 }
@@ -7015,7 +7492,7 @@ fn op_zlib_handle_write_sync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let flush = args.get(1).int32_value(scope).unwrap_or(0);
     let input = arg_bytes(scope, &args, 2).unwrap_or_default();
     let out_off = args.get(4).int32_value(scope).unwrap_or(0) as usize;
@@ -7243,7 +7720,7 @@ fn op_zstd_handle_write_sync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let flush = args.get(1).int32_value(scope).unwrap_or(0);
     let input = arg_bytes(scope, &args, 2);
     let out_len = args.get(3).uint32_value(scope).unwrap_or(0) as usize;
@@ -7277,7 +7754,7 @@ fn op_zstd_handle_write(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let flush = args.get(1).int32_value(scope).unwrap_or(0);
     let input = arg_bytes(scope, &args, 2);
     let out_len = args.get(3).uint32_value(scope).unwrap_or(0) as usize;
@@ -7300,7 +7777,7 @@ fn op_zstd_handle_reset(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = handle_id_arg(scope, &args, 0);
     let Some(engine) = zstd_engine(scope, handle) else {
         return;
     };
@@ -10111,10 +10588,23 @@ fn op_spawn_sync(
     // Read argv0 from the options object (node's spawn/child_process API).
     let argv0 = opt_argv0(scope, opts);
 
+    // node's `killSignal`, as the JS layer validated it: a signal NAME of
+    // this platform, or absent for the default (SIGTERM). It is what ends a
+    // child that outlives `timeout` or overflows `maxBuffer`.
+    let kill_signal = opts.and_then(|o| {
+        let key = v8::String::new(scope, "killSignal")?;
+        let val = o.get(scope, key.into())?;
+        if !val.is_string() {
+            return None;
+        }
+        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
+    });
+
     // A sync spawn with an argv0: the raw-create path when the platform has
     // one (Windows CreateProcessW is the only way to set the first token), the
     // std path -- which carries argv0 through CommandExt::arg0 -- otherwise.
-    // `spawn_sync_argv0` exists only in child_win.rs, so this is Windows-only.
+    // `spawn_sync_argv0_with` exists only in child_win.rs, so this is
+    // Windows-only.
     #[cfg(windows)]
     if let Some(argv0) = argv0.as_deref() {
         // `stdio` stays alive to the end of this block: a numbered slot's
@@ -10145,6 +10635,7 @@ fn op_spawn_sync(
             Some(argv0),
             timeout_ms,
             max_buffer,
+            kill_signal.as_deref(),
             shell,
         );
         rv.set(spawn_sync_result_to_js(scope, result).into());
@@ -10160,6 +10651,7 @@ fn op_spawn_sync(
         shell,
         timeout_ms,
         max_buffer,
+        kill_signal.as_deref(),
         stdio,
         detached,
         windows_hide,
@@ -12454,7 +12946,8 @@ fn op_network_interfaces(
 ///
 /// - An address is reported when its interface is up AND running and the
 ///   entry carries an IPv4 or IPv6 address (libuv's `uv__ifaddr_exclude`);
-///   the link-layer entries (`AF_PACKET` on Linux, `AF_LINK` on macOS) are
+///   the link-layer entries (`AF_PACKET` on Linux, `AF_LINK` on macOS and
+///   the BSDs) are
 ///   not addresses but supply each interface's hardware address, matched by
 ///   name, the last one winning as in libuv's second pass.
 /// - `internal` is the interface's `IFF_LOOPBACK` flag; `scopeid` is the
@@ -12726,7 +13219,16 @@ mod ifaddrs {
                 mac[..n].copy_from_slice(&addr[..n]);
                 Addr::Link(mac)
             }
-            #[cfg(target_vendor = "apple")]
+            // Every platform `sockaddr_bytes` reads by `sa_len`: they share
+            // `sockaddr_dl`'s name-then-address layout (the BSDs other than
+            // Apple's are not release targets, and are not built or tested).
+            #[cfg(any(
+                target_vendor = "apple",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly"
+            ))]
             libc::AF_LINK => {
                 let nlen = field::<1>(raw, std::mem::offset_of!(libc::sockaddr_dl, sdl_nlen))[0];
                 let alen = field::<1>(raw, std::mem::offset_of!(libc::sockaddr_dl, sdl_alen))[0];
@@ -12872,7 +13374,9 @@ fn interface_address(
 /// IPv6 that is libuv's `inet_ntop6` (src/inet.c, BIND's), which differs from
 /// Rust's `Display` in one place: besides `::ffff:a.b.c.d` it prints an
 /// IPv4-compatible address (`::127.0.0.1`, as `ip link set sit0 up` adds on
-/// Linux) and `::0.0.0.2` in dotted form, where Rust prints `::7f00:1`.
+/// Linux) in dotted form, where Rust prints `::7f00:1`. An address whose
+/// first seven words are zero (`::2`) is NOT one of those: it prints as hex
+/// in both.
 fn uv_ip_name(addr: std::net::IpAddr) -> String {
     let v6 = match addr {
         std::net::IpAddr::V4(v4) => return v4.to_string(),
@@ -12911,10 +13415,12 @@ fn uv_ip_name(addr: std::net::IpAddr) -> String {
         if i != 0 {
             out.push(':');
         }
+        // libuv's test has a third clause, `len == 7 && words[7] != 1`. It
+        // can never hold here: a seven-word run from 0 covers word 6, which
+        // the skip above has already passed over. So it is left out.
         let embedded_v4 = i == 6
             && best.is_some_and(|(base, len)| {
-                base == 0
-                    && (len == 6 || (len == 7 && words[7] != 1) || (len == 5 && words[5] == 0xffff))
+                base == 0 && (len == 6 || (len == 5 && words[5] == 0xffff))
             });
         if embedded_v4 {
             let o = v6.octets();
@@ -12929,10 +13435,17 @@ fn uv_ip_name(addr: std::net::IpAddr) -> String {
     out
 }
 
-/// node's `getCIDR` (lib/os.js) over a netmask's groups -- octets for IPv4,
-/// 16-bit groups for IPv6: the set bits of every group up to and including
-/// the first one that is not all ones, or `None` (node's `cidr: null`) when a
-/// later group is not zero.
+/// node's `getCIDR` (lib/internal/util.js, v22.22.2) over a netmask's groups
+/// -- octets for IPv4, 16-bit groups for IPv6: the set bits of every group up
+/// to and including the first one that is not all ones. `None` (node's
+/// `cidr: null`) when that first partial group has a clear bit above a set
+/// one, or when a later group is not zero.
+///
+/// node tests the partial group's binary TEXT for `"01"`, and the text has no
+/// leading zeros, so a clear bit above the group's highest set one is not
+/// seen: 253 (`11111101`) is null, 254 (`11111110`) counts 7, and so does 127
+/// (`1111111`). That is kept as it is: the group must be a run of ones
+/// followed only by zeros, wherever in the group the run starts.
 fn netmask_ones(netmask: std::net::IpAddr) -> Option<u32> {
     let groups: Vec<(u32, u32)> = match netmask {
         std::net::IpAddr::V4(v4) => v4.octets().iter().map(|&g| (u32::from(g), 0xff)).collect(),
@@ -12951,7 +13464,18 @@ fn netmask_ones(netmask: std::net::IpAddr) -> Option<u32> {
             }
         } else {
             ones += group.count_ones();
-            has_zeros = group != full;
+            if group != full {
+                // "01" in the binary text: with the trailing zeros shifted
+                // off, anything but a solid run of ones has a clear bit under
+                // its top one. Zero has no text to fail.
+                if group != 0 {
+                    let run = group >> group.trailing_zeros();
+                    if run & (run + 1) != 0 {
+                        return None;
+                    }
+                }
+                has_zeros = true;
+            }
         }
     }
     Some(ones)
@@ -12998,9 +13522,21 @@ mod network_interface_format_tests {
         assert_eq!(ones("ffff:ffff:ffff:ffff::"), Some(64));
         assert_eq!(ones("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), Some(128));
         // A partial group counts its set bits, as node's countBinaryOnes does.
-        assert_eq!(ones("255.253.0.0"), Some(15));
+        assert_eq!(ones("255.254.0.0"), Some(15));
+        assert_eq!(ones("255.255.240.0"), Some(20));
+        assert_eq!(ones("ffff:ffff:ffff:fe00::"), Some(55));
+        // A partial group with a clear bit above a set one ("01" in its
+        // binary text): node's null. This used to count 15.
+        assert_eq!(ones("255.253.0.0"), None);
+        assert_eq!(ones("255.250.0.0"), None);
+        assert_eq!(ones("ffff:ff0f::"), None);
+        // node's text has no leading zeros, so a run that starts below the
+        // group's top bit still counts.
+        assert_eq!(ones("255.127.0.0"), Some(15));
+        assert_eq!(ones("ffff:7fff::"), Some(31));
         // A set bit after a group that is not all ones: node's null.
         assert_eq!(ones("255.0.255.0"), None);
+        assert_eq!(ones("255.254.1.0"), None);
     }
 }
 
@@ -14169,10 +14705,6 @@ mod permission_audit {
                 "drops the messages held for the forking parent's channel",
             ),
             (
-                "op_tcp_linger_at_exit",
-                "marks a socket from a checked connect for an orderly close at exit",
-            ),
-            (
                 "op_worker_post_message",
                 "posts to a worker already permitted at workerNew / forkSpawn",
             ),
@@ -14213,7 +14745,15 @@ mod permission_audit {
         }
 
         let mut offenders = Vec::new();
-        let check = |name: Option<&str>, body: &str, offenders: &mut Vec<String>| {
+        // The EXEMPT entries the audit actually excused an op by. One that is
+        // never consulted names an op that is gone, renamed, or outside the
+        // audited families (the net ops are not audited here), and would
+        // otherwise sit in the list reading as coverage.
+        let mut consulted: Vec<&'static str> = Vec::new();
+        let check = |name: Option<&str>,
+                     body: &str,
+                     offenders: &mut Vec<String>,
+                     consulted: &mut Vec<&'static str>| {
             let Some(name) = name else { return };
             let sensitive = name.starts_with("op_fs_")
                 || name.starts_with("op_spawn_")
@@ -14223,7 +14763,11 @@ mod permission_audit {
                 // beside them.
                 || name.starts_with("op_worker_")
                 || name.starts_with("op_fork_");
-            if !sensitive || EXEMPT.iter().any(|(n, _)| *n == name) {
+            if !sensitive {
+                return;
+            }
+            if let Some((exempt, _)) = EXEMPT.iter().find(|(n, _)| *n == name) {
+                consulted.push(*exempt);
                 return;
             }
             // No op is excused by its shape. There used to be an escape here
@@ -14268,14 +14812,14 @@ mod permission_audit {
             let mut body = String::new();
             for line in source.lines() {
                 if let Some(name) = top_level_fn_name(line) {
-                    check(current, &body, &mut offenders);
+                    check(current, &body, &mut offenders, &mut consulted);
                     current = Some(name);
                     body.clear();
                     body.push_str(line);
                     body.push('\n');
                     // An empty body is closed on its own line: `fn f() {}`.
                     if line.trim_end().ends_with("{}") {
-                        check(current.take(), &body, &mut offenders);
+                        check(current.take(), &body, &mut offenders, &mut consulted);
                         body.clear();
                     }
                     continue;
@@ -14284,13 +14828,26 @@ mod permission_audit {
                     body.push_str(line);
                     body.push('\n');
                     if line == "}" {
-                        check(current.take(), &body, &mut offenders);
+                        check(current.take(), &body, &mut offenders, &mut consulted);
                         body.clear();
                     }
                 }
             }
-            check(current, &body, &mut offenders);
+            check(current, &body, &mut offenders, &mut consulted);
         }
+
+        let never_consulted: Vec<&str> = EXEMPT
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !consulted.contains(name))
+            .collect();
+        assert!(
+            never_consulted.is_empty(),
+            "these EXEMPT entries excuse nothing -- no audited top-level op has \
+             the name (removed, renamed, or not in a family this test audits):\n  {}\n\n\
+             Delete the entry, or extend the audit to the op's family.",
+            never_consulted.join("\n  ")
+        );
 
         // The parser itself: a visibility or a generic list must not hide an
         // op from the audit, and an indented fn is not a top-level item.

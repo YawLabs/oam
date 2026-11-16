@@ -13,8 +13,9 @@ default = ["napi"]
 # build is byte-for-byte unchanged.
 #
 # Turning it OFF drops the whole of src/napi.rs -- the bulk of this crate's
-# `unsafe` FFI surface -- and the 132-symbol exported ABI (131 `napi_*` entry
-# points plus the `uv_event_loop` data symbol, listed in oam_cli/build.rs).
+# `unsafe` FFI surface -- and the exported ABI: every `napi_*` entry point
+# plus the `uv_event_loop` data symbol, as listed in `NAPI_EXPORTS` in
+# oam_cli/build.rs (the list is the count; no number is repeated here).
 # Worth doing for any build that can never load a native addon: `.node`
 # require() then throws OAM-NATIVE0002 instead of reaching a dlopen path that
 # is present-but-gated.
@@ -76,7 +77,10 @@ x509-parser = { workspace = true }
 curve25519-dalek = { workspace = true }
 # N-API addon loading (feature `napi` only).
 libloading = { workspace = true, optional = true }
-# os/process native values on macOS + other non-linux unix (mem/cpu/rss/ppid).
+# os/process native values. Compiled and called on every target (hostname
+# everywhere, network interfaces on Windows, kernel release + loadavg on
+# unix, mem/cpu/rss/ppid on macOS + other non-linux unix), so it must stay
+# unscoped: see the workspace manifest for the full list.
 sysinfo = { workspace = true }
 # WebSocket ops: Message type for wsSend framing.
 tokio-tungstenite = { workspace = true }

@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "Repo automation: V8 bump bot, snapshot rebuilds, release packaging."
+description = "Repo automation: benchmarks, the conformance and node-suite harnesses, the unsafe-budget ratchet."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
