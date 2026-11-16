@@ -5,8 +5,8 @@
       "generatedAgainst": "v22.22.2 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1616,
-        "missing": 258,
+        "present": 1617,
+        "missing": 257,
         "absentModules": 4,
         "absentModuleExportNames": 10
       },
@@ -109,7 +109,6 @@
           "Cipheriv",
           "Decipher",
           "Decipheriv",
-          "diffieHellman",
           "getCipherInfo",
           "randomFill",
           "setEngine"
@@ -385,8 +384,8 @@
       "generatedAgainst": "v22.22.2 on linux-arm64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1619,
-        "missing": 259,
+        "present": 1620,
+        "missing": 258,
         "absentModules": 4,
         "absentModuleExportNames": 10
       },
@@ -490,7 +489,6 @@
           "Cipheriv",
           "Decipher",
           "Decipheriv",
-          "diffieHellman",
           "getCipherInfo",
           "randomFill",
           "setEngine"
@@ -766,8 +764,8 @@
       "generatedAgainst": "v22.22.2 on win32-arm64",
       "counts": {
         "nodeExportNames": 1874,
-        "present": 1613,
-        "missing": 251,
+        "present": 1614,
+        "missing": 250,
         "absentModules": 4,
         "absentModuleExportNames": 10
       },
@@ -863,7 +861,6 @@
           "Cipheriv",
           "Decipher",
           "Decipheriv",
-          "diffieHellman",
           "getCipherInfo",
           "randomFill",
           "setEngine"
