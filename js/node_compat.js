@@ -21365,6 +21365,7 @@
         var comps = natives.cryptoEcJwkExport(pem, true);
         return natives.cryptoEcJwkImport(comps.crv, comps.x, comps.y);
       }
+      if (kind === "x25519") checkX25519Pem(pem, true, false);
       if (kind === "ed25519" || kind === "x25519") {
         return okpSpkiPem(kind, natives.cryptoOkpComponents(pem, true).x);
       }
@@ -21392,17 +21393,29 @@
 
     // An OKP JWK ({ kty: 'OKP', crv: 'Ed25519' | 'X25519', x, d? }) as PEM:
     // the private key from `d` when `wantPrivate`, else the public key from
-    // `x`. A JWK that names another curve or whose field is not 32 bytes is
-    // node's ERR_CRYPTO_INVALID_JWK.
+    // `x`. Validated in the order of node's getKeyObjectHandleFromJwk: crv a
+    // string naming an OKP curve (ERR_INVALID_ARG_TYPE / ERR_INVALID_ARG_VALUE
+    // on 'key.crv'), x a string -- for a private key too -- then d a string
+    // when private (ERR_INVALID_ARG_TYPE on 'key.x' / 'key.d'), and only a
+    // field of the wrong decoded length is ERR_CRYPTO_INVALID_JWK. Ed448 /
+    // X448 pass node's checks but have no natives here, so a well-formed one
+    // is refused with its own unsupported error.
     function okpJwkToPem(jwk, wantPrivate) {
-      var kind = jwk.crv === "Ed25519" ? "ed25519" : jwk.crv === "X25519" ? "x25519" : null;
-      var field = wantPrivate ? jwk.d : jwk.x;
-      var raw = kind !== null && typeof field === "string" ? new Uint8Array(base64urlDecode(field)) : null;
-      if (raw === null || raw.length !== 32) {
+      if (typeof jwk.crv !== "string") throw codes.ERR_INVALID_ARG_TYPE("key.crv", "string", jwk.crv);
+      if (["Ed25519", "Ed448", "X25519", "X448"].indexOf(jwk.crv) === -1) {
+        throw codes.ERR_INVALID_ARG_VALUE("key.crv", jwk.crv, "must be one of: 'Ed25519', 'Ed448', 'X25519', 'X448'");
+      }
+      if (typeof jwk.x !== "string") throw codes.ERR_INVALID_ARG_TYPE("key.x", "string", jwk.x);
+      if (wantPrivate && typeof jwk.d !== "string") throw codes.ERR_INVALID_ARG_TYPE("key.d", "string", jwk.d);
+      var raw = new Uint8Array(base64urlDecode(wantPrivate ? jwk.d : jwk.x));
+      var wantLength = jwk.crv === "Ed448" ? 57 : jwk.crv === "X448" ? 56 : 32;
+      if (raw.length !== wantLength) {
         var err = new TypeError("Invalid JWK data");
         err.code = "ERR_CRYPTO_INVALID_JWK";
         throw err;
       }
+      if (wantLength !== 32) throw new Error("JWK import is not supported for key type: " + jwk.crv);
+      var kind = jwk.crv === "Ed25519" ? "ed25519" : "x25519";
       return wantPrivate ? okpPkcs8Pem(kind, raw) : okpSpkiPem(kind, raw);
     }
 
@@ -21420,6 +21433,31 @@
     // asymmetricKeyType for a detectKeyType kind.
     function asymmetricTypeOf(kind) {
       return kind === "rsa" || kind === "ec" || kind === "x25519" ? kind : "ed25519";
+    }
+
+    // An X25519 PEM is labelled by its OID alone, so parse it at import, as
+    // node does, rather than let a malformed key surface later as a codeless
+    // TypeError from diffieHellman. node's errors: a bad PKCS#8 is OpenSSL's
+    // DECODER "unsupported"; a bad SPKI is a "decode error" from PEM and
+    // "Failed to read asymmetric key" from DER. (Other key types are still
+    // labelled without parsing; their natives report a bad key on use.)
+    function checkX25519Pem(pem, isPrivate, fromDer) {
+      try {
+        natives.cryptoOkpComponents(pem, isPrivate);
+        return;
+      } catch (_) {
+        // fall through to node's error
+      }
+      if (isPrivate) throw x25519ImportError("error:1E08010C:DECODER routines::unsupported", "DECODER routines", "unsupported", "ERR_OSSL_UNSUPPORTED");
+      if (fromDer) throw new Error("Failed to read asymmetric key");
+      throw x25519ImportError("error:03000072:digital envelope routines::decode error", "digital envelope routines", "decode error", "ERR_OSSL_EVP_DECODE_ERROR");
+    }
+    function x25519ImportError(message, library, reason, code) {
+      var err = new Error(message);
+      err.library = library;
+      err.reason = reason;
+      err.code = code;
+      return err;
     }
 
     // node's error for signing or verifying with a key-agreement (X25519) key.
@@ -21490,6 +21528,7 @@
       var ko = new KeyObject("private", null);
       ko._pem = pem;
       ko._keyType = detectKeyType(pem);
+      if (ko._keyType === "x25519") checkX25519Pem(pem, true, false);
       ko.asymmetricKeyType = asymmetricTypeOf(ko._keyType);
       ko.asymmetricKeySize = undefined;
       ko.export = function(options) {
@@ -21513,6 +21552,7 @@
 
     function createPublicKey(input) {
       var pem;
+      var pubFromDer = false;
       if (typeof input === "object" && input !== null && input.format === "jwk" && input.key) {
         var jwk = input.key;
         if (jwk.kty === "RSA") {
@@ -21542,6 +21582,7 @@
           if (input.format === "der") {
             var pubLabel = input.type === "pkcs1" ? "RSA PUBLIC KEY" : "PUBLIC KEY";
             pem = derToPem(pubBytes, pubLabel);
+            pubFromDer = true;
           } else {
             pem = publicPemFromPem(new TextDecoder().decode(pubBytes));
           }
@@ -21562,6 +21603,7 @@
       var ko = new KeyObject("public", null);
       ko._pem = pem;
       ko._keyType = detectKeyType(pem);
+      if (ko._keyType === "x25519") checkX25519Pem(pem, false, pubFromDer);
       ko.asymmetricKeyType = asymmetricTypeOf(ko._keyType);
       ko.asymmetricKeySize = undefined;
       ko.export = function(options) {

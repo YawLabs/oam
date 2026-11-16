@@ -25,7 +25,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   objects, with node's argument errors and OpenSSL's for two curves or a small-order X25519
   peer. `generateKeyPair('x25519')` / `generateKeyPairSync('x25519')` make X25519 pairs in
   every encoding node offers (PEM, DER, JWK), and `createPrivateKey` / `createPublicKey` /
-  `KeyObject#export` read and write them, Ed25519 and X25519 JWKs included. ssh2 now offers
+  `KeyObject#export` read and write them, Ed25519 and X25519 JWKs included, with node's
+  per-field JWK errors and node's import errors for an X25519 key that does not parse. ssh2 now offers
   `curve25519-sha256` key exchange on oam, as it does on node.
 
 ### Fixed

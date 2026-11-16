@@ -28499,6 +28499,88 @@ gen-cb  x25519 x25519
     assert_eq!(got.len(), want.len(), "line count.\nfull stdout: {stdout}");
 }
 
+// OKP JWK import and X25519 key import, against node v22.22.2: node's
+// per-field JWK checks in getKeyObjectHandleFromJwk's order (crv, x, then
+// d), ERR_CRYPTO_INVALID_JWK only for a wrong decoded length, and a
+// malformed X25519 SPKI / PKCS#8 refused at import with OpenSSL's errors.
+#[test]
+fn crypto_okp_jwk_and_x25519_import_errors_match_node() {
+    let file = write_temp(
+        "crypto_issue_489_import.mjs",
+        r##"import crypto from "node:crypto";
+const E = (e) => e.constructor.name + "|" + e.code + "|" + e.message;
+const T = (f) => { try { const k = f(); return k.type + " " + k.asymmetricKeyType; } catch (e) { return "THROW " + E(e); } };
+const out = (...a) => console.log(a.join(" "));
+const pub = (key) => () => crypto.createPublicKey({ key, format: "jwk" });
+const priv = (key) => () => crypto.createPrivateKey({ key, format: "jwk" });
+const d = "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo", x = "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo";
+out("jwk-crv-foo", T(pub({ kty: "OKP", crv: "foo", x: "AA" })));
+out("jwk-crv-num", T(pub({ kty: "OKP", crv: 5, x: "AA" })));
+out("jwk-crv-none", T(pub({ kty: "OKP", x: "AA" })));
+out("jwk-x-none", T(pub({ kty: "OKP", crv: "X25519" })));
+out("jwk-x-num", T(pub({ kty: "OKP", crv: "Ed25519", x: 5 })));
+out("jwk-x-short", T(pub({ kty: "OKP", crv: "X25519", x: "AA" })));
+out("jwk-priv-x-none", T(priv({ kty: "OKP", crv: "X25519", d })));
+out("jwk-priv-d-none", T(priv({ kty: "OKP", crv: "X25519", x })));
+out("jwk-priv-d-num", T(priv({ kty: "OKP", crv: "X25519", x, d: 5 })));
+out("jwk-priv-d-short", T(priv({ kty: "OKP", crv: "X25519", x, d: "AA" })));
+out("jwk-ed448-short", T(pub({ kty: "OKP", crv: "Ed448", x: "AA" })));
+out("jwk-priv-ok", T(priv({ kty: "OKP", crv: "X25519", x, d })), T(pub({ kty: "OKP", crv: "X25519", x, d })));
+const hexKey = (h) => Buffer.from(h, "hex");
+const pem = (b, label) => "-----BEGIN " + label + "-----\n" + b.toString("base64") + "\n-----END " + label + "-----\n";
+const spki31 = Buffer.concat([hexKey("3029300506032b656e032000"), Buffer.alloc(31, 7)]);
+const p8short = Buffer.concat([hexKey("302d020100300506032b656e04210420"), Buffer.alloc(31, 7)]);
+const trunc = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VuBCIEI\n-----END PRIVATE KEY-----\n";
+out("x25519-spki31-pem", T(() => crypto.createPublicKey(pem(spki31, "PUBLIC KEY"))));
+out("x25519-spki31-der", T(() => crypto.createPublicKey({ key: spki31, format: "der", type: "spki" })));
+out("x25519-trunc-priv", T(() => crypto.createPrivateKey(trunc)));
+out("x25519-trunc-pub", T(() => crypto.createPublicKey(trunc)));
+out("x25519-p8short-priv", T(() => crypto.createPrivateKey(pem(p8short, "PRIVATE KEY"))));
+out("x25519-p8short-der", T(() => crypto.createPrivateKey({ key: p8short, format: "der", type: "pkcs8" })));
+out("x25519-p8short-pub", T(() => crypto.createPublicKey(pem(p8short, "PRIVATE KEY"))));
+try { crypto.createPrivateKey(trunc); } catch (e) { out("x25519-trunc-fields", e.library, e.reason); }
+"##,
+    );
+    let expected = r##"jwk-crv-foo THROW TypeError|ERR_INVALID_ARG_VALUE|The property 'key.crv' must be one of: 'Ed25519', 'Ed448', 'X25519', 'X448'. Received 'foo'
+jwk-crv-num THROW TypeError|ERR_INVALID_ARG_TYPE|The "key.crv" property must be of type string. Received type number (5)
+jwk-crv-none THROW TypeError|ERR_INVALID_ARG_TYPE|The "key.crv" property must be of type string. Received undefined
+jwk-x-none THROW TypeError|ERR_INVALID_ARG_TYPE|The "key.x" property must be of type string. Received undefined
+jwk-x-num THROW TypeError|ERR_INVALID_ARG_TYPE|The "key.x" property must be of type string. Received type number (5)
+jwk-x-short THROW TypeError|ERR_CRYPTO_INVALID_JWK|Invalid JWK data
+jwk-priv-x-none THROW TypeError|ERR_INVALID_ARG_TYPE|The "key.x" property must be of type string. Received undefined
+jwk-priv-d-none THROW TypeError|ERR_INVALID_ARG_TYPE|The "key.d" property must be of type string. Received undefined
+jwk-priv-d-num THROW TypeError|ERR_INVALID_ARG_TYPE|The "key.d" property must be of type string. Received type number (5)
+jwk-priv-d-short THROW TypeError|ERR_CRYPTO_INVALID_JWK|Invalid JWK data
+jwk-ed448-short THROW TypeError|ERR_CRYPTO_INVALID_JWK|Invalid JWK data
+jwk-priv-ok private x25519 public x25519
+x25519-spki31-pem THROW Error|ERR_OSSL_EVP_DECODE_ERROR|error:03000072:digital envelope routines::decode error
+x25519-spki31-der THROW Error|undefined|Failed to read asymmetric key
+x25519-trunc-priv THROW Error|ERR_OSSL_UNSUPPORTED|error:1E08010C:DECODER routines::unsupported
+x25519-trunc-pub THROW Error|ERR_OSSL_UNSUPPORTED|error:1E08010C:DECODER routines::unsupported
+x25519-p8short-priv THROW Error|ERR_OSSL_UNSUPPORTED|error:1E08010C:DECODER routines::unsupported
+x25519-p8short-der THROW Error|ERR_OSSL_UNSUPPORTED|error:1E08010C:DECODER routines::unsupported
+x25519-p8short-pub THROW Error|ERR_OSSL_UNSUPPORTED|error:1E08010C:DECODER routines::unsupported
+x25519-trunc-fields DECODER routines unsupported
+"##;
+    let out = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "#489 import script failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let got: Vec<&str> = stdout.lines().collect();
+    let want: Vec<&str> = expected.lines().collect();
+    for (i, exp) in want.iter().enumerate() {
+        assert_eq!(
+            got.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} differs from node.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+    assert_eq!(got.len(), want.len(), "line count.\nfull stdout: {stdout}");
+}
+
 // ─── X.509 Certificate ──────────────────────────────────────────────
 
 #[test]
