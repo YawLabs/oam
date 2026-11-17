@@ -48648,6 +48648,14 @@
             err = opensslError(err.message, opensslReason(err.code), err.code);
           } else if (err && (err.code === "ECONNRESET" || err.code === "EPROTO") &&
               err.syscall === undefined && !(err instanceof AggregateError)) {
+            // node arms that disconnect (onConnectEnd, an 'end' listener) on
+            // the last line of a tls.connect that returned: the socket a
+            // throwing one left behind just ends -- 'end', then 'close'
+            // with no error, nothing for an 'uncaughtException' to hear.
+            if (socket[kConnectEndUnarmed] && !socket._writeQueuedBeforeConnect) {
+              socket._onReadEof();
+              return;
+            }
             err = disconnectedBeforeSecure(options);
           }
           // A write queued behind the handshake (a request head, a
@@ -48796,7 +48804,18 @@
     // connection has started (the socket is left to fail on its own), and
     // before the handshake over a given socket, which starts after them.
     var ipServernameWarned = false;
+    // Set on the socket a tls.connect throws out of (below) with its connect
+    // started: node never reached the line that arms onConnectEnd for it.
+    var kConnectEndUnarmed = Symbol("oamTlsConnectEndUnarmed");
     function setConnectSessionAndServername(socket, options) {
+      try {
+        setConnectSessionAndServernameChecked(socket, options);
+      } catch (e) {
+        socket[kConnectEndUnarmed] = true;
+        throw e;
+      }
+    }
+    function setConnectSessionAndServernameChecked(socket, options) {
       if (options.session) socket.setSession(options.session);
       var name = options.servername;
       if (!name) return;

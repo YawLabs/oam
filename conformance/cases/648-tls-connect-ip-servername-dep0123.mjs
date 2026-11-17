@@ -59,14 +59,47 @@ quiet(tls.connect({ socket: s, servername: "192.168.0.1" }));
 console.log("returned");
 `,
   "no-port-throws-first": `try { tls.connect({ host: "127.0.0.1", servername: "127.0.0.1" }); } catch (e) { console.log("threw", e.code); }\n`,
-  "non-string": `// The socket a throwing tls.connect leaves behind still fails, unheard.
-process.on("uncaughtException", (e) => console.log("left behind:", e.code));
+  "non-string": `// The socket a throwing tls.connect leaves behind is left to fail on its
+// own, unheard. A server that resets it once its hello is in (a reset on
+// every OS: a hang-up before the hello lands is a FIN on Linux and macOS)
+// draws one 'uncaughtException' each, awaited rather than timed. One that
+// hangs up cleanly draws none: node arms its "disconnected before secure"
+// error on the last line of a tls.connect that returned, so that socket
+// just ends.
+let heard = 0;
+process.on("uncaughtException", (e) => { heard++; console.log("left behind:", e.code); });
+const listen = async (onHello) => {
+  const s = net.createServer((c) => c.once("data", () => onHello(c)));
+  await new Promise((r) => s.listen(0, "127.0.0.1", r));
+  return s;
+};
+const until = (cond) => new Promise((r) => {
+  const t0 = Date.now();
+  const poll = () => (cond() || Date.now() - t0 > 10000 ? r() : setTimeout(poll, 5));
+  poll();
+});
+const resetter = await listen((c) => c.resetAndDestroy());
+let thrown = 0;
 for (const servername of [5, true, { a: 1 }, ["127.0.0.1"], 0, null, false]) {
   try {
-    quiet(tls.connect({ port, host: "127.0.0.1", servername }));
+    quiet(tls.connect({ port: resetter.address().port, host: "127.0.0.1", servername }));
     console.log("connected with", JSON.stringify(servername));
-  } catch (e) { console.log("threw", e.code, e.message); }
+  } catch (e) { thrown++; console.log("threw", e.code, e.message); }
 }
+await until(() => heard >= thrown);
+console.log("heard", heard, "of", thrown);
+resetter.close();
+heard = 0;
+let hungUp = 0;
+const hanger = await listen((c) => { c.on("close", () => hungUp++); c.end(); });
+for (const servername of [5, true]) {
+  try { tls.connect({ port: hanger.address().port, host: "127.0.0.1", servername }); }
+  catch (e) { console.log("threw", e.code); }
+}
+await until(() => hungUp >= 2);
+await tick();
+console.log("after a clean hang-up: heard", heard);
+hanger.close();
 `,
   "non-string-over-a-socket": `const s = quiet(net.connect(port, "127.0.0.1"));
 try { tls.connect({ socket: s, servername: 7 }); } catch (e) { console.log("threw", e.code); }

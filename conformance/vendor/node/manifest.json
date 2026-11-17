@@ -9,8 +9,8 @@
     "maxPartialSkips": 1,
     "minPass": 429,
     "minPassByHost": {
-      "linux-x86_64": 439,
-      "macos-aarch64": 438,
+      "linux-x86_64": 448,
+      "macos-aarch64": 448,
       "windows-aarch64": 439
     }
   },
